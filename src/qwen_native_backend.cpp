@@ -233,23 +233,46 @@ public:
         const double t_prefill_start = wall_seconds();
         uint64_t prefill_ops = 0;
         NativeExecutorReport step;
-        for (size_t pi = 0; pi < prompt_tokens.size(); ++pi) {
-            step = executor_->forward_one_token(prompt_tokens[pi]);
+        // Batched prefill: one forward_n_tokens call processes the full prompt
+        // with matmul'd projections + FFN. Logits/argmax come back for the LAST
+        // prompt token only, which is exactly what decode needs next.
+        //
+        // If logit dumping is on we still need per-token logits, so fall back
+        // to the per-token forward_one_token loop in that case.
+        if (dump) {
+            for (size_t pi = 0; pi < prompt_tokens.size(); ++pi) {
+                step = executor_->forward_one_token(prompt_tokens[pi]);
+                if (!step.ok) throw std::runtime_error("prefill failed");
+                prefill_ops += step.ops_executed;
+                dump->record(static_cast<int>(pi), "prefill",
+                             static_cast<int32_t>(prompt_tokens[pi]),
+                             *executor_, *tokenizer_);
+            }
+        } else {
+            step = executor_->forward_n_tokens(prompt_tokens);
             if (!step.ok) throw std::runtime_error("prefill failed");
-            prefill_ops += step.ops_executed;
-            if (dump) dump->record(static_cast<int>(pi), "prefill",
-                                   static_cast<int32_t>(prompt_tokens[pi]),
-                                   *executor_, *tokenizer_);
+            prefill_ops = step.ops_executed;
         }
         const double t_prefill_end = wall_seconds();
 
+        // After prefill, `step.argmax_token` is the model's prediction of the
+        // token that follows the last prompt token. That prediction *is* the
+        // first generated token (matches llama.cpp semantics: their
+        // `eval time = N-1 runs` while emitting N output tokens).
         std::string generated;
         const int32_t eos = tokenizer_->eos_id();
         uint32_t next_token = step.argmax_token >= 0 ? static_cast<uint32_t>(step.argmax_token)
                                                      : static_cast<uint32_t>(eos);
         uint64_t decode_ops = 0;
         int decoded = 0;
-        for (int i = 0; i < options.max_tokens; ++i) {
+        if (options.max_tokens > 0 && next_token != static_cast<uint32_t>(eos)) {
+            const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
+            generated += piece;
+            if (on_text && !piece.empty()) on_text(piece);
+            ++decoded;
+        }
+        for (int i = 0; i + 1 < options.max_tokens; ++i) {
+            if (next_token == static_cast<uint32_t>(eos)) break;
             const uint32_t feed = next_token;
             step = executor_->forward_one_token(feed);
             if (!step.ok) throw std::runtime_error("decode failed");
@@ -259,11 +282,11 @@ public:
                                    "decode", static_cast<int32_t>(feed),
                                    *executor_, *tokenizer_);
             next_token = static_cast<uint32_t>(new_argmax);
-            ++decoded;
             if (next_token == static_cast<uint32_t>(eos)) break;
             const std::string piece = tokenizer_->decode_one(new_argmax);
             generated += piece;
             if (on_text && !piece.empty()) on_text(piece);
+            ++decoded;
         }
         const double t_decode_end = wall_seconds();
 

@@ -40,6 +40,12 @@ public:
 
     NativeExecutorReport dry_run_token(uint32_t token_id, bool execute_heavy);
     NativeExecutorReport forward_one_token(uint32_t token_id);
+    // Batched prefill. Processes `tokens` consecutively as a single forward
+    // pass using batched matmuls for the linear projections + FFN. Per-token
+    // ops (attention, recurrent state) still iterate sequentially inside.
+    // After return, position_ has advanced by tokens.size() and the LM-head
+    // logits + argmax correspond to the LAST token in the batch.
+    NativeExecutorReport forward_n_tokens(const std::vector<uint32_t> &tokens);
 
     // Copy the most recent logits tensor back to host. Returns false if
     // forward_one_token has not been called yet.
@@ -52,6 +58,8 @@ private:
     const QwenNativeModel &model_;
     const QwenWeights &weights_;
     DeviceBackend &backend_;
+
+    void ensure_batch_scratch(uint32_t batch);
 
     bool scratch_ready_ = false;
     std::unique_ptr<DeviceTensor> h_;
@@ -66,6 +74,29 @@ private:
     std::unique_ptr<DeviceTensor> alpha_;
     std::unique_ptr<DeviceTensor> beta_;
     std::unique_ptr<DeviceTensor> core_;
+
+    // Batched scratch for forward_n_tokens. Sized to `batch_capacity_` rows
+    // each. Allocated on demand (and grown lazily) by ensure_batch_scratch.
+    uint32_t batch_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> h_batch_;
+    std::unique_ptr<DeviceTensor> norm_batch_;
+    std::unique_ptr<DeviceTensor> attn_out_batch_;
+    std::unique_ptr<DeviceTensor> ffn_gate_batch_;
+    std::unique_ptr<DeviceTensor> ffn_up_batch_;
+    std::unique_ptr<DeviceTensor> ffn_mid_batch_;
+    std::unique_ptr<DeviceTensor> ffn_out_batch_;
+    std::unique_ptr<DeviceTensor> proj_batch_;
+    std::unique_ptr<DeviceTensor> gate_proj_batch_;
+    std::unique_ptr<DeviceTensor> alpha_batch_;
+    std::unique_ptr<DeviceTensor> beta_batch_;
+    std::unique_ptr<DeviceTensor> core_batch_;
+    std::unique_ptr<DeviceTensor> q_batch_;
+    std::unique_ptr<DeviceTensor> k_batch_;
+    std::unique_ptr<DeviceTensor> v_batch_;
+    std::unique_ptr<DeviceTensor> mid_batch_;
+    // Preallocated scratch for the per-token conv output (size = conv_dim).
+    // Was a cudaMalloc/cudaFree per call inside recurrent_single_token.
+    std::unique_ptr<DeviceTensor> conv_out_;
     // Per-layer DeltaNet state and conv1d ring buffer. Indexed by absolute
     // layer index; entries for non-recurrent (full attention) layers stay
     // null. This is essential for correctness: each recurrent layer keeps

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace qw3 {
@@ -126,11 +127,25 @@ __global__ void silu_kernel(float *out, const float *x, uint64_t n) {
     if (i < n) out[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
+// Fused silu(gate) * up for the SwiGLU FFN: one launch, one read per element
+// instead of silu (read gate, write gate) then mul (read gate, read up, write
+// out). Saves 64 launches per decode token.
+__global__ void silu_mul_kernel(float *out, const float *gate, const float *up, uint64_t n) {
+    uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gate[i];
+    out[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
 __global__ void rms_norm_kernel(float *out, const float *x, const float *weight, uint64_t n, float eps) {
+    // Single-row RMS norm. Block-strided reduce over n.
+    const uint32_t b = blockIdx.x;
+    const float *x_row = x + static_cast<uint64_t>(b) * n;
+    float *out_row = out + static_cast<uint64_t>(b) * n;
     __shared__ float scratch[256];
     const uint32_t tid = threadIdx.x;
     float sum = 0.0f;
-    for (uint64_t i = tid; i < n; i += blockDim.x) sum += x[i] * x[i];
+    for (uint64_t i = tid; i < n; i += blockDim.x) sum += x_row[i] * x_row[i];
     scratch[tid] = sum;
     __syncthreads();
     for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -138,7 +153,7 @@ __global__ void rms_norm_kernel(float *out, const float *x, const float *weight,
         __syncthreads();
     }
     const float scale = rsqrtf(scratch[0] / static_cast<float>(n) + eps);
-    for (uint64_t i = tid; i < n; i += blockDim.x) out[i] = x[i] * scale * weight[i];
+    for (uint64_t i = tid; i < n; i += blockDim.x) out_row[i] = x_row[i] * scale * weight[i];
 }
 
 __global__ void q8_get_row_kernel(float *out, const uint8_t *weight, uint64_t row, uint64_t cols) {
@@ -152,29 +167,253 @@ __global__ void q8_get_row_kernel(float *out, const uint8_t *weight, uint64_t ro
     out[i] = fp16_to_f32_device(dh) * static_cast<float>(q);
 }
 
-__global__ void q8_matvec_kernel(float *out, const uint8_t *weight, const float *x, uint64_t rows, uint64_t cols) {
-    const uint64_t row = blockIdx.x;
-    if (row >= rows) return;
-    __shared__ float scratch[256];
+// Batched row gather: rows_buf is a device array of `batch` token ids. Each
+// CUDA block (gridDim.y) handles one batch slot, writing to out[b * cols ..].
+__global__ void q8_get_rows_batch_kernel(float *out,
+                                         const uint8_t *weight,
+                                         const uint64_t *rows_buf,
+                                         uint64_t cols) {
+    const uint32_t b = blockIdx.y;
+    const uint64_t row = rows_buf[b];
+    uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    const uint64_t block = i / 32;
+    const uint64_t inb = i % 32;
+    const uint8_t *p = weight + (row * (cols / 32) + block) * 34;
+    const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    const int8_t q = reinterpret_cast<const int8_t *>(p + 2)[inb];
+    out[static_cast<uint64_t>(b) * cols + i] = fp16_to_f32_device(dh) * static_cast<float>(q);
+}
+
+// Multi-row Q8_0 matvec with DP4A. Each block:
+//   1. Cooperatively stages x into shared memory and pre-quantizes it to
+//      int8 with per-32-element scales. This is done ONCE per block and
+//      shared by all WARPS_PER_BLOCK warps that process distinct rows.
+//   2. Each warp = one output row. The inner loop accumulates into int32
+//      with __dp4a (4-element int8 dot product in a single instruction),
+//      which is ~4x the throughput of the scalar (float)int8 * float loop.
+//
+// Per quantized block of 32 weight elements:
+//     contribution = w_scale * x_scale * dp4a_dot(w_i8x4, x_i8x4)
+// where dp4a_dot is computed via 8 __dp4a calls into an int32 accumulator.
+//
+// Falls back to the f32 path below when the per-block shmem budget is
+// exhausted (~80K cols).
+
+// Tiled Q8 matmul: each block handles WARPS_PER_BLOCK rows × BATCH_TILE
+// batch positions, reading the relevant W rows ONCE and reusing them across
+// BATCH_TILE outputs. This is the prefill-optimized variant: with BATCH_TILE=N
+// the weight bandwidth drops by N relative to the per-batch kernel.
+template <uint32_t WARPS_PER_BLOCK, uint32_t BATCH_TILE>
+__global__ void q8_matmul_tiled_dp4a_kernel(float *out,
+                                            const uint8_t *weight,
+                                            const float *x,
+                                            uint64_t rows,
+                                            uint64_t cols,
+                                            uint32_t batch,
+                                            uint32_t in_stride,
+                                            uint32_t out_stride) {
+    constexpr uint32_t LANES = 32;
     const uint32_t tid = threadIdx.x;
-    float sum = 0.0f;
+    const uint32_t warp = tid / LANES;
+    const uint32_t lane = tid % LANES;
+    const uint32_t batch_start = blockIdx.y * BATCH_TILE;
     const uint64_t blocks = cols / 32;
+
+    // Pre-quantize x for up to BATCH_TILE batch positions into shmem.
+    // Layout: [BATCH_TILE, cols] of int8 followed by [BATCH_TILE, blocks] of f32 scales.
+    extern __shared__ __align__(16) char shmem_raw[];
+    int8_t *sx_i8 = reinterpret_cast<int8_t *>(shmem_raw);
+    float *sx_scale = reinterpret_cast<float *>(sx_i8 + BATCH_TILE * cols);
+
+    #pragma unroll
+    for (uint32_t bb = 0; bb < BATCH_TILE; ++bb) {
+        const uint32_t b_idx = batch_start + bb;
+        if (b_idx >= batch) break;
+        const float *x_ptr = x + static_cast<uint64_t>(b_idx) * in_stride;
+        int8_t *sx_row = sx_i8 + static_cast<uint64_t>(bb) * cols;
+        float  *ss_row = sx_scale + static_cast<uint64_t>(bb) * blocks;
+        for (uint64_t b = warp; b < blocks; b += WARPS_PER_BLOCK) {
+            const float v = x_ptr[b * 32 + lane];
+            float absv = fabsf(v);
+            for (int delta = 16; delta > 0; delta >>= 1) {
+                absv = fmaxf(absv, __shfl_xor_sync(0xffffffffu, absv, delta));
+            }
+            const float x_scale = absv * (1.0f / 127.0f);
+            const float x_scale_inv = (absv > 0.0f) ? (127.0f / absv) : 0.0f;
+            const int q = __float2int_rn(v * x_scale_inv);
+            sx_row[b * 32 + lane] = static_cast<int8_t>(max(-127, min(127, q)));
+            if (lane == 0) ss_row[b] = x_scale;
+        }
+    }
+    __syncthreads();
+
+    const uint64_t row = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (row >= rows) return;
     const uint8_t *rowp = weight + row * blocks * 34;
-    for (uint64_t b = tid; b < blocks; b += blockDim.x) {
+
+    // Accumulators for BATCH_TILE batch positions, computed by THIS warp's row.
+    float sums[BATCH_TILE];
+    #pragma unroll
+    for (uint32_t bb = 0; bb < BATCH_TILE; ++bb) sums[bb] = 0.0f;
+
+    for (uint64_t b = lane; b < blocks; b += LANES) {
+        const uint8_t *p = rowp + b * 34;
+        const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+        const float w_scale = fp16_to_f32_device(dh);
+
+        // Pack the 8x4 int8 weight tile into 8 int32s (read once per W row).
+        int32_t w_packs[8];
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            const uint8_t *pw = p + 2 + k * 4;
+            w_packs[k] = static_cast<int32_t>(pw[0])
+                       | (static_cast<int32_t>(pw[1]) << 8)
+                       | (static_cast<int32_t>(pw[2]) << 16)
+                       | (static_cast<int32_t>(pw[3]) << 24);
+        }
+
+        #pragma unroll
+        for (uint32_t bb = 0; bb < BATCH_TILE; ++bb) {
+            const uint32_t b_idx = batch_start + bb;
+            if (b_idx >= batch) continue;
+            const int8_t *sx_row = sx_i8 + static_cast<uint64_t>(bb) * cols + b * 32;
+            const float x_scale = sx_scale[bb * blocks + b];
+            int32_t acc = 0;
+            #pragma unroll
+            for (uint32_t k = 0; k < 8; ++k) {
+                const int32_t x_pack = *reinterpret_cast<const int32_t *>(sx_row + k * 4);
+                acc = __dp4a(w_packs[k], x_pack, acc);
+            }
+            sums[bb] += w_scale * x_scale * static_cast<float>(acc);
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t bb = 0; bb < BATCH_TILE; ++bb) {
+        float s = sums[bb];
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            s += __shfl_xor_sync(0xffffffffu, s, delta);
+        }
+        if (lane == 0) {
+            const uint32_t b_idx = batch_start + bb;
+            if (b_idx < batch) out[static_cast<uint64_t>(b_idx) * out_stride + row] = s;
+        }
+    }
+}
+
+template <uint32_t WARPS_PER_BLOCK>
+__global__ void q8_matvec_dp4a_kernel(float *out,
+                                      const uint8_t *weight,
+                                      const float *x,
+                                      uint64_t rows,
+                                      uint64_t cols,
+                                      uint32_t in_stride,
+                                      uint32_t out_stride) {
+    constexpr uint32_t LANES = 32;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid / LANES;
+    const uint32_t lane = tid % LANES;
+    const uint32_t b_idx = blockIdx.y;
+    const uint64_t blocks = cols / 32;
+    const float *x_ptr = x + static_cast<uint64_t>(b_idx) * in_stride;
+    float *out_ptr = out + static_cast<uint64_t>(b_idx) * out_stride;
+
+    extern __shared__ __align__(16) char shmem_raw[];
+    int8_t *sx_i8 = reinterpret_cast<int8_t *>(shmem_raw);
+    float *sx_scale = reinterpret_cast<float *>(sx_i8 + cols);
+
+    for (uint64_t b = warp; b < blocks; b += WARPS_PER_BLOCK) {
+        const float v = x_ptr[b * 32 + lane];
+        float absv = fabsf(v);
+        for (int delta = 16; delta > 0; delta >>= 1) {
+            absv = fmaxf(absv, __shfl_xor_sync(0xffffffffu, absv, delta));
+        }
+        const float x_scale = absv * (1.0f / 127.0f);
+        const float x_scale_inv = (absv > 0.0f) ? (127.0f / absv) : 0.0f;
+        const int q = __float2int_rn(v * x_scale_inv);
+        sx_i8[b * 32 + lane] = static_cast<int8_t>(max(-127, min(127, q)));
+        if (lane == 0) sx_scale[b] = x_scale;
+    }
+    __syncthreads();
+
+    const uint64_t row = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (row >= rows) return;
+    const uint8_t *rowp = weight + row * blocks * 34;
+
+    float sum = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += LANES) {
+        const uint8_t *p = rowp + b * 34;
+        const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+        const float w_scale = fp16_to_f32_device(dh);
+        const float x_scale = sx_scale[b];
+
+        int32_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            const uint8_t *pw = p + 2 + k * 4;
+            const int32_t w_pack = static_cast<int32_t>(pw[0])
+                                 | (static_cast<int32_t>(pw[1]) << 8)
+                                 | (static_cast<int32_t>(pw[2]) << 16)
+                                 | (static_cast<int32_t>(pw[3]) << 24);
+            const int32_t x_pack = *reinterpret_cast<const int32_t *>(sx_i8 + b * 32 + k * 4);
+            acc = __dp4a(w_pack, x_pack, acc);
+        }
+        sum += w_scale * x_scale * static_cast<float>(acc);
+    }
+    for (int delta = 16; delta > 0; delta >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, delta);
+    }
+    if (lane == 0) out_ptr[row] = sum;
+}
+
+// Pre-DP4A path: read x as floats from shmem or global. Used when the
+// shmem budget for the pre-quantized layout (cols + blocks*sizeof(float))
+// doesn't fit.
+template <uint32_t WARPS_PER_BLOCK, bool USE_SHMEM>
+__global__ void q8_matvec_v2_kernel(float *out,
+                                    const uint8_t *weight,
+                                    const float *x,
+                                    uint64_t rows,
+                                    uint64_t cols,
+                                    uint32_t in_stride,
+                                    uint32_t out_stride) {
+    constexpr uint32_t LANES = 32;
+    constexpr uint32_t THREADS = WARPS_PER_BLOCK * LANES;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp = tid / LANES;
+    const uint32_t lane = tid % LANES;
+    const uint32_t b_idx = blockIdx.y;
+    const uint64_t row = blockIdx.x * WARPS_PER_BLOCK + warp;
+    const uint64_t blocks = cols / 32;
+    const float *x_ptr = x + static_cast<uint64_t>(b_idx) * in_stride;
+    float *out_ptr = out + static_cast<uint64_t>(b_idx) * out_stride;
+
+    extern __shared__ float sx[];
+    if (USE_SHMEM) {
+        for (uint64_t i = tid; i < cols; i += THREADS) sx[i] = x_ptr[i];
+        __syncthreads();
+    }
+    if (row >= rows) return;
+    const uint8_t *rowp = weight + row * blocks * 34;
+    const float *xptr = USE_SHMEM ? sx : x_ptr;
+
+    float sum = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += LANES) {
         const uint8_t *p = rowp + b * 34;
         const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
         const float d = fp16_to_f32_device(dh);
         const int8_t *qs = reinterpret_cast<const int8_t *>(p + 2);
-        const float *xb = x + b * 32;
-        for (uint32_t i = 0; i < 32; ++i) sum += d * static_cast<float>(qs[i]) * xb[i];
+        const float *xb = xptr + b * 32;
+        float local = 0.0f;
+        #pragma unroll
+        for (uint32_t i = 0; i < 32; ++i) local += static_cast<float>(qs[i]) * xb[i];
+        sum += d * local;
     }
-    scratch[tid] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
-        __syncthreads();
+    for (int delta = 16; delta > 0; delta >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, delta);
     }
-    if (tid == 0) out[row] = scratch[0];
+    if (lane == 0) out_ptr[row] = sum;
 }
 
 __global__ void q8_dequant_f32_kernel(float *out, const uint8_t *weight, uint64_t rows, uint64_t cols) {
@@ -190,6 +429,12 @@ __global__ void q8_dequant_f32_kernel(float *out, const uint8_t *weight, uint64_
     const int8_t q = reinterpret_cast<const int8_t *>(p + 2)[inb];
     out[row * cols + col] = fp16_to_f32_device(dh) * static_cast<float>(q);
 }
+
+// Returns the largest dynamic shmem size we will reserve per Q8 matvec block.
+// Caches the device's max-opt-in shmem size and (best effort) opts the
+// shmem-staged matvec kernel into using it. Returns 0 if no kernel
+// instantiation is currently available to opt in.
+size_t q8_matvec_max_shmem(uint32_t warps_per_block);
 
 DeviceStatus dequant_q8_to_f32(float **out_ptr, const CudaWeight &w, bool persistent_cache) {
     if (!out_ptr) return {false, "dequant_q8_to_f32 out_ptr is null"};
@@ -213,6 +458,44 @@ DeviceStatus dequant_q8_to_f32(float **out_ptr, const CudaWeight &w, bool persis
     }
     *out_ptr = target;
     return {};
+}
+
+size_t q8_matvec_max_shmem() {
+    static size_t cached = SIZE_MAX;
+    if (cached != SIZE_MAX) return cached;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        cached = 48 * 1024;
+        return cached;
+    }
+    int max_shmem_optin = 0;
+    cudaDeviceGetAttribute(&max_shmem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    const size_t budget = max_shmem_optin > 4096 ? static_cast<size_t>(max_shmem_optin) - 4096
+                                                 : static_cast<size_t>(48 * 1024);
+    auto opt_in = [&](const void *kernel) {
+        cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(budget));
+    };
+    opt_in(reinterpret_cast<const void *>(&q8_matvec_v2_kernel<8, true>));
+    opt_in(reinterpret_cast<const void *>(&q8_matvec_v2_kernel<16, true>));
+    opt_in(reinterpret_cast<const void *>(&q8_matvec_v2_kernel<32, true>));
+    opt_in(reinterpret_cast<const void *>(&q8_matvec_dp4a_kernel<8>));
+    opt_in(reinterpret_cast<const void *>(&q8_matvec_dp4a_kernel<16>));
+    opt_in(reinterpret_cast<const void *>(&q8_matvec_dp4a_kernel<32>));
+    // Tiled matmul kernels (BATCH_TILE x WARPS_PER_BLOCK) used by prefill.
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<8,  2>));
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<16, 2>));
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<32, 2>));
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<8,  4>));
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<16, 4>));
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<32, 4>));
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<8,  8>));
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<16, 8>));
+    opt_in(reinterpret_cast<const void *>(&q8_matmul_tiled_dp4a_kernel<32, 8>));
+    cached = budget;
+    return cached;
 }
 
 DeviceStatus ensure_q8_f32_cache(CudaWeight &w) {
@@ -333,12 +616,14 @@ __global__ void rmsnorm_per_head_kernel(float *x,
                                         uint32_t n_units,
                                         uint32_t per_unit_stride,
                                         uint32_t head_dim,
+                                        uint32_t batch_stride,
                                         float eps) {
     const uint32_t unit = blockIdx.x;
+    const uint32_t b    = blockIdx.y;
     const uint32_t tid = threadIdx.x;
     if (unit >= n_units) return;
     __shared__ float scratch[256];
-    float *base = x + unit * per_unit_stride;
+    float *base = x + static_cast<uint64_t>(b) * batch_stride + unit * per_unit_stride;
     float sum = 0.0f;
     for (uint32_t i = tid; i < head_dim; i += blockDim.x) sum += base[i] * base[i];
     scratch[tid] = sum;
@@ -355,16 +640,18 @@ __global__ void rope_partial_kernel(float *x,
                                     uint32_t n_units,
                                     uint32_t per_unit_stride,
                                     uint32_t rope_dim,
-                                    uint32_t pos,
+                                    uint32_t base_pos,
+                                    uint32_t batch_stride,
                                     float theta) {
     const uint32_t unit = blockIdx.x;
+    const uint32_t b    = blockIdx.y;
     const uint32_t i = threadIdx.x;
     if (unit >= n_units) return;
     const uint32_t half = rope_dim / 2;
     if (i >= half) return;
-    float *base = x + unit * per_unit_stride;
+    float *base = x + static_cast<uint64_t>(b) * batch_stride + unit * per_unit_stride;
     const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) / static_cast<float>(rope_dim));
-    const float angle = static_cast<float>(pos) * inv_freq;
+    const float angle = static_cast<float>(base_pos + b) * inv_freq;
     float c, s;
     __sincosf(angle, &s, &c);
     const float x0 = base[i];
@@ -373,10 +660,16 @@ __global__ void rope_partial_kernel(float *x,
     base[i + half] = x0 * s + x1 * c;
 }
 
-__global__ void kv_append_kernel(float *cache, const float *src, uint32_t pos, uint32_t per_pos_size) {
+__global__ void kv_append_kernel(float *cache,
+                                 const float *src,
+                                 uint32_t base_pos,
+                                 uint32_t per_pos_size,
+                                 uint32_t src_stride) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t b = blockIdx.y;
     if (i >= per_pos_size) return;
-    cache[static_cast<uint64_t>(pos) * per_pos_size + i] = src[i];
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] = src_row[i];
 }
 
 __global__ void attention_decode_qk_kernel(float *scores,
@@ -473,18 +766,114 @@ __global__ void attention_decode_av_kernel(float *out,
     out[static_cast<uint64_t>(head) * head_dim + d] = acc;
 }
 
+// Fused single-token SDPA decode (1 kernel instead of qk+softmax+av) with
+// online softmax. One block per query head. HEAD_DIM=128 (Qwen3.5).
+//
+// Online softmax: process the KV stream in tiles of TILE tokens, maintain
+// running (max, sum, acc):
+//   new_max  = max(running_max, tile_max)
+//   scale    = exp(running_max - new_max)
+//   running_sum = scale * running_sum + sum_i exp(score_i - new_max)
+//   running_acc = scale * running_acc + sum_i exp(score_i - new_max) * V_i
+// This avoids materializing the scores tensor and reads K,V once per call.
+template <uint32_t HEAD_DIM, uint32_t TILE>
+__global__ void attention_decode_fused_kernel(float *out,
+                                              const float *q,
+                                              uint32_t q_stride,
+                                              const float *k_cache,
+                                              const float *v_cache,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t base_seq_len,
+                                              uint32_t q_batch_stride,
+                                              uint32_t out_batch_stride,
+                                              float scale) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t b    = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_heads) return;
+    // Causal: batch position b attends to base_seq_len + b + 1 tokens.
+    const uint32_t seq_len = base_seq_len + b + 1;
+    const uint32_t kv_head = head / (n_heads / n_kv_heads);
+
+    __shared__ float s_q[HEAD_DIM];
+    __shared__ float s_scores[TILE];
+    __shared__ float warp_sums[HEAD_DIM / 32];
+
+    const float *q_ptr = q + static_cast<uint64_t>(b) * q_batch_stride;
+    float       *out_ptr = out + static_cast<uint64_t>(b) * out_batch_stride;
+    s_q[tid] = q_ptr[head * q_stride + tid];
+    __syncthreads();
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc = 0.0f;
+
+    const uint32_t warp = tid / 32;
+    const uint32_t lane = tid % 32;
+    constexpr uint32_t WARPS = HEAD_DIM / 32;
+
+    for (uint32_t t0 = 0; t0 < seq_len; t0 += TILE) {
+        const uint32_t this_tile = (seq_len - t0 < TILE) ? (seq_len - t0) : TILE;
+
+        // Score each token in the tile via a cooperative dot product.
+        for (uint32_t i = 0; i < this_tile; ++i) {
+            const uint32_t t = t0 + i;
+            const float *k_t = k_cache + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM + kv_head * HEAD_DIM;
+            float local = s_q[tid] * k_t[tid];
+            for (int delta = 16; delta > 0; delta >>= 1) {
+                local += __shfl_xor_sync(0xffffffffu, local, delta);
+            }
+            if (lane == 0) warp_sums[warp] = local;
+            __syncthreads();
+            if (tid == 0) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (uint32_t w = 0; w < WARPS; ++w) dot += warp_sums[w];
+                s_scores[i] = dot * scale;
+            }
+            __syncthreads();
+        }
+
+        float tile_max = -INFINITY;
+        for (uint32_t i = 0; i < this_tile; ++i) {
+            const float v = s_scores[i];
+            if (v > tile_max) tile_max = v;
+        }
+        const float new_max = fmaxf(running_max, tile_max);
+        const float prev_scale = (running_max == -INFINITY) ? 0.0f : __expf(running_max - new_max);
+        running_sum = running_sum * prev_scale;
+        acc = acc * prev_scale;
+        for (uint32_t i = 0; i < this_tile; ++i) {
+            const float w = __expf(s_scores[i] - new_max);
+            const uint32_t t = t0 + i;
+            const float *v_t = v_cache + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM + kv_head * HEAD_DIM;
+            running_sum += w;
+            acc += w * v_t[tid];
+        }
+        running_max = new_max;
+    }
+
+    out_ptr[head * HEAD_DIM + tid] = acc / running_sum;
+}
+
 __global__ void apply_attn_gate_kernel(float *out,
                                        const float *q,
                                        uint32_t q_stride,
                                        uint32_t n_heads,
-                                       uint32_t head_dim) {
+                                       uint32_t head_dim,
+                                       uint32_t batch_stride_q,
+                                       uint32_t batch_stride_out) {
     const uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t b = blockIdx.y;
     const uint64_t total = static_cast<uint64_t>(n_heads) * head_dim;
     if (i >= total) return;
     const uint32_t head = static_cast<uint32_t>(i / head_dim);
     const uint32_t d = static_cast<uint32_t>(i % head_dim);
-    const float gate = q[head * q_stride + head_dim + d];
-    out[i] *= 1.0f / (1.0f + expf(-gate));
+    const float *qp = q + static_cast<uint64_t>(b) * batch_stride_q;
+    float       *op = out + static_cast<uint64_t>(b) * batch_stride_out;
+    const float gate = qp[head * q_stride + head_dim + d];
+    op[i] *= 1.0f / (1.0f + expf(-gate));
 }
 
 __global__ void attention_norm_mid_kernel(float *mid,
@@ -535,6 +924,7 @@ public:
 
     ~CudaDeviceBackend() override {
         if (cublas_handle_) cublasDestroy(cublas_handle_);
+        if (rows_buf_) cudaFree(rows_buf_);
     }
 
     const char *name() const override {
@@ -576,12 +966,37 @@ public:
         return launch_status("cuda q8_0_get_row");
     }
 
+    DeviceStatus q8_0_get_rows_batch(DeviceTensor &out,
+                                     const DeviceWeight &weight,
+                                     const uint64_t *rows,
+                                     uint32_t batch) override {
+        if (batch == 0) return {};
+        const auto &w = as_weight(weight);
+        auto &o = as_tensor(out);
+        // Upload row indices to device (small, one transfer).
+        if (rows_buf_capacity_ < batch) {
+            if (rows_buf_) cudaFree(rows_buf_);
+            cudaMalloc(&rows_buf_, batch * sizeof(uint64_t));
+            rows_buf_capacity_ = batch;
+        }
+        cudaMemcpyAsync(rows_buf_, rows, batch * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        const unsigned threads = 256;
+        const unsigned bx = static_cast<unsigned>((w.cols + threads - 1) / threads);
+        dim3 grid(bx, batch);
+        q8_get_rows_batch_kernel<<<grid, threads>>>(o.ptr, static_cast<const uint8_t *>(w.ptr),
+                                                    rows_buf_, w.cols);
+        return launch_status("cuda q8_0_get_rows_batch");
+    }
+
     DeviceStatus q8_0_matvec(DeviceTensor &out, const DeviceWeight &weight, const DeviceTensor &x) override {
         auto &w = const_cast<CudaWeight &>(as_weight(weight));
         auto &o = as_tensor(out);
         const auto &input = as_tensor(x);
-        const bool use_cublas = linear_backend_ == LinearBackend::Cublas ||
-            (linear_backend_ == LinearBackend::Auto && w.rows >= 1024 && w.cols >= 1024);
+        // The cuBLAS-Sgemv-on-F32-dequant-cache path was an early shortcut. It
+        // reads 4x more bytes per matvec (F32 cache vs Q8 weight) so even though
+        // it uses tensor cores, it loses to a properly tuned Q8 kernel for the
+        // single-token decode workload. Only switch to it when explicitly asked.
+        const bool use_cublas = linear_backend_ == LinearBackend::Cublas;
         if (use_cublas) {
             // Only take the cuBLAS path when the F32 dequant fits in our
             // persistent per-weight cache. Otherwise the previous behaviour
@@ -618,9 +1033,125 @@ public:
                 (void) cudaGetLastError();
             }
         }
-        q8_matvec_kernel<<<static_cast<unsigned>(w.rows), 256>>>(o.ptr, static_cast<const uint8_t *>(w.ptr), input.ptr, w.rows, w.cols);
+        // Pick WARPS_PER_BLOCK so each block has enough rows-per-block to
+        // amortize the shared input-vector load while still launching enough
+        // blocks to saturate all SMs.
+        //   - small matvecs (KV proj, alpha/beta): 8 warps, max parallelism
+        //   - mid (output proj, ffn_down, attn_q): 16 warps
+        //   - big rows (ffn_gate/up, LM head): 32 warps, fewer redundant input reads
+        // Shmem budget per layout:
+        //   - DP4A path  : cols * 1 (i8) + blocks * 4 (f32 scale per block)
+        //   - F32 fallback: cols * 4 (f32 staging)
+        return dispatch_q8_matvec(o.ptr, w, input.ptr, /*batch=*/1, /*in_stride=*/0, /*out_stride=*/0);
+    }
+
+    DeviceStatus q8_0_matmul(DeviceTensor &out,
+                             const DeviceWeight &weight,
+                             const DeviceTensor &x,
+                             uint32_t batch,
+                             uint32_t in_stride,
+                             uint32_t out_stride) override {
+        auto &w = const_cast<CudaWeight &>(as_weight(weight));
+        auto &o = as_tensor(out);
+        const auto &input = as_tensor(x);
+        if (batch == 0) return {};
+        return dispatch_q8_matvec(o.ptr, w, input.ptr, batch, in_stride, out_stride);
+    }
+
+private:
+    DeviceStatus dispatch_q8_matvec(float *out_ptr,
+                                    CudaWeight &w,
+                                    const float *x_ptr,
+                                    uint32_t batch,
+                                    uint32_t in_stride,
+                                    uint32_t out_stride) {
+        // Shmem budget per layout:
+        //   - DP4A path  : cols * 1 (i8) + blocks * 4 (f32 scale per block)
+        //   - F32 fallback: cols * 4 (f32 staging)
+        const size_t shmem_dp4a = static_cast<size_t>(w.cols) + static_cast<size_t>(w.cols / 32) * sizeof(float);
+        const size_t shmem_f32  = static_cast<size_t>(w.cols) * sizeof(float);
+        const size_t shmem_limit = q8_matvec_max_shmem();
+        const uint64_t rows = w.rows;
+        const bool use_dp4a = shmem_dp4a <= shmem_limit;
+        const bool fits_f32_shmem = shmem_f32 <= shmem_limit;
+
+        // Empirical: for Qwen 3.6 27B Q8_0 on Pro 6000 the per-batch kernel
+        // already amortizes W reads through L2 (89 MB FFN weight fits the
+        // ~128 MB L2), so the tiled kernel's higher shmem use and lower
+        // occupancy made prefill *slower*. Keep it gated off for now.
+        if (false && batch > 1 && use_dp4a) {
+            const size_t dp4a8 = shmem_dp4a * 8;
+            const size_t dp4a4 = shmem_dp4a * 4;
+            const size_t dp4a2 = shmem_dp4a * 2;
+            auto launch_tiled = [&](auto tile, auto warps) {
+                constexpr uint32_t T = decltype(tile)::value;
+                constexpr uint32_t W = decltype(warps)::value;
+                const unsigned by = (batch + T - 1) / T;
+                const unsigned bx = static_cast<unsigned>((rows + W - 1) / W);
+                dim3 grid(bx, by);
+                q8_matmul_tiled_dp4a_kernel<W, T>
+                    <<<grid, W * 32, shmem_dp4a * T>>>(
+                        out_ptr, static_cast<const uint8_t *>(w.ptr), x_ptr,
+                        rows, w.cols, batch, in_stride, out_stride);
+            };
+            const auto warps_for_rows = [&]() {
+                if (rows >= 16384) return 32u;
+                if (rows >= 2048) return 16u;
+                return 8u;
+            };
+            const uint32_t W = warps_for_rows();
+            if (dp4a8 <= shmem_limit && batch >= 8) {
+                if (W == 32) launch_tiled(std::integral_constant<uint32_t, 8>{}, std::integral_constant<uint32_t, 32>{});
+                else if (W == 16) launch_tiled(std::integral_constant<uint32_t, 8>{}, std::integral_constant<uint32_t, 16>{});
+                else launch_tiled(std::integral_constant<uint32_t, 8>{}, std::integral_constant<uint32_t, 8>{});
+                return launch_status("cuda q8_matmul tiled8");
+            }
+            if (dp4a4 <= shmem_limit && batch >= 4) {
+                if (W == 32) launch_tiled(std::integral_constant<uint32_t, 4>{}, std::integral_constant<uint32_t, 32>{});
+                else if (W == 16) launch_tiled(std::integral_constant<uint32_t, 4>{}, std::integral_constant<uint32_t, 16>{});
+                else launch_tiled(std::integral_constant<uint32_t, 4>{}, std::integral_constant<uint32_t, 8>{});
+                return launch_status("cuda q8_matmul tiled4");
+            }
+            if (dp4a2 <= shmem_limit) {
+                if (W == 32) launch_tiled(std::integral_constant<uint32_t, 2>{}, std::integral_constant<uint32_t, 32>{});
+                else if (W == 16) launch_tiled(std::integral_constant<uint32_t, 2>{}, std::integral_constant<uint32_t, 16>{});
+                else launch_tiled(std::integral_constant<uint32_t, 2>{}, std::integral_constant<uint32_t, 8>{});
+                return launch_status("cuda q8_matmul tiled2");
+            }
+            // Fall through to per-batch kernel below.
+        }
+
+        auto dispatch = [&](auto warps) {
+            constexpr uint32_t W = decltype(warps)::value;
+            const unsigned blocks_grid = static_cast<unsigned>((rows + W - 1) / W);
+            dim3 grid(blocks_grid, batch);
+            if (use_dp4a) {
+                q8_matvec_dp4a_kernel<W>
+                    <<<grid, W * 32, shmem_dp4a>>>(
+                        out_ptr, static_cast<const uint8_t *>(w.ptr), x_ptr,
+                        rows, w.cols, in_stride, out_stride);
+            } else if (fits_f32_shmem) {
+                q8_matvec_v2_kernel<W, true>
+                    <<<grid, W * 32, shmem_f32>>>(
+                        out_ptr, static_cast<const uint8_t *>(w.ptr), x_ptr,
+                        rows, w.cols, in_stride, out_stride);
+            } else {
+                q8_matvec_v2_kernel<W, false>
+                    <<<grid, W * 32, 0>>>(
+                        out_ptr, static_cast<const uint8_t *>(w.ptr), x_ptr,
+                        rows, w.cols, in_stride, out_stride);
+            }
+        };
+        if (rows >= 16384) {
+            dispatch(std::integral_constant<uint32_t, 32>{});
+        } else if (rows >= 2048) {
+            dispatch(std::integral_constant<uint32_t, 16>{});
+        } else {
+            dispatch(std::integral_constant<uint32_t, 8>{});
+        }
         return launch_status("cuda q8_0_matvec");
     }
+public:
 
     DeviceStatus rms_norm(DeviceTensor &out, const DeviceTensor &x, const DeviceWeight &weight, float eps) override {
         auto &o = as_tensor(out);
@@ -628,6 +1159,21 @@ public:
         const auto &w = as_weight(weight);
         rms_norm_kernel<<<1, 256>>>(o.ptr, input.ptr, static_cast<const float *>(w.ptr), input.count, eps);
         return launch_status("cuda rms_norm");
+    }
+
+    DeviceStatus rms_norm_batch(DeviceTensor &out,
+                                const DeviceTensor &x,
+                                const DeviceWeight &weight,
+                                uint32_t batch,
+                                uint32_t n,
+                                float eps) override {
+        auto &o = as_tensor(out);
+        const auto &input = as_tensor(x);
+        const auto &w = as_weight(weight);
+        if (batch == 0) return {};
+        // One block per row; existing kernel reads blockIdx.x as the row index.
+        rms_norm_kernel<<<batch, 256>>>(o.ptr, input.ptr, static_cast<const float *>(w.ptr), n, eps);
+        return launch_status("cuda rms_norm_batch");
     }
 
     DeviceStatus add(DeviceTensor &out, const DeviceTensor &a, const DeviceTensor &b) override {
@@ -653,9 +1199,19 @@ public:
         return launch_status("cuda mul");
     }
 
+    DeviceStatus silu_mul(DeviceTensor &out, const DeviceTensor &gate, const DeviceTensor &up) override {
+        auto &o = as_tensor(out);
+        const auto &g = as_tensor(gate);
+        const auto &u = as_tensor(up);
+        silu_mul_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256>>>(
+            o.ptr, g.ptr, u.ptr, o.count);
+        return launch_status("cuda silu_mul");
+    }
+
     DeviceStatus recurrent_single_token(DeviceTensor &core,
                                         DeviceTensor &state,
                                         DeviceTensor &conv_state,
+                                        DeviceTensor &conv_out,
                                         const DeviceTensor &proj,
                                         const DeviceTensor &gate,
                                         const DeviceTensor &alpha,
@@ -673,6 +1229,7 @@ public:
         auto &c = as_tensor(core);
         auto &s = as_tensor(state);
         auto &cs = as_tensor(conv_state);
+        auto &cout = as_tensor(conv_out);
         const auto &p = as_tensor(proj);
         const auto &g = as_tensor(gate);
         const auto &a = as_tensor(alpha);
@@ -681,9 +1238,7 @@ public:
         const auto &aw = as_weight(ssm_a);
         const auto &dt = as_weight(dt_bias);
         const auto &nw = as_weight(ssm_norm);
-        float *conv_buf = nullptr;
-        const size_t conv_bytes = static_cast<size_t>(p.count) * sizeof(float);
-        if (auto st = cuda_status(cudaMalloc(&conv_buf, conv_bytes), "cuda recurrent temp"); !st.ok) return st;
+        float *conv_buf = cout.ptr;
         recurrent_conv_kernel<<<static_cast<unsigned>((p.count + 255) / 256), 256>>>(
             conv_buf, cs.ptr, p.ptr, static_cast<const float *>(cw.ptr),
             static_cast<uint32_t>(p.count), conv_kernel_size);
@@ -702,9 +1257,67 @@ public:
                                        head_k_dim,
                                        head_v_dim);
         recurrent_norm_gate_kernel<<<num_v_heads, head_v_dim>>>(c.ptr, g.ptr, static_cast<const float *>(nw.ptr), num_v_heads, head_v_dim, eps);
-        DeviceStatus st = launch_status("cuda recurrent_single_token");
-        cudaFree(conv_buf);
-        return st;
+        return launch_status("cuda recurrent_single_token");
+    }
+
+    DeviceStatus recurrent_single_token_at(DeviceTensor &core,
+                                            DeviceTensor &state,
+                                            DeviceTensor &conv_state,
+                                            DeviceTensor &conv_out,
+                                            const DeviceTensor &proj,
+                                            const DeviceTensor &gate,
+                                            const DeviceTensor &alpha,
+                                            const DeviceTensor &beta,
+                                            const DeviceWeight &conv,
+                                            const DeviceWeight &ssm_a,
+                                            const DeviceWeight &dt_bias,
+                                            const DeviceWeight &ssm_norm,
+                                            uint32_t num_k_heads,
+                                            uint32_t num_v_heads,
+                                            uint32_t head_k_dim,
+                                            uint32_t head_v_dim,
+                                            uint32_t conv_kernel_size,
+                                            uint32_t proj_count,
+                                            uint32_t proj_off,
+                                            uint32_t gate_off,
+                                            uint32_t alpha_off,
+                                            uint32_t beta_off,
+                                            uint32_t core_off,
+                                            float eps) override {
+        auto &c = as_tensor(core);
+        auto &s = as_tensor(state);
+        auto &cs = as_tensor(conv_state);
+        auto &cout = as_tensor(conv_out);
+        const auto &p = as_tensor(proj);
+        const auto &g = as_tensor(gate);
+        const auto &a = as_tensor(alpha);
+        const auto &b = as_tensor(beta);
+        const auto &cw = as_weight(conv);
+        const auto &aw = as_weight(ssm_a);
+        const auto &dt = as_weight(dt_bias);
+        const auto &nw = as_weight(ssm_norm);
+        float *conv_buf = cout.ptr;
+        recurrent_conv_kernel<<<static_cast<unsigned>((proj_count + 255) / 256), 256>>>(
+            conv_buf, cs.ptr, p.ptr + proj_off, static_cast<const float *>(cw.ptr),
+            proj_count, conv_kernel_size);
+        l2_norm_128_kernel<<<num_k_heads, 128>>>(conv_buf, num_k_heads, head_k_dim, eps);
+        l2_norm_128_kernel<<<num_k_heads, 128>>>(conv_buf + num_k_heads * head_k_dim, num_k_heads, head_k_dim, eps);
+        dim3 grid(num_v_heads, head_v_dim);
+        deltanet_kernel<<<grid, 128>>>(c.ptr + core_off,
+                                       s.ptr,
+                                       conv_buf,
+                                       a.ptr + alpha_off,
+                                       b.ptr + beta_off,
+                                       static_cast<const float *>(aw.ptr),
+                                       static_cast<const float *>(dt.ptr),
+                                       num_k_heads,
+                                       num_v_heads,
+                                       head_k_dim,
+                                       head_v_dim);
+        recurrent_norm_gate_kernel<<<num_v_heads, head_v_dim>>>(c.ptr + core_off, g.ptr + gate_off,
+                                                                static_cast<const float *>(nw.ptr),
+                                                                num_v_heads, head_v_dim, eps);
+        return launch_status("cuda recurrent_single_token_at");
     }
 
     DeviceStatus zero_tensor(DeviceTensor &x) override {
@@ -750,10 +1363,29 @@ public:
                                    float eps) override {
         auto &t = as_tensor(x);
         const auto &w = as_weight(weight);
-        rmsnorm_per_head_kernel<<<n_units, 256>>>(t.ptr,
-                                                  static_cast<const float *>(w.ptr),
-                                                  n_units, per_unit_stride, head_dim, eps);
+        dim3 grid(n_units, 1);
+        rmsnorm_per_head_kernel<<<grid, 256>>>(t.ptr,
+                                                static_cast<const float *>(w.ptr),
+                                                n_units, per_unit_stride, head_dim, /*batch_stride=*/0, eps);
         return launch_status("cuda rmsnorm_per_head");
+    }
+
+    DeviceStatus rmsnorm_per_head_batch(DeviceTensor &x,
+                                         const DeviceWeight &weight,
+                                         uint32_t batch,
+                                         uint32_t batch_stride,
+                                         uint32_t n_units,
+                                         uint32_t per_unit_stride,
+                                         uint32_t head_dim,
+                                         float eps) override {
+        if (batch == 0) return {};
+        auto &t = as_tensor(x);
+        const auto &w = as_weight(weight);
+        dim3 grid(n_units, batch);
+        rmsnorm_per_head_kernel<<<grid, 256>>>(t.ptr,
+                                                static_cast<const float *>(w.ptr),
+                                                n_units, per_unit_stride, head_dim, batch_stride, eps);
+        return launch_status("cuda rmsnorm_per_head_batch");
     }
 
     DeviceStatus rope_partial(DeviceTensor &x,
@@ -765,8 +1397,26 @@ public:
         auto &t = as_tensor(x);
         const uint32_t half = rope_dim / 2;
         if (half == 0) return {};
-        rope_partial_kernel<<<n_units, half>>>(t.ptr, n_units, per_unit_stride, rope_dim, pos, theta);
+        dim3 grid(n_units, 1);
+        rope_partial_kernel<<<grid, half>>>(t.ptr, n_units, per_unit_stride, rope_dim, pos, /*batch_stride=*/0, theta);
         return launch_status("cuda rope_partial");
+    }
+
+    DeviceStatus rope_partial_batch(DeviceTensor &x,
+                                    uint32_t batch,
+                                    uint32_t batch_stride,
+                                    uint32_t n_units,
+                                    uint32_t per_unit_stride,
+                                    uint32_t rope_dim,
+                                    uint32_t base_pos,
+                                    float theta) override {
+        if (batch == 0) return {};
+        auto &t = as_tensor(x);
+        const uint32_t half = rope_dim / 2;
+        if (half == 0) return {};
+        dim3 grid(n_units, batch);
+        rope_partial_kernel<<<grid, half>>>(t.ptr, n_units, per_unit_stride, rope_dim, base_pos, batch_stride, theta);
+        return launch_status("cuda rope_partial_batch");
     }
 
     DeviceStatus kv_append(DeviceTensor &cache,
@@ -777,8 +1427,24 @@ public:
         const auto &s = as_tensor(src);
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
-        kv_append_kernel<<<blocks, threads>>>(c.ptr, s.ptr, pos, per_pos_size);
+        dim3 grid(blocks, 1);
+        kv_append_kernel<<<grid, threads>>>(c.ptr, s.ptr, pos, per_pos_size, /*src_stride=*/0);
         return launch_status("cuda kv_append");
+    }
+
+    DeviceStatus kv_append_batch(DeviceTensor &cache,
+                                 const DeviceTensor &src,
+                                 uint32_t base_pos,
+                                 uint32_t per_pos_size,
+                                 uint32_t batch) override {
+        if (batch == 0) return {};
+        auto &c = as_tensor(cache);
+        const auto &s = as_tensor(src);
+        const unsigned threads = 256;
+        const unsigned blocks = (per_pos_size + threads - 1) / threads;
+        dim3 grid(blocks, batch);
+        kv_append_kernel<<<grid, threads>>>(c.ptr, s.ptr, base_pos, per_pos_size, per_pos_size);
+        return launch_status("cuda kv_append_batch");
     }
 
     DeviceStatus attention_decode(DeviceTensor &out,
@@ -793,10 +1459,28 @@ public:
                                    uint32_t seq_len,
                                    float scale) override {
         auto &o = as_tensor(out);
-        auto &s = as_tensor(scores_scratch);
         const auto &qq = as_tensor(q);
         const auto &kc = as_tensor(k_cache);
         const auto &vc = as_tensor(v_cache);
+        if (head_dim == 128) {
+            // Fused flash-attention-style decode: 1 kernel, no scores materialization.
+            dim3 grid(n_heads, 1);
+            attention_decode_fused_kernel<128, 64><<<grid, 128>>>(
+                o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                n_heads, n_kv_heads, /*base_seq_len=*/seq_len - 1,
+                /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale);
+            return launch_status("cuda attn fused");
+        }
+        if (head_dim == 256) {
+            dim3 grid(n_heads, 1);
+            attention_decode_fused_kernel<256, 64><<<grid, 256>>>(
+                o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                n_heads, n_kv_heads, /*base_seq_len=*/seq_len - 1,
+                /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale);
+            return launch_status("cuda attn fused 256");
+        }
+        // Fallback for unexpected head dims.
+        auto &s = as_tensor(scores_scratch);
         dim3 grid_qk(n_heads, seq_len);
         attention_decode_qk_kernel<<<grid_qk, 256>>>(s.ptr, qq.ptr, q_stride, kc.ptr,
                                                     n_heads, n_kv_heads, head_dim, seq_len, scale);
@@ -818,8 +1502,65 @@ public:
         const uint64_t total = static_cast<uint64_t>(n_heads) * head_dim;
         const unsigned threads = 256;
         const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
-        apply_attn_gate_kernel<<<blocks, threads>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim);
+        dim3 grid(blocks, 1);
+        apply_attn_gate_kernel<<<grid, threads>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim, 0, 0);
         return launch_status("cuda apply_attn_gate");
+    }
+
+    DeviceStatus apply_attn_gate_batch(DeviceTensor &out,
+                                        const DeviceTensor &q,
+                                        uint32_t q_stride,
+                                        uint32_t batch,
+                                        uint32_t batch_stride_q,
+                                        uint32_t batch_stride_out,
+                                        uint32_t n_heads,
+                                        uint32_t head_dim) override {
+        if (batch == 0) return {};
+        auto &o = as_tensor(out);
+        const auto &qq = as_tensor(q);
+        const uint64_t total = static_cast<uint64_t>(n_heads) * head_dim;
+        const unsigned threads = 256;
+        const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
+        dim3 grid(blocks, batch);
+        apply_attn_gate_kernel<<<grid, threads>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim,
+                                                  batch_stride_q, batch_stride_out);
+        return launch_status("cuda apply_attn_gate_batch");
+    }
+
+    DeviceStatus attention_decode_batch(DeviceTensor &out,
+                                         const DeviceTensor &q,
+                                         uint32_t q_stride,
+                                         const DeviceTensor &k_cache,
+                                         const DeviceTensor &v_cache,
+                                         uint32_t n_heads,
+                                         uint32_t n_kv_heads,
+                                         uint32_t head_dim,
+                                         uint32_t base_seq_len,
+                                         uint32_t batch,
+                                         uint32_t q_batch_stride,
+                                         uint32_t out_batch_stride,
+                                         float scale) override {
+        if (batch == 0) return {};
+        auto &o = as_tensor(out);
+        const auto &qq = as_tensor(q);
+        const auto &kc = as_tensor(k_cache);
+        const auto &vc = as_tensor(v_cache);
+        dim3 grid(n_heads, batch);
+        if (head_dim == 128) {
+            attention_decode_fused_kernel<128, 64><<<grid, 128>>>(
+                o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                n_heads, n_kv_heads, base_seq_len,
+                q_batch_stride, out_batch_stride, scale);
+            return launch_status("cuda attention_decode_batch 128");
+        }
+        if (head_dim == 256) {
+            attention_decode_fused_kernel<256, 64><<<grid, 256>>>(
+                o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                n_heads, n_kv_heads, base_seq_len,
+                q_batch_stride, out_batch_stride, scale);
+            return launch_status("cuda attention_decode_batch 256");
+        }
+        return {false, "attention_decode_batch unsupported head_dim"};
     }
 
     DeviceArgmax argmax(const DeviceTensor &x) override {
@@ -847,9 +1588,26 @@ public:
                             "copy_to_host");
     }
 
+    DeviceStatus copy_d2d(DeviceTensor &dst,
+                          const DeviceTensor &src,
+                          uint64_t src_offset,
+                          uint64_t count) override {
+        auto &d = as_tensor(dst);
+        const auto &s = as_tensor(src);
+        if (src_offset + count > s.count) return {false, "copy_d2d src oob"};
+        if (count > d.count) return {false, "copy_d2d dst oob"};
+        return cuda_status(cudaMemcpyAsync(d.ptr,
+                                            s.ptr + src_offset,
+                                            static_cast<size_t>(count) * sizeof(float),
+                                            cudaMemcpyDeviceToDevice),
+                            "copy_d2d");
+    }
+
 private:
     LinearBackend linear_backend_ = LinearBackend::Auto;
     cublasHandle_t cublas_handle_ = nullptr;
+    uint64_t *rows_buf_ = nullptr;
+    uint32_t  rows_buf_capacity_ = 0;
 };
 
 } // namespace
