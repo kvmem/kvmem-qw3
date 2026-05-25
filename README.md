@@ -10,18 +10,31 @@ decode, batched prefill).
 llama.cpp is kept around only as a correctness baseline and benchmarking
 counterpart — it never participates in actual generation.
 
-## Status (Qwen 3.6 27B Q8_0, RTX Pro 6000 Blackwell)
+## Status (Qwen 3.6 27B Q8_0, RTX Pro 6000 Blackwell, CUDA-enabled llama.cpp)
+
+Both engines run greedy (qw3 is always argmax; llama.cpp is invoked with
+`--temp 0`), so a correct implementation would emit identical tokens. The
+benchmark uses a ~1.3K-token prompt so warmup overhead is amortized.
 
 | | qw3 | llama.cpp | qw3 / llama.cpp |
 |---|---|---|---|
-| Prefill (4-prompt avg)   |  70.27 tok/s | 142.6 tok/s |  **49.3%** |
-| Prefill (long prompt N=68)| 93.86 tok/s | 142.6 tok/s |  **65.8%** |
-| Decode (4-prompt avg)    |  35.75 tok/s |  45.3 tok/s |  **78.9%** |
-| First-char match         |  ✓ on every prompt |   —   |  —  |
+| Prefill (1322-tok prompt) | 1031.6 tok/s | 3428.7 tok/s | **30.1%** |
+| Decode  (1322-tok prompt) |   22.6 tok/s |   45.3 tok/s | **49.8%** |
+| First-char match          | ✓ on every prompt | — | — |
 
-Output is semantically aligned with llama.cpp (every first generated token
-matches; common-prefix typically 40–80% of the qw3 output). Sub-sentence
-divergence is floating-point drift, not a logic bug.
+How we got here (prefill on the same long prompt):
+
+| Stage | Prefill tok/s | vs llama.cpp |
+|---|---|---|
+| Baseline (dp4a matvec, batched over T) |   100.6 |   2.9% |
+| + cuBLAS HGEMM (FP16 dequant cache + tensor cores) | 602.0 | 17.6% |
+| + Fused batched recurrent (1 launch / layer / sub-op) | 1031.6 | 30.1% |
+
+With greedy sampling the output streams are identical for the first
+generated chunk (the `<think></think>` chat-template prefix, ~20 tokens),
+then floating-point drift in the Q8 dequant + softmax + recurrent stack
+causes one token to flip and the streams to diverge. This is a numerical
+gap to bit-exactness with llama.cpp, not a logic bug.
 
 ## What's implemented
 
@@ -36,24 +49,31 @@ divergence is floating-point drift, not a logic bug.
   per step.
 - **DP4A Q8_0 matvec** with shmem-staged input pre-quantization, multi-row /
   warp-shuffle reductions, and adaptive `WARPS_PER_BLOCK` (8/16/32 by row
-  count).
-- **Q8_0 matmul** — same kernel batched over `gridDim.y`; the FFN weight is
-  read once and reused across the prompt's N tokens during prefill.
+  count). Used for decode (batch = 1) where dp4a beats tensor cores.
+- **Q8_0 matmul via cuBLAS HGEMM** for prefill (batch >= 8). Each Q8 weight
+  is dequantized to FP16 once (cached on the weight for the lifetime of
+  the process) and the prefill activations are converted FP32 → FP16 per
+  call; cuBLAS picks a tensor-core algorithm automatically.
 - **Fused flash-attention decode**, online softmax, no scores materialization;
   instantiated for both `head_dim=128` and `head_dim=256` (Qwen 3.6 uses 256).
 - **Batched prefill attention** with causal seq_len = `base + b + 1` per
   batch row, also in a single kernel launch per layer.
-- DeltaNet recurrent step: per-layer state + conv1d ring buffer, with an
-  offset-aware variant for the batched prefill path.
+- DeltaNet recurrent step: per-layer state + conv1d ring buffer. Decode uses
+  the per-token kernels; prefill uses **time-batched kernels** that process
+  all T tokens of a layer in 4 kernel launches (conv, l2-norm, deltanet,
+  norm+gate) instead of `5 * T` launches.
 - Other fused kernels: `silu_mul`, batched RMSNorm / RoPE / KV-append /
   attention-gate.
 
 **Executor** (`src/qwen_executor.{hpp,cpp}`)
 - `forward_one_token` — decode path. Single-token forward, ~36 tok/s on
-  Qwen 3.6 27B.
-- `forward_n_tokens` — batched prefill. Single forward pass with batched
-  matmuls + per-token attention/recurrent loops; ~2× faster than the old
-  per-token prefill loop.
+  Qwen 3.6 27B; uses the dp4a matvec for Q8 weights and per-token recurrent
+  kernels.
+- `forward_n_tokens` — batched prefill. All Q8 matmuls go through HGEMM /
+  tensor cores; recurrent layers run the time-batched kernels above; the
+  per-batch attention loop is still O(N²) but vectorized in a single launch.
+  ~10× faster than the original per-token prefill (100 → 1031 tok/s on the
+  1322-token prompt).
 - Pre-allocated scratch (`h_`, `norm_`, `q/k/v_`, `mid_`, `ffn_*`, recurrent
   state) + batched versions allocated on demand by `ensure_batch_scratch`.
 
@@ -129,28 +149,45 @@ Smoke test without weights:
 ## Benchmark against llama.cpp
 
 `scripts/compare_with_llama_cpp.py` (driven by `scripts/run_compare.sh`) runs
-a fixed set of prompts through both engines on the remote machine, comparing
-prefill tok/s, decode tok/s, and output common-prefix length.
+a fixed set of prompts through both engines and reports prefill tok/s,
+decode tok/s, and common-prefix length. Both engines are greedy (qw3 is
+always argmax; llama.cpp is invoked with `--temp 0`), so a correct
+implementation would produce identical output sequences.
+
+Short prompts (< 32 tokens) make prefill numbers noisy because per-process
+warmup dominates. For stable measurements use the **long-prompt** mode,
+which adds (or substitutes) a single ~1.3K-token prompt:
 
 ```sh
-# By default both binaries live on the remote Pro6000 host the script
-# was wired for; edit the env vars in run_compare.sh for your setup.
-bash scripts/run_compare.sh
+# Default prompt set (4 short prompts):
+bash scripts/run_compare.sh -n 64
+
+# Add the 1322-token prompt to the default set:
+bash scripts/run_compare.sh --long -n 128
+
+# Run only the long prompt (best for prefill benchmarking):
+bash scripts/run_compare.sh --long-only -n 128 --token-diff
 ```
 
-The Python entry point is also runnable directly:
+`--token-diff` re-tokenizes both engines' outputs via qw3 and reports the
+common token-level prefix length and whether the full token sequences are
+identical.
+
+The Python entry point is runnable directly with the same flags:
 
 ```sh
 python3 scripts/compare_with_llama_cpp.py \
   --qw3   ./build-cuda/qw3 \
   --llama /path/to/llama.cpp/build/bin/llama-completion \
   --model /path/to/Qwen3.6-27B-Q8_0.gguf \
-  --tokens 32
+  --long-only -n 128 --token-diff
 ```
 
-llama.cpp is invoked through `llama-completion` (not `llama-cli`) for
-deterministic, non-interactive execution. The script tolerates `inf` rates
-when prefill is too fast to time.
+llama.cpp must be built with `-DGGML_CUDA=ON` for a meaningful comparison
+on this GPU — the CPU build hits ~2 tok/s decode and ~50 tok/s prefill,
+which would make qw3 look fast for the wrong reason. The script invokes
+llama.cpp through `llama-completion` (not `llama-cli`) for deterministic,
+non-interactive execution.
 
 ## Logit-level parity diffs
 
@@ -200,13 +237,20 @@ description.
 
 ## Known remaining gaps vs llama.cpp
 
-- **Prefill (~50% of llama.cpp).** Limited by Q8 weight read bandwidth.
-  Closing this needs MMA / tensor-core kernels on a repacked Q8 layout
-  (similar to llama.cpp's MMQ kernels).
-- **Decode (~79% of llama.cpp).** Memory-bound at this point with a near-
-  optimal scalar Q8 kernel. Same MMA path would close the rest.
-- **Recurrent layer per-token launches** — 5 small kernels per token ×
-  48 recurrent layers per prefill is ~80ms of launch overhead. Fusing the
-  conv1d + L2 norm + DeltaNet + norm_gate sub-kernels (and/or capturing
-  the loop into a CUDA Graph) would close another chunk.
-- F16 KV cache, repacked Q8 weight layout — deferred.
+- **Prefill (~30% of llama.cpp on 1322-token prompt, ~3.3× off).** The
+  HGEMM tensor-core path dequantizes Q8 → FP16 in a persistent cache and
+  also converts the FP32 activations to FP16 per call; llama.cpp's MMQ
+  kernels run INT8 mma directly on a repacked Q8 layout, which avoids both
+  conversions. Closing this gap needs an INT8 mma kernel (or
+  `cublasLtMatmul` with INT8 inputs + per-block scales).
+- **Decode (~50% of llama.cpp).** Still on the dp4a matvec path; the same
+  MMA approach (now with tensor-core matvec or a 4-bit / 8-bit MMQ style
+  kernel that handles batch == 1 well) would close it.
+- **Numerical drift on greedy.** Greedy on both engines should yield
+  identical tokens; today qw3 matches for ~5–22 tokens then drifts. Sources
+  are the per-block Q8 → FP16 dequant rounding, FP16 accumulator in HGEMM
+  (`CUBLAS_COMPUTE_32F_FAST_16F`), and the manual reductions in the
+  recurrent stack. None block correct *generation*; a tight bit-exact match
+  against llama.cpp is future work.
+- **F16 KV cache, repacked Q8 weight layout, CUDA graph capture of the
+  decode loop** — deferred.
