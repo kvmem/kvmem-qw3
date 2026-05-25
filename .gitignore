@@ -1,0 +1,11 @@
+.DS_Store
+build/
+*.o
+*.a
+*.dylib
+*.so
+qw3
+qw3-inspect
+qw3-smoke
+
+ds4-main
