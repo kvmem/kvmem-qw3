@@ -97,6 +97,10 @@ private:
     // Preallocated scratch for the per-token conv output (size = conv_dim).
     // Was a cudaMalloc/cudaFree per call inside recurrent_single_token.
     std::unique_ptr<DeviceTensor> conv_out_;
+    // Batched scratch for the recurrent conv output during prefill: sized
+    // [batch_capacity_, max_recurrent_qkv]. Used by recurrent_batch as the
+    // intermediate buffer between conv -> l2_norm -> deltanet.
+    std::unique_ptr<DeviceTensor> conv_out_batch_;
     // Per-layer DeltaNet state and conv1d ring buffer. Indexed by absolute
     // layer index; entries for non-recurrent (full attention) layers stay
     // null. This is essential for correctness: each recurrent layer keeps

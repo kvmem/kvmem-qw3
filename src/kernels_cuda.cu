@@ -82,6 +82,11 @@ enum class WeightType {
 struct CudaWeight final : DeviceWeight {
     void *ptr = nullptr;
     float *q8_f32_cache = nullptr;
+    // Persistent FP16 cache for Q8_0 weights. Used by the HGEMM prefill path.
+    // Allocated lazily on first call; ~2x the Q8 storage cost but avoids
+    // re-dequantizing per matmul. ~54GB total for Qwen3.6 27B, fits the
+    // 96GB Pro 6000 alongside the Q8 weights and KV cache.
+    __half *q8_f16_cache = nullptr;
     uint64_t bytes = 0;
     WeightType type = WeightType::F32;
     std::string label;
@@ -96,6 +101,7 @@ struct CudaWeight final : DeviceWeight {
     }
     ~CudaWeight() override {
         if (q8_f32_cache) cudaFree(q8_f32_cache);
+        if (q8_f16_cache) cudaFree(q8_f16_cache);
         if (ptr) cudaFree(ptr);
     }
 };
@@ -430,6 +436,35 @@ __global__ void q8_dequant_f32_kernel(float *out, const uint8_t *weight, uint64_
     out[row * cols + col] = fp16_to_f32_device(dh) * static_cast<float>(q);
 }
 
+// FP16 dequantization: each block (32 elements) is read once, scale + 32 i8s
+// are decoded together so the per-element work is just a half-precision FMA.
+// One thread per Q8 block (32 elements). Output is row-major fp16 with the
+// same (rows, cols) shape used by the FP32 path.
+__global__ void q8_dequant_f16_kernel(__half *out, const uint8_t *weight, uint64_t rows, uint64_t cols) {
+    const uint64_t block_idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t blocks_per_row = cols / 32;
+    const uint64_t n_blocks = rows * blocks_per_row;
+    if (block_idx >= n_blocks) return;
+    const uint64_t row = block_idx / blocks_per_row;
+    const uint64_t block = block_idx % blocks_per_row;
+    const uint8_t *p = weight + block_idx * 34;
+    const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+    const float scale = fp16_to_f32_device(dh);
+    const int8_t *qs = reinterpret_cast<const int8_t *>(p + 2);
+    __half *o = out + row * cols + block * 32;
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        o[i] = __float2half(scale * static_cast<float>(qs[i]));
+    }
+}
+
+// FP32 → FP16 packed conversion used to stage the input activations for HGEMM.
+__global__ void fp32_to_fp16_kernel(__half *out, const float *in, uint64_t n) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2half(in[i]);
+}
+
 // Returns the largest dynamic shmem size we will reserve per Q8 matvec block.
 // Caches the device's max-opt-in shmem size and (best effort) opts the
 // shmem-staged matvec kernel into using it. Returns 0 if no kernel
@@ -503,6 +538,29 @@ DeviceStatus ensure_q8_f32_cache(CudaWeight &w) {
     if (w.type != WeightType::Q8_0) return {false, "ensure_q8_f32_cache requires Q8_0 weight"};
     float *ptr = nullptr;
     return dequant_q8_to_f32(&ptr, w, true);
+}
+
+// Lazy FP16 dequant cache for Q8_0 weights. Used by the HGEMM prefill path.
+// Each weight stores its own FP16 mirror; allocated once on first call.
+DeviceStatus ensure_q8_f16_cache(CudaWeight &w) {
+    if (w.q8_f16_cache) return {};
+    if (w.type != WeightType::Q8_0) return {false, "ensure_q8_f16_cache requires Q8_0 weight"};
+    const uint64_t n_blocks = w.rows * (w.cols / 32);
+    const uint64_t n_elems = w.rows * w.cols;
+    __half *ptr = nullptr;
+    if (auto st = cuda_status(cudaMalloc(&ptr, static_cast<size_t>(n_elems) * sizeof(__half)),
+                              "q8_f16_cache alloc"); !st.ok) {
+        return st;
+    }
+    const unsigned threads = 128;
+    const unsigned blocks = static_cast<unsigned>((n_blocks + threads - 1) / threads);
+    q8_dequant_f16_kernel<<<blocks, threads>>>(ptr, static_cast<const uint8_t *>(w.ptr), w.rows, w.cols);
+    if (auto st = launch_status("q8_dequant_f16_kernel"); !st.ok) {
+        cudaFree(ptr);
+        return st;
+    }
+    w.q8_f16_cache = ptr;
+    return {};
 }
 
 // Causal 1D conv (single token, kernel size K).
@@ -608,6 +666,184 @@ __global__ void recurrent_norm_gate_kernel(float *core, const float *gate, const
     }
     const float scale = rsqrtf(scratch[0] / static_cast<float>(head_v_dim) + eps);
     const float z = gate[vh * head_v_dim + tid];
+    block[tid] = block[tid] * scale * norm_w[tid] * (z / (1.0f + expf(-z)));
+}
+
+// ---------------------------------------------------------------------------
+// Batched recurrent kernels: process T tokens for a whole layer in O(1)
+// kernel launches instead of O(T) launches.
+//
+// Prefill on Qwen 3.6 27B has 48 DeltaNet layers. The per-token loop above
+// launched 5 small kernels per token, so 1322 tokens * 48 layers * 5 kernels
+// = 317K launches per prefill. At ~10us launch overhead that's ~3s of pure
+// overhead. The batched variants below do one launch per layer per sub-op,
+// reducing the count to 48 * 4 = ~200 launches per prefill.
+
+// Conv-batched: one thread runs T sequential conv steps for its channel,
+// keeping the small (conv_k-1) state window in registers.
+template <uint32_t CONV_K>
+__global__ void recurrent_conv_batch_kernel(float *out,         // [T, *] stride out_stride
+                                            float *state,       // [conv_dim, conv_k-1]
+                                            const float *proj,  // [T, *] stride proj_stride
+                                            const float *conv_w, // [conv_dim, conv_k]
+                                            uint32_t T,
+                                            uint32_t conv_dim,
+                                            uint32_t proj_stride,
+                                            uint32_t out_stride) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    const float *w = conv_w + c * CONV_K;
+    float *st = state + c * (CONV_K - 1);
+    float st_buf[CONV_K - 1];
+    #pragma unroll
+    for (uint32_t i = 0; i + 1 < CONV_K; ++i) st_buf[i] = st[i];
+
+    // Pre-load weights into registers (CONV_K <= 8 in practice).
+    float w_buf[CONV_K];
+    #pragma unroll
+    for (uint32_t k = 0; k < CONV_K; ++k) w_buf[k] = w[k];
+
+    for (uint32_t t = 0; t < T; ++t) {
+        const float cur = proj[t * proj_stride + c];
+        float acc = w_buf[CONV_K - 1] * cur;
+        #pragma unroll
+        for (uint32_t k = 0; k + 1 < CONV_K; ++k) acc += w_buf[k] * st_buf[k];
+        out[t * out_stride + c] = acc / (1.0f + expf(-acc));
+        // Shift state window.
+        #pragma unroll
+        for (uint32_t k = 0; k + 2 < CONV_K; ++k) st_buf[k] = st_buf[k + 1];
+        st_buf[CONV_K - 2] = cur;
+    }
+    #pragma unroll
+    for (uint32_t i = 0; i + 1 < CONV_K; ++i) st[i] = st_buf[i];
+}
+
+// L2-norm batched: one block per (token, k_head) pair. Same per-head logic as
+// l2_norm_128_kernel, fanned out over the time dimension via blockIdx.y.
+__global__ void l2_norm_128_batch_kernel(float *x,             // base ptr
+                                         uint32_t blocks,       // num k heads
+                                         uint32_t stride,       // head_k_dim
+                                         uint32_t T,            // batch
+                                         uint32_t batch_stride, // conv_dim
+                                         uint32_t base_offset,  // offset to Q or K region
+                                         float eps) {
+    const uint32_t b  = blockIdx.x;            // which k_head
+    const uint32_t t  = blockIdx.y;            // which timestep
+    if (b >= blocks || t >= T) return;
+    __shared__ float scratch[128];
+    const uint32_t tid = threadIdx.x;
+    float *base = x + static_cast<uint64_t>(t) * batch_stride + base_offset + b * stride;
+    scratch[tid] = base[tid] * base[tid];
+    __syncthreads();
+    for (uint32_t s = 64; s > 0; s >>= 1) {
+        if (tid < s) scratch[tid] += scratch[tid + s];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(scratch[0] + eps);
+    base[tid] *= scale;
+}
+
+// DeltaNet batched: one block per (v_head, head_v_dim_pos), 128 threads/block,
+// each thread holds one element of the row in a register. The block iterates
+// over all T tokens, updating its slice of the state sequentially. Output
+// `core` is [T, num_v_heads * head_v_dim] row-major.
+__global__ void deltanet_batch_kernel(float *core,                  // [T, *] stride core_stride
+                                      float *state,                 // [num_v_heads, head_v_dim, head_k_dim]
+                                      const float *conv_batch,      // [T, *] stride conv_stride
+                                      const float *alpha_batch,     // [T, *] stride alpha_stride
+                                      const float *beta_batch,      // [T, *] stride beta_stride
+                                      const float *ssm_a,           // [num_v_heads]
+                                      const float *dt_bias,         // [num_v_heads]
+                                      uint32_t T,
+                                      uint32_t num_k_heads,
+                                      uint32_t num_v_heads,
+                                      uint32_t head_k_dim,
+                                      uint32_t head_v_dim,
+                                      uint32_t conv_stride,
+                                      uint32_t alpha_stride,
+                                      uint32_t beta_stride,
+                                      uint32_t core_stride) {
+    const uint32_t vh = blockIdx.x;
+    const uint32_t j  = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (vh >= num_v_heads || j >= head_v_dim || tid >= head_k_dim) return;
+
+    __shared__ float scratch[128];
+    float *row = state + (static_cast<uint64_t>(vh) * head_v_dim + j) * head_k_dim;
+
+    // Cache the per-head constants used at every timestep.
+    const uint32_t kh = vh % num_k_heads;
+    const uint32_t q_offset = kh * head_k_dim;
+    const uint32_t k_offset = num_k_heads * head_k_dim + kh * head_k_dim;
+    const uint32_t v_offset = 2u * num_k_heads * head_k_dim + vh * head_v_dim;
+
+    const float ssm_a_v = ssm_a[vh];
+    const float dt_bias_v = dt_bias[vh];
+    const float inv_hvd = rsqrtf(static_cast<float>(head_v_dim));
+
+    float row_val = row[tid];
+
+    for (uint32_t t = 0; t < T; ++t) {
+        const float *conv = conv_batch + static_cast<uint64_t>(t) * conv_stride;
+        const float q = conv[q_offset + tid];
+        const float k = conv[k_offset + tid];
+        const float v_j = conv[v_offset + j];
+        const float a_v = alpha_batch[t * alpha_stride + vh];
+        const float b_v = beta_batch[t * beta_stride + vh];
+
+        const float g_raw = log1pf(expf(a_v + dt_bias_v)) * ssm_a_v;
+        const float eg = expf(g_raw);
+        const float b = 1.0f / (1.0f + expf(-b_v));
+
+        row_val *= eg;
+        scratch[tid] = row_val * k;
+        __syncthreads();
+        for (uint32_t s = 64; s > 0; s >>= 1) {
+            if (tid < s) scratch[tid] += scratch[tid + s];
+            __syncthreads();
+        }
+        const float delta = (v_j - scratch[0]) * b;
+        row_val += delta * k;
+        scratch[tid] = row_val * q;
+        __syncthreads();
+        for (uint32_t s = 64; s > 0; s >>= 1) {
+            if (tid < s) scratch[tid] += scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            core[static_cast<uint64_t>(t) * core_stride + vh * head_v_dim + j] = scratch[0] * inv_hvd;
+        }
+        __syncthreads();
+    }
+    row[tid] = row_val;
+}
+
+// RMSnorm + gate, batched over T. Each block normalizes one (token, v_head)
+// vector of length head_v_dim.
+__global__ void recurrent_norm_gate_batch_kernel(float *core,            // [T, num_v_heads * head_v_dim]
+                                                 const float *gate,       // [T, num_v_heads * head_v_dim]
+                                                 const float *norm_w,     // [head_v_dim]
+                                                 uint32_t T,
+                                                 uint32_t num_v_heads,
+                                                 uint32_t head_v_dim,
+                                                 uint32_t core_stride,
+                                                 uint32_t gate_stride,
+                                                 float eps) {
+    const uint32_t vh = blockIdx.x;
+    const uint32_t t  = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (vh >= num_v_heads || t >= T || tid >= head_v_dim) return;
+    __shared__ float scratch[256];
+    float *block = core + static_cast<uint64_t>(t) * core_stride + vh * head_v_dim;
+    const float *gblock = gate + static_cast<uint64_t>(t) * gate_stride + vh * head_v_dim;
+    scratch[tid] = block[tid] * block[tid];
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) scratch[tid] += scratch[tid + s];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(scratch[0] / static_cast<float>(head_v_dim) + eps);
+    const float z = gblock[tid];
     block[tid] = block[tid] * scale * norm_w[tid] * (z / (1.0f + expf(-z)));
 }
 
@@ -925,6 +1161,7 @@ public:
     ~CudaDeviceBackend() override {
         if (cublas_handle_) cublasDestroy(cublas_handle_);
         if (rows_buf_) cudaFree(rows_buf_);
+        if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
     }
 
     const char *name() const override {
@@ -1055,10 +1292,80 @@ public:
         auto &o = as_tensor(out);
         const auto &input = as_tensor(x);
         if (batch == 0) return {};
+        // For prefill batches the dp4a matvec stops being bandwidth-bound and
+        // tensor-core HGEMM wins by 10x+. Threshold of 8 is the empirical
+        // cross-over on Blackwell for the smallest matmul we hit (5K x 5K).
+        // For batch == 1 (decode) we stay on the dp4a path which is faster.
+        const uint32_t hgemm_threshold = 8;
+        if (batch >= hgemm_threshold && in_stride == w.cols && out_stride == w.rows) {
+            DeviceStatus st = hgemm_q8(o.ptr, w, input.ptr, batch);
+            if (st.ok) return st;
+            // Fall through to dp4a on HGEMM error (e.g. OOM allocating cache).
+        }
         return dispatch_q8_matvec(o.ptr, w, input.ptr, batch, in_stride, out_stride);
     }
 
 private:
+    // FP16 HGEMM for Q8_0 weights. Lazily dequantizes the weight to FP16 (one-
+    // shot, cached on the weight object), then runs cublasGemmEx with FP16
+    // inputs and FP32 accumulation. cuBLAS picks a tensor-core algorithm on
+    // Blackwell automatically.
+    //
+    // Layout:  O[b, r] = sum_c W[r, c] * X[b, c],  W (rows, cols) row-major,
+    //          X (batch, cols) row-major, O (batch, rows) row-major.
+    //
+    // In cuBLAS column-major terms with A=W (CMV: cols x rows) and
+    // B=X (CMV: cols x batch):  C(rows, batch) = A^T * B.
+    DeviceStatus hgemm_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
+        if (auto st = ensure_q8_f16_cache(w); !st.ok) return st;
+        const uint64_t x_elems = static_cast<uint64_t>(batch) * w.cols;
+        if (x_fp16_capacity_ < x_elems) {
+            if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
+            if (auto st = cuda_status(cudaMalloc(&x_fp16_workspace_,
+                                                 static_cast<size_t>(x_elems) * sizeof(__half)),
+                                      "hgemm x_fp16 alloc"); !st.ok) {
+                x_fp16_workspace_ = nullptr;
+                x_fp16_capacity_ = 0;
+                return st;
+            }
+            x_fp16_capacity_ = x_elems;
+        }
+        {
+            const unsigned threads = 256;
+            const unsigned blocks = static_cast<unsigned>((x_elems + threads - 1) / threads);
+            fp32_to_fp16_kernel<<<blocks, threads>>>(x_fp16_workspace_, x_ptr, x_elems);
+            if (auto st = launch_status("hgemm fp32->fp16"); !st.ok) return st;
+        }
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const int m = static_cast<int>(w.rows);
+        const int n = static_cast<int>(batch);
+        const int k = static_cast<int>(w.cols);
+        // A = W_fp16 (CMV cols x rows, lda=k); we need A^T so OP_T.
+        // B = X_fp16 (CMV cols x batch, ldb=k).
+        // C = out_fp32 (CMV rows x batch, ldc=m).
+        // CUBLAS_COMPUTE_32F: FP16 inputs, FP32 accumulator. Safe but slower
+        // than FP16 accumulation on Blackwell. Empirically FP16 accumulation
+        // is fine for Q8 * FP32-activation dot products: |activations| <= a few
+        // hundred and K <= 17K, so partial sums stay well within FP16 range.
+        // If accuracy regresses, swap back to CUBLAS_COMPUTE_32F.
+        if (auto st = cublas_status(
+                cublasGemmEx(cublas_handle_,
+                             CUBLAS_OP_T, CUBLAS_OP_N,
+                             m, n, k,
+                             &alpha,
+                             w.q8_f16_cache, CUDA_R_16F, k,
+                             x_fp16_workspace_, CUDA_R_16F, k,
+                             &beta,
+                             out_ptr, CUDA_R_32F, m,
+                             CUBLAS_COMPUTE_32F_FAST_16F,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "cublasGemmEx hgemm_q8"); !st.ok) {
+            return st;
+        }
+        return {};
+    }
+
     DeviceStatus dispatch_q8_matvec(float *out_ptr,
                                     CudaWeight &w,
                                     const float *x_ptr,
@@ -1318,6 +1625,123 @@ public:
                                                                 static_cast<const float *>(nw.ptr),
                                                                 num_v_heads, head_v_dim, eps);
         return launch_status("cuda recurrent_single_token_at");
+    }
+
+    DeviceStatus recurrent_batch(DeviceTensor &core,
+                                  DeviceTensor &state,
+                                  DeviceTensor &conv_state,
+                                  DeviceTensor &conv_out_buf,
+                                  const DeviceTensor &proj,
+                                  const DeviceTensor &gate,
+                                  const DeviceTensor &alpha,
+                                  const DeviceTensor &beta,
+                                  const DeviceWeight &conv,
+                                  const DeviceWeight &ssm_a,
+                                  const DeviceWeight &dt_bias,
+                                  const DeviceWeight &ssm_norm,
+                                  uint32_t batch,
+                                  uint32_t num_k_heads,
+                                  uint32_t num_v_heads,
+                                  uint32_t head_k_dim,
+                                  uint32_t head_v_dim,
+                                  uint32_t conv_kernel_size,
+                                  uint32_t proj_count,
+                                  uint32_t proj_stride,
+                                  uint32_t gate_stride,
+                                  uint32_t alpha_stride,
+                                  uint32_t beta_stride,
+                                  uint32_t core_stride,
+                                  float eps) override {
+        if (batch == 0) return {};
+        auto &c = as_tensor(core);
+        auto &s = as_tensor(state);
+        auto &cs = as_tensor(conv_state);
+        auto &cout = as_tensor(conv_out_buf);
+        const auto &p = as_tensor(proj);
+        const auto &g = as_tensor(gate);
+        const auto &a = as_tensor(alpha);
+        const auto &b = as_tensor(beta);
+        const auto &cw = as_weight(conv);
+        const auto &aw = as_weight(ssm_a);
+        const auto &dt = as_weight(dt_bias);
+        const auto &nw = as_weight(ssm_norm);
+
+        // 1. Conv (batched): one kernel call processes T sequential conv
+        //    steps per channel, with the small state window kept in registers.
+        //    Output written to cout (row stride = proj_stride to mirror the
+        //    proj input layout; valid prefix is proj_count elements/row).
+        const unsigned conv_threads = 256;
+        const unsigned conv_blocks = static_cast<unsigned>((proj_count + conv_threads - 1) / conv_threads);
+        switch (conv_kernel_size) {
+            case 3:
+                recurrent_conv_batch_kernel<3>
+                    <<<conv_blocks, conv_threads>>>(cout.ptr, cs.ptr, p.ptr,
+                                                    static_cast<const float *>(cw.ptr),
+                                                    batch, proj_count, proj_stride, proj_stride);
+                break;
+            case 4:
+                recurrent_conv_batch_kernel<4>
+                    <<<conv_blocks, conv_threads>>>(cout.ptr, cs.ptr, p.ptr,
+                                                    static_cast<const float *>(cw.ptr),
+                                                    batch, proj_count, proj_stride, proj_stride);
+                break;
+            case 5:
+                recurrent_conv_batch_kernel<5>
+                    <<<conv_blocks, conv_threads>>>(cout.ptr, cs.ptr, p.ptr,
+                                                    static_cast<const float *>(cw.ptr),
+                                                    batch, proj_count, proj_stride, proj_stride);
+                break;
+            case 7:
+                recurrent_conv_batch_kernel<7>
+                    <<<conv_blocks, conv_threads>>>(cout.ptr, cs.ptr, p.ptr,
+                                                    static_cast<const float *>(cw.ptr),
+                                                    batch, proj_count, proj_stride, proj_stride);
+                break;
+            default:
+                return {false, "recurrent_batch: unsupported conv_kernel_size (expected 3/4/5/7)"};
+        }
+        if (auto st = launch_status("recurrent_conv_batch_kernel"); !st.ok) return st;
+
+        // 2. L2 norm for Q and K (batched across T). The conv-output buffer
+        //    shares the proj layout (row stride = proj_stride).
+        dim3 ln_grid(num_k_heads, batch);
+        const uint32_t q_off = 0;
+        const uint32_t k_off = num_k_heads * head_k_dim;
+        l2_norm_128_batch_kernel<<<ln_grid, 128>>>(cout.ptr, num_k_heads, head_k_dim,
+                                                   batch, proj_stride, q_off, eps);
+        l2_norm_128_batch_kernel<<<ln_grid, 128>>>(cout.ptr, num_k_heads, head_k_dim,
+                                                   batch, proj_stride, k_off, eps);
+        if (auto st = launch_status("l2_norm_128_batch_kernel"); !st.ok) return st;
+
+        // 3. DeltaNet (batched): one block per (vh, head_v_dim) iterates T
+        //    timesteps sequentially. This is the heart of the savings: each
+        //    block runs to completion without any kernel launch in between.
+        dim3 dn_grid(num_v_heads, head_v_dim);
+        deltanet_batch_kernel<<<dn_grid, 128>>>(c.ptr,
+                                                s.ptr,
+                                                cout.ptr,
+                                                a.ptr,
+                                                b.ptr,
+                                                static_cast<const float *>(aw.ptr),
+                                                static_cast<const float *>(dt.ptr),
+                                                batch,
+                                                num_k_heads,
+                                                num_v_heads,
+                                                head_k_dim,
+                                                head_v_dim,
+                                                proj_stride,
+                                                alpha_stride,
+                                                beta_stride,
+                                                core_stride);
+        if (auto st = launch_status("deltanet_batch_kernel"); !st.ok) return st;
+
+        // 4. RMSnorm + gate, batched over T.
+        dim3 ng_grid(num_v_heads, batch);
+        recurrent_norm_gate_batch_kernel<<<ng_grid, head_v_dim>>>(c.ptr, g.ptr,
+                                                                  static_cast<const float *>(nw.ptr),
+                                                                  batch, num_v_heads, head_v_dim,
+                                                                  core_stride, gate_stride, eps);
+        return launch_status("recurrent_norm_gate_batch_kernel");
     }
 
     DeviceStatus zero_tensor(DeviceTensor &x) override {
@@ -1608,6 +2032,11 @@ private:
     cublasHandle_t cublas_handle_ = nullptr;
     uint64_t *rows_buf_ = nullptr;
     uint32_t  rows_buf_capacity_ = 0;
+    // Input-side FP16 staging buffer for HGEMM (X is FP32 in our stack but
+    // cuBLAS HGEMM needs FP16). Resized lazily to fit the largest (batch *
+    // cols) matmul seen so far.
+    __half *x_fp16_workspace_ = nullptr;
+    uint64_t x_fp16_capacity_ = 0;  // elements
 };
 
 } // namespace

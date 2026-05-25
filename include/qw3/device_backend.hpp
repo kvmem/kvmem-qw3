@@ -165,6 +165,60 @@ public:
                                        num_k_heads, num_v_heads, head_k_dim, head_v_dim,
                                        conv_kernel_size, eps);
     }
+
+    // Time-batched recurrent layer: processes `batch` tokens in O(1) kernel
+    // launches instead of O(batch). Inputs are row-major:
+    //   proj  : [batch, proj_count]      stride proj_stride
+    //   gate  : [batch, gate_count]      stride gate_stride
+    //   alpha : [batch, num_v_heads]     stride alpha_stride
+    //   beta  : [batch, num_v_heads]     stride beta_stride
+    //   core  : [batch, num_v_heads*head_v_dim] stride core_stride
+    // `conv_out_buf` is a scratch buffer sized to [batch, proj_count].
+    // The default implementation loops over the per-token variant for
+    // backends that don't override it.
+    virtual DeviceStatus recurrent_batch(DeviceTensor &core,
+                                          DeviceTensor &state,
+                                          DeviceTensor &conv_state,
+                                          DeviceTensor &conv_out_buf,
+                                          const DeviceTensor &proj,
+                                          const DeviceTensor &gate,
+                                          const DeviceTensor &alpha,
+                                          const DeviceTensor &beta,
+                                          const DeviceWeight &conv,
+                                          const DeviceWeight &ssm_a,
+                                          const DeviceWeight &dt_bias,
+                                          const DeviceWeight &ssm_norm,
+                                          uint32_t batch,
+                                          uint32_t num_k_heads,
+                                          uint32_t num_v_heads,
+                                          uint32_t head_k_dim,
+                                          uint32_t head_v_dim,
+                                          uint32_t conv_kernel_size,
+                                          uint32_t proj_count,
+                                          uint32_t proj_stride,
+                                          uint32_t gate_stride,
+                                          uint32_t alpha_stride,
+                                          uint32_t beta_stride,
+                                          uint32_t core_stride,
+                                          float eps) {
+        for (uint32_t b = 0; b < batch; ++b) {
+            if (auto st = recurrent_single_token_at(core, state, conv_state, conv_out_buf,
+                                                    proj, gate, alpha, beta,
+                                                    conv, ssm_a, dt_bias, ssm_norm,
+                                                    num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+                                                    conv_kernel_size,
+                                                    proj_count,
+                                                    b * proj_stride,
+                                                    b * gate_stride,
+                                                    b * alpha_stride,
+                                                    b * beta_stride,
+                                                    b * core_stride,
+                                                    eps); !st.ok) {
+                return st;
+            }
+        }
+        return {};
+    }
     virtual DeviceStatus attention_single_token(DeviceTensor &mid,
                                                 DeviceTensor &q,
                                                 DeviceTensor &k,

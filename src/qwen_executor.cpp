@@ -162,6 +162,7 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
     ffn_mid_batch_ = backend_.tensor_f32(B * std::max<uint64_t>(max_ffn, 1), "ffn_mid_batch");
     ffn_out_batch_ = backend_.tensor_f32(B * cfg.n_embd,             "ffn_out_batch");
     if (max_rqkv  > 0) proj_batch_      = backend_.tensor_f32(B * max_rqkv,  "proj_batch");
+    if (max_rqkv  > 0) conv_out_batch_  = backend_.tensor_f32(B * max_rqkv,  "conv_out_batch");
     if (max_rvalue> 0) gate_proj_batch_ = backend_.tensor_f32(B * max_rvalue,"gate_proj_batch");
     if (max_rvalue> 0) core_batch_      = backend_.tensor_f32(B * max_rvalue,"core_batch");
     if (cfg.num_v_heads() > 0) {
@@ -399,36 +400,38 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             require_status(backend_.q8_0_matmul(*beta_batch_, *layer.ssm_beta, *norm_batch_,
                                                  batch, h_stride, beta_stride));
             record(report, "layer." + std::to_string(il) + ".recurrent_projections_batch");
-            if (!recurrent_states_[il] || !conv_states_[il]) {
+            if (!recurrent_states_[il] || !conv_states_[il] || !conv_out_batch_) {
                 throw std::runtime_error("recurrent state not allocated for layer " + std::to_string(il));
             }
-            for (uint32_t b = 0; b < batch; ++b) {
-                require_status(backend_.recurrent_single_token_at(*core_batch_,
-                                                                   *recurrent_states_[il],
-                                                                   *conv_states_[il],
-                                                                   *conv_out_,
-                                                                   *proj_batch_,
-                                                                   *gate_proj_batch_,
-                                                                   *alpha_batch_,
-                                                                   *beta_batch_,
-                                                                   *layer.ssm_conv1d,
-                                                                   *layer.ssm_a,
-                                                                   *layer.ssm_dt_bias,
-                                                                   *layer.ssm_norm,
-                                                                   num_k_heads,
-                                                                   num_v_heads,
-                                                                   head_k_dim,
-                                                                   head_v_dim,
-                                                                   cfg.ssm_conv_kernel,
-                                                                   layer.recurrent_qkv_dim,
-                                                                   b * proj_stride,
-                                                                   b * gate_proj_stride,
-                                                                   b * alpha_stride,
-                                                                   b * beta_stride,
-                                                                   b * core_stride,
-                                                                   eps));
-            }
-            record(report, "layer." + std::to_string(il) + ".deltanet_loop");
+            // One batched call replaces the previous T-token loop (5 kernels x
+            // T tokens). The CUDA backend overrides this with 4 launches per
+            // layer that internally iterate over T.
+            require_status(backend_.recurrent_batch(*core_batch_,
+                                                     *recurrent_states_[il],
+                                                     *conv_states_[il],
+                                                     *conv_out_batch_,
+                                                     *proj_batch_,
+                                                     *gate_proj_batch_,
+                                                     *alpha_batch_,
+                                                     *beta_batch_,
+                                                     *layer.ssm_conv1d,
+                                                     *layer.ssm_a,
+                                                     *layer.ssm_dt_bias,
+                                                     *layer.ssm_norm,
+                                                     batch,
+                                                     num_k_heads,
+                                                     num_v_heads,
+                                                     head_k_dim,
+                                                     head_v_dim,
+                                                     cfg.ssm_conv_kernel,
+                                                     layer.recurrent_qkv_dim,
+                                                     proj_stride,
+                                                     gate_proj_stride,
+                                                     alpha_stride,
+                                                     beta_stride,
+                                                     core_stride,
+                                                     eps));
+            record(report, "layer." + std::to_string(il) + ".deltanet_batch");
             require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.ssm_out, *core_batch_,
                                                  batch, core_stride, h_stride));
             record(report, "layer." + std::to_string(il) + ".recurrent_output_batch");
