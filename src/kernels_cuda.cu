@@ -70,6 +70,19 @@ bool launch_fattn_vec_decode_f16_splitk(
         float scale, cudaStream_t stream);
 size_t fattn_vec_scratch_bytes(uint32_t n_heads, uint32_t batch,
                                uint32_t head_dim, uint32_t seq_len);
+// Tiled flash-attention prefill (FA2 style). One block per (head, BR queries);
+// 4 warps cooperatively load BC=32 K/V tile into shmem, each warp scores
+// against its own query → 4× HBM bandwidth reduction on K/V vs the per-query
+// vec kernel. FP16 K/V only — FP32 KV would need 64 KB shmem per block which
+// exceeds the 48 KB static-shmem cap. The FP32 path stays on the vec splitk
+// kernel (parity-only fallback).
+bool launch_fattn_prefill_f16(
+        float *out, const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
 }
 
 namespace {
@@ -130,6 +143,44 @@ bool prewarm_f16_choice() {
         return true;
     }();
     return choice;
+}
+
+// Prefill attention kernel selector.
+//   QW3_PREFILL_ATTN=tiled  -> FA2-style tiled kernel that loads K/V tiles
+//                              into shmem and reuses them across BR=4 queries.
+//                              Parity-correct but ~7% SLOWER than vec on
+//                              Qwen 3.6 27B at 4K context: per-layer K+V
+//                              (~36 MB) already fits in Blackwell's 120 MB L2,
+//                              so the vec kernel gets free reuse and shmem
+//                              tiling adds load overhead without HBM savings.
+//                              Kept selectable for shapes where L2 spills.
+//   QW3_PREFILL_ATTN=vec    -> (default) per-query split-K vec kernel
+//                              (also used for decode). At prefill seq_len is
+//                              passed as 1, so pick_nsplit→1 and it runs
+//                              one block per (head, query).
+enum class PrefillAttnKernel { Tiled, Vec };
+PrefillAttnKernel prefill_attn_kernel_choice() {
+    static const PrefillAttnKernel choice = []() {
+        const char *env = std::getenv("QW3_PREFILL_ATTN");
+        if (env && std::strcmp(env, "tiled") == 0) return PrefillAttnKernel::Tiled;
+        return PrefillAttnKernel::Vec;
+    }();
+    return choice;
+}
+
+// Min batch (= number of prefill queries) at which we switch to the tiled
+// kernel. Below this the per-query split-K kernel wins (more parallelism per
+// query). Override with QW3_PREFILL_ATTN_MIN_BATCH.
+uint32_t prefill_attn_min_batch() {
+    static const uint32_t v = []() {
+        const char *env = std::getenv("QW3_PREFILL_ATTN_MIN_BATCH");
+        if (env) {
+            int n = std::atoi(env);
+            if (n > 0) return static_cast<uint32_t>(n);
+        }
+        return static_cast<uint32_t>(16);
+    }();
+    return v;
 }
 
 
@@ -2256,6 +2307,24 @@ public:
         const auto &kc = as_tensor(k_cache);
         const auto &vc = as_tensor(v_cache);
         const bool kv_fp16 = kc.is_fp16();
+
+        // Tiled prefill kernel — preferred when batch is large enough that
+        // K/V reuse across BR=4 queries pays for itself. FP16 KV only (FP32
+        // would blow the 48 KB static-shmem cap). Below the threshold the
+        // per-query split-K vec kernel wins (more SM occupancy per query).
+        if (kv_fp16 &&
+            prefill_attn_kernel_choice() == PrefillAttnKernel::Tiled &&
+            batch >= prefill_attn_min_batch() &&
+            (head_dim == 128 || head_dim == 256)) {
+            if (ported::launch_fattn_prefill_f16(
+                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, /*stream=*/0)) {
+                return launch_status("cuda attention_decode_batch tiled f16");
+            }
+        }
+
         if (kv_fp16 && (head_dim == 128 || head_dim == 256)) {
             if (auto st = ensure_fattn_scratch(n_heads, batch, head_dim,
                                                 /*seq_len=*/base_seq_len + batch);

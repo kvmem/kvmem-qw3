@@ -1,6 +1,6 @@
 .DS_Store
 build/
-build-cuda/*
+build-cuda
 ds4-main/*
 
 *.o

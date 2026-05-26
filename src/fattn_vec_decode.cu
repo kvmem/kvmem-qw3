@@ -515,5 +515,253 @@ bool launch_fattn_vec_decode_f16_splitk(
         q_batch_stride, out_batch_stride, scale, nsplit, stream);
 }
 
+// ---------------------------------------------------------------------------
+// Tiled flash-attention prefill kernel (qw3-side, FA2 style).
+//
+// Why this exists separately from fattn_vec_decode_kernel: the decode kernel
+// is parametrized as one block per (head, query) and reads K/V independently
+// per query, with no reuse across queries. For prefill, batch == T queries,
+// and each query reads the full t < base + b + 1 KV stream. That is O(T²)
+// HBM traffic with zero K/V reuse. nsys on a 4K prompt shows fattn_vec is
+// ~534 ms of the 1.4 s prefill at 4096 tokens.
+//
+// Design (FA2 with BR=4, BC=32):
+//   - Grid: (n_heads, ceil(batch / BR), 1).
+//   - Block: 4 warps × 32 lanes = 128 threads.
+//   - Each warp owns one query in the [block_q*BR, block_q*BR + BR) range.
+//   - All 4 warps cooperatively load a BC=32 token tile of K and V into
+//     shmem, then each warp scores and accumulates against its own query.
+//   - K and V loaded into shmem ONCE per BR=4 queries → 4× HBM bandwidth
+//     reduction on K/V vs the per-query decode kernel.
+//   - Online softmax: per-warp running (max, sum, VKQ).
+//   - Causal: scores at kv_idx > base + q_idx are masked to -INFINITY.
+//
+// Shmem (HEAD_DIM=256, FP16 K/V):
+//   K tile: 32 × 256 × 2 = 16 KB
+//   V tile: 32 × 256 × 2 = 16 KB
+//   Total = 32 KB (fits in default 48 KB static shmem limit on every arch
+//   we target — no cudaFuncSetAttribute needed).
+
+template <uint32_t HEAD_DIM, typename KVT, uint32_t BR, uint32_t BC>
+__global__ void
+__launch_bounds__(BR * 32, 1)
+fattn_prefill_kernel(
+        float       * __restrict__ out,         // [batch, n_heads, HEAD_DIM]
+        const float * __restrict__ q,           // [batch, n_heads, q_stride]
+        uint32_t     q_stride,
+        const KVT   * __restrict__ k_cache,     // [seq, n_kv_heads, HEAD_DIM]
+        const KVT   * __restrict__ v_cache,
+        uint32_t     n_heads,
+        uint32_t     n_kv_heads,
+        uint32_t     base_seq_len,
+        uint32_t     batch,
+        uint32_t     q_batch_stride,
+        uint32_t     out_batch_stride,
+        float        scale) {
+    constexpr uint32_t WARP_SIZE  = 32;
+    constexpr uint32_t NWARPS     = BR;
+    constexpr uint32_t D_PER_LANE = HEAD_DIM / WARP_SIZE;
+    static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be a multiple of warp size");
+
+    const uint32_t head    = blockIdx.x;
+    const uint32_t block_q = blockIdx.y;
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t warp    = tid / WARP_SIZE;
+    const uint32_t lane    = tid % WARP_SIZE;
+    if (head >= n_heads) return;
+
+    const uint32_t q_idx   = block_q * BR + warp;
+    const bool warp_active = (q_idx < batch);
+    const uint32_t kv_head = head / (n_heads / n_kv_heads);
+
+    // The tile loop runs from 0 up to the maximum kv index this block needs.
+    // Active queries see different causal limits, but we share one outer
+    // bound so all warps do the same number of tile iterations.
+    uint32_t block_max_q = block_q * BR + BR;
+    if (block_max_q > batch) block_max_q = batch;
+    const uint32_t block_max_kv = base_seq_len + block_max_q;   // exclusive
+    const uint32_t my_max_kv    = base_seq_len + q_idx + 1;     // exclusive (causal)
+
+    // Q in registers (per-warp).
+    float q_reg[D_PER_LANE];
+    if (warp_active) {
+        const float * q_ptr = q + static_cast<uint64_t>(q_idx) * q_batch_stride
+                                + head * q_stride;
+        #pragma unroll
+        for (uint32_t r = 0; r < D_PER_LANE; ++r) {
+            q_reg[r] = q_ptr[r * WARP_SIZE + lane];
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t r = 0; r < D_PER_LANE; ++r) q_reg[r] = 0.0f;
+    }
+
+    // Running softmax + V accumulator.
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float VKQ[D_PER_LANE] = {0.0f};
+
+    // Shmem K/V tiles. KVT (= __half or float) per element.
+    __shared__ KVT s_k[BC * HEAD_DIM];
+    __shared__ KVT s_v[BC * HEAD_DIM];
+
+    // Each tile: load BC tokens of K and V from HBM into shmem cooperatively.
+    // Layout in shmem: s_k[t * HEAD_DIM + d], same for s_v. 128 threads
+    // cooperate; each thread handles HEAD_DIM/(WARP_SIZE) lanes ≡ D_PER_LANE
+    // dims per token, NWARPS tokens deep.
+    static_assert(BC % NWARPS == 0, "BC must be a multiple of NWARPS");
+    constexpr uint32_t TOKENS_PER_WARP = BC / NWARPS;
+
+    for (uint32_t t0 = 0; t0 < block_max_kv; t0 += BC) {
+        // Cooperative tile load. Warp `w` loads tokens [t0 + w * TPW, t0 + (w+1) * TPW).
+        #pragma unroll
+        for (uint32_t tw = 0; tw < TOKENS_PER_WARP; ++tw) {
+            const uint32_t t = t0 + warp * TOKENS_PER_WARP + tw;
+            const bool t_in_range = (t < block_max_kv);
+            const uint32_t shmem_t = warp * TOKENS_PER_WARP + tw;
+            const KVT * k_src = t_in_range
+                ? (k_cache + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                           + kv_head * HEAD_DIM)
+                : nullptr;
+            const KVT * v_src = t_in_range
+                ? (v_cache + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                           + kv_head * HEAD_DIM)
+                : nullptr;
+            #pragma unroll
+            for (uint32_t r = 0; r < D_PER_LANE; ++r) {
+                const uint32_t d = r * WARP_SIZE + lane;
+                if (t_in_range) {
+                    s_k[shmem_t * HEAD_DIM + d] = k_src[d];
+                    s_v[shmem_t * HEAD_DIM + d] = v_src[d];
+                } else {
+                    // Out-of-range tokens get zero K/V; their score will be
+                    // masked to -INFINITY below so the V accumulation is a
+                    // no-op (weight = 0).
+                    if constexpr (std::is_same<KVT, __half>::value) {
+                        s_k[shmem_t * HEAD_DIM + d] = __float2half(0.0f);
+                        s_v[shmem_t * HEAD_DIM + d] = __float2half(0.0f);
+                    } else {
+                        s_k[shmem_t * HEAD_DIM + d] = 0.0f;
+                        s_v[shmem_t * HEAD_DIM + d] = 0.0f;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // Online softmax over BC tokens, score-by-score: each iteration is
+        // warp-uniform (all lanes see the same `score`), so the rescale
+        // branch never diverges.
+        if (warp_active) {
+            #pragma unroll 1
+            for (uint32_t k = 0; k < BC; ++k) {
+                const uint32_t t = t0 + k;
+                const bool valid = (t < my_max_kv);
+
+                // Q · K[t]: each lane computes its slice of the dot product,
+                // then a warp reduce.
+                float local = 0.0f;
+                #pragma unroll
+                for (uint32_t r = 0; r < D_PER_LANE; ++r) {
+                    const float kv = kv_load<KVT>(&s_k[k * HEAD_DIM + r * WARP_SIZE + lane]);
+                    local += q_reg[r] * kv;
+                }
+                const float dot = cuda_helpers::warp_reduce_sum<WARP_SIZE>(local);
+                const float score = valid ? (dot * scale) : -INFINITY;
+
+                // Online softmax update.
+                const float new_max = fmaxf(running_max, score);
+                const float prev_scale = (running_max == -INFINITY)
+                    ? 0.0f
+                    : __expf(running_max - new_max);
+                const float w_k = (score == -INFINITY) ? 0.0f
+                                                       : __expf(score - new_max);
+
+                running_sum = running_sum * prev_scale + w_k;
+                #pragma unroll
+                for (uint32_t r = 0; r < D_PER_LANE; ++r) {
+                    const float v = kv_load<KVT>(&s_v[k * HEAD_DIM + r * WARP_SIZE + lane]);
+                    VKQ[r] = VKQ[r] * prev_scale + w_k * v;
+                }
+                running_max = new_max;
+            }
+        }
+        __syncthreads();    // shmem reuse next tile
+    }
+
+    // Final write: each lane owns r-th D-shard of its warp's query.
+    if (warp_active) {
+        const float inv_sum = (running_sum > 0.0f) ? (1.0f / running_sum) : 0.0f;
+        float * out_ptr = out + static_cast<uint64_t>(q_idx) * out_batch_stride
+                              + head * HEAD_DIM;
+        #pragma unroll
+        for (uint32_t r = 0; r < D_PER_LANE; ++r) {
+            out_ptr[r * WARP_SIZE + lane] = VKQ[r] * inv_sum;
+        }
+    }
+}
+
+template <typename KVT>
+static bool dispatch_launch_prefill(
+        float * out,
+        const float * q,
+        uint32_t q_stride,
+        const KVT * k_cache,
+        const KVT * v_cache,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t batch,
+        uint32_t base_seq_len,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float    scale,
+        cudaStream_t stream) {
+    if (head_dim != 128 && head_dim != 256) return false;
+    if (batch == 0) return true;
+
+    constexpr uint32_t BR = 4;
+    constexpr uint32_t BC = 32;
+    const uint32_t n_blocks_q = (batch + BR - 1) / BR;
+    const dim3 grid(n_heads, n_blocks_q, 1);
+    const dim3 block(BR * 32);
+
+    if (head_dim == 128) {
+        fattn_prefill_kernel<128, KVT, BR, BC><<<grid, block, 0, stream>>>(
+            out, q, q_stride, k_cache, v_cache,
+            n_heads, n_kv_heads, base_seq_len, batch,
+            q_batch_stride, out_batch_stride, scale);
+    } else {
+        fattn_prefill_kernel<256, KVT, BR, BC><<<grid, block, 0, stream>>>(
+            out, q, q_stride, k_cache, v_cache,
+            n_heads, n_kv_heads, base_seq_len, batch,
+            q_batch_stride, out_batch_stride, scale);
+    }
+    return true;
+}
+
+bool launch_fattn_prefill_f16(
+        float *       out,
+        const float * q,
+        uint32_t      q_stride,
+        const void  * k_cache,
+        const void  * v_cache,
+        uint32_t      n_heads,
+        uint32_t      n_kv_heads,
+        uint32_t      head_dim,
+        uint32_t      batch,
+        uint32_t      base_seq_len,
+        uint32_t      q_batch_stride,
+        uint32_t      out_batch_stride,
+        float         scale,
+        cudaStream_t  stream) {
+    return dispatch_launch_prefill<__half>(
+        out, q, q_stride,
+        static_cast<const __half *>(k_cache),
+        static_cast<const __half *>(v_cache),
+        n_heads, n_kv_heads, head_dim, batch, base_seq_len,
+        q_batch_stride, out_batch_stride, scale, stream);
+}
+
 } // namespace ported
 } // namespace qw3
