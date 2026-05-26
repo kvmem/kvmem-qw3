@@ -23,6 +23,9 @@ struct DeviceStatus {
 struct DeviceTensor {
     virtual ~DeviceTensor() = default;
     uint64_t count = 0;
+    // Element size in bytes (4 for FP32, 2 for FP16). Default keeps
+    // backwards compatibility with the historical FP32-only behaviour.
+    uint32_t elem_size = 4;
 };
 
 struct DeviceWeight {
@@ -46,6 +49,13 @@ public:
     virtual DeviceStatus synchronize() = 0;
 
     virtual std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) = 0;
+    // Optional FP16 tensor. Backends that don't override fall back to FP32 —
+    // call sites should be prepared for that and treat the returned tensor
+    // as FP32 (i.e. don't blindly assume FP16 storage). The KV cache uses
+    // this to halve attention bandwidth on the CUDA backend.
+    virtual std::unique_ptr<DeviceTensor> tensor_f16(uint64_t count, const char *label) {
+        return tensor_f32(count, label);
+    }
     virtual std::unique_ptr<DeviceWeight> weight_f32(const float *data, uint64_t count, const char *label) = 0;
     virtual std::unique_ptr<DeviceWeight> weight_q8_0(const void *data, uint64_t rows, uint64_t cols, const char *label) = 0;
 

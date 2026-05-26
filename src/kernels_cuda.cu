@@ -47,6 +47,29 @@ bool launch_fattn_vec_decode_f32(
         uint32_t seq_len, uint32_t batch,
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream);
+bool launch_fattn_vec_decode_f16(
+        float *out, const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t seq_len, uint32_t batch,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+bool launch_fattn_vec_decode_f32_splitk(
+        float *out, void *scratch, const float *q, uint32_t q_stride,
+        const float *k_cache, const float *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t seq_len, uint32_t batch,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+bool launch_fattn_vec_decode_f16_splitk(
+        float *out, void *scratch, const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t seq_len, uint32_t batch,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+size_t fattn_vec_scratch_bytes(uint32_t n_heads, uint32_t batch,
+                               uint32_t head_dim, uint32_t seq_len);
 }
 
 namespace {
@@ -146,15 +169,18 @@ __device__ float fp16_to_f32_device(uint16_t h) {
 struct CudaTensor final : DeviceTensor {
     float *ptr = nullptr;
     std::string label;
-    CudaTensor(uint64_t n, const char *name) {
+    CudaTensor(uint64_t n, const char *name, uint32_t elem_bytes = sizeof(float)) {
         count = n;
+        elem_size = elem_bytes;
         label = name ? name : "tensor";
-        cudaMalloc(&ptr, static_cast<size_t>(n) * sizeof(float));
-        cudaMemset(ptr, 0, static_cast<size_t>(n) * sizeof(float));
+        cudaMalloc(&ptr, static_cast<size_t>(n) * elem_bytes);
+        cudaMemset(ptr, 0, static_cast<size_t>(n) * elem_bytes);
     }
     ~CudaTensor() override {
         if (ptr) cudaFree(ptr);
     }
+    bool is_fp16() const { return elem_size == sizeof(__half); }
+    __half *ptr_h() const { return reinterpret_cast<__half *>(ptr); }
 };
 
 enum class WeightType {
@@ -991,6 +1017,19 @@ __global__ void kv_append_kernel(float *cache,
     cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] = src_row[i];
 }
 
+__global__ void kv_append_kernel_f16(__half *cache,
+                                     const float *src,
+                                     uint32_t base_pos,
+                                     uint32_t per_pos_size,
+                                     uint32_t src_stride) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t b = blockIdx.y;
+    if (i >= per_pos_size) return;
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] =
+        __float2half(src_row[i]);
+}
+
 __global__ void attention_decode_qk_kernel(float *scores,
                                            const float *q,
                                            uint32_t q_stride,
@@ -1246,6 +1285,7 @@ public:
         if (rows_buf_) cudaFree(rows_buf_);
         if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
         if (q8_1_scratch_) cudaFree(q8_1_scratch_);
+        if (fattn_scratch_) cudaFree(fattn_scratch_);
     }
 
     const char *name() const override {
@@ -1270,6 +1310,10 @@ public:
 
     std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) override {
         return std::make_unique<CudaTensor>(count, label);
+    }
+
+    std::unique_ptr<DeviceTensor> tensor_f16(uint64_t count, const char *label) override {
+        return std::make_unique<CudaTensor>(count, label, /*elem_bytes=*/sizeof(__half));
     }
 
     std::unique_ptr<DeviceWeight> weight_f32(const float *data, uint64_t count, const char *label) override {
@@ -1909,7 +1953,7 @@ public:
 
     DeviceStatus zero_tensor(DeviceTensor &x) override {
         auto &t = as_tensor(x);
-        return cuda_status(cudaMemset(t.ptr, 0, static_cast<size_t>(t.count) * sizeof(float)),
+        return cuda_status(cudaMemset(t.ptr, 0, static_cast<size_t>(t.count) * t.elem_size),
                             "zero_tensor");
     }
 
@@ -2015,7 +2059,11 @@ public:
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(blocks, 1);
-        kv_append_kernel<<<grid, threads>>>(c.ptr, s.ptr, pos, per_pos_size, /*src_stride=*/0);
+        if (c.is_fp16()) {
+            kv_append_kernel_f16<<<grid, threads>>>(c.ptr_h(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
+        } else {
+            kv_append_kernel<<<grid, threads>>>(c.ptr, s.ptr, pos, per_pos_size, /*src_stride=*/0);
+        }
         return launch_status("cuda kv_append");
     }
 
@@ -2030,8 +2078,30 @@ public:
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(blocks, batch);
-        kv_append_kernel<<<grid, threads>>>(c.ptr, s.ptr, base_pos, per_pos_size, per_pos_size);
+        if (c.is_fp16()) {
+            kv_append_kernel_f16<<<grid, threads>>>(c.ptr_h(), s.ptr, base_pos, per_pos_size, per_pos_size);
+        } else {
+            kv_append_kernel<<<grid, threads>>>(c.ptr, s.ptr, base_pos, per_pos_size, per_pos_size);
+        }
         return launch_status("cuda kv_append_batch");
+    }
+
+    DeviceStatus ensure_fattn_scratch(uint32_t n_heads, uint32_t batch,
+                                       uint32_t head_dim, uint32_t seq_len) {
+        const size_t need = ported::fattn_vec_scratch_bytes(n_heads, batch,
+                                                             head_dim, seq_len);
+        if (need == 0) return {};
+        if (need > fattn_scratch_capacity_) {
+            if (fattn_scratch_) cudaFree(fattn_scratch_);
+            if (auto st = cuda_status(cudaMalloc(&fattn_scratch_, need),
+                                      "fattn scratch alloc"); !st.ok) {
+                fattn_scratch_ = nullptr;
+                fattn_scratch_capacity_ = 0;
+                return st;
+            }
+            fattn_scratch_capacity_ = need;
+        }
+        return {};
     }
 
     DeviceStatus attention_decode(DeviceTensor &out,
@@ -2049,16 +2119,33 @@ public:
         const auto &qq = as_tensor(q);
         const auto &kc = as_tensor(k_cache);
         const auto &vc = as_tensor(v_cache);
+        const bool kv_fp16 = kc.is_fp16();
+        // FP16 K/V: only the ported path supports half-precision K/V; the
+        // legacy F32 fused/qk-softmax-av kernels are F32-only.
+        if (kv_fp16 && (head_dim == 128 || head_dim == 256)) {
+            if (auto st = ensure_fattn_scratch(n_heads, /*batch=*/1, head_dim, seq_len);
+                !st.ok) return st;
+            if (ported::launch_fattn_vec_decode_f16_splitk(
+                    o.ptr, fattn_scratch_, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim, seq_len, /*batch=*/1,
+                    /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale,
+                    /*stream=*/0)) {
+                return launch_status("cuda attn ported f16 splitk");
+            }
+            return {false, "fattn_vec f16 splitk launcher refused head_dim"};
+        }
         // Ported flash-attention-style decode. Selected via QW3_ATTN=ported.
         // 4-warp parallelism across KV tokens — wins on long context.
         if (attention_kernel_choice() == AttentionKernel::Ported &&
             (head_dim == 128 || head_dim == 256)) {
-            if (ported::launch_fattn_vec_decode_f32(
-                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+            if (auto st = ensure_fattn_scratch(n_heads, /*batch=*/1, head_dim, seq_len);
+                !st.ok) return st;
+            if (ported::launch_fattn_vec_decode_f32_splitk(
+                    o.ptr, fattn_scratch_, qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim, seq_len, /*batch=*/1,
                     /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale,
                     /*stream=*/0)) {
-                return launch_status("cuda attn ported");
+                return launch_status("cuda attn ported splitk");
             }
         }
         if (head_dim == 128) {
@@ -2144,16 +2231,33 @@ public:
         const auto &qq = as_tensor(q);
         const auto &kc = as_tensor(k_cache);
         const auto &vc = as_tensor(v_cache);
+        const bool kv_fp16 = kc.is_fp16();
+        if (kv_fp16 && (head_dim == 128 || head_dim == 256)) {
+            if (auto st = ensure_fattn_scratch(n_heads, batch, head_dim,
+                                                /*seq_len=*/base_seq_len + batch);
+                !st.ok) return st;
+            if (ported::launch_fattn_vec_decode_f16_splitk(
+                    o.ptr, fattn_scratch_, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    /*seq_len=*/base_seq_len + 1, batch,
+                    q_batch_stride, out_batch_stride, scale, /*stream=*/0)) {
+                return launch_status("cuda attention_decode_batch ported f16 splitk");
+            }
+            return {false, "fattn_vec f16 splitk launcher refused head_dim"};
+        }
         // Ported path also covers the per-batch case. Each batch position has
         // seq_len = base_seq_len + b + 1 (causal), which the kernel handles.
         if (attention_kernel_choice() == AttentionKernel::Ported &&
             (head_dim == 128 || head_dim == 256)) {
-            if (ported::launch_fattn_vec_decode_f32(
-                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+            if (auto st = ensure_fattn_scratch(n_heads, batch, head_dim,
+                                                /*seq_len=*/base_seq_len + batch);
+                !st.ok) return st;
+            if (ported::launch_fattn_vec_decode_f32_splitk(
+                    o.ptr, fattn_scratch_, qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim,
                     /*seq_len=*/base_seq_len + 1, batch,
                     q_batch_stride, out_batch_stride, scale, /*stream=*/0)) {
-                return launch_status("cuda attention_decode_batch ported");
+                return launch_status("cuda attention_decode_batch ported splitk");
             }
         }
         dim3 grid(n_heads, batch);
@@ -2228,6 +2332,12 @@ private:
     // grows on demand. Bytes hold (batch * blocks_per_row) block_q8_1 = 36 B.
     void   *q8_1_scratch_ = nullptr;
     size_t  q8_1_scratch_capacity_ = 0;  // bytes
+    // Split-K attention scratch. Holds VKQ partials and (max,sum) tuples for
+    // the fattn-vec decode kernel when seq_len is large enough that we run
+    // multiple blocks per (head, batch). Reused across all attention layers
+    // because the kernel writes-then-reads it in a single launch+combine pair.
+    void   *fattn_scratch_ = nullptr;
+    size_t  fattn_scratch_capacity_ = 0;  // bytes
 };
 
 } // namespace

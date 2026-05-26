@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -121,12 +123,21 @@ void QwenExecutor::ensure_scratch() {
     k_cache_.resize(weights_.n_layers());
     v_cache_.resize(weights_.n_layers());
     const uint64_t kv_per_pos = static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    // Default KV cache dtype: FP16 (2x bandwidth at long context, ~equal
+    // greedy-token output). Force back to FP32 with QW3_KV_DTYPE=fp32.
+    const char *kv_dtype_env = std::getenv("QW3_KV_DTYPE");
+    const bool kv_use_fp16 = !(kv_dtype_env && std::strcmp(kv_dtype_env, "fp32") == 0);
     for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
         if (!cfg.is_standard_attention_layer(il)) continue;
         const std::string klabel = "k_cache_l" + std::to_string(il);
         const std::string vlabel = "v_cache_l" + std::to_string(il);
-        k_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_ctx_size_, klabel.c_str());
-        v_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_ctx_size_, vlabel.c_str());
+        if (kv_use_fp16) {
+            k_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_ctx_size_, klabel.c_str());
+            v_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_ctx_size_, vlabel.c_str());
+        } else {
+            k_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_ctx_size_, klabel.c_str());
+            v_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_ctx_size_, vlabel.c_str());
+        }
     }
 
     const GgufTensorInfo *head = model_.output();

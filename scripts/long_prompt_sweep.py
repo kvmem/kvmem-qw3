@@ -287,7 +287,7 @@ def print_table(cells: List[CellSummary]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--qw3", default=os.environ.get("QW3", "./build-cuda/qw3"))
+    p.add_argument("--qw3", default=os.environ.get("QW3", "./build/qw3"))
     p.add_argument("--llama", default=os.environ.get(
         "LLAMA_CLI", "/tmp/llama.cpp/build-cuda/bin/llama-completion"))
     p.add_argument("--model", default=os.environ.get(
