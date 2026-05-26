@@ -770,15 +770,19 @@ DeviceStatus ensure_q8_f32_cache(CudaWeight &w) {
 // and is expected to size it to the largest weight in the model. Bandwidth-
 // bound (~470 GB/s Q8 read on Blackwell HBM3e) and runs on the same stream
 // as the HGEMM that consumes it, so no sync needed.
-DeviceStatus dequant_q8_to_f16(__half *out, const CudaWeight &w) {
+DeviceStatus dequant_q8_to_f16_stream(__half *out, const CudaWeight &w, cudaStream_t stream) {
     if (w.type != WeightType::Q8_0) return {false, "dequant_q8_to_f16 requires Q8_0 weight"};
     const uint64_t n_blocks = w.rows * (w.cols / 32);
     constexpr unsigned BLOCKS_PER_CTA = 64;
     const unsigned threads = BLOCKS_PER_CTA * 4;     // 4 lanes per sub-block
     const unsigned blocks  = static_cast<unsigned>(
         (n_blocks + BLOCKS_PER_CTA - 1) / BLOCKS_PER_CTA);
-    q8_dequant_f16_kernel<<<blocks, threads>>>(out, static_cast<const uint8_t *>(w.ptr), w.rows, w.cols);
+    q8_dequant_f16_kernel<<<blocks, threads, 0, stream>>>(out, static_cast<const uint8_t *>(w.ptr), w.rows, w.cols);
     return launch_status("q8_dequant_f16_kernel");
+}
+
+DeviceStatus dequant_q8_to_f16(__half *out, const CudaWeight &w) {
+    return dequant_q8_to_f16_stream(out, w, /*stream=*/0);
 }
 
 // Causal 1D conv (single token, kernel size K).
@@ -1393,7 +1397,12 @@ public:
         if (cublas_handle_) cublasDestroy(cublas_handle_);
         if (rows_buf_) cudaFree(rows_buf_);
         if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
-        if (w_fp16_workspace_) cudaFree(w_fp16_workspace_);
+        for (int i = 0; i < 2; ++i) {
+            if (w_fp16_workspace_[i]) cudaFree(w_fp16_workspace_[i]);
+            if (dequant_done_[i]) cudaEventDestroy(dequant_done_[i]);
+            if (hgemm_done_[i]) cudaEventDestroy(hgemm_done_[i]);
+        }
+        if (dequant_stream_) cudaStreamDestroy(dequant_stream_);
         if (q8_1_scratch_) cudaFree(q8_1_scratch_);
         if (fattn_scratch_) cudaFree(fattn_scratch_);
     }
@@ -1594,16 +1603,17 @@ public:
     }
 
 private:
-    // FP16 HGEMM for Q8_0 weights. Dequantizes the weight into a shared FP16
-    // scratch on every call (sized once to fit the largest weight in the
-    // model, ~150 MB on Qwen 3.6 27B), then runs cublasGemmEx with FP16 inputs
-    // and FP32 accumulation. cuBLAS picks a tensor-core algorithm on Blackwell
-    // automatically.
+    // FP16 HGEMM for Q8_0 weights. On every call we dequant the weight into
+    // a per-call FP16 scratch (no persistent mirror — keeps weight memory at
+    // 8-bit only), then run cublasGemmEx with FP16 inputs and FP32 accum.
     //
-    // The on-the-fly dequant trades ~30 GB of weight-mirror memory for a small
-    // per-call dequant cost (~0.2-0.3 ms per weight, BW-bound on the Q8 read).
-    // The matmul itself is compute-bound at our shapes, so the dequant runs in
-    // the slack of the previous launch and almost fully overlaps.
+    // Pipelined: two ping-pong scratch buffers and two CUDA streams let the
+    // dequant of W_{n+1} run concurrently with the HGEMM of W_n. Events
+    // synchronize buffer ownership:
+    //   - dequant_done_[idx]: signals the dequant of buffer[idx] is finished
+    //                         and HGEMM may consume it.
+    //   - hgemm_done_[idx]:   signals HGEMM has finished reading buffer[idx]
+    //                         and the next dequant may overwrite it.
     //
     // Layout:  O[b, r] = sum_c W[r, c] * X[b, c],  W (rows, cols) row-major,
     //          X (batch, cols) row-major, O (batch, rows) row-major.
@@ -1611,19 +1621,38 @@ private:
     // In cuBLAS column-major terms with A=W (CMV: cols x rows) and
     // B=X (CMV: cols x batch):  C(rows, batch) = A^T * B.
     DeviceStatus hgemm_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
+        if (auto st = ensure_dequant_pipeline(); !st.ok) return st;
         const uint64_t w_elems = w.rows * w.cols;
         if (w_fp16_capacity_ < w_elems) {
-            if (w_fp16_workspace_) cudaFree(w_fp16_workspace_);
-            if (auto st = cuda_status(cudaMalloc(&w_fp16_workspace_,
-                                                 static_cast<size_t>(w_elems) * sizeof(__half)),
-                                      "hgemm w_fp16 alloc"); !st.ok) {
-                w_fp16_workspace_ = nullptr;
-                w_fp16_capacity_ = 0;
-                return st;
+            // Resize both ping-pong buffers and clear pending events.
+            for (int i = 0; i < 2; ++i) {
+                if (w_fp16_workspace_[i]) cudaFree(w_fp16_workspace_[i]);
+                w_fp16_workspace_[i] = nullptr;
+            }
+            for (int i = 0; i < 2; ++i) {
+                if (auto st = cuda_status(cudaMalloc(&w_fp16_workspace_[i],
+                                                     static_cast<size_t>(w_elems) * sizeof(__half)),
+                                          "hgemm w_fp16 alloc"); !st.ok) {
+                    w_fp16_capacity_ = 0;
+                    return st;
+                }
             }
             w_fp16_capacity_ = w_elems;
+            w_fp16_idx_ = 0;
+            // No prior in-flight dequants/HGEMMs to wait on after a resize.
         }
-        if (auto st = dequant_q8_to_f16(w_fp16_workspace_, w); !st.ok) return st;
+
+        const int idx = w_fp16_idx_;
+
+        // Dequant runs on dequant_stream_; wait for the previous HGEMM that
+        // read this buffer to finish before overwriting.
+        cudaStreamWaitEvent(dequant_stream_, hgemm_done_[idx], 0);
+        if (auto st = dequant_q8_to_f16_stream(w_fp16_workspace_[idx], w, dequant_stream_); !st.ok) return st;
+        cudaEventRecord(dequant_done_[idx], dequant_stream_);
+
+        // Stage X (FP32 -> FP16) on the cuBLAS / default stream. This work
+        // doesn't conflict with the dequant since they touch different
+        // buffers (x_fp16_workspace_ vs w_fp16_workspace_[idx]).
         const uint64_t x_elems = static_cast<uint64_t>(batch) * w.cols;
         if (x_fp16_capacity_ < x_elems) {
             if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
@@ -1642,14 +1671,17 @@ private:
             fp32_to_fp16_kernel<<<blocks, threads>>>(x_fp16_workspace_, x_ptr, x_elems);
             if (auto st = launch_status("hgemm fp32->fp16"); !st.ok) return st;
         }
+
+        // cuBLAS waits for the matching dequant to complete before reading
+        // buffer[idx]. cuBLAS handle uses the default stream (0), so we issue
+        // a stream-wait on stream 0.
+        cudaStreamWaitEvent(/*stream=*/0, dequant_done_[idx], 0);
+
         const float alpha = 1.0f;
         const float beta = 0.0f;
         const int m = static_cast<int>(w.rows);
         const int n = static_cast<int>(batch);
         const int k = static_cast<int>(w.cols);
-        // A = W_fp16 (CMV cols x rows, lda=k); we need A^T so OP_T.
-        // B = X_fp16 (CMV cols x batch, ldb=k).
-        // C = out_fp32 (CMV rows x batch, ldc=m).
         // CUBLAS_COMPUTE_32F_FAST_16F: FP16 inputs, FP32 accumulator with the
         // FP16-fast-path tensor-core kernels. Tried CUBLAS_COMPUTE_16F (FP16
         // accumulator) for ~2x throughput; cuBLAS 13.x falls back to a non-
@@ -1660,7 +1692,7 @@ private:
                              CUBLAS_OP_T, CUBLAS_OP_N,
                              m, n, k,
                              &alpha,
-                             w_fp16_workspace_, CUDA_R_16F, k,
+                             w_fp16_workspace_[idx], CUDA_R_16F, k,
                              x_fp16_workspace_, CUDA_R_16F, k,
                              &beta,
                              out_ptr, CUDA_R_32F, m,
@@ -1668,6 +1700,26 @@ private:
                              CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                 "cublasGemmEx hgemm_q8"); !st.ok) {
             return st;
+        }
+        cudaEventRecord(hgemm_done_[idx], /*stream=*/0);
+
+        w_fp16_idx_ ^= 1;
+        return {};
+    }
+
+    DeviceStatus ensure_dequant_pipeline() {
+        if (dequant_stream_) return {};
+        if (auto st = cuda_status(cudaStreamCreateWithFlags(&dequant_stream_, cudaStreamNonBlocking),
+                                  "dequant stream"); !st.ok) return st;
+        for (int i = 0; i < 2; ++i) {
+            if (auto st = cuda_status(cudaEventCreateWithFlags(&dequant_done_[i], cudaEventDisableTiming),
+                                      "dequant event"); !st.ok) return st;
+            if (auto st = cuda_status(cudaEventCreateWithFlags(&hgemm_done_[i], cudaEventDisableTiming),
+                                      "hgemm event"); !st.ok) return st;
+            // Initial events are signalled so the first dequant doesn't
+            // block waiting on a non-existent prior HGEMM.
+            cudaEventRecord(dequant_done_[i], /*stream=*/0);
+            cudaEventRecord(hgemm_done_[i],   /*stream=*/0);
         }
         return {};
     }
@@ -2550,12 +2602,17 @@ private:
     // cols) matmul seen so far.
     __half *x_fp16_workspace_ = nullptr;
     uint64_t x_fp16_capacity_ = 0;  // elements
-    // Weight-side FP16 dequant scratch for HGEMM. One buffer, sized to the
-    // largest single Q8_0 weight in the model (~150 MB on Qwen 3.6 27B).
-    // Dequantized fresh on every HGEMM call so we can keep the persistent
-    // weight storage at 8-bit only — no per-weight FP16 mirror.
-    __half *w_fp16_workspace_ = nullptr;
-    uint64_t w_fp16_capacity_ = 0;  // elements
+    // Weight-side FP16 dequant scratch for HGEMM. Two ping-pong buffers, each
+    // sized to the largest single Q8_0 weight (~150 MB on Qwen 3.6 27B). The
+    // dequant of W_{n+1} runs on `dequant_stream_` concurrently with the
+    // HGEMM of W_n on the cuBLAS stream — events on `hgemm_done_` /
+    // `dequant_done_` synchronize the read/write of each buffer.
+    __half *w_fp16_workspace_[2] = {nullptr, nullptr};
+    uint64_t w_fp16_capacity_ = 0;          // elements (per buffer)
+    int      w_fp16_idx_ = 0;               // ping-pong index for next dequant
+    cudaStream_t dequant_stream_ = nullptr;
+    cudaEvent_t  dequant_done_[2] = {nullptr, nullptr};
+    cudaEvent_t  hgemm_done_[2]   = {nullptr, nullptr};
     // Q8_1 staging buffer for the ported mmvq path. Reused across calls;
     // grows on demand. Bytes hold (batch * blocks_per_row) block_q8_1 = 36 B.
     void   *q8_1_scratch_ = nullptr;
