@@ -39,6 +39,15 @@ bool launch_mmvq_q8_0(
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
 
+// Ported MMQ Q8_0 INT8-MMA matmul (src/mmq_q8.cu). Drop-in replacement for
+// the HGEMM prefill path that uses m16n8k32.s8.s8.s32 tensor cores directly
+// against the raw Q8_0 weight + Q8_1 activations — no FP16 dequant cache,
+// no FP32 -> FP16 activation conversion. Off by default until validated.
+bool launch_mmq_q8_0(
+        const uint8_t *weight, const void *y_q8_1, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
+
 // Ported fattn-vec decode (src/fattn_vec_decode.cu).
 bool launch_fattn_vec_decode_f32(
         float *out, const float *q, uint32_t q_stride,
@@ -181,6 +190,28 @@ uint32_t prefill_attn_min_batch() {
         return static_cast<uint32_t>(16);
     }();
     return v;
+}
+
+// Prefill matmul kernel selector.
+//   QW3_MATMUL=mmq    -> INT8 MMA path (m16n8k32.s8.s8.s32) directly on
+//                        Q8_0 weight + Q8_1 activations. Skips the
+//                        Q8 -> FP16 weight dequant cache and the
+//                        FP32 -> FP16 activation conversion. Parity-correct
+//                        with HGEMM (logit max-diff < 1.0; 0 top-1
+//                        mismatches over 33 steps on a smoke prompt) but
+//                        currently ~3x SLOWER than HGEMM in this v1
+//                        (16x32 tile, 1 warp / CTA, no shmem staging).
+//                        Kept off-by-default until a bigger tile (4-warp
+//                        CTA + cooperative weight shmem) catches HGEMM.
+//   QW3_MATMUL=hgemm  -> (default) cuBLAS HGEMM via FP16 mirror cache.
+enum class MatmulKernel { Mmq, Hgemm };
+MatmulKernel matmul_kernel_choice() {
+    static const MatmulKernel choice = []() {
+        const char *env = std::getenv("QW3_MATMUL");
+        if (env && std::strcmp(env, "mmq") == 0) return MatmulKernel::Mmq;
+        return MatmulKernel::Hgemm;
+    }();
+    return choice;
 }
 
 
@@ -1501,6 +1532,13 @@ public:
         // For batch == 1 (decode) we stay on the dp4a path which is faster.
         const uint32_t hgemm_threshold = 8;
         if (batch >= hgemm_threshold && in_stride == w.cols && out_stride == w.rows) {
+            // INT8 MMA path (opt-in via QW3_MATMUL=mmq). Operates on the raw
+            // Q8_0 weight + on-the-fly Q8_1 activation; no FP16 dequant cache,
+            // no FP32 -> FP16 activation conversion. Falls back to HGEMM on
+            // any failure (alloc, launch, shape constraint).
+            if (matmul_kernel_choice() == MatmulKernel::Mmq && (w.cols % 32) == 0) {
+                if (auto st = mmq_q8(o.ptr, w, input.ptr, batch); st.ok) return st;
+            }
             DeviceStatus st = hgemm_q8(o.ptr, w, input.ptr, batch);
             if (st.ok) return st;
             // Fall through to dp4a on HGEMM error (e.g. OOM allocating cache).
@@ -1567,6 +1605,35 @@ private:
             return st;
         }
         return {};
+    }
+
+    // INT8 MMA Q8_0 x Q8_1 matmul (m16n8k32.s8.s8.s32). Uses the same
+    // q8_1_scratch_ buffer as decode mmvq for the activation Q8_1 stage.
+    DeviceStatus mmq_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
+        const size_t need = ported::q8_1_scratch_bytes(batch, w.cols);
+        if (need > q8_1_scratch_capacity_) {
+            if (q8_1_scratch_) cudaFree(q8_1_scratch_);
+            if (auto st = cuda_status(cudaMalloc(&q8_1_scratch_, need),
+                                      "mmq q8_1 scratch alloc"); !st.ok) {
+                q8_1_scratch_ = nullptr;
+                q8_1_scratch_capacity_ = 0;
+                return st;
+            }
+            q8_1_scratch_capacity_ = need;
+        }
+        if (!ported::launch_quantize_q8_1(x_ptr, q8_1_scratch_,
+                                          batch, w.cols, /*stride_x_row=*/w.cols,
+                                          /*stream=*/0)) {
+            return {false, "mmq quantize_q8_1 launch failed"};
+        }
+        if (!ported::launch_mmq_q8_0(static_cast<const uint8_t *>(w.ptr),
+                                     q8_1_scratch_, out_ptr,
+                                     static_cast<uint32_t>(w.rows), w.cols,
+                                     batch, /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                                     /*stream=*/0)) {
+            return {false, "mmq launch failed"};
+        }
+        return launch_status("cuda q8_0_matmul mmq");
     }
 
     DeviceStatus dispatch_q8_matvec(float *out_ptr,

@@ -12,7 +12,12 @@ option(QW3_ENABLE_CUDA "Build CUDA native kernels" OFF)
 if(QW3_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    set(QW3_CUDA_SRCS src/kernels_cuda.cu src/gated_delta_net.cu src/mmvq_q8.cu src/fattn_vec_decode.cu)
+    # Default to Ampere+ — INT8 MMA m16n8k32.s8.s8.s32 (mmq_q8.cu) needs
+    # sm_80. Override with -DCMAKE_CUDA_ARCHITECTURES=...
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80)
+    endif()
+    set(QW3_CUDA_SRCS src/kernels_cuda.cu src/gated_delta_net.cu src/mmvq_q8.cu src/fattn_vec_decode.cu src/mmq_q8.cu)
 else()
     set(QW3_CUDA_SRCS src/kernels_cuda_stub.cpp)
 endif()
