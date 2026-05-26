@@ -319,6 +319,53 @@ __global__ void silu_kernel(float *out, const float *x, uint64_t n) {
     if (i < n) out[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
+// Single-block argmax over the vocab logits. n is ~152K for Qwen3.6 — a single
+// 1024-thread block strided over the array beats a two-stage reduction here
+// (memory-bound, one launch). Result is written as [token : int32, logit-bits :
+// int32] into out[0..1] so the host can read both in a single 8-byte async D2H.
+__global__ void argmax_kernel(int32_t *__restrict__ out,
+                              const float *__restrict__ x,
+                              uint64_t n) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t bsz = blockDim.x;
+    float local_max = -INFINITY;
+    int32_t local_idx = -1;
+    for (uint64_t i = tid; i < n; i += bsz) {
+        const float v = x[i];
+        if (v > local_max) { local_max = v; local_idx = static_cast<int32_t>(i); }
+    }
+    // Warp-level reduction: tie-break on lower index for determinism.
+    for (int off = 16; off > 0; off >>= 1) {
+        const float    om = __shfl_xor_sync(0xffffffff, local_max, off);
+        const int32_t  oi = __shfl_xor_sync(0xffffffff, local_idx, off);
+        if (om > local_max || (om == local_max && oi < local_idx)) {
+            local_max = om; local_idx = oi;
+        }
+    }
+    __shared__ float    warp_max[32];
+    __shared__ int32_t  warp_idx[32];
+    const uint32_t warp = tid >> 5;
+    const uint32_t lane = tid & 31;
+    if (lane == 0) { warp_max[warp] = local_max; warp_idx[warp] = local_idx; }
+    __syncthreads();
+    if (warp == 0) {
+        const uint32_t nwarps = bsz >> 5;
+        if (lane < nwarps) { local_max = warp_max[lane]; local_idx = warp_idx[lane]; }
+        else               { local_max = -INFINITY;  local_idx = -1; }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float   om = __shfl_xor_sync(0xffffffff, local_max, off);
+            const int32_t oi = __shfl_xor_sync(0xffffffff, local_idx, off);
+            if (om > local_max || (om == local_max && oi < local_idx)) {
+                local_max = om; local_idx = oi;
+            }
+        }
+        if (lane == 0) {
+            out[0] = local_idx;
+            out[1] = __float_as_int(local_max);
+        }
+    }
+}
+
 // Fused silu(gate) * up for the SwiGLU FFN: one launch, one read per element
 // instead of silu (read gate, write gate) then mul (read gate, read up, write
 // out). Saves 64 launches per decode token.
@@ -1470,8 +1517,11 @@ public:
             if (hgemm_done_[i]) cudaEventDestroy(hgemm_done_[i]);
         }
         if (dequant_stream_) cudaStreamDestroy(dequant_stream_);
+        if (exec_stream_) cudaStreamDestroy(exec_stream_);
         if (q8_1_scratch_) cudaFree(q8_1_scratch_);
         if (fattn_scratch_) cudaFree(fattn_scratch_);
+        if (argmax_dev_) cudaFree(argmax_dev_);
+        if (argmax_host_) cudaFreeHost(argmax_host_);
     }
 
     const char *name() const override {
@@ -1480,8 +1530,15 @@ public:
 
     DeviceStatus begin() override {
         if (auto st = cuda_status(cudaSetDevice(0), "cuda begin"); !st.ok) return st;
+        if (!exec_stream_) {
+            if (auto st = cuda_status(cudaStreamCreateWithFlags(&exec_stream_,
+                                                                cudaStreamNonBlocking),
+                                      "cuda exec stream"); !st.ok) return st;
+        }
         if (!cublas_handle_) {
             if (auto st = cublas_status(cublasCreate(&cublas_handle_), "cublasCreate"); !st.ok) return st;
+            if (auto st = cublas_status(cublasSetStream(cublas_handle_, exec_stream_),
+                                        "cublasSetStream"); !st.ok) return st;
         }
         return {};
     }
@@ -1491,7 +1548,10 @@ public:
     }
 
     DeviceStatus synchronize() override {
-        return cuda_status(cudaDeviceSynchronize(), "cuda synchronize");
+        if (!exec_stream_) {
+            return cuda_status(cudaDeviceSynchronize(), "cuda synchronize");
+        }
+        return cuda_status(cudaStreamSynchronize(exec_stream_), "cuda stream synchronize");
     }
 
     std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) override {
@@ -1513,7 +1573,8 @@ public:
     DeviceStatus q8_0_get_row(DeviceTensor &out, const DeviceWeight &weight, uint64_t row) override {
         const auto &w = as_weight(weight);
         auto &o = as_tensor(out);
-        q8_get_row_kernel<<<static_cast<unsigned>((w.cols + 255) / 256), 256>>>(o.ptr, static_cast<const uint8_t *>(w.ptr), row, w.cols);
+        q8_get_row_kernel<<<static_cast<unsigned>((w.cols + 255) / 256), 256, 0, exec_stream_>>>(
+            o.ptr, static_cast<const uint8_t *>(w.ptr), row, w.cols);
         return launch_status("cuda q8_0_get_row");
     }
 
@@ -1530,11 +1591,11 @@ public:
             cudaMalloc(&rows_buf_, batch * sizeof(uint64_t));
             rows_buf_capacity_ = batch;
         }
-        cudaMemcpyAsync(rows_buf_, rows, batch * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(rows_buf_, rows, batch * sizeof(uint64_t), cudaMemcpyHostToDevice, exec_stream_);
         const unsigned threads = 256;
         const unsigned bx = static_cast<unsigned>((w.cols + threads - 1) / threads);
         dim3 grid(bx, batch);
-        q8_get_rows_batch_kernel<<<grid, threads>>>(o.ptr, static_cast<const uint8_t *>(w.ptr),
+        q8_get_rows_batch_kernel<<<grid, threads, 0, exec_stream_>>>(o.ptr, static_cast<const uint8_t *>(w.ptr),
                                                     rows_buf_, w.cols);
         return launch_status("cuda q8_0_get_rows_batch");
     }
@@ -1620,7 +1681,7 @@ public:
         if (!ported::launch_quantize_q8_1(input.ptr, q8_1_scratch_,
                                           /*batch=*/1, static_cast<uint32_t>(cols),
                                           /*stride_x_row=*/static_cast<uint32_t>(cols),
-                                          /*stream=*/0)) {
+                                          exec_stream_)) {
             return {false, "fanout quantize_q8_1 launch failed"};
         }
         for (uint32_t i = 0; i < n; ++i) {
@@ -1632,7 +1693,7 @@ public:
                                           static_cast<uint32_t>(w.cols),
                                           /*batch=*/1,
                                           /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
-                                          /*stream=*/0)) {
+                                          exec_stream_)) {
                 return {false, "fanout mmvq_q8_0 launch failed"};
             }
         }
@@ -1735,14 +1796,14 @@ private:
         {
             const unsigned threads = 256;
             const unsigned blocks = static_cast<unsigned>((x_elems + threads - 1) / threads);
-            fp32_to_fp16_kernel<<<blocks, threads>>>(x_fp16_workspace_, x_ptr, x_elems);
+            fp32_to_fp16_kernel<<<blocks, threads, 0, exec_stream_>>>(x_fp16_workspace_, x_ptr, x_elems);
             if (auto st = launch_status("hgemm fp32->fp16"); !st.ok) return st;
         }
 
         // cuBLAS waits for the matching dequant to complete before reading
-        // buffer[idx]. cuBLAS handle uses the default stream (0), so we issue
-        // a stream-wait on stream 0.
-        cudaStreamWaitEvent(/*stream=*/0, dequant_done_[idx], 0);
+        // buffer[idx]. cuBLAS handle is bound to exec_stream_; issue the
+        // stream-wait there.
+        cudaStreamWaitEvent(exec_stream_, dequant_done_[idx], 0);
 
         const float alpha = 1.0f;
         const float beta = 0.0f;
@@ -1768,7 +1829,7 @@ private:
                 "cublasGemmEx hgemm_q8"); !st.ok) {
             return st;
         }
-        cudaEventRecord(hgemm_done_[idx], /*stream=*/0);
+        cudaEventRecord(hgemm_done_[idx], exec_stream_);
 
         w_fp16_idx_ ^= 1;
         return {};
@@ -1785,8 +1846,8 @@ private:
                                       "hgemm event"); !st.ok) return st;
             // Initial events are signalled so the first dequant doesn't
             // block waiting on a non-existent prior HGEMM.
-            cudaEventRecord(dequant_done_[i], /*stream=*/0);
-            cudaEventRecord(hgemm_done_[i],   /*stream=*/0);
+            cudaEventRecord(dequant_done_[i], exec_stream_);
+            cudaEventRecord(hgemm_done_[i],   exec_stream_);
         }
         return {};
     }
@@ -1814,14 +1875,14 @@ private:
         if (auto st = ensure_q8_1_scratch(batch, w.cols); !st.ok) return st;
         if (!ported::launch_quantize_q8_1(x_ptr, q8_1_scratch_,
                                           batch, w.cols, /*stride_x_row=*/w.cols,
-                                          /*stream=*/0)) {
+                                          exec_stream_)) {
             return {false, "mmq quantize_q8_1 launch failed"};
         }
         if (!ported::launch_mmq_q8_0(static_cast<const uint8_t *>(w.ptr),
                                      q8_1_scratch_, out_ptr,
                                      static_cast<uint32_t>(w.rows), w.cols,
                                      batch, /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
-                                     /*stream=*/0)) {
+                                     exec_stream_)) {
             return {false, "mmq launch failed"};
         }
         return launch_status("cuda q8_0_matmul mmq");
@@ -1848,14 +1909,14 @@ private:
             // past row 0.
             const uint32_t qstride = (batch == 1) ? w.cols : in_stride;
             if (!ported::launch_quantize_q8_1(x_ptr, q8_1_scratch_,
-                                              batch, w.cols, qstride, /*stream=*/0)) {
+                                              batch, w.cols, qstride, exec_stream_)) {
                 return {false, "ported quantize_q8_1 launch failed"};
             }
             const uint32_t dst_stride = (batch == 1) ? w.rows : out_stride;
             if (!ported::launch_mmvq_q8_0(static_cast<const uint8_t *>(w.ptr),
                                           q8_1_scratch_, out_ptr,
                                           static_cast<uint32_t>(w.rows), w.cols,
-                                          batch, dst_stride, /*stream=*/0)) {
+                                          batch, dst_stride, exec_stream_)) {
                 return {false, "ported mmvq_q8_0 launch failed"};
             }
             return launch_status("cuda q8_0_matvec ported");
@@ -1886,7 +1947,7 @@ private:
                 const unsigned bx = static_cast<unsigned>((rows + W - 1) / W);
                 dim3 grid(bx, by);
                 q8_matmul_tiled_dp4a_kernel<W, T>
-                    <<<grid, W * 32, shmem_dp4a * T>>>(
+                    <<<grid, W * 32, shmem_dp4a * T, exec_stream_>>>(
                         out_ptr, static_cast<const uint8_t *>(w.ptr), x_ptr,
                         rows, w.cols, batch, in_stride, out_stride);
             };
@@ -1923,17 +1984,17 @@ private:
             dim3 grid(blocks_grid, batch);
             if (use_dp4a) {
                 q8_matvec_dp4a_kernel<W>
-                    <<<grid, W * 32, shmem_dp4a>>>(
+                    <<<grid, W * 32, shmem_dp4a, exec_stream_>>>(
                         out_ptr, static_cast<const uint8_t *>(w.ptr), x_ptr,
                         rows, w.cols, in_stride, out_stride);
             } else if (fits_f32_shmem) {
                 q8_matvec_v2_kernel<W, true>
-                    <<<grid, W * 32, shmem_f32>>>(
+                    <<<grid, W * 32, shmem_f32, exec_stream_>>>(
                         out_ptr, static_cast<const uint8_t *>(w.ptr), x_ptr,
                         rows, w.cols, in_stride, out_stride);
             } else {
                 q8_matvec_v2_kernel<W, false>
-                    <<<grid, W * 32, 0>>>(
+                    <<<grid, W * 32, 0, exec_stream_>>>(
                         out_ptr, static_cast<const uint8_t *>(w.ptr), x_ptr,
                         rows, w.cols, in_stride, out_stride);
             }
@@ -1962,11 +2023,11 @@ public:
             && ((reinterpret_cast<uintptr_t>(w.ptr) & 0xF) == 0)
             && n >= 256;
         if (can_vec) {
-            rms_norm_kernel_vec<1024><<<1, 1024>>>(o.ptr, input.ptr,
+            rms_norm_kernel_vec<1024><<<1, 1024, 0, exec_stream_>>>(o.ptr, input.ptr,
                                                     static_cast<const float *>(w.ptr),
                                                     n, eps);
         } else {
-            rms_norm_kernel<<<1, 256>>>(o.ptr, input.ptr,
+            rms_norm_kernel<<<1, 256, 0, exec_stream_>>>(o.ptr, input.ptr,
                                         static_cast<const float *>(w.ptr), n, eps);
         }
         return launch_status("cuda rms_norm");
@@ -1983,7 +2044,7 @@ public:
         const auto &w = as_weight(weight);
         if (batch == 0) return {};
         // One block per row; existing kernel reads blockIdx.x as the row index.
-        rms_norm_kernel<<<batch, 256>>>(o.ptr, input.ptr, static_cast<const float *>(w.ptr), n, eps);
+        rms_norm_kernel<<<batch, 256, 0, exec_stream_>>>(o.ptr, input.ptr, static_cast<const float *>(w.ptr), n, eps);
         return launch_status("cuda rms_norm_batch");
     }
 
@@ -1991,14 +2052,14 @@ public:
         auto &o = as_tensor(out);
         const auto &aa = as_tensor(a);
         const auto &bb = as_tensor(b);
-        add_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256>>>(o.ptr, aa.ptr, bb.ptr, o.count);
+        add_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256, 0, exec_stream_>>>(o.ptr, aa.ptr, bb.ptr, o.count);
         return launch_status("cuda add");
     }
 
     DeviceStatus silu(DeviceTensor &out, const DeviceTensor &x) override {
         auto &o = as_tensor(out);
         const auto &input = as_tensor(x);
-        silu_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256>>>(o.ptr, input.ptr, o.count);
+        silu_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256, 0, exec_stream_>>>(o.ptr, input.ptr, o.count);
         return launch_status("cuda silu");
     }
 
@@ -2006,7 +2067,7 @@ public:
         auto &o = as_tensor(out);
         const auto &aa = as_tensor(a);
         const auto &bb = as_tensor(b);
-        mul_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256>>>(o.ptr, aa.ptr, bb.ptr, o.count);
+        mul_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256, 0, exec_stream_>>>(o.ptr, aa.ptr, bb.ptr, o.count);
         return launch_status("cuda mul");
     }
 
@@ -2014,7 +2075,7 @@ public:
         auto &o = as_tensor(out);
         const auto &g = as_tensor(gate);
         const auto &u = as_tensor(up);
-        silu_mul_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256>>>(
+        silu_mul_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256, 0, exec_stream_>>>(
             o.ptr, g.ptr, u.ptr, o.count);
         return launch_status("cuda silu_mul");
     }
@@ -2050,13 +2111,13 @@ public:
         const auto &dt = as_weight(dt_bias);
         const auto &nw = as_weight(ssm_norm);
         float *conv_buf = cout.ptr;
-        recurrent_conv_kernel<<<static_cast<unsigned>((p.count + 255) / 256), 256>>>(
+        recurrent_conv_kernel<<<static_cast<unsigned>((p.count + 255) / 256), 256, 0, exec_stream_>>>(
             conv_buf, cs.ptr, p.ptr, static_cast<const float *>(cw.ptr),
             static_cast<uint32_t>(p.count), conv_kernel_size);
-        l2_norm_128_kernel<<<num_k_heads, 128>>>(conv_buf, num_k_heads, head_k_dim, eps);
-        l2_norm_128_kernel<<<num_k_heads, 128>>>(conv_buf + num_k_heads * head_k_dim, num_k_heads, head_k_dim, eps);
+        l2_norm_128_kernel<<<num_k_heads, 128, 0, exec_stream_>>>(conv_buf, num_k_heads, head_k_dim, eps);
+        l2_norm_128_kernel<<<num_k_heads, 128, 0, exec_stream_>>>(conv_buf + num_k_heads * head_k_dim, num_k_heads, head_k_dim, eps);
         dim3 grid(num_v_heads, head_v_dim);
-        deltanet_kernel<<<grid, 128>>>(c.ptr,
+        deltanet_kernel<<<grid, 128, 0, exec_stream_>>>(c.ptr,
                                        s.ptr,
                                        conv_buf,
                                        a.ptr,
@@ -2067,7 +2128,7 @@ public:
                                        num_v_heads,
                                        head_k_dim,
                                        head_v_dim);
-        recurrent_norm_gate_kernel<<<num_v_heads, head_v_dim>>>(c.ptr, g.ptr, static_cast<const float *>(nw.ptr), num_v_heads, head_v_dim, eps);
+        recurrent_norm_gate_kernel<<<num_v_heads, head_v_dim, 0, exec_stream_>>>(c.ptr, g.ptr, static_cast<const float *>(nw.ptr), num_v_heads, head_v_dim, eps);
         return launch_status("cuda recurrent_single_token");
     }
 
@@ -2108,13 +2169,13 @@ public:
         const auto &dt = as_weight(dt_bias);
         const auto &nw = as_weight(ssm_norm);
         float *conv_buf = cout.ptr;
-        recurrent_conv_kernel<<<static_cast<unsigned>((proj_count + 255) / 256), 256>>>(
+        recurrent_conv_kernel<<<static_cast<unsigned>((proj_count + 255) / 256), 256, 0, exec_stream_>>>(
             conv_buf, cs.ptr, p.ptr + proj_off, static_cast<const float *>(cw.ptr),
             proj_count, conv_kernel_size);
-        l2_norm_128_kernel<<<num_k_heads, 128>>>(conv_buf, num_k_heads, head_k_dim, eps);
-        l2_norm_128_kernel<<<num_k_heads, 128>>>(conv_buf + num_k_heads * head_k_dim, num_k_heads, head_k_dim, eps);
+        l2_norm_128_kernel<<<num_k_heads, 128, 0, exec_stream_>>>(conv_buf, num_k_heads, head_k_dim, eps);
+        l2_norm_128_kernel<<<num_k_heads, 128, 0, exec_stream_>>>(conv_buf + num_k_heads * head_k_dim, num_k_heads, head_k_dim, eps);
         dim3 grid(num_v_heads, head_v_dim);
-        deltanet_kernel<<<grid, 128>>>(c.ptr + core_off,
+        deltanet_kernel<<<grid, 128, 0, exec_stream_>>>(c.ptr + core_off,
                                        s.ptr,
                                        conv_buf,
                                        a.ptr + alpha_off,
@@ -2125,7 +2186,7 @@ public:
                                        num_v_heads,
                                        head_k_dim,
                                        head_v_dim);
-        recurrent_norm_gate_kernel<<<num_v_heads, head_v_dim>>>(c.ptr + core_off, g.ptr + gate_off,
+        recurrent_norm_gate_kernel<<<num_v_heads, head_v_dim, 0, exec_stream_>>>(c.ptr + core_off, g.ptr + gate_off,
                                                                 static_cast<const float *>(nw.ptr),
                                                                 num_v_heads, head_v_dim, eps);
         return launch_status("cuda recurrent_single_token_at");
@@ -2179,25 +2240,25 @@ public:
         switch (conv_kernel_size) {
             case 3:
                 recurrent_conv_batch_kernel<3>
-                    <<<conv_blocks, conv_threads>>>(cout.ptr, cs.ptr, p.ptr,
+                    <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
                                                     static_cast<const float *>(cw.ptr),
                                                     batch, proj_count, proj_stride, proj_stride);
                 break;
             case 4:
                 recurrent_conv_batch_kernel<4>
-                    <<<conv_blocks, conv_threads>>>(cout.ptr, cs.ptr, p.ptr,
+                    <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
                                                     static_cast<const float *>(cw.ptr),
                                                     batch, proj_count, proj_stride, proj_stride);
                 break;
             case 5:
                 recurrent_conv_batch_kernel<5>
-                    <<<conv_blocks, conv_threads>>>(cout.ptr, cs.ptr, p.ptr,
+                    <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
                                                     static_cast<const float *>(cw.ptr),
                                                     batch, proj_count, proj_stride, proj_stride);
                 break;
             case 7:
                 recurrent_conv_batch_kernel<7>
-                    <<<conv_blocks, conv_threads>>>(cout.ptr, cs.ptr, p.ptr,
+                    <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
                                                     static_cast<const float *>(cw.ptr),
                                                     batch, proj_count, proj_stride, proj_stride);
                 break;
@@ -2211,9 +2272,9 @@ public:
         dim3 ln_grid(num_k_heads, batch);
         const uint32_t q_off = 0;
         const uint32_t k_off = num_k_heads * head_k_dim;
-        l2_norm_128_batch_kernel<<<ln_grid, 128>>>(cout.ptr, num_k_heads, head_k_dim,
+        l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
                                                    batch, proj_stride, q_off, eps);
-        l2_norm_128_batch_kernel<<<ln_grid, 128>>>(cout.ptr, num_k_heads, head_k_dim,
+        l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
                                                    batch, proj_stride, k_off, eps);
         if (auto st = launch_status("l2_norm_128_batch_kernel"); !st.ok) return st;
 
@@ -2254,14 +2315,14 @@ public:
                 batch,
                 num_k_heads, num_v_heads, head_k_dim,
                 proj_stride, alpha_stride, core_stride,
-                /*stream=*/0);
+                exec_stream_);
             if (!ok) return {false, "recurrent_batch: ported kernel rejected head_dim (only 16/32/64/128)"};
             if (auto st = launch_status("ported::gated_delta_net_kernel"); !st.ok) return st;
         } else {
             // Original qw3 kernel: one block per (vh, head_v_dim) iterates T
             // timesteps; reductions via __syncthreads() in shared memory.
             dim3 dn_grid(num_v_heads, head_v_dim);
-            deltanet_batch_kernel<<<dn_grid, 128>>>(c.ptr,
+            deltanet_batch_kernel<<<dn_grid, 128, 0, exec_stream_>>>(c.ptr,
                                                     s.ptr,
                                                     cout.ptr,
                                                     a.ptr,
@@ -2282,7 +2343,7 @@ public:
 
         // 4. RMSnorm + gate, batched over T.
         dim3 ng_grid(num_v_heads, batch);
-        recurrent_norm_gate_batch_kernel<<<ng_grid, head_v_dim>>>(c.ptr, g.ptr,
+        recurrent_norm_gate_batch_kernel<<<ng_grid, head_v_dim, 0, exec_stream_>>>(c.ptr, g.ptr,
                                                                   static_cast<const float *>(nw.ptr),
                                                                   batch, num_v_heads, head_v_dim,
                                                                   core_stride, gate_stride, eps);
@@ -2291,7 +2352,8 @@ public:
 
     DeviceStatus zero_tensor(DeviceTensor &x) override {
         auto &t = as_tensor(x);
-        return cuda_status(cudaMemset(t.ptr, 0, static_cast<size_t>(t.count) * t.elem_size),
+        return cuda_status(cudaMemsetAsync(t.ptr, 0, static_cast<size_t>(t.count) * t.elem_size,
+                                           exec_stream_),
                             "zero_tensor");
     }
 
@@ -2311,7 +2373,7 @@ public:
         const auto &vv = as_tensor(v);
         const auto &qn = as_weight(q_norm);
         const auto &kn = as_weight(k_norm);
-        attention_norm_mid_kernel<<<n_heads, head_dim>>>(m.ptr,
+        attention_norm_mid_kernel<<<n_heads, head_dim, 0, exec_stream_>>>(m.ptr,
                                                          qq.ptr,
                                                          kk.ptr,
                                                          vv.ptr,
@@ -2333,7 +2395,7 @@ public:
         auto &t = as_tensor(x);
         const auto &w = as_weight(weight);
         dim3 grid(n_units, 1);
-        rmsnorm_per_head_kernel<<<grid, 256>>>(t.ptr,
+        rmsnorm_per_head_kernel<<<grid, 256, 0, exec_stream_>>>(t.ptr,
                                                 static_cast<const float *>(w.ptr),
                                                 n_units, per_unit_stride, head_dim, /*batch_stride=*/0, eps);
         return launch_status("cuda rmsnorm_per_head");
@@ -2351,7 +2413,7 @@ public:
         auto &t = as_tensor(x);
         const auto &w = as_weight(weight);
         dim3 grid(n_units, batch);
-        rmsnorm_per_head_kernel<<<grid, 256>>>(t.ptr,
+        rmsnorm_per_head_kernel<<<grid, 256, 0, exec_stream_>>>(t.ptr,
                                                 static_cast<const float *>(w.ptr),
                                                 n_units, per_unit_stride, head_dim, batch_stride, eps);
         return launch_status("cuda rmsnorm_per_head_batch");
@@ -2367,7 +2429,7 @@ public:
         const uint32_t half = rope_dim / 2;
         if (half == 0) return {};
         dim3 grid(n_units, 1);
-        rope_partial_kernel<<<grid, half>>>(t.ptr, n_units, per_unit_stride, rope_dim, pos, /*batch_stride=*/0, theta);
+        rope_partial_kernel<<<grid, half, 0, exec_stream_>>>(t.ptr, n_units, per_unit_stride, rope_dim, pos, /*batch_stride=*/0, theta);
         return launch_status("cuda rope_partial");
     }
 
@@ -2384,7 +2446,7 @@ public:
         const uint32_t half = rope_dim / 2;
         if (half == 0) return {};
         dim3 grid(n_units, batch);
-        rope_partial_kernel<<<grid, half>>>(t.ptr, n_units, per_unit_stride, rope_dim, base_pos, batch_stride, theta);
+        rope_partial_kernel<<<grid, half, 0, exec_stream_>>>(t.ptr, n_units, per_unit_stride, rope_dim, base_pos, batch_stride, theta);
         return launch_status("cuda rope_partial_batch");
     }
 
@@ -2398,9 +2460,9 @@ public:
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(blocks, 1);
         if (c.is_fp16()) {
-            kv_append_kernel_f16<<<grid, threads>>>(c.ptr_h(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
+            kv_append_kernel_f16<<<grid, threads, 0, exec_stream_>>>(c.ptr_h(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
         } else {
-            kv_append_kernel<<<grid, threads>>>(c.ptr, s.ptr, pos, per_pos_size, /*src_stride=*/0);
+            kv_append_kernel<<<grid, threads, 0, exec_stream_>>>(c.ptr, s.ptr, pos, per_pos_size, /*src_stride=*/0);
         }
         return launch_status("cuda kv_append");
     }
@@ -2417,9 +2479,9 @@ public:
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(blocks, batch);
         if (c.is_fp16()) {
-            kv_append_kernel_f16<<<grid, threads>>>(c.ptr_h(), s.ptr, base_pos, per_pos_size, per_pos_size);
+            kv_append_kernel_f16<<<grid, threads, 0, exec_stream_>>>(c.ptr_h(), s.ptr, base_pos, per_pos_size, per_pos_size);
         } else {
-            kv_append_kernel<<<grid, threads>>>(c.ptr, s.ptr, base_pos, per_pos_size, per_pos_size);
+            kv_append_kernel<<<grid, threads, 0, exec_stream_>>>(c.ptr, s.ptr, base_pos, per_pos_size, per_pos_size);
         }
         return launch_status("cuda kv_append_batch");
     }
@@ -2467,7 +2529,7 @@ public:
                     o.ptr, fattn_scratch_, qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim, seq_len, /*batch=*/1,
                     /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale,
-                    /*stream=*/0)) {
+                    exec_stream_)) {
                 return launch_status("cuda attn ported f16 splitk");
             }
             return {false, "fattn_vec f16 splitk launcher refused head_dim"};
@@ -2482,14 +2544,14 @@ public:
                     o.ptr, fattn_scratch_, qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim, seq_len, /*batch=*/1,
                     /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale,
-                    /*stream=*/0)) {
+                    exec_stream_)) {
                 return launch_status("cuda attn ported splitk");
             }
         }
         if (head_dim == 128) {
             // Fused flash-attention-style decode: 1 kernel, no scores materialization.
             dim3 grid(n_heads, 1);
-            attention_decode_fused_kernel<128, 64><<<grid, 128>>>(
+            attention_decode_fused_kernel<128, 64><<<grid, 128, 0, exec_stream_>>>(
                 o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
                 n_heads, n_kv_heads, /*base_seq_len=*/seq_len - 1,
                 /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale);
@@ -2497,7 +2559,7 @@ public:
         }
         if (head_dim == 256) {
             dim3 grid(n_heads, 1);
-            attention_decode_fused_kernel<256, 64><<<grid, 256>>>(
+            attention_decode_fused_kernel<256, 64><<<grid, 256, 0, exec_stream_>>>(
                 o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
                 n_heads, n_kv_heads, /*base_seq_len=*/seq_len - 1,
                 /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale);
@@ -2506,12 +2568,12 @@ public:
         // Fallback for unexpected head dims.
         auto &s = as_tensor(scores_scratch);
         dim3 grid_qk(n_heads, seq_len);
-        attention_decode_qk_kernel<<<grid_qk, 256>>>(s.ptr, qq.ptr, q_stride, kc.ptr,
+        attention_decode_qk_kernel<<<grid_qk, 256, 0, exec_stream_>>>(s.ptr, qq.ptr, q_stride, kc.ptr,
                                                     n_heads, n_kv_heads, head_dim, seq_len, scale);
         if (auto st = launch_status("cuda attn qk"); !st.ok) return st;
-        attention_decode_softmax_kernel<<<n_heads, 256>>>(s.ptr, n_heads, seq_len);
+        attention_decode_softmax_kernel<<<n_heads, 256, 0, exec_stream_>>>(s.ptr, n_heads, seq_len);
         if (auto st = launch_status("cuda attn softmax"); !st.ok) return st;
-        attention_decode_av_kernel<<<n_heads, head_dim>>>(o.ptr, s.ptr, vc.ptr,
+        attention_decode_av_kernel<<<n_heads, head_dim, 0, exec_stream_>>>(o.ptr, s.ptr, vc.ptr,
                                                          n_heads, n_kv_heads, head_dim, seq_len);
         return launch_status("cuda attn av");
     }
@@ -2527,7 +2589,7 @@ public:
         const unsigned threads = 256;
         const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
         dim3 grid(blocks, 1);
-        apply_attn_gate_kernel<<<grid, threads>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim, 0, 0);
+        apply_attn_gate_kernel<<<grid, threads, 0, exec_stream_>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim, 0, 0);
         return launch_status("cuda apply_attn_gate");
     }
 
@@ -2546,7 +2608,7 @@ public:
         const unsigned threads = 256;
         const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
         dim3 grid(blocks, batch);
-        apply_attn_gate_kernel<<<grid, threads>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim,
+        apply_attn_gate_kernel<<<grid, threads, 0, exec_stream_>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim,
                                                   batch_stride_q, batch_stride_out);
         return launch_status("cuda apply_attn_gate_batch");
     }
@@ -2583,7 +2645,7 @@ public:
                     o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim,
                     batch, base_seq_len,
-                    q_batch_stride, out_batch_stride, scale, /*stream=*/0)) {
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
                 return launch_status("cuda attention_decode_batch tiled f16");
             }
         }
@@ -2596,7 +2658,7 @@ public:
                     o.ptr, fattn_scratch_, qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim,
                     /*seq_len=*/base_seq_len + 1, batch,
-                    q_batch_stride, out_batch_stride, scale, /*stream=*/0)) {
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
                 return launch_status("cuda attention_decode_batch ported f16 splitk");
             }
             return {false, "fattn_vec f16 splitk launcher refused head_dim"};
@@ -2612,20 +2674,20 @@ public:
                     o.ptr, fattn_scratch_, qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim,
                     /*seq_len=*/base_seq_len + 1, batch,
-                    q_batch_stride, out_batch_stride, scale, /*stream=*/0)) {
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
                 return launch_status("cuda attention_decode_batch ported splitk");
             }
         }
         dim3 grid(n_heads, batch);
         if (head_dim == 128) {
-            attention_decode_fused_kernel<128, 64><<<grid, 128>>>(
+            attention_decode_fused_kernel<128, 64><<<grid, 128, 0, exec_stream_>>>(
                 o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
                 n_heads, n_kv_heads, base_seq_len,
                 q_batch_stride, out_batch_stride, scale);
             return launch_status("cuda attention_decode_batch 128");
         }
         if (head_dim == 256) {
-            attention_decode_fused_kernel<256, 64><<<grid, 256>>>(
+            attention_decode_fused_kernel<256, 64><<<grid, 256, 0, exec_stream_>>>(
                 o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
                 n_heads, n_kv_heads, base_seq_len,
                 q_batch_stride, out_batch_stride, scale);
@@ -2636,27 +2698,36 @@ public:
 
     DeviceArgmax argmax(const DeviceTensor &x) override {
         const auto &t = as_tensor(x);
-        std::vector<float> host(static_cast<size_t>(t.count));
-        cudaMemcpy(host.data(), t.ptr, static_cast<size_t>(t.count) * sizeof(float), cudaMemcpyDeviceToHost);
-        DeviceArgmax best;
-        best.logit = -INFINITY;
-        for (size_t i = 0; i < host.size(); ++i) {
-            if (host[i] > best.logit) {
-                best.logit = host[i];
-                best.token = static_cast<int>(i);
-            }
+        if (!argmax_dev_) {
+            cudaMalloc(&argmax_dev_, 2 * sizeof(int32_t));
         }
+        if (!argmax_host_) {
+            cudaHostAlloc(reinterpret_cast<void **>(&argmax_host_),
+                          2 * sizeof(int32_t), cudaHostAllocDefault);
+        }
+        argmax_kernel<<<1, 1024, 0, exec_stream_>>>(argmax_dev_, t.ptr, t.count);
+        cudaMemcpyAsync(argmax_host_, argmax_dev_, 2 * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost, exec_stream_);
+        cudaStreamSynchronize(exec_stream_);
+        DeviceArgmax best;
+        best.token = argmax_host_[0];
+        float logit;
+        std::memcpy(&logit, &argmax_host_[1], sizeof(float));
+        best.logit = logit;
         return best;
     }
 
     DeviceStatus copy_to_host(const DeviceTensor &x, float *host, uint64_t offset, uint64_t count) override {
         const auto &t = as_tensor(x);
         if (offset + count > t.count) return {false, "copy_to_host out of range"};
-        return cuda_status(cudaMemcpy(host,
-                                      t.ptr + offset,
-                                      static_cast<size_t>(count) * sizeof(float),
-                                      cudaMemcpyDeviceToHost),
-                            "copy_to_host");
+        if (auto st = cuda_status(cudaMemcpyAsync(host,
+                                                   t.ptr + offset,
+                                                   static_cast<size_t>(count) * sizeof(float),
+                                                   cudaMemcpyDeviceToHost,
+                                                   exec_stream_),
+                                   "copy_to_host async");
+            !st.ok) return st;
+        return cuda_status(cudaStreamSynchronize(exec_stream_), "copy_to_host sync");
     }
 
     DeviceStatus copy_d2d(DeviceTensor &dst,
@@ -2670,7 +2741,8 @@ public:
         return cuda_status(cudaMemcpyAsync(d.ptr,
                                             s.ptr + src_offset,
                                             static_cast<size_t>(count) * sizeof(float),
-                                            cudaMemcpyDeviceToDevice),
+                                            cudaMemcpyDeviceToDevice,
+                                            exec_stream_),
                             "copy_d2d");
     }
 
@@ -2705,6 +2777,17 @@ private:
     // because the kernel writes-then-reads it in a single launch+combine pair.
     void   *fattn_scratch_ = nullptr;
     size_t  fattn_scratch_capacity_ = 0;  // bytes
+    // Single execution stream for all kernel launches. Created lazily in
+    // begin(). Threading every launch through this stream (instead of stream
+    // 0) is a prerequisite for CUDA graph capture and lets cuBLAS/HGEMM
+    // pipelines coexist with the rest of decode without forced syncs on the
+    // legacy default stream.
+    cudaStream_t exec_stream_ = nullptr;
+    // Device-side argmax output (token, logit) and a pinned-host mirror.
+    // Avoids the synchronous full-logits cudaMemcpy + host scan that the old
+    // path did per token.
+    int32_t *argmax_dev_ = nullptr;     // [token (int32), logit (float as int32 bits)]
+    int32_t *argmax_host_ = nullptr;    // pinned host mirror, 2 ints
 };
 
 } // namespace
