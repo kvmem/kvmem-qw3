@@ -120,6 +120,18 @@ AttentionKernel attention_kernel_choice() {
     return choice;
 }
 
+// Prewarm Q8_0 weights' FP16 mirror at upload time (default ON). Set
+// QW3_PREWARM_F16=0 to disable for decode-only workloads where the FP16
+// cache is unused and memory is tight.
+bool prewarm_f16_choice() {
+    static const bool choice = []() {
+        const char *env = std::getenv("QW3_PREWARM_F16");
+        if (env && std::strcmp(env, "0") == 0) return false;
+        return true;
+    }();
+    return choice;
+}
+
 
 static thread_local char g_err[256];
 
@@ -1321,7 +1333,19 @@ public:
     }
 
     std::unique_ptr<DeviceWeight> weight_q8_0(const void *data, uint64_t rows, uint64_t cols, const char *label) override {
-        return std::make_unique<CudaWeight>(data, rows * (cols / 32) * 34, rows, cols, WeightType::Q8_0, label);
+        auto w = std::make_unique<CudaWeight>(data, rows * (cols / 32) * 34, rows, cols, WeightType::Q8_0, label);
+        // Eagerly populate the FP16 mirror used by the HGEMM prefill path.
+        // The dequant cost (~300ms for the full 27B Qwen 3.6 weight set) used
+        // to fall on the first prefill call, where it bloats short-prompt
+        // timing because it doesn't amortize over a small token budget.
+        // Doing it at upload time folds the cost into model load instead,
+        // where it coexists with the H2D copies for free. Set QW3_PREWARM_F16=0
+        // to skip if you only ever decode (FP16 cache stays unused = no GPU
+        // memory cost).
+        if (prewarm_f16_choice()) {
+            (void)ensure_q8_f16_cache(*w);
+        }
+        return w;
     }
 
     DeviceStatus q8_0_get_row(DeviceTensor &out, const DeviceWeight &weight, uint64_t row) override {

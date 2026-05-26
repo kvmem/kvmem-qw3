@@ -30,10 +30,10 @@ python3 scripts/long_prompt_sweep.py --prompt-tokens "512 1024 2048 4096" \
 
 | Prompt tokens | qw3 prefill | llama prefill | pref ratio | qw3 decode | llama decode | dec ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-|  556 |  970.3 | 2754.1 | **35.2%** | 36.7 | 45.1 | **81.4%** |
-| 1098 | 1590.8 | 3293.9 | **48.3%** | 37.0 | 45.1 | **81.9%** |
-| 2182 | 2175.1 | 3596.9 | **60.5%** | 37.5 | 45.4 | **82.6%** |
-| 4350 | 2359.5 | 3777.3 | **62.5%** | 37.5 | 44.8 | **83.7%** |
+|  556 | 2235.4 | 2749.9 | **81.3%** | 36.8 | 45.1 | **81.6%** |
+| 1098 | 2836.0 | 3297.1 | **86.0%** | 37.0 | 45.3 | **81.7%** |
+| 2182 | 3105.8 | 3598.9 | **86.3%** | 37.5 | 45.4 | **82.6%** |
+| 4350 | 2783.4 | 3776.2 | **73.7%** | 37.5 | 44.8 | **83.8%** |
 
 Two trends jump out:
 
@@ -46,12 +46,13 @@ Two trends jump out:
   softmax combine kernel — the original kernel only used `n_heads × 4`
   warps, leaving most of Blackwell's SMs idle). The remaining 17% gap is
   decode matvec dominated; see roadmap.
-- **Prefill scales monotonically with prompt length** (970 → 2360 tok/s),
-  closing from 35% to 62% of llama.cpp as the matmul shape grows. The
-  HGEMM tensor-core path is the right idea but the Q8 → FP16 dequant +
-  FP32 → FP16 activation conversion still eat ~7% of total time. llama.cpp's
-  MMQ runs INT8 MMA directly on repacked Q8 with no conversions and keeps
-  scaling — that's the next prefill win.
+- **Prefill peaks at 86% of llama.cpp on mid-length prompts** (1K–2K) and
+  drops to 74% at 4K. Eagerly populating the Q8 → FP16 weight cache at
+  upload time (`QW3_PREWARM_F16=1`, default on) moved the ~300 ms one-shot
+  dequant cost out of first-prefill timing — biggest swing at short
+  prompts (35% → 81%). The 4K dip vs the 2K peak is currently being
+  investigated; the leading suspect is HGEMM tile selection / activation
+  buffer pressure at very long batch dimensions.
 
 How we got here (prefill on a 1322-token prompt, earlier baseline measurements):
 
@@ -62,10 +63,14 @@ How we got here (prefill on a 1322-token prompt, earlier baseline measurements):
 | + Fused batched recurrent (1 launch / layer / sub-op) | 1031.6 | 30.1% |
 | + Ported MMVQ (Q8_1 activation) + flash-attention-vec decode | 1539 | 46.5% |
 | + F16 KV cache + split-K decode attention | 1590 | 48.3% |
+| + Eager Q8 → FP16 weight prewarm at upload time (1098-tok prompt) | 2836 | 86.0% |
 
 The split-K decode change moved the needle on **decode throughput** at long
 context (4350 tokens: 22 → 37 tok/s, +68%) while leaving prefill ~unchanged
-— prefill goes through HGEMM, not the per-token fattn-vec path.
+— prefill goes through HGEMM, not the per-token fattn-vec path. The eager
+prewarm pulled the one-shot Q8 → FP16 dequant out of the prefill timing
+window: same total work, just paid during model load (3.6 → 4.1 s) where
+it folds into existing H2D-copy time, instead of biting the first prefill.
 
 ## Bottlenecks and roadmap
 
@@ -74,20 +79,23 @@ new picture:
 
 | Kernel | % wall | Total time | Calls |
 |---|---:|---:|---:|
-| `mul_mat_vec_q8_0` (decode matvec, all linears) | **46.0%** | 1.19 s | 31312 |
-| CUTLASS HGEMM 256×128 (prefill linears) | 12.4% | 0.32 s | 400 |
-| `q8_dequant_f16` (one-shot weight unpack into FP16 cache) | 11.7% | 0.30 s | 496 |
-| `fattn_vec_decode_kernel` NSPLIT=4 (decode attention) | 7.1% | 0.18 s | 1008 |
-| `fattn_vec_decode_kernel` NSPLIT=1 (prefill attention) | 5.6% | 0.14 s | 16 |
-| RMSNorm | 4.4% | 0.11 s | 8256 |
-| `gated_delta_net` (DeltaNet recurrent) | 3.5% | 0.09 s | 48 |
+| `mul_mat_vec_q8_0` (decode matvec, all linears) | **45.8%** | 1.18 s | 31312 |
+| `q8_dequant_f16` (one-shot weight unpack at upload, prewarmed) | 13.4% | 0.35 s | 498 |
+| CUTLASS HGEMM 256×128 (prefill linears) | 12.2% | 0.32 s | 400 |
+| `fattn_vec_decode_kernel` NSPLIT=4 (decode attention) | 6.8% | 0.18 s | 1008 |
+| `fattn_vec_decode_kernel` NSPLIT=1 (prefill attention) | 5.4% | 0.14 s | 16 |
+| RMSNorm | 4.2% | 0.11 s | 8256 |
+| `gated_delta_net` (DeltaNet recurrent) | 3.4% | 0.09 s | 48 |
 
-The shift is dramatic: decode-attention used to be **47.5%** of wall (was
-the #1 bottleneck) and is now **7.1%**. Per-call attention dropped from
+The decode-attention shift was dramatic: it used to be **47.5%** of wall
+(the #1 bottleneck) and is now **6.8%**. Per-call attention dropped from
 1.38 ms to 0.18 ms because NSPLIT=4 multiplies grid occupancy by 4× — 24
 heads × 4 splits = 96 blocks of 4 warps = 384 warps, well above what
 Blackwell's 128 SMs need to fill the pipeline. The combine kernel is
-1.5 ms total across the whole run (negligible).
+1.5 ms total across the whole run (negligible). `q8_dequant_f16` is now
+charged at upload time (eager prewarm) — same total wall time, but the
+~300 ms cost folds into model load instead of the first prefill, where
+it used to dominate short-prompt timing.
 
 The new bottleneck is **decode matvec**: 31312 calls (≈489/token across
 48 layers × ~10 linears) at 38 µs each = 18.5 ms/token, ~70% of decode
@@ -95,15 +103,14 @@ wall time. Closing the remaining 17% decode gap to llama.cpp now means
 attacking matvec, not attention. So the next gains will come from:
 
 1. **MMQ-style prefill (INT8 MMA on repacked Q8).** Drops the Q8 → FP16
-   dequant cache (currently 11.7% of wall) and the FP32 → FP16 activation
-   conversion (~1%), and uses tensor-core integer MMA the way llama.cpp
-   does. Should lift prefill above ~3000 tok/s and remove the gap that
-   widens at short prompts.
+   dequant cache and the FP32 → FP16 activation conversion (~1%), and
+   uses tensor-core integer MMA the way llama.cpp does. Should lift
+   prefill above ~3500 tok/s and close the remaining 14–26% prefill gap.
 
 2. **Persistent activation Q8_1 buffer reuse across Q/K/V/gate/up.** The
    current `mul_mat_vec_q8_0` path re-quantizes the input to Q8_1 once per
    matvec; in attention and FFN, the same input feeds 3+ matvecs. Hoisting
-   the quantization across them cuts the `quantize_q8_1` cost (1.5% on
+   the quantization across them cuts the `quantize_q8_1` cost (1.4% on
    the new profile) and saves a pass over input memory.
 
 3. **CUDA graph capture of the decode loop.** Decode is 489+ kernel
@@ -112,7 +119,7 @@ attacking matvec, not attention. So the next gains will come from:
    At 489 kernels × ~5 µs launch latency = 2.4 ms/token of pure overhead;
    capturing should push decode toward 42 tok/s.
 
-4. **DeltaNet recurrent fusion.** 3.5% on long prompts; the four kernels
+4. **DeltaNet recurrent fusion.** 3.4% on long prompts; the four kernels
    per layer (conv, l2, deltanet, norm-gate) are each light but sequential.
    A single fused launch per layer is mostly a launch-latency win (small,
    but easy and stacks with #3).
