@@ -86,7 +86,7 @@ new picture:
 | Kernel | % wall | Total time | Calls |
 |---|---:|---:|---:|
 | `mul_mat_vec_q8_0` (decode matvec, all linears) | **45.8%** | 1.18 s | 31312 |
-| `q8_dequant_f16` (one-shot weight unpack at upload, prewarmed) | 13.4% | 0.35 s | 498 |
+| `q8_dequant_f16` (per-call weight unpack into shared scratch) | 13.4% | 0.35 s | 498 |
 | CUTLASS HGEMM 256×128 (prefill linears) | 12.2% | 0.32 s | 400 |
 | `fattn_vec_decode_kernel` NSPLIT=4 (decode attention) | 6.8% | 0.18 s | 1008 |
 | `fattn_vec_decode_kernel` NSPLIT=1 (prefill attention) | 5.4% | 0.14 s | 16 |
@@ -98,10 +98,14 @@ The decode-attention shift was dramatic: it used to be **47.5%** of wall
 1.38 ms to 0.18 ms because NSPLIT=4 multiplies grid occupancy by 4× — 24
 heads × 4 splits = 96 blocks of 4 warps = 384 warps, well above what
 Blackwell's 128 SMs need to fill the pipeline. The combine kernel is
-1.5 ms total across the whole run (negligible). `q8_dequant_f16` is now
-charged at upload time (eager prewarm) — same total wall time, but the
-~300 ms cost folds into model load instead of the first prefill, where
-it used to dominate short-prompt timing.
+1.5 ms total across the whole run (negligible). `q8_dequant_f16` runs
+once per HGEMM call into a shared FP16 scratch (sized to the largest
+single weight, ~150 MB) — earlier versions kept a persistent per-weight
+FP16 mirror but that ~doubled live model memory (54 GB on Qwen 3.6 27B)
+and defeated the point of Q8. The current shape pipelines the dequant
+on a side stream against the cuBLAS HGEMM via two ping-pong buffers so
+short prompts pay only the dequant overhead the side stream cannot hide
+(~20% at 401 tokens, near zero by 2K).
 
 The new bottleneck is **decode matvec**: 31312 calls (≈489/token across
 48 layers × ~10 linears) at 38 µs each = 18.5 ms/token, ~70% of decode
@@ -117,17 +121,26 @@ means attacking matvec, not attention. So the next gains will come from:
    ~534 ms to ~100 ms on the 4K case (estimated +500 tok/s prefill at
    long context).
 
-2. **MMQ-style prefill (INT8 MMA on repacked Q8).** Drops the Q8 → FP16
-   dequant cache and the FP32 → FP16 activation conversion, and uses
-   tensor-core integer MMA the way llama.cpp does. Should lift prefill
-   on every prompt length and shrink the −400 to −500 tok/s deficit at
-   1K–2K to near zero.
+2. **MMQ-style prefill (INT8 MMA on raw Q8).** Drops the on-the-fly
+   Q8 → FP16 dequant scratch and the FP32 → FP16 activation conversion,
+   and uses tensor-core integer MMA (`m16n8k32.s8.s8.s32`) the way
+   llama.cpp's `mmq.cuh` does. v1 is in tree (`src/mmq_q8.cu`,
+   selectable via `QW3_MATMUL=mmq`) and is parity-correct, but its
+   16×32 / single-warp tile runs ~3× slower than cuBLAS HGEMM. To
+   beat HGEMM the kernel needs to grow to a 4-warp CTA / 64×64
+   output tile with cooperative shmem-staged weight loads and
+   `ldmatrix.x4` for the A fragments — same shape as upstream
+   `mmq.cuh`. Once that lands, the dequant scratch and ping-pong
+   pipeline added to keep prefill fast without a persistent FP16
+   weight mirror go away entirely, and the short-prompt prefill
+   gap (−20% at 401 tokens vs the old mirror path) closes too.
 
-3. **Persistent activation Q8_1 buffer reuse across Q/K/V/gate/up.** The
-   current `mul_mat_vec_q8_0` path re-quantizes the input to Q8_1 once per
-   matvec; in attention and FFN, the same input feeds 3+ matvecs. Hoisting
-   the quantization across them cuts the `quantize_q8_1` cost (1.4% on
-   the new profile) and saves a pass over input memory.
+3. **Persistent activation Q8_1 buffer reuse across Q/K/V/gate/up.** *(Done — for reference)*
+   Decode used to re-quantize the input to Q8_1 once per matvec; the
+   `q8_0_matvec_fanout` path now hoists the quantization across the
+   3+ matvecs that share an input (recurrent QKVA/B, attention QKV,
+   FFN gate+up) and reuses the staging buffer. Decode +2.5%; prefill
+   path unchanged.
 
 4. **CUDA graph capture of the decode loop.** Decode is 489+ kernel
    launches per token replayed each step. A single captured graph removes
