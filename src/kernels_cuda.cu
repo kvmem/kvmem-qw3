@@ -329,8 +329,75 @@ __global__ void silu_mul_kernel(float *out, const float *gate, const float *up, 
     out[i] = (g / (1.0f + expf(-g))) * up[i];
 }
 
+// Single-row RMS norm: 1 block per row, 1024 threads, vectorized float4 loads,
+// 32-wide warp shuffles for the reduction (shmem only across warps).
+template <uint32_t BLOCK_THREADS>
+__global__ void rms_norm_kernel_vec(float *__restrict__ out,
+                                    const float *__restrict__ x,
+                                    const float *__restrict__ weight,
+                                    uint64_t n,
+                                    float eps) {
+    constexpr uint32_t WARP_SIZE = 32;
+    constexpr uint32_t NWARPS = BLOCK_THREADS / WARP_SIZE;
+    const uint32_t b = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid % WARP_SIZE;
+    const uint32_t warp = tid / WARP_SIZE;
+    const float *x_row = x + static_cast<uint64_t>(b) * n;
+    float *out_row = out + static_cast<uint64_t>(b) * n;
+
+    // Vectorized sum-of-squares using float4 loads. The tail uses scalars.
+    const uint64_t n_vec = n / 4;
+    const float4 *x4 = reinterpret_cast<const float4 *>(x_row);
+    float sum = 0.0f;
+    for (uint64_t i = tid; i < n_vec; i += BLOCK_THREADS) {
+        float4 v = x4[i];
+        sum += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    }
+    for (uint64_t i = n_vec * 4 + tid; i < n; i += BLOCK_THREADS) {
+        const float v = x_row[i];
+        sum += v * v;
+    }
+
+    // Warp reduce, then cross-warp via shmem.
+    #pragma unroll
+    for (int delta = WARP_SIZE / 2; delta > 0; delta >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, delta);
+    }
+    __shared__ float warp_sums[NWARPS];
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = (lane < NWARPS) ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int delta = WARP_SIZE / 2; delta > 0; delta >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, delta);
+        }
+        if (lane == 0) warp_sums[0] = sum;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(warp_sums[0] / static_cast<float>(n) + eps);
+
+    // Vectorized normalize/scale write-back.
+    const float4 *w4 = reinterpret_cast<const float4 *>(weight);
+    float4 *o4 = reinterpret_cast<float4 *>(out_row);
+    for (uint64_t i = tid; i < n_vec; i += BLOCK_THREADS) {
+        const float4 v = x4[i];
+        const float4 wv = w4[i];
+        float4 r;
+        r.x = v.x * scale * wv.x;
+        r.y = v.y * scale * wv.y;
+        r.z = v.z * scale * wv.z;
+        r.w = v.w * scale * wv.w;
+        o4[i] = r;
+    }
+    for (uint64_t i = n_vec * 4 + tid; i < n; i += BLOCK_THREADS) {
+        out_row[i] = x_row[i] * scale * weight[i];
+    }
+}
+
+// Fallback for the unaligned / very-small-n case.
 __global__ void rms_norm_kernel(float *out, const float *x, const float *weight, uint64_t n, float eps) {
-    // Single-row RMS norm. Block-strided reduce over n.
     const uint32_t b = blockIdx.x;
     const float *x_row = x + static_cast<uint64_t>(b) * n;
     float *out_row = out + static_cast<uint64_t>(b) * n;
@@ -1886,7 +1953,22 @@ public:
         auto &o = as_tensor(out);
         const auto &input = as_tensor(x);
         const auto &w = as_weight(weight);
-        rms_norm_kernel<<<1, 256>>>(o.ptr, input.ptr, static_cast<const float *>(w.ptr), input.count, eps);
+        const uint64_t n = input.count;
+        // Vectorized path: float4-aligned and big enough to make a 1024-thread
+        // block worth launching. Otherwise fall back to the scalar kernel.
+        const bool can_vec = (n % 4 == 0)
+            && ((reinterpret_cast<uintptr_t>(input.ptr) & 0xF) == 0)
+            && ((reinterpret_cast<uintptr_t>(o.ptr) & 0xF) == 0)
+            && ((reinterpret_cast<uintptr_t>(w.ptr) & 0xF) == 0)
+            && n >= 256;
+        if (can_vec) {
+            rms_norm_kernel_vec<1024><<<1, 1024>>>(o.ptr, input.ptr,
+                                                    static_cast<const float *>(w.ptr),
+                                                    n, eps);
+        } else {
+            rms_norm_kernel<<<1, 256>>>(o.ptr, input.ptr,
+                                        static_cast<const float *>(w.ptr), n, eps);
+        }
         return launch_status("cuda rms_norm");
     }
 
