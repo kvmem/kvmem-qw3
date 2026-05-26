@@ -28,42 +28,48 @@ python3 scripts/long_prompt_sweep.py --prompt-tokens "512 1024 2048 4096" \
     --trials 3 -n 64 --json /tmp/sweep.json
 ```
 
-| Prompt tokens | qw3 prefill | llama prefill | pref ratio | qw3 decode | llama decode | dec ratio |
+| Prompt tokens | qw3 prefill | llama prefill | prefill Δ | qw3 decode | llama decode | decode Δ |
 |---:|---:|---:|---:|---:|---:|---:|
-|  556 | 2299.9 | 2804.8 | **82.0%** | 36.8 | 45.1 | **81.5%** |
-| 1098 | 2874.6 | 3320.1 | **86.6%** | 37.4 | 45.5 | **82.2%** |
-| 2182 | 3109.5 | 3607.3 | **86.2%** | 37.5 | 45.4 | **82.6%** |
-| 4350 | 2779.5 | 3781.3 | **73.5%** | 37.6 | 44.8 | **83.8%** |
+|  556 | 2299.9 tok/s | 2804.8 tok/s | **−504.9 tok/s** | 36.8 tok/s | 45.1 tok/s | **−8.3 tok/s** |
+| 1098 | 2874.6 tok/s | 3320.1 tok/s | **−445.5 tok/s** | 37.4 tok/s | 45.5 tok/s | **−8.1 tok/s** |
+| 2182 | 3109.5 tok/s | 3607.3 tok/s | **−497.8 tok/s** | 37.5 tok/s | 45.4 tok/s | **−7.9 tok/s** |
+| 4350 | 2779.5 tok/s | 3781.3 tok/s | **−1001.8 tok/s** | 37.6 tok/s | 44.8 tok/s | **−7.2 tok/s** |
 
-Two trends jump out:
+All numbers are absolute tokens/second. The Δ column reports `qw3 − llama.cpp`
+(negative = llama.cpp is faster). Two trends jump out:
 
 - **Decode is now flat across context length** (~37 tok/s from 550 → 4350
-  tokens) and tracks llama.cpp at ~83% of its rate. Earlier the decode
-  rate fell from 37 → 22 tok/s as KV grew, because per-token attention
-  bandwidth scaled with context. Two changes flipped that: F16 KV cache
-  (halves K/V bytes) and **split-K attention** (`fattn_vec_decode_kernel`
-  now parallelizes over KV slices via `NSPLIT ∈ {1,2,4,8}` plus an online-
-  softmax combine kernel — the original kernel only used `n_heads × 4`
-  warps, leaving most of Blackwell's SMs idle). The remaining 17% gap is
-  decode matvec dominated; see roadmap.
-- **Prefill peaks at 86% of llama.cpp on mid-length prompts** (1K–2K) and
-  drops to 74% at 4K. Eagerly populating the Q8 → FP16 weight cache at
-  upload time (`QW3_PREWARM_F16=1`, default on) moved the ~300 ms one-shot
-  dequant cost out of first-prefill timing — biggest swing at short
-  prompts (35% → 81%). The 4K dip vs the 2K peak is currently being
-  investigated; the leading suspect is HGEMM tile selection / activation
-  buffer pressure at very long batch dimensions.
+  tokens) and trails llama.cpp by a constant ~7–8 tok/s. Earlier the
+  decode rate fell from 37 → 22 tok/s as KV grew, because per-token
+  attention bandwidth scaled with context. Two changes flipped that: F16
+  KV cache (halves K/V bytes) and **split-K attention**
+  (`fattn_vec_decode_kernel` now parallelizes over KV slices via
+  `NSPLIT ∈ {1,2,4,8}` plus an online-softmax combine kernel — the
+  original kernel only used `n_heads × 4` warps, leaving most of
+  Blackwell's SMs idle). The remaining gap is decode matvec dominated;
+  see roadmap.
+- **Prefill closes within ~450–500 tok/s of llama.cpp on mid-length
+  prompts** (1K–2K) and widens to ~1000 tok/s at 4K. Eagerly populating
+  the Q8 → FP16 weight cache at upload time (`QW3_PREWARM_F16=1`,
+  default on) moved the ~300 ms one-shot dequant cost out of first-
+  prefill timing — biggest swing at short prompts (970 → 2300 tok/s).
+  The 4K widening is fundamentally O(T²) prefill attention scaling
+  (`fattn_vec_decode_kernel` reads K/V independently per query); a
+  tiled flash-attention prefill kernel that shares K/V across queries
+  is the next attack.
 
 How we got here (prefill on a 1322-token prompt, earlier baseline measurements):
 
-| Stage | Prefill tok/s | vs llama.cpp |
-|---|---|---|
-| Baseline (dp4a matvec, batched over T) |   100.6 |   2.9% |
-| + cuBLAS HGEMM (FP16 dequant cache + tensor cores) | 602.0 | 17.6% |
-| + Fused batched recurrent (1 launch / layer / sub-op) | 1031.6 | 30.1% |
-| + Ported MMVQ (Q8_1 activation) + flash-attention-vec decode | 1539 | 46.5% |
-| + F16 KV cache + split-K decode attention | 1590 | 48.3% |
-| + Eager Q8 → FP16 weight prewarm at upload time (1098-tok prompt) | 2836 | 86.0% |
+| Stage | Prefill (tok/s) | Δ vs llama.cpp (tok/s) |
+|---|---:|---:|
+| Baseline (dp4a matvec, batched over T) |   100.6 | −3300 |
+| + cuBLAS HGEMM (FP16 dequant cache + tensor cores) |  602.0 | −2800 |
+| + Fused batched recurrent (1 launch / layer / sub-op) | 1031.6 | −2270 |
+| + Ported MMVQ (Q8_1 activation) + flash-attention-vec decode | 1539 | −1755 |
+| + F16 KV cache + split-K decode attention | 1590 | −1700 |
+| + Eager Q8 → FP16 weight prewarm at upload time (1098-tok prompt) | 2875 | **−445** |
+
+(llama.cpp on the 1098-token prompt is ~3320 tok/s on this GPU.)
 
 The split-K decode change moved the needle on **decode throughput** at long
 context (4350 tokens: 22 → 37 tok/s, +68%) while leaving prefill ~unchanged
@@ -99,32 +105,42 @@ it used to dominate short-prompt timing.
 
 The new bottleneck is **decode matvec**: 31312 calls (≈489/token across
 48 layers × ~10 linears) at 38 µs each = 18.5 ms/token, ~70% of decode
-wall time. Closing the remaining 17% decode gap to llama.cpp now means
-attacking matvec, not attention. So the next gains will come from:
+wall time. Closing the remaining ~7 tok/s decode gap to llama.cpp now
+means attacking matvec, not attention. So the next gains will come from:
 
-1. **MMQ-style prefill (INT8 MMA on repacked Q8).** Drops the Q8 → FP16
-   dequant cache and the FP32 → FP16 activation conversion (~1%), and
-   uses tensor-core integer MMA the way llama.cpp does. Should lift
-   prefill above ~3500 tok/s and close the remaining 14–26% prefill gap.
+1. **Tiled flash-attention prefill kernel.** The 4K-prompt deficit
+   (−1000 tok/s) is dominated by `fattn_vec_decode_kernel` running with
+   batch = T queries; each query's block reads K/V independently from
+   HBM with no reuse, so the kernel scales O(T²) at ~580 GB/s effective
+   bandwidth. A flash-attention-2 style kernel that tiles BR × BC and
+   shares K/V loads across queries should cut prefill attention from
+   ~534 ms to ~100 ms on the 4K case (estimated +500 tok/s prefill at
+   long context).
 
-2. **Persistent activation Q8_1 buffer reuse across Q/K/V/gate/up.** The
+2. **MMQ-style prefill (INT8 MMA on repacked Q8).** Drops the Q8 → FP16
+   dequant cache and the FP32 → FP16 activation conversion, and uses
+   tensor-core integer MMA the way llama.cpp does. Should lift prefill
+   on every prompt length and shrink the −400 to −500 tok/s deficit at
+   1K–2K to near zero.
+
+3. **Persistent activation Q8_1 buffer reuse across Q/K/V/gate/up.** The
    current `mul_mat_vec_q8_0` path re-quantizes the input to Q8_1 once per
    matvec; in attention and FFN, the same input feeds 3+ matvecs. Hoisting
    the quantization across them cuts the `quantize_q8_1` cost (1.4% on
    the new profile) and saves a pass over input memory.
 
-3. **CUDA graph capture of the decode loop.** Decode is 489+ kernel
+4. **CUDA graph capture of the decode loop.** Decode is 489+ kernel
    launches per token replayed each step. A single captured graph removes
    per-launch overhead — measurable now that the kernel times have shrunk.
    At 489 kernels × ~5 µs launch latency = 2.4 ms/token of pure overhead;
    capturing should push decode toward 42 tok/s.
 
-4. **DeltaNet recurrent fusion.** 3.4% on long prompts; the four kernels
+5. **DeltaNet recurrent fusion.** 3.4% on long prompts; the four kernels
    per layer (conv, l2, deltanet, norm-gate) are each light but sequential.
    A single fused launch per layer is mostly a launch-latency win (small,
-   but easy and stacks with #3).
+   but easy and stacks with #4).
 
-5. **(Done — for reference)** F16 KV cache and split-K attention. Both
+6. **(Done — for reference)** F16 KV cache and split-K attention. Both
    shipped above; together they took decode at 4350 tokens from 22 → 37
    tok/s. Originals kept selectable for comparison.
 
@@ -372,14 +388,16 @@ description.
 See **Bottlenecks and roadmap** above for the prioritized list backed by
 `nsys` profiling. The short version:
 
-- **Decode plateau (~83% of llama.cpp, flat across context).** The bottleneck
-  is now `mul_mat_vec_q8_0` (46% of GPU time, ~489 calls per decode token).
-  CUDA graph capture and persistent Q8_1 activation reuse are the next
-  levers; F16 KV + split-K already closed the long-context cliff.
-- **Prefill scales but lags (~62% of llama.cpp at 4K, less below).** No
-  INT8 MMA path; the HGEMM route pays Q8 → FP16 dequant + FP32 → FP16
-  activation conversion every step. MMQ-style INT8 MMA is the biggest
-  unbooked win.
+- **Decode plateau (~7–8 tok/s behind llama.cpp, flat across context).**
+  The bottleneck is now `mul_mat_vec_q8_0` (46% of GPU time, ~489 calls
+  per decode token). CUDA graph capture and persistent Q8_1 activation
+  reuse are the next levers; F16 KV + split-K already closed the
+  long-context cliff.
+- **Prefill: −500 tok/s at 1K–2K, widening to −1000 tok/s at 4K.** Two
+  separate gaps: HGEMM via FP16 mirror loses to direct INT8 MMA on
+  every prompt length (closing this lifts the whole curve), and at
+  ≥ 4K the per-query fattn-vec attention scales O(T²) without K/V
+  reuse — a tiled flash-attention prefill kernel is the right fix.
 - **Numerical drift on greedy.** Greedy on both engines should yield
   identical tokens; today qw3 matches for ~5–22 tokens then drifts. Sources
   are the per-block Q8 → FP16 dequant rounding, FP16 accumulator in HGEMM

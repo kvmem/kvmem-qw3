@@ -272,16 +272,18 @@ def print_table(cells: List[CellSummary]) -> None:
     print("=" * 100)
     print("LONG-PROMPT SWEEP — median across trials, tok/s")
     print("=" * 100)
-    print(f"{'prompt':>8}  | {'qw3 prefill':>14}  {'llama prefill':>14}  {'pref ratio':>10}  "
-          f"| {'qw3 decode':>11}  {'llama decode':>13}  {'dec ratio':>9}")
+    print(f"{'prompt':>8}  | {'qw3 prefill':>12}  {'llama prefill':>14}  {'pref Δ':>10}  "
+          f"| {'qw3 decode':>11}  {'llama decode':>13}  {'dec Δ':>8}")
+    print(f"{'tokens':>8}  | {'tok/s':>12}  {'tok/s':>14}  {'tok/s':>10}  "
+          f"| {'tok/s':>11}  {'tok/s':>13}  {'tok/s':>8}")
     print("-" * 100)
     for c in cells:
-        pref_r = (c.qw3_prefill_med / c.llama_prefill_med * 100.0) if c.llama_prefill_med else 0.0
-        dec_r  = (c.qw3_decode_med  / c.llama_decode_med  * 100.0) if c.llama_decode_med  else 0.0
+        pref_d = c.qw3_prefill_med - c.llama_prefill_med
+        dec_d  = c.qw3_decode_med  - c.llama_decode_med
         actual = c.actual_prompt_tokens_qw3 or c.actual_prompt_tokens_llama
         print(f"{actual:>8}  | "
-              f"{c.qw3_prefill_med:>14.1f}  {c.llama_prefill_med:>14.1f}  {pref_r:>9.1f}%  "
-              f"| {c.qw3_decode_med:>11.2f}  {c.llama_decode_med:>13.2f}  {dec_r:>8.1f}%")
+              f"{c.qw3_prefill_med:>12.1f}  {c.llama_prefill_med:>14.1f}  {pref_d:>+10.1f}  "
+              f"| {c.qw3_decode_med:>11.2f}  {c.llama_decode_med:>13.2f}  {dec_d:>+8.2f}")
     print("=" * 100)
 
 
