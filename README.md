@@ -183,9 +183,9 @@ ctest --test-dir build --output-on-failure
 CUDA (required for actual model execution):
 
 ```sh
-cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release -DQW3_ENABLE_CUDA=ON
-cmake --build build-cuda -j
-ctest --test-dir build-cuda --output-on-failure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQW3_ENABLE_CUDA=ON
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
 Tested with CUDA 12.x / 13.x and SM_90 (Blackwell). Earlier compute
@@ -196,7 +196,7 @@ capabilities should work; pass `-DCMAKE_CUDA_ARCHITECTURES=<sm>` if needed.
 End-to-end generation on a Qwen 3.6 GGUF:
 
 ```sh
-./build-cuda/qw3 \
+./build/qw3 \
   --backend qwen-native \
   --native-heavy \
   --native-kernels cuda \
@@ -225,13 +225,13 @@ Key flags (see `qw3 --help` for the full list):
 Inspect a GGUF without running it:
 
 ```sh
-./build-cuda/qw3-inspect /path/to/Qwen3.6-27B-Q8_0.gguf
+./build/qw3-inspect /path/to/Qwen3.6-27B-Q8_0.gguf
 ```
 
 Smoke test without weights:
 
 ```sh
-./build-cuda/qw3 --backend mock -p hello
+./build/qw3 --backend mock -p hello
 ```
 
 ## Benchmark against llama.cpp
@@ -278,7 +278,7 @@ The Python entry point is runnable directly with the same flags:
 
 ```sh
 python3 scripts/compare_with_llama_cpp.py \
-  --qw3   ./build-cuda/qw3 \
+  --qw3   ./build/qw3 \
   --llama /path/to/llama.cpp/build/bin/llama-completion \
   --model /path/to/Qwen3.6-27B-Q8_0.gguf \
   --long-only -n 128 --token-diff
@@ -295,7 +295,7 @@ non-interactive execution.
 To compare a single prompt token-by-token:
 
 ```sh
-./build-cuda/qw3 --backend qwen-native --native-heavy --native-kernels cuda \
+./build/qw3 --backend qwen-native --native-heavy --native-kernels cuda \
   --model /path/to/model.gguf \
   -p "Hello" -n 8 \
   --dump-logits qw3.jsonl --dump-logits-top-k 16 --dump-tokens
