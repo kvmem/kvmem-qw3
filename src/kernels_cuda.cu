@@ -1496,11 +1496,11 @@ private:
         // A = W_fp16 (CMV cols x rows, lda=k); we need A^T so OP_T.
         // B = X_fp16 (CMV cols x batch, ldb=k).
         // C = out_fp32 (CMV rows x batch, ldc=m).
-        // CUBLAS_COMPUTE_32F: FP16 inputs, FP32 accumulator. Safe but slower
-        // than FP16 accumulation on Blackwell. Empirically FP16 accumulation
-        // is fine for Q8 * FP32-activation dot products: |activations| <= a few
-        // hundred and K <= 17K, so partial sums stay well within FP16 range.
-        // If accuracy regresses, swap back to CUBLAS_COMPUTE_32F.
+        // CUBLAS_COMPUTE_32F_FAST_16F: FP16 inputs, FP32 accumulator with the
+        // FP16-fast-path tensor-core kernels. Tried CUBLAS_COMPUTE_16F (FP16
+        // accumulator) for ~2x throughput; cuBLAS 13.x falls back to a non-
+        // tensor-core path for our shapes (Q8 weight FP16 mirrors with K up
+        // to ~17K), regressing prefill 25x. Stay on FAST_16F.
         if (auto st = cublas_status(
                 cublasGemmEx(cublas_handle_,
                              CUBLAS_OP_T, CUBLAS_OP_N,
