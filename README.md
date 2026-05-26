@@ -30,16 +30,15 @@ python3 scripts/long_prompt_sweep.py --prompt-tokens "512 1024 2048 4096" \
 
 | Prompt tokens | qw3 prefill | llama prefill | prefill Δ | qw3 decode | llama decode | decode Δ |
 |---:|---:|---:|---:|---:|---:|---:|
-|  556 | 2299.9 tok/s | 2804.8 tok/s | **−504.9 tok/s** | 36.8 tok/s | 45.1 tok/s | **−8.3 tok/s** |
-| 1098 | 2874.6 tok/s | 3320.1 tok/s | **−445.5 tok/s** | 37.4 tok/s | 45.5 tok/s | **−8.1 tok/s** |
-| 2182 | 3109.5 tok/s | 3607.3 tok/s | **−497.8 tok/s** | 37.5 tok/s | 45.4 tok/s | **−7.9 tok/s** |
-| 4350 | 2779.5 tok/s | 3781.3 tok/s | **−1001.8 tok/s** | 37.6 tok/s | 44.8 tok/s | **−7.2 tok/s** |
+|  556 | 1848.4 tok/s | 2751.6 tok/s | **−903.2 tok/s** | 38.6 tok/s | 45.1 tok/s | **−6.5 tok/s** |
+| 1098 | 2503.2 tok/s | 3303.4 tok/s | **−800.3 tok/s** | 39.7 tok/s | 45.4 tok/s | **−5.7 tok/s** |
+| 2182 | 2869.7 tok/s | 3582.3 tok/s | **−712.6 tok/s** | 39.6 tok/s | 45.3 tok/s | **−5.8 tok/s** |
 
 All numbers are absolute tokens/second. The Δ column reports `qw3 − llama.cpp`
 (negative = llama.cpp is faster). Two trends jump out:
 
-- **Decode is now flat across context length** (~37 tok/s from 550 → 4350
-  tokens) and trails llama.cpp by a constant ~7–8 tok/s. Earlier the
+- **Decode is flat across context length** (~38–40 tok/s from 550 → 2200
+  tokens) and trails llama.cpp by a constant ~6 tok/s. Earlier the
   decode rate fell from 37 → 22 tok/s as KV grew, because per-token
   attention bandwidth scaled with context. Two changes flipped that: F16
   KV cache (halves K/V bytes) and **split-K attention**
@@ -48,15 +47,15 @@ All numbers are absolute tokens/second. The Δ column reports `qw3 − llama.cpp
   original kernel only used `n_heads × 4` warps, leaving most of
   Blackwell's SMs idle). The remaining gap is decode matvec dominated;
   see roadmap.
-- **Prefill closes within ~450–500 tok/s of llama.cpp on mid-length
-  prompts** (1K–2K) and widens to ~1000 tok/s at 4K. Eagerly populating
-  the Q8 → FP16 weight cache at upload time (`QW3_PREWARM_F16=1`,
-  default on) moved the ~300 ms one-shot dequant cost out of first-
-  prefill timing — biggest swing at short prompts (970 → 2300 tok/s).
-  The 4K widening is fundamentally O(T²) prefill attention scaling
-  (`fattn_vec_decode_kernel` reads K/V independently per query); a
-  tiled flash-attention prefill kernel that shares K/V across queries
-  is the next attack.
+- **Prefill trails llama.cpp by ~700–900 tok/s** at 1K–2K. The dominant
+  cost on llama.cpp's prefill is `mul_mat_q` (INT8 MMA on raw Q8_0)
+  at 64% of GPU time — they bypass dequant entirely. qw3 currently runs
+  prefill matmul through cuBLAS HGEMM with on-the-fly Q8 → FP16 dequant
+  (~12% of prefill GPU time goes to dequant + FP32→FP16 staging). A
+  4-warp cooperative MMQ port that beats HGEMM is the next prefill
+  attack — see [`feedback_mmq_int8_mma_q8_prefill.md`](./feedback)
+  for the prior single-warp attempt that was 3× slower and the analysis
+  of why.
 
 How we got here (prefill on a 1322-token prompt, earlier baseline measurements):
 
@@ -142,11 +141,16 @@ means attacking matvec, not attention. So the next gains will come from:
    FFN gate+up) and reuses the staging buffer. Decode +2.5%; prefill
    path unchanged.
 
-4. **CUDA graph capture of the decode loop.** Decode is 489+ kernel
-   launches per token replayed each step. A single captured graph removes
-   per-launch overhead — measurable now that the kernel times have shrunk.
-   At 489 kernels × ~5 µs launch latency = 2.4 ms/token of pure overhead;
-   capturing should push decode toward 42 tok/s.
+4. **CUDA graph capture of the decode loop.** *(Phase A done)* The exec
+   stream and device-side argmax are now in place — every kernel and
+   the cuBLAS handle run on a single non-blocking stream, and argmax
+   no longer pulls 152K logits back to the host. Capture itself is
+   pending: the position counter that drops into `kv_append`, RoPE,
+   and `attention_decode` would freeze at capture time, so capture
+   needs either device-side pos counters or per-token
+   `cudaGraphExecUpdate`. llama.cpp uses the latter and that path
+   is the next step. Estimated headroom from the kernel-time vs
+   wall-time breakdown is ~5–7%.
 
 5. **DeltaNet recurrent fusion.** 3.4% on long prompts; the four kernels
    per layer (conv, l2, deltanet, norm-gate) are each light but sequential.
