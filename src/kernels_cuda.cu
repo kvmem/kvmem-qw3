@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -13,7 +14,89 @@
 #include <vector>
 
 namespace qw3 {
+
+// Ported kernel launcher (src/gated_delta_net.cu).
+namespace ported {
+bool launch_gated_delta_net(
+        float *alpha_inout, float *beta_inout,
+        const float *dt_bias, const float *ssm_a,
+        const float *conv_qkv,
+        uint32_t q_offset, uint32_t k_offset, uint32_t v_offset,
+        float *state, float *core_out,
+        uint32_t T,
+        uint32_t num_k_heads, uint32_t num_v_heads, uint32_t head_dim,
+        uint32_t qkv_row_stride, uint32_t gb_row_stride, uint32_t out_row_stride,
+        cudaStream_t stream);
+
+// Ported Q8_0 mmvq launchers (src/mmvq_q8.cu).
+size_t q8_1_scratch_bytes(uint32_t batch, uint32_t cols);
+bool launch_quantize_q8_1(
+        const float *x, void *y_q8_1,
+        uint32_t batch, uint32_t cols, uint32_t stride_x_row,
+        cudaStream_t stream);
+bool launch_mmvq_q8_0(
+        const uint8_t *weight, const void *y_q8_1, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
+
+// Ported fattn-vec decode (src/fattn_vec_decode.cu).
+bool launch_fattn_vec_decode_f32(
+        float *out, const float *q, uint32_t q_stride,
+        const float *k_cache, const float *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t seq_len, uint32_t batch,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+}
+
 namespace {
+
+// Runtime selector for the recurrent (DeltaNet) kernel. Read once on first
+// use. Default is the ported kernel (warp-shuffle reductions, register-
+// resident state). Set QW3_RECURRENT_KERNEL=qw3 to fall back to the original
+// shmem-reduction kernel — kept around for future exploration of why the
+// algorithmic mapping matters this much.
+enum class RecurrentKernel { Qw3, Ported };
+RecurrentKernel recurrent_kernel_choice() {
+    static const RecurrentKernel choice = []() {
+        const char *env = std::getenv("QW3_RECURRENT_KERNEL");
+        if (env && std::strcmp(env, "qw3") == 0) return RecurrentKernel::Qw3;
+        return RecurrentKernel::Ported;
+    }();
+    return choice;
+}
+
+// Runtime selector for the Q8_0 matvec kernel. Same pattern as above.
+//   QW3_MATVEC=qw3     -> original DP4A kernel (kept for future
+//                         exploration / prefill paths).
+//   QW3_MATVEC=ported  -> (default) ported llama.cpp mmvq Q8_0 + Q8_1
+//                         activation quantization. Wins by ~15% on decode.
+enum class MatvecKernel { Qw3, Ported };
+MatvecKernel matvec_kernel_choice() {
+    static const MatvecKernel choice = []() {
+        const char *env = std::getenv("QW3_MATVEC");
+        if (env && std::strcmp(env, "qw3") == 0) return MatvecKernel::Qw3;
+        return MatvecKernel::Ported;
+    }();
+    return choice;
+}
+
+// Runtime selector for the decode attention kernel.
+//   QW3_ATTN=qw3      -> original fused-tile kernel (kept for future
+//                        exploration / short-context comparison).
+//   QW3_ATTN=ported   -> (default) ported flash-attention-style vec
+//                        kernel — parallel across KV tokens with shared
+//                        softmax. ~+26% on long-context decode.
+enum class AttentionKernel { Qw3, Ported };
+AttentionKernel attention_kernel_choice() {
+    static const AttentionKernel choice = []() {
+        const char *env = std::getenv("QW3_ATTN");
+        if (env && std::strcmp(env, "qw3") == 0) return AttentionKernel::Qw3;
+        return AttentionKernel::Ported;
+    }();
+    return choice;
+}
+
 
 static thread_local char g_err[256];
 
@@ -1162,6 +1245,7 @@ public:
         if (cublas_handle_) cublasDestroy(cublas_handle_);
         if (rows_buf_) cudaFree(rows_buf_);
         if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
+        if (q8_1_scratch_) cudaFree(q8_1_scratch_);
     }
 
     const char *name() const override {
@@ -1372,6 +1456,44 @@ private:
                                     uint32_t batch,
                                     uint32_t in_stride,
                                     uint32_t out_stride) {
+        // Ported path: quantize input to Q8_1, then DP4A matvec with Q8_1
+        // activations. Selected via QW3_MATVEC=ported. Caller-side scratch
+        // is reused across calls. Restricted to batch==1 (decode) for now;
+        // for batch 2..7 the qw3 kernel's per-block input-quant cache is
+        // already efficient and the ported kernel's higher block count
+        // regresses small-batch prefill. Falls back to qw3 path otherwise.
+        if (matvec_kernel_choice() == MatvecKernel::Ported &&
+            (w.cols % 32) == 0 && batch == 1) {
+            const size_t need = ported::q8_1_scratch_bytes(batch, w.cols);
+            if (need > q8_1_scratch_capacity_) {
+                if (q8_1_scratch_) cudaFree(q8_1_scratch_);
+                if (auto st = cuda_status(cudaMalloc(&q8_1_scratch_, need),
+                                          "q8_1 scratch alloc"); !st.ok) {
+                    q8_1_scratch_ = nullptr;
+                    q8_1_scratch_capacity_ = 0;
+                    return st;
+                }
+                q8_1_scratch_capacity_ = need;
+            }
+            // in_stride is the float stride between batch rows in x; for
+            // batch==1 the upstream call passes 0, but the ported quantize
+            // kernel still walks (batch=1) row, so it never actually reads
+            // past row 0.
+            const uint32_t qstride = (batch == 1) ? w.cols : in_stride;
+            if (!ported::launch_quantize_q8_1(x_ptr, q8_1_scratch_,
+                                              batch, w.cols, qstride, /*stream=*/0)) {
+                return {false, "ported quantize_q8_1 launch failed"};
+            }
+            const uint32_t dst_stride = (batch == 1) ? w.rows : out_stride;
+            if (!ported::launch_mmvq_q8_0(static_cast<const uint8_t *>(w.ptr),
+                                          q8_1_scratch_, out_ptr,
+                                          static_cast<uint32_t>(w.rows), w.cols,
+                                          batch, dst_stride, /*stream=*/0)) {
+                return {false, "ported mmvq_q8_0 launch failed"};
+            }
+            return launch_status("cuda q8_0_matvec ported");
+        }
+
         // Shmem budget per layout:
         //   - DP4A path  : cols * 1 (i8) + blocks * 4 (f32 scale per block)
         //   - F32 fallback: cols * 4 (f32 staging)
@@ -1713,27 +1835,68 @@ public:
                                                    batch, proj_stride, k_off, eps);
         if (auto st = launch_status("l2_norm_128_batch_kernel"); !st.ok) return st;
 
-        // 3. DeltaNet (batched): one block per (vh, head_v_dim) iterates T
-        //    timesteps sequentially. This is the heart of the savings: each
-        //    block runs to completion without any kernel launch in between.
-        dim3 dn_grid(num_v_heads, head_v_dim);
-        deltanet_batch_kernel<<<dn_grid, 128>>>(c.ptr,
-                                                s.ptr,
-                                                cout.ptr,
-                                                a.ptr,
-                                                b.ptr,
-                                                static_cast<const float *>(aw.ptr),
-                                                static_cast<const float *>(dt.ptr),
-                                                batch,
-                                                num_k_heads,
-                                                num_v_heads,
-                                                head_k_dim,
-                                                head_v_dim,
-                                                proj_stride,
-                                                alpha_stride,
-                                                beta_stride,
-                                                core_stride);
-        if (auto st = launch_status("deltanet_batch_kernel"); !st.ok) return st;
+        // 3. DeltaNet (batched). Two implementations selected at runtime via
+        //    QW3_RECURRENT_KERNEL: "qw3" (default) is the original kernel,
+        //    "ported" dispatches the warp-shuffle kernel from llama.cpp.
+        //    Both produce mathematically equivalent state updates and
+        //    outputs; the ported version uses register-resident state and
+        //    warp-level reductions, removing __syncthreads() from the inner
+        //    loop.
+        if (recurrent_kernel_choice() == RecurrentKernel::Ported) {
+            // Ported kernel requires head_k_dim == head_v_dim (square state).
+            if (head_k_dim != head_v_dim) {
+                return {false, "recurrent_batch: ported kernel requires head_k_dim == head_v_dim"};
+            }
+            // Layout note: cout (conv output) row stride is proj_stride; q
+            // starts at offset 0, k at num_k_heads*head_k_dim, v at
+            // 2*num_k_heads*head_k_dim. alpha and beta share gb_row_stride
+            // (= alpha_stride == beta_stride) per qw3's batched layout.
+            if (alpha_stride != beta_stride) {
+                return {false, "recurrent_batch: ported kernel requires alpha_stride == beta_stride"};
+            }
+            // alpha and beta are scratch (overwritten per-layer by the
+            // projection step); the prep kernel rewrites them in place to
+            // log_g and sigmoid_beta.
+            auto &a_mut = const_cast<CudaTensor &>(as_tensor(alpha));
+            auto &b_mut = const_cast<CudaTensor &>(as_tensor(beta));
+            const uint32_t q_off_floats = 0;
+            const uint32_t k_off_floats = num_k_heads * head_k_dim;
+            const uint32_t v_off_floats = 2u * num_k_heads * head_k_dim;
+            const bool ok = ported::launch_gated_delta_net(
+                a_mut.ptr, b_mut.ptr,
+                static_cast<const float *>(dt.ptr),
+                static_cast<const float *>(aw.ptr),
+                cout.ptr,
+                q_off_floats, k_off_floats, v_off_floats,
+                s.ptr, c.ptr,
+                batch,
+                num_k_heads, num_v_heads, head_k_dim,
+                proj_stride, alpha_stride, core_stride,
+                /*stream=*/0);
+            if (!ok) return {false, "recurrent_batch: ported kernel rejected head_dim (only 16/32/64/128)"};
+            if (auto st = launch_status("ported::gated_delta_net_kernel"); !st.ok) return st;
+        } else {
+            // Original qw3 kernel: one block per (vh, head_v_dim) iterates T
+            // timesteps; reductions via __syncthreads() in shared memory.
+            dim3 dn_grid(num_v_heads, head_v_dim);
+            deltanet_batch_kernel<<<dn_grid, 128>>>(c.ptr,
+                                                    s.ptr,
+                                                    cout.ptr,
+                                                    a.ptr,
+                                                    b.ptr,
+                                                    static_cast<const float *>(aw.ptr),
+                                                    static_cast<const float *>(dt.ptr),
+                                                    batch,
+                                                    num_k_heads,
+                                                    num_v_heads,
+                                                    head_k_dim,
+                                                    head_v_dim,
+                                                    proj_stride,
+                                                    alpha_stride,
+                                                    beta_stride,
+                                                    core_stride);
+            if (auto st = launch_status("deltanet_batch_kernel"); !st.ok) return st;
+        }
 
         // 4. RMSnorm + gate, batched over T.
         dim3 ng_grid(num_v_heads, batch);
@@ -1886,6 +2049,18 @@ public:
         const auto &qq = as_tensor(q);
         const auto &kc = as_tensor(k_cache);
         const auto &vc = as_tensor(v_cache);
+        // Ported flash-attention-style decode. Selected via QW3_ATTN=ported.
+        // 4-warp parallelism across KV tokens — wins on long context.
+        if (attention_kernel_choice() == AttentionKernel::Ported &&
+            (head_dim == 128 || head_dim == 256)) {
+            if (ported::launch_fattn_vec_decode_f32(
+                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim, seq_len, /*batch=*/1,
+                    /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale,
+                    /*stream=*/0)) {
+                return launch_status("cuda attn ported");
+            }
+        }
         if (head_dim == 128) {
             // Fused flash-attention-style decode: 1 kernel, no scores materialization.
             dim3 grid(n_heads, 1);
@@ -1969,6 +2144,18 @@ public:
         const auto &qq = as_tensor(q);
         const auto &kc = as_tensor(k_cache);
         const auto &vc = as_tensor(v_cache);
+        // Ported path also covers the per-batch case. Each batch position has
+        // seq_len = base_seq_len + b + 1 (causal), which the kernel handles.
+        if (attention_kernel_choice() == AttentionKernel::Ported &&
+            (head_dim == 128 || head_dim == 256)) {
+            if (ported::launch_fattn_vec_decode_f32(
+                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    /*seq_len=*/base_seq_len + 1, batch,
+                    q_batch_stride, out_batch_stride, scale, /*stream=*/0)) {
+                return launch_status("cuda attention_decode_batch ported");
+            }
+        }
         dim3 grid(n_heads, batch);
         if (head_dim == 128) {
             attention_decode_fused_kernel<128, 64><<<grid, 128>>>(
@@ -2037,6 +2224,10 @@ private:
     // cols) matmul seen so far.
     __half *x_fp16_workspace_ = nullptr;
     uint64_t x_fp16_capacity_ = 0;  // elements
+    // Q8_1 staging buffer for the ported mmvq path. Reused across calls;
+    // grows on demand. Bytes hold (batch * blocks_per_row) block_q8_1 = 36 B.
+    void   *q8_1_scratch_ = nullptr;
+    size_t  q8_1_scratch_capacity_ = 0;  // bytes
 };
 
 } // namespace

@@ -1,8 +1,9 @@
 .DS_Store
 build/
+build-cuda/*
+ds4-main/*
+
 *.o
 *.a
 *.dylib
 *.so
-
-ds4-main
