@@ -73,6 +73,22 @@ public:
     }
     virtual DeviceStatus q8_0_matvec(DeviceTensor &out, const DeviceWeight &weight, const DeviceTensor &x) = 0;
 
+    // Run several Q8_0 matvecs that share the same input vector x. The MMVQ
+    // path quantizes x to Q8_1 once, then runs each (weight -> out) matvec
+    // against the cached Q8_1 buffer. Saves K-1 redundant input quantizations
+    // in attention QKV (3 projections) and FFN gate+up (2 projections).
+    //
+    // Default falls back to N independent matvecs; CUDA overrides.
+    virtual DeviceStatus q8_0_matvec_fanout(DeviceTensor *const *outs,
+                                            const DeviceWeight *const *weights,
+                                            uint32_t n,
+                                            const DeviceTensor &x) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (auto st = q8_0_matvec(*outs[i], *weights[i], x); !st.ok) return st;
+        }
+        return {};
+    }
+
     // Batched matvec ("matmul") for prefill. The weight (Q8_0, [out_dim x in_dim])
     // is read once and reused across `batch` input vectors stored contiguously
     // in `x`. Output layout: [batch, out_dim], input layout: [batch, in_dim].

@@ -1516,6 +1516,49 @@ public:
         return dispatch_q8_matvec(o.ptr, w, input.ptr, /*batch=*/1, /*in_stride=*/0, /*out_stride=*/0);
     }
 
+    DeviceStatus q8_0_matvec_fanout(DeviceTensor *const *outs,
+                                    const DeviceWeight *const *weights,
+                                    uint32_t n,
+                                    const DeviceTensor &x) override {
+        if (n == 0) return {};
+        const auto &input = as_tensor(x);
+        // Validate every weight has the same input width — that's the
+        // precondition for sharing one Q8_1 quantization. The recurrent /
+        // attention / FFN call sites all satisfy this; if a future caller
+        // doesn't, fall back to per-call dispatch.
+        const uint64_t cols = as_weight(*weights[0]).cols;
+        bool same_cols = true;
+        for (uint32_t i = 1; i < n; ++i) {
+            if (as_weight(*weights[i]).cols != cols) { same_cols = false; break; }
+        }
+        const bool fast_path = same_cols && (cols % 32) == 0 &&
+                               matvec_kernel_choice() == MatvecKernel::Ported;
+        if (!fast_path) {
+            return DeviceBackend::q8_0_matvec_fanout(outs, weights, n, x);
+        }
+        if (auto st = ensure_q8_1_scratch(/*batch=*/1, static_cast<uint32_t>(cols)); !st.ok) return st;
+        if (!ported::launch_quantize_q8_1(input.ptr, q8_1_scratch_,
+                                          /*batch=*/1, static_cast<uint32_t>(cols),
+                                          /*stride_x_row=*/static_cast<uint32_t>(cols),
+                                          /*stream=*/0)) {
+            return {false, "fanout quantize_q8_1 launch failed"};
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            auto &w = const_cast<CudaWeight &>(as_weight(*weights[i]));
+            auto &o = as_tensor(*outs[i]);
+            if (!ported::launch_mmvq_q8_0(static_cast<const uint8_t *>(w.ptr),
+                                          q8_1_scratch_, o.ptr,
+                                          static_cast<uint32_t>(w.rows),
+                                          static_cast<uint32_t>(w.cols),
+                                          /*batch=*/1,
+                                          /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                                          /*stream=*/0)) {
+                return {false, "fanout mmvq_q8_0 launch failed"};
+            }
+        }
+        return launch_status("cuda q8_0_matvec_fanout");
+    }
+
     DeviceStatus q8_0_matmul(DeviceTensor &out,
                              const DeviceWeight &weight,
                              const DeviceTensor &x,
@@ -1607,20 +1650,27 @@ private:
         return {};
     }
 
-    // INT8 MMA Q8_0 x Q8_1 matmul (m16n8k32.s8.s8.s32). Uses the same
-    // q8_1_scratch_ buffer as decode mmvq for the activation Q8_1 stage.
-    DeviceStatus mmq_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
-        const size_t need = ported::q8_1_scratch_bytes(batch, w.cols);
+    // Lazy/owning allocator for the Q8_1 activation scratch shared by mmvq
+    // matvec, mmq matmul, and the matvec_fanout fast path.
+    DeviceStatus ensure_q8_1_scratch(uint32_t batch, uint32_t cols) {
+        const size_t need = ported::q8_1_scratch_bytes(batch, cols);
         if (need > q8_1_scratch_capacity_) {
             if (q8_1_scratch_) cudaFree(q8_1_scratch_);
             if (auto st = cuda_status(cudaMalloc(&q8_1_scratch_, need),
-                                      "mmq q8_1 scratch alloc"); !st.ok) {
+                                      "q8_1 scratch alloc"); !st.ok) {
                 q8_1_scratch_ = nullptr;
                 q8_1_scratch_capacity_ = 0;
                 return st;
             }
             q8_1_scratch_capacity_ = need;
         }
+        return {};
+    }
+
+    // INT8 MMA Q8_0 x Q8_1 matmul (m16n8k32.s8.s8.s32). Uses the same
+    // q8_1_scratch_ buffer as decode mmvq for the activation Q8_1 stage.
+    DeviceStatus mmq_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
+        if (auto st = ensure_q8_1_scratch(batch, w.cols); !st.ok) return st;
         if (!ported::launch_quantize_q8_1(x_ptr, q8_1_scratch_,
                                           batch, w.cols, /*stride_x_row=*/w.cols,
                                           /*stream=*/0)) {
@@ -1650,17 +1700,7 @@ private:
         // regresses small-batch prefill. Falls back to qw3 path otherwise.
         if (matvec_kernel_choice() == MatvecKernel::Ported &&
             (w.cols % 32) == 0 && batch == 1) {
-            const size_t need = ported::q8_1_scratch_bytes(batch, w.cols);
-            if (need > q8_1_scratch_capacity_) {
-                if (q8_1_scratch_) cudaFree(q8_1_scratch_);
-                if (auto st = cuda_status(cudaMalloc(&q8_1_scratch_, need),
-                                          "q8_1 scratch alloc"); !st.ok) {
-                    q8_1_scratch_ = nullptr;
-                    q8_1_scratch_capacity_ = 0;
-                    return st;
-                }
-                q8_1_scratch_capacity_ = need;
-            }
+            if (auto st = ensure_q8_1_scratch(batch, w.cols); !st.ok) return st;
             // in_stride is the float stride between batch rows in x; for
             // batch==1 the upstream call passes 0, but the ported quantize
             // kernel still walks (batch=1) row, so it never actually reads

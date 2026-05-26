@@ -240,10 +240,12 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id) {
         record(report, "layer." + std::to_string(il) + ".attn_norm");
 
         if (layer.recurrent) {
-            require_status(backend_.q8_0_matvec(*proj_, *layer.attn_qkv, *norm_));
-            require_status(backend_.q8_0_matvec(*gate_proj_, *layer.attn_gate, *norm_));
-            require_status(backend_.q8_0_matvec(*alpha_, *layer.ssm_alpha, *norm_));
-            require_status(backend_.q8_0_matvec(*beta_, *layer.ssm_beta, *norm_));
+            {
+                DeviceTensor *outs[4] = {proj_.get(), gate_proj_.get(), alpha_.get(), beta_.get()};
+                const DeviceWeight *ws[4] = {layer.attn_qkv, layer.attn_gate,
+                                              layer.ssm_alpha, layer.ssm_beta};
+                require_status(backend_.q8_0_matvec_fanout(outs, ws, 4, *norm_));
+            }
             record(report, "layer." + std::to_string(il) + ".recurrent_projections");
             if (!recurrent_states_[il] || !conv_states_[il]) {
                 throw std::runtime_error("recurrent state not allocated for layer " + std::to_string(il));
@@ -274,9 +276,11 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id) {
                 throw std::runtime_error("KV cache full: increase --ctx (current=" +
                                          std::to_string(kv_ctx_size_) + ")");
             }
-            require_status(backend_.q8_0_matvec(*q_, *layer.attn_q, *norm_));
-            require_status(backend_.q8_0_matvec(*k_, *layer.attn_k, *norm_));
-            require_status(backend_.q8_0_matvec(*v_, *layer.attn_v, *norm_));
+            {
+                DeviceTensor *outs[3] = {q_.get(), k_.get(), v_.get()};
+                const DeviceWeight *ws[3] = {layer.attn_q, layer.attn_k, layer.attn_v};
+                require_status(backend_.q8_0_matvec_fanout(outs, ws, 3, *norm_));
+            }
             record(report, "layer." + std::to_string(il) + ".attention_qkv_projection");
 
             // Per-head RMS norm using the shared head_dim-vector. Q is laid
@@ -326,8 +330,11 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id) {
         require_status(backend_.rms_norm(*norm_, *h_, *layer.ffn_norm, eps));
         record(report, "layer." + std::to_string(il) + ".ffn_norm");
 
-        require_status(backend_.q8_0_matvec(*ffn_gate_, *layer.ffn_gate, *norm_));
-        require_status(backend_.q8_0_matvec(*ffn_up_, *layer.ffn_up, *norm_));
+        {
+            DeviceTensor *outs[2] = {ffn_gate_.get(), ffn_up_.get()};
+            const DeviceWeight *ws[2] = {layer.ffn_gate, layer.ffn_up};
+            require_status(backend_.q8_0_matvec_fanout(outs, ws, 2, *norm_));
+        }
         require_status(backend_.silu_mul(*ffn_mid_, *ffn_gate_, *ffn_up_));
         require_status(backend_.q8_0_matvec(*ffn_out_, *layer.ffn_down, *ffn_mid_));
         require_status(backend_.add(*h_, *h_, *ffn_out_));
