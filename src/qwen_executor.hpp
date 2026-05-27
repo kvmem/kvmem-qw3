@@ -120,6 +120,12 @@ private:
 
     uint32_t kv_ctx_size_ = 0;
     uint32_t position_ = 0;
+
+    // Set by reset_state() and cleared after the first eager forward_one_token
+    // call of a generate() session. Suppresses CUDA-graph capture on token 0
+    // so every backend-side scratch buffer (q8_1, fattn, argmax_dev, ...) is
+    // allocated and primed before we record pointers into a graph.
+    bool decode_graph_warmup_pending_ = true;
 };
 
 } // namespace qw3

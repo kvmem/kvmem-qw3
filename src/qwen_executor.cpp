@@ -43,6 +43,7 @@ void QwenExecutor::reset_state() {
     // KV caches stay allocated; just reset the position so the next forward
     // overwrites slot 0 (the seq_len passed to attention_decode is position+1).
     position_ = 0;
+    decode_graph_warmup_pending_ = true;
 }
 
 void QwenExecutor::record(NativeExecutorReport &report, const std::string &op) const {
@@ -231,6 +232,12 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id) {
 
     require_status(backend_.begin());
 
+    // CUDA-graph capture path: skip on the first token (warm-up: every
+    // backend-side scratch buffer needs to be sized before we record
+    // pointers into a graph). Skip on layer 0 when we'd have no captured
+    // graph to replay yet — i.e. when capture refused to start.
+    const bool try_capture = !decode_graph_warmup_pending_ && backend_.begin_capture();
+
     require_status(backend_.q8_0_get_row(*h_, weights_.token_embd(), token_id));
     record(report, "token_embedding_lookup");
 
@@ -344,7 +351,22 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id) {
     require_status(backend_.rms_norm(*norm_, *h_, weights_.output_norm(), eps));
     record(report, "output_norm");
     require_status(backend_.q8_0_matvec(*logits_, weights_.output(), *norm_));
-    const DeviceArgmax best = backend_.argmax(*logits_);
+
+    DeviceArgmax best;
+    if (try_capture) {
+        // Record argmax kernel + its async D2H into the captured graph.
+        require_status(backend_.argmax_launch(*logits_));
+        require_status(backend_.end_capture());
+        require_status(backend_.replay_graph());
+        // Sync + read the pinned argmax mirror after the graph has run.
+        best = backend_.argmax_collect();
+    } else {
+        // Eager path: pulls in the warm-up token and any token where
+        // capture refused. Sets decode_graph_warmup_pending_ to false so
+        // the next call attempts capture.
+        best = backend_.argmax(*logits_);
+        decode_graph_warmup_pending_ = false;
+    }
     require_status(backend_.end());
 
     position_++;

@@ -1517,6 +1517,7 @@ public:
             if (hgemm_done_[i]) cudaEventDestroy(hgemm_done_[i]);
         }
         if (dequant_stream_) cudaStreamDestroy(dequant_stream_);
+        if (graph_instance_) cudaGraphExecDestroy(graph_instance_);
         if (exec_stream_) cudaStreamDestroy(exec_stream_);
         if (q8_1_scratch_) cudaFree(q8_1_scratch_);
         if (fattn_scratch_) cudaFree(fattn_scratch_);
@@ -1552,6 +1553,100 @@ public:
             return cuda_status(cudaDeviceSynchronize(), "cuda synchronize");
         }
         return cuda_status(cudaStreamSynchronize(exec_stream_), "cuda stream synchronize");
+    }
+
+    // -- CUDA graph capture for decode --
+    //
+    // Strategy mirrors llama.cpp's pattern: every decode token re-records the
+    // launches into a fresh cudaGraph_t (capture is cheap — nothing actually
+    // runs). Then either instantiate a new executable on the first capture or
+    // try cudaGraphExecUpdate on subsequent captures; on update failure
+    // (kernel-arg shapes changed enough that the existing nodes can't be
+    // patched in place), drop and re-instantiate. cudaGraphLaunch then issues
+    // the whole forward in one go — saves ~150 launch-API trips per token.
+    //
+    // Falls back to the eager path on first failure (and keeps falling back
+    // for the rest of the session). Toggle off entirely with QW3_GRAPH=off.
+    bool begin_capture() override {
+        if (graph_disabled_) return false;
+        if (capture_active_) return false;  // refuse nested capture
+        if (!exec_stream_) return false;
+        const char *env = std::getenv("QW3_GRAPH");
+        if (env && (std::strcmp(env, "off") == 0 || std::strcmp(env, "0") == 0)) {
+            graph_disabled_ = true;
+            return false;
+        }
+        // Ensure any pending work on exec_stream_ has completed before we
+        // start capture (capture refuses if the stream has in-flight work
+        // that wasn't itself captured, depending on the mode).
+        cudaError_t st = cudaStreamSynchronize(exec_stream_);
+        if (st != cudaSuccess) return false;
+        st = cudaStreamBeginCapture(exec_stream_, cudaStreamCaptureModeRelaxed);
+        if (st != cudaSuccess) {
+            (void)cudaGetLastError();
+            graph_disabled_ = true;
+            return false;
+        }
+        capture_active_ = true;
+        return true;
+    }
+
+    DeviceStatus end_capture() override {
+        if (!capture_active_) return {};
+        cudaGraph_t graph = nullptr;
+        cudaError_t st = cudaStreamEndCapture(exec_stream_, &graph);
+        capture_active_ = false;
+        if (st != cudaSuccess) {
+            (void)cudaGetLastError();
+            graph_disabled_ = true;
+            if (graph) cudaGraphDestroy(graph);
+            return {false, "cudaStreamEndCapture failed"};
+        }
+        if (graph_instance_ == nullptr) {
+            cudaError_t inst = cudaGraphInstantiate(&graph_instance_, graph, nullptr, nullptr, 0);
+            if (inst != cudaSuccess) {
+                (void)cudaGetLastError();
+                graph_disabled_ = true;
+                cudaGraphDestroy(graph);
+                graph_instance_ = nullptr;
+                return {false, "cudaGraphInstantiate failed"};
+            }
+        } else {
+#if CUDART_VERSION >= 12000
+            cudaGraphExecUpdateResultInfo info{};
+            cudaError_t up = cudaGraphExecUpdate(graph_instance_, graph, &info);
+#else
+            cudaGraphNode_t err_node = nullptr;
+            cudaGraphExecUpdateResult result = cudaGraphExecUpdateSuccess;
+            cudaError_t up = cudaGraphExecUpdate(graph_instance_, graph, &err_node, &result);
+#endif
+            if (up != cudaSuccess) {
+                // Topology / shape mismatch — drop and re-instantiate.
+                (void)cudaGetLastError();
+                cudaGraphExecDestroy(graph_instance_);
+                graph_instance_ = nullptr;
+                cudaError_t inst = cudaGraphInstantiate(&graph_instance_, graph, nullptr, nullptr, 0);
+                if (inst != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    graph_disabled_ = true;
+                    cudaGraphDestroy(graph);
+                    graph_instance_ = nullptr;
+                    return {false, "cudaGraphInstantiate (after update fail) failed"};
+                }
+            }
+        }
+        cudaGraphDestroy(graph);
+        return {};
+    }
+
+    DeviceStatus replay_graph() override {
+        if (!graph_instance_) return {false, "no captured graph to replay"};
+        cudaError_t st = cudaGraphLaunch(graph_instance_, exec_stream_);
+        if (st != cudaSuccess) {
+            (void)cudaGetLastError();
+            return {false, "cudaGraphLaunch failed"};
+        }
+        return {};
     }
 
     std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) override {
@@ -2698,6 +2793,23 @@ public:
 
     DeviceArgmax argmax(const DeviceTensor &x) override {
         const auto &t = as_tensor(x);
+        if (auto st = argmax_launch(x); !st.ok) {
+            return {};
+        }
+        // Sync immediately so callers that don't use the split-phase API still
+        // observe a fully-populated DeviceArgmax.
+        cudaStreamSynchronize(exec_stream_);
+        DeviceArgmax best;
+        best.token = argmax_host_[0];
+        float logit;
+        std::memcpy(&logit, &argmax_host_[1], sizeof(float));
+        best.logit = logit;
+        (void)t;
+        return best;
+    }
+
+    DeviceStatus argmax_launch(const DeviceTensor &x) override {
+        const auto &t = as_tensor(x);
         if (!argmax_dev_) {
             cudaMalloc(&argmax_dev_, 2 * sizeof(int32_t));
         }
@@ -2708,8 +2820,13 @@ public:
         argmax_kernel<<<1, 1024, 0, exec_stream_>>>(argmax_dev_, t.ptr, t.count);
         cudaMemcpyAsync(argmax_host_, argmax_dev_, 2 * sizeof(int32_t),
                         cudaMemcpyDeviceToHost, exec_stream_);
+        return launch_status("cuda argmax_launch");
+    }
+
+    DeviceArgmax argmax_collect() override {
         cudaStreamSynchronize(exec_stream_);
         DeviceArgmax best;
+        if (!argmax_host_) return best;
         best.token = argmax_host_[0];
         float logit;
         std::memcpy(&logit, &argmax_host_[1], sizeof(float));
@@ -2783,6 +2900,13 @@ private:
     // pipelines coexist with the rest of decode without forced syncs on the
     // legacy default stream.
     cudaStream_t exec_stream_ = nullptr;
+    // CUDA-graph state for the captured per-token decode forward.
+    // graph_instance_ is the executable graph; capture_active_ tracks whether
+    // we're currently between begin_capture/end_capture; graph_disabled_ is a
+    // sticky bit that latches on first capture failure so we don't retry.
+    cudaGraphExec_t graph_instance_ = nullptr;
+    bool capture_active_ = false;
+    bool graph_disabled_ = false;
     // Device-side argmax output (token, logit) and a pinned-host mirror.
     // Avoids the synchronous full-logits cudaMemcpy + host scan that the old
     // path did per token.

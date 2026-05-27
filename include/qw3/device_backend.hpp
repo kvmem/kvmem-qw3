@@ -48,6 +48,23 @@ public:
     virtual DeviceStatus end() = 0;
     virtual DeviceStatus synchronize() = 0;
 
+    // CUDA-graph capture hooks. Default impls are no-ops so non-CUDA backends
+    // pass through. The intended pattern, used for the per-token decode loop:
+    //
+    //   if (begin_capture()) {
+    //       // record kernel launches here
+    //       end_capture();         // turns the recorded launches into a graph
+    //       replay_graph();        // launches the captured graph
+    //   } else {
+    //       // record + execute eagerly (capture unsupported / not enabled)
+    //   }
+    //
+    // begin_capture returns false when graph capture is not supported or has
+    // been disabled at runtime — caller falls back to the eager path.
+    virtual bool begin_capture() { return false; }
+    virtual DeviceStatus end_capture() { return {}; }
+    virtual DeviceStatus replay_graph() { return {}; }
+
     virtual std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) = 0;
     // Optional FP16 tensor. Backends that don't override fall back to FP32 —
     // call sites should be prepared for that and treat the returned tensor
@@ -400,6 +417,18 @@ public:
     virtual DeviceStatus zero_tensor(DeviceTensor &x) = 0;
 
     virtual DeviceArgmax argmax(const DeviceTensor &x) = 0;
+
+    // Two-phase argmax for graph capture: launch the device kernel inside
+    // the captured stream, then later sync + read the device buffer outside
+    // the graph. Default impls fall back to the synchronous argmax above —
+    // they're only correct when graph capture is *not* in flight.
+    virtual DeviceStatus argmax_launch(const DeviceTensor &x) {
+        (void)x;
+        return {};
+    }
+    virtual DeviceArgmax argmax_collect() {
+        return {};
+    }
 
     // Copy `count` floats from the device tensor starting at offset to host
     // memory. Used by --dump-logits and other diagnostics. Default no-op
