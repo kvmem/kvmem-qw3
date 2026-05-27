@@ -38,6 +38,11 @@ bool launch_mmvq_q8_0(
         const uint8_t *weight, const void *y_q8_1, float *dst,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
+bool launch_mmvq_q8_0_two(
+        const uint8_t *weight0, const uint8_t *weight1, const void *y_q8_1,
+        float *dst0, float *dst1,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
 
 // Ported MMQ Q8_0 INT8-MMA matmul (src/mmq_q8.cu). Drop-in replacement for
 // the HGEMM prefill path that uses m16n8k32.s8.s8.s32 tensor cores directly
@@ -1779,18 +1784,50 @@ public:
                                           exec_stream_)) {
             return {false, "fanout quantize_q8_1 launch failed"};
         }
-        for (uint32_t i = 0; i < n; ++i) {
-            auto &w = const_cast<CudaWeight &>(as_weight(*weights[i]));
+        // Pairwise fuse adjacent same-shape weights into a single matvec
+        // kernel (one CTA grid produces both outputs, sharing the activation
+        // L2 read). Hot caller is FFN gate+up where both weights share
+        // (rows, cols). Q+K+V/recurrent fanouts have heterogeneous rows so
+        // they fall through to the per-call path. Disable with QW3_FUSE2=off.
+        const bool fuse2 = []() {
+            const char *e = std::getenv("QW3_FUSE2");
+            return !(e && std::string(e) == "off");
+        }();
+        uint32_t i = 0;
+        while (i < n) {
+            const auto &wa = as_weight(*weights[i]);
+            if (fuse2 && i + 1 < n) {
+                const auto &wb = as_weight(*weights[i + 1]);
+                if (wa.rows == wb.rows && wa.cols == wb.cols) {
+                    auto &oa = as_tensor(*outs[i]);
+                    auto &ob = as_tensor(*outs[i + 1]);
+                    if (!ported::launch_mmvq_q8_0_two(
+                            static_cast<const uint8_t *>(wa.ptr),
+                            static_cast<const uint8_t *>(wb.ptr),
+                            q8_1_scratch_,
+                            oa.ptr, ob.ptr,
+                            static_cast<uint32_t>(wa.rows),
+                            static_cast<uint32_t>(wa.cols),
+                            /*batch=*/1,
+                            /*stride_dst_row=*/static_cast<uint32_t>(wa.rows),
+                            exec_stream_)) {
+                        return {false, "fanout mmvq_q8_0_two launch failed"};
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
             auto &o = as_tensor(*outs[i]);
-            if (!ported::launch_mmvq_q8_0(static_cast<const uint8_t *>(w.ptr),
+            if (!ported::launch_mmvq_q8_0(static_cast<const uint8_t *>(wa.ptr),
                                           q8_1_scratch_, o.ptr,
-                                          static_cast<uint32_t>(w.rows),
-                                          static_cast<uint32_t>(w.cols),
+                                          static_cast<uint32_t>(wa.rows),
+                                          static_cast<uint32_t>(wa.cols),
                                           /*batch=*/1,
-                                          /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                                          /*stride_dst_row=*/static_cast<uint32_t>(wa.rows),
                                           exec_stream_)) {
                 return {false, "fanout mmvq_q8_0 launch failed"};
             }
+            ++i;
         }
         return launch_status("cuda q8_0_matvec_fanout");
     }

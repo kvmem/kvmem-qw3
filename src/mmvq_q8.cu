@@ -233,6 +233,119 @@ __global__ void mul_mat_vec_q8_0_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// mul_mat_vec_q8_0_two_kernel: two Q8_0 weights × one shared Q8_1 activation.
+// Used to fuse FFN gate+up at decode (same input, same shape, different
+// weights). Hot kernel is bandwidth-bound on weight reads, so two-weight
+// fusion does NOT halve runtime — both weights are still pulled from HBM.
+// What it saves is (a) one full grid-launch of CTA setup, and (b) a second
+// L2 read of the activation (~6 KB per CTA). Empirically that's worth a
+// few percent on FFN-heavy decode paths.
+//
+// Shape constraint: both weights must have identical (rows, cols). Caller
+// validates this before dispatching; otherwise fall back to two separate
+// matvec calls.
+
+template <int NCOLS_DST>
+__launch_bounds__(q8_mmvq_nwarps<NCOLS_DST>() * Q8_VEC_WARP_SIZE, 1)
+__global__ void mul_mat_vec_q8_0_two_kernel(
+        const uint8_t *    __restrict__ vx0,
+        const uint8_t *    __restrict__ vx1,
+        const block_q8_1 * __restrict__ vy,
+        float *            __restrict__ dst0,
+        float *            __restrict__ dst1,
+        uint32_t cols,
+        uint32_t rows,
+        uint32_t stride_y_row,
+        uint32_t stride_dst_row)
+{
+    constexpr int NWARPS              = q8_mmvq_nwarps<NCOLS_DST>();
+    constexpr int rows_per_cuda_block = q8_mmvq_rows_per_block<NCOLS_DST>();
+    constexpr int warp_size           = Q8_VEC_WARP_SIZE;
+    constexpr int blocks_per_iter     = VDR_Q8_0 * NWARPS * warp_size / QI8_0;
+
+    const int tid = warp_size * threadIdx.y + threadIdx.x;
+    const int row0 = rows_per_cuda_block * blockIdx.x;
+    const int blocks_per_row_x = cols / QK8_0;
+
+    float tmp0[NCOLS_DST][rows_per_cuda_block] = {{0.0f}};
+    float tmp1[NCOLS_DST][rows_per_cuda_block] = {{0.0f}};
+
+    for (int kbx = tid / (QI8_0 / VDR_Q8_0); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kqs = VDR_Q8_0 * (tid % (QI8_0 / VDR_Q8_0));
+
+        #pragma unroll
+        for (int j = 0; j < NCOLS_DST; ++j) {
+            const block_q8_1 * ya = vy + j * stride_y_row + kbx;
+            const float d_x = __low2float(ya->ds);
+            // Hoist the activation reads once — both weights consume them.
+            int u[VDR_Q8_0];
+            #pragma unroll
+            for (int i = 0; i < VDR_Q8_0; ++i) {
+                u[i] = reinterpret_cast<const int *>(ya->qs)[kqs + i];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const uint64_t row_idx = static_cast<uint64_t>(row0 + i);
+                if (rows_per_cuda_block > 1 && row_idx >= rows) break;
+                const uint8_t * blk0 = vx0 + (row_idx * blocks_per_row_x + kbx) * 34;
+                const uint8_t * blk1 = vx1 + (row_idx * blocks_per_row_x + kbx) * 34;
+                const float d_w0 = __half2float(*reinterpret_cast<const half *>(blk0));
+                const float d_w1 = __half2float(*reinterpret_cast<const half *>(blk1));
+
+                int sumi0 = 0, sumi1 = 0;
+                #pragma unroll
+                for (int k = 0; k < VDR_Q8_0; ++k) {
+                    const int v0 = q8_load_int_align2(blk0 + 2, kqs + k);
+                    const int v1 = q8_load_int_align2(blk1 + 2, kqs + k);
+                    sumi0 = __dp4a(v0, u[k], sumi0);
+                    sumi1 = __dp4a(v1, u[k], sumi1);
+                }
+                tmp0[j][i] += d_w0 * d_x * static_cast<float>(sumi0);
+                tmp1[j][i] += d_w1 * d_x * static_cast<float>(sumi1);
+            }
+        }
+    }
+
+    __shared__ float sh0[NWARPS - 1 > 0 ? NWARPS - 1 : 1][NCOLS_DST][rows_per_cuda_block][warp_size];
+    __shared__ float sh1[NWARPS - 1 > 0 ? NWARPS - 1 : 1][NCOLS_DST][rows_per_cuda_block][warp_size];
+
+    if (NWARPS > 1 && threadIdx.y > 0) {
+        #pragma unroll
+        for (int j = 0; j < NCOLS_DST; ++j) {
+            #pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                sh0[threadIdx.y - 1][j][i][threadIdx.x] = tmp0[j][i];
+                sh1[threadIdx.y - 1][j][i][threadIdx.x] = tmp1[j][i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+
+    #pragma unroll
+    for (int j = 0; j < NCOLS_DST; ++j) {
+        #pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            #pragma unroll
+            for (int l = 0; l < NWARPS - 1; ++l) {
+                tmp0[j][i] += sh0[l][j][i][threadIdx.x];
+                tmp1[j][i] += sh1[l][j][i][threadIdx.x];
+            }
+            tmp0[j][i] = cuda_helpers::warp_reduce_sum<warp_size>(tmp0[j][i]);
+            tmp1[j][i] = cuda_helpers::warp_reduce_sum<warp_size>(tmp1[j][i]);
+        }
+        if (threadIdx.x < rows_per_cuda_block) {
+            const uint64_t row_idx = static_cast<uint64_t>(row0 + threadIdx.x);
+            if (rows_per_cuda_block == 1 || row_idx < rows) {
+                dst0[j * stride_dst_row + row_idx] = tmp0[j][threadIdx.x];
+                dst1[j * stride_dst_row + row_idx] = tmp1[j][threadIdx.x];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public launchers.
 
 // Number of bytes needed to stage `batch` activation rows of `cols` columns
@@ -296,6 +409,51 @@ bool launch_mmvq_q8_0(
             weight,
             reinterpret_cast<const block_q8_1 *>(y_q8_1),
             dst,
+            cols, rows, stride_y_row, stride_dst_row);
+    };
+
+    switch (batch) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        case 8: launch(std::integral_constant<int, 8>{}); break;
+        default: return false;
+    }
+    return true;
+}
+
+// Fused two-weight matvec: gate+up FFN at decode. Caller must guarantee
+// w0 and w1 have identical (rows, cols).
+bool launch_mmvq_q8_0_two(
+        const uint8_t * weight0,
+        const uint8_t * weight1,
+        const void *    y_q8_1,
+        float *         dst0,
+        float *         dst1,
+        uint32_t        rows,
+        uint32_t        cols,
+        uint32_t        batch,
+        uint32_t        stride_dst_row,
+        cudaStream_t    stream) {
+    if (cols % QK8_0 != 0) return false;
+    if (batch == 0 || batch > 8) return false;
+    const uint32_t stride_y_row = cols / QK8_1;
+
+    auto launch = [&](auto NCOLS_C) {
+        constexpr int NCOLS_DST = decltype(NCOLS_C)::value;
+        constexpr int NWARPS    = q8_mmvq_nwarps<NCOLS_DST>();
+        constexpr int RPB       = q8_mmvq_rows_per_block<NCOLS_DST>();
+        const uint32_t nblocks  = (rows + RPB - 1) / RPB;
+        const dim3 grid(nblocks, 1, 1);
+        const dim3 block(Q8_VEC_WARP_SIZE, NWARPS, 1);
+        mul_mat_vec_q8_0_two_kernel<NCOLS_DST><<<grid, block, 0, stream>>>(
+            weight0, weight1,
+            reinterpret_cast<const block_q8_1 *>(y_q8_1),
+            dst0, dst1,
             cols, rows, stride_y_row, stride_dst_row);
     };
 
