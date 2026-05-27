@@ -403,8 +403,37 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         return report;
     }
     ensure_scratch();
-    const uint32_t batch = static_cast<uint32_t>(tokens.size());
-    ensure_batch_scratch(batch);
+    const uint32_t total = static_cast<uint32_t>(tokens.size());
+
+    // Internal prefill chunking (opt-in). llama.cpp processes prefill in
+    // n_batch=512 pieces so a captured CUDA graph amortizes capture cost
+    // across replays. qw3 historically processes the entire prompt in one
+    // batched call, and on this hardware that's the right choice for two
+    // reasons that don't apply to llama.cpp:
+    //
+    //   1. The HGEMM Q8 path uses a multi-stream ping-pong pipeline
+    //      (dequant of W_{n+1} overlaps with HGEMM of W_n). Each chunk
+    //      restarts the pipeline cold, paying a fixed setup cost per
+    //      chunk. (See ensure_dequant_pipeline / hgemm_q8.)
+    //   2. cuBLAS picks a fatter, higher-utilization kernel at batch=4096
+    //      than at batch=512; chunking down loses ~10% throughput to
+    //      lower-batch kernel selection.
+    //
+    // Empirically, chunking at 512 regresses 4K prefill 3325→2366 tok/s
+    // even before any capture concerns (and capture itself is incompatible
+    // with the cross-stream HGEMM dependencies — cudaStreamBeginCapture
+    // refuses the cudaEventRecord on dequant_stream_).
+    //
+    // Kept opt-in via QW3_PREFILL_CHUNK=N for diagnostic / future revival
+    // (e.g. if MMQ replaces HGEMM and removes the ping-pong pipeline,
+    // chunking + capture might become viable).
+    uint32_t chunk_size = total;
+    if (const char *env = std::getenv("QW3_PREFILL_CHUNK")) {
+        int v = std::atoi(env);
+        if (v > 0) chunk_size = static_cast<uint32_t>(v);
+    }
+    if (chunk_size > total) chunk_size = total;
+    ensure_batch_scratch(chunk_size);
 
     const QwenConfig &cfg = model_.config();
     const uint32_t head_k_dim = cfg.head_k_dim();
@@ -416,8 +445,6 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     const uint32_t standard_n_kv_heads = cfg.n_kv_heads;
     const float eps = cfg.rms_eps;
 
-    // Per-row strides for the batched scratch buffers. Each batched buffer
-    // is sized [batch_capacity_, *] so each row is buffer.count / capacity.
     auto row_stride = [this](const DeviceTensor *t) -> uint32_t {
         return static_cast<uint32_t>(t->count / batch_capacity_);
     };
@@ -435,16 +462,49 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
 
     require_status(backend_.begin());
 
-    std::vector<uint64_t> rows_h(batch);
-    for (uint32_t i = 0; i < batch; ++i) rows_h[i] = tokens[i];
-    require_status(backend_.q8_0_get_rows_batch(*h_batch_, weights_.token_embd(), rows_h.data(), batch));
-    record(report, "token_embedding_lookup_batch");
+    // Per-chunk graph capture is gated separately: even when the user
+    // forces chunking, capture is incompatible with the multi-stream
+    // HGEMM ping-pong pipeline (see chunk_size comment above). Setting
+    // QW3_PREFILL_GRAPH=1 attempts capture anyway for diagnostic use.
+    const bool prefill_graph_enabled = []() {
+        const char *e = std::getenv("QW3_PREFILL_GRAPH");
+        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0);
+    }();
 
-    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+    // Skip capture on the first chunk (warmup): backend-side scratch
+    // (q8_1 staging, fattn workspace) sizes itself on first use. After
+    // that, full-size chunks attempt capture+replay; the trailing partial
+    // chunk always runs eagerly so we keep one stable graph topology.
+    bool capture_warmup_pending = true;
+
+    uint32_t last_chunk_batch = 0;
+    for (uint32_t chunk_off = 0; chunk_off < total; chunk_off += chunk_size) {
+        const uint32_t batch = std::min(chunk_size, total - chunk_off);
+        last_chunk_batch = batch;
+        const uint32_t base_pos = position_ + chunk_off;
+        const bool record_ops = (chunk_off == 0);
+        const bool full_chunk = (batch == chunk_size);
+
+        if (base_pos + batch > kv_ctx_size_) {
+            throw std::runtime_error("KV cache full: increase --ctx (current=" +
+                                     std::to_string(kv_ctx_size_) + ")");
+        }
+
+        // Embedding lookup runs eagerly: q8_0_get_rows_batch issues a
+        // pageable host->device memcpy which is unsafe inside stream capture.
+        std::vector<uint64_t> rows_h(batch);
+        for (uint32_t i = 0; i < batch; ++i) rows_h[i] = tokens[chunk_off + i];
+        require_status(backend_.q8_0_get_rows_batch(*h_batch_, weights_.token_embd(), rows_h.data(), batch));
+        if (record_ops) record(report, "token_embedding_lookup_batch");
+
+        const bool try_capture = prefill_graph_enabled
+            && full_chunk && !capture_warmup_pending && backend_.begin_capture();
+
+        for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
         const QwenLayerWeights &layer = weights_.layer(il);
         require_status(backend_.rms_norm_batch(*norm_batch_, *h_batch_, *layer.attn_norm,
                                                 batch, h_stride, eps));
-        record(report, "layer." + std::to_string(il) + ".attn_norm_batch");
+        if (record_ops) record(report, "layer." + std::to_string(il) + ".attn_norm_batch");
 
         if (layer.recurrent) {
             require_status(backend_.q8_0_matmul(*proj_batch_, *layer.attn_qkv, *norm_batch_,
@@ -455,7 +515,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                  batch, h_stride, alpha_stride));
             require_status(backend_.q8_0_matmul(*beta_batch_, *layer.ssm_beta, *norm_batch_,
                                                  batch, h_stride, beta_stride));
-            record(report, "layer." + std::to_string(il) + ".recurrent_projections_batch");
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".recurrent_projections_batch");
             if (!recurrent_states_[il] || !conv_states_[il] || !conv_out_batch_) {
                 throw std::runtime_error("recurrent state not allocated for layer " + std::to_string(il));
             }
@@ -487,22 +547,18 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                      beta_stride,
                                                      core_stride,
                                                      eps));
-            record(report, "layer." + std::to_string(il) + ".deltanet_batch");
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".deltanet_batch");
             require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.ssm_out, *core_batch_,
                                                  batch, core_stride, h_stride));
-            record(report, "layer." + std::to_string(il) + ".recurrent_output_batch");
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".recurrent_output_batch");
         } else {
-            if (position_ + batch > kv_ctx_size_) {
-                throw std::runtime_error("KV cache full: increase --ctx (current=" +
-                                         std::to_string(kv_ctx_size_) + ")");
-            }
             require_status(backend_.q8_0_matmul(*q_batch_, *layer.attn_q, *norm_batch_,
                                                  batch, h_stride, q_stride_buf));
             require_status(backend_.q8_0_matmul(*k_batch_, *layer.attn_k, *norm_batch_,
                                                  batch, h_stride, k_stride_buf));
             require_status(backend_.q8_0_matmul(*v_batch_, *layer.attn_v, *norm_batch_,
                                                  batch, h_stride, v_stride_buf));
-            record(report, "layer." + std::to_string(il) + ".attention_qkv_projection_batch");
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_qkv_projection_batch");
 
             require_status(backend_.rmsnorm_per_head_batch(*q_batch_, *layer.attn_q_norm,
                                                             batch, q_stride_buf,
@@ -519,17 +575,17 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                         batch, q_stride_buf,
                                                         standard_n_heads,
                                                         2 * standard_head_dim,
-                                                        cfg.rope_dim, position_, cfg.rope_theta));
+                                                        cfg.rope_dim, base_pos, cfg.rope_theta));
             require_status(backend_.rope_partial_batch(*k_batch_,
                                                         batch, k_stride_buf,
                                                         standard_n_kv_heads,
                                                         standard_head_dim,
-                                                        cfg.rope_dim, position_, cfg.rope_theta));
+                                                        cfg.rope_dim, base_pos, cfg.rope_theta));
 
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-            require_status(backend_.kv_append_batch(*k_cache_[il], *k_batch_, position_, per_pos, batch));
-            require_status(backend_.kv_append_batch(*v_cache_[il], *v_batch_, position_, per_pos, batch));
-            record(report, "layer." + std::to_string(il) + ".kv_append_batch");
+            require_status(backend_.kv_append_batch(*k_cache_[il], *k_batch_, base_pos, per_pos, batch));
+            require_status(backend_.kv_append_batch(*v_cache_[il], *v_batch_, base_pos, per_pos, batch));
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch");
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
             require_status(backend_.attention_decode_batch(*mid_batch_, *q_batch_,
@@ -537,24 +593,24 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                             *k_cache_[il], *v_cache_[il],
                                                             standard_n_heads, standard_n_kv_heads,
                                                             standard_head_dim,
-                                                            position_, batch,
+                                                            base_pos, batch,
                                                             q_stride_buf, mid_stride, scale));
             require_status(backend_.apply_attn_gate_batch(*mid_batch_, *q_batch_,
                                                            2 * standard_head_dim,
                                                            batch, q_stride_buf, mid_stride,
                                                            standard_n_heads, standard_head_dim));
-            record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch");
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch");
 
             require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.attn_output, *mid_batch_,
                                                  batch, mid_stride, h_stride));
         }
 
         require_status(backend_.add(*h_batch_, *h_batch_, *attn_out_batch_));
-        record(report, "layer." + std::to_string(il) + ".attn_residual_batch");
+        if (record_ops) record(report, "layer." + std::to_string(il) + ".attn_residual_batch");
 
         require_status(backend_.rms_norm_batch(*norm_batch_, *h_batch_, *layer.ffn_norm,
                                                 batch, h_stride, eps));
-        record(report, "layer." + std::to_string(il) + ".ffn_norm_batch");
+        if (record_ops) record(report, "layer." + std::to_string(il) + ".ffn_norm_batch");
 
         require_status(backend_.q8_0_matmul(*ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
                                              batch, h_stride, ffn_stride));
@@ -564,18 +620,30 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         require_status(backend_.q8_0_matmul(*ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
                                              batch, ffn_stride, h_stride));
         require_status(backend_.add(*h_batch_, *h_batch_, *ffn_out_batch_));
-        record(report, "layer." + std::to_string(il) + ".ffn_batch");
+        if (record_ops) record(report, "layer." + std::to_string(il) + ".ffn_batch");
+        }
+
+        if (try_capture) {
+            require_status(backend_.end_capture());
+            require_status(backend_.replay_graph());
+        } else if (full_chunk) {
+            // First full chunk: ran eager so backend-side scratch buffers
+            // (q8_1 staging, fattn workspace) get sized before we attempt
+            // capture on the next chunk.
+            capture_warmup_pending = false;
+        }
     }
 
-    // Only the LAST prompt token's logits are needed to start decoding.
-    require_status(backend_.copy_d2d(*h_, *h_batch_, (batch - 1) * h_stride, h_stride));
+    // Only the LAST prompt token's logits are needed to start decoding. The
+    // last chunk leaves its rows in h_batch_ rows [0, last_chunk_batch).
+    require_status(backend_.copy_d2d(*h_, *h_batch_, (last_chunk_batch - 1) * h_stride, h_stride));
     require_status(backend_.rms_norm(*norm_, *h_, weights_.output_norm(), eps));
     record(report, "output_norm");
     require_status(backend_.q8_0_matvec(*logits_, weights_.output(), *norm_));
     const DeviceArgmax best = backend_.argmax(*logits_);
     require_status(backend_.end());
 
-    position_ += batch;
+    position_ += total;
     report.argmax_token = best.token;
     report.argmax_logit = best.logit;
     report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
