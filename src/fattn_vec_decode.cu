@@ -932,6 +932,43 @@ __device__ __forceinline__ void ldmatrix_x4_a(
 #endif
 }
 
+// cp.async.cg.shared.global of 16 bytes from gmem -> smem. Non-blocking;
+// wait_group(0) drains all in-flight commits in this thread. Falls back to a
+// vectorized synchronous load on pre-Ampere targets.
+__device__ __forceinline__ void cp_async_cg_16(
+        __half *smem_dst, const __half *gmem_src) {
+#if QW3_MMA_AVAILABLE
+    unsigned dst = __cvta_generic_to_shared(smem_dst);
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :: "r"(dst), "l"(gmem_src));
+#else
+    *reinterpret_cast<int4 *>(smem_dst) = *reinterpret_cast<const int4 *>(gmem_src);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_zero_16(__half *smem_dst) {
+#if QW3_MMA_AVAILABLE
+    int4 z; z.x = z.y = z.z = z.w = 0;
+    *reinterpret_cast<int4 *>(smem_dst) = z;
+#else
+    *reinterpret_cast<int4 *>(smem_dst) = make_int4(0, 0, 0, 0);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+#if QW3_MMA_AVAILABLE
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+#if QW3_MMA_AVAILABLE
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+
 } // namespace mma_detail
 
 template <uint32_t HEAD_DIM, uint32_t BR, uint32_t BC>
@@ -1293,11 +1330,368 @@ fattn_prefill_mma_kernel(
     }
 }
 
+// ============================================================================
+// Piped variant: 2-stage cp.async on K loads + Q kept in registers across
+// the entire K-loop (single ldmatrix.x4 per ks before the loop). V load stays
+// synchronous (the strided transposed write doesn't fit cp.async; switching
+// V to row-major + ldmatrix.trans is a follow-up).
+//
+// Shmem grows by BC*HEAD_DIM*sizeof(half) for the second K buffer:
+//   HD=256: 43 -> 59 KB; HD=128: 24 -> 32 KB. Both under 99 KB cap.
+// Q[16*256] is dropped since Q is in registers (saves 8 KB at HD=256).
+//
+// Net per-tile change vs the synchronous kernel:
+//   - K HBM read overlaps the previous tile's QK+softmax+PV (~3-4 us hidden)
+//   - Q ldmatrix.x4 issued QK_KSTEPS times instead of QK_KSTEPS*N_TILES_KV
+// ============================================================================
+template <uint32_t HEAD_DIM, uint32_t BR, uint32_t BC>
+__global__ void
+__launch_bounds__(128, 2)
+fattn_prefill_mma_kernel_pipe(
+        float       * __restrict__ out,
+        const float * __restrict__ q,
+        uint32_t     q_stride,
+        const __half* __restrict__ k_cache,
+        const __half* __restrict__ v_cache,
+        uint32_t     n_heads,
+        uint32_t     n_kv_heads,
+        uint32_t     base_seq_len,
+        uint32_t     batch,
+        uint32_t     q_batch_stride,
+        uint32_t     out_batch_stride,
+        float        scale) {
+    constexpr uint32_t WARP_SIZE = 32;
+    constexpr uint32_t NWARPS    = 4;
+    constexpr uint32_t MMA_M     = 16;
+    constexpr uint32_t MMA_N     = 8;
+    constexpr uint32_t MMA_K     = 16;
+    static_assert(BR == 16, "MMA prefill kernel requires BR=16");
+    static_assert(BC == 32, "MMA prefill kernel requires BC=32");
+    static_assert(HEAD_DIM == 256 || HEAD_DIM == 128,
+                  "MMA prefill kernel supports HEAD_DIM 128 or 256");
+    static_assert(HEAD_DIM % MMA_K == 0, "HEAD_DIM must be a multiple of MMA_K");
+
+    constexpr uint32_t QK_KSTEPS  = HEAD_DIM / MMA_K;
+    constexpr uint32_t QK_N_PER_WARP = BC / NWARPS;
+    static_assert(QK_N_PER_WARP == MMA_N, "BC/NWARPS must equal MMA_N");
+    constexpr uint32_t PV_KSTEPS  = BC / MMA_K;
+    constexpr uint32_t HD_PER_WARP = HEAD_DIM / NWARPS;
+    constexpr uint32_t PV_N_TILES  = HD_PER_WARP / MMA_N;
+
+    const uint32_t head    = blockIdx.x;
+    const uint32_t block_q = blockIdx.y;
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t warp    = tid / WARP_SIZE;
+    const uint32_t lane    = tid % WARP_SIZE;
+    if (head >= n_heads) return;
+    const uint32_t kv_head = head / (n_heads / n_kv_heads);
+    const uint32_t group_id = lane / 4;
+    const uint32_t in_group = lane % 4;
+
+    uint32_t block_max_q = block_q * BR + BR;
+    if (block_max_q > batch) block_max_q = batch;
+    const uint32_t block_max_kv = base_seq_len + block_max_q;
+
+    // ---- Shared memory layout (no s_Q: Q is in registers) -------------------
+    // Two K buffers for cp.async ping-pong; single V_T buffer (V load is sync).
+    extern __shared__ char smem_raw[];
+    char *p = smem_raw;
+    __half *s_K[2];
+    s_K[0] = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
+    s_K[1] = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
+    __half *s_VT  = reinterpret_cast<__half *>(p); p += HEAD_DIM * BC * sizeof(__half);
+    float  *s_S   = reinterpret_cast<float  *>(p); p += BR       * BC * sizeof(float);
+    __half *s_P   = reinterpret_cast<__half *>(p); p += BR       * BC * sizeof(__half);
+    float  *s_m   = reinterpret_cast<float  *>(p); p += BR            * sizeof(float);
+    float  *s_l   = reinterpret_cast<float  *>(p); p += BR            * sizeof(float);
+    float  *s_alpha = reinterpret_cast<float *>(p); p += BR           * sizeof(float);
+
+    // ---- Load Q into registers via ldmatrix ----------------------------------
+    // Stage Q to a tiny shmem scratchpad (BR*HEAD_DIM halves = 16*256 = 8 KB),
+    // do the ldmatrix, then drop. We reuse the s_K[0] buffer for this — it'll
+    // be overwritten by the first K-tile load before any QK consumption.
+    __half *s_Q_scratch = s_K[0];
+    {
+        constexpr uint32_t ROWS_PER_WARP = BR / NWARPS;          // 4
+        for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+            const uint32_t q_row = warp * ROWS_PER_WARP + r;
+            const uint32_t q_idx = block_q * BR + q_row;
+            const bool active   = (q_idx < batch);
+            const float * q_ptr = active
+                ? (q + static_cast<uint64_t>(q_idx) * q_batch_stride
+                     + head * q_stride)
+                : nullptr;
+            #pragma unroll
+            for (uint32_t d0 = 0; d0 < HEAD_DIM; d0 += WARP_SIZE) {
+                const uint32_t d = d0 + lane;
+                const float v = active ? q_ptr[d] : 0.0f;
+                s_Q_scratch[q_row * HEAD_DIM + d] = __float2half(v);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Pre-load all QK_KSTEPS Q fragments into registers via ldmatrix.x4.
+    unsigned Q_frag[QK_KSTEPS][4];
+    #pragma unroll
+    for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+        const uint32_t k0 = ks * MMA_K;
+        mma_detail::ldmatrix_x4_a(Q_frag[ks][0], Q_frag[ks][1],
+                                  Q_frag[ks][2], Q_frag[ks][3],
+                                  &s_Q_scratch[0 * HEAD_DIM + k0], HEAD_DIM);
+    }
+    __syncthreads();   // s_Q_scratch (= s_K[0]) is now free for K-load reuse.
+
+    if (tid < BR) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+    float O_acc[PV_N_TILES][4];
+    #pragma unroll
+    for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) O_acc[n][i] = 0.0f;
+    }
+
+    // K-tile cp.async loader. Issues 8 cp.async.cg.shared.global of 16 B each
+    // per thread, into s_K[stage]. Returns without committing — caller calls
+    // cp_async_commit() once per stage.
+    auto issue_K_load = [&](uint32_t stage, uint32_t t0) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0 + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            __half *dst = &s_K[stage][shm_t * HEAD_DIM + base_d];
+            if (t < block_max_kv) {
+                const __half *k_src = k_cache
+                    + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                    + kv_head * HEAD_DIM + base_d;
+                mma_detail::cp_async_cg_16(dst, k_src);
+            } else {
+                mma_detail::cp_async_zero_16(dst);
+            }
+        }
+    };
+
+    // V-tile sync transposed load. Same as the original kernel.
+    auto load_V_sync = [&](uint32_t t0) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0 + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            __half v8[HALVES_PER_LD];
+            if (t < block_max_kv) {
+                const __half *v_src = v_cache
+                    + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                    + kv_head * HEAD_DIM + base_d;
+                *reinterpret_cast<int4 *>(v8) = *reinterpret_cast<const int4 *>(v_src);
+            } else {
+                *reinterpret_cast<int4 *>(v8) = make_int4(0,0,0,0);
+            }
+            #pragma unroll
+            for (uint32_t i = 0; i < HALVES_PER_LD; ++i) {
+                s_VT[(base_d + i) * BC + shm_t] = v8[i];
+            }
+        }
+    };
+
+    // Prologue: issue stage 0's K cp.async, then commit. Don't wait yet.
+    issue_K_load(0, /*t0=*/0);
+    mma_detail::cp_async_commit();
+
+    // =====================================================================
+    // Pipelined tile loop: while consuming stage `cur`'s K, issue stage
+    // `cur+1`'s K. V load is sync after the K wait (V is consumed only by
+    // PV after softmax, so it doesn't need the same prefetch).
+    // =====================================================================
+    uint32_t cur_stage = 0;
+    for (uint32_t t0 = 0; t0 < block_max_kv; t0 += BC) {
+        const uint32_t next_t0 = t0 + BC;
+        const bool has_next = (next_t0 < block_max_kv);
+        const uint32_t next_stage = cur_stage ^ 1u;
+
+        // Issue stage cur+1's K cp.async BEFORE waiting on cur — this lets
+        // the new HBM read overlap the QK+softmax+PV consumption below.
+        if (has_next) {
+            issue_K_load(next_stage, next_t0);
+            mma_detail::cp_async_commit();
+            // Wait until cur's load is done (1 still in flight = next).
+            mma_detail::cp_async_wait_group<1>();
+        } else {
+            mma_detail::cp_async_wait_group<0>();
+        }
+        __syncthreads();
+
+        // V is loaded synchronously here — out of the K critical path.
+        load_V_sync(t0);
+
+        // ================================================================
+        // QK^T MMA. Q is in registers (Q_frag[]); K from s_K[cur_stage].
+        // ================================================================
+        float c00 = 0.f, c01 = 0.f, c02 = 0.f, c03 = 0.f;
+        #pragma unroll
+        for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+            const uint32_t k0 = ks * MMA_K;
+            const uint32_t kv_col = warp * MMA_N + group_id;
+            const __half *krow0 = &s_K[cur_stage][kv_col * HEAD_DIM + k0 + in_group * 2];
+            unsigned b0 = mma_detail::pack2h(krow0);
+            unsigned b1 = mma_detail::pack2h(krow0 + 8);
+            mma_detail::mma_m16n8k16_f16f16f32(
+                c00, c01, c02, c03,
+                Q_frag[ks][0], Q_frag[ks][1], Q_frag[ks][2], Q_frag[ks][3],
+                b0, b1);
+        }
+
+        __syncthreads();   // wait for V load (issued above) before PV.
+
+        // Write S slice with causal mask (same as base kernel).
+        {
+            const uint32_t base_col = warp * MMA_N + in_group * 2;
+            const uint32_t row_a = group_id;
+            const uint32_t row_b = group_id + 8;
+            const uint32_t q_idx_a = block_q * BR + row_a;
+            const uint32_t q_idx_b = block_q * BR + row_b;
+            const uint32_t my_max_kv_a = base_seq_len + q_idx_a + 1;
+            const uint32_t my_max_kv_b = base_seq_len + q_idx_b + 1;
+            const bool a_active = (q_idx_a < batch);
+            const bool b_active = (q_idx_b < batch);
+            const uint32_t t_a0 = t0 + base_col;
+            const uint32_t t_a1 = t0 + base_col + 1;
+            float v00 = (a_active && t_a0 < my_max_kv_a) ? c00 * scale : -INFINITY;
+            float v01 = (a_active && t_a1 < my_max_kv_a) ? c01 * scale : -INFINITY;
+            float v02 = (b_active && t_a0 < my_max_kv_b) ? c02 * scale : -INFINITY;
+            float v03 = (b_active && t_a1 < my_max_kv_b) ? c03 * scale : -INFINITY;
+            s_S[row_a * BC + base_col + 0] = v00;
+            s_S[row_a * BC + base_col + 1] = v01;
+            s_S[row_b * BC + base_col + 0] = v02;
+            s_S[row_b * BC + base_col + 1] = v03;
+        }
+
+        __syncthreads();
+
+        // Online softmax (identical to base kernel).
+        {
+            constexpr uint32_t ROWS_PER_WARP = BR / NWARPS;
+            #pragma unroll
+            for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+                const uint32_t row = warp * ROWS_PER_WARP + r;
+                const float s = s_S[row * BC + lane];
+                const float row_max_local = s;
+                const float row_max = cuda_helpers::warp_reduce_max<32>(row_max_local);
+                const float prev_m = s_m[row];
+                const float new_m  = fmaxf(prev_m, row_max);
+                const float p_val  = (s == -INFINITY) ? 0.0f
+                                                      : __expf(s - new_m);
+                const float row_p_sum = cuda_helpers::warp_reduce_sum<32>(p_val);
+                const float prev_l   = s_l[row];
+                const float alpha    = (prev_m == -INFINITY) ? 0.0f
+                                                             : __expf(prev_m - new_m);
+                const float new_l    = prev_l * alpha + row_p_sum;
+                if (lane == 0) {
+                    s_m[row]     = new_m;
+                    s_l[row]     = new_l;
+                    s_alpha[row] = alpha;
+                }
+                s_P[row * BC + lane] = __float2half(p_val);
+            }
+        }
+
+        __syncthreads();
+
+        const float alpha_a = s_alpha[group_id];
+        const float alpha_b = s_alpha[group_id + 8];
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            O_acc[n][0] *= alpha_a;
+            O_acc[n][1] *= alpha_a;
+            O_acc[n][2] *= alpha_b;
+            O_acc[n][3] *= alpha_b;
+        }
+
+        // PV MMA (identical to base kernel).
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+            #pragma unroll
+            for (uint32_t ks = 0; ks < PV_KSTEPS; ++ks) {
+                const uint32_t k0 = ks * MMA_K;
+                unsigned a0, a1, a2, a3;
+                mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                          &s_P[0 * BC + k0], BC);
+                const uint32_t out_col = n0 + group_id;
+                const __half *vrow0 = &s_VT[out_col * BC + k0 + in_group * 2];
+                unsigned b0 = mma_detail::pack2h(vrow0);
+                unsigned b1 = mma_detail::pack2h(vrow0 + 8);
+                mma_detail::mma_m16n8k16_f16f16f32(
+                    O_acc[n][0], O_acc[n][1], O_acc[n][2], O_acc[n][3],
+                    a0, a1, a2, a3, b0, b1);
+            }
+        }
+
+        cur_stage = next_stage;
+        __syncthreads();   // s_VT, s_S, s_P reused next tile
+    }
+
+    // Final write (identical to base kernel).
+    const float l_a = s_l[group_id];
+    const float l_b = s_l[group_id + 8];
+    const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
+    const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
+    const uint32_t q_idx_a = block_q * BR + group_id;
+    const uint32_t q_idx_b = block_q * BR + group_id + 8;
+    float * const out_a = (q_idx_a < batch)
+        ? (out + static_cast<uint64_t>(q_idx_a) * out_batch_stride + head * HEAD_DIM)
+        : nullptr;
+    float * const out_b = (q_idx_b < batch)
+        ? (out + static_cast<uint64_t>(q_idx_b) * out_batch_stride + head * HEAD_DIM)
+        : nullptr;
+    #pragma unroll
+    for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+        const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+        const uint32_t col = n0 + in_group * 2;
+        if (out_a) {
+            out_a[col + 0] = O_acc[n][0] * inv_la;
+            out_a[col + 1] = O_acc[n][1] * inv_la;
+        }
+        if (out_b) {
+            out_b[col + 0] = O_acc[n][2] * inv_lb;
+            out_b[col + 1] = O_acc[n][3] * inv_lb;
+        }
+    }
+}
+
 static size_t fattn_mma_smem_bytes(uint32_t head_dim) {
     constexpr uint32_t BR = 16, BC = 32;
     size_t s = 0;
     s += BR       * head_dim * sizeof(__half);   // Q
     s += BC       * head_dim * sizeof(__half);   // K
+    s += head_dim * BC       * sizeof(__half);   // V_T
+    s += BR       * BC       * sizeof(float);    // S
+    s += BR       * BC       * sizeof(__half);   // P
+    s += BR                  * sizeof(float) * 3;// m, l, alpha
+    return s;
+}
+
+// Piped kernel: drops Q (in registers), adds a 2nd K buffer for cp.async ping-pong.
+// HD=256: 43 - 8 (Q) + 16 (K[1]) = 51 KB ; HD=128: 24 - 4 + 8 = 28 KB.
+static size_t fattn_mma_smem_bytes_pipe(uint32_t head_dim) {
+    constexpr uint32_t BR = 16, BC = 32;
+    size_t s = 0;
+    s += 2 * BC   * head_dim * sizeof(__half);   // K[2] (also reused for Q init)
     s += head_dim * BC       * sizeof(__half);   // V_T
     s += BR       * BC       * sizeof(float);    // S
     s += BR       * BC       * sizeof(__half);   // P
@@ -1332,6 +1726,44 @@ bool launch_fattn_prefill_mma_f16(
         cudaFuncSetAttribute(fattn_prefill_mma_kernel<HD, BR, BC>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
         fattn_prefill_mma_kernel<HD, BR, BC><<<grid, block, smem, stream>>>(
+            out, q, q_stride,
+            static_cast<const __half *>(k_cache),
+            static_cast<const __half *>(v_cache),
+            n_heads, n_kv_heads, base_seq_len, batch,
+            q_batch_stride, out_batch_stride, scale);
+    };
+    if (head_dim == 256) launch(std::integral_constant<uint32_t, 256>{});
+    else                 launch(std::integral_constant<uint32_t, 128>{});
+    return true;
+}
+
+bool launch_fattn_prefill_mma_pipe_f16(
+        float *       out,
+        const float * q,
+        uint32_t      q_stride,
+        const void  * k_cache,
+        const void  * v_cache,
+        uint32_t      n_heads,
+        uint32_t      n_kv_heads,
+        uint32_t      head_dim,
+        uint32_t      batch,
+        uint32_t      base_seq_len,
+        uint32_t      q_batch_stride,
+        uint32_t      out_batch_stride,
+        float         scale,
+        cudaStream_t  stream) {
+    if (!(head_dim == 128 || head_dim == 256)) return false;
+    if (batch == 0) return true;
+    constexpr uint32_t BR = 16, BC = 32;
+    const uint32_t n_blocks_q = (batch + BR - 1) / BR;
+    const dim3 grid(n_heads, n_blocks_q, 1);
+    const dim3 block(128);
+    const size_t smem = fattn_mma_smem_bytes_pipe(head_dim);
+    auto launch = [&](auto HD_v) {
+        constexpr uint32_t HD = decltype(HD_v)::value;
+        cudaFuncSetAttribute(fattn_prefill_mma_kernel_pipe<HD, BR, BC>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+        fattn_prefill_mma_kernel_pipe<HD, BR, BC><<<grid, block, smem, stream>>>(
             out, q, q_stride,
             static_cast<const __half *>(k_cache),
             static_cast<const __half *>(v_cache),
