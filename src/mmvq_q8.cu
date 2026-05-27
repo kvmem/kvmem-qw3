@@ -50,6 +50,18 @@ struct alignas(4) block_q8_1 {
 };
 static_assert(sizeof(block_q8_1) == 36, "unexpected block_q8_1 size");
 
+// Q8_1_MMQ block layout: 4 FP32 d-scales | 128 int8 qs. 144 bytes total.
+// Tile-friendly format used by the v4 MMQ kernel — matches llama.cpp's
+// block_q8_1_mmq with the D4 ds_layout (Q8_0 weight uses D4: just d, no
+// per-block sum because Q8_0 has no zero-point). Four 32-element subblocks
+// share a header and live contiguously, which means the 128 int8 quants are
+// 16-byte aligned and ldmatrix.x4-friendly without any per-row pad.
+struct alignas(16) block_q8_1_mmq {
+    float  d4[4];      // per-32-element d-scales (d = amax / 127)
+    int8_t qs[128];    // 4 × 32 quants, contiguous
+};
+static_assert(sizeof(block_q8_1_mmq) == 144, "unexpected block_q8_1_mmq size");
+
 // ---------------------------------------------------------------------------
 // quantize_q8_1: float → block_q8_1.
 //
@@ -376,6 +388,121 @@ bool launch_quantize_q8_1(
         x,
         reinterpret_cast<block_q8_1 *>(y_q8_1),
         ne0, cols, stride_x_row, blocks_per_row);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// quantize_mmq_q8_1: float → block_q8_1_mmq (144-byte tile-friendly format
+// used by the v4 MMQ kernel).
+//
+// The output is laid out as super-block-major × j-minor (matches
+// llama.cpp's quantize_mmq_q8_1 with the D4 ds_layout):
+//
+//   y[ib]  with  ib = super_block * ncols_y + j
+//
+// where ncols_y is the activation row count (batch size) and super_block is
+// the 128-K-element index along the cols axis. Inside each super-block,
+// ncols_y consecutive 144-byte blocks live contiguously, which lets the v4
+// MMQ kernel read mmq_x * 36 contiguous ints per K super-iter without
+// strided gathers.
+//
+// Grid (matches llama.cpp's quantize_mmq_q8_1_cuda layout, channel-flat):
+//   gridDim.x = ncols_y (batch rows; each block handles one j)
+//   gridDim.y = ceil(cols / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ)) = ceil(cols/512)
+//   blockDim  = (CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1) = 128 threads
+//
+// One thread handles 4 floats. 8-thread groups (32 / 4) cooperate on one
+// 32-element subblock to compute amax via warp shuffles. Lane 0 of each
+// group writes the d-scale; every thread writes 4 int8s as a packed char4.
+
+static constexpr int CUDA_QUANTIZE_BLOCK_SIZE_MMQ = 128;
+
+__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1)
+__global__ void quantize_mmq_q8_1_kernel(
+        const float *      __restrict__ x,
+        block_q8_1_mmq *   __restrict__ y,
+        uint32_t ne0,             // padded col count (multiple of 4*QK8_1)
+        uint32_t ne00,            // real col count (zero-padded above this)
+        uint32_t stride_x_row)    // float stride per batch row in x
+{
+    constexpr int vals_per_scale = QK8_1;     // 32, D4 layout
+    constexpr int warp_size      = 32;
+
+    const int64_t i0 =
+        (int64_t)blockDim.x * blockIdx.y * 4 + (int64_t)threadIdx.x * 4;
+    if (i0 >= ne0) return;
+
+    const int     j     = blockIdx.x;          // batch row, 0..ncols_y-1
+    const int     ncols_y = gridDim.x;
+    const int64_t sb    = i0 / (4 * QK8_1);    // super-block index along cols
+    const int64_t ib    = sb * ncols_y + j;
+    const int     iqs   = i0 % (4 * QK8_1);    // 0..127, position within block
+
+    const float4 * x4 = reinterpret_cast<const float4 *>(x);
+    const float4 xi   = (i0 < ne00)
+        ? x4[((int64_t)j * stride_x_row + i0) / 4]
+        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+    // Reduce amax across the 8 threads that share a 32-element subblock
+    // (vals_per_scale/4 == 8, so xor offsets 4,2,1).
+    #pragma unroll
+    for (int offset = vals_per_scale / 8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, offset, warp_size));
+    }
+
+    const float d_inv = (amax == 0.0f) ? 0.0f : (127.0f / amax);
+    char4 q;
+    q.x = (amax == 0.0f) ? 0 : static_cast<int8_t>(__float2int_rn(xi.x * d_inv));
+    q.y = (amax == 0.0f) ? 0 : static_cast<int8_t>(__float2int_rn(xi.y * d_inv));
+    q.z = (amax == 0.0f) ? 0 : static_cast<int8_t>(__float2int_rn(xi.z * d_inv));
+    q.w = (amax == 0.0f) ? 0 : static_cast<int8_t>(__float2int_rn(xi.w * d_inv));
+
+    // Pack 4 int8s as a single 32-bit store.
+    char4 * yqs4 = reinterpret_cast<char4 *>(y[ib].qs);
+    yqs4[iqs / 4] = q;
+
+    // First lane of each 32-element subblock writes the d-scale.
+    if (iqs % 32 == 0) {
+        const float d = (amax == 0.0f) ? 0.0f : (1.0f / d_inv);
+        y[ib].d4[iqs / 32] = d;
+    }
+}
+
+// Number of bytes needed to stage `batch` activation rows of `cols` columns
+// in Q8_1_MMQ form. cols must be a multiple of 4*QK8_1 (= 128).
+size_t q8_1_mmq_scratch_bytes(uint32_t batch, uint32_t cols) {
+    const uint32_t blocks_per_row = (cols + 4 * QK8_1 - 1) / (4 * QK8_1);
+    return static_cast<size_t>(batch) * blocks_per_row * sizeof(block_q8_1_mmq);
+}
+
+// Quantize a (batch, cols) float input into Q8_1_MMQ staging.
+//   x          : float input, batch * stride_x_row floats.
+//   stride_x_row: floats per batch row in x.
+//   y_q8_1_mmq : staging buffer, q8_1_mmq_scratch_bytes(batch, cols) bytes.
+//   batch, cols: shape. cols must be a multiple of 4*QK8_1 (= 128).
+bool launch_quantize_mmq_q8_1(
+        const float * x,
+        void *        y_q8_1_mmq,
+        uint32_t      batch,
+        uint32_t      cols,
+        uint32_t      stride_x_row,
+        cudaStream_t  stream) {
+    if (cols % (4 * QK8_1) != 0) return false;
+    if (cols % 4 != 0) return false;
+    const uint32_t ne0 = cols;
+    const uint32_t block_num_y =
+        (ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 grid(batch, block_num_y, 1);
+    const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_q8_1_kernel<<<grid, block, 0, stream>>>(
+        x,
+        reinterpret_cast<block_q8_1_mmq *>(y_q8_1_mmq),
+        ne0, cols, stride_x_row);
     return true;
 }
 

@@ -53,6 +53,14 @@ bool launch_mmq_q8_0(
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
 
+// Q8_1_MMQ activation staging — required by MMQ v4 kernel (144 B/block,
+// super-block-major × j-minor). Falls back to Q8_1 (36 B) for v2/v3.
+size_t q8_1_mmq_scratch_bytes(uint32_t batch, uint32_t cols);
+bool launch_quantize_mmq_q8_1(
+        const float *x, void *y_q8_1_mmq,
+        uint32_t batch, uint32_t cols, uint32_t stride_x_row,
+        cudaStream_t stream);
+
 // Ported fattn-vec decode (src/fattn_vec_decode.cu).
 bool launch_fattn_vec_decode_f32(
         float *out, const float *q, uint32_t q_stride,
@@ -1525,6 +1533,7 @@ public:
         if (graph_instance_) cudaGraphExecDestroy(graph_instance_);
         if (exec_stream_) cudaStreamDestroy(exec_stream_);
         if (q8_1_scratch_) cudaFree(q8_1_scratch_);
+        if (q8_1_mmq_scratch_) cudaFree(q8_1_mmq_scratch_);
         if (fattn_scratch_) cudaFree(fattn_scratch_);
         if (argmax_dev_) cudaFree(argmax_dev_);
         if (argmax_host_) cudaFreeHost(argmax_host_);
@@ -2001,9 +2010,56 @@ private:
         return {};
     }
 
+    DeviceStatus ensure_q8_1_mmq_scratch(uint32_t batch, uint32_t cols) {
+        const size_t need = ported::q8_1_mmq_scratch_bytes(batch, cols);
+        if (need > q8_1_mmq_scratch_capacity_) {
+            if (q8_1_mmq_scratch_) cudaFree(q8_1_mmq_scratch_);
+            if (auto st = cuda_status(cudaMalloc(&q8_1_mmq_scratch_, need),
+                                      "q8_1_mmq scratch alloc"); !st.ok) {
+                q8_1_mmq_scratch_ = nullptr;
+                q8_1_mmq_scratch_capacity_ = 0;
+                return st;
+            }
+            q8_1_mmq_scratch_capacity_ = need;
+        }
+        return {};
+    }
+
+    // Returns true when the v4 path is selected (QW3_MMQ_VERSION=4).
+    static bool mmq_v4_selected() {
+        static const bool v = []() {
+            const char *e = std::getenv("QW3_MMQ_VERSION");
+            return e && e[0] == '4';
+        }();
+        return v;
+    }
+
     // INT8 MMA Q8_0 x Q8_1 matmul (m16n8k32.s8.s8.s32). Uses the same
     // q8_1_scratch_ buffer as decode mmvq for the activation Q8_1 stage.
+    // v4 (QW3_MMQ_VERSION=4) uses the 144-byte block_q8_1_mmq layout via
+    // q8_1_mmq_scratch_ — it's a tile-friendly format that lets the MMQ
+    // kernel read mmq_x*36 contiguous ints per K super-iter.
     DeviceStatus mmq_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
+        const bool use_v4 = mmq_v4_selected()
+                          && (w.cols % 256 == 0)
+                          && (w.rows >= 128) && (batch >= 128);
+        if (use_v4) {
+            if (auto st = ensure_q8_1_mmq_scratch(batch, w.cols); !st.ok) return st;
+            if (!ported::launch_quantize_mmq_q8_1(x_ptr, q8_1_mmq_scratch_,
+                                                   batch, w.cols, /*stride_x_row=*/w.cols,
+                                                   exec_stream_)) {
+                return {false, "mmq quantize_mmq_q8_1 launch failed"};
+            }
+            if (!ported::launch_mmq_q8_0(static_cast<const uint8_t *>(w.ptr),
+                                         q8_1_mmq_scratch_, out_ptr,
+                                         static_cast<uint32_t>(w.rows), w.cols,
+                                         batch, /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                                         exec_stream_)) {
+                return {false, "mmq launch failed (v4)"};
+            }
+            return launch_status("cuda q8_0_matmul mmq v4");
+        }
+
         if (auto st = ensure_q8_1_scratch(batch, w.cols); !st.ok) return st;
         if (!ported::launch_quantize_q8_1(x_ptr, q8_1_scratch_,
                                           batch, w.cols, /*stride_x_row=*/w.cols,
@@ -2925,6 +2981,8 @@ private:
     // grows on demand. Bytes hold (batch * blocks_per_row) block_q8_1 = 36 B.
     void   *q8_1_scratch_ = nullptr;
     size_t  q8_1_scratch_capacity_ = 0;  // bytes
+    void   *q8_1_mmq_scratch_ = nullptr;
+    size_t  q8_1_mmq_scratch_capacity_ = 0;  // bytes
     // Split-K attention scratch. Holds VKQ partials and (max,sum) tuples for
     // the fattn-vec decode kernel when seq_len is large enough that we run
     // multiple blocks per (head, batch). Reused across all attention layers
