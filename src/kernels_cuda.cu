@@ -114,6 +114,15 @@ bool launch_fattn_prefill_f16(
         uint32_t batch, uint32_t base_seq_len,
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream);
+// Tensor-core (m16n8k16 fp16) prefill flash-attention. Same shape as the
+// tiled FA2 above but inner GEMMs are MMA. FP16 K/V only.
+bool launch_fattn_prefill_mma_f16(
+        float *out, const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
 }
 
 namespace {
@@ -177,12 +186,20 @@ AttentionKernel attention_kernel_choice() {
 //                              (also used for decode). At prefill seq_len is
 //                              passed as 1, so pick_nsplit→1 and it runs
 //                              one block per (head, query).
-enum class PrefillAttnKernel { Tiled, Vec };
+enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma };
 PrefillAttnKernel prefill_attn_kernel_choice() {
     static const PrefillAttnKernel choice = []() {
         const char *env = std::getenv("QW3_PREFILL_ATTN");
+        if (env && std::strcmp(env, "tiled") == 0) return PrefillAttnKernel::Tiled;
         if (env && std::strcmp(env, "vec") == 0) return PrefillAttnKernel::Vec;
-        return PrefillAttnKernel::Tiled;
+        if (env && std::strcmp(env, "cublas") == 0) return PrefillAttnKernel::Cublas;
+        if (env && std::strcmp(env, "mma") == 0) return PrefillAttnKernel::Mma;
+        // Default: tensor-core MMA (m16n8k16.f16) FA2. Lifts per-call attn
+        // ~14.8 ms vs tiled FP32 SIMT's ~22.8 ms at T=4K, +11% prefill end-
+        // to-end. Parity-correct (greedy tokens match tiled at T=1k+).
+        // Tiled remains selectable via QW3_PREFILL_ATTN=tiled. cuBLAS path
+        // (slower, materializes full T×T_kv scores) selectable via =cublas.
+        return PrefillAttnKernel::Mma;
     }();
     return choice;
 }
@@ -327,8 +344,17 @@ const CudaWeight &as_weight(const DeviceWeight &w) {
 }
 
 __global__ void add_kernel(float *out, const float *a, const float *b, uint64_t n) {
-    uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = a[i] + b[i];
+    const uint64_t i4 = (static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (i4 + 4 <= n) {
+        const float4 av = *reinterpret_cast<const float4 *>(a + i4);
+        const float4 bv = *reinterpret_cast<const float4 *>(b + i4);
+        float4 r;
+        r.x = av.x + bv.x; r.y = av.y + bv.y;
+        r.z = av.z + bv.z; r.w = av.w + bv.w;
+        *reinterpret_cast<float4 *>(out + i4) = r;
+    } else {
+        for (uint64_t i = i4; i < n; ++i) out[i] = a[i] + b[i];
+    }
 }
 
 __global__ void mul_kernel(float *out, const float *a, const float *b, uint64_t n) {
@@ -391,11 +417,24 @@ __global__ void argmax_kernel(int32_t *__restrict__ out,
 // Fused silu(gate) * up for the SwiGLU FFN: one launch, one read per element
 // instead of silu (read gate, write gate) then mul (read gate, read up, write
 // out). Saves 64 launches per decode token.
+// Vectorized: 4 elements per thread (float4 in/out).
 __global__ void silu_mul_kernel(float *out, const float *gate, const float *up, uint64_t n) {
-    uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float g = gate[i];
-    out[i] = (g / (1.0f + expf(-g))) * up[i];
+    const uint64_t i4 = (static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (i4 + 4 <= n) {
+        const float4 g = *reinterpret_cast<const float4 *>(gate + i4);
+        const float4 u = *reinterpret_cast<const float4 *>(up   + i4);
+        float4 r;
+        r.x = (g.x / (1.0f + __expf(-g.x))) * u.x;
+        r.y = (g.y / (1.0f + __expf(-g.y))) * u.y;
+        r.z = (g.z / (1.0f + __expf(-g.z))) * u.z;
+        r.w = (g.w / (1.0f + __expf(-g.w))) * u.w;
+        *reinterpret_cast<float4 *>(out + i4) = r;
+    } else {
+        for (uint64_t i = i4; i < n; ++i) {
+            const float g = gate[i];
+            out[i] = (g / (1.0f + __expf(-g))) * up[i];
+        }
+    }
 }
 
 // Single-row RMS norm: 1 block per row, 1024 threads, vectorized float4 loads,
@@ -821,11 +860,134 @@ __global__ void q8_dequant_f16_kernel(__half *out, const uint8_t *weight, uint64
 }
 
 // FP32 → FP16 packed conversion used to stage the input activations for HGEMM.
+// Vectorized: each thread converts 4 floats (float4 load) into 2 __half2 (int2
+// store), 4x fewer memory transactions and threads vs the scalar version.
+// The tail (n % 4) is handled by the same kernel via a per-thread bound check.
 __global__ void fp32_to_fp16_kernel(__half *out, const float *in, uint64_t n) {
-    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = __float2half(in[i]);
+    const uint64_t tid = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t i4  = tid * 4;
+    if (i4 + 4 <= n) {
+        const float4 v = *reinterpret_cast<const float4 *>(in + i4);
+        __half2 a = __floats2half2_rn(v.x, v.y);
+        __half2 b = __floats2half2_rn(v.z, v.w);
+        int2 packed;
+        packed.x = *reinterpret_cast<int *>(&a);
+        packed.y = *reinterpret_cast<int *>(&b);
+        *reinterpret_cast<int2 *>(out + i4) = packed;
+    } else {
+        // tail: scalar fallback
+        for (uint64_t j = i4; j < n; ++j) {
+            out[j] = __float2half(in[j]);
+        }
+    }
 }
+
+// Per-row causal softmax for the cuBLAS-based prefill attention path.
+//
+// Layout: scores [n_groups, T, T_kv] row-major, FP16, group-major. Each
+// (head_in_group, query_row) row holds T_kv scores in [0, base + q + 1) and
+// garbage past my_max_kv. The kernel computes max-shift + exp + 1/sum + scale,
+// with an in-place causal mask, and writes back the normalised probabilities
+// in the same FP16 buffer.
+//
+// Grid:  (T, n_groups)
+// Block: 256 threads, each handling ceil(T_kv / 256) score positions.
+__global__ void softmax_causal_inplace_kernel(__half * __restrict__ scores,
+                                              uint32_t T, uint32_t T_kv,
+                                              uint32_t base_seq_len,
+                                              uint32_t n_groups,
+                                              float scale) {
+    const uint32_t q       = blockIdx.x;
+    const uint32_t group   = blockIdx.y;
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t lane    = tid & 31;
+    const uint32_t warp_id = tid >> 5;
+    constexpr uint32_t BS  = 256;
+    constexpr uint32_t NW  = BS / 32;
+
+    if (q >= T) return;
+    const uint32_t my_max_kv = base_seq_len + q + 1;       // exclusive
+    __half *row = scores + (static_cast<uint64_t>(group) * T + q) * T_kv;
+
+    // Pass 1: row max with -inf for masked positions.
+    float local_max = -INFINITY;
+    for (uint32_t k = tid; k < T_kv; k += BS) {
+        if (k < my_max_kv) {
+            const float s = __half2float(row[k]) * scale;
+            if (s > local_max) local_max = s;
+        }
+    }
+
+    // Block reduce-max via warp + shmem.
+    __shared__ float s_warp_max[NW];
+    {
+        float v = local_max;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off, 32));
+        }
+        if (lane == 0) s_warp_max[warp_id] = v;
+    }
+    __syncthreads();
+    float row_max = -INFINITY;
+    if (warp_id == 0) {
+        float v = (lane < NW) ? s_warp_max[lane] : -INFINITY;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off, 32));
+        }
+        if (lane == 0) s_warp_max[0] = v;
+    }
+    __syncthreads();
+    row_max = s_warp_max[0];
+
+    // Pass 2: write exp(s - row_max) to row, accumulate row_sum.
+    float local_sum = 0.0f;
+    for (uint32_t k = tid; k < T_kv; k += BS) {
+        if (k < my_max_kv) {
+            const float s   = __half2float(row[k]) * scale;
+            const float e   = __expf(s - row_max);
+            row[k]          = __float2half(e);
+            local_sum      += e;
+        } else {
+            row[k] = __float2half(0.0f);
+        }
+    }
+
+    __shared__ float s_warp_sum[NW];
+    {
+        float v = local_sum;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, off, 32);
+        }
+        if (lane == 0) s_warp_sum[warp_id] = v;
+    }
+    __syncthreads();
+    float row_sum = 0.0f;
+    if (warp_id == 0) {
+        float v = (lane < NW) ? s_warp_sum[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, off, 32);
+        }
+        if (lane == 0) s_warp_sum[0] = v;
+    }
+    __syncthreads();
+    row_sum = s_warp_sum[0];
+
+    // Pass 3: divide by row_sum.
+    const float inv = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+    for (uint32_t k = tid; k < T_kv; k += BS) {
+        const float p = __half2float(row[k]) * inv;
+        row[k]       = __float2half(p);
+    }
+}
+
+// FP32 → FP16 conversion that walks Q strided by head: src is [T, n_heads, d]
+// row-major (q_batch_stride = n_heads * d, q_stride = d) but we can just
+// reuse the contiguous fp32_to_fp16_kernel since the source is contiguous in
+// memory. The cuBLAS path interprets the head stride at GEMM time.
 
 // Returns the largest dynamic shmem size we will reserve per Q8 matvec block.
 // Caches the device's max-opt-in shmem size and (best effort) opts the
@@ -1544,6 +1706,8 @@ public:
         if (q8_1_scratch_) cudaFree(q8_1_scratch_);
         if (q8_1_mmq_scratch_) cudaFree(q8_1_mmq_scratch_);
         if (fattn_scratch_) cudaFree(fattn_scratch_);
+        if (prefill_attn_q_fp16_) cudaFree(prefill_attn_q_fp16_);
+        if (prefill_attn_scores_fp16_) cudaFree(prefill_attn_scores_fp16_);
         if (argmax_dev_) cudaFree(argmax_dev_);
         if (argmax_host_) cudaFreeHost(argmax_host_);
     }
@@ -1564,6 +1728,9 @@ public:
             if (auto st = cublas_status(cublasSetStream(cublas_handle_, exec_stream_),
                                         "cublasSetStream"); !st.ok) return st;
         }
+        // Fresh forward — drop any X-FP16 cache from a prior generate().
+        x_fp16_cached_src_ = nullptr;
+        x_fp16_cached_elems_ = 0;
         return {};
     }
 
@@ -2013,6 +2180,14 @@ private:
         // Stage X (FP32 -> FP16) on the cuBLAS / default stream. This work
         // doesn't conflict with the dequant since they touch different
         // buffers (x_fp16_workspace_ vs w_fp16_workspace_[idx]).
+        //
+        // Cache: QKV and gate/up matmul pairs share the same x_ptr in
+        // immediate succession. If the prior conversion was for the same
+        // (x_ptr, x_elems), the FP16 staging buffer still holds it — no
+        // intervening kernel writes to x_fp16_workspace_, and by invariant
+        // no kernel writes to x_ptr's buffer between hgemm_q8 calls with
+        // shared input. Skip the conversion launch on hit. Disable via
+        // QW3_HGEMM_X_CACHE=0 for diagnostic / forced-recompute runs.
         const uint64_t x_elems = static_cast<uint64_t>(batch) * w.cols;
         if (x_fp16_capacity_ < x_elems) {
             if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
@@ -2021,15 +2196,34 @@ private:
                                       "hgemm x_fp16 alloc"); !st.ok) {
                 x_fp16_workspace_ = nullptr;
                 x_fp16_capacity_ = 0;
+                x_fp16_cached_src_ = nullptr;
+                x_fp16_cached_elems_ = 0;
                 return st;
             }
             x_fp16_capacity_ = x_elems;
+            x_fp16_cached_src_ = nullptr;     // resize invalidates the cache
+            x_fp16_cached_elems_ = 0;
         }
-        {
+        const bool x_cache_disabled = []() {
+            const char *e = std::getenv("QW3_HGEMM_X_CACHE");
+            return e && (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+        }();
+        const bool x_cache_hit = !x_cache_disabled
+                              && x_fp16_cached_src_   == x_ptr
+                              && x_fp16_cached_elems_ == x_elems;
+        if (!x_cache_hit) {
             const unsigned threads = 256;
-            const unsigned blocks = static_cast<unsigned>((x_elems + threads - 1) / threads);
+            // Vectorized kernel: 4 elements per thread.
+            const uint64_t threads_total = (x_elems + 3) / 4;
+            const unsigned blocks = static_cast<unsigned>((threads_total + threads - 1) / threads);
             fp32_to_fp16_kernel<<<blocks, threads, 0, exec_stream_>>>(x_fp16_workspace_, x_ptr, x_elems);
-            if (auto st = launch_status("hgemm fp32->fp16"); !st.ok) return st;
+            if (auto st = launch_status("hgemm fp32->fp16"); !st.ok) {
+                x_fp16_cached_src_ = nullptr;
+                x_fp16_cached_elems_ = 0;
+                return st;
+            }
+            x_fp16_cached_src_ = x_ptr;
+            x_fp16_cached_elems_ = x_elems;
         }
 
         // cuBLAS waits for the matching dequant to complete before reading
@@ -2322,8 +2516,20 @@ public:
         const auto &input = as_tensor(x);
         const auto &w = as_weight(weight);
         if (batch == 0) return {};
-        // One block per row; existing kernel reads blockIdx.x as the row index.
-        rms_norm_kernel<<<batch, 256, 0, exec_stream_>>>(o.ptr, input.ptr, static_cast<const float *>(w.ptr), n, eps);
+        // Prefer the vectorized 1024-thread kernel when alignment + size allow.
+        // Same constraints as the single-row path; batch is handled via gridDim.x.
+        const bool can_vec = (n % 4 == 0)
+            && ((reinterpret_cast<uintptr_t>(input.ptr) & 0xF) == 0)
+            && ((reinterpret_cast<uintptr_t>(o.ptr) & 0xF) == 0)
+            && ((reinterpret_cast<uintptr_t>(w.ptr) & 0xF) == 0)
+            && n >= 256;
+        if (can_vec) {
+            rms_norm_kernel_vec<1024><<<batch, 1024, 0, exec_stream_>>>(
+                o.ptr, input.ptr, static_cast<const float *>(w.ptr), n, eps);
+        } else {
+            rms_norm_kernel<<<batch, 256, 0, exec_stream_>>>(
+                o.ptr, input.ptr, static_cast<const float *>(w.ptr), n, eps);
+        }
         return launch_status("cuda rms_norm_batch");
     }
 
@@ -2331,7 +2537,9 @@ public:
         auto &o = as_tensor(out);
         const auto &aa = as_tensor(a);
         const auto &bb = as_tensor(b);
-        add_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256, 0, exec_stream_>>>(o.ptr, aa.ptr, bb.ptr, o.count);
+        const uint64_t threads_total = (o.count + 3) / 4;
+        const unsigned blocks = static_cast<unsigned>((threads_total + 255) / 256);
+        add_kernel<<<blocks, 256, 0, exec_stream_>>>(o.ptr, aa.ptr, bb.ptr, o.count);
         return launch_status("cuda add");
     }
 
@@ -2354,7 +2562,10 @@ public:
         auto &o = as_tensor(out);
         const auto &g = as_tensor(gate);
         const auto &u = as_tensor(up);
-        silu_mul_kernel<<<static_cast<unsigned>((o.count + 255) / 256), 256, 0, exec_stream_>>>(
+        // Vectorized: 4 elements per thread.
+        const uint64_t threads_total = (o.count + 3) / 4;
+        const unsigned blocks = static_cast<unsigned>((threads_total + 255) / 256);
+        silu_mul_kernel<<<blocks, 256, 0, exec_stream_>>>(
             o.ptr, g.ptr, u.ptr, o.count);
         return launch_status("cuda silu_mul");
     }
@@ -2783,6 +2994,198 @@ public:
         return {};
     }
 
+    // Allocates Q-FP16 staging and scores-FP16 scratch for the cuBLAS prefill
+    // path. Sized to the largest (T, T_kv, n_heads, head_dim) seen so far;
+    // grows monotonically. Q scratch holds the full T*n_heads*d FP16 copy of
+    // the FP32 Q tensor (~53 MB at T=4350 for Qwen 3.6 27B). Scores scratch
+    // holds gqa_ratio*T*T_kv FP16 elements reused across all kv_groups (~230
+    // MB at T=T_kv=4350). The scores buffer dominates; if it grows past
+    // QW3_PREFILL_ATTN_MAX_BYTES (default 512 MB), we refuse the cuBLAS path
+    // and the caller falls back to the tiled kernel.
+    DeviceStatus ensure_prefill_attn_scratch(uint32_t T, uint32_t T_kv,
+                                              uint32_t n_heads, uint32_t gqa_ratio,
+                                              uint32_t head_dim) {
+        const uint64_t need_q = static_cast<uint64_t>(T) * n_heads * head_dim;
+        if (need_q > prefill_attn_q_fp16_capacity_) {
+            if (prefill_attn_q_fp16_) cudaFree(prefill_attn_q_fp16_);
+            if (auto st = cuda_status(cudaMalloc(&prefill_attn_q_fp16_,
+                                                 need_q * sizeof(__half)),
+                                      "prefill_attn q_fp16 alloc"); !st.ok) {
+                prefill_attn_q_fp16_ = nullptr;
+                prefill_attn_q_fp16_capacity_ = 0;
+                return st;
+            }
+            prefill_attn_q_fp16_capacity_ = need_q;
+        }
+        const uint64_t need_s = static_cast<uint64_t>(gqa_ratio) * T * T_kv;
+        if (need_s > prefill_attn_scores_fp16_capacity_) {
+            if (prefill_attn_scores_fp16_) cudaFree(prefill_attn_scores_fp16_);
+            if (auto st = cuda_status(cudaMalloc(&prefill_attn_scores_fp16_,
+                                                 need_s * sizeof(__half)),
+                                      "prefill_attn scores_fp16 alloc"); !st.ok) {
+                prefill_attn_scores_fp16_ = nullptr;
+                prefill_attn_scores_fp16_capacity_ = 0;
+                return st;
+            }
+            prefill_attn_scores_fp16_capacity_ = need_s;
+        }
+        return {};
+    }
+
+    // cuBLAS-based prefill attention. For each KV group g (gqa_ratio query
+    // heads share one KV head), runs:
+    //   1) S_g = Q_g · K_g^T            (cuBLAS strided-batched HGEMM, batch=ratio)
+    //   2) P_g = softmax(scale*S_g) w/ causal mask    (one custom kernel)
+    //   3) O_g = P_g · V_g              (cuBLAS strided-batched HGEMM, batch=ratio)
+    //
+    // Layouts (row-major, as the rest of the stack uses):
+    //   Q       : [T, n_heads, d]              FP32 in -> FP16 staged
+    //   K, V    : [T_kv, n_kv_heads, d]        FP16
+    //   O       : [T, n_heads, d]              FP32
+    //   S, P    : [n_kv_heads, ratio, T, T_kv] FP16 (group-major; scratch reused per group)
+    //
+    // cuBLAS is column-major, so each row-major matmul is reinterpreted as
+    // its transpose: row-major C[m,n] = A[m,k]·B[k,n] becomes col-major
+    // C^T[n,m] = B^T[n,k]·A^T[k,m], i.e. cublas(opA=N, opB=N, m=n, n=m, k=k,
+    // A=B_ptr, B=A_ptr). The strides we pass to cuBLAS are then plain row-
+    // strides of the original row-major buffers.
+    DeviceStatus attention_prefill_cublas(float *out_ptr,
+                                           const float *q_ptr,
+                                           uint32_t q_stride,
+                                           const __half *k_ptr,
+                                           const __half *v_ptr,
+                                           uint32_t n_heads,
+                                           uint32_t n_kv_heads,
+                                           uint32_t head_dim,
+                                           uint32_t T,
+                                           uint32_t base_seq_len,
+                                           uint32_t q_batch_stride,
+                                           uint32_t out_batch_stride,
+                                           float scale) {
+        if (n_heads % n_kv_heads != 0) {
+            return {false, "attention_prefill_cublas requires n_heads % n_kv_heads == 0"};
+        }
+        const uint32_t gqa = n_heads / n_kv_heads;
+        const uint32_t T_kv = base_seq_len + T;
+        if (T_kv == 0) return {};
+
+        // q_ptr is row-major [T, n_heads, d] with row stride q_batch_stride
+        // (in floats) and inner stride q_stride (= n_heads*d in our stack).
+        // We need it contiguous as [T, n_heads*d] for the FP32→FP16 stage.
+        // Caller passes q_batch_stride == n_heads*d for the prefill batch.
+        if (q_batch_stride != n_heads * head_dim) {
+            return {false, "attention_prefill_cublas requires contiguous Q per query"};
+        }
+        if (q_stride != n_heads * head_dim) {
+            return {false, "attention_prefill_cublas requires q_stride == n_heads*head_dim"};
+        }
+        if (out_batch_stride != n_heads * head_dim) {
+            return {false, "attention_prefill_cublas requires contiguous O per query"};
+        }
+
+        if (auto st = ensure_prefill_attn_scratch(T, T_kv, n_heads, gqa, head_dim);
+            !st.ok) return st;
+
+        // Stage Q to FP16. Source is contiguous T*n_heads*d FP32.
+        {
+            const uint64_t n = static_cast<uint64_t>(T) * n_heads * head_dim;
+            const unsigned threads = 256;
+            const uint64_t threads_total = (n + 3) / 4;
+            const unsigned blocks = static_cast<unsigned>((threads_total + threads - 1) / threads);
+            fp32_to_fp16_kernel<<<blocks, threads, 0, exec_stream_>>>(
+                prefill_attn_q_fp16_, q_ptr, n);
+            if (auto st = launch_status("prefill_attn fp32->fp16 Q"); !st.ok) return st;
+        }
+
+        const float falpha = 1.0f;
+        const float fzero  = 0.0f;
+        const int d   = static_cast<int>(head_dim);
+        const int t   = static_cast<int>(T);
+        const int tkv = static_cast<int>(T_kv);
+
+        for (uint32_t g = 0; g < n_kv_heads; ++g) {
+            // Q for this group: ratio heads, each [T, d] FP16, head-stride d,
+            // query-stride n_heads*d. Pointer to first head of group g:
+            const __half *Qg = prefill_attn_q_fp16_
+                             + static_cast<uint64_t>(g) * gqa * head_dim;
+            // K/V for this group: one head shared across ratio queries,
+            // shape [T_kv, d] FP16, row stride n_kv_heads*d, head pointer:
+            const __half *Kg = k_ptr + static_cast<uint64_t>(g) * head_dim;
+            const __half *Vg = v_ptr + static_cast<uint64_t>(g) * head_dim;
+            __half *Sg = prefill_attn_scores_fp16_;  // [ratio, T, T_kv] FP16
+
+            // ---- 1) S_h = Q_h · K^T  for h in [0, ratio) ----
+            // Row-major:  C_rm[T, T_kv] = Q_rm[T, d] · (K_rm[T_kv, d])^T.
+            // cuBLAS is col-major; produce C_cm[j,i] = C_rm[i,j] by passing
+            // (A=K, opA=T) and (B=Q, opB=N), m=T_kv, n=T, k=d:
+            //   op(A)[j,k] = K_rm[j,k] (via opA=T over col-major K, lda=n_kv*d)
+            //   op(B)[k,i] = Q_rm[i,k] (via opB=N over col-major Q, ldb=n_h*d)
+            // strideA = 0 (K shared), strideB = head_dim (next Q head),
+            // strideC = T*T_kv (next score plane), batch = ratio.
+            // FP32 accumulator (FAST_16F): K can be 4K+ on long contexts and
+            // FP16 accumulation drifts enough to flip greedy tokens. Same
+            // tradeoff the HGEMM path made — kept tensor cores, lost 16F-acc.
+            if (auto st = cublas_status(
+                    cublasGemmStridedBatchedEx(
+                        cublas_handle_,
+                        CUBLAS_OP_T, CUBLAS_OP_N,
+                        tkv, t, d,
+                        &falpha,
+                        Kg, CUDA_R_16F, static_cast<int>(n_kv_heads * head_dim), 0,
+                        Qg, CUDA_R_16F, static_cast<int>(n_heads * head_dim),
+                            static_cast<long long>(head_dim),
+                        &fzero,
+                        Sg, CUDA_R_16F, tkv,
+                            static_cast<long long>(static_cast<uint64_t>(t) * tkv),
+                        static_cast<int>(gqa),
+                        CUBLAS_COMPUTE_32F_FAST_16F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "prefill_attn QK^T"); !st.ok) return st;
+
+            // ---- 2) softmax(scale * S_h) with causal mask, in-place ----
+            //   grid (T, ratio), block 256 threads, one row per (head, q).
+            {
+                dim3 grid(T, gqa);
+                softmax_causal_inplace_kernel<<<grid, 256, 0, exec_stream_>>>(
+                    Sg, T, T_kv, base_seq_len, gqa, scale);
+                if (auto st = launch_status("prefill_attn softmax"); !st.ok) return st;
+            }
+
+            // ---- 3) O_h = P_h · V  for h in [0, ratio) ----
+            // Row-major:  C_rm[T, d] = P_rm[T, T_kv] · V_rm[T_kv, d].
+            // cuBLAS col-major: C_cm[j,i] = C_rm[i,j] via (A=V, opA=N),
+            // (B=P, opB=N), m=d, n=T, k=T_kv:
+            //   op(A)[j,k] = V_rm[k,j] (opA=N, V col-major, lda=n_kv*d)
+            //   op(B)[k,i] = P_rm[i,k] (opB=N, P col-major, ldb=T_kv)
+            // strideA = 0 (V shared), strideB = T*T_kv, strideC = head_dim,
+            // batch = ratio.
+            //
+            // ldc = n_heads*head_dim so successive q rows step by full row of
+            // row-major O; pointer offset g*ratio*head_dim places this group's
+            // ratio heads at columns [g*ratio*d, (g+1)*ratio*d) of O_rm.
+            // Compute=32F_FAST_16F to keep tensor cores on FP16 inputs while
+            // accumulating FP32 into the FP32 output buffer.
+            float *Og = out_ptr + static_cast<uint64_t>(g) * gqa * head_dim;
+            if (auto st = cublas_status(
+                    cublasGemmStridedBatchedEx(
+                        cublas_handle_,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        d, t, tkv,
+                        &falpha,
+                        Vg, CUDA_R_16F, static_cast<int>(n_kv_heads * head_dim), 0,
+                        Sg, CUDA_R_16F, tkv,
+                            static_cast<long long>(static_cast<uint64_t>(t) * tkv),
+                        &fzero,
+                        Og, CUDA_R_32F, static_cast<int>(n_heads * head_dim),
+                            static_cast<long long>(head_dim),
+                        static_cast<int>(gqa),
+                        CUBLAS_COMPUTE_32F_FAST_16F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "prefill_attn PV"); !st.ok) return st;
+        }
+        return {};
+    }
+
     DeviceStatus attention_decode(DeviceTensor &out,
                                    DeviceTensor &scores_scratch,
                                    const DeviceTensor &q,
@@ -2911,6 +3314,43 @@ public:
         const auto &kc = as_tensor(k_cache);
         const auto &vc = as_tensor(v_cache);
         const bool kv_fp16 = kc.is_fp16();
+
+        // cuBLAS prefill: two strided-batched FP16 GEMMs + in-place causal
+        // softmax. Default for batch >= prefill_attn_min_batch on FP16 KV.
+        // Tensor-core throughput closes the 14×/call gap of the FP32 tiled
+        // kernel on long contexts. Requires contiguous Q (q_batch_stride ==
+        // n_heads*d) which is what the prefill caller passes.
+        if (kv_fp16 &&
+            prefill_attn_kernel_choice() == PrefillAttnKernel::Cublas &&
+            batch >= prefill_attn_min_batch() &&
+            (head_dim == 128 || head_dim == 256) &&
+            q_batch_stride == n_heads * head_dim &&
+            out_batch_stride == n_heads * head_dim &&
+            q_stride == n_heads * head_dim) {
+            if (auto st = attention_prefill_cublas(
+                    o.ptr, qq.ptr, q_stride, kc.ptr_h(), vc.ptr_h(),
+                    n_heads, n_kv_heads, head_dim,
+                    /*T=*/batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale);
+                st.ok) {
+                return launch_status("cuda attention_decode_batch cublas prefill");
+            }
+            // On unexpected failure, fall through to the tiled/vec paths.
+        }
+
+        // Tensor-core MMA prefill (m16n8k16.f16). Opt-in via QW3_PREFILL_ATTN=mma.
+        if (kv_fp16 &&
+            prefill_attn_kernel_choice() == PrefillAttnKernel::Mma &&
+            batch >= prefill_attn_min_batch() &&
+            (head_dim == 128 || head_dim == 256)) {
+            if (ported::launch_fattn_prefill_mma_f16(
+                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch mma f16");
+            }
+        }
 
         // Tiled prefill kernel — preferred when batch is large enough that
         // K/V reuse across BR=4 queries pays for itself. FP16 KV only (FP32
@@ -3080,6 +3520,21 @@ private:
     // because the kernel writes-then-reads it in a single launch+combine pair.
     void   *fattn_scratch_ = nullptr;
     size_t  fattn_scratch_capacity_ = 0;  // bytes
+    // Prefill-attention cuBLAS path scratch. q_fp16 stages a half-precision
+    // copy of the FP32 Q tensor (cuBLAS HGEMM input); scores_fp16 holds one
+    // KV-group worth of attention scores [gqa_ratio, T, T_kv] reused across
+    // groups within a single layer call. Reused across layers in a forward.
+    __half *prefill_attn_q_fp16_ = nullptr;
+    uint64_t prefill_attn_q_fp16_capacity_ = 0;       // elements
+    __half *prefill_attn_scores_fp16_ = nullptr;
+    uint64_t prefill_attn_scores_fp16_capacity_ = 0;  // elements
+    // X-FP16 cache for hgemm_q8. The QKV and gate/up matmul pairs share the
+    // same FP32 input pointer in immediate succession; without a cache we
+    // re-run fp32_to_fp16_kernel on identical data. Cache key is
+    // (x_ptr, x_elems); a hit skips the conversion. Reset on begin() and on
+    // workspace resize. Disable via QW3_HGEMM_X_CACHE=0.
+    const float *x_fp16_cached_src_ = nullptr;
+    uint64_t     x_fp16_cached_elems_ = 0;
     // Single execution stream for all kernel launches. Created lazily in
     // begin(). Threading every launch through this stream (instead of stream
     // 0) is a prerequisite for CUDA graph capture and lets cuBLAS/HGEMM

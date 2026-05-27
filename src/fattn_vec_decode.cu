@@ -825,5 +825,523 @@ bool launch_fattn_prefill_f16(
         q_batch_stride, out_batch_stride, scale, stream);
 }
 
+// ============================================================================
+// Tensor-core (MMA m16n8k16 fp16) prefill flash-attention kernel.
+//
+// Same algorithmic shape as fattn_prefill_kernel but with the QK^T and PV
+// inner loops replaced by MMA tensor-core fragments. Online softmax is row-
+// fused so the [BR, BC] score tile lives only in shmem, never HBM.
+//
+// Geometry (HEAD_DIM=256):
+//   - Block: 4 warps x 32 = 128 threads.
+//   - BR=16 queries per block (one m16 row per QK^T MMA).
+//   - BC=32 KV tokens per tile.
+//   - QK^T: each of 4 warps owns an 8-token slice of BC; QK^T fragment is
+//     m16n8k16 (1 m-tile, HEAD_DIM/16=16 k-steps, 1 n-tile per warp).
+//     Each warp produces 4 floats of S per lane covering its 16x8 slice.
+//     S is staged through shmem [BR, BC] FP32 so all warps see the full row.
+//   - Softmax: one warp owns 4 rows; each lane scans BC scores from shmem,
+//     reduces row max/sum, updates online (m_i, l_i, alpha_i), and writes P
+//     back to shmem as FP16.
+//   - PV: each warp owns 64 of HEAD_DIM dims (HEAD_DIM/4 = 64). PV fragment
+//     is m16n8k16 (1 m-tile, BC/16=2 k-steps, 8 n-tiles per warp).
+//     Output accumulators are FP32 and stay in registers across tiles.
+//
+// Shmem (HEAD_DIM=256, all FP16 except S/m/l/alpha):
+//   Q   [16][256]     8 KB
+//   K   [32][256]    16 KB
+//   V_T [256][32]    16 KB        (V transposed at load: PV B-frag = contig)
+//   S   [16][32]      2 KB FP32
+//   P   [16][32]      1 KB FP16
+//   m,l,alpha[16]   192 B FP32
+//   ----                  -------
+//                       ~43 KB    (under 48 KB static-shmem cap on sm_80+)
+//
+// Causal mask: applied per (q_idx, kv_idx) at the score level, identical to
+// the SIMT kernel.
+//
+// V is loaded into shmem in transposed [HEAD_DIM][BC] order so the PV
+// B-fragment loads are 32-bit reads of consecutive halves down the K (=BC)
+// dimension. Trade: scattered shmem writes during the V load (8 strided
+// stores per thread) instead of vectorized writes; PV inner loop benefits
+// from this for every K-step on every tile.
+// ============================================================================
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#define QW3_MMA_AVAILABLE 1
+#else
+#define QW3_MMA_AVAILABLE 0
+#endif
+
+namespace mma_detail {
+
+// PTX wrapper: m16n8k16.row.col.f32.f16.f16.f32. Non-volatile so ptxas can
+// schedule MMAs around loads for ILP. Same calling convention as the int8
+// MMA in mmq_q8.cu.
+__device__ __forceinline__ void mma_m16n8k16_f16f16f32(
+        float &c0, float &c1, float &c2, float &c3,
+        unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+        unsigned b0, unsigned b1) {
+#if QW3_MMA_AVAILABLE
+    asm(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(b0), "r"(b1));
+#else
+    (void)c0; (void)c1; (void)c2; (void)c3;
+    (void)a0; (void)a1; (void)a2; (void)a3;
+    (void)b0; (void)b1;
+#endif
+}
+
+// Pack two consecutive halves at p[0], p[1] into a single .b32 register.
+__device__ __forceinline__ unsigned pack2h(const __half *p) {
+    __half2 v = *reinterpret_cast<const __half2 *>(p);
+    return *reinterpret_cast<unsigned *>(&v);
+}
+
+__device__ __forceinline__ unsigned pack2h(__half a, __half b) {
+    __half2 v = __halves2half2(a, b);
+    return *reinterpret_cast<unsigned *>(&v);
+}
+
+// ldmatrix.x4 .b16 — loads a 16x16 fp16 tile from shmem into 4 .b32 regs per
+// lane, distributing the result so that each lane holds the A fragment of a
+// m16n8k16.row.col MMA (i.e. lane t -> rows {t/4, t/4+8}, cols
+// {t%4*2..+1, t%4*2+8..+9}).
+//
+// Lane addressing: lane provides the shmem address of (row=lane%16,
+// col_halves=(lane/16)*8). Stride is in halves between rows. The shmem region
+// must be a contiguous 16x16 fp16 tile starting at `base` (i.e.
+// base[row*stride_h + col]).
+__device__ __forceinline__ void ldmatrix_x4_a(
+        unsigned &a0, unsigned &a1, unsigned &a2, unsigned &a3,
+        const __half *base, uint32_t stride_h) {
+#if QW3_MMA_AVAILABLE
+    const uint32_t lane = threadIdx.x % 32;
+    const __half *p = base + (lane & 15) * stride_h + ((lane >> 4) * 8);
+    unsigned smem = __cvta_generic_to_shared(p);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+        : "r"(smem));
+#else
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)base; (void)stride_h;
+#endif
+}
+
+} // namespace mma_detail
+
+template <uint32_t HEAD_DIM, uint32_t BR, uint32_t BC>
+__global__ void
+__launch_bounds__(128, 2)
+fattn_prefill_mma_kernel(
+        float       * __restrict__ out,
+        const float * __restrict__ q,
+        uint32_t     q_stride,
+        const __half* __restrict__ k_cache,
+        const __half* __restrict__ v_cache,
+        uint32_t     n_heads,
+        uint32_t     n_kv_heads,
+        uint32_t     base_seq_len,
+        uint32_t     batch,
+        uint32_t     q_batch_stride,
+        uint32_t     out_batch_stride,
+        float        scale) {
+    constexpr uint32_t WARP_SIZE = 32;
+    constexpr uint32_t NWARPS    = 4;
+    constexpr uint32_t MMA_M     = 16;
+    constexpr uint32_t MMA_N     = 8;
+    constexpr uint32_t MMA_K     = 16;
+    static_assert(BR == 16, "MMA prefill kernel requires BR=16");
+    static_assert(BC == 32, "MMA prefill kernel requires BC=32");
+    static_assert(HEAD_DIM == 256 || HEAD_DIM == 128,
+                  "MMA prefill kernel supports HEAD_DIM 128 or 256");
+    static_assert(HEAD_DIM % MMA_K == 0, "HEAD_DIM must be a multiple of MMA_K");
+
+    constexpr uint32_t QK_KSTEPS  = HEAD_DIM / MMA_K;        // 16 (or 8)
+    constexpr uint32_t QK_N_PER_WARP = BC / NWARPS;          // 8 (= MMA_N)
+    static_assert(QK_N_PER_WARP == MMA_N, "BC/NWARPS must equal MMA_N");
+    constexpr uint32_t PV_KSTEPS  = BC / MMA_K;              // 2
+    constexpr uint32_t HD_PER_WARP = HEAD_DIM / NWARPS;      // 64 (or 32)
+    constexpr uint32_t PV_N_TILES  = HD_PER_WARP / MMA_N;    // 8 (or 4)
+
+    const uint32_t head    = blockIdx.x;
+    const uint32_t block_q = blockIdx.y;
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t warp    = tid / WARP_SIZE;
+    const uint32_t lane    = tid % WARP_SIZE;
+    if (head >= n_heads) return;
+
+    const uint32_t kv_head = head / (n_heads / n_kv_heads);
+
+    // MMA fragment lane layout (m16n8k16.row.col):
+    //   group_id = lane/4 picks row pair {group_id, group_id+8}
+    //   in_group = lane%4 picks the 2-col pair within K (or N for B).
+    const uint32_t group_id = lane / 4;
+    const uint32_t in_group = lane % 4;
+
+    uint32_t block_max_q = block_q * BR + BR;
+    if (block_max_q > batch) block_max_q = batch;
+    const uint32_t block_max_kv = base_seq_len + block_max_q;   // exclusive
+
+    // ---- Shared memory layout -------------------------------------------
+    extern __shared__ char smem_raw[];
+    char *p = smem_raw;
+    __half *s_Q   = reinterpret_cast<__half *>(p); p += BR       * HEAD_DIM * sizeof(__half);
+    __half *s_K   = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
+    __half *s_VT  = reinterpret_cast<__half *>(p); p += HEAD_DIM * BC       * sizeof(__half);
+    float  *s_S   = reinterpret_cast<float  *>(p); p += BR       * BC       * sizeof(float);
+    __half *s_P   = reinterpret_cast<__half *>(p); p += BR       * BC       * sizeof(__half);
+    float  *s_m   = reinterpret_cast<float  *>(p); p += BR                  * sizeof(float);
+    float  *s_l   = reinterpret_cast<float  *>(p); p += BR                  * sizeof(float);
+    float  *s_alpha = reinterpret_cast<float *>(p); p += BR                 * sizeof(float);
+
+    // ---- Load Q into shmem (FP32 -> FP16) -------------------------------
+    // BR*HEAD_DIM = 16*256 = 4096 elements. 128 threads -> 32 elts/thread.
+    // Lane reads HEAD_DIM/WARP_SIZE elements per query row; queries split
+    // by warp_id (4 warps x 4 rows = 16 = BR).
+    {
+        constexpr uint32_t ROWS_PER_WARP = BR / NWARPS;          // 4
+        for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+            const uint32_t q_row = warp * ROWS_PER_WARP + r;
+            const uint32_t q_idx = block_q * BR + q_row;
+            const bool active   = (q_idx < batch);
+            const float * q_ptr = active
+                ? (q + static_cast<uint64_t>(q_idx) * q_batch_stride
+                     + head * q_stride)
+                : nullptr;
+            #pragma unroll
+            for (uint32_t d0 = 0; d0 < HEAD_DIM; d0 += WARP_SIZE) {
+                const uint32_t d = d0 + lane;
+                const float v = active ? q_ptr[d] : 0.0f;
+                s_Q[q_row * HEAD_DIM + d] = __float2half(v);
+            }
+        }
+    }
+
+    // ---- Initialize per-row softmax state --------------------------------
+    if (tid < BR) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+
+    // ---- Output accumulator (FP32 in registers) --------------------------
+    // Each warp owns HD_PER_WARP=64 (or 32 at HD=128) dims of the head.
+    // PV fragment lays out 4 floats per thread per (m=16, n=8) tile, so each
+    // thread holds PV_N_TILES * 4 floats.
+    float O_acc[PV_N_TILES][4];
+    #pragma unroll
+    for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) O_acc[n][i] = 0.0f;
+    }
+
+    __syncthreads();
+
+    // =====================================================================
+    // Tile loop over KV.
+    // =====================================================================
+    for (uint32_t t0 = 0; t0 < block_max_kv; t0 += BC) {
+
+        // ---- Load K tile (row-major) into s_K -------------------------
+        // 32 tokens x 256 halves = 8192 halves; int4 loads of 8 halves =>
+        // 1024 vectors / 128 threads = 8 vectors per thread.
+        {
+            constexpr uint32_t HALVES_PER_LD = 8;
+            constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;   // 32 (or 16)
+            constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;     // 4 (or 8)
+            constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;             // 8 (or 4)
+            const uint32_t row_in_pass = tid / LANES_PER_ROW;
+            const uint32_t col_lane    = tid % LANES_PER_ROW;
+            #pragma unroll
+            for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+                const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+                const uint32_t t     = t0 + shm_t;
+                const uint32_t base_d = col_lane * HALVES_PER_LD;
+                int4 *dst = reinterpret_cast<int4 *>(&s_K[shm_t * HEAD_DIM + base_d]);
+                if (t < block_max_kv) {
+                    const __half *k_src = k_cache
+                        + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *dst = *reinterpret_cast<const int4 *>(k_src);
+                } else {
+                    int4 z; z.x = z.y = z.z = z.w = 0;
+                    *dst = z;
+                }
+            }
+        }
+
+        // ---- Load V tile transposed: s_VT[d, t] = V[t, d] -------------
+        // Same vectorized HBM read as K (8 halves at a time), but stores to
+        // 8 separate shmem locations along the d axis.
+        {
+            constexpr uint32_t HALVES_PER_LD = 8;
+            constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+            constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+            constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+            const uint32_t row_in_pass = tid / LANES_PER_ROW;
+            const uint32_t col_lane    = tid % LANES_PER_ROW;
+            #pragma unroll
+            for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+                const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+                const uint32_t t     = t0 + shm_t;
+                const uint32_t base_d = col_lane * HALVES_PER_LD;
+                __half v8[HALVES_PER_LD];
+                if (t < block_max_kv) {
+                    const __half *v_src = v_cache
+                        + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *reinterpret_cast<int4 *>(v8) = *reinterpret_cast<const int4 *>(v_src);
+                } else {
+                    *reinterpret_cast<int4 *>(v8) = make_int4(0,0,0,0);
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < HALVES_PER_LD; ++i) {
+                    s_VT[(base_d + i) * BC + shm_t] = v8[i];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // ================================================================
+        // QK^T MMA. Each warp computes its 16x8 slice of S = Q * K^T.
+        // ================================================================
+        // Lane layout for MMA m16n8k16.row.col.f16:
+        //   A (Q)  row-major:  thread t holds rows {t/4, t/4+8} x cols
+        //                       {t%4*2, t%4*2+1, t%4*2+8, t%4*2+9}
+        //                       packed into 4 .b32 regs (a0..a3).
+        //   B (K)  col-major:  thread t holds rows {t%4*2, t%4*2+1, t%4*2+8,
+        //                       t%4*2+9} x cols {t/4} packed into 2 .b32
+        //                       regs (b0..b1).
+        //   C (S)  row-major:  thread t holds rows {t/4, t/4+8} x cols
+        //                       {t%4*2, t%4*2+1} as 4 floats c0..c3.
+        // For QK^T, "rows of B" along K dim = HEAD_DIM elements (col-major
+        // means stride along K is 1). K is stored in shmem as s_K[t][d];
+        // viewed as col-major [d, t] this is a stride-256 along d, which
+        // is exactly what the row.col MMA wants when we set ldb = HEAD_DIM
+        // and treat B as col-major over (d, n).
+        float c00 = 0.f, c01 = 0.f, c02 = 0.f, c03 = 0.f;
+        #pragma unroll
+        for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+            const uint32_t k0 = ks * MMA_K;
+            // A (Q) fragment from s_Q via ldmatrix.x4 — single PTX, all 4 a regs.
+            unsigned a0, a1, a2, a3;
+            mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                      &s_Q[0 * HEAD_DIM + k0], HEAD_DIM);
+            // B (K) fragment. B is col-major; rows of B = K dim (= HEAD_DIM).
+            // For warp `warp`, its 8 N-cols start at warp * MMA_N. The MMA
+            // expects, per thread, two pairs along the K dim at column = group_id.
+            const uint32_t kv_col = warp * MMA_N + group_id;
+            const __half *krow0 = &s_K[kv_col * HEAD_DIM + k0 + in_group * 2];
+            unsigned b0 = mma_detail::pack2h(krow0);              // k[col, k0+2c+0..1]
+            unsigned b1 = mma_detail::pack2h(krow0 + 8);          // k[col, k0+2c+8..9]
+            mma_detail::mma_m16n8k16_f16f16f32(c00, c01, c02, c03,
+                                               a0, a1, a2, a3, b0, b1);
+        }
+
+        // Write S slice to shmem with causal mask. Each thread holds 4
+        // values: (row=group_id,    col=warp*8 + in_group*2 + 0)
+        //         (row=group_id,    col=warp*8 + in_group*2 + 1)
+        //         (row=group_id+8,  col=warp*8 + in_group*2 + 0)
+        //         (row=group_id+8,  col=warp*8 + in_group*2 + 1)
+        {
+            const uint32_t base_col = warp * MMA_N + in_group * 2;
+            const uint32_t row_a = group_id;
+            const uint32_t row_b = group_id + 8;
+            const uint32_t q_idx_a = block_q * BR + row_a;
+            const uint32_t q_idx_b = block_q * BR + row_b;
+            const uint32_t my_max_kv_a = base_seq_len + q_idx_a + 1;
+            const uint32_t my_max_kv_b = base_seq_len + q_idx_b + 1;
+            const bool a_active = (q_idx_a < batch);
+            const bool b_active = (q_idx_b < batch);
+            const uint32_t t_a0 = t0 + base_col;
+            const uint32_t t_a1 = t0 + base_col + 1;
+            float v00 = (a_active && t_a0 < my_max_kv_a) ? c00 * scale : -INFINITY;
+            float v01 = (a_active && t_a1 < my_max_kv_a) ? c01 * scale : -INFINITY;
+            float v02 = (b_active && t_a0 < my_max_kv_b) ? c02 * scale : -INFINITY;
+            float v03 = (b_active && t_a1 < my_max_kv_b) ? c03 * scale : -INFINITY;
+            s_S[row_a * BC + base_col + 0] = v00;
+            s_S[row_a * BC + base_col + 1] = v01;
+            s_S[row_b * BC + base_col + 0] = v02;
+            s_S[row_b * BC + base_col + 1] = v03;
+        }
+
+        __syncthreads();
+
+        // ================================================================
+        // Online softmax. One warp owns 4 rows; lane scans BC scores.
+        // ================================================================
+        // 4 warps x 4 rows = 16 = BR. Each warp sweeps its 4 rows; for each
+        // row, all 32 lanes load BC=32 scores (lane l reads s_S[row*BC + l]).
+        {
+            constexpr uint32_t ROWS_PER_WARP = BR / NWARPS;          // 4
+            #pragma unroll
+            for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+                const uint32_t row = warp * ROWS_PER_WARP + r;
+                const float s = s_S[row * BC + lane];                 // lane = col
+                const float row_max_local = s;
+                const float row_max = cuda_helpers::warp_reduce_max<32>(row_max_local);
+                const float prev_m = s_m[row];
+                const float new_m  = fmaxf(prev_m, row_max);
+                const float p_val  = (s == -INFINITY) ? 0.0f
+                                                      : __expf(s - new_m);
+                const float row_p_sum = cuda_helpers::warp_reduce_sum<32>(p_val);
+                const float prev_l   = s_l[row];
+                const float alpha    = (prev_m == -INFINITY) ? 0.0f
+                                                             : __expf(prev_m - new_m);
+                const float new_l    = prev_l * alpha + row_p_sum;
+                if (lane == 0) {
+                    s_m[row]     = new_m;
+                    s_l[row]     = new_l;
+                    s_alpha[row] = alpha;
+                }
+                // Write P (FP16) — lane l writes col l for this row.
+                s_P[row * BC + lane] = __float2half(p_val);
+            }
+        }
+
+        __syncthreads();
+
+        // ================================================================
+        // Rescale O_acc by alpha_row before adding new PV contribution.
+        // ================================================================
+        // Each thread holds 4 floats per N-tile, mapping to rows
+        //   [group_id, group_id+8] x cols [in_group*2, in_group*2+1].
+        // The alpha factor depends only on the row.
+        const float alpha_a = s_alpha[group_id];
+        const float alpha_b = s_alpha[group_id + 8];
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            O_acc[n][0] *= alpha_a;
+            O_acc[n][1] *= alpha_a;
+            O_acc[n][2] *= alpha_b;
+            O_acc[n][3] *= alpha_b;
+        }
+
+        // ================================================================
+        // PV MMA. O += P @ V. P[BR, BC] @ V[BC, HEAD_DIM] -> O[BR, HEAD_DIM].
+        // For MMA m16n8k16.row.col.f16:
+        //   A (P) row-major: rows = BR, K = BC. PV_KSTEPS = BC/MMA_K = 2.
+        //   B (V) col-major along K: viewing V as [HEAD_DIM, BC] col-major
+        //         means stride along K is 1, stride along N is BC. Our s_VT
+        //         is exactly [d=HEAD_DIM, t=BC] row-major in shmem, which
+        //         equals col-major when we re-label (d -> N axis, t -> K
+        //         axis). So ldb = BC.
+        // Each warp owns N range [warp*HD_PER_WARP, (warp+1)*HD_PER_WARP) of
+        // the head dim, split into PV_N_TILES tiles of MMA_N=8.
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+            #pragma unroll
+            for (uint32_t ks = 0; ks < PV_KSTEPS; ++ks) {
+                const uint32_t k0 = ks * MMA_K;
+                // A (P) fragment from s_P via ldmatrix.x4. ldb = BC.
+                unsigned a0, a1, a2, a3;
+                mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                          &s_P[0 * BC + k0], BC);
+                // B (V) fragment. col_in_warp_n = group_id selects an N col
+                // within the 8-col warp slice. Two pairs along K = BC.
+                const uint32_t out_col = n0 + group_id;
+                const __half *vrow0 = &s_VT[out_col * BC + k0 + in_group * 2];
+                unsigned b0 = mma_detail::pack2h(vrow0);
+                unsigned b1 = mma_detail::pack2h(vrow0 + 8);
+                mma_detail::mma_m16n8k16_f16f16f32(
+                    O_acc[n][0], O_acc[n][1], O_acc[n][2], O_acc[n][3],
+                    a0, a1, a2, a3, b0, b1);
+            }
+        }
+
+        __syncthreads();   // s_K, s_VT, s_S, s_P reused next tile
+    }
+
+    // =====================================================================
+    // Final write. Each thread holds 4 FP32 outputs per N-tile:
+    //   (row=group_id   , col=n0 + in_group*2 + 0)
+    //   (row=group_id   , col=n0 + in_group*2 + 1)
+    //   (row=group_id+8 , col=n0 + in_group*2 + 0)
+    //   (row=group_id+8 , col=n0 + in_group*2 + 1)
+    // Divide by l_i and store to global out.
+    // =====================================================================
+    const float l_a = s_l[group_id];
+    const float l_b = s_l[group_id + 8];
+    const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
+    const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
+    const uint32_t q_idx_a = block_q * BR + group_id;
+    const uint32_t q_idx_b = block_q * BR + group_id + 8;
+    float * const out_a = (q_idx_a < batch)
+        ? (out + static_cast<uint64_t>(q_idx_a) * out_batch_stride + head * HEAD_DIM)
+        : nullptr;
+    float * const out_b = (q_idx_b < batch)
+        ? (out + static_cast<uint64_t>(q_idx_b) * out_batch_stride + head * HEAD_DIM)
+        : nullptr;
+    #pragma unroll
+    for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+        const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+        const uint32_t col = n0 + in_group * 2;
+        if (out_a) {
+            out_a[col + 0] = O_acc[n][0] * inv_la;
+            out_a[col + 1] = O_acc[n][1] * inv_la;
+        }
+        if (out_b) {
+            out_b[col + 0] = O_acc[n][2] * inv_lb;
+            out_b[col + 1] = O_acc[n][3] * inv_lb;
+        }
+    }
+}
+
+static size_t fattn_mma_smem_bytes(uint32_t head_dim) {
+    constexpr uint32_t BR = 16, BC = 32;
+    size_t s = 0;
+    s += BR       * head_dim * sizeof(__half);   // Q
+    s += BC       * head_dim * sizeof(__half);   // K
+    s += head_dim * BC       * sizeof(__half);   // V_T
+    s += BR       * BC       * sizeof(float);    // S
+    s += BR       * BC       * sizeof(__half);   // P
+    s += BR                  * sizeof(float) * 3;// m, l, alpha
+    return s;
+}
+
+bool launch_fattn_prefill_mma_f16(
+        float *       out,
+        const float * q,
+        uint32_t      q_stride,
+        const void  * k_cache,
+        const void  * v_cache,
+        uint32_t      n_heads,
+        uint32_t      n_kv_heads,
+        uint32_t      head_dim,
+        uint32_t      batch,
+        uint32_t      base_seq_len,
+        uint32_t      q_batch_stride,
+        uint32_t      out_batch_stride,
+        float         scale,
+        cudaStream_t  stream) {
+    if (!(head_dim == 128 || head_dim == 256)) return false;
+    if (batch == 0) return true;
+    constexpr uint32_t BR = 16, BC = 32;
+    const uint32_t n_blocks_q = (batch + BR - 1) / BR;
+    const dim3 grid(n_heads, n_blocks_q, 1);
+    const dim3 block(128);
+    const size_t smem = fattn_mma_smem_bytes(head_dim);
+    auto launch = [&](auto HD_v) {
+        constexpr uint32_t HD = decltype(HD_v)::value;
+        cudaFuncSetAttribute(fattn_prefill_mma_kernel<HD, BR, BC>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+        fattn_prefill_mma_kernel<HD, BR, BC><<<grid, block, smem, stream>>>(
+            out, q, q_stride,
+            static_cast<const __half *>(k_cache),
+            static_cast<const __half *>(v_cache),
+            n_heads, n_kv_heads, base_seq_len, batch,
+            q_batch_stride, out_batch_stride, scale);
+    };
+    if (head_dim == 256) launch(std::integral_constant<uint32_t, 256>{});
+    else                 launch(std::integral_constant<uint32_t, 128>{});
+    return true;
+}
+
 } // namespace ported
 } // namespace qw3

@@ -30,10 +30,10 @@ python3 scripts/long_prompt_sweep.py --prompt-tokens "512 1024 2048 4096" \
 
 | Prompt tokens | qw3 prefill | llama prefill | prefill % | qw3 decode | llama decode | decode % |
 |---:|---:|---:|---:|---:|---:|---:|
-|  556 | 1903.9 tok/s | 2812.6 tok/s | **67.7%** | 45.41 tok/s | 45.26 tok/s | **100.3%** |
-| 1098 | 2568.0 tok/s | 3317.3 tok/s | **77.4%** | 45.05 tok/s | 45.45 tok/s | **99.1%** |
-| 2182 | 3022.8 tok/s | 3599.4 tok/s | **84.0%** | 45.12 tok/s | 45.35 tok/s | **99.5%** |
-| 4350 | 2969.7 tok/s | 3779.3 tok/s | **78.6%** | 43.77 tok/s | 44.80 tok/s | **97.7%** |
+|  556 | 1950.6 tok/s | 2844.9 tok/s | **68.6%** | 45.68 tok/s | 45.50 tok/s | **100.4%** |
+| 1098 | 2655.3 tok/s | 3328.1 tok/s | **79.8%** | 45.03 tok/s | 45.47 tok/s | **99.0%** |
+| 2182 | 3232.7 tok/s | 3599.6 tok/s | **89.8%** | 45.11 tok/s | 45.34 tok/s | **99.5%** |
+| 4350 | 3344.7 tok/s | 3777.5 tok/s | **88.5%** | 43.87 tok/s | 44.83 tok/s | **97.9%** |
 
 All numbers are absolute tokens/second. The `%` columns report `qw3 / llama.cpp`.
 Two trends jump out:
@@ -441,6 +441,50 @@ weight mirror or any weight duplication.
      `mmq_x ∈ {8, 16, …, 128}` to minimise the column-tile count for
      the actual batch, e.g. 5 tiles at batch=601 with mmq_x=128 vs 7
      at mmq_x=96. Cheap to add (template-switch by 8-step ladder).
+
+5b. **cuBLAS strided-batched attention prefill (negative result).**
+    *(Tried, kept opt-in via `QW3_PREFILL_ATTN=cublas`.)*
+    Hypothesis: replace the hand-rolled `fattn_prefill_kernel` with two
+    `cublasGemmStridedBatchedEx` calls (Q·Kᵀ then P·V, FP16 inputs,
+    FP32 accumulator via `CUBLAS_COMPUTE_32F_FAST_16F`) plus an
+    in-place causal-softmax kernel between them. One call per KV
+    group, batch=6 across the 6 query heads sharing each KV head;
+    K/V passed with `strideA=0` to broadcast across the group.
+    Expected: tensor-core throughput on QK / PV beats the FP32 tiled
+    kernel.
+    Result: **2702 vs 2966 tok/s prefill at 4K (~9% slower)**, same
+    decoded tokens (FP16/FP32 drift within greedy parity). The loss
+    is structural, not a tuning issue — materializing the full
+    `[T, T_kv]` score matrix in HBM costs ~800 MB FP16 round-trip per
+    layer at T=4096 (24 heads × 4096 × 4096 × 2 B), which exceeds
+    what the tile-fused FA2 kernel touches by an order of magnitude.
+    The tiled kernel never spills S to memory: each Q row's
+    `[T_kv]` scores stay in registers/shmem during the row-fused
+    softmax + PV multiply. Blackwell's 1.7 TB/s HBM is the binding
+    constraint, not its tensor cores. Implementation in
+    `attention_prefill_cublas` (`src/kernels_cuda.cu`) with a custom
+    `softmax_causal_inplace_kernel`; kept selectable for shape
+    regimes where the tiled kernel under-occupies SMs.
+
+5c. **X-FP16 cache across consecutive HGEMMs with shared input.**
+    *(Done — default.)*
+    `hgemm_q8` runs `fp32_to_fp16_kernel` on its FP32 input X every
+    call. The transformer's QKV pattern (and FFN gate/up pair) calls
+    `hgemm_q8` 3× and 2× respectively in immediate succession with
+    the *same* `x_ptr` — the FP32→FP16 conversion of the layer input
+    is computed redundantly. Added a 1-slot cache keyed on
+    `(x_ptr, x_elems)` that skips the conversion launch on hit.
+    Invariant: between two consecutive `hgemm_q8` calls with the
+    same `x_ptr`, no kernel writes to that buffer (true in the
+    current executor — `x_normed` is read-only across QKV; `gate`
+    and `up` activations live in different tensors than the next
+    matmul's input). Reset at `begin()` and on workspace resize.
+    Result: at 4K context, prefill **2970 → 3024 tok/s (+1.8%)**;
+    nsys confirms `fp32_to_fp16_kernel` launches drop 496 → 256
+    (saves ~30 ms of GPU work). Identical decoded tokens vs the
+    no-cache run. Disable with `QW3_HGEMM_X_CACHE=0`. Implementation
+    in `hgemm_q8` (`src/kernels_cuda.cu`); the cache fields are
+    `x_fp16_cached_src_` / `x_fp16_cached_elems_`.
 
 6. **Persistent activation Q8_1 buffer reuse across Q/K/V/gate/up.** *(Done — for reference.)*
    Decode used to re-quantize the input to Q8_1 once per matvec; the
