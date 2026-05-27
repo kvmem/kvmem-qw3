@@ -164,8 +164,8 @@ enum class PrefillAttnKernel { Tiled, Vec };
 PrefillAttnKernel prefill_attn_kernel_choice() {
     static const PrefillAttnKernel choice = []() {
         const char *env = std::getenv("QW3_PREFILL_ATTN");
-        if (env && std::strcmp(env, "tiled") == 0) return PrefillAttnKernel::Tiled;
-        return PrefillAttnKernel::Vec;
+        if (env && std::strcmp(env, "vec") == 0) return PrefillAttnKernel::Vec;
+        return PrefillAttnKernel::Tiled;
     }();
     return choice;
 }

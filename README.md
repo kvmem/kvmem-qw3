@@ -30,10 +30,10 @@ python3 scripts/long_prompt_sweep.py --prompt-tokens "512 1024 2048 4096" \
 
 | Prompt tokens | qw3 prefill | llama prefill | prefill % | qw3 decode | llama decode | decode % |
 |---:|---:|---:|---:|---:|---:|---:|
-|  556 | 1870.5 tok/s | 2773.2 tok/s | **67.4%** | 40.02 tok/s | 45.10 tok/s | **88.7%** |
-| 1098 | 2539.8 tok/s | 3317.8 tok/s | **76.6%** | 40.62 tok/s | 45.43 tok/s | **89.4%** |
-| 2182 | 2899.7 tok/s | 3602.2 tok/s | **80.5%** | 40.86 tok/s | 45.38 tok/s | **90.0%** |
-| 4350 | 2698.1 tok/s | 3781.4 tok/s | **71.4%** | 40.80 tok/s | 44.83 tok/s | **91.0%** |
+|  556 | 1893.5 tok/s | 2772.0 tok/s | **68.3%** | 40.16 tok/s | 45.25 tok/s | **88.7%** |
+| 1098 | 2561.0 tok/s | 3307.2 tok/s | **77.4%** | 40.67 tok/s | 45.45 tok/s | **89.5%** |
+| 2182 | 3027.0 tok/s | 3583.5 tok/s | **84.5%** | 40.88 tok/s | 45.32 tok/s | **90.2%** |
+| 4350 | 2977.7 tok/s | 3778.5 tok/s | **78.8%** | 41.02 tok/s | 44.82 tok/s | **91.5%** |
 
 All numbers are absolute tokens/second. The `%` columns report `qw3 / llama.cpp`.
 Two trends jump out:
@@ -50,18 +50,20 @@ Two trends jump out:
   the decode hot path; FFN gate+up matvec fusion shaved another ~1%.
   The remaining gap is pure Q8 matvec wall time at the HBM ceiling
   (~2.5 TB/s effective per call); see roadmap.
-- **Prefill sits at 67–80% of llama.cpp**, peaking at 2K and dropping
-  back at 4K. The dominant cost on llama.cpp's prefill is `mul_mat_q`
-  (INT8 MMA on raw Q8_0) at 64% of GPU time — they bypass dequant
-  entirely. qw3 currently runs prefill matmul through cuBLAS HGEMM with
-  on-the-fly Q8 → FP16 dequant (~12% of prefill GPU time goes to
-  dequant + FP32→FP16 staging). The fall-off at 4K comes from O(T²)
-  per-query fattn-vec attention (no K/V reuse across queries). The
-  in-tree MMQ kernel (`src/mmq_q8.cu`, opt-in via `QW3_MATMUL=mmq`)
-  hits 74% of HGEMM at 2K — closer than v1's 33%, but still trailing —
-  and the v3 ldmatrix variant (`QW3_MMQ_VERSION=3`) is parity-correct
-  but slightly slower. Closing the rest needs cp.async + repacked
-  weights; see roadmap.
+- **Prefill sits at 68–85% of llama.cpp**, with the gap narrowing as
+  context grows past 1K. The dominant cost on llama.cpp's prefill is
+  `mul_mat_q` (INT8 MMA on raw Q8_0) at 64% of GPU time — they bypass
+  dequant entirely. qw3 currently runs prefill matmul through cuBLAS
+  HGEMM with on-the-fly Q8 → FP16 dequant (~12% of prefill GPU time goes
+  to dequant + FP32→FP16 staging). The 4K case used to fall off
+  to 71% because the prefill attention kernel re-used the per-query
+  decode kernel (O(T²) HBM traffic, no K/V reuse); the new tiled
+  FA2-style prefill kernel (BR=16, BC=32, vectorized int4 K/V loads)
+  shares K/V across 16 queries and cuts prefill attention by ~28% at
+  4K, lifting prefill from 71% → 79%. The in-tree MMQ kernel
+  (`src/mmq_q8.cu`, opt-in via `QW3_MATMUL=mmq`) hits 74% of HGEMM at
+  2K — still trailing — and v3 ldmatrix is parity-correct but slightly
+  slower. Closing the rest needs cp.async + repacked weights; see roadmap.
 
 How we got here (prefill on a 1322-token prompt, earlier baseline measurements):
 
@@ -117,14 +119,20 @@ The new bottleneck is **decode matvec**: 31312 calls (≈489/token across
 wall time. Closing the remaining ~7 tok/s decode gap to llama.cpp now
 means attacking matvec, not attention. So the next gains will come from:
 
-1. **Tiled flash-attention prefill kernel.** The 4K-prompt deficit
-   (−1000 tok/s) is dominated by `fattn_vec_decode_kernel` running with
-   batch = T queries; each query's block reads K/V independently from
-   HBM with no reuse, so the kernel scales O(T²) at ~580 GB/s effective
-   bandwidth. A flash-attention-2 style kernel that tiles BR × BC and
-   shares K/V loads across queries should cut prefill attention from
-   ~534 ms to ~100 ms on the 4K case (estimated +500 tok/s prefill at
-   long context).
+1. **Tiled flash-attention prefill kernel.** *(Done — default since this commit.)*
+   The 4K-prompt deficit used to be dominated by `fattn_vec_decode_kernel`
+   running with batch = T queries; each query's block read K/V
+   independently from HBM with no reuse, so the kernel scaled O(T²) at
+   ~580 GB/s effective bandwidth (~534 ms on the 4K case). The new
+   `fattn_prefill_kernel` (in `src/fattn_vec_decode.cu`) is FA2-style:
+   BR=16 queries per block share a BC=32 token K/V tile loaded
+   cooperatively into shmem with vectorized 16-byte (`int4`) HBM loads,
+   then each warp runs an online softmax against its own query. K/V is
+   read from HBM once per 16 queries instead of once per query. Per-call
+   prefill attention dropped 401 → 355 ms at 4K, total prefill attention
+   from 495 → 355 ms (-28%); end-to-end prefill 2698 → 2978 tok/s at
+   4350 prompt tokens (+10.4%), 71% → 79% of llama.cpp. Override via
+   `QW3_PREFILL_ATTN=vec` (legacy split-K) or `QW3_PREFILL_ATTN_BR={4,8,16,32}`.
 
 2. **MMQ-style prefill (INT8 MMA on raw Q8).** Drops the on-the-fly
    Q8 → FP16 dequant scratch and the FP32 → FP16 activation conversion,

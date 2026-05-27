@@ -29,6 +29,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <math.h>
 #include <type_traits>
 
@@ -627,19 +628,33 @@ fattn_prefill_kernel(
                 ? (v_cache + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
                            + kv_head * HEAD_DIM)
                 : nullptr;
-            #pragma unroll
-            for (uint32_t r = 0; r < D_PER_LANE; ++r) {
-                const uint32_t d = r * WARP_SIZE + lane;
-                if (t_in_range) {
-                    s_k[shmem_t * HEAD_DIM + d] = k_src[d];
-                    s_v[shmem_t * HEAD_DIM + d] = v_src[d];
-                } else {
-                    // Out-of-range tokens get zero K/V; their score will be
-                    // masked to -INFINITY below so the V accumulation is a
-                    // no-op (weight = 0).
-                    if constexpr (std::is_same<KVT, __half>::value) {
-                        s_k[shmem_t * HEAD_DIM + d] = __float2half(0.0f);
-                        s_v[shmem_t * HEAD_DIM + d] = __float2half(0.0f);
+            // Vectorized 16-byte load path: each lane grabs 8 halves with one
+            // int4 instruction, replacing 8 strided per-half loads. Both K row
+            // and shmem destination are 16-byte aligned for HEAD_DIM ∈ {128,
+            // 256}. Lanes past LANES_PER_ROW are idle for HEAD_DIM=128.
+            if constexpr (std::is_same<KVT, __half>::value) {
+                constexpr uint32_t HALVES_PER_LD = 8;
+                constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+                if (lane < LANES_PER_ROW) {
+                    const uint32_t base_d = lane * HALVES_PER_LD;
+                    int4 zero4; zero4.x = zero4.y = zero4.z = zero4.w = 0;
+                    if (t_in_range) {
+                        *reinterpret_cast<int4 *>(&s_k[shmem_t * HEAD_DIM + base_d]) =
+                            *reinterpret_cast<const int4 *>(&k_src[base_d]);
+                        *reinterpret_cast<int4 *>(&s_v[shmem_t * HEAD_DIM + base_d]) =
+                            *reinterpret_cast<const int4 *>(&v_src[base_d]);
+                    } else {
+                        *reinterpret_cast<int4 *>(&s_k[shmem_t * HEAD_DIM + base_d]) = zero4;
+                        *reinterpret_cast<int4 *>(&s_v[shmem_t * HEAD_DIM + base_d]) = zero4;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (uint32_t r = 0; r < D_PER_LANE; ++r) {
+                    const uint32_t d = r * WARP_SIZE + lane;
+                    if (t_in_range) {
+                        s_k[shmem_t * HEAD_DIM + d] = k_src[d];
+                        s_v[shmem_t * HEAD_DIM + d] = v_src[d];
                     } else {
                         s_k[shmem_t * HEAD_DIM + d] = 0.0f;
                         s_v[shmem_t * HEAD_DIM + d] = 0.0f;
@@ -701,6 +716,17 @@ fattn_prefill_kernel(
     }
 }
 
+static int prefill_attn_br() {
+    static const int v = []() {
+        const char *e = std::getenv("QW3_PREFILL_ATTN_BR");
+        if (!e) return 16;
+        int n = std::atoi(e);
+        if (n == 4 || n == 8 || n == 16 || n == 32) return n;
+        return 16;
+    }();
+    return v;
+}
+
 template <typename KVT>
 static bool dispatch_launch_prefill(
         float * out,
@@ -720,23 +746,30 @@ static bool dispatch_launch_prefill(
     if (head_dim != 128 && head_dim != 256) return false;
     if (batch == 0) return true;
 
-    constexpr uint32_t BR = 4;
     constexpr uint32_t BC = 32;
-    const uint32_t n_blocks_q = (batch + BR - 1) / BR;
-    const dim3 grid(n_heads, n_blocks_q, 1);
-    const dim3 block(BR * 32);
+    const int br = prefill_attn_br();
 
-    if (head_dim == 128) {
-        fattn_prefill_kernel<128, KVT, BR, BC><<<grid, block, 0, stream>>>(
-            out, q, q_stride, k_cache, v_cache,
-            n_heads, n_kv_heads, base_seq_len, batch,
-            q_batch_stride, out_batch_stride, scale);
-    } else {
-        fattn_prefill_kernel<256, KVT, BR, BC><<<grid, block, 0, stream>>>(
-            out, q, q_stride, k_cache, v_cache,
-            n_heads, n_kv_heads, base_seq_len, batch,
-            q_batch_stride, out_batch_stride, scale);
-    }
+    auto launch = [&](auto BR_v) {
+        constexpr uint32_t BR = decltype(BR_v)::value;
+        const uint32_t n_blocks_q = (batch + BR - 1) / BR;
+        const dim3 grid(n_heads, n_blocks_q, 1);
+        const dim3 block(BR * 32);
+        if (head_dim == 128) {
+            fattn_prefill_kernel<128, KVT, BR, BC><<<grid, block, 0, stream>>>(
+                out, q, q_stride, k_cache, v_cache,
+                n_heads, n_kv_heads, base_seq_len, batch,
+                q_batch_stride, out_batch_stride, scale);
+        } else {
+            fattn_prefill_kernel<256, KVT, BR, BC><<<grid, block, 0, stream>>>(
+                out, q, q_stride, k_cache, v_cache,
+                n_heads, n_kv_heads, base_seq_len, batch,
+                q_batch_stride, out_batch_stride, scale);
+        }
+    };
+    if (br == 32)      launch(std::integral_constant<uint32_t, 32>{});
+    else if (br == 16) launch(std::integral_constant<uint32_t, 16>{});
+    else if (br == 8)  launch(std::integral_constant<uint32_t, 8>{});
+    else               launch(std::integral_constant<uint32_t, 4>{});
     return true;
 }
 
