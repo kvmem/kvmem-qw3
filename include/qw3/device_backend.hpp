@@ -90,6 +90,34 @@ public:
     }
     virtual DeviceStatus q8_0_matvec(DeviceTensor &out, const DeviceWeight &weight, const DeviceTensor &x) = 0;
 
+    // Fused matvec + residual add: out = out + W*x. Used at decode for the
+    // attn_output and ffn_down matvecs whose result is immediately summed
+    // into the residual stream. Saves one add_kernel launch and the
+    // intermediate buffer round-trip per layer (~128 launches/token).
+    //
+    // Default falls back to separate matvec + add via a temporary tensor;
+    // CUDA backend overrides with a fused mmvq kernel.
+    virtual DeviceStatus q8_0_matvec_add(DeviceTensor &accum,
+                                         const DeviceWeight &weight,
+                                         const DeviceTensor &x) {
+        (void)accum; (void)weight; (void)x;
+        return {false, "q8_0_matvec_add not implemented by this backend"};
+    }
+
+    // Fused FFN SwiGLU: out = silu(W_gate * x) * (W_up * x). Used at decode
+    // for the FFN block, where the previous gate+up two-weight matvec was
+    // followed by a separate silu_mul kernel that read both intermediates
+    // back from DRAM. The fused version writes only the n_ff-wide result.
+    //
+    // Default falls back to running them as separate ops; CUDA overrides.
+    virtual DeviceStatus q8_0_matvec_silu_mul(DeviceTensor &out,
+                                              const DeviceWeight &weight_gate,
+                                              const DeviceWeight &weight_up,
+                                              const DeviceTensor &x) {
+        (void)out; (void)weight_gate; (void)weight_up; (void)x;
+        return {false, "q8_0_matvec_silu_mul not implemented by this backend"};
+    }
+
     // Run several Q8_0 matvecs that share the same input vector x. The MMVQ
     // path quantizes x to Q8_1 once, then runs each (weight -> out) matvec
     // against the cached Q8_1 buffer. Saves K-1 redundant input quantizations

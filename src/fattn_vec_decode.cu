@@ -310,13 +310,42 @@ fattn_vec_combine_kernel(
 }
 
 // Pick NSPLIT based on seq_len so we put more blocks on the GPU when KV
-// gets large. Below ~1K tokens the launch overhead and combiner kernel
-// outweigh the parallelism gain; above ~2K tokens 8-way split fills SMs.
+// gets large.
+//
+// Previously this returned 1 for seq_len <= 1024, which left Blackwell with
+// only 24 blocks (one per Q-head) × 4 warps = 96 warps total — under 5% of
+// the 128 SMs' warp capacity. Each block then sequentially walked the full
+// KV tail at ~3 GB/s effective, taking ~315 µs/call (vs the ~2 µs the read
+// is actually worth). The kernel is latency- / sync-bound, not bandwidth-
+// bound, so adding more parallel splits is nearly free in HBM traffic and
+// linear in throughput.
+//
+// New policy: aim for per_split ≈ 128 KV tokens. That keeps each block's
+// inner loop at ~32 iterations (one warp wave per ~10 tokens), enough work
+// to amortize the combine-kernel launch but small enough that 24 heads × N
+// splits fills the SMs.
+//
+//   seq_len <= 64   : 1
+//   seq_len <= 128  : 2     (256 KV tokens / per_split=128 per block)
+//   seq_len <= 256  : 4
+//   seq_len <= 512  : 4
+//   else            : 8     (max NSPLIT instantiated)
+//
+// Override via QW3_FATTN_NSPLIT=N (1/2/4/8) for parity diffs.
 static inline uint32_t pick_nsplit(uint32_t seq_len) {
-    if (seq_len <= 1024) return 1;
-    if (seq_len <= 2048) return 2;
-    if (seq_len <= 4096) return 4;
-    return 8;
+    static const uint32_t kForced = []() -> uint32_t {
+        const char *e = std::getenv("QW3_FATTN_NSPLIT");
+        if (!e) return 0;
+        const int v = std::atoi(e);
+        if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) return static_cast<uint32_t>(v);
+        return 0;
+    }();
+    if (kForced) return kForced;
+    if (seq_len <= 64)   return 1;
+    if (seq_len <= 128)  return 2;
+    if (seq_len <= 512)  return 4;
+    if (seq_len <= 2048) return 8;
+    return 16;
 }
 
 // Scratch sizing helper (in bytes). Caller must allocate at least this many
@@ -386,8 +415,8 @@ static bool dispatch_launch(
                    std::integral_constant<uint32_t, NS>{});               \
             return true;                                                  \
         }
-    DISPATCH(128, 1) DISPATCH(128, 2) DISPATCH(128, 4) DISPATCH(128, 8)
-    DISPATCH(256, 1) DISPATCH(256, 2) DISPATCH(256, 4) DISPATCH(256, 8)
+    DISPATCH(128, 1) DISPATCH(128, 2) DISPATCH(128, 4) DISPATCH(128, 8) DISPATCH(128, 16)
+    DISPATCH(256, 1) DISPATCH(256, 2) DISPATCH(256, 4) DISPATCH(256, 8) DISPATCH(256, 16)
     #undef DISPATCH
     return false;
 }

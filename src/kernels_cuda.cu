@@ -43,6 +43,15 @@ bool launch_mmvq_q8_0_two(
         float *dst0, float *dst1,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
+bool launch_mmvq_q8_0_silu_mul(
+        const uint8_t *weight_gate, const uint8_t *weight_up, const void *y_q8_1,
+        float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
+bool launch_mmvq_q8_0_add(
+        const uint8_t *weight, const void *y_q8_1, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
 
 // Ported MMQ Q8_0 INT8-MMA matmul (src/mmq_q8.cu). Drop-in replacement for
 // the HGEMM prefill path that uses m16n8k32.s8.s8.s32 tensor cores directly
@@ -1839,6 +1848,88 @@ public:
             ++i;
         }
         return launch_status("cuda q8_0_matvec_fanout");
+    }
+
+    // Fused matvec + residual add: dst = dst + W*x. Uses the dedicated
+    // mmvq_add kernel that writes through dst with read-modify-write
+    // instead of materializing the matvec result into a separate buffer
+    // and adding it. Saves one add_kernel launch and the round-trip of
+    // an n_embd-wide scratch buffer per call. Disable with QW3_FUSE_ADD=off
+    // to A/B against the separate-launch path.
+    DeviceStatus q8_0_matvec_add(DeviceTensor &accum,
+                                 const DeviceWeight &weight,
+                                 const DeviceTensor &x) override {
+        const bool fuse = []() {
+            const char *e = std::getenv("QW3_FUSE_ADD");
+            return !(e && std::string(e) == "off");
+        }();
+        if (!fuse) {
+            return DeviceBackend::q8_0_matvec_add(accum, weight, x);
+        }
+        const auto &w = as_weight(weight);
+        if (matvec_kernel_choice() != MatvecKernel::Ported || (w.cols % 32) != 0) {
+            return DeviceBackend::q8_0_matvec_add(accum, weight, x);
+        }
+        auto &o = as_tensor(accum);
+        const auto &input = as_tensor(x);
+        if (auto st = ensure_q8_1_scratch(/*batch=*/1, static_cast<uint32_t>(w.cols)); !st.ok) return st;
+        if (!ported::launch_quantize_q8_1(input.ptr, q8_1_scratch_,
+                                          /*batch=*/1, static_cast<uint32_t>(w.cols),
+                                          /*stride_x_row=*/static_cast<uint32_t>(w.cols),
+                                          exec_stream_)) {
+            return {false, "matvec_add quantize_q8_1 launch failed"};
+        }
+        if (!ported::launch_mmvq_q8_0_add(static_cast<const uint8_t *>(w.ptr),
+                                          q8_1_scratch_, o.ptr,
+                                          static_cast<uint32_t>(w.rows),
+                                          static_cast<uint32_t>(w.cols),
+                                          /*batch=*/1,
+                                          /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                                          exec_stream_)) {
+            return {false, "mmvq_q8_0_add launch failed"};
+        }
+        return launch_status("cuda q8_0_matvec_add");
+    }
+
+    // Fused FFN SwiGLU: out = silu(W_gate * x) * (W_up * x).
+    DeviceStatus q8_0_matvec_silu_mul(DeviceTensor &out,
+                                      const DeviceWeight &weight_gate,
+                                      const DeviceWeight &weight_up,
+                                      const DeviceTensor &x) override {
+        const bool fuse = []() {
+            const char *e = std::getenv("QW3_FUSE_SILU_MUL");
+            return !(e && std::string(e) == "off");
+        }();
+        if (!fuse) {
+            return DeviceBackend::q8_0_matvec_silu_mul(out, weight_gate, weight_up, x);
+        }
+        const auto &wg = as_weight(weight_gate);
+        const auto &wu = as_weight(weight_up);
+        if (wg.rows != wu.rows || wg.cols != wu.cols ||
+            matvec_kernel_choice() != MatvecKernel::Ported || (wg.cols % 32) != 0) {
+            return DeviceBackend::q8_0_matvec_silu_mul(out, weight_gate, weight_up, x);
+        }
+        auto &o = as_tensor(out);
+        const auto &input = as_tensor(x);
+        if (auto st = ensure_q8_1_scratch(/*batch=*/1, static_cast<uint32_t>(wg.cols)); !st.ok) return st;
+        if (!ported::launch_quantize_q8_1(input.ptr, q8_1_scratch_,
+                                          /*batch=*/1, static_cast<uint32_t>(wg.cols),
+                                          /*stride_x_row=*/static_cast<uint32_t>(wg.cols),
+                                          exec_stream_)) {
+            return {false, "silu_mul quantize_q8_1 launch failed"};
+        }
+        if (!ported::launch_mmvq_q8_0_silu_mul(
+                static_cast<const uint8_t *>(wg.ptr),
+                static_cast<const uint8_t *>(wu.ptr),
+                q8_1_scratch_, o.ptr,
+                static_cast<uint32_t>(wg.rows),
+                static_cast<uint32_t>(wg.cols),
+                /*batch=*/1,
+                /*stride_dst_row=*/static_cast<uint32_t>(wg.rows),
+                exec_stream_)) {
+            return {false, "mmvq_q8_0_silu_mul launch failed"};
+        }
+        return launch_status("cuda q8_0_matvec_silu_mul");
     }
 
     DeviceStatus q8_0_matmul(DeviceTensor &out,

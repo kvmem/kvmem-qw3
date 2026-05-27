@@ -276,8 +276,14 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id) {
                                                            cfg.ssm_conv_kernel,
                                                            eps));
             record(report, "layer." + std::to_string(il) + ".deltanet_single_token");
-            require_status(backend_.q8_0_matvec(*attn_out_, *layer.ssm_out, *core_));
-            record(report, "layer." + std::to_string(il) + ".recurrent_output");
+            // Fused matvec + residual add: h += W_out * core. Falls back to
+            // separate matvec + add inside the backend when the fused path
+            // is unavailable (e.g. legacy QW3_MATVEC=qw3).
+            if (auto st = backend_.q8_0_matvec_add(*h_, *layer.ssm_out, *core_); !st.ok) {
+                require_status(backend_.q8_0_matvec(*attn_out_, *layer.ssm_out, *core_));
+                require_status(backend_.add(*h_, *h_, *attn_out_));
+            }
+            record(report, "layer." + std::to_string(il) + ".recurrent_output_add");
         } else {
             if (position_ >= kv_ctx_size_) {
                 throw std::runtime_error("KV cache full: increase --ctx (current=" +
@@ -328,23 +334,33 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id) {
                                                      standard_n_heads, standard_head_dim));
             record(report, "layer." + std::to_string(il) + ".attention_sdpa");
 
-            require_status(backend_.q8_0_matvec(*attn_out_, *layer.attn_output, *mid_));
+            // Fused matvec + residual add: h += W_out * mid.
+            if (auto st = backend_.q8_0_matvec_add(*h_, *layer.attn_output, *mid_); !st.ok) {
+                require_status(backend_.q8_0_matvec(*attn_out_, *layer.attn_output, *mid_));
+                require_status(backend_.add(*h_, *h_, *attn_out_));
+            }
         }
-
-        require_status(backend_.add(*h_, *h_, *attn_out_));
         record(report, "layer." + std::to_string(il) + ".attn_residual");
 
         require_status(backend_.rms_norm(*norm_, *h_, *layer.ffn_norm, eps));
         record(report, "layer." + std::to_string(il) + ".ffn_norm");
 
-        {
+        // Fused FFN SwiGLU: ffn_mid = silu(W_gate * norm) * (W_up * norm)
+        // in a single matvec kernel. Falls back to the two-weight matvec +
+        // silu_mul pipeline if the backend doesn't implement the fused op.
+        if (auto st = backend_.q8_0_matvec_silu_mul(*ffn_mid_, *layer.ffn_gate,
+                                                    *layer.ffn_up, *norm_);
+            !st.ok) {
             DeviceTensor *outs[2] = {ffn_gate_.get(), ffn_up_.get()};
             const DeviceWeight *ws[2] = {layer.ffn_gate, layer.ffn_up};
             require_status(backend_.q8_0_matvec_fanout(outs, ws, 2, *norm_));
+            require_status(backend_.silu_mul(*ffn_mid_, *ffn_gate_, *ffn_up_));
         }
-        require_status(backend_.silu_mul(*ffn_mid_, *ffn_gate_, *ffn_up_));
-        require_status(backend_.q8_0_matvec(*ffn_out_, *layer.ffn_down, *ffn_mid_));
-        require_status(backend_.add(*h_, *h_, *ffn_out_));
+        // Fused matvec + residual add: h += W_down * ffn_mid.
+        if (auto st = backend_.q8_0_matvec_add(*h_, *layer.ffn_down, *ffn_mid_); !st.ok) {
+            require_status(backend_.q8_0_matvec(*ffn_out_, *layer.ffn_down, *ffn_mid_));
+            require_status(backend_.add(*h_, *h_, *ffn_out_));
+        }
         record(report, "layer." + std::to_string(il) + ".ffn");
     }
 

@@ -89,12 +89,13 @@ struct alignas(4) block_q8_1 {
 };
 static_assert(sizeof(block_q8_1) == 36, "unexpected block_q8_1 size");
 
-// PTX wrapper: m16n8k32.row.col.s32.s8.s8.s32.
+// PTX wrapper: m16n8k32.row.col.s32.s8.s8.s32. Non-volatile so ptxas can
+// schedule MMAs and reorder around loads for ILP (matches llama.cpp).
 __device__ __forceinline__ void mma_m16n8k32_s8s8s32(
         int &c0, int &c1, int &c2, int &c3,
         unsigned a0, unsigned a1, unsigned a2, unsigned a3,
         unsigned b0, unsigned b1) {
-    asm volatile(
+    asm(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
@@ -754,6 +755,250 @@ __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_v4(
     }
 }
 
+// MMQ v5 — port of llama.cpp's mul_mat_q for Q8_0 (mmq.cuh:1217-1293,
+// NVIDIA non-AMD branch). We adopt llama.cpp's struct-based tile<> and
+// load_ldmatrix/mma helpers so ptxas treats fragments as register tuples,
+// keeping the 32 A registers + 16 dA + 64 sum within the 255-reg/thread
+// budget. Their q8_0 mmq_x=128 instantiation hits only 8-24 byte spill;
+// our v4 hit 160-208. The struct-of-arrays storage is the missing piece.
+
+namespace v5_tile {
+
+template <int I_, int J_> struct tile_int4 {
+    static constexpr int I = I_;
+    static constexpr int J = J_;
+    int x[4];
+};
+template <int I_, int J_> struct tile_int2 {
+    static constexpr int I = I_;
+    static constexpr int J = J_;
+    int x[2];
+};
+
+using tile_A = tile_int4<16, 8>;       // ne = I*J/32 = 4
+using tile_B = tile_int2< 8, 8>;       // ne = I*J/32 = 2
+using tile_C = tile_int4<16, 8>;       // ne = I*J/32 = 4
+
+// tile_A 16x8 ldmatrix.x4 — pass the raw shared pointer through "l" and let
+// the assembler emit the implicit cvta. Mirrors mma.cuh:830-838.
+__device__ __forceinline__ void load_ldmatrix_A(tile_A &t, const int *xs0, int stride) {
+    int *xi = t.x;
+    const int *xs = xs0 + (threadIdx.x % 16) * stride + (threadIdx.x / 16) * 4;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+        : "l"(xs));
+}
+
+// tile_B 8x8 load_generic — direct shmem reads of the 2 ints per lane.
+// Comment in llama.cpp mmq.cuh:1268 notes load_generic outperforms
+// load_ldmatrix for B at this geometry.
+__device__ __forceinline__ void load_generic_B(tile_B &t, const int *xs0, int stride) {
+    const int lane = static_cast<int>(threadIdx.x);
+    const int i_ = lane / 4;
+    const int j0_ = (lane % 4);    // get_j(0) = (lane%4)*2 + 0 -> NO, see below
+    // tile<8,8,int>::get_j(l) = (l*4) + (lane%4)
+    t.x[0] = xs0[i_ * stride + 0 * 4 + j0_];
+    t.x[1] = xs0[i_ * stride + 1 * 4 + j0_];
+}
+
+// MMA m16n8k32.s8.s8.s32: C += A * B. Non-volatile asm so ptxas can
+// schedule across iterations (matches llama.cpp/mma.cuh:946).
+__device__ __forceinline__ void mma(tile_C &C, const tile_A &A, const tile_B &B) {
+    int *c = C.x;
+    asm(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(A.x[0]), "r"(A.x[1]), "r"(A.x[2]), "r"(A.x[3]),
+          "r"(B.x[0]), "r"(B.x[1]));
+}
+
+}  // namespace v5_tile
+
+template <int mmq_x>
+__device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_v5(
+        const int * __restrict__ x_tile,
+        const int * __restrict__ y_tile_in,
+        float     * __restrict__ sum,
+        int                       k00)
+{
+    constexpr int granularity   = (mmq_x >= 48) ? 16 : 8;
+    constexpr int rows_per_warp = 2 * granularity;
+    constexpr int tile_C_I      = v5_tile::tile_C::I;   // 16
+    constexpr int tile_C_J      = v5_tile::tile_C::J;   // 8
+    constexpr int tile_C_ne     = 4;                    // tile_C ne
+    constexpr int ntx           = rows_per_warp / tile_C_I;
+    constexpr int K_steps       = MMQ_TILE_NE_K / QI8_0;
+
+    const int lane    = static_cast<int>(threadIdx.x);
+    const int warp_id = static_cast<int>(threadIdx.y);
+    const int i0      = (warp_id / ntx) * rows_per_warp;
+    const int * y_tile = y_tile_in + (warp_id % ntx) * (tile_C_J * MMQ_TILE_Y_K);
+
+    const int   * x_qs = x_tile;
+    const float * x_df = reinterpret_cast<const float *>(x_qs + 2 * MMQ_TILE_NE_K);
+    const int   * y_qs = y_tile + 4;
+    const float * y_df = reinterpret_cast<const float *>(y_tile);
+
+    // Pre-load A fragments (struct-typed) and dA scales. Lifetime spans the
+    // full j0 loop; the struct storage helps ptxas register-allocate them.
+    v5_tile::tile_A A[ntx][K_steps];
+    float           dA[ntx][tile_C_ne / 2][K_steps];
+
+    #pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+        #pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            const int k0 = k00 + k01;
+            const int *xs_base = x_qs + (i0 + n * tile_C_I) * MMQ_MMA_TILE_X_K_Q8_0 + k0;
+            v5_tile::load_ldmatrix_A(A[n][k01 / QI8_0], xs_base, MMQ_MMA_TILE_X_K_Q8_0);
+        }
+    }
+    #pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+        #pragma unroll
+        for (int l = 0; l < tile_C_ne / 2; ++l) {
+            const int i_local = i0 + n * tile_C_I + l * 8 + (lane >> 2);
+            #pragma unroll
+            for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+                const int k0 = k00 + k01;
+                dA[n][l][k01 / QI8_0] = x_df[i_local * MMQ_MMA_TILE_X_K_Q8_0 + k0 / QI8_0];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C_J) {
+        #pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            v5_tile::tile_B B;
+            v5_tile::load_generic_B(B, y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+            float dB[tile_C_ne / 2];
+            #pragma unroll
+            for (int l = 0; l < tile_C_ne / 2; ++l) {
+                const int j_local = j0 + (lane & 3) * 2 + l;
+                dB[l] = y_df[j_local * MMQ_TILE_Y_K + k01 / QI8_1];
+            }
+
+            #pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                v5_tile::tile_C C;
+                C.x[0] = C.x[1] = C.x[2] = C.x[3] = 0;
+                v5_tile::mma(C, A[n][k01 / QI8_0], B);
+                #pragma unroll
+                for (int l = 0; l < tile_C_ne; ++l) {
+                    sum[(j0 / tile_C_J + n) * tile_C_ne + l]
+                        += static_cast<float>(C.x[l]) * dA[n][l / 2][k01 / QI8_0] * dB[l % 2];
+                }
+            }
+        }
+    }
+}
+
+// v5 outer kernel. Same outer structure as v4 but uses tile<>-based
+// fragments and helpers ported from llama.cpp/mmq.cuh.
+template <int mmq_x, bool need_check>
+__launch_bounds__(MMQ_THREADS, 1)
+__global__ void mmq_q8_0_v5_kernel(
+        const uint8_t       * __restrict__ wq,
+        const int           * __restrict__ y,
+        float               * __restrict__ dst,
+        uint32_t              rows,
+        uint32_t              cols,
+        uint32_t              batch,
+        uint32_t              ncols_y,
+        uint32_t              stride_dst_row)
+{
+    extern __shared__ int v5_smem[];
+    int * tile_x = v5_smem;
+    int * tile_y = tile_x + MMQ_Y * MMQ_MMA_TILE_X_K_Q8_0;
+
+    const int row0  = static_cast<int>(blockIdx.x) * MMQ_Y;
+    const int col00 = static_cast<int>(blockIdx.y) * mmq_x;
+    const int n_blocks = static_cast<int>(cols) / MMQ_QK;
+    const int stride_in_blocks = n_blocks;
+
+    constexpr int sum_size = mmq_x * MMQ_Y / (MMQ_NWARPS * V2_WARP);
+    float sum[sum_size];
+    #pragma unroll
+    for (int s = 0; s < sum_size; ++s) sum[s] = 0.0f;
+
+    constexpr int blocks_per_iter = MMQ_ITER_K / MMQ_QK;       // 8
+    constexpr int sz_y_block_int  = sizeof(block_q8_1_mmq_t) / sizeof(int);  // 36
+
+    auto load_y_half = [&](int sb_index) {
+        const int total = mmq_x * MMQ_TILE_Y_K;
+        const int tid = static_cast<int>(threadIdx.y) * V2_WARP + static_cast<int>(threadIdx.x);
+        #pragma unroll
+        for (int l0 = 0; l0 < total; l0 += MMQ_THREADS) {
+            const int l = l0 + tid;
+            if (l >= total) break;
+            const int j_in_tile = l / MMQ_TILE_Y_K;
+            const int k_in_block = l % MMQ_TILE_Y_K;
+            const int j_global = col00 + j_in_tile;
+            int v = 0;
+            const bool in_range = need_check ? (j_global < static_cast<int>(batch)) : true;
+            if (in_range) {
+                const int64_t int_idx =
+                    (static_cast<int64_t>(sb_index) * ncols_y + j_global) * sz_y_block_int
+                    + k_in_block;
+                v = y[int_idx];
+            }
+            tile_y[l] = v;
+        }
+    };
+
+    for (int kb0 = 0; kb0 < n_blocks; kb0 += blocks_per_iter) {
+        load_tiles_q8_0_v4<need_check>(
+                wq, tile_x, kb0, row0, static_cast<int>(rows), stride_in_blocks);
+
+        const int sb0 = kb0 / 4;
+
+        load_y_half(sb0);
+        __syncthreads();
+        vec_dot_q8_0_q8_1_mma_v5<mmq_x>(tile_x, tile_y, sum, /*k00=*/0);
+        __syncthreads();
+
+        load_y_half(sb0 + 1);
+        __syncthreads();
+        vec_dot_q8_0_q8_1_mma_v5<mmq_x>(tile_x, tile_y, sum, /*k00=*/MMQ_TILE_NE_K);
+        __syncthreads();
+    }
+
+    // Writeback identical to v4.
+    constexpr int granularity   = (mmq_x >= 48) ? 16 : 8;
+    constexpr int rows_per_warp = 2 * granularity;
+    constexpr int tile_C_I      = 16;
+    constexpr int tile_C_J      = 8;
+    constexpr int tile_C_ne     = 4;
+    constexpr int ntx           = rows_per_warp / tile_C_I;
+
+    const int lane    = static_cast<int>(threadIdx.x);
+    const int warp_id = static_cast<int>(threadIdx.y);
+    const int i0_o    = (warp_id / ntx) * (ntx * tile_C_I);
+
+    #pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C_J) {
+        #pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            #pragma unroll
+            for (int l = 0; l < tile_C_ne; ++l) {
+                const int j_local = j0 + (warp_id % ntx) * tile_C_J + (lane & 3) * 2 + (l % 2);
+                const int j_global = col00 + j_local;
+                if (need_check && j_global >= static_cast<int>(batch)) continue;
+                if (j_local >= mmq_x) continue;
+                const int i_local  = i0_o + n * tile_C_I + (l / 2) * 8 + (lane >> 2);
+                const int i_global = row0 + i_local;
+                if (need_check && i_global >= static_cast<int>(rows)) continue;
+                if (i_local >= MMQ_Y) continue;
+                dst[static_cast<size_t>(j_global) * stride_dst_row + i_global]
+                    = sum[(j0 / tile_C_J + n) * tile_C_ne + l];
+            }
+        }
+    }
+}
+
 // v4 outer kernel. Grid: (rows/MMQ_Y, batch/MMQ_X). Block: (32, 8) = 256.
 template <int mmq_x, bool need_check>
 __launch_bounds__(MMQ_THREADS, 1)
@@ -987,11 +1232,46 @@ bool launch_mmq_q8_0(
         if (!e) return 2;
         if (e[0] == '3') return 3;
         if (e[0] == '4') return 4;
+        if (e[0] == '5') return 5;
         return 2;
     }();
 
+    // v5 with smaller mmq_x — halves sum[] register pressure to eliminate
+    // the 160-byte spill v4 had, and increases #CTAs for better SM
+    // occupancy on Blackwell (more CTAs / less tail wave waste).
+    if (mmq_version == 5 &&
+        cols % MMQ_ITER_K == 0 &&
+        rows >= MMQ_Y && batch >= 64) {
+        // Choose mmq_x to match shape; 64 minimises spills and tail-wave
+        // waste for typical Qwen prefill batches (≤256 → many CTAs,
+        // ≥256 → fits multiple tiles into a wave).
+        constexpr int V5_X = 64;
+        const uint32_t row_tiles = (rows  + MMQ_Y - 1) / MMQ_Y;
+        const uint32_t col_tiles = (batch + V5_X  - 1) / V5_X;
+        const dim3 grid(row_tiles, col_tiles, 1);
+        const dim3 block(V2_WARP, MMQ_NWARPS, 1);
+        const bool needs_check = (rows  % MMQ_Y != 0) || (batch % V5_X != 0);
+        const size_t shmem_x_bytes = static_cast<size_t>(MMQ_Y) * MMQ_MMA_TILE_X_K_Q8_0 * sizeof(int);
+        const size_t shmem_y_bytes = static_cast<size_t>(V5_X)  * MMQ_TILE_Y_K          * sizeof(int);
+        const size_t shmem_bytes   = shmem_x_bytes + shmem_y_bytes;
+        cudaFuncSetAttribute(mmq_q8_0_v5_kernel<V5_X, false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(shmem_bytes));
+        cudaFuncSetAttribute(mmq_q8_0_v5_kernel<V5_X, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(shmem_bytes));
+        const int *y_int = reinterpret_cast<const int *>(y_q8_1);
+        if (needs_check) {
+            mmq_q8_0_v5_kernel<V5_X, true><<<grid, block, shmem_bytes, stream>>>(
+                weight, y_int, dst, rows, cols, batch, batch, stride_dst_row);
+        } else {
+            mmq_q8_0_v5_kernel<V5_X, false><<<grid, block, shmem_bytes, stream>>>(
+                weight, y_int, dst, rows, cols, batch, batch, stride_dst_row);
+        }
+        return true;
+    }
+
     // v4 path: 8-warp 128x128 tile, cols a multiple of 256 required.
-    // Falls through to v2/v3 for shapes that don't fit.
     if (mmq_version == 4 &&
         cols % MMQ_ITER_K == 0 &&
         rows >= MMQ_Y && batch >= MMQ_X) {
@@ -999,10 +1279,9 @@ bool launch_mmq_q8_0(
         const uint32_t col_tiles = (batch + MMQ_X - 1) / MMQ_X;
         const dim3 grid(row_tiles, col_tiles, 1);
         const dim3 block(V2_WARP, MMQ_NWARPS, 1);
-        const bool needs_check = (rows  % MMQ_Y != 0) ||
-                                 (batch % MMQ_X != 0);
-        const size_t shmem_x_bytes = static_cast<size_t>(MMQ_Y)  * MMQ_MMA_TILE_X_K_Q8_0 * sizeof(int);
-        const size_t shmem_y_bytes = static_cast<size_t>(MMQ_X)  * MMQ_TILE_Y_K          * sizeof(int);
+        const bool needs_check = (rows  % MMQ_Y != 0) || (batch % MMQ_X != 0);
+        const size_t shmem_x_bytes = static_cast<size_t>(MMQ_Y) * MMQ_MMA_TILE_X_K_Q8_0 * sizeof(int);
+        const size_t shmem_y_bytes = static_cast<size_t>(MMQ_X) * MMQ_TILE_Y_K          * sizeof(int);
         const size_t shmem_bytes   = shmem_x_bytes + shmem_y_bytes;
         cudaFuncSetAttribute(mmq_q8_0_v4_kernel<MMQ_X, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,

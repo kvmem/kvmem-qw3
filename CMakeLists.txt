@@ -50,6 +50,10 @@ if(QW3_ENABLE_CUDA)
     target_link_libraries(qw3_core PUBLIC CUDA::cudart CUDA::cublas)
     set_property(TARGET qw3_core PROPERTY CUDA_STANDARD 17)
     set_property(TARGET qw3_core PROPERTY CUDA_STANDARD_REQUIRED ON)
+    if(QW3_CUDA_VERBOSE)
+        target_compile_options(qw3_core PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>)
+    endif()
 endif()
 
 add_executable(qw3 src/qw3_cli.cpp)

@@ -7,3 +7,5 @@ ds4-main/*
 *.a
 *.dylib
 *.so
+
+*.gguf
