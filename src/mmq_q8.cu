@@ -55,6 +55,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdlib>
 
 #include "cuda_helpers.cuh"
 
@@ -99,6 +100,44 @@ __device__ __forceinline__ void mma_m16n8k32_s8s8s32(
         : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
           "r"(b0), "r"(b1));
+}
+
+// ldmatrix.x4: load 16x8 .b16 tile from shmem into 4 .b32 regs per lane.
+// For our int8 use this is 16 rows x 8 ints (= 32 int8 K-elements), the A
+// operand of m16n8k32. ptr_int is in units of int (4 bytes); stride_int is
+// the row stride in ints. Lane addressing matches the PTX spec:
+//   lane 0..15 -> row=lane,    col=0
+//   lane 16..31 -> row=lane-16, col=4
+__device__ __forceinline__ void ldmatrix_x4(
+        unsigned &a0, unsigned &a1, unsigned &a2, unsigned &a3,
+        const int *ptr_int, int stride_int) {
+    const int lane = threadIdx.x;
+    const int *xs = ptr_int + (lane & 15) * stride_int + (lane >> 4) * 4;
+    unsigned smem = __cvta_generic_to_shared(xs);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+        : "r"(smem));
+}
+
+// ldmatrix.x2: load 8x8 .b16 tile from shmem into 2 .b32 regs per lane.
+// For our int8 use this is 8 rows x 8 ints (= 32 int8 K-elements x 8 cols),
+// the B operand of m16n8k32 (col-major from the K dimension's perspective).
+// Lane addressing per PTX:
+//   lanes 0..7  -> row=lane,    col=0
+//   lanes 8..15 -> row=lane-8,  col=4
+//   lanes 16..23 -> row=lane-16, col=0   (duplicates 0..7)
+//   lanes 24..31 -> row=lane-24, col=4   (duplicates 8..15)
+__device__ __forceinline__ void ldmatrix_x2(
+        unsigned &b0, unsigned &b1,
+        const int *ptr_int, int stride_int) {
+    const int lane = threadIdx.x;
+    const int *xs = ptr_int + (lane & 7) * stride_int + ((lane >> 3) & 1) * 4;
+    unsigned smem = __cvta_generic_to_shared(xs);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.b16 {%0,%1}, [%2];"
+        : "=r"(b0), "=r"(b1)
+        : "r"(smem));
 }
 
 // Load one int (4 int8s) from a 2-byte-aligned byte stream. Q8_0 weight
@@ -265,6 +304,196 @@ __global__ void mmq_q8_0_v2_kernel(
     }
 }
 
+// v3: same shape as v2 (4-warp 64x128 tile) but:
+//   - Replaces per-lane shmem reads with ldmatrix.x4 (A) + ldmatrix.x2 (B).
+//   - Uses a 16-byte-aligned shmem stride (12 ints/row = 48 bytes) so each
+//     lane's ldmatrix address is 16-byte aligned. The 4 pad ints/row also
+//     stagger banks to reduce conflicts on the K=4 ints offset access.
+//
+// Result on RTX Pro 6000 Blackwell, Qwen3.6-27B prefill (parity-correct):
+//   1K: v2 2132 / v3 1894 tok/s   (v3 -11%)
+//   2K: v2 2026 / v3 1800 tok/s   (v3 -11%)
+//   4K: v2 1678 / v3 1544 tok/s   (v3  -8%)
+// vs HGEMM 2828/2755/2199 — both still well behind cuBLAS.
+//
+// Why v3 regresses: ldmatrix replaces per-lane shmem reads, but those reads
+// were never the bottleneck. The real cost is the gmem->shmem weight fill
+// per K block, which both v2 and v3 perform with synchronous global loads.
+// v3 loses on two fronts:
+//   - 48-byte row stride vs v2's 36-byte stride inflates shmem footprint.
+//   - ldmatrix.x2 only uses 16 of 32 lanes as address providers (B fragment
+//     is 8x8, addresses duplicated across the upper half-warp).
+//
+// v4 path: cp.async double-buffered shmem fills to overlap the next K
+// block's gmem read with the current MMA. Requires repacking Q8_0 weights
+// to a 16-byte-aligned SoA layout (drop the 2-byte FP16 d-prefix, store
+// qs and d in separate tables) so cp.async's 16-byte transfer is usable.
+// That's a multi-day effort; v3 is kept as opt-in (QW3_MMQ_VERSION=3) but
+// default remains v2.
+// Note: cp.async double-buffering not viable here because Q8_0 weight rows
+// aren't 16-byte aligned (FP16 d-prefix offsets the int8 qs to byte 2).
+// Repacking weights to drop that prefix is the v4 path.
+static constexpr int V3_KSTRIDE = 12;  // ints per row in shmem (8 data + 4 pad)
+static constexpr int V3_NDATA   = 8;   // ints of actual data per row
+
+template <bool need_check>
+__launch_bounds__(V2_THREADS, 2)
+__global__ void mmq_q8_0_v3_kernel(
+        const uint8_t   * __restrict__ wq,
+        const block_q8_1 * __restrict__ ya,
+        float           * __restrict__ dst,
+        uint32_t          rows,
+        uint32_t          cols,
+        uint32_t          batch,
+        uint32_t          stride_y_row,
+        uint32_t          stride_dst_row)
+{
+    __shared__ __align__(16) int   W_qs[V2_M_PER_CTA * V3_KSTRIDE];
+    __shared__              float  W_d [V2_M_PER_CTA];
+    __shared__ __align__(16) int   Y_qs[V2_N_PER_CTA * V3_KSTRIDE];
+    __shared__              float  Y_d [V2_N_PER_CTA];
+
+    const int n_blocks = static_cast<int>(cols / MMQ_QK);
+    const int row0  = static_cast<int>(blockIdx.x) * V2_M_PER_CTA;
+    const int col00 = static_cast<int>(blockIdx.y) * V2_N_PER_CTA;
+
+    const int warp_id = static_cast<int>(threadIdx.y);    // 0..3
+    const int lane    = static_cast<int>(threadIdx.x);    // 0..31
+    const int tid     = warp_id * V2_WARP + lane;          // 0..127
+
+    // Per-warp accumulators: 16 N-tiles x 4 outputs each.
+    float acc[V2_NW][4];
+    #pragma unroll
+    for (int n = 0; n < V2_NW; ++n) {
+        acc[n][0] = 0.0f; acc[n][1] = 0.0f;
+        acc[n][2] = 0.0f; acc[n][3] = 0.0f;
+    }
+
+    for (int kb = 0; kb < n_blocks; ++kb) {
+        // -------- Cooperative load of W tile (64 rows x 8 ints) --------
+        // 512 ints across 128 threads -> 4 passes, 1 int/thread/pass.
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int flat = p * V2_THREADS + tid;          // 0..511
+            const int rl   = flat >> 3;                     // 0..63 (which row)
+            const int kqsx = flat & 7;                      // 0..7  (which int in row)
+            const int row  = row0 + rl;
+            unsigned v = 0;
+            const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
+            if (in_range) {
+                const uint8_t *wblk = wq + (static_cast<size_t>(row) * n_blocks + kb) * 34;
+                v = load_int_align2(wblk + 2, 4 * kqsx);
+            }
+            W_qs[rl * V3_KSTRIDE + kqsx] = static_cast<int>(v);
+        }
+        // W_d: 64 floats; first 64 threads each load one.
+        if (tid < V2_M_PER_CTA) {
+            const int row = row0 + tid;
+            float d = 0.0f;
+            const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
+            if (in_range) {
+                const uint8_t *wblk = wq + (static_cast<size_t>(row) * n_blocks + kb) * 34;
+                d = __half2float(*reinterpret_cast<const half *>(wblk));
+            }
+            W_d[tid] = d;
+        }
+
+        // -------- Cooperative load of Y tile (128 rows x 8 ints) --------
+        // 1024 ints across 128 threads -> 8 passes.
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int flat = p * V2_THREADS + tid;
+            const int bl   = flat >> 3;                     // 0..127
+            const int kqsx = flat & 7;                      // 0..7
+            const int batch_idx = col00 + bl;
+            unsigned v = 0;
+            const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
+            if (in_range) {
+                const block_q8_1 *yblk = ya + static_cast<size_t>(batch_idx) * stride_y_row + kb;
+                v = *reinterpret_cast<const unsigned *>(&yblk->qs[4 * kqsx]);
+            }
+            Y_qs[bl * V3_KSTRIDE + kqsx] = static_cast<int>(v);
+        }
+        // Y_d: 128 floats, one per thread.
+        {
+            const int batch_idx = col00 + tid;
+            float d = 0.0f;
+            const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
+            if (in_range) {
+                const block_q8_1 *yblk = ya + static_cast<size_t>(batch_idx) * stride_y_row + kb;
+                d = __low2float(yblk->ds);
+            }
+            Y_d[tid] = d;
+        }
+
+        __syncthreads();
+
+        // -------- Compute --------
+        // A fragment (16 rows x 32 K = 16 rows x 8 ints): 1 ldmatrix.x4 / warp.
+        //   xs = &W_qs[16*warp_id + (lane%16)][(lane/16)*4]
+        unsigned a0, a1, a2, a3;
+        {
+            const int *base = &W_qs[(warp_id * V1_M_TILE) * V3_KSTRIDE];
+            ldmatrix_x4(a0, a1, a2, a3, base, V3_KSTRIDE);
+        }
+
+        // d_w_top/d_w_bot: per-lane-row scales.
+        const int gid    = lane >> 2;     // 0..7 (row within 8)
+        const int tid4   = lane & 3;      // 0..3 (col within 4)
+        const float d_w_top = W_d[warp_id * V1_M_TILE + gid];
+        const float d_w_bot = W_d[warp_id * V1_M_TILE + gid + 8];
+
+        #pragma unroll
+        for (int n = 0; n < V2_NW; ++n) {
+            const int N0 = n * 8;
+            // B fragment (32 K x 8 cols = 8 rows x 8 ints): 1 ldmatrix.x2.
+            //   xs = &Y_qs[N0 + (lane%8)][((lane/8) & 1) * 4]
+            unsigned b0, b1;
+            {
+                const int *base = &Y_qs[N0 * V3_KSTRIDE];
+                ldmatrix_x2(b0, b1, base, V3_KSTRIDE);
+            }
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            mma_m16n8k32_s8s8s32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+
+            // d_y for batch col (N0+2*tid4) lives in lane (gid=2*tid4, *) -> src = 8*tid4.
+            const float d_y_my    = Y_d[N0 + gid];
+            const float d_y_left  = __shfl_sync(0xffffffffu, d_y_my, 8 * tid4,     V2_WARP);
+            const float d_y_right = __shfl_sync(0xffffffffu, d_y_my, 8 * tid4 + 4, V2_WARP);
+
+            acc[n][0] += d_w_top * d_y_left  * static_cast<float>(c0);
+            acc[n][1] += d_w_top * d_y_right * static_cast<float>(c1);
+            acc[n][2] += d_w_bot * d_y_left  * static_cast<float>(c2);
+            acc[n][3] += d_w_bot * d_y_right * static_cast<float>(c3);
+        }
+
+        __syncthreads();
+    }
+
+    // -------- Write back (same as v2) --------
+    const int gid_o  = lane >> 2;
+    const int tid4_o = lane & 3;
+    const int row_top = row0 + warp_id * V1_M_TILE + gid_o;
+    const int row_bot = row_top + 8;
+    const bool top_in = need_check ? (row_top < static_cast<int>(rows)) : true;
+    const bool bot_in = need_check ? (row_bot < static_cast<int>(rows)) : true;
+    #pragma unroll
+    for (int n = 0; n < V2_NW; ++n) {
+        const int col_left  = col00 + n * 8 + 2 * tid4_o;
+        const int col_right = col_left + 1;
+        const bool left_in  = need_check ? (col_left  < static_cast<int>(batch)) : true;
+        const bool right_in = need_check ? (col_right < static_cast<int>(batch)) : true;
+        if (left_in) {
+            if (top_in) dst[static_cast<size_t>(col_left)  * stride_dst_row + row_top] = acc[n][0];
+            if (bot_in) dst[static_cast<size_t>(col_left)  * stride_dst_row + row_bot] = acc[n][2];
+        }
+        if (right_in) {
+            if (top_in) dst[static_cast<size_t>(col_right) * stride_dst_row + row_top] = acc[n][1];
+            if (bot_in) dst[static_cast<size_t>(col_right) * stride_dst_row + row_bot] = acc[n][3];
+        }
+    }
+}
+
 // v1 single-warp kernel (16x32 per CTA). Kept as a fallback for shapes that
 // don't reach the v2 64x64 tile granularity. Identical to the previous-
 // commit kernel but folded into this file's anonymous namespace.
@@ -373,7 +602,17 @@ bool launch_mmq_q8_0(
 
     const uint32_t stride_y_row = cols / MMQ_QK;
 
-    // v2 path: 4-warp 64x64 tile, kicks in whenever the problem is at least
+    // Version select. v2 = 4-warp 64x128 with per-lane shmem reads (default).
+    // v3 = same shape but ldmatrix.x4/x2 for fragment loads. Cached on first
+    // call; flip via QW3_MMQ_VERSION={2,3}.
+    static const int mmq_version = []() {
+        const char *e = std::getenv("QW3_MMQ_VERSION");
+        if (!e) return 2;
+        if (e[0] == '3') return 3;
+        return 2;
+    }();
+
+    // v2/v3 path: 4-warp 64x128 tile, kicks in whenever the problem is at least
     // one tile in each dimension. need_check handles the trailing tile.
     if (rows >= V2_M_PER_CTA && batch >= V2_N_PER_CTA) {
         const uint32_t row_tiles = (rows  + V2_M_PER_CTA - 1) / V2_M_PER_CTA;
@@ -382,14 +621,26 @@ bool launch_mmq_q8_0(
         const dim3 block(V2_WARP, V2_NWARPS, 1);
         const bool needs_check = (rows  % V2_M_PER_CTA != 0) ||
                                  (batch % V2_N_PER_CTA != 0);
-        if (needs_check) {
-            mmq_q8_0_v2_kernel<true><<<grid, block, 0, stream>>>(
-                weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
-                rows, cols, batch, stride_y_row, stride_dst_row);
+        if (mmq_version == 3) {
+            if (needs_check) {
+                mmq_q8_0_v3_kernel<true><<<grid, block, 0, stream>>>(
+                    weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
+                    rows, cols, batch, stride_y_row, stride_dst_row);
+            } else {
+                mmq_q8_0_v3_kernel<false><<<grid, block, 0, stream>>>(
+                    weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
+                    rows, cols, batch, stride_y_row, stride_dst_row);
+            }
         } else {
-            mmq_q8_0_v2_kernel<false><<<grid, block, 0, stream>>>(
-                weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
-                rows, cols, batch, stride_y_row, stride_dst_row);
+            if (needs_check) {
+                mmq_q8_0_v2_kernel<true><<<grid, block, 0, stream>>>(
+                    weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
+                    rows, cols, batch, stride_y_row, stride_dst_row);
+            } else {
+                mmq_q8_0_v2_kernel<false><<<grid, block, 0, stream>>>(
+                    weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
+                    rows, cols, batch, stride_y_row, stride_dst_row);
+            }
         }
         return true;
     }
