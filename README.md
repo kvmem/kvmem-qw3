@@ -141,16 +141,22 @@ means attacking matvec, not attention. So the next gains will come from:
    FFN gate+up) and reuses the staging buffer. Decode +2.5%; prefill
    path unchanged.
 
-4. **CUDA graph capture of the decode loop.** *(Phase A done)* The exec
-   stream and device-side argmax are now in place — every kernel and
-   the cuBLAS handle run on a single non-blocking stream, and argmax
-   no longer pulls 152K logits back to the host. Capture itself is
-   pending: the position counter that drops into `kv_append`, RoPE,
-   and `attention_decode` would freeze at capture time, so capture
-   needs either device-side pos counters or per-token
-   `cudaGraphExecUpdate`. llama.cpp uses the latter and that path
-   is the next step. Estimated headroom from the kernel-time vs
-   wall-time breakdown is ~5–7%.
+4. **CUDA graph capture of the decode loop.** *(Done)* Every
+   `forward_one_token` after a one-token warmup is captured into a
+   `cudaGraph_t` and replayed via `cudaGraphLaunch`. The position
+   counter that drops into `kv_append` / RoPE / `attention_decode`
+   is handled by re-recording each token and patching the exec via
+   `cudaGraphExecUpdate` (re-instantiating on
+   `cudaErrorGraphExecUpdateFailure`), the same shape llama.cpp
+   uses. The argmax tail is split into `argmax_launch` (kernel +
+   async D2H, recorded into the graph) and `argmax_collect` (sync +
+   read pinned mirror, after replay). Yield: +3.3% decode at
+   2453-token prompt (38.34 → 39.59 tok/s, n_decode=256). Profile
+   afterwards shows decode is no longer host-launch-bound:
+   `mul_mat_vec_q8_0_kernel<1>` is now **76.9% of decode GPU time**
+   (38 µs median × 13 420 calls), so the next decode lever is the
+   matvec kernel itself, not launch overhead. Gated by `QW3_GRAPH=off`
+   for A/B.
 
 5. **DeltaNet recurrent fusion.** 3.4% on long prompts; the four kernels
    per layer (conv, l2, deltanet, norm-gate) are each light but sequential.
@@ -405,11 +411,11 @@ description.
 See **Bottlenecks and roadmap** above for the prioritized list backed by
 `nsys` profiling. The short version:
 
-- **Decode plateau (~7–8 tok/s behind llama.cpp, flat across context).**
-  The bottleneck is now `mul_mat_vec_q8_0` (46% of GPU time, ~489 calls
-  per decode token). CUDA graph capture and persistent Q8_1 activation
-  reuse are the next levers; F16 KV + split-K already closed the
-  long-context cliff.
+- **Decode plateau (~6 tok/s behind llama.cpp, flat across context).**
+  After graph capture, decode is GPU-bound on `mul_mat_vec_q8_0_kernel<1>`
+  (76.9% of decode GPU time). The next lever is the matvec kernel
+  itself — llama.cpp's `mul_mat_vec_q` does cooperative multi-row
+  warps with vectorized DP4A; matching that shape is the open work.
 - **Prefill: −500 tok/s at 1K–2K, widening to −1000 tok/s at 4K.** Two
   separate gaps: HGEMM via FP16 mirror loses to direct INT8 MMA on
   every prompt length (closing this lifts the whole curve), and at
