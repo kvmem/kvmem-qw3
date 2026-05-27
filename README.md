@@ -30,23 +30,24 @@ python3 scripts/long_prompt_sweep.py --prompt-tokens "512 1024 2048 4096" \
 
 | Prompt tokens | qw3 prefill | llama prefill | prefill Δ | qw3 decode | llama decode | decode Δ |
 |---:|---:|---:|---:|---:|---:|---:|
-|  556 | 1848.4 tok/s | 2751.6 tok/s | **−903.2 tok/s** | 38.6 tok/s | 45.1 tok/s | **−6.5 tok/s** |
-| 1098 | 2503.2 tok/s | 3303.4 tok/s | **−800.3 tok/s** | 39.7 tok/s | 45.4 tok/s | **−5.7 tok/s** |
-| 2182 | 2869.7 tok/s | 3582.3 tok/s | **−712.6 tok/s** | 39.6 tok/s | 45.3 tok/s | **−5.8 tok/s** |
+|  556 | 1885.3 tok/s | 2772.5 tok/s | **−887.2 tok/s** | 39.3 tok/s | 45.6 tok/s | **−6.3 tok/s** |
+| 1098 | 2522.5 tok/s | 3324.8 tok/s | **−802.3 tok/s** | 40.2 tok/s | 45.8 tok/s | **−5.5 tok/s** |
+| 2182 | 2883.7 tok/s | 3601.1 tok/s | **−717.3 tok/s** | 40.5 tok/s | 45.4 tok/s | **−4.9 tok/s** |
 
 All numbers are absolute tokens/second. The Δ column reports `qw3 − llama.cpp`
 (negative = llama.cpp is faster). Two trends jump out:
 
-- **Decode is flat across context length** (~38–40 tok/s from 550 → 2200
-  tokens) and trails llama.cpp by a constant ~6 tok/s. Earlier the
+- **Decode is flat across context length** (~39–41 tok/s from 550 → 2200
+  tokens) and trails llama.cpp by a constant ~5 tok/s. Earlier the
   decode rate fell from 37 → 22 tok/s as KV grew, because per-token
   attention bandwidth scaled with context. Two changes flipped that: F16
   KV cache (halves K/V bytes) and **split-K attention**
   (`fattn_vec_decode_kernel` now parallelizes over KV slices via
   `NSPLIT ∈ {1,2,4,8}` plus an online-softmax combine kernel — the
   original kernel only used `n_heads × 4` warps, leaving most of
-  Blackwell's SMs idle). The remaining gap is decode matvec dominated;
-  see roadmap.
+  Blackwell's SMs idle). CUDA graph capture took launch overhead off
+  the decode hot path; FFN gate+up matvec fusion shaved another ~1%.
+  The remaining gap is pure Q8 matvec wall time; see roadmap.
 - **Prefill trails llama.cpp by ~700–900 tok/s** at 1K–2K. The dominant
   cost on llama.cpp's prefill is `mul_mat_q` (INT8 MMA on raw Q8_0)
   at 64% of GPU time — they bypass dequant entirely. qw3 currently runs
@@ -411,11 +412,15 @@ description.
 See **Bottlenecks and roadmap** above for the prioritized list backed by
 `nsys` profiling. The short version:
 
-- **Decode plateau (~6 tok/s behind llama.cpp, flat across context).**
-  After graph capture, decode is GPU-bound on `mul_mat_vec_q8_0_kernel<1>`
-  (76.9% of decode GPU time). The next lever is the matvec kernel
-  itself — llama.cpp's `mul_mat_vec_q` does cooperative multi-row
-  warps with vectorized DP4A; matching that shape is the open work.
+- **Decode plateau (~5 tok/s behind llama.cpp, flat across context).**
+  Post-fusion, decode is 85% Q8 matvec (`mul_mat_vec_q8_0_kernel<1>`
+  + the new `mul_mat_vec_q8_0_two_kernel<1>` for fused gate+up). Each
+  matvec runs at ~2.5 TB/s effective on a 96 MB weight (above HBM
+  peak — partial L2 reuse), so per-call latency is at the HBM
+  bandwidth ceiling. Further wins must come from fewer matvec calls
+  (Q+K+V fusion for standard attention layers, recurrent QKV+gate
+  fusion across heterogeneous shapes) or from non-matvec kernels
+  (DeltaNet recurrent fusion is the largest at ~5% of decode time).
 - **Prefill: −500 tok/s at 1K–2K, widening to −1000 tok/s at 4K.** Two
   separate gaps: HGEMM via FP16 mirror loses to direct INT8 MMA on
   every prompt length (closing this lifts the whole curve), and at
