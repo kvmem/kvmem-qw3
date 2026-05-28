@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <math.h>
 #include <type_traits>
 
@@ -1748,10 +1749,20 @@ fattn_prefill_mma_kernel_pipe(
 //   Total = 44 KB → cp.async ping-pong fits (52 KB). We gate on HEAD_DIM.
 // ============================================================================
 
-template <uint32_t HEAD_DIM, uint32_t Q_PER_KV, uint32_t BR, uint32_t BC>
+// ============================================================================
+// GQA-fused prefill MMA kernel (Q_PER_KV q-heads share one CTA per kv_head).
+// See above doc block for invariants. The USE_CP_ASYNC_K template parameter
+// controls whether the K tile is fetched via cp.async (deferred wait at the
+// top of the next iter, overlapping cp.async-K[t+1] with the current tile's
+// softmax + PV). V stays synchronous because the transposed shmem write
+// (s_VT[d, t] = V[t, d]) doesn't fit cp.async's straight gmem→shmem path.
+// Single-buffered K — at HD=256 a second K buffer (16 KB) doesn't fit the
+// 99 KB optin shmem budget alongside Q (24 KB) and other tiles.
+template <uint32_t HEAD_DIM, uint32_t Q_PER_KV, uint32_t BR, uint32_t BC,
+          bool USE_CP_ASYNC_K>
 __global__ void
 __launch_bounds__(128, 1)
-fattn_prefill_mma_gqa_kernel(
+fattn_prefill_mma_gqa_kernel_t(
         float       * __restrict__ out,
         const float * __restrict__ q,
         uint32_t     q_stride,
@@ -1853,35 +1864,66 @@ fattn_prefill_mma_gqa_kernel(
 
     __syncthreads();
 
+    // K loader. issue_K(t0_target) issues cp.async (or sync loads) for the
+    // K tile starting at t0_target. With cp.async, the caller is responsible
+    // for the matching commit + wait_group + __syncthreads() before reading
+    // s_K (the cp.async issues are non-blocking and only become visible
+    // after wait_group + sync).
+    auto issue_K = [&](uint32_t t0_target) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0_target + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            __half *dst = &s_K[shm_t * HEAD_DIM + base_d];
+            const bool in_range = (t < block_max_kv);
+            if (USE_CP_ASYNC_K) {
+                if (in_range) {
+                    const __half *k_src = k_cache
+                        + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    mma_detail::cp_async_cg_16(dst, k_src);
+                } else {
+                    mma_detail::cp_async_zero_16(dst);
+                }
+            } else {
+                int4 *dst4 = reinterpret_cast<int4 *>(dst);
+                if (in_range) {
+                    const __half *k_src = k_cache
+                        + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *dst4 = *reinterpret_cast<const int4 *>(k_src);
+                } else {
+                    int4 z; z.x = z.y = z.z = z.w = 0;
+                    *dst4 = z;
+                }
+            }
+        }
+    };
+
+    // Prologue: issue tile 0's K cp.async (only when USE_CP_ASYNC_K).
+    if (USE_CP_ASYNC_K) {
+        issue_K(0);
+        mma_detail::cp_async_commit();
+    }
+
     // =====================================================================
     // Tile loop over KV.
     // =====================================================================
     for (uint32_t t0 = 0; t0 < block_max_kv; t0 += BC) {
 
-        // ---- Load K tile ----
-        {
-            constexpr uint32_t HALVES_PER_LD = 8;
-            constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
-            constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
-            constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
-            const uint32_t row_in_pass = tid / LANES_PER_ROW;
-            const uint32_t col_lane    = tid % LANES_PER_ROW;
-            #pragma unroll
-            for (uint32_t pass = 0; pass < N_PASS; ++pass) {
-                const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
-                const uint32_t t     = t0 + shm_t;
-                const uint32_t base_d = col_lane * HALVES_PER_LD;
-                int4 *dst = reinterpret_cast<int4 *>(&s_K[shm_t * HEAD_DIM + base_d]);
-                if (t < block_max_kv) {
-                    const __half *k_src = k_cache
-                        + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
-                        + kv_head * HEAD_DIM + base_d;
-                    *dst = *reinterpret_cast<const int4 *>(k_src);
-                } else {
-                    int4 z; z.x = z.y = z.z = z.w = 0;
-                    *dst = z;
-                }
-            }
+        // ---- Wait for K[t0] (cp.async path) or load K[t0] sync ----
+        if (USE_CP_ASYNC_K) {
+            mma_detail::cp_async_wait_group<0>();
+            __syncthreads();
+        } else {
+            issue_K(t0);
         }
 
         // ---- Load V tile transposed: s_VT[d, t] = V[t, d] ----
@@ -1941,6 +1983,18 @@ fattn_prefill_mma_gqa_kernel(
                                           HEAD_DIM);
                 mma_detail::mma_m16n8k16_f16f16f32(c_h[h][0], c_h[h][1], c_h[h][2], c_h[h][3],
                                                    a0, a1, a2, a3, b0, b1);
+            }
+        }
+
+        // ---- Issue K[t0+BC] cp.async now (s_K is dead after QK). The
+        // gmem read overlaps the upcoming Phase A softmax + Phase B PV.
+        // Single-buffered K: writing s_K is safe because no one reads it
+        // until the wait_group + sync at the top of the next iter. ----
+        if (USE_CP_ASYNC_K) {
+            const uint32_t t0_next = t0 + BC;
+            if (t0_next < block_max_kv) {
+                issue_K(t0_next);
+                mma_detail::cp_async_commit();
             }
         }
 
@@ -2214,16 +2268,37 @@ bool launch_fattn_prefill_mma_gqa_f16(
     const dim3 grid(n_kv_heads, n_blocks_q, 1);
     const dim3 block(128);
     const size_t smem = fattn_mma_gqa_smem_bytes(head_dim, q_per_kv);
+    // QW3_PREFILL_FA2_KCPASYNC: cp.async double-buffer the K tile load. The
+    // K[t+1] gmem read is issued post-QK (when s_K is dead) and overlaps the
+    // current tile's softmax + PV. Default ON — measured +5-7% at long T,
+    // ±0.5% noise at short T on Qwen 3.6 27B / RTX Pro 6000. Set to "0" to
+    // force the synchronous K-load fallback.
+    static const bool use_cp_async_k = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_KCPASYNC");
+        if (!e) return true;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
     auto launch = [&](auto HD_v) {
         constexpr uint32_t HD = decltype(HD_v)::value;
-        cudaFuncSetAttribute(fattn_prefill_mma_gqa_kernel<HD, 6, BR, BC>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-        fattn_prefill_mma_gqa_kernel<HD, 6, BR, BC><<<grid, block, smem, stream>>>(
-            out, q, q_stride,
-            static_cast<const __half *>(k_cache),
-            static_cast<const __half *>(v_cache),
-            n_heads, n_kv_heads, base_seq_len, batch,
-            q_batch_stride, out_batch_stride, scale);
+        if (use_cp_async_k) {
+            cudaFuncSetAttribute(fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, true>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, true><<<grid, block, smem, stream>>>(
+                out, q, q_stride,
+                static_cast<const __half *>(k_cache),
+                static_cast<const __half *>(v_cache),
+                n_heads, n_kv_heads, base_seq_len, batch,
+                q_batch_stride, out_batch_stride, scale);
+        } else {
+            cudaFuncSetAttribute(fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, false>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, false><<<grid, block, smem, stream>>>(
+                out, q, q_stride,
+                static_cast<const __half *>(k_cache),
+                static_cast<const __half *>(v_cache),
+                n_heads, n_kv_heads, base_seq_len, batch,
+                q_batch_stride, out_batch_stride, scale);
+        }
     };
     if (head_dim == 256) launch(std::integral_constant<uint32_t, 256>{});
     else                 launch(std::integral_constant<uint32_t, 128>{});
