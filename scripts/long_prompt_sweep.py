@@ -110,6 +110,8 @@ class TrialResult:
 
 
 def run_qw3(args, prompt: str, env_extra: Optional[dict] = None) -> TrialResult:
+    pf = Path("/tmp/qw3_sweep_prompt.txt")
+    pf.write_text(prompt)
     cmd = [
         args.qw3,
         "--backend", "qwen-native",
@@ -122,7 +124,7 @@ def run_qw3(args, prompt: str, env_extra: Optional[dict] = None) -> TrialResult:
         "-n", str(args.n_decode),
         "--temp", "0",
         "--seed", "0",
-        "-p", prompt,
+        "--prompt-file", str(pf),
     ]
     env = os.environ.copy()
     if env_extra:
@@ -152,6 +154,8 @@ def run_qw3(args, prompt: str, env_extra: Optional[dict] = None) -> TrialResult:
 
 
 def run_llama(args, prompt: str) -> TrialResult:
+    pf = Path("/tmp/qw3_sweep_prompt.txt")
+    pf.write_text(prompt)
     cmd = [
         "timeout", str(int(args.timeout)), args.llama,
         "-m", args.model,
@@ -164,7 +168,7 @@ def run_llama(args, prompt: str) -> TrialResult:
         "--temp", "0",
         "--seed", "0",
         "--no-warmup",
-        "-p", prompt,
+        "-f", str(pf),
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
