@@ -556,14 +556,17 @@ __global__ void q8_get_row_kernel(float *out, const uint8_t *weight, uint64_t ro
 }
 
 // Batched row gather: rows_buf is a device array of `batch` token ids. Each
-// CUDA block (gridDim.y) handles one batch slot, writing to out[b * cols ..].
+// CUDA block (gridDim.x) handles one batch slot, writing to out[b * cols ..].
+// gridDim.y tiles the column dim. Order is (cols-tile-y, batch-x) so that
+// gridDim.x — which has a 2^31-1 cap — carries the unbounded `batch` axis;
+// gridDim.y caps at 65535 (~16M cols at threads=256), well above 5120.
 __global__ void q8_get_rows_batch_kernel(float *out,
                                          const uint8_t *weight,
                                          const uint64_t *rows_buf,
                                          uint64_t cols) {
-    const uint32_t b = blockIdx.y;
+    const uint32_t b = blockIdx.x;
     const uint64_t row = rows_buf[b];
-    uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= cols) return;
     const uint64_t block = i / 32;
     const uint64_t inb = i % 32;
@@ -1268,8 +1271,8 @@ __global__ void l2_norm_128_batch_kernel(float *x,             // base ptr
                                          uint32_t batch_stride, // conv_dim
                                          uint32_t base_offset,  // offset to Q or K region
                                          float eps) {
-    const uint32_t b  = blockIdx.x;            // which k_head
-    const uint32_t t  = blockIdx.y;            // which timestep
+    const uint32_t t  = blockIdx.x;            // which timestep
+    const uint32_t b  = blockIdx.y;            // which k_head
     if (b >= blocks || t >= T) return;
     __shared__ float scratch[128];
     const uint32_t tid = threadIdx.x;
@@ -1370,8 +1373,8 @@ __global__ void recurrent_norm_gate_batch_kernel(float *core,            // [T, 
                                                  uint32_t core_stride,
                                                  uint32_t gate_stride,
                                                  float eps) {
-    const uint32_t vh = blockIdx.x;
-    const uint32_t t  = blockIdx.y;
+    const uint32_t t  = blockIdx.x;
+    const uint32_t vh = blockIdx.y;
     const uint32_t tid = threadIdx.x;
     if (vh >= num_v_heads || t >= T || tid >= head_v_dim) return;
     __shared__ float scratch[256];
@@ -1395,8 +1398,8 @@ __global__ void rmsnorm_per_head_kernel(float *x,
                                         uint32_t head_dim,
                                         uint32_t batch_stride,
                                         float eps) {
-    const uint32_t unit = blockIdx.x;
-    const uint32_t b    = blockIdx.y;
+    const uint32_t b    = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
     const uint32_t tid = threadIdx.x;
     if (unit >= n_units) return;
     __shared__ float scratch[256];
@@ -1420,8 +1423,8 @@ __global__ void rope_partial_kernel(float *x,
                                     uint32_t base_pos,
                                     uint32_t batch_stride,
                                     float theta) {
-    const uint32_t unit = blockIdx.x;
-    const uint32_t b    = blockIdx.y;
+    const uint32_t b    = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
     const uint32_t i = threadIdx.x;
     if (unit >= n_units) return;
     const uint32_t half = rope_dim / 2;
@@ -1442,8 +1445,8 @@ __global__ void kv_append_kernel(float *cache,
                                  uint32_t base_pos,
                                  uint32_t per_pos_size,
                                  uint32_t src_stride) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t b = blockIdx.y;
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= per_pos_size) return;
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
     cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] = src_row[i];
@@ -1454,8 +1457,8 @@ __global__ void kv_append_kernel_f16(__half *cache,
                                      uint32_t base_pos,
                                      uint32_t per_pos_size,
                                      uint32_t src_stride) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t b = blockIdx.y;
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= per_pos_size) return;
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
     cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] =
@@ -1654,8 +1657,8 @@ __global__ void apply_attn_gate_kernel(float *out,
                                        uint32_t head_dim,
                                        uint32_t batch_stride_q,
                                        uint32_t batch_stride_out) {
-    const uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t b = blockIdx.y;
+    const uint32_t b = blockIdx.x;
+    const uint64_t i = blockIdx.y * blockDim.x + threadIdx.x;
     const uint64_t total = static_cast<uint64_t>(n_heads) * head_dim;
     if (i >= total) return;
     const uint32_t head = static_cast<uint32_t>(i / head_dim);
@@ -1899,8 +1902,8 @@ public:
         }
         cudaMemcpyAsync(rows_buf_, rows, batch * sizeof(uint64_t), cudaMemcpyHostToDevice, exec_stream_);
         const unsigned threads = 256;
-        const unsigned bx = static_cast<unsigned>((w.cols + threads - 1) / threads);
-        dim3 grid(bx, batch);
+        const unsigned by = static_cast<unsigned>((w.cols + threads - 1) / threads);
+        dim3 grid(batch, by);
         q8_get_rows_batch_kernel<<<grid, threads, 0, exec_stream_>>>(o.ptr, static_cast<const uint8_t *>(w.ptr),
                                                     rows_buf_, w.cols);
         return launch_status("cuda q8_0_get_rows_batch");
@@ -2781,7 +2784,7 @@ public:
 
         // 2. L2 norm for Q and K (batched across T). The conv-output buffer
         //    shares the proj layout (row stride = proj_stride).
-        dim3 ln_grid(num_k_heads, batch);
+        dim3 ln_grid(batch, num_k_heads);
         const uint32_t q_off = 0;
         const uint32_t k_off = num_k_heads * head_k_dim;
         l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
@@ -2854,7 +2857,7 @@ public:
         }
 
         // 4. RMSnorm + gate, batched over T.
-        dim3 ng_grid(num_v_heads, batch);
+        dim3 ng_grid(batch, num_v_heads);
         recurrent_norm_gate_batch_kernel<<<ng_grid, head_v_dim, 0, exec_stream_>>>(c.ptr, g.ptr,
                                                                   static_cast<const float *>(nw.ptr),
                                                                   batch, num_v_heads, head_v_dim,
@@ -2906,7 +2909,7 @@ public:
                                    float eps) override {
         auto &t = as_tensor(x);
         const auto &w = as_weight(weight);
-        dim3 grid(n_units, 1);
+        dim3 grid(1, n_units);
         rmsnorm_per_head_kernel<<<grid, 256, 0, exec_stream_>>>(t.ptr,
                                                 static_cast<const float *>(w.ptr),
                                                 n_units, per_unit_stride, head_dim, /*batch_stride=*/0, eps);
@@ -2924,7 +2927,7 @@ public:
         if (batch == 0) return {};
         auto &t = as_tensor(x);
         const auto &w = as_weight(weight);
-        dim3 grid(n_units, batch);
+        dim3 grid(batch, n_units);
         rmsnorm_per_head_kernel<<<grid, 256, 0, exec_stream_>>>(t.ptr,
                                                 static_cast<const float *>(w.ptr),
                                                 n_units, per_unit_stride, head_dim, batch_stride, eps);
@@ -2940,7 +2943,7 @@ public:
         auto &t = as_tensor(x);
         const uint32_t half = rope_dim / 2;
         if (half == 0) return {};
-        dim3 grid(n_units, 1);
+        dim3 grid(1, n_units);
         rope_partial_kernel<<<grid, half, 0, exec_stream_>>>(t.ptr, n_units, per_unit_stride, rope_dim, pos, /*batch_stride=*/0, theta);
         return launch_status("cuda rope_partial");
     }
@@ -2957,7 +2960,7 @@ public:
         auto &t = as_tensor(x);
         const uint32_t half = rope_dim / 2;
         if (half == 0) return {};
-        dim3 grid(n_units, batch);
+        dim3 grid(batch, n_units);
         rope_partial_kernel<<<grid, half, 0, exec_stream_>>>(t.ptr, n_units, per_unit_stride, rope_dim, base_pos, batch_stride, theta);
         return launch_status("cuda rope_partial_batch");
     }
@@ -2970,7 +2973,7 @@ public:
         const auto &s = as_tensor(src);
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
-        dim3 grid(blocks, 1);
+        dim3 grid(1, blocks);
         if (c.is_fp16()) {
             kv_append_kernel_f16<<<grid, threads, 0, exec_stream_>>>(c.ptr_h(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
         } else {
@@ -2989,7 +2992,7 @@ public:
         const auto &s = as_tensor(src);
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
-        dim3 grid(blocks, batch);
+        dim3 grid(batch, blocks);
         if (c.is_fp16()) {
             kv_append_kernel_f16<<<grid, threads, 0, exec_stream_>>>(c.ptr_h(), s.ptr, base_pos, per_pos_size, per_pos_size);
         } else {
@@ -3292,7 +3295,7 @@ public:
         const uint64_t total = static_cast<uint64_t>(n_heads) * head_dim;
         const unsigned threads = 256;
         const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
-        dim3 grid(blocks, 1);
+        dim3 grid(1, blocks);
         apply_attn_gate_kernel<<<grid, threads, 0, exec_stream_>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim, 0, 0);
         return launch_status("cuda apply_attn_gate");
     }
@@ -3311,7 +3314,7 @@ public:
         const uint64_t total = static_cast<uint64_t>(n_heads) * head_dim;
         const unsigned threads = 256;
         const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
-        dim3 grid(blocks, batch);
+        dim3 grid(batch, blocks);
         apply_attn_gate_kernel<<<grid, threads, 0, exec_stream_>>>(o.ptr, qq.ptr, q_stride, n_heads, head_dim,
                                                   batch_stride_q, batch_stride_out);
         return launch_status("cuda apply_attn_gate_batch");
