@@ -286,7 +286,6 @@ fattn_vec_combine_kernel(
     __syncthreads();
 
     float gmax = -INFINITY;
-    #pragma unroll
     for (uint32_t s = 0; s < NSPLIT; ++s) {
         if (s_sum[s] > 0.0f && s_max[s] > gmax) gmax = s_max[s];
     }
@@ -296,7 +295,6 @@ fattn_vec_combine_kernel(
     // gnum[d] = Σ_s VKQ_s[d] * exp(max_s - gmax)
     float gsum  = 0.0f;
     float gnum  = 0.0f;
-    #pragma unroll
     for (uint32_t s = 0; s < NSPLIT; ++s) {
         if (s_sum[s] <= 0.0f) continue;
         const float w = __expf(s_max[s] - gmax);
@@ -337,15 +335,19 @@ static inline uint32_t pick_nsplit(uint32_t seq_len) {
         const char *e = std::getenv("QW3_FATTN_NSPLIT");
         if (!e) return 0;
         const int v = std::atoi(e);
-        if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) return static_cast<uint32_t>(v);
+        if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32 || v == 64) {
+            return static_cast<uint32_t>(v);
+        }
         return 0;
     }();
     if (kForced) return kForced;
-    if (seq_len <= 64)   return 1;
-    if (seq_len <= 128)  return 2;
-    if (seq_len <= 512)  return 4;
-    if (seq_len <= 2048) return 8;
-    return 16;
+    if (seq_len <= 64)    return 1;
+    if (seq_len <= 128)   return 2;
+    if (seq_len <= 512)   return 4;
+    if (seq_len <= 2048)  return 8;
+    if (seq_len <= 8192)  return 16;
+    if (seq_len <= 32768) return 32;
+    return 64;
 }
 
 // Scratch sizing helper (in bytes). Caller must allocate at least this many
@@ -416,7 +418,9 @@ static bool dispatch_launch(
             return true;                                                  \
         }
     DISPATCH(128, 1) DISPATCH(128, 2) DISPATCH(128, 4) DISPATCH(128, 8) DISPATCH(128, 16)
+    DISPATCH(128, 32) DISPATCH(128, 64)
     DISPATCH(256, 1) DISPATCH(256, 2) DISPATCH(256, 4) DISPATCH(256, 8) DISPATCH(256, 16)
+    DISPATCH(256, 32) DISPATCH(256, 64)
     #undef DISPATCH
     return false;
 }
