@@ -120,6 +120,8 @@ def run_qw3(args, prompt: str, env_extra: Optional[dict] = None) -> TrialResult:
         "--raw",
         "-c", str(args.ctx),
         "-n", str(args.n_decode),
+        "--temp", "0",
+        "--seed", "0",
         "-p", prompt,
     ]
     env = os.environ.copy()
@@ -295,10 +297,10 @@ def main() -> int:
     p.add_argument("--model", default=os.environ.get(
         "MODEL",
         "/home/chaidi/AgentSys/unsloth/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q8_0.gguf"))
-    p.add_argument("-n", "--n-decode", type=int, default=64)
-    p.add_argument("-c", "--ctx", type=int, default=8192)
+    p.add_argument("-n", "--n-decode", type=int, default=256)
+    p.add_argument("-c", "--ctx", type=int, default=36864)
     p.add_argument("--trials", type=int, default=3)
-    p.add_argument("--prompt-tokens", type=str, default="512 1024 2048 4096",
+    p.add_argument("--prompt-tokens", type=str, default="512 1024 2048 4096 8192 16384 32768",
                    help="space- or comma-separated target prompt token counts")
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--json", type=str, default=None,

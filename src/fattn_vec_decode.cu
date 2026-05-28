@@ -1674,6 +1674,403 @@ fattn_prefill_mma_kernel_pipe(
     }
 }
 
+// ============================================================================
+// GQA-fused MMA prefill kernel.
+//
+// Motivation: Qwen 3.6 27B has 24 q-heads / 4 kv-heads (group=6). The plain
+// MMA kernel grids on (n_heads, n_blocks_q), so each of the 6 q-heads sharing
+// a kv_head launches an independent block and reloads the same K/V from HBM.
+// At T=32K the attention tile loop is HBM-bound on K/V reads — fusing the
+// 6 q-heads into one block cuts K/V HBM traffic 6×.
+//
+// Design:
+//   Grid: (n_kv_heads, n_blocks_q). Each block handles ALL Q_PER_KV q-heads
+//   sharing this kv_head, BR queries per q-head.
+//
+//   Outer loop: for each tile of BC KV tokens, load K/V from HBM ONCE into
+//   shmem (cp.async ping-pong on K, sync on V_T).
+//
+//   Inner loop: for each q-head h in 0..Q_PER_KV, run QK^T + softmax + PV
+//   against the shared K/V tile. Per-head register state:
+//     O_acc[Q_PER_KV][PV_N_TILES][4] floats     — output accumulator
+//     Q_frag[Q_PER_KV][QK_KSTEPS][4] unsigneds  — Q fragment registers
+//   Per-head shmem state:
+//     s_m[Q_PER_KV][BR], s_l[Q_PER_KV][BR]      — softmax statistics
+//   s_alpha is reused (only live during one head's softmax step).
+//
+// Register pressure analysis (HD=256, Q_PER_KV=6):
+//   O_acc: 6*8*4 = 192 floats  = 768 B/thread
+//   Q_frag: 6*16*4 = 384 unsigneds = 1536 B/thread
+//   Total fragment regs ~2.3 KB/thread. With launch_bounds(128, 1) each
+//   block gets 256 KB / 128 threads = 2 KB/thread → tight; we may spill.
+//
+// Trade: drop Q_frag from registers and reload it per (tile, q-head) via
+// ldmatrix from a small s_Q[Q_PER_KV*BR*HEAD_DIM]=24 KB (HD=256, 6 heads)
+// — that costs QK_KSTEPS extra ldmatrix per inner-q-head step but halves
+// register pressure. We do this by keeping s_Q persistent across tiles
+// (load Q ONCE before the tile loop, reload Q_frag from s_Q per inner step).
+//
+// Shmem layout (HD=256, Q_PER_KV=6):
+//   s_K[2][BC*HEAD_DIM]   = 2*32*256*2  = 32 KB   (cp.async ping-pong)
+//   s_VT[HEAD_DIM*BC]     = 256*32*2    = 16 KB
+//   s_Q[Q_PER_KV*BR*HD]   = 6*16*256*2  = 48 KB
+//   s_S[BR*BC]            = 16*32*4     = 2 KB
+//   s_P[BR*BC]            = 16*32*2     = 1 KB
+//   s_m,s_l,s_alpha       = ~1 KB
+//   Total                 ≈ 100 KB → at the 99 KB cap. Need to drop one
+//   K buffer (kill cp.async pipeline) OR reduce s_Q.
+//
+// Resolution: keep cp.async, drop s_Q to a "load once per outer q-head loop"
+// buffer of size BR*HEAD_DIM (8 KB) — load Q for q-head h into s_Q, do ALL
+// tiles for that head, swap to next head. But that destroys the "K/V loaded
+// once per tile" benefit because V is reused across heads.
+//
+// Better: keep s_Q sized for ALL Q_PER_KV heads in shmem at once, but drop
+// the second K buffer (no cp.async ping-pong — single K buffer + sync wait).
+// Net shmem (HD=256, Q_PER_KV=6):
+//   s_K[BC*HD]    = 16 KB
+//   s_VT[HD*BC]   = 16 KB
+//   s_Q[6*BR*HD]  = 48 KB
+//   s_S+s_P       = 3 KB
+//   misc          = 1 KB
+//   Total         = 84 KB ≤ 99 KB cap. ✓
+//
+// Trade-off: lose cp.async overlap (one HBM stall per tile). But we GAIN
+// 6× K/V reuse (only 1 HBM load per 6 head-passes vs 6 HBM loads). For
+// long contexts where K/V HBM is the bottleneck, this wins by far.
+//
+// At HD=128, Q_PER_KV=6:
+//   s_K = 8 KB, s_VT = 8 KB, s_Q = 24 KB, s_S+s_P = 3 KB, misc = 1 KB
+//   Total = 44 KB → cp.async ping-pong fits (52 KB). We gate on HEAD_DIM.
+// ============================================================================
+
+template <uint32_t HEAD_DIM, uint32_t Q_PER_KV, uint32_t BR, uint32_t BC>
+__global__ void
+__launch_bounds__(128, 1)
+fattn_prefill_mma_gqa_kernel(
+        float       * __restrict__ out,
+        const float * __restrict__ q,
+        uint32_t     q_stride,
+        const __half* __restrict__ k_cache,
+        const __half* __restrict__ v_cache,
+        uint32_t     n_heads,
+        uint32_t     n_kv_heads,
+        uint32_t     base_seq_len,
+        uint32_t     batch,
+        uint32_t     q_batch_stride,
+        uint32_t     out_batch_stride,
+        float        scale) {
+    constexpr uint32_t WARP_SIZE = 32;
+    constexpr uint32_t NWARPS    = 4;
+    constexpr uint32_t MMA_M     = 16;
+    constexpr uint32_t MMA_N     = 8;
+    constexpr uint32_t MMA_K     = 16;
+    static_assert(BR == 16, "GQA MMA prefill kernel requires BR=16");
+    static_assert(BC == 32, "GQA MMA prefill kernel requires BC=32");
+    static_assert(HEAD_DIM == 256 || HEAD_DIM == 128,
+                  "GQA MMA prefill kernel supports HEAD_DIM 128 or 256");
+    static_assert(HEAD_DIM % MMA_K == 0, "HEAD_DIM must be a multiple of MMA_K");
+
+    constexpr uint32_t QK_KSTEPS  = HEAD_DIM / MMA_K;
+    constexpr uint32_t QK_N_PER_WARP = BC / NWARPS;
+    static_assert(QK_N_PER_WARP == MMA_N, "BC/NWARPS must equal MMA_N");
+    constexpr uint32_t PV_KSTEPS  = BC / MMA_K;
+    constexpr uint32_t HD_PER_WARP = HEAD_DIM / NWARPS;
+    constexpr uint32_t PV_N_TILES  = HD_PER_WARP / MMA_N;
+
+    const uint32_t kv_head = blockIdx.x;
+    const uint32_t block_q = blockIdx.y;
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t warp    = tid / WARP_SIZE;
+    const uint32_t lane    = tid % WARP_SIZE;
+    if (kv_head >= n_kv_heads) return;
+    const uint32_t head_base = kv_head * Q_PER_KV;
+
+    const uint32_t group_id = lane / 4;
+    const uint32_t in_group = lane % 4;
+
+    uint32_t block_max_q = block_q * BR + BR;
+    if (block_max_q > batch) block_max_q = batch;
+    const uint32_t block_max_kv = base_seq_len + block_max_q;
+
+    // ---- Shared memory layout -------------------------------------------
+    extern __shared__ char smem_raw[];
+    char *p = smem_raw;
+    __half *s_K   = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
+    __half *s_VT  = reinterpret_cast<__half *>(p); p += HEAD_DIM * BC       * sizeof(__half);
+    __half *s_Q   = reinterpret_cast<__half *>(p); p += Q_PER_KV * BR * HEAD_DIM * sizeof(__half);
+    float  *s_S   = reinterpret_cast<float  *>(p); p += BR       * BC       * sizeof(float);
+    __half *s_P   = reinterpret_cast<__half *>(p); p += Q_PER_KV * BR * BC * sizeof(__half);
+    float  *s_m   = reinterpret_cast<float  *>(p); p += Q_PER_KV * BR       * sizeof(float);
+    float  *s_l   = reinterpret_cast<float  *>(p); p += Q_PER_KV * BR       * sizeof(float);
+    float  *s_alpha = reinterpret_cast<float *>(p); p += BR                 * sizeof(float);
+
+    // ---- Load Q for ALL q-heads in this kv group into s_Q ------------------
+    // Layout: s_Q[h * BR * HD + r * HD + d]. 4 warps split rows.
+    // Total elts = Q_PER_KV * BR * HEAD_DIM. Threads = 128.
+    {
+        constexpr uint32_t ROWS_PER_WARP = BR / NWARPS;          // 4
+        for (uint32_t h = 0; h < Q_PER_KV; ++h) {
+            const uint32_t head = head_base + h;
+            for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+                const uint32_t q_row = warp * ROWS_PER_WARP + r;
+                const uint32_t q_idx = block_q * BR + q_row;
+                const bool active   = (q_idx < batch);
+                const float * q_ptr = active
+                    ? (q + static_cast<uint64_t>(q_idx) * q_batch_stride
+                         + head * q_stride)
+                    : nullptr;
+                #pragma unroll
+                for (uint32_t d0 = 0; d0 < HEAD_DIM; d0 += WARP_SIZE) {
+                    const uint32_t d = d0 + lane;
+                    const float v = active ? q_ptr[d] : 0.0f;
+                    s_Q[h * BR * HEAD_DIM + q_row * HEAD_DIM + d] = __float2half(v);
+                }
+            }
+        }
+    }
+
+    // ---- Initialize per-(head,row) softmax state ---------------------------
+    if (tid < Q_PER_KV * BR) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+
+    // ---- Per-head output accumulator (FP32 in registers) -------------------
+    float O_acc[Q_PER_KV][PV_N_TILES][4];
+    #pragma unroll
+    for (uint32_t h = 0; h < Q_PER_KV; ++h) {
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) O_acc[h][n][i] = 0.0f;
+        }
+    }
+
+    __syncthreads();
+
+    // =====================================================================
+    // Tile loop over KV.
+    // =====================================================================
+    for (uint32_t t0 = 0; t0 < block_max_kv; t0 += BC) {
+
+        // ---- Load K tile ----
+        {
+            constexpr uint32_t HALVES_PER_LD = 8;
+            constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+            constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+            constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+            const uint32_t row_in_pass = tid / LANES_PER_ROW;
+            const uint32_t col_lane    = tid % LANES_PER_ROW;
+            #pragma unroll
+            for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+                const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+                const uint32_t t     = t0 + shm_t;
+                const uint32_t base_d = col_lane * HALVES_PER_LD;
+                int4 *dst = reinterpret_cast<int4 *>(&s_K[shm_t * HEAD_DIM + base_d]);
+                if (t < block_max_kv) {
+                    const __half *k_src = k_cache
+                        + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *dst = *reinterpret_cast<const int4 *>(k_src);
+                } else {
+                    int4 z; z.x = z.y = z.z = z.w = 0;
+                    *dst = z;
+                }
+            }
+        }
+
+        // ---- Load V tile transposed: s_VT[d, t] = V[t, d] ----
+        {
+            constexpr uint32_t HALVES_PER_LD = 8;
+            constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+            constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+            constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+            const uint32_t row_in_pass = tid / LANES_PER_ROW;
+            const uint32_t col_lane    = tid % LANES_PER_ROW;
+            #pragma unroll
+            for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+                const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+                const uint32_t t     = t0 + shm_t;
+                const uint32_t base_d = col_lane * HALVES_PER_LD;
+                __half v8[HALVES_PER_LD];
+                if (t < block_max_kv) {
+                    const __half *v_src = v_cache
+                        + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *reinterpret_cast<int4 *>(v8) = *reinterpret_cast<const int4 *>(v_src);
+                } else {
+                    *reinterpret_cast<int4 *>(v8) = make_int4(0,0,0,0);
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < HALVES_PER_LD; ++i) {
+                    s_VT[(base_d + i) * BC + shm_t] = v8[i];
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // ---- QK^T phase: compute all Q_PER_KV heads' scores in registers ----
+        // Loop nest swap: K shmem reads are hoisted out of the per-head loop
+        // (K doesn't depend on h), so each ks step does 1 K load and Q_PER_KV
+        // Q loads + MMAs. Saves Q_PER_KV-1 K shmem reads per ks step.
+        // c_h[h] holds head h's m16n8 fragment per thread (4 floats each).
+        float c_h[Q_PER_KV][4];
+        #pragma unroll
+        for (uint32_t h = 0; h < Q_PER_KV; ++h) {
+            c_h[h][0] = 0.f; c_h[h][1] = 0.f;
+            c_h[h][2] = 0.f; c_h[h][3] = 0.f;
+        }
+        #pragma unroll
+        for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+            const uint32_t k0 = ks * MMA_K;
+            const uint32_t kv_col = warp * MMA_N + group_id;
+            const __half *krow0 = &s_K[kv_col * HEAD_DIM + k0 + in_group * 2];
+            const unsigned b0 = mma_detail::pack2h(krow0);
+            const unsigned b1 = mma_detail::pack2h(krow0 + 8);
+            #pragma unroll
+            for (uint32_t h = 0; h < Q_PER_KV; ++h) {
+                unsigned a0, a1, a2, a3;
+                mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                          &s_Q[h * BR * HEAD_DIM + 0 * HEAD_DIM + k0],
+                                          HEAD_DIM);
+                mma_detail::mma_m16n8k16_f16f16f32(c_h[h][0], c_h[h][1], c_h[h][2], c_h[h][3],
+                                                   a0, a1, a2, a3, b0, b1);
+            }
+        }
+
+        // ---- Phase A: per-head softmax + O_acc rescale; produces s_P[h] ----
+        // s_P now holds all heads simultaneously, so Phase B can share V loads.
+        #pragma unroll
+        for (uint32_t h = 0; h < Q_PER_KV; ++h) {
+
+            // Write S slice to shmem with causal mask.
+            {
+                const uint32_t base_col = warp * MMA_N + in_group * 2;
+                const uint32_t row_a = group_id;
+                const uint32_t row_b = group_id + 8;
+                const uint32_t q_idx_a = block_q * BR + row_a;
+                const uint32_t q_idx_b = block_q * BR + row_b;
+                const uint32_t my_max_kv_a = base_seq_len + q_idx_a + 1;
+                const uint32_t my_max_kv_b = base_seq_len + q_idx_b + 1;
+                const bool a_active = (q_idx_a < batch);
+                const bool b_active = (q_idx_b < batch);
+                const uint32_t t_a0 = t0 + base_col;
+                const uint32_t t_a1 = t0 + base_col + 1;
+                float v00 = (a_active && t_a0 < my_max_kv_a) ? c_h[h][0] * scale : -INFINITY;
+                float v01 = (a_active && t_a1 < my_max_kv_a) ? c_h[h][1] * scale : -INFINITY;
+                float v02 = (b_active && t_a0 < my_max_kv_b) ? c_h[h][2] * scale : -INFINITY;
+                float v03 = (b_active && t_a1 < my_max_kv_b) ? c_h[h][3] * scale : -INFINITY;
+                s_S[row_a * BC + base_col + 0] = v00;
+                s_S[row_a * BC + base_col + 1] = v01;
+                s_S[row_b * BC + base_col + 0] = v02;
+                s_S[row_b * BC + base_col + 1] = v03;
+            }
+
+            __syncthreads();
+
+            // Online softmax for this q-head's rows. Write into s_P[h*BR*BC + ...].
+            {
+                constexpr uint32_t ROWS_PER_WARP = BR / NWARPS;
+                #pragma unroll
+                for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+                    const uint32_t row = warp * ROWS_PER_WARP + r;
+                    const float s = s_S[row * BC + lane];
+                    const float row_max = cuda_helpers::warp_reduce_max<32>(s);
+                    const float prev_m = s_m[h * BR + row];
+                    const float new_m  = fmaxf(prev_m, row_max);
+                    const float p_val  = (s == -INFINITY) ? 0.0f
+                                                          : __expf(s - new_m);
+                    const float row_p_sum = cuda_helpers::warp_reduce_sum<32>(p_val);
+                    const float prev_l   = s_l[h * BR + row];
+                    const float alpha    = (prev_m == -INFINITY) ? 0.0f
+                                                                 : __expf(prev_m - new_m);
+                    const float new_l    = prev_l * alpha + row_p_sum;
+                    if (lane == 0) {
+                        s_m[h * BR + row] = new_m;
+                        s_l[h * BR + row] = new_l;
+                        s_alpha[row]      = alpha;
+                    }
+                    s_P[h * BR * BC + row * BC + lane] = __float2half(p_val);
+                }
+            }
+
+            __syncthreads();
+
+            // Rescale O_acc[h] by per-row alpha now (alpha scratch is reused next h).
+            const float alpha_a = s_alpha[group_id];
+            const float alpha_b = s_alpha[group_id + 8];
+            #pragma unroll
+            for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                O_acc[h][n][0] *= alpha_a;
+                O_acc[h][n][1] *= alpha_a;
+                O_acc[h][n][2] *= alpha_b;
+                O_acc[h][n][3] *= alpha_b;
+            }
+
+            __syncthreads();   // s_S, s_alpha free for next head; s_P[h] visible
+        }
+
+        // ---- Phase B: PV with V loads hoisted out of per-head loop ----
+        // For each (n, ks) load V once, then iterate the Q_PER_KV heads.
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+            #pragma unroll
+            for (uint32_t ks = 0; ks < PV_KSTEPS; ++ks) {
+                const uint32_t k0 = ks * MMA_K;
+                const uint32_t out_col = n0 + group_id;
+                const __half *vrow0 = &s_VT[out_col * BC + k0 + in_group * 2];
+                const unsigned b0 = mma_detail::pack2h(vrow0);
+                const unsigned b1 = mma_detail::pack2h(vrow0 + 8);
+                #pragma unroll
+                for (uint32_t h = 0; h < Q_PER_KV; ++h) {
+                    unsigned a0, a1, a2, a3;
+                    mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                              &s_P[h * BR * BC + 0 * BC + k0], BC);
+                    mma_detail::mma_m16n8k16_f16f16f32(
+                        O_acc[h][n][0], O_acc[h][n][1], O_acc[h][n][2], O_acc[h][n][3],
+                        a0, a1, a2, a3, b0, b1);
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // Final write: per-head, divide by l_h and store.
+    // =====================================================================
+    #pragma unroll
+    for (uint32_t h = 0; h < Q_PER_KV; ++h) {
+        const uint32_t head = head_base + h;
+        const float l_a = s_l[h * BR + group_id];
+        const float l_b = s_l[h * BR + group_id + 8];
+        const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
+        const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
+        const uint32_t q_idx_a = block_q * BR + group_id;
+        const uint32_t q_idx_b = block_q * BR + group_id + 8;
+        float * const out_a = (q_idx_a < batch)
+            ? (out + static_cast<uint64_t>(q_idx_a) * out_batch_stride + head * HEAD_DIM)
+            : nullptr;
+        float * const out_b = (q_idx_b < batch)
+            ? (out + static_cast<uint64_t>(q_idx_b) * out_batch_stride + head * HEAD_DIM)
+            : nullptr;
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+            const uint32_t col = n0 + in_group * 2;
+            if (out_a) {
+                out_a[col + 0] = O_acc[h][n][0] * inv_la;
+                out_a[col + 1] = O_acc[h][n][1] * inv_la;
+            }
+            if (out_b) {
+                out_b[col + 0] = O_acc[h][n][2] * inv_lb;
+                out_b[col + 1] = O_acc[h][n][3] * inv_lb;
+            }
+        }
+    }
+}
+
 static size_t fattn_mma_smem_bytes(uint32_t head_dim) {
     constexpr uint32_t BR = 16, BC = 32;
     size_t s = 0;
@@ -1683,6 +2080,19 @@ static size_t fattn_mma_smem_bytes(uint32_t head_dim) {
     s += BR       * BC       * sizeof(float);    // S
     s += BR       * BC       * sizeof(__half);   // P
     s += BR                  * sizeof(float) * 3;// m, l, alpha
+    return s;
+}
+
+static size_t fattn_mma_gqa_smem_bytes(uint32_t head_dim, uint32_t q_per_kv) {
+    constexpr uint32_t BR = 16, BC = 32;
+    size_t s = 0;
+    s += BC       * head_dim * sizeof(__half);   // K (single, no ping-pong)
+    s += head_dim * BC       * sizeof(__half);   // V_T
+    s += q_per_kv * BR * head_dim * sizeof(__half);  // Q (all heads)
+    s += BR       * BC       * sizeof(float);    // S
+    s += q_per_kv * BR * BC  * sizeof(__half);   // P (all heads — for PV V-share)
+    s += q_per_kv * BR       * sizeof(float) * 2;// m, l (per head)
+    s += BR                  * sizeof(float);    // alpha (scratch)
     return s;
 }
 
@@ -1764,6 +2174,47 @@ bool launch_fattn_prefill_mma_pipe_f16(
         cudaFuncSetAttribute(fattn_prefill_mma_kernel_pipe<HD, BR, BC>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
         fattn_prefill_mma_kernel_pipe<HD, BR, BC><<<grid, block, smem, stream>>>(
+            out, q, q_stride,
+            static_cast<const __half *>(k_cache),
+            static_cast<const __half *>(v_cache),
+            n_heads, n_kv_heads, base_seq_len, batch,
+            q_batch_stride, out_batch_stride, scale);
+    };
+    if (head_dim == 256) launch(std::integral_constant<uint32_t, 256>{});
+    else                 launch(std::integral_constant<uint32_t, 128>{});
+    return true;
+}
+
+bool launch_fattn_prefill_mma_gqa_f16(
+        float *       out,
+        const float * q,
+        uint32_t      q_stride,
+        const void  * k_cache,
+        const void  * v_cache,
+        uint32_t      n_heads,
+        uint32_t      n_kv_heads,
+        uint32_t      head_dim,
+        uint32_t      batch,
+        uint32_t      base_seq_len,
+        uint32_t      q_batch_stride,
+        uint32_t      out_batch_stride,
+        float         scale,
+        cudaStream_t  stream) {
+    if (!(head_dim == 128 || head_dim == 256)) return false;
+    if (batch == 0) return true;
+    if (n_kv_heads == 0 || n_heads % n_kv_heads != 0) return false;
+    const uint32_t q_per_kv = n_heads / n_kv_heads;
+    if (!(q_per_kv == 6)) return false;   // Qwen 3.6 27B GQA group size
+    constexpr uint32_t BR = 16, BC = 32;
+    const uint32_t n_blocks_q = (batch + BR - 1) / BR;
+    const dim3 grid(n_kv_heads, n_blocks_q, 1);
+    const dim3 block(128);
+    const size_t smem = fattn_mma_gqa_smem_bytes(head_dim, q_per_kv);
+    auto launch = [&](auto HD_v) {
+        constexpr uint32_t HD = decltype(HD_v)::value;
+        cudaFuncSetAttribute(fattn_prefill_mma_gqa_kernel<HD, 6, BR, BC>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+        fattn_prefill_mma_gqa_kernel<HD, 6, BR, BC><<<grid, block, smem, stream>>>(
             out, q, q_stride,
             static_cast<const __half *>(k_cache),
             static_cast<const __half *>(v_cache),

@@ -131,6 +131,17 @@ bool launch_fattn_prefill_mma_pipe_f16(
         uint32_t batch, uint32_t base_seq_len,
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream);
+// GQA-fused variant: one block per (kv_head, q_block) processes ALL Q_PER_KV
+// q-heads sharing this kv_head, loading K/V once and reusing it Q_PER_KV
+// times. Cuts K/V HBM traffic Q_PER_KV× (6× on Qwen 3.6 27B). Currently
+// instantiated only for Q_PER_KV=6 (Qwen 3.6 27B).
+bool launch_fattn_prefill_mma_gqa_f16(
+        float *out, const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
 }
 
 namespace {
@@ -194,7 +205,7 @@ AttentionKernel attention_kernel_choice() {
 //                              (also used for decode). At prefill seq_len is
 //                              passed as 1, so pick_nsplit→1 and it runs
 //                              one block per (head, query).
-enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma, MmaPipe };
+enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma, MmaPipe, MmaGqa };
 PrefillAttnKernel prefill_attn_kernel_choice() {
     static const PrefillAttnKernel choice = []() {
         const char *env = std::getenv("QW3_PREFILL_ATTN");
@@ -203,14 +214,13 @@ PrefillAttnKernel prefill_attn_kernel_choice() {
         if (env && std::strcmp(env, "cublas") == 0) return PrefillAttnKernel::Cublas;
         if (env && std::strcmp(env, "mma") == 0) return PrefillAttnKernel::Mma;
         if (env && std::strcmp(env, "mma-pipe") == 0) return PrefillAttnKernel::MmaPipe;
-        // Default: tensor-core MMA (m16n8k16.f16) FA2. Lifts per-call attn
-        // ~14.8 ms vs tiled FP32 SIMT's ~22.8 ms at T=4K, +11% prefill end-
-        // to-end. Parity-correct (greedy tokens match tiled at T=1k+).
-        // The mma-pipe variant (cp.async on K + Q-in-reg) is opt-in but a
-        // wash at 4K — V's sync load is in serial dependency with K's wait,
-        // which negates the K-load overlap. Closing this needs V row-major
-        // shmem + ldmatrix.trans in PV (followup commit).
-        return PrefillAttnKernel::Mma;
+        if (env && std::strcmp(env, "mma-gqa") == 0) return PrefillAttnKernel::MmaGqa;
+        // Default: GQA-fused MMA. One block per (kv_head, q_block) processes
+        // all Q_PER_KV q-heads sharing the kv_head, loading K/V once and
+        // reusing it Q_PER_KV× from shmem. At Qwen 3.6 27B's GQA group=6,
+        // this cuts attention K/V HBM traffic 6× — the dominant cost on
+        // long-context prefill where the tile loop is HBM-bound.
+        return PrefillAttnKernel::MmaGqa;
     }();
     return choice;
 }
@@ -2321,25 +2331,26 @@ private:
         return {};
     }
 
-    // Returns true when the v4 path is selected (QW3_MMQ_VERSION=4).
-    static bool mmq_v4_selected() {
+    // Returns true when the activation needs to be staged in the
+    // 144-byte block_q8_1_mmq layout (v4 and v5 both consume that format).
+    static bool mmq_uses_mmq_y_layout() {
         static const bool v = []() {
             const char *e = std::getenv("QW3_MMQ_VERSION");
-            return e && e[0] == '4';
+            return e && (e[0] == '4' || e[0] == '5');
         }();
         return v;
     }
 
     // INT8 MMA Q8_0 x Q8_1 matmul (m16n8k32.s8.s8.s32). Uses the same
     // q8_1_scratch_ buffer as decode mmvq for the activation Q8_1 stage.
-    // v4 (QW3_MMQ_VERSION=4) uses the 144-byte block_q8_1_mmq layout via
-    // q8_1_mmq_scratch_ — it's a tile-friendly format that lets the MMQ
-    // kernel read mmq_x*36 contiguous ints per K super-iter.
+    // v4/v5 use the 144-byte block_q8_1_mmq layout via q8_1_mmq_scratch_ —
+    // it's a tile-friendly format that lets the MMQ kernel read mmq_x*36
+    // contiguous ints per K super-iter.
     DeviceStatus mmq_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
-        const bool use_v4 = mmq_v4_selected()
-                          && (w.cols % 256 == 0)
-                          && (w.rows >= 128) && (batch >= 128);
-        if (use_v4) {
+        const bool use_mmq_y = mmq_uses_mmq_y_layout()
+                            && (w.cols % 256 == 0)
+                            && (w.rows >= 128) && (batch >= 128);
+        if (use_mmq_y) {
             if (auto st = ensure_q8_1_mmq_scratch(batch, w.cols); !st.ok) return st;
             if (!ported::launch_quantize_mmq_q8_1(x_ptr, q8_1_mmq_scratch_,
                                                    batch, w.cols, /*stride_x_row=*/w.cols,
@@ -2351,9 +2362,9 @@ private:
                                          static_cast<uint32_t>(w.rows), w.cols,
                                          batch, /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
                                          exec_stream_)) {
-                return {false, "mmq launch failed (v4)"};
+                return {false, "mmq launch failed (mmq_y)"};
             }
-            return launch_status("cuda q8_0_matmul mmq v4");
+            return launch_status("cuda q8_0_matmul mmq mmq_y");
         }
 
         if (auto st = ensure_q8_1_scratch(batch, w.cols); !st.ok) return st;
@@ -3360,6 +3371,33 @@ public:
                     batch, base_seq_len,
                     q_batch_stride, out_batch_stride, scale, exec_stream_)) {
                 return launch_status("cuda attention_decode_batch mma-pipe f16");
+            }
+        }
+
+        // GQA-fused tensor-core MMA prefill. Default for n_heads/n_kv_heads
+        // = Q_PER_KV instantiated case (=6 on Qwen 3.6 27B). Cuts K/V HBM
+        // traffic Q_PER_KV× at long contexts where the tile loop is HBM-bound.
+        // Falls through to mma-pipe when q_per_kv != 6 or shape is otherwise
+        // unsupported.
+        if (kv_fp16 &&
+            prefill_attn_kernel_choice() == PrefillAttnKernel::MmaGqa &&
+            batch >= prefill_attn_min_batch() &&
+            (head_dim == 128 || head_dim == 256)) {
+            if (ported::launch_fattn_prefill_mma_gqa_f16(
+                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch mma-gqa f16");
+            }
+            // Fallback: q_per_kv != 6 (e.g. DeltaNet path uses standard attn
+            // with different group ratio, or tests with custom shape).
+            if (ported::launch_fattn_prefill_mma_pipe_f16(
+                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch mma-gqa fallback mma-pipe f16");
             }
         }
 
