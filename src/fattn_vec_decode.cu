@@ -937,6 +937,34 @@ __device__ __forceinline__ void ldmatrix_x4_a(
 #endif
 }
 
+// ldmatrix.x2.trans .b16 — loads two 8x8 fp16 tiles from row-major shmem and
+// transposes each 8x8 during the load. Result distribution maps directly to
+// the B fragment of m16n8k16.row.col (col-major B):
+//
+//   lane t in [0, 32) holds:
+//     b0: (s[k0+2*(t%4)+0, n0+t/4], s[k0+2*(t%4)+1, n0+t/4])  — tile 0
+//     b1: (s[k0+2*(t%4)+8, n0+t/4], s[k0+2*(t%4)+9, n0+t/4])  — tile 1
+//
+// For a row-major source s[t, d] with stride_h halves between K rows, base
+// must point to s[k0, n0]. Lanes 0..7 supply tile-0 row addresses (rows
+// k0..k0+7 of the column n0..n0+7); lanes 8..15 supply tile-1 row addresses
+// (rows k0+8..k0+15). Lanes 16..31 still receive the broadcast result.
+__device__ __forceinline__ void ldmatrix_x2_b_trans(
+        unsigned &b0, unsigned &b1,
+        const __half *base, uint32_t stride_h) {
+#if QW3_MMA_AVAILABLE
+    const uint32_t lane = threadIdx.x % 32;
+    const __half *p = base + (lane & 15) * stride_h;
+    unsigned smem = __cvta_generic_to_shared(p);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0,%1}, [%2];"
+        : "=r"(b0), "=r"(b1)
+        : "r"(smem));
+#else
+    (void)b0; (void)b1; (void)base; (void)stride_h;
+#endif
+}
+
 // cp.async.cg.shared.global of 16 bytes from gmem -> smem. Non-blocking;
 // wait_group(0) drains all in-flight commits in this thread. Falls back to a
 // vectorized synchronous load on pre-Ampere targets.
@@ -1751,15 +1779,24 @@ fattn_prefill_mma_kernel_pipe(
 
 // ============================================================================
 // GQA-fused prefill MMA kernel (Q_PER_KV q-heads share one CTA per kv_head).
-// See above doc block for invariants. The USE_CP_ASYNC_K template parameter
-// controls whether the K tile is fetched via cp.async (deferred wait at the
-// top of the next iter, overlapping cp.async-K[t+1] with the current tile's
-// softmax + PV). V stays synchronous because the transposed shmem write
-// (s_VT[d, t] = V[t, d]) doesn't fit cp.async's straight gmem→shmem path.
-// Single-buffered K — at HD=256 a second K buffer (16 KB) doesn't fit the
-// 99 KB optin shmem budget alongside Q (24 KB) and other tiles.
+// See above doc block for invariants. Two cp.async knobs:
+//
+//   USE_CP_ASYNC_K — issue K[t+1] post-QK so its HBM read overlaps the
+//                    current tile's softmax + PV (single-buffered, deferred
+//                    wait at the top of the next iter).
+//   USE_CP_ASYNC_V — store V row-major (s_V[t, d] instead of the old
+//                    transposed s_VT[d, t]) so cp.async's gmem→shmem path
+//                    accepts it. V[t+1] is issued post-PV (when s_V is
+//                    dead) so its read overlaps the next iter's K wait,
+//                    Q init, and start of softmax. PV-side MMA uses
+//                    ldmatrix.x2.trans on the B operand to consume the
+//                    row-major V as col-major B.
+//
+// Single-buffered K and V — at HD=256 a second K buffer (16 KB) doesn't fit
+// the 99 KB optin shmem budget alongside Q (24 KB) and other tiles. The V
+// layout flip is shmem-neutral (still HD*BC halves).
 template <uint32_t HEAD_DIM, uint32_t Q_PER_KV, uint32_t BR, uint32_t BC,
-          bool USE_CP_ASYNC_K>
+          bool USE_CP_ASYNC_K, bool USE_CP_ASYNC_V>
 __global__ void
 __launch_bounds__(128, 1)
 fattn_prefill_mma_gqa_kernel_t(
@@ -1809,10 +1846,14 @@ fattn_prefill_mma_gqa_kernel_t(
     const uint32_t block_max_kv = base_seq_len + block_max_q;
 
     // ---- Shared memory layout -------------------------------------------
+    // s_V_buf is the same HD*BC halves slot used by V. When USE_CP_ASYNC_V is
+    // false we view it as s_VT[d, t] (transposed, stride BC); when true we
+    // view it as s_V[t, d] (row-major, stride HEAD_DIM). cp.async requires
+    // the row-major layout because it can only do contiguous gmem→shmem.
     extern __shared__ char smem_raw[];
     char *p = smem_raw;
-    __half *s_K   = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
-    __half *s_VT  = reinterpret_cast<__half *>(p); p += HEAD_DIM * BC       * sizeof(__half);
+    __half *s_K     = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
+    __half *s_V_buf = reinterpret_cast<__half *>(p); p += HEAD_DIM * BC       * sizeof(__half);
     __half *s_Q   = reinterpret_cast<__half *>(p); p += Q_PER_KV * BR * HEAD_DIM * sizeof(__half);
     float  *s_S   = reinterpret_cast<float  *>(p); p += BR       * BC       * sizeof(float);
     __half *s_P   = reinterpret_cast<__half *>(p); p += Q_PER_KV * BR * BC * sizeof(__half);
@@ -1907,40 +1948,48 @@ fattn_prefill_mma_gqa_kernel_t(
         }
     };
 
-    // Prologue: issue tile 0's K cp.async (only when USE_CP_ASYNC_K).
-    if (USE_CP_ASYNC_K) {
-        issue_K(0);
-        mma_detail::cp_async_commit();
-    }
-
-    // =====================================================================
-    // Tile loop over KV.
-    // =====================================================================
-    for (uint32_t t0 = 0; t0 < block_max_kv; t0 += BC) {
-
-        // ---- Wait for K[t0] (cp.async path) or load K[t0] sync ----
-        if (USE_CP_ASYNC_K) {
-            mma_detail::cp_async_wait_group<0>();
-            __syncthreads();
-        } else {
-            issue_K(t0);
-        }
-
-        // ---- Load V tile transposed: s_VT[d, t] = V[t, d] ----
-        {
-            constexpr uint32_t HALVES_PER_LD = 8;
-            constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
-            constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
-            constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
-            const uint32_t row_in_pass = tid / LANES_PER_ROW;
-            const uint32_t col_lane    = tid % LANES_PER_ROW;
-            #pragma unroll
-            for (uint32_t pass = 0; pass < N_PASS; ++pass) {
-                const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
-                const uint32_t t     = t0 + shm_t;
-                const uint32_t base_d = col_lane * HALVES_PER_LD;
+    // V loader. issue_V(t0_target) issues cp.async (when USE_CP_ASYNC_V) or
+    // performs synchronous loads (otherwise) for the V tile starting at
+    // t0_target. Layouts:
+    //
+    //   USE_CP_ASYNC_V == false: s_V_buf is viewed as s_VT[d, t] (col-major
+    //     in (d, t)) — the legacy transposed layout. The store path does a
+    //     scalar-strided write per half, so cp.async cannot help.
+    //
+    //   USE_CP_ASYNC_V == true:  s_V_buf is viewed as s_V[t, d] (row-major
+    //     in (t, d), stride HEAD_DIM). Each thread writes a contiguous
+    //     16-byte chunk (8 halves), which fits cp.async.cg.16. The PV-side
+    //     MMA reads it via ldmatrix.x2.trans (B operand col-major).
+    //
+    // Lane partitioning for both paths matches the K loader: 8 halves per
+    // lane, LANES_PER_ROW lanes cover one t-row, 128 / LANES_PER_ROW rows
+    // per pass.
+    auto issue_V = [&](uint32_t t0_target) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0_target + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            const bool in_range = (t < block_max_kv);
+            if (USE_CP_ASYNC_V) {
+                __half *dst = &s_V_buf[shm_t * HEAD_DIM + base_d];
+                if (in_range) {
+                    const __half *v_src = v_cache
+                        + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    mma_detail::cp_async_cg_16(dst, v_src);
+                } else {
+                    mma_detail::cp_async_zero_16(dst);
+                }
+            } else {
                 __half v8[HALVES_PER_LD];
-                if (t < block_max_kv) {
+                if (in_range) {
                     const __half *v_src = v_cache
                         + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
                         + kv_head * HEAD_DIM + base_d;
@@ -1950,11 +1999,50 @@ fattn_prefill_mma_gqa_kernel_t(
                 }
                 #pragma unroll
                 for (uint32_t i = 0; i < HALVES_PER_LD; ++i) {
-                    s_VT[(base_d + i) * BC + shm_t] = v8[i];
+                    s_V_buf[(base_d + i) * BC + shm_t] = v8[i];
                 }
             }
         }
+    };
 
+    // Prologue: issue tile 0's K and V cp.async. K commits to one group and
+    // V commits to another, so we can wait on them independently if needed.
+    // Order matters for the wait pattern in the loop:
+    //   - K committed first (group "older")
+    //   - V committed second
+    //
+    // wait_group<0> drains everything; wait_group<1> waits until only 1
+    // group remains in flight. That lets us wait for K alone (1 outstanding
+    // = the V we just committed) before QK, then wait for V before PV.
+    if (USE_CP_ASYNC_K) {
+        issue_K(0);
+        mma_detail::cp_async_commit();
+    }
+    if (USE_CP_ASYNC_V) {
+        issue_V(0);
+        mma_detail::cp_async_commit();
+    }
+
+    // =====================================================================
+    // Tile loop over KV.
+    // =====================================================================
+    for (uint32_t t0 = 0; t0 < block_max_kv; t0 += BC) {
+
+        // ---- Wait for in-flight K (and V if cp.async) at top of tile ----
+        // With both cp.async paths on, the prologue or previous iter has
+        // issued K[t0] and V[t0]. wait_group<0> drains both. Sync loads
+        // follow for whichever buffer is non-async, then a single
+        // __syncthreads makes ALL writes visible before QK reads s_K and
+        // PV reads s_V_buf.
+        if (USE_CP_ASYNC_K || USE_CP_ASYNC_V) {
+            mma_detail::cp_async_wait_group<0>();
+        }
+        if (!USE_CP_ASYNC_K) {
+            issue_K(t0);
+        }
+        if (!USE_CP_ASYNC_V) {
+            issue_V(t0);
+        }
         __syncthreads();
 
         // ---- QK^T phase: compute all Q_PER_KV heads' scores in registers ----
@@ -2072,16 +2160,28 @@ fattn_prefill_mma_gqa_kernel_t(
 
         // ---- Phase B: PV with V loads hoisted out of per-head loop ----
         // For each (n, ks) load V once, then iterate the Q_PER_KV heads.
+        // V layout depends on USE_CP_ASYNC_V: row-major s_V[t, d] with
+        // ldmatrix.x2.trans, or transposed s_VT[d, t] with pack2h.
         #pragma unroll
         for (uint32_t n = 0; n < PV_N_TILES; ++n) {
             const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
             #pragma unroll
             for (uint32_t ks = 0; ks < PV_KSTEPS; ++ks) {
                 const uint32_t k0 = ks * MMA_K;
-                const uint32_t out_col = n0 + group_id;
-                const __half *vrow0 = &s_VT[out_col * BC + k0 + in_group * 2];
-                const unsigned b0 = mma_detail::pack2h(vrow0);
-                const unsigned b1 = mma_detail::pack2h(vrow0 + 8);
+                unsigned b0, b1;
+                if (USE_CP_ASYNC_V) {
+                    // Row-major s_V[t, d]: B operand for m16n8k16.row.col
+                    // is the (BC, HEAD_DIM) submatrix at (k0..k0+15, n0..n0+7),
+                    // viewed col-major. ldmatrix.x2.trans does the transpose.
+                    const __half *vbase = &s_V_buf[k0 * HEAD_DIM + n0];
+                    mma_detail::ldmatrix_x2_b_trans(b0, b1, vbase, HEAD_DIM);
+                } else {
+                    // Transposed s_VT[d, t]: K stride is 1, N stride is BC.
+                    const uint32_t out_col = n0 + group_id;
+                    const __half *vrow0 = &s_V_buf[out_col * BC + k0 + in_group * 2];
+                    b0 = mma_detail::pack2h(vrow0);
+                    b1 = mma_detail::pack2h(vrow0 + 8);
+                }
                 #pragma unroll
                 for (uint32_t h = 0; h < Q_PER_KV; ++h) {
                     unsigned a0, a1, a2, a3;
@@ -2091,6 +2191,18 @@ fattn_prefill_mma_gqa_kernel_t(
                         O_acc[h][n][0], O_acc[h][n][1], O_acc[h][n][2], O_acc[h][n][3],
                         a0, a1, a2, a3, b0, b1);
                 }
+            }
+        }
+
+        // ---- Issue V[t0+BC] cp.async now (s_V_buf is dead after PV). The
+        // gmem read overlaps the next iter's K wait, Q init, and softmax.
+        // Single-buffered V with the wait_group + sync at the top of next
+        // iter ensuring visibility (same pattern as K). ----
+        if (USE_CP_ASYNC_V) {
+            const uint32_t t0_next = t0 + BC;
+            if (t0_next < block_max_kv) {
+                issue_V(t0_next);
+                mma_detail::cp_async_commit();
             }
         }
     }
@@ -2278,26 +2390,40 @@ bool launch_fattn_prefill_mma_gqa_f16(
         if (!e) return true;
         return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
     }();
+    // QW3_PREFILL_FA2_VCPASYNC: cp.async double-buffer the V tile load.
+    // Requires the row-major s_V[t,d] shmem layout and ldmatrix.x2.trans on
+    // the PV-side B operand. V[t+1] is issued post-PV (when s_V is dead)
+    // and overlaps the next iter's K wait + Q init + softmax. Default ON.
+    // Set to "0" to fall back to the legacy transposed sync V load.
+    static const bool use_cp_async_v = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_VCPASYNC");
+        if (!e) return true;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
     auto launch = [&](auto HD_v) {
         constexpr uint32_t HD = decltype(HD_v)::value;
-        if (use_cp_async_k) {
-            cudaFuncSetAttribute(fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, true>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-            fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, true><<<grid, block, smem, stream>>>(
-                out, q, q_stride,
-                static_cast<const __half *>(k_cache),
-                static_cast<const __half *>(v_cache),
-                n_heads, n_kv_heads, base_seq_len, batch,
-                q_batch_stride, out_batch_stride, scale);
+        auto dispatch = [&](auto K_v, auto V_v) {
+            constexpr bool K = decltype(K_v)::value;
+            constexpr bool V = decltype(V_v)::value;
+            cudaFuncSetAttribute(
+                fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, K, V>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, K, V>
+                <<<grid, block, smem, stream>>>(
+                    out, q, q_stride,
+                    static_cast<const __half *>(k_cache),
+                    static_cast<const __half *>(v_cache),
+                    n_heads, n_kv_heads, base_seq_len, batch,
+                    q_batch_stride, out_batch_stride, scale);
+        };
+        if (use_cp_async_k && use_cp_async_v) {
+            dispatch(std::true_type{},  std::true_type{});
+        } else if (use_cp_async_k) {
+            dispatch(std::true_type{},  std::false_type{});
+        } else if (use_cp_async_v) {
+            dispatch(std::false_type{}, std::true_type{});
         } else {
-            cudaFuncSetAttribute(fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, false>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-            fattn_prefill_mma_gqa_kernel_t<HD, 6, BR, BC, false><<<grid, block, smem, stream>>>(
-                out, q, q_stride,
-                static_cast<const __half *>(k_cache),
-                static_cast<const __half *>(v_cache),
-                n_heads, n_kv_heads, base_seq_len, batch,
-                q_batch_stride, out_batch_stride, scale);
+            dispatch(std::false_type{}, std::false_type{});
         }
     };
     if (head_dim == 256) launch(std::integral_constant<uint32_t, 256>{});
