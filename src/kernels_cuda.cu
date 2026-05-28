@@ -134,14 +134,20 @@ bool launch_fattn_prefill_mma_pipe_f16(
 // GQA-fused variant: one block per (kv_head, q_block) processes ALL Q_PER_KV
 // q-heads sharing this kv_head, loading K/V once and reusing it Q_PER_KV
 // times. Cuts K/V HBM traffic Q_PER_KV× (6× on Qwen 3.6 27B). Currently
-// instantiated only for Q_PER_KV=6 (Qwen 3.6 27B).
+// instantiated only for Q_PER_KV=6 (Qwen 3.6 27B). When NSPLIT>1 (chosen
+// internally), `scratch` must hold at least
+// fattn_prefill_mma_gqa_scratch_bytes() bytes for the per-split partials
+// + (m, l) buffers.
 bool launch_fattn_prefill_mma_gqa_f16(
-        float *out, const float *q, uint32_t q_stride,
+        float *out, void *scratch, size_t scratch_bytes,
+        const float *q, uint32_t q_stride,
         const void *k_cache, const void *v_cache,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
         uint32_t batch, uint32_t base_seq_len,
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream);
+size_t fattn_prefill_mma_gqa_scratch_bytes(uint32_t batch, uint32_t n_heads,
+                                            uint32_t n_kv_heads, uint32_t head_dim);
 }
 
 namespace {
@@ -1732,6 +1738,7 @@ public:
         if (fattn_scratch_) cudaFree(fattn_scratch_);
         if (prefill_attn_q_fp16_) cudaFree(prefill_attn_q_fp16_);
         if (prefill_attn_scores_fp16_) cudaFree(prefill_attn_scores_fp16_);
+        if (prefill_gqa_scratch_) cudaFree(prefill_gqa_scratch_);
         if (argmax_dev_) cudaFree(argmax_dev_);
         if (argmax_host_) cudaFreeHost(argmax_host_);
     }
@@ -3057,6 +3064,21 @@ public:
         return {};
     }
 
+    DeviceStatus ensure_prefill_gqa_scratch(size_t need) {
+        if (need == 0) return {};
+        if (need > prefill_gqa_scratch_capacity_) {
+            if (prefill_gqa_scratch_) cudaFree(prefill_gqa_scratch_);
+            if (auto st = cuda_status(cudaMalloc(&prefill_gqa_scratch_, need),
+                                      "prefill_gqa scratch alloc"); !st.ok) {
+                prefill_gqa_scratch_ = nullptr;
+                prefill_gqa_scratch_capacity_ = 0;
+                return st;
+            }
+            prefill_gqa_scratch_capacity_ = need;
+        }
+        return {};
+    }
+
     // cuBLAS-based prefill attention. For each KV group g (gqa_ratio query
     // heads share one KV head), runs:
     //   1) S_g = Q_g · K_g^T            (cuBLAS strided-batched HGEMM, batch=ratio)
@@ -3386,8 +3408,16 @@ public:
             prefill_attn_kernel_choice() == PrefillAttnKernel::MmaGqa &&
             batch >= prefill_attn_min_batch() &&
             (head_dim == 128 || head_dim == 256)) {
+            const size_t need = ported::fattn_prefill_mma_gqa_scratch_bytes(
+                    batch, n_heads, n_kv_heads, head_dim);
+            if (need > 0) {
+                if (auto st = ensure_prefill_gqa_scratch(need); !st.ok) {
+                    return st;
+                }
+            }
             if (ported::launch_fattn_prefill_mma_gqa_f16(
-                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    o.ptr, prefill_gqa_scratch_, prefill_gqa_scratch_capacity_,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim,
                     batch, base_seq_len,
                     q_batch_stride, out_batch_stride, scale, exec_stream_)) {
@@ -3594,6 +3624,11 @@ private:
     uint64_t prefill_attn_q_fp16_capacity_ = 0;       // elements
     __half *prefill_attn_scores_fp16_ = nullptr;
     uint64_t prefill_attn_scores_fp16_capacity_ = 0;  // elements
+    // Per-split partials + (m, l) scratch for the GQA-fused FA2 prefill
+    // kernel when NSPLIT > 1 (split-KV cooperative reduction). Sized to the
+    // largest (n_heads * batch * NSPLIT * (HD + 2)) seen so far.
+    void   *prefill_gqa_scratch_ = nullptr;
+    size_t  prefill_gqa_scratch_capacity_ = 0;        // bytes
     // X-FP16 cache for hgemm_q8. The QKV and gate/up matmul pairs share the
     // same FP32 input pointer in immediate succession; without a cache we
     // re-run fp32_to_fp16_kernel on identical data. Cache key is
