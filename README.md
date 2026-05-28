@@ -18,9 +18,9 @@ Short prompts (< ~100 tokens) make prefill numbers dominated by per-process
 startup overhead — both qw3 and llama.cpp pay fixed costs (model load, CUDA
 context, kernel cache warmup, lazy init), and qw3 even charges the first
 prefill with one-shot kernel selection. Comparisons below run a sweep across
-{512, 1024, 2048, 4096, 8192, 16384, 32768}-token prompts with 3 trials per
-cell, alternating qw3 ↔ llama.cpp to spread thermal drift, and report the
-median.
+{512, 1024, 2048, 4096, 8192, 16384, 32768, 65536}-token prompts with 3
+trials per cell, alternating qw3 ↔ llama.cpp to spread thermal drift, and
+report the median.
 
 Reproduce with:
 
@@ -30,21 +30,23 @@ python3 scripts/long_prompt_sweep.py --json /tmp/sweep.json
 
 | Prompt tokens | qw3 prefill | llama prefill | prefill % | qw3 decode | llama decode | decode % |
 |---:|---:|---:|---:|---:|---:|---:|
-|   556 | 1944.5 tok/s | 2810.2 tok/s | **69.2%** | 45.19 tok/s | 45.81 tok/s | **98.6%** |
-|  1098 | 2754.7 tok/s | 3328.9 tok/s | **82.8%** | 44.60 tok/s | 45.79 tok/s | **97.4%** |
-|  2182 | 3429.1 tok/s | 3595.4 tok/s | **95.4%** | 44.68 tok/s | 45.45 tok/s | **98.3%** |
-|  4350 | 3744.5 tok/s | 3768.0 tok/s | **99.4%** | 43.19 tok/s | 44.96 tok/s | **96.1%** |
-|  8415 | 3734.5 tok/s | 3788.3 tok/s | **98.6%** | 43.62 tok/s | 44.23 tok/s | **98.6%** |
-| 16545 | 3457.7 tok/s | 3707.7 tok/s | **93.3%** | 41.81 tok/s | 43.72 tok/s | **95.6%** |
-| 33076 | 2861.0 tok/s | 3536.3 tok/s | **80.9%** | 41.11 tok/s | 42.57 tok/s | **96.6%** |
+|   556 | 1981.2 tok/s | 2799.0 tok/s | **70.8%** | 45.25 tok/s | 45.76 tok/s | **98.9%** |
+|  1098 | 2779.0 tok/s | 3347.2 tok/s | **83.0%** | 44.62 tok/s | 45.75 tok/s | **97.5%** |
+|  2182 | 3465.3 tok/s | 3610.0 tok/s | **96.0%** | 44.48 tok/s | 45.39 tok/s | **98.0%** |
+|  4350 | 3799.8 tok/s | 3774.5 tok/s | **100.7%** | 43.41 tok/s | 44.97 tok/s | **96.5%** |
+|  8415 | 3822.8 tok/s | 3785.9 tok/s | **101.0%** | 43.71 tok/s | 44.12 tok/s | **99.1%** |
+| 16545 | 3576.1 tok/s | 3713.0 tok/s | **96.3%** | 41.56 tok/s | 43.68 tok/s | **95.1%** |
+| 33076 | 2997.4 tok/s | 3531.9 tok/s | **84.9%** | 40.72 tok/s | 42.51 tok/s | **95.8%** |
+| 65867 | 2231.6 tok/s | 3075.8 tok/s | **72.6%** | 36.98 tok/s | 39.86 tok/s | **92.8%** |
 
-All numbers are absolute tokens/second (n_decode=256, ctx=36864, both engines
+All numbers are absolute tokens/second (n_decode=256, ctx=73728, both engines
 greedy). The `%` columns report `qw3 / llama.cpp`. Three trends jump out:
 
-- **Decode is at parity with llama.cpp up to 4K** (96–100% across short and
-  medium contexts), then degrades past 8K (94.5% at 8K, 86% at 16K, 75% at
-  32K). It used to be 88–92% at 4K. Four changes in this round closed the
-  short-context gap, in order of impact:
+- **Decode tracks llama.cpp closely across the full sweep** — 96–99% from
+  556 to 8K, 95% at 16K–32K, 93% at 65K. The decode side is now matvec-
+  dominated and HBM-bandwidth-bound; further wins require fewer matvec
+  calls, not faster kernels. Four changes closed the short-context gap,
+  in order of impact:
 
   1. **Adaptive decode-attention split-K** (`src/fattn_vec_decode.cu`).
      The old `pick_nsplit` returned `NSPLIT=1` for `seq_len <= 1024`, so
@@ -96,36 +98,48 @@ greedy). The `%` columns report `qw3 / llama.cpp`. Three trends jump out:
   The remaining ~1 tok/s gap at 4K is launch dispatch + DeltaNet recurrent
   fusion potential (~5% of decode); both are small wins from here.
 
-- **Prefill peaks at 99% of llama.cpp around 4K**, holds 95–99% from 2K–8K,
-  then degrades at long T — 93% at 16K, 81% at 32K. The dominant cost on
-  llama.cpp's prefill is `mul_mat_q` (INT8 MMA on raw Q8_0) at 64% of GPU
-  time — they bypass dequant entirely. qw3 currently runs prefill matmul
-  through cuBLAS HGEMM with on-the-fly Q8 → FP16 dequant (~12% of prefill
-  GPU time goes to dequant + FP32→FP16 staging). The prefill attention
-  path went through five stages: tiled FA2 (BR=16, vec int4 K/V loads)
-  cut per-call attn 33→22 ms at 4K (+10%); the m16n8k16.f16 tensor-core
-  rewrite cut it again 22→14 ms (+11%); the GQA q-head fusion (one CTA
-  per kv_head, all 6 q-heads packed into the same block) cut 32K prefill
-  from 1700 → 2520 tok/s (+48%) and 16K from 2455 → 3199 (+30%) by
-  eliminating the 6× K/V re-read per kv_head; **K cp.async** (post-QK
-  issue, single-buffered) added +5–7% at long T (128K prefill 978→1043
-  tok/s); **V cp.async + row-major shmem + ldmatrix.x2.trans** added
-  +14% at 65K (1823→2085 tok/s standalone), with the V[t+1] cp.async
-  hiding ~3–4 µs of HBM latency per tile behind the next iter's softmax
-  + Q init. The in-tree MMQ kernel (`src/mmq_q8.cu`, opt-in via
-  `QW3_MATMUL=mmq`) hits 74% of HGEMM at 2K — still trailing — and v3
-  ldmatrix/v4 8-warp 128×128/v5 mmq_x=64 are all parity-correct but
-  slower than v2; only stream-K outer scheduling remains as a structural
-  attack on MMQ (see prefill roadmap below).
+- **Prefill matches or slightly beats llama.cpp from 2K–8K** (96–101%),
+  then degrades at long T — 96% at 16K, 85% at 32K, 73% at 65K. The
+  dominant cost on llama.cpp's prefill is `mul_mat_q` (INT8 MMA on raw
+  Q8_0) at 64% of GPU time — they bypass dequant entirely. qw3 currently
+  runs prefill matmul through cuBLAS HGEMM with on-the-fly Q8 → FP16
+  dequant (~12% of prefill GPU time goes to dequant + FP32→FP16 staging).
+  The prefill attention path went through six stages: tiled FA2 (BR=16,
+  vec int4 K/V loads) cut per-call attn 33→22 ms at 4K (+10%); the
+  m16n8k16.f16 tensor-core rewrite cut it again 22→14 ms (+11%); the
+  GQA q-head fusion (one CTA per kv_head, all 6 q-heads packed into the
+  same block) cut 32K prefill from 1700 → 2520 tok/s (+48%) and 16K from
+  2455 → 3199 (+30%) by eliminating the 6× K/V re-read per kv_head;
+  **K cp.async** (post-QK issue, single-buffered) added +5–7% at long T
+  (128K prefill 978→1043 tok/s); **V cp.async + row-major shmem +
+  ldmatrix.x2.trans** added +14% at 65K (1823→2085 tok/s standalone),
+  with the V[t+1] cp.async hiding ~3–4 µs of HBM latency per tile behind
+  the next iter's softmax + Q init; **FA2 v2** (`MmaGqaV2`, default)
+  rewrites the kernel with BR=8 + ncols2=2 q-head pack into the MMA
+  m-axis + Q-in-registers + BC=64, mirroring llama.cpp's
+  `flash_attn_ext_f16<256,256,8,8>` structure. v2 collapses v1's
+  per-h softmax loop (12 syncs/tile) into one combined softmax over
+  m=16 rows (3 syncs/tile) — at T=65K that's ~3K syncs/CTA vs v1's 24K.
+  v2 added +1.6% at 4K, +3.0% at 16K, +4.4% at 32K, +6.0% at 65K, and
+  freed 25 KB shmem for future pipeline depth. The in-tree MMQ kernel
+  (`src/mmq_q8.cu`, opt-in via `QW3_MATMUL=mmq`) hits 74% of HGEMM at
+  2K — still trailing — and v3 ldmatrix/v4 8-warp 128×128/v5 mmq_x=64
+  are all parity-correct but slower than v2; only stream-K outer
+  scheduling remains as a structural attack on MMQ (see prefill roadmap
+  below).
 
-- **The long-context cliff is now bounded by HGEMM dequant + remaining
-  attention HBM, not split-K or GQA reads.** Decode degrades from 99% →
-  97% over 8K → 32K (essentially flat); prefill degrades from 99% → 81%.
-  Most of the residual prefill slope at 16K–32K is HGEMM Q8 dequant +
-  activation staging (~17% of prefill time at long T), with the remainder
-  on KV-append and decode-attn growing linearly. The next prefill levers
-  (TMA on K/V, layer-pipeline fusion, CUTLASS Q8-fused-dequant GEMM) all
-  attack this residual.
+- **The long-context cliff is bounded by HBM-BW on the K/V stream**, not
+  by L2 capacity, CTA scheduling, or matmul. The 27% gap at T=65K is
+  what's left after all intra-CTA wins (sync count, ldmatrix patterns,
+  selective cp.async, q-head packing) are exhausted. Profiles show K/V
+  are read once per tile per kv_head per layer with no inter-CTA reuse,
+  so locality reorderings (split-KV, persistent scheduler, grid-axis
+  swap) all came back neutral. The remaining attacks shrink bytes-per-
+  tile (TMA bulk loads, BC=128 with shmem budget shuffle) or hide more
+  of the HBM latency behind compute (FA3-style producer/consumer warp
+  specialization). Decode degrades from 99% → 95% over 8K → 32K and
+  93% at 65K (essentially flat); the residual is KV-append and
+  decode-attn growing linearly with T.
 
 How we got here, decode at 4350-token context (median of 3 trials, n=64,
 llama.cpp baseline 44.77 tok/s on this GPU):
@@ -291,10 +305,34 @@ come from:
     in `src/fattn_vec_decode.cu`; the launcher does a 4-way template
     dispatch on the two flags.
 
-### Long-context profile (T=64K / 96K, 2026-05-28)
+4e. **FA2 v2: BR=8 + ncols2=2 q-head pack + Q-in-registers + BC=64.**
+    *(Done — default for Qwen GQA standard-attn layers since 2026-05-29.)*
+    v1's per-h softmax loop ran 6 sequential phases per BC=32 tile (~12
+    syncs/tile) and was the dominant intra-CTA bottleneck after every
+    micro-opt was exhausted. v2 (`fattn_prefill_mma_gqa_kernel_v2_t`)
+    mirrors llama.cpp's `flash_attn_ext_f16<DKQ=256, DV=256, ncols1=8,
+    ncols2=8>`: ncols2=2 packs two q-heads into the MMA m=16 fragment
+    (8 q-tokens × 2 q-heads = 16 fully-utilized rows, zero waste against
+    Qwen's q_per_kv=6 → 3 CTAs per kv_head), Q lives in registers
+    (saves 48 KB shmem), BC doubles to 64. The packing layout
+    `m_in_frag = c * BR + r` is essential — c=0 fills m=0..7 (a-pair),
+    c=1 fills m=8..15 (b-pair), so each m16n8k16 MMA produces both
+    packed q-heads in a single accumulator. Sync count drops 12→3 per
+    tile; at T=65K that's 3K syncs/CTA vs v1's 24K (8× drop). v2 added
+    +1.6% at 4K, +3.0% at 16K, +4.4% at 32K, +6.0% at 65K — the win
+    grows with T as predicted from the sync-count math. qw3 overtakes
+    llama.cpp at 4K (101%) and 8K (101%). Total shmem ~70 KB (vs v1's
+    95 KB), leaving 25 KB headroom for future BC=128 / pipeline depth /
+    persistent-CTA shuffles. v2 is hard-gated to `q_per_kv == 6`; other
+    GQA shapes fall back to v1 (`MmaGqa`) automatically. Toggles:
+    `QW3_PREFILL_ATTN=mma-gqa` (revert to v1) or `mma-gqa-v2` (explicit).
 
-After K/V cp.async there's still a long-context cliff: prefill drops to
-65% of llama.cpp at 64K and 62% at 96K. `nsys` per-component breakdown:
+### Long-context profile (T=64K / 96K, 2026-05-28; pre-v2)
+
+This profile was taken before the FA2 v2 rewrite. After v2 the FA2
+attention column drops by another ~6% at T=65K (qw3 now 2231 vs 2085
+tok/s pre-v2), but the qualitative shape — long-T gap is FA2, matmul
+runs ahead of llama.cpp — is unchanged. `nsys` per-component breakdown:
 
 | Component | qw3 64K | llama 64K | qw3/llama | qw3 96K | llama 96K | qw3/llama |
 |---|---:|---:|---:|---:|---:|---:|
@@ -364,8 +402,8 @@ Path (a) is what llama.cpp does and is the next implementation target.
 
 ## Prefill roadmap — closing the gap to llama.cpp
 
-Current state: 62–99% of llama.cpp prefill (peaking at 99% around 4–8K,
-falling to 81% at 32K, 65% at 64K, 62% at 96K). The default matmul
+Current state: 71–101% of llama.cpp prefill (peaking at 101% at 4K–8K,
+falling to 96% at 16K, 85% at 32K, 73% at 65K). The default matmul
 backend is HGEMM (cuBLAS HGEMM on Q8 → FP16 weights). MMQ exists as
 opt-in (`QW3_MATMUL=mmq`) but at long T qw3's HGEMM path is **30–40%
 faster than llama.cpp's stream-K MMQ** — see the long-context profile
