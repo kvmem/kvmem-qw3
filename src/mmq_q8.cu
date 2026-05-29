@@ -150,6 +150,34 @@ __device__ __forceinline__ unsigned load_int_align2(const uint8_t *p, int byte_o
            (static_cast<unsigned>(p16[1]) << 16);
 }
 
+// cp.async.cg.shared.global of 16 bytes from gmem -> smem. Used by v7 to
+// pipeline the next K-block's W+Y read against the current K-block's MMA.
+// Plane Q is 16-byte aligned (n_blocks % 16 == 0 for every Qwen3.6 col),
+// so the int8 quants stream is now legal to cp.async with 16-B chunks.
+__device__ __forceinline__ void cp_async_cg_16(void *smem_dst, const void *gmem_src) {
+#if __CUDA_ARCH__ >= 800
+    unsigned dst = __cvta_generic_to_shared(smem_dst);
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :: "r"(dst), "l"(gmem_src));
+#else
+    *reinterpret_cast<int4 *>(smem_dst) = *reinterpret_cast<const int4 *>(gmem_src);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+
 template <bool need_check>
 __launch_bounds__(V2_THREADS, 2)
 __global__ void mmq_q8_0_v2_kernel(
@@ -1429,6 +1457,240 @@ __global__ void mmq_q8_0_v6_kernel(
 
 } // namespace
 
+// ===========================================================================
+// v7: cp.async pipelined version of v2.
+//
+// Same geometry as v2 (4 warps × 64×128 tile, 1 Q8_0 block of K=32 per outer
+// iter). The hot loop fetches K-block kb+1's W and Y *while* the MMA for
+// kb is in flight, using cp.async.cg.shared.global. Two-stage rotating
+// buffer: stage 0 holds kb, stage 1 holds kb+1.
+//
+// Why this can win over v2 (which lost to HGEMM): v2's hot loop is
+// gmem-bound on the W tile read (64 rows × 32 int8 = 2 KB / K block / CTA,
+// but issued *synchronously* — every K iter the CTA stalls waiting for
+// gmem). cp.async keeps the LSUs busy in parallel with the MMA core. With
+// the split-plane Q8 layout (phase A), Plane Q is 16-byte aligned, so
+// cp.async.cg.shared.global with 16-byte transfers is now legal (it was
+// not for the legacy interleaved 34-B blocks).
+//
+// Per K block, per CTA:
+//   W_qs : 64 rows × 32 int8 = 2048 B → 128 cp.async.16-B issues
+//          (1 issue per thread, 128 threads)
+//   W_d  : 64 floats from Plane S (synchronous; 64 lanes, one .h read each)
+//   Y_qs : 128 rows × 32 int8 = 4096 B → 256 cp.async.16-B issues
+//          (2 issues per thread)
+//   Y_d  : 128 floats from .ds (synchronous; one .h read per thread)
+//
+// We use one 4096-B-stage rotating buffer for W_qs and one 8192-B for Y_qs.
+// Total shmem (W_qs * 2 + Y_qs * 2 + W_d * 2 + Y_d * 2) = ~25 KB.
+//
+// The MMA core is identical to v2's per-lane shmem reads. We could swap in
+// ldmatrix.x4/x2 (v3 path) but v3 was a wash without cp.async; the win
+// here is overlap, not fragment-load efficiency.
+
+namespace {
+
+// Per K block:
+//   W_qs[stage] : 64 rows × 32 ints (each thread one int via cp.async.16 → 4 ints)
+//                 → 4 8-int chunks per thread per fill, but better: 64*32/16 = 128
+//                 16-B chunks total, perfectly 1 per thread.
+//   Layout: row-major, V2_K_STRIDE = 36 (32 data + 4 pad) ints per row to
+//   match v2's MMA reader. We write 32 ints/row (8 .b32 = 32 B = 2 cp.async.16),
+//   leaving the 4 pad ints untouched (safe — only the first 32 are read).
+//
+// Wait, v2 stores W_qs as int8_t[V2_M_PER_CTA][V2_K_STRIDE], where V2_K_STRIDE
+// is in BYTES (36 bytes/row). So per row 32 useful bytes, 4 pad. 64 rows × 32 B
+// = 2048 B = 128 16-B chunks. With 128 threads, 1 chunk/thread/iter.
+
+static constexpr int V7_K_STRIDE             = MMQ_QK;                            // 32 (no pad — 16-B aligned for cp.async)
+static constexpr int V7_W_QS_BYTES_PER_STAGE = V2_M_PER_CTA * V7_K_STRIDE;        // 64*32 = 2048 B
+static constexpr int V7_Y_QS_BYTES_PER_STAGE = V2_N_PER_CTA * V7_K_STRIDE;        // 128*32 = 4096 B
+static constexpr int V7_STAGES               = 2;
+
+template <bool need_check>
+__launch_bounds__(V2_THREADS, 2)
+__global__ void mmq_q8_0_v7_kernel(
+        const uint8_t   * __restrict__ wq,
+        const block_q8_1 * __restrict__ ya,
+        float           * __restrict__ dst,
+        uint32_t          rows,
+        uint32_t          cols,
+        uint32_t          batch,
+        uint32_t          stride_y_row,
+        uint32_t          stride_dst_row)
+{
+    // Aligned shmem for cp.async (16-B alignment required).
+    // Use V7_K_STRIDE=32 (not v2's 36): pack contiguous 32-byte rows so per-row
+    // shmem offsets are 32-byte aligned → cp.async.cg.shared.global.16 is legal.
+    __shared__ __align__(16) int8_t W_qs_buf[V7_STAGES][V2_M_PER_CTA][V7_K_STRIDE];
+    __shared__ float                W_d_buf [V7_STAGES][V2_M_PER_CTA];
+    __shared__ __align__(16) int8_t Y_qs_buf[V7_STAGES][V2_N_PER_CTA][V7_K_STRIDE];
+    __shared__ float                Y_d_buf [V7_STAGES][V2_N_PER_CTA];
+
+    const int n_blocks = static_cast<int>(cols / MMQ_QK);
+    const int row0  = static_cast<int>(blockIdx.x) * V2_M_PER_CTA;
+    const int col00 = static_cast<int>(blockIdx.y) * V2_N_PER_CTA;
+
+    const int warp_id = static_cast<int>(threadIdx.y);
+    const int lane    = static_cast<int>(threadIdx.x);
+    const int tid     = warp_id * V2_WARP + lane;
+    const int gid     = lane >> 2;
+    const int tid4    = lane & 3;
+
+    float acc[V2_NW][4];
+    #pragma unroll
+    for (int n = 0; n < V2_NW; ++n) {
+        acc[n][0] = 0.0f; acc[n][1] = 0.0f;
+        acc[n][2] = 0.0f; acc[n][3] = 0.0f;
+    }
+
+    // Issue cp.async loads for K block `kb` into stage `s`. Returns nothing;
+    // caller must call cp_async_commit() after to close the group.
+    auto issue_kb = [&](int kb, int s) {
+        // ---- W_qs: 64 rows × 32 B per row, 128 threads, 16 B/thread/iter ----
+        // Total bytes = 64*32 = 2048 = 128 * 16. One issue per thread.
+        {
+            const int rl    = tid >> 1;          // 0..63 (which row)
+            const int half  = tid & 1;           // 0 or 1 (low or high 16 B)
+            const int row   = row0 + rl;
+            const int col_byte = half * 16;
+            int8_t *dst_p = &W_qs_buf[s][rl][col_byte];
+            const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
+            if (in_range) {
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                const int8_t  *qs_blk   = cuda_helpers::q8_qs_plane(row_base, n_blocks) + kb * 32;
+                cp_async_cg_16(dst_p, qs_blk + col_byte);
+            } else {
+                // Zero-fill via shmem write (synchronous; cp.async would still
+                // need a valid gmem source). Since the boundary handler kicks
+                // in only at trailing tile, this branch is cold.
+                int4 *zp = reinterpret_cast<int4 *>(dst_p);
+                *zp = make_int4(0, 0, 0, 0);
+            }
+        }
+        // ---- Y_qs: 128 rows × 32 B per row = 4096 B.
+        //   block_q8_1.qs is only 4-byte aligned in gmem (block layout is
+        //   {half2 ds; int8 qs[32];}, qs sits at +4 within a 36-B block), so
+        //   cp.async.cg.shared.global.16 is illegal here. Use 4-byte cp.async
+        //   (cp.async.ca.shared.global.4) — 8 issues per row × 128 rows = 1024
+        //   issues / 128 threads = 8 issues per thread.
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const int flat  = p * V2_THREADS + tid;   // 0..1023
+            const int bl    = flat >> 3;              // 0..127 (batch row)
+            const int q     = flat & 7;               // 0..7 (which 4-B chunk)
+            const int batch_idx = col00 + bl;
+            const int col_byte  = q * 4;
+            int *dst_p = reinterpret_cast<int *>(&Y_qs_buf[s][bl][col_byte]);
+            const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
+            if (in_range) {
+                const block_q8_1 *yblk = ya + static_cast<size_t>(batch_idx) * stride_y_row + kb;
+                const int *src_p = reinterpret_cast<const int *>(yblk->qs + col_byte);
+                cp_async_ca_4(dst_p, src_p);
+            } else {
+                cp_async_zero_4(dst_p);
+            }
+        }
+        // ---- Scalar scales (W_d, Y_d): synchronous, small. ----
+        if (tid < V2_M_PER_CTA) {
+            const int row = row0 + tid;
+            float d = 0.0f;
+            const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
+            if (in_range) {
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                d = __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kb]));
+            }
+            W_d_buf[s][tid] = d;
+        }
+        {
+            const int batch_idx = col00 + tid;
+            float d = 0.0f;
+            const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
+            if (in_range) {
+                const block_q8_1 *yblk = ya + static_cast<size_t>(batch_idx) * stride_y_row + kb;
+                d = __low2float(yblk->ds);
+            }
+            Y_d_buf[s][tid] = d;
+        }
+    };
+
+    // Prologue: issue stage 0 for kb=0, commit, then loop with stage rotation.
+    if (n_blocks > 0) {
+        issue_kb(0, 0);
+        cp_async_commit();
+    }
+
+    for (int kb = 0; kb < n_blocks; ++kb) {
+        const int s_cur  = kb & 1;
+        const int s_next = (kb + 1) & 1;
+
+        // Prefetch the next K block (if any) before we wait on the current.
+        // We keep at most 2 in-flight groups: the current (for s_cur) and the
+        // next (for s_next).
+        if (kb + 1 < n_blocks) {
+            issue_kb(kb + 1, s_next);
+            cp_async_commit();
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_group<0>();
+        }
+        __syncthreads();
+
+        // ---------- Compute MMA for s_cur ----------
+        const int rl_top = warp_id * V1_M_TILE + gid;
+        const int rl_bot = rl_top + 8;
+        const unsigned a0 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][4 * tid4]);
+        const unsigned a1 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][4 * tid4]);
+        const unsigned a2 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][4 * tid4 + 16]);
+        const unsigned a3 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][4 * tid4 + 16]);
+        const float d_w_top = W_d_buf[s_cur][rl_top];
+        const float d_w_bot = W_d_buf[s_cur][rl_bot];
+
+        #pragma unroll
+        for (int n = 0; n < V2_NW; ++n) {
+            const int N0 = n * 8;
+            const unsigned b0 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][4 * tid4]);
+            const unsigned b1 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][4 * tid4 + 16]);
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            mma_m16n8k32_s8s8s32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+
+            const float d_y_my    = Y_d_buf[s_cur][N0 + gid];
+            const float d_y_left  = __shfl_sync(0xffffffffu, d_y_my, 8 * tid4,     V2_WARP);
+            const float d_y_right = __shfl_sync(0xffffffffu, d_y_my, 8 * tid4 + 4, V2_WARP);
+
+            acc[n][0] += d_w_top * d_y_left  * static_cast<float>(c0);
+            acc[n][1] += d_w_top * d_y_right * static_cast<float>(c1);
+            acc[n][2] += d_w_bot * d_y_left  * static_cast<float>(c2);
+            acc[n][3] += d_w_bot * d_y_right * static_cast<float>(c3);
+        }
+
+        __syncthreads();
+    }
+
+    // -------- Write back (identical to v2) --------
+    const int row_top = row0 + warp_id * V1_M_TILE + gid;
+    const int row_bot = row_top + 8;
+    const bool top_in = need_check ? (row_top < static_cast<int>(rows)) : true;
+    const bool bot_in = need_check ? (row_bot < static_cast<int>(rows)) : true;
+    #pragma unroll
+    for (int n = 0; n < V2_NW; ++n) {
+        const int col_left  = col00 + n * 8 + 2 * tid4;
+        const int col_right = col_left + 1;
+        const bool left_in  = need_check ? (col_left  < static_cast<int>(batch)) : true;
+        const bool right_in = need_check ? (col_right < static_cast<int>(batch)) : true;
+        if (left_in) {
+            if (top_in) dst[static_cast<size_t>(col_left)  * stride_dst_row + row_top] = acc[n][0];
+            if (bot_in) dst[static_cast<size_t>(col_left)  * stride_dst_row + row_bot] = acc[n][2];
+        }
+        if (right_in) {
+            if (top_in) dst[static_cast<size_t>(col_right) * stride_dst_row + row_top] = acc[n][1];
+            if (bot_in) dst[static_cast<size_t>(col_right) * stride_dst_row + row_bot] = acc[n][3];
+        }
+    }
+}
+
+} // namespace
+
 bool launch_mmq_q8_0(
         const uint8_t * weight,
         const void *    y_q8_1,
@@ -1456,6 +1718,7 @@ bool launch_mmq_q8_0(
         if (e[0] == '4') return 4;
         if (e[0] == '5') return 5;
         if (e[0] == '6') return 6;
+        if (e[0] == '7') return 7;
         return 2;
     }();
 
@@ -1539,6 +1802,16 @@ bool launch_mmq_q8_0(
                     rows, cols, batch, stride_y_row, stride_dst_row);
             } else {
                 mmq_q8_0_v6_kernel<false><<<grid, block, 0, stream>>>(
+                    weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
+                    rows, cols, batch, stride_y_row, stride_dst_row);
+            }
+        } else if (mmq_version == 7) {
+            if (needs_check) {
+                mmq_q8_0_v7_kernel<true><<<grid, block, 0, stream>>>(
+                    weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
+                    rows, cols, batch, stride_y_row, stride_dst_row);
+            } else {
+                mmq_q8_0_v7_kernel<false><<<grid, block, 0, stream>>>(
                     weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
                     rows, cols, batch, stride_y_row, stride_dst_row);
             }
