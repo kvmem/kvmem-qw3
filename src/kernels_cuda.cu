@@ -2440,11 +2440,11 @@ private:
     }
 
     // Returns true when the activation needs to be staged in the
-    // 144-byte block_q8_1_mmq layout (v4 and v5 both consume that format).
+    // 144-byte block_q8_1_mmq layout (v4, v5, and v7 consume that format).
     static bool mmq_uses_mmq_y_layout() {
         static const bool v = []() {
             const char *e = std::getenv("QW3_MMQ_VERSION");
-            return e && (e[0] == '4' || e[0] == '5');
+            return e && (e[0] == '4' || e[0] == '5' || e[0] == '7');
         }();
         return v;
     }

@@ -256,8 +256,8 @@ static ShapeResult run_shape(int M, int N, int K, std::mt19937 &rng) {
 }
 
 int main(int /*argc*/, char ** /*argv*/) {
-    // Force MMQ v4 dispatch in launch_mmq_q8_0.
-    setenv("QW3_MMQ_VERSION", "4", 1);
+    // Force MMQ v7 dispatch in launch_mmq_q8_0 (consumes 144-B block_q8_1_mmq_t).
+    setenv("QW3_MMQ_VERSION", "7", 1);
 
     int dev_count = 0;
     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) {
