@@ -197,8 +197,9 @@ __global__ void mmq_q8_0_v2_kernel(
             unsigned v = 0;
             const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
             if (in_range) {
-                const uint8_t *wblk = wq + (static_cast<size_t>(row) * n_blocks + kb) * 34;
-                v = load_int_align2(wblk + 2, col_byte);
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                const int8_t  *qs_plane = cuda_helpers::q8_qs_plane(row_base, n_blocks);
+                v = load_int_align2(reinterpret_cast<const uint8_t *>(qs_plane + kb * 32), col_byte);
             }
             *reinterpret_cast<unsigned *>(&W_qs[rl][col_byte]) = v;
         }
@@ -208,8 +209,8 @@ __global__ void mmq_q8_0_v2_kernel(
             float d = 0.0f;
             const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
             if (in_range) {
-                const uint8_t *wblk = wq + (static_cast<size_t>(row) * n_blocks + kb) * 34;
-                d = __half2float(*reinterpret_cast<const half *>(wblk));
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                d = __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kb]));
             }
             W_d[tid] = d;
         }
@@ -382,8 +383,9 @@ __global__ void mmq_q8_0_v3_kernel(
             unsigned v = 0;
             const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
             if (in_range) {
-                const uint8_t *wblk = wq + (static_cast<size_t>(row) * n_blocks + kb) * 34;
-                v = load_int_align2(wblk + 2, 4 * kqsx);
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                const int8_t  *qs_plane = cuda_helpers::q8_qs_plane(row_base, n_blocks);
+                v = load_int_align2(reinterpret_cast<const uint8_t *>(qs_plane + kb * 32), 4 * kqsx);
             }
             W_qs[rl * V3_KSTRIDE + kqsx] = static_cast<int>(v);
         }
@@ -393,8 +395,8 @@ __global__ void mmq_q8_0_v3_kernel(
             float d = 0.0f;
             const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
             if (in_range) {
-                const uint8_t *wblk = wq + (static_cast<size_t>(row) * n_blocks + kb) * 34;
-                d = __half2float(*reinterpret_cast<const half *>(wblk));
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                d = __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kb]));
             }
             W_d[tid] = d;
         }
@@ -603,13 +605,13 @@ __device__ __forceinline__ void load_tiles_q8_0_v4(
         const int row = row0 + i;
         const bool in_range = need_check ? (row < rows) : true;
         const int row_clamped = in_range ? row : (rows - 1);  // safe sentinel
-        const uint8_t *base_blk0 = wq + (static_cast<size_t>(row_clamped) * stride_in_blocks
-                                         + kbx0 + kbx) * 34;
-        const uint8_t *base_blk1 = wq + (static_cast<size_t>(row_clamped) * stride_in_blocks
-                                         + kbx0 + kbx + MMQ_TILE_NE_K / QI8_0) * 34;
+        const uint8_t *row_base = wq + static_cast<size_t>(row_clamped) * stride_in_blocks * 34;
+        const int8_t  *qs_plane = cuda_helpers::q8_qs_plane(row_base, stride_in_blocks);
+        const int8_t  *qs_blk0  = qs_plane + (kbx0 + kbx) * 32;
+        const int8_t  *qs_blk1  = qs_plane + (kbx0 + kbx + MMQ_TILE_NE_K / QI8_0) * 32;
 
-        const unsigned v0 = in_range ? load_int_align2(base_blk0 + 2, 4 * kqsx) : 0u;
-        const unsigned v1 = in_range ? load_int_align2(base_blk1 + 2, 4 * kqsx) : 0u;
+        const unsigned v0 = in_range ? load_int_align2(reinterpret_cast<const uint8_t *>(qs_blk0), 4 * kqsx) : 0u;
+        const unsigned v1 = in_range ? load_int_align2(reinterpret_cast<const uint8_t *>(qs_blk1), 4 * kqsx) : 0u;
 
         x_qs[i * MMQ_MMA_TILE_X_K_Q8_0 + 0               + txi] = static_cast<int>(v0);
         x_qs[i * MMQ_MMA_TILE_X_K_Q8_0 + MMQ_TILE_NE_K   + txi] = static_cast<int>(v1);
@@ -626,10 +628,9 @@ __device__ __forceinline__ void load_tiles_q8_0_v4(
         const int row = row0 + i;
         const bool in_range = need_check ? (row < rows) : true;
         const int row_clamped = in_range ? row : (rows - 1);
-        const uint8_t *blk = wq + (static_cast<size_t>(row_clamped) * stride_in_blocks
-                                   + kbx0 + kbxd) * 34;
+        const uint8_t *row_base = wq + static_cast<size_t>(row_clamped) * stride_in_blocks * 34;
         const float d = in_range
-            ? __half2float(*reinterpret_cast<const half *>(blk))
+            ? __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kbx0 + kbxd]))
             : 0.0f;
         x_df[i * MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = d;
     }
@@ -1149,16 +1150,18 @@ __global__ void mmq_q8_0_v1_kernel(
         unsigned a0 = 0, a1 = 0, a2 = 0, a3 = 0;
         float d_w_top = 0.0f, d_w_bot = 0.0f;
         if (row_top_in_range) {
-            const uint8_t *wblk = wq + (static_cast<size_t>(row_top) * n_blocks + kb) * 34;
-            d_w_top = __half2float(*reinterpret_cast<const half *>(wblk));
-            a0 = load_int_align2(wblk + 2, 4 * tid4);
-            a2 = load_int_align2(wblk + 2, 4 * tid4 + 16);
+            const uint8_t *row_base = wq + static_cast<size_t>(row_top) * n_blocks * 34;
+            const int8_t  *qs_blk  = cuda_helpers::q8_qs_plane(row_base, n_blocks) + kb * 32;
+            d_w_top = __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kb]));
+            a0 = load_int_align2(reinterpret_cast<const uint8_t *>(qs_blk), 4 * tid4);
+            a2 = load_int_align2(reinterpret_cast<const uint8_t *>(qs_blk), 4 * tid4 + 16);
         }
         if (row_bot_in_range) {
-            const uint8_t *wblk = wq + (static_cast<size_t>(row_bot) * n_blocks + kb) * 34;
-            d_w_bot = __half2float(*reinterpret_cast<const half *>(wblk));
-            a1 = load_int_align2(wblk + 2, 4 * tid4);
-            a3 = load_int_align2(wblk + 2, 4 * tid4 + 16);
+            const uint8_t *row_base = wq + static_cast<size_t>(row_bot) * n_blocks * 34;
+            const int8_t  *qs_blk  = cuda_helpers::q8_qs_plane(row_base, n_blocks) + kb * 32;
+            d_w_bot = __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kb]));
+            a1 = load_int_align2(reinterpret_cast<const uint8_t *>(qs_blk), 4 * tid4);
+            a3 = load_int_align2(reinterpret_cast<const uint8_t *>(qs_blk), 4 * tid4 + 16);
         }
 
         #pragma unroll
@@ -1350,8 +1353,9 @@ __global__ void mmq_q8_0_v6_kernel(
             unsigned v = 0;
             const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
             if (in_range) {
-                const uint8_t *wblk = wq + (static_cast<size_t>(row) * n_blocks + kb) * 34;
-                v = load_int_align2(wblk + 2, col_byte);
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                const int8_t  *qs_blk  = cuda_helpers::q8_qs_plane(row_base, n_blocks) + kb * 32;
+                v = load_int_align2(reinterpret_cast<const uint8_t *>(qs_blk), col_byte);
             }
             *reinterpret_cast<unsigned *>(&W_qs[rl][col_byte]) = v;
         }
@@ -1360,8 +1364,8 @@ __global__ void mmq_q8_0_v6_kernel(
             float d = 0.0f;
             const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
             if (in_range) {
-                const uint8_t *wblk = wq + (static_cast<size_t>(row) * n_blocks + kb) * 34;
-                d = __half2float(*reinterpret_cast<const half *>(wblk));
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                d = __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kb]));
             }
             W_d[tid] = d;
         }

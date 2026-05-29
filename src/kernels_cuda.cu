@@ -14,6 +14,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "cuda_helpers.cuh"
+
 namespace qw3 {
 
 // Ported kernel launcher (src/gated_delta_net.cu).
@@ -376,7 +378,38 @@ struct CudaWeight final : DeviceWeight {
         type = t;
         label = name ? name : "weight";
         cudaMalloc(&ptr, static_cast<size_t>(bytes));
-        cudaMemcpy(ptr, src, static_cast<size_t>(bytes), cudaMemcpyHostToDevice);
+        if (t == WeightType::Q8_0) {
+            // Repack from interleaved 34-byte blocks [d; qs[32]] into the
+            // split-plane row layout used by all qw3 Q8 readers (v7+):
+            // each row is [scales: n_blocks*2 B][quants: n_blocks*32 B].
+            // Total bytes per row are unchanged, so device allocation size
+            // is identical. The split places qs[] on a 16-byte boundary
+            // (n_blocks % 16 == 0 for every Qwen 3.6 weight) which makes
+            // 16-byte cp.async legal for the pipelined MMQ v7 mainloop.
+            //
+            // Repack happens on host then one H2D memcpy. Peak host RAM
+            // doubles for this tensor only (one row stage); freed before
+            // the next tensor uploads.
+            const uint64_t blocks_per_row = c / 32;
+            const uint64_t row_bytes = blocks_per_row * 34;
+            std::vector<uint8_t> staged(static_cast<size_t>(nbytes));
+            const uint8_t *src_b = static_cast<const uint8_t *>(src);
+            for (uint64_t row = 0; row < r; ++row) {
+                const uint8_t *in_row  = src_b + row * row_bytes;
+                uint8_t       *out_row = staged.data() + row * row_bytes;
+                uint8_t       *plane_d = out_row;                          // 2 * blocks_per_row bytes
+                uint8_t       *plane_q = out_row + 2 * blocks_per_row;     // 32 * blocks_per_row bytes
+                for (uint64_t b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t *blk = in_row + b * 34;
+                    plane_d[2 * b + 0] = blk[0];
+                    plane_d[2 * b + 1] = blk[1];
+                    std::memcpy(plane_q + b * 32, blk + 2, 32);
+                }
+            }
+            cudaMemcpy(ptr, staged.data(), static_cast<size_t>(bytes), cudaMemcpyHostToDevice);
+        } else {
+            cudaMemcpy(ptr, src, static_cast<size_t>(bytes), cudaMemcpyHostToDevice);
+        }
     }
     ~CudaWeight() override {
         if (q8_f32_cache) cudaFree(q8_f32_cache);
@@ -579,11 +612,14 @@ __global__ void rms_norm_kernel(float *out, const float *x, const float *weight,
 __global__ void q8_get_row_kernel(float *out, const uint8_t *weight, uint64_t row, uint64_t cols) {
     uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= cols) return;
+    const uint64_t blocks_per_row = cols / 32;
     const uint64_t block = i / 32;
     const uint64_t inb = i % 32;
-    const uint8_t *p = weight + (row * (cols / 32) + block) * 34;
-    const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
-    const int8_t q = reinterpret_cast<const int8_t *>(p + 2)[inb];
+    const uint8_t *row_base = weight + row * blocks_per_row * 34;
+    const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks_per_row);
+    const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + block);
+    const int8_t   q  = qs_plane[block * 32 + inb];
     out[i] = fp16_to_f32_device(dh) * static_cast<float>(q);
 }
 
@@ -600,11 +636,14 @@ __global__ void q8_get_rows_batch_kernel(float *out,
     const uint64_t row = rows_buf[b];
     uint64_t i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= cols) return;
+    const uint64_t blocks_per_row = cols / 32;
     const uint64_t block = i / 32;
     const uint64_t inb = i % 32;
-    const uint8_t *p = weight + (row * (cols / 32) + block) * 34;
-    const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
-    const int8_t q = reinterpret_cast<const int8_t *>(p + 2)[inb];
+    const uint8_t *row_base = weight + row * blocks_per_row * 34;
+    const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks_per_row);
+    const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + block);
+    const int8_t   q  = qs_plane[block * 32 + inb];
     out[static_cast<uint64_t>(b) * cols + i] = fp16_to_f32_device(dh) * static_cast<float>(q);
 }
 
@@ -673,7 +712,9 @@ __global__ void q8_matmul_tiled_dp4a_kernel(float *out,
 
     const uint64_t row = blockIdx.x * WARPS_PER_BLOCK + warp;
     if (row >= rows) return;
-    const uint8_t *rowp = weight + row * blocks * 34;
+    const uint8_t *row_base = weight + row * blocks * 34;
+    const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks);
 
     // Accumulators for BATCH_TILE batch positions, computed by THIS warp's row.
     float sums[BATCH_TILE];
@@ -681,19 +722,15 @@ __global__ void q8_matmul_tiled_dp4a_kernel(float *out,
     for (uint32_t bb = 0; bb < BATCH_TILE; ++bb) sums[bb] = 0.0f;
 
     for (uint64_t b = lane; b < blocks; b += LANES) {
-        const uint8_t *p = rowp + b * 34;
-        const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+        const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + b);
         const float w_scale = fp16_to_f32_device(dh);
 
         // Pack the 8x4 int8 weight tile into 8 int32s (read once per W row).
+        const int32_t *qs_int = reinterpret_cast<const int32_t *>(qs_plane + b * 32);
         int32_t w_packs[8];
         #pragma unroll
         for (uint32_t k = 0; k < 8; ++k) {
-            const uint8_t *pw = p + 2 + k * 4;
-            w_packs[k] = static_cast<int32_t>(pw[0])
-                       | (static_cast<int32_t>(pw[1]) << 8)
-                       | (static_cast<int32_t>(pw[2]) << 16)
-                       | (static_cast<int32_t>(pw[3]) << 24);
+            w_packs[k] = qs_int[k];
         }
 
         #pragma unroll
@@ -762,23 +799,21 @@ __global__ void q8_matvec_dp4a_kernel(float *out,
 
     const uint64_t row = blockIdx.x * WARPS_PER_BLOCK + warp;
     if (row >= rows) return;
-    const uint8_t *rowp = weight + row * blocks * 34;
+    const uint8_t *row_base = weight + row * blocks * 34;
+    const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks);
 
     float sum = 0.0f;
     for (uint64_t b = lane; b < blocks; b += LANES) {
-        const uint8_t *p = rowp + b * 34;
-        const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+        const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + b);
         const float w_scale = fp16_to_f32_device(dh);
         const float x_scale = sx_scale[b];
 
+        const int32_t *qs_int = reinterpret_cast<const int32_t *>(qs_plane + b * 32);
         int32_t acc = 0;
         #pragma unroll
         for (uint32_t k = 0; k < 8; ++k) {
-            const uint8_t *pw = p + 2 + k * 4;
-            const int32_t w_pack = static_cast<int32_t>(pw[0])
-                                 | (static_cast<int32_t>(pw[1]) << 8)
-                                 | (static_cast<int32_t>(pw[2]) << 16)
-                                 | (static_cast<int32_t>(pw[3]) << 24);
+            const int32_t w_pack = qs_int[k];
             const int32_t x_pack = *reinterpret_cast<const int32_t *>(sx_i8 + b * 32 + k * 4);
             acc = __dp4a(w_pack, x_pack, acc);
         }
@@ -818,15 +853,16 @@ __global__ void q8_matvec_v2_kernel(float *out,
         __syncthreads();
     }
     if (row >= rows) return;
-    const uint8_t *rowp = weight + row * blocks * 34;
+    const uint8_t *row_base = weight + row * blocks * 34;
+    const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks);
     const float *xptr = USE_SHMEM ? sx : x_ptr;
 
     float sum = 0.0f;
     for (uint64_t b = lane; b < blocks; b += LANES) {
-        const uint8_t *p = rowp + b * 34;
-        const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+        const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + b);
         const float d = fp16_to_f32_device(dh);
-        const int8_t *qs = reinterpret_cast<const int8_t *>(p + 2);
+        const int8_t *qs = qs_plane + b * 32;
         const float *xb = xptr + b * 32;
         float local = 0.0f;
         #pragma unroll
@@ -845,11 +881,14 @@ __global__ void q8_dequant_f32_kernel(float *out, const uint8_t *weight, uint64_
     if (i >= n) return;
     const uint64_t row = i / cols;
     const uint64_t col = i % cols;
+    const uint64_t blocks_per_row = cols / 32;
     const uint64_t block = col / 32;
     const uint64_t inb = col % 32;
-    const uint8_t *p = weight + (row * (cols / 32) + block) * 34;
-    const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
-    const int8_t q = reinterpret_cast<const int8_t *>(p + 2)[inb];
+    const uint8_t *row_base = weight + row * blocks_per_row * 34;
+    const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks_per_row);
+    const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + block);
+    const int8_t   q  = qs_plane[block * 32 + inb];
     out[row * cols + col] = fp16_to_f32_device(dh) * static_cast<float>(q);
 }
 
@@ -863,6 +902,10 @@ __global__ void q8_dequant_f32_kernel(float *out, const uint8_t *weight, uint64_
 // ~880 GB/s on the FP16 write. ~6x faster than the original 1-thread-per-
 // block kernel — the dequant cost is now small enough that we don't need a
 // persistent FP16 mirror at 2x weight memory.
+//
+// Reads from the split-plane Q8 layout (q8_d_plane / q8_qs_plane). The plane
+// Q quants are 16-byte aligned within each row (n_blocks % 16 == 0 for every
+// Qwen 3.6 weight), so each lane's 4-int load is naturally aligned.
 __global__ void q8_dequant_f16_kernel(__half *out, const uint8_t *weight, uint64_t rows, uint64_t cols) {
     constexpr unsigned BLOCKS_PER_CTA = 64;
     const uint64_t blocks_per_row = cols / 32;
@@ -874,21 +917,23 @@ __global__ void q8_dequant_f16_kernel(__half *out, const uint8_t *weight, uint64
 
     const uint64_t row = bi / blocks_per_row;
     const uint64_t blk = bi % blocks_per_row;
-    const uint8_t *p   = weight + bi * 34;
+    const uint8_t *row_base = weight + row * blocks_per_row * 34;
+    const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks_per_row);
 
     __shared__ float sscale[BLOCKS_PER_CTA];
     if (lane == 0) {
-        const uint16_t dh = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+        const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + blk);
         sscale[sub] = fp16_to_f32_device(dh);
     }
     __syncthreads();
     const float scale = sscale[sub];
 
-    // qs starts at p+2 (2-byte aligned to block). Load 8 int8s (= two 32-bit
-    // words) via halfword reads to honor the alignment.
-    const uint16_t *pq16 = reinterpret_cast<const uint16_t *>(p + 2 + lane * 8);
-    const unsigned u0 = static_cast<unsigned>(pq16[0]) | (static_cast<unsigned>(pq16[1]) << 16);
-    const unsigned u1 = static_cast<unsigned>(pq16[2]) | (static_cast<unsigned>(pq16[3]) << 16);
+    // qs_plane is 16-byte aligned and contiguous; lane reads 8 int8s as two
+    // 32-bit words from its slice of the block.
+    const unsigned *pq32 = reinterpret_cast<const unsigned *>(qs_plane + blk * 32 + lane * 8);
+    const unsigned u0 = pq32[0];
+    const unsigned u1 = pq32[1];
     int8_t qs[8];
     qs[0] = static_cast<int8_t>(u0 & 0xff);
     qs[1] = static_cast<int8_t>((u0 >>  8) & 0xff);

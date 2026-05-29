@@ -8,9 +8,35 @@
 
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 namespace qw3 {
 namespace cuda_helpers {
+
+// Q8_0 weights are stored on-device in a SPLIT-PLANE row layout (v7+):
+//
+//   row_base[r] = base + r * n_blocks * 34
+//   ┌─────────────────────────────────────────┐
+//   │ Plane S (FP16 scales): n_blocks × 2 B   │  16-byte aligned (n_blocks % 16 == 0)
+//   ├─────────────────────────────────────────┤
+//   │ Plane Q (int8 quants): n_blocks × 32 B  │  starts at byte (2*n_blocks), 16-byte aligned
+//   └─────────────────────────────────────────┘
+//
+// vs the legacy on-disk Q8_0 layout (interleaved 34-byte blocks: [d; qs[32]]).
+// Total bytes per row are unchanged (34 * n_blocks). The split-plane layout
+// places qs[] on a 16-byte boundary so cp.async.cg.shared.global with 16-byte
+// transfers becomes legal — required for the v7 pipelined MMQ kernel.
+//
+// All Q8_0 readers in kernels_cuda.cu / mmvq_q8.cu / mmq_q8.cu use these
+// accessors. Repack happens once at weight upload (CudaWeight Q8_0 ctor).
+__device__ __host__ __forceinline__ const __half *q8_d_plane(const uint8_t *row_base) {
+    return reinterpret_cast<const __half *>(row_base);
+}
+
+__device__ __host__ __forceinline__ const int8_t *q8_qs_plane(const uint8_t *row_base,
+                                                              uint64_t blocks_per_row) {
+    return reinterpret_cast<const int8_t *>(row_base + 2 * blocks_per_row);
+}
 
 // Warp-level sum reduction. width is the active lane count (must be a power of
 // two divisor of 32). On Ampere+ for int the compiler can lower this to

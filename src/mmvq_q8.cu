@@ -201,11 +201,14 @@ __global__ void mul_mat_vec_q8_0_kernel(
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const uint64_t row_idx = static_cast<uint64_t>(row0 + i);
                 if (rows_per_cuda_block > 1 && row_idx >= rows) break;
-                // 34 bytes per Q8_0 block, kbx blocks in.
-                const uint8_t * blk = vx + (row_idx * blocks_per_row_x + kbx) * 34;
-                const half     d_w_h = *reinterpret_cast<const half *>(blk);
-                const float    d_w   = __half2float(d_w_h);
-                tmp[j][i] += vec_dot_q8_0_q8_1(blk + 2, d_w, ya, kqs);
+                const uint8_t * row_base = vx + row_idx * blocks_per_row_x * 34;
+                const half      d_w_h = static_cast<half>(
+                    cuda_helpers::q8_d_plane(row_base)[kbx]);
+                const float     d_w   = __half2float(d_w_h);
+                const int8_t  * qs_blk =
+                    cuda_helpers::q8_qs_plane(row_base, blocks_per_row_x) + kbx * 32;
+                tmp[j][i] += vec_dot_q8_0_q8_1(
+                    reinterpret_cast<const uint8_t *>(qs_blk), d_w, ya, kqs);
             }
         }
     }
@@ -300,16 +303,22 @@ __global__ void mul_mat_vec_q8_0_two_kernel(
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const uint64_t row_idx = static_cast<uint64_t>(row0 + i);
                 if (rows_per_cuda_block > 1 && row_idx >= rows) break;
-                const uint8_t * blk0 = vx0 + (row_idx * blocks_per_row_x + kbx) * 34;
-                const uint8_t * blk1 = vx1 + (row_idx * blocks_per_row_x + kbx) * 34;
-                const float d_w0 = __half2float(*reinterpret_cast<const half *>(blk0));
-                const float d_w1 = __half2float(*reinterpret_cast<const half *>(blk1));
+                const uint8_t * row_base0 = vx0 + row_idx * blocks_per_row_x * 34;
+                const uint8_t * row_base1 = vx1 + row_idx * blocks_per_row_x * 34;
+                const float d_w0 = __half2float(static_cast<half>(
+                    cuda_helpers::q8_d_plane(row_base0)[kbx]));
+                const float d_w1 = __half2float(static_cast<half>(
+                    cuda_helpers::q8_d_plane(row_base1)[kbx]));
+                const int8_t * qs0 =
+                    cuda_helpers::q8_qs_plane(row_base0, blocks_per_row_x) + kbx * 32;
+                const int8_t * qs1 =
+                    cuda_helpers::q8_qs_plane(row_base1, blocks_per_row_x) + kbx * 32;
 
                 int sumi0 = 0, sumi1 = 0;
                 #pragma unroll
                 for (int k = 0; k < VDR_Q8_0; ++k) {
-                    const int v0 = q8_load_int_align2(blk0 + 2, kqs + k);
-                    const int v1 = q8_load_int_align2(blk1 + 2, kqs + k);
+                    const int v0 = q8_load_int_align2(reinterpret_cast<const uint8_t *>(qs0), kqs + k);
+                    const int v1 = q8_load_int_align2(reinterpret_cast<const uint8_t *>(qs1), kqs + k);
                     sumi0 = __dp4a(v0, u[k], sumi0);
                     sumi1 = __dp4a(v1, u[k], sumi1);
                 }
@@ -411,16 +420,22 @@ __global__ void mul_mat_vec_q8_0_silu_mul_kernel(
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const uint64_t row_idx = static_cast<uint64_t>(row0 + i);
                 if (rows_per_cuda_block > 1 && row_idx >= rows) break;
-                const uint8_t * blk_g = vx_gate + (row_idx * blocks_per_row_x + kbx) * 34;
-                const uint8_t * blk_u = vx_up   + (row_idx * blocks_per_row_x + kbx) * 34;
-                const float d_w_g = __half2float(*reinterpret_cast<const half *>(blk_g));
-                const float d_w_u = __half2float(*reinterpret_cast<const half *>(blk_u));
+                const uint8_t * row_base_g = vx_gate + row_idx * blocks_per_row_x * 34;
+                const uint8_t * row_base_u = vx_up   + row_idx * blocks_per_row_x * 34;
+                const float d_w_g = __half2float(static_cast<half>(
+                    cuda_helpers::q8_d_plane(row_base_g)[kbx]));
+                const float d_w_u = __half2float(static_cast<half>(
+                    cuda_helpers::q8_d_plane(row_base_u)[kbx]));
+                const int8_t * qs_g =
+                    cuda_helpers::q8_qs_plane(row_base_g, blocks_per_row_x) + kbx * 32;
+                const int8_t * qs_u =
+                    cuda_helpers::q8_qs_plane(row_base_u, blocks_per_row_x) + kbx * 32;
 
                 int sumi_g = 0, sumi_u = 0;
                 #pragma unroll
                 for (int k = 0; k < VDR_Q8_0; ++k) {
-                    const int v_g = q8_load_int_align2(blk_g + 2, kqs + k);
-                    const int v_u = q8_load_int_align2(blk_u + 2, kqs + k);
+                    const int v_g = q8_load_int_align2(reinterpret_cast<const uint8_t *>(qs_g), kqs + k);
+                    const int v_u = q8_load_int_align2(reinterpret_cast<const uint8_t *>(qs_u), kqs + k);
                     sumi_g = __dp4a(v_g, u[k], sumi_g);
                     sumi_u = __dp4a(v_u, u[k], sumi_u);
                 }
@@ -511,10 +526,14 @@ __global__ void mul_mat_vec_q8_0_add_kernel(
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 const uint64_t row_idx = static_cast<uint64_t>(row0 + i);
                 if (rows_per_cuda_block > 1 && row_idx >= rows) break;
-                const uint8_t * blk = vx + (row_idx * blocks_per_row_x + kbx) * 34;
-                const half     d_w_h = *reinterpret_cast<const half *>(blk);
-                const float    d_w   = __half2float(d_w_h);
-                tmp[j][i] += vec_dot_q8_0_q8_1(blk + 2, d_w, ya, kqs);
+                const uint8_t * row_base = vx + row_idx * blocks_per_row_x * 34;
+                const half      d_w_h = static_cast<half>(
+                    cuda_helpers::q8_d_plane(row_base)[kbx]);
+                const float     d_w   = __half2float(d_w_h);
+                const int8_t  * qs_blk =
+                    cuda_helpers::q8_qs_plane(row_base, blocks_per_row_x) + kbx * 32;
+                tmp[j][i] += vec_dot_q8_0_q8_1(
+                    reinterpret_cast<const uint8_t *>(qs_blk), d_w, ya, kqs);
             }
         }
     }

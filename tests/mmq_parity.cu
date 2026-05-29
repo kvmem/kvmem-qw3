@@ -145,13 +145,34 @@ static ShapeResult run_shape(int M, int N, int K, std::mt19937 &rng) {
     std::vector<uint8_t> Wq;
     quantize_q8_0_host(W, M, K, Wq);
 
+    // Repack Wq into the split-plane layout the device kernels now expect:
+    //   per row: [FP16 scales × n_blocks][int8 quants × n_blocks * 32]
+    // Same total bytes per row; matches CudaWeight's Q8_0 ctor in src/kernels_cuda.cu.
+    std::vector<uint8_t> Wq_split(Wq.size(), 0u);
+    {
+        const int n_blocks_per_row = K / QK;
+        const size_t row_bytes = static_cast<size_t>(n_blocks_per_row) * 34;
+        for (int m = 0; m < M; ++m) {
+            const uint8_t *in_row  = Wq.data() + static_cast<size_t>(m) * row_bytes;
+            uint8_t       *out_row = Wq_split.data() + static_cast<size_t>(m) * row_bytes;
+            uint8_t *plane_d = out_row;
+            uint8_t *plane_q = out_row + 2 * static_cast<size_t>(n_blocks_per_row);
+            for (int b = 0; b < n_blocks_per_row; ++b) {
+                const uint8_t *blk = in_row + static_cast<size_t>(b) * 34;
+                plane_d[2 * b + 0] = blk[0];
+                plane_d[2 * b + 1] = blk[1];
+                std::memcpy(plane_q + static_cast<size_t>(b) * 32, blk + 2, 32);
+            }
+        }
+    }
+
     uint8_t *d_w = nullptr;
     float   *d_x = nullptr;
     float   *d_out = nullptr;
     void    *d_act = nullptr;
 
-    CHECK(cudaMalloc(&d_w, Wq.size()));
-    CHECK(cudaMemcpy(d_w, Wq.data(), Wq.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMalloc(&d_w, Wq_split.size()));
+    CHECK(cudaMemcpy(d_w, Wq_split.data(), Wq_split.size(), cudaMemcpyHostToDevice));
     CHECK(cudaMalloc(&d_x, X.size() * sizeof(float)));
     CHECK(cudaMemcpy(d_x, X.data(), X.size() * sizeof(float),
                      cudaMemcpyHostToDevice));
