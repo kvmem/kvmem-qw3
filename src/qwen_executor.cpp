@@ -432,50 +432,45 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     ensure_scratch();
     const uint32_t total = static_cast<uint32_t>(tokens.size());
 
-    // Internal prefill chunking (opt-in). llama.cpp processes prefill in
-    // n_batch=512 pieces so a captured CUDA graph amortizes capture cost
-    // across replays. qw3 historically processes the entire prompt in one
-    // batched call, and on this hardware that's the right choice for two
-    // reasons that don't apply to llama.cpp:
+    // Prefill chunking. llama.cpp processes prefill in n_batch=512 pieces
+    // so its peak compute scratch stays constant in T. qw3 originally sized
+    // batch scratch to the entire prompt, which made peak memory grow
+    // linearly with T — at T=64K the per-prompt batch scratch alone exceeded
+    // 30 GiB of FP32 storage, vs llama's flat ~30 GiB total. To match memory
+    // parity we apply the same fixed chunk cap as llama.cpp.
     //
-    //   1. The HGEMM Q8 path uses a multi-stream ping-pong pipeline
-    //      (dequant of W_{n+1} overlaps with HGEMM of W_n). Each chunk
-    //      restarts the pipeline cold, paying a fixed setup cost per
-    //      chunk. (See ensure_dequant_pipeline / hgemm_q8.)
-    //   2. cuBLAS picks a fatter, higher-utilization kernel at batch=4096
-    //      than at batch=512; chunking down loses ~10% throughput to
-    //      lower-batch kernel selection.
+    // Memory is the primary constraint. Throughput recovery comes from
+    // amortizing per-chunk fixed costs (HGEMM dequant pipeline restart,
+    // cuBLAS kernel-selection penalty at small batch, MMQ-at-short-batch
+    // dispatch, whole-prompt graph capture #35), NOT from hoarding scratch.
     //
-    // Empirically, chunking at 512 regresses 4K prefill 3325→2366 tok/s
-    // even before any capture concerns (and capture itself is incompatible
-    // with the cross-stream HGEMM dependencies — cudaStreamBeginCapture
-    // refuses the cudaEventRecord on dequant_stream_).
-    //
-    // Kept opt-in via QW3_PREFILL_CHUNK=N for diagnostic / future revival
-    // (e.g. if MMQ replaces HGEMM and removes the ping-pong pipeline,
-    // chunking + capture might become viable).
-    uint32_t chunk_size = total;
+    // Override with QW3_PREFILL_CHUNK=N. Set N=0 to disable the cap entirely
+    // (whole-prompt batch — original behavior, useful for benchmarking the
+    // throughput tax of chunking itself).
+    constexpr uint32_t kQw3DefaultPrefillChunk = 512;
+    uint32_t chunk_size = std::min<uint32_t>(kQw3DefaultPrefillChunk, total);
     if (const char *env = std::getenv("QW3_PREFILL_CHUNK")) {
         int v = std::atoi(env);
-        if (v > 0) chunk_size = static_cast<uint32_t>(v);
-    } else {
-        // Auto-chunk when the full prompt's batch scratch wouldn't fit. The
-        // scratch tensors scale linearly with batch, so we cap the chunk at
-        // 80% of currently free device memory divided by per-token bytes.
-        // At smaller prompts this is a no-op (chunk_size stays = total) and
-        // no chunking overhead is paid; the hot path is unchanged.
-        const uint64_t per_tok = per_token_scratch_bytes();
-        if (per_tok > 0) {
-            const uint64_t free_b = backend_.free_device_bytes();
-            if (free_b > 0) {
-                const uint64_t budget = (free_b * 8) / 10;
-                const uint64_t fits = budget / per_tok;
-                if (fits > 0 && fits < total) {
-                    chunk_size = static_cast<uint32_t>(fits);
-                    // Round down to a multiple of 256 for cleaner kernel
-                    // tiling; minimum 256 to keep grids saturated.
-                    if (chunk_size > 256) chunk_size &= ~static_cast<uint32_t>(255);
-                }
+        if (v > 0) {
+            chunk_size = static_cast<uint32_t>(v);
+        } else if (v == 0) {
+            // Explicit opt-out of chunking.
+            chunk_size = total;
+        }
+    }
+    // Safety floor: even if the user set a large chunk (or QW3_PREFILL_CHUNK=0
+    // disabled the cap), don't exceed what fits in 80% of currently free
+    // device memory. This handles edge cases where weights + KV cache leave
+    // less headroom than the requested chunk's per-prompt scratch.
+    const uint64_t per_tok = per_token_scratch_bytes();
+    if (per_tok > 0) {
+        const uint64_t free_b = backend_.free_device_bytes();
+        if (free_b > 0) {
+            const uint64_t budget = (free_b * 8) / 10;
+            const uint64_t fits = budget / per_tok;
+            if (fits > 0 && fits < chunk_size) {
+                chunk_size = static_cast<uint32_t>(fits);
+                if (chunk_size > 256) chunk_size &= ~static_cast<uint32_t>(255);
             }
         }
     }

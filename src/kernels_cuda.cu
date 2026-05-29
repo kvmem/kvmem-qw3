@@ -2237,11 +2237,24 @@ private:
 
         const int idx = w_fp16_idx_;
 
-        // Dequant runs on dequant_stream_; wait for the previous HGEMM that
-        // read this buffer to finish before overwriting.
-        cudaStreamWaitEvent(dequant_stream_, hgemm_done_[idx], 0);
-        if (auto st = dequant_q8_to_f16_stream(w_fp16_workspace_[idx], w, dequant_stream_); !st.ok) return st;
-        cudaEventRecord(dequant_done_[idx], dequant_stream_);
+        // When stream capture is active, the cross-stream ping-pong pipeline
+        // can't be used: cudaStreamWaitEvent / cudaEventRecord on a stream
+        // that isn't itself being captured trips the capture into an error
+        // state. Fall back to dequant on exec_stream_ (no overlap with the
+        // cuBLAS gemm of the previous matmul, but inside one chunk we lose
+        // ~5% throughput; the capture replay recovers ~10-15% by amortizing
+        // launch overhead across all 8/64/128/etc chunks of a prefill).
+        const bool use_pipeline = !capture_active_;
+
+        if (use_pipeline) {
+            // Dequant runs on dequant_stream_; wait for the previous HGEMM that
+            // read this buffer to finish before overwriting.
+            cudaStreamWaitEvent(dequant_stream_, hgemm_done_[idx], 0);
+            if (auto st = dequant_q8_to_f16_stream(w_fp16_workspace_[idx], w, dequant_stream_); !st.ok) return st;
+            cudaEventRecord(dequant_done_[idx], dequant_stream_);
+        } else {
+            if (auto st = dequant_q8_to_f16_stream(w_fp16_workspace_[idx], w, exec_stream_); !st.ok) return st;
+        }
 
         // Stage X (FP32 -> FP16) on the cuBLAS / default stream. This work
         // doesn't conflict with the dequant since they touch different
@@ -2294,8 +2307,11 @@ private:
 
         // cuBLAS waits for the matching dequant to complete before reading
         // buffer[idx]. cuBLAS handle is bound to exec_stream_; issue the
-        // stream-wait there.
-        cudaStreamWaitEvent(exec_stream_, dequant_done_[idx], 0);
+        // stream-wait there. (Skipped during capture: dequant ran on
+        // exec_stream_, so it's already ordered.)
+        if (use_pipeline) {
+            cudaStreamWaitEvent(exec_stream_, dequant_done_[idx], 0);
+        }
 
         const float alpha = 1.0f;
         const float beta = 0.0f;
@@ -2321,7 +2337,9 @@ private:
                 "cublasGemmEx hgemm_q8"); !st.ok) {
             return st;
         }
-        cudaEventRecord(hgemm_done_[idx], exec_stream_);
+        if (use_pipeline) {
+            cudaEventRecord(hgemm_done_[idx], exec_stream_);
+        }
 
         w_fp16_idx_ ^= 1;
         return {};
