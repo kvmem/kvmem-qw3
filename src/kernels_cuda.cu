@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -335,8 +336,20 @@ struct CudaTensor final : DeviceTensor {
         count = n;
         elem_size = elem_bytes;
         label = name ? name : "tensor";
-        cudaMalloc(&ptr, static_cast<size_t>(n) * elem_bytes);
-        cudaMemset(ptr, 0, static_cast<size_t>(n) * elem_bytes);
+        const size_t bytes = static_cast<size_t>(n) * elem_bytes;
+        cudaError_t err = cudaMalloc(&ptr, bytes);
+        if (err != cudaSuccess) {
+            ptr = nullptr;
+            (void)cudaGetLastError();
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                          "cudaMalloc(%s, %.2f GiB) failed: %s",
+                          label.c_str(),
+                          static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0),
+                          cudaGetErrorString(err));
+            throw std::runtime_error(msg);
+        }
+        cudaMemset(ptr, 0, bytes);
     }
     ~CudaTensor() override {
         if (ptr) cudaFree(ptr);
@@ -1787,6 +1800,15 @@ public:
             return cuda_status(cudaDeviceSynchronize(), "cuda synchronize");
         }
         return cuda_status(cudaStreamSynchronize(exec_stream_), "cuda stream synchronize");
+    }
+
+    uint64_t free_device_bytes() const override {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        return static_cast<uint64_t>(free_b);
     }
 
     // -- CUDA graph capture for decode --

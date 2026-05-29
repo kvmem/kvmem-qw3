@@ -19,30 +19,36 @@ alternating qw3 ↔ llama.cpp to spread thermal drift), median tok/s.
 
 | Prompt tokens | qw3 prefill | llama prefill | prefill % | qw3 decode | llama decode | decode % |
 |---:|---:|---:|---:|---:|---:|---:|
-|   556 | 1986 tok/s | 2792 tok/s | **71.1%** | 45.43 tok/s | 45.15 tok/s | **100.6%** |
-|  1098 | 2775 tok/s | 3304 tok/s | **84.0%** | 45.05 tok/s | 45.46 tok/s | **99.1%**  |
-|  2182 | 3476 tok/s | 3598 tok/s | **96.6%** | 45.18 tok/s | 45.40 tok/s | **99.5%**  |
-|  4350 | 3910 tok/s | 3773 tok/s | **103.6%** | 43.77 tok/s | 44.83 tok/s | **97.6%** |
-|  8415 | 4010 tok/s | 3790 tok/s | **105.8%** | 43.79 tok/s | 43.98 tok/s | **99.6%** |
-| 16545 | 3910 tok/s | 3717 tok/s | **105.2%** | 41.56 tok/s | 43.66 tok/s | **95.2%** |
-| 33076 | 3505 tok/s | 3536 tok/s | **99.1%**  | 41.02 tok/s | 42.26 tok/s | **97.1%** |
-| 65867 | 2840 tok/s | 3076 tok/s | **92.3%**  | 36.99 tok/s | 39.83 tok/s | **92.9%** |
+|    556 | 1989 tok/s | 2825 tok/s | **70.4%** | 45.89 tok/s | 45.51 tok/s | **100.8%** |
+|   1098 | 2778 tok/s | 3321 tok/s | **83.7%** | 45.06 tok/s | 45.50 tok/s | **99.0%**  |
+|   2182 | 3492 tok/s | 3592 tok/s | **97.2%** | 45.12 tok/s | 45.39 tok/s | **99.4%**  |
+|   4350 | 3897 tok/s | 3767 tok/s | **103.5%** | 43.79 tok/s | 44.84 tok/s | **97.7%** |
+|   8415 | 4000 tok/s | 3782 tok/s | **105.8%** | 43.75 tok/s | 43.95 tok/s | **99.6%** |
+|  16545 | 3908 tok/s | 3706 tok/s | **105.4%** | 41.62 tok/s | 43.67 tok/s | **95.3%** |
+|  33076 | 3502 tok/s | 3528 tok/s | **99.3%**  | 41.02 tok/s | 42.26 tok/s | **97.1%** |
+|  65867 | 2840 tok/s | 3075 tok/s | **92.4%**  | 37.17 tok/s | 39.80 tok/s | **93.4%** |
+| 131720 | 2018 tok/s | 2299 tok/s | **87.8%**  | 31.07 tok/s | 35.64 tok/s | **87.2%** |
 
-All numbers absolute tokens/second, n_decode=64, ctx=70K (8K for shorter
-prompts). The `%` columns report `qw3 / llama.cpp`. Headlines:
+All numbers absolute tokens/second, n_decode=64, ctx=140K (140000 for the
+T=131K row; 70K for shorter prompts). The `%` columns report `qw3 /
+llama.cpp`. Headlines:
 
-- **Prefill ≥ 99% of llama.cpp at all T ≥ 2K**, with **103–106% from 4K–16K**.
-  The remaining gap is ~7.7% at T=65K (compute-bound; see development log).
-- **Decode is 93–100% of llama.cpp across the full 556–65K range**. Matvec
+- **Prefill ≥ 97% of llama.cpp at all T ≥ 2K**, with **103–106% from 4K–16K**.
+  Long-context: 92% at T=65K, 88% at T=128K.
+- **Decode is 87–101% of llama.cpp across the full 556–128K range**. Matvec
   is at HBM ceiling (~2.7 TB/s effective); further wins need fewer matvec
   calls, not faster kernels.
+- **Short-prompt gap (T<2K) is launch-overhead-bound**, not compute. nsys
+  attributes ~64% of T=556 prefill to the first-call HGEMM autotuner ("Kernel2",
+  ~111 ms over 32 attention layers × ~14 calls/layer) plus q8 weight dequant
+  staging (~48 ms). Long-T amortizes both. See development log.
 
 Reproduce with:
 
 ```sh
 python3 scripts/long_prompt_sweep.py \
-  --prompt-tokens "512 1024 2048 4096 8192 16384 32768 65536" \
-  --trials 3 -n 64 -c 70000 \
+  --prompt-tokens "512 1024 2048 4096 8192 16384 32768 65536 131072" \
+  --trials 3 -n 64 -c 140000 \
   --json /tmp/sweep.json
 ```
 

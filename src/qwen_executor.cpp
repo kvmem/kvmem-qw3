@@ -189,6 +189,33 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
     batch_capacity_ = batch;
 }
 
+uint64_t QwenExecutor::per_token_scratch_bytes() const {
+    const QwenConfig &cfg = model_.config();
+    uint64_t max_ffn = 0, max_q = 0, max_k = 0, max_v = 0;
+    uint64_t max_rqkv = 0, max_rvalue = 0;
+    for (uint32_t i = 0; i < weights_.n_layers(); ++i) {
+        const QwenLayerWeights &l = weights_.layer(i);
+        if (l.ffn_dim > max_ffn) max_ffn = l.ffn_dim;
+        if (l.q_rows > max_q) max_q = l.q_rows;
+        if (l.k_rows > max_k) max_k = l.k_rows;
+        if (l.v_rows > max_v) max_v = l.v_rows;
+        if (l.recurrent_qkv_dim > max_rqkv) max_rqkv = l.recurrent_qkv_dim;
+        if (l.recurrent_value_dim > max_rvalue) max_rvalue = l.recurrent_value_dim;
+    }
+    uint64_t per_tok = 0;
+    per_tok += 3 * cfg.n_embd;                                    // h, norm, attn_out
+    per_tok += 3 * std::max<uint64_t>(max_ffn, 1);                // ffn_gate, ffn_up, ffn_mid
+    per_tok += cfg.n_embd;                                        // ffn_out
+    if (max_rqkv  > 0) per_tok += 2 * max_rqkv;                   // proj, conv_out
+    if (max_rvalue> 0) per_tok += 2 * max_rvalue;                 // gate_proj, core
+    if (cfg.num_v_heads() > 0) per_tok += 2 * cfg.num_v_heads();  // alpha, beta
+    if (max_q > 0) per_tok += max_q;
+    if (max_k > 0) per_tok += max_k;
+    if (max_v > 0) per_tok += max_v;
+    per_tok += static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim; // mid
+    return per_tok * sizeof(float);
+}
+
 NativeExecutorReport QwenExecutor::dry_run_token(uint32_t token_id, bool execute_heavy) {
     if (execute_heavy) return forward_one_token(token_id);
 
@@ -431,8 +458,29 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     if (const char *env = std::getenv("QW3_PREFILL_CHUNK")) {
         int v = std::atoi(env);
         if (v > 0) chunk_size = static_cast<uint32_t>(v);
+    } else {
+        // Auto-chunk when the full prompt's batch scratch wouldn't fit. The
+        // scratch tensors scale linearly with batch, so we cap the chunk at
+        // 80% of currently free device memory divided by per-token bytes.
+        // At smaller prompts this is a no-op (chunk_size stays = total) and
+        // no chunking overhead is paid; the hot path is unchanged.
+        const uint64_t per_tok = per_token_scratch_bytes();
+        if (per_tok > 0) {
+            const uint64_t free_b = backend_.free_device_bytes();
+            if (free_b > 0) {
+                const uint64_t budget = (free_b * 8) / 10;
+                const uint64_t fits = budget / per_tok;
+                if (fits > 0 && fits < total) {
+                    chunk_size = static_cast<uint32_t>(fits);
+                    // Round down to a multiple of 256 for cleaner kernel
+                    // tiling; minimum 256 to keep grids saturated.
+                    if (chunk_size > 256) chunk_size &= ~static_cast<uint32_t>(255);
+                }
+            }
+        }
     }
     if (chunk_size > total) chunk_size = total;
+    if (chunk_size == 0) chunk_size = total;
     ensure_batch_scratch(chunk_size);
 
     const QwenConfig &cfg = model_.config();

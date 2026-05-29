@@ -123,6 +123,87 @@ ldmatrix / softmax over more compute.
 
 ---
 
+## Short-prompt profile (T=556, qw3 70% of llama)
+
+The prefill table shows qw3 at 70.4% of llama at T=556 and 83.7% at
+T=1098, then ≥97% from T=2K onward. The gap is launch-cost-driven, not
+compute-bound. `nsys` cuda_gpu_kern_sum at T=726 (-n 4, no warmup) over
+~564 ms wall clock:
+
+| Kernel                           | Total (ms) | Calls | Avg (µs) | Share |
+|---|---:|---:|---:|---:|
+| `Kernel2` (cuBLAS HGEMM autotuner)        | 111.5 | 496 | 224.8 | 44.4% |
+| `q8_dequant_f16_kernel`                   |  48.3 | 496 |  97.3 | 19.2% |
+| `gated_delta_net_kernel`                  |  27.8 |  48 | 578.8 | 11.1% |
+| `recurrent_conv_batch_kernel`             |  22.6 |  48 | 469.9 |  9.0% |
+| `mul_mat_vec_q8_0_silu_mul_kernel` (decode) |  8.2 | 64 | 128.3 | 3.3% |
+| `fattn_prefill_mma_gqa_kernel_v2_t`       |   2.4 |  16 | 148.5 |  0.9% |
+| _(other)_                                 |  29.9 |  —  |   —   | 12.1% |
+
+Key observations:
+
+1. **Two-thirds of T=556 prefill time is HGEMM dispatch + dequant**:
+   `Kernel2 + q8_dequant_f16_kernel` together = 159.8 ms (63.6%). At
+   T=4K both kernels run ~3× longer per call (matmul m grows 5×, dequant
+   identical) but the *total* wall time only doubles, so their fraction
+   of prefill drops to ~30%. By T=16K dequant drops below the 1% noise
+   floor and HGEMM is amortized across actual compute.
+2. **DeltaNet recurrent kernels are per-T fixed**: 27.8 ms / 48 layers
+   = 0.58 ms/layer at T=556, vs 35 ms / 48 = 0.73 ms/layer at T=4K (the
+   prefill kernel is sequential along T, so wall time scales linearly).
+   At T=556 they account for 11.1% (28 ms / 252 ms prefill); at T=4K
+   they account for ~3% (35 ms / 1200 ms prefill).
+3. **FA2 itself is fast (0.9% at T=556)**: 16 calls × 148 µs = 2.4 ms
+   total. The per-launch overhead floor (~3.5 µs) dominates over the
+   compute at this length.
+
+llama.cpp avoids HGEMM entirely (it uses `mul_mat_q` MMQ stream-K) so
+it skips the cuBLAS heuristic-search Kernel2 cost. It also captures
+the full prefill in a CUDA graph and amortizes per-launch cost across
+the whole prompt — qw3's per-prompt graph capture is the path to
+closing this gap (task #35 in the roadmap).
+
+The compute side has no slack to cut at T=556: HGEMM is already at
+its tile-undersaturation floor (one CTA per matmul fits one SM
+column). Faster kernels won't help here. Two attacks remain:
+- **Replace HGEMM with MMQ across the board** (kills both Kernel2
+  cost and dequant). Earlier MMQ work (#33-#37) showed v2 is ~74% of
+  HGEMM at long T but ~110% at short T; promoting MMQ at small batch
+  is conditionally a net win at T<2K.
+- **Whole-prompt CUDA graph capture** (#35). llama re-uses captured
+  graphs across replay, paying launch overhead once per ~512-token
+  chunk. qw3's HGEMM ping-pong dependency makes capture infeasible
+  without first dropping HGEMM (so #35 is blocked on the MMQ win).
+
+## T=128K crash (Resolved 2026-05-29)
+
+T=131K was failing with `cuda q8_0_get_rows_batch: invalid argument`.
+Root cause was **silent OOM in `CudaTensor`'s constructor**: the
+batch-scratch tensors at T=131K total ~85 GiB (h, ffn_gate/up/mid,
+attn buffers, recurrent state buffers all allocate at full batch size),
+exceeding the ~95 GiB free after weights+KV cache. `cudaMalloc` returned
+`cudaErrorMemoryAllocation`, the constructor stored a null pointer
+without checking, and the next kernel launch surfaced the error from
+`cudaGetLastError()` at the wrong call site.
+
+Two fixes (`src/kernels_cuda.cu`, `src/qwen_executor.cpp`):
+
+1. `CudaTensor` now throws `std::runtime_error` with a message naming
+   the failed tensor and requested size when `cudaMalloc` fails. No
+   more silent null pointers.
+2. `forward_n_tokens` auto-picks a chunk size when the full prompt
+   wouldn't fit. The executor queries `backend_.free_device_bytes()`,
+   computes per-token batch-scratch bytes, and caps the chunk at 80%
+   of free memory. At T<128K this is a no-op (chunk = total); at
+   T=131K it falls back to chunk≈8K and pays the ~10% chunking
+   overhead documented in [[feedback-prefill-chunking-negative]] in
+   exchange for not OOMing. Manual override via `QW3_PREFILL_CHUNK=N`
+   still wins.
+
+Result: T=131720 sweep now runs at 2018 tok/s (87.8% of llama 2299).
+The remaining 12% gap is a mix of the chunking overhead, FA2 v2 long-T
+compute-bound regime (same as T=65K), and KV-cache HBM at this length.
+
 ## FA2 prefill kernel — full evolution
 
 ### v1 (`fattn_prefill_kernel`)

@@ -47,6 +47,10 @@ public:
     // logits + argmax correspond to the LAST token in the batch.
     NativeExecutorReport forward_n_tokens(const std::vector<uint32_t> &tokens);
 
+    // Per-token batch-scratch footprint in bytes (sum of all *_batch_ tensors
+    // at batch=1). Used to size prefill chunks against free device memory.
+    uint64_t per_token_scratch_bytes() const;
+
     // Copy the most recent logits tensor back to host. Returns false if
     // forward_one_token has not been called yet.
     bool copy_last_logits(std::vector<float> &out) const;

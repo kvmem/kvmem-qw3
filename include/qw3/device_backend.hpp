@@ -48,6 +48,11 @@ public:
     virtual DeviceStatus end() = 0;
     virtual DeviceStatus synchronize() = 0;
 
+    // Free bytes of device memory available for allocation. Returns 0 when
+    // the backend cannot report this (CPU / mock). Used by the executor to
+    // size prefill chunks so per-prompt scratch fits within available memory.
+    virtual uint64_t free_device_bytes() const { return 0; }
+
     // CUDA-graph capture hooks. Default impls are no-ops so non-CUDA backends
     // pass through. The intended pattern, used for the per-token decode loop:
     //
