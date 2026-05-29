@@ -2447,7 +2447,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     constexpr uint32_t MMA_K     = 16;
 
     static_assert(BR == 8,                 "v2 requires BR=8");
-    static_assert(BC == 64,                "v2 requires BC=64");
+    static_assert(BC == 32 || BC == 64,    "v2 supports BC ∈ {32, 64}");
     static_assert(NCOLS2 == 2,             "v2 supports NCOLS2=2");
     static_assert(BR * NCOLS2 == MMA_M,    "BR*NCOLS2 == MMA_M");
     static_assert(Q_PER_KV % NCOLS2 == 0,  "Q_PER_KV must divide by NCOLS2");
@@ -2822,14 +2822,14 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     }
 }
 
-static size_t fattn_mma_gqa_v2_smem_bytes(uint32_t head_dim) {
-    constexpr uint32_t BR = 8, BC = 64, NCOLS2 = 2;
+static size_t fattn_mma_gqa_v2_smem_bytes(uint32_t head_dim, uint32_t bc) {
+    constexpr uint32_t BR = 8, NCOLS2 = 2;
     constexpr uint32_t MMA_M = BR * NCOLS2;   // 16
     size_t s = 0;
-    s += BC       * head_dim * sizeof(__half);   // K
-    s += head_dim * BC       * sizeof(__half);   // V
-    s += MMA_M    * BC       * sizeof(float);    // S
-    s += MMA_M    * BC       * sizeof(__half);   // P
+    s += bc       * head_dim * sizeof(__half);   // K
+    s += head_dim * bc       * sizeof(__half);   // V
+    s += MMA_M    * bc       * sizeof(float);    // S
+    s += MMA_M    * bc       * sizeof(__half);   // P
     s += MMA_M               * sizeof(float) * 3;// m, l, alpha
     return s;
 }
@@ -3157,12 +3157,21 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
     if (n_kv_heads == 0 || n_heads % n_kv_heads != 0) return false;
     const uint32_t q_per_kv = n_heads / n_kv_heads;
     if (!(q_per_kv == 6)) return false;
-    constexpr uint32_t BR = 8, BC = 64, NCOLS2 = 2;
+    constexpr uint32_t BR = 8, NCOLS2 = 2;
+
+    static const uint32_t bc_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_BC");
+        if (!e) return 32;
+        if (std::strcmp(e, "32") == 0) return 32;
+        if (std::strcmp(e, "64") == 0) return 64;
+        return 32;
+    }();
+
     const uint32_t n_blocks_q = (batch + BR - 1) / BR;
     const uint32_t q_groups   = q_per_kv / NCOLS2;     // 3
     const dim3 grid(n_kv_heads * q_groups, n_blocks_q, 1);
     const dim3 block(128);
-    const size_t smem = fattn_mma_gqa_v2_smem_bytes(head_dim);
+    const size_t smem = fattn_mma_gqa_v2_smem_bytes(head_dim, bc_choice);
 
     static const bool use_cp_async_k = []() {
         const char *e = std::getenv("QW3_PREFILL_FA2_KCPASYNC");
@@ -3175,8 +3184,9 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
     }();
 
-    auto launch = [&](auto HD_v) {
+    auto launch = [&](auto HD_v, auto BC_v) {
         constexpr uint32_t HD = decltype(HD_v)::value;
+        constexpr uint32_t BC = decltype(BC_v)::value;
         auto dispatch = [&](auto K_v, auto V_v) {
             constexpr bool K = decltype(K_v)::value;
             constexpr bool V = decltype(V_v)::value;
@@ -3201,8 +3211,13 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
             dispatch(std::false_type{}, std::false_type{});
         }
     };
-    if (head_dim == 256) launch(std::integral_constant<uint32_t, 256>{});
-    else                 launch(std::integral_constant<uint32_t, 128>{});
+
+    auto launch_with_bc = [&](auto HD_v) {
+        if (bc_choice == 32) launch(HD_v, std::integral_constant<uint32_t, 32>{});
+        else                 launch(HD_v, std::integral_constant<uint32_t, 64>{});
+    };
+    if (head_dim == 256) launch_with_bc(std::integral_constant<uint32_t, 256>{});
+    else                 launch_with_bc(std::integral_constant<uint32_t, 128>{});
     return true;
 }
 
