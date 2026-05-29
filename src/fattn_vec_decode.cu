@@ -2446,10 +2446,10 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     constexpr uint32_t MMA_N     = 8;
     constexpr uint32_t MMA_K     = 16;
 
-    static_assert(BR == 8,                 "v2 requires BR=8");
+    static_assert(BR == 8 || BR == 16 || BR == 32, "v2 supports BR ∈ {8, 16, 32}");
     static_assert(BC == 32 || BC == 64,    "v2 supports BC ∈ {32, 64}");
     static_assert(NCOLS2 == 2,             "v2 supports NCOLS2=2");
-    static_assert(BR * NCOLS2 == MMA_M,    "BR*NCOLS2 == MMA_M");
+    static_assert(BR % 8 == 0,             "BR must be multiple of 8");
     static_assert(Q_PER_KV % NCOLS2 == 0,  "Q_PER_KV must divide by NCOLS2");
     static_assert(HEAD_DIM == 128 || HEAD_DIM == 256, "v2 supports HD 128/256");
     static_assert(HEAD_DIM % MMA_K == 0,   "HEAD_DIM multiple of MMA_K");
@@ -2462,6 +2462,15 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     constexpr uint32_t HD_PER_WARP = HEAD_DIM / NWARPS;        // 64
     constexpr uint32_t PV_N_TILES  = HD_PER_WARP / MMA_N;      // 8
     constexpr uint32_t Q_GROUPS_PER_KV = Q_PER_KV / NCOLS2;    // 3
+    // m-axis layout. One m=16 MMA fragment packs NCOLS2=2 q-heads of
+    // Q_ROWS_PER_TILE=8 q-rows each. M_TILES extends BR by stacking q-rows
+    // into multiple m-tiles; each m-tile's MMA shares the same K/V B-frag
+    // load → M_TILES× MMAs per shmem load (the q-rows-per-CTA lever).
+    constexpr uint32_t Q_ROWS_PER_TILE = MMA_M / NCOLS2;       // 8
+    constexpr uint32_t M_TILES         = BR / Q_ROWS_PER_TILE; // 1@BR=8, 2@BR=16, 4@BR=32
+    constexpr uint32_t M_TOTAL         = BR * NCOLS2;          // 16@BR=8, 32@BR=16, 64@BR=32
+    static_assert(M_TILES * MMA_M == M_TOTAL, "M_TILES*MMA_M==M_TOTAL");
+    static_assert(M_TOTAL % NWARPS == 0,      "M_TOTAL divisible by NWARPS");
 
     const uint32_t kvg_idx  = blockIdx.x;
     const uint32_t kv_head  = kvg_idx / Q_GROUPS_PER_KV;
@@ -2490,60 +2499,66 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     char *p = smem_raw;
     __half *s_K     = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
     __half *s_V_buf = reinterpret_cast<__half *>(p); p += HEAD_DIM * BC       * sizeof(__half);
-    float  *s_S     = reinterpret_cast<float  *>(p); p += MMA_M    * BC       * sizeof(float);
-    __half *s_P     = reinterpret_cast<__half *>(p); p += MMA_M    * BC       * sizeof(__half);
-    float  *s_m     = reinterpret_cast<float  *>(p); p += MMA_M               * sizeof(float);
-    float  *s_l     = reinterpret_cast<float  *>(p); p += MMA_M               * sizeof(float);
-    float  *s_alpha = reinterpret_cast<float  *>(p); p += MMA_M               * sizeof(float);
+    float  *s_S     = reinterpret_cast<float  *>(p); p += M_TOTAL  * BC       * sizeof(float);
+    __half *s_P     = reinterpret_cast<__half *>(p); p += M_TOTAL  * BC       * sizeof(__half);
+    float  *s_m     = reinterpret_cast<float  *>(p); p += M_TOTAL              * sizeof(float);
+    float  *s_l     = reinterpret_cast<float  *>(p); p += M_TOTAL              * sizeof(float);
+    float  *s_alpha = reinterpret_cast<float  *>(p); p += M_TOTAL              * sizeof(float);
 
     // ---- Q in registers --------------------------------------------------
-    // Q_reg[ks][slot] holds the m=16 a-fragment for ks-step k0=ks*MMA_K.
-    // ldmatrix.x4 a-frag distribution: lane t holds rows {t/4, t/4+8} at
-    // cols {t%4*2..+1, t%4*2+8..+9}. Mapping to packing m=c*BR+r:
+    // Q_reg[mt][ks][slot] holds the m-tile mt's m=16 a-fragment for ks-step.
+    // For BR=16, mt=0 covers q-rows 0..7, mt=1 covers q-rows 8..15.
+    // Within an m-tile, slots pack two c-heads (C_A, C_B) at (r, r+8) lanes:
     //   slot 0 = pack2h(s[r_a, k0+in_group*2..+1])    head=head_base+C_A
     //   slot 1 = pack2h(s[r_b, k0+in_group*2..+1])    head=head_base+C_B
     //   slot 2 = pack2h(s[r_a, k0+in_group*2+8..+9])  head=head_base+C_A
     //   slot 3 = pack2h(s[r_b, k0+in_group*2+8..+9])  head=head_base+C_B
-    unsigned Q_reg[QK_KSTEPS][4];
+    unsigned Q_reg[M_TILES][QK_KSTEPS][4];
     {
-        const uint32_t q_idx_a = block_q * BR + r_a;
-        const uint32_t q_idx_b = block_q * BR + r_b;
-        const bool a_active = (q_idx_a < batch);
-        const bool b_active = (q_idx_b < batch);
         const uint32_t head_a = head_base + C_A;
         const uint32_t head_b = head_base + C_B;
-        const float *qa = a_active
-            ? (q + (uint64_t)q_idx_a * q_batch_stride + head_a * q_stride) : nullptr;
-        const float *qb = b_active
-            ? (q + (uint64_t)q_idx_b * q_batch_stride + head_b * q_stride) : nullptr;
         #pragma unroll
-        for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
-            const uint32_t k0 = ks * MMA_K;
-            const uint32_t col0 = k0 + in_group * 2;
-            const __half qa0 = qa ? __float2half(qa[col0 + 0]) : (__half)0;
-            const __half qa1 = qa ? __float2half(qa[col0 + 1]) : (__half)0;
-            const __half qb0 = qb ? __float2half(qb[col0 + 0]) : (__half)0;
-            const __half qb1 = qb ? __float2half(qb[col0 + 1]) : (__half)0;
-            const __half qa8 = qa ? __float2half(qa[col0 + 8]) : (__half)0;
-            const __half qa9 = qa ? __float2half(qa[col0 + 9]) : (__half)0;
-            const __half qb8 = qb ? __float2half(qb[col0 + 8]) : (__half)0;
-            const __half qb9 = qb ? __float2half(qb[col0 + 9]) : (__half)0;
-            Q_reg[ks][0] = mma_detail::pack2h(qa0, qa1);
-            Q_reg[ks][1] = mma_detail::pack2h(qb0, qb1);
-            Q_reg[ks][2] = mma_detail::pack2h(qa8, qa9);
-            Q_reg[ks][3] = mma_detail::pack2h(qb8, qb9);
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+            const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+            const bool a_active = (q_idx_a < batch);
+            const bool b_active = (q_idx_b < batch);
+            const float *qa = a_active
+                ? (q + (uint64_t)q_idx_a * q_batch_stride + head_a * q_stride) : nullptr;
+            const float *qb = b_active
+                ? (q + (uint64_t)q_idx_b * q_batch_stride + head_b * q_stride) : nullptr;
+            #pragma unroll
+            for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+                const uint32_t k0 = ks * MMA_K;
+                const uint32_t col0 = k0 + in_group * 2;
+                const __half qa0 = qa ? __float2half(qa[col0 + 0]) : (__half)0;
+                const __half qa1 = qa ? __float2half(qa[col0 + 1]) : (__half)0;
+                const __half qb0 = qb ? __float2half(qb[col0 + 0]) : (__half)0;
+                const __half qb1 = qb ? __float2half(qb[col0 + 1]) : (__half)0;
+                const __half qa8 = qa ? __float2half(qa[col0 + 8]) : (__half)0;
+                const __half qa9 = qa ? __float2half(qa[col0 + 9]) : (__half)0;
+                const __half qb8 = qb ? __float2half(qb[col0 + 8]) : (__half)0;
+                const __half qb9 = qb ? __float2half(qb[col0 + 9]) : (__half)0;
+                Q_reg[mt][ks][0] = mma_detail::pack2h(qa0, qa1);
+                Q_reg[mt][ks][1] = mma_detail::pack2h(qb0, qb1);
+                Q_reg[mt][ks][2] = mma_detail::pack2h(qa8, qa9);
+                Q_reg[mt][ks][3] = mma_detail::pack2h(qb8, qb9);
+            }
         }
     }
 
-    if (tid < MMA_M) {
+    if (tid < M_TOTAL) {
         s_m[tid] = -INFINITY;
         s_l[tid] = 0.0f;
     }
-    float O_acc[PV_N_TILES][4];
+    float O_acc[M_TILES][PV_N_TILES][4];
     #pragma unroll
-    for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+    for (uint32_t mt = 0; mt < M_TILES; ++mt) {
         #pragma unroll
-        for (int i = 0; i < 4; ++i) O_acc[n][i] = 0.0f;
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) O_acc[mt][n][i] = 0.0f;
+        }
     }
     __syncthreads();
 
@@ -2642,11 +2657,16 @@ fattn_prefill_mma_gqa_kernel_v2_t(
         if (!USE_CP_ASYNC_V) issue_V(t0);
         __syncthreads();
 
-        // QK^T phase. One MMA per (ks, nq) covers both packed c-heads.
-        float c_h[QK_N_TILES][4];
+        // QK^T phase. Each (ks, nq) loads one K B-frag and runs M_TILES MMAs
+        // reusing it (the q-rows-per-CTA lever).
+        float c_h[M_TILES][QK_N_TILES][4];
         #pragma unroll
-        for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
-            c_h[nq][0]=0.f; c_h[nq][1]=0.f; c_h[nq][2]=0.f; c_h[nq][3]=0.f;
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            #pragma unroll
+            for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                c_h[mt][nq][0]=0.f; c_h[mt][nq][1]=0.f;
+                c_h[mt][nq][2]=0.f; c_h[mt][nq][3]=0.f;
+            }
         }
         #pragma unroll
         for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
@@ -2657,10 +2677,13 @@ fattn_prefill_mma_gqa_kernel_v2_t(
                 const __half *krow0 = &s_K[kv_col * HEAD_DIM + k0 + in_group * 2];
                 const unsigned b0 = mma_detail::pack2h(krow0);
                 const unsigned b1 = mma_detail::pack2h(krow0 + 8);
-                mma_detail::mma_m16n8k16_f16f16f32(
-                    c_h[nq][0], c_h[nq][1], c_h[nq][2], c_h[nq][3],
-                    Q_reg[ks][0], Q_reg[ks][1], Q_reg[ks][2], Q_reg[ks][3],
-                    b0, b1);
+                #pragma unroll
+                for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                    mma_detail::mma_m16n8k16_f16f16f32(
+                        c_h[mt][nq][0], c_h[mt][nq][1], c_h[mt][nq][2], c_h[mt][nq][3],
+                        Q_reg[mt][ks][0], Q_reg[mt][ks][1], Q_reg[mt][ks][2], Q_reg[mt][ks][3],
+                        b0, b1);
+                }
             }
         }
 
@@ -2669,40 +2692,44 @@ fattn_prefill_mma_gqa_kernel_v2_t(
             if (t0_next < kv_hi) { issue_K(t0_next); mma_detail::cp_async_commit(); }
         }
 
-        // Write S to shmem with causal mask. c_h[nq] slots:
-        //   .0/.1 → m=group_id     (c=C_A, r=r_a=group_id)
-        //   .2/.3 → m=group_id+8   (c=C_B, r=r_b=group_id)
+        // Write S to shmem with causal mask. c_h[mt][nq] slots:
+        //   .0/.1 → m-row m_in_frag=group_id     (c=C_A in m-tile mt, q-row mt*8+r_a)
+        //   .2/.3 → m-row m_in_frag=group_id+8   (c=C_B in m-tile mt, q-row mt*8+r_b)
+        // s_S layout: M_TOTAL rows × BC cols. m-tile mt occupies rows [mt*MMA_M, mt*MMA_M+16).
         {
-            const uint32_t q_idx_a = block_q * BR + r_a;
-            const uint32_t q_idx_b = block_q * BR + r_b;
-            const bool a_active = (q_idx_a < batch);
-            const bool b_active = (q_idx_b < batch);
-            const uint32_t my_max_kv_a = base_seq_len + q_idx_a + 1;
-            const uint32_t my_max_kv_b = base_seq_len + q_idx_b + 1;
-            const uint32_t m_a = C_A * BR + r_a;     // group_id
-            const uint32_t m_b = C_B * BR + r_b;     // group_id + 8
             #pragma unroll
-            for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
-                const uint32_t base_col = warp * (BC / NWARPS) + nq * MMA_N + in_group * 2;
-                const uint32_t t_a0 = t0 + base_col;
-                const uint32_t t_a1 = t0 + base_col + 1;
-                float v00 = (a_active && t_a0 < my_max_kv_a) ? c_h[nq][0] * scale : -INFINITY;
-                float v01 = (a_active && t_a1 < my_max_kv_a) ? c_h[nq][1] * scale : -INFINITY;
-                float v02 = (b_active && t_a0 < my_max_kv_b) ? c_h[nq][2] * scale : -INFINITY;
-                float v03 = (b_active && t_a1 < my_max_kv_b) ? c_h[nq][3] * scale : -INFINITY;
-                s_S[m_a * BC + base_col + 0] = v00;
-                s_S[m_a * BC + base_col + 1] = v01;
-                s_S[m_b * BC + base_col + 0] = v02;
-                s_S[m_b * BC + base_col + 1] = v03;
+            for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+                const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+                const bool a_active = (q_idx_a < batch);
+                const bool b_active = (q_idx_b < batch);
+                const uint32_t my_max_kv_a = base_seq_len + q_idx_a + 1;
+                const uint32_t my_max_kv_b = base_seq_len + q_idx_b + 1;
+                const uint32_t m_a = mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a; // mt*16+group_id
+                const uint32_t m_b = mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b; // mt*16+group_id+8
+                #pragma unroll
+                for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                    const uint32_t base_col = warp * (BC / NWARPS) + nq * MMA_N + in_group * 2;
+                    const uint32_t t_a0 = t0 + base_col;
+                    const uint32_t t_a1 = t0 + base_col + 1;
+                    float v00 = (a_active && t_a0 < my_max_kv_a) ? c_h[mt][nq][0] * scale : -INFINITY;
+                    float v01 = (a_active && t_a1 < my_max_kv_a) ? c_h[mt][nq][1] * scale : -INFINITY;
+                    float v02 = (b_active && t_a0 < my_max_kv_b) ? c_h[mt][nq][2] * scale : -INFINITY;
+                    float v03 = (b_active && t_a1 < my_max_kv_b) ? c_h[mt][nq][3] * scale : -INFINITY;
+                    s_S[m_a * BC + base_col + 0] = v00;
+                    s_S[m_a * BC + base_col + 1] = v01;
+                    s_S[m_b * BC + base_col + 0] = v02;
+                    s_S[m_b * BC + base_col + 1] = v03;
+                }
             }
         }
 
         __syncthreads();
 
-        // Online softmax over m=16 rows × BC=64. 4 warps × 4 rows/warp = 16.
-        // Each lane covers BC/WARP_SIZE=2 cols.
-        constexpr uint32_t ROWS_PER_WARP = MMA_M / NWARPS;       // 4
-        constexpr uint32_t COLS_PER_LANE = BC / WARP_SIZE;       // 2
+        // Online softmax over M_TOTAL rows × BC cols. NWARPS warps × ROWS_PER_WARP rows.
+        // Each lane covers BC/WARP_SIZE cols.
+        constexpr uint32_t ROWS_PER_WARP = M_TOTAL / NWARPS;     // 4@BR=8, 8@BR=16
+        constexpr uint32_t COLS_PER_LANE = BC / WARP_SIZE;       // 1@BC=32, 2@BC=64
         #pragma unroll
         for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
             const uint32_t m_row = warp * ROWS_PER_WARP + r;
@@ -2747,20 +2774,28 @@ fattn_prefill_mma_gqa_kernel_v2_t(
         }
         __syncthreads();
 
-        // Rescale O_acc by per-row alpha. Lane (group_id) → m=group_id (a)
-        // and m=group_id+8 (b).
-        const float alpha_a = s_alpha[group_id];
-        const float alpha_b = s_alpha[group_id + 8];
+        // Rescale O_acc by per-row alpha. For each m-tile mt, lane group_id holds
+        // m=mt*16+group_id (a-side, q-row mt*8+r_a) and m=mt*16+group_id+8 (b-side).
+        float alpha_a[M_TILES], alpha_b[M_TILES];
         #pragma unroll
-        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
-            O_acc[n][0] *= alpha_a;
-            O_acc[n][1] *= alpha_a;
-            O_acc[n][2] *= alpha_b;
-            O_acc[n][3] *= alpha_b;
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            alpha_a[mt] = s_alpha[mt * MMA_M + group_id];
+            alpha_b[mt] = s_alpha[mt * MMA_M + group_id + 8];
+        }
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            #pragma unroll
+            for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                O_acc[mt][n][0] *= alpha_a[mt];
+                O_acc[mt][n][1] *= alpha_a[mt];
+                O_acc[mt][n][2] *= alpha_b[mt];
+                O_acc[mt][n][3] *= alpha_b[mt];
+            }
         }
 
-        // Phase B: PV. ldmatrix.x4 on s_P loads m=16 a-frag (both c-heads packed).
-        // Single MMA per (n, ks) covers both c-heads.
+        // Phase B: PV. Each (n, ks) loads one V B-frag and runs M_TILES MMAs
+        // reusing it (the q-rows-per-CTA lever). P A-frag reloaded per m-tile
+        // from s_P[mt*MMA_M*BC..].
         #pragma unroll
         for (uint32_t n = 0; n < PV_N_TILES; ++n) {
             const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
@@ -2777,12 +2812,15 @@ fattn_prefill_mma_gqa_kernel_v2_t(
                     b0 = mma_detail::pack2h(vrow0);
                     b1 = mma_detail::pack2h(vrow0 + 8);
                 }
-                unsigned a0, a1, a2, a3;
-                mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
-                                          &s_P[0 * BC + k0], BC);
-                mma_detail::mma_m16n8k16_f16f16f32(
-                    O_acc[n][0], O_acc[n][1], O_acc[n][2], O_acc[n][3],
-                    a0, a1, a2, a3, b0, b1);
+                #pragma unroll
+                for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                    unsigned a0, a1, a2, a3;
+                    mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                              &s_P[mt * MMA_M * BC + k0], BC);
+                    mma_detail::mma_m16n8k16_f16f16f32(
+                        O_acc[mt][n][0], O_acc[mt][n][1], O_acc[mt][n][2], O_acc[mt][n][3],
+                        a0, a1, a2, a3, b0, b1);
+                }
             }
         }
 
@@ -2796,41 +2834,44 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     {
         const uint32_t head_a = head_base + C_A;
         const uint32_t head_b = head_base + C_B;
-        const uint32_t q_idx_a = block_q * BR + r_a;
-        const uint32_t q_idx_b = block_q * BR + r_b;
-        const float l_a = s_l[C_A * BR + r_a];
-        const float l_b = s_l[C_B * BR + r_b];
-        const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
-        const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
-        float * const out_a = (q_idx_a < batch)
-            ? (out + (uint64_t)q_idx_a * out_batch_stride + head_a * HEAD_DIM) : nullptr;
-        float * const out_b = (q_idx_b < batch)
-            ? (out + (uint64_t)q_idx_b * out_batch_stride + head_b * HEAD_DIM) : nullptr;
         #pragma unroll
-        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
-            const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
-            const uint32_t col = n0 + in_group * 2;
-            if (out_a) {
-                out_a[col + 0] = O_acc[n][0] * inv_la;
-                out_a[col + 1] = O_acc[n][1] * inv_la;
-            }
-            if (out_b) {
-                out_b[col + 0] = O_acc[n][2] * inv_lb;
-                out_b[col + 1] = O_acc[n][3] * inv_lb;
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+            const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+            const float l_a = s_l[mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a];
+            const float l_b = s_l[mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b];
+            const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
+            const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
+            float * const out_a = (q_idx_a < batch)
+                ? (out + (uint64_t)q_idx_a * out_batch_stride + head_a * HEAD_DIM) : nullptr;
+            float * const out_b = (q_idx_b < batch)
+                ? (out + (uint64_t)q_idx_b * out_batch_stride + head_b * HEAD_DIM) : nullptr;
+            #pragma unroll
+            for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+                const uint32_t col = n0 + in_group * 2;
+                if (out_a) {
+                    out_a[col + 0] = O_acc[mt][n][0] * inv_la;
+                    out_a[col + 1] = O_acc[mt][n][1] * inv_la;
+                }
+                if (out_b) {
+                    out_b[col + 0] = O_acc[mt][n][2] * inv_lb;
+                    out_b[col + 1] = O_acc[mt][n][3] * inv_lb;
+                }
             }
         }
     }
 }
 
-static size_t fattn_mma_gqa_v2_smem_bytes(uint32_t head_dim, uint32_t bc) {
-    constexpr uint32_t BR = 8, NCOLS2 = 2;
-    constexpr uint32_t MMA_M = BR * NCOLS2;   // 16
+static size_t fattn_mma_gqa_v2_smem_bytes(uint32_t head_dim, uint32_t bc, uint32_t br) {
+    constexpr uint32_t NCOLS2 = 2;
+    const uint32_t M_TOTAL = br * NCOLS2;            // 16@BR=8, 32@BR=16
     size_t s = 0;
     s += bc       * head_dim * sizeof(__half);   // K
     s += head_dim * bc       * sizeof(__half);   // V
-    s += MMA_M    * bc       * sizeof(float);    // S
-    s += MMA_M    * bc       * sizeof(__half);   // P
-    s += MMA_M               * sizeof(float) * 3;// m, l, alpha
+    s += M_TOTAL  * bc       * sizeof(float);    // S
+    s += M_TOTAL  * bc       * sizeof(__half);   // P
+    s += M_TOTAL             * sizeof(float) * 3;// m, l, alpha
     return s;
 }
 
@@ -3157,7 +3198,7 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
     if (n_kv_heads == 0 || n_heads % n_kv_heads != 0) return false;
     const uint32_t q_per_kv = n_heads / n_kv_heads;
     if (!(q_per_kv == 6)) return false;
-    constexpr uint32_t BR = 8, NCOLS2 = 2;
+    constexpr uint32_t NCOLS2 = 2;
 
     static const uint32_t bc_choice = []() -> uint32_t {
         const char *e = std::getenv("QW3_PREFILL_FA2_BC");
@@ -3166,12 +3207,23 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         if (std::strcmp(e, "64") == 0) return 64;
         return 32;
     }();
+    static const uint32_t br_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_BR");
+        if (!e) return 16;
+        if (std::strcmp(e, "8")  == 0) return 8;
+        if (std::strcmp(e, "16") == 0) return 16;
+        // BR=32 NCOLS2=2 (M_TILES=4) compiles but regresses 1-1.5% across T —
+        // 4 KB Q_reg spill at 255-reg cap lands on hot path. Kept reachable
+        // via env for diagnostic / future-rewrite use only.
+        if (std::strcmp(e, "32") == 0) return 32;
+        return 16;
+    }();
 
-    const uint32_t n_blocks_q = (batch + BR - 1) / BR;
+    const uint32_t n_blocks_q = (batch + br_choice - 1) / br_choice;
     const uint32_t q_groups   = q_per_kv / NCOLS2;     // 3
     const dim3 grid(n_kv_heads * q_groups, n_blocks_q, 1);
     const dim3 block(128);
-    const size_t smem = fattn_mma_gqa_v2_smem_bytes(head_dim, bc_choice);
+    const size_t smem = fattn_mma_gqa_v2_smem_bytes(head_dim, bc_choice, br_choice);
 
     static const bool use_cp_async_k = []() {
         const char *e = std::getenv("QW3_PREFILL_FA2_KCPASYNC");
@@ -3184,8 +3236,9 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
     }();
 
-    auto launch = [&](auto HD_v, auto BC_v) {
+    auto launch = [&](auto HD_v, auto BR_v, auto BC_v) {
         constexpr uint32_t HD = decltype(HD_v)::value;
+        constexpr uint32_t BR = decltype(BR_v)::value;
         constexpr uint32_t BC = decltype(BC_v)::value;
         auto dispatch = [&](auto K_v, auto V_v) {
             constexpr bool K = decltype(K_v)::value;
@@ -3212,12 +3265,17 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         }
     };
 
-    auto launch_with_bc = [&](auto HD_v) {
-        if (bc_choice == 32) launch(HD_v, std::integral_constant<uint32_t, 32>{});
-        else                 launch(HD_v, std::integral_constant<uint32_t, 64>{});
+    auto launch_with_bc = [&](auto HD_v, auto BR_v) {
+        if (bc_choice == 32) launch(HD_v, BR_v, std::integral_constant<uint32_t, 32>{});
+        else                 launch(HD_v, BR_v, std::integral_constant<uint32_t, 64>{});
     };
-    if (head_dim == 256) launch_with_bc(std::integral_constant<uint32_t, 256>{});
-    else                 launch_with_bc(std::integral_constant<uint32_t, 128>{});
+    auto launch_with_br = [&](auto HD_v) {
+        if      (br_choice == 32) launch_with_bc(HD_v, std::integral_constant<uint32_t, 32>{});
+        else if (br_choice == 16) launch_with_bc(HD_v, std::integral_constant<uint32_t, 16>{});
+        else                      launch_with_bc(HD_v, std::integral_constant<uint32_t, 8>{});
+    };
+    if (head_dim == 256) launch_with_br(std::integral_constant<uint32_t, 256>{});
+    else                 launch_with_br(std::integral_constant<uint32_t, 128>{});
     return true;
 }
 
