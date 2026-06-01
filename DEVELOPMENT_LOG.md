@@ -516,6 +516,42 @@ moved.
 
 ## What hit a wall (negative results)
 
+### Current state (2026-06-01) — q-rows-per-CTA lever exhausted in qw3 architecture
+
+The FA2 long-T gap (NCU-measured 23.3% Tensor pipe util at T=65K vs
+llama's 65.1%, identical 16.7% theoretical occupancy, DRAM at 2% of
+peak) points at exactly one structural lever: increase q-rows-per-CTA
+so each K/V load amortizes more MMA work. Llama uses M_TOTAL=64 (BR=8
+× NCOLS2=8 with q-head zero-pad); qw3's v2 default is M_TOTAL=32
+(BR=16 × NCOLS2=2 with no padding).
+
+Every approach to push M_TOTAL=64 in qw3's current shape failed:
+
+| Variant | Geometry | Outcome |
+|---|---|---|
+| FA2 v2 BR=32 NCOLS2=2 | M_TOTAL=64, 4 MMAs/ks | -1 to -1.5% (4 KB spill at 255-reg cap) |
+| FA2 v2 BR=32 NCOLS2=2 + FP16-O | M_TOTAL=64 with FP16 acc | -5/-9/-20% at T=4K/16K/65K (FP16 mantissa loss) |
+| FA2 v3 BR=64 NCOLS2=1 + Q-in-shmem | M_TOTAL=64 via Q-shmem | -6 to -37% across T (1 block/SM + Q-shmem traffic) |
+| FA2 v4 NWARPS=8 + warp-pair-owns-mtile | M_TOTAL=64 via 8 warps × 4 m-tiles | -0.5/-3/-5/-8.4% at T=4K/16K/33K/65K (1 block/SM, lost SM-level latency hiding) |
+
+Common cause: at HD=256, 256-thread CTA, Blackwell's 65536-reg/SM cap
+puts the M_TOTAL=64 register footprint right at 1 block/SM. v2's
+M_TOTAL=32 fits 2 blocks/SM, providing block-level latency hiding that
+none of the larger geometries can recover.
+
+What still hasn't been tried in this kernel family:
+- O_acc → shmem (constraint: shmem 96 KB cap on sm_120a; M_TOTAL=64 ×
+  HD=256 × 4 B = 64 KB additional, leaves no room for K+V+S+P)
+- Asymmetric warp specialization (producer warps for cp.async only,
+  consumer warps for MMA), Hopper-style — sm_120a doesn't expose
+  `wgmma`-class accumulator-in-shmem MMAs that make the asymmetry pay
+- A completely different kernel family (FlashInfer / FlashAttention3-
+  style with TMA + warp-specialized softmax)
+
+The remaining gap at memory parity is structural, not a tuning
+oversight. Closing it needs a different kernel skeleton than the
+ldmatrix + m16n8k16 chassis we've been iterating on.
+
 ### FA2 v2 BR=32 NCOLS2=2 (M_TILES=4, M_TOTAL=64)
 
 Tried the same lever again — m=64 q-rows/CTA, 4 MMAs per K/V ldmatrix,

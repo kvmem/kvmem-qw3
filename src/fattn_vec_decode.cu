@@ -3526,6 +3526,613 @@ static size_t fattn_mma_gqa_v3_smem_bytes(uint32_t head_dim, uint32_t bc, uint32
 }
 
 
+// =====================================================================
+// fattn_prefill_mma_gqa_kernel_v4_t — NWARPS=8 + warp-pair-owns-mtile
+// =====================================================================
+//
+// Long-T attack #2 (after v3 negative). Mirrors llama.cpp's M_TOTAL=64
+// q-rows-per-CTA exactly while keeping per-thread Q in registers.
+//
+// Geometry:
+//   NWARPS = 8 (vs v2's 4), 256 threads/CTA
+//   BR = 8, BC = 32, NCOLS2 = 2, M_TILES = 4 → M_TOTAL = 64
+//   warp_pair = warp / 2 ∈ {0..3} → owns its own m-tile (8 q-tokens × 2 q-heads)
+//   warp_in_pair = warp % 2 ∈ {0,1} → owns its BC half (16 cols × 2 MMA_N tiles)
+//
+// q-head pad: gqa=6 padded to 8 in m-axis. Heads 6,7 produce -INF scores
+// (masked out before softmax) → zero contribution to O. M_TOTAL=64 active
+// rows of which 8/64 = 12.5% are zero-padded compute (still cheaper than
+// re-reading K/V to avoid the pad).
+//
+// Why warp-pair-owns-mtile (vs v2's all-warps-share-mtiles):
+//   v2 NWARPS=4 with M_TILES=4 (BR=32 NCOLS2=2) hits the 255-reg cap
+//   because every warp holds Q_reg for ALL 4 m-tiles (256 fp32/thread for
+//   Q alone). v3 (BR=64 NCOLS2=1, NWARPS=4) moved Q to shmem to escape;
+//   the 32 KB s_Q + ldmatrix.x4 per (mt, ks) cost regressed throughput.
+//   v4 keeps Q in registers but partitions m-tiles ACROSS warp pairs:
+//   each warp holds Q only for its own m-tile (64 fp32/thread, well
+//   under cap).
+//
+// Why NWARPS=8 (vs v2's 4):
+//   With 4 m-tiles × 2 warps each = 8 warps. Each warp pair splits the
+//   BC axis (16 cols/warp = 2 MMA_N tiles). NWARPS=4 with warp-pair
+//   structure would need M_TILES=2 (just BR=16 NCOLS2=2 = v2 default,
+//   no win), so the 8-warp count is forced by the M_TOTAL=64 target.
+//
+// Per-thread register footprint (vs v2 default BR=16 NCOLS2=2):
+//   Q_reg:  v2  M_TILES=2 × KSTEPS=16 × 4   = 128 fp32
+//           v4  M_TILES_PER_WARP=1 × 16 × 4 = 64 fp32  (-50%)
+//   c_h:    v2  2 × QK_N_TILES=2 × 4        = 16 fp32  (per warp)
+//           v4  1 × 2 × 4                    = 8 fp32   (per warp)
+//   O_acc:  v2  2 × PV_N_TILES=8 × 4        = 64 fp32
+//           v4  1 × PV_N_TILES=16 × 4       = 64 fp32  (HD/2 cols/warp)
+//   Net Q+c_h+O ≈ 136 fp32/thread (v2 def: 208). Predicted ~150-180 reg32
+//   per thread, 0 spills.
+//
+// Shmem (HD=256, BC=32, BR=8, NCOLS2=2, M_TILES=4, KV_PAD=8, S_PAD=4):
+//   s_K: 32×264×2 = 16.5 KB ; s_V: 16.5 KB
+//   s_S: 64×36×4 = 9 KB     ; s_P: 64×40×2 = 5 KB
+//   s_m, s_l, s_alpha: 64×4×3 = 0.75 KB
+//   Total ≈ 47.7 KB — 2 blocks/SM at sm_120a 100 KB opt-in cap.
+//
+// Per-tile sync count (BC=32):
+//   1× post-K-load (post-cp.async wait)
+//   1× post-QK-write s_S (before softmax read)
+//   1× post-softmax write s_P (before PV ldmatrix)
+//   1× pre-V-load wait_group<0>
+//   = 4 syncs/tile (v2 default = 3 syncs/tile; v4's 1 extra is the cost
+//   of warp-pair partial-S merge implicit in s_S).
+//
+// Grid:
+//   (n_kv_heads, n_blocks_q, NSPLIT)
+//   block.x = NWARPS * 32 = 256
+template <uint32_t HEAD_DIM,
+          bool USE_CP_ASYNC_K, bool USE_CP_ASYNC_V, uint32_t NSPLIT,
+          bool USE_FP16_O = false>
+__global__ void
+__launch_bounds__(256, 1)
+fattn_prefill_mma_gqa_kernel_v4_t(
+        float       * __restrict__ out,
+        float       * __restrict__ partials,    // NSPLIT>1 only
+        float       * __restrict__ ms,          // NSPLIT>1 only: [n_heads*batch*NSPLIT*2]
+        const float * __restrict__ q,
+        uint32_t     q_stride,
+        const __half* __restrict__ k_cache,
+        const __half* __restrict__ v_cache,
+        uint32_t     n_heads,
+        uint32_t     n_kv_heads,
+        uint32_t     base_seq_len,
+        uint32_t     batch,
+        uint32_t     q_batch_stride,
+        uint32_t     out_batch_stride,
+        float        scale) {
+    constexpr uint32_t WARP_SIZE = 32;
+    constexpr uint32_t NWARPS    = 8;
+    constexpr uint32_t MMA_M     = 16;
+    constexpr uint32_t MMA_N     = 8;
+    constexpr uint32_t MMA_K     = 16;
+    constexpr uint32_t Q_PER_KV  = 6;     // active heads (gqa=6)
+    constexpr uint32_t Q_PADDED  = 8;     // padded to 8 = NCOLS2 * M_TILES
+    constexpr uint32_t BR        = 8;
+    constexpr uint32_t BC        = 32;
+    constexpr uint32_t NCOLS2    = 2;
+    constexpr uint32_t M_TILES   = 4;     // 4 warp pairs × 1 m-tile/pair
+    constexpr uint32_t M_TOTAL   = M_TILES * MMA_M;       // 64
+    constexpr uint32_t KV_PAD    = 8;
+    constexpr uint32_t S_PAD     = 4;     // fp32 elems
+    constexpr uint32_t S_STRIDE  = BC + S_PAD;            // 36 fp32
+    constexpr uint32_t P_STRIDE  = BC + S_PAD * 2;        // 40 half (=160 B = same byte width as S_STRIDE fp32)
+    constexpr uint32_t HEAD_STRIDE = HEAD_DIM + KV_PAD;   // 264
+
+    static_assert(HEAD_DIM == 128 || HEAD_DIM == 256, "v4 supports HD 128/256");
+    static_assert(M_TOTAL == NCOLS2 * M_TILES * MMA_M / NCOLS2, "M_TOTAL consistency");
+    static_assert(NWARPS == 2 * M_TILES, "v4: 2 warps per m-tile");
+
+    constexpr uint32_t WARPS_PER_PAIR     = 2;
+    constexpr uint32_t COLS_PER_WARP      = BC / WARPS_PER_PAIR;       // 16
+    constexpr uint32_t QK_N_TILES_PER_WARP = COLS_PER_WARP / MMA_N;    // 2
+    constexpr uint32_t QK_KSTEPS          = HEAD_DIM / MMA_K;          // 16
+    constexpr uint32_t HD_PER_WARP_IN_PAIR = HEAD_DIM / WARPS_PER_PAIR;// 128
+    constexpr uint32_t PV_N_TILES         = HD_PER_WARP_IN_PAIR / MMA_N; // 16
+    constexpr uint32_t PV_KSTEPS          = BC / MMA_K;                // 2
+    constexpr uint32_t Q_ROWS_PER_TILE    = MMA_M / NCOLS2;            // 8 = BR
+
+    // Grid: each kv-head is one CTA along blockIdx.x. The CTA covers all
+    // Q_PADDED=8 q-heads of that kv-head (6 active + 2 zero-padded) packed
+    // into M_TILES=4 m-tiles. So Q_GROUPS_PER_KV = 1 here (vs v2's 3).
+    const uint32_t kv_head = blockIdx.x;
+    const uint32_t block_q = blockIdx.y;
+    const uint32_t k_split = blockIdx.z;
+    const uint32_t tid     = threadIdx.x;
+    const uint32_t warp    = tid / WARP_SIZE;
+    const uint32_t lane    = tid % WARP_SIZE;
+    if (kv_head >= n_kv_heads) return;
+
+    const uint32_t warp_pair    = warp / WARPS_PER_PAIR;   // 0..3 = mt
+    const uint32_t warp_in_pair = warp % WARPS_PER_PAIR;   // 0,1
+    const uint32_t mt           = warp_pair;
+    const uint32_t my_bc_lo     = warp_in_pair * COLS_PER_WARP;
+
+    const uint32_t group_id = lane / 4;
+    const uint32_t in_group = lane % 4;
+
+    constexpr uint32_t C_A = 0;
+    constexpr uint32_t C_B = 1;
+    const uint32_t r_a = group_id;       // q-row within tile, a-pair
+    const uint32_t r_b = group_id;       // q-row within tile, b-pair
+
+    // Active heads for this CTA: head_base + 0..5 active, head_base+6..7 padded.
+    const uint32_t head_base = kv_head * Q_PER_KV;
+    // For m-tile mt, this warp-pair owns 2 q-heads (NCOLS2=2):
+    //   head_a_idx = mt * 2 + 0 (in [0..7] padded space)
+    //   head_b_idx = mt * 2 + 1
+    const uint32_t head_a_idx_in_kv = mt * NCOLS2 + C_A;
+    const uint32_t head_b_idx_in_kv = mt * NCOLS2 + C_B;
+    const bool head_a_active = (head_a_idx_in_kv < Q_PER_KV);
+    const bool head_b_active = (head_b_idx_in_kv < Q_PER_KV);
+    const uint32_t head_a = head_base + head_a_idx_in_kv;
+    const uint32_t head_b = head_base + head_b_idx_in_kv;
+
+    uint32_t block_max_q = block_q * BR + BR;
+    if (block_max_q > batch) block_max_q = batch;
+    const uint32_t block_max_kv = base_seq_len + block_max_q;
+
+    // Split-KV.
+    uint32_t kv_lo, kv_hi;
+    if (NSPLIT == 1) {
+        kv_lo = 0;
+        kv_hi = block_max_kv;
+    } else {
+        const uint32_t kv_total = base_seq_len + batch;
+        const uint32_t per_split = ((kv_total + NSPLIT - 1) / NSPLIT + BC - 1) & ~uint32_t(BC - 1);
+        kv_lo = k_split * per_split;
+        kv_hi = kv_lo + per_split;
+        if (kv_hi > block_max_kv) kv_hi = block_max_kv;
+        if (kv_lo >= kv_hi) {
+            // Dead partial.
+            const uint32_t q_idx_a = block_q * BR + r_a;
+            const uint32_t q_idx_b = block_q * BR + r_b;
+            if (warp_in_pair == 0 && in_group == 0) {
+                if (head_a_active && q_idx_a < batch) {
+                    const uint64_t mb = ((uint64_t)head_a * batch + q_idx_a) * NSPLIT + k_split;
+                    ms[mb * 2 + 0] = -INFINITY;
+                    ms[mb * 2 + 1] = 0.0f;
+                }
+                if (head_b_active && q_idx_b < batch) {
+                    const uint64_t mb = ((uint64_t)head_b * batch + q_idx_b) * NSPLIT + k_split;
+                    ms[mb * 2 + 0] = -INFINITY;
+                    ms[mb * 2 + 1] = 0.0f;
+                }
+            }
+            #pragma unroll
+            for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                const uint32_t n0 = warp_in_pair * HD_PER_WARP_IN_PAIR + n * MMA_N;
+                const uint32_t col = n0 + in_group * 2;
+                const uint64_t pa = ((uint64_t)head_a * batch + q_idx_a) * NSPLIT + k_split;
+                const uint64_t pb = ((uint64_t)head_b * batch + q_idx_b) * NSPLIT + k_split;
+                if (head_a_active && q_idx_a < batch) {
+                    partials[pa * HEAD_DIM + col + 0] = 0.0f;
+                    partials[pa * HEAD_DIM + col + 1] = 0.0f;
+                }
+                if (head_b_active && q_idx_b < batch) {
+                    partials[pb * HEAD_DIM + col + 0] = 0.0f;
+                    partials[pb * HEAD_DIM + col + 1] = 0.0f;
+                }
+            }
+            return;
+        }
+    }
+
+    // Shmem.
+    extern __shared__ char smem_raw[];
+    char *p = smem_raw;
+    __half *s_K     = reinterpret_cast<__half *>(p); p += BC * HEAD_STRIDE * sizeof(__half);
+    __half *s_V_buf = reinterpret_cast<__half *>(p); p += BC * HEAD_STRIDE * sizeof(__half);
+    float  *s_S     = reinterpret_cast<float  *>(p); p += M_TOTAL * S_STRIDE * sizeof(float);
+    __half *s_P     = reinterpret_cast<__half *>(p); p += M_TOTAL * P_STRIDE * sizeof(__half);
+    float  *s_m     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    float  *s_l     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    float  *s_alpha = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    (void)s_alpha;
+
+    // ---- Q registers (one m-tile per warp pair, replicated across the pair).
+    // Layout per thread: Q_reg[QK_KSTEPS][4]; the 4 slots are
+    // (a0_lo, b0_lo, a0_hi, b0_hi) packed-half pairs that match the
+    // ldmatrix.x4 a-fragment layout used in mma_m16n8k16_f16f16f32.
+    unsigned Q_reg[QK_KSTEPS][4];
+    {
+        const uint32_t q_idx_a = block_q * BR + r_a;
+        const uint32_t q_idx_b = block_q * BR + r_b;
+        const bool a_active = head_a_active && (q_idx_a < batch);
+        const bool b_active = head_b_active && (q_idx_b < batch);
+        const float *qa = a_active
+            ? (q + (uint64_t)q_idx_a * q_batch_stride + head_a * q_stride) : nullptr;
+        const float *qb = b_active
+            ? (q + (uint64_t)q_idx_b * q_batch_stride + head_b * q_stride) : nullptr;
+        #pragma unroll
+        for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+            const uint32_t k0 = ks * MMA_K;
+            const uint32_t col0 = k0 + in_group * 2;
+            const __half qa0 = qa ? __float2half(qa[col0 + 0]) : (__half)0;
+            const __half qa1 = qa ? __float2half(qa[col0 + 1]) : (__half)0;
+            const __half qb0 = qb ? __float2half(qb[col0 + 0]) : (__half)0;
+            const __half qb1 = qb ? __float2half(qb[col0 + 1]) : (__half)0;
+            const __half qa8 = qa ? __float2half(qa[col0 + 8]) : (__half)0;
+            const __half qa9 = qa ? __float2half(qa[col0 + 9]) : (__half)0;
+            const __half qb8 = qb ? __float2half(qb[col0 + 8]) : (__half)0;
+            const __half qb9 = qb ? __float2half(qb[col0 + 9]) : (__half)0;
+            Q_reg[ks][0] = mma_detail::pack2h(qa0, qa1);
+            Q_reg[ks][1] = mma_detail::pack2h(qb0, qb1);
+            Q_reg[ks][2] = mma_detail::pack2h(qa8, qa9);
+            Q_reg[ks][3] = mma_detail::pack2h(qb8, qb9);
+        }
+    }
+
+    if (tid < M_TOTAL) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+
+    using o_acc_t = typename std::conditional<USE_FP16_O, __half, float>::type;
+    o_acc_t O_acc[PV_N_TILES][4];
+    #pragma unroll
+    for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) O_acc[n][i] = (o_acc_t)0;
+    }
+    __syncthreads();
+
+    auto issue_K = [&](uint32_t t0_target) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = (NWARPS * WARP_SIZE) / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0_target + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            __half *dst = &s_K[shm_t * HEAD_STRIDE + base_d];
+            const bool in_range = (t < block_max_kv);
+            if (USE_CP_ASYNC_K) {
+                if (in_range) {
+                    const __half *k_src = k_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    mma_detail::cp_async_cg_16(dst, k_src);
+                } else {
+                    mma_detail::cp_async_zero_16(dst);
+                }
+            } else {
+                int4 *dst4 = reinterpret_cast<int4 *>(dst);
+                if (in_range) {
+                    const __half *k_src = k_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *dst4 = *reinterpret_cast<const int4 *>(k_src);
+                } else {
+                    int4 z; z.x = z.y = z.z = z.w = 0;
+                    *dst4 = z;
+                }
+            }
+        }
+    };
+
+    auto issue_V = [&](uint32_t t0_target) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = (NWARPS * WARP_SIZE) / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0_target + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            const bool in_range = (t < block_max_kv);
+            __half *dst = &s_V_buf[shm_t * HEAD_STRIDE + base_d];
+            if (USE_CP_ASYNC_V) {
+                if (in_range) {
+                    const __half *v_src = v_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    mma_detail::cp_async_cg_16(dst, v_src);
+                } else {
+                    mma_detail::cp_async_zero_16(dst);
+                }
+            } else {
+                __half v8[HALVES_PER_LD];
+                if (in_range) {
+                    const __half *v_src = v_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *reinterpret_cast<int4 *>(v8) = *reinterpret_cast<const int4 *>(v_src);
+                } else {
+                    *reinterpret_cast<int4 *>(v8) = make_int4(0,0,0,0);
+                }
+                int4 *dst4 = reinterpret_cast<int4 *>(dst);
+                *dst4 = *reinterpret_cast<int4 *>(v8);
+            }
+        }
+    };
+
+    // Prime: K[kv_lo].
+    if (USE_CP_ASYNC_K) { issue_K(kv_lo); mma_detail::cp_async_commit(); }
+    if (USE_CP_ASYNC_V) { issue_V(kv_lo); mma_detail::cp_async_commit(); }
+
+    // Skip-out for entirely zero-padded m-tile (heads 6,7). With M_TILES=4
+    // and active heads 0..5, mt=3's warp pair handles head_a=6 (active=false)
+    // and head_b=7 (active=false). They still cooperate on K/V loads (all
+    // warps must issue), but they skip the QK / softmax / PV work and write
+    // zeros at writeback time. We collapse this by simply NOT executing
+    // the QK accumulator update when both heads inactive — c_h stays zero,
+    // and -INFINITY masking in score-write keeps softmax produce 0 P-values.
+    // O_acc stays zero throughout.
+
+    for (uint32_t t0 = kv_lo; t0 < kv_hi; t0 += BC) {
+        if (USE_CP_ASYNC_K && USE_CP_ASYNC_V) {
+            mma_detail::cp_async_wait_group<1>();
+        } else if (USE_CP_ASYNC_K) {
+            mma_detail::cp_async_wait_group<0>();
+        }
+        if (!USE_CP_ASYNC_K) issue_K(t0);
+        if (!USE_CP_ASYNC_V) issue_V(t0);
+        __syncthreads();
+
+        // ---- QK^T phase. This warp does its m-tile × its BC half (2 nq tiles).
+        float c_h[QK_N_TILES_PER_WARP][4];
+        #pragma unroll
+        for (uint32_t nq = 0; nq < QK_N_TILES_PER_WARP; ++nq) {
+            c_h[nq][0]=0.f; c_h[nq][1]=0.f; c_h[nq][2]=0.f; c_h[nq][3]=0.f;
+        }
+        #pragma unroll
+        for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+            const uint32_t k0 = ks * MMA_K;
+            #pragma unroll
+            for (uint32_t nq = 0; nq < QK_N_TILES_PER_WARP; ++nq) {
+                const uint32_t kv_col = my_bc_lo + nq * MMA_N + group_id;
+                const __half *krow0 = &s_K[kv_col * HEAD_STRIDE + k0 + in_group * 2];
+                const unsigned b0 = mma_detail::pack2h(krow0);
+                const unsigned b1 = mma_detail::pack2h(krow0 + 8);
+                mma_detail::mma_m16n8k16_f16f16f32(
+                    c_h[nq][0], c_h[nq][1], c_h[nq][2], c_h[nq][3],
+                    Q_reg[ks][0], Q_reg[ks][1], Q_reg[ks][2], Q_reg[ks][3],
+                    b0, b1);
+            }
+        }
+
+        if (USE_CP_ASYNC_K) {
+            const uint32_t t0_next = t0 + BC;
+            if (t0_next < kv_hi) { issue_K(t0_next); mma_detail::cp_async_commit(); }
+        }
+
+        // ---- Write S to shmem with causal mask + head-padding mask.
+        {
+            const uint32_t q_idx_a = block_q * BR + r_a;
+            const uint32_t q_idx_b = block_q * BR + r_b;
+            const bool a_active = head_a_active && (q_idx_a < batch);
+            const bool b_active = head_b_active && (q_idx_b < batch);
+            const uint32_t my_max_kv_a = base_seq_len + q_idx_a + 1;
+            const uint32_t my_max_kv_b = base_seq_len + q_idx_b + 1;
+            const uint32_t m_a = mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a;
+            const uint32_t m_b = mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b;
+            #pragma unroll
+            for (uint32_t nq = 0; nq < QK_N_TILES_PER_WARP; ++nq) {
+                const uint32_t base_col = my_bc_lo + nq * MMA_N + in_group * 2;
+                const uint32_t t_a0 = t0 + base_col;
+                const uint32_t t_a1 = t0 + base_col + 1;
+                float v00 = (a_active && t_a0 < my_max_kv_a) ? c_h[nq][0] * scale : -INFINITY;
+                float v01 = (a_active && t_a1 < my_max_kv_a) ? c_h[nq][1] * scale : -INFINITY;
+                float v02 = (b_active && t_a0 < my_max_kv_b) ? c_h[nq][2] * scale : -INFINITY;
+                float v03 = (b_active && t_a1 < my_max_kv_b) ? c_h[nq][3] * scale : -INFINITY;
+                s_S[m_a * S_STRIDE + base_col + 0] = v00;
+                s_S[m_a * S_STRIDE + base_col + 1] = v01;
+                s_S[m_b * S_STRIDE + base_col + 0] = v02;
+                s_S[m_b * S_STRIDE + base_col + 1] = v03;
+            }
+        }
+        __syncthreads();
+
+        // ---- Online softmax over M_TOTAL=64 rows × BC=32 cols.
+        // 8 warps × ROWS_PER_WARP=8 rows each. Each lane covers
+        // BC/WARP_SIZE = 1 col.
+        constexpr uint32_t ROWS_PER_WARP = M_TOTAL / NWARPS;       // 8
+        constexpr uint32_t COLS_PER_LANE = BC / WARP_SIZE;         // 1
+        #pragma unroll
+        for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+            const uint32_t m_row = warp * ROWS_PER_WARP + r;
+            float local_max = -INFINITY;
+            float s_vals[COLS_PER_LANE];
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                s_vals[cc] = s_S[m_row * S_STRIDE + lane * COLS_PER_LANE + cc];
+                if (s_vals[cc] > local_max) local_max = s_vals[cc];
+            }
+            const float row_max = cuda_helpers::warp_reduce_max<32>(local_max);
+            const float prev_m = s_m[m_row];
+            const float new_m  = fmaxf(prev_m, row_max);
+            float local_sum = 0.0f;
+            __half pvals[COLS_PER_LANE];
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                const float p_val = (s_vals[cc] == -INFINITY) ? 0.0f
+                                                              : __expf(s_vals[cc] - new_m);
+                local_sum += p_val;
+                pvals[cc] = __float2half(p_val);
+            }
+            const float row_sum = cuda_helpers::warp_reduce_sum<32>(local_sum);
+            const float prev_l  = s_l[m_row];
+            const float alpha   = (prev_m == -INFINITY) ? 0.0f : __expf(prev_m - new_m);
+            const float new_l   = prev_l * alpha + row_sum;
+            if (lane == 0) {
+                s_m[m_row]     = new_m;
+                s_l[m_row]     = new_l;
+                s_alpha[m_row] = alpha;
+            }
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                s_P[m_row * P_STRIDE + lane * COLS_PER_LANE + cc] = pvals[cc];
+            }
+        }
+
+        if (USE_CP_ASYNC_V) {
+            const bool k_next_pending = USE_CP_ASYNC_K && (t0 + BC < kv_hi);
+            if (k_next_pending) mma_detail::cp_async_wait_group<1>();
+            else                mma_detail::cp_async_wait_group<0>();
+        }
+        __syncthreads();
+
+        // ---- Rescale O_acc by per-row alpha (this warp's m-tile only).
+        const float alpha_a = s_alpha[mt * MMA_M + C_A * Q_ROWS_PER_TILE + group_id];
+        const float alpha_b = s_alpha[mt * MMA_M + C_B * Q_ROWS_PER_TILE + group_id];
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const float r0 = static_cast<float>(O_acc[n][0]) * alpha_a;
+            const float r1 = static_cast<float>(O_acc[n][1]) * alpha_a;
+            const float r2 = static_cast<float>(O_acc[n][2]) * alpha_b;
+            const float r3 = static_cast<float>(O_acc[n][3]) * alpha_b;
+            O_acc[n][0] = static_cast<o_acc_t>(r0);
+            O_acc[n][1] = static_cast<o_acc_t>(r1);
+            O_acc[n][2] = static_cast<o_acc_t>(r2);
+            O_acc[n][3] = static_cast<o_acc_t>(r3);
+        }
+
+        // ---- PV phase. Each warp does ITS m-tile × ITS HD half.
+        // P A-frag from s_P[mt*MMA_M..(mt+1)*MMA_M, k0..k0+16].
+        // V B-frag from s_V_buf row-major; ldmatrix.x2.trans handles the n-axis.
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0 = warp_in_pair * HD_PER_WARP_IN_PAIR + n * MMA_N;
+            #pragma unroll
+            for (uint32_t ks = 0; ks < PV_KSTEPS; ++ks) {
+                const uint32_t k0 = ks * MMA_K;
+                unsigned b0, b1;
+                if (USE_CP_ASYNC_V) {
+                    const __half *vbase = &s_V_buf[k0 * HEAD_STRIDE + n0];
+                    mma_detail::ldmatrix_x2_b_trans(b0, b1, vbase, HEAD_STRIDE);
+                } else {
+                    // Sync V load fallback (uses transposed layout).
+                    const uint32_t out_col = n0 + group_id;
+                    const __half *vrow0 = &s_V_buf[out_col * BC + k0 + in_group * 2];
+                    b0 = mma_detail::pack2h(vrow0);
+                    b1 = mma_detail::pack2h(vrow0 + 8);
+                }
+                unsigned a0, a1, a2, a3;
+                mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                          &s_P[mt * MMA_M * P_STRIDE + k0], P_STRIDE);
+                if constexpr (USE_FP16_O) {
+                    float d0 = static_cast<float>(O_acc[n][0]);
+                    float d1 = static_cast<float>(O_acc[n][1]);
+                    float d2 = static_cast<float>(O_acc[n][2]);
+                    float d3 = static_cast<float>(O_acc[n][3]);
+                    mma_detail::mma_m16n8k16_f16f16f32(
+                        d0, d1, d2, d3,
+                        a0, a1, a2, a3, b0, b1);
+                    O_acc[n][0] = static_cast<o_acc_t>(d0);
+                    O_acc[n][1] = static_cast<o_acc_t>(d1);
+                    O_acc[n][2] = static_cast<o_acc_t>(d2);
+                    O_acc[n][3] = static_cast<o_acc_t>(d3);
+                } else {
+                    float &o0 = reinterpret_cast<float &>(O_acc[n][0]);
+                    float &o1 = reinterpret_cast<float &>(O_acc[n][1]);
+                    float &o2 = reinterpret_cast<float &>(O_acc[n][2]);
+                    float &o3 = reinterpret_cast<float &>(O_acc[n][3]);
+                    mma_detail::mma_m16n8k16_f16f16f32(
+                        o0, o1, o2, o3,
+                        a0, a1, a2, a3, b0, b1);
+                }
+            }
+        }
+
+        if (USE_CP_ASYNC_V) {
+            const uint32_t t0_next = t0 + BC;
+            if (t0_next < kv_hi) { issue_V(t0_next); mma_detail::cp_async_commit(); }
+        }
+    }
+
+    // ---- Writeback / partial dump.
+    const uint32_t q_idx_a = block_q * BR + r_a;
+    const uint32_t q_idx_b = block_q * BR + r_b;
+    const bool a_active = head_a_active && (q_idx_a < batch);
+    const bool b_active = head_b_active && (q_idx_b < batch);
+    const float l_a = s_l[mt * MMA_M + C_A * Q_ROWS_PER_TILE + group_id];
+    const float l_b = s_l[mt * MMA_M + C_B * Q_ROWS_PER_TILE + group_id];
+    const float m_a_val = s_m[mt * MMA_M + C_A * Q_ROWS_PER_TILE + group_id];
+    const float m_b_val = s_m[mt * MMA_M + C_B * Q_ROWS_PER_TILE + group_id];
+
+    if (NSPLIT == 1) {
+        const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
+        const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
+        float * const out_a = a_active
+            ? (out + (uint64_t)q_idx_a * out_batch_stride + head_a * HEAD_DIM) : nullptr;
+        float * const out_b = b_active
+            ? (out + (uint64_t)q_idx_b * out_batch_stride + head_b * HEAD_DIM) : nullptr;
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0 = warp_in_pair * HD_PER_WARP_IN_PAIR + n * MMA_N;
+            const uint32_t col = n0 + in_group * 2;
+            if (out_a) {
+                out_a[col + 0] = static_cast<float>(O_acc[n][0]) * inv_la;
+                out_a[col + 1] = static_cast<float>(O_acc[n][1]) * inv_la;
+            }
+            if (out_b) {
+                out_b[col + 0] = static_cast<float>(O_acc[n][2]) * inv_lb;
+                out_b[col + 1] = static_cast<float>(O_acc[n][3]) * inv_lb;
+            }
+        }
+    } else {
+        // NSPLIT > 1: write un-normalized partials + (m, l) per (head, q_idx, k_split).
+        const uint64_t pa_base = ((uint64_t)head_a * batch + q_idx_a) * NSPLIT + k_split;
+        const uint64_t pb_base = ((uint64_t)head_b * batch + q_idx_b) * NSPLIT + k_split;
+        if (warp_in_pair == 0 && in_group == 0) {
+            if (a_active) {
+                ms[pa_base * 2 + 0] = m_a_val;
+                ms[pa_base * 2 + 1] = l_a;
+            }
+            if (b_active) {
+                ms[pb_base * 2 + 0] = m_b_val;
+                ms[pb_base * 2 + 1] = l_b;
+            }
+        }
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0 = warp_in_pair * HD_PER_WARP_IN_PAIR + n * MMA_N;
+            const uint32_t col = n0 + in_group * 2;
+            if (a_active) {
+                partials[pa_base * HEAD_DIM + col + 0] = static_cast<float>(O_acc[n][0]);
+                partials[pa_base * HEAD_DIM + col + 1] = static_cast<float>(O_acc[n][1]);
+            }
+            if (b_active) {
+                partials[pb_base * HEAD_DIM + col + 0] = static_cast<float>(O_acc[n][2]);
+                partials[pb_base * HEAD_DIM + col + 1] = static_cast<float>(O_acc[n][3]);
+            }
+        }
+    }
+}
+
+static size_t fattn_mma_gqa_v4_smem_bytes(uint32_t head_dim) {
+    constexpr uint32_t BR       = 8;
+    constexpr uint32_t BC       = 32;
+    constexpr uint32_t M_TOTAL  = 64;
+    constexpr uint32_t KV_PAD   = 8;
+    constexpr uint32_t S_PAD    = 4;
+    const uint32_t hd_stride = head_dim + KV_PAD;
+    const uint32_t s_stride  = BC + S_PAD;
+    const uint32_t p_stride  = BC + S_PAD * 2;
+    (void)BR;
+    size_t s = 0;
+    s += BC      * hd_stride * sizeof(__half);     // K
+    s += BC      * hd_stride * sizeof(__half);     // V
+    s += M_TOTAL * s_stride  * sizeof(float);      // S
+    s += M_TOTAL * p_stride  * sizeof(__half);     // P
+    s += M_TOTAL             * sizeof(float) * 3;  // m, l, alpha
+    return s;
+}
+
+
 // Combine kernel: merges NSPLIT partial (m, l, O_un_normalized) tuples per
 // (head, q_token) via online softmax, divides by the merged denominator, and
 // writes the final output.
@@ -4161,6 +4768,139 @@ bool launch_fattn_prefill_mma_gqa_v3_f16(
     };
     if (head_dim == 256) launch_with_br(std::integral_constant<uint32_t, 256>{});
     else                 launch_with_br(std::integral_constant<uint32_t, 128>{});
+    return true;
+}
+
+// =====================================================================
+// v4 launcher: NWARPS=8 + warp-pair-owns-mtile, M_TOTAL=64.
+// =====================================================================
+// Currently gated to Qwen 3.6 27B's q_per_kv=6 (kernel hard-codes Q_PER_KV=6
+// with q-head zero-pad to 8).
+size_t fattn_prefill_mma_gqa_v4_scratch_bytes(uint32_t batch, uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim) {
+    if (n_kv_heads == 0 || n_heads % n_kv_heads != 0) return 0;
+    const uint32_t q_per_kv = n_heads / n_kv_heads;
+    if (q_per_kv != 6) return 0;
+    if (!(head_dim == 128 || head_dim == 256)) return 0;
+    // v4 reuses the same NSPLIT scratch shape as v2: per (head, q_tok, split)
+    // we stash HD floats of un-normalized O plus 2 floats of (m, l).
+    constexpr uint32_t MAX_NSPLIT = 2;
+    return (size_t)n_heads * batch * MAX_NSPLIT * head_dim * sizeof(float)
+         + (size_t)n_heads * batch * MAX_NSPLIT * 2        * sizeof(float);
+}
+
+bool launch_fattn_prefill_mma_gqa_v4_f16(
+        float *       out,
+        void  *       scratch,
+        size_t        scratch_bytes,
+        const float * q,
+        uint32_t      q_stride,
+        const void  * k_cache,
+        const void  * v_cache,
+        uint32_t      n_heads,
+        uint32_t      n_kv_heads,
+        uint32_t      head_dim,
+        uint32_t      batch,
+        uint32_t      base_seq_len,
+        uint32_t      q_batch_stride,
+        uint32_t      out_batch_stride,
+        float         scale,
+        cudaStream_t  stream) {
+    if (!(head_dim == 128 || head_dim == 256)) return false;
+    if (batch == 0) return true;
+    if (n_kv_heads == 0 || n_heads % n_kv_heads != 0) return false;
+    const uint32_t q_per_kv = n_heads / n_kv_heads;
+    if (q_per_kv != 6) return false;
+
+    constexpr uint32_t BR = 8;
+
+    static const bool use_cp_async_k = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_KCPASYNC");
+        if (!e) return true;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
+    static const bool use_cp_async_v = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_VCPASYNC");
+        if (!e) return true;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
+    static const bool use_fp16_o = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_FP16_O");
+        if (!e) return false;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
+
+    const uint32_t n_blocks_q = (batch + BR - 1) / BR;
+    // NSPLIT heuristic: same shape as v2's. Kept conservative for first
+    // landing — default NSPLIT=1 since the v4 grid is already smaller
+    // (n_kv_heads × n_blocks_q vs v2's n_kv_heads*3 × n_blocks_q*2).
+    static const uint32_t v4_nsplit_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_NSPLIT");
+        if (!e) return 1;
+        if (std::strcmp(e, "1") == 0) return 1;
+        if (std::strcmp(e, "2") == 0) return 2;
+        return 1;
+    }();
+    const uint32_t nsplit = v4_nsplit_choice;
+    float *partials = nullptr, *ms_buf = nullptr;
+    if (nsplit > 1) {
+        const size_t need = (size_t)n_heads * batch * nsplit * head_dim * sizeof(float)
+                          + (size_t)n_heads * batch * nsplit * 2        * sizeof(float);
+        if (!scratch || scratch_bytes < need) return false;
+        partials = static_cast<float *>(scratch);
+        ms_buf   = partials + (size_t)n_heads * batch * nsplit * head_dim;
+    }
+    const dim3 grid(n_kv_heads, n_blocks_q, nsplit);
+    const dim3 block(256);
+    const size_t smem = fattn_mma_gqa_v4_smem_bytes(head_dim);
+
+    auto launch = [&](auto HD_v, auto NS_v) {
+        constexpr uint32_t HD = decltype(HD_v)::value;
+        constexpr uint32_t NS = decltype(NS_v)::value;
+        auto dispatch = [&](auto K_v, auto V_v, auto FP16O_v) {
+            constexpr bool K = decltype(K_v)::value;
+            constexpr bool V = decltype(V_v)::value;
+            constexpr bool FP16O = decltype(FP16O_v)::value;
+            cudaFuncSetAttribute(
+                fattn_prefill_mma_gqa_kernel_v4_t<HD, K, V, NS, FP16O>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            fattn_prefill_mma_gqa_kernel_v4_t<HD, K, V, NS, FP16O>
+                <<<grid, block, smem, stream>>>(
+                    out, partials, ms_buf, q, q_stride,
+                    static_cast<const __half *>(k_cache),
+                    static_cast<const __half *>(v_cache),
+                    n_heads, n_kv_heads, base_seq_len, batch,
+                    q_batch_stride, out_batch_stride, scale);
+        };
+        auto dispatch_fp16o = [&](auto K_v, auto V_v) {
+            if (use_fp16_o) dispatch(K_v, V_v, std::true_type{});
+            else            dispatch(K_v, V_v, std::false_type{});
+        };
+        if (use_cp_async_k && use_cp_async_v) {
+            dispatch_fp16o(std::true_type{},  std::true_type{});
+        } else if (use_cp_async_k) {
+            dispatch_fp16o(std::true_type{},  std::false_type{});
+        } else if (use_cp_async_v) {
+            dispatch_fp16o(std::false_type{}, std::true_type{});
+        } else {
+            dispatch_fp16o(std::false_type{}, std::false_type{});
+        }
+        if (NS > 1) {
+            const dim3 cgrid(n_heads, batch, 1);
+            const dim3 cblock(HD);
+            fattn_prefill_mma_gqa_combine_kernel<HD, NS>
+                <<<cgrid, cblock, 0, stream>>>(
+                    out, partials, ms_buf, batch, out_batch_stride);
+        }
+    };
+
+    auto launch_with_ns = [&](auto HD_v) {
+        if (nsplit == 2) launch(HD_v, std::integral_constant<uint32_t, 2>{});
+        else             launch(HD_v, std::integral_constant<uint32_t, 1>{});
+    };
+    if (head_dim == 256) launch_with_ns(std::integral_constant<uint32_t, 256>{});
+    else                 launch_with_ns(std::integral_constant<uint32_t, 128>{});
     return true;
 }
 

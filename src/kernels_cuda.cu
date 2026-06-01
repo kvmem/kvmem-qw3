@@ -175,6 +175,22 @@ bool launch_fattn_prefill_mma_gqa_v3_f16(
         uint32_t batch, uint32_t base_seq_len,
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream);
+// v4 GQA-fused kernel: NWARPS=8 + warp-pair-owns-mtile, M_TOTAL=64.
+// 4 warp pairs, each owns one m-tile (8 q-tokens × 2 q-heads). Per-thread
+// Q_reg covers only its own m-tile, sidestepping v3's 256-fp32 spill.
+// Gated to q_per_kv=6 (Qwen 3.6 27B). NSPLIT=1 default; opt-in NS=2 via env.
+bool launch_fattn_prefill_mma_gqa_v4_f16(
+        float *out,
+        void *scratch, size_t scratch_bytes,
+        const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+size_t fattn_prefill_mma_gqa_v4_scratch_bytes(uint32_t batch, uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim);
 }
 
 namespace {
@@ -238,7 +254,7 @@ AttentionKernel attention_kernel_choice() {
 //                              (also used for decode). At prefill seq_len is
 //                              passed as 1, so pick_nsplit→1 and it runs
 //                              one block per (head, query).
-enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma, MmaPipe, MmaGqa, MmaGqaV2, MmaGqaV3 };
+enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma, MmaPipe, MmaGqa, MmaGqaV2, MmaGqaV3, MmaGqaV4 };
 PrefillAttnKernel prefill_attn_kernel_choice() {
     static const PrefillAttnKernel choice = []() {
         const char *env = std::getenv("QW3_PREFILL_ATTN");
@@ -250,6 +266,7 @@ PrefillAttnKernel prefill_attn_kernel_choice() {
         if (env && std::strcmp(env, "mma-gqa") == 0) return PrefillAttnKernel::MmaGqa;
         if (env && std::strcmp(env, "mma-gqa-v2") == 0) return PrefillAttnKernel::MmaGqaV2;
         if (env && std::strcmp(env, "mma-gqa-v3") == 0) return PrefillAttnKernel::MmaGqaV3;
+        if (env && std::strcmp(env, "mma-gqa-v4") == 0) return PrefillAttnKernel::MmaGqaV4;
         // Default: GQA-fused MMA v2 with BR=8 + ncols2=2 q-head pack into the
         // MMA m-axis + Q-in-registers. Mirrors llama.cpp's
         // flash_attn_ext_f16<256,256,8,8> structure but with ncols2=2 (vs 8) to
@@ -3541,6 +3558,48 @@ public:
                     batch, base_seq_len,
                     q_batch_stride, out_batch_stride, scale, exec_stream_)) {
                 return launch_status("cuda attention_decode_batch mma-pipe f16");
+            }
+        }
+
+        // GQA-fused tensor-core MMA prefill v4 (NWARPS=8 + warp-pair-owns-mtile,
+        // M_TOTAL=64). Opt-in via QW3_PREFILL_ATTN=mma-gqa-v4. Long-T attack #2:
+        // 4 warp pairs each own one m-tile (8 q-tokens × 2 q-heads), so per-
+        // thread Q_reg only covers its own m-tile (sidesteps v3's 256-fp32
+        // spill). Falls through to v2 when q_per_kv != 6.
+        if (kv_fp16 &&
+            prefill_attn_kernel_choice() == PrefillAttnKernel::MmaGqaV4 &&
+            batch >= prefill_attn_min_batch() &&
+            (head_dim == 128 || head_dim == 256)) {
+            const size_t v4_need = ported::fattn_prefill_mma_gqa_v4_scratch_bytes(
+                    batch, n_heads, n_kv_heads, head_dim);
+            if (v4_need > 0) {
+                if (auto st = ensure_prefill_gqa_scratch(v4_need); !st.ok) {
+                    return st;
+                }
+            }
+            if (ported::launch_fattn_prefill_mma_gqa_v4_f16(
+                    o.ptr, prefill_gqa_scratch_, prefill_gqa_scratch_capacity_,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch mma-gqa-v4 f16");
+            }
+            // Fallback: q_per_kv != 6 — use v2.
+            const size_t v2_need = ported::fattn_prefill_mma_gqa_v2_scratch_bytes(
+                    batch, n_heads, n_kv_heads, head_dim);
+            if (v2_need > 0) {
+                if (auto st = ensure_prefill_gqa_scratch(v2_need); !st.ok) {
+                    return st;
+                }
+            }
+            if (ported::launch_fattn_prefill_mma_gqa_v2_f16(
+                    o.ptr, prefill_gqa_scratch_, prefill_gqa_scratch_capacity_,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch mma-gqa-v4 fallback mma-gqa-v2 f16");
             }
         }
 
