@@ -14,11 +14,11 @@
 //     for cross-warp softmax.
 //
 // What we stripped (qw3 doesn't need any of it for Qwen 3.6 27B decode):
-//   - Quantized K / V caches (we use F32; ggml's mmq variants gone).
+//   - Quantized K / V caches (qw3 stores K/V as FP16 by default, FP32 opt-in via QW3_KV_DTYPE=fp32).
 //   - Multi-column / batched-Q (decode is always 1 token here).
 //   - ALiBi slopes, logit-softcap, attention sinks.
 //   - Mask tensor (causal is implicit: t < seq_len).
-//   - F16/BF16 dispatch hairball — pure F32 K/V.
+//   - F16/BF16 dispatch hairball — KVT templated on float|__half only, both supported at runtime.
 //   - The launch_fattn helper and dst_meta machinery. Output is written
 //     directly to dst with shape [n_heads, head_dim].
 //
@@ -2425,7 +2425,7 @@ static size_t fattn_mma_gqa_smem_bytes(uint32_t head_dim, uint32_t q_per_kv) {
 template <uint32_t HEAD_DIM, uint32_t Q_PER_KV, uint32_t BR, uint32_t BC,
           uint32_t NCOLS2, uint32_t KV_PAD,
           bool USE_CP_ASYNC_K, bool USE_CP_ASYNC_V, uint32_t NSPLIT,
-          bool USE_FP16_O = false>
+          bool USE_FP16_O = false, uint32_t S_PAD = 0>
 __global__ void
 __launch_bounds__(128, 1)
 fattn_prefill_mma_gqa_kernel_v2_t(
@@ -2453,12 +2453,22 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     static_assert(BC == 32 || BC == 64,    "v2 supports BC ∈ {32, 64}");
     static_assert(NCOLS2 == 2,             "v2 supports NCOLS2=2");
     static_assert(KV_PAD == 0 || KV_PAD == 8, "v2 supports KV_PAD ∈ {0, 8}");
+    static_assert(S_PAD == 0 || S_PAD == 4, "v2 supports S_PAD ∈ {0, 4} fp32 elems");
     static_assert(BR % 8 == 0,             "BR must be multiple of 8");
     static_assert(Q_PER_KV % NCOLS2 == 0,  "Q_PER_KV must divide by NCOLS2");
     static_assert(HEAD_DIM == 128 || HEAD_DIM == 256, "v2 supports HD 128/256");
     static_assert(HEAD_DIM % MMA_K == 0,   "HEAD_DIM multiple of MMA_K");
     static_assert(BC % MMA_N == 0,         "BC multiple of MMA_N");
     static_assert(BC % NWARPS == 0,        "BC divisible by NWARPS");
+
+    // s_S/s_P row-stride padding (in elements of their respective types).
+    // S_PAD=4 fp32 elems = 16 B = 4 banks shifts each adjacent s_S row off
+    // its predecessor's bank anchor, mapping the 8 group_id lanes onto
+    // distinct bank quartets (was 8-way conflict on softmax-write,
+    // 4-way on s_P ldmatrix.x4 in PV). +0.5 KB shmem at BR=16 BC=32;
+    // still 2 blocks/SM. Same insight as KV_PAD=8 but on the score tile.
+    constexpr uint32_t S_STRIDE = BC + S_PAD;          // fp32 elements
+    constexpr uint32_t P_STRIDE = BC + S_PAD * 2;      // half elements (same bytes as S_PAD fp32)
 
     constexpr uint32_t QK_KSTEPS  = HEAD_DIM / MMA_K;          // 16
     constexpr uint32_t QK_N_TILES = (BC / NWARPS) / MMA_N;     // 2
@@ -2573,8 +2583,8 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     char *p = smem_raw;
     __half *s_K     = reinterpret_cast<__half *>(p); p += BC * HEAD_STRIDE * sizeof(__half);
     __half *s_V_buf = reinterpret_cast<__half *>(p); p += BC * HEAD_STRIDE * sizeof(__half);
-    float  *s_S     = reinterpret_cast<float  *>(p); p += M_TOTAL * BC     * sizeof(float);
-    __half *s_P     = reinterpret_cast<__half *>(p); p += M_TOTAL * BC     * sizeof(__half);
+    float  *s_S     = reinterpret_cast<float  *>(p); p += M_TOTAL * S_STRIDE * sizeof(float);
+    __half *s_P     = reinterpret_cast<__half *>(p); p += M_TOTAL * P_STRIDE * sizeof(__half);
     float  *s_m     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
     float  *s_l     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
     float  *s_alpha = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
@@ -2795,10 +2805,10 @@ fattn_prefill_mma_gqa_kernel_v2_t(
                     float v01 = (a_active && t_a1 < my_max_kv_a) ? c_h[mt][nq][1] * scale : -INFINITY;
                     float v02 = (b_active && t_a0 < my_max_kv_b) ? c_h[mt][nq][2] * scale : -INFINITY;
                     float v03 = (b_active && t_a1 < my_max_kv_b) ? c_h[mt][nq][3] * scale : -INFINITY;
-                    s_S[m_a * BC + base_col + 0] = v00;
-                    s_S[m_a * BC + base_col + 1] = v01;
-                    s_S[m_b * BC + base_col + 0] = v02;
-                    s_S[m_b * BC + base_col + 1] = v03;
+                    s_S[m_a * S_STRIDE + base_col + 0] = v00;
+                    s_S[m_a * S_STRIDE + base_col + 1] = v01;
+                    s_S[m_b * S_STRIDE + base_col + 0] = v02;
+                    s_S[m_b * S_STRIDE + base_col + 1] = v03;
                 }
             }
         }
@@ -2816,7 +2826,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
             float s_vals[COLS_PER_LANE];
             #pragma unroll
             for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
-                s_vals[cc] = s_S[m_row * BC + lane * COLS_PER_LANE + cc];
+                s_vals[cc] = s_S[m_row * S_STRIDE + lane * COLS_PER_LANE + cc];
                 if (s_vals[cc] > local_max) local_max = s_vals[cc];
             }
             const float row_max = cuda_helpers::warp_reduce_max<32>(local_max);
@@ -2842,7 +2852,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
             }
             #pragma unroll
             for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
-                s_P[m_row * BC + lane * COLS_PER_LANE + cc] = pvals[cc];
+                s_P[m_row * P_STRIDE + lane * COLS_PER_LANE + cc] = pvals[cc];
             }
         }
 
@@ -2878,7 +2888,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
 
         // Phase B: PV. Each (n, ks) loads one V B-frag and runs M_TILES MMAs
         // reusing it (the q-rows-per-CTA lever). P A-frag reloaded per m-tile
-        // from s_P[mt*MMA_M*BC..].
+        // from s_P[mt*MMA_M*P_STRIDE..].
         #pragma unroll
         for (uint32_t n = 0; n < PV_N_TILES; ++n) {
             const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
@@ -2899,7 +2909,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
                 for (uint32_t mt = 0; mt < M_TILES; ++mt) {
                     unsigned a0, a1, a2, a3;
                     mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
-                                              &s_P[mt * MMA_M * BC + k0], BC);
+                                              &s_P[mt * MMA_M * P_STRIDE + k0], P_STRIDE);
                     if constexpr (USE_FP16_O) {
                         float d0 = static_cast<float>(O_acc[mt][n][0]);
                         float d1 = static_cast<float>(O_acc[mt][n][1]);
@@ -3009,15 +3019,17 @@ fattn_prefill_mma_gqa_kernel_v2_t(
 }
 
 static size_t fattn_mma_gqa_v2_smem_bytes(uint32_t head_dim, uint32_t bc, uint32_t br,
-                                          uint32_t kv_pad) {
+                                          uint32_t kv_pad, uint32_t s_pad) {
     constexpr uint32_t NCOLS2 = 2;
     const uint32_t M_TOTAL    = br * NCOLS2;            // 16@BR=8, 32@BR=16
     const uint32_t hd_stride  = head_dim + kv_pad;
+    const uint32_t s_stride   = bc + s_pad;             // fp32 elems
+    const uint32_t p_stride   = bc + s_pad * 2;         // half elems (= same bytes)
     size_t s = 0;
     s += bc       * hd_stride * sizeof(__half);   // K
     s += bc       * hd_stride * sizeof(__half);   // V
-    s += M_TOTAL  * bc        * sizeof(float);    // S
-    s += M_TOTAL  * bc        * sizeof(__half);   // P
+    s += M_TOTAL  * s_stride  * sizeof(float);    // S
+    s += M_TOTAL  * p_stride  * sizeof(__half);   // P
     s += M_TOTAL              * sizeof(float) * 3;// m, l, alpha
     return s;
 }
@@ -3935,6 +3947,19 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         if (std::strcmp(e, "8") == 0) return 8;
         return 8;
     }();
+    // s_S/s_P row-stride padding (in fp32 elements; bytes = pad*4 for both
+    // since s_P is __half-typed and we use 2× the element pad to match bytes).
+    // S_PAD=4 fp32 elems = 16 B = 4 banks. Maps adjacent score-tile rows onto
+    // distinct bank quartets; targets the NCU-measured 45% L1 uncoalesced
+    // shmem-wave count on v2's softmax + PV ldmatrix.x4 path. +0.5 KB shmem
+    // at BR=16 BC=32; still 2 blocks/SM.
+    static const uint32_t s_pad_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_SPAD");
+        if (!e) return 4;
+        if (std::strcmp(e, "0") == 0) return 0;
+        if (std::strcmp(e, "4") == 0) return 4;
+        return 4;
+    }();
 
     const uint32_t n_blocks_q = (batch + br_choice - 1) / br_choice;
     const uint32_t q_groups   = q_per_kv / NCOLS2;     // 3
@@ -3949,7 +3974,7 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
     }
     const dim3 grid(n_kv_heads * q_groups, n_blocks_q, nsplit);
     const dim3 block(128);
-    const size_t smem = fattn_mma_gqa_v2_smem_bytes(head_dim, bc_choice, br_choice, kv_pad_choice);
+    const size_t smem = fattn_mma_gqa_v2_smem_bytes(head_dim, bc_choice, br_choice, kv_pad_choice, s_pad_choice);
 
     static const bool use_cp_async_k = []() {
         const char *e = std::getenv("QW3_PREFILL_FA2_KCPASYNC");
@@ -3971,20 +3996,21 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
     }();
 
-    auto launch = [&](auto HD_v, auto BR_v, auto BC_v, auto KPAD_v, auto NS_v) {
+    auto launch = [&](auto HD_v, auto BR_v, auto BC_v, auto KPAD_v, auto SPAD_v, auto NS_v) {
         constexpr uint32_t HD   = decltype(HD_v)::value;
         constexpr uint32_t BR   = decltype(BR_v)::value;
         constexpr uint32_t BC   = decltype(BC_v)::value;
         constexpr uint32_t KPAD = decltype(KPAD_v)::value;
+        constexpr uint32_t SPAD = decltype(SPAD_v)::value;
         constexpr uint32_t NS   = decltype(NS_v)::value;
         auto dispatch = [&](auto K_v, auto V_v, auto FP16O_v) {
             constexpr bool K = decltype(K_v)::value;
             constexpr bool V = decltype(V_v)::value;
             constexpr bool FP16O = decltype(FP16O_v)::value;
             cudaFuncSetAttribute(
-                fattn_prefill_mma_gqa_kernel_v2_t<HD, 6, BR, BC, NCOLS2, KPAD, K, V, NS, FP16O>,
+                fattn_prefill_mma_gqa_kernel_v2_t<HD, 6, BR, BC, NCOLS2, KPAD, K, V, NS, FP16O, SPAD>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-            fattn_prefill_mma_gqa_kernel_v2_t<HD, 6, BR, BC, NCOLS2, KPAD, K, V, NS, FP16O>
+            fattn_prefill_mma_gqa_kernel_v2_t<HD, 6, BR, BC, NCOLS2, KPAD, K, V, NS, FP16O, SPAD>
                 <<<grid, block, smem, stream>>>(
                     out, partials, ms_buf, q, q_stride,
                     static_cast<const __half *>(k_cache),
@@ -4014,13 +4040,17 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         }
     };
 
-    auto launch_with_ns = [&](auto HD_v, auto BR_v, auto BC_v, auto KPAD_v) {
-        if (nsplit == 2) launch(HD_v, BR_v, BC_v, KPAD_v, std::integral_constant<uint32_t, 2>{});
-        else             launch(HD_v, BR_v, BC_v, KPAD_v, std::integral_constant<uint32_t, 1>{});
+    auto launch_with_ns = [&](auto HD_v, auto BR_v, auto BC_v, auto KPAD_v, auto SPAD_v) {
+        if (nsplit == 2) launch(HD_v, BR_v, BC_v, KPAD_v, SPAD_v, std::integral_constant<uint32_t, 2>{});
+        else             launch(HD_v, BR_v, BC_v, KPAD_v, SPAD_v, std::integral_constant<uint32_t, 1>{});
+    };
+    auto launch_with_spad = [&](auto HD_v, auto BR_v, auto BC_v, auto KPAD_v) {
+        if (s_pad_choice == 4) launch_with_ns(HD_v, BR_v, BC_v, KPAD_v, std::integral_constant<uint32_t, 4>{});
+        else                   launch_with_ns(HD_v, BR_v, BC_v, KPAD_v, std::integral_constant<uint32_t, 0>{});
     };
     auto launch_with_kpad = [&](auto HD_v, auto BR_v, auto BC_v) {
-        if (kv_pad_choice == 8) launch_with_ns(HD_v, BR_v, BC_v, std::integral_constant<uint32_t, 8>{});
-        else                    launch_with_ns(HD_v, BR_v, BC_v, std::integral_constant<uint32_t, 0>{});
+        if (kv_pad_choice == 8) launch_with_spad(HD_v, BR_v, BC_v, std::integral_constant<uint32_t, 8>{});
+        else                    launch_with_spad(HD_v, BR_v, BC_v, std::integral_constant<uint32_t, 0>{});
     };
     auto launch_with_bc = [&](auto HD_v, auto BR_v) {
         if (bc_choice == 32) launch_with_kpad(HD_v, BR_v, std::integral_constant<uint32_t, 32>{});
