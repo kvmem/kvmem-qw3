@@ -29,7 +29,10 @@ Both engines run greedy on the same Qwen 3.6 27B Q8_0 model on RTX Pro
 | + V cp.async + row-major shmem + ldmatrix.x2.trans                  | 3744  |  99% |
 | + FA2 v2 (BR=8 ncols2=2 q-head pack, Q-in-regs, BC=64)              | 3800  | 101% |
 | + FA2 v2 BC=32 (2 blocks/SM occupancy)                              | 3830  | 102% |
-| **+ FA2 v2 BR=16 ncols2=2 (M_TILES=2, default 2026-05-29)**         | **3910** | **104%** |
+| + FA2 v2 BR=16 ncols2=2 (M_TILES=2)                                 | 3910  | 104% |
+| + chunk=2048 default (memory parity), HGEMM autotuner restart tax   | 3399  |  90% |
+| + MMQ v7 swizzled at small batch (auto: batch ≤ 512 → MMQ)          | 3520  |  94% |
+| **+ MMQ v8 at large batch (auto: batch ≥ 128 → v8, replaces HGEMM)** | **3711** | **99%** |
 
 ### Long-context cliff progression (T=65K)
 
@@ -40,11 +43,16 @@ Both engines run greedy on the same Qwen 3.6 27B Q8_0 model on RTX Pro
 | + Selective cp.async wait (V overlaps QK)                 | 2232 | 73% |
 | + FA2 v2 (BR=8)                                           | 2367 | 77% |
 | + FA2 v2 BC=32 (2 blocks/SM)                              | 2367 | 77% |
-| **+ FA2 v2 BR=16 ncols2=2 (default 2026-05-29)**          | **2840** | **92%** |
+| + FA2 v2 BR=16 ncols2=2                                   | 2840 | 92% |
+| + chunk=2048 default (HGEMM autotuner tax)                | 2766 | 90% |
+| **+ MMQ v8 default (replaces HGEMM, frees ~3 GiB scratch)** | **2772** | **90%** |
 
-The BR=16 step closed half of the long-T gap in a single change. The
-remaining 7.7% at T=65K is compute-bound (TC util 13% qw3 vs 48% llama)
-and blocked behind a register-pressure wall — see "What hit a wall" below.
+The BR=16 step closed half of the long-T gap in a single change, and
+the v8 default removes the FP16 batch scratch without throughput cost
+at this length. The remaining 9.6% at T=65K is FA2 compute-bound
+(NCU-measured Tensor pipe util: 23.3% qw3 vs 65.1% llama, both at
+identical 16.7% theoretical occupancy, DRAM at 2.07% of peak — *not*
+HBM-bound). See "v2 long-T residual gap, NCU-confirmed" below.
 
 ### Decode journey (4350-token context; llama.cpp baseline 44.77 tok/s)
 
@@ -296,6 +304,214 @@ Measured win vs BR=8 v2:
 ptxas spills 528 B at BR=16 (vs 0 at BR=8) — confirmed off-hot-path
 by walking the SASS. Argmax-perfect parity at -n 64.
 
+### v2 long-T residual gap, NCU-confirmed (2026-06-01)
+
+Earlier sections estimated the long-T gap as "TC util ~13% qw3 vs 48%
+llama" — derived from peak-FP16 throughput assumptions, with a ~1.3×
+error band on the absolute number. Replaced that with direct ncu
+measurement at T=65K, capture point kv≈26K, kernel role matched
+(qw3 v2 vs llama `flash_attn_ext_f16<256, 256, 8, 8>`), 4 invocations
+each, identical 16.7% theoretical occupancy on both sides.
+
+| Section: GPU Speed Of Light  | qw3 v2 | llama  | reading                            |
+|------------------------------|-------:|-------:|------------------------------------|
+| Tensor pipe utilization      | 23.3%  | 65.1%  | qw3 stalls 2.79× more often        |
+| Compute (SM) Throughput      | 50.8%  | 65.1%  | qw3 below NCU's 60% latency floor  |
+| Memory Throughput (L2-dom.)  | 57.5%  | 82.6%  | qw3 leaves L2 idle                 |
+| L2 Cache Throughput          | 57.5%  | 82.6%  | same — L2 is the SoL component     |
+| L1/TEX Cache Throughput      | 57.6%  | 52.0%  | similar; not the bottleneck        |
+| **DRAM Throughput**          | **2.07%** | **5.97%** | **decisively NOT HBM-bound**  |
+| Theoretical occupancy        | 16.7%  | 16.7%  | same reg + shmem budget regime     |
+| L1 uncoalesced shmem waves   | 45%    | 27%    | qw3 has shmem-pattern slack        |
+| Per-block elapsed cycles     | 5.7M   | 723K   | 7.9× — only 2× from q-pack         |
+| NCU rule fired               | "below 60% indicates latency issues" | "Tensor well-utilized" | — |
+
+Two settled questions and one open lever fall out of this:
+
+**1. HBM/TMA attacks are off the lever list.** DRAM throughput at 2.1%
+of peak (and llama at 5.97%) means the long-T gap is *not* a memory-
+bandwidth shortfall. Plans like multi-stage cp.async (nstages=2),
+flashinfer-style TMA bulk loads, or FA3-style producer/consumer warp
+specialization would each cost shmem (halving block-per-SM occupancy)
+in exchange for hiding latency that isn't on the critical path.
+Permanently dropped from the candidate list — see also
+`feedback_fa2_multi_stage_cpasync_deferred.md`.
+
+**2. Occupancy-budget reductions are off the lever list.** Both kernels
+hit 16.7% theoretical occupancy (= 2 warps/scheduler), capped by the
+same reg + shmem footprint. Reducing qw3's footprint cannot unlock more
+parallelism unless we cross the next occupancy step (= 3 warps/sched =
+25%), and our two attempts to do so (FP16-O accumulator standalone, and
+BR=64 NCOLS2=1 with O_acc → shmem) both failed with regressions or
+parity loss. See `feedback_fa2_v2_br32_spill_negative.md`,
+`feedback_fa2_v3_br64_ncols2_1_negative.md`,
+`feedback_fa2_fp16_o_standalone_negative.md`.
+
+**3. The remaining structural lever is what llama actually does:**
+NCOLS2=8 with q-head zero-padding. Qwen 3.6's gqa_ratio = 6, so
+NCOLS2=8 wastes 2/8 = 25% of m-rows on zero-padded heads. In exchange,
+M_TOTAL = BR × NCOLS2 doubles from qw3's 32 to llama's 64 q-rows/CTA,
+which directly halves the softmax-phase amortization cost per K/V load
+— the lever NCU-confirmed at 23.3% → 65.1% Tensor utilization. Llama's
+65.1% is the realistic cap if we replicate that geometry exactly.
+
+The smaller, separable lever is the 45% → 27% uncoalesced-shmem-
+wavefronts gap — at the moment K/V are pad-8 swizzled (KPAD=8, see
+`feedback_fa2_v2_kv_pad_8.md`) but s_S/s_P softmax/probability tiles
+are not. XOR-swizzling those should consume some of the L2 + tensor
+slack without changing geometry.
+
+NCU run files preserved for replay:
+- `/tmp/ncu_run.sh` — qw3 v2 capture (launch-skip 200, count 4)
+- `/tmp/ncu_run_llama_only.sh` — llama with `--no-warmup` + broad regex
+  (`flash_attn_ext_f16` matches function base name only; ncu does not
+  see template args), launch-skip 200 to land kv≈26K.
+
+---
+
+## MMQ matmul evolution (chunk=2048 era)
+
+Before chunk=2048 became the default, prefill matmul was cuBLAS HGEMM
+with a per-call Q8_0 → FP16 dequant ping-pong scratch (constraint:
+"Q8 weight storage must stay 8-bit"). HGEMM beat MMQ at every batch
+size we'd implemented because Cutlass's wider tiles outpaced our
+INT8 path.
+
+The chunk=2048 default (memory parity with llama.cpp at long context)
+created a new pressure: the matmul side runs at modest batch (2048
+× hidden), where HGEMM's autotuner picks small tiles that under-utilize
+SMs, and the per-call dequant tax stays roughly constant. MMQ — if we
+could make it competitive — would also remove the FP16 batch scratch
+allocation entirely, a ~3 GiB win at chunk=2048.
+
+Two kernels closed this:
+
+### MMQ v7 (small-batch optimum — 64×64 tile, 2 blocks/SM)
+
+Built on three pieces of plumbing:
+
+- **Split-plane Q8 weight layout.** Per row, the FP16 scales for all
+  K/32 blocks live in one contiguous span, the INT8 quantized values
+  in another. Lets the inner loop do contiguous cp.async loads of
+  the INT8 quants without hop-and-skip across 34-byte interleaved
+  blocks.
+- **144-byte `block_q8_1_mmq_t` activation layout.** Activations
+  staged as super-blocks of 4×32 INT8 values + 4 FP32 sub-block
+  scales (16 B header + 128 B quants = 144 B). This matches what
+  llama.cpp's MMQ consumes; aligns with the 128-element K-stride of
+  the 8-warp tile.
+- **2-stage cp.async on W and Y, m16n8k32 INT8 MMA.** Inner loop
+  pipelines the next K-stride load behind the current MMA, then
+  rescales accumulators with the per-sub-block FP32 scales.
+
+The crucial unlock was **XOR-swizzled shmem** (`byte_off ^=
+(row & 7) << 4` on both cp.async fill and inner-loop reads): without
+it, all 256-element K rows anchor at bank 0, causing 8-way LDS bank
+conflicts that LDSM has to pay through serialized ports. The swizzle
+gives 8 group_id lanes 8 distinct banks. With it, v7 ≥ HGEMM at every
+T at chunk=512.
+
+v7's tile geometry is 64×64 outputs per CTA (4 warps, 128 threads,
+36 KB shmem, 2 blocks/SM resident). Wins at small batch by saturating
+the grid early — at T=556 with M=2304, the v7 grid is 36 × 9 = 324
+CTAs across 2 blocks/SM = 162 SM-waves, fully utilized.
+
+### MMQ v8 (large-batch optimum — 128×128 tile, 1 block/SM)
+
+v7's plumbing on a 2× wider tile geometry. 8 warps split as 4 stripes
+(32-row × 2-band 64-col), NTX=2 NTJ=8 → each warp does 16 m16n8k32
+MMAs per sub-block × 4 sub-blocks = 64 MMAs per super-block. 250-255
+regs (capped, 0 spills) and 72 KB dynamic shmem, so 1 block/SM.
+
+Why the wider tile helps at large batch: per-CTA arithmetic intensity
+scales with `(M·N)/(M+N)`. v7's 64×64 produces 32 outputs per byte
+loaded along K; v8's 128×128 produces 64. At T=1K v8 is +33% over
+HGEMM where v7 is roughly even. At T=65K both v7 and v8 approach
+HBM ceiling, so v8's ~0.4% lead over HGEMM is small but the +0.2 GiB
+memory win (no FP16 scratch) is the headline.
+
+Critical wiring fix during integration: `mmq_uses_mmq_y_layout()` in
+`kernels_cuda.cu` switches the activation scratch format based on the
+selected version (36-int for v2/3/6; 144-B for v4/5/7/8/auto). When
+v8 was added but the layout filter wasn't updated, qw3 staged 36-int
+activations but v8 read them as 144-B blocks → silent argmax garbage.
+The unit test (`tests/mmq_parity.cu`) couldn't catch it because it
+stages activations directly via `launch_quantize_mmq_q8_1`. Catching
+this required a real-prompt argmax check at Qwen shapes. Lesson:
+parity tests need to exercise the dispatch path, not just the kernel
+in isolation.
+
+### Auto routing (`QW3_MATMUL=auto`, default)
+
+Per-call decision tree:
+
+```
+batch ≥ 8 ? ──→ MMQ
+              ├── batch ≥ 128 & rows ≥ 128 ? ──→ v8 (128×128 tile)
+              └── else                       ──→ v7 (64×64 tile)
+batch < 8  ? ──→ dp4a matvec (decode path)
+```
+
+Both paths use identical activation format (144-B `block_q8_1_mmq_t`)
+and identical Q8_0 weight layout (split-plane). The choice between
+them is purely tile geometry — v8 wins above 128 because of higher
+arithmetic intensity; v7 wins below because of grid saturation +
+occupancy + tile-padding (v8's 128 step wastes 66% of the last column
+at T=556 vs v7's 64 step wasting 31%).
+
+HGEMM-with-dequant is no longer in the default path. It's reachable
+only via explicit `QW3_MATMUL=hgemm`; that costs +~3 GiB FP16 batch
+scratch and is now slower at every batch ≥ 1K.
+
+### A/B vs HGEMM at chunk=2048 (auto path):
+
+| T (tokens) | qw3 prefill (auto MMQ) | qw3 prefill (HGEMM) | Δ vs HGEMM |
+|-----------:|-----------------------:|--------------------:|-----------:|
+|   1024     |  ~3300 tok/s | ~2490 tok/s | **+32.6%** |
+|   2048     |  ~3397 tok/s | ~2891 tok/s | **+17.5%** |
+|   4096     |  ~3713 tok/s | ~3399 tok/s | **+9.2%**  |
+|   8192     |  ~3753 tok/s | ~3592 tok/s | **+4.5%**  |
+|  16384     |  ~3616 tok/s | ~3552 tok/s | **+1.8%**  |
+|  32768     |  ~3298 tok/s | ~3275 tok/s | **+0.7%**  |
+|  65536     |  ~2777 tok/s | ~2766 tok/s | **+0.4%**  |
+
+Memory at T=65K: 20.7 GiB vs HGEMM 20.9 GiB.
+
+### End-to-end vs llama.cpp (auto path, default config):
+
+| T (tokens) | qw3 prefill | llama prefill | qw3/llama |
+|-----------:|------------:|--------------:|----------:|
+|       556  |   2412 tok/s |   2748 tok/s |  87.8%  |
+|      2182  |   3392 tok/s |   3584 tok/s |  94.6%  |
+|      4350  |   3711 tok/s |   3760 tok/s |  98.7%  |
+|      8415  |   3753 tok/s |   3787 tok/s |  99.1%  |
+|     16545  |   3617 tok/s |   3711 tok/s |  97.5%  |
+|     33076  |   3296 tok/s |   3526 tok/s |  93.5%  |
+|     65867  |   2772 tok/s |   3066 tok/s |  90.4%  |
+
+### Why no single MMQ kernel wins everywhere
+
+The tile-vs-occupancy curve has two distinct optima on Blackwell:
+
+- **Large batch** wants a wide tile to amortize K-axis loads (high
+  per-CTA arithmetic intensity). That forces 1 block/SM (shmem +
+  register budget binding on sm_120a).
+- **Small batch** wants many small CTAs to saturate the grid +
+  expose occupancy hiding for HBM stalls. That forces a small tile.
+
+Trying to do both at once runs into hard limits: 128×128 at 2 blocks/SM
+would need ≤50 KB shmem (kills 2-stage cp.async or shrinks K-stride,
+both nuke arithmetic intensity); 128×128 at ≤128 regs spills O_acc
+(4 KB stack traffic in the inner loop). cuBLAS HGEMM and llama.cpp's
+MMQ both ship multiple tile sizes and dispatch by shape — same reason.
+
+A single kernel could in principle replace both via **stream-K
+decomposition** (each CTA owns a slice of the K dimension across
+multiple output tiles, decoupling tile size from grid size). Task #73
+explored this for v7 and was set aside; could revisit with v8 as the
+base. Today's 8% gap at T=65K lives in FA2, not MMQ, so the lever has
+moved.
+
 ---
 
 ## What hit a wall (negative results)
@@ -534,15 +750,21 @@ llama.cpp). Items without an estimated impact are exploratory.
    tuple, re-instantiated on shape change. Internal chunking + capture
    was already tried and is hostile (-28% at 4K — see negatives).
    Whole-prompt capture is the right path. Expected: +2–5% prefill at
-   large batch.
+   large batch, biggest impact at T=556 (where launch overhead is the
+   binding constraint, not the HGEMM autotuner anymore).
 
-**4. Stream-K work partitioning for MMQ**
-   Today MMQ's 200 CTAs × 1 col-tile-wide on 188 SMs gives 1.06 waves
-   + a 12-CTA tail wave (6% SM utilization). Stream-K (one persistent
-   CTA per SM, partition along K with fixup) bumps utilization to
-   ~100%. Expected: +25–35% MMQ throughput → still slower than HGEMM
-   at long T, so this only matters if MMQ becomes faster than HGEMM
-   for some shape regime.
+**4. Stream-K work partitioning for MMQ (single-kernel replacement for v7+v8)**
+   Today's auto router dispatches v7 (small batch, 64×64 tile, 2 blocks/SM)
+   and v8 (large batch, 128×128 tile, 1 block/SM) — two kernels because
+   the tile-vs-occupancy curve has two distinct optima on Blackwell.
+   Stream-K decomposition (each CTA owns a slice of the K dimension across
+   multiple output tiles, fixup kernel for cross-CTA reduction) decouples
+   tile size from grid size, letting one kernel keep v8's arithmetic
+   intensity while saturating the grid at small batch. Substantial
+   rewrite (cross-CTA reduction via gmem or DSMEM, separate fixup pass,
+   scratch memory for partial sums). llama.cpp's MMQ uses this. Currently
+   the auto router gives ≥99% of llama at T=8K with no rewrite, so this
+   is exploratory — only valuable if v8 can also win at T<2K under stream-K.
 
 **5. Per-shape `mmq_x` ladder**
    Template instantiations for `mmq_x ∈ {8, 16, 24, …, 128}` with a

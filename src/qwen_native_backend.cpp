@@ -162,6 +162,7 @@ public:
 
         const uint32_t ctx_size = options_.ctx_size > 0 ? static_cast<uint32_t>(options_.ctx_size) : 4096u;
         executor_ = std::make_unique<QwenExecutor>(*model_, *weights_, *device_, ctx_size);
+        executor_->set_prefill_chunk_override(options_.prefill_chunk);
         executor_->reset_state();
 
         st = device_->end();

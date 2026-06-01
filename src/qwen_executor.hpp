@@ -51,6 +51,14 @@ public:
     // at batch=1). Used to size prefill chunks against free device memory.
     uint64_t per_token_scratch_bytes() const;
 
+    // Prefill chunk override: -1 = use env / built-in default (512), 0 =
+    // whole-prompt (no chunking), >0 = chunk to this many tokens. Set by
+    // the CLI flag `--prefill-chunk N`. When set, takes precedence over
+    // QW3_PREFILL_CHUNK; the safety floor based on free device memory still
+    // applies.
+    void set_prefill_chunk_override(int v) { prefill_chunk_override_ = v; }
+    int  prefill_chunk_override() const { return prefill_chunk_override_; }
+
     // Copy the most recent logits tensor back to host. Returns false if
     // forward_one_token has not been called yet.
     bool copy_last_logits(std::vector<float> &out) const;
@@ -124,6 +132,7 @@ private:
 
     uint32_t kv_ctx_size_ = 0;
     uint32_t position_ = 0;
+    int      prefill_chunk_override_ = -1;
 
     // Set by reset_state() and cleared after the first eager forward_one_token
     // call of a generate() session. Suppresses CUDA-graph capture on token 0

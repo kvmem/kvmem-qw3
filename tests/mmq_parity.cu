@@ -256,8 +256,11 @@ static ShapeResult run_shape(int M, int N, int K, std::mt19937 &rng) {
 }
 
 int main(int /*argc*/, char ** /*argv*/) {
-    // Force MMQ v7 dispatch in launch_mmq_q8_0 (consumes 144-B block_q8_1_mmq_t).
-    setenv("QW3_MMQ_VERSION", "7", 1);
+    // Force MMQ dispatch in launch_mmq_q8_0 (consumes 144-B block_q8_1_mmq_t).
+    // Honor the user's QW3_MMQ_VERSION if set, else default to v7.
+    if (!std::getenv("QW3_MMQ_VERSION")) {
+        setenv("QW3_MMQ_VERSION", "7", 1);
+    }
 
     int dev_count = 0;
     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) {
@@ -277,6 +280,18 @@ int main(int /*argc*/, char ** /*argv*/) {
         {128, 256, 2048},
         {256, 256, 1024},
         {384, 256, 2048},
+        // Qwen 3.6 prefill shapes at chunk=2048 (M=hidden_or_proj_out, N=batch=2048, K=hidden):
+        {2048, 2048, 2048},   // gate_proj / up_proj K, FFN size 13824 -> rows
+        {2304, 2048, 2304},   // attn QKV proj -> 2304-dim hidden
+        {640,  2048, 2304},   // attn output proj
+        {2048, 2048, 2304},   // a typical FFN proj
+        // Tail-chunk shapes (T=8415 has a final 2271-token chunk in chunk=2048 mode):
+        {2304, 2271, 2304},
+        {2048, 2271, 2304},
+        // 8K test: full chunk + a 223-token tail (8415 = 4*2048 + 223):
+        {2304,  223, 2304},
+        {2048,  223, 2304},
+        {640,   223, 2304},
     };
 
     int n_failed = 0;

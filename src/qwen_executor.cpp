@@ -432,24 +432,34 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     ensure_scratch();
     const uint32_t total = static_cast<uint32_t>(tokens.size());
 
-    // Prefill chunking. llama.cpp processes prefill in n_batch=512 pieces
-    // so its peak compute scratch stays constant in T. qw3 originally sized
-    // batch scratch to the entire prompt, which made peak memory grow
-    // linearly with T — at T=64K the per-prompt batch scratch alone exceeded
-    // 30 GiB of FP32 storage, vs llama's flat ~30 GiB total. To match memory
-    // parity we apply the same fixed chunk cap as llama.cpp.
+    // Prefill chunking. The chunk cap controls peak compute scratch (per-token
+    // batch tensors: residual, FFN gate/up, q/k/v projections, etc.). qw3
+    // originally sized batch scratch to the entire prompt, which made peak
+    // memory grow linearly with T — at T=64K the per-prompt batch scratch
+    // alone exceeded 30 GiB of FP32 storage. Capping the chunk holds peak
+    // memory roughly flat in T.
     //
-    // Memory is the primary constraint. Throughput recovery comes from
-    // amortizing per-chunk fixed costs (HGEMM dequant pipeline restart,
-    // cuBLAS kernel-selection penalty at small batch, MMQ-at-short-batch
-    // dispatch, whole-prompt graph capture #35), NOT from hoarding scratch.
+    // The cap is 2048: empirically this recovers most of the chunking
+    // throughput tax (vs whole-prompt) while keeping peak memory close to
+    // chunk=512 (within ~1.1 GiB at T=65K). Smaller chunks pay a per-chunk
+    // amortization tax (HGEMM autotuner restart, MMQ-at-short-batch dispatch,
+    // sub-saturation grids) without buying meaningful memory back; larger
+    // chunks (≥4096) re-grow the per-chunk scratch significantly.
     //
     // Override with QW3_PREFILL_CHUNK=N. Set N=0 to disable the cap entirely
     // (whole-prompt batch — original behavior, useful for benchmarking the
     // throughput tax of chunking itself).
-    constexpr uint32_t kQw3DefaultPrefillChunk = 512;
+    constexpr uint32_t kQw3DefaultPrefillChunk = 2048;
     uint32_t chunk_size = std::min<uint32_t>(kQw3DefaultPrefillChunk, total);
-    if (const char *env = std::getenv("QW3_PREFILL_CHUNK")) {
+    // CLI override (`--prefill-chunk N`) takes precedence over env. -1 means
+    // "no override, use env or default".
+    if (prefill_chunk_override_ >= 0) {
+        if (prefill_chunk_override_ == 0) {
+            chunk_size = total;  // whole-prompt batch
+        } else {
+            chunk_size = static_cast<uint32_t>(prefill_chunk_override_);
+        }
+    } else if (const char *env = std::getenv("QW3_PREFILL_CHUNK")) {
         int v = std::atoi(env);
         if (v > 0) {
             chunk_size = static_cast<uint32_t>(v);

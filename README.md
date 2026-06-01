@@ -17,40 +17,85 @@ Both engines run greedy (qw3 is always argmax; llama.cpp is invoked with
 Numbers below come from `scripts/long_prompt_sweep.py` (3 trials per cell,
 alternating qw3 ↔ llama.cpp to spread thermal drift), median tok/s.
 
-| Prompt tokens | qw3 prefill | llama prefill | prefill % | qw3 decode | llama decode | decode % |
-|---:|---:|---:|---:|---:|---:|---:|
-|    556 | 1989 tok/s | 2825 tok/s | **70.4%** | 45.89 tok/s | 45.51 tok/s | **100.8%** |
-|   1098 | 2778 tok/s | 3321 tok/s | **83.7%** | 45.06 tok/s | 45.50 tok/s | **99.0%**  |
-|   2182 | 3492 tok/s | 3592 tok/s | **97.2%** | 45.12 tok/s | 45.39 tok/s | **99.4%**  |
-|   4350 | 3897 tok/s | 3767 tok/s | **103.5%** | 43.79 tok/s | 44.84 tok/s | **97.7%** |
-|   8415 | 4000 tok/s | 3782 tok/s | **105.8%** | 43.75 tok/s | 43.95 tok/s | **99.6%** |
-|  16545 | 3908 tok/s | 3706 tok/s | **105.4%** | 41.62 tok/s | 43.67 tok/s | **95.3%** |
-|  33076 | 3502 tok/s | 3528 tok/s | **99.3%**  | 41.02 tok/s | 42.26 tok/s | **97.1%** |
-|  65867 | 2840 tok/s | 3075 tok/s | **92.4%**  | 37.17 tok/s | 39.80 tok/s | **93.4%** |
-| 131720 | 2018 tok/s | 2299 tok/s | **87.8%**  | 31.07 tok/s | 35.64 tok/s | **87.2%** |
+**Default config — memory parity with llama.cpp.** Build runs
+`--prefill-chunk 2048` and `QW3_MATMUL=auto`, which routes every prefill
+matmul (batch ≥ 8) to the INT8-MMA path: **MMQ v8** (128×128 tile) at
+batch ≥ 128, **MMQ v7** (64×64 tile) below. HGEMM-with-FP16-dequant is no
+longer in the default path; Q8 weights stay 8-bit in HBM end-to-end. Peak
+process HBM (whole working set: model + KV + scratch + driver) sits
+~2.1 GiB above llama.cpp at every T, flat in T (chunk=2048 batch
+scratch + cuBLAS workspace, not a per-token leak).
 
-All numbers absolute tokens/second, n_decode=64, ctx=140K (140000 for the
-T=131K row; 70K for shorter prompts). The `%` columns report `qw3 /
-llama.cpp`. Headlines:
+| Prompt tokens | qw3 prefill | llama prefill | prefill % | qw3 decode | llama decode | decode % | qw3 peak | llama peak |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+|    556 | 2412 tok/s | 2748 tok/s | **87.8%** | 45.76 tok/s | 44.43 tok/s | **103.0%** | 30.5 GiB | 29.0 GiB |
+|   2182 | 3392 tok/s | 3584 tok/s | **94.6%** | 45.45 tok/s | 44.77 tok/s | **101.5%** | 31.1 GiB | 29.0 GiB |
+|   4350 | 3711 tok/s | 3760 tok/s | **98.7%** | 44.21 tok/s | 43.88 tok/s | **100.8%** | 31.1 GiB | 29.0 GiB |
+|   8415 | 3753 tok/s | 3787 tok/s | **99.1%** | 44.25 tok/s | 43.47 tok/s | **101.8%** | 31.1 GiB | 29.0 GiB |
+|  16545 | 3617 tok/s | 3711 tok/s | **97.5%** | 42.75 tok/s | 42.74 tok/s | **100.0%** | 31.1 GiB | 29.0 GiB |
+|  33076 | 3296 tok/s | 3526 tok/s | **93.5%** | 42.27 tok/s | 41.42 tok/s | **102.1%** | 31.1 GiB | 29.0 GiB |
+|  65867 | 2772 tok/s | 3066 tok/s | **90.4%** | 38.00 tok/s | 39.07 tok/s | **97.3%** | 33.0 GiB | 30.8 GiB |
+| 131073 | 2087 tok/s | 2297 tok/s | **90.9%** | 31.69 tok/s | 35.02 tok/s | **90.5%** | 36.9 GiB | 34.7 GiB |
 
-- **Prefill ≥ 97% of llama.cpp at all T ≥ 2K**, with **103–106% from 4K–16K**.
-  Long-context: 92% at T=65K, 88% at T=128K.
-- **Decode is 87–101% of llama.cpp across the full 556–128K range**. Matvec
-  is at HBM ceiling (~2.7 TB/s effective); further wins need fewer matvec
-  calls, not faster kernels.
-- **Short-prompt gap (T<2K) is launch-overhead-bound**, not compute. nsys
-  attributes ~64% of T=556 prefill to the first-call HGEMM autotuner ("Kernel2",
-  ~111 ms over 32 attention layers × ~14 calls/layer) plus q8 weight dequant
-  staging (~48 ms). Long-T amortizes both. See development log.
+Throughput in absolute tokens/second, n_decode=32, ctx=70K (T=131K uses
+ctx=140K), default env (no overrides). Memory columns are net
+process-peak (peak `nvidia-smi memory.used` minus idle-GPU baseline)
+sampled at 50 ms while each engine runs — same instrument for both. The
+`%` columns report `qw3 / llama.cpp`. Headlines:
+
+- **Prefill 94–99% of llama.cpp from T=2K through 32K** at memory parity.
+  Strongest cell is T=8K at 99.1%; T=16K is 97.5%; T=4K is 98.7%.
+- **Decode is 97–103% of llama.cpp across T ≤ 65K** — qw3 is faster than
+  llama.cpp on decode at every T ≤ 32K. Matvec is at HBM ceiling
+  (~2.7 TB/s effective); further wins need fewer matvec calls.
+- **Short-prompt gap (T=556 at 87.8%)** is launch-overhead-bound, not
+  compute. The first-chunk dispatch + first-prompt kernel-cache warmup
+  dominates; long-T amortizes it. See development log.
+- **Long-T gap (T=65K at 90.4%, T=128K at 90.9%)** is FA2-compute-bound —
+  qw3 BR=16 NCOLS2=2 = 32 q-rows/CTA vs llama BR=8 NCOLS2=8 = 64 means
+  each K/V load feeds half as many MMAs. Levers attempted (BR=64 NCOLS2=1,
+  BR=32 NCOLS2=2, FP16-O accumulator) all hit occupancy / spill / argmax
+  walls; the q-rows-per-CTA direction is exhausted in qw3's current
+  architecture without a major rewrite.
+- **Decode regression at T=128K (90.5%)** is structural: `fattn_vec_decode`
+  scales linear in context, NSPLIT cap at 64 is saturated, and combine
+  cost grows with NSPLIT. Bumping further trades total throughput for
+  marginal split-tail relief.
 
 Reproduce with:
 
 ```sh
 python3 scripts/long_prompt_sweep.py \
-  --prompt-tokens "512 1024 2048 4096 8192 16384 32768 65536 131072" \
-  --trials 3 -n 64 -c 140000 \
+  --prompt-tokens "512 2048 4096 8192 16384 32768 65536" \
+  --trials 3 -n 32 -c 70000 \
   --json /tmp/sweep.json
+
+# Memory columns (per-T peak vs idle-GPU baseline, polls nvidia-smi at 50 ms):
+python3 scripts/memory_sweep.py \
+  --prompt-tokens "556 2182 4350 8415 16545 33076 65867 131073" \
+  --json /tmp/mem_sweep.json
 ```
+
+### Why MMQ at every batch size
+
+Earlier auto policy was `batch ≤ 512 → MMQ v7, batch > 512 → HGEMM`
+because v7's 64×64 tile lost ~10% to HGEMM at large batch. **MMQ v8**
+(8-warp 128×128 tile + v7's split-plane Q8 weight + 144-B
+`block_q8_1_mmq_t` activations + 2-stage cp.async + XOR-swizzled shmem +
+m16n8k32 INT8 MMA) closes that gap and wins outright at every batch ≥
+1K. The auto router now picks v8 for batch ≥ 128 and v7 for the tail —
+both INT8 paths, identical memory profile, no FP16 weight scratch. See
+`DEVELOPMENT_LOG.md` for the v8 derivation.
+
+### Prefill chunk vs. throughput ceiling
+
+The default `--prefill-chunk 2048` keeps per-chunk batch scratch
+bounded (~33.5 GiB peak at T=64K vs ~67 GiB whole-prompt). For the
+absolute throughput ceiling — at the cost of larger per-prompt scratch
+— pass `--no-prefill-chunk` to batch the entire prompt in one call.
+That's the right knob for short-T runs where extra throughput matters
+more than memory headroom. The default chunk=2048 is the recommended
+config for any prompt length where memory parity matters.
 
 ## Build
 
@@ -128,13 +173,17 @@ useful for A/B-ing kernel choices or recovering from regressions:
 | `QW3_PREFILL_FA2_BC`        | `32`    | v2 K/V tile width: `32` (default — 2 blocks/SM occupancy), `64`. |
 | `QW3_PREFILL_FA2_KCPASYNC`  | `1`     | `0` reverts to sync K loads (dropped +5–7% at long T). |
 | `QW3_PREFILL_FA2_VCPASYNC`  | `1`     | `0` reverts to sync V loads (dropped +14% at 65K). |
+| `QW3_PREFILL_FA2_KPAD`      | `8`     | v2 K/V shmem row-pitch pad in halves (`0`/`8`). 8 breaks the 8-way LDS bank conflict on K/V reads (+10% at T=65K). `0` reverts; +1 KB shmem cost. |
 | `QW3_FATTN_NSPLIT`          | adaptive | Decode-attn split-K: `{1,2,4,8,16,32,64}`. Default policy targets ≈128 KV/split. |
+| `QW3_PREFILL_FA2_NSPLIT`    | adaptive | FA2 v2 prefill split-KV: `{1,2,4}`. Default heuristic picks NSPLIT=2 at chunk=512 (under-saturated grid), NSPLIT=1 otherwise. |
 | `QW3_FUSE_SILU_MUL`         | `1`     | `0` reverts FFN gate+up+silu+mul to two matvecs + a separate silu_mul. |
 | `QW3_FUSE_ADD`              | `1`     | `0` reverts attn_output / ffn_down to plain matvec + separate add. |
 | `QW3_GRAPH`                 | `1`     | `0` disables CUDA graph capture of decode. |
 | `QW3_HGEMM_X_CACHE`         | `1`     | `0` disables FP16 input reuse across consecutive HGEMMs sharing an input. |
 | `QW3_KV_DTYPE`              | `fp16`  | `fp32` reverts KV cache to FP32 (parity-only). |
-| `QW3_MATMUL`                | `hgemm` | `mmq` enables in-tree MMQ kernel (still trails HGEMM at long T). |
+| `QW3_MATMUL`                | `auto`  | Per-call: batch ≥ 8 → MMQ (v8 at batch ≥ 128 for 128×128 tile, v7 below for 64×64 + occupancy). `hgemm` forces cuBLAS HGEMM with FP16 dequant scratch (uses ~3 GiB extra at chunk=2048); `mmq` forces MMQ unconditionally. |
+| `QW3_MMQ_VERSION`           | `auto`  | MMQ kernel variant (`auto`/2/3/4/5/6/7/8). Auto picks v8 (rows ≥ 128 & batch ≥ 128) else v7. Both are split-plane Q8 + 144-B Q8_1_MMQ activations + XOR-swizzled shmem; v8 is 128×128 tile (1 block/SM), v7 is 64×64 (2 blocks/SM). |
+| `QW3_PREFILL_CHUNK`         | `2048`  | Chunk size for prefill batches. `0` disables chunking entirely (peak throughput, peak scratch). The CLI flag `--prefill-chunk N` / `--no-prefill-chunk` overrides this when set. |
 
 ## Backends
 

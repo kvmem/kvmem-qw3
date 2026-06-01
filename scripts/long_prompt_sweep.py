@@ -126,6 +126,11 @@ def run_qw3(args, prompt: str, env_extra: Optional[dict] = None) -> TrialResult:
         "--seed", "0",
         "--prompt-file", str(pf),
     ]
+    if getattr(args, "prefill_chunk", None) is not None:
+        if args.prefill_chunk == 0:
+            cmd.append("--no-prefill-chunk")
+        else:
+            cmd += ["--prefill-chunk", str(args.prefill_chunk)]
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
@@ -307,6 +312,9 @@ def main() -> int:
     p.add_argument("--prompt-tokens", type=str, default="512 1024 2048 4096 8192 16384 32768",
                    help="space- or comma-separated target prompt token counts")
     p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--prefill-chunk", type=int, default=None,
+                   help="qw3 --prefill-chunk override; 0 means --no-prefill-chunk; "
+                        "default leaves the qw3 binary's own default in place.")
     p.add_argument("--json", type=str, default=None,
                    help="optional path to dump per-trial results")
     args = p.parse_args()

@@ -28,6 +28,12 @@ void usage(std::ostream &os) {
         "  --native-kernels NAME cuda. Default: cuda\n"
         "  --native-linear-backend NAME auto, cublas, or custom. Default: auto\n"
         "  --native-token-id N   Token id used by qwen-native single-token forward. Default: 0\n"
+        "  --prefill-chunk N     Prefill chunk size in tokens (qwen-native).\n"
+        "                        0 = no chunking (whole-prompt batch, max throughput,\n"
+        "                        peak scratch grows with prompt length).\n"
+        "                        N>0 = process prefill in fixed-size chunks.\n"
+        "                        Unset = built-in default (512, memory parity with llama.cpp).\n"
+        "  --no-prefill-chunk    Sugar for --prefill-chunk 0 (max throughput).\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
@@ -129,6 +135,10 @@ int main(int argc, char **argv) {
                 engine.native_linear_backend = need(arg);
             } else if (arg == "--native-token-id") {
                 engine.native_token_id = parse_int(need(arg), arg);
+            } else if (arg == "--prefill-chunk") {
+                engine.prefill_chunk = parse_int(need(arg), arg);
+            } else if (arg == "--no-prefill-chunk") {
+                engine.prefill_chunk = 0;
             } else if (arg == "--verbose") {
                 engine.verbose = true;
             } else if (arg == "-p" || arg == "--prompt") {

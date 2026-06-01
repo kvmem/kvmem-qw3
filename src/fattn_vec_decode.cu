@@ -2423,12 +2423,15 @@ static size_t fattn_mma_gqa_smem_bytes(uint32_t head_dim, uint32_t q_per_kv) {
 // Shmem (HD=256, BC=64): K(32) + V(32) + S(4) + P(2) + m/l/alpha(0.2) ≈ 70 KB
 // vs v1's 95 KB.
 template <uint32_t HEAD_DIM, uint32_t Q_PER_KV, uint32_t BR, uint32_t BC,
-          uint32_t NCOLS2,
-          bool USE_CP_ASYNC_K, bool USE_CP_ASYNC_V>
+          uint32_t NCOLS2, uint32_t KV_PAD,
+          bool USE_CP_ASYNC_K, bool USE_CP_ASYNC_V, uint32_t NSPLIT,
+          bool USE_FP16_O = false>
 __global__ void
 __launch_bounds__(128, 1)
 fattn_prefill_mma_gqa_kernel_v2_t(
-        float       * __restrict__ out,
+        float       * __restrict__ out,        // [batch, n_heads, HEAD_DIM] (NSPLIT==1)
+        float       * __restrict__ partials,   // [n_heads, batch, NSPLIT, HEAD_DIM] (NSPLIT>1)
+        float       * __restrict__ ms,         // [n_heads, batch, NSPLIT, 2]         (NSPLIT>1)
         const float * __restrict__ q,
         uint32_t     q_stride,
         const __half* __restrict__ k_cache,
@@ -2449,6 +2452,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     static_assert(BR == 8 || BR == 16 || BR == 32, "v2 supports BR ∈ {8, 16, 32}");
     static_assert(BC == 32 || BC == 64,    "v2 supports BC ∈ {32, 64}");
     static_assert(NCOLS2 == 2,             "v2 supports NCOLS2=2");
+    static_assert(KV_PAD == 0 || KV_PAD == 8, "v2 supports KV_PAD ∈ {0, 8}");
     static_assert(BR % 8 == 0,             "BR must be multiple of 8");
     static_assert(Q_PER_KV % NCOLS2 == 0,  "Q_PER_KV must divide by NCOLS2");
     static_assert(HEAD_DIM == 128 || HEAD_DIM == 256, "v2 supports HD 128/256");
@@ -2472,10 +2476,18 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     static_assert(M_TILES * MMA_M == M_TOTAL, "M_TILES*MMA_M==M_TOTAL");
     static_assert(M_TOTAL % NWARPS == 0,      "M_TOTAL divisible by NWARPS");
 
+    // K/V row stride in halves. Padding by 8 halves (16 bytes) shifts each
+    // adjacent row's bank-0 anchor by 4 banks, so the 8 group_id lanes that
+    // share the same in-row offset land on 8 distinct banks (vs 8-way conflict
+    // at KV_PAD=0). V uses HW ldmatrix.trans; the same padding still benefits
+    // V because the load mask treats stride_h as the row pitch.
+    constexpr uint32_t HEAD_STRIDE = HEAD_DIM + KV_PAD;
+
     const uint32_t kvg_idx  = blockIdx.x;
     const uint32_t kv_head  = kvg_idx / Q_GROUPS_PER_KV;
     const uint32_t q_group  = kvg_idx % Q_GROUPS_PER_KV;
     const uint32_t block_q  = blockIdx.y;
+    const uint32_t k_split  = blockIdx.z;
     const uint32_t tid      = threadIdx.x;
     const uint32_t warp     = tid / WARP_SIZE;
     const uint32_t lane     = tid % WARP_SIZE;
@@ -2494,16 +2506,78 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     if (block_max_q > batch) block_max_q = batch;
     const uint32_t block_max_kv = base_seq_len + block_max_q;
 
-    // Shmem layout.
+    // Split-KV: this CTA owns [kv_lo, kv_hi) of the K axis (BC-aligned). For
+    // NSPLIT==1 this matches the pre-split path exactly. CTAs that overshoot
+    // block_max_kv produce -INFINITY scores via the existing causal mask, so
+    // they contribute zero rows but still write a "live" (m, l) tagged with
+    // sum=0 that combine_kernel skips. Empty splits return early via the
+    // dead-partial path.
+    uint32_t kv_lo, kv_hi;
+    if (NSPLIT == 1) {
+        kv_lo = 0;
+        kv_hi = block_max_kv;
+    } else {
+        const uint32_t kv_total = base_seq_len + batch;
+        const uint32_t per_split = ((kv_total + NSPLIT - 1) / NSPLIT + BC - 1) & ~uint32_t(BC - 1);
+        kv_lo = k_split * per_split;
+        kv_hi = kv_lo + per_split;
+        if (kv_hi > block_max_kv) kv_hi = block_max_kv;
+        if (kv_lo >= kv_hi) {
+            // Dead partial: this split has no work for this q-block (entirely
+            // past the causal horizon). Write m=-INF, sum=0, O=0 so combine
+            // skips it.
+            #pragma unroll
+            for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+                const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+                const uint32_t head_a  = head_base + C_A;
+                const uint32_t head_b  = head_base + C_B;
+                if (warp == 0 && in_group == 0) {
+                    if (q_idx_a < batch) {
+                        const uint64_t mb = ((uint64_t)head_a * batch + q_idx_a) * NSPLIT + k_split;
+                        ms[mb * 2 + 0] = -INFINITY;
+                        ms[mb * 2 + 1] = 0.0f;
+                    }
+                    if (q_idx_b < batch) {
+                        const uint64_t mb = ((uint64_t)head_b * batch + q_idx_b) * NSPLIT + k_split;
+                        ms[mb * 2 + 0] = -INFINITY;
+                        ms[mb * 2 + 1] = 0.0f;
+                    }
+                }
+                #pragma unroll
+                for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                    const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+                    const uint32_t col = n0 + in_group * 2;
+                    if (q_idx_a < batch) {
+                        const uint64_t pbase = (((uint64_t)head_a * batch + q_idx_a)
+                                                * NSPLIT + k_split) * HEAD_DIM;
+                        partials[pbase + col + 0] = 0.0f;
+                        partials[pbase + col + 1] = 0.0f;
+                    }
+                    if (q_idx_b < batch) {
+                        const uint64_t pbase = (((uint64_t)head_b * batch + q_idx_b)
+                                                * NSPLIT + k_split) * HEAD_DIM;
+                        partials[pbase + col + 0] = 0.0f;
+                        partials[pbase + col + 1] = 0.0f;
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // Shmem layout. s_K/s_V_buf use HEAD_STRIDE rows = HEAD_DIM + KV_PAD halves
+    // to break the bank conflict (KV_PAD=8) when enabled. Both s_K and s_V_buf
+    // are BC rows × HEAD_STRIDE halves (cp.async-fill layout: [t][d]).
     extern __shared__ char smem_raw[];
     char *p = smem_raw;
-    __half *s_K     = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
-    __half *s_V_buf = reinterpret_cast<__half *>(p); p += HEAD_DIM * BC       * sizeof(__half);
-    float  *s_S     = reinterpret_cast<float  *>(p); p += M_TOTAL  * BC       * sizeof(float);
-    __half *s_P     = reinterpret_cast<__half *>(p); p += M_TOTAL  * BC       * sizeof(__half);
-    float  *s_m     = reinterpret_cast<float  *>(p); p += M_TOTAL              * sizeof(float);
-    float  *s_l     = reinterpret_cast<float  *>(p); p += M_TOTAL              * sizeof(float);
-    float  *s_alpha = reinterpret_cast<float  *>(p); p += M_TOTAL              * sizeof(float);
+    __half *s_K     = reinterpret_cast<__half *>(p); p += BC * HEAD_STRIDE * sizeof(__half);
+    __half *s_V_buf = reinterpret_cast<__half *>(p); p += BC * HEAD_STRIDE * sizeof(__half);
+    float  *s_S     = reinterpret_cast<float  *>(p); p += M_TOTAL * BC     * sizeof(float);
+    __half *s_P     = reinterpret_cast<__half *>(p); p += M_TOTAL * BC     * sizeof(__half);
+    float  *s_m     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    float  *s_l     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    float  *s_alpha = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
 
     // ---- Q in registers --------------------------------------------------
     // Q_reg[mt][ks][slot] holds the m-tile mt's m=16 a-fragment for ks-step.
@@ -2551,13 +2625,19 @@ fattn_prefill_mma_gqa_kernel_v2_t(
         s_m[tid] = -INFINITY;
         s_l[tid] = 0.0f;
     }
-    float O_acc[M_TILES][PV_N_TILES][4];
+    // O accumulator. USE_FP16_O=false → fp32 storage (default, parity gold).
+    // USE_FP16_O=true → __half storage; MMA still f16f16f32, we promote
+    // FP16 → FP32 working set, MMA, narrow back. Saves ~256 B/thread at
+    // BR=16 (M_TILES*PV_N_TILES*4 fp32 → fp16). The lever is register
+    // pressure for the q-rows-per-CTA bump (#5).
+    using o_acc_t = typename std::conditional<USE_FP16_O, __half, float>::type;
+    o_acc_t O_acc[M_TILES][PV_N_TILES][4];
     #pragma unroll
     for (uint32_t mt = 0; mt < M_TILES; ++mt) {
         #pragma unroll
         for (uint32_t n = 0; n < PV_N_TILES; ++n) {
             #pragma unroll
-            for (int i = 0; i < 4; ++i) O_acc[mt][n][i] = 0.0f;
+            for (int i = 0; i < 4; ++i) O_acc[mt][n][i] = (o_acc_t)0;
         }
     }
     __syncthreads();
@@ -2574,7 +2654,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
             const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
             const uint32_t t     = t0_target + shm_t;
             const uint32_t base_d = col_lane * HALVES_PER_LD;
-            __half *dst = &s_K[shm_t * HEAD_DIM + base_d];
+            __half *dst = &s_K[shm_t * HEAD_STRIDE + base_d];
             const bool in_range = (t < block_max_kv);
             if (USE_CP_ASYNC_K) {
                 if (in_range) {
@@ -2614,7 +2694,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
             const uint32_t base_d = col_lane * HALVES_PER_LD;
             const bool in_range = (t < block_max_kv);
             if (USE_CP_ASYNC_V) {
-                __half *dst = &s_V_buf[shm_t * HEAD_DIM + base_d];
+                __half *dst = &s_V_buf[shm_t * HEAD_STRIDE + base_d];
                 if (in_range) {
                     const __half *v_src = v_cache
                         + (uint64_t)t * n_kv_heads * HEAD_DIM
@@ -2641,12 +2721,11 @@ fattn_prefill_mma_gqa_kernel_v2_t(
         }
     };
 
-    if (USE_CP_ASYNC_K) { issue_K(0); mma_detail::cp_async_commit(); }
-    if (USE_CP_ASYNC_V) { issue_V(0); mma_detail::cp_async_commit(); }
-    const uint32_t kv_hi = block_max_kv;
+    if (USE_CP_ASYNC_K) { issue_K(kv_lo); mma_detail::cp_async_commit(); }
+    if (USE_CP_ASYNC_V) { issue_V(kv_lo); mma_detail::cp_async_commit(); }
 
     // ---- Tile loop -------------------------------------------------------
-    for (uint32_t t0 = 0; t0 < kv_hi; t0 += BC) {
+    for (uint32_t t0 = kv_lo; t0 < kv_hi; t0 += BC) {
 
         if (USE_CP_ASYNC_K && USE_CP_ASYNC_V) {
             mma_detail::cp_async_wait_group<1>();
@@ -2674,7 +2753,7 @@ fattn_prefill_mma_gqa_kernel_v2_t(
             #pragma unroll
             for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
                 const uint32_t kv_col = warp * (BC / NWARPS) + nq * MMA_N + group_id;
-                const __half *krow0 = &s_K[kv_col * HEAD_DIM + k0 + in_group * 2];
+                const __half *krow0 = &s_K[kv_col * HEAD_STRIDE + k0 + in_group * 2];
                 const unsigned b0 = mma_detail::pack2h(krow0);
                 const unsigned b1 = mma_detail::pack2h(krow0 + 8);
                 #pragma unroll
@@ -2786,10 +2865,14 @@ fattn_prefill_mma_gqa_kernel_v2_t(
         for (uint32_t mt = 0; mt < M_TILES; ++mt) {
             #pragma unroll
             for (uint32_t n = 0; n < PV_N_TILES; ++n) {
-                O_acc[mt][n][0] *= alpha_a[mt];
-                O_acc[mt][n][1] *= alpha_a[mt];
-                O_acc[mt][n][2] *= alpha_b[mt];
-                O_acc[mt][n][3] *= alpha_b[mt];
+                const float r0 = static_cast<float>(O_acc[mt][n][0]) * alpha_a[mt];
+                const float r1 = static_cast<float>(O_acc[mt][n][1]) * alpha_a[mt];
+                const float r2 = static_cast<float>(O_acc[mt][n][2]) * alpha_b[mt];
+                const float r3 = static_cast<float>(O_acc[mt][n][3]) * alpha_b[mt];
+                O_acc[mt][n][0] = static_cast<o_acc_t>(r0);
+                O_acc[mt][n][1] = static_cast<o_acc_t>(r1);
+                O_acc[mt][n][2] = static_cast<o_acc_t>(r2);
+                O_acc[mt][n][3] = static_cast<o_acc_t>(r3);
             }
         }
 
@@ -2804,11 +2887,568 @@ fattn_prefill_mma_gqa_kernel_v2_t(
                 const uint32_t k0 = ks * MMA_K;
                 unsigned b0, b1;
                 if (USE_CP_ASYNC_V) {
-                    const __half *vbase = &s_V_buf[k0 * HEAD_DIM + n0];
-                    mma_detail::ldmatrix_x2_b_trans(b0, b1, vbase, HEAD_DIM);
+                    const __half *vbase = &s_V_buf[k0 * HEAD_STRIDE + n0];
+                    mma_detail::ldmatrix_x2_b_trans(b0, b1, vbase, HEAD_STRIDE);
                 } else {
                     const uint32_t out_col = n0 + group_id;
                     const __half *vrow0 = &s_V_buf[out_col * BC + k0 + in_group * 2];
+                    b0 = mma_detail::pack2h(vrow0);
+                    b1 = mma_detail::pack2h(vrow0 + 8);
+                }
+                #pragma unroll
+                for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                    unsigned a0, a1, a2, a3;
+                    mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                              &s_P[mt * MMA_M * BC + k0], BC);
+                    if constexpr (USE_FP16_O) {
+                        float d0 = static_cast<float>(O_acc[mt][n][0]);
+                        float d1 = static_cast<float>(O_acc[mt][n][1]);
+                        float d2 = static_cast<float>(O_acc[mt][n][2]);
+                        float d3 = static_cast<float>(O_acc[mt][n][3]);
+                        mma_detail::mma_m16n8k16_f16f16f32(
+                            d0, d1, d2, d3,
+                            a0, a1, a2, a3, b0, b1);
+                        O_acc[mt][n][0] = static_cast<o_acc_t>(d0);
+                        O_acc[mt][n][1] = static_cast<o_acc_t>(d1);
+                        O_acc[mt][n][2] = static_cast<o_acc_t>(d2);
+                        O_acc[mt][n][3] = static_cast<o_acc_t>(d3);
+                    } else {
+                        float &o0 = reinterpret_cast<float &>(O_acc[mt][n][0]);
+                        float &o1 = reinterpret_cast<float &>(O_acc[mt][n][1]);
+                        float &o2 = reinterpret_cast<float &>(O_acc[mt][n][2]);
+                        float &o3 = reinterpret_cast<float &>(O_acc[mt][n][3]);
+                        mma_detail::mma_m16n8k16_f16f16f32(
+                            o0, o1, o2, o3,
+                            a0, a1, a2, a3, b0, b1);
+                    }
+                }
+            }
+        }
+
+        if (USE_CP_ASYNC_V) {
+            const uint32_t t0_next = t0 + BC;
+            if (t0_next < kv_hi) { issue_V(t0_next); mma_detail::cp_async_commit(); }
+        }
+    }
+
+    // ---- Final write -----------------------------------------------------
+    // NSPLIT==1: divide by l_h and store [batch, n_heads, HEAD_DIM].
+    // NSPLIT>1 : write un-normalized O_acc + (m, l) to partials/ms; the
+    //            combine kernel reduces across splits and divides at the end.
+    {
+        const uint32_t head_a = head_base + C_A;
+        const uint32_t head_b = head_base + C_B;
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+            const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+            const float l_a = s_l[mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a];
+            const float l_b = s_l[mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b];
+            if (NSPLIT == 1) {
+                const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
+                const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
+                float * const out_a = (q_idx_a < batch)
+                    ? (out + (uint64_t)q_idx_a * out_batch_stride + head_a * HEAD_DIM) : nullptr;
+                float * const out_b = (q_idx_b < batch)
+                    ? (out + (uint64_t)q_idx_b * out_batch_stride + head_b * HEAD_DIM) : nullptr;
+                #pragma unroll
+                for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                    const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+                    const uint32_t col = n0 + in_group * 2;
+                    if (out_a) {
+                        out_a[col + 0] = static_cast<float>(O_acc[mt][n][0]) * inv_la;
+                        out_a[col + 1] = static_cast<float>(O_acc[mt][n][1]) * inv_la;
+                    }
+                    if (out_b) {
+                        out_b[col + 0] = static_cast<float>(O_acc[mt][n][2]) * inv_lb;
+                        out_b[col + 1] = static_cast<float>(O_acc[mt][n][3]) * inv_lb;
+                    }
+                }
+            } else {
+                // Un-normalized O_acc → partials. Same lane mapping as the
+                // NSPLIT==1 path, just no l-divide.
+                float * const part_a = (q_idx_a < batch)
+                    ? (partials + (((uint64_t)head_a * batch + q_idx_a)
+                                   * NSPLIT + k_split) * HEAD_DIM) : nullptr;
+                float * const part_b = (q_idx_b < batch)
+                    ? (partials + (((uint64_t)head_b * batch + q_idx_b)
+                                   * NSPLIT + k_split) * HEAD_DIM) : nullptr;
+                #pragma unroll
+                for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                    const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+                    const uint32_t col = n0 + in_group * 2;
+                    if (part_a) {
+                        part_a[col + 0] = static_cast<float>(O_acc[mt][n][0]);
+                        part_a[col + 1] = static_cast<float>(O_acc[mt][n][1]);
+                    }
+                    if (part_b) {
+                        part_b[col + 0] = static_cast<float>(O_acc[mt][n][2]);
+                        part_b[col + 1] = static_cast<float>(O_acc[mt][n][3]);
+                    }
+                }
+                // (m, l) per (head, q_idx). Gate to a single writer per row:
+                // warp 0, in_group == 0 → 8 lanes covering group_id 0..7,
+                // matching r_a and r_b q-row offsets.
+                if (warp == 0 && in_group == 0) {
+                    const float m_a = s_m[mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a];
+                    const float m_b = s_m[mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b];
+                    if (q_idx_a < batch) {
+                        const uint64_t mb = ((uint64_t)head_a * batch + q_idx_a) * NSPLIT + k_split;
+                        ms[mb * 2 + 0] = m_a;
+                        ms[mb * 2 + 1] = l_a;
+                    }
+                    if (q_idx_b < batch) {
+                        const uint64_t mb = ((uint64_t)head_b * batch + q_idx_b) * NSPLIT + k_split;
+                        ms[mb * 2 + 0] = m_b;
+                        ms[mb * 2 + 1] = l_b;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static size_t fattn_mma_gqa_v2_smem_bytes(uint32_t head_dim, uint32_t bc, uint32_t br,
+                                          uint32_t kv_pad) {
+    constexpr uint32_t NCOLS2 = 2;
+    const uint32_t M_TOTAL    = br * NCOLS2;            // 16@BR=8, 32@BR=16
+    const uint32_t hd_stride  = head_dim + kv_pad;
+    size_t s = 0;
+    s += bc       * hd_stride * sizeof(__half);   // K
+    s += bc       * hd_stride * sizeof(__half);   // V
+    s += M_TOTAL  * bc        * sizeof(float);    // S
+    s += M_TOTAL  * bc        * sizeof(__half);   // P
+    s += M_TOTAL              * sizeof(float) * 3;// m, l, alpha
+    return s;
+}
+
+// =====================================================================
+// fattn_prefill_mma_gqa_kernel_v3_t — BR=64 + NCOLS2=1 + Q-in-shmem
+// =====================================================================
+//
+// NEGATIVE RESULT (2026-05-30): kept opt-in via QW3_PREFILL_ATTN=mma-gqa-v3.
+// Parity-correct (top-1 disagreements within v2's own run-to-run drift), but
+// throughput regressed -6%/-18%/-37% at T=4K/16K/65K vs v2 default at
+// chunk=512. Two compounding losses outweigh the q-rows-per-CTA win:
+//   1. 76.75 KB shmem → 1 block/SM, vs v2's 38.4 KB → 2 blocks/SM. Halved
+//      occupancy means K cp.async waits stall the whole SM.
+//   2. Q-from-shmem: 64 ldmatrix.x4 per tile × tiles at long T, vs v2's
+//      once-per-CTA Q load into registers (zero shmem traffic for Q).
+//
+// Long-T attack: q-rows-per-CTA lever. v2 default is BR=16 NCOLS2=2 →
+// M_TOTAL=32 q-rows/CTA, M_TILES=2 MMAs per K/V ldmatrix. llama.cpp
+// flash_attn_ext_f16<256,256,8,8> packs 64 q-rows/CTA. v3 mirrors that:
+//
+//   BR=64, NCOLS2=1, M_TILES=4 → 64 q-rows/CTA, 4 MMAs per K/V load.
+//
+// Why NCOLS2=1: with BR=64 NCOLS2=2, M_TOTAL=128 doesn't fit shmem at
+// HD=256 (s_S alone = 128*BC*4 ≥ 16 KB before P/Q). q_per_kv=6 isn't a
+// multiple of NCOLS2=4 either. v3 keeps each m-tile single-headed; the
+// grid covers all 6 q-heads via Q_GROUPS_PER_KV=6 CTAs per kv-head.
+//
+// Why Q-in-shmem (not regs): BR=32 NCOLS2=2 in v2 already spilled 4 KB
+// at the 255-reg cap. BR=64 needs more accumulator state (O_acc=128
+// fp32) so the Q_reg budget can't survive. Move Q to shmem; reload via
+// ldmatrix.x4 per (mt, ks) inside the QK loop. Shmem cost: 32 KB (HD=256).
+//
+// Shmem (HD=256, BC=32, BR=64, NCOLS2=1):
+//   s_K: 16 KB ; s_V: 16 KB ; s_Q: 32 KB ; s_S: 8 KB ; s_P: 4 KB ;
+//   m/l/alpha: ~0.75 KB. Total ≈ 76.75 KB ≤ 98304-byte opt-in cap.
+//   1 block/SM.
+//
+// Lane mapping (NCOLS2=1):
+//   m_in_frag = c * BR + r:
+//     m=0..7  → c=0, r=0..7 (a-pair)
+//     m=8..15 → c=1, r=0..7 (b-pair)
+//   For NCOLS2=1, BOTH a and b pairs target the same q-head, but
+//   different q-row groups within the m-tile:
+//     a-pair → q-row mt*16 + group_id           (rows 0..7 of m-tile)
+//     b-pair → q-row mt*16 + group_id + 8       (rows 8..15 of m-tile)
+//   One MMA m16n8k16 covers 16 q-rows in the m-axis. M_TILES=4 → 64.
+//
+// Q layout in shmem: row-major s_Q[BR, HD] (64 rows × 256 halves).
+// ldmatrix.x4 at base=&s_Q[mt*16, ks*16] with stride=HD loads the
+// canonical (m=16, k=16) a-fragment for m-tile mt step ks.
+template <uint32_t HEAD_DIM, uint32_t Q_PER_KV, uint32_t BR, uint32_t BC,
+          bool USE_CP_ASYNC_K, bool USE_CP_ASYNC_V>
+__global__ void
+__launch_bounds__(128, 1)
+fattn_prefill_mma_gqa_kernel_v3_t(
+        float       * __restrict__ out,
+        const float * __restrict__ q,
+        uint32_t     q_stride,
+        const __half* __restrict__ k_cache,
+        const __half* __restrict__ v_cache,
+        uint32_t     n_heads,
+        uint32_t     n_kv_heads,
+        uint32_t     base_seq_len,
+        uint32_t     batch,
+        uint32_t     q_batch_stride,
+        uint32_t     out_batch_stride,
+        float        scale) {
+    constexpr uint32_t WARP_SIZE = 32;
+    constexpr uint32_t NWARPS    = 4;
+    constexpr uint32_t MMA_M     = 16;
+    constexpr uint32_t MMA_N     = 8;
+    constexpr uint32_t MMA_K     = 16;
+    constexpr uint32_t NCOLS2    = 1;
+
+    static_assert(BR == 32 || BR == 64,    "v3 supports BR ∈ {32, 64}");
+    static_assert(BC == 32 || BC == 64,    "v3 supports BC ∈ {32, 64}");
+    static_assert(BR % MMA_M == 0,         "BR must be multiple of MMA_M");
+    static_assert(HEAD_DIM == 128 || HEAD_DIM == 256, "v3 supports HD 128/256");
+    static_assert(HEAD_DIM % MMA_K == 0,   "HEAD_DIM multiple of MMA_K");
+    static_assert(BC % MMA_N == 0,         "BC multiple of MMA_N");
+    static_assert(BC % NWARPS == 0,        "BC divisible by NWARPS");
+
+    constexpr uint32_t QK_KSTEPS  = HEAD_DIM / MMA_K;          // 16
+    constexpr uint32_t QK_N_TILES = (BC / NWARPS) / MMA_N;     // 2@BC=32
+    constexpr uint32_t PV_KSTEPS  = BC / MMA_K;                // 2@BC=32
+    constexpr uint32_t HD_PER_WARP = HEAD_DIM / NWARPS;        // 64
+    constexpr uint32_t PV_N_TILES  = HD_PER_WARP / MMA_N;      // 8
+    constexpr uint32_t M_TILES     = BR / MMA_M;               // 2@BR=32, 4@BR=64
+    constexpr uint32_t M_TOTAL     = BR;                       // NCOLS2=1
+    static_assert(M_TOTAL % NWARPS == 0,   "M_TOTAL divisible by NWARPS");
+
+    // Grid: blockIdx.x covers (n_kv_heads * Q_PER_KV) since each q-head is
+    // its own CTA (NCOLS2=1, no head-pack into m-axis).
+    const uint32_t hg_idx   = blockIdx.x;
+    const uint32_t kv_head  = hg_idx / Q_PER_KV;
+    const uint32_t q_in_kv  = hg_idx % Q_PER_KV;
+    const uint32_t block_q  = blockIdx.y;
+    const uint32_t tid      = threadIdx.x;
+    const uint32_t warp     = tid / WARP_SIZE;
+    const uint32_t lane     = tid % WARP_SIZE;
+    if (kv_head >= n_kv_heads) return;
+    const uint32_t head     = kv_head * Q_PER_KV + q_in_kv;
+
+    const uint32_t group_id = lane / 4;
+    const uint32_t in_group = lane % 4;
+
+    uint32_t block_max_q = block_q * BR + BR;
+    if (block_max_q > batch) block_max_q = batch;
+    const uint32_t block_max_kv = base_seq_len + block_max_q;
+
+    // Shmem layout.
+    extern __shared__ char smem_raw[];
+    char *p = smem_raw;
+    __half *s_K = reinterpret_cast<__half *>(p); p += BC       * HEAD_DIM * sizeof(__half);
+    __half *s_V = reinterpret_cast<__half *>(p); p += HEAD_DIM * BC       * sizeof(__half);
+    __half *s_Q = reinterpret_cast<__half *>(p); p += BR       * HEAD_DIM * sizeof(__half);
+    float  *s_S = reinterpret_cast<float  *>(p); p += M_TOTAL  * BC       * sizeof(float);
+    __half *s_P = reinterpret_cast<__half *>(p); p += M_TOTAL  * BC       * sizeof(__half);
+    float  *s_m     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    float  *s_l     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    float  *s_alpha = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+
+    // ---- Load Q into shmem (row-major [BR, HEAD_DIM]) -------------------
+    {
+        // 128 threads, BR*HEAD_DIM/2 int4-equivalent halves to fill.
+        // Each thread fills 8 halves (one int4) per pass.
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;          // 32@HD=256
+        constexpr uint32_t ROWS_PER_PASS = 128 / LANES_PER_ROW;               // 4@HD=256
+        constexpr uint32_t N_PASS        = BR / ROWS_PER_PASS;                // 16@BR=64
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t r       = pass * ROWS_PER_PASS + row_in_pass;
+            const uint32_t q_idx   = block_q * BR + r;
+            const uint32_t base_d  = col_lane * HALVES_PER_LD;
+            const bool active      = (q_idx < batch);
+            __half *dst = &s_Q[r * HEAD_DIM + base_d];
+            if (active) {
+                const float *qp = q + (uint64_t)q_idx * q_batch_stride
+                                + head * q_stride + base_d;
+                __half h8[HALVES_PER_LD];
+                #pragma unroll
+                for (uint32_t i = 0; i < HALVES_PER_LD; ++i) {
+                    h8[i] = __float2half(qp[i]);
+                }
+                *reinterpret_cast<int4 *>(dst) = *reinterpret_cast<const int4 *>(h8);
+            } else {
+                int4 z; z.x = z.y = z.z = z.w = 0;
+                *reinterpret_cast<int4 *>(dst) = z;
+            }
+        }
+    }
+
+    if (tid < M_TOTAL) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+    float O_acc[M_TILES][PV_N_TILES][4];
+    #pragma unroll
+    for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) O_acc[mt][n][i] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    auto issue_K = [&](uint32_t t0_target) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0_target + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            __half *dst = &s_K[shm_t * HEAD_DIM + base_d];
+            const bool in_range = (t < block_max_kv);
+            if (USE_CP_ASYNC_K) {
+                if (in_range) {
+                    const __half *k_src = k_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    mma_detail::cp_async_cg_16(dst, k_src);
+                } else {
+                    mma_detail::cp_async_zero_16(dst);
+                }
+            } else {
+                int4 *dst4 = reinterpret_cast<int4 *>(dst);
+                if (in_range) {
+                    const __half *k_src = k_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *dst4 = *reinterpret_cast<const int4 *>(k_src);
+                } else {
+                    int4 z; z.x = z.y = z.z = z.w = 0;
+                    *dst4 = z;
+                }
+            }
+        }
+    };
+
+    auto issue_V = [&](uint32_t t0_target) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0_target + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            const bool in_range = (t < block_max_kv);
+            if (USE_CP_ASYNC_V) {
+                __half *dst = &s_V[shm_t * HEAD_DIM + base_d];
+                if (in_range) {
+                    const __half *v_src = v_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    mma_detail::cp_async_cg_16(dst, v_src);
+                } else {
+                    mma_detail::cp_async_zero_16(dst);
+                }
+            } else {
+                __half v8[HALVES_PER_LD];
+                if (in_range) {
+                    const __half *v_src = v_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *reinterpret_cast<int4 *>(v8) = *reinterpret_cast<const int4 *>(v_src);
+                } else {
+                    *reinterpret_cast<int4 *>(v8) = make_int4(0,0,0,0);
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < HALVES_PER_LD; ++i) {
+                    s_V[(base_d + i) * BC + shm_t] = v8[i];
+                }
+            }
+        }
+    };
+
+    if (USE_CP_ASYNC_K) { issue_K(0); mma_detail::cp_async_commit(); }
+    if (USE_CP_ASYNC_V) { issue_V(0); mma_detail::cp_async_commit(); }
+    const uint32_t kv_hi = block_max_kv;
+
+    // ---- Tile loop -------------------------------------------------------
+    for (uint32_t t0 = 0; t0 < kv_hi; t0 += BC) {
+
+        if (USE_CP_ASYNC_K && USE_CP_ASYNC_V) {
+            mma_detail::cp_async_wait_group<1>();
+        } else if (USE_CP_ASYNC_K) {
+            mma_detail::cp_async_wait_group<0>();
+        }
+        if (!USE_CP_ASYNC_K) issue_K(t0);
+        if (!USE_CP_ASYNC_V) issue_V(t0);
+        __syncthreads();
+
+        // QK^T phase. Each (ks, nq) loads one K B-frag and runs M_TILES MMAs
+        // reusing it (the q-rows-per-CTA lever).
+        // For NCOLS2=1, both a-pair and b-pair within an m-tile target the
+        // same q-head, different q-row groups. Q is loaded via ldmatrix.x4
+        // from s_Q[mt*16 .. mt*16+15, ks*16 .. ks*16+15].
+        float c_h[M_TILES][QK_N_TILES][4];
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            #pragma unroll
+            for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                c_h[mt][nq][0]=0.f; c_h[mt][nq][1]=0.f;
+                c_h[mt][nq][2]=0.f; c_h[mt][nq][3]=0.f;
+            }
+        }
+        #pragma unroll
+        for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+            const uint32_t k0 = ks * MMA_K;
+            // Load K B-frags for all QK_N_TILES.
+            unsigned bb[QK_N_TILES][2];
+            #pragma unroll
+            for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                const uint32_t kv_col = warp * (BC / NWARPS) + nq * MMA_N + group_id;
+                const __half *krow0 = &s_K[kv_col * HEAD_DIM + k0 + in_group * 2];
+                bb[nq][0] = mma_detail::pack2h(krow0);
+                bb[nq][1] = mma_detail::pack2h(krow0 + 8);
+            }
+            // Per m-tile: ldmatrix.x4 the Q a-frag, then run MMAs for all nq.
+            #pragma unroll
+            for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                unsigned a0, a1, a2, a3;
+                mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                          &s_Q[mt * MMA_M * HEAD_DIM + k0],
+                                          HEAD_DIM);
+                #pragma unroll
+                for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                    mma_detail::mma_m16n8k16_f16f16f32(
+                        c_h[mt][nq][0], c_h[mt][nq][1], c_h[mt][nq][2], c_h[mt][nq][3],
+                        a0, a1, a2, a3,
+                        bb[nq][0], bb[nq][1]);
+                }
+            }
+        }
+
+        if (USE_CP_ASYNC_K) {
+            const uint32_t t0_next = t0 + BC;
+            if (t0_next < kv_hi) { issue_K(t0_next); mma_detail::cp_async_commit(); }
+        }
+
+        // Write S to shmem with causal mask. c_h[mt][nq] slots:
+        //   .0/.1 → m-row m_in_frag=group_id     (q-row mt*16+group_id)
+        //   .2/.3 → m-row m_in_frag=group_id+8   (q-row mt*16+group_id+8)
+        // s_S layout: M_TOTAL rows × BC cols. m-tile mt occupies rows
+        // [mt*MMA_M, mt*MMA_M+16).
+        {
+            #pragma unroll
+            for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                const uint32_t q_idx_a = block_q * BR + mt * MMA_M + group_id;
+                const uint32_t q_idx_b = block_q * BR + mt * MMA_M + group_id + 8;
+                const bool a_active = (q_idx_a < batch);
+                const bool b_active = (q_idx_b < batch);
+                const uint32_t my_max_kv_a = base_seq_len + q_idx_a + 1;
+                const uint32_t my_max_kv_b = base_seq_len + q_idx_b + 1;
+                const uint32_t m_a = mt * MMA_M + group_id;
+                const uint32_t m_b = mt * MMA_M + group_id + 8;
+                #pragma unroll
+                for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                    const uint32_t base_col = warp * (BC / NWARPS) + nq * MMA_N + in_group * 2;
+                    const uint32_t t_a0 = t0 + base_col;
+                    const uint32_t t_a1 = t0 + base_col + 1;
+                    float v00 = (a_active && t_a0 < my_max_kv_a) ? c_h[mt][nq][0] * scale : -INFINITY;
+                    float v01 = (a_active && t_a1 < my_max_kv_a) ? c_h[mt][nq][1] * scale : -INFINITY;
+                    float v02 = (b_active && t_a0 < my_max_kv_b) ? c_h[mt][nq][2] * scale : -INFINITY;
+                    float v03 = (b_active && t_a1 < my_max_kv_b) ? c_h[mt][nq][3] * scale : -INFINITY;
+                    s_S[m_a * BC + base_col + 0] = v00;
+                    s_S[m_a * BC + base_col + 1] = v01;
+                    s_S[m_b * BC + base_col + 0] = v02;
+                    s_S[m_b * BC + base_col + 1] = v03;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // Online softmax over M_TOTAL rows × BC cols.
+        constexpr uint32_t ROWS_PER_WARP = M_TOTAL / NWARPS;     // 16@BR=64
+        constexpr uint32_t COLS_PER_LANE = BC / WARP_SIZE;       // 1@BC=32, 2@BC=64
+        #pragma unroll
+        for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+            const uint32_t m_row = warp * ROWS_PER_WARP + r;
+            float local_max = -INFINITY;
+            float s_vals[COLS_PER_LANE];
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                s_vals[cc] = s_S[m_row * BC + lane * COLS_PER_LANE + cc];
+                if (s_vals[cc] > local_max) local_max = s_vals[cc];
+            }
+            const float row_max = cuda_helpers::warp_reduce_max<32>(local_max);
+            const float prev_m = s_m[m_row];
+            const float new_m  = fmaxf(prev_m, row_max);
+            float local_sum = 0.0f;
+            __half pvals[COLS_PER_LANE];
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                const float p_val = (s_vals[cc] == -INFINITY) ? 0.0f
+                                                              : __expf(s_vals[cc] - new_m);
+                local_sum += p_val;
+                pvals[cc] = __float2half(p_val);
+            }
+            const float row_sum = cuda_helpers::warp_reduce_sum<32>(local_sum);
+            const float prev_l  = s_l[m_row];
+            const float alpha   = (prev_m == -INFINITY) ? 0.0f : __expf(prev_m - new_m);
+            const float new_l   = prev_l * alpha + row_sum;
+            if (lane == 0) {
+                s_m[m_row]     = new_m;
+                s_l[m_row]     = new_l;
+                s_alpha[m_row] = alpha;
+            }
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                s_P[m_row * BC + lane * COLS_PER_LANE + cc] = pvals[cc];
+            }
+        }
+
+        if (USE_CP_ASYNC_V) {
+            const bool k_next_pending = USE_CP_ASYNC_K && (t0 + BC < kv_hi);
+            if (k_next_pending) mma_detail::cp_async_wait_group<1>();
+            else                mma_detail::cp_async_wait_group<0>();
+        }
+        __syncthreads();
+
+        // Rescale O_acc by per-row alpha. For each m-tile mt, lane group_id
+        // holds m=mt*16+group_id (a-side, q-row mt*16+group_id) and
+        // m=mt*16+group_id+8 (b-side, q-row mt*16+group_id+8).
+        float alpha_a[M_TILES], alpha_b[M_TILES];
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            alpha_a[mt] = s_alpha[mt * MMA_M + group_id];
+            alpha_b[mt] = s_alpha[mt * MMA_M + group_id + 8];
+        }
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            #pragma unroll
+            for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                O_acc[mt][n][0] *= alpha_a[mt];
+                O_acc[mt][n][1] *= alpha_a[mt];
+                O_acc[mt][n][2] *= alpha_b[mt];
+                O_acc[mt][n][3] *= alpha_b[mt];
+            }
+        }
+
+        // Phase B: PV. Each (n, ks) loads one V B-frag and runs M_TILES MMAs
+        // reusing it (the q-rows-per-CTA lever).
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+            #pragma unroll
+            for (uint32_t ks = 0; ks < PV_KSTEPS; ++ks) {
+                const uint32_t k0 = ks * MMA_K;
+                unsigned b0, b1;
+                if (USE_CP_ASYNC_V) {
+                    const __half *vbase = &s_V[k0 * HEAD_DIM + n0];
+                    mma_detail::ldmatrix_x2_b_trans(b0, b1, vbase, HEAD_DIM);
+                } else {
+                    const uint32_t out_col = n0 + group_id;
+                    const __half *vrow0 = &s_V[out_col * BC + k0 + in_group * 2];
                     b0 = mma_detail::pack2h(vrow0);
                     b1 = mma_detail::pack2h(vrow0 + 8);
                 }
@@ -2830,22 +3470,20 @@ fattn_prefill_mma_gqa_kernel_v2_t(
         }
     }
 
-    // ---- Final write: divide by l_h and store [batch, n_heads, HEAD_DIM] -
+    // ---- Final write: divide by l and store [batch, n_heads, HEAD_DIM] --
     {
-        const uint32_t head_a = head_base + C_A;
-        const uint32_t head_b = head_base + C_B;
         #pragma unroll
         for (uint32_t mt = 0; mt < M_TILES; ++mt) {
-            const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
-            const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
-            const float l_a = s_l[mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a];
-            const float l_b = s_l[mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b];
+            const uint32_t q_idx_a = block_q * BR + mt * MMA_M + group_id;
+            const uint32_t q_idx_b = block_q * BR + mt * MMA_M + group_id + 8;
+            const float l_a = s_l[mt * MMA_M + group_id];
+            const float l_b = s_l[mt * MMA_M + group_id + 8];
             const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
             const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
             float * const out_a = (q_idx_a < batch)
-                ? (out + (uint64_t)q_idx_a * out_batch_stride + head_a * HEAD_DIM) : nullptr;
+                ? (out + (uint64_t)q_idx_a * out_batch_stride + head * HEAD_DIM) : nullptr;
             float * const out_b = (q_idx_b < batch)
-                ? (out + (uint64_t)q_idx_b * out_batch_stride + head_b * HEAD_DIM) : nullptr;
+                ? (out + (uint64_t)q_idx_b * out_batch_stride + head * HEAD_DIM) : nullptr;
             #pragma unroll
             for (uint32_t n = 0; n < PV_N_TILES; ++n) {
                 const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
@@ -2863,12 +3501,12 @@ fattn_prefill_mma_gqa_kernel_v2_t(
     }
 }
 
-static size_t fattn_mma_gqa_v2_smem_bytes(uint32_t head_dim, uint32_t bc, uint32_t br) {
-    constexpr uint32_t NCOLS2 = 2;
-    const uint32_t M_TOTAL = br * NCOLS2;            // 16@BR=8, 32@BR=16
+static size_t fattn_mma_gqa_v3_smem_bytes(uint32_t head_dim, uint32_t bc, uint32_t br) {
+    const uint32_t M_TOTAL = br;                     // NCOLS2=1
     size_t s = 0;
     s += bc       * head_dim * sizeof(__half);   // K
     s += head_dim * bc       * sizeof(__half);   // V
+    s += br       * head_dim * sizeof(__half);   // Q (in shmem)
     s += M_TOTAL  * bc       * sizeof(float);    // S
     s += M_TOTAL  * bc       * sizeof(__half);   // P
     s += M_TOTAL             * sizeof(float) * 3;// m, l, alpha
@@ -2969,6 +3607,69 @@ static inline uint32_t pick_prefill_gqa_nsplit(uint32_t batch, uint32_t n_kv_hea
 size_t fattn_prefill_mma_gqa_scratch_bytes(uint32_t batch, uint32_t n_heads,
                                             uint32_t n_kv_heads, uint32_t head_dim) {
     const uint32_t nsplit = pick_prefill_gqa_nsplit(batch, n_kv_heads, n_heads, head_dim);
+    if (nsplit <= 1) return 0;
+    const size_t partials = (size_t)n_heads * batch * nsplit * head_dim * sizeof(float);
+    const size_t ms       = (size_t)n_heads * batch * nsplit * 2        * sizeof(float);
+    return partials + ms;
+}
+
+// Pick NSPLIT for the v2 prefill kernel.
+//
+// Premise (verified 2026-05-30 on RTX Pro 6000, Qwen 3.6 27B 4 kv-heads):
+//   v2's base grid = (n_kv_heads * 3, ceil(batch/BR), 1). At chunk=512 BR=16
+//   the grid is 4*3*32 = 384 CTAs. With v2's 35 KB shmem allowing 2 blocks/SM,
+//   the resident slot budget is 152*2 = 304. So one wave of 304 + a tail of 80 —
+//   1.26 waves with the last wave 26%-occupied. Splitting K 2× / 4× scales the
+//   grid to 768 / 1536 CTAs (2.5 / 5 waves), packing the SMs more densely.
+//
+//   At whole-prompt T (chunk=0), batch is the full prompt and the grid already
+//   spans many waves; NSPLIT=1 stays correct. At chunk=512 long-T (the regime
+//   where v2 trails llama by ~25-40%), bumping NSPLIT can stack on top of
+//   v2's q-rows-per-CTA gain.
+//
+// Cut-off: split when q_blocks * kv_groups * Q_GROUPS_PER_KV ≤ 304 * 1.5 = 456.
+//   chunk=512 BR=16: 32 * 4 * 3 = 384  → split (NSPLIT=2 brings to 768)
+//   chunk=2048 BR=16: 128*4*3=1536      → no split
+//   T=65K whole: ~4096*4*3 ≈ 49K        → no split
+//
+// NSPLIT=2 is the conservative pick. NSPLIT=4 was useful on v1 (NSPLIT=1
+// underutilized), but on v2 the head-pack already halves the per-CTA grid:
+// going from 1.26 waves to 5 waves (NSPLIT=4) over-shards each CTA's work.
+// Stay at NSPLIT=2 unless QW3_PREFILL_FA2_NSPLIT forces otherwise.
+static inline uint32_t pick_prefill_gqa_v2_nsplit(uint32_t batch, uint32_t n_kv_heads,
+                                                   uint32_t n_heads, uint32_t head_dim,
+                                                   uint32_t br) {
+    static const uint32_t kForced = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_NSPLIT");
+        if (!e) return 0;
+        const int v = std::atoi(e);
+        if (v == 1 || v == 2 || v == 4) return (uint32_t)v;
+        return 0;
+    }();
+    if (kForced) return kForced;
+    (void)n_heads; (void)head_dim;
+    constexpr uint32_t NCOLS2 = 2;
+    const uint32_t q_per_kv      = 6;                          // gated check
+    const uint32_t q_groups      = q_per_kv / NCOLS2;          // 3
+    const uint32_t q_blocks      = (batch + br - 1) / br;
+    const uint32_t base_grid     = q_blocks * n_kv_heads * q_groups;
+    // 2 blocks/SM × 152 SMs = 304 resident slots; allow 1.5× headroom before
+    // splitting (i.e. only split when the base grid leaves >50% of a wave idle).
+    constexpr uint32_t kSatThreshold = 304u + 152u;            // 456
+    return (base_grid <= kSatThreshold) ? 2u : 1u;
+}
+
+size_t fattn_prefill_mma_gqa_v2_scratch_bytes(uint32_t batch, uint32_t n_heads,
+                                                uint32_t n_kv_heads, uint32_t head_dim) {
+    static const uint32_t br_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_BR");
+        if (!e) return 16;
+        if (std::strcmp(e, "8")  == 0) return 8;
+        if (std::strcmp(e, "16") == 0) return 16;
+        if (std::strcmp(e, "32") == 0) return 32;
+        return 16;
+    }();
+    const uint32_t nsplit = pick_prefill_gqa_v2_nsplit(batch, n_kv_heads, n_heads, head_dim, br_choice);
     if (nsplit <= 1) return 0;
     const size_t partials = (size_t)n_heads * batch * nsplit * head_dim * sizeof(float);
     const size_t ms       = (size_t)n_heads * batch * nsplit * 2        * sizeof(float);
@@ -3176,10 +3877,15 @@ bool launch_fattn_prefill_mma_gqa_f16(
     return true;
 }
 
-// v2 launcher: BR=8 + ncols2=2 + Q-in-regs. NSPLIT=1 always. Currently
+// v2 launcher: BR=8/16 + ncols2=2 + Q-in-regs. Optionally split-KV (NSPLIT
+// chosen by SM-saturation heuristic in pick_prefill_gqa_v2_nsplit). When
+// NSPLIT>1 the caller must size `scratch` per fattn_prefill_mma_gqa_v2_scratch_bytes;
+// the launcher dispatches the combine kernel to reduce partials. Currently
 // gated to Qwen 3.6 27B's q_per_kv=6.
 bool launch_fattn_prefill_mma_gqa_v2_f16(
         float *       out,
+        void  *       scratch,
+        size_t        scratch_bytes,
         const float * q,
         uint32_t      q_stride,
         const void  * k_cache,
@@ -3218,12 +3924,162 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         if (std::strcmp(e, "32") == 0) return 32;
         return 16;
     }();
+    // K/V row-stride padding (in halves) to break the 8-way LDS bank conflict
+    // on the QK pack2h read path. Default 0 (no pad). KV_PAD=8 shifts each
+    // adjacent K row by 4 banks, mapping the 8 group_id lanes onto distinct
+    // banks. +1 KB shmem at HD=256 BC=32; still 2 blocks/SM.
+    static const uint32_t kv_pad_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_KPAD");
+        if (!e) return 8;
+        if (std::strcmp(e, "0") == 0) return 0;
+        if (std::strcmp(e, "8") == 0) return 8;
+        return 8;
+    }();
 
     const uint32_t n_blocks_q = (batch + br_choice - 1) / br_choice;
     const uint32_t q_groups   = q_per_kv / NCOLS2;     // 3
-    const dim3 grid(n_kv_heads * q_groups, n_blocks_q, 1);
+    const uint32_t nsplit = pick_prefill_gqa_v2_nsplit(batch, n_kv_heads, n_heads, head_dim, br_choice);
+    float *partials = nullptr, *ms_buf = nullptr;
+    if (nsplit > 1) {
+        const size_t need = (size_t)n_heads * batch * nsplit * head_dim * sizeof(float)
+                          + (size_t)n_heads * batch * nsplit * 2        * sizeof(float);
+        if (!scratch || scratch_bytes < need) return false;
+        partials = static_cast<float *>(scratch);
+        ms_buf   = partials + (size_t)n_heads * batch * nsplit * head_dim;
+    }
+    const dim3 grid(n_kv_heads * q_groups, n_blocks_q, nsplit);
     const dim3 block(128);
-    const size_t smem = fattn_mma_gqa_v2_smem_bytes(head_dim, bc_choice, br_choice);
+    const size_t smem = fattn_mma_gqa_v2_smem_bytes(head_dim, bc_choice, br_choice, kv_pad_choice);
+
+    static const bool use_cp_async_k = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_KCPASYNC");
+        if (!e) return true;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
+    static const bool use_cp_async_v = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_VCPASYNC");
+        if (!e) return true;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
+    // QW3_PREFILL_FA2_FP16_O: store O_acc in __half instead of float. MMA
+    // stays f16f16f32; we promote FP16→FP32 around each MMA. Saves ~256 B/
+    // thread of register pressure at BR=16, more at BR=32/64. Off by default
+    // until parity at long T is confirmed.
+    static const bool use_fp16_o = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_FP16_O");
+        if (!e) return false;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
+
+    auto launch = [&](auto HD_v, auto BR_v, auto BC_v, auto KPAD_v, auto NS_v) {
+        constexpr uint32_t HD   = decltype(HD_v)::value;
+        constexpr uint32_t BR   = decltype(BR_v)::value;
+        constexpr uint32_t BC   = decltype(BC_v)::value;
+        constexpr uint32_t KPAD = decltype(KPAD_v)::value;
+        constexpr uint32_t NS   = decltype(NS_v)::value;
+        auto dispatch = [&](auto K_v, auto V_v, auto FP16O_v) {
+            constexpr bool K = decltype(K_v)::value;
+            constexpr bool V = decltype(V_v)::value;
+            constexpr bool FP16O = decltype(FP16O_v)::value;
+            cudaFuncSetAttribute(
+                fattn_prefill_mma_gqa_kernel_v2_t<HD, 6, BR, BC, NCOLS2, KPAD, K, V, NS, FP16O>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            fattn_prefill_mma_gqa_kernel_v2_t<HD, 6, BR, BC, NCOLS2, KPAD, K, V, NS, FP16O>
+                <<<grid, block, smem, stream>>>(
+                    out, partials, ms_buf, q, q_stride,
+                    static_cast<const __half *>(k_cache),
+                    static_cast<const __half *>(v_cache),
+                    n_heads, n_kv_heads, base_seq_len, batch,
+                    q_batch_stride, out_batch_stride, scale);
+        };
+        auto dispatch_fp16o = [&](auto K_v, auto V_v) {
+            if (use_fp16_o) dispatch(K_v, V_v, std::true_type{});
+            else            dispatch(K_v, V_v, std::false_type{});
+        };
+        if (use_cp_async_k && use_cp_async_v) {
+            dispatch_fp16o(std::true_type{},  std::true_type{});
+        } else if (use_cp_async_k) {
+            dispatch_fp16o(std::true_type{},  std::false_type{});
+        } else if (use_cp_async_v) {
+            dispatch_fp16o(std::false_type{}, std::true_type{});
+        } else {
+            dispatch_fp16o(std::false_type{}, std::false_type{});
+        }
+        if (NS > 1) {
+            const dim3 cgrid(n_heads, batch, 1);
+            const dim3 cblock(HD);
+            fattn_prefill_mma_gqa_combine_kernel<HD, NS>
+                <<<cgrid, cblock, 0, stream>>>(
+                    out, partials, ms_buf, batch, out_batch_stride);
+        }
+    };
+
+    auto launch_with_ns = [&](auto HD_v, auto BR_v, auto BC_v, auto KPAD_v) {
+        if (nsplit == 2) launch(HD_v, BR_v, BC_v, KPAD_v, std::integral_constant<uint32_t, 2>{});
+        else             launch(HD_v, BR_v, BC_v, KPAD_v, std::integral_constant<uint32_t, 1>{});
+    };
+    auto launch_with_kpad = [&](auto HD_v, auto BR_v, auto BC_v) {
+        if (kv_pad_choice == 8) launch_with_ns(HD_v, BR_v, BC_v, std::integral_constant<uint32_t, 8>{});
+        else                    launch_with_ns(HD_v, BR_v, BC_v, std::integral_constant<uint32_t, 0>{});
+    };
+    auto launch_with_bc = [&](auto HD_v, auto BR_v) {
+        if (bc_choice == 32) launch_with_kpad(HD_v, BR_v, std::integral_constant<uint32_t, 32>{});
+        else                 launch_with_kpad(HD_v, BR_v, std::integral_constant<uint32_t, 64>{});
+    };
+    auto launch_with_br = [&](auto HD_v) {
+        if      (br_choice == 32) launch_with_bc(HD_v, std::integral_constant<uint32_t, 32>{});
+        else if (br_choice == 16) launch_with_bc(HD_v, std::integral_constant<uint32_t, 16>{});
+        else                      launch_with_bc(HD_v, std::integral_constant<uint32_t, 8>{});
+    };
+    if (head_dim == 256) launch_with_br(std::integral_constant<uint32_t, 256>{});
+    else                 launch_with_br(std::integral_constant<uint32_t, 128>{});
+    return true;
+}
+
+// v3 launcher: BR=64 + NCOLS2=1 + Q-in-shmem. The q-rows-per-CTA lever
+// applied: 64 q-rows/CTA, 4 MMAs per K/V load. Long-T attack.
+// Currently gated to Qwen 3.6 27B's q_per_kv=6.
+bool launch_fattn_prefill_mma_gqa_v3_f16(
+        float *       out,
+        const float * q,
+        uint32_t      q_stride,
+        const void  * k_cache,
+        const void  * v_cache,
+        uint32_t      n_heads,
+        uint32_t      n_kv_heads,
+        uint32_t      head_dim,
+        uint32_t      batch,
+        uint32_t      base_seq_len,
+        uint32_t      q_batch_stride,
+        uint32_t      out_batch_stride,
+        float         scale,
+        cudaStream_t  stream) {
+    if (!(head_dim == 128 || head_dim == 256)) return false;
+    if (batch == 0) return true;
+    if (n_kv_heads == 0 || n_heads % n_kv_heads != 0) return false;
+    const uint32_t q_per_kv = n_heads / n_kv_heads;
+    if (!(q_per_kv == 6)) return false;
+
+    static const uint32_t bc_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_BC");
+        if (!e) return 32;
+        if (std::strcmp(e, "32") == 0) return 32;
+        if (std::strcmp(e, "64") == 0) return 64;
+        return 32;
+    }();
+    static const uint32_t br_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_BR");
+        if (!e) return 64;
+        if (std::strcmp(e, "32") == 0) return 32;
+        if (std::strcmp(e, "64") == 0) return 64;
+        return 64;
+    }();
+
+    const uint32_t n_blocks_q = (batch + br_choice - 1) / br_choice;
+    // Grid: each q-head is its own CTA (NCOLS2=1).
+    const dim3 grid(n_kv_heads * q_per_kv, n_blocks_q, 1);
+    const dim3 block(128);
+    const size_t smem = fattn_mma_gqa_v3_smem_bytes(head_dim, bc_choice, br_choice);
 
     static const bool use_cp_async_k = []() {
         const char *e = std::getenv("QW3_PREFILL_FA2_KCPASYNC");
@@ -3244,9 +4100,9 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
             constexpr bool K = decltype(K_v)::value;
             constexpr bool V = decltype(V_v)::value;
             cudaFuncSetAttribute(
-                fattn_prefill_mma_gqa_kernel_v2_t<HD, 6, BR, BC, NCOLS2, K, V>,
+                fattn_prefill_mma_gqa_kernel_v3_t<HD, 6, BR, BC, K, V>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-            fattn_prefill_mma_gqa_kernel_v2_t<HD, 6, BR, BC, NCOLS2, K, V>
+            fattn_prefill_mma_gqa_kernel_v3_t<HD, 6, BR, BC, K, V>
                 <<<grid, block, smem, stream>>>(
                     out, q, q_stride,
                     static_cast<const __half *>(k_cache),
@@ -3270,9 +4126,8 @@ bool launch_fattn_prefill_mma_gqa_v2_f16(
         else                 launch(HD_v, BR_v, std::integral_constant<uint32_t, 64>{});
     };
     auto launch_with_br = [&](auto HD_v) {
-        if      (br_choice == 32) launch_with_bc(HD_v, std::integral_constant<uint32_t, 32>{});
-        else if (br_choice == 16) launch_with_bc(HD_v, std::integral_constant<uint32_t, 16>{});
-        else                      launch_with_bc(HD_v, std::integral_constant<uint32_t, 8>{});
+        if (br_choice == 64) launch_with_bc(HD_v, std::integral_constant<uint32_t, 64>{});
+        else                 launch_with_bc(HD_v, std::integral_constant<uint32_t, 32>{});
     };
     if (head_dim == 256) launch_with_br(std::integral_constant<uint32_t, 256>{});
     else                 launch_with_br(std::integral_constant<uint32_t, 128>{});

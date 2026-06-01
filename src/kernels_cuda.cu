@@ -151,9 +151,23 @@ bool launch_fattn_prefill_mma_gqa_f16(
         float scale, cudaStream_t stream);
 size_t fattn_prefill_mma_gqa_scratch_bytes(uint32_t batch, uint32_t n_heads,
                                             uint32_t n_kv_heads, uint32_t head_dim);
-// v2 GQA-fused kernel: BR=8 + ncols2=2 + Q-in-regs. NSPLIT=1 (no scratch).
-// Gated to q_per_kv=6 (Qwen 3.6 27B) for now.
+// v2 GQA-fused kernel: BR=8/16 + ncols2=2 + Q-in-regs. Optional split-KV
+// chosen internally by SM-saturation heuristic; when NSPLIT>1, `scratch`
+// must hold at least fattn_prefill_mma_gqa_v2_scratch_bytes() bytes for
+// per-split partials + (m, l). Gated to q_per_kv=6 (Qwen 3.6 27B).
 bool launch_fattn_prefill_mma_gqa_v2_f16(
+        float *out, void *scratch, size_t scratch_bytes,
+        const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+size_t fattn_prefill_mma_gqa_v2_scratch_bytes(uint32_t batch, uint32_t n_heads,
+                                                uint32_t n_kv_heads, uint32_t head_dim);
+// v3 GQA-fused kernel: BR=64 + ncols2=1 + Q-in-shmem. NSPLIT=1 (no scratch).
+// q-rows-per-CTA = 64 (vs v2's 32). Gated to q_per_kv=6.
+bool launch_fattn_prefill_mma_gqa_v3_f16(
         float *out,
         const float *q, uint32_t q_stride,
         const void *k_cache, const void *v_cache,
@@ -224,7 +238,7 @@ AttentionKernel attention_kernel_choice() {
 //                              (also used for decode). At prefill seq_len is
 //                              passed as 1, so pick_nsplit→1 and it runs
 //                              one block per (head, query).
-enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma, MmaPipe, MmaGqa, MmaGqaV2 };
+enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma, MmaPipe, MmaGqa, MmaGqaV2, MmaGqaV3 };
 PrefillAttnKernel prefill_attn_kernel_choice() {
     static const PrefillAttnKernel choice = []() {
         const char *env = std::getenv("QW3_PREFILL_ATTN");
@@ -235,6 +249,7 @@ PrefillAttnKernel prefill_attn_kernel_choice() {
         if (env && std::strcmp(env, "mma-pipe") == 0) return PrefillAttnKernel::MmaPipe;
         if (env && std::strcmp(env, "mma-gqa") == 0) return PrefillAttnKernel::MmaGqa;
         if (env && std::strcmp(env, "mma-gqa-v2") == 0) return PrefillAttnKernel::MmaGqaV2;
+        if (env && std::strcmp(env, "mma-gqa-v3") == 0) return PrefillAttnKernel::MmaGqaV3;
         // Default: GQA-fused MMA v2 with BR=8 + ncols2=2 q-head pack into the
         // MMA m-axis + Q-in-registers. Mirrors llama.cpp's
         // flash_attn_ext_f16<256,256,8,8> structure but with ncols2=2 (vs 8) to
@@ -263,26 +278,52 @@ uint32_t prefill_attn_min_batch() {
 }
 
 // Prefill matmul kernel selector.
-//   QW3_MATMUL=mmq    -> INT8 MMA path (m16n8k32.s8.s8.s32) directly on
-//                        Q8_0 weight + Q8_1 activations. Skips the
-//                        Q8 -> FP16 weight dequant cache and the
-//                        FP32 -> FP16 activation conversion. Parity-correct
-//                        with HGEMM (logit max-diff < 1.0; 0 top-1
-//                        mismatches over 33 steps on a smoke prompt) but
-//                        currently ~3x SLOWER than HGEMM in this v1
-//                        (16x32 tile, 1 warp / CTA, no shmem staging).
-//                        Kept off-by-default until a bigger tile (4-warp
-//                        CTA + cooperative weight shmem) catches HGEMM.
-//   QW3_MATMUL=hgemm  -> (default) cuBLAS HGEMM with on-the-fly Q8 -> FP16
-//                        weight dequant into a shared scratch buffer.
-enum class MatmulKernel { Mmq, Hgemm };
+//
+// Default is `auto`: route each call by batch size. MMQ v7 (with XOR swizzle,
+// QW3_MMQ_VERSION=7) wins at small batch (≤512) by avoiding the cuBLAS short-
+// batch autotuner cliff (+70% at T=285 in chunk=512 mode). At larger batch
+// HGEMM's wider Cutlass tiles still win, so we route batch>512 to HGEMM.
+//
+//   QW3_MATMUL=auto   -> (default) per-call: batch ≤ 512 → MMQ v7 swizzled,
+//                        batch > 512 → HGEMM. Targets the chunk=512 production
+//                        path while preserving max throughput at chunk=0.
+//
+//   QW3_MATMUL=hgemm  -> Always cuBLAS HGEMM. Per-call FP16 weight scratch
+//                        (no persistent FP16 mirror — Q8 weight stays 8-bit
+//                        in HBM), pipelined dequant on a side stream.
+//                        Best throughput at T≥2K; consumes ~3 GiB extra
+//                        scratch at chunk=512 for FP16 batch buffers.
+//
+//   QW3_MATMUL=mmq    -> Always INT8 MMA path (m16n8k32.s8.s8.s32) on the
+//                        Q8_0 weight + Q8_1 activation, no FP16 dequant
+//                        scratch. Tile/version selected via QW3_MMQ_VERSION
+//                        (default 2; 7 = best at chunk=512 after swizzle).
+//                        Use when memory pressure matters more than peak
+//                        throughput, or for short-batch regimes.
+//
+// Fallback contract: if MMQ is selected but mmq_q8() returns !st.ok (alloc
+// failure, shape constraint, launch error), q8_0_matmul transparently falls
+// back to HGEMM, and HGEMM in turn falls back to dp4a if it fails. The
+// default path therefore always reaches a working kernel even if a future
+// MMQ variant breaks at runtime.
+enum class MatmulKernel { Auto, Mmq, Hgemm };
 MatmulKernel matmul_kernel_choice() {
     static const MatmulKernel choice = []() {
         const char *env = std::getenv("QW3_MATMUL");
-        if (env && std::strcmp(env, "mmq") == 0) return MatmulKernel::Mmq;
-        return MatmulKernel::Hgemm;
+        if (env && std::strcmp(env, "mmq") == 0)   return MatmulKernel::Mmq;
+        if (env && std::strcmp(env, "hgemm") == 0) return MatmulKernel::Hgemm;
+        if (env && std::strcmp(env, "auto") == 0)  return MatmulKernel::Auto;
+        return MatmulKernel::Auto;
     }();
     return choice;
+}
+
+// Per-call routing for QW3_MATMUL=auto. Both v7 (small batch) and v8 (large
+// batch) beat HGEMM at chunk=2048 across the full T range, so the auto router
+// always selects MMQ now. The internal version select inside launch_mmq_q8_0
+// picks v7 or v8 based on batch size.
+inline bool matmul_auto_use_mmq(uint32_t batch) {
+    return batch >= 8u;
 }
 
 
@@ -2226,11 +2267,14 @@ public:
         // For batch == 1 (decode) we stay on the dp4a path which is faster.
         const uint32_t hgemm_threshold = 8;
         if (batch >= hgemm_threshold && in_stride == w.cols && out_stride == w.rows) {
-            // INT8 MMA path (opt-in via QW3_MATMUL=mmq). Operates on the raw
-            // Q8_0 weight + on-the-fly Q8_1 activation; no FP16 dequant cache,
-            // no FP32 -> FP16 activation conversion. Falls back to HGEMM on
-            // any failure (alloc, launch, shape constraint).
-            if (matmul_kernel_choice() == MatmulKernel::Mmq && (w.cols % 32) == 0) {
+            // INT8 MMA path. `auto` routes by batch size (≤512 → MMQ v7
+            // swizzled, else HGEMM); `mmq` forces MMQ unconditionally.
+            // Falls back to HGEMM on any MMQ failure (alloc, launch, shape).
+            const MatmulKernel mk = matmul_kernel_choice();
+            const bool try_mmq =
+                (mk == MatmulKernel::Mmq) ||
+                (mk == MatmulKernel::Auto && matmul_auto_use_mmq(batch));
+            if (try_mmq && (w.cols % 32) == 0) {
                 if (auto st = mmq_q8(o.ptr, w, input.ptr, batch); st.ok) return st;
             }
             DeviceStatus st = hgemm_q8(o.ptr, w, input.ptr, batch);
@@ -2440,11 +2484,14 @@ private:
     }
 
     // Returns true when the activation needs to be staged in the
-    // 144-byte block_q8_1_mmq layout (v4, v5, and v7 consume that format).
+    // 144-byte block_q8_1_mmq layout (v4, v5, v7, v8 consume that format).
+    // Default (no env set) is auto = v7/v8, both 144-B; default to true.
     static bool mmq_uses_mmq_y_layout() {
         static const bool v = []() {
             const char *e = std::getenv("QW3_MMQ_VERSION");
-            return e && (e[0] == '4' || e[0] == '5' || e[0] == '7');
+            if (!e) return true;
+            if (e[0] == 'a') return true;  // auto
+            return (e[0] == '4' || e[0] == '5' || e[0] == '7' || e[0] == '8');
         }();
         return v;
     }
@@ -3497,6 +3544,41 @@ public:
             }
         }
 
+        // GQA-fused tensor-core MMA prefill v3 (BR=64 + ncols2=1 + Q-in-shmem).
+        // Opt-in via QW3_PREFILL_ATTN=mma-gqa-v3. q-rows-per-CTA = 64 (vs v2's
+        // 32) → 4 MMAs per K/V load. Long-T attack. Falls through to v2 when
+        // q_per_kv != 6.
+        if (kv_fp16 &&
+            prefill_attn_kernel_choice() == PrefillAttnKernel::MmaGqaV3 &&
+            batch >= prefill_attn_min_batch() &&
+            (head_dim == 128 || head_dim == 256)) {
+            if (ported::launch_fattn_prefill_mma_gqa_v3_f16(
+                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch mma-gqa-v3 f16");
+            }
+            // Fallback: q_per_kv != 6 — use v2.
+            {
+                const size_t v2_need = ported::fattn_prefill_mma_gqa_v2_scratch_bytes(
+                        batch, n_heads, n_kv_heads, head_dim);
+                if (v2_need > 0) {
+                    if (auto st = ensure_prefill_gqa_scratch(v2_need); !st.ok) {
+                        return st;
+                    }
+                }
+                if (ported::launch_fattn_prefill_mma_gqa_v2_f16(
+                        o.ptr, prefill_gqa_scratch_, prefill_gqa_scratch_capacity_,
+                        qq.ptr, q_stride, kc.ptr, vc.ptr,
+                        n_heads, n_kv_heads, head_dim,
+                        batch, base_seq_len,
+                        q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                    return launch_status("cuda attention_decode_batch mma-gqa-v3 fallback mma-gqa-v2 f16");
+                }
+            }
+        }
+
         // GQA-fused tensor-core MMA prefill v2 (BR=8 + ncols2=2 + Q-in-regs).
         // Opt-in via QW3_PREFILL_ATTN=mma-gqa-v2. Mirrors llama.cpp's
         // flash_attn_ext_f16<256,256,8,8> geometry but with ncols2=2 to match
@@ -3506,8 +3588,16 @@ public:
             prefill_attn_kernel_choice() == PrefillAttnKernel::MmaGqaV2 &&
             batch >= prefill_attn_min_batch() &&
             (head_dim == 128 || head_dim == 256)) {
+            const size_t v2_need = ported::fattn_prefill_mma_gqa_v2_scratch_bytes(
+                    batch, n_heads, n_kv_heads, head_dim);
+            if (v2_need > 0) {
+                if (auto st = ensure_prefill_gqa_scratch(v2_need); !st.ok) {
+                    return st;
+                }
+            }
             if (ported::launch_fattn_prefill_mma_gqa_v2_f16(
-                    o.ptr, qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    o.ptr, prefill_gqa_scratch_, prefill_gqa_scratch_capacity_,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
                     n_heads, n_kv_heads, head_dim,
                     batch, base_seq_len,
                     q_batch_stride, out_batch_stride, scale, exec_stream_)) {

@@ -32,6 +32,13 @@ struct EngineOptions {
     std::string dump_logits_path;
     int dump_logits_top_k = 16;
     bool dump_tokens = false; // print tokenized prompt then exit
+    // Prefill chunk size override.
+    //   -1 (default) : use QW3_PREFILL_CHUNK env var, else built-in default
+    //                  (512 — memory parity with llama.cpp).
+    //    0           : disable chunking entirely (whole-prompt batch). Maximum
+    //                  throughput; peak scratch grows linearly with prompt length.
+    //   >0           : process prefill in fixed-size chunks of this many tokens.
+    int prefill_chunk = -1;
 };
 
 struct GenerationOptions {

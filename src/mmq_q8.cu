@@ -1575,6 +1575,12 @@ __global__ void mmq_q8_0_v7_kernel(
     }
 
     // Issue cp.async loads for super-block `sb` into stage `s`. Caller commits.
+    // Shmem layout is XOR-swizzled: chunk index c of row r lands at
+    // shmem column position c ^ (r & 7). This breaks the 8-way bank conflict
+    // that the row-stride-128B layout otherwise imposes (32 banks/row, so
+    // 8 lanes at the same column across 8 rows all hit one bank). Within-chunk
+    // bytes (low 4 bits) are preserved so cp.async.16 stays a contiguous 16-B
+    // write to the swizzled position.
     auto issue_sb = [&](int sb, int s) {
         // ---- W_qs: 64 rows × 128 B per row = 8192 B = 512 cp.async.16 issues
         //     / 128 threads = 4 issues/thread. Layout same as v2's MMA reader.
@@ -1584,14 +1590,16 @@ __global__ void mmq_q8_0_v7_kernel(
             const int rl     = flat >> 3;              // 0..63
             const int chunk  = flat & 7;
             const int row    = row0 + rl;
-            const int col_byte = chunk * 16;
-            int8_t *dst_p = &W_qs_buf[s][rl][col_byte];
+            // Swizzle destination chunk index by (rl & 7); source stays raw.
+            const int col_byte_dst = (chunk ^ (rl & 7)) * 16;
+            const int col_byte_src = chunk * 16;
+            int8_t *dst_p = &W_qs_buf[s][rl][col_byte_dst];
             const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
             if (in_range) {
                 const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
                 const int8_t  *qs_sb    = cuda_helpers::q8_qs_plane(row_base, n_blocks)
                                           + sb * V7M_K_STRIDE;
-                cp_async_cg_16(dst_p, qs_sb + col_byte);
+                cp_async_cg_16(dst_p, qs_sb + col_byte_src);
             } else {
                 int4 *zp = reinterpret_cast<int4 *>(dst_p);
                 *zp = make_int4(0, 0, 0, 0);
@@ -1605,13 +1613,14 @@ __global__ void mmq_q8_0_v7_kernel(
             const int bl     = flat >> 3;              // 0..63
             const int chunk  = flat & 7;
             const int batch_idx = col00 + bl;
-            const int col_byte  = chunk * 16;
-            int8_t *dst_p = &Y_qs_buf[s][bl][col_byte];
+            const int col_byte_dst = (chunk ^ (bl & 7)) * 16;
+            const int col_byte_src = chunk * 16;
+            int8_t *dst_p = &Y_qs_buf[s][bl][col_byte_dst];
             const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
             if (in_range) {
                 const block_q8_1_mmq_t *yblk =
                     ya + static_cast<size_t>(sb) * stride_y_sb + batch_idx;
-                cp_async_cg_16(dst_p, yblk->qs + col_byte);
+                cp_async_cg_16(dst_p, yblk->qs + col_byte_src);
             } else {
                 int4 *zp = reinterpret_cast<int4 *>(dst_p);
                 *zp = make_int4(0, 0, 0, 0);
@@ -1673,24 +1682,33 @@ __global__ void mmq_q8_0_v7_kernel(
         // ---------- 4 inner sub-blocks share the same shmem fill ----------
         const int rl_top = warp_id * V1_M_TILE + gid;
         const int rl_bot = rl_top + 8;
+        // Both rl_top and rl_bot have (row & 7) == gid (warp_id*16 mod 8 == 0,
+        // and the +8 leaves the low 3 bits unchanged). For Y_qs, N0+gid also
+        // has (row & 7) == gid because N0 = n*8. So the swizzle XOR collapses
+        // to a single `gid << 4` for every read in this loop.
+        const int sw = gid << 4;
 
         #pragma unroll
         for (int sub = 0; sub < V7M_NSUB; ++sub) {
             const int kb_off = sub * MMQ_QK;   // byte offset within the 128-stride row
+            // Swizzled byte offsets: low 4 bits (within-chunk position) preserved,
+            // chunk index (bits 4..6) XORed with (row & 7) == gid.
+            const int off_lo = (kb_off ^ sw) + 4 * tid4;
+            const int off_hi = ((kb_off + 16) ^ sw) + 4 * tid4;
 
             // A fragment: same per-lane reads as v2/Phase B, just at offset kb_off.
-            const unsigned a0 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][kb_off + 4 * tid4]);
-            const unsigned a1 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][kb_off + 4 * tid4]);
-            const unsigned a2 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][kb_off + 4 * tid4 + 16]);
-            const unsigned a3 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][kb_off + 4 * tid4 + 16]);
+            const unsigned a0 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][off_lo]);
+            const unsigned a1 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][off_lo]);
+            const unsigned a2 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][off_hi]);
+            const unsigned a3 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][off_hi]);
             const float d_w_top = W_d_buf[s_cur][rl_top][sub];
             const float d_w_bot = W_d_buf[s_cur][rl_bot][sub];
 
             #pragma unroll
             for (int n = 0; n < V7M_NW; ++n) {
                 const int N0 = n * 8;
-                const unsigned b0 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][kb_off + 4 * tid4]);
-                const unsigned b1 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][kb_off + 4 * tid4 + 16]);
+                const unsigned b0 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][off_lo]);
+                const unsigned b1 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][off_hi]);
                 int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
                 mma_m16n8k32_s8s8s32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 
@@ -1730,6 +1748,296 @@ __global__ void mmq_q8_0_v7_kernel(
     }
 }
 
+// ===========================================================================
+// v8: large-tile MMQ for chunk=2048 large-batch regime.
+//
+// Combines v7's plumbing (split-plane Q8 weights, 144-B block_q8_1_mmq_t
+// activations, 2-stage cp.async pipeline, XOR-swizzled shmem, m16n8k32
+// INT8 MMA core) with v4's tile size (8-warp, 128x128 output tile).
+//
+// Why v7 alone is 10% behind HGEMM at batch>=2048: the 64x64 tile reuses
+// each K-axis read across only 64+64=128 lanes of work; cuBLAS HGEMM uses
+// ~256x128 tiles so each K-load feeds 384 lanes (~3x arithmetic intensity).
+// At large batch this becomes the ceiling.
+//
+// Why v4 alone is 56% behind HGEMM (measured): it has the right tile but
+// none of v7's plumbing — sync K loads, no XOR swizzle, no ldmatrix.x4
+// inner core, suboptimal A/B fragment cache. v8 grafts all of that on.
+//
+// Tile layout:
+//   M_PER_CTA=128 (rows), N_PER_CTA=128 (cols), NWARPS=8 (256 threads)
+//   warp(warp_id/2) -> 32-row stripe (4 stripes total: 0..3 -> rows 0,32,64,96)
+//   warp(warp_id%2) -> 16-col band   (2 bands: 0..15 / 16..31, etc.)
+// Per warp output sub-tile: 32 rows x 16 cols = 2 row-tiles x 2 col-tiles
+// (tile_C = m16n8) with ne=4 outputs/lane each -> 16 floats/lane in sum[].
+//
+// Per K-iter (super-block = 128 K elements = 4 sub-blocks of 32):
+//   W_qs: 128 rows * 128 B = 16384 B = 1024 cp.async.16 / 256 threads = 4/th
+//   Y_qs: 128 rows * 128 B = 16384 B = 4 cp.async.16/thread
+//   W_d : 128 rows * 4 fp32 = 2048 B (synchronous)
+//   Y_d : 128 rows * 4 fp32 = 2048 B (synchronous)
+// Total per stage shmem: 16+16+2+2 = 36 KB; 2 stages = 72 KB. 1 block/SM.
+//
+// XOR swizzle: identical to v7's `chunk ^ (row & 7)` (row stride = 128 B
+// = 8 chunks of 16 B). Inner-loop reads collapse to a single `gid << 4`
+// shift (same lane-row mapping as v7).
+
+static constexpr int V8_M_PER_CTA = 128;
+static constexpr int V8_N_PER_CTA = 128;
+static constexpr int V8_NWARPS    = 8;
+static constexpr int V8_THREADS   = V8_NWARPS * V2_WARP;  // 256
+static constexpr int V8_K_STRIDE  = 128;   // qs per super-block per row
+static constexpr int V8_NSUB      = 4;     // sub-blocks of 32 per super-block
+static constexpr int V8_STAGES    = 2;
+static constexpr int V8_NTX       = 2;     // 2 row-tiles per warp (32 rows)
+static constexpr int V8_NTJ       = 8;     // 8 col-tiles per warp (64 cols)
+
+template <bool need_check>
+__launch_bounds__(V8_THREADS, 1)
+__global__ void mmq_q8_0_v8_kernel(
+        const uint8_t          * __restrict__ wq,
+        const block_q8_1_mmq_t * __restrict__ ya,
+        float                  * __restrict__ dst,
+        uint32_t                  rows,
+        uint32_t                  cols,
+        uint32_t                  batch,
+        uint32_t                  stride_y_sb,
+        uint32_t                  stride_dst_row)
+{
+    extern __shared__ __align__(16) unsigned char v8_smem[];
+    // Layout: W_qs_buf [2][128][128] | Y_qs_buf [2][128][128] | W_d_buf [2][128][4] | Y_d_buf [2][128][4]
+    constexpr int W_qs_bytes = V8_STAGES * V8_M_PER_CTA * V8_K_STRIDE;            // 32768
+    constexpr int Y_qs_bytes = V8_STAGES * V8_N_PER_CTA * V8_K_STRIDE;            // 32768
+    constexpr int W_d_bytes  = V8_STAGES * V8_M_PER_CTA * V8_NSUB * 4;            // 4096
+    auto W_qs_buf = reinterpret_cast<int8_t (*)[V8_M_PER_CTA][V8_K_STRIDE]>(v8_smem);
+    auto Y_qs_buf = reinterpret_cast<int8_t (*)[V8_N_PER_CTA][V8_K_STRIDE]>(v8_smem + W_qs_bytes);
+    auto W_d_buf  = reinterpret_cast<float  (*)[V8_M_PER_CTA][V8_NSUB]>(v8_smem + W_qs_bytes + Y_qs_bytes);
+    auto Y_d_buf  = reinterpret_cast<float  (*)[V8_N_PER_CTA][V8_NSUB]>(v8_smem + W_qs_bytes + Y_qs_bytes + W_d_bytes);
+
+    const int n_blocks  = static_cast<int>(cols / MMQ_QK);
+    const int n_sblocks = static_cast<int>(cols / V8_K_STRIDE);
+    const int row0  = static_cast<int>(blockIdx.x) * V8_M_PER_CTA;
+    const int col00 = static_cast<int>(blockIdx.y) * V8_N_PER_CTA;
+
+    const int warp_id  = static_cast<int>(threadIdx.y);
+    const int lane     = static_cast<int>(threadIdx.x);
+    const int tid      = warp_id * V2_WARP + lane;
+    const int gid      = lane >> 2;
+    const int tid4     = lane & 3;
+
+    // Warp stripe (row) and band (col):
+    //   stripe = warp_id / 2  -> 0..3, row range row0 + 32*stripe + [0..32)
+    //   band   = warp_id % 2  -> 0..1, col range col00 + 64*band + [0..64)
+    const int stripe = warp_id >> 1;
+    const int band   = warp_id & 1;
+
+    // Per-warp accumulators: NTX=2 row-tiles * NTJ=8 col-tiles * 4 outputs = 64 floats.
+    float acc[V8_NTX][V8_NTJ][4];
+    #pragma unroll
+    for (int n = 0; n < V8_NTX; ++n) {
+        #pragma unroll
+        for (int t = 0; t < V8_NTJ; ++t) {
+            acc[n][t][0] = 0.0f; acc[n][t][1] = 0.0f;
+            acc[n][t][2] = 0.0f; acc[n][t][3] = 0.0f;
+        }
+    }
+
+    // Issue cp.async loads for super-block `sb` into stage `s`.
+    auto issue_sb = [&](int sb, int s) {
+        // ---- W_qs: 128 rows x 128 B = 16384 B = 1024 cp.async.16 issues
+        //     / 256 threads = 4 issues/thread. flat index = p*256 + tid.
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int flat   = p * V8_THREADS + tid;   // 0..1023
+            const int rl     = flat >> 3;              // 0..127 (row within tile)
+            const int chunk  = flat & 7;               // 0..7   (16-B chunk in row)
+            const int row    = row0 + rl;
+            const int col_byte_dst = (chunk ^ (rl & 7)) * 16;
+            const int col_byte_src = chunk * 16;
+            int8_t *dst_p = &W_qs_buf[s][rl][col_byte_dst];
+            const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
+            if (in_range) {
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                const int8_t  *qs_sb    = cuda_helpers::q8_qs_plane(row_base, n_blocks)
+                                          + sb * V8_K_STRIDE;
+                cp_async_cg_16(dst_p, qs_sb + col_byte_src);
+            } else {
+                int4 *zp = reinterpret_cast<int4 *>(dst_p);
+                *zp = make_int4(0, 0, 0, 0);
+            }
+        }
+        // ---- Y_qs: same shape (128 rows x 128 B), 4 issues/thread.
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int flat   = p * V8_THREADS + tid;
+            const int bl     = flat >> 3;
+            const int chunk  = flat & 7;
+            const int batch_idx = col00 + bl;
+            const int col_byte_dst = (chunk ^ (bl & 7)) * 16;
+            const int col_byte_src = chunk * 16;
+            int8_t *dst_p = &Y_qs_buf[s][bl][col_byte_dst];
+            const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
+            if (in_range) {
+                const block_q8_1_mmq_t *yblk =
+                    ya + static_cast<size_t>(sb) * stride_y_sb + batch_idx;
+                cp_async_cg_16(dst_p, yblk->qs + col_byte_src);
+            } else {
+                int4 *zp = reinterpret_cast<int4 *>(dst_p);
+                *zp = make_int4(0, 0, 0, 0);
+            }
+        }
+        // ---- W_d: 128 rows x 4 sub-d fp32 = 512 entries / 256 threads = 2/thread.
+        #pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int flat = p * V8_THREADS + tid;     // 0..511
+            const int rl   = flat >> 2;                // 0..127
+            const int sub  = flat & 3;
+            const int row  = row0 + rl;
+            float d = 0.0f;
+            const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
+            if (in_range) {
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                const int kb = sb * V8_NSUB + sub;
+                d = __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kb]));
+            }
+            W_d_buf[s][rl][sub] = d;
+        }
+        // ---- Y_d: 128 rows x 4 fp32 = 512 entries; 2 issues/thread.
+        #pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int flat = p * V8_THREADS + tid;
+            const int bl   = flat >> 2;
+            const int sub  = flat & 3;
+            const int batch_idx = col00 + bl;
+            float d = 0.0f;
+            const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
+            if (in_range) {
+                const block_q8_1_mmq_t *yblk =
+                    ya + static_cast<size_t>(sb) * stride_y_sb + batch_idx;
+                d = yblk->d4[sub];
+            }
+            Y_d_buf[s][bl][sub] = d;
+        }
+    };
+
+    // Prologue.
+    if (n_sblocks > 0) {
+        issue_sb(0, 0);
+        cp_async_commit();
+    }
+
+    for (int sb = 0; sb < n_sblocks; ++sb) {
+        const int s_cur  = sb & 1;
+        const int s_next = (sb + 1) & 1;
+
+        if (sb + 1 < n_sblocks) {
+            issue_sb(sb + 1, s_next);
+            cp_async_commit();
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_group<0>();
+        }
+        __syncthreads();
+
+        // Inner MMA loop. For each of 4 sub-blocks (K=32 each):
+        //   - Load A fragments for this warp's 2 row-tiles (rows = 32*stripe + 0..31)
+        //   - Load B fragments for this warp's 2 col-tiles (cols = 16*band  + 0..15)
+        //   - 4 m16n8k32 MMAs (NTX * NTJ)
+        //   - Scale and accumulate into acc[NTX][NTJ][4]
+        //
+        // Lane-row mapping for tile_C m16n8 (NVIDIA-PTX layout):
+        //   row_top = (i_tile_base) + lane/4         (i_tile_base + 0..7)
+        //   row_bot = row_top + 8                     (i_tile_base + 8..15)
+        // For row-tile n (n=0,1) within stripe `stripe`:
+        //   i_tile_base = 32*stripe + 16*n
+        // The shmem swizzle key is (row & 7) — for row_top = 32*stripe + 16*n + gid,
+        // the low 3 bits are (gid) since 32 and 16 are multiples of 8. So sw = gid<<4
+        // collapses the swizzle, identical to v7.
+        //
+        // For col-tile t (t=0,1) within band `band`:
+        //   j_base_n = 16*band + 8*t   (col 8 lanes wide per col-tile)
+        //   The B fragment row is `b_row = lane/4 = gid` (mapping into Y_qs row gid+j_base_n? no)
+        // Actually for tile_B m8n8 read from Y_qs: rows-of-Y are batch entries,
+        // cols-of-Y are K bytes. Lane mapping: each lane reads Y_qs[N0+gid][off+4*tid4]
+        // to feed the B fragment, where N0 selects the col-tile's first batch row.
+        // Same as v7, but here N0 = 16*band + 8*t for t=0..1.
+        const int sw = gid << 4;    // swizzle shift for inner reads
+
+        #pragma unroll
+        for (int sub = 0; sub < V8_NSUB; ++sub) {
+            const int kb_off = sub * MMQ_QK;
+            const int off_lo = (kb_off ^ sw) + 4 * tid4;
+            const int off_hi = ((kb_off + 16) ^ sw) + 4 * tid4;
+
+            // Load A fragments for both row-tiles. 4 ints/lane per row-tile.
+            unsigned A0[V8_NTX], A1[V8_NTX], A2[V8_NTX], A3[V8_NTX];
+            float    d_w_top[V8_NTX], d_w_bot[V8_NTX];
+            #pragma unroll
+            for (int n = 0; n < V8_NTX; ++n) {
+                const int rl_top = stripe * 32 + n * 16 + gid;
+                const int rl_bot = rl_top + 8;
+                A0[n] = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][off_lo]);
+                A1[n] = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][off_lo]);
+                A2[n] = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][off_hi]);
+                A3[n] = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][off_hi]);
+                d_w_top[n] = W_d_buf[s_cur][rl_top][sub];
+                d_w_bot[n] = W_d_buf[s_cur][rl_bot][sub];
+            }
+
+            // Load B fragments and Y scales for both col-tiles. NTJ=8.
+            #pragma unroll
+            for (int t = 0; t < V8_NTJ; ++t) {
+                const int N0 = band * 64 + t * 8;   // 0,8,...,56 within band 0; 64,...,120 within band 1
+                const unsigned b0 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][off_lo]);
+                const unsigned b1 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][off_hi]);
+
+                const float d_y_my    = Y_d_buf[s_cur][N0 + gid][sub];
+                const float d_y_left  = __shfl_sync(0xffffffffu, d_y_my, 8 * tid4,     V2_WARP);
+                const float d_y_right = __shfl_sync(0xffffffffu, d_y_my, 8 * tid4 + 4, V2_WARP);
+
+                #pragma unroll
+                for (int n = 0; n < V8_NTX; ++n) {
+                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                    mma_m16n8k32_s8s8s32(c0, c1, c2, c3,
+                                         A0[n], A1[n], A2[n], A3[n],
+                                         b0, b1);
+                    acc[n][t][0] += d_w_top[n] * d_y_left  * static_cast<float>(c0);
+                    acc[n][t][1] += d_w_top[n] * d_y_right * static_cast<float>(c1);
+                    acc[n][t][2] += d_w_bot[n] * d_y_left  * static_cast<float>(c2);
+                    acc[n][t][3] += d_w_bot[n] * d_y_right * static_cast<float>(c3);
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Writeback. Output index mapping mirrors v7's per-row-tile pair.
+    #pragma unroll
+    for (int n = 0; n < V8_NTX; ++n) {
+        const int row_top = row0 + stripe * 32 + n * 16 + gid;
+        const int row_bot = row_top + 8;
+        const bool top_in = need_check ? (row_top < static_cast<int>(rows)) : true;
+        const bool bot_in = need_check ? (row_bot < static_cast<int>(rows)) : true;
+        #pragma unroll
+        for (int t = 0; t < V8_NTJ; ++t) {
+            const int N0 = band * 64 + t * 8;
+            const int col_left  = col00 + N0 + 2 * tid4;
+            const int col_right = col_left + 1;
+            const bool left_in  = need_check ? (col_left  < static_cast<int>(batch)) : true;
+            const bool right_in = need_check ? (col_right < static_cast<int>(batch)) : true;
+            if (left_in) {
+                if (top_in) dst[static_cast<size_t>(col_left)  * stride_dst_row + row_top] = acc[n][t][0];
+                if (bot_in) dst[static_cast<size_t>(col_left)  * stride_dst_row + row_bot] = acc[n][t][2];
+            }
+            if (right_in) {
+                if (top_in) dst[static_cast<size_t>(col_right) * stride_dst_row + row_top] = acc[n][t][1];
+                if (bot_in) dst[static_cast<size_t>(col_right) * stride_dst_row + row_bot] = acc[n][t][3];
+            }
+        }
+    }
+}
+
 } // namespace
 
 bool launch_mmq_q8_0(
@@ -1752,16 +2060,29 @@ bool launch_mmq_q8_0(
     //      ldmatrix MMA core. Caller is responsible for staging activations
     //      in the Q8_1_MMQ format (144 B/block, super-block-major × j-minor)
     //      when QW3_MMQ_VERSION=4 is selected. Cached on first call.
-    static const int mmq_version = []() {
+    //
+    // Default is v7 (swizzled split-plane Q8 + cp.async + ldmatrix MMA core).
+    // v7 strictly ≥ HGEMM at every T at chunk=512 after the XOR swizzle
+    // landed (`feedback-mmq-v7-swizzle`); older v2-v6 are kept opt-in for
+    // historical comparisons only.
+    static const int mmq_version_env = []() {
         const char *e = std::getenv("QW3_MMQ_VERSION");
-        if (!e) return 2;
+        if (!e) return 0;  // 0 = auto (per-call: v7 small, v8 large)
+        if (e[0] == 'a') return 0;
+        if (e[0] == '2') return 2;
         if (e[0] == '3') return 3;
         if (e[0] == '4') return 4;
         if (e[0] == '5') return 5;
         if (e[0] == '6') return 6;
         if (e[0] == '7') return 7;
-        return 2;
+        if (e[0] == '8') return 8;
+        return 0;
     }();
+    // Auto: v8 at batch >= V8_N_PER_CTA (and rows >= V8_M_PER_CTA),
+    // else v7. v7's tail fallback handles tiny shapes already.
+    const int mmq_version = (mmq_version_env != 0)
+        ? mmq_version_env
+        : ((batch >= V8_N_PER_CTA && rows >= V8_M_PER_CTA) ? 8 : 7);
 
     // v5 with smaller mmq_x — halves sum[] register pressure to eliminate
     // the 160-byte spill v4 had, and increases #CTAs for better SM
@@ -1823,6 +2144,65 @@ bool launch_mmq_q8_0(
         } else {
             mmq_q8_0_v4_kernel<MMQ_X, false><<<grid, block, shmem_bytes, stream>>>(
                 weight, y_int, dst, rows, cols, batch, batch, stride_dst_row);
+        }
+        return true;
+    }
+
+    // v8 path: 8-warp 128×128 tile with v7's plumbing (split-plane Q8 weight,
+    // 144-B block_q8_1_mmq_t activations, 2-stage cp.async, XOR-swizzled
+    // shmem, m16n8k32 INT8 MMA core). Targets the chunk=2048 large-batch
+    // regime where v7's 64×64 tile leaves ~10% on the table vs HGEMM.
+    if (mmq_version == 8) {
+        if (cols % V8_K_STRIDE != 0) return false;
+        // Tail-chunk fallback: v8 needs batch>=128 AND rows>=128. If either is
+        // smaller, dispatch the v7 kernel — same 144-B activation layout, just a
+        // smaller tile. Avoids silently routing to v2/v3 which expect a different
+        // (36-int) layout.
+        if (rows < V8_M_PER_CTA || batch < V8_N_PER_CTA) {
+            if (rows < V7M_M_PER_CTA || batch < V7M_N_PER_CTA) return false;
+            const uint32_t row_tiles = (rows  + V7M_M_PER_CTA - 1) / V7M_M_PER_CTA;
+            const uint32_t col_tiles = (batch + V7M_N_PER_CTA - 1) / V7M_N_PER_CTA;
+            const dim3 grid(row_tiles, col_tiles, 1);
+            const dim3 block(V2_WARP, V2_NWARPS, 1);
+            const bool needs_check = (rows  % V7M_M_PER_CTA != 0) ||
+                                     (batch % V7M_N_PER_CTA != 0);
+            if (needs_check) {
+                mmq_q8_0_v7_kernel<true><<<grid, block, 0, stream>>>(
+                    weight, reinterpret_cast<const block_q8_1_mmq_t *>(y_q8_1), dst,
+                    rows, cols, batch, /*stride_y_sb=*/batch, stride_dst_row);
+            } else {
+                mmq_q8_0_v7_kernel<false><<<grid, block, 0, stream>>>(
+                    weight, reinterpret_cast<const block_q8_1_mmq_t *>(y_q8_1), dst,
+                    rows, cols, batch, /*stride_y_sb=*/batch, stride_dst_row);
+            }
+            return true;
+        }
+        const uint32_t row_tiles = (rows  + V8_M_PER_CTA - 1) / V8_M_PER_CTA;
+        const uint32_t col_tiles = (batch + V8_N_PER_CTA - 1) / V8_N_PER_CTA;
+        const dim3 grid(row_tiles, col_tiles, 1);
+        const dim3 block(V2_WARP, V8_NWARPS, 1);
+        const bool needs_check = (rows  % V8_M_PER_CTA != 0) ||
+                                 (batch % V8_N_PER_CTA != 0);
+        // Dynamic shmem: W_qs (32 KB) + Y_qs (32 KB) + W_d (4 KB) + Y_d (4 KB) = 72 KB.
+        // Above the 48 KB default — opt in to higher carveout.
+        constexpr int v8_shmem_bytes = 72 * 1024;
+        cudaError_t a1 = cudaFuncSetAttribute(mmq_q8_0_v8_kernel<true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             v8_shmem_bytes);
+        cudaError_t a2 = cudaFuncSetAttribute(mmq_q8_0_v8_kernel<false>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             v8_shmem_bytes);
+        if (a1 != cudaSuccess || a2 != cudaSuccess) {
+            return false;
+        }
+        if (needs_check) {
+            mmq_q8_0_v8_kernel<true><<<grid, block, v8_shmem_bytes, stream>>>(
+                weight, reinterpret_cast<const block_q8_1_mmq_t *>(y_q8_1), dst,
+                rows, cols, batch, /*stride_y_sb=*/batch, stride_dst_row);
+        } else {
+            mmq_q8_0_v8_kernel<false><<<grid, block, v8_shmem_bytes, stream>>>(
+                weight, reinterpret_cast<const block_q8_1_mmq_t *>(y_q8_1), dst,
+                rows, cols, batch, /*stride_y_sb=*/batch, stride_dst_row);
         }
         return true;
     }
