@@ -14,66 +14,76 @@ counterpart — it never participates in actual generation.
 
 Both engines run greedy (qw3 is always argmax; llama.cpp is invoked with
 `--temp 0`), so a correct implementation would emit identical tokens.
-Numbers below come from `scripts/long_prompt_sweep.py` (3 trials per cell,
-alternating qw3 ↔ llama.cpp to spread thermal drift), median tok/s.
+Numbers below come from `scripts/fi_sweep.py` (3 trials per cell,
+alternating qw3-default ↔ qw3+FlashInfer ↔ llama.cpp to spread thermal
+drift), median tok/s, peak HBM polled at 50 ms.
 
-**Default config — memory parity with llama.cpp.** Build runs
-`--prefill-chunk 2048` and `QW3_MATMUL=auto`, which routes every prefill
-matmul (batch ≥ 8) to the INT8-MMA path: **MMQ v8** (128×128 tile) at
-batch ≥ 128, **MMQ v7** (64×64 tile) below. HGEMM-with-FP16-dequant is no
-longer in the default path; Q8 weights stay 8-bit in HBM end-to-end. Peak
-process HBM (whole working set: model + KV + scratch + driver) sits
-~2.1 GiB above llama.cpp at every T, flat in T (chunk=2048 batch
-scratch + cuBLAS workspace, not a per-token leak).
+**Default config — FlashInfer prefill + MMQ v8 matmul, memory parity
+with llama.cpp.** Build runs `--prefill-chunk 2048` and
+`QW3_MATMUL=auto`, which routes every prefill matmul (batch ≥ 8) to
+the INT8-MMA path: **MMQ v8** (128×128 tile) at batch ≥ 128, **MMQ v7**
+(64×64 tile) below. Prefill attention runs **FlashInfer**
+(`SinglePrefillWithKVCacheDispatched<HEAD_DIM=256, kCausal, ...>`) when
+the build flag `-DQW3_ENABLE_FLASHINFER=ON` is set — the configuration
+the table below measures. Override with `QW3_PREFILL_ATTN=mma-gqa-v2`
+to restore the in-tree FA2 v2 kernel (the fallback default for builds
+without FI; numbers in the "FA2 v2 fallback" subsection below).
+HGEMM-with-FP16-dequant is no longer in the default path; Q8 weights
+stay 8-bit in HBM end-to-end. `qw3_cli` sets `CUDA_MODULE_LOADING=EAGER`
+at process init so all kernel modules resolve before the first launch
+(short prefill is no longer launch-overhead-bound, and FI's modules
+load without affecting later kernel-launch cost). Peak process HBM
+sits ~2.3 GiB above llama.cpp at every T, flat in T (chunk=2048 batch
+scratch + cuBLAS workspace + FI Q/O-pack, not a per-token leak).
 
 | Prompt tokens | qw3 prefill | llama prefill | prefill % | qw3 decode | llama decode | decode % | qw3 peak | llama peak |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-|    556 | 2412 tok/s | 2748 tok/s | **87.8%** | 45.76 tok/s | 44.43 tok/s | **103.0%** | 30.5 GiB | 29.0 GiB |
-|   2182 | 3392 tok/s | 3584 tok/s | **94.6%** | 45.45 tok/s | 44.77 tok/s | **101.5%** | 31.1 GiB | 29.0 GiB |
-|   4350 | 3711 tok/s | 3760 tok/s | **98.7%** | 44.21 tok/s | 43.88 tok/s | **100.8%** | 31.1 GiB | 29.0 GiB |
-|   8415 | 3753 tok/s | 3787 tok/s | **99.1%** | 44.25 tok/s | 43.47 tok/s | **101.8%** | 31.1 GiB | 29.0 GiB |
-|  16545 | 3617 tok/s | 3711 tok/s | **97.5%** | 42.75 tok/s | 42.74 tok/s | **100.0%** | 31.1 GiB | 29.0 GiB |
-|  33076 | 3296 tok/s | 3526 tok/s | **93.5%** | 42.27 tok/s | 41.42 tok/s | **102.1%** | 31.1 GiB | 29.0 GiB |
-|  65867 | 2772 tok/s | 3066 tok/s | **90.4%** | 38.00 tok/s | 39.07 tok/s | **97.3%** | 33.0 GiB | 30.8 GiB |
-| 131073 | 2087 tok/s | 2297 tok/s | **90.9%** | 31.69 tok/s | 35.02 tok/s | **90.5%** | 36.9 GiB | 34.7 GiB |
+|    827 | 3392 tok/s | 3213 tok/s | **105.6%** | 45.62 tok/s | 44.56 tok/s | **102.4%** | 30.8 GiB | 29.0 GiB |
+|   2453 | 3734 tok/s | 3679 tok/s | **101.5%** | 45.45 tok/s | 44.68 tok/s | **101.7%** | 31.4 GiB | 29.0 GiB |
+|   4621 | 3833 tok/s | 3720 tok/s | **103.0%** | 44.21 tok/s | 44.42 tok/s | **99.5%**  | 31.4 GiB | 29.0 GiB |
+|   8686 | 3972 tok/s | 3810 tok/s | **104.3%** | 44.34 tok/s | 42.50 tok/s | **104.3%** | 31.4 GiB | 29.0 GiB |
+|  16816 | 3909 tok/s | 3723 tok/s | **105.0%** | 42.42 tok/s | 42.65 tok/s | **99.5%**  | 31.4 GiB | 29.0 GiB |
+|  33347 | 3748 tok/s | 3519 tok/s | **106.5%** | 42.19 tok/s | 41.36 tok/s | **102.0%** | 31.4 GiB | 29.0 GiB |
+|  66138 | 3443 tok/s | 3060 tok/s | **112.5%** | 38.11 tok/s | 38.99 tok/s | **97.7%**  | 33.2 GiB | 30.9 GiB |
+| 131720 | 2940 tok/s | 2296 tok/s | **128.0%** | 31.84 tok/s | 35.01 tok/s | **91.0%**  | 37.3 GiB | 34.7 GiB |
 
-Throughput in absolute tokens/second, n_decode=32, ctx=70K (T=131K uses
-ctx=140K), default env (no overrides). Memory columns are net
-process-peak (peak `nvidia-smi memory.used` minus idle-GPU baseline)
-sampled at 50 ms while each engine runs — same instrument for both. The
-`%` columns report `qw3 / llama.cpp`. Headlines:
+Throughput in absolute tokens/second, n_decode=32, ctx=36864 (T=66K and
+T=131K bump ctx to fit). Memory columns are net process-peak (peak
+`nvidia-smi memory.used` minus idle-GPU baseline) sampled at 50 ms while
+each engine runs — same instrument for both. The `%` columns report
+`qw3 / llama.cpp`. Headlines:
 
-- **Prefill 94–99% of llama.cpp from T=2K through 32K** at memory parity.
-  Strongest cell is T=8K at 99.1%; T=16K is 97.5%; T=4K is 98.7%.
-- **Decode is 97–103% of llama.cpp across T ≤ 65K** — qw3 is faster than
-  llama.cpp on decode at every T ≤ 32K. Matvec is at HBM ceiling
+- **Prefill beats llama.cpp at every T** — 101.5–106.5% from T=2K
+  through T=33K, then widens to **+12.5% at T=66K and +28.0% at
+  T=131K**. The FlashInfer kernel closes the Tensor-Core utilization
+  gap that bottlenecked the in-tree FA2 v2 at long T (23% TC util →
+  ~65%, NCU-confirmed).
+- **Decode is 97–104% of llama.cpp through T=66K** — qw3 is faster
+  than llama.cpp on decode at every T ≤ 33K. Matvec is at HBM ceiling
   (~2.7 TB/s effective); further wins need fewer matvec calls.
-- **Short-prompt gap (T=556 at 87.8%)** is launch-overhead-bound, not
-  compute. The first-chunk dispatch + first-prompt kernel-cache warmup
-  dominates; long-T amortizes it. See development log.
-- **Long-T gap (T=65K at 90.4%, T=128K at 90.9%)** is FA2-compute-bound —
-  qw3 BR=16 NCOLS2=2 = 32 q-rows/CTA vs llama BR=8 NCOLS2=8 = 64 means
-  each K/V load feeds half as many MMAs. Levers attempted (BR=64 NCOLS2=1,
-  BR=32 NCOLS2=2, FP16-O accumulator) all hit occupancy / spill / argmax
-  walls; the q-rows-per-CTA direction is exhausted in qw3's current
-  architecture without a major rewrite.
-- **Decode regression at T=128K (90.5%)** is structural: `fattn_vec_decode`
-  scales linear in context, NSPLIT cap at 64 is saturated, and combine
-  cost grows with NSPLIT. Bumping further trades total throughput for
-  marginal split-tail relief.
+- **Decode regression at T=128K (91.0%)** is structural to
+  `fattn_vec_decode`: scales linear in context, NSPLIT cap at 64 is
+  saturated, and combine cost grows with NSPLIT. Bumping further
+  trades total throughput for marginal split-tail relief. Unrelated
+  to FlashInfer (FI is prefill-only; decode runs the existing fused
+  vec splitk kernel).
+- **Memory: +2.3 GiB at every T, flat.** Includes the ~17 MiB FI
+  Q-pack + O-pack (fp16) sharing `prefill_gqa_scratch_`. Memory
+  parity with llama.cpp is preserved end-to-end.
 
 Reproduce with:
 
 ```sh
+# qw3-default vs qw3+FlashInfer vs llama.cpp, 8 cells, 3 trials/cell:
+python3 scripts/fi_sweep.py \
+  --prompt-tokens "556 2182 4350 8415 16545 33076 65867 131073" \
+  --trials 3 -n 32 --json /tmp/fi_sweep.json
+
+# Or default-only (no FlashInfer column):
 python3 scripts/long_prompt_sweep.py \
   --prompt-tokens "512 2048 4096 8192 16384 32768 65536" \
   --trials 3 -n 32 -c 70000 \
   --json /tmp/sweep.json
-
-# Memory columns (per-T peak vs idle-GPU baseline, polls nvidia-smi at 50 ms):
-python3 scripts/memory_sweep.py \
-  --prompt-tokens "556 2182 4350 8415 16545 33076 65867 131073" \
-  --json /tmp/mem_sweep.json
 ```
 
 ### Why MMQ at every batch size
@@ -96,6 +106,71 @@ absolute throughput ceiling — at the cost of larger per-prompt scratch
 That's the right knob for short-T runs where extra throughput matters
 more than memory headroom. The default chunk=2048 is the recommended
 config for any prompt length where memory parity matters.
+
+### FA2 v2 fallback — builds without FlashInfer
+
+When `-DQW3_ENABLE_FLASHINFER=ON` is not set at build time, prefill
+attention falls back to the in-tree **FA2 v2** kernel (BR=16 NCOLS2=2
++ K/V padded shmem + selective cp.async + s_S/s_P stride pad). To
+A/B against the FI default at runtime in an FI build:
+`QW3_PREFILL_ATTN=mma-gqa-v2`. FA2 v2 vs llama.cpp under the same
+sweep:
+
+| Prompt tokens | qw3 prefill (v2) | llama prefill | prefill % | qw3 decode (v2) | llama decode | decode % |
+|---:|---:|---:|---:|---:|---:|---:|
+|    827 | 3386 tok/s | 3213 tok/s | **105.4%** | 45.68 tok/s | 44.56 tok/s | **102.5%** |
+|   2453 | 3699 tok/s | 3679 tok/s | **100.5%** | 45.49 tok/s | 44.68 tok/s | **101.8%** |
+|   4621 | 3765 tok/s | 3720 tok/s | **101.2%** | 44.79 tok/s | 44.42 tok/s | **100.8%** |
+|   8686 | 3836 tok/s | 3810 tok/s | **100.7%** | 44.60 tok/s | 42.50 tok/s | **104.9%** |
+|  16816 | 3667 tok/s | 3723 tok/s | **98.5%**  | 42.79 tok/s | 42.65 tok/s | **100.3%** |
+|  33347 | 3332 tok/s | 3519 tok/s | **94.7%**  | 42.24 tok/s | 41.36 tok/s | **102.1%** |
+|  66138 | 2813 tok/s | 3060 tok/s | **91.9%**  | 38.12 tok/s | 38.99 tok/s | **97.8%**  |
+| 131720 | 2138 tok/s | 2296 tok/s | **93.1%**  | 31.83 tok/s | 35.01 tok/s | **90.9%**  |
+
+FA2 v2 is competitive at short-to-mid T (94–105% of llama) but
+Tensor-Core-stalled at long T (T=66K = 91.9%, T=131K = 93.1%, NCU
+confirms 23% TC util vs llama's 65%). Levers attempted on FA2 v2
+(BR=64 NCOLS2=1, BR=32 NCOLS2=2, FP16-O accumulator) all hit
+occupancy / spill / argmax walls in our codebase — the q-rows-per-CTA
+direction is exhausted without a major rewrite. FlashInfer was ported
+in as the escape valve.
+
+### How the FlashInfer port is wired
+
+The adapter (`src/flashinfer_prefill_adapter.{cu,hpp}`, ~240 LoC)
+dispatches `flashinfer::SinglePrefillWithKVCacheDispatched<
+HEAD_DIM=256, KV_LAYOUT=NHD, kCausal, ...>` from inside qw3's
+attention path. Q is packed FP16 from the FP32 Q buffer, K/V are
+already FP16 in the KV cache, O is written FP16 then converted back
+to FP32 for the rest of the forward. Q-pack and O-pack share
+`prefill_gqa_scratch_`, the same scratch buffer the in-tree FA2 v2
+path uses — no extra allocation.
+
+The dispatch is gated on `batch ≥ 8` (the existing
+`QW3_PREFILL_ATTN_MIN_BATCH` knob), so it only fires for prefill, not
+decode. Decode keeps running its fused vec splitk kernel.
+
+`CUDA_MODULE_LOADING=EAGER` (set by `qw3_cli` `main()` before any CUDA
+call) is load-bearing: without it, FI's first call triggers a one-shot
+`cuLibraryLoadData` (135 ms, nsys-confirmed) that grows the CUDA
+driver's kernel registry process-wide and raises the floor cost of
+every subsequent `cudaLaunchKernel` — including decode's ~700
+launches/token, causing a flat 15% decode regression at every T. EAGER
+pre-resolves all modules at `cuInit` and eliminates the regression.
+
+Build with FlashInfer:
+
+```sh
+git clone --depth 1 https://github.com/flashinfer-ai/flashinfer.git /tmp/flashinfer
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DQW3_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real \
+  -DQW3_ENABLE_FLASHINFER=ON \
+  -DQW3_FLASHINFER_INCLUDE_DIR=/tmp/flashinfer/include
+cmake --build build -j
+```
+
+Reproduce the A/B with `scripts/fi_sweep.py` (3-way sweep:
+qw3-default vs qw3+`QW3_PREFILL_ATTN=mma-gqa-v2` vs llama.cpp).
 
 ## Build
 
@@ -168,7 +243,7 @@ useful for A/B-ing kernel choices or recovering from regressions:
 
 | Env var                     | Default | Effect |
 |---|---|---|
-| `QW3_PREFILL_ATTN`          | `mma-gqa-v2` | Prefill FA kernel: `mma-gqa-v2` (current default), `mma-gqa` (v1, 6-head loop), `mma-pipe`, `mma`, `vec`, `cublas`. |
+| `QW3_PREFILL_ATTN`          | `flashinfer` (FI build) / `mma-gqa-v2` (non-FI build) | Prefill FA kernel. `flashinfer` is the default when built with `-DQW3_ENABLE_FLASHINFER=ON` (FI port of `SinglePrefillWithKVCacheDispatched<HEAD_DIM=256,kCausal>`; beats llama at every T, +28% at T=131K). `mma-gqa-v2` is the default otherwise and the override for FI builds (in-tree FA2 v2). Other choices: `mma-gqa` (v1, 6-head loop), `mma-pipe`, `mma`, `vec`, `cublas`. |
 | `QW3_PREFILL_FA2_BR`        | `16`    | v2 q-rows-per-CTA: `8`, `16` (default), `32` (parity-correct, regresses 1.5%). |
 | `QW3_PREFILL_FA2_BC`        | `32`    | v2 K/V tile width: `32` (default — 2 blocks/SM occupancy), `64`. |
 | `QW3_PREFILL_FA2_KCPASYNC`  | `1`     | `0` reverts to sync K loads (dropped +5–7% at long T). |

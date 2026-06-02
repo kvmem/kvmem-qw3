@@ -1,0 +1,45 @@
+#pragma once
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <cstdint>
+
+namespace qw3 {
+namespace flashinfer_adapter {
+
+// FlashInfer single-prefill adapter. Two variants share the same Q/KV layout:
+//   q:   FP32 [batch, n_heads, q_stride] — Q in the first head_dim slots,
+//        sigmoid gate in the next head_dim slots (qw3 / qw3_ly convention).
+//   k/v: FP16 [seq, n_kv_heads, head_dim].
+//   out: FP32 [batch, n_heads, head_dim].
+//
+// The _gated variants apply sigmoid(gate) inside the unpack kernel — used by
+// qw3_ly which fuses the gate. The plain variants leave the gate to the
+// caller's downstream apply_attn_gate path — used by qw3 which keeps the
+// step separate. Pick one or the other, never both, or you'll double-gate.
+bool launch_prefill_f16q_f16kv_gated(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+
+bool launch_prefill_f16q_f16kv(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+
+} // namespace flashinfer_adapter
+} // namespace qw3

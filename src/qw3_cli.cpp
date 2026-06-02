@@ -1,6 +1,7 @@
 #include "qw3/gguf.hpp"
 #include "qw3/qw3.hpp"
 
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -91,6 +92,15 @@ uint64_t parse_u64(const std::string &s, const std::string &name) {
 } // namespace
 
 int main(int argc, char **argv) {
+    // Eager-load CUDA modules at process init so subsequent kernel launches
+    // hit a stabilized driver registry. Fixes a 15% decode regression that
+    // appears once FlashInfer's prefill modules get lazy-loaded mid-run, and
+    // also lifts default prefill ~10% by avoiding first-launch load stalls.
+    // Must be set before any CUDA call (driver reads it once at cuInit).
+    if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+        setenv("CUDA_MODULE_LOADING", "EAGER", 0);
+    }
+
     qw3::EngineOptions engine;
     qw3::GenerationOptions gen;
     std::string prompt;

@@ -208,6 +208,21 @@ size_t fattn_prefill_mma_gqa_v5_scratch_bytes(uint32_t batch, uint32_t n_heads,
                                               uint32_t head_dim);
 }
 
+#if QW3_ENABLE_FLASHINFER
+namespace flashinfer_adapter {
+bool launch_prefill_f16q_f16kv(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+}
+#endif
+
 namespace {
 
 // Runtime selector for the recurrent (DeltaNet) kernel. Read once on first
@@ -269,7 +284,7 @@ AttentionKernel attention_kernel_choice() {
 //                              (also used for decode). At prefill seq_len is
 //                              passed as 1, so pick_nsplit→1 and it runs
 //                              one block per (head, query).
-enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma, MmaPipe, MmaGqa, MmaGqaV2, MmaGqaV3, MmaGqaV4, MmaGqaV5 };
+enum class PrefillAttnKernel { Tiled, Vec, Cublas, Mma, MmaPipe, MmaGqa, MmaGqaV2, MmaGqaV3, MmaGqaV4, MmaGqaV5, FlashInfer };
 PrefillAttnKernel prefill_attn_kernel_choice() {
     static const PrefillAttnKernel choice = []() {
         const char *env = std::getenv("QW3_PREFILL_ATTN");
@@ -283,6 +298,14 @@ PrefillAttnKernel prefill_attn_kernel_choice() {
         if (env && std::strcmp(env, "mma-gqa-v3") == 0) return PrefillAttnKernel::MmaGqaV3;
         if (env && std::strcmp(env, "mma-gqa-v4") == 0) return PrefillAttnKernel::MmaGqaV4;
         if (env && std::strcmp(env, "mma-gqa-v5") == 0) return PrefillAttnKernel::MmaGqaV5;
+        if (env && std::strcmp(env, "flashinfer") == 0) return PrefillAttnKernel::FlashInfer;
+#if QW3_ENABLE_FLASHINFER
+        // When the FlashInfer adapter is compiled in, it is the default —
+        // +0.2 → +37.5% prefill across T at decode parity / memory parity.
+        // Override with QW3_PREFILL_ATTN=mma-gqa-v2 to restore the in-tree
+        // FA2 v2 kernel (kept as the fallback for builds without FI).
+        return PrefillAttnKernel::FlashInfer;
+#else
         // Default: GQA-fused MMA v2 with BR=8 + ncols2=2 q-head pack into the
         // MMA m-axis + Q-in-registers. Mirrors llama.cpp's
         // flash_attn_ext_f16<256,256,8,8> structure but with ncols2=2 (vs 8) to
@@ -291,6 +314,7 @@ PrefillAttnKernel prefill_attn_kernel_choice() {
         // dropping sync count from ~12/tile to 3/tile — gain grows with T.
         // Falls back to v1 (MmaGqa) when q_per_kv != 6.
         return PrefillAttnKernel::MmaGqaV2;
+#endif
     }();
     return choice;
 }
@@ -3576,6 +3600,44 @@ public:
                 return launch_status("cuda attention_decode_batch mma-pipe f16");
             }
         }
+
+#if QW3_ENABLE_FLASHINFER
+        // FlashInfer single-prefill (HEAD_DIM=256, FP16 Q, FP16 KV). DEFAULT
+        // when QW3_ENABLE_FLASHINFER=ON; override with
+        // QW3_PREFILL_ATTN=mma-gqa-v2 to restore FA2 v2. A/B vs mma-gqa-v2
+        // at the CUDA_MODULE_LOADING=EAGER baseline qw3_cli sets
+        // (2026-06-02): prefill +0.2% / +0.9% / +1.8% / +3.5% / +6.6% /
+        // +12.5% / +22.4% / +37.5% at
+        // T=827/2453/4621/8686/16816/33347/66138/131720; decode parity
+        // within ±0.3% at every T (FI doesn't run during decode — gated
+        // below the FI dispatch by batch≥8). vs llama.cpp: beats at every
+        // T (101.5–106.5% short-mid, +12.5% at T=66K, +28.0% at T=131K).
+        // Memory parity with FA2 v2 default at every T. Q-pack (fp16) +
+        // O-pack (fp16) share prefill_gqa_scratch_; no extra alloc.
+        if (kv_fp16 &&
+            prefill_attn_kernel_choice() == PrefillAttnKernel::FlashInfer &&
+            batch >= prefill_attn_min_batch() &&
+            head_dim == 256) {
+            const size_t pack_bytes =
+                static_cast<size_t>(batch) * n_heads * head_dim * sizeof(__half);
+            const size_t need = 2 * pack_bytes;
+            if (auto st = ensure_prefill_gqa_scratch(need); !st.ok) {
+                return st;
+            }
+            __half *q_pack = static_cast<__half *>(prefill_gqa_scratch_);
+            __half *o_pack = reinterpret_cast<__half *>(
+                static_cast<char *>(prefill_gqa_scratch_) + pack_bytes);
+            if (flashinfer_adapter::launch_prefill_f16q_f16kv(
+                    o.ptr, q_pack, o_pack,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch flashinfer f16");
+            }
+            // On unexpected failure (e.g. head_dim != 256), fall through to v2.
+        }
+#endif
 
         // GQA-fused tensor-core MMA prefill v5 (BR=32 NCOLS2=2 + O→shmem fp16).
         // Opt-in via QW3_PREFILL_ATTN=mma-gqa-v5. Register-pressure relief
