@@ -4132,6 +4132,620 @@ static size_t fattn_mma_gqa_v4_smem_bytes(uint32_t head_dim) {
     return s;
 }
 
+// =====================================================================
+// fattn_prefill_mma_gqa_kernel_v5_t — BR=32 NCOLS2=2 + O_acc → s_O fp16
+// =====================================================================
+//
+// q-rows-per-CTA = M_TOTAL = 64 (same as v3/v4) but with v2's lane mapping
+// preserved (NCOLS2=2 q-head pack, M_TILES=4 stacked along m-axis). The
+// register-pressure relief lever vs v2 BR=32: O accumulator moves from
+// register array O_acc[M_TILES=4][PV_N_TILES=8][4] (= 128 fp32 = 128 regs/lane)
+// to shared memory s_O[M_TOTAL=64][HD+OPAD=264] (= 33 KB, fp16). During the
+// PV inner loop, only the per-(n) accumulator strip lives in regs:
+// o_regs[M_TILES][4] = 16 fp32 = 16 regs/lane. Register pressure drops
+// 128 → 16 for O, leaving budget for Q_reg[M_TILES=4][QK_KSTEPS=16][4]
+// without the 4-KB BR=32 spill that v2 hits at the 255-reg cap.
+//
+// Tradeoffs:
+//   - Shmem: 80.75 KB (vs v2 BR=16: 35 KB). 1 block/SM (vs v2: 2 blocks/SM).
+//   - PV per (n) iter: 4 fp16 reads + 4 fp16 writes per (mt, lane) of s_O.
+//     Folded with the rescale: read O_old fp16, multiply by alpha_a/alpha_b
+//     into o_regs (eliminates v2's separate rescale phase), accumulate
+//     PV_KSTEPS=2 MMAs in regs, write back fp16. Net round-trip density:
+//     1 fp16↔fp32 round-trip per output element per tile (vs v2's 0;
+//     vs v2 USE_FP16_O's PV_KSTEPS=2 round-trips per output per tile).
+//   - Bank conflicts: O_PAD=8 halves on row stride breaks 8-way LDS
+//     conflict on group_id read pattern (same insight as KV_PAD=8 / S_PAD=4).
+//
+// FP16 round-trip parity risk: lower than v2 USE_FP16_O standalone because
+// the round-trip happens *outside* the ks loop (at the (mt, n) granularity),
+// halving the demote/promote density per output. Tested: see
+// feedback_fa2_v5_*.md.
+//
+// Shmem budget at BR=32, BC=32, KV_PAD=8, S_PAD=4, O_PAD=8:
+//   K        : 32 × 264 × 2 = 16.5 KB
+//   V        : 32 × 264 × 2 = 16.5 KB
+//   S (fp32) : 64 × 36  × 4 =  9.0 KB
+//   P (fp16) : 64 × 40  × 2 =  5.0 KB
+//   O (fp16) : 64 × 264 × 2 = 33.0 KB
+//   m,l,a    : 64 × 12      =  0.75 KB
+//   total    :              ~ 80.75 KB  (1 block/SM @ 99 KB optin)
+template <uint32_t HEAD_DIM, uint32_t Q_PER_KV, uint32_t BR, uint32_t BC,
+          uint32_t NCOLS2, uint32_t KV_PAD, uint32_t S_PAD, uint32_t O_PAD,
+          bool USE_CP_ASYNC_K, bool USE_CP_ASYNC_V, uint32_t NSPLIT>
+__global__ void
+__launch_bounds__(128, 1)
+fattn_prefill_mma_gqa_kernel_v5_t(
+        float       * __restrict__ out,
+        float       * __restrict__ partials,
+        float       * __restrict__ ms,
+        const float * __restrict__ q,
+        uint32_t     q_stride,
+        const __half* __restrict__ k_cache,
+        const __half* __restrict__ v_cache,
+        uint32_t     n_heads,
+        uint32_t     n_kv_heads,
+        uint32_t     base_seq_len,
+        uint32_t     batch,
+        uint32_t     q_batch_stride,
+        uint32_t     out_batch_stride,
+        float        scale) {
+    constexpr uint32_t WARP_SIZE = 32;
+    constexpr uint32_t NWARPS    = 4;
+    constexpr uint32_t MMA_M     = 16;
+    constexpr uint32_t MMA_N     = 8;
+    constexpr uint32_t MMA_K     = 16;
+
+    static_assert(BR == 16 || BR == 32, "v5 supports BR ∈ {16, 32}");
+    static_assert(BC == 32,              "v5 supports BC=32");
+    static_assert(NCOLS2 == 2,           "v5 supports NCOLS2=2");
+    static_assert(KV_PAD == 8,           "v5 expects KV_PAD=8");
+    static_assert(S_PAD  == 4,           "v5 expects S_PAD=4 fp32 elems");
+    static_assert(O_PAD  == 8,           "v5 expects O_PAD=8 half elems");
+    static_assert(BR % 8 == 0,           "BR must be multiple of 8");
+    static_assert(Q_PER_KV % NCOLS2 == 0,"Q_PER_KV must divide by NCOLS2");
+    static_assert(HEAD_DIM == 128 || HEAD_DIM == 256, "v5 supports HD 128/256");
+    static_assert(HEAD_DIM % MMA_K == 0,"HEAD_DIM multiple of MMA_K");
+    static_assert(BC % MMA_N == 0,      "BC multiple of MMA_N");
+    static_assert(BC % NWARPS == 0,     "BC divisible by NWARPS");
+
+    constexpr uint32_t S_STRIDE = BC + S_PAD;          // fp32 elements
+    constexpr uint32_t P_STRIDE = BC + S_PAD * 2;      // half elements
+    constexpr uint32_t O_STRIDE = HEAD_DIM + O_PAD;    // half elements
+
+    constexpr uint32_t QK_KSTEPS  = HEAD_DIM / MMA_K;          // 16
+    constexpr uint32_t QK_N_TILES = (BC / NWARPS) / MMA_N;     // 2
+    constexpr uint32_t PV_KSTEPS  = BC / MMA_K;                // 2
+    constexpr uint32_t HD_PER_WARP = HEAD_DIM / NWARPS;        // 64
+    constexpr uint32_t PV_N_TILES  = HD_PER_WARP / MMA_N;      // 8
+    constexpr uint32_t Q_GROUPS_PER_KV = Q_PER_KV / NCOLS2;    // 3
+    constexpr uint32_t Q_ROWS_PER_TILE = MMA_M / NCOLS2;       // 8
+    constexpr uint32_t M_TILES         = BR / Q_ROWS_PER_TILE; // 2@BR=16, 4@BR=32
+    constexpr uint32_t M_TOTAL         = BR * NCOLS2;          // 32@BR=16, 64@BR=32
+    static_assert(M_TILES * MMA_M == M_TOTAL, "M_TILES*MMA_M==M_TOTAL");
+    static_assert(M_TOTAL % NWARPS == 0,      "M_TOTAL divisible by NWARPS");
+
+    constexpr uint32_t HEAD_STRIDE = HEAD_DIM + KV_PAD;
+
+    const uint32_t kvg_idx  = blockIdx.x;
+    const uint32_t kv_head  = kvg_idx / Q_GROUPS_PER_KV;
+    const uint32_t q_group  = kvg_idx % Q_GROUPS_PER_KV;
+    const uint32_t block_q  = blockIdx.y;
+    const uint32_t k_split  = blockIdx.z;
+    const uint32_t tid      = threadIdx.x;
+    const uint32_t warp     = tid / WARP_SIZE;
+    const uint32_t lane     = tid % WARP_SIZE;
+    if (kv_head >= n_kv_heads) return;
+    const uint32_t head_base = kv_head * Q_PER_KV + q_group * NCOLS2;
+
+    const uint32_t group_id = lane / 4;
+    const uint32_t in_group = lane % 4;
+
+    constexpr uint32_t C_A = 0;
+    constexpr uint32_t C_B = 1;
+    const uint32_t r_a = group_id;
+    const uint32_t r_b = group_id;
+
+    uint32_t block_max_q = block_q * BR + BR;
+    if (block_max_q > batch) block_max_q = batch;
+    const uint32_t block_max_kv = base_seq_len + block_max_q;
+
+    uint32_t kv_lo, kv_hi;
+    if (NSPLIT == 1) {
+        kv_lo = 0;
+        kv_hi = block_max_kv;
+    } else {
+        const uint32_t kv_total = base_seq_len + batch;
+        const uint32_t per_split = ((kv_total + NSPLIT - 1) / NSPLIT + BC - 1) & ~uint32_t(BC - 1);
+        kv_lo = k_split * per_split;
+        kv_hi = kv_lo + per_split;
+        if (kv_hi > block_max_kv) kv_hi = block_max_kv;
+        if (kv_lo >= kv_hi) {
+            #pragma unroll
+            for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+                const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+                const uint32_t head_a  = head_base + C_A;
+                const uint32_t head_b  = head_base + C_B;
+                if (warp == 0 && in_group == 0) {
+                    if (q_idx_a < batch) {
+                        const uint64_t mb = ((uint64_t)head_a * batch + q_idx_a) * NSPLIT + k_split;
+                        ms[mb * 2 + 0] = -INFINITY;
+                        ms[mb * 2 + 1] = 0.0f;
+                    }
+                    if (q_idx_b < batch) {
+                        const uint64_t mb = ((uint64_t)head_b * batch + q_idx_b) * NSPLIT + k_split;
+                        ms[mb * 2 + 0] = -INFINITY;
+                        ms[mb * 2 + 1] = 0.0f;
+                    }
+                }
+                #pragma unroll
+                for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                    const uint32_t n0 = warp * HD_PER_WARP + n * MMA_N;
+                    const uint32_t col = n0 + in_group * 2;
+                    if (q_idx_a < batch) {
+                        const uint64_t pbase = (((uint64_t)head_a * batch + q_idx_a)
+                                                * NSPLIT + k_split) * HEAD_DIM;
+                        partials[pbase + col + 0] = 0.0f;
+                        partials[pbase + col + 1] = 0.0f;
+                    }
+                    if (q_idx_b < batch) {
+                        const uint64_t pbase = (((uint64_t)head_b * batch + q_idx_b)
+                                                * NSPLIT + k_split) * HEAD_DIM;
+                        partials[pbase + col + 0] = 0.0f;
+                        partials[pbase + col + 1] = 0.0f;
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    extern __shared__ char smem_raw[];
+    char *p = smem_raw;
+    __half *s_K     = reinterpret_cast<__half *>(p); p += BC * HEAD_STRIDE * sizeof(__half);
+    __half *s_V_buf = reinterpret_cast<__half *>(p); p += BC * HEAD_STRIDE * sizeof(__half);
+    float  *s_S     = reinterpret_cast<float  *>(p); p += M_TOTAL * S_STRIDE * sizeof(float);
+    __half *s_P     = reinterpret_cast<__half *>(p); p += M_TOTAL * P_STRIDE * sizeof(__half);
+    __half *s_O     = reinterpret_cast<__half *>(p); p += M_TOTAL * O_STRIDE * sizeof(__half);
+    float  *s_m     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    float  *s_l     = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+    float  *s_alpha = reinterpret_cast<float  *>(p); p += M_TOTAL          * sizeof(float);
+
+    // ---- Q in registers (same packing as v2) -----------------------------
+    unsigned Q_reg[M_TILES][QK_KSTEPS][4];
+    {
+        const uint32_t head_a = head_base + C_A;
+        const uint32_t head_b = head_base + C_B;
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+            const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+            const bool a_active = (q_idx_a < batch);
+            const bool b_active = (q_idx_b < batch);
+            const float *qa = a_active
+                ? (q + (uint64_t)q_idx_a * q_batch_stride + head_a * q_stride) : nullptr;
+            const float *qb = b_active
+                ? (q + (uint64_t)q_idx_b * q_batch_stride + head_b * q_stride) : nullptr;
+            #pragma unroll
+            for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+                const uint32_t k0 = ks * MMA_K;
+                const uint32_t col0 = k0 + in_group * 2;
+                const __half qa0 = qa ? __float2half(qa[col0 + 0]) : (__half)0;
+                const __half qa1 = qa ? __float2half(qa[col0 + 1]) : (__half)0;
+                const __half qb0 = qb ? __float2half(qb[col0 + 0]) : (__half)0;
+                const __half qb1 = qb ? __float2half(qb[col0 + 1]) : (__half)0;
+                const __half qa8 = qa ? __float2half(qa[col0 + 8]) : (__half)0;
+                const __half qa9 = qa ? __float2half(qa[col0 + 9]) : (__half)0;
+                const __half qb8 = qb ? __float2half(qb[col0 + 8]) : (__half)0;
+                const __half qb9 = qb ? __float2half(qb[col0 + 9]) : (__half)0;
+                Q_reg[mt][ks][0] = mma_detail::pack2h(qa0, qa1);
+                Q_reg[mt][ks][1] = mma_detail::pack2h(qb0, qb1);
+                Q_reg[mt][ks][2] = mma_detail::pack2h(qa8, qa9);
+                Q_reg[mt][ks][3] = mma_detail::pack2h(qb8, qb9);
+            }
+        }
+    }
+
+    if (tid < M_TOTAL) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+    // Initialize s_O = 0 so the first-tile rescale (alpha=0) reads zeros
+    // instead of uninitialized halves (NaN safety: 0 * NaN = NaN).
+    {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t TOTAL_HALVES  = M_TOTAL * O_STRIDE;
+        constexpr uint32_t STEPS_PER_THR = (TOTAL_HALVES + 128 * HALVES_PER_LD - 1)
+                                         / (128 * HALVES_PER_LD);
+        const int4 zero4 = make_int4(0, 0, 0, 0);
+        #pragma unroll
+        for (uint32_t step = 0; step < STEPS_PER_THR; ++step) {
+            const uint32_t off = (step * 128 + tid) * HALVES_PER_LD;
+            if (off + HALVES_PER_LD <= TOTAL_HALVES) {
+                *reinterpret_cast<int4 *>(&s_O[off]) = zero4;
+            } else {
+                #pragma unroll
+                for (uint32_t i = 0; i < HALVES_PER_LD; ++i) {
+                    if (off + i < TOTAL_HALVES) s_O[off + i] = (__half)0;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    auto issue_K = [&](uint32_t t0_target) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0_target + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            __half *dst = &s_K[shm_t * HEAD_STRIDE + base_d];
+            const bool in_range = (t < block_max_kv);
+            if (USE_CP_ASYNC_K) {
+                if (in_range) {
+                    const __half *k_src = k_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    mma_detail::cp_async_cg_16(dst, k_src);
+                } else {
+                    mma_detail::cp_async_zero_16(dst);
+                }
+            } else {
+                int4 *dst4 = reinterpret_cast<int4 *>(dst);
+                if (in_range) {
+                    const __half *k_src = k_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *dst4 = *reinterpret_cast<const int4 *>(k_src);
+                } else {
+                    int4 z; z.x = z.y = z.z = z.w = 0;
+                    *dst4 = z;
+                }
+            }
+        }
+    };
+
+    auto issue_V = [&](uint32_t t0_target) {
+        constexpr uint32_t HALVES_PER_LD = 8;
+        constexpr uint32_t LANES_PER_ROW = HEAD_DIM / HALVES_PER_LD;
+        constexpr uint32_t TOKENS_PER_PASS = 128 / LANES_PER_ROW;
+        constexpr uint32_t N_PASS = BC / TOKENS_PER_PASS;
+        const uint32_t row_in_pass = tid / LANES_PER_ROW;
+        const uint32_t col_lane    = tid % LANES_PER_ROW;
+        #pragma unroll
+        for (uint32_t pass = 0; pass < N_PASS; ++pass) {
+            const uint32_t shm_t = pass * TOKENS_PER_PASS + row_in_pass;
+            const uint32_t t     = t0_target + shm_t;
+            const uint32_t base_d = col_lane * HALVES_PER_LD;
+            const bool in_range = (t < block_max_kv);
+            if (USE_CP_ASYNC_V) {
+                __half *dst = &s_V_buf[shm_t * HEAD_STRIDE + base_d];
+                if (in_range) {
+                    const __half *v_src = v_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    mma_detail::cp_async_cg_16(dst, v_src);
+                } else {
+                    mma_detail::cp_async_zero_16(dst);
+                }
+            } else {
+                __half v8[HALVES_PER_LD];
+                if (in_range) {
+                    const __half *v_src = v_cache
+                        + (uint64_t)t * n_kv_heads * HEAD_DIM
+                        + kv_head * HEAD_DIM + base_d;
+                    *reinterpret_cast<int4 *>(v8) = *reinterpret_cast<const int4 *>(v_src);
+                } else {
+                    *reinterpret_cast<int4 *>(v8) = make_int4(0,0,0,0);
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < HALVES_PER_LD; ++i) {
+                    s_V_buf[(base_d + i) * BC + shm_t] = v8[i];
+                }
+            }
+        }
+    };
+
+    if (USE_CP_ASYNC_K) { issue_K(kv_lo); mma_detail::cp_async_commit(); }
+    if (USE_CP_ASYNC_V) { issue_V(kv_lo); mma_detail::cp_async_commit(); }
+
+    // ---- Tile loop -------------------------------------------------------
+    for (uint32_t t0 = kv_lo; t0 < kv_hi; t0 += BC) {
+
+        if (USE_CP_ASYNC_K && USE_CP_ASYNC_V) {
+            mma_detail::cp_async_wait_group<1>();
+        } else if (USE_CP_ASYNC_K) {
+            mma_detail::cp_async_wait_group<0>();
+        }
+        if (!USE_CP_ASYNC_K) issue_K(t0);
+        if (!USE_CP_ASYNC_V) issue_V(t0);
+        __syncthreads();
+
+        // QK^T phase. Same as v2.
+        float c_h[M_TILES][QK_N_TILES][4];
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            #pragma unroll
+            for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                c_h[mt][nq][0]=0.f; c_h[mt][nq][1]=0.f;
+                c_h[mt][nq][2]=0.f; c_h[mt][nq][3]=0.f;
+            }
+        }
+        #pragma unroll
+        for (uint32_t ks = 0; ks < QK_KSTEPS; ++ks) {
+            const uint32_t k0 = ks * MMA_K;
+            #pragma unroll
+            for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                const uint32_t kv_col = warp * (BC / NWARPS) + nq * MMA_N + group_id;
+                const __half *krow0 = &s_K[kv_col * HEAD_STRIDE + k0 + in_group * 2];
+                const unsigned b0 = mma_detail::pack2h(krow0);
+                const unsigned b1 = mma_detail::pack2h(krow0 + 8);
+                #pragma unroll
+                for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                    mma_detail::mma_m16n8k16_f16f16f32(
+                        c_h[mt][nq][0], c_h[mt][nq][1], c_h[mt][nq][2], c_h[mt][nq][3],
+                        Q_reg[mt][ks][0], Q_reg[mt][ks][1], Q_reg[mt][ks][2], Q_reg[mt][ks][3],
+                        b0, b1);
+                }
+            }
+        }
+
+        if (USE_CP_ASYNC_K) {
+            const uint32_t t0_next = t0 + BC;
+            if (t0_next < kv_hi) { issue_K(t0_next); mma_detail::cp_async_commit(); }
+        }
+
+        // Write S to shmem with causal mask. Same lane mapping as v2.
+        {
+            #pragma unroll
+            for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+                const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+                const bool a_active = (q_idx_a < batch);
+                const bool b_active = (q_idx_b < batch);
+                const uint32_t my_max_kv_a = base_seq_len + q_idx_a + 1;
+                const uint32_t my_max_kv_b = base_seq_len + q_idx_b + 1;
+                const uint32_t m_a = mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a;
+                const uint32_t m_b = mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b;
+                #pragma unroll
+                for (uint32_t nq = 0; nq < QK_N_TILES; ++nq) {
+                    const uint32_t base_col = warp * (BC / NWARPS) + nq * MMA_N + in_group * 2;
+                    const uint32_t t_a0 = t0 + base_col;
+                    const uint32_t t_a1 = t0 + base_col + 1;
+                    float v00 = (a_active && t_a0 < my_max_kv_a) ? c_h[mt][nq][0] * scale : -INFINITY;
+                    float v01 = (a_active && t_a1 < my_max_kv_a) ? c_h[mt][nq][1] * scale : -INFINITY;
+                    float v02 = (b_active && t_a0 < my_max_kv_b) ? c_h[mt][nq][2] * scale : -INFINITY;
+                    float v03 = (b_active && t_a1 < my_max_kv_b) ? c_h[mt][nq][3] * scale : -INFINITY;
+                    s_S[m_a * S_STRIDE + base_col + 0] = v00;
+                    s_S[m_a * S_STRIDE + base_col + 1] = v01;
+                    s_S[m_b * S_STRIDE + base_col + 0] = v02;
+                    s_S[m_b * S_STRIDE + base_col + 1] = v03;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // Online softmax. Same as v2.
+        constexpr uint32_t ROWS_PER_WARP = M_TOTAL / NWARPS;
+        constexpr uint32_t COLS_PER_LANE = BC / WARP_SIZE;
+        #pragma unroll
+        for (uint32_t r = 0; r < ROWS_PER_WARP; ++r) {
+            const uint32_t m_row = warp * ROWS_PER_WARP + r;
+            float local_max = -INFINITY;
+            float s_vals[COLS_PER_LANE];
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                s_vals[cc] = s_S[m_row * S_STRIDE + lane * COLS_PER_LANE + cc];
+                if (s_vals[cc] > local_max) local_max = s_vals[cc];
+            }
+            const float row_max = cuda_helpers::warp_reduce_max<32>(local_max);
+            const float prev_m = s_m[m_row];
+            const float new_m  = fmaxf(prev_m, row_max);
+            float local_sum = 0.0f;
+            __half pvals[COLS_PER_LANE];
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                const float p_val = (s_vals[cc] == -INFINITY) ? 0.0f
+                                                              : __expf(s_vals[cc] - new_m);
+                local_sum += p_val;
+                pvals[cc] = __float2half(p_val);
+            }
+            const float row_sum = cuda_helpers::warp_reduce_sum<32>(local_sum);
+            const float prev_l  = s_l[m_row];
+            const float alpha   = (prev_m == -INFINITY) ? 0.0f : __expf(prev_m - new_m);
+            const float new_l   = prev_l * alpha + row_sum;
+            if (lane == 0) {
+                s_m[m_row]     = new_m;
+                s_l[m_row]     = new_l;
+                s_alpha[m_row] = alpha;
+            }
+            #pragma unroll
+            for (uint32_t cc = 0; cc < COLS_PER_LANE; ++cc) {
+                s_P[m_row * P_STRIDE + lane * COLS_PER_LANE + cc] = pvals[cc];
+            }
+        }
+
+        if (USE_CP_ASYNC_V) {
+            const bool k_next_pending = USE_CP_ASYNC_K && (t0 + BC < kv_hi);
+            if (k_next_pending) mma_detail::cp_async_wait_group<1>();
+            else                mma_detail::cp_async_wait_group<0>();
+        }
+        __syncthreads();
+
+        // Per-row alpha for rescale fold (same packing as v2).
+        float alpha_a[M_TILES], alpha_b[M_TILES];
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            alpha_a[mt] = s_alpha[mt * MMA_M + group_id];
+            alpha_b[mt] = s_alpha[mt * MMA_M + group_id + 8];
+        }
+
+        // ---- PV with O in shmem ------------------------------------------
+        // Loop nest: for each n, for each mt, hold a 4-fp32 accumulator strip
+        // in regs across PV_KSTEPS MMAs. At strip start, read fp16 O_old from
+        // s_O and multiply by alpha (folds rescale into PV). At strip end,
+        // demote to fp16 and write back to s_O.
+        //
+        // V is loaded M_TILES times more than v2 (mt is now inside n, ks).
+        // PV_KSTEPS=2 here so V issue count = PV_N_TILES * PV_KSTEPS * M_TILES
+        // = 8*2*4 = 64 ldmatrix.x2 per warp per tile (vs v2: 16). Cheap; the
+        // win is the register-pressure relief (O_acc 128 → 16 regs/lane).
+        #pragma unroll
+        for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+            const uint32_t n0  = warp * HD_PER_WARP + n * MMA_N;
+            const uint32_t col = n0 + in_group * 2;
+
+            #pragma unroll
+            for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+                const uint32_t m_a = mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a;
+                const uint32_t m_b = mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b;
+
+                // Read O_old (fp16) + rescale by alpha → 4 fp32 regs.
+                const __half h0 = s_O[m_a * O_STRIDE + col + 0];
+                const __half h1 = s_O[m_a * O_STRIDE + col + 1];
+                const __half h2 = s_O[m_b * O_STRIDE + col + 0];
+                const __half h3 = s_O[m_b * O_STRIDE + col + 1];
+                float o0 = __half2float(h0) * alpha_a[mt];
+                float o1 = __half2float(h1) * alpha_a[mt];
+                float o2 = __half2float(h2) * alpha_b[mt];
+                float o3 = __half2float(h3) * alpha_b[mt];
+
+                #pragma unroll
+                for (uint32_t ks = 0; ks < PV_KSTEPS; ++ks) {
+                    const uint32_t k0 = ks * MMA_K;
+                    unsigned b0, b1;
+                    if (USE_CP_ASYNC_V) {
+                        const __half *vbase = &s_V_buf[k0 * HEAD_STRIDE + n0];
+                        mma_detail::ldmatrix_x2_b_trans(b0, b1, vbase, HEAD_STRIDE);
+                    } else {
+                        const uint32_t out_col = n0 + group_id;
+                        const __half *vrow0 = &s_V_buf[out_col * BC + k0 + in_group * 2];
+                        b0 = mma_detail::pack2h(vrow0);
+                        b1 = mma_detail::pack2h(vrow0 + 8);
+                    }
+                    unsigned a0, a1, a2, a3;
+                    mma_detail::ldmatrix_x4_a(a0, a1, a2, a3,
+                                              &s_P[mt * MMA_M * P_STRIDE + k0], P_STRIDE);
+                    mma_detail::mma_m16n8k16_f16f16f32(
+                        o0, o1, o2, o3, a0, a1, a2, a3, b0, b1);
+                }
+
+                // Demote to fp16 and write back to s_O.
+                s_O[m_a * O_STRIDE + col + 0] = __float2half(o0);
+                s_O[m_a * O_STRIDE + col + 1] = __float2half(o1);
+                s_O[m_b * O_STRIDE + col + 0] = __float2half(o2);
+                s_O[m_b * O_STRIDE + col + 1] = __float2half(o3);
+            }
+        }
+
+        if (USE_CP_ASYNC_V) {
+            const uint32_t t0_next = t0 + BC;
+            if (t0_next < kv_hi) { issue_V(t0_next); mma_detail::cp_async_commit(); }
+        }
+    }
+
+    // ---- Final write -----------------------------------------------------
+    // Each warp owns its own [n0, n0+HD_PER_WARP) cols of s_O, and each lane
+    // wrote/reads exactly its own (m_a, m_b, col) cells, so no inter-thread
+    // sync is needed before reading s_O for global write.
+    {
+        const uint32_t head_a = head_base + C_A;
+        const uint32_t head_b = head_base + C_B;
+        #pragma unroll
+        for (uint32_t mt = 0; mt < M_TILES; ++mt) {
+            const uint32_t q_idx_a = block_q * BR + mt * Q_ROWS_PER_TILE + r_a;
+            const uint32_t q_idx_b = block_q * BR + mt * Q_ROWS_PER_TILE + r_b;
+            const uint32_t m_a = mt * MMA_M + C_A * Q_ROWS_PER_TILE + r_a;
+            const uint32_t m_b = mt * MMA_M + C_B * Q_ROWS_PER_TILE + r_b;
+            const float l_a = s_l[m_a];
+            const float l_b = s_l[m_b];
+            if (NSPLIT == 1) {
+                const float inv_la = (l_a > 0.0f) ? (1.0f / l_a) : 0.0f;
+                const float inv_lb = (l_b > 0.0f) ? (1.0f / l_b) : 0.0f;
+                float * const out_a = (q_idx_a < batch)
+                    ? (out + (uint64_t)q_idx_a * out_batch_stride + head_a * HEAD_DIM) : nullptr;
+                float * const out_b = (q_idx_b < batch)
+                    ? (out + (uint64_t)q_idx_b * out_batch_stride + head_b * HEAD_DIM) : nullptr;
+                #pragma unroll
+                for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                    const uint32_t n0  = warp * HD_PER_WARP + n * MMA_N;
+                    const uint32_t col = n0 + in_group * 2;
+                    if (out_a) {
+                        out_a[col + 0] = __half2float(s_O[m_a * O_STRIDE + col + 0]) * inv_la;
+                        out_a[col + 1] = __half2float(s_O[m_a * O_STRIDE + col + 1]) * inv_la;
+                    }
+                    if (out_b) {
+                        out_b[col + 0] = __half2float(s_O[m_b * O_STRIDE + col + 0]) * inv_lb;
+                        out_b[col + 1] = __half2float(s_O[m_b * O_STRIDE + col + 1]) * inv_lb;
+                    }
+                }
+            } else {
+                float * const part_a = (q_idx_a < batch)
+                    ? (partials + (((uint64_t)head_a * batch + q_idx_a)
+                                   * NSPLIT + k_split) * HEAD_DIM) : nullptr;
+                float * const part_b = (q_idx_b < batch)
+                    ? (partials + (((uint64_t)head_b * batch + q_idx_b)
+                                   * NSPLIT + k_split) * HEAD_DIM) : nullptr;
+                #pragma unroll
+                for (uint32_t n = 0; n < PV_N_TILES; ++n) {
+                    const uint32_t n0  = warp * HD_PER_WARP + n * MMA_N;
+                    const uint32_t col = n0 + in_group * 2;
+                    if (part_a) {
+                        part_a[col + 0] = __half2float(s_O[m_a * O_STRIDE + col + 0]);
+                        part_a[col + 1] = __half2float(s_O[m_a * O_STRIDE + col + 1]);
+                    }
+                    if (part_b) {
+                        part_b[col + 0] = __half2float(s_O[m_b * O_STRIDE + col + 0]);
+                        part_b[col + 1] = __half2float(s_O[m_b * O_STRIDE + col + 1]);
+                    }
+                }
+                if (warp == 0 && in_group == 0) {
+                    const float m_a_v = s_m[m_a];
+                    const float m_b_v = s_m[m_b];
+                    if (q_idx_a < batch) {
+                        const uint64_t mb = ((uint64_t)head_a * batch + q_idx_a) * NSPLIT + k_split;
+                        ms[mb * 2 + 0] = m_a_v;
+                        ms[mb * 2 + 1] = l_a;
+                    }
+                    if (q_idx_b < batch) {
+                        const uint64_t mb = ((uint64_t)head_b * batch + q_idx_b) * NSPLIT + k_split;
+                        ms[mb * 2 + 0] = m_b_v;
+                        ms[mb * 2 + 1] = l_b;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static size_t fattn_mma_gqa_v5_smem_bytes(uint32_t head_dim, uint32_t bc, uint32_t br) {
+    constexpr uint32_t NCOLS2 = 2;
+    constexpr uint32_t KV_PAD = 8;
+    constexpr uint32_t S_PAD  = 4;
+    constexpr uint32_t O_PAD  = 8;
+    const uint32_t M_TOTAL    = br * NCOLS2;
+    const uint32_t hd_stride  = head_dim + KV_PAD;
+    const uint32_t s_stride   = bc + S_PAD;
+    const uint32_t p_stride   = bc + S_PAD * 2;
+    const uint32_t o_stride   = head_dim + O_PAD;
+    size_t s = 0;
+    s += bc      * hd_stride * sizeof(__half);   // K
+    s += bc      * hd_stride * sizeof(__half);   // V
+    s += M_TOTAL * s_stride  * sizeof(float);    // S
+    s += M_TOTAL * p_stride  * sizeof(__half);   // P
+    s += M_TOTAL * o_stride  * sizeof(__half);   // O (fp16, in shmem)
+    s += M_TOTAL             * sizeof(float) * 3;// m, l, alpha
+    return s;
+}
+
 
 // Combine kernel: merges NSPLIT partial (m, l, O_un_normalized) tuples per
 // (head, q_token) via online softmax, divides by the merged denominator, and
@@ -4901,6 +5515,138 @@ bool launch_fattn_prefill_mma_gqa_v4_f16(
     };
     if (head_dim == 256) launch_with_ns(std::integral_constant<uint32_t, 256>{});
     else                 launch_with_ns(std::integral_constant<uint32_t, 128>{});
+    return true;
+}
+
+size_t fattn_prefill_mma_gqa_v5_scratch_bytes(uint32_t batch, uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim) {
+    if (n_kv_heads == 0 || n_heads % n_kv_heads != 0) return 0;
+    const uint32_t q_per_kv = n_heads / n_kv_heads;
+    if (q_per_kv != 6) return 0;
+    if (!(head_dim == 128 || head_dim == 256)) return 0;
+    constexpr uint32_t MAX_NSPLIT = 2;
+    return (size_t)n_heads * batch * MAX_NSPLIT * head_dim * sizeof(float)
+         + (size_t)n_heads * batch * MAX_NSPLIT * 2        * sizeof(float);
+}
+
+bool launch_fattn_prefill_mma_gqa_v5_f16(
+        float *       out,
+        void  *       scratch,
+        size_t        scratch_bytes,
+        const float * q,
+        uint32_t      q_stride,
+        const void  * k_cache,
+        const void  * v_cache,
+        uint32_t      n_heads,
+        uint32_t      n_kv_heads,
+        uint32_t      head_dim,
+        uint32_t      batch,
+        uint32_t      base_seq_len,
+        uint32_t      q_batch_stride,
+        uint32_t      out_batch_stride,
+        float         scale,
+        cudaStream_t  stream) {
+    if (!(head_dim == 128 || head_dim == 256)) return false;
+    if (batch == 0) return true;
+    if (n_kv_heads == 0 || n_heads % n_kv_heads != 0) return false;
+    const uint32_t q_per_kv = n_heads / n_kv_heads;
+    if (q_per_kv != 6) return false;
+
+    constexpr uint32_t NCOLS2  = 2;
+    constexpr uint32_t BC      = 32;
+    constexpr uint32_t KV_PAD  = 8;
+    constexpr uint32_t S_PAD   = 4;
+    constexpr uint32_t O_PAD   = 8;
+
+    static const bool use_cp_async_k = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_KCPASYNC");
+        if (!e) return true;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
+    static const bool use_cp_async_v = []() {
+        const char *e = std::getenv("QW3_PREFILL_FA2_VCPASYNC");
+        if (!e) return true;
+        return !(std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0);
+    }();
+    // BR knob: default 32 (the lever). BR=16 is supported as an A/B knob to
+    // isolate the O→shmem cost from the q-rows-per-CTA win.
+    static const uint32_t br_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_V5_BR");
+        if (!e) return 32;
+        if (std::strcmp(e, "16") == 0) return 16;
+        if (std::strcmp(e, "32") == 0) return 32;
+        return 32;
+    }();
+
+    const uint32_t n_blocks_q = (batch + br_choice - 1) / br_choice;
+
+    static const uint32_t v5_nsplit_choice = []() -> uint32_t {
+        const char *e = std::getenv("QW3_PREFILL_FA2_NSPLIT");
+        if (!e) return 1;
+        if (std::strcmp(e, "1") == 0) return 1;
+        if (std::strcmp(e, "2") == 0) return 2;
+        return 1;
+    }();
+    const uint32_t nsplit = v5_nsplit_choice;
+    float *partials = nullptr, *ms_buf = nullptr;
+    if (nsplit > 1) {
+        const size_t need = (size_t)n_heads * batch * nsplit * head_dim * sizeof(float)
+                          + (size_t)n_heads * batch * nsplit * 2        * sizeof(float);
+        if (!scratch || scratch_bytes < need) return false;
+        partials = static_cast<float *>(scratch);
+        ms_buf   = partials + (size_t)n_heads * batch * nsplit * head_dim;
+    }
+    const dim3 grid(n_kv_heads * (q_per_kv / NCOLS2), n_blocks_q, nsplit);
+    const dim3 block(128);
+    const size_t smem = fattn_mma_gqa_v5_smem_bytes(head_dim, BC, br_choice);
+
+    auto launch = [&](auto HD_v, auto BR_v, auto NS_v) {
+        constexpr uint32_t HD = decltype(HD_v)::value;
+        constexpr uint32_t BR = decltype(BR_v)::value;
+        constexpr uint32_t NS = decltype(NS_v)::value;
+        auto dispatch = [&](auto K_v, auto V_v) {
+            constexpr bool K = decltype(K_v)::value;
+            constexpr bool V = decltype(V_v)::value;
+            cudaFuncSetAttribute(
+                fattn_prefill_mma_gqa_kernel_v5_t<HD, 6, BR, BC, NCOLS2, KV_PAD, S_PAD, O_PAD, K, V, NS>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            fattn_prefill_mma_gqa_kernel_v5_t<HD, 6, BR, BC, NCOLS2, KV_PAD, S_PAD, O_PAD, K, V, NS>
+                <<<grid, block, smem, stream>>>(
+                    out, partials, ms_buf, q, q_stride,
+                    static_cast<const __half *>(k_cache),
+                    static_cast<const __half *>(v_cache),
+                    n_heads, n_kv_heads, base_seq_len, batch,
+                    q_batch_stride, out_batch_stride, scale);
+        };
+        if (use_cp_async_k && use_cp_async_v) {
+            dispatch(std::true_type{},  std::true_type{});
+        } else if (use_cp_async_k) {
+            dispatch(std::true_type{},  std::false_type{});
+        } else if (use_cp_async_v) {
+            dispatch(std::false_type{}, std::true_type{});
+        } else {
+            dispatch(std::false_type{}, std::false_type{});
+        }
+        if (NS > 1) {
+            const dim3 cgrid(n_heads, batch, 1);
+            const dim3 cblock(HD);
+            fattn_prefill_mma_gqa_combine_kernel<HD, NS>
+                <<<cgrid, cblock, 0, stream>>>(
+                    out, partials, ms_buf, batch, out_batch_stride);
+        }
+    };
+
+    auto launch_with_ns_br = [&](auto HD_v, auto BR_v) {
+        if (nsplit == 2) launch(HD_v, BR_v, std::integral_constant<uint32_t, 2>{});
+        else             launch(HD_v, BR_v, std::integral_constant<uint32_t, 1>{});
+    };
+    auto launch_with_br = [&](auto HD_v) {
+        if (br_choice == 16) launch_with_ns_br(HD_v, std::integral_constant<uint32_t, 16>{});
+        else                 launch_with_ns_br(HD_v, std::integral_constant<uint32_t, 32>{});
+    };
+    if (head_dim == 256) launch_with_br(std::integral_constant<uint32_t, 256>{});
+    else                 launch_with_br(std::integral_constant<uint32_t, 128>{});
     return true;
 }
 
