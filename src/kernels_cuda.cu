@@ -220,6 +220,24 @@ bool launch_prefill_f16q_f16kv(
         uint32_t batch, uint32_t base_seq_len,
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream);
+
+uint64_t decode_f32q_f16kv_tmp_elements(uint32_t n_heads,
+                                        uint32_t head_dim,
+                                        uint32_t seq_len);
+
+bool launch_decode_f32q_f16kv(float *out,
+                              __half *o_f16,
+                              __half *tmp,
+                              const float *q,
+                              uint32_t q_stride,
+                              const void *k_cache,
+                              const void *v_cache,
+                              uint32_t n_heads,
+                              uint32_t n_kv_heads,
+                              uint32_t head_dim,
+                              uint32_t seq_len,
+                              float scale,
+                              cudaStream_t stream);
 }
 #endif
 
@@ -269,6 +287,28 @@ AttentionKernel attention_kernel_choice() {
         return AttentionKernel::Ported;
     }();
     return choice;
+}
+
+// Decode attention FlashInfer enable flag. When QW3_ENABLE_FLASHINFER=ON at
+// build time, this controls whether decode uses FlashInfer's
+// SingleDecodeWithKVCacheKernel (stream-K with MMA) or qw3's native
+// fattn_vec_decode (fixed NSPLIT=64 split-K with vector path).
+//   QW3_DECODE_ATTN=flashinfer  -> FlashInfer decode (default when built
+//                                   with QW3_ENABLE_FLASHINFER=ON).
+//   QW3_DECODE_ATTN=native      -> native fattn_vec_decode (default when
+//                                   FlashInfer is not available at build).
+bool decode_flashinfer_attention_enabled() {
+    static const bool enabled = []() {
+#if QW3_ENABLE_FLASHINFER
+        const char *env = std::getenv("QW3_DECODE_ATTN");
+        if (env && std::strcmp(env, "native") == 0) return false;
+        // Default: FlashInfer decode when available.
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return enabled;
 }
 
 // Prefill attention kernel selector.
@@ -1908,6 +1948,8 @@ public:
         if (prefill_attn_q_fp16_) cudaFree(prefill_attn_q_fp16_);
         if (prefill_attn_scores_fp16_) cudaFree(prefill_attn_scores_fp16_);
         if (prefill_gqa_scratch_) cudaFree(prefill_gqa_scratch_);
+        if (flashinfer_decode_o_f16_) cudaFree(flashinfer_decode_o_f16_);
+        if (flashinfer_decode_tmp_) cudaFree(flashinfer_decode_tmp_);
         if (argmax_dev_) cudaFree(argmax_dev_);
         if (argmax_host_) cudaFreeHost(argmax_host_);
     }
@@ -3281,6 +3323,37 @@ public:
         return {};
     }
 
+    // FlashInfer decode scratch. o_elems = n_heads * head_dim (fp16 staging
+    // for FI's output before unpack to fp32 attention output). tmp_elems is
+    // computed via flashinfer_adapter::decode_f32q_f16kv_tmp_elements; pass
+    // 0 to skip the chunked-decode tmp buffer (FI's non-partition path).
+    DeviceStatus ensure_flashinfer_decode_workspace(uint64_t o_elems,
+                                                     uint64_t tmp_elems) {
+        if (o_elems > flashinfer_decode_o_f16_capacity_) {
+            if (flashinfer_decode_o_f16_) cudaFree(flashinfer_decode_o_f16_);
+            if (auto st = cuda_status(
+                    cudaMalloc(&flashinfer_decode_o_f16_, o_elems * sizeof(__half)),
+                    "flashinfer decode o_f16 alloc"); !st.ok) {
+                flashinfer_decode_o_f16_ = nullptr;
+                flashinfer_decode_o_f16_capacity_ = 0;
+                return st;
+            }
+            flashinfer_decode_o_f16_capacity_ = o_elems;
+        }
+        if (tmp_elems > flashinfer_decode_tmp_capacity_) {
+            if (flashinfer_decode_tmp_) cudaFree(flashinfer_decode_tmp_);
+            if (auto st = cuda_status(
+                    cudaMalloc(&flashinfer_decode_tmp_, tmp_elems * sizeof(__half)),
+                    "flashinfer decode tmp alloc"); !st.ok) {
+                flashinfer_decode_tmp_ = nullptr;
+                flashinfer_decode_tmp_capacity_ = 0;
+                return st;
+            }
+            flashinfer_decode_tmp_capacity_ = tmp_elems;
+        }
+        return {};
+    }
+
     // cuBLAS-based prefill attention. For each KV group g (gqa_ratio query
     // heads share one KV head), runs:
     //   1) S_g = Q_g · K_g^T            (cuBLAS strided-batched HGEMM, batch=ratio)
@@ -3451,6 +3524,32 @@ public:
         const auto &kc = as_tensor(k_cache);
         const auto &vc = as_tensor(v_cache);
         const bool kv_fp16 = kc.is_fp16();
+#if QW3_ENABLE_FLASHINFER
+        // FlashInfer single-token decode (HEAD_DIM=128 or 256, FP32 Q,
+        // FP16 KV). DEFAULT when QW3_ENABLE_FLASHINFER=ON; override with
+        // QW3_DECODE_ATTN=native to fall back to fattn_vec_decode. FI uses
+        // a stream-K split-K decomposition with MMA at decode (vs qw3's
+        // vector path with fixed NSPLIT=64), closing the long-T per-call
+        // attention gap (667 us → ~357 us at T=131K, nsys-confirmed).
+        if (decode_flashinfer_attention_enabled() &&
+            kv_fp16 && (head_dim == 128 || head_dim == 256)) {
+            const uint64_t o_elems = static_cast<uint64_t>(n_heads) * head_dim;
+            const uint64_t tmp_elems =
+                flashinfer_adapter::decode_f32q_f16kv_tmp_elements(
+                    n_heads, head_dim, seq_len);
+            if (auto st = ensure_flashinfer_decode_workspace(o_elems, tmp_elems);
+                !st.ok) return st;
+            if (flashinfer_adapter::launch_decode_f32q_f16kv(
+                    o.ptr, flashinfer_decode_o_f16_,
+                    tmp_elems > 0 ? flashinfer_decode_tmp_ : nullptr,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim, seq_len, scale,
+                    exec_stream_)) {
+                return launch_status("cuda attn flashinfer decode f32q f16kv");
+            }
+            // On failure, fall through to native fattn_vec_decode below.
+        }
+#endif
         // FP16 K/V: only the ported path supports half-precision K/V; the
         // legacy F32 fused/qk-softmax-av kernels are F32-only.
         if (kv_fp16 && (head_dim == 128 || head_dim == 256)) {
@@ -4030,6 +4129,13 @@ private:
     // largest (n_heads * batch * NSPLIT * (HD + 2)) seen so far.
     void   *prefill_gqa_scratch_ = nullptr;
     size_t  prefill_gqa_scratch_capacity_ = 0;        // bytes
+    // FlashInfer decode scratch: o_f16 (fp16 staging for FI's output before
+    // unpacking to fp32) and tmp (chunked partial O + LSE when seq_len > 256).
+    // Sized to the largest (n_heads * head_dim) + tmp_elements seen so far.
+    __half *flashinfer_decode_o_f16_ = nullptr;
+    __half *flashinfer_decode_tmp_ = nullptr;
+    uint64_t flashinfer_decode_o_f16_capacity_ = 0;   // elements
+    uint64_t flashinfer_decode_tmp_capacity_ = 0;     // elements
     // X-FP16 cache for hgemm_q8. The QKV and gate/up matmul pairs share the
     // same FP32 input pointer in immediate succession; without a cache we
     // re-run fp32_to_fp16_kernel on identical data. Cache key is
