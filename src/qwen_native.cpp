@@ -41,6 +41,10 @@ const std::vector<QwenLayerTensors> &QwenNativeModel::layers() const {
     return layers_;
 }
 
+const QwenMtpTensors *QwenNativeModel::mtp() const {
+    return mtp_.present ? &mtp_ : nullptr;
+}
+
 const GgufTensorInfo *QwenNativeModel::token_embedding() const {
     return token_embd_;
 }
@@ -59,6 +63,10 @@ const GgufTensorInfo *QwenNativeModel::optional_tensor(const std::string &name) 
 
 void QwenNativeModel::add_missing(const std::string &name) {
     plan_.missing_tensors.push_back(name);
+}
+
+void QwenNativeModel::add_mtp_missing(const std::string &name) {
+    plan_.mtp_missing_tensors.push_back(name);
 }
 
 const GgufTensorInfo *QwenNativeModel::require_tensor(const std::string &name) {
@@ -89,14 +97,22 @@ void QwenNativeModel::count_bound(const GgufTensorInfo *tensor) {
     if (tensor) plan_.n_bound_tensors++;
 }
 
+void QwenNativeModel::count_mtp_bound(const GgufTensorInfo *tensor) {
+    if (!tensor) return;
+    count_bound(tensor);
+    plan_.mtp_bound_tensors++;
+}
+
 void QwenNativeModel::bind() {
     const ModelInfo info = gguf_->model_info();
     plan_.architecture = info.architecture;
-    plan_.n_layers = info.block_count;
-    plan_.n_embd = info.embedding_length;
-    plan_.n_heads = info.head_count;
-    plan_.n_kv_heads = info.head_count_kv;
-    plan_.n_ctx_train = info.context_length;
+    plan_.n_layers = config_->n_layers;
+    plan_.n_total_layers = config_->block_count;
+    plan_.n_nextn_predict_layers = config_->nextn_predict_layers;
+    plan_.n_embd = config_->n_embd;
+    plan_.n_heads = config_->n_heads;
+    plan_.n_kv_heads = config_->n_kv_heads;
+    plan_.n_ctx_train = config_->n_ctx_train;
     plan_.n_tensors = info.tensor_count;
 
     for (const GgufTensorInfo &t : gguf_->tensors()) plan_.tensor_bytes += t.bytes;
@@ -156,6 +172,8 @@ void QwenNativeModel::bind() {
         l.ffn_down = require_tensor(layer_tensor(i, "ffn_down.weight"));
     }
 
+    bind_mtp();
+
     plan_.supported = plan_.missing_tensors.empty();
 
     add_op(plan_.op_plan, "token_embedding_lookup");
@@ -183,7 +201,89 @@ void QwenNativeModel::bind() {
     add_op(plan_.op_plan, "residual_add");
     add_op(plan_.op_plan, "output_rms_norm");
     add_op(plan_.op_plan, "lm_head");
+    if (plan_.n_nextn_predict_layers > 0) {
+        add_op(plan_.op_plan, "optional_mtp_head");
+        add_op(plan_.op_plan, "mtp_concat(norm(token_embd), norm(pre_output_hidden))");
+        add_op(plan_.op_plan, "mtp_transformer_block");
+        add_op(plan_.op_plan, "mtp_lm_head");
+    }
     add_op(plan_.op_plan, "sampler");
+}
+
+void QwenNativeModel::bind_mtp() {
+    if (config_->nextn_predict_layers == 0) return;
+
+    plan_.mtp_layer_index = config_->n_layers;
+    mtp_.present = true;
+    mtp_.layer_index = config_->n_layers;
+
+    if (config_->nextn_predict_layers != 1) {
+        add_mtp_missing("qwen-native MTP currently supports nextn_predict_layers == 1");
+        return;
+    }
+
+    auto require_mtp_tensor = [this](const std::string &name) -> const GgufTensorInfo * {
+        const GgufTensorInfo *t = optional_tensor(name);
+        if (!t) add_mtp_missing(name);
+        count_mtp_bound(t);
+        return t;
+    };
+    auto require_mtp_any_tensor = [this](const std::vector<std::string> &names) -> const GgufTensorInfo * {
+        for (const std::string &name : names) {
+            const GgufTensorInfo *t = optional_tensor(name);
+            if (t) {
+                count_mtp_bound(t);
+                return t;
+            }
+        }
+        std::ostringstream ss;
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (i) ss << " | ";
+            ss << names[i];
+        }
+        add_mtp_missing(ss.str());
+        return nullptr;
+    };
+    auto optional_mtp_tensor = [this](const std::string &name) -> const GgufTensorInfo * {
+        const GgufTensorInfo *t = optional_tensor(name);
+        count_mtp_bound(t);
+        return t;
+    };
+
+    const uint32_t i = mtp_.layer_index;
+    QwenLayerTensors &l = mtp_.layer;
+    l.recurrent = false;
+    l.attn_norm = require_mtp_tensor(layer_tensor(i, "attn_norm.weight"));
+    l.ffn_norm = require_mtp_any_tensor({
+        layer_tensor(i, "ffn_norm.weight"),
+        layer_tensor(i, "post_attention_norm.weight"),
+    });
+    l.attn_q = require_mtp_tensor(layer_tensor(i, "attn_q.weight"));
+    l.attn_k = require_mtp_tensor(layer_tensor(i, "attn_k.weight"));
+    l.attn_v = require_mtp_tensor(layer_tensor(i, "attn_v.weight"));
+    l.attn_q_norm = require_mtp_tensor(layer_tensor(i, "attn_q_norm.weight"));
+    l.attn_k_norm = require_mtp_tensor(layer_tensor(i, "attn_k_norm.weight"));
+    l.attn_output = require_mtp_tensor(layer_tensor(i, "attn_output.weight"));
+    l.ffn_gate = require_mtp_tensor(layer_tensor(i, "ffn_gate.weight"));
+    l.ffn_up = require_mtp_tensor(layer_tensor(i, "ffn_up.weight"));
+    l.ffn_down = require_mtp_tensor(layer_tensor(i, "ffn_down.weight"));
+
+    mtp_.eh_proj = require_mtp_tensor(layer_tensor(i, "nextn.eh_proj.weight"));
+    mtp_.enorm = require_mtp_tensor(layer_tensor(i, "nextn.enorm.weight"));
+    mtp_.hnorm = require_mtp_tensor(layer_tensor(i, "nextn.hnorm.weight"));
+    mtp_.embed_tokens = optional_mtp_tensor(layer_tensor(i, "nextn.embed_tokens.weight"));
+    mtp_.shared_head_head = optional_mtp_tensor(layer_tensor(i, "nextn.shared_head_head.weight"));
+    mtp_.shared_head_norm = optional_mtp_tensor(layer_tensor(i, "nextn.shared_head_norm.weight"));
+
+    if (!mtp_.embed_tokens) mtp_.embed_tokens = token_embd_;
+    if (!mtp_.shared_head_head) mtp_.shared_head_head = output_;
+    if (!mtp_.shared_head_norm) mtp_.shared_head_norm = output_norm_;
+
+    if (!mtp_.embed_tokens) add_mtp_missing("MTP token embedding fallback is missing");
+    if (!mtp_.shared_head_head) add_mtp_missing("MTP LM head fallback is missing");
+    if (!mtp_.shared_head_norm) add_mtp_missing("MTP head norm fallback is missing");
+
+    plan_.mtp_supported = plan_.mtp_missing_tensors.empty();
 }
 
 std::string QwenNativeModel::describe_plan() const {
@@ -191,16 +291,25 @@ std::string QwenNativeModel::describe_plan() const {
     ss << "native backend: " << (plan_.supported ? "supported" : "incomplete") << "\n"
        << "architecture: " << plan_.architecture << "\n"
        << "layers: " << plan_.n_layers << "\n"
+       << "total_layers: " << plan_.n_total_layers << "\n"
+       << "nextn_predict_layers: " << plan_.n_nextn_predict_layers << "\n"
        << "embedding: " << plan_.n_embd << "\n"
        << "heads: " << plan_.n_heads << "\n"
        << "kv_heads: " << plan_.n_kv_heads << "\n"
        << "context_train: " << plan_.n_ctx_train << "\n"
        << "tensors: " << plan_.n_tensors << "\n"
        << "tensor_bytes: " << plan_.tensor_bytes << "\n"
+       << "mtp_supported: " << (plan_.mtp_supported ? "yes" : "no") << "\n"
+       << "mtp_layer_index: " << plan_.mtp_layer_index << "\n"
+       << "mtp_bound_tensors: " << plan_.mtp_bound_tensors << "\n"
        << "bound_tensors: " << plan_.n_bound_tensors << "\n";
     if (!plan_.missing_tensors.empty()) {
         ss << "missing_tensors:\n";
         for (const std::string &name : plan_.missing_tensors) ss << "  " << name << "\n";
+    }
+    if (!plan_.mtp_missing_tensors.empty()) {
+        ss << "mtp_missing_tensors:\n";
+        for (const std::string &name : plan_.mtp_missing_tensors) ss << "  " << name << "\n";
     }
     ss << "op_plan:\n";
     for (const std::string &op : plan_.op_plan) ss << "  " << op << "\n";

@@ -16,7 +16,9 @@ struct QwenConfig {
     std::string architecture; // "qwen35"
 
     // Block layout
-    uint32_t n_layers = 0;
+    uint32_t block_count = 0; // GGUF block_count, including trailing MTP blocks
+    uint32_t nextn_predict_layers = 0;
+    uint32_t n_layers = 0; // main transformer layers executed by qwen-native
     uint32_t n_embd = 0;
     uint32_t n_ff = 0;
     uint32_t n_ctx_train = 0;

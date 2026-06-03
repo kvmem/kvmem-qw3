@@ -55,6 +55,20 @@ bool launch_mmvq_q8_0_add(
         const uint8_t *weight, const void *y_q8_1, float *dst,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
+// Fused 4-weight fanout: concatenate the 4 weights' row-spaces into ONE grid
+// so all four matvecs share a single kernel launch (and the one shared Q8_1
+// activation). Pass nullptr/rows=0 for unused slots (n<4). Used by the MTP
+// verify recurrent-projection / attention-qkv fanout.
+bool launch_mmvq_q8_0_fanout4_batch(
+        const uint8_t *weight0, const uint8_t *weight1,
+        const uint8_t *weight2, const uint8_t *weight3,
+        const void *y_q8_1,
+        float *dst0, float *dst1, float *dst2, float *dst3,
+        uint32_t rows0, uint32_t rows1, uint32_t rows2, uint32_t rows3,
+        uint32_t cols, uint32_t batch,
+        uint32_t stride_dst0, uint32_t stride_dst1,
+        uint32_t stride_dst2, uint32_t stride_dst3,
+        cudaStream_t stream);
 
 // Ported MMQ Q8_0 INT8-MMA matmul (src/mmq_q8.cu). Drop-in replacement for
 // the HGEMM prefill path that uses m16n8k32.s8.s8.s32 tensor cores directly
@@ -419,8 +433,29 @@ MatmulKernel matmul_kernel_choice() {
 // batch) beat HGEMM at chunk=2048 across the full T range, so the auto router
 // always selects MMQ now. The internal version select inside launch_mmq_q8_0
 // picks v7 or v8 based on batch size.
+//
+// The lower bound is the MMA min-batch (see mma_min_batch(), default 8). batch
+// 1..7 stay OFF the INT8-MMA tile: batch==1 is the dp4a decode matvec, and
+// batch 2..7 — notably the MTP speculative VERIFY batch (chain+1 rows) — use
+// the column-batched MMVQ matvec in dispatch_q8_matvec, which loads each Q8
+// weight block once and reuses it across all batch columns. The MMA tile is
+// the wrong tool below batch 8: its 64-wide tile is mostly empty there and runs
+// ~2x slower than the MMVQ matvec (measured at batch=3: 816us vs ~390us/call).
+// HGEMM is also excluded for these batches — its per-call dequant + autotuner
+// restart is a heavy tax under chunked long-sequence prefill. See DEVELOPMENT_LOG.
+inline uint32_t mma_min_batch() {
+    static const uint32_t v = []() -> uint32_t {
+        if (const char *env = std::getenv("QW3_MATMUL_MMA_MIN_BATCH")) {
+            int n = std::atoi(env);
+            if (n >= 1) return static_cast<uint32_t>(n);
+        }
+        return 8u;
+    }();
+    return v;
+}
+
 inline bool matmul_auto_use_mmq(uint32_t batch) {
-    return batch >= 8u;
+    return batch >= mma_min_batch();
 }
 
 
@@ -472,7 +507,8 @@ __device__ float fp16_to_f32_device(uint16_t h) {
 struct CudaTensor final : DeviceTensor {
     float *ptr = nullptr;
     std::string label;
-    CudaTensor(uint64_t n, const char *name, uint32_t elem_bytes = sizeof(float)) {
+    CudaTensor(uint64_t n, const char *name, uint32_t elem_bytes = sizeof(float),
+               bool zero_initialize = true) {
         count = n;
         elem_size = elem_bytes;
         label = name ? name : "tensor";
@@ -489,7 +525,7 @@ struct CudaTensor final : DeviceTensor {
                           cudaGetErrorString(err));
             throw std::runtime_error(msg);
         }
-        cudaMemset(ptr, 0, bytes);
+        if (zero_initialize) cudaMemset(ptr, 0, bytes);
     }
     ~CudaTensor() override {
         if (ptr) cudaFree(ptr);
@@ -636,6 +672,86 @@ __global__ void argmax_kernel(int32_t *__restrict__ out,
             out[1] = __float_as_int(local_max);
         }
     }
+}
+
+// Batched device argmax for the MTP verify path (and any multi-row argmax).
+// Two-stage block reduction: stage-1 reduces each row's row_stride logits in
+// blocks_per_row CTAs (grid.y = batch); stage-2 reduces those partials per row.
+// Replaces the base-class fallback that copied batch*vocab floats to host and
+// scanned on the CPU (~1 ms at vocab=151k for an 18-row verify batch).
+struct ArgmaxPair {
+    float value;
+    int index;
+};
+
+__device__ inline bool argmax_better(float value, int index,
+                                      float best_value, int best_index) {
+    if (index < 0) return false;
+    if (best_index < 0) return true;
+    if (value > best_value) return true;
+    return value == best_value && index < best_index;  // deterministic tie-break
+}
+
+template <uint32_t BLOCK>
+__global__ void argmax_rows_block_kernel(const float *x,
+                                         ArgmaxPair *partial,
+                                         uint32_t row_stride,
+                                         uint32_t blocks_per_row) {
+    __shared__ float values[BLOCK];
+    __shared__ int indices[BLOCK];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t block = blockIdx.x;
+    const uint32_t col = block * BLOCK + tid;
+    const float *base = x + static_cast<uint64_t>(row) * row_stride;
+    values[tid] = col < row_stride ? base[col] : -INFINITY;
+    indices[tid] = col < row_stride ? static_cast<int>(col) : -1;
+    __syncthreads();
+    for (uint32_t stride = BLOCK / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float ov = values[tid + stride];
+            const int oi = indices[tid + stride];
+            if (argmax_better(ov, oi, values[tid], indices[tid])) {
+                values[tid] = ov;
+                indices[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[static_cast<uint64_t>(row) * blocks_per_row + block] = {values[0], indices[0]};
+    }
+}
+
+template <uint32_t BLOCK>
+__global__ void argmax_rows_finalize_kernel(const ArgmaxPair *partial,
+                                            ArgmaxPair *result,
+                                            uint32_t blocks_per_row) {
+    __shared__ float values[BLOCK];
+    __shared__ int indices[BLOCK];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t row = blockIdx.x;
+    if (tid < blocks_per_row) {
+        const ArgmaxPair pair = partial[static_cast<uint64_t>(row) * blocks_per_row + tid];
+        values[tid] = pair.value;
+        indices[tid] = pair.index;
+    } else {
+        values[tid] = -INFINITY;
+        indices[tid] = -1;
+    }
+    __syncthreads();
+    for (uint32_t stride = BLOCK / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float ov = values[tid + stride];
+            const int oi = indices[tid + stride];
+            if (argmax_better(ov, oi, values[tid], indices[tid])) {
+                values[tid] = ov;
+                indices[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) result[row] = {values[0], indices[0]};
 }
 
 // Fused silu(gate) * up for the SwiGLU FFN: one launch, one read per element
@@ -1952,6 +2068,8 @@ public:
         if (flashinfer_decode_tmp_) cudaFree(flashinfer_decode_tmp_);
         if (argmax_dev_) cudaFree(argmax_dev_);
         if (argmax_host_) cudaFreeHost(argmax_host_);
+        if (argmax_batch_partial_) cudaFree(argmax_batch_partial_);
+        if (argmax_batch_result_) cudaFree(argmax_batch_result_);
     }
 
     const char *name() const override {
@@ -2092,6 +2210,11 @@ public:
 
     std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) override {
         return std::make_unique<CudaTensor>(count, label);
+    }
+
+    std::unique_ptr<DeviceTensor> scratch_f32(uint64_t count, const char *label) override {
+        return std::make_unique<CudaTensor>(count, label, sizeof(float),
+                                            /*zero_initialize=*/false);
     }
 
     std::unique_ptr<DeviceTensor> tensor_f16(uint64_t count, const char *label) override {
@@ -2268,6 +2391,91 @@ public:
         return launch_status("cuda q8_0_matvec_fanout");
     }
 
+    // Batched fanout: n weights × one shared activation of `batch` rows. The
+    // base-class default loops q8_0_matmul, which RE-QUANTIZES the activation
+    // to Q8_1 once per weight (n times) and launches n MMVQ kernels. Here we
+    // quantize the activation to Q8_1 ONCE and reuse it across all n weights —
+    // the recurrent-projection verify hot path (qkv/gate/alpha/beta share
+    // norm_batch_) and the attention q/k/v fanout. Only the verify small-batch
+    // (2..8) MMVQ path qualifies; everything else falls back.
+    DeviceStatus q8_0_matmul_fanout(DeviceTensor *const *outs,
+                                    const DeviceWeight *const *weights,
+                                    const uint32_t *out_strides,
+                                    uint32_t n,
+                                    const DeviceTensor &x,
+                                    uint32_t batch,
+                                    uint32_t in_stride) override {
+        if (n == 0 || batch == 0) return {};
+        const auto &input = as_tensor(x);
+        const uint64_t cols = as_weight(*weights[0]).cols;
+        bool same_cols = true;
+        for (uint32_t i = 1; i < n; ++i) {
+            if (as_weight(*weights[i]).cols != cols) { same_cols = false; break; }
+        }
+        // Fast path only for the column-batched MMVQ verify regime (batch 2..8,
+        // shared activation width, ported matvec). batch==1 has its own
+        // q8_0_matvec_fanout override; batch>=mma_min_batch goes to MMA/HGEMM
+        // where re-quant cost is negligible against the tile work.
+        const bool fast_path = same_cols && (cols % 32) == 0 &&
+                               batch >= 2 && batch <= 8 &&
+                               in_stride == cols &&
+                               matvec_kernel_choice() == MatvecKernel::Ported;
+        if (!fast_path) {
+            return DeviceBackend::q8_0_matmul_fanout(outs, weights, out_strides,
+                                                     n, x, batch, in_stride);
+        }
+        if (auto st = ensure_q8_1_scratch(batch, static_cast<uint32_t>(cols)); !st.ok) return st;
+        if (!ported::launch_quantize_q8_1(input.ptr, q8_1_scratch_,
+                                          batch, static_cast<uint32_t>(cols),
+                                          in_stride, exec_stream_)) {
+            return {false, "matmul fanout quantize_q8_1 launch failed"};
+        }
+        // n<=4: one fused launch covering all weights' row-spaces (qw3_ly's
+        // fanout4 kernel). Saves n-1 kernel launches over the per-weight loop.
+        // Disable with QW3_FANOUT4=off to A/B against the loop.
+        const bool fanout4 = []() {
+            const char *e = std::getenv("QW3_FANOUT4");
+            return !(e && std::string(e) == "off");
+        }();
+        if (fanout4 && n >= 2 && n <= 4) {
+            const uint8_t *wptr[4] = {nullptr, nullptr, nullptr, nullptr};
+            float *optr[4] = {nullptr, nullptr, nullptr, nullptr};
+            uint32_t rows[4] = {0, 0, 0, 0};
+            uint32_t strides[4] = {0, 0, 0, 0};
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto &wi = as_weight(*weights[i]);
+                auto &oi = as_tensor(*outs[i]);
+                wptr[i] = static_cast<const uint8_t *>(wi.ptr);
+                optr[i] = oi.ptr;
+                rows[i] = static_cast<uint32_t>(wi.rows);
+                strides[i] = out_strides[i];
+            }
+            if (ported::launch_mmvq_q8_0_fanout4_batch(
+                    wptr[0], wptr[1], wptr[2], wptr[3],
+                    q8_1_scratch_,
+                    optr[0], optr[1], optr[2], optr[3],
+                    rows[0], rows[1], rows[2], rows[3],
+                    static_cast<uint32_t>(cols), batch,
+                    strides[0], strides[1], strides[2], strides[3],
+                    exec_stream_)) {
+                return launch_status("cuda q8_0_matmul_fanout fused");
+            }
+            // Fused launch rejected the shape; fall through to per-weight loop.
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            const auto &wi = as_weight(*weights[i]);
+            auto &oi = as_tensor(*outs[i]);
+            if (!ported::launch_mmvq_q8_0(static_cast<const uint8_t *>(wi.ptr),
+                                          q8_1_scratch_, oi.ptr,
+                                          static_cast<uint32_t>(wi.rows),
+                                          static_cast<uint32_t>(wi.cols),
+                                          batch, out_strides[i], exec_stream_)) {
+                return {false, "matmul fanout mmvq_q8_0 launch failed"};
+            }
+        }
+        return launch_status("cuda q8_0_matmul_fanout");
+    }
+
     // Fused matvec + residual add: dst = dst + W*x. Uses the dedicated
     // mmvq_add kernel that writes through dst with read-modify-write
     // instead of materializing the matvec result into a separate buffer
@@ -2361,10 +2569,13 @@ public:
         const auto &input = as_tensor(x);
         if (batch == 0) return {};
         // For prefill batches the dp4a matvec stops being bandwidth-bound and
-        // tensor-core HGEMM wins by 10x+. Threshold of 8 is the empirical
-        // cross-over on Blackwell for the smallest matmul we hit (5K x 5K).
-        // For batch == 1 (decode) we stay on the dp4a path which is faster.
-        const uint32_t hgemm_threshold = 8;
+        // tensor-core MMA wins by 10x+. batch < mma_min_batch() (default 8)
+        // falls through to dispatch_q8_matvec: batch==1 is the dp4a decode
+        // matvec, batch 2..7 (incl. the MTP verify batch) is the column-batched
+        // MMVQ matvec that amortizes the Q8 weight read across the batch
+        // columns. batch >= mma_min_batch() routes to the INT8 MMA / HGEMM path
+        // where the wide tile is well-filled and weight reuse pays off.
+        const uint32_t hgemm_threshold = mma_min_batch();
         if (batch >= hgemm_threshold && in_stride == w.cols && out_stride == w.rows) {
             // INT8 MMA path. `auto` routes by batch size (≤512 → MMQ v7
             // swizzled, else HGEMM); `mmq` forces MMQ unconditionally.
@@ -2644,18 +2855,27 @@ private:
                                     uint32_t in_stride,
                                     uint32_t out_stride) {
         // Ported path: quantize input to Q8_1, then DP4A matvec with Q8_1
-        // activations. Selected via QW3_MATVEC=ported. Caller-side scratch
-        // is reused across calls. Restricted to batch==1 (decode) for now;
-        // for batch 2..7 the qw3 kernel's per-block input-quant cache is
-        // already efficient and the ported kernel's higher block count
-        // regresses small-batch prefill. Falls back to qw3 path otherwise.
+        // activations. Selected via QW3_MATVEC=ported (the default).
+        //
+        // batch 1..8 use the column-batched MMVQ kernel (mul_mat_vec_q8_0_kernel
+        // with NCOLS_DST==batch): one CTA grid covers all rows, each Q8 weight
+        // block is loaded ONCE and reused across all `batch` activation columns
+        // via the per-thread tmp[NCOLS_DST][...] register accumulator. This is
+        // the kernel the MTP speculative VERIFY batch (chain+1 = 2..5 rows)
+        // needs: decode/verify matvec is HBM-weight-bandwidth-bound, so
+        // amortizing the single weight read across the verify columns makes
+        // verify(N) cost ~one weight pass instead of N. The old per-row
+        // q8_matvec_dp4a_kernel (grid.y=batch) re-read the weight N times,
+        // which made verify as slow as N separate decodes and killed the
+        // speculative speedup. The INT8-MMA tile (mmq_q8) is the wrong tool
+        // here: its 64-wide tile is ~95% empty at batch 2..5 and runs ~2x
+        // slower than this matvec.
         if (matvec_kernel_choice() == MatvecKernel::Ported &&
-            (w.cols % 32) == 0 && batch == 1) {
+            (w.cols % 32) == 0 && batch >= 1 && batch <= 8) {
             if (auto st = ensure_q8_1_scratch(batch, w.cols); !st.ok) return st;
-            // in_stride is the float stride between batch rows in x; for
-            // batch==1 the upstream call passes 0, but the ported quantize
-            // kernel still walks (batch=1) row, so it never actually reads
-            // past row 0.
+            // For batch==1 callers pass in_stride==0; the quantize kernel still
+            // only walks row 0 there. For batch>1 (verify), in_stride is the
+            // float stride between activation rows in x.
             const uint32_t qstride = (batch == 1) ? w.cols : in_stride;
             if (!ported::launch_quantize_q8_1(x_ptr, q8_1_scratch_,
                                               batch, w.cols, qstride, exec_stream_)) {
@@ -2811,11 +3031,20 @@ public:
 
     DeviceStatus add(DeviceTensor &out, const DeviceTensor &a, const DeviceTensor &b) override {
         auto &o = as_tensor(out);
+        return add_n(out, a, b, o.count);
+    }
+
+    DeviceStatus add_n(DeviceTensor &out, const DeviceTensor &a, const DeviceTensor &b,
+                       uint64_t count) override {
+        auto &o = as_tensor(out);
         const auto &aa = as_tensor(a);
         const auto &bb = as_tensor(b);
-        const uint64_t threads_total = (o.count + 3) / 4;
+        if (count > o.count || count > aa.count || count > bb.count) {
+            return {false, "cuda add_n count exceeds tensor size"};
+        }
+        const uint64_t threads_total = (count + 3) / 4;
         const unsigned blocks = static_cast<unsigned>((threads_total + 255) / 256);
-        add_kernel<<<blocks, 256, 0, exec_stream_>>>(o.ptr, aa.ptr, bb.ptr, o.count);
+        add_kernel<<<blocks, 256, 0, exec_stream_>>>(o.ptr, aa.ptr, bb.ptr, count);
         return launch_status("cuda add");
     }
 
@@ -2836,13 +3065,24 @@ public:
 
     DeviceStatus silu_mul(DeviceTensor &out, const DeviceTensor &gate, const DeviceTensor &up) override {
         auto &o = as_tensor(out);
+        return silu_mul_n(out, gate, up, o.count);
+    }
+
+    DeviceStatus silu_mul_n(DeviceTensor &out,
+                            const DeviceTensor &gate,
+                            const DeviceTensor &up,
+                            uint64_t count) override {
+        auto &o = as_tensor(out);
         const auto &g = as_tensor(gate);
         const auto &u = as_tensor(up);
+        if (count > o.count || count > g.count || count > u.count) {
+            return {false, "cuda silu_mul_n count exceeds tensor size"};
+        }
         // Vectorized: 4 elements per thread.
-        const uint64_t threads_total = (o.count + 3) / 4;
+        const uint64_t threads_total = (count + 3) / 4;
         const unsigned blocks = static_cast<unsigned>((threads_total + 255) / 256);
         silu_mul_kernel<<<blocks, 256, 0, exec_stream_>>>(
-            o.ptr, g.ptr, u.ptr, o.count);
+            o.ptr, g.ptr, u.ptr, count);
         return launch_status("cuda silu_mul");
     }
 
@@ -2982,8 +3222,67 @@ public:
                                   uint32_t alpha_stride,
                                   uint32_t beta_stride,
                                   uint32_t core_stride,
-                                  float eps) override {
+                                  float eps,
+                                  DeviceTensor *state_checkpoints,
+                                  DeviceTensor *conv_state_checkpoints,
+                                  uint32_t checkpoint_count) override {
         if (batch == 0) return {};
+        // Speculative-decode rollback checkpoints are only requested on tiny
+        // verifier batches (MTP draft depth + 1, ~4-6 tokens). Capturing the
+        // recurrent + conv state after each token via the single-token path is
+        // mathematically identical to the batched kernels and avoids fusing
+        // checkpoint writes into qw3's two divergent DeltaNet kernels.
+        {
+            auto *state_ckpt = state_checkpoints ? &as_tensor(*state_checkpoints) : nullptr;
+            auto *conv_ckpt = conv_state_checkpoints ? &as_tensor(*conv_state_checkpoints) : nullptr;
+            const uint32_t eff_ckpt = std::min<uint32_t>(checkpoint_count, batch);
+            const bool want_checkpoint =
+                state_ckpt != nullptr && conv_ckpt != nullptr && eff_ckpt > 0;
+            if (want_checkpoint) {
+                auto &s = as_tensor(state);
+                auto &cs = as_tensor(conv_state);
+                const uint64_t state_count = s.count;
+                const uint64_t conv_count = cs.count;
+                for (uint32_t b = 0; b < batch; ++b) {
+                    if (auto st = recurrent_single_token_at(core, state, conv_state, conv_out_buf,
+                                                            proj, gate, alpha, beta,
+                                                            conv, ssm_a, dt_bias, ssm_norm,
+                                                            num_k_heads, num_v_heads,
+                                                            head_k_dim, head_v_dim,
+                                                            conv_kernel_size,
+                                                            proj_count,
+                                                            b * proj_stride,
+                                                            b * gate_stride,
+                                                            b * alpha_stride,
+                                                            b * beta_stride,
+                                                            b * core_stride,
+                                                            eps); !st.ok) {
+                        return st;
+                    }
+                    if (b < eff_ckpt) {
+                        if (auto st = cuda_status(
+                                cudaMemcpyAsync(state_ckpt->ptr + static_cast<uint64_t>(b) * state_count,
+                                                s.ptr,
+                                                static_cast<size_t>(state_count) * sizeof(float),
+                                                cudaMemcpyDeviceToDevice,
+                                                exec_stream_),
+                                "recurrent_batch state checkpoint"); !st.ok) {
+                            return st;
+                        }
+                        if (auto st = cuda_status(
+                                cudaMemcpyAsync(conv_ckpt->ptr + static_cast<uint64_t>(b) * conv_count,
+                                                cs.ptr,
+                                                static_cast<size_t>(conv_count) * sizeof(float),
+                                                cudaMemcpyDeviceToDevice,
+                                                exec_stream_),
+                                "recurrent_batch conv checkpoint"); !st.ok) {
+                            return st;
+                        }
+                    }
+                }
+                return {};
+            }
+        }
         auto &c = as_tensor(core);
         auto &s = as_tensor(state);
         auto &cs = as_tensor(conv_state);
@@ -3702,17 +4001,17 @@ public:
 
 #if QW3_ENABLE_FLASHINFER
         // FlashInfer single-prefill (HEAD_DIM=256, FP16 Q, FP16 KV). DEFAULT
-        // when QW3_ENABLE_FLASHINFER=ON; override with
-        // QW3_PREFILL_ATTN=mma-gqa-v2 to restore FA2 v2. A/B vs mma-gqa-v2
-        // at the CUDA_MODULE_LOADING=EAGER baseline qw3_cli sets
-        // (2026-06-02): prefill +0.2% / +0.9% / +1.8% / +3.5% / +6.6% /
-        // +12.5% / +22.4% / +37.5% at
-        // T=827/2453/4621/8686/16816/33347/66138/131720; decode parity
-        // within ±0.3% at every T (FI doesn't run during decode — gated
-        // below the FI dispatch by batch≥8). vs llama.cpp: beats at every
-        // T (101.5–106.5% short-mid, +12.5% at T=66K, +28.0% at T=131K).
-        // Memory parity with FA2 v2 default at every T. Q-pack (fp16) +
-        // O-pack (fp16) share prefill_gqa_scratch_; no extra alloc.
+        // for large prefill batches. Gated by prefill_attn_min_batch() (=16)
+        // like every other prefill branch: the FI single-prefill kernel is
+        // tuned for wide prefill batches and badly under-parallelizes a tiny
+        // MTP verify batch (chain+1 = 2..5 rows) over a long KV cache — at
+        // T=64K it ran ~3.5 ms/call (64% of verify time). Below min_batch the
+        // dispatch falls through to the split-KV fattn_vec decode kernel (the
+        // same path plain single-token decode uses), which is ~3.5× faster for
+        // few-rows-over-long-KV (995 µs/call vs 3491 µs at T=64K). This makes
+        // MTP a decode speedup at long context too, not just short prompts.
+        // (Was `batch >= 1` — that routed the verify batch through FI and was
+        // the long-context MTP regression.) Real prefill is unaffected.
         if (kv_fp16 &&
             prefill_attn_kernel_choice() == PrefillAttnKernel::FlashInfer &&
             batch >= prefill_attn_min_batch() &&
@@ -4054,6 +4353,71 @@ public:
         return best;
     }
 
+    DeviceStatus argmax_batch(const DeviceTensor &x,
+                              uint32_t batch,
+                              uint32_t row_stride,
+                              std::vector<DeviceArgmax> &out) override {
+        const auto &t = as_tensor(x);
+        out.assign(batch, DeviceArgmax{});
+        if (batch == 0) return {};
+        constexpr uint32_t block = 256;
+        constexpr uint32_t final_block = 1024;
+        const uint32_t blocks_per_row = (row_stride + block - 1) / block;
+        // Fall back to the host scan if the row is too wide for a single
+        // finalize CTA (blocks_per_row must fit final_block threads).
+        if (row_stride == 0 || blocks_per_row > final_block ||
+            t.count < static_cast<uint64_t>(batch) * row_stride) {
+            return DeviceBackend::argmax_batch(x, batch, row_stride, out);
+        }
+        if (auto st = ensure_argmax_batch_scratch(batch, blocks_per_row); !st.ok) return st;
+        const dim3 grid(blocks_per_row, batch, 1);
+        argmax_rows_block_kernel<block><<<grid, block, 0, exec_stream_>>>(
+            t.ptr, argmax_batch_partial_, row_stride, blocks_per_row);
+        if (auto st = launch_status("cuda argmax rows block"); !st.ok) return st;
+        argmax_rows_finalize_kernel<final_block><<<batch, final_block, 0, exec_stream_>>>(
+            argmax_batch_partial_, argmax_batch_result_, blocks_per_row);
+        if (auto st = launch_status("cuda argmax rows finalize"); !st.ok) return st;
+        std::vector<ArgmaxPair> host(batch);
+        if (auto st = cuda_status(cudaMemcpyAsync(host.data(), argmax_batch_result_,
+                                                  static_cast<size_t>(batch) * sizeof(ArgmaxPair),
+                                                  cudaMemcpyDeviceToHost, exec_stream_),
+                                  "argmax batch copy"); !st.ok) return st;
+        if (auto st = cuda_status(cudaStreamSynchronize(exec_stream_),
+                                  "argmax batch sync"); !st.ok) return st;
+        for (uint32_t i = 0; i < batch; ++i) {
+            out[i].token = host[i].index;
+            out[i].logit = host[i].value;
+        }
+        return {};
+    }
+
+    DeviceStatus ensure_argmax_batch_scratch(uint32_t batch, uint32_t blocks_per_row) {
+        const uint64_t partial_need = static_cast<uint64_t>(batch) * blocks_per_row;
+        if (partial_need > argmax_batch_partial_capacity_) {
+            if (argmax_batch_partial_) cudaFree(argmax_batch_partial_);
+            if (auto st = cuda_status(cudaMalloc(&argmax_batch_partial_,
+                                                 static_cast<size_t>(partial_need) * sizeof(ArgmaxPair)),
+                                      "argmax batch partial alloc"); !st.ok) {
+                argmax_batch_partial_ = nullptr;
+                argmax_batch_partial_capacity_ = 0;
+                return st;
+            }
+            argmax_batch_partial_capacity_ = partial_need;
+        }
+        if (batch > argmax_batch_result_capacity_) {
+            if (argmax_batch_result_) cudaFree(argmax_batch_result_);
+            if (auto st = cuda_status(cudaMalloc(&argmax_batch_result_,
+                                                 static_cast<size_t>(batch) * sizeof(ArgmaxPair)),
+                                      "argmax batch result alloc"); !st.ok) {
+                argmax_batch_result_ = nullptr;
+                argmax_batch_result_capacity_ = 0;
+                return st;
+            }
+            argmax_batch_result_capacity_ = batch;
+        }
+        return {};
+    }
+
     DeviceStatus copy_to_host(const DeviceTensor &x, float *host, uint64_t offset, uint64_t count) override {
         const auto &t = as_tensor(x);
         if (offset + count > t.count) return {false, "copy_to_host out of range"};
@@ -4071,16 +4435,124 @@ public:
                           const DeviceTensor &src,
                           uint64_t src_offset,
                           uint64_t count) override {
+        return copy_d2d_into(dst, 0, src, src_offset, count);
+    }
+
+    DeviceStatus copy_d2d_into(DeviceTensor &dst,
+                               uint64_t dst_offset,
+                               const DeviceTensor &src,
+                               uint64_t src_offset,
+                               uint64_t count) override {
         auto &d = as_tensor(dst);
         const auto &s = as_tensor(src);
         if (src_offset + count > s.count) return {false, "copy_d2d src oob"};
-        if (count > d.count) return {false, "copy_d2d dst oob"};
-        return cuda_status(cudaMemcpyAsync(d.ptr,
-                                            s.ptr + src_offset,
-                                            static_cast<size_t>(count) * sizeof(float),
+        if (dst_offset + count > d.count) return {false, "copy_d2d dst oob"};
+        if (d.elem_size != s.elem_size) return {false, "copy_d2d dtype mismatch"};
+        auto *dst_bytes = reinterpret_cast<uint8_t *>(d.ptr);
+        const auto *src_bytes = reinterpret_cast<const uint8_t *>(s.ptr);
+        return cuda_status(cudaMemcpyAsync(dst_bytes + dst_offset * d.elem_size,
+                                            src_bytes + src_offset * s.elem_size,
+                                            static_cast<size_t>(count) * d.elem_size,
                                             cudaMemcpyDeviceToDevice,
                                             exec_stream_),
                             "copy_d2d");
+    }
+
+    DeviceStatus pack_mtp_prefix_hinputs(DeviceTensor &dst,
+                                         const DeviceTensor &first_h,
+                                         const DeviceTensor &h_batch,
+                                         uint32_t batch,
+                                         uint32_t h_stride) override {
+        auto &d = as_tensor(dst);
+        const auto &first = as_tensor(first_h);
+        const auto &h = as_tensor(h_batch);
+        if (batch == 0 || h_stride == 0) return {};
+        if (d.elem_size != first.elem_size || d.elem_size != h.elem_size) {
+            return {false, "pack_mtp_prefix_hinputs dtype mismatch"};
+        }
+        if (first.count < h_stride) return {false, "pack_mtp_prefix_hinputs first_h oob"};
+        if (d.count < static_cast<uint64_t>(batch) * h_stride) {
+            return {false, "pack_mtp_prefix_hinputs dst oob"};
+        }
+        if (batch > 1 && h.count < static_cast<uint64_t>(batch - 1) * h_stride) {
+            return {false, "pack_mtp_prefix_hinputs h_batch oob"};
+        }
+
+        auto *dst_bytes = reinterpret_cast<uint8_t *>(d.ptr);
+        const auto *first_bytes = reinterpret_cast<const uint8_t *>(first.ptr);
+        const auto *h_bytes = reinterpret_cast<const uint8_t *>(h.ptr);
+        const size_t elem = d.elem_size;
+        const size_t row_bytes = static_cast<size_t>(h_stride) * elem;
+        if (auto st = cuda_status(cudaMemcpyAsync(dst_bytes,
+                                                  first_bytes,
+                                                  row_bytes,
+                                                  cudaMemcpyDeviceToDevice,
+                                                  exec_stream_),
+                                  "pack_mtp_prefix_hinputs first"); !st.ok) {
+            return st;
+        }
+        if (batch == 1) return {};
+        return cuda_status(cudaMemcpyAsync(dst_bytes + row_bytes,
+                                           h_bytes,
+                                           static_cast<size_t>(batch - 1) * row_bytes,
+                                           cudaMemcpyDeviceToDevice,
+                                           exec_stream_),
+                           "pack_mtp_prefix_hinputs tail");
+    }
+
+    DeviceStatus pack_mtp_concat(DeviceTensor &dst,
+                                 const DeviceTensor &left,
+                                 const DeviceTensor &right,
+                                 uint32_t batch,
+                                 uint32_t left_stride,
+                                 uint32_t right_stride,
+                                 uint32_t concat_stride,
+                                 uint32_t width) override {
+        auto &d = as_tensor(dst);
+        const auto &l = as_tensor(left);
+        const auto &r = as_tensor(right);
+        if (batch == 0 || width == 0) return {};
+        if (d.elem_size != l.elem_size || d.elem_size != r.elem_size) {
+            return {false, "pack_mtp_concat dtype mismatch"};
+        }
+        if (left_stride < width || right_stride < width || concat_stride < 2 * width) {
+            return {false, "pack_mtp_concat invalid stride"};
+        }
+        const uint64_t last = batch - 1;
+        if (l.count < last * left_stride + width) return {false, "pack_mtp_concat left oob"};
+        if (r.count < last * right_stride + width) return {false, "pack_mtp_concat right oob"};
+        if (d.count < last * concat_stride + static_cast<uint64_t>(2) * width) {
+            return {false, "pack_mtp_concat dst oob"};
+        }
+
+        auto *dst_bytes = reinterpret_cast<uint8_t *>(d.ptr);
+        const auto *left_bytes = reinterpret_cast<const uint8_t *>(l.ptr);
+        const auto *right_bytes = reinterpret_cast<const uint8_t *>(r.ptr);
+        const size_t elem = d.elem_size;
+        const size_t width_bytes = static_cast<size_t>(width) * elem;
+        const size_t dst_pitch = static_cast<size_t>(concat_stride) * elem;
+        const size_t left_pitch = static_cast<size_t>(left_stride) * elem;
+        const size_t right_pitch = static_cast<size_t>(right_stride) * elem;
+        if (auto st = cuda_status(cudaMemcpy2DAsync(dst_bytes,
+                                                    dst_pitch,
+                                                    left_bytes,
+                                                    left_pitch,
+                                                    width_bytes,
+                                                    batch,
+                                                    cudaMemcpyDeviceToDevice,
+                                                    exec_stream_),
+                                  "pack_mtp_concat left"); !st.ok) {
+            return st;
+        }
+        return cuda_status(cudaMemcpy2DAsync(dst_bytes + width_bytes,
+                                             dst_pitch,
+                                             right_bytes,
+                                             right_pitch,
+                                             width_bytes,
+                                             batch,
+                                             cudaMemcpyDeviceToDevice,
+                                             exec_stream_),
+                           "pack_mtp_concat right");
     }
 
 private:
@@ -4161,6 +4633,10 @@ private:
     // path did per token.
     int32_t *argmax_dev_ = nullptr;     // [token (int32), logit (float as int32 bits)]
     int32_t *argmax_host_ = nullptr;    // pinned host mirror, 2 ints
+    ArgmaxPair *argmax_batch_partial_ = nullptr;   // [batch * blocks_per_row]
+    ArgmaxPair *argmax_batch_result_ = nullptr;    // [batch]
+    uint64_t argmax_batch_partial_capacity_ = 0;
+    uint32_t argmax_batch_result_capacity_ = 0;
 };
 
 } // namespace

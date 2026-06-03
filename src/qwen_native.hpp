@@ -34,6 +34,18 @@ struct QwenLayerTensors {
     const GgufTensorInfo *ssm_out = nullptr;
 };
 
+struct QwenMtpTensors {
+    bool present = false;
+    uint32_t layer_index = 0;
+    QwenLayerTensors layer;
+    const GgufTensorInfo *eh_proj = nullptr;
+    const GgufTensorInfo *embed_tokens = nullptr;      // optional; falls back to token_embd.weight
+    const GgufTensorInfo *enorm = nullptr;
+    const GgufTensorInfo *hnorm = nullptr;
+    const GgufTensorInfo *shared_head_head = nullptr;  // optional; falls back to output.weight
+    const GgufTensorInfo *shared_head_norm = nullptr;  // optional; falls back to output_norm.weight
+};
+
 class QwenNativeModel {
 public:
     explicit QwenNativeModel(std::unique_ptr<GgufFile> gguf);
@@ -42,6 +54,7 @@ public:
     const NativePlanInfo &plan() const;
     const QwenConfig &config() const;
     const std::vector<QwenLayerTensors> &layers() const;
+    const QwenMtpTensors *mtp() const;
     const GgufTensorInfo *token_embedding() const;
     const GgufTensorInfo *output_norm() const;
     const GgufTensorInfo *output() const;
@@ -49,16 +62,20 @@ public:
 
 private:
     void bind();
+    void bind_mtp();
     const GgufTensorInfo *require_tensor(const std::string &name);
     const GgufTensorInfo *require_any_tensor(const std::vector<std::string> &names);
     const GgufTensorInfo *optional_tensor(const std::string &name);
     void add_missing(const std::string &name);
+    void add_mtp_missing(const std::string &name);
     void count_bound(const GgufTensorInfo *tensor);
+    void count_mtp_bound(const GgufTensorInfo *tensor);
 
     std::unique_ptr<GgufFile> gguf_;
     std::unique_ptr<QwenConfig> config_;
     NativePlanInfo plan_;
     std::vector<QwenLayerTensors> layers_;
+    QwenMtpTensors mtp_;
     const GgufTensorInfo *token_embd_ = nullptr;
     const GgufTensorInfo *output_norm_ = nullptr;
     const GgufTensorInfo *output_ = nullptr;

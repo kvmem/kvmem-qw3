@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace qw3 {
 
@@ -76,6 +78,12 @@ public:
     // as FP32 (i.e. don't blindly assume FP16 storage). The KV cache uses
     // this to halve attention bandwidth on the CUDA backend.
     virtual std::unique_ptr<DeviceTensor> tensor_f16(uint64_t count, const char *label) {
+        return tensor_f32(count, label);
+    }
+    // Transient FP32 workspace whose previous contents are never observed by
+    // correct code. Backends may skip initialization to avoid large scratch
+    // memset costs; conservative backends can keep zero-initialized behavior.
+    virtual std::unique_ptr<DeviceTensor> scratch_f32(uint64_t count, const char *label) {
         return tensor_f32(count, label);
     }
     virtual std::unique_ptr<DeviceWeight> weight_f32(const float *data, uint64_t count, const char *label) = 0;
@@ -160,6 +168,41 @@ public:
         return {};
     }
 
+    // Run several batched Q8_0 matmuls that share the same input batch. Backends
+    // can reuse input-side staging/quantization work across projections.
+    // `out_strides[i]` is the row stride for `outs[i]`.
+    virtual DeviceStatus q8_0_matmul_fanout(DeviceTensor *const *outs,
+                                            const DeviceWeight *const *weights,
+                                            const uint32_t *out_strides,
+                                            uint32_t n,
+                                            const DeviceTensor &x,
+                                            uint32_t batch,
+                                            uint32_t in_stride) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (auto st = q8_0_matmul(*outs[i], *weights[i], x,
+                                      batch, in_stride, out_strides[i]); !st.ok) {
+                return st;
+            }
+        }
+        return {};
+    }
+
+    // Batched fused matmul + residual add: out = residual + W*x. `matmul_tmp`
+    // is scratch used to hold W*x before the add. Default keeps the two-step
+    // path (matmul into tmp, then add); backends may fuse the residual add
+    // into the matmul writeback. Used by the batched MTP prefix path.
+    virtual DeviceStatus q8_0_matmul_add(DeviceTensor &out,
+                                         const DeviceTensor &residual,
+                                         DeviceTensor &matmul_tmp,
+                                         const DeviceWeight &weight,
+                                         const DeviceTensor &x,
+                                         uint32_t batch,
+                                         uint32_t in_stride,
+                                         uint32_t out_stride) {
+        if (auto st = q8_0_matmul(matmul_tmp, weight, x, batch, in_stride, out_stride); !st.ok) return st;
+        return add(out, residual, matmul_tmp);
+    }
+
     virtual DeviceStatus rms_norm(DeviceTensor &out, const DeviceTensor &x, const DeviceWeight &weight, float eps) = 0;
     // Batched RMS norm. out / x layouts: [batch, n], weight: [n] (shared).
     virtual DeviceStatus rms_norm_batch(DeviceTensor &out,
@@ -176,6 +219,14 @@ public:
         return {};
     }
     virtual DeviceStatus add(DeviceTensor &out, const DeviceTensor &a, const DeviceTensor &b) = 0;
+    // Prefix-limited elementwise add. Batched residual buffers are
+    // capacity-sized; small verifier batches must add only `count` elements,
+    // not every allocated row.
+    virtual DeviceStatus add_n(DeviceTensor &out, const DeviceTensor &a,
+                               const DeviceTensor &b, uint64_t count) {
+        if (count == out.count) return add(out, a, b);
+        return {false, "add_n requires backend override for partial tensors"};
+    }
     virtual DeviceStatus silu(DeviceTensor &out, const DeviceTensor &x) = 0;
     virtual DeviceStatus mul(DeviceTensor &out, const DeviceTensor &a, const DeviceTensor &b) = 0;
     // Default fallback: silu(gate) * up done as two separate kernels.
@@ -183,6 +234,15 @@ public:
     virtual DeviceStatus silu_mul(DeviceTensor &out, const DeviceTensor &gate, const DeviceTensor &up) {
         if (auto st = silu(const_cast<DeviceTensor &>(gate), gate); !st.ok) return st;
         return mul(out, gate, up);
+    }
+    // Prefix-limited SwiGLU. Batched scratch buffers are capacity-sized, so
+    // small verifier batches must not process every allocated row.
+    virtual DeviceStatus silu_mul_n(DeviceTensor &out,
+                                    const DeviceTensor &gate,
+                                    const DeviceTensor &up,
+                                    uint64_t count) {
+        if (count == out.count) return silu_mul(out, gate, up);
+        return {false, "silu_mul_n requires backend override for partial tensors"};
     }
     virtual DeviceStatus recurrent_single_token(DeviceTensor &core,
                                                 DeviceTensor &state,
@@ -276,7 +336,13 @@ public:
                                           uint32_t alpha_stride,
                                           uint32_t beta_stride,
                                           uint32_t core_stride,
-                                          float eps) {
+                                          float eps,
+                                          DeviceTensor *state_checkpoints = nullptr,
+                                          DeviceTensor *conv_state_checkpoints = nullptr,
+                                          uint32_t checkpoint_count = 0) {
+        (void)state_checkpoints;
+        (void)conv_state_checkpoints;
+        (void)checkpoint_count;
         for (uint32_t b = 0; b < batch; ++b) {
             if (auto st = recurrent_single_token_at(core, state, conv_state, conv_out_buf,
                                                     proj, gate, alpha, beta,
@@ -445,11 +511,62 @@ public:
         return {};
     }
 
+    // Combined prefill/verify attention + Q-gate application. Backends can
+    // override to fuse the final gate multiply into attention writeback; the
+    // default preserves the existing two-step behaviour.
+    virtual DeviceStatus attention_decode_batch_gated(DeviceTensor &out,
+                                                      const DeviceTensor &q,
+                                                      uint32_t q_stride,
+                                                      const DeviceTensor &k_cache,
+                                                      const DeviceTensor &v_cache,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t head_dim,
+                                                      uint32_t base_seq_len,
+                                                      uint32_t batch,
+                                                      uint32_t q_batch_stride,
+                                                      uint32_t out_batch_stride,
+                                                      float scale) {
+        if (auto st = attention_decode_batch(out, q, q_stride, k_cache, v_cache,
+                                             n_heads, n_kv_heads, head_dim,
+                                             base_seq_len, batch,
+                                             q_batch_stride, out_batch_stride,
+                                             scale); !st.ok) {
+            return st;
+        }
+        return apply_attn_gate_batch(out, q, q_stride, batch, q_batch_stride,
+                                     out_batch_stride, n_heads, head_dim);
+    }
+
     // Zero all floats in tensor. Used to reset KV / recurrent state between
     // generate() calls.
     virtual DeviceStatus zero_tensor(DeviceTensor &x) = 0;
 
     virtual DeviceArgmax argmax(const DeviceTensor &x) = 0;
+
+    // Batched argmax across `batch` rows of `row_stride` floats each. Default
+    // copies to host and scans; CUDA overrides with a device reduction.
+    virtual DeviceStatus argmax_batch(const DeviceTensor &x,
+                                      uint32_t batch,
+                                      uint32_t row_stride,
+                                      std::vector<DeviceArgmax> &out) {
+        out.assign(batch, DeviceArgmax{});
+        std::vector<float> host(static_cast<size_t>(batch) * row_stride);
+        if (auto st = copy_to_host(x, host.data(), 0, host.size()); !st.ok) return st;
+        for (uint32_t row = 0; row < batch; ++row) {
+            DeviceArgmax best;
+            best.logit = -std::numeric_limits<float>::infinity();
+            const float *base = host.data() + static_cast<size_t>(row) * row_stride;
+            for (uint32_t col = 0; col < row_stride; ++col) {
+                if (base[col] > best.logit) {
+                    best.logit = base[col];
+                    best.token = static_cast<int>(col);
+                }
+            }
+            out[row] = best;
+        }
+        return {};
+    }
 
     // Two-phase argmax for graph capture: launch the device kernel inside
     // the captured stream, then later sync + read the device buffer outside
@@ -478,6 +595,69 @@ public:
                                   uint64_t count) {
         (void)dst; (void)src; (void)src_offset; (void)count;
         return {false, "copy_d2d not implemented for this backend"};
+    }
+
+    // Offset-aware device-to-device copy. Counts are in tensor elements.
+    virtual DeviceStatus copy_d2d_into(DeviceTensor &dst,
+                                       uint64_t dst_offset,
+                                       const DeviceTensor &src,
+                                       uint64_t src_offset,
+                                       uint64_t count) {
+        if (dst_offset != 0) {
+            return {false, "copy_d2d_into with non-zero dst offset requires backend override"};
+        }
+        return copy_d2d(dst, src, src_offset, count);
+    }
+
+    // Pack MTP prefix hidden inputs:
+    //   dst[0]      = first_h
+    //   dst[1..T-1] = h_batch[0..T-2]
+    // Layout is row-major, with every row using `h_stride` elements.
+    virtual DeviceStatus pack_mtp_prefix_hinputs(DeviceTensor &dst,
+                                                 const DeviceTensor &first_h,
+                                                 const DeviceTensor &h_batch,
+                                                 uint32_t batch,
+                                                 uint32_t h_stride) {
+        if (batch == 0 || h_stride == 0) return {};
+        if (auto st = copy_d2d_into(dst, 0, first_h, 0, h_stride); !st.ok) return st;
+        if (batch == 1) return {};
+        return copy_d2d_into(dst,
+                             h_stride,
+                             h_batch,
+                             0,
+                             static_cast<uint64_t>(batch - 1) * h_stride);
+    }
+
+    // Pack MTP concat rows:
+    //   dst[row] = concat(left[row][0:width], right[row][0:width])
+    // Strides and width are in tensor elements.
+    virtual DeviceStatus pack_mtp_concat(DeviceTensor &dst,
+                                         const DeviceTensor &left,
+                                         const DeviceTensor &right,
+                                         uint32_t batch,
+                                         uint32_t left_stride,
+                                         uint32_t right_stride,
+                                         uint32_t concat_stride,
+                                         uint32_t width) {
+        if (batch == 0 || width == 0) return {};
+        for (uint32_t i = 0; i < batch; ++i) {
+            const uint64_t dst_row = static_cast<uint64_t>(i) * concat_stride;
+            if (auto st = copy_d2d_into(dst,
+                                        dst_row,
+                                        left,
+                                        static_cast<uint64_t>(i) * left_stride,
+                                        width); !st.ok) {
+                return st;
+            }
+            if (auto st = copy_d2d_into(dst,
+                                        dst_row + width,
+                                        right,
+                                        static_cast<uint64_t>(i) * right_stride,
+                                        width); !st.ok) {
+                return st;
+            }
+        }
+        return {};
     }
 };
 

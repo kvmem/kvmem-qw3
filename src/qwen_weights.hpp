@@ -56,6 +56,17 @@ struct QwenLayerWeights {
     uint64_t ssm_out_rows = 0;
 };
 
+struct QwenMtpWeights {
+    bool present = false;
+    QwenLayerWeights layer;
+    DeviceWeight *eh_proj = nullptr;
+    DeviceWeight *embed_tokens = nullptr;
+    DeviceWeight *enorm = nullptr;
+    DeviceWeight *hnorm = nullptr;
+    DeviceWeight *shared_head_head = nullptr;
+    DeviceWeight *shared_head_norm = nullptr;
+};
+
 class QwenWeights {
 public:
     QwenWeights(const QwenNativeModel &model, DeviceBackend &backend);
@@ -69,6 +80,7 @@ public:
     DeviceWeight &output() const { return *output_; }
 
     const QwenLayerWeights &layer(uint32_t i) const { return layers_[i]; }
+    const QwenMtpWeights *mtp() const { return mtp_.present ? &mtp_ : nullptr; }
     uint32_t n_layers() const { return static_cast<uint32_t>(layers_.size()); }
 
     uint64_t total_bytes_uploaded() const { return uploaded_bytes_; }
@@ -76,6 +88,7 @@ public:
 
 private:
     DeviceWeight *bind(const GgufTensorInfo *tensor);
+    QwenLayerWeights bind_layer(const QwenLayerTensors &src);
 
     const QwenNativeModel &model_;
     DeviceBackend &backend_;
@@ -85,6 +98,7 @@ private:
     DeviceWeight *output_norm_ = nullptr;
     DeviceWeight *output_ = nullptr;
     std::vector<QwenLayerWeights> layers_;
+    QwenMtpWeights mtp_;
     uint64_t uploaded_bytes_ = 0;
 };
 

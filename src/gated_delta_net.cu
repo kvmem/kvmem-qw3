@@ -29,13 +29,16 @@
 namespace qw3 {
 namespace ported {
 
-// In-place prep: convert qw3's raw alpha and beta into the (log_g,
-// sigmoid_beta) form expected by gated_delta_net_kernel.
+// In-place prep: convert qw3's raw alpha and beta into the (g, sigmoid_beta)
+// form consumed by gated_delta_net_kernel.
 //
-//   log_g[t, vh]      = softplus(alpha[t, vh] + dt_bias[vh]) * ssm_a[vh]
+//   g[t, vh]          = exp(softplus(alpha[t, vh] + dt_bias[vh]) * ssm_a[vh])
 //   sigmoid_beta[t,v] = 1 / (1 + exp(-beta[t, vh]))
 //
-// Both arrays are read with stride [T, num_v_heads]; rewritten in place.
+// Both arrays are read with stride [T, num_v_heads]; rewritten in place. The
+// exp is done HERE, once per (t, vh), instead of inside the main kernel's hot
+// loop where every column-block CTA × warp would recompute the same value at
+// every timestep (num_v_heads × S_v × 32 redundant evals per timestep).
 __global__ void prep_log_g_sigmoid_beta_kernel(
         float *       alpha,        // [T, num_v_heads], stride alpha_stride
         float *       beta,         // [T, num_v_heads], stride beta_stride
@@ -57,7 +60,8 @@ __global__ void prep_log_g_sigmoid_beta_kernel(
     const float a_raw = alpha[a_idx];
     const float bias  = dt_bias[vh];
     const float a_v   = ssm_a[vh];
-    alpha[a_idx] = log1pf(expf(a_raw + bias)) * a_v;
+    const float log_g = log1pf(expf(a_raw + bias)) * a_v;
+    alpha[a_idx] = expf(log_g);   // store the decay g directly (hoisted exp)
 
     const float b_raw = beta[b_idx];
     beta[b_idx] = 1.0f / (1.0f + expf(-b_raw));
@@ -73,7 +77,7 @@ gated_delta_net_kernel(
         const float * q,            // [T, num_k_heads, S_v]
         const float * k,            // [T, num_k_heads, S_v]
         const float * v,            // [T, num_v_heads, S_v]
-        const float * log_g,        // [T, num_v_heads]
+        const float * g_decay,      // [T, num_v_heads], pre-exp'd decay g
         const float * sigmoid_beta, // [T, num_v_heads]
         float *       state,        // [num_v_heads, S_v, S_v]
         float *       out,          // [T, num_v_heads, S_v]
@@ -117,7 +121,7 @@ gated_delta_net_kernel(
         const float * k_t = k + t * qkv_row_stride + k_head_off;
         const float * v_t = v + t * v_row_stride   + v_head_off;
 
-        const float g_val    = expf(log_g[t * gb_row_stride + vh]);
+        const float g_val    = g_decay[t * gb_row_stride + vh];
         const float beta_val = sigmoid_beta[t * gb_row_stride + vh];
 
         float k_reg[rows_per_lane];
@@ -164,7 +168,7 @@ gated_delta_net_kernel(
 
 // qw3-facing launcher. Returns true on success; false if S_v is unsupported.
 bool launch_gated_delta_net(
-        float *       alpha_inout,        // raw alpha → overwritten with log_g
+        float *       alpha_inout,        // raw alpha -> overwritten with decay g (exp hoisted into prep)
         float *       beta_inout,         // raw beta  → overwritten with sigmoid_beta
         const float * dt_bias,
         const float * ssm_a,
@@ -209,7 +213,7 @@ bool launch_gated_delta_net(
             conv_qkv + q_offset,
             conv_qkv + k_offset,
             conv_qkv + v_offset,
-            alpha_inout,    // now log_g
+            alpha_inout,    // now decay g
             beta_inout,     // now sigmoid_beta
             state, core_out,
             T,

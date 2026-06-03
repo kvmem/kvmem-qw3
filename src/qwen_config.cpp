@@ -50,7 +50,14 @@ QwenConfig::QwenConfig(const GgufFile &gguf) {
     }
     const std::string p = architecture + ".";
 
-    n_layers = as_u32(require(gguf, p + "block_count"));
+    block_count = as_u32(require(gguf, p + "block_count"));
+    if (const auto *nextn = optional(gguf, p + "nextn_predict_layers")) {
+        nextn_predict_layers = as_u32(*nextn);
+    }
+    if (nextn_predict_layers > block_count) {
+        throw std::runtime_error("nextn_predict_layers exceeds block_count");
+    }
+    n_layers = block_count - nextn_predict_layers;
     n_embd = as_u32(require(gguf, p + "embedding_length"));
     n_ff = as_u32(require(gguf, p + "feed_forward_length"));
     n_ctx_train = as_u32(require(gguf, p + "context_length"));

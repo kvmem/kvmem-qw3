@@ -17,6 +17,7 @@ struct NativeExecutorReport {
     float argmax_logit = 0.0f;
     std::string argmax_text;
     std::vector<std::string> executed;
+    std::vector<double> elapsed_us;
     std::vector<std::string> missing_kernels;
 };
 
@@ -28,6 +29,22 @@ struct NativeExecutorReport {
  * this class except by pointer. */
 class QwenExecutor {
 public:
+    struct StateSnapshot {
+        bool ready = false;
+        uint32_t position = 0;
+        std::unique_ptr<DeviceTensor> h;
+        std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
+        std::vector<std::unique_ptr<DeviceTensor>> conv_states;
+    };
+    struct StateCheckpointSet {
+        bool ready = false;
+        uint32_t base_position = 0;
+        uint32_t count = 0;
+        uint32_t h_stride = 0;
+        std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
+        std::vector<std::unique_ptr<DeviceTensor>> conv_states;
+    };
+
     QwenExecutor(const QwenNativeModel &model,
                  const QwenWeights &weights,
                  DeviceBackend &backend,
@@ -39,13 +56,47 @@ public:
     uint32_t kv_ctx_size() const { return kv_ctx_size_; }
 
     NativeExecutorReport dry_run_token(uint32_t token_id, bool execute_heavy);
-    NativeExecutorReport forward_one_token(uint32_t token_id);
+    NativeExecutorReport forward_one_token(uint32_t token_id,
+                                           bool compute_logits = true);
     // Batched prefill. Processes `tokens` consecutively as a single forward
     // pass using batched matmuls for the linear projections + FFN. Per-token
     // ops (attention, recurrent state) still iterate sequentially inside.
-    // After return, position_ has advanced by tokens.size() and the LM-head
-    // logits + argmax correspond to the LAST token in the batch.
-    NativeExecutorReport forward_n_tokens(const std::vector<uint32_t> &tokens);
+    // After return, position_ has advanced by tokens.size(). When
+    // compute_logits is true, the LM-head logits + argmax correspond to the
+    // LAST token in the batch. Chunked prefill can set compute_logits=false
+    // for intermediate chunks because only the final prompt token seeds decode.
+    NativeExecutorReport forward_n_tokens(const std::vector<uint32_t> &tokens,
+                                          bool compute_logits = true,
+                                          std::vector<DeviceArgmax> *row_argmaxes = nullptr,
+                                          StateCheckpointSet *state_checkpoints = nullptr,
+                                          uint32_t state_checkpoint_count = 0,
+                                          bool copy_last_logits = true);
+
+    // Diagnostic single-step MTP draft head. Uses the current target
+    // pre-output hidden state (`h_`) plus `token_id` and writes MTP logits to
+    // the normal logits buffer. This does not perform speculative acceptance.
+    NativeExecutorReport forward_mtp_draft(uint32_t token_id);
+    std::vector<NativeExecutorReport> forward_mtp_draft_chain(uint32_t token_id,
+                                                              uint32_t max_tokens);
+    std::vector<NativeExecutorReport> forward_mtp_draft_chain_with_prefix(uint32_t token_id,
+                                                                          uint32_t max_tokens);
+    NativeExecutorReport prime_mtp_prefix_from_last_batch(const std::vector<uint32_t> &tokens,
+                                                          uint32_t base_position,
+                                                          uint32_t batch_min_override = 0);
+    NativeExecutorReport prime_mtp_prefix_from_current(uint32_t token,
+                                                       uint32_t base_position);
+    NativeExecutorReport replay_tokens_with_mtp_prefix(const std::vector<uint32_t> &tokens,
+                                                       uint32_t base_position,
+                                                       bool rebuild_prefix,
+                                                       double *prefix_seconds = nullptr,
+                                                       uint64_t *prefix_ops = nullptr);
+    void commit_mtp_prefix(uint32_t prefix_len);
+    void commit_mtp_prefix_from_current_hidden(uint32_t prefix_len);
+    StateSnapshot snapshot_state();
+    void capture_state(StateSnapshot &snapshot);
+    void restore_state(const StateSnapshot &snapshot);
+    void restore_state_checkpoint(const StateCheckpointSet &checkpoints,
+                                  uint32_t index);
 
     // Per-token batch-scratch footprint in bytes (sum of all *_batch_ tensors
     // at batch=1). Used to size prefill chunks against free device memory.
@@ -64,8 +115,18 @@ public:
     bool copy_last_logits(std::vector<float> &out) const;
 
 private:
+    void begin_record_timing(bool enabled) const;
     void record(NativeExecutorReport &report, const std::string &op) const;
     void ensure_scratch();
+    void ensure_mtp_scratch();
+    void ensure_mtp_batch_scratch(uint32_t batch);
+    void ensure_logits_batch_scratch(uint32_t batch);
+    NativeExecutorReport forward_mtp_draft_from(uint32_t token_id,
+                                                const DeviceTensor &h_input,
+                                                uint32_t rope_pos,
+                                                uint32_t cache_pos,
+                                                uint32_t seq_len,
+                                                bool compute_logits = true);
 
     const QwenNativeModel &model_;
     const QwenWeights &weights_;
@@ -130,6 +191,33 @@ private:
     std::vector<std::unique_ptr<DeviceTensor>> k_cache_;
     std::vector<std::unique_ptr<DeviceTensor>> v_cache_;
 
+    bool mtp_scratch_ready_ = false;
+    std::unique_ptr<DeviceTensor> mtp_h_;
+    std::unique_ptr<DeviceTensor> mtp_embd_;
+    std::unique_ptr<DeviceTensor> mtp_enorm_;
+    std::unique_ptr<DeviceTensor> mtp_hnorm_;
+    std::unique_ptr<DeviceTensor> mtp_concat_;
+    std::unique_ptr<DeviceTensor> mtp_k_cache_;
+    std::unique_ptr<DeviceTensor> mtp_v_cache_;
+    std::unique_ptr<DeviceTensor> mtp_zero_h_;
+    std::unique_ptr<DeviceTensor> mtp_prefix_h_;
+    uint32_t mtp_batch_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> mtp_h_input_batch_;
+    std::unique_ptr<DeviceTensor> mtp_h_batch_;
+    std::unique_ptr<DeviceTensor> mtp_norm_batch_;
+    std::unique_ptr<DeviceTensor> mtp_concat_batch_;
+    std::unique_ptr<DeviceTensor> mtp_q_batch_;
+    std::unique_ptr<DeviceTensor> mtp_k_batch_;
+    std::unique_ptr<DeviceTensor> mtp_v_batch_;
+    std::unique_ptr<DeviceTensor> mtp_mid_batch_;
+    std::unique_ptr<DeviceTensor> mtp_ffn_gate_batch_;
+    std::unique_ptr<DeviceTensor> mtp_ffn_up_batch_;
+    std::unique_ptr<DeviceTensor> mtp_ffn_mid_batch_;
+    std::unique_ptr<DeviceTensor> mtp_ffn_out_batch_;
+    uint32_t mtp_prefix_len_ = 0;
+    uint32_t logits_batch_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> logits_batch_;
+
     uint32_t kv_ctx_size_ = 0;
     uint32_t position_ = 0;
     int      prefill_chunk_override_ = -1;
@@ -139,6 +227,8 @@ private:
     // so every backend-side scratch buffer (q8_1, fattn, argmax_dev, ...) is
     // allocated and primed before we record pointers into a graph.
     bool decode_graph_warmup_pending_ = true;
+
+    mutable double trace_last_seconds_ = 0.0;
 };
 
 } // namespace qw3

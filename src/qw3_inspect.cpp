@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
                   << "metadata: " << info.metadata_count << "\n"
                   << "tensors: " << info.tensor_count << "\n"
                   << "blocks: " << info.block_count << "\n"
+                  << "nextn_predict_layers: " << info.nextn_predict_layers << "\n"
                   << "embedding: " << info.embedding_length << "\n"
                   << "heads: " << info.head_count << "\n"
                   << "kv_heads: " << info.head_count_kv << "\n"

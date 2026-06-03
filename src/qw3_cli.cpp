@@ -28,6 +28,10 @@ void usage(std::ostream &os) {
         "  --native-heavy        Execute the full native device single-token path\n"
         "  --native-kernels NAME cuda. Default: cuda\n"
         "  --native-linear-backend NAME auto, cublas, or custom. Default: auto\n"
+        "  --native-mtp-trace    Run one optional MTP draft-head diagnostic\n"
+        "  --native-mtp-chain N  Diagnostic MTP draft chain length. Default: 1\n"
+        "  --native-mtp-prefix   Populate diagnostic MTP prefix KV before drafts\n"
+        "  --native-mtp-speculate Experimental MTP speculative decode\n"
         "  --native-token-id N   Token id used by qwen-native single-token forward. Default: 0\n"
         "  --prefill-chunk N     Prefill chunk size in tokens (qwen-native).\n"
         "                        0 = no chunking (whole-prompt batch, max throughput,\n"
@@ -143,6 +147,14 @@ int main(int argc, char **argv) {
                 engine.native_kernels = need(arg);
             } else if (arg == "--native-linear-backend") {
                 engine.native_linear_backend = need(arg);
+            } else if (arg == "--native-mtp-trace") {
+                engine.native_mtp_trace = true;
+            } else if (arg == "--native-mtp-chain") {
+                engine.native_mtp_chain = parse_int(need(arg), arg);
+            } else if (arg == "--native-mtp-prefix") {
+                engine.native_mtp_prefix = true;
+            } else if (arg == "--native-mtp-speculate") {
+                engine.native_mtp_speculate = true;
             } else if (arg == "--native-token-id") {
                 engine.native_token_id = parse_int(need(arg), arg);
             } else if (arg == "--prefill-chunk") {
@@ -193,6 +205,7 @@ int main(int argc, char **argv) {
                       << "metadata: " << info.metadata_count << "\n"
                       << "tensors: " << info.tensor_count << "\n"
                       << "blocks: " << info.block_count << "\n"
+                      << "nextn_predict_layers: " << info.nextn_predict_layers << "\n"
                       << "embedding: " << info.embedding_length << "\n"
                       << "heads: " << info.head_count << "\n"
                       << "kv_heads: " << info.head_count_kv << "\n"
@@ -226,16 +239,25 @@ int main(int argc, char **argv) {
             std::cout << "native backend: " << (plan.supported ? "supported" : "incomplete") << "\n"
                       << "architecture: " << plan.architecture << "\n"
                       << "layers: " << plan.n_layers << "\n"
+                      << "total_layers: " << plan.n_total_layers << "\n"
+                      << "nextn_predict_layers: " << plan.n_nextn_predict_layers << "\n"
                       << "embedding: " << plan.n_embd << "\n"
                       << "heads: " << plan.n_heads << "\n"
                       << "kv_heads: " << plan.n_kv_heads << "\n"
                       << "context_train: " << plan.n_ctx_train << "\n"
                       << "tensors: " << plan.n_tensors << "\n"
                       << "bound_tensors: " << plan.n_bound_tensors << "\n"
-                      << "tensor_bytes: " << plan.tensor_bytes << "\n";
+                      << "tensor_bytes: " << plan.tensor_bytes << "\n"
+                      << "mtp_supported: " << (plan.mtp_supported ? "yes" : "no") << "\n"
+                      << "mtp_layer_index: " << plan.mtp_layer_index << "\n"
+                      << "mtp_bound_tensors: " << plan.mtp_bound_tensors << "\n";
             if (!plan.missing_tensors.empty()) {
                 std::cout << "missing_tensors:\n";
                 for (const std::string &name : plan.missing_tensors) std::cout << "  " << name << "\n";
+            }
+            if (!plan.mtp_missing_tensors.empty()) {
+                std::cout << "mtp_missing_tensors:\n";
+                for (const std::string &name : plan.mtp_missing_tensors) std::cout << "  " << name << "\n";
             }
             std::cout << "op_plan:\n";
             for (const std::string &op : plan.op_plan) std::cout << "  " << op << "\n";

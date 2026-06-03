@@ -39,6 +39,10 @@ struct EngineOptions {
     //                  throughput; peak scratch grows linearly with prompt length.
     //   >0           : process prefill in fixed-size chunks of this many tokens.
     int prefill_chunk = -1;
+    bool native_mtp_trace = false; // run one optional MTP draft-head diagnostic
+    int native_mtp_chain = 1; // diagnostic MTP draft chain length
+    bool native_mtp_prefix = false; // populate diagnostic MTP prefix KV cache
+    bool native_mtp_speculate = false; // run experimental MTP speculative decode
 };
 
 struct GenerationOptions {
@@ -58,12 +62,15 @@ struct ModelInfo {
     uint32_t context_length = 0;
     uint64_t tensor_count = 0;
     uint64_t metadata_count = 0;
+    uint32_t nextn_predict_layers = 0;
 };
 
 struct NativePlanInfo {
     bool supported = false;
     std::string architecture;
-    uint32_t n_layers = 0;
+    uint32_t n_layers = 0; // main transformer layers executed by qwen-native
+    uint32_t n_total_layers = 0; // raw GGUF block_count, including trailing MTP blocks
+    uint32_t n_nextn_predict_layers = 0;
     uint32_t n_embd = 0;
     uint32_t n_heads = 0;
     uint32_t n_kv_heads = 0;
@@ -73,7 +80,11 @@ struct NativePlanInfo {
     uint64_t tensor_bytes = 0;
     uint32_t standard_attention_layers = 0;
     uint32_t recurrent_layers = 0;
+    bool mtp_supported = false;
+    uint32_t mtp_layer_index = 0;
+    uint32_t mtp_bound_tensors = 0;
     std::vector<std::string> missing_tensors;
+    std::vector<std::string> mtp_missing_tensors;
     std::vector<std::string> op_plan;
 };
 

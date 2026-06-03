@@ -859,3 +859,128 @@ when they conflict:
   condition is the full sweep (556–65K), not the headline number.
   Short-T regressions are real regressions even if long-T wins are
   big.
+
+---
+
+## MTP speculative decode — correctness & the byte-identity question (2026-06-02)
+
+### TL;DR
+
+MTP speculative decode is **algorithmically lossless** (every committed
+token is a valid greedy argmax of the target model — acceptance only
+commits draft tokens that equal the target's own argmax). It is **not**
+bit-reproducible against plain greedy under the FlashInfer default, and
+— the surprising part — **plain greedy is not bit-reproducible against
+itself** either. The root cause is floating-point **atomic accumulation
+in split-K / stream-K attention reductions**, which is shared by the
+plain and MTP paths alike. This is a *reproducibility* property, not an
+*accuracy* loss. No quality regression, no acceptance-rate impact.
+
+### What was originally suspected (and was wrong)
+
+Initial hypothesis: MTP routes attention through a *different kernel*
+than plain decode, and that kernel mismatch flips a borderline argmax.
+Partly true but not the cause. The dispatch (kernels_cuda.cu) is:
+
+| Path | Batch | Kernel (FI default) |
+|---|---|---|
+| Plain single-token decode (`attention_decode`) | 1 | FI **decode** (`launch_decode_f32q_f16kv`, FP32 Q, stream-K) |
+| MTP verify (`attention_decode_batch`, chain+1) | 3–9 | was native splitk (batch < `prefill_attn_min_batch`=16); now FI prefill after the 2026-06-02 gate drop |
+| Prompt prefill (`attention_decode_batch`) | ≥16 | FI **prefill** (`launch_prefill_f16q_f16kv`, FP16 Q) |
+
+FlashInfer ships attention as **two distinct kernels** (decode FP32-Q,
+prefill FP16-Q); the native path (`fattn_vec_decode_f16_splitk`) is
+**one kernel** covering both batch=1 and batch=N. That asymmetry made
+"native looks byte-identical, FI doesn't" *seem* like the kernel
+mismatch was the cause.
+
+### The experiments that found the real cause
+
+All on the same build, prompt = "Hello! Briefly tell me what
+FlashAttention is.", `-n 48`, greedy:
+
+1. **native attn, MTP vs plain** → byte-identical (initially looked
+   like proof that native is reproducible).
+2. **FI sequential verify** (loops the *same* FI decode kernel plain
+   uses) → **still diverged**. So the flip is *not* in verify — it is
+   seeded upstream and merely inherited.
+3. **Plain greedy run 5× under FI** → **2 distinct outputs** (4× / 1×).
+   Plain greedy is non-deterministic.
+4. **Plain greedy run 5× under native** → **same 2 distinct outputs**
+   (4× / 1×). So native's "byte-identity" in (1) was sampling luck on a
+   short generation, not determinism.
+5. **native + `QW3_FATTN_NSPLIT=1`** (disables qw3's attention split-K)
+   → **5/5 identical**. Nondeterminism eliminated.
+6. **FI + `QW3_FATTN_NSPLIT=1`** → still 2 variants. FI's stream-K is
+   *internal* and not governed by `QW3_FATTN_NSPLIT`, so it stays
+   non-deterministic.
+
+### Root cause
+
+Split-K / stream-K attention decomposition accumulates partial results
+across thread blocks via **floating-point atomics**. Atomic add order is
+nondeterministic across runs → fp16/fp32 rounding differs by 1 ULP on
+some elements → on a token where the top-2 logits are within that noise,
+the argmax flips. Both the FI kernels and qw3's native splitk do this;
+`QW3_FATTN_NSPLIT=1` removes it for the native path only (FI's stream-K
+is internal). This is the same class of nondeterminism as varying batch
+size or cuBLAS algo — it pre-dates MTP and affects plain greedy equally.
+
+### Why this is not an accuracy or acceptance problem
+
+- **Accuracy:** every committed token is the target model's own greedy
+  argmax (computed by whichever kernel ran). No token is accepted that
+  the target wouldn't have produced. Both trajectories at a flip point
+  are valid fp16 greedy outputs; neither is "more correct."
+- **Acceptance rate:** governed by how well the draft head predicts the
+  target argmax — a draft-quality property, not a kernel property. The
+  1-ULP atomic noise only matters at near-tied positions, which are
+  rare. Measured acceptance is in the same band regardless of kernel
+  (FI ≈0.76, native ≈0.72, qw3_ly-no-FI ≈0.72).
+- **A low acceptance rate only costs speed, never correctness** — at 0%
+  acceptance MTP degrades to plain per-token decode, still 100% valid.
+
+### The 2026-06-02 change (route MTP small-batch attention to FI)
+
+User asked: "just use FI for all attention." Done — dropped the
+`batch >= prefill_attn_min_batch()` gate on the **FI prefill branch
+only** in `attention_decode_batch` (changed to `batch >= 1`). The other
+branches (cuBLAS, MMA v2–v5, tiled) keep the gate, so the non-FI build
+and the `QW3_PREFILL_ATTN=mma-gqa-v2` native path are untouched. Effect:
+MTP verify (batch=chain+1) and sub-16-token prompts now run on the FI
+prefill kernel instead of falling through to native splitk.
+
+- **Correctness:** fine. Output coherent, acceptance 0.76, decode
+  perf-neutral (51.8 vs 51.7 tok/s). The FI prefill adapter
+  (`flashinfer_prefill_adapter.cu:run_prefill_typed`) has no lower batch
+  bound — only needs `head_dim==256` and a valid GQA ratio.
+- **Short-prompt prefill:** perf-neutral at the 12-token prompt
+  (122–123 tok/s either way), since prefill of a tiny prompt is
+  launch-bound, not attention-bound.
+- **Does NOT achieve byte-identity** — that was never reachable under FI
+  (FI's two kernels differ, and stream-K atomics are non-deterministic
+  regardless). The gate was a pure performance heuristic, not a
+  correctness guard, so dropping it for the FI branch is safe.
+
+### How to get bit-exact greedy, if ever required (regression testing)
+
+There is no way to make FI bit-reproducible from qw3 (its stream-K is
+internal). The only deterministic config today is:
+
+```
+QW3_DECODE_ATTN=native QW3_PREFILL_ATTN=mma-gqa-v2 QW3_FATTN_NSPLIT=1 QW3_PREFILL_FA2_NSPLIT=1
+```
+
+native single-kernel attention + split-K disabled → 5/5 identical, and
+MTP-speculate == plain-greedy byte-for-byte. Cost: NSPLIT=1 serializes
+the KV reduction (slower at long context, the whole point of split-K).
+This is the right knob set for a "speculative == greedy" CI gate; it is
+**not** the right default (it sacrifices the FI long-context throughput
+win for a reproducibility property end users don't need). A future
+deterministic-reduction attention kernel (tree reduction instead of
+atomics, fixed block order) would give bit-exactness without the
+split-K throughput loss — exploratory, low priority, only worth it if a
+bit-exact gate becomes a hard requirement. Relates to roadmap item #10
+(numerical drift on greedy), of which this is the run-to-run-within-qw3
+component.
+

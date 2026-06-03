@@ -313,6 +313,7 @@ ModelInfo GgufFile::model_info() const {
     if (arch_it != impl_->metadata.end()) info.architecture = arch_it->second.string_value;
     const std::string prefix = info.architecture.empty() ? std::string{} : info.architecture + ".";
     info.block_count = get_u32(impl_->metadata, prefix + "block_count");
+    info.nextn_predict_layers = get_u32(impl_->metadata, prefix + "nextn_predict_layers");
     info.embedding_length = get_u32(impl_->metadata, prefix + "embedding_length");
     info.head_count = get_u32(impl_->metadata, prefix + "attention.head_count");
     info.head_count_kv = get_u32(impl_->metadata, prefix + "attention.head_count_kv");

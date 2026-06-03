@@ -252,6 +252,84 @@ Smoke test without weights:
 ./build/qw3 --backend mock -p hello
 ```
 
+## MTP speculative decode
+
+Qwen 3.6 ships a single Multi-Token-Prediction (MTP / NextN) draft head
+(`nextn_predict_layers: 1`, bound at layer index 64). The Q8_0 GGUF already
+carries the 15 MTP head tensors — check with `qw3-inspect` / `--native-plan`
+(`mtp_supported: yes`). The draft head proposes a chain of speculative tokens;
+the target verifies them in a single batched forward and accepts the longest
+greedy-matching prefix, rolling back KV + DeltaNet recurrent state on the first
+rejection.
+
+```sh
+# Speculative decode, draft chain of 2, mandatory adaptive depth controller:
+QW3_MTP_POLICY=adaptive ./build/qw3 \
+  --backend qwen-native --native-heavy --native-kernels cuda \
+  --native-linear-backend auto \
+  --model /path/to/Qwen3.6-27B-Q8_0.gguf \
+  --native-mtp-speculate --native-mtp-chain 2 \
+  -p "Explain Adam optimizer in one paragraph." -n 256
+```
+
+| Flag | Purpose |
+|---|---|
+| `--native-mtp-speculate` | Enable the speculative decode path (draft → batched verify → accept/rollback). |
+| `--native-mtp-chain N`   | Draft chain length (default 1). With `QW3_MTP_POLICY=adaptive`, this is the starting depth. |
+| `--native-mtp-trace`     | Diagnostic: run the draft head once per step and report acceptance, without speculating. |
+| `--native-mtp-prefix`    | Diagnostic: prime the MTP prefix KV cache before drafting. |
+
+**Acceptance / lossiness.** Speculative decode is greedy-lossless *when the
+draft-built and decode-built KV caches come from the same attention kernel*. The
+in-tree `native` attention (`QW3_DECODE_ATTN=native QW3_PREFILL_ATTN=mma-gqa-v2`)
+satisfies this: speculative output is byte-identical to plain greedy. The
+**FlashInfer default** uses a batched prefill kernel to prime the MTP prefix and
+a single-token decode kernel for plain steps; those agree only up to fp16
+rounding, so a borderline-tied argmax can flip a token. This is a numerical
+property of mixing two FI kernels, not an acceptance-logic error. Set
+`QW3_DECODE_ATTN=native QW3_PREFILL_ATTN=mma-gqa-v2` if you need bit-exact
+speculative == greedy.
+
+The non-MTP greedy path is untouched and remains byte-identical regardless of
+attention backend.
+
+Scripts (`./build/qw3` is the default binary path):
+
+```sh
+# Acceptance sweep (trace or --mtp-speculate), compact table + optional JSON:
+python3 scripts/mtp_acceptance_probe.py --mtp-chain 2 --mtp-speculate -n 64
+
+# Head-to-head vs llama.cpp draft-MTP (needs llama-server with --spec-type draft-mtp):
+python3 scripts/mtp_compare_with_llama_cpp.py --mtp-chains 2 --prompt-tokens "4096 8192"
+```
+
+### Adaptive MTP depth policy
+
+`QW3_MTP_POLICY=adaptive` runs a benefit/cost controller that promotes or demotes
+the draft depth from windowed acceptance statistics (benefit =
+`full_accept_rate / avg_committed_tokens`; marginal cost from a per-depth
+round-cost table). Add `QW3_MTP_POLICY_TRACE=1` to log per-batch
+`depth / action / benefit / cost`. Tuning knobs (all optional):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `QW3_MTP_POLICY`              | `off`   | `adaptive` enables the depth controller. |
+| `QW3_MTP_ADAPTIVE_MAX_CHAIN`  | chain   | Upper depth bound for promotion. |
+| `QW3_MTP_ADAPTIVE_MIN_CHAIN`  | `1`     | Lower depth bound for demotion. |
+| `QW3_MTP_ADAPTIVE_UPDATE_INTERVAL` | `16` | Batches per control window. |
+| `QW3_MTP_ADAPTIVE_MIN_BATCHES`| `64`    | Warmup batches before the first promotion/demotion. |
+| `QW3_MTP_ADAPTIVE_COOLDOWN`   | `8`     | Windows to wait after a depth change. |
+| `QW3_MTP_ADAPTIVE_PROMOTE_MARGIN` / `_DEMOTE_MARGIN` | `0.005` | Benefit-vs-cost margins gating a change. |
+
+### MTP correctness / verifier knobs
+
+| Env var | Default | Effect |
+|---|---|---|
+| `QW3_MTP_VERIFY`              | `batched` | `sequential` verifies drafts one token at a time (slower; same acceptance). |
+| `QW3_MTP_SAFE_MAX_CHAIN`      | guard   | Caps the effective chain to a correctness-safe maximum. |
+| `QW3_MTP_PREFIX_MAX_PROMPT`   | guard   | Disables prefix priming above this prompt length (falls back gracefully). |
+| `QW3_MTP_TRANSACTIONAL_REPLAY`| `1`     | Commit verifier tokens through the stable single-token state path. |
+
 ## Tuning knobs
 
 Most defaults are correct on Blackwell + Qwen 3.6. The env knobs below are

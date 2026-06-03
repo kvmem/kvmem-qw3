@@ -136,7 +136,12 @@ constexpr __host__ __device__ int q8_mmvq_nwarps() {
 
 template <int NCOLS_DST>
 constexpr __host__ __device__ int q8_mmvq_rows_per_block() {
-    return NCOLS_DST == 1 ? 1 : 2;
+    // 1 row per CUDA block for all batch widths. The 2-rows-per-block variant
+    // reuses each activation column across two weight rows, but for the narrow
+    // MTP verify batch (NCOLS_DST 2..6) the extra register + shared-memory
+    // pressure costs more occupancy than the reuse buys. Measured against
+    // qw3_ly: 1 row/block is the faster default for verify batches.
+    return 1;
 }
 
 // Load one int (4 int8s) from a byte stream that is only 2-byte aligned
@@ -193,22 +198,28 @@ __global__ void mul_mat_vec_q8_0_kernel(
     for (int kbx = tid / (QI8_0 / VDR_Q8_0); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kqs = VDR_Q8_0 * (tid % (QI8_0 / VDR_Q8_0));    // 0,2,4,6 (in ints)
 
+        // Weight row (i) is the OUTER loop so each Q8 weight block is fetched
+        // ONCE and reused across all NCOLS_DST activation columns. Decode/verify
+        // matvec is HBM-weight-bandwidth-bound, so amortizing the weight read
+        // across columns makes verify(N) cost ~one weight read instead of N.
+        // (Column-outer ordering re-read the weight N times — the whole reason
+        // the MTP verify batch was as slow as N separate decodes.)
         #pragma unroll
-        for (int j = 0; j < NCOLS_DST; ++j) {
-            const block_q8_1 * ya = vy + j * stride_y_row + kbx;
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            const uint64_t row_idx = static_cast<uint64_t>(row0 + i);
+            if (rows_per_cuda_block > 1 && row_idx >= rows) break;
+            const uint8_t * row_base = vx + row_idx * blocks_per_row_x * 34;
+            const half      d_w_h = static_cast<half>(
+                cuda_helpers::q8_d_plane(row_base)[kbx]);
+            const float     d_w   = __half2float(d_w_h);
+            const int8_t  * qs_blk =
+                cuda_helpers::q8_qs_plane(row_base, blocks_per_row_x) + kbx * 32;
+            const uint8_t * qs_u8 = reinterpret_cast<const uint8_t *>(qs_blk);
 
             #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                const uint64_t row_idx = static_cast<uint64_t>(row0 + i);
-                if (rows_per_cuda_block > 1 && row_idx >= rows) break;
-                const uint8_t * row_base = vx + row_idx * blocks_per_row_x * 34;
-                const half      d_w_h = static_cast<half>(
-                    cuda_helpers::q8_d_plane(row_base)[kbx]);
-                const float     d_w   = __half2float(d_w_h);
-                const int8_t  * qs_blk =
-                    cuda_helpers::q8_qs_plane(row_base, blocks_per_row_x) + kbx * 32;
-                tmp[j][i] += vec_dot_q8_0_q8_1(
-                    reinterpret_cast<const uint8_t *>(qs_blk), d_w, ya, kqs);
+            for (int j = 0; j < NCOLS_DST; ++j) {
+                const block_q8_1 * ya = vy + j * stride_y_row + kbx;
+                tmp[j][i] += vec_dot_q8_0_q8_1(qs_u8, d_w, ya, kqs);
             }
         }
     }
@@ -901,5 +912,151 @@ bool launch_mmvq_q8_0_add(
     return true;
 }
 
+// mul_mat_vec_q8_0_fanout4_batch_kernel: four Q8_0 weights × one shared Q8_1
+// activation, in a single launch. The four weights' row-spaces are
+// concatenated along blockIdx.x; each block resolves which weight it belongs
+// to and computes its local row. NCOLS_DST = batch (verify rows). One row per
+// block (no rows_per_cuda_block reuse — matches the 1-row default).
+template <int NCOLS_DST>
+__global__ void mul_mat_vec_q8_0_fanout4_batch_kernel(
+        const uint8_t * __restrict__ w0,
+        const uint8_t * __restrict__ w1,
+        const uint8_t * __restrict__ w2,
+        const uint8_t * __restrict__ w3,
+        const block_q8_1 * __restrict__ vy,
+        float * __restrict__ d0,
+        float * __restrict__ d1,
+        float * __restrict__ d2,
+        float * __restrict__ d3,
+        uint32_t rows0,
+        uint32_t rows1,
+        uint32_t rows2,
+        uint32_t rows3,
+        uint32_t cols,
+        uint32_t stride_y_row,
+        uint32_t stride_d0,
+        uint32_t stride_d1,
+        uint32_t stride_d2,
+        uint32_t stride_d3) {
+    constexpr int NWARPS          = q8_mmvq_nwarps<NCOLS_DST>();
+    constexpr int warp_size       = Q8_VEC_WARP_SIZE;
+    constexpr int blocks_per_iter = VDR_Q8_0 * NWARPS * warp_size / QI8_0;
+
+    uint32_t row = blockIdx.x;
+    const uint8_t *weight = w0;
+    float *dst = d0;
+    uint32_t rows = rows0;
+    uint32_t stride_dst_row = stride_d0;
+    uint32_t local_row = row;
+
+    if (row >= rows0) {
+        row -= rows0;
+        weight = w1; dst = d1; rows = rows1; stride_dst_row = stride_d1; local_row = row;
+        if (row >= rows1) {
+            row -= rows1;
+            weight = w2; dst = d2; rows = rows2; stride_dst_row = stride_d2; local_row = row;
+            if (row >= rows2) {
+                row -= rows2;
+                weight = w3; dst = d3; rows = rows3; stride_dst_row = stride_d3; local_row = row;
+                if (row >= rows3) return;
+            }
+        }
+    }
+    if (weight == nullptr || dst == nullptr || local_row >= rows) return;
+
+    const int tid = warp_size * threadIdx.y + threadIdx.x;
+    const int blocks_per_row_x = cols / QK8_0;
+
+    float tmp[NCOLS_DST] = {0.0f};
+    for (int kbx = tid / (QI8_0 / VDR_Q8_0); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kqs = VDR_Q8_0 * (tid % (QI8_0 / VDR_Q8_0));
+        // qw3 weight layout is split-plane: all block scales first, then all
+        // int8 quants (NOT the interleaved 34-byte blocks). Use the same plane
+        // helpers as mul_mat_vec_q8_0_kernel.
+        const uint8_t *row_base =
+            weight + static_cast<uint64_t>(local_row) * blocks_per_row_x * 34;
+        const float d_w = __half2float(
+            static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kbx]));
+        const int8_t *qs_blk =
+            cuda_helpers::q8_qs_plane(row_base, blocks_per_row_x) + kbx * 32;
+        const uint8_t *qs_u8 = reinterpret_cast<const uint8_t *>(qs_blk);
+
+        #pragma unroll
+        for (int j = 0; j < NCOLS_DST; ++j) {
+            const block_q8_1 *ya = vy + j * stride_y_row + kbx;
+            tmp[j] += vec_dot_q8_0_q8_1(qs_u8, d_w, ya, kqs);
+        }
+    }
+
+    __shared__ float sh[NWARPS - 1 > 0 ? NWARPS - 1 : 1][NCOLS_DST][warp_size];
+    if (NWARPS > 1 && threadIdx.y > 0) {
+        #pragma unroll
+        for (int j = 0; j < NCOLS_DST; ++j) {
+            sh[threadIdx.y - 1][j][threadIdx.x] = tmp[j];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+
+    #pragma unroll
+    for (int j = 0; j < NCOLS_DST; ++j) {
+        #pragma unroll
+        for (int l = 0; l < NWARPS - 1; ++l) {
+            tmp[j] += sh[l][j][threadIdx.x];
+        }
+        tmp[j] = cuda_helpers::warp_reduce_sum<warp_size>(tmp[j]);
+        if (threadIdx.x == 0) {
+            dst[static_cast<uint64_t>(j) * stride_dst_row + local_row] = tmp[j];
+        }
+    }
+}
+
+bool launch_mmvq_q8_0_fanout4_batch(
+        const uint8_t *weight0, const uint8_t *weight1,
+        const uint8_t *weight2, const uint8_t *weight3,
+        const void *y_q8_1,
+        float *dst0, float *dst1, float *dst2, float *dst3,
+        uint32_t rows0, uint32_t rows1, uint32_t rows2, uint32_t rows3,
+        uint32_t cols, uint32_t batch,
+        uint32_t stride_dst0, uint32_t stride_dst1,
+        uint32_t stride_dst2, uint32_t stride_dst3,
+        cudaStream_t stream) {
+    if (cols % QK8_0 != 0) return false;
+    if (batch == 0 || batch > 8) return false;
+    const uint64_t total_rows64 =
+        static_cast<uint64_t>(rows0) + rows1 + rows2 + rows3;
+    if (total_rows64 == 0 || total_rows64 > 0xffffffffull) return false;
+    const uint32_t stride_y_row = cols / QK8_1;
+    const dim3 grid(static_cast<uint32_t>(total_rows64), 1, 1);
+
+    auto launch = [&](auto NCOLS_C) {
+        constexpr int NCOLS_DST = decltype(NCOLS_C)::value;
+        constexpr int NWARPS    = q8_mmvq_nwarps<NCOLS_DST>();
+        const dim3 block(Q8_VEC_WARP_SIZE, NWARPS, 1);
+        mul_mat_vec_q8_0_fanout4_batch_kernel<NCOLS_DST><<<grid, block, 0, stream>>>(
+            weight0, weight1, weight2, weight3,
+            reinterpret_cast<const block_q8_1 *>(y_q8_1),
+            dst0, dst1, dst2, dst3,
+            rows0, rows1, rows2, rows3,
+            cols, stride_y_row,
+            stride_dst0, stride_dst1, stride_dst2, stride_dst3);
+    };
+
+    switch (batch) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        case 8: launch(std::integral_constant<int, 8>{}); break;
+        default: return false;
+    }
+    return true;
+}
+
 } // namespace ported
 } // namespace qw3
+
+
