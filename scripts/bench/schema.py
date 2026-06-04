@@ -33,7 +33,7 @@ def cell_key(engine: str, mode: str, prompt_tokens: int,
 
 def _med(xs: List[float]) -> float:
     xs = [x for x in xs if x is not None and x > 0]
-    return statistics.median(xs) if xs else 0.0
+    return statistics.fmean(xs) if xs else 0.0
 
 
 def _min_pos(xs: List[float]) -> float:
@@ -188,10 +188,15 @@ class BenchStore:
         for i, existing in enumerate(self.rows):
             if existing.key == row.key:
                 self.rows[i] = row
+                if not row.error:
+                    self.errors = [e for e in self.errors if e.get("cell_key") != row.key]
                 return
         self.rows.append(row)
+        if not row.error:
+            self.errors = [e for e in self.errors if e.get("cell_key") != row.key]
 
     def add_error(self, key: str, message: str) -> None:
+        self.errors = [e for e in self.errors if e.get("cell_key") != key]
         self.errors.append({"cell_key": key, "message": message})
 
     def to_dict(self) -> Dict[str, Any]:

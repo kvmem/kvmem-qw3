@@ -830,17 +830,27 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch");
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-            require_status(backend_.attention_decode_batch(*mid_batch_, *q_batch_,
-                                                            2 * standard_head_dim,
-                                                            *k_cache_[il], *v_cache_[il],
-                                                            standard_n_heads, standard_n_kv_heads,
-                                                            standard_head_dim,
-                                                            base_pos, batch,
-                                                            q_stride_buf, mid_stride, scale));
-            require_status(backend_.apply_attn_gate_batch(*mid_batch_, *q_batch_,
-                                                           2 * standard_head_dim,
-                                                           batch, q_stride_buf, mid_stride,
-                                                           standard_n_heads, standard_head_dim));
+            if (mtp_single_chunk) {
+                require_status(backend_.attention_decode_batch_gated(*mid_batch_, *q_batch_,
+                                                                      2 * standard_head_dim,
+                                                                      *k_cache_[il], *v_cache_[il],
+                                                                      standard_n_heads, standard_n_kv_heads,
+                                                                      standard_head_dim,
+                                                                      base_pos, batch,
+                                                                      q_stride_buf, mid_stride, scale));
+            } else {
+                require_status(backend_.attention_decode_batch(*mid_batch_, *q_batch_,
+                                                               2 * standard_head_dim,
+                                                               *k_cache_[il], *v_cache_[il],
+                                                               standard_n_heads, standard_n_kv_heads,
+                                                               standard_head_dim,
+                                                               base_pos, batch,
+                                                               q_stride_buf, mid_stride, scale));
+                require_status(backend_.apply_attn_gate_batch(*mid_batch_, *q_batch_,
+                                                              2 * standard_head_dim,
+                                                              batch, q_stride_buf, mid_stride,
+                                                              standard_n_heads, standard_head_dim));
+            }
             if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch");
 
             require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.attn_output, *mid_batch_,
@@ -1017,12 +1027,75 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
     return reports;
 }
 
+std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_prefix_device(uint32_t token_id,
+                                                                                           uint32_t max_tokens) {
+    if (max_tokens == 0) return {};
+    ensure_mtp_scratch();
+    if (!mtp_draft_argmaxes_ || mtp_draft_argmax_capacity_ < max_tokens) {
+        mtp_draft_argmaxes_ = backend_.argmax_buffer(max_tokens);
+        mtp_draft_argmax_capacity_ = mtp_draft_argmaxes_ ? max_tokens : 0;
+    }
+    if (!mtp_draft_argmaxes_) {
+        return forward_mtp_draft_chain_with_prefix(token_id, max_tokens);
+    }
+    if (position_ > mtp_prefix_len_) {
+        NativeExecutorReport report;
+        report.missing_kernels.push_back("native MTP prefix KV is behind target position");
+        return {std::move(report)};
+    }
+
+    std::vector<NativeExecutorReport> reports;
+    reports.reserve(max_tokens);
+    for (uint32_t i = 0; i < max_tokens; ++i) {
+        const uint32_t cache_pos = position_ + i;
+        if (cache_pos >= kv_ctx_size_) break;
+        const DeviceTensor &h_input = (i == 0) ? *h_ : *mtp_h_;
+        const DeviceArgmaxBuffer *token_source = i == 0 ? nullptr : mtp_draft_argmaxes_.get();
+        NativeExecutorReport report = forward_mtp_draft_from(token_id,
+                                                             h_input,
+                                                             cache_pos,
+                                                             cache_pos,
+                                                             cache_pos + 1,
+                                                             /*compute_logits=*/true,
+                                                             mtp_draft_argmaxes_.get(),
+                                                             i,
+                                                             token_source,
+                                                             i == 0 ? 0 : i - 1);
+        const bool ok = report.ok;
+        reports.push_back(std::move(report));
+        if (!ok) break;
+        if (i == 0) {
+            mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_, position_ + 1);
+        }
+    }
+
+    if (reports.empty() || !reports.back().ok) return reports;
+    std::vector<DeviceArgmax> host(reports.size());
+    if (auto st = backend_.copy_argmax_buffer_to_host(*mtp_draft_argmaxes_,
+                                                      host.data(),
+                                                      static_cast<uint32_t>(host.size()));
+        !st.ok) {
+        NativeExecutorReport report;
+        report.missing_kernels.push_back(st.message);
+        return {std::move(report)};
+    }
+    for (size_t i = 0; i < reports.size(); ++i) {
+        reports[i].argmax_token = host[i].token;
+        reports[i].argmax_logit = host[i].logit;
+    }
+    return reports;
+}
+
 NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                                           const DeviceTensor &h_input,
                                                           uint32_t rope_pos,
                                                           uint32_t cache_pos,
                                                           uint32_t seq_len,
-                                                          bool compute_logits) {
+                                                          bool compute_logits,
+                                                          DeviceArgmaxBuffer *argmax_out,
+                                                          uint32_t argmax_out_index,
+                                                          const DeviceArgmaxBuffer *token_source,
+                                                          uint32_t token_source_index) {
     NativeExecutorReport report;
     const NativePlanInfo &plan = model_.plan();
     if (!plan.mtp_supported) {
@@ -1055,7 +1128,14 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     require_status(backend_.begin());
     begin_record_timing(executor_trace_timing_enabled());
 
-    require_status(backend_.q8_0_get_row(*mtp_embd_, *mtp->embed_tokens, token_id));
+    if (token_source) {
+        require_status(backend_.q8_0_get_row_from_argmax(*mtp_embd_,
+                                                         *mtp->embed_tokens,
+                                                         *token_source,
+                                                         token_source_index));
+    } else {
+        require_status(backend_.q8_0_get_row(*mtp_embd_, *mtp->embed_tokens, token_id));
+    }
     record(report, "mtp.token_embedding_lookup");
     require_status(backend_.rms_norm(*mtp_enorm_, *mtp_embd_, *mtp->enorm, eps));
     record(report, "mtp.enorm");
@@ -1139,12 +1219,19 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     require_status(backend_.rms_norm(*norm_, *mtp_h_, *mtp->shared_head_norm, eps));
     record(report, "mtp.shared_head_norm");
     require_status(backend_.q8_0_matvec(*logits_, *mtp->shared_head_head, *norm_));
-    const DeviceArgmax best = backend_.argmax(*logits_);
+    DeviceArgmax best;
+    if (argmax_out) {
+        require_status(backend_.argmax_to_buffer(*logits_, *argmax_out, argmax_out_index));
+    } else {
+        best = backend_.argmax(*logits_);
+    }
     require_status(backend_.end());
 
-    report.argmax_token = best.token;
-    report.argmax_logit = best.logit;
-    report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
+    if (!argmax_out) {
+        report.argmax_token = best.token;
+        report.argmax_logit = best.logit;
+        report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
+    }
     record(report, "mtp.lm_head_argmax");
     report.ok = true;
     return report;

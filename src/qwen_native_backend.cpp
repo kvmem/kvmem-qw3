@@ -75,6 +75,10 @@ bool mtp_phase_sync_enabled() {
     return env_flag_enabled("QW3_MTP_PHASE_SYNC");
 }
 
+bool mtp_device_draft_chain_enabled() {
+    return env_flag_enabled("QW3_MTP_DEVICE_DRAFT_CHAIN", true);
+}
+
 bool mtp_verify_sequential_enabled() {
     const char *raw = std::getenv("QW3_MTP_VERIFY");
     if (raw && *raw) {
@@ -974,6 +978,8 @@ private:
         std::unordered_map<std::string, TraceStats> decode_trace;
         uint64_t decode_trace_steps = 0;
         const bool trace_mtp_verify = mtp_verify_trace_enabled();
+        const bool use_device_mtp_draft_chain =
+            spec_mtp && mtp_device_draft_chain_enabled() && !trace_mtp_verify;
         const bool trace_mtp_tokens = mtp_token_trace_enabled();
         std::unordered_map<std::string, TraceStats> mtp_draft_trace;
         std::unordered_map<std::string, TraceStats> mtp_verify_trace;
@@ -1256,8 +1262,9 @@ private:
                 const uint32_t draft_limit =
                     mtp_policy.draft_limit(remaining_tokens, mtp_chain_len);
                 const double t_draft_start = mtp_phase_time();
-                std::vector<NativeExecutorReport> chain =
-                    executor_->forward_mtp_draft_chain_with_prefix(current, draft_limit);
+                std::vector<NativeExecutorReport> chain = use_device_mtp_draft_chain
+                    ? executor_->forward_mtp_draft_chain_with_prefix_device(current, draft_limit)
+                    : executor_->forward_mtp_draft_chain_with_prefix(current, draft_limit);
                 mtp_spec_draft_s += mtp_phase_time() - t_draft_start;
                 std::vector<uint32_t> drafts;
                 uint32_t step_index = 0;

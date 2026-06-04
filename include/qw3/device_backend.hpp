@@ -41,6 +41,11 @@ struct DeviceArgmax {
     float logit = 0.0f;
 };
 
+struct DeviceArgmaxBuffer {
+    virtual ~DeviceArgmaxBuffer() = default;
+    uint64_t count = 0;
+};
+
 class DeviceBackend {
 public:
     virtual ~DeviceBackend() = default;
@@ -90,6 +95,13 @@ public:
     virtual std::unique_ptr<DeviceWeight> weight_q8_0(const void *data, uint64_t rows, uint64_t cols, const char *label) = 0;
 
     virtual DeviceStatus q8_0_get_row(DeviceTensor &out, const DeviceWeight &weight, uint64_t row) = 0;
+    virtual DeviceStatus q8_0_get_row_from_argmax(DeviceTensor &out,
+                                                  const DeviceWeight &weight,
+                                                  const DeviceArgmaxBuffer &argmaxes,
+                                                  uint32_t index) {
+        (void)out; (void)weight; (void)argmaxes; (void)index;
+        return {false, "q8_0_get_row_from_argmax not implemented for this backend"};
+    }
     // Batched embedding lookup. `rows` is a host-side array of `batch` token
     // ids. out layout: [batch, cols].
     virtual DeviceStatus q8_0_get_rows_batch(DeviceTensor &out,
@@ -543,6 +555,23 @@ public:
     virtual DeviceStatus zero_tensor(DeviceTensor &x) = 0;
 
     virtual DeviceArgmax argmax(const DeviceTensor &x) = 0;
+
+    virtual std::unique_ptr<DeviceArgmaxBuffer> argmax_buffer(uint64_t count) {
+        (void)count;
+        return nullptr;
+    }
+    virtual DeviceStatus argmax_to_buffer(const DeviceTensor &x,
+                                          DeviceArgmaxBuffer &out,
+                                          uint32_t index) {
+        (void)x; (void)out; (void)index;
+        return {false, "argmax_to_buffer not implemented for this backend"};
+    }
+    virtual DeviceStatus copy_argmax_buffer_to_host(const DeviceArgmaxBuffer &src,
+                                                    DeviceArgmax *host,
+                                                    uint32_t count) {
+        (void)src; (void)host; (void)count;
+        return {false, "copy_argmax_buffer_to_host not implemented for this backend"};
+    }
 
     // Batched argmax across `batch` rows of `row_stride` floats each. Default
     // copies to host and scans; CUDA overrides with a device reduction.

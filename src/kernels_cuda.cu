@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,8 @@ bool launch_gated_delta_net(
         uint32_t T,
         uint32_t num_k_heads, uint32_t num_v_heads, uint32_t head_dim,
         uint32_t qkv_row_stride, uint32_t gb_row_stride, uint32_t out_row_stride,
+        bool prep_decay, float *state_checkpoints,
+        uint32_t checkpoint_count,
         cudaStream_t stream);
 
 // Ported Q8_0 mmvq launchers (src/mmvq_q8.cu).
@@ -252,6 +255,42 @@ bool launch_decode_f32q_f16kv(float *out,
                               uint32_t seq_len,
                               float scale,
                               cudaStream_t stream);
+
+uint32_t batch_decode_f32q_f16kv_chunk_size(uint32_t n_heads,
+                                            uint32_t n_kv_heads,
+                                            uint32_t head_dim,
+                                            uint32_t batch,
+                                            uint32_t max_seq_len);
+
+bool launch_batch_decode_f32q_f16kv_gated(
+        float *out,
+        __half *o_f16,
+        __half *tmp_v,
+        float *tmp_s,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *request_indices,
+        const int32_t *kv_tile_indices,
+        const int32_t *o_indptr,
+        const int32_t *o_indptr_host,
+        const int32_t *kv_chunk_size,
+        bool partition_kv,
+        bool rowwise_merge,
+        uint32_t page_size,
+        uint32_t total_tiles,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t batch,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream);
 }
 #endif
 
@@ -322,6 +361,70 @@ bool decode_flashinfer_attention_enabled() {
         return false;
 #endif
     }();
+    return enabled;
+}
+
+bool env_flag_enabled_local(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (!raw || !*raw) return default_value;
+    return std::strcmp(raw, "0") != 0 &&
+           std::strcmp(raw, "false") != 0 &&
+           std::strcmp(raw, "off") != 0 &&
+           std::strcmp(raw, "no") != 0;
+}
+
+uint32_t env_uint32_or_local(const char *name, uint32_t fallback) {
+    const char *raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    char *end = nullptr;
+    const unsigned long v = std::strtoul(raw, &end, 10);
+    if (end == raw || *end != '\0' || v > std::numeric_limits<uint32_t>::max()) {
+        return fallback;
+    }
+    return static_cast<uint32_t>(v);
+}
+
+uint32_t flashinfer_verify_decode_max_batch() {
+    static const uint32_t v =
+        env_uint32_or_local("QW3_FLASHINFER_VERIFY_DECODE_MAX_BATCH", 8);
+    return v;
+}
+
+bool flashinfer_batch_verify_decode_enabled(uint32_t batch) {
+    const char *explicit_raw = std::getenv("QW3_FLASHINFER_BATCH_VERIFY_DECODE");
+    if (explicit_raw && *explicit_raw) {
+        return env_flag_enabled_local("QW3_FLASHINFER_BATCH_VERIFY_DECODE", true);
+    }
+    const char *experimental = std::getenv("QW3_EXPERIMENTAL_FLASHINFER_BATCH_VERIFY_DECODE");
+    if (experimental && *experimental) {
+        return env_flag_enabled_local("QW3_EXPERIMENTAL_FLASHINFER_BATCH_VERIFY_DECODE", false);
+    }
+    static const uint32_t max_batch =
+        env_uint32_or_local("QW3_FLASHINFER_BATCH_VERIFY_DECODE_MAX_BATCH", 8);
+    return batch > 1 && max_batch > 0 && batch <= max_batch;
+}
+
+bool flashinfer_batch_decode_partition_enabled() {
+    static const bool enabled =
+        env_flag_enabled_local("QW3_EXPERIMENTAL_FLASHINFER_BATCH_DECODE_PARTITION", true);
+    return enabled;
+}
+
+bool flashinfer_batch_decode_rowwise_merge_enabled() {
+    static const bool enabled =
+        env_flag_enabled_local("QW3_EXPERIMENTAL_FLASHINFER_BATCH_DECODE_ROWWISE_MERGE", true);
+    return enabled;
+}
+
+uint32_t flashinfer_batch_decode_page_size() {
+    static const uint32_t page =
+        env_uint32_or_local("QW3_EXPERIMENTAL_FLASHINFER_BATCH_DECODE_PAGE_SIZE", 256);
+    return page == 0 ? 256 : page;
+}
+
+bool mtp_verify_attention_debug_enabled() {
+    static const bool enabled =
+        env_flag_enabled_local("QW3_MTP_VERIFY_ATTENTION_DEBUG", false);
     return enabled;
 }
 
@@ -684,6 +787,25 @@ struct ArgmaxPair {
     int index;
 };
 
+struct CudaArgmaxBuffer final : DeviceArgmaxBuffer {
+    ArgmaxPair *ptr = nullptr;
+    explicit CudaArgmaxBuffer(uint64_t n) {
+        count = n;
+        cudaMalloc(&ptr, static_cast<size_t>(n) * sizeof(ArgmaxPair));
+    }
+    ~CudaArgmaxBuffer() override {
+        if (ptr) cudaFree(ptr);
+    }
+};
+
+CudaArgmaxBuffer &as_argmax_buffer(DeviceArgmaxBuffer &b) {
+    return static_cast<CudaArgmaxBuffer &>(b);
+}
+
+const CudaArgmaxBuffer &as_argmax_buffer(const DeviceArgmaxBuffer &b) {
+    return static_cast<const CudaArgmaxBuffer &>(b);
+}
+
 __device__ inline bool argmax_better(float value, int index,
                                       float best_value, int best_index) {
     if (index < 0) return false;
@@ -720,6 +842,61 @@ __global__ void argmax_rows_block_kernel(const float *x,
     }
     if (tid == 0) {
         partial[static_cast<uint64_t>(row) * blocks_per_row + block] = {values[0], indices[0]};
+    }
+}
+
+__global__ void argmax_pair_kernel(ArgmaxPair *__restrict__ out,
+                                   uint32_t out_index,
+                                   const float *__restrict__ x,
+                                   uint64_t n) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t bsz = blockDim.x;
+    float local_max = -INFINITY;
+    int32_t local_idx = -1;
+    for (uint64_t i = tid; i < n; i += bsz) {
+        const float v = x[i];
+        if (v > local_max || (v == local_max && static_cast<int32_t>(i) < local_idx)) {
+            local_max = v;
+            local_idx = static_cast<int32_t>(i);
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        const float om = __shfl_xor_sync(0xffffffff, local_max, off);
+        const int32_t oi = __shfl_xor_sync(0xffffffff, local_idx, off);
+        if (om > local_max || (om == local_max && oi < local_idx)) {
+            local_max = om;
+            local_idx = oi;
+        }
+    }
+    __shared__ float warp_max[32];
+    __shared__ int32_t warp_idx[32];
+    const uint32_t warp = tid >> 5;
+    const uint32_t lane = tid & 31;
+    if (lane == 0) {
+        warp_max[warp] = local_max;
+        warp_idx[warp] = local_idx;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const uint32_t nwarps = bsz >> 5;
+        if (lane < nwarps) {
+            local_max = warp_max[lane];
+            local_idx = warp_idx[lane];
+        } else {
+            local_max = -INFINITY;
+            local_idx = -1;
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float om = __shfl_xor_sync(0xffffffff, local_max, off);
+            const int32_t oi = __shfl_xor_sync(0xffffffff, local_idx, off);
+            if (om > local_max || (om == local_max && oi < local_idx)) {
+                local_max = om;
+                local_idx = oi;
+            }
+        }
+        if (lane == 0) {
+            out[out_index] = {local_max, local_idx};
+        }
     }
 }
 
@@ -870,6 +1047,31 @@ __global__ void q8_get_row_kernel(float *out, const uint8_t *weight, uint64_t ro
     const uint64_t block = i / 32;
     const uint64_t inb = i % 32;
     const uint8_t *row_base = weight + row * blocks_per_row * 34;
+    const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks_per_row);
+    const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + block);
+    const int8_t   q  = qs_plane[block * 32 + inb];
+    out[i] = fp16_to_f32_device(dh) * static_cast<float>(q);
+}
+
+__global__ void q8_get_row_from_argmax_kernel(float *out,
+                                              const uint8_t *weight,
+                                              const ArgmaxPair *argmaxes,
+                                              uint32_t argmax_index,
+                                              uint64_t rows,
+                                              uint64_t cols) {
+    const uint64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    const int token = argmaxes[argmax_index].index;
+    if (token < 0 || static_cast<uint64_t>(token) >= rows) {
+        out[i] = 0.0f;
+        return;
+    }
+    const uint64_t blocks_per_row = cols / 32;
+    const uint64_t block = i / 32;
+    const uint64_t inb = i % 32;
+    const uint8_t *row_base =
+        weight + static_cast<uint64_t>(token) * blocks_per_row * 34;
     const __half  *d_plane  = qw3::cuda_helpers::q8_d_plane(row_base);
     const int8_t  *qs_plane = qw3::cuda_helpers::q8_qs_plane(row_base, blocks_per_row);
     const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + block);
@@ -1561,10 +1763,12 @@ __global__ void recurrent_conv_batch_kernel(float *out,         // [T, *] stride
                                             float *state,       // [conv_dim, conv_k-1]
                                             const float *proj,  // [T, *] stride proj_stride
                                             const float *conv_w, // [conv_dim, conv_k]
+                                            float *state_checkpoints,
                                             uint32_t T,
                                             uint32_t conv_dim,
                                             uint32_t proj_stride,
-                                            uint32_t out_stride) {
+                                            uint32_t out_stride,
+                                            uint32_t checkpoint_count) {
     const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= conv_dim) return;
     const float *w = conv_w + c * CONV_K;
@@ -1588,6 +1792,15 @@ __global__ void recurrent_conv_batch_kernel(float *out,         // [T, *] stride
         #pragma unroll
         for (uint32_t k = 0; k + 2 < CONV_K; ++k) st_buf[k] = st_buf[k + 1];
         st_buf[CONV_K - 2] = cur;
+        if (state_checkpoints != nullptr && t < checkpoint_count) {
+            const uint64_t checkpoint_stride =
+                static_cast<uint64_t>(conv_dim) * (CONV_K - 1);
+            float *ckpt = state_checkpoints +
+                static_cast<uint64_t>(t) * checkpoint_stride +
+                c * (CONV_K - 1);
+            #pragma unroll
+            for (uint32_t i = 0; i + 1 < CONV_K; ++i) ckpt[i] = st_buf[i];
+        }
     }
     #pragma unroll
     for (uint32_t i = 0; i + 1 < CONV_K; ++i) st[i] = st_buf[i];
@@ -1618,6 +1831,42 @@ __global__ void l2_norm_128_batch_kernel(float *x,             // base ptr
     base[tid] *= scale;
 }
 
+__global__ void l2_norm_128_qk_batch_kernel(float *x,
+                                            uint32_t blocks,
+                                            uint32_t stride,
+                                            uint32_t T,
+                                            uint32_t batch_stride,
+                                            uint32_t q_offset,
+                                            uint32_t k_offset,
+                                            float eps) {
+    const uint32_t t  = blockIdx.x;
+    const uint32_t b  = blockIdx.y;
+    if (b >= blocks || t >= T) return;
+    __shared__ float scratch[128];
+    const uint32_t tid = threadIdx.x;
+
+    float *q_base = x + static_cast<uint64_t>(t) * batch_stride + q_offset + b * stride;
+    scratch[tid] = q_base[tid] * q_base[tid];
+    __syncthreads();
+    for (uint32_t s_red = 64; s_red > 0; s_red >>= 1) {
+        if (tid < s_red) scratch[tid] += scratch[tid + s_red];
+        __syncthreads();
+    }
+    const float q_scale = rsqrtf(scratch[0] + eps);
+    q_base[tid] *= q_scale;
+    __syncthreads();
+
+    float *k_base = x + static_cast<uint64_t>(t) * batch_stride + k_offset + b * stride;
+    scratch[tid] = k_base[tid] * k_base[tid];
+    __syncthreads();
+    for (uint32_t s_red = 64; s_red > 0; s_red >>= 1) {
+        if (tid < s_red) scratch[tid] += scratch[tid + s_red];
+        __syncthreads();
+    }
+    const float k_scale = rsqrtf(scratch[0] + eps);
+    k_base[tid] *= k_scale;
+}
+
 // DeltaNet batched: one block per (v_head, head_v_dim_pos), 128 threads/block,
 // each thread holds one element of the row in a register. The block iterates
 // over all T tokens, updating its slice of the state sequentially. Output
@@ -1629,6 +1878,7 @@ __global__ void deltanet_batch_kernel(float *core,                  // [T, *] st
                                       const float *beta_batch,      // [T, *] stride beta_stride
                                       const float *ssm_a,           // [num_v_heads]
                                       const float *dt_bias,         // [num_v_heads]
+                                      float *state_checkpoints,
                                       uint32_t T,
                                       uint32_t num_k_heads,
                                       uint32_t num_v_heads,
@@ -1637,7 +1887,8 @@ __global__ void deltanet_batch_kernel(float *core,                  // [T, *] st
                                       uint32_t conv_stride,
                                       uint32_t alpha_stride,
                                       uint32_t beta_stride,
-                                      uint32_t core_stride) {
+                                      uint32_t core_stride,
+                                      uint32_t checkpoint_count) {
     const uint32_t vh = blockIdx.x;
     const uint32_t j  = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -1687,6 +1938,13 @@ __global__ void deltanet_batch_kernel(float *core,                  // [T, *] st
         }
         if (tid == 0) {
             core[static_cast<uint64_t>(t) * core_stride + vh * head_v_dim + j] = scratch[0] * inv_hvd;
+        }
+        if (state_checkpoints != nullptr && t < checkpoint_count) {
+            const uint64_t checkpoint_stride =
+                static_cast<uint64_t>(num_v_heads) * head_v_dim * head_k_dim;
+            state_checkpoints[static_cast<uint64_t>(t) * checkpoint_stride +
+                              (static_cast<uint64_t>(vh) * head_v_dim + j) * head_k_dim + tid] =
+                row_val;
         }
         __syncthreads();
     }
@@ -2066,6 +2324,10 @@ public:
         if (prefill_gqa_scratch_) cudaFree(prefill_gqa_scratch_);
         if (flashinfer_decode_o_f16_) cudaFree(flashinfer_decode_o_f16_);
         if (flashinfer_decode_tmp_) cudaFree(flashinfer_decode_tmp_);
+        if (flashinfer_batch_decode_o_f16_) cudaFree(flashinfer_batch_decode_o_f16_);
+        if (flashinfer_batch_decode_tmp_v_) cudaFree(flashinfer_batch_decode_tmp_v_);
+        if (flashinfer_batch_decode_tmp_s_) cudaFree(flashinfer_batch_decode_tmp_s_);
+        if (flashinfer_batch_decode_meta_i32_) cudaFree(flashinfer_batch_decode_meta_i32_);
         if (argmax_dev_) cudaFree(argmax_dev_);
         if (argmax_host_) cudaFreeHost(argmax_host_);
         if (argmax_batch_partial_) cudaFree(argmax_batch_partial_);
@@ -2235,6 +2497,24 @@ public:
         q8_get_row_kernel<<<static_cast<unsigned>((w.cols + 255) / 256), 256, 0, exec_stream_>>>(
             o.ptr, static_cast<const uint8_t *>(w.ptr), row, w.cols);
         return launch_status("cuda q8_0_get_row");
+    }
+
+    DeviceStatus q8_0_get_row_from_argmax(DeviceTensor &out,
+                                          const DeviceWeight &weight,
+                                          const DeviceArgmaxBuffer &argmaxes,
+                                          uint32_t index) override {
+        const auto &w = as_weight(weight);
+        auto &o = as_tensor(out);
+        const auto &a = as_argmax_buffer(argmaxes);
+        if (index >= a.count) return {false, "q8_0_get_row_from_argmax index oob"};
+        q8_get_row_from_argmax_kernel<<<static_cast<unsigned>((w.cols + 255) / 256), 256, 0, exec_stream_>>>(
+            o.ptr,
+            static_cast<const uint8_t *>(w.ptr),
+            a.ptr,
+            index,
+            w.rows,
+            w.cols);
+        return launch_status("cuda q8_0_get_row_from_argmax");
     }
 
     DeviceStatus q8_0_get_rows_batch(DeviceTensor &out,
@@ -2474,6 +2754,53 @@ public:
             }
         }
         return launch_status("cuda q8_0_matmul_fanout");
+    }
+
+    DeviceStatus q8_0_matmul_add(DeviceTensor &out,
+                                 const DeviceTensor &residual,
+                                 DeviceTensor &matmul_tmp,
+                                 const DeviceWeight &weight,
+                                 const DeviceTensor &x,
+                                 uint32_t batch,
+                                 uint32_t in_stride,
+                                 uint32_t out_stride) override {
+        auto &o = as_tensor(out);
+        const auto &r = as_tensor(residual);
+        const auto &w = as_weight(weight);
+        const auto &input = as_tensor(x);
+
+        const bool fast_path =
+            o.ptr == r.ptr &&
+            matvec_kernel_choice() == MatvecKernel::Ported &&
+            (w.cols % 32) == 0 &&
+            batch >= 1 && batch <= 8 &&
+            in_stride == w.cols &&
+            o.count >= static_cast<uint64_t>(batch) * out_stride;
+        if (!fast_path) {
+            return DeviceBackend::q8_0_matmul_add(out, residual, matmul_tmp,
+                                                  weight, x, batch,
+                                                  in_stride, out_stride);
+        }
+
+        if (auto st = ensure_q8_1_scratch(batch, static_cast<uint32_t>(w.cols)); !st.ok) {
+            return st;
+        }
+        if (!ported::launch_quantize_q8_1(input.ptr, q8_1_scratch_,
+                                          batch, static_cast<uint32_t>(w.cols),
+                                          in_stride, exec_stream_)) {
+            return {false, "matmul_add quantize_q8_1 launch failed"};
+        }
+        if (ported::launch_mmvq_q8_0_add(static_cast<const uint8_t *>(w.ptr),
+                                         q8_1_scratch_, o.ptr,
+                                         static_cast<uint32_t>(w.rows),
+                                         static_cast<uint32_t>(w.cols),
+                                         batch, out_stride,
+                                         exec_stream_)) {
+            return launch_status("cuda q8_0_matmul_add small_batch_inplace");
+        }
+        return DeviceBackend::q8_0_matmul_add(out, residual, matmul_tmp,
+                                              weight, x, batch,
+                                              in_stride, out_stride);
     }
 
     // Fused matvec + residual add: dst = dst + W*x. Uses the dedicated
@@ -3227,62 +3554,6 @@ public:
                                   DeviceTensor *conv_state_checkpoints,
                                   uint32_t checkpoint_count) override {
         if (batch == 0) return {};
-        // Speculative-decode rollback checkpoints are only requested on tiny
-        // verifier batches (MTP draft depth + 1, ~4-6 tokens). Capturing the
-        // recurrent + conv state after each token via the single-token path is
-        // mathematically identical to the batched kernels and avoids fusing
-        // checkpoint writes into qw3's two divergent DeltaNet kernels.
-        {
-            auto *state_ckpt = state_checkpoints ? &as_tensor(*state_checkpoints) : nullptr;
-            auto *conv_ckpt = conv_state_checkpoints ? &as_tensor(*conv_state_checkpoints) : nullptr;
-            const uint32_t eff_ckpt = std::min<uint32_t>(checkpoint_count, batch);
-            const bool want_checkpoint =
-                state_ckpt != nullptr && conv_ckpt != nullptr && eff_ckpt > 0;
-            if (want_checkpoint) {
-                auto &s = as_tensor(state);
-                auto &cs = as_tensor(conv_state);
-                const uint64_t state_count = s.count;
-                const uint64_t conv_count = cs.count;
-                for (uint32_t b = 0; b < batch; ++b) {
-                    if (auto st = recurrent_single_token_at(core, state, conv_state, conv_out_buf,
-                                                            proj, gate, alpha, beta,
-                                                            conv, ssm_a, dt_bias, ssm_norm,
-                                                            num_k_heads, num_v_heads,
-                                                            head_k_dim, head_v_dim,
-                                                            conv_kernel_size,
-                                                            proj_count,
-                                                            b * proj_stride,
-                                                            b * gate_stride,
-                                                            b * alpha_stride,
-                                                            b * beta_stride,
-                                                            b * core_stride,
-                                                            eps); !st.ok) {
-                        return st;
-                    }
-                    if (b < eff_ckpt) {
-                        if (auto st = cuda_status(
-                                cudaMemcpyAsync(state_ckpt->ptr + static_cast<uint64_t>(b) * state_count,
-                                                s.ptr,
-                                                static_cast<size_t>(state_count) * sizeof(float),
-                                                cudaMemcpyDeviceToDevice,
-                                                exec_stream_),
-                                "recurrent_batch state checkpoint"); !st.ok) {
-                            return st;
-                        }
-                        if (auto st = cuda_status(
-                                cudaMemcpyAsync(conv_ckpt->ptr + static_cast<uint64_t>(b) * conv_count,
-                                                cs.ptr,
-                                                static_cast<size_t>(conv_count) * sizeof(float),
-                                                cudaMemcpyDeviceToDevice,
-                                                exec_stream_),
-                                "recurrent_batch conv checkpoint"); !st.ok) {
-                            return st;
-                        }
-                    }
-                }
-                return {};
-            }
-        }
         auto &c = as_tensor(core);
         auto &s = as_tensor(state);
         auto &cs = as_tensor(conv_state);
@@ -3295,6 +3566,11 @@ public:
         const auto &aw = as_weight(ssm_a);
         const auto &dt = as_weight(dt_bias);
         const auto &nw = as_weight(ssm_norm);
+        auto *state_ckpt = state_checkpoints ? &as_tensor(*state_checkpoints) : nullptr;
+        auto *conv_ckpt = conv_state_checkpoints ? &as_tensor(*conv_state_checkpoints) : nullptr;
+        const uint32_t effective_checkpoint_count = std::min<uint32_t>(checkpoint_count, batch);
+        const bool want_checkpoint =
+            state_ckpt != nullptr && conv_ckpt != nullptr && effective_checkpoint_count > 0;
 
         // 1. Conv (batched): one kernel call processes T sequential conv
         //    steps per channel, with the small state window kept in registers.
@@ -3307,25 +3583,33 @@ public:
                 recurrent_conv_batch_kernel<3>
                     <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
                                                     static_cast<const float *>(cw.ptr),
-                                                    batch, proj_count, proj_stride, proj_stride);
+                                                    want_checkpoint ? conv_ckpt->ptr : nullptr,
+                                                    batch, proj_count, proj_stride, proj_stride,
+                                                    effective_checkpoint_count);
                 break;
             case 4:
                 recurrent_conv_batch_kernel<4>
                     <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
                                                     static_cast<const float *>(cw.ptr),
-                                                    batch, proj_count, proj_stride, proj_stride);
+                                                    want_checkpoint ? conv_ckpt->ptr : nullptr,
+                                                    batch, proj_count, proj_stride, proj_stride,
+                                                    effective_checkpoint_count);
                 break;
             case 5:
                 recurrent_conv_batch_kernel<5>
                     <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
                                                     static_cast<const float *>(cw.ptr),
-                                                    batch, proj_count, proj_stride, proj_stride);
+                                                    want_checkpoint ? conv_ckpt->ptr : nullptr,
+                                                    batch, proj_count, proj_stride, proj_stride,
+                                                    effective_checkpoint_count);
                 break;
             case 7:
                 recurrent_conv_batch_kernel<7>
                     <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
                                                     static_cast<const float *>(cw.ptr),
-                                                    batch, proj_count, proj_stride, proj_stride);
+                                                    want_checkpoint ? conv_ckpt->ptr : nullptr,
+                                                    batch, proj_count, proj_stride, proj_stride,
+                                                    effective_checkpoint_count);
                 break;
             default:
                 return {false, "recurrent_batch: unsupported conv_kernel_size (expected 3/4/5/7)"};
@@ -3337,11 +3621,18 @@ public:
         dim3 ln_grid(batch, num_k_heads);
         const uint32_t q_off = 0;
         const uint32_t k_off = num_k_heads * head_k_dim;
-        l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
-                                                   batch, proj_stride, q_off, eps);
-        l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
-                                                   batch, proj_stride, k_off, eps);
-        if (auto st = launch_status("l2_norm_128_batch_kernel"); !st.ok) return st;
+        if (want_checkpoint) {
+            l2_norm_128_qk_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
+                cout.ptr, num_k_heads, head_k_dim,
+                batch, proj_stride, q_off, k_off, eps);
+            if (auto st = launch_status("l2_norm_128_qk_batch_kernel"); !st.ok) return st;
+        } else {
+            l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
+                                                       batch, proj_stride, q_off, eps);
+            l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
+                                                       batch, proj_stride, k_off, eps);
+            if (auto st = launch_status("l2_norm_128_batch_kernel"); !st.ok) return st;
+        }
 
         // 3. DeltaNet (batched). Two implementations selected at runtime via
         //    QW3_RECURRENT_KERNEL: "qw3" (default) is the original kernel,
@@ -3380,6 +3671,9 @@ public:
                 batch,
                 num_k_heads, num_v_heads, head_k_dim,
                 proj_stride, alpha_stride, core_stride,
+                true,
+                want_checkpoint ? state_ckpt->ptr : nullptr,
+                effective_checkpoint_count,
                 exec_stream_);
             if (!ok) return {false, "recurrent_batch: ported kernel rejected head_dim (only 16/32/64/128)"};
             if (auto st = launch_status("ported::gated_delta_net_kernel"); !st.ok) return st;
@@ -3394,6 +3688,7 @@ public:
                                                     b.ptr,
                                                     static_cast<const float *>(aw.ptr),
                                                     static_cast<const float *>(dt.ptr),
+                                                    want_checkpoint ? state_ckpt->ptr : nullptr,
                                                     batch,
                                                     num_k_heads,
                                                     num_v_heads,
@@ -3402,7 +3697,8 @@ public:
                                                     proj_stride,
                                                     alpha_stride,
                                                     beta_stride,
-                                                    core_stride);
+                                                    core_stride,
+                                                    effective_checkpoint_count);
             if (auto st = launch_status("deltanet_batch_kernel"); !st.ok) return st;
         }
 
@@ -3649,6 +3945,67 @@ public:
                 return st;
             }
             flashinfer_decode_tmp_capacity_ = tmp_elems;
+        }
+        return {};
+    }
+
+    DeviceStatus ensure_flashinfer_batch_decode_workspace(uint64_t o_elems,
+                                                          uint64_t tmp_v_elems,
+                                                          uint64_t tmp_s_elems,
+                                                          uint64_t meta_i32_elems) {
+        if (o_elems > flashinfer_batch_decode_o_f16_capacity_) {
+            if (flashinfer_batch_decode_o_f16_) cudaFree(flashinfer_batch_decode_o_f16_);
+            flashinfer_batch_decode_o_f16_ = nullptr;
+            flashinfer_batch_decode_o_f16_capacity_ = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(&flashinfer_batch_decode_o_f16_,
+                               static_cast<size_t>(o_elems) * sizeof(__half)),
+                    "flashinfer batch decode o_f16 alloc"); !st.ok) {
+                return st;
+            }
+            flashinfer_batch_decode_o_f16_capacity_ = o_elems;
+        }
+        if (tmp_v_elems > flashinfer_batch_decode_tmp_v_capacity_) {
+            if (flashinfer_batch_decode_tmp_v_) cudaFree(flashinfer_batch_decode_tmp_v_);
+            flashinfer_batch_decode_tmp_v_ = nullptr;
+            flashinfer_batch_decode_tmp_v_capacity_ = 0;
+            if (tmp_v_elems > 0) {
+                if (auto st = cuda_status(
+                        cudaMalloc(&flashinfer_batch_decode_tmp_v_,
+                                   static_cast<size_t>(tmp_v_elems) * sizeof(__half)),
+                        "flashinfer batch decode tmp_v alloc"); !st.ok) {
+                    return st;
+                }
+            }
+            flashinfer_batch_decode_tmp_v_capacity_ = tmp_v_elems;
+        }
+        if (tmp_s_elems > flashinfer_batch_decode_tmp_s_capacity_) {
+            if (flashinfer_batch_decode_tmp_s_) cudaFree(flashinfer_batch_decode_tmp_s_);
+            flashinfer_batch_decode_tmp_s_ = nullptr;
+            flashinfer_batch_decode_tmp_s_capacity_ = 0;
+            if (tmp_s_elems > 0) {
+                if (auto st = cuda_status(
+                        cudaMalloc(&flashinfer_batch_decode_tmp_s_,
+                                   static_cast<size_t>(tmp_s_elems) * sizeof(float)),
+                        "flashinfer batch decode tmp_s alloc"); !st.ok) {
+                    return st;
+                }
+            }
+            flashinfer_batch_decode_tmp_s_capacity_ = tmp_s_elems;
+        }
+        if (meta_i32_elems > flashinfer_batch_decode_meta_i32_capacity_) {
+            if (flashinfer_batch_decode_meta_i32_) cudaFree(flashinfer_batch_decode_meta_i32_);
+            flashinfer_batch_decode_meta_i32_ = nullptr;
+            flashinfer_batch_decode_meta_i32_capacity_ = 0;
+            if (meta_i32_elems > 0) {
+                if (auto st = cuda_status(
+                        cudaMalloc(&flashinfer_batch_decode_meta_i32_,
+                                   static_cast<size_t>(meta_i32_elems) * sizeof(int32_t)),
+                        "flashinfer batch decode metadata alloc"); !st.ok) {
+                    return st;
+                }
+            }
+            flashinfer_batch_decode_meta_i32_capacity_ = meta_i32_elems;
         }
         return {};
     }
@@ -4310,6 +4667,184 @@ public:
         return {false, "attention_decode_batch unsupported head_dim"};
     }
 
+    DeviceStatus attention_decode_batch_gated(DeviceTensor &out,
+                                              const DeviceTensor &q,
+                                              uint32_t q_stride,
+                                              const DeviceTensor &k_cache,
+                                              const DeviceTensor &v_cache,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim,
+                                              uint32_t base_seq_len,
+                                              uint32_t batch,
+                                              uint32_t q_batch_stride,
+                                              uint32_t out_batch_stride,
+                                              float scale) override {
+        if (batch == 0) return {};
+        auto &o = as_tensor(out);
+        const auto &qq = as_tensor(q);
+        const auto &kc = as_tensor(k_cache);
+        const auto &vc = as_tensor(v_cache);
+        const bool kv_fp16 = kc.is_fp16();
+
+#if QW3_ENABLE_FLASHINFER
+        const uint32_t verify_decode_batch_max = flashinfer_verify_decode_max_batch();
+        const bool debug_verify_attention = mtp_verify_attention_debug_enabled();
+        if (debug_verify_attention) {
+            std::fprintf(stderr,
+                         "[qw3] mtp_verify_attention_debug enter batch=%u base_seq_len=%u "
+                         "n_heads=%u n_kv_heads=%u head_dim=%u kv_fp16=%d "
+                         "decode_flashinfer=%d verify_decode_batch_max=%u "
+                         "batch_verify_enabled=%d\n",
+                         batch, base_seq_len, n_heads, n_kv_heads, head_dim,
+                         kv_fp16 ? 1 : 0,
+                         decode_flashinfer_attention_enabled() ? 1 : 0,
+                         verify_decode_batch_max,
+                         flashinfer_batch_verify_decode_enabled(batch) ? 1 : 0);
+        }
+        if (verify_decode_batch_max > 0 &&
+            batch <= verify_decode_batch_max &&
+            decode_flashinfer_attention_enabled() &&
+            kv_fp16 &&
+            (head_dim == 128 || head_dim == 256) &&
+            flashinfer_batch_verify_decode_enabled(batch)) {
+            const uint32_t max_seq_len = base_seq_len + batch;
+            const uint32_t chunk_size =
+                flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
+                    n_heads, n_kv_heads, head_dim, batch, max_seq_len);
+            const uint32_t page_size = flashinfer_batch_decode_page_size();
+            const bool partition_kv = flashinfer_batch_decode_partition_enabled();
+            if (debug_verify_attention) {
+                std::fprintf(stderr,
+                             "[qw3] mtp_verify_attention_debug batch_decode_plan "
+                             "chunk_size=%u page_size=%u partition_kv=%d rowwise_merge=%d "
+                             "max_seq_len=%u\n",
+                             chunk_size, page_size, partition_kv ? 1 : 0,
+                             flashinfer_batch_decode_rowwise_merge_enabled() ? 1 : 0,
+                             max_seq_len);
+            }
+            if (chunk_size > 0 && page_size > 0) {
+                std::vector<int32_t> page_indices;
+                std::vector<int32_t> page_indptr(batch + 1, 0);
+                std::vector<int32_t> last_page_len(batch, 0);
+                std::vector<int32_t> request_indices;
+                std::vector<int32_t> kv_tile_indices;
+                std::vector<int32_t> o_indptr(batch + 1, 0);
+                for (uint32_t b = 0; b < batch; ++b) {
+                    const uint32_t seq_len = base_seq_len + b + 1;
+                    const uint32_t pages = std::max<uint32_t>(
+                        (seq_len + page_size - 1) / page_size, 1U);
+                    page_indptr[b] = static_cast<int32_t>(page_indices.size());
+                    for (uint32_t p = 0; p < pages; ++p) {
+                        page_indices.push_back(static_cast<int32_t>(p));
+                    }
+                    const uint32_t used_in_last = seq_len - (pages - 1U) * page_size;
+                    last_page_len[b] = static_cast<int32_t>(used_in_last);
+
+                    o_indptr[b] = static_cast<int32_t>(request_indices.size());
+                    const uint32_t tiles = partition_kv
+                        ? std::max<uint32_t>((seq_len + chunk_size - 1) / chunk_size, 1U)
+                        : 1U;
+                    for (uint32_t t = 0; t < tiles; ++t) {
+                        request_indices.push_back(static_cast<int32_t>(b));
+                        kv_tile_indices.push_back(static_cast<int32_t>(t));
+                    }
+                }
+                page_indptr[batch] = static_cast<int32_t>(page_indices.size());
+                o_indptr[batch] = static_cast<int32_t>(request_indices.size());
+                const uint32_t total_tiles = static_cast<uint32_t>(request_indices.size());
+                if (debug_verify_attention) {
+                    std::fprintf(stderr,
+                                 "[qw3] mtp_verify_attention_debug batch_decode_meta "
+                                 "total_tiles=%u pages=%zu\n",
+                                 total_tiles, page_indices.size());
+                }
+
+                std::vector<int32_t> meta;
+                const uint64_t page_indices_offset = 0;
+                meta.insert(meta.end(), page_indices.begin(), page_indices.end());
+                const uint64_t page_indptr_offset = meta.size();
+                meta.insert(meta.end(), page_indptr.begin(), page_indptr.end());
+                const uint64_t last_page_len_offset = meta.size();
+                meta.insert(meta.end(), last_page_len.begin(), last_page_len.end());
+                const uint64_t request_indices_offset = meta.size();
+                meta.insert(meta.end(), request_indices.begin(), request_indices.end());
+                const uint64_t kv_tile_indices_offset = meta.size();
+                meta.insert(meta.end(), kv_tile_indices.begin(), kv_tile_indices.end());
+                const uint64_t o_indptr_offset = meta.size();
+                meta.insert(meta.end(), o_indptr.begin(), o_indptr.end());
+                const uint64_t kv_chunk_size_offset = meta.size();
+                meta.push_back(static_cast<int32_t>(chunk_size));
+
+                const uint64_t o_elems_batch =
+                    static_cast<uint64_t>(batch) * n_heads * head_dim;
+                const uint64_t tmp_v_elems = partition_kv
+                    ? static_cast<uint64_t>(total_tiles) * n_heads * head_dim
+                    : 0;
+                const uint64_t tmp_s_elems = partition_kv
+                    ? static_cast<uint64_t>(total_tiles) * n_heads
+                    : 0;
+                if (auto st = ensure_flashinfer_batch_decode_workspace(
+                        o_elems_batch, tmp_v_elems, tmp_s_elems,
+                        static_cast<uint64_t>(meta.size())); !st.ok) {
+                    return st;
+                }
+                if (auto st = cuda_status(
+                        cudaMemcpyAsync(flashinfer_batch_decode_meta_i32_,
+                                        meta.data(),
+                                        meta.size() * sizeof(int32_t),
+                                        cudaMemcpyHostToDevice,
+                                        exec_stream_),
+                        "flashinfer batch decode metadata copy"); !st.ok) {
+                    return st;
+                }
+
+                int32_t *meta_d = flashinfer_batch_decode_meta_i32_;
+                if (flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
+                        o.ptr, flashinfer_batch_decode_o_f16_,
+                        flashinfer_batch_decode_tmp_v_,
+                        flashinfer_batch_decode_tmp_s_,
+                        qq.ptr, q_stride, kc.ptr, vc.ptr,
+                        meta_d + page_indices_offset,
+                        meta_d + page_indptr_offset,
+                        meta_d + last_page_len_offset,
+                        meta_d + request_indices_offset,
+                        meta_d + kv_tile_indices_offset,
+                        meta_d + o_indptr_offset,
+                        o_indptr.data(),
+                        meta_d + kv_chunk_size_offset,
+                        partition_kv,
+                        flashinfer_batch_decode_rowwise_merge_enabled(),
+                        page_size, total_tiles,
+                        n_heads, n_kv_heads, head_dim, batch,
+                        q_batch_stride, out_batch_stride, scale,
+                        exec_stream_)) {
+                    if (debug_verify_attention) {
+                        std::fprintf(stderr,
+                                     "[qw3] mtp_verify_attention_debug batch_decode_launch=ok\n");
+                    }
+                    return launch_status("cuda attention_decode_batch flashinfer batch decode gated");
+                }
+                if (debug_verify_attention) {
+                    std::fprintf(stderr,
+                                 "[qw3] mtp_verify_attention_debug batch_decode_launch=refused\n");
+                }
+            } else if (debug_verify_attention) {
+                std::fprintf(stderr,
+                             "[qw3] mtp_verify_attention_debug fallback reason=bad_plan\n");
+            }
+        } else if (debug_verify_attention) {
+            std::fprintf(stderr,
+                         "[qw3] mtp_verify_attention_debug fallback reason=condition_miss\n");
+        }
+#endif
+
+        return DeviceBackend::attention_decode_batch_gated(
+            out, q, q_stride, k_cache, v_cache,
+            n_heads, n_kv_heads, head_dim, base_seq_len, batch,
+            q_batch_stride, out_batch_stride, scale);
+    }
+
     DeviceArgmax argmax(const DeviceTensor &x) override {
         const auto &t = as_tensor(x);
         if (auto st = argmax_launch(x); !st.ok) {
@@ -4351,6 +4886,44 @@ public:
         std::memcpy(&logit, &argmax_host_[1], sizeof(float));
         best.logit = logit;
         return best;
+    }
+
+    std::unique_ptr<DeviceArgmaxBuffer> argmax_buffer(uint64_t count) override {
+        if (count == 0) return nullptr;
+        return std::make_unique<CudaArgmaxBuffer>(count);
+    }
+
+    DeviceStatus argmax_to_buffer(const DeviceTensor &x,
+                                  DeviceArgmaxBuffer &out,
+                                  uint32_t index) override {
+        const auto &t = as_tensor(x);
+        auto &dst = as_argmax_buffer(out);
+        if (index >= dst.count) return {false, "argmax_to_buffer index oob"};
+        argmax_pair_kernel<<<1, 1024, 0, exec_stream_>>>(dst.ptr, index, t.ptr, t.count);
+        return launch_status("cuda argmax_to_buffer");
+    }
+
+    DeviceStatus copy_argmax_buffer_to_host(const DeviceArgmaxBuffer &src,
+                                            DeviceArgmax *host,
+                                            uint32_t count) override {
+        const auto &s = as_argmax_buffer(src);
+        if (count > s.count) return {false, "copy_argmax_buffer_to_host count oob"};
+        std::vector<ArgmaxPair> tmp(count);
+        if (auto st = cuda_status(cudaMemcpyAsync(tmp.data(), s.ptr,
+                                                  static_cast<size_t>(count) * sizeof(ArgmaxPair),
+                                                  cudaMemcpyDeviceToHost,
+                                                  exec_stream_),
+                                  "copy_argmax_buffer_to_host"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(cudaStreamSynchronize(exec_stream_),
+                                  "copy_argmax_buffer_to_host sync"); !st.ok) {
+            return st;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            host[i] = {tmp[i].index, tmp[i].value};
+        }
+        return {};
     }
 
     DeviceStatus argmax_batch(const DeviceTensor &x,
@@ -4608,6 +5181,14 @@ private:
     __half *flashinfer_decode_tmp_ = nullptr;
     uint64_t flashinfer_decode_o_f16_capacity_ = 0;   // elements
     uint64_t flashinfer_decode_tmp_capacity_ = 0;     // elements
+    __half *flashinfer_batch_decode_o_f16_ = nullptr;
+    uint64_t flashinfer_batch_decode_o_f16_capacity_ = 0;  // elements
+    __half *flashinfer_batch_decode_tmp_v_ = nullptr;
+    uint64_t flashinfer_batch_decode_tmp_v_capacity_ = 0;  // elements
+    float *flashinfer_batch_decode_tmp_s_ = nullptr;
+    uint64_t flashinfer_batch_decode_tmp_s_capacity_ = 0;  // elements
+    int32_t *flashinfer_batch_decode_meta_i32_ = nullptr;
+    uint64_t flashinfer_batch_decode_meta_i32_capacity_ = 0;  // elements
     // X-FP16 cache for hgemm_q8. The QKV and gate/up matmul pairs share the
     // same FP32 input pointer in immediate succession; without a cache we
     // re-run fp32_to_fp16_kernel on identical data. Cache key is

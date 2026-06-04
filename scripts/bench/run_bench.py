@@ -2,6 +2,7 @@
 """Run the qw3 vs llama.cpp benchmark sweep, write JSON + HTML.
 
 Usage (from repo root):
+    python3 scripts/bench/run_bench.py --full-1kout --resume
     python3 scripts/bench/run_bench.py --quick
     python3 scripts/bench/run_bench.py --comprehensive --out /tmp/bench.json
     python3 scripts/bench/run_bench.py --prompt-tokens "512 4096" --n-decode "64" \
@@ -25,6 +26,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from bench.config import BenchConfig
 from bench.orchestrator import Orchestrator
 from bench.report import render_report
+from bench.report_dynamic import render_dynamic_report
 
 
 def _ints(s: str):
@@ -36,9 +38,11 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     preset = ap.add_mutually_exclusive_group()
     preset.add_argument("--comprehensive", action="store_true",
-                        help="full 3D sweep (default)")
+                        help="legacy multi-n_decode/multi-chain sweep")
     preset.add_argument("--quick", action="store_true",
                         help="small smoke grid for CI/sanity")
+    preset.add_argument("--full-1kout", action="store_true",
+                        help="requested full sweep: 1K..250K prompt targets, 1K output, plain + MTP")
 
     ap.add_argument("--model")
     ap.add_argument("--qw3")
@@ -51,12 +55,28 @@ def main(argv=None) -> int:
     ap.add_argument("--no-plain", action="store_true")
     ap.add_argument("--no-mtp", action="store_true")
     ap.add_argument("--llama-port", type=int)
-    ap.add_argument("--out", type=str, default="/tmp/qw3_bench.json")
+    ap.add_argument("--out", type=str,
+                    default="/tmp/qw3_llama_full_bench/qw3_llama_full_1kout.json")
     ap.add_argument("--html", type=str, default=None,
-                    help="HTML output path (default: <out>.html)")
+                    help="HTML output path (default: replace .json suffix with .html)")
+    ap.add_argument("--static-html", action="store_true",
+                    help="deprecated compatibility option; static HTML is now the default")
+    ap.add_argument("--dynamic-html", action="store_true",
+                    help="generate a report that fetches JSON at page load time")
+    ap.add_argument("--resume", action="store_true",
+                    help="load existing --out JSON and skip successful rows")
+    ap.add_argument("--force", action="store_true",
+                    help="rerun rows even if --resume finds successful results")
+    ap.add_argument("--print-commands", action="store_true",
+                    help="print recommended full-run/view commands and exit")
     args = ap.parse_args(argv)
 
-    cfg = BenchConfig.quick() if args.quick else BenchConfig.comprehensive()
+    if args.quick:
+        cfg = BenchConfig.quick()
+    elif args.comprehensive:
+        cfg = BenchConfig.comprehensive()
+    else:
+        cfg = BenchConfig.full_1kout()
 
     if args.model: cfg.model = args.model
     if args.qw3: cfg.qw3 = args.qw3
@@ -71,17 +91,61 @@ def main(argv=None) -> int:
     if args.llama_port: cfg.llama_port = args.llama_port
 
     out_json = Path(args.out)
-    html_path = Path(args.html) if args.html else Path(str(out_json) + ".html")
+    html_path = Path(args.html) if args.html else out_json.with_suffix(".html")
+
+    if args.print_commands:
+        print_commands(out_json, html_path, cfg)
+        return 0
 
     if not Path(cfg.model).exists():
         print(f"ERROR: model not found: {cfg.model}", file=sys.stderr)
         return 2
 
-    orch = Orchestrator(cfg, out_json)
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    if args.dynamic_html:
+        render_dynamic_report(out_json, html_path)
+        print(f"Dynamic HTML report -> {html_path}")
+
+    orch = Orchestrator(cfg, out_json, resume=args.resume, force=args.force)
     store = orch.run()
-    render_report(store, html_path)
+    if args.dynamic_html:
+        render_dynamic_report(out_json, html_path)
+    else:
+        render_report(store, html_path)
     print(f"HTML report -> {html_path}")
     return 0 if not store.errors else 1
+
+
+def print_commands(out_json: Path, html_path: Path, cfg: BenchConfig) -> None:
+    report_dir = html_path.parent
+    print("# Full qw3 vs llama.cpp benchmark: 1K/2K/4K/8K/16K/64K/128K/250K input targets, 1K output")
+    print("mkdir -p " + str(report_dir))
+    print(
+        "python3 scripts/bench/run_bench.py --full-1kout --resume "
+        f"--model {cfg.model} "
+        f"--qw3 {cfg.qw3} "
+        f"--llama-server {cfg.llama_server} "
+        f"--mtp-chain \"{' '.join(str(c) for c in cfg.mtp_chain)}\" "
+        f"--out {out_json} "
+        f"--html {html_path}"
+    )
+    print()
+    print("# Open the static report directly, or serve the directory from a local HTTP server.")
+    print(f"cd {report_dir}")
+    print(f"# Direct file: {html_path}")
+    print("# Optional: python3 -m http.server 8017")
+    print(f"# Optional browser URL: http://127.0.0.1:8017/{html_path.name}")
+    print()
+    print("# Useful partial/debug runs")
+    print(
+        "python3 scripts/bench/run_bench.py --quick --resume "
+        f"--out {report_dir / 'quick.json'} --html {report_dir / 'quick.html'}"
+    )
+    print(
+        "python3 scripts/bench/run_bench.py --full-1kout --resume --engines qw3 "
+        f"--out {report_dir / 'qw3_only.json'} --html {report_dir / 'qw3_only.html'}"
+    )
 
 
 if __name__ == "__main__":

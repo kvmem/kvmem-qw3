@@ -80,6 +80,8 @@ public:
                                                               uint32_t max_tokens);
     std::vector<NativeExecutorReport> forward_mtp_draft_chain_with_prefix(uint32_t token_id,
                                                                           uint32_t max_tokens);
+    std::vector<NativeExecutorReport> forward_mtp_draft_chain_with_prefix_device(uint32_t token_id,
+                                                                                 uint32_t max_tokens);
     NativeExecutorReport prime_mtp_prefix_from_last_batch(const std::vector<uint32_t> &tokens,
                                                           uint32_t base_position,
                                                           uint32_t batch_min_override = 0);
@@ -126,7 +128,11 @@ private:
                                                 uint32_t rope_pos,
                                                 uint32_t cache_pos,
                                                 uint32_t seq_len,
-                                                bool compute_logits = true);
+                                                bool compute_logits = true,
+                                                DeviceArgmaxBuffer *argmax_out = nullptr,
+                                                uint32_t argmax_out_index = 0,
+                                                const DeviceArgmaxBuffer *token_source = nullptr,
+                                                uint32_t token_source_index = 0);
 
     const QwenNativeModel &model_;
     const QwenWeights &weights_;
@@ -214,6 +220,8 @@ private:
     std::unique_ptr<DeviceTensor> mtp_ffn_up_batch_;
     std::unique_ptr<DeviceTensor> mtp_ffn_mid_batch_;
     std::unique_ptr<DeviceTensor> mtp_ffn_out_batch_;
+    std::unique_ptr<DeviceArgmaxBuffer> mtp_draft_argmaxes_;
+    uint32_t mtp_draft_argmax_capacity_ = 0;
     uint32_t mtp_prefix_len_ = 0;
     uint32_t logits_batch_capacity_ = 0;
     std::unique_ptr<DeviceTensor> logits_batch_;

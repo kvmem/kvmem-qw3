@@ -11,10 +11,11 @@
 //   - Drop the keep_rs_t branch (qw3 only stores final state, K = 1).
 //   - Drop the ggml_tensor wrapper; expose a raw-pointer launcher that
 //     callers in src/kernels_cuda.cu use directly.
-//   - Add prep_log_g_sigmoid_beta_kernel: qw3 stores raw alpha and beta;
-//     the upstream kernel expects log(g) and sigmoid(beta) ready to use.
-//     This small per-(t, vh) kernel converts in place before the main
-//     kernel runs.
+//   - Add prep_g_sigmoid_beta_kernel: qw3 stores raw alpha and beta; this
+//     small per-(t, vh) kernel converts them in place before the main kernel.
+//     By default alpha is rewritten to g directly so the main kernel avoids
+//     repeated exp(log_g) across all column blocks. A fallback can still store
+//     upstream-style log(g) for A/B testing.
 //
 // The state and (q, k, v, alpha, beta) layouts already match qw3's
 // recurrent_batch convention — see kernels_cuda.cu recurrent_batch().
@@ -23,23 +24,24 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <math.h>
+#include <type_traits>
 
 #include "cuda_helpers.cuh"
 
 namespace qw3 {
 namespace ported {
 
-// In-place prep: convert qw3's raw alpha and beta into the (g, sigmoid_beta)
-// form consumed by gated_delta_net_kernel.
+// In-place prep: convert qw3's raw alpha and beta into the values consumed by
+// gated_delta_net_kernel.
 //
-//   g[t, vh]          = exp(softplus(alpha[t, vh] + dt_bias[vh]) * ssm_a[vh])
+//   log_g[t, vh]      = softplus(alpha[t, vh] + dt_bias[vh]) * ssm_a[vh]
+//   g[t, vh]          = exp(log_g[t, vh])
 //   sigmoid_beta[t,v] = 1 / (1 + exp(-beta[t, vh]))
 //
-// Both arrays are read with stride [T, num_v_heads]; rewritten in place. The
-// exp is done HERE, once per (t, vh), instead of inside the main kernel's hot
-// loop where every column-block CTA × warp would recompute the same value at
-// every timestep (num_v_heads × S_v × 32 redundant evals per timestep).
-__global__ void prep_log_g_sigmoid_beta_kernel(
+// Both arrays are read with stride [T, num_v_heads]; rewritten in place. When
+// `prep_decay` is true, alpha is rewritten to g; otherwise it is rewritten to
+// log_g for the conservative fallback path.
+__global__ void prep_g_sigmoid_beta_kernel(
         float *       alpha,        // [T, num_v_heads], stride alpha_stride
         float *       beta,         // [T, num_v_heads], stride beta_stride
         const float * dt_bias,      // [num_v_heads]
@@ -47,7 +49,8 @@ __global__ void prep_log_g_sigmoid_beta_kernel(
         uint32_t      T,
         uint32_t      num_v_heads,
         uint32_t      alpha_stride,
-        uint32_t      beta_stride) {
+        uint32_t      beta_stride,
+        bool          prep_decay) {
     const uint32_t t  = blockIdx.x;
     const uint32_t vh = blockIdx.y * blockDim.x + threadIdx.x;
     if (t >= T || vh >= num_v_heads) return;
@@ -61,7 +64,7 @@ __global__ void prep_log_g_sigmoid_beta_kernel(
     const float bias  = dt_bias[vh];
     const float a_v   = ssm_a[vh];
     const float log_g = log1pf(expf(a_raw + bias)) * a_v;
-    alpha[a_idx] = expf(log_g);   // store the decay g directly (hoisted exp)
+    alpha[a_idx] = prep_decay ? expf(log_g) : log_g;
 
     const float b_raw = beta[b_idx];
     beta[b_idx] = 1.0f / (1.0f + expf(-b_raw));
@@ -70,24 +73,26 @@ __global__ void prep_log_g_sigmoid_beta_kernel(
 // One warp owns one column of the per-head S_v×S_v state; rows distributed
 // across the warp's 32 lanes. State held in registers across all T steps.
 // No __syncthreads() in the inner loop — both reductions are warp-shuffles.
-template <int S_v>
+template <int S_v, bool ALPHA_IS_DECAY>
 __global__ void
 __launch_bounds__((32 < S_v ? 32 : S_v) * 4, 2)
 gated_delta_net_kernel(
         const float * q,            // [T, num_k_heads, S_v]
         const float * k,            // [T, num_k_heads, S_v]
         const float * v,            // [T, num_v_heads, S_v]
-        const float * g_decay,      // [T, num_v_heads], pre-exp'd decay g
+        const float * g_or_log_g,   // [T, num_v_heads]
         const float * sigmoid_beta, // [T, num_v_heads]
         float *       state,        // [num_v_heads, S_v, S_v]
         float *       out,          // [T, num_v_heads, S_v]
+        float *       state_checkpoints,
         uint32_t      T,
         uint32_t      qkv_row_stride,    // stride between t-rows in q/k (floats)
         uint32_t      v_row_stride,      // stride between t-rows in v (floats)
-        uint32_t      gb_row_stride,     // stride between t-rows in log_g/beta
+        uint32_t      gb_row_stride,     // stride between t-rows in g/log_g/beta
         uint32_t      out_row_stride,    // stride between t-rows in out (floats)
         uint3         num_k_heads_fastdiv,
-        float         scale) {
+        float         scale,
+        uint32_t      checkpoint_count) {
     constexpr int warp_size    = 32 < S_v ? 32 : S_v;
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
@@ -121,7 +126,8 @@ gated_delta_net_kernel(
         const float * k_t = k + t * qkv_row_stride + k_head_off;
         const float * v_t = v + t * v_row_stride   + v_head_off;
 
-        const float g_val    = g_decay[t * gb_row_stride + vh];
+        const float g_src    = g_or_log_g[t * gb_row_stride + vh];
+        const float g_val    = ALPHA_IS_DECAY ? g_src : expf(g_src);
         const float beta_val = sigmoid_beta[t * gb_row_stride + vh];
 
         float k_reg[rows_per_lane];
@@ -156,6 +162,18 @@ gated_delta_net_kernel(
         if (lane == 0) {
             out[t * out_row_stride + vh * S_v + col] = attn_col * scale;
         }
+        if (state_checkpoints != nullptr && t < checkpoint_count) {
+            const uint64_t checkpoint_stride =
+                static_cast<uint64_t>(gridDim.x) * S_v * S_v;
+            float *checkpoint_head =
+                state_checkpoints + static_cast<uint64_t>(t) * checkpoint_stride +
+                static_cast<uint64_t>(vh) * S_v * S_v;
+            #pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int i = r * warp_size + lane;
+                checkpoint_head[col * S_v + i] = s_shard[r];
+            }
+        }
     }
 
     // Persist final state.
@@ -168,7 +186,7 @@ gated_delta_net_kernel(
 
 // qw3-facing launcher. Returns true on success; false if S_v is unsupported.
 bool launch_gated_delta_net(
-        float *       alpha_inout,        // raw alpha -> overwritten with decay g (exp hoisted into prep)
+        float *       alpha_inout,        // raw alpha -> overwritten with g/log_g
         float *       beta_inout,         // raw beta  → overwritten with sigmoid_beta
         const float * dt_bias,
         const float * ssm_a,
@@ -185,6 +203,9 @@ bool launch_gated_delta_net(
         uint32_t      qkv_row_stride,
         uint32_t      gb_row_stride,
         uint32_t      out_row_stride,
+        bool          prep_decay,
+        float *       state_checkpoints,
+        uint32_t      checkpoint_count,
         cudaStream_t  stream) {
     if (head_dim != 16 && head_dim != 32 && head_dim != 64 && head_dim != 128) {
         return false;
@@ -194,9 +215,9 @@ bool launch_gated_delta_net(
     {
         const uint32_t threads = 32;
         const dim3 grid(T, (num_v_heads + threads - 1) / threads);
-        prep_log_g_sigmoid_beta_kernel<<<grid, threads, 0, stream>>>(
+        prep_g_sigmoid_beta_kernel<<<grid, threads, 0, stream>>>(
             alpha_inout, beta_inout, dt_bias, ssm_a,
-            T, num_v_heads, gb_row_stride, gb_row_stride);
+            T, num_v_heads, gb_row_stride, gb_row_stride, prep_decay);
     }
 
     // Step 2: ported delta kernel.
@@ -204,28 +225,38 @@ bool launch_gated_delta_net(
     const uint3 fd = cuda_helpers::init_fastdiv_values(num_k_heads);
     constexpr int num_warps = 4;
 
-    auto launch = [&](auto S_v_const) {
+    auto launch = [&](auto S_v_const, auto decay_const) {
         constexpr int S_v = decltype(S_v_const)::value;
+        constexpr bool kAlphaIsDecay = decltype(decay_const)::value;
         const int warp_size = 32 < S_v ? 32 : S_v;
         const dim3 grid(num_v_heads, 1, (S_v + num_warps - 1) / num_warps);
         const dim3 block(warp_size, num_warps, 1);
-        gated_delta_net_kernel<S_v><<<grid, block, 0, stream>>>(
+        gated_delta_net_kernel<S_v, kAlphaIsDecay><<<grid, block, 0, stream>>>(
             conv_qkv + q_offset,
             conv_qkv + k_offset,
             conv_qkv + v_offset,
-            alpha_inout,    // now decay g
+            alpha_inout,    // now g or log_g
             beta_inout,     // now sigmoid_beta
             state, core_out,
+            state_checkpoints,
             T,
             qkv_row_stride, qkv_row_stride, gb_row_stride, out_row_stride,
-            fd, scale);
+            fd, scale, checkpoint_count);
+    };
+
+    auto launch_dim = [&](auto S_v_const) {
+        if (prep_decay) {
+            launch(S_v_const, std::true_type{});
+        } else {
+            launch(S_v_const, std::false_type{});
+        }
     };
 
     switch (head_dim) {
-        case 16:  launch(std::integral_constant<int, 16>{});  break;
-        case 32:  launch(std::integral_constant<int, 32>{});  break;
-        case 64:  launch(std::integral_constant<int, 64>{});  break;
-        case 128: launch(std::integral_constant<int, 128>{}); break;
+        case 16:  launch_dim(std::integral_constant<int, 16>{});  break;
+        case 32:  launch_dim(std::integral_constant<int, 32>{});  break;
+        case 64:  launch_dim(std::integral_constant<int, 64>{});  break;
+        case 128: launch_dim(std::integral_constant<int, 128>{}); break;
         default:  return false;
     }
     return true;

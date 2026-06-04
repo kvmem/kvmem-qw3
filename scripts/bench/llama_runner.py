@@ -108,6 +108,7 @@ def _stream_completion(base_url: str, model_name: str, prompt: str,
         "temperature": 0,
         "stream": True,
         "cache_prompt": False,        # force fresh prefill each trial
+        "ignore_eos": True,           # keep decode length comparable at 1K
         "timings_per_token": True,
     }
     data = json.dumps(payload).encode("utf-8")
@@ -144,7 +145,7 @@ def _stream_completion(base_url: str, model_name: str, prompt: str,
 def _measure(server: LlamaServer, cfg: BenchConfig, prompt: str,
              n_decode: int, is_mtp: bool, mtp_chain: int) -> TrialMeasurement:
     model_name = Path(cfg.model).name
-    timeout = cfg.timeout_for(len(prompt), n_decode)
+    timeout = cfg.timeout_for(server.ctx, n_decode)
     with BackgroundVramPoller() as vram:
         try:
             res = _stream_completion(server.base_url, model_name, prompt,

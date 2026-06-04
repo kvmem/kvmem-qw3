@@ -32,9 +32,9 @@ class BenchConfig:
     llama_server: str = DEFAULT_LLAMA_SERVER
 
     prompt_tokens: List[int] = field(
-        default_factory=lambda: [512, 1024, 2048, 4096, 8192, 16384, 32768])
-    n_decode: List[int] = field(default_factory=lambda: [64, 256, 1024])
-    mtp_chain: List[int] = field(default_factory=lambda: [1, 2, 3, 4])
+        default_factory=lambda: [1024, 2048, 4096, 8192, 16384, 65536, 131072, 256000])
+    n_decode: List[int] = field(default_factory=lambda: [1024])
+    mtp_chain: List[int] = field(default_factory=lambda: [3])
     trials: int = 3
 
     # Engines / modes to run.
@@ -66,6 +66,15 @@ class BenchConfig:
     @classmethod
     def comprehensive(cls) -> "BenchConfig":
         return cls()
+
+    @classmethod
+    def full_1kout(cls) -> "BenchConfig":
+        return cls(
+            prompt_tokens=[1024, 2048, 4096, 8192, 16384, 65536, 131072, 256000],
+            n_decode=[1024],
+            mtp_chain=[2, 3, 4, 5],
+            trials=3,
+        )
 
     @classmethod
     def quick(cls) -> "BenchConfig":

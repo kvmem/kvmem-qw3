@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable, List
 
 from .config import BenchConfig, host_label
-from .schema import BenchStore, ResultRow, TrialMeasurement
+from .schema import BenchStore, ResultRow, TrialMeasurement, cell_key
 from .vram import wait_for_idle
 from . import qw3_runner, llama_runner
 
@@ -46,17 +46,24 @@ def _qw3_mtp_trials(cfg: BenchConfig, p: int, n: int, chain: int) -> List[TrialM
 
 
 class Orchestrator:
-    def __init__(self, cfg: BenchConfig, out_json: Path, log=print):
+    def __init__(self, cfg: BenchConfig, out_json: Path, log=print,
+                 resume: bool = False, force: bool = False):
         self.cfg = cfg
         self.out_json = out_json
         self.log = log
-        self.store = BenchStore(
-            git_commit=_git_commit(),
-            host=host_label(),
-            timestamp=_now(),
-            config=cfg.to_dict(),
-            partial=True,
-        )
+        self.force = force
+        if resume and out_json.exists():
+            self.store = BenchStore.load(out_json)
+            self.store.config = cfg.to_dict()
+            self.store.partial = True
+        else:
+            self.store = BenchStore(
+                git_commit=_git_commit(),
+                host=host_label(),
+                timestamp=_now(),
+                config=cfg.to_dict(),
+                partial=True,
+            )
 
     def _checkpoint(self) -> None:
         self.store.save(self.out_json)
@@ -78,7 +85,16 @@ class Orchestrator:
                      f"ttft={row.ttft_s_med:.3f}s  vram={row.peak_vram_mib}{extra}")
         self._checkpoint()
 
+    def _has_completed(self, engine: str, mode: str, p: int, n: int, chain: int) -> bool:
+        if self.force:
+            return False
+        row = self.store.row_index().get(cell_key(engine, mode, p, n, chain))
+        return bool(row and not row.error and row.trials > 0)
+
     def _run_engine_plain(self, engine: str, p: int, n: int) -> None:
+        if self._has_completed(engine, "plain", p, n, 0):
+            self.log(f"    {engine:5s} plain chain=0  SKIP existing")
+            return
         wait_for_idle()
         if engine == "qw3":
             self._record("qw3", "plain", p, n, 0, _qw3_plain_trials(self.cfg, p, n))
@@ -87,6 +103,9 @@ class Orchestrator:
                          llama_runner.run_plain_trials(self.cfg, p, n, self.cfg.trials))
 
     def _run_engine_mtp(self, engine: str, p: int, n: int, chain: int) -> None:
+        if self._has_completed(engine, "mtp", p, n, chain):
+            self.log(f"    {engine:5s} mtp   chain={chain}  SKIP existing")
+            return
         wait_for_idle()
         if engine == "qw3":
             self._record("qw3", "mtp", p, n, chain,
@@ -97,8 +116,8 @@ class Orchestrator:
 
     def run(self) -> BenchStore:
         cfg = self.cfg
-        total_cells = (len(cfg.prompt_tokens) * len(cfg.n_decode)
-                       * (1 + len(cfg.mtp_chain)) * len(cfg.engines))
+        mode_cells = (1 if cfg.run_plain else 0) + (len(cfg.mtp_chain) if cfg.run_mtp else 0)
+        total_cells = len(cfg.prompt_tokens) * len(cfg.n_decode) * mode_cells * len(cfg.engines)
         self.log(f"sweep: {total_cells} cells  "
                  f"(prompts={cfg.prompt_tokens} n={cfg.n_decode} "
                  f"chains={cfg.mtp_chain} engines={cfg.engines} trials={cfg.trials})")
