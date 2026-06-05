@@ -2,6 +2,7 @@
 build/
 build-cuda
 ds4-main/*
+benchmark/*
 
 *.o
 *.a

@@ -23,6 +23,7 @@ void usage(std::ostream &os) {
         "  --kv-dtype NAME       KV-cache dtype: fp16 (default), fp32, q8, or fp8.\n"
         "                        Sets QW3_KV_DTYPE before the model is loaded.\n"
         "  --enable-thinking     Default chat requests to thinking mode (long CoT).\n"
+        "  --native-mtp-speculate Enable MTP speculative decode.\n"
         "\n"
         "Runtime:\n"
         "  --backend NAME        mock, llama-cli, or qwen-native. Default: llama-cli\n"
