@@ -187,7 +187,7 @@ cudaError_t launch_decode_group_size_dispatch_stages(Params params,
         params, tmp, stream);
 }
 
-template <uint32_t HeadDim>
+template <uint32_t HeadDim, typename DTypeKV>
 bool launch_decode_head_dim(float *out,
                             half *o_f16,
                             half *tmp,
@@ -200,13 +200,13 @@ bool launch_decode_head_dim(float *out,
                             uint32_t seq_len,
                             float scale,
                             cudaStream_t stream) {
-    using Params = flashinfer::SingleDecodeParams<float, half, half>;
+    using Params = flashinfer::SingleDecodeParams<float, DTypeKV, half>;
     using Variant = flashinfer::DefaultAttention<false, false, false, false>;
 
     Params params;
     params.q = const_cast<float *>(q);
-    params.k = const_cast<half *>(static_cast<const half *>(k_cache));
-    params.v = const_cast<half *>(static_cast<const half *>(v_cache));
+    params.k = const_cast<DTypeKV *>(static_cast<const DTypeKV *>(k_cache));
+    params.v = const_cast<DTypeKV *>(static_cast<const DTypeKV *>(v_cache));
     params.o = o_f16;
     params.lse = nullptr;
     params.maybe_alibi_slopes = nullptr;
@@ -471,11 +471,41 @@ bool launch_decode_f32q_f16kv(float *out,
     if (seq_len == 0 || q_stride < head_dim) return false;
 
     if (head_dim == 128) {
-        return launch_decode_head_dim<128>(out, o_f16, tmp, q, q_stride, k_cache, v_cache,
+        return launch_decode_head_dim<128, half>(out, o_f16, tmp, q, q_stride, k_cache, v_cache,
                                            n_heads, n_kv_heads, seq_len, scale, stream);
     }
     if (head_dim == 256) {
-        return launch_decode_head_dim<256>(out, o_f16, tmp, q, q_stride, k_cache, v_cache,
+        return launch_decode_head_dim<256, half>(out, o_f16, tmp, q, q_stride, k_cache, v_cache,
+                                           n_heads, n_kv_heads, seq_len, scale, stream);
+    }
+    return false;
+}
+
+bool launch_decode_f32q_fp8kv(float *out,
+                              half *o_f16,
+                              half *tmp,
+                              const float *q,
+                              uint32_t q_stride,
+                              const void *k_cache,
+                              const void *v_cache,
+                              uint32_t n_heads,
+                              uint32_t n_kv_heads,
+                              uint32_t head_dim,
+                              uint32_t seq_len,
+                              float scale,
+                              cudaStream_t stream) {
+    if (out == nullptr || o_f16 == nullptr || q == nullptr || k_cache == nullptr || v_cache == nullptr) {
+        return false;
+    }
+    if (n_heads == 0 || n_kv_heads == 0 || (n_heads % n_kv_heads) != 0) return false;
+    if (seq_len == 0 || q_stride < head_dim) return false;
+
+    if (head_dim == 128) {
+        return launch_decode_head_dim<128, __nv_fp8_e4m3>(out, o_f16, tmp, q, q_stride, k_cache, v_cache,
+                                           n_heads, n_kv_heads, seq_len, scale, stream);
+    }
+    if (head_dim == 256) {
+        return launch_decode_head_dim<256, __nv_fp8_e4m3>(out, o_f16, tmp, q, q_stride, k_cache, v_cache,
                                            n_heads, n_kv_heads, seq_len, scale, stream);
     }
     return false;

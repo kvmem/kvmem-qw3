@@ -1,6 +1,7 @@
 #include "qw3/device_backend.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #include <cublas_v2.h>
 
 #include <algorithm>
@@ -115,6 +116,14 @@ bool launch_fattn_vec_decode_f32_splitk(
 bool launch_fattn_vec_decode_f16_splitk(
         float *out, void *scratch, const float *q, uint32_t q_stride,
         const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t seq_len, uint32_t batch,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+bool launch_fattn_vec_decode_q8_splitk(
+        float *out, void *scratch, const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        const void *k_scale, const void *v_scale,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
         uint32_t seq_len, uint32_t batch,
         uint32_t q_batch_stride, uint32_t out_batch_stride,
@@ -238,11 +247,36 @@ bool launch_prefill_f16q_f16kv(
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream);
 
+bool launch_prefill_f16q_fp8kv(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+
 uint64_t decode_f32q_f16kv_tmp_elements(uint32_t n_heads,
                                         uint32_t head_dim,
                                         uint32_t seq_len);
 
 bool launch_decode_f32q_f16kv(float *out,
+                              __half *o_f16,
+                              __half *tmp,
+                              const float *q,
+                              uint32_t q_stride,
+                              const void *k_cache,
+                              const void *v_cache,
+                              uint32_t n_heads,
+                              uint32_t n_kv_heads,
+                              uint32_t head_dim,
+                              uint32_t seq_len,
+                              float scale,
+                              cudaStream_t stream);
+
+bool launch_decode_f32q_fp8kv(float *out,
                               __half *o_f16,
                               __half *tmp,
                               const float *q,
@@ -610,6 +644,22 @@ __device__ float fp16_to_f32_device(uint16_t h) {
 struct CudaTensor final : DeviceTensor {
     float *ptr = nullptr;
     std::string label;
+    // Q8 KV-cache support: when q8_kv is true, `ptr` is reinterpreted as an
+    // int8 quant plane and `scale` holds one fp16 scale per quant row (a row
+    // is `q8_row_elems` int8 values sharing a single max-abs scale). Scales
+    // live in a separate allocation so the int8 plane stays 16-byte-load
+    // friendly for the attention kernels.
+    bool q8_kv = false;
+    // FP8 (e4m3) KV-cache: when fp8_kv is true, `ptr` is reinterpreted as a
+    // plane of __nv_fp8_e4m3 (1 byte each). Raw e4m3, NO scale (the FlashInfer
+    // generic prefill/decode path upcasts fp8->half before the fp16 MMA and
+    // applies no KV scale). Opt-in via QW3_KV_DTYPE=fp8. fp8 is 1 byte and so
+    // collides with int8 under the elem_size-keyed is_fp16() test, hence its
+    // own flag rather than reusing q8_kv / elem_size.
+    bool fp8_kv = false;
+    uint32_t q8_row_elems = 0;
+    __half *scale = nullptr;
+    uint64_t scale_count = 0;
     CudaTensor(uint64_t n, const char *name, uint32_t elem_bytes = sizeof(float),
                bool zero_initialize = true) {
         count = n;
@@ -632,9 +682,35 @@ struct CudaTensor final : DeviceTensor {
     }
     ~CudaTensor() override {
         if (ptr) cudaFree(ptr);
+        if (scale) cudaFree(scale);
     }
-    bool is_fp16() const { return elem_size == sizeof(__half); }
+    // Attach a Q8 scale plane. `n` int8 elements grouped into rows of
+    // `row_elems`; allocates n/row_elems fp16 scales.
+    void make_q8_kv(uint32_t row_elems) {
+        q8_kv = true;
+        q8_row_elems = row_elems;
+        scale_count = (row_elems > 0) ? (count / row_elems) : 0;
+        const size_t sbytes = static_cast<size_t>(scale_count) * sizeof(__half);
+        cudaError_t err = cudaMalloc(&scale, sbytes);
+        if (err != cudaSuccess) {
+            scale = nullptr;
+            (void)cudaGetLastError();
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                          "cudaMalloc(%s.scale, %.2f MiB) failed: %s",
+                          label.c_str(),
+                          static_cast<double>(sbytes) / (1024.0 * 1024.0),
+                          cudaGetErrorString(err));
+            throw std::runtime_error(msg);
+        }
+        cudaMemset(scale, 0, sbytes);
+    }
+    bool is_fp16() const { return elem_size == sizeof(__half) && !fp8_kv; }
+    bool is_q8_kv() const { return q8_kv; }
+    bool is_fp8_kv() const { return fp8_kv; }
     __half *ptr_h() const { return reinterpret_cast<__half *>(ptr); }
+    int8_t *ptr_i8() const { return reinterpret_cast<int8_t *>(ptr); }
+    __nv_fp8_e4m3 *ptr_fp8() const { return reinterpret_cast<__nv_fp8_e4m3 *>(ptr); }
 };
 
 enum class WeightType {
@@ -2054,6 +2130,66 @@ __global__ void kv_append_kernel_f16(__half *cache,
         __float2half(src_row[i]);
 }
 
+// FP8 (e4m3) quantize-on-write. Raw e4m3, NO scale: each element is cast
+// straight to __nv_fp8_e4m3 (fixed ±448 range, 3-bit mantissa). Mirrors the
+// fp16 path's layout exactly (element index = (base_pos+b)*per_pos_size + i),
+// so the FlashInfer attention adapters can read it as a contiguous fp8 plane.
+__global__ void kv_append_kernel_fp8(__nv_fp8_e4m3 *cache,
+                                     const float *src,
+                                     uint32_t base_pos,
+                                     uint32_t per_pos_size,
+                                     uint32_t src_stride) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= per_pos_size) return;
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] =
+        __nv_fp8_e4m3(src_row[i]);
+}
+
+// Q8 quantize-on-write. One block per (token b, quant-row). A quant row is
+// `row_elems` consecutive fp32 values (head_dim slice for one kv_head) that
+// share a single symmetric int8 scale = max|x| / 127. Block size == row_elems
+// (256), so each thread owns one element. Layout matches the fp16 path:
+// element index = (base_pos+b)*per_pos_size + row*row_elems + lane.
+__global__ void kv_append_kernel_q8(int8_t *cache,
+                                    __half *scales,
+                                    const float *src,
+                                    uint32_t base_pos,
+                                    uint32_t per_pos_size,
+                                    uint32_t row_elems,
+                                    uint32_t src_stride) {
+    const uint32_t b   = blockIdx.x;
+    const uint32_t row = blockIdx.y;            // 0 .. (per_pos_size/row_elems - 1)
+    const uint32_t lane = threadIdx.x;          // 0 .. row_elems-1
+    const uint32_t rows_per_pos = per_pos_size / row_elems;
+
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    const uint32_t elem_in_pos = row * row_elems + lane;
+    const float x = (lane < row_elems) ? src_row[elem_in_pos] : 0.0f;
+
+    // Block-wide max|x| reduction in shared memory.
+    extern __shared__ float s_absmax[];
+    s_absmax[lane] = fabsf(x);
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (lane < s) s_absmax[lane] = fmaxf(s_absmax[lane], s_absmax[lane + s]);
+        __syncthreads();
+    }
+    const float absmax = s_absmax[0];
+    const float scale = absmax / 127.0f;
+    const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
+
+    const uint64_t pos = static_cast<uint64_t>(base_pos + b);
+    if (lane == 0) {
+        scales[pos * rows_per_pos + row] = __float2half(scale);
+    }
+    // round-to-nearest, clamp to [-127,127].
+    int q = __float2int_rn(x * inv_scale);
+    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+    cache[pos * per_pos_size + elem_in_pos] = static_cast<int8_t>(q);
+}
+
 __global__ void attention_decode_qk_kernel(float *scores,
                                            const float *q,
                                            uint32_t q_stride,
@@ -2481,6 +2617,23 @@ public:
 
     std::unique_ptr<DeviceTensor> tensor_f16(uint64_t count, const char *label) override {
         return std::make_unique<CudaTensor>(count, label, /*elem_bytes=*/sizeof(__half));
+    }
+
+    std::unique_ptr<DeviceTensor> tensor_q8_kv(uint64_t count, uint32_t row_elems,
+                                               const char *label) override {
+        auto t = std::make_unique<CudaTensor>(count, label, /*elem_bytes=*/sizeof(int8_t));
+        t->make_q8_kv(row_elems);
+        return t;
+    }
+
+    std::unique_ptr<DeviceTensor> tensor_fp8_kv(uint64_t count,
+                                                const char *label) override {
+        // Raw e4m3: 1 byte/elem, no scale plane. FlashInfer's generic
+        // prefill/decode templates upcast fp8->half internally.
+        auto t = std::make_unique<CudaTensor>(count, label,
+                                              /*elem_bytes=*/sizeof(__nv_fp8_e4m3));
+        t->fp8_kv = true;
+        return t;
     }
 
     std::unique_ptr<DeviceWeight> weight_f32(const float *data, uint64_t count, const char *label) override {
@@ -3820,7 +3973,15 @@ public:
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(1, blocks);
-        if (c.is_fp16()) {
+        if (c.is_q8_kv()) {
+            const uint32_t row_elems = c.q8_row_elems;
+            const uint32_t rows = per_pos_size / row_elems;
+            dim3 qgrid(1, rows);
+            kv_append_kernel_q8<<<qgrid, row_elems, row_elems * sizeof(float), exec_stream_>>>(
+                c.ptr_i8(), c.scale, s.ptr, pos, per_pos_size, row_elems, /*src_stride=*/0);
+        } else if (c.is_fp8_kv()) {
+            kv_append_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(c.ptr_fp8(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
+        } else if (c.is_fp16()) {
             kv_append_kernel_f16<<<grid, threads, 0, exec_stream_>>>(c.ptr_h(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
         } else {
             kv_append_kernel<<<grid, threads, 0, exec_stream_>>>(c.ptr, s.ptr, pos, per_pos_size, /*src_stride=*/0);
@@ -3839,7 +4000,15 @@ public:
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(batch, blocks);
-        if (c.is_fp16()) {
+        if (c.is_q8_kv()) {
+            const uint32_t row_elems = c.q8_row_elems;
+            const uint32_t rows = per_pos_size / row_elems;
+            dim3 qgrid(batch, rows);
+            kv_append_kernel_q8<<<qgrid, row_elems, row_elems * sizeof(float), exec_stream_>>>(
+                c.ptr_i8(), c.scale, s.ptr, base_pos, per_pos_size, row_elems, per_pos_size);
+        } else if (c.is_fp8_kv()) {
+            kv_append_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(c.ptr_fp8(), s.ptr, base_pos, per_pos_size, per_pos_size);
+        } else if (c.is_fp16()) {
             kv_append_kernel_f16<<<grid, threads, 0, exec_stream_>>>(c.ptr_h(), s.ptr, base_pos, per_pos_size, per_pos_size);
         } else {
             kv_append_kernel<<<grid, threads, 0, exec_stream_>>>(c.ptr, s.ptr, base_pos, per_pos_size, per_pos_size);
@@ -4205,7 +4374,53 @@ public:
             }
             // On failure, fall through to native fattn_vec_decode below.
         }
+        // FP8 (e4m3) KV single-token decode: route to FlashInfer's generic
+        // decode template (upcasts fp8->half internally). Raw e4m3, no scale.
+        // There is no fp8 vec/MMA fallback in qw3, so a launch failure falls
+        // through to the f16/native paths below (which would misread the 1-byte
+        // plane) — but the generic FI decode supports head_dim 128/256 here.
+        if (decode_flashinfer_attention_enabled() &&
+            kc.is_fp8_kv() && (head_dim == 128 || head_dim == 256)) {
+            const uint64_t o_elems = static_cast<uint64_t>(n_heads) * head_dim;
+            const uint64_t tmp_elems =
+                flashinfer_adapter::decode_f32q_f16kv_tmp_elements(
+                    n_heads, head_dim, seq_len);
+            if (auto st = ensure_flashinfer_decode_workspace(o_elems, tmp_elems);
+                !st.ok) return st;
+            if (flashinfer_adapter::launch_decode_f32q_fp8kv(
+                    o.ptr, flashinfer_decode_o_f16_,
+                    tmp_elems > 0 ? flashinfer_decode_tmp_ : nullptr,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim, seq_len, scale,
+                    exec_stream_)) {
+                return launch_status("cuda attn flashinfer decode f32q fp8kv");
+            }
+            return {false, "flashinfer fp8 decode launcher refused"};
+        }
 #endif
+        // Q8 KV: dequant-on-read in the split-K vec kernel (FlashInfer above
+        // is gated on kv_fp16 so it never fires here). Per-row int8 + fp16
+        // scale, scale applied once per token inside the kernel.
+        if (kc.is_q8_kv() && (head_dim == 128 || head_dim == 256)) {
+            if (auto st = ensure_fattn_scratch(n_heads, /*batch=*/1, head_dim, seq_len);
+                !st.ok) return st;
+            if (ported::launch_fattn_vec_decode_q8_splitk(
+                    o.ptr, fattn_scratch_, qq.ptr, q_stride,
+                    kc.ptr_i8(), vc.ptr_i8(), kc.scale, vc.scale,
+                    n_heads, n_kv_heads, head_dim, seq_len, /*batch=*/1,
+                    /*q_batch_stride=*/0, /*out_batch_stride=*/0, scale,
+                    exec_stream_)) {
+                return launch_status("cuda attn ported q8 splitk");
+            }
+            return {false, "fattn_vec q8 splitk launcher refused head_dim"};
+        }
+        // FP8 KV has no native (non-FlashInfer) decode kernel. If we reach here
+        // with an fp8 cache (FlashInfer disabled or its decode toggled off via
+        // QW3_DECODE_ATTN=native), fail loudly rather than misread the 1-byte
+        // plane as fp16.
+        if (kc.is_fp8_kv()) {
+            return {false, "fp8 KV decode requires FlashInfer (QW3_ENABLE_FLASHINFER + decode FI enabled)"};
+        }
         // FP16 K/V: only the ported path supports half-precision K/V; the
         // legacy F32 fused/qk-softmax-av kernels are F32-only.
         if (kv_fp16 && (head_dim == 128 || head_dim == 256)) {
@@ -4319,7 +4534,68 @@ public:
         const auto &vc = as_tensor(v_cache);
         const bool kv_fp16 = kc.is_fp16();
 
-        // cuBLAS prefill: two strided-batched FP16 GEMMs + in-place causal
+        // Q8 KV: all the optimized fp16 batch paths below (cuBLAS / mma-gqa /
+        // FlashInfer) are gated on kv_fp16, so route Q8 to the vec splitk
+        // kernel with dequant-on-read. This covers chunked prefill and MTP
+        // verify under Q8. The FA2 v2 mma-gqa Q8 read is a future optimization;
+        // for now Q8 prefill trades the tensor-core path for the correct vec
+        // path.
+        if (kc.is_q8_kv() && (head_dim == 128 || head_dim == 256)) {
+            if (auto st = ensure_fattn_scratch(n_heads, batch, head_dim,
+                                                /*seq_len=*/base_seq_len + batch);
+                !st.ok) return st;
+            if (ported::launch_fattn_vec_decode_q8_splitk(
+                    o.ptr, fattn_scratch_, qq.ptr, q_stride,
+                    kc.ptr_i8(), vc.ptr_i8(), kc.scale, vc.scale,
+                    n_heads, n_kv_heads, head_dim,
+                    /*seq_len=*/base_seq_len + 1, batch,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch ported q8 splitk");
+            }
+            return {false, "fattn_vec q8 splitk launcher refused head_dim"};
+        }
+
+#if QW3_ENABLE_FLASHINFER
+        // FP8 (e4m3) KV batch attention (prefill + MTP verify): route to
+        // FlashInfer's generic single-prefill template (upcasts fp8->half
+        // internally, fp16 MMA). Raw e4m3, no scale. Fires unconditionally
+        // regardless of prefill_attn_kernel_choice() / prefill_attn_min_batch()
+        // because there is NO fp8 fallback kernel in qw3 — the fp16 paths below
+        // are gated on kv_fp16 and the vec/native kernels would misread the
+        // 1-byte plane. head_dim must be 256 (the only config the adapter
+        // instantiates). Fail loudly otherwise. NOTE: small MTP-verify batches
+        // over a long KV under-parallelize this kernel (the same reason the
+        // fp16 path falls to the vec decode below min_batch); MTP+fp8 is a
+        // deferred optimization, fp16 MTP is unaffected.
+        if (kc.is_fp8_kv()) {
+            if (head_dim != 256) {
+                return {false, "fp8 KV batch attention requires head_dim=256 (FlashInfer adapter)"};
+            }
+            const size_t pack_bytes =
+                static_cast<size_t>(batch) * n_heads * head_dim * sizeof(__half);
+            const size_t need = 2 * pack_bytes;
+            if (auto st = ensure_prefill_gqa_scratch(need); !st.ok) {
+                return st;
+            }
+            __half *q_pack = static_cast<__half *>(prefill_gqa_scratch_);
+            __half *o_pack = reinterpret_cast<__half *>(
+                static_cast<char *>(prefill_gqa_scratch_) + pack_bytes);
+            if (flashinfer_adapter::launch_prefill_f16q_fp8kv(
+                    o.ptr, q_pack, o_pack,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    n_heads, n_kv_heads, head_dim,
+                    batch, base_seq_len,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)) {
+                return launch_status("cuda attention_decode_batch flashinfer fp8");
+            }
+            return {false, "flashinfer fp8 prefill launcher refused"};
+        }
+#else
+        if (kc.is_fp8_kv()) {
+            return {false, "fp8 KV requires QW3_ENABLE_FLASHINFER"};
+        }
+#endif
+
         // softmax. Default for batch >= prefill_attn_min_batch on FP16 KV.
         // Tensor-core throughput closes the 14×/call gap of the FP32 tiled
         // kernel on long contexts. Requires contiguous Q (q_batch_stride ==

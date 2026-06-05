@@ -37,10 +37,37 @@ class BenchConfig:
     mtp_chain: List[int] = field(default_factory=lambda: [3])
     trials: int = 3
 
+    # KV-cache dtype for the qw3 engine. fp16 (default), fp32, q8, or fp8.
+    # Passed to ./build/qw3 as --kv-dtype (sets QW3_KV_DTYPE before model load);
+    # llama always runs its own fp16 KV. To compare dtypes, run the sweep once
+    # per dtype into separate JSON/HTML outputs.
+    kv_dtype: str = "fp16"
+
     # Engines / modes to run.
     engines: List[str] = field(default_factory=lambda: ["qw3", "llama"])
     run_plain: bool = True
     run_mtp: bool = True
+
+    # --- Utility (correctness) phase: passkey retrieval + GSM8K accuracy. ---
+    # Runs ONE `qw3 serve` per sweep (model loaded once) at cfg.kv_dtype and
+    # fires the eval prompts over HTTP. This is the KV-quant sensitivity probe:
+    # passkey stresses long-context attention over the (quantized) cache, GSM8K
+    # stresses short-context CoT reasoning. Compared across dtype runs.
+    run_utility: bool = True
+    util_port: int = 18097
+    util_host: str = "127.0.0.1"
+    passkey_lens: List[int] = field(default_factory=lambda: [4000, 16000, 64000])
+    passkey_depths: List[float] = field(default_factory=lambda: [0.1, 0.5, 0.9])
+    passkey_trials: int = 3
+    passkey_decode: int = 24
+    gsm8k_n: int = 40
+    gsm8k_decode: int = 400
+    gsm8k_data: str = "/tmp/gsm8k_test.jsonl"
+
+    # qw3 serve (perf sweep): one server per cell, requests looped over HTTP so
+    # the 27B model loads ONCE per cell instead of once per trial.
+    qw3_host: str = "127.0.0.1"
+    qw3_port: int = 18098
 
     # llama-server.
     llama_host: str = "127.0.0.1"
@@ -59,6 +86,11 @@ class BenchConfig:
     def timeout_for(self, prompt_tokens: int, n_decode: int) -> float:
         # Long prompts + long decode need more wall-clock; scale loosely.
         return self.base_timeout_s + prompt_tokens / 200.0 + n_decode * 0.5
+
+    def util_ctx(self) -> int:
+        """ctx for the utility server: cover the longest passkey length + decode."""
+        longest = max(self.passkey_lens) if self.passkey_lens else 4096
+        return max(4096, longest + self.passkey_decode + self.ctx_headroom)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -83,6 +115,10 @@ class BenchConfig:
             n_decode=[64, 256],
             mtp_chain=[2],
             trials=2,
+            passkey_lens=[4000],
+            passkey_depths=[0.5],
+            passkey_trials=1,
+            gsm8k_n=5,
         )
 
 

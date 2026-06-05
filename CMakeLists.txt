@@ -71,8 +71,10 @@ if(QW3_ENABLE_CUDA)
     endif()
 endif()
 
-add_executable(qw3 src/qw3_cli.cpp)
-target_link_libraries(qw3 PRIVATE qw3_core)
+add_executable(qw3 src/qw3_cli.cpp src/qw3_server.cpp)
+target_include_directories(qw3 SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+find_package(Threads REQUIRED)
+target_link_libraries(qw3 PRIVATE qw3_core Threads::Threads)
 
 add_executable(qw3-inspect src/qw3_inspect.cpp)
 target_link_libraries(qw3-inspect PRIVATE qw3_core)

@@ -33,6 +33,10 @@ def _ints(s: str):
     return [int(x) for x in re.split(r"[,\s]+", s) if x]
 
 
+def _floats(s: str):
+    return [float(x) for x in re.split(r"[,\s]+", s) if x]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -54,6 +58,19 @@ def main(argv=None) -> int:
     ap.add_argument("--engines", type=str, help="comma list: qw3,llama")
     ap.add_argument("--no-plain", action="store_true")
     ap.add_argument("--no-mtp", action="store_true")
+    ap.add_argument("--kv-dtype", type=str,
+                    help="qw3 KV-cache dtype: fp16 (default), fp32, q8, or fp8. "
+                         "Run once per dtype into separate outputs to compare.")
+    ap.add_argument("--no-utility", action="store_true",
+                    help="skip the passkey + GSM8K utility (correctness) phase")
+    ap.add_argument("--passkey-lens", type=str,
+                    help="comma/space list of passkey context lengths")
+    ap.add_argument("--passkey-depths", type=str,
+                    help="comma/space list of needle depths (0..1)")
+    ap.add_argument("--passkey-trials", type=int)
+    ap.add_argument("--gsm8k-n", type=int)
+    ap.add_argument("--util-port", type=int)
+    ap.add_argument("--qw3-port", type=int)
     ap.add_argument("--llama-port", type=int)
     ap.add_argument("--out", type=str,
                     default="/tmp/qw3_llama_full_bench/qw3_llama_full_1kout.json")
@@ -88,6 +105,14 @@ def main(argv=None) -> int:
     if args.engines: cfg.engines = [e.strip() for e in args.engines.split(",") if e.strip()]
     if args.no_plain: cfg.run_plain = False
     if args.no_mtp: cfg.run_mtp = False
+    if args.kv_dtype: cfg.kv_dtype = args.kv_dtype
+    if args.no_utility: cfg.run_utility = False
+    if args.passkey_lens: cfg.passkey_lens = _ints(args.passkey_lens)
+    if args.passkey_depths: cfg.passkey_depths = _floats(args.passkey_depths)
+    if args.passkey_trials: cfg.passkey_trials = args.passkey_trials
+    if args.gsm8k_n is not None: cfg.gsm8k_n = args.gsm8k_n
+    if args.util_port: cfg.util_port = args.util_port
+    if args.qw3_port: cfg.qw3_port = args.qw3_port
     if args.llama_port: cfg.llama_port = args.llama_port
 
     out_json = Path(args.out)

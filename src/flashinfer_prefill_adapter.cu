@@ -189,5 +189,28 @@ bool launch_prefill_f16q_f16kv(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool launch_prefill_f16q_fp8kv(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream) {
+    unsigned threads = 0, blocks = 0;
+    if (!run_prefill_typed<half, __nv_fp8_e4m3, half>(
+            q_f16, o_f16, q, q_stride, k_cache, v_cache,
+            n_heads, n_kv_heads, head_dim, batch, base_seq_len,
+            q_batch_stride, scale, stream, threads, blocks)) {
+        return false;
+    }
+    if (batch == 0) return true;
+    unpack_kernel<half><<<blocks, threads, 0, stream>>>(
+        out, o_f16, batch, n_heads, head_dim, out_batch_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 } // namespace flashinfer_adapter
 } // namespace qw3

@@ -51,6 +51,12 @@ __device__ __forceinline__ float kv_load<float>(const float *p) { return *p; }
 template <>
 __device__ __forceinline__ float kv_load<__half>(const __half *p) { return __half2float(*p); }
 
+// Q8 KV: raw int8 value cast to float. The per-row scale is applied once per
+// token outside the inner D loop (it's constant across a head_dim row), so the
+// inner load stays a cheap int->float cast.
+template <>
+__device__ __forceinline__ float kv_load<int8_t>(const int8_t *p) { return static_cast<float>(*p); }
+
 // One CUDA block per (head, batch). 128 threads = 4 warps. Each warp owns one
 // KV-token slot per outer-iteration, so 4 KV tokens are scored concurrently.
 //
@@ -87,12 +93,15 @@ fattn_vec_decode_kernel(
         uint32_t     q_stride,
         const KVT   * __restrict__ k_cache,     // [seq, n_kv_heads, HEAD_DIM]
         const KVT   * __restrict__ v_cache,     // [seq, n_kv_heads, HEAD_DIM]
+        const __half * __restrict__ k_scale,    // [seq, n_kv_heads] Q8 only, else nullptr
+        const __half * __restrict__ v_scale,    // [seq, n_kv_heads] Q8 only, else nullptr
         uint32_t     n_heads,
         uint32_t     n_kv_heads,
         uint32_t     base_seq_len,
         uint32_t     q_batch_stride,
         uint32_t     out_batch_stride,
         float        scale) {
+    constexpr bool IS_Q8 = std::is_same<KVT, int8_t>::value;
     constexpr uint32_t NWARPS    = 4;
     constexpr uint32_t WARP_SIZE = 32;
     static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be a multiple of warp size");
@@ -157,6 +166,11 @@ fattn_vec_decode_kernel(
             for (uint32_t r = 0; r < D_PER_LANE; ++r) {
                 local += q_reg[r] * kv_load<KVT>(k_t + r * WARP_SIZE + lane);
             }
+            if (IS_Q8) {
+                // Per-row scale is constant across the head_dim row, so it
+                // factors out of the dot product.
+                local *= __half2float(k_scale[static_cast<uint64_t>(t) * n_kv_heads + kv_head]);
+            }
         }
         local = cuda_helpers::warp_reduce_sum<WARP_SIZE>(local);
         if (lane == 0) {
@@ -194,9 +208,14 @@ fattn_vec_decode_kernel(
 
             const KVT * v_t = v_cache + static_cast<uint64_t>(t) * n_kv_heads * HEAD_DIM
                               + kv_head * HEAD_DIM;
+            // Fold the per-row V scale into the softmax weight (constant across
+            // the head_dim row).
+            const float vw = IS_Q8
+                ? w_t * __half2float(v_scale[static_cast<uint64_t>(t) * n_kv_heads + kv_head])
+                : w_t;
             #pragma unroll
             for (uint32_t r = 0; r < D_PER_LANE; ++r) {
-                VKQ[r] += w_t * kv_load<KVT>(v_t + r * WARP_SIZE + lane);
+                VKQ[r] += vw * kv_load<KVT>(v_t + r * WARP_SIZE + lane);
             }
         }
 
@@ -376,6 +395,8 @@ static bool dispatch_launch(
         uint32_t q_stride,
         const KVT * k_cache,
         const KVT * v_cache,
+        const __half * k_scale,
+        const __half * v_scale,
         uint32_t n_heads,
         uint32_t n_kv_heads,
         uint32_t head_dim,
@@ -401,7 +422,7 @@ static bool dispatch_launch(
         // NSPLIT>1 branch (which won't be taken).
         float * dst = (NS == 1) ? out : partials;
         fattn_vec_decode_kernel<HD, KVT, NS><<<grid, block, 0, stream>>>(
-            dst, ms, q, q_stride, k_cache, v_cache,
+            dst, ms, q, q_stride, k_cache, v_cache, k_scale, v_scale,
             n_heads, n_kv_heads, base_seq_len,
             q_batch_stride, out_batch_stride, scale);
         if (NS > 1) {
@@ -444,7 +465,7 @@ bool launch_fattn_vec_decode_f32(
         cudaStream_t  stream) {
     return dispatch_launch<float>(
         out, /*partials=*/nullptr, /*ms=*/nullptr,
-        q, q_stride, k_cache, v_cache,
+        q, q_stride, k_cache, v_cache, /*k_scale=*/nullptr, /*v_scale=*/nullptr,
         n_heads, n_kv_heads, head_dim, seq_len, batch,
         q_batch_stride, out_batch_stride, scale,
         /*nsplit=*/1, stream);
@@ -474,7 +495,7 @@ bool launch_fattn_vec_decode_f32_splitk(
     if (nsplit == 1) {
         return dispatch_launch<float>(
             out, nullptr, nullptr,
-            q, q_stride, k_cache, v_cache,
+            q, q_stride, k_cache, v_cache, /*k_scale=*/nullptr, /*v_scale=*/nullptr,
             n_heads, n_kv_heads, head_dim, seq_len, batch,
             q_batch_stride, out_batch_stride, scale, /*nsplit=*/1, stream);
     }
@@ -482,7 +503,7 @@ bool launch_fattn_vec_decode_f32_splitk(
     float * ms       = partials + static_cast<size_t>(n_heads) * b_eff * nsplit * head_dim;
     return dispatch_launch<float>(
         out, partials, ms,
-        q, q_stride, k_cache, v_cache,
+        q, q_stride, k_cache, v_cache, /*k_scale=*/nullptr, /*v_scale=*/nullptr,
         n_heads, n_kv_heads, head_dim, seq_len, batch,
         q_batch_stride, out_batch_stride, scale, nsplit, stream);
 }
@@ -510,6 +531,7 @@ bool launch_fattn_vec_decode_f16(
         q, q_stride,
         static_cast<const __half *>(k_cache),
         static_cast<const __half *>(v_cache),
+        /*k_scale=*/nullptr, /*v_scale=*/nullptr,
         n_heads, n_kv_heads, head_dim, seq_len, batch,
         q_batch_stride, out_batch_stride, scale, /*nsplit=*/1, stream);
 }
@@ -537,6 +559,7 @@ bool launch_fattn_vec_decode_f16_splitk(
             out, nullptr, nullptr, q, q_stride,
             static_cast<const __half *>(k_cache),
             static_cast<const __half *>(v_cache),
+            /*k_scale=*/nullptr, /*v_scale=*/nullptr,
             n_heads, n_kv_heads, head_dim, seq_len, batch,
             q_batch_stride, out_batch_stride, scale, /*nsplit=*/1, stream);
     }
@@ -546,6 +569,48 @@ bool launch_fattn_vec_decode_f16_splitk(
         out, partials, ms, q, q_stride,
         static_cast<const __half *>(k_cache),
         static_cast<const __half *>(v_cache),
+        /*k_scale=*/nullptr, /*v_scale=*/nullptr,
+        n_heads, n_kv_heads, head_dim, seq_len, batch,
+        q_batch_stride, out_batch_stride, scale, nsplit, stream);
+}
+
+// Q8 K/V cache variant. k_cache/v_cache are int8 planes; k_scale/v_scale are
+// fp16 per-row scales laid out [seq, n_kv_heads]. Dequant happens inside the
+// kernel (one scale multiply per token, factored out of the head_dim loop).
+bool launch_fattn_vec_decode_q8_splitk(
+        float *       out,
+        void *        scratch,
+        const float * q,
+        uint32_t      q_stride,
+        const void  * k_cache,             // int8_t *
+        const void  * v_cache,             // int8_t *
+        const void  * k_scale,             // __half *
+        const void  * v_scale,             // __half *
+        uint32_t      n_heads,
+        uint32_t      n_kv_heads,
+        uint32_t      head_dim,
+        uint32_t      seq_len,
+        uint32_t      batch,
+        uint32_t      q_batch_stride,
+        uint32_t      out_batch_stride,
+        float         scale,
+        cudaStream_t  stream) {
+    const uint32_t b_eff = batch == 0 ? 1 : batch;
+    const uint32_t nsplit = pick_nsplit(seq_len);
+    const auto * kc = static_cast<const int8_t *>(k_cache);
+    const auto * vc = static_cast<const int8_t *>(v_cache);
+    const auto * ks = static_cast<const __half *>(k_scale);
+    const auto * vs = static_cast<const __half *>(v_scale);
+    if (nsplit == 1) {
+        return dispatch_launch<int8_t>(
+            out, nullptr, nullptr, q, q_stride, kc, vc, ks, vs,
+            n_heads, n_kv_heads, head_dim, seq_len, batch,
+            q_batch_stride, out_batch_stride, scale, /*nsplit=*/1, stream);
+    }
+    float * partials = static_cast<float *>(scratch);
+    float * ms       = partials + static_cast<size_t>(n_heads) * b_eff * nsplit * head_dim;
+    return dispatch_launch<int8_t>(
+        out, partials, ms, q, q_stride, kc, vc, ks, vs,
         n_heads, n_kv_heads, head_dim, seq_len, batch,
         q_batch_stride, out_batch_stride, scale, nsplit, stream);
 }

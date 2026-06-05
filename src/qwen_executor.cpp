@@ -172,14 +172,24 @@ void QwenExecutor::ensure_scratch() {
     v_cache_.resize(weights_.n_layers());
     const uint64_t kv_per_pos = static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
     // Default KV cache dtype: FP16 (2x bandwidth at long context, ~equal
-    // greedy-token output). Force back to FP32 with QW3_KV_DTYPE=fp32.
+    // greedy-token output). Force back to FP32 with QW3_KV_DTYPE=fp32, or down
+    // to per-row int8 (one fp16 scale per head_dim row) with QW3_KV_DTYPE=q8.
     const char *kv_dtype_env = std::getenv("QW3_KV_DTYPE");
-    const bool kv_use_fp16 = !(kv_dtype_env && std::strcmp(kv_dtype_env, "fp32") == 0);
+    const bool kv_use_fp32 = kv_dtype_env && std::strcmp(kv_dtype_env, "fp32") == 0;
+    const bool kv_use_q8 = kv_dtype_env && std::strcmp(kv_dtype_env, "q8") == 0;
+    const bool kv_use_fp8 = kv_dtype_env && std::strcmp(kv_dtype_env, "fp8") == 0;
+    const bool kv_use_fp16 = !kv_use_fp32 && !kv_use_q8 && !kv_use_fp8;
     for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
         if (!cfg.is_standard_attention_layer(il)) continue;
         const std::string klabel = "k_cache_l" + std::to_string(il);
         const std::string vlabel = "v_cache_l" + std::to_string(il);
-        if (kv_use_fp16) {
+        if (kv_use_q8) {
+            k_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_ctx_size_, cfg.head_dim, klabel.c_str());
+            v_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_ctx_size_, cfg.head_dim, vlabel.c_str());
+        } else if (kv_use_fp8) {
+            k_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_ctx_size_, klabel.c_str());
+            v_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_ctx_size_, vlabel.c_str());
+        } else if (kv_use_fp16) {
             k_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_ctx_size_, klabel.c_str());
             v_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_ctx_size_, vlabel.c_str());
         } else {
@@ -212,8 +222,17 @@ void QwenExecutor::ensure_mtp_scratch() {
     const uint64_t kv_per_pos = static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
     const uint64_t kv_slots = std::max<uint32_t>(kv_ctx_size_, 1);
     const char *kv_dtype_env = std::getenv("QW3_KV_DTYPE");
-    const bool kv_use_fp16 = !(kv_dtype_env && std::strcmp(kv_dtype_env, "fp32") == 0);
-    if (kv_use_fp16) {
+    const bool kv_use_fp32 = kv_dtype_env && std::strcmp(kv_dtype_env, "fp32") == 0;
+    const bool kv_use_q8 = kv_dtype_env && std::strcmp(kv_dtype_env, "q8") == 0;
+    const bool kv_use_fp8 = kv_dtype_env && std::strcmp(kv_dtype_env, "fp8") == 0;
+    const bool kv_use_fp16 = !kv_use_fp32 && !kv_use_q8 && !kv_use_fp8;
+    if (kv_use_q8) {
+        mtp_k_cache_ = backend_.tensor_q8_kv(kv_per_pos * kv_slots, cfg.head_dim, "mtp_k_cache");
+        mtp_v_cache_ = backend_.tensor_q8_kv(kv_per_pos * kv_slots, cfg.head_dim, "mtp_v_cache");
+    } else if (kv_use_fp8) {
+        mtp_k_cache_ = backend_.tensor_fp8_kv(kv_per_pos * kv_slots, "mtp_k_cache");
+        mtp_v_cache_ = backend_.tensor_fp8_kv(kv_per_pos * kv_slots, "mtp_v_cache");
+    } else if (kv_use_fp16) {
         mtp_k_cache_ = backend_.tensor_f16(kv_per_pos * kv_slots, "mtp_k_cache");
         mtp_v_cache_ = backend_.tensor_f16(kv_per_pos * kv_slots, "mtp_v_cache");
     } else {

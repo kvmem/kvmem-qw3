@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -31,6 +32,21 @@ bool launch_prefill_f16q_f16kv_gated(
         float scale, cudaStream_t stream);
 
 bool launch_prefill_f16q_f16kv(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        const float *q, uint32_t q_stride,
+        const void *k_cache, const void *v_cache,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t batch, uint32_t base_seq_len,
+        uint32_t q_batch_stride, uint32_t out_batch_stride,
+        float scale, cudaStream_t stream);
+
+// FP8 (e4m3) KV variant of the plain (non-gated) prefill. Q is packed to FP16,
+// K/V are read as __nv_fp8_e4m3 (upcast to half inside FlashInfer's generic
+// template), output unpacked to FP32. The gate is left to the caller. KV
+// pointers point at raw e4m3 planes (no scale). Used when QW3_KV_DTYPE=fp8.
+bool launch_prefill_f16q_fp8kv(
         float *out,
         __half *q_f16,
         __half *o_f16,

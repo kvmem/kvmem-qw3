@@ -572,6 +572,70 @@ def _interactive_section(store: BenchStore) -> str:
 """
 
 
+def _utility_section(store: BenchStore) -> str:
+    util = getattr(store, "utility", None)
+    if util is None:
+        return ""
+    dt = _esc(getattr(util, "kv_dtype", store.config.get("kv_dtype", "fp16")))
+    P: List[str] = ["<h2>Utility (correctness)</h2>"]
+    P.append(f"<div class='facet'><h3>KV dtype <code>{dt}</code> · "
+             "passkey retrieval + GSM8K (greedy, temp=0)</h3>")
+    if not getattr(util, "ok", False):
+        P.append(f"<div class='warn'>Utility phase failed: {_esc(util.error or 'unknown')}</div>")
+        P.append("</div>")
+        return "".join(P)
+
+    # GSM8K headline.
+    acc = util.gsm8k_acc
+    if util.gsm8k_error:
+        P.append(f"<div class='note'>GSM8K skipped: {_esc(util.gsm8k_error)}</div>")
+    elif acc is not None:
+        P.append("<div class='overview'>"
+                 f"<div class='metric'><span>GSM8K accuracy (n={util.gsm8k_n})</span>"
+                 f"<b>{acc*100:.1f}%</b></div>"
+                 f"<div class='metric'><span>GSM8K correct</span>"
+                 f"<b>{util.gsm8k_correct}/{util.gsm8k_n}</b></div>"
+                 "</div>")
+
+    # Passkey table: rows = length, cols = depth.
+    cells = util.passkey_cells
+    if cells:
+        lengths = sorted({c.length for c in cells})
+        depths = sorted({c.depth for c in cells})
+        idx = {(c.length, c.depth): c for c in cells}
+        head = "".join(f"<th>depth {d:g}</th>" for d in depths)
+        P.append("<div class='table-wrap'><table><thead><tr><th>passkey len</th>"
+                 f"{head}<th>row hit-rate</th></tr></thead><tbody>")
+        tot_hits = tot_trials = 0
+        for L in lengths:
+            row_hits = row_trials = 0
+            tds = []
+            for d in depths:
+                c = idx.get((L, d))
+                if c is None:
+                    tds.append("<td>—</td>")
+                    continue
+                row_hits += c.hits
+                row_trials += c.trials
+                pct = c.rate * 100
+                cls = "" if c.rate >= 0.999 else " style='color:#b00'"
+                tds.append(f"<td{cls}>{c.hits}/{c.trials} ({pct:.0f}%)</td>")
+            tot_hits += row_hits
+            tot_trials += row_trials
+            rr = (row_hits / row_trials * 100) if row_trials else 0.0
+            P.append(f"<tr><td>{_fmt_xtick(L)}</td>{''.join(tds)}"
+                     f"<td>{row_hits}/{row_trials} ({rr:.0f}%)</td></tr>")
+        gr = (tot_hits / tot_trials * 100) if tot_trials else 0.0
+        P.append(f"<tr><td><b>overall</b></td>"
+                 f"<td colspan='{len(depths)}'></td>"
+                 f"<td><b>{tot_hits}/{tot_trials} ({gr:.0f}%)</b></td></tr>")
+        P.append("</tbody></table></div>")
+    P.append("<div class='note'>To compare KV dtypes, run the sweep once per "
+             "<code>--kv-dtype</code> and place the reports side by side.</div>")
+    P.append("</div>")
+    return "".join(P)
+
+
 def render_report(store: BenchStore, out_path: Path) -> Path:
     cfg = store.config
     prompts = list(cfg.get("prompt_tokens", []))
@@ -586,6 +650,7 @@ def render_report(store: BenchStore, out_path: Path) -> Path:
     P.append(f"<div class='meta'>commit <code>{_esc(store.git_commit)}</code> · "
              f"host <code>{_esc(store.host)}</code> · {_esc(store.timestamp)} · "
              f"model <code>{_esc(Path(cfg.get('model','')).name)}</code> · "
+             f"kv_dtype <code>{_esc(cfg.get('kv_dtype','fp16'))}</code> · "
              f"trials {cfg.get('trials')}</div>")
     ok_rows = sum(1 for r in store.rows if not r.error)
     failed_rows = sum(1 for r in store.rows if r.error)
@@ -601,6 +666,7 @@ def render_report(store: BenchStore, out_path: Path) -> Path:
         P.append("<div class='note'>Some cells failed and are shown as <b>fail</b> in the relevant tables. "
                  "Detailed failure text is kept in the JSON raw data, but is not expanded here.</div>")
     P.append(_interactive_section(store))
+    P.append(_utility_section(store))
 
     # ---- Plain throughput ----
     P.append("<h2>Plain</h2>")

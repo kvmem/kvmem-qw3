@@ -19,6 +19,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -31,6 +32,53 @@ namespace {
 double wall_seconds() {
     using clk = std::chrono::steady_clock;
     return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
+}
+
+// Host-side token sampler over the full fp32 vocab logits. temp<=0 is greedy
+// (argmax) and is bit-identical to the prior behavior. Otherwise: scale by
+// 1/temp, softmax, nucleus (top-p) truncation, renormalize, draw with rng.
+// Kept on host because copy_last_logits() already round-trips logits for the
+// dump-logits path; sampling adds no device work.
+int32_t sample_token(const std::vector<float> &logits, float temp, float top_p,
+                     std::mt19937_64 &rng) {
+    const int n = static_cast<int>(logits.size());
+    if (n <= 0) return -1;
+    if (temp <= 0.0f) {
+        int best = 0;
+        float bv = logits[0];
+        for (int i = 1; i < n; ++i) if (logits[i] > bv) { bv = logits[i]; best = i; }
+        return best;
+    }
+    // softmax(logits / temp), numerically stabilized by max subtraction.
+    const float inv_t = 1.0f / temp;
+    float maxv = logits[0];
+    for (int i = 1; i < n; ++i) if (logits[i] > maxv) maxv = logits[i];
+    std::vector<std::pair<float, int>> probs(n);
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const float p = std::exp((logits[i] - maxv) * inv_t);
+        probs[i] = {p, i};
+        sum += p;
+    }
+    const float norm = static_cast<float>(1.0 / (sum > 0.0 ? sum : 1.0));
+    for (auto &pr : probs) pr.first *= norm;
+    // Nucleus: sort desc, keep smallest prefix with cumulative prob >= top_p.
+    if (top_p < 1.0f && top_p > 0.0f) {
+        std::sort(probs.begin(), probs.end(),
+                  [](const auto &a, const auto &b) { return a.first > b.first; });
+        double cum = 0.0;
+        size_t keep = probs.size();
+        for (size_t i = 0; i < probs.size(); ++i) {
+            cum += probs[i].first;
+            if (cum >= top_p) { keep = i + 1; break; }
+        }
+        probs.resize(keep);
+    }
+    std::vector<double> weights;
+    weights.reserve(probs.size());
+    for (const auto &pr : probs) weights.push_back(pr.first);
+    std::discrete_distribution<int> dist(weights.begin(), weights.end());
+    return probs[dist(rng)].second;
 }
 
 bool native_prefill_flashinfer_effective() {
@@ -791,10 +839,23 @@ private:
         }
         const double t_prefill_end = wall_seconds();
 
+        // Sampling setup. temp<=0 keeps the greedy argmax path (bit-identical
+        // to before); temp>0 draws from copy_last_logits() via sample_token().
+        const bool do_sample = options.temperature > 0.0f;
+        std::mt19937_64 rng(options.seed);
+        std::vector<float> logit_buf;
+        auto pick_next = [&](int32_t fallback_argmax) -> int32_t {
+            if (!do_sample) return fallback_argmax;
+            if (!executor_->copy_last_logits(logit_buf)) return fallback_argmax;
+            const int32_t t = sample_token(logit_buf, options.temperature,
+                                           options.top_p, rng);
+            return t >= 0 ? t : fallback_argmax;
+        };
+
         std::string generated;
         const int32_t eos = tokenizer_->eos_id();
-        uint32_t next_token = step.argmax_token >= 0 ? static_cast<uint32_t>(step.argmax_token)
-                                                     : static_cast<uint32_t>(eos);
+        const int32_t seed_argmax = step.argmax_token >= 0 ? step.argmax_token : eos;
+        uint32_t next_token = static_cast<uint32_t>(pick_next(seed_argmax));
         uint64_t decode_ops = 0;
         int decoded = 0;
         if (options.max_tokens > 0 && next_token != static_cast<uint32_t>(eos)) {
@@ -809,13 +870,14 @@ private:
             step = executor_->forward_one_token(feed);
             if (!step.ok) throw std::runtime_error("decode failed");
             decode_ops += step.ops_executed;
-            const int32_t new_argmax = step.argmax_token >= 0 ? step.argmax_token : eos;
+            const int32_t fallback = step.argmax_token >= 0 ? step.argmax_token : eos;
             if (dump) dump->record(static_cast<int>(prompt_tokens.size() + i),
                                    "decode", static_cast<int32_t>(feed),
                                    *executor_, *tokenizer_);
-            next_token = static_cast<uint32_t>(new_argmax);
+            const int32_t new_token = pick_next(fallback);
+            next_token = static_cast<uint32_t>(new_token);
             if (next_token == static_cast<uint32_t>(eos)) break;
-            const std::string piece = tokenizer_->decode_one(new_argmax);
+            const std::string piece = tokenizer_->decode_one(new_token);
             generated += piece;
             if (on_text && !piece.empty()) on_text(piece);
             ++decoded;

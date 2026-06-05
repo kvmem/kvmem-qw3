@@ -172,6 +172,49 @@ class TrialMeasurement:
 
 
 @dataclass
+class PasskeyCell:
+    length: int
+    depth: float
+    hits: int
+    trials: int
+
+    @property
+    def rate(self) -> float:
+        return self.hits / self.trials if self.trials else 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class UtilityResult:
+    ok: bool
+    kv_dtype: str = "fp16"
+    passkey_cells: List[PasskeyCell] = field(default_factory=list)
+    gsm8k_correct: int = 0
+    gsm8k_n: int = 0
+    gsm8k_error: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def gsm8k_acc(self) -> Optional[float]:
+        return self.gsm8k_correct / self.gsm8k_n if self.gsm8k_n else None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["passkey_cells"] = [c.to_dict() for c in self.passkey_cells]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "UtilityResult":
+        cells = [PasskeyCell(**c) for c in d.pop("passkey_cells", [])]
+        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        obj = cls(**{k: v for k, v in d.items() if k in known})
+        obj.passkey_cells = cells
+        return obj
+
+
+@dataclass
 class BenchStore:
     """Top-level JSON store. Written incrementally during a sweep."""
     git_commit: str = ""
@@ -180,6 +223,7 @@ class BenchStore:
     config: Dict[str, Any] = field(default_factory=dict)
     rows: List[ResultRow] = field(default_factory=list)
     errors: List[Dict[str, str]] = field(default_factory=list)
+    utility: Optional[UtilityResult] = None
     partial: bool = True
     schema_version: int = SCHEMA_VERSION
 
@@ -200,7 +244,7 @@ class BenchStore:
         self.errors.append({"cell_key": key, "message": message})
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "schema_version": self.schema_version,
             "git_commit": self.git_commit,
             "host": self.host,
@@ -210,6 +254,9 @@ class BenchStore:
             "errors": self.errors,
             "partial": self.partial,
         }
+        if self.utility is not None:
+            d["utility"] = self.utility.to_dict()
+        return d
 
     def save(self, path: Path) -> None:
         tmp = Path(str(path) + ".tmp")
@@ -229,6 +276,8 @@ class BenchStore:
             schema_version=d.get("schema_version", SCHEMA_VERSION),
         )
         store.rows = [ResultRow.from_dict(r) for r in d.get("rows", [])]
+        if "utility" in d and d["utility"]:
+            store.utility = UtilityResult.from_dict(d["utility"])
         return store
 
     def row_index(self) -> Dict[str, ResultRow]:

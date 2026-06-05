@@ -1,8 +1,9 @@
 """Sweep orchestrator: walk the grid, run trials, checkpoint after every row.
 
-Engine asymmetry handled here:
-  - qw3 runs one fresh process per trial (qw3_runner returns one measurement).
-  - llama runs one server per cell, looping `trials` requests internally.
+Both engines now run one server per cell, looping `trials` requests internally
+so the 27B model loads once per cell (not once per trial):
+  - qw3 runs `qw3 serve` (OpenAI-compatible HTTP) and parses per-request timing.
+  - llama runs `llama-server` and reads its `timings` block.
 
 Per cell we alternate which engine goes first to spread thermal drift, and wait
 for the GPU to return near idle between engine switches so peak-VRAM readings
@@ -22,7 +23,7 @@ from typing import Callable, List
 from .config import BenchConfig, host_label
 from .schema import BenchStore, ResultRow, TrialMeasurement, cell_key
 from .vram import wait_for_idle
-from . import qw3_runner, llama_runner
+from . import qw3_runner, llama_runner, utility_runner
 
 
 def _git_commit() -> str:
@@ -38,11 +39,11 @@ def _now() -> str:
 
 
 def _qw3_plain_trials(cfg: BenchConfig, p: int, n: int) -> List[TrialMeasurement]:
-    return [qw3_runner.run_plain(cfg, p, n) for _ in range(cfg.trials)]
+    return qw3_runner.run_plain_trials(cfg, p, n, cfg.trials)
 
 
 def _qw3_mtp_trials(cfg: BenchConfig, p: int, n: int, chain: int) -> List[TrialMeasurement]:
-    return [qw3_runner.run_mtp(cfg, p, n, chain) for _ in range(cfg.trials)]
+    return qw3_runner.run_mtp_trials(cfg, p, n, chain, cfg.trials)
 
 
 class Orchestrator:
@@ -138,8 +139,32 @@ class Orchestrator:
                     for chain in cfg.mtp_chain:
                         for engine in order:
                             self._run_engine_mtp(engine, p, n, chain)
+        self._run_utility()
         self.store.partial = False
         self._checkpoint()
         self.log(f"\ndone: {len(self.store.rows)} rows, "
                  f"{len(self.store.errors)} errors -> {self.out_json}")
         return self.store
+
+    def _run_utility(self) -> None:
+        cfg = self.cfg
+        if not cfg.run_utility:
+            return
+        if not self.force and self.store.utility is not None and self.store.utility.ok:
+            self.log(f"\n[utility] SKIP existing ({cfg.kv_dtype})")
+            return
+        self.log(f"\n[utility] kv_dtype={cfg.kv_dtype}  "
+                 f"passkey lens={cfg.passkey_lens} depths={cfg.passkey_depths} "
+                 f"trials={cfg.passkey_trials}  gsm8k_n={cfg.gsm8k_n}")
+        wait_for_idle()
+        result = utility_runner.run_utility(cfg)
+        self.store.utility = result
+        if not result.ok:
+            self.log(f"    utility ERROR: {result.error}")
+        else:
+            pk_hits = sum(c.hits for c in result.passkey_cells)
+            pk_tot = sum(c.trials for c in result.passkey_cells)
+            acc = result.gsm8k_acc
+            acc_s = f"{acc*100:.1f}%" if acc is not None else "n/a"
+            self.log(f"    passkey {pk_hits}/{pk_tot}  gsm8k {acc_s}")
+        self._checkpoint()

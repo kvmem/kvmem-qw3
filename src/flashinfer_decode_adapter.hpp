@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -22,6 +23,23 @@ uint64_t decode_f32q_f16kv_tmp_elements(uint32_t n_heads,
 //   k/v: FP16 [seq_len, n_kv_heads, head_dim].
 //   out: FP32 [n_heads, head_dim], without applying qw3's Q-gate.
 bool launch_decode_f32q_f16kv(float *out,
+                              __half *o_f16,
+                              __half *tmp,
+                              const float *q,
+                              uint32_t q_stride,
+                              const void *k_cache,
+                              const void *v_cache,
+                              uint32_t n_heads,
+                              uint32_t n_kv_heads,
+                              uint32_t head_dim,
+                              uint32_t seq_len,
+                              float scale,
+                              cudaStream_t stream);
+
+// FP8 (e4m3) KV variant of single-token decode. K/V read as __nv_fp8_e4m3
+// (upcast to half inside FlashInfer's generic decode template), Q stays FP32,
+// out FP32. Raw e4m3, no scale. tmp shape matches the f16kv variant.
+bool launch_decode_f32q_fp8kv(float *out,
                               __half *o_f16,
                               __half *tmp,
                               const float *q,

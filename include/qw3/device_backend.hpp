@@ -85,6 +85,24 @@ public:
     virtual std::unique_ptr<DeviceTensor> tensor_f16(uint64_t count, const char *label) {
         return tensor_f32(count, label);
     }
+    // Optional Q8 KV-cache tensor: `count` int8 elements grouped into rows of
+    // `row_elems` that each share one fp16 max-abs scale. Backends that don't
+    // override fall back to FP32 (callers must check the returned tensor's
+    // actual storage, e.g. via is_q8_kv on the CUDA backend, before assuming
+    // quantized layout).
+    virtual std::unique_ptr<DeviceTensor> tensor_q8_kv(uint64_t count, uint32_t row_elems,
+                                                       const char *label) {
+        (void)row_elems;
+        return tensor_f32(count, label);
+    }
+    // Optional FP8 (e4m3) KV-cache tensor: `count` 1-byte e4m3 elements, no
+    // scale (raw e4m3). Backends that don't override fall back to FP32 (callers
+    // must check the returned tensor's actual storage, e.g. via is_fp8_kv on
+    // the CUDA backend, before assuming fp8 layout).
+    virtual std::unique_ptr<DeviceTensor> tensor_fp8_kv(uint64_t count,
+                                                        const char *label) {
+        return tensor_f32(count, label);
+    }
     // Transient FP32 workspace whose previous contents are never observed by
     // correct code. Backends may skip initialization to avoid large scratch
     // memset costs; conservative backends can keep zero-initialized behavior.

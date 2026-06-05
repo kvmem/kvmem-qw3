@@ -9,3 +9,6 @@ ds4-main/*
 *.so
 
 *.gguf
+
+__pycache__/
+*.pyc

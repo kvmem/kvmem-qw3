@@ -1,5 +1,6 @@
 #include "qw3/gguf.hpp"
 #include "qw3/qw3.hpp"
+#include "server.hpp"
 
 #include <cstdlib>
 #include <exception>
@@ -14,6 +15,14 @@ namespace {
 void usage(std::ostream &os) {
     os <<
         "Usage: qw3 --model MODEL.gguf -p PROMPT [options]\n"
+        "       qw3 serve --model MODEL.gguf [--port 8080] [--kv-dtype q8] [options]\n"
+        "\n"
+        "Serve (OpenAI-compatible HTTP API; loads model once, serves forever):\n"
+        "  --port N              Listen port. Default: 8080\n"
+        "  --host ADDR           Bind address. Default: 127.0.0.1\n"
+        "  --kv-dtype NAME       KV-cache dtype: fp16 (default), fp32, q8, or fp8.\n"
+        "                        Sets QW3_KV_DTYPE before the model is loaded.\n"
+        "  --enable-thinking     Default chat requests to thinking mode (long CoT).\n"
         "\n"
         "Runtime:\n"
         "  --backend NAME        mock, llama-cli, or qwen-native. Default: llama-cli\n"
@@ -114,8 +123,18 @@ int main(int argc, char **argv) {
     bool dump_tensors = false;
     bool think = false;
 
+    // `qw3 serve ...` runs the OpenAI-compatible HTTP server instead of a
+    // one-shot generate. Detected as the first positional argument.
+    bool serve = false;
+    qw3::ServerConfig serve_cfg;
+    int arg_start = 1;
+    if (argc > 1 && std::string(argv[1]) == "serve") {
+        serve = true;
+        arg_start = 2;
+    }
+
     try {
-        for (int i = 1; i < argc; ++i) {
+        for (int i = arg_start; i < argc; ++i) {
             const std::string arg = argv[i];
             auto need = [&](const std::string &name) -> std::string {
                 if (++i >= argc) throw std::runtime_error("missing value for " + name);
@@ -193,6 +212,18 @@ int main(int argc, char **argv) {
                 engine.dump_logits_path = need(arg);
             } else if (arg == "--dump-logits-top-k") {
                 engine.dump_logits_top_k = parse_int(need(arg), arg);
+            } else if (arg == "--port") {
+                serve_cfg.port = parse_int(need(arg), arg);
+            } else if (arg == "--host") {
+                serve_cfg.host = need(arg);
+            } else if (arg == "--kv-dtype") {
+                const std::string dt = need(arg);
+                if (dt != "fp16" && dt != "fp32" && dt != "q8" && dt != "fp8") {
+                    throw std::runtime_error("invalid --kv-dtype (want fp16|fp32|q8|fp8): " + dt);
+                }
+                setenv("QW3_KV_DTYPE", dt.c_str(), 1);
+            } else if (arg == "--enable-thinking") {
+                serve_cfg.enable_thinking_default = true;
             } else {
                 throw std::runtime_error("unknown argument: " + arg);
             }
@@ -262,6 +293,13 @@ int main(int argc, char **argv) {
             std::cout << "op_plan:\n";
             for (const std::string &op : plan.op_plan) std::cout << "  " << op << "\n";
             return 0;
+        }
+
+        if (serve) {
+            engine.backend = qw3::BackendKind::QwenNative;
+            engine.native_heavy = true;
+            if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
+            return qw3::run_server(engine, serve_cfg);
         }
 
         if (prompt.empty()) {
