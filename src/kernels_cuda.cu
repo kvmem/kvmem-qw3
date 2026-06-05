@@ -1517,6 +1517,10 @@ __global__ void fp32_to_fp16_kernel(__half *out, const float *in, uint64_t n) {
 
 // Per-row causal softmax for the cuBLAS-based prefill attention path.
 //
+// LEGACY — sole caller is the TESTED-NEGATIVE cuBLAS prefill path
+// (attention_prefill_cublas, opt-in via QW3_PREFILL_ATTN=cublas). Not used by
+// the default FA2 v2 path. Kept intact alongside its caller.
+//
 // Layout: scores [n_groups, T, T_kv] row-major, FP16, group-major. Each
 // (head_in_group, query_row) row holds T_kv scores in [0, base + q + 1) and
 // garbage past my_max_kv. The kernel computes max-shift + exp + 1/sum + scale,
@@ -4179,8 +4183,18 @@ public:
         return {};
     }
 
-    // cuBLAS-based prefill attention. For each KV group g (gqa_ratio query
-    // heads share one KV head), runs:
+    // cuBLAS-based prefill attention.
+    //
+    // LEGACY — TESTED NEGATIVE — not in the default path. Reachable only via
+    // QW3_PREFILL_ATTN=cublas (PrefillAttnKernel::Cublas). The default is the
+    // tiled FA2 v2 MMA path. Materializing the full [T, T_kv] score matrix
+    // costs a ~800 MB/layer HBM round-trip at T=4K — more than tile-fused
+    // FA2's row-resident softmax — so this runs ~9% slower than v2 and is
+    // kept only as an A/B reference. See feedback_cublas_prefill_attn_negative.md.
+    // Logic left intact (no hot-path edits); the gate at the call site keeps
+    // it off unless explicitly selected.
+    //
+    // For each KV group g (gqa_ratio query heads share one KV head), runs:
     //   1) S_g = Q_g · K_g^T            (cuBLAS strided-batched HGEMM, batch=ratio)
     //   2) P_g = softmax(scale*S_g) w/ causal mask    (one custom kernel)
     //   3) O_g = P_g · V_g              (cuBLAS strided-batched HGEMM, batch=ratio)

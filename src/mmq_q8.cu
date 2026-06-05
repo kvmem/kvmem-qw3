@@ -791,7 +791,16 @@ __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma_v4(
 }
 
 // MMQ v5 — port of llama.cpp's mul_mat_q for Q8_0 (mmq.cuh:1217-1293,
-// NVIDIA non-AMD branch). We adopt llama.cpp's struct-based tile<> and
+// NVIDIA non-AMD branch).
+//
+// LEGACY — TESTED NEGATIVE — not in the default auto path. Reachable only via
+// QW3_MMQ_VERSION=5. Parity-correct but ~31% slower than v2 at T=4K; v7/v8
+// (XOR-swizzled, split-plane W) supersede it. The default auto router picks
+// v8 for batch≥128 && rows≥128, else v7 — never v5. Kept intact for the record
+// (the struct-based tile<> insight below is what v7/v8 build on).
+// See feedback_mmq_v5_v6_negative.md.
+//
+// We adopt llama.cpp's struct-based tile<> and
 // load_ldmatrix/mma helpers so ptxas treats fragments as register tuples,
 // keeping the 32 A registers + 16 dA + 64 sum within the 255-reg/thread
 // budget. Their q8_0 mmq_x=128 instantiation hits only 8-24 byte spill;
@@ -1151,6 +1160,13 @@ __global__ void mmq_q8_0_v4_kernel(
 // Old v1 single-warp kernel — used only for tiny shapes (<64 rows / <64 batch)
 // that don't reach the v2 64x64 tile granularity. Identical to the previous-
 // commit kernel but folded into this file's anonymous namespace.
+//
+// NOTE — NOT legacy/negative: this is still the LIVE final fallback on the
+// default auto path. When a matmul is smaller than every tiled kernel's CTA
+// granularity (sub-tile rows AND batch), the v7/v8/v2 size gates all fall
+// through and dispatch lands here (see the unconditional launch at the bottom
+// of mmq_q8()). Rare for Qwen prefill (rows≥3072, batch usually ≥512) but the
+// path must stay correct — do not remove.
 __launch_bounds__(V2_WARP, 4)
 __global__ void mmq_q8_0_v1_kernel(
         const uint8_t   * __restrict__ wq,
@@ -1245,7 +1261,16 @@ __global__ void mmq_q8_0_v1_kernel(
 // ---------------------------------------------------------------------------
 // v6: same geometry as v2 (64x128 tile, 4 warps) but with cp.async double-
 // buffered Y (activation) tile fills, so the next K-block's Y gmem read
-// overlaps the current K-block's MMA. W stays single-buffer/synchronous —
+// overlaps the current K-block's MMA.
+//
+// LEGACY — TESTED NEGATIVE — not in the default auto path. Reachable only via
+// QW3_MMQ_VERSION=6. The default auto router picks v8 (batch≥128 && rows≥128)
+// or v7, never v6; v6 trails them because cp.async on Y alone (W stays
+// synchronous, see below) only hides the activation-load tail, which v7/v8's
+// XOR-swizzle + split-plane W already subsume. Kept intact for the record.
+// See feedback_mmq_v5_v6_negative.md.
+//
+// W stays single-buffer/synchronous —
 // Q8_0 weight rows have a 2-byte FP16 d-prefix that breaks 4-byte alignment
 // for half of K-blocks, so cp.async (which requires 4/8/16-byte alignment)
 // cannot be used on W without repacking weights. Repacking would either

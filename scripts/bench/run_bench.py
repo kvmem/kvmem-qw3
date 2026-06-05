@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Run the qw3 vs llama.cpp benchmark sweep, write JSON + HTML.
 
+DEPRECATED for qw3-only timing — use scripts/bench2/run.py (clean wall-clock
+HTTP layer). Keep using THIS script when you need the llama.cpp side-by-side
+comparison or the HTML report, which bench2 does not provide. See
+scripts/bench/__init__.py.
+
 Usage (from repo root):
     python3 scripts/bench/run_bench.py --full-1kout --resume
     python3 scripts/bench/run_bench.py --quick

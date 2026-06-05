@@ -1,5 +1,10 @@
 """Drive a persistent `qw3 serve` for one benchmark cell (plain or MTP).
 
+DEPRECATED — this self-launches `qw3 serve` and scrapes per-request timing from
+its stderr. The clean replacement (scripts/bench2/) connects to a server URL
+you start yourself and times purely over HTTP, no stderr parsing. Kept only
+because the bench/ HTML + llama.cpp comparison flow still wires through it.
+
 The 27B model is expensive to load, so — exactly like the llama-server runner —
 we launch ONE `qw3 serve` per cell and loop `trials` requests against it over
 the OpenAI-compatible HTTP API. The model loads once per cell instead of once
