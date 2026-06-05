@@ -34,12 +34,33 @@ double wall_seconds() {
     return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
 }
 
-// Host-side token sampler over the full fp32 vocab logits. temp<=0 is greedy
-// (argmax) and is bit-identical to the prior behavior. Otherwise: scale by
-// 1/temp, softmax, nucleus (top-p) truncation, renormalize, draw with rng.
+void apply_token_penalties(std::vector<float> &logits,
+                           const std::unordered_map<uint32_t, uint32_t> &seen,
+                           float presence_penalty,
+                           float repetition_penalty) {
+    const bool use_presence = presence_penalty != 0.0f;
+    const bool use_repetition = repetition_penalty > 0.0f && repetition_penalty != 1.0f;
+    if (!use_presence && !use_repetition) return;
+    for (const auto &kv : seen) {
+        const uint32_t token = kv.first;
+        if (token >= logits.size()) continue;
+        float &logit = logits[token];
+        if (use_repetition) {
+            logit = logit >= 0.0f ? logit / repetition_penalty
+                                  : logit * repetition_penalty;
+        }
+        if (use_presence) {
+            logit -= presence_penalty;
+        }
+    }
+}
+
+// Host-side token sampler over the full fp32 vocab logits. temp<=0 is greedy.
+// Otherwise: apply top-k/top-p/min-p filters, renormalize, draw with rng.
 // Kept on host because copy_last_logits() already round-trips logits for the
 // dump-logits path; sampling adds no device work.
 int32_t sample_token(const std::vector<float> &logits, float temp, float top_p,
+                     int top_k, float min_p,
                      std::mt19937_64 &rng) {
     const int n = static_cast<int>(logits.size());
     if (n <= 0) return -1;
@@ -62,10 +83,27 @@ int32_t sample_token(const std::vector<float> &logits, float temp, float top_p,
     }
     const float norm = static_cast<float>(1.0 / (sum > 0.0 ? sum : 1.0));
     for (auto &pr : probs) pr.first *= norm;
-    // Nucleus: sort desc, keep smallest prefix with cumulative prob >= top_p.
-    if (top_p < 1.0f && top_p > 0.0f) {
+    const bool need_sort =
+        (top_k > 0 && top_k < n) ||
+        (top_p < 1.0f && top_p > 0.0f) ||
+        (min_p > 0.0f);
+    if (need_sort) {
         std::sort(probs.begin(), probs.end(),
                   [](const auto &a, const auto &b) { return a.first > b.first; });
+    }
+    if (top_k > 0 && top_k < static_cast<int>(probs.size())) {
+        probs.resize(static_cast<size_t>(top_k));
+    }
+    if (min_p > 0.0f && !probs.empty()) {
+        const float cutoff = probs.front().first * min_p;
+        probs.erase(std::remove_if(probs.begin(), probs.end(),
+                                   [&](const auto &pr) { return pr.first < cutoff; }),
+                    probs.end());
+        if (probs.empty()) return -1;
+    }
+    // Nucleus: keep smallest descending-probability prefix with cumulative
+    // probability >= top_p.
+    if (top_p < 1.0f && top_p > 0.0f) {
         double cum = 0.0;
         size_t keep = probs.size();
         for (size_t i = 0; i < probs.size(); ++i) {
@@ -844,11 +882,32 @@ private:
         const bool do_sample = options.temperature > 0.0f;
         std::mt19937_64 rng(options.seed);
         std::vector<float> logit_buf;
+        std::unordered_map<uint32_t, uint32_t> seen_tokens;
+        seen_tokens.reserve(prompt_tokens.size() + static_cast<size_t>(options.max_tokens));
+        for (uint32_t token : prompt_tokens) ++seen_tokens[token];
         auto pick_next = [&](int32_t fallback_argmax) -> int32_t {
-            if (!do_sample) return fallback_argmax;
+            const bool need_logits =
+                do_sample ||
+                options.presence_penalty != 0.0f ||
+                (options.repetition_penalty > 0.0f &&
+                 options.repetition_penalty != 1.0f);
+            if (!need_logits) return fallback_argmax;
             if (!executor_->copy_last_logits(logit_buf)) return fallback_argmax;
+            apply_token_penalties(logit_buf, seen_tokens,
+                                  options.presence_penalty,
+                                  options.repetition_penalty);
+            if (!do_sample) {
+                int best = 0;
+                float bv = logit_buf.empty() ? -std::numeric_limits<float>::infinity()
+                                             : logit_buf[0];
+                for (int i = 1; i < static_cast<int>(logit_buf.size()); ++i) {
+                    if (logit_buf[i] > bv) { bv = logit_buf[i]; best = i; }
+                }
+                return logit_buf.empty() ? fallback_argmax : best;
+            }
             const int32_t t = sample_token(logit_buf, options.temperature,
-                                           options.top_p, rng);
+                                           options.top_p, options.top_k,
+                                           options.min_p, rng);
             return t >= 0 ? t : fallback_argmax;
         };
 
@@ -862,6 +921,7 @@ private:
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
             generated += piece;
             if (on_text && !piece.empty()) on_text(piece);
+            ++seen_tokens[next_token];
             ++decoded;
         }
         for (int i = 0; i + 1 < options.max_tokens; ++i) {
@@ -880,6 +940,7 @@ private:
             const std::string piece = tokenizer_->decode_one(new_token);
             generated += piece;
             if (on_text && !piece.empty()) on_text(piece);
+            ++seen_tokens[next_token];
             ++decoded;
         }
         const double t_decode_end = wall_seconds();

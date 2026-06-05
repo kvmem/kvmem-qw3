@@ -43,31 +43,236 @@ std::string gen_id(const char *prefix) {
     return s;
 }
 
-// Render an OpenAI messages[] array into a Qwen3 chat transcript. System
-// messages are concatenated into the system block; user/assistant turns are
-// emitted in order with <|im_start|>role ... <|im_end|> framing. The final
-// assistant header (+ optional empty-think block) is appended for generation.
-std::string render_messages(const json &messages, bool enable_thinking) {
+std::string dump_json(const json &value) {
+    return value.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+std::string replacement_char() {
+    return "\xEF\xBF\xBD";
+}
+
+size_t utf8_expected_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+bool utf8_cont(unsigned char c) {
+    return (c & 0xC0) == 0x80;
+}
+
+std::string take_complete_utf8(std::string &pending, const std::string &piece) {
+    pending += piece;
+    std::string out;
+    size_t i = 0;
+    while (i < pending.size()) {
+        const unsigned char c0 = static_cast<unsigned char>(pending[i]);
+        const size_t len = utf8_expected_len(c0);
+        if (len == 0) {
+            out += replacement_char();
+            ++i;
+            continue;
+        }
+        if (i + len > pending.size()) break;
+        bool ok = true;
+        for (size_t j = 1; j < len; ++j) {
+            if (!utf8_cont(static_cast<unsigned char>(pending[i + j]))) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            out += replacement_char();
+            ++i;
+            continue;
+        }
+        out.append(pending, i, len);
+        i += len;
+    }
+    pending.erase(0, i);
+    return out;
+}
+
+std::string flush_utf8_pending(std::string &pending) {
+    if (pending.empty()) return {};
+    pending.clear();
+    return replacement_char();
+}
+
+std::string render_content(const json &content) {
+    if (content.is_string()) return content.get<std::string>();
+    if (content.is_null()) return {};
+    if (content.is_array()) {
+        std::string out;
+        for (const auto &item : content) {
+            if (item.is_string()) {
+                out += item.get<std::string>();
+            } else if (item.is_object() && item.contains("text") && item["text"].is_string()) {
+                out += item["text"].get<std::string>();
+            }
+        }
+        return out;
+    }
+    return content.dump();
+}
+
+std::string render_tool_call(const json &call) {
+    const json *fn = &call;
+    if (call.is_object() && call.contains("function") && call["function"].is_object()) {
+        fn = &call["function"];
+    }
+    if (!fn->is_object()) return {};
+    const std::string name = fn->value("name", "");
+    if (name.empty()) return {};
+
+    json args = json::object();
+    if (fn->contains("arguments")) {
+        const json &raw = (*fn)["arguments"];
+        if (raw.is_object()) {
+            args = raw;
+        } else if (raw.is_string()) {
+            try {
+                args = json::parse(raw.get<std::string>());
+            } catch (...) {
+                args = json{{"arguments", raw.get<std::string>()}};
+            }
+        }
+    }
+
+    std::string out = "<tool_call>\n<function=" + name + ">\n";
+    if (args.is_object()) {
+        for (auto it = args.begin(); it != args.end(); ++it) {
+            out += "<parameter=" + it.key() + ">\n";
+            if (it.value().is_string()) {
+                out += it.value().get<std::string>();
+            } else {
+                out += dump_json(it.value());
+            }
+            out += "\n</parameter>\n";
+        }
+    }
+    out += "</function>\n</tool_call>";
+    return out;
+}
+
+std::vector<json> parse_tool_calls_xml(const std::string &text) {
+    std::vector<json> calls;
+    size_t pos = 0;
+    while (true) {
+        const size_t tc0 = text.find("<tool_call>", pos);
+        if (tc0 == std::string::npos) break;
+        const size_t tc1 = text.find("</tool_call>", tc0);
+        if (tc1 == std::string::npos) break;
+        const std::string block = text.substr(tc0, tc1 - tc0);
+        const size_t fn0 = block.find("<function=");
+        if (fn0 == std::string::npos) {
+            pos = tc1 + 12;
+            continue;
+        }
+        const size_t name0 = fn0 + std::string("<function=").size();
+        const size_t name1 = block.find(">", name0);
+        if (name1 == std::string::npos) {
+            pos = tc1 + 12;
+            continue;
+        }
+        const std::string name = block.substr(name0, name1 - name0);
+        json args = json::object();
+        size_t pp = name1 + 1;
+        while (true) {
+            const size_t p0 = block.find("<parameter=", pp);
+            if (p0 == std::string::npos) break;
+            const size_t key0 = p0 + std::string("<parameter=").size();
+            const size_t key1 = block.find(">", key0);
+            if (key1 == std::string::npos) break;
+            const size_t v0 = key1 + 1;
+            const size_t v1 = block.find("</parameter>", v0);
+            if (v1 == std::string::npos) break;
+            std::string value = block.substr(v0, v1 - v0);
+            if (!value.empty() && value.front() == '\n') value.erase(value.begin());
+            if (!value.empty() && value.back() == '\n') value.pop_back();
+            args[block.substr(key0, key1 - key0)] = value;
+            pp = v1 + std::string("</parameter>").size();
+        }
+        calls.push_back(json{
+            {"id", gen_id("call_")},
+            {"type", "function"},
+            {"function", json{{"name", name}, {"arguments", dump_json(args)}}}
+        });
+        pos = tc1 + std::string("</tool_call>").size();
+    }
+    return calls;
+}
+
+// Render an OpenAI messages[] array into a Qwen3.6 chat transcript. This mirrors
+// the GGUF chat_template's text/tool subset closely enough for tool calling:
+// tools are emitted in a system block, assistant tool_calls are serialized as
+// Qwen XML tool calls, and tool results become user-side <tool_response> blocks.
+// The final assistant header (+ thinking prefill or empty-think block) is
+// appended for generation.
+std::string render_messages(const json &messages, const json *tools,
+                            bool enable_thinking) {
     std::string system;
     std::string body;
     for (const auto &m : messages) {
         const std::string role = m.value("role", "");
-        const std::string content = m.value("content", "");
-        if (role == "system") {
+        const std::string content = m.contains("content") ? render_content(m["content"]) : "";
+        if (role == "system" || role == "developer") {
             if (!system.empty()) system += "\n";
             system += content;
-        } else if (role == "user" || role == "assistant" || role == "tool") {
-            const std::string r = (role == "tool") ? "user" : role;
-            body += "<|im_start|>" + r + "\n" + content + "<|im_end|>\n";
+        } else if (role == "user") {
+            body += "<|im_start|>user\n" + content + "<|im_end|>\n";
+        } else if (role == "assistant") {
+            body += "<|im_start|>assistant\n" + content;
+            if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                for (const auto &call : m["tool_calls"]) {
+                    const std::string rendered = render_tool_call(call);
+                    if (!rendered.empty()) {
+                        if (!content.empty()) body += "\n\n";
+                        body += rendered;
+                    }
+                }
+            }
+            body += "<|im_end|>\n";
+        } else if (role == "tool") {
+            body += "<|im_start|>user\n<tool_response>\n" + content +
+                    "\n</tool_response><|im_end|>\n";
         }
     }
     std::string prompt;
-    if (!system.empty()) {
+    if (tools && tools->is_array() && !tools->empty()) {
+        prompt += "<|im_start|>system\n";
+        prompt += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (const auto &tool : *tools) {
+            prompt += "\n" + dump_json(tool);
+        }
+        prompt += "\n</tools>";
+        prompt += "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n";
+        prompt += "<tool_call>\n<function=example_function_name>\n";
+        prompt += "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n";
+        prompt += "<parameter=example_parameter_2>\n";
+        prompt += "This is the value for the second parameter\nthat can span\nmultiple lines\n";
+        prompt += "</parameter>\n</function>\n</tool_call>\n\n";
+        prompt += "<IMPORTANT>\n";
+        prompt += "Reminder:\n";
+        prompt += "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n";
+        prompt += "- Required parameters MUST be specified\n";
+        prompt += "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n";
+        prompt += "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n";
+        prompt += "</IMPORTANT>";
+        if (!system.empty()) prompt += "\n\n" + system;
+        prompt += "<|im_end|>\n";
+    } else if (!system.empty()) {
         prompt += "<|im_start|>system\n" + system + "<|im_end|>\n";
     }
     prompt += body;
     prompt += "<|im_start|>assistant\n";
-    if (!enable_thinking) prompt += "<think>\n\n</think>\n\n";
+    if (enable_thinking) {
+        prompt += "<think>\n";
+    } else {
+        prompt += "<think>\n\n</think>\n\n";
+    }
     return prompt;
 }
 
@@ -129,19 +334,23 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                        {"object", "model"},
                                        {"created", unix_now()},
                                        {"owned_by", "qw3"}}})}};
-        res.set_content(out.dump(), "application/json");
+        res.set_content(dump_json(out), "application/json");
     });
 
     // Build GenerationOptions from common OpenAI fields. Default temperature=0
     // (greedy) for reproducible evals when the client omits it; default top_p=1.
-    auto make_gen = [](const json &req) -> GenerationOptions {
-        GenerationOptions g;
+    auto make_gen = [&](const json &req) -> GenerationOptions {
+        GenerationOptions g = cfg.default_generation;
         g.max_tokens = req.value("max_tokens",
-                                 req.value("max_completion_tokens", 256));
+                                 req.value("max_completion_tokens", g.max_tokens));
         if (g.max_tokens <= 0) g.max_tokens = 256;
-        g.temperature = req.value("temperature", 0.0f);
-        g.top_p = req.value("top_p", 1.0f);
-        g.seed = req.value("seed", static_cast<uint64_t>(0));
+        g.temperature = req.value("temperature", g.temperature);
+        g.top_p = req.value("top_p", g.top_p);
+        g.top_k = req.value("top_k", g.top_k);
+        g.min_p = req.value("min_p", g.min_p);
+        g.presence_penalty = req.value("presence_penalty", g.presence_penalty);
+        g.repetition_penalty = req.value("repetition_penalty", g.repetition_penalty);
+        g.seed = req.value("seed", g.seed);
         return g;
     };
 
@@ -152,19 +361,20 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             req = json::parse(hreq.body);
         } catch (const std::exception &e) {
             res.status = 400;
-            res.set_content(json{{"error", std::string("invalid JSON: ") + e.what()}}.dump(),
+            res.set_content(dump_json(json{{"error", std::string("invalid JSON: ") + e.what()}}),
                             "application/json");
             return;
         }
         if (!req.contains("messages") || !req["messages"].is_array()) {
             res.status = 400;
-            res.set_content(json{{"error", "missing messages[]"}}.dump(),
+            res.set_content(dump_json(json{{"error", "missing messages[]"}}),
                             "application/json");
             return;
         }
         const bool enable_thinking =
             req.value("enable_thinking", cfg.enable_thinking_default);
-        const std::string prompt = render_messages(req["messages"], enable_thinking);
+        const json *tools = req.contains("tools") ? &req["tools"] : nullptr;
+        const std::string prompt = render_messages(req["messages"], tools, enable_thinking);
         GenerationOptions g = make_gen(req);
         g.raw_prompt = true; // prompt is already chat-framed
         const std::vector<std::string> stops = parse_stops(req);
@@ -177,10 +387,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         if (stream) {
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [&, prompt, g, stops, id, created, rid](size_t,
-                                                        httplib::DataSink &sink) {
+                [&, prompt, g, stops, id, created, rid, enable_thinking](size_t,
+                                                                         httplib::DataSink &sink) {
                     std::lock_guard<std::mutex> lk(gen_mu);
                     std::string acc;
+                    std::string utf8_pending;
                     int n_tok = 0;
                     bool stopped = false;
                     auto send_role = [&]() {
@@ -191,23 +402,35 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"index", 0},
                                 {"delta", json{{"role", "assistant"}}},
                                 {"finish_reason", nullptr}}})}};
-                        const std::string s = "data: " + chunk.dump() + "\n\n";
+                        const std::string s = "data: " + dump_json(chunk) + "\n\n";
                         sink.write(s.data(), s.size());
                     };
                     send_role();
+                    if (enable_thinking) {
+                        json chunk = {
+                            {"id", id}, {"object", "chat.completion.chunk"},
+                            {"created", created}, {"model", model_id},
+                            {"choices", json::array({json{
+                                {"index", 0},
+                                {"delta", json{{"content", "<think>\n"}}},
+                                {"finish_reason", nullptr}}})}};
+                        const std::string s = "data: " + dump_json(chunk) + "\n\n";
+                        sink.write(s.data(), s.size());
+                    }
                     eng.generate_stream(prompt, g, [&](const std::string &piece) {
                         if (stopped) return;
                         acc += piece;
-                        std::string emit = piece;
+                        std::string emit = take_complete_utf8(utf8_pending, piece);
                         if (!stops.empty()) {
                             std::string probe = acc;
                             if (apply_stops(probe, stops)) {
                                 stopped = true;
-                                // emit only the part before the stop that we
-                                // haven't already sent
-                                emit = probe.size() > (acc.size() - piece.size())
-                                           ? probe.substr(acc.size() - piece.size())
+                                utf8_pending.clear();
+                                const size_t previous_size = acc.size() - piece.size();
+                                emit = probe.size() > previous_size
+                                           ? probe.substr(previous_size)
                                            : "";
+                                emit = take_complete_utf8(utf8_pending, emit);
                             }
                         }
                         if (!emit.empty()) {
@@ -219,17 +442,29 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     {"index", 0},
                                     {"delta", json{{"content", emit}}},
                                     {"finish_reason", nullptr}}})}};
-                            const std::string s = "data: " + chunk.dump() + "\n\n";
+                            const std::string s = "data: " + dump_json(chunk) + "\n\n";
                             sink.write(s.data(), s.size());
                         }
                     });
+                    const std::string tail = flush_utf8_pending(utf8_pending);
+                    if (!tail.empty()) {
+                        json chunk = {
+                            {"id", id}, {"object", "chat.completion.chunk"},
+                            {"created", created}, {"model", model_id},
+                            {"choices", json::array({json{
+                                {"index", 0},
+                                {"delta", json{{"content", tail}}},
+                                {"finish_reason", nullptr}}})}};
+                        const std::string s = "data: " + dump_json(chunk) + "\n\n";
+                        sink.write(s.data(), s.size());
+                    }
                     json done = {
                         {"id", id}, {"object", "chat.completion.chunk"},
                         {"created", created}, {"model", model_id},
                         {"choices", json::array({json{
                             {"index", 0}, {"delta", json::object()},
                             {"finish_reason", stopped ? "stop" : "length"}}})}};
-                    const std::string ds = "data: " + done.dump() + "\n\n";
+                    const std::string ds = "data: " + dump_json(done) + "\n\n";
                     sink.write(ds.data(), ds.size());
                     const std::string fin = "data: [DONE]\n\n";
                     sink.write(fin.data(), fin.size());
@@ -246,6 +481,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             std::lock_guard<std::mutex> lk(gen_mu);
             text = eng.generate(prompt, g);
         }
+        if (enable_thinking) text = "<think>\n" + text;
+        std::string utf8_pending;
+        text = take_complete_utf8(utf8_pending, text);
+        text += flush_utf8_pending(utf8_pending);
         const bool stopped = apply_stops(text, stops);
         const double ms =
             std::chrono::duration<double, std::milli>(
@@ -253,17 +492,24 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 .count();
         std::cerr << "[qw3-serve] #" << rid << " chat chars=" << text.size()
                   << " " << ms << "ms\n";
+        const std::vector<json> tool_calls = parse_tool_calls_xml(text);
+        json message = json{{"role", "assistant"}, {"content", text}};
+        std::string finish = stopped ? "stop" : "stop";
+        if (!tool_calls.empty()) {
+            message["tool_calls"] = tool_calls;
+            finish = "tool_calls";
+        }
         json out = {
             {"id", id}, {"object", "chat.completion"}, {"created", created},
             {"model", model_id},
             {"choices", json::array({json{
                 {"index", 0},
-                {"message", json{{"role", "assistant"}, {"content", text}}},
-                {"finish_reason", stopped ? "stop" : "stop"}}})},
+                {"message", message},
+                {"finish_reason", finish}}})},
             {"usage", json{{"prompt_tokens", 0},
                            {"completion_tokens", 0},
                            {"total_tokens", 0}}}};
-        res.set_content(out.dump(), "application/json");
+        res.set_content(dump_json(out), "application/json");
     });
 
     svr.Post("/v1/completions", [&](const httplib::Request &hreq,
@@ -273,7 +519,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             req = json::parse(hreq.body);
         } catch (const std::exception &e) {
             res.status = 400;
-            res.set_content(json{{"error", std::string("invalid JSON: ") + e.what()}}.dump(),
+            res.set_content(dump_json(json{{"error", std::string("invalid JSON: ") + e.what()}}),
                             "application/json");
             return;
         }
@@ -285,7 +531,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             prompt = req["prompt"][0].get<std::string>();
         } else {
             res.status = 400;
-            res.set_content(json{{"error", "missing prompt"}}.dump(),
+            res.set_content(dump_json(json{{"error", "missing prompt"}}),
                             "application/json");
             return;
         }
@@ -301,6 +547,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             std::lock_guard<std::mutex> lk(gen_mu);
             text = eng.generate(prompt, g);
         }
+        std::string utf8_pending;
+        text = take_complete_utf8(utf8_pending, text);
+        text += flush_utf8_pending(utf8_pending);
         const bool stopped = apply_stops(text, stops);
         std::cerr << "[qw3-serve] #" << rid << " completion chars="
                   << text.size() << "\n";
@@ -313,7 +562,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             {"usage", json{{"prompt_tokens", 0},
                            {"completion_tokens", 0},
                            {"total_tokens", 0}}}};
-        res.set_content(out.dump(), "application/json");
+        res.set_content(dump_json(out), "application/json");
     });
 
     svr.set_logger([](const httplib::Request &req, const httplib::Response &res) {
@@ -333,4 +582,3 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 }
 
 } // namespace qw3
-

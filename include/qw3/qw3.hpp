@@ -49,6 +49,10 @@ struct GenerationOptions {
     int max_tokens = 256;
     float temperature = 0.6f;
     float top_p = 0.95f;
+    int top_k = 0; // <=0 disables top-k filtering
+    float min_p = 0.0f;
+    float presence_penalty = 0.0f;
+    float repetition_penalty = 1.0f;
     uint64_t seed = 0;
     bool raw_prompt = false;
 };

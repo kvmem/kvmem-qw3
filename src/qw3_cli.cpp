@@ -24,6 +24,8 @@ void usage(std::ostream &os) {
         "                        Sets QW3_KV_DTYPE before the model is loaded.\n"
         "  --enable-thinking     Default chat requests to thinking mode (long CoT).\n"
         "  --native-mtp-speculate Enable MTP speculative decode.\n"
+        "  -n N                  Default max generated tokens for requests\n"
+        "                        that omit max_tokens/max_completion_tokens.\n"
         "\n"
         "Runtime:\n"
         "  --backend NAME        mock, llama-cli, or qwen-native. Default: llama-cli\n"
@@ -62,6 +64,10 @@ void usage(std::ostream &os) {
         "  -n N                  Max generated tokens. Default: 256\n"
         "  --temp F              Temperature. Default: 0.6\n"
         "  --top-p F             Top-p. Default: 0.95\n"
+        "  --top-k N             Top-k. Default: 0 (disabled)\n"
+        "  --min-p F             Min-p. Default: 0.0\n"
+        "  --presence-penalty F  Presence penalty. Default: 0.0\n"
+        "  --repetition-penalty F Repetition penalty. Default: 1.0\n"
         "  --seed N              Seed passed to llama.cpp\n"
         "\n"
         "Diagnostics:\n"
@@ -199,6 +205,14 @@ int main(int argc, char **argv) {
                 gen.temperature = parse_float(need(arg), arg);
             } else if (arg == "--top-p") {
                 gen.top_p = parse_float(need(arg), arg);
+            } else if (arg == "--top-k") {
+                gen.top_k = parse_int(need(arg), arg);
+            } else if (arg == "--min-p") {
+                gen.min_p = parse_float(need(arg), arg);
+            } else if (arg == "--presence-penalty") {
+                gen.presence_penalty = parse_float(need(arg), arg);
+            } else if (arg == "--repetition-penalty") {
+                gen.repetition_penalty = parse_float(need(arg), arg);
             } else if (arg == "--seed") {
                 gen.seed = parse_u64(need(arg), arg);
             } else if (arg == "--inspect") {
@@ -300,6 +314,7 @@ int main(int argc, char **argv) {
             engine.backend = qw3::BackendKind::QwenNative;
             engine.native_heavy = true;
             if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
+            serve_cfg.default_generation = gen;
             return qw3::run_server(engine, serve_cfg);
         }
 
