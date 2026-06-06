@@ -63,11 +63,15 @@ bool utf8_cont(unsigned char c) {
     return (c & 0xC0) == 0x80;
 }
 
-std::string take_complete_utf8(std::string &pending, const std::string &piece) {
+std::string take_complete_utf8(std::string &pending,
+                               const std::string &piece,
+                               size_t holdback = 0) {
     pending += piece;
     std::string out;
     size_t i = 0;
+    const size_t limit = pending.size() > holdback ? pending.size() - holdback : 0;
     while (i < pending.size()) {
+        if (i >= limit) break;
         const unsigned char c0 = static_cast<unsigned char>(pending[i]);
         const size_t len = utf8_expected_len(c0);
         if (len == 0) {
@@ -75,7 +79,7 @@ std::string take_complete_utf8(std::string &pending, const std::string &piece) {
             ++i;
             continue;
         }
-        if (i + len > pending.size()) break;
+        if (i + len > pending.size() || i + len > limit) break;
         bool ok = true;
         for (size_t j = 1; j < len; ++j) {
             if (!utf8_cont(static_cast<unsigned char>(pending[i + j]))) {
@@ -95,10 +99,23 @@ std::string take_complete_utf8(std::string &pending, const std::string &piece) {
     return out;
 }
 
-std::string flush_utf8_pending(std::string &pending) {
+std::string flush_utf8_pending(std::string &pending, bool replace_incomplete = true) {
     if (pending.empty()) return {};
-    pending.clear();
-    return replacement_char();
+    std::string out = take_complete_utf8(pending, {}, 0);
+    if (!pending.empty()) {
+        pending.clear();
+        if (replace_incomplete) out += replacement_char();
+    }
+    return out;
+}
+
+size_t utf8_safe_prefix_len(const std::string &text, size_t desired) {
+    size_t cut = std::min(desired, text.size());
+    while (cut > 0 && cut < text.size() &&
+           utf8_cont(static_cast<unsigned char>(text[cut]))) {
+        --cut;
+    }
+    return cut;
 }
 
 struct ReasoningSplit {
@@ -147,10 +164,11 @@ public:
                 const size_t close = pending_.find("</think>");
                 if (close == std::string::npos) {
                     const size_t keep = std::min<size_t>(pending_.size(), 7);
-                    if (pending_.size() > keep) {
-                        out.push_back({StreamPart::Reasoning,
-                                       pending_.substr(0, pending_.size() - keep)});
-                        pending_.erase(0, pending_.size() - keep);
+                    const size_t emit_len =
+                        utf8_safe_prefix_len(pending_, pending_.size() - keep);
+                    if (emit_len > 0) {
+                        out.push_back({StreamPart::Reasoning, pending_.substr(0, emit_len)});
+                        pending_.erase(0, emit_len);
                     }
                     break;
                 }
@@ -529,7 +547,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             }
                         }
                     });
-                    const std::string tail = flush_utf8_pending(utf8_pending);
+                    const std::string tail = flush_utf8_pending(utf8_pending, false);
                     if (!tail.empty()) {
                         for (const auto &part : reasoning_splitter.push(tail)) {
                             if (part.second.empty()) continue;
@@ -574,7 +592,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         if (enable_thinking) text = "<think>\n" + text;
         std::string utf8_pending;
         text = take_complete_utf8(utf8_pending, text);
-        text += flush_utf8_pending(utf8_pending);
+        text += flush_utf8_pending(utf8_pending, false);
         const bool stopped = apply_stops(text, stops);
         const double ms =
             std::chrono::duration<double, std::milli>(
@@ -643,7 +661,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         std::string utf8_pending;
         text = take_complete_utf8(utf8_pending, text);
-        text += flush_utf8_pending(utf8_pending);
+        text += flush_utf8_pending(utf8_pending, false);
         const bool stopped = apply_stops(text, stops);
         std::cerr << "[qw3-serve] #" << rid << " completion chars="
                   << text.size() << "\n";
