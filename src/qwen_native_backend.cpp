@@ -343,6 +343,23 @@ bool mtp_policy_trace_enabled() {
     return env_flag_enabled("QW3_MTP_POLICY_TRACE");
 }
 
+uint32_t mtp_startup_demote_batches() {
+    const char *raw = std::getenv("QW3_MTP_ADAPTIVE_STARTUP_DEMOTE_BATCHES");
+    if (!raw || !*raw) return 0;
+    const std::string value = env_lower_ascii(raw);
+    if (env_disabled_value(value) || value == "off" || value == "none") {
+        return 0;
+    }
+    size_t pos = 0;
+    const unsigned long parsed = std::stoul(value, &pos);
+    if (pos != value.size() ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("invalid QW3_MTP_ADAPTIVE_STARTUP_DEMOTE_BATCHES: " +
+                                 value);
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
 float env_float_or(const char *name, float fallback) {
     const char *raw = std::getenv(name);
     if (!raw || !*raw) return fallback;
@@ -383,6 +400,7 @@ struct MtpAdaptivePolicy {
     uint32_t cooldown_batches = 8;
     uint32_t demote_windows = 2;
     uint32_t promote_windows = 1;
+    uint32_t startup_demote_batches = 0;
     uint32_t initial_depth = 1;
     uint32_t depth = 1;
     uint32_t batches = 0;
@@ -425,9 +443,10 @@ struct MtpAdaptivePolicy {
         max_depth = std::min<uint32_t>(max_depth, kCostDepths);
         max_depth = std::min<uint32_t>(max_depth, kMaxTrackedDepth);
         max_depth = std::max<uint32_t>(1, max_depth);
+        const uint32_t default_min_depth = max_depth >= 4 ? 4 : 1;
         min_depth = std::min<uint32_t>(
             max_depth,
-            env_uint32_or("QW3_MTP_ADAPTIVE_MIN_CHAIN", 1));
+            env_uint32_or("QW3_MTP_ADAPTIVE_MIN_CHAIN", default_min_depth));
         min_depth = std::max<uint32_t>(1, min_depth);
         update_interval = std::max<uint32_t>(
             1, env_uint32_or("QW3_MTP_ADAPTIVE_UPDATE_INTERVAL", 16));
@@ -438,6 +457,7 @@ struct MtpAdaptivePolicy {
             1, env_uint32_or("QW3_MTP_ADAPTIVE_DEMOTE_WINDOWS", 2));
         promote_windows = std::max<uint32_t>(
             1, env_uint32_or("QW3_MTP_ADAPTIVE_PROMOTE_WINDOWS", 1));
+        startup_demote_batches = mtp_startup_demote_batches();
         demote_margin = std::max<float>(
             0.0f, env_float_or("QW3_MTP_ADAPTIVE_DEMOTE_MARGIN", 0.005f));
         promote_margin = std::max<float>(
@@ -554,6 +574,21 @@ struct MtpAdaptivePolicy {
         ++window_batches;
         ++window_hist[accepted];
         ++depth_accept_hist[tracked_depth][accepted];
+
+        if (startup_demote_batches > 0 && batches <= startup_demote_batches &&
+            depth == initial_depth && depth == max_depth && depth > min_depth &&
+            full_depth_batches(depth) == startup_demote_batches &&
+            compute_depth_score(context_tokens, depth, false) &&
+            last_benefit + demote_margin < last_cost) {
+            --depth;
+            ++demotions;
+            ++changes;
+            bad_windows = 0;
+            good_windows = 0;
+            cooldown = cooldown_batches;
+            reset_window(depth);
+            return "startup_demote";
+        }
 
         if (cooldown > 0) {
             --cooldown;
@@ -1304,6 +1339,8 @@ private:
                        << " cooldown=" << mtp_policy.cooldown_batches
                        << " demote_windows=" << mtp_policy.demote_windows
                        << " promote_windows=" << mtp_policy.promote_windows
+                       << " startup_demote_batches="
+                       << mtp_policy.startup_demote_batches
                        << " demote_margin=" << std::fixed << std::setprecision(4)
                        << mtp_policy.demote_margin
                        << " promote_margin=" << mtp_policy.promote_margin

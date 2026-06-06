@@ -13,3 +13,5 @@ benchmark/*
 
 __pycache__/
 *.pyc
+
+adaptive_mtp.md

@@ -315,11 +315,12 @@ round-cost table). Add `QW3_MTP_POLICY_TRACE=1` to log per-batch
 |---|---|---|
 | `QW3_MTP_POLICY`              | `off`   | `adaptive` enables the depth controller. |
 | `QW3_MTP_ADAPTIVE_MAX_CHAIN`  | chain   | Upper depth bound for promotion. |
-| `QW3_MTP_ADAPTIVE_MIN_CHAIN`  | `1`     | Lower depth bound for demotion. |
+| `QW3_MTP_ADAPTIVE_MIN_CHAIN`  | `4` when max depth >= 4, else `1` | Lower depth bound for demotion. |
 | `QW3_MTP_ADAPTIVE_UPDATE_INTERVAL` | `16` | Batches per control window. |
 | `QW3_MTP_ADAPTIVE_MIN_BATCHES`| `64`    | Warmup batches before the first promotion/demotion. |
 | `QW3_MTP_ADAPTIVE_COOLDOWN`   | `8`     | Windows to wait after a depth change. |
 | `QW3_MTP_ADAPTIVE_PROMOTE_MARGIN` / `_DEMOTE_MARGIN` | `0.005` | Benefit-vs-cost margins gating a change. |
+| `QW3_MTP_ADAPTIVE_STARTUP_DEMOTE_BATCHES` | `0` | Optional early demotion probe at the initial max depth; disabled by default. |
 
 ### MTP correctness / verifier knobs
 
