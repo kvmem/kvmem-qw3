@@ -101,6 +101,86 @@ std::string flush_utf8_pending(std::string &pending) {
     return replacement_char();
 }
 
+struct ReasoningSplit {
+    std::string reasoning;
+    std::string content;
+};
+
+ReasoningSplit split_reasoning(const std::string &text) {
+    const std::string open = "<think>";
+    const std::string close = "</think>";
+    const size_t start = text.find(open);
+    if (start == std::string::npos) return ReasoningSplit{{}, text};
+    const size_t reasoning_start = start + open.size();
+    const size_t end = text.find(close, reasoning_start);
+    if (end == std::string::npos) {
+        std::string reasoning = text.substr(reasoning_start);
+        if (!reasoning.empty() && reasoning.front() == '\n') reasoning.erase(reasoning.begin());
+        return ReasoningSplit{reasoning, {}};
+    }
+    std::string reasoning = text.substr(reasoning_start, end - reasoning_start);
+    std::string content = text.substr(end + close.size());
+    if (!reasoning.empty() && reasoning.front() == '\n') reasoning.erase(reasoning.begin());
+    if (!reasoning.empty() && reasoning.back() == '\n') reasoning.pop_back();
+    while (!content.empty() && (content.front() == '\n' || content.front() == '\r')) {
+        content.erase(content.begin());
+    }
+    return ReasoningSplit{reasoning, content};
+}
+
+enum class StreamPart {
+    Reasoning,
+    Content,
+};
+
+class ReasoningStreamSplitter {
+public:
+    explicit ReasoningStreamSplitter(bool enabled)
+        : enabled_(enabled), part_(enabled ? StreamPart::Reasoning : StreamPart::Content) {}
+
+    std::vector<std::pair<StreamPart, std::string>> push(const std::string &text) {
+        if (!enabled_) return {{StreamPart::Content, text}};
+        pending_ += text;
+        std::vector<std::pair<StreamPart, std::string>> out;
+        while (!pending_.empty()) {
+            if (part_ == StreamPart::Reasoning) {
+                const size_t close = pending_.find("</think>");
+                if (close == std::string::npos) {
+                    const size_t keep = std::min<size_t>(pending_.size(), 7);
+                    if (pending_.size() > keep) {
+                        out.push_back({StreamPart::Reasoning,
+                                       pending_.substr(0, pending_.size() - keep)});
+                        pending_.erase(0, pending_.size() - keep);
+                    }
+                    break;
+                }
+                if (close > 0) out.push_back({StreamPart::Reasoning, pending_.substr(0, close)});
+                pending_.erase(0, close + std::string("</think>").size());
+                while (!pending_.empty() && (pending_.front() == '\n' || pending_.front() == '\r')) {
+                    pending_.erase(pending_.begin());
+                }
+                part_ = StreamPart::Content;
+            } else {
+                out.push_back({StreamPart::Content, pending_});
+                pending_.clear();
+            }
+        }
+        return out;
+    }
+
+    std::vector<std::pair<StreamPart, std::string>> finish() {
+        if (pending_.empty()) return {};
+        std::vector<std::pair<StreamPart, std::string>> out{{part_, pending_}};
+        pending_.clear();
+        return out;
+    }
+
+private:
+    bool enabled_ = false;
+    StreamPart part_ = StreamPart::Content;
+    std::string pending_;
+};
+
 std::string render_content(const json &content) {
     if (content.is_string()) return content.get<std::string>();
     if (content.is_null()) return {};
@@ -392,8 +472,20 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     std::lock_guard<std::mutex> lk(gen_mu);
                     std::string acc;
                     std::string utf8_pending;
+                    ReasoningStreamSplitter reasoning_splitter(enable_thinking);
                     int n_tok = 0;
                     bool stopped = false;
+                    auto send_delta = [&](const json &delta) {
+                        json chunk = {
+                            {"id", id}, {"object", "chat.completion.chunk"},
+                            {"created", created}, {"model", model_id},
+                            {"choices", json::array({json{
+                                {"index", 0},
+                                {"delta", delta},
+                                {"finish_reason", nullptr}}})}};
+                        const std::string s = "data: " + dump_json(chunk) + "\n\n";
+                        sink.write(s.data(), s.size());
+                    };
                     auto send_role = [&]() {
                         json chunk = {
                             {"id", id}, {"object", "chat.completion.chunk"},
@@ -407,15 +499,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     };
                     send_role();
                     if (enable_thinking) {
-                        json chunk = {
-                            {"id", id}, {"object", "chat.completion.chunk"},
-                            {"created", created}, {"model", model_id},
-                            {"choices", json::array({json{
-                                {"index", 0},
-                                {"delta", json{{"content", "<think>\n"}}},
-                                {"finish_reason", nullptr}}})}};
-                        const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        sink.write(s.data(), s.size());
+                        send_delta(json{{"reasoning_content", ""}});
                     }
                     eng.generate_stream(prompt, g, [&](const std::string &piece) {
                         if (stopped) return;
@@ -435,28 +519,34 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         }
                         if (!emit.empty()) {
                             ++n_tok;
-                            json chunk = {
-                                {"id", id}, {"object", "chat.completion.chunk"},
-                                {"created", created}, {"model", model_id},
-                                {"choices", json::array({json{
-                                    {"index", 0},
-                                    {"delta", json{{"content", emit}}},
-                                    {"finish_reason", nullptr}}})}};
-                            const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                            sink.write(s.data(), s.size());
+                            for (const auto &part : reasoning_splitter.push(emit)) {
+                                if (part.second.empty()) continue;
+                                if (part.first == StreamPart::Reasoning) {
+                                    send_delta(json{{"reasoning_content", part.second}});
+                                } else {
+                                    send_delta(json{{"content", part.second}});
+                                }
+                            }
                         }
                     });
                     const std::string tail = flush_utf8_pending(utf8_pending);
                     if (!tail.empty()) {
-                        json chunk = {
-                            {"id", id}, {"object", "chat.completion.chunk"},
-                            {"created", created}, {"model", model_id},
-                            {"choices", json::array({json{
-                                {"index", 0},
-                                {"delta", json{{"content", tail}}},
-                                {"finish_reason", nullptr}}})}};
-                        const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        sink.write(s.data(), s.size());
+                        for (const auto &part : reasoning_splitter.push(tail)) {
+                            if (part.second.empty()) continue;
+                            if (part.first == StreamPart::Reasoning) {
+                                send_delta(json{{"reasoning_content", part.second}});
+                            } else {
+                                send_delta(json{{"content", part.second}});
+                            }
+                        }
+                    }
+                    for (const auto &part : reasoning_splitter.finish()) {
+                        if (part.second.empty()) continue;
+                        if (part.first == StreamPart::Reasoning) {
+                            send_delta(json{{"reasoning_content", part.second}});
+                        } else {
+                            send_delta(json{{"content", part.second}});
+                        }
                     }
                     json done = {
                         {"id", id}, {"object", "chat.completion.chunk"},
@@ -493,7 +583,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         std::cerr << "[qw3-serve] #" << rid << " chat chars=" << text.size()
                   << " " << ms << "ms\n";
         const std::vector<json> tool_calls = parse_tool_calls_xml(text);
-        json message = json{{"role", "assistant"}, {"content", text}};
+        const ReasoningSplit split = split_reasoning(text);
+        json message = json{{"role", "assistant"}, {"content", split.content}};
+        if (!split.reasoning.empty()) {
+            message["reasoning_content"] = split.reasoning;
+        }
         std::string finish = stopped ? "stop" : "stop";
         if (!tool_calls.empty()) {
             message["tool_calls"] = tool_calls;
