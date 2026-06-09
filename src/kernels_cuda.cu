@@ -3428,14 +3428,23 @@ private:
     // Returns true when the activation needs to be staged in the
     // 144-byte block_q8_1_mmq layout (v4, v5, v7, v8 consume that format).
     // Default (no env set) is auto = v7/v8, both 144-B; default to true.
-    static bool mmq_uses_mmq_y_layout() {
-        static const bool v = []() {
+    static int mmq_version_env_value() {
+        static const int v = []() {
             const char *e = std::getenv("QW3_MMQ_VERSION");
-            if (!e) return true;
-            if (e[0] == 'a') return true;  // auto
-            return (e[0] == '4' || e[0] == '5' || e[0] == '7' || e[0] == '8');
+            if (!e || e[0] == 'a') return 0;
+            if (e[0] >= '2' && e[0] <= '8') return e[0] - '0';
+            return 0;
         }();
         return v;
+    }
+
+    static bool mmq_uses_mmq_y_layout(uint32_t rows, uint32_t cols, uint32_t batch) {
+        const int version = mmq_version_env_value();
+        if (version == 2 || version == 3 || version == 6) return false;
+        if (version == 4) return (cols % 256 == 0) && rows >= 128 && batch >= 128;
+        if (version == 5) return (cols % 256 == 0) && rows >= 128 && batch >= 64;
+        if (version == 7) return (cols % 128 == 0) && rows >= 64 && batch >= 64;
+        return (cols % 128 == 0) && rows >= 128;
     }
 
     // INT8 MMA Q8_0 x Q8_1 matmul (m16n8k32.s8.s8.s32). Uses the same
@@ -3444,9 +3453,8 @@ private:
     // it's a tile-friendly format that lets the MMQ kernel read mmq_x*36
     // contiguous ints per K super-iter.
     DeviceStatus mmq_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
-        const bool use_mmq_y = mmq_uses_mmq_y_layout()
-                            && (w.cols % 256 == 0)
-                            && (w.rows >= 128) && (batch >= 128);
+        const bool use_mmq_y =
+            mmq_uses_mmq_y_layout(static_cast<uint32_t>(w.rows), w.cols, batch);
         if (use_mmq_y) {
             if (auto st = ensure_q8_1_mmq_scratch(batch, w.cols); !st.ok) return st;
             if (!ported::launch_quantize_mmq_q8_1(x_ptr, q8_1_mmq_scratch_,

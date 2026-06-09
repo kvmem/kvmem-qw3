@@ -141,6 +141,9 @@ struct ReasoningSplit {
     std::string content;
 };
 
+std::string render_content(const json &content);
+std::string trim_ascii_ws(std::string s);
+
 ReasoningSplit split_reasoning(const std::string &text) {
     const std::string open = "<think>";
     const std::string close = "</think>";
@@ -161,6 +164,35 @@ ReasoningSplit split_reasoning(const std::string &text) {
         content.erase(content.begin());
     }
     return ReasoningSplit{reasoning, content};
+}
+
+bool is_tool_response_content(const std::string &content) {
+    const std::string trimmed = trim_ascii_ws(content);
+    const std::string open = "<tool_response>";
+    const std::string close = "</tool_response>";
+    return trimmed.rfind(open, 0) == 0 &&
+           trimmed.size() >= close.size() &&
+           trimmed.compare(trimmed.size() - close.size(), close.size(), close) == 0;
+}
+
+size_t last_query_index_for_template(const json &messages) {
+    if (!messages.is_array() || messages.empty()) return 0;
+    bool multi_step_tool = true;
+    size_t last_query = messages.size() - 1;
+    for (size_t rev = 0; rev < messages.size(); ++rev) {
+        const size_t i = messages.size() - 1 - rev;
+        const auto &m = messages[i];
+        if (!m.is_object()) continue;
+        if (multi_step_tool && m.value("role", "") == "user") {
+            const std::string content =
+                trim_ascii_ws(m.contains("content") ? render_content(m["content"]) : "");
+            if (!is_tool_response_content(content)) {
+                multi_step_tool = false;
+                last_query = i;
+            }
+        }
+    }
+    return last_query;
 }
 
 enum class StreamPart {
@@ -232,6 +264,21 @@ std::string render_content(const json &content) {
         return out;
     }
     return content.dump();
+}
+
+std::string trim_ascii_ws(std::string s) {
+    size_t b = 0;
+    while (b < s.size() &&
+           (s[b] == ' ' || s[b] == '\n' || s[b] == '\r' || s[b] == '\t')) {
+        ++b;
+    }
+    size_t e = s.size();
+    while (e > b &&
+           (s[e - 1] == ' ' || s[e - 1] == '\n' ||
+            s[e - 1] == '\r' || s[e - 1] == '\t')) {
+        --e;
+    }
+    return s.substr(b, e - b);
 }
 
 std::string render_tool_call(const json &call) {
@@ -340,6 +387,28 @@ json tool_call_delta(const json &calls) {
     return json{{"tool_calls", deltas}};
 }
 
+bool could_be_tool_call_prefix(const std::string &text) {
+    static const std::string target = "<tool_call>";
+    size_t i = 0;
+    while (i < text.size() &&
+           (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t')) {
+        ++i;
+    }
+    const std::string s = text.substr(i);
+    if (s.empty()) return true;
+    if (s.size() <= target.size()) return target.compare(0, s.size(), s) == 0;
+    return s.compare(0, target.size(), target) == 0;
+}
+
+bool starts_with_tool_call(const std::string &text) {
+    size_t i = 0;
+    while (i < text.size() &&
+           (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t')) {
+        ++i;
+    }
+    return text.compare(i, std::string("<tool_call>").size(), "<tool_call>") == 0;
+}
+
 // Render an OpenAI messages[] array into a Qwen3.6 chat transcript. This mirrors
 // the GGUF chat_template's text/tool subset closely enough for tool calling:
 // tools are emitted in a system block, assistant tool_calls are serialized as
@@ -349,33 +418,26 @@ json tool_call_delta(const json &calls) {
 std::string render_messages(const json &messages, const json *tools,
                             bool enable_thinking,
                             const std::string &forced_tool_name = {}) {
-    std::string system;
-    std::string body;
-    for (const auto &m : messages) {
-        const std::string role = m.value("role", "");
-        const std::string content = m.contains("content") ? render_content(m["content"]) : "";
-        if (role == "system" || role == "developer") {
-            if (!system.empty()) system += "\n";
-            system += content;
-        } else if (role == "user") {
-            body += "<|im_start|>user\n" + content + "<|im_end|>\n";
-        } else if (role == "assistant") {
-            body += "<|im_start|>assistant\n" + content;
-            if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
-                for (const auto &call : m["tool_calls"]) {
-                    const std::string rendered = render_tool_call(call);
-                    if (!rendered.empty()) {
-                        if (!content.empty()) body += "\n\n";
-                        body += rendered;
-                    }
+    size_t num_sys = 0;
+    std::string merged_system;
+    if (messages.is_array() && !messages.empty() && messages[0].is_object()) {
+        const std::string first_role = messages[0].value("role", "");
+        if (first_role == "system" || first_role == "developer") {
+            merged_system = trim_ascii_ws(
+                messages[0].contains("content") ? render_content(messages[0]["content"]) : "");
+            num_sys = 1;
+            if (messages.size() > 1 && messages[1].is_object()) {
+                const std::string second_role = messages[1].value("role", "");
+                if (second_role == "system" || second_role == "developer") {
+                    const std::string second = trim_ascii_ws(
+                        messages[1].contains("content") ? render_content(messages[1]["content"]) : "");
+                    merged_system += "\n" + second;
+                    num_sys = 2;
                 }
             }
-            body += "<|im_end|>\n";
-        } else if (role == "tool") {
-            body += "<|im_start|>user\n<tool_response>\n" + content +
-                    "\n</tool_response><|im_end|>\n";
         }
     }
+
     std::string prompt;
     if (tools && tools->is_array() && !tools->empty()) {
         prompt += "<|im_start|>system\n";
@@ -394,18 +456,74 @@ std::string render_messages(const json &messages, const json *tools,
         prompt += "Reminder:\n";
         prompt += "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n";
         prompt += "- Required parameters MUST be specified\n";
-        prompt += "- When calling a function, output ONLY one or more <tool_call> blocks and no natural language content\n";
+        prompt += "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n";
         if (!forced_tool_name.empty()) {
             prompt += "- You MUST call the function named `" + forced_tool_name + "`\n";
         }
         prompt += "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n";
         prompt += "</IMPORTANT>";
-        if (!system.empty()) prompt += "\n\n" + system;
+        if (!merged_system.empty()) prompt += "\n\n" + merged_system;
         prompt += "<|im_end|>\n";
-    } else if (!system.empty()) {
-        prompt += "<|im_start|>system\n" + system + "<|im_end|>\n";
+    } else if (!merged_system.empty()) {
+        prompt += "<|im_start|>system\n" + merged_system + "<|im_end|>\n";
     }
-    prompt += body;
+
+    const size_t last_query_index = last_query_index_for_template(messages);
+    for (size_t i = 0; messages.is_array() && i < messages.size(); ++i) {
+        const auto &m = messages[i];
+        if (!m.is_object() || i < num_sys) continue;
+        const std::string role = m.value("role", "");
+        if (role == "system" || role == "developer") continue;
+        const std::string content =
+            trim_ascii_ws(m.contains("content") ? render_content(m["content"]) : "");
+        if (role == "user") {
+            prompt += "<|im_start|>user\n" + content + "<|im_end|>\n";
+        } else if (role == "assistant") {
+            std::string assistant_content = content;
+            std::string reasoning_content;
+            if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
+                reasoning_content =
+                    trim_ascii_ws(m["reasoning_content"].get<std::string>());
+            } else {
+                const ReasoningSplit split = split_reasoning(assistant_content);
+                if (!split.reasoning.empty() || split.content != assistant_content) {
+                    reasoning_content = trim_ascii_ws(split.reasoning);
+                    assistant_content = split.content;
+                }
+            }
+            prompt += "<|im_start|>assistant\n";
+            if (i > last_query_index) {
+                prompt += "<think>\n" + reasoning_content + "\n</think>\n\n";
+            }
+            prompt += assistant_content;
+            if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
+                bool first_tool_call = true;
+                for (const auto &call : m["tool_calls"]) {
+                    const std::string rendered = render_tool_call(call);
+                    if (rendered.empty()) continue;
+                    if (first_tool_call) {
+                        if (!assistant_content.empty()) prompt += "\n\n";
+                    } else {
+                        prompt += "\n";
+                    }
+                    prompt += rendered;
+                    first_tool_call = false;
+                }
+            }
+            prompt += "<|im_end|>\n";
+        } else if (role == "tool") {
+            const bool prev_tool =
+                i > 0 && messages[i - 1].is_object() &&
+                messages[i - 1].value("role", "") == "tool";
+            const bool next_tool =
+                i + 1 < messages.size() && messages[i + 1].is_object() &&
+                messages[i + 1].value("role", "") == "tool";
+            if (!prev_tool) prompt += "<|im_start|>user";
+            prompt += "\n<tool_response>\n" + content + "\n</tool_response>";
+            if (!next_tool) prompt += "<|im_end|>\n";
+        }
+    }
+
     prompt += "<|im_start|>assistant\n";
     if (enable_thinking) {
         prompt += "<think>\n";
@@ -545,6 +663,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             !tool_request;
         const std::vector<std::string> stops = parse_stops(req);
         const bool stream = req.value("stream", false);
+        const bool stream_include_usage =
+            req.contains("stream_options") && req["stream_options"].is_object() &&
+            req["stream_options"].value("include_usage", false);
+        const bool forced_tool_request = tool_request && !forced_tool_name.empty();
         const std::string id = gen_id("chatcmpl-");
         const int64_t created = unix_now();
         const uint64_t rid = ++req_counter;
@@ -554,7 +676,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [&, prompt, g, stops, id, created, rid, enable_thinking,
-                 tool_request](size_t, httplib::DataSink &sink) {
+                 tool_request, forced_tool_request,
+                 stream_include_usage](size_t, httplib::DataSink &sink) {
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
                     if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
@@ -593,6 +716,20 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"finish_reason", finish_reason}}})}};
                         const std::string ds = "data: " + dump_json(done) + "\n\n";
                         sink.write(ds.data(), ds.size());
+                        if (stream_include_usage) {
+                            json usage = {
+                                {"id", id},
+                                {"object", "chat.completion.chunk"},
+                                {"created", created},
+                                {"model", model_id},
+                                {"choices", json::array()},
+                                {"usage", json{{"prompt_tokens", 0},
+                                               {"completion_tokens", 0},
+                                               {"total_tokens", 0}}}};
+                            const std::string us =
+                                "data: " + dump_json(usage) + "\n\n";
+                            sink.write(us.data(), us.size());
+                        }
                         const std::string fin = "data: [DONE]\n\n";
                         sink.write(fin.data(), fin.size());
                         sink.done();
@@ -602,40 +739,99 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         if (enable_thinking) {
                             send_delta(json{{"reasoning_content", ""}});
                         }
-                        if (tool_request) {
-                            eng.generate_stream(prompt, g, [&](const std::string &piece) {
-                            if (stopped) return;
-                            acc += piece;
-                            if (!stops.empty()) {
-                                std::string probe = acc;
-                                if (apply_stops(probe, stops)) {
-                                    stopped = true;
-                                    acc = std::move(probe);
+                        auto emit_text = [&](const std::string &text) {
+                            if (text.empty()) return;
+                            ++n_tok;
+                            for (const auto &part : reasoning_splitter.push(text)) {
+                                if (part.second.empty()) continue;
+                                if (part.first == StreamPart::Reasoning) {
+                                    send_delta(json{{"reasoning_content", part.second}});
+                                } else {
+                                    send_delta(json{{"content", part.second}});
                                 }
                             }
-                        });
-                        std::string text = take_complete_utf8(utf8_pending, acc);
-                        text += flush_utf8_pending(utf8_pending, false);
-                        const std::string framed =
-                            enable_thinking ? ("<think>\n" + text) : text;
-                        const std::vector<json> tool_calls = parse_tool_calls_xml(framed);
-                        const ReasoningSplit split = split_reasoning(framed);
-                        if (!split.reasoning.empty()) {
-                            send_delta(json{{"reasoning_content", split.reasoning}});
-                        }
-                        if (!tool_calls.empty()) {
-                            send_delta(tool_call_delta(tool_calls));
-                            send_done("tool_calls");
-                        } else {
-                            if (!split.content.empty()) {
-                                send_delta(json{{"content", split.content}});
+                        };
+                        auto finish_text_stream = [&]() {
+                            const std::string tail = flush_utf8_pending(utf8_pending, false);
+                            if (!tail.empty()) emit_text(tail);
+                            for (const auto &part : reasoning_splitter.finish()) {
+                                if (part.second.empty()) continue;
+                                if (part.first == StreamPart::Reasoning) {
+                                    send_delta(json{{"reasoning_content", part.second}});
+                                } else {
+                                    send_delta(json{{"content", part.second}});
+                                }
                             }
-                            send_done(stopped ? "stop" : "stop");
+                        };
+                        if (tool_request) {
+                            bool classified = forced_tool_request;
+                            bool buffering_tool = forced_tool_request;
+                            std::string pending_prefix;
+                            eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                                if (stopped) return;
+                                acc += piece;
+                                std::string emit = take_complete_utf8(utf8_pending, piece);
+                                if (!stops.empty()) {
+                                    std::string probe = acc;
+                                    if (apply_stops(probe, stops)) {
+                                        stopped = true;
+                                        utf8_pending.clear();
+                                        const size_t previous_size = acc.size() - piece.size();
+                                        emit = probe.size() > previous_size
+                                                   ? probe.substr(previous_size)
+                                                   : "";
+                                        acc = std::move(probe);
+                                        emit = take_complete_utf8(utf8_pending, emit);
+                                    }
+                                }
+                                if (emit.empty() || buffering_tool) return;
+                                if (!classified) {
+                                    pending_prefix += emit;
+                                    if (starts_with_tool_call(pending_prefix)) {
+                                        buffering_tool = true;
+                                        classified = true;
+                                        return;
+                                    }
+                                    if (could_be_tool_call_prefix(pending_prefix)) {
+                                        return;
+                                    }
+                                    classified = true;
+                                    emit = pending_prefix;
+                                    pending_prefix.clear();
+                                }
+                                emit_text(emit);
+                            });
+                            if (buffering_tool) {
+                                std::string text = take_complete_utf8(utf8_pending, acc);
+                                text += flush_utf8_pending(utf8_pending, false);
+                                const std::string framed =
+                                    enable_thinking ? ("<think>\n" + text) : text;
+                                const std::vector<json> tool_calls =
+                                    parse_tool_calls_xml(framed);
+                                const ReasoningSplit split = split_reasoning(framed);
+                                if (!split.reasoning.empty()) {
+                                    send_delta(json{{"reasoning_content", split.reasoning}});
+                                }
+                                if (!tool_calls.empty()) {
+                                    send_delta(tool_call_delta(tool_calls));
+                                    send_done("tool_calls");
+                                } else {
+                                    if (!split.content.empty()) {
+                                        send_delta(json{{"content", split.content}});
+                                    }
+                                    send_done(stopped ? "stop" : "stop");
+                                }
+                            } else {
+                                if (!pending_prefix.empty()) emit_text(pending_prefix);
+                                finish_text_stream();
+                                send_done(stopped ? "stop" : "stop");
+                            }
+                            std::cerr << "[qw3-serve] #" << rid
+                                      << " chat(stream tools) chars=" << acc.size()
+                                      << " streamed=" << (buffering_tool ? "false" : "true")
+                                      << "\n";
+                            return true;
                         }
-                        std::cerr << "[qw3-serve] #" << rid
-                                  << " chat(stream tools) chars=" << acc.size() << "\n";
-                        return true;
-                    }
                         eng.generate_stream(prompt, g, [&](const std::string &piece) {
                             if (stopped) return;
                             acc += piece;
@@ -653,36 +849,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 }
                             }
                             if (!emit.empty()) {
-                                ++n_tok;
-                                for (const auto &part : reasoning_splitter.push(emit)) {
-                                    if (part.second.empty()) continue;
-                                    if (part.first == StreamPart::Reasoning) {
-                                        send_delta(json{{"reasoning_content", part.second}});
-                                    } else {
-                                        send_delta(json{{"content", part.second}});
-                                    }
-                                }
+                                emit_text(emit);
                             }
                         });
-                        const std::string tail = flush_utf8_pending(utf8_pending, false);
-                        if (!tail.empty()) {
-                            for (const auto &part : reasoning_splitter.push(tail)) {
-                                if (part.second.empty()) continue;
-                                if (part.first == StreamPart::Reasoning) {
-                                    send_delta(json{{"reasoning_content", part.second}});
-                                } else {
-                                    send_delta(json{{"content", part.second}});
-                                }
-                            }
-                        }
-                        for (const auto &part : reasoning_splitter.finish()) {
-                            if (part.second.empty()) continue;
-                            if (part.first == StreamPart::Reasoning) {
-                                send_delta(json{{"reasoning_content", part.second}});
-                            } else {
-                                send_delta(json{{"content", part.second}});
-                            }
-                        }
+                        finish_text_stream();
                         send_done(stopped ? "stop" : "stop");
                         std::cerr << "[qw3-serve] #" << rid
                                   << " chat(stream) tokens=" << n_tok << "\n";

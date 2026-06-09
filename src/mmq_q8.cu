@@ -2103,11 +2103,12 @@ bool launch_mmq_q8_0(
         if (e[0] == '8') return 8;
         return 0;
     }();
-    // Auto: v8 at batch >= V8_N_PER_CTA (and rows >= V8_M_PER_CTA),
-    // else v7. v7's tail fallback handles tiny shapes already.
+    // Auto: use v8 whenever the row tile is available. Its checked
+    // specialization handles trailing batch tiles, including batch < 128.
+    // Older v7 remains opt-in via QW3_MMQ_VERSION=7 for comparison.
     const int mmq_version = (mmq_version_env != 0)
         ? mmq_version_env
-        : ((batch >= V8_N_PER_CTA && rows >= V8_M_PER_CTA) ? 8 : 7);
+        : (rows >= V8_M_PER_CTA ? 8 : 7);
 
     // v5 with smaller mmq_x — halves sum[] register pressure to eliminate
     // the 160-byte spill v4 had, and increases #CTAs for better SM
@@ -2179,29 +2180,7 @@ bool launch_mmq_q8_0(
     // regime where v7's 64×64 tile leaves ~10% on the table vs HGEMM.
     if (mmq_version == 8) {
         if (cols % V8_K_STRIDE != 0) return false;
-        // Tail-chunk fallback: v8 needs batch>=128 AND rows>=128. If either is
-        // smaller, dispatch the v7 kernel — same 144-B activation layout, just a
-        // smaller tile. Avoids silently routing to v2/v3 which expect a different
-        // (36-int) layout.
-        if (rows < V8_M_PER_CTA || batch < V8_N_PER_CTA) {
-            if (rows < V7M_M_PER_CTA || batch < V7M_N_PER_CTA) return false;
-            const uint32_t row_tiles = (rows  + V7M_M_PER_CTA - 1) / V7M_M_PER_CTA;
-            const uint32_t col_tiles = (batch + V7M_N_PER_CTA - 1) / V7M_N_PER_CTA;
-            const dim3 grid(row_tiles, col_tiles, 1);
-            const dim3 block(V2_WARP, V2_NWARPS, 1);
-            const bool needs_check = (rows  % V7M_M_PER_CTA != 0) ||
-                                     (batch % V7M_N_PER_CTA != 0);
-            if (needs_check) {
-                mmq_q8_0_v7_kernel<true><<<grid, block, 0, stream>>>(
-                    weight, reinterpret_cast<const block_q8_1_mmq_t *>(y_q8_1), dst,
-                    rows, cols, batch, /*stride_y_sb=*/batch, stride_dst_row);
-            } else {
-                mmq_q8_0_v7_kernel<false><<<grid, block, 0, stream>>>(
-                    weight, reinterpret_cast<const block_q8_1_mmq_t *>(y_q8_1), dst,
-                    rows, cols, batch, /*stride_y_sb=*/batch, stride_dst_row);
-            }
-            return true;
-        }
+        if (rows < V8_M_PER_CTA) return false;
         const uint32_t row_tiles = (rows  + V8_M_PER_CTA - 1) / V8_M_PER_CTA;
         const uint32_t col_tiles = (batch + V8_N_PER_CTA - 1) / V8_N_PER_CTA;
         const dim3 grid(row_tiles, col_tiles, 1);

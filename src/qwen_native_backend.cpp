@@ -1032,6 +1032,30 @@ private:
         req->cv.notify_one();
     }
 
+    void log_zero_decode_diagnostic(const char *path,
+                                    const std::vector<uint32_t> &prompt_tokens,
+                                    const NativeExecutorReport &step) {
+        std::ostringstream msg;
+        msg << "native zero_decode:"
+            << " path=" << path
+            << " prompt_tokens=" << prompt_tokens.size()
+            << " argmax_token=" << step.argmax_token
+            << " argmax_logit=" << std::fixed << std::setprecision(4)
+            << step.argmax_logit;
+        if (tokenizer_ && step.argmax_token >= 0) {
+            msg << " argmax_text="
+                << escape_text(tokenizer_->decode_one(step.argmax_token));
+        }
+        msg << " prompt_tail=[";
+        const size_t begin = prompt_tokens.size() > 16 ? prompt_tokens.size() - 16 : 0;
+        for (size_t i = begin; i < prompt_tokens.size(); ++i) {
+            if (i != begin) msg << ",";
+            msg << prompt_tokens[i];
+        }
+        msg << "]";
+        log(msg.str());
+    }
+
     void continuous_batch_worker_loop() {
         try {
             DeviceStatus st = device_->begin();
@@ -1082,6 +1106,11 @@ private:
 
                         if (req->options.max_tokens <= 0 ||
                             a.next_token == static_cast<uint32_t>(eos)) {
+                            if (req->options.max_tokens > 0) {
+                                log_zero_decode_diagnostic("continuous",
+                                                           req->prompt_tokens,
+                                                           step);
+                            }
                             complete_continuous_request(req, {});
                         } else {
                             emit_continuous_token(a, a.next_token);
@@ -1348,6 +1377,10 @@ private:
             ++decoded;
         }
         const double t_decode_end = wall_seconds();
+
+        if (decoded == 0 && options.max_tokens > 0) {
+            log_zero_decode_diagnostic("plain", prompt_tokens, step);
+        }
 
         st = device_->end();
         if (!st.ok) throw std::runtime_error(st.message);
