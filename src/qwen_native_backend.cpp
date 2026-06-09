@@ -226,6 +226,10 @@ uint32_t continuous_batching_max_active() {
     return std::max<uint32_t>(1, env_uint32_or("QW3_CONTINUOUS_BATCHING_MAX_ACTIVE", 2));
 }
 
+bool continuous_batching_trace_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_TRACE");
+}
+
 bool mtp_trace_enabled() {
     return env_flag_enabled("QW3_MTP_TRACE");
 }
@@ -947,7 +951,7 @@ private:
         cb_stop_ = false;
         cb_running_ = true;
         cb_worker_ = std::thread([this]() { continuous_batch_worker_loop(); });
-        log("native continuous_batching: enabled=true mode=round_robin_executor");
+        log("native continuous_batching: enabled=true mode=batch_step_executor");
     }
 
     void stop_continuous_batch_worker() {
@@ -1004,7 +1008,6 @@ private:
                 ? static_cast<uint32_t>(options_.ctx_size)
                 : 4096u;
             const int32_t eos = tokenizer_->eos_id();
-            size_t rr = 0;
             const uint32_t max_active = continuous_batching_max_active();
 
             while (true) {
@@ -1066,31 +1069,7 @@ private:
                 }
 
                 if (active.empty()) continue;
-                if (rr >= active.size()) rr = 0;
-                ContinuousBatchActive &a = active[rr];
-                try {
-                    const uint32_t feed = a.next_token;
-                    NativeExecutorReport step = a.executor->forward_one_token(feed);
-                    if (!step.ok) throw std::runtime_error("decode failed");
-                    a.decode_ops += step.ops_executed;
-                    const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
-                    a.next_token = static_cast<uint32_t>(next);
-                    if (a.next_token == static_cast<uint32_t>(eos)) {
-                        finish_continuous_active(a);
-                        active.erase(active.begin() + static_cast<std::ptrdiff_t>(rr));
-                    } else {
-                        emit_continuous_token(a, a.next_token);
-                        if (a.decoded >= a.req->options.max_tokens) {
-                            finish_continuous_active(a);
-                            active.erase(active.begin() + static_cast<std::ptrdiff_t>(rr));
-                        } else {
-                            ++rr;
-                        }
-                    }
-                } catch (const std::exception &e) {
-                    complete_continuous_request(a.req, {}, e.what());
-                    active.erase(active.begin() + static_cast<std::ptrdiff_t>(rr));
-                }
+                continuous_decode_batch_step(active, eos);
             }
 
             st = device_->end();
@@ -1114,6 +1093,53 @@ private:
             }
             log(std::string("native continuous_batching: worker_failed reason=\"") +
                 e.what() + "\"");
+        }
+    }
+
+    void continuous_decode_batch_step(std::vector<ContinuousBatchActive> &active,
+                                      int32_t eos) {
+        const size_t batch = active.size();
+        if (batch == 0) return;
+        if (continuous_batching_trace_enabled()) {
+            std::ostringstream msg;
+            msg << "native continuous_batch_step:"
+                << " batch=" << batch
+                << " total_batches=" << (cb_decode_batches_.load() + 1)
+                << " total_tokens=" << (cb_decode_tokens_.load() + batch);
+            log(msg.str());
+        }
+        ++cb_decode_batches_;
+        cb_decode_tokens_ += batch;
+        uint32_t prev_max = cb_decode_max_batch_.load();
+        while (batch > prev_max &&
+               !cb_decode_max_batch_.compare_exchange_weak(
+                   prev_max, static_cast<uint32_t>(batch))) {}
+
+        for (size_t i = 0; i < active.size();) {
+            ContinuousBatchActive &a = active[i];
+            try {
+                const uint32_t feed = a.next_token;
+                NativeExecutorReport step = a.executor->forward_one_token(feed);
+                if (!step.ok) throw std::runtime_error("decode failed");
+                a.decode_ops += step.ops_executed;
+                const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
+                a.next_token = static_cast<uint32_t>(next);
+                if (a.next_token == static_cast<uint32_t>(eos)) {
+                    finish_continuous_active(a);
+                    active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
+                    continue;
+                }
+                emit_continuous_token(a, a.next_token);
+                if (a.decoded >= a.req->options.max_tokens) {
+                    finish_continuous_active(a);
+                    active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
+                    continue;
+                }
+                ++i;
+            } catch (const std::exception &e) {
+                complete_continuous_request(a.req, {}, e.what());
+                active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
+            }
         }
     }
 
@@ -1143,7 +1169,10 @@ private:
                 << (a.decoded / decode_s) << " tok/s)";
         }
         msg << " prefill_ops=" << a.prefill_ops
-            << " decode_ops=" << a.decode_ops;
+            << " decode_ops=" << a.decode_ops
+            << " batch_steps=" << cb_decode_batches_.load()
+            << " batch_tokens=" << cb_decode_tokens_.load()
+            << " max_batch=" << cb_decode_max_batch_.load();
         log(msg.str());
         complete_continuous_request(a.req, std::move(a.req->generated));
     }
@@ -2240,6 +2269,9 @@ private:
     bool cb_running_ = false;
     bool cb_stop_ = false;
     std::atomic<uint64_t> cb_request_counter_{0};
+    std::atomic<uint64_t> cb_decode_batches_{0};
+    std::atomic<uint64_t> cb_decode_tokens_{0};
+    std::atomic<uint32_t> cb_decode_max_batch_{0};
 };
 
 } // namespace
