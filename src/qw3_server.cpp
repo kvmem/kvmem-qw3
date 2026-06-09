@@ -2,6 +2,8 @@
 
 #include "env_flags.hpp"
 #include "qw3/qw3.hpp"
+#include "qw3/gguf.hpp"
+#include "qw3/tokenizer.hpp"
 
 // Vendored single-header deps (included as SYSTEM headers via CMake so their
 // warnings don't trip -Wall -Wextra -Wpedantic).
@@ -29,9 +31,13 @@ bool serve_continuous_batching_enabled() {
 }
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
-    return g.temperature <= 0.0f &&
-           g.presence_penalty == 0.0f &&
-           (g.repetition_penalty <= 0.0f || g.repetition_penalty == 1.0f);
+    return g.max_tokens >= 0;
+}
+
+json usage_json(size_t prompt_tokens, size_t completion_tokens) {
+    return json{{"prompt_tokens", prompt_tokens},
+                {"completion_tokens", completion_tokens},
+                {"total_tokens", prompt_tokens + completion_tokens}};
 }
 
 std::string basename_of(const std::string &path) {
@@ -581,6 +587,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
     Engine eng(engine);
+    GgufFile usage_gguf(engine.model_path);
+    QwenTokenizer usage_tokenizer(usage_gguf);
     const std::string model_id = basename_of(engine.model_path);
     std::cerr << "[qw3-serve] model loaded; id=" << model_id << "\n";
 
@@ -655,12 +663,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const bool tool_request = tools && tools->is_array() && !tools->empty();
         const std::string prompt =
             render_messages(req["messages"], tools, enable_thinking, forced_tool_name);
+        const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
         GenerationOptions g = make_gen(req);
         g.raw_prompt = true; // prompt is already chat-framed
         g.continuous_batching =
             serve_continuous_batching_enabled() &&
-            serve_continuous_batch_request_supported(g) &&
-            !tool_request;
+            serve_continuous_batch_request_supported(g);
+        const std::string route = g.continuous_batching ? "continuous" : "plain";
+        const std::string fallback_reason =
+            g.continuous_batching ? "" :
+            (serve_continuous_batching_enabled() ? "request_unsupported" : "disabled");
         const std::vector<std::string> stops = parse_stops(req);
         const bool stream = req.value("stream", false);
         const bool stream_include_usage =
@@ -677,14 +689,25 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 "text/event-stream",
                 [&, prompt, g, stops, id, created, rid, enable_thinking,
                  tool_request, forced_tool_request,
-                 stream_include_usage](size_t, httplib::DataSink &sink) {
+                 stream_include_usage, prompt_token_count, route,
+                 fallback_reason](size_t, httplib::DataSink &sink) {
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
                     if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
                     std::string utf8_pending;
                     ReasoningStreamSplitter reasoning_splitter(enable_thinking);
-                    int n_tok = 0;
+                    size_t completion_tokens = 0;
                     bool stopped = false;
+                    bool client_closed = false;
+                    auto send_raw = [&](const std::string &s) {
+                        if (client_closed) return false;
+                        if (!sink.write(s.data(), s.size())) {
+                            client_closed = true;
+                            stopped = true;
+                            return false;
+                        }
+                        return true;
+                    };
                     auto send_delta = [&](const json &delta) {
                         json chunk = {
                             {"id", id}, {"object", "chat.completion.chunk"},
@@ -694,7 +717,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"delta", delta},
                                 {"finish_reason", nullptr}}})}};
                         const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        sink.write(s.data(), s.size());
+                        send_raw(s);
                     };
                     auto send_role = [&]() {
                         json chunk = {
@@ -705,9 +728,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"delta", json{{"role", "assistant"}}},
                                 {"finish_reason", nullptr}}})}};
                         const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        sink.write(s.data(), s.size());
+                        send_raw(s);
                     };
                     auto send_done = [&](const std::string &finish_reason) {
+                        if (client_closed) return;
                         json done = {
                             {"id", id}, {"object", "chat.completion.chunk"},
                             {"created", created}, {"model", model_id},
@@ -715,7 +739,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"index", 0}, {"delta", json::object()},
                                 {"finish_reason", finish_reason}}})}};
                         const std::string ds = "data: " + dump_json(done) + "\n\n";
-                        sink.write(ds.data(), ds.size());
+                        send_raw(ds);
                         if (stream_include_usage) {
                             json usage = {
                                 {"id", id},
@@ -723,15 +747,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"created", created},
                                 {"model", model_id},
                                 {"choices", json::array()},
-                                {"usage", json{{"prompt_tokens", 0},
-                                               {"completion_tokens", 0},
-                                               {"total_tokens", 0}}}};
+                                {"usage", usage_json(prompt_token_count,
+                                                     completion_tokens)}};
                             const std::string us =
                                 "data: " + dump_json(usage) + "\n\n";
-                            sink.write(us.data(), us.size());
+                            send_raw(us);
                         }
                         const std::string fin = "data: [DONE]\n\n";
-                        sink.write(fin.data(), fin.size());
+                        send_raw(fin);
                         sink.done();
                     };
                     try {
@@ -741,7 +764,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         }
                         auto emit_text = [&](const std::string &text) {
                             if (text.empty()) return;
-                            ++n_tok;
                             for (const auto &part : reasoning_splitter.push(text)) {
                                 if (part.second.empty()) continue;
                                 if (part.first == StreamPart::Reasoning) {
@@ -769,6 +791,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             std::string pending_prefix;
                             eng.generate_stream(prompt, g, [&](const std::string &piece) {
                                 if (stopped) return;
+                                ++completion_tokens;
                                 acc += piece;
                                 std::string emit = take_complete_utf8(utf8_pending, piece);
                                 if (!stops.empty()) {
@@ -828,12 +851,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             }
                             std::cerr << "[qw3-serve] #" << rid
                                       << " chat(stream tools) chars=" << acc.size()
+                                      << " completion_tokens=" << completion_tokens
+                                      << " prompt_tokens=" << prompt_token_count
+                                      << " route=" << route
                                       << " streamed=" << (buffering_tool ? "false" : "true")
+                                      << (client_closed ? " client_closed=true" : "")
                                       << "\n";
                             return true;
                         }
                         eng.generate_stream(prompt, g, [&](const std::string &piece) {
                             if (stopped) return;
+                            ++completion_tokens;
                             acc += piece;
                             std::string emit = take_complete_utf8(utf8_pending, piece);
                             if (!stops.empty()) {
@@ -855,7 +883,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         finish_text_stream();
                         send_done(stopped ? "stop" : "stop");
                         std::cerr << "[qw3-serve] #" << rid
-                                  << " chat(stream) tokens=" << n_tok << "\n";
+                                  << " chat(stream) completion_tokens="
+                                  << completion_tokens
+                                  << " prompt_tokens=" << prompt_token_count
+                                  << " route=" << route
+                                  << (client_closed ? " client_closed=true" : "")
+                                  << "\n";
                         return true;
                     } catch (const std::exception &e) {
                         json chunk = {
@@ -867,9 +900,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"finish_reason", "error"}}})},
                             {"error", e.what()}};
                         const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        sink.write(s.data(), s.size());
+                        send_raw(s);
                         const std::string fin = "data: [DONE]\n\n";
-                        sink.write(fin.data(), fin.size());
+                        send_raw(fin);
                         sink.done();
                         std::cerr << "[qw3-serve] #" << rid
                                   << " chat(stream) error=" << e.what() << "\n";
@@ -880,12 +913,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
 
         std::string text;
+        size_t completion_tokens = 0;
         try {
             if (g.continuous_batching) {
-                text = eng.generate(prompt, g);
+                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                    ++completion_tokens;
+                    text += piece;
+                });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
-                text = eng.generate(prompt, g);
+                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                    ++completion_tokens;
+                    text += piece;
+                });
             }
         } catch (const std::exception &e) {
             std::cerr << "[qw3-serve] #" << rid << " chat error="
@@ -903,7 +943,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 std::chrono::steady_clock::now() - t0)
                 .count();
         std::cerr << "[qw3-serve] #" << rid << " chat chars=" << text.size()
-                  << " " << ms << "ms\n";
+                  << " completion_tokens=" << completion_tokens
+                  << " prompt_tokens=" << prompt_token_count
+                  << " route=" << route;
+        if (!fallback_reason.empty()) {
+            std::cerr << " fallback_reason=" << fallback_reason;
+        }
+        std::cerr << " " << ms << "ms\n";
         const std::vector<json> tool_calls = parse_tool_calls_xml(text);
         const ReasoningSplit split = split_reasoning(text);
         json message = json{{"role", "assistant"},
@@ -923,9 +969,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 {"index", 0},
                 {"message", message},
                 {"finish_reason", finish}}})},
-            {"usage", json{{"prompt_tokens", 0},
-                           {"completion_tokens", 0},
-                           {"total_tokens", 0}}}};
+            {"usage", usage_json(prompt_token_count, completion_tokens)}};
         res.set_content(dump_json(out), "application/json");
     });
 
@@ -957,18 +1001,30 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.continuous_batching =
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);
+        const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
+        const std::string route = g.continuous_batching ? "continuous" : "plain";
+        const std::string fallback_reason =
+            g.continuous_batching ? "" :
+            (serve_continuous_batching_enabled() ? "request_unsupported" : "disabled");
         const std::vector<std::string> stops = parse_stops(req);
         const std::string id = gen_id("cmpl-");
         const int64_t created = unix_now();
         const uint64_t rid = ++req_counter;
 
         std::string text;
+        size_t completion_tokens = 0;
         try {
             if (g.continuous_batching) {
-                text = eng.generate(prompt, g);
+                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                    ++completion_tokens;
+                    text += piece;
+                });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
-                text = eng.generate(prompt, g);
+                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                    ++completion_tokens;
+                    text += piece;
+                });
             }
         } catch (const std::exception &e) {
             std::cerr << "[qw3-serve] #" << rid << " completion error="
@@ -981,16 +1037,21 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         text += flush_utf8_pending(utf8_pending, false);
         const bool stopped = apply_stops(text, stops);
         std::cerr << "[qw3-serve] #" << rid << " completion chars="
-                  << text.size() << "\n";
+                  << text.size()
+                  << " completion_tokens=" << completion_tokens
+                  << " prompt_tokens=" << prompt_token_count
+                  << " route=" << route;
+        if (!fallback_reason.empty()) {
+            std::cerr << " fallback_reason=" << fallback_reason;
+        }
+        std::cerr << "\n";
         json out = {
             {"id", id}, {"object", "text_completion"}, {"created", created},
             {"model", model_id},
             {"choices", json::array({json{
                 {"index", 0}, {"text", text}, {"logprobs", nullptr},
                 {"finish_reason", stopped ? "stop" : "length"}}})},
-            {"usage", json{{"prompt_tokens", 0},
-                           {"completion_tokens", 0},
-                           {"total_tokens", 0}}}};
+            {"usage", usage_json(prompt_token_count, completion_tokens)}};
         res.set_content(dump_json(out), "application/json");
     });
 

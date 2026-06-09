@@ -790,6 +790,7 @@ public:
 
         const double t0 = wall_seconds();
         model_ = std::make_unique<QwenNativeModel>(std::make_unique<GgufFile>(options.model_path));
+        tokenizer_ = std::make_unique<QwenTokenizer>(model_->gguf());
         const double t_gguf = wall_seconds();
 
         // Device backend + weight uploads are now part of load(), not
@@ -946,6 +947,8 @@ private:
         std::shared_ptr<ContinuousBatchRequest> req;
         std::unique_ptr<QwenExecutor> executor;
         std::unordered_map<uint32_t, uint32_t> seen_tokens;
+        std::mt19937_64 rng;
+        std::vector<float> logit_buf;
         uint32_t next_token = 0;
         int decoded = 0;
         uint64_t prefill_ops = 0;
@@ -972,11 +975,7 @@ private:
 
     static bool continuous_batch_request_supported(const GenerationOptions &options,
                                                    const DumpStream *dump) {
-        return dump == nullptr &&
-               options.temperature <= 0.0f &&
-               options.presence_penalty == 0.0f &&
-               (options.repetition_penalty <= 0.0f ||
-                options.repetition_penalty == 1.0f);
+        return dump == nullptr && options.max_tokens >= 0;
     }
 
     void start_continuous_batch_worker() {
@@ -1092,6 +1091,7 @@ private:
                         a.seen_tokens.reserve(req->prompt_tokens.size() +
                                               static_cast<size_t>(req->options.max_tokens));
                         for (uint32_t token : req->prompt_tokens) ++a.seen_tokens[token];
+                        a.rng.seed(req->options.seed);
 
                         const double t0 = wall_seconds();
                         NativeExecutorReport step =
@@ -1102,7 +1102,8 @@ private:
                         a.decode_start = t1;
                         a.prefill_ops = step.ops_executed;
                         const int32_t seed = step.argmax_token >= 0 ? step.argmax_token : eos;
-                        a.next_token = static_cast<uint32_t>(seed);
+                        a.next_token = static_cast<uint32_t>(
+                            pick_continuous_next_token(a, seed));
 
                         if (req->options.max_tokens <= 0 ||
                             a.next_token == static_cast<uint32_t>(eos)) {
@@ -1223,7 +1224,8 @@ private:
                 if (!step.ok) throw std::runtime_error("decode failed");
                 a.decode_ops += step.ops_executed;
                 const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
-                a.next_token = static_cast<uint32_t>(next);
+                a.next_token = static_cast<uint32_t>(
+                    pick_continuous_next_token(a, next));
                 if (a.next_token == static_cast<uint32_t>(eos)) {
                     finish_continuous_active(a);
                     a.req.reset();
@@ -1244,13 +1246,46 @@ private:
                                     [](const ContinuousBatchActive &a) {
                                         return !a.req;
                                     }),
-                     active.end());
+        active.end());
+    }
+
+    int32_t pick_continuous_next_token(ContinuousBatchActive &a,
+                                       int32_t fallback_argmax) {
+        const GenerationOptions &options = a.req->options;
+        const bool do_sample = options.temperature > 0.0f;
+        const bool need_logits =
+            do_sample ||
+            options.presence_penalty != 0.0f ||
+            (options.repetition_penalty > 0.0f &&
+             options.repetition_penalty != 1.0f);
+        if (!need_logits) return fallback_argmax;
+        if (!a.executor->copy_last_logits(a.logit_buf)) return fallback_argmax;
+        apply_token_penalties(a.logit_buf, a.seen_tokens,
+                              options.presence_penalty,
+                              options.repetition_penalty);
+        if (!do_sample) {
+            int best = 0;
+            float bv = a.logit_buf.empty()
+                ? -std::numeric_limits<float>::infinity()
+                : a.logit_buf[0];
+            for (int i = 1; i < static_cast<int>(a.logit_buf.size()); ++i) {
+                if (a.logit_buf[i] > bv) {
+                    bv = a.logit_buf[i];
+                    best = i;
+                }
+            }
+            return a.logit_buf.empty() ? fallback_argmax : best;
+        }
+        const int32_t token = sample_token(a.logit_buf, options.temperature,
+                                           options.top_p, options.top_k,
+                                           options.min_p, a.rng);
+        return token >= 0 ? token : fallback_argmax;
     }
 
     void emit_continuous_token(ContinuousBatchActive &a, uint32_t token) {
         const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
         a.req->generated += piece;
-        if (a.req->on_text && !piece.empty()) a.req->on_text(piece);
+        if (a.req->on_text) a.req->on_text(piece);
         ++a.seen_tokens[token];
         ++a.decoded;
     }
@@ -1353,7 +1388,7 @@ private:
         if (options.max_tokens > 0 && next_token != static_cast<uint32_t>(eos)) {
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
             generated += piece;
-            if (on_text && !piece.empty()) on_text(piece);
+            if (on_text) on_text(piece);
             ++seen_tokens[next_token];
             ++decoded;
         }
@@ -1372,7 +1407,7 @@ private:
             if (next_token == static_cast<uint32_t>(eos)) break;
             const std::string piece = tokenizer_->decode_one(new_token);
             generated += piece;
-            if (on_text && !piece.empty()) on_text(piece);
+            if (on_text) on_text(piece);
             ++seen_tokens[next_token];
             ++decoded;
         }
@@ -1770,7 +1805,7 @@ private:
             if (decoded >= options.max_tokens || token == static_cast<uint32_t>(eos)) return false;
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
             generated += piece;
-            if (on_text && !piece.empty()) on_text(piece);
+            if (on_text) on_text(piece);
             ++decoded;
             return true;
         };
