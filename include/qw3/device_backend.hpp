@@ -475,6 +475,49 @@ public:
         return {};
     }
 
+    // Append into a KV cache addressed as physical pages. `page_indices` maps
+    // logical page id -> physical page id, and `page_size` is measured in
+    // tokens. The default implementation preserves compatibility for identity
+    // page tables; CUDA overrides this with true physical-page writes.
+    virtual DeviceStatus kv_append_paged(DeviceTensor &cache,
+                                         const DeviceTensor &src,
+                                         uint32_t logical_pos,
+                                         uint32_t per_pos_size,
+                                         const int32_t *page_indices,
+                                         uint32_t n_pages,
+                                         uint32_t page_size) {
+        if (page_size == 0) return {false, "kv_append_paged requires page_size > 0"};
+        const uint32_t logical_page = logical_pos / page_size;
+        const uint32_t page_offset = logical_pos % page_size;
+        if (!page_indices || logical_page >= n_pages) {
+            return {false, "kv_append_paged page table is too small"};
+        }
+        if (page_indices[logical_page] < 0) {
+            return {false, "kv_append_paged encountered negative physical page"};
+        }
+        const uint32_t physical_pos =
+            static_cast<uint32_t>(page_indices[logical_page]) * page_size + page_offset;
+        return kv_append(cache, src, physical_pos, per_pos_size);
+    }
+
+    virtual DeviceStatus kv_append_batch_paged(DeviceTensor &cache,
+                                               const DeviceTensor &src,
+                                               uint32_t base_logical_pos,
+                                               uint32_t per_pos_size,
+                                               uint32_t batch,
+                                               const int32_t *page_indices,
+                                               uint32_t n_pages,
+                                               uint32_t page_size) {
+        for (uint32_t i = 0; i < batch; ++i) {
+            if (auto st = kv_append_paged(cache, src, base_logical_pos + i,
+                                          per_pos_size, page_indices, n_pages,
+                                          page_size); !st.ok) {
+                return st;
+            }
+        }
+        return {};
+    }
+
     // Decode-step attention: causal scaled dot-product over the live KV cache.
     //   out[head, d]     = sum_t softmax(q_head . K[t, kv_head] * scale) * V[t, kv_head, d]
     // where kv_head = head / (n_heads / n_kv_heads).
@@ -566,6 +609,47 @@ public:
         }
         return apply_attn_gate_batch(out, q, q_stride, batch, q_batch_stride,
                                      out_batch_stride, n_heads, head_dim);
+    }
+
+    // Paged-KV variant for one logical sequence. Row b attends to
+    // base_seq_len + b + 1 logical tokens, described by the same page table.
+    // Backends without native paged attention fall back to the contiguous path
+    // when the page table is identity.
+    virtual DeviceStatus attention_decode_batch_paged_gated(
+                                                      DeviceTensor &out,
+                                                      const DeviceTensor &q,
+                                                      uint32_t q_stride,
+                                                      const DeviceTensor &k_cache,
+                                                      const DeviceTensor &v_cache,
+                                                      const int32_t *page_indices,
+                                                      uint32_t n_pages,
+                                                      uint32_t page_size,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t head_dim,
+                                                      uint32_t base_seq_len,
+                                                      uint32_t batch,
+                                                      uint32_t q_batch_stride,
+                                                      uint32_t out_batch_stride,
+                                                      float scale) {
+        if (!page_indices || page_size == 0) {
+            return {false, "attention_decode_batch_paged_gated requires a page table"};
+        }
+        const uint32_t need_pages =
+            (base_seq_len + batch + page_size - 1) / page_size;
+        if (need_pages > n_pages) {
+            return {false, "attention_decode_batch_paged_gated page table is too small"};
+        }
+        for (uint32_t p = 0; p < need_pages; ++p) {
+            if (page_indices[p] != static_cast<int32_t>(p)) {
+                return {false, "paged attention fallback only supports identity page tables"};
+            }
+        }
+        return attention_decode_batch_gated(out, q, q_stride, k_cache, v_cache,
+                                            n_heads, n_kv_heads, head_dim,
+                                            base_seq_len, batch,
+                                            q_batch_stride, out_batch_stride,
+                                            scale);
     }
 
     // Zero all floats in tensor. Used to reset KV / recurrent state between

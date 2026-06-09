@@ -2121,6 +2121,31 @@ __global__ void kv_append_kernel(float *cache,
     cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] = src_row[i];
 }
 
+__device__ __forceinline__ uint32_t kv_physical_pos_from_pages(
+        uint32_t logical_pos,
+        const int32_t *page_indices,
+        uint32_t page_size) {
+    const uint32_t logical_page = logical_pos / page_size;
+    const uint32_t page_offset = logical_pos - logical_page * page_size;
+    return static_cast<uint32_t>(page_indices[logical_page]) * page_size + page_offset;
+}
+
+__global__ void kv_append_paged_kernel(float *cache,
+                                       const float *src,
+                                       uint32_t base_logical_pos,
+                                       uint32_t per_pos_size,
+                                       uint32_t src_stride,
+                                       const int32_t *page_indices,
+                                       uint32_t page_size) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= per_pos_size) return;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(base_logical_pos + b, page_indices, page_size);
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] = src_row[i];
+}
+
 __global__ void kv_append_kernel_f16(__half *cache,
                                      const float *src,
                                      uint32_t base_pos,
@@ -2131,6 +2156,23 @@ __global__ void kv_append_kernel_f16(__half *cache,
     if (i >= per_pos_size) return;
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
     cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] =
+        __float2half(src_row[i]);
+}
+
+__global__ void kv_append_paged_kernel_f16(__half *cache,
+                                           const float *src,
+                                           uint32_t base_logical_pos,
+                                           uint32_t per_pos_size,
+                                           uint32_t src_stride,
+                                           const int32_t *page_indices,
+                                           uint32_t page_size) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= per_pos_size) return;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(base_logical_pos + b, page_indices, page_size);
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] =
         __float2half(src_row[i]);
 }
 
@@ -2148,6 +2190,23 @@ __global__ void kv_append_kernel_fp8(__nv_fp8_e4m3 *cache,
     if (i >= per_pos_size) return;
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
     cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] =
+        __nv_fp8_e4m3(src_row[i]);
+}
+
+__global__ void kv_append_paged_kernel_fp8(__nv_fp8_e4m3 *cache,
+                                           const float *src,
+                                           uint32_t base_logical_pos,
+                                           uint32_t per_pos_size,
+                                           uint32_t src_stride,
+                                           const int32_t *page_indices,
+                                           uint32_t page_size) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= per_pos_size) return;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(base_logical_pos + b, page_indices, page_size);
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] =
         __nv_fp8_e4m3(src_row[i]);
 }
 
@@ -2189,6 +2248,46 @@ __global__ void kv_append_kernel_q8(int8_t *cache,
         scales[pos * rows_per_pos + row] = __float2half(scale);
     }
     // round-to-nearest, clamp to [-127,127].
+    int q = __float2int_rn(x * inv_scale);
+    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+    cache[pos * per_pos_size + elem_in_pos] = static_cast<int8_t>(q);
+}
+
+__global__ void kv_append_paged_kernel_q8(int8_t *cache,
+                                          __half *scales,
+                                          const float *src,
+                                          uint32_t base_logical_pos,
+                                          uint32_t per_pos_size,
+                                          uint32_t row_elems,
+                                          uint32_t src_stride,
+                                          const int32_t *page_indices,
+                                          uint32_t page_size) {
+    const uint32_t b   = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t rows_per_pos = per_pos_size / row_elems;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(base_logical_pos + b, page_indices, page_size);
+
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    const uint32_t elem_in_pos = row * row_elems + lane;
+    const float x = (lane < row_elems) ? src_row[elem_in_pos] : 0.0f;
+
+    extern __shared__ float s_absmax[];
+    s_absmax[lane] = fabsf(x);
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (lane < s) s_absmax[lane] = fmaxf(s_absmax[lane], s_absmax[lane + s]);
+        __syncthreads();
+    }
+    const float absmax = s_absmax[0];
+    const float scale = absmax / 127.0f;
+    const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
+
+    const uint64_t pos = static_cast<uint64_t>(physical_pos);
+    if (lane == 0) {
+        scales[pos * rows_per_pos + row] = __float2half(scale);
+    }
     int q = __float2int_rn(x * inv_scale);
     q = q < -127 ? -127 : (q > 127 ? 127 : q);
     cache[pos * per_pos_size + elem_in_pos] = static_cast<int8_t>(q);
@@ -2468,6 +2567,7 @@ public:
         if (flashinfer_batch_decode_tmp_v_) cudaFree(flashinfer_batch_decode_tmp_v_);
         if (flashinfer_batch_decode_tmp_s_) cudaFree(flashinfer_batch_decode_tmp_s_);
         if (flashinfer_batch_decode_meta_i32_) cudaFree(flashinfer_batch_decode_meta_i32_);
+        if (kv_page_indices_i32_) cudaFree(kv_page_indices_i32_);
         if (argmax_dev_) cudaFree(argmax_dev_);
         if (argmax_host_) cudaFreeHost(argmax_host_);
         if (argmax_batch_partial_) cudaFree(argmax_batch_partial_);
@@ -4020,6 +4120,73 @@ public:
         return launch_status("cuda kv_append_batch");
     }
 
+    DeviceStatus ensure_kv_page_indices(const int32_t *page_indices,
+                                        uint32_t n_pages) {
+        if (!page_indices || n_pages == 0) {
+            return {false, "paged KV requires a non-empty page table"};
+        }
+        if (n_pages > kv_page_indices_i32_capacity_) {
+            if (kv_page_indices_i32_) cudaFree(kv_page_indices_i32_);
+            kv_page_indices_i32_ = nullptr;
+            if (auto st = cuda_status(cudaMalloc(&kv_page_indices_i32_,
+                                                 static_cast<size_t>(n_pages) * sizeof(int32_t)),
+                                      "kv page table malloc"); !st.ok) {
+                kv_page_indices_i32_capacity_ = 0;
+                return st;
+            }
+            kv_page_indices_i32_capacity_ = n_pages;
+        }
+        return cuda_status(cudaMemcpyAsync(kv_page_indices_i32_,
+                                           page_indices,
+                                           static_cast<size_t>(n_pages) * sizeof(int32_t),
+                                           cudaMemcpyHostToDevice,
+                                           exec_stream_),
+                           "kv page table copy");
+    }
+
+    DeviceStatus kv_append_batch_paged(DeviceTensor &cache,
+                                       const DeviceTensor &src,
+                                       uint32_t base_logical_pos,
+                                       uint32_t per_pos_size,
+                                       uint32_t batch,
+                                       const int32_t *page_indices,
+                                       uint32_t n_pages,
+                                       uint32_t page_size) override {
+        if (batch == 0) return {};
+        if (page_size == 0) return {false, "kv_append_batch_paged page_size=0"};
+        const uint32_t need_pages =
+            (base_logical_pos + batch + page_size - 1) / page_size;
+        if (need_pages > n_pages) return {false, "kv_append_batch_paged page table too small"};
+        if (auto st = ensure_kv_page_indices(page_indices, n_pages); !st.ok) return st;
+
+        auto &c = as_tensor(cache);
+        const auto &s = as_tensor(src);
+        const unsigned threads = 256;
+        const unsigned blocks = (per_pos_size + threads - 1) / threads;
+        dim3 grid(batch, blocks);
+        if (c.is_q8_kv()) {
+            const uint32_t row_elems = c.q8_row_elems;
+            const uint32_t rows = per_pos_size / row_elems;
+            dim3 qgrid(batch, rows);
+            kv_append_paged_kernel_q8<<<qgrid, row_elems, row_elems * sizeof(float), exec_stream_>>>(
+                c.ptr_i8(), c.scale, s.ptr, base_logical_pos, per_pos_size,
+                row_elems, per_pos_size, kv_page_indices_i32_, page_size);
+        } else if (c.is_fp8_kv()) {
+            kv_append_paged_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr_fp8(), s.ptr, base_logical_pos, per_pos_size, per_pos_size,
+                kv_page_indices_i32_, page_size);
+        } else if (c.is_fp16()) {
+            kv_append_paged_kernel_f16<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr_h(), s.ptr, base_logical_pos, per_pos_size, per_pos_size,
+                kv_page_indices_i32_, page_size);
+        } else {
+            kv_append_paged_kernel<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr, s.ptr, base_logical_pos, per_pos_size, per_pos_size,
+                kv_page_indices_i32_, page_size);
+        }
+        return launch_status("cuda kv_append_batch_paged");
+    }
+
     DeviceStatus ensure_fattn_scratch(uint32_t n_heads, uint32_t batch,
                                        uint32_t head_dim, uint32_t seq_len) {
         const size_t need = ported::fattn_vec_scratch_bytes(n_heads, batch,
@@ -4957,6 +5124,153 @@ public:
         return {false, "attention_decode_batch unsupported head_dim"};
     }
 
+    DeviceStatus attention_decode_batch_paged_gated(
+                                              DeviceTensor &out,
+                                              const DeviceTensor &q,
+                                              uint32_t q_stride,
+                                              const DeviceTensor &k_cache,
+                                              const DeviceTensor &v_cache,
+                                              const int32_t *logical_page_indices,
+                                              uint32_t n_pages,
+                                              uint32_t page_size,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim,
+                                              uint32_t base_seq_len,
+                                              uint32_t batch,
+                                              uint32_t q_batch_stride,
+                                              uint32_t out_batch_stride,
+                                              float scale) override {
+        if (batch == 0) return {};
+        if (!logical_page_indices || n_pages == 0 || page_size == 0) {
+            return {false, "paged attention requires a non-empty page table"};
+        }
+        const uint32_t need_pages = (base_seq_len + batch + page_size - 1) / page_size;
+        if (need_pages > n_pages) return {false, "paged attention page table too small"};
+
+        auto &o = as_tensor(out);
+        const auto &qq = as_tensor(q);
+        const auto &kc = as_tensor(k_cache);
+        const auto &vc = as_tensor(v_cache);
+
+#if QW3_ENABLE_FLASHINFER
+        const bool kv_fp16 = kc.is_fp16();
+        const bool debug_verify_attention = mtp_verify_attention_debug_enabled();
+        if (decode_flashinfer_attention_enabled() &&
+            kv_fp16 &&
+            (head_dim == 128 || head_dim == 256)) {
+            const uint32_t max_seq_len = base_seq_len + batch;
+            const uint32_t chunk_size =
+                flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
+                    n_heads, n_kv_heads, head_dim, batch, max_seq_len);
+            const bool partition_kv = flashinfer_batch_decode_partition_enabled();
+            if (chunk_size > 0) {
+                std::vector<int32_t> page_indices;
+                std::vector<int32_t> page_indptr(batch + 1, 0);
+                std::vector<int32_t> last_page_len(batch, 0);
+                std::vector<int32_t> request_indices;
+                std::vector<int32_t> kv_tile_indices;
+                std::vector<int32_t> o_indptr(batch + 1, 0);
+                for (uint32_t b = 0; b < batch; ++b) {
+                    const uint32_t seq_len = base_seq_len + b + 1;
+                    const uint32_t pages = std::max<uint32_t>(
+                        (seq_len + page_size - 1) / page_size, 1U);
+                    page_indptr[b] = static_cast<int32_t>(page_indices.size());
+                    for (uint32_t p = 0; p < pages; ++p) {
+                        page_indices.push_back(logical_page_indices[p]);
+                    }
+                    const uint32_t used_in_last = seq_len - (pages - 1U) * page_size;
+                    last_page_len[b] = static_cast<int32_t>(used_in_last);
+
+                    o_indptr[b] = static_cast<int32_t>(request_indices.size());
+                    const uint32_t tiles = partition_kv
+                        ? std::max<uint32_t>((seq_len + chunk_size - 1) / chunk_size, 1U)
+                        : 1U;
+                    for (uint32_t t = 0; t < tiles; ++t) {
+                        request_indices.push_back(static_cast<int32_t>(b));
+                        kv_tile_indices.push_back(static_cast<int32_t>(t));
+                    }
+                }
+                page_indptr[batch] = static_cast<int32_t>(page_indices.size());
+                o_indptr[batch] = static_cast<int32_t>(request_indices.size());
+                const uint32_t total_tiles = static_cast<uint32_t>(request_indices.size());
+
+                std::vector<int32_t> meta;
+                const uint64_t page_indices_offset = 0;
+                meta.insert(meta.end(), page_indices.begin(), page_indices.end());
+                const uint64_t page_indptr_offset = meta.size();
+                meta.insert(meta.end(), page_indptr.begin(), page_indptr.end());
+                const uint64_t last_page_len_offset = meta.size();
+                meta.insert(meta.end(), last_page_len.begin(), last_page_len.end());
+                const uint64_t request_indices_offset = meta.size();
+                meta.insert(meta.end(), request_indices.begin(), request_indices.end());
+                const uint64_t kv_tile_indices_offset = meta.size();
+                meta.insert(meta.end(), kv_tile_indices.begin(), kv_tile_indices.end());
+                const uint64_t o_indptr_offset = meta.size();
+                meta.insert(meta.end(), o_indptr.begin(), o_indptr.end());
+                const uint64_t kv_chunk_size_offset = meta.size();
+                meta.push_back(static_cast<int32_t>(chunk_size));
+
+                const uint64_t o_elems_batch =
+                    static_cast<uint64_t>(batch) * n_heads * head_dim;
+                const uint64_t tmp_v_elems = partition_kv
+                    ? static_cast<uint64_t>(total_tiles) * n_heads * head_dim
+                    : 0;
+                const uint64_t tmp_s_elems = partition_kv
+                    ? static_cast<uint64_t>(total_tiles) * n_heads
+                    : 0;
+                if (auto st = ensure_flashinfer_batch_decode_workspace(
+                        o_elems_batch, tmp_v_elems, tmp_s_elems,
+                        static_cast<uint64_t>(meta.size())); !st.ok) {
+                    return st;
+                }
+                if (auto st = cuda_status(
+                        cudaMemcpyAsync(flashinfer_batch_decode_meta_i32_,
+                                        meta.data(),
+                                        meta.size() * sizeof(int32_t),
+                                        cudaMemcpyHostToDevice,
+                                        exec_stream_),
+                        "flashinfer paged batch decode metadata copy"); !st.ok) {
+                    return st;
+                }
+
+                int32_t *meta_d = flashinfer_batch_decode_meta_i32_;
+                if (flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
+                        o.ptr, flashinfer_batch_decode_o_f16_,
+                        flashinfer_batch_decode_tmp_v_,
+                        flashinfer_batch_decode_tmp_s_,
+                        qq.ptr, q_stride, kc.ptr, vc.ptr,
+                        meta_d + page_indices_offset,
+                        meta_d + page_indptr_offset,
+                        meta_d + last_page_len_offset,
+                        meta_d + request_indices_offset,
+                        meta_d + kv_tile_indices_offset,
+                        meta_d + o_indptr_offset,
+                        o_indptr.data(),
+                        meta_d + kv_chunk_size_offset,
+                        partition_kv,
+                        flashinfer_batch_decode_rowwise_merge_enabled(),
+                        page_size, total_tiles,
+                        n_heads, n_kv_heads, head_dim, batch,
+                        q_batch_stride, out_batch_stride, scale,
+                        exec_stream_)) {
+                    return launch_status("cuda attention_decode_batch flashinfer paged decode gated");
+                }
+                if (debug_verify_attention) {
+                    std::fprintf(stderr,
+                                 "[qw3] paged attention FI launch refused; falling back\n");
+                }
+            }
+        }
+#endif
+
+        return DeviceBackend::attention_decode_batch_paged_gated(
+            out, q, q_stride, k_cache, v_cache,
+            logical_page_indices, n_pages, page_size,
+            n_heads, n_kv_heads, head_dim, base_seq_len, batch,
+            q_batch_stride, out_batch_stride, scale);
+    }
+
     DeviceStatus attention_decode_batch_gated(DeviceTensor &out,
                                               const DeviceTensor &q,
                                               uint32_t q_stride,
@@ -5479,6 +5793,8 @@ private:
     uint64_t flashinfer_batch_decode_tmp_s_capacity_ = 0;  // elements
     int32_t *flashinfer_batch_decode_meta_i32_ = nullptr;
     uint64_t flashinfer_batch_decode_meta_i32_capacity_ = 0;  // elements
+    int32_t *kv_page_indices_i32_ = nullptr;
+    uint32_t kv_page_indices_i32_capacity_ = 0;  // elements
     // X-FP16 cache for hgemm_q8. The QKV and gate/up matmul pairs share the
     // same FP32 input pointer in immediate succession; without a cache we
     // re-run fp32_to_fp16_kernel on identical data. Cache key is

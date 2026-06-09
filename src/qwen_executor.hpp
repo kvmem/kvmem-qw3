@@ -123,6 +123,10 @@ private:
     void ensure_mtp_scratch();
     void ensure_mtp_batch_scratch(uint32_t batch);
     void ensure_logits_batch_scratch(uint32_t batch);
+    void ensure_kv_pages(uint32_t logical_pos, uint32_t count);
+    int32_t allocate_kv_physical_page(uint32_t logical_page) const;
+    const int32_t *kv_page_indices() const { return kv_page_indices_.data(); }
+    uint32_t kv_page_count() const { return static_cast<uint32_t>(kv_page_indices_.size()); }
     NativeExecutorReport forward_mtp_draft_from(uint32_t token_id,
                                                 const DeviceTensor &h_input,
                                                 uint32_t rope_pos,
@@ -229,6 +233,10 @@ private:
     uint32_t kv_ctx_size_ = 0;
     uint32_t position_ = 0;
     int      prefill_chunk_override_ = -1;
+    uint32_t kv_page_size_ = 16;
+    uint32_t kv_max_pages_ = 0;
+    std::string kv_alloc_mode_;
+    std::vector<int32_t> kv_page_indices_;
 
     // Set by reset_state() and cleared after the first eager forward_one_token
     // call of a generate() session. Suppresses CUDA-graph capture on token 0

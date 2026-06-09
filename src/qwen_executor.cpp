@@ -55,7 +55,18 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
                            DeviceBackend &backend,
                            uint32_t kv_ctx_size)
     : model_(model), weights_(weights), backend_(backend),
-      kv_ctx_size_(kv_ctx_size) {}
+      kv_ctx_size_(kv_ctx_size) {
+    kv_page_size_ = std::max<uint32_t>(1, env_uint32_or("QW3_PAGED_KV_PAGE_SIZE", 16));
+    kv_max_pages_ = (kv_ctx_size_ + kv_page_size_ - 1) / kv_page_size_;
+    kv_alloc_mode_ = env_lower_ascii(env_value("QW3_PAGED_KV_ALLOC"));
+    if (kv_alloc_mode_.empty()) kv_alloc_mode_ = "identity";
+    if (kv_alloc_mode_ != "identity" &&
+        kv_alloc_mode_ != "reverse" &&
+        kv_alloc_mode_ != "evens-first") {
+        throw std::runtime_error("invalid QW3_PAGED_KV_ALLOC: " + kv_alloc_mode_ +
+                                 " (want identity|reverse|evens-first)");
+    }
+}
 
 QwenExecutor::~QwenExecutor() = default;
 
@@ -69,8 +80,52 @@ void QwenExecutor::reset_state() {
     // KV caches stay allocated; just reset the position so the next forward
     // overwrites slot 0 (the seq_len passed to attention_decode is position+1).
     position_ = 0;
+    kv_page_indices_.clear();
     mtp_prefix_len_ = 0;
     decode_graph_warmup_pending_ = true;
+}
+
+void QwenExecutor::ensure_kv_pages(uint32_t logical_pos, uint32_t count) {
+    if (count == 0) return;
+    const uint64_t end_pos = static_cast<uint64_t>(logical_pos) + count;
+    if (end_pos > kv_ctx_size_) {
+        throw std::runtime_error("KV cache full: increase --ctx (current=" +
+                                 std::to_string(kv_ctx_size_) + ")");
+    }
+    const uint32_t need_pages =
+        static_cast<uint32_t>((end_pos + kv_page_size_ - 1) / kv_page_size_);
+    if (need_pages > kv_max_pages_) {
+        throw std::runtime_error("KV page table full: increase --ctx (current=" +
+                                 std::to_string(kv_ctx_size_) + ")");
+    }
+    while (kv_page_indices_.size() < need_pages) {
+        const uint32_t logical_page = static_cast<uint32_t>(kv_page_indices_.size());
+        kv_page_indices_.push_back(allocate_kv_physical_page(logical_page));
+    }
+}
+
+int32_t QwenExecutor::allocate_kv_physical_page(uint32_t logical_page) const {
+    if (logical_page >= kv_max_pages_) {
+        throw std::runtime_error("KV physical page allocation exceeded page capacity");
+    }
+    if (kv_alloc_mode_ == "identity") {
+        return static_cast<int32_t>(logical_page);
+    }
+    if (kv_alloc_mode_ == "reverse") {
+        return static_cast<int32_t>(kv_max_pages_ - 1U - logical_page);
+    }
+    if (kv_alloc_mode_ == "evens-first") {
+        const uint32_t even_count = (kv_max_pages_ + 1U) / 2U;
+        const uint32_t physical_page =
+            logical_page < even_count
+                ? logical_page * 2U
+                : (logical_page - even_count) * 2U + 1U;
+        if (physical_page >= kv_max_pages_) {
+            throw std::runtime_error("evens-first KV page allocator produced an invalid page");
+        }
+        return static_cast<int32_t>(physical_page);
+    }
+    throw std::runtime_error("invalid QW3_PAGED_KV_ALLOC: " + kv_alloc_mode_);
 }
 
 void QwenExecutor::begin_record_timing(bool enabled) const {
@@ -171,6 +226,8 @@ void QwenExecutor::ensure_scratch() {
     k_cache_.resize(weights_.n_layers());
     v_cache_.resize(weights_.n_layers());
     const uint64_t kv_per_pos = static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    const uint64_t kv_physical_slots =
+        static_cast<uint64_t>(std::max<uint32_t>(kv_max_pages_, 1)) * kv_page_size_;
     // Default KV cache dtype: FP16 (2x bandwidth at long context, ~equal
     // greedy-token output). Force back to FP32 with QW3_KV_DTYPE=fp32, or down
     // to per-row int8 (one fp16 scale per head_dim row) with QW3_KV_DTYPE=q8.
@@ -184,17 +241,17 @@ void QwenExecutor::ensure_scratch() {
         const std::string klabel = "k_cache_l" + std::to_string(il);
         const std::string vlabel = "v_cache_l" + std::to_string(il);
         if (kv_use_q8) {
-            k_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_ctx_size_, cfg.head_dim, klabel.c_str());
-            v_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_ctx_size_, cfg.head_dim, vlabel.c_str());
+            k_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_physical_slots, cfg.head_dim, klabel.c_str());
+            v_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_physical_slots, cfg.head_dim, vlabel.c_str());
         } else if (kv_use_fp8) {
-            k_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_ctx_size_, klabel.c_str());
-            v_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_ctx_size_, vlabel.c_str());
+            k_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_physical_slots, klabel.c_str());
+            v_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_physical_slots, vlabel.c_str());
         } else if (kv_use_fp16) {
-            k_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_ctx_size_, klabel.c_str());
-            v_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_ctx_size_, vlabel.c_str());
+            k_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_physical_slots, klabel.c_str());
+            v_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_physical_slots, vlabel.c_str());
         } else {
-            k_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_ctx_size_, klabel.c_str());
-            v_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_ctx_size_, vlabel.c_str());
+            k_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_physical_slots, klabel.c_str());
+            v_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_physical_slots, vlabel.c_str());
         }
     }
 
@@ -399,8 +456,9 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     // verify/replay pass (compute_logits == false) — the captured topology
     // assumes the full LM-head argmax tail runs, which the no-logits path
     // skips, so re-using a stale graph would be incorrect.
-    const bool try_capture = compute_logits &&
-        !decode_graph_warmup_pending_ && backend_.begin_capture();
+    // Paged KV currently uploads the host page table during append/attention;
+    // keep decode eager until page tables are device-resident across steps.
+    const bool try_capture = false;
 
     require_status(backend_.q8_0_get_row(*h_, weights_.token_embd(), token_id));
     record(report, "token_embedding_lookup");
@@ -449,10 +507,7 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             }
             record(report, "layer." + std::to_string(il) + ".recurrent_output_add");
         } else {
-            if (position_ >= kv_ctx_size_) {
-                throw std::runtime_error("KV cache full: increase --ctx (current=" +
-                                         std::to_string(kv_ctx_size_) + ")");
-            }
+            ensure_kv_pages(position_, 1);
             {
                 DeviceTensor *outs[3] = {q_.get(), k_.get(), v_.get()};
                 const DeviceWeight *ws[3] = {layer.attn_q, layer.attn_k, layer.attn_v};
@@ -482,21 +537,24 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
 
             // Append K and V to the live cache.
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-            require_status(backend_.kv_append(*k_cache_[il], *k_, position_, per_pos));
-            require_status(backend_.kv_append(*v_cache_[il], *v_, position_, per_pos));
-            record(report, "layer." + std::to_string(il) + ".kv_append");
+            require_status(backend_.kv_append_batch_paged(
+                *k_cache_[il], *k_, position_, per_pos, 1,
+                kv_page_indices(), kv_page_count(), kv_page_size_));
+            require_status(backend_.kv_append_batch_paged(
+                *v_cache_[il], *v_, position_, per_pos, 1,
+                kv_page_indices(), kv_page_count(), kv_page_size_));
+            record(report, "layer." + std::to_string(il) + ".kv_append_paged");
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-            require_status(backend_.attention_decode(*mid_, *scores_, *q_,
-                                                     2 * standard_head_dim,
-                                                     *k_cache_[il], *v_cache_[il],
-                                                     standard_n_heads, standard_n_kv_heads,
-                                                     standard_head_dim,
-                                                     position_ + 1, scale));
-            require_status(backend_.apply_attn_gate(*mid_, *q_,
-                                                     2 * standard_head_dim,
-                                                     standard_n_heads, standard_head_dim));
-            record(report, "layer." + std::to_string(il) + ".attention_sdpa");
+            require_status(backend_.attention_decode_batch_paged_gated(
+                *mid_, *q_, 2 * standard_head_dim,
+                *k_cache_[il], *v_cache_[il],
+                kv_page_indices(), kv_page_count(), kv_page_size_,
+                standard_n_heads, standard_n_kv_heads, standard_head_dim,
+                position_, 1,
+                standard_n_heads * 2 * standard_head_dim,
+                standard_n_heads * standard_head_dim, scale));
+            record(report, "layer." + std::to_string(il) + ".attention_sdpa_paged");
 
             // Fused matvec + residual add: h += W_out * mid.
             if (auto st = backend_.q8_0_matvec_add(*h_, *layer.attn_output, *mid_); !st.ok) {
@@ -695,14 +753,10 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         }
     }
 
-    // Per-chunk graph capture is gated separately: even when the user
-    // forces chunking, capture is incompatible with the multi-stream
-    // HGEMM ping-pong pipeline (see chunk_size comment above). Setting
-    // QW3_PREFILL_GRAPH=1 attempts capture anyway for diagnostic use.
-    const bool prefill_graph_enabled = []() {
-        const char *e = std::getenv("QW3_PREFILL_GRAPH");
-        return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0);
-    }();
+    // Per-chunk graph capture is disabled while paged KV copies host page
+    // metadata inside append/attention calls. Re-enable once page tables are
+    // owned as stable device buffers by the scheduler.
+    const bool prefill_graph_enabled = false;
 
     // Skip capture on the first chunk (warmup): backend-side scratch
     // (q8_1 staging, fattn workspace) sizes itself on first use. After
@@ -718,10 +772,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         const bool record_ops = (chunk_off == 0);
         const bool full_chunk = (batch == chunk_size);
 
-        if (base_pos + batch > kv_ctx_size_) {
-            throw std::runtime_error("KV cache full: increase --ctx (current=" +
-                                     std::to_string(kv_ctx_size_) + ")");
-        }
+        ensure_kv_pages(base_pos, batch);
 
         // Embedding lookup runs eagerly: q8_0_get_rows_batch issues a
         // pageable host->device memcpy which is unsafe inside stream capture.
@@ -844,33 +895,23 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                         cfg.rope_dim, base_pos, cfg.rope_theta));
 
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-            require_status(backend_.kv_append_batch(*k_cache_[il], *k_batch_, base_pos, per_pos, batch));
-            require_status(backend_.kv_append_batch(*v_cache_[il], *v_batch_, base_pos, per_pos, batch));
-            if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch");
+            require_status(backend_.kv_append_batch_paged(
+                *k_cache_[il], *k_batch_, base_pos, per_pos, batch,
+                kv_page_indices(), kv_page_count(), kv_page_size_));
+            require_status(backend_.kv_append_batch_paged(
+                *v_cache_[il], *v_batch_, base_pos, per_pos, batch,
+                kv_page_indices(), kv_page_count(), kv_page_size_));
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch_paged");
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-            if (mtp_single_chunk) {
-                require_status(backend_.attention_decode_batch_gated(*mid_batch_, *q_batch_,
-                                                                      2 * standard_head_dim,
-                                                                      *k_cache_[il], *v_cache_[il],
-                                                                      standard_n_heads, standard_n_kv_heads,
-                                                                      standard_head_dim,
-                                                                      base_pos, batch,
-                                                                      q_stride_buf, mid_stride, scale));
-            } else {
-                require_status(backend_.attention_decode_batch(*mid_batch_, *q_batch_,
-                                                               2 * standard_head_dim,
-                                                               *k_cache_[il], *v_cache_[il],
-                                                               standard_n_heads, standard_n_kv_heads,
-                                                               standard_head_dim,
-                                                               base_pos, batch,
-                                                               q_stride_buf, mid_stride, scale));
-                require_status(backend_.apply_attn_gate_batch(*mid_batch_, *q_batch_,
-                                                              2 * standard_head_dim,
-                                                              batch, q_stride_buf, mid_stride,
-                                                              standard_n_heads, standard_head_dim));
-            }
-            if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch");
+            require_status(backend_.attention_decode_batch_paged_gated(
+                *mid_batch_, *q_batch_, 2 * standard_head_dim,
+                *k_cache_[il], *v_cache_[il],
+                kv_page_indices(), kv_page_count(), kv_page_size_,
+                standard_n_heads, standard_n_kv_heads,
+                standard_head_dim, base_pos, batch,
+                q_stride_buf, mid_stride, scale));
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch_paged");
 
             require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.attn_output, *mid_batch_,
                                                  batch, mid_stride, h_stride));
