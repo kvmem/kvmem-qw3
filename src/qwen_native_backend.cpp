@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -19,10 +21,13 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <deque>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -215,6 +220,10 @@ MtpTransactionalReplayMode mtp_transactional_replay_mode() {
 
 bool decode_as_batch_enabled() {
     return env_flag_enabled("QW3_DECODE_AS_BATCH");
+}
+
+uint32_t continuous_batching_max_active() {
+    return std::max<uint32_t>(1, env_uint32_or("QW3_CONTINUOUS_BATCHING_MAX_ACTIVE", 2));
 }
 
 bool mtp_trace_enabled() {
@@ -761,6 +770,10 @@ private:
 
 class QwenNativeBackend final : public Backend {
 public:
+    ~QwenNativeBackend() override {
+        stop_continuous_batch_worker();
+    }
+
     std::string name() const override {
         return "qwen-native";
     }
@@ -872,6 +885,17 @@ public:
         const bool trace_mtp = options_.native_mtp_trace || mtp_trace_enabled();
         const bool active_mtp = trace_mtp || spec_mtp;
 
+        if (options.continuous_batching && !active_mtp &&
+            continuous_batch_request_supported(options, dump.get())) {
+            return generate_continuous_batched(prompt_tokens, options, on_text);
+        }
+
+        // The continuous batching worker owns the shared CUDA backend while it
+        // is running. Unsupported requests fall back to the original path only
+        // after the worker drains, so scratch/stream state is never shared by
+        // two host threads at once.
+        stop_continuous_batch_worker();
+
         // Non-MTP greedy decode keeps qw3's native graph-capture / FlashInfer
         // / internal-chunking path byte-for-byte. MTP machinery is purely
         // additive: only the active_mtp branch differs.
@@ -883,6 +907,247 @@ public:
     }
 
 private:
+    struct ContinuousBatchRequest {
+        uint64_t id = 0;
+        std::vector<uint32_t> prompt_tokens;
+        GenerationOptions options;
+        TokenCallback on_text;
+
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done = false;
+        std::string generated;
+        std::string error;
+    };
+
+    struct ContinuousBatchActive {
+        std::shared_ptr<ContinuousBatchRequest> req;
+        std::unique_ptr<QwenExecutor> executor;
+        std::unordered_map<uint32_t, uint32_t> seen_tokens;
+        uint32_t next_token = 0;
+        int decoded = 0;
+        uint64_t prefill_ops = 0;
+        uint64_t decode_ops = 0;
+        double prefill_s = 0.0;
+        double decode_start = 0.0;
+    };
+
+    static bool continuous_batch_request_supported(const GenerationOptions &options,
+                                                   const DumpStream *dump) {
+        return dump == nullptr &&
+               options.temperature <= 0.0f &&
+               options.presence_penalty == 0.0f &&
+               (options.repetition_penalty <= 0.0f ||
+                options.repetition_penalty == 1.0f);
+    }
+
+    void start_continuous_batch_worker() {
+        std::lock_guard<std::mutex> lk(cb_mu_);
+        if (cb_running_) return;
+        cb_stop_ = false;
+        cb_running_ = true;
+        cb_worker_ = std::thread([this]() { continuous_batch_worker_loop(); });
+        log("native continuous_batching: enabled=true mode=round_robin_executor");
+    }
+
+    void stop_continuous_batch_worker() {
+        {
+            std::lock_guard<std::mutex> lk(cb_mu_);
+            if (!cb_running_) return;
+            cb_stop_ = true;
+        }
+        cb_cv_.notify_all();
+        if (cb_worker_.joinable()) cb_worker_.join();
+        cb_running_ = false;
+    }
+
+    std::string generate_continuous_batched(const std::vector<uint32_t> &prompt_tokens,
+                                            const GenerationOptions &options,
+                                            const TokenCallback &on_text) {
+        start_continuous_batch_worker();
+        auto req = std::make_shared<ContinuousBatchRequest>();
+        req->id = ++cb_request_counter_;
+        req->prompt_tokens = prompt_tokens;
+        req->options = options;
+        req->on_text = on_text;
+        {
+            std::lock_guard<std::mutex> lk(cb_mu_);
+            cb_pending_.push_back(req);
+        }
+        cb_cv_.notify_one();
+
+        std::unique_lock<std::mutex> lk(req->mu);
+        req->cv.wait(lk, [&]() { return req->done; });
+        if (!req->error.empty()) throw std::runtime_error(req->error);
+        return req->generated;
+    }
+
+    void complete_continuous_request(const std::shared_ptr<ContinuousBatchRequest> &req,
+                                     std::string generated,
+                                     std::string error = {}) {
+        {
+            std::lock_guard<std::mutex> lk(req->mu);
+            req->generated = std::move(generated);
+            req->error = std::move(error);
+            req->done = true;
+        }
+        req->cv.notify_one();
+    }
+
+    void continuous_batch_worker_loop() {
+        try {
+            DeviceStatus st = device_->begin();
+            if (!st.ok) throw std::runtime_error(st.message);
+
+            std::vector<ContinuousBatchActive> active;
+            const uint32_t ctx_size = options_.ctx_size > 0
+                ? static_cast<uint32_t>(options_.ctx_size)
+                : 4096u;
+            const int32_t eos = tokenizer_->eos_id();
+            size_t rr = 0;
+            const uint32_t max_active = continuous_batching_max_active();
+
+            while (true) {
+                std::deque<std::shared_ptr<ContinuousBatchRequest>> arrivals;
+                {
+                    std::unique_lock<std::mutex> lk(cb_mu_);
+                    cb_cv_.wait(lk, [&]() {
+                        return cb_stop_ || !cb_pending_.empty() || !active.empty();
+                    });
+                    if (cb_stop_ && cb_pending_.empty() && active.empty()) break;
+                    arrivals.swap(cb_pending_);
+                }
+
+                while (!arrivals.empty() && active.size() < max_active) {
+                    auto req = arrivals.front();
+                    arrivals.pop_front();
+                    try {
+                        ContinuousBatchActive a;
+                        a.req = req;
+                        a.executor = std::make_unique<QwenExecutor>(*model_, *weights_, *device_, ctx_size);
+                        a.executor->set_prefill_chunk_override(options_.prefill_chunk);
+                        a.executor->reset_state();
+                        a.seen_tokens.reserve(req->prompt_tokens.size() +
+                                              static_cast<size_t>(req->options.max_tokens));
+                        for (uint32_t token : req->prompt_tokens) ++a.seen_tokens[token];
+
+                        const double t0 = wall_seconds();
+                        NativeExecutorReport step =
+                            a.executor->forward_n_tokens(req->prompt_tokens);
+                        if (!step.ok) throw std::runtime_error("prefill failed");
+                        const double t1 = wall_seconds();
+                        a.prefill_s = std::max(t1 - t0, 1e-9);
+                        a.decode_start = t1;
+                        a.prefill_ops = step.ops_executed;
+                        const int32_t seed = step.argmax_token >= 0 ? step.argmax_token : eos;
+                        a.next_token = static_cast<uint32_t>(seed);
+
+                        if (req->options.max_tokens <= 0 ||
+                            a.next_token == static_cast<uint32_t>(eos)) {
+                            complete_continuous_request(req, {});
+                        } else {
+                            emit_continuous_token(a, a.next_token);
+                            if (a.decoded >= req->options.max_tokens) {
+                                finish_continuous_active(a);
+                            } else {
+                                active.push_back(std::move(a));
+                            }
+                        }
+                    } catch (const std::exception &e) {
+                        complete_continuous_request(req, {}, e.what());
+                    }
+                }
+                if (!arrivals.empty()) {
+                    std::lock_guard<std::mutex> lk(cb_mu_);
+                    while (!arrivals.empty()) {
+                        cb_pending_.push_front(arrivals.back());
+                        arrivals.pop_back();
+                    }
+                }
+
+                if (active.empty()) continue;
+                if (rr >= active.size()) rr = 0;
+                ContinuousBatchActive &a = active[rr];
+                try {
+                    const uint32_t feed = a.next_token;
+                    NativeExecutorReport step = a.executor->forward_one_token(feed);
+                    if (!step.ok) throw std::runtime_error("decode failed");
+                    a.decode_ops += step.ops_executed;
+                    const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
+                    a.next_token = static_cast<uint32_t>(next);
+                    if (a.next_token == static_cast<uint32_t>(eos)) {
+                        finish_continuous_active(a);
+                        active.erase(active.begin() + static_cast<std::ptrdiff_t>(rr));
+                    } else {
+                        emit_continuous_token(a, a.next_token);
+                        if (a.decoded >= a.req->options.max_tokens) {
+                            finish_continuous_active(a);
+                            active.erase(active.begin() + static_cast<std::ptrdiff_t>(rr));
+                        } else {
+                            ++rr;
+                        }
+                    }
+                } catch (const std::exception &e) {
+                    complete_continuous_request(a.req, {}, e.what());
+                    active.erase(active.begin() + static_cast<std::ptrdiff_t>(rr));
+                }
+            }
+
+            st = device_->end();
+            if (!st.ok) throw std::runtime_error(st.message);
+            {
+                std::lock_guard<std::mutex> lk(cb_mu_);
+                cb_running_ = false;
+                cb_stop_ = false;
+            }
+        } catch (const std::exception &e) {
+            std::deque<std::shared_ptr<ContinuousBatchRequest>> pending;
+            {
+                std::lock_guard<std::mutex> lk(cb_mu_);
+                pending.swap(cb_pending_);
+                cb_running_ = false;
+                cb_stop_ = false;
+            }
+            while (!pending.empty()) {
+                complete_continuous_request(pending.front(), {}, e.what());
+                pending.pop_front();
+            }
+            log(std::string("native continuous_batching: worker_failed reason=\"") +
+                e.what() + "\"");
+        }
+    }
+
+    void emit_continuous_token(ContinuousBatchActive &a, uint32_t token) {
+        const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
+        a.req->generated += piece;
+        if (a.req->on_text && !piece.empty()) a.req->on_text(piece);
+        ++a.seen_tokens[token];
+        ++a.decoded;
+    }
+
+    void finish_continuous_active(ContinuousBatchActive &a) {
+        const double decode_s = std::max(wall_seconds() - a.decode_start, 1e-9);
+        std::ostringstream msg;
+        msg << "native continuous_batch:"
+            << " request=" << a.req->id
+            << " prompt_tokens=" << a.req->prompt_tokens.size()
+            << " prefill=" << fmt_seconds(a.prefill_s);
+        if (!a.req->prompt_tokens.empty()) {
+            msg << " (" << std::fixed << std::setprecision(2)
+                << (a.req->prompt_tokens.size() / a.prefill_s) << " tok/s)";
+        }
+        msg << " decoded=" << a.decoded
+            << " decode=" << fmt_seconds(decode_s);
+        if (a.decoded > 0) {
+            msg << " (" << std::fixed << std::setprecision(2)
+                << (a.decoded / decode_s) << " tok/s)";
+        }
+        msg << " prefill_ops=" << a.prefill_ops
+            << " decode_ops=" << a.decode_ops;
+        log(msg.str());
+        complete_continuous_request(a.req, std::move(a.req->generated));
+    }
+
     // qw3's original non-MTP generate path. Unchanged behavior: internal
     // chunking + graph capture live inside the executor.
     std::string generate_plain(const std::vector<uint32_t> &prompt_tokens,
@@ -1967,6 +2232,14 @@ private:
     std::unique_ptr<QwenWeights> weights_;
     std::unique_ptr<QwenExecutor> executor_;
     std::unique_ptr<QwenTokenizer> tokenizer_;
+
+    std::mutex cb_mu_;
+    std::condition_variable cb_cv_;
+    std::deque<std::shared_ptr<ContinuousBatchRequest>> cb_pending_;
+    std::thread cb_worker_;
+    bool cb_running_ = false;
+    bool cb_stop_ = false;
+    std::atomic<uint64_t> cb_request_counter_{0};
 };
 
 } // namespace

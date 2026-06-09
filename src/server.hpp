@@ -7,9 +7,10 @@
 namespace qw3 {
 
 // Configuration for the OpenAI-compatible HTTP server. The model itself is
-// loaded once (from EngineOptions) and reused across all requests; requests are
-// serialized behind a mutex because the native executor holds a single shared
-// KV cache + scratch and is not safe for concurrent generate() calls.
+// loaded once (from EngineOptions) and reused across all requests. By default
+// generation is serialized behind a mutex because the native executor holds a
+// single shared KV cache + scratch. With QW3_CONTINUOUS_BATCHING=1, supported
+// greedy requests are routed through the native backend's batching worker.
 struct ServerConfig {
     std::string host = "127.0.0.1";
     int port = 8080;

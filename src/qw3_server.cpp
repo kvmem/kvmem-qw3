@@ -1,5 +1,6 @@
 #include "server.hpp"
 
+#include "env_flags.hpp"
 #include "qw3/qw3.hpp"
 
 // Vendored single-header deps (included as SYSTEM headers via CMake so their
@@ -22,6 +23,16 @@ namespace qw3 {
 namespace {
 
 using json = nlohmann::json;
+
+bool serve_continuous_batching_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING");
+}
+
+bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
+    return g.temperature <= 0.0f &&
+           g.presence_penalty == 0.0f &&
+           (g.repetition_penalty <= 0.0f || g.repetition_penalty == 1.0f);
+}
 
 std::string basename_of(const std::string &path) {
     const size_t slash = path.find_last_of("/\\");
@@ -511,6 +522,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             render_messages(req["messages"], tools, enable_thinking, forced_tool_name);
         GenerationOptions g = make_gen(req);
         g.raw_prompt = true; // prompt is already chat-framed
+        g.continuous_batching =
+            serve_continuous_batching_enabled() &&
+            serve_continuous_batch_request_supported(g) &&
+            !tool_request;
         const std::vector<std::string> stops = parse_stops(req);
         const bool stream = req.value("stream", false);
         const std::string id = gen_id("chatcmpl-");
@@ -523,7 +538,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 "text/event-stream",
                 [&, prompt, g, stops, id, created, rid, enable_thinking,
                  tool_request](size_t, httplib::DataSink &sink) {
-                    std::lock_guard<std::mutex> lk(gen_mu);
+                    std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
+                    if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
                     std::string utf8_pending;
                     ReasoningStreamSplitter reasoning_splitter(enable_thinking);
@@ -658,7 +674,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
 
         std::string text;
-        {
+        if (g.continuous_batching) {
+            text = eng.generate(prompt, g);
+        } else {
             std::lock_guard<std::mutex> lk(gen_mu);
             text = eng.generate(prompt, g);
         }
@@ -723,13 +741,18 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         GenerationOptions g = make_gen(req);
         g.raw_prompt = true; // /v1/completions sends raw text, no chat template
+        g.continuous_batching =
+            serve_continuous_batching_enabled() &&
+            serve_continuous_batch_request_supported(g);
         const std::vector<std::string> stops = parse_stops(req);
         const std::string id = gen_id("cmpl-");
         const int64_t created = unix_now();
         const uint64_t rid = ++req_counter;
 
         std::string text;
-        {
+        if (g.continuous_batching) {
+            text = eng.generate(prompt, g);
+        } else {
             std::lock_guard<std::mutex> lk(gen_mu);
             text = eng.generate(prompt, g);
         }
@@ -758,7 +781,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     });
 
     std::cerr << "[qw3-serve] listening on http://" << cfg.host << ":"
-              << cfg.port << "  (model loaded once, requests serialized)\n";
+              << cfg.port << "  (model loaded once, continuous_batching="
+              << (serve_continuous_batching_enabled() ? "on" : "off") << ")\n";
     if (!svr.listen(cfg.host, cfg.port)) {
         std::cerr << "[qw3-serve] failed to bind " << cfg.host << ":"
                   << cfg.port << "\n";
