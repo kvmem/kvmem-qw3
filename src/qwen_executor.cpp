@@ -946,13 +946,22 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                     standard_head_dim, base_pos, batch,
                     q_stride_buf, mid_stride, scale));
             } else {
-                require_status(backend_.attention_decode_batch_paged_gated(
+                DeviceStatus attn_st = backend_.attention_decode_batch_paged_gated_device(
                     *mid_batch_, *q_batch_, 2 * standard_head_dim,
                     *k_cache_[il], *v_cache_[il],
-                    kv_page_indices(), kv_page_count(), kv_page_size(),
+                    kv_page_indices_device(), kv_page_count(), kv_page_size(),
                     standard_n_heads, standard_n_kv_heads,
                     standard_head_dim, base_pos, batch,
-                    q_stride_buf, mid_stride, scale));
+                    q_stride_buf, mid_stride, scale);
+                if (!attn_st.ok) {
+                    require_status(backend_.attention_decode_batch_paged_gated(
+                        *mid_batch_, *q_batch_, 2 * standard_head_dim,
+                        *k_cache_[il], *v_cache_[il],
+                        kv_page_indices(), kv_page_count(), kv_page_size(),
+                        standard_n_heads, standard_n_kv_heads,
+                        standard_head_dim, base_pos, batch,
+                        q_stride_buf, mid_stride, scale));
+                }
             }
             if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch_paged");
 

@@ -2294,6 +2294,19 @@ __global__ void kv_append_paged_kernel_q8(int8_t *cache,
     cache[pos * per_pos_size + elem_in_pos] = static_cast<int8_t>(q);
 }
 
+__global__ void expand_flashinfer_page_indices_kernel(int32_t *dst,
+                                                      const int32_t *logical_pages,
+                                                      const int32_t *page_indptr,
+                                                      uint32_t batch) {
+    const uint32_t b = blockIdx.x;
+    if (b >= batch) return;
+    const uint32_t begin = static_cast<uint32_t>(page_indptr[b]);
+    const uint32_t end = static_cast<uint32_t>(page_indptr[b + 1]);
+    for (uint32_t i = threadIdx.x; i < end - begin; i += blockDim.x) {
+        dst[begin + i] = logical_pages[i];
+    }
+}
+
 __global__ void attention_decode_qk_kernel(float *scores,
                                            const float *q,
                                            uint32_t q_stride,
@@ -5356,14 +5369,11 @@ public:
                                               uint32_t out_batch_stride,
                                               float scale) override {
         if (batch == 0) return {};
-        if (batch != 1) {
-            return {false, "paged device attention currently supports batch=1"};
-        }
         if (n_pages == 0 || page_size == 0) {
             return {false, "paged device attention requires a non-empty page table"};
         }
-        const uint32_t seq_len = base_seq_len + 1;
-        const uint32_t need_pages = (seq_len + page_size - 1) / page_size;
+        const uint32_t max_seq_len = base_seq_len + batch;
+        const uint32_t need_pages = (max_seq_len + page_size - 1) / page_size;
         if (need_pages > n_pages) return {false, "paged device attention page table too small"};
 
         auto &o = as_tensor(out);
@@ -5381,37 +5391,53 @@ public:
             (head_dim == 128 || head_dim == 256)) {
             const uint32_t chunk_size =
                 flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
-                    n_heads, n_kv_heads, head_dim, batch, seq_len);
+                    n_heads, n_kv_heads, head_dim, batch, max_seq_len);
             const bool partition_kv = flashinfer_batch_decode_partition_enabled();
             if (chunk_size > 0) {
+                std::vector<int32_t> page_indptr(batch + 1, 0);
+                std::vector<int32_t> last_page_len(batch, 0);
                 std::vector<int32_t> request_indices;
                 std::vector<int32_t> kv_tile_indices;
-                const uint32_t tiles = partition_kv
-                    ? std::max<uint32_t>((seq_len + chunk_size - 1) / chunk_size, 1U)
-                    : 1U;
-                request_indices.reserve(tiles);
-                kv_tile_indices.reserve(tiles);
-                for (uint32_t t = 0; t < tiles; ++t) {
-                    request_indices.push_back(0);
-                    kv_tile_indices.push_back(static_cast<int32_t>(t));
+                std::vector<int32_t> o_indptr(batch + 1, 0);
+                uint32_t total_page_indices = 0;
+                for (uint32_t b = 0; b < batch; ++b) {
+                    const uint32_t seq_len = base_seq_len + b + 1;
+                    const uint32_t pages_for_request = std::max<uint32_t>(
+                        (seq_len + page_size - 1) / page_size, 1U);
+                    page_indptr[b] = static_cast<int32_t>(total_page_indices);
+                    total_page_indices += pages_for_request;
+                    const uint32_t used_in_last =
+                        seq_len - (pages_for_request - 1U) * page_size;
+                    last_page_len[b] = static_cast<int32_t>(used_in_last);
+
+                    o_indptr[b] = static_cast<int32_t>(request_indices.size());
+                    const uint32_t tiles = partition_kv
+                        ? std::max<uint32_t>((seq_len + chunk_size - 1) / chunk_size, 1U)
+                        : 1U;
+                    for (uint32_t t = 0; t < tiles; ++t) {
+                        request_indices.push_back(static_cast<int32_t>(b));
+                        kv_tile_indices.push_back(static_cast<int32_t>(t));
+                    }
                 }
+                page_indptr[batch] = static_cast<int32_t>(total_page_indices);
+                o_indptr[batch] = static_cast<int32_t>(request_indices.size());
                 const uint32_t total_tiles = static_cast<uint32_t>(request_indices.size());
-                const int32_t o_indptr_host[2] = {0, static_cast<int32_t>(total_tiles)};
 
                 std::vector<int32_t> meta;
+                const uint64_t page_indices_offset = 0;
+                if (batch > 1) {
+                    meta.resize(total_page_indices, 0);
+                }
                 const uint64_t page_indptr_offset = meta.size();
-                meta.push_back(0);
-                meta.push_back(static_cast<int32_t>(need_pages));
+                meta.insert(meta.end(), page_indptr.begin(), page_indptr.end());
                 const uint64_t last_page_len_offset = meta.size();
-                const uint32_t used_in_last = seq_len - (need_pages - 1U) * page_size;
-                meta.push_back(static_cast<int32_t>(used_in_last));
+                meta.insert(meta.end(), last_page_len.begin(), last_page_len.end());
                 const uint64_t request_indices_offset = meta.size();
                 meta.insert(meta.end(), request_indices.begin(), request_indices.end());
                 const uint64_t kv_tile_indices_offset = meta.size();
                 meta.insert(meta.end(), kv_tile_indices.begin(), kv_tile_indices.end());
                 const uint64_t o_indptr_offset = meta.size();
-                meta.push_back(o_indptr_host[0]);
-                meta.push_back(o_indptr_host[1]);
+                meta.insert(meta.end(), o_indptr.begin(), o_indptr.end());
                 const uint64_t kv_chunk_size_offset = meta.size();
                 meta.push_back(static_cast<int32_t>(chunk_size));
 
@@ -5439,18 +5465,27 @@ public:
                 }
 
                 int32_t *meta_d = flashinfer_batch_decode_meta_i32_;
+                const int32_t *fi_page_indices = pages.ptr_i32();
+                if (batch > 1) {
+                    expand_flashinfer_page_indices_kernel<<<batch, 128, 0, exec_stream_>>>(
+                        meta_d + page_indices_offset, pages.ptr_i32(),
+                        meta_d + page_indptr_offset, batch);
+                    if (auto st = launch_status("flashinfer paged device page index expand");
+                        !st.ok) return st;
+                    fi_page_indices = meta_d + page_indices_offset;
+                }
                 if (flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
                         o.ptr, flashinfer_batch_decode_o_f16_,
                         flashinfer_batch_decode_tmp_v_,
                         flashinfer_batch_decode_tmp_s_,
                         qq.ptr, q_stride, kc.ptr, vc.ptr,
-                        pages.ptr_i32(),
+                        fi_page_indices,
                         meta_d + page_indptr_offset,
                         meta_d + last_page_len_offset,
                         meta_d + request_indices_offset,
                         meta_d + kv_tile_indices_offset,
                         meta_d + o_indptr_offset,
-                        o_indptr_host,
+                        o_indptr.data(),
                         meta_d + kv_chunk_size_offset,
                         partition_kv,
                         flashinfer_batch_decode_rowwise_merge_enabled(),
