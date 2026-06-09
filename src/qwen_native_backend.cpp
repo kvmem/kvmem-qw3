@@ -892,20 +892,20 @@ public:
         executor_ = std::make_unique<QwenExecutor>(*model_, *weights_, *device_, ctx_size);
         executor_->set_prefill_chunk_override(options_.prefill_chunk);
         executor_->reset_state();
-        const uint32_t kv_page_size =
-            std::max<uint32_t>(1, env_uint32_or("QW3_PAGED_KV_PAGE_SIZE", 16));
-        const uint32_t per_executor_pages = (ctx_size + kv_page_size - 1) / kv_page_size;
-        const uint32_t requested_pool_pages =
-            env_uint32_or("QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES",
-                          per_executor_pages);
-        const uint32_t pool_pages = std::max<uint32_t>(
-            1, std::min<uint32_t>(requested_pool_pages, per_executor_pages));
-        cb_kv_pool_ = std::make_unique<GlobalKvPagePool>(pool_pages, kv_page_size);
-        if (requested_pool_pages != pool_pages) {
-            log("native continuous_batching: clamped KV pool pages from " +
-                std::to_string(requested_pool_pages) + " to " +
-                std::to_string(pool_pages) +
-                " while KV tensors remain per-executor");
+        if (env_flag_enabled("QW3_CONTINUOUS_BATCHING")) {
+            const uint32_t kv_page_size =
+                std::max<uint32_t>(1, env_uint32_or("QW3_PAGED_KV_PAGE_SIZE", 16));
+            const uint32_t per_executor_pages =
+                (ctx_size + kv_page_size - 1) / kv_page_size;
+            const uint32_t default_pool_pages =
+                per_executor_pages * continuous_batching_max_active();
+            const uint32_t requested_pool_pages =
+                env_uint32_or("QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES",
+                              default_pool_pages);
+            const uint32_t pool_pages = std::max<uint32_t>(1, requested_pool_pages);
+            cb_kv_pool_ =
+                std::make_unique<GlobalKvPagePool>(pool_pages, kv_page_size);
+            allocate_continuous_kv_cache(pool_pages, kv_page_size);
         }
 
         st = device_->end();
@@ -1201,6 +1201,60 @@ private:
         log(msg.str());
     }
 
+    void allocate_continuous_kv_cache(uint32_t pool_pages, uint32_t page_size) {
+        const QwenConfig &cfg = model_->config();
+        const uint64_t kv_per_pos =
+            static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+        const uint64_t physical_slots =
+            static_cast<uint64_t>(pool_pages) * page_size;
+        const std::string kv_dtype = env_lower_ascii(env_value("QW3_KV_DTYPE"));
+        const bool kv_use_fp32 = kv_dtype == "fp32";
+        const bool kv_use_q8 = kv_dtype == "q8";
+        const bool kv_use_fp8 = kv_dtype == "fp8";
+        const bool kv_use_fp16 = !kv_use_fp32 && !kv_use_q8 && !kv_use_fp8;
+
+        cb_k_cache_storage_.clear();
+        cb_v_cache_storage_.clear();
+        cb_k_cache_storage_.resize(weights_->n_layers());
+        cb_v_cache_storage_.resize(weights_->n_layers());
+        cb_kv_cache_view_.physical_slots = physical_slots;
+        cb_kv_cache_view_.k_cache.assign(weights_->n_layers(), nullptr);
+        cb_kv_cache_view_.v_cache.assign(weights_->n_layers(), nullptr);
+
+        for (uint32_t il = 0; il < weights_->n_layers(); ++il) {
+            if (!cfg.is_standard_attention_layer(il)) continue;
+            const std::string klabel = "cb_k_cache_l" + std::to_string(il);
+            const std::string vlabel = "cb_v_cache_l" + std::to_string(il);
+            if (kv_use_q8) {
+                cb_k_cache_storage_[il] = device_->tensor_q8_kv(
+                    kv_per_pos * physical_slots, cfg.head_dim, klabel.c_str());
+                cb_v_cache_storage_[il] = device_->tensor_q8_kv(
+                    kv_per_pos * physical_slots, cfg.head_dim, vlabel.c_str());
+            } else if (kv_use_fp8) {
+                cb_k_cache_storage_[il] = device_->tensor_fp8_kv(
+                    kv_per_pos * physical_slots, klabel.c_str());
+                cb_v_cache_storage_[il] = device_->tensor_fp8_kv(
+                    kv_per_pos * physical_slots, vlabel.c_str());
+            } else if (kv_use_fp16) {
+                cb_k_cache_storage_[il] = device_->tensor_f16(
+                    kv_per_pos * physical_slots, klabel.c_str());
+                cb_v_cache_storage_[il] = device_->tensor_f16(
+                    kv_per_pos * physical_slots, vlabel.c_str());
+            } else {
+                cb_k_cache_storage_[il] = device_->tensor_f32(
+                    kv_per_pos * physical_slots, klabel.c_str());
+                cb_v_cache_storage_[il] = device_->tensor_f32(
+                    kv_per_pos * physical_slots, vlabel.c_str());
+            }
+            cb_kv_cache_view_.k_cache[il] = cb_k_cache_storage_[il].get();
+            cb_kv_cache_view_.v_cache[il] = cb_v_cache_storage_[il].get();
+        }
+        log("native continuous_batching: global KV cache pages=" +
+            std::to_string(pool_pages) +
+            " page_size=" + std::to_string(page_size) +
+            " physical_slots=" + std::to_string(physical_slots));
+    }
+
     void continuous_batch_worker_loop() {
         std::vector<ContinuousBatchActive> active;
         try {
@@ -1233,7 +1287,7 @@ private:
                         a.req = req;
                         a.executor = std::make_unique<QwenExecutor>(
                             *model_, *weights_, *device_, ctx_size,
-                            cb_kv_pool_.get());
+                            cb_kv_pool_.get(), &cb_kv_cache_view_);
                         a.executor->set_prefill_chunk_override(options_.prefill_chunk);
                         a.executor->reset_state();
                         a.seen_tokens.reserve(req->prompt_tokens.size() +
@@ -1337,8 +1391,12 @@ private:
             if (view.kv_page_size == 0 ||
                 view.kv_page_count == 0 ||
                 view.kv_page_indices_device == nullptr ||
-                view.k_cache == nullptr ||
-                view.v_cache == nullptr) {
+                ((view.k_cache == nullptr || view.k_cache->empty()) &&
+                 (view.k_cache_external == nullptr ||
+                  view.k_cache_external->empty())) ||
+                ((view.v_cache == nullptr || view.v_cache->empty()) &&
+                 (view.v_cache_external == nullptr ||
+                  view.v_cache_external->empty()))) {
                 return false;
             }
         }
@@ -2565,6 +2623,9 @@ private:
     std::unique_ptr<QwenExecutor> executor_;
     std::unique_ptr<QwenTokenizer> tokenizer_;
     std::unique_ptr<GlobalKvPagePool> cb_kv_pool_;
+    std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
+    std::vector<std::unique_ptr<DeviceTensor>> cb_v_cache_storage_;
+    QwenExecutor::KvCacheStorage cb_kv_cache_view_;
 
     std::mutex cb_mu_;
     std::condition_variable cb_cv_;

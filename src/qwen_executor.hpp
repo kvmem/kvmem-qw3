@@ -63,6 +63,8 @@ public:
         const DeviceTensor *kv_page_indices_device = nullptr;
         const std::vector<std::unique_ptr<DeviceTensor>> *k_cache = nullptr;
         const std::vector<std::unique_ptr<DeviceTensor>> *v_cache = nullptr;
+        const std::vector<DeviceTensor *> *k_cache_external = nullptr;
+        const std::vector<DeviceTensor *> *v_cache_external = nullptr;
         const std::vector<std::unique_ptr<DeviceTensor>> *recurrent_states = nullptr;
         const std::vector<std::unique_ptr<DeviceTensor>> *conv_states = nullptr;
         const DeviceTensor *hidden = nullptr;
@@ -74,12 +76,18 @@ public:
         uint32_t logical_pages = 0;
         std::vector<int32_t> physical_pages;
     };
+    struct KvCacheStorage {
+        uint64_t physical_slots = 0;
+        std::vector<DeviceTensor *> k_cache;
+        std::vector<DeviceTensor *> v_cache;
+    };
 
     QwenExecutor(const QwenNativeModel &model,
                  const QwenWeights &weights,
                  DeviceBackend &backend,
                  uint32_t kv_ctx_size,
-                 KvPhysicalPageAllocator *kv_page_allocator = nullptr);
+                 KvPhysicalPageAllocator *kv_page_allocator = nullptr,
+                 KvCacheStorage *external_kv_cache = nullptr);
     ~QwenExecutor();
 
     void reset_state();
@@ -181,6 +189,9 @@ private:
     const DeviceTensor &kv_page_indices_device() const { return kv_pages_.device_indices(); }
     uint32_t kv_page_count() const { return kv_pages_.count(); }
     uint32_t kv_page_size() const { return kv_pages_.page_size; }
+    DeviceTensor &k_cache(uint32_t layer);
+    DeviceTensor &v_cache(uint32_t layer);
+    bool has_external_kv_cache() const { return external_kv_cache_ != nullptr; }
     NativeExecutorReport forward_mtp_draft_from(uint32_t token_id,
                                                 const DeviceTensor &h_input,
                                                 uint32_t rope_pos,
@@ -254,6 +265,7 @@ private:
     // One [ctx_size * n_kv_heads * head_dim] tensor per standard attention layer.
     std::vector<std::unique_ptr<DeviceTensor>> k_cache_;
     std::vector<std::unique_ptr<DeviceTensor>> v_cache_;
+    KvCacheStorage *external_kv_cache_ = nullptr;
 
     bool mtp_scratch_ready_ = false;
     std::unique_ptr<DeviceTensor> mtp_h_;

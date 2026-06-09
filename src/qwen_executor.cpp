@@ -54,8 +54,10 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
                            const QwenWeights &weights,
                            DeviceBackend &backend,
                            uint32_t kv_ctx_size,
-                           KvPhysicalPageAllocator *kv_page_allocator)
+                           KvPhysicalPageAllocator *kv_page_allocator,
+                           KvCacheStorage *external_kv_cache)
     : model_(model), weights_(weights), backend_(backend),
+      external_kv_cache_(external_kv_cache),
       kv_ctx_size_(kv_ctx_size) {
     kv_pages_.configure(kv_ctx_size_, kv_page_allocator);
 }
@@ -74,10 +76,44 @@ QwenExecutor::DecodeStateView QwenExecutor::decode_state_view() const {
     view.kv_page_indices_device = kv_pages_.device_pages.get();
     view.k_cache = &k_cache_;
     view.v_cache = &v_cache_;
+    view.k_cache_external = external_kv_cache_ ? &external_kv_cache_->k_cache : nullptr;
+    view.v_cache_external = external_kv_cache_ ? &external_kv_cache_->v_cache : nullptr;
     view.recurrent_states = &recurrent_states_;
     view.conv_states = &conv_states_;
     view.hidden = h_.get();
     return view;
+}
+
+DeviceTensor &QwenExecutor::k_cache(uint32_t layer) {
+    if (external_kv_cache_) {
+        if (layer >= external_kv_cache_->k_cache.size() ||
+            external_kv_cache_->k_cache[layer] == nullptr) {
+            throw std::runtime_error("external K cache missing for layer " +
+                                     std::to_string(layer));
+        }
+        return *external_kv_cache_->k_cache[layer];
+    }
+    if (layer >= k_cache_.size() || !k_cache_[layer]) {
+        throw std::runtime_error("K cache missing for layer " +
+                                 std::to_string(layer));
+    }
+    return *k_cache_[layer];
+}
+
+DeviceTensor &QwenExecutor::v_cache(uint32_t layer) {
+    if (external_kv_cache_) {
+        if (layer >= external_kv_cache_->v_cache.size() ||
+            external_kv_cache_->v_cache[layer] == nullptr) {
+            throw std::runtime_error("external V cache missing for layer " +
+                                     std::to_string(layer));
+        }
+        return *external_kv_cache_->v_cache[layer];
+    }
+    if (layer >= v_cache_.size() || !v_cache_[layer]) {
+        throw std::runtime_error("V cache missing for layer " +
+                                 std::to_string(layer));
+    }
+    return *v_cache_[layer];
 }
 
 QwenExecutor::KvStateSnapshot QwenExecutor::kv_state_snapshot() const {
@@ -151,7 +187,8 @@ void QwenExecutor::KvPageTable::ensure_pages(DeviceBackend &backend,
             allocator ? allocator->allocate_physical_page()
                       : allocate_physical_page(logical_page);
         if (physical_page < 0 ||
-            static_cast<uint32_t>(physical_page) >= max_pages) {
+            static_cast<uint32_t>(physical_page) >=
+                (allocator ? allocator->total_pages() : max_pages)) {
             if (allocator) {
                 allocator->release_physical_pages(std::vector<int32_t>{physical_page});
             }
@@ -304,10 +341,10 @@ void QwenExecutor::ensure_scratch() {
     scores_ = backend_.tensor_f32(static_cast<uint64_t>(cfg.n_heads) * std::max<uint32_t>(kv_ctx_size_, 1), "attn_scores");
 
     // Per-layer KV cache for the standard-attention layers only.
-    k_cache_.resize(weights_.n_layers());
-    v_cache_.resize(weights_.n_layers());
     const uint64_t kv_per_pos = static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
-    const uint64_t kv_physical_slots = kv_pages_.physical_slots();
+    const uint64_t kv_physical_slots =
+        external_kv_cache_ ? external_kv_cache_->physical_slots
+                           : kv_pages_.physical_slots();
     // Default KV cache dtype: FP16 (2x bandwidth at long context, ~equal
     // greedy-token output). Force back to FP32 with QW3_KV_DTYPE=fp32, or down
     // to per-row int8 (one fp16 scale per head_dim row) with QW3_KV_DTYPE=q8.
@@ -316,22 +353,26 @@ void QwenExecutor::ensure_scratch() {
     const bool kv_use_q8 = kv_dtype_env && std::strcmp(kv_dtype_env, "q8") == 0;
     const bool kv_use_fp8 = kv_dtype_env && std::strcmp(kv_dtype_env, "fp8") == 0;
     const bool kv_use_fp16 = !kv_use_fp32 && !kv_use_q8 && !kv_use_fp8;
-    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
-        if (!cfg.is_standard_attention_layer(il)) continue;
-        const std::string klabel = "k_cache_l" + std::to_string(il);
-        const std::string vlabel = "v_cache_l" + std::to_string(il);
-        if (kv_use_q8) {
-            k_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_physical_slots, cfg.head_dim, klabel.c_str());
-            v_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_physical_slots, cfg.head_dim, vlabel.c_str());
-        } else if (kv_use_fp8) {
-            k_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_physical_slots, klabel.c_str());
-            v_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_physical_slots, vlabel.c_str());
-        } else if (kv_use_fp16) {
-            k_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_physical_slots, klabel.c_str());
-            v_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_physical_slots, vlabel.c_str());
-        } else {
-            k_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_physical_slots, klabel.c_str());
-            v_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_physical_slots, vlabel.c_str());
+    if (!external_kv_cache_) {
+        k_cache_.resize(weights_.n_layers());
+        v_cache_.resize(weights_.n_layers());
+        for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+            if (!cfg.is_standard_attention_layer(il)) continue;
+            const std::string klabel = "k_cache_l" + std::to_string(il);
+            const std::string vlabel = "v_cache_l" + std::to_string(il);
+            if (kv_use_q8) {
+                k_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_physical_slots, cfg.head_dim, klabel.c_str());
+                v_cache_[il] = backend_.tensor_q8_kv(kv_per_pos * kv_physical_slots, cfg.head_dim, vlabel.c_str());
+            } else if (kv_use_fp8) {
+                k_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_physical_slots, klabel.c_str());
+                v_cache_[il] = backend_.tensor_fp8_kv(kv_per_pos * kv_physical_slots, vlabel.c_str());
+            } else if (kv_use_fp16) {
+                k_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_physical_slots, klabel.c_str());
+                v_cache_[il] = backend_.tensor_f16(kv_per_pos * kv_physical_slots, vlabel.c_str());
+            } else {
+                k_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_physical_slots, klabel.c_str());
+                v_cache_[il] = backend_.tensor_f32(kv_per_pos * kv_physical_slots, vlabel.c_str());
+            }
         }
     }
 
@@ -618,17 +659,17 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             // Append K and V to the live cache.
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
             require_status(backend_.kv_append_batch_paged_device(
-                *k_cache_[il], *k_, position_, per_pos, 1,
+                k_cache(il), *k_, position_, per_pos, 1,
                 kv_page_indices_device(), kv_page_count(), kv_page_size()));
             require_status(backend_.kv_append_batch_paged_device(
-                *v_cache_[il], *v_, position_, per_pos, 1,
+                v_cache(il), *v_, position_, per_pos, 1,
                 kv_page_indices_device(), kv_page_count(), kv_page_size()));
             record(report, "layer." + std::to_string(il) + ".kv_append_paged");
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
             require_status(backend_.attention_decode_batch_paged_gated_device(
                 *mid_, *q_, 2 * standard_head_dim,
-                *k_cache_[il], *v_cache_[il],
+                k_cache(il), v_cache(il),
                 kv_page_indices_device(), kv_page_count(), kv_page_size(),
                 standard_n_heads, standard_n_kv_heads, standard_head_dim,
                 position_, 1,
@@ -976,10 +1017,10 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
 
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
             require_status(backend_.kv_append_batch_paged_device(
-                *k_cache_[il], *k_batch_, base_pos, per_pos, batch,
+                k_cache(il), *k_batch_, base_pos, per_pos, batch,
                 kv_page_indices_device(), kv_page_count(), kv_page_size()));
             require_status(backend_.kv_append_batch_paged_device(
-                *v_cache_[il], *v_batch_, base_pos, per_pos, batch,
+                v_cache(il), *v_batch_, base_pos, per_pos, batch,
                 kv_page_indices_device(), kv_page_count(), kv_page_size()));
             if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch_paged");
 
@@ -987,7 +1028,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             if (batch == 1) {
                 require_status(backend_.attention_decode_batch_paged_gated_device(
                     *mid_batch_, *q_batch_, 2 * standard_head_dim,
-                    *k_cache_[il], *v_cache_[il],
+                    k_cache(il), v_cache(il),
                     kv_page_indices_device(), kv_page_count(), kv_page_size(),
                     standard_n_heads, standard_n_kv_heads,
                     standard_head_dim, base_pos, batch,
@@ -995,7 +1036,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             } else {
                 DeviceStatus attn_st = backend_.attention_decode_batch_paged_gated_device(
                     *mid_batch_, *q_batch_, 2 * standard_head_dim,
-                    *k_cache_[il], *v_cache_[il],
+                    k_cache(il), v_cache(il),
                     kv_page_indices_device(), kv_page_count(), kv_page_size(),
                     standard_n_heads, standard_n_kv_heads,
                     standard_head_dim, base_pos, batch,
@@ -1003,7 +1044,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 if (!attn_st.ok) {
                     require_status(backend_.attention_decode_batch_paged_gated(
                         *mid_batch_, *q_batch_, 2 * standard_head_dim,
-                        *k_cache_[il], *v_cache_[il],
+                        k_cache(il), v_cache(il),
                         kv_page_indices(), kv_page_count(), kv_page_size(),
                         standard_n_heads, standard_n_kv_heads,
                         standard_head_dim, base_pos, batch,

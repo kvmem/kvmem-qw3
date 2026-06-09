@@ -26,7 +26,7 @@ should be committed separately from unrelated work.
 | 1 | Continuous batching service semantics | Completed | Passed on 2026-06-09 |
 | 2 | Simplified admission control | Completed | Passed on 2026-06-09 |
 | 3 | Request-level paged KV state | Completed | Passed on 2026-06-09 |
-| 4 | Global KV page pool | In Progress | 4a passed on 2026-06-09 |
+| 4 | Global KV page pool | Completed | Passed on 2026-06-09 |
 | 5 | BatchedDecodeExecutor batch=1 parity | Pending | Not run |
 | 6 | Batched greedy decode with FlashInfer paged attention | Pending | Not run |
 | 7 | Chunked prefill and decode interleaving | Pending | Not run |
@@ -260,7 +260,7 @@ Verification:
 
 Completion Notes:
 
-- In progress.
+- Completed on 2026-06-09.
 - Stage 4a completed on 2026-06-09.
 - Added `KvPhysicalPageAllocator` abstraction.
 - Added a native `GlobalKvPagePool` allocator with free-list based physical
@@ -303,6 +303,43 @@ Completion Notes:
     `global KV page pool exhausted: free=0 total=1 page_size=16`.
   - A minimal `/v1/completions` request succeeded under the same pool.
   - Log included `kv_pool_used=1 kv_pool_free=0`.
+- Stage 4b completed on 2026-06-09.
+- Added backend-owned global K/V tensor storage for continuous batching.
+- Added `QwenExecutor::KvCacheStorage` so continuous batching executors can
+  write/read K/V through shared backend-owned tensors.
+- Standard attention K/V append and attention paths now use cache accessors
+  that can resolve either executor-owned or backend-owned cache tensors.
+- `QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES` now controls both the allocator page
+  count and the global K/V tensor physical capacity when continuous batching is
+  enabled.
+- The global K/V cache is allocated only when `QW3_CONTINUOUS_BATCHING=1`, so
+  plain CLI and paged-KV regression paths do not allocate extra continuous
+  batching storage or perturb their baseline behavior.
+- Build passed: `cmake --build build -j`.
+- Unit tests passed: `ctest --test-dir build --output-on-failure`.
+- Diff check passed: `git diff --check`.
+- Paged KV regression passed after the non-CB allocation fix:
+  - Command output JSON: `/tmp/qw3_stage4b_paged_kv_rerun2.json`
+  - Prompts: `short chinese`
+  - Page sizes: `16 32`
+  - Allocation modes: `identity reverse`
+  - KV dtype: `fp16`
+  - Result: 8/8 cases passed.
+- Continuous batching regression passed:
+  - Command output JSON: `/tmp/qw3_stage4b_cb_rerun2.json`
+  - Evidence: `trace_max_batch=2`, `summary_max_batch=2`,
+    `paged_kv_ready=True`, `hgemm_guard=True`.
+  - Regression JSON contains `global KV cache pages=` and
+    `kv_pool_used=/kv_pool_free=` logs.
+- KV pool exhaustion smoke was repeated with backend-owned global K/V storage:
+  - Temporary service used `QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES=1` and
+    `QW3_PAGED_KV_PAGE_SIZE=16`.
+  - Multi-page chat request returned `HTTP/1.1 429 Too Many Requests`.
+  - Minimal `/v1/completions` request returned `HTTP/1.1 200 OK`.
+  - Log included `global KV cache pages=1 page_size=16 physical_slots=16`
+    and `kv_pool_used=1 kv_pool_free=0`.
+- Note: one continuous regression run produced a transient exact-output
+  mismatch on the `cuda` prompt; an immediate rerun passed.
 
 ## Stage 5: BatchedDecodeExecutor Batch=1 Parity
 
