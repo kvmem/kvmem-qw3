@@ -851,6 +851,24 @@ public:
         if (!tokenizer_) tokenizer_ = std::make_unique<QwenTokenizer>(model_->gguf());
         const std::vector<int32_t> ids = tokenizer_->encode(prompt);
         std::vector<uint32_t> prompt_tokens(ids.begin(), ids.end());
+        GenerationOptions effective_options = options;
+        const uint32_t ctx_size = options_.ctx_size > 0
+            ? static_cast<uint32_t>(options_.ctx_size)
+            : 4096u;
+        if (prompt_tokens.size() > static_cast<size_t>(ctx_size)) {
+            throw std::runtime_error("prompt exceeds KV context: prompt_tokens=" +
+                                     std::to_string(prompt_tokens.size()) +
+                                     " ctx=" + std::to_string(ctx_size));
+        }
+        const uint32_t max_emit_tokens =
+            ctx_size - static_cast<uint32_t>(prompt_tokens.size()) + 1U;
+        if (effective_options.max_tokens > static_cast<int>(max_emit_tokens)) {
+            log("native generate: capping max_tokens from " +
+                std::to_string(effective_options.max_tokens) + " to " +
+                std::to_string(max_emit_tokens) +
+                " to fit KV ctx=" + std::to_string(ctx_size));
+            effective_options.max_tokens = static_cast<int>(max_emit_tokens);
+        }
 
         if (options_.dump_tokens) {
             std::ostringstream out;
@@ -889,9 +907,9 @@ public:
         const bool trace_mtp = options_.native_mtp_trace || mtp_trace_enabled();
         const bool active_mtp = trace_mtp || spec_mtp;
 
-        if (options.continuous_batching && !active_mtp &&
-            continuous_batch_request_supported(options, dump.get())) {
-            return generate_continuous_batched(prompt_tokens, options, on_text);
+        if (effective_options.continuous_batching && !active_mtp &&
+            continuous_batch_request_supported(effective_options, dump.get())) {
+            return generate_continuous_batched(prompt_tokens, effective_options, on_text);
         }
 
         // The continuous batching worker owns the shared CUDA backend while it
@@ -904,9 +922,9 @@ public:
         // / internal-chunking path byte-for-byte. MTP machinery is purely
         // additive: only the active_mtp branch differs.
         if (!active_mtp) {
-            return generate_plain(prompt_tokens, options, on_text, dump.get());
+            return generate_plain(prompt_tokens, effective_options, on_text, dump.get());
         }
-        return generate_mtp(prompt_tokens, options, on_text, dump.get(),
+        return generate_mtp(prompt_tokens, effective_options, on_text, dump.get(),
                             spec_mtp, trace_mtp);
     }
 

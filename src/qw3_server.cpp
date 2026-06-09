@@ -58,6 +58,13 @@ std::string dump_json(const json &value) {
     return value.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
+void set_error_response(httplib::Response &res,
+                        int status,
+                        const std::string &message) {
+    res.status = status;
+    res.set_content(dump_json(json{{"error", message}}), "application/json");
+}
+
 std::string replacement_char() {
     return "\xEF\xBF\xBD";
 }
@@ -590,12 +597,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         sink.write(fin.data(), fin.size());
                         sink.done();
                     };
-                    send_role();
-                    if (enable_thinking) {
-                        send_delta(json{{"reasoning_content", ""}});
-                    }
-                    if (tool_request) {
-                        eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                    try {
+                        send_role();
+                        if (enable_thinking) {
+                            send_delta(json{{"reasoning_content", ""}});
+                        }
+                        if (tool_request) {
+                            eng.generate_stream(prompt, g, [&](const std::string &piece) {
                             if (stopped) return;
                             acc += piece;
                             if (!stops.empty()) {
@@ -628,25 +636,37 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                   << " chat(stream tools) chars=" << acc.size() << "\n";
                         return true;
                     }
-                    eng.generate_stream(prompt, g, [&](const std::string &piece) {
-                        if (stopped) return;
-                        acc += piece;
-                        std::string emit = take_complete_utf8(utf8_pending, piece);
-                        if (!stops.empty()) {
-                            std::string probe = acc;
-                            if (apply_stops(probe, stops)) {
-                                stopped = true;
-                                utf8_pending.clear();
-                                const size_t previous_size = acc.size() - piece.size();
-                                emit = probe.size() > previous_size
-                                           ? probe.substr(previous_size)
-                                           : "";
-                                emit = take_complete_utf8(utf8_pending, emit);
+                        eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                            if (stopped) return;
+                            acc += piece;
+                            std::string emit = take_complete_utf8(utf8_pending, piece);
+                            if (!stops.empty()) {
+                                std::string probe = acc;
+                                if (apply_stops(probe, stops)) {
+                                    stopped = true;
+                                    utf8_pending.clear();
+                                    const size_t previous_size = acc.size() - piece.size();
+                                    emit = probe.size() > previous_size
+                                               ? probe.substr(previous_size)
+                                               : "";
+                                    emit = take_complete_utf8(utf8_pending, emit);
+                                }
                             }
-                        }
-                        if (!emit.empty()) {
-                            ++n_tok;
-                            for (const auto &part : reasoning_splitter.push(emit)) {
+                            if (!emit.empty()) {
+                                ++n_tok;
+                                for (const auto &part : reasoning_splitter.push(emit)) {
+                                    if (part.second.empty()) continue;
+                                    if (part.first == StreamPart::Reasoning) {
+                                        send_delta(json{{"reasoning_content", part.second}});
+                                    } else {
+                                        send_delta(json{{"content", part.second}});
+                                    }
+                                }
+                            }
+                        });
+                        const std::string tail = flush_utf8_pending(utf8_pending, false);
+                        if (!tail.empty()) {
+                            for (const auto &part : reasoning_splitter.push(tail)) {
                                 if (part.second.empty()) continue;
                                 if (part.first == StreamPart::Reasoning) {
                                     send_delta(json{{"reasoning_content", part.second}});
@@ -655,10 +675,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 }
                             }
                         }
-                    });
-                    const std::string tail = flush_utf8_pending(utf8_pending, false);
-                    if (!tail.empty()) {
-                        for (const auto &part : reasoning_splitter.push(tail)) {
+                        for (const auto &part : reasoning_splitter.finish()) {
                             if (part.second.empty()) continue;
                             if (part.first == StreamPart::Reasoning) {
                                 send_delta(json{{"reasoning_content", part.second}});
@@ -666,29 +683,45 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 send_delta(json{{"content", part.second}});
                             }
                         }
+                        send_done(stopped ? "stop" : "stop");
+                        std::cerr << "[qw3-serve] #" << rid
+                                  << " chat(stream) tokens=" << n_tok << "\n";
+                        return true;
+                    } catch (const std::exception &e) {
+                        json chunk = {
+                            {"id", id}, {"object", "chat.completion.chunk"},
+                            {"created", created}, {"model", model_id},
+                            {"choices", json::array({json{
+                                {"index", 0},
+                                {"delta", json::object()},
+                                {"finish_reason", "error"}}})},
+                            {"error", e.what()}};
+                        const std::string s = "data: " + dump_json(chunk) + "\n\n";
+                        sink.write(s.data(), s.size());
+                        const std::string fin = "data: [DONE]\n\n";
+                        sink.write(fin.data(), fin.size());
+                        sink.done();
+                        std::cerr << "[qw3-serve] #" << rid
+                                  << " chat(stream) error=" << e.what() << "\n";
+                        return false;
                     }
-                    for (const auto &part : reasoning_splitter.finish()) {
-                        if (part.second.empty()) continue;
-                        if (part.first == StreamPart::Reasoning) {
-                            send_delta(json{{"reasoning_content", part.second}});
-                        } else {
-                            send_delta(json{{"content", part.second}});
-                        }
-                    }
-                    send_done(stopped ? "stop" : "stop");
-                    std::cerr << "[qw3-serve] #" << rid
-                              << " chat(stream) tokens=" << n_tok << "\n";
-                    return true;
                 });
             return;
         }
 
         std::string text;
-        if (g.continuous_batching) {
-            text = eng.generate(prompt, g);
-        } else {
-            std::lock_guard<std::mutex> lk(gen_mu);
-            text = eng.generate(prompt, g);
+        try {
+            if (g.continuous_batching) {
+                text = eng.generate(prompt, g);
+            } else {
+                std::lock_guard<std::mutex> lk(gen_mu);
+                text = eng.generate(prompt, g);
+            }
+        } catch (const std::exception &e) {
+            std::cerr << "[qw3-serve] #" << rid << " chat error="
+                      << e.what() << "\n";
+            set_error_response(res, 500, e.what());
+            return;
         }
         if (enable_thinking) text = "<think>\n" + text;
         std::string utf8_pending;
@@ -760,11 +793,18 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const uint64_t rid = ++req_counter;
 
         std::string text;
-        if (g.continuous_batching) {
-            text = eng.generate(prompt, g);
-        } else {
-            std::lock_guard<std::mutex> lk(gen_mu);
-            text = eng.generate(prompt, g);
+        try {
+            if (g.continuous_batching) {
+                text = eng.generate(prompt, g);
+            } else {
+                std::lock_guard<std::mutex> lk(gen_mu);
+                text = eng.generate(prompt, g);
+            }
+        } catch (const std::exception &e) {
+            std::cerr << "[qw3-serve] #" << rid << " completion error="
+                      << e.what() << "\n";
+            set_error_response(res, 500, e.what());
+            return;
         }
         std::string utf8_pending;
         text = take_complete_utf8(utf8_pending, text);
