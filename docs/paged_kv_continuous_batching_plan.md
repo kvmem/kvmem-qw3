@@ -27,7 +27,7 @@ should be committed separately from unrelated work.
 | 2 | Simplified admission control | Completed | Passed on 2026-06-09 |
 | 3 | Request-level paged KV state | Completed | Passed on 2026-06-09 |
 | 4 | Global KV page pool | Completed | Passed on 2026-06-09 |
-| 5 | BatchedDecodeExecutor batch=1 parity | Pending | Not run |
+| 5 | BatchedDecodeExecutor batch=1 parity | Completed | Passed on 2026-06-10 |
 | 6 | Batched greedy decode with FlashInfer paged attention | Pending | Not run |
 | 7 | Chunked prefill and decode interleaving | Pending | Not run |
 | 8 | Batched sampling optimization | Pending | Not run |
@@ -358,7 +358,26 @@ Verification:
 
 Completion Notes:
 
-- Pending.
+- Stage 5 completed on 2026-06-10.
+- Added an internal `BatchedDecodeExecutor` abstraction for the native
+  continuous batching decode path.
+- The first implementation is intentionally delegated: it packages batch input
+  and output structs, then calls each active request's existing
+  `forward_one_token()` path. This preserves current behavior while giving
+  Stage 6 a stable replacement point for FlashInfer paged batch decode.
+- Continuous batching trace logs now include
+  `decode_executor=delegated`.
+- Verification:
+  - `cmake --build build -j`: passed.
+  - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+  - `git diff --check`: passed.
+  - `python3 scripts/paged_kv_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --page-sizes '16 32' --alloc-modes 'identity reverse' --prompts 'short chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage5_paged_kv.json --timeout 900`: passed, 8/8 runs.
+  - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage5_cb_rerun.json --timeout 900 --min-batch 2`: passed on rerun, 4/4 comparisons, `max_batch=2`, `paged_kv_ready=true`, `hgemm_guard=true`.
+- Note: the first continuous batching regression run wrote
+  `/tmp/qw3_stage5_cb.json` and failed 2 output comparisons because the plain
+  baseline returned a transient abnormal text for `capital` and a different
+  short reasoning prefix for `cuda`. The immediate rerun passed all
+  comparisons and kept the required batching evidence.
 
 ## Stage 6: Batched Greedy Decode With FlashInfer Paged Attention
 

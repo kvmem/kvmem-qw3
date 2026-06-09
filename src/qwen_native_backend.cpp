@@ -1076,6 +1076,51 @@ private:
         size_t size() const { return active_indices.size(); }
     };
 
+    struct BatchedDecodeInput {
+        const ContinuousDecodeBatch *batch = nullptr;
+    };
+
+    struct BatchedDecodeOutput {
+        size_t active_index = 0;
+        uint32_t feed_token = 0;
+        NativeExecutorReport report;
+        std::string error;
+
+        bool ok() const { return error.empty() && report.ok; }
+    };
+
+    class BatchedDecodeExecutor {
+    public:
+        std::vector<BatchedDecodeOutput> decode(
+                std::vector<ContinuousBatchActive> &active,
+                const BatchedDecodeInput &input) {
+            std::vector<BatchedDecodeOutput> outputs;
+            if (input.batch == nullptr) return outputs;
+            const ContinuousDecodeBatch &batch = *input.batch;
+            outputs.reserve(batch.size());
+            for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
+                BatchedDecodeOutput out;
+                out.active_index = batch.active_indices[batch_i];
+                out.feed_token = batch.feed_tokens[batch_i];
+                if (out.active_index >= active.size()) {
+                    out.error = "decode active index out of range";
+                    outputs.push_back(std::move(out));
+                    continue;
+                }
+                try {
+                    out.report =
+                        active[out.active_index].executor->forward_one_token(
+                            out.feed_token);
+                    if (!out.report.ok) out.error = "decode failed";
+                } catch (const std::exception &e) {
+                    out.error = e.what();
+                }
+                outputs.push_back(std::move(out));
+            }
+            return outputs;
+        }
+    };
+
     static bool continuous_batch_request_supported(const GenerationOptions &options,
                                                    const DumpStream *dump) {
         return dump == nullptr && options.max_tokens >= 0;
@@ -1410,6 +1455,7 @@ private:
         if (continuous_batching_trace_enabled()) {
             std::ostringstream msg;
             msg << "native continuous_batch_step:"
+                << " decode_executor=delegated"
                 << " batch=" << batch.size()
                 << " paged_kv_ready="
                 << (continuous_decode_batch_has_paged_kv(batch) ? "true" : "false")
@@ -1424,14 +1470,17 @@ private:
                !cb_decode_max_batch_.compare_exchange_weak(
                    prev_max, static_cast<uint32_t>(batch.size()))) {}
 
-        for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
-            const size_t active_index = batch.active_indices[batch_i];
+        BatchedDecodeExecutor decode_executor;
+        const std::vector<BatchedDecodeOutput> outputs =
+            decode_executor.decode(active, BatchedDecodeInput{&batch});
+        for (const BatchedDecodeOutput &out : outputs) {
+            const size_t active_index = out.active_index;
             if (active_index >= active.size()) continue;
             ContinuousBatchActive &a = active[active_index];
             try {
-                const uint32_t feed = batch.feed_tokens[batch_i];
-                NativeExecutorReport step = a.executor->forward_one_token(feed);
-                if (!step.ok) throw std::runtime_error("decode failed");
+                if (!out.error.empty()) throw std::runtime_error(out.error);
+                const NativeExecutorReport &step = out.report;
+                if (!out.ok()) throw std::runtime_error("decode failed");
                 a.decode_ops += step.ops_executed;
                 a.kv_state.update(a.executor->kv_state_snapshot());
                 const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
