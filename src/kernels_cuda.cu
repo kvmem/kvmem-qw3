@@ -595,6 +595,14 @@ inline bool matmul_auto_use_mmq(uint32_t batch) {
     return batch >= mma_min_batch();
 }
 
+inline bool hgemm_disabled() {
+    const char *env = std::getenv("QW3_DISABLE_HGEMM");
+    if (!env || !*env) return false;
+    return std::strcmp(env, "0") != 0 &&
+           std::strcmp(env, "off") != 0 &&
+           std::strcmp(env, "false") != 0;
+}
+
 
 static thread_local char g_err[256];
 
@@ -3206,9 +3214,14 @@ public:
             if (try_mmq && (w.cols % 32) == 0) {
                 if (auto st = mmq_q8(o.ptr, w, input.ptr, batch); st.ok) return st;
             }
-            DeviceStatus st = hgemm_q8(o.ptr, w, input.ptr, batch);
-            if (st.ok) return st;
-            // Fall through to dp4a on HGEMM error (e.g. OOM allocating cache).
+            if (!hgemm_disabled()) {
+                DeviceStatus st = hgemm_q8(o.ptr, w, input.ptr, batch);
+                if (st.ok) return st;
+            }
+            // Fall through to dp4a when HGEMM is disabled or errors (e.g.
+            // OOM allocating cache). Continuous batching sets
+            // QW3_DISABLE_HGEMM=1 so the batched path never silently routes
+            // through cuBLAS HGEMM.
         }
         return dispatch_q8_matvec(o.ptr, w, input.ptr, batch, in_stride, out_stride);
     }

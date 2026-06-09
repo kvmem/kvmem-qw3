@@ -443,6 +443,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     engine.backend = BackendKind::QwenNative;
     engine.native_heavy = true;
     if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
+    if (serve_continuous_batching_enabled()) {
+        if (std::getenv("QW3_MATMUL") == nullptr) {
+            setenv("QW3_MATMUL", "mmq", 1);
+        }
+        setenv("QW3_DISABLE_HGEMM", "1", 1);
+        std::cerr << "[qw3-serve] continuous batching matmul guard: "
+                  << "QW3_MATMUL=" << std::getenv("QW3_MATMUL")
+                  << " QW3_DISABLE_HGEMM=" << std::getenv("QW3_DISABLE_HGEMM")
+                  << "\n";
+    }
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
     Engine eng(engine);
