@@ -957,9 +957,26 @@ private:
         std::string error;
     };
 
+    struct ContinuousRequestKvState {
+        uint32_t seq_len = 0;
+        uint32_t ctx_size = 0;
+        uint32_t page_size = 0;
+        uint32_t logical_pages = 0;
+        std::vector<int32_t> physical_pages;
+
+        void update(const QwenExecutor::KvStateSnapshot &snapshot) {
+            seq_len = snapshot.seq_len;
+            ctx_size = snapshot.ctx_size;
+            page_size = snapshot.page_size;
+            logical_pages = snapshot.logical_pages;
+            physical_pages = snapshot.physical_pages;
+        }
+    };
+
     struct ContinuousBatchActive {
         std::shared_ptr<ContinuousBatchRequest> req;
         std::unique_ptr<QwenExecutor> executor;
+        ContinuousRequestKvState kv_state;
         std::unordered_map<uint32_t, uint32_t> seen_tokens;
         std::mt19937_64 rng;
         std::vector<float> logit_buf;
@@ -1158,6 +1175,7 @@ private:
                         a.prefill_s = std::max(t1 - t0, 1e-9);
                         a.decode_start = t1;
                         a.prefill_ops = step.ops_executed;
+                        a.kv_state.update(a.executor->kv_state_snapshot());
                         const int32_t seed = step.argmax_token >= 0 ? step.argmax_token : eos;
                         a.next_token = static_cast<uint32_t>(
                             pick_continuous_next_token(a, seed));
@@ -1283,6 +1301,7 @@ private:
                 NativeExecutorReport step = a.executor->forward_one_token(feed);
                 if (!step.ok) throw std::runtime_error("decode failed");
                 a.decode_ops += step.ops_executed;
+                a.kv_state.update(a.executor->kv_state_snapshot());
                 const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
                 a.next_token = static_cast<uint32_t>(
                     pick_continuous_next_token(a, next));
@@ -1369,6 +1388,9 @@ private:
         }
         msg << " prefill_ops=" << a.prefill_ops
             << " decode_ops=" << a.decode_ops
+            << " kv_seq_len=" << a.kv_state.seq_len
+            << " kv_page_size=" << a.kv_state.page_size
+            << " kv_pages=" << a.kv_state.logical_pages
             << " batch_steps=" << cb_decode_batches_.load()
             << " batch_tokens=" << cb_decode_tokens_.load()
             << " max_batch=" << cb_decode_max_batch_.load();

@@ -57,6 +57,13 @@ public:
         const std::vector<std::unique_ptr<DeviceTensor>> *conv_states = nullptr;
         const DeviceTensor *hidden = nullptr;
     };
+    struct KvStateSnapshot {
+        uint32_t seq_len = 0;
+        uint32_t ctx_size = 0;
+        uint32_t page_size = 0;
+        uint32_t logical_pages = 0;
+        std::vector<int32_t> physical_pages;
+    };
 
     QwenExecutor(const QwenNativeModel &model,
                  const QwenWeights &weights,
@@ -68,6 +75,7 @@ public:
     uint32_t position() const { return position_; }
     uint32_t kv_ctx_size() const { return kv_ctx_size_; }
     DecodeStateView decode_state_view() const;
+    KvStateSnapshot kv_state_snapshot() const;
 
     NativeExecutorReport dry_run_token(uint32_t token_id, bool execute_heavy);
     NativeExecutorReport forward_one_token(uint32_t token_id,

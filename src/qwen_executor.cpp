@@ -77,6 +77,16 @@ QwenExecutor::DecodeStateView QwenExecutor::decode_state_view() const {
     return view;
 }
 
+QwenExecutor::KvStateSnapshot QwenExecutor::kv_state_snapshot() const {
+    KvStateSnapshot snapshot;
+    snapshot.seq_len = position_;
+    snapshot.ctx_size = kv_ctx_size_;
+    snapshot.page_size = kv_pages_.page_size;
+    snapshot.logical_pages = kv_pages_.count();
+    snapshot.physical_pages = kv_pages_.pages;
+    return snapshot;
+}
+
 void QwenExecutor::reset_state() {
     for (auto &s : recurrent_states_) {
         if (s) (void) backend_.zero_tensor(*s);

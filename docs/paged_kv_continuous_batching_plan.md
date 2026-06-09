@@ -25,7 +25,7 @@ should be committed separately from unrelated work.
 | 0 | Baseline freeze and regression harness | Completed | Passed on 2026-06-09 |
 | 1 | Continuous batching service semantics | Completed | Passed on 2026-06-09 |
 | 2 | Simplified admission control | Completed | Passed on 2026-06-09 |
-| 3 | Request-level paged KV state | Pending | Not run |
+| 3 | Request-level paged KV state | Completed | Passed on 2026-06-09 |
 | 4 | Global KV page pool | Pending | Not run |
 | 5 | BatchedDecodeExecutor batch=1 parity | Pending | Not run |
 | 6 | Batched greedy decode with FlashInfer paged attention | Pending | Not run |
@@ -209,7 +209,37 @@ Verification:
 
 Completion Notes:
 
-- Pending.
+- Completed on 2026-06-09.
+- Added `QwenExecutor::KvStateSnapshot`.
+- Added `QwenExecutor::kv_state_snapshot()` for request-level logical KV state
+  inspection.
+- Added `ContinuousRequestKvState` in the native continuous batching path.
+- Active continuous batching requests now refresh request KV state after
+  prefill and each decode step.
+- Continuous batching completion logs now include:
+  - `kv_seq_len`
+  - `kv_page_size`
+  - `kv_pages`
+- Physical KV storage is intentionally unchanged in this stage; this stage only
+  makes request-level logical page state explicit and observable.
+- Build passed: `cmake --build build -j`.
+- Unit tests passed: `ctest --test-dir build --output-on-failure`.
+- Diff check passed: `git diff --check`.
+- Paged KV regression passed:
+  - Command output JSON: `/tmp/qw3_stage3_paged_kv.json`
+  - Prompts: `short chinese boundary_24_words`
+  - Page sizes: `16 32`
+  - Allocation modes: `identity reverse`
+  - KV dtype: `fp16`
+  - Result: 12/12 cases passed.
+- Continuous batching regression passed:
+  - Command output JSON: `/tmp/qw3_stage3_cb_rerun2.json`
+  - Evidence: `trace_max_batch=2`, `summary_max_batch=2`,
+    `paged_kv_ready=True`, `hgemm_guard=True`.
+  - Regression JSON contains `kv_seq_len=` from continuous batching logs.
+- Note: one earlier continuous regression run produced a transient exact-output
+  mismatch on the `cuda` prompt; an immediate isolated rerun passed. The failed
+  run did not show HTTP or batching evidence failures.
 
 ## Stage 4: Global KV Page Pool
 
