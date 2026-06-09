@@ -61,6 +61,22 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
 
 QwenExecutor::~QwenExecutor() = default;
 
+QwenExecutor::DecodeStateView QwenExecutor::decode_state_view() const {
+    DecodeStateView view;
+    view.position = position_;
+    view.kv_ctx_size = kv_ctx_size_;
+    view.kv_page_size = kv_pages_.page_size;
+    view.kv_page_count = kv_pages_.count();
+    view.kv_page_indices_host = kv_pages_.host_indices();
+    view.kv_page_indices_device = kv_pages_.device_pages.get();
+    view.k_cache = &k_cache_;
+    view.v_cache = &v_cache_;
+    view.recurrent_states = &recurrent_states_;
+    view.conv_states = &conv_states_;
+    view.hidden = h_.get();
+    return view;
+}
+
 void QwenExecutor::reset_state() {
     for (auto &s : recurrent_states_) {
         if (s) (void) backend_.zero_tensor(*s);

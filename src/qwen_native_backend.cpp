@@ -940,11 +940,13 @@ private:
         std::vector<size_t> active_indices;
         std::vector<uint32_t> feed_tokens;
         std::vector<uint32_t> positions;
+        std::vector<QwenExecutor::DecodeStateView> state_views;
 
         void clear() {
             active_indices.clear();
             feed_tokens.clear();
             positions.clear();
+            state_views.clear();
         }
 
         size_t size() const { return active_indices.size(); }
@@ -1118,11 +1120,29 @@ private:
         batch.active_indices.reserve(active.size());
         batch.feed_tokens.reserve(active.size());
         batch.positions.reserve(active.size());
+        batch.state_views.reserve(active.size());
         for (size_t i = 0; i < active.size(); ++i) {
+            QwenExecutor::DecodeStateView view = active[i].executor->decode_state_view();
             batch.active_indices.push_back(i);
             batch.feed_tokens.push_back(active[i].next_token);
-            batch.positions.push_back(active[i].executor->position());
+            batch.positions.push_back(view.position);
+            batch.state_views.push_back(view);
         }
+    }
+
+    static bool continuous_decode_batch_has_paged_kv(
+            const ContinuousDecodeBatch &batch) {
+        if (batch.size() == 0) return false;
+        for (const auto &view : batch.state_views) {
+            if (view.kv_page_size == 0 ||
+                view.kv_page_count == 0 ||
+                view.kv_page_indices_device == nullptr ||
+                view.k_cache == nullptr ||
+                view.v_cache == nullptr) {
+                return false;
+            }
+        }
+        return true;
     }
 
     void continuous_decode_batch_step(std::vector<ContinuousBatchActive> &active,
@@ -1133,6 +1153,8 @@ private:
             std::ostringstream msg;
             msg << "native continuous_batch_step:"
                 << " batch=" << batch.size()
+                << " paged_kv_ready="
+                << (continuous_decode_batch_has_paged_kv(batch) ? "true" : "false")
                 << " total_batches=" << (cb_decode_batches_.load() + 1)
                 << " total_tokens=" << (cb_decode_tokens_.load() + batch.size());
             log(msg.str());

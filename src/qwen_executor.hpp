@@ -44,6 +44,19 @@ public:
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
         std::vector<std::unique_ptr<DeviceTensor>> conv_states;
     };
+    struct DecodeStateView {
+        uint32_t position = 0;
+        uint32_t kv_ctx_size = 0;
+        uint32_t kv_page_size = 0;
+        uint32_t kv_page_count = 0;
+        const int32_t *kv_page_indices_host = nullptr;
+        const DeviceTensor *kv_page_indices_device = nullptr;
+        const std::vector<std::unique_ptr<DeviceTensor>> *k_cache = nullptr;
+        const std::vector<std::unique_ptr<DeviceTensor>> *v_cache = nullptr;
+        const std::vector<std::unique_ptr<DeviceTensor>> *recurrent_states = nullptr;
+        const std::vector<std::unique_ptr<DeviceTensor>> *conv_states = nullptr;
+        const DeviceTensor *hidden = nullptr;
+    };
 
     QwenExecutor(const QwenNativeModel &model,
                  const QwenWeights &weights,
@@ -54,6 +67,7 @@ public:
     void reset_state();
     uint32_t position() const { return position_; }
     uint32_t kv_ctx_size() const { return kv_ctx_size_; }
+    DecodeStateView decode_state_view() const;
 
     NativeExecutorReport dry_run_token(uint32_t token_id, bool execute_heavy);
     NativeExecutorReport forward_one_token(uint32_t token_id,
