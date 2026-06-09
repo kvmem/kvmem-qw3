@@ -53,13 +53,16 @@ uint32_t mtp_prefix_batch_min_tokens() {
 QwenExecutor::QwenExecutor(const QwenNativeModel &model,
                            const QwenWeights &weights,
                            DeviceBackend &backend,
-                           uint32_t kv_ctx_size)
+                           uint32_t kv_ctx_size,
+                           KvPhysicalPageAllocator *kv_page_allocator)
     : model_(model), weights_(weights), backend_(backend),
       kv_ctx_size_(kv_ctx_size) {
-    kv_pages_.configure(kv_ctx_size_);
+    kv_pages_.configure(kv_ctx_size_, kv_page_allocator);
 }
 
-QwenExecutor::~QwenExecutor() = default;
+QwenExecutor::~QwenExecutor() {
+    kv_pages_.reset();
+}
 
 QwenExecutor::DecodeStateView QwenExecutor::decode_state_view() const {
     DecodeStateView view;
@@ -102,9 +105,11 @@ void QwenExecutor::reset_state() {
     decode_graph_warmup_pending_ = true;
 }
 
-void QwenExecutor::KvPageTable::configure(uint32_t ctx_size) {
+void QwenExecutor::KvPageTable::configure(uint32_t ctx_size,
+                                          KvPhysicalPageAllocator *page_allocator) {
     page_size = std::max<uint32_t>(1, env_uint32_or("QW3_PAGED_KV_PAGE_SIZE", 16));
     max_pages = (ctx_size + page_size - 1) / page_size;
+    allocator = page_allocator;
     alloc_mode = env_lower_ascii(env_value("QW3_PAGED_KV_ALLOC"));
     if (alloc_mode.empty()) alloc_mode = "identity";
     if (alloc_mode != "identity" &&
@@ -117,6 +122,9 @@ void QwenExecutor::KvPageTable::configure(uint32_t ctx_size) {
 }
 
 void QwenExecutor::KvPageTable::reset() {
+    if (allocator && !pages.empty()) {
+        allocator->release_physical_pages(pages);
+    }
     pages.clear();
     device_synced = 0;
 }
@@ -139,7 +147,20 @@ void QwenExecutor::KvPageTable::ensure_pages(DeviceBackend &backend,
     }
     while (pages.size() < need_pages) {
         const uint32_t logical_page = static_cast<uint32_t>(pages.size());
-        pages.push_back(allocate_physical_page(logical_page));
+        const int32_t physical_page =
+            allocator ? allocator->allocate_physical_page()
+                      : allocate_physical_page(logical_page);
+        if (physical_page < 0 ||
+            static_cast<uint32_t>(physical_page) >= max_pages) {
+            if (allocator) {
+                allocator->release_physical_pages(std::vector<int32_t>{physical_page});
+            }
+            throw std::runtime_error(
+                "KV physical page allocation returned out-of-range page " +
+                std::to_string(physical_page) + " for max_pages=" +
+                std::to_string(max_pages));
+        }
+        pages.push_back(physical_page);
     }
     if (!device_pages) {
         device_pages = backend.tensor_i32(std::max<uint32_t>(max_pages, 1),

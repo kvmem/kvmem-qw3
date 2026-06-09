@@ -26,7 +26,7 @@ should be committed separately from unrelated work.
 | 1 | Continuous batching service semantics | Completed | Passed on 2026-06-09 |
 | 2 | Simplified admission control | Completed | Passed on 2026-06-09 |
 | 3 | Request-level paged KV state | Completed | Passed on 2026-06-09 |
-| 4 | Global KV page pool | Pending | Not run |
+| 4 | Global KV page pool | In Progress | 4a passed on 2026-06-09 |
 | 5 | BatchedDecodeExecutor batch=1 parity | Pending | Not run |
 | 6 | Batched greedy decode with FlashInfer paged attention | Pending | Not run |
 | 7 | Chunked prefill and decode interleaving | Pending | Not run |
@@ -260,7 +260,49 @@ Verification:
 
 Completion Notes:
 
-- Pending.
+- In progress.
+- Stage 4a completed on 2026-06-09.
+- Added `KvPhysicalPageAllocator` abstraction.
+- Added a native `GlobalKvPagePool` allocator with free-list based physical
+  page allocation and release.
+- Continuous batching executors now allocate logical page table physical page
+  IDs through the global allocator.
+- Executor `reset_state()` and destruction release allocated page IDs back to
+  the allocator.
+- Completion logs now include:
+  - `kv_pool_used`
+  - `kv_pool_free`
+- Added boundary validation for allocator-returned physical page IDs.
+- Added `QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES`.
+  - In Stage 4a, the configured value is clamped to the per-executor page
+    capacity because K/V tensors are still physically owned by each executor.
+  - Stage 4b must remove this clamp by moving K/V tensor storage to a backend
+    global physical pool.
+- Mapped `global KV page pool exhausted` errors to HTTP 429 for non-stream
+  requests.
+- Build passed: `cmake --build build -j`.
+- Unit tests passed: `ctest --test-dir build --output-on-failure`.
+- Diff check passed: `git diff --check`.
+- Paged KV regression passed:
+  - Command output JSON: `/tmp/qw3_stage4a_paged_kv.json`
+  - Prompts: `short chinese`
+  - Page sizes: `16 32`
+  - Allocation modes: `identity reverse`
+  - KV dtype: `fp16`
+  - Result: 8/8 cases passed.
+- Continuous batching regression passed:
+  - Command output JSON: `/tmp/qw3_stage4a_cb.json`
+  - Evidence: `trace_max_batch=2`, `summary_max_batch=2`,
+    `paged_kv_ready=True`, `hgemm_guard=True`.
+- KV pool exhaustion smoke passed:
+  - Temporary service used `QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES=1` and
+    `QW3_PAGED_KV_PAGE_SIZE=16`.
+  - A chat request that needed more than one page returned
+    `HTTP/1.1 429 Too Many Requests`.
+  - Error message:
+    `global KV page pool exhausted: free=0 total=1 page_size=16`.
+  - A minimal `/v1/completions` request succeeded under the same pool.
+  - Log included `kv_pool_used=1 kv_pool_free=0`.
 
 ## Stage 5: BatchedDecodeExecutor Batch=1 Parity
 

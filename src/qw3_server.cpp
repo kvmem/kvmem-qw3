@@ -74,6 +74,7 @@ void set_error_response(httplib::Response &res,
 int status_for_exception(const std::exception &e) {
     const std::string msg = e.what();
     if (msg.find("admission rejected") != std::string::npos) return 429;
+    if (msg.find("global KV page pool exhausted") != std::string::npos) return 429;
     if (msg.find("prompt exceeds KV context") != std::string::npos) return 413;
     return 500;
 }

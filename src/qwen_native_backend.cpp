@@ -242,6 +242,63 @@ bool continuous_batching_trace_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_TRACE");
 }
 
+class GlobalKvPagePool final : public KvPhysicalPageAllocator {
+public:
+    GlobalKvPagePool(uint32_t total_pages, uint32_t page_size)
+        : total_pages_(total_pages), page_size_(page_size) {
+        free_pages_.reserve(total_pages_);
+        for (uint32_t i = 0; i < total_pages_; ++i) {
+            free_pages_.push_back(static_cast<int32_t>(total_pages_ - 1U - i));
+        }
+    }
+
+    int32_t allocate_physical_page() override {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (free_pages_.empty()) {
+            throw std::runtime_error(
+                "global KV page pool exhausted: free=0 total=" +
+                std::to_string(total_pages_) +
+                " page_size=" + std::to_string(page_size_));
+        }
+        const int32_t page = free_pages_.back();
+        free_pages_.pop_back();
+        ++used_pages_;
+        return page;
+    }
+
+    void release_physical_pages(const std::vector<int32_t> &pages) override {
+        if (pages.empty()) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int32_t page : pages) {
+            if (page < 0 || static_cast<uint32_t>(page) >= total_pages_) {
+                continue;
+            }
+            free_pages_.push_back(page);
+            if (used_pages_ > 0) --used_pages_;
+        }
+    }
+
+    uint32_t free_pages() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return static_cast<uint32_t>(free_pages_.size());
+    }
+
+    uint32_t used_pages() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return used_pages_;
+    }
+
+    uint32_t total_pages() const override { return total_pages_; }
+    uint32_t page_size() const { return page_size_; }
+
+private:
+    uint32_t total_pages_ = 0;
+    uint32_t page_size_ = 0;
+    mutable std::mutex mu_;
+    std::vector<int32_t> free_pages_;
+    uint32_t used_pages_ = 0;
+};
+
 bool mtp_trace_enabled() {
     return env_flag_enabled("QW3_MTP_TRACE");
 }
@@ -835,6 +892,21 @@ public:
         executor_ = std::make_unique<QwenExecutor>(*model_, *weights_, *device_, ctx_size);
         executor_->set_prefill_chunk_override(options_.prefill_chunk);
         executor_->reset_state();
+        const uint32_t kv_page_size =
+            std::max<uint32_t>(1, env_uint32_or("QW3_PAGED_KV_PAGE_SIZE", 16));
+        const uint32_t per_executor_pages = (ctx_size + kv_page_size - 1) / kv_page_size;
+        const uint32_t requested_pool_pages =
+            env_uint32_or("QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES",
+                          per_executor_pages);
+        const uint32_t pool_pages = std::max<uint32_t>(
+            1, std::min<uint32_t>(requested_pool_pages, per_executor_pages));
+        cb_kv_pool_ = std::make_unique<GlobalKvPagePool>(pool_pages, kv_page_size);
+        if (requested_pool_pages != pool_pages) {
+            log("native continuous_batching: clamped KV pool pages from " +
+                std::to_string(requested_pool_pages) + " to " +
+                std::to_string(pool_pages) +
+                " while KV tensors remain per-executor");
+        }
 
         st = device_->end();
         if (!st.ok) throw std::runtime_error(std::string("device end failed: ") + st.message);
@@ -1159,7 +1231,9 @@ private:
                     try {
                         ContinuousBatchActive a;
                         a.req = req;
-                        a.executor = std::make_unique<QwenExecutor>(*model_, *weights_, *device_, ctx_size);
+                        a.executor = std::make_unique<QwenExecutor>(
+                            *model_, *weights_, *device_, ctx_size,
+                            cb_kv_pool_.get());
                         a.executor->set_prefill_chunk_override(options_.prefill_chunk);
                         a.executor->reset_state();
                         a.seen_tokens.reserve(req->prompt_tokens.size() +
@@ -1391,6 +1465,10 @@ private:
             << " kv_seq_len=" << a.kv_state.seq_len
             << " kv_page_size=" << a.kv_state.page_size
             << " kv_pages=" << a.kv_state.logical_pages
+            << " kv_pool_used="
+            << (cb_kv_pool_ ? cb_kv_pool_->used_pages() : 0)
+            << " kv_pool_free="
+            << (cb_kv_pool_ ? cb_kv_pool_->free_pages() : 0)
             << " batch_steps=" << cb_decode_batches_.load()
             << " batch_tokens=" << cb_decode_tokens_.load()
             << " max_batch=" << cb_decode_max_batch_.load();
@@ -2486,6 +2564,7 @@ private:
     std::unique_ptr<QwenWeights> weights_;
     std::unique_ptr<QwenExecutor> executor_;
     std::unique_ptr<QwenTokenizer> tokenizer_;
+    std::unique_ptr<GlobalKvPagePool> cb_kv_pool_;
 
     std::mutex cb_mu_;
     std::condition_variable cb_cv_;

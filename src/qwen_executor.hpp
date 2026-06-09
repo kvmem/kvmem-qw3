@@ -21,6 +21,16 @@ struct NativeExecutorReport {
     std::vector<std::string> missing_kernels;
 };
 
+class KvPhysicalPageAllocator {
+public:
+    virtual ~KvPhysicalPageAllocator() = default;
+    virtual int32_t allocate_physical_page() = 0;
+    virtual void release_physical_pages(const std::vector<int32_t> &pages) = 0;
+    virtual uint32_t free_pages() const = 0;
+    virtual uint32_t used_pages() const = 0;
+    virtual uint32_t total_pages() const = 0;
+};
+
 /* Per-session executor.
  *
  * Owns transient device-resident scratch buffers (h, norm, attn_out, ffn_*,
@@ -68,7 +78,8 @@ public:
     QwenExecutor(const QwenNativeModel &model,
                  const QwenWeights &weights,
                  DeviceBackend &backend,
-                 uint32_t kv_ctx_size);
+                 uint32_t kv_ctx_size,
+                 KvPhysicalPageAllocator *kv_page_allocator = nullptr);
     ~QwenExecutor();
 
     void reset_state();
@@ -145,9 +156,10 @@ private:
         std::string alloc_mode = "identity";
         std::vector<int32_t> pages;
         std::unique_ptr<DeviceTensor> device_pages;
+        KvPhysicalPageAllocator *allocator = nullptr;
         uint32_t device_synced = 0;
 
-        void configure(uint32_t ctx_size);
+        void configure(uint32_t ctx_size, KvPhysicalPageAllocator *page_allocator);
         void reset();
         void ensure_pages(DeviceBackend &backend, uint32_t ctx_size,
                           uint32_t logical_pos, uint32_t count);
