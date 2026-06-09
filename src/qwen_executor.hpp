@@ -117,6 +117,25 @@ public:
     bool copy_last_logits(std::vector<float> &out) const;
 
 private:
+    struct KvPageTable {
+        uint32_t page_size = 16;
+        uint32_t max_pages = 0;
+        std::string alloc_mode = "identity";
+        std::vector<int32_t> pages;
+        std::unique_ptr<DeviceTensor> device_pages;
+        uint32_t device_synced = 0;
+
+        void configure(uint32_t ctx_size);
+        void reset();
+        void ensure_pages(DeviceBackend &backend, uint32_t ctx_size,
+                          uint32_t logical_pos, uint32_t count);
+        int32_t allocate_physical_page(uint32_t logical_page) const;
+        const int32_t *host_indices() const { return pages.data(); }
+        const DeviceTensor &device_indices() const { return *device_pages; }
+        uint32_t count() const { return static_cast<uint32_t>(pages.size()); }
+        uint64_t physical_slots() const;
+    };
+
     void begin_record_timing(bool enabled) const;
     void record(NativeExecutorReport &report, const std::string &op) const;
     void ensure_scratch();
@@ -124,10 +143,10 @@ private:
     void ensure_mtp_batch_scratch(uint32_t batch);
     void ensure_logits_batch_scratch(uint32_t batch);
     void ensure_kv_pages(uint32_t logical_pos, uint32_t count);
-    int32_t allocate_kv_physical_page(uint32_t logical_page) const;
-    const int32_t *kv_page_indices() const { return kv_page_indices_.data(); }
-    const DeviceTensor &kv_page_indices_device() const { return *kv_page_indices_dev_; }
-    uint32_t kv_page_count() const { return static_cast<uint32_t>(kv_page_indices_.size()); }
+    const int32_t *kv_page_indices() const { return kv_pages_.host_indices(); }
+    const DeviceTensor &kv_page_indices_device() const { return kv_pages_.device_indices(); }
+    uint32_t kv_page_count() const { return kv_pages_.count(); }
+    uint32_t kv_page_size() const { return kv_pages_.page_size; }
     NativeExecutorReport forward_mtp_draft_from(uint32_t token_id,
                                                 const DeviceTensor &h_input,
                                                 uint32_t rope_pos,
@@ -234,12 +253,7 @@ private:
     uint32_t kv_ctx_size_ = 0;
     uint32_t position_ = 0;
     int      prefill_chunk_override_ = -1;
-    uint32_t kv_page_size_ = 16;
-    uint32_t kv_max_pages_ = 0;
-    std::string kv_alloc_mode_;
-    std::vector<int32_t> kv_page_indices_;
-    std::unique_ptr<DeviceTensor> kv_page_indices_dev_;
-    uint32_t kv_page_indices_dev_synced_ = 0;
+    KvPageTable kv_pages_;
 
     // Set by reset_state() and cleared after the first eager forward_one_token
     // call of a generate() session. Suppresses CUDA-graph capture on token 0
