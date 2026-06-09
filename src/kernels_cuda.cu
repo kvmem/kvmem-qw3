@@ -710,6 +710,7 @@ struct CudaTensor final : DeviceTensor {
     bool is_fp8_kv() const { return fp8_kv; }
     __half *ptr_h() const { return reinterpret_cast<__half *>(ptr); }
     int8_t *ptr_i8() const { return reinterpret_cast<int8_t *>(ptr); }
+    int32_t *ptr_i32() const { return reinterpret_cast<int32_t *>(ptr); }
     __nv_fp8_e4m3 *ptr_fp8() const { return reinterpret_cast<__nv_fp8_e4m3 *>(ptr); }
 };
 
@@ -2714,6 +2715,27 @@ public:
         return std::make_unique<CudaTensor>(count, label);
     }
 
+    std::unique_ptr<DeviceTensor> tensor_i32(uint64_t count, const char *label) override {
+        return std::make_unique<CudaTensor>(count, label, sizeof(int32_t));
+    }
+
+    DeviceStatus copy_i32_from_host(DeviceTensor &dst,
+                                    uint64_t dst_offset,
+                                    const int32_t *src,
+                                    uint64_t count) override {
+        if (count == 0) return {};
+        if (!src) return {false, "copy_i32_from_host null src"};
+        auto &d = as_tensor(dst);
+        if (d.elem_size != sizeof(int32_t)) return {false, "copy_i32_from_host dtype mismatch"};
+        if (dst_offset + count > d.count) return {false, "copy_i32_from_host dst oob"};
+        return cuda_status(cudaMemcpyAsync(d.ptr_i32() + dst_offset,
+                                           src,
+                                           static_cast<size_t>(count) * sizeof(int32_t),
+                                           cudaMemcpyHostToDevice,
+                                           exec_stream_),
+                           "copy_i32_from_host");
+    }
+
     std::unique_ptr<DeviceTensor> scratch_f32(uint64_t count, const char *label) override {
         return std::make_unique<CudaTensor>(count, label, sizeof(float),
                                             /*zero_initialize=*/false);
@@ -4187,6 +4209,51 @@ public:
         return launch_status("cuda kv_append_batch_paged");
     }
 
+    DeviceStatus kv_append_batch_paged_device(DeviceTensor &cache,
+                                              const DeviceTensor &src,
+                                              uint32_t base_logical_pos,
+                                              uint32_t per_pos_size,
+                                              uint32_t batch,
+                                              const DeviceTensor &page_indices,
+                                              uint32_t n_pages,
+                                              uint32_t page_size) override {
+        if (batch == 0) return {};
+        if (page_size == 0) return {false, "kv_append_batch_paged_device page_size=0"};
+        const uint32_t need_pages =
+            (base_logical_pos + batch + page_size - 1) / page_size;
+        if (need_pages > n_pages) return {false, "kv_append_batch_paged_device page table too small"};
+        const auto &pages = as_tensor(page_indices);
+        if (pages.elem_size != sizeof(int32_t)) return {false, "kv_append_batch_paged_device dtype mismatch"};
+        if (pages.count < n_pages) return {false, "kv_append_batch_paged_device page tensor too small"};
+
+        auto &c = as_tensor(cache);
+        const auto &s = as_tensor(src);
+        const unsigned threads = 256;
+        const unsigned blocks = (per_pos_size + threads - 1) / threads;
+        dim3 grid(batch, blocks);
+        if (c.is_q8_kv()) {
+            const uint32_t row_elems = c.q8_row_elems;
+            const uint32_t rows = per_pos_size / row_elems;
+            dim3 qgrid(batch, rows);
+            kv_append_paged_kernel_q8<<<qgrid, row_elems, row_elems * sizeof(float), exec_stream_>>>(
+                c.ptr_i8(), c.scale, s.ptr, base_logical_pos, per_pos_size,
+                row_elems, per_pos_size, pages.ptr_i32(), page_size);
+        } else if (c.is_fp8_kv()) {
+            kv_append_paged_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr_fp8(), s.ptr, base_logical_pos, per_pos_size, per_pos_size,
+                pages.ptr_i32(), page_size);
+        } else if (c.is_fp16()) {
+            kv_append_paged_kernel_f16<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr_h(), s.ptr, base_logical_pos, per_pos_size, per_pos_size,
+                pages.ptr_i32(), page_size);
+        } else {
+            kv_append_paged_kernel<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr, s.ptr, base_logical_pos, per_pos_size, per_pos_size,
+                pages.ptr_i32(), page_size);
+        }
+        return launch_status("cuda kv_append_batch_paged_device");
+    }
+
     DeviceStatus ensure_fattn_scratch(uint32_t n_heads, uint32_t batch,
                                        uint32_t head_dim, uint32_t seq_len) {
         const size_t need = ported::fattn_vec_scratch_bytes(n_heads, batch,
@@ -5269,6 +5336,134 @@ public:
             logical_page_indices, n_pages, page_size,
             n_heads, n_kv_heads, head_dim, base_seq_len, batch,
             q_batch_stride, out_batch_stride, scale);
+    }
+
+    DeviceStatus attention_decode_batch_paged_gated_device(
+                                              DeviceTensor &out,
+                                              const DeviceTensor &q,
+                                              uint32_t q_stride,
+                                              const DeviceTensor &k_cache,
+                                              const DeviceTensor &v_cache,
+                                              const DeviceTensor &page_indices,
+                                              uint32_t n_pages,
+                                              uint32_t page_size,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim,
+                                              uint32_t base_seq_len,
+                                              uint32_t batch,
+                                              uint32_t q_batch_stride,
+                                              uint32_t out_batch_stride,
+                                              float scale) override {
+        if (batch == 0) return {};
+        if (batch != 1) {
+            return {false, "paged device attention currently supports batch=1"};
+        }
+        if (n_pages == 0 || page_size == 0) {
+            return {false, "paged device attention requires a non-empty page table"};
+        }
+        const uint32_t seq_len = base_seq_len + 1;
+        const uint32_t need_pages = (seq_len + page_size - 1) / page_size;
+        if (need_pages > n_pages) return {false, "paged device attention page table too small"};
+
+        auto &o = as_tensor(out);
+        const auto &qq = as_tensor(q);
+        const auto &kc = as_tensor(k_cache);
+        const auto &vc = as_tensor(v_cache);
+        const auto &pages = as_tensor(page_indices);
+        if (pages.elem_size != sizeof(int32_t) || pages.count < n_pages) {
+            return {false, "paged device attention page tensor invalid"};
+        }
+
+#if QW3_ENABLE_FLASHINFER
+        if (decode_flashinfer_attention_enabled() &&
+            kc.is_fp16() &&
+            (head_dim == 128 || head_dim == 256)) {
+            const uint32_t chunk_size =
+                flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
+                    n_heads, n_kv_heads, head_dim, batch, seq_len);
+            const bool partition_kv = flashinfer_batch_decode_partition_enabled();
+            if (chunk_size > 0) {
+                std::vector<int32_t> request_indices;
+                std::vector<int32_t> kv_tile_indices;
+                const uint32_t tiles = partition_kv
+                    ? std::max<uint32_t>((seq_len + chunk_size - 1) / chunk_size, 1U)
+                    : 1U;
+                request_indices.reserve(tiles);
+                kv_tile_indices.reserve(tiles);
+                for (uint32_t t = 0; t < tiles; ++t) {
+                    request_indices.push_back(0);
+                    kv_tile_indices.push_back(static_cast<int32_t>(t));
+                }
+                const uint32_t total_tiles = static_cast<uint32_t>(request_indices.size());
+                const int32_t o_indptr_host[2] = {0, static_cast<int32_t>(total_tiles)};
+
+                std::vector<int32_t> meta;
+                const uint64_t page_indptr_offset = meta.size();
+                meta.push_back(0);
+                meta.push_back(static_cast<int32_t>(need_pages));
+                const uint64_t last_page_len_offset = meta.size();
+                const uint32_t used_in_last = seq_len - (need_pages - 1U) * page_size;
+                meta.push_back(static_cast<int32_t>(used_in_last));
+                const uint64_t request_indices_offset = meta.size();
+                meta.insert(meta.end(), request_indices.begin(), request_indices.end());
+                const uint64_t kv_tile_indices_offset = meta.size();
+                meta.insert(meta.end(), kv_tile_indices.begin(), kv_tile_indices.end());
+                const uint64_t o_indptr_offset = meta.size();
+                meta.push_back(o_indptr_host[0]);
+                meta.push_back(o_indptr_host[1]);
+                const uint64_t kv_chunk_size_offset = meta.size();
+                meta.push_back(static_cast<int32_t>(chunk_size));
+
+                const uint64_t o_elems_batch =
+                    static_cast<uint64_t>(batch) * n_heads * head_dim;
+                const uint64_t tmp_v_elems = partition_kv
+                    ? static_cast<uint64_t>(total_tiles) * n_heads * head_dim
+                    : 0;
+                const uint64_t tmp_s_elems = partition_kv
+                    ? static_cast<uint64_t>(total_tiles) * n_heads
+                    : 0;
+                if (auto st = ensure_flashinfer_batch_decode_workspace(
+                        o_elems_batch, tmp_v_elems, tmp_s_elems,
+                        static_cast<uint64_t>(meta.size())); !st.ok) {
+                    return st;
+                }
+                if (auto st = cuda_status(
+                        cudaMemcpyAsync(flashinfer_batch_decode_meta_i32_,
+                                        meta.data(),
+                                        meta.size() * sizeof(int32_t),
+                                        cudaMemcpyHostToDevice,
+                                        exec_stream_),
+                        "flashinfer paged device decode metadata copy"); !st.ok) {
+                    return st;
+                }
+
+                int32_t *meta_d = flashinfer_batch_decode_meta_i32_;
+                if (flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
+                        o.ptr, flashinfer_batch_decode_o_f16_,
+                        flashinfer_batch_decode_tmp_v_,
+                        flashinfer_batch_decode_tmp_s_,
+                        qq.ptr, q_stride, kc.ptr, vc.ptr,
+                        pages.ptr_i32(),
+                        meta_d + page_indptr_offset,
+                        meta_d + last_page_len_offset,
+                        meta_d + request_indices_offset,
+                        meta_d + kv_tile_indices_offset,
+                        meta_d + o_indptr_offset,
+                        o_indptr_host,
+                        meta_d + kv_chunk_size_offset,
+                        partition_kv,
+                        flashinfer_batch_decode_rowwise_merge_enabled(),
+                        page_size, total_tiles,
+                        n_heads, n_kv_heads, head_dim, batch,
+                        q_batch_stride, out_batch_stride, scale,
+                        exec_stream_)) {
+                    return launch_status("cuda attention_decode_batch flashinfer paged device decode gated");
+                }
+            }
+        }
+#endif
+        return {false, "paged device attention requires FlashInfer FP16 batch decode"};
     }
 
     DeviceStatus attention_decode_batch_gated(DeviceTensor &out,

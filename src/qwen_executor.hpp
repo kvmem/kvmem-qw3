@@ -126,6 +126,7 @@ private:
     void ensure_kv_pages(uint32_t logical_pos, uint32_t count);
     int32_t allocate_kv_physical_page(uint32_t logical_page) const;
     const int32_t *kv_page_indices() const { return kv_page_indices_.data(); }
+    const DeviceTensor &kv_page_indices_device() const { return *kv_page_indices_dev_; }
     uint32_t kv_page_count() const { return static_cast<uint32_t>(kv_page_indices_.size()); }
     NativeExecutorReport forward_mtp_draft_from(uint32_t token_id,
                                                 const DeviceTensor &h_input,
@@ -237,6 +238,8 @@ private:
     uint32_t kv_max_pages_ = 0;
     std::string kv_alloc_mode_;
     std::vector<int32_t> kv_page_indices_;
+    std::unique_ptr<DeviceTensor> kv_page_indices_dev_;
+    uint32_t kv_page_indices_dev_synced_ = 0;
 
     // Set by reset_state() and cleared after the first eager forward_one_token
     // call of a generate() session. Suppresses CUDA-graph capture on token 0

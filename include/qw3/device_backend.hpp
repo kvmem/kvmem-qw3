@@ -78,6 +78,16 @@ public:
     virtual DeviceStatus replay_graph() { return {}; }
 
     virtual std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) = 0;
+    virtual std::unique_ptr<DeviceTensor> tensor_i32(uint64_t count, const char *label) {
+        return tensor_f32(count, label);
+    }
+    virtual DeviceStatus copy_i32_from_host(DeviceTensor &dst,
+                                           uint64_t dst_offset,
+                                           const int32_t *src,
+                                           uint64_t count) {
+        (void)dst; (void)dst_offset; (void)src; (void)count;
+        return {false, "copy_i32_from_host not implemented for this backend"};
+    }
     // Optional FP16 tensor. Backends that don't override fall back to FP32 —
     // call sites should be prepared for that and treat the returned tensor
     // as FP32 (i.e. don't blindly assume FP16 storage). The KV cache uses
@@ -518,6 +528,19 @@ public:
         return {};
     }
 
+    virtual DeviceStatus kv_append_batch_paged_device(DeviceTensor &cache,
+                                                      const DeviceTensor &src,
+                                                      uint32_t base_logical_pos,
+                                                      uint32_t per_pos_size,
+                                                      uint32_t batch,
+                                                      const DeviceTensor &page_indices,
+                                                      uint32_t n_pages,
+                                                      uint32_t page_size) {
+        (void)cache; (void)src; (void)base_logical_pos; (void)per_pos_size;
+        (void)batch; (void)page_indices; (void)n_pages; (void)page_size;
+        return {false, "kv_append_batch_paged_device requires backend override"};
+    }
+
     // Decode-step attention: causal scaled dot-product over the live KV cache.
     //   out[head, d]     = sum_t softmax(q_head . K[t, kv_head] * scale) * V[t, kv_head, d]
     // where kv_head = head / (n_heads / n_kv_heads).
@@ -650,6 +673,30 @@ public:
                                             base_seq_len, batch,
                                             q_batch_stride, out_batch_stride,
                                             scale);
+    }
+
+    virtual DeviceStatus attention_decode_batch_paged_gated_device(
+                                                      DeviceTensor &out,
+                                                      const DeviceTensor &q,
+                                                      uint32_t q_stride,
+                                                      const DeviceTensor &k_cache,
+                                                      const DeviceTensor &v_cache,
+                                                      const DeviceTensor &page_indices,
+                                                      uint32_t n_pages,
+                                                      uint32_t page_size,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t head_dim,
+                                                      uint32_t base_seq_len,
+                                                      uint32_t batch,
+                                                      uint32_t q_batch_stride,
+                                                      uint32_t out_batch_stride,
+                                                      float scale) {
+        (void)out; (void)q; (void)q_stride; (void)k_cache; (void)v_cache;
+        (void)page_indices; (void)n_pages; (void)page_size; (void)n_heads;
+        (void)n_kv_heads; (void)head_dim; (void)base_seq_len; (void)batch;
+        (void)q_batch_stride; (void)out_batch_stride; (void)scale;
+        return {false, "attention_decode_batch_paged_gated_device requires backend override"};
     }
 
     // Zero all floats in tensor. Used to reset KV / recurrent state between

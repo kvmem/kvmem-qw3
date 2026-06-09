@@ -81,6 +81,7 @@ void QwenExecutor::reset_state() {
     // overwrites slot 0 (the seq_len passed to attention_decode is position+1).
     position_ = 0;
     kv_page_indices_.clear();
+    kv_page_indices_dev_synced_ = 0;
     mtp_prefix_len_ = 0;
     decode_graph_warmup_pending_ = true;
 }
@@ -101,6 +102,19 @@ void QwenExecutor::ensure_kv_pages(uint32_t logical_pos, uint32_t count) {
     while (kv_page_indices_.size() < need_pages) {
         const uint32_t logical_page = static_cast<uint32_t>(kv_page_indices_.size());
         kv_page_indices_.push_back(allocate_kv_physical_page(logical_page));
+    }
+    if (!kv_page_indices_dev_) {
+        kv_page_indices_dev_ = backend_.tensor_i32(std::max<uint32_t>(kv_max_pages_, 1),
+                                                   "kv_page_indices");
+        kv_page_indices_dev_synced_ = 0;
+    }
+    const uint32_t have_pages = static_cast<uint32_t>(kv_page_indices_.size());
+    if (kv_page_indices_dev_synced_ < have_pages) {
+        const uint32_t start = kv_page_indices_dev_synced_;
+        const uint32_t count_new = have_pages - start;
+        require_status(backend_.copy_i32_from_host(
+            *kv_page_indices_dev_, start, kv_page_indices_.data() + start, count_new));
+        kv_page_indices_dev_synced_ = have_pages;
     }
 }
 
@@ -537,19 +551,19 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
 
             // Append K and V to the live cache.
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-            require_status(backend_.kv_append_batch_paged(
+            require_status(backend_.kv_append_batch_paged_device(
                 *k_cache_[il], *k_, position_, per_pos, 1,
-                kv_page_indices(), kv_page_count(), kv_page_size_));
-            require_status(backend_.kv_append_batch_paged(
+                kv_page_indices_device(), kv_page_count(), kv_page_size_));
+            require_status(backend_.kv_append_batch_paged_device(
                 *v_cache_[il], *v_, position_, per_pos, 1,
-                kv_page_indices(), kv_page_count(), kv_page_size_));
+                kv_page_indices_device(), kv_page_count(), kv_page_size_));
             record(report, "layer." + std::to_string(il) + ".kv_append_paged");
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-            require_status(backend_.attention_decode_batch_paged_gated(
+            require_status(backend_.attention_decode_batch_paged_gated_device(
                 *mid_, *q_, 2 * standard_head_dim,
                 *k_cache_[il], *v_cache_[il],
-                kv_page_indices(), kv_page_count(), kv_page_size_,
+                kv_page_indices_device(), kv_page_count(), kv_page_size_,
                 standard_n_heads, standard_n_kv_heads, standard_head_dim,
                 position_, 1,
                 standard_n_heads * 2 * standard_head_dim,
@@ -895,22 +909,32 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                         cfg.rope_dim, base_pos, cfg.rope_theta));
 
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-            require_status(backend_.kv_append_batch_paged(
+            require_status(backend_.kv_append_batch_paged_device(
                 *k_cache_[il], *k_batch_, base_pos, per_pos, batch,
-                kv_page_indices(), kv_page_count(), kv_page_size_));
-            require_status(backend_.kv_append_batch_paged(
+                kv_page_indices_device(), kv_page_count(), kv_page_size_));
+            require_status(backend_.kv_append_batch_paged_device(
                 *v_cache_[il], *v_batch_, base_pos, per_pos, batch,
-                kv_page_indices(), kv_page_count(), kv_page_size_));
+                kv_page_indices_device(), kv_page_count(), kv_page_size_));
             if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch_paged");
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-            require_status(backend_.attention_decode_batch_paged_gated(
-                *mid_batch_, *q_batch_, 2 * standard_head_dim,
-                *k_cache_[il], *v_cache_[il],
-                kv_page_indices(), kv_page_count(), kv_page_size_,
-                standard_n_heads, standard_n_kv_heads,
-                standard_head_dim, base_pos, batch,
-                q_stride_buf, mid_stride, scale));
+            if (batch == 1) {
+                require_status(backend_.attention_decode_batch_paged_gated_device(
+                    *mid_batch_, *q_batch_, 2 * standard_head_dim,
+                    *k_cache_[il], *v_cache_[il],
+                    kv_page_indices_device(), kv_page_count(), kv_page_size_,
+                    standard_n_heads, standard_n_kv_heads,
+                    standard_head_dim, base_pos, batch,
+                    q_stride_buf, mid_stride, scale));
+            } else {
+                require_status(backend_.attention_decode_batch_paged_gated(
+                    *mid_batch_, *q_batch_, 2 * standard_head_dim,
+                    *k_cache_[il], *v_cache_[il],
+                    kv_page_indices(), kv_page_count(), kv_page_size_,
+                    standard_n_heads, standard_n_kv_heads,
+                    standard_head_dim, base_pos, batch,
+                    q_stride_buf, mid_stride, scale));
+            }
             if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch_paged");
 
             require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.attn_output, *mid_batch_,
