@@ -24,7 +24,7 @@ should be committed separately from unrelated work.
 | --- | --- | --- | --- |
 | 0 | Baseline freeze and regression harness | Completed | Passed on 2026-06-09 |
 | 1 | Continuous batching service semantics | Completed | Passed on 2026-06-09 |
-| 2 | Simplified admission control | Pending | Not run |
+| 2 | Simplified admission control | Completed | Passed on 2026-06-09 |
 | 3 | Request-level paged KV state | Pending | Not run |
 | 4 | Global KV page pool | Pending | Not run |
 | 5 | BatchedDecodeExecutor batch=1 parity | Pending | Not run |
@@ -160,7 +160,34 @@ Verification:
 
 Completion Notes:
 
-- Pending.
+- Completed on 2026-06-09.
+- Added `QW3_CONTINUOUS_BATCHING_MAX_PENDING`, default `128`.
+- Added `QW3_CONTINUOUS_BATCHING_MAX_TOTAL_TOKENS`.
+  - Default budget is `ctx_size * QW3_CONTINUOUS_BATCHING_MAX_ACTIVE`.
+  - Setting the env var to `0` disables the token budget.
+- Each continuous batching request now reserves
+  `prompt_tokens + max_tokens` at admission.
+- Reserved token budget is released on finish, error, zero-decode completion,
+  and worker failure.
+- Non-stream admission failures now return HTTP 429 with a clear error message.
+- Over-context prompts map to HTTP 413.
+- Negative admission smoke passed:
+  - Temporary service used `QW3_CONTINUOUS_BATCHING_MAX_TOTAL_TOKENS=64`.
+  - Request with reservation `105` returned:
+    `HTTP/1.1 429 Too Many Requests`.
+  - Error message:
+    `continuous batching admission rejected: request token reservation 105 exceeds total token budget 64`.
+- Positive admission smoke passed under the same service:
+  - Small request returned `HTTP/1.1 200 OK`.
+  - Usage was `completion_tokens=1`, `prompt_tokens=20`,
+    `total_tokens=21`.
+- Build passed: `cmake --build build -j`.
+- Unit tests passed: `ctest --test-dir build --output-on-failure`.
+- Diff check passed: `git diff --check`.
+- Continuous batching regression passed:
+  - Command output JSON: `/tmp/qw3_stage2_cb.json`
+  - Evidence: `trace_max_batch=2`, `summary_max_batch=2`,
+    `paged_kv_ready=True`, `hgemm_guard=True`.
 
 ## Stage 3: Request-Level Paged KV State
 

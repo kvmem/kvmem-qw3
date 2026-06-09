@@ -71,6 +71,13 @@ void set_error_response(httplib::Response &res,
     res.set_content(dump_json(json{{"error", message}}), "application/json");
 }
 
+int status_for_exception(const std::exception &e) {
+    const std::string msg = e.what();
+    if (msg.find("admission rejected") != std::string::npos) return 429;
+    if (msg.find("prompt exceeds KV context") != std::string::npos) return 413;
+    return 500;
+}
+
 std::string replacement_char() {
     return "\xEF\xBF\xBD";
 }
@@ -930,7 +937,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         } catch (const std::exception &e) {
             std::cerr << "[qw3-serve] #" << rid << " chat error="
                       << e.what() << "\n";
-            set_error_response(res, 500, e.what());
+            set_error_response(res, status_for_exception(e), e.what());
             return;
         }
         if (enable_thinking) text = "<think>\n" + text;
@@ -1029,7 +1036,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         } catch (const std::exception &e) {
             std::cerr << "[qw3-serve] #" << rid << " completion error="
                       << e.what() << "\n";
-            set_error_response(res, 500, e.what());
+            set_error_response(res, status_for_exception(e), e.what());
             return;
         }
         std::string utf8_pending;

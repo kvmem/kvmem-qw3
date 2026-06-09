@@ -226,6 +226,18 @@ uint32_t continuous_batching_max_active() {
     return std::max<uint32_t>(1, env_uint32_or("QW3_CONTINUOUS_BATCHING_MAX_ACTIVE", 2));
 }
 
+uint32_t continuous_batching_max_pending() {
+    return std::max<uint32_t>(1, env_uint32_or("QW3_CONTINUOUS_BATCHING_MAX_PENDING", 128));
+}
+
+uint64_t continuous_batching_max_total_tokens(uint32_t ctx_size, uint32_t max_active) {
+    const uint64_t default_budget =
+        static_cast<uint64_t>(ctx_size) * static_cast<uint64_t>(max_active);
+    const uint64_t configured =
+        env_uint64_or("QW3_CONTINUOUS_BATCHING_MAX_TOTAL_TOKENS", default_budget);
+    return configured == 0 ? std::numeric_limits<uint64_t>::max() : configured;
+}
+
 bool continuous_batching_trace_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_TRACE");
 }
@@ -935,6 +947,8 @@ private:
         std::vector<uint32_t> prompt_tokens;
         GenerationOptions options;
         TokenCallback on_text;
+        uint64_t reserved_tokens = 0;
+        bool budget_released = false;
 
         std::mutex mu;
         std::condition_variable cv;
@@ -1007,8 +1021,39 @@ private:
         req->prompt_tokens = prompt_tokens;
         req->options = options;
         req->on_text = on_text;
+        req->reserved_tokens =
+            static_cast<uint64_t>(prompt_tokens.size()) +
+            static_cast<uint64_t>(std::max(0, options.max_tokens));
+        const uint32_t ctx_size = options_.ctx_size > 0
+            ? static_cast<uint32_t>(options_.ctx_size)
+            : 4096u;
+        const uint32_t max_active = continuous_batching_max_active();
+        const uint32_t max_pending = continuous_batching_max_pending();
+        const uint64_t max_total_tokens =
+            continuous_batching_max_total_tokens(ctx_size, max_active);
         {
             std::lock_guard<std::mutex> lk(cb_mu_);
+            if (cb_pending_.size() >= max_pending) {
+                throw std::runtime_error(
+                    "continuous batching admission rejected: pending queue full (" +
+                    std::to_string(cb_pending_.size()) + "/" +
+                    std::to_string(max_pending) + ")");
+            }
+            if (req->reserved_tokens > max_total_tokens) {
+                throw std::runtime_error(
+                    "continuous batching admission rejected: request token reservation " +
+                    std::to_string(req->reserved_tokens) +
+                    " exceeds total token budget " +
+                    std::to_string(max_total_tokens));
+            }
+            if (cb_reserved_tokens_ + req->reserved_tokens > max_total_tokens) {
+                throw std::runtime_error(
+                    "continuous batching admission rejected: total token budget exhausted " +
+                    std::to_string(cb_reserved_tokens_) + "+" +
+                    std::to_string(req->reserved_tokens) + ">" +
+                    std::to_string(max_total_tokens));
+            }
+            cb_reserved_tokens_ += req->reserved_tokens;
             cb_pending_.push_back(req);
         }
         cb_cv_.notify_one();
@@ -1022,6 +1067,7 @@ private:
     void complete_continuous_request(const std::shared_ptr<ContinuousBatchRequest> &req,
                                      std::string generated,
                                      std::string error = {}) {
+        release_continuous_request_budget(req);
         {
             std::lock_guard<std::mutex> lk(req->mu);
             req->generated = std::move(generated);
@@ -1029,6 +1075,17 @@ private:
             req->done = true;
         }
         req->cv.notify_one();
+    }
+
+    void release_continuous_request_budget(
+            const std::shared_ptr<ContinuousBatchRequest> &req) {
+        std::lock_guard<std::mutex> lk(cb_mu_);
+        if (req->budget_released) return;
+        req->budget_released = true;
+        cb_reserved_tokens_ =
+            req->reserved_tokens > cb_reserved_tokens_
+                ? 0
+                : cb_reserved_tokens_ - req->reserved_tokens;
     }
 
     void log_zero_decode_diagnostic(const char *path,
@@ -1056,11 +1113,11 @@ private:
     }
 
     void continuous_batch_worker_loop() {
+        std::vector<ContinuousBatchActive> active;
         try {
             DeviceStatus st = device_->begin();
             if (!st.ok) throw std::runtime_error(st.message);
 
-            std::vector<ContinuousBatchActive> active;
             const uint32_t ctx_size = options_.ctx_size > 0
                 ? static_cast<uint32_t>(options_.ctx_size)
                 : 4096u;
@@ -1156,6 +1213,9 @@ private:
             while (!pending.empty()) {
                 complete_continuous_request(pending.front(), {}, e.what());
                 pending.pop_front();
+            }
+            for (auto &a : active) {
+                if (a.req) complete_continuous_request(a.req, {}, e.what());
             }
             log(std::string("native continuous_batching: worker_failed reason=\"") +
                 e.what() + "\"");
@@ -2412,6 +2472,7 @@ private:
     bool cb_running_ = false;
     bool cb_stop_ = false;
     std::atomic<uint64_t> cb_request_counter_{0};
+    uint64_t cb_reserved_tokens_ = 0;
     std::atomic<uint64_t> cb_decode_batches_{0};
     std::atomic<uint64_t> cb_decode_tokens_{0};
     std::atomic<uint32_t> cb_decode_max_batch_{0};
