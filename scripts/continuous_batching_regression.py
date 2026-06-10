@@ -248,6 +248,7 @@ def run_server_case(*,
                     concurrent: bool,
                     continuous_batching: bool,
                     max_active: int,
+                    continuous_env: Dict[str, str],
                     extra_args: Sequence[str]) -> ServerRun:
     env = os.environ.copy()
     if continuous_batching:
@@ -256,6 +257,7 @@ def run_server_case(*,
         env["QW3_CONTINUOUS_BATCHING_MAX_ACTIVE"] = str(max_active)
         if os.environ.get("QW3_TEST_ENABLE_BODY_BATCH") == "1":
             env["QW3_CONTINUOUS_BATCHING_BODY_BATCH"] = "1"
+        env.update(continuous_env)
     else:
         env.pop("QW3_CONTINUOUS_BATCHING", None)
         env.pop("QW3_CONTINUOUS_BATCHING_TRACE", None)
@@ -409,6 +411,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=[],
         help="extra argument passed to qw3 serve; repeat for multiple args",
     )
+    ap.add_argument(
+        "--continuous-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra environment variable for the continuous run only",
+    )
     args = ap.parse_args(argv)
 
     binary = Path(args.qw3)
@@ -435,6 +444,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     prompts = {name: catalog[name] for name in args.prompts}
     port = args.port if args.port else free_port()
+    continuous_env: Dict[str, str] = {}
+    for item in args.continuous_env:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise SystemExit(f"invalid --continuous-env value: {item!r}")
+        continuous_env[key] = value
 
     print(
         f"running continuous batching regression: prompts={len(prompts)} "
@@ -458,6 +473,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         concurrent=False,
         continuous_batching=False,
         max_active=args.max_active,
+        continuous_env={},
         extra_args=args.extra_arg,
     )
     for result in baseline.results:
@@ -477,6 +493,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         concurrent=True,
         continuous_batching=True,
         max_active=args.max_active,
+        continuous_env=continuous_env,
         extra_args=args.extra_arg,
     )
     for result in continuous.results:

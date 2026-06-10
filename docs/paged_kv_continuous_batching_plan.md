@@ -28,7 +28,7 @@ should be committed separately from unrelated work.
 | 3 | Request-level paged KV state | Completed | Passed on 2026-06-09 |
 | 4 | Global KV page pool | Completed | Passed on 2026-06-09 |
 | 5 | BatchedDecodeExecutor batch=1 parity | Completed | Passed on 2026-06-10 |
-| 6 | Batched greedy decode with FlashInfer paged attention | In Progress | Ragged backend path passed on 2026-06-10 |
+| 6 | Batched greedy decode with FlashInfer paged attention | In Progress | Recurrent body-batch parity passed on 2026-06-10 |
 | 7 | Chunked prefill and decode interleaving | Completed | Passed on 2026-06-10 |
 | 8 | Batched sampling optimization | Pending | Not run |
 
@@ -497,14 +497,29 @@ Completion Notes:
     - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
     - Default body-batch with recurrent batching disabled:
       `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_recurrent_default_fp16_cb.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed.
-    - Experimental recurrent batching enabled failed exact parity:
-      `/tmp/qw3_stage6_recurrent_independent_fp16_cb.json` and
-      `/tmp/qw3_stage6_recurrent_independent_fp16_cb3.json` both diverged on
-      `capital` and `math`. Short-test latency improved, but correctness is
-      not acceptable yet. Suspected remaining causes are a subtle DeltaNet
-      independent-state math difference or decode recurrent projection
-      numerical path differences versus per-request matvec. Keep this path
-      experimental until exact parity is restored.
+    - Root cause of the earlier exact-parity failure was found: the
+      cross-request recurrent body-batch path updated the recurrent state and
+      residual, then skipped the same layer's FFN before continuing to the next
+      layer. The delegated per-request path calls
+      `forward_recurrent_layer_from_current_hidden()`, which includes both the
+      recurrent sublayer and the FFN, so outputs diverged immediately after the
+      first batched recurrent step.
+    - Fixed the cross-request recurrent batch path to run batched FFN norm,
+      gate/up projections, SwiGLU, down projection, and residual add before
+      leaving a recurrent layer.
+    - Added `--continuous-env KEY=VALUE` to
+      `scripts/continuous_batching_regression.py` so experimental continuous
+      batching knobs can be tested only on the continuous run while keeping the
+      baseline process clean.
+    - Experimental recurrent batching enabled now passes exact parity:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_batch_clean.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --continuous-env QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1`: passed, `trace_max_batch=2`, `body_batch_ready=true`, `mode=body_batch_fp16`, `ragged_metadata_ready=true`.
+    - Wider recurrent batching regression also passed:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math chinese cuda' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_batch_4prompt.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --continuous-env QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1`: passed exact output parity, `trace_max_batch=2`, `summary_max_batch=2`, `body_batch_ready=true`, `mode=body_batch_fp16`, `ragged_metadata_ready=true`.
+    - FP8 KV recurrent batching regression passed:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_batch_fp8.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --continuous-env QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1 --extra-arg=--kv-dtype --extra-arg=fp8`: passed exact output parity, `trace_max_batch=2`, `summary_max_batch=2`, `body_batch_ready=true`, `ragged_metadata_ready=true`.
+    - This path is still behind `QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1`
+      until throughput tests and longer OpenCode-style streaming tests are
+      repeated.
 
 Stage 6 throughput subplan:
 

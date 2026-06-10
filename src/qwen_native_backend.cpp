@@ -1679,6 +1679,27 @@ private:
                                 conv_state_stride));
                             outputs[row].report.ops_executed += 1;
                         }
+                        require_ok(backend_.rms_norm_batch(
+                            *norm_batch_, *hidden_batch_, *layer.ffn_norm,
+                            bsz, hidden, eps));
+                        require_ok(backend_.q8_0_matmul(
+                            *ffn_gate_batch_, *layer.ffn_gate,
+                            *norm_batch_, bsz, hidden,
+                            static_cast<uint32_t>(layer.ffn_dim)));
+                        require_ok(backend_.q8_0_matmul(
+                            *ffn_up_batch_, *layer.ffn_up,
+                            *norm_batch_, bsz, hidden,
+                            static_cast<uint32_t>(layer.ffn_dim)));
+                        require_ok(backend_.silu_mul_n(
+                            *ffn_mid_batch_, *ffn_gate_batch_, *ffn_up_batch_,
+                            static_cast<uint64_t>(bsz) * layer.ffn_dim));
+                        require_ok(backend_.q8_0_matmul(
+                            *ffn_out_batch_, *layer.ffn_down,
+                            *ffn_mid_batch_, bsz,
+                            static_cast<uint32_t>(layer.ffn_dim), hidden));
+                        require_ok(backend_.add_n(
+                            *hidden_batch_, *hidden_batch_, *ffn_out_batch_,
+                            static_cast<uint64_t>(bsz) * hidden));
                         continue;
                     }
 
