@@ -29,7 +29,7 @@ should be committed separately from unrelated work.
 | 4 | Global KV page pool | Completed | Passed on 2026-06-09 |
 | 5 | BatchedDecodeExecutor batch=1 parity | Completed | Passed on 2026-06-10 |
 | 6 | Batched greedy decode with FlashInfer paged attention | Pending | Not run |
-| 7 | Chunked prefill and decode interleaving | Pending | Not run |
+| 7 | Chunked prefill and decode interleaving | Completed | Passed on 2026-06-10 |
 | 8 | Batched sampling optimization | Pending | Not run |
 
 ## Stage 0: Baseline Freeze and Regression Harness
@@ -398,7 +398,34 @@ Verification:
 
 Completion Notes:
 
-- Pending.
+- Stage 7 completed on 2026-06-10.
+- Continuous batching now keeps newly admitted requests in a prefilling set
+  before they become active decode requests.
+- Each scheduler turn advances at most one prefill chunk, and active decode
+  batches run before the next prefill chunk. Prefilling requests count toward
+  `QW3_CONTINUOUS_BATCHING_MAX_ACTIVE`, so KV/token capacity is not
+  oversubscribed.
+- Prefill chunk sizes are clamped to the intended service range:
+  - `--prefill-chunk 0`: whole prompt prefill.
+  - positive values below 512 use 512.
+  - positive values above 4096 use 4096.
+  - unset/default uses 512.
+- Added `scripts/continuous_prefill_interleave_regression.py`, which starts a
+  continuous batching server, sends a long prompt followed by a short prompt,
+  and verifies that the short request starts decode before the long request's
+  final prefill chunk.
+- Verification:
+  - `cmake --build build -j`: passed.
+  - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+  - `git diff --check`: passed.
+  - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage7_cb.json --timeout 900 --min-batch 2`: passed, 4/4 comparisons, `max_batch=2`, `paged_kv_ready=true`, `hgemm_guard=true`.
+  - `python3 scripts/continuous_prefill_interleave_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --ctx 2048 --prefill-chunk 512 --max-tokens 4 --out-json /tmp/qw3_stage7_interleave_rerun.json --timeout 900`: passed, `long_nonfinal_chunks=3`, `short_decode_before_long_final_prefill=true`.
+  - `python3 scripts/paged_kv_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --page-sizes '16 32' --alloc-modes 'identity reverse' --prompts 'short chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage7_paged_kv.json --timeout 900`: passed, 8/8 runs.
+  - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 4096 --prefill-chunk 4096 --out-json /tmp/qw3_stage7_cb_4096_rerun.json --timeout 900 --min-batch 2`: passed on rerun, 4/4 comparisons, `max_batch=2`, `paged_kv_ready=true`, `hgemm_guard=true`.
+- Note: the first `--prefill-chunk 4096` continuous batching run wrote
+  `/tmp/qw3_stage7_cb_4096.json` and failed one comparison because the plain
+  baseline returned the known transient abnormal `capital` output. Immediate
+  rerun passed all comparisons.
 
 ## Stage 7: Chunked Prefill and Decode Interleaving
 

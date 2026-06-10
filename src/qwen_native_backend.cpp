@@ -1054,6 +1054,7 @@ private:
         std::vector<float> logit_buf;
         uint32_t next_token = 0;
         int decoded = 0;
+        uint32_t prefill_offset = 0;
         uint64_t prefill_ops = 0;
         uint64_t decode_ops = 0;
         double prefill_s = 0.0;
@@ -1302,6 +1303,7 @@ private:
 
     void continuous_batch_worker_loop() {
         std::vector<ContinuousBatchActive> active;
+        std::vector<ContinuousBatchActive> prefilling;
         try {
             DeviceStatus st = device_->begin();
             if (!st.ok) throw std::runtime_error(st.message);
@@ -1318,57 +1320,24 @@ private:
                 {
                     std::unique_lock<std::mutex> lk(cb_mu_);
                     cb_cv_.wait(lk, [&]() {
-                        return cb_stop_ || !cb_pending_.empty() || !active.empty();
+                        return cb_stop_ || !cb_pending_.empty() ||
+                               !active.empty() || !prefilling.empty();
                     });
-                    if (cb_stop_ && cb_pending_.empty() && active.empty()) break;
+                    if (cb_stop_ && cb_pending_.empty() && active.empty() &&
+                        prefilling.empty()) {
+                        break;
+                    }
                     arrivals.swap(cb_pending_);
                 }
 
-                while (!arrivals.empty() && active.size() < max_active) {
+                while (!arrivals.empty() &&
+                       active.size() + prefilling.size() < max_active) {
                     auto req = arrivals.front();
                     arrivals.pop_front();
                     try {
                         ContinuousBatchActive a;
-                        a.req = req;
-                        a.executor = std::make_unique<QwenExecutor>(
-                            *model_, *weights_, *device_, ctx_size,
-                            cb_kv_pool_.get(), &cb_kv_cache_view_);
-                        a.executor->set_prefill_chunk_override(options_.prefill_chunk);
-                        a.executor->reset_state();
-                        a.seen_tokens.reserve(req->prompt_tokens.size() +
-                                              static_cast<size_t>(req->options.max_tokens));
-                        for (uint32_t token : req->prompt_tokens) ++a.seen_tokens[token];
-                        a.rng.seed(req->options.seed);
-
-                        const double t0 = wall_seconds();
-                        NativeExecutorReport step =
-                            a.executor->forward_n_tokens(req->prompt_tokens);
-                        if (!step.ok) throw std::runtime_error("prefill failed");
-                        const double t1 = wall_seconds();
-                        a.prefill_s = std::max(t1 - t0, 1e-9);
-                        a.decode_start = t1;
-                        a.prefill_ops = step.ops_executed;
-                        a.kv_state.update(a.executor->kv_state_snapshot());
-                        const int32_t seed = step.argmax_token >= 0 ? step.argmax_token : eos;
-                        a.next_token = static_cast<uint32_t>(
-                            pick_continuous_next_token(a, seed));
-
-                        if (req->options.max_tokens <= 0 ||
-                            a.next_token == static_cast<uint32_t>(eos)) {
-                            if (req->options.max_tokens > 0) {
-                                log_zero_decode_diagnostic("continuous",
-                                                           req->prompt_tokens,
-                                                           step);
-                            }
-                            complete_continuous_request(req, {});
-                        } else {
-                            emit_continuous_token(a, a.next_token);
-                            if (a.decoded >= req->options.max_tokens) {
-                                finish_continuous_active(a);
-                            } else {
-                                active.push_back(std::move(a));
-                            }
-                        }
+                        initialize_continuous_active(a, req, ctx_size);
+                        prefilling.push_back(std::move(a));
                     } catch (const std::exception &e) {
                         complete_continuous_request(req, {}, e.what());
                     }
@@ -1381,9 +1350,13 @@ private:
                     }
                 }
 
-                if (active.empty()) continue;
-                build_continuous_decode_batch(active, decode_batch);
-                continuous_decode_batch_step(active, decode_batch, eos);
+                if (!active.empty()) {
+                    build_continuous_decode_batch(active, decode_batch);
+                    continuous_decode_batch_step(active, decode_batch, eos);
+                }
+                if (!prefilling.empty()) {
+                    advance_continuous_prefill(prefilling, active, eos);
+                }
             }
 
             st = device_->end();
@@ -1408,8 +1381,115 @@ private:
             for (auto &a : active) {
                 if (a.req) complete_continuous_request(a.req, {}, e.what());
             }
+            for (auto &a : prefilling) {
+                if (a.req) complete_continuous_request(a.req, {}, e.what());
+            }
             log(std::string("native continuous_batching: worker_failed reason=\"") +
                 e.what() + "\"");
+        }
+    }
+
+    void initialize_continuous_active(
+            ContinuousBatchActive &a,
+            const std::shared_ptr<ContinuousBatchRequest> &req,
+            uint32_t ctx_size) {
+        a.req = req;
+        a.executor = std::make_unique<QwenExecutor>(
+            *model_, *weights_, *device_, ctx_size,
+            cb_kv_pool_.get(), &cb_kv_cache_view_);
+        a.executor->set_prefill_chunk_override(options_.prefill_chunk);
+        a.executor->reset_state();
+        a.seen_tokens.reserve(req->prompt_tokens.size() +
+                              static_cast<size_t>(req->options.max_tokens));
+        for (uint32_t token : req->prompt_tokens) ++a.seen_tokens[token];
+        a.rng.seed(req->options.seed);
+    }
+
+    uint32_t continuous_prefill_chunk_tokens(uint32_t remaining) const {
+        if (remaining == 0) return 0;
+        if (options_.prefill_chunk == 0) return remaining;
+        uint32_t chunk = options_.prefill_chunk > 0
+            ? static_cast<uint32_t>(options_.prefill_chunk)
+            : 512u;
+        chunk = std::max<uint32_t>(512u, chunk);
+        chunk = std::min<uint32_t>(4096u, chunk);
+        return std::min<uint32_t>(remaining, chunk);
+    }
+
+    void advance_continuous_prefill(std::vector<ContinuousBatchActive> &prefilling,
+                                    std::vector<ContinuousBatchActive> &active,
+                                    int32_t eos) {
+        if (prefilling.empty()) return;
+        ContinuousBatchActive &a = prefilling.front();
+        try {
+            const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
+            if (a.prefill_offset >= prompt.size() && !prompt.empty()) {
+                throw std::runtime_error("continuous prefill has no prompt tokens");
+            }
+            const uint32_t remaining =
+                static_cast<uint32_t>(prompt.size() - a.prefill_offset);
+            const uint32_t chunk = continuous_prefill_chunk_tokens(remaining);
+            const bool final_chunk = prompt.empty() || chunk >= remaining;
+            std::vector<uint32_t> chunk_tokens(
+                prompt.begin() + static_cast<std::ptrdiff_t>(a.prefill_offset),
+                prompt.begin() + static_cast<std::ptrdiff_t>(a.prefill_offset + chunk));
+
+            const double t0 = wall_seconds();
+            NativeExecutorReport step =
+                a.executor->forward_n_tokens(chunk_tokens, final_chunk);
+            if (!step.ok) throw std::runtime_error("prefill failed");
+            const double t1 = wall_seconds();
+            a.prefill_s += std::max(t1 - t0, 1e-9);
+            a.prefill_ops += step.ops_executed;
+            a.prefill_offset += chunk;
+            a.kv_state.update(a.executor->kv_state_snapshot());
+
+            if (continuous_batching_trace_enabled()) {
+                std::ostringstream msg;
+                msg << "native continuous_prefill_chunk:"
+                    << " request=" << a.req->id
+                    << " offset=" << a.prefill_offset
+                    << " total=" << prompt.size()
+                    << " chunk=" << chunk
+                    << " final=" << (final_chunk ? "true" : "false");
+                log(msg.str());
+            }
+
+            if (!final_chunk) {
+                if (prefilling.size() > 1) {
+                    std::rotate(prefilling.begin(), prefilling.begin() + 1,
+                                prefilling.end());
+                }
+                return;
+            }
+
+            a.decode_start = t1;
+            const int32_t seed = step.argmax_token >= 0 ? step.argmax_token : eos;
+            a.next_token = static_cast<uint32_t>(
+                pick_continuous_next_token(a, seed));
+
+            if (a.req->options.max_tokens <= 0 ||
+                a.next_token == static_cast<uint32_t>(eos)) {
+                if (a.req->options.max_tokens > 0) {
+                    log_zero_decode_diagnostic("continuous",
+                                               a.req->prompt_tokens,
+                                               step);
+                }
+                complete_continuous_request(a.req, {});
+                prefilling.erase(prefilling.begin());
+                return;
+            }
+
+            emit_continuous_token(a, a.next_token);
+            if (a.decoded >= a.req->options.max_tokens) {
+                finish_continuous_active(a);
+            } else {
+                active.push_back(std::move(a));
+            }
+            prefilling.erase(prefilling.begin());
+        } catch (const std::exception &e) {
+            complete_continuous_request(a.req, {}, e.what());
+            prefilling.erase(prefilling.begin());
         }
     }
 
