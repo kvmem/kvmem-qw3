@@ -28,7 +28,7 @@ should be committed separately from unrelated work.
 | 3 | Request-level paged KV state | Completed | Passed on 2026-06-09 |
 | 4 | Global KV page pool | Completed | Passed on 2026-06-09 |
 | 5 | BatchedDecodeExecutor batch=1 parity | Completed | Passed on 2026-06-10 |
-| 6 | Batched greedy decode with FlashInfer paged attention | Pending | Not run |
+| 6 | Batched greedy decode with FlashInfer paged attention | In Progress | Partial lm_head batch passed on 2026-06-10 |
 | 7 | Chunked prefill and decode interleaving | Completed | Passed on 2026-06-10 |
 | 8 | Batched sampling optimization | Pending | Not run |
 
@@ -398,6 +398,61 @@ Verification:
 
 Completion Notes:
 
+- Stage 6 is in progress, not complete.
+- Added a first real kernel-batched decode tail for greedy requests:
+  request bodies still advance through per-request `forward_one_token(...,
+  compute_logits=false)`, but active hidden states are packed into a
+  `[batch, hidden]` buffer and the final `output_norm`, `lm_head`, and
+  `argmax` run as batch kernels.
+- The batched tail is enabled only for greedy requests that do not require full
+  logits for sampling or penalties. Sampling and penalty requests keep the
+  delegated path for correctness.
+- Continuous batching trace now reports both scheduler and kernel batching via
+  `native continuous_batch_executor: mode=... scheduler_batch=... kernel_batch=...`.
+- Added a server-side max token cap: request `max_tokens` is limited by the
+  service default configured with `-n`. This prevents OpenCode-style
+  `max_tokens=32000` requests from reserving an entire context window and
+  rejecting concurrent requests.
+- Streaming chat requests whose rendered prompt exceeds `--ctx` are rejected
+  before opening the SSE stream with HTTP 413, instead of returning an HTTP 200
+  error chunk.
+- Verification:
+  - `cmake --build build -j`: passed.
+  - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+  - `git diff --check`: passed.
+  - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_lmhead_cb.json --timeout 900 --min-batch 2`: passed, 4/4 comparisons, `max_batch=2`, `paged_kv_ready=true`, `hgemm_guard=true`; log contained `mode=lm_head_batch` with `kernel_batch=2`.
+  - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 128 --ctx 2048 --prefill-chunk 512 --out-json /tmp/qw3_stage6_lmhead_cb_128.json --timeout 900 --min-batch 2`: passed; `mode=lm_head_batch` appeared 82 times.
+  - `python3 scripts/paged_kv_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --page-sizes '16 32' --alloc-modes 'identity reverse' --prompts 'short chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_lmhead_paged_kv.json --timeout 900`: passed, 8/8 runs.
+- Remaining Stage 6 work:
+  - Cross-request recurrent-state batching is not implemented. Existing
+    `recurrent_batch()` is a time-batch kernel for one sequence state, so it
+    cannot be reused directly for independent requests without new state
+    metadata support.
+  - Cross-request paged attention is not wired into the executor. Existing
+    prefill batch attention assumes one logical sequence/page table or
+    consecutive positions; continuous batching needs ragged per-request page
+    metadata.
+  - Q/K/V, FFN, and attention output linear layers are still executed in the
+    per-request body path, so aggregate decode throughput is only slightly
+    improved by the batched lm_head tail.
+
+## Stage 7: Chunked Prefill and Decode Interleaving
+
+Goal: prevent long prefills from blocking active decode requests.
+
+Tasks:
+
+- Track prefill progress per pending request.
+- Interleave decode steps with configurable prefill chunks.
+- Support chunk sizes in the 512 to 4096 range.
+
+Verification:
+
+- Short request latency remains bounded while a long prompt is prefilling.
+- Different chunk sizes remain correct.
+
+Completion Notes:
+
 - Stage 7 completed on 2026-06-10.
 - Continuous batching now keeps newly admitted requests in a prefilling set
   before they become active decode requests.
@@ -426,25 +481,6 @@ Completion Notes:
   `/tmp/qw3_stage7_cb_4096.json` and failed one comparison because the plain
   baseline returned the known transient abnormal `capital` output. Immediate
   rerun passed all comparisons.
-
-## Stage 7: Chunked Prefill and Decode Interleaving
-
-Goal: prevent long prefills from blocking active decode requests.
-
-Tasks:
-
-- Track prefill progress per pending request.
-- Interleave decode steps with configurable prefill chunks.
-- Support chunk sizes in the 512 to 4096 range.
-
-Verification:
-
-- Short request latency remains bounded while a long prompt is prefilling.
-- Different chunk sizes remain correct.
-
-Completion Notes:
-
-- Pending.
 
 ## Stage 8: Batched Sampling Optimization
 

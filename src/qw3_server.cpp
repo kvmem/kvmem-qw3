@@ -627,6 +627,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.max_tokens = req.value("max_tokens",
                                  req.value("max_completion_tokens", g.max_tokens));
         if (g.max_tokens <= 0) g.max_tokens = 256;
+        if (cfg.default_generation.max_tokens > 0 &&
+            g.max_tokens > cfg.default_generation.max_tokens) {
+            std::cerr << "[qw3-serve] capping request max_tokens from "
+                      << g.max_tokens << " to "
+                      << cfg.default_generation.max_tokens
+                      << " (server limit)\n";
+            g.max_tokens = cfg.default_generation.max_tokens;
+        }
         g.temperature = req.value("temperature", g.temperature);
         g.top_p = req.value("top_p", g.top_p);
         g.top_k = req.value("top_k", g.top_k);
@@ -672,6 +680,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const std::string prompt =
             render_messages(req["messages"], tools, enable_thinking, forced_tool_name);
         const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
+        if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
+            set_error_response(
+                res,
+                413,
+                "prompt exceeds KV context: prompt_tokens=" +
+                    std::to_string(prompt_token_count) +
+                    " ctx=" + std::to_string(engine.ctx_size));
+            return;
+        }
         GenerationOptions g = make_gen(req);
         g.raw_prompt = true; // prompt is already chat-framed
         g.continuous_batching =

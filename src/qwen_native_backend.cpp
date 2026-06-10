@@ -1092,12 +1092,25 @@ private:
 
     class BatchedDecodeExecutor {
     public:
+        BatchedDecodeExecutor(const QwenNativeModel &model,
+                              const QwenWeights &weights,
+                              DeviceBackend &backend)
+            : model_(model), weights_(weights), backend_(backend) {}
+
+        const std::string &last_mode() const { return last_mode_; }
+        uint32_t last_kernel_batch() const { return last_kernel_batch_; }
+
         std::vector<BatchedDecodeOutput> decode(
                 std::vector<ContinuousBatchActive> &active,
                 const BatchedDecodeInput &input) {
             std::vector<BatchedDecodeOutput> outputs;
             if (input.batch == nullptr) return outputs;
             const ContinuousDecodeBatch &batch = *input.batch;
+            if (can_use_lm_head_batch(active, batch)) {
+                return decode_lm_head_batch(active, batch);
+            }
+            last_mode_ = "delegated";
+            last_kernel_batch_ = 1;
             outputs.reserve(batch.size());
             for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
                 BatchedDecodeOutput out;
@@ -1120,6 +1133,139 @@ private:
             }
             return outputs;
         }
+
+    private:
+        static bool request_needs_logits(const GenerationOptions &options) {
+            return options.temperature > 0.0f ||
+                   options.presence_penalty != 0.0f ||
+                   (options.repetition_penalty > 0.0f &&
+                    options.repetition_penalty != 1.0f);
+        }
+
+        bool can_use_lm_head_batch(const std::vector<ContinuousBatchActive> &active,
+                                   const ContinuousDecodeBatch &batch) const {
+            if (batch.size() < 2) return false;
+            for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
+                const size_t active_index = batch.active_indices[batch_i];
+                if (active_index >= active.size()) return false;
+                const ContinuousBatchActive &a = active[active_index];
+                if (!a.req || !a.executor) return false;
+                if (request_needs_logits(a.req->options)) return false;
+            }
+            return true;
+        }
+
+        void ensure_lm_head_scratch(uint32_t batch, uint32_t hidden, uint32_t vocab) {
+            if (batch == 0 || batch <= lm_head_batch_capacity_) return;
+            hidden_batch_ = backend_.scratch_f32(static_cast<uint64_t>(batch) * hidden,
+                                                 "cb_decode_hidden_batch");
+            norm_batch_ = backend_.scratch_f32(static_cast<uint64_t>(batch) * hidden,
+                                               "cb_decode_norm_batch");
+            logits_batch_ = backend_.scratch_f32(static_cast<uint64_t>(batch) * vocab,
+                                                 "cb_decode_logits_batch");
+            lm_head_batch_capacity_ = batch;
+        }
+
+        static void require_ok(const DeviceStatus &st) {
+            if (!st.ok) throw std::runtime_error(st.message);
+        }
+
+        std::vector<BatchedDecodeOutput> decode_lm_head_batch(
+                std::vector<ContinuousBatchActive> &active,
+                const ContinuousDecodeBatch &batch) {
+            std::vector<BatchedDecodeOutput> outputs;
+            outputs.reserve(batch.size());
+            last_mode_ = "lm_head_batch";
+            last_kernel_batch_ = static_cast<uint32_t>(batch.size());
+
+            uint32_t hidden = 0;
+            const uint32_t vocab = static_cast<uint32_t>(weights_.output().rows);
+            try {
+                for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
+                    BatchedDecodeOutput out;
+                    out.active_index = batch.active_indices[batch_i];
+                    out.feed_token = batch.feed_tokens[batch_i];
+                    if (out.active_index >= active.size()) {
+                        out.error = "decode active index out of range";
+                        outputs.push_back(std::move(out));
+                        continue;
+                    }
+                    ContinuousBatchActive &a = active[out.active_index];
+                    try {
+                        out.report = a.executor->forward_one_token(
+                            out.feed_token, /*compute_logits=*/false);
+                        if (!out.report.ok) out.error = "decode body failed";
+                    } catch (const std::exception &e) {
+                        out.error = e.what();
+                    }
+                    if (out.error.empty()) {
+                        QwenExecutor::DecodeStateView view =
+                            a.executor->decode_state_view();
+                        if (view.hidden == nullptr || view.hidden->count == 0) {
+                            out.error = "decode hidden state unavailable";
+                        } else if (hidden == 0) {
+                            hidden = static_cast<uint32_t>(view.hidden->count);
+                        } else if (view.hidden->count != hidden) {
+                            out.error = "decode hidden size mismatch";
+                        }
+                    }
+                    outputs.push_back(std::move(out));
+                }
+
+                bool any_error = false;
+                for (const auto &out : outputs) {
+                    any_error = any_error || !out.error.empty();
+                }
+                if (any_error || hidden == 0) return outputs;
+
+                const uint32_t bsz = static_cast<uint32_t>(batch.size());
+                ensure_lm_head_scratch(bsz, hidden, vocab);
+                require_ok(backend_.begin());
+                for (uint32_t row = 0; row < bsz; ++row) {
+                    ContinuousBatchActive &a = active[outputs[row].active_index];
+                    QwenExecutor::DecodeStateView view =
+                        a.executor->decode_state_view();
+                    require_ok(backend_.copy_d2d_into(
+                        *hidden_batch_, static_cast<uint64_t>(row) * hidden,
+                        *view.hidden, 0, hidden));
+                }
+                const float eps = model_.config().rms_eps;
+                require_ok(backend_.rms_norm_batch(
+                    *norm_batch_, *hidden_batch_, weights_.output_norm(),
+                    bsz, hidden, eps));
+                require_ok(backend_.q8_0_matmul(
+                    *logits_batch_, weights_.output(), *norm_batch_,
+                    bsz, hidden, vocab));
+                std::vector<DeviceArgmax> argmaxes;
+                require_ok(backend_.argmax_batch(*logits_batch_, bsz, vocab, argmaxes));
+                require_ok(backend_.end());
+                for (uint32_t row = 0; row < bsz && row < argmaxes.size(); ++row) {
+                    outputs[row].report.argmax_token = argmaxes[row].token;
+                    outputs[row].report.argmax_logit = argmaxes[row].logit;
+                    outputs[row].report.argmax_text =
+                        model_.gguf().token_text(
+                            static_cast<uint32_t>(argmaxes[row].token));
+                    outputs[row].report.ok = true;
+                    outputs[row].report.ops_executed += 3;
+                }
+            } catch (const std::exception &e) {
+                try { (void)backend_.end(); } catch (...) {}
+                for (auto &out : outputs) {
+                    if (out.error.empty()) out.error = e.what();
+                }
+            }
+            return outputs;
+        }
+
+        const QwenNativeModel &model_;
+        const QwenWeights &weights_;
+        DeviceBackend &backend_;
+        uint32_t lm_head_batch_capacity_ = 0;
+        std::unique_ptr<DeviceTensor> hidden_batch_;
+        std::unique_ptr<DeviceTensor> norm_batch_;
+        std::unique_ptr<DeviceTensor> logits_batch_;
+        std::string last_mode_ = "delegated";
+        uint32_t last_kernel_batch_ = 1;
     };
 
     static bool continuous_batch_request_supported(const GenerationOptions &options,
@@ -1550,9 +1696,19 @@ private:
                !cb_decode_max_batch_.compare_exchange_weak(
                    prev_max, static_cast<uint32_t>(batch.size()))) {}
 
-        BatchedDecodeExecutor decode_executor;
+        if (!cb_decode_executor_) {
+            cb_decode_executor_ =
+                std::make_unique<BatchedDecodeExecutor>(*model_, *weights_, *device_);
+        }
         const std::vector<BatchedDecodeOutput> outputs =
-            decode_executor.decode(active, BatchedDecodeInput{&batch});
+            cb_decode_executor_->decode(active, BatchedDecodeInput{&batch});
+        if (continuous_batching_trace_enabled()) {
+            log("native continuous_batch_executor:"
+                " mode=" + cb_decode_executor_->last_mode() +
+                " scheduler_batch=" + std::to_string(batch.size()) +
+                " kernel_batch=" +
+                std::to_string(cb_decode_executor_->last_kernel_batch()));
+        }
         for (const BatchedDecodeOutput &out : outputs) {
             const size_t active_index = out.active_index;
             if (active_index >= active.size()) continue;
@@ -2751,6 +2907,7 @@ private:
     std::unique_ptr<QwenWeights> weights_;
     std::unique_ptr<QwenExecutor> executor_;
     std::unique_ptr<QwenTokenizer> tokenizer_;
+    std::unique_ptr<BatchedDecodeExecutor> cb_decode_executor_;
     std::unique_ptr<GlobalKvPagePool> cb_kv_pool_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_v_cache_storage_;
