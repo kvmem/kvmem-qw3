@@ -517,6 +517,12 @@ Completion Notes:
       `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math chinese cuda' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_batch_4prompt.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --continuous-env QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1`: passed exact output parity, `trace_max_batch=2`, `summary_max_batch=2`, `body_batch_ready=true`, `mode=body_batch_fp16`, `ragged_metadata_ready=true`.
     - FP8 KV recurrent batching regression passed:
       `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_batch_fp8.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --continuous-env QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1 --extra-arg=--kv-dtype --extra-arg=fp8`: passed exact output parity, `trace_max_batch=2`, `summary_max_batch=2`, `body_batch_ready=true`, `ragged_metadata_ready=true`.
+    - Serial 64-token throughput direction check:
+      default body-batch wrote `/tmp/qw3_body_batch_default_64_serial.json`
+      with continuous request latencies around `2.625-2.650s`; recurrent
+      body-batch wrote `/tmp/qw3_body_batch_recurrent_64_serial.json` with
+      continuous request latencies around `1.721-1.746s`, exact parity still
+      passing, `trace_max_batch=2`, and `ragged_metadata_ready=true`.
     - This path is still behind `QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1`
       until throughput tests and longer OpenCode-style streaming tests are
       repeated.
