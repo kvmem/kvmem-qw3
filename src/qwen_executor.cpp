@@ -84,6 +84,28 @@ QwenExecutor::DecodeStateView QwenExecutor::decode_state_view() const {
     return view;
 }
 
+QwenExecutor::MutableDecodeStateView QwenExecutor::mutable_decode_state_view() {
+    MutableDecodeStateView view;
+    view.position = position_;
+    view.kv_ctx_size = kv_ctx_size_;
+    view.kv_page_size = kv_pages_.page_size;
+    view.kv_page_count = kv_pages_.count();
+    view.kv_page_indices_host = kv_pages_.host_indices();
+    view.kv_page_indices_device = kv_pages_.device_pages.get();
+    view.k_cache = &k_cache_;
+    view.v_cache = &v_cache_;
+    view.k_cache_external = external_kv_cache_ ? &external_kv_cache_->k_cache : nullptr;
+    view.v_cache_external = external_kv_cache_ ? &external_kv_cache_->v_cache : nullptr;
+    view.recurrent_states = &recurrent_states_;
+    view.conv_states = &conv_states_;
+    view.hidden = h_.get();
+    return view;
+}
+
+void QwenExecutor::prepare_decode_token_pages(uint32_t count) {
+    ensure_kv_pages(position_, count);
+}
+
 DeviceTensor &QwenExecutor::k_cache(uint32_t layer) {
     if (external_kv_cache_) {
         if (layer >= external_kv_cache_->k_cache.size() ||

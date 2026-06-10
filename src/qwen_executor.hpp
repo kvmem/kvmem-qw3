@@ -69,6 +69,21 @@ public:
         const std::vector<std::unique_ptr<DeviceTensor>> *conv_states = nullptr;
         const DeviceTensor *hidden = nullptr;
     };
+    struct MutableDecodeStateView {
+        uint32_t position = 0;
+        uint32_t kv_ctx_size = 0;
+        uint32_t kv_page_size = 0;
+        uint32_t kv_page_count = 0;
+        const int32_t *kv_page_indices_host = nullptr;
+        const DeviceTensor *kv_page_indices_device = nullptr;
+        std::vector<DeviceTensor *> *k_cache_external = nullptr;
+        std::vector<DeviceTensor *> *v_cache_external = nullptr;
+        std::vector<std::unique_ptr<DeviceTensor>> *k_cache = nullptr;
+        std::vector<std::unique_ptr<DeviceTensor>> *v_cache = nullptr;
+        std::vector<std::unique_ptr<DeviceTensor>> *recurrent_states = nullptr;
+        std::vector<std::unique_ptr<DeviceTensor>> *conv_states = nullptr;
+        DeviceTensor *hidden = nullptr;
+    };
     struct KvStateSnapshot {
         uint32_t seq_len = 0;
         uint32_t ctx_size = 0;
@@ -94,7 +109,10 @@ public:
     uint32_t position() const { return position_; }
     uint32_t kv_ctx_size() const { return kv_ctx_size_; }
     DecodeStateView decode_state_view() const;
+    MutableDecodeStateView mutable_decode_state_view();
     KvStateSnapshot kv_state_snapshot() const;
+    void prepare_decode_token_pages(uint32_t count = 1);
+    void advance_position(uint32_t count = 1) { position_ += count; }
 
     NativeExecutorReport dry_run_token(uint32_t token_id, bool execute_heavy);
     NativeExecutorReport forward_one_token(uint32_t token_id,
