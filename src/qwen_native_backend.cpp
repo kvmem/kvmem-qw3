@@ -247,7 +247,7 @@ bool continuous_batching_body_batch_enabled() {
 }
 
 bool continuous_batching_recurrent_batch_enabled() {
-    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH");
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH", true);
 }
 
 class GlobalKvPagePool final : public KvPhysicalPageAllocator {

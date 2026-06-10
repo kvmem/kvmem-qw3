@@ -523,9 +523,33 @@ Completion Notes:
       body-batch wrote `/tmp/qw3_body_batch_recurrent_64_serial.json` with
       continuous request latencies around `1.721-1.746s`, exact parity still
       passing, `trace_max_batch=2`, and `ragged_metadata_ready=true`.
-    - This path is still behind `QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1`
-      until throughput tests and longer OpenCode-style streaming tests are
-      repeated.
+    - Recurrent body-batch is now the default body-batch path. Set
+      `QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=0` to opt out and use the
+      delegated per-request recurrent fallback.
+    - Default-on recurrent body-batch verification:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_default_on_16.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed exact parity.
+    - Explicit opt-out verification:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_optout_16_serial.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --continuous-env QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=0`: passed exact parity.
+    - Longer default-on verification:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 128 --ctx 2048 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_default_on_128.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed exact parity.
+    - Batch=4 default-on verification:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math chinese cuda' --max-tokens 32 --ctx 2048 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_default_on_4prompt_32.json --timeout 900 --max-active 4 --min-batch 4 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed exact parity, `trace_max_batch=4`.
+    - FP8 KV default-on verification:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_recurrent_default_on_fp8_16.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --extra-arg=--kv-dtype --extra-arg=fp8`: passed exact parity.
+    - OpenCode-style streaming smoke passed on a temporary port `8097` with
+      `stream=true`, tools metadata, `enable_thinking=false`, and default-on
+      recurrent body-batch. Two concurrent chat stream requests both returned
+      `[DONE]`; server logs showed `batch=2`, `mode=body_batch_fp16`, and
+      `ragged_metadata_ready=true`.
+  - Added `scripts/continuous_batching_benchmark.py` for throughput sweeps
+    across `plain`, `continuous`, `body`, and `recurrent` variants. The script
+    starts one service per variant, sends deterministic completion requests,
+    records request wall time, completion token/s, latency percentiles, and
+    batching evidence, and writes a JSON summary.
+  - Benchmark smoke passed:
+    `python3 scripts/continuous_batching_benchmark.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 32 --ctx 2048 --prefill-chunk 512 --out-json /tmp/qw3_cb_benchmark_smoke.json --timeout 900 --max-active 2 --variants 'plain continuous body recurrent'`.
+    Results: `plain=42.97 tok/s`, `continuous=43.73 tok/s`,
+    `body=46.94 tok/s`, `recurrent=69.84 tok/s`.
 
 Stage 6 throughput subplan:
 
