@@ -1099,6 +1099,11 @@ private:
 
         const std::string &last_mode() const { return last_mode_; }
         uint32_t last_kernel_batch() const { return last_kernel_batch_; }
+        bool last_ragged_metadata_ready() const { return last_ragged_metadata_ready_; }
+        uint32_t last_ragged_metadata_pages() const { return last_ragged_metadata_pages_; }
+        uint32_t last_ragged_metadata_max_seq_len() const {
+            return last_ragged_metadata_max_seq_len_;
+        }
 
         std::vector<BatchedDecodeOutput> decode(
                 std::vector<ContinuousBatchActive> &active,
@@ -1106,6 +1111,7 @@ private:
             std::vector<BatchedDecodeOutput> outputs;
             if (input.batch == nullptr) return outputs;
             const ContinuousDecodeBatch &batch = *input.batch;
+            reset_last_ragged_metadata();
             if (can_use_lm_head_batch(active, batch)) {
                 return decode_lm_head_batch(active, batch);
             }
@@ -1166,8 +1172,110 @@ private:
             lm_head_batch_capacity_ = batch;
         }
 
+        void ensure_ragged_metadata_scratch(uint32_t batch, uint32_t pages) {
+            if (batch > ragged_metadata_batch_capacity_) {
+                ragged_positions_i32_ =
+                    backend_.tensor_i32(batch, "cb_decode_positions_i32");
+                ragged_page_indptr_i32_ =
+                    backend_.tensor_i32(static_cast<uint64_t>(batch) + 1,
+                                        "cb_decode_page_indptr_i32");
+                ragged_last_page_len_i32_ =
+                    backend_.tensor_i32(batch, "cb_decode_last_page_len_i32");
+                ragged_seq_lens_i32_ =
+                    backend_.tensor_i32(batch, "cb_decode_seq_lens_i32");
+                ragged_metadata_batch_capacity_ = batch;
+            }
+            if (pages > ragged_metadata_page_capacity_) {
+                ragged_page_indices_i32_ =
+                    backend_.tensor_i32(pages, "cb_decode_page_indices_i32");
+                ragged_metadata_page_capacity_ = pages;
+            }
+        }
+
         static void require_ok(const DeviceStatus &st) {
             if (!st.ok) throw std::runtime_error(st.message);
+        }
+
+        void reset_last_ragged_metadata() {
+            last_ragged_metadata_ready_ = false;
+            last_ragged_metadata_pages_ = 0;
+            last_ragged_metadata_max_seq_len_ = 0;
+        }
+
+        bool pack_ragged_metadata_after_body(
+                const std::vector<ContinuousBatchActive> &active,
+                const std::vector<BatchedDecodeOutput> &outputs) {
+            reset_last_ragged_metadata();
+            const uint32_t bsz = static_cast<uint32_t>(outputs.size());
+            if (bsz == 0) return false;
+
+            uint32_t page_size = 0;
+            uint32_t total_pages = 0;
+            uint32_t max_seq_len = 0;
+            ragged_positions_h_.assign(bsz, 0);
+            ragged_page_indptr_h_.assign(static_cast<size_t>(bsz) + 1, 0);
+            ragged_last_page_len_h_.assign(bsz, 0);
+            ragged_seq_lens_h_.assign(bsz, 0);
+            ragged_page_indices_h_.clear();
+
+            for (uint32_t row = 0; row < bsz; ++row) {
+                const BatchedDecodeOutput &out = outputs[row];
+                if (!out.error.empty() || out.active_index >= active.size()) {
+                    return false;
+                }
+                const QwenExecutor::DecodeStateView view =
+                    active[out.active_index].executor->decode_state_view();
+                const uint32_t seq_len = view.position;
+                if (seq_len == 0 || view.kv_page_size == 0 ||
+                    view.kv_page_indices_host == nullptr) {
+                    return false;
+                }
+                if (page_size == 0) {
+                    page_size = view.kv_page_size;
+                } else if (page_size != view.kv_page_size) {
+                    return false;
+                }
+                const uint32_t pages =
+                    (seq_len + page_size - 1) / page_size;
+                if (pages == 0 || view.kv_page_count < pages) {
+                    return false;
+                }
+                ragged_positions_h_[row] = static_cast<int32_t>(seq_len - 1);
+                ragged_seq_lens_h_[row] = static_cast<int32_t>(seq_len);
+                const uint32_t last_len = seq_len % page_size;
+                ragged_last_page_len_h_[row] =
+                    static_cast<int32_t>(last_len == 0 ? page_size : last_len);
+                ragged_page_indptr_h_[row] =
+                    static_cast<int32_t>(ragged_page_indices_h_.size());
+                for (uint32_t p = 0; p < pages; ++p) {
+                    ragged_page_indices_h_.push_back(view.kv_page_indices_host[p]);
+                }
+                total_pages += pages;
+                max_seq_len = std::max(max_seq_len, seq_len);
+            }
+            ragged_page_indptr_h_[bsz] =
+                static_cast<int32_t>(ragged_page_indices_h_.size());
+            if (total_pages != ragged_page_indices_h_.size()) return false;
+
+            ensure_ragged_metadata_scratch(bsz, total_pages);
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_positions_i32_, 0, ragged_positions_h_.data(), bsz));
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_page_indices_i32_, 0,
+                ragged_page_indices_h_.data(), total_pages));
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_page_indptr_i32_, 0,
+                ragged_page_indptr_h_.data(), static_cast<uint64_t>(bsz) + 1));
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_last_page_len_i32_, 0,
+                ragged_last_page_len_h_.data(), bsz));
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_seq_lens_i32_, 0, ragged_seq_lens_h_.data(), bsz));
+
+            last_ragged_metadata_ready_ = true;
+            last_ragged_metadata_pages_ = total_pages;
+            last_ragged_metadata_max_seq_len_ = max_seq_len;
+            return true;
         }
 
         std::vector<BatchedDecodeOutput> decode_lm_head_batch(
@@ -1221,6 +1329,7 @@ private:
                 const uint32_t bsz = static_cast<uint32_t>(batch.size());
                 ensure_lm_head_scratch(bsz, hidden, vocab);
                 require_ok(backend_.begin());
+                (void)pack_ragged_metadata_after_body(active, outputs);
                 for (uint32_t row = 0; row < bsz; ++row) {
                     ContinuousBatchActive &a = active[outputs[row].active_index];
                     QwenExecutor::DecodeStateView view =
@@ -1261,11 +1370,26 @@ private:
         const QwenWeights &weights_;
         DeviceBackend &backend_;
         uint32_t lm_head_batch_capacity_ = 0;
+        uint32_t ragged_metadata_batch_capacity_ = 0;
+        uint32_t ragged_metadata_page_capacity_ = 0;
         std::unique_ptr<DeviceTensor> hidden_batch_;
         std::unique_ptr<DeviceTensor> norm_batch_;
         std::unique_ptr<DeviceTensor> logits_batch_;
+        std::unique_ptr<DeviceTensor> ragged_positions_i32_;
+        std::unique_ptr<DeviceTensor> ragged_page_indices_i32_;
+        std::unique_ptr<DeviceTensor> ragged_page_indptr_i32_;
+        std::unique_ptr<DeviceTensor> ragged_last_page_len_i32_;
+        std::unique_ptr<DeviceTensor> ragged_seq_lens_i32_;
+        std::vector<int32_t> ragged_positions_h_;
+        std::vector<int32_t> ragged_page_indices_h_;
+        std::vector<int32_t> ragged_page_indptr_h_;
+        std::vector<int32_t> ragged_last_page_len_h_;
+        std::vector<int32_t> ragged_seq_lens_h_;
         std::string last_mode_ = "delegated";
         uint32_t last_kernel_batch_ = 1;
+        bool last_ragged_metadata_ready_ = false;
+        uint32_t last_ragged_metadata_pages_ = 0;
+        uint32_t last_ragged_metadata_max_seq_len_ = 0;
     };
 
     static bool continuous_batch_request_supported(const GenerationOptions &options,
@@ -1703,11 +1827,19 @@ private:
         const std::vector<BatchedDecodeOutput> outputs =
             cb_decode_executor_->decode(active, BatchedDecodeInput{&batch});
         if (continuous_batching_trace_enabled()) {
-            log("native continuous_batch_executor:"
-                " mode=" + cb_decode_executor_->last_mode() +
-                " scheduler_batch=" + std::to_string(batch.size()) +
-                " kernel_batch=" +
-                std::to_string(cb_decode_executor_->last_kernel_batch()));
+            std::ostringstream msg;
+            msg << "native continuous_batch_executor:"
+                << " mode=" << cb_decode_executor_->last_mode()
+                << " scheduler_batch=" << batch.size()
+                << " kernel_batch=" << cb_decode_executor_->last_kernel_batch()
+                << " ragged_metadata_ready="
+                << (cb_decode_executor_->last_ragged_metadata_ready()
+                    ? "true" : "false")
+                << " ragged_pages="
+                << cb_decode_executor_->last_ragged_metadata_pages()
+                << " ragged_max_seq_len="
+                << cb_decode_executor_->last_ragged_metadata_max_seq_len();
+            log(msg.str());
         }
         for (const BatchedDecodeOutput &out : outputs) {
             const size_t active_index = out.active_index;
