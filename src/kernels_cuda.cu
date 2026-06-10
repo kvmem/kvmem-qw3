@@ -2163,6 +2163,19 @@ __device__ __forceinline__ uint32_t kv_physical_pos_from_pages(
     return static_cast<uint32_t>(page_indices[logical_page]) * page_size + page_offset;
 }
 
+__device__ __forceinline__ uint32_t kv_physical_pos_from_ragged_pages(
+        uint32_t batch_row,
+        uint32_t logical_pos,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        uint32_t page_size) {
+    const uint32_t logical_page = logical_pos / page_size;
+    const uint32_t page_offset = logical_pos - logical_page * page_size;
+    const uint32_t begin = static_cast<uint32_t>(page_indptr[batch_row]);
+    return static_cast<uint32_t>(page_indices[begin + logical_page]) * page_size +
+           page_offset;
+}
+
 __global__ void kv_append_paged_kernel(float *cache,
                                        const float *src,
                                        uint32_t base_logical_pos,
@@ -2175,6 +2188,25 @@ __global__ void kv_append_paged_kernel(float *cache,
     if (i >= per_pos_size) return;
     const uint32_t physical_pos =
         kv_physical_pos_from_pages(base_logical_pos + b, page_indices, page_size);
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] = src_row[i];
+}
+
+__global__ void kv_append_paged_ragged_kernel(float *cache,
+                                              const float *src,
+                                              const int32_t *logical_positions,
+                                              uint32_t per_pos_size,
+                                              uint32_t src_stride,
+                                              const int32_t *page_indices,
+                                              const int32_t *page_indptr,
+                                              uint32_t page_size) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= per_pos_size) return;
+    const uint32_t logical_pos = static_cast<uint32_t>(logical_positions[b]);
+    const uint32_t physical_pos =
+        kv_physical_pos_from_ragged_pages(b, logical_pos, page_indices,
+                                          page_indptr, page_size);
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
     cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] = src_row[i];
 }
@@ -2209,6 +2241,26 @@ __global__ void kv_append_paged_kernel_f16(__half *cache,
         __float2half(src_row[i]);
 }
 
+__global__ void kv_append_paged_ragged_kernel_f16(__half *cache,
+                                                  const float *src,
+                                                  const int32_t *logical_positions,
+                                                  uint32_t per_pos_size,
+                                                  uint32_t src_stride,
+                                                  const int32_t *page_indices,
+                                                  const int32_t *page_indptr,
+                                                  uint32_t page_size) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= per_pos_size) return;
+    const uint32_t logical_pos = static_cast<uint32_t>(logical_positions[b]);
+    const uint32_t physical_pos =
+        kv_physical_pos_from_ragged_pages(b, logical_pos, page_indices,
+                                          page_indptr, page_size);
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] =
+        __float2half(src_row[i]);
+}
+
 // FP8 (e4m3) quantize-on-write. Raw e4m3, NO scale: each element is cast
 // straight to __nv_fp8_e4m3 (fixed ±448 range, 3-bit mantissa). Mirrors the
 // fp16 path's layout exactly (element index = (base_pos+b)*per_pos_size + i),
@@ -2238,6 +2290,26 @@ __global__ void kv_append_paged_kernel_fp8(__nv_fp8_e4m3 *cache,
     if (i >= per_pos_size) return;
     const uint32_t physical_pos =
         kv_physical_pos_from_pages(base_logical_pos + b, page_indices, page_size);
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] =
+        __nv_fp8_e4m3(src_row[i]);
+}
+
+__global__ void kv_append_paged_ragged_kernel_fp8(__nv_fp8_e4m3 *cache,
+                                                  const float *src,
+                                                  const int32_t *logical_positions,
+                                                  uint32_t per_pos_size,
+                                                  uint32_t src_stride,
+                                                  const int32_t *page_indices,
+                                                  const int32_t *page_indptr,
+                                                  uint32_t page_size) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= per_pos_size) return;
+    const uint32_t logical_pos = static_cast<uint32_t>(logical_positions[b]);
+    const uint32_t physical_pos =
+        kv_physical_pos_from_ragged_pages(b, logical_pos, page_indices,
+                                          page_indptr, page_size);
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
     cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] =
         __nv_fp8_e4m3(src_row[i]);
@@ -2301,6 +2373,49 @@ __global__ void kv_append_paged_kernel_q8(int8_t *cache,
     const uint32_t rows_per_pos = per_pos_size / row_elems;
     const uint32_t physical_pos =
         kv_physical_pos_from_pages(base_logical_pos + b, page_indices, page_size);
+
+    const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
+    const uint32_t elem_in_pos = row * row_elems + lane;
+    const float x = (lane < row_elems) ? src_row[elem_in_pos] : 0.0f;
+
+    extern __shared__ float s_absmax[];
+    s_absmax[lane] = fabsf(x);
+    __syncthreads();
+    for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (lane < s) s_absmax[lane] = fmaxf(s_absmax[lane], s_absmax[lane + s]);
+        __syncthreads();
+    }
+    const float absmax = s_absmax[0];
+    const float scale = absmax / 127.0f;
+    const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
+
+    const uint64_t pos = static_cast<uint64_t>(physical_pos);
+    if (lane == 0) {
+        scales[pos * rows_per_pos + row] = __float2half(scale);
+    }
+    int q = __float2int_rn(x * inv_scale);
+    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+    cache[pos * per_pos_size + elem_in_pos] = static_cast<int8_t>(q);
+}
+
+__global__ void kv_append_paged_ragged_kernel_q8(int8_t *cache,
+                                                 __half *scales,
+                                                 const float *src,
+                                                 const int32_t *logical_positions,
+                                                 uint32_t per_pos_size,
+                                                 uint32_t row_elems,
+                                                 uint32_t src_stride,
+                                                 const int32_t *page_indices,
+                                                 const int32_t *page_indptr,
+                                                 uint32_t page_size) {
+    const uint32_t b   = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t rows_per_pos = per_pos_size / row_elems;
+    const uint32_t logical_pos = static_cast<uint32_t>(logical_positions[b]);
+    const uint32_t physical_pos =
+        kv_physical_pos_from_ragged_pages(b, logical_pos, page_indices,
+                                          page_indptr, page_size);
 
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
     const uint32_t elem_in_pos = row * row_elems + lane;
@@ -4333,6 +4448,66 @@ public:
                 pages.ptr_i32(), page_size);
         }
         return launch_status("cuda kv_append_batch_paged_device");
+    }
+
+    DeviceStatus kv_append_batch_paged_ragged_device(
+                                              DeviceTensor &cache,
+                                              const DeviceTensor &src,
+                                              const DeviceTensor &logical_positions,
+                                              uint32_t per_pos_size,
+                                              uint32_t batch,
+                                              uint32_t src_stride,
+                                              const DeviceTensor &page_indices,
+                                              const DeviceTensor &page_indptr,
+                                              uint32_t page_size) override {
+        if (batch == 0) return {};
+        if (page_size == 0) {
+            return {false, "kv_append_batch_paged_ragged_device page_size=0"};
+        }
+        const auto &positions = as_tensor(logical_positions);
+        const auto &pages = as_tensor(page_indices);
+        const auto &indptr = as_tensor(page_indptr);
+        if (positions.elem_size != sizeof(int32_t) ||
+            pages.elem_size != sizeof(int32_t) ||
+            indptr.elem_size != sizeof(int32_t)) {
+            return {false, "kv_append_batch_paged_ragged_device metadata dtype mismatch"};
+        }
+        if (positions.count < batch || indptr.count < static_cast<uint64_t>(batch) + 1) {
+            return {false, "kv_append_batch_paged_ragged_device metadata tensor too small"};
+        }
+
+        auto &c = as_tensor(cache);
+        const auto &s = as_tensor(src);
+        const unsigned threads = 256;
+        const unsigned blocks = (per_pos_size + threads - 1) / threads;
+        dim3 grid(batch, blocks);
+        if (c.is_q8_kv()) {
+            const uint32_t row_elems = c.q8_row_elems;
+            if (row_elems == 0 || per_pos_size % row_elems != 0) {
+                return {false, "kv_append_batch_paged_ragged_device invalid q8 row size"};
+            }
+            const uint32_t rows = per_pos_size / row_elems;
+            dim3 qgrid(batch, rows);
+            kv_append_paged_ragged_kernel_q8<<<qgrid, row_elems,
+                                                row_elems * sizeof(float),
+                                                exec_stream_>>>(
+                c.ptr_i8(), c.scale, s.ptr, positions.ptr_i32(),
+                per_pos_size, row_elems, src_stride, pages.ptr_i32(),
+                indptr.ptr_i32(), page_size);
+        } else if (c.is_fp8_kv()) {
+            kv_append_paged_ragged_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr_fp8(), s.ptr, positions.ptr_i32(), per_pos_size,
+                src_stride, pages.ptr_i32(), indptr.ptr_i32(), page_size);
+        } else if (c.is_fp16()) {
+            kv_append_paged_ragged_kernel_f16<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr_h(), s.ptr, positions.ptr_i32(), per_pos_size,
+                src_stride, pages.ptr_i32(), indptr.ptr_i32(), page_size);
+        } else {
+            kv_append_paged_ragged_kernel<<<grid, threads, 0, exec_stream_>>>(
+                c.ptr, s.ptr, positions.ptr_i32(), per_pos_size,
+                src_stride, pages.ptr_i32(), indptr.ptr_i32(), page_size);
+        }
+        return launch_status("cuda kv_append_batch_paged_ragged_device");
     }
 
     DeviceStatus ensure_fattn_scratch(uint32_t n_heads, uint32_t batch,

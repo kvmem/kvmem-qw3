@@ -557,6 +557,25 @@ public:
         return {false, "kv_append_batch_paged_device requires backend override"};
     }
 
+    // Cross-request paged KV append. src layout is [batch, src_stride], each
+    // row b writes to logical_positions[b] through the page-table slice
+    // page_indices[page_indptr[b]..page_indptr[b+1]).
+    virtual DeviceStatus kv_append_batch_paged_ragged_device(
+                                                      DeviceTensor &cache,
+                                                      const DeviceTensor &src,
+                                                      const DeviceTensor &logical_positions,
+                                                      uint32_t per_pos_size,
+                                                      uint32_t batch,
+                                                      uint32_t src_stride,
+                                                      const DeviceTensor &page_indices,
+                                                      const DeviceTensor &page_indptr,
+                                                      uint32_t page_size) {
+        (void)cache; (void)src; (void)logical_positions; (void)per_pos_size;
+        (void)batch; (void)src_stride; (void)page_indices; (void)page_indptr;
+        (void)page_size;
+        return {false, "kv_append_batch_paged_ragged_device requires backend override"};
+    }
+
     // Decode-step attention: causal scaled dot-product over the live KV cache.
     //   out[head, d]     = sum_t softmax(q_head . K[t, kv_head] * scale) * V[t, kv_head, d]
     // where kv_head = head / (n_heads / n_kv_heads).

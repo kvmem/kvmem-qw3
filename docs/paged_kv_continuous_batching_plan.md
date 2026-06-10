@@ -450,6 +450,11 @@ Completion Notes:
     decode-page preparation hook. The continuous batching executor now proves
     that active greedy requests have mutable hidden state, page tables, and
     current-token KV pages ready before the delegated body path runs.
+  - Added a backend interface and CUDA implementation for ragged batched KV
+    append. The new append path supports per-row logical positions and
+    per-request page-table slices for FP32, FP16, FP8, and Q8 KV cache
+    storage. This removes the remaining append-side blocker for cross-request
+    standard-attention batching.
   - This path is available for attention executor wiring, but the current
     continuous batching executor still uses the delegated body path plus
     batched lm_head tail.
@@ -460,6 +465,7 @@ Completion Notes:
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_ragged_backend_cb.json --timeout 900 --min-batch 2`: passed, `trace_max_batch=2`, `summary_max_batch=2`, `paged_kv_ready=true`, `hgemm_guard=true`.
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_ragged_metadata_required_cb.json --timeout 900 --min-batch 2 --require-ragged-metadata`: passed, `ragged_metadata_ready=true`, `ragged_pages=4`, `ragged_max_seq_len=22`.
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_ready_cb.json --timeout 900 --min-batch 2 --require-body-batch-ready --require-ragged-metadata`: passed, `body_batch_ready=true`, `ragged_metadata_ready=true`, `ragged_pages=4`, `ragged_max_seq_len=22`.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_ragged_kv_append_cb.json --timeout 900 --min-batch 2 --require-body-batch-ready --require-ragged-metadata`: passed, `body_batch_ready=true`, `ragged_metadata_ready=true`, `ragged_pages=4`, `ragged_max_seq_len=21`.
 
 Stage 6 throughput subplan:
 
