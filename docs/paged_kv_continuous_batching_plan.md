@@ -461,6 +461,16 @@ Completion Notes:
     FlashInfer ragged paged batch decode. Recurrent layers are still executed
     per request through a narrow single-layer executor interface, so this is
     correctness-first and not the final throughput target.
+  - Extended the FlashInfer paged batch decode adapter from FP16 KV to FP8
+    KV by instantiating the same paged batch decode path with raw e4m3 KV
+    cache storage. Both non-ragged paged device attention and ragged
+    continuous-batching attention now dispatch to the FP8 launcher when
+    `QW3_KV_DTYPE=fp8`.
+  - Fixed the FP8 non-ragged paged device attention path: it previously chose
+    an FP8 batch-decode plan but still launched the FP16 KV FlashInfer kernel,
+    causing the 1-byte FP8 cache plane to be read as half data. That made even
+    non-continuous FP8 requests non-deterministic across repeated requests.
+    The path now dispatches FP16 and FP8 launchers consistently.
   - Verification:
     - `cmake --build build -j`: passed.
     - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
@@ -473,6 +483,10 @@ Completion Notes:
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_on_16_cb.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed, `mode=body_batch_fp16`, exact output parity.
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_on_4prompts_cb.json --timeout 900 --max-active 4 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed, `max_batch=4`, `mode=body_batch_fp16`.
     - Matched 4-prompt comparison without body batch wrote `/tmp/qw3_stage6_body_off_4prompts_cb.json`. Body batch reduced observed continuous request latencies from roughly `0.667-0.810s` to `0.611-0.741s` for this short test. This is a modest improvement because recurrent layers are still per-request.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_fp8_body_off_fixed_cb.json --timeout 900 --min-batch 2 --require-ragged-metadata --extra-arg=--kv-dtype --extra-arg=fp8`: passed, exact output parity, `max_batch=2`.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_fp8_fixed_cb.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --extra-arg=--kv-dtype --extra-arg=fp8`: passed, exact output parity, `max_batch=2`, `mode=body_batch_fp16`.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_fp8_4prompts_fixed_rerun_cb.json --timeout 900 --max-active 4 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --extra-arg=--kv-dtype --extra-arg=fp8`: passed on rerun, exact output parity, `max_batch=4`.
+    - Note: the first FP8 4-prompt body-batch run wrote `/tmp/qw3_stage6_body_fp8_4prompts_fixed_cb.json` and had one `cuda` prompt divergence after a 10-character common prefix. Immediate rerun passed all comparisons; FP8 KV is numerically more sensitive, so wider FP8 tests should be repeated before treating a late greedy-token split as a deterministic regression.
 
 Stage 6 throughput subplan:
 

@@ -1174,7 +1174,7 @@ private:
                                 const ContinuousDecodeBatch &batch) const {
             if (!can_use_lm_head_batch(active, batch)) return false;
             const std::string kv_dtype = env_lower_ascii(env_value("QW3_KV_DTYPE"));
-            if (!kv_dtype.empty() && kv_dtype != "fp16") return false;
+            if (!kv_dtype.empty() && kv_dtype != "fp16" && kv_dtype != "fp8") return false;
             for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
                 const QwenLayerWeights &layer = weights_.layer(il);
                 if (!layer.recurrent && (!layer.attn_q || !layer.attn_k ||

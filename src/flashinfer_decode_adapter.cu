@@ -531,6 +531,26 @@ uint32_t batch_decode_f32q_f16kv_chunk_size(uint32_t n_heads,
     return 0;
 }
 
+uint32_t batch_decode_f32q_fp8kv_chunk_size(uint32_t n_heads,
+                                            uint32_t n_kv_heads,
+                                            uint32_t head_dim,
+                                            uint32_t batch,
+                                            uint32_t max_seq_len) {
+    if (n_heads == 0 || n_kv_heads == 0 || batch == 0 || max_seq_len == 0) return 0;
+    if ((n_heads % n_kv_heads) != 0) return 0;
+    using Params = flashinfer::BatchDecodeParams<float, __nv_fp8_e4m3, half, int32_t>;
+    using Variant = flashinfer::DefaultAttention<false, false, false, false>;
+    if (head_dim == 128) {
+        return plan_batch_decode_head_dim<128, Params, Variant>(
+            n_heads, n_kv_heads, batch, max_seq_len);
+    }
+    if (head_dim == 256) {
+        return plan_batch_decode_head_dim<256, Params, Variant>(
+            n_heads, n_kv_heads, batch, max_seq_len);
+    }
+    return 0;
+}
+
 bool launch_batch_decode_f32q_f16kv_gated(
         float *out,
         half *o_f16,
@@ -607,6 +627,103 @@ bool launch_batch_decode_f32q_f16kv_gated(
     params.kv_chunk_size_ptr = const_cast<int32_t *>(kv_chunk_size);
     params.block_valid_mask = nullptr;
 
+    (void)cudaGetLastError();
+    cudaError_t st = cudaErrorInvalidValue;
+    if (head_dim == 128) {
+        st = launch_batch_decode_head_dim_dispatch<128, Params, Variant>(
+            params, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
+    } else if (head_dim == 256) {
+        st = launch_batch_decode_head_dim_dispatch<256, Params, Variant>(
+            params, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
+    }
+    if (st != cudaSuccess) return false;
+
+    const uint64_t elems = static_cast<uint64_t>(batch) * n_heads * head_dim;
+    const unsigned threads = 256;
+    const unsigned blocks = static_cast<unsigned>((elems + threads - 1) / threads);
+    unpack_gate_batch_kernel<<<blocks, threads, 0, stream>>>(
+        out, o_f16, q, q_stride, batch, n_heads, head_dim,
+        q_batch_stride, out_batch_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_batch_decode_f32q_fp8kv_gated(
+        float *out,
+        half *o_f16,
+        half *tmp_v,
+        float *tmp_s,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *request_indices,
+        const int32_t *kv_tile_indices,
+        const int32_t *o_indptr,
+        const int32_t *o_indptr_host,
+        const int32_t *kv_chunk_size,
+        bool partition_kv,
+        bool rowwise_merge,
+        uint32_t page_size,
+        uint32_t total_tiles,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t batch,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream) {
+    if (out == nullptr || o_f16 == nullptr || q == nullptr ||
+        k_cache == nullptr || v_cache == nullptr || page_indices == nullptr ||
+        page_indptr == nullptr || last_page_len == nullptr ||
+        request_indices == nullptr || kv_tile_indices == nullptr ||
+        o_indptr == nullptr || o_indptr_host == nullptr ||
+        kv_chunk_size == nullptr) {
+        return false;
+    }
+    if (partition_kv && (tmp_v == nullptr || tmp_s == nullptr)) {
+        return false;
+    }
+    if (n_heads == 0 || n_kv_heads == 0 || (n_heads % n_kv_heads) != 0) return false;
+    if (batch == 0 || total_tiles == 0 || page_size == 0 || q_stride < head_dim) return false;
+
+    using Params = flashinfer::BatchDecodeParams<float, __nv_fp8_e4m3, half, int32_t>;
+    using Variant = flashinfer::DefaultAttention<false, false, false, false>;
+
+    auto paged_kv = flashinfer::paged_kv_t<__nv_fp8_e4m3, int32_t>(
+        n_kv_heads, page_size, head_dim, batch, flashinfer::QKVLayout::kNHD,
+        const_cast<__nv_fp8_e4m3 *>(static_cast<const __nv_fp8_e4m3 *>(k_cache)),
+        const_cast<__nv_fp8_e4m3 *>(static_cast<const __nv_fp8_e4m3 *>(v_cache)),
+        const_cast<int32_t *>(page_indices),
+        const_cast<int32_t *>(page_indptr),
+        const_cast<int32_t *>(last_page_len),
+        nullptr);
+    Params params(
+        const_cast<float *>(q),
+        nullptr,
+        paged_kv,
+        o_f16,
+        nullptr,
+        nullptr,
+        n_heads,
+        static_cast<int32_t>(q_batch_stride),
+        static_cast<int32_t>(q_stride),
+        -1,
+        0.0f,
+        scale,
+        1.0f,
+        1.0f);
+    params.padded_batch_size = total_tiles;
+    params.request_indices = const_cast<int32_t *>(request_indices);
+    params.kv_tile_indices = const_cast<int32_t *>(kv_tile_indices);
+    params.o_indptr = const_cast<int32_t *>(o_indptr);
+    params.kv_chunk_size_ptr = const_cast<int32_t *>(kv_chunk_size);
+    params.block_valid_mask = nullptr;
+
+    (void)cudaGetLastError();
     cudaError_t st = cudaErrorInvalidValue;
     if (head_dim == 128) {
         st = launch_batch_decode_head_dim_dispatch<128, Params, Variant>(

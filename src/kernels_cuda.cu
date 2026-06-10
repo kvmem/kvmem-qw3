@@ -296,7 +296,43 @@ uint32_t batch_decode_f32q_f16kv_chunk_size(uint32_t n_heads,
                                             uint32_t batch,
                                             uint32_t max_seq_len);
 
+uint32_t batch_decode_f32q_fp8kv_chunk_size(uint32_t n_heads,
+                                            uint32_t n_kv_heads,
+                                            uint32_t head_dim,
+                                            uint32_t batch,
+                                            uint32_t max_seq_len);
+
 bool launch_batch_decode_f32q_f16kv_gated(
+        float *out,
+        __half *o_f16,
+        __half *tmp_v,
+        float *tmp_s,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *request_indices,
+        const int32_t *kv_tile_indices,
+        const int32_t *o_indptr,
+        const int32_t *o_indptr_host,
+        const int32_t *kv_chunk_size,
+        bool partition_kv,
+        bool rowwise_merge,
+        uint32_t page_size,
+        uint32_t total_tiles,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t batch,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream);
+
+bool launch_batch_decode_f32q_fp8kv_gated(
         float *out,
         __half *o_f16,
         __half *tmp_v,
@@ -5630,10 +5666,12 @@ public:
 
 #if QW3_ENABLE_FLASHINFER
         if (decode_flashinfer_attention_enabled() &&
-            kc.is_fp16() &&
+            (kc.is_fp16() || kc.is_fp8_kv()) &&
             (head_dim == 128 || head_dim == 256)) {
-            const uint32_t chunk_size =
-                flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
+            const uint32_t chunk_size = kc.is_fp8_kv()
+                ? flashinfer_adapter::batch_decode_f32q_fp8kv_chunk_size(
+                    n_heads, n_kv_heads, head_dim, batch, max_seq_len)
+                : flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
                     n_heads, n_kv_heads, head_dim, batch, max_seq_len);
             const bool partition_kv = flashinfer_batch_decode_partition_enabled();
             if (chunk_size > 0) {
@@ -5717,7 +5755,8 @@ public:
                         !st.ok) return st;
                     fi_page_indices = meta_d + page_indices_offset;
                 }
-                if (flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
+                const bool launched = kc.is_fp8_kv()
+                    ? flashinfer_adapter::launch_batch_decode_f32q_fp8kv_gated(
                         o.ptr, flashinfer_batch_decode_o_f16_,
                         flashinfer_batch_decode_tmp_v_,
                         flashinfer_batch_decode_tmp_s_,
@@ -5735,13 +5774,33 @@ public:
                         page_size, total_tiles,
                         n_heads, n_kv_heads, head_dim, batch,
                         q_batch_stride, out_batch_stride, scale,
-                        exec_stream_)) {
+                        exec_stream_)
+                    : flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
+                        o.ptr, flashinfer_batch_decode_o_f16_,
+                        flashinfer_batch_decode_tmp_v_,
+                        flashinfer_batch_decode_tmp_s_,
+                        qq.ptr, q_stride, kc.ptr, vc.ptr,
+                        fi_page_indices,
+                        meta_d + page_indptr_offset,
+                        meta_d + last_page_len_offset,
+                        meta_d + request_indices_offset,
+                        meta_d + kv_tile_indices_offset,
+                        meta_d + o_indptr_offset,
+                        o_indptr.data(),
+                        meta_d + kv_chunk_size_offset,
+                        partition_kv,
+                        flashinfer_batch_decode_rowwise_merge_enabled(),
+                        page_size, total_tiles,
+                        n_heads, n_kv_heads, head_dim, batch,
+                        q_batch_stride, out_batch_stride, scale,
+                        exec_stream_);
+                if (launched) {
                     return launch_status("cuda attention_decode_batch flashinfer paged device decode gated");
                 }
             }
         }
 #endif
-        return {false, "paged device attention requires FlashInfer FP16 batch decode"};
+        return {false, "paged device attention requires FlashInfer FP16/FP8 batch decode"};
     }
 
     DeviceStatus attention_decode_batch_paged_gated_ragged_device(
@@ -5785,7 +5844,7 @@ public:
 
 #if QW3_ENABLE_FLASHINFER
         if (decode_flashinfer_attention_enabled() &&
-            kc.is_fp16() &&
+            (kc.is_fp16() || kc.is_fp8_kv()) &&
             (head_dim == 128 || head_dim == 256)) {
             std::vector<int32_t> seq_h(batch, 0);
             std::vector<int32_t> indptr_h(static_cast<size_t>(batch) + 1, 0);
@@ -5824,8 +5883,10 @@ public:
                 max_seq_len = std::max(max_seq_len, static_cast<uint32_t>(seq_h[b]));
             }
 
-            const uint32_t chunk_size =
-                flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
+            const uint32_t chunk_size = kc.is_fp8_kv()
+                ? flashinfer_adapter::batch_decode_f32q_fp8kv_chunk_size(
+                    n_heads, n_kv_heads, head_dim, batch, max_seq_len)
+                : flashinfer_adapter::batch_decode_f32q_f16kv_chunk_size(
                     n_heads, n_kv_heads, head_dim, batch, max_seq_len);
             if (chunk_size == 0) {
                 return {false, "ragged attention FlashInfer plan rejected shape"};
@@ -5883,14 +5944,13 @@ public:
             }
 
             int32_t *meta_d = flashinfer_batch_decode_meta_i32_;
-            if (flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
+            const bool launched = kc.is_fp8_kv()
+                ? flashinfer_adapter::launch_batch_decode_f32q_fp8kv_gated(
                     o.ptr, flashinfer_batch_decode_o_f16_,
                     flashinfer_batch_decode_tmp_v_,
                     flashinfer_batch_decode_tmp_s_,
                     qq.ptr, q_stride, kc.ptr, vc.ptr,
-                    pages.ptr_i32(),
-                    indptr.ptr_i32(),
-                    last_len.ptr_i32(),
+                    pages.ptr_i32(), indptr.ptr_i32(), last_len.ptr_i32(),
                     meta_d + request_indices_offset,
                     meta_d + kv_tile_indices_offset,
                     meta_d + o_indptr_offset,
@@ -5901,12 +5961,30 @@ public:
                     page_size, total_tiles,
                     n_heads, n_kv_heads, head_dim, batch,
                     q_batch_stride, out_batch_stride, scale,
-                    exec_stream_)) {
+                    exec_stream_)
+                : flashinfer_adapter::launch_batch_decode_f32q_f16kv_gated(
+                    o.ptr, flashinfer_batch_decode_o_f16_,
+                    flashinfer_batch_decode_tmp_v_,
+                    flashinfer_batch_decode_tmp_s_,
+                    qq.ptr, q_stride, kc.ptr, vc.ptr,
+                    pages.ptr_i32(), indptr.ptr_i32(), last_len.ptr_i32(),
+                    meta_d + request_indices_offset,
+                    meta_d + kv_tile_indices_offset,
+                    meta_d + o_indptr_offset,
+                    o_indptr.data(),
+                    meta_d + kv_chunk_size_offset,
+                    partition_kv,
+                    flashinfer_batch_decode_rowwise_merge_enabled(),
+                    page_size, total_tiles,
+                    n_heads, n_kv_heads, head_dim, batch,
+                    q_batch_stride, out_batch_stride, scale,
+                    exec_stream_);
+            if (launched) {
                 return launch_status("cuda attention_decode_batch flashinfer ragged paged decode gated");
             }
         }
 #endif
-        return {false, "cuda ragged paged batch decode attention requires FlashInfer FP16 KV"};
+        return {false, "cuda ragged paged batch decode attention requires FlashInfer FP16/FP8 KV"};
     }
 
     DeviceStatus attention_decode_batch_gated(DeviceTensor &out,

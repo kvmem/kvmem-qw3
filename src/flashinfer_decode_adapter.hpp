@@ -59,7 +59,43 @@ uint32_t batch_decode_f32q_f16kv_chunk_size(uint32_t n_heads,
                                             uint32_t batch,
                                             uint32_t max_seq_len);
 
+uint32_t batch_decode_f32q_fp8kv_chunk_size(uint32_t n_heads,
+                                            uint32_t n_kv_heads,
+                                            uint32_t head_dim,
+                                            uint32_t batch,
+                                            uint32_t max_seq_len);
+
 bool launch_batch_decode_f32q_f16kv_gated(
+        float *out,
+        __half *o_f16,
+        __half *tmp_v,
+        float *tmp_s,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *request_indices,
+        const int32_t *kv_tile_indices,
+        const int32_t *o_indptr,
+        const int32_t *o_indptr_host,
+        const int32_t *kv_chunk_size,
+        bool partition_kv,
+        bool rowwise_merge,
+        uint32_t page_size,
+        uint32_t total_tiles,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t batch,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream);
+
+bool launch_batch_decode_f32q_fp8kv_gated(
         float *out,
         __half *o_f16,
         __half *tmp_v,
