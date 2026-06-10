@@ -2118,6 +2118,30 @@ __global__ void rope_partial_kernel(float *x,
     base[i + half] = x0 * s + x1 * c;
 }
 
+__global__ void rope_partial_positions_kernel(float *x,
+                                              uint32_t n_units,
+                                              uint32_t per_unit_stride,
+                                              uint32_t rope_dim,
+                                              const int32_t *positions,
+                                              uint32_t batch_stride,
+                                              float theta) {
+    const uint32_t b    = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t i = threadIdx.x;
+    if (unit >= n_units) return;
+    const uint32_t half = rope_dim / 2;
+    if (i >= half) return;
+    float *base = x + static_cast<uint64_t>(b) * batch_stride + unit * per_unit_stride;
+    const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) / static_cast<float>(rope_dim));
+    const float angle = static_cast<float>(positions[b]) * inv_freq;
+    float c, s;
+    __sincosf(angle, &s, &c);
+    const float x0 = base[i];
+    const float x1 = base[i + half];
+    base[i]        = x0 * c - x1 * s;
+    base[i + half] = x0 * s + x1 * c;
+}
+
 __global__ void kv_append_kernel(float *cache,
                                  const float *src,
                                  uint32_t base_pos,
@@ -4124,6 +4148,29 @@ public:
         return launch_status("cuda rope_partial_batch");
     }
 
+    DeviceStatus rope_partial_batch_positions(DeviceTensor &x,
+                                              uint32_t batch,
+                                              uint32_t batch_stride,
+                                              uint32_t n_units,
+                                              uint32_t per_unit_stride,
+                                              uint32_t rope_dim,
+                                              const DeviceTensor &positions,
+                                              float theta) override {
+        if (batch == 0) return {};
+        auto &t = as_tensor(x);
+        const auto &pos = as_tensor(positions);
+        if (pos.elem_size != sizeof(int32_t) || pos.count < batch) {
+            return {false, "rope_partial_batch_positions positions tensor invalid"};
+        }
+        const uint32_t half = rope_dim / 2;
+        if (half == 0) return {};
+        dim3 grid(batch, n_units);
+        rope_partial_positions_kernel<<<grid, half, 0, exec_stream_>>>(
+            t.ptr, n_units, per_unit_stride, rope_dim, pos.ptr_i32(),
+            batch_stride, theta);
+        return launch_status("cuda rope_partial_batch_positions");
+    }
+
     DeviceStatus kv_append(DeviceTensor &cache,
                            const DeviceTensor &src,
                            uint32_t pos,
@@ -5520,6 +5567,32 @@ public:
         }
 #endif
         return {false, "paged device attention requires FlashInfer FP16 batch decode"};
+    }
+
+    DeviceStatus attention_decode_batch_paged_gated_ragged_device(
+                                              DeviceTensor &out,
+                                              const DeviceTensor &q,
+                                              uint32_t q_stride,
+                                              const DeviceTensor &k_cache,
+                                              const DeviceTensor &v_cache,
+                                              const DeviceTensor &page_indices,
+                                              const DeviceTensor &page_indptr,
+                                              const DeviceTensor &last_page_len,
+                                              const DeviceTensor &seq_lens,
+                                              uint32_t page_size,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim,
+                                              uint32_t batch,
+                                              uint32_t q_batch_stride,
+                                              uint32_t out_batch_stride,
+                                              float scale) override {
+        (void)out; (void)q; (void)q_stride; (void)k_cache; (void)v_cache;
+        (void)page_indices; (void)page_indptr; (void)last_page_len;
+        (void)seq_lens; (void)page_size; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)batch; (void)q_batch_stride;
+        (void)out_batch_stride; (void)scale;
+        return {false, "cuda ragged paged batch decode attention not implemented"};
     }
 
     DeviceStatus attention_decode_batch_gated(DeviceTensor &out,

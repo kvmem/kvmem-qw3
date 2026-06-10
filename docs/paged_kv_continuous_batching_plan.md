@@ -436,6 +436,37 @@ Completion Notes:
     per-request body path, so aggregate decode throughput is only slightly
     improved by the batched lm_head tail.
 
+Stage 6 throughput subplan:
+
+1. Metadata and observability:
+   - Keep reporting `scheduler_batch` separately from `kernel_batch`.
+   - Add backend interfaces for arbitrary per-row RoPE positions and ragged
+     per-request paged attention metadata.
+   - Verification: compile-only plus existing continuous batching regression.
+2. Batched standard-attention layer:
+   - Pack active request hidden states into `[B, hidden]`.
+   - Batch attention norm, Q/K/V projections, Q/K norms, per-row-position
+     RoPE, KV append, FlashInfer ragged paged decode, attention output
+     projection, and residual.
+   - Verification: batch=1 parity, batch=2 exact greedy parity, page-table
+     isolation tests.
+3. Batched recurrent layer:
+   - Add independent-state recurrent batch kernels. This is distinct from the
+     existing time-batched `recurrent_batch()`.
+   - Keep each request's recurrent and conv states isolated.
+   - Verification: state isolation tests and exact greedy parity.
+4. Batched FFN:
+   - Batch FFN norm, gate/up projections, SwiGLU, down projection, and residual
+     for active requests.
+   - Verification: exact greedy parity and throughput counters.
+5. Full greedy decode executor:
+   - Replace the delegated body path for greedy no-penalty requests.
+   - Keep fallback to delegated decode for unsupported dtypes, sampling,
+     penalties, and any backend lacking the required kernels.
+   - Verification: continuous batching regression, paged KV regression,
+     OpenCode concurrent streaming test, and throughput comparison against the
+     delegated path.
+
 ## Stage 7: Chunked Prefill and Decode Interleaving
 
 Goal: prevent long prefills from blocking active decode requests.

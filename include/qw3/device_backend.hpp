@@ -466,6 +466,22 @@ public:
         return {};
     }
 
+    // Batched RoPE where every row has an arbitrary logical position. This is
+    // required for cross-request continuous decode: active rows are not
+    // consecutive positions from the same sequence.
+    virtual DeviceStatus rope_partial_batch_positions(DeviceTensor &x,
+                                                      uint32_t batch,
+                                                      uint32_t batch_stride,
+                                                      uint32_t n_units,
+                                                      uint32_t per_unit_stride,
+                                                      uint32_t rope_dim,
+                                                      const DeviceTensor &positions,
+                                                      float theta) {
+        (void)x; (void)batch; (void)batch_stride; (void)n_units;
+        (void)per_unit_stride; (void)rope_dim; (void)positions; (void)theta;
+        return {false, "rope_partial_batch_positions requires backend override"};
+    }
+
     // Append `per_pos_size` floats from src into cache at slot `pos`.
     virtual DeviceStatus kv_append(DeviceTensor &cache,
                                    const DeviceTensor &src,
@@ -697,6 +713,37 @@ public:
         (void)n_kv_heads; (void)head_dim; (void)base_seq_len; (void)batch;
         (void)q_batch_stride; (void)out_batch_stride; (void)scale;
         return {false, "attention_decode_batch_paged_gated_device requires backend override"};
+    }
+
+    // Cross-request ragged paged decode attention. Each row b has its own page
+    // table slice page_indices[page_indptr[b]..page_indptr[b+1]), last page
+    // length, and sequence length. This is the continuous batching variant;
+    // unlike attention_decode_batch_paged_gated_device it does not assume one
+    // shared page table or consecutive positions.
+    virtual DeviceStatus attention_decode_batch_paged_gated_ragged_device(
+                                                      DeviceTensor &out,
+                                                      const DeviceTensor &q,
+                                                      uint32_t q_stride,
+                                                      const DeviceTensor &k_cache,
+                                                      const DeviceTensor &v_cache,
+                                                      const DeviceTensor &page_indices,
+                                                      const DeviceTensor &page_indptr,
+                                                      const DeviceTensor &last_page_len,
+                                                      const DeviceTensor &seq_lens,
+                                                      uint32_t page_size,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t head_dim,
+                                                      uint32_t batch,
+                                                      uint32_t q_batch_stride,
+                                                      uint32_t out_batch_stride,
+                                                      float scale) {
+        (void)out; (void)q; (void)q_stride; (void)k_cache; (void)v_cache;
+        (void)page_indices; (void)page_indptr; (void)last_page_len;
+        (void)seq_lens; (void)page_size; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)batch; (void)q_batch_stride;
+        (void)out_batch_stride; (void)scale;
+        return {false, "attention_decode_batch_paged_gated_ragged_device requires backend override"};
     }
 
     // Zero all floats in tensor. Used to reset KV / recurrent state between
