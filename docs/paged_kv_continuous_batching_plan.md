@@ -28,7 +28,7 @@ should be committed separately from unrelated work.
 | 3 | Request-level paged KV state | Completed | Passed on 2026-06-09 |
 | 4 | Global KV page pool | Completed | Passed on 2026-06-09 |
 | 5 | BatchedDecodeExecutor batch=1 parity | Completed | Passed on 2026-06-10 |
-| 6 | Batched greedy decode with FlashInfer paged attention | In Progress | Partial lm_head batch passed on 2026-06-10 |
+| 6 | Batched greedy decode with FlashInfer paged attention | In Progress | Ragged backend path passed on 2026-06-10 |
 | 7 | Chunked prefill and decode interleaving | Completed | Passed on 2026-06-10 |
 | 8 | Batched sampling optimization | Pending | Not run |
 
@@ -435,6 +435,20 @@ Completion Notes:
   - Q/K/V, FFN, and attention output linear layers are still executed in the
     per-request body path, so aggregate decode throughput is only slightly
     improved by the batched lm_head tail.
+- Stage 6.1 backend metadata and ragged attention path:
+  - Added backend interfaces for per-row RoPE positions and ragged per-request
+    paged decode attention metadata.
+  - Added a CUDA per-row-position RoPE kernel for packed request batches.
+  - Added a FlashInfer-backed ragged paged decode implementation for FP16 KV
+    cache with head dimensions supported by the existing FlashInfer adapter.
+  - This path is available for executor wiring, but the current continuous
+    batching executor still uses the delegated body path plus batched lm_head
+    tail.
+  - Verification:
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - `git diff --check`: passed.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_ragged_backend_cb.json --timeout 900 --min-batch 2`: passed, `trace_max_batch=2`, `summary_max_batch=2`, `paged_kv_ready=true`, `hgemm_guard=true`.
 
 Stage 6 throughput subplan:
 
