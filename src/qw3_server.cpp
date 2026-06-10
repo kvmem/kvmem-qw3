@@ -10,6 +10,7 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -622,18 +623,36 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     // Build GenerationOptions from common OpenAI fields. Default temperature=0
     // (greedy) for reproducible evals when the client omits it; default top_p=1.
-    auto make_gen = [&](const json &req) -> GenerationOptions {
+    auto make_gen = [&](const json &req, size_t prompt_token_count) -> GenerationOptions {
         GenerationOptions g = cfg.default_generation;
-        g.max_tokens = req.value("max_tokens",
-                                 req.value("max_completion_tokens", g.max_tokens));
-        if (g.max_tokens <= 0) g.max_tokens = 256;
-        if (cfg.default_generation.max_tokens > 0 &&
+        const int remaining_ctx =
+            std::max(1, engine.ctx_size - static_cast<int>(prompt_token_count));
+        const bool has_max_tokens =
+            req.contains("max_tokens") || req.contains("max_completion_tokens");
+        if (has_max_tokens) {
+            g.max_tokens = req.value("max_tokens",
+                                     req.value("max_completion_tokens", remaining_ctx));
+            if (g.max_tokens <= 0) g.max_tokens = remaining_ctx;
+        } else {
+            g.max_tokens = cfg.default_max_tokens_set
+                ? cfg.default_generation.max_tokens
+                : remaining_ctx;
+            if (g.max_tokens <= 0) g.max_tokens = remaining_ctx;
+        }
+        if (cfg.default_max_tokens_set &&
+            cfg.default_generation.max_tokens > 0 &&
             g.max_tokens > cfg.default_generation.max_tokens) {
             std::cerr << "[qw3-serve] capping request max_tokens from "
                       << g.max_tokens << " to "
                       << cfg.default_generation.max_tokens
                       << " (server limit)\n";
             g.max_tokens = cfg.default_generation.max_tokens;
+        }
+        if (g.max_tokens > remaining_ctx) {
+            std::cerr << "[qw3-serve] capping request max_tokens from "
+                      << g.max_tokens << " to " << remaining_ctx
+                      << " (remaining context)\n";
+            g.max_tokens = remaining_ctx;
         }
         g.temperature = req.value("temperature", g.temperature);
         g.top_p = req.value("top_p", g.top_p);
@@ -689,7 +708,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     " ctx=" + std::to_string(engine.ctx_size));
             return;
         }
-        GenerationOptions g = make_gen(req);
+        GenerationOptions g = make_gen(req, prompt_token_count);
         g.raw_prompt = true; // prompt is already chat-framed
         g.continuous_batching =
             serve_continuous_batching_enabled() &&
@@ -1021,12 +1040,21 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             "application/json");
             return;
         }
-        GenerationOptions g = make_gen(req);
+        const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
+        if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
+            set_error_response(
+                res,
+                413,
+                "prompt exceeds KV context: prompt_tokens=" +
+                    std::to_string(prompt_token_count) +
+                    " ctx=" + std::to_string(engine.ctx_size));
+            return;
+        }
+        GenerationOptions g = make_gen(req, prompt_token_count);
         g.raw_prompt = true; // /v1/completions sends raw text, no chat template
         g.continuous_batching =
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);
-        const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
         const std::string route = g.continuous_batching ? "continuous" : "plain";
         const std::string fallback_reason =
             g.continuous_batching ? "" :

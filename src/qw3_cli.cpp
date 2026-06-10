@@ -24,8 +24,8 @@ void usage(std::ostream &os) {
         "                        Sets QW3_KV_DTYPE before the model is loaded.\n"
         "  --enable-thinking     Default chat requests to thinking mode (long CoT).\n"
         "  --native-mtp-speculate Enable MTP speculative decode.\n"
-        "  -n N                  Default max generated tokens for requests\n"
-        "                        that omit max_tokens/max_completion_tokens.\n"
+        "  -n N                  Optional service max generated tokens cap.\n"
+        "                        Default: use remaining context per request.\n"
         "\n"
         "Runtime:\n"
         "  --backend NAME        mock, llama-cli, or qwen-native. Default: llama-cli\n"
@@ -201,6 +201,7 @@ int main(int argc, char **argv) {
                 think = true;
             } else if (arg == "-n") {
                 gen.max_tokens = parse_int(need(arg), arg);
+                serve_cfg.default_max_tokens_set = true;
             } else if (arg == "--temp") {
                 gen.temperature = parse_float(need(arg), arg);
             } else if (arg == "--top-p") {

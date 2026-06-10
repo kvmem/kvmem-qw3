@@ -550,6 +550,20 @@ Completion Notes:
     `python3 scripts/continuous_batching_benchmark.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 32 --ctx 2048 --prefill-chunk 512 --out-json /tmp/qw3_cb_benchmark_smoke.json --timeout 900 --max-active 2 --variants 'plain continuous body recurrent'`.
     Results: `plain=42.97 tok/s`, `continuous=43.73 tok/s`,
     `body=46.94 tok/s`, `recurrent=69.84 tok/s`.
+  - Changed server `-n` semantics for OpenAI-compatible serving:
+    omitting `-n` now means each request defaults to the remaining context
+    window (`ctx - prompt_tokens`) instead of an independent small generation
+    cap. Passing `-n` still installs an explicit service-side cap. This avoids
+    OpenCode requests with `max_tokens=32000` being truncated by an accidental
+    `-n 1024` service default.
+  - Verification of the new `-n` default:
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - Started 128K context service without `-n`:
+      `env QW3_CONTINUOUS_BATCHING=1 QW3_CONTINUOUS_BATCHING_TRACE=1 QW3_CONTINUOUS_BATCHING_BODY_BATCH=1 QW3_CONTINUOUS_BATCHING_MAX_ACTIVE=2 QW3_MATMUL=mmq ./build/qw3 serve --model models/Qwen3.6-27B-Q8_0.gguf --host 127.0.0.1 --port 8080 --ctx 131072 --temp 0 --prefill-chunk 512 --kv-dtype fp8`.
+    - A chat request with `max_tokens=32000` and a short instruction returned
+      `OK` with `completion_tokens=1`; server logs showed no
+      `server limit` cap.
 
 Stage 6 throughput subplan:
 
