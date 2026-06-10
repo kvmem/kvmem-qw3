@@ -455,9 +455,12 @@ Completion Notes:
     per-request page-table slices for FP32, FP16, FP8, and Q8 KV cache
     storage. This removes the remaining append-side blocker for cross-request
     standard-attention batching.
-  - This path is available for attention executor wiring, but the current
-    continuous batching executor still uses the delegated body path plus
-    batched lm_head tail.
+  - Added an experimental FP16 KV body-batch executor path gated by
+    `QW3_CONTINUOUS_BATCHING_BODY_BATCH=1`. Standard-attention layers now use
+    batched Q/K/V projection, per-row RoPE, ragged paged KV append, and
+    FlashInfer ragged paged batch decode. Recurrent layers are still executed
+    per request through a narrow single-layer executor interface, so this is
+    correctness-first and not the final throughput target.
   - Verification:
     - `cmake --build build -j`: passed.
     - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
@@ -466,6 +469,10 @@ Completion Notes:
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_ragged_metadata_required_cb.json --timeout 900 --min-batch 2 --require-ragged-metadata`: passed, `ragged_metadata_ready=true`, `ragged_pages=4`, `ragged_max_seq_len=22`.
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_ready_cb.json --timeout 900 --min-batch 2 --require-body-batch-ready --require-ragged-metadata`: passed, `body_batch_ready=true`, `ragged_metadata_ready=true`, `ragged_pages=4`, `ragged_max_seq_len=22`.
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_ragged_kv_append_cb.json --timeout 900 --min-batch 2 --require-body-batch-ready --require-ragged-metadata`: passed, `body_batch_ready=true`, `ragged_metadata_ready=true`, `ragged_pages=4`, `ragged_max_seq_len=21`.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_on_cb.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed, `mode=body_batch_fp16`.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 16 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_on_16_cb.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed, `mode=body_batch_fp16`, exact output parity.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_on_4prompts_cb.json --timeout 900 --max-active 4 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed, `max_batch=4`, `mode=body_batch_fp16`.
+    - Matched 4-prompt comparison without body batch wrote `/tmp/qw3_stage6_body_off_4prompts_cb.json`. Body batch reduced observed continuous request latencies from roughly `0.667-0.810s` to `0.611-0.741s` for this short test. This is a modest improvement because recurrent layers are still per-request.
 
 Stage 6 throughput subplan:
 

@@ -43,6 +43,9 @@ EXECUTOR_RE = re.compile(
 BODY_READY_RE = re.compile(
     r"native continuous_batch_executor:.*?body_batch_ready=(?P<body>true|false)"
 )
+BODY_MODE_RE = re.compile(
+    r"native continuous_batch_executor:.*?mode=(?P<mode>body_batch_fp16)"
+)
 
 
 @dataclass
@@ -81,6 +84,7 @@ class ServerRun:
     saw_paged_kv_ready: bool = False
     saw_hgemm_guard: bool = False
     saw_body_batch_ready: bool = False
+    saw_body_batch_mode: bool = False
     saw_ragged_metadata_ready: bool = False
     max_ragged_pages: int = 0
     max_ragged_seq_len: int = 0
@@ -189,7 +193,7 @@ def terminate_server(proc: subprocess.Popen[str]) -> str:
     return out + err
 
 
-def parse_server_log(log: str) -> Tuple[int, int, bool, bool, bool, bool, int, int]:
+def parse_server_log(log: str) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int]:
     max_trace_batch = 0
     saw_paged_kv_ready = False
     for m in BATCH_STEP_RE.finditer(log):
@@ -203,9 +207,12 @@ def parse_server_log(log: str) -> Tuple[int, int, bool, bool, bool, bool, int, i
         "QW3_DISABLE_HGEMM=1" in log
     )
     saw_body_batch_ready = False
+    saw_body_batch_mode = False
     saw_ragged_metadata_ready = False
     max_ragged_pages = 0
     max_ragged_seq_len = 0
+    for m in BODY_MODE_RE.finditer(log):
+        saw_body_batch_mode = saw_body_batch_mode or m.group("mode") == "body_batch_fp16"
     for m in BODY_READY_RE.finditer(log):
         saw_body_batch_ready = saw_body_batch_ready or m.group("body") == "true"
     for m in EXECUTOR_RE.finditer(log):
@@ -220,6 +227,7 @@ def parse_server_log(log: str) -> Tuple[int, int, bool, bool, bool, bool, int, i
         saw_paged_kv_ready,
         saw_hgemm_guard,
         saw_body_batch_ready,
+        saw_body_batch_mode,
         saw_ragged_metadata_ready,
         max_ragged_pages,
         max_ragged_seq_len,
@@ -246,10 +254,13 @@ def run_server_case(*,
         env["QW3_CONTINUOUS_BATCHING"] = "1"
         env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
         env["QW3_CONTINUOUS_BATCHING_MAX_ACTIVE"] = str(max_active)
+        if os.environ.get("QW3_TEST_ENABLE_BODY_BATCH") == "1":
+            env["QW3_CONTINUOUS_BATCHING_BODY_BATCH"] = "1"
     else:
         env.pop("QW3_CONTINUOUS_BATCHING", None)
         env.pop("QW3_CONTINUOUS_BATCHING_TRACE", None)
         env.pop("QW3_CONTINUOUS_BATCHING_MAX_ACTIVE", None)
+        env.pop("QW3_CONTINUOUS_BATCHING_BODY_BATCH", None)
     env.setdefault("QW3_MATMUL", "mmq")
 
     cmd = [
@@ -311,6 +322,7 @@ def run_server_case(*,
         saw_paged,
         saw_hgemm,
         saw_body,
+        saw_body_mode,
         saw_ragged,
         max_ragged_pages,
         max_ragged_seq_len,
@@ -326,6 +338,7 @@ def run_server_case(*,
         saw_paged_kv_ready=saw_paged,
         saw_hgemm_guard=saw_hgemm,
         saw_body_batch_ready=saw_body,
+        saw_body_batch_mode=saw_body_mode,
         saw_ragged_metadata_ready=saw_ragged,
         max_ragged_pages=max_ragged_pages,
         max_ragged_seq_len=max_ragged_seq_len,
@@ -381,6 +394,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="require at least one batched decode step with body inputs ready",
     )
     ap.add_argument(
+        "--enable-body-batch",
+        action="store_true",
+        help="enable QW3_CONTINUOUS_BATCHING_BODY_BATCH for the continuous run",
+    )
+    ap.add_argument(
+        "--require-body-batch-mode",
+        action="store_true",
+        help="require at least one continuous executor step in mode=body_batch_fp16",
+    )
+    ap.add_argument(
         "--extra-arg",
         action="append",
         default=[],
@@ -417,6 +440,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"running continuous batching regression: prompts={len(prompts)} "
         f"max_tokens={args.max_tokens} port={port}"
     )
+    if args.enable_body_batch:
+        os.environ["QW3_TEST_ENABLE_BODY_BATCH"] = "1"
+    else:
+        os.environ.pop("QW3_TEST_ENABLE_BODY_BATCH", None)
     baseline = run_server_case(
         mode="baseline",
         binary=binary,
@@ -487,6 +514,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         failed_requirements.append("did not observe QW3_DISABLE_HGEMM=1 guard")
     if args.require_body_batch_ready and not continuous.saw_body_batch_ready:
         failed_requirements.append("did not observe body_batch_ready=true")
+    if args.require_body_batch_mode and not continuous.saw_body_batch_mode:
+        failed_requirements.append("did not observe mode=body_batch_fp16")
     if args.require_ragged_metadata and not continuous.saw_ragged_metadata_ready:
         failed_requirements.append("did not observe ragged_metadata_ready=true")
 
@@ -502,6 +531,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "prefill_chunk": args.prefill_chunk,
             "max_active": args.max_active,
             "min_batch": args.min_batch,
+            "enable_body_batch": args.enable_body_batch,
         },
         "status": {
             "failed_runs": len(failed_runs),
@@ -513,6 +543,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "continuous_saw_paged_kv_ready": continuous.saw_paged_kv_ready,
             "continuous_saw_hgemm_guard": continuous.saw_hgemm_guard,
             "continuous_saw_body_batch_ready": continuous.saw_body_batch_ready,
+            "continuous_saw_body_batch_mode": continuous.saw_body_batch_mode,
             "continuous_saw_ragged_metadata_ready": (
                 continuous.saw_ragged_metadata_ready
             ),
@@ -544,6 +575,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"paged_kv_ready={continuous.saw_paged_kv_ready} "
         f"hgemm_guard={continuous.saw_hgemm_guard} "
         f"body_batch_ready={continuous.saw_body_batch_ready} "
+        f"body_batch_mode={continuous.saw_body_batch_mode} "
         f"ragged_metadata_ready={continuous.saw_ragged_metadata_ready} "
         f"ragged_pages={continuous.max_ragged_pages} "
         f"ragged_max_seq_len={continuous.max_ragged_seq_len}"

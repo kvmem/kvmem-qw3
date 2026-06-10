@@ -117,6 +117,11 @@ public:
     NativeExecutorReport dry_run_token(uint32_t token_id, bool execute_heavy);
     NativeExecutorReport forward_one_token(uint32_t token_id,
                                            bool compute_logits = true);
+    // Execute one recurrent layer plus its FFN using the executor's current
+    // hidden state. This does not advance position and is used by the
+    // continuous-batching body path while standard-attention layers are
+    // processed as a cross-request batch.
+    NativeExecutorReport forward_recurrent_layer_from_current_hidden(uint32_t layer_index);
     // Batched prefill. Processes `tokens` consecutively as a single forward
     // pass using batched matmuls for the linear projections + FFN. Per-token
     // ops (attention, recurrent state) still iterate sequentially inside.

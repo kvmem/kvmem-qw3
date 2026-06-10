@@ -770,6 +770,95 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     return report;
 }
 
+NativeExecutorReport QwenExecutor::forward_recurrent_layer_from_current_hidden(
+        uint32_t layer_index) {
+    NativeExecutorReport report;
+    const NativePlanInfo &plan = model_.plan();
+    if (!plan.supported) {
+        report.missing_kernels.push_back("native model plan is incomplete");
+        return report;
+    }
+    if (layer_index >= weights_.n_layers()) {
+        report.missing_kernels.push_back("recurrent layer index out of range");
+        return report;
+    }
+    ensure_scratch();
+
+    const QwenConfig &cfg = model_.config();
+    const QwenLayerWeights &layer = weights_.layer(layer_index);
+    if (!layer.recurrent) {
+        report.missing_kernels.push_back("requested layer is not recurrent");
+        return report;
+    }
+    const uint32_t head_k_dim = cfg.head_k_dim();
+    const uint32_t head_v_dim = cfg.head_v_dim_ssm();
+    const uint32_t num_k_heads = cfg.num_k_heads();
+    const uint32_t num_v_heads = cfg.num_v_heads();
+    const float eps = cfg.rms_eps;
+
+    require_status(backend_.begin());
+    begin_record_timing(executor_trace_timing_enabled());
+
+    require_status(backend_.rms_norm(*norm_, *h_, *layer.attn_norm, eps));
+    record(report, "layer." + std::to_string(layer_index) + ".attn_norm");
+    {
+        DeviceTensor *outs[4] = {proj_.get(), gate_proj_.get(), alpha_.get(), beta_.get()};
+        const DeviceWeight *ws[4] = {layer.attn_qkv, layer.attn_gate,
+                                      layer.ssm_alpha, layer.ssm_beta};
+        require_status(backend_.q8_0_matvec_fanout(outs, ws, 4, *norm_));
+    }
+    record(report, "layer." + std::to_string(layer_index) + ".recurrent_projections");
+    if (!recurrent_states_[layer_index] || !conv_states_[layer_index]) {
+        throw std::runtime_error("recurrent state not allocated for layer " +
+                                 std::to_string(layer_index));
+    }
+    require_status(backend_.recurrent_single_token(*core_,
+                                                   *recurrent_states_[layer_index],
+                                                   *conv_states_[layer_index],
+                                                   *conv_out_,
+                                                   *proj_,
+                                                   *gate_proj_,
+                                                   *alpha_,
+                                                   *beta_,
+                                                   *layer.ssm_conv1d,
+                                                   *layer.ssm_a,
+                                                   *layer.ssm_dt_bias,
+                                                   *layer.ssm_norm,
+                                                   num_k_heads,
+                                                   num_v_heads,
+                                                   head_k_dim,
+                                                   head_v_dim,
+                                                   cfg.ssm_conv_kernel,
+                                                   eps));
+    record(report, "layer." + std::to_string(layer_index) + ".deltanet_single_token");
+    if (auto st = backend_.q8_0_matvec_add(*h_, *layer.ssm_out, *core_); !st.ok) {
+        require_status(backend_.q8_0_matvec(*attn_out_, *layer.ssm_out, *core_));
+        require_status(backend_.add(*h_, *h_, *attn_out_));
+    }
+    record(report, "layer." + std::to_string(layer_index) + ".recurrent_output_add");
+    record(report, "layer." + std::to_string(layer_index) + ".attn_residual");
+
+    require_status(backend_.rms_norm(*norm_, *h_, *layer.ffn_norm, eps));
+    record(report, "layer." + std::to_string(layer_index) + ".ffn_norm");
+    if (auto st = backend_.q8_0_matvec_silu_mul(*ffn_mid_, *layer.ffn_gate,
+                                                *layer.ffn_up, *norm_);
+        !st.ok) {
+        DeviceTensor *outs[2] = {ffn_gate_.get(), ffn_up_.get()};
+        const DeviceWeight *ws[2] = {layer.ffn_gate, layer.ffn_up};
+        require_status(backend_.q8_0_matvec_fanout(outs, ws, 2, *norm_));
+        require_status(backend_.silu_mul(*ffn_mid_, *ffn_gate_, *ffn_up_));
+    }
+    if (auto st = backend_.q8_0_matvec_add(*h_, *layer.ffn_down, *ffn_mid_); !st.ok) {
+        require_status(backend_.q8_0_matvec(*ffn_out_, *layer.ffn_down, *ffn_mid_));
+        require_status(backend_.add(*h_, *h_, *ffn_out_));
+    }
+    record(report, "layer." + std::to_string(layer_index) + ".ffn");
+
+    require_status(backend_.end());
+    report.ok = true;
+    return report;
+}
+
 NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> &tokens,
                                                     bool compute_logits,
                                                     std::vector<DeviceArgmax> *row_argmaxes,

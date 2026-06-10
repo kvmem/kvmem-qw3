@@ -242,6 +242,10 @@ bool continuous_batching_trace_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_TRACE");
 }
 
+bool continuous_batching_body_batch_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_BODY_BATCH");
+}
+
 class GlobalKvPagePool final : public KvPhysicalPageAllocator {
 public:
     GlobalKvPagePool(uint32_t total_pages, uint32_t page_size)
@@ -1113,6 +1117,10 @@ private:
             if (input.batch == nullptr) return outputs;
             const ContinuousDecodeBatch &batch = *input.batch;
             reset_last_ragged_metadata();
+            if (continuous_batching_body_batch_enabled() &&
+                can_use_body_batch(active, batch)) {
+                return decode_body_batch(active, batch);
+            }
             if (can_use_lm_head_batch(active, batch)) {
                 return decode_lm_head_batch(active, batch);
             }
@@ -1162,6 +1170,21 @@ private:
             return true;
         }
 
+        bool can_use_body_batch(const std::vector<ContinuousBatchActive> &active,
+                                const ContinuousDecodeBatch &batch) const {
+            if (!can_use_lm_head_batch(active, batch)) return false;
+            const std::string kv_dtype = env_lower_ascii(env_value("QW3_KV_DTYPE"));
+            if (!kv_dtype.empty() && kv_dtype != "fp16") return false;
+            for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+                const QwenLayerWeights &layer = weights_.layer(il);
+                if (!layer.recurrent && (!layer.attn_q || !layer.attn_k ||
+                                         !layer.attn_v || !layer.attn_output)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         void ensure_lm_head_scratch(uint32_t batch, uint32_t hidden, uint32_t vocab) {
             if (batch == 0 || batch <= lm_head_batch_capacity_) return;
             hidden_batch_ = backend_.scratch_f32(static_cast<uint64_t>(batch) * hidden,
@@ -1171,6 +1194,44 @@ private:
             logits_batch_ = backend_.scratch_f32(static_cast<uint64_t>(batch) * vocab,
                                                  "cb_decode_logits_batch");
             lm_head_batch_capacity_ = batch;
+        }
+
+        void ensure_body_scratch(uint32_t batch) {
+            if (batch == 0 || batch <= body_batch_capacity_) return;
+            const QwenConfig &cfg = model_.config();
+            uint64_t max_ffn = 1;
+            uint64_t max_q = 1;
+            uint64_t max_k = 1;
+            uint64_t max_v = 1;
+            for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+                const QwenLayerWeights &layer = weights_.layer(il);
+                max_ffn = std::max<uint64_t>(max_ffn, layer.ffn_dim);
+                max_q = std::max<uint64_t>(max_q, layer.q_rows);
+                max_k = std::max<uint64_t>(max_k, layer.k_rows);
+                max_v = std::max<uint64_t>(max_v, layer.v_rows);
+            }
+            const uint64_t B = batch;
+            hidden_batch_ = backend_.scratch_f32(B * cfg.n_embd,
+                                                 "cb_body_hidden_batch");
+            norm_batch_ = backend_.scratch_f32(B * cfg.n_embd,
+                                               "cb_body_norm_batch");
+            attn_out_batch_ = backend_.scratch_f32(B * cfg.n_embd,
+                                                   "cb_body_attn_out_batch");
+            ffn_gate_batch_ = backend_.scratch_f32(B * max_ffn,
+                                                   "cb_body_ffn_gate_batch");
+            ffn_up_batch_ = backend_.scratch_f32(B * max_ffn,
+                                                 "cb_body_ffn_up_batch");
+            ffn_mid_batch_ = backend_.scratch_f32(B * max_ffn,
+                                                  "cb_body_ffn_mid_batch");
+            ffn_out_batch_ = backend_.scratch_f32(B * cfg.n_embd,
+                                                  "cb_body_ffn_out_batch");
+            q_batch_ = backend_.scratch_f32(B * max_q, "cb_body_q_batch");
+            k_batch_ = backend_.scratch_f32(B * max_k, "cb_body_k_batch");
+            v_batch_ = backend_.scratch_f32(B * max_v, "cb_body_v_batch");
+            mid_batch_ = backend_.scratch_f32(
+                B * static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim,
+                "cb_body_mid_batch");
+            body_batch_capacity_ = batch;
         }
 
         void ensure_ragged_metadata_scratch(uint32_t batch, uint32_t pages) {
@@ -1311,6 +1372,301 @@ private:
             return true;
         }
 
+        bool pack_ragged_metadata_for_body(
+                std::vector<ContinuousBatchActive> &active,
+                const ContinuousDecodeBatch &batch) {
+            last_ragged_metadata_ready_ = false;
+            last_ragged_metadata_pages_ = 0;
+            last_ragged_metadata_max_seq_len_ = 0;
+            const uint32_t bsz = static_cast<uint32_t>(batch.size());
+            if (bsz == 0) return false;
+
+            uint32_t page_size = 0;
+            uint32_t total_pages = 0;
+            uint32_t max_seq_len = 0;
+            ragged_positions_h_.assign(bsz, 0);
+            ragged_page_indptr_h_.assign(static_cast<size_t>(bsz) + 1, 0);
+            ragged_last_page_len_h_.assign(bsz, 0);
+            ragged_seq_lens_h_.assign(bsz, 0);
+            ragged_page_indices_h_.clear();
+
+            for (uint32_t row = 0; row < bsz; ++row) {
+                const size_t active_index = batch.active_indices[row];
+                if (active_index >= active.size() || !active[active_index].executor) {
+                    return false;
+                }
+                active[active_index].executor->prepare_decode_token_pages(1);
+                QwenExecutor::MutableDecodeStateView view =
+                    active[active_index].executor->mutable_decode_state_view();
+                const uint32_t old_pos = view.position;
+                const uint32_t seq_len = old_pos + 1;
+                if (view.kv_page_size == 0 || view.kv_page_indices_host == nullptr) {
+                    return false;
+                }
+                if (page_size == 0) {
+                    page_size = view.kv_page_size;
+                } else if (page_size != view.kv_page_size) {
+                    return false;
+                }
+                const uint32_t pages = (seq_len + page_size - 1) / page_size;
+                if (pages == 0 || view.kv_page_count < pages) return false;
+                ragged_positions_h_[row] = static_cast<int32_t>(old_pos);
+                ragged_seq_lens_h_[row] = static_cast<int32_t>(seq_len);
+                const uint32_t last_len = seq_len % page_size;
+                ragged_last_page_len_h_[row] =
+                    static_cast<int32_t>(last_len == 0 ? page_size : last_len);
+                ragged_page_indptr_h_[row] =
+                    static_cast<int32_t>(ragged_page_indices_h_.size());
+                for (uint32_t p = 0; p < pages; ++p) {
+                    ragged_page_indices_h_.push_back(view.kv_page_indices_host[p]);
+                }
+                total_pages += pages;
+                max_seq_len = std::max(max_seq_len, seq_len);
+            }
+            ragged_page_indptr_h_[bsz] =
+                static_cast<int32_t>(ragged_page_indices_h_.size());
+            if (total_pages != ragged_page_indices_h_.size()) return false;
+
+            ensure_ragged_metadata_scratch(bsz, total_pages);
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_positions_i32_, 0, ragged_positions_h_.data(), bsz));
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_page_indices_i32_, 0,
+                ragged_page_indices_h_.data(), total_pages));
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_page_indptr_i32_, 0,
+                ragged_page_indptr_h_.data(), static_cast<uint64_t>(bsz) + 1));
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_last_page_len_i32_, 0,
+                ragged_last_page_len_h_.data(), bsz));
+            require_ok(backend_.copy_i32_from_host(
+                *ragged_seq_lens_i32_, 0, ragged_seq_lens_h_.data(), bsz));
+
+            last_ragged_metadata_ready_ = true;
+            last_ragged_metadata_pages_ = total_pages;
+            last_ragged_metadata_max_seq_len_ = max_seq_len;
+            return true;
+        }
+
+        static DeviceTensor *layer_k_cache(QwenExecutor::MutableDecodeStateView &view,
+                                           uint32_t layer_index) {
+            if (view.k_cache_external && layer_index < view.k_cache_external->size()) {
+                return (*view.k_cache_external)[layer_index];
+            }
+            if (view.k_cache && layer_index < view.k_cache->size() &&
+                (*view.k_cache)[layer_index]) {
+                return (*view.k_cache)[layer_index].get();
+            }
+            return nullptr;
+        }
+
+        static DeviceTensor *layer_v_cache(QwenExecutor::MutableDecodeStateView &view,
+                                           uint32_t layer_index) {
+            if (view.v_cache_external && layer_index < view.v_cache_external->size()) {
+                return (*view.v_cache_external)[layer_index];
+            }
+            if (view.v_cache && layer_index < view.v_cache->size() &&
+                (*view.v_cache)[layer_index]) {
+                return (*view.v_cache)[layer_index].get();
+            }
+            return nullptr;
+        }
+
+        std::vector<BatchedDecodeOutput> decode_body_batch(
+                std::vector<ContinuousBatchActive> &active,
+                const ContinuousDecodeBatch &batch) {
+            std::vector<BatchedDecodeOutput> outputs;
+            outputs.reserve(batch.size());
+            last_mode_ = "body_batch_fp16";
+            last_kernel_batch_ = static_cast<uint32_t>(batch.size());
+            last_body_batch_ready_ = false;
+            const uint32_t bsz = static_cast<uint32_t>(batch.size());
+            const QwenConfig &cfg = model_.config();
+            const uint32_t hidden = cfg.n_embd;
+            const uint32_t vocab = static_cast<uint32_t>(weights_.output().rows);
+            const uint32_t standard_head_dim = cfg.head_dim;
+            const uint32_t standard_n_heads = cfg.n_heads;
+            const uint32_t standard_n_kv_heads = cfg.n_kv_heads;
+            const uint32_t q_stride = 2 * standard_head_dim;
+            const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
+            const uint32_t mid_stride = standard_n_heads * standard_head_dim;
+            const float eps = cfg.rms_eps;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
+
+            try {
+                if (!prepare_body_batch_inputs(active, batch)) {
+                    throw std::runtime_error("body batch inputs unavailable");
+                }
+                ensure_body_scratch(bsz);
+                ensure_lm_head_scratch(bsz, hidden, vocab);
+                if (!pack_ragged_metadata_for_body(active, batch)) {
+                    throw std::runtime_error("body batch ragged metadata unavailable");
+                }
+
+                std::vector<uint64_t> rows_h(bsz, 0);
+                for (uint32_t row = 0; row < bsz; ++row) {
+                    rows_h[row] = batch.feed_tokens[row];
+                    BatchedDecodeOutput out;
+                    out.active_index = batch.active_indices[row];
+                    out.feed_token = batch.feed_tokens[row];
+                    outputs.push_back(std::move(out));
+                }
+
+                require_ok(backend_.begin());
+                require_ok(backend_.q8_0_get_rows_batch(
+                    *hidden_batch_, weights_.token_embd(), rows_h.data(), bsz));
+
+                for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+                    const QwenLayerWeights &layer = weights_.layer(il);
+                    if (layer.recurrent) {
+                        for (uint32_t row = 0; row < bsz; ++row) {
+                            ContinuousBatchActive &a = active[outputs[row].active_index];
+                            QwenExecutor::MutableDecodeStateView view =
+                                a.executor->mutable_decode_state_view();
+                            require_ok(backend_.copy_d2d_into(
+                                *view.hidden, 0, *hidden_batch_,
+                                static_cast<uint64_t>(row) * hidden, hidden));
+                        }
+                        require_ok(backend_.end());
+                        for (uint32_t row = 0; row < bsz; ++row) {
+                            ContinuousBatchActive &a = active[outputs[row].active_index];
+                            NativeExecutorReport r =
+                                a.executor->forward_recurrent_layer_from_current_hidden(il);
+                            if (!r.ok) throw std::runtime_error("recurrent layer failed");
+                            outputs[row].report.ops_executed += r.ops_executed;
+                        }
+                        require_ok(backend_.begin());
+                        for (uint32_t row = 0; row < bsz; ++row) {
+                            ContinuousBatchActive &a = active[outputs[row].active_index];
+                            QwenExecutor::MutableDecodeStateView view =
+                                a.executor->mutable_decode_state_view();
+                            require_ok(backend_.copy_d2d_into(
+                                *hidden_batch_, static_cast<uint64_t>(row) * hidden,
+                                *view.hidden, 0, hidden));
+                        }
+                        continue;
+                    }
+
+                    require_ok(backend_.rms_norm_batch(
+                        *norm_batch_, *hidden_batch_, *layer.attn_norm,
+                        bsz, hidden, eps));
+                    DeviceTensor *qkv_outs[3] = {
+                        q_batch_.get(), k_batch_.get(), v_batch_.get()
+                    };
+                    const DeviceWeight *qkv_ws[3] = {
+                        layer.attn_q, layer.attn_k, layer.attn_v
+                    };
+                    const uint32_t qkv_strides[3] = {
+                        static_cast<uint32_t>(layer.q_rows),
+                        static_cast<uint32_t>(layer.k_rows),
+                        static_cast<uint32_t>(layer.v_rows),
+                    };
+                    require_ok(backend_.q8_0_matmul_fanout(
+                        qkv_outs, qkv_ws, qkv_strides, 3,
+                        *norm_batch_, bsz, hidden));
+                    require_ok(backend_.rmsnorm_per_head_batch(
+                        *q_batch_, *layer.attn_q_norm, bsz,
+                        static_cast<uint32_t>(layer.q_rows), standard_n_heads,
+                        q_stride, standard_head_dim, eps));
+                    require_ok(backend_.rmsnorm_per_head_batch(
+                        *k_batch_, *layer.attn_k_norm, bsz,
+                        static_cast<uint32_t>(layer.k_rows), standard_n_kv_heads,
+                        standard_head_dim, standard_head_dim, eps));
+                    require_ok(backend_.rope_partial_batch_positions(
+                        *q_batch_, bsz, static_cast<uint32_t>(layer.q_rows),
+                        standard_n_heads, q_stride, cfg.rope_dim,
+                        *ragged_positions_i32_, cfg.rope_theta));
+                    require_ok(backend_.rope_partial_batch_positions(
+                        *k_batch_, bsz, static_cast<uint32_t>(layer.k_rows),
+                        standard_n_kv_heads, standard_head_dim, cfg.rope_dim,
+                        *ragged_positions_i32_, cfg.rope_theta));
+
+                    QwenExecutor::MutableDecodeStateView first_view =
+                        active[outputs[0].active_index].executor->mutable_decode_state_view();
+                    DeviceTensor *k_cache = layer_k_cache(first_view, il);
+                    DeviceTensor *v_cache = layer_v_cache(first_view, il);
+                    if (!k_cache || !v_cache) {
+                        throw std::runtime_error("body batch KV cache unavailable");
+                    }
+                    require_ok(backend_.kv_append_batch_paged_ragged_device(
+                        *k_cache, *k_batch_, *ragged_positions_i32_, per_pos, bsz,
+                        static_cast<uint32_t>(layer.k_rows), *ragged_page_indices_i32_,
+                        *ragged_page_indptr_i32_, first_view.kv_page_size));
+                    require_ok(backend_.kv_append_batch_paged_ragged_device(
+                        *v_cache, *v_batch_, *ragged_positions_i32_, per_pos, bsz,
+                        static_cast<uint32_t>(layer.v_rows), *ragged_page_indices_i32_,
+                        *ragged_page_indptr_i32_, first_view.kv_page_size));
+                    require_ok(backend_.attention_decode_batch_paged_gated_ragged_device(
+                        *mid_batch_, *q_batch_, q_stride, *k_cache, *v_cache,
+                        *ragged_page_indices_i32_, *ragged_page_indptr_i32_,
+                        *ragged_last_page_len_i32_, *ragged_seq_lens_i32_,
+                        first_view.kv_page_size, standard_n_heads,
+                        standard_n_kv_heads, standard_head_dim, bsz,
+                        static_cast<uint32_t>(layer.q_rows), mid_stride, scale));
+                    require_ok(backend_.q8_0_matmul(
+                        *attn_out_batch_, *layer.attn_output, *mid_batch_,
+                        bsz, mid_stride, hidden));
+                    require_ok(backend_.add_n(
+                        *hidden_batch_, *hidden_batch_, *attn_out_batch_,
+                        static_cast<uint64_t>(bsz) * hidden));
+
+                    require_ok(backend_.rms_norm_batch(
+                        *norm_batch_, *hidden_batch_, *layer.ffn_norm,
+                        bsz, hidden, eps));
+                    require_ok(backend_.q8_0_matmul(
+                        *ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
+                        bsz, hidden, static_cast<uint32_t>(layer.ffn_dim)));
+                    require_ok(backend_.q8_0_matmul(
+                        *ffn_up_batch_, *layer.ffn_up, *norm_batch_,
+                        bsz, hidden, static_cast<uint32_t>(layer.ffn_dim)));
+                    require_ok(backend_.silu_mul_n(
+                        *ffn_mid_batch_, *ffn_gate_batch_, *ffn_up_batch_,
+                        static_cast<uint64_t>(bsz) * layer.ffn_dim));
+                    require_ok(backend_.q8_0_matmul(
+                        *ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
+                        bsz, static_cast<uint32_t>(layer.ffn_dim), hidden));
+                    require_ok(backend_.add_n(
+                        *hidden_batch_, *hidden_batch_, *ffn_out_batch_,
+                        static_cast<uint64_t>(bsz) * hidden));
+                }
+
+                for (uint32_t row = 0; row < bsz; ++row) {
+                    ContinuousBatchActive &a = active[outputs[row].active_index];
+                    QwenExecutor::MutableDecodeStateView view =
+                        a.executor->mutable_decode_state_view();
+                    require_ok(backend_.copy_d2d_into(
+                        *view.hidden, 0, *hidden_batch_,
+                        static_cast<uint64_t>(row) * hidden, hidden));
+                    a.executor->advance_position(1);
+                }
+                require_ok(backend_.rms_norm_batch(
+                    *norm_batch_, *hidden_batch_, weights_.output_norm(),
+                    bsz, hidden, eps));
+                require_ok(backend_.q8_0_matmul(
+                    *logits_batch_, weights_.output(), *norm_batch_,
+                    bsz, hidden, vocab));
+                std::vector<DeviceArgmax> argmaxes;
+                require_ok(backend_.argmax_batch(*logits_batch_, bsz, vocab, argmaxes));
+                require_ok(backend_.end());
+
+                for (uint32_t row = 0; row < bsz && row < argmaxes.size(); ++row) {
+                    outputs[row].report.argmax_token = argmaxes[row].token;
+                    outputs[row].report.argmax_logit = argmaxes[row].logit;
+                    outputs[row].report.argmax_text =
+                        model_.gguf().token_text(
+                            static_cast<uint32_t>(argmaxes[row].token));
+                    outputs[row].report.ok = true;
+                    outputs[row].report.ops_executed += 1;
+                }
+            } catch (const std::exception &e) {
+                try { (void)backend_.end(); } catch (...) {}
+                for (auto &out : outputs) {
+                    if (out.error.empty()) out.error = e.what();
+                }
+            }
+            return outputs;
+        }
+
         std::vector<BatchedDecodeOutput> decode_lm_head_batch(
                 std::vector<ContinuousBatchActive> &active,
                 const ContinuousDecodeBatch &batch) {
@@ -1404,11 +1760,21 @@ private:
         const QwenWeights &weights_;
         DeviceBackend &backend_;
         uint32_t lm_head_batch_capacity_ = 0;
+        uint32_t body_batch_capacity_ = 0;
         uint32_t ragged_metadata_batch_capacity_ = 0;
         uint32_t ragged_metadata_page_capacity_ = 0;
         std::unique_ptr<DeviceTensor> hidden_batch_;
         std::unique_ptr<DeviceTensor> norm_batch_;
         std::unique_ptr<DeviceTensor> logits_batch_;
+        std::unique_ptr<DeviceTensor> attn_out_batch_;
+        std::unique_ptr<DeviceTensor> ffn_gate_batch_;
+        std::unique_ptr<DeviceTensor> ffn_up_batch_;
+        std::unique_ptr<DeviceTensor> ffn_mid_batch_;
+        std::unique_ptr<DeviceTensor> ffn_out_batch_;
+        std::unique_ptr<DeviceTensor> q_batch_;
+        std::unique_ptr<DeviceTensor> k_batch_;
+        std::unique_ptr<DeviceTensor> v_batch_;
+        std::unique_ptr<DeviceTensor> mid_batch_;
         std::unique_ptr<DeviceTensor> ragged_positions_i32_;
         std::unique_ptr<DeviceTensor> ragged_page_indices_i32_;
         std::unique_ptr<DeviceTensor> ragged_page_indptr_i32_;
