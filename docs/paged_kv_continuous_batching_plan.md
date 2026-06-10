@@ -487,6 +487,24 @@ Completion Notes:
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_fp8_fixed_cb.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --extra-arg=--kv-dtype --extra-arg=fp8`: passed, exact output parity, `max_batch=2`, `mode=body_batch_fp16`.
     - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_body_fp8_4prompts_fixed_rerun_cb.json --timeout 900 --max-active 4 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata --extra-arg=--kv-dtype --extra-arg=fp8`: passed on rerun, exact output parity, `max_batch=4`.
     - Note: the first FP8 4-prompt body-batch run wrote `/tmp/qw3_stage6_body_fp8_4prompts_fixed_cb.json` and had one `cuda` prompt divergence after a 10-character common prefix. Immediate rerun passed all comparisons; FP8 KV is numerically more sensitive, so wider FP8 tests should be repeated before treating a late greedy-token split as a deterministic regression.
+  - Added an experimental cross-request recurrent batch backend path behind
+    `QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH=1`. It packs each request's
+    recurrent and conv state into `[batch, state]` scratch buffers, runs an
+    independent-state CUDA DeltaNet batch kernel, and copies state back to the
+    owning executors. This is deliberately not enabled by default yet.
+  - Recurrent batch verification status:
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - Default body-batch with recurrent batching disabled:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_stage6_recurrent_default_fp16_cb.json --timeout 900 --min-batch 2 --enable-body-batch --require-body-batch-mode --require-ragged-metadata`: passed.
+    - Experimental recurrent batching enabled failed exact parity:
+      `/tmp/qw3_stage6_recurrent_independent_fp16_cb.json` and
+      `/tmp/qw3_stage6_recurrent_independent_fp16_cb3.json` both diverged on
+      `capital` and `math`. Short-test latency improved, but correctness is
+      not acceptable yet. Suspected remaining causes are a subtle DeltaNet
+      independent-state math difference or decode recurrent projection
+      numerical path differences versus per-request matvec. Keep this path
+      experimental until exact parity is restored.
 
 Stage 6 throughput subplan:
 

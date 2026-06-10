@@ -246,6 +246,10 @@ bool continuous_batching_body_batch_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_BODY_BATCH");
 }
 
+bool continuous_batching_recurrent_batch_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH");
+}
+
 class GlobalKvPagePool final : public KvPhysicalPageAllocator {
 public:
     GlobalKvPagePool(uint32_t total_pages, uint32_t page_size)
@@ -1203,12 +1207,20 @@ private:
             uint64_t max_q = 1;
             uint64_t max_k = 1;
             uint64_t max_v = 1;
+            uint64_t max_recurrent_qkv = 1;
+            uint64_t max_recurrent_value = 1;
             for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
                 const QwenLayerWeights &layer = weights_.layer(il);
                 max_ffn = std::max<uint64_t>(max_ffn, layer.ffn_dim);
                 max_q = std::max<uint64_t>(max_q, layer.q_rows);
                 max_k = std::max<uint64_t>(max_k, layer.k_rows);
                 max_v = std::max<uint64_t>(max_v, layer.v_rows);
+                max_recurrent_qkv =
+                    std::max<uint64_t>(max_recurrent_qkv,
+                                       layer.recurrent_qkv_dim);
+                max_recurrent_value =
+                    std::max<uint64_t>(max_recurrent_value,
+                                       layer.recurrent_value_dim);
             }
             const uint64_t B = batch;
             hidden_batch_ = backend_.scratch_f32(B * cfg.n_embd,
@@ -1231,6 +1243,26 @@ private:
             mid_batch_ = backend_.scratch_f32(
                 B * static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim,
                 "cb_body_mid_batch");
+            recurrent_proj_batch_ = backend_.scratch_f32(
+                B * max_recurrent_qkv, "cb_body_recurrent_proj_batch");
+            recurrent_gate_batch_ = backend_.scratch_f32(
+                B * max_recurrent_value, "cb_body_recurrent_gate_batch");
+            recurrent_alpha_batch_ = backend_.scratch_f32(
+                B * cfg.num_v_heads(), "cb_body_recurrent_alpha_batch");
+            recurrent_beta_batch_ = backend_.scratch_f32(
+                B * cfg.num_v_heads(), "cb_body_recurrent_beta_batch");
+            recurrent_core_batch_ = backend_.scratch_f32(
+                B * max_recurrent_value, "cb_body_recurrent_core_batch");
+            recurrent_conv_out_batch_ = backend_.scratch_f32(
+                B * max_recurrent_qkv, "cb_body_recurrent_conv_out_batch");
+            recurrent_state_batch_ = backend_.scratch_f32(
+                B * static_cast<uint64_t>(cfg.num_v_heads()) *
+                    cfg.head_v_dim_ssm() * cfg.head_k_dim(),
+                "cb_body_recurrent_state_batch");
+            recurrent_conv_state_batch_ = backend_.scratch_f32(
+                B * max_recurrent_qkv *
+                    static_cast<uint64_t>(cfg.ssm_conv_kernel - 1),
+                "cb_body_recurrent_conv_state_batch");
             body_batch_capacity_ = batch;
         }
 
@@ -1519,30 +1551,133 @@ private:
                 for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
                     const QwenLayerWeights &layer = weights_.layer(il);
                     if (layer.recurrent) {
+                        if (!continuous_batching_recurrent_batch_enabled()) {
+                            for (uint32_t row = 0; row < bsz; ++row) {
+                                ContinuousBatchActive &a = active[outputs[row].active_index];
+                                QwenExecutor::MutableDecodeStateView view =
+                                    a.executor->mutable_decode_state_view();
+                                require_ok(backend_.copy_d2d_into(
+                                    *view.hidden, 0, *hidden_batch_,
+                                    static_cast<uint64_t>(row) * hidden, hidden));
+                            }
+                            require_ok(backend_.end());
+                            for (uint32_t row = 0; row < bsz; ++row) {
+                                ContinuousBatchActive &a = active[outputs[row].active_index];
+                                NativeExecutorReport r =
+                                    a.executor->forward_recurrent_layer_from_current_hidden(il);
+                                if (!r.ok) throw std::runtime_error("recurrent layer failed");
+                                outputs[row].report.ops_executed += r.ops_executed;
+                            }
+                            require_ok(backend_.begin());
+                            for (uint32_t row = 0; row < bsz; ++row) {
+                                ContinuousBatchActive &a = active[outputs[row].active_index];
+                                QwenExecutor::MutableDecodeStateView view =
+                                    a.executor->mutable_decode_state_view();
+                                require_ok(backend_.copy_d2d_into(
+                                    *hidden_batch_, static_cast<uint64_t>(row) * hidden,
+                                    *view.hidden, 0, hidden));
+                            }
+                            continue;
+                        }
+                        const uint32_t num_k_heads = cfg.num_k_heads();
+                        const uint32_t num_v_heads = cfg.num_v_heads();
+                        const uint32_t head_k_dim = cfg.head_k_dim();
+                        const uint32_t head_v_dim = cfg.head_v_dim_ssm();
+                        const uint32_t proj_stride =
+                            static_cast<uint32_t>(layer.recurrent_qkv_dim);
+                        const uint32_t gate_stride =
+                            static_cast<uint32_t>(layer.recurrent_value_dim);
+                        const uint32_t alpha_stride = num_v_heads;
+                        const uint32_t beta_stride = num_v_heads;
+                        const uint32_t core_stride =
+                            static_cast<uint32_t>(layer.recurrent_value_dim);
+                        const uint32_t state_stride =
+                            num_v_heads * head_v_dim * head_k_dim;
+                        const uint32_t conv_state_stride =
+                            proj_stride * (cfg.ssm_conv_kernel - 1);
+                        if (proj_stride == 0 || gate_stride == 0 ||
+                            core_stride == 0 || state_stride == 0 ||
+                            conv_state_stride == 0) {
+                            throw std::runtime_error("recurrent layer shape unavailable");
+                        }
+                        require_ok(backend_.rms_norm_batch(
+                            *norm_batch_, *hidden_batch_, *layer.attn_norm,
+                            bsz, hidden, eps));
+                        require_ok(backend_.q8_0_matmul(
+                            *recurrent_proj_batch_, *layer.attn_qkv,
+                            *norm_batch_, bsz, hidden, proj_stride));
+                        require_ok(backend_.q8_0_matmul(
+                            *recurrent_gate_batch_, *layer.attn_gate,
+                            *norm_batch_, bsz, hidden, gate_stride));
+                        require_ok(backend_.q8_0_matmul(
+                            *recurrent_alpha_batch_, *layer.ssm_alpha,
+                            *norm_batch_, bsz, hidden, alpha_stride));
+                        require_ok(backend_.q8_0_matmul(
+                            *recurrent_beta_batch_, *layer.ssm_beta,
+                            *norm_batch_, bsz, hidden, beta_stride));
                         for (uint32_t row = 0; row < bsz; ++row) {
                             ContinuousBatchActive &a = active[outputs[row].active_index];
                             QwenExecutor::MutableDecodeStateView view =
                                 a.executor->mutable_decode_state_view();
+                            if (!view.recurrent_states || !view.conv_states ||
+                                il >= view.recurrent_states->size() ||
+                                il >= view.conv_states->size() ||
+                                !(*view.recurrent_states)[il] ||
+                                !(*view.conv_states)[il]) {
+                                throw std::runtime_error("body batch recurrent state unavailable");
+                            }
+                            DeviceTensor &state = *(*view.recurrent_states)[il];
+                            DeviceTensor &conv_state = *(*view.conv_states)[il];
+                            if (state.count < state_stride ||
+                                conv_state.count < conv_state_stride) {
+                                throw std::runtime_error("body batch recurrent state too small");
+                            }
                             require_ok(backend_.copy_d2d_into(
-                                *view.hidden, 0, *hidden_batch_,
-                                static_cast<uint64_t>(row) * hidden, hidden));
+                                *recurrent_state_batch_,
+                                static_cast<uint64_t>(row) * state_stride,
+                                state, 0, state_stride));
+                            require_ok(backend_.copy_d2d_into(
+                                *recurrent_conv_state_batch_,
+                                static_cast<uint64_t>(row) * conv_state_stride,
+                                conv_state, 0, conv_state_stride));
                         }
-                        require_ok(backend_.end());
-                        for (uint32_t row = 0; row < bsz; ++row) {
-                            ContinuousBatchActive &a = active[outputs[row].active_index];
-                            NativeExecutorReport r =
-                                a.executor->forward_recurrent_layer_from_current_hidden(il);
-                            if (!r.ok) throw std::runtime_error("recurrent layer failed");
-                            outputs[row].report.ops_executed += r.ops_executed;
-                        }
-                        require_ok(backend_.begin());
+                        require_ok(backend_.recurrent_batch_independent(
+                            *recurrent_core_batch_,
+                            *recurrent_state_batch_,
+                            *recurrent_conv_state_batch_,
+                            *recurrent_conv_out_batch_,
+                            *recurrent_proj_batch_,
+                            *recurrent_gate_batch_,
+                            *recurrent_alpha_batch_,
+                            *recurrent_beta_batch_,
+                            *layer.ssm_conv1d,
+                            *layer.ssm_a,
+                            *layer.ssm_dt_bias,
+                            *layer.ssm_norm,
+                            bsz, num_k_heads, num_v_heads,
+                            head_k_dim, head_v_dim, cfg.ssm_conv_kernel,
+                            proj_stride, proj_stride, gate_stride,
+                            alpha_stride, beta_stride, core_stride,
+                            state_stride, conv_state_stride, eps));
+                        require_ok(backend_.q8_0_matmul_add(
+                            *hidden_batch_, *hidden_batch_, *attn_out_batch_,
+                            *layer.ssm_out, *recurrent_core_batch_,
+                            bsz, core_stride, hidden));
                         for (uint32_t row = 0; row < bsz; ++row) {
                             ContinuousBatchActive &a = active[outputs[row].active_index];
                             QwenExecutor::MutableDecodeStateView view =
                                 a.executor->mutable_decode_state_view();
+                            DeviceTensor &state = *(*view.recurrent_states)[il];
+                            DeviceTensor &conv_state = *(*view.conv_states)[il];
                             require_ok(backend_.copy_d2d_into(
-                                *hidden_batch_, static_cast<uint64_t>(row) * hidden,
-                                *view.hidden, 0, hidden));
+                                state, 0, *recurrent_state_batch_,
+                                static_cast<uint64_t>(row) * state_stride,
+                                state_stride));
+                            require_ok(backend_.copy_d2d_into(
+                                conv_state, 0, *recurrent_conv_state_batch_,
+                                static_cast<uint64_t>(row) * conv_state_stride,
+                                conv_state_stride));
+                            outputs[row].report.ops_executed += 1;
                         }
                         continue;
                     }
@@ -1775,6 +1910,14 @@ private:
         std::unique_ptr<DeviceTensor> k_batch_;
         std::unique_ptr<DeviceTensor> v_batch_;
         std::unique_ptr<DeviceTensor> mid_batch_;
+        std::unique_ptr<DeviceTensor> recurrent_proj_batch_;
+        std::unique_ptr<DeviceTensor> recurrent_gate_batch_;
+        std::unique_ptr<DeviceTensor> recurrent_alpha_batch_;
+        std::unique_ptr<DeviceTensor> recurrent_beta_batch_;
+        std::unique_ptr<DeviceTensor> recurrent_core_batch_;
+        std::unique_ptr<DeviceTensor> recurrent_conv_out_batch_;
+        std::unique_ptr<DeviceTensor> recurrent_state_batch_;
+        std::unique_ptr<DeviceTensor> recurrent_conv_state_batch_;
         std::unique_ptr<DeviceTensor> ragged_positions_i32_;
         std::unique_ptr<DeviceTensor> ragged_page_indices_i32_;
         std::unique_ptr<DeviceTensor> ragged_page_indptr_i32_;
