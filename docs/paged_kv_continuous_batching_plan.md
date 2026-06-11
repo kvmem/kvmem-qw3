@@ -929,6 +929,31 @@ Follow-up: FlashInfer paged prefill
     - FP8 KV:
       `/tmp/qw3_prefill_ragged_device_metadata_fp8_cb.json`, passed exact
       parity, `prefill_ragged_device_metadata_ready=true`.
+  - 32K FP8 KV sanity benchmark after device metadata staging:
+    `/tmp/qw3_cb_32k_metadata_sanity.json`, `ctx=262144`,
+    `prefill_chunk=2048`, `max_tokens=128`, `--ignore-eos --timing`.
+    - concurrency 1: wall `11.838s`, output `10.81 tok/s`,
+      prefill `3701.26 tok/s`, decode `43.72 tok/s`.
+    - concurrency 2: wall `21.377s`, output `11.98 tok/s`,
+      prefill `3696.26 tok/s`, decode `33.31 tok/s`.
+    - Interpretation: prefill ragged metadata staging did not regress the
+      existing 32K paged-prefill throughput, but total wall time is still
+      nearly additive across requests because prefill execution remains
+      delegated per request.
+  - Next implementation boundary:
+    - FlashInfer ragged paged prefill can be used for standard-attention
+      layers once a batched prefill executor owns concatenated Q/K/V rows and
+      the staged ragged metadata.
+    - Qwen3.6 27B still needs a multi-sequence recurrent/deltanet prefill
+      primitive. Existing backend support covers single-sequence multi-token
+      `recurrent_batch` and multi-sequence single-token
+      `recurrent_batch_independent`; neither is the high-throughput
+      multi-request prefill primitive by itself.
+    - Therefore the next high-performance step is not to fake batching by
+      replaying prefill as many decode-shaped steps. It is to add an explicit
+      multi-sequence recurrent prefill backend or an equivalent executor
+      strategy that preserves per-request token order while batching the
+      linear/FFN and standard-attention work.
 
 ## Stage 8: Batched Sampling Optimization
 
