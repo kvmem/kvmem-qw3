@@ -1051,6 +1051,27 @@ Follow-up: FlashInfer paged prefill
       `/tmp/qw3_prefill_recurrent_pack_fp8_cb.json`, passed exact parity,
       `prefill_recurrent_state_packed=true`,
       `prefill_recurrent_state_packed_layers=48`.
+  - Added opt-in recurrent-state unpack staging:
+    - When `QW3_CONTINUOUS_BATCHING_PREFILL_PACK_RECURRENT_STATE=1`, the
+      scheduler now writes the packed recurrent/conv state batch rows back to
+      each request after packing.
+    - This validates the full state transfer path needed after
+      `recurrent_batch_ragged(...)` updates batched state scratch.
+    - Logs now include `recurrent_state_unpacked=true`.
+  - Verification for recurrent-state unpack staging:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV opt-in pack/unpack:
+      `/tmp/qw3_prefill_recurrent_unpack_fp16_cb.json`, passed exact parity,
+      `prefill_recurrent_state_packed=true`,
+      `prefill_recurrent_state_unpacked=true`,
+      `prefill_recurrent_state_packed_layers=48`.
+    - FP8 KV opt-in pack/unpack:
+      `/tmp/qw3_prefill_recurrent_unpack_fp8_cb.json`, passed exact parity,
+      `prefill_recurrent_state_packed=true`,
+      `prefill_recurrent_state_unpacked=true`,
+      `prefill_recurrent_state_packed_layers=48`.
 
 ## Stage 8: Batched Sampling Optimization
 

@@ -1130,6 +1130,7 @@ private:
         bool ragged_device_metadata_ready = false;
         bool recurrent_state_ready = false;
         bool recurrent_state_packed = false;
+        bool recurrent_state_unpacked = false;
         uint32_t recurrent_state_packed_layers = 0;
 
         void clear() {
@@ -1147,6 +1148,7 @@ private:
             ragged_device_metadata_ready = false;
             recurrent_state_ready = false;
             recurrent_state_packed = false;
+            recurrent_state_unpacked = false;
             recurrent_state_packed_layers = 0;
         }
 
@@ -2749,9 +2751,11 @@ private:
             std::vector<ContinuousBatchActive> &prefilling,
             ContinuousPrefillBatch &batch) {
         batch.recurrent_state_packed = false;
+        batch.recurrent_state_unpacked = false;
         batch.recurrent_state_packed_layers = 0;
         if (!batch.recurrent_state_ready || batch.size() == 0) return;
         const uint32_t bsz = static_cast<uint32_t>(batch.size());
+        uint32_t unpacked_layers = 0;
         for (uint32_t il = 0; il < weights_->n_layers(); ++il) {
             const QwenLayerWeights &layer = weights_->layer(il);
             if (!layer.recurrent) continue;
@@ -2796,10 +2800,29 @@ private:
                     static_cast<uint64_t>(row) * conv_state_stride,
                     *(*view.conv_states)[il], 0, conv_state_stride));
             }
+            for (uint32_t row = 0; row < bsz; ++row) {
+                const ContinuousPrefillBatchEntry &entry = batch.entries[row];
+                QwenExecutor::DecodeStateView view =
+                    prefilling[entry.prefill_index].executor->decode_state_view();
+                require_device_status(device_->copy_d2d_into(
+                    *(*view.recurrent_states)[il], 0,
+                    *cb_prefill_recurrent_state_batch_,
+                    static_cast<uint64_t>(row) * state_stride,
+                    state_stride));
+                require_device_status(device_->copy_d2d_into(
+                    *(*view.conv_states)[il], 0,
+                    *cb_prefill_conv_state_batch_,
+                    static_cast<uint64_t>(row) * conv_state_stride,
+                    conv_state_stride));
+            }
             ++batch.recurrent_state_packed_layers;
+            ++unpacked_layers;
         }
         batch.recurrent_state_packed =
             batch.recurrent_state_packed_layers > 0;
+        batch.recurrent_state_unpacked =
+            batch.recurrent_state_packed &&
+            unpacked_layers == batch.recurrent_state_packed_layers;
     }
 
     void apply_continuous_prefill_batch_outputs(
@@ -2932,6 +2955,8 @@ private:
                 << (batch.recurrent_state_ready ? "true" : "false")
                 << " recurrent_state_packed="
                 << (batch.recurrent_state_packed ? "true" : "false")
+                << " recurrent_state_unpacked="
+                << (batch.recurrent_state_unpacked ? "true" : "false")
                 << " recurrent_state_packed_layers="
                 << batch.recurrent_state_packed_layers
                 << " ragged_pages=" << batch.page_indices.size()
