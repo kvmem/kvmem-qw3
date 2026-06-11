@@ -869,6 +869,24 @@ Follow-up: FlashInfer paged prefill
     and use FlashInfer ragged paged prefill only for the standard-attention
     layers; treating all concatenated prefill tokens as independent rows would
     be mathematically wrong.
+  - Structured the prefill-batch plan after commit `54eb7fa`:
+    `ContinuousPrefillBatch` now carries per-entry `request_id`, `offset`,
+    `total`, `chunk`, and `final_chunk` metadata. The current executor remains
+    `mode=delegated`, but future ragged prefill execution can consume this
+    plan directly instead of reconstructing scheduler state from logs or the
+    mutable prefill queue.
+  - Verification for structured prefill-batch metadata:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV forced coalescing regression:
+      `/tmp/qw3_prefill_batch_metadata_cb.json`, passed exact parity,
+      `prefill_batch_chunks=2`, `prefill_batch_tokens=12`,
+      `ragged_metadata_ready=true`.
+    - FP8 KV forced coalescing regression:
+      `/tmp/qw3_prefill_batch_metadata_fp8_cb.json`, passed exact parity,
+      `prefill_batch_chunks=2`, `prefill_batch_tokens=12`,
+      `ragged_metadata_ready=true`.
 
 ## Stage 8: Batched Sampling Optimization
 

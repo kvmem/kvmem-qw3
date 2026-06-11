@@ -1102,6 +1102,29 @@ private:
         size_t size() const { return active_indices.size(); }
     };
 
+    struct ContinuousPrefillBatchEntry {
+        size_t prefill_index = 0;
+        uint64_t request_id = 0;
+        uint32_t offset = 0;
+        uint32_t total = 0;
+        uint32_t chunk = 0;
+        bool final_chunk = false;
+    };
+
+    struct ContinuousPrefillBatch {
+        std::vector<ContinuousPrefillBatchEntry> entries;
+        uint64_t total_tokens = 0;
+        uint32_t final_chunks = 0;
+
+        void clear() {
+            entries.clear();
+            total_tokens = 0;
+            final_chunks = 0;
+        }
+
+        size_t size() const { return entries.size(); }
+    };
+
     struct BatchedDecodeInput {
         const ContinuousDecodeBatch *batch = nullptr;
     };
@@ -2412,6 +2435,38 @@ private:
         }
     }
 
+    void build_continuous_prefill_batch(
+            const std::vector<ContinuousBatchActive> &prefilling,
+            uint32_t max_chunks,
+            ContinuousPrefillBatch &batch) const {
+        batch.clear();
+        if (prefilling.empty() || max_chunks == 0) return;
+        const uint32_t n =
+            std::min<uint32_t>(max_chunks,
+                               static_cast<uint32_t>(prefilling.size()));
+        batch.entries.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const ContinuousBatchActive &a = prefilling[i];
+            if (!a.req) continue;
+            const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
+            if (a.prefill_offset >= prompt.size() && !prompt.empty()) continue;
+            const uint32_t remaining =
+                a.prefill_offset < prompt.size()
+                    ? static_cast<uint32_t>(prompt.size() - a.prefill_offset)
+                    : 0u;
+            ContinuousPrefillBatchEntry entry;
+            entry.prefill_index = i;
+            entry.request_id = a.req->id;
+            entry.offset = a.prefill_offset;
+            entry.total = static_cast<uint32_t>(prompt.size());
+            entry.chunk = continuous_prefill_chunk_tokens(remaining);
+            entry.final_chunk = prompt.empty() || entry.chunk >= remaining;
+            batch.total_tokens += entry.chunk;
+            if (entry.final_chunk) ++batch.final_chunks;
+            batch.entries.push_back(entry);
+        }
+    }
+
     void advance_continuous_prefill_batch(
             std::vector<ContinuousBatchActive> &prefilling,
             std::vector<ContinuousBatchActive> &active,
@@ -2431,29 +2486,19 @@ private:
             return;
         }
 
-        const uint32_t planned_chunks =
-            std::min<uint32_t>(max_chunks,
-                               static_cast<uint32_t>(prefilling.size()));
-        uint64_t planned_tokens = 0;
-        uint32_t planned_final = 0;
-        for (uint32_t i = 0; i < planned_chunks; ++i) {
-            const ContinuousBatchActive &a = prefilling[i];
-            const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
-            if (a.prefill_offset >= prompt.size() && !prompt.empty()) continue;
-            const uint32_t remaining =
-                static_cast<uint32_t>(prompt.size() - a.prefill_offset);
-            const uint32_t chunk = continuous_prefill_chunk_tokens(remaining);
-            planned_tokens += chunk;
-            if (prompt.empty() || chunk >= remaining) ++planned_final;
-        }
+        ContinuousPrefillBatch batch;
+        build_continuous_prefill_batch(prefilling, max_chunks, batch);
+        if (batch.size() == 0) return;
 
         if (continuous_batching_trace_enabled()) {
             std::ostringstream msg;
             msg << "native continuous_prefill_batch:"
                 << " mode=delegated"
-                << " chunks=" << planned_chunks
-                << " tokens=" << planned_tokens
-                << " final_chunks=" << planned_final;
+                << " chunks=" << batch.size()
+                << " tokens=" << batch.total_tokens
+                << " final_chunks=" << batch.final_chunks
+                << " first_request=" << batch.entries.front().request_id
+                << " first_offset=" << batch.entries.front().offset;
             log(msg.str());
         }
 
@@ -2462,7 +2507,7 @@ private:
         uint64_t executed_tokens = 0;
         uint32_t completed_chunks = 0;
         for (uint32_t step = 0;
-             step < planned_chunks && !prefilling.empty() && active.empty();
+             step < batch.size() && !prefilling.empty() && active.empty();
              ++step) {
             ContinuousBatchActive &front = prefilling.front();
             const std::vector<uint32_t> &prompt = front.req->prompt_tokens;
