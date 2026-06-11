@@ -271,6 +271,10 @@ bool continuous_batching_prefill_pack_recurrent_state_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_PREFILL_PACK_RECURRENT_STATE");
 }
 
+bool continuous_batching_ragged_prefill_executor_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_EXECUTOR");
+}
+
 class GlobalKvPagePool final : public KvPhysicalPageAllocator {
 public:
     GlobalKvPagePool(uint32_t total_pages, uint32_t page_size)
@@ -1200,23 +1204,43 @@ private:
 
     struct BatchedPrefillTiming {
         double total_s = 0.0;
+        double ragged_s = 0.0;
         double delegated_s = 0.0;
+    };
+
+    struct BatchedPrefillDeviceMetadata {
+        const DeviceTensor *q_indptr = nullptr;
+        const DeviceTensor *page_indptr = nullptr;
+        const DeviceTensor *row_page_indptr = nullptr;
+        const DeviceTensor *page_indices = nullptr;
+        const DeviceTensor *logical_positions = nullptr;
+        const DeviceTensor *last_page_len = nullptr;
+        const DeviceTensor *seq_lens = nullptr;
     };
 
     class BatchedPrefillExecutor {
     public:
+        BatchedPrefillExecutor(const QwenNativeModel &model,
+                               const QwenWeights &weights,
+                               DeviceBackend &backend)
+            : model_(model), weights_(weights), backend_(backend) {}
+
         const std::string &last_mode() const { return last_mode_; }
         const BatchedPrefillTiming &last_timing() const { return last_timing_; }
         uint32_t last_kernel_batch() const { return last_kernel_batch_; }
 
         std::vector<BatchedPrefillOutput> prefill(
                 std::vector<ContinuousBatchActive> &prefilling,
-                const ContinuousPrefillBatch &batch) {
+                const ContinuousPrefillBatch &batch,
+                const BatchedPrefillDeviceMetadata &metadata) {
             std::vector<BatchedPrefillOutput> outputs;
             outputs.reserve(batch.size());
+            last_timing_ = {};
+            if (can_use_ragged_prefill(prefilling, batch, metadata)) {
+                return prefill_ragged(prefilling, batch, metadata);
+            }
             last_mode_ = "delegated";
             last_kernel_batch_ = 1;
-            last_timing_ = {};
             const double t0 = wall_seconds();
 
             for (const ContinuousPrefillBatchEntry &entry : batch.entries) {
@@ -1272,6 +1296,115 @@ private:
         }
 
     private:
+        static bool request_needs_logits(const GenerationOptions &options) {
+            return options.temperature > 0.0f ||
+                   options.presence_penalty != 0.0f ||
+                   (options.repetition_penalty > 0.0f &&
+                    options.repetition_penalty != 1.0f);
+        }
+
+        bool can_use_ragged_prefill(
+                const std::vector<ContinuousBatchActive> &prefilling,
+                const ContinuousPrefillBatch &batch,
+                const BatchedPrefillDeviceMetadata &metadata) const {
+            if (!continuous_batching_ragged_prefill_executor_enabled()) return false;
+            if (batch.size() < 2 || batch.total_tokens == 0) return false;
+            if (!batch.ragged_metadata_ready ||
+                !batch.ragged_device_metadata_ready ||
+                !batch.ragged_row_metadata_ready ||
+                !batch.recurrent_state_ready) {
+                return false;
+            }
+            if (!metadata.q_indptr || !metadata.page_indptr ||
+                !metadata.row_page_indptr || !metadata.page_indices ||
+                !metadata.logical_positions || !metadata.last_page_len ||
+                !metadata.seq_lens) {
+                return false;
+            }
+            const std::string kv_dtype =
+                env_lower_ascii(env_value("QW3_KV_DTYPE"));
+            if (!kv_dtype.empty() && kv_dtype != "fp16" && kv_dtype != "fp8") {
+                return false;
+            }
+            for (const ContinuousPrefillBatchEntry &entry : batch.entries) {
+                if (entry.prefill_index >= prefilling.size()) return false;
+                const ContinuousBatchActive &a = prefilling[entry.prefill_index];
+                if (!a.req || !a.executor) return false;
+                if (request_needs_logits(a.req->options)) return false;
+                if (entry.offset != a.prefill_offset) return false;
+                if (entry.chunk == 0 ||
+                    entry.offset + entry.chunk > a.req->prompt_tokens.size()) {
+                    return false;
+                }
+            }
+            for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+                const QwenLayerWeights &layer = weights_.layer(il);
+                if (!layer.recurrent && (!layer.attn_q || !layer.attn_k ||
+                                         !layer.attn_v || !layer.attn_output)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        std::vector<BatchedPrefillOutput> prefill_ragged(
+                std::vector<ContinuousBatchActive> &prefilling,
+                const ContinuousPrefillBatch &batch,
+                const BatchedPrefillDeviceMetadata &metadata) {
+            (void)metadata;
+            last_mode_ = "ragged_prefill_fallback";
+            last_kernel_batch_ = static_cast<uint32_t>(batch.size());
+            const double t0 = wall_seconds();
+            std::vector<BatchedPrefillOutput> outputs;
+            outputs.reserve(batch.size());
+            for (const ContinuousPrefillBatchEntry &entry : batch.entries) {
+                BatchedPrefillOutput out;
+                out.prefill_index = entry.prefill_index;
+                out.request_id = entry.request_id;
+                out.offset = entry.offset;
+                out.total = entry.total;
+                out.chunk = entry.chunk;
+                out.final_chunk = entry.final_chunk;
+                const double step0 = wall_seconds();
+                try {
+                    if (entry.prefill_index >= prefilling.size()) {
+                        throw std::runtime_error("prefill index out of range");
+                    }
+                    ContinuousBatchActive &a = prefilling[entry.prefill_index];
+                    const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
+                    std::vector<uint32_t> chunk_tokens(
+                        prompt.begin() +
+                            static_cast<std::ptrdiff_t>(entry.offset),
+                        prompt.begin() +
+                            static_cast<std::ptrdiff_t>(entry.offset + entry.chunk));
+                    out.report =
+                        a.executor->forward_n_tokens(chunk_tokens,
+                                                     entry.final_chunk);
+                    if (!out.report.ok) {
+                        throw std::runtime_error("prefill failed");
+                    }
+                    const double step1 = wall_seconds();
+                    out.seconds = std::max(step1 - step0, 1e-9);
+                    a.prefill_s += out.seconds;
+                    a.prefill_ops += out.report.ops_executed;
+                    a.prefill_offset += entry.chunk;
+                    a.kv_state.update(a.executor->kv_state_snapshot());
+                } catch (const std::exception &e) {
+                    out.error = e.what();
+                    out.seconds = std::max(wall_seconds() - step0, 0.0);
+                }
+                outputs.push_back(std::move(out));
+            }
+            const double t1 = wall_seconds();
+            last_timing_.total_s = std::max(t1 - t0, 0.0);
+            last_timing_.ragged_s = 0.0;
+            last_timing_.delegated_s = last_timing_.total_s;
+            return outputs;
+        }
+
+        const QwenNativeModel &model_;
+        const QwenWeights &weights_;
+        DeviceBackend &backend_;
         std::string last_mode_ = "delegated";
         BatchedPrefillTiming last_timing_;
         uint32_t last_kernel_batch_ = 1;
@@ -3006,10 +3139,21 @@ private:
         }
 
         if (!cb_prefill_executor_) {
-            cb_prefill_executor_ = std::make_unique<BatchedPrefillExecutor>();
+            cb_prefill_executor_ =
+                std::make_unique<BatchedPrefillExecutor>(
+                    *model_, *weights_, *device_);
         }
+        BatchedPrefillDeviceMetadata prefill_metadata;
+        prefill_metadata.q_indptr = cb_prefill_q_indptr_i32_.get();
+        prefill_metadata.page_indptr = cb_prefill_page_indptr_i32_.get();
+        prefill_metadata.row_page_indptr = cb_prefill_row_page_indptr_i32_.get();
+        prefill_metadata.page_indices = cb_prefill_page_indices_i32_.get();
+        prefill_metadata.logical_positions =
+            cb_prefill_logical_positions_i32_.get();
+        prefill_metadata.last_page_len = cb_prefill_last_page_len_i32_.get();
+        prefill_metadata.seq_lens = cb_prefill_seq_lens_i32_.get();
         const std::vector<BatchedPrefillOutput> outputs =
-            cb_prefill_executor_->prefill(prefilling, batch);
+            cb_prefill_executor_->prefill(prefilling, batch, prefill_metadata);
         uint32_t executed_chunks = 0;
         uint64_t executed_tokens = 0;
         uint32_t completed_chunks = 0;
@@ -3033,6 +3177,7 @@ private:
                 << " tokens=" << executed_tokens
                 << " completed_chunks=" << completed_chunks
                 << " total=" << fmt_seconds(timing.total_s)
+                << " ragged=" << fmt_seconds(timing.ragged_s)
                 << " delegated=" << fmt_seconds(timing.delegated_s);
             log(msg.str());
         }

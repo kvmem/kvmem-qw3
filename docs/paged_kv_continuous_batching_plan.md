@@ -1092,6 +1092,26 @@ Follow-up: FlashInfer paged prefill
     - FP8 KV:
       `/tmp/qw3_prefill_row_metadata_fp8_cb.json`, passed exact parity,
       `prefill_ragged_row_metadata_ready=true`.
+  - Added gated ragged prefill executor framework:
+    - `QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_EXECUTOR=1` now routes eligible
+      prefill batches through a dedicated `BatchedPrefillExecutor` path.
+    - The initial gated path still delegates each request chunk to the existing
+      exact prefill executor, so it validates scheduler/executor wiring before
+      replacing the layer loop.
+    - The executor now receives staged device metadata for request-level
+      FlashInfer ragged attention and row-level paged KV append.
+  - Verification for gated ragged prefill executor framework:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV opt-in executor:
+      `/tmp/qw3_ragged_prefill_executor_framework_fp16_cb.json`, passed exact
+      parity, `prefill_ragged_device_metadata_ready=true`,
+      `prefill_ragged_row_metadata_ready=true`.
+    - FP8 KV opt-in executor:
+      `/tmp/qw3_ragged_prefill_executor_framework_fp8_cb.json`, passed exact
+      parity, `prefill_ragged_device_metadata_ready=true`,
+      `prefill_ragged_row_metadata_ready=true`.
 
 ## Stage 8: Batched Sampling Optimization
 
