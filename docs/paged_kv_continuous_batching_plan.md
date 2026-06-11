@@ -1029,6 +1029,28 @@ Follow-up: FlashInfer paged prefill
     - FP8 KV:
       `/tmp/qw3_prefill_recurrent_state_fp8_cb.json`, passed exact parity,
       `prefill_recurrent_state_ready=true`.
+  - Added opt-in recurrent-state batch packing:
+    - `QW3_CONTINUOUS_BATCHING_PREFILL_PACK_RECURRENT_STATE=1` enables packing
+      each request's recurrent state and conv state into reusable batch scratch
+      tensors.
+    - This is default off so current service performance is not affected before
+      the ragged recurrent executor path consumes the packed state.
+    - The pack layout matches the new `recurrent_batch_ragged(...)` backend
+      primitive: row `b` owns its recurrent state and conv state slice.
+    - Logs now include `recurrent_state_packed=true` and
+      `recurrent_state_packed_layers=N` when the pack path succeeds.
+  - Verification for recurrent-state batch packing:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV opt-in pack:
+      `/tmp/qw3_prefill_recurrent_pack_fp16_cb.json`, passed exact parity,
+      `prefill_recurrent_state_packed=true`,
+      `prefill_recurrent_state_packed_layers=48`.
+    - FP8 KV opt-in pack:
+      `/tmp/qw3_prefill_recurrent_pack_fp8_cb.json`, passed exact parity,
+      `prefill_recurrent_state_packed=true`,
+      `prefill_recurrent_state_packed_layers=48`.
 
 ## Stage 8: Batched Sampling Optimization
 

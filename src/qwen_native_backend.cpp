@@ -267,6 +267,10 @@ bool continuous_batching_prefill_batch_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_PREFILL_BATCH", true);
 }
 
+bool continuous_batching_prefill_pack_recurrent_state_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_PREFILL_PACK_RECURRENT_STATE");
+}
+
 class GlobalKvPagePool final : public KvPhysicalPageAllocator {
 public:
     GlobalKvPagePool(uint32_t total_pages, uint32_t page_size)
@@ -1125,6 +1129,8 @@ private:
         bool ragged_metadata_ready = false;
         bool ragged_device_metadata_ready = false;
         bool recurrent_state_ready = false;
+        bool recurrent_state_packed = false;
+        uint32_t recurrent_state_packed_layers = 0;
 
         void clear() {
             entries.clear();
@@ -1140,6 +1146,8 @@ private:
             ragged_metadata_ready = false;
             ragged_device_metadata_ready = false;
             recurrent_state_ready = false;
+            recurrent_state_packed = false;
+            recurrent_state_packed_layers = 0;
         }
 
         size_t size() const { return entries.size(); }
@@ -2715,6 +2723,85 @@ private:
         batch.ragged_device_metadata_ready = true;
     }
 
+    void ensure_continuous_prefill_recurrent_state_scratch(
+            uint32_t batch_size,
+            uint64_t state_stride,
+            uint64_t conv_state_stride) {
+        const uint64_t state_count =
+            static_cast<uint64_t>(batch_size) * state_stride;
+        const uint64_t conv_count =
+            static_cast<uint64_t>(batch_size) * conv_state_stride;
+        if (state_count > cb_prefill_recurrent_state_capacity_) {
+            cb_prefill_recurrent_state_batch_ =
+                device_->scratch_f32(state_count,
+                                     "cb_prefill_recurrent_state_batch");
+            cb_prefill_recurrent_state_capacity_ = state_count;
+        }
+        if (conv_count > cb_prefill_conv_state_capacity_) {
+            cb_prefill_conv_state_batch_ =
+                device_->scratch_f32(conv_count,
+                                     "cb_prefill_conv_state_batch");
+            cb_prefill_conv_state_capacity_ = conv_count;
+        }
+    }
+
+    void pack_continuous_prefill_recurrent_state_batch(
+            std::vector<ContinuousBatchActive> &prefilling,
+            ContinuousPrefillBatch &batch) {
+        batch.recurrent_state_packed = false;
+        batch.recurrent_state_packed_layers = 0;
+        if (!batch.recurrent_state_ready || batch.size() == 0) return;
+        const uint32_t bsz = static_cast<uint32_t>(batch.size());
+        for (uint32_t il = 0; il < weights_->n_layers(); ++il) {
+            const QwenLayerWeights &layer = weights_->layer(il);
+            if (!layer.recurrent) continue;
+            uint64_t state_stride = 0;
+            uint64_t conv_state_stride = 0;
+            for (const ContinuousPrefillBatchEntry &entry : batch.entries) {
+                if (entry.prefill_index >= prefilling.size()) return;
+                QwenExecutor::DecodeStateView view =
+                    prefilling[entry.prefill_index].executor->decode_state_view();
+                if (!view.recurrent_states || !view.conv_states ||
+                    il >= view.recurrent_states->size() ||
+                    il >= view.conv_states->size() ||
+                    !(*view.recurrent_states)[il] ||
+                    !(*view.conv_states)[il]) {
+                    return;
+                }
+                const uint64_t row_state =
+                    (*view.recurrent_states)[il]->count;
+                const uint64_t row_conv =
+                    (*view.conv_states)[il]->count;
+                if (state_stride == 0) {
+                    state_stride = row_state;
+                    conv_state_stride = row_conv;
+                } else if (state_stride != row_state ||
+                           conv_state_stride != row_conv) {
+                    return;
+                }
+            }
+            if (state_stride == 0 || conv_state_stride == 0) return;
+            ensure_continuous_prefill_recurrent_state_scratch(
+                bsz, state_stride, conv_state_stride);
+            for (uint32_t row = 0; row < bsz; ++row) {
+                const ContinuousPrefillBatchEntry &entry = batch.entries[row];
+                QwenExecutor::DecodeStateView view =
+                    prefilling[entry.prefill_index].executor->decode_state_view();
+                require_device_status(device_->copy_d2d_into(
+                    *cb_prefill_recurrent_state_batch_,
+                    static_cast<uint64_t>(row) * state_stride,
+                    *(*view.recurrent_states)[il], 0, state_stride));
+                require_device_status(device_->copy_d2d_into(
+                    *cb_prefill_conv_state_batch_,
+                    static_cast<uint64_t>(row) * conv_state_stride,
+                    *(*view.conv_states)[il], 0, conv_state_stride));
+            }
+            ++batch.recurrent_state_packed_layers;
+        }
+        batch.recurrent_state_packed =
+            batch.recurrent_state_packed_layers > 0;
+    }
+
     void apply_continuous_prefill_batch_outputs(
             std::vector<ContinuousBatchActive> &prefilling,
             std::vector<ContinuousBatchActive> &active,
@@ -2824,6 +2911,9 @@ private:
         build_continuous_prefill_batch(prefilling, max_chunks, batch);
         if (batch.size() == 0) return;
         prepare_continuous_prefill_ragged_metadata_device(batch);
+        if (continuous_batching_prefill_pack_recurrent_state_enabled()) {
+            pack_continuous_prefill_recurrent_state_batch(prefilling, batch);
+        }
 
         if (continuous_batching_trace_enabled()) {
             std::ostringstream msg;
@@ -2840,6 +2930,10 @@ private:
                 << (batch.ragged_device_metadata_ready ? "true" : "false")
                 << " recurrent_state_ready="
                 << (batch.recurrent_state_ready ? "true" : "false")
+                << " recurrent_state_packed="
+                << (batch.recurrent_state_packed ? "true" : "false")
+                << " recurrent_state_packed_layers="
+                << batch.recurrent_state_packed_layers
                 << " ragged_pages=" << batch.page_indices.size()
                 << " ragged_max_seq_len=" << batch.max_seq_len;
             log(msg.str());
@@ -4194,6 +4288,10 @@ private:
     std::unique_ptr<DeviceTensor> cb_prefill_page_indices_i32_;
     std::unique_ptr<DeviceTensor> cb_prefill_last_page_len_i32_;
     std::unique_ptr<DeviceTensor> cb_prefill_seq_lens_i32_;
+    uint64_t cb_prefill_recurrent_state_capacity_ = 0;
+    uint64_t cb_prefill_conv_state_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> cb_prefill_recurrent_state_batch_;
+    std::unique_ptr<DeviceTensor> cb_prefill_conv_state_batch_;
 
     std::mutex cb_mu_;
     std::condition_variable cb_cv_;
