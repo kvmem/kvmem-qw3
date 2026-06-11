@@ -461,6 +461,71 @@ public:
         (void)eps;
         return {false, "recurrent_batch_independent requires backend override"};
     }
+
+    // Cross-request recurrent prefill: q_indptr describes ragged token ranges
+    // in the row-major proj/gate/alpha/beta/core buffers. Each sequence has
+    // an independent recurrent state and conv state, and tokens within a
+    // sequence are processed sequentially.
+    virtual DeviceStatus recurrent_batch_ragged(DeviceTensor &core,
+                                                DeviceTensor &state_batch,
+                                                DeviceTensor &conv_state_batch,
+                                                DeviceTensor &conv_out_buf,
+                                                const DeviceTensor &proj,
+                                                const DeviceTensor &gate,
+                                                const DeviceTensor &alpha,
+                                                const DeviceTensor &beta,
+                                                const DeviceTensor &q_indptr,
+                                                const DeviceWeight &conv,
+                                                const DeviceWeight &ssm_a,
+                                                const DeviceWeight &dt_bias,
+                                                const DeviceWeight &ssm_norm,
+                                                uint32_t batch,
+                                                uint32_t total_q,
+                                                uint32_t num_k_heads,
+                                                uint32_t num_v_heads,
+                                                uint32_t head_k_dim,
+                                                uint32_t head_v_dim,
+                                                uint32_t conv_kernel_size,
+                                                uint32_t proj_count,
+                                                uint32_t proj_stride,
+                                                uint32_t gate_stride,
+                                                uint32_t alpha_stride,
+                                                uint32_t beta_stride,
+                                                uint32_t core_stride,
+                                                uint32_t state_stride,
+                                                uint32_t conv_state_stride,
+                                                float eps) {
+        (void)core;
+        (void)state_batch;
+        (void)conv_state_batch;
+        (void)conv_out_buf;
+        (void)proj;
+        (void)gate;
+        (void)alpha;
+        (void)beta;
+        (void)q_indptr;
+        (void)conv;
+        (void)ssm_a;
+        (void)dt_bias;
+        (void)ssm_norm;
+        (void)batch;
+        (void)total_q;
+        (void)num_k_heads;
+        (void)num_v_heads;
+        (void)head_k_dim;
+        (void)head_v_dim;
+        (void)conv_kernel_size;
+        (void)proj_count;
+        (void)proj_stride;
+        (void)gate_stride;
+        (void)alpha_stride;
+        (void)beta_stride;
+        (void)core_stride;
+        (void)state_stride;
+        (void)conv_state_stride;
+        (void)eps;
+        return {false, "recurrent_batch_ragged requires backend override"};
+    }
     virtual DeviceStatus attention_single_token(DeviceTensor &mid,
                                                 DeviceTensor &q,
                                                 DeviceTensor &k,

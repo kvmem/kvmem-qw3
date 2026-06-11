@@ -2061,6 +2061,50 @@ __global__ void recurrent_conv_independent_batch_kernel(
     st[CONV_K - 2] = proj[static_cast<uint64_t>(b) * proj_stride + c];
 }
 
+template <uint32_t CONV_K>
+__global__ void recurrent_conv_ragged_batch_kernel(
+                                            float *out,          // [total_q, *]
+                                            float *state,        // [B, conv_state_stride]
+                                            const float *proj,   // [total_q, *]
+                                            const int32_t *q_indptr,
+                                            const float *conv_w,
+                                            uint32_t B,
+                                            uint32_t conv_dim,
+                                            uint32_t state_stride,
+                                            uint32_t proj_stride,
+                                            uint32_t out_stride) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (b >= B || c >= conv_dim) return;
+    const int32_t begin_i = q_indptr[b];
+    const int32_t end_i = q_indptr[b + 1];
+    if (begin_i < 0 || end_i < begin_i) return;
+    const uint32_t begin = static_cast<uint32_t>(begin_i);
+    const uint32_t end = static_cast<uint32_t>(end_i);
+    const float *w = conv_w + c * CONV_K;
+    float *st = state + static_cast<uint64_t>(b) * state_stride +
+                c * (CONV_K - 1);
+    float st_buf[CONV_K - 1];
+    #pragma unroll
+    for (uint32_t i = 0; i + 1 < CONV_K; ++i) st_buf[i] = st[i];
+    float w_buf[CONV_K];
+    #pragma unroll
+    for (uint32_t k = 0; k < CONV_K; ++k) w_buf[k] = w[k];
+    for (uint32_t t = begin; t < end; ++t) {
+        const float cur = proj[static_cast<uint64_t>(t) * proj_stride + c];
+        float acc = w_buf[CONV_K - 1] * cur;
+        #pragma unroll
+        for (uint32_t k = 0; k + 1 < CONV_K; ++k) acc += w_buf[k] * st_buf[k];
+        out[static_cast<uint64_t>(t) * out_stride + c] =
+            acc / (1.0f + expf(-acc));
+        #pragma unroll
+        for (uint32_t k = 0; k + 2 < CONV_K; ++k) st_buf[k] = st_buf[k + 1];
+        st_buf[CONV_K - 2] = cur;
+    }
+    #pragma unroll
+    for (uint32_t i = 0; i + 1 < CONV_K; ++i) st[i] = st_buf[i];
+}
+
 // L2-norm batched: one block per (token, k_head) pair. Same per-head logic as
 // l2_norm_128_kernel, fanned out over the time dimension via blockIdx.y.
 __global__ void l2_norm_128_batch_kernel(float *x,             // base ptr
@@ -2272,6 +2316,86 @@ __global__ void deltanet_independent_batch_kernel(
         core[static_cast<uint64_t>(b) * core_stride + vh * head_v_dim + j] =
             scratch[0] * inv_hvd;
     }
+}
+
+__global__ void deltanet_ragged_batch_kernel(
+                                      float *core,              // [total_q, *]
+                                      float *state,             // [B, state_stride]
+                                      const float *conv_batch,  // [total_q, *]
+                                      const float *alpha_batch, // [total_q, *]
+                                      const float *beta_batch,  // [total_q, *]
+                                      const int32_t *q_indptr,
+                                      const float *ssm_a,
+                                      const float *dt_bias,
+                                      uint32_t B,
+                                      uint32_t num_k_heads,
+                                      uint32_t num_v_heads,
+                                      uint32_t head_k_dim,
+                                      uint32_t head_v_dim,
+                                      uint32_t conv_stride,
+                                      uint32_t alpha_stride,
+                                      uint32_t beta_stride,
+                                      uint32_t core_stride,
+                                      uint32_t state_stride) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t vh = blockIdx.y;
+    const uint32_t j = blockIdx.z;
+    const uint32_t tid = threadIdx.x;
+    if (b >= B || vh >= num_v_heads || j >= head_v_dim ||
+        tid >= head_k_dim) return;
+    const int32_t begin_i = q_indptr[b];
+    const int32_t end_i = q_indptr[b + 1];
+    if (begin_i < 0 || end_i < begin_i) return;
+    const uint32_t begin = static_cast<uint32_t>(begin_i);
+    const uint32_t end = static_cast<uint32_t>(end_i);
+
+    __shared__ float scratch[128];
+    float *row = state + static_cast<uint64_t>(b) * state_stride +
+                 (static_cast<uint64_t>(vh) * head_v_dim + j) * head_k_dim;
+
+    const uint32_t kh = vh % num_k_heads;
+    const uint32_t q_offset = kh * head_k_dim;
+    const uint32_t k_offset = num_k_heads * head_k_dim + kh * head_k_dim;
+    const uint32_t v_offset = 2u * num_k_heads * head_k_dim + vh * head_v_dim;
+    const float ssm_a_v = ssm_a[vh];
+    const float dt_bias_v = dt_bias[vh];
+    const float inv_hvd = rsqrtf(static_cast<float>(head_v_dim));
+    float row_val = row[tid];
+
+    for (uint32_t t = begin; t < end; ++t) {
+        const float *conv = conv_batch + static_cast<uint64_t>(t) * conv_stride;
+        const float q = conv[q_offset + tid];
+        const float k = conv[k_offset + tid];
+        const float v_j = conv[v_offset + j];
+        const float a_v = alpha_batch[static_cast<uint64_t>(t) * alpha_stride + vh];
+        const float b_v = beta_batch[static_cast<uint64_t>(t) * beta_stride + vh];
+
+        const float g_raw = log1pf(expf(a_v + dt_bias_v)) * ssm_a_v;
+        const float eg = expf(g_raw);
+        const float beta_sigmoid = 1.0f / (1.0f + expf(-b_v));
+
+        row_val *= eg;
+        scratch[tid] = row_val * k;
+        __syncthreads();
+        for (uint32_t s = 64; s > 0; s >>= 1) {
+            if (tid < s) scratch[tid] += scratch[tid + s];
+            __syncthreads();
+        }
+        const float delta = (v_j - scratch[0]) * beta_sigmoid;
+        row_val += delta * k;
+        scratch[tid] = row_val * q;
+        __syncthreads();
+        for (uint32_t s = 64; s > 0; s >>= 1) {
+            if (tid < s) scratch[tid] += scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            core[static_cast<uint64_t>(t) * core_stride +
+                 vh * head_v_dim + j] = scratch[0] * inv_hvd;
+        }
+        __syncthreads();
+    }
+    row[tid] = row_val;
 }
 
 // RMSnorm + gate, batched over T. Each block normalizes one (token, v_head)
@@ -4524,6 +4648,141 @@ public:
             c.ptr, g.ptr, static_cast<const float *>(nw.ptr),
             batch, num_v_heads, head_v_dim, core_stride, gate_stride, eps);
         return launch_status("recurrent independent norm gate");
+    }
+
+    DeviceStatus recurrent_batch_ragged(DeviceTensor &core,
+                                        DeviceTensor &state_batch,
+                                        DeviceTensor &conv_state_batch,
+                                        DeviceTensor &conv_out_buf,
+                                        const DeviceTensor &proj,
+                                        const DeviceTensor &gate,
+                                        const DeviceTensor &alpha,
+                                        const DeviceTensor &beta,
+                                        const DeviceTensor &q_indptr,
+                                        const DeviceWeight &conv,
+                                        const DeviceWeight &ssm_a,
+                                        const DeviceWeight &dt_bias,
+                                        const DeviceWeight &ssm_norm,
+                                        uint32_t batch,
+                                        uint32_t total_q,
+                                        uint32_t num_k_heads,
+                                        uint32_t num_v_heads,
+                                        uint32_t head_k_dim,
+                                        uint32_t head_v_dim,
+                                        uint32_t conv_kernel_size,
+                                        uint32_t proj_count,
+                                        uint32_t proj_stride,
+                                        uint32_t gate_stride,
+                                        uint32_t alpha_stride,
+                                        uint32_t beta_stride,
+                                        uint32_t core_stride,
+                                        uint32_t state_stride,
+                                        uint32_t conv_state_stride,
+                                        float eps) override {
+        if (batch == 0 || total_q == 0) return {};
+        auto &c = as_tensor(core);
+        auto &s = as_tensor(state_batch);
+        auto &cs = as_tensor(conv_state_batch);
+        auto &cout = as_tensor(conv_out_buf);
+        const auto &p = as_tensor(proj);
+        const auto &g = as_tensor(gate);
+        const auto &a = as_tensor(alpha);
+        const auto &b = as_tensor(beta);
+        const auto &qptr = as_tensor(q_indptr);
+        const auto &cw = as_weight(conv);
+        const auto &aw = as_weight(ssm_a);
+        const auto &dt = as_weight(dt_bias);
+        const auto &nw = as_weight(ssm_norm);
+        if (qptr.elem_size != sizeof(int32_t) ||
+            qptr.count < static_cast<uint64_t>(batch) + 1) {
+            return {false, "recurrent_batch_ragged q_indptr must be i32[batch+1]"};
+        }
+        if (head_k_dim != 128 || head_v_dim > 256) {
+            return {false, "recurrent_batch_ragged unsupported head dims"};
+        }
+        const uint64_t need_state =
+            static_cast<uint64_t>(batch - 1) * state_stride +
+            static_cast<uint64_t>(num_v_heads) * head_v_dim * head_k_dim;
+        const uint64_t need_conv_state =
+            static_cast<uint64_t>(batch - 1) * conv_state_stride +
+            static_cast<uint64_t>(proj_count) * (conv_kernel_size - 1);
+        const uint64_t need_proj =
+            static_cast<uint64_t>(total_q - 1) * proj_stride + proj_count;
+        const uint64_t need_core =
+            static_cast<uint64_t>(total_q - 1) * core_stride +
+            static_cast<uint64_t>(num_v_heads) * head_v_dim;
+        if (s.count < need_state || cs.count < need_conv_state ||
+            p.count < need_proj || cout.count < need_proj ||
+            c.count < need_core) {
+            return {false, "recurrent_batch_ragged tensor too small"};
+        }
+
+        const unsigned conv_threads = 256;
+        const unsigned conv_blocks =
+            static_cast<unsigned>((proj_count + conv_threads - 1) / conv_threads);
+        dim3 conv_grid(batch, conv_blocks);
+        switch (conv_kernel_size) {
+            case 3:
+                recurrent_conv_ragged_batch_kernel<3>
+                    <<<conv_grid, conv_threads, 0, exec_stream_>>>(
+                        cout.ptr, cs.ptr, p.ptr, qptr.ptr_i32(),
+                        static_cast<const float *>(cw.ptr), batch, proj_count,
+                        conv_state_stride, proj_stride, proj_stride);
+                break;
+            case 4:
+                recurrent_conv_ragged_batch_kernel<4>
+                    <<<conv_grid, conv_threads, 0, exec_stream_>>>(
+                        cout.ptr, cs.ptr, p.ptr, qptr.ptr_i32(),
+                        static_cast<const float *>(cw.ptr), batch, proj_count,
+                        conv_state_stride, proj_stride, proj_stride);
+                break;
+            case 5:
+                recurrent_conv_ragged_batch_kernel<5>
+                    <<<conv_grid, conv_threads, 0, exec_stream_>>>(
+                        cout.ptr, cs.ptr, p.ptr, qptr.ptr_i32(),
+                        static_cast<const float *>(cw.ptr), batch, proj_count,
+                        conv_state_stride, proj_stride, proj_stride);
+                break;
+            case 7:
+                recurrent_conv_ragged_batch_kernel<7>
+                    <<<conv_grid, conv_threads, 0, exec_stream_>>>(
+                        cout.ptr, cs.ptr, p.ptr, qptr.ptr_i32(),
+                        static_cast<const float *>(cw.ptr), batch, proj_count,
+                        conv_state_stride, proj_stride, proj_stride);
+                break;
+            default:
+                return {false, "recurrent_batch_ragged unsupported conv_kernel_size"};
+        }
+        if (auto st = launch_status("recurrent_conv_ragged_batch_kernel");
+            !st.ok) return st;
+
+        dim3 ln_grid(total_q, num_k_heads);
+        const uint32_t q_off = 0;
+        const uint32_t k_off = num_k_heads * head_k_dim;
+        l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
+            cout.ptr, num_k_heads, head_k_dim, total_q, proj_stride, q_off, eps);
+        l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
+            cout.ptr, num_k_heads, head_k_dim, total_q, proj_stride, k_off, eps);
+        if (auto st = launch_status("recurrent ragged l2 norm"); !st.ok) {
+            return st;
+        }
+
+        dim3 dn_grid(batch, num_v_heads, head_v_dim);
+        deltanet_ragged_batch_kernel<<<dn_grid, 128, 0, exec_stream_>>>(
+            c.ptr, s.ptr, cout.ptr, a.ptr, b.ptr, qptr.ptr_i32(),
+            static_cast<const float *>(aw.ptr),
+            static_cast<const float *>(dt.ptr),
+            batch, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+            proj_stride, alpha_stride, beta_stride, core_stride, state_stride);
+        if (auto st = launch_status("deltanet_ragged_batch_kernel"); !st.ok) {
+            return st;
+        }
+
+        dim3 ng_grid(total_q, num_v_heads);
+        recurrent_norm_gate_batch_kernel<<<ng_grid, head_v_dim, 0, exec_stream_>>>(
+            c.ptr, g.ptr, static_cast<const float *>(nw.ptr),
+            total_q, num_v_heads, head_v_dim, core_stride, gate_stride, eps);
+        return launch_status("recurrent ragged norm gate");
     }
 
     DeviceStatus zero_tensor(DeviceTensor &x) override {

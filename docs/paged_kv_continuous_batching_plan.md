@@ -987,6 +987,29 @@ Follow-up: FlashInfer paged prefill
       concurrency 1 prefill `3699.59 tok/s`, concurrency 2 prefill
       `3694.59 tok/s`; no regression versus the previous metadata-only
       baseline, but wall time remains near-additive because mode is delegated.
+  - Added a CUDA backend foundation for multi-sequence recurrent prefill:
+    - New `DeviceBackend::recurrent_batch_ragged(...)` interface.
+    - New CUDA ragged recurrent conv kernel that processes each request's
+      `q_indptr[b]..q_indptr[b+1]` token span sequentially while running
+      requests in parallel.
+    - New CUDA ragged DeltaNet kernel with independent per-request recurrent
+      state, preserving token order within each request.
+    - Existing batched L2 norm and recurrent norm/gate kernels are reused over
+      `total_q` concatenated rows.
+    - This primitive is not yet wired into `BatchedPrefillExecutor`; it is the
+      backend foundation needed before replacing delegated per-request prefill.
+  - Verification for ragged recurrent backend foundation:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV continuous regression:
+      `/tmp/qw3_ragged_recurrent_foundation_fp16_cb.json`, passed exact
+      parity, `prefill_ragged_device_metadata_ready=true`,
+      decode `ragged_metadata_ready=true`.
+    - FP8 KV continuous regression:
+      `/tmp/qw3_ragged_recurrent_foundation_fp8_cb.json`, passed exact parity,
+      `prefill_ragged_device_metadata_ready=true`,
+      decode `ragged_metadata_ready=true`.
 
 ## Stage 8: Batched Sampling Optimization
 
