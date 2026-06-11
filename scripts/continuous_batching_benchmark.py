@@ -46,6 +46,14 @@ GENERATE_RE = re.compile(
     r"decode=(?P<decode>[0-9.]+)s"
 )
 
+TIMING_RE = re.compile(
+    r"native continuous_batch_timing:\s+"
+    r"mode=(?P<mode>\S+)\s+"
+    r"batch=(?P<batch>\d+)\s+"
+    r"kernel_batch=(?P<kernel_batch>\d+)\s+"
+    r"total=(?P<total>[0-9.]+)s"
+)
+
 
 @dataclass
 class BenchRequest:
@@ -89,6 +97,9 @@ class BenchRun:
     decode_tokens: int
     decode_s: float
     decode_tokens_per_s: float
+    decode_step_tokens: int
+    decode_step_s: float
+    decode_step_tokens_per_s: float
     mean_latency_s: float
     p50_latency_s: float
     p90_latency_s: float
@@ -107,6 +118,12 @@ class SummaryMetrics:
     decoded_tokens: int
     decode_s: float
     max_batch: int
+
+
+@dataclass
+class TimingMetrics:
+    batch_tokens: int
+    total_s: float
 
 
 def parse_int_list(raw: str) -> List[int]:
@@ -245,6 +262,18 @@ def parse_summary_metrics(log: str) -> List[SummaryMetrics]:
     return summaries
 
 
+def parse_timing_metrics(log: str) -> List[TimingMetrics]:
+    timings: List[TimingMetrics] = []
+    for m in TIMING_RE.finditer(log):
+        timings.append(
+            TimingMetrics(
+                batch_tokens=int(m.group("batch")),
+                total_s=float(m.group("total")),
+            )
+        )
+    return timings
+
+
 def make_command(binary: Path,
                  model: Path,
                  host: str,
@@ -275,7 +304,10 @@ def make_command(binary: Path,
     return cmd
 
 
-def make_env(variant: BenchVariant, max_active: int, trace: bool) -> Dict[str, str]:
+def make_env(variant: BenchVariant,
+             max_active: int,
+             trace: bool,
+             timing: bool) -> Dict[str, str]:
     env = os.environ.copy()
     env.setdefault("QW3_MATMUL", "mmq")
     if variant.continuous:
@@ -284,11 +316,16 @@ def make_env(variant: BenchVariant, max_active: int, trace: bool) -> Dict[str, s
             env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
         else:
             env.pop("QW3_CONTINUOUS_BATCHING_TRACE", None)
+        if timing:
+            env["QW3_CONTINUOUS_BATCHING_TIMING"] = "1"
+        else:
+            env.pop("QW3_CONTINUOUS_BATCHING_TIMING", None)
         env["QW3_CONTINUOUS_BATCHING_MAX_ACTIVE"] = str(max_active)
         env.update(variant.env)
     else:
         env.pop("QW3_CONTINUOUS_BATCHING", None)
         env.pop("QW3_CONTINUOUS_BATCHING_TRACE", None)
+        env.pop("QW3_CONTINUOUS_BATCHING_TIMING", None)
         env.pop("QW3_CONTINUOUS_BATCHING_MAX_ACTIVE", None)
         env.pop("QW3_CONTINUOUS_BATCHING_BODY_BATCH", None)
         env.pop("QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH", None)
@@ -342,9 +379,10 @@ def run_variant(*,
                 timeout_s: int,
                 max_active: int,
                 trace: bool,
+                timing: bool,
                 ignore_eos: bool,
                 extra_args: Sequence[str]) -> BenchRun:
-    env = make_env(variant, max_active, trace)
+    env = make_env(variant, max_active, trace, timing)
     cmd = make_command(
         binary, model, host, port, max_tokens, ctx_size, prefill_chunk, extra_args
     )
@@ -395,6 +433,9 @@ def run_variant(*,
         decode_tokens += summary.decoded_tokens
         decode_s += summary.decode_s
         summary_max_batch = max(summary_max_batch, summary.max_batch)
+    timing_metrics = parse_timing_metrics(log)
+    decode_step_tokens = sum(t.batch_tokens for t in timing_metrics)
+    decode_step_s = sum(t.total_s for t in timing_metrics)
     return BenchRun(
         variant=variant.name,
         ctx_size=ctx_size,
@@ -414,6 +455,11 @@ def run_variant(*,
         decode_tokens=decode_tokens,
         decode_s=decode_s,
         decode_tokens_per_s=decode_tokens / decode_s if decode_s > 0.0 else 0.0,
+        decode_step_tokens=decode_step_tokens,
+        decode_step_s=decode_step_s,
+        decode_step_tokens_per_s=(
+            decode_step_tokens / decode_step_s if decode_step_s > 0.0 else 0.0
+        ),
         mean_latency_s=statistics.fmean(latencies) if latencies else 0.0,
         p50_latency_s=percentile(latencies, 0.50),
         p90_latency_s=percentile(latencies, 0.90),
@@ -434,6 +480,7 @@ def build_run_from_requests(*,
                             request_wall_s: float,
                             requests: List[BenchRequest],
                             summaries: Sequence[SummaryMetrics],
+                            timings: Sequence[TimingMetrics],
                             full_log: str) -> BenchRun:
     latencies = [r.elapsed_s for r in requests if r.ok]
     output_tokens = sum(r.completion_tokens for r in requests if r.ok)
@@ -442,6 +489,8 @@ def build_run_from_requests(*,
     prefill_s = sum(s.prefill_s for s in summaries)
     decode_tokens = sum(s.decoded_tokens for s in summaries)
     decode_s = sum(s.decode_s for s in summaries)
+    decode_step_tokens = sum(t.batch_tokens for t in timings)
+    decode_step_s = sum(t.total_s for t in timings)
     max_summary_batch = max((s.max_batch for s in summaries), default=0)
     return BenchRun(
         variant=variant.name,
@@ -462,6 +511,11 @@ def build_run_from_requests(*,
         decode_tokens=decode_tokens,
         decode_s=decode_s,
         decode_tokens_per_s=decode_tokens / decode_s if decode_s > 0.0 else 0.0,
+        decode_step_tokens=decode_step_tokens,
+        decode_step_s=decode_step_s,
+        decode_step_tokens_per_s=(
+            decode_step_tokens / decode_step_s if decode_step_s > 0.0 else 0.0
+        ),
         mean_latency_s=statistics.fmean(latencies) if latencies else 0.0,
         p50_latency_s=percentile(latencies, 0.50),
         p90_latency_s=percentile(latencies, 0.90),
@@ -488,10 +542,11 @@ def run_reused_variant_matrix(*,
                               timeout_s: int,
                               max_active: int,
                               trace: bool,
+                              timing: bool,
                               ignore_eos: bool,
                               extra_args: Sequence[str]) -> List[BenchRun]:
     max_concurrency = max(concurrency_levels)
-    env = make_env(variant, max(max_active, max_concurrency), trace)
+    env = make_env(variant, max(max_active, max_concurrency), trace, timing)
     cmd = make_command(
         binary, model, host, port, max_tokens, ctx_size, prefill_chunk, extra_args
     )
@@ -526,8 +581,10 @@ def run_reused_variant_matrix(*,
         log = cbr.terminate_server(proc)
     elapsed_s = time.monotonic() - start
     summaries = parse_summary_metrics(log)
+    timing_metrics = parse_timing_metrics(log)
     runs: List[BenchRun] = []
     cursor = 0
+    single_pending = len(pending) == 1
     for input_target, wall_s, requests in pending:
         next_cursor = cursor + len(requests)
         run_summaries = summaries[cursor:next_cursor]
@@ -540,6 +597,7 @@ def run_reused_variant_matrix(*,
             request_wall_s=wall_s,
             requests=requests,
             summaries=run_summaries,
+            timings=timing_metrics if single_pending else [],
             full_log=log,
         )
         run.elapsed_s = elapsed_s
@@ -633,6 +691,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="enable verbose continuous batching trace logs",
     )
     ap.add_argument(
+        "--timing",
+        action="store_true",
+        help="enable continuous batching timing logs and decode-step throughput",
+    )
+    ap.add_argument(
         "--ignore-eos",
         action="store_true",
         help="request benchmark generations to continue until max_tokens",
@@ -692,6 +755,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     timeout_s=args.timeout,
                     max_active=args.max_active,
                     trace=args.trace,
+                    timing=args.timing,
                     ignore_eos=args.ignore_eos,
                     extra_args=args.extra_arg,
                 )
@@ -708,6 +772,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         f"out_tok/s={run.tokens_per_s:.2f} "
                         f"prefill_tok/s={run.prefill_tokens_per_s:.2f} "
                         f"decode_tok/s={run.decode_tokens_per_s:.2f} "
+                        f"decode_step_tok/s={run.decode_step_tokens_per_s:.2f} "
                         f"prefill_tokens={run.prefill_tokens} "
                         f"decode_tokens={run.decode_tokens} "
                         f"batch={max(run.max_trace_batch, run.max_summary_batch)}"
@@ -737,6 +802,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     timeout_s=args.timeout,
                     max_active=max_active,
                     trace=args.trace,
+                    timing=args.timing,
                     ignore_eos=args.ignore_eos,
                     extra_args=args.extra_arg,
                 )
@@ -750,6 +816,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"out_tok/s={run.tokens_per_s:.2f} "
                     f"prefill_tok/s={run.prefill_tokens_per_s:.2f} "
                     f"decode_tok/s={run.decode_tokens_per_s:.2f} "
+                    f"decode_step_tok/s={run.decode_step_tokens_per_s:.2f} "
                     f"tokens={run.output_tokens} "
                     f"mean={run.mean_latency_s:.3f}s "
                     f"p50={run.p50_latency_s:.3f}s "
@@ -780,6 +847,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "synthetic_repeat": args.synthetic_repeat,
             "prefill_chunk": args.prefill_chunk,
             "max_active": args.max_active,
+            "timing": args.timing,
             "ignore_eos": args.ignore_eos,
             "variants": args.variants,
         },

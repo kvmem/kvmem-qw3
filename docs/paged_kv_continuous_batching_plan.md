@@ -757,6 +757,19 @@ Follow-up: FlashInfer paged prefill
     The next required performance step is true ragged batched prefill across
     multiple prefilling requests while preserving recurrent/deltanet
     per-request token order.
+  - Added benchmark timing metrics after commit `efec134`:
+    `scripts/continuous_batching_benchmark.py --timing` now enables
+    `QW3_CONTINUOUS_BATCHING_TIMING=1` and reports `decode_step_tok/s`, derived
+    from `native continuous_batch_timing` batched decode step totals. This
+    separates global batched decode throughput from per-request overlapping
+    decode latency sums.
+  - Timing probe:
+    `/tmp/qw3_cb_32k_conc4_timing_probe.json` with 32K input, concurrency 4,
+    FP8 KV, `max_tokens=16`, and `prefill_chunk=2048` showed decode entering
+    `body_batch_fp16` for batch 2/3/4. Batch-4 decode steps were roughly
+    32-33 ms, while four request prefills each remained about 8.87 s.
+  - Benchmark timing smoke:
+    `python3 scripts/continuous_batching_benchmark.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --ctx 4096 --input-token-targets '1024' --concurrency-levels '2' --reuse-server --max-active 2 --max-tokens 8 --ignore-eos --timing --prefill-chunk 512 --out-json /tmp/qw3_benchmark_timing_smoke.json --timeout 600 --variants recurrent --extra-arg=--kv-dtype --extra-arg=fp8`: passed, `decode_step_tok/s=61.40`.
 
 ## Stage 8: Batched Sampling Optimization
 
