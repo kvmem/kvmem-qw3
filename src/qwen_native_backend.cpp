@@ -235,6 +235,10 @@ uint32_t continuous_batching_prefill_burst(uint32_t max_active) {
         1, env_uint32_or("QW3_CONTINUOUS_BATCHING_PREFILL_BURST", max_active));
 }
 
+uint32_t continuous_batching_admission_wait_us() {
+    return env_uint32_or("QW3_CONTINUOUS_BATCHING_ADMISSION_WAIT_US", 1000);
+}
+
 uint64_t continuous_batching_max_total_tokens(uint32_t ctx_size, uint32_t max_active) {
     const uint64_t default_budget =
         static_cast<uint64_t>(ctx_size) * static_cast<uint64_t>(max_active);
@@ -257,6 +261,10 @@ bool continuous_batching_body_batch_enabled() {
 
 bool continuous_batching_recurrent_batch_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH", true);
+}
+
+bool continuous_batching_prefill_batch_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_PREFILL_BATCH", true);
 }
 
 class GlobalKvPagePool final : public KvPhysicalPageAllocator {
@@ -2221,6 +2229,18 @@ private:
                         prefilling.empty()) {
                         break;
                     }
+                    if (active.empty() && prefilling.empty() &&
+                        !cb_pending_.empty()) {
+                        const uint32_t wait_us =
+                            continuous_batching_admission_wait_us();
+                        if (wait_us > 0 && cb_pending_.size() < max_active) {
+                            cb_cv_.wait_for(
+                                lk, std::chrono::microseconds(wait_us), [&]() {
+                                    return cb_stop_ ||
+                                           cb_pending_.size() >= max_active;
+                                });
+                        }
+                    }
                     arrivals.swap(cb_pending_);
                 }
 
@@ -2253,12 +2273,8 @@ private:
                     ? 1u
                     : std::min<uint32_t>(
                           static_cast<uint32_t>(prefilling.size()), prefill_burst);
-                for (uint32_t step = 0;
-                     step < prefill_steps && !prefilling.empty();
-                     ++step) {
-                    advance_continuous_prefill(prefilling, active, eos);
-                    if (!active.empty()) break;
-                }
+                advance_continuous_prefill_batch(prefilling, active, eos,
+                                                 prefill_steps);
             }
 
             st = device_->end();
@@ -2393,6 +2409,87 @@ private:
         } catch (const std::exception &e) {
             complete_continuous_request(a.req, {}, e.what());
             prefilling.erase(prefilling.begin());
+        }
+    }
+
+    void advance_continuous_prefill_batch(
+            std::vector<ContinuousBatchActive> &prefilling,
+            std::vector<ContinuousBatchActive> &active,
+            int32_t eos,
+            uint32_t max_chunks) {
+        if (prefilling.empty() || max_chunks == 0) return;
+        const bool use_batch_boundary =
+            continuous_batching_prefill_batch_enabled() &&
+            active.empty() && max_chunks > 1 && prefilling.size() > 1;
+        if (!use_batch_boundary) {
+            for (uint32_t step = 0;
+                 step < max_chunks && !prefilling.empty();
+                 ++step) {
+                advance_continuous_prefill(prefilling, active, eos);
+                if (!active.empty()) break;
+            }
+            return;
+        }
+
+        const uint32_t planned_chunks =
+            std::min<uint32_t>(max_chunks,
+                               static_cast<uint32_t>(prefilling.size()));
+        uint64_t planned_tokens = 0;
+        uint32_t planned_final = 0;
+        for (uint32_t i = 0; i < planned_chunks; ++i) {
+            const ContinuousBatchActive &a = prefilling[i];
+            const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
+            if (a.prefill_offset >= prompt.size() && !prompt.empty()) continue;
+            const uint32_t remaining =
+                static_cast<uint32_t>(prompt.size() - a.prefill_offset);
+            const uint32_t chunk = continuous_prefill_chunk_tokens(remaining);
+            planned_tokens += chunk;
+            if (prompt.empty() || chunk >= remaining) ++planned_final;
+        }
+
+        if (continuous_batching_trace_enabled()) {
+            std::ostringstream msg;
+            msg << "native continuous_prefill_batch:"
+                << " mode=delegated"
+                << " chunks=" << planned_chunks
+                << " tokens=" << planned_tokens
+                << " final_chunks=" << planned_final;
+            log(msg.str());
+        }
+
+        const double t0 = wall_seconds();
+        uint32_t executed_chunks = 0;
+        uint64_t executed_tokens = 0;
+        uint32_t completed_chunks = 0;
+        for (uint32_t step = 0;
+             step < planned_chunks && !prefilling.empty() && active.empty();
+             ++step) {
+            ContinuousBatchActive &front = prefilling.front();
+            const std::vector<uint32_t> &prompt = front.req->prompt_tokens;
+            const uint32_t remaining =
+                front.prefill_offset < prompt.size()
+                    ? static_cast<uint32_t>(prompt.size() - front.prefill_offset)
+                    : 0u;
+            const uint32_t chunk = continuous_prefill_chunk_tokens(remaining);
+            const bool final_chunk = prompt.empty() || chunk >= remaining;
+
+            advance_continuous_prefill(prefilling, active, eos);
+            executed_tokens += chunk;
+            if (final_chunk) ++completed_chunks;
+            ++executed_chunks;
+        }
+        const double t1 = wall_seconds();
+
+        if (continuous_batching_timing_enabled() ||
+            continuous_batching_trace_enabled()) {
+            std::ostringstream msg;
+            msg << "native continuous_prefill_batch_done:"
+                << " mode=delegated"
+                << " chunks=" << executed_chunks
+                << " tokens=" << executed_tokens
+                << " completed_chunks=" << completed_chunks
+                << " total=" << fmt_seconds(std::max(t1 - t0, 0.0));
+            log(msg.str());
         }
     }
 

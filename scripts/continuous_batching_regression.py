@@ -46,6 +46,10 @@ BODY_READY_RE = re.compile(
 BODY_MODE_RE = re.compile(
     r"native continuous_batch_executor:.*?mode=(?P<mode>body_batch_fp16)"
 )
+PREFILL_BATCH_RE = re.compile(
+    r"native continuous_prefill_batch:.*?chunks=(?P<chunks>\d+).*?"
+    r"tokens=(?P<tokens>\d+)"
+)
 
 
 @dataclass
@@ -88,6 +92,8 @@ class ServerRun:
     saw_ragged_metadata_ready: bool = False
     max_ragged_pages: int = 0
     max_ragged_seq_len: int = 0
+    max_prefill_batch_chunks: int = 0
+    max_prefill_batch_tokens: int = 0
 
 
 def prompt_catalog() -> Dict[str, str]:
@@ -193,7 +199,9 @@ def terminate_server(proc: subprocess.Popen[str]) -> str:
     return out + err
 
 
-def parse_server_log(log: str) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int]:
+def parse_server_log(
+    log: str,
+) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int, int, int]:
     max_trace_batch = 0
     saw_paged_kv_ready = False
     for m in BATCH_STEP_RE.finditer(log):
@@ -221,6 +229,15 @@ def parse_server_log(log: str) -> Tuple[int, int, bool, bool, bool, bool, bool, 
         )
         max_ragged_pages = max(max_ragged_pages, int(m.group("pages")))
         max_ragged_seq_len = max(max_ragged_seq_len, int(m.group("max_seq")))
+    max_prefill_batch_chunks = 0
+    max_prefill_batch_tokens = 0
+    for m in PREFILL_BATCH_RE.finditer(log):
+        max_prefill_batch_chunks = max(
+            max_prefill_batch_chunks, int(m.group("chunks"))
+        )
+        max_prefill_batch_tokens = max(
+            max_prefill_batch_tokens, int(m.group("tokens"))
+        )
     return (
         max_trace_batch,
         max_summary_batch,
@@ -231,6 +248,8 @@ def parse_server_log(log: str) -> Tuple[int, int, bool, bool, bool, bool, bool, 
         saw_ragged_metadata_ready,
         max_ragged_pages,
         max_ragged_seq_len,
+        max_prefill_batch_chunks,
+        max_prefill_batch_tokens,
     )
 
 
@@ -328,6 +347,8 @@ def run_server_case(*,
         saw_ragged,
         max_ragged_pages,
         max_ragged_seq_len,
+        max_prefill_batch_chunks,
+        max_prefill_batch_tokens,
     ) = parse_server_log(log)
     return ServerRun(
         mode=mode,
@@ -344,6 +365,8 @@ def run_server_case(*,
         saw_ragged_metadata_ready=saw_ragged,
         max_ragged_pages=max_ragged_pages,
         max_ragged_seq_len=max_ragged_seq_len,
+        max_prefill_batch_chunks=max_prefill_batch_chunks,
+        max_prefill_batch_tokens=max_prefill_batch_tokens,
     )
 
 
@@ -389,6 +412,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--require-ragged-metadata",
         action="store_true",
         help="require at least one batched decode step with ragged metadata ready",
+    )
+    ap.add_argument(
+        "--require-prefill-batch",
+        action="store_true",
+        help="require at least one observed continuous prefill batch with chunks >= --min-batch",
     )
     ap.add_argument(
         "--require-body-batch-ready",
@@ -535,6 +563,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         failed_requirements.append("did not observe mode=body_batch_fp16")
     if args.require_ragged_metadata and not continuous.saw_ragged_metadata_ready:
         failed_requirements.append("did not observe ragged_metadata_ready=true")
+    if (args.require_prefill_batch and
+            continuous.max_prefill_batch_chunks < args.min_batch):
+        failed_requirements.append(
+            "did not observe continuous_prefill_batch chunks >= "
+            f"{args.min_batch}"
+        )
 
     summary = {
         "config": {
@@ -566,6 +600,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             "continuous_max_ragged_pages": continuous.max_ragged_pages,
             "continuous_max_ragged_seq_len": continuous.max_ragged_seq_len,
+            "continuous_max_prefill_batch_chunks": (
+                continuous.max_prefill_batch_chunks
+            ),
+            "continuous_max_prefill_batch_tokens": (
+                continuous.max_prefill_batch_tokens
+            ),
             "baseline_elapsed_s": baseline.elapsed_s,
             "continuous_elapsed_s": continuous.elapsed_s,
         },
@@ -595,7 +635,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"body_batch_mode={continuous.saw_body_batch_mode} "
         f"ragged_metadata_ready={continuous.saw_ragged_metadata_ready} "
         f"ragged_pages={continuous.max_ragged_pages} "
-        f"ragged_max_seq_len={continuous.max_ragged_seq_len}"
+        f"ragged_max_seq_len={continuous.max_ragged_seq_len} "
+        f"prefill_batch_chunks={continuous.max_prefill_batch_chunks} "
+        f"prefill_batch_tokens={continuous.max_prefill_batch_tokens}"
     )
     print(
         f"elapsed: baseline={baseline.elapsed_s:.3f}s "

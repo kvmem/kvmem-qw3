@@ -828,6 +828,47 @@ Follow-up: FlashInfer paged prefill
       `/tmp/qw3_cb_32k_conc4_default_body_timing.json`, wall `39.814s`,
       output `12.86 tok/s`, prefill `3695.32 tok/s`, request-level decode
       `26.64 tok/s`, global decode-step `119.61 tok/s`.
+  - Added the first explicit multi-request prefill-batch scheduler boundary on
+    2026-06-11:
+    - `QW3_CONTINUOUS_BATCHING_ADMISSION_WAIT_US`, default `1000`, lets an idle
+      worker briefly coalesce newly arriving requests before admission. This is
+      only applied when there is no active decode and no request already in
+      prefill, so decode priority is unchanged.
+    - `QW3_CONTINUOUS_BATCHING_PREFILL_BATCH`, default on, groups multiple
+      prefilling requests into an observable `native continuous_prefill_batch`
+      scheduler boundary. The current executor mode is still `delegated`, so
+      model math remains the existing per-request `forward_n_tokens` path. This
+      is intentionally a foundation step for wiring a true ragged prefill
+      executor without changing scheduler semantics again.
+    - `scripts/continuous_batching_regression.py` now parses prefill-batch
+      evidence and supports `--require-prefill-batch`.
+  - Verification for the prefill-batch scheduler foundation:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - Forced coalescing prefill-batch regression:
+      `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math' --max-tokens 4 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_prefill_batch_boundary_cb.json --timeout 900 --min-batch 2 --require-prefill-batch --require-ragged-metadata --continuous-env QW3_CONTINUOUS_BATCHING_ADMISSION_WAIT_US=50000`: passed, exact parity, `max_batch=2`, `ragged_metadata_ready=true`, `prefill_batch_chunks=2`, `prefill_batch_tokens=12`.
+    - Default-window FP16 KV regression:
+      `/tmp/qw3_prefill_batch_default_fp16_rerun_cb.json`, passed exact parity,
+      `max_batch=2`, `mode=body_batch_fp16`, `ragged_metadata_ready=true`,
+      `prefill_batch_chunks=2`.
+    - Default-window FP8 KV regression:
+      `/tmp/qw3_prefill_batch_default_fp8_rerun_cb.json`, passed exact parity,
+      `max_batch=3`, `mode=body_batch_fp16`, `ragged_metadata_ready=true`,
+      `prefill_batch_chunks=2`.
+    - Prefill-batch opt-out regression:
+      `/tmp/qw3_prefill_batch_optout_cb.json`, passed exact parity with
+      `QW3_CONTINUOUS_BATCHING_PREFILL_BATCH=0`,
+      `prefill_batch_chunks=0`, `max_batch=2`,
+      `ragged_metadata_ready=true`.
+  - Current limitation after this step: prefill chunks are now grouped and
+    observable at the scheduler level, but still executed by the per-request
+    executor. The next throughput step is adding a real
+    `BatchedPrefillExecutor` that consumes this batch boundary. For Qwen3.6
+    27B, that executor must preserve per-request recurrent/deltanet token order
+    and use FlashInfer ragged paged prefill only for the standard-attention
+    layers; treating all concatenated prefill tokens as independent rows would
+    be mathematically wrong.
 
 ## Stage 8: Batched Sampling Optimization
 
