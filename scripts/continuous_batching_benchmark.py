@@ -418,6 +418,7 @@ def run_variant(*,
         saw_ragged,
         _max_ragged_pages,
         _max_ragged_seq_len,
+        *_prefill_metrics,
     ) = cbr.parse_server_log(log)
     latencies = [r.elapsed_s for r in requests if r.ok]
     output_tokens = sum(r.completion_tokens for r in requests if r.ok)

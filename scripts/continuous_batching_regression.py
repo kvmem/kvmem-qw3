@@ -59,6 +59,9 @@ PREFILL_BATCH_RE = re.compile(
     r"ragged_pages=(?P<pages>\d+).*?"
     r"ragged_max_seq_len=(?P<max_seq>\d+)"
 )
+PREFILL_DONE_RE = re.compile(
+    r"native continuous_prefill_batch_done:.*?mode=(?P<mode>\S+)"
+)
 
 
 @dataclass
@@ -112,6 +115,7 @@ class ServerRun:
     max_prefill_recurrent_state_packed_layers: int = 0
     max_prefill_ragged_pages: int = 0
     max_prefill_ragged_seq_len: int = 0
+    saw_prefill_ragged_executor: bool = False
 
 
 def prompt_catalog() -> Dict[str, str]:
@@ -219,7 +223,7 @@ def terminate_server(proc: subprocess.Popen[str]) -> str:
 
 def parse_server_log(
     log: str,
-) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int, int, int, bool, bool, bool, bool, bool, bool, int, int, int]:
+) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int, int, int, bool, bool, bool, bool, bool, bool, int, int, int, bool]:
     max_trace_batch = 0
     saw_paged_kv_ready = False
     for m in BATCH_STEP_RE.finditer(log):
@@ -258,6 +262,7 @@ def parse_server_log(
     max_prefill_recurrent_state_packed_layers = 0
     max_prefill_ragged_pages = 0
     max_prefill_ragged_seq_len = 0
+    saw_prefill_ragged_executor = False
     for m in PREFILL_BATCH_RE.finditer(log):
         max_prefill_batch_chunks = max(
             max_prefill_batch_chunks, int(m.group("chunks"))
@@ -298,6 +303,11 @@ def parse_server_log(
         max_prefill_ragged_seq_len = max(
             max_prefill_ragged_seq_len, int(m.group("max_seq"))
         )
+    for m in PREFILL_DONE_RE.finditer(log):
+        saw_prefill_ragged_executor = (
+            saw_prefill_ragged_executor or
+            m.group("mode") == "ragged_prefill"
+        )
     return (
         max_trace_batch,
         max_summary_batch,
@@ -319,6 +329,7 @@ def parse_server_log(
         max_prefill_recurrent_state_packed_layers,
         max_prefill_ragged_pages,
         max_prefill_ragged_seq_len,
+        saw_prefill_ragged_executor,
     )
 
 
@@ -427,6 +438,7 @@ def run_server_case(*,
         max_prefill_recurrent_state_packed_layers,
         max_prefill_ragged_pages,
         max_prefill_ragged_seq_len,
+        saw_prefill_ragged_executor,
     ) = parse_server_log(log)
     return ServerRun(
         mode=mode,
@@ -458,6 +470,7 @@ def run_server_case(*,
         ),
         max_prefill_ragged_pages=max_prefill_ragged_pages,
         max_prefill_ragged_seq_len=max_prefill_ragged_seq_len,
+        saw_prefill_ragged_executor=saw_prefill_ragged_executor,
     )
 
 
@@ -538,6 +551,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--require-prefill-recurrent-state-unpacked",
         action="store_true",
         help="require continuous prefill-batch recurrent state to be unpacked",
+    )
+    ap.add_argument(
+        "--require-prefill-ragged-executor",
+        action="store_true",
+        help="require at least one prefill batch to execute in mode=ragged_prefill",
     )
     ap.add_argument(
         "--require-body-batch-ready",
@@ -721,6 +739,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         failed_requirements.append(
             "did not observe continuous prefill recurrent_state_unpacked=true"
         )
+    if (args.require_prefill_ragged_executor and
+            not continuous.saw_prefill_ragged_executor):
+        failed_requirements.append(
+            "did not observe continuous_prefill_batch_done mode=ragged_prefill"
+        )
 
     summary = {
         "config": {
@@ -785,6 +808,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "continuous_max_prefill_ragged_seq_len": (
                 continuous.max_prefill_ragged_seq_len
             ),
+            "continuous_saw_prefill_ragged_executor": (
+                continuous.saw_prefill_ragged_executor
+            ),
             "baseline_elapsed_s": baseline.elapsed_s,
             "continuous_elapsed_s": continuous.elapsed_s,
         },
@@ -832,7 +858,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"prefill_recurrent_state_packed_layers="
         f"{continuous.max_prefill_recurrent_state_packed_layers} "
         f"prefill_ragged_pages={continuous.max_prefill_ragged_pages} "
-        f"prefill_ragged_max_seq_len={continuous.max_prefill_ragged_seq_len}"
+        f"prefill_ragged_max_seq_len={continuous.max_prefill_ragged_seq_len} "
+        f"prefill_ragged_executor={continuous.saw_prefill_ragged_executor}"
     )
     print(
         f"elapsed: baseline={baseline.elapsed_s:.3f}s "
