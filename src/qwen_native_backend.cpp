@@ -1124,6 +1124,7 @@ private:
         uint32_t max_seq_len = 0;
         bool ragged_metadata_ready = false;
         bool ragged_device_metadata_ready = false;
+        bool recurrent_state_ready = false;
 
         void clear() {
             entries.clear();
@@ -1138,6 +1139,7 @@ private:
             max_seq_len = 0;
             ragged_metadata_ready = false;
             ragged_device_metadata_ready = false;
+            recurrent_state_ready = false;
         }
 
         size_t size() const { return entries.size(); }
@@ -2562,6 +2564,7 @@ private:
         batch.seq_lens.reserve(n);
         batch.q_indptr.push_back(0);
         batch.page_indptr.push_back(0);
+        bool all_recurrent_state_ready = true;
         for (uint32_t i = 0; i < n; ++i) {
             ContinuousBatchActive &a = prefilling[i];
             if (!a.req) continue;
@@ -2579,11 +2582,30 @@ private:
             entry.chunk = continuous_prefill_chunk_tokens(remaining);
             entry.final_chunk = prompt.empty() || entry.chunk >= remaining;
             if (entry.chunk > 0 && a.executor) {
+                a.executor->prepare_runtime_state();
                 a.executor->prepare_kv_pages(entry.offset, entry.chunk);
             }
             const QwenExecutor::DecodeStateView view =
                 a.executor ? a.executor->decode_state_view()
                            : QwenExecutor::DecodeStateView{};
+            bool entry_recurrent_ready =
+                view.recurrent_states != nullptr &&
+                view.conv_states != nullptr &&
+                view.recurrent_states->size() >= weights_->n_layers() &&
+                view.conv_states->size() >= weights_->n_layers();
+            if (entry_recurrent_ready) {
+                for (uint32_t il = 0; il < weights_->n_layers(); ++il) {
+                    const QwenLayerWeights &layer = weights_->layer(il);
+                    if (!layer.recurrent) continue;
+                    if (!(*view.recurrent_states)[il] ||
+                        !(*view.conv_states)[il]) {
+                        entry_recurrent_ready = false;
+                        break;
+                    }
+                }
+            }
+            all_recurrent_state_ready =
+                all_recurrent_state_ready && entry_recurrent_ready;
             const uint32_t seq_len = entry.offset + entry.chunk;
             bool entry_metadata_ready =
                 entry.chunk > 0 &&
@@ -2630,6 +2652,8 @@ private:
                     static_cast<int32_t>(batch.page_indices.size()));
             }
         }
+        batch.recurrent_state_ready =
+            batch.size() > 0 && all_recurrent_state_ready;
         batch.ragged_metadata_ready =
             batch.size() > 0 &&
             batch.q_indptr.size() == batch.size() + 1 &&
@@ -2814,6 +2838,8 @@ private:
                 << (batch.ragged_metadata_ready ? "true" : "false")
                 << " ragged_device_metadata_ready="
                 << (batch.ragged_device_metadata_ready ? "true" : "false")
+                << " recurrent_state_ready="
+                << (batch.recurrent_state_ready ? "true" : "false")
                 << " ragged_pages=" << batch.page_indices.size()
                 << " ragged_max_seq_len=" << batch.max_seq_len;
             log(msg.str());

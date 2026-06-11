@@ -1010,6 +1010,25 @@ Follow-up: FlashInfer paged prefill
       `/tmp/qw3_ragged_recurrent_foundation_fp8_cb.json`, passed exact parity,
       `prefill_ragged_device_metadata_ready=true`,
       decode `ragged_metadata_ready=true`.
+  - Added recurrent-state readiness for batched prefill:
+    - `QwenExecutor::prepare_runtime_state()` exposes the existing lazy
+      scratch/state allocation without changing executor math.
+    - Continuous prefill batch construction now prepares runtime state before
+      collecting decode-state views, then logs
+      `recurrent_state_ready=true` when all recurrent and conv state tensors
+      are allocated for every request in the prefill batch.
+    - `scripts/continuous_batching_regression.py` now supports
+      `--require-prefill-recurrent-state`.
+  - Verification for recurrent-state readiness:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV:
+      `/tmp/qw3_prefill_recurrent_state_fp16_cb.json`, passed exact parity,
+      `prefill_recurrent_state_ready=true`.
+    - FP8 KV:
+      `/tmp/qw3_prefill_recurrent_state_fp8_cb.json`, passed exact parity,
+      `prefill_recurrent_state_ready=true`.
 
 ## Stage 8: Batched Sampling Optimization
 

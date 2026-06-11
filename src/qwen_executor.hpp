@@ -111,6 +111,7 @@ public:
     DecodeStateView decode_state_view() const;
     MutableDecodeStateView mutable_decode_state_view();
     KvStateSnapshot kv_state_snapshot() const;
+    void prepare_runtime_state();
     void prepare_kv_pages(uint32_t logical_pos, uint32_t count);
     void prepare_decode_token_pages(uint32_t count = 1);
     void advance_position(uint32_t count = 1) { position_ += count; }
