@@ -272,7 +272,14 @@ bool continuous_batching_prefill_pack_recurrent_state_enabled() {
 }
 
 bool continuous_batching_ragged_prefill_executor_enabled() {
-    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_EXECUTOR");
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_EXECUTOR",
+                            true);
+}
+
+uint32_t continuous_batching_ragged_prefill_min_tokens() {
+    return std::max<uint32_t>(
+        1, env_uint32_or("QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_MIN_TOKENS",
+                         512));
 }
 
 class GlobalKvPagePool final : public KvPhysicalPageAllocator {
@@ -1317,6 +1324,10 @@ private:
                 const BatchedPrefillDeviceMetadata &metadata) const {
             if (!continuous_batching_ragged_prefill_executor_enabled()) return false;
             if (batch.size() < 2 || batch.total_tokens == 0) return false;
+            if (batch.total_tokens <
+                continuous_batching_ragged_prefill_min_tokens()) {
+                return false;
+            }
             if (!batch.ragged_metadata_ready ||
                 !batch.ragged_device_metadata_ready ||
                 !batch.ragged_row_metadata_ready ||

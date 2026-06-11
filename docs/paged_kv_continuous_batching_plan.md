@@ -1174,6 +1174,22 @@ Follow-up: FlashInfer paged prefill
       `prefill_tok/s ~= 3637`, improving over both the original ragged
       executor (`~=1846`) and delegated continuous prefill (`~=3414`) in this
       benchmark shape.
+  - Enabled ragged prefill executor by default for sufficiently large batches:
+    - `QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_EXECUTOR` now defaults to enabled
+      and can still be disabled with `0/off/false/no`.
+    - `QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_MIN_TOKENS` controls the minimum
+      concatenated prefill rows required to use the real ragged executor;
+      default is `512`, so short tail chunks keep the delegated path.
+  - Verification for default ragged prefill threshold:
+    - FP16 KV forced short-path coverage:
+      `/tmp/qw3_ragged_prefill_default_threshold_forced_fp16_cb.json`, passed,
+      with `QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_MIN_TOKENS=1` and
+      `mode=ragged_prefill`.
+    - 2 x ~2048-token default-enabled benchmark:
+      `/tmp/qw3_ragged_prefill_default_enabled_bench.json`, passed,
+      `prefill_tok/s ~= 3653`; logs show 1024-token batches using
+      `mode=ragged_prefill` and the 14-token final tail using
+      `mode=delegated`.
 
 ## Stage 8: Batched Sampling Optimization
 
