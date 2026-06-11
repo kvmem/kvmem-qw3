@@ -697,6 +697,23 @@ Follow-up: FlashInfer paged prefill
     long-prompt throughput is still limited by request-serial prefill chunks.
     The next throughput step is true ragged batched prefill across prefilling
     requests.
+  - Added the first ragged paged prefill foundation after commit `6a1704e`:
+    FlashInfer adapter and CUDA backend interface for
+    `attention_prefill_batch_paged_ragged_gated_device(...)`, supporting
+    concatenated query rows plus `q_indptr/page_indptr/page_indices/
+    last_page_len` metadata for FP16 and FP8 KV. This is not yet wired into the
+    continuous scheduler.
+  - Verification for the foundation:
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - `git diff --check`: passed.
+    - Existing single-request 32K paged prefill regression after the new
+      interface: `/tmp/qw3_ragged_foundation_regression_fp16.json`,
+      `prefill_tok/s=3763.75`, `decode_tok/s=45.98`.
+  - Important integration note: the full scheduler/executor ragged prefill
+    path must handle recurrent/deltanet layers per request. It is not correct
+    to concatenate chunk rows and treat them like independent decode rows,
+    because recurrent state has intra-request token dependencies.
 
 ## Stage 8: Batched Sampling Optimization
 

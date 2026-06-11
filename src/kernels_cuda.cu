@@ -306,6 +306,62 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         float scale,
         cudaStream_t stream);
 
+bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        int32_t *int_workspace,
+        void *host_int_workspace,
+        size_t int_workspace_bytes,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *q_indptr,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream);
+
+bool launch_batch_prefill_paged_ragged_f16q_fp8kv_gated(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        int32_t *int_workspace,
+        void *host_int_workspace,
+        size_t int_workspace_bytes,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *q_indptr,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream);
+
 uint64_t decode_f32q_f16kv_tmp_elements(uint32_t n_heads,
                                         uint32_t head_dim,
                                         uint32_t seq_len);
@@ -6094,6 +6150,119 @@ public:
         }
 #endif
         return {false, "paged prefill requires FlashInfer FP16/FP8 batch prefill"};
+    }
+
+    DeviceStatus attention_prefill_batch_paged_ragged_gated_device(
+                                              DeviceTensor &out,
+                                              const DeviceTensor &q,
+                                              uint32_t q_stride,
+                                              const DeviceTensor &k_cache,
+                                              const DeviceTensor &v_cache,
+                                              const DeviceTensor &page_indices,
+                                              const DeviceTensor &page_indptr,
+                                              const DeviceTensor &last_page_len,
+                                              const DeviceTensor &q_indptr,
+                                              const int32_t *q_indptr_host,
+                                              const int32_t *page_indptr_host,
+                                              uint32_t batch,
+                                              uint32_t total_q,
+                                              uint32_t page_size,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim,
+                                              uint32_t q_batch_stride,
+                                              uint32_t out_batch_stride,
+                                              float scale) override {
+        if (batch == 0 || total_q == 0) return {};
+        if (page_size == 0) {
+            return {false, "ragged paged prefill requires page_size > 0"};
+        }
+        if (!q_indptr_host || !page_indptr_host) {
+            return {false, "ragged paged prefill requires host indptr metadata"};
+        }
+        if (q_indptr_host[0] != 0 ||
+            q_indptr_host[batch] != static_cast<int32_t>(total_q) ||
+            page_indptr_host[0] != 0 ||
+            page_indptr_host[batch] <= 0) {
+            return {false, "ragged paged prefill invalid host indptr metadata"};
+        }
+
+        auto &o = as_tensor(out);
+        const auto &qq = as_tensor(q);
+        const auto &kc = as_tensor(k_cache);
+        const auto &vc = as_tensor(v_cache);
+        const auto &pages = as_tensor(page_indices);
+        const auto &indptr = as_tensor(page_indptr);
+        const auto &last_len = as_tensor(last_page_len);
+        const auto &qptr = as_tensor(q_indptr);
+        if (pages.elem_size != sizeof(int32_t) ||
+            indptr.elem_size != sizeof(int32_t) ||
+            last_len.elem_size != sizeof(int32_t) ||
+            qptr.elem_size != sizeof(int32_t)) {
+            return {false, "ragged paged prefill metadata dtype mismatch"};
+        }
+        if (indptr.count < static_cast<uint64_t>(batch) + 1 ||
+            qptr.count < static_cast<uint64_t>(batch) + 1 ||
+            last_len.count < batch ||
+            pages.count < static_cast<uint64_t>(page_indptr_host[batch])) {
+            return {false, "ragged paged prefill metadata tensor too small"};
+        }
+
+#if QW3_ENABLE_FLASHINFER
+        if (prefill_attn_kernel_choice() == PrefillAttnKernel::FlashInfer &&
+            (kc.is_fp16() || kc.is_fp8_kv()) &&
+            (head_dim == 128 || head_dim == 256)) {
+            const uint64_t q_elems =
+                static_cast<uint64_t>(total_q) * n_heads * head_dim;
+            const uint64_t o_elems = q_elems;
+            const uint64_t meta_i32_elems = 1u << 20;
+            if (auto st = ensure_flashinfer_batch_prefill_workspace(
+                    q_elems, o_elems, meta_i32_elems); !st.ok) {
+                return st;
+            }
+            void *host_meta = nullptr;
+            if (auto st = acquire_flashinfer_batch_prefill_host_workspace(&host_meta);
+                !st.ok) {
+                return st;
+            }
+            const bool launched = kc.is_fp8_kv()
+                ? flashinfer_adapter::launch_batch_prefill_paged_ragged_f16q_fp8kv_gated(
+                    o.ptr,
+                    flashinfer_batch_prefill_q_f16_,
+                    flashinfer_batch_prefill_o_f16_,
+                    flashinfer_batch_prefill_meta_i32_,
+                    host_meta,
+                    static_cast<size_t>(flashinfer_batch_prefill_meta_i32_capacity_) *
+                        sizeof(int32_t),
+                    qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
+                    indptr.ptr_i32(), last_len.ptr_i32(), qptr.ptr_i32(),
+                    q_indptr_host, page_indptr_host, batch, total_q,
+                    page_size, n_heads, n_kv_heads, head_dim,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_)
+                : flashinfer_adapter::launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
+                    o.ptr,
+                    flashinfer_batch_prefill_q_f16_,
+                    flashinfer_batch_prefill_o_f16_,
+                    flashinfer_batch_prefill_meta_i32_,
+                    host_meta,
+                    static_cast<size_t>(flashinfer_batch_prefill_meta_i32_capacity_) *
+                        sizeof(int32_t),
+                    qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
+                    indptr.ptr_i32(), last_len.ptr_i32(), qptr.ptr_i32(),
+                    q_indptr_host, page_indptr_host, batch, total_q,
+                    page_size, n_heads, n_kv_heads, head_dim,
+                    q_batch_stride, out_batch_stride, scale, exec_stream_);
+            if (launched) {
+                if (auto st = record_flashinfer_batch_prefill_host_workspace();
+                    !st.ok) {
+                    return st;
+                }
+                return launch_status("cuda attention_prefill_batch flashinfer ragged paged gated");
+            }
+            return {false, "flashinfer ragged paged prefill launcher refused"};
+        }
+#endif
+        return {false, "ragged paged prefill requires FlashInfer FP16/FP8 batch prefill"};
     }
 
     DeviceStatus attention_decode_batch_paged_gated_device(

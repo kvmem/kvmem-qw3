@@ -328,6 +328,153 @@ bool run_batch_prefill_paged_typed(
     return st == cudaSuccess;
 }
 
+template <typename TKV>
+bool run_batch_prefill_paged_ragged_typed(
+        float *out,
+        half *q_f16,
+        half *o_f16,
+        int32_t *int_workspace,
+        void *host_int_workspace,
+        size_t int_workspace_bytes,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *q_indptr,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream,
+        unsigned &threads_out,
+        unsigned &blocks_out) {
+    if (out == nullptr || q_f16 == nullptr || o_f16 == nullptr ||
+        int_workspace == nullptr || host_int_workspace == nullptr ||
+        q == nullptr || k_cache == nullptr || v_cache == nullptr ||
+        page_indices == nullptr || page_indptr == nullptr ||
+        last_page_len == nullptr || q_indptr == nullptr ||
+        q_indptr_host == nullptr || page_indptr_host == nullptr) {
+        return false;
+    }
+    if (head_dim != 128 && head_dim != 256) return false;
+    if (n_heads == 0 || n_kv_heads == 0 || (n_heads % n_kv_heads) != 0) return false;
+    if (batch == 0 || total_q == 0 || page_size == 0 || q_stride < head_dim) return false;
+    if (q_indptr_host[0] != 0 || page_indptr_host[0] != 0) return false;
+    if (q_indptr_host[batch] != static_cast<int32_t>(total_q)) return false;
+    if (page_indptr_host[batch] <= 0) return false;
+
+    threads_out = 256;
+    const uint64_t q_elems = static_cast<uint64_t>(total_q) * n_heads * head_dim;
+    blocks_out = static_cast<unsigned>((q_elems + threads_out - 1) / threads_out);
+    pack_q_kernel<half><<<blocks_out, threads_out, 0, stream>>>(
+        q_f16, q, q_stride, total_q, n_heads, head_dim, q_batch_stride);
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    using Params = flashinfer::BatchPrefillPagedParams<half, TKV, half, int32_t>;
+    using Variant = flashinfer::DefaultAttention<false, false, false, false>;
+
+    flashinfer::PrefillPlanInfo plan_info;
+    cudaError_t plan_st = flashinfer::PrefillPlan<int32_t>(
+        nullptr, 0,
+        int_workspace,
+        host_int_workspace,
+        int_workspace_bytes,
+        plan_info,
+        const_cast<int32_t *>(q_indptr_host),
+        const_cast<int32_t *>(page_indptr_host),
+        total_q,
+        batch,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        head_dim,
+        page_size,
+        false,
+        sizeof(half),
+        -1,
+        0,
+        true,
+        0,
+        stream);
+    if (plan_st != cudaSuccess || plan_info.split_kv) return false;
+
+    auto paged_kv = flashinfer::paged_kv_t<TKV, int32_t>(
+        n_kv_heads, page_size, head_dim, batch, flashinfer::QKVLayout::kNHD,
+        const_cast<TKV *>(static_cast<const TKV *>(k_cache)),
+        const_cast<TKV *>(static_cast<const TKV *>(v_cache)),
+        const_cast<int32_t *>(page_indices),
+        const_cast<int32_t *>(page_indptr),
+        const_cast<int32_t *>(last_page_len),
+        nullptr);
+    Params params(q_f16,
+                  paged_kv,
+                  nullptr,
+                  const_cast<int32_t *>(q_indptr),
+                  nullptr,
+                  nullptr,
+                  o_f16,
+                  nullptr,
+                  nullptr,
+                  n_heads,
+                  static_cast<int32_t>(n_heads * head_dim),
+                  static_cast<int32_t>(head_dim),
+                  -1,
+                  0.0f,
+                  scale,
+                  1.0f,
+                  1.0f);
+    int32_t *plan_i32 = int_workspace;
+    params.request_indices = reinterpret_cast<int32_t *>(
+        reinterpret_cast<char *>(plan_i32) + plan_info.request_indices_offset);
+    params.qo_tile_indices = reinterpret_cast<int32_t *>(
+        reinterpret_cast<char *>(plan_i32) + plan_info.qo_tile_indices_offset);
+    params.kv_tile_indices = reinterpret_cast<int32_t *>(
+        reinterpret_cast<char *>(plan_i32) + plan_info.kv_tile_indices_offset);
+    params.o_indptr = reinterpret_cast<int32_t *>(
+        reinterpret_cast<char *>(plan_i32) + plan_info.o_indptr_offset);
+    params.kv_chunk_size_ptr = reinterpret_cast<int32_t *>(
+        reinterpret_cast<char *>(plan_i32) + plan_info.kv_chunk_size_ptr_offset);
+    params.padded_batch_size = static_cast<uint32_t>(plan_info.padded_batch_size);
+    params.partition_kv = false;
+    params.max_total_num_rows = total_q;
+    params.total_num_rows = nullptr;
+    params.merge_indptr = nullptr;
+    params.block_valid_mask = nullptr;
+
+    cudaError_t st = cudaErrorInvalidValue;
+    if (head_dim == 128) {
+        if (plan_info.cta_tile_q == 16) {
+            st = dispatch_batch_prefill_paged<16, 128, Params, Variant>(
+                params, nullptr, nullptr, stream);
+        } else if (plan_info.cta_tile_q == 64) {
+            st = dispatch_batch_prefill_paged<64, 128, Params, Variant>(
+                params, nullptr, nullptr, stream);
+        } else if (plan_info.cta_tile_q == 128) {
+            st = dispatch_batch_prefill_paged<128, 128, Params, Variant>(
+                params, nullptr, nullptr, stream);
+        }
+    } else if (head_dim == 256) {
+        if (plan_info.cta_tile_q == 16) {
+            st = dispatch_batch_prefill_paged<16, 256, Params, Variant>(
+                params, nullptr, nullptr, stream);
+        } else if (plan_info.cta_tile_q == 64) {
+            st = dispatch_batch_prefill_paged<64, 256, Params, Variant>(
+                params, nullptr, nullptr, stream);
+        }
+    }
+    return st == cudaSuccess;
+}
+
 } // namespace
 
 bool launch_prefill_f16q_f16kv_gated(
@@ -470,6 +617,92 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
     }
     unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
         out, o_f16, q, q_stride, batch, n_heads, head_dim,
+        q_batch_stride, out_batch_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
+        float *out,
+        half *q_f16,
+        half *o_f16,
+        int32_t *int_workspace,
+        void *host_int_workspace,
+        size_t int_workspace_bytes,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *q_indptr,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream) {
+    unsigned threads = 0, blocks = 0;
+    if (!run_batch_prefill_paged_ragged_typed<half>(
+            out, q_f16, o_f16, int_workspace, host_int_workspace,
+            int_workspace_bytes, q, q_stride, k_cache, v_cache,
+            page_indices, page_indptr, last_page_len, q_indptr,
+            q_indptr_host, page_indptr_host, batch, total_q, page_size,
+            n_heads, n_kv_heads, head_dim, q_batch_stride, out_batch_stride,
+            scale, stream, threads, blocks)) {
+        return false;
+    }
+    unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
+        out, o_f16, q, q_stride, total_q, n_heads, head_dim,
+        q_batch_stride, out_batch_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_batch_prefill_paged_ragged_f16q_fp8kv_gated(
+        float *out,
+        half *q_f16,
+        half *o_f16,
+        int32_t *int_workspace,
+        void *host_int_workspace,
+        size_t int_workspace_bytes,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        const int32_t *page_indptr,
+        const int32_t *last_page_len,
+        const int32_t *q_indptr,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream) {
+    unsigned threads = 0, blocks = 0;
+    if (!run_batch_prefill_paged_ragged_typed<__nv_fp8_e4m3>(
+            out, q_f16, o_f16, int_workspace, host_int_workspace,
+            int_workspace_bytes, q, q_stride, k_cache, v_cache,
+            page_indices, page_indptr, last_page_len, q_indptr,
+            q_indptr_host, page_indptr_host, batch, total_q, page_size,
+            n_heads, n_kv_heads, head_dim, q_batch_stride, out_batch_stride,
+            scale, stream, threads, blocks)) {
+        return false;
+    }
+    unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
+        out, o_f16, q, q_stride, total_q, n_heads, head_dim,
         q_batch_stride, out_batch_stride);
     return cudaGetLastError() == cudaSuccess;
 }

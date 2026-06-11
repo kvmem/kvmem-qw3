@@ -821,6 +821,41 @@ public:
         return {false, "attention_prefill_batch_paged_gated_device requires backend override"};
     }
 
+    // Cross-request paged-KV prefill. q/out rows are concatenated across
+    // requests, described by q_indptr[batch+1]. page_indices are flattened
+    // page table slices described by page_indptr[batch+1], and last_page_len
+    // stores each request's final page occupancy. The host indptr mirrors are
+    // required by FlashInfer's prefill planner.
+    virtual DeviceStatus attention_prefill_batch_paged_ragged_gated_device(
+                                                      DeviceTensor &out,
+                                                      const DeviceTensor &q,
+                                                      uint32_t q_stride,
+                                                      const DeviceTensor &k_cache,
+                                                      const DeviceTensor &v_cache,
+                                                      const DeviceTensor &page_indices,
+                                                      const DeviceTensor &page_indptr,
+                                                      const DeviceTensor &last_page_len,
+                                                      const DeviceTensor &q_indptr,
+                                                      const int32_t *q_indptr_host,
+                                                      const int32_t *page_indptr_host,
+                                                      uint32_t batch,
+                                                      uint32_t total_q,
+                                                      uint32_t page_size,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t head_dim,
+                                                      uint32_t q_batch_stride,
+                                                      uint32_t out_batch_stride,
+                                                      float scale) {
+        (void)out; (void)q; (void)q_stride; (void)k_cache; (void)v_cache;
+        (void)page_indices; (void)page_indptr; (void)last_page_len;
+        (void)q_indptr; (void)q_indptr_host; (void)page_indptr_host;
+        (void)batch; (void)total_q; (void)page_size; (void)n_heads;
+        (void)n_kv_heads; (void)head_dim; (void)q_batch_stride;
+        (void)out_batch_stride; (void)scale;
+        return {false, "attention_prefill_batch_paged_ragged_gated_device requires backend override"};
+    }
+
     // Cross-request ragged paged decode attention. Each row b has its own page
     // table slice page_indices[page_indptr[b]..page_indptr[b+1]), last page
     // length, and sequence length. This is the continuous batching variant;
