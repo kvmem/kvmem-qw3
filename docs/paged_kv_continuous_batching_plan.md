@@ -1072,6 +1072,26 @@ Follow-up: FlashInfer paged prefill
       `prefill_recurrent_state_packed=true`,
       `prefill_recurrent_state_unpacked=true`,
       `prefill_recurrent_state_packed_layers=48`.
+  - Added row-level prefill KV metadata for the real executor path:
+    - `ContinuousPrefillBatch` now carries `logical_positions` and
+      `row_page_indptr`.
+    - Request-level `page_indptr` is still used for FlashInfer ragged prefill
+      attention.
+    - Row-level `row_page_indptr` is needed by
+      `kv_append_batch_paged_ragged_device(...)`, because KV append indexes
+      metadata by query row rather than by request.
+    - The scheduler stages both metadata vectors to device and logs
+      `ragged_row_metadata_ready=true`.
+  - Verification for row-level prefill KV metadata:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV:
+      `/tmp/qw3_prefill_row_metadata_fp16_cb.json`, passed exact parity,
+      `prefill_ragged_row_metadata_ready=true`.
+    - FP8 KV:
+      `/tmp/qw3_prefill_row_metadata_fp8_cb.json`, passed exact parity,
+      `prefill_ragged_row_metadata_ready=true`.
 
 ## Stage 8: Batched Sampling Optimization
 

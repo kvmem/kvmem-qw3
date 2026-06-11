@@ -1119,7 +1119,9 @@ private:
         std::vector<ContinuousPrefillBatchEntry> entries;
         std::vector<int32_t> q_indptr;
         std::vector<int32_t> page_indptr;
+        std::vector<int32_t> row_page_indptr;
         std::vector<int32_t> page_indices;
+        std::vector<int32_t> logical_positions;
         std::vector<int32_t> last_page_len;
         std::vector<int32_t> seq_lens;
         uint64_t total_tokens = 0;
@@ -1128,6 +1130,7 @@ private:
         uint32_t max_seq_len = 0;
         bool ragged_metadata_ready = false;
         bool ragged_device_metadata_ready = false;
+        bool ragged_row_metadata_ready = false;
         bool recurrent_state_ready = false;
         bool recurrent_state_packed = false;
         bool recurrent_state_unpacked = false;
@@ -1137,7 +1140,9 @@ private:
             entries.clear();
             q_indptr.clear();
             page_indptr.clear();
+            row_page_indptr.clear();
             page_indices.clear();
+            logical_positions.clear();
             last_page_len.clear();
             seq_lens.clear();
             total_tokens = 0;
@@ -1146,6 +1151,7 @@ private:
             max_seq_len = 0;
             ragged_metadata_ready = false;
             ragged_device_metadata_ready = false;
+            ragged_row_metadata_ready = false;
             recurrent_state_ready = false;
             recurrent_state_packed = false;
             recurrent_state_unpacked = false;
@@ -2635,8 +2641,15 @@ private:
                 if (pages == 0 || view.kv_page_count < pages) {
                     entry_metadata_ready = false;
                 } else {
+                    const int32_t request_page_begin =
+                        static_cast<int32_t>(batch.page_indices.size());
                     for (uint32_t p = 0; p < pages; ++p) {
                         batch.page_indices.push_back(view.kv_page_indices_host[p]);
+                    }
+                    for (uint32_t t = 0; t < entry.chunk; ++t) {
+                        batch.logical_positions.push_back(
+                            static_cast<int32_t>(entry.offset + t));
+                        batch.row_page_indptr.push_back(request_page_begin);
                     }
                     const uint32_t last_len = seq_len % view.kv_page_size;
                     batch.last_page_len.push_back(static_cast<int32_t>(
@@ -2648,6 +2661,8 @@ private:
             if (!entry_metadata_ready) {
                 batch.page_indices.clear();
                 batch.page_indptr.clear();
+                batch.row_page_indptr.clear();
+                batch.logical_positions.clear();
                 batch.last_page_len.clear();
                 batch.seq_lens.clear();
                 batch.page_size = 0;
@@ -2664,19 +2679,27 @@ private:
         }
         batch.recurrent_state_ready =
             batch.size() > 0 && all_recurrent_state_ready;
+        if (!batch.row_page_indptr.empty()) {
+            batch.row_page_indptr.push_back(
+                static_cast<int32_t>(batch.page_indices.size()));
+        }
         batch.ragged_metadata_ready =
             batch.size() > 0 &&
             batch.q_indptr.size() == batch.size() + 1 &&
             batch.page_indptr.size() == batch.size() + 1 &&
+            batch.logical_positions.size() == batch.total_tokens &&
+            batch.row_page_indptr.size() == batch.total_tokens + 1 &&
             batch.last_page_len.size() == batch.size() &&
             batch.seq_lens.size() == batch.size() &&
             !batch.page_indices.empty() &&
             batch.page_size > 0;
+        batch.ragged_row_metadata_ready = batch.ragged_metadata_ready;
     }
 
     void ensure_continuous_prefill_ragged_metadata_device(
             uint32_t batch_size,
-            uint32_t pages) {
+            uint32_t pages,
+            uint32_t total_q) {
         if (batch_size > cb_prefill_ragged_batch_capacity_) {
             cb_prefill_q_indptr_i32_ =
                 device_->tensor_i32(static_cast<uint64_t>(batch_size) + 1,
@@ -2696,6 +2719,15 @@ private:
                 device_->tensor_i32(pages, "cb_prefill_page_indices_i32");
             cb_prefill_ragged_page_capacity_ = pages;
         }
+        if (total_q > cb_prefill_ragged_row_capacity_) {
+            cb_prefill_logical_positions_i32_ =
+                device_->tensor_i32(total_q,
+                                    "cb_prefill_logical_positions_i32");
+            cb_prefill_row_page_indptr_i32_ =
+                device_->tensor_i32(static_cast<uint64_t>(total_q) + 1,
+                                    "cb_prefill_row_page_indptr_i32");
+            cb_prefill_ragged_row_capacity_ = total_q;
+        }
     }
 
     static void require_device_status(const DeviceStatus &st) {
@@ -2708,7 +2740,8 @@ private:
         if (!batch.ragged_metadata_ready || batch.size() == 0) return;
         const uint32_t bsz = static_cast<uint32_t>(batch.size());
         const uint32_t pages = static_cast<uint32_t>(batch.page_indices.size());
-        ensure_continuous_prefill_ragged_metadata_device(bsz, pages);
+        const uint32_t total_q = static_cast<uint32_t>(batch.total_tokens);
+        ensure_continuous_prefill_ragged_metadata_device(bsz, pages, total_q);
         require_device_status(device_->copy_i32_from_host(
             *cb_prefill_q_indptr_i32_, 0, batch.q_indptr.data(),
             static_cast<uint64_t>(bsz) + 1));
@@ -2717,6 +2750,12 @@ private:
             static_cast<uint64_t>(bsz) + 1));
         require_device_status(device_->copy_i32_from_host(
             *cb_prefill_page_indices_i32_, 0, batch.page_indices.data(), pages));
+        require_device_status(device_->copy_i32_from_host(
+            *cb_prefill_logical_positions_i32_, 0,
+            batch.logical_positions.data(), total_q));
+        require_device_status(device_->copy_i32_from_host(
+            *cb_prefill_row_page_indptr_i32_, 0,
+            batch.row_page_indptr.data(), static_cast<uint64_t>(total_q) + 1));
         require_device_status(device_->copy_i32_from_host(
             *cb_prefill_last_page_len_i32_, 0,
             batch.last_page_len.data(), bsz));
@@ -2951,6 +2990,8 @@ private:
                 << (batch.ragged_metadata_ready ? "true" : "false")
                 << " ragged_device_metadata_ready="
                 << (batch.ragged_device_metadata_ready ? "true" : "false")
+                << " ragged_row_metadata_ready="
+                << (batch.ragged_row_metadata_ready ? "true" : "false")
                 << " recurrent_state_ready="
                 << (batch.recurrent_state_ready ? "true" : "false")
                 << " recurrent_state_packed="
@@ -4308,9 +4349,12 @@ private:
     QwenExecutor::KvCacheStorage cb_kv_cache_view_;
     uint32_t cb_prefill_ragged_batch_capacity_ = 0;
     uint32_t cb_prefill_ragged_page_capacity_ = 0;
+    uint32_t cb_prefill_ragged_row_capacity_ = 0;
     std::unique_ptr<DeviceTensor> cb_prefill_q_indptr_i32_;
     std::unique_ptr<DeviceTensor> cb_prefill_page_indptr_i32_;
+    std::unique_ptr<DeviceTensor> cb_prefill_row_page_indptr_i32_;
     std::unique_ptr<DeviceTensor> cb_prefill_page_indices_i32_;
+    std::unique_ptr<DeviceTensor> cb_prefill_logical_positions_i32_;
     std::unique_ptr<DeviceTensor> cb_prefill_last_page_len_i32_;
     std::unique_ptr<DeviceTensor> cb_prefill_seq_lens_i32_;
     uint64_t cb_prefill_recurrent_state_capacity_ = 0;

@@ -51,6 +51,7 @@ PREFILL_BATCH_RE = re.compile(
     r"tokens=(?P<tokens>\d+).*?"
     r"ragged_metadata_ready=(?P<ragged>true|false).*?"
     r"ragged_device_metadata_ready=(?P<device>true|false).*?"
+    r"ragged_row_metadata_ready=(?P<rowmeta>true|false).*?"
     r"recurrent_state_ready=(?P<recurrent>true|false).*?"
     r"recurrent_state_packed=(?P<packed>true|false).*?"
     r"recurrent_state_unpacked=(?P<unpacked>true|false).*?"
@@ -104,6 +105,7 @@ class ServerRun:
     max_prefill_batch_tokens: int = 0
     saw_prefill_ragged_metadata_ready: bool = False
     saw_prefill_ragged_device_metadata_ready: bool = False
+    saw_prefill_ragged_row_metadata_ready: bool = False
     saw_prefill_recurrent_state_ready: bool = False
     saw_prefill_recurrent_state_packed: bool = False
     saw_prefill_recurrent_state_unpacked: bool = False
@@ -217,7 +219,7 @@ def terminate_server(proc: subprocess.Popen[str]) -> str:
 
 def parse_server_log(
     log: str,
-) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int, int, int, bool, bool, bool, bool, bool, int, int, int]:
+) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int, int, int, bool, bool, bool, bool, bool, bool, int, int, int]:
     max_trace_batch = 0
     saw_paged_kv_ready = False
     for m in BATCH_STEP_RE.finditer(log):
@@ -249,6 +251,7 @@ def parse_server_log(
     max_prefill_batch_tokens = 0
     saw_prefill_ragged_metadata_ready = False
     saw_prefill_ragged_device_metadata_ready = False
+    saw_prefill_ragged_row_metadata_ready = False
     saw_prefill_recurrent_state_ready = False
     saw_prefill_recurrent_state_packed = False
     saw_prefill_recurrent_state_unpacked = False
@@ -268,6 +271,10 @@ def parse_server_log(
         saw_prefill_ragged_device_metadata_ready = (
             saw_prefill_ragged_device_metadata_ready or
             m.group("device") == "true"
+        )
+        saw_prefill_ragged_row_metadata_ready = (
+            saw_prefill_ragged_row_metadata_ready or
+            m.group("rowmeta") == "true"
         )
         saw_prefill_recurrent_state_ready = (
             saw_prefill_recurrent_state_ready or
@@ -305,6 +312,7 @@ def parse_server_log(
         max_prefill_batch_tokens,
         saw_prefill_ragged_metadata_ready,
         saw_prefill_ragged_device_metadata_ready,
+        saw_prefill_ragged_row_metadata_ready,
         saw_prefill_recurrent_state_ready,
         saw_prefill_recurrent_state_packed,
         saw_prefill_recurrent_state_unpacked,
@@ -412,6 +420,7 @@ def run_server_case(*,
         max_prefill_batch_tokens,
         saw_prefill_ragged,
         saw_prefill_ragged_device,
+        saw_prefill_ragged_row,
         saw_prefill_recurrent_state,
         saw_prefill_recurrent_state_packed,
         saw_prefill_recurrent_state_unpacked,
@@ -438,6 +447,7 @@ def run_server_case(*,
         max_prefill_batch_tokens=max_prefill_batch_tokens,
         saw_prefill_ragged_metadata_ready=saw_prefill_ragged,
         saw_prefill_ragged_device_metadata_ready=saw_prefill_ragged_device,
+        saw_prefill_ragged_row_metadata_ready=saw_prefill_ragged_row,
         saw_prefill_recurrent_state_ready=saw_prefill_recurrent_state,
         saw_prefill_recurrent_state_packed=saw_prefill_recurrent_state_packed,
         saw_prefill_recurrent_state_unpacked=(
@@ -508,6 +518,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--require-prefill-ragged-device-metadata",
         action="store_true",
         help="require continuous prefill-batch ragged metadata copied to device",
+    )
+    ap.add_argument(
+        "--require-prefill-ragged-row-metadata",
+        action="store_true",
+        help="require continuous prefill-batch row-level KV metadata",
     )
     ap.add_argument(
         "--require-prefill-recurrent-state",
@@ -686,6 +701,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "did not observe continuous prefill "
             "ragged_device_metadata_ready=true"
         )
+    if (args.require_prefill_ragged_row_metadata and
+            not continuous.saw_prefill_ragged_row_metadata_ready):
+        failed_requirements.append(
+            "did not observe continuous prefill ragged_row_metadata_ready=true"
+        )
     if (args.require_prefill_recurrent_state and
             not continuous.saw_prefill_recurrent_state_ready):
         failed_requirements.append(
@@ -744,6 +764,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "continuous_saw_prefill_ragged_device_metadata_ready": (
                 continuous.saw_prefill_ragged_device_metadata_ready
             ),
+            "continuous_saw_prefill_ragged_row_metadata_ready": (
+                continuous.saw_prefill_ragged_row_metadata_ready
+            ),
             "continuous_saw_prefill_recurrent_state_ready": (
                 continuous.saw_prefill_recurrent_state_ready
             ),
@@ -798,6 +821,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{continuous.saw_prefill_ragged_metadata_ready} "
         f"prefill_ragged_device_metadata_ready="
         f"{continuous.saw_prefill_ragged_device_metadata_ready} "
+        f"prefill_ragged_row_metadata_ready="
+        f"{continuous.saw_prefill_ragged_row_metadata_ready} "
         f"prefill_recurrent_state_ready="
         f"{continuous.saw_prefill_recurrent_state_ready} "
         f"prefill_recurrent_state_packed="
