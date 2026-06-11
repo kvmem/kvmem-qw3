@@ -161,6 +161,7 @@ def post_completion(base_url: str,
                     name: str,
                     prompt: str,
                     max_tokens: int,
+                    ignore_eos: bool,
                     timeout_s: float) -> BenchRequest:
     parsed = urllib.parse.urlparse(base_url)
     conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout_s)
@@ -169,6 +170,8 @@ def post_completion(base_url: str,
         "max_tokens": max_tokens,
         "temperature": 0,
     }
+    if ignore_eos:
+        payload["ignore_eos"] = True
     body = json.dumps(payload, ensure_ascii=False)
     headers = {"Content-Type": "application/json"}
     start = time.monotonic()
@@ -295,6 +298,7 @@ def make_env(variant: BenchVariant, max_active: int, trace: bool) -> Dict[str, s
 def send_requests(base_url: str,
                   prompts: Dict[str, str],
                   max_tokens: int,
+                  ignore_eos: bool,
                   timeout_s: int,
                   concurrent: bool) -> tuple[float, List[BenchRequest]]:
     request_start = time.monotonic()
@@ -308,6 +312,7 @@ def send_requests(base_url: str,
                     name,
                     prompt,
                     max_tokens,
+                    ignore_eos,
                     float(timeout_s),
                 )
                 for name, prompt in prompts.items()
@@ -317,7 +322,9 @@ def send_requests(base_url: str,
     else:
         for name, prompt in prompts.items():
             requests.append(
-                post_completion(base_url, name, prompt, max_tokens, float(timeout_s))
+                post_completion(
+                    base_url, name, prompt, max_tokens, ignore_eos,
+                    float(timeout_s))
             )
     return time.monotonic() - request_start, requests
 
@@ -335,6 +342,7 @@ def run_variant(*,
                 timeout_s: int,
                 max_active: int,
                 trace: bool,
+                ignore_eos: bool,
                 extra_args: Sequence[str]) -> BenchRun:
     env = make_env(variant, max_active, trace)
     cmd = make_command(
@@ -355,7 +363,8 @@ def run_variant(*,
     try:
         cbr.wait_for_health(base_url, timeout_s=min(120.0, float(timeout_s)))
         request_wall_s, requests = send_requests(
-            base_url, prompts, max_tokens, timeout_s, variant.concurrent
+            base_url, prompts, max_tokens, ignore_eos, timeout_s,
+            variant.concurrent
         )
     finally:
         log = cbr.terminate_server(proc)
@@ -479,6 +488,7 @@ def run_reused_variant_matrix(*,
                               timeout_s: int,
                               max_active: int,
                               trace: bool,
+                              ignore_eos: bool,
                               extra_args: Sequence[str]) -> List[BenchRun]:
     max_concurrency = max(concurrency_levels)
     env = make_env(variant, max(max_active, max_concurrency), trace)
@@ -502,7 +512,8 @@ def run_reused_variant_matrix(*,
             for concurrency in concurrency_levels:
                 prompts = synthetic_prompts_for_target(concurrency, input_target)
                 wall_s, requests = send_requests(
-                    base_url, prompts, max_tokens, timeout_s, variant.concurrent
+                    base_url, prompts, max_tokens, ignore_eos, timeout_s,
+                    variant.concurrent
                 )
                 pending.append((input_target, wall_s, requests))
                 print(
@@ -622,6 +633,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="enable verbose continuous batching trace logs",
     )
     ap.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="request benchmark generations to continue until max_tokens",
+    )
+    ap.add_argument(
         "--reuse-server",
         action="store_true",
         help="load one server per variant/ctx and run all input/concurrency cases",
@@ -676,6 +692,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     timeout_s=args.timeout,
                     max_active=args.max_active,
                     trace=args.trace,
+                    ignore_eos=args.ignore_eos,
                     extra_args=args.extra_arg,
                 )
                 runs.extend(matrix_runs)
@@ -720,6 +737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     timeout_s=args.timeout,
                     max_active=max_active,
                     trace=args.trace,
+                    ignore_eos=args.ignore_eos,
                     extra_args=args.extra_arg,
                 )
                 runs.append(run)
@@ -762,6 +780,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "synthetic_repeat": args.synthetic_repeat,
             "prefill_chunk": args.prefill_chunk,
             "max_active": args.max_active,
+            "ignore_eos": args.ignore_eos,
             "variants": args.variants,
         },
         "runs": [asdict(run) for run in runs],

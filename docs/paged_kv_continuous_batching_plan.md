@@ -714,6 +714,49 @@ Follow-up: FlashInfer paged prefill
     path must handle recurrent/deltanet layers per request. It is not correct
     to concatenate chunk rows and treat them like independent decode rows,
     because recurrent state has intra-request token dependencies.
+  - Added a low-risk scheduler prefill burst step on 2026-06-11. When there
+    are no active decode requests, the worker may advance up to
+    `QW3_CONTINUOUS_BATCHING_PREFILL_BURST` prefilling requests in one loop
+    turn, defaulting to `QW3_CONTINUOUS_BATCHING_MAX_ACTIVE`. When active
+    decode exists, decode remains first and only one prefill chunk is advanced
+    before returning to decode. If a prefill chunk finishes and enters decode,
+    the burst stops immediately.
+  - Expected effect: slightly reduce long-prompt multi-request scheduler
+    overhead without changing the executor math path. This is not a substitute
+    for true ragged batched prefill.
+  - Fixed local paged KV prefill correctness on 2026-06-11 by enabling the
+    paged prefill write path by default. The old default wrote chunk prefill KV
+    to linear logical offsets while paged decode read through the page table.
+    Identity allocation passed accidentally; reverse allocation diverged once
+    prompt length was large enough to affect decode logits.
+  - Updated `scripts/paged_kv_regression.py` to force greedy generation with
+    `--temp 0`, so page-size/allocation invariance checks are not polluted by
+    sampling.
+  - Added request-level `ignore_eos` / `ignore_eos_token` support for
+    benchmarks. The default remains model-faithful EOS stopping; benchmark
+    requests can opt in to forcing generation until `max_tokens`.
+  - Added `--ignore-eos` to `scripts/continuous_batching_benchmark.py` so
+    decode throughput sweeps are not skewed by zero-token EOS completions.
+  - Verification for these fixes:
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - `git diff --check`: passed.
+    - `python3 scripts/paged_kv_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --page-sizes '16 32' --alloc-modes 'identity reverse' --prompts 'short chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_paged_prefill_default_paged_kv.json --timeout 900`: passed, 8/8 runs and 0 failed comparisons.
+    - `python3 scripts/continuous_batching_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --prompts 'capital math cuda chinese' --max-tokens 8 --ctx 1024 --prefill-chunk 512 --out-json /tmp/qw3_ignore_eos_cb_regression_rerun.json --timeout 900 --min-batch 2`: passed, 4/4 comparisons, `max_batch=2`, `paged_kv_ready=true`, `hgemm_guard=true`.
+    - 32K benchmark with FP8 KV, `ctx=262144`, `prefill_chunk=2048`,
+      `max_tokens=128`, and `--ignore-eos`:
+      `/tmp/qw3_cb_32k_decode128_ignore_eos.json`.
+      - concurrency 1: wall `11.824s`, output `10.83 tok/s`,
+        prefill `3705.03 tok/s`, decode `43.76 tok/s`.
+      - concurrency 2: wall `21.375s`, output `11.98 tok/s`,
+        prefill `3695.01 tok/s`, decode `33.34 tok/s`.
+      - concurrency 4: wall `39.934s`, output `12.82 tok/s`,
+        prefill `3682.65 tok/s`, decode `27.52 tok/s`.
+  - Interpretation: single-request paged prefill is correct and fast, but
+    multi-request 32K throughput is still dominated by request-serial prefill.
+    The next required performance step is true ragged batched prefill across
+    multiple prefilling requests while preserving recurrent/deltanet
+    per-request token order.
 
 ## Stage 8: Batched Sampling Optimization
 

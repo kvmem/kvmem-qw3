@@ -230,6 +230,11 @@ uint32_t continuous_batching_max_pending() {
     return std::max<uint32_t>(1, env_uint32_or("QW3_CONTINUOUS_BATCHING_MAX_PENDING", 128));
 }
 
+uint32_t continuous_batching_prefill_burst(uint32_t max_active) {
+    return std::max<uint32_t>(
+        1, env_uint32_or("QW3_CONTINUOUS_BATCHING_PREFILL_BURST", max_active));
+}
+
 uint64_t continuous_batching_max_total_tokens(uint32_t ctx_size, uint32_t max_active) {
     const uint64_t default_budget =
         static_cast<uint64_t>(ctx_size) * static_cast<uint64_t>(max_active);
@@ -2200,6 +2205,8 @@ private:
                 : 4096u;
             const int32_t eos = tokenizer_->eos_id();
             const uint32_t max_active = continuous_batching_max_active();
+            const uint32_t prefill_burst =
+                continuous_batching_prefill_burst(max_active);
             ContinuousDecodeBatch decode_batch;
 
             while (true) {
@@ -2237,12 +2244,20 @@ private:
                     }
                 }
 
-                if (!active.empty()) {
+                const bool had_active_decode = !active.empty();
+                if (had_active_decode) {
                     build_continuous_decode_batch(active, decode_batch);
                     continuous_decode_batch_step(active, decode_batch, eos);
                 }
-                if (!prefilling.empty()) {
+                const uint32_t prefill_steps = had_active_decode
+                    ? 1u
+                    : std::min<uint32_t>(
+                          static_cast<uint32_t>(prefilling.size()), prefill_burst);
+                for (uint32_t step = 0;
+                     step < prefill_steps && !prefilling.empty();
+                     ++step) {
                     advance_continuous_prefill(prefilling, active, eos);
+                    if (!active.empty()) break;
                 }
             }
 
@@ -2356,7 +2371,8 @@ private:
                 pick_continuous_next_token(a, seed));
 
             if (a.req->options.max_tokens <= 0 ||
-                a.next_token == static_cast<uint32_t>(eos)) {
+                (!a.req->options.ignore_eos &&
+                 a.next_token == static_cast<uint32_t>(eos))) {
                 if (a.req->options.max_tokens > 0) {
                     log_zero_decode_diagnostic("continuous",
                                                a.req->prompt_tokens,
@@ -2494,7 +2510,8 @@ private:
                 const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
                 a.next_token = static_cast<uint32_t>(
                     pick_continuous_next_token(a, next));
-                if (a.next_token == static_cast<uint32_t>(eos)) {
+                if (!a.req->options.ignore_eos &&
+                    a.next_token == static_cast<uint32_t>(eos)) {
                     finish_continuous_active(a);
                     a.req.reset();
                     continue;
@@ -2660,7 +2677,10 @@ private:
         uint32_t next_token = static_cast<uint32_t>(pick_next(seed_argmax));
         uint64_t decode_ops = 0;
         int decoded = 0;
-        if (options.max_tokens > 0 && next_token != static_cast<uint32_t>(eos)) {
+        const auto should_stop_eos = [&]() {
+            return !options.ignore_eos && next_token == static_cast<uint32_t>(eos);
+        };
+        if (options.max_tokens > 0 && !should_stop_eos()) {
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
             generated += piece;
             if (on_text) on_text(piece);
@@ -2668,7 +2688,7 @@ private:
             ++decoded;
         }
         for (int i = 0; i + 1 < options.max_tokens; ++i) {
-            if (next_token == static_cast<uint32_t>(eos)) break;
+            if (should_stop_eos()) break;
             const uint32_t feed = next_token;
             step = executor_->forward_one_token(feed);
             if (!step.ok) throw std::runtime_error("decode failed");
@@ -2679,7 +2699,7 @@ private:
                                    *executor_, *tokenizer_);
             const int32_t new_token = pick_next(fallback);
             next_token = static_cast<uint32_t>(new_token);
-            if (next_token == static_cast<uint32_t>(eos)) break;
+            if (should_stop_eos()) break;
             const std::string piece = tokenizer_->decode_one(new_token);
             generated += piece;
             if (on_text) on_text(piece);

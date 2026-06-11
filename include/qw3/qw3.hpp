@@ -55,6 +55,7 @@ struct GenerationOptions {
     float repetition_penalty = 1.0f;
     uint64_t seed = 0;
     bool raw_prompt = false;
+    bool ignore_eos = false;
     // Internal serving flag: enqueue this request on the native continuous
     // batching worker when the backend supports it. CLI single-shot generation
     // leaves this false and keeps the original synchronous path.

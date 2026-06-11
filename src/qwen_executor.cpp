@@ -41,7 +41,7 @@ bool full_executor_trace_enabled() {
 }
 
 bool paged_kv_prefill_for_local_cache_enabled() {
-    return env_flag_enabled("QW3_PAGED_KV_PREFILL", false);
+    return env_flag_enabled("QW3_PAGED_KV_PREFILL", true);
 }
 
 bool mtp_prefix_batch_enabled() {

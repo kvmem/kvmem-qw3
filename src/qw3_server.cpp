@@ -661,6 +661,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.presence_penalty = req.value("presence_penalty", g.presence_penalty);
         g.repetition_penalty = req.value("repetition_penalty", g.repetition_penalty);
         g.seed = req.value("seed", g.seed);
+        g.ignore_eos = req.value("ignore_eos",
+                                 req.value("ignore_eos_token", g.ignore_eos));
         return g;
     };
 

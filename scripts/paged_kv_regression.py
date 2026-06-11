@@ -203,6 +203,8 @@ def run_qw3(
         "--raw",
         "--kv-dtype",
         kv_dtype,
+        "--temp",
+        "0",
         "-p",
         prompt,
         "-n",
