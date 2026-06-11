@@ -50,6 +50,7 @@ PREFILL_BATCH_RE = re.compile(
     r"native continuous_prefill_batch:.*?chunks=(?P<chunks>\d+).*?"
     r"tokens=(?P<tokens>\d+).*?"
     r"ragged_metadata_ready=(?P<ragged>true|false).*?"
+    r"ragged_device_metadata_ready=(?P<device>true|false).*?"
     r"ragged_pages=(?P<pages>\d+).*?"
     r"ragged_max_seq_len=(?P<max_seq>\d+)"
 )
@@ -98,6 +99,7 @@ class ServerRun:
     max_prefill_batch_chunks: int = 0
     max_prefill_batch_tokens: int = 0
     saw_prefill_ragged_metadata_ready: bool = False
+    saw_prefill_ragged_device_metadata_ready: bool = False
     max_prefill_ragged_pages: int = 0
     max_prefill_ragged_seq_len: int = 0
 
@@ -207,7 +209,7 @@ def terminate_server(proc: subprocess.Popen[str]) -> str:
 
 def parse_server_log(
     log: str,
-) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int, int, int, bool, int, int]:
+) -> Tuple[int, int, bool, bool, bool, bool, bool, int, int, int, int, bool, bool, int, int]:
     max_trace_batch = 0
     saw_paged_kv_ready = False
     for m in BATCH_STEP_RE.finditer(log):
@@ -238,6 +240,7 @@ def parse_server_log(
     max_prefill_batch_chunks = 0
     max_prefill_batch_tokens = 0
     saw_prefill_ragged_metadata_ready = False
+    saw_prefill_ragged_device_metadata_ready = False
     max_prefill_ragged_pages = 0
     max_prefill_ragged_seq_len = 0
     for m in PREFILL_BATCH_RE.finditer(log):
@@ -249,6 +252,10 @@ def parse_server_log(
         )
         saw_prefill_ragged_metadata_ready = (
             saw_prefill_ragged_metadata_ready or m.group("ragged") == "true"
+        )
+        saw_prefill_ragged_device_metadata_ready = (
+            saw_prefill_ragged_device_metadata_ready or
+            m.group("device") == "true"
         )
         max_prefill_ragged_pages = max(
             max_prefill_ragged_pages, int(m.group("pages"))
@@ -269,6 +276,7 @@ def parse_server_log(
         max_prefill_batch_chunks,
         max_prefill_batch_tokens,
         saw_prefill_ragged_metadata_ready,
+        saw_prefill_ragged_device_metadata_ready,
         max_prefill_ragged_pages,
         max_prefill_ragged_seq_len,
     )
@@ -371,6 +379,7 @@ def run_server_case(*,
         max_prefill_batch_chunks,
         max_prefill_batch_tokens,
         saw_prefill_ragged,
+        saw_prefill_ragged_device,
         max_prefill_ragged_pages,
         max_prefill_ragged_seq_len,
     ) = parse_server_log(log)
@@ -392,6 +401,7 @@ def run_server_case(*,
         max_prefill_batch_chunks=max_prefill_batch_chunks,
         max_prefill_batch_tokens=max_prefill_batch_tokens,
         saw_prefill_ragged_metadata_ready=saw_prefill_ragged,
+        saw_prefill_ragged_device_metadata_ready=saw_prefill_ragged_device,
         max_prefill_ragged_pages=max_prefill_ragged_pages,
         max_prefill_ragged_seq_len=max_prefill_ragged_seq_len,
     )
@@ -449,6 +459,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--require-prefill-ragged-metadata",
         action="store_true",
         help="require continuous prefill-batch ragged metadata to be ready",
+    )
+    ap.add_argument(
+        "--require-prefill-ragged-device-metadata",
+        action="store_true",
+        help="require continuous prefill-batch ragged metadata copied to device",
     )
     ap.add_argument(
         "--require-body-batch-ready",
@@ -606,6 +621,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         failed_requirements.append(
             "did not observe continuous prefill ragged_metadata_ready=true"
         )
+    if (args.require_prefill_ragged_device_metadata and
+            not continuous.saw_prefill_ragged_device_metadata_ready):
+        failed_requirements.append(
+            "did not observe continuous prefill "
+            "ragged_device_metadata_ready=true"
+        )
 
     summary = {
         "config": {
@@ -645,6 +666,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ),
             "continuous_saw_prefill_ragged_metadata_ready": (
                 continuous.saw_prefill_ragged_metadata_ready
+            ),
+            "continuous_saw_prefill_ragged_device_metadata_ready": (
+                continuous.saw_prefill_ragged_device_metadata_ready
             ),
             "continuous_max_prefill_ragged_pages": (
                 continuous.max_prefill_ragged_pages
@@ -686,6 +710,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"prefill_batch_tokens={continuous.max_prefill_batch_tokens} "
         f"prefill_ragged_metadata_ready="
         f"{continuous.saw_prefill_ragged_metadata_ready} "
+        f"prefill_ragged_device_metadata_ready="
+        f"{continuous.saw_prefill_ragged_device_metadata_ready} "
         f"prefill_ragged_pages={continuous.max_prefill_ragged_pages} "
         f"prefill_ragged_max_seq_len={continuous.max_prefill_ragged_seq_len}"
     )

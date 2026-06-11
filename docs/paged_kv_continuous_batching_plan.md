@@ -910,6 +910,25 @@ Follow-up: FlashInfer paged prefill
       `/tmp/qw3_prefill_ragged_metadata_fp8_cb.json`, passed exact parity,
       `prefill_ragged_metadata_ready=true`, `prefill_ragged_pages=2`,
       `prefill_ragged_max_seq_len=7`, decode `ragged_metadata_ready=true`.
+  - Added device-side prefill ragged metadata staging:
+    - Continuous prefill now allocates reusable i32 scratch tensors for
+      `q_indptr`, `page_indptr`, `page_indices`, `last_page_len`, and
+      `seq_lens`.
+    - The scheduler copies the prefill ragged metadata to device memory before
+      delegated execution and logs `ragged_device_metadata_ready=true`.
+    - This validates the metadata transport required by
+      `attention_prefill_batch_paged_ragged_gated_device(...)` without changing
+      the math path yet.
+  - Verification for device-side prefill ragged metadata:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV:
+      `/tmp/qw3_prefill_ragged_device_metadata_fp16_cb.json`, passed exact
+      parity, `prefill_ragged_device_metadata_ready=true`.
+    - FP8 KV:
+      `/tmp/qw3_prefill_ragged_device_metadata_fp8_cb.json`, passed exact
+      parity, `prefill_ragged_device_metadata_ready=true`.
 
 ## Stage 8: Batched Sampling Optimization
 

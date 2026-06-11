@@ -1123,6 +1123,7 @@ private:
         uint32_t page_size = 0;
         uint32_t max_seq_len = 0;
         bool ragged_metadata_ready = false;
+        bool ragged_device_metadata_ready = false;
 
         void clear() {
             entries.clear();
@@ -1136,6 +1137,7 @@ private:
             page_size = 0;
             max_seq_len = 0;
             ragged_metadata_ready = false;
+            ragged_device_metadata_ready = false;
         }
 
         size_t size() const { return entries.size(); }
@@ -2545,6 +2547,57 @@ private:
             batch.page_size > 0;
     }
 
+    void ensure_continuous_prefill_ragged_metadata_device(
+            uint32_t batch_size,
+            uint32_t pages) {
+        if (batch_size > cb_prefill_ragged_batch_capacity_) {
+            cb_prefill_q_indptr_i32_ =
+                device_->tensor_i32(static_cast<uint64_t>(batch_size) + 1,
+                                    "cb_prefill_q_indptr_i32");
+            cb_prefill_page_indptr_i32_ =
+                device_->tensor_i32(static_cast<uint64_t>(batch_size) + 1,
+                                    "cb_prefill_page_indptr_i32");
+            cb_prefill_last_page_len_i32_ =
+                device_->tensor_i32(batch_size,
+                                    "cb_prefill_last_page_len_i32");
+            cb_prefill_seq_lens_i32_ =
+                device_->tensor_i32(batch_size, "cb_prefill_seq_lens_i32");
+            cb_prefill_ragged_batch_capacity_ = batch_size;
+        }
+        if (pages > cb_prefill_ragged_page_capacity_) {
+            cb_prefill_page_indices_i32_ =
+                device_->tensor_i32(pages, "cb_prefill_page_indices_i32");
+            cb_prefill_ragged_page_capacity_ = pages;
+        }
+    }
+
+    static void require_device_status(const DeviceStatus &st) {
+        if (!st.ok) throw std::runtime_error(st.message);
+    }
+
+    void prepare_continuous_prefill_ragged_metadata_device(
+            ContinuousPrefillBatch &batch) {
+        batch.ragged_device_metadata_ready = false;
+        if (!batch.ragged_metadata_ready || batch.size() == 0) return;
+        const uint32_t bsz = static_cast<uint32_t>(batch.size());
+        const uint32_t pages = static_cast<uint32_t>(batch.page_indices.size());
+        ensure_continuous_prefill_ragged_metadata_device(bsz, pages);
+        require_device_status(device_->copy_i32_from_host(
+            *cb_prefill_q_indptr_i32_, 0, batch.q_indptr.data(),
+            static_cast<uint64_t>(bsz) + 1));
+        require_device_status(device_->copy_i32_from_host(
+            *cb_prefill_page_indptr_i32_, 0, batch.page_indptr.data(),
+            static_cast<uint64_t>(bsz) + 1));
+        require_device_status(device_->copy_i32_from_host(
+            *cb_prefill_page_indices_i32_, 0, batch.page_indices.data(), pages));
+        require_device_status(device_->copy_i32_from_host(
+            *cb_prefill_last_page_len_i32_, 0,
+            batch.last_page_len.data(), bsz));
+        require_device_status(device_->copy_i32_from_host(
+            *cb_prefill_seq_lens_i32_, 0, batch.seq_lens.data(), bsz));
+        batch.ragged_device_metadata_ready = true;
+    }
+
     void advance_continuous_prefill_batch(
             std::vector<ContinuousBatchActive> &prefilling,
             std::vector<ContinuousBatchActive> &active,
@@ -2567,6 +2620,7 @@ private:
         ContinuousPrefillBatch batch;
         build_continuous_prefill_batch(prefilling, max_chunks, batch);
         if (batch.size() == 0) return;
+        prepare_continuous_prefill_ragged_metadata_device(batch);
 
         if (continuous_batching_trace_enabled()) {
             std::ostringstream msg;
@@ -2579,6 +2633,8 @@ private:
                 << " first_offset=" << batch.entries.front().offset
                 << " ragged_metadata_ready="
                 << (batch.ragged_metadata_ready ? "true" : "false")
+                << " ragged_device_metadata_ready="
+                << (batch.ragged_device_metadata_ready ? "true" : "false")
                 << " ragged_pages=" << batch.page_indices.size()
                 << " ragged_max_seq_len=" << batch.max_seq_len;
             log(msg.str());
@@ -3928,6 +3984,13 @@ private:
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_v_cache_storage_;
     QwenExecutor::KvCacheStorage cb_kv_cache_view_;
+    uint32_t cb_prefill_ragged_batch_capacity_ = 0;
+    uint32_t cb_prefill_ragged_page_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> cb_prefill_q_indptr_i32_;
+    std::unique_ptr<DeviceTensor> cb_prefill_page_indptr_i32_;
+    std::unique_ptr<DeviceTensor> cb_prefill_page_indices_i32_;
+    std::unique_ptr<DeviceTensor> cb_prefill_last_page_len_i32_;
+    std::unique_ptr<DeviceTensor> cb_prefill_seq_lens_i32_;
 
     std::mutex cb_mu_;
     std::condition_variable cb_cv_;
