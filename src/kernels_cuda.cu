@@ -2684,7 +2684,7 @@ __global__ void expand_flashinfer_page_indices_kernel(int32_t *dst,
     const uint32_t begin = static_cast<uint32_t>(page_indptr[b]);
     const uint32_t end = static_cast<uint32_t>(page_indptr[b + 1]);
     for (uint32_t i = threadIdx.x; i < end - begin; i += blockDim.x) {
-        dst[begin + i] = logical_pages[i];
+        dst[begin + i] = logical_pages[begin + i];
     }
 }
 

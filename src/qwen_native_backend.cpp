@@ -252,7 +252,7 @@ bool continuous_batching_timing_enabled() {
 }
 
 bool continuous_batching_body_batch_enabled() {
-    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_BODY_BATCH");
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_BODY_BATCH", true);
 }
 
 bool continuous_batching_recurrent_batch_enabled() {

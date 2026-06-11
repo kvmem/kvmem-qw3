@@ -608,7 +608,12 @@ def run_reused_variant_matrix(*,
 def variants_for(names: Sequence[str]) -> List[BenchVariant]:
     all_variants = {
         "plain": BenchVariant("plain", continuous=False, concurrent=False, env={}),
-        "continuous": BenchVariant("continuous", continuous=True, concurrent=True, env={}),
+        "continuous": BenchVariant(
+            "continuous",
+            continuous=True,
+            concurrent=True,
+            env={"QW3_CONTINUOUS_BATCHING_BODY_BATCH": "0"},
+        ),
         "body": BenchVariant(
             "body",
             continuous=True,

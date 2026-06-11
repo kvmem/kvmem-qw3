@@ -770,6 +770,34 @@ Follow-up: FlashInfer paged prefill
     32-33 ms, while four request prefills each remained about 8.87 s.
   - Benchmark timing smoke:
     `python3 scripts/continuous_batching_benchmark.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --ctx 4096 --input-token-targets '1024' --concurrency-levels '2' --reuse-server --max-active 2 --max-tokens 8 --ignore-eos --timing --prefill-chunk 512 --out-json /tmp/qw3_benchmark_timing_smoke.json --timeout 600 --variants recurrent --extra-arg=--kv-dtype --extra-arg=fp8`: passed, `decode_step_tok/s=61.40`.
+  - Enabled body-batch decode by default for continuous batching on
+    2026-06-11. The previous default required
+    `QW3_CONTINUOUS_BATCHING_BODY_BATCH=1`, which made a normally-started
+    continuous batching service miss the high-throughput decode body path.
+    The path can still be disabled with
+    `QW3_CONTINUOUS_BATCHING_BODY_BATCH=0`; the benchmark script sets that
+    explicitly for its legacy `continuous` variant so comparisons keep their
+    meaning.
+  - Fixed ragged FlashInfer page-index expansion on 2026-06-11. The expansion
+    kernel copied `logical_pages[i]` instead of `logical_pages[begin + i]`,
+    which was only correct for the first request's page-table slice. This
+    could corrupt batched paged decode metadata once multiple requests had
+    different page-table offsets.
+  - Verification for default body-batch and page-index fix:
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV default body-batch regression:
+      `/tmp/qw3_body_batch_default_on_fp16_fixed_pages.json`, 4/4
+      comparisons passed, `max_batch=4`, `mode=body_batch_fp16`,
+      `ragged_metadata_ready=true`.
+    - FP8 KV default body-batch stable prompt regression:
+      `/tmp/qw3_body_batch_default_on_fp8_stable_prompts.json`, 3/3
+      comparisons passed, `max_batch=3`, `mode=body_batch_fp16`,
+      `ragged_metadata_ready=true`.
+    - Paged KV regression after the page-index fix:
+      `/tmp/qw3_default_body_batch_page_index_paged_kv.json`, 8/8 runs passed
+      and 0 failed comparisons across page sizes `16 32` and allocation modes
+      `identity reverse`.
 
 ## Stage 8: Batched Sampling Optimization
 
