@@ -1154,6 +1154,26 @@ Follow-up: FlashInfer paged prefill
       (`prefill_tok/s ~= 1691`), so the next performance target is the
       recurrent ragged prefill primitive/state movement rather than MMQ
       version selection.
+  - Optimized ragged recurrent prefill by reusing the ported recurrent kernel:
+    - `recurrent_batch_ragged(...)` now accepts the host `q_indptr` mirror and,
+      under the default `QW3_RECURRENT_KERNEL=ported`, slices the ragged batch
+      by request and reuses the existing high-performance single-sequence
+      batched recurrent conv + ported DeltaNet + norm/gate kernels.
+    - This keeps the FlashInfer paged ragged attention path intact and avoids
+      writing a new recurrent kernel in this step.
+  - Verification for ported recurrent ragged prefill:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV exact parity:
+      `/tmp/qw3_ragged_prefill_ported_recurrent_fp16_cb.json`, passed.
+    - FP8 KV exact parity:
+      `/tmp/qw3_ragged_prefill_ported_recurrent_fp8_cb.json`, passed.
+    - 2 x ~2048-token prefill sanity:
+      `/tmp/qw3_ragged_prefill_ported_recurrent_bench.json`,
+      `prefill_tok/s ~= 3637`, improving over both the original ragged
+      executor (`~=1846`) and delegated continuous prefill (`~=3414`) in this
+      benchmark shape.
 
 ## Stage 8: Batched Sampling Optimization
 

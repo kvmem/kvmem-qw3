@@ -475,6 +475,7 @@ public:
                                                 const DeviceTensor &alpha,
                                                 const DeviceTensor &beta,
                                                 const DeviceTensor &q_indptr,
+                                                const int32_t *q_indptr_host,
                                                 const DeviceWeight &conv,
                                                 const DeviceWeight &ssm_a,
                                                 const DeviceWeight &dt_bias,
@@ -504,6 +505,7 @@ public:
         (void)alpha;
         (void)beta;
         (void)q_indptr;
+        (void)q_indptr_host;
         (void)conv;
         (void)ssm_a;
         (void)dt_bias;

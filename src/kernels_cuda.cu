@@ -4659,6 +4659,7 @@ public:
                                         const DeviceTensor &alpha,
                                         const DeviceTensor &beta,
                                         const DeviceTensor &q_indptr,
+                                        const int32_t *q_indptr_host,
                                         const DeviceWeight &conv,
                                         const DeviceWeight &ssm_a,
                                         const DeviceWeight &dt_bias,
@@ -4700,6 +4701,13 @@ public:
         if (head_k_dim != 128 || head_v_dim > 256) {
             return {false, "recurrent_batch_ragged unsupported head dims"};
         }
+        if (!q_indptr_host) {
+            return {false, "recurrent_batch_ragged requires host q_indptr"};
+        }
+        if (q_indptr_host[0] != 0 ||
+            q_indptr_host[batch] != static_cast<int32_t>(total_q)) {
+            return {false, "recurrent_batch_ragged invalid host q_indptr"};
+        }
         const uint64_t need_state =
             static_cast<uint64_t>(batch - 1) * state_stride +
             static_cast<uint64_t>(num_v_heads) * head_v_dim * head_k_dim;
@@ -4715,6 +4723,131 @@ public:
             p.count < need_proj || cout.count < need_proj ||
             c.count < need_core) {
             return {false, "recurrent_batch_ragged tensor too small"};
+        }
+
+        if (recurrent_kernel_choice() == RecurrentKernel::Ported) {
+            if (head_k_dim != head_v_dim) {
+                return {false, "recurrent_batch_ragged ported kernel requires head_k_dim == head_v_dim"};
+            }
+            if (alpha_stride != beta_stride) {
+                return {false, "recurrent_batch_ragged ported kernel requires alpha_stride == beta_stride"};
+            }
+            for (uint32_t req = 0; req < batch; ++req) {
+                const int32_t begin_i = q_indptr_host[req];
+                const int32_t end_i = q_indptr_host[req + 1];
+                if (begin_i < 0 || end_i < begin_i) {
+                    return {false, "recurrent_batch_ragged invalid request span"};
+                }
+                const uint32_t begin = static_cast<uint32_t>(begin_i);
+                const uint32_t end = static_cast<uint32_t>(end_i);
+                const uint32_t span = end - begin;
+                if (span == 0) continue;
+
+                float *conv_state_row =
+                    cs.ptr + static_cast<uint64_t>(req) * conv_state_stride;
+                float *state_row =
+                    s.ptr + static_cast<uint64_t>(req) * state_stride;
+                const float *proj_row =
+                    p.ptr + static_cast<uint64_t>(begin) * proj_stride;
+                float *conv_out_row =
+                    cout.ptr + static_cast<uint64_t>(begin) * proj_stride;
+
+                const unsigned conv_threads = 256;
+                const unsigned conv_blocks =
+                    static_cast<unsigned>((proj_count + conv_threads - 1) /
+                                          conv_threads);
+                switch (conv_kernel_size) {
+                    case 3:
+                        recurrent_conv_batch_kernel<3>
+                            <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
+                                conv_out_row, conv_state_row, proj_row,
+                                static_cast<const float *>(cw.ptr), nullptr,
+                                span, proj_count, proj_stride, proj_stride, 0);
+                        break;
+                    case 4:
+                        recurrent_conv_batch_kernel<4>
+                            <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
+                                conv_out_row, conv_state_row, proj_row,
+                                static_cast<const float *>(cw.ptr), nullptr,
+                                span, proj_count, proj_stride, proj_stride, 0);
+                        break;
+                    case 5:
+                        recurrent_conv_batch_kernel<5>
+                            <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
+                                conv_out_row, conv_state_row, proj_row,
+                                static_cast<const float *>(cw.ptr), nullptr,
+                                span, proj_count, proj_stride, proj_stride, 0);
+                        break;
+                    case 7:
+                        recurrent_conv_batch_kernel<7>
+                            <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
+                                conv_out_row, conv_state_row, proj_row,
+                                static_cast<const float *>(cw.ptr), nullptr,
+                                span, proj_count, proj_stride, proj_stride, 0);
+                        break;
+                    default:
+                        return {false, "recurrent_batch_ragged unsupported conv_kernel_size"};
+                }
+                if (auto st = launch_status(
+                        "recurrent_batch_ragged ported conv"); !st.ok) {
+                    return st;
+                }
+
+                dim3 ln_grid(span, num_k_heads);
+                const uint32_t q_off = 0;
+                const uint32_t k_off = num_k_heads * head_k_dim;
+                l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
+                    conv_out_row, num_k_heads, head_k_dim, span, proj_stride,
+                    q_off, eps);
+                l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
+                    conv_out_row, num_k_heads, head_k_dim, span, proj_stride,
+                    k_off, eps);
+                if (auto st = launch_status(
+                        "recurrent_batch_ragged ported l2 norm"); !st.ok) {
+                    return st;
+                }
+
+                auto &a_mut = const_cast<CudaTensor &>(as_tensor(alpha));
+                auto &b_mut = const_cast<CudaTensor &>(as_tensor(beta));
+                const uint32_t q_off_floats = 0;
+                const uint32_t k_off_floats = num_k_heads * head_k_dim;
+                const uint32_t v_off_floats =
+                    2u * num_k_heads * head_k_dim;
+                const bool ok = ported::launch_gated_delta_net(
+                    a_mut.ptr + static_cast<uint64_t>(begin) * alpha_stride,
+                    b_mut.ptr + static_cast<uint64_t>(begin) * beta_stride,
+                    static_cast<const float *>(dt.ptr),
+                    static_cast<const float *>(aw.ptr),
+                    conv_out_row,
+                    q_off_floats, k_off_floats, v_off_floats,
+                    state_row,
+                    c.ptr + static_cast<uint64_t>(begin) * core_stride,
+                    span,
+                    num_k_heads, num_v_heads, head_k_dim,
+                    proj_stride, alpha_stride, core_stride,
+                    true, nullptr, 0, exec_stream_);
+                if (!ok) {
+                    return {false, "recurrent_batch_ragged ported kernel rejected head_dim"};
+                }
+                if (auto st = launch_status(
+                        "recurrent_batch_ragged ported delta"); !st.ok) {
+                    return st;
+                }
+
+                dim3 ng_grid(span, num_v_heads);
+                recurrent_norm_gate_batch_kernel<<<ng_grid, head_v_dim, 0,
+                                                    exec_stream_>>>(
+                    c.ptr + static_cast<uint64_t>(begin) * core_stride,
+                    g.ptr + static_cast<uint64_t>(begin) * gate_stride,
+                    static_cast<const float *>(nw.ptr),
+                    span, num_v_heads, head_v_dim, core_stride, gate_stride,
+                    eps);
+                if (auto st = launch_status(
+                        "recurrent_batch_ragged ported norm gate"); !st.ok) {
+                    return st;
+                }
+            }
+            return {};
         }
 
         const unsigned conv_threads = 256;

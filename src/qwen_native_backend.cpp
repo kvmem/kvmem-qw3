@@ -1619,6 +1619,7 @@ private:
                             *recurrent_alpha_batch_,
                             *recurrent_beta_batch_,
                             *metadata.q_indptr,
+                            batch.q_indptr.data(),
                             *layer.ssm_conv1d,
                             *layer.ssm_a,
                             *layer.ssm_dt_bias,
