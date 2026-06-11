@@ -110,6 +110,10 @@ void QwenExecutor::prepare_decode_token_pages(uint32_t count) {
     ensure_kv_pages(position_, count);
 }
 
+void QwenExecutor::prepare_kv_pages(uint32_t logical_pos, uint32_t count) {
+    ensure_kv_pages(logical_pos, count);
+}
+
 DeviceTensor &QwenExecutor::k_cache(uint32_t layer) {
     if (external_kv_cache_) {
         if (layer >= external_kv_cache_->k_cache.size() ||

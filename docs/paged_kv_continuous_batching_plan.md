@@ -887,6 +887,29 @@ Follow-up: FlashInfer paged prefill
       `/tmp/qw3_prefill_batch_metadata_fp8_cb.json`, passed exact parity,
       `prefill_batch_chunks=2`, `prefill_batch_tokens=12`,
       `ragged_metadata_ready=true`.
+  - Added prefill ragged metadata construction after the structured batch
+    plan:
+    - `QwenExecutor::prepare_kv_pages(logical_pos, count)` exposes the
+      existing page allocator for scheduler-side metadata preparation.
+    - `ContinuousPrefillBatch` now builds `q_indptr`, `page_indptr`,
+      `page_indices`, `last_page_len`, and `seq_lens` from each request's
+      logical page table before delegated execution. This prepares the exact
+      metadata shape needed by FlashInfer ragged paged prefill while keeping
+      the math path unchanged.
+    - `scripts/continuous_batching_regression.py` now parses prefill ragged
+      metadata and supports `--require-prefill-ragged-metadata`.
+  - Verification for prefill ragged metadata:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV:
+      `/tmp/qw3_prefill_ragged_metadata_fp16_cb.json`, passed exact parity,
+      `prefill_ragged_metadata_ready=true`, `prefill_ragged_pages=2`,
+      `prefill_ragged_max_seq_len=7`, decode `ragged_metadata_ready=true`.
+    - FP8 KV:
+      `/tmp/qw3_prefill_ragged_metadata_fp8_cb.json`, passed exact parity,
+      `prefill_ragged_metadata_ready=true`, `prefill_ragged_pages=2`,
+      `prefill_ragged_max_seq_len=7`, decode `ragged_metadata_ready=true`.
 
 ## Stage 8: Batched Sampling Optimization
 

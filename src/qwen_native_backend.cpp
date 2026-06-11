@@ -1113,13 +1113,29 @@ private:
 
     struct ContinuousPrefillBatch {
         std::vector<ContinuousPrefillBatchEntry> entries;
+        std::vector<int32_t> q_indptr;
+        std::vector<int32_t> page_indptr;
+        std::vector<int32_t> page_indices;
+        std::vector<int32_t> last_page_len;
+        std::vector<int32_t> seq_lens;
         uint64_t total_tokens = 0;
         uint32_t final_chunks = 0;
+        uint32_t page_size = 0;
+        uint32_t max_seq_len = 0;
+        bool ragged_metadata_ready = false;
 
         void clear() {
             entries.clear();
+            q_indptr.clear();
+            page_indptr.clear();
+            page_indices.clear();
+            last_page_len.clear();
+            seq_lens.clear();
             total_tokens = 0;
             final_chunks = 0;
+            page_size = 0;
+            max_seq_len = 0;
+            ragged_metadata_ready = false;
         }
 
         size_t size() const { return entries.size(); }
@@ -2436,17 +2452,23 @@ private:
     }
 
     void build_continuous_prefill_batch(
-            const std::vector<ContinuousBatchActive> &prefilling,
+            std::vector<ContinuousBatchActive> &prefilling,
             uint32_t max_chunks,
-            ContinuousPrefillBatch &batch) const {
+            ContinuousPrefillBatch &batch) {
         batch.clear();
         if (prefilling.empty() || max_chunks == 0) return;
         const uint32_t n =
             std::min<uint32_t>(max_chunks,
                                static_cast<uint32_t>(prefilling.size()));
         batch.entries.reserve(n);
+        batch.q_indptr.reserve(static_cast<size_t>(n) + 1);
+        batch.page_indptr.reserve(static_cast<size_t>(n) + 1);
+        batch.last_page_len.reserve(n);
+        batch.seq_lens.reserve(n);
+        batch.q_indptr.push_back(0);
+        batch.page_indptr.push_back(0);
         for (uint32_t i = 0; i < n; ++i) {
-            const ContinuousBatchActive &a = prefilling[i];
+            ContinuousBatchActive &a = prefilling[i];
             if (!a.req) continue;
             const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
             if (a.prefill_offset >= prompt.size() && !prompt.empty()) continue;
@@ -2461,10 +2483,66 @@ private:
             entry.total = static_cast<uint32_t>(prompt.size());
             entry.chunk = continuous_prefill_chunk_tokens(remaining);
             entry.final_chunk = prompt.empty() || entry.chunk >= remaining;
+            if (entry.chunk > 0 && a.executor) {
+                a.executor->prepare_kv_pages(entry.offset, entry.chunk);
+            }
+            const QwenExecutor::DecodeStateView view =
+                a.executor ? a.executor->decode_state_view()
+                           : QwenExecutor::DecodeStateView{};
+            const uint32_t seq_len = entry.offset + entry.chunk;
+            bool entry_metadata_ready =
+                entry.chunk > 0 &&
+                view.kv_page_size > 0 &&
+                view.kv_page_indices_host != nullptr &&
+                view.kv_page_count > 0;
+            if (entry_metadata_ready) {
+                if (batch.page_size == 0) {
+                    batch.page_size = view.kv_page_size;
+                } else if (batch.page_size != view.kv_page_size) {
+                    entry_metadata_ready = false;
+                }
+            }
+            if (entry_metadata_ready) {
+                const uint32_t pages =
+                    (seq_len + view.kv_page_size - 1) / view.kv_page_size;
+                if (pages == 0 || view.kv_page_count < pages) {
+                    entry_metadata_ready = false;
+                } else {
+                    for (uint32_t p = 0; p < pages; ++p) {
+                        batch.page_indices.push_back(view.kv_page_indices_host[p]);
+                    }
+                    const uint32_t last_len = seq_len % view.kv_page_size;
+                    batch.last_page_len.push_back(static_cast<int32_t>(
+                        last_len == 0 ? view.kv_page_size : last_len));
+                    batch.seq_lens.push_back(static_cast<int32_t>(seq_len));
+                    batch.max_seq_len = std::max(batch.max_seq_len, seq_len);
+                }
+            }
+            if (!entry_metadata_ready) {
+                batch.page_indices.clear();
+                batch.page_indptr.clear();
+                batch.last_page_len.clear();
+                batch.seq_lens.clear();
+                batch.page_size = 0;
+                batch.max_seq_len = 0;
+            }
             batch.total_tokens += entry.chunk;
             if (entry.final_chunk) ++batch.final_chunks;
             batch.entries.push_back(entry);
+            batch.q_indptr.push_back(static_cast<int32_t>(batch.total_tokens));
+            if (!batch.page_indptr.empty()) {
+                batch.page_indptr.push_back(
+                    static_cast<int32_t>(batch.page_indices.size()));
+            }
         }
+        batch.ragged_metadata_ready =
+            batch.size() > 0 &&
+            batch.q_indptr.size() == batch.size() + 1 &&
+            batch.page_indptr.size() == batch.size() + 1 &&
+            batch.last_page_len.size() == batch.size() &&
+            batch.seq_lens.size() == batch.size() &&
+            !batch.page_indices.empty() &&
+            batch.page_size > 0;
     }
 
     void advance_continuous_prefill_batch(
@@ -2498,7 +2576,11 @@ private:
                 << " tokens=" << batch.total_tokens
                 << " final_chunks=" << batch.final_chunks
                 << " first_request=" << batch.entries.front().request_id
-                << " first_offset=" << batch.entries.front().offset;
+                << " first_offset=" << batch.entries.front().offset
+                << " ragged_metadata_ready="
+                << (batch.ragged_metadata_ready ? "true" : "false")
+                << " ragged_pages=" << batch.page_indices.size()
+                << " ragged_max_seq_len=" << batch.max_seq_len;
             log(msg.str());
         }
 
