@@ -1112,6 +1112,48 @@ Follow-up: FlashInfer paged prefill
       `/tmp/qw3_ragged_prefill_executor_framework_fp8_cb.json`, passed exact
       parity, `prefill_ragged_device_metadata_ready=true`,
       `prefill_ragged_row_metadata_ready=true`.
+  - Added real opt-in ragged prefill executor:
+    - `QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_EXECUTOR=1` now executes
+      eligible greedy prefill batches with a concatenated ragged layer loop
+      instead of delegating each request chunk.
+    - Standard attention layers append KV through
+      `kv_append_batch_paged_ragged_device(...)` and run FlashInfer ragged
+      paged prefill through
+      `attention_prefill_batch_paged_ragged_gated_device(...)`.
+    - Recurrent layers run the existing ragged DeltaNet primitive
+      `recurrent_batch_ragged(...)`; recurrent state is packed/unpacked per
+      layer from each request executor.
+    - Final-chunk logits are computed only for request-final rows; non-final
+      chunks advance KV/recurrent state without LM-head work.
+    - The path remains opt-in because the current recurrent ragged primitive
+      processes each request's token span sequentially, so multi-request
+      prefill is correct but not yet faster for recurrent-heavy Qwen3.6.
+  - Verification for real ragged prefill executor:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV exact parity:
+      `/tmp/qw3_ragged_prefill_executor_real_fp16_cb.json`, passed,
+      log contains `continuous_prefill_batch_done: mode=ragged_prefill`.
+    - FP8 KV exact parity:
+      `/tmp/qw3_ragged_prefill_executor_real_fp8_cb.json`, passed.
+    - FP16 KV with timing instrumentation:
+      `/tmp/qw3_ragged_prefill_timing_fp16_cb.json`, passed exact parity.
+    - Interleaved prefill/decode:
+      `/tmp/qw3_continuous_prefill_interleave_ragged.json`, passed,
+      `long_nonfinal_chunks=3`,
+      `short_decode_before_long_final_prefill=true`.
+    - 2 x ~2048-token prefill sanity:
+      `/tmp/qw3_ragged_prefill_timing_bench.json`,
+      ragged prefill was correct but slower
+      (`prefill_tok/s ~= 1846`) than delegated continuous prefill
+      (`/tmp/qw3_delegated_prefill_timing_bench.json`,
+      `prefill_tok/s ~= 3414`).
+      Forcing `QW3_MMQ_VERSION=7`
+      (`/tmp/qw3_ragged_prefill_mmqv7_bench.json`) was slower
+      (`prefill_tok/s ~= 1691`), so the next performance target is the
+      recurrent ragged prefill primitive/state movement rather than MMQ
+      version selection.
 
 ## Stage 8: Batched Sampling Optimization
 
