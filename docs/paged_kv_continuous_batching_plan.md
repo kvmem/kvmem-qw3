@@ -954,6 +954,39 @@ Follow-up: FlashInfer paged prefill
       multi-sequence recurrent prefill backend or an equivalent executor
       strategy that preserves per-request token order while batching the
       linear/FFN and standard-attention work.
+  - Added `BatchedPrefillExecutor` after the prefill metadata staging:
+    - The scheduler now hands `ContinuousPrefillBatch` to a dedicated prefill
+      executor object instead of directly looping inside
+      `advance_continuous_prefill_batch`.
+    - The current mode is still `delegated`: each entry calls the existing
+      per-request `forward_n_tokens`, so model math and kernels are unchanged.
+    - Final prefill chunks in the same batch are applied together after
+      execution, allowing all completed prompts to enter the next decode batch.
+    - Non-final chunks are moved behind untouched prefilling requests to keep
+      long-prompt interleaving behavior.
+  - Verification for `BatchedPrefillExecutor` delegated mode:
+    - `git diff --check`: passed.
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - FP16 KV:
+      `/tmp/qw3_prefill_executor_fp16_cb.json`, passed exact parity,
+      `prefill_batch_chunks=2`,
+      `prefill_ragged_device_metadata_ready=true`,
+      decode `ragged_metadata_ready=true`.
+    - FP8 KV:
+      `/tmp/qw3_prefill_executor_fp8_cb.json`, passed exact parity,
+      `prefill_batch_chunks=2`,
+      `prefill_ragged_device_metadata_ready=true`,
+      decode `ragged_metadata_ready=true`.
+    - Long/short interleave:
+      `/tmp/qw3_prefill_executor_interleave.json`, passed with
+      `long_nonfinal_chunks=3` and
+      `short_decode_before_long_final_prefill=true`.
+    - 32K FP8 KV sanity benchmark:
+      `/tmp/qw3_cb_32k_prefill_executor_sanity.json`,
+      concurrency 1 prefill `3699.59 tok/s`, concurrency 2 prefill
+      `3694.59 tok/s`; no regression versus the previous metadata-only
+      baseline, but wall time remains near-additive because mode is delegated.
 
 ## Stage 8: Batched Sampling Optimization
 

@@ -1166,6 +1166,99 @@ private:
         double post_s = 0.0;
     };
 
+    struct BatchedPrefillOutput {
+        size_t prefill_index = 0;
+        uint64_t request_id = 0;
+        uint32_t offset = 0;
+        uint32_t total = 0;
+        uint32_t chunk = 0;
+        bool final_chunk = false;
+        double seconds = 0.0;
+        NativeExecutorReport report;
+        std::string error;
+
+        bool ok() const { return error.empty() && report.ok; }
+    };
+
+    struct BatchedPrefillTiming {
+        double total_s = 0.0;
+        double delegated_s = 0.0;
+    };
+
+    class BatchedPrefillExecutor {
+    public:
+        const std::string &last_mode() const { return last_mode_; }
+        const BatchedPrefillTiming &last_timing() const { return last_timing_; }
+        uint32_t last_kernel_batch() const { return last_kernel_batch_; }
+
+        std::vector<BatchedPrefillOutput> prefill(
+                std::vector<ContinuousBatchActive> &prefilling,
+                const ContinuousPrefillBatch &batch) {
+            std::vector<BatchedPrefillOutput> outputs;
+            outputs.reserve(batch.size());
+            last_mode_ = "delegated";
+            last_kernel_batch_ = 1;
+            last_timing_ = {};
+            const double t0 = wall_seconds();
+
+            for (const ContinuousPrefillBatchEntry &entry : batch.entries) {
+                BatchedPrefillOutput out;
+                out.prefill_index = entry.prefill_index;
+                out.request_id = entry.request_id;
+                out.offset = entry.offset;
+                out.total = entry.total;
+                out.chunk = entry.chunk;
+                out.final_chunk = entry.final_chunk;
+                const double step0 = wall_seconds();
+                try {
+                    if (entry.prefill_index >= prefilling.size()) {
+                        throw std::runtime_error("prefill index out of range");
+                    }
+                    ContinuousBatchActive &a = prefilling[entry.prefill_index];
+                    if (!a.req || !a.executor) {
+                        throw std::runtime_error("prefill request unavailable");
+                    }
+                    const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
+                    if (entry.offset != a.prefill_offset ||
+                        entry.offset + entry.chunk > prompt.size()) {
+                        throw std::runtime_error("prefill batch entry is stale");
+                    }
+                    std::vector<uint32_t> chunk_tokens(
+                        prompt.begin() +
+                            static_cast<std::ptrdiff_t>(entry.offset),
+                        prompt.begin() +
+                            static_cast<std::ptrdiff_t>(entry.offset + entry.chunk));
+                    out.report =
+                        a.executor->forward_n_tokens(chunk_tokens,
+                                                     entry.final_chunk);
+                    if (!out.report.ok) {
+                        throw std::runtime_error("prefill failed");
+                    }
+                    const double step1 = wall_seconds();
+                    out.seconds = std::max(step1 - step0, 1e-9);
+                    a.prefill_s += out.seconds;
+                    a.prefill_ops += out.report.ops_executed;
+                    a.prefill_offset += entry.chunk;
+                    a.kv_state.update(a.executor->kv_state_snapshot());
+                } catch (const std::exception &e) {
+                    out.error = e.what();
+                    out.seconds = std::max(wall_seconds() - step0, 0.0);
+                }
+                outputs.push_back(std::move(out));
+            }
+
+            const double t1 = wall_seconds();
+            last_timing_.total_s = std::max(t1 - t0, 0.0);
+            last_timing_.delegated_s = last_timing_.total_s;
+            return outputs;
+        }
+
+    private:
+        std::string last_mode_ = "delegated";
+        BatchedPrefillTiming last_timing_;
+        uint32_t last_kernel_batch_ = 1;
+    };
+
     class BatchedDecodeExecutor {
     public:
         BatchedDecodeExecutor(const QwenNativeModel &model,
@@ -2598,6 +2691,92 @@ private:
         batch.ragged_device_metadata_ready = true;
     }
 
+    void apply_continuous_prefill_batch_outputs(
+            std::vector<ContinuousBatchActive> &prefilling,
+            std::vector<ContinuousBatchActive> &active,
+            const std::vector<BatchedPrefillOutput> &outputs,
+            int32_t eos) {
+        if (outputs.empty()) return;
+        std::vector<uint8_t> state(prefilling.size(), 0);
+        constexpr uint8_t kProcessedNonFinal = 1;
+        constexpr uint8_t kRemove = 2;
+
+        for (const BatchedPrefillOutput &out : outputs) {
+            if (out.prefill_index >= prefilling.size()) continue;
+            ContinuousBatchActive &a = prefilling[out.prefill_index];
+            if (!out.error.empty()) {
+                complete_continuous_request(a.req, {}, out.error);
+                state[out.prefill_index] = kRemove;
+                continue;
+            }
+            if (!out.ok()) {
+                complete_continuous_request(a.req, {}, "prefill failed");
+                state[out.prefill_index] = kRemove;
+                continue;
+            }
+
+            if (continuous_batching_trace_enabled()) {
+                std::ostringstream msg;
+                msg << "native continuous_prefill_chunk:"
+                    << " request=" << out.request_id
+                    << " offset=" << (out.offset + out.chunk)
+                    << " total=" << out.total
+                    << " chunk=" << out.chunk
+                    << " final=" << (out.final_chunk ? "true" : "false");
+                log(msg.str());
+            }
+
+            if (!out.final_chunk) {
+                state[out.prefill_index] = kProcessedNonFinal;
+                continue;
+            }
+
+            a.decode_start = wall_seconds();
+            const int32_t seed =
+                out.report.argmax_token >= 0 ? out.report.argmax_token : eos;
+            a.next_token = static_cast<uint32_t>(
+                pick_continuous_next_token(a, seed));
+
+            if (a.req->options.max_tokens <= 0 ||
+                (!a.req->options.ignore_eos &&
+                 a.next_token == static_cast<uint32_t>(eos))) {
+                if (a.req->options.max_tokens > 0) {
+                    log_zero_decode_diagnostic("continuous",
+                                               a.req->prompt_tokens,
+                                               out.report);
+                }
+                complete_continuous_request(a.req, {});
+                state[out.prefill_index] = kRemove;
+                continue;
+            }
+
+            emit_continuous_token(a, a.next_token);
+            if (a.decoded >= a.req->options.max_tokens) {
+                finish_continuous_active(a);
+            } else {
+                active.push_back(std::move(a));
+            }
+            state[out.prefill_index] = kRemove;
+        }
+
+        std::vector<ContinuousBatchActive> remaining;
+        std::vector<ContinuousBatchActive> processed_nonfinal;
+        remaining.reserve(prefilling.size());
+        processed_nonfinal.reserve(prefilling.size());
+        for (size_t i = 0; i < prefilling.size(); ++i) {
+            if (state[i] == kRemove) continue;
+            if (state[i] == kProcessedNonFinal) {
+                processed_nonfinal.push_back(std::move(prefilling[i]));
+            } else {
+                remaining.push_back(std::move(prefilling[i]));
+            }
+        }
+        for (auto &a : processed_nonfinal) {
+            remaining.push_back(std::move(a));
+        }
+        prefilling.swap(remaining);
+    }
+
     void advance_continuous_prefill_batch(
             std::vector<ContinuousBatchActive> &prefilling,
             std::vector<ContinuousBatchActive> &active,
@@ -2640,38 +2819,35 @@ private:
             log(msg.str());
         }
 
-        const double t0 = wall_seconds();
+        if (!cb_prefill_executor_) {
+            cb_prefill_executor_ = std::make_unique<BatchedPrefillExecutor>();
+        }
+        const std::vector<BatchedPrefillOutput> outputs =
+            cb_prefill_executor_->prefill(prefilling, batch);
         uint32_t executed_chunks = 0;
         uint64_t executed_tokens = 0;
         uint32_t completed_chunks = 0;
-        for (uint32_t step = 0;
-             step < batch.size() && !prefilling.empty() && active.empty();
-             ++step) {
-            ContinuousBatchActive &front = prefilling.front();
-            const std::vector<uint32_t> &prompt = front.req->prompt_tokens;
-            const uint32_t remaining =
-                front.prefill_offset < prompt.size()
-                    ? static_cast<uint32_t>(prompt.size() - front.prefill_offset)
-                    : 0u;
-            const uint32_t chunk = continuous_prefill_chunk_tokens(remaining);
-            const bool final_chunk = prompt.empty() || chunk >= remaining;
-
-            advance_continuous_prefill(prefilling, active, eos);
-            executed_tokens += chunk;
-            if (final_chunk) ++completed_chunks;
+        for (const BatchedPrefillOutput &out : outputs) {
             ++executed_chunks;
+            executed_tokens += out.chunk;
+            if (out.final_chunk && out.ok()) ++completed_chunks;
         }
-        const double t1 = wall_seconds();
+        apply_continuous_prefill_batch_outputs(prefilling, active, outputs, eos);
 
         if (continuous_batching_timing_enabled() ||
             continuous_batching_trace_enabled()) {
+            const BatchedPrefillTiming &timing =
+                cb_prefill_executor_->last_timing();
             std::ostringstream msg;
             msg << "native continuous_prefill_batch_done:"
-                << " mode=delegated"
+                << " mode=" << cb_prefill_executor_->last_mode()
+                << " kernel_batch="
+                << cb_prefill_executor_->last_kernel_batch()
                 << " chunks=" << executed_chunks
                 << " tokens=" << executed_tokens
                 << " completed_chunks=" << completed_chunks
-                << " total=" << fmt_seconds(std::max(t1 - t0, 0.0));
+                << " total=" << fmt_seconds(timing.total_s)
+                << " delegated=" << fmt_seconds(timing.delegated_s);
             log(msg.str());
         }
     }
@@ -3979,6 +4155,7 @@ private:
     std::unique_ptr<QwenWeights> weights_;
     std::unique_ptr<QwenExecutor> executor_;
     std::unique_ptr<QwenTokenizer> tokenizer_;
+    std::unique_ptr<BatchedPrefillExecutor> cb_prefill_executor_;
     std::unique_ptr<BatchedDecodeExecutor> cb_decode_executor_;
     std::unique_ptr<GlobalKvPagePool> cb_kv_pool_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
