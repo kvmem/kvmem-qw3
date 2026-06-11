@@ -798,6 +798,36 @@ Follow-up: FlashInfer paged prefill
       `/tmp/qw3_default_body_batch_page_index_paged_kv.json`, 8/8 runs passed
       and 0 failed comparisons across page sizes `16 32` and allocation modes
       `identity reverse`.
+  - Raised the default continuous batching prefill chunk from 512 to 2048 on
+    2026-06-11, matching the native executor default and the benchmark
+    configuration that restores most 32K prefill throughput. Explicit
+    `--prefill-chunk` values still override this and remain clamped to the
+    512-4096 service range.
+  - Fixed body-batch metadata ordering on 2026-06-11 by moving
+    `backend_.begin()` before body-batch input preparation and ragged metadata
+    copies. Long/short interleaved requests could otherwise enqueue ragged
+    metadata H2D copies outside the same backend execution scope used by
+    append/attention, which intermittently surfaced as
+    `ragged attention seq_len must be positive`.
+  - Verification for the default chunk and metadata ordering fixes:
+    - `cmake --build build -j`: passed.
+    - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+    - Default continuous batching stable prompt regression:
+      `/tmp/qw3_default_chunk2048_cb.json`, 3/3 comparisons passed,
+      `max_batch=3`, `mode=body_batch_fp16`.
+    - Long/short prefill interleave regression:
+      `/tmp/qw3_body_batch_begin_before_metadata_interleave.json`, passed with
+      `long_nonfinal_chunks=3` and
+      `short_decode_before_long_final_prefill=true`.
+    - FP8 KV default body-batch stable prompt regression:
+      `/tmp/qw3_body_batch_begin_before_metadata_fp8_rerun_single.json`, 3/3
+      comparisons passed, `max_batch=3`, `mode=body_batch_fp16`.
+    - 32K concurrency-4 benchmark with default body-batch, FP8 KV,
+      `ctx=262144`, `prefill_chunk=2048`, `max_tokens=128`, and
+      `--ignore-eos --timing`:
+      `/tmp/qw3_cb_32k_conc4_default_body_timing.json`, wall `39.814s`,
+      output `12.86 tok/s`, prefill `3695.32 tok/s`, request-level decode
+      `26.64 tok/s`, global decode-step `119.61 tok/s`.
 
 ## Stage 8: Batched Sampling Optimization
 

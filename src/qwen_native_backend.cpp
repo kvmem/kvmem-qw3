@@ -1551,6 +1551,7 @@ private:
 
             try {
                 const double t_prepare0 = wall_seconds();
+                require_ok(backend_.begin());
                 if (!prepare_body_batch_inputs(active, batch)) {
                     throw std::runtime_error("body batch inputs unavailable");
                 }
@@ -1571,7 +1572,6 @@ private:
                     outputs.push_back(std::move(out));
                 }
 
-                require_ok(backend_.begin());
                 require_ok(backend_.q8_0_get_rows_batch(
                     *hidden_batch_, weights_.token_embd(), rows_h.data(), bsz));
                 const double t_embed1 = wall_seconds();
@@ -2312,7 +2312,7 @@ private:
         if (options_.prefill_chunk == 0) return remaining;
         uint32_t chunk = options_.prefill_chunk > 0
             ? static_cast<uint32_t>(options_.prefill_chunk)
-            : 512u;
+            : 2048u;
         chunk = std::max<uint32_t>(512u, chunk);
         chunk = std::min<uint32_t>(4096u, chunk);
         return std::min<uint32_t>(remaining, chunk);
