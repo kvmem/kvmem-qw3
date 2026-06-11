@@ -567,6 +567,27 @@ Completion Notes:
 
 Stage 6 throughput subplan:
 
+Paged-prefill regression found on 2026-06-10:
+
+- Root cause: local/plain prefill was routed through paged KV append plus
+  FlashInfer `BatchDecodeWithPagedKVCache` via
+  `attention_decode_batch_paged_gated_device()`. That path is decode-shaped
+  and is not the high-throughput prefill attention path.
+- Fix applied for local KV caches: default local/plain prefill now uses the
+  contiguous KV append + prefill attention path again. Paged prefill can still
+  be forced for local caches with `QW3_PAGED_KV_PREFILL=1`; external/global KV
+  pool executors still use paged prefill until a true FlashInfer paged prefill
+  path is implemented.
+- Verification:
+  - Before fix, plain 32K prefill, FP16 KV, `ctx=40960`,
+    `--prefill-chunk 2048`: `20.983s`, `1561.76 tok/s`.
+  - With `QW3_PAGED_KV_PREFILL=0`: `8.648s`, `3789.58 tok/s`.
+  - New default after fix: `8.648s`, `3789.42 tok/s`.
+  - Decode stayed stable at roughly `46 tok/s`.
+- Remaining work: implement true FlashInfer paged prefill for external/global
+  KV pool so continuous batching prefill gets the same prefill throughput
+  recovery without giving up paged KV storage.
+
 1. Metadata and observability:
    - Keep reporting `scheduler_batch` separately from `kernel_batch`.
    - Add backend interfaces for arbitrary per-row RoPE positions and ragged
@@ -641,6 +662,41 @@ Completion Notes:
   `/tmp/qw3_stage7_cb_4096.json` and failed one comparison because the plain
   baseline returned the known transient abnormal `capital` output. Immediate
   rerun passed all comparisons.
+
+Follow-up: FlashInfer paged prefill
+
+- Implemented a true FlashInfer `BatchPrefillWithPagedKVCacheDispatched` path
+  for single-sequence paged chunk prefill. The previous paged chunk path used
+  FlashInfer batch decode metadata, which was decode-shaped and regressed 32K
+  prefill throughput.
+- The implementation uses FlashInfer `PrefillPlan` metadata, device
+  `q_indptr/page_indptr/last_page_len`, and a pinned host metadata ring guarded
+  by CUDA events so asynchronous metadata copies cannot race with host buffer
+  reuse across layers.
+- Verification:
+  - `cmake --build build -j`: passed.
+  - `ctest --test-dir build --output-on-failure`: passed, 2/2 tests.
+  - `git diff --check`: passed.
+  - Forced paged prefill long prompt:
+    `python3 scripts/paged_kv_regression.py --qw3 ./build/qw3 --model models/Qwen3.6-27B-Q8_0.gguf --ctx 4096 --max-tokens 4 --prefill-chunk 512 --kv-dtypes fp16 --page-sizes 128 --alloc-modes identity --prompts longish_2300_words --env QW3_PAGED_KV_PREFILL=1 --env QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES=4096 --out-json /tmp/qw3_paged_prefill_long_nonblocking_fixed.json --timeout 600`: passed, `prompt_tokens=2300`, `prefill_tps=3341.29`, `decode_tps=27.37`.
+  - 32K FP16 KV forced paged prefill:
+    `/tmp/qw3_plain_32k_real_paged_prefill_fp16.json`: `prompt_tokens=32771`, `prefill=8.712s (3761.79 tok/s)`, `decode=0.349s (45.91 tok/s)`.
+  - 32K FP8 KV forced paged prefill:
+    `/tmp/qw3_plain_32k_real_paged_prefill_fp8.json`: `prompt_tokens=32771`, `prefill=8.860s (3698.74 tok/s)`, `decode=0.346s (46.29 tok/s)`.
+  - After fixing `scripts/continuous_batching_benchmark.py` to parse
+    `native generate:` summaries, a reused-server continuous batching sweep
+    with 32K input, FP8 KV, `--prefill-chunk 2048`, and `max_tokens=128`
+    showed:
+    - concurrency 1: wall `11.831s`, output `10.82 tok/s`, prefill
+      `3702.10 tok/s`, decode `43.76 tok/s`.
+    - concurrency 2: wall `21.334s`, output `12.00 tok/s`, prefill
+      `3694.38 tok/s`, decode `33.69 tok/s`.
+    - concurrency 4: wall `40.000s`, output `12.80 tok/s`, prefill
+      `3681.41 tok/s`, decode `27.24 tok/s`.
+  - Interpretation: single-request paged prefill is fixed, but multi-request
+    long-prompt throughput is still limited by request-serial prefill chunks.
+    The next throughput step is true ragged batched prefill across prefilling
+    requests.
 
 ## Stage 8: Batched Sampling Optimization
 

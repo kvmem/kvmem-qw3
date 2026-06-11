@@ -18,7 +18,7 @@ struct EngineOptions {
     std::string model_path;
     BackendKind backend = BackendKind::LlamaCli;
     std::string llama_cli_path = "llama-completion";
-    int ctx_size = 32768;
+    int ctx_size = 262144;
     int threads = 0;
     int gpu_layers = -1;
     int batch_size = 2048;

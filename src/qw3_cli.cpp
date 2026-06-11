@@ -33,7 +33,7 @@ void usage(std::ostream &os) {
         "  --llama-completion PATH\n"
         "                        Alias for --llama-cli\n"
         "  -m, --model FILE      GGUF model path\n"
-        "  -c, --ctx N           Context size. Default: 32768\n"
+        "  -c, --ctx N           Context size. Default: 262144\n"
         "  -t, --threads N       llama.cpp CPU helper threads\n"
         "  -ngl N                GPU layers passed to llama.cpp. Default: -1\n"
         "  -b, --batch N         Batch size passed to llama.cpp. Default: 2048\n"

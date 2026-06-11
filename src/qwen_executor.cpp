@@ -40,6 +40,10 @@ bool full_executor_trace_enabled() {
            env_flag_enabled("QW3_MTP_VERIFY_TRACE");
 }
 
+bool paged_kv_prefill_for_local_cache_enabled() {
+    return env_flag_enabled("QW3_PAGED_KV_PREFILL", false);
+}
+
 bool mtp_prefix_batch_enabled() {
     return env_flag_enabled("QW3_MTP_PREFIX_BATCH", true);
 }
@@ -962,6 +966,8 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     const uint32_t alpha_stride = alpha_batch_ ? row_stride(alpha_batch_.get()) : 0;
     const uint32_t beta_stride = beta_batch_ ? row_stride(beta_batch_.get()) : 0;
     const uint32_t core_stride = core_batch_ ? row_stride(core_batch_.get()) : 0;
+    const bool use_paged_prefill =
+        has_external_kv_cache() || paged_kv_prefill_for_local_cache_enabled();
 
     require_status(backend_.begin());
     begin_record_timing(full_executor_trace_enabled());
@@ -1127,42 +1133,60 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                         cfg.rope_dim, base_pos, cfg.rope_theta));
 
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-            require_status(backend_.kv_append_batch_paged_device(
-                k_cache(il), *k_batch_, base_pos, per_pos, batch,
-                kv_page_indices_device(), kv_page_count(), kv_page_size()));
-            require_status(backend_.kv_append_batch_paged_device(
-                v_cache(il), *v_batch_, base_pos, per_pos, batch,
-                kv_page_indices_device(), kv_page_count(), kv_page_size()));
-            if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch_paged");
+            if (use_paged_prefill) {
+                require_status(backend_.kv_append_batch_paged_device(
+                    k_cache(il), *k_batch_, base_pos, per_pos, batch,
+                    kv_page_indices_device(), kv_page_count(), kv_page_size()));
+                require_status(backend_.kv_append_batch_paged_device(
+                    v_cache(il), *v_batch_, base_pos, per_pos, batch,
+                    kv_page_indices_device(), kv_page_count(), kv_page_size()));
+                if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch_paged");
+            } else {
+                require_status(backend_.kv_append_batch(
+                    k_cache(il), *k_batch_, base_pos, per_pos, batch));
+                require_status(backend_.kv_append_batch(
+                    v_cache(il), *v_batch_, base_pos, per_pos, batch));
+                if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch");
+            }
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-            if (batch == 1) {
-                require_status(backend_.attention_decode_batch_paged_gated_device(
-                    *mid_batch_, *q_batch_, 2 * standard_head_dim,
-                    k_cache(il), v_cache(il),
-                    kv_page_indices_device(), kv_page_count(), kv_page_size(),
-                    standard_n_heads, standard_n_kv_heads,
-                    standard_head_dim, base_pos, batch,
-                    q_stride_buf, mid_stride, scale));
-            } else {
-                DeviceStatus attn_st = backend_.attention_decode_batch_paged_gated_device(
-                    *mid_batch_, *q_batch_, 2 * standard_head_dim,
-                    k_cache(il), v_cache(il),
-                    kv_page_indices_device(), kv_page_count(), kv_page_size(),
-                    standard_n_heads, standard_n_kv_heads,
-                    standard_head_dim, base_pos, batch,
-                    q_stride_buf, mid_stride, scale);
-                if (!attn_st.ok) {
-                    require_status(backend_.attention_decode_batch_paged_gated(
+            if (use_paged_prefill) {
+                if (batch == 1) {
+                    require_status(backend_.attention_decode_batch_paged_gated_device(
                         *mid_batch_, *q_batch_, 2 * standard_head_dim,
                         k_cache(il), v_cache(il),
-                        kv_page_indices(), kv_page_count(), kv_page_size(),
+                        kv_page_indices_device(), kv_page_count(), kv_page_size(),
                         standard_n_heads, standard_n_kv_heads,
                         standard_head_dim, base_pos, batch,
                         q_stride_buf, mid_stride, scale));
+                } else {
+                    DeviceStatus attn_st = backend_.attention_prefill_batch_paged_gated_device(
+                        *mid_batch_, *q_batch_, 2 * standard_head_dim,
+                        k_cache(il), v_cache(il),
+                        kv_page_indices_device(), kv_page_count(), kv_page_size(),
+                        standard_n_heads, standard_n_kv_heads,
+                        standard_head_dim, base_pos, batch,
+                        q_stride_buf, mid_stride, scale);
+                    if (!attn_st.ok) {
+                        require_status(backend_.attention_decode_batch_paged_gated(
+                            *mid_batch_, *q_batch_, 2 * standard_head_dim,
+                            k_cache(il), v_cache(il),
+                            kv_page_indices(), kv_page_count(), kv_page_size(),
+                            standard_n_heads, standard_n_kv_heads,
+                            standard_head_dim, base_pos, batch,
+                            q_stride_buf, mid_stride, scale));
+                    }
                 }
+                if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch_paged");
+            } else {
+                require_status(backend_.attention_decode_batch_gated(
+                    *mid_batch_, *q_batch_, 2 * standard_head_dim,
+                    k_cache(il), v_cache(il),
+                    standard_n_heads, standard_n_kv_heads,
+                    standard_head_dim, base_pos, batch,
+                    q_stride_buf, mid_stride, scale));
+                if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch");
             }
-            if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_sdpa_batch_paged");
 
             require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.attn_output, *mid_batch_,
                                                  batch, mid_stride, h_stride));

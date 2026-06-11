@@ -242,6 +242,10 @@ bool continuous_batching_trace_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_TRACE");
 }
 
+bool continuous_batching_timing_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_TIMING");
+}
+
 bool continuous_batching_body_batch_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_BODY_BATCH");
 }
@@ -1098,6 +1102,16 @@ private:
         bool ok() const { return error.empty() && report.ok; }
     };
 
+    struct BatchedDecodeTiming {
+        double total_s = 0.0;
+        double prepare_s = 0.0;
+        double metadata_s = 0.0;
+        double embed_s = 0.0;
+        double layers_s = 0.0;
+        double final_s = 0.0;
+        double post_s = 0.0;
+    };
+
     class BatchedDecodeExecutor {
     public:
         BatchedDecodeExecutor(const QwenNativeModel &model,
@@ -1113,6 +1127,7 @@ private:
         uint32_t last_ragged_metadata_max_seq_len() const {
             return last_ragged_metadata_max_seq_len_;
         }
+        const BatchedDecodeTiming &last_timing() const { return last_timing_; }
 
         std::vector<BatchedDecodeOutput> decode(
                 std::vector<ContinuousBatchActive> &active,
@@ -1121,6 +1136,7 @@ private:
             if (input.batch == nullptr) return outputs;
             const ContinuousDecodeBatch &batch = *input.batch;
             reset_last_ragged_metadata();
+            last_timing_ = {};
             if (continuous_batching_body_batch_enabled() &&
                 can_use_body_batch(active, batch)) {
                 return decode_body_batch(active, batch);
@@ -1131,6 +1147,7 @@ private:
             last_mode_ = "delegated";
             last_kernel_batch_ = 1;
             outputs.reserve(batch.size());
+            const double t0 = wall_seconds();
             for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
                 BatchedDecodeOutput out;
                 out.active_index = batch.active_indices[batch_i];
@@ -1150,6 +1167,7 @@ private:
                 }
                 outputs.push_back(std::move(out));
             }
+            last_timing_.total_s = std::max(wall_seconds() - t0, 0.0);
             return outputs;
         }
 
@@ -1509,6 +1527,7 @@ private:
                 const ContinuousDecodeBatch &batch) {
             std::vector<BatchedDecodeOutput> outputs;
             outputs.reserve(batch.size());
+            const double t_total0 = wall_seconds();
             last_mode_ = "body_batch_fp16";
             last_kernel_batch_ = static_cast<uint32_t>(batch.size());
             last_body_batch_ready_ = false;
@@ -1526,14 +1545,17 @@ private:
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
 
             try {
+                const double t_prepare0 = wall_seconds();
                 if (!prepare_body_batch_inputs(active, batch)) {
                     throw std::runtime_error("body batch inputs unavailable");
                 }
                 ensure_body_scratch(bsz);
                 ensure_lm_head_scratch(bsz, hidden, vocab);
+                const double t_prepare1 = wall_seconds();
                 if (!pack_ragged_metadata_for_body(active, batch)) {
                     throw std::runtime_error("body batch ragged metadata unavailable");
                 }
+                const double t_metadata1 = wall_seconds();
 
                 std::vector<uint64_t> rows_h(bsz, 0);
                 for (uint32_t row = 0; row < bsz; ++row) {
@@ -1547,7 +1569,9 @@ private:
                 require_ok(backend_.begin());
                 require_ok(backend_.q8_0_get_rows_batch(
                     *hidden_batch_, weights_.token_embd(), rows_h.data(), bsz));
+                const double t_embed1 = wall_seconds();
 
+                const double t_layers0 = wall_seconds();
                 for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
                     const QwenLayerWeights &layer = weights_.layer(il);
                     if (layer.recurrent) {
@@ -1785,6 +1809,7 @@ private:
                         *hidden_batch_, *hidden_batch_, *ffn_out_batch_,
                         static_cast<uint64_t>(bsz) * hidden));
                 }
+                const double t_layers1 = wall_seconds();
 
                 for (uint32_t row = 0; row < bsz; ++row) {
                     ContinuousBatchActive &a = active[outputs[row].active_index];
@@ -1804,6 +1829,7 @@ private:
                 std::vector<DeviceArgmax> argmaxes;
                 require_ok(backend_.argmax_batch(*logits_batch_, bsz, vocab, argmaxes));
                 require_ok(backend_.end());
+                const double t_final1 = wall_seconds();
 
                 for (uint32_t row = 0; row < bsz && row < argmaxes.size(); ++row) {
                     outputs[row].report.argmax_token = argmaxes[row].token;
@@ -1814,11 +1840,20 @@ private:
                     outputs[row].report.ok = true;
                     outputs[row].report.ops_executed += 1;
                 }
+                const double t_post1 = wall_seconds();
+                last_timing_.prepare_s = std::max(t_prepare1 - t_prepare0, 0.0);
+                last_timing_.metadata_s = std::max(t_metadata1 - t_prepare1, 0.0);
+                last_timing_.embed_s = std::max(t_embed1 - t_metadata1, 0.0);
+                last_timing_.layers_s = std::max(t_layers1 - t_layers0, 0.0);
+                last_timing_.final_s = std::max(t_final1 - t_layers1, 0.0);
+                last_timing_.post_s = std::max(t_post1 - t_final1, 0.0);
+                last_timing_.total_s = std::max(t_post1 - t_total0, 0.0);
             } catch (const std::exception &e) {
                 try { (void)backend_.end(); } catch (...) {}
                 for (auto &out : outputs) {
                     if (out.error.empty()) out.error = e.what();
                 }
+                last_timing_.total_s = std::max(wall_seconds() - t_total0, 0.0);
             }
             return outputs;
         }
@@ -1828,13 +1863,17 @@ private:
                 const ContinuousDecodeBatch &batch) {
             std::vector<BatchedDecodeOutput> outputs;
             outputs.reserve(batch.size());
+            const double t_total0 = wall_seconds();
             last_mode_ = "lm_head_batch";
             last_kernel_batch_ = static_cast<uint32_t>(batch.size());
+            const double t_prepare0 = wall_seconds();
             last_body_batch_ready_ = prepare_body_batch_inputs(active, batch);
+            const double t_prepare1 = wall_seconds();
 
             uint32_t hidden = 0;
             const uint32_t vocab = static_cast<uint32_t>(weights_.output().rows);
             try {
+                const double t_layers0 = wall_seconds();
                 for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
                     BatchedDecodeOutput out;
                     out.active_index = batch.active_indices[batch_i];
@@ -1865,6 +1904,7 @@ private:
                     }
                     outputs.push_back(std::move(out));
                 }
+                const double t_layers1 = wall_seconds();
 
                 bool any_error = false;
                 for (const auto &out : outputs) {
@@ -1875,7 +1915,9 @@ private:
                 const uint32_t bsz = static_cast<uint32_t>(batch.size());
                 ensure_lm_head_scratch(bsz, hidden, vocab);
                 require_ok(backend_.begin());
+                const double t_metadata0 = wall_seconds();
                 (void)pack_ragged_metadata_after_body(active, outputs);
+                const double t_metadata1 = wall_seconds();
                 for (uint32_t row = 0; row < bsz; ++row) {
                     ContinuousBatchActive &a = active[outputs[row].active_index];
                     QwenExecutor::DecodeStateView view =
@@ -1894,6 +1936,7 @@ private:
                 std::vector<DeviceArgmax> argmaxes;
                 require_ok(backend_.argmax_batch(*logits_batch_, bsz, vocab, argmaxes));
                 require_ok(backend_.end());
+                const double t_final1 = wall_seconds();
                 for (uint32_t row = 0; row < bsz && row < argmaxes.size(); ++row) {
                     outputs[row].report.argmax_token = argmaxes[row].token;
                     outputs[row].report.argmax_logit = argmaxes[row].logit;
@@ -1903,11 +1946,19 @@ private:
                     outputs[row].report.ok = true;
                     outputs[row].report.ops_executed += 3;
                 }
+                const double t_post1 = wall_seconds();
+                last_timing_.prepare_s = std::max(t_prepare1 - t_prepare0, 0.0);
+                last_timing_.metadata_s = std::max(t_metadata1 - t_metadata0, 0.0);
+                last_timing_.layers_s = std::max(t_layers1 - t_layers0, 0.0);
+                last_timing_.final_s = std::max(t_final1 - t_metadata1, 0.0);
+                last_timing_.post_s = std::max(t_post1 - t_final1, 0.0);
+                last_timing_.total_s = std::max(t_post1 - t_total0, 0.0);
             } catch (const std::exception &e) {
                 try { (void)backend_.end(); } catch (...) {}
                 for (auto &out : outputs) {
                     if (out.error.empty()) out.error = e.what();
                 }
+                last_timing_.total_s = std::max(wall_seconds() - t_total0, 0.0);
             }
             return outputs;
         }
@@ -1919,6 +1970,7 @@ private:
         uint32_t body_batch_capacity_ = 0;
         uint32_t ragged_metadata_batch_capacity_ = 0;
         uint32_t ragged_metadata_page_capacity_ = 0;
+        BatchedDecodeTiming last_timing_;
         std::unique_ptr<DeviceTensor> hidden_batch_;
         std::unique_ptr<DeviceTensor> norm_batch_;
         std::unique_ptr<DeviceTensor> logits_batch_;
@@ -2391,6 +2443,26 @@ private:
         }
         const std::vector<BatchedDecodeOutput> outputs =
             cb_decode_executor_->decode(active, BatchedDecodeInput{&batch});
+        if (continuous_batching_timing_enabled()) {
+            const BatchedDecodeTiming &timing = cb_decode_executor_->last_timing();
+            std::ostringstream msg;
+            msg << "native continuous_batch_timing:"
+                << " mode=" << cb_decode_executor_->last_mode()
+                << " batch=" << batch.size()
+                << " kernel_batch=" << cb_decode_executor_->last_kernel_batch()
+                << " total=" << fmt_seconds(timing.total_s)
+                << " prepare=" << fmt_seconds(timing.prepare_s)
+                << " metadata=" << fmt_seconds(timing.metadata_s)
+                << " embed=" << fmt_seconds(timing.embed_s)
+                << " layers=" << fmt_seconds(timing.layers_s)
+                << " final=" << fmt_seconds(timing.final_s)
+                << " post=" << fmt_seconds(timing.post_s)
+                << " ragged_pages="
+                << cb_decode_executor_->last_ragged_metadata_pages()
+                << " ragged_max_seq_len="
+                << cb_decode_executor_->last_ragged_metadata_max_seq_len();
+            log(msg.str());
+        }
         if (continuous_batching_trace_enabled()) {
             std::ostringstream msg;
             msg << "native continuous_batch_executor:"

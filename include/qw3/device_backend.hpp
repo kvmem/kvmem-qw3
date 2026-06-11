@@ -794,6 +794,33 @@ public:
         return {false, "attention_decode_batch_paged_gated_device requires backend override"};
     }
 
+    // Paged-KV prefill for one logical sequence. Unlike the decode-shaped
+    // paged entry above, this treats `batch` as a contiguous query chunk and
+    // uses a causal prefill kernel over q_len=batch, kv_len=base_seq_len+batch.
+    virtual DeviceStatus attention_prefill_batch_paged_gated_device(
+                                                      DeviceTensor &out,
+                                                      const DeviceTensor &q,
+                                                      uint32_t q_stride,
+                                                      const DeviceTensor &k_cache,
+                                                      const DeviceTensor &v_cache,
+                                                      const DeviceTensor &page_indices,
+                                                      uint32_t n_pages,
+                                                      uint32_t page_size,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t head_dim,
+                                                      uint32_t base_seq_len,
+                                                      uint32_t batch,
+                                                      uint32_t q_batch_stride,
+                                                      uint32_t out_batch_stride,
+                                                      float scale) {
+        (void)out; (void)q; (void)q_stride; (void)k_cache; (void)v_cache;
+        (void)page_indices; (void)n_pages; (void)page_size; (void)n_heads;
+        (void)n_kv_heads; (void)head_dim; (void)base_seq_len; (void)batch;
+        (void)q_batch_stride; (void)out_batch_stride; (void)scale;
+        return {false, "attention_prefill_batch_paged_gated_device requires backend override"};
+    }
+
     // Cross-request ragged paged decode attention. Each row b has its own page
     // table slice page_indices[page_indptr[b]..page_indptr[b+1]), last page
     // length, and sequence length. This is the continuous batching variant;

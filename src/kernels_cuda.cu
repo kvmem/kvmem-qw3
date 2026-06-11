@@ -258,6 +258,54 @@ bool launch_prefill_f16q_fp8kv(
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream);
 
+bool launch_batch_prefill_paged_f16q_f16kv_gated(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        int32_t *int_workspace,
+        void *host_int_workspace,
+        size_t int_workspace_bytes,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        uint32_t n_pages,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t base_seq_len,
+        uint32_t batch,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream);
+
+bool launch_batch_prefill_paged_f16q_fp8kv_gated(
+        float *out,
+        __half *q_f16,
+        __half *o_f16,
+        int32_t *int_workspace,
+        void *host_int_workspace,
+        size_t int_workspace_bytes,
+        const float *q,
+        uint32_t q_stride,
+        const void *k_cache,
+        const void *v_cache,
+        const int32_t *page_indices,
+        uint32_t n_pages,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t base_seq_len,
+        uint32_t batch,
+        uint32_t q_batch_stride,
+        uint32_t out_batch_stride,
+        float scale,
+        cudaStream_t stream);
+
 uint64_t decode_f32q_f16kv_tmp_elements(uint32_t n_heads,
                                         uint32_t head_dim,
                                         uint32_t seq_len);
@@ -2830,6 +2878,7 @@ __global__ void attention_norm_mid_kernel(float *mid,
 }
 
 class CudaDeviceBackend final : public DeviceBackend {
+    static constexpr uint32_t kFlashInferBatchPrefillHostSlots = 8;
 public:
     explicit CudaDeviceBackend(LinearBackend linear_backend)
         : linear_backend_(linear_backend) {}
@@ -2858,6 +2907,17 @@ public:
         if (flashinfer_batch_decode_tmp_v_) cudaFree(flashinfer_batch_decode_tmp_v_);
         if (flashinfer_batch_decode_tmp_s_) cudaFree(flashinfer_batch_decode_tmp_s_);
         if (flashinfer_batch_decode_meta_i32_) cudaFree(flashinfer_batch_decode_meta_i32_);
+        if (flashinfer_batch_prefill_q_f16_) cudaFree(flashinfer_batch_prefill_q_f16_);
+        if (flashinfer_batch_prefill_o_f16_) cudaFree(flashinfer_batch_prefill_o_f16_);
+        if (flashinfer_batch_prefill_meta_i32_) cudaFree(flashinfer_batch_prefill_meta_i32_);
+        for (uint32_t i = 0; i < kFlashInferBatchPrefillHostSlots; ++i) {
+            if (flashinfer_batch_prefill_meta_events_[i]) {
+                cudaEventDestroy(flashinfer_batch_prefill_meta_events_[i]);
+            }
+            if (flashinfer_batch_prefill_meta_hosts_[i]) {
+                cudaFreeHost(flashinfer_batch_prefill_meta_hosts_[i]);
+            }
+        }
         if (kv_page_indices_i32_) cudaFree(kv_page_indices_i32_);
         if (argmax_dev_) cudaFree(argmax_dev_);
         if (argmax_host_) cudaFreeHost(argmax_host_);
@@ -4920,6 +4980,112 @@ public:
         return {};
     }
 
+    DeviceStatus ensure_flashinfer_batch_prefill_workspace(uint64_t q_elems,
+                                                           uint64_t o_elems,
+                                                           uint64_t meta_i32_elems) {
+        if (q_elems > flashinfer_batch_prefill_q_f16_capacity_) {
+            if (flashinfer_batch_prefill_q_f16_) cudaFree(flashinfer_batch_prefill_q_f16_);
+            flashinfer_batch_prefill_q_f16_ = nullptr;
+            flashinfer_batch_prefill_q_f16_capacity_ = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(&flashinfer_batch_prefill_q_f16_,
+                               static_cast<size_t>(q_elems) * sizeof(__half)),
+                    "flashinfer batch prefill q_f16 alloc"); !st.ok) {
+                return st;
+            }
+            flashinfer_batch_prefill_q_f16_capacity_ = q_elems;
+        }
+        if (o_elems > flashinfer_batch_prefill_o_f16_capacity_) {
+            if (flashinfer_batch_prefill_o_f16_) cudaFree(flashinfer_batch_prefill_o_f16_);
+            flashinfer_batch_prefill_o_f16_ = nullptr;
+            flashinfer_batch_prefill_o_f16_capacity_ = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(&flashinfer_batch_prefill_o_f16_,
+                               static_cast<size_t>(o_elems) * sizeof(__half)),
+                    "flashinfer batch prefill o_f16 alloc"); !st.ok) {
+                return st;
+            }
+            flashinfer_batch_prefill_o_f16_capacity_ = o_elems;
+        }
+        if (meta_i32_elems > flashinfer_batch_prefill_meta_i32_capacity_) {
+            if (flashinfer_batch_prefill_meta_i32_) cudaFree(flashinfer_batch_prefill_meta_i32_);
+            flashinfer_batch_prefill_meta_i32_ = nullptr;
+            flashinfer_batch_prefill_meta_i32_capacity_ = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(&flashinfer_batch_prefill_meta_i32_,
+                               static_cast<size_t>(meta_i32_elems) * sizeof(int32_t)),
+                    "flashinfer batch prefill metadata alloc"); !st.ok) {
+                return st;
+            }
+            flashinfer_batch_prefill_meta_i32_capacity_ = meta_i32_elems;
+        }
+        const uint64_t meta_bytes = meta_i32_elems * sizeof(int32_t);
+        for (uint32_t i = 0; i < kFlashInferBatchPrefillHostSlots; ++i) {
+            if (!flashinfer_batch_prefill_meta_events_[i]) {
+                if (auto st = cuda_status(
+                        cudaEventCreateWithFlags(&flashinfer_batch_prefill_meta_events_[i],
+                                                 cudaEventDisableTiming),
+                        "flashinfer batch prefill metadata event create"); !st.ok) {
+                    return st;
+                }
+            }
+            if (meta_bytes > flashinfer_batch_prefill_meta_host_capacities_[i]) {
+                if (flashinfer_batch_prefill_meta_recorded_[i]) {
+                    cudaEventSynchronize(flashinfer_batch_prefill_meta_events_[i]);
+                    flashinfer_batch_prefill_meta_recorded_[i] = false;
+                }
+                if (flashinfer_batch_prefill_meta_hosts_[i]) {
+                    cudaFreeHost(flashinfer_batch_prefill_meta_hosts_[i]);
+                }
+                flashinfer_batch_prefill_meta_hosts_[i] = nullptr;
+                flashinfer_batch_prefill_meta_host_capacities_[i] = 0;
+                if (meta_bytes > 0) {
+                    if (auto st = cuda_status(
+                            cudaMallocHost(&flashinfer_batch_prefill_meta_hosts_[i],
+                                           static_cast<size_t>(meta_bytes)),
+                            "flashinfer batch prefill pinned metadata alloc"); !st.ok) {
+                        return st;
+                    }
+                }
+                flashinfer_batch_prefill_meta_host_capacities_[i] = meta_bytes;
+            }
+        }
+        return {};
+    }
+
+    DeviceStatus acquire_flashinfer_batch_prefill_host_workspace(void **host_workspace) {
+        const uint32_t slot = flashinfer_batch_prefill_meta_next_slot_
+            % kFlashInferBatchPrefillHostSlots;
+        flashinfer_batch_prefill_meta_next_slot_ =
+            (slot + 1U) % kFlashInferBatchPrefillHostSlots;
+        if (flashinfer_batch_prefill_meta_recorded_[slot]) {
+            if (auto st = cuda_status(
+                    cudaEventSynchronize(flashinfer_batch_prefill_meta_events_[slot]),
+                    "flashinfer batch prefill metadata host slot wait"); !st.ok) {
+                return st;
+            }
+            flashinfer_batch_prefill_meta_recorded_[slot] = false;
+        }
+        *host_workspace = flashinfer_batch_prefill_meta_hosts_[slot];
+        flashinfer_batch_prefill_meta_active_slot_ = slot;
+        return {};
+    }
+
+    DeviceStatus record_flashinfer_batch_prefill_host_workspace() {
+        const uint32_t slot = flashinfer_batch_prefill_meta_active_slot_;
+        if (slot >= kFlashInferBatchPrefillHostSlots ||
+            !flashinfer_batch_prefill_meta_events_[slot]) {
+            return {false, "flashinfer batch prefill metadata slot invalid"};
+        }
+        if (auto st = cuda_status(
+                cudaEventRecord(flashinfer_batch_prefill_meta_events_[slot], exec_stream_),
+                "flashinfer batch prefill metadata host slot event"); !st.ok) {
+            return st;
+        }
+        flashinfer_batch_prefill_meta_recorded_[slot] = true;
+        return {};
+    }
+
     // cuBLAS-based prefill attention.
     //
     // LEGACY — TESTED NEGATIVE — not in the default path. Reachable only via
@@ -5841,6 +6007,95 @@ public:
             q_batch_stride, out_batch_stride, scale);
     }
 
+    DeviceStatus attention_prefill_batch_paged_gated_device(
+                                              DeviceTensor &out,
+                                              const DeviceTensor &q,
+                                              uint32_t q_stride,
+                                              const DeviceTensor &k_cache,
+                                              const DeviceTensor &v_cache,
+                                              const DeviceTensor &page_indices,
+                                              uint32_t n_pages,
+                                              uint32_t page_size,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim,
+                                              uint32_t base_seq_len,
+                                              uint32_t batch,
+                                              uint32_t q_batch_stride,
+                                              uint32_t out_batch_stride,
+                                              float scale) override {
+        if (batch == 0) return {};
+        if (n_pages == 0 || page_size == 0) {
+            return {false, "paged prefill requires a non-empty page table"};
+        }
+        const uint32_t max_seq_len = base_seq_len + batch;
+        const uint32_t need_pages = (max_seq_len + page_size - 1) / page_size;
+        if (need_pages > n_pages) return {false, "paged prefill page table too small"};
+
+        auto &o = as_tensor(out);
+        const auto &qq = as_tensor(q);
+        const auto &kc = as_tensor(k_cache);
+        const auto &vc = as_tensor(v_cache);
+        const auto &pages = as_tensor(page_indices);
+        if (pages.elem_size != sizeof(int32_t) || pages.count < n_pages) {
+            return {false, "paged prefill page tensor invalid"};
+        }
+
+#if QW3_ENABLE_FLASHINFER
+        if (prefill_attn_kernel_choice() == PrefillAttnKernel::FlashInfer &&
+            (kc.is_fp16() || kc.is_fp8_kv()) &&
+            (head_dim == 128 || head_dim == 256)) {
+            const uint64_t q_elems =
+                static_cast<uint64_t>(batch) * n_heads * head_dim;
+            const uint64_t o_elems = q_elems;
+            const uint64_t meta_i32_elems = 1u << 20;  // 4 MiB scheduler/prefix workspace.
+            if (auto st = ensure_flashinfer_batch_prefill_workspace(
+                    q_elems, o_elems, meta_i32_elems); !st.ok) {
+                return st;
+            }
+            void *host_meta = nullptr;
+            if (auto st = acquire_flashinfer_batch_prefill_host_workspace(&host_meta);
+                !st.ok) {
+                return st;
+            }
+            const bool launched = kc.is_fp8_kv()
+                ? flashinfer_adapter::launch_batch_prefill_paged_f16q_fp8kv_gated(
+                    o.ptr,
+                    flashinfer_batch_prefill_q_f16_,
+                    flashinfer_batch_prefill_o_f16_,
+                    flashinfer_batch_prefill_meta_i32_,
+                    host_meta,
+                    static_cast<size_t>(flashinfer_batch_prefill_meta_i32_capacity_) *
+                        sizeof(int32_t),
+                    qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
+                    n_pages, page_size, n_heads, n_kv_heads, head_dim,
+                    base_seq_len, batch, q_batch_stride, out_batch_stride,
+                    scale, exec_stream_)
+                : flashinfer_adapter::launch_batch_prefill_paged_f16q_f16kv_gated(
+                    o.ptr,
+                    flashinfer_batch_prefill_q_f16_,
+                    flashinfer_batch_prefill_o_f16_,
+                    flashinfer_batch_prefill_meta_i32_,
+                    host_meta,
+                    static_cast<size_t>(flashinfer_batch_prefill_meta_i32_capacity_) *
+                        sizeof(int32_t),
+                    qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
+                    n_pages, page_size, n_heads, n_kv_heads, head_dim,
+                    base_seq_len, batch, q_batch_stride, out_batch_stride,
+                    scale, exec_stream_);
+            if (launched) {
+                if (auto st = record_flashinfer_batch_prefill_host_workspace();
+                    !st.ok) {
+                    return st;
+                }
+                return launch_status("cuda attention_prefill_batch flashinfer paged gated");
+            }
+            return {false, "flashinfer paged prefill launcher refused"};
+        }
+#endif
+        return {false, "paged prefill requires FlashInfer FP16/FP8 batch prefill"};
+    }
+
     DeviceStatus attention_decode_batch_paged_gated_device(
                                               DeviceTensor &out,
                                               const DeviceTensor &q,
@@ -6720,6 +6975,18 @@ private:
     uint64_t flashinfer_batch_decode_tmp_s_capacity_ = 0;  // elements
     int32_t *flashinfer_batch_decode_meta_i32_ = nullptr;
     uint64_t flashinfer_batch_decode_meta_i32_capacity_ = 0;  // elements
+    __half *flashinfer_batch_prefill_q_f16_ = nullptr;
+    uint64_t flashinfer_batch_prefill_q_f16_capacity_ = 0;  // elements
+    __half *flashinfer_batch_prefill_o_f16_ = nullptr;
+    uint64_t flashinfer_batch_prefill_o_f16_capacity_ = 0;  // elements
+    int32_t *flashinfer_batch_prefill_meta_i32_ = nullptr;
+    uint64_t flashinfer_batch_prefill_meta_i32_capacity_ = 0;  // elements
+    void *flashinfer_batch_prefill_meta_hosts_[kFlashInferBatchPrefillHostSlots] = {};
+    uint64_t flashinfer_batch_prefill_meta_host_capacities_[kFlashInferBatchPrefillHostSlots] = {};
+    cudaEvent_t flashinfer_batch_prefill_meta_events_[kFlashInferBatchPrefillHostSlots] = {};
+    bool flashinfer_batch_prefill_meta_recorded_[kFlashInferBatchPrefillHostSlots] = {};
+    uint32_t flashinfer_batch_prefill_meta_next_slot_ = 0;
+    uint32_t flashinfer_batch_prefill_meta_active_slot_ = 0;
     int32_t *kv_page_indices_i32_ = nullptr;
     uint32_t kv_page_indices_i32_capacity_ = 0;  // elements
     // X-FP16 cache for hgemm_q8. The QKV and gate/up matmul pairs share the
