@@ -19,6 +19,7 @@ import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from dataclasses import asdict, dataclass
@@ -53,6 +54,8 @@ TIMING_RE = re.compile(
     r"kernel_batch=(?P<kernel_batch>\d+)\s+"
     r"total=(?P<total>[0-9.]+)s"
 )
+
+TIMING_FIELD_RE = re.compile(r"(?P<key>[a-z_]+)=(?P<value>[0-9.]+)s")
 
 
 @dataclass
@@ -100,6 +103,22 @@ class BenchRun:
     decode_step_tokens: int
     decode_step_s: float
     decode_step_tokens_per_s: float
+    decode_prepare_s: float
+    decode_metadata_s: float
+    decode_embed_s: float
+    decode_layers_s: float
+    decode_recurrent_s: float
+    decode_recurrent_state_s: float
+    decode_attention_s: float
+    decode_qkv_s: float
+    decode_kv_append_s: float
+    decode_attn_kernel_s: float
+    decode_attn_output_s: float
+    decode_ffn_s: float
+    decode_final_s: float
+    decode_lm_head_s: float
+    decode_argmax_s: float
+    decode_post_s: float
     mean_latency_s: float
     p50_latency_s: float
     p90_latency_s: float
@@ -122,8 +141,63 @@ class SummaryMetrics:
 
 @dataclass
 class TimingMetrics:
+    mode: str
     batch_tokens: int
+    kernel_batch: int
     total_s: float
+    prepare_s: float = 0.0
+    metadata_s: float = 0.0
+    embed_s: float = 0.0
+    layers_s: float = 0.0
+    recurrent_s: float = 0.0
+    recurrent_state_s: float = 0.0
+    attention_s: float = 0.0
+    qkv_s: float = 0.0
+    kv_append_s: float = 0.0
+    attn_kernel_s: float = 0.0
+    attn_output_s: float = 0.0
+    ffn_s: float = 0.0
+    final_s: float = 0.0
+    lm_head_s: float = 0.0
+    argmax_s: float = 0.0
+    post_s: float = 0.0
+
+
+def start_log_drain(proc: subprocess.Popen[str]) -> tuple[List[str], List[threading.Thread]]:
+    chunks: List[str] = []
+    lock = threading.Lock()
+
+    def drain(stream: object) -> None:
+        if stream is None:
+            return
+        try:
+            for line in stream:  # type: ignore[operator]
+                with lock:
+                    chunks.append(line)
+        except Exception:  # noqa: BLE001 - best-effort log collection
+            return
+
+    threads: List[threading.Thread] = []
+    for stream in (proc.stdout, proc.stderr):
+        t = threading.Thread(target=drain, args=(stream,), daemon=True)
+        t.start()
+        threads.append(t)
+    return chunks, threads
+
+
+def terminate_drained_server(proc: subprocess.Popen[str],
+                             chunks: List[str],
+                             threads: List[threading.Thread]) -> str:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=15)
+    for t in threads:
+        t.join(timeout=2)
+    return "".join(chunks)
 
 
 def parse_int_list(raw: str) -> List[int]:
@@ -265,13 +339,55 @@ def parse_summary_metrics(log: str) -> List[SummaryMetrics]:
 def parse_timing_metrics(log: str) -> List[TimingMetrics]:
     timings: List[TimingMetrics] = []
     for m in TIMING_RE.finditer(log):
+        line_end = log.find("\n", m.start())
+        line = log[m.start(): line_end if line_end >= 0 else len(log)]
+        fields = {fm.group("key"): float(fm.group("value"))
+                  for fm in TIMING_FIELD_RE.finditer(line)}
         timings.append(
             TimingMetrics(
+                mode=m.group("mode"),
                 batch_tokens=int(m.group("batch")),
+                kernel_batch=int(m.group("kernel_batch")),
                 total_s=float(m.group("total")),
+                prepare_s=fields.get("prepare", 0.0),
+                metadata_s=fields.get("metadata", 0.0),
+                embed_s=fields.get("embed", 0.0),
+                layers_s=fields.get("layers", 0.0),
+                recurrent_s=fields.get("recurrent", 0.0),
+                recurrent_state_s=fields.get("recurrent_state", 0.0),
+                attention_s=fields.get("attention", 0.0),
+                qkv_s=fields.get("qkv", 0.0),
+                kv_append_s=fields.get("kv_append", 0.0),
+                attn_kernel_s=fields.get("attn_kernel", 0.0),
+                attn_output_s=fields.get("attn_output", 0.0),
+                ffn_s=fields.get("ffn", 0.0),
+                final_s=fields.get("final", 0.0),
+                lm_head_s=fields.get("lm_head", 0.0),
+                argmax_s=fields.get("argmax", 0.0),
+                post_s=fields.get("post", 0.0),
             )
         )
     return timings
+
+
+def sum_timing(timings: Sequence[TimingMetrics], field: str) -> float:
+    return sum(float(getattr(t, field)) for t in timings)
+
+
+def take_timing_slice(timings: Sequence[TimingMetrics],
+                      start: int,
+                      target_tokens: int) -> tuple[List[TimingMetrics], int]:
+    if target_tokens <= 0:
+        return [], start
+    selected: List[TimingMetrics] = []
+    cursor = start
+    tokens = 0
+    while cursor < len(timings) and tokens < target_tokens:
+        t = timings[cursor]
+        selected.append(t)
+        tokens += t.batch_tokens
+        cursor += 1
+    return selected, cursor
 
 
 def make_command(binary: Path,
@@ -310,6 +426,7 @@ def make_env(variant: BenchVariant,
              timing: bool) -> Dict[str, str]:
     env = os.environ.copy()
     env.setdefault("QW3_MATMUL", "mmq")
+    env.setdefault("QW3_DISABLE_HGEMM", "1")
     if variant.continuous:
         env["QW3_CONTINUOUS_BATCHING"] = "1"
         if trace:
@@ -394,6 +511,7 @@ def run_variant(*,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    log_chunks, log_threads = start_log_drain(proc)
     start = time.monotonic()
     log = ""
     requests: List[BenchRequest] = []
@@ -405,7 +523,7 @@ def run_variant(*,
             variant.concurrent
         )
     finally:
-        log = cbr.terminate_server(proc)
+        log = terminate_drained_server(proc, log_chunks, log_threads)
 
     elapsed_s = time.monotonic() - start
     (
@@ -437,6 +555,11 @@ def run_variant(*,
     timing_metrics = parse_timing_metrics(log)
     decode_step_tokens = sum(t.batch_tokens for t in timing_metrics)
     decode_step_s = sum(t.total_s for t in timing_metrics)
+    saw_body_from_timing = any(t.mode == "body_batch_fp16" for t in timing_metrics)
+    max_timing_kernel_batch = max(
+        (t.kernel_batch for t in timing_metrics),
+        default=0,
+    )
     return BenchRun(
         variant=variant.name,
         ctx_size=ctx_size,
@@ -461,14 +584,30 @@ def run_variant(*,
         decode_step_tokens_per_s=(
             decode_step_tokens / decode_step_s if decode_step_s > 0.0 else 0.0
         ),
+        decode_prepare_s=sum_timing(timing_metrics, "prepare_s"),
+        decode_metadata_s=sum_timing(timing_metrics, "metadata_s"),
+        decode_embed_s=sum_timing(timing_metrics, "embed_s"),
+        decode_layers_s=sum_timing(timing_metrics, "layers_s"),
+        decode_recurrent_s=sum_timing(timing_metrics, "recurrent_s"),
+        decode_recurrent_state_s=sum_timing(timing_metrics, "recurrent_state_s"),
+        decode_attention_s=sum_timing(timing_metrics, "attention_s"),
+        decode_qkv_s=sum_timing(timing_metrics, "qkv_s"),
+        decode_kv_append_s=sum_timing(timing_metrics, "kv_append_s"),
+        decode_attn_kernel_s=sum_timing(timing_metrics, "attn_kernel_s"),
+        decode_attn_output_s=sum_timing(timing_metrics, "attn_output_s"),
+        decode_ffn_s=sum_timing(timing_metrics, "ffn_s"),
+        decode_final_s=sum_timing(timing_metrics, "final_s"),
+        decode_lm_head_s=sum_timing(timing_metrics, "lm_head_s"),
+        decode_argmax_s=sum_timing(timing_metrics, "argmax_s"),
+        decode_post_s=sum_timing(timing_metrics, "post_s"),
         mean_latency_s=statistics.fmean(latencies) if latencies else 0.0,
         p50_latency_s=percentile(latencies, 0.50),
         p90_latency_s=percentile(latencies, 0.90),
-        max_trace_batch=max_trace_batch,
+        max_trace_batch=max(max_trace_batch, max_timing_kernel_batch),
         max_summary_batch=summary_max_batch,
-        saw_body_batch_ready=saw_body,
-        saw_body_batch_mode=saw_body_mode,
-        saw_ragged_metadata_ready=saw_ragged,
+        saw_body_batch_ready=saw_body or saw_body_from_timing,
+        saw_body_batch_mode=saw_body_mode or saw_body_from_timing,
+        saw_ragged_metadata_ready=saw_ragged or saw_body_from_timing,
         log=log,
     )
 
@@ -493,6 +632,11 @@ def build_run_from_requests(*,
     decode_step_tokens = sum(t.batch_tokens for t in timings)
     decode_step_s = sum(t.total_s for t in timings)
     max_summary_batch = max((s.max_batch for s in summaries), default=0)
+    saw_body_from_timing = any(t.mode == "body_batch_fp16" for t in timings)
+    max_timing_kernel_batch = max(
+        (t.kernel_batch for t in timings),
+        default=0,
+    )
     return BenchRun(
         variant=variant.name,
         ctx_size=ctx_size,
@@ -517,14 +661,30 @@ def build_run_from_requests(*,
         decode_step_tokens_per_s=(
             decode_step_tokens / decode_step_s if decode_step_s > 0.0 else 0.0
         ),
+        decode_prepare_s=sum_timing(timings, "prepare_s"),
+        decode_metadata_s=sum_timing(timings, "metadata_s"),
+        decode_embed_s=sum_timing(timings, "embed_s"),
+        decode_layers_s=sum_timing(timings, "layers_s"),
+        decode_recurrent_s=sum_timing(timings, "recurrent_s"),
+        decode_recurrent_state_s=sum_timing(timings, "recurrent_state_s"),
+        decode_attention_s=sum_timing(timings, "attention_s"),
+        decode_qkv_s=sum_timing(timings, "qkv_s"),
+        decode_kv_append_s=sum_timing(timings, "kv_append_s"),
+        decode_attn_kernel_s=sum_timing(timings, "attn_kernel_s"),
+        decode_attn_output_s=sum_timing(timings, "attn_output_s"),
+        decode_ffn_s=sum_timing(timings, "ffn_s"),
+        decode_final_s=sum_timing(timings, "final_s"),
+        decode_lm_head_s=sum_timing(timings, "lm_head_s"),
+        decode_argmax_s=sum_timing(timings, "argmax_s"),
+        decode_post_s=sum_timing(timings, "post_s"),
         mean_latency_s=statistics.fmean(latencies) if latencies else 0.0,
         p50_latency_s=percentile(latencies, 0.50),
         p90_latency_s=percentile(latencies, 0.90),
-        max_trace_batch=0,
+        max_trace_batch=max_timing_kernel_batch,
         max_summary_batch=max_summary_batch,
-        saw_body_batch_ready=False,
-        saw_body_batch_mode=False,
-        saw_ragged_metadata_ready=False,
+        saw_body_batch_ready=saw_body_from_timing,
+        saw_body_batch_mode=saw_body_from_timing,
+        saw_ragged_metadata_ready=saw_body_from_timing,
         log=full_log,
     )
 
@@ -558,6 +718,7 @@ def run_reused_variant_matrix(*,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    log_chunks, log_threads = start_log_drain(proc)
     base_url = f"http://{host}:{port}"
     pending: List[tuple[int, float, List[BenchRequest]]] = []
     start = time.monotonic()
@@ -579,17 +740,21 @@ def run_reused_variant_matrix(*,
                     flush=True,
                 )
     finally:
-        log = cbr.terminate_server(proc)
+        log = terminate_drained_server(proc, log_chunks, log_threads)
     elapsed_s = time.monotonic() - start
     summaries = parse_summary_metrics(log)
     timing_metrics = parse_timing_metrics(log)
     runs: List[BenchRun] = []
     cursor = 0
-    single_pending = len(pending) == 1
+    timing_cursor = 0
     for input_target, wall_s, requests in pending:
         next_cursor = cursor + len(requests)
         run_summaries = summaries[cursor:next_cursor]
         cursor = next_cursor
+        target_decode_tokens = sum(s.decoded_tokens for s in run_summaries)
+        run_timings, timing_cursor = take_timing_slice(
+            timing_metrics, timing_cursor, target_decode_tokens
+        )
         run = build_run_from_requests(
             variant=variant,
             ctx_size=ctx_size,
@@ -598,7 +763,7 @@ def run_reused_variant_matrix(*,
             request_wall_s=wall_s,
             requests=requests,
             summaries=run_summaries,
-            timings=timing_metrics if single_pending else [],
+            timings=run_timings,
             full_log=log,
         )
         run.elapsed_s = elapsed_s
@@ -779,6 +944,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         f"prefill_tok/s={run.prefill_tokens_per_s:.2f} "
                         f"decode_tok/s={run.decode_tokens_per_s:.2f} "
                         f"decode_step_tok/s={run.decode_step_tokens_per_s:.2f} "
+                        f"layers={run.decode_layers_s:.3f}s "
+                        f"recurrent={run.decode_recurrent_s:.3f}s "
+                        f"attention={run.decode_attention_s:.3f}s "
+                        f"ffn={run.decode_ffn_s:.3f}s "
+                        f"final={run.decode_final_s:.3f}s "
                         f"prefill_tokens={run.prefill_tokens} "
                         f"decode_tokens={run.decode_tokens} "
                         f"batch={max(run.max_trace_batch, run.max_summary_batch)}"
@@ -823,6 +993,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"prefill_tok/s={run.prefill_tokens_per_s:.2f} "
                     f"decode_tok/s={run.decode_tokens_per_s:.2f} "
                     f"decode_step_tok/s={run.decode_step_tokens_per_s:.2f} "
+                    f"layers={run.decode_layers_s:.3f}s "
+                    f"recurrent={run.decode_recurrent_s:.3f}s "
+                    f"attention={run.decode_attention_s:.3f}s "
+                    f"ffn={run.decode_ffn_s:.3f}s "
+                    f"final={run.decode_final_s:.3f}s "
                     f"tokens={run.output_tokens} "
                     f"mean={run.mean_latency_s:.3f}s "
                     f"p50={run.p50_latency_s:.3f}s "

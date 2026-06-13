@@ -240,8 +240,8 @@ uint32_t continuous_batching_admission_wait_us() {
 }
 
 uint64_t continuous_batching_max_total_tokens(uint32_t ctx_size, uint32_t max_active) {
-    const uint64_t default_budget =
-        static_cast<uint64_t>(ctx_size) * static_cast<uint64_t>(max_active);
+    (void)max_active;
+    const uint64_t default_budget = static_cast<uint64_t>(ctx_size);
     const uint64_t configured =
         env_uint64_or("QW3_CONTINUOUS_BATCHING_MAX_TOTAL_TOKENS", default_budget);
     return configured == 0 ? std::numeric_limits<uint64_t>::max() : configured;
@@ -257,6 +257,10 @@ bool continuous_batching_timing_enabled() {
 
 bool continuous_batching_body_batch_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_BODY_BATCH", true);
+}
+
+bool continuous_batching_lm_head_batch_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_LM_HEAD_BATCH", true);
 }
 
 bool continuous_batching_recurrent_batch_enabled() {
@@ -937,8 +941,7 @@ public:
                 std::max<uint32_t>(1, env_uint32_or("QW3_PAGED_KV_PAGE_SIZE", 16));
             const uint32_t per_executor_pages =
                 (ctx_size + kv_page_size - 1) / kv_page_size;
-            const uint32_t default_pool_pages =
-                per_executor_pages * continuous_batching_max_active();
+            const uint32_t default_pool_pages = per_executor_pages;
             const uint32_t requested_pool_pages =
                 env_uint32_or("QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES",
                               default_pool_pages);
@@ -1191,7 +1194,17 @@ private:
         double metadata_s = 0.0;
         double embed_s = 0.0;
         double layers_s = 0.0;
+        double recurrent_s = 0.0;
+        double recurrent_state_s = 0.0;
+        double attention_s = 0.0;
+        double qkv_s = 0.0;
+        double kv_append_s = 0.0;
+        double attn_kernel_s = 0.0;
+        double attn_output_s = 0.0;
+        double ffn_s = 0.0;
         double final_s = 0.0;
+        double lm_head_s = 0.0;
+        double argmax_s = 0.0;
         double post_s = 0.0;
     };
 
@@ -1366,28 +1379,29 @@ private:
             return true;
         }
 
-        void ensure_ragged_scratch(uint32_t total_q, uint32_t final_rows) {
+        void ensure_ragged_scratch(uint32_t total_q, uint32_t final_rows,
+                                   uint32_t batch_size) {
+            const QwenConfig &cfg = model_.config();
+            uint64_t max_ffn = 1;
+            uint64_t max_q = 1;
+            uint64_t max_k = 1;
+            uint64_t max_v = 1;
+            uint64_t max_recurrent_qkv = 1;
+            uint64_t max_recurrent_value = 1;
+            for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+                const QwenLayerWeights &layer = weights_.layer(il);
+                max_ffn = std::max<uint64_t>(max_ffn, layer.ffn_dim);
+                max_q = std::max<uint64_t>(max_q, layer.q_rows);
+                max_k = std::max<uint64_t>(max_k, layer.k_rows);
+                max_v = std::max<uint64_t>(max_v, layer.v_rows);
+                max_recurrent_qkv =
+                    std::max<uint64_t>(max_recurrent_qkv,
+                                       layer.recurrent_qkv_dim);
+                max_recurrent_value =
+                    std::max<uint64_t>(max_recurrent_value,
+                                       layer.recurrent_value_dim);
+            }
             if (total_q > ragged_capacity_) {
-                const QwenConfig &cfg = model_.config();
-                uint64_t max_ffn = 1;
-                uint64_t max_q = 1;
-                uint64_t max_k = 1;
-                uint64_t max_v = 1;
-                uint64_t max_recurrent_qkv = 1;
-                uint64_t max_recurrent_value = 1;
-                for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
-                    const QwenLayerWeights &layer = weights_.layer(il);
-                    max_ffn = std::max<uint64_t>(max_ffn, layer.ffn_dim);
-                    max_q = std::max<uint64_t>(max_q, layer.q_rows);
-                    max_k = std::max<uint64_t>(max_k, layer.k_rows);
-                    max_v = std::max<uint64_t>(max_v, layer.v_rows);
-                    max_recurrent_qkv =
-                        std::max<uint64_t>(max_recurrent_qkv,
-                                           layer.recurrent_qkv_dim);
-                    max_recurrent_value =
-                        std::max<uint64_t>(max_recurrent_value,
-                                           layer.recurrent_value_dim);
-                }
                 const uint64_t T = total_q;
                 hidden_batch_ = backend_.scratch_f32(T * cfg.n_embd,
                                                      "cb_prefill_hidden_batch");
@@ -1430,18 +1444,21 @@ private:
                 recurrent_conv_out_batch_ = backend_.scratch_f32(
                     T * max_recurrent_qkv,
                     "cb_prefill_recurrent_conv_out_batch");
+                ragged_capacity_ = total_q;
+            }
+            if (batch_size > ragged_state_capacity_) {
+                const uint64_t B = batch_size;
                 recurrent_state_batch_ = backend_.scratch_f32(
-                    T * static_cast<uint64_t>(cfg.num_v_heads()) *
+                    B * static_cast<uint64_t>(cfg.num_v_heads()) *
                         cfg.head_v_dim_ssm() * cfg.head_k_dim(),
                     "cb_prefill_recurrent_state_batch");
                 recurrent_conv_state_batch_ = backend_.scratch_f32(
-                    T * max_recurrent_qkv *
+                    B * max_recurrent_qkv *
                         static_cast<uint64_t>(cfg.ssm_conv_kernel - 1),
                     "cb_prefill_recurrent_conv_state_batch");
-                ragged_capacity_ = total_q;
+                ragged_state_capacity_ = batch_size;
             }
             if (final_rows > final_capacity_) {
-                const QwenConfig &cfg = model_.config();
                 const uint32_t vocab =
                     static_cast<uint32_t>(weights_.output().rows);
                 final_hidden_batch_ = backend_.scratch_f32(
@@ -1523,7 +1540,7 @@ private:
                 const float eps = cfg.rms_eps;
                 const float scale =
                     1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-                ensure_ragged_scratch(total_q, final_rows);
+                ensure_ragged_scratch(total_q, final_rows, bsz);
 
                 require_ok(backend_.begin());
                 const double t_prepare1 = wall_seconds();
@@ -1871,6 +1888,7 @@ private:
         const QwenWeights &weights_;
         DeviceBackend &backend_;
         uint32_t ragged_capacity_ = 0;
+        uint32_t ragged_state_capacity_ = 0;
         uint32_t final_capacity_ = 0;
         std::unique_ptr<DeviceTensor> hidden_batch_;
         std::unique_ptr<DeviceTensor> norm_batch_;
@@ -1968,6 +1986,7 @@ private:
 
         bool can_use_lm_head_batch(const std::vector<ContinuousBatchActive> &active,
                                    const ContinuousDecodeBatch &batch) const {
+            if (!continuous_batching_lm_head_batch_enabled()) return false;
             if (batch.size() < 2) return false;
             for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
                 const size_t active_index = batch.active_indices[batch_i];
@@ -2359,9 +2378,18 @@ private:
                 const double t_embed1 = wall_seconds();
 
                 const double t_layers0 = wall_seconds();
+                double recurrent_s = 0.0;
+                double recurrent_state_s = 0.0;
+                double attention_s = 0.0;
+                double qkv_s = 0.0;
+                double kv_append_s = 0.0;
+                double attn_kernel_s = 0.0;
+                double attn_output_s = 0.0;
+                double ffn_s = 0.0;
                 for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
                     const QwenLayerWeights &layer = weights_.layer(il);
                     if (layer.recurrent) {
+                        const double t_recurrent0 = wall_seconds();
                         if (!continuous_batching_recurrent_batch_enabled()) {
                             for (uint32_t row = 0; row < bsz; ++row) {
                                 ContinuousBatchActive &a = active[outputs[row].active_index];
@@ -2388,6 +2416,8 @@ private:
                                     *hidden_batch_, static_cast<uint64_t>(row) * hidden,
                                     *view.hidden, 0, hidden));
                             }
+                            recurrent_s +=
+                                std::max(wall_seconds() - t_recurrent0, 0.0);
                             continue;
                         }
                         const uint32_t num_k_heads = cfg.num_k_heads();
@@ -2426,6 +2456,7 @@ private:
                         require_ok(backend_.q8_0_matmul(
                             *recurrent_beta_batch_, *layer.ssm_beta,
                             *norm_batch_, bsz, hidden, beta_stride));
+                        const double t_state_pack0 = wall_seconds();
                         for (uint32_t row = 0; row < bsz; ++row) {
                             ContinuousBatchActive &a = active[outputs[row].active_index];
                             QwenExecutor::MutableDecodeStateView view =
@@ -2452,6 +2483,8 @@ private:
                                 static_cast<uint64_t>(row) * conv_state_stride,
                                 conv_state, 0, conv_state_stride));
                         }
+                        recurrent_state_s +=
+                            std::max(wall_seconds() - t_state_pack0, 0.0);
                         require_ok(backend_.recurrent_batch_independent(
                             *recurrent_core_batch_,
                             *recurrent_state_batch_,
@@ -2474,6 +2507,7 @@ private:
                             *hidden_batch_, *hidden_batch_, *attn_out_batch_,
                             *layer.ssm_out, *recurrent_core_batch_,
                             bsz, core_stride, hidden));
+                        const double t_state_unpack0 = wall_seconds();
                         for (uint32_t row = 0; row < bsz; ++row) {
                             ContinuousBatchActive &a = active[outputs[row].active_index];
                             QwenExecutor::MutableDecodeStateView view =
@@ -2490,6 +2524,9 @@ private:
                                 conv_state_stride));
                             outputs[row].report.ops_executed += 1;
                         }
+                        recurrent_state_s +=
+                            std::max(wall_seconds() - t_state_unpack0, 0.0);
+                        const double t_ffn0 = wall_seconds();
                         require_ok(backend_.rms_norm_batch(
                             *norm_batch_, *hidden_batch_, *layer.ffn_norm,
                             bsz, hidden, eps));
@@ -2511,9 +2548,13 @@ private:
                         require_ok(backend_.add_n(
                             *hidden_batch_, *hidden_batch_, *ffn_out_batch_,
                             static_cast<uint64_t>(bsz) * hidden));
+                        ffn_s += std::max(wall_seconds() - t_ffn0, 0.0);
+                        recurrent_s +=
+                            std::max(wall_seconds() - t_recurrent0, 0.0);
                         continue;
                     }
 
+                    const double t_attention0 = wall_seconds();
                     require_ok(backend_.rms_norm_batch(
                         *norm_batch_, *hidden_batch_, *layer.attn_norm,
                         bsz, hidden, eps));
@@ -2528,6 +2569,7 @@ private:
                         static_cast<uint32_t>(layer.k_rows),
                         static_cast<uint32_t>(layer.v_rows),
                     };
+                    const double t_qkv0 = wall_seconds();
                     require_ok(backend_.q8_0_matmul_fanout(
                         qkv_outs, qkv_ws, qkv_strides, 3,
                         *norm_batch_, bsz, hidden));
@@ -2547,6 +2589,7 @@ private:
                         *k_batch_, bsz, static_cast<uint32_t>(layer.k_rows),
                         standard_n_kv_heads, standard_head_dim, cfg.rope_dim,
                         *ragged_positions_i32_, cfg.rope_theta));
+                    qkv_s += std::max(wall_seconds() - t_qkv0, 0.0);
 
                     QwenExecutor::MutableDecodeStateView first_view =
                         active[outputs[0].active_index].executor->mutable_decode_state_view();
@@ -2555,6 +2598,7 @@ private:
                     if (!k_cache || !v_cache) {
                         throw std::runtime_error("body batch KV cache unavailable");
                     }
+                    const double t_kv_append0 = wall_seconds();
                     require_ok(backend_.kv_append_batch_paged_ragged_device(
                         *k_cache, *k_batch_, *ragged_positions_i32_, per_pos, bsz,
                         static_cast<uint32_t>(layer.k_rows), *ragged_page_indices_i32_,
@@ -2563,6 +2607,8 @@ private:
                         *v_cache, *v_batch_, *ragged_positions_i32_, per_pos, bsz,
                         static_cast<uint32_t>(layer.v_rows), *ragged_page_indices_i32_,
                         *ragged_page_indptr_i32_, first_view.kv_page_size));
+                    kv_append_s += std::max(wall_seconds() - t_kv_append0, 0.0);
+                    const double t_attn_kernel0 = wall_seconds();
                     require_ok(backend_.attention_decode_batch_paged_gated_ragged_device(
                         *mid_batch_, *q_batch_, q_stride, *k_cache, *v_cache,
                         *ragged_page_indices_i32_, *ragged_page_indptr_i32_,
@@ -2570,13 +2616,21 @@ private:
                         first_view.kv_page_size, standard_n_heads,
                         standard_n_kv_heads, standard_head_dim, bsz,
                         static_cast<uint32_t>(layer.q_rows), mid_stride, scale));
+                    attn_kernel_s +=
+                        std::max(wall_seconds() - t_attn_kernel0, 0.0);
+                    const double t_attn_output0 = wall_seconds();
                     require_ok(backend_.q8_0_matmul(
                         *attn_out_batch_, *layer.attn_output, *mid_batch_,
                         bsz, mid_stride, hidden));
                     require_ok(backend_.add_n(
                         *hidden_batch_, *hidden_batch_, *attn_out_batch_,
                         static_cast<uint64_t>(bsz) * hidden));
+                    attn_output_s +=
+                        std::max(wall_seconds() - t_attn_output0, 0.0);
+                    attention_s +=
+                        std::max(wall_seconds() - t_attention0, 0.0);
 
+                    const double t_ffn0 = wall_seconds();
                     require_ok(backend_.rms_norm_batch(
                         *norm_batch_, *hidden_batch_, *layer.ffn_norm,
                         bsz, hidden, eps));
@@ -2595,6 +2649,7 @@ private:
                     require_ok(backend_.add_n(
                         *hidden_batch_, *hidden_batch_, *ffn_out_batch_,
                         static_cast<uint64_t>(bsz) * hidden));
+                    ffn_s += std::max(wall_seconds() - t_ffn0, 0.0);
                 }
                 const double t_layers1 = wall_seconds();
 
@@ -2610,9 +2665,11 @@ private:
                 require_ok(backend_.rms_norm_batch(
                     *norm_batch_, *hidden_batch_, weights_.output_norm(),
                     bsz, hidden, eps));
+                const double t_lm_head0 = wall_seconds();
                 require_ok(backend_.q8_0_matmul(
                     *logits_batch_, weights_.output(), *norm_batch_,
                     bsz, hidden, vocab));
+                const double t_argmax0 = wall_seconds();
                 std::vector<DeviceArgmax> argmaxes;
                 require_ok(backend_.argmax_batch(*logits_batch_, bsz, vocab, argmaxes));
                 require_ok(backend_.end());
@@ -2632,7 +2689,17 @@ private:
                 last_timing_.metadata_s = std::max(t_metadata1 - t_prepare1, 0.0);
                 last_timing_.embed_s = std::max(t_embed1 - t_metadata1, 0.0);
                 last_timing_.layers_s = std::max(t_layers1 - t_layers0, 0.0);
+                last_timing_.recurrent_s = recurrent_s;
+                last_timing_.recurrent_state_s = recurrent_state_s;
+                last_timing_.attention_s = attention_s;
+                last_timing_.qkv_s = qkv_s;
+                last_timing_.kv_append_s = kv_append_s;
+                last_timing_.attn_kernel_s = attn_kernel_s;
+                last_timing_.attn_output_s = attn_output_s;
+                last_timing_.ffn_s = ffn_s;
                 last_timing_.final_s = std::max(t_final1 - t_layers1, 0.0);
+                last_timing_.lm_head_s = std::max(t_argmax0 - t_lm_head0, 0.0);
+                last_timing_.argmax_s = std::max(t_final1 - t_argmax0, 0.0);
                 last_timing_.post_s = std::max(t_post1 - t_final1, 0.0);
                 last_timing_.total_s = std::max(t_post1 - t_total0, 0.0);
             } catch (const std::exception &e) {
@@ -2717,9 +2784,11 @@ private:
                 require_ok(backend_.rms_norm_batch(
                     *norm_batch_, *hidden_batch_, weights_.output_norm(),
                     bsz, hidden, eps));
+                const double t_lm_head0 = wall_seconds();
                 require_ok(backend_.q8_0_matmul(
                     *logits_batch_, weights_.output(), *norm_batch_,
                     bsz, hidden, vocab));
+                const double t_argmax0 = wall_seconds();
                 std::vector<DeviceArgmax> argmaxes;
                 require_ok(backend_.argmax_batch(*logits_batch_, bsz, vocab, argmaxes));
                 require_ok(backend_.end());
@@ -2738,6 +2807,8 @@ private:
                 last_timing_.metadata_s = std::max(t_metadata1 - t_metadata0, 0.0);
                 last_timing_.layers_s = std::max(t_layers1 - t_layers0, 0.0);
                 last_timing_.final_s = std::max(t_final1 - t_metadata1, 0.0);
+                last_timing_.lm_head_s = std::max(t_argmax0 - t_lm_head0, 0.0);
+                last_timing_.argmax_s = std::max(t_final1 - t_argmax0, 0.0);
                 last_timing_.post_s = std::max(t_post1 - t_final1, 0.0);
                 last_timing_.total_s = std::max(t_post1 - t_total0, 0.0);
             } catch (const std::exception &e) {
@@ -2833,6 +2904,16 @@ private:
         req->reserved_tokens =
             static_cast<uint64_t>(prompt_tokens.size()) +
             static_cast<uint64_t>(std::max(0, options.max_tokens));
+        if (continuous_batching_trace_enabled()) {
+            std::ostringstream msg;
+            msg << "native continuous_request:"
+                << " request=" << req->id
+                << " prompt_tokens=" << prompt_tokens.size()
+                << " max_tokens=" << options.max_tokens
+                << " ignore_eos=" << (options.ignore_eos ? "true" : "false")
+                << " reserved_tokens=" << req->reserved_tokens;
+            log(msg.str());
+        }
         const uint32_t ctx_size = options_.ctx_size > 0
             ? static_cast<uint32_t>(options_.ctx_size)
             : 4096u;
@@ -3755,7 +3836,18 @@ private:
                 << " metadata=" << fmt_seconds(timing.metadata_s)
                 << " embed=" << fmt_seconds(timing.embed_s)
                 << " layers=" << fmt_seconds(timing.layers_s)
+                << " recurrent=" << fmt_seconds(timing.recurrent_s)
+                << " recurrent_state="
+                << fmt_seconds(timing.recurrent_state_s)
+                << " attention=" << fmt_seconds(timing.attention_s)
+                << " qkv=" << fmt_seconds(timing.qkv_s)
+                << " kv_append=" << fmt_seconds(timing.kv_append_s)
+                << " attn_kernel=" << fmt_seconds(timing.attn_kernel_s)
+                << " attn_output=" << fmt_seconds(timing.attn_output_s)
+                << " ffn=" << fmt_seconds(timing.ffn_s)
                 << " final=" << fmt_seconds(timing.final_s)
+                << " lm_head=" << fmt_seconds(timing.lm_head_s)
+                << " argmax=" << fmt_seconds(timing.argmax_s)
                 << " post=" << fmt_seconds(timing.post_s)
                 << " ragged_pages="
                 << cb_decode_executor_->last_ragged_metadata_pages()
@@ -4380,8 +4472,11 @@ private:
             log("native mtp_speculate: ok=false reason=\"MTP prefix cache is unavailable\"");
         }
 
+        auto should_stop_mtp_eos = [&](uint32_t token) -> bool {
+            return !options.ignore_eos && token == static_cast<uint32_t>(eos);
+        };
         auto emit_generated_token = [&](uint32_t token) -> bool {
-            if (decoded >= options.max_tokens || token == static_cast<uint32_t>(eos)) return false;
+            if (decoded >= options.max_tokens || should_stop_mtp_eos(token)) return false;
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
             generated += piece;
             if (on_text) on_text(piece);
@@ -4389,7 +4484,7 @@ private:
             return true;
         };
 
-        if (options.max_tokens > 0 && next_token != static_cast<uint32_t>(eos)) {
+        if (options.max_tokens > 0 && !should_stop_mtp_eos(next_token)) {
             if (emit_generated_token(next_token) && trace_mtp && !run_spec_mtp) {
                 trace_mtp_chain(next_token, decoded - 1);
             }
@@ -4398,7 +4493,7 @@ private:
         uint64_t plain_decode_forwards = 0;
         const bool decode_as_batch = decode_as_batch_enabled();
         auto run_plain_decode_remaining = [&]() {
-            while (decoded < options.max_tokens && next_token != static_cast<uint32_t>(eos)) {
+            while (decoded < options.max_tokens && !should_stop_mtp_eos(next_token)) {
                 const uint32_t feed = next_token;
                 if (decode_as_batch) {
                     const std::vector<uint32_t> one_token{feed};
@@ -4431,7 +4526,7 @@ private:
         if (run_spec_mtp) {
             while (run_spec_mtp &&
                    decoded < options.max_tokens &&
-                   next_token != static_cast<uint32_t>(eos)) {
+                   !should_stop_mtp_eos(next_token)) {
                 const uint32_t current = next_token;
                 const uint32_t remaining_tokens =
                     static_cast<uint32_t>(options.max_tokens - decoded);
@@ -4468,7 +4563,7 @@ private:
                         log(mtp_msg.str());
                     }
                     if (!mtp.ok || mtp.argmax_token < 0 ||
-                        mtp.argmax_token == eos) {
+                        should_stop_mtp_eos(static_cast<uint32_t>(mtp.argmax_token))) {
                         break;
                     }
                     drafts.push_back(static_cast<uint32_t>(mtp.argmax_token));

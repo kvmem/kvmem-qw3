@@ -335,6 +335,72 @@ std::string render_tool_call(const json &call) {
     return out;
 }
 
+json make_tool_call_json(const std::string &name, const json &args) {
+    if (name.empty()) return json();
+    json normalized_args = args.is_object() ? args : json::object();
+    return json{
+        {"id", gen_id("call_")},
+        {"type", "function"},
+        {"function", json{{"name", name},
+                          {"arguments", dump_json(normalized_args)}}}
+    };
+}
+
+bool parse_json_tool_call_value(const json &value, std::vector<json> &calls) {
+    if (value.is_array()) {
+        bool any = false;
+        for (const auto &item : value) {
+            any = parse_json_tool_call_value(item, calls) || any;
+        }
+        return any;
+    }
+    if (!value.is_object()) return false;
+
+    const json *fn = &value;
+    if (value.contains("function") && value["function"].is_object()) {
+        fn = &value["function"];
+    }
+    if (!fn->is_object()) return false;
+
+    std::string name;
+    if (fn->contains("name") && (*fn)["name"].is_string()) {
+        name = (*fn)["name"].get<std::string>();
+    } else if (fn->contains("tool") && (*fn)["tool"].is_string()) {
+        name = (*fn)["tool"].get<std::string>();
+    }
+    if (name.empty()) return false;
+
+    json args = json::object();
+    if (fn->contains("arguments")) {
+        const json &raw = (*fn)["arguments"];
+        if (raw.is_object()) {
+            args = raw;
+        } else if (raw.is_string()) {
+            try {
+                json parsed = json::parse(raw.get<std::string>());
+                if (parsed.is_object()) args = parsed;
+            } catch (...) {
+                args = json{{"arguments", raw.get<std::string>()}};
+            }
+        }
+    } else if (fn->contains("parameters") && (*fn)["parameters"].is_object()) {
+        args = (*fn)["parameters"];
+    }
+    calls.push_back(make_tool_call_json(name, args));
+    return true;
+}
+
+bool parse_json_tool_call_text(const std::string &text, std::vector<json> &calls) {
+    const std::string trimmed = trim_ascii_ws(text);
+    if (trimmed.empty()) return false;
+    try {
+        const json value = json::parse(trimmed);
+        return parse_json_tool_call_value(value, calls);
+    } catch (...) {
+        return false;
+    }
+}
+
 std::vector<json> parse_tool_calls_xml(const std::string &text) {
     std::vector<json> calls;
     size_t pos = 0;
@@ -344,20 +410,24 @@ std::vector<json> parse_tool_calls_xml(const std::string &text) {
         const size_t tc1 = text.find("</tool_call>", tc0);
         if (tc1 == std::string::npos) break;
         const std::string block = text.substr(tc0, tc1 - tc0);
+        const size_t inner0 = tc0 + std::string("<tool_call>").size();
+        const std::string inner = text.substr(inner0, tc1 - inner0);
         const size_t fn0 = block.find("<function=");
         if (fn0 == std::string::npos) {
-            pos = tc1 + 12;
+            (void)parse_json_tool_call_text(inner, calls);
+            pos = tc1 + std::string("</tool_call>").size();
             continue;
         }
         const size_t name0 = fn0 + std::string("<function=").size();
         const size_t name1 = block.find(">", name0);
         if (name1 == std::string::npos) {
-            pos = tc1 + 12;
+            pos = tc1 + std::string("</tool_call>").size();
             continue;
         }
         const std::string name = block.substr(name0, name1 - name0);
         json args = json::object();
         size_t pp = name1 + 1;
+        bool saw_parameter = false;
         while (true) {
             const size_t p0 = block.find("<parameter=", pp);
             if (p0 == std::string::npos) break;
@@ -371,13 +441,27 @@ std::vector<json> parse_tool_calls_xml(const std::string &text) {
             if (!value.empty() && value.front() == '\n') value.erase(value.begin());
             if (!value.empty() && value.back() == '\n') value.pop_back();
             args[block.substr(key0, key1 - key0)] = value;
+            saw_parameter = true;
             pp = v1 + std::string("</parameter>").size();
         }
-        calls.push_back(json{
-            {"id", gen_id("call_")},
-            {"type", "function"},
-            {"function", json{{"name", name}, {"arguments", dump_json(args)}}}
-        });
+        if (!saw_parameter) {
+            const size_t body0 = name1 + 1;
+            const size_t body1 = block.find("</function>", body0);
+            if (body1 != std::string::npos) {
+                const std::string body = block.substr(body0, body1 - body0);
+                std::vector<json> parsed;
+                if (parse_json_tool_call_text(
+                        "{\"name\":" + dump_json(name) +
+                        ",\"arguments\":" + trim_ascii_ws(body) + "}",
+                        parsed) &&
+                    !parsed.empty()) {
+                    calls.push_back(parsed.front());
+                    pos = tc1 + std::string("</tool_call>").size();
+                    continue;
+                }
+            }
+        }
+        calls.push_back(make_tool_call_json(name, args));
         pos = tc1 + std::string("</tool_call>").size();
     }
     return calls;
@@ -400,6 +484,56 @@ json tool_call_delta(const json &calls) {
         deltas.push_back(d);
     }
     return json{{"tool_calls", deltas}};
+}
+
+std::string tool_calls_debug_summary(const std::vector<json> &calls) {
+    json summary = json::array();
+    for (const auto &call : calls) {
+        json item = json::object();
+        if (call.contains("function") && call["function"].is_object()) {
+            const json &fn = call["function"];
+            item["name"] = fn.value("name", "");
+            json keys = json::array();
+            try {
+                const json args =
+                    json::parse(fn.value("arguments", "{}"));
+                if (args.is_object()) {
+                    for (auto it = args.begin(); it != args.end(); ++it) {
+                        keys.push_back(it.key());
+                    }
+                }
+            } catch (...) {
+                keys.push_back("<invalid-json-arguments>");
+            }
+            item["argument_keys"] = keys;
+        }
+        summary.push_back(item);
+    }
+    return dump_json(summary);
+}
+
+std::string tools_debug_summary(const json &tools) {
+    json summary = json::array();
+    if (!tools.is_array()) return "[]";
+    for (const auto &tool : tools) {
+        if (!tool.is_object()) continue;
+        const json *fn = &tool;
+        if (tool.contains("function") && tool["function"].is_object()) {
+            fn = &tool["function"];
+        }
+        json item = json::object();
+        item["name"] = fn->value("name", "");
+        json required = json::array();
+        if (fn->contains("parameters") && (*fn)["parameters"].is_object()) {
+            const json &params = (*fn)["parameters"];
+            if (params.contains("required") && params["required"].is_array()) {
+                required = params["required"];
+            }
+        }
+        item["required"] = required;
+        summary.push_back(item);
+    }
+    return dump_json(summary);
 }
 
 bool could_be_tool_call_prefix(const std::string &text) {
@@ -698,6 +832,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         const json *tools = tool_choice_none ? nullptr : raw_tools;
         const bool tool_request = tools && tools->is_array() && !tools->empty();
+        if (tool_request) {
+            std::cerr << "[qw3-serve] incoming tools="
+                      << tools_debug_summary(*tools);
+            if (!forced_tool_name.empty()) {
+                std::cerr << " forced=" << forced_tool_name;
+            }
+            std::cerr << "\n";
+        }
         const std::string prompt =
             render_messages(req["messages"], tools, enable_thinking, forced_tool_name);
         const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
@@ -882,9 +1024,23 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     send_delta(json{{"reasoning_content", split.reasoning}});
                                 }
                                 if (!tool_calls.empty()) {
+                                    std::cerr << "[qw3-serve] #" << rid
+                                              << " tool_calls="
+                                              << tool_calls_debug_summary(tool_calls)
+                                              << "\n";
                                     send_delta(tool_call_delta(tool_calls));
                                     send_done("tool_calls");
                                 } else {
+                                    std::string preview = split.content.empty()
+                                        ? framed : split.content;
+                                    if (preview.size() > 240) {
+                                        preview.resize(240);
+                                    }
+                                    std::replace(preview.begin(), preview.end(),
+                                                 '\n', ' ');
+                                    std::cerr << "[qw3-serve] #" << rid
+                                              << " tool_parse_empty preview="
+                                              << dump_json(preview) << "\n";
                                     if (!split.content.empty()) {
                                         send_delta(json{{"content", split.content}});
                                     }
@@ -1005,6 +1161,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         std::string finish = stopped ? "stop" : "stop";
         if (!tool_calls.empty()) {
+            std::cerr << "[qw3-serve] #" << rid
+                      << " tool_calls=" << tool_calls_debug_summary(tool_calls)
+                      << "\n";
             message["tool_calls"] = tool_calls;
             finish = "tool_calls";
         }
