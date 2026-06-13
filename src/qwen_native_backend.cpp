@@ -280,6 +280,10 @@ bool continuous_batching_ragged_prefill_executor_enabled() {
                             true);
 }
 
+bool continuous_batching_mtp_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_BATCHING_MTP", true);
+}
+
 uint32_t continuous_batching_ragged_prefill_min_tokens() {
     return std::max<uint32_t>(
         1, env_uint32_or("QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_MIN_TOKENS",
@@ -1035,7 +1039,10 @@ public:
         const bool trace_mtp = options_.native_mtp_trace || mtp_trace_enabled();
         const bool active_mtp = trace_mtp || spec_mtp;
 
-        if (effective_options.continuous_batching && !active_mtp &&
+        const bool route_continuous =
+            effective_options.continuous_batching &&
+            (!active_mtp || continuous_batching_mtp_enabled());
+        if (route_continuous &&
             continuous_batch_request_supported(effective_options, dump.get())) {
             return generate_continuous_batched(prompt_tokens, effective_options, on_text);
         }
@@ -1064,6 +1071,9 @@ private:
         TokenCallback on_text;
         uint64_t reserved_tokens = 0;
         bool budget_released = false;
+        bool spec_mtp = false;
+        bool trace_mtp = false;
+        bool active_mtp = false;
 
         std::mutex mu;
         std::condition_variable cv;
@@ -2901,6 +2911,9 @@ private:
         req->prompt_tokens = prompt_tokens;
         req->options = options;
         req->on_text = on_text;
+        req->spec_mtp = mtp_speculate_enabled(options_);
+        req->trace_mtp = options_.native_mtp_trace || mtp_trace_enabled();
+        req->active_mtp = req->spec_mtp || req->trace_mtp;
         req->reserved_tokens =
             static_cast<uint64_t>(prompt_tokens.size()) +
             static_cast<uint64_t>(std::max(0, options.max_tokens));
@@ -2911,6 +2924,7 @@ private:
                 << " prompt_tokens=" << prompt_tokens.size()
                 << " max_tokens=" << options.max_tokens
                 << " ignore_eos=" << (options.ignore_eos ? "true" : "false")
+                << " active_mtp=" << (req->active_mtp ? "true" : "false")
                 << " reserved_tokens=" << req->reserved_tokens;
             log(msg.str());
         }
@@ -3102,6 +3116,13 @@ private:
                 while (!arrivals.empty() &&
                        active.size() + prefilling.size() < max_active) {
                     auto req = arrivals.front();
+                    if (req && req->active_mtp) {
+                        if (active.empty() && prefilling.empty()) {
+                            arrivals.pop_front();
+                            run_continuous_mtp_request(req, ctx_size);
+                        }
+                        break;
+                    }
                     arrivals.pop_front();
                     try {
                         ContinuousBatchActive a;
@@ -3159,6 +3180,37 @@ private:
             }
             log(std::string("native continuous_batching: worker_failed reason=\"") +
                 e.what() + "\"");
+        }
+    }
+
+    void run_continuous_mtp_request(
+            const std::shared_ptr<ContinuousBatchRequest> &req,
+            uint32_t ctx_size) {
+        if (!req) return;
+        try {
+            if (continuous_batching_trace_enabled()) {
+                std::ostringstream msg;
+                msg << "native continuous_mtp:"
+                    << " request=" << req->id
+                    << " prompt_tokens=" << req->prompt_tokens.size()
+                    << " max_tokens=" << req->options.max_tokens
+                    << " spec=" << (req->spec_mtp ? "true" : "false")
+                    << " trace=" << (req->trace_mtp ? "true" : "false")
+                    << " mode=single_request_barrier";
+                log(msg.str());
+            }
+            auto executor = std::make_unique<QwenExecutor>(
+                *model_, *weights_, *device_, ctx_size,
+                cb_kv_pool_.get(), &cb_kv_cache_view_);
+            executor->set_prefill_chunk_override(options_.prefill_chunk);
+            std::vector<uint32_t> prompt = req->prompt_tokens;
+            std::string generated = generate_mtp(
+                prompt, req->options, req->on_text, nullptr,
+                req->spec_mtp, req->trace_mtp, executor.get(),
+                /*manage_device_scope=*/false);
+            complete_continuous_request(req, std::move(generated));
+        } catch (const std::exception &e) {
+            complete_continuous_request(req, {}, e.what());
         }
     }
 
@@ -4120,9 +4172,17 @@ private:
                              const TokenCallback &on_text,
                              DumpStream *dump,
                              bool spec_mtp,
-                             bool trace_mtp) {
-        DeviceStatus st = device_->begin();
-        if (!st.ok) throw std::runtime_error(st.message);
+                             bool trace_mtp,
+                             QwenExecutor *override_executor = nullptr,
+                             bool manage_device_scope = true) {
+        QwenExecutor *executor_ =
+            override_executor != nullptr ? override_executor : this->executor_.get();
+        if (!executor_) throw std::runtime_error("MTP executor unavailable");
+        DeviceStatus st;
+        if (manage_device_scope) {
+            st = device_->begin();
+            if (!st.ok) throw std::runtime_error(st.message);
+        }
         executor_->reset_state();
 
         const uint32_t requested_mtp_chain_len = mtp_trace_chain_len(options_);
@@ -4825,8 +4885,10 @@ private:
         }
         const double t_decode_end = wall_seconds();
 
-        st = device_->end();
-        if (!st.ok) throw std::runtime_error(st.message);
+        if (manage_device_scope) {
+            st = device_->end();
+            if (!st.ok) throw std::runtime_error(st.message);
+        }
 
         const double prefill_s = std::max(t_prefill_end - t_prefill_start, 1e-9);
         const double decode_s = std::max(t_decode_end - t_prefill_end, 1e-9);
