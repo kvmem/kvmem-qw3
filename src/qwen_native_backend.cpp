@@ -3437,6 +3437,7 @@ private:
             double replay_s = 0.0;
             double prefix_s = 0.0;
             double decode_start = 0.0;
+            MtpAdaptivePolicy policy;
         };
         std::vector<ContinuousBatchActive> mtp_active;
         std::vector<MtpStats> stats;
@@ -3522,6 +3523,35 @@ private:
                     mtp_active.push_back(std::move(a));
                     stats.emplace_back();
                     stats.back().decode_start = wall_seconds();
+                    stats.back().policy.configure(
+                        true, chain_len, req->prompt_tokens.size());
+                    if (stats.back().policy.enabled) {
+                        const MtpAdaptivePolicy &policy = stats.back().policy;
+                        std::ostringstream policy_msg;
+                        policy_msg << "native mtp_policy_config:"
+                                   << " min=" << policy.min_depth
+                                   << " max=" << policy.max_depth
+                                   << " initial=" << policy.initial_depth
+                                   << " update_interval="
+                                   << policy.update_interval
+                                   << " min_decision_batches="
+                                   << policy.min_decision_batches
+                                   << " cooldown="
+                                   << policy.cooldown_batches
+                                   << " demote_windows="
+                                   << policy.demote_windows
+                                   << " promote_windows="
+                                   << policy.promote_windows
+                                   << " startup_demote_batches="
+                                   << policy.startup_demote_batches
+                                   << " demote_margin="
+                                   << policy.demote_margin
+                                   << " promote_margin="
+                                   << policy.promote_margin
+                                   << " trace="
+                                   << (policy.trace ? "true" : "false");
+                        log(policy_msg.str());
+                    }
                 }
             };
 
@@ -3565,7 +3595,7 @@ private:
                         static_cast<uint32_t>(
                             a.req->options.max_tokens - a.decoded);
                     const uint32_t draft_limit =
-                        std::min<uint32_t>(chain_len, remaining);
+                        stats[row].policy.draft_limit(remaining, chain_len);
                     const double draft0 = wall_seconds();
                     std::vector<NativeExecutorReport> chain =
                         use_device_draft
@@ -3749,6 +3779,40 @@ private:
                                 break;
                             }
                         }
+                        const char *policy_action = s.policy.update(
+                            static_cast<uint32_t>(job.drafts.size()),
+                            accepted,
+                            a.req
+                                ? a.req->prompt_tokens.size() +
+                                      static_cast<size_t>(a.decoded)
+                                : 0);
+                        if (s.policy.enabled && s.policy.trace) {
+                            std::ostringstream policy_msg;
+                            policy_msg << "native mtp_policy:"
+                                       << " batch=" << s.verify_batches
+                                       << " ctx="
+                                       << (a.req
+                                               ? a.req->prompt_tokens.size() +
+                                                     static_cast<size_t>(
+                                                         a.decoded)
+                                               : 0)
+                                       << " drafted=" << job.drafts.size()
+                                       << " accepted=" << accepted
+                                       << " depth=" << s.policy.depth
+                                       << " action=" << policy_action
+                                       << " window_batches="
+                                       << s.policy.window_batches
+                                       << " avg_committed=" << std::fixed
+                                       << std::setprecision(4)
+                                       << s.policy.last_avg_committed
+                                       << " full_rate="
+                                       << s.policy.last_full_rate
+                                       << " benefit=" << s.policy.last_benefit
+                                       << " cost=" << s.policy.last_cost
+                                       << " next_cost="
+                                       << s.policy.last_next_cost;
+                            log(policy_msg.str());
+                        }
                         const bool all_accepted =
                             accepted == job.drafts.size();
                         if (all_accepted) {
@@ -3850,7 +3914,9 @@ private:
                                 << " accepted=" << s.accepted
                                 << " rejected=" << s.rejected
                                 << " rollbacks=" << s.rollbacks
-                                << " adaptive=false promotions=0"
+                                << " adaptive="
+                                << (s.policy.enabled ? "true" : "false")
+                                << " promotions=" << s.policy.promotions
                                 << " reject_budget=off fallback=false"
                                 << " acceptance=" << std::fixed
                                 << std::setprecision(4)
