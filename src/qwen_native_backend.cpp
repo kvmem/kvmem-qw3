@@ -1148,6 +1148,7 @@ private:
         std::vector<int32_t> logical_positions;
         std::vector<int32_t> last_page_len;
         std::vector<int32_t> seq_lens;
+        std::vector<uint32_t> token_rows;
         uint64_t total_tokens = 0;
         uint32_t final_chunks = 0;
         uint32_t page_size = 0;
@@ -1155,6 +1156,7 @@ private:
         bool ragged_metadata_ready = false;
         bool ragged_device_metadata_ready = false;
         bool ragged_row_metadata_ready = false;
+        bool collect_row_argmaxes = false;
         bool recurrent_state_ready = false;
         bool recurrent_state_packed = false;
         bool recurrent_state_unpacked = false;
@@ -1169,6 +1171,7 @@ private:
             logical_positions.clear();
             last_page_len.clear();
             seq_lens.clear();
+            token_rows.clear();
             total_tokens = 0;
             final_chunks = 0;
             page_size = 0;
@@ -1176,6 +1179,7 @@ private:
             ragged_metadata_ready = false;
             ragged_device_metadata_ready = false;
             ragged_row_metadata_ready = false;
+            collect_row_argmaxes = false;
             recurrent_state_ready = false;
             recurrent_state_packed = false;
             recurrent_state_unpacked = false;
@@ -1227,6 +1231,7 @@ private:
         bool final_chunk = false;
         double seconds = 0.0;
         NativeExecutorReport report;
+        std::vector<DeviceArgmax> row_argmaxes;
         std::string error;
 
         bool ok() const { return error.empty() && report.ok; }
@@ -1347,7 +1352,7 @@ private:
                 const BatchedPrefillDeviceMetadata &metadata) const {
             if (!continuous_batching_ragged_prefill_executor_enabled()) return false;
             if (batch.size() < 2 || batch.total_tokens == 0) return false;
-            if (batch.total_tokens <
+            if (!batch.collect_row_argmaxes && batch.total_tokens <
                 continuous_batching_ragged_prefill_min_tokens()) {
                 return false;
             }
@@ -1536,7 +1541,9 @@ private:
                 const double t_prepare0 = wall_seconds();
                 const uint32_t bsz = static_cast<uint32_t>(batch.size());
                 const uint32_t total_q = static_cast<uint32_t>(batch.total_tokens);
-                const uint32_t final_rows = std::max<uint32_t>(batch.final_chunks, 1);
+                const uint32_t final_rows = batch.collect_row_argmaxes
+                    ? std::max<uint32_t>(total_q, 1)
+                    : std::max<uint32_t>(batch.final_chunks, 1);
                 const QwenConfig &cfg = model_.config();
                 const uint32_t hidden = cfg.n_embd;
                 const uint32_t vocab =
@@ -1558,14 +1565,13 @@ private:
                 std::vector<uint64_t> rows_h(total_q, 0);
                 for (uint32_t req = 0; req < bsz; ++req) {
                     const ContinuousPrefillBatchEntry &entry = batch.entries[req];
-                    const ContinuousBatchActive &a =
-                        prefilling[entry.prefill_index];
-                    const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
                     const uint32_t row_begin =
                         static_cast<uint32_t>(batch.q_indptr[req]);
                     for (uint32_t t = 0; t < entry.chunk; ++t) {
-                        rows_h[row_begin + t] =
-                            prompt[entry.offset + t];
+                        rows_h[row_begin + t] = !batch.token_rows.empty()
+                            ? batch.token_rows[row_begin + t]
+                            : prefilling[entry.prefill_index]
+                                  .req->prompt_tokens[entry.offset + t];
                     }
                 }
                 require_ok(backend_.q8_0_get_rows_batch(
@@ -1827,7 +1833,16 @@ private:
                     }
                 }
                 std::vector<DeviceArgmax> argmaxes;
-                if (final_row > 0) {
+                if (batch.collect_row_argmaxes) {
+                    require_ok(backend_.rms_norm_batch(
+                        *final_norm_batch_, *hidden_batch_,
+                        weights_.output_norm(), total_q, hidden, eps));
+                    require_ok(backend_.q8_0_matmul(
+                        *final_logits_batch_, weights_.output(),
+                        *final_norm_batch_, total_q, hidden, vocab));
+                    require_ok(backend_.argmax_batch(
+                        *final_logits_batch_, total_q, vocab, argmaxes));
+                } else if (final_row > 0) {
                     require_ok(backend_.rms_norm_batch(
                         *final_norm_batch_, *final_hidden_batch_,
                         weights_.output_norm(), final_row, hidden, eps));
@@ -1855,15 +1870,38 @@ private:
                     a.prefill_offset += outputs[row].chunk;
                     a.kv_state.update(a.executor->kv_state_snapshot());
                 }
-                for (uint32_t i = 0; i < final_output_rows.size() &&
-                                     i < argmaxes.size(); ++i) {
-                    BatchedPrefillOutput &out =
-                        outputs[final_output_rows[i]];
-                    out.report.argmax_token = argmaxes[i].token;
-                    out.report.argmax_logit = argmaxes[i].logit;
-                    out.report.argmax_text =
-                        model_.gguf().token_text(
-                            static_cast<uint32_t>(argmaxes[i].token));
+                if (batch.collect_row_argmaxes) {
+                    for (uint32_t row = 0; row < bsz; ++row) {
+                        const uint32_t begin =
+                            static_cast<uint32_t>(batch.q_indptr[row]);
+                        const uint32_t end =
+                            static_cast<uint32_t>(batch.q_indptr[row + 1]);
+                        BatchedPrefillOutput &out = outputs[row];
+                        if (begin < end && end <= argmaxes.size()) {
+                            out.row_argmaxes.assign(
+                                argmaxes.begin() +
+                                    static_cast<std::ptrdiff_t>(begin),
+                                argmaxes.begin() +
+                                    static_cast<std::ptrdiff_t>(end));
+                            const DeviceArgmax &last = out.row_argmaxes.back();
+                            out.report.argmax_token = last.token;
+                            out.report.argmax_logit = last.logit;
+                            out.report.argmax_text =
+                                model_.gguf().token_text(
+                                    static_cast<uint32_t>(last.token));
+                        }
+                    }
+                } else {
+                    for (uint32_t i = 0; i < final_output_rows.size() &&
+                                         i < argmaxes.size(); ++i) {
+                        BatchedPrefillOutput &out =
+                            outputs[final_output_rows[i]];
+                        out.report.argmax_token = argmaxes[i].token;
+                        out.report.argmax_logit = argmaxes[i].logit;
+                        out.report.argmax_text =
+                            model_.gguf().token_text(
+                                static_cast<uint32_t>(argmaxes[i].token));
+                    }
                 }
                 const double t_post1 = wall_seconds();
                 last_timing_.prepare_s =
