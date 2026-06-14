@@ -280,6 +280,12 @@ bool continuous_batching_ragged_prefill_executor_enabled() {
                             true);
 }
 
+uint32_t continuous_batching_mtp_ragged_verify_min_tokens() {
+    return std::max<uint32_t>(
+        1, env_uint32_or("QW3_CONTINUOUS_BATCHING_MTP_RAGGED_VERIFY_MIN_TOKENS",
+                         16));
+}
+
 bool continuous_batching_mtp_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_MTP", true);
 }
@@ -1379,7 +1385,8 @@ private:
                 if (!a.req || !a.executor) return false;
                 if (request_needs_logits(a.req->options)) return false;
                 if (entry.offset != a.prefill_offset) return false;
-                if (entry.chunk == 0 ||
+                if (entry.chunk == 0) return false;
+                if (!batch.collect_row_argmaxes &&
                     entry.offset + entry.chunk > a.req->prompt_tokens.size()) {
                     return false;
                 }
@@ -3156,8 +3163,22 @@ private:
                     auto req = arrivals.front();
                     if (req && req->active_mtp) {
                         if (active.empty() && prefilling.empty()) {
-                            arrivals.pop_front();
-                            run_continuous_mtp_request(req, ctx_size);
+                            std::vector<std::shared_ptr<ContinuousBatchRequest>>
+                                mtp_reqs;
+                            while (!arrivals.empty() &&
+                                   mtp_reqs.size() < max_active &&
+                                   arrivals.front() &&
+                                   arrivals.front()->active_mtp) {
+                                mtp_reqs.push_back(arrivals.front());
+                                arrivals.pop_front();
+                            }
+                            if (mtp_reqs.size() >= 2) {
+                                run_continuous_mtp_batch_requests(
+                                    mtp_reqs, ctx_size, max_active);
+                            } else if (!mtp_reqs.empty()) {
+                                run_continuous_mtp_request(
+                                    mtp_reqs.front(), ctx_size);
+                            }
                         }
                         break;
                     }
@@ -3249,6 +3270,553 @@ private:
             complete_continuous_request(req, std::move(generated));
         } catch (const std::exception &e) {
             complete_continuous_request(req, {}, e.what());
+        }
+    }
+
+    struct ContinuousMtpVerifyJob {
+        size_t row = 0;
+        uint32_t current = 0;
+        uint32_t base_position = 0;
+        std::vector<uint32_t> drafts;
+        std::vector<uint32_t> verify_tokens;
+        QwenExecutor::StateSnapshot snapshot;
+    };
+
+    void build_continuous_mtp_verify_batch(
+            std::vector<ContinuousBatchActive> &mtp_active,
+            const std::vector<ContinuousMtpVerifyJob> &jobs,
+            ContinuousPrefillBatch &batch) {
+        batch.clear();
+        batch.collect_row_argmaxes = true;
+        if (jobs.empty()) return;
+        batch.entries.reserve(jobs.size());
+        batch.q_indptr.reserve(jobs.size() + 1);
+        batch.page_indptr.reserve(jobs.size() + 1);
+        batch.last_page_len.reserve(jobs.size());
+        batch.seq_lens.reserve(jobs.size());
+        batch.q_indptr.push_back(0);
+        batch.page_indptr.push_back(0);
+        bool all_recurrent_state_ready = true;
+        for (uint32_t row = 0; row < jobs.size(); ++row) {
+            const ContinuousMtpVerifyJob &job = jobs[row];
+            if (job.row >= mtp_active.size()) continue;
+            ContinuousBatchActive &a = mtp_active[job.row];
+            if (!a.executor || job.verify_tokens.empty()) continue;
+            const uint32_t chunk =
+                static_cast<uint32_t>(job.verify_tokens.size());
+            a.prefill_offset = job.base_position;
+            a.executor->prepare_runtime_state();
+            a.executor->prepare_kv_pages(job.base_position, chunk);
+            QwenExecutor::DecodeStateView view =
+                a.executor->decode_state_view();
+
+            ContinuousPrefillBatchEntry entry;
+            entry.prefill_index = job.row;
+            entry.request_id = a.req ? a.req->id : 0;
+            entry.offset = job.base_position;
+            entry.total = job.base_position + chunk;
+            entry.chunk = chunk;
+            entry.final_chunk = true;
+
+            bool entry_recurrent_ready =
+                view.recurrent_states != nullptr &&
+                view.conv_states != nullptr &&
+                view.recurrent_states->size() >= weights_->n_layers() &&
+                view.conv_states->size() >= weights_->n_layers();
+            if (entry_recurrent_ready) {
+                for (uint32_t il = 0; il < weights_->n_layers(); ++il) {
+                    const QwenLayerWeights &layer = weights_->layer(il);
+                    if (!layer.recurrent) continue;
+                    if (!(*view.recurrent_states)[il] ||
+                        !(*view.conv_states)[il]) {
+                        entry_recurrent_ready = false;
+                        break;
+                    }
+                }
+            }
+            all_recurrent_state_ready =
+                all_recurrent_state_ready && entry_recurrent_ready;
+
+            bool entry_metadata_ready =
+                view.kv_page_size > 0 &&
+                view.kv_page_indices_host != nullptr &&
+                view.kv_page_count > 0;
+            if (entry_metadata_ready) {
+                if (batch.page_size == 0) {
+                    batch.page_size = view.kv_page_size;
+                } else if (batch.page_size != view.kv_page_size) {
+                    entry_metadata_ready = false;
+                }
+            }
+            const uint32_t seq_len = job.base_position + chunk;
+            if (entry_metadata_ready) {
+                const uint32_t pages =
+                    (seq_len + view.kv_page_size - 1) / view.kv_page_size;
+                if (pages == 0 || view.kv_page_count < pages) {
+                    entry_metadata_ready = false;
+                } else {
+                    const int32_t request_page_begin =
+                        static_cast<int32_t>(batch.page_indices.size());
+                    for (uint32_t p = 0; p < pages; ++p) {
+                        batch.page_indices.push_back(
+                            view.kv_page_indices_host[p]);
+                    }
+                    for (uint32_t t = 0; t < chunk; ++t) {
+                        batch.logical_positions.push_back(
+                            static_cast<int32_t>(job.base_position + t));
+                        batch.row_page_indptr.push_back(request_page_begin);
+                        batch.token_rows.push_back(job.verify_tokens[t]);
+                    }
+                    const uint32_t last_len = seq_len % view.kv_page_size;
+                    batch.last_page_len.push_back(static_cast<int32_t>(
+                        last_len == 0 ? view.kv_page_size : last_len));
+                    batch.seq_lens.push_back(static_cast<int32_t>(seq_len));
+                    batch.max_seq_len = std::max(batch.max_seq_len, seq_len);
+                }
+            }
+            if (!entry_metadata_ready) {
+                batch.clear();
+                batch.collect_row_argmaxes = true;
+                return;
+            }
+            batch.total_tokens += chunk;
+            ++batch.final_chunks;
+            batch.entries.push_back(entry);
+            batch.q_indptr.push_back(static_cast<int32_t>(batch.total_tokens));
+            batch.page_indptr.push_back(
+                static_cast<int32_t>(batch.page_indices.size()));
+        }
+        if (!batch.row_page_indptr.empty()) {
+            batch.row_page_indptr.push_back(
+                static_cast<int32_t>(batch.page_indices.size()));
+        }
+        batch.recurrent_state_ready =
+            batch.size() > 0 && all_recurrent_state_ready;
+        batch.ragged_metadata_ready =
+            batch.size() > 0 &&
+            batch.q_indptr.size() == batch.size() + 1 &&
+            batch.page_indptr.size() == batch.size() + 1 &&
+            batch.logical_positions.size() == batch.total_tokens &&
+            batch.token_rows.size() == batch.total_tokens &&
+            batch.row_page_indptr.size() == batch.total_tokens + 1 &&
+            batch.last_page_len.size() == batch.size() &&
+            batch.seq_lens.size() == batch.size() &&
+            !batch.page_indices.empty() &&
+            batch.page_size > 0;
+        batch.ragged_row_metadata_ready = batch.ragged_metadata_ready;
+    }
+
+    void run_continuous_mtp_batch_requests(
+            const std::vector<std::shared_ptr<ContinuousBatchRequest>> &reqs,
+            uint32_t ctx_size,
+            uint32_t max_active) {
+        if (reqs.empty()) return;
+        const int32_t eos = tokenizer_->eos_id();
+        const uint32_t requested_chain = mtp_trace_chain_len(options_);
+        const uint32_t chain_len =
+            std::min<uint32_t>(requested_chain, mtp_safe_chain_max());
+        const uint32_t state_checkpoint_count = 0;
+        const bool use_device_draft =
+            mtp_device_draft_chain_enabled() && !mtp_verify_trace_enabled();
+        struct MtpStats {
+            uint64_t drafted = 0;
+            uint64_t accepted = 0;
+            uint64_t rejected = 0;
+            uint64_t rollbacks = 0;
+            uint64_t verify_batches = 0;
+            uint64_t verify_tokens = 0;
+            uint64_t decode_ops = 0;
+            double decode_start = 0.0;
+        };
+        std::vector<ContinuousBatchActive> mtp_active;
+        std::vector<MtpStats> stats;
+        mtp_active.reserve(reqs.size());
+        stats.reserve(reqs.size());
+
+        auto should_stop = [&](const ContinuousBatchActive &a,
+                               uint32_t token) {
+            return a.req && !a.req->options.ignore_eos &&
+                   token == static_cast<uint32_t>(eos);
+        };
+        auto emit = [&](ContinuousBatchActive &a, uint32_t token) {
+            if (!a.req || a.decoded >= a.req->options.max_tokens ||
+                should_stop(a, token)) {
+                return false;
+            }
+            const std::string piece =
+                tokenizer_->decode_one(static_cast<int32_t>(token));
+            a.req->generated += piece;
+            if (a.req->on_text) a.req->on_text(piece);
+            ++a.decoded;
+            return true;
+        };
+
+        auto admit_mtp_request =
+            [&](const std::shared_ptr<ContinuousBatchRequest> &req) {
+                if (!req || !req->spec_mtp || req->trace_mtp) {
+                    run_continuous_mtp_request(req, ctx_size);
+                    return;
+                }
+                ContinuousBatchActive a;
+                initialize_continuous_active(a, req, ctx_size);
+                if (continuous_batching_trace_enabled()) {
+                    std::ostringstream msg;
+                    msg << "native continuous_mtp:"
+                        << " request=" << req->id
+                        << " prompt_tokens=" << req->prompt_tokens.size()
+                        << " max_tokens=" << req->options.max_tokens
+                        << " spec=true trace=false"
+                        << " mode=batched_verify";
+                    log(msg.str());
+                }
+                constexpr uint32_t kMtpPrefillChunk = 4096;
+                a.executor->set_prefill_chunk_override(
+                    static_cast<int>(kMtpPrefillChunk));
+                NativeExecutorReport step;
+                uint64_t prefill_ops = 0;
+                for (size_t offset = 0; offset < req->prompt_tokens.size();
+                     offset += kMtpPrefillChunk) {
+                    const size_t end = std::min(
+                        req->prompt_tokens.size(),
+                        offset + static_cast<size_t>(kMtpPrefillChunk));
+                    std::vector<uint32_t> chunk(
+                        req->prompt_tokens.begin() +
+                            static_cast<std::ptrdiff_t>(offset),
+                        req->prompt_tokens.begin() +
+                            static_cast<std::ptrdiff_t>(end));
+                    const bool need_logits = end == req->prompt_tokens.size();
+                    step = a.executor->forward_n_tokens(chunk, need_logits);
+                    if (!step.ok) throw std::runtime_error("MTP prefill failed");
+                    prefill_ops += step.ops_executed;
+                    NativeExecutorReport prefix =
+                        a.executor->prime_mtp_prefix_from_last_batch(
+                            chunk, static_cast<uint32_t>(offset));
+                    if (!prefix.ok) {
+                        throw std::runtime_error(
+                            "MTP prefix priming failed in batched lane");
+                    }
+                }
+                a.prefill_ops = prefill_ops;
+                a.next_token = step.argmax_token >= 0
+                    ? static_cast<uint32_t>(step.argmax_token)
+                    : static_cast<uint32_t>(eos);
+                a.decode_start = wall_seconds();
+                if (req->options.max_tokens > 0 &&
+                    !should_stop(a, a.next_token)) {
+                    emit(a, a.next_token);
+                }
+                if (a.decoded >= req->options.max_tokens ||
+                    should_stop(a, a.next_token)) {
+                    finish_continuous_active(a);
+                } else {
+                    mtp_active.push_back(std::move(a));
+                    stats.emplace_back();
+                    stats.back().decode_start = wall_seconds();
+                }
+            };
+
+        try {
+            for (const auto &req : reqs) {
+                admit_mtp_request(req);
+            }
+
+            while (mtp_active.size() < max_active) {
+                std::shared_ptr<ContinuousBatchRequest> req;
+                {
+                    std::lock_guard<std::mutex> lk(cb_mu_);
+                    if (cb_pending_.empty() || !cb_pending_.front() ||
+                        !cb_pending_.front()->active_mtp ||
+                        !cb_pending_.front()->spec_mtp ||
+                        cb_pending_.front()->trace_mtp) {
+                        break;
+                    }
+                    req = cb_pending_.front();
+                    cb_pending_.pop_front();
+                }
+                admit_mtp_request(req);
+            }
+
+            if (!cb_prefill_executor_) {
+                cb_prefill_executor_ =
+                    std::make_unique<BatchedPrefillExecutor>(
+                        *model_, *weights_, *device_);
+            }
+            while (!mtp_active.empty()) {
+                std::vector<ContinuousMtpVerifyJob> jobs;
+                jobs.reserve(mtp_active.size());
+                for (size_t row = 0; row < mtp_active.size(); ++row) {
+                    ContinuousBatchActive &a = mtp_active[row];
+                    if (!a.req || a.decoded >= a.req->options.max_tokens ||
+                        should_stop(a, a.next_token)) {
+                        continue;
+                    }
+                    const uint32_t current = a.next_token;
+                    const uint32_t remaining =
+                        static_cast<uint32_t>(
+                            a.req->options.max_tokens - a.decoded);
+                    const uint32_t draft_limit =
+                        std::min<uint32_t>(chain_len, remaining);
+                    std::vector<NativeExecutorReport> chain =
+                        use_device_draft
+                            ? a.executor->forward_mtp_draft_chain_with_prefix_device(
+                                  current, draft_limit)
+                            : a.executor->forward_mtp_draft_chain_with_prefix(
+                                  current, draft_limit);
+                    ContinuousMtpVerifyJob job;
+                    job.row = row;
+                    job.current = current;
+                    job.base_position = a.executor->position();
+                    a.executor->capture_state(job.snapshot);
+                    job.verify_tokens.push_back(current);
+                    for (const NativeExecutorReport &draft : chain) {
+                        if (!draft.ok || draft.argmax_token < 0) break;
+                        const uint32_t token =
+                            static_cast<uint32_t>(draft.argmax_token);
+                        if (should_stop(a, token)) break;
+                        job.drafts.push_back(token);
+                        job.verify_tokens.push_back(token);
+                        stats[row].drafted += 1;
+                    }
+                    if (!job.drafts.empty()) {
+                        jobs.push_back(std::move(job));
+                    } else {
+                        NativeExecutorReport step =
+                            a.executor->forward_one_token(current);
+                        if (!step.ok) {
+                            throw std::runtime_error("MTP fallback decode failed");
+                        }
+                        stats[row].decode_ops += step.ops_executed;
+                        a.executor->commit_mtp_prefix(a.executor->position());
+                        a.next_token = step.argmax_token >= 0
+                            ? static_cast<uint32_t>(step.argmax_token)
+                            : static_cast<uint32_t>(eos);
+                        emit(a, a.next_token);
+                    }
+                }
+                if (!jobs.empty()) {
+                    std::vector<BatchedPrefillOutput> outputs;
+                    outputs.reserve(jobs.size());
+                    auto run_single_verifier =
+                        [&](const ContinuousMtpVerifyJob &job) {
+                            BatchedPrefillOutput out;
+                            out.prefill_index = job.row;
+                            out.request_id =
+                                mtp_active[job.row].req
+                                    ? mtp_active[job.row].req->id
+                                    : 0;
+                            out.offset = job.base_position;
+                            out.total = job.base_position +
+                                        static_cast<uint32_t>(
+                                            job.verify_tokens.size());
+                            out.chunk =
+                                static_cast<uint32_t>(
+                                    job.verify_tokens.size());
+                            out.final_chunk = true;
+                            out.report =
+                                mtp_active[job.row].executor->forward_n_tokens(
+                                    job.verify_tokens, true,
+                                    &out.row_argmaxes, nullptr, 0,
+                                    /*copy_last_logits=*/false);
+                            if (!out.report.ok) {
+                                out.error = "MTP single verifier failed";
+                            }
+                            return out;
+                        };
+                    if (jobs.size() == 1) {
+                        const ContinuousMtpVerifyJob &job = jobs.front();
+                        outputs.push_back(run_single_verifier(job));
+                    } else {
+                        ContinuousPrefillBatch batch;
+                        build_continuous_mtp_verify_batch(
+                            mtp_active, jobs, batch);
+                        const bool try_ragged_verify =
+                            batch.ragged_metadata_ready &&
+                            batch.total_tokens >=
+                                continuous_batching_mtp_ragged_verify_min_tokens();
+                        if (try_ragged_verify) {
+                            prepare_continuous_prefill_ragged_metadata_device(
+                                batch);
+                            BatchedPrefillDeviceMetadata metadata;
+                            metadata.q_indptr = cb_prefill_q_indptr_i32_.get();
+                            metadata.page_indptr =
+                                cb_prefill_page_indptr_i32_.get();
+                            metadata.row_page_indptr =
+                                cb_prefill_row_page_indptr_i32_.get();
+                            metadata.page_indices =
+                                cb_prefill_page_indices_i32_.get();
+                            metadata.logical_positions =
+                                cb_prefill_logical_positions_i32_.get();
+                            metadata.last_page_len =
+                                cb_prefill_last_page_len_i32_.get();
+                            metadata.seq_lens = cb_prefill_seq_lens_i32_.get();
+                            outputs = cb_prefill_executor_->prefill(
+                                mtp_active, batch, metadata);
+                        }
+                        bool need_single_fallback =
+                            outputs.size() != jobs.size();
+                        if (!need_single_fallback) {
+                            for (const BatchedPrefillOutput &out : outputs) {
+                                if (!out.ok()) {
+                                    need_single_fallback = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (need_single_fallback) {
+                            for (const ContinuousMtpVerifyJob &job : jobs) {
+                                if (job.row < mtp_active.size()) {
+                                    mtp_active[job.row].executor->restore_state(
+                                        job.snapshot);
+                                }
+                            }
+                            outputs.clear();
+                            outputs.reserve(jobs.size());
+                            for (const ContinuousMtpVerifyJob &job : jobs) {
+                                outputs.push_back(run_single_verifier(job));
+                            }
+                        }
+                    }
+                    for (uint32_t j = 0; j < jobs.size(); ++j) {
+                        const ContinuousMtpVerifyJob &job = jobs[j];
+                        ContinuousBatchActive &a = mtp_active[job.row];
+                        MtpStats &s = stats[job.row];
+                        if (j >= outputs.size() || !outputs[j].ok() ||
+                            outputs[j].row_argmaxes.size() !=
+                                job.verify_tokens.size()) {
+                            throw std::runtime_error(
+                                "MTP batched verifier failed");
+                        }
+                        const auto &row_argmaxes = outputs[j].row_argmaxes;
+                        s.verify_batches += 1;
+                        s.verify_tokens += row_argmaxes.size();
+                        s.decode_ops += outputs[j].report.ops_executed;
+                        uint32_t accepted = 0;
+                        int32_t target = eos;
+                        for (uint32_t i = 0; i < job.drafts.size(); ++i) {
+                            target = row_argmaxes[i].token >= 0
+                                ? row_argmaxes[i].token
+                                : eos;
+                            if (target == static_cast<int32_t>(job.drafts[i])) {
+                                ++accepted;
+                                ++s.accepted;
+                            } else {
+                                ++s.rejected;
+                                break;
+                            }
+                        }
+                        const bool all_accepted =
+                            accepted == job.drafts.size();
+                        if (all_accepted) {
+                            if (mtp_rebuild_accepted_prefix_enabled()) {
+                                NativeExecutorReport prefix =
+                                    a.executor->prime_mtp_prefix_from_last_batch(
+                                        job.verify_tokens, job.base_position,
+                                        mtp_prefix_rebuild_batch_min_tokens());
+                                if (!prefix.ok) {
+                                    const std::string reason =
+                                        prefix.missing_kernels.empty()
+                                            ? "unknown"
+                                            : prefix.missing_kernels.front();
+                                    throw std::runtime_error(
+                                        "MTP batched verifier prefix rebuild failed: " +
+                                        reason);
+                                }
+                                s.decode_ops += prefix.ops_executed;
+                            } else {
+                                a.executor->commit_mtp_prefix(
+                                    a.executor->position());
+                            }
+                        } else {
+                            a.executor->restore_state(job.snapshot);
+                            std::vector<uint32_t> replay;
+                            replay.reserve(accepted + 1);
+                            replay.push_back(job.current);
+                            for (uint32_t i = 0; i < accepted; ++i) {
+                                replay.push_back(job.drafts[i]);
+                            }
+                            double prefix_seconds = 0.0;
+                            uint64_t prefix_ops = 0;
+                            NativeExecutorReport replay_report =
+                                a.executor->replay_tokens_with_mtp_prefix(
+                                    replay, job.base_position,
+                                    mtp_rebuild_accepted_prefix_enabled(),
+                                    &prefix_seconds, &prefix_ops);
+                            (void)prefix_seconds;
+                            if (!replay_report.ok) {
+                                throw std::runtime_error(
+                                    "MTP batched verifier replay failed");
+                            }
+                            s.decode_ops +=
+                                replay_report.ops_executed + prefix_ops;
+                            ++s.rollbacks;
+                        }
+                        for (uint32_t i = 0; i < accepted; ++i) {
+                            if (!emit(a, job.drafts[i])) break;
+                        }
+                        if (a.decoded >= a.req->options.max_tokens) continue;
+                        if (all_accepted) {
+                            target = row_argmaxes[job.drafts.size()].token >= 0
+                                ? row_argmaxes[job.drafts.size()].token
+                                : eos;
+                        }
+                        a.next_token = static_cast<uint32_t>(target);
+                        emit(a, a.next_token);
+                    }
+                }
+                for (size_t i = mtp_active.size(); i > 0; --i) {
+                    ContinuousBatchActive &a = mtp_active[i - 1];
+                    if (!a.req || a.decoded >= a.req->options.max_tokens ||
+                        should_stop(a, a.next_token)) {
+                        const MtpStats s = stats[i - 1];
+                        const double decode_s =
+                            std::max(wall_seconds() - s.decode_start, 1e-9);
+                        std::ostringstream summary;
+                        summary << "native mtp_spec_summary:"
+                                << " enabled=true"
+                                << " batches=" << s.verify_batches
+                                << " drafted=" << s.drafted
+                                << " accepted=" << s.accepted
+                                << " rejected=" << s.rejected
+                                << " rollbacks=" << s.rollbacks
+                                << " adaptive=false promotions=0"
+                                << " reject_budget=off fallback=false"
+                                << " acceptance=" << std::fixed
+                                << std::setprecision(4)
+                                << (s.drafted > 0
+                                        ? static_cast<double>(s.accepted) /
+                                              static_cast<double>(s.drafted)
+                                        : 0.0)
+                                << " mtp_ops=0 prefix_tokens=0 prefix_ops=0"
+                                << " prefix1_reuse=0 state_ckpt_reuse=0"
+                                << " state_ckpt_count="
+                                << state_checkpoint_count
+                                << " batched_verify_batches="
+                                << s.verify_batches
+                                << " batched_verify_tokens="
+                                << s.verify_tokens;
+                        log(summary.str());
+                        log("native generate: prompt_tokens=" +
+                            std::to_string(a.req->prompt_tokens.size()) +
+                            " prefill=0.000s decoded=" +
+                            std::to_string(a.decoded) +
+                            " decode=" + fmt_seconds(decode_s));
+                        finish_continuous_active(a);
+                        mtp_active.erase(mtp_active.begin() +
+                                         static_cast<std::ptrdiff_t>(i - 1));
+                        stats.erase(stats.begin() +
+                                    static_cast<std::ptrdiff_t>(i - 1));
+                    }
+                }
+            }
+        } catch (const std::exception &e) {
+            for (auto &a : mtp_active) {
+                if (a.req) complete_continuous_request(a.req, {}, e.what());
+            }
+            for (const auto &req : reqs) {
+                if (req && !req->done) {
+                    complete_continuous_request(req, {}, e.what());
+                }
+            }
         }
     }
 
