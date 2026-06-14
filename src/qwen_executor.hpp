@@ -42,6 +42,8 @@ public:
     struct StateSnapshot {
         bool ready = false;
         uint32_t position = 0;
+        uint32_t kv_logical_pages = 0;
+        uint32_t mtp_prefix_len = 0;
         std::unique_ptr<DeviceTensor> h;
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
         std::vector<std::unique_ptr<DeviceTensor>> conv_states;
@@ -196,6 +198,7 @@ private:
         void reset();
         void ensure_pages(DeviceBackend &backend, uint32_t ctx_size,
                           uint32_t logical_pos, uint32_t count);
+        void truncate_to_logical_pages(uint32_t logical_pages);
         int32_t allocate_physical_page(uint32_t logical_page) const;
         const int32_t *host_indices() const { return pages.data(); }
         const DeviceTensor &device_indices() const { return *device_pages; }

@@ -4340,6 +4340,8 @@ private:
         uint64_t mtp_spec_rollbacks = 0;
         uint64_t mtp_spec_prefix1_reused = 0;
         uint64_t mtp_spec_state_checkpoint_reused = 0;
+        uint64_t mtp_spec_batched_verify_batches = 0;
+        uint64_t mtp_spec_batched_verify_tokens = 0;
         std::vector<uint64_t> mtp_accept_len_hist(mtp_chain_len + 1, 0);
         double mtp_spec_draft_s = 0.0;
         double mtp_spec_snapshot_s = 0.0;
@@ -4690,6 +4692,8 @@ private:
                         state_checkpoint_count > 0 ? &mtp_spec_state_checkpoints : nullptr,
                         state_checkpoint_count,
                         /*copy_last_logits=*/!mtp_skip_verify_logits_copy_enabled());
+                    ++mtp_spec_batched_verify_batches;
+                    mtp_spec_batched_verify_tokens += verify_tokens.size();
                     if (trace_mtp_verify) {
                         accumulate_trace(mtp_verify_trace, step);
                         mtp_verify_trace_steps += verify_tokens.size();
@@ -4941,6 +4945,10 @@ private:
                          << " prefix1_reuse=" << mtp_spec_prefix1_reused
                          << " state_ckpt_reuse=" << mtp_spec_state_checkpoint_reused
                          << " state_ckpt_count=" << state_checkpoint_count
+                         << " batched_verify_batches="
+                         << mtp_spec_batched_verify_batches
+                         << " batched_verify_tokens="
+                         << mtp_spec_batched_verify_tokens
                          << " draft_s=" << fmt_seconds(mtp_spec_draft_s)
                          << " snapshot_s=" << fmt_seconds(mtp_spec_snapshot_s)
                          << " verify_s=" << fmt_seconds(mtp_spec_verify_s)

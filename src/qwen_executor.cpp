@@ -248,6 +248,18 @@ void QwenExecutor::KvPageTable::ensure_pages(DeviceBackend &backend,
     }
 }
 
+void QwenExecutor::KvPageTable::truncate_to_logical_pages(uint32_t logical_pages) {
+    if (logical_pages >= pages.size()) return;
+    std::vector<int32_t> released(
+        pages.begin() + static_cast<std::ptrdiff_t>(logical_pages),
+        pages.end());
+    pages.resize(logical_pages);
+    device_synced = std::min<uint32_t>(device_synced, logical_pages);
+    if (allocator && !released.empty()) {
+        allocator->release_physical_pages(released);
+    }
+}
+
 int32_t QwenExecutor::KvPageTable::allocate_physical_page(uint32_t logical_page) const {
     if (logical_page >= max_pages) {
         throw std::runtime_error("KV physical page allocation exceeded page capacity");
@@ -1602,6 +1614,8 @@ QwenExecutor::StateSnapshot QwenExecutor::snapshot_state() {
 void QwenExecutor::capture_state(StateSnapshot &snapshot) {
     ensure_scratch();
     snapshot.position = position_;
+    snapshot.kv_logical_pages = kv_pages_.count();
+    snapshot.mtp_prefix_len = mtp_prefix_len_;
     if (h_) {
         if (!snapshot.h || snapshot.h->count != h_->count) {
             snapshot.h = backend_.scratch_f32(h_->count, "snapshot_h");
@@ -1662,6 +1676,9 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
         }
     }
     position_ = snapshot.position;
+    kv_pages_.truncate_to_logical_pages(snapshot.kv_logical_pages);
+    mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_,
+                                         snapshot.mtp_prefix_len);
 }
 
 void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoints,
@@ -1697,6 +1714,10 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
         }
     }
     position_ = checkpoints.base_position + index + 1;
+    const uint32_t logical_pages =
+        (position_ + kv_pages_.page_size - 1) / kv_pages_.page_size;
+    kv_pages_.truncate_to_logical_pages(logical_pages);
+    mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_, position_);
 }
 
 NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_current(uint32_t token,
