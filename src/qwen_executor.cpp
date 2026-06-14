@@ -1687,25 +1687,71 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
         throw std::runtime_error("cannot restore an empty QwenExecutor checkpoint");
     }
     ensure_scratch();
-    if (!h_batch_) {
-        throw std::runtime_error("cannot restore checkpoint without batch hidden state");
-    }
     if (h_ && checkpoints.h_stride > 0) {
-        require_status(backend_.copy_d2d(*h_, *h_batch_,
-                                         static_cast<uint64_t>(index) * checkpoints.h_stride,
-                                         h_->count));
+        const DeviceTensor *hidden_source = checkpoints.h_shared
+            ? checkpoints.h_shared.get()
+            : checkpoints.h
+            ? checkpoints.h.get()
+            : h_batch_.get();
+        if (!hidden_source) {
+            throw std::runtime_error(
+                "cannot restore checkpoint without hidden state");
+        }
+        const uint64_t hidden_index =
+            (checkpoints.h_shared
+                 ? static_cast<uint64_t>(checkpoints.h_checkpoint_row)
+                 : 0) +
+            index;
+        require_status(backend_.copy_d2d(
+            *h_, *hidden_source,
+            hidden_index * checkpoints.h_stride,
+            h_->count));
     }
     for (size_t i = 0; i < recurrent_states_.size(); ++i) {
-        if (recurrent_states_[i] && i < checkpoints.recurrent_states.size() &&
-            checkpoints.recurrent_states[i]) {
+        if (recurrent_states_[i] &&
+            i < checkpoints.recurrent_states_shared.size() &&
+            checkpoints.recurrent_states_shared[i]) {
+            const uint64_t state_count = recurrent_states_[i]->count;
+            const uint32_t row_stride =
+                checkpoints.checkpoint_stride > 0
+                    ? checkpoints.checkpoint_stride
+                    : checkpoints.count;
+            const uint64_t src_offset =
+                (static_cast<uint64_t>(checkpoints.checkpoint_row) *
+                     row_stride +
+                 index) *
+                state_count;
+            require_status(backend_.copy_d2d(
+                *recurrent_states_[i],
+                *checkpoints.recurrent_states_shared[i], src_offset,
+                state_count));
+        } else if (recurrent_states_[i] &&
+                   i < checkpoints.recurrent_states.size() &&
+                   checkpoints.recurrent_states[i]) {
             const uint64_t state_count = recurrent_states_[i]->count;
             require_status(backend_.copy_d2d(*recurrent_states_[i],
                                              *checkpoints.recurrent_states[i],
                                              static_cast<uint64_t>(index) * state_count,
                                              state_count));
         }
-        if (conv_states_[i] && i < checkpoints.conv_states.size() &&
-            checkpoints.conv_states[i]) {
+        if (conv_states_[i] &&
+            i < checkpoints.conv_states_shared.size() &&
+            checkpoints.conv_states_shared[i]) {
+            const uint64_t state_count = conv_states_[i]->count;
+            const uint32_t row_stride =
+                checkpoints.checkpoint_stride > 0
+                    ? checkpoints.checkpoint_stride
+                    : checkpoints.count;
+            const uint64_t src_offset =
+                (static_cast<uint64_t>(checkpoints.checkpoint_row) *
+                     row_stride +
+                 index) *
+                state_count;
+            require_status(backend_.copy_d2d(
+                *conv_states_[i], *checkpoints.conv_states_shared[i],
+                src_offset, state_count));
+        } else if (conv_states_[i] && i < checkpoints.conv_states.size() &&
+                   checkpoints.conv_states[i]) {
             const uint64_t state_count = conv_states_[i]->count;
             require_status(backend_.copy_d2d(*conv_states_[i],
                                              *checkpoints.conv_states[i],

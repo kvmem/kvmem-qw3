@@ -53,8 +53,15 @@ public:
         uint32_t base_position = 0;
         uint32_t count = 0;
         uint32_t h_stride = 0;
+        uint32_t checkpoint_stride = 0;
+        uint32_t checkpoint_row = 0;
+        uint32_t h_checkpoint_row = 0;
+        std::unique_ptr<DeviceTensor> h;
+        std::shared_ptr<DeviceTensor> h_shared;
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
         std::vector<std::unique_ptr<DeviceTensor>> conv_states;
+        std::vector<std::shared_ptr<DeviceTensor>> recurrent_states_shared;
+        std::vector<std::shared_ptr<DeviceTensor>> conv_states_shared;
     };
     struct DecodeStateView {
         uint32_t position = 0;

@@ -495,7 +495,10 @@ public:
                                                 uint32_t core_stride,
                                                 uint32_t state_stride,
                                                 uint32_t conv_state_stride,
-                                                float eps) {
+                                                float eps,
+                                                DeviceTensor *state_checkpoints = nullptr,
+                                                DeviceTensor *conv_state_checkpoints = nullptr,
+                                                uint32_t checkpoint_count = 0) {
         (void)core;
         (void)state_batch;
         (void)conv_state_batch;
@@ -526,6 +529,9 @@ public:
         (void)state_stride;
         (void)conv_state_stride;
         (void)eps;
+        (void)state_checkpoints;
+        (void)conv_state_checkpoints;
+        (void)checkpoint_count;
         return {false, "recurrent_batch_ragged requires backend override"};
     }
     virtual DeviceStatus attention_single_token(DeviceTensor &mid,

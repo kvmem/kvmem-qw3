@@ -2068,11 +2068,13 @@ __global__ void recurrent_conv_ragged_batch_kernel(
                                             const float *proj,   // [total_q, *]
                                             const int32_t *q_indptr,
                                             const float *conv_w,
+                                            float *state_checkpoints,
                                             uint32_t B,
                                             uint32_t conv_dim,
                                             uint32_t state_stride,
                                             uint32_t proj_stride,
-                                            uint32_t out_stride) {
+                                            uint32_t out_stride,
+                                            uint32_t checkpoint_count) {
     const uint32_t b = blockIdx.x;
     const uint32_t c = blockIdx.y * blockDim.x + threadIdx.x;
     if (b >= B || c >= conv_dim) return;
@@ -2100,6 +2102,17 @@ __global__ void recurrent_conv_ragged_batch_kernel(
         #pragma unroll
         for (uint32_t k = 0; k + 2 < CONV_K; ++k) st_buf[k] = st_buf[k + 1];
         st_buf[CONV_K - 2] = cur;
+        const uint32_t local_t = t - begin;
+        if (state_checkpoints != nullptr && local_t < checkpoint_count) {
+            const uint64_t checkpoint_stride =
+                static_cast<uint64_t>(conv_dim) * (CONV_K - 1);
+            float *ckpt = state_checkpoints +
+                (static_cast<uint64_t>(b) * checkpoint_count + local_t) *
+                    checkpoint_stride +
+                static_cast<uint64_t>(c) * (CONV_K - 1);
+            #pragma unroll
+            for (uint32_t i = 0; i + 1 < CONV_K; ++i) ckpt[i] = st_buf[i];
+        }
     }
     #pragma unroll
     for (uint32_t i = 0; i + 1 < CONV_K; ++i) st[i] = st_buf[i];
@@ -2327,6 +2340,7 @@ __global__ void deltanet_ragged_batch_kernel(
                                       const int32_t *q_indptr,
                                       const float *ssm_a,
                                       const float *dt_bias,
+                                      float *state_checkpoints,
                                       uint32_t B,
                                       uint32_t num_k_heads,
                                       uint32_t num_v_heads,
@@ -2336,7 +2350,8 @@ __global__ void deltanet_ragged_batch_kernel(
                                       uint32_t alpha_stride,
                                       uint32_t beta_stride,
                                       uint32_t core_stride,
-                                      uint32_t state_stride) {
+                                      uint32_t state_stride,
+                                      uint32_t checkpoint_count) {
     const uint32_t b = blockIdx.x;
     const uint32_t vh = blockIdx.y;
     const uint32_t j = blockIdx.z;
@@ -2392,6 +2407,18 @@ __global__ void deltanet_ragged_batch_kernel(
         if (tid == 0) {
             core[static_cast<uint64_t>(t) * core_stride +
                  vh * head_v_dim + j] = scratch[0] * inv_hvd;
+        }
+        const uint32_t local_t = t - begin;
+        if (state_checkpoints != nullptr && local_t < checkpoint_count) {
+            const uint64_t checkpoint_stride =
+                static_cast<uint64_t>(num_v_heads) * head_v_dim *
+                head_k_dim;
+            float *checkpoint_head =
+                state_checkpoints +
+                (static_cast<uint64_t>(b) * checkpoint_count + local_t) *
+                    checkpoint_stride +
+                (static_cast<uint64_t>(vh) * head_v_dim + j) * head_k_dim;
+            checkpoint_head[tid] = row_val;
         }
         __syncthreads();
     }
@@ -4679,7 +4706,10 @@ public:
                                         uint32_t core_stride,
                                         uint32_t state_stride,
                                         uint32_t conv_state_stride,
-                                        float eps) override {
+                                        float eps,
+                                        DeviceTensor *state_checkpoints,
+                                        DeviceTensor *conv_state_checkpoints,
+                                        uint32_t checkpoint_count) override {
         if (batch == 0 || total_q == 0) return {};
         auto &c = as_tensor(core);
         auto &s = as_tensor(state_batch);
@@ -4694,6 +4724,13 @@ public:
         const auto &aw = as_weight(ssm_a);
         const auto &dt = as_weight(dt_bias);
         const auto &nw = as_weight(ssm_norm);
+        auto *state_ckpt = state_checkpoints ? &as_tensor(*state_checkpoints) : nullptr;
+        auto *conv_ckpt = conv_state_checkpoints ? &as_tensor(*conv_state_checkpoints) : nullptr;
+        const uint32_t effective_checkpoint_count =
+            std::min<uint32_t>(checkpoint_count, total_q);
+        const bool want_checkpoint =
+            state_ckpt != nullptr && conv_ckpt != nullptr &&
+            effective_checkpoint_count > 0;
         if (qptr.elem_size != sizeof(int32_t) ||
             qptr.count < static_cast<uint64_t>(batch) + 1) {
             return {false, "recurrent_batch_ragged q_indptr must be i32[batch+1]"};
@@ -4742,6 +4779,8 @@ public:
                 const uint32_t end = static_cast<uint32_t>(end_i);
                 const uint32_t span = end - begin;
                 if (span == 0) continue;
+                const uint32_t req_checkpoint_count =
+                    std::min<uint32_t>(effective_checkpoint_count, span);
 
                 float *conv_state_row =
                     cs.ptr + static_cast<uint64_t>(req) * conv_state_stride;
@@ -4761,29 +4800,57 @@ public:
                         recurrent_conv_batch_kernel<3>
                             <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
                                 conv_out_row, conv_state_row, proj_row,
-                                static_cast<const float *>(cw.ptr), nullptr,
-                                span, proj_count, proj_stride, proj_stride, 0);
+                                static_cast<const float *>(cw.ptr),
+                                want_checkpoint
+                                    ? conv_ckpt->ptr +
+                                          static_cast<uint64_t>(req) *
+                                              effective_checkpoint_count *
+                                              conv_state_stride
+                                    : nullptr,
+                                span, proj_count, proj_stride, proj_stride,
+                                req_checkpoint_count);
                         break;
                     case 4:
                         recurrent_conv_batch_kernel<4>
                             <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
                                 conv_out_row, conv_state_row, proj_row,
-                                static_cast<const float *>(cw.ptr), nullptr,
-                                span, proj_count, proj_stride, proj_stride, 0);
+                                static_cast<const float *>(cw.ptr),
+                                want_checkpoint
+                                    ? conv_ckpt->ptr +
+                                          static_cast<uint64_t>(req) *
+                                              effective_checkpoint_count *
+                                              conv_state_stride
+                                    : nullptr,
+                                span, proj_count, proj_stride, proj_stride,
+                                req_checkpoint_count);
                         break;
                     case 5:
                         recurrent_conv_batch_kernel<5>
                             <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
                                 conv_out_row, conv_state_row, proj_row,
-                                static_cast<const float *>(cw.ptr), nullptr,
-                                span, proj_count, proj_stride, proj_stride, 0);
+                                static_cast<const float *>(cw.ptr),
+                                want_checkpoint
+                                    ? conv_ckpt->ptr +
+                                          static_cast<uint64_t>(req) *
+                                              effective_checkpoint_count *
+                                              conv_state_stride
+                                    : nullptr,
+                                span, proj_count, proj_stride, proj_stride,
+                                req_checkpoint_count);
                         break;
                     case 7:
                         recurrent_conv_batch_kernel<7>
                             <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
                                 conv_out_row, conv_state_row, proj_row,
-                                static_cast<const float *>(cw.ptr), nullptr,
-                                span, proj_count, proj_stride, proj_stride, 0);
+                                static_cast<const float *>(cw.ptr),
+                                want_checkpoint
+                                    ? conv_ckpt->ptr +
+                                          static_cast<uint64_t>(req) *
+                                              effective_checkpoint_count *
+                                              conv_state_stride
+                                    : nullptr,
+                                span, proj_count, proj_stride, proj_stride,
+                                req_checkpoint_count);
                         break;
                     default:
                         return {false, "recurrent_batch_ragged unsupported conv_kernel_size"};
@@ -4825,7 +4892,14 @@ public:
                     span,
                     num_k_heads, num_v_heads, head_k_dim,
                     proj_stride, alpha_stride, core_stride,
-                    true, nullptr, 0, exec_stream_);
+                    true,
+                    want_checkpoint
+                        ? state_ckpt->ptr +
+                              static_cast<uint64_t>(req) *
+                                  effective_checkpoint_count *
+                                  state_stride
+                        : nullptr,
+                    req_checkpoint_count, exec_stream_);
                 if (!ok) {
                     return {false, "recurrent_batch_ragged ported kernel rejected head_dim"};
                 }
@@ -4859,29 +4933,37 @@ public:
                 recurrent_conv_ragged_batch_kernel<3>
                     <<<conv_grid, conv_threads, 0, exec_stream_>>>(
                         cout.ptr, cs.ptr, p.ptr, qptr.ptr_i32(),
-                        static_cast<const float *>(cw.ptr), batch, proj_count,
-                        conv_state_stride, proj_stride, proj_stride);
+                        static_cast<const float *>(cw.ptr),
+                        want_checkpoint ? conv_ckpt->ptr : nullptr,
+                        batch, proj_count, conv_state_stride, proj_stride,
+                        proj_stride, effective_checkpoint_count);
                 break;
             case 4:
                 recurrent_conv_ragged_batch_kernel<4>
                     <<<conv_grid, conv_threads, 0, exec_stream_>>>(
                         cout.ptr, cs.ptr, p.ptr, qptr.ptr_i32(),
-                        static_cast<const float *>(cw.ptr), batch, proj_count,
-                        conv_state_stride, proj_stride, proj_stride);
+                        static_cast<const float *>(cw.ptr),
+                        want_checkpoint ? conv_ckpt->ptr : nullptr,
+                        batch, proj_count, conv_state_stride, proj_stride,
+                        proj_stride, effective_checkpoint_count);
                 break;
             case 5:
                 recurrent_conv_ragged_batch_kernel<5>
                     <<<conv_grid, conv_threads, 0, exec_stream_>>>(
                         cout.ptr, cs.ptr, p.ptr, qptr.ptr_i32(),
-                        static_cast<const float *>(cw.ptr), batch, proj_count,
-                        conv_state_stride, proj_stride, proj_stride);
+                        static_cast<const float *>(cw.ptr),
+                        want_checkpoint ? conv_ckpt->ptr : nullptr,
+                        batch, proj_count, conv_state_stride, proj_stride,
+                        proj_stride, effective_checkpoint_count);
                 break;
             case 7:
                 recurrent_conv_ragged_batch_kernel<7>
                     <<<conv_grid, conv_threads, 0, exec_stream_>>>(
                         cout.ptr, cs.ptr, p.ptr, qptr.ptr_i32(),
-                        static_cast<const float *>(cw.ptr), batch, proj_count,
-                        conv_state_stride, proj_stride, proj_stride);
+                        static_cast<const float *>(cw.ptr),
+                        want_checkpoint ? conv_ckpt->ptr : nullptr,
+                        batch, proj_count, conv_state_stride, proj_stride,
+                        proj_stride, effective_checkpoint_count);
                 break;
             default:
                 return {false, "recurrent_batch_ragged unsupported conv_kernel_size"};
@@ -4905,8 +4987,10 @@ public:
             c.ptr, s.ptr, cout.ptr, a.ptr, b.ptr, qptr.ptr_i32(),
             static_cast<const float *>(aw.ptr),
             static_cast<const float *>(dt.ptr),
+            want_checkpoint ? state_ckpt->ptr : nullptr,
             batch, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-            proj_stride, alpha_stride, beta_stride, core_stride, state_stride);
+            proj_stride, alpha_stride, beta_stride, core_stride, state_stride,
+            effective_checkpoint_count);
         if (auto st = launch_status("deltanet_ragged_batch_kernel"); !st.ok) {
             return st;
         }

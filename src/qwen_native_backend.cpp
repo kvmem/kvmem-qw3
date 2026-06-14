@@ -1242,6 +1242,7 @@ private:
         double seconds = 0.0;
         NativeExecutorReport report;
         std::vector<DeviceArgmax> row_argmaxes;
+        QwenExecutor::StateCheckpointSet checkpoints;
         std::string error;
 
         bool ok() const { return error.empty() && report.ok; }
@@ -1569,6 +1570,39 @@ private:
                 const float scale =
                     1.0f / std::sqrt(static_cast<float>(standard_head_dim));
                 ensure_ragged_scratch(total_q, final_rows, bsz);
+                uint32_t ragged_checkpoint_count = 0;
+                if (batch.collect_row_argmaxes) {
+                    for (uint32_t row = 0; row < bsz; ++row) {
+                        BatchedPrefillOutput &out = outputs[row];
+                        ragged_checkpoint_count =
+                            std::max<uint32_t>(ragged_checkpoint_count,
+                                               out.chunk);
+                        out.checkpoints.ready = false;
+                        out.checkpoints.base_position = out.offset;
+                        out.checkpoints.count = out.chunk;
+                        out.checkpoints.h_stride = hidden;
+                        if (out.checkpoints.recurrent_states.size() !=
+                            weights_.n_layers()) {
+                            out.checkpoints.recurrent_states.resize(
+                                weights_.n_layers());
+                        }
+                        if (out.checkpoints.conv_states.size() !=
+                            weights_.n_layers()) {
+                            out.checkpoints.conv_states.resize(
+                                weights_.n_layers());
+                        }
+                        if (out.checkpoints.recurrent_states_shared.size() !=
+                            weights_.n_layers()) {
+                            out.checkpoints.recurrent_states_shared.resize(
+                                weights_.n_layers());
+                        }
+                        if (out.checkpoints.conv_states_shared.size() !=
+                            weights_.n_layers()) {
+                            out.checkpoints.conv_states_shared.resize(
+                                weights_.n_layers());
+                        }
+                    }
+                }
 
                 require_ok(backend_.begin());
                 const double t_prepare1 = wall_seconds();
@@ -1664,6 +1698,26 @@ private:
                                 static_cast<uint64_t>(row) * conv_state_stride,
                                 conv_state, 0, conv_state_stride));
                         }
+                        std::shared_ptr<DeviceTensor> state_checkpoint_shared;
+                        std::shared_ptr<DeviceTensor> conv_checkpoint_shared;
+                        DeviceTensor *state_checkpoint_ptr = nullptr;
+                        DeviceTensor *conv_checkpoint_ptr = nullptr;
+                        if (batch.collect_row_argmaxes &&
+                            ragged_checkpoint_count > 0) {
+                            state_checkpoint_shared = backend_.scratch_f32(
+                                static_cast<uint64_t>(bsz) *
+                                    ragged_checkpoint_count * state_stride,
+                                "mtp_ragged_checkpoint_state_batch");
+                            conv_checkpoint_shared = backend_.scratch_f32(
+                                static_cast<uint64_t>(bsz) *
+                                    ragged_checkpoint_count *
+                                    conv_state_stride,
+                                "mtp_ragged_checkpoint_conv_batch");
+                            state_checkpoint_ptr =
+                                state_checkpoint_shared.get();
+                            conv_checkpoint_ptr =
+                                conv_checkpoint_shared.get();
+                        }
                         require_ok(backend_.recurrent_batch_ragged(
                             *recurrent_core_batch_,
                             *recurrent_state_batch_,
@@ -1683,7 +1737,22 @@ private:
                             head_k_dim, head_v_dim, cfg.ssm_conv_kernel,
                             proj_stride, proj_stride, gate_stride,
                             alpha_stride, beta_stride, core_stride,
-                            state_stride, conv_state_stride, eps));
+                            state_stride, conv_state_stride, eps,
+                            state_checkpoint_ptr, conv_checkpoint_ptr,
+                            ragged_checkpoint_count));
+                        if (state_checkpoint_shared &&
+                            conv_checkpoint_shared) {
+                            for (uint32_t row = 0; row < bsz; ++row) {
+                                BatchedPrefillOutput &out = outputs[row];
+                                out.checkpoints.checkpoint_stride =
+                                    ragged_checkpoint_count;
+                                out.checkpoints.checkpoint_row = row;
+                                out.checkpoints.recurrent_states_shared[il] =
+                                    state_checkpoint_shared;
+                                out.checkpoints.conv_states_shared[il] =
+                                    conv_checkpoint_shared;
+                            }
+                        }
                         require_ok(backend_.q8_0_matmul_add(
                             *hidden_batch_, *hidden_batch_, *attn_out_batch_,
                             *layer.ssm_out, *recurrent_core_batch_,
@@ -1832,6 +1901,17 @@ private:
                         *view.hidden, 0, *hidden_batch_,
                         static_cast<uint64_t>(last_q) * hidden, hidden));
                     a.executor->advance_position(outputs[row].chunk);
+                    if (batch.collect_row_argmaxes) {
+                        BatchedPrefillOutput &out = outputs[row];
+                        const uint32_t begin =
+                            static_cast<uint32_t>(batch.q_indptr[row]);
+                        out.checkpoints.h_shared =
+                            std::shared_ptr<DeviceTensor>(
+                                hidden_batch_.get(),
+                                [](DeviceTensor *) {});
+                        out.checkpoints.h_checkpoint_row = begin;
+                        out.checkpoints.ready = true;
+                    }
                     if (outputs[row].final_chunk) {
                         final_output_rows.push_back(row);
                         require_ok(backend_.copy_d2d_into(
@@ -3814,11 +3894,11 @@ private:
                             job.layered_verified = true;
                         }
                     } else {
+                        bool used_ragged_verify = false;
                         ContinuousPrefillBatch batch;
                         build_continuous_mtp_verify_batch(
                             mtp_active, jobs, batch);
                         const bool try_ragged_verify =
-                            state_checkpoint_count == 0 &&
                             batch.ragged_metadata_ready &&
                             batch.total_tokens >=
                                 continuous_batching_mtp_ragged_verify_min_tokens();
@@ -3841,6 +3921,7 @@ private:
                             const double verify0 = wall_seconds();
                             outputs = cb_prefill_executor_->prefill(
                                 mtp_active, batch, metadata);
+                            used_ragged_verify = true;
                             const double verify_s =
                                 std::max(wall_seconds() - verify0, 0.0);
                             for (const ContinuousMtpVerifyJob &job : jobs) {
@@ -3859,9 +3940,15 @@ private:
                                     need_single_fallback = true;
                                     break;
                                 }
+                                if (state_checkpoint_count > 0 &&
+                                    !out.checkpoints.ready) {
+                                    need_single_fallback = true;
+                                    break;
+                                }
                             }
                         }
                         if (need_single_fallback) {
+                            used_ragged_verify = false;
                             for (const ContinuousMtpVerifyJob &job : jobs) {
                                 if (job.snapshot.ready &&
                                     job.row < mtp_active.size()) {
@@ -3879,6 +3966,13 @@ private:
                                         std::max(wall_seconds() - verify0,
                                                  0.0);
                                 }
+                            }
+                        } else if (used_ragged_verify &&
+                                   state_checkpoint_count > 0) {
+                            for (uint32_t j = 0;
+                                 j < jobs.size() && j < outputs.size(); ++j) {
+                                jobs[j].checkpoints =
+                                    std::move(outputs[j].checkpoints);
                             }
                         }
                     }
