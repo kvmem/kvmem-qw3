@@ -3280,6 +3280,7 @@ private:
         std::vector<uint32_t> drafts;
         std::vector<uint32_t> verify_tokens;
         QwenExecutor::StateSnapshot snapshot;
+        QwenExecutor::StateCheckpointSet checkpoints;
     };
 
     void build_continuous_mtp_verify_batch(
@@ -3415,7 +3416,8 @@ private:
         const uint32_t requested_chain = mtp_trace_chain_len(options_);
         const uint32_t chain_len =
             std::min<uint32_t>(requested_chain, mtp_safe_chain_max());
-        const uint32_t state_checkpoint_count = 0;
+        const uint32_t state_checkpoint_count =
+            mtp_state_checkpoint_count(chain_len);
         const bool use_device_draft =
             mtp_device_draft_chain_enabled() && !mtp_verify_trace_enabled();
         struct MtpStats {
@@ -3426,6 +3428,14 @@ private:
             uint64_t verify_batches = 0;
             uint64_t verify_tokens = 0;
             uint64_t decode_ops = 0;
+            uint64_t state_checkpoint_reused = 0;
+            uint64_t prefix1_reused = 0;
+            double draft_s = 0.0;
+            double snapshot_s = 0.0;
+            double verify_s = 0.0;
+            double restore_s = 0.0;
+            double replay_s = 0.0;
+            double prefix_s = 0.0;
             double decode_start = 0.0;
         };
         std::vector<ContinuousBatchActive> mtp_active;
@@ -3556,17 +3566,25 @@ private:
                             a.req->options.max_tokens - a.decoded);
                     const uint32_t draft_limit =
                         std::min<uint32_t>(chain_len, remaining);
+                    const double draft0 = wall_seconds();
                     std::vector<NativeExecutorReport> chain =
                         use_device_draft
                             ? a.executor->forward_mtp_draft_chain_with_prefix_device(
                                   current, draft_limit)
                             : a.executor->forward_mtp_draft_chain_with_prefix(
                                   current, draft_limit);
+                    stats[row].draft_s +=
+                        std::max(wall_seconds() - draft0, 0.0);
                     ContinuousMtpVerifyJob job;
                     job.row = row;
                     job.current = current;
                     job.base_position = a.executor->position();
-                    a.executor->capture_state(job.snapshot);
+                    if (state_checkpoint_count == 0) {
+                        const double snapshot0 = wall_seconds();
+                        a.executor->capture_state(job.snapshot);
+                        stats[row].snapshot_s +=
+                            std::max(wall_seconds() - snapshot0, 0.0);
+                    }
                     job.verify_tokens.push_back(current);
                     for (const NativeExecutorReport &draft : chain) {
                         if (!draft.ok || draft.argmax_token < 0) break;
@@ -3597,7 +3615,7 @@ private:
                     std::vector<BatchedPrefillOutput> outputs;
                     outputs.reserve(jobs.size());
                     auto run_single_verifier =
-                        [&](const ContinuousMtpVerifyJob &job) {
+                        [&](ContinuousMtpVerifyJob &job) {
                             BatchedPrefillOutput out;
                             out.prefill_index = job.row;
                             out.request_id =
@@ -3615,7 +3633,11 @@ private:
                             out.report =
                                 mtp_active[job.row].executor->forward_n_tokens(
                                     job.verify_tokens, true,
-                                    &out.row_argmaxes, nullptr, 0,
+                                    &out.row_argmaxes,
+                                    state_checkpoint_count > 0
+                                        ? &job.checkpoints
+                                        : nullptr,
+                                    state_checkpoint_count,
                                     /*copy_last_logits=*/false);
                             if (!out.report.ok) {
                                 out.error = "MTP single verifier failed";
@@ -3623,13 +3645,19 @@ private:
                             return out;
                         };
                     if (jobs.size() == 1) {
-                        const ContinuousMtpVerifyJob &job = jobs.front();
+                        ContinuousMtpVerifyJob &job = jobs.front();
+                        const double verify0 = wall_seconds();
                         outputs.push_back(run_single_verifier(job));
+                        if (job.row < stats.size()) {
+                            stats[job.row].verify_s +=
+                                std::max(wall_seconds() - verify0, 0.0);
+                        }
                     } else {
                         ContinuousPrefillBatch batch;
                         build_continuous_mtp_verify_batch(
                             mtp_active, jobs, batch);
                         const bool try_ragged_verify =
+                            state_checkpoint_count == 0 &&
                             batch.ragged_metadata_ready &&
                             batch.total_tokens >=
                                 continuous_batching_mtp_ragged_verify_min_tokens();
@@ -3649,8 +3677,18 @@ private:
                             metadata.last_page_len =
                                 cb_prefill_last_page_len_i32_.get();
                             metadata.seq_lens = cb_prefill_seq_lens_i32_.get();
+                            const double verify0 = wall_seconds();
                             outputs = cb_prefill_executor_->prefill(
                                 mtp_active, batch, metadata);
+                            const double verify_s =
+                                std::max(wall_seconds() - verify0, 0.0);
+                            for (const ContinuousMtpVerifyJob &job : jobs) {
+                                if (job.row < stats.size()) {
+                                    stats[job.row].verify_s +=
+                                        verify_s /
+                                        static_cast<double>(jobs.size());
+                                }
+                            }
                         }
                         bool need_single_fallback =
                             outputs.size() != jobs.size();
@@ -3664,15 +3702,22 @@ private:
                         }
                         if (need_single_fallback) {
                             for (const ContinuousMtpVerifyJob &job : jobs) {
-                                if (job.row < mtp_active.size()) {
+                                if (job.snapshot.ready &&
+                                    job.row < mtp_active.size()) {
                                     mtp_active[job.row].executor->restore_state(
                                         job.snapshot);
                                 }
                             }
                             outputs.clear();
                             outputs.reserve(jobs.size());
-                            for (const ContinuousMtpVerifyJob &job : jobs) {
+                            for (ContinuousMtpVerifyJob &job : jobs) {
+                                const double verify0 = wall_seconds();
                                 outputs.push_back(run_single_verifier(job));
+                                if (job.row < stats.size()) {
+                                    stats[job.row].verify_s +=
+                                        std::max(wall_seconds() - verify0,
+                                                 0.0);
+                                }
                             }
                         }
                     }
@@ -3708,10 +3753,13 @@ private:
                             accepted == job.drafts.size();
                         if (all_accepted) {
                             if (mtp_rebuild_accepted_prefix_enabled()) {
+                                const double prefix0 = wall_seconds();
                                 NativeExecutorReport prefix =
                                     a.executor->prime_mtp_prefix_from_last_batch(
                                         job.verify_tokens, job.base_position,
                                         mtp_prefix_rebuild_batch_min_tokens());
+                                s.prefix_s +=
+                                    std::max(wall_seconds() - prefix0, 0.0);
                                 if (!prefix.ok) {
                                     const std::string reason =
                                         prefix.missing_kernels.empty()
@@ -3727,27 +3775,51 @@ private:
                                     a.executor->position());
                             }
                         } else {
-                            a.executor->restore_state(job.snapshot);
-                            std::vector<uint32_t> replay;
-                            replay.reserve(accepted + 1);
-                            replay.push_back(job.current);
-                            for (uint32_t i = 0; i < accepted; ++i) {
-                                replay.push_back(job.drafts[i]);
+                            const bool use_checkpoint_replay =
+                                state_checkpoint_count > 0 &&
+                                job.checkpoints.ready &&
+                                accepted < job.checkpoints.count;
+                            if (use_checkpoint_replay) {
+                                const double restore0 = wall_seconds();
+                                a.executor->restore_state_checkpoint(
+                                    job.checkpoints, accepted);
+                                s.restore_s +=
+                                    std::max(wall_seconds() - restore0, 0.0);
+                                ++s.state_checkpoint_reused;
+                                if (accepted == 0) ++s.prefix1_reused;
+                            } else {
+                                if (!job.snapshot.ready) {
+                                    throw std::runtime_error(
+                                        "MTP batched verifier replay requires a state snapshot");
+                                }
+                                const double restore0 = wall_seconds();
+                                a.executor->restore_state(job.snapshot);
+                                s.restore_s +=
+                                    std::max(wall_seconds() - restore0, 0.0);
+                                std::vector<uint32_t> replay;
+                                replay.reserve(accepted + 1);
+                                replay.push_back(job.current);
+                                for (uint32_t i = 0; i < accepted; ++i) {
+                                    replay.push_back(job.drafts[i]);
+                                }
+                                double prefix_seconds = 0.0;
+                                uint64_t prefix_ops = 0;
+                                const double replay0 = wall_seconds();
+                                NativeExecutorReport replay_report =
+                                    a.executor->replay_tokens_with_mtp_prefix(
+                                        replay, job.base_position,
+                                        mtp_rebuild_accepted_prefix_enabled(),
+                                        &prefix_seconds, &prefix_ops);
+                                s.replay_s +=
+                                    std::max(wall_seconds() - replay0, 0.0);
+                                s.prefix_s += prefix_seconds;
+                                if (!replay_report.ok) {
+                                    throw std::runtime_error(
+                                        "MTP batched verifier replay failed");
+                                }
+                                s.decode_ops +=
+                                    replay_report.ops_executed + prefix_ops;
                             }
-                            double prefix_seconds = 0.0;
-                            uint64_t prefix_ops = 0;
-                            NativeExecutorReport replay_report =
-                                a.executor->replay_tokens_with_mtp_prefix(
-                                    replay, job.base_position,
-                                    mtp_rebuild_accepted_prefix_enabled(),
-                                    &prefix_seconds, &prefix_ops);
-                            (void)prefix_seconds;
-                            if (!replay_report.ok) {
-                                throw std::runtime_error(
-                                    "MTP batched verifier replay failed");
-                            }
-                            s.decode_ops +=
-                                replay_report.ops_executed + prefix_ops;
                             ++s.rollbacks;
                         }
                         for (uint32_t i = 0; i < accepted; ++i) {
@@ -3787,13 +3859,21 @@ private:
                                               static_cast<double>(s.drafted)
                                         : 0.0)
                                 << " mtp_ops=0 prefix_tokens=0 prefix_ops=0"
-                                << " prefix1_reuse=0 state_ckpt_reuse=0"
+                                << " prefix1_reuse=" << s.prefix1_reused
+                                << " state_ckpt_reuse="
+                                << s.state_checkpoint_reused
                                 << " state_ckpt_count="
                                 << state_checkpoint_count
                                 << " batched_verify_batches="
                                 << s.verify_batches
                                 << " batched_verify_tokens="
-                                << s.verify_tokens;
+                                << s.verify_tokens
+                                << " draft_s=" << fmt_seconds(s.draft_s)
+                                << " snapshot_s=" << fmt_seconds(s.snapshot_s)
+                                << " verify_s=" << fmt_seconds(s.verify_s)
+                                << " restore_s=" << fmt_seconds(s.restore_s)
+                                << " replay_s=" << fmt_seconds(s.replay_s)
+                                << " prefix_s=" << fmt_seconds(s.prefix_s);
                         log(summary.str());
                         log("native generate: prompt_tokens=" +
                             std::to_string(a.req->prompt_tokens.size()) +
