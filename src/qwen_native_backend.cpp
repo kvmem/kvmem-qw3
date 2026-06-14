@@ -290,6 +290,10 @@ bool continuous_batching_mtp_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_MTP", true);
 }
 
+bool continuous_mtp_layered_verify_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_MTP_LAYERED_VERIFY");
+}
+
 uint32_t continuous_batching_ragged_prefill_min_tokens() {
     return std::max<uint32_t>(
         1, env_uint32_or("QW3_CONTINUOUS_BATCHING_RAGGED_PREFILL_MIN_TOKENS",
@@ -3281,6 +3285,7 @@ private:
         std::vector<uint32_t> verify_tokens;
         QwenExecutor::StateSnapshot snapshot;
         QwenExecutor::StateCheckpointSet checkpoints;
+        bool layered_verified = false;
     };
 
     void build_continuous_mtp_verify_batch(
@@ -3443,6 +3448,127 @@ private:
         std::vector<MtpStats> stats;
         mtp_active.reserve(reqs.size());
         stats.reserve(reqs.size());
+
+        auto run_layered_verifier =
+            [&](std::vector<ContinuousMtpVerifyJob> &jobs,
+                std::vector<BatchedPrefillOutput> &outputs) {
+                outputs.clear();
+                outputs.resize(jobs.size());
+                if (jobs.empty()) return false;
+                if (!cb_decode_executor_) {
+                    cb_decode_executor_ =
+                        std::make_unique<BatchedDecodeExecutor>(
+                            *model_, *weights_, *device_);
+                }
+                std::vector<bool> active_job(jobs.size(), true);
+                uint32_t active_count = static_cast<uint32_t>(jobs.size());
+                const uint32_t max_rows = static_cast<uint32_t>(
+                    std::max<size_t>(1, jobs.front().verify_tokens.size()));
+                for (uint32_t depth = 0; depth < max_rows && active_count > 0;
+                     ++depth) {
+                    ContinuousDecodeBatch decode_batch;
+                    decode_batch.active_indices.reserve(active_count);
+                    decode_batch.feed_tokens.reserve(active_count);
+                    decode_batch.positions.reserve(active_count);
+                    decode_batch.state_views.reserve(active_count);
+                    std::vector<uint32_t> job_indices;
+                    job_indices.reserve(active_count);
+                    for (uint32_t j = 0; j < jobs.size(); ++j) {
+                        if (!active_job[j] ||
+                            depth >= jobs[j].verify_tokens.size()) {
+                            continue;
+                        }
+                        const size_t row = jobs[j].row;
+                        if (row >= mtp_active.size()) return false;
+                        ContinuousBatchActive &a = mtp_active[row];
+                        a.next_token = jobs[j].verify_tokens[depth];
+                        QwenExecutor::DecodeStateView view =
+                            a.executor->decode_state_view();
+                        decode_batch.active_indices.push_back(row);
+                        decode_batch.feed_tokens.push_back(a.next_token);
+                        decode_batch.positions.push_back(view.position);
+                        decode_batch.state_views.push_back(view);
+                        job_indices.push_back(j);
+                    }
+                    if (decode_batch.size() == 0) break;
+                    const double verify0 = wall_seconds();
+                    const std::vector<BatchedDecodeOutput> layer_outputs =
+                        cb_decode_executor_->decode(
+                            mtp_active, BatchedDecodeInput{&decode_batch});
+                    const double verify_s =
+                        std::max(wall_seconds() - verify0, 0.0);
+                    if (layer_outputs.size() != job_indices.size()) {
+                        return false;
+                    }
+                    const double per_row_verify_s =
+                        verify_s / static_cast<double>(job_indices.size());
+                    for (uint32_t row_i = 0; row_i < layer_outputs.size();
+                         ++row_i) {
+                        const uint32_t j = job_indices[row_i];
+                        ContinuousMtpVerifyJob &job = jobs[j];
+                        BatchedPrefillOutput &out = outputs[j];
+                        const BatchedDecodeOutput &layer_out =
+                            layer_outputs[row_i];
+                        MtpStats &s = stats[job.row];
+                        s.verify_s += per_row_verify_s;
+                        if (!layer_out.ok()) {
+                            out.error = layer_out.error.empty()
+                                ? "MTP layered verifier failed"
+                                : layer_out.error;
+                            return false;
+                        }
+                        if (out.row_argmaxes.empty()) {
+                            out.prefill_index = job.row;
+                            out.request_id =
+                                mtp_active[job.row].req
+                                    ? mtp_active[job.row].req->id
+                                    : 0;
+                            out.offset = job.base_position;
+                            out.total = job.base_position +
+                                        static_cast<uint32_t>(
+                                            job.verify_tokens.size());
+                            out.chunk =
+                                static_cast<uint32_t>(
+                                    job.verify_tokens.size());
+                            out.final_chunk = true;
+                            out.report.ok = true;
+                        }
+                        out.row_argmaxes.push_back(DeviceArgmax{
+                            layer_out.report.argmax_token,
+                            layer_out.report.argmax_logit
+                        });
+                        out.report.ops_executed +=
+                            layer_out.report.ops_executed;
+                        if (depth < job.drafts.size()) {
+                            const int32_t target =
+                                layer_out.report.argmax_token >= 0
+                                    ? layer_out.report.argmax_token
+                                    : eos;
+                            if (target !=
+                                static_cast<int32_t>(job.drafts[depth])) {
+                                active_job[j] = false;
+                                --active_count;
+                            }
+                        } else {
+                            active_job[j] = false;
+                            --active_count;
+                        }
+                    }
+                }
+                for (uint32_t j = 0; j < jobs.size(); ++j) {
+                    if (outputs[j].row_argmaxes.empty()) return false;
+                    outputs[j].report.ok = true;
+                    const DeviceArgmax &last = outputs[j].row_argmaxes.back();
+                    outputs[j].report.argmax_token = last.token;
+                    outputs[j].report.argmax_logit = last.logit;
+                    if (last.token >= 0) {
+                        outputs[j].report.argmax_text =
+                            model_->gguf().token_text(
+                                static_cast<uint32_t>(last.token));
+                    }
+                }
+                return true;
+            };
 
         auto should_stop = [&](const ContinuousBatchActive &a,
                                uint32_t token) {
@@ -3682,6 +3808,11 @@ private:
                             stats[job.row].verify_s +=
                                 std::max(wall_seconds() - verify0, 0.0);
                         }
+                    } else if (continuous_mtp_layered_verify_enabled() &&
+                               run_layered_verifier(jobs, outputs)) {
+                        for (ContinuousMtpVerifyJob &job : jobs) {
+                            job.layered_verified = true;
+                        }
                     } else {
                         ContinuousPrefillBatch batch;
                         build_continuous_mtp_verify_batch(
@@ -3755,9 +3886,14 @@ private:
                         const ContinuousMtpVerifyJob &job = jobs[j];
                         ContinuousBatchActive &a = mtp_active[job.row];
                         MtpStats &s = stats[job.row];
+                        const bool row_count_ok = job.layered_verified
+                            ? (!outputs[j].row_argmaxes.empty() &&
+                               outputs[j].row_argmaxes.size() <=
+                                   job.verify_tokens.size())
+                            : (outputs[j].row_argmaxes.size() ==
+                               job.verify_tokens.size());
                         if (j >= outputs.size() || !outputs[j].ok() ||
-                            outputs[j].row_argmaxes.size() !=
-                                job.verify_tokens.size()) {
+                            !row_count_ok) {
                             throw std::runtime_error(
                                 "MTP batched verifier failed");
                         }
@@ -3767,7 +3903,8 @@ private:
                         s.decode_ops += outputs[j].report.ops_executed;
                         uint32_t accepted = 0;
                         int32_t target = eos;
-                        for (uint32_t i = 0; i < job.drafts.size(); ++i) {
+                        for (uint32_t i = 0; i < job.drafts.size() &&
+                                             i < row_argmaxes.size(); ++i) {
                             target = row_argmaxes[i].token >= 0
                                 ? row_argmaxes[i].token
                                 : eos;
@@ -3816,7 +3953,19 @@ private:
                         const bool all_accepted =
                             accepted == job.drafts.size();
                         if (all_accepted) {
-                            if (mtp_rebuild_accepted_prefix_enabled()) {
+                            if (job.layered_verified) {
+                                if (mtp_rebuild_accepted_prefix_enabled()) {
+                                    const double prefix0 = wall_seconds();
+                                    a.executor
+                                        ->commit_mtp_prefix_from_current_hidden(
+                                            a.executor->position());
+                                    s.prefix_s += std::max(
+                                        wall_seconds() - prefix0, 0.0);
+                                } else {
+                                    a.executor->commit_mtp_prefix(
+                                        a.executor->position());
+                                }
+                            } else if (mtp_rebuild_accepted_prefix_enabled()) {
                                 const double prefix0 = wall_seconds();
                                 NativeExecutorReport prefix =
                                     a.executor->prime_mtp_prefix_from_last_batch(
@@ -3838,6 +3987,19 @@ private:
                                 a.executor->commit_mtp_prefix(
                                     a.executor->position());
                             }
+                        } else if (job.layered_verified) {
+                            if (mtp_rebuild_accepted_prefix_enabled()) {
+                                const double prefix0 = wall_seconds();
+                                a.executor
+                                    ->commit_mtp_prefix_from_current_hidden(
+                                        a.executor->position());
+                                s.prefix_s +=
+                                    std::max(wall_seconds() - prefix0, 0.0);
+                            } else {
+                                a.executor->commit_mtp_prefix(
+                                    a.executor->position());
+                            }
+                            ++s.rollbacks;
                         } else {
                             const bool use_checkpoint_replay =
                                 state_checkpoint_count > 0 &&
@@ -3891,6 +4053,10 @@ private:
                         }
                         if (a.decoded >= a.req->options.max_tokens) continue;
                         if (all_accepted) {
+                            if (job.drafts.size() >= row_argmaxes.size()) {
+                                throw std::runtime_error(
+                                    "MTP verifier missing final target row");
+                            }
                             target = row_argmaxes[job.drafts.size()].token >= 0
                                 ? row_argmaxes[job.drafts.size()].token
                                 : eos;
