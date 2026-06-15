@@ -290,6 +290,10 @@ bool continuous_batching_mtp_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING_MTP", true);
 }
 
+bool continuous_mtp_batched_draft_enabled() {
+    return env_flag_enabled("QW3_CONTINUOUS_MTP_BATCHED_DRAFT");
+}
+
 bool continuous_mtp_layered_verify_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_MTP_LAYERED_VERIFY");
 }
@@ -3430,6 +3434,368 @@ private:
         bool layered_verified = false;
     };
 
+    struct ContinuousMtpDraftStep {
+        size_t row = 0;
+        uint32_t input_token = 0;
+        uint32_t cache_pos = 0;
+        int32_t output_token = -1;
+        float output_logit = 0.0f;
+        NativeExecutorReport report;
+    };
+
+    void ensure_continuous_mtp_draft_scratch(uint32_t batch) {
+        if (batch == 0 || batch <= cb_mtp_draft_capacity_) return;
+        const QwenConfig &cfg = model_->config();
+        const QwenMtpWeights *mtp = weights_->mtp();
+        if (!mtp) throw std::runtime_error("MTP weights unavailable");
+        const QwenLayerWeights &layer = mtp->layer;
+        const uint64_t B = batch;
+        cb_mtp_h_input_batch_ =
+            device_->scratch_f32(B * cfg.n_embd, "cb_mtp_draft_h_input");
+        cb_mtp_h_batch_ =
+            device_->scratch_f32(B * cfg.n_embd, "cb_mtp_draft_h");
+        cb_mtp_norm_batch_ =
+            device_->scratch_f32(B * cfg.n_embd, "cb_mtp_draft_norm");
+        cb_mtp_concat_batch_ = device_->scratch_f32(
+            B * static_cast<uint64_t>(2) * cfg.n_embd,
+            "cb_mtp_draft_concat");
+        cb_mtp_q_batch_ = device_->scratch_f32(
+            B * std::max<uint64_t>(layer.q_rows, 1),
+            "cb_mtp_draft_q");
+        cb_mtp_q_row_ =
+            device_->scratch_f32(std::max<uint64_t>(layer.q_rows, 1),
+                                 "cb_mtp_draft_q_row");
+        cb_mtp_k_batch_ = device_->scratch_f32(
+            B * std::max<uint64_t>(layer.k_rows, 1),
+            "cb_mtp_draft_k");
+        cb_mtp_v_batch_ = device_->scratch_f32(
+            B * std::max<uint64_t>(layer.v_rows, 1),
+            "cb_mtp_draft_v");
+        cb_mtp_k_row_ =
+            device_->scratch_f32(std::max<uint64_t>(layer.k_rows, 1),
+                                 "cb_mtp_draft_k_row");
+        cb_mtp_v_row_ =
+            device_->scratch_f32(std::max<uint64_t>(layer.v_rows, 1),
+                                 "cb_mtp_draft_v_row");
+        cb_mtp_mid_batch_ = device_->scratch_f32(
+            B * static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim,
+            "cb_mtp_draft_mid");
+        cb_mtp_mid_row_ = device_->scratch_f32(
+            static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim,
+            "cb_mtp_draft_mid_row");
+        cb_mtp_ffn_gate_batch_ = device_->scratch_f32(
+            B * std::max<uint64_t>(layer.ffn_dim, 1),
+            "cb_mtp_draft_ffn_gate");
+        cb_mtp_ffn_up_batch_ = device_->scratch_f32(
+            B * std::max<uint64_t>(layer.ffn_dim, 1),
+            "cb_mtp_draft_ffn_up");
+        cb_mtp_ffn_mid_batch_ = device_->scratch_f32(
+            B * std::max<uint64_t>(layer.ffn_dim, 1),
+            "cb_mtp_draft_ffn_mid");
+        cb_mtp_ffn_out_batch_ =
+            device_->scratch_f32(B * cfg.n_embd, "cb_mtp_draft_ffn_out");
+        cb_mtp_logits_batch_ = device_->scratch_f32(
+            B * static_cast<uint64_t>(weights_->output().rows),
+            "cb_mtp_draft_logits");
+        cb_mtp_draft_capacity_ = batch;
+    }
+
+    bool run_continuous_mtp_batched_draft_step(
+            std::vector<ContinuousBatchActive> &mtp_active,
+            std::vector<ContinuousMtpDraftStep> &steps,
+            bool first_depth) {
+        if (steps.size() < 2) return false;
+        auto trace_stage = [&](const char *stage) {
+            if (!continuous_batching_trace_enabled()) return;
+            std::ostringstream msg;
+            msg << "native continuous_mtp_batched_draft_stage:"
+                << " stage=" << stage
+                << " batch=" << steps.size()
+                << " first_depth=" << (first_depth ? "true" : "false");
+            log(msg.str());
+        };
+        const NativePlanInfo &plan = model_->plan();
+        const QwenMtpWeights *mtp = weights_->mtp();
+        if (!plan.mtp_supported || !mtp || mtp->layer.recurrent) return false;
+        if (!mtp->eh_proj || !mtp->embed_tokens || !mtp->enorm ||
+            !mtp->hnorm || !mtp->shared_head_head || !mtp->shared_head_norm) {
+            return false;
+        }
+        const uint32_t bsz = static_cast<uint32_t>(steps.size());
+        const QwenConfig &cfg = model_->config();
+        const QwenLayerWeights &layer = mtp->layer;
+        const uint32_t hidden = cfg.n_embd;
+        const uint32_t standard_head_dim = cfg.head_dim;
+        const uint32_t standard_n_heads = cfg.n_heads;
+        const uint32_t standard_n_kv_heads = cfg.n_kv_heads;
+        const uint32_t q_stride = static_cast<uint32_t>(layer.q_rows);
+        const uint32_t k_stride = static_cast<uint32_t>(layer.k_rows);
+        const uint32_t v_stride = static_cast<uint32_t>(layer.v_rows);
+        const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
+        const uint32_t mid_stride = standard_n_heads * standard_head_dim;
+        const uint32_t ffn_stride = static_cast<uint32_t>(layer.ffn_dim);
+        const uint32_t vocab = static_cast<uint32_t>(weights_->output().rows);
+        const float eps = cfg.rms_eps;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
+        if (q_stride == 0 || k_stride == 0 || v_stride == 0 ||
+            ffn_stride == 0) {
+            return false;
+        }
+
+        ensure_continuous_mtp_draft_scratch(bsz);
+        ContinuousPrefillBatch metadata_batch;
+        metadata_batch.collect_row_argmaxes = true;
+        metadata_batch.page_size = 0;
+        metadata_batch.q_indptr.push_back(0);
+        metadata_batch.page_indptr.push_back(0);
+        std::vector<uint64_t> rows_h(bsz, 0);
+
+        for (uint32_t i = 0; i < bsz; ++i) {
+            ContinuousMtpDraftStep &step = steps[i];
+            if (step.row >= mtp_active.size()) return false;
+            ContinuousBatchActive &a = mtp_active[step.row];
+            if (!a.executor) return false;
+            a.executor->prepare_mtp_prefix_pages(step.cache_pos, 1);
+            QwenExecutor::MtpPrefixStateView view =
+                a.executor->mtp_prefix_state_view();
+            if (!view.ready || !view.k_cache || !view.v_cache ||
+                !view.page_indices_host || view.page_size == 0 ||
+                !view.draft_hidden || !view.current_hidden) {
+                return false;
+            }
+            const uint32_t seq_len = step.cache_pos + 1;
+            const uint32_t pages =
+                (seq_len + view.page_size - 1) / view.page_size;
+            if (pages == 0 || pages > view.page_count) return false;
+            if (metadata_batch.page_size == 0) {
+                metadata_batch.page_size = view.page_size;
+            } else if (metadata_batch.page_size != view.page_size) {
+                return false;
+            }
+            rows_h[i] = step.input_token;
+            metadata_batch.logical_positions.push_back(
+                static_cast<int32_t>(step.cache_pos));
+            metadata_batch.row_page_indptr.push_back(
+                static_cast<int32_t>(metadata_batch.page_indices.size()));
+            for (uint32_t p = 0; p < pages; ++p) {
+                metadata_batch.page_indices.push_back(view.page_indices_host[p]);
+            }
+            const uint32_t last_len = seq_len % view.page_size;
+            metadata_batch.last_page_len.push_back(static_cast<int32_t>(
+                last_len == 0 ? view.page_size : last_len));
+            metadata_batch.seq_lens.push_back(static_cast<int32_t>(seq_len));
+            metadata_batch.q_indptr.push_back(static_cast<int32_t>(i + 1));
+            metadata_batch.page_indptr.push_back(
+                static_cast<int32_t>(metadata_batch.page_indices.size()));
+            metadata_batch.max_seq_len =
+                std::max<uint32_t>(metadata_batch.max_seq_len, seq_len);
+        }
+        metadata_batch.total_tokens = bsz;
+        metadata_batch.row_page_indptr.push_back(
+            static_cast<int32_t>(metadata_batch.page_indices.size()));
+        metadata_batch.ragged_metadata_ready =
+            metadata_batch.page_size > 0 &&
+            metadata_batch.q_indptr.size() == static_cast<size_t>(bsz) + 1 &&
+            metadata_batch.page_indptr.size() == static_cast<size_t>(bsz) + 1 &&
+            metadata_batch.logical_positions.size() == bsz &&
+            metadata_batch.row_page_indptr.size() == static_cast<size_t>(bsz) + 1 &&
+            metadata_batch.last_page_len.size() == bsz &&
+            metadata_batch.seq_lens.size() == bsz &&
+            !metadata_batch.page_indices.empty();
+        metadata_batch.ragged_row_metadata_ready =
+            metadata_batch.ragged_metadata_ready;
+
+        try {
+            trace_stage("begin");
+            require_device_status(device_->begin());
+            trace_stage("pack_hidden");
+            for (uint32_t i = 0; i < bsz; ++i) {
+                ContinuousMtpDraftStep &step = steps[i];
+                ContinuousBatchActive &a = mtp_active[step.row];
+                QwenExecutor::MtpPrefixStateView view =
+                    a.executor->mtp_prefix_state_view();
+                DeviceTensor *src_h =
+                    first_depth ? view.current_hidden : view.draft_hidden;
+                if (!src_h) throw std::runtime_error("MTP draft hidden missing");
+                require_device_status(device_->copy_d2d_into(
+                    *cb_mtp_h_input_batch_,
+                    static_cast<uint64_t>(i) * hidden,
+                    *src_h, 0, hidden));
+            }
+            trace_stage("embed");
+            require_device_status(device_->q8_0_get_rows_batch(
+                *cb_mtp_norm_batch_, *mtp->embed_tokens, rows_h.data(), bsz));
+            require_device_status(device_->rms_norm_batch(
+                *cb_mtp_ffn_out_batch_, *cb_mtp_norm_batch_, *mtp->enorm,
+                bsz, hidden, eps));
+            require_device_status(device_->rms_norm_batch(
+                *cb_mtp_h_batch_, *cb_mtp_h_input_batch_, *mtp->hnorm,
+                bsz, hidden, eps));
+            require_device_status(device_->pack_mtp_concat(
+                *cb_mtp_concat_batch_, *cb_mtp_ffn_out_batch_,
+                *cb_mtp_h_batch_, bsz, hidden, hidden,
+                static_cast<uint32_t>(2 * hidden), hidden));
+            require_device_status(device_->q8_0_matmul(
+                *cb_mtp_h_batch_, *mtp->eh_proj, *cb_mtp_concat_batch_,
+                bsz, static_cast<uint32_t>(2 * hidden), hidden));
+            trace_stage("qkv");
+            require_device_status(device_->rms_norm_batch(
+                *cb_mtp_norm_batch_, *cb_mtp_h_batch_, *layer.attn_norm,
+                bsz, hidden, eps));
+            DeviceTensor *qkv_outs[3] = {
+                cb_mtp_q_batch_.get(), cb_mtp_k_batch_.get(),
+                cb_mtp_v_batch_.get()
+            };
+            const DeviceWeight *qkv_ws[3] = {
+                layer.attn_q, layer.attn_k, layer.attn_v
+            };
+            const uint32_t qkv_strides[3] = {q_stride, k_stride, v_stride};
+            require_device_status(device_->q8_0_matmul_fanout(
+                qkv_outs, qkv_ws, qkv_strides, 3,
+                *cb_mtp_norm_batch_, bsz, hidden));
+            require_device_status(device_->rmsnorm_per_head_batch(
+                *cb_mtp_q_batch_, *layer.attn_q_norm, bsz, q_stride,
+                standard_n_heads, 2 * standard_head_dim,
+                standard_head_dim, eps));
+            require_device_status(device_->rmsnorm_per_head_batch(
+                *cb_mtp_k_batch_, *layer.attn_k_norm, bsz, k_stride,
+                standard_n_kv_heads, standard_head_dim,
+                standard_head_dim, eps));
+            std::vector<int32_t> rope_pos_h(bsz, 0);
+            for (uint32_t i = 0; i < bsz; ++i) {
+                rope_pos_h[i] = static_cast<int32_t>(steps[i].cache_pos);
+            }
+            if (bsz > cb_mtp_draft_positions_capacity_) {
+                cb_mtp_draft_positions_i32_ =
+                    device_->tensor_i32(bsz, "cb_mtp_draft_positions");
+                cb_mtp_draft_positions_capacity_ = bsz;
+            }
+            require_device_status(device_->copy_i32_from_host(
+                *cb_mtp_draft_positions_i32_, 0, rope_pos_h.data(), bsz));
+            require_device_status(device_->rope_partial_batch_positions(
+                *cb_mtp_q_batch_, bsz, q_stride, standard_n_heads,
+                2 * standard_head_dim, cfg.rope_dim,
+                *cb_mtp_draft_positions_i32_, cfg.rope_theta));
+            require_device_status(device_->rope_partial_batch_positions(
+                *cb_mtp_k_batch_, bsz, k_stride, standard_n_kv_heads,
+                standard_head_dim, cfg.rope_dim,
+                *cb_mtp_draft_positions_i32_, cfg.rope_theta));
+            trace_stage("kv_append_k_before");
+            for (uint32_t i = 0; i < bsz; ++i) {
+                ContinuousMtpDraftStep &step = steps[i];
+                ContinuousBatchActive &a = mtp_active[step.row];
+                QwenExecutor::MtpPrefixStateView view =
+                    a.executor->mtp_prefix_state_view();
+                require_device_status(device_->copy_d2d_into(
+                    *cb_mtp_k_row_, 0, *cb_mtp_k_batch_,
+                    static_cast<uint64_t>(i) * k_stride, k_stride));
+                require_device_status(device_->kv_append_batch_paged_device(
+                    *view.k_cache, *cb_mtp_k_row_, step.cache_pos, per_pos,
+                    1, *view.page_indices_device, view.page_count,
+                    view.page_size));
+            }
+            trace_stage("kv_append_k_after");
+            trace_stage("kv_append_v_before");
+            for (uint32_t i = 0; i < bsz; ++i) {
+                ContinuousMtpDraftStep &step = steps[i];
+                ContinuousBatchActive &a = mtp_active[step.row];
+                QwenExecutor::MtpPrefixStateView view =
+                    a.executor->mtp_prefix_state_view();
+                require_device_status(device_->copy_d2d_into(
+                    *cb_mtp_v_row_, 0, *cb_mtp_v_batch_,
+                    static_cast<uint64_t>(i) * v_stride, v_stride));
+                require_device_status(device_->kv_append_batch_paged_device(
+                    *view.v_cache, *cb_mtp_v_row_, step.cache_pos, per_pos,
+                    1, *view.page_indices_device, view.page_count,
+                    view.page_size));
+            }
+            trace_stage("kv_append_v_after");
+            trace_stage("attention");
+            for (uint32_t i = 0; i < bsz; ++i) {
+                ContinuousMtpDraftStep &step = steps[i];
+                ContinuousBatchActive &a = mtp_active[step.row];
+                QwenExecutor::MtpPrefixStateView view =
+                    a.executor->mtp_prefix_state_view();
+                require_device_status(device_->copy_d2d_into(
+                    *cb_mtp_q_row_, 0, *cb_mtp_q_batch_,
+                    static_cast<uint64_t>(i) * q_stride, q_stride));
+                require_device_status(device_->attention_decode_batch_paged_gated_device(
+                    *cb_mtp_mid_row_, *cb_mtp_q_row_,
+                    2 * standard_head_dim, *view.k_cache, *view.v_cache,
+                    *view.page_indices_device, view.page_count, view.page_size,
+                    standard_n_heads, standard_n_kv_heads, standard_head_dim,
+                    step.cache_pos, 1, q_stride, mid_stride, scale));
+                require_device_status(device_->copy_d2d_into(
+                    *cb_mtp_mid_batch_, static_cast<uint64_t>(i) * mid_stride,
+                    *cb_mtp_mid_row_, 0, mid_stride));
+            }
+            require_device_status(device_->q8_0_matmul_add(
+                *cb_mtp_h_batch_, *cb_mtp_h_batch_, *cb_mtp_ffn_out_batch_,
+                *layer.attn_output, *cb_mtp_mid_batch_, bsz, mid_stride,
+                hidden));
+            trace_stage("ffn");
+            require_device_status(device_->rms_norm_batch(
+                *cb_mtp_norm_batch_, *cb_mtp_h_batch_, *layer.ffn_norm,
+                bsz, hidden, eps));
+            DeviceTensor *ffn_outs[2] = {
+                cb_mtp_ffn_gate_batch_.get(), cb_mtp_ffn_up_batch_.get()
+            };
+            const DeviceWeight *ffn_ws[2] = {layer.ffn_gate, layer.ffn_up};
+            const uint32_t ffn_strides[2] = {ffn_stride, ffn_stride};
+            require_device_status(device_->q8_0_matmul_fanout(
+                ffn_outs, ffn_ws, ffn_strides, 2, *cb_mtp_norm_batch_,
+                bsz, hidden));
+            require_device_status(device_->silu_mul_n(
+                *cb_mtp_ffn_mid_batch_, *cb_mtp_ffn_gate_batch_,
+                *cb_mtp_ffn_up_batch_, static_cast<uint64_t>(bsz) * ffn_stride));
+            require_device_status(device_->q8_0_matmul_add(
+                *cb_mtp_h_batch_, *cb_mtp_h_batch_, *cb_mtp_ffn_out_batch_,
+                *layer.ffn_down, *cb_mtp_ffn_mid_batch_, bsz, ffn_stride,
+                hidden));
+            require_device_status(device_->rms_norm_batch(
+                *cb_mtp_norm_batch_, *cb_mtp_h_batch_, *mtp->shared_head_norm,
+                bsz, hidden, eps));
+            require_device_status(device_->q8_0_matmul(
+                *cb_mtp_logits_batch_, *mtp->shared_head_head,
+                *cb_mtp_norm_batch_, bsz, hidden, vocab));
+            trace_stage("argmax");
+            std::vector<DeviceArgmax> argmaxes;
+            require_device_status(device_->argmax_batch(
+                *cb_mtp_logits_batch_, bsz, vocab, argmaxes));
+            trace_stage("writeback");
+            for (uint32_t i = 0; i < bsz; ++i) {
+                ContinuousMtpDraftStep &step = steps[i];
+                ContinuousBatchActive &a = mtp_active[step.row];
+                QwenExecutor::MtpPrefixStateView view =
+                    a.executor->mtp_prefix_state_view();
+                if (!view.draft_hidden) {
+                    throw std::runtime_error("MTP draft hidden missing");
+                }
+                require_device_status(device_->copy_d2d_into(
+                    *view.draft_hidden, 0, *cb_mtp_h_batch_,
+                    static_cast<uint64_t>(i) * hidden, hidden));
+                a.executor->set_mtp_prefix_len(step.cache_pos + 1);
+                if (i < argmaxes.size()) {
+                    step.output_token = argmaxes[i].token;
+                    step.output_logit = argmaxes[i].logit;
+                }
+                step.report.ok = step.output_token >= 0;
+                step.report.argmax_token = step.output_token;
+                step.report.argmax_logit = step.output_logit;
+                if (step.output_token >= 0) {
+                    step.report.argmax_text = model_->gguf().token_text(
+                        static_cast<uint32_t>(step.output_token));
+                }
+                step.report.ops_executed = 1;
+            }
+            require_device_status(device_->end());
+            return true;
+        } catch (...) {
+            try { (void)device_->end(); } catch (...) {}
+            throw;
+        }
+    }
+
     void build_continuous_mtp_verify_batch(
             std::vector<ContinuousBatchActive> &mtp_active,
             const std::vector<ContinuousMtpVerifyJob> &jobs,
@@ -3863,18 +4229,110 @@ private:
                 msg << "native continuous_mtp_batched_draft:"
                     << " eligible=" << draft_ready
                     << " active=" << mtp_active.size()
-                    << " enabled=false";
+                    << " enabled="
+                    << (continuous_mtp_batched_draft_enabled()
+                            ? "true" : "false");
                 log(msg.str());
             }
             while (!mtp_active.empty()) {
                 std::vector<ContinuousMtpVerifyJob> jobs;
                 jobs.reserve(mtp_active.size());
+                std::vector<size_t> draft_rows;
+                draft_rows.reserve(mtp_active.size());
                 for (size_t row = 0; row < mtp_active.size(); ++row) {
                     ContinuousBatchActive &a = mtp_active[row];
-                    if (!a.req || a.decoded >= a.req->options.max_tokens ||
-                        should_stop(a, a.next_token)) {
-                        continue;
+                    if (a.req && a.decoded < a.req->options.max_tokens &&
+                        !should_stop(a, a.next_token)) {
+                        draft_rows.push_back(row);
                     }
+                }
+
+                std::vector<ContinuousMtpVerifyJob> batched_jobs;
+                if (continuous_mtp_batched_draft_enabled() &&
+                    draft_rows.size() >= 2) {
+                    batched_jobs.reserve(draft_rows.size());
+                    for (size_t row : draft_rows) {
+                        ContinuousBatchActive &a = mtp_active[row];
+                        ContinuousMtpVerifyJob job;
+                        job.row = row;
+                        job.current = a.next_token;
+                        job.base_position = a.executor->position();
+                        if (state_checkpoint_count == 0) {
+                            const double snapshot0 = wall_seconds();
+                            a.executor->capture_state(job.snapshot);
+                            stats[row].snapshot_s +=
+                                std::max(wall_seconds() - snapshot0, 0.0);
+                        }
+                        job.verify_tokens.push_back(job.current);
+                        batched_jobs.push_back(std::move(job));
+                    }
+                    bool batch_ok = true;
+                    for (uint32_t depth = 0; depth < chain_len && batch_ok;
+                         ++depth) {
+                        std::vector<ContinuousMtpDraftStep> steps;
+                        steps.reserve(batched_jobs.size());
+                        for (ContinuousMtpVerifyJob &job : batched_jobs) {
+                            ContinuousBatchActive &a = mtp_active[job.row];
+                            const uint32_t remaining =
+                                static_cast<uint32_t>(
+                                    a.req->options.max_tokens - a.decoded);
+                            const uint32_t draft_limit =
+                                stats[job.row].policy.draft_limit(remaining,
+                                                                   chain_len);
+                            if (depth >= draft_limit) continue;
+                            ContinuousMtpDraftStep step;
+                            step.row = job.row;
+                            step.input_token = depth == 0
+                                ? job.current
+                                : job.drafts.back();
+                            step.cache_pos = job.base_position + depth;
+                            steps.push_back(std::move(step));
+                        }
+                        if (steps.size() < 2) break;
+                        const double draft0 = wall_seconds();
+                        batch_ok = run_continuous_mtp_batched_draft_step(
+                            mtp_active, steps, depth == 0);
+                        const double per_row_s =
+                            std::max(wall_seconds() - draft0, 0.0) /
+                            static_cast<double>(steps.size());
+                        if (!batch_ok) break;
+                        for (const ContinuousMtpDraftStep &step : steps) {
+                            stats[step.row].draft_s += per_row_s;
+                            if (!step.report.ok || step.output_token < 0) {
+                                continue;
+                            }
+                            ContinuousBatchActive &a = mtp_active[step.row];
+                            const uint32_t token =
+                                static_cast<uint32_t>(step.output_token);
+                            if (should_stop(a, token)) continue;
+                            auto it = std::find_if(
+                                batched_jobs.begin(), batched_jobs.end(),
+                                [&](const ContinuousMtpVerifyJob &job) {
+                                    return job.row == step.row;
+                                });
+                            if (it == batched_jobs.end()) continue;
+                            it->drafts.push_back(token);
+                            it->verify_tokens.push_back(token);
+                            stats[step.row].drafted += 1;
+                        }
+                    }
+                    if (batch_ok) {
+                        for (ContinuousMtpVerifyJob &job : batched_jobs) {
+                            if (!job.drafts.empty()) {
+                                jobs.push_back(std::move(job));
+                            }
+                        }
+                    }
+                }
+
+                for (size_t row : draft_rows) {
+                    auto already = std::find_if(
+                        jobs.begin(), jobs.end(),
+                        [&](const ContinuousMtpVerifyJob &job) {
+                            return job.row == row;
+                        });
+                    if (already != jobs.end()) continue;
+                    ContinuousBatchActive &a = mtp_active[row];
                     const uint32_t current = a.next_token;
                     const uint32_t remaining =
                         static_cast<uint32_t>(
@@ -6250,6 +6708,26 @@ private:
     std::vector<std::unique_ptr<DeviceTensor>> cb_mtp_v_cache_storage_;
     QwenExecutor::KvCacheStorage cb_kv_cache_view_;
     QwenExecutor::KvCacheStorage cb_mtp_kv_cache_view_;
+    uint32_t cb_mtp_draft_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> cb_mtp_h_input_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_h_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_norm_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_concat_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_q_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_q_row_;
+    std::unique_ptr<DeviceTensor> cb_mtp_k_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_v_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_k_row_;
+    std::unique_ptr<DeviceTensor> cb_mtp_v_row_;
+    std::unique_ptr<DeviceTensor> cb_mtp_mid_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_mid_row_;
+    std::unique_ptr<DeviceTensor> cb_mtp_ffn_gate_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_ffn_up_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_ffn_mid_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_ffn_out_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_logits_batch_;
+    std::unique_ptr<DeviceTensor> cb_mtp_draft_positions_i32_;
+    uint32_t cb_mtp_draft_positions_capacity_ = 0;
     uint32_t cb_prefill_ragged_batch_capacity_ = 0;
     uint32_t cb_prefill_ragged_page_capacity_ = 0;
     uint32_t cb_prefill_ragged_row_capacity_ = 0;

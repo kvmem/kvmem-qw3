@@ -117,6 +117,7 @@ public:
         DeviceTensor *v_cache = nullptr;
         DeviceTensor *prefix_hidden = nullptr;
         DeviceTensor *current_hidden = nullptr;
+        DeviceTensor *draft_hidden = nullptr;
     };
 
     QwenExecutor(const QwenNativeModel &model,
@@ -138,6 +139,8 @@ public:
     KvStateSnapshot kv_state_snapshot() const;
     void prepare_runtime_state();
     void prepare_kv_pages(uint32_t logical_pos, uint32_t count);
+    void prepare_mtp_prefix_pages(uint32_t logical_pos, uint32_t count);
+    void set_mtp_prefix_len(uint32_t prefix_len);
     void prepare_decode_token_pages(uint32_t count = 1);
     void advance_position(uint32_t count = 1) { position_ += count; }
 

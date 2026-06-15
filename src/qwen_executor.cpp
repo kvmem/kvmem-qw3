@@ -140,6 +140,7 @@ QwenExecutor::MtpPrefixStateView QwenExecutor::mtp_prefix_state_view() {
     view.v_cache = mtp_v_cache;
     view.prefix_hidden = mtp_prefix_h_.get();
     view.current_hidden = h_.get();
+    view.draft_hidden = mtp_h_.get();
     return view;
 }
 
@@ -153,6 +154,20 @@ void QwenExecutor::prepare_runtime_state() {
 
 void QwenExecutor::prepare_kv_pages(uint32_t logical_pos, uint32_t count) {
     ensure_kv_pages(logical_pos, count);
+}
+
+void QwenExecutor::prepare_mtp_prefix_pages(uint32_t logical_pos,
+                                            uint32_t count) {
+    ensure_mtp_scratch();
+    mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, logical_pos, count);
+    if (external_mtp_kv_cache_) {
+        mtp_kv_pages_.validate_physical_capacity(
+            external_mtp_kv_cache_->physical_slots, "external MTP");
+    }
+}
+
+void QwenExecutor::set_mtp_prefix_len(uint32_t prefix_len) {
+    mtp_prefix_len_ = std::min<uint32_t>(prefix_len, kv_ctx_size_);
 }
 
 DeviceTensor &QwenExecutor::k_cache(uint32_t layer) {
