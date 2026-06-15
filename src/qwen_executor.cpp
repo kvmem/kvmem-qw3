@@ -63,12 +63,15 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
                            DeviceBackend &backend,
                            uint32_t kv_ctx_size,
                            KvPhysicalPageAllocator *kv_page_allocator,
-                           KvCacheStorage *external_kv_cache)
+                           KvCacheStorage *external_kv_cache,
+                           KvPhysicalPageAllocator *mtp_kv_page_allocator,
+                           KvCacheStorage *external_mtp_kv_cache)
     : model_(model), weights_(weights), backend_(backend),
       external_kv_cache_(external_kv_cache),
+      external_mtp_kv_cache_(external_mtp_kv_cache),
       kv_ctx_size_(kv_ctx_size) {
     kv_pages_.configure(kv_ctx_size_, kv_page_allocator);
-    mtp_kv_pages_.configure(kv_ctx_size_, nullptr);
+    mtp_kv_pages_.configure(kv_ctx_size_, mtp_kv_page_allocator);
 }
 
 QwenExecutor::~QwenExecutor() {
@@ -115,7 +118,17 @@ QwenExecutor::MutableDecodeStateView QwenExecutor::mutable_decode_state_view() {
 QwenExecutor::MtpPrefixStateView QwenExecutor::mtp_prefix_state_view() {
     ensure_mtp_scratch();
     MtpPrefixStateView view;
-    view.ready = mtp_scratch_ready_ && mtp_k_cache_ && mtp_v_cache_ &&
+    DeviceTensor *mtp_k_cache =
+        external_mtp_kv_cache_ &&
+                !external_mtp_kv_cache_->k_cache.empty()
+            ? external_mtp_kv_cache_->k_cache.front()
+            : mtp_k_cache_.get();
+    DeviceTensor *mtp_v_cache =
+        external_mtp_kv_cache_ &&
+                !external_mtp_kv_cache_->v_cache.empty()
+            ? external_mtp_kv_cache_->v_cache.front()
+            : mtp_v_cache_.get();
+    view.ready = mtp_scratch_ready_ && mtp_k_cache && mtp_v_cache &&
                  mtp_prefix_h_ && h_;
     view.prefix_len = mtp_prefix_len_;
     view.ctx_size = kv_ctx_size_;
@@ -123,8 +136,8 @@ QwenExecutor::MtpPrefixStateView QwenExecutor::mtp_prefix_state_view() {
     view.page_count = mtp_kv_pages_.count();
     view.page_indices_host = mtp_kv_pages_.host_indices();
     view.page_indices_device = mtp_kv_pages_.device_pages.get();
-    view.k_cache = mtp_k_cache_.get();
-    view.v_cache = mtp_v_cache_.get();
+    view.k_cache = mtp_k_cache;
+    view.v_cache = mtp_v_cache;
     view.prefix_hidden = mtp_prefix_h_.get();
     view.current_hidden = h_.get();
     return view;
@@ -172,6 +185,34 @@ DeviceTensor &QwenExecutor::v_cache(uint32_t layer) {
                                  std::to_string(layer));
     }
     return *v_cache_[layer];
+}
+
+DeviceTensor &QwenExecutor::mtp_k_cache() {
+    if (external_mtp_kv_cache_) {
+        if (external_mtp_kv_cache_->k_cache.empty() ||
+            external_mtp_kv_cache_->k_cache.front() == nullptr) {
+            throw std::runtime_error("external MTP K cache missing");
+        }
+        return *external_mtp_kv_cache_->k_cache.front();
+    }
+    if (!mtp_k_cache_) {
+        throw std::runtime_error("MTP K cache missing");
+    }
+    return *mtp_k_cache_;
+}
+
+DeviceTensor &QwenExecutor::mtp_v_cache() {
+    if (external_mtp_kv_cache_) {
+        if (external_mtp_kv_cache_->v_cache.empty() ||
+            external_mtp_kv_cache_->v_cache.front() == nullptr) {
+            throw std::runtime_error("external MTP V cache missing");
+        }
+        return *external_mtp_kv_cache_->v_cache.front();
+    }
+    if (!mtp_v_cache_) {
+        throw std::runtime_error("MTP V cache missing");
+    }
+    return *mtp_v_cache_;
 }
 
 QwenExecutor::KvStateSnapshot QwenExecutor::kv_state_snapshot() const {
@@ -273,6 +314,27 @@ void QwenExecutor::KvPageTable::ensure_pages(DeviceBackend &backend,
     }
 }
 
+void QwenExecutor::KvPageTable::validate_physical_capacity(
+        uint64_t physical_slots, const char *label) const {
+    if (page_size == 0) {
+        throw std::runtime_error(std::string(label) +
+                                 " KV page size is zero");
+    }
+    const uint64_t physical_pages =
+        (physical_slots + page_size - 1) / page_size;
+    for (int32_t page : pages) {
+        if (page < 0 || static_cast<uint64_t>(page) >= physical_pages) {
+            throw std::runtime_error(
+                std::string(label) +
+                " KV physical page out of cache bounds: page=" +
+                std::to_string(page) +
+                " physical_pages=" + std::to_string(physical_pages) +
+                " physical_slots=" + std::to_string(physical_slots) +
+                " page_size=" + std::to_string(page_size));
+        }
+    }
+}
+
 void QwenExecutor::KvPageTable::truncate_to_logical_pages(uint32_t logical_pages) {
     if (logical_pages >= pages.size()) return;
     std::vector<int32_t> released(
@@ -315,6 +377,10 @@ uint64_t QwenExecutor::KvPageTable::physical_slots() const {
 
 void QwenExecutor::ensure_kv_pages(uint32_t logical_pos, uint32_t count) {
     kv_pages_.ensure_pages(backend_, kv_ctx_size_, logical_pos, count);
+    if (external_kv_cache_) {
+        kv_pages_.validate_physical_capacity(external_kv_cache_->physical_slots,
+                                             "external");
+    }
 }
 
 void QwenExecutor::begin_record_timing(bool enabled) const {
@@ -475,7 +541,14 @@ void QwenExecutor::ensure_mtp_scratch() {
     const bool kv_use_q8 = kv_dtype_env && std::strcmp(kv_dtype_env, "q8") == 0;
     const bool kv_use_fp8 = kv_dtype_env && std::strcmp(kv_dtype_env, "fp8") == 0;
     const bool kv_use_fp16 = !kv_use_fp32 && !kv_use_q8 && !kv_use_fp8;
-    if (kv_use_q8) {
+    if (external_mtp_kv_cache_) {
+        if (external_mtp_kv_cache_->k_cache.empty() ||
+            external_mtp_kv_cache_->v_cache.empty() ||
+            !external_mtp_kv_cache_->k_cache.front() ||
+            !external_mtp_kv_cache_->v_cache.front()) {
+            throw std::runtime_error("external MTP KV cache is incomplete");
+        }
+    } else if (kv_use_q8) {
         mtp_k_cache_ = backend_.tensor_q8_kv(kv_per_pos * kv_slots, cfg.head_dim, "mtp_k_cache");
         mtp_v_cache_ = backend_.tensor_q8_kv(kv_per_pos * kv_slots, cfg.head_dim, "mtp_v_cache");
     } else if (kv_use_fp8) {
@@ -1552,27 +1625,33 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
 
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
     mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
+    if (external_mtp_kv_cache_) {
+        mtp_kv_pages_.validate_physical_capacity(
+            external_mtp_kv_cache_->physical_slots, "external MTP");
+    }
     const bool use_paged_prefix = mtp_paged_prefix_enabled();
+    DeviceTensor &mtp_k = mtp_k_cache();
+    DeviceTensor &mtp_v = mtp_v_cache();
     if (use_paged_prefix) {
-        require_status(backend_.kv_append_paged(
-            *mtp_k_cache_, *k_, cache_pos, per_pos,
-            mtp_kv_pages_.host_indices(), mtp_kv_pages_.count(),
-            mtp_kv_pages_.page_size));
-        require_status(backend_.kv_append_paged(
-            *mtp_v_cache_, *v_, cache_pos, per_pos,
-            mtp_kv_pages_.host_indices(), mtp_kv_pages_.count(),
-            mtp_kv_pages_.page_size));
+        require_status(backend_.kv_append_batch_paged_device(
+            mtp_k, *k_, cache_pos, per_pos,
+            1, mtp_kv_pages_.device_indices(),
+            mtp_kv_pages_.count(), mtp_kv_pages_.page_size));
+        require_status(backend_.kv_append_batch_paged_device(
+            mtp_v, *v_, cache_pos, per_pos,
+            1, mtp_kv_pages_.device_indices(),
+            mtp_kv_pages_.count(), mtp_kv_pages_.page_size));
     } else {
-        require_status(backend_.kv_append(*mtp_k_cache_, *k_, cache_pos, per_pos));
-        require_status(backend_.kv_append(*mtp_v_cache_, *v_, cache_pos, per_pos));
+        require_status(backend_.kv_append(mtp_k, *k_, cache_pos, per_pos));
+        require_status(backend_.kv_append(mtp_v, *v_, cache_pos, per_pos));
     }
     record(report, "mtp.kv_append");
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
     if (use_paged_prefix) {
-        require_status(backend_.attention_decode_batch_paged_gated(
-            *mid_, *q_, 2 * standard_head_dim, *mtp_k_cache_,
-            *mtp_v_cache_, mtp_kv_pages_.host_indices(),
+        require_status(backend_.attention_decode_batch_paged_gated_device(
+            *mid_, *q_, 2 * standard_head_dim, mtp_k,
+            mtp_v, mtp_kv_pages_.device_indices(),
             mtp_kv_pages_.count(), mtp_kv_pages_.page_size,
             standard_n_heads, standard_n_kv_heads, standard_head_dim,
             seq_len - 1, 1, 2 * standard_head_dim,
@@ -1580,7 +1659,7 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     } else {
         require_status(backend_.attention_decode(*mid_, *scores_, *q_,
                                                  2 * standard_head_dim,
-                                                 *mtp_k_cache_, *mtp_v_cache_,
+                                                 mtp_k, mtp_v,
                                                  standard_n_heads, standard_n_kv_heads,
                                                  standard_head_dim,
                                                  seq_len, scale));
@@ -2068,36 +2147,50 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
                                                cfg.rope_dim, base_position, cfg.rope_theta));
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
     mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, base_position, batch);
+    if (external_mtp_kv_cache_) {
+        mtp_kv_pages_.validate_physical_capacity(
+            external_mtp_kv_cache_->physical_slots, "external MTP");
+    }
     const bool use_paged_prefix = mtp_paged_prefix_enabled();
+    DeviceTensor &mtp_k = mtp_k_cache();
+    DeviceTensor &mtp_v = mtp_v_cache();
     if (use_paged_prefix) {
-        require_status(backend_.kv_append_batch_paged(
-            *mtp_k_cache_, *mtp_k_batch_, base_position, per_pos, batch,
-            mtp_kv_pages_.host_indices(), mtp_kv_pages_.count(),
+        require_status(backend_.kv_append_batch_paged_device(
+            mtp_k, *mtp_k_batch_, base_position, per_pos, batch,
+            mtp_kv_pages_.device_indices(), mtp_kv_pages_.count(),
             mtp_kv_pages_.page_size));
-        require_status(backend_.kv_append_batch_paged(
-            *mtp_v_cache_, *mtp_v_batch_, base_position, per_pos, batch,
-            mtp_kv_pages_.host_indices(), mtp_kv_pages_.count(),
+        require_status(backend_.kv_append_batch_paged_device(
+            mtp_v, *mtp_v_batch_, base_position, per_pos, batch,
+            mtp_kv_pages_.device_indices(), mtp_kv_pages_.count(),
             mtp_kv_pages_.page_size));
     } else {
-        require_status(backend_.kv_append_batch(*mtp_k_cache_, *mtp_k_batch_,
+        require_status(backend_.kv_append_batch(mtp_k, *mtp_k_batch_,
                                                 base_position, per_pos, batch));
-        require_status(backend_.kv_append_batch(*mtp_v_cache_, *mtp_v_batch_,
+        require_status(backend_.kv_append_batch(mtp_v, *mtp_v_batch_,
                                                 base_position, per_pos, batch));
     }
     record(report, "mtp.kv_append_batch");
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
     if (use_paged_prefix) {
-        require_status(backend_.attention_decode_batch_paged_gated(
+        DeviceStatus attn_st = backend_.attention_prefill_batch_paged_gated_device(
             *mtp_mid_batch_, *mtp_q_batch_, 2 * standard_head_dim,
-            *mtp_k_cache_, *mtp_v_cache_, mtp_kv_pages_.host_indices(),
+            mtp_k, mtp_v, mtp_kv_pages_.device_indices(),
             mtp_kv_pages_.count(), mtp_kv_pages_.page_size,
             standard_n_heads, standard_n_kv_heads, standard_head_dim,
-            base_position, batch, q_stride_buf, mid_stride, scale));
+            base_position, batch, q_stride_buf, mid_stride, scale);
+        if (!attn_st.ok) {
+            require_status(backend_.attention_decode_batch_paged_gated_device(
+                *mtp_mid_batch_, *mtp_q_batch_, 2 * standard_head_dim,
+                mtp_k, mtp_v, mtp_kv_pages_.device_indices(),
+                mtp_kv_pages_.count(), mtp_kv_pages_.page_size,
+                standard_n_heads, standard_n_kv_heads, standard_head_dim,
+                base_position, batch, q_stride_buf, mid_stride, scale));
+        }
     } else {
         require_status(backend_.attention_decode_batch_gated(
             *mtp_mid_batch_, *mtp_q_batch_, 2 * standard_head_dim,
-            *mtp_k_cache_, *mtp_v_cache_, standard_n_heads,
+            mtp_k, mtp_v, standard_n_heads,
             standard_n_kv_heads, standard_head_dim, base_position, batch,
             q_stride_buf, mid_stride, scale));
     }

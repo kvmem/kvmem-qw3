@@ -124,7 +124,9 @@ public:
                  DeviceBackend &backend,
                  uint32_t kv_ctx_size,
                  KvPhysicalPageAllocator *kv_page_allocator = nullptr,
-                 KvCacheStorage *external_kv_cache = nullptr);
+                 KvCacheStorage *external_kv_cache = nullptr,
+                 KvPhysicalPageAllocator *mtp_kv_page_allocator = nullptr,
+                 KvCacheStorage *external_mtp_kv_cache = nullptr);
     ~QwenExecutor();
 
     void reset_state();
@@ -219,6 +221,8 @@ private:
         void reset();
         void ensure_pages(DeviceBackend &backend, uint32_t ctx_size,
                           uint32_t logical_pos, uint32_t count);
+        void validate_physical_capacity(uint64_t physical_slots,
+                                        const char *label) const;
         void truncate_to_logical_pages(uint32_t logical_pages);
         int32_t allocate_physical_page(uint32_t logical_page) const;
         const int32_t *host_indices() const { return pages.data(); }
@@ -240,6 +244,8 @@ private:
     uint32_t kv_page_size() const { return kv_pages_.page_size; }
     DeviceTensor &k_cache(uint32_t layer);
     DeviceTensor &v_cache(uint32_t layer);
+    DeviceTensor &mtp_k_cache();
+    DeviceTensor &mtp_v_cache();
     bool has_external_kv_cache() const { return external_kv_cache_ != nullptr; }
     NativeExecutorReport forward_mtp_draft_from(uint32_t token_id,
                                                 const DeviceTensor &h_input,
@@ -315,6 +321,7 @@ private:
     std::vector<std::unique_ptr<DeviceTensor>> k_cache_;
     std::vector<std::unique_ptr<DeviceTensor>> v_cache_;
     KvCacheStorage *external_kv_cache_ = nullptr;
+    KvCacheStorage *external_mtp_kv_cache_ = nullptr;
 
     bool mtp_scratch_ready_ = false;
     std::unique_ptr<DeviceTensor> mtp_h_;

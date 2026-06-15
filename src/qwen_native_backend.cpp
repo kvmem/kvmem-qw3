@@ -963,6 +963,13 @@ public:
             cb_kv_pool_ =
                 std::make_unique<GlobalKvPagePool>(pool_pages, kv_page_size);
             allocate_continuous_kv_cache(pool_pages, kv_page_size);
+            const uint32_t mtp_pool_pages = std::max<uint32_t>(
+                1, env_uint32_or("QW3_CONTINUOUS_BATCHING_MTP_KV_POOL_PAGES",
+                                 pool_pages));
+            cb_mtp_kv_pool_ =
+                std::make_unique<GlobalKvPagePool>(mtp_pool_pages,
+                                                   kv_page_size);
+            allocate_continuous_mtp_kv_cache(mtp_pool_pages, kv_page_size);
         }
 
         st = device_->end();
@@ -3199,6 +3206,60 @@ private:
             " physical_slots=" + std::to_string(physical_slots));
     }
 
+    void allocate_continuous_mtp_kv_cache(uint32_t pool_pages,
+                                          uint32_t page_size) {
+        const QwenConfig &cfg = model_->config();
+        const uint64_t kv_per_pos =
+            static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+        const uint64_t physical_slots =
+            static_cast<uint64_t>(pool_pages) * page_size;
+        const std::string kv_dtype = env_lower_ascii(env_value("QW3_KV_DTYPE"));
+        const bool kv_use_fp32 = kv_dtype == "fp32";
+        const bool kv_use_q8 = kv_dtype == "q8";
+        const bool kv_use_fp8 = kv_dtype == "fp8";
+        const bool kv_use_fp16 = !kv_use_fp32 && !kv_use_q8 && !kv_use_fp8;
+
+        cb_mtp_k_cache_storage_.clear();
+        cb_mtp_v_cache_storage_.clear();
+        cb_mtp_k_cache_storage_.resize(1);
+        cb_mtp_v_cache_storage_.resize(1);
+        cb_mtp_kv_cache_view_.physical_slots = physical_slots;
+        cb_mtp_kv_cache_view_.k_cache.assign(1, nullptr);
+        cb_mtp_kv_cache_view_.v_cache.assign(1, nullptr);
+
+        if (kv_use_q8) {
+            cb_mtp_k_cache_storage_[0] = device_->tensor_q8_kv(
+                kv_per_pos * physical_slots, cfg.head_dim,
+                "cb_mtp_k_cache");
+            cb_mtp_v_cache_storage_[0] = device_->tensor_q8_kv(
+                kv_per_pos * physical_slots, cfg.head_dim,
+                "cb_mtp_v_cache");
+        } else if (kv_use_fp8) {
+            cb_mtp_k_cache_storage_[0] = device_->tensor_fp8_kv(
+                kv_per_pos * physical_slots, "cb_mtp_k_cache");
+            cb_mtp_v_cache_storage_[0] = device_->tensor_fp8_kv(
+                kv_per_pos * physical_slots, "cb_mtp_v_cache");
+        } else if (kv_use_fp16) {
+            cb_mtp_k_cache_storage_[0] = device_->tensor_f16(
+                kv_per_pos * physical_slots, "cb_mtp_k_cache");
+            cb_mtp_v_cache_storage_[0] = device_->tensor_f16(
+                kv_per_pos * physical_slots, "cb_mtp_v_cache");
+        } else {
+            cb_mtp_k_cache_storage_[0] = device_->tensor_f32(
+                kv_per_pos * physical_slots, "cb_mtp_k_cache");
+            cb_mtp_v_cache_storage_[0] = device_->tensor_f32(
+                kv_per_pos * physical_slots, "cb_mtp_v_cache");
+        }
+        cb_mtp_kv_cache_view_.k_cache[0] =
+            cb_mtp_k_cache_storage_[0].get();
+        cb_mtp_kv_cache_view_.v_cache[0] =
+            cb_mtp_v_cache_storage_[0].get();
+        log("native continuous_batching: global MTP KV cache pages=" +
+            std::to_string(pool_pages) +
+            " page_size=" + std::to_string(page_size) +
+            " physical_slots=" + std::to_string(physical_slots));
+    }
+
     void continuous_batch_worker_loop() {
         std::vector<ContinuousBatchActive> active;
         std::vector<ContinuousBatchActive> prefilling;
@@ -3344,7 +3405,8 @@ private:
             }
             auto executor = std::make_unique<QwenExecutor>(
                 *model_, *weights_, *device_, ctx_size,
-                cb_kv_pool_.get(), &cb_kv_cache_view_);
+                cb_kv_pool_.get(), &cb_kv_cache_view_,
+                cb_mtp_kv_pool_.get(), &cb_mtp_kv_cache_view_);
             executor->set_prefill_chunk_override(options_.prefill_chunk);
             std::vector<uint32_t> prompt = req->prompt_tokens;
             std::string generated = generate_mtp(
@@ -4250,7 +4312,8 @@ private:
         a.req = req;
         a.executor = std::make_unique<QwenExecutor>(
             *model_, *weights_, *device_, ctx_size,
-            cb_kv_pool_.get(), &cb_kv_cache_view_);
+            cb_kv_pool_.get(), &cb_kv_cache_view_,
+            cb_mtp_kv_pool_.get(), &cb_mtp_kv_cache_view_);
         a.executor->set_prefill_chunk_override(options_.prefill_chunk);
         a.executor->reset_state();
         a.seen_tokens.reserve(req->prompt_tokens.size() +
@@ -6180,9 +6243,13 @@ private:
     std::unique_ptr<BatchedPrefillExecutor> cb_prefill_executor_;
     std::unique_ptr<BatchedDecodeExecutor> cb_decode_executor_;
     std::unique_ptr<GlobalKvPagePool> cb_kv_pool_;
+    std::unique_ptr<GlobalKvPagePool> cb_mtp_kv_pool_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_v_cache_storage_;
+    std::vector<std::unique_ptr<DeviceTensor>> cb_mtp_k_cache_storage_;
+    std::vector<std::unique_ptr<DeviceTensor>> cb_mtp_v_cache_storage_;
     QwenExecutor::KvCacheStorage cb_kv_cache_view_;
+    QwenExecutor::KvCacheStorage cb_mtp_kv_cache_view_;
     uint32_t cb_prefill_ragged_batch_capacity_ = 0;
     uint32_t cb_prefill_ragged_page_capacity_ = 0;
     uint32_t cb_prefill_ragged_row_capacity_ = 0;
