@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <mutex>
@@ -29,6 +30,30 @@ using json = nlohmann::json;
 
 bool serve_continuous_batching_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING");
+}
+
+void setenv_value(const char *key, const std::string &value) {
+    setenv(key, value.c_str(), 1);
+}
+
+void setenv_value(const char *key, const char *value) {
+    setenv(key, value, 1);
+}
+
+void setenv_value(const char *key, int value) {
+    setenv_value(key, std::to_string(value));
+}
+
+void setenv_value(const char *key, uint64_t value) {
+    setenv_value(key, std::to_string(value));
+}
+
+void setenv_bool(const char *key, bool value) {
+    setenv_value(key, value ? "1" : "0");
+}
+
+const char *yesno(bool v) {
+    return v ? "1" : "0";
 }
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
@@ -717,16 +742,108 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     engine.backend = BackendKind::QwenNative;
     engine.native_heavy = true;
     if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
-    if (serve_continuous_batching_enabled()) {
-        if (std::getenv("QW3_MATMUL") == nullptr) {
-            setenv("QW3_MATMUL", "mmq", 1);
-        }
-        setenv("QW3_DISABLE_HGEMM", "1", 1);
-        std::cerr << "[qw3-serve] continuous batching matmul guard: "
-                  << "QW3_MATMUL=" << std::getenv("QW3_MATMUL")
-                  << " QW3_DISABLE_HGEMM=" << std::getenv("QW3_DISABLE_HGEMM")
-                  << "\n";
+    if (cfg.max_active <= 0) throw std::runtime_error("--max-active must be > 0");
+    if (cfg.max_pending <= 0) throw std::runtime_error("--max-pending must be > 0");
+    if (cfg.kv_page_size <= 0) throw std::runtime_error("--kv-page-size must be > 0");
+    if (cfg.kv_pool_pages < 0) throw std::runtime_error("--kv-pool-pages must be >= 0");
+    if (cfg.mtp_kv_pool_pages < 0) throw std::runtime_error("--mtp-kv-pool-pages must be >= 0");
+    if (cfg.kv_dtype != "fp16" && cfg.kv_dtype != "fp32" &&
+        cfg.kv_dtype != "q8" && cfg.kv_dtype != "fp8") {
+        throw std::runtime_error("invalid --kv-dtype (want fp16|fp32|q8|fp8): " + cfg.kv_dtype);
     }
+    if (engine.prefill_chunk < 0) {
+        engine.prefill_chunk = 2048;
+    }
+    if (!engine.native_mtp_chain_set) {
+        engine.native_mtp_chain = 0;
+    }
+    if (engine.native_mtp_chain < 0) {
+        throw std::runtime_error("--mtp-chain must be >= 0");
+    }
+    if (cfg.continuous_batching) {
+        if (!cfg.paged_kv_set) cfg.paged_kv = true;
+        if (!cfg.body_batch_set) cfg.body_batch = true;
+    }
+    if (cfg.continuous_batching && !cfg.paged_kv) {
+        throw std::runtime_error(
+            "--continuous-batching requires paged KV; remove --no-paged-kv");
+    }
+    if (!cfg.paged_kv) {
+        cfg.continuous_batching = false;
+        cfg.mtp_paged_prefix = false;
+    }
+    const bool mtp_enabled = !engine.native_mtp_trace && engine.native_mtp_chain > 0;
+    engine.native_mtp_speculate = mtp_enabled;
+    if (mtp_enabled && cfg.continuous_batching && !cfg.mtp_batched_draft_set) {
+        cfg.mtp_batched_draft = true;
+    }
+    if (mtp_enabled && cfg.paged_kv && !cfg.mtp_paged_prefix_set) {
+        cfg.mtp_paged_prefix = true;
+    }
+    if (!mtp_enabled) {
+        cfg.mtp_batched_draft = false;
+        cfg.mtp_paged_prefix = false;
+    }
+
+    // The backend still reads several low-level toggles from process config.
+    // Keep that as an internal bridge; the user-facing API is the explicit CLI
+    // surface above, and this happens before model load.
+    setenv_bool("QW3_CONTINUOUS_BATCHING", cfg.continuous_batching);
+    setenv_bool("QW3_CONTINUOUS_BATCHING_BODY_BATCH", cfg.body_batch);
+    setenv_bool("QW3_CONTINUOUS_MTP_BATCHED_DRAFT", cfg.mtp_batched_draft);
+    setenv_bool("QW3_MTP_PAGED_PREFIX", cfg.mtp_paged_prefix);
+    setenv_bool("QW3_MTP_SPECULATE", engine.native_mtp_speculate);
+    setenv_value("QW3_KV_DTYPE", cfg.kv_dtype);
+    setenv_value("QW3_MATMUL", "mmq");
+    setenv_bool("QW3_DISABLE_HGEMM", true);
+    setenv_value("QW3_PAGED_KV_PAGE_SIZE", cfg.kv_page_size);
+    setenv_value("QW3_CONTINUOUS_BATCHING_MAX_ACTIVE", cfg.max_active);
+    setenv_value("QW3_CONTINUOUS_BATCHING_MAX_PENDING", cfg.max_pending);
+    if (cfg.max_total_tokens_set) {
+        setenv_value("QW3_CONTINUOUS_BATCHING_MAX_TOTAL_TOKENS", cfg.max_total_tokens);
+    }
+    if (cfg.kv_pool_pages > 0) {
+        setenv_value("QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES", cfg.kv_pool_pages);
+    }
+    if (cfg.mtp_kv_pool_pages > 0) {
+        setenv_value("QW3_CONTINUOUS_BATCHING_MTP_KV_POOL_PAGES", cfg.mtp_kv_pool_pages);
+    }
+
+    std::cerr << "[qw3-serve] effective serving parameters:\n"
+              << "  host=" << cfg.host << "\n"
+              << "  port=" << cfg.port << "\n"
+              << "  model=" << engine.model_path << "\n"
+              << "  backend=" << backend_kind_name(engine.backend) << "\n"
+              << "  native_kernels=" << engine.native_kernels << "\n"
+              << "  ctx=" << engine.ctx_size << "\n"
+              << "  batch=" << engine.batch_size << "\n"
+              << "  prefill_chunk=" << engine.prefill_chunk << "\n"
+              << "  kv_dtype=" << cfg.kv_dtype << "\n"
+              << "  paged_kv=" << yesno(cfg.paged_kv) << "\n"
+              << "  kv_page_size=" << cfg.kv_page_size << "\n"
+              << "  kv_pool_pages=" << cfg.kv_pool_pages << " (0=auto)\n"
+              << "  mtp_kv_pool_pages=" << cfg.mtp_kv_pool_pages << " (0=auto)\n"
+              << "  continuous_batching=" << yesno(cfg.continuous_batching) << "\n"
+              << "  body_batch=" << yesno(cfg.body_batch) << "\n"
+              << "  max_active=" << cfg.max_active << "\n"
+              << "  max_pending=" << cfg.max_pending << "\n"
+              << "  max_total_tokens="
+              << (cfg.max_total_tokens_set ? std::to_string(cfg.max_total_tokens)
+                                           : std::string("auto(ctx)"))
+              << "\n"
+              << "  mtp_chain=" << engine.native_mtp_chain << "\n"
+              << "  mtp_speculate=" << yesno(engine.native_mtp_speculate) << "\n"
+              << "  mtp_batched_draft=" << yesno(cfg.mtp_batched_draft) << "\n"
+              << "  mtp_paged_prefix=" << yesno(cfg.mtp_paged_prefix) << "\n"
+              << "  matmul=mmq\n"
+              << "  disable_hgemm=1\n"
+              << "  default_max_tokens="
+              << (cfg.default_max_tokens_set
+                      ? std::to_string(cfg.default_generation.max_tokens)
+                      : std::string("remaining_context"))
+              << "\n"
+              << "  enable_thinking_default="
+              << yesno(cfg.enable_thinking_default) << "\n";
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
     Engine eng(engine);

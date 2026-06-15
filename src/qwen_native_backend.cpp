@@ -3321,12 +3321,9 @@ private:
                                 mtp_reqs.push_back(arrivals.front());
                                 arrivals.pop_front();
                             }
-                            if (mtp_reqs.size() >= 2) {
+                            if (!mtp_reqs.empty()) {
                                 run_continuous_mtp_batch_requests(
                                     mtp_reqs, ctx_size, max_active);
-                            } else if (!mtp_reqs.empty()) {
-                                run_continuous_mtp_request(
-                                    mtp_reqs.front(), ctx_size);
                             }
                         }
                         break;
@@ -4194,21 +4191,36 @@ private:
                 admit_mtp_request(req);
             }
 
-            while (mtp_active.size() < max_active) {
-                std::shared_ptr<ContinuousBatchRequest> req;
-                {
-                    std::lock_guard<std::mutex> lk(cb_mu_);
-                    if (cb_pending_.empty() || !cb_pending_.front() ||
-                        !cb_pending_.front()->active_mtp ||
-                        !cb_pending_.front()->spec_mtp ||
-                        cb_pending_.front()->trace_mtp) {
-                        break;
+            auto admit_pending_mtp_requests = [&]() {
+                uint32_t admitted = 0;
+                while (mtp_active.size() < max_active) {
+                    std::shared_ptr<ContinuousBatchRequest> req;
+                    {
+                        std::lock_guard<std::mutex> lk(cb_mu_);
+                        if (cb_pending_.empty() || !cb_pending_.front() ||
+                            !cb_pending_.front()->active_mtp ||
+                            !cb_pending_.front()->spec_mtp ||
+                            cb_pending_.front()->trace_mtp) {
+                            break;
+                        }
+                        req = cb_pending_.front();
+                        cb_pending_.pop_front();
                     }
-                    req = cb_pending_.front();
-                    cb_pending_.pop_front();
+                    admit_mtp_request(req);
+                    ++admitted;
                 }
-                admit_mtp_request(req);
-            }
+                if (admitted > 0 && continuous_batching_trace_enabled()) {
+                    std::ostringstream msg;
+                    msg << "native continuous_mtp_admit_pending:"
+                        << " admitted=" << admitted
+                        << " active=" << mtp_active.size()
+                        << " max_active=" << max_active;
+                    log(msg.str());
+                }
+                return admitted;
+            };
+
+            admit_pending_mtp_requests();
 
             if (!cb_prefill_executor_) {
                 cb_prefill_executor_ =
@@ -4235,6 +4247,7 @@ private:
                 log(msg.str());
             }
             while (!mtp_active.empty()) {
+                admit_pending_mtp_requests();
                 std::vector<ContinuousMtpVerifyJob> jobs;
                 jobs.reserve(mtp_active.size());
                 std::vector<size_t> draft_rows;

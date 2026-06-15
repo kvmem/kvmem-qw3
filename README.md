@@ -215,10 +215,6 @@ performance on the table on consumer Blackwell.
 
 ```sh
 ./build/qw3 \
-  --backend qwen-native \
-  --native-heavy \
-  --native-kernels cuda \
-  --native-linear-backend auto \
   --model /path/to/Qwen3.6-27B-Q8_0.gguf \
   -p "Explain Adam optimizer in one paragraph." \
   -n 256
@@ -228,10 +224,10 @@ Key flags (see `qw3 --help` for the full list):
 
 | Flag | Purpose |
 |---|---|
-| `--backend qwen-native`        | Use qw3's native engine (the optimization path). |
-| `--native-heavy`               | Run the full forward (without this, only no-op plan validation runs). |
-| `--native-kernels cuda`        | Pick the CUDA device backend. |
-| `--native-linear-backend auto` | Custom Q8 kernels for big matmuls. Use `custom` to force, `cublas` to experiment. |
+| `--backend qwen-native`        | Native engine. This is now the default; use `--backend llama-cli` only for external llama.cpp comparison. |
+| `--native-heavy`               | Compatibility flag. Native generation is enabled by default. |
+| `--native-kernels cuda`        | Diagnostic override. CUDA is the default and currently required for native inference. |
+| `--native-linear-backend auto` | Diagnostic override for linear backend A/B tests. Default is `auto`. |
 | `-p "..."` / `--prompt-file`   | Prompt (chat-formatted by default; use `--raw` to skip Qwen chat template). |
 | `--system "..."`               | System prompt (default: a generic assistant prompt). |
 | `--think`                      | Don't inject the empty `<think>` block. |
@@ -262,22 +258,35 @@ the target verifies them in a single batched forward and accepts the longest
 greedy-matching prefix, rolling back KV + DeltaNet recurrent state on the first
 rejection.
 
+Single-request speculative decode:
+
 ```sh
-# Speculative decode, draft chain of 2, mandatory adaptive depth controller:
-QW3_MTP_POLICY=adaptive ./build/qw3 \
-  --backend qwen-native --native-heavy --native-kernels cuda \
-  --native-linear-backend auto \
+./build/qw3 \
   --model /path/to/Qwen3.6-27B-Q8_0.gguf \
-  --native-mtp-speculate --native-mtp-chain 2 \
-  -p "Explain Adam optimizer in one paragraph." -n 256
+  --mtp-chain 2 \
+  -p "Explain Adam optimizer in one paragraph." \
+  -n 256
+```
+
+Serving with MTP:
+
+```sh
+./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --continuous-batching \
+  --max-active 4 \
+  --kv-dtype fp8 \
+  --mtp-chain 4
 ```
 
 | Flag | Purpose |
 |---|---|
-| `--native-mtp-speculate` | Enable the speculative decode path (draft → batched verify → accept/rollback). |
-| `--native-mtp-chain N`   | Draft chain length (default 1). With `QW3_MTP_POLICY=adaptive`, this is the starting depth. |
-| `--native-mtp-trace`     | Diagnostic: run the draft head once per step and report acceptance, without speculating. |
-| `--native-mtp-prefix`    | Diagnostic: prime the MTP prefix KV cache before drafting. |
+| `--mtp-chain N` | MTP speculative chain length. `0` disables MTP; `N>0` enables speculative decode. |
+| `--continuous-batching` | Enables the service scheduler. When combined with `--mtp-chain N`, the server enables the continuous MTP path. |
+| `--mtp-batched-draft` / `--no-mtp-batched-draft` | Force-enable or force-disable batched MTP draft projection/FFN/logits in serving. By default this is enabled when MTP + continuous batching are enabled. |
+| `--mtp-paged-prefix` / `--no-mtp-paged-prefix` | Force-enable or force-disable the paged MTP prefix cache. By default this is enabled when MTP + paged KV are enabled. |
+| `--native-mtp-chain N` | Compatibility alias for `--mtp-chain N`. Prefer `--mtp-chain`. |
+| `--native-mtp-trace` | Diagnostic mode: run draft-head tracing without normal speculation. |
 
 **Acceptance / lossiness.** Speculative decode is greedy-lossless *when the
 draft-built and decode-built KV caches come from the same attention kernel*. The
@@ -296,7 +305,7 @@ attention backend.
 Scripts (`./build/qw3` is the default binary path):
 
 ```sh
-# Acceptance sweep (trace or --mtp-speculate), compact table + optional JSON:
+# Acceptance sweep, compact table + optional JSON:
 python3 scripts/mtp_acceptance_probe.py --mtp-chain 2 --mtp-speculate -n 64
 
 # Head-to-head vs llama.cpp draft-MTP (needs llama-server with --spec-type draft-mtp):
@@ -305,11 +314,14 @@ python3 scripts/mtp_compare_with_llama_cpp.py --mtp-chains 2 --prompt-tokens "40
 
 ### Adaptive MTP depth policy
 
-`QW3_MTP_POLICY=adaptive` runs a benefit/cost controller that promotes or demotes
-the draft depth from windowed acceptance statistics (benefit =
-`full_accept_rate / avg_committed_tokens`; marginal cost from a per-depth
-round-cost table). Add `QW3_MTP_POLICY_TRACE=1` to log per-batch
-`depth / action / benefit / cost`. Tuning knobs (all optional):
+The current serving recommendation is to choose a fixed chain with
+`--mtp-chain N` and benchmark it for the workload. The older adaptive controller
+still exists as a development diagnostic. If enabled with `QW3_MTP_POLICY`, it
+promotes or demotes the draft depth from windowed acceptance statistics
+(benefit = `full_accept_rate / avg_committed_tokens`; marginal cost from a
+per-depth round-cost table). Add `QW3_MTP_POLICY_TRACE=1` to log per-batch
+`depth / action / benefit / cost`. These knobs are not required for normal
+serving:
 
 | Env var | Default | Effect |
 |---|---|---|
@@ -324,6 +336,9 @@ round-cost table). Add `QW3_MTP_POLICY_TRACE=1` to log per-batch
 
 ### MTP correctness / verifier knobs
 
+These are internal diagnostic knobs for verifier A/B tests. They are not part
+of the normal serving startup command.
+
 | Env var | Default | Effect |
 |---|---|---|
 | `QW3_MTP_VERIFY`              | `batched` | `sequential` verifies drafts one token at a time (slower; same acceptance). |
@@ -331,10 +346,459 @@ round-cost table). Add `QW3_MTP_POLICY_TRACE=1` to log per-batch
 | `QW3_MTP_PREFIX_MAX_PROMPT`   | guard   | Disables prefix priming above this prompt length (falls back gracefully). |
 | `QW3_MTP_TRANSACTIONAL_REPLAY`| `1`     | Commit verifier tokens through the stable single-token state path. |
 
-## Tuning knobs
+## Paged KV and continuous batching
 
-Most defaults are correct on Blackwell + Qwen 3.6. The env knobs below are
-useful for A/B-ing kernel choices or recovering from regressions:
+The `continuous_batching` branch now has a service-oriented paged-KV and
+continuous-batching path for OpenAI-compatible workloads. Service behavior is
+controlled by explicit `qw3 serve` switches. Some lower-level backend toggles
+still exist for development diagnostics, but normal serving should not require
+setting environment variables.
+
+### Current implementation status
+
+Implemented:
+
+- **Request-isolated logical page tables.** Each request owns a logical KV page
+  table. Logical pages map to physical pages allocated by a backend-level page
+  allocator.
+- **Global physical KV pool for continuous batching.** When the server is
+  started with `--continuous-batching`, standard attention K/V storage is
+  allocated once at backend load time and shared by active request executors
+  through per-request page tables.
+- **Paged KV dtypes.** Continuous batching supports `fp16` and raw e4m3 `fp8`
+  KV cache storage. FP8 paged decode paths dispatch through the FP8 FlashInfer
+  launcher instead of accidentally reading FP8 cache as FP16.
+- **OpenAI-compatible service routing.** `/v1/chat/completions` and
+  `/v1/completions` can route greedy, streaming, tools-shaped, and OpenCode-like
+  requests through the continuous scheduler. Usage accounting reports real
+  prompt/completion token counts for both streaming and non-streaming responses.
+- **Admission control.** The service tracks active requests, pending requests,
+  and token reservations. Over-context prompts return HTTP 413; pool/token
+  exhaustion returns clear admission errors instead of crashing the worker.
+- **Batched decode executor.** The body-batch path can batch standard attention
+  layers with per-row RoPE positions, ragged paged KV append, FlashInfer ragged
+  paged decode attention, FFN, recurrent layers, lm-head, and argmax for greedy
+  no-penalty requests. Unsupported sampling/penalty cases fall back to the
+  delegated safe path.
+- **Continuous MTP integration.** MTP speculative decode can run with paged KV
+  and continuous batching. The verifier is batched; the MTP draft path can also
+  batch the expensive projection/FFN/logits work across requests. This is the
+  default when serving with `--continuous-batching --mtp-chain N`.
+
+Not complete yet:
+
+- **True fully batched MTP attention.** Current batched MTP draft uses batched
+  projection/FFN/logits, but per-row paged MTP attention is still used for
+  stability. A direct ragged paged attention call with MTP's gated Q layout
+  exposed a crash, so the stable path reuses the existing paged MTP attention
+  interface row-by-row rather than adding a new kernel.
+- **True FlashInfer paged prefill everywhere.** Plain local prefill was restored
+  to the contiguous high-throughput FlashInfer prefill path by default.
+  External/global KV pool prefill still needs a true FlashInfer paged prefill
+  integration to recover the same prefill throughput without giving up paged KV
+  storage.
+- **Sampling and penalties in the full batched body executor.** Greedy
+  no-penalty requests use the optimized body-batch path. Sampling, presence
+  penalty, and repetition penalty still use the safer fallback path where full
+  logits are required.
+- **Large-matrix benchmark coverage.** Current regression and smoke benchmarks
+  cover correctness and representative throughput, but the full 4K/8K/16K/64K/
+  128K by concurrency matrix should be rerun before declaring service-level
+  performance final.
+
+### Service command
+
+`qw3 serve` defaults to the conservative baseline: one request at a time,
+FP16 KV, no global paged-KV serving pool, no continuous batching, and no MTP.
+Use explicit flags to opt into the newer serving features.
+
+```sh
+./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+Notes:
+
+- `--ctx` already defaults to `262144`.
+- Omit `-n` for OpenAI-compatible serving if the desired default is "use the
+  remaining context window". Passing `-n N` installs an explicit service-side
+  generation cap.
+- Serving defaults to `--kv-dtype fp16`. Use `--kv-dtype fp8` for lower KV
+  memory pressure after FP8 validation.
+- Add `--continuous-batching` to enable the continuous scheduler. This also
+  enables the required global paged-KV serving pool and body-batch decode
+  executor by default.
+- Add `--paged-kv` to enable the global paged-KV serving pool explicitly.
+- Use `--mtp-chain N` to control MTP. `--mtp-chain 0` is the default and means
+  MTP is off. `N>0` enables MTP speculation.
+- Use `--max-active N` to raise or lower continuous-batching concurrency once
+  `--continuous-batching` is enabled.
+- Use `--kv-page-size N`, `--kv-pool-pages N`, and `--mtp-kv-pool-pages N` to
+  tune the paged-KV pool. `0` pool pages means auto.
+- The intended serving matmul path is MMQ and HGEMM is disabled internally for
+  `qw3 serve`; HGEMM is not part of the continuous batching optimization plan.
+
+Serving feature switches:
+
+| Switch | Default | Effect |
+|---|---:|---|
+| `--continuous-batching` | off | Enables the continuous scheduler. Also enables paged KV and body batch unless explicitly disabled. |
+| `--no-continuous-batching` | n/a | Compatibility/debug switch to force the baseline single-request service path. |
+| `--paged-kv` | off | Enables the global paged-KV serving pool without enabling the continuous scheduler. |
+| `--no-paged-kv` | n/a | Disables the global paged-KV pool. Cannot be combined with `--continuous-batching`. |
+| `--body-batch` | on when continuous batching is on | Enables the optimized greedy decode body executor. |
+| `--no-body-batch` | n/a | Forces the safer delegated per-request body path. |
+| `--max-active N` | `2` | Maximum active continuous requests admitted to the decode loop. |
+| `--max-pending N` | `128` | Maximum queued requests waiting for continuous admission. |
+| `--max-total-tokens N` | `ctx` | Admission token reservation budget. `0` disables this budget. |
+| `--kv-page-size N` | `16` | Logical and physical KV page size in tokens. |
+| `--kv-pool-pages N` | auto | Number of physical pages in the global KV pool. `0` means auto. |
+| `--mtp-kv-pool-pages N` | auto | Number of physical pages in the separate MTP prefix KV pool. `0` means auto. |
+| `--kv-dtype fp16\|fp8\|fp32\|q8` | `fp16` | KV cache dtype. FP16 is the conservative default; FP8 reduces KV memory. |
+| `--mtp-chain N` | `0` | MTP speculative chain length. `0` disables MTP; `N>0` enables it. |
+| `--mtp-batched-draft` | auto | Forces batched MTP draft projection/FFN/logits. Auto-on for MTP + continuous batching. |
+| `--no-mtp-batched-draft` | n/a | Disables batched MTP draft for debugging. |
+| `--mtp-paged-prefix` | auto | Forces paged MTP prefix KV. Auto-on for MTP + paged KV. |
+| `--no-mtp-paged-prefix` | n/a | Disables paged MTP prefix for debugging. |
+
+Explicit examples:
+
+Enable continuous batching:
+
+```sh
+./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --continuous-batching
+```
+
+Enable continuous batching with FP8 KV and MTP:
+
+```sh
+./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --continuous-batching \
+  --kv-dtype fp8 \
+  --mtp-chain 4
+```
+
+Increase active continuous requests:
+
+```sh
+./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --continuous-batching \
+  --max-active 4 \
+  --max-pending 128
+```
+
+Tune paged-KV block and pool sizing:
+
+```sh
+./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --continuous-batching \
+  --kv-page-size 32 \
+  --kv-pool-pages 8192 \
+  --mtp-kv-pool-pages 8192
+```
+
+### OpenAI-compatible smoke tests
+
+Model list:
+
+```sh
+curl -sS http://127.0.0.1:8080/v1/models
+```
+
+Non-streaming chat:
+
+```sh
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.6-27B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "你好，用一句话介绍你自己。"}],
+    "temperature": 0,
+    "max_tokens": 64
+  }'
+```
+
+Streaming chat:
+
+```sh
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.6-27B-Q8_0.gguf",
+    "stream": true,
+    "stream_options": {"include_usage": true},
+    "messages": [{"role": "user", "content": "写一个三句话的科幻故事。"}],
+    "temperature": 0,
+    "max_tokens": 128
+  }'
+```
+
+Simple concurrent probe:
+
+```sh
+python3 - <<'PY'
+import concurrent.futures, json, urllib.request
+
+url = "http://127.0.0.1:8080/v1/chat/completions"
+prompts = [
+    "请帮我写一个末日生存的小说开头。",
+    "请帮我写一个末日生存的小说开头。",
+    "请帮我写一个末日生存的小说开头。",
+    "请帮我写一个末日生存的小说开头。",
+]
+
+def run(i, prompt):
+    body = json.dumps({
+        "model": "Qwen3.6-27B-Q8_0.gguf",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 128,
+    }).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        data = json.loads(resp.read().decode())
+    text = data["choices"][0]["message"]["content"]
+    usage = data.get("usage", {})
+    return i, len(text), usage
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+    for row in ex.map(lambda x: run(*x), enumerate(prompts)):
+        print(row)
+PY
+```
+
+### Regression commands
+
+Paged KV regression:
+
+```sh
+python3 scripts/paged_kv_regression.py \
+  --qw3 ./build/qw3 \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --page-sizes '16 32' \
+  --alloc-modes 'identity reverse' \
+  --prompts 'short chinese' \
+  --max-tokens 8 \
+  --ctx 1024 \
+  --prefill-chunk 512 \
+  --out-json /tmp/qw3_paged_kv_regression.json \
+  --timeout 900
+```
+
+Continuous batching regression:
+
+```sh
+python3 scripts/continuous_batching_regression.py \
+  --qw3 ./build/qw3 \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --prompts 'capital math cuda chinese' \
+  --max-tokens 8 \
+  --ctx 1024 \
+  --prefill-chunk 512 \
+  --out-json /tmp/qw3_continuous_batching_regression.json \
+  --timeout 900 \
+  --max-active 4 \
+  --min-batch 2 \
+  --enable-body-batch \
+  --require-body-batch-mode \
+  --require-ragged-metadata
+```
+
+Continuous batching with FP8 KV:
+
+```sh
+python3 scripts/continuous_batching_regression.py \
+  --qw3 ./build/qw3 \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --prompts 'capital math cuda chinese' \
+  --max-tokens 8 \
+  --ctx 1024 \
+  --prefill-chunk 512 \
+  --out-json /tmp/qw3_continuous_batching_fp8_regression.json \
+  --timeout 900 \
+  --max-active 4 \
+  --min-batch 2 \
+  --enable-body-batch \
+  --require-body-batch-mode \
+  --require-ragged-metadata \
+  --extra-arg=--kv-dtype \
+  --extra-arg=fp8
+```
+
+MTP + continuous batching regression:
+
+```sh
+python3 scripts/mtp_continuous_regression.py \
+  --qw3 ./build/qw3 \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --ctx 4096 \
+  --max-tokens 16 \
+  --chain 4 \
+  --kv-dtype fp8 \
+  --concurrent-continuous 2 \
+  --timeout 900 \
+  --out-json /tmp/qw3_mtp_continuous_default_fp8.json \
+  --skip-text-compare
+```
+
+MTP + continuous batching with FP16 KV:
+
+```sh
+python3 scripts/mtp_continuous_regression.py \
+  --qw3 ./build/qw3 \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --ctx 4096 \
+  --max-tokens 16 \
+  --chain 4 \
+  --kv-dtype fp16 \
+  --concurrent-continuous 2 \
+  --timeout 900 \
+  --out-json /tmp/qw3_mtp_continuous_fp16.json \
+  --skip-text-compare
+```
+
+### Benchmark commands and current results
+
+Continuous batching smoke benchmark:
+
+```sh
+python3 scripts/continuous_batching_benchmark.py \
+  --qw3 ./build/qw3 \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --prompts 'capital math' \
+  --max-tokens 32 \
+  --ctx 2048 \
+  --prefill-chunk 512 \
+  --out-json /tmp/qw3_cb_benchmark_smoke.json \
+  --timeout 900 \
+  --max-active 2 \
+  --variants 'plain continuous body recurrent'
+```
+
+Observed smoke result:
+
+| Variant | Completion throughput |
+|---|---:|
+| plain | 43.52 tok/s |
+| continuous | 43.91 tok/s |
+| body | 47.17 tok/s |
+| recurrent | 70.98 tok/s |
+
+MTP continuous-batching throughput check:
+
+```sh
+python3 scripts/mtp_throughput_benchmark.py \
+  --qw3 ./build/qw3 \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --ctx 4096 \
+  --max-tokens 128 \
+  --prompt-repeat 32 \
+  --chain 4 \
+  --kv-dtype fp8 \
+  --concurrency-levels '1,4' \
+  --modes 'continuous,continuous_mtp' \
+  --timeout 900 \
+  --out-json /tmp/qw3_mtp_batched_draft_compare_c1_c4_fp8.json
+```
+
+Short smoke variant used during README validation:
+
+```sh
+python3 scripts/mtp_throughput_benchmark.py \
+  --qw3 ./build/qw3 \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --ctx 4096 \
+  --max-tokens 32 \
+  --prompt-repeat 8 \
+  --chain 4 \
+  --kv-dtype fp8 \
+  --concurrency-levels '1,2' \
+  --modes 'continuous,continuous_mtp' \
+  --timeout 900 \
+  --out-json /tmp/qw3_mtp_batched_draft_smoke_fp8.json
+```
+
+Observed short smoke result:
+
+| Mode | Concurrency | Output throughput | Notes |
+|---|---:|---:|---|
+| continuous | 1 | 37.28 tok/s | no MTP |
+| continuous | 2 | 61.75 tok/s | no MTP |
+| continuous_mtp | 1 | 58.29 tok/s | 18 accepted / 38 drafted |
+| continuous_mtp | 2 | 74.03 tok/s | 43 accepted / 76 drafted |
+
+Observed result after `7081750 Batch MTP draft across continuous requests`:
+
+| Mode | Concurrency | Output throughput | Notes |
+|---|---:|---:|---|
+| continuous | 1 | 39.46 tok/s | no MTP |
+| continuous | 4 | 112.51 tok/s | no MTP |
+| continuous_mtp | 1 | 97.97 tok/s | 95 accepted / 131 drafted |
+| continuous_mtp | 4 | 117.85 tok/s | 365 accepted / 570 drafted, 146 verifier batches |
+
+This is the first measured point where MTP plus continuous batching beats
+ordinary continuous batching at four concurrent requests on this benchmark
+(`117.85 tok/s` vs `112.51 tok/s`). Before the batched draft change, the same
+4-way MTP benchmark was around `88 tok/s`; the draft compute was still mostly
+per-request and dominated high-concurrency MTP.
+
+### Development checkpoints
+
+Recent local commits on the `continuous_batching` branch:
+
+| Commit | Summary |
+|---|---|
+| `7081750` | Batch MTP draft across continuous requests. |
+| `13ae691` | Stabilize paged MTP prefix cache with a separate global MTP KV pool and FlashInfer paged prefill for prefix priming. |
+| `e2ad3c7` | Add paged MTP prefix cache path. |
+| `0f70675` | Add continuous MTP batched verifier path. |
+
+The latest validated baseline at the time of writing:
+
+- `cmake --build build -j`: passed.
+- `git diff --check`: passed.
+- MTP continuous regression, default FP8 path: passed.
+- MTP continuous regression, FP8 path: passed.
+- MTP continuous regression, FP16 path: passed.
+
+### Next optimization priorities
+
+1. **Implement true FlashInfer paged prefill for global KV.** This is the
+   highest-priority paged-KV performance item. Local/plain prefill can reach
+   the contiguous FlashInfer prefill path, but continuous batching with global
+   paged KV still needs the proper paged prefill interface.
+2. **Make MTP attention truly batched.** Current batched MTP draft batches the
+   heavy projection/FFN/logits work, but attention remains per-row for
+   stability. The next step is to adapt FlashInfer paged decode/paged-ragged
+   decode to MTP's gated Q layout without writing a custom attention kernel.
+3. **Broaden FP8 KV coverage.** FP8 paged decode and MTP regression pass, but
+   long-context and higher-concurrency FP8 sweeps should be repeated before
+   treating FP8 KV as the production default.
+4. **Finish the full throughput matrix.** Run 4K, 8K, 16K, 64K, and 128K
+   prompt lengths with concurrency 1/2/4/8 and decode length 512 for
+   prefill/decode throughput reporting.
+5. **Sampling/penalty batching.** The optimized body-batch executor currently
+   targets greedy no-penalty requests. Sampling and penalty paths need a batched
+   logits/filtering design before they can use the same high-throughput body
+   executor.
+6. **OpenAI compatibility stress tests.** Continue OpenCode/tool-call/streaming
+   tests with multiple concurrent agents, long conversations, cancellation, and
+   client disconnects.
+
+## Development tuning knobs
+
+Most defaults are correct on Blackwell + Qwen 3.6. Normal serving should use
+the explicit `qw3 serve` switches above. The environment knobs below are
+developer diagnostics for A/B-ing kernel choices, disabling a specific
+sub-path, or recovering from regressions:
 
 | Env var                     | Default | Effect |
 |---|---|---|
@@ -352,10 +816,21 @@ useful for A/B-ing kernel choices or recovering from regressions:
 | `QW3_FUSE_ADD`              | `1`     | `0` reverts attn_output / ffn_down to plain matvec + separate add. |
 | `QW3_GRAPH`                 | `1`     | `0` disables CUDA graph capture of decode. |
 | `QW3_HGEMM_X_CACHE`         | `1`     | `0` disables FP16 input reuse across consecutive HGEMMs sharing an input. |
-| `QW3_KV_DTYPE`              | `fp16`  | `fp32` reverts KV cache to FP32 (parity-only). |
-| `QW3_MATMUL`                | `auto`  | Per-call: batch ≥ 8 → MMQ (v8 at batch ≥ 128 for 128×128 tile, v7 below for 64×64 + occupancy). `hgemm` forces cuBLAS HGEMM with FP16 dequant scratch (uses ~3 GiB extra at chunk=2048); `mmq` forces MMQ unconditionally. |
+| `QW3_KV_DTYPE`              | `fp16` | KV cache dtype for env-driven paths. `fp16` is the baseline/default, `fp8` uses raw e4m3 KV cache storage, `fp32` is parity-only, and `q8` is experimental. CLI `--kv-dtype` overrides this for service/local runs that expose the flag. |
+| `QW3_MATMUL`                | `auto` CLI / `mmq` serve | Per-call: batch ≥ 8 → MMQ (v8 at batch ≥ 128 for 128×128 tile, v7 below for 64×64 + occupancy). `hgemm` forces cuBLAS HGEMM with FP16 dequant scratch (uses ~3 GiB extra at chunk=2048); `mmq` forces MMQ unconditionally. |
 | `QW3_MMQ_VERSION`           | `auto`  | MMQ kernel variant (`auto`/2/3/4/5/6/7/8). Auto picks v8 (rows ≥ 128 & batch ≥ 128) else v7. Both are split-plane Q8 + 144-B Q8_1_MMQ activations + XOR-swizzled shmem; v8 is 128×128 tile (1 block/SM), v7 is 64×64 (2 blocks/SM). |
 | `QW3_PREFILL_CHUNK`         | `2048`  | Chunk size for prefill batches. `0` disables chunking entirely (peak throughput, peak scratch). The CLI flag `--prefill-chunk N` / `--no-prefill-chunk` overrides this when set. |
+| `QW3_CONTINUOUS_BATCHING`   | `0` | Internal bridge for the OpenAI-compatible continuous batching scheduler and backend-owned global KV page pool. Use `qw3 serve --continuous-batching` instead. |
+| `QW3_CONTINUOUS_BATCHING_BODY_BATCH` | `1` when continuous batching is enabled | Enable the optimized greedy body-batch executor for continuous batching. |
+| `QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH` | `1` when body-batch is enabled | Use the independent-state recurrent batch path inside the body-batch executor. Set `0` to fall back to per-request recurrent layers. |
+| `QW3_CONTINUOUS_BATCHING_MAX_ACTIVE` | service default | Maximum active continuous requests admitted to the decode loop. |
+| `QW3_CONTINUOUS_BATCHING_MAX_PENDING` | `128` | Maximum queued continuous requests before admission returns an error. |
+| `QW3_CONTINUOUS_BATCHING_MAX_TOTAL_TOKENS` | `ctx * max_active` | Token reservation budget. Set `0` to disable this budget. |
+| `QW3_CONTINUOUS_BATCHING_KV_POOL_PAGES` | `ceil(ctx / page_size)` | Number of physical pages in the backend-owned global KV pool. |
+| `QW3_CONTINUOUS_BATCHING_MTP_KV_POOL_PAGES` | same as KV pool | Number of physical pages in the separate global MTP prefix KV pool. |
+| `QW3_PAGED_KV_PAGE_SIZE`    | `16`    | Logical/physical page size in tokens for paged KV. |
+| `QW3_MTP_PAGED_PREFIX`      | `0` | Use paged MTP prefix KV append/attention paths. `qw3 serve --continuous-batching --mtp-chain N` enables this internally when paged KV is active. |
+| `QW3_CONTINUOUS_MTP_BATCHED_DRAFT` | `0` | Batch MTP draft projection/FFN/logits across continuous requests. `qw3 serve --continuous-batching --mtp-chain N` enables this internally. Keeps per-row paged MTP attention for stability. |
 
 ## Backends
 
@@ -409,7 +884,7 @@ non-interactive execution.
 To compare a single prompt token-by-token:
 
 ```sh
-./build/qw3 --backend qwen-native --native-heavy --native-kernels cuda \
+./build/qw3 \
   --model /path/to/model.gguf \
   -p "Hello" -n 8 \
   --dump-logits qw3.jsonl --dump-logits-top-k 16 --dump-tokens

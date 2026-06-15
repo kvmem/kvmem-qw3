@@ -88,10 +88,7 @@ def parse_mtp_summary(log: str) -> MtpSummary:
 
 def make_env(continuous: bool, extra_env: Dict[str, str]) -> Dict[str, str]:
     env = os.environ.copy()
-    env.setdefault("QW3_MATMUL", "mmq")
-    env.setdefault("QW3_DISABLE_HGEMM", "1")
     if continuous:
-        env["QW3_CONTINUOUS_BATCHING"] = "1"
         env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
     else:
         env.pop("QW3_CONTINUOUS_BATCHING", None)
@@ -130,14 +127,15 @@ def run_server_case(*,
         str(max_tokens),
         "--temp",
         "0",
-        "--native-mtp-speculate",
-        "--native-mtp-chain",
+        "--mtp-chain",
         str(chain),
         "--prefill-chunk",
         str(prefill_chunk),
         "--kv-dtype",
         kv_dtype,
     ]
+    if continuous:
+        cmd.extend(["--continuous-batching", "--max-active", "2"])
     proc = subprocess.Popen(
         cmd,
         env=make_env(continuous, extra_env),
@@ -202,8 +200,10 @@ def run_continuous_concurrent_case(*,
         str(max_tokens),
         "--temp",
         "0",
-        "--native-mtp-speculate",
-        "--native-mtp-chain",
+        "--continuous-batching",
+        "--max-active",
+        str(max(1, concurrency)),
+        "--mtp-chain",
         str(chain),
         "--prefill-chunk",
         str(prefill_chunk),

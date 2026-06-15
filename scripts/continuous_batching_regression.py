@@ -2,8 +2,9 @@
 """Continuous-batching correctness and efficiency regression runner.
 
 This script starts the local OpenAI-compatible qw3 server, collects a serial
-baseline with continuous batching disabled, then restarts the server with
-QW3_CONTINUOUS_BATCHING=1 and sends concurrent deterministic greedy requests.
+baseline with continuous batching disabled, then restarts the server with the
+explicit --continuous-batching CLI switch and sends concurrent deterministic
+greedy requests.
 
 Correctness is defined as exact text equality against the serial baseline for
 each prompt. The continuous-batching run also requires server logs to prove
@@ -237,8 +238,8 @@ def parse_server_log(
     for m in SUMMARY_RE.finditer(log):
         max_summary_batch = max(max_summary_batch, int(m.group("max_batch")))
     saw_hgemm_guard = (
-        "continuous batching matmul guard" in log and
-        "QW3_DISABLE_HGEMM=1" in log
+        ("continuous batching matmul guard" in log and "QW3_DISABLE_HGEMM=1" in log) or
+        ("matmul=mmq" in log and "disable_hgemm=1" in log)
     )
     saw_body_batch_ready = False
     saw_body_batch_mode = False
@@ -355,19 +356,13 @@ def run_server_case(*,
                     extra_args: Sequence[str]) -> ServerRun:
     env = os.environ.copy()
     if continuous_batching:
-        env["QW3_CONTINUOUS_BATCHING"] = "1"
         env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
-        env["QW3_CONTINUOUS_BATCHING_MAX_ACTIVE"] = str(max_active)
-        if os.environ.get("QW3_TEST_ENABLE_BODY_BATCH") == "1":
-            env["QW3_CONTINUOUS_BATCHING_BODY_BATCH"] = "1"
         env.update(continuous_env)
     else:
         env.pop("QW3_CONTINUOUS_BATCHING", None)
         env.pop("QW3_CONTINUOUS_BATCHING_TRACE", None)
         env.pop("QW3_CONTINUOUS_BATCHING_MAX_ACTIVE", None)
         env.pop("QW3_CONTINUOUS_BATCHING_BODY_BATCH", None)
-    env.setdefault("QW3_MATMUL", "mmq")
-    env.setdefault("QW3_DISABLE_HGEMM", "1")
 
     cmd = [
         str(binary),
@@ -387,6 +382,8 @@ def run_server_case(*,
     ]
     if prefill_chunk is not None:
         cmd.extend(["--prefill-chunk", str(prefill_chunk)])
+    if continuous_batching:
+        cmd.extend(["--continuous-batching", "--max-active", str(max_active)])
     cmd.extend(extra_args)
 
     start = time.monotonic()
@@ -570,7 +567,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--enable-body-batch",
         action="store_true",
-        help="enable QW3_CONTINUOUS_BATCHING_BODY_BATCH for the continuous run",
+        help="pass --body-batch for the continuous run",
     )
     ap.add_argument(
         "--require-body-batch-mode",
@@ -646,10 +643,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"running continuous batching regression: prompts={len(prompts)} "
         f"max_tokens={args.max_tokens} port={port}"
     )
+    continuous_extra_args = list(args.extra_arg)
     if args.enable_body_batch:
-        os.environ["QW3_TEST_ENABLE_BODY_BATCH"] = "1"
-    else:
-        os.environ.pop("QW3_TEST_ENABLE_BODY_BATCH", None)
+        continuous_extra_args.append("--body-batch")
     baseline = run_server_case(
         mode="baseline",
         binary=binary,
@@ -685,7 +681,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         continuous_batching=True,
         max_active=args.max_active,
         continuous_env=continuous_env,
-        extra_args=args.extra_arg,
+        extra_args=continuous_extra_args,
     )
     for result in continuous.results:
         print_result("continuous", result)

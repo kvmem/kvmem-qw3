@@ -80,6 +80,7 @@ class BenchVariant:
     continuous: bool
     concurrent: bool
     env: Dict[str, str]
+    args: Sequence[str] = ()
 
 
 @dataclass
@@ -397,7 +398,9 @@ def make_command(binary: Path,
                  max_tokens: int,
                  ctx_size: int,
                  prefill_chunk: Optional[int],
-                 extra_args: Sequence[str]) -> List[str]:
+                 extra_args: Sequence[str],
+                 continuous: bool,
+                 max_active: int) -> List[str]:
     cmd = [
         str(binary),
         "serve",
@@ -416,6 +419,8 @@ def make_command(binary: Path,
     ]
     if prefill_chunk is not None:
         cmd.extend(["--prefill-chunk", str(prefill_chunk)])
+    if continuous:
+        cmd.extend(["--continuous-batching", "--max-active", str(max_active)])
     cmd.extend(extra_args)
     return cmd
 
@@ -425,10 +430,7 @@ def make_env(variant: BenchVariant,
              trace: bool,
              timing: bool) -> Dict[str, str]:
     env = os.environ.copy()
-    env.setdefault("QW3_MATMUL", "mmq")
-    env.setdefault("QW3_DISABLE_HGEMM", "1")
     if variant.continuous:
-        env["QW3_CONTINUOUS_BATCHING"] = "1"
         if trace:
             env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
         else:
@@ -437,7 +439,6 @@ def make_env(variant: BenchVariant,
             env["QW3_CONTINUOUS_BATCHING_TIMING"] = "1"
         else:
             env.pop("QW3_CONTINUOUS_BATCHING_TIMING", None)
-        env["QW3_CONTINUOUS_BATCHING_MAX_ACTIVE"] = str(max_active)
         env.update(variant.env)
     else:
         env.pop("QW3_CONTINUOUS_BATCHING", None)
@@ -500,8 +501,10 @@ def run_variant(*,
                 ignore_eos: bool,
                 extra_args: Sequence[str]) -> BenchRun:
     env = make_env(variant, max_active, trace, timing)
+    variant_args = list(variant.args) + list(extra_args)
     cmd = make_command(
-        binary, model, host, port, max_tokens, ctx_size, prefill_chunk, extra_args
+        binary, model, host, port, max_tokens, ctx_size, prefill_chunk,
+        variant_args, variant.continuous, max_active
     )
 
     proc = subprocess.Popen(
@@ -708,8 +711,10 @@ def run_reused_variant_matrix(*,
                               extra_args: Sequence[str]) -> List[BenchRun]:
     max_concurrency = max(concurrency_levels)
     env = make_env(variant, max(max_active, max_concurrency), trace, timing)
+    variant_args = list(variant.args) + list(extra_args)
     cmd = make_command(
-        binary, model, host, port, max_tokens, ctx_size, prefill_chunk, extra_args
+        binary, model, host, port, max_tokens, ctx_size, prefill_chunk,
+        variant_args, variant.continuous, max(max_active, max_concurrency)
     )
     proc = subprocess.Popen(
         cmd,
@@ -778,25 +783,26 @@ def variants_for(names: Sequence[str]) -> List[BenchVariant]:
             "continuous",
             continuous=True,
             concurrent=True,
-            env={"QW3_CONTINUOUS_BATCHING_BODY_BATCH": "0"},
+            env={},
+            args=("--no-body-batch",),
         ),
         "body": BenchVariant(
             "body",
             continuous=True,
             concurrent=True,
             env={
-                "QW3_CONTINUOUS_BATCHING_BODY_BATCH": "1",
                 "QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH": "0",
             },
+            args=("--body-batch",),
         ),
         "recurrent": BenchVariant(
             "recurrent",
             continuous=True,
             concurrent=True,
             env={
-                "QW3_CONTINUOUS_BATCHING_BODY_BATCH": "1",
                 "QW3_CONTINUOUS_BATCHING_RECURRENT_BATCH": "1",
             },
+            args=("--body-batch",),
         ),
     }
     result: List[BenchVariant] = []

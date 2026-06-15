@@ -15,20 +15,41 @@ namespace {
 void usage(std::ostream &os) {
     os <<
         "Usage: qw3 --model MODEL.gguf -p PROMPT [options]\n"
-        "       qw3 serve --model MODEL.gguf [--port 8080] [--kv-dtype q8] [options]\n"
+        "       qw3 serve --model MODEL.gguf [--port 8080] [options]\n"
         "\n"
-        "Serve (OpenAI-compatible HTTP API; loads model once, serves forever):\n"
+        "Serve (OpenAI-compatible HTTP API; loads model once, serves forever).\n"
+        "  Default is the conservative baseline: one request at a time, FP16 KV,\n"
+        "  no global paged KV, no continuous batching, and no MTP.\n"
         "  --port N              Listen port. Default: 8080\n"
         "  --host ADDR           Bind address. Default: 127.0.0.1\n"
-        "  --kv-dtype NAME       KV-cache dtype: fp16 (default), fp32, q8, or fp8.\n"
-        "                        Sets QW3_KV_DTYPE before the model is loaded.\n"
+        "  --continuous-batching Enable continuous request batching. Also enables\n"
+        "                        the required global paged-KV serving pool and\n"
+        "                        body-batch executor by default.\n"
+        "  --paged-kv            Enable the global paged-KV serving pool.\n"
+        "  --body-batch          Enable batched decode body executor.\n"
+        "  --max-active N        Max active continuous requests. Default: 2\n"
+        "  --max-pending N       Max queued continuous requests. Default: 128\n"
+        "  --max-total-tokens N  Total token reservation budget. Default: ctx.\n"
+        "                        0 disables this admission budget.\n"
+        "  --kv-page-size N      Paged-KV logical/physical page size. Default: 16\n"
+        "  --kv-pool-pages N     Global KV pool pages. Default: ceil(ctx/page_size)\n"
+        "  --mtp-kv-pool-pages N Global MTP-prefix KV pages. Default: kv-pool-pages\n"
+        "  --kv-dtype NAME       KV-cache dtype: fp16 default, or fp8/fp32/q8.\n"
+        "  --mtp-chain N         MTP speculative chain length. Default: 0 (off).\n"
+        "                        N>0 enables MTP speculation.\n"
+        "  --mtp-batched-draft   Batch MTP draft projection/FFN/logits.\n"
+        "  --mtp-paged-prefix    Use paged MTP prefix KV.\n"
+        "  --no-continuous-batching, --no-paged-kv, --no-body-batch,\n"
+        "  --no-mtp-batched-draft, --no-mtp-paged-prefix\n"
+        "                        Compatibility/debug disable switches.\n"
         "  --enable-thinking     Default chat requests to thinking mode (long CoT).\n"
-        "  --native-mtp-speculate Enable MTP speculative decode.\n"
+        "  --native-mtp-chain N  Alias for --mtp-chain.\n"
+        "  --native-mtp-trace    Diagnostic mode; disables default MTP speculate.\n"
         "  -n N                  Optional service max generated tokens cap.\n"
         "                        Default: use remaining context per request.\n"
         "\n"
         "Runtime:\n"
-        "  --backend NAME        mock, llama-cli, or qwen-native. Default: llama-cli\n"
+        "  --backend NAME        qwen-native, mock, or llama-cli. Default: qwen-native\n"
         "  --llama-cli PATH      llama.cpp llama-completion binary. Default: llama-completion\n"
         "  --llama-completion PATH\n"
         "                        Alias for --llama-cli\n"
@@ -37,7 +58,7 @@ void usage(std::ostream &os) {
         "  -t, --threads N       llama.cpp CPU helper threads\n"
         "  -ngl N                GPU layers passed to llama.cpp. Default: -1\n"
         "  -b, --batch N         Batch size passed to llama.cpp. Default: 2048\n"
-        "  --native-heavy        Execute the full native device single-token path\n"
+        "  --native-heavy        Compatibility flag; native generation is enabled by default\n"
         "  --native-kernels NAME cuda. Default: cuda\n"
         "  --native-linear-backend NAME auto, cublas, or custom. Default: auto\n"
         "  --native-mtp-trace    Run one optional MTP draft-head diagnostic\n"
@@ -49,7 +70,7 @@ void usage(std::ostream &os) {
         "                        0 = no chunking (whole-prompt batch, max throughput,\n"
         "                        peak scratch grows with prompt length).\n"
         "                        N>0 = process prefill in fixed-size chunks.\n"
-        "                        Unset = built-in default (512, memory parity with llama.cpp).\n"
+        "                        Unset = built-in default (2048 for serving).\n"
         "  --no-prefill-chunk    Sugar for --prefill-chunk 0 (max throughput).\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
@@ -134,6 +155,8 @@ int main(int argc, char **argv) {
     // one-shot generate. Detected as the first positional argument.
     bool serve = false;
     qw3::ServerConfig serve_cfg;
+    bool kv_dtype_cli_set = false;
+    std::string kv_dtype_cli;
     int arg_start = 1;
     if (argc > 1 && std::string(argv[1]) == "serve") {
         serve = true;
@@ -177,6 +200,10 @@ int main(int argc, char **argv) {
                 engine.native_mtp_trace = true;
             } else if (arg == "--native-mtp-chain") {
                 engine.native_mtp_chain = parse_int(need(arg), arg);
+                engine.native_mtp_chain_set = true;
+            } else if (arg == "--mtp-chain") {
+                engine.native_mtp_chain = parse_int(need(arg), arg);
+                engine.native_mtp_chain_set = true;
             } else if (arg == "--native-mtp-prefix") {
                 engine.native_mtp_prefix = true;
             } else if (arg == "--native-mtp-speculate") {
@@ -232,12 +259,55 @@ int main(int argc, char **argv) {
                 serve_cfg.port = parse_int(need(arg), arg);
             } else if (arg == "--host") {
                 serve_cfg.host = need(arg);
+            } else if (arg == "--continuous-batching") {
+                serve_cfg.continuous_batching = true;
+            } else if (arg == "--no-continuous-batching") {
+                serve_cfg.continuous_batching = false;
+            } else if (arg == "--paged-kv") {
+                serve_cfg.paged_kv = true;
+                serve_cfg.paged_kv_set = true;
+            } else if (arg == "--no-paged-kv") {
+                serve_cfg.paged_kv = false;
+                serve_cfg.paged_kv_set = true;
+            } else if (arg == "--body-batch") {
+                serve_cfg.body_batch = true;
+                serve_cfg.body_batch_set = true;
+            } else if (arg == "--no-body-batch") {
+                serve_cfg.body_batch = false;
+                serve_cfg.body_batch_set = true;
+            } else if (arg == "--max-active") {
+                serve_cfg.max_active = parse_int(need(arg), arg);
+            } else if (arg == "--max-pending") {
+                serve_cfg.max_pending = parse_int(need(arg), arg);
+            } else if (arg == "--max-total-tokens") {
+                serve_cfg.max_total_tokens = parse_u64(need(arg), arg);
+                serve_cfg.max_total_tokens_set = true;
+            } else if (arg == "--kv-page-size") {
+                serve_cfg.kv_page_size = parse_int(need(arg), arg);
+            } else if (arg == "--kv-pool-pages") {
+                serve_cfg.kv_pool_pages = parse_int(need(arg), arg);
+            } else if (arg == "--mtp-kv-pool-pages") {
+                serve_cfg.mtp_kv_pool_pages = parse_int(need(arg), arg);
+            } else if (arg == "--mtp-batched-draft") {
+                serve_cfg.mtp_batched_draft = true;
+                serve_cfg.mtp_batched_draft_set = true;
+            } else if (arg == "--no-mtp-batched-draft") {
+                serve_cfg.mtp_batched_draft = false;
+                serve_cfg.mtp_batched_draft_set = true;
+            } else if (arg == "--mtp-paged-prefix") {
+                serve_cfg.mtp_paged_prefix = true;
+                serve_cfg.mtp_paged_prefix_set = true;
+            } else if (arg == "--no-mtp-paged-prefix") {
+                serve_cfg.mtp_paged_prefix = false;
+                serve_cfg.mtp_paged_prefix_set = true;
             } else if (arg == "--kv-dtype") {
                 const std::string dt = need(arg);
                 if (dt != "fp16" && dt != "fp32" && dt != "q8" && dt != "fp8") {
                     throw std::runtime_error("invalid --kv-dtype (want fp16|fp32|q8|fp8): " + dt);
                 }
-                setenv("QW3_KV_DTYPE", dt.c_str(), 1);
+                serve_cfg.kv_dtype = dt;
+                kv_dtype_cli_set = true;
+                kv_dtype_cli = dt;
             } else if (arg == "--enable-thinking") {
                 serve_cfg.enable_thinking_default = true;
             } else {
@@ -317,6 +387,10 @@ int main(int argc, char **argv) {
             if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
             serve_cfg.default_generation = gen;
             return qw3::run_server(engine, serve_cfg);
+        }
+
+        if (kv_dtype_cli_set) {
+            setenv("QW3_KV_DTYPE", kv_dtype_cli.c_str(), 1);
         }
 
         if (prompt.empty()) {

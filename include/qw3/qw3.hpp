@@ -16,14 +16,14 @@ enum class BackendKind {
 
 struct EngineOptions {
     std::string model_path;
-    BackendKind backend = BackendKind::LlamaCli;
+    BackendKind backend = BackendKind::QwenNative;
     std::string llama_cli_path = "llama-completion";
     int ctx_size = 262144;
     int threads = 0;
     int gpu_layers = -1;
     int batch_size = 2048;
     bool verbose = false;
-    bool native_heavy = false;
+    bool native_heavy = true;
     int native_token_id = 0;
     std::string native_kernels = "cuda";
     std::string native_linear_backend = "auto";
@@ -34,13 +34,14 @@ struct EngineOptions {
     bool dump_tokens = false; // print tokenized prompt then exit
     // Prefill chunk size override.
     //   -1 (default) : use QW3_PREFILL_CHUNK env var, else built-in default
-    //                  (512 — memory parity with llama.cpp).
+    //                  (2048 for serving / native generation).
     //    0           : disable chunking entirely (whole-prompt batch). Maximum
     //                  throughput; peak scratch grows linearly with prompt length.
     //   >0           : process prefill in fixed-size chunks of this many tokens.
     int prefill_chunk = -1;
     bool native_mtp_trace = false; // run one optional MTP draft-head diagnostic
-    int native_mtp_chain = 1; // diagnostic MTP draft chain length
+    int native_mtp_chain = 1; // one-shot diagnostic default; serve normalizes unset to 0
+    bool native_mtp_chain_set = false;
     bool native_mtp_prefix = false; // populate diagnostic MTP prefix KV cache
     bool native_mtp_speculate = false; // run experimental MTP speculative decode
 };

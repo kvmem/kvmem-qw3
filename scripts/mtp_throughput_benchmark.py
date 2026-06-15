@@ -59,11 +59,7 @@ def percentile(values: Sequence[float], pct: float) -> float:
 
 def make_env(mode: BenchMode, max_active: int, extra_env: Dict[str, str]) -> Dict[str, str]:
     env = os.environ.copy()
-    env.setdefault("QW3_MATMUL", "mmq")
-    env.setdefault("QW3_DISABLE_HGEMM", "1")
     if mode.continuous:
-        env["QW3_CONTINUOUS_BATCHING"] = "1"
-        env["QW3_CONTINUOUS_BATCHING_MAX_ACTIVE"] = str(max_active)
         env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
     else:
         env.pop("QW3_CONTINUOUS_BATCHING", None)
@@ -82,7 +78,8 @@ def make_command(binary: Path,
                  ctx_size: int,
                  prefill_chunk: int,
                  chain: int,
-                 kv_dtype: str) -> list[str]:
+                 kv_dtype: str,
+                 max_active: int) -> list[str]:
     cmd = [
         str(binary),
         "serve",
@@ -103,8 +100,10 @@ def make_command(binary: Path,
         "--kv-dtype",
         kv_dtype,
     ]
+    if mode.continuous:
+        cmd.extend(["--continuous-batching", "--max-active", str(max_active)])
     if mode.mtp:
-        cmd.extend(["--native-mtp-speculate", "--native-mtp-chain", str(chain)])
+        cmd.extend(["--mtp-chain", str(chain)])
     return cmd
 
 
@@ -140,8 +139,9 @@ def run_case(*,
              timeout_s: int,
              max_active: int,
              extra_env: Dict[str, str]) -> MtpBenchRun:
-    cmd = make_command(binary, model, host, port, mode, max_tokens, ctx_size,
-                       prefill_chunk, chain, kv_dtype)
+    cmd = make_command(
+        binary, model, host, port, mode, max_tokens, ctx_size, prefill_chunk,
+        chain, kv_dtype, max(max_active, concurrency))
     proc = subprocess.Popen(
         cmd,
         env=make_env(mode, max(max_active, concurrency), extra_env),
