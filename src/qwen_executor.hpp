@@ -105,6 +105,19 @@ public:
         std::vector<DeviceTensor *> k_cache;
         std::vector<DeviceTensor *> v_cache;
     };
+    struct MtpPrefixStateView {
+        bool ready = false;
+        uint32_t prefix_len = 0;
+        uint32_t ctx_size = 0;
+        uint32_t page_size = 0;
+        uint32_t page_count = 0;
+        const int32_t *page_indices_host = nullptr;
+        const DeviceTensor *page_indices_device = nullptr;
+        DeviceTensor *k_cache = nullptr;
+        DeviceTensor *v_cache = nullptr;
+        DeviceTensor *prefix_hidden = nullptr;
+        DeviceTensor *current_hidden = nullptr;
+    };
 
     QwenExecutor(const QwenNativeModel &model,
                  const QwenWeights &weights,
@@ -119,6 +132,7 @@ public:
     uint32_t kv_ctx_size() const { return kv_ctx_size_; }
     DecodeStateView decode_state_view() const;
     MutableDecodeStateView mutable_decode_state_view();
+    MtpPrefixStateView mtp_prefix_state_view();
     KvStateSnapshot kv_state_snapshot() const;
     void prepare_runtime_state();
     void prepare_kv_pages(uint32_t logical_pos, uint32_t count);
@@ -312,6 +326,7 @@ private:
     std::unique_ptr<DeviceTensor> mtp_v_cache_;
     std::unique_ptr<DeviceTensor> mtp_zero_h_;
     std::unique_ptr<DeviceTensor> mtp_prefix_h_;
+    KvPageTable mtp_kv_pages_;
     uint32_t mtp_batch_capacity_ = 0;
     std::unique_ptr<DeviceTensor> mtp_h_input_batch_;
     std::unique_ptr<DeviceTensor> mtp_h_batch_;

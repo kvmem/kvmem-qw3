@@ -3787,6 +3787,23 @@ private:
                     std::make_unique<BatchedPrefillExecutor>(
                         *model_, *weights_, *device_);
             }
+            if (continuous_batching_trace_enabled() && !mtp_active.empty()) {
+                uint32_t draft_ready = 0;
+                for (ContinuousBatchActive &a : mtp_active) {
+                    if (!a.executor) continue;
+                    QwenExecutor::MtpPrefixStateView view =
+                        a.executor->mtp_prefix_state_view();
+                    if (view.ready && view.prefix_len >= a.executor->position()) {
+                        ++draft_ready;
+                    }
+                }
+                std::ostringstream msg;
+                msg << "native continuous_mtp_batched_draft:"
+                    << " eligible=" << draft_ready
+                    << " active=" << mtp_active.size()
+                    << " enabled=false";
+                log(msg.str());
+            }
             while (!mtp_active.empty()) {
                 std::vector<ContinuousMtpVerifyJob> jobs;
                 jobs.reserve(mtp_active.size());

@@ -48,6 +48,10 @@ bool mtp_prefix_batch_enabled() {
     return env_flag_enabled("QW3_MTP_PREFIX_BATCH", true);
 }
 
+bool mtp_paged_prefix_enabled() {
+    return env_flag_enabled("QW3_MTP_PAGED_PREFIX");
+}
+
 uint32_t mtp_prefix_batch_min_tokens() {
     return env_uint32_or("QW3_MTP_PREFIX_BATCH_MIN", 32);
 }
@@ -64,10 +68,12 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
       external_kv_cache_(external_kv_cache),
       kv_ctx_size_(kv_ctx_size) {
     kv_pages_.configure(kv_ctx_size_, kv_page_allocator);
+    mtp_kv_pages_.configure(kv_ctx_size_, nullptr);
 }
 
 QwenExecutor::~QwenExecutor() {
     kv_pages_.reset();
+    mtp_kv_pages_.reset();
 }
 
 QwenExecutor::DecodeStateView QwenExecutor::decode_state_view() const {
@@ -103,6 +109,24 @@ QwenExecutor::MutableDecodeStateView QwenExecutor::mutable_decode_state_view() {
     view.recurrent_states = &recurrent_states_;
     view.conv_states = &conv_states_;
     view.hidden = h_.get();
+    return view;
+}
+
+QwenExecutor::MtpPrefixStateView QwenExecutor::mtp_prefix_state_view() {
+    ensure_mtp_scratch();
+    MtpPrefixStateView view;
+    view.ready = mtp_scratch_ready_ && mtp_k_cache_ && mtp_v_cache_ &&
+                 mtp_prefix_h_ && h_;
+    view.prefix_len = mtp_prefix_len_;
+    view.ctx_size = kv_ctx_size_;
+    view.page_size = mtp_kv_pages_.page_size;
+    view.page_count = mtp_kv_pages_.count();
+    view.page_indices_host = mtp_kv_pages_.host_indices();
+    view.page_indices_device = mtp_kv_pages_.device_pages.get();
+    view.k_cache = mtp_k_cache_.get();
+    view.v_cache = mtp_v_cache_.get();
+    view.prefix_hidden = mtp_prefix_h_.get();
+    view.current_hidden = h_.get();
     return view;
 }
 
@@ -171,6 +195,7 @@ void QwenExecutor::reset_state() {
     // overwrites slot 0 (the seq_len passed to attention_decode is position+1).
     position_ = 0;
     kv_pages_.reset();
+    mtp_kv_pages_.reset();
     mtp_prefix_len_ = 0;
     decode_graph_warmup_pending_ = true;
 }
@@ -1526,20 +1551,44 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                          cfg.rope_dim, rope_pos, cfg.rope_theta));
 
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-    require_status(backend_.kv_append(*mtp_k_cache_, *k_, cache_pos, per_pos));
-    require_status(backend_.kv_append(*mtp_v_cache_, *v_, cache_pos, per_pos));
+    mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
+    const bool use_paged_prefix = mtp_paged_prefix_enabled();
+    if (use_paged_prefix) {
+        require_status(backend_.kv_append_paged(
+            *mtp_k_cache_, *k_, cache_pos, per_pos,
+            mtp_kv_pages_.host_indices(), mtp_kv_pages_.count(),
+            mtp_kv_pages_.page_size));
+        require_status(backend_.kv_append_paged(
+            *mtp_v_cache_, *v_, cache_pos, per_pos,
+            mtp_kv_pages_.host_indices(), mtp_kv_pages_.count(),
+            mtp_kv_pages_.page_size));
+    } else {
+        require_status(backend_.kv_append(*mtp_k_cache_, *k_, cache_pos, per_pos));
+        require_status(backend_.kv_append(*mtp_v_cache_, *v_, cache_pos, per_pos));
+    }
     record(report, "mtp.kv_append");
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-    require_status(backend_.attention_decode(*mid_, *scores_, *q_,
-                                             2 * standard_head_dim,
-                                             *mtp_k_cache_, *mtp_v_cache_,
-                                             standard_n_heads, standard_n_kv_heads,
-                                             standard_head_dim,
-                                             seq_len, scale));
-    require_status(backend_.apply_attn_gate(*mid_, *q_,
-                                             2 * standard_head_dim,
-                                             standard_n_heads, standard_head_dim));
+    if (use_paged_prefix) {
+        require_status(backend_.attention_decode_batch_paged_gated(
+            *mid_, *q_, 2 * standard_head_dim, *mtp_k_cache_,
+            *mtp_v_cache_, mtp_kv_pages_.host_indices(),
+            mtp_kv_pages_.count(), mtp_kv_pages_.page_size,
+            standard_n_heads, standard_n_kv_heads, standard_head_dim,
+            seq_len - 1, 1, 2 * standard_head_dim,
+            standard_n_heads * standard_head_dim, scale));
+    } else {
+        require_status(backend_.attention_decode(*mid_, *scores_, *q_,
+                                                 2 * standard_head_dim,
+                                                 *mtp_k_cache_, *mtp_v_cache_,
+                                                 standard_n_heads, standard_n_kv_heads,
+                                                 standard_head_dim,
+                                                 seq_len, scale));
+        require_status(backend_.apply_attn_gate(*mid_, *q_,
+                                                2 * standard_head_dim,
+                                                standard_n_heads,
+                                                standard_head_dim));
+    }
     record(report, "mtp.attention_sdpa");
     // h += W_out * mid (fused matvec+add with eager fallback, mirroring the
     // main decode path).
@@ -2018,20 +2067,40 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
                                                standard_head_dim,
                                                cfg.rope_dim, base_position, cfg.rope_theta));
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-    require_status(backend_.kv_append_batch(*mtp_k_cache_, *mtp_k_batch_,
-                                            base_position, per_pos, batch));
-    require_status(backend_.kv_append_batch(*mtp_v_cache_, *mtp_v_batch_,
-                                            base_position, per_pos, batch));
+    mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, base_position, batch);
+    const bool use_paged_prefix = mtp_paged_prefix_enabled();
+    if (use_paged_prefix) {
+        require_status(backend_.kv_append_batch_paged(
+            *mtp_k_cache_, *mtp_k_batch_, base_position, per_pos, batch,
+            mtp_kv_pages_.host_indices(), mtp_kv_pages_.count(),
+            mtp_kv_pages_.page_size));
+        require_status(backend_.kv_append_batch_paged(
+            *mtp_v_cache_, *mtp_v_batch_, base_position, per_pos, batch,
+            mtp_kv_pages_.host_indices(), mtp_kv_pages_.count(),
+            mtp_kv_pages_.page_size));
+    } else {
+        require_status(backend_.kv_append_batch(*mtp_k_cache_, *mtp_k_batch_,
+                                                base_position, per_pos, batch));
+        require_status(backend_.kv_append_batch(*mtp_v_cache_, *mtp_v_batch_,
+                                                base_position, per_pos, batch));
+    }
     record(report, "mtp.kv_append_batch");
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-    require_status(backend_.attention_decode_batch_gated(*mtp_mid_batch_, *mtp_q_batch_,
-                                                         2 * standard_head_dim,
-                                                         *mtp_k_cache_, *mtp_v_cache_,
-                                                         standard_n_heads, standard_n_kv_heads,
-                                                         standard_head_dim,
-                                                         base_position, batch,
-                                                         q_stride_buf, mid_stride, scale));
+    if (use_paged_prefix) {
+        require_status(backend_.attention_decode_batch_paged_gated(
+            *mtp_mid_batch_, *mtp_q_batch_, 2 * standard_head_dim,
+            *mtp_k_cache_, *mtp_v_cache_, mtp_kv_pages_.host_indices(),
+            mtp_kv_pages_.count(), mtp_kv_pages_.page_size,
+            standard_n_heads, standard_n_kv_heads, standard_head_dim,
+            base_position, batch, q_stride_buf, mid_stride, scale));
+    } else {
+        require_status(backend_.attention_decode_batch_gated(
+            *mtp_mid_batch_, *mtp_q_batch_, 2 * standard_head_dim,
+            *mtp_k_cache_, *mtp_v_cache_, standard_n_heads,
+            standard_n_kv_heads, standard_head_dim, base_position, batch,
+            q_stride_buf, mid_stride, scale));
+    }
     record(report, "mtp.attention_sdpa_batch");
     require_status(backend_.q8_0_matmul_add(*mtp_h_batch_,
                                             *mtp_h_batch_,
