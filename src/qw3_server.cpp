@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -426,7 +427,111 @@ bool parse_json_tool_call_text(const std::string &text, std::vector<json> &calls
     }
 }
 
-std::vector<json> parse_tool_calls_xml(const std::string &text) {
+// XML <parameter=k>v</parameter> values are always textual. Coerce a single
+// scalar string into the JSON type the tool schema declares. On any failure to
+// represent the value as the requested type, fall back to the original string
+// so a malformed value never drops the parameter.
+json coerce_scalar_string(const std::string &raw, const std::string &type) {
+    const std::string value = trim_ascii_ws(raw);
+    if (type == "integer") {
+        try {
+            size_t idx = 0;
+            const long long v = std::stoll(value, &idx);
+            if (!value.empty() && idx == value.size()) return json(v);
+        } catch (...) {}
+        return json(raw);
+    }
+    if (type == "number") {
+        try {
+            size_t idx = 0;
+            const double v = std::stod(value, &idx);
+            if (!value.empty() && idx == value.size()) return json(v);
+        } catch (...) {}
+        return json(raw);
+    }
+    if (type == "boolean") {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lower == "true") return json(true);
+        if (lower == "false") return json(false);
+        return json(raw);
+    }
+    if (type == "null") {
+        if (value == "null" || value.empty()) return json(nullptr);
+        return json(raw);
+    }
+    if (type == "array" || type == "object") {
+        try {
+            const json parsed = json::parse(value);
+            if (type == "array" && parsed.is_array()) return parsed;
+            if (type == "object" && parsed.is_object()) return parsed;
+        } catch (...) {}
+        return json(raw);
+    }
+    return json(raw);  // "string" or unknown type
+}
+
+// Coerce a textual parameter value using a JSON-schema property node. Supports
+// a scalar "type", a "type" array (union), and simple anyOf/oneOf. For unions
+// the first sub-schema that yields a non-string (a real coercion) wins, falling
+// back to the raw string when nothing matches.
+json coerce_value_by_schema(const std::string &value, const json &schema) {
+    if (!schema.is_object()) return json(value);
+    for (const char *combo : {"anyOf", "oneOf"}) {
+        if (schema.contains(combo) && schema[combo].is_array()) {
+            for (const auto &sub : schema[combo]) {
+                const json coerced = coerce_value_by_schema(value, sub);
+                if (!coerced.is_string()) return coerced;
+            }
+            return json(value);
+        }
+    }
+    if (schema.contains("type")) {
+        const json &t = schema["type"];
+        if (t.is_string()) {
+            return coerce_scalar_string(value, t.get<std::string>());
+        }
+        if (t.is_array()) {
+            for (const auto &tt : t) {
+                if (!tt.is_string()) continue;
+                const std::string ty = tt.get<std::string>();
+                if (ty == "string") return json(value);
+                const json coerced = coerce_scalar_string(value, ty);
+                if (!coerced.is_string()) return coerced;
+            }
+            return json(value);
+        }
+    }
+    return json(value);
+}
+
+// Find the JSON-schema "properties" map for a named function in an OpenAI
+// tools array. Returns nullptr when the tool, its parameters, or its properties
+// are absent, in which case parameters are left as raw strings.
+const json *find_tool_properties(const json *tools, const std::string &name) {
+    if (!tools || !tools->is_array()) return nullptr;
+    for (const auto &t : *tools) {
+        if (!t.is_object()) continue;
+        const json *fn = (t.contains("function") && t["function"].is_object())
+                             ? &t["function"]
+                             : &t;
+        if (!fn->is_object()) continue;
+        if (fn->value("name", std::string()) != name) continue;
+        if (!fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
+            return nullptr;
+        }
+        const json &params = (*fn)["parameters"];
+        if (params.contains("properties") && params["properties"].is_object()) {
+            return &params["properties"];
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+std::vector<json> parse_tool_calls_xml(const std::string &text,
+                                       const json *tools = nullptr) {
     std::vector<json> calls;
     size_t pos = 0;
     while (true) {
@@ -450,6 +555,7 @@ std::vector<json> parse_tool_calls_xml(const std::string &text) {
             continue;
         }
         const std::string name = block.substr(name0, name1 - name0);
+        const json *props = find_tool_properties(tools, name);
         json args = json::object();
         size_t pp = name1 + 1;
         bool saw_parameter = false;
@@ -465,7 +571,12 @@ std::vector<json> parse_tool_calls_xml(const std::string &text) {
             std::string value = block.substr(v0, v1 - v0);
             if (!value.empty() && value.front() == '\n') value.erase(value.begin());
             if (!value.empty() && value.back() == '\n') value.pop_back();
-            args[block.substr(key0, key1 - key0)] = value;
+            const std::string key = block.substr(key0, key1 - key0);
+            if (props && props->contains(key) && (*props)[key].is_object()) {
+                args[key] = coerce_value_by_schema(value, (*props)[key]);
+            } else {
+                args[key] = value;
+            }
             saw_parameter = true;
             pp = v1 + std::string("</parameter>").size();
         }
@@ -744,6 +855,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
     if (cfg.max_active <= 0) throw std::runtime_error("--max-active must be > 0");
     if (cfg.max_pending <= 0) throw std::runtime_error("--max-pending must be > 0");
+    if (cfg.prefill_burst < 0) throw std::runtime_error("--prefill-burst must be >= 0");
     if (cfg.kv_page_size <= 0) throw std::runtime_error("--kv-page-size must be > 0");
     if (cfg.kv_pool_pages < 0) throw std::runtime_error("--kv-pool-pages must be >= 0");
     if (cfg.mtp_kv_pool_pages < 0) throw std::runtime_error("--mtp-kv-pool-pages must be >= 0");
@@ -759,6 +871,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     }
     if (engine.native_mtp_chain < 0) {
         throw std::runtime_error("--mtp-chain must be >= 0");
+    }
+    if (engine.mtp_policy != "fixed" && engine.mtp_policy != "adaptive") {
+        throw std::runtime_error("invalid --mtp-policy (want fixed|adaptive): " +
+                                 engine.mtp_policy);
+    }
+    if (engine.mtp_adaptive_min_chain < 0) {
+        throw std::runtime_error("--mtp-adaptive-min-chain must be >= 0");
+    }
+    if (engine.mtp_adaptive_max_chain < 0) {
+        throw std::runtime_error("--mtp-adaptive-max-chain must be >= 0");
     }
     if (cfg.continuous_batching) {
         if (!cfg.paged_kv_set) cfg.paged_kv = true;
@@ -793,12 +915,26 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     setenv_bool("QW3_CONTINUOUS_MTP_BATCHED_DRAFT", cfg.mtp_batched_draft);
     setenv_bool("QW3_MTP_PAGED_PREFIX", cfg.mtp_paged_prefix);
     setenv_bool("QW3_MTP_SPECULATE", engine.native_mtp_speculate);
+    setenv_value("QW3_MTP_POLICY", engine.mtp_policy);
+    if (engine.mtp_adaptive_min_chain > 0) {
+        setenv_value("QW3_MTP_ADAPTIVE_MIN_CHAIN",
+                     engine.mtp_adaptive_min_chain);
+    }
+    if (engine.mtp_adaptive_max_chain > 0) {
+        setenv_value("QW3_MTP_ADAPTIVE_MAX_CHAIN",
+                     engine.mtp_adaptive_max_chain);
+    }
     setenv_value("QW3_KV_DTYPE", cfg.kv_dtype);
     setenv_value("QW3_MATMUL", "mmq");
     setenv_bool("QW3_DISABLE_HGEMM", true);
     setenv_value("QW3_PAGED_KV_PAGE_SIZE", cfg.kv_page_size);
     setenv_value("QW3_CONTINUOUS_BATCHING_MAX_ACTIVE", cfg.max_active);
     setenv_value("QW3_CONTINUOUS_BATCHING_MAX_PENDING", cfg.max_pending);
+    if (cfg.prefill_burst > 0) {
+        setenv_value("QW3_CONTINUOUS_BATCHING_PREFILL_BURST", cfg.prefill_burst);
+        setenv_value("QW3_CONTINUOUS_BATCHING_ACTIVE_PREFILL_BURST",
+                     cfg.prefill_burst);
+    }
     if (cfg.max_total_tokens_set) {
         setenv_value("QW3_CONTINUOUS_BATCHING_MAX_TOTAL_TOKENS", cfg.max_total_tokens);
     }
@@ -827,11 +963,26 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  body_batch=" << yesno(cfg.body_batch) << "\n"
               << "  max_active=" << cfg.max_active << "\n"
               << "  max_pending=" << cfg.max_pending << "\n"
+              << "  prefill_burst="
+              << (cfg.prefill_burst > 0 ? std::to_string(cfg.prefill_burst)
+                                         : std::string("max-active"))
+              << "\n"
               << "  max_total_tokens="
               << (cfg.max_total_tokens_set ? std::to_string(cfg.max_total_tokens)
                                            : std::string("auto(ctx)"))
               << "\n"
               << "  mtp_chain=" << engine.native_mtp_chain << "\n"
+              << "  mtp_policy=" << engine.mtp_policy << "\n"
+              << "  mtp_adaptive_min_chain="
+              << (engine.mtp_adaptive_min_chain > 0
+                      ? std::to_string(engine.mtp_adaptive_min_chain)
+                      : std::string("auto"))
+              << "\n"
+              << "  mtp_adaptive_max_chain="
+              << (engine.mtp_adaptive_max_chain > 0
+                      ? std::to_string(engine.mtp_adaptive_max_chain)
+                      : std::string("auto"))
+              << "\n"
               << "  mtp_speculate=" << yesno(engine.native_mtp_speculate) << "\n"
               << "  mtp_batched_draft=" << yesno(cfg.mtp_batched_draft) << "\n"
               << "  mtp_paged_prefix=" << yesno(cfg.mtp_paged_prefix) << "\n"
@@ -989,11 +1140,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const uint64_t rid = ++req_counter;
         const auto t0 = std::chrono::steady_clock::now();
 
+        // The streaming content provider outlives this handler scope, so the
+        // raw `tools` pointer into `req` would dangle. Capture a by-value copy
+        // for schema-driven argument coercion inside the stream callback.
+        const json tools_schema = tools ? *tools : json();
+
         if (stream) {
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [&, prompt, g, stops, id, created, rid, enable_thinking,
-                 tool_request, forced_tool_request,
+                 tool_request, forced_tool_request, tools_schema,
                  stream_include_usage, prompt_token_count, route,
                  fallback_reason](size_t, httplib::DataSink &sink) {
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
@@ -1135,7 +1291,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 const std::string framed =
                                     enable_thinking ? ("<think>\n" + text) : text;
                                 const std::vector<json> tool_calls =
-                                    parse_tool_calls_xml(framed);
+                                    parse_tool_calls_xml(
+                                        framed,
+                                        tools_schema.is_array() ? &tools_schema
+                                                                : nullptr);
                                 const ReasoningSplit split = split_reasoning(framed);
                                 if (!split.reasoning.empty()) {
                                     send_delta(json{{"reasoning_content", split.reasoning}});
@@ -1269,7 +1428,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             std::cerr << " fallback_reason=" << fallback_reason;
         }
         std::cerr << " " << ms << "ms\n";
-        const std::vector<json> tool_calls = parse_tool_calls_xml(text);
+        const std::vector<json> tool_calls = parse_tool_calls_xml(text, tools);
         const ReasoningSplit split = split_reasoning(text);
         json message = json{{"role", "assistant"},
                             {"content", tool_calls.empty() ? split.content : ""}};

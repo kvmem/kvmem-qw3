@@ -56,6 +56,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 
 #include "cuda_helpers.cuh"
 
@@ -1774,6 +1775,215 @@ __global__ void mmq_q8_0_v7_kernel(
 }
 
 // ===========================================================================
+// vmed: medium-batch MMA kernel. v7's verified core (m16n8k32 INT8 MMA, XOR
+// swizzle, 2-stage cp.async, split-plane Q8 weights, 144-B block_q8_1_mmq_t
+// activations) with the BATCH (N) tile lifted into a template parameter so the
+// tensor-core tile is sized to the batch instead of v7's fixed 64 / v8's 128.
+//
+// Why this exists: for batch in [16,128) the auto-router sends work to v8's
+// 128-wide tile (rows are always thousands, so rows>=128 always holds), which
+// issues 16 N-sub-tile MMAs even when only 2-3 are non-empty. The microbench
+// showed mmq is FLAT at ~0.084 ms across M=1..64 — it pays full-128-tile cost
+// for a sliver of real work. Sizing N_TILE to the batch cuts the MMA count
+// proportionally and drops a medium-batch matmul toward the HBM weight-read
+// floor (the regime MTP verify / low-concurrency draft lands in).
+//
+// M side is fixed at 64 rows (4 warps × 16-row stripes), identical to v7.
+// N_TILE ∈ {16,32,64}; NW = N_TILE/8 N-sub-tiles. All N_TILE are multiples of
+// 8 so the swizzle collapse (row&7 == gid for N0=n*8) is preserved.
+
+template <int N_TILE, bool need_check>
+__launch_bounds__(V2_THREADS, 2)
+__global__ void mmq_q8_0_vmed_kernel(
+        const uint8_t          * __restrict__ wq,
+        const block_q8_1_mmq_t * __restrict__ ya,
+        float                  * __restrict__ dst,
+        uint32_t                  rows,
+        uint32_t                  cols,
+        uint32_t                  batch,
+        uint32_t                  stride_y_sb,
+        uint32_t                  stride_dst_row)
+{
+    constexpr int NW          = N_TILE / 8;
+    constexpr int Y_QS_PASSES = (N_TILE * 8) / V2_THREADS;  // 1 / 2 / 4
+
+    __shared__ __align__(16) int8_t W_qs_buf[V7_STAGES][V7M_M_PER_CTA][V7M_K_STRIDE];
+    __shared__ float                W_d_buf [V7_STAGES][V7M_M_PER_CTA][V7M_NSUB];
+    __shared__ __align__(16) int8_t Y_qs_buf[V7_STAGES][N_TILE][V7M_K_STRIDE];
+    __shared__ float                Y_d_buf [V7_STAGES][N_TILE][V7M_NSUB];
+
+    const int n_blocks  = static_cast<int>(cols / MMQ_QK);
+    const int n_sblocks = static_cast<int>(cols / V7M_K_STRIDE);
+    const int row0  = static_cast<int>(blockIdx.x) * V7M_M_PER_CTA;
+    const int col00 = static_cast<int>(blockIdx.y) * N_TILE;
+
+    const int warp_id = static_cast<int>(threadIdx.y);
+    const int lane    = static_cast<int>(threadIdx.x);
+    const int tid     = warp_id * V2_WARP + lane;
+    const int gid     = lane >> 2;
+    const int tid4    = lane & 3;
+
+    float acc[NW][4];
+    #pragma unroll
+    for (int n = 0; n < NW; ++n) {
+        acc[n][0] = 0.0f; acc[n][1] = 0.0f;
+        acc[n][2] = 0.0f; acc[n][3] = 0.0f;
+    }
+
+    auto issue_sb = [&](int sb, int s) {
+        // W_qs: 64 rows × 128 B = 8192 B = 512 cp.async.16 / 128 threads = 4/thread.
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int flat   = p * V2_THREADS + tid;
+            const int rl     = flat >> 3;
+            const int chunk  = flat & 7;
+            const int row    = row0 + rl;
+            const int col_byte_dst = (chunk ^ (rl & 7)) * 16;
+            const int col_byte_src = chunk * 16;
+            int8_t *dst_p = &W_qs_buf[s][rl][col_byte_dst];
+            const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
+            if (in_range) {
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                const int8_t  *qs_sb    = cuda_helpers::q8_qs_plane(row_base, n_blocks)
+                                          + sb * V7M_K_STRIDE;
+                cp_async_cg_16(dst_p, qs_sb + col_byte_src);
+            } else {
+                int4 *zp = reinterpret_cast<int4 *>(dst_p);
+                *zp = make_int4(0, 0, 0, 0);
+            }
+        }
+        // Y_qs: N_TILE rows × 128 B → N_TILE*8 cp.async.16 = Y_QS_PASSES/thread.
+        #pragma unroll
+        for (int p = 0; p < Y_QS_PASSES; ++p) {
+            const int flat   = p * V2_THREADS + tid;
+            const int bl     = flat >> 3;
+            const int chunk  = flat & 7;
+            const int batch_idx = col00 + bl;
+            const int col_byte_dst = (chunk ^ (bl & 7)) * 16;
+            const int col_byte_src = chunk * 16;
+            int8_t *dst_p = &Y_qs_buf[s][bl][col_byte_dst];
+            const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
+            if (in_range) {
+                const block_q8_1_mmq_t *yblk =
+                    ya + static_cast<size_t>(sb) * stride_y_sb + batch_idx;
+                cp_async_cg_16(dst_p, yblk->qs + col_byte_src);
+            } else {
+                int4 *zp = reinterpret_cast<int4 *>(dst_p);
+                *zp = make_int4(0, 0, 0, 0);
+            }
+        }
+        // W_d: 64 rows × 4 sub = 256 ; 2 passes.
+        #pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int flat = p * V2_THREADS + tid;
+            const int rl   = flat >> 2;
+            const int sub  = flat & 3;
+            const int row  = row0 + rl;
+            float d = 0.0f;
+            const bool in_range = need_check ? (row < static_cast<int>(rows)) : true;
+            if (in_range) {
+                const uint8_t *row_base = wq + static_cast<size_t>(row) * n_blocks * 34;
+                const int kb = sb * V7M_NSUB + sub;
+                d = __half2float(static_cast<half>(cuda_helpers::q8_d_plane(row_base)[kb]));
+            }
+            W_d_buf[s][rl][sub] = d;
+        }
+        // Y_d: N_TILE rows × 4 sub = N_TILE*4 values (guard the partial pass at N_TILE=16).
+        #pragma unroll
+        for (int base = 0; base < N_TILE * 4; base += V2_THREADS) {
+            const int flat = base + tid;
+            if (flat < N_TILE * 4) {
+                const int bl   = flat >> 2;
+                const int sub  = flat & 3;
+                const int batch_idx = col00 + bl;
+                float d = 0.0f;
+                const bool in_range = need_check ? (batch_idx < static_cast<int>(batch)) : true;
+                if (in_range) {
+                    const block_q8_1_mmq_t *yblk =
+                        ya + static_cast<size_t>(sb) * stride_y_sb + batch_idx;
+                    d = yblk->d4[sub];
+                }
+                Y_d_buf[s][bl][sub] = d;
+            }
+        }
+    };
+
+    // VMED_BODY_MARKER
+    if (n_sblocks > 0) {
+        issue_sb(0, 0);
+        cp_async_commit();
+    }
+
+    for (int sb = 0; sb < n_sblocks; ++sb) {
+        const int s_cur = sb & 1;
+        if (sb + 1 < n_sblocks) {
+            issue_sb(sb + 1, (sb + 1) & 1);
+            cp_async_commit();
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_group<0>();
+        }
+        __syncthreads();
+
+        const int rl_top = warp_id * V1_M_TILE + gid;
+        const int rl_bot = rl_top + 8;
+        const int sw = gid << 4;   // swizzle collapses to gid<<4 (see v7 note)
+
+        #pragma unroll
+        for (int sub = 0; sub < V7M_NSUB; ++sub) {
+            const int kb_off = sub * MMQ_QK;
+            const int off_lo = (kb_off ^ sw) + 4 * tid4;
+            const int off_hi = ((kb_off + 16) ^ sw) + 4 * tid4;
+
+            const unsigned a0 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][off_lo]);
+            const unsigned a1 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][off_lo]);
+            const unsigned a2 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_top][off_hi]);
+            const unsigned a3 = *reinterpret_cast<unsigned *>(&W_qs_buf[s_cur][rl_bot][off_hi]);
+            const float d_w_top = W_d_buf[s_cur][rl_top][sub];
+            const float d_w_bot = W_d_buf[s_cur][rl_bot][sub];
+
+            #pragma unroll
+            for (int n = 0; n < NW; ++n) {
+                const int N0 = n * 8;
+                const unsigned b0 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][off_lo]);
+                const unsigned b1 = *reinterpret_cast<unsigned *>(&Y_qs_buf[s_cur][N0 + gid][off_hi]);
+                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                mma_m16n8k32_s8s8s32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+
+                const float d_y_my    = Y_d_buf[s_cur][N0 + gid][sub];
+                const float d_y_left  = __shfl_sync(0xffffffffu, d_y_my, 8 * tid4,     V2_WARP);
+                const float d_y_right = __shfl_sync(0xffffffffu, d_y_my, 8 * tid4 + 4, V2_WARP);
+
+                acc[n][0] += d_w_top * d_y_left  * static_cast<float>(c0);
+                acc[n][1] += d_w_top * d_y_right * static_cast<float>(c1);
+                acc[n][2] += d_w_bot * d_y_left  * static_cast<float>(c2);
+                acc[n][3] += d_w_bot * d_y_right * static_cast<float>(c3);
+            }
+        }
+        __syncthreads();
+    }
+
+    const int row_top = row0 + warp_id * V1_M_TILE + gid;
+    const int row_bot = row_top + 8;
+    const bool top_in = need_check ? (row_top < static_cast<int>(rows)) : true;
+    const bool bot_in = need_check ? (row_bot < static_cast<int>(rows)) : true;
+    #pragma unroll
+    for (int n = 0; n < NW; ++n) {
+        const int col_left  = col00 + n * 8 + 2 * tid4;
+        const int col_right = col_left + 1;
+        const bool left_in  = need_check ? (col_left  < static_cast<int>(batch)) : true;
+        const bool right_in = need_check ? (col_right < static_cast<int>(batch)) : true;
+        if (left_in) {
+            if (top_in) dst[static_cast<size_t>(col_left)  * stride_dst_row + row_top] = acc[n][0];
+            if (bot_in) dst[static_cast<size_t>(col_left)  * stride_dst_row + row_bot] = acc[n][2];
+        }
+        if (right_in) {
+            if (top_in) dst[static_cast<size_t>(col_right) * stride_dst_row + row_top] = acc[n][1];
+            if (bot_in) dst[static_cast<size_t>(col_right) * stride_dst_row + row_bot] = acc[n][3];
+        }
+    }
+}
+// ===========================================================================
 // v8: large-tile MMQ for chunk=2048 large-batch regime.
 //
 // Combines v7's plumbing (split-plane Q8 weights, 144-B block_q8_1_mmq_t
@@ -2287,6 +2497,53 @@ bool launch_mmq_q8_0(
     mmq_q8_0_v1_kernel<<<grid, block, 0, stream>>>(
         weight, reinterpret_cast<const block_q8_1 *>(y_q8_1), dst,
         rows, cols, batch, stride_y_row, stride_dst_row);
+    return true;
+}
+
+// Medium-batch launcher: routes a batch in [9,128) to the vmed kernel with an
+// N_TILE sized to the batch (16/32/64). Activations MUST be staged in the
+// 144-B block_q8_1_mmq_t format (super-block-major × j-minor) via
+// launch_quantize_mmq_q8_1, same as v7/v8. Returns false (caller falls back)
+// if the shape is unsupported.
+//
+// N_TILE selection: smallest tile that covers the batch, to minimise empty
+// MMA sub-tiles. batch≤16→16, ≤32→32, else 64. Above 64 the caller should use
+// launch_mmq_q8_0 (v8's 128 tile). need_check guards the trailing N tile.
+bool launch_mmq_q8_0_medium(
+        const uint8_t * weight,
+        const void *    y_q8_1_mmq,
+        float *         dst,
+        uint32_t        rows,
+        uint32_t        cols,
+        uint32_t        batch,
+        uint32_t        stride_dst_row,
+        cudaStream_t    stream) {
+    if (cols % V7M_K_STRIDE != 0) return false;   // need whole 128-K super-blocks
+    if (batch == 0 || rows == 0) return false;
+    if (batch > 64) return false;                 // use v8 above the vmed range
+
+    const uint32_t stride_y_sb = batch;           // super-block-major × j-minor
+    const auto *ya = reinterpret_cast<const block_q8_1_mmq_t *>(y_q8_1_mmq);
+
+    auto launch = [&](auto N_C) {
+        constexpr int N_TILE = decltype(N_C)::value;
+        const uint32_t row_tiles = (rows  + V7M_M_PER_CTA - 1) / V7M_M_PER_CTA;
+        const uint32_t col_tiles = (batch + N_TILE        - 1) / N_TILE;
+        const dim3 grid(row_tiles, col_tiles, 1);
+        const dim3 block(V2_WARP, V2_NWARPS, 1);
+        const bool needs_check = (rows % V7M_M_PER_CTA != 0) || (batch % N_TILE != 0);
+        if (needs_check) {
+            mmq_q8_0_vmed_kernel<N_TILE, true><<<grid, block, 0, stream>>>(
+                weight, ya, dst, rows, cols, batch, stride_y_sb, stride_dst_row);
+        } else {
+            mmq_q8_0_vmed_kernel<N_TILE, false><<<grid, block, 0, stream>>>(
+                weight, ya, dst, rows, cols, batch, stride_y_sb, stride_dst_row);
+        }
+    };
+
+    if (batch <= 16)      launch(std::integral_constant<int, 16>{});
+    else if (batch <= 32) launch(std::integral_constant<int, 32>{});
+    else                  launch(std::integral_constant<int, 64>{});
     return true;
 }
 

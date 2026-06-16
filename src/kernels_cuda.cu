@@ -83,6 +83,13 @@ bool launch_mmq_q8_0(
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
 
+// Medium-batch INT8-MMA (vmed): batch in [~12,64], N tile sized to batch.
+// Activations must be staged as 144-B block_q8_1_mmq (super-block-major).
+bool launch_mmq_q8_0_medium(
+        const uint8_t *weight, const void *y_q8_1_mmq, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
+
 // Q8_1_MMQ activation staging — required by MMQ v4 kernel (144 B/block,
 // super-block-major × j-minor). Falls back to Q8_1 (36 B) for v2/v3.
 size_t q8_1_mmq_scratch_bytes(uint32_t batch, uint32_t cols);
@@ -265,6 +272,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -289,6 +298,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -313,6 +324,8 @@ bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -341,6 +354,8 @@ bool launch_batch_prefill_paged_ragged_f16q_fp8kv_gated(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -733,6 +748,34 @@ inline uint32_t mma_min_batch() {
 
 inline bool matmul_auto_use_mmq(uint32_t batch) {
     return batch >= mma_min_batch();
+}
+
+// Medium-batch vmed kernel toggle (default ON). QW3_VMED=0 disables, routing
+// medium batches back through v7/v8. See project_mtp_vmed_medium_batch_mma_kernel.
+inline bool vmed_enabled() {
+    static const bool on = []() {
+        const char *env = std::getenv("QW3_VMED");
+        if (!env || !*env) return true;
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "off") != 0 &&
+               std::strcmp(env, "false") != 0;
+    }();
+    return on;
+}
+
+// Lower bound for routing into the INT8-MMA path (vmed/mmq). Below this, the
+// MMVQ column-batched matvec wins (microbench crossover ~M=12-16). When vmed
+// is enabled this is lower than mma_min_batch() so medium batches reach the
+// tensor-core tile; when disabled it equals mma_min_batch().
+inline uint32_t vmed_min_batch() {
+    static const uint32_t v = []() -> uint32_t {
+        if (const char *env = std::getenv("QW3_VMED_MIN_BATCH")) {
+            int n = std::atoi(env);
+            if (n >= 1) return static_cast<uint32_t>(n);
+        }
+        return 12u;
+    }();
+    return v;
 }
 
 inline bool hgemm_disabled() {
@@ -3117,6 +3160,7 @@ public:
         if (flashinfer_batch_prefill_q_f16_) cudaFree(flashinfer_batch_prefill_q_f16_);
         if (flashinfer_batch_prefill_o_f16_) cudaFree(flashinfer_batch_prefill_o_f16_);
         if (flashinfer_batch_prefill_meta_i32_) cudaFree(flashinfer_batch_prefill_meta_i32_);
+        if (flashinfer_batch_prefill_float_) cudaFree(flashinfer_batch_prefill_float_);
         for (uint32_t i = 0; i < kFlashInferBatchPrefillHostSlots; ++i) {
             if (flashinfer_batch_prefill_meta_events_[i]) {
                 cudaEventDestroy(flashinfer_batch_prefill_meta_events_[i]);
@@ -3989,6 +4033,28 @@ private:
     // it's a tile-friendly format that lets the MMQ kernel read mmq_x*36
     // contiguous ints per K super-iter.
     DeviceStatus mmq_q8(float *out_ptr, CudaWeight &w, const float *x_ptr, uint32_t batch) {
+        // Medium-batch vmed path: for batch in [vmed_min, 64] the v8/v7 tiles
+        // (128/64-wide) are mostly empty and pay full-tile compute; vmed sizes
+        // the N tile to the batch (16/32/64), 2-3x faster at M=16..64 (see
+        // project_mtp_vmed_medium_batch_mma_kernel). Requires cols % 128 == 0
+        // and the 144-B block_q8_1_mmq activation layout. Disable via
+        // QW3_VMED=0. Falls through to the standard mmq path on any failure.
+        if (batch >= vmed_min_batch() && batch <= 64 && vmed_enabled() && (w.cols % 128) == 0) {
+            if (auto st = ensure_q8_1_mmq_scratch(batch, w.cols); st.ok) {
+                if (ported::launch_quantize_mmq_q8_1(x_ptr, q8_1_mmq_scratch_,
+                                                     batch, w.cols, /*stride_x_row=*/w.cols,
+                                                     exec_stream_) &&
+                    ported::launch_mmq_q8_0_medium(static_cast<const uint8_t *>(w.ptr),
+                                                   q8_1_mmq_scratch_, out_ptr,
+                                                   static_cast<uint32_t>(w.rows), w.cols,
+                                                   batch, /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                                                   exec_stream_)) {
+                    return launch_status("cuda q8_0_matmul vmed");
+                }
+            }
+            // else: fall through to the standard mmq path below.
+        }
+
         const bool use_mmq_y =
             mmq_uses_mmq_y_layout(static_cast<uint32_t>(w.rows), w.cols, batch);
         if (use_mmq_y) {
@@ -5514,7 +5580,8 @@ public:
 
     DeviceStatus ensure_flashinfer_batch_prefill_workspace(uint64_t q_elems,
                                                            uint64_t o_elems,
-                                                           uint64_t meta_i32_elems) {
+                                                           uint64_t meta_i32_elems,
+                                                           uint64_t float_elems) {
         if (q_elems > flashinfer_batch_prefill_q_f16_capacity_) {
             if (flashinfer_batch_prefill_q_f16_) cudaFree(flashinfer_batch_prefill_q_f16_);
             flashinfer_batch_prefill_q_f16_ = nullptr;
@@ -5550,6 +5617,18 @@ public:
                 return st;
             }
             flashinfer_batch_prefill_meta_i32_capacity_ = meta_i32_elems;
+        }
+        if (float_elems > flashinfer_batch_prefill_float_capacity_) {
+            if (flashinfer_batch_prefill_float_) cudaFree(flashinfer_batch_prefill_float_);
+            flashinfer_batch_prefill_float_ = nullptr;
+            flashinfer_batch_prefill_float_capacity_ = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(&flashinfer_batch_prefill_float_,
+                               static_cast<size_t>(float_elems) * sizeof(float)),
+                    "flashinfer batch prefill float workspace alloc"); !st.ok) {
+                return st;
+            }
+            flashinfer_batch_prefill_float_capacity_ = float_elems;
         }
         const uint64_t meta_bytes = meta_i32_elems * sizeof(int32_t);
         for (uint32_t i = 0; i < kFlashInferBatchPrefillHostSlots; ++i) {
@@ -6581,8 +6660,16 @@ public:
                 static_cast<uint64_t>(batch) * n_heads * head_dim;
             const uint64_t o_elems = q_elems;
             const uint64_t meta_i32_elems = 1u << 20;  // 4 MiB scheduler/prefix workspace.
+            // Float scratch for FlashInfer split-KV partial-output merge. The
+            // planner partitions the long KV stream across many CTAs (verify is
+            // batch~5 vs base grid 4 CTAs), writes per-chunk partial O+LSE here,
+            // then merges via VariableLengthMergeStates. 512 MiB covers the
+            // worst case (24 heads × ~94 padded_batch × 128 cta_tile_q × 256
+            // head_dim × 4B ≈ 282 MiB); overflow degrades gracefully to a
+            // disable-split plan + batch-decode fallback.
+            const uint64_t float_elems = 128ull << 20;  // 512 MiB
             if (auto st = ensure_flashinfer_batch_prefill_workspace(
-                    q_elems, o_elems, meta_i32_elems); !st.ok) {
+                    q_elems, o_elems, meta_i32_elems, float_elems); !st.ok) {
                 return st;
             }
             void *host_meta = nullptr;
@@ -6599,6 +6686,9 @@ public:
                     host_meta,
                     static_cast<size_t>(flashinfer_batch_prefill_meta_i32_capacity_) *
                         sizeof(int32_t),
+                    flashinfer_batch_prefill_float_,
+                    static_cast<size_t>(flashinfer_batch_prefill_float_capacity_) *
+                        sizeof(float),
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
@@ -6611,6 +6701,9 @@ public:
                     host_meta,
                     static_cast<size_t>(flashinfer_batch_prefill_meta_i32_capacity_) *
                         sizeof(int32_t),
+                    flashinfer_batch_prefill_float_,
+                    static_cast<size_t>(flashinfer_batch_prefill_float_capacity_) *
+                        sizeof(float),
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
@@ -6692,8 +6785,13 @@ public:
                 static_cast<uint64_t>(total_q) * n_heads * head_dim;
             const uint64_t o_elems = q_elems;
             const uint64_t meta_i32_elems = 1u << 20;
+            // Enable FlashInfer split-KV for the ragged MTP verify batch: the
+            // batch is only a few query rows per request but each attends a
+            // long KV, so without splitting the grid starves (~n_kv_heads CTAs)
+            // and co-batching concurrent requests yields no attention speedup.
+            const uint64_t float_elems = 128ull << 20;  // 512 MiB scratch
             if (auto st = ensure_flashinfer_batch_prefill_workspace(
-                    q_elems, o_elems, meta_i32_elems); !st.ok) {
+                    q_elems, o_elems, meta_i32_elems, float_elems); !st.ok) {
                 return st;
             }
             void *host_meta = nullptr;
@@ -6710,6 +6808,9 @@ public:
                     host_meta,
                     static_cast<size_t>(flashinfer_batch_prefill_meta_i32_capacity_) *
                         sizeof(int32_t),
+                    flashinfer_batch_prefill_float_,
+                    static_cast<size_t>(flashinfer_batch_prefill_float_capacity_) *
+                        sizeof(float),
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     indptr.ptr_i32(), last_len.ptr_i32(), qptr.ptr_i32(),
                     q_indptr_host, page_indptr_host, batch, total_q,
@@ -6723,6 +6824,9 @@ public:
                     host_meta,
                     static_cast<size_t>(flashinfer_batch_prefill_meta_i32_capacity_) *
                         sizeof(int32_t),
+                    flashinfer_batch_prefill_float_,
+                    static_cast<size_t>(flashinfer_batch_prefill_float_capacity_) *
+                        sizeof(float),
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     indptr.ptr_i32(), last_len.ptr_i32(), qptr.ptr_i32(),
                     q_indptr_host, page_indptr_host, batch, total_q,
@@ -6924,6 +7028,9 @@ public:
                                               const DeviceTensor &page_indptr,
                                               const DeviceTensor &last_page_len,
                                               const DeviceTensor &seq_lens,
+                                              const int32_t *page_indptr_host,
+                                              const int32_t *last_page_len_host,
+                                              const int32_t *seq_lens_host,
                                               uint32_t page_size,
                                               uint32_t n_heads,
                                               uint32_t n_kv_heads,
@@ -6960,24 +7067,32 @@ public:
             std::vector<int32_t> seq_h(batch, 0);
             std::vector<int32_t> indptr_h(static_cast<size_t>(batch) + 1, 0);
             std::vector<int32_t> last_len_h(batch, 0);
-            if (auto st = cuda_status(
-                    cudaMemcpyAsync(seq_h.data(), seq.ptr_i32(),
-                                    batch * sizeof(int32_t),
-                                    cudaMemcpyDeviceToHost, exec_stream_),
-                    "ragged attention seq_lens copy"); !st.ok) return st;
-            if (auto st = cuda_status(
-                    cudaMemcpyAsync(indptr_h.data(), indptr.ptr_i32(),
-                                    (static_cast<size_t>(batch) + 1) * sizeof(int32_t),
-                                    cudaMemcpyDeviceToHost, exec_stream_),
-                    "ragged attention page_indptr copy"); !st.ok) return st;
-            if (auto st = cuda_status(
-                    cudaMemcpyAsync(last_len_h.data(), last_len.ptr_i32(),
-                                    batch * sizeof(int32_t),
-                                    cudaMemcpyDeviceToHost, exec_stream_),
-                    "ragged attention last_page_len copy"); !st.ok) return st;
-            if (auto st = cuda_status(cudaStreamSynchronize(exec_stream_),
-                                      "ragged attention metadata sync"); !st.ok) {
-                return st;
+            if (seq_lens_host && page_indptr_host && last_page_len_host) {
+                std::copy(seq_lens_host, seq_lens_host + batch, seq_h.begin());
+                std::copy(page_indptr_host, page_indptr_host + batch + 1,
+                          indptr_h.begin());
+                std::copy(last_page_len_host, last_page_len_host + batch,
+                          last_len_h.begin());
+            } else {
+                if (auto st = cuda_status(
+                        cudaMemcpyAsync(seq_h.data(), seq.ptr_i32(),
+                                        batch * sizeof(int32_t),
+                                        cudaMemcpyDeviceToHost, exec_stream_),
+                        "ragged attention seq_lens copy"); !st.ok) return st;
+                if (auto st = cuda_status(
+                        cudaMemcpyAsync(indptr_h.data(), indptr.ptr_i32(),
+                                        (static_cast<size_t>(batch) + 1) * sizeof(int32_t),
+                                        cudaMemcpyDeviceToHost, exec_stream_),
+                        "ragged attention page_indptr copy"); !st.ok) return st;
+                if (auto st = cuda_status(
+                        cudaMemcpyAsync(last_len_h.data(), last_len.ptr_i32(),
+                                        batch * sizeof(int32_t),
+                                        cudaMemcpyDeviceToHost, exec_stream_),
+                        "ragged attention last_page_len copy"); !st.ok) return st;
+                if (auto st = cuda_status(cudaStreamSynchronize(exec_stream_),
+                                          "ragged attention metadata sync"); !st.ok) {
+                    return st;
+                }
             }
 
             uint32_t max_seq_len = 0;
@@ -7626,6 +7741,8 @@ private:
     uint64_t flashinfer_batch_prefill_o_f16_capacity_ = 0;  // elements
     int32_t *flashinfer_batch_prefill_meta_i32_ = nullptr;
     uint64_t flashinfer_batch_prefill_meta_i32_capacity_ = 0;  // elements
+    float *flashinfer_batch_prefill_float_ = nullptr;
+    uint64_t flashinfer_batch_prefill_float_capacity_ = 0;  // elements
     void *flashinfer_batch_prefill_meta_hosts_[kFlashInferBatchPrefillHostSlots] = {};
     uint64_t flashinfer_batch_prefill_meta_host_capacities_[kFlashInferBatchPrefillHostSlots] = {};
     cudaEvent_t flashinfer_batch_prefill_meta_events_[kFlashInferBatchPrefillHostSlots] = {};

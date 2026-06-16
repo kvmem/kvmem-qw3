@@ -235,6 +235,11 @@ uint32_t continuous_batching_prefill_burst(uint32_t max_active) {
         1, env_uint32_or("QW3_CONTINUOUS_BATCHING_PREFILL_BURST", max_active));
 }
 
+uint32_t continuous_batching_active_prefill_burst() {
+    return std::max<uint32_t>(
+        1, env_uint32_or("QW3_CONTINUOUS_BATCHING_ACTIVE_PREFILL_BURST", 1));
+}
+
 uint32_t continuous_batching_admission_wait_us() {
     return env_uint32_or("QW3_CONTINUOUS_BATCHING_ADMISSION_WAIT_US", 1000);
 }
@@ -291,7 +296,7 @@ bool continuous_batching_mtp_enabled() {
 }
 
 bool continuous_mtp_batched_draft_enabled() {
-    return env_flag_enabled("QW3_CONTINUOUS_MTP_BATCHED_DRAFT");
+    return env_flag_enabled("QW3_CONTINUOUS_MTP_BATCHED_DRAFT", true);
 }
 
 bool continuous_mtp_layered_verify_enabled() {
@@ -2763,6 +2768,9 @@ private:
                         *mid_batch_, *q_batch_, q_stride, *k_cache, *v_cache,
                         *ragged_page_indices_i32_, *ragged_page_indptr_i32_,
                         *ragged_last_page_len_i32_, *ragged_seq_lens_i32_,
+                        ragged_page_indptr_h_.data(),
+                        ragged_last_page_len_h_.data(),
+                        ragged_seq_lens_h_.data(),
                         first_view.kv_page_size, standard_n_heads,
                         standard_n_kv_heads, standard_head_dim, bsz,
                         static_cast<uint32_t>(layer.q_rows), mid_stride, scale));
@@ -3350,10 +3358,11 @@ private:
                     build_continuous_decode_batch(active, decode_batch);
                     continuous_decode_batch_step(active, decode_batch, eos);
                 }
-                const uint32_t prefill_steps = had_active_decode
-                    ? 1u
-                    : std::min<uint32_t>(
-                          static_cast<uint32_t>(prefilling.size()), prefill_burst);
+                const uint32_t prefill_steps = std::min<uint32_t>(
+                    static_cast<uint32_t>(prefilling.size()),
+                    had_active_decode
+                        ? continuous_batching_active_prefill_burst()
+                        : prefill_burst);
                 advance_continuous_prefill_batch(prefilling, active, eos,
                                                  prefill_steps);
             }
@@ -3601,10 +3610,16 @@ private:
             !metadata_batch.page_indices.empty();
         metadata_batch.ragged_row_metadata_ready =
             metadata_batch.ragged_metadata_ready;
+        // The fused KV-append + attention below require valid ragged metadata
+        // (one global MTP KV tensor indexed per-row). If it didn't assemble,
+        // fall back to the per-row draft path.
+        if (!metadata_batch.ragged_metadata_ready) return false;
 
         try {
             trace_stage("begin");
             require_device_status(device_->begin());
+            prepare_continuous_prefill_ragged_metadata_device(metadata_batch);
+            if (!metadata_batch.ragged_device_metadata_ready) return false;
             trace_stage("pack_hidden");
             for (uint32_t i = 0; i < bsz; ++i) {
                 ContinuousMtpDraftStep &step = steps[i];
@@ -3678,54 +3693,38 @@ private:
                 standard_head_dim, cfg.rope_dim,
                 *cb_mtp_draft_positions_i32_, cfg.rope_theta));
             trace_stage("kv_append_k_before");
-            for (uint32_t i = 0; i < bsz; ++i) {
-                ContinuousMtpDraftStep &step = steps[i];
-                ContinuousBatchActive &a = mtp_active[step.row];
-                QwenExecutor::MtpPrefixStateView view =
-                    a.executor->mtp_prefix_state_view();
-                require_device_status(device_->copy_d2d_into(
-                    *cb_mtp_k_row_, 0, *cb_mtp_k_batch_,
-                    static_cast<uint64_t>(i) * k_stride, k_stride));
-                require_device_status(device_->kv_append_batch_paged_device(
-                    *view.k_cache, *cb_mtp_k_row_, step.cache_pos, per_pos,
-                    1, *view.page_indices_device, view.page_count,
-                    view.page_size));
-            }
+            // All rows share one global MTP KV tensor, so KV-append and
+            // attention fuse into single ragged calls across the batch (mirrors
+            // the plain decode body-batch path). cb_mtp_draft_positions_i32_
+            // already holds per-row cache_pos; cb_prefill_* device metadata was
+            // uploaded above from metadata_batch.
+            QwenExecutor::MtpPrefixStateView view0 =
+                mtp_active[steps[0].row].executor->mtp_prefix_state_view();
+            require_device_status(device_->kv_append_batch_paged_ragged_device(
+                *view0.k_cache, *cb_mtp_k_batch_, *cb_mtp_draft_positions_i32_,
+                per_pos, bsz, k_stride,
+                *cb_prefill_page_indices_i32_, *cb_prefill_page_indptr_i32_,
+                view0.page_size));
             trace_stage("kv_append_k_after");
             trace_stage("kv_append_v_before");
-            for (uint32_t i = 0; i < bsz; ++i) {
-                ContinuousMtpDraftStep &step = steps[i];
-                ContinuousBatchActive &a = mtp_active[step.row];
-                QwenExecutor::MtpPrefixStateView view =
-                    a.executor->mtp_prefix_state_view();
-                require_device_status(device_->copy_d2d_into(
-                    *cb_mtp_v_row_, 0, *cb_mtp_v_batch_,
-                    static_cast<uint64_t>(i) * v_stride, v_stride));
-                require_device_status(device_->kv_append_batch_paged_device(
-                    *view.v_cache, *cb_mtp_v_row_, step.cache_pos, per_pos,
-                    1, *view.page_indices_device, view.page_count,
-                    view.page_size));
-            }
+            require_device_status(device_->kv_append_batch_paged_ragged_device(
+                *view0.v_cache, *cb_mtp_v_batch_, *cb_mtp_draft_positions_i32_,
+                per_pos, bsz, v_stride,
+                *cb_prefill_page_indices_i32_, *cb_prefill_page_indptr_i32_,
+                view0.page_size));
             trace_stage("kv_append_v_after");
             trace_stage("attention");
-            for (uint32_t i = 0; i < bsz; ++i) {
-                ContinuousMtpDraftStep &step = steps[i];
-                ContinuousBatchActive &a = mtp_active[step.row];
-                QwenExecutor::MtpPrefixStateView view =
-                    a.executor->mtp_prefix_state_view();
-                require_device_status(device_->copy_d2d_into(
-                    *cb_mtp_q_row_, 0, *cb_mtp_q_batch_,
-                    static_cast<uint64_t>(i) * q_stride, q_stride));
-                require_device_status(device_->attention_decode_batch_paged_gated_device(
-                    *cb_mtp_mid_row_, *cb_mtp_q_row_,
-                    2 * standard_head_dim, *view.k_cache, *view.v_cache,
-                    *view.page_indices_device, view.page_count, view.page_size,
-                    standard_n_heads, standard_n_kv_heads, standard_head_dim,
-                    step.cache_pos, 1, q_stride, mid_stride, scale));
-                require_device_status(device_->copy_d2d_into(
-                    *cb_mtp_mid_batch_, static_cast<uint64_t>(i) * mid_stride,
-                    *cb_mtp_mid_row_, 0, mid_stride));
-            }
+            require_device_status(
+                device_->attention_decode_batch_paged_gated_ragged_device(
+                    *cb_mtp_mid_batch_, *cb_mtp_q_batch_, 2 * standard_head_dim,
+                    *view0.k_cache, *view0.v_cache,
+                    *cb_prefill_page_indices_i32_, *cb_prefill_page_indptr_i32_,
+                    *cb_prefill_last_page_len_i32_, *cb_prefill_seq_lens_i32_,
+                    metadata_batch.page_indptr.data(),
+                    metadata_batch.last_page_len.data(),
+                    metadata_batch.seq_lens.data(),
+                    view0.page_size, standard_n_heads, standard_n_kv_heads,
+                    standard_head_dim, bsz, q_stride, mid_stride, scale));
             require_device_status(device_->q8_0_matmul_add(
                 *cb_mtp_h_batch_, *cb_mtp_h_batch_, *cb_mtp_ffn_out_batch_,
                 *layer.attn_output, *cb_mtp_mid_batch_, bsz, mid_stride,
@@ -3938,8 +3937,10 @@ private:
             uint64_t verify_batches = 0;
             uint64_t verify_tokens = 0;
             uint64_t decode_ops = 0;
+            uint64_t prefill_ops = 0;
             uint64_t state_checkpoint_reused = 0;
             uint64_t prefix1_reused = 0;
+            double prefill_s = 0.0;
             double draft_s = 0.0;
             double snapshot_s = 0.0;
             double verify_s = 0.0;
@@ -4116,6 +4117,7 @@ private:
                     static_cast<int>(kMtpPrefillChunk));
                 NativeExecutorReport step;
                 uint64_t prefill_ops = 0;
+                const double prefill0 = wall_seconds();
                 for (size_t offset = 0; offset < req->prompt_tokens.size();
                      offset += kMtpPrefillChunk) {
                     const size_t end = std::min(
@@ -4138,6 +4140,7 @@ private:
                             "MTP prefix priming failed in batched lane");
                     }
                 }
+                const double prefill_s = std::max(wall_seconds() - prefill0, 1e-9);
                 a.prefill_ops = prefill_ops;
                 a.next_token = step.argmax_token >= 0
                     ? static_cast<uint32_t>(step.argmax_token)
@@ -4153,6 +4156,8 @@ private:
                 } else {
                     mtp_active.push_back(std::move(a));
                     stats.emplace_back();
+                    stats.back().prefill_ops = prefill_ops;
+                    stats.back().prefill_s = prefill_s;
                     stats.back().decode_start = wall_seconds();
                     stats.back().policy.configure(
                         true, chain_len, req->prompt_tokens.size());
@@ -4753,9 +4758,14 @@ private:
                         log(summary.str());
                         log("native generate: prompt_tokens=" +
                             std::to_string(a.req->prompt_tokens.size()) +
-                            " prefill=0.000s decoded=" +
+                            " prefill=" + fmt_seconds(s.prefill_s) +
+                            " decoded=" +
                             std::to_string(a.decoded) +
-                            " decode=" + fmt_seconds(decode_s));
+                            " decode=" + fmt_seconds(decode_s) +
+                            " prefill_ops=" +
+                            std::to_string(s.prefill_ops) +
+                            " decode_ops=" +
+                            std::to_string(s.decode_ops));
                         finish_continuous_active(a);
                         mtp_active.erase(mtp_active.begin() +
                                          static_cast<std::ptrdiff_t>(i - 1));

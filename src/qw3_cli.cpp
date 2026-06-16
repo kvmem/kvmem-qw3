@@ -29,6 +29,8 @@ void usage(std::ostream &os) {
         "  --body-batch          Enable batched decode body executor.\n"
         "  --max-active N        Max active continuous requests. Default: 2\n"
         "  --max-pending N       Max queued continuous requests. Default: 128\n"
+        "  --prefill-burst N     Prefill chunks advanced per scheduler turn.\n"
+        "                        Default: max-active\n"
         "  --max-total-tokens N  Total token reservation budget. Default: ctx.\n"
         "                        0 disables this admission budget.\n"
         "  --kv-page-size N      Paged-KV logical/physical page size. Default: 16\n"
@@ -37,6 +39,9 @@ void usage(std::ostream &os) {
         "  --kv-dtype NAME       KV-cache dtype: fp16 default, or fp8/fp32/q8.\n"
         "  --mtp-chain N         MTP speculative chain length. Default: 0 (off).\n"
         "                        N>0 enables MTP speculation.\n"
+        "  --mtp-policy NAME     MTP depth policy: fixed default, or adaptive.\n"
+        "  --mtp-adaptive-min-chain N  Adaptive MTP minimum chain. Default: auto.\n"
+        "  --mtp-adaptive-max-chain N  Adaptive MTP maximum chain. Default: --mtp-chain.\n"
         "  --mtp-batched-draft   Batch MTP draft projection/FFN/logits.\n"
         "  --mtp-paged-prefix    Use paged MTP prefix KV.\n"
         "  --no-continuous-batching, --no-paged-kv, --no-body-batch,\n"
@@ -65,6 +70,7 @@ void usage(std::ostream &os) {
         "  --native-mtp-chain N  Diagnostic MTP draft chain length. Default: 1\n"
         "  --native-mtp-prefix   Populate diagnostic MTP prefix KV before drafts\n"
         "  --native-mtp-speculate Experimental MTP speculative decode\n"
+        "  --mtp-policy NAME     MTP depth policy: fixed default, or adaptive.\n"
         "  --native-token-id N   Token id used by qwen-native single-token forward. Default: 0\n"
         "  --prefill-chunk N     Prefill chunk size in tokens (qwen-native).\n"
         "                        0 = no chunking (whole-prompt batch, max throughput,\n"
@@ -204,6 +210,16 @@ int main(int argc, char **argv) {
             } else if (arg == "--mtp-chain") {
                 engine.native_mtp_chain = parse_int(need(arg), arg);
                 engine.native_mtp_chain_set = true;
+            } else if (arg == "--mtp-policy") {
+                const std::string policy = need(arg);
+                if (policy != "fixed" && policy != "adaptive" && policy != "auto") {
+                    throw std::runtime_error("invalid --mtp-policy (want fixed|adaptive|auto): " + policy);
+                }
+                engine.mtp_policy = policy == "auto" ? "adaptive" : policy;
+            } else if (arg == "--mtp-adaptive-min-chain") {
+                engine.mtp_adaptive_min_chain = parse_int(need(arg), arg);
+            } else if (arg == "--mtp-adaptive-max-chain") {
+                engine.mtp_adaptive_max_chain = parse_int(need(arg), arg);
             } else if (arg == "--native-mtp-prefix") {
                 engine.native_mtp_prefix = true;
             } else if (arg == "--native-mtp-speculate") {
@@ -279,6 +295,8 @@ int main(int argc, char **argv) {
                 serve_cfg.max_active = parse_int(need(arg), arg);
             } else if (arg == "--max-pending") {
                 serve_cfg.max_pending = parse_int(need(arg), arg);
+            } else if (arg == "--prefill-burst") {
+                serve_cfg.prefill_burst = parse_int(need(arg), arg);
             } else if (arg == "--max-total-tokens") {
                 serve_cfg.max_total_tokens = parse_u64(need(arg), arg);
                 serve_cfg.max_total_tokens_set = true;
@@ -391,6 +409,25 @@ int main(int argc, char **argv) {
 
         if (kv_dtype_cli_set) {
             setenv("QW3_KV_DTYPE", kv_dtype_cli.c_str(), 1);
+        }
+        if (engine.mtp_policy != "fixed" && engine.mtp_policy != "adaptive") {
+            throw std::runtime_error("invalid --mtp-policy (want fixed|adaptive): " +
+                                     engine.mtp_policy);
+        }
+        if (engine.mtp_adaptive_min_chain < 0) {
+            throw std::runtime_error("--mtp-adaptive-min-chain must be >= 0");
+        }
+        if (engine.mtp_adaptive_max_chain < 0) {
+            throw std::runtime_error("--mtp-adaptive-max-chain must be >= 0");
+        }
+        setenv("QW3_MTP_POLICY", engine.mtp_policy.c_str(), 1);
+        if (engine.mtp_adaptive_min_chain > 0) {
+            setenv("QW3_MTP_ADAPTIVE_MIN_CHAIN",
+                   std::to_string(engine.mtp_adaptive_min_chain).c_str(), 1);
+        }
+        if (engine.mtp_adaptive_max_chain > 0) {
+            setenv("QW3_MTP_ADAPTIVE_MAX_CHAIN",
+                   std::to_string(engine.mtp_adaptive_max_chain).c_str(), 1);
         }
 
         if (prompt.empty()) {

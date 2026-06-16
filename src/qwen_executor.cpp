@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -1301,6 +1302,15 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                         standard_head_dim, base_pos, batch,
                         q_stride_buf, mid_stride, scale);
                     if (!attn_st.ok) {
+                        if (std::getenv("QW3_DEBUG_PREFILL_PLAN")) {
+                            static int fb_dbg = 0;
+                            if (fb_dbg < 4) {
+                                std::fprintf(stderr,
+                                    "[qw3] verify attn FELL BACK to batch-decode: %s\n",
+                                    attn_st.message ? attn_st.message : "(null)");
+                                ++fb_dbg;
+                            }
+                        }
                         require_status(backend_.attention_decode_batch_paged_gated(
                             *mid_batch_, *q_batch_, 2 * standard_head_dim,
                             k_cache(il), v_cache(il),

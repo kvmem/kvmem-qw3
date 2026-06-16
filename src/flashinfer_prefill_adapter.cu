@@ -167,6 +167,8 @@ bool run_batch_prefill_paged_typed(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -233,8 +235,16 @@ bool run_batch_prefill_paged_typed(
     void *plan_host_workspace =
         reinterpret_cast<void *>(reinterpret_cast<char *>(host_int_workspace) + prefix_bytes);
     const size_t plan_int_workspace_bytes = int_workspace_bytes - prefix_bytes;
+    // Enable KV-cache partitioning when a float scratch is supplied. This is
+    // the verify (small qo, huge kv) case: without splitting the planner packs
+    // all qo rows into 1 tile and launches only n_kv_heads CTAs (~4 on a 188-SM
+    // GPU at 128K), serializing the entire KV stream. Splitting fans the KV
+    // across hundreds of CTAs; FlashInfer's kernel writes per-chunk partials to
+    // tmp_v/tmp_s and merges them via VariableLengthMergeStates internally.
+    const bool allow_split_kv =
+        (float_workspace != nullptr && float_workspace_bytes > 0);
     cudaError_t plan_st = flashinfer::PrefillPlan<int32_t>(
-        nullptr, 0,
+        float_workspace, float_workspace_bytes,
         plan_int_workspace,
         plan_host_workspace,
         plan_int_workspace_bytes,
@@ -252,10 +262,10 @@ bool run_batch_prefill_paged_typed(
         sizeof(half),
         -1,
         0,
-        true,
+        /*disable_split_kv=*/!allow_split_kv,
         0,
         stream);
-    if (plan_st != cudaSuccess || plan_info.split_kv) return false;
+    if (plan_st != cudaSuccess) return false;
 
     int32_t *q_indptr_d = int_workspace;
     int32_t *page_indptr_d = int_workspace + 2;
@@ -298,31 +308,51 @@ bool run_batch_prefill_paged_typed(
     params.kv_chunk_size_ptr = reinterpret_cast<int32_t *>(
         reinterpret_cast<char *>(plan_i32) + plan_info.kv_chunk_size_ptr_offset);
     params.padded_batch_size = static_cast<uint32_t>(plan_info.padded_batch_size);
-    params.partition_kv = false;
     params.max_total_num_rows = batch;
-    params.total_num_rows = nullptr;
-    params.merge_indptr = nullptr;
-    params.block_valid_mask = nullptr;
+
+    // Partial-output scratch for the split-KV path. Non-null tmp_v switches the
+    // FlashInfer kernel into partition_kv mode: each (qo_tile, kv_chunk) CTA
+    // writes its partial O + LSE into tmp_v/tmp_s, then the kernel merges them
+    // with VariableLengthMergeStates using merge_indptr.
+    typename Params::DTypeO *tmp_v = nullptr;
+    float *tmp_s = nullptr;
+    if (plan_info.split_kv) {
+        params.partition_kv = true;
+        params.merge_indptr = reinterpret_cast<int32_t *>(
+            reinterpret_cast<char *>(plan_i32) + plan_info.merge_indptr_offset);
+        params.block_valid_mask = reinterpret_cast<bool *>(
+            reinterpret_cast<char *>(plan_i32) + plan_info.block_valid_mask_offset);
+        params.total_num_rows = nullptr;
+        tmp_v = reinterpret_cast<typename Params::DTypeO *>(
+            reinterpret_cast<char *>(float_workspace) + plan_info.v_offset);
+        tmp_s = reinterpret_cast<float *>(
+            reinterpret_cast<char *>(float_workspace) + plan_info.s_offset);
+    } else {
+        params.partition_kv = false;
+        params.total_num_rows = nullptr;
+        params.merge_indptr = nullptr;
+        params.block_valid_mask = nullptr;
+    }
 
     cudaError_t st = cudaErrorInvalidValue;
     if (head_dim == 128) {
         if (plan_info.cta_tile_q == 16) {
             st = dispatch_batch_prefill_paged<16, 128, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         } else if (plan_info.cta_tile_q == 64) {
             st = dispatch_batch_prefill_paged<64, 128, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         } else if (plan_info.cta_tile_q == 128) {
             st = dispatch_batch_prefill_paged<128, 128, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         }
     } else if (head_dim == 256) {
         if (plan_info.cta_tile_q == 16) {
             st = dispatch_batch_prefill_paged<16, 256, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         } else if (plan_info.cta_tile_q == 64) {
             st = dispatch_batch_prefill_paged<64, 256, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         }
     }
     return st == cudaSuccess;
@@ -336,6 +366,8 @@ bool run_batch_prefill_paged_ragged_typed(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -384,8 +416,17 @@ bool run_batch_prefill_paged_ragged_typed(
     using Variant = flashinfer::DefaultAttention<false, false, false, false>;
 
     flashinfer::PrefillPlanInfo plan_info;
+    // For MTP verify the "batch" is only a handful of query rows per request,
+    // but each row attends its own long KV. Without split-KV the planner packs
+    // all rows into a tiny qo grid and launches ~n_kv_heads CTAs that serially
+    // stream each row's KV — so co-batching N concurrent requests does NOT speed
+    // up the dominant attention cost. Enable split-KV when a float scratch is
+    // supplied; the kernel writes per-chunk partials to tmp_v/tmp_s and merges
+    // them via VariableLengthMergeStates (mirrors the non-ragged verify path).
+    const bool allow_split_kv =
+        (float_workspace != nullptr && float_workspace_bytes > 0);
     cudaError_t plan_st = flashinfer::PrefillPlan<int32_t>(
-        nullptr, 0,
+        float_workspace, float_workspace_bytes,
         int_workspace,
         host_int_workspace,
         int_workspace_bytes,
@@ -403,10 +444,10 @@ bool run_batch_prefill_paged_ragged_typed(
         sizeof(half),
         -1,
         0,
-        true,
+        /*disable_split_kv=*/!allow_split_kv,
         0,
         stream);
-    if (plan_st != cudaSuccess || plan_info.split_kv) return false;
+    if (plan_st != cudaSuccess) return false;
 
     auto paged_kv = flashinfer::paged_kv_t<TKV, int32_t>(
         n_kv_heads, page_size, head_dim, batch, flashinfer::QKVLayout::kNHD,
@@ -445,31 +486,47 @@ bool run_batch_prefill_paged_ragged_typed(
     params.kv_chunk_size_ptr = reinterpret_cast<int32_t *>(
         reinterpret_cast<char *>(plan_i32) + plan_info.kv_chunk_size_ptr_offset);
     params.padded_batch_size = static_cast<uint32_t>(plan_info.padded_batch_size);
-    params.partition_kv = false;
     params.max_total_num_rows = total_q;
-    params.total_num_rows = nullptr;
-    params.merge_indptr = nullptr;
-    params.block_valid_mask = nullptr;
+
+    typename Params::DTypeO *tmp_v = nullptr;
+    float *tmp_s = nullptr;
+    if (plan_info.split_kv) {
+        params.partition_kv = true;
+        params.merge_indptr = reinterpret_cast<int32_t *>(
+            reinterpret_cast<char *>(plan_i32) + plan_info.merge_indptr_offset);
+        params.block_valid_mask = reinterpret_cast<bool *>(
+            reinterpret_cast<char *>(plan_i32) + plan_info.block_valid_mask_offset);
+        params.total_num_rows = nullptr;
+        tmp_v = reinterpret_cast<typename Params::DTypeO *>(
+            reinterpret_cast<char *>(float_workspace) + plan_info.v_offset);
+        tmp_s = reinterpret_cast<float *>(
+            reinterpret_cast<char *>(float_workspace) + plan_info.s_offset);
+    } else {
+        params.partition_kv = false;
+        params.total_num_rows = nullptr;
+        params.merge_indptr = nullptr;
+        params.block_valid_mask = nullptr;
+    }
 
     cudaError_t st = cudaErrorInvalidValue;
     if (head_dim == 128) {
         if (plan_info.cta_tile_q == 16) {
             st = dispatch_batch_prefill_paged<16, 128, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         } else if (plan_info.cta_tile_q == 64) {
             st = dispatch_batch_prefill_paged<64, 128, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         } else if (plan_info.cta_tile_q == 128) {
             st = dispatch_batch_prefill_paged<128, 128, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         }
     } else if (head_dim == 256) {
         if (plan_info.cta_tile_q == 16) {
             st = dispatch_batch_prefill_paged<16, 256, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         } else if (plan_info.cta_tile_q == 64) {
             st = dispatch_batch_prefill_paged<64, 256, Params, Variant>(
-                params, nullptr, nullptr, stream);
+                params, tmp_v, tmp_s, stream);
         }
     }
     return st == cudaSuccess;
@@ -554,6 +611,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -573,7 +632,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
     unsigned threads = 0, blocks = 0;
     if (!run_batch_prefill_paged_typed<half>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
-            int_workspace_bytes, q, q_stride, k_cache, v_cache, page_indices,
+            int_workspace_bytes, float_workspace, float_workspace_bytes,
+            q, q_stride, k_cache, v_cache, page_indices,
             n_pages, page_size, n_heads, n_kv_heads, head_dim, base_seq_len,
             batch, q_batch_stride, out_batch_stride, scale, stream, threads, blocks)) {
         return false;
@@ -591,6 +651,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -610,7 +672,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
     unsigned threads = 0, blocks = 0;
     if (!run_batch_prefill_paged_typed<__nv_fp8_e4m3>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
-            int_workspace_bytes, q, q_stride, k_cache, v_cache, page_indices,
+            int_workspace_bytes, float_workspace, float_workspace_bytes,
+            q, q_stride, k_cache, v_cache, page_indices,
             n_pages, page_size, n_heads, n_kv_heads, head_dim, base_seq_len,
             batch, q_batch_stride, out_batch_stride, scale, stream, threads, blocks)) {
         return false;
@@ -628,6 +691,8 @@ bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -651,7 +716,8 @@ bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
     unsigned threads = 0, blocks = 0;
     if (!run_batch_prefill_paged_ragged_typed<half>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
-            int_workspace_bytes, q, q_stride, k_cache, v_cache,
+            int_workspace_bytes, float_workspace, float_workspace_bytes,
+            q, q_stride, k_cache, v_cache,
             page_indices, page_indptr, last_page_len, q_indptr,
             q_indptr_host, page_indptr_host, batch, total_q, page_size,
             n_heads, n_kv_heads, head_dim, q_batch_stride, out_batch_stride,
@@ -671,6 +737,8 @@ bool launch_batch_prefill_paged_ragged_f16q_fp8kv_gated(
         int32_t *int_workspace,
         void *host_int_workspace,
         size_t int_workspace_bytes,
+        float *float_workspace,
+        size_t float_workspace_bytes,
         const float *q,
         uint32_t q_stride,
         const void *k_cache,
@@ -694,7 +762,8 @@ bool launch_batch_prefill_paged_ragged_f16q_fp8kv_gated(
     unsigned threads = 0, blocks = 0;
     if (!run_batch_prefill_paged_ragged_typed<__nv_fp8_e4m3>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
-            int_workspace_bytes, q, q_stride, k_cache, v_cache,
+            int_workspace_bytes, float_workspace, float_workspace_bytes,
+            q, q_stride, k_cache, v_cache,
             page_indices, page_indptr, last_page_len, q_indptr,
             q_indptr_host, page_indptr_host, batch, total_q, page_size,
             n_heads, n_kv_heads, head_dim, q_batch_stride, out_batch_stride,

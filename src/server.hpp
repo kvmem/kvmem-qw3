@@ -27,6 +27,7 @@ struct ServerConfig {
     bool mtp_batched_draft_set = false;
     int max_active = 2;
     int max_pending = 128;
+    int prefill_burst = 0;
     uint64_t max_total_tokens = 0;
     bool max_total_tokens_set = false;
     int kv_page_size = 16;

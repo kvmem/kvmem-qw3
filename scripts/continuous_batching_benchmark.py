@@ -960,6 +960,65 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         f"batch={max(run.max_trace_batch, run.max_summary_batch)}"
                     )
                 continue
+            if args.input_token_targets:
+                for input_target in input_targets:
+                    for concurrency in concurrency_levels:
+                        prompts = synthetic_prompts_for_target(concurrency, input_target)
+                        max_active = max(args.max_active, concurrency)
+                        print(
+                            f"running benchmark variant={variant.name} "
+                            f"ctx={ctx_size} input_target={input_target} "
+                            f"concurrency={concurrency}"
+                        )
+                        run = run_variant(
+                            variant=variant,
+                            binary=binary,
+                            model=model,
+                            host=args.host,
+                            port=port,
+                            prompts=prompts,
+                            max_tokens=args.max_tokens,
+                            ctx_size=ctx_size,
+                            prefill_chunk=args.prefill_chunk,
+                            timeout_s=args.timeout,
+                            max_active=max_active,
+                            trace=args.trace,
+                            timing=args.timing,
+                            ignore_eos=args.ignore_eos,
+                            extra_args=args.extra_arg,
+                        )
+                        run.input_target_tokens = input_target
+                        runs.append(run)
+                        failed = [r for r in run.requests if not r.ok]
+                        status = "FAIL" if failed else "ok"
+                        print(
+                            f"{status:4s} {run.variant:10s} "
+                            f"ctx={run.ctx_size:6d} "
+                            f"input={run.input_target_tokens:6d} "
+                            f"conc={run.concurrency:2d} "
+                            f"wall={run.request_wall_s:.3f}s "
+                            f"out_tok/s={run.tokens_per_s:.2f} "
+                            f"prefill_tok/s={run.prefill_tokens_per_s:.2f} "
+                            f"decode_tok/s={run.decode_tokens_per_s:.2f} "
+                            f"decode_step_tok/s={run.decode_step_tokens_per_s:.2f} "
+                            f"layers={run.decode_layers_s:.3f}s "
+                            f"recurrent={run.decode_recurrent_s:.3f}s "
+                            f"attention={run.decode_attention_s:.3f}s "
+                            f"ffn={run.decode_ffn_s:.3f}s "
+                            f"final={run.decode_final_s:.3f}s "
+                            f"tokens={run.output_tokens} "
+                            f"mean={run.mean_latency_s:.3f}s "
+                            f"p50={run.p50_latency_s:.3f}s "
+                            f"p90={run.p90_latency_s:.3f}s "
+                            f"batch={max(run.max_trace_batch, run.max_summary_batch)} "
+                            f"body={run.saw_body_batch_mode} "
+                            f"ragged={run.saw_ragged_metadata_ready}"
+                        )
+                        for req in run.requests:
+                            if not req.ok:
+                                print(f"     {req.name}: {req.error}")
+                continue
+
             for concurrency in concurrency_levels:
                 prompts = (
                     synthetic_prompts(concurrency, args.synthetic_repeat)

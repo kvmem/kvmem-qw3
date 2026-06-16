@@ -44,6 +44,9 @@ struct EngineOptions {
     bool native_mtp_chain_set = false;
     bool native_mtp_prefix = false; // populate diagnostic MTP prefix KV cache
     bool native_mtp_speculate = false; // run experimental MTP speculative decode
+    std::string mtp_policy = "fixed"; // fixed or adaptive
+    int mtp_adaptive_min_chain = 0; // 0 = backend default
+    int mtp_adaptive_max_chain = 0; // 0 = backend default / mtp_chain
 };
 
 struct GenerationOptions {

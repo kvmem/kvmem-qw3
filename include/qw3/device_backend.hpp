@@ -944,6 +944,9 @@ public:
                                                       const DeviceTensor &page_indptr,
                                                       const DeviceTensor &last_page_len,
                                                       const DeviceTensor &seq_lens,
+                                                      const int32_t *page_indptr_host,
+                                                      const int32_t *last_page_len_host,
+                                                      const int32_t *seq_lens_host,
                                                       uint32_t page_size,
                                                       uint32_t n_heads,
                                                       uint32_t n_kv_heads,
@@ -954,7 +957,8 @@ public:
                                                       float scale) {
         (void)out; (void)q; (void)q_stride; (void)k_cache; (void)v_cache;
         (void)page_indices; (void)page_indptr; (void)last_page_len;
-        (void)seq_lens; (void)page_size; (void)n_heads; (void)n_kv_heads;
+        (void)seq_lens; (void)page_indptr_host; (void)last_page_len_host;
+        (void)seq_lens_host; (void)page_size; (void)n_heads; (void)n_kv_heads;
         (void)head_dim; (void)batch; (void)q_batch_stride;
         (void)out_batch_stride; (void)scale;
         return {false, "attention_decode_batch_paged_gated_ragged_device requires backend override"};
