@@ -789,6 +789,13 @@ inline bool hgemm_disabled() {
 
 static thread_local char g_err[256];
 
+// Tensor zero-init stream. CudaTensor's ctor zero-fills new allocations; that
+// memset must be ordered on exec_stream_ (set in begin()) rather than the null
+// stream, because exec_stream_ is non-blocking and would not otherwise wait on
+// a null-stream memset. nullptr before begin() → falls back to a synchronous
+// null-stream memset (startup allocations, no concurrent exec work).
+static cudaStream_t g_tensor_init_stream = nullptr;
+
 DeviceStatus cuda_status(cudaError_t err, const char *where) {
     if (err == cudaSuccess) return {};
     std::snprintf(g_err, sizeof(g_err), "%s: %s", where, cudaGetErrorString(err));
@@ -869,7 +876,13 @@ struct CudaTensor final : DeviceTensor {
                           cudaGetErrorString(err));
             throw std::runtime_error(msg);
         }
-        if (zero_initialize) cudaMemset(ptr, 0, bytes);
+        if (zero_initialize) {
+            if (g_tensor_init_stream) {
+                cudaMemsetAsync(ptr, 0, bytes, g_tensor_init_stream);
+            } else {
+                cudaMemset(ptr, 0, bytes);
+            }
+        }
     }
     ~CudaTensor() override {
         if (ptr) cudaFree(ptr);
@@ -894,7 +907,11 @@ struct CudaTensor final : DeviceTensor {
                           cudaGetErrorString(err));
             throw std::runtime_error(msg);
         }
-        cudaMemset(scale, 0, sbytes);
+        if (g_tensor_init_stream) {
+            cudaMemsetAsync(scale, 0, sbytes, g_tensor_init_stream);
+        } else {
+            cudaMemset(scale, 0, sbytes);
+        }
     }
     bool is_fp16() const { return elem_size == sizeof(__half) && !fp8_kv; }
     bool is_q8_kv() const { return q8_kv; }
@@ -3187,6 +3204,12 @@ public:
                                                                 cudaStreamNonBlocking),
                                       "cuda exec stream"); !st.ok) return st;
         }
+        // Tensor zero-init (CudaTensor ctor) must run on exec_stream_, not the
+        // null stream: exec_stream_ is non-blocking, so a null-stream memset
+        // does NOT order against subsequent exec_stream_ kernels. Tensors
+        // allocated mid-forward (e.g. the lazily-grown KV page-index buffer at
+        // large --ctx) would otherwise race their first reader.
+        g_tensor_init_stream = exec_stream_;
         if (!cublas_handle_) {
             if (auto st = cublas_status(cublasCreate(&cublas_handle_), "cublasCreate"); !st.ok) return st;
             if (auto st = cublas_status(cublasSetStream(cublas_handle_, exec_stream_),
