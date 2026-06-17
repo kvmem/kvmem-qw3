@@ -217,6 +217,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--temp", "0",
         "--ctx", str(args.ctx),
         "--prefill-chunk", str(args.prefill_chunk),
+        "--continuous-batching",
+        "--max-active", "2",
+        "--paged-kv",
     ]
     long_prompt = " ".join(["word"] * args.long_words)
     short_prompt = "2 + 2 ="

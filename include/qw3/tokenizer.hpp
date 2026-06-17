@@ -39,6 +39,13 @@ public:
     bool add_bos_default() const { return add_bos_; }
     int32_t vocab_size() const { return static_cast<int32_t>(tokens_.size()); }
 
+    // Look up the id of a literal vocab token (e.g. "</think>", "<think>").
+    // Returns -1 when the token is not present in the vocab.
+    int32_t token_id(const std::string &token) const {
+        const auto it = token_to_id_.find(token);
+        return it == token_to_id_.end() ? -1 : it->second;
+    }
+
     // Translate text bytes into the BPE-encoded character form (visible vocab
     // alphabet). Useful for debugging and for the dump-logits diff.
     std::string bytes_to_chars(const std::string &bytes) const;

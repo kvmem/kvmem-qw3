@@ -39,6 +39,9 @@ struct ServerConfig {
     // <think>\n\n</think> block (brief working, no long CoT), matching the eval
     // harness expectation.
     bool enable_thinking_default = false;
+    // Default thinking budget (max tokens inside <think>) when a chat request
+    // omits `thinking_budget`. 0 disables the cap.
+    int thinking_budget_default = 0;
 };
 
 // Loads the model (via Engine(engine)) and serves until the process is killed.

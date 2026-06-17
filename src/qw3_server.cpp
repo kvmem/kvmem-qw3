@@ -994,7 +994,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       : std::string("remaining_context"))
               << "\n"
               << "  enable_thinking_default="
-              << yesno(cfg.enable_thinking_default) << "\n";
+              << yesno(cfg.enable_thinking_default) << "\n"
+              << "  thinking_budget_default="
+              << (cfg.thinking_budget_default > 0
+                      ? std::to_string(cfg.thinking_budget_default)
+                      : std::string("0(disabled)"))
+              << "\n";
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
     Engine eng(engine);
@@ -1065,6 +1070,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.seed = req.value("seed", g.seed);
         g.ignore_eos = req.value("ignore_eos",
                                  req.value("ignore_eos_token", g.ignore_eos));
+        g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
+        if (g.thinking_budget < 0) g.thinking_budget = 0;
         return g;
     };
 
@@ -1122,6 +1129,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         GenerationOptions g = make_gen(req, prompt_token_count);
         g.raw_prompt = true; // prompt is already chat-framed
+        g.thinking_open = enable_thinking; // budget only runs while <think> is open
         g.continuous_batching =
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);

@@ -48,6 +48,8 @@ void usage(std::ostream &os) {
         "  --no-mtp-batched-draft, --no-mtp-paged-prefix\n"
         "                        Compatibility/debug disable switches.\n"
         "  --enable-thinking     Default chat requests to thinking mode (long CoT).\n"
+        "  --thinking-budget N   Default max tokens inside <think> before the\n"
+        "                        engine force-closes it. 0 disables (default).\n"
         "  --native-mtp-chain N  Alias for --mtp-chain.\n"
         "  --native-mtp-trace    Diagnostic mode; disables default MTP speculate.\n"
         "  -n N                  Optional service max generated tokens cap.\n"
@@ -328,6 +330,11 @@ int main(int argc, char **argv) {
                 kv_dtype_cli = dt;
             } else if (arg == "--enable-thinking") {
                 serve_cfg.enable_thinking_default = true;
+            } else if (arg == "--thinking-budget") {
+                serve_cfg.thinking_budget_default = parse_int(need(arg), arg);
+                if (serve_cfg.thinking_budget_default < 0) {
+                    throw std::runtime_error("--thinking-budget must be >= 0");
+                }
             } else {
                 throw std::runtime_error("unknown argument: " + arg);
             }

@@ -64,6 +64,14 @@ struct GenerationOptions {
     // batching worker when the backend supports it. CLI single-shot generation
     // leaves this false and keeps the original synchronous path.
     bool continuous_batching = false;
+    // Thinking budget: cap the number of tokens generated inside the <think>
+    // block. 0 disables the cap. When the budget is reached while the block is
+    // still open, the engine force-injects a short guidance line and the
+    // </think> closing tag so the model proceeds straight to its answer.
+    int thinking_budget = 0;
+    // Whether the prompt already opened a <think> block (enable_thinking). The
+    // budget counter only runs while a think block is open.
+    bool thinking_open = false;
 };
 
 struct ModelInfo {

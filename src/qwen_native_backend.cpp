@@ -1124,6 +1124,21 @@ private:
         }
     };
 
+    // Per-request state for the thinking-token budget. Counts tokens emitted
+    // inside an open <think> block; when the budget is reached the engine feeds
+    // a short queued guidance line + the </think> close token so the model
+    // proceeds straight to its answer. Disabled when budget == 0.
+    struct ThinkingBudgetState {
+        int budget = 0;          // max tokens inside <think>; 0 disables
+        bool open = false;       // a <think> block is currently open
+        int close_id = -1;       // tokenizer id of "</think>" (-1 = unavailable)
+        int think_tokens = 0;    // tokens generated so far inside the block
+        bool forced = false;     // currently feeding forced close tokens
+        std::deque<uint32_t> forced_queue; // remaining forced tokens to feed
+
+        bool active() const { return budget > 0 && close_id >= 0; }
+    };
+
     struct ContinuousBatchActive {
         std::shared_ptr<ContinuousBatchRequest> req;
         std::unique_ptr<QwenExecutor> executor;
@@ -1131,6 +1146,7 @@ private:
         std::unordered_map<uint32_t, uint32_t> seen_tokens;
         std::mt19937_64 rng;
         std::vector<float> logit_buf;
+        ThinkingBudgetState budget;
         uint32_t next_token = 0;
         int decoded = 0;
         uint32_t prefill_offset = 0;
@@ -4090,6 +4106,7 @@ private:
                 tokenizer_->decode_one(static_cast<int32_t>(token));
             a.req->generated += piece;
             if (a.req->on_text) a.req->on_text(piece);
+            budget_observe(a.budget, token);
             ++a.decoded;
             return true;
         };
@@ -4259,10 +4276,34 @@ private:
                 draft_rows.reserve(mtp_active.size());
                 for (size_t row = 0; row < mtp_active.size(); ++row) {
                     ContinuousBatchActive &a = mtp_active[row];
-                    if (a.req && a.decoded < a.req->options.max_tokens &&
-                        !should_stop(a, a.next_token)) {
-                        draft_rows.push_back(row);
+                    if (!a.req || a.decoded >= a.req->options.max_tokens ||
+                        should_stop(a, a.next_token)) {
+                        continue;
                     }
+                    // Thinking-budget forced rows: feed the current token to
+                    // advance the cache, then emit the queued guidance/</think>
+                    // token instead of speculating. Resumes normal speculation
+                    // once the close tag drains and the block is closed.
+                    if (a.budget.active() &&
+                        (budget_should_force(a.budget) ||
+                         !a.budget.forced_queue.empty())) {
+                        const uint32_t current = a.next_token;
+                        NativeExecutorReport fstep =
+                            a.executor->forward_one_token(current);
+                        if (!fstep.ok) {
+                            throw std::runtime_error(
+                                "MTP thinking-budget decode failed");
+                        }
+                        stats[row].decode_ops += fstep.ops_executed;
+                        a.executor->commit_mtp_prefix(a.executor->position());
+                        const uint32_t argmax = fstep.argmax_token >= 0
+                            ? static_cast<uint32_t>(fstep.argmax_token)
+                            : static_cast<uint32_t>(eos);
+                        a.next_token = budget_next_feed(a.budget, argmax);
+                        emit(a, a.next_token);
+                        continue;
+                    }
+                    draft_rows.push_back(row);
                 }
 
                 std::vector<ContinuousMtpVerifyJob> batched_jobs;
@@ -4801,6 +4842,7 @@ private:
                               static_cast<size_t>(req->options.max_tokens));
         for (uint32_t token : req->prompt_tokens) ++a.seen_tokens[token];
         a.rng.seed(req->options.seed);
+        budget_init(a.budget, req->options);
     }
 
     uint32_t continuous_prefill_chunk_tokens(uint32_t remaining) const {
@@ -4863,8 +4905,9 @@ private:
 
             a.decode_start = t1;
             const int32_t seed = step.argmax_token >= 0 ? step.argmax_token : eos;
-            a.next_token = static_cast<uint32_t>(
-                pick_continuous_next_token(a, seed));
+            a.next_token = budget_apply(
+                a.budget,
+                static_cast<uint32_t>(pick_continuous_next_token(a, seed)));
 
             if (a.req->options.max_tokens <= 0 ||
                 (!a.req->options.ignore_eos &&
@@ -5235,8 +5278,9 @@ private:
             a.decode_start = wall_seconds();
             const int32_t seed =
                 out.report.argmax_token >= 0 ? out.report.argmax_token : eos;
-            a.next_token = static_cast<uint32_t>(
-                pick_continuous_next_token(a, seed));
+            a.next_token = budget_apply(
+                a.budget,
+                static_cast<uint32_t>(pick_continuous_next_token(a, seed)));
 
             if (a.req->options.max_tokens <= 0 ||
                 (!a.req->options.ignore_eos &&
@@ -5509,8 +5553,9 @@ private:
                 a.decode_ops += step.ops_executed;
                 a.kv_state.update(a.executor->kv_state_snapshot());
                 const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
-                a.next_token = static_cast<uint32_t>(
-                    pick_continuous_next_token(a, next));
+                a.next_token = budget_apply(
+                    a.budget,
+                    static_cast<uint32_t>(pick_continuous_next_token(a, next)));
                 if (!a.req->options.ignore_eos &&
                     a.next_token == static_cast<uint32_t>(eos)) {
                     finish_continuous_active(a);
@@ -5609,6 +5654,98 @@ private:
         complete_continuous_request(a.req, std::move(a.req->generated));
     }
 
+    // ---- Thinking-token budget helpers ------------------------------------
+    // Force the model out of a long <think> block once it has spent its token
+    // budget. We count tokens emitted while a <think> block is open; when the
+    // count reaches the budget we stop sampling and instead feed a short
+    // queued guidance line followed by the </think> close tag. The model then
+    // resumes free generation for its actual answer. This mirrors the in-loop
+    // injection that vLLM/SGLang use for reasoning budgets.
+
+    // Guidance line injected right before the forced </think>, matching the
+    // phrasing Qwen's own budget reference uses so the model transitions
+    // cleanly from reasoning to answer.
+    static const char *thinking_budget_guidance() {
+        return "\n\nConsidering the limited time by the user, I have to give the "
+               "solution based on the thinking directly now.\n";
+    }
+
+    void budget_init(ThinkingBudgetState &state,
+                     const GenerationOptions &options) const {
+        state = ThinkingBudgetState{};
+        state.budget = options.thinking_budget;
+        state.open = options.thinking_open;
+        if (state.budget > 0 && tokenizer_) {
+            state.close_id = tokenizer_->token_id("</think>");
+        }
+    }
+
+    // Build the forced-token sequence (guidance text + </think>) to inject when
+    // the budget is hit. Returns empty when the budget is inactive.
+    std::vector<uint32_t> budget_close_tokens(const ThinkingBudgetState &state) const {
+        std::vector<uint32_t> out;
+        if (!state.active() || !tokenizer_) return out;
+        const std::vector<int32_t> guide =
+            tokenizer_->encode(thinking_budget_guidance());
+        out.reserve(guide.size() + 1);
+        for (int32_t id : guide) {
+            if (id >= 0 && id != state.close_id) out.push_back(static_cast<uint32_t>(id));
+        }
+        out.push_back(static_cast<uint32_t>(state.close_id));
+        return out;
+    }
+
+    // Account for a token the model just committed. Detects a natural </think>
+    // close (stops counting) and otherwise advances the in-think counter.
+    void budget_observe(ThinkingBudgetState &state, uint32_t token) const {
+        if (!state.active() || !state.open) return;
+        if (static_cast<int>(token) == state.close_id) {
+            state.open = false;
+            state.forced = false;
+            state.forced_queue.clear();
+            return;
+        }
+        ++state.think_tokens;
+    }
+
+    // If the budget is exhausted while still inside <think>, enqueue the forced
+    // guidance+close tokens. Returns the next token to FEED in place of the
+    // model's own pick: the front of the forced queue, or `proposed` when no
+    // override is active. The caller emits the returned token and feeds it back
+    // into the model so the KV cache stays consistent.
+    uint32_t budget_next_feed(ThinkingBudgetState &state, uint32_t proposed) const {
+        if (!state.active()) return proposed;
+        if (state.forced_queue.empty() && state.open && !state.forced &&
+            state.think_tokens >= state.budget) {
+            const std::vector<uint32_t> close = budget_close_tokens(state);
+            for (uint32_t t : close) state.forced_queue.push_back(t);
+            state.forced = !state.forced_queue.empty();
+        }
+        if (!state.forced_queue.empty()) {
+            const uint32_t forced = state.forced_queue.front();
+            state.forced_queue.pop_front();
+            return forced;
+        }
+        return proposed;
+    }
+
+    // Single entry point for the non-speculative paths: override the proposed
+    // token with the budget's forced token (if any), then account for the
+    // chosen token. Returns the token to emit + feed.
+    uint32_t budget_apply(ThinkingBudgetState &state, uint32_t proposed) const {
+        const uint32_t chosen = budget_next_feed(state, proposed);
+        budget_observe(state, chosen);
+        return chosen;
+    }
+
+    // True when an open <think> block has spent its budget and the forced
+    // close sequence has not yet been queued/drained. Used by speculative
+    // paths to break out to a plain forced-feed loop at a round boundary.
+    bool budget_should_force(const ThinkingBudgetState &state) const {
+        return state.active() && state.open && !state.forced &&
+               state.forced_queue.empty() && state.think_tokens >= state.budget;
+    }
+
     // qw3's original non-MTP generate path. Unchanged behavior: internal
     // chunking + graph capture live inside the executor.
     std::string generate_plain(const std::vector<uint32_t> &prompt_tokens,
@@ -5674,8 +5811,11 @@ private:
 
         std::string generated;
         const int32_t eos = tokenizer_->eos_id();
+        ThinkingBudgetState budget;
+        budget_init(budget, options);
         const int32_t seed_argmax = step.argmax_token >= 0 ? step.argmax_token : eos;
         uint32_t next_token = static_cast<uint32_t>(pick_next(seed_argmax));
+        next_token = budget_apply(budget, next_token);
         uint64_t decode_ops = 0;
         int decoded = 0;
         const auto should_stop_eos = [&]() {
@@ -5699,9 +5839,9 @@ private:
                                    "decode", static_cast<int32_t>(feed),
                                    *executor_, *tokenizer_);
             const int32_t new_token = pick_next(fallback);
-            next_token = static_cast<uint32_t>(new_token);
+            next_token = budget_apply(budget, static_cast<uint32_t>(new_token));
             if (should_stop_eos()) break;
-            const std::string piece = tokenizer_->decode_one(new_token);
+            const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
             generated += piece;
             if (on_text) on_text(piece);
             ++seen_tokens[next_token];
@@ -5871,6 +6011,8 @@ private:
 
         std::string generated;
         const int32_t eos = tokenizer_->eos_id();
+        ThinkingBudgetState budget;
+        budget_init(budget, options);
         uint32_t next_token = step.argmax_token >= 0 ? static_cast<uint32_t>(step.argmax_token)
                                                      : static_cast<uint32_t>(eos);
         uint64_t decode_ops = 0;
@@ -6115,6 +6257,7 @@ private:
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
             generated += piece;
             if (on_text) on_text(piece);
+            budget_observe(budget, token);
             ++decoded;
             return true;
         };
@@ -6150,7 +6293,7 @@ private:
                                        "decode", static_cast<int32_t>(feed),
                                        *executor_, *tokenizer_);
                 ++plain_decode_forwards;
-                next_token = static_cast<uint32_t>(new_argmax);
+                next_token = budget_next_feed(budget, static_cast<uint32_t>(new_argmax));
                 if (!emit_generated_token(next_token)) break;
                 if (trace_mtp && decoded < options.max_tokens) {
                     trace_mtp_chain(next_token, decoded - 1);
@@ -6162,6 +6305,13 @@ private:
             while (run_spec_mtp &&
                    decoded < options.max_tokens &&
                    !should_stop_mtp_eos(next_token)) {
+                // Once the thinking budget is exhausted, stop speculating and
+                // fall through to the plain decode loop, which feeds the forced
+                // guidance + </think> close tokens deterministically.
+                if (budget_should_force(budget)) {
+                    run_spec_mtp = false;
+                    break;
+                }
                 const uint32_t current = next_token;
                 const uint32_t remaining_tokens =
                     static_cast<uint32_t>(options.max_tokens - decoded);
