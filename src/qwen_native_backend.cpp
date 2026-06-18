@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -309,6 +310,20 @@ uint32_t continuous_batching_ragged_prefill_min_tokens() {
                          512));
 }
 
+bool prefix_cache_enabled() {
+    return env_flag_enabled("QW3_PREFIX_CACHE");
+}
+
+// Cap on total physical KV pages pinned by the prefix cache. 0 = unlimited
+// (bounded only by the pool). Used to trigger LRU eviction.
+uint32_t prefix_cache_max_pages() {
+    return env_uint32_or("QW3_PREFIX_CACHE_MAX_PAGES", 0);
+}
+
+bool prefix_cache_trace_enabled() {
+    return env_flag_enabled("QW3_PREFIX_CACHE_TRACE");
+}
+
 class GlobalKvPagePool final : public KvPhysicalPageAllocator {
 public:
     GlobalKvPagePool(uint32_t total_pages, uint32_t page_size)
@@ -317,20 +332,44 @@ public:
         for (uint32_t i = 0; i < total_pages_; ++i) {
             free_pages_.push_back(static_cast<int32_t>(total_pages_ - 1U - i));
         }
+        page_pin_refcount_.assign(total_pages_, 0);
+    }
+
+    // Installed by the backend's prefix cache. On free-stack exhaustion the
+    // pool invokes this to reclaim pinned (refcount==0 entry) cache pages back
+    // onto the free stack. Must return the number of pages freed (0 = nothing
+    // evictable). The callback runs WITHOUT the pool mutex held (it itself
+    // calls unpin_pages/release_physical_pages, which take the lock).
+    void set_evict_callback(std::function<uint32_t()> cb) {
+        evict_cb_ = std::move(cb);
     }
 
     int32_t allocate_physical_page() override {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (free_pages_.empty()) {
-            throw std::runtime_error(
-                "global KV page pool exhausted: free=0 total=" +
-                std::to_string(total_pages_) +
-                " page_size=" + std::to_string(page_size_));
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (!free_pages_.empty()) {
+                    const int32_t page = free_pages_.back();
+                    free_pages_.pop_back();
+                    ++used_pages_;
+                    return page;
+                }
+            }
+            // Free stack empty: ask the prefix cache to evict the LRU entry
+            // whose refcount is 0, then retry. A single eviction may reclaim
+            // ZERO physical pages when the victim shares all its pages with a
+            // longer cached entry (extension/multi-turn). The evict callback
+            // returns the number of ENTRIES it evicted (progress), not pages,
+            // so we keep evicting until a page actually frees up or there is
+            // nothing left to evict. Each iteration drops one entry's pin, so
+            // the entry that uniquely owns the shared region eventually frees.
+            if (!evict_cb_ || evict_cb_() == 0) break;
         }
-        const int32_t page = free_pages_.back();
-        free_pages_.pop_back();
-        ++used_pages_;
-        return page;
+        std::lock_guard<std::mutex> lk(mu_);
+        throw std::runtime_error(
+            "global KV page pool exhausted: free=0 total=" +
+            std::to_string(total_pages_) +
+            " page_size=" + std::to_string(page_size_));
     }
 
     void release_physical_pages(const std::vector<int32_t> &pages) override {
@@ -340,8 +379,37 @@ public:
             if (page < 0 || static_cast<uint32_t>(page) >= total_pages_) {
                 continue;
             }
+            // Defense in depth: a page still pinned by a prefix-cache entry
+            // must never re-enter the free stack (the owning executor's
+            // `owned` flag should already prevent this).
+            if (page_pin_refcount_[page] > 0) continue;
             free_pages_.push_back(page);
             if (used_pages_ > 0) --used_pages_;
+        }
+    }
+
+    // Pin pages held by a prefix-cache entry so they can never be handed out
+    // by allocate_physical_page or returned to the free stack while live.
+    void pin_pages(const std::vector<int32_t> &pages) {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int32_t page : pages) {
+            if (page < 0 || static_cast<uint32_t>(page) >= total_pages_) {
+                continue;
+            }
+            ++page_pin_refcount_[page];
+        }
+    }
+
+    // Drop the cache's pin on pages (called just before releasing them at
+    // eviction). Does NOT return them to the free stack; pair with
+    // release_physical_pages.
+    void unpin_pages(const std::vector<int32_t> &pages) {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int32_t page : pages) {
+            if (page < 0 || static_cast<uint32_t>(page) >= total_pages_) {
+                continue;
+            }
+            if (page_pin_refcount_[page] > 0) --page_pin_refcount_[page];
         }
     }
 
@@ -363,6 +431,8 @@ private:
     uint32_t page_size_ = 0;
     mutable std::mutex mu_;
     std::vector<int32_t> free_pages_;
+    std::vector<uint16_t> page_pin_refcount_;
+    std::function<uint32_t()> evict_cb_;
     uint32_t used_pages_ = 0;
 };
 
@@ -1154,6 +1224,14 @@ private:
         uint64_t decode_ops = 0;
         double prefill_s = 0.0;
         double decode_start = 0.0;
+        // Prefix-cache bookkeeping (serve path). held_prefix_entries are entry
+        // ids whose refcount this request holds (adopted on hit + committed on
+        // miss); all are decremented at finish. prefix_commit_pending requests
+        // a one-shot recurrent+KV snapshot when prefill_offset reaches
+        // prefix_commit_len (a page-aligned boundary < prompt_len).
+        std::vector<uint64_t> held_prefix_entries;
+        bool prefix_commit_pending = false;
+        uint32_t prefix_commit_len = 0;
     };
 
     struct ContinuousDecodeBatch {
@@ -4843,6 +4921,59 @@ private:
         for (uint32_t token : req->prompt_tokens) ++a.seen_tokens[token];
         a.rng.seed(req->options.seed);
         budget_init(a.budget, req->options);
+
+        // ---- Prefix cache: seed on hit, schedule commit on miss ----------
+        if (prefix_cache_enabled() && cb_kv_pool_ && !req->prompt_tokens.empty()) {
+            prefix_cache_install_evict_cb();
+            const uint32_t page_size = a.executor->kv_page_size_public();
+            const uint32_t prompt_len =
+                static_cast<uint32_t>(req->prompt_tokens.size());
+            std::vector<int32_t> hit_pages;
+            QwenExecutor::StateSnapshot hit_recur;
+            uint32_t hit_len = 0;
+            const uint64_t hit_id = prefix_cache_lookup(
+                req->prompt_tokens, page_size, hit_pages, hit_recur, hit_len);
+            if (hit_id != 0 && hit_len > 0 && hit_len < prompt_len) {
+                try {
+                    a.executor->seed_from_shared_prefix(hit_pages, hit_recur,
+                                                        hit_len);
+                    a.prefill_offset = hit_len;
+                    a.held_prefix_entries.push_back(hit_id);
+                    a.kv_state.update(a.executor->kv_state_snapshot());
+                    if (prefix_cache_trace_enabled()) {
+                        std::ostringstream m;
+                        m << "prefix_cache hit id=" << hit_id
+                          << " req=" << req->id
+                          << " reused_tokens=" << hit_len
+                          << " pages=" << hit_pages.size();
+                        log(m.str());
+                    }
+                } catch (const std::exception &e) {
+                    // Seeding failed: roll back to a clean cold prefill and
+                    // drop the refcount we took in lookup.
+                    a.executor->reset_state();
+                    a.prefill_offset = 0;
+                    ContinuousBatchActive tmp;
+                    tmp.held_prefix_entries.push_back(hit_id);
+                    prefix_cache_release(tmp);
+                    if (prefix_cache_trace_enabled()) {
+                        log(std::string("prefix_cache hit-seed failed, cold "
+                                        "fallback: ") + e.what());
+                    }
+                }
+            }
+            // Schedule a commit of the longest page-aligned prefix strictly
+            // shorter than the prompt, unless we already reuse one that long.
+            // v1 commits a single prefix per prompt.
+            if (page_size > 0 && prompt_len >= 2 * page_size) {
+                uint32_t commit_len = (prompt_len / page_size) * page_size;
+                if (commit_len >= prompt_len) commit_len -= page_size;
+                if (commit_len > a.prefill_offset) {
+                    a.prefix_commit_pending = true;
+                    a.prefix_commit_len = commit_len;
+                }
+            }
+        }
     }
 
     uint32_t continuous_prefill_chunk_tokens(uint32_t remaining) const {
@@ -4868,7 +4999,16 @@ private:
             }
             const uint32_t remaining =
                 static_cast<uint32_t>(prompt.size() - a.prefill_offset);
-            const uint32_t chunk = continuous_prefill_chunk_tokens(remaining);
+            uint32_t chunk = continuous_prefill_chunk_tokens(remaining);
+            // Clamp the chunk so prefill lands exactly on the prefix-cache
+            // commit boundary; capture_state then snapshots recurrent state at
+            // precisely aligned_len. Without this the executor would overshoot
+            // the boundary and the snapshot would be lossy.
+            if (a.prefix_commit_pending &&
+                a.prefill_offset < a.prefix_commit_len &&
+                a.prefill_offset + chunk > a.prefix_commit_len) {
+                chunk = a.prefix_commit_len - a.prefill_offset;
+            }
             const bool final_chunk = prompt.empty() || chunk >= remaining;
             std::vector<uint32_t> chunk_tokens(
                 prompt.begin() + static_cast<std::ptrdiff_t>(a.prefill_offset),
@@ -4883,6 +5023,13 @@ private:
             a.prefill_ops += step.ops_executed;
             a.prefill_offset += chunk;
             a.kv_state.update(a.executor->kv_state_snapshot());
+
+            // Commit the aligned prefix the moment prefill reaches its end.
+            if (a.prefix_commit_pending &&
+                a.prefill_offset == a.prefix_commit_len) {
+                prefix_cache_commit(a, a.prefix_commit_len);
+                a.prefix_commit_pending = false;
+            }
 
             if (continuous_batching_trace_enabled()) {
                 std::ostringstream msg;
@@ -5330,6 +5477,7 @@ private:
         if (prefilling.empty() || max_chunks == 0) return;
         const bool use_batch_boundary =
             continuous_batching_prefill_batch_enabled() &&
+            !prefix_cache_enabled() &&
             active.empty() && max_chunks > 1 && prefilling.size() > 1;
         if (!use_batch_boundary) {
             for (uint32_t step = 0;
@@ -5621,7 +5769,283 @@ private:
         ++a.decoded;
     }
 
+    // ---- Prefix cache methods (Phase 1) -----------------------------------
+
+    void prefix_require_ok(const DeviceStatus &st) {
+        if (!st.ok) throw std::runtime_error(st.message);
+    }
+
+    static uint64_t prefix_cache_hash(const uint32_t *tokens, size_t n) {
+        // FNV-1a over the token id bytes. Only used to bucket; exact-token
+        // comparison defeats collisions.
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t t = tokens[i];
+            for (int b = 0; b < 4; ++b) {
+                h ^= static_cast<uint64_t>(t & 0xFFu);
+                h *= 1099511628211ULL;
+                t >>= 8;
+            }
+        }
+        return h;
+    }
+
+    void prefix_cache_install_evict_cb() {
+        if (prefix_cache_evict_cb_installed_ || !cb_kv_pool_) return;
+        cb_kv_pool_->set_evict_callback([this]() -> uint32_t {
+            return prefix_cache_evict_lru(1);
+        });
+        prefix_cache_evict_cb_installed_ = true;
+    }
+
+    // Longest cached entry whose `tokens` is an exact prefix of `prompt` and
+    // strictly shorter than it. On hit, bumps refcount + LRU and returns a
+    // copy of the entry's pages/state via out-params; caller seeds the executor.
+    // Returns the entry id on hit, 0 on miss.
+    uint64_t prefix_cache_lookup(const std::vector<uint32_t> &prompt,
+                                 uint32_t page_size,
+                                 std::vector<int32_t> &out_pages,
+                                 QwenExecutor::StateSnapshot &out_recur,
+                                 uint32_t &out_aligned_len) {
+        if (!prefix_cache_enabled() || prompt.size() < 2 * page_size) return 0;
+        std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+        const uint32_t prompt_len = static_cast<uint32_t>(prompt.size());
+        // Probe page-aligned prefix lengths from longest to shortest. The
+        // longest aligned length strictly below prompt_len is the first probe.
+        uint32_t probe = (prompt_len / page_size) * page_size;
+        if (probe >= prompt_len) probe -= page_size;
+        for (; probe >= page_size; probe -= page_size) {
+            const uint64_t h = prefix_cache_hash(prompt.data(), probe);
+            auto it = prefix_cache_.find(h);
+            if (it == prefix_cache_.end()) continue;
+            for (PrefixCacheEntry &e : it->second) {
+                if (e.aligned_len != probe) continue;
+                if (e.tokens.size() != probe) continue;
+                if (!std::equal(e.tokens.begin(), e.tokens.end(),
+                                prompt.begin())) {
+                    continue;  // hash collision
+                }
+                // Hit. Pin already held by the entry; bump refcount + LRU.
+                ++e.refcount;
+                e.last_used_seq = ++prefix_cache_seq_;
+                out_pages = e.kv_pages;
+                out_recur = clone_state_snapshot(e.recur);
+                out_aligned_len = e.aligned_len;
+                return e.id;
+            }
+        }
+        return 0;
+    }
+
+    // Deep-copy a StateSnapshot (device tensors) so the adopting executor gets
+    // its own restorable copy and the cache entry's master copy is untouched.
+    QwenExecutor::StateSnapshot clone_state_snapshot(
+            const QwenExecutor::StateSnapshot &src) {
+        QwenExecutor::StateSnapshot dst;
+        dst.ready = src.ready;
+        dst.position = src.position;
+        dst.kv_logical_pages = src.kv_logical_pages;
+        dst.mtp_prefix_len = src.mtp_prefix_len;
+        if (src.h) {
+            dst.h = device_->scratch_f32(src.h->count, "prefix_clone_h");
+            prefix_require_ok(device_->copy_d2d(*dst.h, *src.h, 0, src.h->count));
+        }
+        dst.recurrent_states.resize(src.recurrent_states.size());
+        dst.conv_states.resize(src.conv_states.size());
+        for (size_t i = 0; i < src.recurrent_states.size(); ++i) {
+            if (src.recurrent_states[i]) {
+                dst.recurrent_states[i] = device_->scratch_f32(
+                    src.recurrent_states[i]->count, "prefix_clone_recur");
+                prefix_require_ok(device_->copy_d2d(*dst.recurrent_states[i],
+                                             *src.recurrent_states[i], 0,
+                                             src.recurrent_states[i]->count));
+            }
+        }
+        for (size_t i = 0; i < src.conv_states.size(); ++i) {
+            if (src.conv_states[i]) {
+                dst.conv_states[i] = device_->scratch_f32(
+                    src.conv_states[i]->count, "prefix_clone_conv");
+                prefix_require_ok(device_->copy_d2d(*dst.conv_states[i],
+                                             *src.conv_states[i], 0,
+                                             src.conv_states[i]->count));
+            }
+        }
+        return dst;
+    }
+
+    // Commit the page-aligned prefix [0..aligned_len) of a freshly-prefilled
+    // request: snapshot recurrent state (already at aligned_len), pin the
+    // prefix KV pages, mark them borrowed in the executor, and insert an entry.
+    // The committing request itself holds a refcount (released at finish).
+    void prefix_cache_commit(ContinuousBatchActive &a, uint32_t aligned_len) {
+        if (!prefix_cache_enabled() || aligned_len == 0 || !a.executor) return;
+        const uint32_t page_size = a.executor->kv_page_size_public();
+        if (page_size == 0 || (aligned_len % page_size) != 0) return;
+        const uint32_t prefix_pages = aligned_len / page_size;
+
+        // Don't duplicate an entry that already covers this exact prefix.
+        const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
+        const uint64_t h = prefix_cache_hash(prompt.data(), aligned_len);
+        {
+            std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+            auto it = prefix_cache_.find(h);
+            if (it != prefix_cache_.end()) {
+                for (PrefixCacheEntry &e : it->second) {
+                    if (e.aligned_len == aligned_len &&
+                        e.tokens.size() == aligned_len &&
+                        std::equal(e.tokens.begin(), e.tokens.end(),
+                                   prompt.begin())) {
+                        ++e.refcount;  // creator holds it too
+                        e.last_used_seq = ++prefix_cache_seq_;
+                        a.held_prefix_entries.push_back(e.id);
+                        return;
+                    }
+                }
+            }
+        }
+
+        PrefixCacheEntry entry;
+        entry.aligned_len = aligned_len;
+        entry.tokens.assign(prompt.begin(),
+                            prompt.begin() + static_cast<std::ptrdiff_t>(aligned_len));
+        // Capture recurrent+conv state at exactly aligned_len. The executor's
+        // position_ is aligned_len here (caller invokes at the boundary).
+        a.executor->capture_state(entry.recur);
+        // Mark prefix pages borrowed in the executor + collect their physical
+        // ids; the executor keeps reading them but will not free them.
+        entry.kv_pages = a.executor->mark_kv_prefix_shared(prefix_pages);
+        if (entry.kv_pages.size() != prefix_pages) return;  // nothing to share
+        if (cb_kv_pool_) cb_kv_pool_->pin_pages(entry.kv_pages);
+
+        uint64_t eid = 0;
+        {
+            std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+            entry.id = prefix_cache_next_id_++;
+            entry.refcount = 1;  // creator holds it until finish
+            entry.last_used_seq = ++prefix_cache_seq_;
+            prefix_cache_pinned_pages_ += prefix_pages;
+            a.held_prefix_entries.push_back(entry.id);
+            eid = entry.id;
+            const uint32_t alen = entry.aligned_len;
+            prefix_cache_[h].push_back(std::move(entry));
+            if (prefix_cache_trace_enabled()) {
+                std::ostringstream m;
+                m << "prefix_cache commit id=" << eid
+                  << " req=" << a.req->id
+                  << " aligned_len=" << alen
+                  << " pages=" << prefix_pages
+                  << " pinned_pages=" << prefix_cache_pinned_pages_;
+                log(m.str());
+            }
+        }
+        (void) eid;
+        // Enforce the page budget: evict LRU refcount==0 entries until we are
+        // within QW3_PREFIX_CACHE_MAX_PAGES (0 = unlimited). The just-committed
+        // entry has refcount 1 so it is never the victim here.
+        const uint32_t budget = prefix_cache_max_pages();
+        if (budget > 0) {
+            for (int guard = 0; guard < 4096; ++guard) {
+                uint32_t pinned;
+                {
+                    std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+                    pinned = prefix_cache_pinned_pages_;
+                }
+                if (pinned <= budget) break;
+                if (prefix_cache_evict_lru(1) == 0) break;  // nothing evictable
+            }
+        }
+    }
+
+    // Drop refcounts this request holds. Pinned pages are NOT freed here; they
+    // stay until the entry is evicted at refcount 0.
+    void prefix_cache_release(ContinuousBatchActive &a) {
+        if (a.held_prefix_entries.empty()) return;
+        std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+        for (uint64_t eid : a.held_prefix_entries) {
+            for (auto &kv : prefix_cache_) {
+                for (PrefixCacheEntry &e : kv.second) {
+                    if (e.id == eid && e.refcount > 0) { --e.refcount; break; }
+                }
+            }
+        }
+        a.held_prefix_entries.clear();
+    }
+
+    // Evict up to `want` LRU entries with refcount==0, unpin + free their pages
+    // back to the pool. Returns the number of ENTRIES evicted (the progress
+    // signal for allocate_physical_page's retry loop), NOT the page count: an
+    // entry whose pages are all shared with a longer cached entry reclaims ZERO
+    // physical pages on its own (its pages stay pinned by the other entry), yet
+    // dropping it is still progress -- the next eviction can then free the
+    // uniquely-owning entry. Called by the pool's evict callback (pool mutex
+    // NOT held here).
+    uint32_t prefix_cache_evict_lru(uint32_t want) {
+        std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+        uint32_t evicted_entries = 0;
+        for (uint32_t n = 0; n < want; ++n) {
+            // Find the global LRU evictable entry.
+            uint64_t best_seq = UINT64_MAX;
+            uint64_t best_hash = 0;
+            size_t best_idx = 0;
+            bool found = false;
+            for (auto &kv : prefix_cache_) {
+                for (size_t i = 0; i < kv.second.size(); ++i) {
+                    const PrefixCacheEntry &e = kv.second[i];
+                    if (e.refcount != 0) continue;
+                    if (e.last_used_seq < best_seq) {
+                        best_seq = e.last_used_seq;
+                        best_hash = kv.first;
+                        best_idx = i;
+                        found = true;
+                    }
+                }
+            }
+            if (!found) break;
+            auto &bucket = prefix_cache_[best_hash];
+            PrefixCacheEntry &victim = bucket[best_idx];
+            if (cb_kv_pool_) {
+                cb_kv_pool_->unpin_pages(victim.kv_pages);
+                cb_kv_pool_->release_physical_pages(victim.kv_pages);
+            }
+            const uint32_t pages = static_cast<uint32_t>(victim.kv_pages.size());
+            ++evicted_entries;
+            if (prefix_cache_pinned_pages_ >= pages) {
+                prefix_cache_pinned_pages_ -= pages;
+            }
+            if (prefix_cache_trace_enabled()) {
+                std::ostringstream m;
+                m << "prefix_cache evict id=" << victim.id
+                  << " aligned_len=" << victim.aligned_len
+                  << " pages=" << pages
+                  << " pinned_pages=" << prefix_cache_pinned_pages_;
+                log(m.str());
+            }
+            bucket.erase(bucket.begin() + static_cast<std::ptrdiff_t>(best_idx));
+            if (bucket.empty()) prefix_cache_.erase(best_hash);
+        }
+        return evicted_entries;
+    }
+
+    void prefix_cache_clear() {
+        std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+        for (auto &kv : prefix_cache_) {
+            for (PrefixCacheEntry &e : kv.second) {
+                if (cb_kv_pool_) {
+                    cb_kv_pool_->unpin_pages(e.kv_pages);
+                    cb_kv_pool_->release_physical_pages(e.kv_pages);
+                }
+            }
+        }
+        prefix_cache_.clear();
+        prefix_cache_pinned_pages_ = 0;
+    }
+
     void finish_continuous_active(ContinuousBatchActive &a) {
+        // Release any prefix-cache entries this request held (adopted or
+        // committed) before tearing down the executor: dropping the refcount
+        // makes the entry evictable, and the executor dtor frees only its
+        // private (owned) suffix pages — never the pinned shared prefix.
+        prefix_cache_release(a);
         const double decode_s = std::max(wall_seconds() - a.decode_start, 1e-9);
         std::ostringstream msg;
         msg << "native continuous_batch:"
@@ -6875,6 +7299,26 @@ private:
     std::unique_ptr<BatchedDecodeExecutor> cb_decode_executor_;
     std::unique_ptr<GlobalKvPagePool> cb_kv_pool_;
     std::unique_ptr<GlobalKvPagePool> cb_mtp_kv_pool_;
+
+    // ---- Prefix cache (Phase 1: lossless page-aligned prefix reuse) -------
+    // One entry per committed, page-aligned prompt prefix. Pages are pinned in
+    // cb_kv_pool_ while the entry lives; recur holds the recurrent+conv state
+    // captured at exactly aligned_len so reuse is lossless on the hybrid model.
+    struct PrefixCacheEntry {
+        uint64_t id = 0;
+        std::vector<uint32_t> tokens;     // exact prefix tokens (collision-safe)
+        uint32_t aligned_len = 0;         // == tokens.size(), multiple of page_size
+        std::vector<int32_t> kv_pages;    // pinned physical pages, logical 0..n
+        QwenExecutor::StateSnapshot recur;// recurrent+conv state at aligned_len
+        uint32_t refcount = 0;            // live requests reading these pages
+        uint64_t last_used_seq = 0;       // LRU
+    };
+    std::unordered_map<uint64_t, std::vector<PrefixCacheEntry>> prefix_cache_;
+    std::mutex prefix_cache_mu_;
+    uint64_t prefix_cache_seq_ = 0;
+    uint64_t prefix_cache_next_id_ = 1;
+    uint32_t prefix_cache_pinned_pages_ = 0;
+    bool prefix_cache_evict_cb_installed_ = false;
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_v_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_mtp_k_cache_storage_;

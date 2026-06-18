@@ -44,6 +44,10 @@ void usage(std::ostream &os) {
         "  --mtp-adaptive-max-chain N  Adaptive MTP maximum chain. Default: --mtp-chain.\n"
         "  --mtp-batched-draft   Batch MTP draft projection/FFN/logits.\n"
         "  --mtp-paged-prefix    Use paged MTP prefix KV.\n"
+        "  --prefix-cache        Enable lossless prefix KV caching: reuse the KV\n"
+        "                        of a shared prompt prefix across requests (re-ask\n"
+        "                        / multi-turn append). Continuous-batching path;\n"
+        "                        MTP requests cold-prefill. Default: off.\n"
         "  --no-continuous-batching, --no-paged-kv, --no-body-batch,\n"
         "  --no-mtp-batched-draft, --no-mtp-paged-prefix\n"
         "                        Compatibility/debug disable switches.\n"
@@ -93,7 +97,7 @@ void usage(std::ostream &os) {
         "  -n N                  Max generated tokens. Default: 256\n"
         "  --temp F              Temperature. Default: 0.6\n"
         "  --top-p F             Top-p. Default: 0.95\n"
-        "  --top-k N             Top-k. Default: 0 (disabled)\n"
+        "  --top-k N             Top-k. Default: 20 (Qwen3 recommended; 0 disables)\n"
         "  --min-p F             Min-p. Default: 0.0\n"
         "  --presence-penalty F  Presence penalty. Default: 0.0\n"
         "  --repetition-penalty F Repetition penalty. Default: 1.0\n"
@@ -249,8 +253,10 @@ int main(int argc, char **argv) {
                 serve_cfg.default_max_tokens_set = true;
             } else if (arg == "--temp") {
                 gen.temperature = parse_float(need(arg), arg);
+                serve_cfg.temperature_set = true;
             } else if (arg == "--top-p") {
                 gen.top_p = parse_float(need(arg), arg);
+                serve_cfg.top_p_set = true;
             } else if (arg == "--top-k") {
                 gen.top_k = parse_int(need(arg), arg);
             } else if (arg == "--min-p") {
@@ -320,6 +326,8 @@ int main(int argc, char **argv) {
             } else if (arg == "--no-mtp-paged-prefix") {
                 serve_cfg.mtp_paged_prefix = false;
                 serve_cfg.mtp_paged_prefix_set = true;
+            } else if (arg == "--prefix-cache") {
+                serve_cfg.prefix_cache = true;
             } else if (arg == "--kv-dtype") {
                 const std::string dt = need(arg);
                 if (dt != "fp16" && dt != "fp32" && dt != "q8" && dt != "fp8") {

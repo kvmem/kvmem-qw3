@@ -275,9 +275,17 @@ void QwenExecutor::KvPageTable::configure(uint32_t ctx_size,
 
 void QwenExecutor::KvPageTable::reset() {
     if (allocator && !pages.empty()) {
-        allocator->release_physical_pages(pages);
+        // Only release pages this table actually owns. Borrowed (prefix-cache)
+        // pages are pinned elsewhere and must never go back on the free stack.
+        std::vector<int32_t> to_release;
+        to_release.reserve(pages.size());
+        for (size_t i = 0; i < pages.size(); ++i) {
+            if (i >= owned.size() || owned[i]) to_release.push_back(pages[i]);
+        }
+        if (!to_release.empty()) allocator->release_physical_pages(to_release);
     }
     pages.clear();
+    owned.clear();
     device_synced = 0;
 }
 
@@ -314,6 +322,7 @@ void QwenExecutor::KvPageTable::ensure_pages(DeviceBackend &backend,
                 std::to_string(max_pages));
         }
         pages.push_back(physical_page);
+        owned.push_back(true);
     }
     if (!device_pages) {
         device_pages = backend.tensor_i32(std::max<uint32_t>(max_pages, 1),
@@ -353,14 +362,55 @@ void QwenExecutor::KvPageTable::validate_physical_capacity(
 
 void QwenExecutor::KvPageTable::truncate_to_logical_pages(uint32_t logical_pages) {
     if (logical_pages >= pages.size()) return;
-    std::vector<int32_t> released(
-        pages.begin() + static_cast<std::ptrdiff_t>(logical_pages),
-        pages.end());
+    std::vector<int32_t> released;
+    released.reserve(pages.size() - logical_pages);
+    for (size_t i = logical_pages; i < pages.size(); ++i) {
+        // Borrowed (prefix-cache) pages are pinned elsewhere; never release.
+        if (i >= owned.size() || owned[i]) released.push_back(pages[i]);
+    }
     pages.resize(logical_pages);
+    if (owned.size() > logical_pages) owned.resize(logical_pages);
     device_synced = std::min<uint32_t>(device_synced, logical_pages);
     if (allocator && !released.empty()) {
         allocator->release_physical_pages(released);
     }
+}
+
+void QwenExecutor::KvPageTable::adopt_shared_pages(DeviceBackend &backend,
+                                                  const std::vector<int32_t> &shared) {
+    if (!pages.empty()) {
+        throw std::runtime_error(
+            "adopt_shared_pages requires a freshly-reset KV page table");
+    }
+    if (shared.empty()) return;
+    const uint32_t need = static_cast<uint32_t>(shared.size());
+    if (need > max_pages) {
+        throw std::runtime_error(
+            "adopt_shared_pages: shared prefix exceeds KV page capacity");
+    }
+    pages = shared;
+    // Borrowed pages: this table never releases them (pinned by the cache).
+    owned.assign(pages.size(), false);
+    if (!device_pages) {
+        device_pages = backend.tensor_i32(std::max<uint32_t>(max_pages, 1),
+                                          "kv_page_indices");
+    }
+    require_status(backend.copy_i32_from_host(*device_pages, 0, pages.data(),
+                                              need));
+    device_synced = need;
+}
+
+std::vector<int32_t> QwenExecutor::KvPageTable::detach_pages_from(uint32_t logical_start) {
+    std::vector<int32_t> detached;
+    if (logical_start >= pages.size()) return detached;
+    detached.assign(pages.begin() + static_cast<std::ptrdiff_t>(logical_start),
+                    pages.end());
+    // Drop the detached logical range WITHOUT releasing the physical pages:
+    // ownership is transferred to the caller (prefix-cache entry).
+    pages.resize(logical_start);
+    if (owned.size() > logical_start) owned.resize(logical_start);
+    device_synced = std::min<uint32_t>(device_synced, logical_start);
+    return detached;
 }
 
 int32_t QwenExecutor::KvPageTable::allocate_physical_page(uint32_t logical_page) const {
@@ -1832,6 +1882,48 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
     kv_pages_.truncate_to_logical_pages(snapshot.kv_logical_pages);
     mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_,
                                          snapshot.mtp_prefix_len);
+}
+
+void QwenExecutor::seed_from_shared_prefix(const std::vector<int32_t> &shared_pages,
+                                           const StateSnapshot &recur,
+                                           uint32_t aligned_len) {
+    ensure_scratch();
+    const uint32_t page_size = kv_pages_.page_size;
+    if (page_size == 0) {
+        throw std::runtime_error("seed_from_shared_prefix: zero KV page size");
+    }
+    if (static_cast<uint64_t>(shared_pages.size()) * page_size != aligned_len) {
+        throw std::runtime_error(
+            "seed_from_shared_prefix: aligned_len must be a whole number of "
+            "KV pages");
+    }
+    // The page table must be empty (caller resets the executor first).
+    kv_pages_.adopt_shared_pages(backend_, shared_pages);
+    // Restore recurrent + conv state captured at exactly aligned_len. This
+    // also sets position_ and truncates kv logical pages to recur.kv_logical_pages.
+    // Because we adopted exactly the shared pages, that truncation is a no-op.
+    restore_state(recur);
+    position_ = aligned_len;
+}
+
+std::vector<int32_t> QwenExecutor::mark_kv_prefix_shared(uint32_t logical_start_page) {
+    // Mark the prefix [0..logical_start_page) as borrowed so this executor's
+    // dtor/reset won't free those pages — the prefix cache now pins them. The
+    // suffix [logical_start_page..end) stays owned and frees normally when the
+    // live request finishes. Returns the prefix's physical pages for the cache
+    // to record + pin.
+    const uint32_t n = std::min<uint32_t>(
+        logical_start_page, static_cast<uint32_t>(kv_pages_.pages.size()));
+    if (kv_pages_.owned.size() < kv_pages_.pages.size()) {
+        kv_pages_.owned.resize(kv_pages_.pages.size(), true);
+    }
+    for (uint32_t i = 0; i < n; ++i) kv_pages_.owned[i] = false;
+    return std::vector<int32_t>(kv_pages_.pages.begin(),
+                                kv_pages_.pages.begin() + n);
+}
+
+std::vector<int32_t> QwenExecutor::kv_physical_pages() const {
+    return kv_pages_.pages;
 }
 
 void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoints,

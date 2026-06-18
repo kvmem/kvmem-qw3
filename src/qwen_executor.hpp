@@ -194,6 +194,28 @@ public:
     void restore_state_checkpoint(const StateCheckpointSet &checkpoints,
                                   uint32_t index);
 
+    // ---- Prefix-cache reuse (serve / continuous-batching) -----------------
+    // Seed this (freshly-reset) executor from a cached, page-aligned prefix.
+    // Installs `shared_pages` as logical KV pages [0..n) marked non-owned (the
+    // pool pins them; this executor never frees them), restores recurrent +
+    // conv state from `recur`, and sets position_ = aligned_len. Subsequent
+    // prefill must start at aligned_len (use prefill_offset). aligned_len must
+    // equal shared_pages.size() * kv page_size.
+    void seed_from_shared_prefix(const std::vector<int32_t> &shared_pages,
+                                 const StateSnapshot &recur,
+                                 uint32_t aligned_len);
+    // Hand the physical KV pages for logical range [logical_start_page..end)
+    // to the caller WITHOUT freeing them, and mark the retained pages
+    // [0..logical_start_page) as non-owned so this executor's dtor won't free
+    // them either (they are now pinned by the prefix cache). Returns the
+    // detached physical pages. Used at commit time when the executor keeps
+    // reading the shared prefix it just promoted.
+    std::vector<int32_t> mark_kv_prefix_shared(uint32_t logical_start_page);
+    // Snapshot of the current physical KV pages (logical order). Used to
+    // record a freshly-computed prefix into the cache.
+    std::vector<int32_t> kv_physical_pages() const;
+    uint32_t kv_page_size_public() const { return kv_pages_.page_size; }
+
     // Per-token batch-scratch footprint in bytes (sum of all *_batch_ tensors
     // at batch=1). Used to size prefill chunks against free device memory.
     uint64_t per_token_scratch_bytes() const;
@@ -216,6 +238,11 @@ private:
         uint32_t max_pages = 0;
         std::string alloc_mode = "identity";
         std::vector<int32_t> pages;
+        // Per-logical-page ownership. true = this table allocated the physical
+        // page and must release it on reset/truncate/dtor. false = the page is
+        // borrowed from a prefix-cache entry (pinned elsewhere); never release.
+        // Always the same length as `pages`.
+        std::vector<bool> owned;
         std::unique_ptr<DeviceTensor> device_pages;
         KvPhysicalPageAllocator *allocator = nullptr;
         uint32_t device_synced = 0;
@@ -228,6 +255,17 @@ private:
                                         const char *label) const;
         void truncate_to_logical_pages(uint32_t logical_pages);
         int32_t allocate_physical_page(uint32_t logical_page) const;
+        // Install pre-existing (pinned, cache-owned) physical pages as logical
+        // pages [0..shared.size()) without allocating. Must be called on a
+        // freshly-reset table (pages empty). The pages are marked non-owned so
+        // they are never released by this table.
+        void adopt_shared_pages(DeviceBackend &backend,
+                                const std::vector<int32_t> &shared);
+        // Hand the physical pages for logical range [logical_start..end) to the
+        // caller WITHOUT releasing them, and drop them from this table. Used to
+        // transfer freshly-computed pages into a prefix-cache entry so the
+        // executor dtor won't free them. Returns the detached physical pages.
+        std::vector<int32_t> detach_pages_from(uint32_t logical_start);
         const int32_t *host_indices() const { return pages.data(); }
         const DeviceTensor &device_indices() const { return *device_pages; }
         uint32_t count() const { return static_cast<uint32_t>(pages.size()); }

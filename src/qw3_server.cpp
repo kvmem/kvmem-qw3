@@ -906,6 +906,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         cfg.mtp_batched_draft = false;
         cfg.mtp_paged_prefix = false;
     }
+    if (cfg.prefix_cache && !cfg.continuous_batching) {
+        std::cerr << "[qw3-serve] --prefix-cache requires --continuous-batching; "
+                     "prefix caching disabled\n";
+        cfg.prefix_cache = false;
+    }
+    if (cfg.prefix_cache && mtp_enabled) {
+        std::cerr << "[qw3-serve] note: --prefix-cache active, but MTP requests "
+                     "cold-prefill in v1 (cache applies to the plain "
+                     "continuous-batching path)\n";
+    }
 
     // The backend still reads several low-level toggles from process config.
     // Keep that as an internal bridge; the user-facing API is the explicit CLI
@@ -914,6 +924,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     setenv_bool("QW3_CONTINUOUS_BATCHING_BODY_BATCH", cfg.body_batch);
     setenv_bool("QW3_CONTINUOUS_MTP_BATCHED_DRAFT", cfg.mtp_batched_draft);
     setenv_bool("QW3_MTP_PAGED_PREFIX", cfg.mtp_paged_prefix);
+    // Prefix caching is only meaningful on the continuous-batching path; force
+    // it off otherwise. Page budget unlimited (0) is the tuned value. Tracing
+    // is a pure diagnostic with a safe off-default in the backend, so it is not
+    // clobbered here — leaving it lets a diagnostic harness opt in via
+    // QW3_PREFIX_CACHE_TRACE without a user-facing switch.
+    {
+        const bool prefix_cache_on = cfg.prefix_cache && cfg.continuous_batching;
+        setenv_bool("QW3_PREFIX_CACHE", prefix_cache_on);
+        setenv_value("QW3_PREFIX_CACHE_MAX_PAGES", 0);
+    }
     setenv_bool("QW3_MTP_SPECULATE", engine.native_mtp_speculate);
     setenv_value("QW3_MTP_POLICY", engine.mtp_policy);
     if (engine.mtp_adaptive_min_chain > 0) {
@@ -986,6 +1006,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  mtp_speculate=" << yesno(engine.native_mtp_speculate) << "\n"
               << "  mtp_batched_draft=" << yesno(cfg.mtp_batched_draft) << "\n"
               << "  mtp_paged_prefix=" << yesno(cfg.mtp_paged_prefix) << "\n"
+              << "  prefix_cache="
+              << yesno(cfg.prefix_cache && cfg.continuous_batching) << "\n"
               << "  matmul=mmq\n"
               << "  disable_hgemm=1\n"
               << "  default_max_tokens="
@@ -1028,10 +1050,20 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         res.set_content(dump_json(out), "application/json");
     });
 
-    // Build GenerationOptions from common OpenAI fields. Default temperature=0
-    // (greedy) for reproducible evals when the client omits it; default top_p=1.
-    auto make_gen = [&](const json &req, size_t prompt_token_count) -> GenerationOptions {
+    // Build GenerationOptions from common OpenAI fields. Sampling defaults to
+    // the Qwen3-recommended preset for the request's thinking mode (see below);
+    // any field the client sends overrides it.
+    auto make_gen = [&](const json &req, size_t prompt_token_count,
+                        bool enable_thinking = true) -> GenerationOptions {
         GenerationOptions g = cfg.default_generation;
+        // Qwen3-recommended sampling preset per mode, applied only where the
+        // user did not pin the value on the CLI or in the request. Thinking:
+        // temp 0.6 / top_p 0.95 (the struct + CLI default). Non-thinking:
+        // temp 0.7 / top_p 0.8. top_k=20 / min_p=0 are shared, so untouched.
+        if (!enable_thinking) {
+            if (!cfg.temperature_set) g.temperature = 0.7f;
+            if (!cfg.top_p_set) g.top_p = 0.8f;
+        }
         const int remaining_ctx =
             std::max(1, engine.ctx_size - static_cast<int>(prompt_token_count));
         const bool has_max_tokens =
@@ -1127,7 +1159,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     " ctx=" + std::to_string(engine.ctx_size));
             return;
         }
-        GenerationOptions g = make_gen(req, prompt_token_count);
+        GenerationOptions g = make_gen(req, prompt_token_count, enable_thinking);
         g.raw_prompt = true; // prompt is already chat-framed
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
         g.continuous_batching =

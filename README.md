@@ -437,6 +437,10 @@ Notes:
   `--continuous-batching` is enabled.
 - Use `--kv-page-size N`, `--kv-pool-pages N`, and `--mtp-kv-pool-pages N` to
   tune the paged-KV pool. `0` pool pages means auto.
+- Enable **prefix caching** (lossless page-aligned KV reuse across requests that
+  share a prompt prefix) with `--prefix-cache`. It is off by default and
+  currently wired on the plain continuous-batching path (MTP requests
+  cold-prefill in v1). See the prefix-cache section below.
 - The intended serving matmul path is MMQ and HGEMM is disabled internally for
   `qw3 serve`; HGEMM is not part of the continuous batching optimization plan.
 
@@ -462,6 +466,7 @@ Serving feature switches:
 | `--no-mtp-batched-draft` | n/a | Disables batched MTP draft for debugging. |
 | `--mtp-paged-prefix` | auto | Forces paged MTP prefix KV. Auto-on for MTP + paged KV. |
 | `--no-mtp-paged-prefix` | n/a | Disables paged MTP prefix for debugging. |
+| `--prefix-cache` | off | Lossless prefix KV caching: reuse a shared prompt prefix's KV across requests. Requires `--continuous-batching`; MTP requests cold-prefill in v1. |
 
 Explicit examples:
 
@@ -503,6 +508,51 @@ Tune paged-KV block and pool sizing:
   --kv-pool-pages 8192 \
   --mtp-kv-pool-pages 8192
 ```
+
+### Prefix caching (lossless KV reuse)
+
+Prefix caching reuses the KV pages and recurrent/conv state of an already-served
+prompt prefix, so a later request that shares a page-aligned prefix skips
+re-prefilling it. Reuse is lossless: a cache-hit greedy completion is
+byte-identical to the same prompt run cold (verified on the hybrid
+DeltaNet+attention model). Enable it with the `--prefix-cache` switch; it is
+**off by default**. The page budget (unlimited, bounded by the KV pool) is the
+tuned value and is not exposed as a separate switch.
+
+| Switch | Default | Effect |
+|---|---:|---|
+| `--prefix-cache` | off | Enables lossless prefix KV caching on the continuous-batching path. Requires `--continuous-batching`. |
+
+Scope and limits (v1):
+
+- Reuse fires when one prompt is a **strict token-prefix** of another — re-ask
+  of the same prompt, or multi-turn append (identical history + a new question
+  at the end). Measured end-to-end latency saved in the multi-turn-append case:
+  ~92% at 16k, ~96% at 32k, ~98% at 64k shared prefix (prefill collapses from
+  seconds to ~0.06s; the longer the shared context, the larger the win).
+- The "shared system preamble + a *different* question" case does not reuse yet
+  (each distinct question commits its own entry). That is the next milestone.
+- **MTP** requests (`--mtp-chain N`) bypass the cache in v1 and cold-prefill.
+- Enabling the cache currently forces the per-row prefill path (batch-prefill is
+  disabled so commits land exactly on page boundaries).
+
+Complete launch command with continuous batching + prefix caching:
+
+```sh
+./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --continuous-batching \
+  --max-active 4 \
+  --max-pending 128 \
+  --kv-dtype fp16 \
+  --prefix-cache
+```
+
+Verification scripts: `scripts/prefix_cache_canary.py` (lossless invariant),
+`scripts/prefix_cache_eviction.py` (LRU eviction + cache-off regression),
+`scripts/prefix_cache_latency_bench.py` (16k/32k/64k latency savings).
 
 ### OpenAI-compatible smoke tests
 

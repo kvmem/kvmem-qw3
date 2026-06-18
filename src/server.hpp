@@ -16,6 +16,11 @@ struct ServerConfig {
     int port = 8080;
     GenerationOptions default_generation;
     bool default_max_tokens_set = false;
+    // Track whether the user pinned sampling on the CLI. When unset, the server
+    // applies the Qwen3-recommended preset for the request's thinking mode
+    // (thinking: temp 0.6/top_p 0.95; non-thinking: temp 0.7/top_p 0.8).
+    bool temperature_set = false;
+    bool top_p_set = false;
     bool continuous_batching = false;
     bool paged_kv = false;
     bool paged_kv_set = false;
@@ -25,6 +30,11 @@ struct ServerConfig {
     bool mtp_paged_prefix_set = false;
     bool mtp_batched_draft = false;
     bool mtp_batched_draft_set = false;
+    // Lossless page-aligned prefix KV caching on the continuous-batching path.
+    // Off by default; --prefix-cache opts in. Page budget is unlimited (bounded
+    // by the KV pool) and tracing is off — these are the tuned values, so they
+    // are not exposed as separate switches.
+    bool prefix_cache = false;
     int max_active = 2;
     int max_pending = 128;
     int prefill_burst = 0;
