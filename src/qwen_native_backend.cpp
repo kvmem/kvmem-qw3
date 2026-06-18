@@ -3549,8 +3549,8 @@ private:
         uint32_t base_position = 0;
         std::vector<uint32_t> drafts;
         std::vector<uint32_t> verify_tokens;
-        QwenExecutor::StateSnapshot snapshot;
-        QwenExecutor::StateCheckpointSet checkpoints;
+        // snapshot/checkpoints live in the per-row MtpStats (persistent across
+        // loop iterations) and are referenced by `row`, never owned here.
         bool layered_verified = false;
     };
 
@@ -4036,6 +4036,14 @@ private:
             uint32_t max_active) {
         if (reqs.empty()) return;
         const int32_t eos = tokenizer_->eos_id();
+        const bool cb_mtp_phase_sync = mtp_phase_sync_enabled();
+        auto cb_phase_time = [&]() -> double {
+            if (cb_mtp_phase_sync) {
+                DeviceStatus sync_st = device_->synchronize();
+                if (!sync_st.ok) throw std::runtime_error(sync_st.message);
+            }
+            return wall_seconds();
+        };
         const uint32_t requested_chain = mtp_trace_chain_len(options_);
         const uint32_t chain_len =
             std::min<uint32_t>(requested_chain, mtp_safe_chain_max());
@@ -4061,8 +4069,18 @@ private:
             double restore_s = 0.0;
             double replay_s = 0.0;
             double prefix_s = 0.0;
+            double loop_wall_s = 0.0;
             double decode_start = 0.0;
             MtpAdaptivePolicy policy;
+            // Persistent per-row verify state. Reused across loop iterations so
+            // the ~37 device tensors (hidden + recurrent + conv) backing the
+            // snapshot/checkpoints are allocated once per row, not once per
+            // batch. The job below only references these by row; allocating a
+            // fresh snapshot per batch costs ~74 synchronous cudaMalloc/cudaFree
+            // pairs per step (~11 ms), which was the entire CB-vs-legacy MTP
+            // regression. Legacy reuses a single snapshot the same way.
+            QwenExecutor::StateSnapshot snapshot;
+            QwenExecutor::StateCheckpointSet checkpoints;
         };
         std::vector<ContinuousBatchActive> mtp_active;
         std::vector<MtpStats> stats;
@@ -4111,12 +4129,12 @@ private:
                         job_indices.push_back(j);
                     }
                     if (decode_batch.size() == 0) break;
-                    const double verify0 = wall_seconds();
+                    const double verify0 = cb_phase_time();
                     const std::vector<BatchedDecodeOutput> layer_outputs =
                         cb_decode_executor_->decode(
                             mtp_active, BatchedDecodeInput{&decode_batch});
                     const double verify_s =
-                        std::max(wall_seconds() - verify0, 0.0);
+                        std::max(cb_phase_time() - verify0, 0.0);
                     if (layer_outputs.size() != job_indices.size()) {
                         return false;
                     }
@@ -4367,6 +4385,7 @@ private:
                 log(msg.str());
             }
             while (!mtp_active.empty()) {
+                const double loop_iter0 = wall_seconds();
                 admit_pending_mtp_requests();
                 std::vector<ContinuousMtpVerifyJob> jobs;
                 jobs.reserve(mtp_active.size());
@@ -4415,10 +4434,10 @@ private:
                         job.current = a.next_token;
                         job.base_position = a.executor->position();
                         if (state_checkpoint_count == 0) {
-                            const double snapshot0 = wall_seconds();
-                            a.executor->capture_state(job.snapshot);
+                            const double snapshot0 = cb_phase_time();
+                            a.executor->capture_state(stats[row].snapshot);
                             stats[row].snapshot_s +=
-                                std::max(wall_seconds() - snapshot0, 0.0);
+                                std::max(cb_phase_time() - snapshot0, 0.0);
                         }
                         job.verify_tokens.push_back(job.current);
                         batched_jobs.push_back(std::move(job));
@@ -4446,11 +4465,11 @@ private:
                             steps.push_back(std::move(step));
                         }
                         if (steps.size() < 2) break;
-                        const double draft0 = wall_seconds();
+                        const double draft0 = cb_phase_time();
                         batch_ok = run_continuous_mtp_batched_draft_step(
                             mtp_active, steps, depth == 0);
                         const double per_row_s =
-                            std::max(wall_seconds() - draft0, 0.0) /
+                            std::max(cb_phase_time() - draft0, 0.0) /
                             static_cast<double>(steps.size());
                         if (!batch_ok) break;
                         for (const ContinuousMtpDraftStep &step : steps) {
@@ -4496,7 +4515,7 @@ private:
                             a.req->options.max_tokens - a.decoded);
                     const uint32_t draft_limit =
                         stats[row].policy.draft_limit(remaining, chain_len);
-                    const double draft0 = wall_seconds();
+                    const double draft0 = cb_phase_time();
                     std::vector<NativeExecutorReport> chain =
                         use_device_draft
                             ? a.executor->forward_mtp_draft_chain_with_prefix_device(
@@ -4504,16 +4523,16 @@ private:
                             : a.executor->forward_mtp_draft_chain_with_prefix(
                                   current, draft_limit);
                     stats[row].draft_s +=
-                        std::max(wall_seconds() - draft0, 0.0);
+                        std::max(cb_phase_time() - draft0, 0.0);
                     ContinuousMtpVerifyJob job;
                     job.row = row;
                     job.current = current;
                     job.base_position = a.executor->position();
                     if (state_checkpoint_count == 0) {
-                        const double snapshot0 = wall_seconds();
-                        a.executor->capture_state(job.snapshot);
+                        const double snapshot0 = cb_phase_time();
+                        a.executor->capture_state(stats[row].snapshot);
                         stats[row].snapshot_s +=
-                            std::max(wall_seconds() - snapshot0, 0.0);
+                            std::max(cb_phase_time() - snapshot0, 0.0);
                     }
                     job.verify_tokens.push_back(current);
                     for (const NativeExecutorReport &draft : chain) {
@@ -4565,7 +4584,7 @@ private:
                                     job.verify_tokens, true,
                                     &out.row_argmaxes,
                                     state_checkpoint_count > 0
-                                        ? &job.checkpoints
+                                        ? &stats[job.row].checkpoints
                                         : nullptr,
                                     state_checkpoint_count,
                                     /*copy_last_logits=*/false);
@@ -4576,11 +4595,11 @@ private:
                         };
                     if (jobs.size() == 1) {
                         ContinuousMtpVerifyJob &job = jobs.front();
-                        const double verify0 = wall_seconds();
+                        const double verify0 = cb_phase_time();
                         outputs.push_back(run_single_verifier(job));
                         if (job.row < stats.size()) {
                             stats[job.row].verify_s +=
-                                std::max(wall_seconds() - verify0, 0.0);
+                                std::max(cb_phase_time() - verify0, 0.0);
                         }
                     } else if (continuous_mtp_layered_verify_enabled() &&
                                run_layered_verifier(jobs, outputs)) {
@@ -4612,12 +4631,12 @@ private:
                             metadata.last_page_len =
                                 cb_prefill_last_page_len_i32_.get();
                             metadata.seq_lens = cb_prefill_seq_lens_i32_.get();
-                            const double verify0 = wall_seconds();
+                            const double verify0 = cb_phase_time();
                             outputs = cb_prefill_executor_->prefill(
                                 mtp_active, batch, metadata);
                             used_ragged_verify = true;
                             const double verify_s =
-                                std::max(wall_seconds() - verify0, 0.0);
+                                std::max(cb_phase_time() - verify0, 0.0);
                             for (const ContinuousMtpVerifyJob &job : jobs) {
                                 if (job.row < stats.size()) {
                                     stats[job.row].verify_s +=
@@ -4644,20 +4663,21 @@ private:
                         if (need_single_fallback) {
                             used_ragged_verify = false;
                             for (const ContinuousMtpVerifyJob &job : jobs) {
-                                if (job.snapshot.ready &&
-                                    job.row < mtp_active.size()) {
+                                if (job.row < mtp_active.size() &&
+                                    job.row < stats.size() &&
+                                    stats[job.row].snapshot.ready) {
                                     mtp_active[job.row].executor->restore_state(
-                                        job.snapshot);
+                                        stats[job.row].snapshot);
                                 }
                             }
                             outputs.clear();
                             outputs.reserve(jobs.size());
                             for (ContinuousMtpVerifyJob &job : jobs) {
-                                const double verify0 = wall_seconds();
+                                const double verify0 = cb_phase_time();
                                 outputs.push_back(run_single_verifier(job));
                                 if (job.row < stats.size()) {
                                     stats[job.row].verify_s +=
-                                        std::max(wall_seconds() - verify0,
+                                        std::max(cb_phase_time() - verify0,
                                                  0.0);
                                 }
                             }
@@ -4665,8 +4685,10 @@ private:
                                    state_checkpoint_count > 0) {
                             for (uint32_t j = 0;
                                  j < jobs.size() && j < outputs.size(); ++j) {
-                                jobs[j].checkpoints =
-                                    std::move(outputs[j].checkpoints);
+                                if (jobs[j].row < stats.size()) {
+                                    stats[jobs[j].row].checkpoints =
+                                        std::move(outputs[j].checkpoints);
+                                }
                             }
                         }
                     }
@@ -4743,24 +4765,24 @@ private:
                         if (all_accepted) {
                             if (job.layered_verified) {
                                 if (mtp_rebuild_accepted_prefix_enabled()) {
-                                    const double prefix0 = wall_seconds();
+                                    const double prefix0 = cb_phase_time();
                                     a.executor
                                         ->commit_mtp_prefix_from_current_hidden(
                                             a.executor->position());
                                     s.prefix_s += std::max(
-                                        wall_seconds() - prefix0, 0.0);
+                                        cb_phase_time() - prefix0, 0.0);
                                 } else {
                                     a.executor->commit_mtp_prefix(
                                         a.executor->position());
                                 }
                             } else if (mtp_rebuild_accepted_prefix_enabled()) {
-                                const double prefix0 = wall_seconds();
+                                const double prefix0 = cb_phase_time();
                                 NativeExecutorReport prefix =
                                     a.executor->prime_mtp_prefix_from_last_batch(
                                         job.verify_tokens, job.base_position,
                                         mtp_prefix_rebuild_batch_min_tokens());
                                 s.prefix_s +=
-                                    std::max(wall_seconds() - prefix0, 0.0);
+                                    std::max(cb_phase_time() - prefix0, 0.0);
                                 if (!prefix.ok) {
                                     const std::string reason =
                                         prefix.missing_kernels.empty()
@@ -4777,12 +4799,12 @@ private:
                             }
                         } else if (job.layered_verified) {
                             if (mtp_rebuild_accepted_prefix_enabled()) {
-                                const double prefix0 = wall_seconds();
+                                const double prefix0 = cb_phase_time();
                                 a.executor
                                     ->commit_mtp_prefix_from_current_hidden(
                                         a.executor->position());
                                 s.prefix_s +=
-                                    std::max(wall_seconds() - prefix0, 0.0);
+                                    std::max(cb_phase_time() - prefix0, 0.0);
                             } else {
                                 a.executor->commit_mtp_prefix(
                                     a.executor->position());
@@ -4791,25 +4813,44 @@ private:
                         } else {
                             const bool use_checkpoint_replay =
                                 state_checkpoint_count > 0 &&
-                                job.checkpoints.ready &&
-                                accepted < job.checkpoints.count;
+                                s.checkpoints.ready &&
+                                accepted < s.checkpoints.count;
                             if (use_checkpoint_replay) {
-                                const double restore0 = wall_seconds();
+                                const double restore0 = cb_phase_time();
                                 a.executor->restore_state_checkpoint(
-                                    job.checkpoints, accepted);
+                                    s.checkpoints, accepted);
                                 s.restore_s +=
-                                    std::max(wall_seconds() - restore0, 0.0);
+                                    std::max(cb_phase_time() - restore0, 0.0);
                                 ++s.state_checkpoint_reused;
                                 if (accepted == 0) ++s.prefix1_reused;
+                                // restore_state_checkpoint clamps the MTP prefix
+                                // length down to the restored position. When
+                                // accepted>=1 that leaves position_ ahead of the
+                                // prefix, so the next batch's draft chain bails
+                                // (position_ > mtp_prefix_len_) and falls back to
+                                // a full target forward_one_token (~22 ms each).
+                                // Re-extend the prefix from the just-restored
+                                // hidden state, mirroring the legacy reject path.
+                                if (mtp_rebuild_accepted_prefix_enabled()) {
+                                    const double prefix0 = cb_phase_time();
+                                    a.executor
+                                        ->commit_mtp_prefix_from_current_hidden(
+                                            a.executor->position());
+                                    s.prefix_s +=
+                                        std::max(cb_phase_time() - prefix0, 0.0);
+                                } else {
+                                    a.executor->commit_mtp_prefix(
+                                        a.executor->position());
+                                }
                             } else {
-                                if (!job.snapshot.ready) {
+                                if (!s.snapshot.ready) {
                                     throw std::runtime_error(
                                         "MTP batched verifier replay requires a state snapshot");
                                 }
-                                const double restore0 = wall_seconds();
-                                a.executor->restore_state(job.snapshot);
+                                const double restore0 = cb_phase_time();
+                                a.executor->restore_state(s.snapshot);
                                 s.restore_s +=
-                                    std::max(wall_seconds() - restore0, 0.0);
+                                    std::max(cb_phase_time() - restore0, 0.0);
                                 std::vector<uint32_t> replay;
                                 replay.reserve(accepted + 1);
                                 replay.push_back(job.current);
@@ -4818,14 +4859,14 @@ private:
                                 }
                                 double prefix_seconds = 0.0;
                                 uint64_t prefix_ops = 0;
-                                const double replay0 = wall_seconds();
+                                const double replay0 = cb_phase_time();
                                 NativeExecutorReport replay_report =
                                     a.executor->replay_tokens_with_mtp_prefix(
                                         replay, job.base_position,
                                         mtp_rebuild_accepted_prefix_enabled(),
                                         &prefix_seconds, &prefix_ops);
                                 s.replay_s +=
-                                    std::max(wall_seconds() - replay0, 0.0);
+                                    std::max(cb_phase_time() - replay0, 0.0);
                                 s.prefix_s += prefix_seconds;
                                 if (!replay_report.ok) {
                                     throw std::runtime_error(
@@ -4853,11 +4894,14 @@ private:
                         emit(a, a.next_token);
                     }
                 }
+                for (MtpStats &ls : stats) {
+                    ls.loop_wall_s += std::max(wall_seconds() - loop_iter0, 0.0);
+                }
                 for (size_t i = mtp_active.size(); i > 0; --i) {
                     ContinuousBatchActive &a = mtp_active[i - 1];
                     if (!a.req || a.decoded >= a.req->options.max_tokens ||
                         should_stop(a, a.next_token)) {
-                        const MtpStats s = stats[i - 1];
+                        const MtpStats &s = stats[i - 1];
                         const double decode_s =
                             std::max(wall_seconds() - s.decode_start, 1e-9);
                         std::ostringstream summary;
@@ -4894,6 +4938,8 @@ private:
                                 << " restore_s=" << fmt_seconds(s.restore_s)
                                 << " replay_s=" << fmt_seconds(s.replay_s)
                                 << " prefix_s=" << fmt_seconds(s.prefix_s);
+                        summary << " loop_wall_s=" << fmt_seconds(s.loop_wall_s);
+                        if (cb_mtp_phase_sync) summary << " phase_sync=true";
                         log(summary.str());
                         log("native generate: prompt_tokens=" +
                             std::to_string(a.req->prompt_tokens.size()) +
