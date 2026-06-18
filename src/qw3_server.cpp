@@ -672,26 +672,32 @@ std::string tools_debug_summary(const json &tools) {
     return dump_json(summary);
 }
 
-bool could_be_tool_call_prefix(const std::string &text) {
-    static const std::string target = "<tool_call>";
-    size_t i = 0;
-    while (i < text.size() &&
-           (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t')) {
-        ++i;
+// Streaming tool-call detection. The model may emit natural-language reasoning
+// before a <tool_call> block (the Hermes prompt at render_messages explicitly
+// allows this), so the stream cannot be classified once on its first token.
+// Instead content streams incrementally until a <tool_call> marker appears
+// anywhere, at which point the caller switches to buffering and parses the call
+// from the full accumulated text.
+//
+// Returns how many leading bytes of `text` are safe to emit as content right
+// now. If a complete "<tool_call>" marker is present, returns its byte offset
+// and sets marker_found. Otherwise holds back the longest tail of `text` that
+// could be the start of a "<tool_call>" marker still being streamed.
+size_t tool_call_safe_emit_len(const std::string &text, bool &marker_found) {
+    static const std::string marker = "<tool_call>";
+    marker_found = false;
+    const size_t pos = text.find(marker);
+    if (pos != std::string::npos) {
+        marker_found = true;
+        return pos;
     }
-    const std::string s = text.substr(i);
-    if (s.empty()) return true;
-    if (s.size() <= target.size()) return target.compare(0, s.size(), s) == 0;
-    return s.compare(0, target.size(), target) == 0;
-}
-
-bool starts_with_tool_call(const std::string &text) {
-    size_t i = 0;
-    while (i < text.size() &&
-           (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t')) {
-        ++i;
+    const size_t max_partial = std::min(text.size(), marker.size() - 1);
+    for (size_t k = max_partial; k > 0; --k) {
+        if (text.compare(text.size() - k, k, marker, 0, k) == 0) {
+            return text.size() - k;
+        }
     }
-    return text.compare(i, std::string("<tool_call>").size(), "<tool_call>") == 0;
+    return text.size();
 }
 
 // Render an OpenAI messages[] array into a Qwen3.6 chat transcript. This mirrors
@@ -1287,9 +1293,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             }
                         };
                         if (tool_request) {
-                            bool classified = forced_tool_request;
+                            // The model may stream natural-language reasoning
+                            // before a <tool_call> block (the Hermes prompt
+                            // explicitly allows this), so we cannot classify the
+                            // response on its first token. Stream content
+                            // incrementally while scanning for a <tool_call>
+                            // marker anywhere; once it appears, stop streaming
+                            // and buffer the remainder so the full call is parsed
+                            // at the end from the accumulated text.
                             bool buffering_tool = forced_tool_request;
-                            std::string pending_prefix;
+                            bool streamed_content = false;
+                            std::string content_pending;
                             eng.generate_stream(prompt, g, [&](const std::string &piece) {
                                 if (stopped) return;
                                 ++completion_tokens;
@@ -1308,22 +1322,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         emit = take_complete_utf8(utf8_pending, emit);
                                     }
                                 }
-                                if (emit.empty() || buffering_tool) return;
-                                if (!classified) {
-                                    pending_prefix += emit;
-                                    if (starts_with_tool_call(pending_prefix)) {
-                                        buffering_tool = true;
-                                        classified = true;
-                                        return;
-                                    }
-                                    if (could_be_tool_call_prefix(pending_prefix)) {
-                                        return;
-                                    }
-                                    classified = true;
-                                    emit = pending_prefix;
-                                    pending_prefix.clear();
+                                if (buffering_tool || emit.empty()) return;
+                                content_pending += emit;
+                                bool marker_found = false;
+                                const size_t safe =
+                                    tool_call_safe_emit_len(content_pending, marker_found);
+                                if (safe > 0) {
+                                    emit_text(content_pending.substr(0, safe));
+                                    streamed_content = true;
+                                    content_pending.erase(0, safe);
                                 }
-                                emit_text(emit);
+                                if (marker_found) {
+                                    // Remainder from the marker onward is the
+                                    // tool call; reparse from `acc` at the end.
+                                    buffering_tool = true;
+                                    content_pending.clear();
+                                }
                             });
                             if (buffering_tool) {
                                 std::string text = take_complete_utf8(utf8_pending, acc);
@@ -1336,7 +1350,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         tools_schema.is_array() ? &tools_schema
                                                                 : nullptr);
                                 const ReasoningSplit split = split_reasoning(framed);
-                                if (!split.reasoning.empty()) {
+                                // Only emit reasoning/content from the buffered
+                                // text when we did NOT already stream it
+                                // incrementally before the marker, to avoid
+                                // duplicating deltas.
+                                if (!streamed_content && !split.reasoning.empty()) {
                                     send_delta(json{{"reasoning_content", split.reasoning}});
                                 }
                                 if (!tool_calls.empty()) {
@@ -1357,22 +1375,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     std::cerr << "[qw3-serve] #" << rid
                                               << " tool_parse_empty preview="
                                               << dump_json(preview) << "\n";
-                                    if (!split.content.empty()) {
+                                    if (!streamed_content && !split.content.empty()) {
                                         send_delta(json{{"content", split.content}});
                                     }
-                                    send_done(stopped ? "stop" : "stop");
+                                    send_done("stop");
                                 }
                             } else {
-                                if (!pending_prefix.empty()) emit_text(pending_prefix);
+                                if (!content_pending.empty()) emit_text(content_pending);
                                 finish_text_stream();
-                                send_done(stopped ? "stop" : "stop");
+                                send_done("stop");
                             }
                             std::cerr << "[qw3-serve] #" << rid
                                       << " chat(stream tools) chars=" << acc.size()
                                       << " completion_tokens=" << completion_tokens
                                       << " prompt_tokens=" << prompt_token_count
                                       << " route=" << route
-                                      << " streamed=" << (buffering_tool ? "false" : "true")
+                                      << " buffered_tool=" << (buffering_tool ? "true" : "false")
                                       << (client_closed ? " client_closed=true" : "")
                                       << "\n";
                             return true;

@@ -3156,9 +3156,29 @@ private:
         req->spec_mtp = mtp_speculate_enabled(options_);
         req->trace_mtp = options_.native_mtp_trace || mtp_trace_enabled();
         req->active_mtp = req->spec_mtp || req->trace_mtp;
-        req->reserved_tokens =
-            static_cast<uint64_t>(prompt_tokens.size()) +
-            static_cast<uint64_t>(std::max(0, options.max_tokens));
+        // reserved_tokens is an admission-accounting figure only (it gates the
+        // shared KV budget; it does NOT bound actual generation, which uses
+        // options.max_tokens in the decode loop, nor actual KV pages, which the
+        // page pool hands out on demand with eviction). Clients that omit
+        // max_tokens get g.max_tokens defaulted to the whole remaining context
+        // upstream, which would make a single request reserve the entire KV
+        // pool and reject every concurrent request. Cap the per-request
+        // reservation at the fair per-slot share of the budget (ctx /
+        // max_active) so up to --max-active requests can always co-reside;
+        // genuine physical pressure is still bounded by the page pool.
+        {
+            const uint32_t reserve_ctx = options_.ctx_size > 0
+                ? static_cast<uint32_t>(options_.ctx_size)
+                : 4096u;
+            const uint32_t reserve_active =
+                std::max(1u, continuous_batching_max_active());
+            const uint64_t per_request_cap =
+                std::max<uint64_t>(1, reserve_ctx / reserve_active);
+            const uint64_t requested =
+                static_cast<uint64_t>(prompt_tokens.size()) +
+                static_cast<uint64_t>(std::max(0, options.max_tokens));
+            req->reserved_tokens = std::min(requested, per_request_cap);
+        }
         if (continuous_batching_trace_enabled()) {
             std::ostringstream msg;
             msg << "native continuous_request:"
