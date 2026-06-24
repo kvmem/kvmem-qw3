@@ -3618,6 +3618,8 @@ public:
             if (hgemm_done_[i]) cudaEventDestroy(hgemm_done_[i]);
         }
         if (dequant_stream_) cudaStreamDestroy(dequant_stream_);
+        if (kv_copy_exec_ready_) cudaEventDestroy(kv_copy_exec_ready_);
+        if (kv_copy_stream_) cudaStreamDestroy(kv_copy_stream_);
         if (graph_instance_) cudaGraphExecDestroy(graph_instance_);
         if (exec_stream_) cudaStreamDestroy(exec_stream_);
         if (q8_1_scratch_) cudaFree(q8_1_scratch_);
@@ -3679,11 +3681,37 @@ public:
         return {};
     }
 
+    DeviceStatus begin_kv_transfer_from_device() override {
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        if (!exec_stream_) return {false, "KVMem transfer requires exec stream"};
+        if (auto st = cuda_status(cudaEventRecord(kv_copy_exec_ready_, exec_stream_),
+                                  "KVMem D2H record exec event");
+            !st.ok) return st;
+        return cuda_status(cudaStreamWaitEvent(kv_copy_stream_, kv_copy_exec_ready_, 0),
+                           "KVMem D2H wait exec event");
+    }
+
+    DeviceStatus begin_kv_transfer_to_device() override {
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        return {};
+    }
+
+    DeviceStatus wait_kv_transfer() override {
+        if (!kv_copy_stream_) return {};
+        return cuda_status(cudaStreamSynchronize(kv_copy_stream_),
+                           "KVMem copy stream synchronize");
+    }
+
     DeviceStatus end() override {
         return synchronize();
     }
 
     DeviceStatus synchronize() override {
+        if (kv_copy_stream_) {
+            if (auto st = cuda_status(cudaStreamSynchronize(kv_copy_stream_),
+                                      "cuda kv copy stream synchronize");
+                !st.ok) return st;
+        }
         if (!exec_stream_) {
             return cuda_status(cudaDeviceSynchronize(), "cuda synchronize");
         }
@@ -4327,6 +4355,26 @@ public:
     }
 
 private:
+    DeviceStatus ensure_kv_copy_stream() {
+        if (!exec_stream_) {
+            if (auto st = begin(); !st.ok) return st;
+        }
+        if (!kv_copy_stream_) {
+            if (auto st = cuda_status(cudaStreamCreateWithFlags(&kv_copy_stream_,
+                                                                cudaStreamNonBlocking),
+                                      "KVMem copy stream");
+                !st.ok) return st;
+        }
+        if (!kv_copy_exec_ready_) {
+            if (auto st = cuda_status(cudaEventCreateWithFlags(
+                                          &kv_copy_exec_ready_,
+                                          cudaEventDisableTiming),
+                                      "KVMem exec-ready event");
+                !st.ok) return st;
+        }
+        return {};
+    }
+
     // FP16 HGEMM for Q8_0 weights. On every call we dequant the weight into
     // a per-call FP16 scratch (no persistent mirror — keeps weight memory at
     // 8-bit only), then run cublasGemmEx with FP16 inputs and FP32 accum.
@@ -8295,30 +8343,53 @@ public:
                                     void *host,
                                     uint64_t byte_offset,
                                     uint64_t byte_count) override {
+        if (auto st = begin_kv_transfer_from_device(); !st.ok) return st;
+        if (auto st = copy_bytes_to_host_async(x, host, byte_offset, byte_count);
+            !st.ok) return st;
+        return wait_kv_transfer();
+    }
+
+    DeviceStatus copy_bytes_to_host_async(const DeviceTensor &x,
+                                          void *host,
+                                          uint64_t byte_offset,
+                                          uint64_t byte_count) override {
         if (byte_count == 0) return {};
         if (!host) return {false, "copy_bytes_to_host null host"};
+        if (!kv_copy_stream_) {
+            if (auto st = begin_kv_transfer_from_device(); !st.ok) return st;
+        }
         const auto &t = as_tensor(x);
         const uint64_t total_bytes = t.count * static_cast<uint64_t>(t.elem_size);
         if (byte_offset > total_bytes || byte_count > total_bytes - byte_offset) {
             return {false, "copy_bytes_to_host out of range"};
         }
         const auto *src = reinterpret_cast<const uint8_t *>(t.ptr) + byte_offset;
-        if (auto st = cuda_status(cudaMemcpyAsync(host, src,
-                                                  static_cast<size_t>(byte_count),
-                                                  cudaMemcpyDeviceToHost,
-                                                  exec_stream_),
-                                  "copy_bytes_to_host async");
-            !st.ok) return st;
-        return cuda_status(cudaStreamSynchronize(exec_stream_),
-                           "copy_bytes_to_host sync");
+        return cuda_status(cudaMemcpyAsync(host, src,
+                                           static_cast<size_t>(byte_count),
+                                           cudaMemcpyDeviceToHost,
+                                           kv_copy_stream_),
+                           "copy_bytes_to_host async");
     }
 
     DeviceStatus copy_bytes_from_host(DeviceTensor &x,
                                       uint64_t byte_offset,
                                       const void *host,
                                       uint64_t byte_count) override {
+        if (auto st = begin_kv_transfer_to_device(); !st.ok) return st;
+        if (auto st = copy_bytes_from_host_async(x, byte_offset, host, byte_count);
+            !st.ok) return st;
+        return wait_kv_transfer();
+    }
+
+    DeviceStatus copy_bytes_from_host_async(DeviceTensor &x,
+                                            uint64_t byte_offset,
+                                            const void *host,
+                                            uint64_t byte_count) override {
         if (byte_count == 0) return {};
         if (!host) return {false, "copy_bytes_from_host null host"};
+        if (!kv_copy_stream_) {
+            if (auto st = begin_kv_transfer_to_device(); !st.ok) return st;
+        }
         auto &t = as_tensor(x);
         const uint64_t total_bytes = t.count * static_cast<uint64_t>(t.elem_size);
         if (byte_offset > total_bytes || byte_count > total_bytes - byte_offset) {
@@ -8328,7 +8399,7 @@ public:
         return cuda_status(cudaMemcpyAsync(dst, host,
                                            static_cast<size_t>(byte_count),
                                            cudaMemcpyHostToDevice,
-                                           exec_stream_),
+                                           kv_copy_stream_),
                            "copy_bytes_from_host async");
     }
 
@@ -8477,6 +8548,8 @@ private:
     cudaStream_t dequant_stream_ = nullptr;
     cudaEvent_t  dequant_done_[2] = {nullptr, nullptr};
     cudaEvent_t  hgemm_done_[2]   = {nullptr, nullptr};
+    cudaStream_t kv_copy_stream_ = nullptr;
+    cudaEvent_t kv_copy_exec_ready_ = nullptr;
     // Q8_1 staging buffer for the ported mmvq path. Reused across calls;
     // grows on demand. Bytes hold (batch * blocks_per_row) block_q8_1 = 36 B.
     void   *q8_1_scratch_ = nullptr;

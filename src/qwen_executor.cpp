@@ -2410,9 +2410,11 @@ void QwenExecutor::kvmem_copy_block_to_host(const KvMemBlock &block,
             const uint64_t byte_offset =
                 static_cast<uint64_t>(physical_page) * page_size * per_pos *
                 static_cast<uint64_t>(kc.elem_size);
-            require_status(backend_.copy_bytes_to_host(kc, out, byte_offset, page_bytes));
+            require_status(backend_.copy_bytes_to_host_async(kc, out, byte_offset,
+                                                             page_bytes));
             out += page_bytes;
-            require_status(backend_.copy_bytes_to_host(vc, out, byte_offset, page_bytes));
+            require_status(backend_.copy_bytes_to_host_async(vc, out, byte_offset,
+                                                             page_bytes));
             out += page_bytes;
         }
     }
@@ -2448,9 +2450,11 @@ void QwenExecutor::kvmem_copy_block_from_host(
             const uint64_t byte_offset =
                 static_cast<uint64_t>(physical_page) * page_size * per_pos *
                 static_cast<uint64_t>(kc.elem_size);
-            require_status(backend_.copy_bytes_from_host(kc, byte_offset, in, page_bytes));
+            require_status(backend_.copy_bytes_from_host_async(kc, byte_offset, in,
+                                                               page_bytes));
             in += page_bytes;
-            require_status(backend_.copy_bytes_from_host(vc, byte_offset, in, page_bytes));
+            require_status(backend_.copy_bytes_from_host_async(vc, byte_offset, in,
+                                                               page_bytes));
             in += page_bytes;
         }
     }
@@ -2459,6 +2463,8 @@ void QwenExecutor::kvmem_copy_block_from_host(
 void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
     if (!block_store_) return;
     const auto &blocks = block_store_->blocks();
+    bool queued_h2d = false;
+    require_status(backend_.begin_kv_transfer_to_device());
     for (const KvMemRemap &rm : plan.remaps) {
         const KvMemBlock &block = blocks[rm.block_id];
         if (kvmem_block_pages_resident(block)) {
@@ -2499,6 +2505,7 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
             (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
         }
         kvmem_copy_block_from_host(block, kvmem_stage_buffer_);
+        queued_h2d = true;
         if (kvmem_tier_trace_enabled()) {
             std::fprintf(stderr,
                          "[kvmem-tier] stage_in block=%u from=%s bytes=%llu\n",
@@ -2513,6 +2520,9 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
         }
         block_store_->set_block_tier(rm.block_id, KvTier::GPU);
     }
+    if (queued_h2d) {
+        require_status(backend_.wait_kv_transfer());
+    }
 }
 
 void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
@@ -2524,7 +2534,9 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
         const KvMemBlock &block = blocks[block_id];
         if (!kvmem_block_pages_resident(block)) continue;
         kvmem_canonicalize_block_for_tier(block_id);
+        require_status(backend_.begin_kv_transfer_from_device());
         kvmem_copy_block_to_host(block, kvmem_stage_buffer_);
+        require_status(backend_.wait_kv_transfer());
         bool placed = false;
         int32_t cpu_slot = -1;
         int32_t nvme_slot = -1;

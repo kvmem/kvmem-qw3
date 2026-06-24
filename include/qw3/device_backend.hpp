@@ -1211,12 +1211,33 @@ public:
         return {false, "copy_bytes_to_host not implemented for this backend"};
     }
 
+    // Async raw byte copies for tiered KV storage. The default implementation
+    // preserves synchronous semantics so non-CUDA/mock backends do not need to
+    // understand streams. CUDA overrides these with a dedicated copy stream;
+    // callers must keep host buffers alive until wait_kv_transfer() returns.
+    virtual DeviceStatus begin_kv_transfer_from_device() { return {}; }
+    virtual DeviceStatus begin_kv_transfer_to_device() { return {}; }
+    virtual DeviceStatus wait_kv_transfer() { return {}; }
+    virtual DeviceStatus copy_bytes_to_host_async(const DeviceTensor &x,
+                                                  void *host,
+                                                  uint64_t byte_offset,
+                                                  uint64_t byte_count) {
+        return copy_bytes_to_host(x, host, byte_offset, byte_count);
+    }
+
     virtual DeviceStatus copy_bytes_from_host(DeviceTensor &x,
                                               uint64_t byte_offset,
                                               const void *host,
                                               uint64_t byte_count) {
         (void)x; (void)byte_offset; (void)host; (void)byte_count;
         return {false, "copy_bytes_from_host not implemented for this backend"};
+    }
+
+    virtual DeviceStatus copy_bytes_from_host_async(DeviceTensor &x,
+                                                    uint64_t byte_offset,
+                                                    const void *host,
+                                                    uint64_t byte_count) {
+        return copy_bytes_from_host(x, byte_offset, host, byte_count);
     }
 
     // Device-to-device copy: dst[0..count) = src[src_offset..src_offset+count).
