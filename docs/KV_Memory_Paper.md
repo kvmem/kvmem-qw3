@@ -345,16 +345,28 @@ CPU/NVMe copy in the true-position frame, avoiding long-run accumulation from
 repeated window-frame spills. Stage-in then starts from this canonical frame and
 normal window assembly re-RoPEs to the selected window slot.
 
+CPU-tier backing is allocated through `DeviceBackend::host_buffer`; the CUDA
+backend uses `cudaHostAlloc`, so CPU slots are pinned and can feed H2D tier
+stage-in directly without an extra heap staging copy. NVMe blocks still read
+through per-block host staging buffers whose lifetime covers the queued H2D
+copy.
+
+Tier transfer uses a dedicated backend KV copy stream. D2H stage-out records an
+event on the execution stream before copying so GPU writes are visible; H2D
+stage-in queues K/V page copies on the copy stream and waits before window
+assembly. Reselection now has a split `prepare` / `finish` form: `prepare`
+computes the plan and starts CPU/NVMe→GPU prefetch, while `finish` waits,
+assembles the window, and spills deselected blocks. In the MTP speculative path,
+when a committed step triggers reselection, the runtime starts KVMem prefetch
+before rebuilding the accepted MTP prefix and finishes the reselect immediately
+after that prefix work, before any target attention can read the KVMem window.
+This gives the copy stream a compute window without changing rollback or
+selection semantics.
+
 `QW3_KVMEM_TIER_TRACE=1` emits diagnostic `stage_out`, `cpu_evict`,
 `canonicalize`, and `stage_in` lines. The model-gated E2E runner uses this to
 assert that tiered sparse runs actually exercise GPU→CPU/NVMe stage-out and
 CPU/NVMe→GPU stage-in.
-
-The copy path is still synchronous. Future prefetch work should use an async
-copy stream plus pinned CPU buffers and should be MTP-aware: MTP verification
-does more per-step layer work by validating multiple drafted tokens, giving a
-larger compute window in which CPU/NVMe stage-in can overlap with verifier
-attention/FFN work.
 
 ---
 
@@ -531,9 +543,10 @@ Complete: #37 block store, #38 re-RoPE kernel + math, #39 page-index assembly +
 byte-lossless, #40 cumulative-attention selection (window-local retention),
 #43 CPU pinned tier skeleton, #48/#49 global content-frame KV retrieval
 (resurrection of dropped blocks), CPU/NVMe stage-out/stage-in with canonical
-tier backing, and model-gated tier E2E coverage. Pending: bounded GPU physical
-page pool, prefill-time offload, async copy/NVMe prefetch overlap, true pinned
-host buffers, and KVMem-aware continuous+MTP batching.
+tier backing, backend-managed pinned host buffers, copy-stream stage-in/out,
+MTP-aware reselect prefetch overlap, and model-gated tier E2E coverage. Pending:
+bounded GPU physical page pool, prefill-time offload, async NVMe I/O, q8/fp8
+tier payload support, and KVMem-aware continuous+MTP batching.
 
 Known limitations of the current retrieval signal (future work): (1) the mean
 key over a 128-token block dilutes a short codeword, so smaller `--kvmem-block-tokens`
