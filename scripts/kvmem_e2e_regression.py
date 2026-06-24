@@ -214,6 +214,17 @@ def compare_identity(results: List[CaseResult],
     return None
 
 
+def tier_args(args: argparse.Namespace) -> List[str]:
+    out: List[str] = []
+    if args.kvmem_cpu_bytes > 0:
+        out.extend(["--kvmem-cpu-bytes", str(args.kvmem_cpu_bytes)])
+    if args.kvmem_nvme_dir:
+        out.extend(["--kvmem-nvme-dir", args.kvmem_nvme_dir])
+    if args.kvmem_nvme_bytes > 0:
+        out.extend(["--kvmem-nvme-bytes", str(args.kvmem_nvme_bytes)])
+    return out
+
+
 def run_continuous_case(name: str,
                         qw3: Path,
                         model: Path,
@@ -223,7 +234,8 @@ def run_continuous_case(name: str,
                         timeout_s: int,
                         extra_args: Sequence[str],
                         expect_success: bool,
-                        expect_error_substring: Optional[str] = None) -> CaseResult:
+                        expect_error_substring: Optional[str] = None,
+                        extra_env: Optional[Dict[str, str]] = None) -> CaseResult:
     host = "127.0.0.1"
     port = find_free_port()
     cmd = [
@@ -247,6 +259,8 @@ def run_continuous_case(name: str,
     cmd.extend(extra_args)
     env = os.environ.copy()
     env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
+    if extra_env:
+        env.update(extra_env)
     start = time.monotonic()
     proc = subprocess.Popen(
         cmd,
@@ -328,6 +342,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="skip single-request KVMem + MTP check",
     )
+    ap.add_argument(
+        "--kvmem-cpu-bytes",
+        type=int,
+        default=0,
+        help="optional CPU tier byte budget passed to all KVMem cases",
+    )
+    ap.add_argument(
+        "--kvmem-nvme-dir",
+        default="",
+        help="optional NVMe tier directory passed to all KVMem cases",
+    )
+    ap.add_argument(
+        "--kvmem-nvme-bytes",
+        type=int,
+        default=0,
+        help="optional NVMe tier byte budget passed to all KVMem cases",
+    )
     args = ap.parse_args(argv)
 
     qw3 = Path(args.qw3)
@@ -339,6 +370,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     results: List[CaseResult] = []
     failures: List[str] = []
+    tier = tier_args(args)
+    tier_env = {"QW3_KVMEM_TIER_TRACE": "1"} if tier else None
 
     prompt = identity_prompt()
     results.append(run_cli(
@@ -364,7 +397,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "--kvmem-block-tokens", "16",
             "--kvmem-budget", "4096",
             "--kvmem-method", "recency",
-        ],
+        ] + tier,
+        tier_env,
     ))
     results.append(run_cli(
         "kvmem_identity_step",
@@ -380,7 +414,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "--kvmem-budget", "4096",
             "--kvmem-method", "recency",
             "--kvmem-update-mode", "step",
-        ],
+        ] + tier,
+        tier_env,
     ))
 
     for lhs, rhs in [
@@ -406,7 +441,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "--kvmem-block-tokens", "16",
             "--kvmem-budget", "4096",
             "--kvmem-method", "recency",
-        ],
+        ] + tier,
+        tier_env,
     ))
     results.append(run_cli(
         "kvmem_codeword_sparse",
@@ -423,7 +459,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "--kvmem-sink-blocks", "1",
             "--kvmem-recent-blocks", "1",
             "--kvmem-method", "recency",
-        ],
+        ] + tier,
+        tier_env,
     ))
     by_name = {r.name: r for r in results}
     full = by_name["kvmem_codeword_full"]
@@ -434,6 +471,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         failures.append("tight sparse KVMem output matched full-window output")
     elif SECRET not in full.stdout:
         failures.append(f"full-window codeword output did not contain {SECRET}")
+    if tier and "[kvmem-tier] stage_out" not in sparse.stderr:
+        failures.append("tiered sparse KVMem did not emit stage_out trace")
+
+    if tier:
+        results.append(run_cli(
+            "kvmem_retrieval_stagein",
+            qw3,
+            model,
+            sparse_prompt,
+            codeword_max_tokens,
+            max(args.ctx, 2048),
+            args.timeout,
+            [
+                "--kvmem",
+                "--kvmem-block-tokens", "16",
+                "--kvmem-budget", "64",
+                "--kvmem-sink-blocks", "1",
+                "--kvmem-recent-blocks", "1",
+                "--kvmem-method", "retrieval",
+                "--kvmem-interval", "1",
+            ] + tier,
+            tier_env,
+        ))
+        stagein = results[-1]
+        if not stagein.ok:
+            failures.append("tiered retrieval stage-in command failed")
+        elif "[kvmem-tier] stage_in" not in stagein.stderr:
+            failures.append("tiered retrieval KVMem did not emit stage_in trace")
 
     if not args.skip_mtp:
         results.append(run_cli(
@@ -451,7 +516,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "--kvmem-method", "recency",
                 "--native-mtp-speculate",
                 "--mtp-chain", "2",
-            ],
+            ] + tier,
+            tier_env,
         ))
         if not results[-1].ok:
             failures.append("single-request KVMem + MTP command failed")
@@ -469,8 +535,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.max_tokens,
             args.ctx,
             args.timeout,
-            [],
+            tier,
             expect_success=True,
+            extra_env=tier_env,
         ))
         if not results[-1].ok:
             failures.append("KVMem continuous-batching request failed")
@@ -483,9 +550,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.max_tokens,
             args.ctx,
             args.timeout,
-            ["--mtp-chain", "2"],
+            ["--mtp-chain", "2"] + tier,
             expect_success=False,
             expect_error_substring="cannot be combined with MTP",
+            extra_env=tier_env,
         ))
         if not results[-1].ok:
             failures.append("KVMem + continuous + MTP hard-error guard failed")

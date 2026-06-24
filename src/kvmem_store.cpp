@@ -68,6 +68,11 @@ void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
     }
 }
 
+void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {
+    if (block_id >= block_count()) return;
+    blocks_[block_id].baked_pos = baked_pos;
+}
+
 std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;

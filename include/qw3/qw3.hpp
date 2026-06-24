@@ -71,6 +71,9 @@ struct EngineOptions {
     double kvmem_gpu_memory_ratio = 0.50;
     double kvmem_gpu_high_watermark = 0.95;
     double kvmem_gpu_low_watermark = 0.85;
+    uint64_t kvmem_cpu_bytes = 0;
+    uint64_t kvmem_nvme_bytes = 0;
+    std::string kvmem_nvme_dir;
 };
 
 struct GenerationOptions {

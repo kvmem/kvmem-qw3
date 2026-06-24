@@ -117,6 +117,15 @@ public:
         erase_lru(block_id);
     }
 
+    void clear() {
+        free_slots_.clear();
+        for (uint32_t i = 0; i < slot_count_; ++i) {
+            free_slots_.push_back(static_cast<int32_t>(slot_count_ - 1U - i));
+        }
+        block_to_slot_.clear();
+        lru_.clear();
+    }
+
     void touch(uint32_t block_id) {
         erase_lru(block_id);
         lru_.push_back(block_id);

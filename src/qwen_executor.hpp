@@ -4,6 +4,8 @@
 #include "qwen_weights.hpp"
 #include "qw3/device_backend.hpp"
 #include "qw3/kvmem_store.hpp"
+#include "qw3/nvme_kv_tier.hpp"
+#include "qw3/pinned_kv_tier.hpp"
 
 #include <cstdio>
 #include <memory>
@@ -470,7 +472,10 @@ private:
     std::vector<int32_t> window_pages_host_;
     std::unique_ptr<DeviceTensor> window_pages_device_;
     uint32_t window_page_count_ = 0;
-    std::vector<std::vector<uint8_t>> kvmem_cpu_spill_;
+    std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
+    std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
+    std::vector<uint8_t> kvmem_cpu_bytes_;
+    std::vector<uint8_t> kvmem_stage_buffer_;
     // Attention query position within the assembled window (== sum of selected
     // block token counts at assembly; grows by 1 per decoded token appended at
     // the window tail). Equals position_ under identity (all-block) selection.
@@ -481,6 +486,8 @@ private:
     void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
     bool kvmem_block_pages_resident(const KvMemBlock &block) const;
     uint64_t kvmem_kv_page_bytes() const;
+    uint64_t kvmem_block_spill_bytes(const KvMemBlock &block) const;
+    void kvmem_canonicalize_block_for_tier(uint32_t block_id);
     void kvmem_copy_block_to_host(const KvMemBlock &block,
                                   std::vector<uint8_t> &dst);
     void kvmem_copy_block_from_host(const KvMemBlock &block,

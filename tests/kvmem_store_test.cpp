@@ -215,6 +215,10 @@ static void test_tier_metadata() {
     CHECK(s.blocks()[1].tier == KvTier::SSD);
     CHECK(s.blocks()[1].cpu_slot == -1);
     CHECK(s.blocks()[1].nvme_slot == 3);
+    s.set_block_baked_pos(1, 128);
+    CHECK(s.blocks()[1].baked_pos == 128);
+    s.set_block_baked_pos(1, 0);
+    CHECK(s.blocks()[1].baked_pos == 0);
 }
 
 int main() {

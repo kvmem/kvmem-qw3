@@ -39,6 +39,11 @@ hard-error guard for KVMem + continuous batching + MTP. Set
 `SKIP_KVMEM_E2E=1` to skip it in smoke runs when only the model-free CTest suite
 is desired.
 
+The runner also accepts `--kvmem-cpu-bytes`, `--kvmem-nvme-dir`, and
+`--kvmem-nvme-bytes`. When these are set, it enables `QW3_KVMEM_TIER_TRACE=1`
+and adds a retrieval-stage-in case; the run fails unless sparse KVMem emits
+stage-out activity and retrieval emits stage-in activity.
+
 ## Efficiency
 
 - `long_prompt_sweep.py` vs llama.cpp (default + paged KV)

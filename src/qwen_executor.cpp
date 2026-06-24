@@ -10,6 +10,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace qw3 {
 namespace {
@@ -43,6 +44,10 @@ bool full_executor_trace_enabled() {
 
 bool paged_kv_prefill_for_local_cache_enabled() {
     return env_flag_enabled("QW3_PAGED_KV_PREFILL", true);
+}
+
+bool kvmem_tier_trace_enabled() {
+    return env_flag_enabled("QW3_KVMEM_TIER_TRACE");
 }
 
 bool mtp_prefix_batch_enabled() {
@@ -299,7 +304,9 @@ void QwenExecutor::reset_state() {
     window_pages_host_.clear();
     window_page_count_ = 0;
     window_query_pos_ = 0;
-    kvmem_cpu_spill_.clear();
+    if (kvmem_cpu_tier_) kvmem_cpu_tier_->clear();
+    if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
+    kvmem_stage_buffer_.clear();
     // Cumulative-attention selection signal: drop the live interval; buffers stay
     // allocated (reused next session). bs_score_layer_ is model-fixed, keep it.
     bs_score_ready_ = false;
@@ -2221,7 +2228,32 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     window_pages_host_.clear();
     window_page_count_ = 0;
     window_query_pos_ = 0;
-    kvmem_cpu_spill_.clear();
+    kvmem_cpu_tier_.reset();
+    kvmem_nvme_tier_.reset();
+    kvmem_cpu_bytes_.clear();
+    kvmem_stage_buffer_.clear();
+    if (effective.cpu_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
+        PinnedKvTierConfig pcfg;
+        pcfg.total_bytes = effective.cpu_tier_bytes;
+        pcfg.slot_bytes = effective.estimated_block_bytes;
+        kvmem_cpu_tier_ = std::make_unique<PinnedKvTier>(pcfg);
+        if (kvmem_cpu_tier_->enabled()) {
+            kvmem_cpu_bytes_.resize(
+                static_cast<uint64_t>(kvmem_cpu_tier_->slot_count()) *
+                pcfg.slot_bytes);
+        }
+    }
+    if (effective.nvme_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
+        if (effective.nvme_tier_dir.empty()) {
+            throw std::runtime_error(
+                "--kvmem-nvme-bytes requires --kvmem-nvme-dir");
+        }
+        NvmeKvTierConfig ncfg;
+        ncfg.dir = effective.nvme_tier_dir;
+        ncfg.total_bytes = effective.nvme_tier_bytes;
+        ncfg.slot_bytes = effective.estimated_block_bytes;
+        kvmem_nvme_tier_ = std::make_unique<NvmeKvTier>(std::move(ncfg));
+    }
     bs_score_ready_ = false;
     bs_window_blocks_ = 0;
     bs_window_block_ids_.clear();
@@ -2282,6 +2314,54 @@ bool QwenExecutor::kvmem_block_pages_resident(const KvMemBlock &block) const {
     return true;
 }
 
+uint64_t QwenExecutor::kvmem_block_spill_bytes(const KvMemBlock &block) const {
+    if (block.n_tokens == 0) return 0;
+    const QwenConfig &cfg = model_.config();
+    const uint64_t page_bytes = kvmem_kv_page_bytes();
+    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t first_page = block.orig_pos_start / page_size;
+    const uint32_t last_page =
+        (block.orig_pos_start + block.n_tokens - 1) / page_size;
+    const uint32_t n_pages = last_page - first_page + 1;
+    return page_bytes * n_pages *
+           count_standard_attention_layers(cfg, weights_.n_layers()) * 2ull;
+}
+
+void QwenExecutor::kvmem_canonicalize_block_for_tier(uint32_t block_id) {
+    if (!block_store_) return;
+    const auto &blocks = block_store_->blocks();
+    if (block_id >= blocks.size()) return;
+    const KvMemBlock &block = blocks[block_id];
+    if (block.n_tokens == 0) return;
+    if (!kvmem_block_pages_resident(block)) {
+        throw std::runtime_error(
+            "KVMem canonicalize requested for a non-resident block");
+    }
+    const int64_t canonical = static_cast<int64_t>(block.orig_pos_start);
+    if (block.baked_pos == canonical) return;
+    const int64_t from = block.baked_pos;
+
+    const QwenConfig &cfg = model_.config();
+    const uint32_t per_pos =
+        static_cast<uint32_t>(cfg.n_kv_heads) * cfg.head_dim;
+    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+        if (!cfg.is_standard_attention_layer(il)) continue;
+        DeviceTensor &kc = k_cache(il);
+        require_status(backend_.rope_block_remap_paged_device(
+            kc, block.n_tokens, cfg.n_kv_heads, per_pos, cfg.head_dim,
+            cfg.rope_dim, /*win_base=*/block.orig_pos_start,
+            /*from_base=*/static_cast<int32_t>(from),
+            /*to_base=*/static_cast<int32_t>(block.orig_pos_start),
+            kv_page_indices_device(), kv_pages_.page_size, cfg.rope_theta));
+    }
+    block_store_->set_block_baked_pos(block_id, canonical);
+    if (kvmem_tier_trace_enabled()) {
+        std::fprintf(stderr,
+                     "[kvmem-tier] canonicalize block=%u from=%lld to=%u\n",
+                     block_id, static_cast<long long>(from), block.orig_pos_start);
+    }
+}
+
 void QwenExecutor::kvmem_copy_block_to_host(const KvMemBlock &block,
                                             std::vector<uint8_t> &dst) {
     if (block.n_tokens == 0) {
@@ -2293,11 +2373,10 @@ void QwenExecutor::kvmem_copy_block_to_host(const KvMemBlock &block,
     const uint32_t page_size = kv_pages_.page_size;
     const uint32_t first_page = block.orig_pos_start / page_size;
     const uint32_t last_page = (block.orig_pos_start + block.n_tokens - 1) / page_size;
-    const uint32_t n_pages = last_page - first_page + 1;
     const uint64_t per_pos =
         static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
     dst.clear();
-    dst.resize(page_bytes * n_pages * count_standard_attention_layers(cfg, weights_.n_layers()) * 2ull);
+    dst.resize(kvmem_block_spill_bytes(block));
     uint8_t *out = dst.data();
     for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
         if (!cfg.is_standard_attention_layer(il)) continue;
@@ -2330,10 +2409,8 @@ void QwenExecutor::kvmem_copy_block_from_host(
     const uint32_t page_size = kv_pages_.page_size;
     const uint32_t first_page = block.orig_pos_start / page_size;
     const uint32_t last_page = (block.orig_pos_start + block.n_tokens - 1) / page_size;
-    const uint32_t n_pages = last_page - first_page + 1;
-    const uint64_t expected =
-        page_bytes * n_pages * count_standard_attention_layers(cfg, weights_.n_layers()) * 2ull;
-    if (src.size() != expected) {
+    const uint64_t expected = kvmem_block_spill_bytes(block);
+    if (src.size() < expected) {
         throw std::runtime_error("KVMem CPU stage-in found wrong spill buffer size");
     }
     const uint64_t per_pos =
@@ -2365,19 +2442,34 @@ void QwenExecutor::kvmem_copy_block_from_host(
 void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
     if (!block_store_) return;
     const auto &blocks = block_store_->blocks();
-    if (kvmem_cpu_spill_.size() < blocks.size()) {
-        kvmem_cpu_spill_.resize(blocks.size());
-    }
     for (const KvMemRemap &rm : plan.remaps) {
         const KvMemBlock &block = blocks[rm.block_id];
         if (kvmem_block_pages_resident(block)) {
             block_store_->set_block_tier(rm.block_id, KvTier::GPU);
             continue;
         }
-        if (rm.block_id >= kvmem_cpu_spill_.size() ||
-            kvmem_cpu_spill_[rm.block_id].empty()) {
+        const uint64_t bytes = kvmem_block_spill_bytes(block);
+        kvmem_stage_buffer_.resize(bytes);
+        if (block.tier == KvTier::CPU) {
+            if (!kvmem_cpu_tier_) {
+                throw std::runtime_error("KVMem CPU stage-in has no CPU tier");
+            }
+            const int32_t slot = kvmem_cpu_tier_->block_slot(rm.block_id);
+            if (slot < 0) {
+                throw std::runtime_error("KVMem CPU stage-in missing CPU slot");
+            }
+            const uint64_t offset = kvmem_cpu_tier_->slot_offset(slot);
+            std::memcpy(kvmem_stage_buffer_.data(),
+                        kvmem_cpu_bytes_.data() + offset,
+                        static_cast<size_t>(bytes));
+        } else if (block.tier == KvTier::SSD) {
+            if (!kvmem_nvme_tier_) {
+                throw std::runtime_error("KVMem NVMe stage-in has no NVMe tier");
+            }
+            kvmem_nvme_tier_->read_block(rm.block_id, kvmem_stage_buffer_.data(), bytes);
+        } else {
             throw std::runtime_error(
-                "KVMem stage-in requested a block without CPU spill data");
+                "KVMem stage-in requested a non-resident block with no backing tier");
         }
         const uint32_t page_size = kv_pages_.page_size;
         const uint32_t first_page = block.orig_pos_start / page_size;
@@ -2386,30 +2478,99 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
         for (uint32_t lp = first_page; lp <= last_page; ++lp) {
             (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
         }
-        kvmem_copy_block_from_host(block, kvmem_cpu_spill_[rm.block_id]);
+        kvmem_copy_block_from_host(block, kvmem_stage_buffer_);
+        if (kvmem_tier_trace_enabled()) {
+            std::fprintf(stderr,
+                         "[kvmem-tier] stage_in block=%u from=%s bytes=%llu\n",
+                         rm.block_id,
+                         block.tier == KvTier::CPU ? "cpu" : "nvme",
+                         static_cast<unsigned long long>(bytes));
+        }
+        if (block.tier == KvTier::CPU && kvmem_cpu_tier_) {
+            kvmem_cpu_tier_->release_block(rm.block_id);
+        } else if (block.tier == KvTier::SSD && kvmem_nvme_tier_) {
+            kvmem_nvme_tier_->release_block(rm.block_id);
+        }
         block_store_->set_block_tier(rm.block_id, KvTier::GPU);
     }
 }
 
 void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
     if (!block_store_ || block_ids.empty()) return;
+    if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) return;
     const auto &blocks = block_store_->blocks();
-    if (kvmem_cpu_spill_.size() < blocks.size()) {
-        kvmem_cpu_spill_.resize(blocks.size());
-    }
     for (uint32_t block_id : block_ids) {
         if (block_id >= blocks.size()) continue;
         const KvMemBlock &block = blocks[block_id];
         if (!kvmem_block_pages_resident(block)) continue;
-        kvmem_copy_block_to_host(block, kvmem_cpu_spill_[block_id]);
+        kvmem_canonicalize_block_for_tier(block_id);
+        kvmem_copy_block_to_host(block, kvmem_stage_buffer_);
+        bool placed = false;
+        int32_t cpu_slot = -1;
+        int32_t nvme_slot = -1;
+        if (kvmem_cpu_tier_) {
+            PinnedSlotPlacement placement;
+            if (kvmem_nvme_tier_) {
+                placement = kvmem_cpu_tier_->place_block_evicting(block_id);
+            } else {
+                placement = kvmem_cpu_tier_->place_block(block_id);
+            }
+            if (placement.slot >= 0) {
+                if (placement.evicted_block >= 0) {
+                    const uint32_t victim =
+                        static_cast<uint32_t>(placement.evicted_block);
+                    const uint64_t victim_bytes =
+                        kvmem_block_spill_bytes(blocks[victim]);
+                    const uint64_t victim_offset =
+                        kvmem_cpu_tier_->slot_offset(placement.slot);
+                    kvmem_nvme_tier_->write_block(
+                        victim, kvmem_cpu_bytes_.data() + victim_offset,
+                        victim_bytes);
+                    if (kvmem_tier_trace_enabled()) {
+                        std::fprintf(stderr,
+                                     "[kvmem-tier] cpu_evict block=%u to=nvme slot=%d bytes=%llu\n",
+                                     victim, kvmem_nvme_tier_->block_slot(victim),
+                                     static_cast<unsigned long long>(victim_bytes));
+                    }
+                    block_store_->set_block_tier(
+                        victim, KvTier::SSD, -1,
+                        kvmem_nvme_tier_->block_slot(victim));
+                }
+                const uint64_t offset = kvmem_cpu_tier_->slot_offset(placement.slot);
+                if (offset + kvmem_stage_buffer_.size() > kvmem_cpu_bytes_.size()) {
+                    throw std::runtime_error("KVMem CPU tier slot write out of range");
+                }
+                std::memcpy(kvmem_cpu_bytes_.data() + offset,
+                            kvmem_stage_buffer_.data(),
+                            kvmem_stage_buffer_.size());
+                placed = true;
+                cpu_slot = placement.slot;
+            }
+        } else if (kvmem_nvme_tier_) {
+            kvmem_nvme_tier_->write_block(
+                block_id, kvmem_stage_buffer_.data(),
+                kvmem_stage_buffer_.size());
+            placed = true;
+            nvme_slot = kvmem_nvme_tier_->block_slot(block_id);
+        }
+        if (!placed) continue;
         const uint32_t page_size = kv_pages_.page_size;
         const uint32_t first_page = block.orig_pos_start / page_size;
         const uint32_t last_page =
             (block.orig_pos_start + block.n_tokens - 1) / page_size;
         kv_pages_.release_logical_pages(backend_, first_page,
                                         last_page - first_page + 1);
-        block_store_->set_block_tier(block_id, KvTier::CPU,
-                                     static_cast<int32_t>(block_id), -1);
+        block_store_->set_block_tier(
+            block_id, cpu_slot >= 0 ? KvTier::CPU : KvTier::SSD,
+            cpu_slot, nvme_slot);
+        if (kvmem_tier_trace_enabled()) {
+            std::fprintf(stderr,
+                         "[kvmem-tier] stage_out block=%u to=%s slot=%d bytes=%llu pages=%u\n",
+                         block_id, cpu_slot >= 0 ? "cpu" : "nvme",
+                         cpu_slot >= 0 ? cpu_slot : nvme_slot,
+                         static_cast<unsigned long long>(kvmem_stage_buffer_.size()),
+                         last_page - first_page + 1);
+        }
     }
 }
 

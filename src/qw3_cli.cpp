@@ -105,6 +105,10 @@ void usage(std::ostream &os) {
         "                        Default: 0.50.\n"
         "  --kvmem-gpu-high-watermark F Spill threshold for future tiering. Default: 0.95.\n"
         "  --kvmem-gpu-low-watermark F  Evict target for future tiering. Default: 0.85.\n"
+        "  --kvmem-cpu-bytes N   CPU tier byte budget for offloaded KV blocks.\n"
+        "                        0 disables runtime page release. Default: 0.\n"
+        "  --kvmem-nvme-dir DIR  Directory for KVMem NVMe backing file.\n"
+        "  --kvmem-nvme-bytes N  NVMe tier byte budget. Requires --kvmem-nvme-dir.\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
@@ -308,6 +312,12 @@ int main(int argc, char **argv) {
                 engine.kvmem_gpu_high_watermark = parse_float(need(arg), arg);
             } else if (arg == "--kvmem-gpu-low-watermark") {
                 engine.kvmem_gpu_low_watermark = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-cpu-bytes") {
+                engine.kvmem_cpu_bytes = parse_u64(need(arg), arg);
+            } else if (arg == "--kvmem-nvme-dir") {
+                engine.kvmem_nvme_dir = need(arg);
+            } else if (arg == "--kvmem-nvme-bytes") {
+                engine.kvmem_nvme_bytes = parse_u64(need(arg), arg);
             } else if (arg == "--verbose") {
                 engine.verbose = true;
             } else if (arg == "-p" || arg == "--prompt") {

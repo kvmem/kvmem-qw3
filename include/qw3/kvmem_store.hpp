@@ -23,6 +23,7 @@
 // same selected block IDs); the per-layer dimension is reserved for later.
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace qw3 {
@@ -131,6 +132,9 @@ struct KvMemStoreConfig {
     double gpu_low_watermark = 0.85;
     uint32_t estimated_gpu_block_capacity = 0;
     uint64_t estimated_block_bytes = 0;
+    uint64_t cpu_tier_bytes = 0;
+    uint64_t nvme_tier_bytes = 0;
+    std::string nvme_tier_dir;
 };
 
 class KvMemStore {
@@ -175,6 +179,7 @@ public:
     void set_block_tier(uint32_t block_id, KvTier tier,
                         int32_t cpu_slot = -1,
                         int32_t nvme_slot = -1);
+    void set_block_baked_pos(uint32_t block_id, int64_t baked_pos);
 
     // Diff `selected_ids` against current GPU residency / working-set state and produce the
     // stage-in/out lists + the window remap plan. Each remap de-rotates from the

@@ -322,19 +322,39 @@ window page table, and the live score interval. Device buffers (`bs_kbar_`,
 `bs_score_accum_`, `bs_win_base_dev_`, `bs_blk_tokens_dev_`) stay allocated and
 grow lazily by block capacity. `bs_score_layer_` is model-fixed and kept.
 
-### Tiering (skeleton only — #41 pending)
+### Tiering
 
-`PinnedKvTier` (`include/qw3/pinned_kv_tier.hpp`) is a pure-host page-locked slot
-allocator: a fixed-count slab (LIFO free list mirroring `GlobalKvPagePool`), a
-`block_id ↔ slot` residency map, and LRU victim ordering. It owns no GPU memory
-and issues no copies — the CUDA backend is meant to supply the `cudaHostAlloc`'d
-buffer and perform D2H/H2D over a copy stream. v1 never evicts (returns slot=-1
-when full); the eviction hook is reserved for the NVMe tier. Unit-tested in
-`tests/pinned_kv_tier_test.cpp`.
+`PinnedKvTier` (`include/qw3/pinned_kv_tier.hpp`) is a host slot allocator: a
+fixed-count slab, a `block_id ↔ slot` residency map, LRU victim ordering, and
+explicit eviction/release hooks. `NvmeKvTier`
+(`include/qw3/nvme_kv_tier.hpp`) owns a raw backing file with the same fixed-slot
+residency model.
 
-The actual GPU→CPU→NVMe spill/stage primitives, the copy-stream overlap, and the
-cross-layer prefetch pipeline are **not yet implemented** (task #41). Today
-everything is resident on GPU and "selection" is intra-GPU sparsification.
+When `--kvmem-cpu-bytes` is positive, `QwenExecutor` stages unselected
+GPU-resident blocks out of the KV cache into the CPU tier and marks their
+logical pages non-resident. If CPU slots are full and `--kvmem-nvme-dir` /
+`--kvmem-nvme-bytes` are configured, the CPU LRU block is written to NVMe before
+the slot is reused. When a selected block is not GPU-resident, it is read back
+from CPU or NVMe, assigned fresh GPU physical pages for its original logical
+range, copied into the KV cache, then assembled into the active window.
+
+Tier backing is canonicalized for accuracy: before a GPU-resident block is
+copied to CPU/NVMe, K is re-RoPE'd back from its current `baked_pos` to
+`orig_pos_start`. V is position-invariant and is copied as-is. This keeps the
+CPU/NVMe copy in the true-position frame, avoiding long-run accumulation from
+repeated window-frame spills. Stage-in then starts from this canonical frame and
+normal window assembly re-RoPEs to the selected window slot.
+
+`QW3_KVMEM_TIER_TRACE=1` emits diagnostic `stage_out`, `cpu_evict`,
+`canonicalize`, and `stage_in` lines. The model-gated E2E runner uses this to
+assert that tiered sparse runs actually exercise GPU→CPU/NVMe stage-out and
+CPU/NVMe→GPU stage-in.
+
+The copy path is still synchronous. Future prefetch work should use an async
+copy stream plus pinned CPU buffers and should be MTP-aware: MTP verification
+does more per-step layer work by validating multiple drafted tokens, giving a
+larger compute window in which CPU/NVMe stage-in can overlap with verifier
+attention/FFN work.
 
 ---
 
@@ -356,6 +376,9 @@ everything is resident on GPU and "selection" is intra-GPU sparsification.
 --kvmem-gpu-memory-ratio F  Fraction of total GPU memory used to estimate KVMem KV cap. Default 0.50.
 --kvmem-gpu-high-watermark F  Future spill threshold for GPU-resident blocks. Default 0.95.
 --kvmem-gpu-low-watermark F   Future eviction target after spill. Default 0.85.
+--kvmem-cpu-bytes N         CPU tier byte budget. 0 disables runtime page release. Default 0.
+--kvmem-nvme-dir DIR        NVMe backing-file directory.
+--kvmem-nvme-bytes N        NVMe tier byte budget. Requires --kvmem-nvme-dir.
 ```
 
 `--kvmem-method` picks what ranks the middle (non-sink/recent) blocks each
@@ -407,16 +430,26 @@ estimated_gpu_blocks =
 ```
 
 When the backend can report total device memory, `select_budget` is clipped to
-this estimated block capacity. CPU/NVMe tiering will reuse the same estimate as
-the global GPU repository cap and apply the high/low watermarks for spill and
-eviction.
+this estimated block capacity. CPU/NVMe tier slot sizing uses the same block-byte
+estimate.
 
-Pending with #41: `--kv-store-cpu-bytes`, `--kv-store-ssd-dir`,
-`--kv-store-ssd-bytes` (CPU pinned + NVMe tier budgets).
+Runtime tier budgets:
+
+```
+--kvmem-cpu-bytes N
+--kvmem-nvme-dir DIR
+--kvmem-nvme-bytes N
+```
+
+`--kvmem-cpu-bytes=0` leaves runtime page release disabled: KVMem still runs a
+sparse window, but cold blocks remain GPU-resident. Setting a positive CPU
+budget enables GPU->CPU stage-out for unselected blocks. If the CPU tier is full
+and NVMe is configured, the CPU LRU block is synchronously written to the NVMe
+backing file before the slot is reused.
 
 ### Tiering implementation status
 
-The current implementation has the following tiering foundations in place:
+The current implementation has the following tiering pieces in place:
 
 - `PinnedKvTier` tracks CPU pinned slots, block residency, LRU order, explicit
   LRU eviction, and slot reuse.
@@ -425,16 +458,25 @@ The current implementation has the following tiering foundations in place:
 - `DeviceBackend` exposes raw byte D2H/H2D copy hooks so executor code can move
   KV payloads without depending on the KV dtype.
 - `KvMemBlock` carries CPU/NVMe slot handles plus in-flight and dirty flags.
+- `QwenExecutor` can copy unselected blocks from GPU KV pages into the CPU tier,
+  release their logical pages as non-resident (`page=-1`), spill evicted CPU
+  slots to NVMe, and stage selected CPU/NVMe blocks back into newly allocated
+  GPU pages before window assembly.
+- `QW3_KVMEM_TIER_TRACE=1` emits diagnostic `stage_out`, `cpu_evict`, and
+  `stage_in` lines. The model-gated E2E runner uses this to assert that tiered
+  sparse runs actually exercise GPU->CPU/NVMe stage-out and CPU/NVMe->GPU
+  stage-in.
 
-One architectural constraint remains before enabling default runtime GPU memory
-release: the current executor allocates each standard-attention layer's KV cache
-tensor for the full `ctx_size` physical page capacity. Therefore, copying a
-block to CPU/NVMe and marking it cold does not by itself reduce GPU memory
-unless the page table and KV tensor allocation are changed so logical context
-capacity and GPU physical page capacity are independent. The next runtime
-tiering step is to introduce a bounded GPU physical page pool for KVMem, allow
-logical pages to be non-resident, and stage selected logical blocks back into
-available physical pages before window assembly.
+Two architectural constraints remain:
+
+- Runtime release is opt-in through `--kvmem-cpu-bytes`. The default preserves
+  the original sparse-window behavior without releasing GPU pages.
+- In the non-continuous single-request path, each standard-attention layer's KV
+  tensor is still allocated for the full `ctx_size` physical page capacity.
+  Therefore CPU/NVMe stage-out reduces active GPU page residency and enables the
+  logical/non-resident state machine, but it does not yet reduce the initial
+  CUDA KV tensor allocation. The next step is a bounded KVMem GPU physical page
+  pool whose capacity is independent from logical context length.
 
 Internal diagnostic (default off, env-gated): `QW3_KVMEM_TRACE=1`
 prints the top attention-heat blocks of each interval.
@@ -480,16 +522,18 @@ Kernel-level gold standards: `tests/rope_remap_parity.cu`,
 | Backend interface (virtuals + defaults) | `include/qw3/device_backend.hpp` |
 | Backend wiring (config, register, reselect cadence) | `src/qwen_native_backend.cpp` |
 | CLI flags | `src/qw3_cli.cpp`, `include/qw3/qw3.hpp` |
-| CPU pinned tier skeleton (host) | `include/qw3/pinned_kv_tier.hpp` |
+| CPU/NVMe tier allocators | `include/qw3/pinned_kv_tier.hpp`, `include/qw3/nvme_kv_tier.hpp` |
+| Runtime tier stage-in/out + canonicalization | `src/qwen_executor.cpp` (`kvmem_stage_in`, `kvmem_stage_out`, `kvmem_canonicalize_block_for_tier`) |
 
 ## Status
 
 Complete: #37 block store, #38 re-RoPE kernel + math, #39 page-index assembly +
 byte-lossless, #40 cumulative-attention selection (window-local retention),
 #43 CPU pinned tier skeleton, #48/#49 global content-frame KV retrieval
-(resurrection of dropped blocks). Pending: #41 three-tier GPU/CPU/NVMe storage
-(spill/stage + prefetch overlap), #42 the remaining tier CLI flags + regression
-guard.
+(resurrection of dropped blocks), CPU/NVMe stage-out/stage-in with canonical
+tier backing, and model-gated tier E2E coverage. Pending: bounded GPU physical
+page pool, prefill-time offload, async copy/NVMe prefetch overlap, true pinned
+host buffers, and KVMem-aware continuous+MTP batching.
 
 Known limitations of the current retrieval signal (future work): (1) the mean
 key over a 128-token block dilutes a short codeword, so smaller `--kvmem-block-tokens`
