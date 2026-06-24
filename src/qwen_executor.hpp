@@ -495,6 +495,9 @@ private:
                                   std::vector<uint8_t> &dst);
     void kvmem_copy_block_from_host(const KvMemBlock &block,
                                     const std::vector<uint8_t> &src);
+    void kvmem_copy_block_from_host(const KvMemBlock &block,
+                                    const void *src,
+                                    uint64_t bytes);
     void sync_window_pages_device(uint32_t have_pages);
     // Grow the window page table by the trailing physical page so a decode
     // token can be appended at window slot window_query_pos_.

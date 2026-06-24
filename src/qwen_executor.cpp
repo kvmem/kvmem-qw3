@@ -2422,6 +2422,11 @@ void QwenExecutor::kvmem_copy_block_to_host(const KvMemBlock &block,
 
 void QwenExecutor::kvmem_copy_block_from_host(
         const KvMemBlock &block, const std::vector<uint8_t> &src) {
+    kvmem_copy_block_from_host(block, src.data(), src.size());
+}
+
+void QwenExecutor::kvmem_copy_block_from_host(
+        const KvMemBlock &block, const void *src, uint64_t src_bytes) {
     if (block.n_tokens == 0) return;
     const QwenConfig &cfg = model_.config();
     const uint64_t page_bytes = kvmem_kv_page_bytes();
@@ -2429,12 +2434,15 @@ void QwenExecutor::kvmem_copy_block_from_host(
     const uint32_t first_page = block.orig_pos_start / page_size;
     const uint32_t last_page = (block.orig_pos_start + block.n_tokens - 1) / page_size;
     const uint64_t expected = kvmem_block_spill_bytes(block);
-    if (src.size() < expected) {
+    if (src_bytes < expected) {
         throw std::runtime_error("KVMem CPU stage-in found wrong spill buffer size");
+    }
+    if (!src) {
+        throw std::runtime_error("KVMem CPU stage-in found null spill buffer");
     }
     const uint64_t per_pos =
         static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
-    const uint8_t *in = src.data();
+    const uint8_t *in = static_cast<const uint8_t *>(src);
     for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
         if (!cfg.is_standard_attention_layer(il)) continue;
         DeviceTensor &kc = k_cache(il);
@@ -2464,6 +2472,7 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
     if (!block_store_) return;
     const auto &blocks = block_store_->blocks();
     bool queued_h2d = false;
+    std::vector<std::vector<uint8_t>> nvme_stage_buffers;
     require_status(backend_.begin_kv_transfer_to_device());
     for (const KvMemRemap &rm : plan.remaps) {
         const KvMemBlock &block = blocks[rm.block_id];
@@ -2472,7 +2481,8 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
             continue;
         }
         const uint64_t bytes = kvmem_block_spill_bytes(block);
-        kvmem_stage_buffer_.resize(bytes);
+        const void *stage_src = nullptr;
+        uint64_t stage_bytes = bytes;
         if (block.tier == KvTier::CPU) {
             if (!kvmem_cpu_tier_) {
                 throw std::runtime_error("KVMem CPU stage-in has no CPU tier");
@@ -2485,14 +2495,19 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
                 throw std::runtime_error("KVMem CPU stage-in missing CPU slot");
             }
             const uint64_t offset = kvmem_cpu_tier_->slot_offset(slot);
-            std::memcpy(kvmem_stage_buffer_.data(),
-                        kvmem_cpu_data() + offset,
-                        static_cast<size_t>(bytes));
+            if (offset + bytes > kvmem_cpu_bytes()) {
+                throw std::runtime_error("KVMem CPU tier slot read out of range");
+            }
+            stage_src = kvmem_cpu_data() + offset;
         } else if (block.tier == KvTier::SSD) {
             if (!kvmem_nvme_tier_) {
                 throw std::runtime_error("KVMem NVMe stage-in has no NVMe tier");
             }
-            kvmem_nvme_tier_->read_block(rm.block_id, kvmem_stage_buffer_.data(), bytes);
+            nvme_stage_buffers.emplace_back();
+            std::vector<uint8_t> &buf = nvme_stage_buffers.back();
+            buf.resize(bytes);
+            kvmem_nvme_tier_->read_block(rm.block_id, buf.data(), bytes);
+            stage_src = buf.data();
         } else {
             throw std::runtime_error(
                 "KVMem stage-in requested a non-resident block with no backing tier");
@@ -2504,7 +2519,7 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
         for (uint32_t lp = first_page; lp <= last_page; ++lp) {
             (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
         }
-        kvmem_copy_block_from_host(block, kvmem_stage_buffer_);
+        kvmem_copy_block_from_host(block, stage_src, stage_bytes);
         queued_h2d = true;
         if (kvmem_tier_trace_enabled()) {
             std::fprintf(stderr,
