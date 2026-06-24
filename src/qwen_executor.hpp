@@ -3,7 +3,9 @@
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
 #include "qw3/device_backend.hpp"
+#include "qw3/kvmem_store.hpp"
 
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,6 +46,17 @@ public:
         uint32_t position = 0;
         uint32_t kv_logical_pages = 0;
         uint32_t mtp_prefix_len = 0;
+        // kvmem window state: when kvmem is active the assembled window advances
+        // in lockstep with position_ as decode/verify tokens append at the
+        // window tail. A snapshot/restore (MTP rollback) must round-trip the
+        // window query position and page-table length so a rejected verify
+        // batch leaves the window exactly where it was before the batch. Under
+        // identity (all-fit) selection window_query_pos == position and these
+        // are consistent with the position restore; under non-kvmem decode they
+        // are zero/false and restore is a no-op.
+        bool kvmem_active = false;
+        uint32_t window_query_pos = 0;
+        uint32_t window_page_count = 0;
         std::unique_ptr<DeviceTensor> h;
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
         std::vector<std::unique_ptr<DeviceTensor>> conv_states;
@@ -56,6 +69,15 @@ public:
         uint32_t checkpoint_stride = 0;
         uint32_t checkpoint_row = 0;
         uint32_t h_checkpoint_row = 0;
+        // kvmem window state at the verify batch's base. When the batch ran in a
+        // window frame (kvmem_active_), restore_state_checkpoint(index) must roll
+        // the window tail back to base + (index+1), exactly mirroring how it
+        // rolls position_ back. The verify batch only ever GREW the window at the
+        // tail (no mid-batch re-RoPE), so truncating window_pages_host_/_count_
+        // and resetting window_query_pos_ is sufficient — no device re-upload.
+        bool kvmem_active = false;
+        uint32_t window_base_query_pos = 0;
+        uint32_t window_base_page_count = 0;
         std::unique_ptr<DeviceTensor> h;
         std::shared_ptr<DeviceTensor> h_shared;
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
@@ -232,6 +254,34 @@ public:
     // forward_one_token has not been called yet.
     bool copy_last_logits(std::vector<float> &out) const;
 
+    // ---- Block-sparse KV attention (single-session, opt-in) ---------------
+    // Master switch. When false (default) the forward path is byte-identical
+    // to the pre-block-sparse code: no KvMemStore, no window page table, no
+    // re-RoPE. Set once at session start from the CLI flag.
+    void set_kvmem_enabled(bool on) { kvmem_enabled_ = on; }
+    bool kvmem_enabled() const { return kvmem_enabled_; }
+    void configure_kvmem(const KvMemStoreConfig &cfg);
+
+    // Register newly-appended context tokens with the block store (called after
+    // prefill / each committed decode token grows the context). No-op when
+    // block-sparse is disabled.
+    void kvmem_register_append(uint32_t n_new_tokens);
+
+    // Re-select the working set from the built-in cumulative-attention top-k
+    // and assemble it: re-RoPE each moved block in place (per attention layer)
+    // and install the window page table + window query position used by the
+    // next decode steps. No-op when disabled. Returns the number of blocks in
+    // the assembled window (0 when disabled).
+    uint32_t kvmem_reselect();
+
+    // Install an explicit block-ID selection instead of the built-in top-k
+    // (the external-selector hook; also used by tests to force a fixed set,
+    // e.g. the identity all-blocks selection that must reproduce the plain
+    // path byte-for-byte). Assembles the same way as kvmem_reselect.
+    uint32_t kvmem_set_selection(const std::vector<uint32_t> &block_ids);
+
+    const KvMemStore *block_store() const { return block_store_.get(); }
+
 private:
     struct KvPageTable {
         uint32_t page_size = 16;
@@ -398,6 +448,130 @@ private:
     uint32_t position_ = 0;
     int      prefill_chunk_override_ = -1;
     KvPageTable kv_pages_;
+
+    // ---- Block-sparse KV attention state (inert unless enabled) -----------
+    // All zero/null when kvmem_enabled_ is false, so the forward path
+    // takes the identical pre-block-sparse branches.
+    bool kvmem_enabled_ = false;
+    // True once a selection has been assembled this session; gates the decode
+    // window substitution. Cleared by reset_state().
+    bool kvmem_active_ = false;
+    std::unique_ptr<KvMemStore> block_store_;
+    // Window page table: the selected blocks' ORIGINAL physical pages, in
+    // ascending (window) order. No-copy — these alias kv_pages_ slots; the
+    // window is a reordering of pointers, re-RoPE rebakes K in place. Borrowed,
+    // never released by this table.
+    std::vector<int32_t> window_pages_host_;
+    std::unique_ptr<DeviceTensor> window_pages_device_;
+    uint32_t window_page_count_ = 0;
+    // Attention query position within the assembled window (== sum of selected
+    // block token counts at assembly; grows by 1 per decoded token appended at
+    // the window tail). Equals position_ under identity (all-block) selection.
+    uint32_t window_query_pos_ = 0;
+    // Assemble window_pages_* + per-layer re-RoPE from a finished selection plan.
+    void kvmem_assemble(const KvMemPlan &plan);
+    void sync_window_pages_device(uint32_t have_pages);
+    // Grow the window page table by the trailing physical page so a decode
+    // token can be appended at window slot window_query_pos_.
+    void kvmem_extend_window_for_decode();
+    // Batched analogue: grow the window so `n` tokens can be appended starting
+    // at window slot window_query_pos_ (used by the window-aware batched verify
+    // in forward_n_tokens).
+    void kvmem_extend_window_for_decode_n(uint32_t n);
+
+    // ---- Cumulative-attention selection signal (#40, low-intrusion) -------
+    // Per-window-block representative K (mean baked K) + a GPU-resident
+    // per-block score accumulator. Each decode step a single kernel scores the
+    // current Q against every window block's k̄ and atomic-adds into the
+    // accumulator (no D2H). At the reselect boundary the accumulator is drained
+    // to host and folded into KvMemStore::attn_score so pick_topk_blocks
+    // ranks by attention heat instead of recency alone. All inert (and no extra
+    // kernels) unless kvmem_active_ and a representative layer exists.
+    void kvmem_recompute_kbar();        // after assembly: rebuild k̄ + reset accum
+    void kvmem_score_current_step(uint32_t layer_index, float scale);
+    void kvmem_drain_scores();           // accum -> KvMemStore::accumulate_attn
+    int32_t bs_score_layer_ = -1;               // representative standard-attn layer (-1 none)
+    uint32_t bs_window_blocks_ = 0;             // blocks in the current window
+    bool bs_score_ready_ = false;               // accumulator holds a live interval
+    std::vector<uint32_t> bs_window_block_ids_; // window slot w -> block_id (for drain)
+    std::vector<int32_t> bs_win_base_host_;     // window slot w -> first window pos
+    std::vector<int32_t> bs_blk_tokens_host_;   // window slot w -> token count
+    std::unique_ptr<DeviceTensor> bs_kbar_;            // [blocks, n_kv_heads, head_dim] fp32
+    std::unique_ptr<DeviceTensor> bs_score_accum_;     // [blocks] fp32
+    std::unique_ptr<DeviceTensor> bs_win_base_dev_;    // [blocks] int32
+    std::unique_ptr<DeviceTensor> bs_blk_tokens_dev_;  // [blocks] int32
+    uint32_t bs_kbar_capacity_ = 0;             // allocated block capacity
+
+    // ---- Global content-frame KV retrieval (#48/#49) ----------------------
+    // The window-local signal above can only RETAIN blocks already inside the
+    // active window. This maintains a position-invariant CONTENT mean-Key for
+    // every historical (prefill) block and, each retrieval interval, scores ALL
+    // of them by similarity to the de-RoPE'd current query — so a block dropped
+    // from the window can be RESURRECTED when it matches the query. The index is
+    // built ONCE from the pristine post-prefill cache (blocks baked at true
+    // positions) and is immutable thereafter (content is position-invariant).
+    // When the index is live, global retrieval scores OVERWRITE the window-local
+    // heat via set_attn_scores; a quantized (q8/fp8) cache that can't be
+    // de-RoPE'd falls back to the window-local signal.
+    void kvmem_build_content_index();         // once, from pristine cache
+    void kvmem_snapshot_content_query(uint32_t layer_index);  // per step
+    bool kvmem_retrieval_score();              // interval -> set_attn_scores
+    bool g_content_ready_ = false;                    // g_kbar_ holds the index
+    bool g_query_ready_ = false;                       // g_query_content_ is live
+    uint32_t g_indexed_blocks_ = 0;                    // blocks covered by the index
+    uint32_t g_kbar_global_capacity_ = 0;              // allocated block capacity
+    std::vector<int32_t> g_orig_base_host_;            // block_id -> true first pos
+    std::vector<int32_t> g_blk_tokens_host_;           // block_id -> token count
+    std::unique_ptr<DeviceTensor> g_kbar_;             // [blocks, n_kv_heads, head_dim] fp32, by block_id
+    std::unique_ptr<DeviceTensor> g_score_dev_;        // [blocks] fp32
+    std::unique_ptr<DeviceTensor> g_query_content_;    // [n_heads, head_dim] fp32 (content frame)
+    std::unique_ptr<DeviceTensor> g_orig_base_dev_;    // [blocks] int32
+    std::unique_ptr<DeviceTensor> g_blk_tokens_dev_;   // [blocks] int32
+
+    // ---- KVMem attention-distribution diagnostics -------------------------
+    // Enabled only when QW3_KVMEM_ATTN_TRACE points at a JSONL output path.
+    // Recomputes true decode softmax attention at sampled token positions and
+    // aggregates mass by selected KVMem block for every standard-attention layer.
+    bool kvmem_attn_trace_enabled() const;
+    bool kvmem_attn_trace_sample_now() const;
+    void kvmem_trace_attention_layer(uint32_t layer_index,
+                                     const DeviceTensor &k_cache,
+                                     const DeviceTensor &q,
+                                     uint32_t q_stride,
+                                     const DeviceTensor &page_indices,
+                                     uint32_t n_pages,
+                                     uint32_t seq_len,
+                                     float scale);
+    std::FILE *kvmem_attn_trace_file_ = nullptr;
+    uint64_t kvmem_attn_trace_seen_tokens_ = 0;
+    uint64_t kvmem_attn_trace_sample_ = 0;
+    uint32_t kvmem_attn_trace_mass_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> kvmem_attn_trace_mass_;
+
+    // ---- Global attention-distribution diagnostics ------------------------
+    // Enabled when QW3_ATTN_TRACE points at a JSONL output path. Unlike the
+    // kvmem trace above, this does not require kvmem and groups the currently
+    // visible logical KV sequence into fixed-size blocks.
+    bool global_attn_trace_enabled() const;
+    bool global_attn_trace_sample_now() const;
+    void global_trace_attention_layer(uint32_t layer_index,
+                                      const DeviceTensor &k_cache,
+                                      const DeviceTensor &q,
+                                      uint32_t q_stride,
+                                      const DeviceTensor &page_indices,
+                                      uint32_t n_pages,
+                                      uint32_t seq_len,
+                                      float scale);
+    std::FILE *global_attn_trace_file_ = nullptr;
+    uint64_t global_attn_trace_seen_tokens_ = 0;
+    uint64_t global_attn_trace_sample_ = 0;
+    uint32_t global_attn_trace_block_tokens_ = 0;
+    uint32_t global_attn_trace_block_capacity_ = 0;
+    std::vector<int32_t> global_attn_trace_base_host_;
+    std::vector<int32_t> global_attn_trace_tokens_host_;
+    std::unique_ptr<DeviceTensor> global_attn_trace_base_dev_;
+    std::unique_ptr<DeviceTensor> global_attn_trace_tokens_dev_;
+    std::unique_ptr<DeviceTensor> global_attn_trace_mass_;
 
     // Set by reset_state() and cleared after the first eager forward_one_token
     // call of a generate() session. Suppresses CUDA-graph capture on token 0

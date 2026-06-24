@@ -30,6 +30,8 @@ class BenchMode:
 class MtpBenchRun:
     mode: str
     concurrency: int
+    max_active: int
+    paged_kv: bool
     elapsed_s: float
     request_wall_s: float
     output_tokens: int
@@ -79,7 +81,11 @@ def make_command(binary: Path,
                  prefill_chunk: int,
                  chain: int,
                  kv_dtype: str,
-                 max_active: int) -> list[str]:
+                 max_active: int,
+                 *,
+                 paged_kv: bool = False,
+                 body_batch: bool = False,
+                 kv_pool_pages: Optional[int] = None) -> list[str]:
     cmd = [
         str(binary),
         "serve",
@@ -100,8 +106,14 @@ def make_command(binary: Path,
         "--kv-dtype",
         kv_dtype,
     ]
+    if kv_pool_pages is not None:
+        cmd.extend(["--kv-pool-pages", str(kv_pool_pages)])
     if mode.continuous:
         cmd.extend(["--continuous-batching", "--max-active", str(max_active)])
+    if paged_kv:
+        cmd.append("--paged-kv")
+    if body_batch:
+        cmd.append("--body-batch")
     if mode.mtp:
         cmd.extend(["--mtp-chain", str(chain)])
     return cmd
@@ -123,6 +135,86 @@ def synthetic_prompts(concurrency: int, repeat: int) -> dict[str, str]:
     }
 
 
+def parse_mtp_summaries(log: str) -> list[mcr.MtpSummary]:
+    return [
+        mcr.MtpSummary(
+            enabled=m.group("enabled") == "true",
+            batches=int(m.group("batches")),
+            drafted=int(m.group("drafted")),
+            accepted=int(m.group("accepted")),
+            rejected=int(m.group("rejected")),
+            rollbacks=int(m.group("rollbacks")),
+            acceptance=float(m.group("acceptance")),
+            batched_verify_batches=int(m.group("batched_verify_batches")),
+            batched_verify_tokens=int(m.group("batched_verify_tokens")),
+        )
+        for m in mcr.MTP_SPEC_RE.finditer(log)
+    ]
+
+
+def build_run_result(*,
+                     mode: BenchMode,
+                     concurrency: int,
+                     max_active: int,
+                     paged_kv: bool,
+                     elapsed_s: float,
+                     request_wall_s: float,
+                     requests: list[cbb.BenchRequest],
+                     log: str,
+                     command: list[str]) -> MtpBenchRun:
+    output_tokens = sum(r.completion_tokens for r in requests if r.ok)
+    latencies = [r.elapsed_s for r in requests if r.ok]
+    summaries = parse_mtp_summaries(log)
+    return MtpBenchRun(
+        mode=mode.name,
+        concurrency=concurrency,
+        max_active=max_active,
+        paged_kv=paged_kv,
+        elapsed_s=elapsed_s,
+        request_wall_s=request_wall_s,
+        output_tokens=output_tokens,
+        output_tokens_per_s=(
+            output_tokens / request_wall_s if request_wall_s > 0.0 else 0.0
+        ),
+        mean_latency_s=statistics.fmean(latencies) if latencies else 0.0,
+        p50_latency_s=percentile(latencies, 0.50),
+        p90_latency_s=percentile(latencies, 0.90),
+        requests=requests,
+        mtp_summaries=summaries,
+        continuous_mtp_count=log.count("native continuous_mtp:"),
+        route_continuous_count=log.count("route=continuous"),
+        command=command,
+        log=log,
+    )
+
+
+def send_concurrent_requests(*,
+                             base_url: str,
+                             concurrency: int,
+                             prompt_repeat: int,
+                             max_tokens: int,
+                             timeout_s: int) -> tuple[float, list[cbb.BenchRequest]]:
+    prompts = synthetic_prompts(concurrency, prompt_repeat)
+    request_start = time.monotonic()
+    requests: list[cbb.BenchRequest] = []
+    with futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futs = [
+            pool.submit(
+                cbb.post_completion,
+                base_url,
+                name,
+                prompt,
+                max_tokens,
+                True,
+                float(timeout_s),
+            )
+            for name, prompt in prompts.items()
+        ]
+        for fut in futs:
+            requests.append(fut.result())
+    return time.monotonic() - request_start, requests
+
+
 def run_case(*,
              mode: BenchMode,
              binary: Path,
@@ -138,82 +230,153 @@ def run_case(*,
              kv_dtype: str,
              timeout_s: int,
              max_active: int,
-             extra_env: Dict[str, str]) -> MtpBenchRun:
+             extra_env: Dict[str, str],
+             paged_kv: bool = False,
+             body_batch: bool = False,
+             kv_pool_pages: Optional[int] = None) -> MtpBenchRun:
+    effective_max_active = max(max_active, concurrency)
     cmd = make_command(
         binary, model, host, port, mode, max_tokens, ctx_size, prefill_chunk,
-        chain, kv_dtype, max(max_active, concurrency))
+        chain, kv_dtype, effective_max_active,
+        paged_kv=paged_kv, body_batch=body_batch, kv_pool_pages=kv_pool_pages)
     proc = subprocess.Popen(
         cmd,
-        env=make_env(mode, max(max_active, concurrency), extra_env),
+        env=make_env(mode, effective_max_active, extra_env),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     log_chunks, log_threads = cbb.start_log_drain(proc)
     base_url = f"http://{host}:{port}"
-    prompts = synthetic_prompts(concurrency, prompt_repeat)
     start = time.monotonic()
     requests: list[cbb.BenchRequest] = []
     request_wall_s = 0.0
     log = ""
     try:
         cbr.wait_for_health(base_url, timeout_s=min(120.0, float(timeout_s)))
-        request_start = time.monotonic()
-        with futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futs = [
-                pool.submit(
-                    cbb.post_completion,
-                    base_url,
-                    name,
-                    prompt,
-                    max_tokens,
-                    True,
-                    float(timeout_s),
-                )
-                for name, prompt in prompts.items()
-            ]
-            for fut in futs:
-                requests.append(fut.result())
-        request_wall_s = time.monotonic() - request_start
+        request_wall_s, requests = send_concurrent_requests(
+            base_url=base_url,
+            concurrency=concurrency,
+            prompt_repeat=prompt_repeat,
+            max_tokens=max_tokens,
+            timeout_s=timeout_s,
+        )
     finally:
         log = cbb.terminate_drained_server(proc, log_chunks, log_threads)
 
-    elapsed_s = time.monotonic() - start
-    output_tokens = sum(r.completion_tokens for r in requests if r.ok)
-    latencies = [r.elapsed_s for r in requests if r.ok]
-    summaries = [
-        mcr.MtpSummary(
-            enabled=m.group("enabled") == "true",
-            batches=int(m.group("batches")),
-            drafted=int(m.group("drafted")),
-            accepted=int(m.group("accepted")),
-            rejected=int(m.group("rejected")),
-            rollbacks=int(m.group("rollbacks")),
-            acceptance=float(m.group("acceptance")),
-            batched_verify_batches=int(m.group("batched_verify_batches")),
-            batched_verify_tokens=int(m.group("batched_verify_tokens")),
-        )
-        for m in mcr.MTP_SPEC_RE.finditer(log)
-    ]
-    return MtpBenchRun(
-        mode=mode.name,
+    return build_run_result(
+        mode=mode,
         concurrency=concurrency,
-        elapsed_s=elapsed_s,
+        max_active=effective_max_active,
+        paged_kv=paged_kv,
+        elapsed_s=time.monotonic() - start,
         request_wall_s=request_wall_s,
-        output_tokens=output_tokens,
-        output_tokens_per_s=(
-            output_tokens / request_wall_s if request_wall_s > 0.0 else 0.0
-        ),
-        mean_latency_s=statistics.fmean(latencies) if latencies else 0.0,
-        p50_latency_s=percentile(latencies, 0.50),
-        p90_latency_s=percentile(latencies, 0.90),
         requests=requests,
-        mtp_summaries=summaries,
-        continuous_mtp_count=log.count("native continuous_mtp:"),
-        route_continuous_count=log.count("route=continuous"),
-        command=cmd,
         log=log,
+        command=cmd,
     )
+
+
+def run_reused_server_sweep(*,
+                            mode: BenchMode,
+                            binary: Path,
+                            model: Path,
+                            host: str,
+                            port: int,
+                            concurrency_levels: Sequence[int],
+                            prompt_repeat: int,
+                            max_tokens: int,
+                            ctx_size: int,
+                            prefill_chunk: int,
+                            chain: int,
+                            kv_dtype: str,
+                            timeout_s: int,
+                            max_active: int,
+                            extra_env: Dict[str, str],
+                            paged_kv: bool = False,
+                            body_batch: bool = False,
+                            kv_pool_pages: Optional[int] = None) -> list[MtpBenchRun]:
+    effective_max_active = max(max_active, max(concurrency_levels, default=1))
+    cmd = make_command(
+        binary, model, host, port, mode, max_tokens, ctx_size, prefill_chunk,
+        chain, kv_dtype, effective_max_active,
+        paged_kv=paged_kv, body_batch=body_batch, kv_pool_pages=kv_pool_pages)
+    proc = subprocess.Popen(
+        cmd,
+        env=make_env(mode, effective_max_active, extra_env),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    log_chunks, log_threads = cbb.start_log_drain(proc)
+    base_url = f"http://{host}:{port}"
+    runs: list[MtpBenchRun] = []
+    try:
+        cbr.wait_for_health(base_url, timeout_s=min(120.0, float(timeout_s)))
+        for concurrency in concurrency_levels:
+            log_before = len(log_chunks)
+            sweep_start = time.monotonic()
+            request_wall_s, requests = send_concurrent_requests(
+                base_url=base_url,
+                concurrency=concurrency,
+                prompt_repeat=prompt_repeat,
+                max_tokens=max_tokens,
+                timeout_s=timeout_s,
+            )
+            log_slice = "".join(log_chunks[log_before:])
+            runs.append(build_run_result(
+                mode=mode,
+                concurrency=concurrency,
+                max_active=effective_max_active,
+                paged_kv=paged_kv,
+                elapsed_s=time.monotonic() - sweep_start,
+                request_wall_s=request_wall_s,
+                requests=requests,
+                log=log_slice,
+                command=cmd,
+            ))
+    finally:
+        cbb.terminate_drained_server(proc, log_chunks, log_threads)
+    return runs
+
+
+def print_run_line(run: MtpBenchRun, paged_kv: bool) -> None:
+    accepted = sum(s.accepted for s in run.mtp_summaries)
+    drafted = sum(s.drafted for s in run.mtp_summaries)
+    batched_verify = sum(s.batched_verify_batches for s in run.mtp_summaries)
+    print(
+        f"{run.mode:15s} conc={run.concurrency:2d} "
+        f"max_active={run.max_active:2d} "
+        f"paged_kv={str(paged_kv):5s} "
+        f"wall={run.request_wall_s:.3f}s "
+        f"out_tok/s={run.output_tokens_per_s:.2f} "
+        f"tokens={run.output_tokens} "
+        f"mean={run.mean_latency_s:.3f}s "
+        f"mtp_accept={accepted}/{drafted} "
+        f"batched_verify={batched_verify} "
+        f"continuous_mtp={run.continuous_mtp_count}",
+        flush=True,
+    )
+
+
+def record_failure(failures: list[str],
+                   run: MtpBenchRun,
+                   paged_kv: bool) -> None:
+    failed = [r for r in run.requests if not r.ok]
+    if failed:
+        failures.append(
+            f"{run.mode} concurrency={run.concurrency} "
+            f"max_active={run.max_active} paged_kv={paged_kv} "
+            f"failed={len(failed)}"
+        )
+
+
+def concurrency_levels_for(max_active: int,
+                           args_concurrency: Sequence[int],
+                           up_to_max_active: bool) -> list[int]:
+    if up_to_max_active:
+        return list(range(1, max_active + 1))
+    return [c for c in args_concurrency if c <= max_active]
 
 
 def parse_env(raw: Sequence[str]) -> Dict[str, str]:
@@ -263,6 +426,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--kv-dtype", default="fp8", choices=("fp16", "fp8", "q8", "fp32"))
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--max-active", type=int, default=4)
+    ap.add_argument(
+        "--max-active-levels",
+        type=cbb.parse_int_list,
+        default=None,
+        help="Sweep max-active for continuous modes (e.g. '1 2 4'). "
+        "Legacy modes run once regardless.",
+    )
+    ap.add_argument("--paged-kv", action="store_true")
+    ap.add_argument("--body-batch", action="store_true")
+    ap.add_argument("--kv-pool-pages", type=int, default=None)
+    ap.add_argument(
+        "--concurrency-up-to-max-active",
+        action="store_true",
+        help="For each max-active, sweep concurrency from 1 through max-active.",
+    )
+    ap.add_argument(
+        "--reuse-server",
+        action="store_true",
+        help="Reuse one server per max-active while sweeping concurrency.",
+    )
     ap.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     args = ap.parse_args(argv)
 
@@ -275,50 +458,78 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     port = args.port if args.port else cbr.free_port()
     extra_env = parse_env(args.env)
 
+    max_active_levels = args.max_active_levels or [args.max_active]
+
     runs: list[MtpBenchRun] = []
     failures: list[str] = []
     for mode in modes_for(args.modes):
-        for concurrency in args.concurrency_levels:
-            print(
-                f"running mode={mode.name} concurrency={concurrency} "
-                f"max_tokens={args.max_tokens}",
-                flush=True,
-            )
-            run = run_case(
-                mode=mode,
-                binary=binary,
-                model=model,
-                host=args.host,
-                port=port,
-                concurrency=concurrency,
-                prompt_repeat=args.prompt_repeat,
-                max_tokens=args.max_tokens,
-                ctx_size=args.ctx,
-                prefill_chunk=args.prefill_chunk,
-                chain=args.chain,
-                kv_dtype=args.kv_dtype,
-                timeout_s=args.timeout,
-                max_active=args.max_active,
-                extra_env=extra_env,
-            )
-            runs.append(run)
-            failed = [r for r in run.requests if not r.ok]
-            if failed:
-                failures.append(f"{mode.name} concurrency={concurrency} failed={len(failed)}")
-            accepted = sum(s.accepted for s in run.mtp_summaries)
-            drafted = sum(s.drafted for s in run.mtp_summaries)
-            batched_verify = sum(s.batched_verify_batches for s in run.mtp_summaries)
-            print(
-                f"{mode.name:15s} conc={concurrency:2d} "
-                f"wall={run.request_wall_s:.3f}s "
-                f"out_tok/s={run.output_tokens_per_s:.2f} "
-                f"tokens={run.output_tokens} "
-                f"mean={run.mean_latency_s:.3f}s "
-                f"mtp_accept={accepted}/{drafted} "
-                f"batched_verify={batched_verify} "
-                f"continuous_mtp={run.continuous_mtp_count}",
-                flush=True,
-            )
+        active_levels = max_active_levels if mode.continuous else [args.max_active]
+        for max_active in active_levels:
+            conc_levels = concurrency_levels_for(
+                max_active, args.concurrency_levels, args.concurrency_up_to_max_active)
+            if not conc_levels:
+                continue
+            if args.reuse_server and mode.continuous:
+                print(
+                    f"running mode={mode.name} max_active={max_active} "
+                    f"concurrency={conc_levels} paged_kv={args.paged_kv}",
+                    flush=True,
+                )
+                batch = run_reused_server_sweep(
+                    mode=mode,
+                    binary=binary,
+                    model=model,
+                    host=args.host,
+                    port=port,
+                    concurrency_levels=conc_levels,
+                    prompt_repeat=args.prompt_repeat,
+                    max_tokens=args.max_tokens,
+                    ctx_size=args.ctx,
+                    prefill_chunk=args.prefill_chunk,
+                    chain=args.chain,
+                    kv_dtype=args.kv_dtype,
+                    timeout_s=args.timeout,
+                    max_active=max_active,
+                    extra_env=extra_env,
+                    paged_kv=args.paged_kv,
+                    body_batch=args.body_batch,
+                    kv_pool_pages=args.kv_pool_pages,
+                )
+                for run in batch:
+                    runs.append(run)
+                    record_failure(failures, run, args.paged_kv)
+                    print_run_line(run, args.paged_kv)
+                continue
+            for concurrency in conc_levels:
+                print(
+                    f"running mode={mode.name} concurrency={concurrency} "
+                    f"max_active={max_active} paged_kv={args.paged_kv} "
+                    f"max_tokens={args.max_tokens}",
+                    flush=True,
+                )
+                run = run_case(
+                    mode=mode,
+                    binary=binary,
+                    model=model,
+                    host=args.host,
+                    port=port,
+                    concurrency=concurrency,
+                    prompt_repeat=args.prompt_repeat,
+                    max_tokens=args.max_tokens,
+                    ctx_size=args.ctx,
+                    prefill_chunk=args.prefill_chunk,
+                    chain=args.chain,
+                    kv_dtype=args.kv_dtype,
+                    timeout_s=args.timeout,
+                    max_active=max_active,
+                    extra_env=extra_env,
+                    paged_kv=args.paged_kv,
+                    body_batch=args.body_batch,
+                    kv_pool_pages=args.kv_pool_pages,
+                )
+                runs.append(run)
+                record_failure(failures, run, args.paged_kv)
+                print_run_line(run, args.paged_kv)
 
     out = {
         "config": vars(args),

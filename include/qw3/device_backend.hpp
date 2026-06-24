@@ -55,10 +55,11 @@ public:
     virtual DeviceStatus end() = 0;
     virtual DeviceStatus synchronize() = 0;
 
-    // Free bytes of device memory available for allocation. Returns 0 when
-    // the backend cannot report this (CPU / mock). Used by the executor to
-    // size prefill chunks so per-prompt scratch fits within available memory.
+    // Free / total bytes of device memory. Return 0 when the backend cannot
+    // report this (CPU / mock). Free bytes are used to size prefill chunks;
+    // total bytes are used for KVMem ratio-based KV residency budgeting.
     virtual uint64_t free_device_bytes() const { return 0; }
+    virtual uint64_t total_device_bytes() const { return 0; }
 
     // CUDA-graph capture hooks. Default impls are no-ops so non-CUDA backends
     // pass through. The intended pattern, used for the per-token decode loop:
@@ -690,6 +691,151 @@ public:
         return {false, "kv_append_batch_paged_device requires backend override"};
     }
 
+    // Block-sparse re-RoPE: re-bake one block's stored K in place, from its
+    // current bake position (from_base) to a new window slot (to_base). The
+    // block occupies logical window positions [win_base..win_base+n_tokens) in
+    // the page table. Operates directly on the paged cache (fp16/fp32) where K
+    // is stored — no copy. De-rotate(from)+re-rotate(to) with the same __sincosf
+    // so the prior bake's range-reduction error cancels (lossless to ~1 ULP).
+    virtual DeviceStatus rope_block_remap_paged_device(
+                                                      DeviceTensor &k_cache,
+                                                      uint32_t n_tokens,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t per_pos_size,
+                                                      uint32_t head_dim,
+                                                      uint32_t rope_dim,
+                                                      uint32_t win_base,
+                                                      int32_t from_base,
+                                                      int32_t to_base,
+                                                      const DeviceTensor &page_indices,
+                                                      uint32_t page_size,
+                                                      float theta) {
+        (void)k_cache; (void)n_tokens; (void)n_kv_heads; (void)per_pos_size;
+        (void)head_dim; (void)rope_dim; (void)win_base; (void)from_base;
+        (void)to_base; (void)page_indices; (void)page_size; (void)theta;
+        return {false, "rope_block_remap_paged_device requires backend override"};
+    }
+
+    // Block-sparse cumulative-attention selection signal (#40). Both are
+    // no-ops on backends without an override (selection falls back to recency).
+    //
+    // block_kmean_paged_device: compute a per-window-block representative K
+    // vector = mean baked K over the block's tokens, for `n_blocks` window
+    // blocks. win_base[w]/blk_tokens[w] (device int32) give each block's window
+    // position range; the window page table addresses physical slots. kbar
+    // output is fp32 [n_blocks, n_kv_heads, head_dim]. Called once per reselect
+    // interval (amortized), not per step.
+    virtual DeviceStatus block_kmean_paged_device(const DeviceTensor &k_cache,
+                                                  DeviceTensor &kbar,
+                                                  uint32_t n_blocks,
+                                                  uint32_t n_kv_heads,
+                                                  uint32_t per_pos_size,
+                                                  uint32_t head_dim,
+                                                  const DeviceTensor &win_base,
+                                                  const DeviceTensor &blk_tokens,
+                                                  const DeviceTensor &page_indices,
+                                                  uint32_t page_size) {
+        (void)k_cache; (void)kbar; (void)n_blocks; (void)n_kv_heads;
+        (void)per_pos_size; (void)head_dim; (void)win_base; (void)blk_tokens;
+        (void)page_indices; (void)page_size;
+        return {false, "block_kmean_paged_device requires backend override"};
+    }
+
+    // block_attn_score_step_device: for the current decode token's RoPE-baked Q
+    // (layout [n_heads, q_stride], head_dim floats read per head), add to each
+    // window block's accumulator slot accum[w] the sum over query heads of
+    // max(0, scale * (q_head . kbar_block[kv_head])). GPU-resident accumulator;
+    // no D2H. Called once per decode step at a single representative layer.
+    virtual DeviceStatus block_attn_score_step_device(DeviceTensor &accum,
+                                                      const DeviceTensor &q,
+                                                      const DeviceTensor &kbar,
+                                                      uint32_t q_stride,
+                                                      uint32_t n_blocks,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t head_dim,
+                                                      float scale) {
+        (void)accum; (void)q; (void)kbar; (void)q_stride; (void)n_blocks;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale;
+        return {false, "block_attn_score_step_device requires backend override"};
+    }
+
+    // Diagnostic-only true attention mass tracing. Recomputes the decode
+    // softmax for one query token over a paged KV cache, then aggregates the
+    // normalized attention weights by kvmem window block. `mass` is fp32
+    // [n_window_blocks + 1], where the last slot is the decode tail after the
+    // last assembled block. The sum of `mass` is n_heads; callers can normalize
+    // by the sum to get a per-layer probability distribution. This is intended
+    // for trace/analysis runs and is not on the default inference path.
+    virtual DeviceStatus block_attention_mass_paged_device(
+                                                      DeviceTensor &mass,
+                                                      const DeviceTensor &q,
+                                                      uint32_t q_stride,
+                                                      const DeviceTensor &k_cache,
+                                                      uint32_t n_window_blocks,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t per_pos_size,
+                                                      uint32_t head_dim,
+                                                      const DeviceTensor &win_base,
+                                                      const DeviceTensor &blk_tokens,
+                                                      const DeviceTensor &page_indices,
+                                                      uint32_t n_pages,
+                                                      uint32_t page_size,
+                                                      uint32_t seq_len,
+                                                      float scale) {
+        (void)mass; (void)q; (void)q_stride; (void)k_cache; (void)n_window_blocks;
+        (void)n_heads; (void)n_kv_heads; (void)per_pos_size; (void)head_dim;
+        (void)win_base; (void)blk_tokens; (void)page_indices; (void)n_pages;
+        (void)page_size; (void)seq_len; (void)scale;
+        return {false, "block_attention_mass_paged_device requires backend override"};
+    }
+
+    // block_kmean_content_paged_device: global content-frame mean-Key index
+    // (#48). Like block_kmean_paged_device, but reads through the FULL repository
+    // page table at each block's TRUE positions and DE-RoPEs every token's K by
+    // (orig_base[w]+tok) before averaging, recovering the position-invariant raw
+    // key. orig_base[w]/blk_tokens[w] (device int32) give each block's true
+    // position range; page_indices is the full repository table. kbar output is
+    // fp32 [n_blocks, n_kv_heads, head_dim] indexed by block_id. Built ONCE from
+    // the pristine post-prefill cache (blocks baked at true positions), immutable
+    // thereafter — never rebuilt as blocks are re-RoPE'd into windows.
+    virtual DeviceStatus block_kmean_content_paged_device(const DeviceTensor &k_cache,
+                                                          DeviceTensor &kbar,
+                                                          uint32_t n_blocks,
+                                                          uint32_t n_kv_heads,
+                                                          uint32_t per_pos_size,
+                                                          uint32_t head_dim,
+                                                          uint32_t rope_dim,
+                                                          const DeviceTensor &orig_base,
+                                                          const DeviceTensor &blk_tokens,
+                                                          const DeviceTensor &page_indices,
+                                                          uint32_t page_size,
+                                                          float theta) {
+        (void)k_cache; (void)kbar; (void)n_blocks; (void)n_kv_heads;
+        (void)per_pos_size; (void)head_dim; (void)rope_dim; (void)orig_base;
+        (void)blk_tokens; (void)page_indices; (void)page_size; (void)theta;
+        return {false, "block_kmean_content_paged_device requires backend override"};
+    }
+
+    // derope_query_device: de-RoPE the current decode token's RoPE-baked Q (baked
+    // at query_pos, layout [n_heads, q_stride] with attn-Q the first head_dim of
+    // each unit) into a contiguous content-frame query [n_heads, head_dim], so it
+    // can be dotted against the content-frame mean keys above. Same de-rotate math
+    // (SAME __sincosf as the bake). Called once per retrieval interval.
+    virtual DeviceStatus derope_query_device(DeviceTensor &q_content,
+                                             const DeviceTensor &q,
+                                             uint32_t q_stride,
+                                             uint32_t n_heads,
+                                             uint32_t head_dim,
+                                             uint32_t rope_dim,
+                                             int32_t query_pos,
+                                             float theta) {
+        (void)q_content; (void)q; (void)q_stride; (void)n_heads; (void)head_dim;
+        (void)rope_dim; (void)query_pos; (void)theta;
+        return {false, "derope_query_device requires backend override"};
+    }
+
     // Cross-request paged KV append. src layout is [batch, src_stride], each
     // row b writes to logical_positions[b] through the page-table slice
     // page_indices[page_indptr[b]..page_indptr[b+1]).
@@ -1029,6 +1175,25 @@ public:
     virtual DeviceStatus copy_to_host(const DeviceTensor &x, float *host, uint64_t offset, uint64_t count) {
         (void)x; (void)host; (void)offset; (void)count;
         return {false, "copy_to_host not implemented for this backend"};
+    }
+
+    // Raw byte copies for tiered KV storage. Offsets/counts are bytes, not
+    // tensor elements, so this can move fp16/fp32/fp8/q8 KV cache payloads
+    // without knowing the dtype at the call site.
+    virtual DeviceStatus copy_bytes_to_host(const DeviceTensor &x,
+                                            void *host,
+                                            uint64_t byte_offset,
+                                            uint64_t byte_count) {
+        (void)x; (void)host; (void)byte_offset; (void)byte_count;
+        return {false, "copy_bytes_to_host not implemented for this backend"};
+    }
+
+    virtual DeviceStatus copy_bytes_from_host(DeviceTensor &x,
+                                              uint64_t byte_offset,
+                                              const void *host,
+                                              uint64_t byte_count) {
+        (void)x; (void)byte_offset; (void)host; (void)byte_count;
+        return {false, "copy_bytes_from_host not implemented for this backend"};
     }
 
     // Device-to-device copy: dst[0..count) = src[src_offset..src_offset+count).

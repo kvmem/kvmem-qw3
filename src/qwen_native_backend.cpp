@@ -1028,6 +1028,7 @@ public:
         const uint32_t ctx_size = options_.ctx_size > 0 ? static_cast<uint32_t>(options_.ctx_size) : 4096u;
         executor_ = std::make_unique<QwenExecutor>(*model_, *weights_, *device_, ctx_size);
         executor_->set_prefill_chunk_override(options_.prefill_chunk);
+        configure_executor_kvmem(*executor_);
         executor_->reset_state();
         if (env_flag_enabled("QW3_CONTINUOUS_BATCHING")) {
             const uint32_t kv_page_size =
@@ -1138,6 +1139,26 @@ public:
         const bool route_continuous =
             effective_options.continuous_batching &&
             (!active_mtp || continuous_batching_mtp_enabled());
+
+        // kvmem × MTP on the continuous-batching path is not yet wired: the CB
+        // decode body batches standard-attention layers across requests with
+        // kernels that read each executor's live page table directly, not the
+        // assembled kvmem window. Combining them there would silently verify
+        // against the wrong KV. Per the locked design decision this is a HARD
+        // ERROR — never a silent fallback to plain decode or a silent MTP
+        // disable. The single-request (non-CB) generate_mtp path IS kvmem-aware
+        // (Phase C): it routes verify through the window-aware forward_one_token
+        // and rolls the window back on rejection, so kvmem + MTP is allowed
+        // there. The user must drop --continuous-batching to combine them.
+        if (options_.kvmem_enabled && active_mtp && route_continuous) {
+            throw std::runtime_error(
+                "kvmem (--kvmem) cannot be combined with MTP speculative "
+                "decode on the continuous-batching path yet: the CB decode "
+                "body is not kvmem-window-aware. Run kvmem + MTP without "
+                "--continuous-batching (single-request path is supported), or "
+                "drop --kvmem / --mtp-chain to use the CB path.");
+        }
+
         if (route_continuous &&
             continuous_batch_request_supported(effective_options, dump.get())) {
             return generate_continuous_batched(prompt_tokens, effective_options, on_text);
@@ -1232,6 +1253,10 @@ private:
         std::vector<uint64_t> held_prefix_entries;
         bool prefix_commit_pending = false;
         uint32_t prefix_commit_len = 0;
+        // kvmem reselect cadence (per-request, mirrors generate_plain's
+        // bs_steps_since_reselect): counts committed decode tokens since the
+        // last window reselection. Unused when --kvmem is off.
+        int kvmem_steps_since_reselect = 0;
     };
 
     struct ContinuousDecodeBatch {
@@ -2250,6 +2275,18 @@ private:
         bool can_use_body_batch(const std::vector<ContinuousBatchActive> &active,
                                 const ContinuousDecodeBatch &batch) const {
             if (!can_use_lm_head_batch(active, batch)) return false;
+            // kvmem sequences must run the per-seq forward_one_token path: the
+            // body-batch executor reads each request's live page table directly
+            // and has no window/re-RoPE branch, so batching a kvmem seq would
+            // attend over the full cache instead of the assembled window. The
+            // delegated + lm_head paths call forward_one_token, which honors the
+            // kvmem window. (Phase D adds a window-aware body batch.)
+            for (size_t batch_i = 0; batch_i < batch.size(); ++batch_i) {
+                const size_t active_index = batch.active_indices[batch_i];
+                if (active_index >= active.size()) return false;
+                const ContinuousBatchActive &a = active[active_index];
+                if (a.executor && a.executor->kvmem_enabled()) return false;
+            }
             const std::string kv_dtype = env_lower_ascii(env_value("QW3_KV_DTYPE"));
             if (!kv_dtype.empty() && kv_dtype != "fp16" && kv_dtype != "fp8") return false;
             for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
@@ -3127,6 +3164,11 @@ private:
     void start_continuous_batch_worker() {
         std::lock_guard<std::mutex> lk(cb_mu_);
         if (cb_running_) return;
+        // A previous worker may have exited on its own (e.g. an unrecoverable
+        // error inside the loop) leaving cb_running_ == false but the thread
+        // object still joinable. Reassigning a joinable std::thread calls
+        // std::terminate, so join the dead worker before spawning a new one.
+        if (cb_worker_.joinable()) cb_worker_.join();
         cb_stop_ = false;
         cb_running_ = true;
         cb_worker_ = std::thread([this]() { continuous_batch_worker_loop(); });
@@ -3136,8 +3178,11 @@ private:
     void stop_continuous_batch_worker() {
         {
             std::lock_guard<std::mutex> lk(cb_mu_);
-            if (!cb_running_) return;
-            cb_stop_ = true;
+            // If the worker self-exited (cb_running_ already false) the thread
+            // object can still be joinable; fall through to join it so the
+            // std::thread destructor never sees a joinable thread (which would
+            // std::terminate). Only skip the stop-signal when still running.
+            if (cb_running_) cb_stop_ = true;
         }
         cb_cv_.notify_all();
         if (cb_worker_.joinable()) cb_worker_.join();
@@ -4971,6 +5016,77 @@ private:
         }
     }
 
+    // Build a KvMemStoreConfig from CLI options and enable kvmem on an
+    // executor. No-op when --kvmem is off, so the forward path stays byte-
+    // identical to plain. Shared by the single-session (generate_plain) and
+    // per-request continuous-batching executors — kvmem state is per-executor,
+    // so each concurrent request maintains its own block table + window with no
+    // cross-request interference.
+    void configure_executor_kvmem(QwenExecutor &exec) const {
+        if (!options_.kvmem_enabled) return;
+        KvMemStoreConfig bs_cfg;
+        bs_cfg.block_tokens =
+            static_cast<uint32_t>(std::max(1, options_.kvmem_block_tokens));
+        bs_cfg.select_budget =
+            static_cast<uint32_t>(std::max(1, options_.kvmem_budget));
+        bs_cfg.sink_blocks =
+            static_cast<uint32_t>(std::max(0, options_.kvmem_sink_blocks));
+        bs_cfg.recent_blocks =
+            static_cast<uint32_t>(std::max(0, options_.kvmem_recent_blocks));
+        bs_cfg.retrieval_blocks =
+            static_cast<uint32_t>(std::max(0, options_.kvmem_retrieval_blocks));
+        bs_cfg.profile_blocks =
+            static_cast<uint32_t>(std::max(0, options_.kvmem_profile_blocks));
+        bs_cfg.gpu_memory_ratio = options_.kvmem_gpu_memory_ratio;
+        bs_cfg.gpu_high_watermark = options_.kvmem_gpu_high_watermark;
+        bs_cfg.gpu_low_watermark = options_.kvmem_gpu_low_watermark;
+        if (options_.kvmem_method == "h2o") {
+            bs_cfg.select_method = KvMemMethod::H2O;
+        } else if (options_.kvmem_method == "recency") {
+            bs_cfg.select_method = KvMemMethod::Recency;
+        } else {
+            bs_cfg.select_method = KvMemMethod::Retrieval;
+        }
+        bs_cfg.select_policy = options_.kvmem_select_policy == "quota"
+            ? KvMemSelectPolicy::Quota
+            : KvMemSelectPolicy::TopK;
+        bs_cfg.retrieval_method = options_.kvmem_retrieval_method == "content_mean"
+            ? KvMemRetrievalMethod::ContentMean
+            : KvMemRetrievalMethod::MeanAttention;
+        bs_cfg.update_mode = options_.kvmem_update_mode == "step"
+            ? KvMemUpdateMode::Step
+            : KvMemUpdateMode::Interval;
+        exec.set_kvmem_enabled(true);
+        exec.configure_kvmem(bs_cfg);
+    }
+
+    // First kvmem working-set build for a CB request, at the prefill->active
+    // transition. Mirrors generate_plain (6293-6297): register the whole
+    // prompt as context blocks then assemble the first window. Under the
+    // default all-fit budget this selects every block (identity) so decode
+    // stays byte-identical to plain. No-op when this request has no kvmem.
+    void kvmem_on_prefill_complete(ContinuousBatchActive &a) {
+        if (!a.executor || !a.executor->kvmem_enabled()) return;
+        a.executor->kvmem_register_append(
+            static_cast<uint32_t>(a.req->prompt_tokens.size()));
+        a.executor->kvmem_reselect();
+        a.kvmem_steps_since_reselect = 0;
+    }
+
+    // Per committed decode token: grow the context by one and reselect on the
+    // interval boundary. Mirrors generate_plain (6362-6368). No-op when this
+    // request has no kvmem.
+    void kvmem_on_decode_step(ContinuousBatchActive &a) {
+        if (!a.executor || !a.executor->kvmem_enabled()) return;
+        a.executor->kvmem_register_append(1);
+        if (options_.kvmem_update_mode == "step") return;
+        const int interval = std::max(1, options_.kvmem_interval);
+        if (++a.kvmem_steps_since_reselect >= interval) {
+            a.executor->kvmem_reselect();
+            a.kvmem_steps_since_reselect = 0;
+        }
+    }
+
     void initialize_continuous_active(
             ContinuousBatchActive &a,
             const std::shared_ptr<ContinuousBatchRequest> &req,
@@ -4982,6 +5098,11 @@ private:
             cb_mtp_kv_pool_.get(), &cb_mtp_kv_cache_view_);
         a.executor->set_prefill_chunk_override(options_.prefill_chunk);
         a.executor->reset_state();
+        // Per-request kvmem: each CB executor gets its own block store + window
+        // when --kvmem is set. The reselect cadence is driven below at the
+        // prefill->active transition (first register + reselect) and per decode
+        // step (continuous_decode_batch_step). No-op when --kvmem is off.
+        configure_executor_kvmem(*a.executor);
         a.seen_tokens.reserve(req->prompt_tokens.size() +
                               static_cast<size_t>(req->options.max_tokens));
         for (uint32_t token : req->prompt_tokens) ++a.seen_tokens[token];
@@ -5117,6 +5238,9 @@ private:
             }
 
             a.decode_start = t1;
+            // kvmem: first working-set build now that the full prompt is
+            // prefilled (identity selection under the default budget).
+            kvmem_on_prefill_complete(a);
             const int32_t seed = step.argmax_token >= 0 ? step.argmax_token : eos;
             a.next_token = budget_apply(
                 a.budget,
@@ -5489,6 +5613,9 @@ private:
             }
 
             a.decode_start = wall_seconds();
+            // kvmem: first working-set build now that the full prompt is
+            // prefilled (identity selection under the default budget).
+            kvmem_on_prefill_complete(a);
             const int32_t seed =
                 out.report.argmax_token >= 0 ? out.report.argmax_token : eos;
             a.next_token = budget_apply(
@@ -5766,6 +5893,9 @@ private:
                 if (!out.ok()) throw std::runtime_error("decode failed");
                 a.decode_ops += step.ops_executed;
                 a.kv_state.update(a.executor->kv_state_snapshot());
+                // kvmem: the token just decoded grew this request's context by
+                // one. Register it and reselect on the interval boundary.
+                kvmem_on_decode_step(a);
                 const int32_t next = step.argmax_token >= 0 ? step.argmax_token : eos;
                 a.next_token = budget_apply(
                     a.budget,
@@ -6265,6 +6395,21 @@ private:
         }
         const double t_prefill_end = wall_seconds();
 
+        // Block-sparse: register the prefilled prompt as context blocks and
+        // assemble the first working set. Under the default all-fit budget this
+        // selects every block (identity), so the decode path stays byte-
+        // identical to plain; once the context exceeds the budget the built-in
+        // top-k starts dropping cold blocks.
+        const bool bs_on = executor_->kvmem_enabled();
+        int bs_steps_since_reselect = 0;
+        const int bs_interval =
+            std::max(1, options_.kvmem_interval);
+        if (bs_on) {
+            executor_->kvmem_register_append(
+                static_cast<uint32_t>(prompt_tokens.size()));
+            executor_->kvmem_reselect();
+        }
+
         // Sampling setup. temp<=0 keeps the greedy argmax path (bit-identical
         // to before); temp>0 draws from copy_last_logits() via sample_token().
         const bool do_sample = options.temperature > 0.0f;
@@ -6324,6 +6469,18 @@ private:
             step = executor_->forward_one_token(feed);
             if (!step.ok) throw std::runtime_error("decode failed");
             decode_ops += step.ops_executed;
+            // Block-sparse: the token just decoded grew the context by one.
+            // Register it, and reselect the working set on the interval
+            // boundary (the agent-step cadence is approximated here by a fixed
+            // step interval; reselection re-bakes any moved block in place).
+            if (bs_on) {
+                executor_->kvmem_register_append(1);
+                if (options_.kvmem_update_mode != "step" &&
+                    ++bs_steps_since_reselect >= bs_interval) {
+                    executor_->kvmem_reselect();
+                    bs_steps_since_reselect = 0;
+                }
+            }
             const int32_t fallback = step.argmax_token >= 0 ? step.argmax_token : eos;
             if (dump) dump->record(static_cast<int>(prompt_tokens.size() + i),
                                    "decode", static_cast<int32_t>(feed),
@@ -6388,6 +6545,43 @@ private:
         }
         executor_->reset_state();
 
+        // kvmem × MTP (Phase C). When kvmem is enabled the verify path must
+        // attend over the assembled window, which only the per-token
+        // forward_one_token path honors — so MTP verify is forced sequential
+        // here (each verify token re-enters the window-aware forward_one_token
+        // and appends K/V at the window tail). Rejection rollback uses the full
+        // state snapshot + sequential replay, both window-aware; the window
+        // page-table tail is truncated back by restore_state. The draft head
+        // runs over its own MTP prefix KV at true positions (not the window) —
+        // under the default identity (all-fit) budget the window equals the
+        // true positions so this is byte-identical to plain MTP; under a sparse
+        // budget the drafts are merely lower-acceptance guesses while the
+        // window-aware verify stays authoritative. The kvmem cadence
+        // (register_append per committed token + interval reselect) is driven
+        // off position deltas in the loops below.
+        const bool kvmem_on = executor_->kvmem_enabled();
+        const int kvmem_interval = std::max(1, options_.kvmem_interval);
+        uint32_t kvmem_last_reselect_pos = 0;
+        // Register newly-committed tokens with the block store and reselect the
+        // working set on the interval boundary. `committed_pos` is the
+        // executor's post-commit position(); we register the delta since the
+        // last call so accepted-chain commits (which advance position by >1)
+        // register the whole jump in one shot.
+        uint32_t kvmem_registered_pos = 0;
+        auto kvmem_advance_to = [&](uint32_t committed_pos) {
+            if (!kvmem_on) return;
+            if (committed_pos > kvmem_registered_pos) {
+                executor_->kvmem_register_append(committed_pos -
+                                                 kvmem_registered_pos);
+                kvmem_registered_pos = committed_pos;
+            }
+            if (options_.kvmem_update_mode != "step" &&
+                committed_pos >= kvmem_last_reselect_pos +
+                                     static_cast<uint32_t>(kvmem_interval)) {
+                executor_->kvmem_reselect();
+                kvmem_last_reselect_pos = committed_pos;
+            }
+        };
         const uint32_t requested_mtp_chain_len = mtp_trace_chain_len(options_);
         const uint32_t safe_mtp_chain_max = spec_mtp
             ? mtp_safe_chain_max()
@@ -6499,6 +6693,18 @@ private:
         }
         const double t_prefill_end = wall_seconds();
 
+        // kvmem: register the prefilled prompt as context blocks and assemble
+        // the first working set (mirrors generate_plain). Under the default
+        // all-fit budget this is an identity selection so the window equals the
+        // true cache and MTP verify stays byte-identical to plain MTP.
+        if (kvmem_on) {
+            executor_->kvmem_register_append(
+                static_cast<uint32_t>(prompt_tokens.size()));
+            executor_->kvmem_reselect();
+            kvmem_registered_pos = executor_->position();
+            kvmem_last_reselect_pos = executor_->position();
+        }
+
         std::string generated;
         const int32_t eos = tokenizer_->eos_id();
         ThinkingBudgetState budget;
@@ -6560,6 +6766,15 @@ private:
         QwenExecutor::StateCheckpointSet mtp_spec_state_checkpoints;
         const bool use_single_token_replay = mtp_single_token_replay_enabled();
         const bool reuse_current_mtp_prefix = mtp_reuse_current_prefix_enabled();
+        // kvmem (D1/D1.1): the BATCHED verifier (forward_n_tokens) is window-aware
+        // — it appends + attends in the assembled window frame (window_query_pos_
+        // base + window page table) — and restore_state_checkpoint() now also
+        // rolls the window tail back per accepted row (StateCheckpointSet carries
+        // the window base). So kvmem uses the SAME fast batched verify + free
+        // per-row checkpoint rollback as plain MTP; no path is disabled. The
+        // draft head still runs over its own MTP prefix KV at true positions;
+        // verify over the window stays authoritative, so a draft/window mismatch
+        // only lowers acceptance, never correctness.
         const bool use_sequential_verifier = mtp_verify_sequential_enabled();
         const MtpTransactionalReplayMode transactional_replay_mode =
             !use_sequential_verifier
@@ -6763,7 +6978,9 @@ private:
         auto run_plain_decode_remaining = [&]() {
             while (decoded < options.max_tokens && !should_stop_mtp_eos(next_token)) {
                 const uint32_t feed = next_token;
-                if (decode_as_batch) {
+                // kvmem requires the window-aware per-token path: the batched
+                // forward_n_tokens attends over true positions, not the window.
+                if (decode_as_batch && !kvmem_on) {
                     const std::vector<uint32_t> one_token{feed};
                     step = executor_->forward_n_tokens(one_token);
                 } else {
@@ -6771,6 +6988,7 @@ private:
                 }
                 if (!step.ok) throw std::runtime_error("decode failed");
                 decode_ops += step.ops_executed;
+                kvmem_advance_to(executor_->position());
                 if (decode_trace_enabled() && !step.elapsed_us.empty()) {
                     accumulate_trace(decode_trace, step);
                     ++decode_trace_steps;
@@ -6854,6 +7072,7 @@ private:
                     decode_ops += step.ops_executed;
                     const int32_t new_argmax = step.argmax_token >= 0 ? step.argmax_token : eos;
                     executor_->commit_mtp_prefix(executor_->position());
+                    kvmem_advance_to(executor_->position());
                     next_token = static_cast<uint32_t>(new_argmax);
                     if (!emit_generated_token(next_token)) break;
                     continue;
@@ -7091,6 +7310,18 @@ private:
                         run_spec_mtp = false;
                     }
                 }
+                // kvmem cadence: the batched window-aware verify
+                // (forward_n_tokens) advances position_ + the window tail
+                // (window_query_pos_) in lockstep; on reject, either
+                // restore_state_checkpoint (window-aware per-row rollback, D1.1)
+                // or restore_state(snapshot) rolls BOTH back, and the replay
+                // re-advances both by the accepted count. So position_ and the
+                // window tail stay consistent for every committed token this
+                // iteration. Register the committed delta and reselect on the
+                // interval boundary (re-bakes any moved block in place, rebuilds
+                // k̄). Runs once per spec iteration, after both the all-accepted
+                // and rollback branches settle.
+                kvmem_advance_to(executor_->position());
             }
         }
         if (!run_spec_mtp) {

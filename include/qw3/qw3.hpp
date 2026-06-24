@@ -47,6 +47,30 @@ struct EngineOptions {
     std::string mtp_policy = "fixed"; // fixed or adaptive
     int mtp_adaptive_min_chain = 0; // 0 = backend default
     int mtp_adaptive_max_chain = 0; // 0 = backend default / mtp_chain
+
+    // ---- Block-sparse KV attention (single-session, opt-in) ---------------
+    // Master switch (default OFF). When false the forward path is byte-
+    // identical to the pre-block-sparse code. All params below take effect
+    // only when this is true.
+    bool kvmem_enabled = false;
+    int kvmem_block_tokens = 128;        // block granularity (multiple of KV page size)
+    int kvmem_budget = 131072;    // max window tokens kept per selection
+    int kvmem_interval = 64;      // decode steps between reselections
+    int kvmem_sink_blocks = 1;           // always-kept prefix blocks
+    int kvmem_recent_blocks = 0;         // always-kept suffix blocks (0 = derive)
+    // Selection signal that ranks the middle blocks each reselection:
+    // "retrieval" (default, global content similarity, can resurrect dropped
+    // blocks), "h2o" (window-local cumulative attention heat, retention only),
+    // or "recency" (sink + recent windows only, no learned signal).
+    std::string kvmem_method = "retrieval";
+    std::string kvmem_select_policy = "topk"; // topk or quota
+    std::string kvmem_retrieval_method = "mean_attention";
+    std::string kvmem_update_mode = "interval"; // interval or step
+    int kvmem_retrieval_blocks = 0; // 0 = derive from remaining budget
+    int kvmem_profile_blocks = 0;   // 0 = derive from remaining budget
+    double kvmem_gpu_memory_ratio = 0.50;
+    double kvmem_gpu_high_watermark = 0.95;
+    double kvmem_gpu_low_watermark = 0.85;
 };
 
 struct GenerationOptions {

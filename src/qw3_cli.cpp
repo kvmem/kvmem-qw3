@@ -84,6 +84,27 @@ void usage(std::ostream &os) {
         "                        N>0 = process prefill in fixed-size chunks.\n"
         "                        Unset = built-in default (2048 for serving).\n"
         "  --no-prefill-chunk    Sugar for --prefill-chunk 0 (max throughput).\n"
+        "  --kvmem     Enable kvmem block-sparse KV attention (qwen-native,\n"
+        "                        single-session). Default OFF. When off the\n"
+        "                        forward path is byte-identical to the default.\n"
+        "  --kvmem-block-tokens N   Block granularity in tokens (multiple of KV page\n"
+        "                        size). Default: 128.\n"
+        "  --kvmem-budget N  Max window tokens kept per selection. Default: 131072.\n"
+        "  --kvmem-interval N  Decode steps between reselections. Default: 64.\n"
+        "  --kvmem-sink-blocks N    Always-kept prefix blocks. Default: 1.\n"
+        "  --kvmem-recent-blocks N  Always-kept suffix blocks (0 = derive). Default: 0.\n"
+        "  --kvmem-method M  Block selection signal: retrieval|h2o|recency.\n"
+        "                        Default: retrieval.\n"
+        "  --kvmem-select-policy M  Selection policy: topk|quota. Default: topk.\n"
+        "  --kvmem-retrieval-method M  Retrieval scorer: mean_attention|content_mean.\n"
+        "                        Default: mean_attention.\n"
+        "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
+        "  --kvmem-retrieval-blocks N  Quota policy retrieval blocks (0 = derive).\n"
+        "  --kvmem-profile-blocks N    Quota policy profile blocks (0 = derive).\n"
+        "  --kvmem-gpu-memory-ratio F  GPU memory fraction for KVMem KV cap.\n"
+        "                        Default: 0.50.\n"
+        "  --kvmem-gpu-high-watermark F Spill threshold for future tiering. Default: 0.95.\n"
+        "  --kvmem-gpu-low-watermark F  Evict target for future tiering. Default: 0.85.\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
@@ -236,6 +257,57 @@ int main(int argc, char **argv) {
                 engine.prefill_chunk = parse_int(need(arg), arg);
             } else if (arg == "--no-prefill-chunk") {
                 engine.prefill_chunk = 0;
+            } else if (arg == "--kvmem") {
+                engine.kvmem_enabled = true;
+            } else if (arg == "--kvmem-block-tokens") {
+                engine.kvmem_block_tokens = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-budget") {
+                engine.kvmem_budget = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-interval") {
+                engine.kvmem_interval = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-sink-blocks") {
+                engine.kvmem_sink_blocks = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-recent-blocks") {
+                engine.kvmem_recent_blocks = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-method") {
+                engine.kvmem_method = need(arg);
+                if (engine.kvmem_method != "retrieval" &&
+                    engine.kvmem_method != "h2o" &&
+                    engine.kvmem_method != "recency") {
+                    throw std::runtime_error(
+                        "--kvmem-method must be retrieval|h2o|recency");
+                }
+            } else if (arg == "--kvmem-select-policy") {
+                engine.kvmem_select_policy = need(arg);
+                if (engine.kvmem_select_policy != "topk" &&
+                    engine.kvmem_select_policy != "quota") {
+                    throw std::runtime_error(
+                        "--kvmem-select-policy must be topk|quota");
+                }
+            } else if (arg == "--kvmem-retrieval-method") {
+                engine.kvmem_retrieval_method = need(arg);
+                if (engine.kvmem_retrieval_method != "mean_attention" &&
+                    engine.kvmem_retrieval_method != "content_mean") {
+                    throw std::runtime_error(
+                        "--kvmem-retrieval-method must be mean_attention|content_mean");
+                }
+            } else if (arg == "--kvmem-update-mode") {
+                engine.kvmem_update_mode = need(arg);
+                if (engine.kvmem_update_mode != "interval" &&
+                    engine.kvmem_update_mode != "step") {
+                    throw std::runtime_error(
+                        "--kvmem-update-mode must be interval|step");
+                }
+            } else if (arg == "--kvmem-retrieval-blocks") {
+                engine.kvmem_retrieval_blocks = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-profile-blocks") {
+                engine.kvmem_profile_blocks = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-gpu-memory-ratio") {
+                engine.kvmem_gpu_memory_ratio = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-gpu-high-watermark") {
+                engine.kvmem_gpu_high_watermark = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-gpu-low-watermark") {
+                engine.kvmem_gpu_low_watermark = parse_float(need(arg), arg);
             } else if (arg == "--verbose") {
                 engine.verbose = true;
             } else if (arg == "-p" || arg == "--prompt") {

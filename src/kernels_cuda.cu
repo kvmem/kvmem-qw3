@@ -239,6 +239,63 @@ bool launch_fattn_prefill_mma_gqa_v5_f16(
 size_t fattn_prefill_mma_gqa_v5_scratch_bytes(uint32_t batch, uint32_t n_heads,
                                               uint32_t n_kv_heads,
                                               uint32_t head_dim);
+// Re-RoPE block remap for block-sparse KV reuse (see kernel comment).
+bool launch_rope_block_remap(float *x, uint32_t n_tokens, uint32_t n_units,
+                             uint32_t per_unit_stride, uint32_t rope_dim,
+                             int32_t orig_base, int32_t new_base,
+                             uint32_t row_stride, float theta,
+                             cudaStream_t stream);
+
+// Paged in-place re-RoPE on the stored cache. is_fp16 selects __half vs float
+// storage (q8 cache is not supported: re-RoPE on quantized K is lossy and the
+// block-sparse path requires fp16/fp32 KV). See kernel comment.
+bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
+                                   uint32_t n_tokens, uint32_t n_kv_heads,
+                                   uint32_t per_pos_size, uint32_t head_dim,
+                                   uint32_t rope_dim, uint32_t win_base,
+                                   int32_t orig_base, int32_t new_base,
+                                   const int32_t *page_indices,
+                                   uint32_t page_size, float theta,
+                                   cudaStream_t stream);
+
+// Block-sparse selection signal (#40). See kernel comments.
+bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
+                              uint32_t n_blocks, uint32_t n_kv_heads,
+                              uint32_t per_pos_size, uint32_t head_dim,
+                              const int32_t *win_base, const int32_t *blk_tokens,
+                              const int32_t *page_indices, uint32_t page_size,
+                              cudaStream_t stream);
+bool launch_block_attn_score_step(float *accum, const float *q,
+                                  const float *kbar, uint32_t q_stride,
+                                  uint32_t n_blocks, uint32_t n_heads,
+                                  uint32_t n_kv_heads, uint32_t head_dim,
+                                  float scale, cudaStream_t stream);
+bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
+                                       const float *q, uint32_t q_stride,
+                                       uint32_t n_window_blocks,
+                                       uint32_t n_heads,
+                                       uint32_t n_kv_heads,
+                                       uint32_t per_pos_size,
+                                       uint32_t head_dim,
+                                       const int32_t *win_base,
+                                       const int32_t *blk_tokens,
+                                       const int32_t *page_indices,
+                                       uint32_t page_size,
+                                       uint32_t seq_len,
+                                       float scale,
+                                       cudaStream_t stream);
+// Global content-frame KV retrieval index (#48). See kernel comments.
+bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
+                                      uint32_t n_blocks, uint32_t n_kv_heads,
+                                      uint32_t per_pos_size, uint32_t head_dim,
+                                      uint32_t rope_dim, const int32_t *orig_base,
+                                      const int32_t *blk_tokens,
+                                      const int32_t *page_indices,
+                                      uint32_t page_size, float theta,
+                                      cudaStream_t stream);
+bool launch_derope_query(float *q_content, const float *q, uint32_t q_stride,
+                         uint32_t n_heads, uint32_t head_dim, uint32_t rope_dim,
+                         int32_t query_pos, float theta, cudaStream_t stream);
 }
 
 #if QW3_ENABLE_FLASHINFER
@@ -2587,6 +2644,407 @@ __global__ void rope_partial_positions_kernel(float *x,
     base[i + half] = x0 * s + x1 * c;
 }
 
+// Re-RoPE delta rotation for block-sparse KV reuse. A cached K row was baked
+// with RoPE at its original absolute position (k_stored = R(p_orig·f)·k_raw).
+// To reuse it at a remapped position p_new we apply a single delta rotation
+// R((p_new-p_orig)·f), since RoPE composes: R(a)·R(b) = R(a+b). All tokens in
+// a contiguous block share the same delta = p_new_start - p_orig_start, so the
+// rotation angle depends only on the freq channel i and the constant delta.
+// Operates on fp32 rows (a staging copy of the block's K), in place.
+//   grid = (n_tokens, n_units[=n_kv_heads]), block = rope_dim/2 threads.
+__global__ void rope_block_remap_kernel(float *x,
+                                        uint32_t n_units,
+                                        uint32_t per_unit_stride,
+                                        uint32_t rope_dim,
+                                        int32_t orig_base,
+                                        int32_t new_base,
+                                        uint32_t row_stride,
+                                        float theta) {
+    const uint32_t tok  = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t i = threadIdx.x;
+    if (unit >= n_units) return;
+    const uint32_t half = rope_dim / 2;
+    if (i >= half) return;
+    float *base = x + static_cast<uint64_t>(tok) * row_stride + unit * per_unit_stride;
+    // Re-RoPE by de-rotating the original bake and re-rotating at the new
+    // window position. Both rotations use the SAME __powf/__sincosf production
+    // uses (rope_partial_kernel), so this reproduces a fresh bake at new_base
+    // to fp ULP. Crucially the de-rotation reuses the SAME (sin,cos) as the
+    // original bake (applied as the transpose, R(θ)^T·R(θ)=I), so __sincosf's
+    // range-reduction error at a huge orig position (~1M for a block pulled
+    // from a long context) CANCELS instead of being left stale in the key.
+    const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) / static_cast<float>(rope_dim));
+    const float ang_o = static_cast<float>(orig_base + static_cast<int32_t>(tok)) * inv_freq;
+    const float ang_n = static_cast<float>(new_base + static_cast<int32_t>(tok)) * inv_freq;
+    float so, co, sn, cn;
+    __sincosf(ang_o, &so, &co);
+    __sincosf(ang_n, &sn, &cn);
+    const float x0 = base[i];
+    const float x1 = base[i + half];
+    // De-rotate by orig (transpose of R(ang_o)): undo the stored bake.
+    const float d0 =  x0 * co + x1 * so;
+    const float d1 = -x0 * so + x1 * co;
+    // Re-rotate at the new window position.
+    base[i]        = d0 * cn - d1 * sn;
+    base[i + half] = d0 * sn + d1 * cn;
+}
+
+// Paged, in-place re-RoPE on the STORED KV cache (block-sparse assembly, #39).
+//
+// Unlike rope_block_remap_kernel (contiguous fp32, used by the #38 math gold
+// standard), this operates on the live paged cache exactly where the K is
+// stored: dtype is fp16 or fp32, and each window token maps to a physical slot
+// through the page table (kv_physical_pos_from_pages), mirroring
+// kv_append_paged_kernel_f16's indexing byte-for-byte. The block occupies
+// logical window positions [win_base .. win_base+n_tokens) in the page table;
+// the key there was baked at original position orig_base+tok and is rotated to
+// new_base+tok. De-rotate/re-rotate with the SAME __sincosf as the bake so the
+// huge-orig range-reduction error cancels (see rope_block_remap_kernel comment).
+//
+// Per (token, kv_head) row layout in the cache slot is [n_kv_heads, head_dim];
+// RoPE touches only the first rope_dim of each head. grid = (n_tokens, n_units),
+// block = rope_dim/2 threads.
+__device__ __forceinline__ uint32_t kv_physical_pos_from_pages(
+        uint32_t logical_pos, const int32_t *page_indices, uint32_t page_size);
+template <typename T>
+__global__ void rope_block_remap_paged_kernel(T *cache,
+                                              uint32_t per_pos_size,
+                                              uint32_t head_dim,
+                                              uint32_t rope_dim,
+                                              uint32_t win_base,
+                                              int32_t orig_base,
+                                              int32_t new_base,
+                                              const int32_t *page_indices,
+                                              uint32_t page_size,
+                                              float theta) {
+    const uint32_t tok  = blockIdx.x;   // 0..n_tokens-1 within the block
+    const uint32_t unit = blockIdx.y;   // kv head
+    const uint32_t i = threadIdx.x;
+    const uint32_t half = rope_dim / 2;
+    if (i >= half) return;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(win_base + tok, page_indices, page_size);
+    T *base = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+              static_cast<uint64_t>(unit) * head_dim;
+    const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) / static_cast<float>(rope_dim));
+    const float ang_o = static_cast<float>(orig_base + static_cast<int32_t>(tok)) * inv_freq;
+    const float ang_n = static_cast<float>(new_base + static_cast<int32_t>(tok)) * inv_freq;
+    float so, co, sn, cn;
+    __sincosf(ang_o, &so, &co);
+    __sincosf(ang_n, &sn, &cn);
+    const float x0 = static_cast<float>(base[i]);
+    const float x1 = static_cast<float>(base[i + half]);
+    const float d0 =  x0 * co + x1 * so;
+    const float d1 = -x0 * so + x1 * co;
+    base[i]        = static_cast<T>(d0 * cn - d1 * sn);
+    base[i + half] = static_cast<T>(d0 * sn + d1 * cn);
+}
+
+// ---- Block-sparse cumulative-attention selection signal (#40) -----------
+//
+// Low-intrusion: instead of materializing the attention score matrix (the
+// FlashInfer decode kernel is online-softmax and never forms it), we keep a
+// per-window-block representative K vector (the block's mean baked K) and, each
+// decode step, score every window block by q . k̄ summed over query heads. This
+// is a cheap monotone proxy for "how much this block is attended to" — it does
+// NOT touch the attention kernel or alter its output, and runs as one extra
+// global launch per step at a single representative attention layer.
+//
+// block_kmean_paged_kernel: per window block w and kv head h, average the baked
+// K over the block's tokens. grid = (n_blocks_w, n_kv_heads), block = head_dim
+// threads (each thread owns one dim d). win_base[w]/blk_tokens[w] give the
+// block's window position range; physical slots come through the window page
+// table exactly like rope_block_remap_paged_kernel. Output kbar is fp32,
+// layout [n_blocks_w, n_kv_heads, head_dim].
+__device__ __forceinline__ uint32_t kv_physical_pos_from_pages(
+        uint32_t logical_pos, const int32_t *page_indices, uint32_t page_size);
+template <typename T>
+__global__ void block_kmean_paged_kernel(const T *k_cache,
+                                         float *kbar,
+                                         uint32_t per_pos_size,
+                                         uint32_t head_dim,
+                                         const int32_t *win_base,
+                                         const int32_t *blk_tokens,
+                                         const int32_t *page_indices,
+                                         uint32_t page_size) {
+    const uint32_t w = blockIdx.x;     // window block index
+    const uint32_t h = blockIdx.y;     // kv head
+    const uint32_t d = threadIdx.x;    // dim within head
+    if (d >= head_dim) return;
+    const uint32_t base = static_cast<uint32_t>(win_base[w]);
+    const uint32_t n = static_cast<uint32_t>(blk_tokens[w]);
+    float acc = 0.0f;
+    for (uint32_t tok = 0; tok < n; ++tok) {
+        const uint32_t physical_pos =
+            kv_physical_pos_from_pages(base + tok, page_indices, page_size);
+        const T *row = k_cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+                       static_cast<uint64_t>(h) * head_dim;
+        acc += static_cast<float>(row[d]);
+    }
+    const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
+    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] = acc * inv;
+}
+
+// block_attn_score_step_kernel: for the current decode token's RoPE-baked Q,
+// add to each window block's accumulator the sum over query heads of
+// max(0, scale * (q_head . k̄_block[kv_head])). One CUDA block per window block
+// (no cross-block atomics needed; each writes its own accum slot). blockDim =
+// head_dim threads doing a shared-memory dot reduction per head.
+__global__ void block_attn_score_step_kernel(float *accum,
+                                             const float *q,
+                                             const float *kbar,
+                                             uint32_t q_stride,
+                                             uint32_t n_heads,
+                                             uint32_t n_kv_heads,
+                                             uint32_t head_dim,
+                                             float scale) {
+    extern __shared__ float red[];
+    const uint32_t w = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    const uint32_t group = n_heads / n_kv_heads;
+    float block_score = 0.0f;
+    for (uint32_t qh = 0; qh < n_heads; ++qh) {
+        const uint32_t kvh = qh / group;
+        const float qv = (d < head_dim) ? q[qh * q_stride + d] : 0.0f;
+        const float kv = (d < head_dim)
+            ? kbar[(static_cast<uint64_t>(w) * n_kv_heads + kvh) * head_dim + d]
+            : 0.0f;
+        red[d] = qv * kv;
+        __syncthreads();
+        for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (d < s) red[d] += red[d + s];
+            __syncthreads();
+        }
+        if (d == 0) {
+            const float dot = red[0] * scale;
+            block_score += dot > 0.0f ? dot : 0.0f;
+        }
+        __syncthreads();
+    }
+    if (d == 0) accum[w] += block_score;
+}
+
+__device__ __forceinline__ uint32_t kvmem_window_bucket_for_pos(
+        uint32_t pos,
+        const int32_t *win_base,
+        const int32_t *blk_tokens,
+        uint32_t n_window_blocks) {
+    if (n_window_blocks == 0) return 0;
+    uint32_t lo = 0;
+    uint32_t hi = n_window_blocks;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) >> 1;
+        const uint32_t base = static_cast<uint32_t>(win_base[mid]);
+        if (base <= pos) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == 0) return n_window_blocks;  // before first block: tail/unknown
+    const uint32_t idx = lo - 1;
+    const uint32_t base = static_cast<uint32_t>(win_base[idx]);
+    const uint32_t n = static_cast<uint32_t>(blk_tokens[idx]);
+    return (pos < base + n) ? idx : n_window_blocks;  // final slot = decode tail
+}
+
+template <typename T>
+__global__ void block_attention_mass_paged_kernel(float *mass,
+                                                  const float *q,
+                                                  uint32_t q_stride,
+                                                  const T *k_cache,
+                                                  uint32_t n_window_blocks,
+                                                  uint32_t n_heads,
+                                                  uint32_t n_kv_heads,
+                                                  uint32_t per_pos_size,
+                                                  uint32_t head_dim,
+                                                  const int32_t *win_base,
+                                                  const int32_t *blk_tokens,
+                                                  const int32_t *page_indices,
+                                                  uint32_t page_size,
+                                                  uint32_t seq_len,
+                                                  float scale) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_heads || seq_len == 0) return;
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint32_t kv_head = head / group;
+    const float *q_attn = q + static_cast<uint64_t>(head) * q_stride;
+
+    __shared__ float scratch[256];
+    float local_max = -INFINITY;
+    for (uint32_t t = tid; t < seq_len; t += blockDim.x) {
+        const uint32_t physical_pos =
+            kv_physical_pos_from_pages(t, page_indices, page_size);
+        const T *k_t = k_cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+                       static_cast<uint64_t>(kv_head) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            dot += q_attn[d] * static_cast<float>(k_t[d]);
+        }
+        const float score = dot * scale;
+        if (score > local_max) local_max = score;
+    }
+    scratch[tid] = local_max;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s && scratch[tid + s] > scratch[tid]) {
+            scratch[tid] = scratch[tid + s];
+        }
+        __syncthreads();
+    }
+    const float row_max = scratch[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (uint32_t t = tid; t < seq_len; t += blockDim.x) {
+        const uint32_t physical_pos =
+            kv_physical_pos_from_pages(t, page_indices, page_size);
+        const T *k_t = k_cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+                       static_cast<uint64_t>(kv_head) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            dot += q_attn[d] * static_cast<float>(k_t[d]);
+        }
+        local_sum += __expf(dot * scale - row_max);
+    }
+    scratch[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) scratch[tid] += scratch[tid + s];
+        __syncthreads();
+    }
+    const float row_sum = scratch[0];
+    if (row_sum <= 0.0f || !isfinite(row_sum)) return;
+    const float inv_sum = 1.0f / row_sum;
+
+    for (uint32_t t = tid; t < seq_len; t += blockDim.x) {
+        const uint32_t physical_pos =
+            kv_physical_pos_from_pages(t, page_indices, page_size);
+        const T *k_t = k_cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+                       static_cast<uint64_t>(kv_head) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            dot += q_attn[d] * static_cast<float>(k_t[d]);
+        }
+        const float weight = __expf(dot * scale - row_max) * inv_sum;
+        const uint32_t bucket = kvmem_window_bucket_for_pos(
+            t, win_base, blk_tokens, n_window_blocks);
+        atomicAdd(mass + bucket, weight);
+    }
+}
+
+// ---- Global content-frame KV retrieval index (#48) ----------------------
+//
+// The #40 signal above is window-local: a block must be IN the active window to
+// accumulate heat, so it can only RETAIN heavy hitters, never RESURRECT a block
+// that was already dropped. Global retrieval fixes this by maintaining a
+// position-invariant CONTENT mean-Key for every historical block, then scoring
+// the current (also de-RoPE'd) query against ALL of them each interval.
+//
+// block_kmean_content_paged_kernel: like block_kmean_paged_kernel but reads
+// through the FULL repository page table at each block's TRUE positions and
+// DE-RoPEs every token's K by (orig_base+tok) before averaging, recovering the
+// raw (pre-RoPE) key so the mean is position-invariant content. De-rotation
+// uses the SAME __sincosf as the original bake (rope_partial_kernel /
+// rope_block_remap_paged_kernel), so the huge-position range-reduction error
+// cancels exactly (see rope_block_remap_paged_kernel comment). RoPE touches only
+// the first rope_dim of each head; dims beyond rope_dim pass through. Built ONCE
+// from the pristine post-prefill cache (blocks baked at true positions) and then
+// immutable — never rebuilt as blocks are re-RoPE'd into windows during assembly.
+// grid = (n_blocks, n_kv_heads), block = head_dim threads. Output kbar fp32,
+// layout [n_blocks, n_kv_heads, head_dim] indexed by block_id.
+template <typename T>
+__global__ void block_kmean_content_paged_kernel(const T *k_cache,
+                                                 float *kbar,
+                                                 uint32_t per_pos_size,
+                                                 uint32_t head_dim,
+                                                 uint32_t rope_dim,
+                                                 const int32_t *orig_base,
+                                                 const int32_t *blk_tokens,
+                                                 const int32_t *page_indices,
+                                                 uint32_t page_size,
+                                                 float theta) {
+    const uint32_t w = blockIdx.x;     // block index (block_id)
+    const uint32_t h = blockIdx.y;     // kv head
+    const uint32_t d = threadIdx.x;    // dim within head
+    if (d >= head_dim) return;
+    const int32_t base = orig_base[w];
+    const uint32_t n = static_cast<uint32_t>(blk_tokens[w]);
+    const uint32_t half = rope_dim / 2;
+    float acc = 0.0f;
+    for (uint32_t tok = 0; tok < n; ++tok) {
+        const uint32_t physical_pos = kv_physical_pos_from_pages(
+            static_cast<uint32_t>(base) + tok, page_indices, page_size);
+        const T *row = k_cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+                       static_cast<uint64_t>(h) * head_dim;
+        float deroped;
+        if (d < half) {
+            const float inv_freq = __powf(theta, -2.0f * static_cast<float>(d) /
+                                                  static_cast<float>(rope_dim));
+            const float ang = static_cast<float>(base + static_cast<int32_t>(tok)) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            const float x0 = static_cast<float>(row[d]);
+            const float x1 = static_cast<float>(row[d + half]);
+            deroped = x0 * c + x1 * s;       // de-rotate dim i
+        } else if (d < rope_dim) {
+            const uint32_t i = d - half;
+            const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) /
+                                                  static_cast<float>(rope_dim));
+            const float ang = static_cast<float>(base + static_cast<int32_t>(tok)) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            const float x0 = static_cast<float>(row[d - half]);
+            const float x1 = static_cast<float>(row[d]);
+            deroped = -x0 * s + x1 * c;      // de-rotate dim i+half
+        } else {
+            deroped = static_cast<float>(row[d]);  // beyond rope_dim: untouched
+        }
+        acc += deroped;
+    }
+    const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
+    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] = acc * inv;
+}
+
+// derope_query_kernel: de-RoPE the current decode token's RoPE-baked Q (baked at
+// query_pos) into a contiguous content-frame query [n_heads, head_dim], so it
+// can be dotted against the content-frame mean keys above (q_raw . k̄_raw is
+// position-invariant content similarity). Same de-rotate math; the input Q has
+// the [n_heads, 2, head_dim] layout (attn-Q is the first head_dim of each unit,
+// per-unit stride q_stride). grid = (n_heads), block = head_dim threads.
+__global__ void derope_query_kernel(float *q_content,
+                                    const float *q,
+                                    uint32_t q_stride,
+                                    uint32_t head_dim,
+                                    uint32_t rope_dim,
+                                    int32_t query_pos,
+                                    float theta) {
+    const uint32_t qh = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    if (d >= head_dim) return;
+    const float *row = q + static_cast<uint64_t>(qh) * q_stride;
+    const uint32_t half = rope_dim / 2;
+    float deroped;
+    if (d < half) {
+        const float inv_freq = __powf(theta, -2.0f * static_cast<float>(d) /
+                                              static_cast<float>(rope_dim));
+        const float ang = static_cast<float>(query_pos) * inv_freq;
+        float s, c;
+        __sincosf(ang, &s, &c);
+        deroped = row[d] * c + row[d + half] * s;
+    } else if (d < rope_dim) {
+        const uint32_t i = d - half;
+        const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) /
+                                              static_cast<float>(rope_dim));
+        const float ang = static_cast<float>(query_pos) * inv_freq;
+        float s, c;
+        __sincosf(ang, &s, &c);
+        deroped = -row[d - half] * s + row[d] * c;
+    } else {
+        deroped = row[d];
+    }
+    q_content[static_cast<uint64_t>(qh) * head_dim + d] = deroped;
+}
+
 __global__ void kv_append_kernel(float *cache,
                                  const float *src,
                                  uint32_t base_pos,
@@ -3239,6 +3697,15 @@ public:
             return 0;
         }
         return static_cast<uint64_t>(free_b);
+    }
+
+    uint64_t total_device_bytes() const override {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        return static_cast<uint64_t>(total_b);
     }
 
     // -- CUDA graph capture for decode --
@@ -5376,6 +5843,227 @@ public:
                 pages.ptr_i32(), page_size);
         }
         return launch_status("cuda kv_append_batch_paged_device");
+    }
+
+    DeviceStatus rope_block_remap_paged_device(DeviceTensor &k_cache,
+                                               uint32_t n_tokens,
+                                               uint32_t n_kv_heads,
+                                               uint32_t per_pos_size,
+                                               uint32_t head_dim,
+                                               uint32_t rope_dim,
+                                               uint32_t win_base,
+                                               int32_t from_base,
+                                               int32_t to_base,
+                                               const DeviceTensor &page_indices,
+                                               uint32_t page_size,
+                                               float theta) override {
+        if (n_tokens == 0 || n_kv_heads == 0) return {};
+        if (from_base == to_base) return {};  // already baked at the target slot
+        if (page_size == 0) return {false, "rope_block_remap_paged_device page_size=0"};
+        auto &c = as_tensor(k_cache);
+        const auto &pages = as_tensor(page_indices);
+        if (pages.elem_size != sizeof(int32_t)) {
+            return {false, "rope_block_remap_paged_device page dtype mismatch"};
+        }
+        const bool is_fp16 = c.is_fp16();
+        const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
+                            !c.is_fp8_kv();
+        if (!is_fp16 && !is_f32) {
+            return {false, "rope_block_remap_paged_device requires fp16 or fp32 KV "
+                           "(q8/fp8 re-RoPE is lossy)"};
+        }
+        void *ptr = is_fp16 ? static_cast<void *>(c.ptr_h())
+                            : static_cast<void *>(c.ptr);
+        if (!ported::launch_rope_block_remap_paged(
+                ptr, is_fp16, n_tokens, n_kv_heads, per_pos_size, head_dim,
+                rope_dim, win_base, from_base, to_base, pages.ptr_i32(),
+                page_size, theta, exec_stream_)) {
+            return {false, "rope_block_remap_paged launch failed"};
+        }
+        return launch_status("cuda rope_block_remap_paged_device");
+    }
+
+    DeviceStatus block_kmean_paged_device(const DeviceTensor &k_cache,
+                                          DeviceTensor &kbar,
+                                          uint32_t n_blocks,
+                                          uint32_t n_kv_heads,
+                                          uint32_t per_pos_size,
+                                          uint32_t head_dim,
+                                          const DeviceTensor &win_base,
+                                          const DeviceTensor &blk_tokens,
+                                          const DeviceTensor &page_indices,
+                                          uint32_t page_size) override {
+        if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return {};
+        if (page_size == 0) return {false, "block_kmean_paged_device page_size=0"};
+        const auto &c = as_tensor(k_cache);
+        const auto &pages = as_tensor(page_indices);
+        const auto &wb = as_tensor(win_base);
+        const auto &bt = as_tensor(blk_tokens);
+        auto &kb = as_tensor(kbar);
+        if (pages.elem_size != sizeof(int32_t) ||
+            wb.elem_size != sizeof(int32_t) || bt.elem_size != sizeof(int32_t)) {
+            return {false, "block_kmean_paged_device metadata dtype mismatch"};
+        }
+        const bool is_fp16 = c.is_fp16();
+        const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
+                            !c.is_fp8_kv();
+        if (!is_fp16 && !is_f32) {
+            // q8/fp8 K is fine to skip — selection just stays recency-weighted.
+            return {false, "block_kmean_paged_device requires fp16 or fp32 KV"};
+        }
+        const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
+                                  : static_cast<const void *>(c.ptr);
+        if (!ported::launch_block_kmean_paged(
+                const_cast<void *>(ptr), is_fp16, kb.ptr, n_blocks,
+                n_kv_heads, per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
+                pages.ptr_i32(), page_size, exec_stream_)) {
+            return {false, "block_kmean_paged launch failed"};
+        }
+        return launch_status("cuda block_kmean_paged_device");
+    }
+
+    DeviceStatus block_attn_score_step_device(DeviceTensor &accum,
+                                              const DeviceTensor &q,
+                                              const DeviceTensor &kbar,
+                                              uint32_t q_stride,
+                                              uint32_t n_blocks,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t head_dim,
+                                              float scale) override {
+        if (n_blocks == 0 || n_heads == 0 || head_dim == 0) return {};
+        auto &a = as_tensor(accum);
+        const auto &qt = as_tensor(q);
+        const auto &kb = as_tensor(kbar);
+        if (!ported::launch_block_attn_score_step(
+                a.ptr, qt.ptr, kb.ptr, q_stride, n_blocks,
+                n_heads, n_kv_heads, head_dim, scale, exec_stream_)) {
+            return {false, "block_attn_score_step launch failed"};
+        }
+        return launch_status("cuda block_attn_score_step_device");
+    }
+
+    DeviceStatus block_attention_mass_paged_device(
+                                              DeviceTensor &mass,
+                                              const DeviceTensor &q,
+                                              uint32_t q_stride,
+                                              const DeviceTensor &k_cache,
+                                              uint32_t n_window_blocks,
+                                              uint32_t n_heads,
+                                              uint32_t n_kv_heads,
+                                              uint32_t per_pos_size,
+                                              uint32_t head_dim,
+                                              const DeviceTensor &win_base,
+                                              const DeviceTensor &blk_tokens,
+                                              const DeviceTensor &page_indices,
+                                              uint32_t n_pages,
+                                              uint32_t page_size,
+                                              uint32_t seq_len,
+                                              float scale) override {
+        if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || seq_len == 0) {
+            return {};
+        }
+        if (page_size == 0) return {false, "block_attention_mass_paged_device page_size=0"};
+        const uint32_t need_pages = (seq_len + page_size - 1) / page_size;
+        if (need_pages > n_pages) {
+            return {false, "block_attention_mass_paged_device page table too small"};
+        }
+        auto &m = as_tensor(mass);
+        const auto &qt = as_tensor(q);
+        const auto &kc = as_tensor(k_cache);
+        const auto &wb = as_tensor(win_base);
+        const auto &bt = as_tensor(blk_tokens);
+        const auto &pages = as_tensor(page_indices);
+        const uint32_t buckets = n_window_blocks + 1;
+        if (m.count < buckets) {
+            return {false, "block_attention_mass_paged_device mass tensor too small"};
+        }
+        if (pages.elem_size != sizeof(int32_t) ||
+            wb.elem_size != sizeof(int32_t) || bt.elem_size != sizeof(int32_t)) {
+            return {false, "block_attention_mass_paged_device metadata dtype mismatch"};
+        }
+        const bool is_fp16 = kc.is_fp16();
+        const bool is_f32 = (kc.elem_size == sizeof(float)) && !kc.is_q8_kv() &&
+                            !kc.is_fp8_kv();
+        if (!is_fp16 && !is_f32) {
+            return {false, "block_attention_mass_paged_device requires fp16 or fp32 KV"};
+        }
+        if (auto st = cuda_status(cudaMemsetAsync(m.ptr, 0,
+                            static_cast<size_t>(buckets) * sizeof(float),
+                            exec_stream_),
+                            "block_attention_mass memset"); !st.ok) {
+            return st;
+        }
+        const void *ptr = is_fp16 ? static_cast<const void *>(kc.ptr_h())
+                                  : static_cast<const void *>(kc.ptr);
+        if (!ported::launch_block_attention_mass_paged(
+                const_cast<void *>(ptr), is_fp16, m.ptr, qt.ptr, q_stride,
+                n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
+                wb.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size, seq_len,
+                scale, exec_stream_)) {
+            return {false, "block_attention_mass_paged launch failed"};
+        }
+        return launch_status("cuda block_attention_mass_paged_device");
+    }
+
+    DeviceStatus block_kmean_content_paged_device(const DeviceTensor &k_cache,
+                                                  DeviceTensor &kbar,
+                                                  uint32_t n_blocks,
+                                                  uint32_t n_kv_heads,
+                                                  uint32_t per_pos_size,
+                                                  uint32_t head_dim,
+                                                  uint32_t rope_dim,
+                                                  const DeviceTensor &orig_base,
+                                                  const DeviceTensor &blk_tokens,
+                                                  const DeviceTensor &page_indices,
+                                                  uint32_t page_size,
+                                                  float theta) override {
+        if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return {};
+        if (page_size == 0) return {false, "block_kmean_content_paged_device page_size=0"};
+        const auto &c = as_tensor(k_cache);
+        const auto &pages = as_tensor(page_indices);
+        const auto &ob = as_tensor(orig_base);
+        const auto &bt = as_tensor(blk_tokens);
+        auto &kb = as_tensor(kbar);
+        if (pages.elem_size != sizeof(int32_t) ||
+            ob.elem_size != sizeof(int32_t) || bt.elem_size != sizeof(int32_t)) {
+            return {false, "block_kmean_content_paged_device metadata dtype mismatch"};
+        }
+        const bool is_fp16 = c.is_fp16();
+        const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
+                            !c.is_fp8_kv();
+        if (!is_fp16 && !is_f32) {
+            // q8/fp8 K can't be de-RoPE'd meaningfully — retrieval stays recency.
+            return {false, "block_kmean_content_paged_device requires fp16 or fp32 KV"};
+        }
+        const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
+                                  : static_cast<const void *>(c.ptr);
+        if (!ported::launch_block_kmean_content_paged(
+                const_cast<void *>(ptr), is_fp16, kb.ptr, n_blocks, n_kv_heads,
+                per_pos_size, head_dim, rope_dim, ob.ptr_i32(), bt.ptr_i32(),
+                pages.ptr_i32(), page_size, theta, exec_stream_)) {
+            return {false, "block_kmean_content_paged launch failed"};
+        }
+        return launch_status("cuda block_kmean_content_paged_device");
+    }
+
+    DeviceStatus derope_query_device(DeviceTensor &q_content,
+                                     const DeviceTensor &q,
+                                     uint32_t q_stride,
+                                     uint32_t n_heads,
+                                     uint32_t head_dim,
+                                     uint32_t rope_dim,
+                                     int32_t query_pos,
+                                     float theta) override {
+        if (n_heads == 0 || head_dim == 0) return {};
+        auto &qc = as_tensor(q_content);
+        const auto &qt = as_tensor(q);
+        if (!ported::launch_derope_query(
+                qc.ptr, qt.ptr, q_stride, n_heads, head_dim, rope_dim,
+                query_pos, theta, exec_stream_)) {
+            return {false, "derope_query launch failed"};
+        }
+        return launch_status("cuda derope_query_device");
     }
 
     DeviceStatus kv_append_batch_paged_ragged_device(
@@ -7573,6 +8261,47 @@ public:
         return cuda_status(cudaStreamSynchronize(exec_stream_), "copy_to_host sync");
     }
 
+    DeviceStatus copy_bytes_to_host(const DeviceTensor &x,
+                                    void *host,
+                                    uint64_t byte_offset,
+                                    uint64_t byte_count) override {
+        if (byte_count == 0) return {};
+        if (!host) return {false, "copy_bytes_to_host null host"};
+        const auto &t = as_tensor(x);
+        const uint64_t total_bytes = t.count * static_cast<uint64_t>(t.elem_size);
+        if (byte_offset > total_bytes || byte_count > total_bytes - byte_offset) {
+            return {false, "copy_bytes_to_host out of range"};
+        }
+        const auto *src = reinterpret_cast<const uint8_t *>(t.ptr) + byte_offset;
+        if (auto st = cuda_status(cudaMemcpyAsync(host, src,
+                                                  static_cast<size_t>(byte_count),
+                                                  cudaMemcpyDeviceToHost,
+                                                  exec_stream_),
+                                  "copy_bytes_to_host async");
+            !st.ok) return st;
+        return cuda_status(cudaStreamSynchronize(exec_stream_),
+                           "copy_bytes_to_host sync");
+    }
+
+    DeviceStatus copy_bytes_from_host(DeviceTensor &x,
+                                      uint64_t byte_offset,
+                                      const void *host,
+                                      uint64_t byte_count) override {
+        if (byte_count == 0) return {};
+        if (!host) return {false, "copy_bytes_from_host null host"};
+        auto &t = as_tensor(x);
+        const uint64_t total_bytes = t.count * static_cast<uint64_t>(t.elem_size);
+        if (byte_offset > total_bytes || byte_count > total_bytes - byte_offset) {
+            return {false, "copy_bytes_from_host out of range"};
+        }
+        auto *dst = reinterpret_cast<uint8_t *>(t.ptr) + byte_offset;
+        return cuda_status(cudaMemcpyAsync(dst, host,
+                                           static_cast<size_t>(byte_count),
+                                           cudaMemcpyHostToDevice,
+                                           exec_stream_),
+                           "copy_bytes_from_host async");
+    }
+
     DeviceStatus copy_d2d(DeviceTensor &dst,
                           const DeviceTensor &src,
                           uint64_t src_offset,
@@ -7806,6 +8535,143 @@ private:
 };
 
 } // namespace
+
+namespace ported {
+bool launch_rope_block_remap(float *x, uint32_t n_tokens, uint32_t n_units,
+                             uint32_t per_unit_stride, uint32_t rope_dim,
+                             int32_t orig_base, int32_t new_base,
+                             uint32_t row_stride, float theta,
+                             cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_tokens == 0 || n_units == 0 || half == 0) return true;
+    dim3 grid(n_tokens, n_units);
+    rope_block_remap_kernel<<<grid, half, 0, stream>>>(
+        x, n_units, per_unit_stride, rope_dim, orig_base, new_base,
+        row_stride, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
+                                   uint32_t n_tokens, uint32_t n_kv_heads,
+                                   uint32_t per_pos_size, uint32_t head_dim,
+                                   uint32_t rope_dim, uint32_t win_base,
+                                   int32_t orig_base, int32_t new_base,
+                                   const int32_t *page_indices,
+                                   uint32_t page_size, float theta,
+                                   cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_tokens == 0 || n_kv_heads == 0 || half == 0) return true;
+    dim3 grid(n_tokens, n_kv_heads);
+    if (is_fp16) {
+        rope_block_remap_paged_kernel<__half><<<grid, half, 0, stream>>>(
+            static_cast<__half *>(cache), per_pos_size, head_dim, rope_dim,
+            win_base, orig_base, new_base, page_indices, page_size, theta);
+    } else {
+        rope_block_remap_paged_kernel<float><<<grid, half, 0, stream>>>(
+            static_cast<float *>(cache), per_pos_size, head_dim, rope_dim,
+            win_base, orig_base, new_base, page_indices, page_size, theta);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
+                              uint32_t n_blocks, uint32_t n_kv_heads,
+                              uint32_t per_pos_size, uint32_t head_dim,
+                              const int32_t *win_base, const int32_t *blk_tokens,
+                              const int32_t *page_indices, uint32_t page_size,
+                              cudaStream_t stream) {
+    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_blocks, n_kv_heads);
+    if (is_fp16) {
+        block_kmean_paged_kernel<__half><<<grid, head_dim, 0, stream>>>(
+            static_cast<const __half *>(k_cache), kbar, per_pos_size, head_dim,
+            win_base, blk_tokens, page_indices, page_size);
+    } else {
+        block_kmean_paged_kernel<float><<<grid, head_dim, 0, stream>>>(
+            static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
+            win_base, blk_tokens, page_indices, page_size);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attn_score_step(float *accum, const float *q,
+                                  const float *kbar, uint32_t q_stride,
+                                  uint32_t n_blocks, uint32_t n_heads,
+                                  uint32_t n_kv_heads, uint32_t head_dim,
+                                  float scale, cudaStream_t stream) {
+    if (n_blocks == 0 || n_heads == 0 || head_dim == 0) return true;
+    // Round threads up to a power of two >= head_dim for the shared reduction.
+    uint32_t threads = 1;
+    while (threads < head_dim) threads <<= 1;
+    const size_t shmem = static_cast<size_t>(threads) * sizeof(float);
+    block_attn_score_step_kernel<<<n_blocks, threads, shmem, stream>>>(
+        accum, q, kbar, q_stride, n_heads, n_kv_heads, head_dim, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
+                                       const float *q, uint32_t q_stride,
+                                       uint32_t n_window_blocks,
+                                       uint32_t n_heads,
+                                       uint32_t n_kv_heads,
+                                       uint32_t per_pos_size,
+                                       uint32_t head_dim,
+                                       const int32_t *win_base,
+                                       const int32_t *blk_tokens,
+                                       const int32_t *page_indices,
+                                       uint32_t page_size,
+                                       uint32_t seq_len,
+                                       float scale,
+                                       cudaStream_t stream) {
+    if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || seq_len == 0) {
+        return true;
+    }
+    constexpr uint32_t threads = 256;
+    if (is_fp16) {
+        block_attention_mass_paged_kernel<__half><<<n_heads, threads, 0, stream>>>(
+            mass, q, q_stride, static_cast<const __half *>(k_cache),
+            n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
+            win_base, blk_tokens, page_indices, page_size, seq_len, scale);
+    } else {
+        block_attention_mass_paged_kernel<float><<<n_heads, threads, 0, stream>>>(
+            mass, q, q_stride, static_cast<const float *>(k_cache),
+            n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
+            win_base, blk_tokens, page_indices, page_size, seq_len, scale);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
+                                      uint32_t n_blocks, uint32_t n_kv_heads,
+                                      uint32_t per_pos_size, uint32_t head_dim,
+                                      uint32_t rope_dim, const int32_t *orig_base,
+                                      const int32_t *blk_tokens,
+                                      const int32_t *page_indices,
+                                      uint32_t page_size, float theta,
+                                      cudaStream_t stream) {
+    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_blocks, n_kv_heads);
+    if (is_fp16) {
+        block_kmean_content_paged_kernel<__half><<<grid, head_dim, 0, stream>>>(
+            static_cast<const __half *>(k_cache), kbar, per_pos_size, head_dim,
+            rope_dim, orig_base, blk_tokens, page_indices, page_size, theta);
+    } else {
+        block_kmean_content_paged_kernel<float><<<grid, head_dim, 0, stream>>>(
+            static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
+            rope_dim, orig_base, blk_tokens, page_indices, page_size, theta);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_derope_query(float *q_content, const float *q, uint32_t q_stride,
+                         uint32_t n_heads, uint32_t head_dim, uint32_t rope_dim,
+                         int32_t query_pos, float theta, cudaStream_t stream) {
+    if (n_heads == 0 || head_dim == 0) return true;
+    derope_query_kernel<<<n_heads, head_dim, 0, stream>>>(
+        q_content, q, q_stride, head_dim, rope_dim, query_pos, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+} // namespace ported
 
 bool cuda_device_backend_available() {
     int count = 0;

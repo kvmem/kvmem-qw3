@@ -45,6 +45,7 @@ add_library(qw3_core
     src/qwen_executor.cpp
     src/qwen_weights.cpp
     src/qwen_config.cpp
+    src/kvmem_store.cpp
     src/tokenizer.cpp
 )
 
@@ -85,11 +86,35 @@ if(QW3_BUILD_TESTS)
     enable_testing()
     add_test(NAME qw3-smoke COMMAND qw3-smoke)
 
+    add_executable(qw3-kvmem-store tests/kvmem_store_test.cpp)
+    target_link_libraries(qw3-kvmem-store PRIVATE qw3_core)
+    add_test(NAME qw3-kvmem-store COMMAND qw3-kvmem-store)
+
+    add_executable(qw3-pinned-kv-tier tests/pinned_kv_tier_test.cpp)
+    target_link_libraries(qw3-pinned-kv-tier PRIVATE qw3_core)
+    add_test(NAME qw3-pinned-kv-tier COMMAND qw3-pinned-kv-tier)
+
+    add_executable(qw3-nvme-kv-tier tests/nvme_kv_tier_test.cpp)
+    target_link_libraries(qw3-nvme-kv-tier PRIVATE qw3_core)
+    add_test(NAME qw3-nvme-kv-tier COMMAND qw3-nvme-kv-tier)
+
     if(QW3_ENABLE_CUDA)
         add_executable(qw3-mmq-parity tests/mmq_parity.cu)
         target_link_libraries(qw3-mmq-parity PRIVATE qw3_core)
         set_property(TARGET qw3-mmq-parity PROPERTY CUDA_STANDARD 17)
         set_property(TARGET qw3-mmq-parity PROPERTY CUDA_STANDARD_REQUIRED ON)
         add_test(NAME qw3-mmq-parity COMMAND qw3-mmq-parity)
+
+        add_executable(qw3-rope-remap-parity tests/rope_remap_parity.cu)
+        target_link_libraries(qw3-rope-remap-parity PRIVATE qw3_core)
+        set_property(TARGET qw3-rope-remap-parity PROPERTY CUDA_STANDARD 17)
+        set_property(TARGET qw3-rope-remap-parity PROPERTY CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME qw3-rope-remap-parity COMMAND qw3-rope-remap-parity)
+
+        add_executable(qw3-kvmem-assembly tests/kvmem_assembly.cu)
+        target_link_libraries(qw3-kvmem-assembly PRIVATE qw3_core)
+        set_property(TARGET qw3-kvmem-assembly PROPERTY CUDA_STANDARD 17)
+        set_property(TARGET qw3-kvmem-assembly PROPERTY CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME qw3-kvmem-assembly COMMAND qw3-kvmem-assembly)
     endif()
 endif()

@@ -57,6 +57,35 @@ uint32_t mtp_prefix_batch_min_tokens() {
     return env_uint32_or("QW3_MTP_PREFIX_BATCH_MIN", 32);
 }
 
+uint32_t count_standard_attention_layers(const QwenConfig &cfg,
+                                         uint32_t n_layers) {
+    uint32_t out = 0;
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        if (cfg.is_standard_attention_layer(il)) ++out;
+    }
+    return out;
+}
+
+uint64_t estimate_kvmem_block_bytes(const QwenConfig &cfg,
+                                    uint32_t standard_layers,
+                                    uint32_t block_tokens) {
+    const char *kv_dtype_env = std::getenv("QW3_KV_DTYPE");
+    const bool kv_use_fp32 = kv_dtype_env && std::strcmp(kv_dtype_env, "fp32") == 0;
+    const bool kv_use_q8 = kv_dtype_env && std::strcmp(kv_dtype_env, "q8") == 0;
+    const bool kv_use_fp8 = kv_dtype_env && std::strcmp(kv_dtype_env, "fp8") == 0;
+    const uint64_t elem_bytes = kv_use_fp32 ? 4ull : (kv_use_fp8 || kv_use_q8 ? 1ull : 2ull);
+    const uint64_t kv_values =
+        static_cast<uint64_t>(block_tokens) * cfg.n_kv_heads * cfg.head_dim;
+    uint64_t bytes = static_cast<uint64_t>(standard_layers) * kv_values *
+                     2ull * elem_bytes;  // K + V
+    if (kv_use_q8) {
+        // q8 stores one fp16 scale per row; rows are token x kv-head, for K and V.
+        bytes += static_cast<uint64_t>(standard_layers) * block_tokens *
+                 cfg.n_kv_heads * 2ull * sizeof(uint16_t);
+    }
+    return bytes;
+}
+
 } // namespace
 
 QwenExecutor::QwenExecutor(const QwenNativeModel &model,
@@ -76,6 +105,14 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
 }
 
 QwenExecutor::~QwenExecutor() {
+    if (kvmem_attn_trace_file_) {
+        std::fclose(kvmem_attn_trace_file_);
+        kvmem_attn_trace_file_ = nullptr;
+    }
+    if (global_attn_trace_file_) {
+        std::fclose(global_attn_trace_file_);
+        global_attn_trace_file_ = nullptr;
+    }
     kv_pages_.reset();
     mtp_kv_pages_.reset();
 }
@@ -255,6 +292,35 @@ void QwenExecutor::reset_state() {
     mtp_kv_pages_.reset();
     mtp_prefix_len_ = 0;
     decode_graph_warmup_pending_ = true;
+    // Block-sparse runtime state is per-session: drop the working set + window
+    // table. The block store itself (configured selection params) is kept; a
+    // fresh register_append sequence rebuilds the block table for the new run.
+    kvmem_active_ = false;
+    window_pages_host_.clear();
+    window_page_count_ = 0;
+    window_query_pos_ = 0;
+    // Cumulative-attention selection signal: drop the live interval; buffers stay
+    // allocated (reused next session). bs_score_layer_ is model-fixed, keep it.
+    bs_score_ready_ = false;
+    bs_window_blocks_ = 0;
+    bs_window_block_ids_.clear();
+    bs_win_base_host_.clear();
+    bs_blk_tokens_host_.clear();
+    // Global content-frame retrieval index is per-session: drop it so the next
+    // run rebuilds from its own pristine post-prefill cache. Device buffers stay
+    // allocated (reused next session, regrown by block capacity).
+    g_content_ready_ = false;
+    g_query_ready_ = false;
+    g_indexed_blocks_ = 0;
+    g_orig_base_host_.clear();
+    g_blk_tokens_host_.clear();
+    if (block_store_) {
+        *block_store_ = KvMemStore(block_store_->config());
+    }
+    kvmem_attn_trace_seen_tokens_ = 0;
+    kvmem_attn_trace_sample_ = 0;
+    global_attn_trace_seen_tokens_ = 0;
+    global_attn_trace_sample_ = 0;
 }
 
 void QwenExecutor::KvPageTable::configure(uint32_t ctx_size,
@@ -777,6 +843,10 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     const uint32_t standard_n_heads = cfg.n_heads;
     const uint32_t standard_n_kv_heads = cfg.n_kv_heads;
     const float eps = cfg.rms_eps;
+    const bool kvmem_trace_this_token =
+        compute_logits && kvmem_attn_trace_sample_now();
+    const bool global_trace_this_token =
+        compute_logits && global_attn_trace_sample_now();
 
     require_status(backend_.begin());
     begin_record_timing(executor_trace_timing_enabled());
@@ -839,6 +909,20 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             record(report, "layer." + std::to_string(il) + ".recurrent_output_add");
         } else {
             ensure_kv_pages(position_, 1);
+            // Block-sparse decode: the live KV cache (kv_pages_ @ position_) is
+            // the growing repository, but attention runs over the assembled
+            // WINDOW — the selected blocks' physical pages re-RoPE'd into a
+            // contiguous [0..window_query_pos_) range. The new token's Q/K are
+            // baked at the window tail, its KV appended at the window tail slot,
+            // and attention scans the window page list. Under an identity (all-
+            // block) selection window_* == kv_pages_/position_ exactly, so these
+            // branches are byte-identical to the plain path below.
+            const bool bs = kvmem_active_;
+            if (bs) kvmem_extend_window_for_decode();
+            const uint32_t attn_pos = bs ? window_query_pos_ : position_;
+            const DeviceTensor &pages_dev =
+                bs ? *window_pages_device_ : kv_page_indices_device();
+            const uint32_t pages_count = bs ? window_page_count_ : kv_page_count();
             {
                 DeviceTensor *outs[3] = {q_.get(), k_.get(), v_.get()};
                 const DeviceWeight *ws[3] = {layer.attn_q, layer.attn_k, layer.attn_v};
@@ -859,33 +943,58 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                                                      standard_head_dim, eps));
 
             // Partial RoPE on the first rope_dim of each head's first segment.
+            // Baked at the window position when block-sparse is active.
             require_status(backend_.rope_partial(*q_, standard_n_heads,
                                                  2 * standard_head_dim,
-                                                 cfg.rope_dim, position_, cfg.rope_theta));
+                                                 cfg.rope_dim, attn_pos, cfg.rope_theta));
             require_status(backend_.rope_partial(*k_, standard_n_kv_heads,
                                                  standard_head_dim,
-                                                 cfg.rope_dim, position_, cfg.rope_theta));
+                                                 cfg.rope_dim, attn_pos, cfg.rope_theta));
 
             // Append K and V to the live cache.
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
             require_status(backend_.kv_append_batch_paged_device(
-                k_cache(il), *k_, position_, per_pos, 1,
-                kv_page_indices_device(), kv_page_count(), kv_page_size()));
+                k_cache(il), *k_, attn_pos, per_pos, 1,
+                pages_dev, pages_count, kv_page_size()));
             require_status(backend_.kv_append_batch_paged_device(
-                v_cache(il), *v_, position_, per_pos, 1,
-                kv_page_indices_device(), kv_page_count(), kv_page_size()));
+                v_cache(il), *v_, attn_pos, per_pos, 1,
+                pages_dev, pages_count, kv_page_size()));
             record(report, "layer." + std::to_string(il) + ".kv_append_paged");
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
             require_status(backend_.attention_decode_batch_paged_gated_device(
                 *mid_, *q_, 2 * standard_head_dim,
                 k_cache(il), v_cache(il),
-                kv_page_indices_device(), kv_page_count(), kv_page_size(),
+                pages_dev, pages_count, kv_page_size(),
                 standard_n_heads, standard_n_kv_heads, standard_head_dim,
-                position_, 1,
+                attn_pos, 1,
                 standard_n_heads * 2 * standard_head_dim,
                 standard_n_heads * standard_head_dim, scale));
             record(report, "layer." + std::to_string(il) + ".attention_sdpa_paged");
+
+            if (global_trace_this_token) {
+                global_trace_attention_layer(
+                    il, k_cache(il), *q_, 2 * standard_head_dim,
+                    pages_dev, pages_count, attn_pos + 1, scale);
+            }
+
+            if (bs && kvmem_trace_this_token) {
+                kvmem_trace_attention_layer(
+                    il, k_cache(il), *q_, 2 * standard_head_dim,
+                    pages_dev, pages_count, attn_pos + 1, scale);
+            }
+
+            // Cumulative-attention selection signal (#40): score the current Q
+            // against each window block's representative K at the representative
+            // layer only. One extra global launch per step; no D2H. Inert unless
+            // block-sparse is active and k̄ is live for this interval.
+            if (bs) kvmem_score_current_step(il, scale);
+
+            // Global content-frame retrieval (#49): de-RoPE the current Q into
+            // the content frame at the representative layer so it can be scored
+            // against the global content index at the next retrieval boundary.
+            // Inert unless the global index is live (fp16/fp32 cache).
+            if (bs) kvmem_snapshot_content_query(il);
 
             // Fused matvec + residual add: h += W_out * mid.
             if (auto st = backend_.q8_0_matvec_add(*h_, *layer.attn_output, *mid_); !st.ok) {
@@ -924,6 +1033,7 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
         // eager begin/end pairing here is always correct.
         require_status(backend_.end());
         position_++;
+        if (kvmem_active_) window_query_pos_++;
         report.ok = true;
         return report;
     }
@@ -950,6 +1060,15 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     require_status(backend_.end());
 
     position_++;
+    if (kvmem_active_) window_query_pos_++;
+    if (kvmem_active_ && kvmem_attn_trace_enabled()) {
+        ++kvmem_attn_trace_seen_tokens_;
+    }
+    if (kvmem_trace_this_token) ++kvmem_attn_trace_sample_;
+    if (global_attn_trace_enabled()) {
+        ++global_attn_trace_seen_tokens_;
+    }
+    if (global_trace_this_token) ++global_attn_trace_sample_;
     report.argmax_token = best.token;
     report.argmax_logit = best.logit;
     report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
@@ -1063,6 +1182,20 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     ensure_scratch();
     const uint32_t total = static_cast<uint32_t>(tokens.size());
 
+    // Block-sparse (kvmem) batched verify: when a window is active this batch
+    // appends + attends in the WINDOW frame (window_query_pos_ base + window
+    // page table), exactly mirroring the single-token decode path
+    // (forward_one_token bs branch). MTP verify is always a single chunk
+    // (mtp_single_chunk forces chunk_size=total below), so chunk_off is always 0
+    // and the window base position is window_query_pos_. Under identity
+    // (all-block) selection window_query_pos_ == position_, so this stays
+    // byte-identical to the plain path. Per-step attention heat
+    // (kvmem_score_current_step / kvmem_snapshot_content_query) is NOT
+    // accumulated here: the default Retrieval selector is position-invariant and
+    // unaffected; H2O/Recency see slightly staler heat across an MTP verify
+    // batch (v1 limitation).
+    const bool bs = kvmem_active_;
+
     // MTP verify/replay requires the whole batch to live in h_batch_ at the
     // tail (per-row argmax) and consistent checkpoint base positions, so it
     // must run as a single chunk. The verifier batch is tiny (chain length,
@@ -1167,6 +1300,13 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         state_checkpoints->base_position = position_;
         state_checkpoints->count = save_state_checkpoints;
         state_checkpoints->h_stride = h_stride;
+        // Record the window base so restore_state_checkpoint can roll the window
+        // tail back per accepted row (see StateCheckpointSet::kvmem_active). The
+        // window is extended below (kvmem_extend_window_for_decode_n); its base
+        // query pos / page count here are the pre-batch values.
+        state_checkpoints->kvmem_active = bs;
+        state_checkpoints->window_base_query_pos = window_query_pos_;
+        state_checkpoints->window_base_page_count = window_page_count_;
         if (state_checkpoints->recurrent_states.size() != recurrent_states_.size()) {
             state_checkpoints->recurrent_states.resize(recurrent_states_.size());
         }
@@ -1195,6 +1335,22 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         const bool full_chunk = (batch == chunk_size);
 
         ensure_kv_pages(base_pos, batch);
+
+        // Block-sparse: extend the assembled window so the batch's `batch`
+        // tokens can be appended at window slots [window_query_pos_,
+        // window_query_pos_+batch). The window's trailing pages alias the SAME
+        // physical pages ensure_kv_pages just allocated at the true positions
+        // [base_pos, base_pos+batch) (no copy). Append + attention below then
+        // run in the WINDOW frame: base position window_query_pos_, window page
+        // table. Under identity (all-block) selection window_query_pos_ ==
+        // base_pos == position_ and the window page list == kv_pages_, so this
+        // is byte-identical to the plain paged path. Non-bs: attn_base_pos ==
+        // base_pos and the plain page table is used.
+        if (bs) kvmem_extend_window_for_decode_n(batch);
+        const uint32_t attn_base_pos = bs ? window_query_pos_ : base_pos;
+        const DeviceTensor &attn_pages_dev =
+            bs ? *window_pages_device_ : kv_page_indices_device();
+        const uint32_t attn_pages_count = bs ? window_page_count_ : kv_page_count();
 
         // Embedding lookup runs eagerly: q8_0_get_rows_batch issues a
         // pageable host->device memcpy which is unsafe inside stream capture.
@@ -1309,21 +1465,21 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                         batch, q_stride_buf,
                                                         standard_n_heads,
                                                         2 * standard_head_dim,
-                                                        cfg.rope_dim, base_pos, cfg.rope_theta));
+                                                        cfg.rope_dim, attn_base_pos, cfg.rope_theta));
             require_status(backend_.rope_partial_batch(*k_batch_,
                                                         batch, k_stride_buf,
                                                         standard_n_kv_heads,
                                                         standard_head_dim,
-                                                        cfg.rope_dim, base_pos, cfg.rope_theta));
+                                                        cfg.rope_dim, attn_base_pos, cfg.rope_theta));
 
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
             if (use_paged_prefill) {
                 require_status(backend_.kv_append_batch_paged_device(
-                    k_cache(il), *k_batch_, base_pos, per_pos, batch,
-                    kv_page_indices_device(), kv_page_count(), kv_page_size()));
+                    k_cache(il), *k_batch_, attn_base_pos, per_pos, batch,
+                    attn_pages_dev, attn_pages_count, kv_page_size()));
                 require_status(backend_.kv_append_batch_paged_device(
-                    v_cache(il), *v_batch_, base_pos, per_pos, batch,
-                    kv_page_indices_device(), kv_page_count(), kv_page_size()));
+                    v_cache(il), *v_batch_, attn_base_pos, per_pos, batch,
+                    attn_pages_dev, attn_pages_count, kv_page_size()));
                 if (record_ops) record(report, "layer." + std::to_string(il) + ".kv_append_batch_paged");
             } else {
                 require_status(backend_.kv_append_batch(
@@ -1339,17 +1495,17 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                     require_status(backend_.attention_decode_batch_paged_gated_device(
                         *mid_batch_, *q_batch_, 2 * standard_head_dim,
                         k_cache(il), v_cache(il),
-                        kv_page_indices_device(), kv_page_count(), kv_page_size(),
+                        attn_pages_dev, attn_pages_count, kv_page_size(),
                         standard_n_heads, standard_n_kv_heads,
-                        standard_head_dim, base_pos, batch,
+                        standard_head_dim, attn_base_pos, batch,
                         q_stride_buf, mid_stride, scale));
                 } else {
                     DeviceStatus attn_st = backend_.attention_prefill_batch_paged_gated_device(
                         *mid_batch_, *q_batch_, 2 * standard_head_dim,
                         k_cache(il), v_cache(il),
-                        kv_page_indices_device(), kv_page_count(), kv_page_size(),
+                        attn_pages_dev, attn_pages_count, kv_page_size(),
                         standard_n_heads, standard_n_kv_heads,
-                        standard_head_dim, base_pos, batch,
+                        standard_head_dim, attn_base_pos, batch,
                         q_stride_buf, mid_stride, scale);
                     if (!attn_st.ok) {
                         if (std::getenv("QW3_DEBUG_PREFILL_PLAN")) {
@@ -1364,9 +1520,10 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                         require_status(backend_.attention_decode_batch_paged_gated(
                             *mid_batch_, *q_batch_, 2 * standard_head_dim,
                             k_cache(il), v_cache(il),
-                            kv_page_indices(), kv_page_count(), kv_page_size(),
+                            bs ? window_pages_host_.data() : kv_page_indices(),
+                            attn_pages_count, kv_page_size(),
                             standard_n_heads, standard_n_kv_heads,
-                            standard_head_dim, base_pos, batch,
+                            standard_head_dim, attn_base_pos, batch,
                             q_stride_buf, mid_stride, scale));
                     }
                 }
@@ -1433,6 +1590,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     // optionally checkpoints), no logits at all.
     if (!compute_logits && !row_argmaxes) {
         position_ += total;
+        if (bs) window_query_pos_ += total;
         require_status(backend_.end());
         report.ok = true;
         return report;
@@ -1463,6 +1621,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         require_status(backend_.end());
 
         position_ += total;
+        if (bs) window_query_pos_ += total;
         const DeviceArgmax &best = row_argmaxes->back();
         report.argmax_token = best.token;
         report.argmax_logit = best.logit;
@@ -1479,6 +1638,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     require_status(backend_.end());
 
     position_ += total;
+    if (bs) window_query_pos_ += total;
     report.argmax_token = best.token;
     report.argmax_logit = best.logit;
     report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
@@ -1819,6 +1979,10 @@ void QwenExecutor::capture_state(StateSnapshot &snapshot) {
     snapshot.position = position_;
     snapshot.kv_logical_pages = kv_pages_.count();
     snapshot.mtp_prefix_len = mtp_prefix_len_;
+    // kvmem window state (inert unless kvmem is active for this session).
+    snapshot.kvmem_active = kvmem_active_;
+    snapshot.window_query_pos = window_query_pos_;
+    snapshot.window_page_count = window_page_count_;
     if (h_) {
         if (!snapshot.h || snapshot.h->count != h_->count) {
             snapshot.h = backend_.scratch_f32(h_->count, "snapshot_h");
@@ -1882,6 +2046,19 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
     kv_pages_.truncate_to_logical_pages(snapshot.kv_logical_pages);
     mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_,
                                          snapshot.mtp_prefix_len);
+    // Roll the kvmem window back to where it was at capture. Verify/decode only
+    // ever appends pages at the window tail (kvmem_extend_window_for_decode), so
+    // truncating the host page list + count and restoring window_query_pos_ is
+    // sufficient: the surviving window slots keep their original re-RoPE bake.
+    // No device re-upload is needed — the appended tail pages are simply no
+    // longer addressed (window_page_count_ caps what attention/append read).
+    if (snapshot.kvmem_active) {
+        window_query_pos_ = snapshot.window_query_pos;
+        window_page_count_ = snapshot.window_page_count;
+        if (window_pages_host_.size() > window_page_count_) {
+            window_pages_host_.resize(window_page_count_);
+        }
+    }
 }
 
 void QwenExecutor::seed_from_shared_prefix(const std::vector<int32_t> &shared_pages,
@@ -1924,6 +2101,722 @@ std::vector<int32_t> QwenExecutor::mark_kv_prefix_shared(uint32_t logical_start_
 
 std::vector<int32_t> QwenExecutor::kv_physical_pages() const {
     return kv_pages_.pages;
+}
+
+// ---- Block-sparse KV attention ------------------------------------------
+
+void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
+    // v1 requires block_tokens to be a positive multiple of the KV page size so
+    // every block boundary is page-aligned: the window packs selected blocks
+    // contiguously, and a non-aligned block would split a physical page across
+    // two logical window slots (corrupting the byte-offset math). The default
+    // block_tokens=128 / page_size=16 satisfies this.
+    const uint32_t page_size = kv_pages_.page_size;
+    if (cfg.block_tokens == 0 || page_size == 0 ||
+        (cfg.block_tokens % page_size) != 0) {
+        throw std::runtime_error(
+            "block-sparse requires --kvmem-block-tokens to be a positive multiple "
+            "of the KV page size (" + std::to_string(page_size) + ")");
+    }
+    KvMemStoreConfig effective = cfg;
+    if (effective.gpu_memory_ratio < 0.0) effective.gpu_memory_ratio = 0.0;
+    if (effective.gpu_memory_ratio > 1.0) effective.gpu_memory_ratio = 1.0;
+    if (effective.gpu_low_watermark < 0.0) effective.gpu_low_watermark = 0.0;
+    if (effective.gpu_low_watermark > 1.0) effective.gpu_low_watermark = 1.0;
+    if (effective.gpu_high_watermark < effective.gpu_low_watermark) {
+        effective.gpu_high_watermark = effective.gpu_low_watermark;
+    }
+    if (effective.gpu_high_watermark > 1.0) effective.gpu_high_watermark = 1.0;
+
+    const QwenConfig &model_cfg = model_.config();
+    const uint32_t standard_layers =
+        count_standard_attention_layers(model_cfg, weights_.n_layers());
+    effective.estimated_block_bytes =
+        estimate_kvmem_block_bytes(model_cfg, standard_layers,
+                                   effective.block_tokens);
+    const uint64_t total_device_bytes = backend_.total_device_bytes();
+    if (effective.gpu_memory_ratio > 0.0 &&
+        total_device_bytes > 0 &&
+        effective.estimated_block_bytes > 0) {
+        const uint64_t cap_bytes = static_cast<uint64_t>(
+            static_cast<long double>(total_device_bytes) *
+            effective.gpu_memory_ratio);
+        const uint64_t cap_blocks64 = cap_bytes / effective.estimated_block_bytes;
+        const uint32_t cap_blocks = cap_blocks64 >
+                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+            ? std::numeric_limits<uint32_t>::max()
+            : static_cast<uint32_t>(cap_blocks64);
+        effective.estimated_gpu_block_capacity = cap_blocks;
+        if (cap_blocks > 0) {
+            const uint64_t cap_tokens =
+                static_cast<uint64_t>(cap_blocks) * effective.block_tokens;
+            if (cap_tokens < effective.select_budget) {
+                effective.select_budget = static_cast<uint32_t>(std::max<uint64_t>(
+                    effective.block_tokens, cap_tokens));
+            }
+        }
+    }
+
+    block_store_ = std::make_unique<KvMemStore>(effective);
+    kvmem_active_ = false;
+    window_pages_host_.clear();
+    window_page_count_ = 0;
+    window_query_pos_ = 0;
+    bs_score_ready_ = false;
+    bs_window_blocks_ = 0;
+    bs_window_block_ids_.clear();
+    bs_win_base_host_.clear();
+    bs_blk_tokens_host_.clear();
+    g_content_ready_ = false;
+    g_query_ready_ = false;
+    g_indexed_blocks_ = 0;
+    g_orig_base_host_.clear();
+    g_blk_tokens_host_.clear();
+}
+
+void QwenExecutor::kvmem_register_append(uint32_t n_new_tokens) {
+    if (!kvmem_enabled_ || !block_store_) return;
+    block_store_->register_append(n_new_tokens);
+}
+
+void QwenExecutor::sync_window_pages_device(uint32_t have_pages) {
+    if (have_pages == 0) return;
+    if (!window_pages_device_) {
+        window_pages_device_ = backend_.tensor_i32(
+            std::max<uint32_t>(kv_pages_.max_pages, 1), "kv_window_page_indices");
+    }
+    // The window page list is rewritten wholesale on every assembly (it is a
+    // reordering, not an append), so re-upload all `have_pages` entries.
+    require_status(backend_.copy_i32_from_host(
+        *window_pages_device_, 0, window_pages_host_.data(), have_pages));
+}
+
+void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
+    const QwenConfig &cfg = model_.config();
+    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t per_pos =
+        static_cast<uint32_t>(cfg.n_kv_heads) * cfg.head_dim;
+
+    // Build the window page-index list = each selected block's ORIGINAL
+    // physical pages, in window (ascending block-id) order, packed contiguously
+    // from window position 0. No-copy: these alias the same physical pages the
+    // block already occupies in kv_pages_; the window is just a pointer
+    // reordering. baked_pos in the plan tells us where the block's K currently
+    // sits so re-RoPE can de-rotate from there.
+    window_pages_host_.clear();
+    const auto &blocks = block_store_->blocks();
+    // Per-window-block metadata for the cumulative-attention selection signal:
+    // window slot w -> (block_id, first window pos, token count). Built in the
+    // same window order as the page list so kbar slot w lines up with accum[w].
+    bs_window_block_ids_.clear();
+    bs_win_base_host_.clear();
+    bs_blk_tokens_host_.clear();
+    for (const KvMemRemap &rm : plan.remaps) {
+        const KvMemBlock &b = blocks[rm.block_id];
+        // The block's original logical positions are
+        // [orig_pos_start .. orig_pos_start + n_tokens). Map each through the
+        // live kv_pages_ table to its physical page, and lay those physical
+        // pages into the window in order. Because blocks are block_tokens-
+        // aligned and the window packs them contiguously, a block that is not
+        // page-aligned in the window would split a physical page across two
+        // logical window slots — guard against it (v1 requires block_tokens to
+        // be a multiple of page_size so window slots stay page-aligned).
+        const uint32_t first_logical = b.orig_pos_start;
+        const uint32_t last_logical = b.orig_pos_start + b.n_tokens - 1;
+        const uint32_t first_page = first_logical / page_size;
+        const uint32_t last_page = last_logical / page_size;
+        for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+            if (lp >= kv_pages_.pages.size()) {
+                throw std::runtime_error(
+                    "block-sparse window references unallocated KV page");
+            }
+            window_pages_host_.push_back(kv_pages_.pages[lp]);
+        }
+        bs_window_block_ids_.push_back(rm.block_id);
+        bs_win_base_host_.push_back(rm.to_base);
+        bs_blk_tokens_host_.push_back(static_cast<int32_t>(b.n_tokens));
+    }
+    window_page_count_ = static_cast<uint32_t>(window_pages_host_.size());
+    window_query_pos_ = plan.total_window_tokens;
+    sync_window_pages_device(window_page_count_);
+
+    // Re-RoPE each moved block in place, per standard attention layer. Skipped
+    // blocks (already baked at their window slot) issue no kernel. The window
+    // page table addresses the physical pages, so the kernel maps window slot
+    // win_base+tok -> page_indices[(win_base+tok)/page_size] just like append.
+    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+        if (!cfg.is_standard_attention_layer(il)) continue;
+        DeviceTensor &kc = k_cache(il);
+        for (const KvMemRemap &rm : plan.remaps) {
+            if (rm.skip) continue;
+            require_status(backend_.rope_block_remap_paged_device(
+                kc, rm.n_tokens, cfg.n_kv_heads, per_pos, cfg.head_dim,
+                cfg.rope_dim, /*win_base=*/static_cast<uint32_t>(rm.to_base),
+                /*from_base=*/rm.from_base, /*to_base=*/rm.to_base,
+                *window_pages_device_, page_size, cfg.rope_theta));
+        }
+    }
+    kvmem_active_ = true;
+    // Rebuild the per-block representative K + reset the score accumulator for
+    // the new interval (k̄ is read from the just-re-RoPE'd window K).
+    kvmem_recompute_kbar();
+}
+
+uint32_t QwenExecutor::kvmem_reselect() {
+    if (!kvmem_enabled_ || !block_store_) return 0;
+    if (block_store_->block_count() == 0) return 0;
+    const KvMemMethod method = block_store_->config().select_method;
+    // Build the global content-frame index once, from the pristine post-prefill
+    // cache (every block still baked at its true position). After the first
+    // assembly re-RoPEs selected blocks into window slots this is no longer
+    // possible, but the content mean is position-invariant so one build serves
+    // the whole session. Only needed for the Retrieval method.
+    if (method == KvMemMethod::Retrieval && !g_content_ready_ &&
+        !kvmem_active_) {
+        kvmem_build_content_index();
+    }
+    // Score selection by the configured method (all three feed pick_topk, which
+    // always keeps the sink + recent windows):
+    //   Retrieval — global content similarity (can resurrect dropped blocks);
+    //               falls back to the window-local heat fold when the
+    //               index/query isn't live (q8/fp8, or first selection).
+    //   H2O       — window-local cumulative attention heat only.
+    //   Recency   — no learned signal; pick_topk keeps sink + recent only.
+    switch (method) {
+        case KvMemMethod::Retrieval:
+            // Preserve the just-finished step's window-local profile before
+            // the global retrieval scorer overwrites the ranking score. Quota
+            // selection can then draw from both pools.
+            kvmem_drain_scores();
+            (void)kvmem_retrieval_score();
+            break;
+        case KvMemMethod::H2O:
+            kvmem_drain_scores();
+            break;
+        case KvMemMethod::Recency:
+            // Drop any heat the per-step accumulator gathered so it does not
+            // leak into pick_topk; selection stays sink + recent only.
+            bs_score_ready_ = false;
+            break;
+    }
+    KvMemPlan plan =
+        block_store_->set_selection(block_store_->pick_topk_blocks());
+    kvmem_assemble(plan);
+    return window_query_pos_;
+}
+
+uint32_t QwenExecutor::kvmem_set_selection(
+        const std::vector<uint32_t> &block_ids) {
+    if (!kvmem_enabled_ || !block_store_) return 0;
+    if (block_store_->block_count() == 0) return 0;
+    KvMemPlan plan = block_store_->set_selection(block_ids);
+    kvmem_assemble(plan);
+    return window_query_pos_;
+}
+
+// Ensure the window page table has a physical page covering window slot
+// `window_query_pos_` (the slot the next decode token will occupy). The new
+// token's true KV was just allocated in kv_pages_ at logical `position_`; in
+// the no-copy design the window's trailing slot aliases that same physical
+// page. Under identity selection window_query_pos_ == position_, so this
+// appends the exact page kv_pages_ just grew — keeping the two tables in
+// lockstep and the decode path byte-identical to plain.
+void QwenExecutor::kvmem_extend_window_for_decode() {
+    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t need_pages = (window_query_pos_ + page_size) / page_size;
+    if (need_pages <= window_page_count_) return;  // current page has room
+    // The true tail page kv_pages_ just allocated for `position_`.
+    const uint32_t true_page = position_ / page_size;
+    if (true_page >= kv_pages_.pages.size()) {
+        throw std::runtime_error(
+            "block-sparse decode: true KV page not allocated before window extend");
+    }
+    window_pages_host_.push_back(kv_pages_.pages[true_page]);
+    window_page_count_ = static_cast<uint32_t>(window_pages_host_.size());
+    sync_window_pages_device(window_page_count_);
+}
+
+// Batched analogue of kvmem_extend_window_for_decode: grow the window so `n`
+// tokens can be appended starting at window slot window_query_pos_. The true
+// tail pages for [position_, position_+n) must already be allocated (caller
+// runs ensure_kv_pages first); we alias the SAME physical pages into the window
+// page list (no copy — window slots and true slots share pages during decode,
+// since window_query_pos_ and position_ advance in lockstep). This pushes the
+// exact same physical pages, in the same order, that `n` successive
+// kvmem_extend_window_for_decode() calls would (each decode token advances
+// position_ and window_query_pos_ together, so window page `pg` aliases true
+// page `pg + (position_ - window_query_pos_)/page_size`). Syncs once at the end.
+void QwenExecutor::kvmem_extend_window_for_decode_n(uint32_t n) {
+    if (n == 0) return;
+    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t need_pages =
+        (window_query_pos_ + n + page_size - 1) / page_size;
+    if (need_pages <= window_page_count_) return;  // current pages have room
+    // Constant page offset between the window tail and the true cache tail;
+    // window_query_pos_ <= position_ always (the window is a compressed view).
+    const uint32_t delta = (position_ - window_query_pos_) / page_size;
+    for (uint32_t pg = window_page_count_; pg < need_pages; ++pg) {
+        const uint32_t true_page = pg + delta;
+        if (true_page >= kv_pages_.pages.size()) {
+            throw std::runtime_error(
+                "block-sparse batched decode: true KV page not allocated "
+                "before window extend");
+        }
+        window_pages_host_.push_back(kv_pages_.pages[true_page]);
+    }
+    window_page_count_ = static_cast<uint32_t>(window_pages_host_.size());
+    sync_window_pages_device(window_page_count_);
+}
+
+// Rebuild the per-window-block representative K (mean baked K) at the first
+// standard attention layer and reset the per-block score accumulator. Called at
+// the end of assembly, once per reselect interval (cost amortized). Reads the
+// just-re-RoPE'd window K so k̄ lives in the same window frame as the Q the
+// per-step kernel will score against.
+void QwenExecutor::kvmem_recompute_kbar() {
+    bs_score_ready_ = false;
+    bs_window_blocks_ = static_cast<uint32_t>(bs_window_block_ids_.size());
+    if (bs_window_blocks_ == 0) return;
+
+    const QwenConfig &cfg = model_.config();
+    // Pick the first standard attention layer as the global representative.
+    if (bs_score_layer_ < 0) {
+        for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+            if (cfg.is_standard_attention_layer(il)) {
+                bs_score_layer_ = static_cast<int32_t>(il);
+                break;
+            }
+        }
+    }
+    if (bs_score_layer_ < 0) return;  // no standard attention layers (shouldn't happen)
+
+    const uint32_t n_kv_heads = cfg.n_kv_heads;
+    const uint32_t head_dim = cfg.head_dim;
+    const uint32_t per_pos = n_kv_heads * head_dim;
+
+    // (Re)allocate device buffers when the block capacity grows.
+    if (bs_window_blocks_ > bs_kbar_capacity_) {
+        bs_kbar_capacity_ = bs_window_blocks_;
+        bs_kbar_ = backend_.tensor_f32(
+            static_cast<uint64_t>(bs_kbar_capacity_) * n_kv_heads * head_dim,
+            "bs_kbar");
+        bs_score_accum_ = backend_.tensor_f32(bs_kbar_capacity_, "bs_score_accum");
+        bs_win_base_dev_ = backend_.tensor_i32(bs_kbar_capacity_, "bs_win_base");
+        bs_blk_tokens_dev_ = backend_.tensor_i32(bs_kbar_capacity_, "bs_blk_tokens");
+    }
+    require_status(backend_.copy_i32_from_host(
+        *bs_win_base_dev_, 0, bs_win_base_host_.data(), bs_window_blocks_));
+    require_status(backend_.copy_i32_from_host(
+        *bs_blk_tokens_dev_, 0, bs_blk_tokens_host_.data(), bs_window_blocks_));
+    require_status(backend_.zero_tensor(*bs_score_accum_));
+
+    // k̄ needs fp16/fp32 K; q8/fp8 caches can't be averaged meaningfully here,
+    // so selection silently stays recency-weighted (the kernel returns an error
+    // we tolerate).
+    auto st = backend_.block_kmean_paged_device(
+        k_cache(static_cast<uint32_t>(bs_score_layer_)), *bs_kbar_,
+        bs_window_blocks_, n_kv_heads, per_pos, head_dim,
+        *bs_win_base_dev_, *bs_blk_tokens_dev_, *window_pages_device_,
+        kv_pages_.page_size);
+    bs_score_ready_ = st.ok;
+}
+
+// Per decode step at the representative layer: score the current RoPE-baked Q
+// against every window block's k̄ and atomic-add into the GPU-resident
+// accumulator. No D2H. Inert unless this is the representative layer and k̄ is
+// live for the current interval.
+void QwenExecutor::kvmem_score_current_step(uint32_t layer_index,
+                                                   float scale) {
+    if (!bs_score_ready_ || bs_window_blocks_ == 0) return;
+    if (static_cast<int32_t>(layer_index) != bs_score_layer_) return;
+    const QwenConfig &cfg = model_.config();
+    (void)backend_.block_attn_score_step_device(
+        *bs_score_accum_, *q_, *bs_kbar_,
+        /*q_stride=*/2 * cfg.head_dim, bs_window_blocks_,
+        cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale);
+}
+
+// Drain the interval's accumulator to host and fold it into the block store's
+// cumulative attn_score (indexed by block_id) so the next pick_topk ranks by
+// attention heat. Called at the reselect boundary before pick_topk.
+void QwenExecutor::kvmem_drain_scores() {
+    if (!bs_score_ready_ || bs_window_blocks_ == 0 || !block_store_) return;
+    std::vector<float> accum(bs_window_blocks_, 0.0f);
+    if (auto st = backend_.copy_to_host(*bs_score_accum_, accum.data(), 0,
+                                        bs_window_blocks_);
+        !st.ok) {
+        bs_score_ready_ = false;
+        return;
+    }
+    std::vector<double> scores(block_store_->block_count(), 0.0);
+    for (uint32_t w = 0; w < bs_window_blocks_; ++w) {
+        const uint32_t id = bs_window_block_ids_[w];
+        if (id < scores.size()) scores[id] += static_cast<double>(accum[w]);
+    }
+    block_store_->accumulate_attn(scores);
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        // Surface the top attention-heat blocks of the interval so the
+        // selection signal is observable (internal diagnostic, default off).
+        std::vector<std::pair<float, uint32_t>> ranked;
+        ranked.reserve(bs_window_blocks_);
+        for (uint32_t w = 0; w < bs_window_blocks_; ++w) {
+            ranked.emplace_back(accum[w], bs_window_block_ids_[w]);
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto &a, const auto &b) { return a.first > b.first; });
+        std::fprintf(stderr, "[bs-trace] interval scores (top): ");
+        for (size_t i = 0; i < ranked.size() && i < 6; ++i) {
+            std::fprintf(stderr, "blk%u=%.2f ", ranked[i].second, ranked[i].first);
+        }
+        std::fprintf(stderr, "(window_blocks=%u)\n", bs_window_blocks_);
+    }
+    bs_score_ready_ = false;
+}
+
+bool QwenExecutor::kvmem_attn_trace_enabled() const {
+    const char *path = std::getenv("QW3_KVMEM_ATTN_TRACE");
+    if (!path || !*path) return false;
+    return !env_disabled_value(env_lower_ascii(path));
+}
+
+bool QwenExecutor::kvmem_attn_trace_sample_now() const {
+    if (!kvmem_active_ || !block_store_ || bs_window_blocks_ == 0) return false;
+    if (!kvmem_attn_trace_enabled()) return false;
+    const uint32_t interval =
+        std::max<uint32_t>(1, env_uint32_or("QW3_KVMEM_ATTN_TRACE_INTERVAL", 1));
+    return (kvmem_attn_trace_seen_tokens_ % interval) == 0;
+}
+
+void QwenExecutor::kvmem_trace_attention_layer(uint32_t layer_index,
+                                               const DeviceTensor &k_cache,
+                                               const DeviceTensor &q,
+                                               uint32_t q_stride,
+                                               const DeviceTensor &page_indices,
+                                               uint32_t n_pages,
+                                               uint32_t seq_len,
+                                               float scale) {
+    if (!kvmem_attn_trace_enabled() || !block_store_) return;
+    if (bs_window_blocks_ == 0 || !bs_win_base_dev_ || !bs_blk_tokens_dev_) return;
+
+    const uint32_t buckets = bs_window_blocks_ + 1;  // final bucket = decode tail
+    if (!kvmem_attn_trace_mass_ || buckets > kvmem_attn_trace_mass_capacity_) {
+        kvmem_attn_trace_mass_capacity_ = buckets;
+        kvmem_attn_trace_mass_ =
+            backend_.tensor_f32(kvmem_attn_trace_mass_capacity_,
+                                "kvmem_attn_trace_mass");
+    }
+
+    const QwenConfig &cfg = model_.config();
+    const uint32_t per_pos = cfg.n_kv_heads * cfg.head_dim;
+    auto st = backend_.block_attention_mass_paged_device(
+        *kvmem_attn_trace_mass_, q, q_stride, k_cache,
+        bs_window_blocks_, cfg.n_heads, cfg.n_kv_heads, per_pos, cfg.head_dim,
+        *bs_win_base_dev_, *bs_blk_tokens_dev_, page_indices, n_pages,
+        kv_pages_.page_size, seq_len, scale);
+    if (!st.ok) return;  // diagnostic-only path: unsupported KV dtype just skips
+
+    std::vector<float> mass(buckets, 0.0f);
+    if (auto copy = backend_.copy_to_host(*kvmem_attn_trace_mass_, mass.data(), 0,
+                                          buckets);
+        !copy.ok) {
+        return;
+    }
+
+    if (!kvmem_attn_trace_file_) {
+        const char *path = std::getenv("QW3_KVMEM_ATTN_TRACE");
+        kvmem_attn_trace_file_ = std::fopen(path, "a");
+        if (!kvmem_attn_trace_file_) return;
+    }
+
+    double sum = 0.0;
+    for (float v : mass) sum += static_cast<double>(v);
+
+    std::FILE *f = kvmem_attn_trace_file_;
+    std::fprintf(f,
+                 "{\"kind\":\"kvmem_attention_mass\","
+                 "\"sample\":%llu,\"position\":%u,\"window_query_pos\":%u,"
+                 "\"seq_len\":%u,\"layer\":%u,\"n_heads\":%u,"
+                 "\"n_kv_heads\":%u,\"head_dim\":%u,\"sum\":%.9g,"
+                 "\"block_ids\":[",
+                 static_cast<unsigned long long>(kvmem_attn_trace_sample_),
+                 position_, window_query_pos_, seq_len, layer_index,
+                 cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, sum);
+    for (uint32_t i = 0; i < bs_window_blocks_; ++i) {
+        if (i) std::fputc(',', f);
+        std::fprintf(f, "%u", bs_window_block_ids_[i]);
+    }
+    if (bs_window_blocks_ > 0) std::fputc(',', f);
+    std::fputs("-1],\"mass\":[", f);
+    for (uint32_t i = 0; i < buckets; ++i) {
+        if (i) std::fputc(',', f);
+        std::fprintf(f, "%.9g", static_cast<double>(mass[i]));
+    }
+    std::fputs("]}\n", f);
+    std::fflush(f);
+}
+
+bool QwenExecutor::global_attn_trace_enabled() const {
+    const char *path = std::getenv("QW3_ATTN_TRACE");
+    if (!path || !*path) return false;
+    return !env_disabled_value(env_lower_ascii(path));
+}
+
+bool QwenExecutor::global_attn_trace_sample_now() const {
+    if (!global_attn_trace_enabled()) return false;
+    const uint32_t interval =
+        std::max<uint32_t>(1, env_uint32_or("QW3_ATTN_TRACE_INTERVAL", 1));
+    return (global_attn_trace_seen_tokens_ % interval) == 0;
+}
+
+void QwenExecutor::global_trace_attention_layer(uint32_t layer_index,
+                                                const DeviceTensor &k_cache,
+                                                const DeviceTensor &q,
+                                                uint32_t q_stride,
+                                                const DeviceTensor &page_indices,
+                                                uint32_t n_pages,
+                                                uint32_t seq_len,
+                                                float scale) {
+    if (!global_attn_trace_enabled() || seq_len == 0) return;
+
+    const uint32_t block_tokens =
+        std::max<uint32_t>(1, env_uint32_or("QW3_ATTN_TRACE_BLOCK_TOKENS", 128));
+    const uint32_t n_blocks = (seq_len + block_tokens - 1) / block_tokens;
+    const uint32_t buckets = n_blocks + 1;  // final bucket should stay 0 here
+    if (n_blocks == 0) return;
+
+    if (n_blocks > global_attn_trace_block_capacity_ ||
+        block_tokens != global_attn_trace_block_tokens_) {
+        global_attn_trace_block_tokens_ = block_tokens;
+        global_attn_trace_block_capacity_ = n_blocks;
+        global_attn_trace_base_dev_ =
+            backend_.tensor_i32(global_attn_trace_block_capacity_,
+                                "global_attn_trace_base");
+        global_attn_trace_tokens_dev_ =
+            backend_.tensor_i32(global_attn_trace_block_capacity_,
+                                "global_attn_trace_tokens");
+        global_attn_trace_mass_ =
+            backend_.tensor_f32(global_attn_trace_block_capacity_ + 1,
+                                "global_attn_trace_mass");
+    }
+    global_attn_trace_base_host_.resize(n_blocks);
+    global_attn_trace_tokens_host_.resize(n_blocks);
+    for (uint32_t i = 0; i < n_blocks; ++i) {
+        const uint32_t base = i * block_tokens;
+        global_attn_trace_base_host_[i] = static_cast<int32_t>(base);
+        const uint32_t remain = (seq_len > base) ? (seq_len - base) : 0;
+        global_attn_trace_tokens_host_[i] =
+            static_cast<int32_t>(std::min(block_tokens, remain));
+    }
+    require_status(backend_.copy_i32_from_host(
+        *global_attn_trace_base_dev_, 0, global_attn_trace_base_host_.data(),
+        n_blocks));
+    require_status(backend_.copy_i32_from_host(
+        *global_attn_trace_tokens_dev_, 0, global_attn_trace_tokens_host_.data(),
+        n_blocks));
+
+    const QwenConfig &cfg = model_.config();
+    const uint32_t per_pos = cfg.n_kv_heads * cfg.head_dim;
+    auto st = backend_.block_attention_mass_paged_device(
+        *global_attn_trace_mass_, q, q_stride, k_cache,
+        n_blocks, cfg.n_heads, cfg.n_kv_heads, per_pos, cfg.head_dim,
+        *global_attn_trace_base_dev_, *global_attn_trace_tokens_dev_,
+        page_indices, n_pages, kv_pages_.page_size, seq_len, scale);
+    if (!st.ok) return;
+
+    std::vector<float> mass(buckets, 0.0f);
+    if (auto copy = backend_.copy_to_host(*global_attn_trace_mass_, mass.data(), 0,
+                                          buckets);
+        !copy.ok) {
+        return;
+    }
+
+    if (!global_attn_trace_file_) {
+        const char *path = std::getenv("QW3_ATTN_TRACE");
+        global_attn_trace_file_ = std::fopen(path, "a");
+        if (!global_attn_trace_file_) return;
+    }
+
+    double sum = 0.0;
+    for (float v : mass) sum += static_cast<double>(v);
+
+    std::FILE *f = global_attn_trace_file_;
+    std::fprintf(f,
+                 "{\"kind\":\"attention_mass\",\"mode\":\"global\","
+                 "\"sample\":%llu,\"position\":%u,\"seq_len\":%u,"
+                 "\"layer\":%u,\"n_heads\":%u,\"n_kv_heads\":%u,"
+                 "\"head_dim\":%u,\"block_tokens\":%u,\"sum\":%.9g,"
+                 "\"block_ids\":[",
+                 static_cast<unsigned long long>(global_attn_trace_sample_),
+                 position_, seq_len, layer_index, cfg.n_heads, cfg.n_kv_heads,
+                 cfg.head_dim, block_tokens, sum);
+    for (uint32_t i = 0; i < n_blocks; ++i) {
+        if (i) std::fputc(',', f);
+        std::fprintf(f, "%u", i);
+    }
+    if (n_blocks > 0) std::fputc(',', f);
+    std::fputs("-1],\"mass\":[", f);
+    for (uint32_t i = 0; i < buckets; ++i) {
+        if (i) std::fputc(',', f);
+        std::fprintf(f, "%.9g", static_cast<double>(mass[i]));
+    }
+    std::fputs("]}\n", f);
+    std::fflush(f);
+}
+
+// ---- Global content-frame KV retrieval (#48/#49) ------------------------
+
+// Build the position-invariant content-frame mean-Key index over ALL current
+// (prefill) blocks, ONCE, from the pristine post-prefill cache. This is the only
+// moment every block's K sits at its true baked position (orig_pos_start+tok);
+// after the first assembly, selected blocks are re-RoPE'd into window slots, so
+// de-RoPE'ing by their original position would no longer match the stored phase.
+// The content mean is position-invariant, so building it once and keeping it is
+// correct for the whole session. Reads through the FULL repository page table.
+// q8/fp8 caches can't be de-RoPE'd → index stays unbuilt, retrieval falls back to
+// the window-local heat signal.
+void QwenExecutor::kvmem_build_content_index() {
+    g_content_ready_ = false;
+    if (!block_store_) return;
+    // Internal diagnostic (default off): force the legacy window-local recency
+    // path by never building the global index. Lets validation A/B the two
+    // selection policies at identical fp16 cache quality.
+    if (env_flag_enabled("QW3_KVMEM_RETRIEVAL_DISABLE")) return;
+    const uint32_t n_blocks = block_store_->block_count();
+    if (n_blocks == 0) return;
+
+    const QwenConfig &cfg = model_.config();
+    if (bs_score_layer_ < 0) {
+        for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+            if (cfg.is_standard_attention_layer(il)) {
+                bs_score_layer_ = static_cast<int32_t>(il);
+                break;
+            }
+        }
+    }
+    if (bs_score_layer_ < 0) return;
+
+    const uint32_t n_kv_heads = cfg.n_kv_heads;
+    const uint32_t head_dim = cfg.head_dim;
+    const uint32_t per_pos = n_kv_heads * head_dim;
+
+    // block_id -> (true first position, token count) from the block store.
+    const auto &blocks = block_store_->blocks();
+    g_orig_base_host_.resize(n_blocks);
+    g_blk_tokens_host_.resize(n_blocks);
+    for (uint32_t i = 0; i < n_blocks; ++i) {
+        g_orig_base_host_[i] = static_cast<int32_t>(blocks[i].orig_pos_start);
+        g_blk_tokens_host_[i] = static_cast<int32_t>(blocks[i].n_tokens);
+    }
+
+    if (n_blocks > g_kbar_global_capacity_) {
+        g_kbar_global_capacity_ = n_blocks;
+        g_kbar_ = backend_.tensor_f32(
+            static_cast<uint64_t>(g_kbar_global_capacity_) * n_kv_heads * head_dim,
+            "g_kbar");
+        g_score_dev_ = backend_.tensor_f32(g_kbar_global_capacity_, "g_score");
+        g_orig_base_dev_ = backend_.tensor_i32(g_kbar_global_capacity_, "g_orig_base");
+        g_blk_tokens_dev_ = backend_.tensor_i32(g_kbar_global_capacity_, "g_blk_tokens");
+    }
+    if (!g_query_content_) {
+        g_query_content_ = backend_.tensor_f32(
+            static_cast<uint64_t>(cfg.n_heads) * head_dim, "g_query_content");
+    }
+    require_status(backend_.copy_i32_from_host(
+        *g_orig_base_dev_, 0, g_orig_base_host_.data(), n_blocks));
+    require_status(backend_.copy_i32_from_host(
+        *g_blk_tokens_dev_, 0, g_blk_tokens_host_.data(), n_blocks));
+
+    auto st = backend_.block_kmean_content_paged_device(
+        k_cache(static_cast<uint32_t>(bs_score_layer_)), *g_kbar_,
+        n_blocks, n_kv_heads, per_pos, head_dim, cfg.rope_dim,
+        *g_orig_base_dev_, *g_blk_tokens_dev_, kv_page_indices_device(),
+        kv_pages_.page_size, cfg.rope_theta);
+    if (st.ok) {
+        g_content_ready_ = true;
+        g_indexed_blocks_ = n_blocks;
+    }
+}
+
+// Per decode step at the representative layer: de-RoPE the current RoPE-baked Q
+// (baked at window_query_pos_) into the content frame so it can be scored against
+// the content-frame mean keys at the retrieval boundary. Cheap (one launch per
+// step at one layer); inert unless the global index is live.
+void QwenExecutor::kvmem_snapshot_content_query(uint32_t layer_index) {
+    if (!g_content_ready_) return;
+    if (static_cast<int32_t>(layer_index) != bs_score_layer_) return;
+    const QwenConfig &cfg = model_.config();
+    auto st = backend_.derope_query_device(
+        *g_query_content_, *q_, /*q_stride=*/2 * cfg.head_dim,
+        cfg.n_heads, cfg.head_dim, cfg.rope_dim,
+        static_cast<int32_t>(window_query_pos_), cfg.rope_theta);
+    g_query_ready_ = st.ok;
+}
+
+// At the retrieval boundary, score EVERY indexed block by the de-RoPE'd query vs
+// its content mean key (zeroed accumulator => the score kernel OVERWRITES, since
+// retrieval re-ranks fresh each interval), drain to host, and overwrite the block
+// store's per-block score. pick_topk then ranks globally and can resurrect a
+// block dropped from the window. Returns false if anything is not live (caller
+// then keeps the window-local heat signal).
+bool QwenExecutor::kvmem_retrieval_score() {
+    if (!g_content_ready_ || !g_query_ready_ || !block_store_) return false;
+    if (g_indexed_blocks_ == 0) return false;
+    const QwenConfig &cfg = model_.config();
+    // Content-frame Q . k̄ has no 1/sqrt(d) softmax scale to honor (it is a bare
+    // similarity rank), so use scale = 1.
+    require_status(backend_.zero_tensor(*g_score_dev_));
+    if (auto st = backend_.block_attn_score_step_device(
+            *g_score_dev_, *g_query_content_, *g_kbar_,
+            /*q_stride=*/cfg.head_dim, g_indexed_blocks_,
+            cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, /*scale=*/1.0f);
+        !st.ok) {
+        return false;
+    }
+    std::vector<float> score(g_indexed_blocks_, 0.0f);
+    if (auto st = backend_.copy_to_host(*g_score_dev_, score.data(), 0,
+                                        g_indexed_blocks_);
+        !st.ok) {
+        return false;
+    }
+    std::vector<double> scores(block_store_->block_count(), 0.0);
+    for (uint32_t id = 0; id < g_indexed_blocks_ && id < scores.size(); ++id) {
+        scores[id] = static_cast<double>(score[id]);
+    }
+    if (block_store_->config().retrieval_method ==
+        KvMemRetrievalMethod::MeanAttention) {
+        double max_score = -std::numeric_limits<double>::infinity();
+        for (uint32_t id = 0; id < g_indexed_blocks_ && id < scores.size(); ++id) {
+            max_score = std::max(max_score, scores[id]);
+        }
+        double denom = 0.0;
+        if (std::isfinite(max_score)) {
+            for (uint32_t id = 0; id < g_indexed_blocks_ && id < scores.size(); ++id) {
+                scores[id] = std::exp(scores[id] - max_score);
+                denom += scores[id];
+            }
+        }
+        if (denom > 0.0) {
+            for (uint32_t id = 0; id < g_indexed_blocks_ && id < scores.size(); ++id) {
+                scores[id] /= denom;
+            }
+        }
+    }
+    block_store_->set_retrieval_scores(scores);
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::vector<std::pair<float, uint32_t>> ranked;
+        ranked.reserve(g_indexed_blocks_);
+        for (uint32_t id = 0; id < g_indexed_blocks_; ++id) {
+            ranked.emplace_back(score[id], id);
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto &a, const auto &b) { return a.first > b.first; });
+        std::fprintf(stderr, "[bs-retrieval] top blocks: ");
+        for (size_t i = 0; i < ranked.size() && i < 6; ++i) {
+            std::fprintf(stderr, "blk%u=%.3f ", ranked[i].second, ranked[i].first);
+        }
+        std::fprintf(stderr, "(indexed=%u)\n", g_indexed_blocks_);
+    }
+    return true;
 }
 
 void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoints,
@@ -2008,6 +2901,22 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
     const uint32_t logical_pages =
         (position_ + kv_pages_.page_size - 1) / kv_pages_.page_size;
     kv_pages_.truncate_to_logical_pages(logical_pages);
+    // Roll the kvmem window tail back to the accepted row, mirroring the
+    // position_/kv_pages_ rollback above. The verify batch only GREW the window
+    // at the tail (kvmem_extend_window_for_decode_n, no mid-batch re-RoPE), so
+    // restoring window_query_pos_ to base+(index+1) and trimming the host page
+    // list + count to cover exactly those slots reverts the batch's extension.
+    // The surviving slots keep their original physical-page aliasing and their
+    // device entries are untouched, so no re-upload is needed (the dropped tail
+    // pages are simply no longer addressed — window_page_count_ caps reads).
+    if (checkpoints.kvmem_active) {
+        const uint32_t page_size = kv_pages_.page_size;
+        window_query_pos_ = checkpoints.window_base_query_pos + index + 1;
+        window_page_count_ = (window_query_pos_ + page_size - 1) / page_size;
+        if (window_pages_host_.size() > window_page_count_) {
+            window_pages_host_.resize(window_page_count_);
+        }
+    }
     mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_, position_);
 }
 
