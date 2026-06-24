@@ -2230,7 +2230,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     window_query_pos_ = 0;
     kvmem_cpu_tier_.reset();
     kvmem_nvme_tier_.reset();
-    kvmem_cpu_bytes_.clear();
+    kvmem_cpu_bytes_.reset();
     kvmem_stage_buffer_.clear();
     if (effective.cpu_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
         PinnedKvTierConfig pcfg;
@@ -2238,9 +2238,10 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         pcfg.slot_bytes = effective.estimated_block_bytes;
         kvmem_cpu_tier_ = std::make_unique<PinnedKvTier>(pcfg);
         if (kvmem_cpu_tier_->enabled()) {
-            kvmem_cpu_bytes_.resize(
+            kvmem_cpu_bytes_ = backend_.host_buffer(
                 static_cast<uint64_t>(kvmem_cpu_tier_->slot_count()) *
-                pcfg.slot_bytes);
+                    pcfg.slot_bytes,
+                "kvmem_cpu_tier");
         }
     }
     if (effective.nvme_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
@@ -2325,6 +2326,22 @@ uint64_t QwenExecutor::kvmem_block_spill_bytes(const KvMemBlock &block) const {
     const uint32_t n_pages = last_page - first_page + 1;
     return page_bytes * n_pages *
            count_standard_attention_layers(cfg, weights_.n_layers()) * 2ull;
+}
+
+uint8_t *QwenExecutor::kvmem_cpu_data() {
+    return kvmem_cpu_bytes_
+        ? static_cast<uint8_t *>(kvmem_cpu_bytes_->data)
+        : nullptr;
+}
+
+const uint8_t *QwenExecutor::kvmem_cpu_data() const {
+    return kvmem_cpu_bytes_
+        ? static_cast<const uint8_t *>(kvmem_cpu_bytes_->data)
+        : nullptr;
+}
+
+uint64_t QwenExecutor::kvmem_cpu_bytes() const {
+    return kvmem_cpu_bytes_ ? kvmem_cpu_bytes_->bytes : 0;
 }
 
 void QwenExecutor::kvmem_canonicalize_block_for_tier(uint32_t block_id) {
@@ -2454,13 +2471,16 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
             if (!kvmem_cpu_tier_) {
                 throw std::runtime_error("KVMem CPU stage-in has no CPU tier");
             }
+            if (!kvmem_cpu_data()) {
+                throw std::runtime_error("KVMem CPU stage-in has no CPU backing buffer");
+            }
             const int32_t slot = kvmem_cpu_tier_->block_slot(rm.block_id);
             if (slot < 0) {
                 throw std::runtime_error("KVMem CPU stage-in missing CPU slot");
             }
             const uint64_t offset = kvmem_cpu_tier_->slot_offset(slot);
             std::memcpy(kvmem_stage_buffer_.data(),
-                        kvmem_cpu_bytes_.data() + offset,
+                        kvmem_cpu_data() + offset,
                         static_cast<size_t>(bytes));
         } else if (block.tier == KvTier::SSD) {
             if (!kvmem_nvme_tier_) {
@@ -2509,6 +2529,9 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
         int32_t cpu_slot = -1;
         int32_t nvme_slot = -1;
         if (kvmem_cpu_tier_) {
+            if (!kvmem_cpu_data()) {
+                throw std::runtime_error("KVMem CPU stage-out has no CPU backing buffer");
+            }
             PinnedSlotPlacement placement;
             if (kvmem_nvme_tier_) {
                 placement = kvmem_cpu_tier_->place_block_evicting(block_id);
@@ -2524,7 +2547,7 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                     const uint64_t victim_offset =
                         kvmem_cpu_tier_->slot_offset(placement.slot);
                     kvmem_nvme_tier_->write_block(
-                        victim, kvmem_cpu_bytes_.data() + victim_offset,
+                        victim, kvmem_cpu_data() + victim_offset,
                         victim_bytes);
                     if (kvmem_tier_trace_enabled()) {
                         std::fprintf(stderr,
@@ -2537,10 +2560,10 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                         kvmem_nvme_tier_->block_slot(victim));
                 }
                 const uint64_t offset = kvmem_cpu_tier_->slot_offset(placement.slot);
-                if (offset + kvmem_stage_buffer_.size() > kvmem_cpu_bytes_.size()) {
+                if (offset + kvmem_stage_buffer_.size() > kvmem_cpu_bytes()) {
                     throw std::runtime_error("KVMem CPU tier slot write out of range");
                 }
-                std::memcpy(kvmem_cpu_bytes_.data() + offset,
+                std::memcpy(kvmem_cpu_data() + offset,
                             kvmem_stage_buffer_.data(),
                             kvmem_stage_buffer_.size());
                 placed = true;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <new>
 #include <limits>
 #include <memory>
 #include <string>
@@ -46,6 +47,13 @@ struct DeviceArgmaxBuffer {
     uint64_t count = 0;
 };
 
+struct HostBuffer {
+    virtual ~HostBuffer() = default;
+    void *data = nullptr;
+    uint64_t bytes = 0;
+    bool pinned = false;
+};
+
 class DeviceBackend {
 public:
     virtual ~DeviceBackend() = default;
@@ -79,6 +87,21 @@ public:
     virtual DeviceStatus replay_graph() { return {}; }
 
     virtual std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) = 0;
+    virtual std::unique_ptr<HostBuffer> host_buffer(uint64_t bytes,
+                                                    const char *label) {
+        (void)label;
+        struct HeapHostBuffer final : HostBuffer {
+            explicit HeapHostBuffer(uint64_t n) {
+                bytes = n;
+                pinned = false;
+                if (n > 0) data = ::operator new(static_cast<size_t>(n));
+            }
+            ~HeapHostBuffer() override {
+                ::operator delete(data);
+            }
+        };
+        return std::make_unique<HeapHostBuffer>(bytes);
+    }
     virtual std::unique_ptr<DeviceTensor> tensor_i32(uint64_t count, const char *label) {
         return tensor_f32(count, label);
     }

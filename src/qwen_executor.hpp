@@ -474,7 +474,7 @@ private:
     uint32_t window_page_count_ = 0;
     std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
-    std::vector<uint8_t> kvmem_cpu_bytes_;
+    std::unique_ptr<HostBuffer> kvmem_cpu_bytes_;
     std::vector<uint8_t> kvmem_stage_buffer_;
     // Attention query position within the assembled window (== sum of selected
     // block token counts at assembly; grows by 1 per decoded token appended at
@@ -487,6 +487,9 @@ private:
     bool kvmem_block_pages_resident(const KvMemBlock &block) const;
     uint64_t kvmem_kv_page_bytes() const;
     uint64_t kvmem_block_spill_bytes(const KvMemBlock &block) const;
+    uint8_t *kvmem_cpu_data();
+    const uint8_t *kvmem_cpu_data() const;
+    uint64_t kvmem_cpu_bytes() const;
     void kvmem_canonicalize_block_for_tier(uint32_t block_id);
     void kvmem_copy_block_to_host(const KvMemBlock &block,
                                   std::vector<uint8_t> &dst);

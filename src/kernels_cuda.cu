@@ -3832,6 +3832,36 @@ public:
                                             /*zero_initialize=*/false);
     }
 
+    std::unique_ptr<HostBuffer> host_buffer(uint64_t bytes,
+                                            const char *label) override {
+        struct CudaHostBuffer final : HostBuffer {
+            std::string label;
+            CudaHostBuffer(uint64_t n, const char *name) {
+                bytes = n;
+                pinned = true;
+                label = name ? name : "host_buffer";
+                if (n == 0) return;
+                cudaError_t err = cudaHostAlloc(&data, static_cast<size_t>(n),
+                                                cudaHostAllocDefault);
+                if (err != cudaSuccess) {
+                    data = nullptr;
+                    (void)cudaGetLastError();
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg),
+                                  "cudaHostAlloc(%s, %.2f MiB) failed: %s",
+                                  label.c_str(),
+                                  static_cast<double>(n) / (1024.0 * 1024.0),
+                                  cudaGetErrorString(err));
+                    throw std::runtime_error(msg);
+                }
+            }
+            ~CudaHostBuffer() override {
+                if (data) cudaFreeHost(data);
+            }
+        };
+        return std::make_unique<CudaHostBuffer>(bytes, label);
+    }
+
     std::unique_ptr<DeviceTensor> tensor_f16(uint64_t count, const char *label) override {
         return std::make_unique<CudaTensor>(count, label, /*elem_bytes=*/sizeof(__half));
     }
