@@ -307,6 +307,7 @@ void QwenExecutor::reset_state() {
     if (kvmem_cpu_tier_) kvmem_cpu_tier_->clear();
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
     kvmem_stage_buffer_.clear();
+    kvmem_prefetch_ = KvMemPrefetchState{};
     // Cumulative-attention selection signal: drop the live interval; buffers stay
     // allocated (reused next session). bs_score_layer_ is model-fixed, keep it.
     bs_score_ready_ = false;
@@ -2232,6 +2233,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_nvme_tier_.reset();
     kvmem_cpu_bytes_.reset();
     kvmem_stage_buffer_.clear();
+    kvmem_prefetch_ = KvMemPrefetchState{};
     if (effective.cpu_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
         PinnedKvTierConfig pcfg;
         pcfg.total_bytes = effective.cpu_tier_bytes;
@@ -2469,75 +2471,97 @@ void QwenExecutor::kvmem_copy_block_from_host(
 }
 
 void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
+    kvmem_start_prefetch(plan);
+    kvmem_finish_prefetch();
+}
+
+void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     if (!block_store_) return;
-    const auto &blocks = block_store_->blocks();
-    bool queued_h2d = false;
-    std::vector<std::vector<uint8_t>> nvme_stage_buffers;
-    require_status(backend_.begin_kv_transfer_to_device());
-    for (const KvMemRemap &rm : plan.remaps) {
-        const KvMemBlock &block = blocks[rm.block_id];
-        if (kvmem_block_pages_resident(block)) {
-            block_store_->set_block_tier(rm.block_id, KvTier::GPU);
-            continue;
-        }
-        const uint64_t bytes = kvmem_block_spill_bytes(block);
-        const void *stage_src = nullptr;
-        uint64_t stage_bytes = bytes;
-        if (block.tier == KvTier::CPU) {
-            if (!kvmem_cpu_tier_) {
-                throw std::runtime_error("KVMem CPU stage-in has no CPU tier");
-            }
-            if (!kvmem_cpu_data()) {
-                throw std::runtime_error("KVMem CPU stage-in has no CPU backing buffer");
-            }
-            const int32_t slot = kvmem_cpu_tier_->block_slot(rm.block_id);
-            if (slot < 0) {
-                throw std::runtime_error("KVMem CPU stage-in missing CPU slot");
-            }
-            const uint64_t offset = kvmem_cpu_tier_->slot_offset(slot);
-            if (offset + bytes > kvmem_cpu_bytes()) {
-                throw std::runtime_error("KVMem CPU tier slot read out of range");
-            }
-            stage_src = kvmem_cpu_data() + offset;
-        } else if (block.tier == KvTier::SSD) {
-            if (!kvmem_nvme_tier_) {
-                throw std::runtime_error("KVMem NVMe stage-in has no NVMe tier");
-            }
-            nvme_stage_buffers.emplace_back();
-            std::vector<uint8_t> &buf = nvme_stage_buffers.back();
-            buf.resize(bytes);
-            kvmem_nvme_tier_->read_block(rm.block_id, buf.data(), bytes);
-            stage_src = buf.data();
-        } else {
-            throw std::runtime_error(
-                "KVMem stage-in requested a non-resident block with no backing tier");
-        }
-        const uint32_t page_size = kv_pages_.page_size;
-        const uint32_t first_page = block.orig_pos_start / page_size;
-        const uint32_t last_page =
-            (block.orig_pos_start + block.n_tokens - 1) / page_size;
-        for (uint32_t lp = first_page; lp <= last_page; ++lp) {
-            (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
-        }
-        kvmem_copy_block_from_host(block, stage_src, stage_bytes);
-        queued_h2d = true;
-        if (kvmem_tier_trace_enabled()) {
-            std::fprintf(stderr,
-                         "[kvmem-tier] stage_in block=%u from=%s bytes=%llu\n",
-                         rm.block_id,
-                         block.tier == KvTier::CPU ? "cpu" : "nvme",
-                         static_cast<unsigned long long>(bytes));
-        }
-        if (block.tier == KvTier::CPU && kvmem_cpu_tier_) {
-            kvmem_cpu_tier_->release_block(rm.block_id);
-        } else if (block.tier == KvTier::SSD && kvmem_nvme_tier_) {
-            kvmem_nvme_tier_->release_block(rm.block_id);
-        }
-        block_store_->set_block_tier(rm.block_id, KvTier::GPU);
+    if (kvmem_prefetch_.active) {
+        throw std::runtime_error("KVMem prefetch already active");
     }
-    if (queued_h2d) {
+    kvmem_prefetch_ = KvMemPrefetchState{};
+    kvmem_prefetch_.active = true;
+    try {
+        const auto &blocks = block_store_->blocks();
+        require_status(backend_.begin_kv_transfer_to_device());
+        for (const KvMemRemap &rm : plan.remaps) {
+            const KvMemBlock &block = blocks[rm.block_id];
+            if (kvmem_block_pages_resident(block)) {
+                block_store_->set_block_tier(rm.block_id, KvTier::GPU);
+                continue;
+            }
+            const uint64_t bytes = kvmem_block_spill_bytes(block);
+            const void *stage_src = nullptr;
+            uint64_t stage_bytes = bytes;
+            if (block.tier == KvTier::CPU) {
+                if (!kvmem_cpu_tier_) {
+                    throw std::runtime_error("KVMem CPU stage-in has no CPU tier");
+                }
+                if (!kvmem_cpu_data()) {
+                    throw std::runtime_error("KVMem CPU stage-in has no CPU backing buffer");
+                }
+                const int32_t slot = kvmem_cpu_tier_->block_slot(rm.block_id);
+                if (slot < 0) {
+                    throw std::runtime_error("KVMem CPU stage-in missing CPU slot");
+                }
+                const uint64_t offset = kvmem_cpu_tier_->slot_offset(slot);
+                if (offset + bytes > kvmem_cpu_bytes()) {
+                    throw std::runtime_error("KVMem CPU tier slot read out of range");
+                }
+                stage_src = kvmem_cpu_data() + offset;
+            } else if (block.tier == KvTier::SSD) {
+                if (!kvmem_nvme_tier_) {
+                    throw std::runtime_error("KVMem NVMe stage-in has no NVMe tier");
+                }
+                kvmem_prefetch_.nvme_buffers.emplace_back();
+                std::vector<uint8_t> &buf = kvmem_prefetch_.nvme_buffers.back();
+                buf.resize(bytes);
+                kvmem_nvme_tier_->read_block(rm.block_id, buf.data(), bytes);
+                stage_src = buf.data();
+            } else {
+                throw std::runtime_error(
+                    "KVMem stage-in requested a non-resident block with no backing tier");
+            }
+            const uint32_t page_size = kv_pages_.page_size;
+            const uint32_t first_page = block.orig_pos_start / page_size;
+            const uint32_t last_page =
+                (block.orig_pos_start + block.n_tokens - 1) / page_size;
+            for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+                (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
+            }
+            kvmem_copy_block_from_host(block, stage_src, stage_bytes);
+            kvmem_prefetch_.queued_h2d = true;
+            kvmem_prefetch_.blocks.push_back(KvMemPrefetchBlock{rm.block_id,
+                                                                block.tier});
+            if (kvmem_tier_trace_enabled()) {
+                std::fprintf(stderr,
+                             "[kvmem-tier] stage_in block=%u from=%s bytes=%llu\n",
+                             rm.block_id,
+                             block.tier == KvTier::CPU ? "cpu" : "nvme",
+                             static_cast<unsigned long long>(bytes));
+            }
+        }
+    } catch (...) {
+        kvmem_prefetch_ = KvMemPrefetchState{};
+        throw;
+    }
+}
+
+void QwenExecutor::kvmem_finish_prefetch() {
+    if (!kvmem_prefetch_.active) return;
+    if (kvmem_prefetch_.queued_h2d) {
         require_status(backend_.wait_kv_transfer());
     }
+    for (const KvMemPrefetchBlock &pb : kvmem_prefetch_.blocks) {
+        if (pb.from == KvTier::CPU && kvmem_cpu_tier_) {
+            kvmem_cpu_tier_->release_block(pb.block_id);
+        } else if (pb.from == KvTier::SSD && kvmem_nvme_tier_) {
+            kvmem_nvme_tier_->release_block(pb.block_id);
+        }
+        block_store_->set_block_tier(pb.block_id, KvTier::GPU);
+    }
+    kvmem_prefetch_ = KvMemPrefetchState{};
 }
 
 void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
@@ -2738,7 +2762,8 @@ uint32_t QwenExecutor::kvmem_reselect() {
     }
     KvMemPlan plan =
         block_store_->set_selection(block_store_->pick_topk_blocks());
-    kvmem_stage_in(plan);
+    kvmem_start_prefetch(plan);
+    kvmem_finish_prefetch();
     kvmem_assemble(plan);
     kvmem_stage_out(plan.stage_out);
     return window_query_pos_;
@@ -2749,7 +2774,8 @@ uint32_t QwenExecutor::kvmem_set_selection(
     if (!kvmem_enabled_ || !block_store_) return 0;
     if (block_store_->block_count() == 0) return 0;
     KvMemPlan plan = block_store_->set_selection(block_ids);
-    kvmem_stage_in(plan);
+    kvmem_start_prefetch(plan);
+    kvmem_finish_prefetch();
     kvmem_assemble(plan);
     kvmem_stage_out(plan.stage_out);
     return window_query_pos_;

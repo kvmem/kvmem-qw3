@@ -476,6 +476,17 @@ private:
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
     std::unique_ptr<HostBuffer> kvmem_cpu_bytes_;
     std::vector<uint8_t> kvmem_stage_buffer_;
+    struct KvMemPrefetchBlock {
+        uint32_t block_id = 0;
+        KvTier from = KvTier::GPU;
+    };
+    struct KvMemPrefetchState {
+        bool active = false;
+        bool queued_h2d = false;
+        std::vector<KvMemPrefetchBlock> blocks;
+        std::vector<std::vector<uint8_t>> nvme_buffers;
+    };
+    KvMemPrefetchState kvmem_prefetch_;
     // Attention query position within the assembled window (== sum of selected
     // block token counts at assembly; grows by 1 per decoded token appended at
     // the window tail). Equals position_ under identity (all-block) selection.
@@ -483,6 +494,8 @@ private:
     // Assemble window_pages_* + per-layer re-RoPE from a finished selection plan.
     void kvmem_assemble(const KvMemPlan &plan);
     void kvmem_stage_in(const KvMemPlan &plan);
+    void kvmem_start_prefetch(const KvMemPlan &plan);
+    void kvmem_finish_prefetch();
     void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
     bool kvmem_block_pages_resident(const KvMemBlock &block) const;
     uint64_t kvmem_kv_page_bytes() const;
