@@ -299,6 +299,7 @@ void QwenExecutor::reset_state() {
     window_pages_host_.clear();
     window_page_count_ = 0;
     window_query_pos_ = 0;
+    kvmem_cpu_spill_.clear();
     // Cumulative-attention selection signal: drop the live interval; buffers stay
     // allocated (reused next session). bs_score_layer_ is model-fixed, keep it.
     bs_score_ready_ = false;
@@ -440,6 +441,64 @@ void QwenExecutor::KvPageTable::truncate_to_logical_pages(uint32_t logical_pages
     if (allocator && !released.empty()) {
         allocator->release_physical_pages(released);
     }
+}
+
+bool QwenExecutor::KvPageTable::logical_page_resident(
+        uint32_t logical_page) const {
+    return logical_page < pages.size() && pages[logical_page] >= 0;
+}
+
+int32_t QwenExecutor::KvPageTable::ensure_logical_page_resident(
+        DeviceBackend &backend, uint32_t logical_page) {
+    if (logical_page >= max_pages) {
+        throw std::runtime_error("KV logical page exceeds page capacity");
+    }
+    while (pages.size() <= logical_page) {
+        const uint32_t lp = static_cast<uint32_t>(pages.size());
+        const int32_t physical_page =
+            allocator ? allocator->allocate_physical_page()
+                      : allocate_physical_page(lp);
+        pages.push_back(physical_page);
+        owned.push_back(true);
+    }
+    if (pages[logical_page] < 0) {
+        const int32_t physical_page =
+            allocator ? allocator->allocate_physical_page()
+                      : allocate_physical_page(logical_page);
+        pages[logical_page] = physical_page;
+        if (owned.size() < pages.size()) owned.resize(pages.size(), true);
+        owned[logical_page] = true;
+    }
+    if (!device_pages) {
+        device_pages = backend.tensor_i32(std::max<uint32_t>(max_pages, 1),
+                                          "kv_page_indices");
+    }
+    require_status(backend.copy_i32_from_host(
+        *device_pages, logical_page, &pages[logical_page], 1));
+    device_synced = std::max<uint32_t>(device_synced, logical_page + 1);
+    return pages[logical_page];
+}
+
+void QwenExecutor::KvPageTable::release_logical_pages(
+        DeviceBackend &backend, uint32_t logical_start, uint32_t count) {
+    if (count == 0 || logical_start >= pages.size()) return;
+    const uint32_t end = std::min<uint32_t>(
+        static_cast<uint32_t>(pages.size()), logical_start + count);
+    std::vector<int32_t> released;
+    released.reserve(end - logical_start);
+    for (uint32_t lp = logical_start; lp < end; ++lp) {
+        if (pages[lp] < 0) continue;
+        if (lp >= owned.size() || owned[lp]) released.push_back(pages[lp]);
+        pages[lp] = -1;
+        if (lp < owned.size()) owned[lp] = false;
+    }
+    if (allocator && !released.empty()) {
+        allocator->release_physical_pages(released);
+    }
+    if (!device_pages) return;
+    require_status(backend.copy_i32_from_host(
+        *device_pages, logical_start, pages.data() + logical_start,
+        end - logical_start));
 }
 
 void QwenExecutor::KvPageTable::adopt_shared_pages(DeviceBackend &backend,
@@ -2162,6 +2221,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     window_pages_host_.clear();
     window_page_count_ = 0;
     window_query_pos_ = 0;
+    kvmem_cpu_spill_.clear();
     bs_score_ready_ = false;
     bs_window_blocks_ = 0;
     bs_window_block_ids_.clear();
@@ -2189,6 +2249,168 @@ void QwenExecutor::sync_window_pages_device(uint32_t have_pages) {
     // reordering, not an append), so re-upload all `have_pages` entries.
     require_status(backend_.copy_i32_from_host(
         *window_pages_device_, 0, window_pages_host_.data(), have_pages));
+}
+
+uint64_t QwenExecutor::kvmem_kv_page_bytes() const {
+    const QwenConfig &cfg = model_.config();
+    const uint64_t per_pos =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    const uint64_t elems = static_cast<uint64_t>(kv_pages_.page_size) * per_pos;
+    const DeviceTensor *sample = nullptr;
+    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+        if (!cfg.is_standard_attention_layer(il)) continue;
+        sample = external_kv_cache_ ? external_kv_cache_->k_cache[il]
+                                    : k_cache_[il].get();
+        break;
+    }
+    if (!sample) return 0;
+    if (sample->elem_size == 1) {
+        throw std::runtime_error(
+            "KVMem CPU offload does not yet support 1-byte KV dtypes");
+    }
+    return elems * static_cast<uint64_t>(sample->elem_size);
+}
+
+bool QwenExecutor::kvmem_block_pages_resident(const KvMemBlock &block) const {
+    if (block.n_tokens == 0) return true;
+    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t first_page = block.orig_pos_start / page_size;
+    const uint32_t last_page = (block.orig_pos_start + block.n_tokens - 1) / page_size;
+    for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+        if (!kv_pages_.logical_page_resident(lp)) return false;
+    }
+    return true;
+}
+
+void QwenExecutor::kvmem_copy_block_to_host(const KvMemBlock &block,
+                                            std::vector<uint8_t> &dst) {
+    if (block.n_tokens == 0) {
+        dst.clear();
+        return;
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint64_t page_bytes = kvmem_kv_page_bytes();
+    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t first_page = block.orig_pos_start / page_size;
+    const uint32_t last_page = (block.orig_pos_start + block.n_tokens - 1) / page_size;
+    const uint32_t n_pages = last_page - first_page + 1;
+    const uint64_t per_pos =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    dst.clear();
+    dst.resize(page_bytes * n_pages * count_standard_attention_layers(cfg, weights_.n_layers()) * 2ull);
+    uint8_t *out = dst.data();
+    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+        if (!cfg.is_standard_attention_layer(il)) continue;
+        DeviceTensor &kc = k_cache(il);
+        DeviceTensor &vc = v_cache(il);
+        if (kc.elem_size != vc.elem_size) {
+            throw std::runtime_error("KVMem CPU offload found mixed K/V dtypes");
+        }
+        for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+            if (!kv_pages_.logical_page_resident(lp)) {
+                throw std::runtime_error("KVMem CPU offload saw non-resident GPU page");
+            }
+            const int32_t physical_page = kv_pages_.pages[lp];
+            const uint64_t byte_offset =
+                static_cast<uint64_t>(physical_page) * page_size * per_pos *
+                static_cast<uint64_t>(kc.elem_size);
+            require_status(backend_.copy_bytes_to_host(kc, out, byte_offset, page_bytes));
+            out += page_bytes;
+            require_status(backend_.copy_bytes_to_host(vc, out, byte_offset, page_bytes));
+            out += page_bytes;
+        }
+    }
+}
+
+void QwenExecutor::kvmem_copy_block_from_host(
+        const KvMemBlock &block, const std::vector<uint8_t> &src) {
+    if (block.n_tokens == 0) return;
+    const QwenConfig &cfg = model_.config();
+    const uint64_t page_bytes = kvmem_kv_page_bytes();
+    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t first_page = block.orig_pos_start / page_size;
+    const uint32_t last_page = (block.orig_pos_start + block.n_tokens - 1) / page_size;
+    const uint32_t n_pages = last_page - first_page + 1;
+    const uint64_t expected =
+        page_bytes * n_pages * count_standard_attention_layers(cfg, weights_.n_layers()) * 2ull;
+    if (src.size() != expected) {
+        throw std::runtime_error("KVMem CPU stage-in found wrong spill buffer size");
+    }
+    const uint64_t per_pos =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    const uint8_t *in = src.data();
+    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+        if (!cfg.is_standard_attention_layer(il)) continue;
+        DeviceTensor &kc = k_cache(il);
+        DeviceTensor &vc = v_cache(il);
+        if (kc.elem_size != vc.elem_size) {
+            throw std::runtime_error("KVMem CPU stage-in found mixed K/V dtypes");
+        }
+        for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+            if (!kv_pages_.logical_page_resident(lp)) {
+                throw std::runtime_error("KVMem CPU stage-in target page missing");
+            }
+            const int32_t physical_page = kv_pages_.pages[lp];
+            const uint64_t byte_offset =
+                static_cast<uint64_t>(physical_page) * page_size * per_pos *
+                static_cast<uint64_t>(kc.elem_size);
+            require_status(backend_.copy_bytes_from_host(kc, byte_offset, in, page_bytes));
+            in += page_bytes;
+            require_status(backend_.copy_bytes_from_host(vc, byte_offset, in, page_bytes));
+            in += page_bytes;
+        }
+    }
+}
+
+void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
+    if (!block_store_) return;
+    const auto &blocks = block_store_->blocks();
+    if (kvmem_cpu_spill_.size() < blocks.size()) {
+        kvmem_cpu_spill_.resize(blocks.size());
+    }
+    for (const KvMemRemap &rm : plan.remaps) {
+        const KvMemBlock &block = blocks[rm.block_id];
+        if (kvmem_block_pages_resident(block)) {
+            block_store_->set_block_tier(rm.block_id, KvTier::GPU);
+            continue;
+        }
+        if (rm.block_id >= kvmem_cpu_spill_.size() ||
+            kvmem_cpu_spill_[rm.block_id].empty()) {
+            throw std::runtime_error(
+                "KVMem stage-in requested a block without CPU spill data");
+        }
+        const uint32_t page_size = kv_pages_.page_size;
+        const uint32_t first_page = block.orig_pos_start / page_size;
+        const uint32_t last_page =
+            (block.orig_pos_start + block.n_tokens - 1) / page_size;
+        for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+            (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
+        }
+        kvmem_copy_block_from_host(block, kvmem_cpu_spill_[rm.block_id]);
+        block_store_->set_block_tier(rm.block_id, KvTier::GPU);
+    }
+}
+
+void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
+    if (!block_store_ || block_ids.empty()) return;
+    const auto &blocks = block_store_->blocks();
+    if (kvmem_cpu_spill_.size() < blocks.size()) {
+        kvmem_cpu_spill_.resize(blocks.size());
+    }
+    for (uint32_t block_id : block_ids) {
+        if (block_id >= blocks.size()) continue;
+        const KvMemBlock &block = blocks[block_id];
+        if (!kvmem_block_pages_resident(block)) continue;
+        kvmem_copy_block_to_host(block, kvmem_cpu_spill_[block_id]);
+        const uint32_t page_size = kv_pages_.page_size;
+        const uint32_t first_page = block.orig_pos_start / page_size;
+        const uint32_t last_page =
+            (block.orig_pos_start + block.n_tokens - 1) / page_size;
+        kv_pages_.release_logical_pages(backend_, first_page,
+                                        last_page - first_page + 1);
+        block_store_->set_block_tier(block_id, KvTier::CPU,
+                                     static_cast<int32_t>(block_id), -1);
+    }
 }
 
 void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
@@ -2229,6 +2451,10 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
             if (lp >= kv_pages_.pages.size()) {
                 throw std::runtime_error(
                     "block-sparse window references unallocated KV page");
+            }
+            if (kv_pages_.pages[lp] < 0) {
+                throw std::runtime_error(
+                    "block-sparse window references offloaded KV page");
             }
             window_pages_host_.push_back(kv_pages_.pages[lp]);
         }
@@ -2301,7 +2527,9 @@ uint32_t QwenExecutor::kvmem_reselect() {
     }
     KvMemPlan plan =
         block_store_->set_selection(block_store_->pick_topk_blocks());
+    kvmem_stage_in(plan);
     kvmem_assemble(plan);
+    kvmem_stage_out(plan.stage_out);
     return window_query_pos_;
 }
 
@@ -2310,7 +2538,9 @@ uint32_t QwenExecutor::kvmem_set_selection(
     if (!kvmem_enabled_ || !block_store_) return 0;
     if (block_store_->block_count() == 0) return 0;
     KvMemPlan plan = block_store_->set_selection(block_ids);
+    kvmem_stage_in(plan);
     kvmem_assemble(plan);
+    kvmem_stage_out(plan.stage_out);
     return window_query_pos_;
 }
 

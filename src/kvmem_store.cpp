@@ -58,8 +58,14 @@ void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
     if (block_id >= block_count()) return;
     KvMemBlock &b = blocks_[block_id];
     b.tier = tier;
-    b.cpu_slot = cpu_slot;
-    b.nvme_slot = nvme_slot;
+    if (tier == KvTier::GPU) {
+        b.cpu_slot = -1;
+        b.nvme_slot = -1;
+    } else {
+        b.gpu_slot = -1;
+        b.cpu_slot = cpu_slot;
+        b.nvme_slot = nvme_slot;
+    }
 }
 
 std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
@@ -200,11 +206,13 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
     std::vector<bool> now_selected(block_count(), false);
     for (uint32_t id : selected_ids) now_selected[id] = true;
 
-    // Stage-out: blocks currently resident but no longer selected. Their cache
-    // pages keep whatever bake they currently hold (baked_pos unchanged); a
-    // future re-selection will de-rotate from there.
+    // Stage-out: any GPU-resident block that is not selected. On the first
+    // post-prefill selection, many cold blocks were never in the prior working
+    // set, but they still occupy GPU KV pages and must be eligible for offload.
+    // Their cache pages keep whatever bake they currently hold (baked_pos
+    // unchanged); a future re-selection will de-rotate from there.
     for (auto &b : blocks_) {
-        if (b.in_working_set && !now_selected[b.block_id]) {
+        if (b.tier == KvTier::GPU && !now_selected[b.block_id]) {
             plan.stage_out.push_back(b.block_id);
             b.in_working_set = false;
         }

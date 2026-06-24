@@ -57,7 +57,9 @@ static void test_selection_diff_and_remap() {
     // Select blocks {0, 2, 4} (out of order on purpose).
     auto plan = s.set_selection({4, 0, 2});
     CHECK(plan.stage_in.size() == 3);       // all three newly resident
-    CHECK(plan.stage_out.empty());
+    CHECK(plan.stage_out.size() == 2);      // cold GPU blocks 1 and 3 leave
+    CHECK(plan.stage_out[0] == 1);
+    CHECK(plan.stage_out[1] == 3);
     CHECK(plan.remaps.size() == 3);
     CHECK(plan.total_window_tokens == 128 * 3);
     // Window order is ascending block id; packed contiguously from 0.
@@ -74,6 +76,9 @@ static void test_selection_diff_and_remap() {
     CHECK(plan.remaps[2].block_id == 4);
     CHECK(plan.remaps[2].from_base == 128 * 4);
     CHECK(plan.remaps[2].to_base == 128 * 2);
+    for (uint32_t id : plan.stage_out) {
+        s.set_block_tier(id, KvTier::CPU, static_cast<int32_t>(id), -1);
+    }
 
     // Reselect {0, 2, 3}: block 4 leaves, block 3 enters, 0 and 2 stay.
     // Blocks 0 and 2 are now baked at their window slots (0 and 128), so on
@@ -90,6 +95,22 @@ static void test_selection_diff_and_remap() {
     CHECK(plan2.remaps[2].to_base == 128 * 2);
     CHECK(plan2.remaps[2].skip == false);
     CHECK(plan2.total_window_tokens == 128 * 3);
+}
+
+static void test_stage_in_uses_tier_residency() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+
+    auto plan = s.set_selection({0, 3});
+    CHECK(plan.stage_out.size() == 2);
+    s.set_block_tier(1, KvTier::CPU, 1, -1);
+    s.set_block_tier(2, KvTier::CPU, 2, -1);
+
+    auto plan2 = s.set_selection({0, 1, 3});
+    CHECK(plan2.stage_in.size() == 1);
+    CHECK(plan2.stage_in[0] == 1);
+    CHECK(plan2.stage_out.empty());
 }
 
 static void test_topk_budget_sink_recent() {
@@ -199,6 +220,7 @@ static void test_tier_metadata() {
 int main() {
     test_register_append();
     test_selection_diff_and_remap();
+    test_stage_in_uses_tier_residency();
     test_topk_budget_sink_recent();
     test_quota_policy_sink_recent_retrieval_profile();
     test_topk_all_fit();

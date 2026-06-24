@@ -304,6 +304,12 @@ private:
         void validate_physical_capacity(uint64_t physical_slots,
                                         const char *label) const;
         void truncate_to_logical_pages(uint32_t logical_pages);
+        bool logical_page_resident(uint32_t logical_page) const;
+        int32_t ensure_logical_page_resident(DeviceBackend &backend,
+                                             uint32_t logical_page);
+        void release_logical_pages(DeviceBackend &backend,
+                                   uint32_t logical_start,
+                                   uint32_t count);
         int32_t allocate_physical_page(uint32_t logical_page) const;
         // Install pre-existing (pinned, cache-owned) physical pages as logical
         // pages [0..shared.size()) without allocating. Must be called on a
@@ -464,12 +470,21 @@ private:
     std::vector<int32_t> window_pages_host_;
     std::unique_ptr<DeviceTensor> window_pages_device_;
     uint32_t window_page_count_ = 0;
+    std::vector<std::vector<uint8_t>> kvmem_cpu_spill_;
     // Attention query position within the assembled window (== sum of selected
     // block token counts at assembly; grows by 1 per decoded token appended at
     // the window tail). Equals position_ under identity (all-block) selection.
     uint32_t window_query_pos_ = 0;
     // Assemble window_pages_* + per-layer re-RoPE from a finished selection plan.
     void kvmem_assemble(const KvMemPlan &plan);
+    void kvmem_stage_in(const KvMemPlan &plan);
+    void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
+    bool kvmem_block_pages_resident(const KvMemBlock &block) const;
+    uint64_t kvmem_kv_page_bytes() const;
+    void kvmem_copy_block_to_host(const KvMemBlock &block,
+                                  std::vector<uint8_t> &dst);
+    void kvmem_copy_block_from_host(const KvMemBlock &block,
+                                    const std::vector<uint8_t> &src);
     void sync_window_pages_device(uint32_t have_pages);
     // Grow the window page table by the trailing physical page so a decode
     // token can be appended at window slot window_query_pos_.

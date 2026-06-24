@@ -176,7 +176,7 @@ public:
                         int32_t cpu_slot = -1,
                         int32_t nvme_slot = -1);
 
-    // Diff `selected_ids` against the current working set and produce the
+    // Diff `selected_ids` against current GPU residency / working-set state and produce the
     // stage-in/out lists + the window remap plan. Each remap de-rotates from the
     // block's CURRENT bake position and re-rotates to its new window slot (in
     // place, no copy); blocks already in the right slot get skip=true. Updates
