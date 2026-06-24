@@ -6571,8 +6571,9 @@ private:
         // last call so accepted-chain commits (which advance position by >1)
         // register the whole jump in one shot.
         uint32_t kvmem_registered_pos = 0;
-        auto kvmem_advance_to = [&](uint32_t committed_pos) {
-            if (!kvmem_on) return;
+        auto kvmem_advance_to = [&](uint32_t committed_pos,
+                                    bool defer_finish = false) -> bool {
+            if (!kvmem_on) return false;
             if (committed_pos > kvmem_registered_pos) {
                 executor_->kvmem_register_append(committed_pos -
                                                  kvmem_registered_pos);
@@ -6581,9 +6582,15 @@ private:
             if (options_.kvmem_update_mode != "step" &&
                 committed_pos >= kvmem_last_reselect_pos +
                                      static_cast<uint32_t>(kvmem_interval)) {
-                executor_->kvmem_reselect();
+                if (defer_finish) {
+                    executor_->kvmem_prepare_reselect();
+                } else {
+                    executor_->kvmem_reselect();
+                }
                 kvmem_last_reselect_pos = committed_pos;
+                return defer_finish;
             }
+            return false;
         };
         const uint32_t requested_mtp_chain_len = mtp_trace_chain_len(options_);
         const uint32_t safe_mtp_chain_max = spec_mtp
@@ -6791,9 +6798,11 @@ private:
             mtp_state_checkpoint_count(mtp_chain_len);
 
         auto rebuild_accepted_mtp_prefix = [&](const std::vector<uint32_t> &tokens,
-                                               uint32_t base_position) {
+                                               uint32_t base_position,
+                                               bool finish_deferred_kvmem = false) {
             if (!mtp_rebuild_accepted_prefix_enabled()) {
                 executor_->commit_mtp_prefix(executor_->position());
+                if (finish_deferred_kvmem) executor_->kvmem_finish_reselect();
                 return;
             }
             const double t_prefix_start = mtp_phase_time();
@@ -6808,10 +6817,13 @@ private:
                 throw std::runtime_error("MTP accepted-prefix rebuild failed: " + reason);
             }
             mtp_ops += prefix.ops_executed;
+            if (finish_deferred_kvmem) executor_->kvmem_finish_reselect();
         };
-        auto rebuild_current_mtp_prefix = [&](uint32_t token, uint32_t base_position) {
+        auto rebuild_current_mtp_prefix = [&](uint32_t token, uint32_t base_position,
+                                              bool finish_deferred_kvmem = false) {
             if (!mtp_rebuild_accepted_prefix_enabled()) {
                 executor_->commit_mtp_prefix(executor_->position());
+                if (finish_deferred_kvmem) executor_->kvmem_finish_reselect();
                 return;
             }
             const double t_prefix_start = mtp_phase_time();
@@ -6825,6 +6837,7 @@ private:
                 throw std::runtime_error("MTP current-prefix rebuild failed: " + reason);
             }
             mtp_ops += prefix.ops_executed;
+            if (finish_deferred_kvmem) executor_->kvmem_finish_reselect();
         };
         auto replay_target_tokens_sequential = [&](const std::vector<uint32_t> &tokens,
                                                    uint32_t base_position,
@@ -7206,6 +7219,8 @@ private:
                     log(policy_msg.str());
                 }
                 if (all_accepted) {
+                    bool kvmem_advanced_this_iter = false;
+                    bool kvmem_finish_after_prefix = false;
                     if (use_transactional_replay_all) {
                         if (!captured_snapshot) {
                             throw std::runtime_error("MTP transactional replay requires a state snapshot");
@@ -7223,7 +7238,12 @@ private:
                         }
                         decode_ops += step.ops_executed;
                     } else {
-                        rebuild_accepted_mtp_prefix(verify_tokens, verify_base_position);
+                        kvmem_finish_after_prefix =
+                            kvmem_advance_to(executor_->position(),
+                                             /*defer_finish=*/true);
+                        kvmem_advanced_this_iter = true;
+                        rebuild_accepted_mtp_prefix(verify_tokens, verify_base_position,
+                                                    kvmem_finish_after_prefix);
                     }
                     for (uint32_t i = 0; i < accepted; ++i) {
                         if (!emit_generated_token(drafts[i])) break;
@@ -7234,7 +7254,13 @@ private:
                         : eos;
                     next_token = static_cast<uint32_t>(target_token);
                     if (!emit_generated_token(next_token)) break;
+                    if (!kvmem_advanced_this_iter) {
+                        kvmem_advance_to(executor_->position());
+                        kvmem_advanced_this_iter = true;
+                    }
                 } else {
+                    bool kvmem_advanced_this_iter = false;
+                    bool kvmem_finish_after_prefix = false;
                     ++mtp_spec_rollbacks;
                     std::vector<uint32_t> replay;
                     replay.reserve(accepted + 1);
@@ -7294,13 +7320,30 @@ private:
                     } else if (single_token_replay &&
                         reuse_current_mtp_prefix &&
                         mtp_rebuild_accepted_prefix_enabled()) {
+                        kvmem_finish_after_prefix =
+                            kvmem_advance_to(executor_->position(),
+                                             /*defer_finish=*/true);
+                        kvmem_advanced_this_iter = true;
                         const double t_prefix_start = mtp_phase_time();
                         executor_->commit_mtp_prefix_from_current_hidden(executor_->position());
                         mtp_spec_prefix_s += mtp_phase_time() - t_prefix_start;
+                        if (kvmem_finish_after_prefix) {
+                            executor_->kvmem_finish_reselect();
+                        }
                     } else if (single_token_replay) {
-                        rebuild_current_mtp_prefix(replay.front(), verify_base_position);
+                        kvmem_finish_after_prefix =
+                            kvmem_advance_to(executor_->position(),
+                                             /*defer_finish=*/true);
+                        kvmem_advanced_this_iter = true;
+                        rebuild_current_mtp_prefix(replay.front(), verify_base_position,
+                                                   kvmem_finish_after_prefix);
                     } else {
-                        rebuild_accepted_mtp_prefix(replay, verify_base_position);
+                        kvmem_finish_after_prefix =
+                            kvmem_advance_to(executor_->position(),
+                                             /*defer_finish=*/true);
+                        kvmem_advanced_this_iter = true;
+                        rebuild_accepted_mtp_prefix(replay, verify_base_position,
+                                                    kvmem_finish_after_prefix);
                     }
                     for (uint32_t i = 0; i < accepted; ++i) {
                         if (!emit_generated_token(drafts[i])) break;
@@ -7312,6 +7355,10 @@ private:
                         mtp_spec_fallback = true;
                         run_spec_mtp = false;
                     }
+                    if (!kvmem_advanced_this_iter) {
+                        kvmem_advance_to(executor_->position());
+                        kvmem_advanced_this_iter = true;
+                    }
                 }
                 // kvmem cadence: the batched window-aware verify
                 // (forward_n_tokens) advances position_ + the window tail
@@ -7320,11 +7367,11 @@ private:
                 // or restore_state(snapshot) rolls BOTH back, and the replay
                 // re-advances both by the accepted count. So position_ and the
                 // window tail stay consistent for every committed token this
-                // iteration. Register the committed delta and reselect on the
-                // interval boundary (re-bakes any moved block in place, rebuilds
-                // k̄). Runs once per spec iteration, after both the all-accepted
-                // and rollback branches settle.
-                kvmem_advance_to(executor_->position());
+                // iteration. The branches above register the committed delta
+                // exactly once. When a prefix rebuild follows, they may split
+                // reselection into prepare/finish so tier H2D can overlap with
+                // the MTP-prefix compute, then finish before the next target
+                // attention uses the KVMem window.
             }
         }
         if (!run_spec_mtp) {

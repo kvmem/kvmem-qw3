@@ -308,6 +308,8 @@ void QwenExecutor::reset_state() {
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
     kvmem_stage_buffer_.clear();
     kvmem_prefetch_ = KvMemPrefetchState{};
+    kvmem_pending_reselect_ = false;
+    kvmem_pending_plan_ = KvMemPlan{};
     // Cumulative-attention selection signal: drop the live interval; buffers stay
     // allocated (reused next session). bs_score_layer_ is model-fixed, keep it.
     bs_score_ready_ = false;
@@ -2234,6 +2236,8 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_cpu_bytes_.reset();
     kvmem_stage_buffer_.clear();
     kvmem_prefetch_ = KvMemPrefetchState{};
+    kvmem_pending_reselect_ = false;
+    kvmem_pending_plan_ = KvMemPlan{};
     if (effective.cpu_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
         PinnedKvTierConfig pcfg;
         pcfg.total_bytes = effective.cpu_tier_bytes;
@@ -2724,8 +2728,16 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
 }
 
 uint32_t QwenExecutor::kvmem_reselect() {
+    (void)kvmem_prepare_reselect();
+    return kvmem_finish_reselect();
+}
+
+uint32_t QwenExecutor::kvmem_prepare_reselect() {
     if (!kvmem_enabled_ || !block_store_) return 0;
     if (block_store_->block_count() == 0) return 0;
+    if (kvmem_pending_reselect_) {
+        throw std::runtime_error("KVMem reselect already prepared");
+    }
     const KvMemMethod method = block_store_->config().select_method;
     // Build the global content-frame index once, from the pristine post-prefill
     // cache (every block still baked at its true position). After the first
@@ -2760,12 +2772,20 @@ uint32_t QwenExecutor::kvmem_reselect() {
             bs_score_ready_ = false;
             break;
     }
-    KvMemPlan plan =
+    kvmem_pending_plan_ =
         block_store_->set_selection(block_store_->pick_topk_blocks());
-    kvmem_start_prefetch(plan);
+    kvmem_start_prefetch(kvmem_pending_plan_);
+    kvmem_pending_reselect_ = true;
+    return kvmem_pending_plan_.total_window_tokens;
+}
+
+uint32_t QwenExecutor::kvmem_finish_reselect() {
+    if (!kvmem_pending_reselect_) return window_query_pos_;
     kvmem_finish_prefetch();
-    kvmem_assemble(plan);
-    kvmem_stage_out(plan.stage_out);
+    kvmem_assemble(kvmem_pending_plan_);
+    kvmem_stage_out(kvmem_pending_plan_.stage_out);
+    kvmem_pending_reselect_ = false;
+    kvmem_pending_plan_ = KvMemPlan{};
     return window_query_pos_;
 }
 
@@ -2773,6 +2793,9 @@ uint32_t QwenExecutor::kvmem_set_selection(
         const std::vector<uint32_t> &block_ids) {
     if (!kvmem_enabled_ || !block_store_) return 0;
     if (block_store_->block_count() == 0) return 0;
+    if (kvmem_pending_reselect_) {
+        throw std::runtime_error("KVMem explicit selection during pending reselect");
+    }
     KvMemPlan plan = block_store_->set_selection(block_ids);
     kvmem_start_prefetch(plan);
     kvmem_finish_prefetch();

@@ -275,6 +275,13 @@ public:
     // next decode steps. No-op when disabled. Returns the number of blocks in
     // the assembled window (0 when disabled).
     uint32_t kvmem_reselect();
+    // Split form of kvmem_reselect() for overlapping tier prefetch with
+    // independent compute. prepare computes the selection plan and starts
+    // CPU/NVMe -> GPU prefetch; finish waits, assembles the window, and spills
+    // deselected blocks. No attention over KVMem may run between prepare and
+    // finish.
+    uint32_t kvmem_prepare_reselect();
+    uint32_t kvmem_finish_reselect();
 
     // Install an explicit block-ID selection instead of the built-in top-k
     // (the external-selector hook; also used by tests to force a fixed set,
@@ -487,6 +494,8 @@ private:
         std::vector<std::vector<uint8_t>> nvme_buffers;
     };
     KvMemPrefetchState kvmem_prefetch_;
+    bool kvmem_pending_reselect_ = false;
+    KvMemPlan kvmem_pending_plan_;
     // Attention query position within the assembled window (== sum of selected
     // block token counts at assembly; grows by 1 per decoded token appended at
     // the window tail). Equals position_ under identity (all-block) selection.
