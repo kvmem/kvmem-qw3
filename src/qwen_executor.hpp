@@ -48,6 +48,7 @@ public:
         uint32_t position = 0;
         uint32_t kv_logical_pages = 0;
         uint32_t mtp_prefix_len = 0;
+        uint32_t kvmem_registered_pos = 0;
         // kvmem window state: when kvmem is active the assembled window advances
         // in lockstep with position_ as decode/verify tokens append at the
         // window tail. A snapshot/restore (MTP rollback) must round-trip the
@@ -268,6 +269,7 @@ public:
     // prefill / each committed decode token grows the context). No-op when
     // block-sparse is disabled.
     void kvmem_register_append(uint32_t n_new_tokens);
+    void kvmem_maybe_prefill_offload();
 
     // Re-select the working set from the built-in cumulative-attention top-k
     // and assemble it: re-RoPE each moved block in place (per attention layer)
@@ -307,6 +309,7 @@ private:
         uint32_t device_synced = 0;
 
         void configure(uint32_t ctx_size, KvPhysicalPageAllocator *page_allocator);
+        void set_allocator(KvPhysicalPageAllocator *page_allocator);
         void reset();
         void ensure_pages(DeviceBackend &backend, uint32_t ctx_size,
                           uint32_t logical_pos, uint32_t count);
@@ -340,6 +343,7 @@ private:
     void begin_record_timing(bool enabled) const;
     void record(NativeExecutorReport &report, const std::string &op) const;
     void ensure_scratch();
+    void allocate_kvmem_gpu_cache(uint64_t physical_slots);
     void ensure_mtp_scratch();
     void ensure_mtp_batch_scratch(uint32_t batch);
     void ensure_logits_batch_scratch(uint32_t batch);
@@ -428,6 +432,10 @@ private:
     std::vector<std::unique_ptr<DeviceTensor>> v_cache_;
     KvCacheStorage *external_kv_cache_ = nullptr;
     KvCacheStorage *external_mtp_kv_cache_ = nullptr;
+    std::unique_ptr<KvPhysicalPageAllocator> kvmem_gpu_page_pool_;
+    std::vector<std::unique_ptr<DeviceTensor>> kvmem_k_cache_storage_;
+    std::vector<std::unique_ptr<DeviceTensor>> kvmem_v_cache_storage_;
+    KvCacheStorage kvmem_kv_cache_view_;
 
     bool mtp_scratch_ready_ = false;
     std::unique_ptr<DeviceTensor> mtp_h_;
@@ -468,6 +476,7 @@ private:
     // All zero/null when kvmem_enabled_ is false, so the forward path
     // takes the identical pre-block-sparse branches.
     bool kvmem_enabled_ = false;
+    uint32_t kvmem_registered_pos_ = 0;
     // True once a selection has been assembled this session; gates the decode
     // window substitution. Cleared by reset_state().
     bool kvmem_active_ = false;
@@ -527,7 +536,9 @@ private:
     // Batched analogue: grow the window so `n` tokens can be appended starting
     // at window slot window_query_pos_ (used by the window-aware batched verify
     // in forward_n_tokens).
-    void kvmem_extend_window_for_decode_n(uint32_t n);
+    void kvmem_extend_window_for_decode_n(uint32_t n,
+                                          uint32_t true_base_pos);
+    void kvmem_register_until(uint32_t target_pos);
 
     // ---- Cumulative-attention selection signal (#40, low-intrusion) -------
     // Per-window-block representative K (mean baked K) + a GPU-resident

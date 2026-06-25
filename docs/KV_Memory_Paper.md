@@ -364,9 +364,31 @@ This gives the copy stream a compute window without changing rollback or
 selection semantics.
 
 `QW3_KVMEM_TIER_TRACE=1` emits diagnostic `stage_out`, `cpu_evict`,
-`canonicalize`, and `stage_in` lines. The model-gated E2E runner uses this to
-assert that tiered sparse runs actually exercise GPU→CPU/NVMe stage-out and
-CPU/NVMe→GPU stage-in.
+`canonicalize`, `stage_in`, and `bounded_gpu_pool` lines. The model-gated E2E
+runner uses this to assert that tiered sparse runs actually exercise
+GPU→CPU/NVMe stage-out, CPU/NVMe→GPU stage-in, and the bounded single-request
+GPU page pool.
+
+For the non-continuous single-request path, KVMem can now allocate a bounded GPU
+physical page pool instead of full-`ctx_size` KV tensors. This path is enabled
+only when KVMem has a backing tier (`--kvmem-cpu-bytes` or NVMe bytes) and the
+ratio-derived GPU block capacity is smaller than the logical context. The
+executor builds an internal `KvCacheStorage` with `physical_slots =
+pool_pages * page_size`, installs a local page allocator into the normal
+`KvPageTable`, and keeps the logical page table at full context length. Cold
+blocks are marked non-resident (`page=-1`) after stage-out, so the logical
+context can exceed the bounded physical pool while selected blocks and newly
+appended tokens occupy only the configured GPU slots.
+
+Long prefill is handled incrementally under this bounded mode. `forward_n_tokens`
+automatically caps prefill chunks to at most one KVMem block, registers completed
+chunks with the block store, and triggers reselection/stage-out when free GPU
+pages approach the append reserve. Once a prefill-time selection is active,
+subsequent prompt chunks append and attend in the assembled KVMem window frame,
+using the current chunk's true base position to alias the new physical pages
+correctly. This gives bounded prefill the same correctness model as decode:
+the working set is explicit, sink/recent blocks are always retained, and any
+selected offloaded block must stage back in before attention can read it.
 
 ---
 
@@ -428,8 +450,9 @@ working set again until the next request/step entry point. This preserves MTP
 correctness because KVMem metadata is advanced only after verifier-committed
 tokens, not speculative draft tokens.
 
-The GPU memory ratio is currently used to estimate a maximum active working-set
-budget:
+The GPU memory ratio is used to estimate both the maximum active working-set
+budget and, when tiering is enabled on the single-request path, the bounded GPU
+physical page pool:
 
 ```
 estimated_block_bytes =
@@ -442,8 +465,12 @@ estimated_gpu_blocks =
 ```
 
 When the backend can report total device memory, `select_budget` is clipped to
-this estimated block capacity. CPU/NVMe tier slot sizing uses the same block-byte
-estimate.
+the low-watermark target within this estimated block capacity so one or more
+blocks remain available for appends. CPU/NVMe tier slot sizing uses the same
+block-byte estimate. If tiering is enabled and the estimated GPU capacity is at
+least two blocks but smaller than the logical context, the executor allocates
+only that many physical GPU blocks for the single-request KV cache; otherwise it
+falls back to the normal full-ctx allocation.
 
 Runtime tier budgets:
 
@@ -474,21 +501,26 @@ The current implementation has the following tiering pieces in place:
   release their logical pages as non-resident (`page=-1`), spill evicted CPU
   slots to NVMe, and stage selected CPU/NVMe blocks back into newly allocated
   GPU pages before window assembly.
+- The single-request path can use a bounded local GPU page pool plus an internal
+  external KV cache view, reducing standard-attention KV tensor allocation from
+  logical `ctx_size` slots to the ratio-derived physical slot count.
+- Bounded prefill is supported by chunk-level KVMem registration and prefill-time
+  reselection/stage-out; chunk size is capped to KVMem block size in this mode
+  so each chunk can complete before cold blocks are evicted.
 - `QW3_KVMEM_TIER_TRACE=1` emits diagnostic `stage_out`, `cpu_evict`, and
-  `stage_in` lines. The model-gated E2E runner uses this to assert that tiered
-  sparse runs actually exercise GPU->CPU/NVMe stage-out and CPU/NVMe->GPU
-  stage-in.
+  `stage_in` lines, plus `bounded_gpu_pool` when the bounded local pool is
+  active. The model-gated E2E runner uses this to assert that tiered sparse runs
+  actually exercise GPU->CPU/NVMe stage-out, CPU/NVMe->GPU stage-in, and bounded
+  single-request allocation.
 
-Two architectural constraints remain:
+Architectural constraints that remain:
 
 - Runtime release is opt-in through `--kvmem-cpu-bytes`. The default preserves
   the original sparse-window behavior without releasing GPU pages.
-- In the non-continuous single-request path, each standard-attention layer's KV
-  tensor is still allocated for the full `ctx_size` physical page capacity.
-  Therefore CPU/NVMe stage-out reduces active GPU page residency and enables the
-  logical/non-resident state machine, but it does not yet reduce the initial
-  CUDA KV tensor allocation. The next step is a bounded KVMem GPU physical page
-  pool whose capacity is independent from logical context length.
+- The bounded GPU pool is currently single-request only. Continuous batching
+  already has its own global physical page pool; KVMem + continuous batching +
+  MTP remains explicitly blocked until the verifier/body-batch path becomes
+  KVMem-window-aware.
 
 Internal diagnostic (default off, env-gated): `QW3_KVMEM_TRACE=1`
 prints the top attention-heat blocks of each interval.
@@ -544,9 +576,9 @@ byte-lossless, #40 cumulative-attention selection (window-local retention),
 #43 CPU pinned tier skeleton, #48/#49 global content-frame KV retrieval
 (resurrection of dropped blocks), CPU/NVMe stage-out/stage-in with canonical
 tier backing, backend-managed pinned host buffers, copy-stream stage-in/out,
-MTP-aware reselect prefetch overlap, and model-gated tier E2E coverage. Pending:
-bounded GPU physical page pool, prefill-time offload, async NVMe I/O, q8/fp8
-tier payload support, and KVMem-aware continuous+MTP batching.
+MTP-aware reselect prefetch overlap, bounded single-request GPU physical page
+pool, prefill-time offload, and model-gated tier E2E coverage. Pending: async
+NVMe I/O, q8/fp8 tier payload support, and KVMem-aware continuous+MTP batching.
 
 Known limitations of the current retrieval signal (future work): (1) the mean
 key over a 128-token block dilutes a short codeword, so smaller `--kvmem-block-tokens`

@@ -41,8 +41,10 @@ is desired.
 
 The runner also accepts `--kvmem-cpu-bytes`, `--kvmem-nvme-dir`, and
 `--kvmem-nvme-bytes`. When these are set, it enables `QW3_KVMEM_TIER_TRACE=1`
-and adds a retrieval-stage-in case; the run fails unless sparse KVMem emits
-stage-out activity and retrieval emits stage-in activity.
+and adds retrieval-stage-in plus bounded single-request GPU-pool cases; the run
+fails unless sparse KVMem emits stage-out activity, retrieval emits stage-in
+activity, and the bounded-pool case emits `bounded_gpu_pool` while completing a
+long prefill with CPU/NVMe offload.
 
 ## Efficiency
 

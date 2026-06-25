@@ -12,6 +12,8 @@ real qw3 binary with a GGUF model and checks:
 5. Continuous batching + KVMem works without MTP.
 6. Continuous batching + KVMem + MTP fails explicitly instead of silently using
    an unsafe route.
+7. Tiered KVMem can run with a bounded single-request GPU page pool smaller
+   than ctx, forcing prefill-time CPU offload before decode.
 """
 
 from __future__ import annotations
@@ -195,6 +197,12 @@ def identity_prompt() -> str:
     return (
         "Write one concise sentence explaining why paged KV cache page tables "
         "must preserve token order."
+    )
+
+
+def bounded_pool_prompt() -> str:
+    return " ".join(
+        ["alpha beta gamma delta epsilon zeta eta theta iota kappa"] * 80
     )
 
 
@@ -499,6 +507,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             failures.append("tiered retrieval stage-in command failed")
         elif "[kvmem-tier] stage_in" not in stagein.stderr:
             failures.append("tiered retrieval KVMem did not emit stage_in trace")
+
+        results.append(run_cli(
+            "kvmem_bounded_gpu_pool",
+            qw3,
+            model,
+            bounded_pool_prompt(),
+            1,
+            max(args.ctx, 1024),
+            args.timeout,
+            [
+                "--prefill-chunk", "64",
+                "--kvmem",
+                "--kvmem-block-tokens", "16",
+                "--kvmem-budget", "64",
+                "--kvmem-sink-blocks", "1",
+                "--kvmem-recent-blocks", "1",
+                "--kvmem-method", "recency",
+                "--kvmem-gpu-memory-ratio", "0.00005",
+            ] + tier,
+            tier_env,
+        ))
+        bounded = results[-1]
+        if not bounded.ok:
+            failures.append("bounded GPU-pool KVMem command failed")
+        elif "[kvmem-tier] bounded_gpu_pool" not in bounded.stderr:
+            failures.append("bounded GPU-pool KVMem did not enable bounded pool")
+        elif "[kvmem-tier] stage_out" not in bounded.stderr:
+            failures.append("bounded GPU-pool KVMem did not stage out during prefill")
 
     if not args.skip_mtp:
         results.append(run_cli(
