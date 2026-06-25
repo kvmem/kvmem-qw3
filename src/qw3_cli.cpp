@@ -2,11 +2,14 @@
 #include "qw3/qw3.hpp"
 #include "server.hpp"
 
+#include <cmath>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -105,10 +108,12 @@ void usage(std::ostream &os) {
         "                        Default: 0.50.\n"
         "  --kvmem-gpu-high-watermark F Spill threshold for future tiering. Default: 0.95.\n"
         "  --kvmem-gpu-low-watermark F  Evict target for future tiering. Default: 0.85.\n"
-        "  --kvmem-cpu-bytes N   CPU tier byte budget for offloaded KV blocks.\n"
+        "  --kvmem-cpu-gb F      CPU tier budget in GiB for offloaded KV blocks.\n"
         "                        0 disables runtime page release. Default: 0.\n"
+        "  --kvmem-cpu-bytes N   CPU tier budget in bytes (legacy alias).\n"
         "  --kvmem-nvme-dir DIR  Directory for KVMem NVMe backing file.\n"
-        "  --kvmem-nvme-bytes N  NVMe tier byte budget. Requires --kvmem-nvme-dir.\n"
+        "  --kvmem-nvme-gb F     NVMe tier budget in GiB. Requires --kvmem-nvme-dir.\n"
+        "  --kvmem-nvme-bytes N  NVMe tier budget in bytes (legacy alias).\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
@@ -165,6 +170,20 @@ uint64_t parse_u64(const std::string &s, const std::string &name) {
     uint64_t v = std::stoull(s, &pos);
     if (pos != s.size()) throw std::runtime_error("invalid integer for " + name + ": " + s);
     return v;
+}
+
+uint64_t parse_gib_bytes(const std::string &s, const std::string &name) {
+    size_t pos = 0;
+    const double gib = std::stod(s, &pos);
+    if (pos != s.size() || !std::isfinite(gib) || gib < 0.0) {
+        throw std::runtime_error("invalid GiB value for " + name + ": " + s);
+    }
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    const double bytes = gib * kGiB;
+    if (bytes > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+        throw std::runtime_error("GiB value too large for " + name + ": " + s);
+    }
+    return static_cast<uint64_t>(bytes);
 }
 
 } // namespace
@@ -312,10 +331,14 @@ int main(int argc, char **argv) {
                 engine.kvmem_gpu_high_watermark = parse_float(need(arg), arg);
             } else if (arg == "--kvmem-gpu-low-watermark") {
                 engine.kvmem_gpu_low_watermark = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-cpu-gb") {
+                engine.kvmem_cpu_bytes = parse_gib_bytes(need(arg), arg);
             } else if (arg == "--kvmem-cpu-bytes") {
                 engine.kvmem_cpu_bytes = parse_u64(need(arg), arg);
             } else if (arg == "--kvmem-nvme-dir") {
                 engine.kvmem_nvme_dir = need(arg);
+            } else if (arg == "--kvmem-nvme-gb") {
+                engine.kvmem_nvme_bytes = parse_gib_bytes(need(arg), arg);
             } else if (arg == "--kvmem-nvme-bytes") {
                 engine.kvmem_nvme_bytes = parse_u64(need(arg), arg);
             } else if (arg == "--verbose") {

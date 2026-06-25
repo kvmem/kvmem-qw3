@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
@@ -55,6 +56,14 @@ void setenv_bool(const char *key, bool value) {
 
 const char *yesno(bool v) {
     return v ? "1" : "0";
+}
+
+std::string bytes_gib_label(uint64_t bytes) {
+    char buf[64];
+    const double gib = static_cast<double>(bytes) /
+        (1024.0 * 1024.0 * 1024.0);
+    std::snprintf(buf, sizeof(buf), "%.3f GiB", gib);
+    return std::string(buf);
 }
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
@@ -1027,6 +1036,24 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << (cfg.thinking_budget_default > 0
                       ? std::to_string(cfg.thinking_budget_default)
                       : std::string("0(disabled)"))
+              << "\n"
+              << "  kvmem=" << yesno(engine.kvmem_enabled) << "\n"
+              << "  kvmem_block_tokens=" << engine.kvmem_block_tokens << "\n"
+              << "  kvmem_budget=" << engine.kvmem_budget << "\n"
+              << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
+              << "  kvmem_method=" << engine.kvmem_method << "\n"
+              << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
+              << "  kvmem_sink_blocks=" << engine.kvmem_sink_blocks << "\n"
+              << "  kvmem_recent_blocks=" << engine.kvmem_recent_blocks << "\n"
+              << "  kvmem_gpu_memory_ratio=" << engine.kvmem_gpu_memory_ratio << "\n"
+              << "  kvmem_cpu_tier=" << engine.kvmem_cpu_bytes
+              << " bytes (" << bytes_gib_label(engine.kvmem_cpu_bytes) << ")\n"
+              << "  kvmem_nvme_tier=" << engine.kvmem_nvme_bytes
+              << " bytes (" << bytes_gib_label(engine.kvmem_nvme_bytes) << ")\n"
+              << "  kvmem_nvme_dir="
+              << (engine.kvmem_nvme_dir.empty()
+                      ? std::string("(unset)")
+                      : engine.kvmem_nvme_dir)
               << "\n";
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";

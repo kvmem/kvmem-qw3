@@ -882,6 +882,110 @@ sub-path, or recovering from regressions:
 | `QW3_MTP_PAGED_PREFIX`      | `0` | Use paged MTP prefix KV append/attention paths. `qw3 serve --continuous-batching --mtp-chain N` enables this internally when paged KV is active. |
 | `QW3_CONTINUOUS_MTP_BATCHED_DRAFT` | `0` | Batch MTP draft projection/FFN/logits across continuous requests. `qw3 serve --continuous-batching --mtp-chain N` enables this internally. Keeps per-row paged MTP attention for stability. |
 
+## KVMem
+
+KVMem treats the KV cache as a block-structured memory system. It can keep a
+selected working set on GPU while staging cold blocks to CPU memory and, when
+configured, to an NVMe backing file. The default path is unchanged unless
+`--kvmem` is passed.
+
+Recommended manual service test:
+
+```sh
+QW3_KVMEM_TIER_TRACE=1 ./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --ctx 65536 \
+  --temp 0 \
+  --top-k 1 \
+  --kvmem \
+  --kvmem-block-tokens 128 \
+  --kvmem-budget 8192 \
+  --kvmem-sink-blocks 1 \
+  --kvmem-recent-blocks 8 \
+  --kvmem-update-mode step \
+  --kvmem-method retrieval \
+  --kvmem-retrieval-method mean_attention \
+  --kvmem-gpu-memory-ratio 0.50 \
+  --kvmem-cpu-gb 16
+```
+
+Add an NVMe tier when CPU memory is not enough:
+
+```sh
+mkdir -p /tmp/qw3_kvmem_nvme
+
+QW3_KVMEM_TIER_TRACE=1 ./build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --ctx 65536 \
+  --temp 0 \
+  --top-k 1 \
+  --kvmem \
+  --kvmem-block-tokens 128 \
+  --kvmem-budget 8192 \
+  --kvmem-sink-blocks 1 \
+  --kvmem-recent-blocks 8 \
+  --kvmem-update-mode step \
+  --kvmem-method retrieval \
+  --kvmem-retrieval-method mean_attention \
+  --kvmem-gpu-memory-ratio 0.50 \
+  --kvmem-cpu-gb 16 \
+  --kvmem-nvme-dir /tmp/qw3_kvmem_nvme \
+  --kvmem-nvme-gb 64
+```
+
+KVMem CLI parameters:
+
+| Parameter | Default | Description |
+|---|---:|---|
+| `--kvmem` | off | Enable KVMem block-sparse KV attention. Without this flag the normal forward path is used. |
+| `--kvmem-block-tokens N` | `128` | KV block granularity in tokens. Must be a positive multiple of the KV page size. |
+| `--kvmem-budget N` | `131072` | Maximum selected working-set window per selection, in tokens. Approximate selected block count is `budget / block_tokens`. |
+| `--kvmem-sink-blocks N` | `1` | Always keep the first N blocks for attention-sink behavior. |
+| `--kvmem-recent-blocks N` | `0` | Always keep the most recent N blocks. `0` lets KVMem derive the recent allocation. |
+| `--kvmem-method M` | `retrieval` | Selection signal: `retrieval`, `h2o`, or `recency`. |
+| `--kvmem-retrieval-method M` | `mean_attention` | Retrieval scorer: `mean_attention` or `content_mean`. |
+| `--kvmem-select-policy M` | `topk` | Selection policy: `topk` or `quota`. |
+| `--kvmem-retrieval-blocks N` | `0` | Quota-policy retrieval block count. `0` derives from remaining budget. |
+| `--kvmem-profile-blocks N` | `0` | Quota-policy profile block count. `0` derives from remaining budget. |
+| `--kvmem-update-mode M` | `interval` | Reselect cadence: `interval` or `step`. `step` selects after prefill and does not automatically reselect during decode. |
+| `--kvmem-interval N` | `64` | Decode tokens between reselections when `--kvmem-update-mode interval` is used. |
+| `--kvmem-gpu-memory-ratio F` | `0.50` | Approximate fraction of GPU memory that KVMem may use for its bounded GPU KV pool. |
+| `--kvmem-gpu-high-watermark F` | `0.95` | GPU tier high-watermark knob reserved for tiering policy. Leave at default for normal tests. |
+| `--kvmem-gpu-low-watermark F` | `0.85` | GPU tier low-watermark knob reserved for tiering policy. Leave at default for normal tests. |
+| `--kvmem-cpu-gb F` | `0` | CPU tier budget in GiB. `0` disables CPU tier runtime page release. |
+| `--kvmem-cpu-bytes N` | `0` | Legacy byte-level CPU tier budget. Prefer `--kvmem-cpu-gb` for manual runs. |
+| `--kvmem-nvme-dir DIR` | unset | Directory for the NVMe backing file. Required when NVMe tier budget is nonzero. |
+| `--kvmem-nvme-gb F` | `0` | NVMe tier budget in GiB. Requires `--kvmem-nvme-dir`. |
+| `--kvmem-nvme-bytes N` | `0` | Legacy byte-level NVMe tier budget. Prefer `--kvmem-nvme-gb` for manual runs. |
+
+`--kvmem-cpu-gb` and `--kvmem-nvme-gb` use GiB units
+(`1 GiB = 1024^3 bytes`). The older `--kvmem-cpu-bytes` and
+`--kvmem-nvme-bytes` flags remain available for scripts and exact-byte tests.
+
+Useful KVMem environment variables:
+
+| Variable | Description |
+|---|---|
+| `QW3_KVMEM_TIER_TRACE=1` | Print tier events such as `stage_out`, `stage_in`, `cpu_evict`, `stage_in_async_read`, and `bounded_gpu_pool`. Recommended when testing CPU/NVMe offload. |
+| `QW3_KVMEM_TRACE=1` | Print selection/retrieval diagnostics. This can be verbose. |
+| `QW3_KVMEM_ATTN_TRACE=/path/to/file.jsonl` | Dump KVMem attention-mass traces for analysis. This is expensive and should not be enabled for normal serving. |
+| `QW3_KVMEM_ATTN_TRACE_INTERVAL=N` | Sampling interval for `QW3_KVMEM_ATTN_TRACE`; default is every token. |
+
+Compatibility notes:
+
+- Single-request KVMem + MTP is supported.
+- KVMem + continuous batching is supported without MTP.
+- KVMem + continuous batching + MTP is guarded with a hard error in the
+  current implementation, because the continuous batching MTP verifier is not
+  fully KVMem-window-aware yet.
+- For fast correctness checks, prefer short deterministic requests
+  (`--temp 0 --top-k 1`) and compare KVMem lossless or short decode output
+  against baseline before running full agent/SWE evaluations.
+
 ## Backends
 
 | Backend       | When to use it |
