@@ -507,6 +507,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             failures.append("tiered retrieval stage-in command failed")
         elif "[kvmem-tier] stage_in" not in stagein.stderr:
             failures.append("tiered retrieval KVMem did not emit stage_in trace")
+        elif args.kvmem_nvme_bytes > 0 and "[kvmem-tier] stage_in_async_read" not in stagein.stderr:
+            failures.append("tiered retrieval KVMem did not emit async NVMe read trace")
 
         results.append(run_cli(
             "kvmem_bounded_gpu_pool",

@@ -8,6 +8,7 @@
 #include "qw3/pinned_kv_tier.hpp"
 
 #include <cstdio>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -496,11 +497,17 @@ private:
         uint32_t block_id = 0;
         KvTier from = KvTier::GPU;
     };
+    struct KvMemPrefetchNvmeRead {
+        uint32_t block_id = 0;
+        uint64_t bytes = 0;
+        std::vector<uint8_t> buffer;
+    };
     struct KvMemPrefetchState {
         bool active = false;
         bool queued_h2d = false;
         std::vector<KvMemPrefetchBlock> blocks;
-        std::vector<std::vector<uint8_t>> nvme_buffers;
+        std::vector<KvMemPrefetchNvmeRead> nvme_reads;
+        std::future<void> nvme_future;
     };
     KvMemPrefetchState kvmem_prefetch_;
     bool kvmem_pending_reselect_ = false;

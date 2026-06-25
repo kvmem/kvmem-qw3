@@ -347,27 +347,28 @@ normal window assembly re-RoPEs to the selected window slot.
 
 CPU-tier backing is allocated through `DeviceBackend::host_buffer`; the CUDA
 backend uses `cudaHostAlloc`, so CPU slots are pinned and can feed H2D tier
-stage-in directly without an extra heap staging copy. NVMe blocks still read
-through per-block host staging buffers whose lifetime covers the queued H2D
-copy.
+stage-in directly without an extra heap staging copy. NVMe blocks read through
+per-block host staging buffers whose lifetime covers the queued H2D copy.
 
 Tier transfer uses a dedicated backend KV copy stream. D2H stage-out records an
 event on the execution stream before copying so GPU writes are visible; H2D
 stage-in queues K/V page copies on the copy stream and waits before window
 assembly. Reselection now has a split `prepare` / `finish` form: `prepare`
-computes the plan and starts CPU/NVMe→GPU prefetch, while `finish` waits,
+computes the plan, queues CPU→GPU copies immediately, and starts a background
+NVMe read task for SSD-resident blocks. `finish` waits for that read task,
+queues the resulting NVMe→host-staging→GPU copies, waits for the copy stream,
 assembles the window, and spills deselected blocks. In the MTP speculative path,
 when a committed step triggers reselection, the runtime starts KVMem prefetch
 before rebuilding the accepted MTP prefix and finishes the reselect immediately
 after that prefix work, before any target attention can read the KVMem window.
-This gives the copy stream a compute window without changing rollback or
-selection semantics.
+This gives both the copy stream and NVMe read path a compute window without
+changing rollback or selection semantics.
 
 `QW3_KVMEM_TIER_TRACE=1` emits diagnostic `stage_out`, `cpu_evict`,
-`canonicalize`, `stage_in`, and `bounded_gpu_pool` lines. The model-gated E2E
-runner uses this to assert that tiered sparse runs actually exercise
-GPU→CPU/NVMe stage-out, CPU/NVMe→GPU stage-in, and the bounded single-request
-GPU page pool.
+`canonicalize`, `stage_in_async_read`, `stage_in`, and `bounded_gpu_pool` lines.
+The model-gated E2E runner uses this to assert that tiered sparse runs actually
+exercise GPU→CPU/NVMe stage-out, async NVMe read prefetch, CPU/NVMe→GPU
+stage-in, and the bounded single-request GPU page pool.
 
 For the non-continuous single-request path, KVMem can now allocate a bounded GPU
 physical page pool instead of full-`ctx_size` KV tensors. This path is enabled
@@ -501,6 +502,9 @@ The current implementation has the following tiering pieces in place:
   release their logical pages as non-resident (`page=-1`), spill evicted CPU
   slots to NVMe, and stage selected CPU/NVMe blocks back into newly allocated
   GPU pages before window assembly.
+- NVMe stage-in starts a background read task during `kvmem_prepare_reselect`;
+  `kvmem_finish_reselect` joins it and queues H2D copies, allowing SSD reads to
+  overlap with independent compute such as MTP accepted-prefix rebuild.
 - The single-request path can use a bounded local GPU page pool plus an internal
   external KV cache view, reducing standard-attention KV tensor allocation from
   logical `ctx_size` slots to the ratio-derived physical slot count.
@@ -508,10 +512,11 @@ The current implementation has the following tiering pieces in place:
   reselection/stage-out; chunk size is capped to KVMem block size in this mode
   so each chunk can complete before cold blocks are evicted.
 - `QW3_KVMEM_TIER_TRACE=1` emits diagnostic `stage_out`, `cpu_evict`, and
-  `stage_in` lines, plus `bounded_gpu_pool` when the bounded local pool is
-  active. The model-gated E2E runner uses this to assert that tiered sparse runs
-  actually exercise GPU->CPU/NVMe stage-out, CPU/NVMe->GPU stage-in, and bounded
-  single-request allocation.
+  `stage_in` lines, plus `stage_in_async_read` when NVMe prefetch starts and
+  `bounded_gpu_pool` when the bounded local pool is active. The model-gated E2E
+  runner uses this to assert that tiered sparse runs actually exercise
+  GPU->CPU/NVMe stage-out, async NVMe read prefetch, CPU/NVMe->GPU stage-in, and
+  bounded single-request allocation.
 
 Architectural constraints that remain:
 
@@ -577,8 +582,9 @@ byte-lossless, #40 cumulative-attention selection (window-local retention),
 (resurrection of dropped blocks), CPU/NVMe stage-out/stage-in with canonical
 tier backing, backend-managed pinned host buffers, copy-stream stage-in/out,
 MTP-aware reselect prefetch overlap, bounded single-request GPU physical page
-pool, prefill-time offload, and model-gated tier E2E coverage. Pending: async
-NVMe I/O, q8/fp8 tier payload support, and KVMem-aware continuous+MTP batching.
+pool, prefill-time offload, async NVMe stage-in reads, and model-gated tier E2E
+coverage. Pending: async NVMe stage-out writes, q8/fp8 tier payload support,
+and KVMem-aware continuous+MTP batching.
 
 Known limitations of the current retrieval signal (future work): (1) the mean
 key over a 128-token block dilutes a short codeword, so smaller `--kvmem-block-tokens`

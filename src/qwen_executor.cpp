@@ -2725,11 +2725,18 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                 if (!kvmem_nvme_tier_) {
                     throw std::runtime_error("KVMem NVMe stage-in has no NVMe tier");
                 }
-                kvmem_prefetch_.nvme_buffers.emplace_back();
-                std::vector<uint8_t> &buf = kvmem_prefetch_.nvme_buffers.back();
-                buf.resize(bytes);
-                kvmem_nvme_tier_->read_block(rm.block_id, buf.data(), bytes);
-                stage_src = buf.data();
+                KvMemPrefetchNvmeRead read;
+                read.block_id = rm.block_id;
+                read.bytes = bytes;
+                read.buffer.resize(bytes);
+                kvmem_prefetch_.nvme_reads.push_back(std::move(read));
+                if (kvmem_tier_trace_enabled()) {
+                    std::fprintf(stderr,
+                                 "[kvmem-tier] stage_in_async_read block=%u from=nvme bytes=%llu\n",
+                                 rm.block_id,
+                                 static_cast<unsigned long long>(bytes));
+                }
+                continue;
             } else {
                 throw std::runtime_error(
                     "KVMem stage-in requested a non-resident block with no backing tier");
@@ -2753,6 +2760,18 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                              static_cast<unsigned long long>(bytes));
             }
         }
+        if (!kvmem_prefetch_.nvme_reads.empty()) {
+            NvmeKvTier *tier = kvmem_nvme_tier_.get();
+            std::vector<KvMemPrefetchNvmeRead> *reads =
+                &kvmem_prefetch_.nvme_reads;
+            kvmem_prefetch_.nvme_future = std::async(
+                std::launch::async, [tier, reads]() {
+                    for (KvMemPrefetchNvmeRead &read : *reads) {
+                        tier->read_block(read.block_id, read.buffer.data(),
+                                         read.bytes);
+                    }
+                });
+        }
     } catch (...) {
         kvmem_prefetch_ = KvMemPrefetchState{};
         throw;
@@ -2761,16 +2780,48 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
 
 void QwenExecutor::kvmem_finish_prefetch() {
     if (!kvmem_prefetch_.active) return;
-    if (kvmem_prefetch_.queued_h2d) {
-        require_status(backend_.wait_kv_transfer());
-    }
-    for (const KvMemPrefetchBlock &pb : kvmem_prefetch_.blocks) {
-        if (pb.from == KvTier::CPU && kvmem_cpu_tier_) {
-            kvmem_cpu_tier_->release_block(pb.block_id);
-        } else if (pb.from == KvTier::SSD && kvmem_nvme_tier_) {
-            kvmem_nvme_tier_->release_block(pb.block_id);
+    try {
+        if (kvmem_prefetch_.nvme_future.valid()) {
+            kvmem_prefetch_.nvme_future.get();
         }
-        block_store_->set_block_tier(pb.block_id, KvTier::GPU);
+        if (!kvmem_prefetch_.nvme_reads.empty()) {
+            const auto &blocks = block_store_->blocks();
+            for (KvMemPrefetchNvmeRead &read : kvmem_prefetch_.nvme_reads) {
+                const KvMemBlock &block = blocks[read.block_id];
+                const uint32_t page_size = kv_pages_.page_size;
+                const uint32_t first_page = block.orig_pos_start / page_size;
+                const uint32_t last_page =
+                    (block.orig_pos_start + block.n_tokens - 1) / page_size;
+                for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+                    (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
+                }
+                kvmem_copy_block_from_host(block, read.buffer.data(),
+                                           read.bytes);
+                kvmem_prefetch_.queued_h2d = true;
+                kvmem_prefetch_.blocks.push_back(
+                    KvMemPrefetchBlock{read.block_id, KvTier::SSD});
+                if (kvmem_tier_trace_enabled()) {
+                    std::fprintf(stderr,
+                                 "[kvmem-tier] stage_in block=%u from=nvme bytes=%llu\n",
+                                 read.block_id,
+                                 static_cast<unsigned long long>(read.bytes));
+                }
+            }
+        }
+        if (kvmem_prefetch_.queued_h2d) {
+            require_status(backend_.wait_kv_transfer());
+        }
+        for (const KvMemPrefetchBlock &pb : kvmem_prefetch_.blocks) {
+            if (pb.from == KvTier::CPU && kvmem_cpu_tier_) {
+                kvmem_cpu_tier_->release_block(pb.block_id);
+            } else if (pb.from == KvTier::SSD && kvmem_nvme_tier_) {
+                kvmem_nvme_tier_->release_block(pb.block_id);
+            }
+            block_store_->set_block_tier(pb.block_id, KvTier::GPU);
+        }
+    } catch (...) {
+        kvmem_prefetch_ = KvMemPrefetchState{};
+        throw;
     }
     kvmem_prefetch_ = KvMemPrefetchState{};
 }
