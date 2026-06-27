@@ -2,6 +2,7 @@
 #include "env_flags.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -105,6 +106,46 @@ bool kvmem_tier_trace_enabled() {
     return env_flag_enabled("QW3_KVMEM_TIER_TRACE");
 }
 
+// ---- KVMem component timing (env QW3_KVMEM_TIMING; OFF by default) ---------
+// Process-global wall-clock accumulators for the tier/selection components so
+// the latency-breakdown harness can attribute TTFT/TBT to retrieval (selection
+// scoring + pick_topk), stage-in (CPU/NVMe -> GPU), stage-out (GPU -> CPU/NVMe)
+// and window assemble (re-RoPE). When enabled the GPU-async regions (retrieval
+// scoring, assemble) add a device sync so their kernel time is captured; that
+// perturbs throughput, so throughput must be measured WITHOUT this flag.
+bool kvmem_timing_flag() {
+    return env_flag_enabled("QW3_KVMEM_TIMING");
+}
+
+struct KvMemTimingTotals {
+    std::atomic<uint64_t> retrieval_ns{0};
+    std::atomic<uint64_t> stage_in_ns{0};
+    std::atomic<uint64_t> stage_out_ns{0};
+    std::atomic<uint64_t> assemble_ns{0};
+    std::atomic<uint64_t> assemble_pages_ns{0};
+    std::atomic<uint64_t> assemble_rerope_ns{0};
+    std::atomic<uint64_t> assemble_kbar_ns{0};
+    std::atomic<uint32_t> retrieval_calls{0};
+    std::atomic<uint32_t> stage_in_calls{0};
+    std::atomic<uint32_t> stage_out_calls{0};
+    std::atomic<uint32_t> assemble_calls{0};
+    std::atomic<uint32_t> stage_in_blocks{0};
+    std::atomic<uint32_t> stage_out_blocks{0};
+};
+
+KvMemTimingTotals &kvmem_timing_totals() {
+    static KvMemTimingTotals totals;
+    return totals;
+}
+
+uint64_t kvmem_steady_ns() {
+    using clk = std::chrono::steady_clock;
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clk::now().time_since_epoch())
+            .count());
+}
+
 bool mtp_prefix_batch_enabled() {
     return env_flag_enabled("QW3_MTP_PREFIX_BATCH", true);
 }
@@ -148,6 +189,97 @@ uint64_t estimate_kvmem_block_bytes(const QwenConfig &cfg,
 
 } // namespace
 
+bool QwenExecutor::kvmem_timing_enabled() { return kvmem_timing_flag(); }
+
+QwenExecutor::KvMemTimingSnapshot QwenExecutor::kvmem_timing_snapshot() {
+    const KvMemTimingTotals &t = kvmem_timing_totals();
+    KvMemTimingSnapshot s;
+    s.retrieval_ns = t.retrieval_ns.load(std::memory_order_relaxed);
+    s.stage_in_ns = t.stage_in_ns.load(std::memory_order_relaxed);
+    s.stage_out_ns = t.stage_out_ns.load(std::memory_order_relaxed);
+    s.assemble_ns = t.assemble_ns.load(std::memory_order_relaxed);
+    s.assemble_pages_ns = t.assemble_pages_ns.load(std::memory_order_relaxed);
+    s.assemble_rerope_ns = t.assemble_rerope_ns.load(std::memory_order_relaxed);
+    s.assemble_kbar_ns = t.assemble_kbar_ns.load(std::memory_order_relaxed);
+    s.retrieval_calls = t.retrieval_calls.load(std::memory_order_relaxed);
+    s.stage_in_calls = t.stage_in_calls.load(std::memory_order_relaxed);
+    s.stage_out_calls = t.stage_out_calls.load(std::memory_order_relaxed);
+    s.assemble_calls = t.assemble_calls.load(std::memory_order_relaxed);
+    s.stage_in_blocks = t.stage_in_blocks.load(std::memory_order_relaxed);
+    s.stage_out_blocks = t.stage_out_blocks.load(std::memory_order_relaxed);
+    return s;
+}
+
+QwenExecutor::KvMemTierUsage QwenExecutor::kvmem_tier_usage() const {
+    KvMemTierUsage u;
+    if (!kvmem_enabled_ || !block_store_) return u;
+    u.enabled = true;
+    u.active = kvmem_active_;
+    const KvMemStoreConfig &cfg = block_store_->config();
+    u.total_blocks = block_store_->block_count();
+    u.block_bytes = cfg.estimated_block_bytes;
+    const uint32_t page_size = kv_pages_.page_size ? kv_pages_.page_size : 1u;
+    const uint32_t pages_per_block =
+        std::max<uint32_t>(1u, cfg.block_tokens / page_size);
+    if (kvmem_gpu_page_pool_) {
+        // Bounded pool engaged: GPU holds only the resident working set; the
+        // rest has spilled to the CPU/NVMe tiers.
+        u.gpu_pool = true;
+        const uint64_t used_blk =
+            kvmem_gpu_page_pool_->used_pages() / pages_per_block;
+        const uint64_t cap_blk =
+            (static_cast<uint64_t>(kvmem_gpu_page_pool_->used_pages()) +
+             kvmem_gpu_page_pool_->free_pages()) / pages_per_block;
+        u.gpu_used_bytes = used_blk * u.block_bytes;
+        u.gpu_capacity_bytes = cap_blk * u.block_bytes;
+    } else {
+        // No bounded pool: every block is resident on the GPU in the normal KV
+        // cache, so the GPU footprint is the whole store.
+        u.gpu_used_bytes = u.total_blocks * u.block_bytes;
+        u.gpu_capacity_bytes = u.gpu_used_bytes;
+    }
+    if (kvmem_cpu_tier_) {
+        u.cpu_tier = true;
+        u.cpu_used_bytes =
+            static_cast<uint64_t>(kvmem_cpu_tier_->used_slots()) * u.block_bytes;
+        u.cpu_capacity_bytes =
+            static_cast<uint64_t>(kvmem_cpu_tier_->slot_count()) * u.block_bytes;
+    }
+    if (kvmem_nvme_tier_) {
+        u.nvme_tier = true;
+        u.nvme_used_bytes =
+            static_cast<uint64_t>(kvmem_nvme_tier_->used_slots()) * u.block_bytes;
+        u.nvme_capacity_bytes =
+            static_cast<uint64_t>(kvmem_nvme_tier_->slot_count()) * u.block_bytes;
+    }
+    return u;
+}
+
+void QwenExecutor::kvmem_timing_emit_delta(const char *tag,
+                                           const KvMemTimingSnapshot &base) {
+    const KvMemTimingSnapshot now = kvmem_timing_snapshot();
+    std::fprintf(
+        stderr,
+        "[kvmem-timing] %s retrieval_ms=%.3f stage_in_ms=%.3f "
+        "stage_out_ms=%.3f assemble_ms=%.3f (pages=%.3f rerope=%.3f kbar=%.3f) "
+        "| retrieval=%u stage_in=%u(%ublk) "
+        "stage_out=%u(%ublk) assemble=%u\n",
+        tag ? tag : "",
+        (now.retrieval_ns - base.retrieval_ns) / 1e6,
+        (now.stage_in_ns - base.stage_in_ns) / 1e6,
+        (now.stage_out_ns - base.stage_out_ns) / 1e6,
+        (now.assemble_ns - base.assemble_ns) / 1e6,
+        (now.assemble_pages_ns - base.assemble_pages_ns) / 1e6,
+        (now.assemble_rerope_ns - base.assemble_rerope_ns) / 1e6,
+        (now.assemble_kbar_ns - base.assemble_kbar_ns) / 1e6,
+        now.retrieval_calls - base.retrieval_calls,
+        now.stage_in_calls - base.stage_in_calls,
+        now.stage_in_blocks - base.stage_in_blocks,
+        now.stage_out_calls - base.stage_out_calls,
+        now.stage_out_blocks - base.stage_out_blocks,
+        now.assemble_calls - base.assemble_calls);
+}
+
 QwenExecutor::QwenExecutor(const QwenNativeModel &model,
                            const QwenWeights &weights,
                            DeviceBackend &backend,
@@ -175,6 +307,11 @@ QwenExecutor::~QwenExecutor() {
     }
     kv_pages_.reset();
     mtp_kv_pages_.reset();
+    // Return the pinned CPU-tier buffer to the shared pool (if borrowed) so the
+    // next executor reuses it instead of paying cudaHostAlloc again.
+    if (host_tier_pool_ && kvmem_cpu_bytes_) {
+        host_tier_pool_->release(std::move(kvmem_cpu_bytes_));
+    }
 }
 
 QwenExecutor::DecodeStateView QwenExecutor::decode_state_view() const {
@@ -1772,7 +1909,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         if (chunk_bs) window_query_pos_ += batch;
         if (kvmem_gpu_page_pool_ && !mtp_single_chunk) {
             kvmem_register_until(base_pos + batch);
-            kvmem_maybe_prefill_offload();
+            kvmem_maybe_prefill_offload(batch);
         }
 
         if (try_capture) {
@@ -2376,6 +2513,9 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     window_query_pos_ = 0;
     kvmem_cpu_tier_.reset();
     kvmem_nvme_tier_.reset();
+    if (host_tier_pool_ && kvmem_cpu_bytes_) {
+        host_tier_pool_->release(std::move(kvmem_cpu_bytes_));
+    }
     kvmem_cpu_bytes_.reset();
     kvmem_stage_buffer_.clear();
     kvmem_prefetch_ = KvMemPrefetchState{};
@@ -2426,10 +2566,12 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         pcfg.slot_bytes = effective.estimated_block_bytes;
         kvmem_cpu_tier_ = std::make_unique<PinnedKvTier>(pcfg);
         if (kvmem_cpu_tier_->enabled()) {
-            kvmem_cpu_bytes_ = backend_.host_buffer(
+            const uint64_t buf_bytes =
                 static_cast<uint64_t>(kvmem_cpu_tier_->slot_count()) *
-                    pcfg.slot_bytes,
-                "kvmem_cpu_tier");
+                pcfg.slot_bytes;
+            kvmem_cpu_bytes_ = host_tier_pool_
+                ? host_tier_pool_->acquire(buf_bytes, "kvmem_cpu_tier")
+                : backend_.host_buffer(buf_bytes, "kvmem_cpu_tier");
         }
     }
     if (effective.nvme_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
@@ -2470,18 +2612,27 @@ void QwenExecutor::kvmem_register_until(uint32_t target_pos) {
     kvmem_registered_pos_ = target_pos;
 }
 
-void QwenExecutor::kvmem_maybe_prefill_offload() {
+void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
     if (!kvmem_enabled_ || !block_store_ || !kvmem_gpu_page_pool_) return;
     if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) return;
     const KvMemStoreConfig &cfg = block_store_->config();
     if (cfg.estimated_block_bytes == 0 || cfg.block_tokens == 0) return;
-    const uint32_t page_size = kv_pages_.page_size;
+    const uint32_t page_size = std::max<uint32_t>(1, kv_pages_.page_size);
     const uint32_t pages_per_block =
-        std::max<uint32_t>(1, cfg.block_tokens / std::max<uint32_t>(1, page_size));
+        std::max<uint32_t>(1, cfg.block_tokens / page_size);
     const uint32_t free_pages = kvmem_gpu_page_pool_->free_pages();
     const uint32_t keep_free_blocks =
         std::max<uint32_t>(1, cfg.recent_blocks > 0 ? cfg.recent_blocks : 1);
-    if (free_pages > keep_free_blocks * pages_per_block) return;
+    // Reserve room for the next prefill append plus a recent-block cushion. The
+    // append grabs ceil(next_chunk_tokens / page_size) pages in one shot before
+    // any offload runs again, so offloading only once `free_pages` is down to the
+    // cushion would let that append exhaust the pool and throw. Trigger early
+    // enough that the upcoming chunk still fits.
+    const uint32_t next_chunk_pages =
+        (next_chunk_tokens + page_size - 1) / page_size;
+    const uint32_t headroom_pages =
+        next_chunk_pages + keep_free_blocks * pages_per_block;
+    if (free_pages > headroom_pages) return;
     kvmem_reselect();
 }
 
@@ -2691,6 +2842,8 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     if (kvmem_prefetch_.active) {
         throw std::runtime_error("KVMem prefetch already active");
     }
+    const bool tm = kvmem_timing_flag();
+    const uint64_t t_in0 = tm ? kvmem_steady_ns() : 0;
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_prefetch_.active = true;
     try {
@@ -2776,10 +2929,17 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
         kvmem_prefetch_ = KvMemPrefetchState{};
         throw;
     }
+    if (tm) {
+        kvmem_timing_totals().stage_in_ns.fetch_add(
+            kvmem_steady_ns() - t_in0, std::memory_order_relaxed);
+    }
 }
 
 void QwenExecutor::kvmem_finish_prefetch() {
     if (!kvmem_prefetch_.active) return;
+    const bool tm = kvmem_timing_flag();
+    const uint64_t t_in0 = tm ? kvmem_steady_ns() : 0;
+    uint32_t staged = 0;
     try {
         if (kvmem_prefetch_.nvme_future.valid()) {
             kvmem_prefetch_.nvme_future.get();
@@ -2811,6 +2971,7 @@ void QwenExecutor::kvmem_finish_prefetch() {
         if (kvmem_prefetch_.queued_h2d) {
             require_status(backend_.wait_kv_transfer());
         }
+        staged = static_cast<uint32_t>(kvmem_prefetch_.blocks.size());
         for (const KvMemPrefetchBlock &pb : kvmem_prefetch_.blocks) {
             if (pb.from == KvTier::CPU && kvmem_cpu_tier_) {
                 kvmem_cpu_tier_->release_block(pb.block_id);
@@ -2824,11 +2985,21 @@ void QwenExecutor::kvmem_finish_prefetch() {
         throw;
     }
     kvmem_prefetch_ = KvMemPrefetchState{};
+    if (tm) {
+        KvMemTimingTotals &t = kvmem_timing_totals();
+        t.stage_in_ns.fetch_add(kvmem_steady_ns() - t_in0,
+                                std::memory_order_relaxed);
+        t.stage_in_calls.fetch_add(1, std::memory_order_relaxed);
+        t.stage_in_blocks.fetch_add(staged, std::memory_order_relaxed);
+    }
 }
 
 void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
     if (!block_store_ || block_ids.empty()) return;
     if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) return;
+    const bool tm = kvmem_timing_flag();
+    const uint64_t t_out0 = tm ? kvmem_steady_ns() : 0;
+    uint32_t staged_out = 0;
     const auto &blocks = block_store_->blocks();
     for (uint32_t block_id : block_ids) {
         if (block_id >= blocks.size()) continue;
@@ -2890,6 +3061,7 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
             nvme_slot = kvmem_nvme_tier_->block_slot(block_id);
         }
         if (!placed) continue;
+        ++staged_out;
         const uint32_t page_size = kv_pages_.page_size;
         const uint32_t first_page = block.orig_pos_start / page_size;
         const uint32_t last_page =
@@ -2908,9 +3080,18 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                          last_page - first_page + 1);
         }
     }
+    if (tm) {
+        KvMemTimingTotals &t = kvmem_timing_totals();
+        t.stage_out_ns.fetch_add(kvmem_steady_ns() - t_out0,
+                                 std::memory_order_relaxed);
+        t.stage_out_calls.fetch_add(1, std::memory_order_relaxed);
+        t.stage_out_blocks.fetch_add(staged_out, std::memory_order_relaxed);
+    }
 }
 
 void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
+    const bool tm = kvmem_timing_flag();
+    const uint64_t t_asm0 = tm ? kvmem_steady_ns() : 0;
     const QwenConfig &cfg = model_.config();
     const uint32_t page_size = kv_pages_.page_size;
     const uint32_t per_pos =
@@ -2962,27 +3143,81 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     window_page_count_ = static_cast<uint32_t>(window_pages_host_.size());
     window_query_pos_ = plan.total_window_tokens;
     sync_window_pages_device(window_page_count_);
+    uint64_t t_pages = 0;
+    if (tm) {
+        require_status(backend_.synchronize());
+        t_pages = kvmem_steady_ns();
+    }
 
     // Re-RoPE each moved block in place, per standard attention layer. Skipped
-    // blocks (already baked at their window slot) issue no kernel. The window
-    // page table addresses the physical pages, so the kernel maps window slot
-    // win_base+tok -> page_indices[(win_base+tok)/page_size] just like append.
-    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
-        if (!cfg.is_standard_attention_layer(il)) continue;
-        DeviceTensor &kc = k_cache(il);
-        for (const KvMemRemap &rm : plan.remaps) {
-            if (rm.skip) continue;
-            require_status(backend_.rope_block_remap_paged_device(
-                kc, rm.n_tokens, cfg.n_kv_heads, per_pos, cfg.head_dim,
-                cfg.rope_dim, /*win_base=*/static_cast<uint32_t>(rm.to_base),
-                /*from_base=*/rm.from_base, /*to_base=*/rm.to_base,
-                *window_pages_device_, page_size, cfg.rope_theta));
+    // blocks (already baked at their window slot) issue no kernel. Collect all
+    // moved (non-skip) blocks once and upload their {to_base, from_base,
+    // n_tokens} to the device, then issue ONE batched launch per standard
+    // attention layer (its grid covers every moved block at once) instead of a
+    // per-(layer,block) launch storm. The window page table addresses the
+    // physical pages, so the kernel maps window slot to_base+tok ->
+    // page_indices[(to_base+tok)/page_size] just like append; moved blocks
+    // occupy disjoint physical pages, so the batch races nowhere and is
+    // byte-identical to the per-block loop.
+    bs_remap_to_host_.clear();
+    bs_remap_from_host_.clear();
+    bs_remap_ntok_host_.clear();
+    uint32_t max_block_tokens = 0;
+    for (const KvMemRemap &rm : plan.remaps) {
+        if (rm.skip) continue;
+        bs_remap_to_host_.push_back(rm.to_base);
+        bs_remap_from_host_.push_back(rm.from_base);
+        bs_remap_ntok_host_.push_back(static_cast<int32_t>(rm.n_tokens));
+        max_block_tokens = std::max(max_block_tokens, rm.n_tokens);
+    }
+    const uint32_t n_moved = static_cast<uint32_t>(bs_remap_to_host_.size());
+    if (n_moved > 0) {
+        if (n_moved > bs_remap_capacity_) {
+            bs_remap_capacity_ = n_moved;
+            bs_remap_to_dev_ = backend_.tensor_i32(bs_remap_capacity_, "bs_remap_to");
+            bs_remap_from_dev_ =
+                backend_.tensor_i32(bs_remap_capacity_, "bs_remap_from");
+            bs_remap_ntok_dev_ =
+                backend_.tensor_i32(bs_remap_capacity_, "bs_remap_ntok");
         }
+        require_status(backend_.copy_i32_from_host(
+            *bs_remap_to_dev_, 0, bs_remap_to_host_.data(), n_moved));
+        require_status(backend_.copy_i32_from_host(
+            *bs_remap_from_dev_, 0, bs_remap_from_host_.data(), n_moved));
+        require_status(backend_.copy_i32_from_host(
+            *bs_remap_ntok_dev_, 0, bs_remap_ntok_host_.data(), n_moved));
+        for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+            if (!cfg.is_standard_attention_layer(il)) continue;
+            DeviceTensor &kc = k_cache(il);
+            require_status(backend_.rope_block_remap_paged_batched_device(
+                kc, n_moved, max_block_tokens, cfg.n_kv_heads, per_pos,
+                cfg.head_dim, cfg.rope_dim, *bs_remap_to_dev_,
+                *bs_remap_from_dev_, *bs_remap_ntok_dev_, *window_pages_device_,
+                page_size, cfg.rope_theta));
+        }
+    }
+    uint64_t t_rerope = 0;
+    if (tm) {
+        require_status(backend_.synchronize());
+        t_rerope = kvmem_steady_ns();
     }
     kvmem_active_ = true;
     // Rebuild the per-block representative K + reset the score accumulator for
     // the new interval (k̄ is read from the just-re-RoPE'd window K).
     kvmem_recompute_kbar();
+    if (tm) {
+        require_status(backend_.synchronize());
+        const uint64_t t_end = kvmem_steady_ns();
+        KvMemTimingTotals &t = kvmem_timing_totals();
+        t.assemble_pages_ns.fetch_add(t_pages - t_asm0,
+                                      std::memory_order_relaxed);
+        t.assemble_rerope_ns.fetch_add(t_rerope - t_pages,
+                                       std::memory_order_relaxed);
+        t.assemble_kbar_ns.fetch_add(t_end - t_rerope,
+                                     std::memory_order_relaxed);
+        t.assemble_ns.fetch_add(t_end - t_asm0, std::memory_order_relaxed);
+        t.assemble_calls.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 uint32_t QwenExecutor::kvmem_reselect() {
@@ -2996,6 +3231,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     if (kvmem_pending_reselect_) {
         throw std::runtime_error("KVMem reselect already prepared");
     }
+    const bool tm = kvmem_timing_flag();
+    const uint64_t t_sel0 = tm ? kvmem_steady_ns() : 0;
     const KvMemMethod method = block_store_->config().select_method;
     // Build the global content-frame index once, from the pristine post-prefill
     // cache (every block still baked at its true position). After the first
@@ -3032,6 +3269,13 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     }
     kvmem_pending_plan_ =
         block_store_->set_selection(block_store_->pick_topk_blocks());
+    if (tm) {
+        require_status(backend_.synchronize());
+        KvMemTimingTotals &t = kvmem_timing_totals();
+        t.retrieval_ns.fetch_add(kvmem_steady_ns() - t_sel0,
+                                 std::memory_order_relaxed);
+        t.retrieval_calls.fetch_add(1, std::memory_order_relaxed);
+    }
     kvmem_start_prefetch(kvmem_pending_plan_);
     kvmem_pending_reselect_ = true;
     return kvmem_pending_plan_.total_window_tokens;
@@ -3651,7 +3895,20 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
         }
     }
     position_ = checkpoints.base_position + index + 1;
-    if (kvmem_enabled_) kvmem_registered_pos_ = position_;
+    // kvmem block-store registration tracks how many committed tokens have been
+    // folded into the block store, which only ever grows via register_append.
+    // The MTP verify batch is mtp_single_chunk, so it registered NOTHING; the
+    // store still holds exactly `base_position` tokens. Rolling this counter to
+    // the post-restore `position_` would make the executor believe the
+    // accepted+1 newly-committed tokens are already registered, so the
+    // subsequent kvmem_mtp_advance_to -> register_append guard
+    // (position_ <= kvmem_registered_pos_) would no-op and those tokens would
+    // never enter the store. The next kvmem_reselect would then rebuild the
+    // window from an under-counted total_tokens_, leaving window_query_pos_
+    // behind position_ (RoPE-frame desync, growing each reject). Restore to the
+    // store's true registered length so advance_to registers the gap. Mirrors
+    // restore_state, which restores the pre-verify kvmem_registered_pos.
+    if (kvmem_enabled_) kvmem_registered_pos_ = checkpoints.base_position;
     const uint32_t logical_pages =
         (position_ + kv_pages_.page_size - 1) / kv_pages_.page_size;
     kv_pages_.truncate_to_logical_pages(logical_pages);

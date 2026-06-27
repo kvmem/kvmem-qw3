@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <new>
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace qw3 {
@@ -739,6 +741,25 @@ public:
         return {false, "rope_block_remap_paged_device requires backend override"};
     }
 
+    // Batched re-RoPE: move n_blocks blocks in ONE launch. to_base/from_base/
+    // n_tokens are device int32 arrays of length n_blocks (window slot, original
+    // bake position, and token count per block); max_n_tokens bounds grid.x.
+    // Equivalent to calling rope_block_remap_paged_device once per block, but
+    // collapses the per-(layer,block) launch storm during window assembly.
+    virtual DeviceStatus rope_block_remap_paged_batched_device(
+            DeviceTensor &k_cache, uint32_t n_blocks, uint32_t max_n_tokens,
+            uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+            uint32_t rope_dim, const DeviceTensor &to_base,
+            const DeviceTensor &from_base, const DeviceTensor &n_tokens,
+            const DeviceTensor &page_indices, uint32_t page_size, float theta) {
+        (void)k_cache; (void)n_blocks; (void)max_n_tokens; (void)n_kv_heads;
+        (void)per_pos_size; (void)head_dim; (void)rope_dim; (void)to_base;
+        (void)from_base; (void)n_tokens; (void)page_indices; (void)page_size;
+        (void)theta;
+        return {false,
+                "rope_block_remap_paged_batched_device requires backend override"};
+    }
+
     // Block-sparse cumulative-attention selection signal (#40). Both are
     // no-ops on backends without an override (selection falls back to recency).
     //
@@ -1311,6 +1332,51 @@ public:
         }
         return {};
     }
+};
+
+// Size-keyed recycling pool for host buffers (used for kvmem's pinned CPU tier).
+//
+// kvmem's CPU tier needs a large cudaHostAlloc'd buffer, and pinned allocation
+// runs at ~0.6 s/GB. On the continuous-batching path each request builds a fresh
+// executor and configures kvmem, so allocating the tier buffer per request added
+// (e.g.) ~5 s to the TTFT of every request with an 8 GiB CPU tier. This pool
+// recycles freed buffers keyed by exact byte size: sequential requests reuse one
+// buffer (the alloc is paid once), while concurrent requests still receive
+// distinct buffers (the pool grows on demand) so no two live executors ever share
+// backing bytes. acquire() transfers ownership out; release() takes it back.
+// Recycled bytes are stale, which is safe because each executor's tier slot
+// bookkeeping starts empty and only reads slots it has itself written. Pooled
+// buffers outlive the per-request executors and are freed when the pool is
+// destroyed, which must happen while the owning backend (CUDA context) is alive.
+class HostTierBufferPool {
+public:
+    explicit HostTierBufferPool(DeviceBackend &backend) : backend_(backend) {}
+
+    std::unique_ptr<HostBuffer> acquire(uint64_t bytes, const char *label) {
+        if (bytes == 0) return nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = free_.find(bytes);
+            if (it != free_.end() && !it->second.empty()) {
+                std::unique_ptr<HostBuffer> buf = std::move(it->second.back());
+                it->second.pop_back();
+                return buf;
+            }
+        }
+        return backend_.host_buffer(bytes, label);
+    }
+
+    void release(std::unique_ptr<HostBuffer> buf) {
+        if (!buf) return;
+        const uint64_t bytes = buf->bytes;
+        std::lock_guard<std::mutex> lk(mu_);
+        free_[bytes].push_back(std::move(buf));
+    }
+
+private:
+    DeviceBackend &backend_;
+    std::mutex mu_;
+    std::unordered_map<uint64_t, std::vector<std::unique_ptr<HostBuffer>>> free_;
 };
 
 bool cuda_device_backend_available();

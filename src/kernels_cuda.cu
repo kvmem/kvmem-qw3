@@ -258,6 +258,25 @@ bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    uint32_t page_size, float theta,
                                    cudaStream_t stream);
 
+// Batched analogue: re-RoPE n_blocks moved blocks in ONE launch (grid.z indexes
+// the block). Each block reads its own from_base[bz]/to_base[bz]/n_tokens[bz]
+// from device arrays; win_base == to_base (window slot). Collapses the
+// per-(layer,block) launch storm in kvmem_assemble (16 std-attn layers x ~dozens
+// of moved blocks) into one launch per layer. Byte-identical to issuing the
+// scalar kernel once per block (blocks touch disjoint physical pages: no race).
+bool launch_rope_block_remap_paged_batched(void *cache, bool is_fp16,
+                                           uint32_t n_blocks,
+                                           uint32_t max_n_tokens,
+                                           uint32_t n_kv_heads,
+                                           uint32_t per_pos_size,
+                                           uint32_t head_dim, uint32_t rope_dim,
+                                           const int32_t *to_base,
+                                           const int32_t *from_base,
+                                           const int32_t *n_tokens,
+                                           const int32_t *page_indices,
+                                           uint32_t page_size, float theta,
+                                           cudaStream_t stream);
+
 // Block-sparse selection signal (#40). See kernel comments.
 bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
                               uint32_t n_blocks, uint32_t n_kv_heads,
@@ -2723,6 +2742,46 @@ __global__ void rope_block_remap_paged_kernel(T *cache,
     const uint32_t i = threadIdx.x;
     const uint32_t half = rope_dim / 2;
     if (i >= half) return;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(win_base + tok, page_indices, page_size);
+    T *base = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+              static_cast<uint64_t>(unit) * head_dim;
+    const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) / static_cast<float>(rope_dim));
+    const float ang_o = static_cast<float>(orig_base + static_cast<int32_t>(tok)) * inv_freq;
+    const float ang_n = static_cast<float>(new_base + static_cast<int32_t>(tok)) * inv_freq;
+    float so, co, sn, cn;
+    __sincosf(ang_o, &so, &co);
+    __sincosf(ang_n, &sn, &cn);
+    const float x0 = static_cast<float>(base[i]);
+    const float x1 = static_cast<float>(base[i + half]);
+    const float d0 =  x0 * co + x1 * so;
+    const float d1 = -x0 * so + x1 * co;
+    base[i]        = static_cast<T>(d0 * cn - d1 * sn);
+    base[i + half] = static_cast<T>(d0 * sn + d1 * cn);
+}
+
+// Batched re-RoPE: one launch handles all moved blocks for a layer. grid =
+// (max_n_tokens, n_kv_heads, n_blocks); blockIdx.z selects the block and pulls
+// its window slot (to_base), original bake (from_base) and token count from
+// device arrays. The per-(tok,unit,i) math is identical to the scalar kernel, so
+// the result is byte-for-byte the same as issuing it once per block.
+template <typename T>
+__global__ void rope_block_remap_paged_batched_kernel(
+        T *cache, uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *from_base,
+        const int32_t *n_tokens, const int32_t *page_indices,
+        uint32_t page_size, float theta) {
+    const uint32_t bz   = blockIdx.z;   // which moved block
+    const uint32_t tok  = blockIdx.x;   // token within the block
+    const uint32_t unit = blockIdx.y;   // kv head
+    const uint32_t i = threadIdx.x;
+    const uint32_t half = rope_dim / 2;
+    if (i >= half) return;
+    if (tok >= static_cast<uint32_t>(n_tokens[bz])) return;  // partial-block guard
+    const int32_t orig_base = from_base[bz];
+    const int32_t new_base  = to_base[bz];
+    if (orig_base == new_base) return;  // already at target slot: skip (no write)
+    const uint32_t win_base = static_cast<uint32_t>(new_base);
     const uint32_t physical_pos =
         kv_physical_pos_from_pages(win_base + tok, page_indices, page_size);
     T *base = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
@@ -5961,6 +6020,40 @@ public:
         return launch_status("cuda rope_block_remap_paged_device");
     }
 
+    DeviceStatus rope_block_remap_paged_batched_device(
+            DeviceTensor &k_cache, uint32_t n_blocks, uint32_t max_n_tokens,
+            uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+            uint32_t rope_dim, const DeviceTensor &to_base,
+            const DeviceTensor &from_base, const DeviceTensor &n_tokens,
+            const DeviceTensor &page_indices, uint32_t page_size,
+            float theta) override {
+        if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return {};
+        if (page_size == 0)
+            return {false, "rope_block_remap_paged_batched_device page_size=0"};
+        auto &c = as_tensor(k_cache);
+        const auto &pages = as_tensor(page_indices);
+        if (pages.elem_size != sizeof(int32_t)) {
+            return {false, "rope_block_remap_paged_batched_device page dtype mismatch"};
+        }
+        const bool is_fp16 = c.is_fp16();
+        const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
+                            !c.is_fp8_kv();
+        if (!is_fp16 && !is_f32) {
+            return {false, "rope_block_remap_paged_batched_device requires fp16 or "
+                           "fp32 KV (q8/fp8 re-RoPE is lossy)"};
+        }
+        void *ptr = is_fp16 ? static_cast<void *>(c.ptr_h())
+                            : static_cast<void *>(c.ptr);
+        if (!ported::launch_rope_block_remap_paged_batched(
+                ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
+                head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
+                as_tensor(from_base).ptr_i32(), as_tensor(n_tokens).ptr_i32(),
+                pages.ptr_i32(), page_size, theta, exec_stream_)) {
+            return {false, "rope_block_remap_paged_batched launch failed"};
+        }
+        return launch_status("cuda rope_block_remap_paged_batched_device");
+    }
+
     DeviceStatus block_kmean_paged_device(const DeviceTensor &k_cache,
                                           DeviceTensor &kbar,
                                           uint32_t n_blocks,
@@ -8673,6 +8766,34 @@ bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
         rope_block_remap_paged_kernel<float><<<grid, half, 0, stream>>>(
             static_cast<float *>(cache), per_pos_size, head_dim, rope_dim,
             win_base, orig_base, new_base, page_indices, page_size, theta);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_rope_block_remap_paged_batched(void *cache, bool is_fp16,
+                                           uint32_t n_blocks,
+                                           uint32_t max_n_tokens,
+                                           uint32_t n_kv_heads,
+                                           uint32_t per_pos_size,
+                                           uint32_t head_dim, uint32_t rope_dim,
+                                           const int32_t *to_base,
+                                           const int32_t *from_base,
+                                           const int32_t *n_tokens,
+                                           const int32_t *page_indices,
+                                           uint32_t page_size, float theta,
+                                           cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0 || half == 0)
+        return true;
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    if (is_fp16) {
+        rope_block_remap_paged_batched_kernel<__half><<<grid, half, 0, stream>>>(
+            static_cast<__half *>(cache), per_pos_size, head_dim, rope_dim,
+            to_base, from_base, n_tokens, page_indices, page_size, theta);
+    } else {
+        rope_block_remap_paged_batched_kernel<float><<<grid, half, 0, stream>>>(
+            static_cast<float *>(cache), per_pos_size, head_dim, rope_dim,
+            to_base, from_base, n_tokens, page_indices, page_size, theta);
     }
     return cudaGetLastError() == cudaSuccess;
 }

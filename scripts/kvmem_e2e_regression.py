@@ -26,7 +26,7 @@ import os
 import socket
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -46,6 +46,22 @@ class CaseResult:
     status: Optional[int] = None
     response: str = ""
     error: Optional[str] = None
+    completions: List[str] = field(default_factory=list)
+
+
+def parse_completion_text(body: str) -> str:
+    """Extract choices[0].text from an OpenAI /v1/completions JSON body."""
+    try:
+        obj = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    choices = obj.get("choices") if isinstance(obj, dict) else None
+    if not choices:
+        return ""
+    first = choices[0]
+    if isinstance(first, dict):
+        return first.get("text") or first.get("message", {}).get("content", "") or ""
+    return ""
 
 
 def find_free_port() -> int:
@@ -243,7 +259,8 @@ def run_continuous_case(name: str,
                         extra_args: Sequence[str],
                         expect_success: bool,
                         expect_error_substring: Optional[str] = None,
-                        extra_env: Optional[Dict[str, str]] = None) -> CaseResult:
+                        extra_env: Optional[Dict[str, str]] = None,
+                        enable_kvmem: bool = True) -> CaseResult:
     host = "127.0.0.1"
     port = find_free_port()
     cmd = [
@@ -259,11 +276,14 @@ def run_continuous_case(name: str,
         "--prefill-chunk", "256",
         "--continuous-batching",
         "--max-active", str(max(2, len(prompts))),
-        "--kvmem",
-        "--kvmem-block-tokens", "16",
-        "--kvmem-budget", "4096",
-        "--kvmem-method", "recency",
     ]
+    if enable_kvmem:
+        cmd.extend([
+            "--kvmem",
+            "--kvmem-block-tokens", "16",
+            "--kvmem-budget", "4096",
+            "--kvmem-method", "recency",
+        ])
     cmd.extend(extra_args)
     env = os.environ.copy()
     env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
@@ -281,12 +301,14 @@ def run_continuous_case(name: str,
     status = None
     error: Optional[str] = None
     log = ""
+    completions: List[str] = []
     try:
         wait_for_health(host, port, min(120.0, float(timeout_s)))
         if len(prompts) == 1:
             status, response_text = post_completion(
                 host, port, prompts[0], max_tokens, float(timeout_s)
             )
+            completions = [parse_completion_text(response_text)]
         else:
             with futures.ThreadPoolExecutor(max_workers=len(prompts)) as ex:
                 futs = [
@@ -296,6 +318,7 @@ def run_continuous_case(name: str,
                 replies = [f.result(timeout=timeout_s) for f in futs]
             status = max(s for s, _ in replies)
             response_text = "\n".join(body for _, body in replies)
+            completions = [parse_completion_text(body) for _, body in replies]
     except BaseException as exc:  # noqa: BLE001
         error = str(exc)
     finally:
@@ -329,6 +352,7 @@ def run_continuous_case(name: str,
         status=status,
         response=response_text,
         error=error,
+        completions=completions,
     )
 
 
@@ -580,21 +604,87 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not results[-1].ok:
             failures.append("KVMem continuous-batching request failed")
 
+        # Phase-D ragged gate: CB + MTP + kvmem at an all-fit (identity) budget
+        # must be byte-identical to plain CB + MTP. Drive >=2 concurrent prompts
+        # so the verify batch has jobs.size()>1 and takes the window-aware ragged
+        # route (jobs.size()==1 uses the single verifier). Force the ragged route
+        # deterministically by lowering the ragged-verify min-token threshold
+        # (default 16) to 1 -- applied to BOTH the plain baseline and the kvmem
+        # run so the only variable is kvmem on/off, not the verify kernel route.
+        # NSPLIT=1 neutralizes the known fp-atomic split-K nondeterminism so
+        # greedy output is reproducible. A longer generation keeps both requests
+        # co-batched for many verify steps.
+        mtp_max_tokens = max(args.max_tokens, 48)
+        mtp_args = [
+            "--native-mtp-speculate",
+            "--mtp-chain", "2",
+            "--kvmem-budget", "131072",
+        ]
+        parity_env = dict(tier_env or {})
+        parity_env["QW3_FATTN_NSPLIT"] = "1"
+        parity_env["QW3_PREFILL_FA2_NSPLIT"] = "1"
+        parity_env["QW3_CONTINUOUS_BATCHING_MTP_RAGGED_VERIFY_MIN_TOKENS"] = "1"
+
+        plain_mtp = run_continuous_case(
+            "plain_continuous_mtp",
+            qw3,
+            model,
+            prompts,
+            mtp_max_tokens,
+            args.ctx,
+            args.timeout,
+            ["--native-mtp-speculate", "--mtp-chain", "2"] + tier,
+            expect_success=True,
+            extra_env=parity_env,
+            enable_kvmem=False,
+        )
+        results.append(plain_mtp)
+        if not plain_mtp.ok:
+            failures.append("plain continuous + MTP baseline request failed")
+
+        kvmem_mtp = run_continuous_case(
+            "kvmem_continuous_mtp",
+            qw3,
+            model,
+            prompts,
+            mtp_max_tokens,
+            args.ctx,
+            args.timeout,
+            mtp_args + tier,
+            expect_success=True,
+            extra_env=parity_env,
+        )
+        results.append(kvmem_mtp)
+        if not kvmem_mtp.ok:
+            failures.append("KVMem + continuous + MTP (ragged route) request failed")
+        elif plain_mtp.ok:
+            if kvmem_mtp.completions != plain_mtp.completions:
+                failures.append(
+                    "kvmem CB+MTP (identity budget) diverged from plain CB+MTP: "
+                    f"plain={plain_mtp.completions!r} kvmem={kvmem_mtp.completions!r}"
+                )
+
+        # The opt-in LAYERED verifier is the one remaining unsupported combo and
+        # must still hard-error (never silently verify against the wrong KV).
+        layered_env = dict(tier_env or {})
+        layered_env["QW3_CONTINUOUS_MTP_LAYERED_VERIFY"] = "1"
         results.append(run_continuous_case(
-            "kvmem_continuous_mtp_hard_error",
+            "kvmem_continuous_mtp_layered_hard_error",
             qw3,
             model,
             ["Answer briefly: hello"],
             args.max_tokens,
             args.ctx,
             args.timeout,
-            ["--mtp-chain", "2"] + tier,
+            ["--native-mtp-speculate", "--mtp-chain", "2"] + tier,
             expect_success=False,
-            expect_error_substring="cannot be combined with MTP",
-            extra_env=tier_env,
+            expect_error_substring="cannot be combined with the layered MTP",
+            extra_env=layered_env,
         ))
         if not results[-1].ok:
-            failures.append("KVMem + continuous + MTP hard-error guard failed")
+            failures.append(
+                "KVMem + continuous + layered-MTP hard-error guard failed"
+            )
 
     for r in results:
         status = "ok" if r.ok else "FAIL"

@@ -264,13 +264,75 @@ public:
     // re-RoPE. Set once at session start from the CLI flag.
     void set_kvmem_enabled(bool on) { kvmem_enabled_ = on; }
     bool kvmem_enabled() const { return kvmem_enabled_; }
+    // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
+    // it per executor. Set before configure_kvmem(); the pool must outlive this
+    // executor. No-op effect when kvmem or the CPU tier is off.
+    void set_host_tier_pool(HostTierBufferPool *pool) { host_tier_pool_ = pool; }
     void configure_kvmem(const KvMemStoreConfig &cfg);
+
+    // ---- Window-aware batched verify support (CB-MTP ragged path) ----------
+    // When kvmem is active the assembled window advances in lockstep with
+    // position_ as decode/verify tokens append at the window tail. The CB-MTP
+    // ragged verify executor builds its page metadata from the WINDOW (not the
+    // full cache); unlike forward_n_tokens it does NOT self-advance the window,
+    // so it must call kvmem_advance_window(chunk) after a successful batched
+    // verify. These accessors expose the window frame the metadata builder reads.
+    bool kvmem_active() const { return kvmem_active_; }
+    uint32_t window_query_pos() const { return window_query_pos_; }
+    uint32_t window_page_count() const { return window_page_count_; }
+    const std::vector<int32_t> &window_pages_host() const {
+        return window_pages_host_;
+    }
+
+    // ---- Tier residency reporting (diagnostics) ----------------------------
+    // Where the block-sparse KV currently lives across the GPU bounded pool /
+    // CPU pinned tier / NVMe tier. Counts come from the live allocators; bytes
+    // are derived from the per-block estimate. All-zero when kvmem is disabled.
+    // Used to report the GPU/CPU/NVMe KV footprint during long-context sweeps.
+    struct KvMemTierUsage {
+        bool     enabled = false;
+        bool     active = false;
+        uint64_t total_blocks = 0;
+        uint64_t block_bytes = 0;
+        bool     gpu_pool = false;          // bounded pool present (i.e. spilling)
+        uint64_t gpu_used_bytes = 0;
+        uint64_t gpu_capacity_bytes = 0;
+        bool     cpu_tier = false;
+        uint64_t cpu_used_bytes = 0;
+        uint64_t cpu_capacity_bytes = 0;
+        bool     nvme_tier = false;
+        uint64_t nvme_used_bytes = 0;
+        uint64_t nvme_capacity_bytes = 0;
+    };
+    KvMemTierUsage kvmem_tier_usage() const;
+    // Extend the assembled window so `n` verify tokens can append at the window
+    // tail. True KV for [true_base_pos, true_base_pos+n) must already be
+    // allocated (caller runs prepare_kv_pages first). No-op unless kvmem is
+    // active. Mirrors the chunk_bs extend in forward_n_tokens.
+    void kvmem_extend_window_for_verify(uint32_t n, uint32_t true_base_pos) {
+        if (!kvmem_active_) return;
+        kvmem_extend_window_for_decode_n(n, true_base_pos);
+    }
+    // Advance the window tail by `n` after a BATCHED verify kernel appended `n`
+    // tokens at window slot window_query_pos_. forward_one_token /
+    // forward_n_tokens self-advance the window; the ragged batched-prefill path
+    // bypasses them and must call this on the success path only. No-op unless
+    // kvmem is active.
+    void kvmem_advance_window(uint32_t n) {
+        if (!kvmem_active_) return;
+        window_query_pos_ += n;
+    }
 
     // Register newly-appended context tokens with the block store (called after
     // prefill / each committed decode token grows the context). No-op when
     // block-sparse is disabled.
     void kvmem_register_append(uint32_t n_new_tokens);
-    void kvmem_maybe_prefill_offload();
+    // Spill cold blocks to the tier mid-prefill if the bounded GPU page pool is
+    // about to run short. `next_chunk_tokens` is the size of the upcoming prefill
+    // append, so the offload fires while there is still room for it (a full chunk
+    // can grab >100 pages at once, so a "only when nearly empty" trigger would
+    // let the pool exhaust mid-chunk and throw). No-op when not bounded/tiered.
+    void kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens);
 
     // Re-select the working set from the built-in cumulative-attention top-k
     // and assemble it: re-RoPE each moved block in place (per attention layer)
@@ -293,6 +355,36 @@ public:
     uint32_t kvmem_set_selection(const std::vector<uint32_t> &block_ids);
 
     const KvMemStore *block_store() const { return block_store_.get(); }
+
+    // ---- KVMem component timing (env QW3_KVMEM_TIMING; OFF by default) ------
+    // Process-global wall-clock breakdown of the tier/selection components used
+    // by the latency-breakdown harness. Snapshot at request admit, emit the
+    // delta at finish. When enabled the GPU-async regions add a device sync so
+    // their kernel time is captured -- this perturbs throughput, so measure
+    // throughput WITHOUT the flag and the breakdown WITH it.
+    struct KvMemTimingSnapshot {
+        uint64_t retrieval_ns = 0;
+        uint64_t stage_in_ns = 0;
+        uint64_t stage_out_ns = 0;
+        uint64_t assemble_ns = 0;
+        // assemble_ns is split into its three GPU substeps: window page-table
+        // construction (the "virtual page" reordering + sync_window_pages_device
+        // H2D), re-RoPE of moved blocks (rope_block_remap), and k̄ recompute
+        // (block_kmean). Captured only under the timing flag (extra device syncs).
+        uint64_t assemble_pages_ns = 0;
+        uint64_t assemble_rerope_ns = 0;
+        uint64_t assemble_kbar_ns = 0;
+        uint32_t retrieval_calls = 0;
+        uint32_t stage_in_calls = 0;
+        uint32_t stage_out_calls = 0;
+        uint32_t assemble_calls = 0;
+        uint32_t stage_in_blocks = 0;
+        uint32_t stage_out_blocks = 0;
+    };
+    static bool kvmem_timing_enabled();
+    static KvMemTimingSnapshot kvmem_timing_snapshot();
+    static void kvmem_timing_emit_delta(const char *tag,
+                                        const KvMemTimingSnapshot &baseline);
 
 private:
     struct KvPageTable {
@@ -492,6 +584,11 @@ private:
     std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
     std::unique_ptr<HostBuffer> kvmem_cpu_bytes_;
+    // Shared recycler for the pinned CPU-tier buffer. When set (continuous-
+    // batching path), configure_kvmem borrows the buffer from here instead of
+    // cudaHostAlloc-ing per request; the destructor returns it. Borrowed, owned
+    // by the backend and must outlive this executor. Null => own per-executor.
+    HostTierBufferPool *host_tier_pool_ = nullptr;
     std::vector<uint8_t> kvmem_stage_buffer_;
     struct KvMemPrefetchBlock {
         uint32_t block_id = 0;
@@ -569,6 +666,16 @@ private:
     std::unique_ptr<DeviceTensor> bs_win_base_dev_;    // [blocks] int32
     std::unique_ptr<DeviceTensor> bs_blk_tokens_dev_;  // [blocks] int32
     uint32_t bs_kbar_capacity_ = 0;             // allocated block capacity
+    // Batched re-RoPE inputs (moved blocks only): window slot / original bake /
+    // token count per moved block, uploaded once per reselect, then reused across
+    // all standard-attention layers (one batched launch per layer).
+    std::vector<int32_t> bs_remap_to_host_;     // moved block i -> window slot (to_base)
+    std::vector<int32_t> bs_remap_from_host_;   // moved block i -> original bake (from_base)
+    std::vector<int32_t> bs_remap_ntok_host_;   // moved block i -> token count
+    std::unique_ptr<DeviceTensor> bs_remap_to_dev_;    // [moved] int32
+    std::unique_ptr<DeviceTensor> bs_remap_from_dev_;  // [moved] int32
+    std::unique_ptr<DeviceTensor> bs_remap_ntok_dev_;  // [moved] int32
+    uint32_t bs_remap_capacity_ = 0;            // allocated moved-block capacity
 
     // ---- Global content-frame KV retrieval (#48/#49) ----------------------
     // The window-local signal above can only RETAIN blocks already inside the

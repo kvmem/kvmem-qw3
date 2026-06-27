@@ -1015,6 +1015,7 @@ public:
         const LinearBackend linear_backend = parse_linear_backend(options_.native_linear_backend);
         device_ = make_cuda_device_backend(linear_backend);
         if (!device_) throw std::runtime_error("CUDA device backend is unavailable");
+        cb_host_tier_pool_ = std::make_unique<HostTierBufferPool>(*device_);
 
         DeviceStatus st = device_->begin();
         if (!st.ok) throw std::runtime_error(std::string("device begin failed: ") + st.message);
@@ -1140,23 +1141,27 @@ public:
             effective_options.continuous_batching &&
             (!active_mtp || continuous_batching_mtp_enabled());
 
-        // kvmem × MTP on the continuous-batching path is not yet wired: the CB
-        // decode body batches standard-attention layers across requests with
-        // kernels that read each executor's live page table directly, not the
-        // assembled kvmem window. Combining them there would silently verify
-        // against the wrong KV. Per the locked design decision this is a HARD
-        // ERROR — never a silent fallback to plain decode or a silent MTP
-        // disable. The single-request (non-CB) generate_mtp path IS kvmem-aware
-        // (Phase C): it routes verify through the window-aware forward_one_token
-        // and rolls the window back on rejection, so kvmem + MTP is allowed
-        // there. The user must drop --continuous-batching to combine them.
-        if (options_.kvmem_enabled && active_mtp && route_continuous) {
+        // kvmem × MTP on the continuous-batching path now runs through the
+        // window-aware RAGGED verify route (build_continuous_mtp_verify_batch
+        // substitutes the assembled window page table + logical positions for
+        // every kvmem row; the post-kernel advance + snapshot/checkpoint
+        // rollback keep window_query_pos_ in lockstep with position_). The only
+        // remaining unsupported combination is the opt-in LAYERED verifier
+        // (QW3_CONTINUOUS_MTP_LAYERED_VERIFY): its BatchedDecodeExecutor reads
+        // each executor's live full-cache page table, not the window, so it
+        // would silently verify against the wrong KV. Per the locked design
+        // decision that stays a HARD ERROR — never a silent fallback or MTP
+        // disable. (When --kvmem is set, configure_executor_kvmem applies to
+        // every CB executor, so this global guard covers all rows; there is no
+        // kvmem/non-kvmem mix within one CB worker.)
+        if (options_.kvmem_enabled && active_mtp && route_continuous &&
+            continuous_mtp_layered_verify_enabled()) {
             throw std::runtime_error(
-                "kvmem (--kvmem) cannot be combined with MTP speculative "
-                "decode on the continuous-batching path yet: the CB decode "
-                "body is not kvmem-window-aware. Run kvmem + MTP without "
-                "--continuous-batching (single-request path is supported), or "
-                "drop --kvmem / --mtp-chain to use the CB path.");
+                "kvmem (--kvmem) cannot be combined with the layered MTP "
+                "verifier (QW3_CONTINUOUS_MTP_LAYERED_VERIFY) on the "
+                "continuous-batching path: the layered decode executor is not "
+                "kvmem-window-aware. Unset QW3_CONTINUOUS_MTP_LAYERED_VERIFY to "
+                "use the window-aware ragged verify route, or drop --kvmem.");
         }
 
         if (route_continuous &&
@@ -1257,6 +1262,18 @@ private:
         // bs_steps_since_reselect): counts committed decode tokens since the
         // last window reselection. Unused when --kvmem is off.
         int kvmem_steps_since_reselect = 0;
+        // Position-delta cadence trackers for the MTP path, where multiple
+        // tokens commit per verify step. Mirror the single-request
+        // kvmem_advance_to lambda: register the position() delta since the last
+        // call (so an accepted chain registers its whole jump at once) and
+        // reselect on the interval boundary. Unused when --kvmem is off.
+        uint32_t kvmem_registered_pos = 0;
+        uint32_t kvmem_last_reselect_pos = 0;
+        // KVMem component-timing baseline (env QW3_KVMEM_TIMING). Snapshot of
+        // the process-global tier/selection accumulators at admit; the per-
+        // request breakdown is the delta emitted at finish. Inert when timing
+        // is off.
+        QwenExecutor::KvMemTimingSnapshot kvmem_timing_baseline;
     };
 
     struct ContinuousDecodeBatch {
@@ -1716,6 +1733,20 @@ private:
                         out.checkpoints.base_position = out.offset;
                         out.checkpoints.count = out.chunk;
                         out.checkpoints.h_stride = hidden;
+                        // Capture the pre-advance window frame so that
+                        // restore_state_checkpoint(index) can roll the kvmem
+                        // window tail back per accepted row, mirroring how it
+                        // rolls position_ back. window_query_pos() still equals
+                        // the verify base here (advance happens post-kernel).
+                        if (out.prefill_index < prefilling.size()) {
+                            QwenExecutor *ex =
+                                prefilling[out.prefill_index].executor.get();
+                            out.checkpoints.kvmem_active = ex->kvmem_active();
+                            out.checkpoints.window_base_query_pos =
+                                ex->window_query_pos();
+                            out.checkpoints.window_base_page_count =
+                                ex->window_page_count();
+                        }
                         if (out.checkpoints.recurrent_states.size() !=
                             weights_.n_layers()) {
                             out.checkpoints.recurrent_states.resize(
@@ -3951,6 +3982,21 @@ private:
         }
     }
 
+    // True if any verify job's executor is currently running in the kvmem
+    // window frame. Such rows must take the window-aware ragged verify route,
+    // never the full-cache layered verifier.
+    static bool mtp_jobs_have_kvmem_row(
+            const std::vector<ContinuousBatchActive> &mtp_active,
+            const std::vector<ContinuousMtpVerifyJob> &jobs) {
+        for (const ContinuousMtpVerifyJob &job : jobs) {
+            if (job.row < mtp_active.size() && mtp_active[job.row].executor &&
+                mtp_active[job.row].executor->kvmem_active()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void build_continuous_mtp_verify_batch(
             std::vector<ContinuousBatchActive> &mtp_active,
             const std::vector<ContinuousMtpVerifyJob> &jobs,
@@ -3976,8 +4022,26 @@ private:
             a.prefill_offset = job.base_position;
             a.executor->prepare_runtime_state();
             a.executor->prepare_kv_pages(job.base_position, chunk);
+            // kvmem rows verify in the WINDOW frame: extend the assembled window
+            // so the `chunk` verify tokens append at the window tail (true KV at
+            // [base_position, base_position+chunk) was just allocated above), and
+            // source the page table + logical positions from the window instead
+            // of the full cache. Mirrors forward_n_tokens' chunk_bs branch so the
+            // batched verify attends exactly what the single-request path would.
+            const bool row_bs = a.executor->kvmem_active();
+            if (row_bs) {
+                a.executor->kvmem_extend_window_for_verify(chunk,
+                                                           job.base_position);
+            }
             QwenExecutor::DecodeStateView view =
                 a.executor->decode_state_view();
+            const uint32_t row_base =
+                row_bs ? a.executor->window_query_pos() : job.base_position;
+            const int32_t *row_page_src =
+                row_bs ? a.executor->window_pages_host().data()
+                       : view.kv_page_indices_host;
+            const uint32_t row_page_avail =
+                row_bs ? a.executor->window_page_count() : view.kv_page_count;
 
             ContinuousPrefillBatchEntry entry;
             entry.prefill_index = job.row;
@@ -4008,8 +4072,8 @@ private:
 
             bool entry_metadata_ready =
                 view.kv_page_size > 0 &&
-                view.kv_page_indices_host != nullptr &&
-                view.kv_page_count > 0;
+                row_page_src != nullptr &&
+                row_page_avail > 0;
             if (entry_metadata_ready) {
                 if (batch.page_size == 0) {
                     batch.page_size = view.kv_page_size;
@@ -4017,22 +4081,23 @@ private:
                     entry_metadata_ready = false;
                 }
             }
-            const uint32_t seq_len = job.base_position + chunk;
+            // Window frame for kvmem rows (row_base == window_query_pos), true
+            // frame otherwise (row_base == base_position).
+            const uint32_t seq_len = row_base + chunk;
             if (entry_metadata_ready) {
                 const uint32_t pages =
                     (seq_len + view.kv_page_size - 1) / view.kv_page_size;
-                if (pages == 0 || view.kv_page_count < pages) {
+                if (pages == 0 || row_page_avail < pages) {
                     entry_metadata_ready = false;
                 } else {
                     const int32_t request_page_begin =
                         static_cast<int32_t>(batch.page_indices.size());
                     for (uint32_t p = 0; p < pages; ++p) {
-                        batch.page_indices.push_back(
-                            view.kv_page_indices_host[p]);
+                        batch.page_indices.push_back(row_page_src[p]);
                     }
                     for (uint32_t t = 0; t < chunk; ++t) {
                         batch.logical_positions.push_back(
-                            static_cast<int32_t>(job.base_position + t));
+                            static_cast<int32_t>(row_base + t));
                         batch.row_page_indptr.push_back(request_page_begin);
                         batch.token_rows.push_back(job.verify_tokens[t]);
                     }
@@ -4295,8 +4360,27 @@ private:
                     static_cast<int>(kMtpPrefillChunk));
                 NativeExecutorReport step;
                 uint64_t prefill_ops = 0;
+                if (QwenExecutor::kvmem_timing_enabled()) {
+                    a.kvmem_timing_baseline = QwenExecutor::kvmem_timing_snapshot();
+                }
                 const double prefill0 = wall_seconds();
-                for (size_t offset = 0; offset < req->prompt_tokens.size();
+                // Prefix-cache: start prefill at a.prefill_offset (set to the
+                // reused prefix length by seed_from_shared_prefix in
+                // initialize_continuous_active). Starting at 0 would re-append
+                // the seeded tokens at position_=hit_len, corrupting the KV
+                // layout (double-prefill). The seeded MAIN KV pages are
+                // physically resident; only the MTP draft prefix (a SEPARATE KV
+                // cache) was not seeded, and its hidden states are not
+                // recoverable from the prefix cache. So for a seeded request we
+                // skip MTP-prefix priming: the draft chain then bails
+                // (position_ > mtp_prefix_len_==0) to a full forward_one_token
+                // per token — correct output, just no speculation over the
+                // reused prefix. Non-seeded requests prime as before.
+                const bool seeded_prefix = a.prefill_offset > 0;
+                const size_t prefill_start = std::min<size_t>(
+                    a.prefill_offset, req->prompt_tokens.size());
+                for (size_t offset = prefill_start;
+                     offset < req->prompt_tokens.size();
                      offset += kMtpPrefillChunk) {
                     const size_t end = std::min(
                         req->prompt_tokens.size(),
@@ -4310,13 +4394,42 @@ private:
                     step = a.executor->forward_n_tokens(chunk, need_logits);
                     if (!step.ok) throw std::runtime_error("MTP prefill failed");
                     prefill_ops += step.ops_executed;
-                    NativeExecutorReport prefix =
-                        a.executor->prime_mtp_prefix_from_last_batch(
-                            chunk, static_cast<uint32_t>(offset));
-                    if (!prefix.ok) {
-                        throw std::runtime_error(
-                            "MTP prefix priming failed in batched lane");
+                    if (!seeded_prefix) {
+                        NativeExecutorReport prefix =
+                            a.executor->prime_mtp_prefix_from_last_batch(
+                                chunk, static_cast<uint32_t>(offset));
+                        if (!prefix.ok) {
+                            throw std::runtime_error(
+                                "MTP prefix priming failed in batched lane");
+                        }
                     }
+                }
+                // Seeding only ever reuses a strict prefix (hit_len <
+                // prompt_len), so prefill_start < prompt_len and the loop ran at
+                // least one chunk, leaving `step` holding the final logits.
+                if (!step.ok) {
+                    throw std::runtime_error(
+                        "MTP prefill produced no logits (empty prompt?)");
+                }
+                // kvmem: build the working-set window now that the full prompt
+                // KV is resident. register_append clamps to position_, so the
+                // seeded region registers correctly. Under the default all-fit
+                // budget this is identity selection => decode stays
+                // byte-identical to plain MTP. No-op when --kvmem is off.
+                kvmem_on_prefill_complete(a);
+                // Phase split: everything accumulated up to here (prefill-chunk
+                // offload reselects + the first post-prefill window assembly) is
+                // the TTFT-phase kvmem cost. Emit it as phase=prefill, then re-
+                // baseline so the finish emit captures only the decode-phase
+                // reselect cadence. This is what isolates "why is kvmem_gpu TTFT
+                // ~= plain" (tiny prefill assembly) from the decode penalty.
+                if (QwenExecutor::kvmem_timing_enabled()) {
+                    const std::string ptag =
+                        "phase=prefill request=" + std::to_string(req->id);
+                    QwenExecutor::kvmem_timing_emit_delta(
+                        ptag.c_str(), a.kvmem_timing_baseline);
+                    a.kvmem_timing_baseline =
+                        QwenExecutor::kvmem_timing_snapshot();
                 }
                 const double prefill_s = std::max(wall_seconds() - prefill0, 1e-9);
                 a.prefill_ops = prefill_ops;
@@ -4478,7 +4591,13 @@ private:
                         job.row = row;
                         job.current = a.next_token;
                         job.base_position = a.executor->position();
-                        if (state_checkpoint_count == 0) {
+                        // kvmem rows always snapshot, even under checkpoints:
+                        // the ragged single-fallback restore (and the commit
+                        // snapshot-replay path) is window-aware only via
+                        // restore_state(snapshot), so the window base must be
+                        // captured here regardless of state_checkpoint_count.
+                        if (state_checkpoint_count == 0 ||
+                            a.executor->kvmem_active()) {
                             const double snapshot0 = cb_phase_time();
                             a.executor->capture_state(stats[row].snapshot);
                             stats[row].snapshot_s +=
@@ -4573,7 +4692,12 @@ private:
                     job.row = row;
                     job.current = current;
                     job.base_position = a.executor->position();
-                    if (state_checkpoint_count == 0) {
+                    // kvmem rows always snapshot, even under checkpoints (see
+                    // batched-draft path above): restore_state(snapshot) is the
+                    // only window-aware rollback used by the ragged
+                    // single-fallback and commit snapshot-replay paths.
+                    if (state_checkpoint_count == 0 ||
+                        a.executor->kvmem_active()) {
                         const double snapshot0 = cb_phase_time();
                         a.executor->capture_state(stats[row].snapshot);
                         stats[row].snapshot_s +=
@@ -4647,7 +4771,13 @@ private:
                                 std::max(cb_phase_time() - verify0, 0.0);
                         }
                     } else if (continuous_mtp_layered_verify_enabled() &&
+                               !mtp_jobs_have_kvmem_row(mtp_active, jobs) &&
                                run_layered_verifier(jobs, outputs)) {
+                        // The layered verifier reads the live full-cache page
+                        // table and is NOT kvmem-window-aware, so kvmem rows are
+                        // forced to the window-aware ragged route below. (The
+                        // request-entry guard already hard-errors kvmem +
+                        // layered, so this is belt-and-suspenders.)
                         for (ContinuousMtpVerifyJob &job : jobs) {
                             job.layered_verified = true;
                         }
@@ -4733,6 +4863,29 @@ private:
                                 if (jobs[j].row < stats.size()) {
                                     stats[jobs[j].row].checkpoints =
                                         std::move(outputs[j].checkpoints);
+                                }
+                            }
+                        }
+                        // Ragged verify appended `chunk` tokens at each kvmem
+                        // row's window tail (physical KV written) but, unlike
+                        // forward_n_tokens, did NOT self-advance
+                        // window_query_pos_. Advance it now on the
+                        // ragged-success path ONLY so the window stays in
+                        // lockstep with position_ (which prefill_ragged advanced
+                        // by chunk). The single-fallback path re-ran
+                        // forward_n_tokens, which self-advances, so advancing
+                        // here would double-count. The commit loop below rolls
+                        // both position_ and the window back per accepted row.
+                        if (used_ragged_verify) {
+                            for (uint32_t j = 0;
+                                 j < jobs.size() && j < outputs.size(); ++j) {
+                                const ContinuousMtpVerifyJob &job = jobs[j];
+                                if (job.row >= mtp_active.size()) continue;
+                                ContinuousBatchActive &a = mtp_active[job.row];
+                                if (a.executor && a.executor->kvmem_active()) {
+                                    a.executor->kvmem_advance_window(
+                                        static_cast<uint32_t>(
+                                            job.verify_tokens.size()));
                                 }
                             }
                         }
@@ -4922,6 +5075,16 @@ private:
                             }
                             ++s.rollbacks;
                         }
+                        // kvmem cadence: position() now reflects this row's
+                        // final committed KV length (the rollback block above
+                        // settled it for every accept/reject branch, and my
+                        // Task-3 ragged window advance is in lockstep with it).
+                        // Register the newly-committed tokens with the block
+                        // store and reselect the window on the interval
+                        // boundary, mirroring the single-request kvmem_advance_to
+                        // cadence. No-op when --kvmem is off; under the default
+                        // all-fit budget this stays byte-identical to plain MTP.
+                        kvmem_mtp_advance_to(a, a.executor->position());
                         for (uint32_t i = 0; i < accepted; ++i) {
                             if (!emit(a, job.drafts[i])) break;
                         }
@@ -4996,6 +5159,22 @@ private:
                             std::to_string(s.prefill_ops) +
                             " decode_ops=" +
                             std::to_string(s.decode_ops));
+                        if (a.executor && a.executor->kvmem_enabled()) {
+                            const QwenExecutor::KvMemTierUsage tu =
+                                a.executor->kvmem_tier_usage();
+                            std::ostringstream tmsg;
+                            tmsg << "[kvmem-tier-usage]"
+                                 << " total_blocks=" << tu.total_blocks
+                                 << " block_bytes=" << tu.block_bytes
+                                 << " gpu_used=" << tu.gpu_used_bytes
+                                 << " gpu_cap=" << tu.gpu_capacity_bytes
+                                 << " gpu_pool=" << (tu.gpu_pool ? 1 : 0)
+                                 << " cpu_used=" << tu.cpu_used_bytes
+                                 << " cpu_cap=" << tu.cpu_capacity_bytes
+                                 << " nvme_used=" << tu.nvme_used_bytes
+                                 << " nvme_cap=" << tu.nvme_capacity_bytes;
+                            log(tmsg.str());
+                        }
                         finish_continuous_active(a);
                         mtp_active.erase(mtp_active.begin() +
                                          static_cast<std::ptrdiff_t>(i - 1));
@@ -5074,6 +5253,29 @@ private:
             static_cast<uint32_t>(a.req->prompt_tokens.size()));
         a.executor->kvmem_reselect();
         a.kvmem_steps_since_reselect = 0;
+        a.kvmem_registered_pos = a.executor->position();
+        a.kvmem_last_reselect_pos = a.executor->position();
+    }
+
+    // Per-row MTP cadence: register the position() delta since the last call
+    // and reselect on the interval boundary. The MTP commit path advances
+    // position() by the accepted-chain length (>1), so register the whole jump
+    // in one shot rather than per token. Mirrors the single-request
+    // kvmem_advance_to lambda (~6641). No-op when this request has no kvmem.
+    void kvmem_mtp_advance_to(ContinuousBatchActive &a, uint32_t committed_pos) {
+        if (!a.executor || !a.executor->kvmem_enabled()) return;
+        if (committed_pos > a.kvmem_registered_pos) {
+            a.executor->kvmem_register_append(committed_pos -
+                                              a.kvmem_registered_pos);
+            a.kvmem_registered_pos = committed_pos;
+        }
+        if (options_.kvmem_update_mode == "step") return;
+        const uint32_t interval =
+            static_cast<uint32_t>(std::max(1, options_.kvmem_interval));
+        if (committed_pos >= a.kvmem_last_reselect_pos + interval) {
+            a.executor->kvmem_reselect();
+            a.kvmem_last_reselect_pos = committed_pos;
+        }
     }
 
     // Per committed decode token: grow the context by one and reselect on the
@@ -5100,6 +5302,9 @@ private:
             cb_kv_pool_.get(), &cb_kv_cache_view_,
             cb_mtp_kv_pool_.get(), &cb_mtp_kv_cache_view_);
         a.executor->set_prefill_chunk_override(options_.prefill_chunk);
+        // Borrow the pinned CPU-tier buffer from the shared pool so admit does
+        // not pay a per-request cudaHostAlloc of the whole --kvmem-cpu-gb tier.
+        a.executor->set_host_tier_pool(cb_host_tier_pool_.get());
         a.executor->reset_state();
         // Per-request kvmem: each CB executor gets its own block store + window
         // when --kvmem is set. The reselect cadence is driven below at the
@@ -6274,6 +6479,11 @@ private:
             << " batch_tokens=" << cb_decode_tokens_.load()
             << " max_batch=" << cb_decode_max_batch_.load();
         log(msg.str());
+        if (QwenExecutor::kvmem_timing_enabled()) {
+            std::string tag = "phase=decode request=" + std::to_string(a.req->id);
+            QwenExecutor::kvmem_timing_emit_delta(tag.c_str(),
+                                                  a.kvmem_timing_baseline);
+        }
         complete_continuous_request(a.req, std::move(a.req->generated));
     }
 
@@ -6651,6 +6861,10 @@ private:
         };
 
         const double t_prefill_start = wall_seconds();
+        QwenExecutor::KvMemTimingSnapshot kvmem_tbase;
+        if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
+            kvmem_tbase = QwenExecutor::kvmem_timing_snapshot();
+        }
         uint64_t prefill_ops = 0;
         NativeExecutorReport step;
         uint32_t prefill_chunks = 0;
@@ -6713,6 +6927,11 @@ private:
             executor_->kvmem_reselect();
             kvmem_registered_pos = executor_->position();
             kvmem_last_reselect_pos = executor_->position();
+        }
+        if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
+            QwenExecutor::kvmem_timing_emit_delta("phase=prefill request=mtp",
+                                                  kvmem_tbase);
+            kvmem_tbase = QwenExecutor::kvmem_timing_snapshot();
         }
 
         std::string generated;
@@ -7410,6 +7629,25 @@ private:
         }
         msg << " prefill_ops=" << prefill_ops << " decode_ops=" << decode_ops;
         log(msg.str());
+        if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
+            QwenExecutor::kvmem_timing_emit_delta("phase=decode request=mtp",
+                                                  kvmem_tbase);
+        }
+        if (kvmem_on) {
+            const QwenExecutor::KvMemTierUsage tu = executor_->kvmem_tier_usage();
+            std::ostringstream tmsg;
+            tmsg << "[kvmem-tier-usage]"
+                 << " total_blocks=" << tu.total_blocks
+                 << " block_bytes=" << tu.block_bytes
+                 << " gpu_used=" << tu.gpu_used_bytes
+                 << " gpu_cap=" << tu.gpu_capacity_bytes
+                 << " gpu_pool=" << (tu.gpu_pool ? 1 : 0)
+                 << " cpu_used=" << tu.cpu_used_bytes
+                 << " cpu_cap=" << tu.cpu_capacity_bytes
+                 << " nvme_used=" << tu.nvme_used_bytes
+                 << " nvme_cap=" << tu.nvme_capacity_bytes;
+            log(tmsg.str());
+        }
         if (spec_mtp) {
             std::ostringstream spec_summary;
             spec_summary << "native mtp_spec_summary:"
@@ -7639,6 +7877,12 @@ private:
     EngineOptions options_;
     std::unique_ptr<QwenNativeModel> model_;
     std::unique_ptr<DeviceBackend> device_;
+    // Recycles the pinned kvmem CPU-tier buffer across the per-request CB
+    // executors so it is cudaHostAlloc'd once, not per admit (an 8 GiB tier
+    // otherwise added ~5 s to every request's TTFT). Declared right after
+    // device_ so it is destroyed before it (frees buffers while CUDA is alive)
+    // and after the executors that borrow from it.
+    std::unique_ptr<HostTierBufferPool> cb_host_tier_pool_;
     std::unique_ptr<QwenWeights> weights_;
     std::unique_ptr<QwenExecutor> executor_;
     std::unique_ptr<QwenTokenizer> tokenizer_;
