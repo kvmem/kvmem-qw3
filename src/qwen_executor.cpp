@@ -499,7 +499,7 @@ void QwenExecutor::reset_state() {
     window_query_pos_ = 0;
     if (kvmem_cpu_tier_) kvmem_cpu_tier_->clear();
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
-    kvmem_stage_buffer_.clear();
+    kvmem_stage_pinned_.reset();
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};
@@ -1587,9 +1587,55 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     }
     if (mtp_single_chunk) chunk_size = total;  // MTP verify: never split
     if (!mtp_single_chunk && kvmem_gpu_page_pool_ && block_store_) {
-        chunk_size = std::min<uint32_t>(
-            chunk_size,
-            std::max<uint32_t>(1, block_store_->config().block_tokens));
+        // The bounded GPU pool used to force prefill into block-granular
+        // (block_tokens, e.g. 16-token) chunks. That collapsed every matmul
+        // (attn projections, FFN, DeltaNet) into the tiny-batch MMVQ regime —
+        // each weight tile is read but feeds only ~16 columns, so weight-read
+        // amortization is ~chunk/block worse. Empirically this was a ~7x
+        // prefill cliff the instant the pool engaged (the whole spill regime).
+        //
+        // The append for a chunk grabs ceil(batch/page_size) pages in one shot
+        // before the post-chunk offload runs, so the only real constraint is
+        // that a chunk must fit in the pool headroom left over the resident
+        // window. After a reselect the window holds ~budget_blocks (+ recent
+        // cushion); the rest of the pool is free for the next chunk's append.
+        // Cap to that headroom (keeping one block of slack so the offload's own
+        // keep-free cushion is honored), aligned down to a block boundary, and
+        // never below block_tokens. The existing kvmem_maybe_prefill_offload
+        // headroom reservation (next_chunk_pages + cushion) then keeps the pool
+        // from overflowing for any chunk this cap allows.
+        const uint32_t block_tokens =
+            std::max<uint32_t>(1, block_store_->config().block_tokens);
+        const uint32_t psz = std::max<uint32_t>(1, kv_pages_.page_size);
+        const uint32_t pages_per_block =
+            std::max<uint32_t>(1, block_tokens / psz);
+        const uint32_t pool_pages = kvmem_gpu_page_pool_->total_pages();
+        const uint32_t budget_blocks =
+            std::max<uint32_t>(1, block_store_->budget_blocks());
+        const uint32_t cushion_blocks =
+            std::max<uint32_t>(1, block_store_->config().recent_blocks);
+        const uint64_t resident_pages =
+            static_cast<uint64_t>(budget_blocks + cushion_blocks) *
+            pages_per_block;
+        const uint32_t headroom_pages =
+            static_cast<uint64_t>(pool_pages) > resident_pages
+                ? static_cast<uint32_t>(pool_pages - resident_pages)
+                : 0;
+        // Use only a quarter of the budget->pool gap for a single chunk. A
+        // chunk's pages are claimed in one shot before the post-chunk offload
+        // runs, and the offload's reselect can transiently hold extra pages
+        // (stage-in of any resurrected block before the stage-out release).
+        // A quarter leaves generous margin on tight pools (where budget ~ pool)
+        // while still letting the chunk reach the full default whenever the pool
+        // is sized well above the window budget (the common case).
+        const uint32_t chunk_pages_cap = headroom_pages / 4;
+        uint32_t max_chunk_tokens =
+            chunk_pages_cap > 0 ? chunk_pages_cap * psz : block_tokens;
+        if (max_chunk_tokens < block_tokens) max_chunk_tokens = block_tokens;
+        if (max_chunk_tokens > block_tokens) {
+            max_chunk_tokens -= max_chunk_tokens % block_tokens;
+        }
+        chunk_size = std::min<uint32_t>(chunk_size, max_chunk_tokens);
     }
     if (chunk_size > total) chunk_size = total;
     if (chunk_size == 0) chunk_size = total;
@@ -2517,7 +2563,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         host_tier_pool_->release(std::move(kvmem_cpu_bytes_));
     }
     kvmem_cpu_bytes_.reset();
-    kvmem_stage_buffer_.clear();
+    kvmem_stage_pinned_.reset();
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};
@@ -2749,6 +2795,14 @@ void QwenExecutor::kvmem_copy_block_to_host(const KvMemBlock &block,
         dst.clear();
         return;
     }
+    dst.clear();
+    dst.resize(kvmem_block_spill_bytes(block));
+    kvmem_copy_block_to_host_ptr(block, dst.data());
+}
+
+void QwenExecutor::kvmem_copy_block_to_host_ptr(const KvMemBlock &block,
+                                                uint8_t *out) {
+    if (block.n_tokens == 0) return;
     const QwenConfig &cfg = model_.config();
     const uint64_t page_bytes = kvmem_kv_page_bytes();
     const uint32_t page_size = kv_pages_.page_size;
@@ -2756,9 +2810,6 @@ void QwenExecutor::kvmem_copy_block_to_host(const KvMemBlock &block,
     const uint32_t last_page = (block.orig_pos_start + block.n_tokens - 1) / page_size;
     const uint64_t per_pos =
         static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
-    dst.clear();
-    dst.resize(kvmem_block_spill_bytes(block));
-    uint8_t *out = dst.data();
     for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
         if (!cfg.is_standard_attention_layer(il)) continue;
         DeviceTensor &kc = k_cache(il);
@@ -2782,6 +2833,14 @@ void QwenExecutor::kvmem_copy_block_to_host(const KvMemBlock &block,
             out += page_bytes;
         }
     }
+}
+
+uint8_t *QwenExecutor::kvmem_ensure_stage_pinned(uint64_t bytes) {
+    if (bytes == 0) return nullptr;
+    if (!kvmem_stage_pinned_ || kvmem_stage_pinned_->bytes < bytes) {
+        kvmem_stage_pinned_ = backend_.host_buffer(bytes, "kvmem_stageout");
+    }
+    return static_cast<uint8_t *>(kvmem_stage_pinned_->data);
 }
 
 void QwenExecutor::kvmem_copy_block_from_host(
@@ -3005,9 +3064,14 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
         if (block_id >= blocks.size()) continue;
         const KvMemBlock &block = blocks[block_id];
         if (!kvmem_block_pages_resident(block)) continue;
+        const uint64_t src_bytes = kvmem_block_spill_bytes(block);
+        // D2H into pinned host memory so the block's K/V page copies queue
+        // asynchronously on the copy stream (a pageable buffer would serialize
+        // them through the driver's bounce buffer).
+        uint8_t *src = kvmem_ensure_stage_pinned(src_bytes);
         kvmem_canonicalize_block_for_tier(block_id);
         require_status(backend_.begin_kv_transfer_from_device());
-        kvmem_copy_block_to_host(block, kvmem_stage_buffer_);
+        kvmem_copy_block_to_host_ptr(block, src);
         require_status(backend_.wait_kv_transfer());
         bool placed = false;
         int32_t cpu_slot = -1;
@@ -3044,19 +3108,15 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                         kvmem_nvme_tier_->block_slot(victim));
                 }
                 const uint64_t offset = kvmem_cpu_tier_->slot_offset(placement.slot);
-                if (offset + kvmem_stage_buffer_.size() > kvmem_cpu_bytes()) {
+                if (offset + src_bytes > kvmem_cpu_bytes()) {
                     throw std::runtime_error("KVMem CPU tier slot write out of range");
                 }
-                std::memcpy(kvmem_cpu_data() + offset,
-                            kvmem_stage_buffer_.data(),
-                            kvmem_stage_buffer_.size());
+                std::memcpy(kvmem_cpu_data() + offset, src, src_bytes);
                 placed = true;
                 cpu_slot = placement.slot;
             }
         } else if (kvmem_nvme_tier_) {
-            kvmem_nvme_tier_->write_block(
-                block_id, kvmem_stage_buffer_.data(),
-                kvmem_stage_buffer_.size());
+            kvmem_nvme_tier_->write_block(block_id, src, src_bytes);
             placed = true;
             nvme_slot = kvmem_nvme_tier_->block_slot(block_id);
         }
@@ -3076,7 +3136,7 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                          "[kvmem-tier] stage_out block=%u to=%s slot=%d bytes=%llu pages=%u\n",
                          block_id, cpu_slot >= 0 ? "cpu" : "nvme",
                          cpu_slot >= 0 ? cpu_slot : nvme_slot,
-                         static_cast<unsigned long long>(kvmem_stage_buffer_.size()),
+                         static_cast<unsigned long long>(src_bytes),
                          last_page - first_page + 1);
         }
     }

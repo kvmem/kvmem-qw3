@@ -589,7 +589,12 @@ private:
     // cudaHostAlloc-ing per request; the destructor returns it. Borrowed, owned
     // by the backend and must outlive this executor. Null => own per-executor.
     HostTierBufferPool *host_tier_pool_ = nullptr;
-    std::vector<uint8_t> kvmem_stage_buffer_;
+    // Pinned single-block staging buffer for stage-out. D2H into pinned host
+    // memory lets a block's K/V page copies queue asynchronously on the copy
+    // stream; a pageable destination forces the driver to serialize each copy
+    // through an internal bounce buffer, which was the dominant stage-out cost.
+    // Lazily grown to one block.
+    std::unique_ptr<HostBuffer> kvmem_stage_pinned_;
     struct KvMemPrefetchBlock {
         uint32_t block_id = 0;
         KvTier from = KvTier::GPU;
@@ -628,6 +633,14 @@ private:
     void kvmem_canonicalize_block_for_tier(uint32_t block_id);
     void kvmem_copy_block_to_host(const KvMemBlock &block,
                                   std::vector<uint8_t> &dst);
+    // Issue the block's K/V page D2H copies into a caller-owned buffer (must
+    // hold kvmem_block_spill_bytes(block) bytes). Pinned buffers let the copies
+    // queue asynchronously on the copy stream; the caller drains with
+    // wait_kv_transfer() before reading.
+    void kvmem_copy_block_to_host_ptr(const KvMemBlock &block, uint8_t *out);
+    // Ensure the pinned stage-out staging buffer holds at least `bytes`
+    // (grows if needed). Returns the buffer base pointer.
+    uint8_t *kvmem_ensure_stage_pinned(uint64_t bytes);
     void kvmem_copy_block_from_host(const KvMemBlock &block,
                                     const std::vector<uint8_t> &src);
     void kvmem_copy_block_from_host(const KvMemBlock &block,
