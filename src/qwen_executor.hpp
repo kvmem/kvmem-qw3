@@ -460,7 +460,8 @@ private:
                                                 uint32_t argmax_out_index = 0,
                                                 const DeviceArgmaxBuffer *token_source = nullptr,
                                                 uint32_t token_source_index = 0,
-                                                bool window_frame = false);
+                                                bool window_frame = false,
+                                                bool kv_only = false);
 
     const QwenNativeModel &model_;
     const QwenWeights &weights_;

@@ -2221,7 +2221,8 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                                           uint32_t argmax_out_index,
                                                           const DeviceArgmaxBuffer *token_source,
                                                           uint32_t token_source_index,
-                                                          bool window_frame) {
+                                                          bool window_frame,
+                                                          bool kv_only) {
     NativeExecutorReport report;
     const NativePlanInfo &plan = model_.plan();
     if (!plan.mtp_supported) {
@@ -2330,6 +2331,21 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
         require_status(backend_.kv_append(mtp_v, *v_, cache_pos, per_pos));
     }
     record(report, "mtp.kv_append");
+
+    // Prefix-prime fast path: when this forward only exists to populate the MTP
+    // KV cache at the true token position (commit-time prefix maintenance), the
+    // self-attention + residual + FFN below produce a hidden state that is never
+    // read — the prime callers take mtp_prefix_h_ from the MAIN hidden, not from
+    // this MTP forward, and the next draft chain reads only the appended K/V. So
+    // we stop right after kv_append, turning the prime from O(ctx) attention into
+    // O(1) per token. Persistent state (mtp KV, mtp_prefix_h_, mtp_prefix_len_)
+    // is bit-identical to running the full forward, so acceptance and output are
+    // unchanged for both plain-MTP and kvmem-MTP.
+    if (kv_only) {
+        require_status(backend_.end());
+        report.ok = true;
+        return report;
+    }
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
     if (use_paged_prefix) {
@@ -4219,7 +4235,13 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_current(uint32_t token,
                                                        base_position,
                                                        base_position,
                                                        base_position + 1,
-                                                       /*compute_logits=*/false);
+                                                       /*compute_logits=*/false,
+                                                       /*argmax_out=*/nullptr,
+                                                       /*argmax_out_index=*/0,
+                                                       /*token_source=*/nullptr,
+                                                       /*token_source_index=*/0,
+                                                       /*window_frame=*/false,
+                                                       /*kv_only=*/true);
     report.ops_executed += step.ops_executed;
     if (!step.ok) {
         report.missing_kernels = std::move(step.missing_kernels);
@@ -4323,7 +4345,13 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
 
             NativeExecutorReport step = forward_mtp_draft_from(tokens[i], *h_input,
                                                                pos, pos, pos + 1,
-                                                               /*compute_logits=*/false);
+                                                               /*compute_logits=*/false,
+                                                               /*argmax_out=*/nullptr,
+                                                               /*argmax_out_index=*/0,
+                                                               /*token_source=*/nullptr,
+                                                               /*token_source_index=*/0,
+                                                               /*window_frame=*/false,
+                                                               /*kv_only=*/true);
             seq_report.ops_executed += step.ops_executed;
             if (!step.ok) {
                 seq_report.missing_kernels = std::move(step.missing_kernels);
@@ -4478,59 +4506,17 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
     }
     record(report, "mtp.kv_append_batch");
 
-    const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-    if (use_paged_prefix) {
-        DeviceStatus attn_st = backend_.attention_prefill_batch_paged_gated_device(
-            *mtp_mid_batch_, *mtp_q_batch_, 2 * standard_head_dim,
-            mtp_k, mtp_v, mtp_kv_pages_.device_indices(),
-            mtp_kv_pages_.count(), mtp_kv_pages_.page_size,
-            standard_n_heads, standard_n_kv_heads, standard_head_dim,
-            base_position, batch, q_stride_buf, mid_stride, scale);
-        if (!attn_st.ok) {
-            require_status(backend_.attention_decode_batch_paged_gated_device(
-                *mtp_mid_batch_, *mtp_q_batch_, 2 * standard_head_dim,
-                mtp_k, mtp_v, mtp_kv_pages_.device_indices(),
-                mtp_kv_pages_.count(), mtp_kv_pages_.page_size,
-                standard_n_heads, standard_n_kv_heads, standard_head_dim,
-                base_position, batch, q_stride_buf, mid_stride, scale));
-        }
-    } else {
-        require_status(backend_.attention_decode_batch_gated(
-            *mtp_mid_batch_, *mtp_q_batch_, 2 * standard_head_dim,
-            mtp_k, mtp_v, standard_n_heads,
-            standard_n_kv_heads, standard_head_dim, base_position, batch,
-            q_stride_buf, mid_stride, scale));
-    }
-    record(report, "mtp.attention_sdpa_batch");
-    require_status(backend_.q8_0_matmul_add(*mtp_h_batch_,
-                                            *mtp_h_batch_,
-                                            *mtp_ffn_out_batch_,
-                                            *layer.attn_output,
-                                            *mtp_mid_batch_,
-                                            batch, mid_stride, mtp_h_stride));
-    record(report, "mtp.attn_residual_batch");
-
-    require_status(backend_.rms_norm_batch(*mtp_norm_batch_, *mtp_h_batch_,
-                                           *layer.ffn_norm, batch, mtp_h_stride, eps));
-    record(report, "mtp.ffn_norm_batch");
-    {
-        DeviceTensor *outs[2] = {mtp_ffn_gate_batch_.get(), mtp_ffn_up_batch_.get()};
-        const DeviceWeight *ws[2] = {layer.ffn_gate, layer.ffn_up};
-        const uint32_t strides[2] = {ffn_stride, ffn_stride};
-        require_status(backend_.q8_0_matmul_fanout(outs, ws, strides, 2,
-                                                   *mtp_norm_batch_, batch, mtp_h_stride));
-    }
-    require_status(backend_.silu_mul_n(*mtp_ffn_mid_batch_,
-                                       *mtp_ffn_gate_batch_,
-                                       *mtp_ffn_up_batch_,
-                                       static_cast<uint64_t>(batch) * ffn_stride));
-    require_status(backend_.q8_0_matmul_add(*mtp_h_batch_,
-                                            *mtp_h_batch_,
-                                            *mtp_ffn_out_batch_,
-                                            *layer.ffn_down,
-                                            *mtp_ffn_mid_batch_,
-                                            batch, ffn_stride, mtp_h_stride));
-    record(report, "mtp.ffn_batch");
+    // Prefix-prime fast path (see the kv_only branch in forward_mtp_draft_from):
+    // this batched forward exists only to populate the MTP KV cache at the true
+    // accepted-token positions. The self-attention + residual + FFN that the
+    // legacy code ran here over all prior KV (the O(ctx) cost) feed a hidden
+    // state that is never read — mtp_prefix_h_ below is taken from the MAIN
+    // hidden (h_batch_), and the next draft chain reads only the K/V appended
+    // above. Stopping after kv_append leaves the persistent state (mtp KV,
+    // mtp_prefix_h_, mtp_prefix_len_) bit-identical, so acceptance and output are
+    // unchanged; only the wasted attention is removed.
+    (void)mid_stride;
+    (void)ffn_stride;
 
     require_status(backend_.end());
     require_status(backend_.copy_d2d(*mtp_prefix_h_, *h_batch_,
