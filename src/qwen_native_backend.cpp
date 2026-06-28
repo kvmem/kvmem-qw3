@@ -1,10 +1,13 @@
 #include "backend.hpp"
 #include "env_flags.hpp"
+#include "kvmem_session.hpp"
 #include "qwen_executor.hpp"
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
 #include "qw3/device_backend.hpp"
 #include "qw3/tokenizer.hpp"
+
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <array>
@@ -1065,6 +1068,210 @@ public:
             << " size=" << std::fixed << std::setprecision(1) << mib << " MiB"
             << " backend=" << linear_backend_name(linear_backend);
         log(msg.str());
+    }
+
+    // ---- kvmem growth-profiling harness ----------------------------------
+    // Drives the persistent context-growth experiment: prefill an initial long
+    // context, then keep appending document chunks across turns up to the
+    // largest ladder target, sampling a short MTP decode probe at each point.
+    // For each turn it prints the user-requested sequential micro-step
+    // breakdown (selection / stage-in / stage-out / assemble / prefill /
+    // decode) plus a final summary table with tier residency. Requires kvmem
+    // enabled (the free run_kvmem_session forces it on with update-mode=step).
+    int run_kvmem_session(const KvMemSessionConfig &cfg) {
+        if (!model_ || !tokenizer_ || !device_ || !executor_) {
+            throw std::runtime_error("kvmem-session: backend not fully loaded "
+                                     "(need --native-kernels cuda)");
+        }
+        if (!executor_->kvmem_enabled()) {
+            throw std::runtime_error("kvmem-session requires kvmem enabled");
+        }
+        if (cfg.ladder_tokens.empty()) {
+            throw std::runtime_error("kvmem-session: empty ladder");
+        }
+        if (!QwenExecutor::kvmem_timing_enabled()) {
+            log("kvmem-session: WARNING QW3_KVMEM_TIMING not set; the "
+                "selection/stage/assemble breakdown will read as zero");
+        }
+
+        // Pre-tokenize a synthetic document pool large enough to cover the
+        // largest ladder target. Each turn carves an exact token slice so the
+        // running position lands precisely on each ladder point after prefill.
+        const uint64_t max_target = cfg.ladder_tokens.back();
+        std::vector<uint32_t> pool;
+        build_session_corpus(pool, max_target + 2048);
+        log("kvmem-session: corpus pool tokens=" + std::to_string(pool.size()) +
+            " target_max=" + std::to_string(max_target));
+
+        GenerationOptions gen;
+        gen.max_tokens = std::max(1, cfg.decode_tokens);
+        gen.temperature = 0.0f;
+        gen.top_k = 0;
+        gen.top_p = 1.0f;
+        gen.ignore_eos = true;  // decode exactly decode_tokens (steady-state TBT)
+
+        struct TurnRow {
+            size_t turn = 0;
+            uint64_t ctx_tokens = 0;
+            uint64_t delta_tokens = 0;
+            double sel_ms = 0, stage_in_ms = 0, stage_out_ms = 0, assemble_ms = 0;
+            double asm_pages_ms = 0, asm_rerope_ms = 0, asm_kbar_ms = 0;
+            uint32_t stage_in_blocks = 0, stage_out_blocks = 0;
+            // kvmem work forced DURING prefill (bounded-pool offload), folded
+            // into prefill_s. Surfaced so step5's gross wall isn't opaque.
+            double inpre_ms = 0;
+            uint32_t inpre_stage_in_blocks = 0, inpre_stage_out_blocks = 0;
+            double prefill_s = 0, decode_s = 0, decode_tps = 0;
+            int decoded = 0;
+            double acceptance = 0;
+            uint64_t kv_bytes = 0, gpu_used = 0, cpu_used = 0, nvme_used = 0;
+            bool gpu_pool = false;
+            uint64_t gpu_mib = 0, rss_mib = 0;
+        };
+        std::vector<TurnRow> rows;
+
+        size_t pool_cursor = 0;
+        for (size_t ti = 0; ti < cfg.ladder_tokens.size(); ++ti) {
+            const uint64_t target = cfg.ladder_tokens[ti];
+            const uint64_t cur_pos = executor_->position();
+            if (target <= cur_pos) {
+                log("kvmem-session: ladder[" + std::to_string(ti) +
+                    "]=" + std::to_string(target) +
+                    " already reached (pos=" + std::to_string(cur_pos) +
+                    "), skipping");
+                continue;
+            }
+            uint64_t delta = target - cur_pos;
+            if (pool_cursor + delta > pool.size()) {
+                delta = pool.size() - pool_cursor;  // clamp (corpus exhausted)
+            }
+            if (delta == 0) {
+                log("kvmem-session: corpus exhausted at ladder[" +
+                    std::to_string(ti) + "]");
+                break;
+            }
+            std::vector<uint32_t> chunk(
+                pool.begin() + static_cast<std::ptrdiff_t>(pool_cursor),
+                pool.begin() + static_cast<std::ptrdiff_t>(pool_cursor + delta));
+            pool_cursor += delta;
+
+            const QwenExecutor::KvMemTimingSnapshot tbase =
+                QwenExecutor::kvmem_timing_snapshot();
+
+            MtpGenStats stats;
+            const bool reset = (ti == 0);
+            (void)generate_mtp(chunk, gen, TokenCallback{}, /*dump=*/nullptr,
+                               /*spec_mtp=*/true, /*trace_mtp=*/false,
+                               /*override_executor=*/nullptr,
+                               /*manage_device_scope=*/true,
+                               /*reset_session=*/reset, &stats);
+
+            const QwenExecutor::KvMemTimingSnapshot tnow =
+                QwenExecutor::kvmem_timing_snapshot();
+
+            auto dms = [](uint64_t a, uint64_t b) {
+                return static_cast<double>(a - b) / 1.0e6;  // ns -> ms
+            };
+            // Steps 1-4 (selection/stage-in/stage-out/assemble) are charged at
+            // the POST-PREFILL decode-window reselect only. generate_mtp returns
+            // the kvmem timing snapshot taken at the prefill->reselect boundary;
+            // diffing the global counters (tnow, captured after the call -- and
+            // decode does NOT reselect in step mode) against that boundary
+            // isolates the boundary reselect from mid-prefill offload churn,
+            // which stays inside prefill_s.
+            const QwenExecutor::KvMemTimingSnapshot &base =
+                stats.kvmem_boundary_valid ? stats.kvmem_at_boundary : tbase;
+            TurnRow row;
+            row.turn = ti;
+            row.ctx_tokens = executor_->position();
+            row.delta_tokens = delta;
+            row.sel_ms = dms(tnow.retrieval_ns, base.retrieval_ns);
+            row.stage_in_ms = dms(tnow.stage_in_ns, base.stage_in_ns);
+            row.stage_out_ms = dms(tnow.stage_out_ns, base.stage_out_ns);
+            row.assemble_ms = dms(tnow.assemble_ns, base.assemble_ns);
+            row.asm_pages_ms = dms(tnow.assemble_pages_ns, base.assemble_pages_ns);
+            row.asm_rerope_ms = dms(tnow.assemble_rerope_ns, base.assemble_rerope_ns);
+            row.asm_kbar_ms = dms(tnow.assemble_kbar_ns, base.assemble_kbar_ns);
+            row.stage_in_blocks = tnow.stage_in_blocks - base.stage_in_blocks;
+            row.stage_out_blocks = tnow.stage_out_blocks - base.stage_out_blocks;
+            // kvmem work forced during prefill = (turn start -> prefill end).
+            if (stats.kvmem_boundary_valid) {
+                const QwenExecutor::KvMemTimingSnapshot &b = stats.kvmem_at_boundary;
+                row.inpre_ms = dms(b.retrieval_ns, tbase.retrieval_ns) +
+                               dms(b.stage_in_ns, tbase.stage_in_ns) +
+                               dms(b.stage_out_ns, tbase.stage_out_ns) +
+                               dms(b.assemble_ns, tbase.assemble_ns);
+                row.inpre_stage_in_blocks = b.stage_in_blocks - tbase.stage_in_blocks;
+                row.inpre_stage_out_blocks = b.stage_out_blocks - tbase.stage_out_blocks;
+            }
+            row.prefill_s = stats.prefill_s;
+            // decode_s is already the pure decode loop -- generate_mtp now
+            // excludes the post-prefill reselect (reported via stats.reselect_s).
+            row.decode_s = std::max(stats.decode_s, 1.0e-9);
+            row.decoded = stats.decoded;
+            row.decode_tps =
+                row.decoded > 0 ? row.decoded / row.decode_s : 0.0;
+            row.acceptance = stats.acceptance;
+
+            const QwenExecutor::KvMemTierUsage tu = executor_->kvmem_tier_usage();
+            row.kv_bytes = tu.total_blocks * tu.block_bytes;
+            row.gpu_used = tu.gpu_used_bytes;
+            row.cpu_used = tu.cpu_used_bytes;
+            row.nvme_used = tu.nvme_used_bytes;
+            row.gpu_pool = tu.gpu_pool;
+            const uint64_t gpu_total = device_->total_device_bytes();
+            const uint64_t gpu_free = device_->free_device_bytes();
+            row.gpu_mib =
+                (gpu_total > gpu_free ? gpu_total - gpu_free : 0) / (1024 * 1024);
+            row.rss_mib = current_rss_mib();
+
+            print_session_turn(row.turn, row.ctx_tokens, row.delta_tokens,
+                               row.sel_ms, row.stage_in_ms, row.stage_out_ms,
+                               row.assemble_ms, row.asm_pages_ms,
+                               row.asm_rerope_ms, row.asm_kbar_ms,
+                               row.stage_in_blocks, row.stage_out_blocks,
+                               row.prefill_s, row.decode_s, row.decode_tps,
+                               row.decoded, row.acceptance, row.gpu_mib,
+                               row.rss_mib, row.inpre_ms,
+                               row.inpre_stage_in_blocks,
+                               row.inpre_stage_out_blocks);
+            rows.push_back(row);
+        }
+
+        // Final summary table.
+        std::ostringstream tbl;
+        tbl << "\n=== kvmem-session SUMMARY (update_mode=step, MTP on) ===\n";
+        tbl << "  turn      ctx    delta   sel_ms  in_ms  out_ms  asm_ms"
+               "  prefill_s  pre_tok/s  decode_s  dec_tok/s  accept    KVgib  GPUgib  CPUgib  NVMEgib  pool  GPUmib  RSSmib\n";
+        for (const TurnRow &r : rows) {
+            tbl << "  " << std::setw(4) << r.turn
+                << std::setw(9) << r.ctx_tokens
+                << std::setw(9) << r.delta_tokens
+                << std::fixed << std::setprecision(2)
+                << std::setw(9) << r.sel_ms
+                << std::setw(7) << r.stage_in_ms
+                << std::setw(8) << r.stage_out_ms
+                << std::setw(8) << r.assemble_ms
+                << std::setw(11) << r.prefill_s
+                << std::setprecision(1)
+                << std::setw(11) << (r.delta_tokens / std::max(r.prefill_s, 1e-9))
+                << std::setprecision(2)
+                << std::setw(10) << r.decode_s
+                << std::setw(11) << r.decode_tps
+                << std::setprecision(4)
+                << std::setw(8) << r.acceptance
+                << std::setprecision(3)
+                << std::setw(9) << (r.kv_bytes / (1024.0 * 1024.0 * 1024.0))
+                << std::setw(8) << (r.gpu_used / (1024.0 * 1024.0 * 1024.0))
+                << std::setw(8) << (r.cpu_used / (1024.0 * 1024.0 * 1024.0))
+                << std::setw(9) << (r.nvme_used / (1024.0 * 1024.0 * 1024.0))
+                << std::setw(6) << (r.gpu_pool ? 1 : 0)
+                << std::setw(8) << r.gpu_mib
+                << std::setw(8) << r.rss_mib
+                << "\n";
+        }
+        std::cerr << tbl.str();
+        return 0;
     }
 
     std::string generate(const std::string &prompt,
@@ -6738,8 +6945,32 @@ private:
         return generated;
     }
 
+    // Per-call wall-clock + acceptance, threaded out for the kvmem-session
+    // growth harness (run_kvmem_session). Filled just before return when a
+    // non-null stats_out is passed; default callers ignore it.
+    struct MtpGenStats {
+        double prefill_s = 0.0;
+        double decode_s = 0.0;   // PURE decode loop (post-prefill reselect excluded)
+        double reselect_s = 0.0; // post-prefill (decode-window) reselect wall clock
+        int decoded = 0;
+        uint64_t prompt_tokens = 0;
+        double acceptance = 0.0;
+        // kvmem timing snapshot captured at the prefill->reselect boundary, so
+        // the session harness can isolate the post-prefill (decode-window)
+        // reselect breakdown from mid-prefill offload churn (which is folded
+        // into prefill_s). Valid only when kvmem timing is enabled.
+        QwenExecutor::KvMemTimingSnapshot kvmem_at_boundary;
+        bool kvmem_boundary_valid = false;
+    };
+
     // MTP draft/verify/speculate + adaptive-depth path. Ported from qw3_ly,
     // adapted to qw3's executor signatures + memory-safe prefix chunking.
+    //
+    // reset_session: when true (default) the executor state is wiped at entry,
+    // which is the standalone single-request behavior every existing caller
+    // relies on. The kvmem-session harness passes false to keep the executor's
+    // KV cache + kvmem block store alive across turns so context grows
+    // incrementally (the new turn's chunk is appended at the running position).
     std::string generate_mtp(std::vector<uint32_t> &prompt_tokens,
                              const GenerationOptions &options,
                              const TokenCallback &on_text,
@@ -6747,7 +6978,9 @@ private:
                              bool spec_mtp,
                              bool trace_mtp,
                              QwenExecutor *override_executor = nullptr,
-                             bool manage_device_scope = true) {
+                             bool manage_device_scope = true,
+                             bool reset_session = true,
+                             MtpGenStats *stats_out = nullptr) {
         QwenExecutor *executor_ =
             override_executor != nullptr ? override_executor : this->executor_.get();
         if (!executor_) throw std::runtime_error("MTP executor unavailable");
@@ -6756,7 +6989,9 @@ private:
             st = device_->begin();
             if (!st.ok) throw std::runtime_error(st.message);
         }
-        executor_->reset_state();
+        if (reset_session) {
+            executor_->reset_state();
+        }
 
         // kvmem × MTP (Phase C). When kvmem is enabled the verify path must
         // attend over the assembled window, which only the per-token
@@ -6861,6 +7096,11 @@ private:
         };
 
         const double t_prefill_start = wall_seconds();
+        // Absolute base position for this prefill. Zero on a fresh session
+        // (reset_session=true), but on a resumed kvmem-session turn the prompt
+        // chunk appends at the running position, so the MTP draft prefix must
+        // be primed at the absolute base (not the call-relative chunk offset).
+        const uint32_t prefill_base = executor_->position();
         QwenExecutor::KvMemTimingSnapshot kvmem_tbase;
         if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
             kvmem_tbase = QwenExecutor::kvmem_timing_snapshot();
@@ -6904,7 +7144,7 @@ private:
                 const bool need_logits = end == prompt_tokens.size();
                 step = executor_->forward_n_tokens(chunk, need_logits);
                 if (!step.ok) throw std::runtime_error("prefill failed");
-                prime_mtp_prefix(chunk, static_cast<uint32_t>(offset));
+                prime_mtp_prefix(chunk, prefill_base + static_cast<uint32_t>(offset));
                 const double t_chunk_end = wall_seconds();
                 prefill_ops += step.ops_executed;
                 if (trace_prefill) {
@@ -6916,6 +7156,17 @@ private:
             prefill_chunk_size = kMtpPrefillChunk;
         }
         const double t_prefill_end = wall_seconds();
+
+        // Snapshot kvmem timing at the prefill->reselect boundary. The reselect
+        // below is the post-prefill (decode-window) selection the session
+        // harness charges as steps 1-4; any mid-prefill offload churn already
+        // landed before this point and stays inside prefill_s.
+        QwenExecutor::KvMemTimingSnapshot kvmem_at_prefill_end;
+        bool kvmem_boundary_valid = false;
+        if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
+            kvmem_at_prefill_end = QwenExecutor::kvmem_timing_snapshot();
+            kvmem_boundary_valid = true;
+        }
 
         // kvmem: register the prefilled prompt as context blocks and assemble
         // the first working set (mirrors generate_plain). Under the default
@@ -6933,6 +7184,10 @@ private:
                                                   kvmem_tbase);
             kvmem_tbase = QwenExecutor::kvmem_timing_snapshot();
         }
+        // Boundary between the post-prefill reselect and the decode loop. For
+        // plain MTP (kvmem off) the reselect block above is skipped, so this
+        // equals t_prefill_end and decode_s stays byte-identical to before.
+        const double t_reselect_end = wall_seconds();
 
         std::string generated;
         const int32_t eos = tokenizer_->eos_id();
@@ -7608,7 +7863,10 @@ private:
         }
 
         const double prefill_s = std::max(t_prefill_end - t_prefill_start, 1e-9);
-        const double decode_s = std::max(t_decode_end - t_prefill_end, 1e-9);
+        // The post-prefill (decode-window) reselect sits between t_prefill_end
+        // and the decode loop; isolate it so decode_s is the pure decode loop.
+        const double reselect_s = std::max(t_reselect_end - t_prefill_end, 0.0);
+        const double decode_s = std::max(t_decode_end - t_reselect_end, 1e-9);
         std::ostringstream msg;
         msg << "native generate:"
             << " prompt_tokens=" << prompt_tokens.size()
@@ -7801,6 +8059,21 @@ private:
             log_decode_trace(decode_trace, decode_trace_steps);
         }
 
+        if (stats_out) {
+            stats_out->prefill_s = prefill_s;
+            stats_out->decode_s = decode_s;
+            stats_out->reselect_s = reselect_s;
+            stats_out->decoded = decoded;
+            stats_out->prompt_tokens = prompt_tokens.size();
+            stats_out->acceptance =
+                mtp_spec_drafted > 0
+                    ? static_cast<double>(mtp_spec_accepted) /
+                          static_cast<double>(mtp_spec_drafted)
+                    : 0.0;
+            stats_out->kvmem_at_boundary = kvmem_at_prefill_end;
+            stats_out->kvmem_boundary_valid = kvmem_boundary_valid;
+        }
+
         return generated;
     }
 
@@ -7812,6 +8085,119 @@ private:
 
     void log(const std::string &line) const {
         std::cerr << "[qw3] " << line << "\n";
+    }
+
+    // Build a synthetic document pool of at least `want_tokens` tokens. The
+    // sentences are deterministic but varied (cycled vocab + a small LCG) so the
+    // MTP draft head sees enough local structure to keep acceptance healthy
+    // without the degenerate-repeat fp-atomic nondeterminism. Tokens are flat,
+    // so each session turn can carve an exact-count slice for its delta.
+    void build_session_corpus(std::vector<uint32_t> &pool,
+                              uint64_t want_tokens) const {
+        static const char *kNames[] = {
+            "Atlas", "Borealis", "Cygnus", "Draco", "Equinox", "Fenrir",
+            "Gemini", "Helios", "Icarus", "Juno", "Kepler", "Lyra",
+            "Meridian", "Nimbus", "Orion", "Pegasus", "Quasar", "Rigel",
+            "Solstice", "Titan", "Umbra", "Vega", "Wraith", "Xenon"};
+        static const char *kNouns[] = {
+            "module", "pipeline", "scheduler", "allocator", "kernel", "tensor",
+            "gateway", "registry", "cache", "shard", "ledger", "planner",
+            "executor", "router", "sentinel", "indexer", "compiler", "daemon"};
+        static const char *kVerbs[] = {
+            "processed", "validated", "compressed", "dispatched", "reconciled",
+            "buffered", "serialized", "rebalanced", "checkpointed", "migrated"};
+        const size_t nn = sizeof(kNames) / sizeof(kNames[0]);
+        const size_t no = sizeof(kNouns) / sizeof(kNouns[0]);
+        const size_t nv = sizeof(kVerbs) / sizeof(kVerbs[0]);
+        pool.reserve(static_cast<size_t>(want_tokens) + 4096);
+        uint64_t lcg = 0x9e3779b97f4a7c15ull;
+        uint64_t doc = 0;
+        std::string para;
+        para.reserve(8192);
+        while (pool.size() < want_tokens) {
+            para.clear();
+            // Batch ~32 sentences per encode call to amortize tokenizer cost.
+            for (int s = 0; s < 32 && pool.size() < want_tokens; ++s) {
+                lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+                const uint64_t r = lcg >> 17;
+                para += "Record ";
+                para += std::to_string(doc++);
+                para += ": the ";
+                para += kNouns[(r) % no];
+                para += " ";
+                para += kNames[(r >> 3) % nn];
+                para += " ";
+                para += kVerbs[(r >> 8) % nv];
+                para += " ";
+                para += std::to_string(static_cast<unsigned>((r >> 11) % 100000));
+                para += " entries for region ";
+                para += kNames[(r >> 21) % nn];
+                para += " while the ";
+                para += kNouns[(r >> 27) % no];
+                para += " reported a latency of ";
+                para += std::to_string(static_cast<unsigned>((r >> 33) % 4096));
+                para += " microseconds.\n";
+            }
+            const std::vector<int32_t> ids = tokenizer_->encode(para, false);
+            pool.reserve(pool.size() + ids.size());
+            for (int32_t id : ids) {
+                pool.push_back(static_cast<uint32_t>(id));
+                if (pool.size() >= want_tokens) break;
+            }
+        }
+    }
+
+    static uint64_t current_rss_mib() {
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+        // ru_maxrss is in KiB on Linux.
+        return static_cast<uint64_t>(ru.ru_maxrss) / 1024;
+    }
+
+    void print_session_turn(size_t turn, uint64_t ctx_tokens,
+                            uint64_t delta_tokens, double sel_ms,
+                            double stage_in_ms, double stage_out_ms,
+                            double assemble_ms, double asm_pages_ms,
+                            double asm_rerope_ms, double asm_kbar_ms,
+                            uint32_t stage_in_blocks, uint32_t stage_out_blocks,
+                            double prefill_s, double decode_s, double decode_tps,
+                            int decoded, double acceptance, uint64_t gpu_mib,
+                            uint64_t rss_mib, double inpre_ms = 0.0,
+                            uint32_t inpre_stage_in_blocks = 0,
+                            uint32_t inpre_stage_out_blocks = 0) const {
+        std::ostringstream m;
+        m << std::fixed;
+        m << "\n[kvmem-session] turn=" << turn
+          << " ctx=" << ctx_tokens << "tok (+" << delta_tokens << ")"
+          << " GPU=" << gpu_mib << "MiB RSS=" << rss_mib << "MiB\n";
+        m << std::setprecision(3);
+        m << "  step1 selection (top-k retrieval)        = "
+          << std::setw(10) << sel_ms << " ms\n";
+        m << "  step2 stage-in   (CPU/NVMe -> GPU)        = "
+          << std::setw(10) << stage_in_ms << " ms  (" << stage_in_blocks
+          << " blk)\n";
+        m << "  step3 stage-out  (GPU -> CPU/NVMe evict)  = "
+          << std::setw(10) << stage_out_ms << " ms  (" << stage_out_blocks
+          << " blk)\n";
+        m << "  step4 assemble   (pages+re-RoPE+k-bar)    = "
+          << std::setw(10) << assemble_ms << " ms  (pages=" << asm_pages_ms
+          << " rerope=" << asm_rerope_ms << " kbar=" << asm_kbar_ms << ")\n";
+        m << "  step5 prefill    (forward new chunk)      = "
+          << std::setw(10) << (prefill_s * 1000.0) << " ms  ("
+          << std::setprecision(1) << (delta_tokens / std::max(prefill_s, 1e-9))
+          << " tok/s)\n";
+        m << std::setprecision(3);
+        // The bounded GPU pool can force kvmem stage-in/out mid-prefill; that
+        // cost is INSIDE step5's wall above (not double-counted in steps 1-4,
+        // which are the post-prefill decode-window reselect only).
+        m << "    +-- of which kvmem in-prefill offload   = "
+          << std::setw(10) << inpre_ms << " ms  (in=" << inpre_stage_in_blocks
+          << " out=" << inpre_stage_out_blocks << " blk)\n";
+        m << "  step6 decode     (MTP, " << decoded << " tok)            = "
+          << std::setw(10) << (decode_s * 1000.0) << " ms  ("
+          << std::setprecision(2) << decode_tps << " tok/s, accept="
+          << std::setprecision(4) << acceptance << ")";
+        log(m.str());
     }
 
     void log_prefill_chunk(uint32_t chunk_index, size_t offset, size_t tokens,
@@ -7968,6 +8354,41 @@ private:
 
 std::unique_ptr<Backend> make_qwen_native_backend() {
     return std::make_unique<QwenNativeBackend>();
+}
+
+int run_kvmem_session(EngineOptions engine, const KvMemSessionConfig &cfg) {
+    // Force the single-request native MTP + kvmem path this harness profiles.
+    engine.backend = BackendKind::QwenNative;
+    engine.native_heavy = true;
+    if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
+    if (engine.prefill_chunk < 0) engine.prefill_chunk = 2048;
+
+    // kvmem is mandatory; reselect only at the prefill boundary (step mode),
+    // never during decode -- exactly the configuration the user asked to
+    // profile.
+    engine.kvmem_enabled = true;
+    engine.kvmem_update_mode = "step";
+
+    // MTP on for realistic decode throughput.
+    if (!engine.native_mtp_chain_set || engine.native_mtp_chain <= 0) {
+        engine.native_mtp_chain = 4;
+        engine.native_mtp_chain_set = true;
+    }
+    engine.native_mtp_speculate = true;
+
+    // Env bridge (the backend still reads a few toggles from process env at
+    // load + generate). QW3_KVMEM_TIMING populates the step-1..4 breakdown; its
+    // extra device syncs only touch the prefill-boundary reselect (step mode
+    // has no decode-time reselect), so steady-state decode throughput is
+    // unperturbed.
+    setenv("QW3_MTP_SPECULATE", "1", 1);
+    setenv("QW3_MTP_POLICY",
+           engine.mtp_policy.empty() ? "fixed" : engine.mtp_policy.c_str(), 1);
+    setenv("QW3_KVMEM_TIMING", "1", 1);
+
+    QwenNativeBackend backend;
+    backend.load(engine);
+    return backend.run_kvmem_session(cfg);
 }
 
 } // namespace qw3

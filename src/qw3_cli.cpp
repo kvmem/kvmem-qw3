@@ -1,7 +1,9 @@
 #include "qw3/gguf.hpp"
 #include "qw3/qw3.hpp"
+#include "kvmem_session.hpp"
 #include "server.hpp"
 
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -12,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -19,6 +22,7 @@ void usage(std::ostream &os) {
     os <<
         "Usage: qw3 --model MODEL.gguf -p PROMPT [options]\n"
         "       qw3 serve --model MODEL.gguf [--port 8080] [options]\n"
+        "       qw3 kvmem-session --model MODEL.gguf [--session-ladder L] [options]\n"
         "\n"
         "Serve (OpenAI-compatible HTTP API; loads model once, serves forever).\n"
         "  Default is the conservative baseline: one request at a time, FP16 KV,\n"
@@ -133,6 +137,17 @@ void usage(std::ostream &os) {
         "  --repetition-penalty F Repetition penalty. Default: 1.0\n"
         "  --seed N              Seed passed to llama.cpp\n"
         "\n"
+        "kvmem-session (growth-profiling harness; one persistent process that\n"
+        "  prefills a long context then keeps growing it across turns, measuring\n"
+        "  the sequential wall-clock cost of every micro-step at each ladder point.\n"
+        "  Forces --kvmem on, --kvmem-update-mode step, and MTP speculate on.\n"
+        "  Reuses all --kvmem* and --kv-dtype flags; sizes --ctx automatically.):\n"
+        "  --session-ladder L    Comma-separated cumulative context targets, e.g.\n"
+        "                        256K,512K,1M,1.5M,2M. K/M/G suffixes + fractions\n"
+        "                        allowed. Must be strictly increasing.\n"
+        "                        Default: 256K,512K,1M,1.5M,2M.\n"
+        "  --session-decode-tokens N  MTP decode probe length per turn. Default: 256.\n"
+        "\n"
         "Diagnostics:\n"
         "  --inspect             Print GGUF summary and exit\n"
         "  --native-plan         Build the qwen-native tensor binding and op plan, then exit\n"
@@ -186,6 +201,45 @@ uint64_t parse_gib_bytes(const std::string &s, const std::string &name) {
     return static_cast<uint64_t>(bytes);
 }
 
+// Parse a single token-count like "256K", "1M", "1.5M", "2097152". Suffix
+// K/M/G are binary (1024-based); a bare number is taken as-is. Fractions are
+// allowed with a suffix (e.g. "1.5M" = 1572864).
+uint64_t parse_token_count(const std::string &s, const std::string &name) {
+    if (s.empty()) throw std::runtime_error("empty token count for " + name);
+    double mult = 1.0;
+    std::string num = s;
+    const char suf = static_cast<char>(std::toupper(s.back()));
+    if (suf == 'K') { mult = 1024.0; num = s.substr(0, s.size() - 1); }
+    else if (suf == 'M') { mult = 1024.0 * 1024.0; num = s.substr(0, s.size() - 1); }
+    else if (suf == 'G') { mult = 1024.0 * 1024.0 * 1024.0; num = s.substr(0, s.size() - 1); }
+    size_t pos = 0;
+    const double v = std::stod(num, &pos);
+    if (pos != num.size() || !std::isfinite(v) || v < 0.0) {
+        throw std::runtime_error("invalid token count for " + name + ": " + s);
+    }
+    return static_cast<uint64_t>(v * mult);
+}
+
+// Parse a comma-separated cumulative ladder like "256K,512K,1M,1.5M,2M" into a
+// strictly increasing list of token targets.
+std::vector<uint64_t> parse_ladder(const std::string &s, const std::string &name) {
+    std::vector<uint64_t> out;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (item.empty()) continue;
+        out.push_back(parse_token_count(item, name));
+    }
+    if (out.empty()) throw std::runtime_error("empty ladder for " + name);
+    for (size_t i = 1; i < out.size(); ++i) {
+        if (out[i] <= out[i - 1]) {
+            throw std::runtime_error("ladder must be strictly increasing for " +
+                                     name + ": " + s);
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -213,9 +267,21 @@ int main(int argc, char **argv) {
     qw3::ServerConfig serve_cfg;
     bool kv_dtype_cli_set = false;
     std::string kv_dtype_cli;
+
+    // `qw3 kvmem-session ...` runs the kvmem context-growth profiling harness:
+    // prefill a long context, then keep growing it across turns up to the
+    // largest ladder target, printing the per-turn micro-step breakdown.
+    bool kvmem_session = false;
+    std::vector<uint64_t> session_ladder = {262144, 524288, 1048576, 1572864,
+                                            2097152};
+    int session_decode_tokens = 256;
+
     int arg_start = 1;
     if (argc > 1 && std::string(argv[1]) == "serve") {
         serve = true;
+        arg_start = 2;
+    } else if (argc > 1 && std::string(argv[1]) == "kvmem-session") {
+        kvmem_session = true;
         arg_start = 2;
     }
 
@@ -448,6 +514,13 @@ int main(int argc, char **argv) {
                 if (serve_cfg.thinking_budget_default < 0) {
                     throw std::runtime_error("--thinking-budget must be >= 0");
                 }
+            } else if (arg == "--session-ladder") {
+                session_ladder = parse_ladder(need(arg), arg);
+            } else if (arg == "--session-decode-tokens") {
+                session_decode_tokens = parse_int(need(arg), arg);
+                if (session_decode_tokens <= 0) {
+                    throw std::runtime_error("--session-decode-tokens must be > 0");
+                }
             } else {
                 throw std::runtime_error("unknown argument: " + arg);
             }
@@ -525,6 +598,31 @@ int main(int argc, char **argv) {
             if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
             serve_cfg.default_generation = gen;
             return qw3::run_server(engine, serve_cfg);
+        }
+
+        if (kvmem_session) {
+            engine.backend = qw3::BackendKind::QwenNative;
+            engine.native_heavy = true;
+            if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
+            if (kv_dtype_cli_set) {
+                setenv("QW3_KV_DTYPE", kv_dtype_cli.c_str(), 1);
+            }
+            // ctx_size must cover the largest ladder target plus the decode
+            // probes so the executor's KV cache can hold the grown context.
+            const uint64_t max_target = session_ladder.back();
+            const uint64_t need_ctx =
+                max_target +
+                static_cast<uint64_t>(session_decode_tokens) *
+                    session_ladder.size() +
+                4096;
+            if (engine.ctx_size <= 0 ||
+                static_cast<uint64_t>(engine.ctx_size) < need_ctx) {
+                engine.ctx_size = static_cast<int>(need_ctx);
+            }
+            qw3::KvMemSessionConfig sess;
+            sess.ladder_tokens = session_ladder;
+            sess.decode_tokens = session_decode_tokens;
+            return qw3::run_kvmem_session(engine, sess);
         }
 
         if (kv_dtype_cli_set) {
