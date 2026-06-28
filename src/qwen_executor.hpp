@@ -459,7 +459,8 @@ private:
                                                 DeviceArgmaxBuffer *argmax_out = nullptr,
                                                 uint32_t argmax_out_index = 0,
                                                 const DeviceArgmaxBuffer *token_source = nullptr,
-                                                uint32_t token_source_index = 0);
+                                                uint32_t token_source_index = 0,
+                                                bool window_frame = false);
 
     const QwenNativeModel &model_;
     const QwenWeights &weights_;
@@ -581,6 +582,13 @@ private:
     std::vector<int32_t> window_pages_host_;
     std::unique_ptr<DeviceTensor> window_pages_device_;
     uint32_t window_page_count_ = 0;
+    // MTP-draft mirror of the main window page table. The MTP draft head has its
+    // own KV cache (mtp_kv_pages_), so the window is a separate page-pointer
+    // reordering over the SAME selected blocks (lockstep with the main window;
+    // its length tracks window_query_pos_). Built + re-RoPE'd in kvmem_assemble.
+    std::vector<int32_t> mtp_window_pages_host_;
+    std::unique_ptr<DeviceTensor> mtp_window_pages_device_;
+    uint32_t mtp_window_page_count_ = 0;
     std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
     std::unique_ptr<HostBuffer> kvmem_cpu_bytes_;
@@ -647,6 +655,7 @@ private:
                                     const void *src,
                                     uint64_t bytes);
     void sync_window_pages_device(uint32_t have_pages);
+    void sync_mtp_window_pages_device(uint32_t have_pages);
     // Grow the window page table by the trailing physical page so a decode
     // token can be appended at window slot window_query_pos_.
     void kvmem_extend_window_for_decode();
@@ -655,6 +664,11 @@ private:
     // in forward_n_tokens).
     void kvmem_extend_window_for_decode_n(uint32_t n,
                                           uint32_t true_base_pos);
+    // MTP-draft mirror: grow the MTP window so `n` speculative draft tokens can
+    // be appended at window slot window_query_pos_ aliasing the MTP cache's
+    // true-tail pages. Trimmed back to the pre-chain length after the draft.
+    void kvmem_extend_mtp_window_for_decode_n(uint32_t n,
+                                              uint32_t true_base_pos);
     void kvmem_register_until(uint32_t target_pos);
 
     // ---- Cumulative-attention selection signal (#40, low-intrusion) -------

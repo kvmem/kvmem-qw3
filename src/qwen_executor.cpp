@@ -496,6 +496,8 @@ void QwenExecutor::reset_state() {
     kvmem_registered_pos_ = 0;
     window_pages_host_.clear();
     window_page_count_ = 0;
+    mtp_window_pages_host_.clear();
+    mtp_window_page_count_ = 0;
     window_query_pos_ = 0;
     if (kvmem_cpu_tier_) kvmem_cpu_tier_->clear();
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
@@ -2082,22 +2084,52 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
         reports.push_back(std::move(report));
         return reports;
     }
+    // kvmem: run the speculative draft over the same re-RoPE'd window the verify
+    // path uses (selected blocks only). Each step writes speculative K at window
+    // slot window_query_pos_+i, aliasing the true MTP tail page just allocated;
+    // attention scans the window page list, so draft cost is bounded by the
+    // window and the draft agrees with the window-aware verify. The chain is
+    // speculative: position_/window_query_pos_/mtp_prefix_len_ are NOT advanced,
+    // and the aliased tail pages are trimmed off the window list afterwards
+    // (commit-time priming re-primes the accepted token at its true position).
+    // When kvmem is off this branch is bypassed and the draft is byte-identical
+    // to the legacy true-frame path below.
+    const bool window_mode = kvmem_active_;
+    const uint32_t pre_window_pages = mtp_window_page_count_;
     uint32_t current = token_id;
     for (uint32_t i = 0; i < max_tokens; ++i) {
         const uint32_t cache_pos = position_ + i;
         if (cache_pos >= kv_ctx_size_) break;
         const DeviceTensor &h_input = (i == 0) ? *h_ : *mtp_h_;
-        NativeExecutorReport report = forward_mtp_draft_from(current, h_input,
-                                                             cache_pos, cache_pos,
-                                                             cache_pos + 1);
+        NativeExecutorReport report;
+        if (window_mode) {
+            mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
+            kvmem_extend_mtp_window_for_decode_n(i + 1, position_);
+            const uint32_t win_pos = window_query_pos_ + i;
+            report = forward_mtp_draft_from(current, h_input, win_pos, win_pos,
+                                            win_pos + 1, /*compute_logits=*/true,
+                                            /*argmax_out=*/nullptr,
+                                            /*argmax_out_index=*/0,
+                                            /*token_source=*/nullptr,
+                                            /*token_source_index=*/0,
+                                            /*window_frame=*/true);
+        } else {
+            report = forward_mtp_draft_from(current, h_input,
+                                            cache_pos, cache_pos,
+                                            cache_pos + 1);
+        }
         const bool ok = report.ok;
         const int next = report.argmax_token;
         reports.push_back(std::move(report));
         if (!ok || next < 0) break;
-        if (i == 0) {
+        if (!window_mode && i == 0) {
             mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_, position_ + 1);
         }
         current = static_cast<uint32_t>(next);
+    }
+    if (window_mode && mtp_window_page_count_ != pre_window_pages) {
+        mtp_window_pages_host_.resize(pre_window_pages);
+        mtp_window_page_count_ = pre_window_pages;
     }
     return reports;
 }
@@ -2119,6 +2151,11 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
         return {std::move(report)};
     }
 
+    // kvmem windowed draft (see forward_mtp_draft_chain_with_prefix): drive the
+    // window frame here too while preserving on-device argmax chaining (the
+    // argmax buffer / token_source are independent of the KV frame).
+    const bool window_mode = kvmem_active_;
+    const uint32_t pre_window_pages = mtp_window_page_count_;
     std::vector<NativeExecutorReport> reports;
     reports.reserve(max_tokens);
     for (uint32_t i = 0; i < max_tokens; ++i) {
@@ -2126,22 +2163,35 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
         if (cache_pos >= kv_ctx_size_) break;
         const DeviceTensor &h_input = (i == 0) ? *h_ : *mtp_h_;
         const DeviceArgmaxBuffer *token_source = i == 0 ? nullptr : mtp_draft_argmaxes_.get();
+        uint32_t draft_pos = cache_pos;
+        bool window_frame = false;
+        if (window_mode) {
+            mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
+            kvmem_extend_mtp_window_for_decode_n(i + 1, position_);
+            draft_pos = window_query_pos_ + i;
+            window_frame = true;
+        }
         NativeExecutorReport report = forward_mtp_draft_from(token_id,
                                                              h_input,
-                                                             cache_pos,
-                                                             cache_pos,
-                                                             cache_pos + 1,
+                                                             draft_pos,
+                                                             draft_pos,
+                                                             draft_pos + 1,
                                                              /*compute_logits=*/true,
                                                              mtp_draft_argmaxes_.get(),
                                                              i,
                                                              token_source,
-                                                             i == 0 ? 0 : i - 1);
+                                                             i == 0 ? 0 : i - 1,
+                                                             window_frame);
         const bool ok = report.ok;
         reports.push_back(std::move(report));
         if (!ok) break;
-        if (i == 0) {
+        if (!window_mode && i == 0) {
             mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_, position_ + 1);
         }
+    }
+    if (window_mode && mtp_window_page_count_ != pre_window_pages) {
+        mtp_window_pages_host_.resize(pre_window_pages);
+        mtp_window_page_count_ = pre_window_pages;
     }
 
     if (reports.empty() || !reports.back().ok) return reports;
@@ -2170,7 +2220,8 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                                           DeviceArgmaxBuffer *argmax_out,
                                                           uint32_t argmax_out_index,
                                                           const DeviceArgmaxBuffer *token_source,
-                                                          uint32_t token_source_index) {
+                                                          uint32_t token_source_index,
+                                                          bool window_frame) {
     NativeExecutorReport report;
     const NativePlanInfo &plan = model_.plan();
     if (!plan.mtp_supported) {
@@ -2246,23 +2297,34 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                          cfg.rope_dim, rope_pos, cfg.rope_theta));
 
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-    mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
-    if (external_mtp_kv_cache_) {
-        mtp_kv_pages_.validate_physical_capacity(
-            external_mtp_kv_cache_->physical_slots, "external MTP");
+    // kvmem windowed draft (window_frame=true, only when kvmem_active_): attend
+    // the same re-RoPE'd window the verify path uses. The window pages alias the
+    // already-primed physical MTP pages, so no ensure_pages/validate is needed;
+    // the page table is the lockstep MTP window built in kvmem_assemble.
+    if (!window_frame) {
+        mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
+        if (external_mtp_kv_cache_) {
+            mtp_kv_pages_.validate_physical_capacity(
+                external_mtp_kv_cache_->physical_slots, "external MTP");
+        }
     }
-    const bool use_paged_prefix = mtp_paged_prefix_enabled();
+    const bool use_paged_prefix = mtp_paged_prefix_enabled() || window_frame;
+    const DeviceTensor &mtp_pages_dev =
+        window_frame ? *mtp_window_pages_device_ : mtp_kv_pages_.device_indices();
+    const uint32_t mtp_pages_count =
+        window_frame ? mtp_window_page_count_ : mtp_kv_pages_.count();
+    const uint32_t mtp_page_size = mtp_kv_pages_.page_size;
     DeviceTensor &mtp_k = mtp_k_cache();
     DeviceTensor &mtp_v = mtp_v_cache();
     if (use_paged_prefix) {
         require_status(backend_.kv_append_batch_paged_device(
             mtp_k, *k_, cache_pos, per_pos,
-            1, mtp_kv_pages_.device_indices(),
-            mtp_kv_pages_.count(), mtp_kv_pages_.page_size));
+            1, mtp_pages_dev,
+            mtp_pages_count, mtp_page_size));
         require_status(backend_.kv_append_batch_paged_device(
             mtp_v, *v_, cache_pos, per_pos,
-            1, mtp_kv_pages_.device_indices(),
-            mtp_kv_pages_.count(), mtp_kv_pages_.page_size));
+            1, mtp_pages_dev,
+            mtp_pages_count, mtp_page_size));
     } else {
         require_status(backend_.kv_append(mtp_k, *k_, cache_pos, per_pos));
         require_status(backend_.kv_append(mtp_v, *v_, cache_pos, per_pos));
@@ -2273,8 +2335,8 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     if (use_paged_prefix) {
         require_status(backend_.attention_decode_batch_paged_gated_device(
             *mid_, *q_, 2 * standard_head_dim, mtp_k,
-            mtp_v, mtp_kv_pages_.device_indices(),
-            mtp_kv_pages_.count(), mtp_kv_pages_.page_size,
+            mtp_v, mtp_pages_dev,
+            mtp_pages_count, mtp_page_size,
             standard_n_heads, standard_n_kv_heads, standard_head_dim,
             seq_len - 1, 1, 2 * standard_head_dim,
             standard_n_heads * standard_head_dim, scale));
@@ -2447,6 +2509,18 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
         if (window_pages_host_.size() > window_page_count_) {
             window_pages_host_.resize(window_page_count_);
         }
+        // MTP draft window is lockstep with the main window (same blocks); roll
+        // its tail back so the next draft chain sees the pre-verify window. Clamp
+        // the count to the actual host length -- the MTP window only grows during
+        // the draft (not the verify that just ran), so its host can legitimately
+        // be shorter than window_page_count_; the next draft's extend regrows it.
+        // Keeping count == host size is the invariant the extend relies on.
+        mtp_window_page_count_ = std::min<uint32_t>(
+            window_page_count_,
+            static_cast<uint32_t>(mtp_window_pages_host_.size()));
+        if (mtp_window_pages_host_.size() > mtp_window_page_count_) {
+            mtp_window_pages_host_.resize(mtp_window_page_count_);
+        }
     }
 }
 
@@ -2527,9 +2601,44 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     if (effective.gpu_memory_ratio > 0.0 &&
         total_device_bytes > 0 &&
         effective.estimated_block_bytes > 0) {
-        const uint64_t cap_bytes = static_cast<uint64_t>(
+        // The ratio bounds TOTAL process GPU usage (model weights + GPU-resident
+        // KV + prefill scratch), not just the KV pool in isolation. Weights are
+        // already resident at configure time, so the room left for the resident
+        // KV pool is (ratio*total - already_used - scratch_reserve). Sizing the
+        // pool from the raw ratio*total instead lets the whole KV stay GPU-
+        // resident at intermediate contexts (e.g. 256K: 13.4 GiB KV < 47.8 GiB
+        // raw cap), so the bounded pool never engages and never frees GPU pages
+        // after stage-out -> process peak blows past the ratio ceiling. Reserving
+        // weights + scratch forces the pool to engage and cap resident KV so the
+        // ceiling actually holds. The adaptive prefill-chunk cap below keeps
+        // scratch within the reserve at the longest contexts.
+        const uint64_t ceiling = static_cast<uint64_t>(
             static_cast<long double>(total_device_bytes) *
             effective.gpu_memory_ratio);
+        const uint64_t free_now = backend_.free_device_bytes();
+        const uint64_t used_now =
+            (free_now > 0 && free_now <= total_device_bytes)
+                ? (total_device_bytes - free_now)
+                : 0;
+        // Prefill scratch (FA2 attention workspace + q8_1 matmul staging +
+        // split-K partials) is additive and grows with KV length, reaching
+        // ~13 GiB at 2M ctx for this model. Reserve enough headroom that the
+        // resident pool + scratch stay under the ceiling at the LONGEST context.
+        // The pool only needs to hold the decode window (~1.7 GiB for a 32K
+        // window) plus transient prefill-chunk / reselect pages, so a ~4 GiB
+        // pool (ceiling 47.8 - weights 28.6 - reserve 15) is ample; the unused
+        // budget is better handed to scratch. Tunable via
+        // QW3_KVMEM_SCRATCH_RESERVE_MIB.
+        uint64_t scratch_reserve = static_cast<uint64_t>(15) << 30;
+        if (const char *env = std::getenv("QW3_KVMEM_SCRATCH_RESERVE_MIB")) {
+            const long long v = std::atoll(env);
+            if (v >= 0) scratch_reserve = static_cast<uint64_t>(v) << 20;
+        }
+        const uint64_t reserved = used_now + scratch_reserve;
+        const uint64_t cap_bytes =
+            (ceiling > reserved + effective.estimated_block_bytes)
+                ? (ceiling - reserved)
+                : effective.estimated_block_bytes;
         const uint64_t cap_blocks64 = cap_bytes / effective.estimated_block_bytes;
         const uint32_t cap_blocks = cap_blocks64 >
                 static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
@@ -2556,6 +2665,8 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_active_ = false;
     window_pages_host_.clear();
     window_page_count_ = 0;
+    mtp_window_pages_host_.clear();
+    mtp_window_page_count_ = 0;
     window_query_pos_ = 0;
     kvmem_cpu_tier_.reset();
     kvmem_nvme_tier_.reset();
@@ -2692,6 +2803,17 @@ void QwenExecutor::sync_window_pages_device(uint32_t have_pages) {
     // reordering, not an append), so re-upload all `have_pages` entries.
     require_status(backend_.copy_i32_from_host(
         *window_pages_device_, 0, window_pages_host_.data(), have_pages));
+}
+
+void QwenExecutor::sync_mtp_window_pages_device(uint32_t have_pages) {
+    if (have_pages == 0) return;
+    if (!mtp_window_pages_device_) {
+        mtp_window_pages_device_ = backend_.tensor_i32(
+            std::max<uint32_t>(mtp_kv_pages_.max_pages, 1),
+            "mtp_kv_window_page_indices");
+    }
+    require_status(backend_.copy_i32_from_host(
+        *mtp_window_pages_device_, 0, mtp_window_pages_host_.data(), have_pages));
 }
 
 uint64_t QwenExecutor::kvmem_kv_page_bytes() const {
@@ -3164,6 +3286,23 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     // reordering. baked_pos in the plan tells us where the block's K currently
     // sits so re-RoPE can de-rotate from there.
     window_pages_host_.clear();
+    // MTP draft mirror: build the same window over the MTP draft head's own KV
+    // cache (mtp_kv_pages_). Only when the MTP scratch is live (spec decode); a
+    // plain kvmem decode never touches the MTP cache.
+    //
+    // The mirror requires every selected block's MTP pages to be primed. The MTP
+    // prefix is primed lazily, AFTER each prefill chunk's main forward returns
+    // (prime_mtp_prefix uses that chunk's batch hidden states), so during prefill
+    // mtp_prefix_len_ lags the registered position: a mid-prefill reselect fired
+    // by kvmem_maybe_prefill_offload registers blocks (from the freshly-written
+    // MAIN cache) whose MTP pages do not exist yet. That mid-prefill mirror is
+    // throwaway anyway -- it is only consumed by the decode-phase windowed draft,
+    // and it is rebuilt at the post-prefill reselect once priming has caught up.
+    // So gate the mirror on the MTP cache covering all registered blocks; when it
+    // lags, skip the build (the stale mirror is never read before the rebuild).
+    const bool build_mtp_window =
+        mtp_scratch_ready_ && mtp_prefix_len_ >= kvmem_registered_pos_;
+    if (build_mtp_window) mtp_window_pages_host_.clear();
     const auto &blocks = block_store_->blocks();
     // Per-window-block metadata for the cumulative-attention selection signal:
     // window slot w -> (block_id, first window pos, token count). Built in the
@@ -3195,6 +3334,14 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                     "block-sparse window references offloaded KV page");
             }
             window_pages_host_.push_back(kv_pages_.pages[lp]);
+            if (build_mtp_window) {
+                if (lp >= mtp_kv_pages_.pages.size() ||
+                    mtp_kv_pages_.pages[lp] < 0) {
+                    throw std::runtime_error(
+                        "block-sparse MTP window references unprimed KV page");
+                }
+                mtp_window_pages_host_.push_back(mtp_kv_pages_.pages[lp]);
+            }
         }
         bs_window_block_ids_.push_back(rm.block_id);
         bs_win_base_host_.push_back(rm.to_base);
@@ -3203,6 +3350,11 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     window_page_count_ = static_cast<uint32_t>(window_pages_host_.size());
     window_query_pos_ = plan.total_window_tokens;
     sync_window_pages_device(window_page_count_);
+    if (build_mtp_window) {
+        mtp_window_page_count_ =
+            static_cast<uint32_t>(mtp_window_pages_host_.size());
+        sync_mtp_window_pages_device(mtp_window_page_count_);
+    }
     uint64_t t_pages = 0;
     if (tm) {
         require_status(backend_.synchronize());
@@ -3253,6 +3405,17 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 kc, n_moved, max_block_tokens, cfg.n_kv_heads, per_pos,
                 cfg.head_dim, cfg.rope_dim, *bs_remap_to_dev_,
                 *bs_remap_from_dev_, *bs_remap_ntok_dev_, *window_pages_device_,
+                page_size, cfg.rope_theta));
+        }
+        // MTP draft head is one extra standard-attention layer with its own K
+        // cache. Re-RoPE it in lockstep using the SAME {to,from,ntok} remaps
+        // (its K is baked at the same rotation as the main cache for every
+        // selected block) but the MTP window page table. One launch.
+        if (build_mtp_window) {
+            require_status(backend_.rope_block_remap_paged_batched_device(
+                mtp_k_cache(), n_moved, max_block_tokens, cfg.n_kv_heads, per_pos,
+                cfg.head_dim, cfg.rope_dim, *bs_remap_to_dev_,
+                *bs_remap_from_dev_, *bs_remap_ntok_dev_, *mtp_window_pages_device_,
                 page_size, cfg.rope_theta));
         }
     }
@@ -3423,6 +3586,42 @@ void QwenExecutor::kvmem_extend_window_for_decode_n(uint32_t n,
     }
     window_page_count_ = static_cast<uint32_t>(window_pages_host_.size());
     sync_window_pages_device(window_page_count_);
+}
+
+void QwenExecutor::kvmem_extend_mtp_window_for_decode_n(uint32_t n,
+                                                        uint32_t true_base_pos) {
+    if (n == 0) return;
+    const uint32_t page_size = mtp_kv_pages_.page_size;
+    const uint32_t need_pages =
+        (window_query_pos_ + n + page_size - 1) / page_size;
+    // The host vector is the source of truth for how many window pages actually
+    // exist; mtp_window_page_count_ only mirrors it. A state restore can leave
+    // the count ahead of the host length (it force-syncs the count to the main
+    // window without growing the host), so grow against the host size and
+    // re-sync the count from it -- never trust a stale count as the loop base.
+    if (mtp_window_pages_host_.size() >= need_pages) {
+        mtp_window_page_count_ =
+            static_cast<uint32_t>(mtp_window_pages_host_.size());
+        return;  // current pages already cover the requested slots
+    }
+    if (true_base_pos < window_query_pos_) {
+        throw std::runtime_error(
+            "block-sparse MTP draft: true base precedes window tail");
+    }
+    const uint32_t delta = (true_base_pos - window_query_pos_) / page_size;
+    while (mtp_window_pages_host_.size() < need_pages) {
+        const uint32_t pg = static_cast<uint32_t>(mtp_window_pages_host_.size());
+        const uint32_t true_page = pg + delta;
+        if (true_page >= mtp_kv_pages_.pages.size() ||
+            mtp_kv_pages_.pages[true_page] < 0) {
+            throw std::runtime_error(
+                "block-sparse MTP draft: true MTP KV page not allocated "
+                "before window extend");
+        }
+        mtp_window_pages_host_.push_back(mtp_kv_pages_.pages[true_page]);
+    }
+    mtp_window_page_count_ = static_cast<uint32_t>(mtp_window_pages_host_.size());
+    sync_mtp_window_pages_device(mtp_window_page_count_);
 }
 
 // Rebuild the per-window-block representative K (mean baked K) at the first
@@ -3986,6 +4185,17 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
         window_page_count_ = (window_query_pos_ + page_size - 1) / page_size;
         if (window_pages_host_.size() > window_page_count_) {
             window_pages_host_.resize(window_page_count_);
+        }
+        // MTP draft window is lockstep with the main window; roll its tail back.
+        // Clamp the count to the actual host length: the MTP window only grows
+        // during the draft (not this verify), so its host can be shorter than
+        // window_page_count_; the next draft's extend regrows it. Keeping
+        // count == host size is the invariant the extend relies on.
+        mtp_window_page_count_ = std::min<uint32_t>(
+            window_page_count_,
+            static_cast<uint32_t>(mtp_window_pages_host_.size()));
+        if (mtp_window_pages_host_.size() > mtp_window_page_count_) {
+            mtp_window_pages_host_.resize(mtp_window_page_count_);
         }
     }
     mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_, position_);
