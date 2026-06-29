@@ -64,23 +64,21 @@ void apply_token_penalties(std::vector<float> &logits,
     }
 }
 
-// Host-side token sampler over the full fp32 vocab logits. temp<=0 is greedy.
-// Otherwise: apply top-k/top-p/min-p filters, renormalize, draw with rng.
-// Kept on host because copy_last_logits() already round-trips logits for the
-// dump-logits path; sampling adds no device work.
-int32_t sample_token(const std::vector<float> &logits, float temp, float top_p,
-                     int top_k, float min_p,
-                     std::mt19937_64 &rng) {
+// Full-vocab probability vector that token sampling draws from: softmax(logits/temp)
+// with top-k/top-p/min-p truncation applied and renormalized over the kept set.
+// Entries outside the kept set are 0. Penalties are NOT applied here — callers
+// penalize the logits first (matching apply_token_penalties usage). This is the
+// single source of truth for the sampling distribution, shared by the non-MTP
+// sampler (sample_token) and the MTP speculative accept test, so MTP under temp>0
+// reproduces exactly the same distribution as plain decode.
+std::vector<float> sampling_distribution(const std::vector<float> &logits,
+                                         float temp, float top_p, int top_k,
+                                         float min_p) {
     const int n = static_cast<int>(logits.size());
-    if (n <= 0) return -1;
-    if (temp <= 0.0f) {
-        int best = 0;
-        float bv = logits[0];
-        for (int i = 1; i < n; ++i) if (logits[i] > bv) { bv = logits[i]; best = i; }
-        return best;
-    }
+    std::vector<float> out(n > 0 ? static_cast<size_t>(n) : 0, 0.0f);
+    if (n <= 0) return out;
     // softmax(logits / temp), numerically stabilized by max subtraction.
-    const float inv_t = 1.0f / temp;
+    const float inv_t = 1.0f / (temp > 0.0f ? temp : 1.0f);
     float maxv = logits[0];
     for (int i = 1; i < n; ++i) if (logits[i] > maxv) maxv = logits[i];
     std::vector<std::pair<float, int>> probs(n);
@@ -100,32 +98,149 @@ int32_t sample_token(const std::vector<float> &logits, float temp, float top_p,
         std::sort(probs.begin(), probs.end(),
                   [](const auto &a, const auto &b) { return a.first > b.first; });
     }
-    if (top_k > 0 && top_k < static_cast<int>(probs.size())) {
-        probs.resize(static_cast<size_t>(top_k));
-    }
-    if (min_p > 0.0f && !probs.empty()) {
+    // Truncation order mirrors the original sample_token: top_k, then min_p, then
+    // nucleus (top_p). The list is sorted descending, so each filter keeps a prefix.
+    size_t keep = probs.size();
+    if (top_k > 0 && top_k < static_cast<int>(keep)) keep = static_cast<size_t>(top_k);
+    if (min_p > 0.0f && keep > 0) {
         const float cutoff = probs.front().first * min_p;
-        probs.erase(std::remove_if(probs.begin(), probs.end(),
-                                   [&](const auto &pr) { return pr.first < cutoff; }),
-                    probs.end());
-        if (probs.empty()) return -1;
+        size_t k = 0;
+        while (k < keep && probs[k].first >= cutoff) ++k;
+        keep = k;
     }
-    // Nucleus: keep smallest descending-probability prefix with cumulative
-    // probability >= top_p.
     if (top_p < 1.0f && top_p > 0.0f) {
         double cum = 0.0;
-        size_t keep = probs.size();
-        for (size_t i = 0; i < probs.size(); ++i) {
+        size_t k = keep;
+        for (size_t i = 0; i < keep; ++i) {
             cum += probs[i].first;
-            if (cum >= top_p) { keep = i + 1; break; }
+            if (cum >= top_p) { k = i + 1; break; }
         }
-        probs.resize(keep);
+        keep = k;
     }
-    std::vector<double> weights;
-    weights.reserve(probs.size());
-    for (const auto &pr : probs) weights.push_back(pr.first);
-    std::discrete_distribution<int> dist(weights.begin(), weights.end());
-    return probs[dist(rng)].second;
+    double kept_sum = 0.0;
+    for (size_t i = 0; i < keep; ++i) kept_sum += probs[i].first;
+    if (kept_sum <= 0.0) {
+        // Degenerate (e.g. min_p removed everything): collapse to the top token.
+        if (!probs.empty()) out[probs.front().second] = 1.0f;
+        return out;
+    }
+    const float kn = static_cast<float>(1.0 / kept_sum);
+    for (size_t i = 0; i < keep; ++i) out[probs[i].second] = probs[i].first * kn;
+    return out;
+}
+
+// Draw an index from a (full-vocab) probability vector. Nonzero entries are
+// collected first so discrete_distribution stays cheap even over a 150K vocab.
+int32_t sample_from(const std::vector<float> &probs, std::mt19937_64 &rng) {
+    std::vector<double> w;
+    std::vector<int> idx;
+    for (int i = 0; i < static_cast<int>(probs.size()); ++i) {
+        if (probs[i] > 0.0f) { w.push_back(probs[i]); idx.push_back(i); }
+    }
+    if (w.empty()) return -1;
+    std::discrete_distribution<int> dist(w.begin(), w.end());
+    return idx[dist(rng)];
+}
+
+// Host-side token sampler over the full fp32 vocab logits. temp<=0 is greedy.
+// Otherwise draws from sampling_distribution(). Kept on host because
+// copy_last_logits() already round-trips logits; sampling adds no device work.
+int32_t sample_token(const std::vector<float> &logits, float temp, float top_p,
+                     int top_k, float min_p,
+                     std::mt19937_64 &rng) {
+    const int n = static_cast<int>(logits.size());
+    if (n <= 0) return -1;
+    if (temp <= 0.0f) {
+        int best = 0;
+        float bv = logits[0];
+        for (int i = 1; i < n; ++i) if (logits[i] > bv) { bv = logits[i]; best = i; }
+        return best;
+    }
+    return sample_from(sampling_distribution(logits, temp, top_p, top_k, min_p), rng);
+}
+
+struct SpecAcceptResult {
+    uint32_t accepted = 0;     // number of leading drafts accepted
+    int32_t extra_token = -1;  // residual (on reject) or bonus (on full accept)
+};
+
+// Distribution-lossless speculative-sampling accept test for an argmax-fed draft
+// chain. Because each draft was produced greedily, the proposal q_i is a point mass
+// at draft_i, so the classic rejection test collapses to: accept draft_i with
+// probability p_i(draft_i) where p_i = sampling_distribution(penalized target row i);
+// on reject, emit a draw from the residual (p_i with draft_i removed, renormalized)
+// and stop; if all drafts accept, emit a bonus draw from the final target row.
+// Penalties are applied per row against the running committed prefix (seen + the
+// drafts accepted so far). This is provably equal in distribution to drawing each
+// committed token directly from the target distribution p — the same distribution
+// the non-MTP sampler draws from — so MTP temp>0 output matches plain temp>0.
+SpecAcceptResult speculative_accept_pointmass(
+        const std::vector<std::vector<float>> &target_rows,  // size == drafts.size()+1
+        const std::vector<uint32_t> &drafts,
+        float temp, float top_p, int top_k, float min_p,
+        float presence_penalty, float repetition_penalty,
+        const std::unordered_map<uint32_t, uint32_t> &seen,
+        std::mt19937_64 &rng) {
+    SpecAcceptResult r;
+    std::unordered_map<uint32_t, uint32_t> ctx = seen;
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    const size_t n = drafts.size();
+    // Target distribution for a row. temp>0 is the truncated/renormalized
+    // sampling distribution; temp<=0 collapses to a point mass at the argmax so
+    // the accept test reproduces greedy decoding (now over the penalized logits),
+    // letting penalties apply correctly even when sampling is off.
+    auto target_dist = [&](const std::vector<float> &row) -> std::vector<float> {
+        if (temp > 0.0f)
+            return sampling_distribution(row, temp, top_p, top_k, min_p);
+        std::vector<float> p(row.size(), 0.0f);
+        if (!row.empty()) {
+            int best = 0;
+            float bv = row[0];
+            for (int i = 1; i < static_cast<int>(row.size()); ++i)
+                if (row[i] > bv) { bv = row[i]; best = i; }
+            p[best] = 1.0f;
+        }
+        return p;
+    };
+    for (size_t i = 0; i < n && i < target_rows.size(); ++i) {
+        std::vector<float> row = target_rows[i];  // copy; penalized in place
+        apply_token_penalties(row, ctx, presence_penalty, repetition_penalty);
+        std::vector<float> p = target_dist(row);
+        const uint32_t d = drafts[i];
+        const float accept_prob = (d < p.size()) ? p[d] : 0.0f;
+        if (unit(rng) < static_cast<double>(accept_prob)) {
+            ++ctx[d];
+            ++r.accepted;
+            continue;
+        }
+        // Reject: draw from the residual (p with the rejected draft removed).
+        if (d < p.size()) p[d] = 0.0f;
+        int32_t resid = sample_from(p, rng);
+        r.extra_token = resid >= 0 ? resid : static_cast<int32_t>(d);
+        return r;  // accepted == i
+    }
+    // All drafts accepted: bonus draw from the final (post-chain) target row.
+    if (n < target_rows.size()) {
+        std::vector<float> row = target_rows[n];
+        apply_token_penalties(row, ctx, presence_penalty, repetition_penalty);
+        std::vector<float> p = target_dist(row);
+        r.extra_token = sample_from(p, rng);
+    }
+    return r;
+}
+
+// True iff a request needs its per-row target logits pulled to host on the MTP
+// verify path: sampling (temp>0) OR active presence/repetition penalties. When
+// false the greedy argmax-equality accept loop runs and is byte-identical to the
+// pre-sampling MTP. Shared by the single-request and CB accept sites so both gate
+// identically.
+inline bool mtp_options_need_logits(float temperature,
+                                    float presence_penalty,
+                                    float repetition_penalty) {
+    if (temperature > 0.0f) return true;
+    if (presence_penalty != 0.0f) return true;
+    if (repetition_penalty > 0.0f && repetition_penalty != 1.0f) return true;
+    return false;
 }
 
 bool native_prefill_flashinfer_effective() {
@@ -1601,6 +1716,11 @@ private:
         double seconds = 0.0;
         NativeExecutorReport report;
         std::vector<DeviceArgmax> row_argmaxes;
+        // Per-row full fp32 LM-head logits, populated only on the single-verifier
+        // (forward_n_tokens) path when the request samples (temp>0); the MTP
+        // speculative-sampling accept test needs the target distribution per row,
+        // not just the argmax. Empty on greedy / ragged-verify rows.
+        std::vector<std::vector<float>> row_logits;
         QwenExecutor::StateCheckpointSet checkpoints;
         std::string error;
 
@@ -4540,6 +4660,10 @@ private:
             a.req->generated += piece;
             if (a.req->on_text) a.req->on_text(piece);
             budget_observe(a.budget, token);
+            // Track committed tokens so the next verify batch's penalties
+            // (presence/repetition) see the running output. No-op for greedy
+            // (penalties unused), so greedy MTP stays byte-identical.
+            ++a.seen_tokens[token];
             ++a.decoded;
             return true;
         };
@@ -4640,9 +4764,13 @@ private:
                 }
                 const double prefill_s = std::max(wall_seconds() - prefill0, 1e-9);
                 a.prefill_ops = prefill_ops;
-                a.next_token = step.argmax_token >= 0
-                    ? static_cast<uint32_t>(step.argmax_token)
-                    : static_cast<uint32_t>(eos);
+                // First post-prefill token: sample from the last prefill row when
+                // temp>0 (pick_continuous_next_token round-trips logits_ via
+                // copy_last_logits + applies penalties); greedy returns the
+                // argmax unchanged, so greedy MTP stays byte-identical.
+                a.next_token = static_cast<uint32_t>(pick_continuous_next_token(
+                    a, step.argmax_token >= 0 ? step.argmax_token
+                                              : static_cast<int32_t>(eos)));
                 a.decode_start = wall_seconds();
                 if (req->options.max_tokens > 0 &&
                     !should_stop(a, a.next_token)) {
@@ -4929,10 +5057,14 @@ private:
                             throw std::runtime_error("MTP fallback decode failed");
                         }
                         stats[row].decode_ops += step.ops_executed;
+                        // Sample/pick from the just-computed logits before
+                        // commit_mtp_prefix (which leaves logits_ untouched but we
+                        // pick first to be safe); samples when temp>0, else argmax.
+                        const int32_t fb = step.argmax_token >= 0
+                            ? step.argmax_token : eos;
+                        a.next_token = static_cast<uint32_t>(
+                            pick_continuous_next_token(a, fb));
                         a.executor->commit_mtp_prefix(a.executor->position());
-                        a.next_token = step.argmax_token >= 0
-                            ? static_cast<uint32_t>(step.argmax_token)
-                            : static_cast<uint32_t>(eos);
                         emit(a, a.next_token);
                     }
                 }
@@ -4943,10 +5075,8 @@ private:
                         [&](ContinuousMtpVerifyJob &job) {
                             BatchedPrefillOutput out;
                             out.prefill_index = job.row;
-                            out.request_id =
-                                mtp_active[job.row].req
-                                    ? mtp_active[job.row].req->id
-                                    : 0;
+                            ContinuousBatchActive &ja = mtp_active[job.row];
+                            out.request_id = ja.req ? ja.req->id : 0;
                             out.offset = job.base_position;
                             out.total = job.base_position +
                                         static_cast<uint32_t>(
@@ -4955,27 +5085,58 @@ private:
                                 static_cast<uint32_t>(
                                     job.verify_tokens.size());
                             out.final_chunk = true;
+                            // When the request samples (temp>0) or applies
+                            // penalties, pull every verify row's full distribution
+                            // to host for the point-mass accept test; pure-greedy
+                            // rows skip this and stay byte-identical.
+                            const bool job_samples =
+                                ja.req && mtp_options_need_logits(
+                                    ja.req->options.temperature,
+                                    ja.req->options.presence_penalty,
+                                    ja.req->options.repetition_penalty);
                             out.report =
-                                mtp_active[job.row].executor->forward_n_tokens(
+                                ja.executor->forward_n_tokens(
                                     job.verify_tokens, true,
                                     &out.row_argmaxes,
                                     state_checkpoint_count > 0
                                         ? &stats[job.row].checkpoints
                                         : nullptr,
                                     state_checkpoint_count,
-                                    /*copy_last_logits=*/false);
+                                    /*copy_last_logits=*/false,
+                                    job_samples ? &out.row_logits : nullptr);
                             if (!out.report.ok) {
                                 out.error = "MTP single verifier failed";
                             }
                             return out;
                         };
-                    if (jobs.size() == 1) {
-                        ContinuousMtpVerifyJob &job = jobs.front();
-                        const double verify0 = cb_phase_time();
-                        outputs.push_back(run_single_verifier(job));
-                        if (job.row < stats.size()) {
-                            stats[job.row].verify_s +=
-                                std::max(cb_phase_time() - verify0, 0.0);
+                    // Speculative SAMPLING (temp>0) or penalties need each verify
+                    // row's full distribution on host, which only the single-
+                    // verifier (forward_n_tokens) path transports. The ragged/
+                    // layered batched verifiers report argmax only, so any batch
+                    // with a logits-needing row is forced through the per-job
+                    // single verifier. Pure-greedy batches keep their existing fast
+                    // routing byte-identically. (Throughput-batched sampling is
+                    // deferred.)
+                    bool batch_needs_sampling = false;
+                    for (const ContinuousMtpVerifyJob &job : jobs) {
+                        if (job.row < mtp_active.size() &&
+                            mtp_active[job.row].req &&
+                            mtp_options_need_logits(
+                                mtp_active[job.row].req->options.temperature,
+                                mtp_active[job.row].req->options.presence_penalty,
+                                mtp_active[job.row].req->options.repetition_penalty)) {
+                            batch_needs_sampling = true;
+                            break;
+                        }
+                    }
+                    if (jobs.size() == 1 || batch_needs_sampling) {
+                        for (ContinuousMtpVerifyJob &job : jobs) {
+                            const double verify0 = cb_phase_time();
+                            outputs.push_back(run_single_verifier(job));
+                            if (job.row < stats.size()) {
+                                stats[job.row].verify_s +=
+                                    std::max(cb_phase_time() - verify0, 0.0);
+                            }
                         }
                     } else if (continuous_mtp_layered_verify_enabled() &&
                                !mtp_jobs_have_kvmem_row(mtp_active, jobs) &&
@@ -5116,19 +5277,42 @@ private:
                         s.verify_batches += 1;
                         s.verify_tokens += row_argmaxes.size();
                         s.decode_ops += outputs[j].report.ops_executed;
+                        // temp>0 or penalties → point-mass accept test over the
+                        // host target rows (temp<=0 collapses to greedy over the
+                        // penalized logits inside the helper). Pure greedy (no
+                        // penalties) → the original argmax-equality loop,
+                        // byte-identical to greedy MTP.
+                        const bool do_sample =
+                            a.req && mtp_options_need_logits(
+                                a.req->options.temperature,
+                                a.req->options.presence_penalty,
+                                a.req->options.repetition_penalty);
                         uint32_t accepted = 0;
                         int32_t target = eos;
-                        for (uint32_t i = 0; i < job.drafts.size() &&
-                                             i < row_argmaxes.size(); ++i) {
-                            target = row_argmaxes[i].token >= 0
-                                ? row_argmaxes[i].token
-                                : eos;
-                            if (target == static_cast<int32_t>(job.drafts[i])) {
-                                ++accepted;
-                                ++s.accepted;
-                            } else {
-                                ++s.rejected;
-                                break;
+                        if (do_sample) {
+                            const GenerationOptions &o = a.req->options;
+                            SpecAcceptResult sr = speculative_accept_pointmass(
+                                outputs[j].row_logits, job.drafts,
+                                o.temperature, o.top_p, o.top_k, o.min_p,
+                                o.presence_penalty, o.repetition_penalty,
+                                a.seen_tokens, a.rng);
+                            accepted = sr.accepted;
+                            target = sr.extra_token >= 0 ? sr.extra_token : eos;
+                            s.accepted += accepted;
+                            if (accepted < job.drafts.size()) ++s.rejected;
+                        } else {
+                            for (uint32_t i = 0; i < job.drafts.size() &&
+                                                 i < row_argmaxes.size(); ++i) {
+                                target = row_argmaxes[i].token >= 0
+                                    ? row_argmaxes[i].token
+                                    : eos;
+                                if (target == static_cast<int32_t>(job.drafts[i])) {
+                                    ++accepted;
+                                    ++s.accepted;
+                                } else {
+                                    ++s.rejected;
+                                    break;
+                                }
                             }
                         }
                         const char *policy_action = s.policy.update(
@@ -5296,7 +5480,10 @@ private:
                             if (!emit(a, job.drafts[i])) break;
                         }
                         if (a.decoded >= a.req->options.max_tokens) continue;
-                        if (all_accepted) {
+                        if (all_accepted && !do_sample) {
+                            // Greedy: bonus token is the final row's argmax.
+                            // (Sampling already drew the bonus into `target`
+                            // inside speculative_accept_pointmass.)
                             if (job.drafts.size() >= row_argmaxes.size()) {
                                 throw std::runtime_error(
                                     "MTP verifier missing final target row");
@@ -6796,6 +6983,20 @@ private:
         if (!st.ok) throw std::runtime_error(st.message);
         executor_->reset_state();
 
+        // Query-conditioned KVMem (#82): mark the question token span BEFORE
+        // prefill (mirrors generate_mtp). Inert unless kvmem is on and the span
+        // is non-empty -> single-token / recency path unchanged.
+        if (executor_->kvmem_enabled() &&
+            options.kvmem_query_end > options.kvmem_query_begin) {
+            executor_->kvmem_set_query_span(options.kvmem_query_begin,
+                                            options.kvmem_query_end);
+            std::ostringstream qmsg;
+            qmsg << "native kvmem query-conditioned: span=["
+                 << options.kvmem_query_begin << "," << options.kvmem_query_end
+                 << ") tokens=" << (options.kvmem_query_end - options.kvmem_query_begin);
+            log(qmsg.str());
+        }
+
         const double t_prefill_start = wall_seconds();
         uint64_t prefill_ops = 0;
         NativeExecutorReport step;
@@ -7008,6 +7209,19 @@ private:
         // (register_append per committed token + interval reselect) is driven
         // off position deltas in the loops below.
         const bool kvmem_on = executor_->kvmem_enabled();
+        // Query-conditioned KVMem (#82): mark the question token span BEFORE
+        // prefill so the executor captures the in-span Q rows during prefill and
+        // ranks blocks by the multi-token mean at the boundary. Inert (single-token
+        // / recency path unchanged) unless kvmem is on and the span is non-empty.
+        if (kvmem_on && options.kvmem_query_end > options.kvmem_query_begin) {
+            executor_->kvmem_set_query_span(options.kvmem_query_begin,
+                                            options.kvmem_query_end);
+            std::ostringstream qmsg;
+            qmsg << "native kvmem query-conditioned: span=["
+                 << options.kvmem_query_begin << "," << options.kvmem_query_end
+                 << ") tokens=" << (options.kvmem_query_end - options.kvmem_query_begin);
+            log(qmsg.str());
+        }
         const int kvmem_interval = std::max(1, options_.kvmem_interval);
         uint32_t kvmem_last_reselect_pos = 0;
         // Register newly-committed tokens with the block store and reselect the
@@ -7193,8 +7407,58 @@ private:
         const int32_t eos = tokenizer_->eos_id();
         ThinkingBudgetState budget;
         budget_init(budget, options);
-        uint32_t next_token = step.argmax_token >= 0 ? static_cast<uint32_t>(step.argmax_token)
-                                                     : static_cast<uint32_t>(eos);
+
+        // Sampling setup for distribution-lossless MTP. temp<=0 with no penalties
+        // keeps the exact greedy argmax path (byte-identical to pre-change). When
+        // temp>0 we run the point-mass speculative-sampling accept test over the
+        // target rows transported to host, reproducing the non-MTP sampler's
+        // distribution; mtp_seen tracks committed tokens for presence/repetition
+        // penalties, and mtp_rng is seeded per-request like generate_plain.
+        const bool mtp_do_sample = options.temperature > 0.0f;
+        const bool mtp_use_penalties =
+            options.presence_penalty != 0.0f ||
+            (options.repetition_penalty > 0.0f &&
+             options.repetition_penalty != 1.0f);
+        const bool mtp_need_logits_pick = mtp_do_sample || mtp_use_penalties;
+        std::mt19937_64 mtp_rng(options.seed);
+        std::vector<float> mtp_logit_buf;
+        std::unordered_map<uint32_t, uint32_t> mtp_seen;
+        if (mtp_need_logits_pick) {
+            mtp_seen.reserve(prompt_tokens.size() +
+                             static_cast<size_t>(options.max_tokens));
+            for (uint32_t token : prompt_tokens) ++mtp_seen[token];
+        }
+        // Pick the next token from the executor's last logits row, applying
+        // penalties + sampling when active, else returning the device argmax
+        // fallback. Used for the prefill seed, the drafts-empty fallback, and the
+        // plain-decode tail so a sampling request samples on every non-spec path.
+        auto pick_from_last_logits = [&](int32_t fallback_argmax) -> uint32_t {
+            if (!mtp_need_logits_pick) return static_cast<uint32_t>(fallback_argmax);
+            if (!executor_->copy_last_logits(mtp_logit_buf))
+                return static_cast<uint32_t>(fallback_argmax);
+            apply_token_penalties(mtp_logit_buf, mtp_seen,
+                                  options.presence_penalty,
+                                  options.repetition_penalty);
+            int32_t tok;
+            if (mtp_do_sample) {
+                tok = sample_token(mtp_logit_buf, options.temperature,
+                                   options.top_p, options.top_k,
+                                   options.min_p, mtp_rng);
+            } else {
+                int best = 0;
+                float bv = mtp_logit_buf.empty()
+                    ? -std::numeric_limits<float>::infinity()
+                    : mtp_logit_buf[0];
+                for (int i = 1; i < static_cast<int>(mtp_logit_buf.size()); ++i)
+                    if (mtp_logit_buf[i] > bv) { bv = mtp_logit_buf[i]; best = i; }
+                tok = mtp_logit_buf.empty() ? fallback_argmax : best;
+            }
+            return tok >= 0 ? static_cast<uint32_t>(tok)
+                            : static_cast<uint32_t>(fallback_argmax);
+        };
+
+        uint32_t next_token = pick_from_last_logits(
+            step.argmax_token >= 0 ? step.argmax_token : eos);
         uint64_t decode_ops = 0;
         std::unordered_map<std::string, TraceStats> decode_trace;
         uint64_t decode_trace_steps = 0;
@@ -7453,6 +7717,9 @@ private:
             generated += piece;
             if (on_text) on_text(piece);
             budget_observe(budget, token);
+            // Track committed tokens for the next accept test's penalties (no-op
+            // for greedy without penalties, keeping that path byte-identical).
+            if (mtp_need_logits_pick) ++mtp_seen[token];
             ++decoded;
             return true;
         };
@@ -7478,6 +7745,10 @@ private:
                 }
                 if (!step.ok) throw std::runtime_error("decode failed");
                 decode_ops += step.ops_executed;
+                // Sample (or greedily pick) before any kvmem reselect or draft
+                // trace runs, so logits_ still holds this forward's output.
+                const uint32_t sampled = pick_from_last_logits(
+                    step.argmax_token >= 0 ? step.argmax_token : eos);
                 kvmem_advance_to(executor_->position());
                 if (decode_trace_enabled() && !step.elapsed_us.empty()) {
                     accumulate_trace(decode_trace, step);
@@ -7491,7 +7762,7 @@ private:
                                        "decode", static_cast<int32_t>(feed),
                                        *executor_, *tokenizer_);
                 ++plain_decode_forwards;
-                next_token = budget_next_feed(budget, static_cast<uint32_t>(new_argmax));
+                next_token = budget_next_feed(budget, sampled);
                 if (!emit_generated_token(next_token)) break;
                 if (trace_mtp && decoded < options.max_tokens) {
                     trace_mtp_chain(next_token, decoded - 1);
@@ -7561,9 +7832,10 @@ private:
                     if (!step.ok) throw std::runtime_error("decode failed");
                     decode_ops += step.ops_executed;
                     const int32_t new_argmax = step.argmax_token >= 0 ? step.argmax_token : eos;
+                    // Sample/pick before commit_mtp_prefix so logits_ is intact.
+                    next_token = pick_from_last_logits(new_argmax);
                     executor_->commit_mtp_prefix(executor_->position());
                     kvmem_advance_to(executor_->position());
-                    next_token = static_cast<uint32_t>(new_argmax);
                     if (!emit_generated_token(next_token)) break;
                     continue;
                 }
@@ -7586,11 +7858,16 @@ private:
                 verify_tokens.push_back(current);
                 verify_tokens.insert(verify_tokens.end(), drafts.begin(), drafts.end());
                 std::vector<DeviceArgmax> row_argmaxes;
+                // Per-row target distributions on host, populated only when the
+                // request samples (temp>0). Same indexing as row_argmaxes: row i
+                // gates draft i; the final row is the all-accept bonus source.
+                std::vector<std::vector<float>> row_logits;
                 const double t_verify_start = mtp_phase_time();
                 if (use_sequential_verifier) {
                     step = NativeExecutorReport{};
                     step.ok = true;
                     row_argmaxes.reserve(verify_tokens.size());
+                    if (mtp_need_logits_pick) row_logits.reserve(verify_tokens.size());
                     for (uint32_t token : verify_tokens) {
                         NativeExecutorReport verify_step = executor_->forward_one_token(token);
                         if (trace_mtp_verify) {
@@ -7607,13 +7884,20 @@ private:
                             verify_step.argmax_token,
                             verify_step.argmax_logit
                         });
+                        // Copy this row's logits before the next forward_one_token
+                        // overwrites the executor's logits_ scratch.
+                        if (mtp_need_logits_pick) {
+                            row_logits.emplace_back();
+                            executor_->copy_last_logits(row_logits.back());
+                        }
                     }
                 } else {
                     step = executor_->forward_n_tokens(
                         verify_tokens, true, &row_argmaxes,
                         state_checkpoint_count > 0 ? &mtp_spec_state_checkpoints : nullptr,
                         state_checkpoint_count,
-                        /*copy_last_logits=*/!mtp_skip_verify_logits_copy_enabled());
+                        /*copy_last_logits=*/!mtp_skip_verify_logits_copy_enabled(),
+                        mtp_need_logits_pick ? &row_logits : nullptr);
                     ++mtp_spec_batched_verify_batches;
                     mtp_spec_batched_verify_tokens += verify_tokens.size();
                     if (trace_mtp_verify) {
@@ -7630,17 +7914,41 @@ private:
 
                 uint32_t accepted = 0;
                 int32_t target_token = eos;
-                for (uint32_t i = 0; i < drafts.size(); ++i) {
-                    target_token = row_argmaxes[i].token >= 0 ? row_argmaxes[i].token : eos;
-                    ++mtp_chain_verified[i];
-                    const bool ok = target_token == static_cast<int32_t>(drafts[i]);
-                    if (ok) {
-                        ++accepted;
+                if (mtp_need_logits_pick) {
+                    // Distribution-lossless point-mass speculative-sampling accept
+                    // test. extra_token is the residual draw on reject or the bonus
+                    // draw on full accept; both replace the greedy argmax target.
+                    // temp<=0 with penalties collapses to greedy over the penalized
+                    // logits inside the helper, so penalties apply there too.
+                    SpecAcceptResult sr = speculative_accept_pointmass(
+                        row_logits, drafts,
+                        options.temperature, options.top_p, options.top_k,
+                        options.min_p, options.presence_penalty,
+                        options.repetition_penalty, mtp_seen, mtp_rng);
+                    accepted = sr.accepted;
+                    target_token = sr.extra_token >= 0 ? sr.extra_token : eos;
+                    for (uint32_t i = 0; i < accepted; ++i) {
+                        ++mtp_chain_verified[i];
                         ++mtp_spec_accepted;
                         ++mtp_chain_accepted[i];
-                    } else {
+                    }
+                    if (accepted < drafts.size()) {
+                        ++mtp_chain_verified[accepted];
                         ++mtp_spec_rejected;
-                        break;
+                    }
+                } else {
+                    for (uint32_t i = 0; i < drafts.size(); ++i) {
+                        target_token = row_argmaxes[i].token >= 0 ? row_argmaxes[i].token : eos;
+                        ++mtp_chain_verified[i];
+                        const bool ok = target_token == static_cast<int32_t>(drafts[i]);
+                        if (ok) {
+                            ++accepted;
+                            ++mtp_spec_accepted;
+                            ++mtp_chain_accepted[i];
+                        } else {
+                            ++mtp_spec_rejected;
+                            break;
+                        }
                     }
                 }
 
@@ -7723,9 +8031,15 @@ private:
                         if (!emit_generated_token(drafts[i])) break;
                     }
                     if (decoded >= options.max_tokens) break;
-                    target_token = row_argmaxes[drafts.size()].token >= 0
-                        ? row_argmaxes[drafts.size()].token
-                        : eos;
+                    // Greedy: the bonus token is the final row's argmax. The accept
+                    // test already drew the bonus into target_token whenever logits
+                    // were picked (sampling or penalties), so only recompute it on the
+                    // pure-greedy (no-penalty) path.
+                    if (!mtp_need_logits_pick) {
+                        target_token = row_argmaxes[drafts.size()].token >= 0
+                            ? row_argmaxes[drafts.size()].token
+                            : eos;
+                    }
                     next_token = static_cast<uint32_t>(target_token);
                     if (!emit_generated_token(next_token)) break;
                     if (!kvmem_advanced_this_iter) {

@@ -1041,6 +1041,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_block_tokens=" << engine.kvmem_block_tokens << "\n"
               << "  kvmem_budget=" << engine.kvmem_budget << "\n"
               << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
+              << "  kvmem_query_conditioned="
+              << yesno(engine.kvmem_query_conditioned) << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
               << "  kvmem_sink_blocks=" << engine.kvmem_sink_blocks << "\n"
@@ -1195,6 +1197,50 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         GenerationOptions g = make_gen(req, prompt_token_count, enable_thinking);
         g.raw_prompt = true; // prompt is already chat-framed
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
+
+        // Query-conditioned KVMem: mark the final user message's token span so
+        // the executor selects the decode window by multi-token mean relevance
+        // to the question instead of recency. Computed by render-twice-and-diff
+        // (robust to chat template + BPE): re-render with the final user
+        // message's content emptied; the common-prefix-len + length-delta then
+        // brackets exactly the question content tokens (role markers / assistant
+        // suffix fall in the shared prefix/suffix). Only when the server was
+        // launched with --kvmem-query-conditioned; otherwise the span stays empty
+        // and selection is byte-identical to the single-token / recency path.
+        if (engine.kvmem_query_conditioned) {
+            const json &msgs = req["messages"];
+            const size_t lqi = last_query_index_for_template(msgs);
+            if (lqi < msgs.size() && msgs[lqi].is_object() &&
+                msgs[lqi].value("role", "") == "user") {
+                json msgs_empty = msgs;
+                msgs_empty[lqi]["content"] = "";
+                const std::string empty_prompt = render_messages(
+                    msgs_empty, tools, enable_thinking, forced_tool_name);
+                const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
+                const std::vector<int32_t> tok_empty =
+                    usage_tokenizer.encode(empty_prompt);
+                if (tok_full.size() > tok_empty.size()) {
+                    size_t qb = 0;
+                    const size_t maxn = tok_empty.size();
+                    while (qb < maxn && tok_full[qb] == tok_empty[qb]) ++qb;
+                    const size_t qe = qb + (tok_full.size() - tok_empty.size());
+                    g.kvmem_query_begin = static_cast<uint32_t>(qb);
+                    g.kvmem_query_end = static_cast<uint32_t>(qe);
+                    std::cerr << "[qw3-serve] kvmem query span [" << qb << ","
+                              << qe << ") of " << tok_full.size()
+                              << " prompt tokens\n";
+                    if (std::getenv("QW3_KVMEM_TRACE")) {
+                        const std::vector<int32_t> slice(
+                            tok_full.begin() + static_cast<long>(qb),
+                            tok_full.begin() + static_cast<long>(qe));
+                        std::string txt = usage_tokenizer.decode(slice);
+                        if (txt.size() > 200) txt = txt.substr(0, 200) + "...";
+                        std::cerr << "[qw3-serve] kvmem query span text: \""
+                                  << txt << "\"\n";
+                    }
+                }
+            }
+        }
         g.continuous_batching =
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);

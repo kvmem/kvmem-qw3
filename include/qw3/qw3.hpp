@@ -66,6 +66,11 @@ struct EngineOptions {
     std::string kvmem_select_policy = "topk"; // topk or quota
     std::string kvmem_retrieval_method = "mean_attention";
     std::string kvmem_update_mode = "interval"; // interval or step
+    // When true, the serve layer marks the final user message's token span as
+    // the "question" and the executor scores blocks by the multi-token mean
+    // (mean over question tokens) instead of recency. Default OFF -> behavior is
+    // byte-identical to the recency/single-token retrieval path.
+    bool kvmem_query_conditioned = false;
     int kvmem_retrieval_blocks = 0; // 0 = derive from remaining budget
     int kvmem_profile_blocks = 0;   // 0 = derive from remaining budget
     double kvmem_gpu_memory_ratio = 0.50;
@@ -99,6 +104,12 @@ struct GenerationOptions {
     // Whether the prompt already opened a <think> block (enable_thinking). The
     // budget counter only runs while a think block is open.
     bool thinking_open = false;
+    // Query-conditioned KVMem: half-open token span [begin,end) of the prompt
+    // that is the user's question. The executor captures these query rows during
+    // prefill and uses them for multi-token block selection. begin==end (default)
+    // means no span -> the recency/single-token path runs unchanged.
+    uint32_t kvmem_query_begin = 0;
+    uint32_t kvmem_query_end = 0;
 };
 
 struct ModelInfo {

@@ -185,12 +185,17 @@ public:
     // compute_logits is true, the LM-head logits + argmax correspond to the
     // LAST token in the batch. Chunked prefill can set compute_logits=false
     // for intermediate chunks because only the final prompt token seeds decode.
+    // When `row_logits_host` is non-null (verify path only, i.e. row_argmaxes
+    // set), each row's full fp32 LM-head logits are copied to host alongside
+    // the per-row argmaxes. Used by the MTP speculative-sampling accept test,
+    // which needs the target distribution per row (not just its argmax).
     NativeExecutorReport forward_n_tokens(const std::vector<uint32_t> &tokens,
                                           bool compute_logits = true,
                                           std::vector<DeviceArgmax> *row_argmaxes = nullptr,
                                           StateCheckpointSet *state_checkpoints = nullptr,
                                           uint32_t state_checkpoint_count = 0,
-                                          bool copy_last_logits = true);
+                                          bool copy_last_logits = true,
+                                          std::vector<std::vector<float>> *row_logits_host = nullptr);
 
     // Diagnostic single-step MTP draft head. Uses the current target
     // pre-output hidden state (`h_`) plus `token_id` and writes MTP logits to
@@ -264,6 +269,10 @@ public:
     // re-RoPE. Set once at session start from the CLI flag.
     void set_kvmem_enabled(bool on) { kvmem_enabled_ = on; }
     bool kvmem_enabled() const { return kvmem_enabled_; }
+    // Mark the final user message's token span [begin,end) for query-conditioned
+    // multi-token selection. Called by the backend BEFORE prefill. begin==end -> no
+    // span -> byte-identical single-token/recency path. (Public: backend-invoked.)
+    void kvmem_set_query_span(uint32_t begin, uint32_t end);   // before prefill
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
     // it per executor. Set before configure_kvmem(); the pool must outlive this
     // executor. No-op effect when kvmem or the CPU tier is off.
@@ -730,6 +739,27 @@ private:
     std::unique_ptr<DeviceTensor> g_query_content_;    // [n_heads, head_dim] fp32 (content frame)
     std::unique_ptr<DeviceTensor> g_orig_base_dev_;    // [blocks] int32
     std::unique_ptr<DeviceTensor> g_blk_tokens_dev_;   // [blocks] int32
+
+    // ---- Query-conditioned multi-token selection (#77-#82) -----------------
+    // When the serve layer marks the final user message's token span [qb,qe),
+    // the executor captures the de-RoPE'd (content-frame) query rows for those
+    // tokens DURING prefill at bs_score_layer_ (kvmem_capture_query_multi), then
+    // at the prefill->decode boundary scores every block by the mean over the M
+    // question tokens (rewards broadly-relevant blocks) instead of the single
+    // last-token query. Default OFF (span empty) -> the single-token retrieval /
+    // recency path is byte-identical.
+    void kvmem_capture_query_multi(uint32_t chunk_off, uint32_t batch,
+                                   uint32_t base_pos, uint32_t q_token_stride);
+    bool kvmem_retrieval_score_multitoken();                   // boundary, multi-token
+    uint32_t kvmem_query_begin_ = 0;
+    uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
+    uint32_t kvmem_query_base_pos_ = 0;                        // position() at span-set; anchors
+                                                               // prompt-token indices vs the
+                                                               // possibly-chunked prefill calls
+    uint32_t g_query_multi_count_ = 0;                         // rows captured so far
+    uint32_t g_query_multi_capacity_ = 0;                      // allocated rows (cap)
+    bool g_query_multi_ready_ = false;                         // all span rows captured
+    std::unique_ptr<DeviceTensor> g_query_multi_;              // [M, n_heads, head_dim] fp32
 
     // ---- KVMem attention-distribution diagnostics -------------------------
     // Enabled only when QW3_KVMEM_ATTN_TRACE points at a JSONL output path.

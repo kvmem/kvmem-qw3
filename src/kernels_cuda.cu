@@ -315,6 +315,11 @@ bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
 bool launch_derope_query(float *q_content, const float *q, uint32_t q_stride,
                          uint32_t n_heads, uint32_t head_dim, uint32_t rope_dim,
                          int32_t query_pos, float theta, cudaStream_t stream);
+bool launch_derope_query_multi(float *q_multi, const float *q,
+                               uint32_t q_token_stride, uint32_t q_head_stride,
+                               uint32_t cnt, uint32_t n_heads, uint32_t head_dim,
+                               uint32_t rope_dim, int32_t start_pos, float theta,
+                               cudaStream_t stream);
 }
 
 #if QW3_ENABLE_FLASHINFER
@@ -3102,6 +3107,52 @@ __global__ void derope_query_kernel(float *q_content,
         deroped = row[d];
     }
     q_content[static_cast<uint64_t>(qh) * head_dim + d] = deroped;
+}
+
+// derope_query_multi_kernel: batched variant of derope_query_kernel. De-RoPEs a
+// contiguous run of `cnt` query tokens (the in-span question tokens captured
+// during prefill) into a packed content-frame buffer [cnt, n_heads, head_dim].
+// Input `q` points at the FIRST in-span token row; token r lives at
+// q + r*q_token_stride, head qh at + qh*q_head_stride (attn-Q is the first
+// head_dim of each 2*head_dim unit). Token r is RoPE-baked at start_pos+r.
+// grid = (n_heads, cnt), block = head_dim threads.
+__global__ void derope_query_multi_kernel(float *q_multi,
+                                          const float *q,
+                                          uint32_t q_token_stride,
+                                          uint32_t q_head_stride,
+                                          uint32_t n_heads,
+                                          uint32_t head_dim,
+                                          uint32_t rope_dim,
+                                          int32_t start_pos,
+                                          float theta) {
+    const uint32_t r = blockIdx.y;
+    const uint32_t qh = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    if (d >= head_dim) return;
+    const float *row = q + static_cast<uint64_t>(r) * q_token_stride +
+                       static_cast<uint64_t>(qh) * q_head_stride;
+    const int32_t query_pos = start_pos + static_cast<int32_t>(r);
+    const uint32_t half = rope_dim / 2;
+    float deroped;
+    if (d < half) {
+        const float inv_freq = __powf(theta, -2.0f * static_cast<float>(d) /
+                                              static_cast<float>(rope_dim));
+        const float ang = static_cast<float>(query_pos) * inv_freq;
+        float s, c;
+        __sincosf(ang, &s, &c);
+        deroped = row[d] * c + row[d + half] * s;
+    } else if (d < rope_dim) {
+        const uint32_t i = d - half;
+        const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) /
+                                              static_cast<float>(rope_dim));
+        const float ang = static_cast<float>(query_pos) * inv_freq;
+        float s, c;
+        __sincosf(ang, &s, &c);
+        deroped = -row[d - half] * s + row[d] * c;
+    } else {
+        deroped = row[d];
+    }
+    q_multi[(static_cast<uint64_t>(r) * n_heads + qh) * head_dim + d] = deroped;
 }
 
 __global__ void kv_append_kernel(float *cache,
@@ -6237,6 +6288,30 @@ public:
         return launch_status("cuda derope_query_device");
     }
 
+    DeviceStatus derope_query_multi_device(DeviceTensor &q_multi,
+                                           const DeviceTensor &q,
+                                           uint64_t q_elem_offset,
+                                           uint64_t out_elem_offset,
+                                           uint32_t q_token_stride,
+                                           uint32_t q_head_stride,
+                                           uint32_t cnt,
+                                           uint32_t n_heads,
+                                           uint32_t head_dim,
+                                           uint32_t rope_dim,
+                                           int32_t start_pos,
+                                           float theta) override {
+        if (cnt == 0 || n_heads == 0 || head_dim == 0) return {};
+        auto &qm = as_tensor(q_multi);
+        const auto &qt = as_tensor(q);
+        if (!ported::launch_derope_query_multi(
+                qm.ptr + out_elem_offset, qt.ptr + q_elem_offset,
+                q_token_stride, q_head_stride, cnt, n_heads, head_dim, rope_dim,
+                start_pos, theta, exec_stream_)) {
+            return {false, "derope_query_multi launch failed"};
+        }
+        return launch_status("cuda derope_query_multi_device");
+    }
+
     DeviceStatus kv_append_batch_paged_ragged_device(
                                               DeviceTensor &cache,
                                               const DeviceTensor &src,
@@ -8893,6 +8968,19 @@ bool launch_derope_query(float *q_content, const float *q, uint32_t q_stride,
     if (n_heads == 0 || head_dim == 0) return true;
     derope_query_kernel<<<n_heads, head_dim, 0, stream>>>(
         q_content, q, q_stride, head_dim, rope_dim, query_pos, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_derope_query_multi(float *q_multi, const float *q,
+                               uint32_t q_token_stride, uint32_t q_head_stride,
+                               uint32_t cnt, uint32_t n_heads, uint32_t head_dim,
+                               uint32_t rope_dim, int32_t start_pos, float theta,
+                               cudaStream_t stream) {
+    if (cnt == 0 || n_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_heads, cnt);
+    derope_query_multi_kernel<<<grid, head_dim, 0, stream>>>(
+        q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim, rope_dim,
+        start_pos, theta);
     return cudaGetLastError() == cudaSuccess;
 }
 } // namespace ported

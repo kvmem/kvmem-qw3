@@ -106,6 +106,9 @@ void usage(std::ostream &os) {
         "  --kvmem-retrieval-method M  Retrieval scorer: mean_attention|content_mean.\n"
         "                        Default: mean_attention.\n"
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
+        "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
+        "                        final user message (the question) instead of recency.\n"
+        "                        Requires the serve layer to mark the query span.\n"
         "  --kvmem-retrieval-blocks N  Quota policy retrieval blocks (0 = derive).\n"
         "  --kvmem-profile-blocks N    Quota policy profile blocks (0 = derive).\n"
         "  --kvmem-gpu-memory-ratio F  GPU memory fraction for KVMem KV cap.\n"
@@ -387,6 +390,8 @@ int main(int argc, char **argv) {
                     throw std::runtime_error(
                         "--kvmem-update-mode must be interval|step");
                 }
+            } else if (arg == "--kvmem-query-conditioned") {
+                engine.kvmem_query_conditioned = true;
             } else if (arg == "--kvmem-retrieval-blocks") {
                 engine.kvmem_retrieval_blocks = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-profile-blocks") {

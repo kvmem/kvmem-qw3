@@ -880,6 +880,30 @@ public:
         return {false, "derope_query_device requires backend override"};
     }
 
+    // derope_query_multi_device: batched de-RoPE of `cnt` contiguous query tokens
+    // (the in-span question tokens captured during prefill) into a packed
+    // content-frame buffer [cnt, n_heads, head_dim] at out_elem_offset. Input `q`
+    // is read from q_elem_offset; token r at q_token_stride*r, head qh at
+    // +q_head_stride (attn-Q the first head_dim of each unit), baked at start_pos+r.
+    // Same de-rotate math (SAME __sincosf) as derope_query_device.
+    virtual DeviceStatus derope_query_multi_device(DeviceTensor &q_multi,
+                                                   const DeviceTensor &q,
+                                                   uint64_t q_elem_offset,
+                                                   uint64_t out_elem_offset,
+                                                   uint32_t q_token_stride,
+                                                   uint32_t q_head_stride,
+                                                   uint32_t cnt,
+                                                   uint32_t n_heads,
+                                                   uint32_t head_dim,
+                                                   uint32_t rope_dim,
+                                                   int32_t start_pos,
+                                                   float theta) {
+        (void)q_multi; (void)q; (void)q_elem_offset; (void)out_elem_offset;
+        (void)q_token_stride; (void)q_head_stride; (void)cnt; (void)n_heads;
+        (void)head_dim; (void)rope_dim; (void)start_pos; (void)theta;
+        return {false, "derope_query_multi_device requires backend override"};
+    }
+
     // Cross-request paged KV append. src layout is [batch, src_stride], each
     // row b writes to logical_positions[b] through the page-table slice
     // page_indices[page_indptr[b]..page_indptr[b+1]).
