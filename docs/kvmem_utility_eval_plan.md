@@ -220,3 +220,48 @@ All new, pure Python; the only qw3 touchpoint is the HTTP API.
   currently restricts edits to this plan file).
 - Out of scope (deferred, user said "later"): 8-bit kvmem, async NVMe stage-out, prefill-throughput
   work.
+
+## Results — selection-signal A/B (multi-session bucket, budget=32, temp=0.6)
+
+The accuracy bottleneck is **retrieval selection**, not the post-retrieval machinery: a budget=ALL
+diagnostic (all ~110 blocks resident) scores 14/17 = 82.4% on the worst (multi-session) bucket — i.e.
+when nothing is cut, accuracy ≈ Full Context. So the open lever is the ranking *signal*. Same-build
+A/B on the 17 multi-session indices:
+
+| Selection signal | Correct | Accuracy |
+|---|---|---|
+| Mean key (`content_mean`, default) — `q·k̄` | 2/17 | 11.8% |
+| Raw-key ColBERT **MaxSim** (`QW3_KVMEM_QC_MAXSIM=1`) | 6/17 | **35.3%** |
+| *(ceiling)* budget=all diagnostic | 14/17 | 82.4% |
+| *(ceiling)* Full Context | — | ~81% |
+
+MaxSim replaces the per-block mean key (`q·mean(keys) ≡ mean_t(q·k)`, which dilutes one
+answer-bearing token among ~1024) with a per-(query-token, head) **max** over the block's raw
+de-RoPE'd tokens, so a needle token spikes the block score. Default-OFF / byte-identical when unset;
+the ~7.4 GB raw-key capture buffer is allocated only when the flag is on. The mean and MaxSim arms
+succeed on **disjoint** samples → the signals are complementary.
+
+**ExactMass (AgentKV port, built):** `QW3_KVMEM_QC_EXACTMASS` softmaxes the per-token logit
+`scale·(q·k_raw)` over ALL key tokens (one global denominator) then sums each block's mass — a needle
+token's softmax mass survives and blocks compete globally. Reuses the raw-key + query buffers (new
+scoring kernel + scorer, no new capture). Default-OFF / byte-identical when unset.
+
+| Selection signal | Correct | Accuracy |
+|---|---|---|
+| Mean key (`content_mean`, default) | 2/17 | 11.8% |
+| Raw-key MaxSim (`QW3_KVMEM_QC_MAXSIM`) | 6/17 | 35.3% |
+| Raw-key **ExactMass per-head** (`QW3_KVMEM_QC_EXACTMASS`) | 8/17 | **47.1%** |
+| ExactMass strict-AgentKV group-mean (`QW3_KVMEM_QC_EXACTMASS_STRICT`) | 4/17 | 23.5% |
+| ExactMass + context-free query (`QW3_KVMEM_QC_QUERY_CONTEXTFREE`) | 3/17 | 17.6% |
+
+Per-head ExactMass is the best standalone scorer. Two AgentKV-faithful variants are **net-negative**:
+the group-mean head reduction (average the 6 query heads per KV group before the softmax) and the
+context-free query (prefill the question alone, no history). Both regress for the same reason — qw3
+**reuses** the contextualized KV cache (it never re-prefills the question after selection, the KVMem
+premise), so its keys are contextualized and all-heads; forcing only the *query* toward AgentKV's
+isolated/averaged frame is a representation mismatch that drops selective signal. The context-free
+wins are a strict subset of the contextualized ones (0 new, 5 lost).
+
+**Next lever (planned, not yet built):** **MeanK↔ExactMass rank fusion** (`alpha=0.70`, AgentKV's
+reported best). ExactMass(8) ∪ MaxSim(6) oracle union = 11/17, so the complementary signals leave
+headroom. Reuses the existing buffers — host-side rank fusion of the two scorers. Held pending green-light.

@@ -277,6 +277,15 @@ public:
     // K chunk is captured. (Public: backend-invoked.)
     void kvmem_set_query_span(uint32_t begin, uint32_t end,
                               uint32_t prompt_tokens);          // before prefill
+    // Context-free query embedding (AgentKV run_segment isolation, opt-in via
+    // QW3_KVMEM_QC_QUERY_CONTEXTFREE). Call right AFTER kvmem_set_query_span and
+    // BEFORE the main prefill (KV empty, position 0): runs an isolated forward over
+    // the question tokens alone (no history) to capture a context-free retrieval Q,
+    // then rolls the executor back so the full prefill rebuilds the real KV cache.
+    // No-op (returns false) when the flag is off — byte-identical. (Public:
+    // backend-invoked.)
+    bool kvmem_capture_query_contextfree(const std::vector<uint32_t> &question_tokens);
+    bool kvmem_query_contextfree_enabled() const { return kvmem_qc_query_contextfree_; }
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
     // it per executor. Set before configure_kvmem(); the pool must outlive this
     // executor. No-op effect when kvmem or the CPU tier is off.
@@ -785,6 +794,45 @@ private:
     bool kvmem_qc_single_layer_ = false;                       // env: force L=1 old path
     bool kvmem_qc_softmax_ = false;                            // env: softmax-over-pages scorer
     bool kvmem_no_rerope_ = false;                             // env: skip re-RoPE collapse (true-pos test)
+
+    // ---- Raw-key ColBERT MaxSim selection (#104) ---------------------------
+    // The mean-k scorers above collapse a block's ~1024 tokens to one mean key,
+    // so q·k̄ ≡ mean_t(q·k) DILUTES a single answer-bearing token. QW3_KVMEM_QC_MAXSIM
+    // (default OFF, byte-identical when unset) instead keeps the RAW per-token
+    // de-RoPE'd keys (captured into g_kraw_multi_ during prefill, like the mean) and
+    // scores each block by a per-(query token, head) MAX over its tokens — a needle
+    // token spikes the block score instead of being averaged away. Only allocated /
+    // run when the flag is set; the ~7.4 GB fp32 buffer is the cost (efficiency
+    // deferred, utility test first). Respects QW3_KVMEM_QC_LAYERS for cheap L=1 runs.
+    bool kvmem_retrieval_score_maxsim();                       // boundary, raw-key MaxSim
+    bool kvmem_qc_maxsim_ = false;                             // env: raw-key MaxSim scorer
+    // ---- Raw-key ExactMass selection (AgentKV port) ------------------------
+    // ExactMass softmaxes the per-token logit scale·(q·k_raw) over ALL key tokens
+    // then sums each block's mass (Σexp under a global denominator), so a needle
+    // token's mass survives AND blocks compete globally — distinct from softmax-
+    // over-pages (exp of the diluted per-block mean key). Reuses g_kraw_multi_ +
+    // g_query_multi_ (no new buffer/capture). QW3_KVMEM_QC_EXACTMASS, default OFF.
+    bool kvmem_retrieval_score_exactmass();                    // boundary, raw-key ExactMass
+    bool kvmem_qc_exactmass_ = false;                          // env: raw-key ExactMass scorer
+    bool kvmem_qc_exactmass_strict_ = false;                   // env: strict-AgentKV group-mean query
+    // ---- Context-free query embedding (AgentKV run_segment isolation) -------
+    // AgentKV computes the retrieval query by prefilling the QUESTION ALONE (no
+    // history, causal self-attention only) so the query embedding is not pulled
+    // toward the history by full-prompt cross-attention. qw3's default capture
+    // grabs the CONTEXTUALIZED question Q during the full prefill. When this flag
+    // is set, after set_query_span (KV empty, pos 0) we run an isolated forward
+    // over just the question token ids, capture the context-free de-RoPE'd Q into
+    // g_query_multi_, then roll the executor back to a clean pre-prefill state so
+    // the main prefill rebuilds the real KV cache. Retrieval-only: g_query_multi_
+    // feeds ONLY the block scorer; generation still uses the question's KV in the
+    // re-RoPE'd window (qw3 never re-prefills the question post-selection).
+    // QW3_KVMEM_QC_QUERY_CONTEXTFREE, default OFF, byte-identical when unset. The
+    // capture method is public (backend-invoked, declared near kvmem_set_query_span).
+    bool kvmem_qc_query_contextfree_ = false;                  // env: context-free query embed
+    bool kvmem_capture_query_only_ = false;                    // transient: suppress kbar/kraw in isolated pass
+    uint32_t kvmem_qc_total_tokens_ = 0;                       // total prompt tokens (kraw stride)
+    std::unique_ptr<DeviceTensor> g_kraw_multi_;              // [L, total_tokens, n_kv_heads, head_dim] fp32
+    bool g_kraw_multi_ready_ = false;                          // g_kraw_multi_ holds raw keys
     int32_t kvmem_qc_layer_cap_ = -1;                          // env: cap L (-1 = all std layers)
     uint32_t kvmem_qc_num_layers_ = 0;                         // L (resolved std-layer count)
     uint32_t kvmem_query_span_ = 0;                            // S (span length, == capacity)

@@ -1908,9 +1908,14 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                     // Build the full-coverage per-layer content index incrementally
                     // (#91): index EVERY block of this chunk from the freshly-RoPE'd
                     // K (de-RoPE'd at rope_base_pos == the bake position), not just
-                    // the in-span question rows.
-                    kvmem_capture_kbar_multi(static_cast<uint32_t>(slot), batch,
-                                             base_pos, rope_base_pos, k_stride_buf);
+                    // the in-span question rows. Suppressed during the context-free
+                    // query pass (isolated question-only forward), whose K is NOT the
+                    // real history — the content index/raw-keys are built only by the
+                    // subsequent full prefill.
+                    if (!kvmem_capture_query_only_) {
+                        kvmem_capture_kbar_multi(static_cast<uint32_t>(slot), batch,
+                                                 base_pos, rope_base_pos, k_stride_buf);
+                    }
                 }
             }
 
@@ -3585,7 +3590,15 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             // (3) single last-token content scorer.
             if (kvmem_query_end_ > kvmem_query_begin_ && g_query_multi_ready_) {
                 bool scored = false;
-                if (!kvmem_qc_single_layer_ && g_kbar_multi_ready_) {
+                // (-1) raw-key ExactMass over per-token keys (AgentKV port,
+                // QW3_KVMEM_QC_EXACTMASS) — global per-token softmax mass per block.
+                // Falls through if the raw buffer isn't live / shmem cap exceeded.
+                if (kvmem_qc_exactmass_) scored = kvmem_retrieval_score_exactmass();
+                // (0) raw-key ColBERT MaxSim over per-token keys (#104,
+                // QW3_KVMEM_QC_MAXSIM) — replaces the diluting mean with a per-token
+                // MAX. Falls through to the mean scorers if the raw buffer isn't live.
+                if (!scored && kvmem_qc_maxsim_) scored = kvmem_retrieval_score_maxsim();
+                if (!scored && !kvmem_qc_single_layer_ && g_kbar_multi_ready_) {
                     scored = kvmem_retrieval_score_multilayer();
                 }
                 if (!scored) scored = kvmem_retrieval_score_multitoken();
@@ -4256,6 +4269,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     g_kbar_multi_blocks_ = 0;
     kvmem_qc_total_blocks_ = 0;
     kvmem_qc_captured_blocks_ = 0;
+    g_kraw_multi_ready_ = false;
+    kvmem_qc_total_tokens_ = 0;
     if (end <= begin) return;
     const QwenConfig &cfg = model_.config();
     // Resolve the normal-attention layer set (pins bs_score_layer_ as a side
@@ -4303,6 +4318,26 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
         g_kbar_multi_ = backend_.tensor_f32(per_layer * L, "g_kbar_multi");
     }
     require_status(backend_.zero_tensor(*g_kbar_multi_));
+    // Raw-key MaxSim (#104) / ExactMass (AgentKV port): keep the full per-token
+    // de-RoPE'd K (no mean) so the scorer can MAX / softmax over a block's tokens.
+    // Layout [L, total_tokens, n_kv_heads, head_dim] fp32 — at max history (~113K
+    // tok × 16 layers) this is ~7.4 GB, so it is allocated ONLY when a raw-key
+    // scorer flag is set (default paths pay zero).
+    if (kvmem_qc_maxsim_ || kvmem_qc_exactmass_) {
+        kvmem_qc_total_tokens_ = prompt_tokens;
+        const uint64_t kraw_per_layer =
+            static_cast<uint64_t>(prompt_tokens) * n_kv_heads * head_dim;
+        const uint64_t kraw_total = kraw_per_layer * L;
+        if (!g_kraw_multi_ || g_kraw_multi_->count < kraw_total) {
+            g_kraw_multi_ = backend_.tensor_f32(kraw_total, "g_kraw_multi");
+        }
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(stderr,
+                "[bs-maxsim] alloc g_kraw_multi: L=%u total_tokens=%u -> %.2f GiB\n",
+                L, prompt_tokens,
+                static_cast<double>(kraw_total) * sizeof(float) / (1024.0*1024.0*1024.0));
+        }
+    }
     // Single-layer index buffer (g_kbar_) + the per-block score buffer
     // (g_score_dev_, sized by g_kbar_global_capacity_) + the content query slot
     // (g_query_content_) back the single-layer multitoken fallback and the
@@ -4339,6 +4374,18 @@ void QwenExecutor::kvmem_resolve_std_layers() {
     kvmem_qc_single_layer_ = env_flag_enabled("QW3_KVMEM_QC_SINGLE_LAYER");
     kvmem_qc_softmax_ = env_flag_enabled("QW3_KVMEM_QC_SOFTMAX");
     kvmem_no_rerope_ = env_flag_enabled("QW3_KVMEM_NO_REROPE");
+    kvmem_qc_maxsim_ = env_flag_enabled("QW3_KVMEM_QC_MAXSIM");
+    // Strict-AgentKV (QW3_KVMEM_QC_EXACTMASS_STRICT) averages each KV group's query
+    // heads BEFORE the softmax (4 effective heads), matching _full_layer_qk. It
+    // implies ExactMass (same raw-key buffer + scorer); the scorer branches on the
+    // strict flag to pick the group_mean kernel mode.
+    kvmem_qc_exactmass_strict_ = env_flag_enabled("QW3_KVMEM_QC_EXACTMASS_STRICT");
+    kvmem_qc_exactmass_ =
+        env_flag_enabled("QW3_KVMEM_QC_EXACTMASS") || kvmem_qc_exactmass_strict_;
+    // Context-free query embedding (AgentKV run_segment isolation): orthogonal to
+    // the scorer choice — applies to whichever scorer consumes g_query_multi_.
+    kvmem_qc_query_contextfree_ =
+        env_flag_enabled("QW3_KVMEM_QC_QUERY_CONTEXTFREE");
     kvmem_qc_layer_cap_ = -1;
     if (const char *cap = std::getenv("QW3_KVMEM_QC_LAYERS")) {
         const int v = std::atoi(cap);
@@ -4427,6 +4474,79 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
     }
 }
 
+// Context-free query embedding (AgentKV run_segment isolation). Called right after
+// kvmem_set_query_span and BEFORE the main prefill, when the KV cache is empty and
+// position_ == 0. Runs an isolated forward over the question token ids ALONE
+// (causal self-attention, no history) and captures the context-free de-RoPE'd Q
+// into g_query_multi_, then rolls the executor back to the clean pre-prefill state
+// so the subsequent full prefill rebuilds the real KV cache + content index. The
+// captured Q is RETRIEVAL-ONLY (g_query_multi_ feeds only the block scorer);
+// generation still uses the question's KV in the re-RoPE'd window. Returns true on
+// success, leaving g_query_multi_ready_ true so the main prefill skips its own
+// contextualized query capture. No-op (false) when the flag is off — byte-identical.
+bool QwenExecutor::kvmem_capture_query_contextfree(
+        const std::vector<uint32_t> &question_tokens) {
+    if (!kvmem_qc_query_contextfree_) return false;
+    if (question_tokens.empty()) return false;
+    if (kvmem_query_end_ <= kvmem_query_begin_) return false;
+    if (!g_query_multi_) return false;
+    // Only safe from a clean pre-prefill state: the isolated forward writes KV at
+    // positions [0,M) and we roll position_ back to 0, which only restores the cache
+    // if it was empty to begin with. A non-zero position means a continuation whose
+    // first M cache slots hold real history — skip (fall back to contextualized
+    // capture) rather than corrupt it.
+    if (position_ != 0) return false;
+    // Save the real span anchoring (the isolated pass re-anchors to [0,M) at base 0)
+    // and clamp the isolated row count to S (== g_query_multi_ per-layer stride,
+    // fixed by set_query_span; matches its first-kCap-tokens clamp).
+    const uint32_t saved_qb = kvmem_query_begin_;
+    const uint32_t saved_qe = kvmem_query_end_;
+    const uint32_t saved_base = kvmem_query_base_pos_;
+    const uint32_t S = kvmem_query_span_;
+    uint32_t M = static_cast<uint32_t>(question_tokens.size());
+    if (S > 0 && M > S) M = S;
+    std::vector<uint32_t> qtoks(question_tokens.begin(),
+                                question_tokens.begin() + M);
+    // Re-anchor to the isolated positions [0, M) (base 0 == positions 0..M-1) so
+    // kvmem_capture_query_multi maps every isolated row in-span and de-RoPEs at the
+    // isolated position (returning Q to the same position-0 content frame as the
+    // contextualized path). Suppress the content-index / raw-key capture — the
+    // isolated K is the context-free question, NOT the real history.
+    kvmem_query_begin_ = 0;
+    kvmem_query_end_ = M;
+    kvmem_query_base_pos_ = 0;
+    g_query_multi_count_ = 0;
+    g_query_multi_ready_ = false;
+    kvmem_capture_query_only_ = true;
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+            "[bs-qcfree] isolated question-only prefill: M=%u rows (S=%u)\n", M, S);
+    }
+    NativeExecutorReport rep = forward_n_tokens(qtoks);
+    kvmem_capture_query_only_ = false;
+    // Roll back to the clean pre-prefill state the main prefill expects: position 0,
+    // empty KV pages, zeroed recurrent/conv (DeltaNet) states. Preserve the kvmem
+    // span buffers + freshly-captured g_query_multi_ (ready stays true).
+    position_ = 0;
+    kv_pages_.reset();
+    for (auto &s : recurrent_states_) { if (s) (void)backend_.zero_tensor(*s); }
+    for (auto &s : conv_states_) { if (s) (void)backend_.zero_tensor(*s); }
+    decode_graph_warmup_pending_ = true;
+    // Restore the real span anchoring for the main prefill (its kbar/kraw capture
+    // only checks the span is non-empty; the query capture stays gated by ready).
+    kvmem_query_begin_ = saved_qb;
+    kvmem_query_end_ = saved_qe;
+    kvmem_query_base_pos_ = saved_base;
+    if (!rep.ok || !g_query_multi_ready_) {
+        // Isolated pass failed / under-filled: drop back to the contextualized
+        // capture (still correct, just not context-free).
+        g_query_multi_ready_ = false;
+        g_query_multi_count_ = 0;
+        return false;
+    }
+    return true;
+}
+
 // During prefill at every normal-attention layer: build the per-layer content
 // mean-key for the chunk's blocks directly from the freshly-RoPE'd K batch (#91).
 // Unlike kvmem_capture_query_multi (which captures only the in-span QUESTION rows)
@@ -4468,6 +4588,22 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
         k_token_stride, batch, bt, n_kv_heads, head_dim, cfg.rope_dim,
         static_cast<int32_t>(rope_base_pos), cfg.rope_theta);
     if (!st.ok) return;
+    // Raw-key MaxSim (#104): in ADDITION to the mean, store each chunk row's
+    // de-RoPE'd K into g_kraw_multi_ so the scorer can MAX over a block's tokens.
+    // Chunk row r is global token (base_pos + r); store [base_pos, base_pos+rows)
+    // capped at total_tokens. out_base_elem indexes (slot, base_pos) in fp32 elems.
+    if ((kvmem_qc_maxsim_ || kvmem_qc_exactmass_) && g_kraw_multi_ &&
+        kvmem_qc_total_tokens_ > 0 && base_pos < kvmem_qc_total_tokens_) {
+        const uint32_t store_rows =
+            std::min(batch, kvmem_qc_total_tokens_ - base_pos);
+        const uint64_t out_base_elem =
+            (static_cast<uint64_t>(slot) * kvmem_qc_total_tokens_ + base_pos) *
+            n_kv_heads * head_dim;
+        (void)backend_.derope_store_content_batch_device(
+            *k_batch_, *g_kraw_multi_, out_base_elem, k_token_stride, store_rows,
+            n_kv_heads, head_dim, cfg.rope_dim,
+            static_cast<int32_t>(rope_base_pos), cfg.rope_theta);
+    }
     // Advance the captured-block count ONCE per chunk (after the last slot writes
     // its slice) — every normal layer sees the same chunk in one forward pass, so
     // progress is identical across the L slots.
@@ -4490,6 +4626,9 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     if (!kvmem_qc_single_layer_) {
         g_kbar_multi_ready_ = true;
         g_kbar_multi_blocks_ = kvmem_qc_total_blocks_;
+    }
+    if ((kvmem_qc_maxsim_ || kvmem_qc_exactmass_) && g_kraw_multi_) {
+        g_kraw_multi_ready_ = true;
     }
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
@@ -4688,6 +4827,198 @@ bool QwenExecutor::kvmem_retrieval_score_multilayer() {
                      "[bs-multilayer] query-conditioned multi-layer mean: "
                      "L=%u M=%u tokens scored %u blocks\n",
                      L, M, nb);
+    }
+    return true;
+}
+
+// Raw-key ColBERT MaxSim scoring at the reselect boundary (#104): instead of the
+// per-block MEAN key (q·k̄ ≡ mean_t(q·k), which dilutes one answer-bearing token
+// among the block's ~1024), score each block by the per-(query token, head) MAX
+// over its RAW per-token de-RoPE'd keys (captured into g_kraw_multi_ during
+// prefill). A needle token then spikes the block score instead of being averaged
+// away. The per-block sum Σ_l Σ_j Σ_qh max_t ReLU(q[l,j,qh]·k_raw[l,first_w+t,kvh])
+// is divided by (L·M) and folded into the block store with the SAME MeanAttention
+// softmax tail as the multilayer scorer — so the ONLY changed variable vs the
+// default is mean→max over tokens. Returns false (caller falls back to the mean
+// multilayer scorer) if the raw-key buffer / query isn't live.
+bool QwenExecutor::kvmem_retrieval_score_maxsim() {
+    if (!kvmem_qc_maxsim_) return false;
+    if (!block_store_) return false;
+    if (!g_kraw_multi_ || !g_kraw_multi_ready_) return false;
+    if (kvmem_qc_total_tokens_ == 0 || kvmem_qc_total_blocks_ == 0) return false;
+    if (!g_query_multi_ || !g_query_multi_ready_ || g_query_multi_count_ == 0)
+        return false;
+    if (!g_score_dev_ || !g_orig_base_dev_ || !g_blk_tokens_dev_) return false;
+    const QwenConfig &cfg = model_.config();
+    const uint32_t L = kvmem_qc_num_layers_;
+    const uint32_t M = g_query_multi_count_;
+    const uint32_t S = kvmem_query_span_;       // per-layer row stride in g_query_multi_
+    const uint32_t nb = kvmem_qc_total_blocks_;
+    const uint32_t total_tokens = kvmem_qc_total_tokens_;
+    if (L == 0 || nb > g_kbar_global_capacity_) return false;  // g_score_dev_ sizing
+    const uint32_t bt =
+        std::max<uint32_t>(block_store_->config().block_tokens, 1u);
+
+    // Per-block token ranges into g_kraw_multi_: block w owns the contiguous tokens
+    // [w*bt, min((w+1)*bt, total_tokens)). Reuse the (QC-path-unused) metadata
+    // device tensors for first-token / token-count.
+    g_orig_base_host_.resize(nb);
+    g_blk_tokens_host_.resize(nb);
+    for (uint32_t w = 0; w < nb; ++w) {
+        const uint32_t first = w * bt;
+        const uint32_t ntok = (first < total_tokens)
+                                  ? std::min(bt, total_tokens - first)
+                                  : 0u;
+        g_orig_base_host_[w] = static_cast<int32_t>(first);
+        g_blk_tokens_host_[w] = static_cast<int32_t>(ntok);
+    }
+    if (auto st = backend_.copy_i32_from_host(*g_orig_base_dev_, 0,
+                                              g_orig_base_host_.data(), nb);
+        !st.ok) {
+        return false;
+    }
+    if (auto st = backend_.copy_i32_from_host(*g_blk_tokens_dev_, 0,
+                                              g_blk_tokens_host_.data(), nb);
+        !st.ok) {
+        return false;
+    }
+    if (auto st = backend_.zero_tensor(*g_score_dev_); !st.ok) return false;
+
+    // Accumulate over the L normal-attention layers (one launch per layer; the
+    // kernel does score[w] += ... so the buffer must start zeroed). q/kraw slot
+    // slices are selected via the element offsets.
+    const uint64_t q_layer_elems =
+        static_cast<uint64_t>(S) * cfg.n_heads * cfg.head_dim;
+    const uint64_t kraw_layer_elems =
+        static_cast<uint64_t>(total_tokens) * cfg.n_kv_heads * cfg.head_dim;
+    for (uint32_t slot = 0; slot < L; ++slot) {
+        if (auto st = backend_.block_attn_score_maxsim_device(
+                *g_score_dev_, *g_query_multi_, *g_kraw_multi_, M, nb,
+                *g_orig_base_dev_, *g_blk_tokens_dev_,
+                cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, /*scale=*/1.0f,
+                /*q_elem_off=*/static_cast<uint64_t>(slot) * q_layer_elems,
+                /*kraw_elem_off=*/static_cast<uint64_t>(slot) * kraw_layer_elems);
+            !st.ok) {
+            return false;  // e.g. shmem cap -> caller falls back to the mean scorer
+        }
+    }
+    std::vector<float> score(nb, 0.0f);
+    if (auto st = backend_.copy_to_host(*g_score_dev_, score.data(), 0, nb);
+        !st.ok) {
+        return false;
+    }
+    // Divide by (L*M) -> per-layer-per-token MEAN regime (matches the multilayer
+    // scorer's MeanAttention softmax temperature). Un-indexed blocks stay 0.0.
+    const double inv_lm = 1.0 / (static_cast<double>(L) * static_cast<double>(M));
+    std::vector<double> best(block_store_->block_count(), 0.0);
+    for (uint32_t id = 0; id < nb && id < best.size(); ++id) {
+        best[id] = static_cast<double>(score[id]) * inv_lm;
+    }
+    if (block_store_->config().retrieval_method ==
+        KvMemRetrievalMethod::MeanAttention) {
+        double max_score = -std::numeric_limits<double>::infinity();
+        for (uint32_t id = 0; id < nb && id < best.size(); ++id) {
+            max_score = std::max(max_score, best[id]);
+        }
+        double denom = 0.0;
+        if (std::isfinite(max_score)) {
+            for (uint32_t id = 0; id < nb && id < best.size(); ++id) {
+                best[id] = std::exp(best[id] - max_score);
+                denom += best[id];
+            }
+        }
+        if (denom > 0.0) {
+            for (uint32_t id = 0; id < nb && id < best.size(); ++id) {
+                best[id] /= denom;
+            }
+        }
+    }
+    block_store_->set_retrieval_scores(best);
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[bs-maxsim] query-conditioned raw-key MaxSim: "
+                     "L=%u M=%u tokens scored %u blocks\n",
+                     L, M, nb);
+    }
+    return true;
+}
+
+// Raw-key ExactMass scoring at the reselect boundary (AgentKV port): instead of
+// either the diluting mean key (q·k̄ ≡ mean_t(q·k)) or MaxSim's single-best token,
+// softmax the per-token logit scale·(q·k_raw) over ALL key tokens and sum each
+// block's attention MASS (Σ_{t∈w} softmax_t). exp is applied to every raw token
+// THEN summed (Σexp under one global denominator), so a needle token's mass
+// survives AND blocks compete globally — the faithful analog of AgentKV's
+// _stream_exact_mass_scores_pagewise (vs the inert softmax-over-pages path, which
+// exps the already-diluted per-block mean). The kernel's softmax IS the block
+// distribution, so there is NO inv_lm divide and NO MeanAttention tail; the masses
+// (mean over L·M·n_heads of each block's softmax mass) are set as the scores
+// directly. Returns false (caller falls back) if the raw-key buffer / query isn't
+// live or the kernel rejects nb (shmem cap).
+bool QwenExecutor::kvmem_retrieval_score_exactmass() {
+    if (!kvmem_qc_exactmass_) return false;
+    if (!block_store_) return false;
+    if (!g_kraw_multi_ || !g_kraw_multi_ready_) return false;
+    if (kvmem_qc_total_tokens_ == 0 || kvmem_qc_total_blocks_ == 0) return false;
+    if (!g_query_multi_ || !g_query_multi_ready_ || g_query_multi_count_ == 0)
+        return false;
+    if (!g_score_dev_) return false;
+    const QwenConfig &cfg = model_.config();
+    const uint32_t L = kvmem_qc_num_layers_;
+    const uint32_t M = g_query_multi_count_;
+    const uint32_t S = kvmem_query_span_;       // per-layer row stride in g_query_multi_
+    const uint32_t nb = kvmem_qc_total_blocks_;
+    const uint32_t total_tokens = kvmem_qc_total_tokens_;
+    if (L == 0 || nb > g_kbar_global_capacity_) return false;  // g_score_dev_ sizing
+    const uint32_t bt =
+        std::max<uint32_t>(block_store_->config().block_tokens, 1u);
+
+    if (auto st = backend_.zero_tensor(*g_score_dev_); !st.ok) return false;
+
+    // scale = 1/sqrt(head_dim) (true softmax temperature). Each CTA emits a softmax
+    // distribution over blocks; head_w averages over the per-(layer, query token,
+    // head) CTAs so the final score is the MEAN attention mass each block receives.
+    // Strict-AgentKV (group_mean) averages each KV group's query heads BEFORE the
+    // softmax, so there are n_kv_heads effective heads, not n_heads.
+    const uint32_t group_mean = kvmem_qc_exactmass_strict_ ? 1u : 0u;
+    const uint32_t eff_heads = group_mean ? cfg.n_kv_heads : cfg.n_heads;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
+    const float head_w =
+        1.0f / (static_cast<float>(L) * static_cast<float>(M) *
+                static_cast<float>(eff_heads));
+    const uint64_t q_layer_elems =
+        static_cast<uint64_t>(S) * cfg.n_heads * cfg.head_dim;
+    const uint64_t kraw_layer_elems =
+        static_cast<uint64_t>(total_tokens) * cfg.n_kv_heads * cfg.head_dim;
+    for (uint32_t slot = 0; slot < L; ++slot) {
+        if (auto st = backend_.block_attn_score_exactmass_device(
+                *g_score_dev_, *g_query_multi_, *g_kraw_multi_, M, total_tokens,
+                nb, bt, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale, head_w,
+                /*q_elem_off=*/static_cast<uint64_t>(slot) * q_layer_elems,
+                /*kraw_elem_off=*/static_cast<uint64_t>(slot) * kraw_layer_elems,
+                /*group_mean=*/group_mean);
+            !st.ok) {
+            return false;  // shmem cap / launch error -> caller falls back
+        }
+    }
+    std::vector<float> score(nb, 0.0f);
+    if (auto st = backend_.copy_to_host(*g_score_dev_, score.data(), 0, nb);
+        !st.ok) {
+        return false;
+    }
+    // The kernel already normalized (softmax mass averaged over L·M·n_heads), so the
+    // scores ARE the block distribution: no inv_lm, no MeanAttention tail.
+    std::vector<double> best(block_store_->block_count(), 0.0);
+    for (uint32_t id = 0; id < nb && id < best.size(); ++id) {
+        best[id] = static_cast<double>(score[id]);
+    }
+    block_store_->set_retrieval_scores(best);
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[bs-exactmass] query-conditioned raw-key ExactMass (%s): "
+                     "L=%u M=%u eff_heads=%u tokens scored %u blocks\n",
+                     group_mean ? "strict-AgentKV group-mean" : "per-head",
+                     L, M, eff_heads, nb);
     }
     return true;
 }

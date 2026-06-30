@@ -895,6 +895,94 @@ public:
         return {false, "block_kmean_content_batch_device requires backend override"};
     }
 
+    // derope_store_content_batch_device (#104, raw-key MaxSim): like
+    // block_kmean_content_batch_device but STORES each de-RoPE'd K row instead of
+    // averaging — fills kraw (fp32 [.., n_kv_heads, head_dim]) so the MaxSim scorer
+    // can take a MAX over a block's per-token keys rather than scoring one diluted
+    // mean key. Same de-rotate math. out_base_elem indexes the (slot, first-global-
+    // token) origin element; row r is de-RoPE'd at (rope_base + r) and written there.
+    virtual DeviceStatus derope_store_content_batch_device(const DeviceTensor &k_batch,
+                                                           DeviceTensor &kraw,
+                                                           uint64_t out_base_elem,
+                                                           uint32_t k_stride,
+                                                           uint32_t batch,
+                                                           uint32_t n_kv_heads,
+                                                           uint32_t head_dim,
+                                                           uint32_t rope_dim,
+                                                           int32_t rope_base,
+                                                           float theta) {
+        (void)k_batch; (void)kraw; (void)out_base_elem; (void)k_stride; (void)batch;
+        (void)n_kv_heads; (void)head_dim; (void)rope_dim; (void)rope_base; (void)theta;
+        return {false, "derope_store_content_batch_device requires backend override"};
+    }
+
+    // block_attn_score_maxsim_device (#104, raw-key ColBERT MaxSim): per normal-
+    // attention layer (one launch, ACCUMULATES into score), for every block w
+    //   score[w] += Σ_{j<M} Σ_{qh<n_heads}
+    //                 max_{t<blk_tokens[w]} ReLU(scale·(q[j,qh] · kraw[first_w+t,kvh])),
+    // kvh = qh/(n_heads/n_kv_heads). Replaces the per-block MEAN key (which dilutes a
+    // single answer-bearing token among the block's ~1024) with a per-(query token,
+    // head) MAX over the block's tokens. q_layer is [M, n_heads, head_dim] fp32;
+    // kraw is [total_tokens, n_kv_heads, head_dim] fp32. q_elem_off / kraw_elem_off
+    // select this layer's slice. blk_first_tok/blk_tokens are int32 [n_blocks].
+    // score is fp32 [n_blocks] (caller zeros once before the L-layer loop). Returns an
+    // error if the per-block running-max shmem exceeds the cap (caller falls back).
+    virtual DeviceStatus block_attn_score_maxsim_device(DeviceTensor &score,
+                                                        const DeviceTensor &q_layer,
+                                                        const DeviceTensor &kraw,
+                                                        uint32_t M,
+                                                        uint32_t n_blocks,
+                                                        const DeviceTensor &blk_first_tok,
+                                                        const DeviceTensor &blk_tokens,
+                                                        uint32_t n_heads,
+                                                        uint32_t n_kv_heads,
+                                                        uint32_t head_dim,
+                                                        float scale,
+                                                        uint64_t q_elem_off = 0,
+                                                        uint64_t kraw_elem_off = 0) {
+        (void)score; (void)q_layer; (void)kraw; (void)M; (void)n_blocks;
+        (void)blk_first_tok; (void)blk_tokens; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale; (void)q_elem_off; (void)kraw_elem_off;
+        return {false, "block_attn_score_maxsim_device requires backend override"};
+    }
+
+    // block_attn_score_exactmass_device (ExactMass, AgentKV port): per normal-
+    // attention layer (one launch, ACCUMULATES into score), for every block w
+    //   score[w] += head_w · Σ_{j<M} Σ_{qh<n_heads}
+    //                 Σ_{t : t/bt==w} softmax_t( scale·(q[j,qh] · kraw[t,kvh]) ),
+    // kvh = qh/(n_heads/n_kv_heads), head_w = 1/(L·M·n_heads). When group_mean=1
+    // (strict AgentKV) the per-CTA query is the MEAN of the KV group's query heads
+    // formed BEFORE the softmax; the caller sets head_w = 1/(L·M·n_kv_heads). Unlike
+    // block_attn_score_softmax_pages_device (softmax over per-block MEAN keys →
+    // exp(mean), needle diluted), the exp here is applied to every RAW token logit
+    // and THEN summed into blocks (Σexp) under one global softmax denominator, so a
+    // needle token's mass survives and blocks compete globally. q_layer is
+    // [M, n_heads, head_dim] fp32; kraw is [total_tokens, n_kv_heads, head_dim] fp32;
+    // q_elem_off / kraw_elem_off select this layer's slice. block_tokens (bt) is the
+    // uniform per-block token span (t/bt is the block id). score is fp32 [n_blocks]
+    // (caller zeros once). Returns an error if the per-block shmem exceeds the cap.
+    virtual DeviceStatus block_attn_score_exactmass_device(DeviceTensor &score,
+                                                           const DeviceTensor &q_layer,
+                                                           const DeviceTensor &kraw,
+                                                           uint32_t M,
+                                                           uint32_t total_tokens,
+                                                           uint32_t n_blocks,
+                                                           uint32_t block_tokens,
+                                                           uint32_t n_heads,
+                                                           uint32_t n_kv_heads,
+                                                           uint32_t head_dim,
+                                                           float scale,
+                                                           float head_w,
+                                                           uint64_t q_elem_off = 0,
+                                                           uint64_t kraw_elem_off = 0,
+                                                           uint32_t group_mean = 0) {
+        (void)score; (void)q_layer; (void)kraw; (void)M; (void)total_tokens;
+        (void)n_blocks; (void)block_tokens; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale; (void)head_w; (void)q_elem_off;
+        (void)kraw_elem_off; (void)group_mean;
+        return {false, "block_attn_score_exactmass_device requires backend override"};
+    }
+
     // block_attn_score_multilayer_device: one-shot fused multi-layer block scorer
     // (#88). For every block w in a SINGLE launch, computes
     //   score[w] = Σ_{l<L} Σ_{j<M} Σ_{qh<n_heads}

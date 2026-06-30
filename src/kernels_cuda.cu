@@ -334,6 +334,28 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint32_t n_kv_heads, uint32_t head_dim,
                                       uint32_t rope_dim, int32_t rope_base,
                                       float theta, cudaStream_t stream);
+// Raw-key MaxSim (#104): store each de-RoPE'd K row (no mean) + ColBERT MaxSim score.
+bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
+                                       uint64_t out_base_elem, uint32_t k_stride,
+                                       uint32_t batch, uint32_t n_kv_heads,
+                                       uint32_t head_dim, uint32_t rope_dim,
+                                       int32_t rope_base, float theta,
+                                       cudaStream_t stream);
+bool launch_block_attn_score_maxsim(float *score, const float *q_layer,
+                                    const float *kraw, uint32_t M,
+                                    uint32_t n_blocks, const int32_t *blk_first_tok,
+                                    const int32_t *blk_tokens, uint32_t n_heads,
+                                    uint32_t n_kv_heads, uint32_t head_dim,
+                                    float scale, cudaStream_t stream);
+// Raw-key ExactMass (AgentKV port): global per-token softmax mass per block.
+bool launch_block_attn_score_exactmass(float *score, const float *q_layer,
+                                       const float *kraw, uint32_t M,
+                                       uint32_t total_tokens, uint32_t n_blocks,
+                                       uint32_t block_tokens, uint32_t n_heads,
+                                       uint32_t n_kv_heads, uint32_t head_dim,
+                                       float scale, float head_w,
+                                       uint32_t group_mean,
+                                       cudaStream_t stream);
 bool launch_derope_query(float *q_content, const float *q, uint32_t q_stride,
                          uint32_t n_heads, uint32_t head_dim, uint32_t rope_dim,
                          int32_t query_pos, float theta, cudaStream_t stream);
@@ -3317,6 +3339,301 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
     const uint64_t blk = kbar_block_base + j;
     kbar[(blk * gridDim.y + h) * head_dim + d] = acc * inv;
+}
+
+// derope_store_content_batch_kernel (MaxSim, raw-key retrieval): like
+// block_kmean_content_batch_kernel but STORES each de-RoPE'd K row instead of
+// averaging — keeps the full per-token content-frame key so the scorer can take a
+// MAX over a block's tokens rather than scoring one diluted mean key. Same
+// de-rotate math (so the content frame matches the query capture and the huge-
+// position range-reduction error cancels). k_batch is the chunk's fp32 [batch,
+// n_kv_heads*head_dim] (row stride k_stride) RoPE-baked at rope_base; row r is
+// de-RoPE'd at (rope_base + r) and written at global token (out_base_elem indexes
+// the (slot,first-global-token) origin) row r, head h. grid = (batch, n_kv_heads),
+// block = head_dim threads. Output layout [.., n_kv_heads, head_dim] fp32.
+__global__ void derope_store_content_batch_kernel(const float *k_batch,
+                                                  float *kraw,
+                                                  uint64_t out_base_elem,
+                                                  uint32_t k_stride,
+                                                  uint32_t batch,
+                                                  uint32_t n_kv_heads,
+                                                  uint32_t head_dim,
+                                                  uint32_t rope_dim,
+                                                  int32_t rope_base,
+                                                  float theta) {
+    const uint32_t r = blockIdx.x;     // chunk-local row
+    const uint32_t h = blockIdx.y;     // kv head
+    const uint32_t d = threadIdx.x;    // dim within head
+    if (d >= head_dim || r >= batch) return;
+    const float *row = k_batch + static_cast<uint64_t>(r) * k_stride +
+                       static_cast<uint64_t>(h) * head_dim;
+    const int32_t pos = rope_base + static_cast<int32_t>(r);
+    const uint32_t half = rope_dim / 2;
+    float deroped;
+    if (d < half) {
+        const float inv_freq = __powf(theta, -2.0f * static_cast<float>(d) /
+                                              static_cast<float>(rope_dim));
+        const float ang = static_cast<float>(pos) * inv_freq;
+        float s, c;
+        __sincosf(ang, &s, &c);
+        deroped = row[d] * c + row[d + half] * s;       // de-rotate dim i
+    } else if (d < rope_dim) {
+        const uint32_t i = d - half;
+        const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) /
+                                              static_cast<float>(rope_dim));
+        const float ang = static_cast<float>(pos) * inv_freq;
+        float s, c;
+        __sincosf(ang, &s, &c);
+        deroped = -row[d - half] * s + row[d] * c;      // de-rotate dim i+half
+    } else {
+        deroped = row[d];                               // beyond rope_dim: untouched
+    }
+    kraw[out_base_elem + (static_cast<uint64_t>(r) * n_kv_heads + h) * head_dim + d] =
+        deroped;
+}
+
+// block_attn_score_maxsim_kernel (MaxSim, raw-key retrieval): ColBERT-style block
+// scorer over the RAW per-token de-RoPE'd keys (one normal-attention layer per
+// launch, ACCUMULATES into score). For block w:
+//   score[w] += Σ_{j<M} Σ_{qh<n_heads}
+//                 max_{t < blk_tokens[w]} ReLU(scale·(q[j,qh] · kraw[first_w+t, kvh])),
+// kvh = qh/group. Replaces the per-block MEAN key (q·mean(k) ≡ mean_t(q·k), which
+// dilutes a single answer-bearing token among the block's ~1024) with a per-(query
+// token, head) MAX over the block's tokens, so a needle token spikes the score.
+// grid = n_blocks, blockDim = 256 (8 warps). Each warp owns query heads qh = wid,
+// wid+nwarps, …; for each owned qh it walks the block's tokens (loads kraw[first+t,
+// kvh] into 8 strided elems/lane), dots each query token j (warp-shuffle reduction
+// over head_dim), ReLU, and keeps a per-query-token running max in dynamic shmem
+// (nwarps*M floats; lane 0 of each warp owns its M maxes). After the token loop
+// lane 0 sums the M maxes into the warp partial; one cross-warp reduction folds the
+// partials and lane 0 of warp 0 adds the total to score[w].
+//   q_layer  [M, n_heads, head_dim]            fp32 (this layer's slice; M valid rows)
+//   kraw     [total_tokens, n_kv_heads, head_dim] fp32 (this layer's slice)
+//   score    [n_blocks]                          fp32 (+=, caller zeros once)
+__global__ void block_attn_score_maxsim_kernel(float *score,
+                                               const float *q_layer,
+                                               const float *kraw,
+                                               uint32_t M,
+                                               uint32_t n_blocks,
+                                               const int32_t *blk_first_tok,
+                                               const int32_t *blk_tokens,
+                                               uint32_t n_heads,
+                                               uint32_t n_kv_heads,
+                                               uint32_t head_dim,
+                                               float scale) {
+    const uint32_t w = blockIdx.x;
+    if (w >= n_blocks) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wid = threadIdx.x >> 5;            // warp id
+    const uint32_t nwarps = blockDim.x >> 5;          // 8
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint32_t elems = (head_dim + 31u) / 32u;    // strided elems per lane
+    const uint32_t first = static_cast<uint32_t>(blk_first_tok[w]);
+    const uint32_t n = static_cast<uint32_t>(blk_tokens[w]);
+
+    extern __shared__ float smax[];                   // [nwarps * M]
+    float *my = smax + static_cast<uint64_t>(wid) * M;
+
+    float warp_sum = 0.0f;
+    for (uint32_t qh = wid; qh < n_heads; qh += nwarps) {
+        const uint32_t kvh = qh / group;
+        // Reset this warp's M running maxes (lane 0 owns my[]).
+        if (lane == 0) {
+            for (uint32_t j = 0; j < M; ++j) my[j] = 0.0f;
+        }
+        __syncwarp();
+        for (uint32_t t = 0; t < n; ++t) {
+            const float *krow =
+                kraw + (static_cast<uint64_t>(first + t) * n_kv_heads + kvh) * head_dim;
+            float kreg[8];
+            #pragma unroll
+            for (uint32_t e = 0; e < 8; ++e) {
+                const uint32_t idx = e * 32u + lane;
+                kreg[e] = (e < elems && idx < head_dim) ? krow[idx] : 0.0f;
+            }
+            for (uint32_t j = 0; j < M; ++j) {
+                const float *qr =
+                    q_layer + (static_cast<uint64_t>(j) * n_heads + qh) * head_dim;
+                float dot = 0.0f;
+                #pragma unroll
+                for (uint32_t e = 0; e < 8; ++e) {
+                    const uint32_t idx = e * 32u + lane;
+                    if (e < elems && idx < head_dim) dot += qr[idx] * kreg[e];
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    dot += __shfl_down_sync(0xffffffffu, dot, off);
+                }
+                if (lane == 0) {
+                    const float v = dot * scale;
+                    const float relu = v > 0.0f ? v : 0.0f;
+                    if (relu > my[j]) my[j] = relu;
+                }
+            }
+        }
+        __syncwarp();
+        if (lane == 0) {
+            float s = 0.0f;
+            for (uint32_t j = 0; j < M; ++j) s += my[j];
+            warp_sum += s;
+        }
+    }
+    __shared__ float wsh[32];
+    if (lane == 0) wsh[wid] = warp_sum;
+    __syncthreads();
+    if (wid == 0) {
+        float tt = (lane < nwarps) ? wsh[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            tt += __shfl_down_sync(0xffffffffu, tt, off);
+        }
+        if (lane == 0) score[w] += tt;
+    }
+}
+
+// block_attn_score_exactmass_kernel (ExactMass, raw-key, AgentKV port): one CUDA
+// block per (query token j, query head qh). The CTA softmaxes the per-token logit
+// scale·(q[j,qh]·k_raw[t,kvh]) over ALL total_tokens key positions, then folds the
+// per-block attention MASS into score[w] (+=, ACCUMULATES over the L per-layer
+// launches). For block w:
+//   score[w] += head_w · Σ_{t : t/bt==w} softmax_t( scale·(q[j,qh]·k_raw[t,kvh]) ),
+// kvh = qh/group, head_w = 1/(L·M·n_heads). The key distinction from
+// block_attn_score_softmax_pages (which softmaxes per-block MEAN keys → exp(mean),
+// so a needle token is already diluted before the exp): here the exp is applied to
+// every RAW token logit and THEN summed into blocks (Σexp), a faithful port of
+// AgentKV's _stream_exact_mass_scores_pagewise, so a needle token's mass survives
+// and blocks compete under one global softmax denominator.
+//   q_layer [M, n_heads, head_dim]               fp32 (this layer slice; caller offsets ptr)
+//   kraw    [total_tokens, n_kv_heads, head_dim] fp32 (this layer slice; caller offsets ptr)
+//   score   [n_blocks]                            fp32 (+=, caller zeros once)
+// grid = M·n_heads (or M·n_kv_heads when group_mean=1: strict AgentKV, see below),
+// blockDim = 256. Dynamic shmem: q_vec[head_dim] + s_acc[n_blocks].
+// Two dot-passes (global max, then exp); pass 3 has no dots. Efficiency deferred
+// (correctness/utility first): kraw is re-read per (j,head) CTA.
+//
+// group_mean=0 (default): one CTA per (query token j, query head qh), heads kept
+//   distinct, masses averaged AFTER the softmax (head_w = 1/(L·M·n_heads)).
+// group_mean=1 (strict AgentKV): one CTA per (query token j, KV group g); the query
+//   is the MEAN of group g's query heads formed BEFORE the softmax, matching
+//   _full_layer_qk's q.view(Q,nkv,groups,hd).mean(dim=2). Caller sets
+//   head_w = 1/(L·M·n_kv_heads) and grid = M·n_kv_heads.
+__global__ void block_attn_score_exactmass_kernel(float *score,
+                                                  const float *q_layer,
+                                                  const float *kraw,
+                                                  uint32_t M,
+                                                  uint32_t total_tokens,
+                                                  uint32_t n_blocks,
+                                                  uint32_t block_tokens,
+                                                  uint32_t n_heads,
+                                                  uint32_t n_kv_heads,
+                                                  uint32_t head_dim,
+                                                  float scale,
+                                                  float head_w,
+                                                  uint32_t group_mean) {
+    const uint32_t bid = blockIdx.x;
+    const uint32_t group = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1u;
+    const uint32_t heads_dim = group_mean ? n_kv_heads : n_heads;
+    const uint32_t j = bid / heads_dim;
+    const uint32_t h = bid - j * heads_dim;   // strict: KV group g; else: query head qh
+    if (j >= M) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nthreads = blockDim.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wid = tid >> 5;
+    const uint32_t nwarps = nthreads >> 5;
+    const uint32_t kvh = group_mean ? h : (h / group);
+
+    extern __shared__ float smem[];
+    float *q_vec = smem;                 // [head_dim]
+    float *s_acc = smem + head_dim;      // [n_blocks]
+    __shared__ float s_max;
+    __shared__ float s_sum;
+    __shared__ float wred[32];
+
+    // Load the query into shmem; zero the per-block mass accumulator. In strict
+    // (group_mean) mode q_vec is the mean over KV group g's query heads
+    // [g*group, g*group+group); else it is the single query head h.
+    if (group_mean) {
+        const uint32_t qh0 = h * group;
+        for (uint32_t d = tid; d < head_dim; d += nthreads) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < group; ++r) {
+                const float *qr = q_layer +
+                    (static_cast<uint64_t>(j) * n_heads + (qh0 + r)) * head_dim;
+                acc += qr[d];
+            }
+            q_vec[d] = acc / static_cast<float>(group);
+        }
+    } else {
+        const float *qr =
+            q_layer + (static_cast<uint64_t>(j) * n_heads + h) * head_dim;
+        for (uint32_t d = tid; d < head_dim; d += nthreads) q_vec[d] = qr[d];
+    }
+    for (uint32_t w = tid; w < n_blocks; w += nthreads) s_acc[w] = 0.0f;
+    __syncthreads();
+
+    // Pass 1: global max of logit[t] = scale·(q·k_raw[t,kvh]) over ALL tokens.
+    float local_max = -INFINITY;
+    for (uint32_t t = tid; t < total_tokens; t += nthreads) {
+        const float *krow =
+            kraw + (static_cast<uint64_t>(t) * n_kv_heads + kvh) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; ++d) dot += q_vec[d] * krow[d];
+        const float logit = dot * scale;
+        if (logit > local_max) local_max = logit;
+    }
+    {
+        float v = local_max;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+        if (lane == 0) wred[wid] = v;
+        __syncthreads();
+        if (wid == 0) {
+            float t2 = (lane < nwarps) ? wred[lane] : -INFINITY;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                t2 = fmaxf(t2, __shfl_down_sync(0xffffffffu, t2, off));
+            if (lane == 0) s_max = t2;
+        }
+        __syncthreads();
+    }
+    const float m = s_max;
+
+    // Pass 2: exp(logit - m) per token; accumulate per-block mass (shared atomics)
+    // and the global softmax denominator.
+    float local_z = 0.0f;
+    for (uint32_t t = tid; t < total_tokens; t += nthreads) {
+        const float *krow =
+            kraw + (static_cast<uint64_t>(t) * n_kv_heads + kvh) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; ++d) dot += q_vec[d] * krow[d];
+        const float e = __expf(dot * scale - m);
+        atomicAdd(&s_acc[t / block_tokens], e);
+        local_z += e;
+    }
+    {
+        float v = local_z;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0) wred[wid] = v;
+        __syncthreads();
+        if (wid == 0) {
+            float t2 = (lane < nwarps) ? wred[lane] : 0.0f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                t2 += __shfl_down_sync(0xffffffffu, t2, off);
+            if (lane == 0) s_sum = (t2 > 0.0f) ? t2 : 1.0f;
+        }
+        __syncthreads();
+    }
+    const float inv_z = head_w / s_sum;
+
+    // Pass 3: fold the normalized per-block mass into the global score (+=).
+    for (uint32_t w = tid; w < n_blocks; w += nthreads) {
+        atomicAdd(&score[w], s_acc[w] * inv_z);
+    }
 }
 
 // derope_query_kernel: de-RoPE the current decode token's RoPE-baked Q (baked at
@@ -6603,6 +6920,100 @@ public:
         return launch_status("cuda block_kmean_content_batch_device");
     }
 
+    DeviceStatus derope_store_content_batch_device(const DeviceTensor &k_batch,
+                                                   DeviceTensor &kraw,
+                                                   uint64_t out_base_elem,
+                                                   uint32_t k_stride,
+                                                   uint32_t batch,
+                                                   uint32_t n_kv_heads,
+                                                   uint32_t head_dim,
+                                                   uint32_t rope_dim,
+                                                   int32_t rope_base,
+                                                   float theta) override {
+        if (batch == 0 || n_kv_heads == 0 || head_dim == 0) return {};
+        const auto &kbt = as_tensor(k_batch);
+        auto &kr = as_tensor(kraw);
+        if (kbt.elem_size != sizeof(float) || kr.elem_size != sizeof(float)) {
+            return {false, "derope_store_content_batch_device requires fp32 buffers"};
+        }
+        if (!ported::launch_derope_store_content_batch(
+                kbt.ptr, kr.ptr, out_base_elem, k_stride, batch, n_kv_heads,
+                head_dim, rope_dim, rope_base, theta, exec_stream_)) {
+            return {false, "derope_store_content_batch launch failed"};
+        }
+        return launch_status("cuda derope_store_content_batch_device");
+    }
+
+    DeviceStatus block_attn_score_maxsim_device(DeviceTensor &score,
+                                                const DeviceTensor &q_layer,
+                                                const DeviceTensor &kraw,
+                                                uint32_t M,
+                                                uint32_t n_blocks,
+                                                const DeviceTensor &blk_first_tok,
+                                                const DeviceTensor &blk_tokens,
+                                                uint32_t n_heads,
+                                                uint32_t n_kv_heads,
+                                                uint32_t head_dim,
+                                                float scale,
+                                                uint64_t q_elem_off = 0,
+                                                uint64_t kraw_elem_off = 0) override {
+        if (n_blocks == 0 || M == 0 || n_heads == 0 || head_dim == 0) return {};
+        auto &sc = as_tensor(score);
+        const auto &ql = as_tensor(q_layer);
+        const auto &kr = as_tensor(kraw);
+        const auto &ft = as_tensor(blk_first_tok);
+        const auto &bt = as_tensor(blk_tokens);
+        if (ql.elem_size != sizeof(float) || kr.elem_size != sizeof(float)) {
+            return {false, "block_attn_score_maxsim_device requires fp32 buffers"};
+        }
+        if (ft.elem_size != sizeof(int32_t) || bt.elem_size != sizeof(int32_t)) {
+            return {false, "block_attn_score_maxsim_device metadata dtype mismatch"};
+        }
+        if (!ported::launch_block_attn_score_maxsim(
+                sc.ptr, ql.ptr + q_elem_off, kr.ptr + kraw_elem_off, M, n_blocks,
+                ft.ptr_i32(), bt.ptr_i32(), n_heads, n_kv_heads, head_dim, scale,
+                exec_stream_)) {
+            // shmem cap exceeded or launch error; executor falls back to mean.
+            return {false, "block_attn_score_maxsim launch failed"};
+        }
+        return launch_status("cuda block_attn_score_maxsim_device");
+    }
+
+    DeviceStatus block_attn_score_exactmass_device(DeviceTensor &score,
+                                                   const DeviceTensor &q_layer,
+                                                   const DeviceTensor &kraw,
+                                                   uint32_t M,
+                                                   uint32_t total_tokens,
+                                                   uint32_t n_blocks,
+                                                   uint32_t block_tokens,
+                                                   uint32_t n_heads,
+                                                   uint32_t n_kv_heads,
+                                                   uint32_t head_dim,
+                                                   float scale,
+                                                   float head_w,
+                                                   uint64_t q_elem_off = 0,
+                                                   uint64_t kraw_elem_off = 0,
+                                                   uint32_t group_mean = 0) override {
+        if (n_blocks == 0 || M == 0 || n_heads == 0 || head_dim == 0 ||
+            total_tokens == 0) {
+            return {};
+        }
+        auto &sc = as_tensor(score);
+        const auto &ql = as_tensor(q_layer);
+        const auto &kr = as_tensor(kraw);
+        if (ql.elem_size != sizeof(float) || kr.elem_size != sizeof(float)) {
+            return {false, "block_attn_score_exactmass_device requires fp32 buffers"};
+        }
+        if (!ported::launch_block_attn_score_exactmass(
+                sc.ptr, ql.ptr + q_elem_off, kr.ptr + kraw_elem_off, M,
+                total_tokens, n_blocks, block_tokens, n_heads, n_kv_heads,
+                head_dim, scale, head_w, group_mean, exec_stream_)) {
+            // shmem cap exceeded or launch error; executor falls back.
+            return {false, "block_attn_score_exactmass launch failed"};
+        }
+        return launch_status("cuda block_attn_score_exactmass_device");
+    }
+
     DeviceStatus derope_query_device(DeviceTensor &q_content,
                                      const DeviceTensor &q,
                                      uint32_t q_stride,
@@ -9355,6 +9766,63 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
     block_kmean_content_batch_kernel<<<grid, head_dim, 0, stream>>>(
         k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens, head_dim,
         rope_dim, rope_base, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
+                                       uint64_t out_base_elem, uint32_t k_stride,
+                                       uint32_t batch, uint32_t n_kv_heads,
+                                       uint32_t head_dim, uint32_t rope_dim,
+                                       int32_t rope_base, float theta,
+                                       cudaStream_t stream) {
+    if (batch == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(batch, n_kv_heads);
+    derope_store_content_batch_kernel<<<grid, head_dim, 0, stream>>>(
+        k_batch, kraw, out_base_elem, k_stride, batch, n_kv_heads, head_dim,
+        rope_dim, rope_base, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attn_score_maxsim(float *score, const float *q_layer,
+                                    const float *kraw, uint32_t M,
+                                    uint32_t n_blocks, const int32_t *blk_first_tok,
+                                    const int32_t *blk_tokens, uint32_t n_heads,
+                                    uint32_t n_kv_heads, uint32_t head_dim,
+                                    float scale, cudaStream_t stream) {
+    if (n_blocks == 0 || M == 0 || n_heads == 0 || head_dim == 0) return true;
+    constexpr uint32_t threads = 256;  // 8 warps; each warp owns a head set
+    const uint32_t nwarps = threads >> 5;
+    const size_t shmem = static_cast<size_t>(nwarps) * M * sizeof(float);
+    if (shmem > 48u * 1024u) return false;  // caller falls back to mean scorer
+    block_attn_score_maxsim_kernel<<<n_blocks, threads, shmem, stream>>>(
+        score, q_layer, kraw, M, n_blocks, blk_first_tok, blk_tokens, n_heads,
+        n_kv_heads, head_dim, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attn_score_exactmass(float *score, const float *q_layer,
+                                       const float *kraw, uint32_t M,
+                                       uint32_t total_tokens, uint32_t n_blocks,
+                                       uint32_t block_tokens, uint32_t n_heads,
+                                       uint32_t n_kv_heads, uint32_t head_dim,
+                                       float scale, float head_w,
+                                       uint32_t group_mean,
+                                       cudaStream_t stream) {
+    if (n_blocks == 0 || M == 0 || n_heads == 0 || head_dim == 0 ||
+        total_tokens == 0 || block_tokens == 0) {
+        return true;
+    }
+    if (group_mean && n_kv_heads == 0) return false;
+    // q_vec[head_dim] + s_acc[n_blocks] in dynamic shmem; cap to 48 KB so the
+    // caller falls back to the mean/MaxSim scorer if n_blocks is too large.
+    const size_t shmem =
+        (static_cast<size_t>(head_dim) + n_blocks) * sizeof(float);
+    if (shmem > 48u * 1024u) return false;
+    constexpr uint32_t threads = 256;  // 8 warps
+    const uint32_t grid = M * (group_mean ? n_kv_heads : n_heads);
+    block_attn_score_exactmass_kernel<<<grid, threads, shmem, stream>>>(
+        score, q_layer, kraw, M, total_tokens, n_blocks, block_tokens, n_heads,
+        n_kv_heads, head_dim, scale, head_w, group_mean);
     return cudaGetLastError() == cudaSuccess;
 }
 
