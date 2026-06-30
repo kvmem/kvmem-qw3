@@ -48,11 +48,15 @@ DOC_BASELINES: "OrderedDict[str, float]" = OrderedDict([
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Run the KVMem LongMemEval utility eval.")
     ap.add_argument("--data", type=Path,
-                    default=Path("/data/chaidi/kvmem_eval/data/longmemeval_s.json"))
+                    default=Path("/home/chaidi/qw3/selected_12_samples.jsonl"))
     ap.add_argument("--base-url", default="http://127.0.0.1:8080/v1")
     ap.add_argument("--out-dir", type=Path,
                     default=Path("/data/chaidi/kvmem_eval/results"))
     ap.add_argument("--per-type", type=int, default=17)
+    ap.add_argument("--use-all", action="store_true",
+                    help="run every loaded sample in file order (the provided "
+                         "selected_12_samples.jsonl IS the exact 102 subset; skip "
+                         "the deterministic build_subset reconstruction)")
     ap.add_argument("--limit", type=int, default=None,
                     help="cap total samples (smoke runs); applied after subset build")
     ap.add_argument("--indices", default=None,
@@ -89,9 +93,11 @@ def main() -> int:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    subset = build_subset(load_all(args.data), per_type=args.per_type)
+    loaded = load_all(args.data)
+    subset = loaded if args.use_all else build_subset(loaded, per_type=args.per_type)
     samples = select_samples(subset, args)
-    print(f"[run_eval] loaded subset={len(subset)} running={len(samples)} samples")
+    print(f"[run_eval] loaded={len(loaded)} subset={len(subset)} "
+          f"running={len(samples)} samples (use_all={args.use_all})")
 
     client = Qw3Client(
         base_url=args.base_url,
@@ -114,7 +120,12 @@ def main() -> int:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     jsonl_path = args.out_dir / f"{args.tag}_eval_{ts}.jsonl"
     summary_path = args.out_dir / f"{args.tag}_eval_{ts}_summary.json"
+    # Hypotheses file in the schema the provided evaluate_qa_deepseek.py expects
+    # (--hyp-file: one {question_id, hypothesis} object per line). The reference
+    # file for that judge is the original samples JSONL (--ref-file).
+    hyp_path = args.out_dir / f"{args.tag}_eval_{ts}_hyp.jsonl"
     print(f"[run_eval] writing per-sample -> {jsonl_path}")
+    print(f"[run_eval] writing hypotheses -> {hyp_path}")
 
     correct_by_type: "OrderedDict[str, int]" = OrderedDict((t, 0) for t in QUESTION_TYPES)
     total_by_type: "OrderedDict[str, int]" = OrderedDict((t, 0) for t in QUESTION_TYPES)
@@ -126,7 +137,8 @@ def main() -> int:
     latencies: list[float] = []
 
     run_t0 = time.monotonic()
-    with jsonl_path.open("w", encoding="utf-8") as out:
+    with jsonl_path.open("w", encoding="utf-8") as out, \
+            hyp_path.open("w", encoding="utf-8") as hyp_out:
         for pos, (idx, s) in enumerate(samples):
             res = client.chat(render_messages(s))
             total_by_type[s.question_type] = total_by_type.get(s.question_type, 0) + 1
@@ -173,6 +185,10 @@ def main() -> int:
             }
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             out.flush()
+            hyp_out.write(json.dumps(
+                {"question_id": s.question_id, "hypothesis": res.answer},
+                ensure_ascii=False) + "\n")
+            hyp_out.flush()
 
             acc = (n_correct / n_done * 100.0) if n_done else 0.0
             flag = "ERR" if res.error else ("CUT" if res.truncated else "ok ")
@@ -216,6 +232,8 @@ def main() -> int:
         "mean_latency_s": (sum(latencies) / len(latencies)) if latencies else None,
         "run_wall_s": run_wall,
         "jsonl_path": str(jsonl_path),
+        "hyp_path": str(hyp_path),
+        "ref_path": str(args.data),
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -239,7 +257,12 @@ def main() -> int:
     if ttfts:
         print(f"  mean TTFT={summary['mean_ttft_s']:.1f}s  mean latency={summary['mean_latency_s']:.1f}s")
     print(f"  per-sample : {jsonl_path}")
+    print(f"  hypotheses : {hyp_path}")
     print(f"  summary    : {summary_path}")
+    if args.no_judge:
+        print("\n  grade with the provided judge:")
+        print(f"    python3 evaluate_qa_deepseek.py --hyp-file {hyp_path} \\")
+        print(f"      --ref-file {args.data} --output {args.out_dir}/{args.tag}_eval_{ts}_graded.jsonl")
     return 0
 
 

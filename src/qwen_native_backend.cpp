@@ -6989,7 +6989,8 @@ private:
         if (executor_->kvmem_enabled() &&
             options.kvmem_query_end > options.kvmem_query_begin) {
             executor_->kvmem_set_query_span(options.kvmem_query_begin,
-                                            options.kvmem_query_end);
+                                            options.kvmem_query_end,
+                                            static_cast<uint32_t>(prompt_tokens.size()));
             std::ostringstream qmsg;
             qmsg << "native kvmem query-conditioned: span=["
                  << options.kvmem_query_begin << "," << options.kvmem_query_end
@@ -7215,7 +7216,8 @@ private:
         // / recency path unchanged) unless kvmem is on and the span is non-empty.
         if (kvmem_on && options.kvmem_query_end > options.kvmem_query_begin) {
             executor_->kvmem_set_query_span(options.kvmem_query_begin,
-                                            options.kvmem_query_end);
+                                            options.kvmem_query_end,
+                                            static_cast<uint32_t>(prompt_tokens.size()));
             std::ostringstream qmsg;
             qmsg << "native kvmem query-conditioned: span=["
                  << options.kvmem_query_begin << "," << options.kvmem_query_end

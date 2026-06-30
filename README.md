@@ -948,6 +948,7 @@ KVMem CLI parameters:
 | `--kvmem-recent-blocks N` | `0` | Always keep the most recent N blocks. `0` lets KVMem derive the recent allocation. |
 | `--kvmem-method M` | `retrieval` | Selection signal: `retrieval`, `h2o`, or `recency`. |
 | `--kvmem-retrieval-method M` | `mean_attention` | Retrieval scorer: `mean_attention` or `content_mean`. |
+| `--kvmem-query-conditioned` | off | Score blocks by the multi-token mean of the final user message (the question) against each block's mean-k, instead of falling back to a recency window. Default-OFF, byte-identical when unset. Required for the LongMemEval benchmark below. |
 | `--kvmem-select-policy M` | `topk` | Selection policy: `topk` or `quota`. |
 | `--kvmem-retrieval-blocks N` | `0` | Quota-policy retrieval block count. `0` derives from remaining budget. |
 | `--kvmem-profile-blocks N` | `0` | Quota-policy profile block count. `0` derives from remaining budget. |
@@ -974,6 +975,10 @@ Useful KVMem environment variables:
 | `QW3_KVMEM_TRACE=1` | Print selection/retrieval diagnostics. This can be verbose. |
 | `QW3_KVMEM_ATTN_TRACE=/path/to/file.jsonl` | Dump KVMem attention-mass traces for analysis. This is expensive and should not be enabled for normal serving. |
 | `QW3_KVMEM_ATTN_TRACE_INTERVAL=N` | Sampling interval for `QW3_KVMEM_ATTN_TRACE`; default is every token. |
+| `QW3_KVMEM_QC_SOFTMAX=1` | Query-conditioned scorer: use softmax-over-pages (accumulated attention mass per block) instead of the default sum-of-ReLU. A/B knob; does not change which blocks survive the budget cut (see the retrieval finding below). |
+| `QW3_KVMEM_QC_SINGLE_LAYER=1` | Score using only the first normal-attention layer's mean-k instead of all 16. Apples-to-apples comparison knob for the multi-layer scorer. |
+| `QW3_KVMEM_QC_LAYERS=N` | Cap the number of normal-attention layers used by the query-conditioned scorer (debug). |
+| `QW3_KVMEM_NO_REROPE=1` | Skip the position-collapse re-RoPE in window assembly; selected blocks keep their true-position rotation. Diagnostic only — run with MTP off (the MTP draft position site is not rewired). |
 
 Compatibility notes:
 
@@ -985,6 +990,76 @@ Compatibility notes:
 - For fast correctness checks, prefer short deterministic requests
   (`--temp 0 --top-k 1`) and compare KVMem lossless or short decode output
   against baseline before running full agent/SWE evaluations.
+
+### LongMemEval-S utility benchmark
+
+The external Python harness in `scripts/kvmem_eval/` measures KVMem retrieval
+accuracy on a 102-sample LongMemEval-S subset (17 per question type × 6 types:
+`single-session-{user,assistant,preference}`, `multi-session`,
+`temporal-reasoning`, `knowledge-update`). It hits `qw3 serve` **only** through the
+OpenAI HTTP API; grading uses a DeepSeek answer-equivalence judge
+(`evaluate_qa_deepseek.py`). No eval logic lives in qw3 C++.
+
+Data: build the subset from the public `xiaowu0162/longmemeval` dataset
+(`scripts/kvmem_eval/dataset.py`), or point `--data` at your own JSONL with the same
+schema. Histories are ~110K tokens, so the data file is large (~50 MB) and is not
+committed to the repo.
+
+1. Serve with KVMem query-conditioned selection:
+
+```sh
+build/qw3 serve \
+  --model models/Qwen3.6-27B-Q8_0.gguf \
+  --ctx 163840 --kv-dtype fp16 \
+  --kvmem --kvmem-block-tokens 1024 --kvmem-budget 32768 \
+  --kvmem-method retrieval --kvmem-retrieval-method content_mean \
+  --kvmem-update-mode step --kvmem-query-conditioned \
+  --kvmem-gpu-memory-ratio 0.5 \
+  --kvmem-cpu-gb 64 --kvmem-nvme-gb 256 --kvmem-nvme-dir /data/qw3_kvmem_eval_nvme \
+  --prefill-chunk 2048 --enable-thinking --temp 0.6 \
+  --native-mtp-speculate --mtp-chain 4 --port 8080
+```
+
+2. Run the harness (`--use-all` runs the provided 102-subset in file order;
+   `--no-judge` records model answers without inline grading; `--indices` runs a
+   subset such as the multi-session bucket):
+
+```sh
+python3 scripts/kvmem_eval/run_eval.py --use-all --no-judge \
+  --data selected_12_samples.jsonl --tag kvmem_run
+# e.g. multi-session only: --indices 6,7,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71
+```
+
+Outputs land in `/data/chaidi/kvmem_eval/results/<tag>_eval_<ts>{,_hyp,_summary}.jsonl`.
+
+3. Grade with DeepSeek (API key from the `DEEPSEEK_API_KEY` env var **only** — never
+   hardcode or commit it):
+
+```sh
+DEEPSEEK_API_KEY=... python3 evaluate_qa_deepseek.py \
+  --hyp-file /data/chaidi/kvmem_eval/results/<tag>_eval_<ts>_hyp.jsonl \
+  --ref-file selected_12_samples.jsonl \
+  --output   /data/chaidi/kvmem_eval/results/<tag>_eval_<ts>_graded.jsonl
+```
+
+Baselines for comparison:
+
+- **Full Context** (accuracy upper bound): the same command with **no** `--kvmem*`
+  flags (plain `--ctx 163840`).
+- **budget=all diagnostic** (isolates retrieval vs post-retrieval): keep every flag
+  but set `--kvmem-budget 163840 --kvmem-gpu-memory-ratio 0.9` so all ~110 history
+  blocks stay GPU-resident (verify with `QW3_KVMEM_TRACE=1`: tier usage shows
+  `gpu_used == gpu_cap`, cpu/nvme = 0).
+
+> **Known result (2026-06-30): retrieval selection is the accuracy bottleneck, not
+> the post-retrieval path.** On the worst (multi-session) bucket the default 32-block
+> budget scores ~12%, but budget=all scores ~82% — matching Full Context. So
+> assembly, re-RoPE, windowed attention, and generation are lossless; the
+> `content_mean` scorer simply ranks the answer-bearing block too low to survive a
+> tight budget. Changing the scoring function (`QW3_KVMEM_QC_SOFTMAX`) or position
+> handling (`QW3_KVMEM_NO_REROPE`) does **not** help, because neither changes which
+> blocks are kept. The open lever is the ranking signal and/or the budget. See
+> `docs/kvmem_utility_eval_plan.md` for the full A/B table.
 
 ## Backends
 

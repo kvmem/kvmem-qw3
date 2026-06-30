@@ -59,10 +59,31 @@ class Sample:
 
 
 def load_all(path: Path) -> list[Sample]:
-    with path.open("r", encoding="utf-8") as handle:
-        raw = json.load(handle)
-    if not isinstance(raw, list):
-        raise ValueError(f"expected a JSON list of samples, got {type(raw).__name__}")
+    """Load samples from a JSON array, JSONL, or concatenated/pretty-printed JSON
+    objects. The original HF `longmemeval_s.json` is a JSON array; the provided
+    `selected_12_samples.jsonl` is a stream of concatenated (pretty-printed) JSON
+    objects, so we fall back to a raw_decode loop that tolerates arbitrary
+    whitespace (incl. newlines) between objects."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        raw = json.loads(text)
+        if not isinstance(raw, list):
+            raise ValueError(
+                f"expected a JSON list of samples, got {type(raw).__name__}"
+            )
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        raw = []
+        idx = 0
+        n = len(text)
+        while idx < n:
+            while idx < n and text[idx].isspace():
+                idx += 1
+            if idx >= n:
+                break
+            obj, end = decoder.raw_decode(text, idx)
+            raw.append(obj)
+            idx = end
     return [Sample.from_raw(r) for r in raw]
 
 

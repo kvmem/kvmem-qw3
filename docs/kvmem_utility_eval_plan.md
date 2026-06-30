@@ -1,5 +1,36 @@
 # Plan: KVMem utility evaluation (external Python over qw3's OpenAI API)
 
+## KNOWN PROBLEM 2026-06-30 — the accuracy gap is RETRIEVAL SELECTION, not the machinery
+
+Status of the KV-native retrieval number: **the query-conditioned scorer's recall is the
+bottleneck.** The `content_mean` (mean-k) similarity ranks the answer-bearing block too low
+to survive a 32-block (`--kvmem-budget 32768` @ `--kvmem-block-tokens 1024`) cut, so the
+needle is dropped before attention ever sees it.
+
+**Evidence (17 multi-session samples, the worst type):**
+
+| arm | budget | multi-session |
+| --- | --- | ---: |
+| query-conditioned, sum-of-ReLU scorer | 32 blocks | ~11.8% |
+| query-conditioned, softmax-over-pages scorer (`QW3_KVMEM_QC_SOFTMAX=1`) | 32 blocks | 2/17 = 11.8% |
+| + no-re-RoPE true-position (`QW3_KVMEM_NO_REROPE=1`, MTP off) | 32 blocks | no improvement |
+| **all blocks resident (`--kvmem-budget 163840 --kvmem-gpu-memory-ratio 0.9`)** | **~110 blocks** | **14/17 = 82.4%** |
+| Full Context (kvmem OFF, doc upper bound) | — | 81–92% |
+
+The **budget=all** arm holds every block GPU-resident (tier trace: `gpu_used==gpu_cap`,
+cpu/nvme=0) and scores **82.4%**, matching Full Context, with **12/17 wrong→right flips and 0
+regressions** vs budget=32. So the assemble + re-RoPE + windowed-attention + generation path
+is **lossless** — the only thing standing between 11.8% and 82.4% is *which blocks the scorer
+keeps*. The 3 still-wrong at budget=all are genuine reasoning/counting failures, not retrieval.
+
+**What this rules out as levers** (all tested, all inert because they don't change which
+blocks survive the cut): the squashing function (softmax vs sum-of-ReLU) and position handling
+(re-RoPE collapse vs true-position). **The open lever is the ranking signal** — mean-k of the
+de-RoPE'd content frame is a weak deep-semantic proxy at a 32/110-block budget — and/or a
+larger budget. Graded artifacts:
+`/data/chaidi/kvmem_eval/results/ab_budgetall_ms_eval_20260630_042351_graded.jsonl`.
+See `## KVMem` → "LongMemEval-S utility benchmark" in `README.md` for the reproduce recipe.
+
 ## Context
 
 `docs/motivation_experiment_summary_en.md` establishes baselines on a 102-sample LongMemEval-S

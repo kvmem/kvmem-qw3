@@ -289,6 +289,20 @@ bool launch_block_attn_score_step(float *accum, const float *q,
                                   uint32_t n_blocks, uint32_t n_heads,
                                   uint32_t n_kv_heads, uint32_t head_dim,
                                   float scale, cudaStream_t stream);
+bool launch_block_attn_score_multilayer(float *score, const float *q_multi,
+                                        const float *kbar_multi,
+                                        uint32_t n_layers, uint32_t n_tokens,
+                                        uint32_t q_layer_stride,
+                                        uint32_t n_blocks, uint32_t n_heads,
+                                        uint32_t n_kv_heads, uint32_t head_dim,
+                                        float scale, cudaStream_t stream);
+bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
+                                           const float *kbar_multi,
+                                           uint32_t n_layers, uint32_t n_tokens,
+                                           uint32_t q_layer_stride,
+                                           uint32_t n_blocks, uint32_t n_heads,
+                                           uint32_t n_kv_heads, uint32_t head_dim,
+                                           float scale, cudaStream_t stream);
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        const float *q, uint32_t q_stride,
                                        uint32_t n_window_blocks,
@@ -312,6 +326,14 @@ bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       const int32_t *page_indices,
                                       uint32_t page_size, float theta,
                                       cudaStream_t stream);
+// Incremental content-frame index from the prefill K batch (#91). See kernel.
+bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
+                                      uint64_t kbar_block_base,
+                                      uint32_t n_blocks_chunk, uint32_t k_stride,
+                                      uint32_t batch, uint32_t blk_tokens,
+                                      uint32_t n_kv_heads, uint32_t head_dim,
+                                      uint32_t rope_dim, int32_t rope_base,
+                                      float theta, cudaStream_t stream);
 bool launch_derope_query(float *q_content, const float *q, uint32_t q_stride,
                          uint32_t n_heads, uint32_t head_dim, uint32_t rope_dim,
                          int32_t query_pos, float theta, cudaStream_t stream);
@@ -2889,6 +2911,165 @@ __global__ void block_attn_score_step_kernel(float *accum,
     if (d == 0) accum[w] += block_score;
 }
 
+// block_attn_score_multilayer_kernel: one-shot fused multi-layer block scorer
+// (#88). One CUDA block per KVMem block w (grid = n_blocks, blockDim = 256 = 8
+// warps). For block w, computes
+//   score[w] = Σ_{l<L} Σ_{j<M} Σ_{qh<n_heads}
+//                  ReLU(scale · (q_multi[l,j,qh] · kbar_multi[l,w,kvh])),
+// kvh = qh/group. Each warp owns a head set (qh = warp_id, +NWARPS, …); the
+// per-head dot (head_dim contiguous fp32) is a warp-shuffle reduction (each lane
+// owns head_dim/32 strided elems, 5 shuffles, no __syncthreads in the inner
+// loop). k̄[l,w,kvh] is hoisted into registers across the M-token loop (it does
+// not depend on j). Replaces the M-launch + M-D2H single-layer loop with one
+// launch + one D2H while folding in ALL L normal-attention layers.
+//   q_multi      [L, q_layer_stride, n_heads, head_dim] fp32 (M valid rows/layer)
+//   kbar_multi   [L, n_blocks, n_kv_heads, head_dim]    fp32
+//   score        [n_blocks] fp32 (OVERWRITTEN)
+__global__ void block_attn_score_multilayer_kernel(float *score,
+                                                   const float *q_multi,
+                                                   const float *kbar_multi,
+                                                   uint32_t n_layers,
+                                                   uint32_t n_tokens,
+                                                   uint32_t q_layer_stride,
+                                                   uint32_t n_blocks,
+                                                   uint32_t n_heads,
+                                                   uint32_t n_kv_heads,
+                                                   uint32_t head_dim,
+                                                   float scale) {
+    const uint32_t w = blockIdx.x;
+    if (w >= n_blocks) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wid = threadIdx.x >> 5;            // warp id
+    const uint32_t nwarps = blockDim.x >> 5;          // 8
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint32_t elems = (head_dim + 31u) / 32u;    // strided elems per lane
+    const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
+
+    float warp_sum = 0.0f;
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        const float *kbar_l =
+            kbar_multi + static_cast<uint64_t>(l) * n_blocks * n_kv_heads * head_dim;
+        const float *q_l =
+            q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
+        for (uint32_t qh = wid; qh < n_heads; qh += nwarps) {
+            const uint32_t kvh = qh / group;
+            const float *kbar_row =
+                kbar_l + (static_cast<uint64_t>(w) * n_kv_heads + kvh) * head_dim;
+            // Hoist k̄[l,w,kvh] into registers (constant across the j loop).
+            float kreg[8];
+            #pragma unroll
+            for (uint32_t e = 0; e < 8; ++e) {
+                const uint32_t idx = e * 32u + lane;
+                kreg[e] = (e < elems && idx < head_dim) ? kbar_row[idx] : 0.0f;
+            }
+            for (uint32_t j = 0; j < n_tokens; ++j) {
+                const float *qr = q_l + (static_cast<uint64_t>(j) * n_heads + qh) * head_dim;
+                float dot = 0.0f;
+                #pragma unroll
+                for (uint32_t e = 0; e < 8; ++e) {
+                    const uint32_t idx = e * 32u + lane;
+                    if (e < elems && idx < head_dim) dot += qr[idx] * kreg[e];
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    dot += __shfl_down_sync(0xffffffffu, dot, off);
+                }
+                if (lane == 0) {
+                    const float v = dot * scale;
+                    warp_sum += v > 0.0f ? v : 0.0f;
+                }
+            }
+        }
+    }
+    // Reduce the per-warp partial sums (held in lane 0 of each warp).
+    __shared__ float wsh[32];
+    if (lane == 0) wsh[wid] = warp_sum;
+    __syncthreads();
+    if (wid == 0) {
+        float t = (lane < nwarps) ? wsh[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            t += __shfl_down_sync(0xffffffffu, t, off);
+        }
+        if (lane == 0) score[w] = t;
+    }
+}
+
+// block_attn_score_softmax_pages_kernel: one CUDA block per (layer,token). For
+// each query head it computes logit[w] = scale·(q[l,t,h]·k̄[l,w,h/group]) for every
+// page w, softmaxes those logits OVER PAGES, then atomicAdds (1/(L·H))·softmax_w
+// into the global score[w]. Summed across the (L·n_tokens) grid this gives
+//   score[w] = Σ_t mean_l mean_h softmax_w(scale·(q·k̄)),
+// the accumulated attention mass each page receives. score must be pre-zeroed.
+// Page logits live in dynamic shared memory s_logit[n_blocks]; the per-head
+// max/sum reductions are serialized on thread 0 (n_blocks is small, ~hundreds).
+__global__ void block_attn_score_softmax_pages_kernel(float *score,
+                                                      const float *q_multi,
+                                                      const float *kbar_multi,
+                                                      uint32_t n_layers,
+                                                      uint32_t n_tokens,
+                                                      uint32_t q_layer_stride,
+                                                      uint32_t n_blocks,
+                                                      uint32_t n_heads,
+                                                      uint32_t n_kv_heads,
+                                                      uint32_t head_dim,
+                                                      float scale) {
+    const uint32_t lt = blockIdx.x;
+    const uint32_t l = lt / n_tokens;
+    const uint32_t t = lt % n_tokens;
+    if (l >= n_layers) return;
+    extern __shared__ float s_logit[];   // [n_blocks]
+    __shared__ float s_max;
+    __shared__ float s_sum;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nthreads = blockDim.x;
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
+    const float *kbar_l =
+        kbar_multi + static_cast<uint64_t>(l) * n_blocks * n_kv_heads * head_dim;
+    const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
+    // Per-head weight: each (layer,token) contributes mean over heads, and the
+    // grid sum over layers must end up as a mean over L. n_tokens is summed (not
+    // averaged) so the final score accumulates one unit of mass per query token.
+    const float head_w = 1.0f / (static_cast<float>(n_layers) *
+                                 static_cast<float>(n_heads));
+    for (uint32_t qh = 0; qh < n_heads; ++qh) {
+        const uint32_t kvh = qh / group;
+        const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+        // logit[w] = scale * dot(q[l,t,qh], k̄[l,w,kvh]) for every page.
+        for (uint32_t w = tid; w < n_blocks; w += nthreads) {
+            const float *kbar_row =
+                kbar_l + (static_cast<uint64_t>(w) * n_kv_heads + kvh) * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; ++d) dot += qr[d] * kbar_row[d];
+            s_logit[w] = dot * scale;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float m = -INFINITY;
+            for (uint32_t w = 0; w < n_blocks; ++w) m = fmaxf(m, s_logit[w]);
+            s_max = m;
+        }
+        __syncthreads();
+        const float m = s_max;
+        for (uint32_t w = tid; w < n_blocks; w += nthreads) {
+            s_logit[w] = __expf(s_logit[w] - m);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (uint32_t w = 0; w < n_blocks; ++w) sum += s_logit[w];
+            s_sum = sum > 0.0f ? sum : 1.0f;
+        }
+        __syncthreads();
+        const float inv = head_w / s_sum;
+        for (uint32_t w = tid; w < n_blocks; w += nthreads) {
+            atomicAdd(&score[w], s_logit[w] * inv);
+        }
+        __syncthreads();  // s_logit reused by the next head
+    }
+}
+
 __device__ __forceinline__ uint32_t kvmem_window_bucket_for_pos(
         uint32_t pos,
         const int32_t *win_base,
@@ -3067,6 +3248,75 @@ __global__ void block_kmean_content_paged_kernel(const T *k_cache,
     }
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
     kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] = acc * inv;
+}
+
+// block_kmean_content_batch_kernel (#91): build per-block content mean-Keys for
+// one normal-attention layer directly from the freshly-RoPE'd prefill K batch,
+// instead of re-reading the paged cache post-prefill. The paged builder can only
+// run ONCE, from the pristine cache before any block is offloaded/re-RoPE'd into
+// a window — so for histories larger than the GPU page pool it covers only the
+// blocks resident at the first mid-prefill offload (the tail is never indexed,
+// hence unselectable). This variant captures each block's content key the moment
+// its K is produced during prefill, so EVERY block is indexed regardless of later
+// offload/window state. k_batch is the contiguous [batch, n_kv_heads*head_dim]
+// (row stride k_stride) K buffer for this chunk, RoPE-baked at `rope_base` (the
+// window position when the window is active, the true position otherwise). Each
+// block owns a contiguous run of up to blk_tokens rows; de-RoPE every row at the
+// position it was actually baked at (rope_base + r), recovering the same
+// position-invariant content frame the paged builder produces (identical
+// de-rotate math, so the huge-position range-reduction error cancels). Chunks are
+// block-aligned (chunk_size % blk_tokens == 0 and base_pos block-aligned), so a
+// block never straddles two chunks; the final chunk's last block may be partial.
+// grid = (n_blocks_chunk, n_kv_heads), block = head_dim threads. Writes the slot
+// slice at global block (kbar_block_base + j), layout [.., n_kv_heads, head_dim].
+__global__ void block_kmean_content_batch_kernel(const float *k_batch,
+                                                 float *kbar,
+                                                 uint64_t kbar_block_base,
+                                                 uint32_t k_stride,
+                                                 uint32_t batch,
+                                                 uint32_t blk_tokens,
+                                                 uint32_t head_dim,
+                                                 uint32_t rope_dim,
+                                                 int32_t rope_base,
+                                                 float theta) {
+    const uint32_t j = blockIdx.x;     // chunk-local block index
+    const uint32_t h = blockIdx.y;     // kv head
+    const uint32_t d = threadIdx.x;    // dim within head
+    if (d >= head_dim) return;
+    const uint32_t r_lo = j * blk_tokens;
+    if (r_lo >= batch) return;
+    const uint32_t r_hi = min(r_lo + blk_tokens, batch);
+    const uint32_t half = rope_dim / 2;
+    float acc = 0.0f;
+    for (uint32_t r = r_lo; r < r_hi; ++r) {
+        const float *row = k_batch + static_cast<uint64_t>(r) * k_stride +
+                           static_cast<uint64_t>(h) * head_dim;
+        const int32_t pos = rope_base + static_cast<int32_t>(r);
+        float deroped;
+        if (d < half) {
+            const float inv_freq = __powf(theta, -2.0f * static_cast<float>(d) /
+                                                  static_cast<float>(rope_dim));
+            const float ang = static_cast<float>(pos) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            deroped = row[d] * c + row[d + half] * s;       // de-rotate dim i
+        } else if (d < rope_dim) {
+            const uint32_t i = d - half;
+            const float inv_freq = __powf(theta, -2.0f * static_cast<float>(i) /
+                                                  static_cast<float>(rope_dim));
+            const float ang = static_cast<float>(pos) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            deroped = -row[d - half] * s + row[d] * c;      // de-rotate dim i+half
+        } else {
+            deroped = row[d];                               // beyond rope_dim: untouched
+        }
+        acc += deroped;
+    }
+    const uint32_t n = r_hi - r_lo;
+    const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
+    const uint64_t blk = kbar_block_base + j;
+    kbar[(blk * gridDim.y + h) * head_dim + d] = acc * inv;
 }
 
 // derope_query_kernel: de-RoPE the current decode token's RoPE-baked Q (baked at
@@ -6165,6 +6415,60 @@ public:
         return launch_status("cuda block_attn_score_step_device");
     }
 
+    DeviceStatus block_attn_score_multilayer_device(DeviceTensor &score,
+                                                    const DeviceTensor &q_multi,
+                                                    const DeviceTensor &kbar_multi,
+                                                    uint32_t n_layers,
+                                                    uint32_t n_tokens,
+                                                    uint32_t q_layer_stride,
+                                                    uint32_t n_blocks,
+                                                    uint32_t n_heads,
+                                                    uint32_t n_kv_heads,
+                                                    uint32_t head_dim,
+                                                    float scale) override {
+        if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
+            head_dim == 0) {
+            return {};
+        }
+        auto &sc = as_tensor(score);
+        const auto &qm = as_tensor(q_multi);
+        const auto &kb = as_tensor(kbar_multi);
+        if (!ported::launch_block_attn_score_multilayer(
+                sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, exec_stream_)) {
+            return {false, "block_attn_score_multilayer launch failed"};
+        }
+        return launch_status("cuda block_attn_score_multilayer_device");
+    }
+
+    DeviceStatus block_attn_score_softmax_pages_device(DeviceTensor &score,
+                                                       const DeviceTensor &q_multi,
+                                                       const DeviceTensor &kbar_multi,
+                                                       uint32_t n_layers,
+                                                       uint32_t n_tokens,
+                                                       uint32_t q_layer_stride,
+                                                       uint32_t n_blocks,
+                                                       uint32_t n_heads,
+                                                       uint32_t n_kv_heads,
+                                                       uint32_t head_dim,
+                                                       float scale) override {
+        if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
+            head_dim == 0) {
+            return {};
+        }
+        auto &sc = as_tensor(score);
+        const auto &qm = as_tensor(q_multi);
+        const auto &kb = as_tensor(kbar_multi);
+        if (!ported::launch_block_attn_score_softmax_pages(
+                sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, exec_stream_)) {
+            // n_blocks exceeded the shmem page cap (or a launch error); the
+            // executor falls back to the sum-of-ReLU multilayer path.
+            return {false, "block_attn_score_softmax_pages launch failed"};
+        }
+        return launch_status("cuda block_attn_score_softmax_pages_device");
+    }
+
     DeviceStatus block_attention_mass_paged_device(
                                               DeviceTensor &mass,
                                               const DeviceTensor &q,
@@ -6239,7 +6543,8 @@ public:
                                                   const DeviceTensor &blk_tokens,
                                                   const DeviceTensor &page_indices,
                                                   uint32_t page_size,
-                                                  float theta) override {
+                                                  float theta,
+                                                  uint64_t out_elem_off = 0) override {
         if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return {};
         if (page_size == 0) return {false, "block_kmean_content_paged_device page_size=0"};
         const auto &c = as_tensor(k_cache);
@@ -6261,12 +6566,41 @@ public:
         const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
                                   : static_cast<const void *>(c.ptr);
         if (!ported::launch_block_kmean_content_paged(
-                const_cast<void *>(ptr), is_fp16, kb.ptr, n_blocks, n_kv_heads,
-                per_pos_size, head_dim, rope_dim, ob.ptr_i32(), bt.ptr_i32(),
-                pages.ptr_i32(), page_size, theta, exec_stream_)) {
+                const_cast<void *>(ptr), is_fp16, kb.ptr + out_elem_off, n_blocks,
+                n_kv_heads, per_pos_size, head_dim, rope_dim, ob.ptr_i32(),
+                bt.ptr_i32(), pages.ptr_i32(), page_size, theta, exec_stream_)) {
             return {false, "block_kmean_content_paged launch failed"};
         }
         return launch_status("cuda block_kmean_content_paged_device");
+    }
+
+    DeviceStatus block_kmean_content_batch_device(const DeviceTensor &k_batch,
+                                                  DeviceTensor &kbar,
+                                                  uint64_t kbar_block_base,
+                                                  uint32_t n_blocks_chunk,
+                                                  uint32_t k_stride,
+                                                  uint32_t batch,
+                                                  uint32_t blk_tokens,
+                                                  uint32_t n_kv_heads,
+                                                  uint32_t head_dim,
+                                                  uint32_t rope_dim,
+                                                  int32_t rope_base,
+                                                  float theta) override {
+        if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 || batch == 0) {
+            return {};
+        }
+        const auto &kbt = as_tensor(k_batch);
+        auto &kb = as_tensor(kbar);
+        if (kbt.elem_size != sizeof(float) || kb.elem_size != sizeof(float)) {
+            return {false, "block_kmean_content_batch_device requires fp32 buffers"};
+        }
+        if (!ported::launch_block_kmean_content_batch(
+                kbt.ptr, kb.ptr, kbar_block_base, n_blocks_chunk, k_stride, batch,
+                blk_tokens, n_kv_heads, head_dim, rope_dim, rope_base, theta,
+                exec_stream_)) {
+            return {false, "block_kmean_content_batch launch failed"};
+        }
+        return launch_status("cuda block_kmean_content_batch_device");
     }
 
     DeviceStatus derope_query_device(DeviceTensor &q_content,
@@ -8908,6 +9242,51 @@ bool launch_block_attn_score_step(float *accum, const float *q,
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool launch_block_attn_score_multilayer(float *score, const float *q_multi,
+                                        const float *kbar_multi,
+                                        uint32_t n_layers, uint32_t n_tokens,
+                                        uint32_t q_layer_stride,
+                                        uint32_t n_blocks, uint32_t n_heads,
+                                        uint32_t n_kv_heads, uint32_t head_dim,
+                                        float scale, cudaStream_t stream) {
+    if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
+        head_dim == 0) {
+        return true;
+    }
+    constexpr uint32_t threads = 256;  // 8 warps; each warp owns a head set
+    block_attn_score_multilayer_kernel<<<n_blocks, threads, 0, stream>>>(
+        score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
+        n_blocks, n_heads, n_kv_heads, head_dim, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
+                                           const float *kbar_multi,
+                                           uint32_t n_layers, uint32_t n_tokens,
+                                           uint32_t q_layer_stride,
+                                           uint32_t n_blocks, uint32_t n_heads,
+                                           uint32_t n_kv_heads, uint32_t head_dim,
+                                           float scale, cudaStream_t stream) {
+    if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
+        head_dim == 0) {
+        return true;
+    }
+    // Page logits live in dynamic shared memory; cap pages so the request fits a
+    // conservative 48 KB shmem budget. Caller falls back to the sum-of-ReLU path.
+    constexpr uint32_t kMaxPages = 8192;
+    if (n_blocks > kMaxPages) return false;
+    // score[] is accumulated across the grid -> must start at zero.
+    cudaMemsetAsync(score, 0, static_cast<size_t>(n_blocks) * sizeof(float),
+                    stream);
+    constexpr uint32_t threads = 128;
+    const uint32_t grid = n_layers * n_tokens;
+    const size_t shmem = static_cast<size_t>(n_blocks) * sizeof(float);
+    block_attn_score_softmax_pages_kernel<<<grid, threads, shmem, stream>>>(
+        score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
+        n_blocks, n_heads, n_kv_heads, head_dim, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        const float *q, uint32_t q_stride,
                                        uint32_t n_window_blocks,
@@ -8959,6 +9338,23 @@ bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
             static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
             rope_dim, orig_base, blk_tokens, page_indices, page_size, theta);
     }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
+                                      uint64_t kbar_block_base,
+                                      uint32_t n_blocks_chunk, uint32_t k_stride,
+                                      uint32_t batch, uint32_t blk_tokens,
+                                      uint32_t n_kv_heads, uint32_t head_dim,
+                                      uint32_t rope_dim, int32_t rope_base,
+                                      float theta, cudaStream_t stream) {
+    if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 || batch == 0) {
+        return true;
+    }
+    dim3 grid(n_blocks_chunk, n_kv_heads);
+    block_kmean_content_batch_kernel<<<grid, head_dim, 0, stream>>>(
+        k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens, head_dim,
+        rope_dim, rope_base, theta);
     return cudaGetLastError() == cudaSuccess;
 }
 

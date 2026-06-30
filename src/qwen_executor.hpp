@@ -271,8 +271,12 @@ public:
     bool kvmem_enabled() const { return kvmem_enabled_; }
     // Mark the final user message's token span [begin,end) for query-conditioned
     // multi-token selection. Called by the backend BEFORE prefill. begin==end -> no
-    // span -> byte-identical single-token/recency path. (Public: backend-invoked.)
-    void kvmem_set_query_span(uint32_t begin, uint32_t end);   // before prefill
+    // span -> byte-identical single-token/recency path. prompt_tokens is the full
+    // prompt length: it fixes the final block count up front so the incremental
+    // per-layer content index (#91) can size its per-layer stride before the first
+    // K chunk is captured. (Public: backend-invoked.)
+    void kvmem_set_query_span(uint32_t begin, uint32_t end,
+                              uint32_t prompt_tokens);          // before prefill
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
     // it per executor. Set before configure_kvmem(); the pool must outlive this
     // executor. No-op effect when kvmem or the CPU tier is off.
@@ -748,18 +752,62 @@ private:
     // question tokens (rewards broadly-relevant blocks) instead of the single
     // last-token query. Default OFF (span empty) -> the single-token retrieval /
     // recency path is byte-identical.
-    void kvmem_capture_query_multi(uint32_t chunk_off, uint32_t batch,
-                                   uint32_t base_pos, uint32_t q_token_stride);
+    void kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
+                                   uint32_t batch, uint32_t base_pos,
+                                   uint32_t rope_base_pos,
+                                   uint32_t q_token_stride);
     bool kvmem_retrieval_score_multitoken();                   // boundary, multi-token
     uint32_t kvmem_query_begin_ = 0;
     uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
     uint32_t kvmem_query_base_pos_ = 0;                        // position() at span-set; anchors
                                                                // prompt-token indices vs the
                                                                // possibly-chunked prefill calls
-    uint32_t g_query_multi_count_ = 0;                         // rows captured so far
-    uint32_t g_query_multi_capacity_ = 0;                      // allocated rows (cap)
+    uint32_t g_query_multi_count_ = 0;                         // rows captured so far (per slot)
+    uint32_t g_query_multi_capacity_ = 0;                      // allocated rows (cap, == S)
     bool g_query_multi_ready_ = false;                         // all span rows captured
-    std::unique_ptr<DeviceTensor> g_query_multi_;              // [M, n_heads, head_dim] fp32
+    std::unique_ptr<DeviceTensor> g_query_multi_;              // [L, S, n_heads, head_dim] fp32
+
+    // ---- Per-normal-attention-layer multi-layer selection (#85-#90) --------
+    // Qwen3.6-27B is hybrid: full_attention_interval=4 over 64 layers => 16
+    // normal-attention layers. The single-layer proxy above (bs_score_layer_)
+    // ranks blocks by ONE early std layer's content mean-key, a poor proxy for
+    // "which old session holds the answer". This generalizes the query-
+    // conditioned path to score by ALL L normal layers at once: g_kbar_multi_
+    // holds a per-layer content index, g_query_multi_ holds per-layer query rows
+    // ([L,S,...]), and one fused kernel sums ReLU(q·k̄) over (layers,tokens) per
+    // block in a single launch + single D2H (the step-mode reselect fires once
+    // at the prefill->decode boundary, so this is a one-time per-request cost).
+    // This is the DEFAULT for --kvmem-query-conditioned; QW3_KVMEM_QC_SINGLE_LAYER=1
+    // forces the old single-layer multitoken path (L=1, layer=bs_score_layer_)
+    // for A/B comparison. QW3_KVMEM_QC_LAYERS=N caps L (debug).
+    void kvmem_resolve_std_layers();        // populate std_layers_/std_layer_slot_
+    bool kvmem_retrieval_score_multilayer();                   // boundary, fused multi-layer
+    bool kvmem_qc_single_layer_ = false;                       // env: force L=1 old path
+    bool kvmem_qc_softmax_ = false;                            // env: softmax-over-pages scorer
+    bool kvmem_no_rerope_ = false;                             // env: skip re-RoPE collapse (true-pos test)
+    int32_t kvmem_qc_layer_cap_ = -1;                          // env: cap L (-1 = all std layers)
+    uint32_t kvmem_qc_num_layers_ = 0;                         // L (resolved std-layer count)
+    uint32_t kvmem_query_span_ = 0;                            // S (span length, == capacity)
+    std::vector<int32_t> std_layer_slot_;                      // il -> slot 0..L-1, or -1
+    std::vector<uint32_t> std_layers_;                         // slot -> il
+    std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_kv_heads, head_dim] fp32
+    bool g_kbar_multi_ready_ = false;                          // g_kbar_multi_ holds the index
+    uint32_t g_kbar_multi_blocks_ = 0;                         // blocks covered (per layer)
+    uint32_t g_kbar_multi_capacity_ = 0;                       // allocated block capacity (per layer)
+
+    // Incremental content-index build from the prefill K batch (#91). The paged
+    // builder (kvmem_build_content_index) can only run once from the pristine
+    // cache, so for histories larger than the GPU page pool it covers only the
+    // blocks resident at the first mid-prefill offload (the tail is unindexed and
+    // unselectable). When a query span is active we instead capture each block's
+    // per-layer content mean-key the moment its K is RoPE'd during prefill
+    // (kvmem_capture_kbar_multi), covering EVERY block. kvmem_qc_total_blocks_ is
+    // the final block count (from the prompt length at span-set), which fixes the
+    // per-layer stride in g_kbar_multi_; kvmem_qc_captured_blocks_ tracks progress.
+    void kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch, uint32_t base_pos,
+                                  uint32_t rope_base_pos, uint32_t k_token_stride);
+    uint32_t kvmem_qc_total_blocks_ = 0;                       // final block count (index stride)
+    uint32_t kvmem_qc_captured_blocks_ = 0;                    // blocks captured so far (slot 0)
 
     // ---- KVMem attention-distribution diagnostics -------------------------
     // Enabled only when QW3_KVMEM_ATTN_TRACE points at a JSONL output path.

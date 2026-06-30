@@ -844,6 +844,9 @@ public:
     // fp32 [n_blocks, n_kv_heads, head_dim] indexed by block_id. Built ONCE from
     // the pristine post-prefill cache (blocks baked at true positions), immutable
     // thereafter — never rebuilt as blocks are re-RoPE'd into windows.
+    // out_elem_off (default 0) writes kbar starting at that fp32 element offset, so
+    // a single [L, n_blocks, n_kv_heads, head_dim] buffer can be filled one normal
+    // layer's slice at a time (multi-layer selection, #86).
     virtual DeviceStatus block_kmean_content_paged_device(const DeviceTensor &k_cache,
                                                           DeviceTensor &kbar,
                                                           uint32_t n_blocks,
@@ -855,11 +858,96 @@ public:
                                                           const DeviceTensor &blk_tokens,
                                                           const DeviceTensor &page_indices,
                                                           uint32_t page_size,
-                                                          float theta) {
+                                                          float theta,
+                                                          uint64_t out_elem_off = 0) {
         (void)k_cache; (void)kbar; (void)n_blocks; (void)n_kv_heads;
         (void)per_pos_size; (void)head_dim; (void)rope_dim; (void)orig_base;
         (void)blk_tokens; (void)page_indices; (void)page_size; (void)theta;
+        (void)out_elem_off;
         return {false, "block_kmean_content_paged_device requires backend override"};
+    }
+
+    // block_kmean_content_batch_device (#91): build per-block content mean-Keys for
+    // one normal-attention layer directly from the freshly-RoPE'd prefill K batch,
+    // so EVERY block is indexed during prefill (the paged builder above can only run
+    // once from the pristine cache and misses the tail of histories larger than the
+    // GPU page pool). k_batch is the contiguous fp32 [batch, n_kv_heads*head_dim]
+    // (row stride k_stride) K buffer RoPE-baked at rope_base; each chunk-local block
+    // owns up to blk_tokens contiguous rows, de-RoPE'd at (rope_base + row). Writes
+    // kbar (fp32 [.., n_kv_heads, head_dim]) at global block (kbar_block_base + j),
+    // so one [L, n_blocks, n_kv_heads, head_dim] buffer is filled a (layer, chunk)
+    // slice at a time. Chunks are block-aligned, so blocks never straddle chunks.
+    virtual DeviceStatus block_kmean_content_batch_device(const DeviceTensor &k_batch,
+                                                          DeviceTensor &kbar,
+                                                          uint64_t kbar_block_base,
+                                                          uint32_t n_blocks_chunk,
+                                                          uint32_t k_stride,
+                                                          uint32_t batch,
+                                                          uint32_t blk_tokens,
+                                                          uint32_t n_kv_heads,
+                                                          uint32_t head_dim,
+                                                          uint32_t rope_dim,
+                                                          int32_t rope_base,
+                                                          float theta) {
+        (void)k_batch; (void)kbar; (void)kbar_block_base; (void)n_blocks_chunk;
+        (void)k_stride; (void)batch; (void)blk_tokens; (void)n_kv_heads;
+        (void)head_dim; (void)rope_dim; (void)rope_base; (void)theta;
+        return {false, "block_kmean_content_batch_device requires backend override"};
+    }
+
+    // block_attn_score_multilayer_device: one-shot fused multi-layer block scorer
+    // (#88). For every block w in a SINGLE launch, computes
+    //   score[w] = Σ_{l<L} Σ_{j<M} Σ_{qh<n_heads}
+    //                  ReLU(scale · (q_multi[l,j,qh] · kbar_multi[l,w,kvh])),
+    // with kvh = qh / (n_heads/n_kv_heads). q_multi is [L, q_layer_stride, n_heads,
+    // head_dim] fp32 (only the first M token rows per layer are read; layer stride
+    // is q_layer_stride rows); kbar_multi is [L, n_blocks, n_kv_heads, head_dim]
+    // fp32. Output score is fp32 [n_blocks] (overwritten, not accumulated). Replaces
+    // the M-launch + M-D2H single-layer multitoken loop with 1 launch + 1 D2H.
+    virtual DeviceStatus block_attn_score_multilayer_device(DeviceTensor &score,
+                                                            const DeviceTensor &q_multi,
+                                                            const DeviceTensor &kbar_multi,
+                                                            uint32_t n_layers,
+                                                            uint32_t n_tokens,
+                                                            uint32_t q_layer_stride,
+                                                            uint32_t n_blocks,
+                                                            uint32_t n_heads,
+                                                            uint32_t n_kv_heads,
+                                                            uint32_t head_dim,
+                                                            float scale) {
+        (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
+        (void)q_layer_stride; (void)n_blocks; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale;
+        return {false, "block_attn_score_multilayer_device requires backend override"};
+    }
+
+    // block_attn_score_softmax_pages_device: query-conditioned scorer variant that
+    // forms a PROPER per-(layer,token,head) softmax distribution over pages (#102).
+    // One CUDA block per (layer,token); for each query head it softmaxes
+    // scale·(q·k̄) over the n_blocks pages, averages over heads, and atomicAdds the
+    // (1/(n_layers·n_heads))-weighted distribution into score[w]. Summed over the
+    // (layer,token) grid this yields
+    //   score[w] = Σ_t mean_l mean_h softmax_w( scale · (q[l,t,h]·k̄[l,w,h/group]) ),
+    // i.e. accumulated attention mass each page receives from all question tokens,
+    // averaged over the L normal-attention layers. score is ZEROED then accumulated.
+    // scale should be 1/sqrt(head_dim) (real-attention temperature). Same q_multi /
+    // kbar_multi layouts as block_attn_score_multilayer_device. Returns an error if
+    // n_blocks exceeds the kernel's shared-memory page cap (caller falls back).
+    virtual DeviceStatus block_attn_score_softmax_pages_device(DeviceTensor &score,
+                                                               const DeviceTensor &q_multi,
+                                                               const DeviceTensor &kbar_multi,
+                                                               uint32_t n_layers,
+                                                               uint32_t n_tokens,
+                                                               uint32_t q_layer_stride,
+                                                               uint32_t n_blocks,
+                                                               uint32_t n_heads,
+                                                               uint32_t n_kv_heads,
+                                                               uint32_t head_dim,
+                                                               float scale) {
+        (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
+        (void)q_layer_stride; (void)n_blocks; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale;
+        return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 
     // derope_query_device: de-RoPE the current decode token's RoPE-baked Q (baked
