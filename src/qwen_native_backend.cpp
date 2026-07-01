@@ -81,51 +81,72 @@ std::vector<float> sampling_distribution(const std::vector<float> &logits,
     const float inv_t = 1.0f / (temp > 0.0f ? temp : 1.0f);
     float maxv = logits[0];
     for (int i = 1; i < n; ++i) if (logits[i] > maxv) maxv = logits[i];
-    std::vector<std::pair<float, int>> probs(n);
+    // Softmax denominator over the full vocab, in one pass (no per-token storage).
     double sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        const float p = std::exp((logits[i] - maxv) * inv_t);
-        probs[i] = {p, i};
-        sum += p;
-    }
+    for (int i = 0; i < n; ++i) sum += std::exp((logits[i] - maxv) * inv_t);
     const float norm = static_cast<float>(1.0 / (sum > 0.0 ? sum : 1.0));
-    for (auto &pr : probs) pr.first *= norm;
+    auto prob_of = [&](int i) -> float {
+        return std::exp((logits[i] - maxv) * inv_t) * norm;
+    };
     const bool need_sort =
         (top_k > 0 && top_k < n) ||
         (top_p < 1.0f && top_p > 0.0f) ||
         (min_p > 0.0f);
-    if (need_sort) {
-        std::sort(probs.begin(), probs.end(),
-                  [](const auto &a, const auto &b) { return a.first > b.first; });
+    if (!need_sort) {
+        // No truncation: emit the full-vocab softmax directly.
+        for (int i = 0; i < n; ++i) out[i] = prob_of(i);
+        return out;
     }
-    // Truncation order mirrors the original sample_token: top_k, then min_p, then
-    // nucleus (top_p). The list is sorted descending, so each filter keeps a prefix.
-    size_t keep = probs.size();
-    if (top_k > 0 && top_k < static_cast<int>(keep)) keep = static_cast<size_t>(top_k);
-    if (min_p > 0.0f && keep > 0) {
-        const float cutoff = probs.front().first * min_p;
-        size_t k = 0;
-        while (k < keep && probs[k].first >= cutoff) ++k;
-        keep = k;
-    }
-    if (top_p < 1.0f && top_p > 0.0f) {
-        double cum = 0.0;
-        size_t k = keep;
-        for (size_t i = 0; i < keep; ++i) {
-            cum += probs[i].first;
-            if (cum >= top_p) { k = i + 1; break; }
+    // Truncation only needs the highest-probability tokens, so avoid the O(V log V)
+    // full sort: isolate the top candidates with O(V) partial selection and sort
+    // only that window. exp is monotonic, so ranking by logit equals ranking by
+    // probability; the kept set + renormalization below is identical to sorting the
+    // whole vocab. If a filter would keep the entire window, widen it and retry —
+    // that bounds the answer exactly. Truncation order matches the original
+    // sample_token: top_k, then min_p, then nucleus (top_p); each keeps a prefix.
+    std::vector<int> idx(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) idx[i] = i;
+    auto by_logit_desc = [&](int a, int b) { return logits[a] > logits[b]; };
+    size_t cap = static_cast<size_t>(n);
+    if (top_k > 0 && static_cast<size_t>(top_k) < cap) cap = static_cast<size_t>(top_k);
+    size_t K = std::min<size_t>(cap, 128);
+    if (K == 0) K = std::min<size_t>(cap, 1);
+    size_t keep = 0;
+    for (;;) {
+        if (K > cap) K = cap;
+        std::nth_element(idx.begin(), idx.begin() + K, idx.end(), by_logit_desc);
+        std::sort(idx.begin(), idx.begin() + K, by_logit_desc);
+        keep = K;
+        if (top_k > 0 && static_cast<size_t>(top_k) < keep) keep = static_cast<size_t>(top_k);
+        if (min_p > 0.0f && keep > 0) {
+            const float cutoff = prob_of(idx[0]) * min_p;
+            size_t k = 0;
+            while (k < keep && prob_of(idx[k]) >= cutoff) ++k;
+            keep = k;
         }
-        keep = k;
+        if (top_p < 1.0f && top_p > 0.0f) {
+            double cum = 0.0;
+            size_t k = keep;
+            for (size_t i = 0; i < keep; ++i) {
+                cum += prob_of(idx[i]);
+                if (cum >= top_p) { k = i + 1; break; }
+            }
+            keep = k;
+        }
+        // Exact once the kept set fits strictly inside the window (or the window
+        // already spans the whole eligible vocab / top_k cap).
+        if (keep < K || K >= cap) break;
+        K = std::min<size_t>(cap, K * 2);
     }
     double kept_sum = 0.0;
-    for (size_t i = 0; i < keep; ++i) kept_sum += probs[i].first;
+    for (size_t i = 0; i < keep; ++i) kept_sum += prob_of(idx[i]);
     if (kept_sum <= 0.0) {
         // Degenerate (e.g. min_p removed everything): collapse to the top token.
-        if (!probs.empty()) out[probs.front().second] = 1.0f;
+        out[idx[0]] = 1.0f;
         return out;
     }
     const float kn = static_cast<float>(1.0 / kept_sum);
-    for (size_t i = 0; i < keep; ++i) out[probs[i].second] = probs[i].first * kn;
+    for (size_t i = 0; i < keep; ++i) out[idx[i]] = prob_of(idx[i]) * kn;
     return out;
 }
 
