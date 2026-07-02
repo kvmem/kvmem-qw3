@@ -453,6 +453,20 @@ bool prefix_cache_enabled() {
     return env_flag_enabled("QW3_PREFIX_CACHE");
 }
 
+// kvmem single-request (non-CB) prefix cache. When on, the plain-route shared
+// executor is kept warm across requests: if a new prompt begins with the entire
+// token sequence of the previous request (prompt + generated response), the
+// executor resumes at that end (via a captured StateSnapshot) and only the new
+// suffix is prefilled. Default off -> reset_state() every request, byte-identical
+// to today. Distinct from the CB-only QW3_PREFIX_CACHE above.
+bool kvmem_prefix_cache_enabled() {
+    return env_flag_enabled("QW3_KVMEM_PREFIX_CACHE");
+}
+
+bool kvmem_prefix_cache_trace_enabled() {
+    return env_flag_enabled("QW3_KVMEM_PREFIX_CACHE_TRACE");
+}
+
 // Cap on total physical KV pages pinned by the prefix cache. 0 = unlimited
 // (bounded only by the pool). Used to trigger LRU eviction.
 uint32_t prefix_cache_max_pages() {
@@ -6621,6 +6635,32 @@ private:
     // strictly shorter than it. On hit, bumps refcount + LRU and returns a
     // copy of the entry's pages/state via out-params; caller seeds the executor.
     // Returns the entry id on hit, 0 on miss.
+    // kvmem single-request prefix reuse predicate. Returns M (the number of
+    // leading prompt tokens that can be resumed from kvmem_warm_ckpt_ without
+    // re-prefill) iff every guard holds:
+    //   - QW3_KVMEM_PREFIX_CACHE on and executor kvmem-enabled,
+    //   - a valid warm checkpoint exists,
+    //   - the new prompt STRICTLY extends the whole warm log (>= 1 suffix token,
+    //     so decode always re-seeds from a real forward),
+    //   - the warm log is a byte-exact prefix of the new prompt,
+    //   - no query-conditioned span is requested (suffix-only prefill can't
+    //     recapture an in-prefix query span; deferred).
+    // Otherwise 0 -> caller does the full reset+prefill (byte-identical to today).
+    uint32_t kvmem_prefix_reuse_len(const std::vector<uint32_t> &prompt,
+                                    const GenerationOptions &options) {
+        if (!kvmem_prefix_cache_enabled()) return 0;
+        if (!executor_ || !executor_->kvmem_enabled()) return 0;
+        if (!kvmem_warm_valid_ || kvmem_warm_log_.empty()) return 0;
+        if (options.kvmem_query_end > options.kvmem_query_begin) return 0;
+        const size_t m = kvmem_warm_log_.size();
+        if (prompt.size() <= m) return 0;  // strict: need >=1 suffix token
+        if (!std::equal(kvmem_warm_log_.begin(), kvmem_warm_log_.end(),
+                        prompt.begin())) {
+            return 0;
+        }
+        return static_cast<uint32_t>(m);
+    }
+
     uint64_t prefix_cache_lookup(const std::vector<uint32_t> &prompt,
                                  uint32_t page_size,
                                  std::vector<int32_t> &out_pages,
@@ -7002,7 +7042,29 @@ private:
                                DumpStream *dump) {
         DeviceStatus st = device_->begin();
         if (!st.ok) throw std::runtime_error(st.message);
-        executor_->reset_state();
+
+        // kvmem prefix cache (QW3_KVMEM_PREFIX_CACHE): if this prompt strictly
+        // extends the whole warm sequence of the previous request, resume the
+        // warm executor at that end and prefill only the suffix. Otherwise fall
+        // back to the byte-identical reset+full-prefill path and (if the flag is
+        // on) drop the now-stale warm checkpoint.
+        const uint32_t reuse_m = kvmem_prefix_reuse_len(prompt_tokens, options);
+        const bool warm_reuse = reuse_m > 0;
+        if (warm_reuse) {
+            executor_->restore_state(kvmem_warm_ckpt_);
+            if (kvmem_prefix_cache_trace_enabled()) {
+                std::ostringstream tmsg;
+                tmsg << "kvmem prefix-cache HIT (plain): reuse=" << reuse_m
+                     << " prompt=" << prompt_tokens.size()
+                     << " suffix=" << (prompt_tokens.size() - reuse_m);
+                log(tmsg.str());
+            }
+        } else {
+            executor_->reset_state();
+            if (kvmem_prefix_cache_enabled()) kvmem_warm_valid_ = false;
+        }
+        const bool warm_capture =
+            kvmem_prefix_cache_enabled() && executor_->kvmem_enabled();
 
         // Query-conditioned KVMem (#82): mark the question token span BEFORE
         // prefill (mirrors generate_mtp). Inert unless kvmem is on and the span
@@ -7022,8 +7084,13 @@ private:
         const double t_prefill_start = wall_seconds();
         uint64_t prefill_ops = 0;
         NativeExecutorReport step;
+        // On warm reuse the [0,reuse_m) prefix is already resident (restored
+        // above); prefill only the trailing suffix. reuse_m<prompt.size() is
+        // guaranteed by the strict-extend predicate, so >=1 token still forwards
+        // and step carries a fresh decode seed.
+        const size_t prefill_begin = warm_reuse ? reuse_m : 0;
         if (dump) {
-            for (size_t pi = 0; pi < prompt_tokens.size(); ++pi) {
+            for (size_t pi = prefill_begin; pi < prompt_tokens.size(); ++pi) {
                 step = executor_->forward_one_token(prompt_tokens[pi]);
                 if (!step.ok) throw std::runtime_error("prefill failed");
                 prefill_ops += step.ops_executed;
@@ -7031,6 +7098,12 @@ private:
                              static_cast<int32_t>(prompt_tokens[pi]),
                              *executor_, *tokenizer_);
             }
+        } else if (warm_reuse) {
+            std::vector<uint32_t> suffix(prompt_tokens.begin() + prefill_begin,
+                                         prompt_tokens.end());
+            step = executor_->forward_n_tokens(suffix);
+            if (!step.ok) throw std::runtime_error("prefill failed");
+            prefill_ops = step.ops_executed;
         } else {
             step = executor_->forward_n_tokens(prompt_tokens);
             if (!step.ok) throw std::runtime_error("prefill failed");
@@ -7048,8 +7121,13 @@ private:
         const int bs_interval =
             std::max(1, options_.kvmem_interval);
         if (bs_on) {
-            executor_->kvmem_register_append(
-                static_cast<uint32_t>(prompt_tokens.size()));
+            // On warm reuse the prefix blocks are already registered from the
+            // prior turn; register only the freshly-prefilled suffix.
+            const uint32_t reg_n =
+                warm_reuse
+                    ? static_cast<uint32_t>(prompt_tokens.size() - reuse_m)
+                    : static_cast<uint32_t>(prompt_tokens.size());
+            executor_->kvmem_register_append(reg_n);
             executor_->kvmem_reselect();
         }
 
@@ -7088,6 +7166,10 @@ private:
         };
 
         std::string generated;
+        // Committed decode token ids, accumulated only when we intend to keep a
+        // warm checkpoint. Appended in commit order so kvmem_warm_log_ stays
+        // consistent with the executor KV / kvmem register count.
+        std::vector<uint32_t> gen_tokens;
         const int32_t eos = tokenizer_->eos_id();
         ThinkingBudgetState budget;
         budget_init(budget, options);
@@ -7104,6 +7186,7 @@ private:
             generated += piece;
             if (on_text) on_text(piece);
             ++seen_tokens[next_token];
+            if (warm_capture) gen_tokens.push_back(next_token);
             ++decoded;
         }
         for (int i = 0; i + 1 < options.max_tokens; ++i) {
@@ -7135,12 +7218,41 @@ private:
             generated += piece;
             if (on_text) on_text(piece);
             ++seen_tokens[next_token];
+            if (warm_capture) gen_tokens.push_back(next_token);
             ++decoded;
         }
         const double t_decode_end = wall_seconds();
 
         if (decoded == 0 && options.max_tokens > 0) {
             log_zero_decode_diagnostic("plain", prompt_tokens, step);
+        }
+
+        // kvmem prefix cache: record this request's end as the warm resume
+        // point for the next request. The last emitted token is never forwarded
+        // (its KV is not in the store), so resize the log down to the executor
+        // position -> it matches KV pages + kvmem register count exactly. A
+        // position() beyond the log can't happen on the plain path, but guard it
+        // (invalidate) rather than capture an inconsistent checkpoint. Captured
+        // inside the device scope since capture_state issues device copies.
+        if (warm_capture) {
+            kvmem_warm_log_ = prompt_tokens;
+            kvmem_warm_log_.insert(kvmem_warm_log_.end(),
+                                   gen_tokens.begin(), gen_tokens.end());
+            const size_t pos = executor_->position();
+            if (pos <= kvmem_warm_log_.size()) {
+                kvmem_warm_log_.resize(pos);
+                executor_->capture_state(kvmem_warm_ckpt_);
+                kvmem_warm_valid_ = true;
+                if (kvmem_prefix_cache_trace_enabled()) {
+                    std::ostringstream cmsg;
+                    cmsg << "kvmem prefix-cache CAPTURE (plain): warm_log="
+                         << kvmem_warm_log_.size() << " pos=" << pos
+                         << " decoded=" << decoded;
+                    log(cmsg.str());
+                }
+            } else {
+                kvmem_warm_valid_ = false;
+            }
         }
 
         st = device_->end();
@@ -7163,6 +7275,10 @@ private:
                 << (decoded / decode_s) << " tok/s)";
         }
         msg << " prefill_ops=" << prefill_ops << " decode_ops=" << decode_ops;
+        if (warm_reuse) {
+            msg << " kvmem_reuse=" << reuse_m
+                << " prefilled=" << (prompt_tokens.size() - reuse_m);
+        }
         log(msg.str());
 
         return generated;
@@ -7207,13 +7323,36 @@ private:
         QwenExecutor *executor_ =
             override_executor != nullptr ? override_executor : this->executor_.get();
         if (!executor_) throw std::runtime_error("MTP executor unavailable");
+        // kvmem prefix cache (QW3_KVMEM_PREFIX_CACHE): only the plain-route shared
+        // executor (override_executor==nullptr) on a fresh-session request
+        // (reset_session) is eligible. run_kvmem_session (reset_session=false) and
+        // the CB per-request executors are excluded, so those paths are untouched.
+        const uint32_t kvmem_reuse_m =
+            (reset_session && override_executor == nullptr)
+                ? kvmem_prefix_reuse_len(prompt_tokens, options)
+                : 0;
+        const bool kvmem_warm_reuse = kvmem_reuse_m > 0;
+        const bool kvmem_warm_capture =
+            reset_session && override_executor == nullptr &&
+            kvmem_prefix_cache_enabled() && executor_->kvmem_enabled();
         DeviceStatus st;
         if (manage_device_scope) {
             st = device_->begin();
             if (!st.ok) throw std::runtime_error(st.message);
         }
-        if (reset_session) {
+        if (kvmem_warm_reuse) {
+            // Resume at the end of the prior request; suffix-only prefill below.
+            executor_->restore_state(kvmem_warm_ckpt_);
+            if (kvmem_prefix_cache_trace_enabled()) {
+                std::ostringstream tmsg;
+                tmsg << "kvmem prefix-cache HIT (mtp): reuse=" << kvmem_reuse_m
+                     << " prompt=" << prompt_tokens.size()
+                     << " suffix=" << (prompt_tokens.size() - kvmem_reuse_m);
+                log(tmsg.str());
+            }
+        } else if (reset_session) {
             executor_->reset_state();
+            if (kvmem_warm_capture) kvmem_warm_valid_ = false;
         }
 
         // kvmem × MTP (Phase C). When kvmem is enabled the verify path must
@@ -7338,6 +7477,18 @@ private:
         // chunk appends at the running position, so the MTP draft prefix must
         // be primed at the absolute base (not the call-relative chunk offset).
         const uint32_t prefill_base = executor_->position();
+        // On warm reuse prefill_base == kvmem_reuse_m (restored position), so the
+        // [0,kvmem_reuse_m) prefix is already resident and only the suffix is
+        // prefilled. prime_mtp_prefix(chunk, prefill_base + offset) stays at the
+        // correct absolute base since offset runs over the suffix.
+        std::vector<uint32_t> kvmem_suffix;
+        if (kvmem_warm_reuse) {
+            kvmem_suffix.assign(prompt_tokens.begin() + kvmem_reuse_m,
+                                prompt_tokens.end());
+        }
+        const std::vector<uint32_t> &prefill_tokens =
+            kvmem_warm_reuse ? kvmem_suffix : prompt_tokens;
+        const size_t kvmem_prefill_begin = kvmem_warm_reuse ? kvmem_reuse_m : 0;
         QwenExecutor::KvMemTimingSnapshot kvmem_tbase;
         if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
             kvmem_tbase = QwenExecutor::kvmem_timing_snapshot();
@@ -7352,7 +7503,7 @@ private:
                 log("native mtp_prefix: ok=false reason=\"dump logits path does not expose batch hidden rows\"");
                 use_mtp_prefix = false;
             }
-            for (size_t pi = 0; pi < prompt_tokens.size(); ++pi) {
+            for (size_t pi = kvmem_prefill_begin; pi < prompt_tokens.size(); ++pi) {
                 step = executor_->forward_one_token(prompt_tokens[pi]);
                 if (!step.ok) throw std::runtime_error("prefill failed");
                 prefill_ops += step.ops_executed;
@@ -7363,22 +7514,22 @@ private:
         } else if (!use_mtp_prefix) {
             // No prefix priming needed: defer to qw3's internal-chunking prefill.
             const double t_chunk_start = wall_seconds();
-            step = executor_->forward_n_tokens(prompt_tokens);
+            step = executor_->forward_n_tokens(prefill_tokens);
             if (!step.ok) throw std::runtime_error("prefill failed");
             const double t_chunk_end = wall_seconds();
             prefill_ops = step.ops_executed;
             prefill_chunks = 1;
             if (trace_prefill) {
-                log_prefill_chunk(0, 0, prompt_tokens.size(), t_chunk_end - t_chunk_start);
+                log_prefill_chunk(0, 0, prefill_tokens.size(), t_chunk_end - t_chunk_start);
             }
         } else {
-            for (size_t offset = 0; offset < prompt_tokens.size(); offset += kMtpPrefillChunk) {
-                const size_t end = std::min(prompt_tokens.size(),
+            for (size_t offset = 0; offset < prefill_tokens.size(); offset += kMtpPrefillChunk) {
+                const size_t end = std::min(prefill_tokens.size(),
                                             offset + static_cast<size_t>(kMtpPrefillChunk));
-                std::vector<uint32_t> chunk(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(offset),
-                                            prompt_tokens.begin() + static_cast<std::ptrdiff_t>(end));
+                std::vector<uint32_t> chunk(prefill_tokens.begin() + static_cast<std::ptrdiff_t>(offset),
+                                            prefill_tokens.begin() + static_cast<std::ptrdiff_t>(end));
                 const double t_chunk_start = wall_seconds();
-                const bool need_logits = end == prompt_tokens.size();
+                const bool need_logits = end == prefill_tokens.size();
                 step = executor_->forward_n_tokens(chunk, need_logits);
                 if (!step.ok) throw std::runtime_error("prefill failed");
                 prime_mtp_prefix(chunk, prefill_base + static_cast<uint32_t>(offset));
@@ -7427,6 +7578,9 @@ private:
         const double t_reselect_end = wall_seconds();
 
         std::string generated;
+        // Committed decode token ids for the kvmem warm checkpoint; appended in
+        // emit order (== commit order) only when a warm capture is intended.
+        std::vector<uint32_t> gen_tokens;
         const int32_t eos = tokenizer_->eos_id();
         ThinkingBudgetState budget;
         budget_init(budget, options);
@@ -7743,6 +7897,7 @@ private:
             // Track committed tokens for the next accept test's penalties (no-op
             // for greedy without penalties, keeping that path byte-identical).
             if (mtp_need_logits_pick) ++mtp_seen[token];
+            if (kvmem_warm_capture) gen_tokens.push_back(token);
             ++decoded;
             return true;
         };
@@ -8194,6 +8349,34 @@ private:
         }
         const double t_decode_end = wall_seconds();
 
+        // kvmem prefix cache: record this request's end as the warm resume point.
+        // warm_log = prompt + emitted tokens, resized down to the executor
+        // position (the last emitted token is never forwarded, so its KV is not
+        // resident). position() beyond the log (e.g. an accepted token committed
+        // to KV but not emitted because max_tokens was hit) invalidates the warm
+        // state instead of capturing an inconsistent checkpoint. Captured inside
+        // the device scope since capture_state issues device copies.
+        if (kvmem_warm_capture) {
+            kvmem_warm_log_ = prompt_tokens;
+            kvmem_warm_log_.insert(kvmem_warm_log_.end(),
+                                   gen_tokens.begin(), gen_tokens.end());
+            const size_t pos = executor_->position();
+            if (pos <= kvmem_warm_log_.size()) {
+                kvmem_warm_log_.resize(pos);
+                executor_->capture_state(kvmem_warm_ckpt_);
+                kvmem_warm_valid_ = true;
+                if (kvmem_prefix_cache_trace_enabled()) {
+                    std::ostringstream cmsg;
+                    cmsg << "kvmem prefix-cache CAPTURE (mtp): warm_log="
+                         << kvmem_warm_log_.size() << " pos=" << pos
+                         << " decoded=" << decoded;
+                    log(cmsg.str());
+                }
+            } else {
+                kvmem_warm_valid_ = false;
+            }
+        }
+
         if (manage_device_scope) {
             st = device_->end();
             if (!st.ok) throw std::runtime_error(st.message);
@@ -8223,6 +8406,10 @@ private:
                 << " prefill_chunk_size=" << prefill_chunk_size;
         }
         msg << " prefill_ops=" << prefill_ops << " decode_ops=" << decode_ops;
+        if (kvmem_warm_reuse) {
+            msg << " kvmem_reuse=" << kvmem_reuse_m
+                << " prefilled=" << (prompt_tokens.size() - kvmem_reuse_m);
+        }
         log(msg.str());
         if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
             QwenExecutor::kvmem_timing_emit_delta("phase=decode request=mtp",
@@ -8633,6 +8820,17 @@ private:
     uint64_t prefix_cache_next_id_ = 1;
     uint32_t prefix_cache_pinned_pages_ = 0;
     bool prefix_cache_evict_cb_installed_ = false;
+
+    // ---- kvmem single-request prefix cache (QW3_KVMEM_PREFIX_CACHE) --------
+    // Keeps the plain-route shared executor_ warm across requests. kvmem_warm_log_
+    // is the full token sequence of the last request (prompt + committed decode
+    // tokens); kvmem_warm_ckpt_ is capture_state() at exactly that end position.
+    // If a new prompt begins with the whole warm log, we restore_state() and
+    // prefill only the trailing suffix instead of reset+full re-prefill.
+    std::vector<uint32_t> kvmem_warm_log_;
+    QwenExecutor::StateSnapshot kvmem_warm_ckpt_;
+    bool kvmem_warm_valid_ = false;
+
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_v_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_mtp_k_cache_storage_;

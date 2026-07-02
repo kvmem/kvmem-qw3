@@ -35,6 +35,11 @@ struct ServerConfig {
     // by the KV pool) and tracing is off — these are the tuned values, so they
     // are not exposed as separate switches.
     bool prefix_cache = false;
+    // kvmem single-request prefix cache on the plain (non-CB) serve route. Off
+    // by default; --kvmem-prefix-cache opts in. Requires --kvmem. Keeps the
+    // shared executor warm across requests and prefills only the new suffix when
+    // a prompt strictly extends the prior request (prompt+response).
+    bool kvmem_prefix_cache = false;
     int max_active = 2;
     int max_pending = 128;
     int prefill_burst = 0;

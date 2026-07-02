@@ -121,6 +121,11 @@ void usage(std::ostream &os) {
         "  --kvmem-nvme-dir DIR  Directory for KVMem NVMe backing file.\n"
         "  --kvmem-nvme-gb F     NVMe tier budget in GiB. Requires --kvmem-nvme-dir.\n"
         "  --kvmem-nvme-bytes N  NVMe tier budget in bytes (legacy alias).\n"
+        "  --kvmem-prefix-cache  Serve plain (non-CB) route only: keep the shared\n"
+        "                        executor warm across requests and prefill only the\n"
+        "                        new suffix when a prompt strictly extends the prior\n"
+        "                        request (prompt+response). Requires --kvmem.\n"
+        "                        Default: off.\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
@@ -506,6 +511,8 @@ int main(int argc, char **argv) {
                 serve_cfg.mtp_paged_prefix_set = true;
             } else if (arg == "--prefix-cache") {
                 serve_cfg.prefix_cache = true;
+            } else if (arg == "--kvmem-prefix-cache") {
+                serve_cfg.kvmem_prefix_cache = true;
             } else if (arg == "--kv-dtype") {
                 const std::string dt = need(arg);
                 if (dt != "fp16" && dt != "fp32" && dt != "q8" && dt != "fp8") {

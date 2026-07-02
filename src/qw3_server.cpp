@@ -931,6 +931,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                      "cold-prefill in v1 (cache applies to the plain "
                      "continuous-batching path)\n";
     }
+    if (cfg.kvmem_prefix_cache && !engine.kvmem_enabled) {
+        std::cerr << "[qw3-serve] --kvmem-prefix-cache requires --kvmem; "
+                     "kvmem prefix caching disabled\n";
+        cfg.kvmem_prefix_cache = false;
+    }
+    if (cfg.kvmem_prefix_cache && cfg.continuous_batching) {
+        std::cerr << "[qw3-serve] note: --kvmem-prefix-cache applies to the plain "
+                     "(non-continuous-batching) serve route; it is inert while "
+                     "--continuous-batching is active\n";
+    }
 
     // The backend still reads several low-level toggles from process config.
     // Keep that as an internal bridge; the user-facing API is the explicit CLI
@@ -949,6 +959,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         setenv_bool("QW3_PREFIX_CACHE", prefix_cache_on);
         setenv_value("QW3_PREFIX_CACHE_MAX_PAGES", 0);
     }
+    // kvmem single-request prefix cache: plain-route warm reuse. Requires kvmem;
+    // inert on the CB path (only generate_plain / generate_mtp on the shared
+    // executor read it). Tracing left to QW3_KVMEM_PREFIX_CACHE_TRACE opt-in.
+    setenv_bool("QW3_KVMEM_PREFIX_CACHE",
+                cfg.kvmem_prefix_cache && engine.kvmem_enabled);
     setenv_bool("QW3_MTP_SPECULATE", engine.native_mtp_speculate);
     setenv_value("QW3_MTP_POLICY", engine.mtp_policy);
     if (engine.mtp_adaptive_min_chain > 0) {
@@ -1056,6 +1071,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << (engine.kvmem_nvme_dir.empty()
                       ? std::string("(unset)")
                       : engine.kvmem_nvme_dir)
+              << "\n"
+              << "  kvmem_prefix_cache="
+              << yesno(cfg.kvmem_prefix_cache && engine.kvmem_enabled &&
+                       !cfg.continuous_batching)
               << "\n";
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
