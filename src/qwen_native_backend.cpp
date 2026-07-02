@@ -1241,9 +1241,9 @@ public:
 
         GenerationOptions gen;
         gen.max_tokens = std::max(1, cfg.decode_tokens);
-        gen.temperature = 0.0f;
-        gen.top_k = 0;
-        gen.top_p = 1.0f;
+        gen.temperature = cfg.temperature;
+        gen.top_k = cfg.top_k;
+        gen.top_p = cfg.top_p;
         gen.ignore_eos = true;  // decode exactly decode_tokens (steady-state TBT)
 
         struct TurnRow {
@@ -5647,9 +5647,9 @@ private:
         bs_cfg.select_policy = options_.kvmem_select_policy == "quota"
             ? KvMemSelectPolicy::Quota
             : KvMemSelectPolicy::TopK;
-        bs_cfg.retrieval_method = options_.kvmem_retrieval_method == "content_mean"
-            ? KvMemRetrievalMethod::ContentMean
-            : KvMemRetrievalMethod::MeanAttention;
+        bs_cfg.retrieval_method = options_.kvmem_retrieval_method == "per-token"
+            ? KvMemRetrievalMethod::PerToken
+            : KvMemRetrievalMethod::MeanK;
         bs_cfg.update_mode = options_.kvmem_update_mode == "step"
             ? KvMemUpdateMode::Step
             : KvMemUpdateMode::Interval;
@@ -7017,17 +7017,6 @@ private:
                  << options.kvmem_query_begin << "," << options.kvmem_query_end
                  << ") tokens=" << (options.kvmem_query_end - options.kvmem_query_begin);
             log(qmsg.str());
-            // Context-free query embedding (AgentKV run_segment isolation, opt-in):
-            // BEFORE the main prefill (KV empty, pos 0) capture a question-only Q.
-            if (executor_->kvmem_query_contextfree_enabled() &&
-                options.kvmem_query_end <= prompt_tokens.size()) {
-                std::vector<uint32_t> qtoks(
-                    prompt_tokens.begin() + options.kvmem_query_begin,
-                    prompt_tokens.begin() + options.kvmem_query_end);
-                const bool cf = executor_->kvmem_capture_query_contextfree(qtoks);
-                log(std::string("native kvmem context-free query embed: ") +
-                    (cf ? "captured (retrieval-only)" : "skipped/failed"));
-            }
         }
 
         const double t_prefill_start = wall_seconds();
@@ -7255,17 +7244,6 @@ private:
                  << options.kvmem_query_begin << "," << options.kvmem_query_end
                  << ") tokens=" << (options.kvmem_query_end - options.kvmem_query_begin);
             log(qmsg.str());
-            // Context-free query embedding (AgentKV run_segment isolation, opt-in):
-            // BEFORE the main prefill (KV empty, pos 0) capture a question-only Q.
-            if (executor_->kvmem_query_contextfree_enabled() &&
-                options.kvmem_query_end <= prompt_tokens.size()) {
-                std::vector<uint32_t> qtoks(
-                    prompt_tokens.begin() + options.kvmem_query_begin,
-                    prompt_tokens.begin() + options.kvmem_query_end);
-                const bool cf = executor_->kvmem_capture_query_contextfree(qtoks);
-                log(std::string("native kvmem context-free query embed: ") +
-                    (cf ? "captured (retrieval-only)" : "skipped/failed"));
-            }
         }
         const int kvmem_interval = std::max(1, options_.kvmem_interval);
         uint32_t kvmem_last_reselect_pos = 0;

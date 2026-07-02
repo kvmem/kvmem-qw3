@@ -916,36 +916,6 @@ public:
         return {false, "derope_store_content_batch_device requires backend override"};
     }
 
-    // block_attn_score_maxsim_device (#104, raw-key ColBERT MaxSim): per normal-
-    // attention layer (one launch, ACCUMULATES into score), for every block w
-    //   score[w] += Σ_{j<M} Σ_{qh<n_heads}
-    //                 max_{t<blk_tokens[w]} ReLU(scale·(q[j,qh] · kraw[first_w+t,kvh])),
-    // kvh = qh/(n_heads/n_kv_heads). Replaces the per-block MEAN key (which dilutes a
-    // single answer-bearing token among the block's ~1024) with a per-(query token,
-    // head) MAX over the block's tokens. q_layer is [M, n_heads, head_dim] fp32;
-    // kraw is [total_tokens, n_kv_heads, head_dim] fp32. q_elem_off / kraw_elem_off
-    // select this layer's slice. blk_first_tok/blk_tokens are int32 [n_blocks].
-    // score is fp32 [n_blocks] (caller zeros once before the L-layer loop). Returns an
-    // error if the per-block running-max shmem exceeds the cap (caller falls back).
-    virtual DeviceStatus block_attn_score_maxsim_device(DeviceTensor &score,
-                                                        const DeviceTensor &q_layer,
-                                                        const DeviceTensor &kraw,
-                                                        uint32_t M,
-                                                        uint32_t n_blocks,
-                                                        const DeviceTensor &blk_first_tok,
-                                                        const DeviceTensor &blk_tokens,
-                                                        uint32_t n_heads,
-                                                        uint32_t n_kv_heads,
-                                                        uint32_t head_dim,
-                                                        float scale,
-                                                        uint64_t q_elem_off = 0,
-                                                        uint64_t kraw_elem_off = 0) {
-        (void)score; (void)q_layer; (void)kraw; (void)M; (void)n_blocks;
-        (void)blk_first_tok; (void)blk_tokens; (void)n_heads; (void)n_kv_heads;
-        (void)head_dim; (void)scale; (void)q_elem_off; (void)kraw_elem_off;
-        return {false, "block_attn_score_maxsim_device requires backend override"};
-    }
-
     // block_attn_score_exactmass_device (ExactMass, AgentKV port): per normal-
     // attention layer (one launch, ACCUMULATES into score), for every block w
     //   score[w] += head_w · Σ_{j<M} Σ_{qh<n_heads}
@@ -983,32 +953,6 @@ public:
         return {false, "block_attn_score_exactmass_device requires backend override"};
     }
 
-    // block_attn_score_multilayer_device: one-shot fused multi-layer block scorer
-    // (#88). For every block w in a SINGLE launch, computes
-    //   score[w] = Σ_{l<L} Σ_{j<M} Σ_{qh<n_heads}
-    //                  ReLU(scale · (q_multi[l,j,qh] · kbar_multi[l,w,kvh])),
-    // with kvh = qh / (n_heads/n_kv_heads). q_multi is [L, q_layer_stride, n_heads,
-    // head_dim] fp32 (only the first M token rows per layer are read; layer stride
-    // is q_layer_stride rows); kbar_multi is [L, n_blocks, n_kv_heads, head_dim]
-    // fp32. Output score is fp32 [n_blocks] (overwritten, not accumulated). Replaces
-    // the M-launch + M-D2H single-layer multitoken loop with 1 launch + 1 D2H.
-    virtual DeviceStatus block_attn_score_multilayer_device(DeviceTensor &score,
-                                                            const DeviceTensor &q_multi,
-                                                            const DeviceTensor &kbar_multi,
-                                                            uint32_t n_layers,
-                                                            uint32_t n_tokens,
-                                                            uint32_t q_layer_stride,
-                                                            uint32_t n_blocks,
-                                                            uint32_t n_heads,
-                                                            uint32_t n_kv_heads,
-                                                            uint32_t head_dim,
-                                                            float scale) {
-        (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
-        (void)q_layer_stride; (void)n_blocks; (void)n_heads; (void)n_kv_heads;
-        (void)head_dim; (void)scale;
-        return {false, "block_attn_score_multilayer_device requires backend override"};
-    }
-
     // block_attn_score_softmax_pages_device: query-conditioned scorer variant that
     // forms a PROPER per-(layer,token,head) softmax distribution over pages (#102).
     // One CUDA block per (layer,token); for each query head it softmaxes
@@ -1018,8 +962,9 @@ public:
     //   score[w] = Σ_t mean_l mean_h softmax_w( scale · (q[l,t,h]·k̄[l,w,h/group]) ),
     // i.e. accumulated attention mass each page receives from all question tokens,
     // averaged over the L normal-attention layers. score is ZEROED then accumulated.
-    // scale should be 1/sqrt(head_dim) (real-attention temperature). Same q_multi /
-    // kbar_multi layouts as block_attn_score_multilayer_device. Returns an error if
+    // scale should be 1/sqrt(head_dim) (real-attention temperature). q_multi is
+    // [L, q_layer_stride, n_heads, head_dim] fp32 (first M token rows/layer read);
+    // kbar_multi is [L, n_blocks, n_kv_heads, head_dim] fp32. Returns an error if
     // n_blocks exceeds the kernel's shared-memory page cap (caller falls back).
     virtual DeviceStatus block_attn_score_softmax_pages_device(DeviceTensor &score,
                                                                const DeviceTensor &q_multi,

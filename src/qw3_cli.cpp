@@ -103,8 +103,8 @@ void usage(std::ostream &os) {
         "  --kvmem-method M  Block selection signal: retrieval|h2o|recency.\n"
         "                        Default: retrieval.\n"
         "  --kvmem-select-policy M  Selection policy: topk|quota. Default: topk.\n"
-        "  --kvmem-retrieval-method M  Retrieval scorer: mean_attention|content_mean.\n"
-        "                        Default: mean_attention.\n"
+        "  --kvmem-retrieval-method M  Query-conditioned scorer: mean-k|per-token.\n"
+        "                        Default: mean-k (needs --kvmem-query-conditioned).\n"
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
         "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
         "                        final user message (the question) instead of recency.\n"
@@ -150,6 +150,8 @@ void usage(std::ostream &os) {
         "                        allowed. Must be strictly increasing.\n"
         "                        Default: 256K,512K,1M,1.5M,2M.\n"
         "  --session-decode-tokens N  MTP decode probe length per turn. Default: 256.\n"
+        "  --temp F              Decode-probe temperature. Default 0 (greedy);\n"
+        "                        --temp>0 uses the Qwen3 sampled recipe.\n"
         "\n"
         "Diagnostics:\n"
         "  --inspect             Print GGUF summary and exit\n"
@@ -378,10 +380,10 @@ int main(int argc, char **argv) {
                 }
             } else if (arg == "--kvmem-retrieval-method") {
                 engine.kvmem_retrieval_method = need(arg);
-                if (engine.kvmem_retrieval_method != "mean_attention" &&
-                    engine.kvmem_retrieval_method != "content_mean") {
+                if (engine.kvmem_retrieval_method != "mean-k" &&
+                    engine.kvmem_retrieval_method != "per-token") {
                     throw std::runtime_error(
-                        "--kvmem-retrieval-method must be mean_attention|content_mean");
+                        "--kvmem-retrieval-method must be mean-k|per-token");
                 }
             } else if (arg == "--kvmem-update-mode") {
                 engine.kvmem_update_mode = need(arg);
@@ -627,6 +629,13 @@ int main(int argc, char **argv) {
             qw3::KvMemSessionConfig sess;
             sess.ladder_tokens = session_ladder;
             sess.decode_tokens = session_decode_tokens;
+            // Default greedy; --temp opts the decode probe into the Qwen3
+            // sampled recipe (top_p/top_k carry their gen defaults 0.95/20).
+            if (serve_cfg.temperature_set) {
+                sess.temperature = gen.temperature;
+                sess.top_p = gen.top_p;
+                sess.top_k = gen.top_k;
+            }
             return qw3::run_kvmem_session(engine, sess);
         }
 

@@ -64,7 +64,7 @@ struct EngineOptions {
     // or "recency" (sink + recent windows only, no learned signal).
     std::string kvmem_method = "retrieval";
     std::string kvmem_select_policy = "topk"; // topk or quota
-    std::string kvmem_retrieval_method = "mean_attention";
+    std::string kvmem_retrieval_method = "mean-k"; // mean-k or per-token
     std::string kvmem_update_mode = "interval"; // interval or step
     // When true, the serve layer marks the final user message's token span as
     // the "question" and the executor scores blocks by the multi-token mean

@@ -1,5 +1,33 @@
 # Plan: KVMem utility evaluation (external Python over qw3's OpenAI API)
 
+## UPDATE 2026-07-01 — query-conditioned scorers consolidated to two CLI methods
+
+The `QW3_KVMEM_QC_*` env-flag zoo (softmax-pages, sum-of-ReLU multilayer, single-layer,
+MaxSim, ExactMass + strict/context-free sub-variants) has been **deleted** down to the two
+LongMemEval-S keepers, now selected via CLI instead of env:
+
+| CLI (requires `--kvmem-query-conditioned`) | scorer | buffer | LongMemEval-S (bt256, budget 64K) |
+| --- | --- | --- | ---: |
+| `--kvmem-retrieval-method mean-k` **(default)** | softmax-over-pages on the per-block mean key | ~28 MB `g_kbar_multi_` | **85.3%** |
+| `--kvmem-retrieval-method per-token` | ExactMass over raw per-token keys (per-head) | ~7.4 GB `g_kraw_multi_` (allocated only here) | 81.4% |
+
+**Env → CLI mapping** (the old flags no longer exist):
+- `QW3_KVMEM_QC_SOFTMAX=1` → `--kvmem-retrieval-method mean-k`
+- `QW3_KVMEM_QC_EXACTMASS=1` → `--kvmem-retrieval-method per-token`
+- `content_mean` / `mean_attention` CLI values → **removed** (the old `content_mean` ran the
+  now-deleted sum-of-ReLU multilayer scorer; the mean-k product is softmax-over-pages).
+
+**Deleted outright** (scorers + kernels + env flags): sum-of-ReLU `block_attn_score_multilayer`,
+`block_attn_score_maxsim` (MaxSim), ExactMass strict-AgentKV group-mean, context-free query embed,
+and the single-layer A/B path. `QW3_KVMEM_NO_REROPE` and `QW3_KVMEM_QC_LAYERS` (debug L cap) are
+retained. Without `--kvmem-query-conditioned` the executor falls back to the internal single
+last-token scorer (unchanged, byte-identical when kvmem is off).
+
+The eval scripts under `/data/chaidi/kvmem_eval/*.sh` have been updated to pass
+`--kvmem-retrieval-method {mean-k|per-token}` instead of the `QW3_KVMEM_QC_*` env + `content_mean`.
+The historical A/B tables below still name the old env flags — kept for the experimental record;
+map them via the table above.
+
 ## KNOWN PROBLEM 2026-06-30 — the accuracy gap is RETRIEVAL SELECTION, not the machinery
 
 Status of the KV-native retrieval number: **the query-conditioned scorer's recall is the

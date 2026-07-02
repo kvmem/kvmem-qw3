@@ -289,13 +289,6 @@ bool launch_block_attn_score_step(float *accum, const float *q,
                                   uint32_t n_blocks, uint32_t n_heads,
                                   uint32_t n_kv_heads, uint32_t head_dim,
                                   float scale, cudaStream_t stream);
-bool launch_block_attn_score_multilayer(float *score, const float *q_multi,
-                                        const float *kbar_multi,
-                                        uint32_t n_layers, uint32_t n_tokens,
-                                        uint32_t q_layer_stride,
-                                        uint32_t n_blocks, uint32_t n_heads,
-                                        uint32_t n_kv_heads, uint32_t head_dim,
-                                        float scale, cudaStream_t stream);
 bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            const float *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
@@ -334,19 +327,13 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint32_t n_kv_heads, uint32_t head_dim,
                                       uint32_t rope_dim, int32_t rope_base,
                                       float theta, cudaStream_t stream);
-// Raw-key MaxSim (#104): store each de-RoPE'd K row (no mean) + ColBERT MaxSim score.
+// Raw-key store (per-token retrieval): store each de-RoPE'd K row (no mean).
 bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
                                        uint64_t out_base_elem, uint32_t k_stride,
                                        uint32_t batch, uint32_t n_kv_heads,
                                        uint32_t head_dim, uint32_t rope_dim,
                                        int32_t rope_base, float theta,
                                        cudaStream_t stream);
-bool launch_block_attn_score_maxsim(float *score, const float *q_layer,
-                                    const float *kraw, uint32_t M,
-                                    uint32_t n_blocks, const int32_t *blk_first_tok,
-                                    const int32_t *blk_tokens, uint32_t n_heads,
-                                    uint32_t n_kv_heads, uint32_t head_dim,
-                                    float scale, cudaStream_t stream);
 // Raw-key ExactMass (AgentKV port): global per-token softmax mass per block.
 bool launch_block_attn_score_exactmass(float *score, const float *q_layer,
                                        const float *kraw, uint32_t M,
@@ -2933,90 +2920,6 @@ __global__ void block_attn_score_step_kernel(float *accum,
     if (d == 0) accum[w] += block_score;
 }
 
-// block_attn_score_multilayer_kernel: one-shot fused multi-layer block scorer
-// (#88). One CUDA block per KVMem block w (grid = n_blocks, blockDim = 256 = 8
-// warps). For block w, computes
-//   score[w] = Σ_{l<L} Σ_{j<M} Σ_{qh<n_heads}
-//                  ReLU(scale · (q_multi[l,j,qh] · kbar_multi[l,w,kvh])),
-// kvh = qh/group. Each warp owns a head set (qh = warp_id, +NWARPS, …); the
-// per-head dot (head_dim contiguous fp32) is a warp-shuffle reduction (each lane
-// owns head_dim/32 strided elems, 5 shuffles, no __syncthreads in the inner
-// loop). k̄[l,w,kvh] is hoisted into registers across the M-token loop (it does
-// not depend on j). Replaces the M-launch + M-D2H single-layer loop with one
-// launch + one D2H while folding in ALL L normal-attention layers.
-//   q_multi      [L, q_layer_stride, n_heads, head_dim] fp32 (M valid rows/layer)
-//   kbar_multi   [L, n_blocks, n_kv_heads, head_dim]    fp32
-//   score        [n_blocks] fp32 (OVERWRITTEN)
-__global__ void block_attn_score_multilayer_kernel(float *score,
-                                                   const float *q_multi,
-                                                   const float *kbar_multi,
-                                                   uint32_t n_layers,
-                                                   uint32_t n_tokens,
-                                                   uint32_t q_layer_stride,
-                                                   uint32_t n_blocks,
-                                                   uint32_t n_heads,
-                                                   uint32_t n_kv_heads,
-                                                   uint32_t head_dim,
-                                                   float scale) {
-    const uint32_t w = blockIdx.x;
-    if (w >= n_blocks) return;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t wid = threadIdx.x >> 5;            // warp id
-    const uint32_t nwarps = blockDim.x >> 5;          // 8
-    const uint32_t group = n_heads / n_kv_heads;
-    const uint32_t elems = (head_dim + 31u) / 32u;    // strided elems per lane
-    const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
-
-    float warp_sum = 0.0f;
-    for (uint32_t l = 0; l < n_layers; ++l) {
-        const float *kbar_l =
-            kbar_multi + static_cast<uint64_t>(l) * n_blocks * n_kv_heads * head_dim;
-        const float *q_l =
-            q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
-        for (uint32_t qh = wid; qh < n_heads; qh += nwarps) {
-            const uint32_t kvh = qh / group;
-            const float *kbar_row =
-                kbar_l + (static_cast<uint64_t>(w) * n_kv_heads + kvh) * head_dim;
-            // Hoist k̄[l,w,kvh] into registers (constant across the j loop).
-            float kreg[8];
-            #pragma unroll
-            for (uint32_t e = 0; e < 8; ++e) {
-                const uint32_t idx = e * 32u + lane;
-                kreg[e] = (e < elems && idx < head_dim) ? kbar_row[idx] : 0.0f;
-            }
-            for (uint32_t j = 0; j < n_tokens; ++j) {
-                const float *qr = q_l + (static_cast<uint64_t>(j) * n_heads + qh) * head_dim;
-                float dot = 0.0f;
-                #pragma unroll
-                for (uint32_t e = 0; e < 8; ++e) {
-                    const uint32_t idx = e * 32u + lane;
-                    if (e < elems && idx < head_dim) dot += qr[idx] * kreg[e];
-                }
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    dot += __shfl_down_sync(0xffffffffu, dot, off);
-                }
-                if (lane == 0) {
-                    const float v = dot * scale;
-                    warp_sum += v > 0.0f ? v : 0.0f;
-                }
-            }
-        }
-    }
-    // Reduce the per-warp partial sums (held in lane 0 of each warp).
-    __shared__ float wsh[32];
-    if (lane == 0) wsh[wid] = warp_sum;
-    __syncthreads();
-    if (wid == 0) {
-        float t = (lane < nwarps) ? wsh[lane] : 0.0f;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            t += __shfl_down_sync(0xffffffffu, t, off);
-        }
-        if (lane == 0) score[w] = t;
-    }
-}
-
 // block_attn_score_softmax_pages_kernel: one CUDA block per (layer,token). For
 // each query head it computes logit[w] = scale·(q[l,t,h]·k̄[l,w,h/group]) for every
 // page w, softmaxes those logits OVER PAGES, then atomicAdds (1/(L·H))·softmax_w
@@ -3390,105 +3293,6 @@ __global__ void derope_store_content_batch_kernel(const float *k_batch,
     }
     kraw[out_base_elem + (static_cast<uint64_t>(r) * n_kv_heads + h) * head_dim + d] =
         deroped;
-}
-
-// block_attn_score_maxsim_kernel (MaxSim, raw-key retrieval): ColBERT-style block
-// scorer over the RAW per-token de-RoPE'd keys (one normal-attention layer per
-// launch, ACCUMULATES into score). For block w:
-//   score[w] += Σ_{j<M} Σ_{qh<n_heads}
-//                 max_{t < blk_tokens[w]} ReLU(scale·(q[j,qh] · kraw[first_w+t, kvh])),
-// kvh = qh/group. Replaces the per-block MEAN key (q·mean(k) ≡ mean_t(q·k), which
-// dilutes a single answer-bearing token among the block's ~1024) with a per-(query
-// token, head) MAX over the block's tokens, so a needle token spikes the score.
-// grid = n_blocks, blockDim = 256 (8 warps). Each warp owns query heads qh = wid,
-// wid+nwarps, …; for each owned qh it walks the block's tokens (loads kraw[first+t,
-// kvh] into 8 strided elems/lane), dots each query token j (warp-shuffle reduction
-// over head_dim), ReLU, and keeps a per-query-token running max in dynamic shmem
-// (nwarps*M floats; lane 0 of each warp owns its M maxes). After the token loop
-// lane 0 sums the M maxes into the warp partial; one cross-warp reduction folds the
-// partials and lane 0 of warp 0 adds the total to score[w].
-//   q_layer  [M, n_heads, head_dim]            fp32 (this layer's slice; M valid rows)
-//   kraw     [total_tokens, n_kv_heads, head_dim] fp32 (this layer's slice)
-//   score    [n_blocks]                          fp32 (+=, caller zeros once)
-__global__ void block_attn_score_maxsim_kernel(float *score,
-                                               const float *q_layer,
-                                               const float *kraw,
-                                               uint32_t M,
-                                               uint32_t n_blocks,
-                                               const int32_t *blk_first_tok,
-                                               const int32_t *blk_tokens,
-                                               uint32_t n_heads,
-                                               uint32_t n_kv_heads,
-                                               uint32_t head_dim,
-                                               float scale) {
-    const uint32_t w = blockIdx.x;
-    if (w >= n_blocks) return;
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t wid = threadIdx.x >> 5;            // warp id
-    const uint32_t nwarps = blockDim.x >> 5;          // 8
-    const uint32_t group = n_heads / n_kv_heads;
-    const uint32_t elems = (head_dim + 31u) / 32u;    // strided elems per lane
-    const uint32_t first = static_cast<uint32_t>(blk_first_tok[w]);
-    const uint32_t n = static_cast<uint32_t>(blk_tokens[w]);
-
-    extern __shared__ float smax[];                   // [nwarps * M]
-    float *my = smax + static_cast<uint64_t>(wid) * M;
-
-    float warp_sum = 0.0f;
-    for (uint32_t qh = wid; qh < n_heads; qh += nwarps) {
-        const uint32_t kvh = qh / group;
-        // Reset this warp's M running maxes (lane 0 owns my[]).
-        if (lane == 0) {
-            for (uint32_t j = 0; j < M; ++j) my[j] = 0.0f;
-        }
-        __syncwarp();
-        for (uint32_t t = 0; t < n; ++t) {
-            const float *krow =
-                kraw + (static_cast<uint64_t>(first + t) * n_kv_heads + kvh) * head_dim;
-            float kreg[8];
-            #pragma unroll
-            for (uint32_t e = 0; e < 8; ++e) {
-                const uint32_t idx = e * 32u + lane;
-                kreg[e] = (e < elems && idx < head_dim) ? krow[idx] : 0.0f;
-            }
-            for (uint32_t j = 0; j < M; ++j) {
-                const float *qr =
-                    q_layer + (static_cast<uint64_t>(j) * n_heads + qh) * head_dim;
-                float dot = 0.0f;
-                #pragma unroll
-                for (uint32_t e = 0; e < 8; ++e) {
-                    const uint32_t idx = e * 32u + lane;
-                    if (e < elems && idx < head_dim) dot += qr[idx] * kreg[e];
-                }
-                #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    dot += __shfl_down_sync(0xffffffffu, dot, off);
-                }
-                if (lane == 0) {
-                    const float v = dot * scale;
-                    const float relu = v > 0.0f ? v : 0.0f;
-                    if (relu > my[j]) my[j] = relu;
-                }
-            }
-        }
-        __syncwarp();
-        if (lane == 0) {
-            float s = 0.0f;
-            for (uint32_t j = 0; j < M; ++j) s += my[j];
-            warp_sum += s;
-        }
-    }
-    __shared__ float wsh[32];
-    if (lane == 0) wsh[wid] = warp_sum;
-    __syncthreads();
-    if (wid == 0) {
-        float tt = (lane < nwarps) ? wsh[lane] : 0.0f;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            tt += __shfl_down_sync(0xffffffffu, tt, off);
-        }
-        if (lane == 0) score[w] += tt;
-    }
 }
 
 // block_attn_score_exactmass_kernel (ExactMass, raw-key, AgentKV port): one CUDA
@@ -6732,32 +6536,6 @@ public:
         return launch_status("cuda block_attn_score_step_device");
     }
 
-    DeviceStatus block_attn_score_multilayer_device(DeviceTensor &score,
-                                                    const DeviceTensor &q_multi,
-                                                    const DeviceTensor &kbar_multi,
-                                                    uint32_t n_layers,
-                                                    uint32_t n_tokens,
-                                                    uint32_t q_layer_stride,
-                                                    uint32_t n_blocks,
-                                                    uint32_t n_heads,
-                                                    uint32_t n_kv_heads,
-                                                    uint32_t head_dim,
-                                                    float scale) override {
-        if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
-            head_dim == 0) {
-            return {};
-        }
-        auto &sc = as_tensor(score);
-        const auto &qm = as_tensor(q_multi);
-        const auto &kb = as_tensor(kbar_multi);
-        if (!ported::launch_block_attn_score_multilayer(
-                sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
-                n_blocks, n_heads, n_kv_heads, head_dim, scale, exec_stream_)) {
-            return {false, "block_attn_score_multilayer launch failed"};
-        }
-        return launch_status("cuda block_attn_score_multilayer_device");
-    }
-
     DeviceStatus block_attn_score_softmax_pages_device(DeviceTensor &score,
                                                        const DeviceTensor &q_multi,
                                                        const DeviceTensor &kbar_multi,
@@ -6942,41 +6720,6 @@ public:
             return {false, "derope_store_content_batch launch failed"};
         }
         return launch_status("cuda derope_store_content_batch_device");
-    }
-
-    DeviceStatus block_attn_score_maxsim_device(DeviceTensor &score,
-                                                const DeviceTensor &q_layer,
-                                                const DeviceTensor &kraw,
-                                                uint32_t M,
-                                                uint32_t n_blocks,
-                                                const DeviceTensor &blk_first_tok,
-                                                const DeviceTensor &blk_tokens,
-                                                uint32_t n_heads,
-                                                uint32_t n_kv_heads,
-                                                uint32_t head_dim,
-                                                float scale,
-                                                uint64_t q_elem_off = 0,
-                                                uint64_t kraw_elem_off = 0) override {
-        if (n_blocks == 0 || M == 0 || n_heads == 0 || head_dim == 0) return {};
-        auto &sc = as_tensor(score);
-        const auto &ql = as_tensor(q_layer);
-        const auto &kr = as_tensor(kraw);
-        const auto &ft = as_tensor(blk_first_tok);
-        const auto &bt = as_tensor(blk_tokens);
-        if (ql.elem_size != sizeof(float) || kr.elem_size != sizeof(float)) {
-            return {false, "block_attn_score_maxsim_device requires fp32 buffers"};
-        }
-        if (ft.elem_size != sizeof(int32_t) || bt.elem_size != sizeof(int32_t)) {
-            return {false, "block_attn_score_maxsim_device metadata dtype mismatch"};
-        }
-        if (!ported::launch_block_attn_score_maxsim(
-                sc.ptr, ql.ptr + q_elem_off, kr.ptr + kraw_elem_off, M, n_blocks,
-                ft.ptr_i32(), bt.ptr_i32(), n_heads, n_kv_heads, head_dim, scale,
-                exec_stream_)) {
-            // shmem cap exceeded or launch error; executor falls back to mean.
-            return {false, "block_attn_score_maxsim launch failed"};
-        }
-        return launch_status("cuda block_attn_score_maxsim_device");
     }
 
     DeviceStatus block_attn_score_exactmass_device(DeviceTensor &score,
@@ -9653,24 +9396,6 @@ bool launch_block_attn_score_step(float *accum, const float *q,
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool launch_block_attn_score_multilayer(float *score, const float *q_multi,
-                                        const float *kbar_multi,
-                                        uint32_t n_layers, uint32_t n_tokens,
-                                        uint32_t q_layer_stride,
-                                        uint32_t n_blocks, uint32_t n_heads,
-                                        uint32_t n_kv_heads, uint32_t head_dim,
-                                        float scale, cudaStream_t stream) {
-    if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
-        head_dim == 0) {
-        return true;
-    }
-    constexpr uint32_t threads = 256;  // 8 warps; each warp owns a head set
-    block_attn_score_multilayer_kernel<<<n_blocks, threads, 0, stream>>>(
-        score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
-        n_blocks, n_heads, n_kv_heads, head_dim, scale);
-    return cudaGetLastError() == cudaSuccess;
-}
-
 bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            const float *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
@@ -9780,23 +9505,6 @@ bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
     derope_store_content_batch_kernel<<<grid, head_dim, 0, stream>>>(
         k_batch, kraw, out_base_elem, k_stride, batch, n_kv_heads, head_dim,
         rope_dim, rope_base, theta);
-    return cudaGetLastError() == cudaSuccess;
-}
-
-bool launch_block_attn_score_maxsim(float *score, const float *q_layer,
-                                    const float *kraw, uint32_t M,
-                                    uint32_t n_blocks, const int32_t *blk_first_tok,
-                                    const int32_t *blk_tokens, uint32_t n_heads,
-                                    uint32_t n_kv_heads, uint32_t head_dim,
-                                    float scale, cudaStream_t stream) {
-    if (n_blocks == 0 || M == 0 || n_heads == 0 || head_dim == 0) return true;
-    constexpr uint32_t threads = 256;  // 8 warps; each warp owns a head set
-    const uint32_t nwarps = threads >> 5;
-    const size_t shmem = static_cast<size_t>(nwarps) * M * sizeof(float);
-    if (shmem > 48u * 1024u) return false;  // caller falls back to mean scorer
-    block_attn_score_maxsim_kernel<<<n_blocks, threads, shmem, stream>>>(
-        score, q_layer, kraw, M, n_blocks, blk_first_tok, blk_tokens, n_heads,
-        n_kv_heads, head_dim, scale);
     return cudaGetLastError() == cudaSuccess;
 }
 

@@ -277,15 +277,6 @@ public:
     // K chunk is captured. (Public: backend-invoked.)
     void kvmem_set_query_span(uint32_t begin, uint32_t end,
                               uint32_t prompt_tokens);          // before prefill
-    // Context-free query embedding (AgentKV run_segment isolation, opt-in via
-    // QW3_KVMEM_QC_QUERY_CONTEXTFREE). Call right AFTER kvmem_set_query_span and
-    // BEFORE the main prefill (KV empty, position 0): runs an isolated forward over
-    // the question tokens alone (no history) to capture a context-free retrieval Q,
-    // then rolls the executor back so the full prefill rebuilds the real KV cache.
-    // No-op (returns false) when the flag is off — byte-identical. (Public:
-    // backend-invoked.)
-    bool kvmem_capture_query_contextfree(const std::vector<uint32_t> &question_tokens);
-    bool kvmem_query_contextfree_enabled() const { return kvmem_qc_query_contextfree_; }
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
     // it per executor. Set before configure_kvmem(); the pool must outlive this
     // executor. No-op effect when kvmem or the CPU tier is off.
@@ -459,6 +450,7 @@ private:
     void record(NativeExecutorReport &report, const std::string &op) const;
     void ensure_scratch();
     void allocate_kvmem_gpu_cache(uint64_t physical_slots);
+    void allocate_kvmem_mtp_gpu_cache(uint64_t physical_slots);
     void ensure_mtp_scratch();
     void ensure_mtp_batch_scratch(uint32_t batch);
     void ensure_logits_batch_scratch(uint32_t batch);
@@ -553,6 +545,12 @@ private:
     std::vector<std::unique_ptr<DeviceTensor>> kvmem_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> kvmem_v_cache_storage_;
     KvCacheStorage kvmem_kv_cache_view_;
+    // Bounded GPU page pool for the MTP layer's KV, sibling of
+    // kvmem_gpu_page_pool_. Engaged only on the single-request internal-MTP
+    // path when the main kvmem pool is engaged; keeps MTP GPU residency to one
+    // layer's window instead of the full-context dense cache.
+    std::unique_ptr<KvPhysicalPageAllocator> kvmem_mtp_gpu_page_pool_;
+    bool kvmem_mtp_tiered_ = false;
 
     bool mtp_scratch_ready_ = false;
     std::unique_ptr<DeviceTensor> mtp_h_;
@@ -656,12 +654,17 @@ private:
     void kvmem_finish_prefetch();
     void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
     bool kvmem_block_pages_resident(const KvMemBlock &block) const;
+    bool kvmem_block_mtp_pages_resident(const KvMemBlock &block) const;
     uint64_t kvmem_kv_page_bytes() const;
     uint64_t kvmem_block_spill_bytes(const KvMemBlock &block) const;
     uint8_t *kvmem_cpu_data();
     const uint8_t *kvmem_cpu_data() const;
     uint64_t kvmem_cpu_bytes() const;
     void kvmem_canonicalize_block_for_tier(uint32_t block_id);
+    // Grow mtp_baked_pos_ to cover every registered block, initializing new
+    // entries to their true (canonical) first position. No-op unless the MTP
+    // head is tiered/windowed.
+    void kvmem_sync_mtp_baked_pos();
     void kvmem_copy_block_to_host(const KvMemBlock &block,
                                   std::vector<uint8_t> &dst);
     // Issue the block's K/V page D2H copies into a caller-owned buffer (must
@@ -726,6 +729,25 @@ private:
     std::unique_ptr<DeviceTensor> bs_remap_from_dev_;  // [moved] int32
     std::unique_ptr<DeviceTensor> bs_remap_ntok_dev_;  // [moved] int32
     uint32_t bs_remap_capacity_ = 0;            // allocated moved-block capacity
+    // MTP-head re-RoPE lockstep (Design B). The MTP draft head's KV rotation does
+    // NOT follow main's block.baked_pos: during prefill a mid-prefill offload
+    // re-RoPEs main K to packed window slots while MTP K stays canonical (its
+    // window is not built until decode priming catches up). So MTP carries its
+    // own per-block baked position and its own moved-block remap arrays, de-rotated
+    // in lockstep with the MTP window rather than the main remaps. mtp_baked_pos_
+    // is the single source of truth for where MTP K currently sits (canonical on
+    // registration; a packed slot after a decode assemble; back to canonical after
+    // a stage-out canonicalize). Inert (stays canonical, zero moved blocks -> no
+    // launch) unless the MTP window is built, so identity-budget runs are
+    // byte-identical to a non-MTP-tiered build.
+    std::vector<int64_t> mtp_baked_pos_;        // block_id -> MTP K current bake
+    std::vector<int32_t> bs_mtp_remap_to_host_;
+    std::vector<int32_t> bs_mtp_remap_from_host_;
+    std::vector<int32_t> bs_mtp_remap_ntok_host_;
+    std::unique_ptr<DeviceTensor> bs_mtp_remap_to_dev_;
+    std::unique_ptr<DeviceTensor> bs_mtp_remap_from_dev_;
+    std::unique_ptr<DeviceTensor> bs_mtp_remap_ntok_dev_;
+    uint32_t bs_mtp_remap_capacity_ = 0;
 
     // ---- Global content-frame KV retrieval (#48/#49) ----------------------
     // The window-local signal above can only RETAIN blocks already inside the
@@ -765,7 +787,6 @@ private:
                                    uint32_t batch, uint32_t base_pos,
                                    uint32_t rope_base_pos,
                                    uint32_t q_token_stride);
-    bool kvmem_retrieval_score_multitoken();                   // boundary, multi-token
     uint32_t kvmem_query_begin_ = 0;
     uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
     uint32_t kvmem_query_base_pos_ = 0;                        // position() at span-set; anchors
@@ -783,53 +804,26 @@ private:
     // "which old session holds the answer". This generalizes the query-
     // conditioned path to score by ALL L normal layers at once: g_kbar_multi_
     // holds a per-layer content index, g_query_multi_ holds per-layer query rows
-    // ([L,S,...]), and one fused kernel sums ReLU(q·k̄) over (layers,tokens) per
-    // block in a single launch + single D2H (the step-mode reselect fires once
-    // at the prefill->decode boundary, so this is a one-time per-request cost).
-    // This is the DEFAULT for --kvmem-query-conditioned; QW3_KVMEM_QC_SINGLE_LAYER=1
-    // forces the old single-layer multitoken path (L=1, layer=bs_score_layer_)
-    // for A/B comparison. QW3_KVMEM_QC_LAYERS=N caps L (debug).
+    // ([L,S,...]), and one fused kernel scores every block by the query rows in a
+    // single launch + single D2H (the step-mode reselect fires once at the prefill
+    // ->decode boundary, so this is a one-time per-request cost). Multi-layer
+    // capture is always on for --kvmem-query-conditioned. QW3_KVMEM_QC_LAYERS=N
+    // caps L (debug).
     void kvmem_resolve_std_layers();        // populate std_layers_/std_layer_slot_
-    bool kvmem_retrieval_score_multilayer();                   // boundary, fused multi-layer
-    bool kvmem_qc_single_layer_ = false;                       // env: force L=1 old path
-    bool kvmem_qc_softmax_ = false;                            // env: softmax-over-pages scorer
+    // mean-k scorer (--kvmem-retrieval-method mean-k, default): per-(layer, query
+    // token, head) softmax of q·k̄ OVER PAGES on the cheap per-block mean key.
+    bool kvmem_retrieval_score_mean_softmax();                 // boundary, softmax-over-pages
     bool kvmem_no_rerope_ = false;                             // env: skip re-RoPE collapse (true-pos test)
 
-    // ---- Raw-key ColBERT MaxSim selection (#104) ---------------------------
-    // The mean-k scorers above collapse a block's ~1024 tokens to one mean key,
-    // so q·k̄ ≡ mean_t(q·k) DILUTES a single answer-bearing token. QW3_KVMEM_QC_MAXSIM
-    // (default OFF, byte-identical when unset) instead keeps the RAW per-token
-    // de-RoPE'd keys (captured into g_kraw_multi_ during prefill, like the mean) and
-    // scores each block by a per-(query token, head) MAX over its tokens — a needle
-    // token spikes the block score instead of being averaged away. Only allocated /
-    // run when the flag is set; the ~7.4 GB fp32 buffer is the cost (efficiency
-    // deferred, utility test first). Respects QW3_KVMEM_QC_LAYERS for cheap L=1 runs.
-    bool kvmem_retrieval_score_maxsim();                       // boundary, raw-key MaxSim
-    bool kvmem_qc_maxsim_ = false;                             // env: raw-key MaxSim scorer
-    // ---- Raw-key ExactMass selection (AgentKV port) ------------------------
+    // ---- Raw-key ExactMass selection (--kvmem-retrieval-method per-token) ---
     // ExactMass softmaxes the per-token logit scale·(q·k_raw) over ALL key tokens
     // then sums each block's mass (Σexp under a global denominator), so a needle
     // token's mass survives AND blocks compete globally — distinct from softmax-
-    // over-pages (exp of the diluted per-block mean key). Reuses g_kraw_multi_ +
-    // g_query_multi_ (no new buffer/capture). QW3_KVMEM_QC_EXACTMASS, default OFF.
+    // over-pages (exp of the diluted per-block mean key). Keeps the RAW per-token
+    // de-RoPE'd keys in g_kraw_multi_ (~7.4 GB fp32), allocated/captured ONLY when
+    // per-token is selected. kvmem_qc_pertoken_ mirrors the retrieval_method enum.
     bool kvmem_retrieval_score_exactmass();                    // boundary, raw-key ExactMass
-    bool kvmem_qc_exactmass_ = false;                          // env: raw-key ExactMass scorer
-    bool kvmem_qc_exactmass_strict_ = false;                   // env: strict-AgentKV group-mean query
-    // ---- Context-free query embedding (AgentKV run_segment isolation) -------
-    // AgentKV computes the retrieval query by prefilling the QUESTION ALONE (no
-    // history, causal self-attention only) so the query embedding is not pulled
-    // toward the history by full-prompt cross-attention. qw3's default capture
-    // grabs the CONTEXTUALIZED question Q during the full prefill. When this flag
-    // is set, after set_query_span (KV empty, pos 0) we run an isolated forward
-    // over just the question token ids, capture the context-free de-RoPE'd Q into
-    // g_query_multi_, then roll the executor back to a clean pre-prefill state so
-    // the main prefill rebuilds the real KV cache. Retrieval-only: g_query_multi_
-    // feeds ONLY the block scorer; generation still uses the question's KV in the
-    // re-RoPE'd window (qw3 never re-prefills the question post-selection).
-    // QW3_KVMEM_QC_QUERY_CONTEXTFREE, default OFF, byte-identical when unset. The
-    // capture method is public (backend-invoked, declared near kvmem_set_query_span).
-    bool kvmem_qc_query_contextfree_ = false;                  // env: context-free query embed
-    bool kvmem_capture_query_only_ = false;                    // transient: suppress kbar/kraw in isolated pass
+    bool kvmem_qc_pertoken_ = false;                           // retrieval_method == PerToken
     uint32_t kvmem_qc_total_tokens_ = 0;                       // total prompt tokens (kraw stride)
     std::unique_ptr<DeviceTensor> g_kraw_multi_;              // [L, total_tokens, n_kv_heads, head_dim] fp32
     bool g_kraw_multi_ready_ = false;                          // g_kraw_multi_ holds raw keys

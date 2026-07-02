@@ -20,6 +20,12 @@ struct KvMemSessionConfig {
     std::vector<uint64_t> ladder_tokens;
     // Tokens to decode (MTP) at each ladder point to sample steady-state TBT.
     int decode_tokens = 256;
+    // Decode-probe sampling. Default is greedy (temp=0) for a stable
+    // steady-state throughput probe; --temp/--top-p/--top-k route the Qwen3
+    // sampled path (MTP is distribution-lossless under temp>0).
+    float temperature = 0.0f;
+    float top_p = 1.0f;
+    int top_k = 0;
 };
 
 // Loads the model once (kvmem on, update-mode step, MTP on) and runs the growth

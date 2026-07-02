@@ -105,7 +105,9 @@ struct KvMemPlan {
 // Recency explicitly disables the more expensive upstream signal.
 enum class KvMemMethod : uint8_t { Retrieval = 0, H2O = 1, Recency = 2 };
 enum class KvMemSelectPolicy : uint8_t { TopK = 0, Quota = 1 };
-enum class KvMemRetrievalMethod : uint8_t { MeanAttention = 0, ContentMean = 1 };
+// Query-conditioned scorer (--kvmem-retrieval-method): MeanK = softmax-over-pages
+// on the cheap per-block mean key; PerToken = ExactMass over raw per-token keys.
+enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1 };
 enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
 
 struct KvMemStoreConfig {
@@ -116,7 +118,7 @@ struct KvMemStoreConfig {
                                      // 0 => derived from budget at use time
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
-    KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanAttention;
+    KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
 
     // Quota policy. Zero means derive from the remaining budget at selection

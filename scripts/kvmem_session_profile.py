@@ -228,6 +228,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="comma-separated cumulative ctx targets (K/M suffixes)")
     ap.add_argument("--decode-tokens", type=int, default=256,
                     help="MTP decode probe length per turn")
+    ap.add_argument("--temp", type=float, default=0.0,
+                    help="decode-probe temperature (0=greedy, default). temp>0 "
+                         "routes the Qwen3 sampled recipe (top_p=0.95 top_k=20)")
     ap.add_argument("--chain", type=int, default=4, help="MTP chain length")
     ap.add_argument("--window", type=int, default=32768,
                     help="retrieval window in tokens (--kvmem-budget)")
@@ -293,6 +296,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--kvmem-method", args.method,
         "--kvmem-gpu-memory-ratio", str(args.gpu_ratio),
     ]
+    if args.temp > 0.0:
+        cmd += ["--temp", str(args.temp)]
     tiered = max_target >= args.tier_threshold
     if tiered:
         cmd += ["--kvmem-cpu-gb", str(args.cpu_gb),
