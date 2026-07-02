@@ -269,6 +269,13 @@ public:
     // re-RoPE. Set once at session start from the CLI flag.
     void set_kvmem_enabled(bool on) { kvmem_enabled_ = on; }
     bool kvmem_enabled() const { return kvmem_enabled_; }
+    // True when a CPU or NVMe tier is configured (blocks can be offloaded off
+    // GPU). Stable for the session. The kvmem prefix cache uses !kvmem_has_tiers()
+    // to gate prompt-end (partial) resume to the dense/untiered case where
+    // [0,P) blocks are permanently GPU-resident.
+    bool kvmem_has_tiers() const {
+        return kvmem_cpu_tier_ != nullptr || kvmem_nvme_tier_ != nullptr;
+    }
     // Mark the final user message's token span [begin,end) for query-conditioned
     // multi-token selection. Called by the backend BEFORE prefill. begin==end -> no
     // span -> byte-identical single-token/recency path. prompt_tokens is the full
@@ -340,6 +347,15 @@ public:
     // prefill / each committed decode token grows the context). No-op when
     // block-sparse is disabled.
     void kvmem_register_append(uint32_t n_new_tokens);
+    // Rewind the block store to exactly `token_pos` tokens after restore_state()
+    // has already rewound position/KV-pages/recurrent/window to a prompt-end
+    // checkpoint (kvmem prefix cache). Drops trailing blocks, releases their
+    // CPU/NVMe tier slots (GPU pages were freed by restore_state's KV-page
+    // truncate, so they are NOT released here), and invalidates the per-session
+    // selection indices so the next kvmem_reselect() rebuilds over the correct
+    // block count. No-op when block-sparse is disabled or token_pos is already
+    // the live end.
+    void kvmem_truncate_to(uint32_t token_pos);
     // Spill cold blocks to the tier mid-prefill if the bounded GPU page pool is
     // about to run short. `next_chunk_tokens` is the size of the upcoming prefill
     // append, so the offload fires while there is still room for it (a full chunk

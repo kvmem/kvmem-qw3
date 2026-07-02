@@ -2949,6 +2949,42 @@ void QwenExecutor::kvmem_register_until(uint32_t target_pos) {
     kvmem_registered_pos_ = target_pos;
 }
 
+void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
+    if (!kvmem_enabled_ || !block_store_) return;
+    // Rewind the block table to `token_pos` tokens. restore_state() has already
+    // rewound position/KV-pages/recurrent/window; this reconciles the block
+    // store + tier slots + selection indices, which restore_state does not touch.
+    std::vector<KvMemDroppedBlock> dropped = block_store_->truncate_to(token_pos);
+    // Release CPU/NVMe tier slots for dropped blocks. GPU pages are NOT released
+    // here: restore_state's truncate_to_logical_pages already freed the physical
+    // pages for positions >= token_pos, so a second release would double-free.
+    for (const KvMemDroppedBlock &d : dropped) {
+        if (d.cpu_slot >= 0 && kvmem_cpu_tier_) kvmem_cpu_tier_->release_block(d.block_id);
+        if (d.nvme_slot >= 0 && kvmem_nvme_tier_) kvmem_nvme_tier_->release_block(d.block_id);
+    }
+    // Invalidate the per-session selection indices so a stale index over the old
+    // (larger) block count cannot survive. restore_state leaves kvmem_active_
+    // true, so the retrieval-index rebuild guard (!kvmem_active_) would otherwise
+    // skip the rebuild; the post-suffix kvmem_reselect() rebuilds over the
+    // correct block count. Position/KV/recurrent/window are NOT touched here.
+    bs_score_ready_ = false;
+    bs_window_blocks_ = 0;
+    bs_window_block_ids_.clear();
+    bs_win_base_host_.clear();
+    bs_blk_tokens_host_.clear();
+    g_content_ready_ = false;
+    g_query_ready_ = false;
+    g_indexed_blocks_ = 0;
+    g_orig_base_host_.clear();
+    g_blk_tokens_host_.clear();
+    g_kbar_multi_ready_ = false;
+    g_kbar_multi_blocks_ = 0;
+    kvmem_qc_total_blocks_ = 0;
+    kvmem_qc_captured_blocks_ = 0;
+    kvmem_pending_reselect_ = false;
+    kvmem_pending_plan_ = KvMemPlan{};
+}
+
 void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
     if (!kvmem_enabled_ || !block_store_ || !kvmem_gpu_page_pool_) return;
     if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) return;

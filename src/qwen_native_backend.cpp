@@ -6631,34 +6631,77 @@ private:
         prefix_cache_evict_cb_installed_ = true;
     }
 
-    // Longest cached entry whose `tokens` is an exact prefix of `prompt` and
-    // strictly shorter than it. On hit, bumps refcount + LRU and returns a
-    // copy of the entry's pages/state via out-params; caller seeds the executor.
-    // Returns the entry id on hit, 0 on miss.
-    // kvmem single-request prefix reuse predicate. Returns M (the number of
-    // leading prompt tokens that can be resumed from kvmem_warm_ckpt_ without
-    // re-prefill) iff every guard holds:
-    //   - QW3_KVMEM_PREFIX_CACHE on and executor kvmem-enabled,
-    //   - a valid warm checkpoint exists,
-    //   - the new prompt STRICTLY extends the whole warm log (>= 1 suffix token,
-    //     so decode always re-seeds from a real forward),
-    //   - the warm log is a byte-exact prefix of the new prompt,
-    //   - no query-conditioned span is requested (suffix-only prefill can't
-    //     recapture an in-prefix query span; deferred).
-    // Otherwise 0 -> caller does the full reset+prefill (byte-identical to today).
-    uint32_t kvmem_prefix_reuse_len(const std::vector<uint32_t> &prompt,
-                                    const GenerationOptions &options) {
-        if (!kvmem_prefix_cache_enabled()) return 0;
-        if (!executor_ || !executor_->kvmem_enabled()) return 0;
-        if (!kvmem_warm_valid_ || kvmem_warm_log_.empty()) return 0;
-        if (options.kvmem_query_end > options.kvmem_query_begin) return 0;
-        const size_t m = kvmem_warm_log_.size();
-        if (prompt.size() <= m) return 0;  // strict: need >=1 suffix token
-        if (!std::equal(kvmem_warm_log_.begin(), kvmem_warm_log_.end(),
-                        prompt.begin())) {
-            return 0;
+    // A chosen resume point: c = token position to resume at, prompt_ckpt selects
+    // ckpt_prompt_ (P) vs ckpt_end_ (M). c==0 means "no reuse -> full reset".
+    struct KvmemReuse { uint32_t c = 0; bool prompt_ckpt = false; };
+
+    // Longest-common-prefix reuse pick. Computes D (the longest common token
+    // prefix of the warm log and the new prompt) and returns the largest
+    // checkpoint C in {M,P} with C <= D and C < prompt.size() (strict, so >=1
+    // suffix token always re-prefills and re-seeds decode). Preference M over P:
+    // reusing at M skips re-decoding as well as re-prefilling. Returns {} (full
+    // reset) when the flag is off, kvmem is off, no valid warm state, or
+    // query-conditioning is *active* for this request (suffix-only prefill can't
+    // recapture an in-prefix span; deferred). QC is only active above budget:
+    // below budget selection is identity, so a span the server set is ignored
+    // and reuse proceeds as in the dense config.
+    KvmemReuse kvmem_prefix_reuse(const std::vector<uint32_t> &prompt,
+                                  const GenerationOptions &options) {
+        if (!kvmem_prefix_cache_enabled()) return {};
+        if (!executor_ || !executor_->kvmem_enabled()) return {};
+        if (!kvmem_warm_valid_ || kvmem_warm_log_.empty()) return {};
+        const uint32_t sel_budget = executor_->block_store()
+            ? executor_->block_store()->config().select_budget : 0;
+        const bool qc_active = (options.kvmem_query_end > options.kvmem_query_begin) &&
+                               sel_budget > 0 && prompt.size() > sel_budget;
+        if (qc_active) return {};
+        const size_t lim = std::min(kvmem_warm_log_.size(), prompt.size());
+        size_t D = 0;
+        while (D < lim && kvmem_warm_log_[D] == prompt[D]) ++D;
+        if (kvmem_warm_end_pos_ <= D && kvmem_warm_end_pos_ < prompt.size()) {
+            return {kvmem_warm_end_pos_, false};
         }
-        return static_cast<uint32_t>(m);
+        if (kvmem_warm_prompt_resumable_ &&
+            kvmem_warm_prompt_pos_ <= D &&
+            kvmem_warm_prompt_pos_ < prompt.size()) {
+            return {kvmem_warm_prompt_pos_, true};
+        }
+        // Miss despite a valid warm log: log why so the miss pattern is
+        // diagnosable. D<P means divergence landed below the prompt-end
+        // checkpoint (tokenization boundary or upstream prefix instability);
+        // D far below both means an unrelated request overwrote the warm slot.
+        if (kvmem_prefix_cache_trace_enabled()) {
+            std::ostringstream mmsg;
+            mmsg << "kvmem prefix-cache MISS (why): D=" << D
+                 << " P=" << kvmem_warm_prompt_pos_
+                 << " M=" << kvmem_warm_end_pos_
+                 << " P_resumable=" << (kvmem_warm_prompt_resumable_ ? 1 : 0)
+                 << " warm_log=" << kvmem_warm_log_.size()
+                 << " prompt=" << prompt.size();
+            log(mmsg.str());
+        }
+        return {};
+    }
+
+    // True when the live block store is cleanly resumable at a prompt-end
+    // checkpoint: every block is GPU-resident at its true position (identity
+    // re-RoPE, baked_pos == orig_pos_start). Gated on actual runtime residency,
+    // not on whether tiers are *configured* — below budget a tiered store keeps
+    // everything GPU-resident with identity bakes, so ckpt_P is safe there.
+    // Evaluated at ckpt_prompt_ capture time. Once anything spills (offload to
+    // CPU/NVMe or a sparse budget re-RoPEs a block to a window slot) the scan
+    // returns false -> ckpt_prompt_ not offered, and reuse falls back to
+    // ckpt_end_ only.
+    bool kvmem_all_gpu_identity() const {
+        const KvMemStore *bs = executor_->block_store();
+        if (!bs) return false;
+        for (const auto &b : bs->blocks()) {
+            if (b.tier != KvTier::GPU ||
+                b.baked_pos != static_cast<int64_t>(b.orig_pos_start)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     uint64_t prefix_cache_lookup(const std::vector<uint32_t> &prompt,
@@ -7043,18 +7086,24 @@ private:
         DeviceStatus st = device_->begin();
         if (!st.ok) throw std::runtime_error(st.message);
 
-        // kvmem prefix cache (QW3_KVMEM_PREFIX_CACHE): if this prompt strictly
-        // extends the whole warm sequence of the previous request, resume the
-        // warm executor at that end and prefill only the suffix. Otherwise fall
-        // back to the byte-identical reset+full-prefill path and (if the flag is
-        // on) drop the now-stale warm checkpoint.
-        const uint32_t reuse_m = kvmem_prefix_reuse_len(prompt_tokens, options);
+        // kvmem prefix cache (QW3_KVMEM_PREFIX_CACHE): resume the warm executor at
+        // the longest reusable checkpoint (turn-end M or prompt-end P) that is a
+        // token prefix of the new prompt, and prefill only the trailing suffix.
+        // Otherwise fall back to the byte-identical reset+full-prefill path and
+        // (if the flag is on) drop the now-stale warm checkpoints.
+        const KvmemReuse ru = kvmem_prefix_reuse(prompt_tokens, options);
+        const uint32_t reuse_m = ru.c;
         const bool warm_reuse = reuse_m > 0;
         if (warm_reuse) {
-            executor_->restore_state(kvmem_warm_ckpt_);
+            executor_->restore_state(ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
+                                                    : kvmem_warm_ckpt_end_);
+            // restore_state rewound position/KV/recurrent/window to C but not the
+            // block store (still at the prior turn's end M). Rewind it to C.
+            executor_->kvmem_truncate_to(reuse_m);
             if (kvmem_prefix_cache_trace_enabled()) {
                 std::ostringstream tmsg;
                 tmsg << "kvmem prefix-cache HIT (plain): reuse=" << reuse_m
+                     << " ckpt=" << (ru.prompt_ckpt ? "P" : "M")
                      << " prompt=" << prompt_tokens.size()
                      << " suffix=" << (prompt_tokens.size() - reuse_m);
                 log(tmsg.str());
@@ -7066,11 +7115,25 @@ private:
         const bool warm_capture =
             kvmem_prefix_cache_enabled() && executor_->kvmem_enabled();
 
+        // "Operating dense" predicate: below budget the store keeps every block
+        // GPU-resident in identity order, so selection/QC are no-ops and the
+        // request behaves exactly like the dense (budget==ctx) config. Above
+        // budget the tiered/sparse/QC machinery actually engages.
+        const uint32_t kvmem_sel_budget =
+            (executor_->kvmem_enabled() && executor_->block_store())
+                ? executor_->block_store()->config().select_budget : 0;
+        const bool kvmem_below_budget =
+            kvmem_sel_budget > 0 && prompt_tokens.size() <= kvmem_sel_budget;
+        const bool qc_active =
+            (options.kvmem_query_end > options.kvmem_query_begin) &&
+            kvmem_sel_budget > 0 && prompt_tokens.size() > kvmem_sel_budget;
+
         // Query-conditioned KVMem (#82): mark the question token span BEFORE
-        // prefill (mirrors generate_mtp). Inert unless kvmem is on and the span
-        // is non-empty -> single-token / recency path unchanged.
-        if (executor_->kvmem_enabled() &&
-            options.kvmem_query_end > options.kvmem_query_begin) {
+        // prefill (mirrors generate_mtp). Only active above budget; below budget
+        // the span is cleared so a warm HIT (restore_state, no reset_state)
+        // cannot carry a stale span from a prior over-budget turn into the
+        // identity path.
+        if (executor_->kvmem_enabled() && qc_active) {
             executor_->kvmem_set_query_span(options.kvmem_query_begin,
                                             options.kvmem_query_end,
                                             static_cast<uint32_t>(prompt_tokens.size()));
@@ -7079,6 +7142,11 @@ private:
                  << options.kvmem_query_begin << "," << options.kvmem_query_end
                  << ") tokens=" << (options.kvmem_query_end - options.kvmem_query_begin);
             log(qmsg.str());
+        } else if (executor_->kvmem_enabled()) {
+            // Below budget (or no span): clear any residual span/g_query_multi
+            // so kvmem_prepare_reselect keeps the single-token identity path.
+            executor_->kvmem_set_query_span(
+                0, 0, static_cast<uint32_t>(prompt_tokens.size()));
         }
 
         const double t_prefill_start = wall_seconds();
@@ -7089,6 +7157,41 @@ private:
         // guaranteed by the strict-extend predicate, so >=1 token still forwards
         // and step carries a fresh decode seed.
         const size_t prefill_begin = warm_reuse ? reuse_m : 0;
+        // kvmem prefix cache: choose where to stage the prompt-end (P) checkpoint.
+        // Capturing at the last BLOCK boundary strictly below P leaves a resume
+        // point below the chat-template reformat that rewrites the final few
+        // tokens each turn (observed D == P-4). Dense/untiered OR below-budget
+        // tiered (both keep [0,B) GPU-resident with identity bakes, the ckpt_P
+        // resumability precondition); over-budget sparse/tiered falls back to
+        // capturing at P (offered only when kvmem_all_gpu_identity holds).
+        uint32_t warm_prompt_pos = 0;
+        bool warm_prompt_resumable = false;
+        uint32_t ckpt_split = 0;
+        bool do_boundary_capture = false;
+        if (warm_capture && executor_->kvmem_enabled() &&
+            (!executor_->kvmem_has_tiers() || kvmem_below_budget)) {
+            const uint32_t bt = executor_->block_store()
+                                    ? executor_->block_store()->config().block_tokens
+                                    : 256;
+            const uint32_t prompt_end = static_cast<uint32_t>(prompt_tokens.size());
+            if (prompt_end > bt) {
+                const uint32_t B = ((prompt_end - 1) / bt) * bt;  // last block start < P
+                if (B >= prefill_begin && B < prompt_end) {
+                    ckpt_split = B;
+                    do_boundary_capture = true;
+                }
+            }
+        }
+        // Prefill the global range [gbegin, gend) of prompt_tokens. Factored out so
+        // the block-boundary checkpoint can split the prompt prefill at `split`.
+        auto do_prefill_range = [&](size_t gbegin, size_t gend) {
+            if (gbegin >= gend) return;
+            std::vector<uint32_t> seg(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(gbegin),
+                                      prompt_tokens.begin() + static_cast<std::ptrdiff_t>(gend));
+            step = executor_->forward_n_tokens(seg, gend == prompt_tokens.size());
+            if (!step.ok) throw std::runtime_error("prefill failed");
+            prefill_ops += step.ops_executed;
+        };
         if (dump) {
             for (size_t pi = prefill_begin; pi < prompt_tokens.size(); ++pi) {
                 step = executor_->forward_one_token(prompt_tokens[pi]);
@@ -7098,16 +7201,23 @@ private:
                              static_cast<int32_t>(prompt_tokens[pi]),
                              *executor_, *tokenizer_);
             }
-        } else if (warm_reuse) {
-            std::vector<uint32_t> suffix(prompt_tokens.begin() + prefill_begin,
-                                         prompt_tokens.end());
-            step = executor_->forward_n_tokens(suffix);
-            if (!step.ok) throw std::runtime_error("prefill failed");
-            prefill_ops = step.ops_executed;
+        } else if (do_boundary_capture) {
+            // First segment [prefill_begin, split): advance recurrent state to B.
+            do_prefill_range(prefill_begin, ckpt_split);
+            // Register + reselect so the store/window describe exactly `split`
+            // tokens, then stage ckpt_P at the block boundary (recurrent state is
+            // captured here, physically at B).
+            executor_->kvmem_register_append(
+                ckpt_split - static_cast<uint32_t>(prefill_begin));
+            executor_->kvmem_reselect();
+            kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
+            executor_->capture_state(kvmem_warm_ckpt_prompt_);
+            warm_prompt_pos = ckpt_split;
+            warm_prompt_resumable = kvmem_all_gpu_identity();
+            // Second segment [split, P): finish the prompt.
+            do_prefill_range(ckpt_split, prompt_tokens.size());
         } else {
-            step = executor_->forward_n_tokens(prompt_tokens);
-            if (!step.ok) throw std::runtime_error("prefill failed");
-            prefill_ops = step.ops_executed;
+            do_prefill_range(prefill_begin, prompt_tokens.size());
         }
         const double t_prefill_end = wall_seconds();
 
@@ -7121,14 +7231,28 @@ private:
         const int bs_interval =
             std::max(1, options_.kvmem_interval);
         if (bs_on) {
-            // On warm reuse the prefix blocks are already registered from the
-            // prior turn; register only the freshly-prefilled suffix.
+            // Register the tokens not yet in the store so it lands at prompt.size().
+            // Already registered before this point: reuse_m (warm restore) plus the
+            // first segment when a block-boundary ckpt_P split ran.
+            const uint32_t already =
+                do_boundary_capture ? ckpt_split
+                                    : static_cast<uint32_t>(prefill_begin);
             const uint32_t reg_n =
-                warm_reuse
-                    ? static_cast<uint32_t>(prompt_tokens.size() - reuse_m)
-                    : static_cast<uint32_t>(prompt_tokens.size());
+                static_cast<uint32_t>(prompt_tokens.size()) - already;
             executor_->kvmem_register_append(reg_n);
             executor_->kvmem_reselect();
+        }
+
+        // kvmem prefix cache: fallback prompt-end (P) checkpoint. When the
+        // block-boundary split above already staged ckpt_P at B, skip this;
+        // otherwise (tiny prompt, sparse/tiered, or ckpt_M reuse past the last
+        // boundary) capture at P here, AFTER register+reselect so the snapshot's
+        // block store / window / registered_pos all describe exactly P tokens.
+        if (warm_capture && !do_boundary_capture) {
+            kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
+            executor_->capture_state(kvmem_warm_ckpt_prompt_);
+            warm_prompt_pos = static_cast<uint32_t>(executor_->position());
+            warm_prompt_resumable = kvmem_all_gpu_identity();
         }
 
         // Sampling setup. temp<=0 keeps the greedy argmax path (bit-identical
@@ -7201,7 +7325,12 @@ private:
             // step interval; reselection re-bakes any moved block in place).
             if (bs_on) {
                 executor_->kvmem_register_append(1);
+                // Only reselect once the store has actually spilled past budget;
+                // below budget selection is identity (a no-op) so skip it and
+                // "use all the context". No-op in step mode regardless.
                 if (options_.kvmem_update_mode != "step" &&
+                    executor_->block_store()->block_count() >
+                        executor_->block_store()->budget_blocks() &&
                     ++bs_steps_since_reselect >= bs_interval) {
                     executor_->kvmem_reselect();
                     bs_steps_since_reselect = 0;
@@ -7241,12 +7370,20 @@ private:
             const size_t pos = executor_->position();
             if (pos <= kvmem_warm_log_.size()) {
                 kvmem_warm_log_.resize(pos);
-                executor_->capture_state(kvmem_warm_ckpt_);
+                executor_->capture_state(kvmem_warm_ckpt_end_);
+                // Commit the staged prompt-end (P) checkpoint alongside the
+                // turn-end (M) one; flip all warm fields together so a mid-decode
+                // throw leaves the prior turn's warm state intact.
+                kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
+                kvmem_warm_prompt_pos_ = warm_prompt_pos;
+                kvmem_warm_prompt_resumable_ = warm_prompt_resumable;
                 kvmem_warm_valid_ = true;
                 if (kvmem_prefix_cache_trace_enabled()) {
                     std::ostringstream cmsg;
                     cmsg << "kvmem prefix-cache CAPTURE (plain): warm_log="
                          << kvmem_warm_log_.size() << " pos=" << pos
+                         << " P=" << warm_prompt_pos
+                         << " P_resumable=" << (warm_prompt_resumable ? 1 : 0)
                          << " decoded=" << decoded;
                     log(cmsg.str());
                 }
@@ -7327,10 +7464,11 @@ private:
         // executor (override_executor==nullptr) on a fresh-session request
         // (reset_session) is eligible. run_kvmem_session (reset_session=false) and
         // the CB per-request executors are excluded, so those paths are untouched.
-        const uint32_t kvmem_reuse_m =
+        const KvmemReuse kvmem_ru =
             (reset_session && override_executor == nullptr)
-                ? kvmem_prefix_reuse_len(prompt_tokens, options)
-                : 0;
+                ? kvmem_prefix_reuse(prompt_tokens, options)
+                : KvmemReuse{};
+        const uint32_t kvmem_reuse_m = kvmem_ru.c;
         const bool kvmem_warm_reuse = kvmem_reuse_m > 0;
         const bool kvmem_warm_capture =
             reset_session && override_executor == nullptr &&
@@ -7341,11 +7479,18 @@ private:
             if (!st.ok) throw std::runtime_error(st.message);
         }
         if (kvmem_warm_reuse) {
-            // Resume at the end of the prior request; suffix-only prefill below.
-            executor_->restore_state(kvmem_warm_ckpt_);
+            // Resume at the chosen checkpoint (M=turn-end or P=prompt-end), then
+            // rewind the block store / tier slots / stale selection index to
+            // exactly reuse_m tokens (restore_state rewinds position + KV pages +
+            // recurrent state + window, but NOT the block store). Suffix-only
+            // prefill below then re-prefills [reuse_m, prompt.end()).
+            executor_->restore_state(kvmem_ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
+                                                          : kvmem_warm_ckpt_end_);
+            executor_->kvmem_truncate_to(kvmem_reuse_m);
             if (kvmem_prefix_cache_trace_enabled()) {
                 std::ostringstream tmsg;
                 tmsg << "kvmem prefix-cache HIT (mtp): reuse=" << kvmem_reuse_m
+                     << " ckpt=" << (kvmem_ru.prompt_ckpt ? "P" : "M")
                      << " prompt=" << prompt_tokens.size()
                      << " suffix=" << (prompt_tokens.size() - kvmem_reuse_m);
                 log(tmsg.str());
@@ -7370,11 +7515,24 @@ private:
         // (register_append per committed token + interval reselect) is driven
         // off position deltas in the loops below.
         const bool kvmem_on = executor_->kvmem_enabled();
+        // "Operating dense" predicate (see generate_plain): below budget the
+        // store stays GPU-resident in identity order, so selection/QC are no-ops
+        // and this turn behaves like the dense config.
+        const uint32_t kvmem_sel_budget =
+            (kvmem_on && executor_->block_store())
+                ? executor_->block_store()->config().select_budget : 0;
+        const bool kvmem_below_budget =
+            kvmem_sel_budget > 0 && prompt_tokens.size() <= kvmem_sel_budget;
+        const bool qc_active =
+            (options.kvmem_query_end > options.kvmem_query_begin) &&
+            kvmem_sel_budget > 0 && prompt_tokens.size() > kvmem_sel_budget;
         // Query-conditioned KVMem (#82): mark the question token span BEFORE
         // prefill so the executor captures the in-span Q rows during prefill and
-        // ranks blocks by the multi-token mean at the boundary. Inert (single-token
-        // / recency path unchanged) unless kvmem is on and the span is non-empty.
-        if (kvmem_on && options.kvmem_query_end > options.kvmem_query_begin) {
+        // ranks blocks by the multi-token mean at the boundary. Only active above
+        // budget; below budget the span is cleared so a warm HIT (restore_state,
+        // no reset_state) cannot carry a stale span from a prior over-budget turn
+        // into the identity path.
+        if (kvmem_on && qc_active) {
             executor_->kvmem_set_query_span(options.kvmem_query_begin,
                                             options.kvmem_query_end,
                                             static_cast<uint32_t>(prompt_tokens.size()));
@@ -7383,6 +7541,9 @@ private:
                  << options.kvmem_query_begin << "," << options.kvmem_query_end
                  << ") tokens=" << (options.kvmem_query_end - options.kvmem_query_begin);
             log(qmsg.str());
+        } else if (kvmem_on) {
+            executor_->kvmem_set_query_span(
+                0, 0, static_cast<uint32_t>(prompt_tokens.size()));
         }
         const int kvmem_interval = std::max(1, options_.kvmem_interval);
         uint32_t kvmem_last_reselect_pos = 0;
@@ -7400,7 +7561,12 @@ private:
                                                  kvmem_registered_pos);
                 kvmem_registered_pos = committed_pos;
             }
+            // Only reselect once the store has actually spilled past budget;
+            // below budget selection is identity, so skip it and use all the
+            // context. No-op in step mode regardless.
             if (options_.kvmem_update_mode != "step" &&
+                executor_->block_store()->block_count() >
+                    executor_->block_store()->budget_blocks() &&
                 committed_pos >= kvmem_last_reselect_pos +
                                      static_cast<uint32_t>(kvmem_interval)) {
                 if (defer_finish) {
@@ -7489,6 +7655,33 @@ private:
         const std::vector<uint32_t> &prefill_tokens =
             kvmem_warm_reuse ? kvmem_suffix : prompt_tokens;
         const size_t kvmem_prefill_begin = kvmem_warm_reuse ? kvmem_reuse_m : 0;
+        // kvmem prefix cache: choose where to stage the prompt-end (P) checkpoint.
+        // Capturing at the last BLOCK boundary strictly below P (rather than at P
+        // itself) leaves a resume point below the chat-template reformat that
+        // rewrites the final few tokens each turn (observed D == P-4), so next
+        // turn's longest-common-prefix D >= B and the reuse actually fires. The
+        // dense/untiered case OR a below-budget tiered turn both keep [0,B)
+        // GPU-resident with identity bakes (the ckpt_P resumability precondition);
+        // over-budget sparse/tiered falls back to capturing at P below (offered
+        // only when all_gpu_identity).
+        uint32_t kvmem_warm_prompt_pos = 0;
+        bool kvmem_warm_prompt_resumable = false;
+        uint32_t kvmem_ckpt_split = 0;
+        bool kvmem_do_boundary_capture = false;
+        if (kvmem_warm_capture && kvmem_on &&
+            (!executor_->kvmem_has_tiers() || kvmem_below_budget)) {
+            const uint32_t bt = executor_->block_store()
+                                    ? executor_->block_store()->config().block_tokens
+                                    : 256;
+            const uint32_t prompt_end = static_cast<uint32_t>(prompt_tokens.size());
+            if (prompt_end > bt) {
+                const uint32_t B = ((prompt_end - 1) / bt) * bt;  // last block start < P
+                if (B >= prefill_base && B < prompt_end) {
+                    kvmem_ckpt_split = B;
+                    kvmem_do_boundary_capture = true;
+                }
+            }
+        }
         QwenExecutor::KvMemTimingSnapshot kvmem_tbase;
         if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
             kvmem_tbase = QwenExecutor::kvmem_timing_snapshot();
@@ -7498,6 +7691,46 @@ private:
         uint32_t prefill_chunks = 0;
         uint32_t prefill_chunk_size = 0;
         const bool trace_prefill = prefill_trace_enabled();
+        // Prefill the local range [lbegin, lend) of prefill_tokens. Factored out
+        // so the block-boundary checkpoint can split the prompt prefill at `split`
+        // (capture recurrent state there) and resume the tail without duplicating
+        // the two prefill flavors (internal-chunking vs MTP-prefix priming).
+        auto do_prefill_range = [&](size_t lbegin, size_t lend) {
+            if (lbegin >= lend) return;
+            if (!use_mtp_prefix) {
+                std::vector<uint32_t> seg(prefill_tokens.begin() + static_cast<std::ptrdiff_t>(lbegin),
+                                          prefill_tokens.begin() + static_cast<std::ptrdiff_t>(lend));
+                const double t_chunk_start = wall_seconds();
+                step = executor_->forward_n_tokens(seg, lend == prefill_tokens.size());
+                if (!step.ok) throw std::runtime_error("prefill failed");
+                const double t_chunk_end = wall_seconds();
+                prefill_ops += step.ops_executed;
+                if (trace_prefill) {
+                    log_prefill_chunk(prefill_chunks, lbegin, seg.size(),
+                                      t_chunk_end - t_chunk_start);
+                }
+                ++prefill_chunks;
+            } else {
+                for (size_t offset = lbegin; offset < lend; offset += kMtpPrefillChunk) {
+                    const size_t end = std::min(lend, offset + static_cast<size_t>(kMtpPrefillChunk));
+                    std::vector<uint32_t> chunk(prefill_tokens.begin() + static_cast<std::ptrdiff_t>(offset),
+                                                prefill_tokens.begin() + static_cast<std::ptrdiff_t>(end));
+                    const double t_chunk_start = wall_seconds();
+                    const bool need_logits = end == prefill_tokens.size();
+                    step = executor_->forward_n_tokens(chunk, need_logits);
+                    if (!step.ok) throw std::runtime_error("prefill failed");
+                    prime_mtp_prefix(chunk, prefill_base + static_cast<uint32_t>(offset));
+                    const double t_chunk_end = wall_seconds();
+                    prefill_ops += step.ops_executed;
+                    if (trace_prefill) {
+                        log_prefill_chunk(prefill_chunks, offset, chunk.size(),
+                                          t_chunk_end - t_chunk_start);
+                    }
+                    ++prefill_chunks;
+                }
+                prefill_chunk_size = kMtpPrefillChunk;
+            }
+        };
         if (dump) {
             if (use_mtp_prefix) {
                 log("native mtp_prefix: ok=false reason=\"dump logits path does not expose batch hidden rows\"");
@@ -7511,37 +7744,25 @@ private:
                              static_cast<int32_t>(prompt_tokens[pi]),
                              *executor_, *tokenizer_);
             }
-        } else if (!use_mtp_prefix) {
-            // No prefix priming needed: defer to qw3's internal-chunking prefill.
-            const double t_chunk_start = wall_seconds();
-            step = executor_->forward_n_tokens(prefill_tokens);
-            if (!step.ok) throw std::runtime_error("prefill failed");
-            const double t_chunk_end = wall_seconds();
-            prefill_ops = step.ops_executed;
-            prefill_chunks = 1;
-            if (trace_prefill) {
-                log_prefill_chunk(0, 0, prefill_tokens.size(), t_chunk_end - t_chunk_start);
-            }
+        } else if (kvmem_do_boundary_capture) {
+            const size_t split_local =
+                kvmem_ckpt_split - static_cast<uint32_t>(kvmem_prefill_begin);
+            // First segment [prefill_base, split): advance recurrent state to B.
+            do_prefill_range(0, split_local);
+            // Register + reselect so the store/window describe exactly `split`
+            // tokens, then stage ckpt_P at the block boundary. The recurrent state
+            // is captured here, physically at B — it cannot be rewound from a later
+            // snapshot, which is why the prefill is split.
+            executor_->kvmem_register_append(static_cast<uint32_t>(split_local));
+            executor_->kvmem_reselect();
+            kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
+            executor_->capture_state(kvmem_warm_ckpt_prompt_);
+            kvmem_warm_prompt_pos = kvmem_ckpt_split;
+            kvmem_warm_prompt_resumable = kvmem_all_gpu_identity();
+            // Second segment [split, P): finish the prompt.
+            do_prefill_range(split_local, prefill_tokens.size());
         } else {
-            for (size_t offset = 0; offset < prefill_tokens.size(); offset += kMtpPrefillChunk) {
-                const size_t end = std::min(prefill_tokens.size(),
-                                            offset + static_cast<size_t>(kMtpPrefillChunk));
-                std::vector<uint32_t> chunk(prefill_tokens.begin() + static_cast<std::ptrdiff_t>(offset),
-                                            prefill_tokens.begin() + static_cast<std::ptrdiff_t>(end));
-                const double t_chunk_start = wall_seconds();
-                const bool need_logits = end == prefill_tokens.size();
-                step = executor_->forward_n_tokens(chunk, need_logits);
-                if (!step.ok) throw std::runtime_error("prefill failed");
-                prime_mtp_prefix(chunk, prefill_base + static_cast<uint32_t>(offset));
-                const double t_chunk_end = wall_seconds();
-                prefill_ops += step.ops_executed;
-                if (trace_prefill) {
-                    log_prefill_chunk(prefill_chunks, offset, chunk.size(),
-                                      t_chunk_end - t_chunk_start);
-                }
-                ++prefill_chunks;
-            }
-            prefill_chunk_size = kMtpPrefillChunk;
+            do_prefill_range(0, prefill_tokens.size());
         }
         const double t_prefill_end = wall_seconds();
 
@@ -7561,11 +7782,30 @@ private:
         // all-fit budget this is an identity selection so the window equals the
         // true cache and MTP verify stays byte-identical to plain MTP.
         if (kvmem_on) {
-            executor_->kvmem_register_append(
-                static_cast<uint32_t>(prompt_tokens.size()));
+            // Register the tokens not yet in the store so it lands at prompt.size().
+            // Already registered before this point: reuse_m (warm restore) plus the
+            // first segment when a block-boundary ckpt_P split ran.
+            const uint32_t already =
+                kvmem_do_boundary_capture
+                    ? kvmem_ckpt_split
+                    : static_cast<uint32_t>(kvmem_prefill_begin);
+            const uint32_t reg_n =
+                static_cast<uint32_t>(prompt_tokens.size()) - already;
+            executor_->kvmem_register_append(reg_n);
             executor_->kvmem_reselect();
             kvmem_registered_pos = executor_->position();
             kvmem_last_reselect_pos = executor_->position();
+        }
+        // kvmem prefix cache: fallback prompt-end (P) checkpoint. When the
+        // block-boundary split above already staged ckpt_P at B, skip this;
+        // otherwise (tiny prompt, sparse/tiered, or ckpt_M reuse past the last
+        // boundary) capture at P here, AFTER register+reselect so the snapshot
+        // describes exactly P tokens (block store + window + registered_pos).
+        if (kvmem_warm_capture && !kvmem_do_boundary_capture) {
+            kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
+            executor_->capture_state(kvmem_warm_ckpt_prompt_);
+            kvmem_warm_prompt_pos = static_cast<uint32_t>(executor_->position());
+            kvmem_warm_prompt_resumable = kvmem_all_gpu_identity();
         }
         if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
             QwenExecutor::kvmem_timing_emit_delta("phase=prefill request=mtp",
@@ -8363,12 +8603,20 @@ private:
             const size_t pos = executor_->position();
             if (pos <= kvmem_warm_log_.size()) {
                 kvmem_warm_log_.resize(pos);
-                executor_->capture_state(kvmem_warm_ckpt_);
+                executor_->capture_state(kvmem_warm_ckpt_end_);
+                // Commit the staged prompt-end (P) checkpoint alongside the
+                // turn-end (M) one; flip all warm fields together so a mid-decode
+                // throw leaves the prior turn's warm state intact.
+                kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
+                kvmem_warm_prompt_pos_ = kvmem_warm_prompt_pos;
+                kvmem_warm_prompt_resumable_ = kvmem_warm_prompt_resumable;
                 kvmem_warm_valid_ = true;
                 if (kvmem_prefix_cache_trace_enabled()) {
                     std::ostringstream cmsg;
                     cmsg << "kvmem prefix-cache CAPTURE (mtp): warm_log="
                          << kvmem_warm_log_.size() << " pos=" << pos
+                         << " P=" << kvmem_warm_prompt_pos
+                         << " P_resumable=" << (kvmem_warm_prompt_resumable ? 1 : 0)
                          << " decoded=" << decoded;
                     log(cmsg.str());
                 }
@@ -8824,11 +9072,27 @@ private:
     // ---- kvmem single-request prefix cache (QW3_KVMEM_PREFIX_CACHE) --------
     // Keeps the plain-route shared executor_ warm across requests. kvmem_warm_log_
     // is the full token sequence of the last request (prompt + committed decode
-    // tokens); kvmem_warm_ckpt_ is capture_state() at exactly that end position.
-    // If a new prompt begins with the whole warm log, we restore_state() and
-    // prefill only the trailing suffix instead of reset+full re-prefill.
+    // tokens). Two resume checkpoints of that request are kept (a small ladder):
+    //   kvmem_warm_ckpt_end_    -- capture_state at turn end (position M, after
+    //                              decode). Reuse here needs the whole warm log
+    //                              to be a token prefix of the new prompt.
+    //   kvmem_warm_ckpt_prompt_ -- capture_state at prompt end (position P, after
+    //                              the post-prefill reselect, before decode). Lets
+    //                              a new prompt that diverges INSIDE the prior
+    //                              response region [P,M) still resume at P and
+    //                              re-prefill only [P,end) instead of the whole
+    //                              accumulated prompt. Only offered when the prior
+    //                              request stayed dense/GPU-resident (no tiers,
+    //                              identity bakes) -- see kvmem_all_gpu_identity().
+    // On a new request we pick the largest checkpoint C in {M,P} with C <= D (the
+    // longest common token prefix) and C < prompt.size(), restore it, rewind the
+    // block store to C (kvmem_truncate_to), and prefill [C,end).
     std::vector<uint32_t> kvmem_warm_log_;
-    QwenExecutor::StateSnapshot kvmem_warm_ckpt_;
+    QwenExecutor::StateSnapshot kvmem_warm_ckpt_end_;
+    QwenExecutor::StateSnapshot kvmem_warm_ckpt_prompt_;
+    uint32_t kvmem_warm_prompt_pos_ = 0;   // P (position of ckpt_prompt_)
+    uint32_t kvmem_warm_end_pos_ = 0;      // M (position of ckpt_end_)
+    bool kvmem_warm_prompt_resumable_ = false;  // ckpt_prompt_ safe to resume
     bool kvmem_warm_valid_ = false;
 
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;

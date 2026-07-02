@@ -32,6 +32,28 @@ void KvMemStore::register_append(uint32_t n_new_tokens) {
     }
 }
 
+std::vector<KvMemDroppedBlock> KvMemStore::truncate_to(uint32_t token_pos) {
+    std::vector<KvMemDroppedBlock> dropped;
+    if (token_pos >= total_tokens_) return dropped;
+    // Pop fully-past blocks from the back, then shrink the trailing partial one.
+    while (!blocks_.empty() && blocks_.back().orig_pos_start >= token_pos) {
+        const KvMemBlock &b = blocks_.back();
+        dropped.push_back(KvMemDroppedBlock{b.block_id, b.tier,
+                                            b.gpu_slot, b.cpu_slot, b.nvme_slot});
+        total_tokens_ -= b.n_tokens;
+        blocks_.pop_back();
+    }
+    if (!blocks_.empty()) {
+        KvMemBlock &last = blocks_.back();
+        if (last.orig_pos_end() > token_pos) {
+            const uint32_t keep = token_pos - last.orig_pos_start;
+            total_tokens_ -= (last.n_tokens - keep);
+            last.n_tokens = keep;
+        }
+    }
+    return dropped;
+}
+
 void KvMemStore::accumulate_attn(const std::vector<double> &scores) {
     const uint32_t n = std::min<uint32_t>(static_cast<uint32_t>(scores.size()),
                                           block_count());

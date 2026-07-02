@@ -221,6 +221,90 @@ static void test_tier_metadata() {
     CHECK(s.blocks()[1].baked_pos == 0);
 }
 
+static void test_truncate_to() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+
+    // (1) truncate on a block boundary: 5 full blocks -> keep exactly 3.
+    {
+        KvMemStore s(cfg);
+        s.register_append(128 * 5);           // ids 0..4, 640 tokens
+        auto dropped = s.truncate_to(128 * 3);
+        CHECK(s.block_count() == 3);
+        CHECK(dropped.size() == 2);           // blocks 4 then 3 popped (back-first)
+        CHECK(dropped[0].block_id == 4);
+        CHECK(dropped[1].block_id == 3);
+        CHECK(s.blocks()[2].n_tokens == 128);
+        // Re-registering the suffix restores the original layout.
+        s.register_append(128 * 2);
+        CHECK(s.block_count() == 5);
+        CHECK(s.blocks()[3].orig_pos_start == 128 * 3);
+        CHECK(s.blocks()[4].n_tokens == 128);
+    }
+
+    // (2) truncate mid-block: shrink the trailing partial block in place.
+    {
+        KvMemStore s(cfg);
+        s.register_append(128 * 3);           // ids 0..2
+        auto dropped = s.truncate_to(128 * 2 + 40);
+        CHECK(s.block_count() == 3);          // block 2 shrunk, not popped
+        CHECK(dropped.empty());
+        CHECK(s.blocks()[2].n_tokens == 40);
+        CHECK(s.blocks()[2].orig_pos_start == 128 * 2);
+        // Growth continues from the shrunk boundary, not the old end.
+        s.register_append(10);
+        CHECK(s.block_count() == 3);
+        CHECK(s.blocks()[2].n_tokens == 50);
+    }
+
+    // (3) truncate straddling a partial trailing block: pop the partial, shrink
+    // the now-trailing full block.
+    {
+        KvMemStore s(cfg);
+        s.register_append(128 * 2 + 30);      // ids 0,1 full; id 2 partial (30)
+        CHECK(s.block_count() == 3);
+        auto dropped = s.truncate_to(128 + 50); // keep block0 full, block1 -> 50
+        CHECK(s.block_count() == 2);
+        CHECK(dropped.size() == 1);
+        CHECK(dropped[0].block_id == 2);
+        CHECK(s.blocks()[1].n_tokens == 50);
+    }
+
+    // (4) no-op cases: token_pos == total (the ckpt_M case) and > total.
+    {
+        KvMemStore s(cfg);
+        s.register_append(128 * 2 + 10);      // 266 tokens
+        CHECK(s.truncate_to(266).empty());
+        CHECK(s.block_count() == 3);
+        CHECK(s.truncate_to(9999).empty());
+        CHECK(s.block_count() == 3);
+    }
+
+    // (5) truncate to 0: everything dropped, dense indices intact on regrow.
+    {
+        KvMemStore s(cfg);
+        s.register_append(128 * 2);
+        auto dropped = s.truncate_to(0);
+        CHECK(s.block_count() == 0);
+        CHECK(dropped.size() == 2);
+        s.register_append(128);
+        CHECK(s.block_count() == 1);
+        CHECK(s.blocks()[0].block_id == 0);
+        CHECK(s.blocks()[0].orig_pos_start == 0);
+    }
+
+    // (6) dropped list carries tier slots so the executor can release them.
+    {
+        KvMemStore s(cfg);
+        s.register_append(128 * 3);
+        s.set_block_tier(2, KvTier::CPU, 7, -1);
+        auto dropped = s.truncate_to(128 * 2);
+        CHECK(dropped.size() == 1);
+        CHECK(dropped[0].block_id == 2);
+        CHECK(dropped[0].tier == KvTier::CPU);
+        CHECK(dropped[0].cpu_slot == 7);
+    }
+}
+
 int main() {
     test_register_append();
     test_selection_diff_and_remap();
@@ -230,6 +314,7 @@ int main() {
     test_topk_all_fit();
     test_topk_empty();
     test_tier_metadata();
+    test_truncate_to();
 
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);

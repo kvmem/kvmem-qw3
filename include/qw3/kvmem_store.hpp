@@ -78,6 +78,17 @@ struct KvMemRemap {
     bool     skip = false;    // from_base == to_base: no kernel needed
 };
 
+// One block removed by truncate_to, carrying the tier slots the executor must
+// release. GPU pages are NOT freed here (restore_state already truncated the KV
+// page table); only CPU/NVMe tier slots are the executor's to release.
+struct KvMemDroppedBlock {
+    uint32_t block_id = 0;
+    KvTier   tier = KvTier::GPU;
+    int32_t  gpu_slot = -1;
+    int32_t  cpu_slot = -1;
+    int32_t  nvme_slot = -1;
+};
+
 // Result of diffing a new selection against the current working set.
 struct KvMemPlan {
     std::vector<uint32_t> stage_in;   // selected blocks not currently resident
@@ -152,6 +163,16 @@ public:
     // new block starts. Returns the number of blocks that became newly full
     // (the trailing partial block is always present once any token exists).
     void register_append(uint32_t n_new_tokens);
+
+    // Drop trailing blocks so the store holds exactly `token_pos` tokens (the
+    // inverse of register_append). Used by the kvmem prefix cache to rewind the
+    // block table when resuming at a prompt-end checkpoint whose position is
+    // BELOW the live end. A partially-covered trailing block is shrunk in place;
+    // fully-past blocks are popped from the back (block_id == vector index, so
+    // popping keeps indices dense). Returns the popped blocks + their tier slots
+    // so the caller can release CPU/NVMe storage. `token_pos >= total_tokens_`
+    // is a no-op (returns empty).
+    std::vector<KvMemDroppedBlock> truncate_to(uint32_t token_pos);
 
     // Capacity of the selection budget measured in blocks.
     uint32_t budget_blocks() const { return cfg_.select_budget / cfg_.block_tokens; }
