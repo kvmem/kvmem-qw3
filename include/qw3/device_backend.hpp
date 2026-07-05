@@ -966,6 +966,10 @@ public:
     // [L, q_layer_stride, n_heads, head_dim] fp32 (first M token rows/layer read);
     // kbar_multi is [L, n_blocks, n_kv_heads, head_dim] fp32. Returns an error if
     // n_blocks exceeds the kernel's shared-memory page cap (caller falls back).
+    // excl_lo_end / excl_hi_begin mask the always-kept sink [0,excl_lo_end) and
+    // recent [excl_hi_begin,n_blocks) bands out of the per-token softmax so their
+    // probability mass redistributes onto the retrievable middle. Defaults
+    // (0, UINT32_MAX) mask nothing (byte-identical to the pre-masking path).
     virtual DeviceStatus block_attn_score_softmax_pages_device(DeviceTensor &score,
                                                                const DeviceTensor &q_multi,
                                                                const DeviceTensor &kbar_multi,
@@ -976,10 +980,12 @@ public:
                                                                uint32_t n_heads,
                                                                uint32_t n_kv_heads,
                                                                uint32_t head_dim,
-                                                               float scale) {
+                                                               float scale,
+                                                               uint32_t excl_lo_end = 0,
+                                                               uint32_t excl_hi_begin = UINT32_MAX) {
         (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
         (void)q_layer_stride; (void)n_blocks; (void)n_heads; (void)n_kv_heads;
-        (void)head_dim; (void)scale;
+        (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 

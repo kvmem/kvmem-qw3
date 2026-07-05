@@ -130,7 +130,7 @@ class DeepSeekJudge:
         self.base_url = (
             base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         ).rstrip("/")
-        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
         self.temperature = temperature
         self.max_retries = max_retries
         self.timeout = timeout

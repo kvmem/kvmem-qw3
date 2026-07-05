@@ -295,7 +295,9 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            uint32_t q_layer_stride,
                                            uint32_t n_blocks, uint32_t n_heads,
                                            uint32_t n_kv_heads, uint32_t head_dim,
-                                           float scale, cudaStream_t stream);
+                                           float scale, uint32_t excl_lo_end,
+                                           uint32_t excl_hi_begin,
+                                           cudaStream_t stream);
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        const float *q, uint32_t q_stride,
                                        uint32_t n_window_blocks,
@@ -2938,7 +2940,9 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
                                                       uint32_t n_heads,
                                                       uint32_t n_kv_heads,
                                                       uint32_t head_dim,
-                                                      float scale) {
+                                                      float scale,
+                                                      uint32_t excl_lo_end,
+                                                      uint32_t excl_hi_begin) {
     const uint32_t lt = blockIdx.x;
     const uint32_t l = lt / n_tokens;
     const uint32_t t = lt % n_tokens;
@@ -2962,7 +2966,14 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
         const uint32_t kvh = qh / group;
         const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
         // logit[w] = scale * dot(q[l,t,qh], k̄[l,w,kvh]) for every page.
+        // Pages in the always-kept sink/recent bands [0,excl_lo_end) and
+        // [excl_hi_begin,n_blocks) are masked to -inf so their softmax mass
+        // redistributes onto the retrievable middle (they are pinned anyway).
         for (uint32_t w = tid; w < n_blocks; w += nthreads) {
+            if (w < excl_lo_end || w >= excl_hi_begin) {
+                s_logit[w] = -INFINITY;
+                continue;
+            }
             const float *kbar_row =
                 kbar_l + (static_cast<uint64_t>(w) * n_kv_heads + kvh) * head_dim;
             float dot = 0.0f;
@@ -6546,7 +6557,9 @@ public:
                                                        uint32_t n_heads,
                                                        uint32_t n_kv_heads,
                                                        uint32_t head_dim,
-                                                       float scale) override {
+                                                       float scale,
+                                                       uint32_t excl_lo_end,
+                                                       uint32_t excl_hi_begin) override {
         if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
             head_dim == 0) {
             return {};
@@ -6556,7 +6569,8 @@ public:
         const auto &kb = as_tensor(kbar_multi);
         if (!ported::launch_block_attn_score_softmax_pages(
                 sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
-                n_blocks, n_heads, n_kv_heads, head_dim, scale, exec_stream_)) {
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, excl_lo_end,
+                excl_hi_begin, exec_stream_)) {
             // n_blocks exceeded the shmem page cap (or a launch error); the
             // executor falls back to the sum-of-ReLU multilayer path.
             return {false, "block_attn_score_softmax_pages launch failed"};
@@ -9402,7 +9416,9 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            uint32_t q_layer_stride,
                                            uint32_t n_blocks, uint32_t n_heads,
                                            uint32_t n_kv_heads, uint32_t head_dim,
-                                           float scale, cudaStream_t stream) {
+                                           float scale, uint32_t excl_lo_end,
+                                           uint32_t excl_hi_begin,
+                                           cudaStream_t stream) {
     if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
         head_dim == 0) {
         return true;
@@ -9419,7 +9435,8 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
     const size_t shmem = static_cast<size_t>(n_blocks) * sizeof(float);
     block_attn_score_softmax_pages_kernel<<<grid, threads, shmem, stream>>>(
         score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
-        n_blocks, n_heads, n_kv_heads, head_dim, scale);
+        n_blocks, n_heads, n_kv_heads, head_dim, scale, excl_lo_end,
+        excl_hi_begin);
     return cudaGetLastError() == cudaSuccess;
 }
 

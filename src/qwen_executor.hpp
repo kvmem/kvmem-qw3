@@ -828,8 +828,11 @@ private:
     void kvmem_resolve_std_layers();        // populate std_layers_/std_layer_slot_
     // mean-k scorer (--kvmem-retrieval-method mean-k, default): per-(layer, query
     // token, head) softmax of q·k̄ OVER PAGES on the cheap per-block mean key.
-    bool kvmem_retrieval_score_mean_softmax();                 // boundary, softmax-over-pages
+    // mask_mode: -1 = honor env QW3_KVMEM_MASK_KEPT (default), 0 = force no mask,
+    // 1 = force mask of the always-kept sink/recent bands (used by the dump sweep).
+    bool kvmem_retrieval_score_mean_softmax(int mask_mode = -1);  // boundary, softmax-over-pages
     bool kvmem_no_rerope_ = false;                             // env: skip re-RoPE collapse (true-pos test)
+    bool kvmem_fix_bakedpos_ = true;                           // record window bake pos for window-baked chunks (env off-switch QW3_KVMEM_FIX_BAKEDPOS=0)
 
     // ---- Raw-key ExactMass selection (--kvmem-retrieval-method per-token) ---
     // ExactMass softmaxes the per-token logit scale·(q·k_raw) over ALL key tokens

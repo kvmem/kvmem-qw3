@@ -2068,6 +2068,32 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         if (chunk_bs) window_query_pos_ += batch;
         if (kvmem_gpu_page_pool_ && !mtp_single_chunk) {
             kvmem_register_until(base_pos + batch);
+            // Window-baked chunk: K/V were physically RoPE'd at rope_base_pos (the
+            // WINDOW frame), not the true position, yet register_append recorded
+            // baked_pos == orig_pos_start (true). Correct the bookkeeping to the
+            // ACTUAL bake position so the reselect below — and every later
+            // de-rotate (set_selection -> assemble, canonicalize-for-tier) —
+            // cancels the real rotation. delta == 0 when not window-active or
+            // under NO_REROPE, so this is a no-op below budget and byte-identical.
+            if (chunk_bs && kvmem_fix_bakedpos_ && block_store_) {
+                const int64_t delta = static_cast<int64_t>(rope_base_pos) -
+                                      static_cast<int64_t>(base_pos);
+                if (delta != 0) {
+                    const auto &blks = block_store_->blocks();
+                    for (uint32_t bi = static_cast<uint32_t>(blks.size());
+                         bi-- > 0;) {
+                        const KvMemBlock &b = blks[bi];
+                        // Blocks are ordered by ascending orig_pos_start; stop at
+                        // the first one fully before this chunk's true range.
+                        if (static_cast<uint32_t>(b.orig_pos_start) + b.n_tokens <=
+                            base_pos) {
+                            break;
+                        }
+                        block_store_->set_block_baked_pos(
+                            bi, static_cast<int64_t>(b.orig_pos_start) + delta);
+                    }
+                }
+            }
             kvmem_maybe_prefill_offload(batch);
         }
 
@@ -2794,10 +2820,47 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 ? (ceiling - reserved)
                 : effective.estimated_block_bytes;
         const uint64_t cap_blocks64 = cap_bytes / effective.estimated_block_bytes;
-        const uint32_t cap_blocks = cap_blocks64 >
+        uint32_t cap_blocks = cap_blocks64 >
                 static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
             ? std::numeric_limits<uint32_t>::max()
             : static_cast<uint32_t>(cap_blocks64);
+        // cudaMemGetInfo is GLOBAL, so `used_now` (total - free) also counts any
+        // co-tenant process on the GPU, and at very long ctx the weights alone
+        // can approach the ceiling. Either drives cap_bytes to ~one block, which
+        // (via the gpu_blocks>=2 gate below) DISABLES the bounded pool and falls
+        // back to the DENSE full-ctx KV cache -- O(ctx) per standard layer, tens
+        // of GiB, the exact OOM this pool exists to prevent. The bounded pool is
+        // the memory-SAVING path, so whenever tiers can absorb the spill and the
+        // context does not fit densely, floor the capacity to a minimum resident
+        // window: enough blocks to hold the selection budget (kept above the
+        // low-watermark shrink threshold below) plus a recent cushion and prefill
+        // -chunk headroom. This window is small (~budget tokens of KV) and always
+        // required for kvmem to function, so flooring never over-commits memory.
+        const bool tiers_available =
+            effective.estimated_block_bytes > 0 &&
+            (effective.cpu_tier_bytes > 0 || effective.nvme_tier_bytes > 0);
+        if (tiers_available) {
+            const uint32_t budget_blocks_min = std::max<uint32_t>(
+                1, effective.select_budget / effective.block_tokens);
+            const uint32_t recent_blocks_min =
+                effective.recent_blocks > 0
+                    ? effective.recent_blocks
+                    : std::max<uint32_t>(1, budget_blocks_min / 4);
+            const long double lw = effective.gpu_low_watermark > 0.0
+                ? static_cast<long double>(effective.gpu_low_watermark)
+                : 1.0L;
+            const uint32_t budget_keep =
+                static_cast<uint32_t>(
+                    static_cast<long double>(budget_blocks_min) / lw) + 2u;
+            const uint32_t min_window_blocks =
+                budget_keep + recent_blocks_min + 16u;
+            const uint64_t ctx_blocks_est =
+                (static_cast<uint64_t>(kv_ctx_size_) + effective.block_tokens - 1) /
+                effective.block_tokens;
+            if (ctx_blocks_est > min_window_blocks && cap_blocks < min_window_blocks) {
+                cap_blocks = min_window_blocks;
+            }
+        }
         effective.estimated_gpu_block_capacity = cap_blocks;
         if (cap_blocks > 0) {
             const uint32_t budget_blocks = std::max<uint32_t>(
@@ -3915,6 +3978,97 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     }
     kvmem_pending_plan_ =
         block_store_->set_selection(block_store_->pick_topk_blocks());
+    // DIAGNOSTIC (default OFF): dump the per-block retrieval ranking + selection
+    // for the first few reselects so an offline tool can locate the answer block
+    // and read its rank/score vs. the budget cutoff. Gated on QW3_KVMEM_DUMP_SCORES
+    // (a file path); no effect on any normal run. Bounded to the first
+    // QW3_KVMEM_DUMP_MAX (default 2) reselects to keep the file small.
+    if (const char *dump_path = std::getenv("QW3_KVMEM_DUMP_SCORES")) {
+        // Dump once per distinct question span (the post-prefill retrieval), so a
+        // single server launch handling several requests emits one snapshot each.
+        static int kvmem_dump_seq = 0;
+        static uint32_t kvmem_dump_last_qb = 0xffffffffu;
+        static uint32_t kvmem_dump_last_qe = 0xffffffffu;
+        // Only dump once the content index the scorer actually uses is LIVE. The
+        // warm-checkpoint boundary split calls reselect mid-prefill (with the same
+        // question span but only ckpt_split blocks registered and the incremental
+        // index still filling), which would otherwise be captured first and latch
+        // out the real, full-coverage final reselect. Gating on index-ready skips
+        // those intermediate reselects and captures the post-prefill selection.
+        const bool index_ready =
+            kvmem_qc_pertoken_ ? g_kraw_multi_ready_ : g_kbar_multi_ready_;
+        const bool span_is_new = index_ready &&
+            (kvmem_query_end_ > kvmem_query_begin_) &&
+            (kvmem_query_begin_ != kvmem_dump_last_qb ||
+             kvmem_query_end_ != kvmem_dump_last_qe);
+        if (span_is_new) {
+            kvmem_dump_last_qb = kvmem_query_begin_;
+            kvmem_dump_last_qe = kvmem_query_end_;
+            // Write one snapshot (meta + per-block rows) from the CURRENT block
+            // store state; `mask_label` tags which softmax-mask config produced
+            // the scores (-1 = as-run, 0 = forced no-mask, 1 = forced mask).
+            auto dump_snapshot = [&](int mask_label) {
+                const auto &cfg = block_store_->config();
+                const auto &blks = block_store_->blocks();
+                if (std::FILE *f = std::fopen(dump_path, "a")) {
+                    uint32_t nsel = 0;
+                    for (const auto &b : blks) nsel += b.in_working_set ? 1u : 0u;
+                    std::fprintf(f,
+                        "{\"type\":\"meta\",\"seq\":%d,\"block_count\":%zu,"
+                        "\"selected\":%u,\"query_begin\":%u,\"query_end\":%u,"
+                        "\"budget_blocks\":%u,\"recent\":%u,\"sink\":%u,"
+                        "\"block_tokens\":%u,\"method\":\"%s\",\"mask\":%d,"
+                        "\"qc_total_blocks\":%u,\"qc_captured_blocks\":%u,"
+                        "\"index_ready\":%d,\"query_ready\":%d}\n",
+                        kvmem_dump_seq, blks.size(), nsel,
+                        kvmem_query_begin_, kvmem_query_end_,
+                        block_store_->budget_blocks(), cfg.recent_blocks,
+                        cfg.sink_blocks, cfg.block_tokens,
+                        kvmem_qc_pertoken_ ? "per-token" : "mean-k", mask_label,
+                        kvmem_qc_total_blocks_, kvmem_qc_captured_blocks_,
+                        index_ready ? 1 : 0, g_query_multi_ready_ ? 1 : 0);
+                    for (const auto &b : blks) {
+                        std::fprintf(f,
+                            "{\"b\":%u,\"p0\":%u,\"nt\":%u,\"rs\":%.9g,\"ps\":%.9g,"
+                            "\"as\":%.9g,\"sel\":%d,\"tier\":%d}\n",
+                            b.block_id, b.orig_pos_start, b.n_tokens,
+                            b.retrieval_score, b.profile_score, b.attn_score,
+                            b.in_working_set ? 1 : 0, static_cast<int>(b.tier));
+                    }
+                    std::fclose(f);
+                }
+                ++kvmem_dump_seq;
+            };
+            // Mask sweep (QW3_KVMEM_DUMP_MASK_SWEEP): re-score the SAME prefilled
+            // index/query twice (mask off, mask on) and dump each, so a single
+            // ~12-min prefill yields an apples-to-apples answer-block ranking with
+            // and without kept-band masking. Only the mean-k path supports the
+            // override; per-token dumps a single as-run snapshot. Restores the
+            // production (env-honoring) selection afterward so downstream stage
+            // in/out is unchanged.
+            const bool sweep = std::getenv("QW3_KVMEM_DUMP_MASK_SWEEP") != nullptr;
+            const bool can_sweep = sweep && !kvmem_qc_pertoken_ &&
+                (kvmem_query_end_ > kvmem_query_begin_) && g_query_multi_ready_;
+            if (can_sweep) {
+                if (kvmem_retrieval_score_mean_softmax(0)) {
+                    kvmem_pending_plan_ =
+                        block_store_->set_selection(block_store_->pick_topk_blocks());
+                    dump_snapshot(0);
+                }
+                if (kvmem_retrieval_score_mean_softmax(1)) {
+                    kvmem_pending_plan_ =
+                        block_store_->set_selection(block_store_->pick_topk_blocks());
+                    dump_snapshot(1);
+                }
+                // Restore production-consistent scoring/selection.
+                (void)kvmem_retrieval_score_mean_softmax(-1);
+                kvmem_pending_plan_ =
+                    block_store_->set_selection(block_store_->pick_topk_blocks());
+            } else {
+                dump_snapshot(-1);
+            }
+        }
+    }
     if (tm) {
         require_status(backend_.synchronize());
         KvMemTimingTotals &t = kvmem_timing_totals();
@@ -4650,6 +4804,13 @@ void QwenExecutor::kvmem_resolve_std_layers() {
         }
     }
     kvmem_no_rerope_ = env_flag_enabled("QW3_KVMEM_NO_REROPE");
+    // Default ON: record the ACTUAL window bake position as baked_pos for chunks
+    // prefilled while the window is active, so downstream de-rotate (set_selection
+    // -> assemble, canonicalize) cancels the real rotation. QW3_KVMEM_FIX_BAKEDPOS=0
+    // restores the old (buggy true-pos) bookkeeping for A/B comparison.
+    if (const char *e = std::getenv("QW3_KVMEM_FIX_BAKEDPOS")) {
+        kvmem_fix_bakedpos_ = !(e[0] == '0' && e[1] == '\0');
+    }
     // Query-conditioned scorer choice comes from the CLI (--kvmem-retrieval-method):
     // PerToken -> raw-key ExactMass (needs the ~7.4 GB g_kraw_multi_ buffer), else
     // MeanK -> softmax-over-pages on the ~28 MB mean-key buffer (default).
@@ -4833,7 +4994,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
 // no host-side inv_lm divide or extra normalization tail. Returns false (caller falls
 // back to the single last-token scorer) if the index/query isn't live or the kernel
 // rejects the page count. See docs/kvmem_utility_eval_plan.md.
-bool QwenExecutor::kvmem_retrieval_score_mean_softmax() {
+bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
     if (!block_store_) return false;
     if (!g_kbar_multi_ready_ || g_kbar_multi_blocks_ == 0) return false;
     if (!g_query_multi_ || !g_query_multi_ready_ || g_query_multi_count_ == 0)
@@ -4852,10 +5013,52 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax() {
     // the page distribution). Returns false if the kernel rejects nb (shmem page
     // cap) -> caller falls back to the single last-token scorer.
     const float sm_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
+    // Mask the always-kept sink [0,sink) and recent [nb-recent,nb) bands out of
+    // the softmax so their probability mass (dominated by the boundary/adjacency
+    // artifact) redistributes onto the retrievable middle. pick_topk_blocks keeps
+    // those bands unconditionally regardless of score, so zeroing them here never
+    // drops a kept block; it only sharpens the ranking of the contested middle.
+    // Only meaningful over budget (nb>budget) where selection is actually
+    // competitive. Default ON; QW3_KVMEM_MASK_KEPT=0 restores the un-masked path.
+    uint32_t excl_lo_end = 0;
+    uint32_t excl_hi_begin = UINT32_MAX;
+    {
+        bool mask_on;
+        if (mask_mode == 0) {
+            mask_on = false;
+        } else if (mask_mode == 1) {
+            mask_on = true;
+        } else {
+            const char *mask_env = std::getenv("QW3_KVMEM_MASK_KEPT");
+            mask_on = !(mask_env && std::string(mask_env) == "0");
+        }
+        const uint32_t budget = block_store_->budget_blocks();
+        if (mask_on && budget > 0 && nb > budget) {
+            const KvMemStoreConfig &bcfg = block_store_->config();
+            uint32_t sink = std::min(bcfg.sink_blocks, nb);
+            uint32_t recent = bcfg.recent_blocks == 0
+                                  ? std::max<uint32_t>(1, budget / 4)
+                                  : bcfg.recent_blocks;
+            recent = std::min(recent, nb);
+            // Only mask if a non-empty retrievable middle survives.
+            if (sink + recent < nb) {
+                excl_lo_end = sink;
+                excl_hi_begin = nb - recent;
+                if (std::getenv("QW3_KVMEM_TRACE")) {
+                    std::fprintf(stderr,
+                                 "[bs-mean-softmax] masking kept bands: "
+                                 "sink[0,%u) recent[%u,%u) middle=%u blocks\n",
+                                 excl_lo_end, excl_hi_begin, nb,
+                                 excl_hi_begin - excl_lo_end);
+                }
+            }
+        }
+    }
     if (auto st = backend_.block_attn_score_softmax_pages_device(
             *g_score_dev_, *g_query_multi_, *g_kbar_multi_,
             L, M, /*q_layer_stride=*/S, nb,
-            cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, sm_scale);
+            cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, sm_scale,
+            excl_lo_end, excl_hi_begin);
         !st.ok) {
         return false;
     }
