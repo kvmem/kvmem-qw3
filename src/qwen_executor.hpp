@@ -197,6 +197,14 @@ public:
                                           bool copy_last_logits = true,
                                           std::vector<std::vector<float>> *row_logits_host = nullptr);
 
+    // The prefill sub-chunk width forward_n_tokens will use for a batch of
+    // `total` tokens (the non-verify path). This is the single source of truth
+    // for the chunk cap: CLI/env override, the free-memory safety floor, and the
+    // bounded KVMem GPU pool headroom cap. Callers that must keep the whole batch
+    // resident (e.g. MTP prefix priming reads the last batch's hidden rows) drive
+    // their outer loop by this width so forward_n_tokens never re-splits a chunk.
+    uint32_t effective_prefill_chunk_size(uint32_t total) const;
+
     // Diagnostic single-step MTP draft head. Uses the current target
     // pre-output hidden state (`h_`) plus `token_id` and writes MTP logits to
     // the normal logits buffer. This does not perform speculative acceptance.
@@ -298,6 +306,12 @@ public:
     // so it must call kvmem_advance_window(chunk) after a successful batched
     // verify. These accessors expose the window frame the metadata builder reads.
     bool kvmem_active() const { return kvmem_active_; }
+    // True when query-conditioned selection uses the raw per-token index
+    // (g_kraw_multi_, --kvmem-retrieval-method per-token). That index is strided by
+    // the per-turn total token count and cannot be fixed-stride at large --ctx, so
+    // the backend refuses above-budget session reuse (M-reuse) in this mode and
+    // falls back to a full cold prefill (correct, just unoptimized).
+    bool kvmem_qc_pertoken() const { return kvmem_qc_pertoken_; }
     uint32_t window_query_pos() const { return window_query_pos_; }
     uint32_t window_page_count() const { return window_page_count_; }
     const std::vector<int32_t> &window_pages_host() const {
@@ -869,6 +883,55 @@ private:
                                   uint32_t rope_base_pos, uint32_t k_token_stride);
     uint32_t kvmem_qc_total_blocks_ = 0;                       // final block count (index stride)
     uint32_t kvmem_qc_captured_blocks_ = 0;                    // blocks captured so far (slot 0)
+    // Fixed per-layer stride (in blocks) of g_kbar_multi_, pinned at ctx_blocks
+    // (ceil(kv_ctx_size_/block_tokens)) for the whole session so preserved [0,D)
+    // index slices stay valid as the block count grows across resumed turns
+    // (server-side session continuation). 0 -> not yet allocated; when nonzero the
+    // scorer passes it as kbar_layer_stride while g_kbar_multi_blocks_ stays the
+    // scored count. Legacy (non-resumable) turns leave it == the turn's block count.
+    uint32_t kvmem_qc_layer_stride_blocks_ = 0;
+    // Set by kvmem_truncate_to when a truncate drops ZERO blocks (pure append /
+    // session resume): the resident token length that the preserved [0,D) index
+    // already covers. Consumed + cleared at the top of kvmem_set_query_span, where
+    // it seeds kvmem_qc_captured_blocks_ = resume/block_tokens and suppresses the
+    // full-buffer zero so only the new suffix's blocks are (re)captured. 0 on a cold
+    // turn (reset_state / a dropping truncate), which zeroes the whole index.
+    uint32_t kvmem_qc_resume_base_tokens_ = 0;
+public:
+    // Enable/disable decode-time content capture around the (plain) decode loop.
+    // The server-side session-continuation path enables it before decoding an
+    // above-budget query-conditioned turn and disables (+ finalizes the trailing
+    // partial block) after, so the turn's generated blocks are indexed for the
+    // NEXT turn's reuse. No-op unless kvmem + a QC span + the fixed-stride index
+    // are live; safe to call unconditionally.
+    void kvmem_decode_capture_begin();
+    void kvmem_decode_capture_finalize();
+    // Per-std-layer decode hook: stage the just-RoPE'd K row (k_) for this token,
+    // de-RoPE'd at its bake position rope_pos into the position-invariant content
+    // frame. Called once per normal-attention layer inside forward_one_token.
+    void kvmem_decode_capture_stage(uint32_t layer_index, uint32_t rope_pos);
+
+private:
+    // ---- Decode-time content capture (server-side session continuation) -------
+    // The incremental prefill capture (kvmem_capture_kbar_multi) only runs during
+    // prefill, so a turn's generated tokens are never indexed. Above budget they
+    // land in the preserved [0,D) region on the next resume turn but would stay
+    // zero-ranked (unselectable), breaking reuse==fresh equivalence. So above budget
+    // we index each generated block DURING decode as it completes. Decode K is
+    // window-baked at a position that RESELECT re-bakes mid-block (interval < block
+    // size), so contiguous-position batch de-RoPE is unsafe; instead each token's K
+    // is de-RoPE'd at its OWN bake position the moment it is produced (reselect-
+    // immune, since the content frame is position-invariant) and the resulting
+    // content-frame rows are staged here [L, block_tokens, n_kv_heads*head_dim] fp32.
+    // On block completion the staged rows are meaned (rope_dim==0, no further rotate)
+    // into g_kbar_multi_[slot*stride + true_block_index]. Allocated lazily on the
+    // first above-budget decode; unused (and un-allocated) below budget / off / MTP.
+    void kvmem_capture_decode_block(uint32_t true_block_index, uint32_t rows);
+    std::unique_ptr<DeviceTensor> g_kbar_decode_stage_;        // [L, block_tokens, n_kv_heads*head_dim] fp32 content-frame rows
+    bool kvmem_decode_capture_on_ = false;                     // enabled by kvmem_decode_capture_begin (plain above-budget QC turn)
+    bool decode_stage_active_ = false;                         // currently staging a block started at its first (offset-0) token
+    uint32_t decode_stage_rows_ = 0;                           // content-frame rows staged in the current block
+    uint32_t decode_stage_block_ = 0;                          // TRUE block index currently being staged
 
     // ---- KVMem attention-distribution diagnostics -------------------------
     // Enabled only when QW3_KVMEM_ATTN_TRACE points at a JSONL output path.

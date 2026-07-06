@@ -293,7 +293,9 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            const float *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
                                            uint32_t q_layer_stride,
-                                           uint32_t n_blocks, uint32_t n_heads,
+                                           uint32_t n_blocks,
+                                           uint32_t kbar_layer_stride,
+                                           uint32_t n_heads,
                                            uint32_t n_kv_heads, uint32_t head_dim,
                                            float scale, uint32_t excl_lo_end,
                                            uint32_t excl_hi_begin,
@@ -2937,6 +2939,7 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
                                                       uint32_t n_tokens,
                                                       uint32_t q_layer_stride,
                                                       uint32_t n_blocks,
+                                                      uint32_t kbar_layer_stride,
                                                       uint32_t n_heads,
                                                       uint32_t n_kv_heads,
                                                       uint32_t head_dim,
@@ -2954,8 +2957,14 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
     const uint32_t nthreads = blockDim.x;
     const uint32_t group = n_heads / n_kv_heads;
     const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
+    // Per-layer base uses kbar_layer_stride (in blocks), which may exceed n_blocks
+    // when g_kbar_multi_ is allocated at a fixed session stride (ctx_blocks) so
+    // preserved [0,D) slices stay valid as the block count grows across turns.
+    // n_blocks remains the loop/count bound. Callers that don't fix-stride pass
+    // kbar_layer_stride == n_blocks (byte-identical).
     const float *kbar_l =
-        kbar_multi + static_cast<uint64_t>(l) * n_blocks * n_kv_heads * head_dim;
+        kbar_multi +
+        static_cast<uint64_t>(l) * kbar_layer_stride * n_kv_heads * head_dim;
     const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
     // Per-head weight: each (layer,token) contributes mean over heads, and the
     // grid sum over layers must end up as a mean over L. n_tokens is summed (not
@@ -6554,6 +6563,7 @@ public:
                                                        uint32_t n_tokens,
                                                        uint32_t q_layer_stride,
                                                        uint32_t n_blocks,
+                                                       uint32_t kbar_layer_stride,
                                                        uint32_t n_heads,
                                                        uint32_t n_kv_heads,
                                                        uint32_t head_dim,
@@ -6569,8 +6579,8 @@ public:
         const auto &kb = as_tensor(kbar_multi);
         if (!ported::launch_block_attn_score_softmax_pages(
                 sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
-                n_blocks, n_heads, n_kv_heads, head_dim, scale, excl_lo_end,
-                excl_hi_begin, exec_stream_)) {
+                n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                excl_lo_end, excl_hi_begin, exec_stream_)) {
             // n_blocks exceeded the shmem page cap (or a launch error); the
             // executor falls back to the sum-of-ReLU multilayer path.
             return {false, "block_attn_score_softmax_pages launch failed"};
@@ -6694,7 +6704,8 @@ public:
                                                   uint32_t head_dim,
                                                   uint32_t rope_dim,
                                                   int32_t rope_base,
-                                                  float theta) override {
+                                                  float theta,
+                                                  uint32_t src_row_off = 0) override {
         if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 || batch == 0) {
             return {};
         }
@@ -6703,8 +6714,9 @@ public:
         if (kbt.elem_size != sizeof(float) || kb.elem_size != sizeof(float)) {
             return {false, "block_kmean_content_batch_device requires fp32 buffers"};
         }
+        const float *k_ptr = kbt.ptr + static_cast<uint64_t>(src_row_off) * k_stride;
         if (!ported::launch_block_kmean_content_batch(
-                kbt.ptr, kb.ptr, kbar_block_base, n_blocks_chunk, k_stride, batch,
+                k_ptr, kb.ptr, kbar_block_base, n_blocks_chunk, k_stride, batch,
                 blk_tokens, n_kv_heads, head_dim, rope_dim, rope_base, theta,
                 exec_stream_)) {
             return {false, "block_kmean_content_batch launch failed"};
@@ -9414,7 +9426,9 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            const float *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
                                            uint32_t q_layer_stride,
-                                           uint32_t n_blocks, uint32_t n_heads,
+                                           uint32_t n_blocks,
+                                           uint32_t kbar_layer_stride,
+                                           uint32_t n_heads,
                                            uint32_t n_kv_heads, uint32_t head_dim,
                                            float scale, uint32_t excl_lo_end,
                                            uint32_t excl_hi_begin,
@@ -9435,8 +9449,8 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
     const size_t shmem = static_cast<size_t>(n_blocks) * sizeof(float);
     block_attn_score_softmax_pages_kernel<<<grid, threads, shmem, stream>>>(
         score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
-        n_blocks, n_heads, n_kv_heads, head_dim, scale, excl_lo_end,
-        excl_hi_begin);
+        n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+        excl_lo_end, excl_hi_begin);
     return cudaGetLastError() == cudaSuccess;
 }
 

@@ -362,6 +362,8 @@ int main(int argc, char **argv) {
                 engine.kvmem_block_tokens = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-budget") {
                 engine.kvmem_budget = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-gen-budget") {
+                engine.kvmem_gen_budget = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-interval") {
                 engine.kvmem_interval = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-sink-blocks") {

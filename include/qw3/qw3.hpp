@@ -55,6 +55,7 @@ struct EngineOptions {
     bool kvmem_enabled = false;
     int kvmem_block_tokens = 128;        // block granularity (multiple of KV page size)
     int kvmem_budget = 131072;    // max window tokens kept per selection
+    int kvmem_gen_budget = 32768; // GPU pool reserve for generated tokens; also caps max_tokens
     int kvmem_interval = 64;      // decode steps between reselections
     int kvmem_sink_blocks = 1;           // always-kept prefix blocks
     int kvmem_recent_blocks = 0;         // always-kept suffix blocks (0 = derive)

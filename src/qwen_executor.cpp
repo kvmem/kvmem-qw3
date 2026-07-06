@@ -540,6 +540,11 @@ void QwenExecutor::reset_state() {
     g_kbar_multi_blocks_ = 0;
     kvmem_qc_total_blocks_ = 0;
     kvmem_qc_captured_blocks_ = 0;
+    // A full reset is a cold start: no prefix survives, so clear the fixed stride
+    // and the session-continuation resume base. The next kvmem_set_query_span then
+    // zeroes the whole content index (resume_base == 0) and re-pins the stride.
+    kvmem_qc_layer_stride_blocks_ = 0;
+    kvmem_qc_resume_base_tokens_ = 0;
     if (block_store_) {
         *block_store_ = KvMemStore(block_store_->config());
     }
@@ -1357,6 +1362,12 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                                                  standard_head_dim,
                                                  cfg.rope_dim, rope_pos, cfg.rope_theta));
 
+            // Above-budget QC content index for the generated token: de-RoPE the
+            // freshly-baked K at its bake position into the content frame (position-
+            // invariant, so reselect re-baking the window is immaterial). No-op unless
+            // decode capture was armed on the plain path (kvmem, above budget, mean-k).
+            if (bs) kvmem_decode_capture_stage(il, rope_pos);
+
             // Append K and V to the live cache.
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
             require_status(backend_.kv_append_batch_paged_device(
@@ -1572,6 +1583,102 @@ NativeExecutorReport QwenExecutor::forward_recurrent_layer_from_current_hidden(
     return report;
 }
 
+uint32_t QwenExecutor::effective_prefill_chunk_size(uint32_t total) const {
+    if (total == 0) return 0;
+    // Default cap 2048: recovers most of the chunking throughput tax vs
+    // whole-prompt while holding peak scratch close to chunk=512. See
+    // forward_n_tokens for the tuning rationale.
+    constexpr uint32_t kQw3DefaultPrefillChunk = 2048;
+    uint32_t chunk_size = std::min<uint32_t>(kQw3DefaultPrefillChunk, total);
+    // CLI override (`--prefill-chunk N`) takes precedence over env. -1 means
+    // "no override, use env or default".
+    if (prefill_chunk_override_ >= 0) {
+        if (prefill_chunk_override_ == 0) {
+            chunk_size = total;  // whole-prompt batch
+        } else {
+            chunk_size = static_cast<uint32_t>(prefill_chunk_override_);
+        }
+    } else if (const char *env = std::getenv("QW3_PREFILL_CHUNK")) {
+        int v = std::atoi(env);
+        if (v > 0) {
+            chunk_size = static_cast<uint32_t>(v);
+        } else if (v == 0) {
+            // Explicit opt-out of chunking.
+            chunk_size = total;
+        }
+    }
+    // Safety floor: even if the user set a large chunk (or QW3_PREFILL_CHUNK=0
+    // disabled the cap), don't exceed what fits in 80% of currently free
+    // device memory. This handles edge cases where weights + KV cache leave
+    // less headroom than the requested chunk's per-prompt scratch.
+    const uint64_t per_tok = per_token_scratch_bytes();
+    if (per_tok > 0) {
+        const uint64_t free_b = backend_.free_device_bytes();
+        if (free_b > 0) {
+            const uint64_t budget = (free_b * 8) / 10;
+            const uint64_t fits = budget / per_tok;
+            if (fits > 0 && fits < chunk_size) {
+                chunk_size = static_cast<uint32_t>(fits);
+                if (chunk_size > 256) chunk_size &= ~static_cast<uint32_t>(255);
+            }
+        }
+    }
+    if (kvmem_gpu_page_pool_ && block_store_) {
+        // The bounded GPU pool used to force prefill into block-granular
+        // (block_tokens, e.g. 16-token) chunks. That collapsed every matmul
+        // (attn projections, FFN, DeltaNet) into the tiny-batch MMVQ regime —
+        // each weight tile is read but feeds only ~16 columns, so weight-read
+        // amortization is ~chunk/block worse. Empirically this was a ~7x
+        // prefill cliff the instant the pool engaged (the whole spill regime).
+        //
+        // The append for a chunk grabs ceil(batch/page_size) pages in one shot
+        // before the post-chunk offload runs, so the only real constraint is
+        // that a chunk must fit in the pool headroom left over the resident
+        // window. After a reselect the window holds ~budget_blocks (+ recent
+        // cushion); the rest of the pool is free for the next chunk's append.
+        // Cap to that headroom (keeping one block of slack so the offload's own
+        // keep-free cushion is honored), aligned down to a block boundary, and
+        // never below block_tokens. The existing kvmem_maybe_prefill_offload
+        // headroom reservation (next_chunk_pages + cushion) then keeps the pool
+        // from overflowing for any chunk this cap allows.
+        const uint32_t block_tokens =
+            std::max<uint32_t>(1, block_store_->config().block_tokens);
+        const uint32_t psz = std::max<uint32_t>(1, kv_pages_.page_size);
+        const uint32_t pages_per_block =
+            std::max<uint32_t>(1, block_tokens / psz);
+        const uint32_t pool_pages = kvmem_gpu_page_pool_->total_pages();
+        const uint32_t budget_blocks =
+            std::max<uint32_t>(1, block_store_->budget_blocks());
+        const uint32_t cushion_blocks =
+            std::max<uint32_t>(1, block_store_->config().recent_blocks);
+        const uint64_t resident_pages =
+            static_cast<uint64_t>(budget_blocks + cushion_blocks) *
+            pages_per_block;
+        const uint32_t headroom_pages =
+            static_cast<uint64_t>(pool_pages) > resident_pages
+                ? static_cast<uint32_t>(pool_pages - resident_pages)
+                : 0;
+        // Use only a quarter of the budget->pool gap for a single chunk. A
+        // chunk's pages are claimed in one shot before the post-chunk offload
+        // runs, and the offload's reselect can transiently hold extra pages
+        // (stage-in of any resurrected block before the stage-out release).
+        // A quarter leaves generous margin on tight pools (where budget ~ pool)
+        // while still letting the chunk reach the full default whenever the pool
+        // is sized well above the window budget (the common case).
+        const uint32_t chunk_pages_cap = headroom_pages / 4;
+        uint32_t max_chunk_tokens =
+            chunk_pages_cap > 0 ? chunk_pages_cap * psz : block_tokens;
+        if (max_chunk_tokens < block_tokens) max_chunk_tokens = block_tokens;
+        if (max_chunk_tokens > block_tokens) {
+            max_chunk_tokens -= max_chunk_tokens % block_tokens;
+        }
+        chunk_size = std::min<uint32_t>(chunk_size, max_chunk_tokens);
+    }
+    if (chunk_size > total) chunk_size = total;
+    if (chunk_size == 0) chunk_size = total;
+    return chunk_size;
+}
+
 NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> &tokens,
                                                     bool compute_logits,
                                                     std::vector<DeviceArgmax> *row_argmaxes,
@@ -1625,94 +1732,12 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     //
     // Override with QW3_PREFILL_CHUNK=N. Set N=0 to disable the cap entirely
     // (whole-prompt batch — original behavior, useful for benchmarking the
-    // throughput tax of chunking itself).
-    constexpr uint32_t kQw3DefaultPrefillChunk = 2048;
-    uint32_t chunk_size = std::min<uint32_t>(kQw3DefaultPrefillChunk, total);
-    // CLI override (`--prefill-chunk N`) takes precedence over env. -1 means
-    // "no override, use env or default".
-    if (prefill_chunk_override_ >= 0) {
-        if (prefill_chunk_override_ == 0) {
-            chunk_size = total;  // whole-prompt batch
-        } else {
-            chunk_size = static_cast<uint32_t>(prefill_chunk_override_);
-        }
-    } else if (const char *env = std::getenv("QW3_PREFILL_CHUNK")) {
-        int v = std::atoi(env);
-        if (v > 0) {
-            chunk_size = static_cast<uint32_t>(v);
-        } else if (v == 0) {
-            // Explicit opt-out of chunking.
-            chunk_size = total;
-        }
-    }
-    // Safety floor: even if the user set a large chunk (or QW3_PREFILL_CHUNK=0
-    // disabled the cap), don't exceed what fits in 80% of currently free
-    // device memory. This handles edge cases where weights + KV cache leave
-    // less headroom than the requested chunk's per-prompt scratch.
-    const uint64_t per_tok = per_token_scratch_bytes();
-    if (per_tok > 0) {
-        const uint64_t free_b = backend_.free_device_bytes();
-        if (free_b > 0) {
-            const uint64_t budget = (free_b * 8) / 10;
-            const uint64_t fits = budget / per_tok;
-            if (fits > 0 && fits < chunk_size) {
-                chunk_size = static_cast<uint32_t>(fits);
-                if (chunk_size > 256) chunk_size &= ~static_cast<uint32_t>(255);
-            }
-        }
-    }
+    // throughput tax of chunking itself). effective_prefill_chunk_size() is the
+    // single source of truth for the cap (override/env, free-memory floor, and
+    // the bounded KVMem GPU pool headroom cap); the MTP prefix priming loop
+    // queries the same function so its outer chunks match what runs here.
+    uint32_t chunk_size = effective_prefill_chunk_size(total);
     if (mtp_single_chunk) chunk_size = total;  // MTP verify: never split
-    if (!mtp_single_chunk && kvmem_gpu_page_pool_ && block_store_) {
-        // The bounded GPU pool used to force prefill into block-granular
-        // (block_tokens, e.g. 16-token) chunks. That collapsed every matmul
-        // (attn projections, FFN, DeltaNet) into the tiny-batch MMVQ regime —
-        // each weight tile is read but feeds only ~16 columns, so weight-read
-        // amortization is ~chunk/block worse. Empirically this was a ~7x
-        // prefill cliff the instant the pool engaged (the whole spill regime).
-        //
-        // The append for a chunk grabs ceil(batch/page_size) pages in one shot
-        // before the post-chunk offload runs, so the only real constraint is
-        // that a chunk must fit in the pool headroom left over the resident
-        // window. After a reselect the window holds ~budget_blocks (+ recent
-        // cushion); the rest of the pool is free for the next chunk's append.
-        // Cap to that headroom (keeping one block of slack so the offload's own
-        // keep-free cushion is honored), aligned down to a block boundary, and
-        // never below block_tokens. The existing kvmem_maybe_prefill_offload
-        // headroom reservation (next_chunk_pages + cushion) then keeps the pool
-        // from overflowing for any chunk this cap allows.
-        const uint32_t block_tokens =
-            std::max<uint32_t>(1, block_store_->config().block_tokens);
-        const uint32_t psz = std::max<uint32_t>(1, kv_pages_.page_size);
-        const uint32_t pages_per_block =
-            std::max<uint32_t>(1, block_tokens / psz);
-        const uint32_t pool_pages = kvmem_gpu_page_pool_->total_pages();
-        const uint32_t budget_blocks =
-            std::max<uint32_t>(1, block_store_->budget_blocks());
-        const uint32_t cushion_blocks =
-            std::max<uint32_t>(1, block_store_->config().recent_blocks);
-        const uint64_t resident_pages =
-            static_cast<uint64_t>(budget_blocks + cushion_blocks) *
-            pages_per_block;
-        const uint32_t headroom_pages =
-            static_cast<uint64_t>(pool_pages) > resident_pages
-                ? static_cast<uint32_t>(pool_pages - resident_pages)
-                : 0;
-        // Use only a quarter of the budget->pool gap for a single chunk. A
-        // chunk's pages are claimed in one shot before the post-chunk offload
-        // runs, and the offload's reselect can transiently hold extra pages
-        // (stage-in of any resurrected block before the stage-out release).
-        // A quarter leaves generous margin on tight pools (where budget ~ pool)
-        // while still letting the chunk reach the full default whenever the pool
-        // is sized well above the window budget (the common case).
-        const uint32_t chunk_pages_cap = headroom_pages / 4;
-        uint32_t max_chunk_tokens =
-            chunk_pages_cap > 0 ? chunk_pages_cap * psz : block_tokens;
-        if (max_chunk_tokens < block_tokens) max_chunk_tokens = block_tokens;
-        if (max_chunk_tokens > block_tokens) {
-            max_chunk_tokens -= max_chunk_tokens % block_tokens;
-        }
-        chunk_size = std::min<uint32_t>(chunk_size, max_chunk_tokens);
-    }
     if (chunk_size > total) chunk_size = total;
     if (chunk_size == 0) chunk_size = total;
     ensure_batch_scratch(chunk_size);
@@ -2800,16 +2825,22 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             (free_now > 0 && free_now <= total_device_bytes)
                 ? (total_device_bytes - free_now)
                 : 0;
-        // Prefill scratch (FA2 attention workspace + q8_1 matmul staging +
-        // split-K partials) is additive and grows with KV length, reaching
-        // ~13 GiB at 2M ctx for this model. Reserve enough headroom that the
-        // resident pool + scratch stay under the ceiling at the LONGEST context.
-        // The pool only needs to hold the decode window (~1.7 GiB for a 32K
-        // window) plus transient prefill-chunk / reselect pages, so a ~4 GiB
-        // pool (ceiling 47.8 - weights 28.6 - reserve 15) is ample; the unused
-        // budget is better handed to scratch. Tunable via
-        // QW3_KVMEM_SCRATCH_RESERVE_MIB.
-        uint64_t scratch_reserve = static_cast<uint64_t>(15) << 30;
+        // Reserve headroom under the ceiling for transient prefill scratch (FA2
+        // attention workspace + split-K partials + q8_1 matmul staging +
+        // per-token activation scratch = per_token_scratch_bytes()*chunk). Under
+        // kvmem this scratch is NOT ctx-bound: attention is windowed to
+        // select_budget and prefill runs in fixed chunks, so the transient peak
+        // is bounded by the window/chunk, not the total context. Measured on
+        // this model (budget 32768, chunk 2048): peak scratch over idle stays
+        // flat at <0.8 GiB across 30K..150K-token prefills. A 3 GiB reserve is
+        // ~4x that measured peak; the runtime chunk-floor (see the forward-time
+        // free_device_bytes cap) plus the cudaMalloc hard-fail auto-chunk remain
+        // the actual OOM backstop, so this static value only needs to be
+        // realistic, not worst-case. The old 15 GiB flat reserve was calibrated
+        // for the non-kvmem 2M-ctx dense path and over-subtracted ~14 GiB here,
+        // spuriously tripping the budget+gen_reserve hard-error at ratio 0.5.
+        // Tunable via QW3_KVMEM_SCRATCH_RESERVE_MIB.
+        uint64_t scratch_reserve = static_cast<uint64_t>(3) << 30;
         if (const char *env = std::getenv("QW3_KVMEM_SCRATCH_RESERVE_MIB")) {
             const long long v = std::atoll(env);
             if (v >= 0) scratch_reserve = static_cast<uint64_t>(v) << 20;
@@ -2863,18 +2894,35 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         }
         effective.estimated_gpu_block_capacity = cap_blocks;
         if (cap_blocks > 0) {
-            const uint32_t budget_blocks = std::max<uint32_t>(
-                1, static_cast<uint32_t>(
-                       static_cast<long double>(cap_blocks) *
-                       static_cast<long double>(effective.gpu_low_watermark)));
-            const uint64_t cap_tokens =
-                static_cast<uint64_t>(
-                    std::min<uint32_t>(cap_blocks, budget_blocks)) *
+            // The bounded GPU pool must hold BOTH the selection window
+            // (select_budget) AND one turn's newly generated tokens
+            // (gen_budget). In step update-mode no decode-time stage-out fires,
+            // so a turn's register_append blocks stay GPU-resident; sizing the
+            // pool to budget + gen_reserve makes mid-decode pool exhaustion
+            // structurally impossible (paired with the server's max_tokens <=
+            // gen_budget clamp). Hard-fail at configure time when VRAM can't fit
+            // both, naming the knobs, instead of silently shrinking the window.
+            const uint32_t sel_budget_blocks = std::max<uint32_t>(
+                1, (effective.select_budget + effective.block_tokens - 1) /
+                       effective.block_tokens);
+            const uint32_t gen_reserve_blocks =
+                (effective.gen_budget + effective.block_tokens - 1) /
                 effective.block_tokens;
-            if (cap_tokens < effective.select_budget) {
-                effective.select_budget = static_cast<uint32_t>(std::max<uint64_t>(
-                    effective.block_tokens, cap_tokens));
+            const uint64_t required_blocks =
+                static_cast<uint64_t>(sel_budget_blocks) + gen_reserve_blocks;
+            if (required_blocks > cap_blocks) {
+                throw std::runtime_error(
+                    "kvmem: GPU pool cannot fit selection budget + generation "
+                    "reserve. Need " + std::to_string(required_blocks) +
+                    " blocks (" + std::to_string(sel_budget_blocks) +
+                    " for --kvmem-budget + " + std::to_string(gen_reserve_blocks) +
+                    " for --kvmem-gen-budget) but only " +
+                    std::to_string(cap_blocks) + " fit under the current VRAM "
+                    "ceiling. Raise --kvmem-gpu-memory-ratio, or lower "
+                    "--kvmem-budget / --kvmem-gen-budget.");
             }
+            effective.estimated_gpu_block_capacity =
+                static_cast<uint32_t>(required_blocks);
         }
     }
 
@@ -2985,6 +3033,56 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         ncfg.slot_bytes = effective.estimated_block_bytes;
         kvmem_nvme_tier_ = std::make_unique<NvmeKvTier>(std::move(ncfg));
     }
+    // Capacity guarantee for the bounded GPU pool. When the pool engaged
+    // (gpu_blocks < ctx_blocks, so a >budget prompt must spill), every history
+    // block beyond the resident selection budget has to live in a CPU/NVMe
+    // spill tier. Selection keeps at most budget_blocks GPU-resident, so a
+    // prompt filling --ctx pushes up to (ctx_blocks - budget_blocks) blocks
+    // into the tiers at once. If CPU+NVMe cannot hold that many, a long
+    // query-conditioned prefill fills the pool with blocks that have nowhere
+    // to spill and throws "local KVMem GPU page pool exhausted" mid-request
+    // (kvmem_stage_out can neither place nor release them). Fail fast here,
+    // at configure time, naming the exact knobs to change.
+    if (kvmem_gpu_page_pool_ && effective.estimated_block_bytes > 0) {
+        const uint64_t cap_ctx_blocks =
+            (static_cast<uint64_t>(kv_ctx_size_) + effective.block_tokens - 1) /
+            effective.block_tokens;
+        const uint64_t cap_budget_blocks = std::max<uint64_t>(
+            1, (static_cast<uint64_t>(effective.select_budget) +
+                effective.block_tokens - 1) / effective.block_tokens);
+        const uint64_t spill_needed_blocks =
+            cap_ctx_blocks > cap_budget_blocks
+                ? cap_ctx_blocks - cap_budget_blocks
+                : 0;
+        const uint64_t cpu_slots =
+            kvmem_cpu_tier_ ? kvmem_cpu_tier_->slot_count() : 0;
+        const uint64_t nvme_slots =
+            kvmem_nvme_tier_ ? kvmem_nvme_tier_->slot_count() : 0;
+        const uint64_t spill_have_blocks = cpu_slots + nvme_slots;
+        if (spill_have_blocks < spill_needed_blocks) {
+            auto gib = [&](uint64_t blocks) {
+                char buf[32];
+                const double v =
+                    static_cast<double>(blocks) *
+                    static_cast<double>(effective.estimated_block_bytes) /
+                    (1024.0 * 1024.0 * 1024.0);
+                std::snprintf(buf, sizeof(buf), "%.2f", v);
+                return std::string(buf);
+            };
+            throw std::runtime_error(
+                "kvmem: spill tiers too small for the bounded GPU pool. A prompt "
+                "near --ctx (" + std::to_string(cap_ctx_blocks) + " blocks) would "
+                "spill up to " + std::to_string(spill_needed_blocks) + " blocks (" +
+                gib(spill_needed_blocks) + " GiB) into CPU+NVMe beyond the " +
+                std::to_string(cap_budget_blocks) + "-block GPU selection budget, "
+                "but only " + std::to_string(spill_have_blocks) + " spill slots (" +
+                gib(spill_have_blocks) + " GiB: cpu=" + std::to_string(cpu_slots) +
+                " + nvme=" + std::to_string(nvme_slots) + ") are configured. A long "
+                "query-conditioned prefill would exhaust the GPU page pool. Raise "
+                "--kvmem-cpu-gb and/or add --kvmem-nvme-dir + --kvmem-nvme-gb, or "
+                "lower --ctx, or raise --kvmem-budget.");
+        }
+    }
     bs_score_ready_ = false;
     bs_window_blocks_ = 0;
     bs_window_block_ids_.clear();
@@ -3046,6 +3144,24 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
     kvmem_qc_captured_blocks_ = 0;
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};
+    // Server-side session continuation: signal the reuse point to the next
+    // kvmem_set_query_span so it PRESERVES the [0,token_pos) content-index slices
+    // (position-invariant, fixed stride) and seeds the captured-block count instead
+    // of zeroing the whole index. Set uniformly: the fixed stride keeps surviving
+    // [0, floor(token_pos/bt)) slices at a stable offset whether or not high blocks
+    // were dropped (divergence), and set_query_span only consumes it when a QC span
+    // is active with resume_base <= prompt_tokens (cold/below-budget turns clear it
+    // unused). The boundary block containing token_pos keeps its prior (possibly
+    // stale) mean — a bounded ranking approximation; KV bytes stay exact.
+    kvmem_qc_resume_base_tokens_ = token_pos;
+    // Defensive query-span reset (belt-and-suspenders, plan §4): the resumed turn
+    // re-sets the span via kvmem_set_query_span against the NEW question, but clear
+    // here regardless so a stale span can never survive a truncate. Costs nothing on
+    // the reset path (set_query_span overwrites these immediately).
+    kvmem_query_begin_ = 0;
+    kvmem_query_end_ = 0;
+    g_query_multi_ready_ = false;
+    g_query_multi_count_ = 0;
 }
 
 void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
@@ -3654,7 +3770,25 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
             placed = true;
             nvme_slot = kvmem_nvme_tier_->block_slot(block_id);
         }
-        if (!placed) continue;
+        if (!placed) {
+            // The spill tier is full and this block cannot be evicted from the
+            // bounded GPU pool. Silently skipping (the old behavior) left the
+            // block's GPU pages allocated -> the pool filled monotonically over
+            // a long prefill and later threw the cryptic "local KVMem GPU page
+            // pool exhausted". The configure-time capacity check now guarantees
+            // CPU+NVMe can hold (ctx - budget) blocks, so this is unreachable in
+            // a well-formed config; if it ever fires it is a real accounting
+            // bug, so fail loud with the actionable knobs instead of leaking.
+            if (kvmem_gpu_page_pool_) {
+                throw std::runtime_error(
+                    "kvmem: KV spill tier full during stage-out (block=" +
+                    std::to_string(block_id) + "); the bounded GPU page pool "
+                    "cannot free it because CPU+NVMe are exhausted. Raise "
+                    "--kvmem-cpu-gb and/or add --kvmem-nvme-dir + "
+                    "--kvmem-nvme-gb, or lower --ctx / raise --kvmem-budget.");
+            }
+            continue;
+        }
         ++staged_out;
         const uint32_t page_size = kv_pages_.page_size;
         const uint32_t first_page = block.orig_pos_start / page_size;
@@ -4689,6 +4823,12 @@ bool QwenExecutor::kvmem_retrieval_score() {
 // -> the single-token retrieval / recency path runs unchanged.
 void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
                                         uint32_t prompt_tokens) {
+    // Consume + clear the resume base up front (set by the preceding
+    // kvmem_truncate_to on a session-continuation turn). It is only USED when a
+    // span is active below (above-budget QC); on a cold/below-budget call it is
+    // still cleared here so it can never leak into a later turn.
+    const uint32_t resume_base = kvmem_qc_resume_base_tokens_;
+    kvmem_qc_resume_base_tokens_ = 0;
     kvmem_query_begin_ = begin;
     kvmem_query_end_ = end;
     // Anchor the span to the prefill's base position so the (possibly chunked)
@@ -4740,16 +4880,43 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     kvmem_qc_total_blocks_ = total_blocks;
     const uint32_t n_kv_heads = cfg.n_kv_heads;
     const uint32_t head_dim = cfg.head_dim;
+    // Fixed per-layer stride for g_kbar_multi_: pin it at the session's ctx block
+    // capacity (ceil(kv_ctx_size_/block_tokens)) so preserved [0,D) index slices
+    // stay at a stable per-layer offset as the block count grows across resumed
+    // turns (server-side session continuation). This decouples "where layer l's
+    // slice starts" from "how many blocks this turn scores" (total_blocks). The
+    // scorer + incremental capture both key on this stride; the buffer is
+    // over-allocated to the ctx cap once (≈64 MiB at 262144 ctx) and never
+    // reallocates as the session grows. Clamp up so a prompt longer than the
+    // configured ctx can't under-size the stride.
+    const uint32_t ctx_blocks = (kv_ctx_size_ + bt - 1) / bt;
+    const uint32_t stride_blocks = std::max(ctx_blocks, total_blocks);
+    kvmem_qc_layer_stride_blocks_ = stride_blocks;
     const uint64_t per_layer =
-        static_cast<uint64_t>(total_blocks) * n_kv_heads * head_dim;
-    // Per-layer content index [L, total_blocks, n_kv_heads, head_dim] fp32. Zero
-    // it so any (defensively) un-captured block ranks at 0.0 rather than stale.
-    if (!g_kbar_multi_ || total_blocks > g_kbar_multi_capacity_ ||
+        static_cast<uint64_t>(stride_blocks) * n_kv_heads * head_dim;
+    // Per-layer content index [L, stride_blocks, n_kv_heads, head_dim] fp32.
+    bool freshly_allocated = false;
+    if (!g_kbar_multi_ || stride_blocks > g_kbar_multi_capacity_ ||
         g_kbar_multi_->count < per_layer * L) {
-        g_kbar_multi_capacity_ = total_blocks;
+        g_kbar_multi_capacity_ = stride_blocks;
         g_kbar_multi_ = backend_.tensor_f32(per_layer * L, "g_kbar_multi");
+        freshly_allocated = true;
     }
-    require_status(backend_.zero_tensor(*g_kbar_multi_));
+    // Resume seeding (server-side session continuation): when the preceding
+    // truncate preserved the [0,resume_base) prefix, its per-block mean-k slices
+    // are still valid in g_kbar_multi_ (position-invariant, fixed stride). Seed the
+    // captured-block count to ceil(resume_base/bt) so the suffix's incremental
+    // capture fills only [ceil(resume_base/bt), total_blocks) and PRESERVE the
+    // surviving slices (skip the full-buffer zero). The boundary block
+    // floor(resume_base/bt) — refilled from tokens partly reused (not in the suffix
+    // K batch) — keeps its prior-turn mean (a small, bounded ranking approximation;
+    // KV bytes are always exact). A cold/diverged turn (resume_base==0) or a fresh
+    // allocation zeroes the whole index so any un-captured block ranks at 0.0.
+    if (resume_base > 0 && resume_base <= prompt_tokens && !freshly_allocated) {
+        kvmem_qc_captured_blocks_ = (resume_base + bt - 1) / bt;  // ceil
+    } else {
+        require_status(backend_.zero_tensor(*g_kbar_multi_));
+    }
     // Raw-key ExactMass (per-token method): keep the full per-token de-RoPE'd K
     // (no mean) so the scorer can softmax over a block's tokens. Layout
     // [L, total_tokens, n_kv_heads, head_dim] fp32 — at max history (~113K tok × 16
@@ -4921,22 +5088,40 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     const uint32_t n_kv_heads = cfg.n_kv_heads;
     const uint32_t head_dim = cfg.head_dim;
     const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
-    // Defensive: incremental capture assumes block-aligned chunks. A misaligned
-    // chunk (should never happen with the fixed chunking) would make blocks
-    // straddle chunks, so skip rather than mis-index.
-    if (base_pos % bt != 0) return;
-    const uint32_t first_block = base_pos / bt;
+    // Per-layer slice base uses the FIXED session stride (ctx_blocks) when set, so
+    // preserved [0,D) slices stay put as the block count grows across resumed turns
+    // (server-side session continuation). Falls back to the turn's block count when
+    // no fixed stride was pinned (byte-identical legacy layout).
+    const uint32_t stride_blocks =
+        kvmem_qc_layer_stride_blocks_ != 0 ? kvmem_qc_layer_stride_blocks_
+                                           : kvmem_qc_total_blocks_;
+    // A session-continuation suffix begins mid-block (base_pos % bt != 0): the
+    // leading (bt - off) rows finish the boundary block whose earlier tokens were
+    // REUSED (not present in k_batch_), so it can't be re-meaned here and keeps its
+    // prior-turn mean (seeded as already-captured in kvmem_set_query_span). Indexing
+    // starts at the next block boundary. On a cold/fresh prefill base_pos is
+    // block-aligned (off == 0) so row_off == 0 and this is byte-identical to the
+    // original path. (A multi-chunk misaligned suffix similarly approximates the one
+    // straddling block at each 2048-chunk seam; single-chunk question suffixes — the
+    // common case — are exact except the leading boundary block.)
+    const uint32_t off = base_pos % bt;
+    const uint32_t row_off = (off == 0) ? 0u : (bt - off);
+    if (row_off >= batch) return;                  // chunk entirely in boundary block
+    const uint32_t eff_batch = batch - row_off;
+    const uint32_t eff_base_pos = base_pos + row_off;      // block-aligned
+    const uint32_t eff_rope_base = rope_base_pos + row_off;
+    const uint32_t first_block = eff_base_pos / bt;        // == ceil(base_pos/bt)
     if (first_block >= kvmem_qc_total_blocks_) return;
     const uint32_t n_blocks_chunk = std::min(
-        (batch + bt - 1) / bt, kvmem_qc_total_blocks_ - first_block);
+        (eff_batch + bt - 1) / bt, kvmem_qc_total_blocks_ - first_block);
     if (n_blocks_chunk == 0) return;
     const uint64_t per_pos = static_cast<uint64_t>(n_kv_heads) * head_dim;
     const uint64_t kbar_block_base =
-        static_cast<uint64_t>(slot) * kvmem_qc_total_blocks_ + first_block;
+        static_cast<uint64_t>(slot) * stride_blocks + first_block;
     auto st = backend_.block_kmean_content_batch_device(
         *k_batch_, *g_kbar_multi_, kbar_block_base, n_blocks_chunk,
-        k_token_stride, batch, bt, n_kv_heads, head_dim, cfg.rope_dim,
-        static_cast<int32_t>(rope_base_pos), cfg.rope_theta);
+        k_token_stride, eff_batch, bt, n_kv_heads, head_dim, cfg.rope_dim,
+        static_cast<int32_t>(eff_rope_base), cfg.rope_theta, /*src_row_off=*/row_off);
     if (!st.ok) return;
     // Raw-key MaxSim (#104): in ADDITION to the mean, store each chunk row's
     // de-RoPE'd K into g_kraw_multi_ so the scorer can MAX over a block's tokens.
@@ -4956,10 +5141,18 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     }
     // Advance the captured-block count ONCE per chunk (after the last slot writes
     // its slice) — every normal layer sees the same chunk in one forward pass, so
-    // progress is identical across the L slots.
+    // progress is identical across the L slots. Track the highest block index touched
+    // (monotone, idempotent) rather than a running sum: on a session-continuation
+    // resume the count is pre-seeded to the boundary block (kvmem_set_query_span), and
+    // a misaligned suffix skips that leading block, so a running sum would under- or
+    // double-count. first_block + n_blocks_chunk is the exclusive end of this chunk's
+    // captured range; blocks are captured in increasing, contiguous order.
     const uint32_t L = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
     if (slot + 1 != L) return;
-    kvmem_qc_captured_blocks_ += n_blocks_chunk;
+    const uint32_t last_touched = first_block + n_blocks_chunk;
+    if (last_touched > kvmem_qc_captured_blocks_) {
+        kvmem_qc_captured_blocks_ = last_touched;
+    }
     if (kvmem_qc_captured_blocks_ < kvmem_qc_total_blocks_) return;
     // Whole history covered: publish the index. Copy the slot-0 slice into g_kbar_
     // so the single last-token fallback scorer ranks against the same full-coverage
@@ -4984,6 +5177,137 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
             "(slot0->g_kbar)\n",
             L, kvmem_qc_total_blocks_);
     }
+}
+
+// Enable decode-time content capture for the coming (plain) decode loop. Only
+// arms when kvmem + a fixed-stride QC index are live (above-budget mean-k turn);
+// below budget / off / per-token it is a no-op, so the caller can invoke it
+// unconditionally. Resets the per-block staging cursor so the first generated
+// block boundary starts fresh.
+void QwenExecutor::kvmem_decode_capture_begin() {
+    kvmem_decode_capture_on_ = false;
+    decode_stage_active_ = false;
+    decode_stage_rows_ = 0;
+    decode_stage_block_ = 0;
+    if (!kvmem_enabled_ || !block_store_) return;
+    if (!g_kbar_multi_ || kvmem_qc_layer_stride_blocks_ == 0) return;
+    if (kvmem_qc_pertoken_) return;                       // per-token index not fixed-stride
+    if (kvmem_query_end_ <= kvmem_query_begin_) return;   // no QC span -> below budget / dense
+    kvmem_decode_capture_on_ = true;
+}
+
+// Per-std-layer decode hook (inside forward_one_token, after K RoPE, before the
+// KV append). Stages the current token's post-RoPE K row (k_) de-RoPE'd at its
+// actual bake position rope_pos, so the staged row is in the position-invariant
+// content frame (immune to later reselect re-baking). A block is staged only when
+// its FIRST (offset-0) token was itself generated; the prompt/response boundary
+// block (whose offset-0 token is a prompt token) is left with its prefill partial
+// mean (a bounded ranking approximation; KV bytes stay exact). On the last std
+// layer of a token that completes a block, the block is meaned into g_kbar_multi_.
+void QwenExecutor::kvmem_decode_capture_stage(uint32_t layer_index,
+                                              uint32_t rope_pos) {
+    if (!kvmem_decode_capture_on_ || !k_ || !g_kbar_multi_) return;
+    const int32_t slot = (static_cast<size_t>(layer_index) < std_layer_slot_.size())
+                             ? std_layer_slot_[layer_index] : -1;
+    if (slot < 0) return;
+    const QwenConfig &cfg = model_.config();
+    const uint32_t n_kv_heads = cfg.n_kv_heads;
+    const uint32_t head_dim = cfg.head_dim;
+    const uint32_t per_pos = n_kv_heads * head_dim;
+    const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
+    const uint32_t L = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
+    const uint32_t p = position_;                 // true position of this token
+    const uint32_t i = p % bt;                     // row within its block
+    const uint32_t block = p / bt;
+    // Decide block membership once per token (on the first std layer). A block is
+    // eligible only if we captured its offset-0 token: on i==0 start a fresh block;
+    // otherwise continue only if we are already mid-staging THIS block.
+    if (slot == 0) {
+        if (i == 0) {
+            decode_stage_active_ = true;
+            decode_stage_block_ = block;
+        } else if (!(decode_stage_active_ && decode_stage_block_ == block)) {
+            decode_stage_active_ = false;
+        }
+    }
+    if (!decode_stage_active_ || decode_stage_block_ != block) return;
+    if (block >= kvmem_qc_layer_stride_blocks_) {         // beyond the fixed index
+        decode_stage_active_ = false;
+        return;
+    }
+    // Lazily size the content-frame staging buffer [L, block_tokens, per_pos].
+    const uint64_t stage_rows = static_cast<uint64_t>(L) * bt;
+    if (!g_kbar_decode_stage_ ||
+        g_kbar_decode_stage_->count < stage_rows * per_pos) {
+        g_kbar_decode_stage_ =
+            backend_.tensor_f32(stage_rows * per_pos, "g_kbar_decode_stage");
+    }
+    // De-RoPE the current layer's K (single row, baked at rope_pos) into the
+    // content frame and stage it at slot-row i. k_ is [n_kv_heads, head_dim].
+    const uint64_t out_base =
+        (static_cast<uint64_t>(slot) * bt + i) * per_pos;
+    (void)backend_.derope_store_content_batch_device(
+        *k_, *g_kbar_decode_stage_, out_base, /*k_stride=*/per_pos, /*batch=*/1,
+        n_kv_heads, head_dim, cfg.rope_dim, static_cast<int32_t>(rope_pos),
+        cfg.rope_theta);
+    // Advance the row cursor + finalize a completed block once per token (after
+    // the last std layer has staged its slice; progress is identical across L).
+    if (static_cast<uint32_t>(slot) + 1 == L) {
+        decode_stage_rows_ = i + 1;
+        if (i + 1 == bt) {
+            kvmem_capture_decode_block(block, bt);
+            decode_stage_active_ = false;
+            decode_stage_rows_ = 0;
+        }
+    }
+}
+
+// Mean the `rows` staged content-frame rows of the just-completed decode block
+// into g_kbar_multi_[slot*stride + true_block_index] for every std layer. The
+// staged rows are ALREADY de-RoPE'd (per-token, at capture time), so the mean
+// applies NO further rotation (rope_dim==0); src_row_off selects slot s's rows.
+// Writes only the index BUFFER — the block/coverage counts that drive THIS turn's
+// scorer are left untouched (a reselect mid-decode must keep scoring the prompt's
+// blocks); the NEXT turn re-establishes coverage via kvmem_set_query_span's resume
+// seeding, which trusts these preserved slices.
+void QwenExecutor::kvmem_capture_decode_block(uint32_t true_block_index,
+                                              uint32_t rows) {
+    if (!g_kbar_decode_stage_ || !g_kbar_multi_ || rows == 0) return;
+    if (true_block_index >= kvmem_qc_layer_stride_blocks_) return;
+    const QwenConfig &cfg = model_.config();
+    const uint32_t n_kv_heads = cfg.n_kv_heads;
+    const uint32_t head_dim = cfg.head_dim;
+    const uint32_t per_pos = n_kv_heads * head_dim;
+    const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
+    const uint32_t L = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
+    const uint32_t stride = kvmem_qc_layer_stride_blocks_;
+    for (uint32_t s = 0; s < L; ++s) {
+        const uint64_t kbar_block_base =
+            static_cast<uint64_t>(s) * stride + true_block_index;
+        (void)backend_.block_kmean_content_batch_device(
+            *g_kbar_decode_stage_, *g_kbar_multi_, kbar_block_base,
+            /*n_blocks_chunk=*/1, /*k_stride=*/per_pos, /*batch=*/rows,
+            /*blk_tokens=*/bt, n_kv_heads, head_dim, /*rope_dim=*/0,
+            /*rope_base=*/0, cfg.rope_theta, /*src_row_off=*/s * bt);
+    }
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+            "[bs-decode-cap] block=%u rows=%u -> g_kbar_multi_ (L=%u stride=%u)\n",
+            true_block_index, rows, L, stride);
+    }
+}
+
+// End-of-turn: finalize a trailing partial decode block (a response whose last
+// block is < block_tokens long) so it carries a mean for the next turn's resume
+// seeding, then disarm capture. Idempotent; safe to call when capture is off.
+void QwenExecutor::kvmem_decode_capture_finalize() {
+    if (kvmem_decode_capture_on_ && decode_stage_active_ && decode_stage_rows_ > 0) {
+        kvmem_capture_decode_block(decode_stage_block_, decode_stage_rows_);
+    }
+    kvmem_decode_capture_on_ = false;
+    decode_stage_active_ = false;
+    decode_stage_rows_ = 0;
+    decode_stage_block_ = 0;
 }
 
 // Query-conditioned MEAN-K scoring at the reselect boundary (--kvmem-retrieval-method
@@ -5054,9 +5378,14 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
             }
         }
     }
+    // kbar_layer_stride is the fixed session stride when resumable indexing is live
+    // (g_kbar_multi_ over-allocated at ctx_blocks so preserved [0,D) slices survive
+    // a growing block count); otherwise it equals nb (byte-identical legacy layout).
+    const uint32_t kbar_stride =
+        kvmem_qc_layer_stride_blocks_ != 0 ? kvmem_qc_layer_stride_blocks_ : nb;
     if (auto st = backend_.block_attn_score_softmax_pages_device(
             *g_score_dev_, *g_query_multi_, *g_kbar_multi_,
-            L, M, /*q_layer_stride=*/S, nb,
+            L, M, /*q_layer_stride=*/S, nb, /*kbar_layer_stride=*/kbar_stride,
             cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, sm_scale,
             excl_lo_end, excl_hi_begin);
         !st.ok) {

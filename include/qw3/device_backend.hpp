@@ -877,6 +877,9 @@ public:
     // kbar (fp32 [.., n_kv_heads, head_dim]) at global block (kbar_block_base + j),
     // so one [L, n_blocks, n_kv_heads, head_dim] buffer is filled a (layer, chunk)
     // slice at a time. Chunks are block-aligned, so blocks never straddle chunks.
+    // src_row_off (default 0): skip this many leading rows of k_batch before block 0
+    // begins, so an over-budget resume suffix whose first token is mid-block can index
+    // only its full trailing blocks (the straddling boundary block keeps its prior mean).
     virtual DeviceStatus block_kmean_content_batch_device(const DeviceTensor &k_batch,
                                                           DeviceTensor &kbar,
                                                           uint64_t kbar_block_base,
@@ -888,10 +891,11 @@ public:
                                                           uint32_t head_dim,
                                                           uint32_t rope_dim,
                                                           int32_t rope_base,
-                                                          float theta) {
+                                                          float theta,
+                                                          uint32_t src_row_off = 0) {
         (void)k_batch; (void)kbar; (void)kbar_block_base; (void)n_blocks_chunk;
         (void)k_stride; (void)batch; (void)blk_tokens; (void)n_kv_heads;
-        (void)head_dim; (void)rope_dim; (void)rope_base; (void)theta;
+        (void)head_dim; (void)rope_dim; (void)rope_base; (void)theta; (void)src_row_off;
         return {false, "block_kmean_content_batch_device requires backend override"};
     }
 
@@ -964,8 +968,12 @@ public:
     // averaged over the L normal-attention layers. score is ZEROED then accumulated.
     // scale should be 1/sqrt(head_dim) (real-attention temperature). q_multi is
     // [L, q_layer_stride, n_heads, head_dim] fp32 (first M token rows/layer read);
-    // kbar_multi is [L, n_blocks, n_kv_heads, head_dim] fp32. Returns an error if
-    // n_blocks exceeds the kernel's shared-memory page cap (caller falls back).
+    // kbar_multi is [L, kbar_layer_stride, n_kv_heads, head_dim] fp32 with the first
+    // n_blocks pages/layer scored. kbar_layer_stride (in blocks) may exceed n_blocks
+    // when the index is allocated at a fixed session stride so preserved [0,D) slices
+    // stay valid as the block count grows; callers that don't fix-stride pass
+    // kbar_layer_stride == n_blocks. Returns an error if n_blocks exceeds the
+    // kernel's shared-memory page cap (caller falls back).
     // excl_lo_end / excl_hi_begin mask the always-kept sink [0,excl_lo_end) and
     // recent [excl_hi_begin,n_blocks) bands out of the per-token softmax so their
     // probability mass redistributes onto the retrievable middle. Defaults
@@ -977,6 +985,7 @@ public:
                                                                uint32_t n_tokens,
                                                                uint32_t q_layer_stride,
                                                                uint32_t n_blocks,
+                                                               uint32_t kbar_layer_stride,
                                                                uint32_t n_heads,
                                                                uint32_t n_kv_heads,
                                                                uint32_t head_dim,
@@ -984,8 +993,8 @@ public:
                                                                uint32_t excl_lo_end = 0,
                                                                uint32_t excl_hi_begin = UINT32_MAX) {
         (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
-        (void)q_layer_stride; (void)n_blocks; (void)n_heads; (void)n_kv_heads;
-        (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
+        (void)q_layer_stride; (void)n_blocks; (void)kbar_layer_stride; (void)n_heads;
+        (void)n_kv_heads; (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 

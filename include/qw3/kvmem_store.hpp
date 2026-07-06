@@ -124,6 +124,8 @@ enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
 struct KvMemStoreConfig {
     uint32_t block_tokens = 128;     // --kvmem-block-tokens
     uint32_t select_budget = 131072; // --kvmem-budget (max window tokens)
+    uint32_t gen_budget = 32768;     // --kvmem-gen-budget (GPU pool reserve for
+                                     // one turn's newly generated tokens)
     uint32_t sink_blocks = 1;        // --kvmem-sink-blocks (always-kept prefix)
     uint32_t recent_blocks = 0;      // --kvmem-recent-blocks (always-kept suffix);
                                      // 0 => derived from budget at use time

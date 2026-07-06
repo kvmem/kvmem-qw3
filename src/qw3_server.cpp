@@ -1147,16 +1147,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << " (remaining context)\n";
             g.max_tokens = remaining_ctx;
         }
-        // kvmem: a single turn's generation must not itself exceed the selection
-        // budget. Below-budget generation stays within the ~2x-budget bounded GPU
-        // pool (which throws on exhaustion) and keeps prefix reuse in the dense
-        // regime; over-budget generation would spill mid-decode.
-        if (engine.kvmem_enabled && engine.kvmem_budget > 0 &&
-            g.max_tokens > engine.kvmem_budget) {
+        // kvmem: a single turn's generation must not exceed the GPU pool's
+        // generation reserve (--kvmem-gen-budget). The bounded pool is sized for
+        // select_budget + gen_budget, so capping max_tokens at gen_budget keeps
+        // step-mode decode (which never stages out) from exhausting the pool.
+        if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0 &&
+            g.max_tokens > engine.kvmem_gen_budget) {
             std::cerr << "[qw3-serve] capping request max_tokens from "
-                      << g.max_tokens << " to " << engine.kvmem_budget
-                      << " (kvmem budget)\n";
-            g.max_tokens = engine.kvmem_budget;
+                      << g.max_tokens << " to " << engine.kvmem_gen_budget
+                      << " (kvmem gen budget)\n";
+            g.max_tokens = engine.kvmem_gen_budget;
         }
         g.temperature = req.value("temperature", g.temperature);
         g.top_p = req.value("top_p", g.top_p);
