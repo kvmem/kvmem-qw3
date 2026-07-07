@@ -4878,6 +4878,18 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     const uint32_t total_blocks = (prompt_tokens + bt - 1) / bt;
     if (total_blocks == 0) return;
     kvmem_qc_total_blocks_ = total_blocks;
+    // Sub-block mean-k (SubBlockMeanK): capture this many equal, non-overlapping
+    // sub-block means per block so the scorer can run softmax at sub-block
+    // granularity. 1 for plain mean-k / per-token -> byte-identical layout.
+    kvmem_qc_n_subblocks_ =
+        std::max<uint32_t>(1u, block_store_->config().n_subblocks);
+    if (kvmem_qc_n_subblocks_ > 1 && std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[bs-subblock] sub-block mean-k active: n_subblocks=%u "
+                     "(sub_tokens=%u per %u-token block)\n",
+                     kvmem_qc_n_subblocks_,
+                     (bt + kvmem_qc_n_subblocks_ - 1) / kvmem_qc_n_subblocks_, bt);
+    }
     const uint32_t n_kv_heads = cfg.n_kv_heads;
     const uint32_t head_dim = cfg.head_dim;
     // Fixed per-layer stride for g_kbar_multi_: pin it at the session's ctx block
@@ -4892,9 +4904,10 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     const uint32_t ctx_blocks = (kv_ctx_size_ + bt - 1) / bt;
     const uint32_t stride_blocks = std::max(ctx_blocks, total_blocks);
     kvmem_qc_layer_stride_blocks_ = stride_blocks;
-    const uint64_t per_layer =
-        static_cast<uint64_t>(stride_blocks) * n_kv_heads * head_dim;
-    // Per-layer content index [L, stride_blocks, n_kv_heads, head_dim] fp32.
+    const uint64_t per_layer = static_cast<uint64_t>(stride_blocks) *
+                               kvmem_qc_n_subblocks_ * n_kv_heads * head_dim;
+    // Per-layer content index [L, stride_blocks, n_subblocks, n_kv_heads, head_dim]
+    // fp32 (n_subblocks==1 for plain mean-k -> the original layout).
     bool freshly_allocated = false;
     if (!g_kbar_multi_ || stride_blocks > g_kbar_multi_capacity_ ||
         g_kbar_multi_->count < per_layer * L) {
@@ -5121,7 +5134,8 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     auto st = backend_.block_kmean_content_batch_device(
         *k_batch_, *g_kbar_multi_, kbar_block_base, n_blocks_chunk,
         k_token_stride, eff_batch, bt, n_kv_heads, head_dim, cfg.rope_dim,
-        static_cast<int32_t>(eff_rope_base), cfg.rope_theta, /*src_row_off=*/row_off);
+        static_cast<int32_t>(eff_rope_base), cfg.rope_theta, /*src_row_off=*/row_off,
+        /*n_subblocks=*/kvmem_qc_n_subblocks_);
     if (!st.ok) return;
     // Raw-key MaxSim (#104): in ADDITION to the mean, store each chunk row's
     // de-RoPE'd K into g_kraw_multi_ so the scorer can MAX over a block's tokens.
@@ -5158,9 +5172,15 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     // so the single last-token fallback scorer ranks against the same full-coverage
     // index. Mark the global index live so the one-shot paged builder stays gated
     // off at the reselect boundary.
+    // The single last-token fallback index (g_kbar_) is laid out one mean per
+    // block; only seed it from slot 0 when g_kbar_multi_ shares that layout
+    // (n_subblocks == 1). Under sub-block mode the leading per_layer elements are
+    // a block's sub-block means, not a contiguous block run, so the D2D copy would
+    // mis-seed the fallback — skip it (the fallback scorer is unavailable in
+    // sub-block mode, guarded at the shmem-cap check).
     const uint64_t per_layer =
         static_cast<uint64_t>(kvmem_qc_total_blocks_) * per_pos;
-    if (g_kbar_ && g_kbar_->count >= per_layer) {
+    if (kvmem_qc_n_subblocks_ == 1 && g_kbar_ && g_kbar_->count >= per_layer) {
         (void)backend_.copy_d2d(*g_kbar_, *g_kbar_multi_, /*src_offset=*/0,
                                 per_layer);
     }
@@ -5192,6 +5212,7 @@ void QwenExecutor::kvmem_decode_capture_begin() {
     if (!kvmem_enabled_ || !block_store_) return;
     if (!g_kbar_multi_ || kvmem_qc_layer_stride_blocks_ == 0) return;
     if (kvmem_qc_pertoken_) return;                       // per-token index not fixed-stride
+    if (kvmem_qc_n_subblocks_ > 1) return;                // sub-block index: decode capture is a follow-up
     if (kvmem_query_end_ <= kvmem_query_begin_) return;   // no QC span -> below budget / dense
     kvmem_decode_capture_on_ = true;
 }
@@ -5387,7 +5408,7 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
             *g_score_dev_, *g_query_multi_, *g_kbar_multi_,
             L, M, /*q_layer_stride=*/S, nb, /*kbar_layer_stride=*/kbar_stride,
             cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, sm_scale,
-            excl_lo_end, excl_hi_begin);
+            excl_lo_end, excl_hi_begin, /*n_subblocks=*/kvmem_qc_n_subblocks_);
         !st.ok) {
         return false;
     }

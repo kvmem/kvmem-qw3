@@ -880,6 +880,10 @@ public:
     // src_row_off (default 0): skip this many leading rows of k_batch before block 0
     // begins, so an over-budget resume suffix whose first token is mid-block can index
     // only its full trailing blocks (the straddling boundary block keeps its prior mean).
+    // n_subblocks (default 1, plain mean-k): capture this many equal, non-overlapping
+    // sub-block means per block (sub_tokens = ceil(blk_tokens/n_subblocks), last
+    // sub-block absorbs the remainder); kbar is then [.., n_subblocks, n_kv_heads,
+    // head_dim] with block b's sub-blocks at slots [b*n_subblocks, (b+1)*n_subblocks).
     virtual DeviceStatus block_kmean_content_batch_device(const DeviceTensor &k_batch,
                                                           DeviceTensor &kbar,
                                                           uint64_t kbar_block_base,
@@ -892,10 +896,12 @@ public:
                                                           uint32_t rope_dim,
                                                           int32_t rope_base,
                                                           float theta,
-                                                          uint32_t src_row_off = 0) {
+                                                          uint32_t src_row_off = 0,
+                                                          uint32_t n_subblocks = 1) {
         (void)k_batch; (void)kbar; (void)kbar_block_base; (void)n_blocks_chunk;
         (void)k_stride; (void)batch; (void)blk_tokens; (void)n_kv_heads;
         (void)head_dim; (void)rope_dim; (void)rope_base; (void)theta; (void)src_row_off;
+        (void)n_subblocks;
         return {false, "block_kmean_content_batch_device requires backend override"};
     }
 
@@ -978,6 +984,9 @@ public:
     // recent [excl_hi_begin,n_blocks) bands out of the per-token softmax so their
     // probability mass redistributes onto the retrievable middle. Defaults
     // (0, UINT32_MAX) mask nothing (byte-identical to the pre-masking path).
+    // n_subblocks (default 1): when >1, kbar_multi carries n_subblocks means per
+    // block; the softmax runs over all n_blocks*n_subblocks logits and a block's
+    // sub-block masses are summed into score[w] (masking bands are per block).
     virtual DeviceStatus block_attn_score_softmax_pages_device(DeviceTensor &score,
                                                                const DeviceTensor &q_multi,
                                                                const DeviceTensor &kbar_multi,
@@ -991,10 +1000,12 @@ public:
                                                                uint32_t head_dim,
                                                                float scale,
                                                                uint32_t excl_lo_end = 0,
-                                                               uint32_t excl_hi_begin = UINT32_MAX) {
+                                                               uint32_t excl_hi_begin = UINT32_MAX,
+                                                               uint32_t n_subblocks = 1) {
         (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
         (void)q_layer_stride; (void)n_blocks; (void)kbar_layer_stride; (void)n_heads;
         (void)n_kv_heads; (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
+        (void)n_subblocks;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 

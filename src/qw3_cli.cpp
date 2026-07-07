@@ -388,10 +388,14 @@ int main(int argc, char **argv) {
             } else if (arg == "--kvmem-retrieval-method") {
                 engine.kvmem_retrieval_method = need(arg);
                 if (engine.kvmem_retrieval_method != "mean-k" &&
-                    engine.kvmem_retrieval_method != "per-token") {
+                    engine.kvmem_retrieval_method != "per-token" &&
+                    engine.kvmem_retrieval_method != "sub-block-mean-k") {
                     throw std::runtime_error(
-                        "--kvmem-retrieval-method must be mean-k|per-token");
+                        "--kvmem-retrieval-method must be "
+                        "mean-k|per-token|sub-block-mean-k");
                 }
+            } else if (arg == "--kvmem-subblocks") {
+                engine.kvmem_subblocks = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-update-mode") {
                 engine.kvmem_update_mode = need(arg);
                 if (engine.kvmem_update_mode != "interval" &&

@@ -865,10 +865,11 @@ private:
     uint32_t kvmem_query_span_ = 0;                            // S (span length, == capacity)
     std::vector<int32_t> std_layer_slot_;                      // il -> slot 0..L-1, or -1
     std::vector<uint32_t> std_layers_;                         // slot -> il
-    std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_kv_heads, head_dim] fp32
+    std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_subblocks, n_kv_heads, head_dim] fp32
     bool g_kbar_multi_ready_ = false;                          // g_kbar_multi_ holds the index
     uint32_t g_kbar_multi_blocks_ = 0;                         // blocks covered (per layer)
     uint32_t g_kbar_multi_capacity_ = 0;                       // allocated block capacity (per layer)
+    uint32_t kvmem_qc_n_subblocks_ = 1;                        // sub-block means per block (SubBlockMeanK; 1 = plain mean-k)
 
     // Incremental content-index build from the prefill K batch (#91). The paged
     // builder (kvmem_build_content_index) can only run once from the pristine

@@ -117,8 +117,11 @@ struct KvMemPlan {
 enum class KvMemMethod : uint8_t { Retrieval = 0, H2O = 1, Recency = 2 };
 enum class KvMemSelectPolicy : uint8_t { TopK = 0, Quota = 1 };
 // Query-conditioned scorer (--kvmem-retrieval-method): MeanK = softmax-over-pages
-// on the cheap per-block mean key; PerToken = ExactMass over raw per-token keys.
-enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1 };
+// on the cheap per-block mean key; PerToken = ExactMass over raw per-token keys;
+// SubBlockMeanK = MeanK at sub-block granularity (n_subblocks means per block,
+// softmax over all block*sub-block logits, mass summed back per block) so a
+// concentrated relevant sub-region isn't diluted by a block's mean.
+enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMeanK = 2 };
 enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
 
 struct KvMemStoreConfig {
@@ -132,6 +135,8 @@ struct KvMemStoreConfig {
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
+    uint32_t n_subblocks = 1;        // --kvmem-subblocks; sub-block means per block
+                                     // (SubBlockMeanK only; 1 => plain mean-k)
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
 
     // Quota policy. Zero means derive from the remaining budget at selection

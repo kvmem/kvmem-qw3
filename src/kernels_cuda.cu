@@ -299,6 +299,7 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            uint32_t n_kv_heads, uint32_t head_dim,
                                            float scale, uint32_t excl_lo_end,
                                            uint32_t excl_hi_begin,
+                                           uint32_t n_subblocks,
                                            cudaStream_t stream);
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        const float *q, uint32_t q_stride,
@@ -330,7 +331,8 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint32_t batch, uint32_t blk_tokens,
                                       uint32_t n_kv_heads, uint32_t head_dim,
                                       uint32_t rope_dim, int32_t rope_base,
-                                      float theta, cudaStream_t stream);
+                                      float theta, uint32_t n_subblocks,
+                                      cudaStream_t stream);
 // Raw-key store (per-token retrieval): store each de-RoPE'd K row (no mean).
 bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
                                        uint64_t out_base_elem, uint32_t k_stride,
@@ -2945,26 +2947,35 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
                                                       uint32_t head_dim,
                                                       float scale,
                                                       uint32_t excl_lo_end,
-                                                      uint32_t excl_hi_begin) {
+                                                      uint32_t excl_hi_begin,
+                                                      uint32_t n_subblocks) {
     const uint32_t lt = blockIdx.x;
     const uint32_t l = lt / n_tokens;
     const uint32_t t = lt % n_tokens;
     if (l >= n_layers) return;
-    extern __shared__ float s_logit[];   // [n_blocks]
+    extern __shared__ float s_logit[];   // [n_blocks * n_subblocks]
     __shared__ float s_max;
     __shared__ float s_sum;
     const uint32_t tid = threadIdx.x;
     const uint32_t nthreads = blockDim.x;
     const uint32_t group = n_heads / n_kv_heads;
     const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
-    // Per-layer base uses kbar_layer_stride (in blocks), which may exceed n_blocks
-    // when g_kbar_multi_ is allocated at a fixed session stride (ctx_blocks) so
-    // preserved [0,D) slices stay valid as the block count grows across turns.
+    // Softmax runs at SUB-BLOCK granularity: total = n_blocks*n_subblocks logits.
+    // logit index p maps to block w = p/n_subblocks, sub-block sb = p%n_subblocks.
+    // A block's sub-block masses are summed back into score[w] at the end, so a
+    // concentrated relevant sub-region keeps its mass instead of being diluted by
+    // the block mean. n_subblocks==1 (plain mean-k) => total==n_blocks, p==w,
+    // byte-identical to the pre-sub-block path.
+    const uint32_t total = n_blocks * n_subblocks;
+    // Per-layer base uses kbar_layer_stride (in blocks) × n_subblocks. The stride
+    // may exceed n_blocks when g_kbar_multi_ is allocated at a fixed session stride
+    // (ctx_blocks) so preserved [0,D) slices stay valid as the block count grows.
     // n_blocks remains the loop/count bound. Callers that don't fix-stride pass
     // kbar_layer_stride == n_blocks (byte-identical).
     const float *kbar_l =
         kbar_multi +
-        static_cast<uint64_t>(l) * kbar_layer_stride * n_kv_heads * head_dim;
+        static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks * n_kv_heads *
+            head_dim;
     const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
     // Per-head weight: each (layer,token) contributes mean over heads, and the
     // grid sum over layers must end up as a mean over L. n_tokens is summed (not
@@ -2974,42 +2985,43 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
     for (uint32_t qh = 0; qh < n_heads; ++qh) {
         const uint32_t kvh = qh / group;
         const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
-        // logit[w] = scale * dot(q[l,t,qh], k̄[l,w,kvh]) for every page.
-        // Pages in the always-kept sink/recent bands [0,excl_lo_end) and
-        // [excl_hi_begin,n_blocks) are masked to -inf so their softmax mass
-        // redistributes onto the retrievable middle (they are pinned anyway).
-        for (uint32_t w = tid; w < n_blocks; w += nthreads) {
+        // logit[p] = scale * dot(q[l,t,qh], k̄[l,w,sb,kvh]) for every sub-block.
+        // Sub-blocks of a block in the always-kept sink/recent bands
+        // [0,excl_lo_end) / [excl_hi_begin,n_blocks) are masked to -inf so their
+        // softmax mass redistributes onto the retrievable middle (they are pinned).
+        for (uint32_t p = tid; p < total; p += nthreads) {
+            const uint32_t w = p / n_subblocks;
             if (w < excl_lo_end || w >= excl_hi_begin) {
-                s_logit[w] = -INFINITY;
+                s_logit[p] = -INFINITY;
                 continue;
             }
             const float *kbar_row =
-                kbar_l + (static_cast<uint64_t>(w) * n_kv_heads + kvh) * head_dim;
+                kbar_l + (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
             float dot = 0.0f;
             for (uint32_t d = 0; d < head_dim; ++d) dot += qr[d] * kbar_row[d];
-            s_logit[w] = dot * scale;
+            s_logit[p] = dot * scale;
         }
         __syncthreads();
         if (tid == 0) {
             float m = -INFINITY;
-            for (uint32_t w = 0; w < n_blocks; ++w) m = fmaxf(m, s_logit[w]);
+            for (uint32_t p = 0; p < total; ++p) m = fmaxf(m, s_logit[p]);
             s_max = m;
         }
         __syncthreads();
         const float m = s_max;
-        for (uint32_t w = tid; w < n_blocks; w += nthreads) {
-            s_logit[w] = __expf(s_logit[w] - m);
+        for (uint32_t p = tid; p < total; p += nthreads) {
+            s_logit[p] = __expf(s_logit[p] - m);
         }
         __syncthreads();
         if (tid == 0) {
             float sum = 0.0f;
-            for (uint32_t w = 0; w < n_blocks; ++w) sum += s_logit[w];
+            for (uint32_t p = 0; p < total; ++p) sum += s_logit[p];
             s_sum = sum > 0.0f ? sum : 1.0f;
         }
         __syncthreads();
         const float inv = head_w / s_sum;
-        for (uint32_t w = tid; w < n_blocks; w += nthreads) {
-            atomicAdd(&score[w], s_logit[w] * inv);
+        for (uint32_t p = tid; p < total; p += nthreads) {
+            atomicAdd(&score[p / n_subblocks], s_logit[p] * inv);
         }
         __syncthreads();  // s_logit reused by the next head
     }
@@ -3223,14 +3235,24 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
                                                  uint32_t head_dim,
                                                  uint32_t rope_dim,
                                                  int32_t rope_base,
-                                                 float theta) {
-    const uint32_t j = blockIdx.x;     // chunk-local block index
+                                                 float theta,
+                                                 uint32_t n_subblocks) {
+    // grid.x enumerates (chunk-local block, sub-block); n_subblocks==1 (plain
+    // mean-k) collapses to the original one-mean-per-block layout exactly.
+    const uint32_t combined = blockIdx.x;
+    const uint32_t j = combined / n_subblocks;   // chunk-local block index
+    const uint32_t sb = combined % n_subblocks;  // sub-block within the block
     const uint32_t h = blockIdx.y;     // kv head
     const uint32_t d = threadIdx.x;    // dim within head
     if (d >= head_dim) return;
-    const uint32_t r_lo = j * blk_tokens;
+    const uint32_t sub_tokens = (blk_tokens + n_subblocks - 1) / n_subblocks;
+    const uint32_t blk_lo = j * blk_tokens;
+    const uint32_t r_lo = blk_lo + sb * sub_tokens;
     if (r_lo >= batch) return;
-    const uint32_t r_hi = min(r_lo + blk_tokens, batch);
+    uint32_t r_hi = r_lo + sub_tokens;
+    const uint32_t blk_hi = blk_lo + blk_tokens;
+    if (r_hi > blk_hi) r_hi = blk_hi;   // last sub-block stops at the block end
+    if (r_hi > batch) r_hi = batch;
     const uint32_t half = rope_dim / 2;
     float acc = 0.0f;
     for (uint32_t r = r_lo; r < r_hi; ++r) {
@@ -3260,7 +3282,7 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     }
     const uint32_t n = r_hi - r_lo;
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
-    const uint64_t blk = kbar_block_base + j;
+    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
     kbar[(blk * gridDim.y + h) * head_dim + d] = acc * inv;
 }
 
@@ -6569,7 +6591,8 @@ public:
                                                        uint32_t head_dim,
                                                        float scale,
                                                        uint32_t excl_lo_end,
-                                                       uint32_t excl_hi_begin) override {
+                                                       uint32_t excl_hi_begin,
+                                                       uint32_t n_subblocks) override {
         if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
             head_dim == 0) {
             return {};
@@ -6580,7 +6603,7 @@ public:
         if (!ported::launch_block_attn_score_softmax_pages(
                 sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
                 n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
-                excl_lo_end, excl_hi_begin, exec_stream_)) {
+                excl_lo_end, excl_hi_begin, n_subblocks, exec_stream_)) {
             // n_blocks exceeded the shmem page cap (or a launch error); the
             // executor falls back to the sum-of-ReLU multilayer path.
             return {false, "block_attn_score_softmax_pages launch failed"};
@@ -6705,7 +6728,8 @@ public:
                                                   uint32_t rope_dim,
                                                   int32_t rope_base,
                                                   float theta,
-                                                  uint32_t src_row_off = 0) override {
+                                                  uint32_t src_row_off = 0,
+                                                  uint32_t n_subblocks = 1) override {
         if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 || batch == 0) {
             return {};
         }
@@ -6718,7 +6742,7 @@ public:
         if (!ported::launch_block_kmean_content_batch(
                 k_ptr, kb.ptr, kbar_block_base, n_blocks_chunk, k_stride, batch,
                 blk_tokens, n_kv_heads, head_dim, rope_dim, rope_base, theta,
-                exec_stream_)) {
+                n_subblocks, exec_stream_)) {
             return {false, "block_kmean_content_batch launch failed"};
         }
         return launch_status("cuda block_kmean_content_batch_device");
@@ -9432,25 +9456,29 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            uint32_t n_kv_heads, uint32_t head_dim,
                                            float scale, uint32_t excl_lo_end,
                                            uint32_t excl_hi_begin,
+                                           uint32_t n_subblocks,
                                            cudaStream_t stream) {
     if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
         head_dim == 0) {
         return true;
     }
-    // Page logits live in dynamic shared memory; cap pages so the request fits a
-    // conservative 48 KB shmem budget. Caller falls back to the sum-of-ReLU path.
+    const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
+    // Sub-block logits live in dynamic shared memory; cap the PRODUCT
+    // n_blocks*n_subblocks so the request fits a conservative 48 KB shmem budget.
+    // Caller falls back to the sum-of-ReLU path when exceeded.
     constexpr uint32_t kMaxPages = 8192;
-    if (n_blocks > kMaxPages) return false;
-    // score[] is accumulated across the grid -> must start at zero.
+    if (static_cast<uint64_t>(n_blocks) * ns > kMaxPages) return false;
+    // score[] is accumulated across the grid -> must start at zero. It stays
+    // per-block (n_blocks entries); sub-block masses are summed in by the kernel.
     cudaMemsetAsync(score, 0, static_cast<size_t>(n_blocks) * sizeof(float),
                     stream);
     constexpr uint32_t threads = 128;
     const uint32_t grid = n_layers * n_tokens;
-    const size_t shmem = static_cast<size_t>(n_blocks) * sizeof(float);
+    const size_t shmem = static_cast<size_t>(n_blocks) * ns * sizeof(float);
     block_attn_score_softmax_pages_kernel<<<grid, threads, shmem, stream>>>(
         score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
         n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
-        excl_lo_end, excl_hi_begin);
+        excl_lo_end, excl_hi_begin, ns);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -9514,14 +9542,16 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint32_t batch, uint32_t blk_tokens,
                                       uint32_t n_kv_heads, uint32_t head_dim,
                                       uint32_t rope_dim, int32_t rope_base,
-                                      float theta, cudaStream_t stream) {
+                                      float theta, uint32_t n_subblocks,
+                                      cudaStream_t stream) {
     if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 || batch == 0) {
         return true;
     }
-    dim3 grid(n_blocks_chunk, n_kv_heads);
+    const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
+    dim3 grid(n_blocks_chunk * ns, n_kv_heads);
     block_kmean_content_batch_kernel<<<grid, head_dim, 0, stream>>>(
         k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens, head_dim,
-        rope_dim, rope_base, theta);
+        rope_dim, rope_base, theta, ns);
     return cudaGetLastError() == cudaSuccess;
 }
 

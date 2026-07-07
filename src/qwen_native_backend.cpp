@@ -5698,9 +5698,16 @@ private:
         bs_cfg.select_policy = options_.kvmem_select_policy == "quota"
             ? KvMemSelectPolicy::Quota
             : KvMemSelectPolicy::TopK;
-        bs_cfg.retrieval_method = options_.kvmem_retrieval_method == "per-token"
-            ? KvMemRetrievalMethod::PerToken
-            : KvMemRetrievalMethod::MeanK;
+        bs_cfg.retrieval_method =
+            options_.kvmem_retrieval_method == "per-token"
+                ? KvMemRetrievalMethod::PerToken
+                : (options_.kvmem_retrieval_method == "sub-block-mean-k"
+                       ? KvMemRetrievalMethod::SubBlockMeanK
+                       : KvMemRetrievalMethod::MeanK);
+        bs_cfg.n_subblocks =
+            bs_cfg.retrieval_method == KvMemRetrievalMethod::SubBlockMeanK
+                ? static_cast<uint32_t>(std::max(1, options_.kvmem_subblocks))
+                : 1u;
         bs_cfg.update_mode = options_.kvmem_update_mode == "step"
             ? KvMemUpdateMode::Step
             : KvMemUpdateMode::Interval;
