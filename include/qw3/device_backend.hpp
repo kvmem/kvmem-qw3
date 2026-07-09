@@ -987,6 +987,9 @@ public:
     // n_subblocks (default 1): when >1, kbar_multi carries n_subblocks means per
     // block; the softmax runs over all n_blocks*n_subblocks logits and a block's
     // sub-block masses are summed into score[w] (masking bands are per block).
+    // reduce_max (default 0): with n_subblocks>1, score each block by its best
+    // sub-block's mass (max over sub-blocks) instead of the sum — MaxSim late
+    // interaction. No-op at n_subblocks==1 (single sub-block => max == sum).
     virtual DeviceStatus block_attn_score_softmax_pages_device(DeviceTensor &score,
                                                                const DeviceTensor &q_multi,
                                                                const DeviceTensor &kbar_multi,
@@ -1001,11 +1004,12 @@ public:
                                                                float scale,
                                                                uint32_t excl_lo_end = 0,
                                                                uint32_t excl_hi_begin = UINT32_MAX,
-                                                               uint32_t n_subblocks = 1) {
+                                                               uint32_t n_subblocks = 1,
+                                                               uint32_t reduce_max = 0) {
         (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
         (void)q_layer_stride; (void)n_blocks; (void)kbar_layer_stride; (void)n_heads;
         (void)n_kv_heads; (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
-        (void)n_subblocks;
+        (void)n_subblocks; (void)reduce_max;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 

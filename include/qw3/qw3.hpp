@@ -67,6 +67,7 @@ struct EngineOptions {
     std::string kvmem_select_policy = "topk"; // topk or quota
     std::string kvmem_retrieval_method = "mean-k"; // mean-k, per-token, or sub-block-mean-k
     int kvmem_subblocks = 4;      // sub-block means per block (sub-block-mean-k only)
+    std::string kvmem_subblock_reduce = "max"; // sub-block score reduction: max or sum
     std::string kvmem_update_mode = "interval"; // interval or step
     // When true, the serve layer marks the final user message's token span as
     // the "question" and the executor scores blocks by the multi-token mean

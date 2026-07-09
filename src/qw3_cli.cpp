@@ -396,6 +396,13 @@ int main(int argc, char **argv) {
                 }
             } else if (arg == "--kvmem-subblocks") {
                 engine.kvmem_subblocks = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-subblock-reduce") {
+                engine.kvmem_subblock_reduce = need(arg);
+                if (engine.kvmem_subblock_reduce != "max" &&
+                    engine.kvmem_subblock_reduce != "sum") {
+                    throw std::runtime_error(
+                        "--kvmem-subblock-reduce must be max|sum");
+                }
             } else if (arg == "--kvmem-update-mode") {
                 engine.kvmem_update_mode = need(arg);
                 if (engine.kvmem_update_mode != "interval" &&

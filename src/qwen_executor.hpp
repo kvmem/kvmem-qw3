@@ -870,6 +870,7 @@ private:
     uint32_t g_kbar_multi_blocks_ = 0;                         // blocks covered (per layer)
     uint32_t g_kbar_multi_capacity_ = 0;                       // allocated block capacity (per layer)
     uint32_t kvmem_qc_n_subblocks_ = 1;                        // sub-block means per block (SubBlockMeanK; 1 = plain mean-k)
+    bool kvmem_qc_subblock_max_ = true;                        // sub-block reduction: true=max over sub-blocks (MaxSim), false=sum (mass). No-op at n_subblocks==1.
 
     // Incremental content-index build from the prefill K batch (#91). The paged
     // builder (kvmem_build_content_index) can only run once from the pristine

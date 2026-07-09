@@ -5708,6 +5708,10 @@ private:
             bs_cfg.retrieval_method == KvMemRetrievalMethod::SubBlockMeanK
                 ? static_cast<uint32_t>(std::max(1, options_.kvmem_subblocks))
                 : 1u;
+        bs_cfg.subblock_reduce =
+            options_.kvmem_subblock_reduce == "sum"
+                ? KvMemSubblockReduce::Sum
+                : KvMemSubblockReduce::Max;
         bs_cfg.update_mode = options_.kvmem_update_mode == "step"
             ? KvMemUpdateMode::Step
             : KvMemUpdateMode::Interval;

@@ -122,6 +122,13 @@ enum class KvMemSelectPolicy : uint8_t { TopK = 0, Quota = 1 };
 // softmax over all block*sub-block logits, mass summed back per block) so a
 // concentrated relevant sub-region isn't diluted by a block's mean.
 enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMeanK = 2 };
+// Sub-block score reduction (--kvmem-subblock-reduce; SubBlockMeanK only):
+// Sum aggregates a block's sub-block softmax masses (average attention the block
+// receives); Max scores a block by its single best sub-block (MaxSim-style late
+// interaction: max over the document side, still summed over query tokens/heads/
+// layers) so a concentrated relevant sub-region wins instead of being averaged
+// down. At n_subblocks == 1 the two are identical (one sub-block per block).
+enum class KvMemSubblockReduce : uint8_t { Sum = 0, Max = 1 };
 enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
 
 struct KvMemStoreConfig {
@@ -137,6 +144,7 @@ struct KvMemStoreConfig {
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
     uint32_t n_subblocks = 1;        // --kvmem-subblocks; sub-block means per block
                                      // (SubBlockMeanK only; 1 => plain mean-k)
+    KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
 
     // Quota policy. Zero means derive from the remaining budget at selection

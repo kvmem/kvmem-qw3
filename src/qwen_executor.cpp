@@ -4883,12 +4883,15 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // granularity. 1 for plain mean-k / per-token -> byte-identical layout.
     kvmem_qc_n_subblocks_ =
         std::max<uint32_t>(1u, block_store_->config().n_subblocks);
+    kvmem_qc_subblock_max_ =
+        block_store_->config().subblock_reduce == KvMemSubblockReduce::Max;
     if (kvmem_qc_n_subblocks_ > 1 && std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
                      "[bs-subblock] sub-block mean-k active: n_subblocks=%u "
-                     "(sub_tokens=%u per %u-token block)\n",
+                     "(sub_tokens=%u per %u-token block) reduce=%s\n",
                      kvmem_qc_n_subblocks_,
-                     (bt + kvmem_qc_n_subblocks_ - 1) / kvmem_qc_n_subblocks_, bt);
+                     (bt + kvmem_qc_n_subblocks_ - 1) / kvmem_qc_n_subblocks_, bt,
+                     kvmem_qc_subblock_max_ ? "max" : "sum");
     }
     const uint32_t n_kv_heads = cfg.n_kv_heads;
     const uint32_t head_dim = cfg.head_dim;
@@ -5408,7 +5411,8 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
             *g_score_dev_, *g_query_multi_, *g_kbar_multi_,
             L, M, /*q_layer_stride=*/S, nb, /*kbar_layer_stride=*/kbar_stride,
             cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, sm_scale,
-            excl_lo_end, excl_hi_begin, /*n_subblocks=*/kvmem_qc_n_subblocks_);
+            excl_lo_end, excl_hi_begin, /*n_subblocks=*/kvmem_qc_n_subblocks_,
+            /*reduce_max=*/kvmem_qc_subblock_max_ ? 1u : 0u);
         !st.ok) {
         return false;
     }
