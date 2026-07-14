@@ -829,9 +829,6 @@ private:
                                    uint32_t q_token_stride);
     uint32_t kvmem_query_begin_ = 0;
     uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
-    uint32_t kvmem_query_base_pos_ = 0;                        // position() at span-set; anchors
-                                                               // prompt-token indices vs the
-                                                               // possibly-chunked prefill calls
     uint32_t g_query_multi_count_ = 0;                         // rows captured so far (per slot)
     uint32_t g_query_multi_capacity_ = 0;                      // allocated rows (cap, == S)
     bool g_query_multi_ready_ = false;                         // all span rows captured

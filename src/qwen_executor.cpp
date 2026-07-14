@@ -47,6 +47,37 @@ bool paged_kv_prefill_for_local_cache_enabled() {
     return env_flag_enabled("QW3_PAGED_KV_PREFILL", true);
 }
 
+struct QuerySpanOverlap {
+    uint32_t row_offset = 0;
+    uint32_t count = 0;
+};
+
+// All query spans supplied by the serve layer are absolute token positions in
+// the complete rendered prompt. `chunk_begin` is also absolute: forward_n_tokens
+// derives it from the executor's running position, which is zero on a cold
+// prefill and the restored checkpoint position on a warm suffix-only prefill.
+// Keeping the overlap calculation in this one helper prevents cold/warm paths
+// from accidentally mixing prompt-absolute and suffix-relative coordinates.
+constexpr QuerySpanOverlap query_span_overlap(uint32_t chunk_begin,
+                                               uint32_t chunk_tokens,
+                                               uint32_t query_begin,
+                                               uint32_t query_end) {
+    const uint32_t chunk_end = chunk_begin + chunk_tokens;
+    const uint32_t lo = chunk_begin > query_begin ? chunk_begin : query_begin;
+    const uint32_t hi = chunk_end < query_end ? chunk_end : query_end;
+    return hi > lo ? QuerySpanOverlap{lo - chunk_begin, hi - lo}
+                   : QuerySpanOverlap{};
+}
+
+// Cold full-prefill and warm checkpoint-resume regression cases. The latter is
+// the LongMemEval failure mode: query [109902,109949) lies in a suffix chunk
+// beginning at restored position 109888 and must capture all 47 rows.
+static_assert(query_span_overlap(0, 256, 104, 151).row_offset == 104);
+static_assert(query_span_overlap(0, 256, 104, 151).count == 47);
+static_assert(query_span_overlap(109888, 68, 109902, 109949).row_offset == 14);
+static_assert(query_span_overlap(109888, 68, 109902, 109949).count == 47);
+static_assert(query_span_overlap(100, 16, 200, 220).count == 0);
+
 class LocalKvPagePool final : public KvPhysicalPageAllocator {
 public:
     LocalKvPagePool(uint32_t total_pages, uint32_t page_size)
@@ -4917,10 +4948,6 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     kvmem_qc_resume_base_tokens_ = 0;
     kvmem_query_begin_ = begin;
     kvmem_query_end_ = end;
-    // Anchor the span to the prefill's base position so the (possibly chunked)
-    // forward_n_tokens calls can map their call-relative chunk_off back to an
-    // absolute prompt-token index. position() here is the pre-prefill base.
-    kvmem_query_base_pos_ = position_;
     g_query_multi_count_ = 0;
     g_query_multi_ready_ = false;
     g_kbar_multi_ready_ = false;
@@ -5250,13 +5277,11 @@ void QwenExecutor::kvmem_capture_deltanet_query(uint32_t dn_slot,
     if (kvmem_query_end_ <= kvmem_query_begin_) return;
     if (!g_deltanet_q_ || kvmem_dn_ready_) return;
     (void)chunk_off;
-    if (base_pos < kvmem_query_base_pos_) return;
-    const uint32_t abs_lo = base_pos - kvmem_query_base_pos_;
-    const uint32_t lo = std::max(abs_lo, kvmem_query_begin_);
-    const uint32_t hi = std::min(abs_lo + batch, kvmem_query_end_);
-    if (hi <= lo) return;
-    const uint32_t r0 = lo - abs_lo;          // chunk-local first in-span row
-    const uint32_t cnt = hi - lo;             // rows captured this chunk
+    const QuerySpanOverlap overlap = query_span_overlap(
+        base_pos, batch, kvmem_query_begin_, kvmem_query_end_);
+    if (overlap.count == 0) return;
+    const uint32_t r0 = overlap.row_offset;    // chunk-local first in-span row
+    const uint32_t cnt = overlap.count;        // rows captured this chunk
     const QwenConfig &cfg = model_.config();
     const uint32_t num_k_heads = cfg.num_k_heads();
     const uint32_t head_k_dim = cfg.head_k_dim();
@@ -5419,7 +5444,7 @@ bool QwenExecutor::kvmem_retrieval_score_deltanet() {
 
 // During prefill at bs_score_layer_: de-RoPE the in-span Q rows of the current
 // chunk into g_query_multi_ at their true bake positions. The overlap of the
-// chunk's prompt-token indices [chunk_off, chunk_off+batch) with [qb,qe) is a
+// chunk's absolute prompt-token indices [base_pos, base_pos+batch) with [qb,qe) is a
 // contiguous run, so one batched launch covers it; counts accumulate across
 // chunks until the whole span is captured. Inert unless a span is active.
 void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
@@ -5428,19 +5453,15 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
                                              uint32_t q_token_stride) {
     if (kvmem_query_end_ <= kvmem_query_begin_) return;
     if (!g_query_multi_ || !q_batch_ || g_query_multi_ready_) return;
-    // Absolute prompt-token index of this chunk's first row. base_pos is the
-    // executor's running position for chunk row 0; subtracting the span base
-    // (position() at set_query_span) yields the prompt index, which is what the
-    // span [qb,qe) is expressed in. Robust to generate_mtp's 4096-token backend
-    // chunking (each forward_n_tokens call resets its internal chunk_off to 0).
+    // base_pos and [query_begin,query_end) are both absolute positions in the
+    // complete prompt. This remains true after prefix reuse: restore_state sets
+    // position() to checkpoint C and suffix prefill begins at base_pos=C.
     (void)chunk_off;
-    if (base_pos < kvmem_query_base_pos_) return;
-    const uint32_t abs_lo = base_pos - kvmem_query_base_pos_;
-    const uint32_t lo = std::max(abs_lo, kvmem_query_begin_);
-    const uint32_t hi = std::min(abs_lo + batch, kvmem_query_end_);
-    if (hi <= lo) return;
-    const uint32_t r0 = lo - abs_lo;          // chunk-local first in-span row
-    const uint32_t cnt = hi - lo;             // rows captured this chunk
+    const QuerySpanOverlap overlap = query_span_overlap(
+        base_pos, batch, kvmem_query_begin_, kvmem_query_end_);
+    if (overlap.count == 0) return;
+    const uint32_t r0 = overlap.row_offset;    // chunk-local first in-span row
+    const uint32_t cnt = overlap.count;        // rows captured this chunk
     const QwenConfig &cfg = model_.config();
     const uint32_t n_heads = cfg.n_heads;
     const uint32_t head_dim = cfg.head_dim;
