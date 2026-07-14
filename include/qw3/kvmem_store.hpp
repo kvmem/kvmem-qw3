@@ -121,7 +121,14 @@ enum class KvMemSelectPolicy : uint8_t { TopK = 0, Quota = 1 };
 // SubBlockMeanK = MeanK at sub-block granularity (n_subblocks means per block,
 // softmax over all block*sub-block logits, mass summed back per block) so a
 // concentrated relevant sub-region isn't diluted by a block's mean.
-enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMeanK = 2 };
+//   DeltaNet (EXPERIMENTAL, NOT RECOMMENDED) = rank blocks by each historical
+//              block's NET EDIT to the DeltaNet
+//              recurrent state (E_j = S_j - a_j S_{j-1}) read by the current
+//              DeltaNet query, aggregated over query tokens / heads / layers with
+//              a per-layer RMS normalization (see deltanet_retrieval.md). Unlike
+//              the mean-k / per-token scorers (which read standard-attention keys)
+//              this reads the RECURRENT layers' state increments.
+enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMeanK = 2, DeltaNet = 3 };
 // Sub-block score reduction (--kvmem-subblock-reduce; SubBlockMeanK only):
 // Sum aggregates a block's sub-block softmax masses (average attention the block
 // receives); Max scores a block by its single best sub-block (MaxSim-style late
@@ -130,6 +137,7 @@ enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMea
 // down. At n_subblocks == 1 the two are identical (one sub-block per block).
 enum class KvMemSubblockReduce : uint8_t { Sum = 0, Max = 1 };
 enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
+enum class KvMemDeltaNetLayerPolicy : uint8_t { Even = 0, Late = 1 };
 
 struct KvMemStoreConfig {
     uint32_t block_tokens = 128;     // --kvmem-block-tokens
@@ -138,7 +146,7 @@ struct KvMemStoreConfig {
                                      // one turn's newly generated tokens)
     uint32_t sink_blocks = 1;        // --kvmem-sink-blocks (always-kept prefix)
     uint32_t recent_blocks = 0;      // --kvmem-recent-blocks (always-kept suffix);
-                                     // 0 => derived from budget at use time
+                                     // 0 => keep no suffix blocks unconditionally
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
@@ -146,6 +154,22 @@ struct KvMemStoreConfig {
                                      // (SubBlockMeanK only; 1 => plain mean-k)
     KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
+
+    // Archived experimental DeltaNet retrieval. Not exposed by the CLI and not
+    // recommended for production; retained for future research and reproducibility.
+    // See docs/kvmem_deltanet_retrieval_experimental.md.
+    // Scores blocks by their net edit to the DeltaNet recurrent state read by the
+    // current DeltaNet query. The full per-block state edit E_j is a d_v x d_k
+    // matrix per (layer, head, block) (~64 KB at state_size 128), so the number of
+    // DeltaNet layers that feed the score is capped by a memory budget: the
+    // executor picks evenly-spaced DeltaNet layers up to deltanet_layers, further
+    // clamped so the E_j buffer fits deltanet_mem_budget_bytes.
+    uint32_t deltanet_layers = 0;             // --kvmem-deltanet-layers (0 => derive from budget)
+    KvMemDeltaNetLayerPolicy deltanet_layer_policy = KvMemDeltaNetLayerPolicy::Even;
+    uint64_t deltanet_mem_budget_bytes = 0;   // --kvmem-deltanet-mem-budget-gb (0 => 32 GiB default)
+    bool     deltanet_decay = true;           // --kvmem-deltanet-decay (apply exp(G_M - G_j))
+    uint32_t deltanet_topk_q = 4;             // --kvmem-deltanet-topk-q (TopKMean over query tokens)
+    uint32_t deltanet_topk_h = 4;             // --kvmem-deltanet-topk-h (TopKMean over heads)
 
     // Quota policy. Zero means derive from the remaining budget at selection
     // time. Quotas are measured in blocks and apply after sink/recent are kept.

@@ -401,7 +401,7 @@ selected offloaded block must stage back in before attention can read it.
 --kvmem-budget N     Max window tokens kept per selection. Default 131072.
 --kvmem-interval N   Decode steps between reselections. Default 64.
 --kvmem-sink-blocks N       Always-kept prefix blocks. Default 1.
---kvmem-recent-blocks N     Always-kept suffix blocks (0 = derive from budget). Default 0.
+--kvmem-recent-blocks N     Always-kept suffix blocks (0 = none). Default 0.
 --kvmem-method M     Selection signal: retrieval | h2o | recency. Default retrieval.
 --kvmem-select-policy M     Selection policy: topk | quota. Default topk.
 --kvmem-retrieval-method M  Retrieval scorer: mean_attention | content_mean. Default mean_attention.

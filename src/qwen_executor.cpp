@@ -540,11 +540,22 @@ void QwenExecutor::reset_state() {
     g_kbar_multi_blocks_ = 0;
     kvmem_qc_total_blocks_ = 0;
     kvmem_qc_captured_blocks_ = 0;
+    // DeltaNet-state retrieval capture is per-request (device buffers stay
+    // allocated for reuse; regrown by set_query_span as the block count grows).
+    kvmem_dn_ready_ = false;
+    kvmem_dn_qcount_ = 0;
     // A full reset is a cold start: no prefix survives, so clear the fixed stride
     // and the session-continuation resume base. The next kvmem_set_query_span then
     // zeroes the whole content index (resume_base == 0) and re-pins the stride.
     kvmem_qc_layer_stride_blocks_ = 0;
     kvmem_qc_resume_base_tokens_ = 0;
+    // Clean-query prefill (task #50): drop the decode-window pin so a request that
+    // does NOT use clean-query never inherits a stale pin. Do NOT clear
+    // g_query_multi_clean_count_ here: PASS A stashes the clean query and THEN calls
+    // reset_state before PASS B restores it, so clearing the count would lose the
+    // stash. It is instead overwritten by the next PASS-A stash and only ever read
+    // after a stash within the same request.
+    kvmem_qc_pin_from_block_ = 0xffffffffu;
     if (block_store_) {
         *block_store_ = KvMemStore(block_store_->config());
     }
@@ -1896,6 +1907,36 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 state_checkpoint = state_checkpoints->recurrent_states[il].get();
                 conv_state_checkpoint = state_checkpoints->conv_states[il].get();
             }
+            // DeltaNet-state retrieval capture (retrieval_method==deltanet;
+            // deltanet_retrieval.md). For a selected DeltaNet layer with an active
+            // question span, snapshot S_j per block + accumulate the in-block
+            // log-decay so the reselect boundary can score blocks by their state
+            // edits. Inert (nullptr) otherwise -> byte-identical to the base path.
+            DeviceTensor *dn_snap = nullptr;
+            DeviceTensor *dn_decay = nullptr;
+            uint64_t dn_snap_off = 0, dn_decay_off = 0;
+            uint32_t dn_bt = 0, dn_nblocks = 0;
+            int32_t dn_slot_il = -1;
+            if (kvmem_qc_deltanet_ && kvmem_query_end_ > kvmem_query_begin_ &&
+                g_deltanet_snap_ && !kvmem_dn_ready_ &&
+                static_cast<size_t>(il) < dn_layer_slot_.size()) {
+                dn_slot_il = dn_layer_slot_[il];
+            }
+            if (dn_slot_il >= 0) {
+                const uint32_t bt =
+                    std::max<uint32_t>(block_store_->config().block_tokens, 1u);
+                const uint32_t nblk = kvmem_qc_total_blocks_;
+                const uint64_t snap_per_layer =
+                    static_cast<uint64_t>(nblk) * num_v_heads * head_v_dim * head_k_dim;
+                const uint64_t decay_per_layer =
+                    static_cast<uint64_t>(nblk) * num_v_heads;
+                dn_snap = g_deltanet_snap_.get();
+                dn_decay = g_deltanet_decaysum_.get();
+                dn_snap_off = static_cast<uint64_t>(dn_slot_il) * snap_per_layer;
+                dn_decay_off = static_cast<uint64_t>(dn_slot_il) * decay_per_layer;
+                dn_bt = bt;
+                dn_nblocks = nblk;
+            }
             // One batched call replaces the previous T-token loop (5 kernels x
             // T tokens). The CUDA backend overrides this with 4 launches per
             // layer that internally iterate over T.
@@ -1926,8 +1967,24 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                      eps,
                                                      state_checkpoint,
                                                      conv_state_checkpoint,
-                                                     save_state_checkpoints));
+                                                     save_state_checkpoints,
+                                                     dn_snap,
+                                                     dn_decay,
+                                                     dn_snap_off,
+                                                     dn_decay_off,
+                                                     dn_bt,
+                                                     base_pos,
+                                                     dn_nblocks));
             if (record_ops) record(report, "layer." + std::to_string(il) + ".deltanet_batch");
+            // After recurrent_batch, conv_out_batch_ holds this layer's L2-normed
+            // DeltaNet Q (first num_k_heads*head_k_dim of each row). Capture the
+            // in-span question rows for DeltaNet-state scoring before the next
+            // recurrent layer overwrites the buffer.
+            if (dn_slot_il >= 0) {
+                kvmem_capture_deltanet_query(static_cast<uint32_t>(dn_slot_il),
+                                             chunk_off, batch, base_pos,
+                                             *conv_out_batch_, proj_stride);
+            }
             require_status(backend_.q8_0_matmul(*attn_out_batch_, *layer.ssm_out, *core_batch_,
                                                  batch, core_stride, h_stride));
             if (record_ops) record(report, "layer." + std::to_string(il) + ".recurrent_output_batch");
@@ -2873,10 +2930,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         if (tiers_available) {
             const uint32_t budget_blocks_min = std::max<uint32_t>(
                 1, effective.select_budget / effective.block_tokens);
-            const uint32_t recent_blocks_min =
-                effective.recent_blocks > 0
-                    ? effective.recent_blocks
-                    : std::max<uint32_t>(1, budget_blocks_min / 4);
+            const uint32_t recent_blocks_min = effective.recent_blocks;
             const long double lw = effective.gpu_low_watermark > 0.0
                 ? static_cast<long double>(effective.gpu_low_watermark)
                 : 1.0L;
@@ -2921,8 +2975,26 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                     "ceiling. Raise --kvmem-gpu-memory-ratio, or lower "
                     "--kvmem-budget / --kvmem-gen-budget.");
             }
+            uint64_t pool_blocks = required_blocks;
+            // Full-context-query probe (task #50 follow-up). Size the GPU pool to
+            // hold as much of the context as VRAM allows (up to the full ctx),
+            // DECOUPLED from select_budget. With the whole prompt resident the
+            // pressure-gated prefill offload (kvmem_maybe_prefill_offload) never
+            // fires, so kvmem_active_ stays false through prefill and the trailing
+            // question tokens attend over the ENTIRE context -> the captured
+            // retrieval query is full-context, not recency-windowed. Selection and
+            // decode still use select_budget: the post-prefill reselect assembles a
+            // select_budget window from that full-context query. Env-gated; default
+            // off -> pool == required_blocks -> byte-identical to today.
+            if (std::getenv("QW3_KVMEM_FULLCTX_QUERY")) {
+                const uint64_t ctx_blocks =
+                    (static_cast<uint64_t>(kv_ctx_size_) +
+                     effective.block_tokens - 1) / effective.block_tokens;
+                pool_blocks = std::min<uint64_t>(cap_blocks, ctx_blocks);
+                if (pool_blocks < required_blocks) pool_blocks = required_blocks;
+            }
             effective.estimated_gpu_block_capacity =
-                static_cast<uint32_t>(required_blocks);
+                static_cast<uint32_t>(pool_blocks);
         }
     }
 
@@ -4092,7 +4164,16 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             //   mean-k    -> softmax-over-pages on the per-block mean key (default).
             // Either falls back to the single last-token content scorer if its
             // buffer isn't live (e.g. no query span, or the shmem page cap is hit).
-            if (kvmem_query_end_ > kvmem_query_begin_ && g_query_multi_ready_) {
+            if (kvmem_qc_deltanet_ && kvmem_dn_ready_) {
+                // DeltaNet-state retrieval (deltanet_retrieval.md). Falls back to
+                // mean-k / single-token content scoring if its capture isn't live.
+                bool scored = kvmem_retrieval_score_deltanet();
+                if (!scored) {
+                    if (kvmem_query_end_ > kvmem_query_begin_ && g_query_multi_ready_)
+                        scored = kvmem_retrieval_score_mean_softmax();
+                    if (!scored) (void)kvmem_retrieval_score();
+                }
+            } else if (kvmem_query_end_ > kvmem_query_begin_ && g_query_multi_ready_) {
                 bool scored = false;
                 if (kvmem_qc_pertoken_) scored = kvmem_retrieval_score_exactmass();
                 else                    scored = kvmem_retrieval_score_mean_softmax();
@@ -4111,7 +4192,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             break;
     }
     kvmem_pending_plan_ =
-        block_store_->set_selection(block_store_->pick_topk_blocks());
+        block_store_->set_selection(kvmem_selection_with_pin());
     // DIAGNOSTIC (default OFF): dump the per-block retrieval ranking + selection
     // for the first few reselects so an offline tool can locate the answer block
     // and read its rank/score vs. the budget cutoff. Gated on QW3_KVMEM_DUMP_SCORES
@@ -4129,8 +4210,9 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
         // index still filling), which would otherwise be captured first and latch
         // out the real, full-coverage final reselect. Gating on index-ready skips
         // those intermediate reselects and captures the post-prefill selection.
-        const bool index_ready =
-            kvmem_qc_pertoken_ ? g_kraw_multi_ready_ : g_kbar_multi_ready_;
+        const bool index_ready = kvmem_qc_deltanet_
+            ? kvmem_dn_ready_
+            : (kvmem_qc_pertoken_ ? g_kraw_multi_ready_ : g_kbar_multi_ready_);
         const bool span_is_new = index_ready &&
             (kvmem_query_end_ > kvmem_query_begin_) &&
             (kvmem_query_begin_ != kvmem_dump_last_qb ||
@@ -4158,9 +4240,13 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                         kvmem_query_begin_, kvmem_query_end_,
                         block_store_->budget_blocks(), cfg.recent_blocks,
                         cfg.sink_blocks, cfg.block_tokens,
-                        kvmem_qc_pertoken_ ? "per-token" : "mean-k", mask_label,
+                        kvmem_qc_deltanet_ ? "deltanet" :
+                            (kvmem_qc_pertoken_ ? "per-token" : "mean-k"),
+                        mask_label,
                         kvmem_qc_total_blocks_, kvmem_qc_captured_blocks_,
-                        index_ready ? 1 : 0, g_query_multi_ready_ ? 1 : 0);
+                        index_ready ? 1 : 0,
+                        kvmem_qc_deltanet_ ? (kvmem_dn_ready_ ? 1 : 0)
+                                           : (g_query_multi_ready_ ? 1 : 0));
                     for (const auto &b : blks) {
                         std::fprintf(f,
                             "{\"b\":%u,\"p0\":%u,\"nt\":%u,\"rs\":%.9g,\"ps\":%.9g,"
@@ -4197,7 +4283,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                 // Restore production-consistent scoring/selection.
                 (void)kvmem_retrieval_score_mean_softmax(-1);
                 kvmem_pending_plan_ =
-                    block_store_->set_selection(block_store_->pick_topk_blocks());
+                    block_store_->set_selection(kvmem_selection_with_pin());
             } else {
                 dump_snapshot(-1);
             }
@@ -4968,6 +5054,46 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
         g_query_content_ = backend_.tensor_f32(
             static_cast<uint64_t>(cfg.n_heads) * head_dim, "g_query_content");
     }
+
+    // DeltaNet-state retrieval buffers (deltanet_retrieval.md). Allocated only
+    // when the deltanet method is selected. Sized for the full block count.
+    if (kvmem_qc_deltanet_) {
+        kvmem_resolve_deltanet_layers();
+        kvmem_dn_ready_ = false;
+        kvmem_dn_qcount_ = 0;
+        const uint32_t L_dn = kvmem_dn_num_layers_;
+        if (L_dn > 0) {
+            const uint32_t vh = cfg.num_v_heads();
+            const uint32_t dv = cfg.head_v_dim_ssm();
+            const uint32_t dk = cfg.head_k_dim();
+            // g_deltanet_snap_ [L_dn, blocks, vh, dv, dk] fp32 (S_j per block).
+            const uint64_t snap_per_layer =
+                static_cast<uint64_t>(total_blocks) * vh * dv * dk;
+            // g_deltanet_decaysum_ / decay_d / r [L_dn, blocks, vh] fp32.
+            const uint64_t small_per_layer =
+                static_cast<uint64_t>(total_blocks) * vh;
+            if (!g_deltanet_snap_ || total_blocks > g_deltanet_capacity_blocks_) {
+                g_deltanet_capacity_blocks_ = total_blocks;
+                g_deltanet_snap_ =
+                    backend_.tensor_f32(snap_per_layer * L_dn, "g_deltanet_snap");
+                g_deltanet_decaysum_ =
+                    backend_.tensor_f32(small_per_layer * L_dn, "g_deltanet_decaysum");
+                g_deltanet_decay_d_ =
+                    backend_.tensor_f32(small_per_layer * L_dn, "g_deltanet_decay_d");
+                g_deltanet_r_ =
+                    backend_.tensor_f32(small_per_layer * L_dn, "g_deltanet_r");
+            }
+            // g_deltanet_q_ [L_dn, S, num_k_heads, dk] fp32.
+            const uint64_t q_rows = static_cast<uint64_t>(L_dn) * S;
+            const uint64_t q_elems = q_rows * cfg.num_k_heads() * dk;
+            if (!g_deltanet_q_ || g_deltanet_q_->count < q_elems) {
+                g_deltanet_q_ = backend_.tensor_f32(q_elems, "g_deltanet_q");
+            }
+            // Zero the snapshot + decay accumulators so uncaptured blocks read 0.
+            require_status(backend_.zero_tensor(*g_deltanet_snap_));
+            require_status(backend_.zero_tensor(*g_deltanet_decaysum_));
+        }
+    }
 }
 
 // Resolve the normal-attention layer slot maps from the model config + env A/B
@@ -4999,6 +5125,8 @@ void QwenExecutor::kvmem_resolve_std_layers() {
     // MeanK -> softmax-over-pages on the ~28 MB mean-key buffer (default).
     kvmem_qc_pertoken_ = block_store_ && block_store_->config().retrieval_method ==
                                              KvMemRetrievalMethod::PerToken;
+    kvmem_qc_deltanet_ = block_store_ && block_store_->config().retrieval_method ==
+                                             KvMemRetrievalMethod::DeltaNet;
     kvmem_qc_layer_cap_ = -1;
     if (const char *cap = std::getenv("QW3_KVMEM_QC_LAYERS")) {
         const int v = std::atoi(cap);
@@ -5016,6 +5144,277 @@ void QwenExecutor::kvmem_resolve_std_layers() {
         std_layers_.push_back(il);
     }
     kvmem_qc_num_layers_ = static_cast<uint32_t>(std_layers_.size());
+}
+
+// Resolve the DeltaNet (recurrent) layer subset that feeds DeltaNet-state
+// retrieval (deltanet_retrieval.md). The per-block state edit E_j is a d_v*d_k
+// fp32 matrix per (layer, head), so the number of DeltaNet layers is capped by a
+// memory budget: pick evenly-spaced recurrent layers up to the configured count
+// (deltanet_layers, 0 => half the DeltaNet layers), then clamp so the E_j
+// snapshot buffer fits deltanet_mem_budget_bytes. Logs the resolved L_dn + the
+// estimated buffer size; hard-errors if even one layer exceeds the budget.
+void QwenExecutor::kvmem_resolve_deltanet_layers() {
+    const QwenConfig &cfg = model_.config();
+    dn_layers_.clear();
+    dn_layer_slot_.assign(weights_.n_layers(), -1);
+    kvmem_dn_num_layers_ = 0;
+    if (!block_store_) return;
+
+    // Enumerate all recurrent (DeltaNet) layers.
+    std::vector<uint32_t> recurrent;
+    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+        if (weights_.layer(il).recurrent) recurrent.push_back(il);
+    }
+    const uint32_t n_dn = static_cast<uint32_t>(recurrent.size());
+    if (n_dn == 0) return;
+
+    const KvMemStoreConfig &bc = block_store_->config();
+    // Desired count: explicit flag, else half the DeltaNet layers (>=1).
+    uint32_t desired = bc.deltanet_layers;
+    if (desired == 0) desired = std::max<uint32_t>(1u, n_dn / 2);
+    desired = std::min(desired, n_dn);
+
+    // Budget clamp. E_j snapshot bytes per layer = blocks * v_heads * d_v * d_k * 4.
+    const uint32_t bt = std::max<uint32_t>(bc.block_tokens, 1u);
+    const uint32_t ctx_blocks = (kv_ctx_size_ + bt - 1) / bt;
+    const uint64_t bytes_per_layer =
+        static_cast<uint64_t>(ctx_blocks) * cfg.num_v_heads() *
+        cfg.head_v_dim_ssm() * cfg.head_k_dim() * sizeof(float);
+    uint64_t budget = bc.deltanet_mem_budget_bytes;
+    if (budget == 0) budget = 32ull * 1024 * 1024 * 1024;  // 32 GiB default
+    uint32_t max_by_budget = bytes_per_layer > 0
+        ? static_cast<uint32_t>(budget / bytes_per_layer)
+        : desired;
+    if (max_by_budget == 0) {
+        throw std::runtime_error(
+            "kvmem deltanet retrieval: a single DeltaNet layer's state-edit buffer (" +
+            std::to_string(bytes_per_layer / (1024 * 1024)) +
+            " MiB) exceeds --kvmem-deltanet-mem-budget-gb; lower the context size, "
+            "raise the budget, or increase --kvmem-block-tokens");
+    }
+    const uint32_t L_dn = std::min(desired, max_by_budget);
+
+    // Select either evenly across depth (the original behavior) or take the
+    // deepest recurrent layers. The latter is useful for retrieval experiments:
+    // late queries/edits are more semantic, and a small late-only subset avoids
+    // giving early noisy layers equal weight after per-layer RMS normalization.
+    for (uint32_t k = 0; k < L_dn; ++k) {
+        uint32_t idx = 0;
+        if (bc.deltanet_layer_policy == KvMemDeltaNetLayerPolicy::Late) {
+            idx = n_dn - L_dn + k;
+        } else {
+            idx = (L_dn == 1) ? (n_dn / 2)
+                              : static_cast<uint32_t>(
+                                    (static_cast<uint64_t>(k) * (n_dn - 1)) /
+                                    (L_dn - 1));
+        }
+        if (idx >= n_dn) idx = n_dn - 1;
+        const uint32_t il = recurrent[idx];
+        if (dn_layer_slot_[il] >= 0) continue;   // dedupe (rounding collision)
+        dn_layer_slot_[il] = static_cast<int32_t>(dn_layers_.size());
+        dn_layers_.push_back(il);
+    }
+    kvmem_dn_num_layers_ = static_cast<uint32_t>(dn_layers_.size());
+
+    if (std::getenv("QW3_KVMEM_TRACE") || std::getenv("QW3_KVMEM_DELTANET_TRACE")) {
+        std::fprintf(stderr,
+            "[bs-deltanet] resolved L_dn=%u of %u DeltaNet layers "
+            "(desired=%u budget_cap=%u policy=%s), v_heads=%u state=%ux%u, "
+            "~%.2f GiB E_j buffer (%u ctx blocks)\n",
+            kvmem_dn_num_layers_, n_dn, desired, max_by_budget,
+            bc.deltanet_layer_policy == KvMemDeltaNetLayerPolicy::Late
+                ? "late" : "even",
+            cfg.num_v_heads(), cfg.head_v_dim_ssm(), cfg.head_k_dim(),
+            static_cast<double>(bytes_per_layer) * kvmem_dn_num_layers_ /
+                (1024.0 * 1024.0 * 1024.0),
+            ctx_blocks);
+        std::fprintf(stderr, "[bs-deltanet] layer ids:");
+        for (uint32_t il : dn_layers_) std::fprintf(stderr, " %u", il);
+        std::fprintf(stderr, "\n");
+    }
+}
+
+// DeltaNet-state retrieval query capture. After recurrent_batch for a selected
+// DeltaNet layer, conv_out holds the L2-normalized DeltaNet Q in the first
+// num_k_heads*head_k_dim of each row. Copy the in-span question rows into
+// g_deltanet_q_[dn_slot, count..] (no RoPE — DeltaNet queries are not rotated).
+// Mirrors kvmem_capture_query_multi's span-overlap bookkeeping; advances the
+// shared row count once (after the last DeltaNet slot writes) and publishes the
+// index when the whole span is captured across all layers.
+void QwenExecutor::kvmem_capture_deltanet_query(uint32_t dn_slot,
+                                                uint32_t chunk_off,
+                                                uint32_t batch,
+                                                uint32_t base_pos,
+                                                const DeviceTensor &conv_out,
+                                                uint32_t conv_stride) {
+    if (kvmem_query_end_ <= kvmem_query_begin_) return;
+    if (!g_deltanet_q_ || kvmem_dn_ready_) return;
+    (void)chunk_off;
+    if (base_pos < kvmem_query_base_pos_) return;
+    const uint32_t abs_lo = base_pos - kvmem_query_base_pos_;
+    const uint32_t lo = std::max(abs_lo, kvmem_query_begin_);
+    const uint32_t hi = std::min(abs_lo + batch, kvmem_query_end_);
+    if (hi <= lo) return;
+    const uint32_t r0 = lo - abs_lo;          // chunk-local first in-span row
+    const uint32_t cnt = hi - lo;             // rows captured this chunk
+    const QwenConfig &cfg = model_.config();
+    const uint32_t num_k_heads = cfg.num_k_heads();
+    const uint32_t head_k_dim = cfg.head_k_dim();
+    const uint32_t S = kvmem_query_span_;
+    const uint64_t q_dst_off =
+        (static_cast<uint64_t>(dn_slot) * S + kvmem_dn_qcount_) *
+        num_k_heads * head_k_dim;
+    auto st = backend_.deltanet_pack_query_device(
+        *g_deltanet_q_, conv_out, q_dst_off, conv_stride, r0,
+        /*dst_row_base=*/0, cnt, num_k_heads, head_k_dim);
+    if (!st.ok) return;
+    // Advance the shared per-slot row count once, after the last DeltaNet slot.
+    const uint32_t L = std::max<uint32_t>(kvmem_dn_num_layers_, 1u);
+    if (dn_slot + 1 == L) {
+        kvmem_dn_qcount_ += cnt;
+        if (kvmem_dn_qcount_ >= S) kvmem_dn_ready_ = true;
+        if (std::getenv("QW3_KVMEM_DELTANET_TRACE")) {
+            std::fprintf(stderr,
+                "[bs-deltanet-qcap] slot=%u r0=%u cnt=%u count=%u/%u ready=%d\n",
+                dn_slot, r0, cnt, kvmem_dn_qcount_, S, kvmem_dn_ready_ ? 1 : 0);
+        }
+    }
+}
+
+// DeltaNet-state retrieval boundary scorer (deltanet_retrieval.md §4-10). Folds
+// the captured per-block state edits E_j = S_j - a_j S_{j-1}, in-block decays a_j,
+// and DeltaNet queries into the per-block score:
+//   s_j = Σ_l w_l · RMSnorm_j[ TopKMean_h( TopKMean_t( d_j·||E_j^T q_t||_2 ) ) ]
+// with d_j = exp(G_M - G_j) (or 1 when deltanet_decay is off). Returns false
+// (caller falls back to mean-k) if the capture isn't live.
+bool QwenExecutor::kvmem_retrieval_score_deltanet() {
+    if (!block_store_ || !kvmem_qc_deltanet_) return false;
+    if (!kvmem_dn_ready_ || kvmem_dn_num_layers_ == 0) return false;
+    if (!g_deltanet_snap_ || !g_deltanet_decaysum_ || !g_deltanet_decay_d_ ||
+        !g_deltanet_q_ || !g_deltanet_r_) {
+        return false;
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t L = kvmem_dn_num_layers_;
+    const uint32_t nb = kvmem_qc_total_blocks_;
+    const uint32_t vh = cfg.num_v_heads();
+    const uint32_t dv = cfg.head_v_dim_ssm();
+    const uint32_t dk = cfg.head_k_dim();
+    const uint32_t nkh = cfg.num_k_heads();
+    const uint32_t M = std::min(kvmem_dn_qcount_, kvmem_query_span_);
+    if (nb == 0 || vh == 0 || M == 0) return false;
+    const KvMemStoreConfig &bc = block_store_->config();
+    const uint32_t topk_q = std::max<uint32_t>(1u, bc.deltanet_topk_q);
+    const uint32_t topk_h = std::max<uint32_t>(1u, bc.deltanet_topk_h);
+
+    const uint64_t small_per_layer = static_cast<uint64_t>(nb) * vh;
+    const uint64_t snap_per_layer =
+        static_cast<uint64_t>(nb) * vh * dv * dk;
+    const uint64_t q_per_layer =
+        static_cast<uint64_t>(kvmem_query_span_) * nkh * dk;
+
+    // Build the post-block decay coefficient d[l,blk,vh] = exp(G_M - G_j) on host
+    // from the accumulated in-block log-decays (G_j = Σ_{u<=j} decaysum[u]). This
+    // is a cheap [L*nb*vh] reduction; done on host for clarity (first version).
+    std::vector<float> decaysum(small_per_layer * L, 0.0f);
+    if (auto cp = backend_.copy_to_host(*g_deltanet_decaysum_, decaysum.data(), 0,
+                                        decaysum.size());
+        !cp.ok) {
+        return false;
+    }
+    std::vector<float> decay_d(small_per_layer * L, 1.0f);
+    if (bc.deltanet_decay) {
+        for (uint32_t l = 0; l < L; ++l) {
+            for (uint32_t h = 0; h < vh; ++h) {
+                // G_j prefix sum over blocks; d_j = exp(G_M - G_j).
+                double G = 0.0;
+                std::vector<double> Gj(nb, 0.0);
+                for (uint32_t j = 0; j < nb; ++j) {
+                    G += decaysum[(static_cast<uint64_t>(l) * nb + j) * vh + h];
+                    Gj[j] = G;
+                }
+                const double G_M = Gj[nb - 1];
+                for (uint32_t j = 0; j < nb; ++j) {
+                    decay_d[(static_cast<uint64_t>(l) * nb + j) * vh + h] =
+                        static_cast<float>(std::exp(G_M - Gj[j]));
+                }
+            }
+        }
+    }
+    if (auto cp = backend_.copy_bytes_from_host(
+            *g_deltanet_decay_d_, /*byte_offset=*/0, decay_d.data(),
+            decay_d.size() * sizeof(float));
+        !cp.ok) {
+        return false;
+    }
+
+    // Per-layer block/head scores r[l,blk,vh] via the GPU scorer.
+    for (uint32_t l = 0; l < L; ++l) {
+        if (auto st = backend_.deltanet_block_score_device(
+                *g_deltanet_r_, *g_deltanet_snap_, *g_deltanet_decaysum_,
+                *g_deltanet_decay_d_, *g_deltanet_q_,
+                /*r_off=*/static_cast<uint64_t>(l) * small_per_layer,
+                /*snap_off=*/static_cast<uint64_t>(l) * snap_per_layer,
+                /*decay_off=*/static_cast<uint64_t>(l) * small_per_layer,
+                /*decay_d_off=*/static_cast<uint64_t>(l) * small_per_layer,
+                /*q_off=*/static_cast<uint64_t>(l) * q_per_layer,
+                nb, nkh, vh, dv, dk, M, topk_q);
+            !st.ok) {
+            return false;
+        }
+    }
+
+    // Aggregate over heads (TopKMean_h), per-layer RMS-normalize over blocks, and
+    // sum across layers with equal weights. Done on host (nb*vh*L floats).
+    std::vector<float> r(small_per_layer * L, 0.0f);
+    if (auto cp = backend_.copy_to_host(*g_deltanet_r_, r.data(), 0, r.size());
+        !cp.ok) {
+        return false;
+    }
+    std::vector<double> layer_block(static_cast<uint64_t>(L) * nb, 0.0);
+    for (uint32_t l = 0; l < L; ++l) {
+        for (uint32_t j = 0; j < nb; ++j) {
+            // TopKMean over heads.
+            std::vector<float> hv(vh);
+            for (uint32_t h = 0; h < vh; ++h) {
+                hv[h] = r[(static_cast<uint64_t>(l) * nb + j) * vh + h];
+            }
+            const uint32_t kh = std::min(topk_h, vh);
+            std::partial_sort(hv.begin(), hv.begin() + kh, hv.end(),
+                              std::greater<float>());
+            double sum = 0.0;
+            for (uint32_t i = 0; i < kh; ++i) sum += hv[i];
+            layer_block[static_cast<uint64_t>(l) * nb + j] =
+                kh > 0 ? sum / kh : 0.0;
+        }
+        // Per-layer RMS normalize across blocks.
+        double ms = 0.0;
+        for (uint32_t j = 0; j < nb; ++j) {
+            const double v = layer_block[static_cast<uint64_t>(l) * nb + j];
+            ms += v * v;
+        }
+        const double rms = std::sqrt(ms / std::max<uint32_t>(nb, 1)) + 1e-6;
+        for (uint32_t j = 0; j < nb; ++j) {
+            layer_block[static_cast<uint64_t>(l) * nb + j] /= rms;
+        }
+    }
+    std::vector<double> best(block_store_->block_count(), 0.0);
+    const double wl = 1.0 / static_cast<double>(L);
+    for (uint32_t j = 0; j < nb && j < best.size(); ++j) {
+        double s = 0.0;
+        for (uint32_t l = 0; l < L; ++l) {
+            s += wl * layer_block[static_cast<uint64_t>(l) * nb + j];
+        }
+        best[j] = s;
+    }
+    block_store_->set_retrieval_scores(best);
+    if (std::getenv("QW3_KVMEM_TRACE") || std::getenv("QW3_KVMEM_DELTANET_TRACE")) {
+        std::fprintf(stderr,
+            "[bs-deltanet] scored %u blocks over L_dn=%u layers, M=%u query "
+            "tokens, decay=%s\n",
+            nb, L, M, bc.deltanet_decay ? "on" : "off");
+    }
+    return true;
 }
 
 // During prefill at bs_score_layer_: de-RoPE the in-span Q rows of the current
@@ -5078,6 +5477,59 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
                 g_query_multi_ready_ ? 1 : 0);
         }
     }
+}
+
+// Clean-query prefill (task #50). After a PASS-A prefill of the question tokens in
+// isolation, g_query_multi_ holds the recency-free de-RoPE'd query. Copy it into a
+// persistent buffer that the reset_state between the two passes will not clear.
+void QwenExecutor::kvmem_stash_clean_query() {
+    if (!g_query_multi_ || g_query_multi_count_ == 0) return;
+    const uint64_t n = g_query_multi_->count;
+    if (!g_query_multi_clean_ || g_query_multi_clean_->count < n) {
+        g_query_multi_clean_ = backend_.tensor_f32(n, "g_query_multi_clean");
+    }
+    require_status(backend_.copy_d2d(*g_query_multi_clean_, *g_query_multi_, 0, n));
+    g_query_multi_clean_count_ = g_query_multi_count_;
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr, "[bs-cleanq] stash rows=%u elems=%llu\n",
+                     g_query_multi_clean_count_,
+                     static_cast<unsigned long long>(n));
+    }
+}
+
+// Restore the stashed clean query into g_query_multi_ and mark it ready, so the
+// (mid-prefill and decode-time) reselects rank blocks by the recency-free query.
+// g_query_multi_ is re-allocated at the same [L,S,...] size in PASS B, so the copy
+// count matches; clamp to the smaller of the two just in case.
+void QwenExecutor::kvmem_restore_clean_query() {
+    if (!g_query_multi_clean_ || g_query_multi_clean_count_ == 0 || !g_query_multi_)
+        return;
+    const uint64_t n =
+        std::min<uint64_t>(g_query_multi_->count, g_query_multi_clean_->count);
+    require_status(backend_.copy_d2d(*g_query_multi_, *g_query_multi_clean_, 0, n));
+    g_query_multi_count_ = g_query_multi_clean_count_;
+    g_query_multi_ready_ = true;
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr, "[bs-cleanq] restore rows=%u\n",
+                     g_query_multi_count_);
+    }
+}
+
+// pick_topk_blocks() unioned with the pinned tail [pin_from, block_count()). When no
+// pin is set (0xffffffff, the default cleared by reset_state) this returns
+// pick_topk_blocks() verbatim -> byte-identical selection. set_selection sorts the
+// ids internally, so the appended pinned ids need not be ordered.
+std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
+    std::vector<uint32_t> sel = block_store_->pick_topk_blocks();
+    if (kvmem_qc_pin_from_block_ == 0xffffffffu) return sel;
+    const uint32_t nb = block_store_->block_count();
+    if (kvmem_qc_pin_from_block_ >= nb) return sel;
+    std::vector<bool> in_sel(nb, false);
+    for (uint32_t id : sel) if (id < nb) in_sel[id] = true;
+    for (uint32_t id = kvmem_qc_pin_from_block_; id < nb; ++id) {
+        if (!in_sel[id]) sel.push_back(id);
+    }
+    return sel;
 }
 
 // During prefill at every normal-attention layer: build the per-layer content
@@ -5358,8 +5810,8 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
     // Per-(layer, question token, head) softmax over pages: score[w] comes back
     // already equal to the accumulated attention mass each page receives, so there
     // is no inv_lm divide and no extra normalization tail (the kernel's softmax IS
-    // the page distribution). Returns false if the kernel rejects nb (shmem page
-    // cap) -> caller falls back to the single last-token scorer.
+    // the page distribution). The CUDA backend preserves this exact computation
+    // above the fused kernel's shared-memory cap via a tiled two-dot path.
     const float sm_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
     // Mask the always-kept sink [0,sink) and recent [nb-recent,nb) bands out of
     // the softmax so their probability mass (dominated by the boundary/adjacency
@@ -5384,10 +5836,7 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
         if (mask_on && budget > 0 && nb > budget) {
             const KvMemStoreConfig &bcfg = block_store_->config();
             uint32_t sink = std::min(bcfg.sink_blocks, nb);
-            uint32_t recent = bcfg.recent_blocks == 0
-                                  ? std::max<uint32_t>(1, budget / 4)
-                                  : bcfg.recent_blocks;
-            recent = std::min(recent, nb);
+            const uint32_t recent = std::min(bcfg.recent_blocks, nb);
             // Only mask if a non-empty retrievable middle survives.
             if (sink + recent < nb) {
                 excl_lo_end = sink;

@@ -467,6 +467,14 @@ bool kvmem_prefix_cache_trace_enabled() {
     return env_flag_enabled("QW3_KVMEM_PREFIX_CACHE_TRACE");
 }
 
+// Clean-query prefill (task #50). When on (and the turn is above budget with a
+// query span), the query embedding used to SELECT context blocks is captured from
+// the question tokens prefilled IN ISOLATION (PASS A), removing the recency bias
+// the mid-prefill window otherwise bakes into it. Default off -> byte-identical.
+bool kvmem_clean_query_enabled() {
+    return env_flag_enabled("QW3_KVMEM_CLEAN_QUERY");
+}
+
 // Cap on total physical KV pages pinned by the prefix cache. 0 = unlimited
 // (bounded only by the pool). Used to trigger LRU eviction.
 uint32_t prefix_cache_max_pages() {
@@ -5703,7 +5711,23 @@ private:
                 ? KvMemRetrievalMethod::PerToken
                 : (options_.kvmem_retrieval_method == "sub-block-mean-k"
                        ? KvMemRetrievalMethod::SubBlockMeanK
-                       : KvMemRetrievalMethod::MeanK);
+                       : (options_.kvmem_retrieval_method == "deltanet"
+                              ? KvMemRetrievalMethod::DeltaNet
+                              : KvMemRetrievalMethod::MeanK));
+        bs_cfg.deltanet_layers =
+            static_cast<uint32_t>(std::max(0, options_.kvmem_deltanet_layers));
+        bs_cfg.deltanet_layer_policy =
+            options_.kvmem_deltanet_layer_policy == "late"
+                ? KvMemDeltaNetLayerPolicy::Late
+                : KvMemDeltaNetLayerPolicy::Even;
+        bs_cfg.deltanet_mem_budget_bytes = static_cast<uint64_t>(
+            std::max(0.0, options_.kvmem_deltanet_mem_budget_gb) *
+            1024.0 * 1024.0 * 1024.0);
+        bs_cfg.deltanet_decay = options_.kvmem_deltanet_decay;
+        bs_cfg.deltanet_topk_q =
+            static_cast<uint32_t>(std::max(1, options_.kvmem_deltanet_topk_q));
+        bs_cfg.deltanet_topk_h =
+            static_cast<uint32_t>(std::max(1, options_.kvmem_deltanet_topk_h));
         bs_cfg.n_subblocks =
             bs_cfg.retrieval_method == KvMemRetrievalMethod::SubBlockMeanK
                 ? static_cast<uint32_t>(std::max(1, options_.kvmem_subblocks))
@@ -7639,6 +7663,37 @@ private:
         const bool qc_active =
             (options.kvmem_query_end > options.kvmem_query_begin) &&
             kvmem_sel_budget > 0 && prompt_tokens.size() > kvmem_sel_budget;
+        // Clean-query prefill (task #50). Engage only above budget with a span, when
+        // the flag is on, and NOT on a warm-reuse / prefix-cache-capture turn (those
+        // own the prefill split) nor the logit-dump path. warm_reuse/warm_capture are
+        // resolved above; boundary capture (a subset of warm_capture) is therefore
+        // excluded too. When off, everything below is byte-identical to today.
+        const bool clean_query =
+            kvmem_on && qc_active && kvmem_clean_query_enabled() &&
+            !kvmem_warm_reuse && !kvmem_warm_capture && dump == nullptr;
+        if (clean_query) {
+            // PASS A: capture the query from the question tokens ALONE. The question
+            // prefills at positions 0..S attending only over itself + sink, so the
+            // de-RoPE'd (content-frame) query the executor captures is free of the
+            // recency window that contaminates it in the normal single-pass prefill.
+            // Stash it (survives reset_state), then reset so PASS B starts cold.
+            const uint32_t qb = options.kvmem_query_begin;
+            const uint32_t qe = options.kvmem_query_end;
+            std::vector<uint32_t> qtoks(
+                prompt_tokens.begin() + static_cast<std::ptrdiff_t>(qb),
+                prompt_tokens.begin() + static_cast<std::ptrdiff_t>(qe));
+            executor_->reset_state();
+            executor_->kvmem_set_query_span(0,
+                                            static_cast<uint32_t>(qtoks.size()),
+                                            static_cast<uint32_t>(qtoks.size()));
+            NativeExecutorReport pa =
+                executor_->forward_n_tokens(qtoks, /*need_logits=*/false);
+            if (!pa.ok) throw std::runtime_error("clean-query PASS A prefill failed");
+            executor_->kvmem_stash_clean_query();
+            executor_->reset_state();
+            log("native kvmem clean-query PASS A: captured isolated query over "
+                + std::to_string(qtoks.size()) + " question tokens");
+        }
         // Query-conditioned KVMem (#82): mark the question token span BEFORE
         // prefill so the executor captures the in-span Q rows during prefill and
         // ranks blocks by the multi-token mean at the boundary. Only active above
@@ -7894,6 +7949,31 @@ private:
                                                     : kvmem_all_gpu_identity();
             // Second segment [split, P): finish the prompt.
             do_prefill_range(split_local, prefill_tokens.size());
+        } else if (clean_query) {
+            // PASS B (task #50). Split the prefill at the question boundary qb.
+            const uint32_t bt = executor_->block_store()
+                                    ? executor_->block_store()->config().block_tokens
+                                    : 256;
+            const uint32_t qb = options.kvmem_query_begin;
+            // [0, qb): context-only prefill. The query span is [qb,qe), so this
+            // builds g_kbar_multi_ for every context block but captures NO query
+            // rows (none lie in [qb,qe) yet) — g_query_multi_ready_ stays false, so
+            // any automatic pool-fill offload here falls back to recency (staging
+            // only; the position-invariant content index is what selection reads).
+            do_prefill_range(0, qb);
+            // Register context blocks, restore the clean query stashed in PASS A,
+            // pin the question + generated tail (survives every reselect), then
+            // reselect: the CLEAN query scores the context and assembles the decode
+            // window (kvmem_active_ / window_query_pos_).
+            executor_->kvmem_register_append(qb);
+            executor_->kvmem_restore_clean_query();
+            executor_->kvmem_set_pin_from_block(qb / bt);
+            executor_->kvmem_reselect();
+            // [qb, P): prefill the question into the active window (attends over the
+            // selected context at bounded window positions). This recaptures a
+            // recency-contaminated query into g_query_multi_ — overwritten by the
+            // restore in the post-prefill block before any decode-time reselect.
+            do_prefill_range(qb, prefill_tokens.size());
         } else {
             do_prefill_range(0, prefill_tokens.size());
         }
@@ -7914,7 +7994,20 @@ private:
         // the first working set (mirrors generate_plain). Under the default
         // all-fit budget this is an identity selection so the window equals the
         // true cache and MTP verify stays byte-identical to plain MTP.
-        if (kvmem_on) {
+        if (kvmem_on && clean_query) {
+            // PASS B tail: the context blocks were registered + selected mid-prefill
+            // (the reselect at qb IS the decode window; the question is its live
+            // tail). Register only the question blocks, then restore the clean query
+            // one more time to overwrite the recency-contaminated capture from the
+            // [qb,P) re-prefill, so decode-time interval reselects keep scoring with
+            // the clean query. No extra reselect — the window is already assembled.
+            const uint32_t qb = options.kvmem_query_begin;
+            executor_->kvmem_register_append(
+                static_cast<uint32_t>(prompt_tokens.size()) - qb);
+            executor_->kvmem_restore_clean_query();
+            kvmem_registered_pos = executor_->position();
+            kvmem_last_reselect_pos = executor_->position();
+        } else if (kvmem_on) {
             // Register the tokens not yet in the store so it lands at prompt.size().
             // Already registered before this point: reuse_m (warm restore) plus the
             // first segment when a block-boundary ckpt_P split ran.

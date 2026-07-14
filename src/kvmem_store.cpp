@@ -110,12 +110,10 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
 
     // Always-keep windows: first `sink_blocks` and last `recent_blocks`.
     const uint32_t sink = std::min(cfg_.sink_blocks, n);
-    uint32_t recent = cfg_.recent_blocks;
-    if (recent == 0) {
-        // Derive a default recent window: a quarter of the budget, at least 1.
-        recent = std::max<uint32_t>(1, budget / 4);
-    }
-    recent = std::min(recent, n);
+    // Zero is literal: do not reserve any suffix blocks.  Earlier versions used
+    // zero as an implicit "auto = budget/4", which made a 200K-token budget
+    // silently pin 50K tokens and was both surprising and hard to control.
+    const uint32_t recent = std::min(cfg_.recent_blocks, n);
 
     std::vector<bool> kept(n, false);
     uint32_t kept_count = 0;

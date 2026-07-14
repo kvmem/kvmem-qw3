@@ -6,6 +6,7 @@
 
 #include "qw3/kvmem_store.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -143,6 +144,31 @@ static void test_topk_budget_sink_recent() {
     CHECK(has0 && has9 && has5 && has6);
     // Returned ascending.
     for (size_t i = 1; i < sel.size(); ++i) CHECK(sel[i] > sel[i - 1]);
+}
+
+static void test_topk_zero_recent_keeps_no_suffix() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 128;
+    cfg.select_budget = 128 * 4;   // budget = 4 blocks
+    cfg.sink_blocks = 1;
+    cfg.recent_blocks = 0;         // literal: no always-kept suffix
+    KvMemStore s(cfg);
+    s.register_append(128 * 10);   // ids 0..9
+
+    std::vector<double> scores(10, 0.0);
+    scores[3] = 80.0;
+    scores[5] = 100.0;
+    scores[6] = 90.0;
+    scores[9] = -100.0;            // tail must not be pinned
+    s.set_retrieval_scores(scores);
+
+    const auto sel = s.pick_topk_blocks();
+    CHECK(sel.size() == 4);
+    CHECK(std::find(sel.begin(), sel.end(), 0) != sel.end());
+    CHECK(std::find(sel.begin(), sel.end(), 3) != sel.end());
+    CHECK(std::find(sel.begin(), sel.end(), 5) != sel.end());
+    CHECK(std::find(sel.begin(), sel.end(), 6) != sel.end());
+    CHECK(std::find(sel.begin(), sel.end(), 9) == sel.end());
 }
 
 static void test_quota_policy_sink_recent_retrieval_profile() {
@@ -305,16 +331,63 @@ static void test_truncate_to() {
     }
 }
 
+// DeltaNet-retrieval config surfaces through KvMemStoreConfig with sane defaults
+// and that retrieval scores (which the DeltaNet scorer writes via
+// set_retrieval_scores) rank blocks exactly like the mean-k path — the store is
+// method-agnostic, so a DeltaNet score set feeds pick_topk identically.
+static void test_deltanet_config_and_scores() {
+    KvMemStoreConfig cfg;
+    // Defaults: DeltaNet retrieval off by default; decay on; topk = 4.
+    CHECK(cfg.retrieval_method == KvMemRetrievalMethod::MeanK);
+    CHECK(cfg.deltanet_decay == true);
+    CHECK(cfg.deltanet_topk_q == 4);
+    CHECK(cfg.deltanet_topk_h == 4);
+    CHECK(cfg.deltanet_layers == 0);
+    CHECK(cfg.deltanet_layer_policy == KvMemDeltaNetLayerPolicy::Even);
+    CHECK(cfg.deltanet_mem_budget_bytes == 0);
+
+    cfg.block_tokens = 128;
+    cfg.select_budget = 128 * 4;   // budget = 4 blocks
+    cfg.sink_blocks = 1;
+    cfg.recent_blocks = 1;
+    cfg.retrieval_method = KvMemRetrievalMethod::DeltaNet;
+    KvMemStore s(cfg);
+    s.register_append(128 * 10);   // 10 blocks, ids 0..9
+
+    // A DeltaNet score vector (what kvmem_retrieval_score_deltanet produces):
+    // blocks 4 and 7 rank highest in the middle.
+    std::vector<double> dn_scores(10, 0.0);
+    dn_scores[4] = 5.0;
+    dn_scores[7] = 4.0;
+    dn_scores[2] = 1.0;
+    s.set_retrieval_scores(dn_scores);
+
+    auto sel = s.pick_topk_blocks();
+    CHECK(sel.size() == 4);
+    bool has0 = false, has9 = false, has4 = false, has7 = false;
+    for (uint32_t id : sel) {
+        if (id == 0) has0 = true;
+        if (id == 9) has9 = true;
+        if (id == 4) has4 = true;
+        if (id == 7) has7 = true;
+    }
+    // Sink (0) + recent (9) kept unconditionally; the two hottest middle (4,7) win.
+    CHECK(has0 && has9 && has4 && has7);
+    for (size_t i = 1; i < sel.size(); ++i) CHECK(sel[i] > sel[i - 1]);
+}
+
 int main() {
     test_register_append();
     test_selection_diff_and_remap();
     test_stage_in_uses_tier_residency();
     test_topk_budget_sink_recent();
+    test_topk_zero_recent_keeps_no_suffix();
     test_quota_policy_sink_recent_retrieval_profile();
     test_topk_all_fit();
     test_topk_empty();
     test_tier_metadata();
     test_truncate_to();
+    test_deltanet_config_and_scores();
 
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);

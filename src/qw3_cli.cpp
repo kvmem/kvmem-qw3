@@ -99,12 +99,24 @@ void usage(std::ostream &os) {
         "  --kvmem-budget N  Max window tokens kept per selection. Default: 131072.\n"
         "  --kvmem-interval N  Decode steps between reselections. Default: 64.\n"
         "  --kvmem-sink-blocks N    Always-kept prefix blocks. Default: 1.\n"
-        "  --kvmem-recent-blocks N  Always-kept suffix blocks (0 = derive). Default: 0.\n"
+        "  --kvmem-recent-blocks N  Always-kept suffix blocks (0 = none). Default: 0.\n"
         "  --kvmem-method M  Block selection signal: retrieval|h2o|recency.\n"
         "                        Default: retrieval.\n"
         "  --kvmem-select-policy M  Selection policy: topk|quota. Default: topk.\n"
-        "  --kvmem-retrieval-method M  Query-conditioned scorer: mean-k|per-token.\n"
-        "                        Default: mean-k (needs --kvmem-query-conditioned).\n"
+        "  --kvmem-retrieval-method M  Query-conditioned scorer: mean-k|per-token|\n"
+        "                        sub-block-mean-k. Default: mean-k\n"
+        "                        (needs --kvmem-query-conditioned).\n"
+#if 0  // Experimental DeltaNet retrieval is archived; see docs/kvmem_deltanet_retrieval_experimental.md.
+        "  --kvmem-deltanet-layers N  DeltaNet-retrieval layer count (0 = derive from\n"
+        "                        --kvmem-deltanet-mem-budget-gb). deltanet method only.\n"
+        "  --kvmem-deltanet-layer-policy P  Layer subset: even|late. Default: even.\n"
+        "  --kvmem-deltanet-mem-budget-gb F  Cap for the per-block DeltaNet state-edit\n"
+        "                        buffer. Default: 32.\n"
+        "  --kvmem-deltanet-decay on|off  Apply the exp(G_M-G_j) post-block decay to\n"
+        "                        each block's state edit. Default: on.\n"
+        "  --kvmem-deltanet-topk-q N  TopKMean over query tokens. Default: 4.\n"
+        "  --kvmem-deltanet-topk-h N  TopKMean over DeltaNet heads. Default: 4.\n"
+#endif
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
         "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
         "                        final user message (the question) instead of recency.\n"
@@ -394,6 +406,30 @@ int main(int argc, char **argv) {
                         "--kvmem-retrieval-method must be "
                         "mean-k|per-token|sub-block-mean-k");
                 }
+#if 0  // Archived experimental CLI; implementation remains for future research.
+            } else if (arg == "--kvmem-deltanet-layers") {
+                engine.kvmem_deltanet_layers = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-deltanet-layer-policy") {
+                engine.kvmem_deltanet_layer_policy = need(arg);
+                if (engine.kvmem_deltanet_layer_policy != "even" &&
+                    engine.kvmem_deltanet_layer_policy != "late") {
+                    throw std::runtime_error(
+                        "--kvmem-deltanet-layer-policy must be even|late");
+                }
+            } else if (arg == "--kvmem-deltanet-mem-budget-gb") {
+                engine.kvmem_deltanet_mem_budget_gb = parse_float(need(arg), arg);
+            } else if (arg == "--kvmem-deltanet-decay") {
+                const std::string v = need(arg);
+                if (v != "on" && v != "off") {
+                    throw std::runtime_error(
+                        "--kvmem-deltanet-decay must be on|off");
+                }
+                engine.kvmem_deltanet_decay = (v == "on");
+            } else if (arg == "--kvmem-deltanet-topk-q") {
+                engine.kvmem_deltanet_topk_q = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-deltanet-topk-h") {
+                engine.kvmem_deltanet_topk_h = parse_int(need(arg), arg);
+#endif
             } else if (arg == "--kvmem-subblocks") {
                 engine.kvmem_subblocks = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-subblock-reduce") {

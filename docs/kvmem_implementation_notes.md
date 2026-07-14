@@ -36,6 +36,12 @@ The most important implementation files are:
 - `include/qw3/device_backend.hpp`: backend abstraction for page-table operations,
   raw byte copies, KVMem kernels, and the reusable pinned host buffer pool.
 
+> **Experimental method status (2026-07-12):** the DeltaNet state-edit retrieval
+> path is retained in the source tree for reproducibility but is not recommended
+> and is no longer exposed through the CLI. Its design, measurements, limitations,
+> and possible future work are recorded in
+> `docs/kvmem_deltanet_retrieval_experimental.md`.
+
 ## 1. Conceptual Model
 
 KVMem treats a long agent/session context as a growing repository of KV blocks.
@@ -133,8 +139,8 @@ The configuration includes:
 - `block_tokens`: block granularity.
 - `select_budget`: maximum selected window tokens.
 - `sink_blocks`: prefix blocks always kept.
-- `recent_blocks`: suffix blocks always kept; zero means derive a recent window
-  from the budget.
+- `recent_blocks`: suffix blocks always kept; zero means no suffix blocks are
+  kept unconditionally.
 - `select_method`: retrieval, H2O/profile, or recency.
 - `select_policy`: top-k or quota.
 - `retrieval_method`: `mean-k` or `per-token`.
@@ -483,10 +489,10 @@ The selector always preserves:
 - sink blocks: a prefix region, usually the first block,
 - recent blocks: a suffix region near the current tail.
 
-The sink region preserves stable prefix information. The recent region prevents
-the model from losing the immediate local continuation. If `recent_blocks` is
-zero, the implementation derives a recent window from the budget, defaulting to
-approximately one quarter of the budget, at least one block.
+The sink region preserves stable prefix information. A configured recent region
+prevents the model from losing the immediate local continuation. A value of zero
+disables unconditional suffix retention; retrieval may still select tail blocks
+normally when their scores rank into the budget.
 
 ### 5.2 Top-K Policy
 
@@ -951,6 +957,63 @@ workspace memory system may also store text and metadata as the source of truth
 for audit, deletion, and compatibility. The current KVMem implementation can be
 described as the KV-native substrate rather than the complete text+KV memory
 product.
+
+### 12.7 LongMemEval-M Diagnosis and Scalable Mean-K Scoring
+
+The original fused mean-k softmax scorer stored every block/sub-block logit in
+one CTA's dynamic shared memory. It therefore accepted at most 8192 pages and
+could not preserve the same scoring semantics on million-token LongMemEval-M
+prompts with 32-token blocks. The fused kernel remains the fast path at or below
+8192 pages. Larger inputs now use an exact tiled two-dot implementation:
+
+1. compute per-tile softmax maxima and sums;
+2. merge them into one global log-sum-exp state per layer/query/head;
+3. recompute logits and accumulate normalized mass into block scores.
+
+The scalable path uses workspace proportional to the number of distributions
+and tiles, rather than the total logits. CUDA parity tests cover the 8192/8193
+boundary, kept-band masking, sub-block reductions, and comparison with both the
+fused kernel and a host reference. The largest observed relative error in those
+tests was approximately `4.8e-7`.
+
+A 2026-07-14 diagnostic used 10 LongMemEval-M samples with a 2M context limit,
+200K selected-token budget, 32-token blocks, 8 sink blocks, query-conditioned
+mean-k, and no sub-block mode. Manual accuracy was 6/10 after enabling the
+scalable scorer. Score dumps for the four remaining failures showed that their
+gold sessions were not wholly absent. Approximate gold-session block coverage
+was 60/194, 30/239, 61/256, and 59/233. Each gold session also contained a
+high-ranked block (best ranks 4--402), but only a scattered fraction of the
+session survived selection.
+
+The observed failure mode is therefore usually not complete retrieval failure.
+It is fragmented evidence retrieval and downstream disambiguation/reasoning:
+
+- a relevant numeric fact can be combined with a similarly worded distractor;
+- old and updated facts can both be present without the newest value winning;
+- event content can survive while its session date/header does not;
+- multiple retrieved events can still be placed in the wrong temporal order.
+
+This diagnosis motivates neighbor expansion and session/header-aware selection
+before simply increasing the token budget. It also motivates an oracle test that
+forces the answer-local blocks to separate retrieval errors from model reasoning
+errors.
+
+The same diagnostic exposed a configuration ambiguity: `recent_blocks == 0`
+previously derived an unconditional suffix of `budget/4`. At a 200K budget and
+32-token blocks this silently pinned 1600 blocks (51,200 tokens). Zero is now
+literal and reserves no suffix blocks. Experiments that require recency must set
+an explicit nonzero value so their budget allocation is reproducible.
+
+### 12.8 Experimental Clean-Query Capture
+
+An opt-in diagnostic path, enabled only by `QW3_KVMEM_CLEAN_QUERY=1`, prefills
+the final question once in isolation and stashes its content-frame query rows.
+The normal context prefill then uses those rows for selection before prefilling
+the question into the selected decode window. This tests whether query vectors
+formed after an already-compressed long prefill are themselves biased toward the
+temporary recent window. The feature is disabled by default and does not engage
+for warm reuse, prefix-cache capture, or logit-dump requests. It remains an
+experimental probe rather than a recommended evaluation default.
 
 ## 13. Suggested Paper Framing
 

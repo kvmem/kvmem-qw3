@@ -350,6 +350,20 @@ bool launch_block_attn_score_exactmass(float *score, const float *q_layer,
                                        float scale, float head_w,
                                        uint32_t group_mean,
                                        cudaStream_t stream);
+// DeltaNet retrieval (retrieval_method==deltanet): pack per-layer query rows.
+bool launch_deltanet_pack_query(float *q_dst, const float *cout,
+                                uint32_t conv_stride, uint32_t r0,
+                                uint32_t dst_row_base, uint32_t cnt,
+                                uint32_t num_k_heads, uint32_t head_k_dim,
+                                cudaStream_t stream);
+// DeltaNet retrieval (retrieval_method==deltanet): per-layer block scorer.
+bool launch_deltanet_block_score(float *r_out, const float *dn_snap,
+                                 const float *decaysum, const float *decay_d,
+                                 const float *q_layer, uint32_t n_blocks,
+                                 uint32_t num_k_heads, uint32_t num_v_heads,
+                                 uint32_t head_v_dim, uint32_t head_k_dim,
+                                 uint32_t M, uint32_t topk_q,
+                                 cudaStream_t stream);
 bool launch_derope_query(float *q_content, const float *q, uint32_t q_stride,
                          uint32_t n_heads, uint32_t head_dim, uint32_t rope_dim,
                          int32_t query_pos, float theta, cudaStream_t stream);
@@ -2379,7 +2393,19 @@ __global__ void deltanet_batch_kernel(float *core,                  // [T, *] st
                                       uint32_t alpha_stride,
                                       uint32_t beta_stride,
                                       uint32_t core_stride,
-                                      uint32_t checkpoint_count) {
+                                      uint32_t checkpoint_count,
+                                      // DeltaNet retrieval block-boundary snapshot
+                                      // (kvmem retrieval_method==deltanet). When
+                                      // dn_snap != nullptr, the state row_val is
+                                      // written into dn_snap at the LAST token of
+                                      // every block (and the final partial block),
+                                      // giving S_j per block. Layout of dn_snap
+                                      // (already offset to this layer's slice):
+                                      // [block, num_v_heads, head_v_dim, head_k_dim].
+                                      float *dn_snap = nullptr,
+                                      uint32_t dn_block_tokens = 0,
+                                      uint32_t dn_base_pos = 0,
+                                      uint32_t dn_n_blocks = 0) {
     const uint32_t vh = blockIdx.x;
     const uint32_t j  = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -2397,6 +2423,9 @@ __global__ void deltanet_batch_kernel(float *core,                  // [T, *] st
     const float ssm_a_v = ssm_a[vh];
     const float dt_bias_v = dt_bias[vh];
     const float inv_hvd = rsqrtf(static_cast<float>(head_v_dim));
+    const bool dn_capture = (dn_snap != nullptr && dn_block_tokens > 0);
+    const uint64_t dn_row_stride =
+        static_cast<uint64_t>(num_v_heads) * head_v_dim * head_k_dim;
 
     float row_val = row[tid];
 
@@ -2437,9 +2466,183 @@ __global__ void deltanet_batch_kernel(float *core,                  // [T, *] st
                               (static_cast<uint64_t>(vh) * head_v_dim + j) * head_k_dim + tid] =
                 row_val;
         }
+        if (dn_capture) {
+            const uint32_t gpos = dn_base_pos + t;
+            const bool block_end = ((gpos + 1) % dn_block_tokens == 0) || (t + 1 == T);
+            if (block_end) {
+                const uint32_t blk = gpos / dn_block_tokens;
+                if (blk < dn_n_blocks) {
+                    dn_snap[static_cast<uint64_t>(blk) * dn_row_stride +
+                            (static_cast<uint64_t>(vh) * head_v_dim + j) * head_k_dim + tid] =
+                        row_val;
+                }
+            }
+        }
         __syncthreads();
     }
     row[tid] = row_val;
+}
+
+// DeltaNet retrieval: per-block cumulative in-block log-decay scan
+// (kvmem retrieval_method==deltanet). g_raw[t,vh] = softplus(alpha+dt_bias)*ssm_a
+// (identical to the delta kernel's decay), summed over the tokens of each block
+// into decaysum[blk, vh]. Accumulates (+=) so multiple prefill chunks fold into
+// the same per-block sum. alpha_batch is the RAW alpha [T, alpha_stride]; the
+// caller runs this on the qw3 (non-ported) path where alpha is not overwritten.
+// grid = (dn_n_blocks_chunk, num_v_heads); one thread per (block, vh).
+__global__ void deltanet_decay_scan_kernel(const float *alpha_batch,
+                                           const float *dt_bias,
+                                           const float *ssm_a,
+                                           float *decaysum,        // [blocks, num_v_heads] (offset to layer)
+                                           uint32_t T,
+                                           uint32_t num_v_heads,
+                                           uint32_t alpha_stride,
+                                           uint32_t block_tokens,
+                                           uint32_t base_pos,
+                                           uint32_t n_blocks) {
+    const uint32_t blk_local = blockIdx.x;   // chunk-local block enumerated below
+    const uint32_t vh = blockIdx.y * blockDim.x + threadIdx.x;
+    if (vh >= num_v_heads) return;
+    // First global block covered by this chunk (base_pos assumed block-aligned on
+    // a fresh prefill; a misaligned suffix folds its partial leading block here).
+    const uint32_t first_blk = base_pos / block_tokens;
+    const uint32_t blk = first_blk + blk_local;
+    if (blk >= n_blocks) return;
+    const uint32_t blk_lo = blk * block_tokens;
+    const uint32_t blk_hi = blk_lo + block_tokens;
+    const float dtb = dt_bias[vh];
+    const float a = ssm_a[vh];
+    float sum = 0.0f;
+    for (uint32_t gpos = blk_lo; gpos < blk_hi; ++gpos) {
+        if (gpos < base_pos) continue;               // token not in this chunk
+        const uint32_t t = gpos - base_pos;
+        if (t >= T) break;
+        const float a_v = alpha_batch[t * alpha_stride + vh];
+        sum += log1pf(expf(a_v + dtb)) * a;
+    }
+    decaysum[static_cast<uint64_t>(blk) * num_v_heads + vh] += sum;
+}
+
+// DeltaNet retrieval: pack the in-span DeltaNet query rows for one layer.
+// The conv output `cout` holds the L2-normalized DeltaNet Q in the first
+// num_k_heads*head_k_dim of each row (row stride conv_stride). For the `cnt`
+// in-span question tokens starting at chunk-local row r0, copy [num_k_heads,
+// head_k_dim] into q_dst at (dst_row_base + r) row. grid = (cnt, num_k_heads),
+// block = head_k_dim threads. No RoPE (DeltaNet queries are not rotated).
+__global__ void deltanet_pack_query_kernel(float *q_dst,
+                                           const float *cout,
+                                           uint32_t conv_stride,
+                                           uint32_t r0,
+                                           uint32_t dst_row_base,
+                                           uint32_t cnt,
+                                           uint32_t num_k_heads,
+                                           uint32_t head_k_dim) {
+    const uint32_t r = blockIdx.x;
+    const uint32_t kh = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (r >= cnt || kh >= num_k_heads || d >= head_k_dim) return;
+    const float v = cout[static_cast<uint64_t>(r0 + r) * conv_stride +
+                         kh * head_k_dim + d];
+    q_dst[((static_cast<uint64_t>(dst_row_base + r) * num_k_heads) + kh) * head_k_dim + d] = v;
+}
+
+// DeltaNet retrieval: per (block, v-head) block score for one layer.
+//   r[blk,vh] = TopKMean_t( d[blk,vh] * || (S_j - a_j S_{j-1})^T q_t ||_2 )
+// S_j = dn_snap[blk], S_{j-1} = dn_snap[blk-1] (0 for blk 0), a_j = exp(decaysum
+// [blk,vh]); d[blk,vh] is the precomputed post-block decay exp(G_M - G_j) (or 1).
+// q rows are the L2-normalized DeltaNet queries [M, num_k_heads, head_k_dim] for
+// this layer; v-head vh reads k-head vh%num_k_heads. grid = (n_blocks, num_v_heads),
+// block = head_k_dim threads. Dynamic shmem: q_all[M*head_k_dim] + norm2[M].
+__global__ void deltanet_block_score_kernel(float *r_out,           // [n_blocks, num_v_heads] (offset to layer)
+                                            const float *dn_snap,   // [blocks, v_heads, d_v, d_k] (offset to layer)
+                                            const float *decaysum,  // [blocks, v_heads] (offset to layer)
+                                            const float *decay_d,   // [blocks, v_heads] (offset to layer)
+                                            const float *q_layer,   // [M, num_k_heads, d_k] (offset to layer)
+                                            uint32_t n_blocks,
+                                            uint32_t num_k_heads,
+                                            uint32_t num_v_heads,
+                                            uint32_t head_v_dim,
+                                            uint32_t head_k_dim,
+                                            uint32_t M,
+                                            uint32_t topk_q) {
+    const uint32_t blk = blockIdx.x;
+    const uint32_t vh = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (blk >= n_blocks || vh >= num_v_heads || tid >= head_k_dim) return;
+
+    extern __shared__ float smem[];
+    float *q_all = smem;                 // [M * head_k_dim]
+    float *norm2 = smem + static_cast<uint64_t>(M) * head_k_dim;  // [M]
+    __shared__ float scratch[128];
+
+    const uint32_t kh = vh % num_k_heads;
+    // Load this v-head's k-head query rows into shmem (de-RoPE'd + L2-normed).
+    for (uint32_t t = 0; t < M; ++t) {
+        q_all[t * head_k_dim + tid] =
+            q_layer[(static_cast<uint64_t>(t) * num_k_heads + kh) * head_k_dim + tid];
+        if (tid == 0) norm2[t] = 0.0f;
+    }
+    __syncthreads();
+
+    const float a_j = expf(decaysum[static_cast<uint64_t>(blk) * num_v_heads + vh]);
+    const uint64_t dn_row_stride =
+        static_cast<uint64_t>(num_v_heads) * head_v_dim * head_k_dim;
+    const float *S_j = dn_snap + static_cast<uint64_t>(blk) * dn_row_stride +
+                       static_cast<uint64_t>(vh) * head_v_dim * head_k_dim;
+    const float *S_prev = (blk > 0)
+        ? dn_snap + static_cast<uint64_t>(blk - 1) * dn_row_stride +
+              static_cast<uint64_t>(vh) * head_v_dim * head_k_dim
+        : nullptr;
+
+    // Reduction start: the next power of two >= head_k_dim, so the tree reduction
+    // is correct for any head_k_dim (production is 128; smaller dims — tests — are
+    // handled without reading past blockDim into uninitialized shared memory).
+    uint32_t red0 = 1;
+    while (red0 < head_k_dim) red0 <<= 1;
+    red0 >>= 1;
+
+    // Accumulate ||E_j^T q_t||^2 over the d_v rows of E_j = S_j - a_j S_{j-1}.
+    for (uint32_t jrow = 0; jrow < head_v_dim; ++jrow) {
+        const float sj = S_j[jrow * head_k_dim + tid];
+        const float sp = S_prev ? S_prev[jrow * head_k_dim + tid] : 0.0f;
+        const float e = sj - a_j * sp;
+        for (uint32_t t = 0; t < M; ++t) {
+            scratch[tid] = e * q_all[t * head_k_dim + tid];
+            __syncthreads();
+            for (uint32_t s = red0; s > 0; s >>= 1) {
+                if (tid < s && tid + s < head_k_dim) scratch[tid] += scratch[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) norm2[t] += scratch[0] * scratch[0];
+            __syncthreads();
+        }
+    }
+
+    if (tid == 0) {
+        const float d = decay_d[static_cast<uint64_t>(blk) * num_v_heads + vh];
+        // r_t = d * ||E_j^T q_t||. TopKMean over the top-`topk_q` tokens.
+        float best[8];
+        const uint32_t kq = topk_q < 8 ? (topk_q == 0 ? 1u : topk_q) : 8u;
+        for (uint32_t i = 0; i < kq; ++i) best[i] = -1.0f;
+        for (uint32_t t = 0; t < M; ++t) {
+            const float r_t = d * sqrtf(norm2[t]);
+            // Insert into the descending top-kq list.
+            for (uint32_t i = 0; i < kq; ++i) {
+                if (r_t > best[i]) {
+                    for (uint32_t s = kq - 1; s > i; --s) best[s] = best[s - 1];
+                    best[i] = r_t;
+                    break;
+                }
+            }
+        }
+        float sum = 0.0f;
+        uint32_t cnt = 0;
+        for (uint32_t i = 0; i < kq && i < M; ++i) {
+            if (best[i] >= 0.0f) { sum += best[i]; ++cnt; }
+        }
+        r_out[static_cast<uint64_t>(blk) * num_v_heads + vh] =
+            cnt > 0 ? sum / static_cast<float>(cnt) : 0.0f;
+    }
 }
 
 __global__ void deltanet_independent_batch_kernel(
@@ -3047,6 +3250,219 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
         }
         __syncthreads();  // s_logit reused by the next head
     }
+}
+
+// Scalable exact softmax-over-pages path for n_blocks*n_subblocks > the fused
+// kernel's shared-memory cap.  Softmax is global per (layer, token, query-head),
+// so CTAs first produce tile-local log-sum-exp pairs, a second kernel merges the
+// pairs, and a final kernel recomputes the dots and writes one score per block.
+// Recomputing avoids materialising O(L*M*H*pages) logits in global memory.
+//
+// The final kernel assigns one thread to one output block.  It therefore needs
+// no atomicAdd even though it accumulates every (layer,token,head) distribution.
+// This is deliberately a correctness-first baseline; the old one-CTA fused
+// kernel remains the fast path for small page counts.
+constexpr uint32_t kSoftmaxPagesTile = 512;
+constexpr uint32_t kSoftmaxPagesThreads = 128;
+
+__global__ void block_attn_softmax_pages_partial_lse_kernel(
+        float *partial_max,
+        float *partial_sum,
+        const float *q_multi,
+        const float *kbar_multi,
+        uint32_t n_distributions,
+        uint32_t n_tiles,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t n_blocks,
+        uint32_t kbar_layer_stride,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin,
+        uint32_t n_subblocks) {
+    const uint64_t job = blockIdx.x;
+    const uint32_t dist = static_cast<uint32_t>(job / n_tiles);
+    const uint32_t tile = static_cast<uint32_t>(job -
+                                                static_cast<uint64_t>(dist) * n_tiles);
+    if (dist >= n_distributions) return;
+
+    const uint32_t qh = dist % n_heads;
+    const uint32_t lt = dist / n_heads;
+    const uint32_t t = lt % n_tokens;
+    const uint32_t l = lt / n_tokens;
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint32_t kvh = qh / group;
+    const uint32_t total = n_blocks * n_subblocks;
+    const uint32_t p0 = tile * kSoftmaxPagesTile;
+    const uint32_t p1 = min(p0 + kSoftmaxPagesTile, total);
+    const uint32_t tid = threadIdx.x;
+
+    __shared__ float logits[kSoftmaxPagesTile];
+    __shared__ float reduce[kSoftmaxPagesThreads];
+
+    const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
+    const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
+    const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+    const float *kbar_l =
+        kbar_multi +
+        static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks *
+            n_kv_heads * head_dim;
+
+    float local_max = -INFINITY;
+    for (uint32_t p = p0 + tid; p < p1; p += blockDim.x) {
+        const uint32_t w = p / n_subblocks;
+        float logit = -INFINITY;
+        if (w >= excl_lo_end && w < excl_hi_begin) {
+            const float *kbar_row =
+                kbar_l + (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; ++d) dot += qr[d] * kbar_row[d];
+            logit = dot * scale;
+        }
+        logits[p - p0] = logit;
+        local_max = fmaxf(local_max, logit);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] = fmaxf(reduce[tid], reduce[tid + s]);
+        __syncthreads();
+    }
+    const float tile_max = reduce[0];
+
+    float local_sum = 0.0f;
+    if (isfinite(tile_max)) {
+        for (uint32_t p = p0 + tid; p < p1; p += blockDim.x) {
+            local_sum += __expf(logits[p - p0] - tile_max);
+        }
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial_max[job] = tile_max;
+        partial_sum[job] = reduce[0];
+    }
+}
+
+__global__ void block_attn_softmax_pages_merge_lse_kernel(
+        float *global_max,
+        float *global_sum,
+        const float *partial_max,
+        const float *partial_sum,
+        uint32_t n_distributions,
+        uint32_t n_tiles) {
+    const uint32_t dist = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (dist >= n_distributions) return;
+    __shared__ float reduce[kSoftmaxPagesThreads];
+
+    float local_max = -INFINITY;
+    const uint64_t base = static_cast<uint64_t>(dist) * n_tiles;
+    for (uint32_t tile = tid; tile < n_tiles; tile += blockDim.x) {
+        local_max = fmaxf(local_max, partial_max[base + tile]);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] = fmaxf(reduce[tid], reduce[tid + s]);
+        __syncthreads();
+    }
+    const float m = reduce[0];
+
+    float local_sum = 0.0f;
+    if (isfinite(m)) {
+        for (uint32_t tile = tid; tile < n_tiles; tile += blockDim.x) {
+            const float tm = partial_max[base + tile];
+            if (isfinite(tm)) {
+                local_sum += partial_sum[base + tile] * __expf(tm - m);
+            }
+        }
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        global_max[dist] = m;
+        global_sum[dist] = reduce[0];
+    }
+}
+
+__global__ void block_attn_softmax_pages_recompute_kernel(
+        float *score,
+        const float *q_multi,
+        const float *kbar_multi,
+        const float *global_max,
+        const float *global_sum,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t n_blocks,
+        uint32_t kbar_layer_stride,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin,
+        uint32_t n_subblocks,
+        uint32_t reduce_max) {
+    const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_blocks) return;
+    if (w < excl_lo_end || w >= excl_hi_begin) {
+        score[w] = 0.0f;
+        return;
+    }
+
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
+    float accum = 0.0f;
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        const float *q_l =
+            q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
+        const float *kbar_l =
+            kbar_multi +
+            static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks *
+                n_kv_heads * head_dim;
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            for (uint32_t qh = 0; qh < n_heads; ++qh) {
+                const uint32_t dist = (l * n_tokens + t) * n_heads + qh;
+                const float denom = global_sum[dist];
+                if (!(denom > 0.0f)) continue;
+                const float m = global_max[dist];
+                const uint32_t kvh = qh / group;
+                const float *qr =
+                    q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+                float block_mass = 0.0f;
+                for (uint32_t sb = 0; sb < n_subblocks; ++sb) {
+                    const uint32_t p = w * n_subblocks + sb;
+                    const float *kbar_row =
+                        kbar_l +
+                        (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
+                    float dot = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; ++d)
+                        dot += qr[d] * kbar_row[d];
+                    const float mass = __expf(dot * scale - m) / denom;
+                    if (reduce_max && n_subblocks > 1)
+                        block_mass = fmaxf(block_mass, mass);
+                    else
+                        block_mass += mass;
+                }
+                accum += block_mass;
+            }
+        }
+    }
+    score[w] = accum / (static_cast<float>(n_layers) *
+                        static_cast<float>(n_heads));
 }
 
 __device__ __forceinline__ uint32_t kvmem_window_bucket_for_pos(
@@ -5580,7 +5996,14 @@ public:
                                   float eps,
                                   DeviceTensor *state_checkpoints,
                                   DeviceTensor *conv_state_checkpoints,
-                                  uint32_t checkpoint_count) override {
+                                  uint32_t checkpoint_count,
+                                  DeviceTensor *dn_state_snap,
+                                  DeviceTensor *dn_decaysum,
+                                  uint64_t dn_layer_snap_off,
+                                  uint64_t dn_layer_decay_off,
+                                  uint32_t dn_block_tokens,
+                                  uint32_t dn_base_pos,
+                                  uint32_t dn_n_blocks) override {
         if (batch == 0) return {};
         auto &c = as_tensor(core);
         auto &s = as_tensor(state);
@@ -5599,6 +6022,14 @@ public:
         const uint32_t effective_checkpoint_count = std::min<uint32_t>(checkpoint_count, batch);
         const bool want_checkpoint =
             state_ckpt != nullptr && conv_ckpt != nullptr && effective_checkpoint_count > 0;
+        // DeltaNet retrieval capture: when requested, force the qw3 delta kernel
+        // (which emits per-block state snapshots + accumulates in-block log-decay)
+        // regardless of QW3_RECURRENT_KERNEL. The ported warp kernel does not
+        // support the snapshot side-channel.
+        auto *dn_snap = dn_state_snap ? &as_tensor(*dn_state_snap) : nullptr;
+        auto *dn_decay = dn_decaysum ? &as_tensor(*dn_decaysum) : nullptr;
+        const bool dn_capture =
+            dn_snap != nullptr && dn_decay != nullptr && dn_block_tokens > 0;
 
         // 1. Conv (batched): one kernel call processes T sequential conv
         //    steps per channel, with the small state window kept in registers.
@@ -5669,7 +6100,7 @@ public:
         //    outputs; the ported version uses register-resident state and
         //    warp-level reductions, removing __syncthreads() from the inner
         //    loop.
-        if (recurrent_kernel_choice() == RecurrentKernel::Ported) {
+        if (recurrent_kernel_choice() == RecurrentKernel::Ported && !dn_capture) {
             // Ported kernel requires head_k_dim == head_v_dim (square state).
             if (head_k_dim != head_v_dim) {
                 return {false, "recurrent_batch: ported kernel requires head_k_dim == head_v_dim"};
@@ -5707,7 +6138,10 @@ public:
             if (auto st = launch_status("ported::gated_delta_net_kernel"); !st.ok) return st;
         } else {
             // Original qw3 kernel: one block per (vh, head_v_dim) iterates T
-            // timesteps; reductions via __syncthreads() in shared memory.
+            // timesteps; reductions via __syncthreads() in shared memory. When
+            // dn_capture is on, this kernel also emits per-block state snapshots
+            // (S_j at each block boundary) into dn_snap, and a companion decay-scan
+            // kernel accumulates each block's in-block log-decay into dn_decay.
             dim3 dn_grid(num_v_heads, head_v_dim);
             deltanet_batch_kernel<<<dn_grid, 128, 0, exec_stream_>>>(c.ptr,
                                                     s.ptr,
@@ -5726,8 +6160,33 @@ public:
                                                     alpha_stride,
                                                     beta_stride,
                                                     core_stride,
-                                                    effective_checkpoint_count);
+                                                    effective_checkpoint_count,
+                                                    dn_capture ? dn_snap->ptr + dn_layer_snap_off : nullptr,
+                                                    dn_capture ? dn_block_tokens : 0u,
+                                                    dn_base_pos,
+                                                    dn_n_blocks);
             if (auto st = launch_status("deltanet_batch_kernel"); !st.ok) return st;
+            if (dn_capture) {
+                // Accumulate this chunk's in-block log-decay per (block, vh). The
+                // qw3 delta kernel reads RAW alpha (a.ptr), so alpha is intact here.
+                const uint32_t first_blk = dn_base_pos / dn_block_tokens;
+                const uint32_t last_gpos = dn_base_pos + batch;   // exclusive
+                const uint32_t last_blk = (last_gpos + dn_block_tokens - 1) / dn_block_tokens;
+                const uint32_t n_blk_chunk =
+                    (last_blk > first_blk) ? (last_blk - first_blk) : 0u;
+                if (n_blk_chunk > 0) {
+                    const uint32_t vh_threads = 64;
+                    dim3 ds_grid(n_blk_chunk, (num_v_heads + vh_threads - 1) / vh_threads);
+                    deltanet_decay_scan_kernel<<<ds_grid, vh_threads, 0, exec_stream_>>>(
+                        a.ptr,
+                        static_cast<const float *>(dt.ptr),
+                        static_cast<const float *>(aw.ptr),
+                        dn_decay->ptr + dn_layer_decay_off,
+                        batch, num_v_heads, alpha_stride, dn_block_tokens,
+                        dn_base_pos, dn_n_blocks);
+                    if (auto st = launch_status("deltanet_decay_scan_kernel"); !st.ok) return st;
+                }
+            }
         }
 
         // 4. RMSnorm + gate, batched over T.
@@ -6627,8 +7086,6 @@ public:
                 sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
                 n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
                 excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, exec_stream_)) {
-            // n_blocks exceeded the shmem page cap (or a launch error); the
-            // executor falls back to the sum-of-ReLU multilayer path.
             return {false, "block_attn_score_softmax_pages launch failed"};
         }
         return launch_status("cuda block_attn_score_softmax_pages_device");
@@ -6828,6 +7285,60 @@ public:
             return {false, "block_attn_score_exactmass launch failed"};
         }
         return launch_status("cuda block_attn_score_exactmass_device");
+    }
+
+    DeviceStatus deltanet_pack_query_device(DeviceTensor &q_dst,
+                                            const DeviceTensor &conv_out,
+                                            uint64_t q_dst_off,
+                                            uint32_t conv_stride,
+                                            uint32_t r0,
+                                            uint32_t dst_row_base,
+                                            uint32_t cnt,
+                                            uint32_t num_k_heads,
+                                            uint32_t head_k_dim) override {
+        if (cnt == 0 || num_k_heads == 0 || head_k_dim == 0) return {};
+        auto &qd = as_tensor(q_dst);
+        const auto &co = as_tensor(conv_out);
+        if (!ported::launch_deltanet_pack_query(
+                qd.ptr + q_dst_off, co.ptr, conv_stride, r0, dst_row_base, cnt,
+                num_k_heads, head_k_dim, exec_stream_)) {
+            return {false, "deltanet_pack_query launch failed"};
+        }
+        return launch_status("cuda deltanet_pack_query_device");
+    }
+
+    DeviceStatus deltanet_block_score_device(DeviceTensor &r_out,
+                                             const DeviceTensor &dn_snap,
+                                             const DeviceTensor &decaysum,
+                                             const DeviceTensor &decay_d,
+                                             const DeviceTensor &q_layer,
+                                             uint64_t r_off,
+                                             uint64_t snap_off,
+                                             uint64_t decay_off,
+                                             uint64_t decay_d_off,
+                                             uint64_t q_off,
+                                             uint32_t n_blocks,
+                                             uint32_t num_k_heads,
+                                             uint32_t num_v_heads,
+                                             uint32_t head_v_dim,
+                                             uint32_t head_k_dim,
+                                             uint32_t M,
+                                             uint32_t topk_q) override {
+        if (n_blocks == 0 || num_v_heads == 0 || head_k_dim == 0 || M == 0) {
+            return {};
+        }
+        auto &r = as_tensor(r_out);
+        const auto &sn = as_tensor(dn_snap);
+        const auto &ds = as_tensor(decaysum);
+        const auto &dd = as_tensor(decay_d);
+        const auto &ql = as_tensor(q_layer);
+        if (!ported::launch_deltanet_block_score(
+                r.ptr + r_off, sn.ptr + snap_off, ds.ptr + decay_off,
+                dd.ptr + decay_d_off, ql.ptr + q_off, n_blocks, num_k_heads,
+                num_v_heads, head_v_dim, head_k_dim, M, topk_q, exec_stream_)) {
+            return {false, "deltanet_block_score launch failed"};
+        }
+        return launch_status("cuda deltanet_block_score_device");
     }
 
     DeviceStatus derope_query_device(DeviceTensor &q_content,
@@ -9487,23 +9998,96 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
         return true;
     }
     const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
-    // Sub-block logits live in dynamic shared memory; cap the PRODUCT
-    // n_blocks*n_subblocks so the request fits a conservative 48 KB shmem budget.
-    // Caller falls back to the sum-of-ReLU path when exceeded.
+    // Sub-block logits live in dynamic shared memory in the original fast path;
+    // cap the PRODUCT so it fits a conservative 48 KB budget. Larger requests
+    // use an exact tiled two-dot path below instead of changing scorer semantics.
     constexpr uint32_t kMaxPages = 8192;
-    if (static_cast<uint64_t>(n_blocks) * ns > kMaxPages) return false;
+    const uint64_t total64 = static_cast<uint64_t>(n_blocks) * ns;
+    if (total64 > UINT32_MAX) return false;
+    const bool force_tiled = []() {
+        const char *v = std::getenv("QW3_KVMEM_SOFTMAX_PAGES_FORCE_TILED");
+        return v && *v && std::strcmp(v, "0") != 0 &&
+               std::strcmp(v, "off") != 0 && std::strcmp(v, "false") != 0;
+    }();
     // score[] is accumulated across the grid -> must start at zero. It stays
     // per-block (n_blocks entries); sub-block masses are summed in by the kernel.
     cudaMemsetAsync(score, 0, static_cast<size_t>(n_blocks) * sizeof(float),
                     stream);
     constexpr uint32_t threads = 128;
-    const uint32_t grid = n_layers * n_tokens;
-    const size_t shmem = static_cast<size_t>(n_blocks) * ns * sizeof(float);
-    block_attn_score_softmax_pages_kernel<<<grid, threads, shmem, stream>>>(
-        score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
-        n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
-        excl_lo_end, excl_hi_begin, ns, reduce_max);
-    return cudaGetLastError() == cudaSuccess;
+    if (total64 <= kMaxPages && !force_tiled) {
+        const uint32_t grid = n_layers * n_tokens;
+        const size_t shmem = static_cast<size_t>(total64) * sizeof(float);
+        block_attn_score_softmax_pages_kernel<<<grid, threads, shmem, stream>>>(
+            score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
+            n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+            excl_lo_end, excl_hi_begin, ns, reduce_max);
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(stderr,
+                         "[bs-mean-softmax] scorer_path=fused pages=%llu blocks=%u\n",
+                         static_cast<unsigned long long>(total64), n_blocks);
+        }
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    const uint32_t total = static_cast<uint32_t>(total64);
+    const uint32_t n_tiles =
+        (total + kSoftmaxPagesTile - 1) / kSoftmaxPagesTile;
+    const uint64_t n_distributions64 =
+        static_cast<uint64_t>(n_layers) * n_tokens * n_heads;
+    const uint64_t n_jobs = n_distributions64 * n_tiles;
+    if (n_distributions64 > UINT32_MAX || n_jobs > 0x7fffffffu) return false;
+    const uint32_t n_distributions = static_cast<uint32_t>(n_distributions64);
+
+    // [partial max, partial sum] per (distribution,tile), followed by the merged
+    // [global max, global sum] per distribution. cudaMallocAsync keeps allocation
+    // stream ordered and lets the CUDA pool reuse this ~few-MiB workspace.
+    const uint64_t workspace_floats = 2 * n_jobs + 2 * n_distributions64;
+    if (workspace_floats > SIZE_MAX / sizeof(float)) return false;
+    float *workspace = nullptr;
+    if (cudaMallocAsync(reinterpret_cast<void **>(&workspace),
+                        static_cast<size_t>(workspace_floats) * sizeof(float),
+                        stream) != cudaSuccess) {
+        return false;
+    }
+    float *partial_max = workspace;
+    float *partial_sum = partial_max + n_jobs;
+    float *global_max = partial_sum + n_jobs;
+    float *global_sum = global_max + n_distributions64;
+
+    block_attn_softmax_pages_partial_lse_kernel<<<
+        static_cast<uint32_t>(n_jobs), kSoftmaxPagesThreads, 0, stream>>>(
+        partial_max, partial_sum, q_multi, kbar_multi, n_distributions,
+        n_tiles, n_tokens, q_layer_stride, n_blocks, kbar_layer_stride,
+        n_heads, n_kv_heads, head_dim, scale, excl_lo_end, excl_hi_begin, ns);
+    cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess) {
+        block_attn_softmax_pages_merge_lse_kernel<<<
+            n_distributions, kSoftmaxPagesThreads, 0, stream>>>(
+            global_max, global_sum, partial_max, partial_sum,
+            n_distributions, n_tiles);
+        err = cudaGetLastError();
+    }
+    if (err == cudaSuccess) {
+        const uint32_t score_grid =
+            (n_blocks + kSoftmaxPagesThreads - 1) / kSoftmaxPagesThreads;
+        block_attn_softmax_pages_recompute_kernel<<<
+            score_grid, kSoftmaxPagesThreads, 0, stream>>>(
+            score, q_multi, kbar_multi, global_max, global_sum, n_layers,
+            n_tokens, q_layer_stride, n_blocks, kbar_layer_stride, n_heads,
+            n_kv_heads, head_dim, scale, excl_lo_end, excl_hi_begin, ns,
+            reduce_max);
+        err = cudaGetLastError();
+    }
+    const cudaError_t free_err = cudaFreeAsync(workspace, stream);
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[bs-mean-softmax] scorer_path=tiled-two-dot pages=%u "
+                     "blocks=%u distributions=%u tiles=%u workspace=%.2f MiB\n",
+                     total, n_blocks, n_distributions, n_tiles,
+                     static_cast<double>(workspace_floats * sizeof(float)) /
+                         (1024.0 * 1024.0));
+    }
+    return err == cudaSuccess && free_err == cudaSuccess;
 }
 
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
@@ -9638,6 +10222,35 @@ bool launch_derope_query_multi(float *q_multi, const float *q,
     derope_query_multi_kernel<<<grid, head_dim, 0, stream>>>(
         q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim, rope_dim,
         start_pos, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_deltanet_block_score(float *r_out, const float *dn_snap,
+                                 const float *decaysum, const float *decay_d,
+                                 const float *q_layer, uint32_t n_blocks,
+                                 uint32_t num_k_heads, uint32_t num_v_heads,
+                                 uint32_t head_v_dim, uint32_t head_k_dim,
+                                 uint32_t M, uint32_t topk_q,
+                                 cudaStream_t stream) {
+    if (n_blocks == 0 || num_v_heads == 0 || head_k_dim == 0 || M == 0) return true;
+    const dim3 grid(n_blocks, num_v_heads);
+    const size_t shmem =
+        (static_cast<size_t>(M) * head_k_dim + M) * sizeof(float);
+    deltanet_block_score_kernel<<<grid, head_k_dim, shmem, stream>>>(
+        r_out, dn_snap, decaysum, decay_d, q_layer, n_blocks, num_k_heads,
+        num_v_heads, head_v_dim, head_k_dim, M, topk_q);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_deltanet_pack_query(float *q_dst, const float *cout,
+                                uint32_t conv_stride, uint32_t r0,
+                                uint32_t dst_row_base, uint32_t cnt,
+                                uint32_t num_k_heads, uint32_t head_k_dim,
+                                cudaStream_t stream) {
+    if (cnt == 0 || num_k_heads == 0 || head_k_dim == 0) return true;
+    const dim3 grid(cnt, num_k_heads);
+    deltanet_pack_query_kernel<<<grid, head_k_dim, 0, stream>>>(
+        q_dst, cout, conv_stride, r0, dst_row_base, cnt, num_k_heads, head_k_dim);
     return cudaGetLastError() == cudaSuccess;
 }
 } // namespace ported

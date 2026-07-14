@@ -58,17 +58,26 @@ struct EngineOptions {
     int kvmem_gen_budget = 32768; // GPU pool reserve for generated tokens; also caps max_tokens
     int kvmem_interval = 64;      // decode steps between reselections
     int kvmem_sink_blocks = 1;           // always-kept prefix blocks
-    int kvmem_recent_blocks = 0;         // always-kept suffix blocks (0 = derive)
+    int kvmem_recent_blocks = 0;         // always-kept suffix blocks (0 = none)
     // Selection signal that ranks the middle blocks each reselection:
     // "retrieval" (default, global content similarity, can resurrect dropped
     // blocks), "h2o" (window-local cumulative attention heat, retention only),
     // or "recency" (sink + recent windows only, no learned signal).
     std::string kvmem_method = "retrieval";
     std::string kvmem_select_policy = "topk"; // topk or quota
-    std::string kvmem_retrieval_method = "mean-k"; // mean-k, per-token, or sub-block-mean-k
+    std::string kvmem_retrieval_method = "mean-k"; // supported CLI: mean-k, per-token, sub-block-mean-k
     int kvmem_subblocks = 4;      // sub-block means per block (sub-block-mean-k only)
     std::string kvmem_subblock_reduce = "max"; // sub-block score reduction: max or sum
     std::string kvmem_update_mode = "interval"; // interval or step
+    // Archived experimental DeltaNet retrieval. These programmatic fields remain
+    // for reproducibility, but the corresponding CLI is disabled and the method
+    // is not recommended. See docs/kvmem_deltanet_retrieval_experimental.md.
+    int kvmem_deltanet_layers = 0;          // 0 = derive from budget
+    std::string kvmem_deltanet_layer_policy = "even"; // even or late
+    double kvmem_deltanet_mem_budget_gb = 32.0;
+    bool kvmem_deltanet_decay = true;       // apply exp(G_M - G_j)
+    int kvmem_deltanet_topk_q = 4;          // TopKMean over query tokens
+    int kvmem_deltanet_topk_h = 4;          // TopKMean over heads
     // When true, the serve layer marks the final user message's token span as
     // the "question" and the executor scores blocks by the multi-token mean
     // (mean over question tokens) instead of recency. Default OFF -> behavior is

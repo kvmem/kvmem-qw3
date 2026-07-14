@@ -292,6 +292,16 @@ public:
     // K chunk is captured. (Public: backend-invoked.)
     void kvmem_set_query_span(uint32_t begin, uint32_t end,
                               uint32_t prompt_tokens);          // before prefill
+    // Clean-query prefill (task #50, QW3_KVMEM_CLEAN_QUERY). Backend-invoked.
+    // stash: after a PASS-A isolated question prefill, copy the captured de-RoPE'd
+    // query into a persistent buffer that survives reset_state. restore: copy it
+    // back into g_query_multi_ and flip ready, so context selection (and decode-time
+    // reselects) rank by the recency-free query. set_pin_from_block: force
+    // pick_topk to always keep blocks with id >= b (the question + generated live
+    // tail); 0xffffffff (default, set by reset_state) => no pin => byte-identical.
+    void kvmem_stash_clean_query();
+    void kvmem_restore_clean_query();
+    void kvmem_set_pin_from_block(uint32_t b) { kvmem_qc_pin_from_block_ = b; }
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
     // it per executor. Set before configure_kvmem(); the pool must outlive this
     // executor. No-op effect when kvmem or the CPU tier is off.
@@ -826,6 +836,15 @@ private:
     uint32_t g_query_multi_capacity_ = 0;                      // allocated rows (cap, == S)
     bool g_query_multi_ready_ = false;                         // all span rows captured
     std::unique_ptr<DeviceTensor> g_query_multi_;              // [L, S, n_heads, head_dim] fp32
+    // Clean-query prefill (task #50). The PASS-A isolated-question query is stashed
+    // here; it is NOT touched by reset_state so it survives the pass boundary.
+    std::unique_ptr<DeviceTensor> g_query_multi_clean_;        // [L, S, n_heads, head_dim] fp32
+    uint32_t g_query_multi_clean_count_ = 0;                   // rows stashed (== S when ready)
+    // Force pick_topk to always keep blocks with id >= this (question + live tail);
+    // 0xffffffff => no pin. pick_topk result is unioned with [pin,block_count) in
+    // kvmem_selection_with_pin() before set_selection at every reselect site.
+    uint32_t kvmem_qc_pin_from_block_ = 0xffffffffu;
+    std::vector<uint32_t> kvmem_selection_with_pin();
 
     // ---- Per-normal-attention-layer multi-layer selection (#85-#90) --------
     // Qwen3.6-27B is hybrid: full_attention_interval=4 over 64 layers => 16
@@ -871,6 +890,36 @@ private:
     uint32_t g_kbar_multi_capacity_ = 0;                       // allocated block capacity (per layer)
     uint32_t kvmem_qc_n_subblocks_ = 1;                        // sub-block means per block (SubBlockMeanK; 1 = plain mean-k)
     bool kvmem_qc_subblock_max_ = true;                        // sub-block reduction: true=max over sub-blocks (MaxSim), false=sum (mass). No-op at n_subblocks==1.
+
+    // ---- DeltaNet-state retrieval (--kvmem-retrieval-method deltanet) --------
+    // Scores each historical block by the net EDIT it made to the DeltaNet
+    // recurrent state (E_j = S_j - a_j S_{j-1}) read by the current DeltaNet query
+    // (see deltanet_retrieval.md). Full per-block state edits are large (d_v*d_k
+    // fp32 per head per layer), so only a memory-budget-capped subset of the 48
+    // DeltaNet layers feeds the score (dn_layers_/dn_layer_slot_, evenly spaced).
+    // During prefill the qw3 delta kernel snapshots S_j per block into
+    // g_deltanet_snap_ and a companion scan accumulates each block's in-block
+    // log-decay into g_deltanet_decaysum_; the DeltaNet queries are captured
+    // (conv + L2-norm, exactly as the read-out uses them) into g_deltanet_q_. At
+    // the reselect boundary kvmem_retrieval_score_deltanet folds these into a
+    // per-block score. Allocated only when the deltanet method is selected.
+    bool kvmem_qc_deltanet_ = false;                           // retrieval_method == DeltaNet
+    void kvmem_resolve_deltanet_layers();                      // populate dn_layers_/dn_layer_slot_ (mem-budget capped)
+    void kvmem_capture_deltanet_query(uint32_t dn_slot, uint32_t chunk_off,
+                                      uint32_t batch, uint32_t base_pos,
+                                      const DeviceTensor &conv_out, uint32_t conv_stride);
+    bool kvmem_retrieval_score_deltanet();                     // boundary DeltaNet-state scorer
+    std::vector<uint32_t> dn_layers_;                          // dn_slot -> layer id (recurrent)
+    std::vector<int32_t> dn_layer_slot_;                       // il -> dn_slot 0..L_dn-1, or -1
+    uint32_t kvmem_dn_num_layers_ = 0;                         // L_dn (selected DeltaNet-layer count)
+    uint32_t kvmem_dn_qcount_ = 0;                             // captured DeltaNet query rows (per slot)
+    bool kvmem_dn_ready_ = false;                              // snapshots + decay + query all captured
+    std::unique_ptr<DeviceTensor> g_deltanet_snap_;            // [L_dn, blocks, num_v_heads, d_v, d_k] fp32 (S_j per block)
+    std::unique_ptr<DeviceTensor> g_deltanet_decaysum_;        // [L_dn, blocks, num_v_heads] fp32 (Σ in-block log-decay)
+    std::unique_ptr<DeviceTensor> g_deltanet_decay_d_;         // [L_dn, blocks, num_v_heads] fp32 (post-block decay exp(G_M-G_j) or 1)
+    std::unique_ptr<DeviceTensor> g_deltanet_q_;               // [L_dn, S, num_k_heads, d_k] fp32 (L2-normed query)
+    std::unique_ptr<DeviceTensor> g_deltanet_r_;               // [L_dn, blocks, num_v_heads] fp32 (per-layer block/head scores)
+    uint32_t g_deltanet_capacity_blocks_ = 0;                  // allocated block capacity (per layer)
 
     // Incremental content-index build from the prefill K batch (#91). The paged
     // builder (kvmem_build_content_index) can only run once from the pristine

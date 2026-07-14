@@ -405,10 +405,29 @@ public:
                                           float eps,
                                           DeviceTensor *state_checkpoints = nullptr,
                                           DeviceTensor *conv_state_checkpoints = nullptr,
-                                          uint32_t checkpoint_count = 0) {
+                                          uint32_t checkpoint_count = 0,
+                                          // DeltaNet retrieval block-boundary state
+                                          // capture (kvmem retrieval_method==deltanet;
+                                          // see deltanet_retrieval.md). When
+                                          // dn_state_snap != nullptr the CUDA backend
+                                          // captures S_j per block into dn_state_snap
+                                          // (offset dn_layer_snap_off) and accumulates
+                                          // each block's in-block log-decay into
+                                          // dn_decaysum (offset dn_layer_decay_off).
+                                          // Forces the qw3 (non-ported) delta kernel.
+                                          DeviceTensor *dn_state_snap = nullptr,
+                                          DeviceTensor *dn_decaysum = nullptr,
+                                          uint64_t dn_layer_snap_off = 0,
+                                          uint64_t dn_layer_decay_off = 0,
+                                          uint32_t dn_block_tokens = 0,
+                                          uint32_t dn_base_pos = 0,
+                                          uint32_t dn_n_blocks = 0) {
         (void)state_checkpoints;
         (void)conv_state_checkpoints;
         (void)checkpoint_count;
+        (void)dn_state_snap; (void)dn_decaysum; (void)dn_layer_snap_off;
+        (void)dn_layer_decay_off; (void)dn_block_tokens; (void)dn_base_pos;
+        (void)dn_n_blocks;
         for (uint32_t b = 0; b < batch; ++b) {
             if (auto st = recurrent_single_token_at(core, state, conv_state, conv_out_buf,
                                                     proj, gate, alpha, beta,
@@ -978,8 +997,9 @@ public:
     // n_blocks pages/layer scored. kbar_layer_stride (in blocks) may exceed n_blocks
     // when the index is allocated at a fixed session stride so preserved [0,D) slices
     // stay valid as the block count grows; callers that don't fix-stride pass
-    // kbar_layer_stride == n_blocks. Returns an error if n_blocks exceeds the
-    // kernel's shared-memory page cap (caller falls back).
+    // kbar_layer_stride == n_blocks. Up to 8192 pages use the original one-CTA
+    // shared-memory fused kernel; larger requests use an exact tiled two-dot
+    // implementation with a small log-sum-exp workspace.
     // excl_lo_end / excl_hi_begin mask the always-kept sink [0,excl_lo_end) and
     // recent [excl_hi_begin,n_blocks) bands out of the per-token softmax so their
     // probability mass redistributes onto the retrievable middle. Defaults
@@ -1011,6 +1031,59 @@ public:
         (void)n_kv_heads; (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
         (void)n_subblocks; (void)reduce_max;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
+    }
+
+    // deltanet_pack_query_device: pack one DeltaNet layer's in-span query rows
+    // (kvmem retrieval_method==deltanet). The conv output `conv_out` holds the
+    // L2-normalized DeltaNet Q in the first num_k_heads*head_k_dim of each row
+    // (row stride conv_stride). Copies `cnt` rows starting at chunk-local row r0
+    // into q_dst[dst_row_base + r][num_k_heads][head_k_dim]. No RoPE (DeltaNet
+    // queries are not rotated; the read-out dots them against the state directly).
+    virtual DeviceStatus deltanet_pack_query_device(DeviceTensor &q_dst,
+                                                    const DeviceTensor &conv_out,
+                                                    uint64_t q_dst_off,
+                                                    uint32_t conv_stride,
+                                                    uint32_t r0,
+                                                    uint32_t dst_row_base,
+                                                    uint32_t cnt,
+                                                    uint32_t num_k_heads,
+                                                    uint32_t head_k_dim) {
+        (void)q_dst; (void)conv_out; (void)q_dst_off; (void)conv_stride; (void)r0;
+        (void)dst_row_base; (void)cnt; (void)num_k_heads; (void)head_k_dim;
+        return {false, "deltanet_pack_query_device requires backend override"};
+    }
+
+    // deltanet_block_score_device: DeltaNet-retrieval per-layer block scorer
+    // (kvmem retrieval_method==deltanet; see deltanet_retrieval.md §5-8). For one
+    // DeltaNet layer, computes r[blk,vh] = TopKMean_t( d[blk,vh] *
+    // ||(S_j - a_j S_{j-1})^T q_t||_2 ) into r_out[blk,vh]. dn_snap holds S_j per
+    // block ([blocks, v_heads, d_v, d_k]); decaysum holds each block's in-block
+    // log-decay (a_j = exp(decaysum)); decay_d holds the precomputed post-block
+    // decay exp(G_M-G_j) (or all-ones when decay is off); q_layer is the layer's
+    // L2-normalized DeltaNet queries [M, num_k_heads, d_k]. All pointers are
+    // pre-offset to this layer's slice by the caller (via *_off element offsets).
+    virtual DeviceStatus deltanet_block_score_device(DeviceTensor &r_out,
+                                                     const DeviceTensor &dn_snap,
+                                                     const DeviceTensor &decaysum,
+                                                     const DeviceTensor &decay_d,
+                                                     const DeviceTensor &q_layer,
+                                                     uint64_t r_off,
+                                                     uint64_t snap_off,
+                                                     uint64_t decay_off,
+                                                     uint64_t decay_d_off,
+                                                     uint64_t q_off,
+                                                     uint32_t n_blocks,
+                                                     uint32_t num_k_heads,
+                                                     uint32_t num_v_heads,
+                                                     uint32_t head_v_dim,
+                                                     uint32_t head_k_dim,
+                                                     uint32_t M,
+                                                     uint32_t topk_q) {
+        (void)r_out; (void)dn_snap; (void)decaysum; (void)decay_d; (void)q_layer;
+        (void)r_off; (void)snap_off; (void)decay_off; (void)decay_d_off; (void)q_off;
+        (void)n_blocks; (void)num_k_heads; (void)num_v_heads; (void)head_v_dim;
+        (void)head_k_dim; (void)M; (void)topk_q;
+        return {false, "deltanet_block_score_device requires backend override"};
     }
 
     // derope_query_device: de-RoPE the current decode token's RoPE-baked Q (baked
