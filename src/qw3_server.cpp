@@ -849,6 +849,21 @@ bool apply_stops(std::string &text, const std::vector<std::string> &stops) {
     return false;
 }
 
+const char *generation_finish_reason(bool stop_matched,
+                                     size_t completion_tokens,
+                                     int max_tokens) {
+    // The engine returns normally both when it emits EOS and when it exhausts
+    // max_tokens. A client stop string takes precedence; otherwise reaching
+    // the configured token ceiling is OpenAI's "length", while an earlier
+    // normal return is EOS and therefore "stop".
+    if (stop_matched) return "stop";
+    if (max_tokens > 0 &&
+        completion_tokens >= static_cast<size_t>(max_tokens)) {
+        return "length";
+    }
+    return "stop";
+}
+
 std::vector<std::string> parse_stops(const json &req) {
     std::vector<std::string> stops;
     if (!req.contains("stop") || req["stop"].is_null()) return stops;
@@ -1104,6 +1119,38 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         res.set_content(dump_json(out), "application/json");
     });
 
+    // llama.cpp-compatible tokenizer-count endpoint.  AgentLongBench's
+    // canonical worker uses this to size the generation request before it
+    // calls /v1/chat/completions.  Returning only count by default avoids
+    // serializing a 100K-250K element token-id array for long prompts; the
+    // opt-in return_tokens mode exists for tokenizer-parity validation.
+    auto handle_tokenize = [&](const httplib::Request &hreq,
+                               httplib::Response &res) {
+        json req;
+        try {
+            req = json::parse(hreq.body);
+        } catch (const std::exception &e) {
+            res.status = 400;
+            res.set_content(
+                dump_json(json{{"error", std::string("invalid JSON: ") + e.what()}}),
+                "application/json");
+            return;
+        }
+        if (!req.contains("content") || !req["content"].is_string()) {
+            res.status = 400;
+            res.set_content(dump_json(json{{"error", "missing string content"}}),
+                            "application/json");
+            return;
+        }
+        const std::string content = req["content"].get<std::string>();
+        const std::vector<int32_t> tokens = usage_tokenizer.encode(content);
+        json out{{"count", tokens.size()}};
+        if (req.value("return_tokens", false)) out["tokens"] = tokens;
+        res.set_content(dump_json(out), "application/json");
+    };
+    svr.Post("/tokenize", handle_tokenize);
+    svr.Post("/v1/tokenize", handle_tokenize);
+
     // Build GenerationOptions from common OpenAI fields. Sampling defaults to
     // the Qwen3-recommended preset for the request's thinking mode (see below);
     // any field the client sends overrides it.
@@ -1239,26 +1286,83 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         // and selection is byte-identical to the single-token / recency path.
         if (engine.kvmem_query_conditioned) {
             const json &msgs = req["messages"];
-            const size_t lqi = last_query_index_for_template(msgs);
-            if (lqi < msgs.size() && msgs[lqi].is_object() &&
-                msgs[lqi].value("role", "") == "user") {
+            bool explicit_span = false;
+
+            // Optional API extension for benchmarks whose exact canonical
+            // prompt is one long user message containing both history and the
+            // final question.  Offsets are UTF-8 byte offsets into that
+            // message's content.  Removing only the marked substring and
+            // comparing the two chat renderings preserves the exact model
+            // prompt while still identifying the true retrieval query.
+            if (req.contains("kvmem_query_span")) {
+                const json &span = req["kvmem_query_span"];
+                if (!span.is_object() || !span.contains("message_index") ||
+                    !span.contains("content_start") ||
+                    !span.contains("content_end") ||
+                    !span["message_index"].is_number_integer() ||
+                    !span["content_start"].is_number_integer() ||
+                    !span["content_end"].is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_span requires integer message_index, "
+                        "content_start, and content_end");
+                    return;
+                }
+                const int64_t message_index = span["message_index"].get<int64_t>();
+                const int64_t content_start = span["content_start"].get<int64_t>();
+                const int64_t content_end = span["content_end"].get<int64_t>();
+                if (message_index < 0 ||
+                    message_index >= static_cast<int64_t>(msgs.size()) ||
+                    !msgs[static_cast<size_t>(message_index)].is_object() ||
+                    !msgs[static_cast<size_t>(message_index)].contains("content") ||
+                    !msgs[static_cast<size_t>(message_index)]["content"].is_string()) {
+                    set_error_response(res, 400,
+                                       "kvmem_query_span message_index does not "
+                                       "reference a string-content message");
+                    return;
+                }
+                const std::string content =
+                    msgs[static_cast<size_t>(message_index)]["content"]
+                        .get<std::string>();
+                if (content_start < 0 || content_end <= content_start ||
+                    content_end > static_cast<int64_t>(content.size())) {
+                    set_error_response(res, 400,
+                                       "kvmem_query_span content offsets are "
+                                       "outside the message content");
+                    return;
+                }
+
                 json msgs_empty = msgs;
-                msgs_empty[lqi]["content"] = "";
+                std::string content_empty = content;
+                content_empty.erase(static_cast<size_t>(content_start),
+                                    static_cast<size_t>(content_end - content_start));
+                msgs_empty[static_cast<size_t>(message_index)]["content"] =
+                    std::move(content_empty);
                 const std::string empty_prompt = render_messages(
                     msgs_empty, tools, enable_thinking, forced_tool_name);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
-                if (tok_full.size() > tok_empty.size()) {
-                    size_t qb = 0;
-                    const size_t maxn = tok_empty.size();
-                    while (qb < maxn && tok_full[qb] == tok_empty[qb]) ++qb;
-                    const size_t qe = qb + (tok_full.size() - tok_empty.size());
+                size_t qb = 0;
+                const size_t prefix_max = std::min(tok_full.size(), tok_empty.size());
+                while (qb < prefix_max && tok_full[qb] == tok_empty[qb]) ++qb;
+                size_t suffix = 0;
+                while (suffix < tok_full.size() - qb &&
+                       suffix < tok_empty.size() - qb &&
+                       tok_full[tok_full.size() - 1 - suffix] ==
+                           tok_empty[tok_empty.size() - 1 - suffix]) {
+                    ++suffix;
+                }
+                const size_t qe = tok_full.size() - suffix;
+                if (qe > qb) {
                     g.kvmem_query_begin = static_cast<uint32_t>(qb);
                     g.kvmem_query_end = static_cast<uint32_t>(qe);
-                    std::cerr << "[qw3-serve] kvmem query span [" << qb << ","
-                              << qe << ") of " << tok_full.size()
-                              << " prompt tokens\n";
+                    explicit_span = true;
+                    std::cerr << "[qw3-serve] kvmem explicit query span ["
+                              << qb << "," << qe << ") of " << tok_full.size()
+                              << " prompt tokens, message=" << message_index
+                              << " content_bytes=[" << content_start << ","
+                              << content_end << ")\n";
                     if (std::getenv("QW3_KVMEM_TRACE")) {
                         const std::vector<int32_t> slice(
                             tok_full.begin() + static_cast<long>(qb),
@@ -1267,6 +1371,46 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         if (txt.size() > 200) txt = txt.substr(0, 200) + "...";
                         std::cerr << "[qw3-serve] kvmem query span text: \""
                                   << txt << "\"\n";
+                    }
+                }
+            }
+
+            // Existing default behavior is deliberately unchanged when the
+            // explicit field is absent: use the complete final user message.
+            if (!explicit_span && !req.contains("kvmem_query_span")) {
+                const size_t lqi = last_query_index_for_template(msgs);
+                if (lqi < msgs.size() && msgs[lqi].is_object() &&
+                    msgs[lqi].value("role", "") == "user") {
+                    json msgs_empty = msgs;
+                    msgs_empty[lqi]["content"] = "";
+                    const std::string empty_prompt = render_messages(
+                        msgs_empty, tools, enable_thinking, forced_tool_name);
+                    const std::vector<int32_t> tok_full =
+                        usage_tokenizer.encode(prompt);
+                    const std::vector<int32_t> tok_empty =
+                        usage_tokenizer.encode(empty_prompt);
+                    if (tok_full.size() > tok_empty.size()) {
+                        size_t qb = 0;
+                        const size_t maxn = tok_empty.size();
+                        while (qb < maxn && tok_full[qb] == tok_empty[qb]) ++qb;
+                        const size_t qe =
+                            qb + (tok_full.size() - tok_empty.size());
+                        g.kvmem_query_begin = static_cast<uint32_t>(qb);
+                        g.kvmem_query_end = static_cast<uint32_t>(qe);
+                        std::cerr << "[qw3-serve] kvmem query span [" << qb
+                                  << "," << qe << ") of " << tok_full.size()
+                                  << " prompt tokens\n";
+                        if (std::getenv("QW3_KVMEM_TRACE")) {
+                            const std::vector<int32_t> slice(
+                                tok_full.begin() + static_cast<long>(qb),
+                                tok_full.begin() + static_cast<long>(qe));
+                            std::string txt = usage_tokenizer.decode(slice);
+                            if (txt.size() > 200)
+                                txt = txt.substr(0, 200) + "...";
+                            std::cerr
+                                << "[qw3-serve] kvmem query span text: \""
+                                << txt << "\"\n";
+                        }
                     }
                 }
             }
@@ -1481,12 +1625,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     if (!streamed_content && !split.content.empty()) {
                                         send_delta(json{{"content", split.content}});
                                     }
-                                    send_done("stop");
+                                    send_done(generation_finish_reason(
+                                        stopped, completion_tokens, g.max_tokens));
                                 }
                             } else {
                                 if (!content_pending.empty()) emit_text(content_pending);
                                 finish_text_stream();
-                                send_done("stop");
+                                send_done(generation_finish_reason(
+                                    stopped, completion_tokens, g.max_tokens));
                             }
                             std::cerr << "[qw3-serve] #" << rid
                                       << " chat(stream tools) chars=" << acc.size()
@@ -1520,7 +1666,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             }
                         });
                         finish_text_stream();
-                        send_done(stopped ? "stop" : "stop");
+                        send_done(generation_finish_reason(
+                            stopped, completion_tokens, g.max_tokens));
                         std::cerr << "[qw3-serve] #" << rid
                                   << " chat(stream) completion_tokens="
                                   << completion_tokens
@@ -1596,7 +1743,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         if (!split.reasoning.empty()) {
             message["reasoning_content"] = split.reasoning;
         }
-        std::string finish = stopped ? "stop" : "stop";
+        std::string finish = generation_finish_reason(
+            stopped, completion_tokens, g.max_tokens);
         if (!tool_calls.empty()) {
             std::cerr << "[qw3-serve] #" << rid
                       << " tool_calls=" << tool_calls_debug_summary(tool_calls)
@@ -1701,7 +1849,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             {"model", model_id},
             {"choices", json::array({json{
                 {"index", 0}, {"text", text}, {"logprobs", nullptr},
-                {"finish_reason", stopped ? "stop" : "length"}}})},
+                {"finish_reason", generation_finish_reason(
+                    stopped, completion_tokens, g.max_tokens)}}})},
             {"usage", usage_json(prompt_token_count, completion_tokens)}};
         res.set_content(dump_json(out), "application/json");
     });

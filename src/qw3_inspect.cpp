@@ -1,5 +1,6 @@
 #include "qw3/gguf.hpp"
 #include "qw3/qw3.hpp"
+#include "qw3/tokenizer.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -53,20 +54,37 @@ void print_value(const qw3::GgufValue &v) {
 
 int main(int argc, char **argv) {
     bool dump_meta = false;
+    bool tokenize_stdin = false;
     std::string path;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--meta" || a == "--dump-metadata") {
             dump_meta = true;
+        } else if (a == "--tokenize-stdin") {
+            tokenize_stdin = true;
         } else {
             path = a;
         }
     }
     if (path.empty()) {
-        std::cerr << "Usage: qw3-inspect [--meta] MODEL.gguf\n";
+        std::cerr << "Usage: qw3-inspect [--meta|--tokenize-stdin] MODEL.gguf\n";
         return 2;
     }
     try {
+        if (tokenize_stdin) {
+            const qw3::GgufFile gguf(path);
+            const qw3::QwenTokenizer tokenizer(gguf);
+            const std::string input((std::istreambuf_iterator<char>(std::cin)),
+                                    std::istreambuf_iterator<char>());
+            const std::vector<int32_t> ids = tokenizer.encode(input);
+            std::cout << '[';
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (i) std::cout << ',';
+                std::cout << ids[i];
+            }
+            std::cout << "]\n";
+            return 0;
+        }
         if (dump_meta) {
             const qw3::GgufFile gguf(path);
             std::vector<std::string> keys;

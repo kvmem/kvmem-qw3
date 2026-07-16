@@ -366,6 +366,73 @@ The query span is capped at 512 tokens in the current implementation. The cap is
 a practical bound on retrieval overhead and memory. For most question-conditioned
 agent steps, the final user question is short relative to the context.
 
+#### 4.4.1 Message-role policy and planned API metadata (2026-07-15)
+
+The current server does not receive an explicit semantic distinction between
+retrieval corpus and retrieval query. Its automatic policy is to use the content
+span of the last ordinary `user` message (excluding a tool-response wrapper) as
+the query. This is a useful default for chat and agent traffic, where a new step
+normally ends with a user task, but it is not a general context detector. In
+particular, if a request ends with one very large user message containing only
+history, that whole message is considered the query and the executor's 512-token
+cap keeps only its first 512 query tokens.
+
+The agreed first-stage policy is therefore:
+
+- the last ordinary `user` message is the retrieval query;
+- earlier `user` messages, prior `assistant` messages, and tool results are the
+  retrieval corpus;
+- genuine `system` / `developer` instructions are control context and should
+  eventually be semantically pinned rather than merely relying on the fixed
+  prefix sink;
+- the current query and the live recent agent/tool trajectory should remain in
+  the active window.
+
+Until explicit API metadata is implemented, every query-conditioned experiment
+must end with a separate, short user query. A context warm-up must not end with
+the long context message itself. Append a user message such as:
+
+```text
+Please remember the information above and reply with a brief confirmation.
+```
+
+That short message is intentionally the warm-up query. It prevents the long
+context from being interpreted as the query and, under the current
+implementation, activates incremental mean-key capture for the complete prompt.
+The later real request appends a new final user message, which then becomes the
+new retrieval query. The confirmation query can influence the warm-up working-set
+selection; this is a documented property of the temporary experimental protocol,
+not a claim of equivalence to a future context-only prefill mode.
+
+The planned OpenAI-compatible API extension is a top-level, namespaced object:
+
+```json
+{
+  "kvmem": {
+    "mode": "last-user | explicit | context-only",
+    "pinned_message_indices": [0],
+    "context_message_indices": [1],
+    "query_message_indices": [2]
+  }
+}
+```
+
+The modes are intended to mean:
+
+- `last-user`: the automatic policy above and the initial implementation target;
+- `explicit`: the caller supplies message indices for pinned control text,
+  retrieval corpus, and query;
+- `context-only`: build the complete context index during a prefill-only warm-up
+  without inventing a retrieval query.
+
+The explicit and context-only modes are a recorded design, not current API
+behavior. Their implementation also requires context mean-key construction to be
+independent of query availability: context keys depend only on the context, while
+query capture and retrieval scoring depend on the later query. Message rendering
+should eventually return token spans per message, blocks containing pinned/query
+tokens should be pinned as whole blocks, and only corpus blocks should compete in
+retrieval top-k.
+
 ### 4.5 Mean-K Softmax-Over-Pages Scoring
 
 At the reselection boundary, the default query-conditioned retrieval method is

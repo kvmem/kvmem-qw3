@@ -5,7 +5,9 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <cwctype>
 #include <limits>
+#include <locale>
 #include <stdexcept>
 #include <utility>
 
@@ -87,8 +89,6 @@ std::vector<uint32_t> gpt2_bytes_to_unicode_table() {
 bool ascii_digit(uint8_t c) { return c >= '0' && c <= '9'; }
 bool ascii_alpha(uint8_t c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 bool ascii_space(uint8_t c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; }
-bool ascii_newline(uint8_t c) { return c == '\r' || c == '\n'; }
-
 bool cp_is_cjk(uint32_t cp) {
     // CJK Unified, CJK Ext A, Hiragana, Katakana, Hangul, fullwidth forms.
     return (cp >= 0x3040 && cp <= 0x30FF) ||
@@ -100,13 +100,34 @@ bool cp_is_cjk(uint32_t cp) {
 }
 
 bool cp_is_letter(uint32_t cp) {
-    if (ascii_alpha(static_cast<uint8_t>(cp))) return true;
-    if (cp < 0x80) return false;
-    // Treat any non-ASCII non-CJK printable codepoint as a letter for the
-    // letter-run rule; this is intentionally loose.
-    if (cp_is_cjk(cp)) return false;
-    if (cp >= 0x80 && cp <= 0xA0) return false;
-    return true;
+    if (cp < 0x80) return ascii_alpha(static_cast<uint8_t>(cp));
+    if (cp_is_cjk(cp)) return true;
+    // C wide-character functions otherwise start in the "C" locale even when
+    // LANG/LC_ALL is UTF-8.  Constructing the environment locale explicitly
+    // makes accented Latin and other scripts follow Unicode-like alpha
+    // classification without mutating the process-global locale.
+    static const std::locale utf8_locale("");
+    return cp <= static_cast<uint32_t>(WCHAR_MAX) &&
+           std::use_facet<std::ctype<wchar_t>>(utf8_locale).is(
+               std::ctype_base::alpha, static_cast<wchar_t>(cp));
+}
+
+bool cp_is_number(uint32_t cp) {
+    if (cp < 0x80) return ascii_digit(static_cast<uint8_t>(cp));
+    static const std::locale utf8_locale("");
+    return cp <= static_cast<uint32_t>(WCHAR_MAX) &&
+           std::use_facet<std::ctype<wchar_t>>(utf8_locale).is(
+               std::ctype_base::digit, static_cast<wchar_t>(cp));
+}
+
+bool cp_is_mark(uint32_t cp) {
+    // The common Unicode combining-mark blocks.  Qwen3.5's regex joins marks
+    // to letter runs (\p{L}\p{M}) rather than treating them as punctuation.
+    return (cp >= 0x0300 && cp <= 0x036F) ||
+           (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+           (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+           (cp >= 0x20D0 && cp <= 0x20FF) ||
+           (cp >= 0xFE20 && cp <= 0xFE2F);
 }
 
 bool cp_is_space(uint32_t cp) {
@@ -194,144 +215,140 @@ std::string QwenTokenizer::bytes_to_chars(const std::string &bytes) const {
 }
 
 std::vector<std::string> QwenTokenizer::pre_tokenize(const std::string &text) const {
-    // Qwen / GPT-style pre-tokenizer (simplified port). The exact upstream
-    // regex is:
-    //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3}
-    //   | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
-    // We mirror the high-level shape: digits (max 3), CJK runs, letter runs
-    // (with optional single leading-space "joiner"), punctuation runs, and
-    // whitespace handling, working on UTF-8 codepoints.
+    // Exact Qwen3.5 pre-tokenizer control flow, matching llama.cpp's optimized
+    // implementation of:
+    //   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    //   | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+    //   | \p{N}
+    //   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+    //   | \s*[\r\n]+ | \s+(?!\S) | \s+
+    //
+    // Two details are important for long JSON/tool traces: Qwen3.5 isolates
+    // every numeric codepoint (not 1-3 digit groups), and a whitespace run
+    // before more text leaves its final space for the next token.  The old
+    // approximation got both wrong and drifted by 10-16% on AgentLongBench.
+    struct Codepoint {
+        uint32_t value;
+        size_t byte_begin;
+        size_t byte_end;
+    };
+    std::vector<Codepoint> cpts;
+    cpts.reserve(text.size());
+    for (size_t byte_pos = 0; byte_pos < text.size();) {
+        const size_t begin = byte_pos;
+        const uint32_t cp = utf8_decode(text, byte_pos);
+        cpts.push_back({cp, begin, byte_pos});
+    }
+
     std::vector<std::string> pieces;
-    const size_t len = text.size();
+    pieces.reserve(cpts.size());
+    const size_t len = cpts.size();
     size_t pos = 0;
+    auto cp = [&](size_t i) -> uint32_t {
+        return i < len ? cpts[i].value : 0xFFFFFFFFu;
+    };
+    auto is_letter_or_mark = [&](size_t i) -> bool {
+        return i < len && (cp_is_letter(cp(i)) || cp_is_mark(cp(i)));
+    };
+    auto is_number = [&](size_t i) -> bool {
+        return i < len && cp_is_number(cp(i));
+    };
+    auto is_space = [&](size_t i) -> bool {
+        return i < len && cp_is_space(cp(i));
+    };
+    auto add_piece = [&](size_t begin, size_t end) {
+        if (end <= begin) return;
+        const size_t byte_begin = cpts[begin].byte_begin;
+        const size_t byte_end = cpts[end - 1].byte_end;
+        pieces.push_back(text.substr(byte_begin, byte_end - byte_begin));
+    };
+
     while (pos < len) {
         const size_t start = pos;
-        const uint8_t c0 = static_cast<uint8_t>(text[pos]);
+        const uint32_t c0 = cp(pos);
 
-        // English contractions ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
-        if (c0 == '\'' && pos + 1 < len) {
-            const char a = text[pos + 1];
-            const char b = pos + 2 < len ? text[pos + 2] : '\0';
+        // English contractions, case-insensitive.
+        if (c0 == '\'' && pos + 1 < len && cp(pos + 1) < 0x80) {
+            const char a = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(cp(pos + 1))));
+            const char b = pos + 2 < len && cp(pos + 2) < 0x80
+                ? static_cast<char>(
+                      std::tolower(static_cast<unsigned char>(cp(pos + 2))))
+                : '\0';
             if (a == 's' || a == 't' || a == 'm' || a == 'd') {
-                pos += 2; pieces.push_back(text.substr(start, pos - start)); continue;
+                pos += 2;
+                add_piece(start, pos);
+                continue;
             }
             if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) {
-                pos += 3; pieces.push_back(text.substr(start, pos - start)); continue;
-            }
-        }
-
-        // Digits: up to 3 contiguous decimal digits at a time.
-        if (ascii_digit(c0)) {
-            int n = 0;
-            while (pos < len && ascii_digit(static_cast<uint8_t>(text[pos])) && n < 3) {
-                ++pos; ++n;
-            }
-            pieces.push_back(text.substr(start, pos - start)); continue;
-        }
-
-        // Optional joiner + letter run: matches "[^\r\n\p{L}\p{N}]?\p{L}+".
-        // This is the rule that turns " world" into a single piece. It must
-        // run before any whitespace collapsing.
-        {
-            size_t cp_end_lk = pos;
-            const uint32_t cp_lk = utf8_decode(text, cp_end_lk);
-            // Try with the current codepoint as the leading joiner.
-            const bool joinerable = !ascii_newline(static_cast<uint8_t>(c0)) &&
-                                    !cp_is_letter(cp_lk) &&
-                                    !(cp_lk < 0x80 && ascii_digit(static_cast<uint8_t>(cp_lk)));
-            if (joinerable && cp_end_lk < len) {
-                size_t after = cp_end_lk;
-                const uint32_t next_cp = utf8_decode(text, after);
-                if (cp_is_letter(next_cp)) {
-                    pos = cp_end_lk;
-                    while (pos < len) {
-                        size_t e2 = pos;
-                        const uint32_t cp2 = utf8_decode(text, e2);
-                        if (!cp_is_letter(cp2)) break;
-                        pos = e2;
-                    }
-                    pieces.push_back(text.substr(start, pos - start));
-                    continue;
-                }
-            }
-            if (cp_is_letter(cp_lk)) {
-                pos = cp_end_lk;
-                while (pos < len) {
-                    size_t e2 = pos;
-                    const uint32_t cp2 = utf8_decode(text, e2);
-                    if (!cp_is_letter(cp2)) break;
-                    pos = e2;
-                }
-                pieces.push_back(text.substr(start, pos - start));
+                pos += 3;
+                add_piece(start, pos);
                 continue;
             }
         }
 
-        // CJK runs.
-        {
-            size_t cp_end = pos;
-            const uint32_t cp = utf8_decode(text, cp_end);
-            if (cp_is_cjk(cp)) {
-                do {
-                    pos = cp_end;
-                    if (pos >= len) break;
-                    size_t next_end = pos;
-                    const uint32_t next_cp = utf8_decode(text, next_end);
-                    if (!cp_is_cjk(next_cp)) break;
-                    cp_end = next_end;
-                } while (pos < len);
-                pieces.push_back(text.substr(start, pos - start));
-                continue;
-            }
-        }
-
-        // Whitespace handling: pull newlines as their own run; otherwise
-        // emit the whole whitespace block (after consuming the optional
-        // leading-space joiner above didn't apply, this is a pure-space
-        // tail that does not precede a letter, so it stays as-is).
-        if (ascii_space(c0)) {
-            size_t p = pos;
-            size_t last_nl_end = 0;
-            while (p < len && ascii_space(static_cast<uint8_t>(text[p]))) {
-                if (ascii_newline(static_cast<uint8_t>(text[p]))) last_nl_end = p + 1;
-                ++p;
-            }
-            if (last_nl_end > 0) {
-                pos = last_nl_end;
-            } else {
-                pos = p;
-            }
-            pieces.push_back(text.substr(start, pos - start));
+        // Optional non-newline/non-letter/non-number joiner plus letters/marks.
+        if (c0 != '\r' && c0 != '\n' && !is_number(pos) &&
+            (is_letter_or_mark(pos) || is_letter_or_mark(pos + 1))) {
+            ++pos;
+            while (is_letter_or_mark(pos)) ++pos;
+            add_piece(start, pos);
             continue;
         }
 
-        // Punctuation / symbol run (optional single leading space).
-        {
-            size_t punct_pos = pos;
-            if (c0 == ' ') {
-                size_t e = punct_pos; utf8_decode(text, e); punct_pos = e;
-            }
-            const size_t punct_run_start = punct_pos;
-            while (punct_pos < len) {
-                size_t e2 = punct_pos;
-                const uint32_t cp2 = utf8_decode(text, e2);
-                if (cp_is_letter(cp2) || cp_is_space(cp2) || cp_is_cjk(cp2) ||
-                    (cp2 < 0x80 && ascii_digit(static_cast<uint8_t>(cp2)))) break;
-                punct_pos = e2;
-            }
-            if (punct_pos > punct_run_start) {
-                while (punct_pos < len && ascii_newline(static_cast<uint8_t>(text[punct_pos]))) ++punct_pos;
-                pos = punct_pos;
-                pieces.push_back(text.substr(start, pos - start));
-                continue;
-            }
+        // Qwen3.5 isolates every numeric codepoint.
+        if (is_number(pos)) {
+            ++pos;
+            add_piece(start, pos);
+            continue;
         }
 
-        // Fallback: consume one codepoint.
-        size_t cp_end = pos;
-        utf8_decode(text, cp_end);
-        pos = cp_end > pos ? cp_end : pos + 1;
-        pieces.push_back(text.substr(start, pos - start));
+        // Optional literal space plus a punctuation/symbol run and trailing
+        // CR/LF.  Out-of-range is excluded explicitly.
+        size_t punct = c0 == ' ' ? pos + 1 : pos;
+        if (punct < len && !is_space(punct) && !is_letter_or_mark(punct) &&
+            !is_number(punct)) {
+            pos = punct;
+            while (pos < len && !is_space(pos) && !is_letter_or_mark(pos) &&
+                   !is_number(pos)) {
+                ++pos;
+            }
+            while (pos < len && (cp(pos) == '\r' || cp(pos) == '\n')) ++pos;
+            add_piece(start, pos);
+            continue;
+        }
+
+        // Whitespace alternatives, in regex order.
+        size_t whitespace = 0;
+        size_t last_newline_end = 0;
+        while (is_space(pos + whitespace)) {
+            const uint32_t w = cp(pos + whitespace);
+            if (w == '\r' || w == '\n') {
+                last_newline_end = pos + whitespace + 1;
+            }
+            ++whitespace;
+        }
+        if (last_newline_end > 0) {
+            pos = last_newline_end;
+            add_piece(start, pos);
+            continue;
+        }
+        // \s+(?!\S): before more text, emit all but the final whitespace so
+        // that the final character can become the next token's joiner.
+        if (whitespace > 1 && pos + whitespace < len) {
+            pos += whitespace - 1;
+            add_piece(start, pos);
+            continue;
+        }
+        if (whitespace > 0) {
+            pos += whitespace;
+            add_piece(start, pos);
+            continue;
+        }
+
+        // Defensive fallback for an unclassified codepoint.
+        ++pos;
+        add_piece(start, pos);
     }
     return pieces;
 }

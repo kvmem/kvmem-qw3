@@ -20,12 +20,10 @@ namespace qw3 {
  * Implementation notes:
  *  - GPT-2's byte->unicode mapping is applied so that raw UTF-8 bytes are
  *    representable as printable characters that appear in the vocab.
- *  - The pre-tokenizer is the Qwen3 / GPT-4-ish split: digit runs, CJK,
- *    letters with optional leading space, punctuation runs, whitespace.
- *    Not a perfect port of the upstream Rust tokenizers regex; it is the
- *    minimum that matches single chat templates well enough to compare
- *    logits against llama.cpp on short prompts. This will be tightened in
- *    follow-up work if/when a long-prompt token-stream diff misses. */
+ *  - The pre-tokenizer implements Qwen3.5's Unicode-aware control flow:
+ *    single numeric codepoints, letter/combining-mark runs with an optional
+ *    joiner, punctuation runs, and the regex's lookahead-sensitive whitespace
+ *    split. Long-prompt token counts are regression-checked against llama.cpp. */
 class QwenTokenizer {
 public:
     explicit QwenTokenizer(const GgufFile &gguf);
