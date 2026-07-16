@@ -7198,17 +7198,6 @@ private:
             // restore_state rewound position/KV/recurrent/window to C but not the
             // block store (still at the prior turn's end M). Rewind it to C.
             executor_->kvmem_truncate_to(reuse_m);
-            // Above-budget block-boundary (P) resume: restore_state reinstated the
-            // window snapshot captured at B, but above budget that window is stale
-            // (its GPU slots were recycled by the reselects/decode that ran after
-            // B). Rebuild it from the preserved [0,B) blocks so the suffix prefill
-            // extends a valid window frame (the first suffix chunk appends at
-            // window_query_pos_). Gated on kvmem_active() (true only above budget):
-            // M-reuse restores the most-recent, still-valid window and below budget
-            // the window is identity, so neither needs the rebuild.
-            if (ru.prompt_ckpt && executor_->kvmem_active()) {
-                executor_->kvmem_reselect();
-            }
             if (kvmem_prefix_cache_trace_enabled()) {
                 std::ostringstream tmsg;
                 tmsg << "kvmem prefix-cache HIT (plain): reuse=" << reuse_m
@@ -7267,6 +7256,11 @@ private:
         // guaranteed by the strict-extend predicate, so >=1 token still forwards
         // and step carries a fresh decode seed.
         const size_t prefill_begin = warm_reuse ? reuse_m : 0;
+        // Above-budget continuation (P or M checkpoint): rebuild the prefill
+        // working window before the first suffix token. Cold/all-fit requests
+        // are no-ops here and enter pressure mode only when the pool fills.
+        executor_->kvmem_prepare_prefill_window(
+            static_cast<uint32_t>(prompt_tokens.size() - prefill_begin));
         // kvmem prefix cache: choose where to stage the prompt-end (P) checkpoint.
         // Capturing at the last BLOCK boundary strictly below P leaves a resume
         // point below the chat-template reformat that rewrites the final few
@@ -7320,12 +7314,12 @@ private:
         } else if (do_boundary_capture) {
             // First segment [prefill_begin, split): advance recurrent state to B.
             do_prefill_range(prefill_begin, ckpt_split);
-            // Register + reselect so the store/window describe exactly `split`
-            // tokens, then stage ckpt_P at the block boundary (recurrent state is
-            // captured here, physically at B).
+            // Register + pressure-select so the store/window describe exactly
+            // `split` tokens, then stage ckpt_P at the block boundary. This is a
+            // prefill working-set checkpoint, not a query-conditioned boundary.
             executor_->kvmem_register_append(
                 ckpt_split - static_cast<uint32_t>(prefill_begin));
-            executor_->kvmem_reselect();
+            executor_->kvmem_reselect_prefill_pressure();
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = ckpt_split;
@@ -7617,12 +7611,6 @@ private:
             executor_->restore_state(kvmem_ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
                                                           : kvmem_warm_ckpt_end_);
             executor_->kvmem_truncate_to(kvmem_reuse_m);
-            // Above-budget block-boundary (P) resume: rebuild the stale window
-            // snapshot from the preserved [0,B) blocks (see the plain path). Gated
-            // on kvmem_active() (true only above budget).
-            if (kvmem_ru.prompt_ckpt && executor_->kvmem_active()) {
-                executor_->kvmem_reselect();
-            }
             if (kvmem_prefix_cache_trace_enabled()) {
                 std::ostringstream tmsg;
                 tmsg << "kvmem prefix-cache HIT (mtp): reuse=" << kvmem_reuse_m
@@ -7827,6 +7815,11 @@ private:
         const std::vector<uint32_t> &prefill_tokens =
             kvmem_warm_reuse ? kvmem_suffix : prompt_tokens;
         const size_t kvmem_prefill_begin = kvmem_warm_reuse ? kvmem_reuse_m : 0;
+        // Common prefill entry for checkpoint reuse and persistent
+        // reset_session=false growth: discard the prior semantic working set
+        // before any new above-budget token is evaluated.
+        executor_->kvmem_prepare_prefill_window(
+            static_cast<uint32_t>(prefill_tokens.size()));
         // kvmem prefix cache: choose where to stage the prompt-end (P) checkpoint.
         // Capturing at the last BLOCK boundary strictly below P (rather than at P
         // itself) leaves a resume point below the chat-template reformat that
@@ -7933,12 +7926,12 @@ private:
                 kvmem_ckpt_split - static_cast<uint32_t>(kvmem_prefill_begin);
             // First segment [prefill_base, split): advance recurrent state to B.
             do_prefill_range(0, split_local);
-            // Register + reselect so the store/window describe exactly `split`
-            // tokens, then stage ckpt_P at the block boundary. The recurrent state
-            // is captured here, physically at B — it cannot be rewound from a later
-            // snapshot, which is why the prefill is split.
+            // Register + pressure-select so the store/window describe exactly
+            // `split` tokens, then stage ckpt_P at the block boundary. The
+            // recurrent state is captured here, physically at B — it cannot be
+            // rewound from a later snapshot, which is why the prefill is split.
             executor_->kvmem_register_append(static_cast<uint32_t>(split_local));
-            executor_->kvmem_reselect();
+            executor_->kvmem_reselect_prefill_pressure();
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             kvmem_warm_prompt_pos = kvmem_ckpt_split;
@@ -7958,8 +7951,9 @@ private:
             // [0, qb): context-only prefill. The query span is [qb,qe), so this
             // builds g_kbar_multi_ for every context block but captures NO query
             // rows (none lie in [qb,qe) yet) — g_query_multi_ready_ stays false, so
-            // any automatic pool-fill offload here falls back to recency (staging
-            // only; the position-invariant content index is what selection reads).
+            // any automatic pool-fill offload here uses the deterministic
+            // prefill-pressure sink+tail window (staging only; the
+            // position-invariant content index is what final selection reads).
             do_prefill_range(0, qb);
             // Register context blocks, restore the clean query stashed in PASS A,
             // pin the question + generated tail (survives every reselect), then

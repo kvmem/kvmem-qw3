@@ -221,6 +221,13 @@ public:
     // selected block IDs in ascending (window) order. Honors the budget.
     std::vector<uint32_t> pick_topk_blocks() const;
 
+    // Deterministic working set used only while a long prefill is under memory
+    // pressure. Keep the configured sink prefix, then fill every remaining
+    // budget slot with the newest blocks. This deliberately ignores all
+    // retrieval/profile/attention scores and also ignores `recent_blocks`:
+    // "recent" here means the full newest tail left after reserving the sink.
+    std::vector<uint32_t> pick_prefill_pressure_blocks() const;
+
     // Accumulate per-block attention quality (decode side-channel, #40). `scores`
     // is indexed by block_id; entries beyond block_count() are ignored.
     void accumulate_attn(const std::vector<double> &scores);

@@ -176,13 +176,17 @@ The implementation uses these scheduling/update points:
    - Query-conditioned spans can be registered with `kvmem_set_query_span`.
    - The executor allocates query and mean-key buffers for the expected prompt
      length.
+   - If a new turn resumes an already sparse session, the inherited semantic
+     window is normalized through `kvmem_prepare_prefill_window` before the
+     first new token is evaluated.
 2. During prefill:
    - Newly written tokens are registered into `KvMemStore` through
      `kvmem_register_until` / `kvmem_register_append`.
    - Query rows inside the marked question span are captured and de-RoPEd.
    - Per-block content mean keys are captured from freshly produced K batches.
-   - If a bounded GPU pool is close to exhaustion, KVMem triggers an in-prefill
-     reselection/offload through `kvmem_maybe_prefill_offload`.
+   - If a bounded GPU pool is close to exhaustion, KVMem triggers a deterministic
+     in-prefill pressure selection/offload through
+     `kvmem_maybe_prefill_offload`.
 3. At the prefill-to-decode boundary:
    - KVMem performs the main selection and window assembly through
      `kvmem_reselect`, or the split `kvmem_prepare_reselect` /
@@ -255,7 +259,23 @@ invariant required by the physical page allocator.
 Long prefill can consume a large number of pages before reaching the step
 boundary. `kvmem_maybe_prefill_offload(next_chunk_tokens)` checks whether the
 bounded GPU page pool has enough free pages for the next prefill chunk plus a
-small cushion of recent blocks. If not, it triggers a reselect during prefill.
+small cushion of recent blocks. If not, it calls
+`kvmem_reselect_prefill_pressure` rather than the semantic retrieval selector.
+
+The pressure policy is deterministic. It keeps the configured sink prefix and
+fills every remaining budget slot with the newest historical blocks. The word
+"recent" in this policy means the entire newest tail left after reserving the
+sink; it is independent of the smaller `recent_blocks` region optionally pinned
+by the semantic selector. Attention, retrieval, and profile scores are ignored.
+
+This separation matters for multi-turn execution. A restored checkpoint carries
+the previous turn's assembled semantic window. If the next turn starts a long
+prefill directly on that window, some new hidden states are shaped by the old
+query before page pressure first triggers. `kvmem_prepare_prefill_window`
+therefore normalizes every already-sparse continuation to the same sink-plus-tail
+policy before its first suffix token. P and M checkpoint reuse and persistent
+`reset_session=false` growth follow the same rule. The post-prefill selector is
+still query-conditioned mean-k/H2O/recency and is not changed by this mechanism.
 
 This avoids a failure mode where the next chunk allocates pages in one burst and
 exhausts the pool before the scheduler has a chance to evict. It also spreads
@@ -265,8 +285,9 @@ prefill-to-decode boundary.
 For method writing, this is the key argument:
 
 > KVMem schedules memory at semantic step boundaries but also includes a
-> resource-triggered in-prefill offload path to maintain the bounded-GPU
-> invariant during very long prompt ingestion.
+> resource-triggered, query-independent sink-plus-tail offload path to maintain
+> the bounded-GPU invariant during very long prompt ingestion. Semantic
+> retrieval is reserved for the prefill-to-decode boundary.
 
 ## 4. KV-Native Mean-K Retrieval
 

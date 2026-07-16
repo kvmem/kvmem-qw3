@@ -95,6 +95,29 @@ void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {
     blocks_[block_id].baked_pos = baked_pos;
 }
 
+std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
+    const uint32_t n = block_count();
+    std::vector<uint32_t> selected;
+    if (n == 0) return selected;
+
+    const uint32_t budget = budget_blocks();
+    if (budget == 0 || n <= budget) {
+        selected.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) selected.push_back(i);
+        return selected;
+    }
+
+    const uint32_t sink = std::min({cfg_.sink_blocks, budget, n});
+    const uint32_t tail = budget - sink;
+    selected.reserve(budget);
+    for (uint32_t i = 0; i < sink; ++i) selected.push_back(i);
+    // n > budget guarantees `tail_begin >= sink`, so the prefix and suffix do
+    // not overlap and the result contains exactly `budget` ascending IDs.
+    const uint32_t tail_begin = n - tail;
+    for (uint32_t i = tail_begin; i < n; ++i) selected.push_back(i);
+    return selected;
+}
+
 std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;

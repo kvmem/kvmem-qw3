@@ -3227,10 +3227,9 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
         if (d.nvme_slot >= 0 && kvmem_nvme_tier_) kvmem_nvme_tier_->release_block(d.block_id);
     }
     // Invalidate the per-session selection indices so a stale index over the old
-    // (larger) block count cannot survive. restore_state leaves kvmem_active_
-    // true, so the retrieval-index rebuild guard (!kvmem_active_) would otherwise
-    // skip the rebuild; the post-suffix kvmem_reselect() rebuilds over the
-    // correct block count. Position/KV/recurrent/window are NOT touched here.
+    // (larger) block count cannot survive. The warm-resume pressure selection and
+    // the post-suffix semantic selection rebuild over the corrected block table.
+    // Position/KV/recurrent/window are NOT touched here.
     bs_score_ready_ = false;
     bs_window_blocks_ = 0;
     bs_window_block_ids_.clear();
@@ -3288,7 +3287,7 @@ void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
     const uint32_t headroom_pages =
         next_chunk_pages + keep_free_blocks * pages_per_block;
     if (free_pages > headroom_pages) return;
-    kvmem_reselect();
+    kvmem_reselect_prefill_pressure();
 }
 
 void QwenExecutor::sync_window_pages_device(uint32_t have_pages) {
@@ -4150,6 +4149,53 @@ uint32_t QwenExecutor::kvmem_reselect() {
     return kvmem_finish_reselect();
 }
 
+void QwenExecutor::kvmem_prepare_content_index_before_first_selection() {
+    if (!block_store_) return;
+    const KvMemMethod method = block_store_->config().select_method;
+    if (method == KvMemMethod::Retrieval && !g_content_ready_ &&
+        !kvmem_active_ && kvmem_query_end_ <= kvmem_query_begin_) {
+        kvmem_build_content_index();
+    }
+}
+
+uint32_t QwenExecutor::kvmem_reselect_prefill_pressure() {
+    if (!kvmem_enabled_ || !block_store_) return 0;
+    if (block_store_->block_count() == 0) return 0;
+    if (kvmem_pending_reselect_) {
+        throw std::runtime_error(
+            "KVMem prefill-pressure selection during pending reselect");
+    }
+
+    // Non-query-conditioned retrieval historically snapshots its immutable
+    // content index immediately before the first mid-prefill eviction. Keep
+    // that correctness side effect, but do not score or consult it here.
+    kvmem_prepare_content_index_before_first_selection();
+    const std::vector<uint32_t> selected =
+        block_store_->pick_prefill_pressure_blocks();
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        const uint32_t n = block_store_->block_count();
+        const uint32_t sink = std::min<uint32_t>(
+            block_store_->config().sink_blocks,
+            static_cast<uint32_t>(selected.size()));
+        const uint32_t tail_begin = selected.size() > sink
+            ? selected[sink] : n;
+        std::fprintf(stderr,
+                     "[bs-prefill-pressure] blocks=%u selected=%zu sink=%u "
+                     "tail_begin=%u\n",
+                     n, selected.size(), sink, tail_begin);
+    }
+    return kvmem_set_selection(selected);
+}
+
+void QwenExecutor::kvmem_prepare_prefill_window(uint32_t upcoming_tokens) {
+    if (!kvmem_enabled_ || !block_store_ || !kvmem_active_) return;
+    if (upcoming_tokens == 0) return;
+    const uint64_t projected_tokens =
+        static_cast<uint64_t>(position_) + upcoming_tokens;
+    if (projected_tokens <= block_store_->config().select_budget) return;
+    (void)kvmem_reselect_prefill_pressure();
+}
+
 uint32_t QwenExecutor::kvmem_prepare_reselect() {
     if (!kvmem_enabled_ || !block_store_) return 0;
     if (block_store_->block_count() == 0) return 0;
@@ -4172,10 +4218,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     // g_content_ready_ on completion, so this guard is also self-disabling once it
     // has run; the explicit span check keeps the paged builder off even on the
     // transient mid-prefill reselects (before the incremental index completes).
-    if (method == KvMemMethod::Retrieval && !g_content_ready_ &&
-        !kvmem_active_ && kvmem_query_end_ <= kvmem_query_begin_) {
-        kvmem_build_content_index();
-    }
+    kvmem_prepare_content_index_before_first_selection();
     // Score selection by the configured method (all three feed pick_topk, which
     // always keeps the sink + recent windows):
     //   Retrieval — global content similarity (can resurrect dropped blocks);

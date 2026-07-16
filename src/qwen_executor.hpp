@@ -376,9 +376,9 @@ public:
     // checkpoint (kvmem prefix cache). Drops trailing blocks, releases their
     // CPU/NVMe tier slots (GPU pages were freed by restore_state's KV-page
     // truncate, so they are NOT released here), and invalidates the per-session
-    // selection indices so the next kvmem_reselect() rebuilds over the correct
-    // block count. No-op when block-sparse is disabled or token_pos is already
-    // the live end.
+    // selection indices so the pre-suffix pressure-window rebuild and the final
+    // semantic reselect both operate over the correct block count. No-op when
+    // block-sparse is disabled or token_pos is already the live end.
     void kvmem_truncate_to(uint32_t token_pos);
     // Spill cold blocks to the tier mid-prefill if the bounded GPU page pool is
     // about to run short. `next_chunk_tokens` is the size of the upcoming prefill
@@ -386,6 +386,18 @@ public:
     // can grab >100 pages at once, so a "only when nearly empty" trigger would
     // let the pool exhaust mid-chunk and throw). No-op when not bounded/tiered.
     void kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens);
+
+    // Assemble the deterministic long-prefill working set: configured sink
+    // prefix plus the newest blocks filling the rest of the selection budget.
+    // Unlike kvmem_reselect(), this never runs or consumes a semantic scorer.
+    uint32_t kvmem_reselect_prefill_pressure();
+
+    // Normalize an already-sparse window before appending a new prefill suffix.
+    // This is what prevents a previous turn's semantic working set from shaping
+    // the next above-budget prefill before physical page pressure first fires.
+    // Cold/all-fit paths are no-ops and transition through the normal pressure
+    // trigger only after they actually outgrow the resident pool.
+    void kvmem_prepare_prefill_window(uint32_t upcoming_tokens);
 
     // Re-select the working set from the built-in cumulative-attention top-k
     // and assemble it: re-RoPE each moved block in place (per attention layer)
@@ -801,6 +813,10 @@ private:
     // heat via set_attn_scores; a quantized (q8/fp8) cache that can't be
     // de-RoPE'd falls back to the window-local signal.
     void kvmem_build_content_index();         // once, from pristine cache
+    // Preserve the non-query-conditioned retrieval index before the first
+    // pressure eviction, without coupling that bookkeeping to the selection
+    // policy used for the eviction itself.
+    void kvmem_prepare_content_index_before_first_selection();
     void kvmem_snapshot_content_query(uint32_t layer_index);  // per step
     bool kvmem_retrieval_score();              // interval -> set_attn_scores
     bool g_content_ready_ = false;                    // g_kbar_ holds the index

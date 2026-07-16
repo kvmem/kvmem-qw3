@@ -171,6 +171,84 @@ static void test_topk_zero_recent_keeps_no_suffix() {
     CHECK(std::find(sel.begin(), sel.end(), 9) == sel.end());
 }
 
+static void test_prefill_pressure_sink_full_recent_tail() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 128;
+    cfg.select_budget = 128 * 5;  // budget = 5 blocks
+    cfg.sink_blocks = 2;
+    cfg.recent_blocks = 0;        // pressure policy deliberately ignores this
+    KvMemStore s(cfg);
+    s.register_append(128 * 10);  // ids 0..9
+
+    // Make old middle blocks arbitrarily hot. Pressure selection must remain a
+    // pure positional sink + newest-tail policy: [0,1] + [7,8,9].
+    std::vector<double> scores(10, 0.0);
+    scores[2] = 1000.0;
+    scores[3] = 999.0;
+    scores[4] = 998.0;
+    s.set_retrieval_scores(scores);
+    const std::vector<uint32_t> expected{0, 1, 7, 8, 9};
+    CHECK(s.pick_prefill_pressure_blocks() == expected);
+
+    // A prior semantic working set and a different score vector cannot affect
+    // the next pressure choice.
+    (void)s.set_selection({0, 1, 2, 3, 4});
+    scores.assign(10, 0.0);
+    scores[5] = 5000.0;
+    scores[6] = 4000.0;
+    s.set_retrieval_scores(scores);
+    CHECK(s.pick_prefill_pressure_blocks() == expected);
+
+    // `recent_blocks` is a semantic-selector pin, not the pressure tail size.
+    cfg.recent_blocks = 4;
+    KvMemStore with_semantic_recent(cfg);
+    with_semantic_recent.register_append(128 * 10);
+    CHECK(with_semantic_recent.pick_prefill_pressure_blocks() == expected);
+}
+
+static void test_prefill_pressure_edges() {
+    // With no sink, the whole pressure budget is the newest tail.
+    {
+        KvMemStoreConfig cfg;
+        cfg.block_tokens = 32;
+        cfg.select_budget = 32 * 3;
+        cfg.sink_blocks = 0;
+        KvMemStore s(cfg);
+        s.register_append(32 * 6);
+        const std::vector<uint32_t> expected{3, 4, 5};
+        CHECK(s.pick_prefill_pressure_blocks() == expected);
+    }
+
+    // Sink is clamped by the budget, leaving no tail when it consumes all slots.
+    {
+        KvMemStoreConfig cfg;
+        cfg.block_tokens = 32;
+        cfg.select_budget = 32 * 3;
+        cfg.sink_blocks = 8;
+        cfg.recent_blocks = 8;
+        KvMemStore s(cfg);
+        s.register_append(32 * 7 + 11);  // partial block id 7 included in n
+        const std::vector<uint32_t> expected{0, 1, 2};
+        CHECK(s.pick_prefill_pressure_blocks() == expected);
+    }
+
+    // Below budget remains identity, including the trailing partial block.
+    {
+        KvMemStoreConfig cfg;
+        cfg.block_tokens = 32;
+        cfg.select_budget = 32 * 8;
+        cfg.sink_blocks = 2;
+        KvMemStore s(cfg);
+        s.register_append(32 * 3 + 7);
+        const std::vector<uint32_t> expected{0, 1, 2, 3};
+        CHECK(s.pick_prefill_pressure_blocks() == expected);
+    }
+
+    KvMemStoreConfig cfg;
+    KvMemStore empty(cfg);
+    CHECK(empty.pick_prefill_pressure_blocks().empty());
+}
+
 static void test_quota_policy_sink_recent_retrieval_profile() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 128;
@@ -382,6 +460,8 @@ int main() {
     test_stage_in_uses_tier_residency();
     test_topk_budget_sink_recent();
     test_topk_zero_recent_keeps_no_suffix();
+    test_prefill_pressure_sink_full_recent_tail();
+    test_prefill_pressure_edges();
     test_quota_policy_sink_recent_retrieval_profile();
     test_topk_all_fit();
     test_topk_empty();
