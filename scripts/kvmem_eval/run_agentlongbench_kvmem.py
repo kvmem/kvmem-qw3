@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--api-base", default="http://127.0.0.1:8087/v1")
     parser.add_argument("--model", default="Qwen3.6-27B-Q8_0.gguf")
+    parser.add_argument("--method", default="kvmem_mean_k_32k_b32")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--max-tokens", type=int, default=50000)
@@ -274,11 +275,13 @@ def chat_completion(
     }
 
 
-def base_row(index: int, total: int, sample: dict[str, Any]) -> dict[str, Any]:
+def base_row(
+    index: int, total: int, sample: dict[str, Any], method: str
+) -> dict[str, Any]:
     raw = sample.get("raw") if isinstance(sample.get("raw"), dict) else {}
     return {
         "benchmark": "AgentLongBench-500-long250",
-        "method": "kvmem_mean_k_32k_b32",
+        "method": method,
         "index": index,
         "total": total,
         "stable_sample_id": sample["stable_sample_id"],
@@ -347,7 +350,7 @@ def write_progress(root: Path, samples: list[dict[str, Any]], current: int | Non
     )
 
 
-def write_final(root: Path, samples: list[dict[str, Any]]) -> None:
+def write_final(root: Path, samples: list[dict[str, Any]], method: str) -> None:
     output = paths(root)
     answer_rows = read_jsonl(output["answers"])
     eval_rows = read_jsonl(output["eval"])
@@ -358,7 +361,7 @@ def write_final(root: Path, samples: list[dict[str, Any]]) -> None:
     total = len(samples)
     summary = {
         "benchmark": "AgentLongBench-500-long250",
-        "method": "kvmem_mean_k_32k_b32",
+        "method": method,
         "total": total,
         "answers": len(answers),
         "evaluated": len(evals),
@@ -425,7 +428,7 @@ def main() -> None:
     args.output_root.mkdir(parents=True, exist_ok=True)
     config = {
         "benchmark": "AgentLongBench-500-long250",
-        "method": "kvmem_mean_k_32k_b32",
+        "method": args.method,
         "dataset": str(args.dataset),
         "canonical_manifest": str(args.manifest),
         "canonical_worker": str(
@@ -445,6 +448,7 @@ def main() -> None:
     if output["config"].exists():
         previous = json.loads(output["config"].read_text(encoding="utf-8"))
         comparable = (
+            "method",
             "dataset",
             "canonical_manifest",
             "model",
@@ -488,7 +492,7 @@ def main() -> None:
                 max(1, args.context_window - prompt_tokens - args.context_safety_margin),
             )
             row = {
-                **base_row(index, total, sample),
+                **base_row(index, total, sample, args.method),
                 "prompt_sha256": prompt_hash,
                 "prompt_tokens": prompt_tokens,
                 "prompt_tokenizer": "qw3:/tokenize",
@@ -599,7 +603,7 @@ def main() -> None:
         )
         write_progress(args.output_root, samples, index)
 
-    write_final(args.output_root, samples)
+    write_final(args.output_root, samples, args.method)
     print(f"[complete] results={args.output_root}", flush=True)
 
 
