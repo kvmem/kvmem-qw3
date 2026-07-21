@@ -99,6 +99,11 @@ class Qw3Client:
             "enable_thinking": overrides.get("enable_thinking", self.enable_thinking),
             "stream": True,
         }
+        extra_body = overrides.get("extra_body")
+        if extra_body is not None:
+            if not isinstance(extra_body, dict):
+                raise TypeError("extra_body must be a dict when provided")
+            payload.update(extra_body)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -111,6 +116,7 @@ class Qw3Client:
         reasoning_parts: list[str] = []
         content_parts: list[str] = []
         finish_reason = ""
+        stream_error: str | None = None
         prompt_tokens: int | None = None
         completion_tokens: int | None = None
 
@@ -143,6 +149,19 @@ class Qw3Client:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+
+                # The qw3 server keeps the HTTP/SSE stream well-formed when a
+                # generation exception occurs: it emits one terminal chunk with
+                # finish_reason="error" and the exception text in the root
+                # `error` field. Treat that as a failed sample rather than an
+                # ordinary empty answer.
+                chunk_error = chunk.get("error")
+                if chunk_error:
+                    if isinstance(chunk_error, dict):
+                        stream_error = str(
+                            chunk_error.get("message") or chunk_error)
+                    else:
+                        stream_error = str(chunk_error)
 
                 # usage may ride on a trailing chunk (choices empty)
                 usage = chunk.get("usage")
@@ -191,6 +210,8 @@ class Qw3Client:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             first_part=first_part,
+            error=(stream_error or "server stream finished with error")
+            if finish_reason == "error" else stream_error,
         )
 
 

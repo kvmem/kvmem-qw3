@@ -334,6 +334,13 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint32_t rope_dim, int32_t rope_base,
                                       float theta, uint32_t n_subblocks,
                                       cudaStream_t stream);
+bool launch_block_kmean_content_batch_merge(
+    const float *k_batch, float *kbar, uint64_t kbar_block_base,
+    uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+    uint32_t blk_tokens, uint32_t first_block_token_offset,
+    uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+    int32_t rope_base, float theta, uint32_t n_subblocks,
+    cudaStream_t stream);
 // Raw-key store (per-token retrieval): store each de-RoPE'd K row (no mean).
 bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
                                        uint64_t out_base_elem, uint32_t k_stride,
@@ -3722,6 +3729,80 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
     const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
     kbar[(blk * gridDim.y + h) * head_dim + d] = acc * inv;
+}
+
+// Exact incremental variant for a chunk whose first row begins inside an
+// already-indexed logical block. `first_block_token_offset` rows of that block
+// have previously contributed to kbar. Merge their existing mean with the new
+// rows by exact prefix/new counts. An aligned replay passes offset=0, which
+// overwrites every replayed block and invalidates stale first-pass means.
+__global__ void block_kmean_content_batch_merge_kernel(
+        const float *k_batch, float *kbar, uint64_t kbar_block_base,
+        uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+        uint32_t first_block_token_offset, uint32_t head_dim,
+        uint32_t rope_dim, int32_t rope_base, float theta,
+        uint32_t n_subblocks) {
+    const uint32_t combined = blockIdx.x;
+    const uint32_t j = combined / n_subblocks;
+    const uint32_t sb = combined % n_subblocks;
+    const uint32_t h = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    // Coordinates are relative to the first destination block; incoming row r
+    // occupies coordinate first_block_token_offset+r.
+    const uint32_t sub_tokens =
+        (blk_tokens + n_subblocks - 1) / n_subblocks;
+    const uint32_t sb_lo = j * blk_tokens + sb * sub_tokens;
+    const uint32_t block_hi = (j + 1) * blk_tokens;
+    const uint32_t sb_hi = min(sb_lo + sub_tokens, block_hi);
+    const uint32_t incoming_lo = first_block_token_offset;
+    const uint32_t incoming_hi = incoming_lo + batch;
+    const uint32_t overlap_lo = max(sb_lo, incoming_lo);
+    const uint32_t overlap_hi = min(sb_hi, incoming_hi);
+    if (overlap_lo >= overlap_hi) return;
+
+    // Only the first destination block can contain an existing prefix. This
+    // generic intersection naturally yields zero for later blocks/sub-blocks.
+    const uint32_t prefix_hi = min(first_block_token_offset, sb_hi);
+    const uint32_t prior = prefix_hi > sb_lo ? prefix_hi - sb_lo : 0u;
+    const uint32_t r_lo = overlap_lo - incoming_lo;
+    const uint32_t r_hi = overlap_hi - incoming_lo;
+    const uint32_t half = rope_dim / 2;
+    float acc = 0.0f;
+    for (uint32_t r = r_lo; r < r_hi; ++r) {
+        const float *row = k_batch + static_cast<uint64_t>(r) * k_stride +
+                           static_cast<uint64_t>(h) * head_dim;
+        const int32_t pos = rope_base + static_cast<int32_t>(r);
+        float deroped;
+        if (d < half) {
+            const float inv_freq = __powf(
+                theta, -2.0f * static_cast<float>(d) /
+                           static_cast<float>(rope_dim));
+            const float ang = static_cast<float>(pos) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            deroped = row[d] * c + row[d + half] * s;
+        } else if (d < rope_dim) {
+            const uint32_t i = d - half;
+            const float inv_freq = __powf(
+                theta, -2.0f * static_cast<float>(i) /
+                           static_cast<float>(rope_dim));
+            const float ang = static_cast<float>(pos) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            deroped = -row[d - half] * s + row[d] * c;
+        } else {
+            deroped = row[d];
+        }
+        acc += deroped;
+    }
+    const uint32_t added = r_hi - r_lo;
+    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
+    const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
+    const float prior_sum = prior > 0
+        ? kbar[out] * static_cast<float>(prior) : 0.0f;
+    kbar[out] = (prior_sum + acc) / static_cast<float>(prior + added);
 }
 
 // derope_store_content_batch_kernel (MaxSim, raw-key retrieval): like
@@ -7228,6 +7309,37 @@ public:
         return launch_status("cuda block_kmean_content_batch_device");
     }
 
+    DeviceStatus block_kmean_content_batch_merge_device(
+            const DeviceTensor &k_batch, DeviceTensor &kbar,
+            uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+            uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+            uint32_t first_block_token_offset, uint32_t n_kv_heads,
+            uint32_t head_dim, uint32_t rope_dim, int32_t rope_base,
+            float theta, uint32_t n_subblocks = 1) override {
+        if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 ||
+            batch == 0) {
+            return {};
+        }
+        const auto &kbt = as_tensor(k_batch);
+        auto &kb = as_tensor(kbar);
+        if (kbt.elem_size != sizeof(float) || kb.elem_size != sizeof(float)) {
+            return {false,
+                    "block_kmean_content_batch_merge_device requires fp32 buffers"};
+        }
+        if (first_block_token_offset >= blk_tokens) {
+            return {false,
+                    "block_kmean_content_batch_merge_device offset out of range"};
+        }
+        if (!ported::launch_block_kmean_content_batch_merge(
+                kbt.ptr, kb.ptr, kbar_block_base, n_blocks_chunk, k_stride,
+                batch, blk_tokens, first_block_token_offset, n_kv_heads,
+                head_dim, rope_dim, rope_base, theta, n_subblocks,
+                exec_stream_)) {
+            return {false, "block_kmean_content_batch_merge launch failed"};
+        }
+        return launch_status("cuda block_kmean_content_batch_merge_device");
+    }
+
     DeviceStatus derope_store_content_batch_device(const DeviceTensor &k_batch,
                                                    DeviceTensor &kraw,
                                                    uint64_t out_base_elem,
@@ -10160,6 +10272,26 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
     block_kmean_content_batch_kernel<<<grid, head_dim, 0, stream>>>(
         k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens, head_dim,
         rope_dim, rope_base, theta, ns);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_content_batch_merge(
+        const float *k_batch, float *kbar, uint64_t kbar_block_base,
+        uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+        uint32_t blk_tokens, uint32_t first_block_token_offset,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+        int32_t rope_base, float theta, uint32_t n_subblocks,
+        cudaStream_t stream) {
+    if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 ||
+        batch == 0) {
+        return true;
+    }
+    if (first_block_token_offset >= blk_tokens) return false;
+    const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
+    dim3 grid(n_blocks_chunk * ns, n_kv_heads);
+    block_kmean_content_batch_merge_kernel<<<grid, head_dim, 0, stream>>>(
+        k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens,
+        first_block_token_offset, head_dim, rope_dim, rope_base, theta, ns);
     return cudaGetLastError() == cudaSuccess;
 }
 

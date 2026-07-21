@@ -95,6 +95,13 @@ void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {
     blocks_[block_id].baked_pos = baked_pos;
 }
 
+void KvMemStore::record_block_rerope(uint32_t block_id, int64_t baked_pos) {
+    if (block_id >= block_count()) return;
+    KvMemBlock &block = blocks_[block_id];
+    if (block.baked_pos != baked_pos) ++block.remap_count;
+    block.baked_pos = baked_pos;
+}
+
 std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
@@ -281,7 +288,10 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
         plan.remaps.push_back(rm);
 
         b.in_working_set = true;
-        b.baked_pos = static_cast<int64_t>(window_pos);
+        if (!cfg_.immutable_source_k) {
+            if (!rm.skip) ++b.remap_count;
+            b.baked_pos = static_cast<int64_t>(window_pos);
+        }
         window_pos += b.n_tokens;
     }
     plan.total_window_tokens = window_pos;

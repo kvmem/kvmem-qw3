@@ -219,6 +219,111 @@ def main() -> int:
             "QW3_FATTN_NSPLIT": "1",
             "QW3_PREFILL_FA2_NSPLIT": "1",
             "QW3_KVMEM_TIMING": "1",
+            **(
+                {"QW3_KVMEM_RECOMPUTE_QUERY": os.environ["QW3_KVMEM_RECOMPUTE_QUERY"]}
+                if "QW3_KVMEM_RECOMPUTE_QUERY" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_IMMUTABLE_SOURCE_K":
+                 os.environ["QW3_KVMEM_IMMUTABLE_SOURCE_K"]}
+                if "QW3_KVMEM_IMMUTABLE_SOURCE_K" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP"]}
+                if "QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_STABLE_INGEST":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_STABLE_INGEST"]}
+                if "QW3_KVMEM_TRANSCRIPT_STABLE_INGEST" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_STABLE_FAST":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_STABLE_FAST"]}
+                if "QW3_KVMEM_TRANSCRIPT_STABLE_FAST" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_RESET_FINAL_RECURRENT":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_RESET_FINAL_RECURRENT"]}
+                if "QW3_KVMEM_TRANSCRIPT_RESET_FINAL_RECURRENT" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_RESET_EACH_RECURRENT":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_RESET_EACH_RECURRENT"]}
+                if "QW3_KVMEM_TRANSCRIPT_RESET_EACH_RECURRENT" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_SESSION_LOCAL":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_SESSION_LOCAL"]}
+                if "QW3_KVMEM_TRANSCRIPT_SESSION_LOCAL" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_EXACT_QUESTION":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_EXACT_QUESTION"]}
+                if "QW3_KVMEM_TRANSCRIPT_EXACT_QUESTION" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_TOKENS":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_REFRESH_TOKENS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_TOKENS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_CACHED_TOKENS":
+                 os.environ[
+                     "QW3_KVMEM_TRANSCRIPT_REFRESH_CACHED_TOKENS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_CACHED_TOKENS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_MEANK":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_REFRESH_MEANK"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_MEANK" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_RELEVANCE_ORDER":
+                 os.environ[
+                     "QW3_KVMEM_TRANSCRIPT_REFRESH_RELEVANCE_ORDER"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_RELEVANCE_ORDER" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_BLOCKS":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_REFRESH_BLOCKS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_BLOCKS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_CORE_TOKENS":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_REFRESH_CORE_TOKENS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_CORE_TOKENS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_NEIGHBOR_BLOCKS":
+                 os.environ[
+                     "QW3_KVMEM_TRANSCRIPT_REFRESH_NEIGHBOR_BLOCKS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_NEIGHBOR_BLOCKS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_SESSION_EXPAND":
+                 os.environ[
+                     "QW3_KVMEM_TRANSCRIPT_REFRESH_SESSION_EXPAND"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_SESSION_EXPAND" in os.environ
+                else {}
+            ),
         },
     }
 

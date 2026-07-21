@@ -77,6 +77,53 @@ def render_messages(sample: Sample) -> list[dict[str, Any]]:
     ]
 
 
+def render_transcript_messages(sample: Sample) -> list[dict[str, Any]]:
+    """Render the benchmark history as its original user/assistant turns.
+
+    This is the experimental lifecycle form used to simulate a long-lived chat:
+    once the 224K working set plus 32K reserve is full, each subsequent user
+    message can trigger re-selection, while the following recorded assistant
+    message is teacher-forced prefill rather than newly decoded text. Session
+    dates are attached to the first real message of each session, so no synthetic
+    user query is introduced solely for metadata.
+    """
+    messages: list[dict[str, Any]] = [{
+        "role": "system",
+        "content": SYSTEM_INSTRUCTION.format(
+            question_date=sample.question_date or "unknown"),
+    }]
+    dates = sample.haystack_dates
+    for idx, session in enumerate(sample.haystack_sessions):
+        date = dates[idx] if idx < len(dates) else ""
+        header = (f"=== Conversation on {date} ===" if date
+                  else f"=== Conversation {idx + 1} ===")
+        first_emitted = True
+        for turn in session:
+            role = str(turn.get("role", "")).strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(turn.get("content", "")).strip()
+            if first_emitted:
+                content = f"{header}\n{content}"
+            message = {"role": role, "content": content}
+            if first_emitted:
+                # Experimental metadata consumed only when
+                # kvmem_transcript_replay is requested.  The chat renderer
+                # ignores unknown message fields, so the prompt text remains
+                # byte-for-byte identical while the server can map independent
+                # LongMemEval sessions to exact token boundaries.
+                message["kvmem_session_start"] = True
+                first_emitted = False
+            messages.append(message)
+    question_user = (
+        "=== End of conversation history ===\n\n"
+        "Based on the conversations above, answer the following question.\n"
+        f"Question (asked on {sample.question_date}): {sample.question}"
+    )
+    messages.append({"role": "user", "content": question_user})
+    return messages
+
+
 if __name__ == "__main__":
     import argparse
     from pathlib import Path

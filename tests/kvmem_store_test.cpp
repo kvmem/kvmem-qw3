@@ -77,6 +77,9 @@ static void test_selection_diff_and_remap() {
     CHECK(plan.remaps[2].block_id == 4);
     CHECK(plan.remaps[2].from_base == 128 * 4);
     CHECK(plan.remaps[2].to_base == 128 * 2);
+    CHECK(s.blocks()[0].remap_count == 0);
+    CHECK(s.blocks()[2].remap_count == 1);
+    CHECK(s.blocks()[4].remap_count == 1);
     for (uint32_t id : plan.stage_out) {
         s.set_block_tier(id, KvTier::CPU, static_cast<int32_t>(id), -1);
     }
@@ -96,6 +99,53 @@ static void test_selection_diff_and_remap() {
     CHECK(plan2.remaps[2].to_base == 128 * 2);
     CHECK(plan2.remaps[2].skip == false);
     CHECK(plan2.total_window_tokens == 128 * 3);
+    CHECK(s.blocks()[2].remap_count == 1);  // stable slot: no new write
+    CHECK(s.blocks()[3].remap_count == 1);
+
+    // Tier canonicalization is another fp16 re-RoPE write and must contribute
+    // to the diagnostic count even though it is not part of set_selection().
+    s.record_block_rerope(3, s.blocks()[3].orig_pos_start);
+    CHECK(s.blocks()[3].remap_count == 2);
+}
+
+static void test_immutable_source_selection_keeps_construction_bake() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.immutable_source_k = true;
+    KvMemStore s(cfg);
+    s.register_append(32 * 6);
+
+    // Source block 4 was constructed in its original frame.  Selecting it into
+    // slot 1 materializes working K from 128 -> 32 without mutating source
+    // metadata.
+    auto p1 = s.set_selection({0, 4});
+    CHECK(p1.remaps.size() == 2);
+    CHECK(p1.remaps[1].block_id == 4);
+    CHECK(p1.remaps[1].from_base == 128);
+    CHECK(p1.remaps[1].to_base == 32);
+    CHECK(!p1.remaps[1].skip);
+    CHECK(s.blocks()[4].baked_pos == 128);
+    CHECK(s.blocks()[4].remap_count == 0);
+
+    // A different selection moves the same block to slot 2.  The plan must
+    // still start at the immutable construction frame, not at the prior window
+    // slot.  This is the property that prevents cumulative fp16 re-RoPE drift.
+    auto p2 = s.set_selection({0, 2, 4});
+    CHECK(p2.remaps.size() == 3);
+    CHECK(p2.remaps[2].block_id == 4);
+    CHECK(p2.remaps[2].from_base == 128);
+    CHECK(p2.remaps[2].to_base == 64);
+    CHECK(s.blocks()[4].baked_pos == 128);
+    CHECK(s.blocks()[4].remap_count == 0);
+
+    // Window-baked source K created by a later prefill chunk is also immutable:
+    // its recorded construction position remains the source of every future
+    // one-shot materialization.
+    s.set_block_baked_pos(4, 777);
+    auto p3 = s.set_selection({0, 4});
+    CHECK(p3.remaps[1].from_base == 777);
+    CHECK(p3.remaps[1].to_base == 32);
+    CHECK(s.blocks()[4].baked_pos == 777);
 }
 
 static void test_stage_in_uses_tier_residency() {
@@ -457,6 +507,7 @@ static void test_deltanet_config_and_scores() {
 int main() {
     test_register_append();
     test_selection_diff_and_remap();
+    test_immutable_source_selection_keeps_construction_bake();
     test_stage_in_uses_tier_residency();
     test_topk_budget_sink_recent();
     test_topk_zero_recent_keeps_no_suffix();

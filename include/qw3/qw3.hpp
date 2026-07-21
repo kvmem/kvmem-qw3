@@ -122,6 +122,28 @@ struct GenerationOptions {
     // means no span -> the recency/single-token path runs unchanged.
     uint32_t kvmem_query_begin = 0;
     uint32_t kvmem_query_end = 0;
+    // Experimental transcript replay: every span is a user query that arrived
+    // after the KVMem working-set + generation reserve was already full. During
+    // prefill the backend reselects at each span, replays that query against the
+    // new window, then teacher-forces the recorded response. Only the final span
+    // is followed by decode. Empty keeps the normal one-shot path unchanged.
+    struct KvMemReplayQuerySpan {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+    };
+    std::vector<KvMemReplayQuerySpan> kvmem_replay_query_spans;
+    // Optional transcript-construction boundaries. Each value is the first
+    // token of an independent historical session, before block alignment. The
+    // session-local canonical-KV experiment uses these boundaries to prevent a
+    // block's hidden state from inheriting unrelated preceding sessions.
+    std::vector<uint32_t> kvmem_replay_session_starts;
+    // Optional diagnostics-only metadata. The context span identifies the
+    // flattened benchmark history inside the rendered prompt, while trace_tag
+    // provides a stable request/sample key for offline retrieval analysis.
+    // These fields never participate in scoring or block selection.
+    uint32_t kvmem_context_begin = 0;
+    uint32_t kvmem_context_end = 0;
+    std::string kvmem_trace_tag;
 };
 
 struct ModelInfo {

@@ -924,6 +924,35 @@ public:
         return {false, "block_kmean_content_batch_device requires backend override"};
     }
 
+    // Incremental counterpart used when a logical block is produced by several
+    // prefill calls (multi-turn transcript replay / resumed sessions). The first
+    // input row belongs at `first_block_token_offset` in the first destination
+    // block. Existing means for [0, offset) are merged by their exact row count;
+    // later blocks are overwritten from an empty prefix.
+    virtual DeviceStatus block_kmean_content_batch_merge_device(
+            const DeviceTensor &k_batch,
+            DeviceTensor &kbar,
+            uint64_t kbar_block_base,
+            uint32_t n_blocks_chunk,
+            uint32_t k_stride,
+            uint32_t batch,
+            uint32_t blk_tokens,
+            uint32_t first_block_token_offset,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            uint32_t rope_dim,
+            int32_t rope_base,
+            float theta,
+            uint32_t n_subblocks = 1) {
+        (void)k_batch; (void)kbar; (void)kbar_block_base;
+        (void)n_blocks_chunk; (void)k_stride; (void)batch;
+        (void)blk_tokens; (void)first_block_token_offset;
+        (void)n_kv_heads; (void)head_dim; (void)rope_dim;
+        (void)rope_base; (void)theta; (void)n_subblocks;
+        return {false,
+                "block_kmean_content_batch_merge_device requires backend override"};
+    }
+
     // derope_store_content_batch_device (#104, raw-key MaxSim): like
     // block_kmean_content_batch_device but STORES each de-RoPE'd K row instead of
     // averaging — fills kraw (fp32 [.., n_kv_heads, head_dim]) so the MaxSim scorer

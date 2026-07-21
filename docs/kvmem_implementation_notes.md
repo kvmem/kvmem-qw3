@@ -6,6 +6,10 @@ intended to be a concise paper draft. Instead, it records the mechanisms,
 design invariants, equations, scheduling decisions, data structures, efficiency
 arguments, limitations, and paper-relevant interpretation of the implementation.
 
+> **Active issue tracker:** unresolved correctness bugs, retrieval-quality
+> limitations, compatibility gaps, validation evidence, and recommended repair
+> order are maintained in `docs/kvmem_known_issues.md`.
+
 The implementation is centered around three ideas:
 
 1. Step-level memory scheduling: KVMem updates its memory state at structured
@@ -685,6 +689,51 @@ attention layer. The CUDA grid covers:
 
 This avoids a launch storm of one kernel per `(layer, block)` pair.
 
+#### 6.4.1 Experimental immutable-source K construction
+
+The default path above changes fp16 K in place.  In a normal single reselect
+this adds only one rounding step, but transcript replay can move the same block
+thousands of times.  Each inverse/forward RoPE then starts from the previously
+rounded result, so the numerical error is cumulative and affects every later
+prefill/decode attention that reads the block, not only retrieval scoring.
+
+`QW3_KVMEM_IMMUTABLE_SOURCE_K=1` enables the drift-free construction path used
+by the LongMemEval-M repair experiment:
+
+1. The bounded repository K is the immutable **source K**. `baked_pos` records
+   the RoPE frame in which that source was constructed and is not changed by
+   selection.
+2. V remains single-copy because it has no positional rotation.
+3. A second bounded **working K** tensor is allocated for the normal-attention
+   layers. Before every assembly, source K is copied to working K with one
+   contiguous D2D copy per layer.
+4. The existing batched remap kernel transforms working K exactly once from
+   the source construction frame to the selected window frame. Attention,
+   teacher-forced prefill, query replay, and final decode read working K.
+5. Stage-out/in preserves source K bytes verbatim together with `baked_pos`;
+   it does not canonicalize source K through another lossy fp16 transform.
+
+The extra GPU cost is one K copy (not K+V): for Qwen3.6-27B with a 256K-token
+fp16 resident pool this is approximately 8 GiB.  CPU/NVMe records are unchanged.
+The full-pool copy intentionally uses one large transfer per standard layer;
+copying selected scattered pages individually would create tens of thousands
+of tiny transfers at block size 32.
+
+Correctness guards/tests:
+
+- `KvMemStore::set_selection` always emits `from_base=source baked_pos` in this
+  mode and never commits the selected window position back into source metadata.
+- appending across a re-selection into an existing partial source block fails
+  loudly; transcript replay/checkpoint boundaries must be block-aligned.
+- `qw3-kvmem-immutable-k` performs 1800 changing fp16 remaps. The immutable
+  result is byte-identical to a one-shot source-to-final mapping, while its
+  in-place control accumulates a measurable error.
+
+The mode is deliberately environment-gated while the frozen ten-sample
+LongMemEval-M study is running. It currently requires fp16/fp32, a bounded
+tiered GPU pool, and leaves the MTP draft K on its existing path; target-model
+verification reads the drift-free main K, so draft K cannot change correctness.
+
 ### 6.5 MTP Window Mirror
 
 When MTP speculative decoding is active and KVMem tiering is enabled for the MTP
@@ -1085,6 +1134,37 @@ This diagnosis motivates neighbor expansion and session/header-aware selection
 before simply increasing the token budget. It also motivates an oracle test that
 forces the answer-local blocks to separate retrieval errors from model reasoning
 errors.
+
+#### 12.7.1 Bounded fresh construction for hybrid state consistency
+
+The subsequent frozen-ten repair study found a second, independent failure
+mode. Reassembling normal-attention K/V does not reassemble Qwen3.6's 48
+DeltaNet layers, and mixing freshly prefetched evidence with a large set of old
+locally-constructed K/V produces a window whose hidden representations do not
+describe one coherent history.
+
+The current experimental repair keeps the historical repository and mean-K
+index, but compiles a small answer window at query time:
+
+1. score the complete historical repository with the ordinary query-conditioned
+   mean-K scorer;
+2. take 1024 full 32-token source blocks (32K tokens) and restore source order;
+3. prefill those exact source tokens once from a clean recurrent state;
+4. assemble only the stable eight-block sink plus the fresh blocks before the
+   exact final query.
+
+The last step is important. A knowledge-update sample had the new and old facts
+at mean-K ranks 3 and 29. Dense replay of the top blocks answered correctly at
+32K, 8K, 2K, and 1K, while adding 32K of old cached evidence to the 32K fresh
+window reverted to the old fact. Adding roughly 192K of old cached evidence was
+worse. Consequently block-refresh mode defaults its cached cap to the configured
+sink size; an explicit `QW3_KVMEM_TRANSCRIPT_REFRESH_CACHED_TOKENS` remains only
+for controlled A/Bs.
+
+This is not a full-history recomputation: a roughly 1.1M-token transcript still
+recomputes only 32K selected source tokens. The frozen-ten run is still in
+progress, so this path remains environment-gated and is not yet the production
+default.
 
 The same diagnostic exposed a configuration ambiguity: `recent_blocks == 0`
 previously derived an unconditional suffix of `budget/4`. At a 200K budget and

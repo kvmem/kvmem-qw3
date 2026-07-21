@@ -34,6 +34,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--benchmark-name",
+        default="AgentLongBench-500-long250",
+        help="artifact label; does not change prompt construction or evaluation",
+    )
+    parser.add_argument(
+        "--allow-custom-subset",
+        action="store_true",
+        help="allow a validated samples/manifest pair other than canonical long250",
+    )
     parser.add_argument("--api-base", default="http://127.0.0.1:8087/v1")
     parser.add_argument("--model", default="Qwen3.6-27B-Q8_0.gguf")
     parser.add_argument("--method", default="kvmem_mean_k_32k_b32")
@@ -48,6 +58,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--question-id", action="append", default=[])
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument(
+        "--kvmem-retrieval-trace-metadata",
+        action="store_true",
+        help="send diagnostics-only context span and stable sample trace tag",
+    )
     parser.add_argument("--seed", type=int)
     return parser.parse_args()
 
@@ -173,10 +188,45 @@ def query_byte_span(sample: dict[str, Any], prompt: str) -> tuple[int, int]:
     return byte_start, byte_end
 
 
+def history_byte_span(
+    canonical: Any, sample: dict[str, Any], prompt: str
+) -> tuple[int, int]:
+    """Return the exact canonical flattened-history byte span.
+
+    The FullContext worker joins rendered non-system messages with one newline.
+    RAG's chunk source uses two newlines; the analysis tool deliberately maps
+    both forms through their shared message/text coordinates instead of treating
+    their token offsets as interchangeable.
+    """
+    raw = sample.get("raw") if isinstance(sample.get("raw"), dict) else {}
+    messages = sample.get("messages") or raw.get("messages") or []
+    lines = [
+        canonical.message_to_text(message)
+        for message in messages
+        if not (isinstance(message, dict) and message.get("role") == "system")
+    ]
+    history = "\n".join(lines)
+    marker = "Full conversation history:\n"
+    marker_start = prompt.find(marker)
+    if marker_start < 0:
+        raise RuntimeError("canonical prompt is missing the history marker")
+    char_start = marker_start + len(marker)
+    char_end = char_start + len(history)
+    if prompt[char_start:char_end] != history:
+        raise RuntimeError("flattened history character span does not round-trip")
+    if prompt.find(marker, marker_start + 1) >= 0:
+        raise RuntimeError("canonical prompt has an ambiguous duplicate history marker")
+    byte_start = len(prompt[:char_start].encode("utf-8"))
+    byte_end = byte_start + len(history.encode("utf-8"))
+    return byte_start, byte_end
+
+
 def chat_completion(
     args: argparse.Namespace,
     prompt: str,
     query_span: tuple[int, int],
+    context_span: tuple[int, int] | None,
+    trace_tag: str | None,
     request_max_tokens: int,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -194,6 +244,13 @@ def chat_completion(
             "content_end": query_span[1],
         },
     }
+    if context_span is not None and trace_tag is not None:
+        payload["kvmem_context_span"] = {
+            "message_index": 0,
+            "content_start": context_span[0],
+            "content_end": context_span[1],
+        }
+        payload["kvmem_trace_tag"] = trace_tag
     if args.seed is not None:
         payload["seed"] = args.seed
     request = urllib.request.Request(
@@ -276,11 +333,15 @@ def chat_completion(
 
 
 def base_row(
-    index: int, total: int, sample: dict[str, Any], method: str
+    index: int,
+    total: int,
+    sample: dict[str, Any],
+    method: str,
+    benchmark_name: str,
 ) -> dict[str, Any]:
     raw = sample.get("raw") if isinstance(sample.get("raw"), dict) else {}
     return {
-        "benchmark": "AgentLongBench-500-long250",
+        "benchmark": benchmark_name,
         "method": method,
         "index": index,
         "total": total,
@@ -350,7 +411,12 @@ def write_progress(root: Path, samples: list[dict[str, Any]], current: int | Non
     )
 
 
-def write_final(root: Path, samples: list[dict[str, Any]], method: str) -> None:
+def write_final(
+    root: Path,
+    samples: list[dict[str, Any]],
+    method: str,
+    benchmark_name: str,
+) -> None:
     output = paths(root)
     answer_rows = read_jsonl(output["answers"])
     eval_rows = read_jsonl(output["eval"])
@@ -360,7 +426,7 @@ def write_final(root: Path, samples: list[dict[str, Any]], method: str) -> None:
     exact = sum(row.get("correct") is True for row in evals)
     total = len(samples)
     summary = {
-        "benchmark": "AgentLongBench-500-long250",
+        "benchmark": benchmark_name,
         "method": method,
         "total": total,
         "answers": len(answers),
@@ -404,11 +470,26 @@ def main() -> None:
     canonical = load_canonical_module(args.benchmark_repo)
     samples = read_jsonl(args.dataset)
     canonical_manifest = read_jsonl(args.manifest)
-    if len(samples) != 250 or len(canonical_manifest) != 250:
+    if len(samples) != len(canonical_manifest):
         raise RuntimeError(
-            f"full run requires canonical 250 rows; got samples={len(samples)} "
+            f"samples/manifest length mismatch: samples={len(samples)} "
             f"manifest={len(canonical_manifest)}"
         )
+    if not args.allow_custom_subset and len(samples) != 250:
+        raise RuntimeError(
+            f"full run requires canonical 250 rows; got {len(samples)}. "
+            "Pass --allow-custom-subset only for a separately materialized subset."
+        )
+    sample_ids = [str(row.get("stable_sample_id") or "") for row in samples]
+    manifest_ids = [
+        str(row.get("stable_sample_id") or "") for row in canonical_manifest
+    ]
+    if any(not sid for sid in sample_ids) or sample_ids != manifest_ids:
+        raise RuntimeError(
+            "samples and manifest must contain the same non-empty stable IDs in order"
+        )
+    if len(set(sample_ids)) != len(sample_ids):
+        raise RuntimeError("samples contain duplicate stable_sample_id values")
     if args.question_id:
         wanted = set(args.question_id)
         samples = [
@@ -427,7 +508,7 @@ def main() -> None:
     output = paths(args.output_root)
     args.output_root.mkdir(parents=True, exist_ok=True)
     config = {
-        "benchmark": "AgentLongBench-500-long250",
+        "benchmark": args.benchmark_name,
         "method": args.method,
         "dataset": str(args.dataset),
         "canonical_manifest": str(args.manifest),
@@ -441,13 +522,16 @@ def main() -> None:
         "max_tokens": args.max_tokens,
         "context_window": args.context_window,
         "enable_thinking": args.enable_thinking,
+        "kvmem_retrieval_trace_metadata": args.kvmem_retrieval_trace_metadata,
         "seed": args.seed,
+        "allow_custom_subset": args.allow_custom_subset,
         "selected_samples": len(samples),
         "started_at": now_iso(),
     }
     if output["config"].exists():
         previous = json.loads(output["config"].read_text(encoding="utf-8"))
         comparable = (
+            "benchmark",
             "method",
             "dataset",
             "canonical_manifest",
@@ -457,10 +541,20 @@ def main() -> None:
             "max_tokens",
             "context_window",
             "enable_thinking",
+            "kvmem_retrieval_trace_metadata",
             "seed",
+            "allow_custom_subset",
             "selected_samples",
         )
-        if any(previous.get(key) != config.get(key) for key in comparable):
+        if any(
+            (
+                previous.get(key, False)
+                if key == "kvmem_retrieval_trace_metadata"
+                else previous.get(key)
+            )
+            != config.get(key)
+            for key in comparable
+        ):
             raise RuntimeError("output root already contains a different run configuration")
     else:
         write_json(output["config"], config)
@@ -486,13 +580,24 @@ def main() -> None:
             if expected_hash and prompt_hash != expected_hash:
                 raise RuntimeError(f"prompt hash mismatch for {sid}")
             query_span = query_byte_span(sample, prompt)
+            context_span = (
+                history_byte_span(canonical, sample, prompt)
+                if args.kvmem_retrieval_trace_metadata
+                else None
+            )
             prompt_tokens = tokenize_count(args.api_base, prompt, args.timeout_sec)
             request_max_tokens = min(
                 args.max_tokens,
                 max(1, args.context_window - prompt_tokens - args.context_safety_margin),
             )
             row = {
-                **base_row(index, total, sample, args.method),
+                **base_row(
+                    index,
+                    total,
+                    sample,
+                    args.method,
+                    args.benchmark_name,
+                ),
                 "prompt_sha256": prompt_hash,
                 "prompt_tokens": prompt_tokens,
                 "prompt_tokenizer": "qw3:/tokenize",
@@ -504,6 +609,9 @@ def main() -> None:
                 "top_p": args.top_p,
                 "enable_thinking": args.enable_thinking,
             }
+            if context_span is not None:
+                row["kvmem_context_span_content_bytes"] = list(context_span)
+                row["kvmem_trace_tag"] = sid
             if sid not in manifest_ids:
                 append_jsonl(output["manifest"], row)
                 manifest_ids.add(sid)
@@ -519,7 +627,14 @@ def main() -> None:
             last_error: Exception | None = None
             for attempt in range(1, args.attempts + 1):
                 try:
-                    result = chat_completion(args, prompt, query_span, request_max_tokens)
+                    result = chat_completion(
+                        args,
+                        prompt,
+                        query_span,
+                        context_span,
+                        sid if context_span is not None else None,
+                        request_max_tokens,
+                    )
                     answer = {**row, **result, "answered_at": now_iso()}
                     append_jsonl(output["answers"], answer)
                     answers[sid] = answer
@@ -603,7 +718,7 @@ def main() -> None:
         )
         write_progress(args.output_root, samples, index)
 
-    write_final(args.output_root, samples, args.method)
+    write_final(args.output_root, samples, args.method, args.benchmark_name)
     print(f"[complete] results={args.output_root}", flush=True)
 
 

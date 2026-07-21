@@ -67,7 +67,7 @@ std::string bytes_gib_label(uint64_t bytes) {
 }
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
-    return g.max_tokens >= 0;
+    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty();
 }
 
 json usage_json(size_t prompt_tokens, size_t completion_tokens) {
@@ -715,9 +715,19 @@ size_t tool_call_safe_emit_len(const std::string &text, bool &marker_found) {
 // Qwen XML tool calls, and tool results become user-side <tool_response> blocks.
 // The final assistant header (+ thinking prefill or empty-think block) is
 // appended for generation.
-std::string render_messages(const json &messages, const json *tools,
-                            bool enable_thinking,
-                            const std::string &forced_tool_name = {}) {
+struct RenderedMessageSpan {
+    size_t message_index = 0;
+    std::string role;
+    size_t segment_begin = 0;
+    size_t segment_end = 0;
+    size_t content_begin = 0;
+    size_t content_end = 0;
+};
+
+std::string render_messages(
+        const json &messages, const json *tools, bool enable_thinking,
+        const std::string &forced_tool_name = {},
+        std::vector<RenderedMessageSpan> *message_spans = nullptr) {
     size_t num_sys = 0;
     std::string merged_system;
     if (messages.is_array() && !messages.empty() && messages[0].is_object()) {
@@ -777,8 +787,19 @@ std::string render_messages(const json &messages, const json *tools,
         const std::string content =
             trim_ascii_ws(m.contains("content") ? render_content(m["content"]) : "");
         if (role == "user") {
-            prompt += "<|im_start|>user\n" + content + "<|im_end|>\n";
+            const size_t segment_begin = prompt.size();
+            prompt += "<|im_start|>user\n";
+            const size_t content_begin = prompt.size();
+            prompt += content;
+            const size_t content_end = prompt.size();
+            prompt += "<|im_end|>\n";
+            if (message_spans) {
+                message_spans->push_back(RenderedMessageSpan{
+                    i, role, segment_begin, prompt.size(), content_begin,
+                    content_end});
+            }
         } else if (role == "assistant") {
+            const size_t segment_begin = prompt.size();
             std::string assistant_content = content;
             std::string reasoning_content;
             if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
@@ -811,6 +832,10 @@ std::string render_messages(const json &messages, const json *tools,
                 }
             }
             prompt += "<|im_end|>\n";
+            if (message_spans) {
+                message_spans->push_back(RenderedMessageSpan{
+                    i, role, segment_begin, prompt.size(), 0, 0});
+            }
         } else if (role == "tool") {
             const bool prev_tool =
                 i > 0 && messages[i - 1].is_object() &&
@@ -1259,9 +1284,36 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
             std::cerr << "\n";
         }
-        const std::string prompt =
-            render_messages(req["messages"], tools, enable_thinking, forced_tool_name);
-        const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
+        bool transcript_replay = false;
+        if (req.contains("kvmem_transcript_replay")) {
+            if (!req["kvmem_transcript_replay"].is_boolean()) {
+                set_error_response(res, 400,
+                                   "kvmem_transcript_replay must be a boolean");
+                return;
+            }
+            transcript_replay = req["kvmem_transcript_replay"].get<bool>();
+        }
+        if (transcript_replay &&
+            (!engine.kvmem_enabled || !engine.kvmem_query_conditioned)) {
+            set_error_response(
+                res, 400,
+                "kvmem_transcript_replay requires --kvmem and "
+                "--kvmem-query-conditioned");
+            return;
+        }
+        if (transcript_replay && engine.kvmem_retrieval_method != "mean-k") {
+            set_error_response(
+                res, 400,
+                "kvmem_transcript_replay currently requires mean-k retrieval");
+            return;
+        }
+        std::vector<RenderedMessageSpan> rendered_message_spans;
+        const std::string prompt = render_messages(
+            req["messages"], tools, enable_thinking, forced_tool_name,
+            transcript_replay ? &rendered_message_spans : nullptr);
+        const std::vector<int32_t> prompt_token_ids =
+            usage_tokenizer.encode(prompt);
+        const size_t prompt_token_count = prompt_token_ids.size();
         if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
             set_error_response(
                 res,
@@ -1287,6 +1339,230 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         if (engine.kvmem_query_conditioned) {
             const json &msgs = req["messages"];
             bool explicit_span = false;
+
+            // Experimental role-preserving transcript replay. Render-time byte
+            // spans are converted to exact token spans in one linear pass over
+            // message segments. Segment boundaries are Qwen special-token
+            // boundaries; verify compositional tokenization against the full
+            // prompt before accepting the mapping. Only user messages that
+            // ARRIVE after select_budget + gen_budget is already full become
+            // replay/reselection events.
+            if (transcript_replay) {
+                std::vector<int32_t> rebuilt;
+                rebuilt.reserve(prompt_token_ids.size());
+                size_t byte_cursor = 0;
+                size_t token_cursor = 0;
+                const uint64_t pressure_threshold =
+                    static_cast<uint64_t>(std::max(0, engine.kvmem_budget)) +
+                    static_cast<uint64_t>(std::max(0, engine.kvmem_gen_budget));
+                for (const RenderedMessageSpan &span : rendered_message_spans) {
+                    const std::string gap = prompt.substr(
+                        byte_cursor, span.segment_begin - byte_cursor);
+                    const std::vector<int32_t> gap_tokens =
+                        usage_tokenizer.encode(gap);
+                    rebuilt.insert(rebuilt.end(), gap_tokens.begin(), gap_tokens.end());
+                    token_cursor += gap_tokens.size();
+
+                    const std::string segment = prompt.substr(
+                        span.segment_begin, span.segment_end - span.segment_begin);
+                    const std::vector<int32_t> segment_tokens =
+                        usage_tokenizer.encode(segment);
+                    const size_t segment_token_begin = token_cursor;
+                    if (span.message_index < msgs.size() &&
+                        msgs[span.message_index].is_object() &&
+                        msgs[span.message_index].contains(
+                            "kvmem_session_start")) {
+                        const json &marker =
+                            msgs[span.message_index]["kvmem_session_start"];
+                        if (!marker.is_boolean()) {
+                            set_error_response(
+                                res, 400,
+                                "message kvmem_session_start must be a boolean");
+                            return;
+                        }
+                        if (marker.get<bool>()) {
+                            g.kvmem_replay_session_starts.push_back(
+                                static_cast<uint32_t>(segment_token_begin));
+                        }
+                    }
+                    if (span.role == "user") {
+                        std::string empty_segment = segment;
+                        const size_t local_content_begin =
+                            span.content_begin - span.segment_begin;
+                        const size_t local_content_end =
+                            span.content_end - span.segment_begin;
+                        empty_segment.erase(
+                            local_content_begin,
+                            local_content_end - local_content_begin);
+                        const std::vector<int32_t> empty_tokens =
+                            usage_tokenizer.encode(empty_segment);
+                        size_t local_qb = 0;
+                        const size_t prefix_max =
+                            std::min(segment_tokens.size(), empty_tokens.size());
+                        while (local_qb < prefix_max &&
+                               segment_tokens[local_qb] == empty_tokens[local_qb]) {
+                            ++local_qb;
+                        }
+                        size_t suffix = 0;
+                        while (suffix < segment_tokens.size() - local_qb &&
+                               suffix < empty_tokens.size() - local_qb &&
+                               segment_tokens[segment_tokens.size() - 1 - suffix] ==
+                                   empty_tokens[empty_tokens.size() - 1 - suffix]) {
+                            ++suffix;
+                        }
+                        const size_t local_qe = segment_tokens.size() - suffix;
+                        if (local_qe > local_qb &&
+                            segment_token_begin >= pressure_threshold) {
+                            g.kvmem_replay_query_spans.push_back(
+                                GenerationOptions::KvMemReplayQuerySpan{
+                                    static_cast<uint32_t>(segment_token_begin +
+                                                          local_qb),
+                                    static_cast<uint32_t>(segment_token_begin +
+                                                          local_qe)});
+                        }
+                    }
+                    rebuilt.insert(rebuilt.end(), segment_tokens.begin(),
+                                   segment_tokens.end());
+                    token_cursor += segment_tokens.size();
+                    byte_cursor = span.segment_end;
+                }
+                const std::vector<int32_t> tail_tokens =
+                    usage_tokenizer.encode(prompt.substr(byte_cursor));
+                rebuilt.insert(rebuilt.end(), tail_tokens.begin(), tail_tokens.end());
+                if (rebuilt != prompt_token_ids) {
+                    set_error_response(
+                        res, 500,
+                        "kvmem_transcript_replay token-span mapping was not "
+                        "compositional at message boundaries");
+                    return;
+                }
+                if (g.kvmem_replay_query_spans.empty()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_transcript_replay found no user query arriving "
+                        "after the KVMem pressure threshold");
+                    return;
+                }
+                const auto &last = g.kvmem_replay_query_spans.back();
+                g.kvmem_query_begin = last.begin;
+                g.kvmem_query_end = last.end;
+                explicit_span = true;
+                std::cerr << "[qw3-serve] kvmem transcript replay: events="
+                          << g.kvmem_replay_query_spans.size()
+                          << " sessions="
+                          << g.kvmem_replay_session_starts.size()
+                          << " threshold=" << pressure_threshold
+                          << " first=[" << g.kvmem_replay_query_spans.front().begin
+                          << "," << g.kvmem_replay_query_spans.front().end << ")"
+                          << " last=[" << last.begin << "," << last.end << ")"
+                          << " prompt_tokens=" << prompt_token_count << "\n";
+            }
+
+            // Optional diagnostics-only sample key. Restrict it to a compact,
+            // JSON-safe alphabet because the executor's score dump is written
+            // directly with fprintf. It is never consumed by retrieval logic.
+            if (req.contains("kvmem_trace_tag")) {
+                if (!req["kvmem_trace_tag"].is_string()) {
+                    set_error_response(res, 400,
+                                       "kvmem_trace_tag must be a string");
+                    return;
+                }
+                const std::string tag = req["kvmem_trace_tag"].get<std::string>();
+                const bool tag_ok = !tag.empty() && tag.size() <= 128 &&
+                    std::all_of(tag.begin(), tag.end(), [](unsigned char c) {
+                        return std::isalnum(c) || c == '-' || c == '_' ||
+                               c == '.' || c == ':';
+                    });
+                if (!tag_ok) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_trace_tag must be 1..128 characters from "
+                        "[A-Za-z0-9_.:-]");
+                    return;
+                }
+                g.kvmem_trace_tag = tag;
+            }
+
+            // Optional diagnostics-only span for the benchmark history. It is
+            // mapped from UTF-8 content bytes to exact rendered-prompt tokens by
+            // the same remove-and-diff procedure used for the query span. The
+            // resulting bounds are exported with selected KVMem blocks, enabling
+            // offline projection into the RAG history coordinate system.
+            if (req.contains("kvmem_context_span")) {
+                const json &span = req["kvmem_context_span"];
+                if (!span.is_object() || !span.contains("message_index") ||
+                    !span.contains("content_start") ||
+                    !span.contains("content_end") ||
+                    !span["message_index"].is_number_integer() ||
+                    !span["content_start"].is_number_integer() ||
+                    !span["content_end"].is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_context_span requires integer message_index, "
+                        "content_start, and content_end");
+                    return;
+                }
+                const int64_t message_index = span["message_index"].get<int64_t>();
+                const int64_t content_start = span["content_start"].get<int64_t>();
+                const int64_t content_end = span["content_end"].get<int64_t>();
+                if (message_index < 0 ||
+                    message_index >= static_cast<int64_t>(msgs.size()) ||
+                    !msgs[static_cast<size_t>(message_index)].is_object() ||
+                    !msgs[static_cast<size_t>(message_index)].contains("content") ||
+                    !msgs[static_cast<size_t>(message_index)]["content"].is_string()) {
+                    set_error_response(res, 400,
+                                       "kvmem_context_span message_index does not "
+                                       "reference a string-content message");
+                    return;
+                }
+                const std::string content =
+                    msgs[static_cast<size_t>(message_index)]["content"]
+                        .get<std::string>();
+                if (content_start < 0 || content_end <= content_start ||
+                    content_end > static_cast<int64_t>(content.size())) {
+                    set_error_response(res, 400,
+                                       "kvmem_context_span content offsets are "
+                                       "outside the message content");
+                    return;
+                }
+                json msgs_empty = msgs;
+                std::string content_empty = content;
+                content_empty.erase(static_cast<size_t>(content_start),
+                                    static_cast<size_t>(content_end - content_start));
+                msgs_empty[static_cast<size_t>(message_index)]["content"] =
+                    std::move(content_empty);
+                const std::string empty_prompt = render_messages(
+                    msgs_empty, tools, enable_thinking, forced_tool_name);
+                const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
+                const std::vector<int32_t> tok_empty =
+                    usage_tokenizer.encode(empty_prompt);
+                size_t cb = 0;
+                const size_t prefix_max = std::min(tok_full.size(), tok_empty.size());
+                while (cb < prefix_max && tok_full[cb] == tok_empty[cb]) ++cb;
+                size_t suffix = 0;
+                while (suffix < tok_full.size() - cb &&
+                       suffix < tok_empty.size() - cb &&
+                       tok_full[tok_full.size() - 1 - suffix] ==
+                           tok_empty[tok_empty.size() - 1 - suffix]) {
+                    ++suffix;
+                }
+                const size_t ce = tok_full.size() - suffix;
+                if (ce <= cb) {
+                    set_error_response(res, 400,
+                                       "kvmem_context_span maps to an empty token span");
+                    return;
+                }
+                g.kvmem_context_begin = static_cast<uint32_t>(cb);
+                g.kvmem_context_end = static_cast<uint32_t>(ce);
+                if (std::getenv("QW3_KVMEM_TRACE")) {
+                    std::cerr << "[qw3-serve] kvmem context span [" << cb
+                              << "," << ce << ") of " << tok_full.size()
+                              << " prompt tokens, tag="
+                              << (g.kvmem_trace_tag.empty() ? "(none)"
+                                                           : g.kvmem_trace_tag)
+                              << "\n";
+                }
+            }
 
             // Optional API extension for benchmarks whose exact canonical
             // prompt is one long user message containing both history and the
@@ -1357,6 +1633,25 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 if (qe > qb) {
                     g.kvmem_query_begin = static_cast<uint32_t>(qb);
                     g.kvmem_query_end = static_cast<uint32_t>(qe);
+                    if (transcript_replay) {
+                        // The transcript mapper initially records the complete
+                        // arriving user-message content. An explicit subspan on
+                        // that final message is the actual retrieval query, so
+                        // keep the answer-producing replay event and the global
+                        // query coordinates identical. Intermediate historical
+                        // user events retain their complete-message spans.
+                        if (g.kvmem_replay_query_spans.empty()) {
+                            set_error_response(
+                                res, 400,
+                                "explicit transcript query span has no final "
+                                "replay event");
+                            return;
+                        }
+                        g.kvmem_replay_query_spans.back().begin =
+                            static_cast<uint32_t>(qb);
+                        g.kvmem_replay_query_spans.back().end =
+                            static_cast<uint32_t>(qe);
+                    }
                     explicit_span = true;
                     std::cerr << "[qw3-serve] kvmem explicit query span ["
                               << qb << "," << qe << ") of " << tok_full.size()

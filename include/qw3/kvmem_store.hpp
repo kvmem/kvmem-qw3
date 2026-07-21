@@ -49,11 +49,12 @@ struct KvMemBlock {
     // prefill a block is baked at its true sequential position == orig_pos_start.
     // Each assembly remaps IN PLACE from baked_pos to the new window slot via a
     // de-rotate(baked_pos)+re-rotate(new) pass (rope_block_remap_paged), reusing
-    // the same __sincosf so the prior bake's error cancels. All window slots are
-    // <=128k (the regime production already runs in), so repeated in-place
-    // remaps stay clean; fp16 storage drift is ~1 ULP/remap, bounded by skipping
-    // no-op remaps (baked_pos already == new slot).
+    // the same __sincosf. With fp16 KV, however, every non-noop remap rounds the
+    // result again; a long multi-turn trace can therefore accumulate error. The
+    // counter is diagnostics for the immutable-source-K redesign and has no
+    // influence on selection.
     int64_t  baked_pos = -1;        // -1 until first registered (then orig_pos_start)
+    uint32_t remap_count = 0;       // number of non-noop in-place re-RoPE moves
     bool     in_working_set = false;
 
     // Cumulative attention quality (built-in top-k selection signal, #40).
@@ -155,6 +156,12 @@ struct KvMemStoreConfig {
     KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
 
+    // Experimental drift-free K construction.  The executor keeps the
+    // historical/source K immutable and materializes a separate working K for
+    // each selected window.  In this mode baked_pos describes the source K's
+    // construction frame and set_selection() must never overwrite it.
+    bool immutable_source_k = false;
+
     // Archived experimental DeltaNet retrieval. Not exposed by the CLI and not
     // recommended for production; retained for future research and reproducibility.
     // See docs/kvmem_deltanet_retrieval_experimental.md.
@@ -249,12 +256,14 @@ public:
                         int32_t cpu_slot = -1,
                         int32_t nvme_slot = -1);
     void set_block_baked_pos(uint32_t block_id, int64_t baked_pos);
+    void record_block_rerope(uint32_t block_id, int64_t baked_pos);
 
     // Diff `selected_ids` against current GPU residency / working-set state and produce the
-    // stage-in/out lists + the window remap plan. Each remap de-rotates from the
-    // block's CURRENT bake position and re-rotates to its new window slot (in
-    // place, no copy); blocks already in the right slot get skip=true. Updates
-    // each block's baked_pos / in_working_set. `selected_ids` need not be sorted;
+    // stage-in/out lists + the window remap plan. In the legacy mode each remap
+    // de-rotates from the block's CURRENT bake position and re-rotates in place,
+    // then commits the new baked_pos. With immutable_source_k, baked_pos remains
+    // the source K's construction frame and each plan remaps a freshly copied
+    // working K from that immutable frame. `selected_ids` need not be sorted;
     // it is sorted ascending internally so window order is deterministic (sink
     // first ... recent last). Blocks are packed contiguously from window pos 0.
     KvMemPlan set_selection(std::vector<uint32_t> selected_ids);

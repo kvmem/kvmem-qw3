@@ -230,6 +230,21 @@ public:
     StateSnapshot snapshot_state();
     void capture_state(StateSnapshot &snapshot);
     void restore_state(const StateSnapshot &snapshot);
+    // Diagnostic query replay: after the ordinary post-prefill semantic
+    // selection has been computed, keep that exact context selection, rewind
+    // only the suffix beginning at a block-aligned query boundary, restore the
+    // recurrent/conv state captured at that boundary, and let the backend
+    // prefill the suffix again against the final selected window.  Unlike
+    // restore_state(), this deliberately does NOT restore the old pressure
+    // window.  Default inference never calls this path.
+    void kvmem_begin_query_replay(const StateSnapshot &boundary,
+                                  const std::vector<uint32_t> &context_block_ids,
+                                  bool reset_recurrent_state = false);
+    void kvmem_end_query_replay();
+    // Start a new local recurrent segment while retaining the assembled
+    // normal-attention KVMem window. Used only by controlled transcript-memory
+    // construction experiments; ordinary inference never calls it.
+    void kvmem_reset_recurrent_state();
     void restore_state_checkpoint(const StateCheckpointSet &checkpoints,
                                   uint32_t index);
 
@@ -291,7 +306,24 @@ public:
     // per-layer content index (#91) can size its per-layer stride before the first
     // K chunk is captured. (Public: backend-invoked.)
     void kvmem_set_query_span(uint32_t begin, uint32_t end,
-                              uint32_t prompt_tokens);          // before prefill
+                              uint32_t prompt_tokens,
+                              bool preserve_content_index = false); // before prefill
+    // Publish the incrementally captured mean-K index for the CURRENT logical
+    // prefix, even though the full teacher-forced transcript has not yet been
+    // consumed. Used only by experimental transcript replay before an
+    // intermediate semantic re-selection.
+    bool kvmem_publish_captured_prefix(uint32_t scoreable_tokens);
+    // Attach diagnostics-only request metadata to score dumps. The context span
+    // is prompt-absolute and trace_tag is a stable sample id. Neither value is
+    // read by retrieval/scoring code.
+    void kvmem_set_trace_metadata(const std::string &trace_tag,
+                                  uint32_t context_begin,
+                                  uint32_t context_end,
+                                  const std::vector<uint32_t> &prompt_tokens);
+    void kvmem_set_trace_reselect_event(uint32_t index, uint32_t count) {
+        kvmem_trace_event_index_ = index;
+        kvmem_trace_event_count_ = count;
+    }
     // Clean-query prefill (task #50, QW3_KVMEM_CLEAN_QUERY). Backend-invoked.
     // stash: after a PASS-A isolated question prefill, copy the captured de-RoPE'd
     // query into a persistent buffer that survives reset_state. restore: copy it
@@ -512,6 +544,8 @@ private:
     uint32_t kv_page_count() const { return kv_pages_.count(); }
     uint32_t kv_page_size() const { return kv_pages_.page_size; }
     DeviceTensor &k_cache(uint32_t layer);
+    DeviceTensor &working_k_cache(uint32_t layer);
+    DeviceTensor &attention_k_cache(uint32_t layer);
     DeviceTensor &v_cache(uint32_t layer);
     DeviceTensor &mtp_k_cache();
     DeviceTensor &mtp_v_cache();
@@ -596,6 +630,11 @@ private:
     std::unique_ptr<KvPhysicalPageAllocator> kvmem_gpu_page_pool_;
     std::vector<std::unique_ptr<DeviceTensor>> kvmem_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> kvmem_v_cache_storage_;
+    // Optional RoPE working copy.  Source K remains in kvmem_k_cache_storage_
+    // at the frame in which it was first constructed/tiered; attention reads
+    // this copy after a one-shot source->window materialization per assembly.
+    // V is position independent and therefore needs no duplicate.
+    std::vector<std::unique_ptr<DeviceTensor>> kvmem_work_k_cache_storage_;
     KvCacheStorage kvmem_kv_cache_view_;
     // Bounded GPU page pool for the MTP layer's KV, sibling of
     // kvmem_gpu_page_pool_. Engaged only on the single-request internal-MTP
@@ -644,14 +683,20 @@ private:
     // takes the identical pre-block-sparse branches.
     bool kvmem_enabled_ = false;
     uint32_t kvmem_registered_pos_ = 0;
+    // Suppress the automatic sink+recent pressure reselect while the short
+    // query suffix is being replayed into an already-final semantic window.
+    // The selected suffix blocks were removed first, so replay consumes the
+    // same GPU-pool capacity they occupied before the rewind.
+    bool kvmem_query_replay_active_ = false;
     // True once a selection has been assembled this session; gates the decode
     // window substitution. Cleared by reset_state().
     bool kvmem_active_ = false;
+    bool kvmem_immutable_source_k_ = false;
     std::unique_ptr<KvMemStore> block_store_;
     // Window page table: the selected blocks' ORIGINAL physical pages, in
-    // ascending (window) order. No-copy — these alias kv_pages_ slots; the
-    // window is a reordering of pointers, re-RoPE rebakes K in place. Borrowed,
-    // never released by this table.
+    // ascending (window) order. These alias kv_pages_ slots. In legacy mode
+    // re-RoPE rebakes source K in place; in immutable-source mode the same page
+    // indices address a separate working K tensor and source K is untouched.
     std::vector<int32_t> window_pages_host_;
     std::unique_ptr<DeviceTensor> window_pages_device_;
     uint32_t window_page_count_ = 0;
@@ -946,7 +991,9 @@ private:
     void kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch, uint32_t base_pos,
                                   uint32_t rope_base_pos, uint32_t k_token_stride);
     uint32_t kvmem_qc_total_blocks_ = 0;                       // final block count (index stride)
+    uint32_t kvmem_qc_prompt_tokens_ = 0;                      // exact final logical prompt length
     uint32_t kvmem_qc_captured_blocks_ = 0;                    // blocks captured so far (slot 0)
+    uint32_t kvmem_qc_captured_tokens_ = 0;                    // exact contiguous prefix represented by the index
     // Fixed per-layer stride (in blocks) of g_kbar_multi_, pinned at ctx_blocks
     // (ceil(kv_ctx_size_/block_tokens)) for the whole session so preserved [0,D)
     // index slices stay valid as the block count grows across resumed turns
@@ -961,6 +1008,13 @@ private:
     // full-buffer zero so only the new suffix's blocks are (re)captured. 0 on a cold
     // turn (reset_state / a dropping truncate), which zeroes the whole index.
     uint32_t kvmem_qc_resume_base_tokens_ = 0;
+    // Diagnostics-only metadata copied from GenerationOptions once per request.
+    std::string kvmem_trace_tag_;
+    uint32_t kvmem_context_begin_ = 0;
+    uint32_t kvmem_context_end_ = 0;
+    uint32_t kvmem_trace_event_index_ = 0;
+    uint32_t kvmem_trace_event_count_ = 0;
+    std::vector<uint32_t> kvmem_trace_prompt_tokens_;
 public:
     // Enable/disable decode-time content capture around the (plain) decode loop.
     // The server-side session-continuation path enables it before decoding an
