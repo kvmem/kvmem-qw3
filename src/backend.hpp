@@ -3,6 +3,7 @@
 #include "qw3/qw3.hpp"
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace qw3 {
@@ -15,6 +16,14 @@ public:
     virtual std::string generate(const std::string &prompt,
                                  const GenerationOptions &options,
                                  const TokenCallback &on_text) = 0;
+    virtual std::string generate_session(const std::string &prompt_fragment,
+                                         const GenerationOptions &options,
+                                         const TokenCallback &on_text,
+                                         bool reset) {
+        if (reset) return generate(prompt_fragment, options, on_text);
+        throw std::runtime_error(
+            "persistent session append is unsupported by this backend");
+    }
 };
 
 std::unique_ptr<Backend> make_backend(BackendKind kind);

@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
                     default=ROOT / "models/Qwen3.6-27B-Q8_0.gguf")
     ap.add_argument("--data", type=Path,
                     default=Path("/data/chaidi/kvmem_eval/data/longmemeval_s.json"))
+    ap.add_argument(
+        "--eval-script", type=Path,
+        default=ROOT / "scripts/kvmem_eval/run_eval.py",
+        help="evaluation client to run after the server is healthy; default "
+             "keeps the canonical one-shot harness unchanged")
     ap.add_argument("--out-dir", type=Path,
                     default=Path("/data/chaidi/kvmem_eval/results"))
     ap.add_argument("--host", default="127.0.0.1")
@@ -133,7 +138,7 @@ def build_commands(args: argparse.Namespace) -> tuple[list[str], list[str], Path
 
     base_url = f"http://{args.host}:{args.port}/v1"
     evaluation = [
-        sys.executable, str(ROOT / "scripts/kvmem_eval/run_eval.py"),
+        sys.executable, str(args.eval_script),
         "--data", str(args.data),
         "--use-all",
         "--base-url", base_url,
@@ -338,8 +343,10 @@ def main() -> int:
     if not args.binary.is_file():
         print(f"ERROR: qw3 binary not found: {args.binary}", file=sys.stderr)
         return 2
-    if not args.model.is_file() or not args.data.is_file():
-        print("ERROR: model or dataset path does not exist", file=sys.stderr)
+    if (not args.model.is_file() or not args.data.is_file() or
+            not args.eval_script.is_file()):
+        print("ERROR: model, dataset, or eval script does not exist",
+              file=sys.stderr)
         return 2
     if not port_is_free(args.host, args.port):
         print(f"ERROR: listen address is already in use: {args.host}:{args.port}",

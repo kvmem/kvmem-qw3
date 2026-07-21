@@ -59,3 +59,26 @@ The API key is read only from the environment and is never included in the
 manifest or logs. By default, an existing tag is rejected; use a new tag or
 explicit `--force`. Interrupted evaluations preserve the partial JSONL emitted
 by `run_eval.py`.
+
+## Incremental LongMemEval-M session ingest
+
+`run_longmemeval_session_ingest.py` is a separate, causal harness for testing a
+long-lived KVMem session. It does not change the canonical one-shot runner.
+Historical assistant turns are supplied with `max_tokens=0`, so they are
+teacher-forced prefill rather than regenerated. Once the prior rendered history
+has filled the configured active capacity, the first user turn of each new
+dataset session triggers semantic reselection and query replay; the remaining
+turns keep that exact selected context.
+
+The frozen ten-error launcher is:
+
+```bash
+DEEPSEEK_API_KEY=... \
+scripts/kvmem_eval/run_longmemeval_m_session_ingest10.sh
+```
+
+It writes both a sample-level result JSONL and a request-level audit JSONL. The
+audit verifies every ingest request returned `finish_reason=prefill_only`, and
+records the session index, phase, fragment token count, selection mode, and
+latency. Server-side `QW3_KVMEM_TRACE=1` logs the absolute query span, semantic
+selection, aligned query replay, and retained session checkpoint.

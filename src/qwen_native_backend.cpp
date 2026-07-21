@@ -478,8 +478,9 @@ bool kvmem_clean_query_enabled() {
 // Controlled diagnostic: use the ordinary pressure-window query to choose the
 // final mean-K blocks, then rewind to the block containing the query and prefill
 // that short suffix again against the fixed final window. Default off.
-bool kvmem_recompute_query_enabled() {
-    return env_flag_enabled("QW3_KVMEM_RECOMPUTE_QUERY");
+bool kvmem_recompute_query_enabled(bool configured_default) {
+    return env_flag_enabled("QW3_KVMEM_RECOMPUTE_QUERY",
+                            configured_default);
 }
 
 // Cap on total physical KV pages pinned by the prefix cache. 0 = unlimited
@@ -1477,6 +1478,52 @@ public:
     std::string generate(const std::string &prompt,
                          const GenerationOptions &options,
                          const TokenCallback &on_text) override {
+        kvmem_api_session_active_ = false;
+        kvmem_api_session_id_.clear();
+        kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
+        kvmem_api_boundary_pos_ = 0;
+        kvmem_api_tail_tokens_.clear();
+        return generate_internal(prompt, options, on_text,
+                                 /*reset_session=*/true);
+    }
+
+    std::string generate_session(const std::string &prompt_fragment,
+                                 const GenerationOptions &options,
+                                 const TokenCallback &on_text,
+                                 bool reset) override {
+        if (!options_.kvmem_enabled) {
+            throw std::runtime_error(
+                "persistent session append requires KVMem");
+        }
+        if (!options_.kvmem_query_conditioned ||
+            options_.kvmem_retrieval_method != "mean-k") {
+            throw std::runtime_error(
+                "persistent KVMem sessions currently require "
+                "--kvmem-query-conditioned with mean-k retrieval");
+        }
+        if (options.kvmem_session_id.empty()) {
+            throw std::invalid_argument(
+                "persistent session append requires kvmem_session_id");
+        }
+        if (reset) {
+            kvmem_api_session_active_ = true;
+            kvmem_api_session_id_ = options.kvmem_session_id;
+            kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
+            kvmem_api_boundary_pos_ = 0;
+            kvmem_api_tail_tokens_.clear();
+        } else if (!kvmem_api_session_active_ ||
+                   kvmem_api_session_id_ != options.kvmem_session_id) {
+            throw std::runtime_error(
+                "KVMem session append does not match the active session");
+        }
+        return generate_internal(prompt_fragment, options, on_text,
+                                 /*reset_session=*/reset);
+    }
+
+    std::string generate_internal(const std::string &prompt,
+                                  const GenerationOptions &options,
+                                  const TokenCallback &on_text,
+                                  bool reset_session) {
         if (!model_) throw std::runtime_error("qwen-native backend is not loaded");
         if (options_.native_kernels != "cuda") {
             throw std::runtime_error("qwen-native now uses a device-resident executor; use --native-kernels cuda");
@@ -1489,16 +1536,32 @@ public:
         const std::vector<int32_t> ids = tokenizer_->encode(prompt);
         std::vector<uint32_t> prompt_tokens(ids.begin(), ids.end());
         GenerationOptions effective_options = options;
+        const uint32_t append_base = reset_session
+            ? 0u : static_cast<uint32_t>(executor_->position());
+        if (!reset_session &&
+            effective_options.kvmem_query_end >
+                effective_options.kvmem_query_begin) {
+            effective_options.kvmem_query_begin += append_base;
+            effective_options.kvmem_query_end += append_base;
+        }
+        if (!reset_session &&
+            effective_options.kvmem_context_end >
+                effective_options.kvmem_context_begin) {
+            effective_options.kvmem_context_begin += append_base;
+            effective_options.kvmem_context_end += append_base;
+        }
         const uint32_t ctx_size = options_.ctx_size > 0
             ? static_cast<uint32_t>(options_.ctx_size)
             : 4096u;
-        if (prompt_tokens.size() > static_cast<size_t>(ctx_size)) {
+        const uint64_t total_prompt_tokens =
+            static_cast<uint64_t>(append_base) + prompt_tokens.size();
+        if (total_prompt_tokens > static_cast<uint64_t>(ctx_size)) {
             throw std::runtime_error("prompt exceeds KV context: prompt_tokens=" +
-                                     std::to_string(prompt_tokens.size()) +
+                                     std::to_string(total_prompt_tokens) +
                                      " ctx=" + std::to_string(ctx_size));
         }
         const uint32_t max_emit_tokens =
-            ctx_size - static_cast<uint32_t>(prompt_tokens.size()) + 1U;
+            ctx_size - static_cast<uint32_t>(total_prompt_tokens) + 1U;
         if (effective_options.max_tokens > static_cast<int>(max_emit_tokens)) {
             log("native generate: capping max_tokens from " +
                 std::to_string(effective_options.max_tokens) + " to " +
@@ -1544,7 +1607,12 @@ public:
         const bool trace_mtp = options_.native_mtp_trace || mtp_trace_enabled();
         const bool active_mtp = trace_mtp || spec_mtp;
 
-        const bool route_continuous =
+        if (!effective_options.kvmem_session_id.empty() && !active_mtp) {
+            throw std::runtime_error(
+                "persistent KVMem session append currently requires native MTP");
+        }
+
+        const bool route_continuous = reset_session &&
             effective_options.continuous_batching &&
             (!active_mtp || continuous_batching_mtp_enabled());
 
@@ -1589,7 +1657,10 @@ public:
             return generate_plain(prompt_tokens, effective_options, on_text, dump.get());
         }
         return generate_mtp(prompt_tokens, effective_options, on_text, dump.get(),
-                            spec_mtp, trace_mtp);
+                            spec_mtp, trace_mtp,
+                            /*override_executor=*/nullptr,
+                            /*manage_device_scope=*/true,
+                            reset_session);
     }
 
 private:
@@ -7237,9 +7308,13 @@ private:
         (void)kvmem_below_budget;
         const bool qc_active =
             (options.kvmem_query_end > options.kvmem_query_begin) &&
-            kvmem_sel_budget > 0 && prompt_tokens.size() > kvmem_sel_budget;
+            kvmem_sel_budget > 0 && prompt_tokens.size() > kvmem_sel_budget &&
+            options.kvmem_reselect_mode != KvMemReselectMode::Off;
 
         if (executor_->kvmem_enabled()) {
+            executor_->kvmem_set_keep_selected_prefill(
+                options.kvmem_prefill_window_mode ==
+                KvMemPrefillWindowMode::KeepSelected);
             executor_->kvmem_set_trace_metadata(
                 options.kvmem_trace_tag,
                 options.kvmem_context_begin,
@@ -7296,6 +7371,24 @@ private:
         // still declines (captured as a non-resumable P below).
         const bool qc_pertoken_here =
             qc_active && executor_->kvmem_qc_pertoken();
+        const bool recompute_query =
+            executor_->kvmem_enabled() && qc_active &&
+            kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
+            !warm_reuse && !warm_capture && dump == nullptr &&
+            executor_->block_store() &&
+            executor_->block_store()->config().retrieval_method ==
+                KvMemRetrievalMethod::MeanK;
+        QwenExecutor::StateSnapshot query_replay_ckpt;
+        uint32_t query_replay_begin = 0;
+        if (recompute_query) {
+            const uint32_t bt = std::max<uint32_t>(
+                1, executor_->block_store()->config().block_tokens);
+            query_replay_begin = (options.kvmem_query_begin / bt) * bt;
+            if (query_replay_begin == 0) {
+                throw std::runtime_error(
+                    "KVMem query replay requires a non-zero aligned boundary");
+            }
+        }
         uint32_t warm_prompt_pos = 0;
         bool warm_prompt_resumable = false;
         uint32_t ckpt_split = 0;
@@ -7318,7 +7411,8 @@ private:
             if (gbegin >= gend) return;
             std::vector<uint32_t> seg(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(gbegin),
                                       prompt_tokens.begin() + static_cast<std::ptrdiff_t>(gend));
-            step = executor_->forward_n_tokens(seg, gend == prompt_tokens.size());
+            step = executor_->forward_n_tokens(
+                seg, options.max_tokens > 0 && gend == prompt_tokens.size());
             if (!step.ok) throw std::runtime_error("prefill failed");
             prefill_ops += step.ops_executed;
         };
@@ -7354,6 +7448,10 @@ private:
                                               : kvmem_all_gpu_identity();
             // Second segment [split, P): finish the prompt.
             do_prefill_range(ckpt_split, prompt_tokens.size());
+        } else if (recompute_query) {
+            do_prefill_range(prefill_begin, query_replay_begin);
+            executor_->capture_state(query_replay_ckpt);
+            do_prefill_range(query_replay_begin, prompt_tokens.size());
         } else {
             do_prefill_range(prefill_begin, prompt_tokens.size());
         }
@@ -7378,7 +7476,51 @@ private:
             const uint32_t reg_n =
                 static_cast<uint32_t>(prompt_tokens.size()) - already;
             executor_->kvmem_register_append(reg_n);
-            executor_->kvmem_reselect();
+            if (options.kvmem_reselect_mode == KvMemReselectMode::Off) {
+                if (options.kvmem_prefill_window_mode !=
+                    KvMemPrefillWindowMode::KeepSelected) {
+                    executor_->kvmem_reselect_prefill_pressure();
+                }
+            } else {
+                if (recompute_query) {
+                    const uint32_t bt = std::max<uint32_t>(
+                        1, executor_->block_store()->config().block_tokens);
+                    executor_->kvmem_set_pin_from_block(
+                        query_replay_begin / bt);
+                }
+                executor_->kvmem_reselect();
+            }
+            if (recompute_query &&
+                options.kvmem_reselect_mode != KvMemReselectMode::Off) {
+                std::vector<uint32_t> selected_context;
+                bool suffix_fully_selected = true;
+                const auto &blocks = executor_->block_store()->blocks();
+                for (const KvMemBlock &b : blocks) {
+                    if (b.orig_pos_start < query_replay_begin) {
+                        if (b.in_working_set) {
+                            selected_context.push_back(b.block_id);
+                        }
+                    } else if (!b.in_working_set) {
+                        suffix_fully_selected = false;
+                    }
+                }
+                if (!suffix_fully_selected) {
+                    throw std::runtime_error(
+                        "KVMem query replay requires every replay-suffix block "
+                        "to be present in the final selection");
+                }
+                executor_->kvmem_begin_query_replay(
+                    query_replay_ckpt, selected_context);
+                do_prefill_range(query_replay_begin, prompt_tokens.size());
+                executor_->kvmem_end_query_replay();
+                log("native kvmem query replay (plain): boundary=" +
+                    std::to_string(query_replay_begin) +
+                    " suffix_tokens=" +
+                    std::to_string(prompt_tokens.size() -
+                                   query_replay_begin) +
+                    " fixed_context_blocks=" +
+                    std::to_string(selected_context.size()));
+            }
         }
 
         // kvmem prefix cache: fallback prompt-end (P) checkpoint. When the
@@ -7391,6 +7533,50 @@ private:
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             warm_prompt_resumable = kvmem_all_gpu_identity();
+        }
+
+        // A zero completion budget is a real prefill-only transaction. Persist
+        // the exact prompt-end state, but never initialize sampling, choose a
+        // next token, enter decode capture, or append generated KV.
+        if (options.max_tokens == 0) {
+            if (warm_capture) {
+                kvmem_warm_log_ = prompt_tokens;
+                const size_t pos = executor_->position();
+                if (pos <= kvmem_warm_log_.size()) {
+                    kvmem_warm_log_.resize(pos);
+                    executor_->capture_state(kvmem_warm_ckpt_end_);
+                    kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
+                    kvmem_warm_prompt_pos_ = warm_prompt_pos;
+                    kvmem_warm_prompt_resumable_ = warm_prompt_resumable;
+                    kvmem_warm_valid_ = true;
+                    if (kvmem_prefix_cache_trace_enabled()) {
+                        std::ostringstream cmsg;
+                        cmsg << "kvmem prefix-cache CAPTURE "
+                             << "(plain prefill-only): warm_log="
+                             << kvmem_warm_log_.size() << " pos=" << pos
+                             << " P=" << warm_prompt_pos
+                             << " P_resumable="
+                             << (warm_prompt_resumable ? 1 : 0);
+                        log(cmsg.str());
+                    }
+                } else {
+                    kvmem_warm_valid_ = false;
+                }
+            }
+            st = device_->end();
+            if (!st.ok) throw std::runtime_error(st.message);
+            const double prefill_s =
+                std::max(t_prefill_end - t_prefill_start, 1e-9);
+            std::ostringstream msg;
+            msg << "native prefill-only: prompt_tokens="
+                << prompt_tokens.size() << " prefill="
+                << fmt_seconds(prefill_s) << " prefill_ops=" << prefill_ops;
+            if (warm_reuse) {
+                msg << " kvmem_reuse=" << reuse_m
+                    << " prefilled=" << (prompt_tokens.size() - reuse_m);
+            }
+            log(msg.str());
+            return {};
         }
 
         // Sampling setup. temp<=0 keeps the greedy argmax path (bit-identical
@@ -7610,16 +7796,19 @@ private:
         // the CB per-request executors are excluded, so those paths are untouched.
         const bool transcript_replay_requested =
             !options.kvmem_replay_query_spans.empty();
+        const bool api_session = !options.kvmem_session_id.empty() &&
+            override_executor == nullptr;
         const KvmemReuse kvmem_ru =
             (reset_session && override_executor == nullptr &&
-             !transcript_replay_requested)
+             !transcript_replay_requested && !api_session)
                 ? kvmem_prefix_reuse(prompt_tokens, options)
                 : KvmemReuse{};
         const uint32_t kvmem_reuse_m = kvmem_ru.c;
         const bool kvmem_warm_reuse = kvmem_reuse_m > 0;
         const bool kvmem_warm_capture =
             reset_session && override_executor == nullptr &&
-            !transcript_replay_requested && kvmem_prefix_cache_enabled() &&
+            !transcript_replay_requested && !api_session &&
+            kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
         DeviceStatus st;
         if (manage_device_scope) {
@@ -7663,18 +7852,32 @@ private:
         // (register_append per committed token + interval reselect) is driven
         // off position deltas in the loops below.
         const bool kvmem_on = executor_->kvmem_enabled();
+        if (kvmem_on) {
+            executor_->kvmem_set_keep_selected_prefill(
+                options.kvmem_prefill_window_mode ==
+                KvMemPrefillWindowMode::KeepSelected);
+        }
         // "Operating dense" predicate (see generate_plain): below budget the
         // store stays GPU-resident in identity order, so selection/QC are no-ops
         // and this turn behaves like the dense config.
         const uint32_t kvmem_sel_budget =
             (kvmem_on && executor_->block_store())
                 ? executor_->block_store()->config().select_budget : 0;
+        const uint32_t logical_prompt_tokens = reset_session
+            ? static_cast<uint32_t>(prompt_tokens.size())
+            : static_cast<uint32_t>(executor_->position() +
+                                    prompt_tokens.size());
+        const uint32_t api_append_base = api_session
+            ? static_cast<uint32_t>(executor_->position()) : 0;
         const bool kvmem_below_budget =
-            kvmem_sel_budget > 0 && prompt_tokens.size() <= kvmem_sel_budget;
+            kvmem_sel_budget > 0 &&
+            logical_prompt_tokens <= kvmem_sel_budget;
         (void)kvmem_below_budget;
         const bool qc_active =
             (options.kvmem_query_end > options.kvmem_query_begin) &&
-            kvmem_sel_budget > 0 && prompt_tokens.size() > kvmem_sel_budget;
+            kvmem_sel_budget > 0 &&
+            logical_prompt_tokens > kvmem_sel_budget &&
+            options.kvmem_reselect_mode != KvMemReselectMode::Off;
         const bool transcript_replay =
             transcript_replay_requested && kvmem_on && qc_active &&
             reset_session && !kvmem_warm_reuse && !kvmem_warm_capture &&
@@ -7746,12 +7949,40 @@ private:
             !transcript_replay &&
             !kvmem_warm_reuse && !kvmem_warm_capture && dump == nullptr;
         const bool recompute_query =
-            kvmem_on && qc_active && kvmem_recompute_query_enabled() &&
+            kvmem_on && qc_active &&
+            kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
             !transcript_replay && !clean_query && !kvmem_warm_reuse &&
             !kvmem_warm_capture &&
             dump == nullptr && executor_->block_store() &&
             executor_->block_store()->config().retrieval_method ==
                 KvMemRetrievalMethod::MeanK;
+        const uint32_t api_bt = kvmem_on && executor_->block_store()
+            ? std::max<uint32_t>(
+                  1, executor_->block_store()->config().block_tokens)
+            : 1;
+        const uint32_t api_sequence_base = api_session
+            ? (reset_session ? 0 : kvmem_api_boundary_pos_) : 0;
+        std::vector<uint32_t> api_sequence_tokens;
+        uint32_t api_final_boundary = 0;
+        if (api_session) {
+            if (!reset_session) {
+                if ((kvmem_api_boundary_pos_ > 0 &&
+                     !kvmem_api_boundary_ckpt_.ready) ||
+                    kvmem_api_boundary_pos_ +
+                            kvmem_api_tail_tokens_.size() !=
+                        api_append_base) {
+                    throw std::runtime_error(
+                        "KVMem session boundary checkpoint/tail is not "
+                        "consistent with the live executor position");
+                }
+                api_sequence_tokens = kvmem_api_tail_tokens_;
+            }
+            api_sequence_tokens.insert(api_sequence_tokens.end(),
+                                       prompt_tokens.begin(),
+                                       prompt_tokens.end());
+            api_final_boundary =
+                (logical_prompt_tokens / api_bt) * api_bt;
+        }
         if (clean_query) {
             // PASS A: capture the query from the question tokens ALONE. The question
             // prefills at positions 0..S attending only over itself + sink, so the
@@ -7781,7 +8012,29 @@ private:
         // budget; below budget the span is cleared so a warm HIT (restore_state,
         // no reset_state) cannot carry a stale span from a prior over-budget turn
         // into the identity path.
-        if (kvmem_on && qc_active) {
+        if (kvmem_on && api_session) {
+            if (qc_active) {
+                executor_->kvmem_set_query_span(
+                    options.kvmem_query_begin, options.kvmem_query_end,
+                    logical_prompt_tokens,
+                    /*preserve_content_index=*/!reset_session);
+                std::ostringstream qmsg;
+                qmsg << "native kvmem session query-conditioned: span=["
+                     << options.kvmem_query_begin << ","
+                     << options.kvmem_query_end << ") tokens="
+                     << (options.kvmem_query_end -
+                         options.kvmem_query_begin)
+                     << " logical_prompt_tokens=" << logical_prompt_tokens;
+                log(qmsg.str());
+            } else {
+                // Build and extend the position-invariant mean-K source index
+                // during teacher-forced history ingest, before any query exists.
+                executor_->kvmem_set_query_span(
+                    0, 0, logical_prompt_tokens,
+                    /*preserve_content_index=*/!reset_session,
+                    /*capture_content_without_query=*/true);
+            }
+        } else if (kvmem_on && qc_active) {
             const uint32_t initial_qb =
                 transcript_replay && !transcript_session_local
                 ? options.kvmem_replay_query_spans.front().begin
@@ -7791,7 +8044,7 @@ private:
                 ? options.kvmem_replay_query_spans.front().end
                 : options.kvmem_query_end;
             executor_->kvmem_set_query_span(initial_qb, initial_qe,
-                                            static_cast<uint32_t>(prompt_tokens.size()));
+                                            logical_prompt_tokens);
             std::ostringstream qmsg;
             qmsg << "native kvmem query-conditioned: span=["
                  << initial_qb << "," << initial_qe
@@ -7805,7 +8058,7 @@ private:
             log(qmsg.str());
         } else if (kvmem_on) {
             executor_->kvmem_set_query_span(
-                0, 0, static_cast<uint32_t>(prompt_tokens.size()));
+                0, 0, logical_prompt_tokens);
         }
         const int kvmem_interval = std::max(1, options_.kvmem_interval);
         uint32_t kvmem_last_reselect_pos = 0;
@@ -7949,6 +8202,21 @@ private:
                 throw std::runtime_error(
                     "KVMem query replay requires a non-zero aligned boundary");
             }
+            if (api_session &&
+                kvmem_query_replay_begin < api_append_base) {
+                if (!kvmem_api_boundary_ckpt_.ready ||
+                    kvmem_api_boundary_pos_ !=
+                        kvmem_query_replay_begin) {
+                    throw std::runtime_error(
+                        "KVMem session query replay cannot recover the "
+                        "preceding partial block boundary");
+                }
+                // State at B was captured while ingesting the previous
+                // request. The replay suffix below prepends the saved B..P tail
+                // before the new query fragment.
+                kvmem_query_replay_ckpt =
+                    std::move(kvmem_api_boundary_ckpt_);
+            }
         }
         if (kvmem_warm_capture && kvmem_on && !transcript_replay &&
             !kvmem_qc_pertoken_here) {
@@ -7976,13 +8244,16 @@ private:
         // so the block-boundary checkpoint can split the prompt prefill at `split`
         // (capture recurrent state there) and resume the tail without duplicating
         // the two prefill flavors (internal-chunking vs MTP-prefix priming).
-        auto do_prefill_range = [&](size_t lbegin, size_t lend) {
+        auto do_prefill_vector_raw = [&](const std::vector<uint32_t> &tokens,
+                                         size_t lbegin, size_t lend) {
             if (lbegin >= lend) return;
             if (!use_mtp_prefix) {
-                std::vector<uint32_t> seg(prefill_tokens.begin() + static_cast<std::ptrdiff_t>(lbegin),
-                                          prefill_tokens.begin() + static_cast<std::ptrdiff_t>(lend));
+                std::vector<uint32_t> seg(
+                    tokens.begin() + static_cast<std::ptrdiff_t>(lbegin),
+                    tokens.begin() + static_cast<std::ptrdiff_t>(lend));
                 const double t_chunk_start = wall_seconds();
-                step = executor_->forward_n_tokens(seg, lend == prefill_tokens.size());
+                step = executor_->forward_n_tokens(
+                    seg, options.max_tokens > 0 && lend == tokens.size());
                 if (!step.ok) throw std::runtime_error("prefill failed");
                 const double t_chunk_end = wall_seconds();
                 prefill_ops += step.ops_executed;
@@ -8002,10 +8273,12 @@ private:
                         1, executor_->effective_prefill_chunk_size(remaining));
                     const size_t end =
                         offset + std::min<size_t>(remaining, width);
-                    std::vector<uint32_t> chunk(prefill_tokens.begin() + static_cast<std::ptrdiff_t>(offset),
-                                                prefill_tokens.begin() + static_cast<std::ptrdiff_t>(end));
+                    std::vector<uint32_t> chunk(
+                        tokens.begin() + static_cast<std::ptrdiff_t>(offset),
+                        tokens.begin() + static_cast<std::ptrdiff_t>(end));
                     const double t_chunk_start = wall_seconds();
-                    const bool need_logits = end == prefill_tokens.size();
+                    const bool need_logits =
+                        options.max_tokens > 0 && end == tokens.size();
                     // Use the executor's live position, not the original prompt
                     // offset. They are equal on ordinary prefill and ordinary
                     // block-aligned replay, while an ephemeral selected-session
@@ -8025,6 +8298,37 @@ private:
                     offset = end;
                 }
             }
+        };
+        // Capture the last block-aligned state of an API session while the
+        // corresponding tokens are actually being prefilled. Query replay may
+        // call this a second time and intentionally overwrite the first-pass
+        // snapshot with the state built against the selected semantic window.
+        auto do_prefill_vector = [&](const std::vector<uint32_t> &tokens,
+                                     uint32_t absolute_base,
+                                     size_t lbegin, size_t lend) {
+            if (lbegin >= lend) return;
+            const uint64_t abs_begin =
+                static_cast<uint64_t>(absolute_base) + lbegin;
+            const uint64_t abs_end =
+                static_cast<uint64_t>(absolute_base) + lend;
+            if (api_session && api_final_boundary > abs_begin &&
+                api_final_boundary <= abs_end) {
+                const size_t split = static_cast<size_t>(
+                    api_final_boundary - absolute_base);
+                do_prefill_vector_raw(tokens, lbegin, split);
+                executor_->capture_state(kvmem_api_boundary_ckpt_);
+                kvmem_api_boundary_pos_ = api_final_boundary;
+                do_prefill_vector_raw(tokens, split, lend);
+            } else {
+                do_prefill_vector_raw(tokens, lbegin, lend);
+            }
+        };
+        const uint32_t prefill_absolute_base = api_session
+            ? api_append_base
+            : static_cast<uint32_t>(kvmem_prefill_begin);
+        auto do_prefill_range = [&](size_t lbegin, size_t lend) {
+            do_prefill_vector(prefill_tokens, prefill_absolute_base,
+                              lbegin, lend);
         };
         if (dump) {
             if (use_mtp_prefix) {
@@ -9310,10 +9614,24 @@ private:
             // the hybrid recurrent state there, then finish the prompt exactly
             // as usual. The post-prefill selection below still uses this first
             // pass's pressure-window query.
-            do_prefill_range(0, kvmem_query_replay_begin);
-            executor_->capture_state(kvmem_query_replay_ckpt);
-            do_prefill_range(kvmem_query_replay_begin,
-                             prefill_tokens.size());
+            if (kvmem_query_replay_begin >= prefill_absolute_base) {
+                const size_t replay_local = static_cast<size_t>(
+                    kvmem_query_replay_begin - prefill_absolute_base);
+                if (replay_local > prefill_tokens.size()) {
+                    throw std::runtime_error(
+                        "KVMem query replay boundary is outside the appended "
+                        "prompt fragment");
+                }
+                do_prefill_range(0, replay_local);
+                executor_->capture_state(kvmem_query_replay_ckpt);
+                do_prefill_range(replay_local,
+                                 prefill_tokens.size());
+            } else {
+                // The aligned boundary is in the previous request's trailing
+                // partial block. Its snapshot was restored from the API
+                // session checkpoint above; first-pass only the new fragment.
+                do_prefill_range(0, prefill_tokens.size());
+            }
         } else {
             do_prefill_range(0, prefill_tokens.size());
         }
@@ -9369,8 +9687,29 @@ private:
             const uint32_t reg_n =
                 static_cast<uint32_t>(prompt_tokens.size()) - already;
             executor_->kvmem_register_append(reg_n);
-            executor_->kvmem_reselect();
-            if (recompute_query) {
+            if (options.kvmem_reselect_mode == KvMemReselectMode::Off) {
+                // A persistent prefill-only ingest must not collapse from the
+                // physical 224K+32K pool to the 224K selection budget merely
+                // because an API fragment ended. The mid-prefill page-pressure
+                // hook selects sink+recent when the pool is actually close to
+                // full; a later pressure-mode append also rebuilds the window
+                // before ingest. Keep one-shot behavior unchanged.
+                if (!api_session &&
+                    options.kvmem_prefill_window_mode !=
+                    KvMemPrefillWindowMode::KeepSelected) {
+                    executor_->kvmem_reselect_prefill_pressure();
+                }
+            } else {
+                if (recompute_query) {
+                    const uint32_t bt = std::max<uint32_t>(
+                        1, executor_->block_store()->config().block_tokens);
+                    executor_->kvmem_set_pin_from_block(
+                        kvmem_query_replay_begin / bt);
+                }
+                executor_->kvmem_reselect();
+            }
+            if (recompute_query &&
+                options.kvmem_reselect_mode != KvMemReselectMode::Off) {
                 // Freeze the exact semantic context selected above. Every block
                 // in the short replay suffix must already be selected; otherwise
                 // adding it during replay would change the retrieval result and
@@ -9394,19 +9733,81 @@ private:
                 }
                 executor_->kvmem_begin_query_replay(
                     kvmem_query_replay_ckpt, selected_context);
-                do_prefill_range(kvmem_query_replay_begin,
-                                 prefill_tokens.size());
+                std::vector<uint32_t> replay_tokens;
+                if (api_session) {
+                    if (kvmem_query_replay_begin < api_sequence_base ||
+                        kvmem_query_replay_begin > logical_prompt_tokens) {
+                        throw std::runtime_error(
+                            "KVMem session replay boundary is outside the "
+                            "checkpoint tail plus appended fragment");
+                    }
+                    const size_t replay_offset = static_cast<size_t>(
+                        kvmem_query_replay_begin - api_sequence_base);
+                    replay_tokens.assign(
+                        api_sequence_tokens.begin() +
+                            static_cast<std::ptrdiff_t>(replay_offset),
+                        api_sequence_tokens.end());
+                } else {
+                    replay_tokens.assign(
+                        prompt_tokens.begin() + static_cast<std::ptrdiff_t>(
+                            kvmem_query_replay_begin),
+                        prompt_tokens.end());
+                }
+                do_prefill_vector(replay_tokens,
+                                  kvmem_query_replay_begin, 0,
+                                  replay_tokens.size());
                 executor_->kvmem_end_query_replay();
+                if (api_session &&
+                    api_final_boundary == kvmem_query_replay_begin &&
+                    !kvmem_api_boundary_ckpt_.ready) {
+                    // No complete new block was crossed during replay, so the
+                    // old aligned state is still the correct future boundary.
+                    kvmem_api_boundary_ckpt_ =
+                        std::move(kvmem_query_replay_ckpt);
+                    kvmem_api_boundary_pos_ = api_final_boundary;
+                }
                 log("native kvmem query replay: boundary=" +
                     std::to_string(kvmem_query_replay_begin) +
                     " suffix_tokens=" +
-                    std::to_string(prompt_tokens.size() -
-                                   kvmem_query_replay_begin) +
+                    std::to_string(replay_tokens.size()) +
                     " fixed_context_blocks=" +
                     std::to_string(selected_context.size()));
             }
             kvmem_registered_pos = executor_->position();
             kvmem_last_reselect_pos = executor_->position();
+        }
+        if (api_session) {
+            if (executor_->position() != logical_prompt_tokens) {
+                throw std::runtime_error(
+                    "KVMem session prefill ended at an unexpected logical "
+                    "position");
+            }
+            if (api_final_boundary > 0 &&
+                (!kvmem_api_boundary_ckpt_.ready ||
+                 kvmem_api_boundary_pos_ != api_final_boundary)) {
+                throw std::runtime_error(
+                    "KVMem session failed to capture its final aligned "
+                    "checkpoint");
+            }
+            const size_t tail_offset = static_cast<size_t>(
+                api_final_boundary - api_sequence_base);
+            if (tail_offset > api_sequence_tokens.size()) {
+                throw std::runtime_error(
+                    "KVMem session tail offset exceeds the ingested token "
+                    "sequence");
+            }
+            kvmem_api_tail_tokens_.assign(
+                api_sequence_tokens.begin() +
+                    static_cast<std::ptrdiff_t>(tail_offset),
+                api_sequence_tokens.end());
+            if (std::getenv("QW3_KVMEM_TRACE")) {
+                log("native kvmem api-session checkpoint: id=" +
+                    options.kvmem_session_id + " boundary=" +
+                    std::to_string(kvmem_api_boundary_pos_) + " tail=" +
+                    std::to_string(kvmem_api_tail_tokens_.size()) +
+                    " logical_end=" +
+                    std::to_string(logical_prompt_tokens));
+            }
         }
         // kvmem prefix cache: fallback prompt-end (P) checkpoint. When the
         // block-boundary split above already staged ckpt_P at B, skip this;
@@ -9428,6 +9829,66 @@ private:
         // plain MTP (kvmem off) the reselect block above is skipped, so this
         // equals t_prefill_end and decode_s stays byte-identical to before.
         const double t_reselect_end = wall_seconds();
+
+        // Complete the state transaction here for max_tokens=0. In particular,
+        // do not initialize the sampler, draft/verify machinery, or decode KV.
+        if (options.max_tokens == 0) {
+            if (kvmem_warm_capture) {
+                kvmem_warm_log_ = prompt_tokens;
+                const size_t pos = executor_->position();
+                if (pos <= kvmem_warm_log_.size()) {
+                    kvmem_warm_log_.resize(pos);
+                    executor_->capture_state(kvmem_warm_ckpt_end_);
+                    kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
+                    kvmem_warm_prompt_pos_ = kvmem_warm_prompt_pos;
+                    kvmem_warm_prompt_resumable_ =
+                        kvmem_warm_prompt_resumable;
+                    kvmem_warm_valid_ = true;
+                    if (kvmem_prefix_cache_trace_enabled()) {
+                        std::ostringstream cmsg;
+                        cmsg << "kvmem prefix-cache CAPTURE "
+                             << "(mtp prefill-only): warm_log="
+                             << kvmem_warm_log_.size() << " pos=" << pos
+                             << " P=" << kvmem_warm_prompt_pos
+                             << " P_resumable="
+                             << (kvmem_warm_prompt_resumable ? 1 : 0);
+                        log(cmsg.str());
+                    }
+                } else {
+                    kvmem_warm_valid_ = false;
+                }
+            }
+            if (manage_device_scope) {
+                st = device_->end();
+                if (!st.ok) throw std::runtime_error(st.message);
+            }
+            const double prefill_s =
+                std::max(t_prefill_end - t_prefill_start, 1e-9);
+            const double reselect_s =
+                std::max(t_reselect_end - t_prefill_end, 0.0);
+            std::ostringstream msg;
+            msg << "native prefill-only: prompt_tokens="
+                << prompt_tokens.size() << " prefill="
+                << fmt_seconds(prefill_s) << " reselect="
+                << fmt_seconds(reselect_s) << " prefill_ops=" << prefill_ops;
+            if (kvmem_warm_reuse) {
+                msg << " kvmem_reuse=" << kvmem_reuse_m
+                    << " prefilled="
+                    << (prompt_tokens.size() - kvmem_reuse_m);
+            }
+            log(msg.str());
+            if (stats_out) {
+                stats_out->prefill_s = prefill_s;
+                stats_out->decode_s = 0.0;
+                stats_out->reselect_s = reselect_s;
+                stats_out->decoded = 0;
+                stats_out->prompt_tokens = prompt_tokens.size();
+                stats_out->acceptance = 0.0;
+                stats_out->kvmem_at_boundary = kvmem_at_prefill_end;
+                stats_out->kvmem_boundary_valid = kvmem_boundary_valid;
+            }
+            return {};
+        }
 
         std::string generated;
         // Committed decode token ids for the kvmem warm checkpoint; appended in
@@ -10706,6 +11167,19 @@ private:
     uint32_t kvmem_warm_end_pos_ = 0;      // M (position of ckpt_end_)
     bool kvmem_warm_prompt_resumable_ = false;  // ckpt_prompt_ safe to resume
     bool kvmem_warm_valid_ = false;
+
+    // Generic API-level persistent session. The first implementation is
+    // intentionally single-active-session because executor_ itself is a single
+    // live KV/recurrent state; the id prevents accidental cross-sample appends.
+    bool kvmem_api_session_active_ = false;
+    std::string kvmem_api_session_id_;
+    // Last block-aligned model/recurrent state plus the at-most-(block-1)
+    // teacher-forced tokens after it. Together they let the next request replay
+    // a query whose first token shares the preceding partial block, without
+    // rebuilding the historical selected context.
+    QwenExecutor::StateSnapshot kvmem_api_boundary_ckpt_;
+    uint32_t kvmem_api_boundary_pos_ = 0;
+    std::vector<uint32_t> kvmem_api_tail_tokens_;
 
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_v_cache_storage_;

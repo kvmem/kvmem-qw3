@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -74,6 +75,34 @@ json usage_json(size_t prompt_tokens, size_t completion_tokens) {
     return json{{"prompt_tokens", prompt_tokens},
                 {"completion_tokens", completion_tokens},
                 {"total_tokens", prompt_tokens + completion_tokens}};
+}
+
+bool parse_explicit_max_tokens(const json &req, bool &present, int &value,
+                               std::string &error) {
+    const char *key = nullptr;
+    if (req.contains("max_tokens")) {
+        key = "max_tokens";
+    } else if (req.contains("max_completion_tokens")) {
+        key = "max_completion_tokens";
+    }
+    present = key != nullptr;
+    if (!present) return true;
+    const json &field = req[key];
+    if (!field.is_number_integer()) {
+        error = std::string(key) + " must be an integer";
+        return false;
+    }
+    const int64_t raw = field.get<int64_t>();
+    if (raw < 0) {
+        error = std::string(key) + " must be >= 0";
+        return false;
+    }
+    if (raw > std::numeric_limits<int>::max()) {
+        error = std::string(key) + " is too large";
+        return false;
+    }
+    value = static_cast<int>(raw);
+    return true;
 }
 
 std::string basename_of(const std::string &path) {
@@ -727,7 +756,8 @@ struct RenderedMessageSpan {
 std::string render_messages(
         const json &messages, const json *tools, bool enable_thinking,
         const std::string &forced_tool_name = {},
-        std::vector<RenderedMessageSpan> *message_spans = nullptr) {
+        std::vector<RenderedMessageSpan> *message_spans = nullptr,
+        bool add_generation_prompt = true) {
     size_t num_sys = 0;
     std::string merged_system;
     if (messages.is_array() && !messages.empty() && messages[0].is_object()) {
@@ -813,7 +843,7 @@ std::string render_messages(
                 }
             }
             prompt += "<|im_start|>assistant\n";
-            if (i > last_query_index) {
+            if (add_generation_prompt && i > last_query_index) {
                 prompt += "<think>\n" + reasoning_content + "\n</think>\n\n";
             }
             prompt += assistant_content;
@@ -849,11 +879,13 @@ std::string render_messages(
         }
     }
 
-    prompt += "<|im_start|>assistant\n";
-    if (enable_thinking) {
-        prompt += "<think>\n";
-    } else {
-        prompt += "<think>\n\n</think>\n\n";
+    if (add_generation_prompt) {
+        prompt += "<|im_start|>assistant\n";
+        if (enable_thinking) {
+            prompt += "<think>\n";
+        } else {
+            prompt += "<think>\n\n</think>\n\n";
+        }
     }
     return prompt;
 }
@@ -881,6 +913,7 @@ const char *generation_finish_reason(bool stop_matched,
     // max_tokens. A client stop string takes precedence; otherwise reaching
     // the configured token ceiling is OpenAI's "length", while an earlier
     // normal return is EOS and therefore "stop".
+    if (max_tokens == 0) return "prefill_only";
     if (stop_matched) return "stop";
     if (max_tokens > 0 &&
         completion_tokens >= static_cast<size_t>(max_tokens)) {
@@ -1098,6 +1131,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
               << "  kvmem_query_conditioned="
               << yesno(engine.kvmem_query_conditioned) << "\n"
+              << "  kvmem_recompute_query="
+              << yesno(engine.kvmem_recompute_query) << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
               << "  kvmem_sink_blocks=" << engine.kvmem_sink_blocks << "\n"
@@ -1192,17 +1227,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         const int remaining_ctx =
             std::max(1, engine.ctx_size - static_cast<int>(prompt_token_count));
-        const bool has_max_tokens =
-            req.contains("max_tokens") || req.contains("max_completion_tokens");
+        bool has_max_tokens = false;
+        int requested_max_tokens = 0;
+        std::string max_tokens_error;
+        if (!parse_explicit_max_tokens(req, has_max_tokens,
+                                       requested_max_tokens,
+                                       max_tokens_error)) {
+            throw std::invalid_argument(max_tokens_error);
+        }
         if (has_max_tokens) {
-            g.max_tokens = req.value("max_tokens",
-                                     req.value("max_completion_tokens", remaining_ctx));
-            if (g.max_tokens <= 0) g.max_tokens = remaining_ctx;
+            // 0 has an intentional, first-class meaning: execute the complete
+            // prefill/state-update path without entering sampling or decode.
+            g.max_tokens = requested_max_tokens;
         } else {
             g.max_tokens = cfg.default_max_tokens_set
                 ? cfg.default_generation.max_tokens
                 : remaining_ctx;
-            if (g.max_tokens <= 0) g.max_tokens = remaining_ctx;
         }
         if (cfg.default_max_tokens_set &&
             cfg.default_generation.max_tokens > 0 &&
@@ -1261,6 +1301,139 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             "application/json");
             return;
         }
+        bool explicit_max_tokens = false;
+        int requested_max_tokens = 0;
+        std::string max_tokens_error;
+        if (!parse_explicit_max_tokens(req, explicit_max_tokens,
+                                       requested_max_tokens,
+                                       max_tokens_error)) {
+            set_error_response(res, 400, max_tokens_error);
+            return;
+        }
+        const bool prefill_only = explicit_max_tokens
+            ? requested_max_tokens == 0
+            : (cfg.default_max_tokens_set &&
+               cfg.default_generation.max_tokens == 0);
+        KvMemReselectMode kvmem_reselect_mode = KvMemReselectMode::Auto;
+        if (req.contains("kvmem_reselect")) {
+            if (!req["kvmem_reselect"].is_string()) {
+                set_error_response(res, 400,
+                                   "kvmem_reselect must be auto|force|off");
+                return;
+            }
+            const std::string mode = req["kvmem_reselect"].get<std::string>();
+            if (mode == "auto") {
+                kvmem_reselect_mode = KvMemReselectMode::Auto;
+            } else if (mode == "force") {
+                kvmem_reselect_mode = KvMemReselectMode::Force;
+            } else if (mode == "off") {
+                kvmem_reselect_mode = KvMemReselectMode::Off;
+            } else {
+                set_error_response(res, 400,
+                                   "kvmem_reselect must be auto|force|off");
+                return;
+            }
+        }
+        KvMemPrefillWindowMode kvmem_prefill_window_mode =
+            KvMemPrefillWindowMode::Pressure;
+        if (req.contains("kvmem_prefill_window")) {
+            if (!req["kvmem_prefill_window"].is_string()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_prefill_window must be pressure|keep_selected");
+                return;
+            }
+            const std::string mode =
+                req["kvmem_prefill_window"].get<std::string>();
+            if (mode == "pressure") {
+                kvmem_prefill_window_mode =
+                    KvMemPrefillWindowMode::Pressure;
+            } else if (mode == "keep_selected") {
+                kvmem_prefill_window_mode =
+                    KvMemPrefillWindowMode::KeepSelected;
+            } else {
+                set_error_response(
+                    res, 400,
+                    "kvmem_prefill_window must be pressure|keep_selected");
+                return;
+            }
+        }
+        bool kvmem_session_request = false;
+        bool kvmem_session_reset = false;
+        std::string kvmem_session_id;
+        std::string kvmem_session_op;
+        if (req.contains("kvmem_session_id") ||
+            req.contains("kvmem_session_op")) {
+            if (!req.contains("kvmem_session_id") ||
+                !req["kvmem_session_id"].is_string() ||
+                req["kvmem_session_id"].get<std::string>().empty()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_id must be a non-empty string");
+                return;
+            }
+            if (!req.contains("kvmem_session_op") ||
+                !req["kvmem_session_op"].is_string()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_op must be start|append|finish");
+                return;
+            }
+            kvmem_session_id = req["kvmem_session_id"].get<std::string>();
+            kvmem_session_op = req["kvmem_session_op"].get<std::string>();
+            if (kvmem_session_op != "start" &&
+                kvmem_session_op != "append" &&
+                kvmem_session_op != "finish") {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_op must be start|append|finish");
+                return;
+            }
+            if (!engine.kvmem_enabled) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_* requires --kvmem");
+                return;
+            }
+            kvmem_session_request = true;
+            kvmem_session_reset = kvmem_session_op == "start";
+            if (kvmem_session_op != "finish" && !prefill_only) {
+                set_error_response(
+                    res, 400,
+                    "kvmem session start/append requires max_tokens=0");
+                return;
+            }
+            if (kvmem_session_reset &&
+                kvmem_prefill_window_mode ==
+                    KvMemPrefillWindowMode::KeepSelected) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_prefill_window=keep_selected requires an active "
+                    "session selection");
+                return;
+            }
+        }
+        if (kvmem_reselect_mode == KvMemReselectMode::Force &&
+            !req.contains("kvmem_query_span")) {
+            set_error_response(
+                res, 400,
+                "kvmem_reselect=force requires kvmem_query_span");
+            return;
+        }
+        if (kvmem_reselect_mode == KvMemReselectMode::Force &&
+            !engine.kvmem_query_conditioned) {
+            set_error_response(
+                res, 400,
+                "kvmem_reselect=force requires --kvmem-query-conditioned");
+            return;
+        }
+        if (kvmem_reselect_mode == KvMemReselectMode::Off &&
+            req.contains("kvmem_query_span")) {
+            set_error_response(
+                res, 400,
+                "kvmem_query_span cannot be used with kvmem_reselect=off");
+            return;
+        }
         const bool enable_thinking =
             req.value("enable_thinking", cfg.enable_thinking_default);
         const json *raw_tools = req.contains("tools") ? &req["tools"] : nullptr;
@@ -1310,7 +1483,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         std::vector<RenderedMessageSpan> rendered_message_spans;
         const std::string prompt = render_messages(
             req["messages"], tools, enable_thinking, forced_tool_name,
-            transcript_replay ? &rendered_message_spans : nullptr);
+            transcript_replay ? &rendered_message_spans : nullptr,
+            /*add_generation_prompt=*/!prefill_only);
         const std::vector<int32_t> prompt_token_ids =
             usage_tokenizer.encode(prompt);
         const size_t prompt_token_count = prompt_token_ids.size();
@@ -1326,6 +1500,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         GenerationOptions g = make_gen(req, prompt_token_count, enable_thinking);
         g.raw_prompt = true; // prompt is already chat-framed
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
+        g.kvmem_reselect_mode = kvmem_reselect_mode;
+        g.kvmem_prefill_window_mode = kvmem_prefill_window_mode;
+        g.kvmem_session_id = kvmem_session_id;
 
         // Query-conditioned KVMem: mark the final user message's token span so
         // the executor selects the decode window by multi-token mean relevance
@@ -1336,7 +1513,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         // suffix fall in the shared prefix/suffix). Only when the server was
         // launched with --kvmem-query-conditioned; otherwise the span stays empty
         // and selection is byte-identical to the single-token / recency path.
-        if (engine.kvmem_query_conditioned) {
+        if (engine.kvmem_query_conditioned &&
+            kvmem_reselect_mode != KvMemReselectMode::Off) {
             const json &msgs = req["messages"];
             bool explicit_span = false;
 
@@ -1532,7 +1710,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 msgs_empty[static_cast<size_t>(message_index)]["content"] =
                     std::move(content_empty);
                 const std::string empty_prompt = render_messages(
-                    msgs_empty, tools, enable_thinking, forced_tool_name);
+                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    /*message_spans=*/nullptr,
+                    /*add_generation_prompt=*/!prefill_only);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
@@ -1615,7 +1795,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 msgs_empty[static_cast<size_t>(message_index)]["content"] =
                     std::move(content_empty);
                 const std::string empty_prompt = render_messages(
-                    msgs_empty, tools, enable_thinking, forced_tool_name);
+                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    /*message_spans=*/nullptr,
+                    /*add_generation_prompt=*/!prefill_only);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
@@ -1679,7 +1861,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     json msgs_empty = msgs;
                     msgs_empty[lqi]["content"] = "";
                     const std::string empty_prompt = render_messages(
-                        msgs_empty, tools, enable_thinking, forced_tool_name);
+                        msgs_empty, tools, enable_thinking, forced_tool_name,
+                        /*message_spans=*/nullptr,
+                        /*add_generation_prompt=*/!prefill_only);
                     const std::vector<int32_t> tok_full =
                         usage_tokenizer.encode(prompt);
                     const std::vector<int32_t> tok_empty =
@@ -1711,9 +1895,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
         }
         g.continuous_batching =
+            !kvmem_session_request &&
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);
-        const std::string route = g.continuous_batching ? "continuous" : "plain";
+        const std::string route = kvmem_session_request
+            ? ("session-" + kvmem_session_op)
+            : (g.continuous_batching ? "continuous" : "plain");
         const std::string fallback_reason =
             g.continuous_batching ? "" :
             (serve_continuous_batching_enabled() ? "request_unsupported" : "disabled");
@@ -1739,7 +1926,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 [&, prompt, g, stops, id, created, rid, enable_thinking,
                  tool_request, forced_tool_request, tools_schema,
                  stream_include_usage, prompt_token_count, route,
-                 fallback_reason](size_t, httplib::DataSink &sink) {
+                 fallback_reason, kvmem_session_request,
+                 kvmem_session_reset](size_t, httplib::DataSink &sink) {
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
                     if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
@@ -1807,8 +1995,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         sink.done();
                     };
                     try {
+                        auto generate_request = [&](const auto &callback) {
+                            if (kvmem_session_request) {
+                                eng.generate_session_stream(
+                                    prompt, g, callback, kvmem_session_reset);
+                            } else {
+                                eng.generate_stream(prompt, g, callback);
+                            }
+                        };
                         send_role();
-                        if (enable_thinking) {
+                        if (enable_thinking && g.max_tokens > 0) {
                             send_delta(json{{"reasoning_content", ""}});
                         }
                         auto emit_text = [&](const std::string &text) {
@@ -1846,7 +2042,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             bool buffering_tool = forced_tool_request;
                             bool streamed_content = false;
                             std::string content_pending;
-                            eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                            generate_request([&](const std::string &piece) {
                                 if (stopped) return;
                                 ++completion_tokens;
                                 acc += piece;
@@ -1939,7 +2135,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                       << "\n";
                             return true;
                         }
-                        eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                        generate_request([&](const std::string &piece) {
                             if (stopped) return;
                             ++completion_tokens;
                             acc += piece;
@@ -1996,7 +2192,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         std::string text;
         size_t completion_tokens = 0;
         try {
-            if (g.continuous_batching) {
+            if (kvmem_session_request) {
+                std::lock_guard<std::mutex> lk(gen_mu);
+                eng.generate_session_stream(
+                    prompt, g, [&](const std::string &piece) {
+                        ++completion_tokens;
+                        text += piece;
+                    }, kvmem_session_reset);
+            } else if (g.continuous_batching) {
                 eng.generate_stream(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
@@ -2014,7 +2217,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             set_error_response(res, status_for_exception(e), e.what());
             return;
         }
-        if (enable_thinking) text = "<think>\n" + text;
+        if (enable_thinking && g.max_tokens > 0) text = "<think>\n" + text;
         std::string utf8_pending;
         text = take_complete_utf8(utf8_pending, text);
         text += flush_utf8_pending(utf8_pending, false);
@@ -2081,6 +2284,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             "application/json");
             return;
         }
+        bool explicit_max_tokens = false;
+        int requested_max_tokens = 0;
+        std::string max_tokens_error;
+        if (!parse_explicit_max_tokens(req, explicit_max_tokens,
+                                       requested_max_tokens,
+                                       max_tokens_error)) {
+            set_error_response(res, 400, max_tokens_error);
+            return;
+        }
+        (void)explicit_max_tokens;
+        (void)requested_max_tokens;
         const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
         if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
             set_error_response(

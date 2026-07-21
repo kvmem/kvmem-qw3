@@ -45,6 +45,13 @@ void Engine::generate_stream(const std::string &prompt,
     impl_->backend->generate(prompt, options, on_text);
 }
 
+void Engine::generate_session_stream(const std::string &prompt_fragment,
+                                     const GenerationOptions &options,
+                                     const TokenCallback &on_text,
+                                     bool reset) {
+    impl_->backend->generate_session(prompt_fragment, options, on_text, reset);
+}
+
 std::string render_qwen3_chat_prompt(const std::string &system,
                                      const std::string &user,
                                      bool enable_thinking) {

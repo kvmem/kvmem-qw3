@@ -549,6 +549,7 @@ void QwenExecutor::reset_state() {
     kvmem_active_ = false;
     kvmem_registered_pos_ = 0;
     kvmem_query_replay_active_ = false;
+    kvmem_keep_selected_prefill_ = false;
     window_pages_host_.clear();
     window_page_count_ = 0;
     mtp_window_pages_host_.clear();
@@ -582,6 +583,7 @@ void QwenExecutor::reset_state() {
     kvmem_query_end_ = 0;
     g_query_multi_count_ = 0;
     g_query_multi_ready_ = false;
+    kvmem_qc_capture_active_ = false;
     // Per-layer multi-layer index + incremental-capture progress are per-request:
     // drop them so a fresh request rebuilds its own full-coverage index (#91).
     g_kbar_multi_ready_ = false;
@@ -2113,14 +2115,16 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             // EVERY normal-attention layer with its slot so block scoring folds in
             // all L layers; single-layer mode resolves to just bs_score_layer_
             // (slot 0). Inert unless a span is active.
-            if (kvmem_query_end_ > kvmem_query_begin_) {
+            if (kvmem_qc_capture_active_) {
                 const int32_t slot =
                     (static_cast<size_t>(il) < std_layer_slot_.size())
                         ? std_layer_slot_[il] : -1;
                 if (slot >= 0) {
-                    kvmem_capture_query_multi(static_cast<uint32_t>(slot), chunk_off,
-                                              batch, base_pos, rope_base_pos,
-                                              q_stride_buf);
+                    if (kvmem_query_end_ > kvmem_query_begin_) {
+                        kvmem_capture_query_multi(
+                            static_cast<uint32_t>(slot), chunk_off, batch,
+                            base_pos, rope_base_pos, q_stride_buf);
+                    }
                     // Build the full-coverage per-layer content index incrementally
                     // (#91): index EVERY block of this chunk from the freshly-RoPE'd
                     // K (de-RoPE'd at rope_base_pos == the bake position), not just
@@ -3564,6 +3568,11 @@ void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
     const uint32_t headroom_pages =
         next_chunk_pages + keep_free_blocks * pages_per_block;
     if (free_pages > headroom_pages) return;
+    if (kvmem_keep_selected_prefill_) {
+        throw std::runtime_error(
+            "KVMem keep-selected prefill exhausted the reserved GPU headroom; "
+            "reduce the appended session or increase the generation reserve");
+    }
     kvmem_reselect_prefill_pressure();
 }
 
@@ -4496,6 +4505,7 @@ uint32_t QwenExecutor::kvmem_reselect_prefill_pressure() {
 void QwenExecutor::kvmem_prepare_prefill_window(uint32_t upcoming_tokens) {
     if (!kvmem_enabled_ || !block_store_ || !kvmem_active_) return;
     if (upcoming_tokens == 0) return;
+    if (kvmem_keep_selected_prefill_) return;
     const uint64_t projected_tokens =
         static_cast<uint64_t>(position_) + upcoming_tokens;
     if (projected_tokens <= block_store_->config().select_budget) return;
@@ -5345,7 +5355,8 @@ void QwenExecutor::kvmem_set_trace_metadata(
 // -> the single-token retrieval / recency path runs unchanged.
 void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
                                         uint32_t prompt_tokens,
-                                        bool preserve_content_index) {
+                                        bool preserve_content_index,
+                                        bool capture_content_without_query) {
     // Consume + clear the resume base up front (set by the preceding
     // kvmem_truncate_to on a session-continuation turn). It is only USED when a
     // span is active below (above-budget QC); on a cold/below-budget call it is
@@ -5360,6 +5371,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     kvmem_query_end_ = end;
     g_query_multi_count_ = 0;
     g_query_multi_ready_ = false;
+    kvmem_qc_capture_active_ =
+        end > begin || capture_content_without_query;
     g_kbar_multi_ready_ = false;
     g_kbar_multi_blocks_ = 0;
     if (!preserve_content_index) {
@@ -5376,28 +5389,23 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     }
     g_kraw_multi_ready_ = false;
     kvmem_qc_total_tokens_ = 0;
-    if (end <= begin) return;
+    if (!kvmem_qc_capture_active_) return;
     const QwenConfig &cfg = model_.config();
     // Resolve the normal-attention layer set (pins bs_score_layer_ as a side
     // effect) and read the env A/B knobs so capture/scoring agree on L this run.
     kvmem_resolve_std_layers();
-    // Cap the captured question length (the mean is order-free; questions are
-    // tiny vs the cap). Clamp to the first kCap tokens if longer.
-    constexpr uint32_t kCap = 512;
-    if (kvmem_query_end_ - kvmem_query_begin_ > kCap) {
-        kvmem_query_end_ = kvmem_query_begin_ + kCap;
-    }
     // g_query_multi_ holds the per-layer de-RoPE'd question rows, laid out
     // [L, S, n_heads, head_dim] (S = span length, per-layer row stride). Allocate
     // by the exact L*S so a tiny question only costs tens of MB.
-    const uint32_t S = kvmem_query_end_ - kvmem_query_begin_;
+    const uint32_t S = std::max<uint32_t>(
+        1, kvmem_query_end_ - kvmem_query_begin_);
     kvmem_query_span_ = S;
     const uint32_t L = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
     const uint64_t rows = static_cast<uint64_t>(L) * S;
     if (!g_query_multi_ || g_query_multi_capacity_ < rows) {
         g_query_multi_ = backend_.tensor_f32(
             rows * cfg.n_heads * cfg.head_dim, "g_query_multi");
-        g_query_multi_capacity_ = static_cast<uint32_t>(rows);
+        g_query_multi_capacity_ = rows;
     }
     // Incremental full-coverage content index (#91): the paged builder can only
     // run once from the pristine cache and misses the tail of histories larger
@@ -6045,7 +6053,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
                                             uint32_t base_pos,
                                             uint32_t rope_base_pos,
                                             uint32_t k_token_stride) {
-    if (kvmem_query_end_ <= kvmem_query_begin_) return;     // span inactive
+    if (!kvmem_qc_capture_active_) return;
     if (!g_kbar_multi_ || !k_batch_ || g_kbar_multi_ready_) return;
     if (kvmem_qc_total_blocks_ == 0 || !block_store_) return;
     const QwenConfig &cfg = model_.config();

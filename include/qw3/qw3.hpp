@@ -14,6 +14,17 @@ enum class BackendKind {
     QwenNative,
 };
 
+enum class KvMemReselectMode {
+    Auto,
+    Force,
+    Off,
+};
+
+enum class KvMemPrefillWindowMode {
+    Pressure,
+    KeepSelected,
+};
+
 struct EngineOptions {
     std::string model_path;
     BackendKind backend = BackendKind::QwenNative;
@@ -83,6 +94,10 @@ struct EngineOptions {
     // (mean over question tokens) instead of recency. Default OFF -> behavior is
     // byte-identical to the recency/single-token retrieval path.
     bool kvmem_query_conditioned = false;
+    // Re-prefill the query suffix against the just-selected semantic window.
+    // Enabled by default for query-conditioned mean-k; the first-pass query is
+    // still used for retrieval scoring, while decode consumes the replayed KV.
+    bool kvmem_recompute_query = true;
     int kvmem_retrieval_blocks = 0; // 0 = derive from remaining budget
     int kvmem_profile_blocks = 0;   // 0 = derive from remaining budget
     double kvmem_gpu_memory_ratio = 0.50;
@@ -116,6 +131,12 @@ struct GenerationOptions {
     // Whether the prompt already opened a <think> block (enable_thinking). The
     // budget counter only runs while a think block is open.
     bool thinking_open = false;
+    // Generic multi-request KVMem controls. These describe inference behavior;
+    // dataset/session parsing remains entirely in the caller.
+    KvMemReselectMode kvmem_reselect_mode = KvMemReselectMode::Auto;
+    KvMemPrefillWindowMode kvmem_prefill_window_mode =
+        KvMemPrefillWindowMode::Pressure;
+    std::string kvmem_session_id;
     // Query-conditioned KVMem: half-open token span [begin,end) of the prompt
     // that is the user's question. The executor captures these query rows during
     // prefill and uses them for multi-token block selection. begin==end (default)
@@ -198,6 +219,13 @@ public:
     void generate_stream(const std::string &prompt,
                          const GenerationOptions &options,
                          const TokenCallback &on_text);
+    // Append a prompt fragment to one persistent native KVMem session. `reset`
+    // starts/replaces the session; false continues from the executor's live
+    // token/KV/recurrent state without re-tokenizing an earlier prefix.
+    void generate_session_stream(const std::string &prompt_fragment,
+                                 const GenerationOptions &options,
+                                 const TokenCallback &on_text,
+                                 bool reset);
 
 private:
     struct Impl;

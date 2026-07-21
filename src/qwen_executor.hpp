@@ -307,7 +307,8 @@ public:
     // K chunk is captured. (Public: backend-invoked.)
     void kvmem_set_query_span(uint32_t begin, uint32_t end,
                               uint32_t prompt_tokens,
-                              bool preserve_content_index = false); // before prefill
+                              bool preserve_content_index = false,
+                              bool capture_content_without_query = false); // before prefill
     // Publish the incrementally captured mean-K index for the CURRENT logical
     // prefix, even though the full teacher-forced transcript has not yet been
     // consumed. Used only by experimental transcript replay before an
@@ -430,6 +431,13 @@ public:
     // Cold/all-fit paths are no-ops and transition through the normal pressure
     // trigger only after they actually outgrow the resident pool.
     void kvmem_prepare_prefill_window(uint32_t upcoming_tokens);
+    // Keep the currently assembled semantic selection while appending a
+    // teacher-forced suffix. If the suffix would exhaust the reserved GPU
+    // headroom, the executor fails explicitly instead of silently replacing
+    // the semantic context with sink+recent.
+    void kvmem_set_keep_selected_prefill(bool keep) {
+        kvmem_keep_selected_prefill_ = keep;
+    }
 
     // Re-select the working set from the built-in cumulative-attention top-k
     // and assemble it: re-RoPE each moved block in place (per attention layer)
@@ -688,6 +696,7 @@ private:
     // The selected suffix blocks were removed first, so replay consumes the
     // same GPU-pool capacity they occupied before the rewind.
     bool kvmem_query_replay_active_ = false;
+    bool kvmem_keep_selected_prefill_ = false;
     // True once a selection has been assembled this session; gates the decode
     // window substitution. Cleared by reset_state().
     bool kvmem_active_ = false;
@@ -891,8 +900,12 @@ private:
     uint32_t kvmem_query_begin_ = 0;
     uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
     uint32_t g_query_multi_count_ = 0;                         // rows captured so far (per slot)
-    uint32_t g_query_multi_capacity_ = 0;                      // allocated rows (cap, == S)
+    uint64_t g_query_multi_capacity_ = 0;                      // allocated rows across layers
     bool g_query_multi_ready_ = false;                         // all span rows captured
+    // Persistent API sessions build the mean-K content index while ingesting
+    // history, before a retrieval query exists. This flag keeps K capture live
+    // when query_begin==query_end; query capture/scoring remain disabled.
+    bool kvmem_qc_capture_active_ = false;
     std::unique_ptr<DeviceTensor> g_query_multi_;              // [L, S, n_heads, head_dim] fp32
     // Clean-query prefill (task #50). The PASS-A isolated-question query is stashed
     // here; it is NOT touched by reset_state so it survives the pass boundary.
