@@ -241,6 +241,15 @@ public:
                                   const std::vector<uint32_t> &context_block_ids,
                                   bool reset_recurrent_state = false);
     void kvmem_end_query_replay();
+    // Diagnostic-only DeltaNet state interchange used by the rebuilt-state
+    // experiment. The file embeds the exact source token vector; import refuses
+    // a token, layer, or tensor-shape mismatch before changing live state.
+    void kvmem_export_recurrent_state(
+        const std::string &path,
+        const std::vector<uint32_t> &source_tokens) const;
+    void kvmem_import_recurrent_state(
+        const std::string &path,
+        const std::vector<uint32_t> &expected_source_tokens);
     // Start a new local recurrent segment while retaining the assembled
     // normal-attention KVMem window. Used only by controlled transcript-memory
     // construction experiments; ordinary inference never calls it.

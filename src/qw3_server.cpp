@@ -68,7 +68,11 @@ std::string bytes_gib_label(uint64_t bytes) {
 }
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
-    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty();
+    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty() &&
+        g.kvmem_rebuilt_state_export_key.empty() &&
+        g.kvmem_rebuilt_state_import_key.empty() &&
+        g.kvmem_rebuilt_state_capture_key.empty() &&
+        g.kvmem_rebuilt_state_seed_key.empty();
 }
 
 json usage_json(size_t prompt_tokens, size_t completion_tokens) {
@@ -1133,6 +1137,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << yesno(engine.kvmem_query_conditioned) << "\n"
               << "  kvmem_recompute_query="
               << yesno(engine.kvmem_recompute_query) << "\n"
+              << "  kvmem_immutable_k="
+              << yesno(engine.kvmem_immutable_source_k) << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
               << "  kvmem_sink_blocks=" << engine.kvmem_sink_blocks << "\n"
@@ -1281,6 +1287,55 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                  req.value("ignore_eos_token", g.ignore_eos));
         g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
         if (g.thinking_budget < 0) g.thinking_budget = 0;
+        auto parse_rebuilt_state_key = [&](const char *field,
+                                           std::string &out) {
+            if (!req.contains(field)) return;
+            if (!req[field].is_string()) {
+                throw std::invalid_argument(std::string(field) +
+                                            " must be a string key");
+            }
+            out = req[field].get<std::string>();
+            const bool valid = !out.empty() && out.size() <= 128 &&
+                std::all_of(out.begin(), out.end(), [](unsigned char c) {
+                    return std::isalnum(c) || c == '-' || c == '_' || c == '.';
+                });
+            if (!valid) {
+                throw std::invalid_argument(
+                    std::string(field) +
+                    " must contain 1..128 characters from [A-Za-z0-9_.-]");
+            }
+        };
+        parse_rebuilt_state_key("kvmem_rebuilt_state_export",
+                                g.kvmem_rebuilt_state_export_key);
+        parse_rebuilt_state_key("kvmem_rebuilt_state_import",
+                                g.kvmem_rebuilt_state_import_key);
+        parse_rebuilt_state_key("kvmem_rebuilt_state_capture",
+                                g.kvmem_rebuilt_state_capture_key);
+        parse_rebuilt_state_key("kvmem_rebuilt_state_seed",
+                                g.kvmem_rebuilt_state_seed_key);
+        if (!g.kvmem_rebuilt_state_export_key.empty() &&
+            !g.kvmem_rebuilt_state_import_key.empty()) {
+            throw std::invalid_argument(
+                "kvmem_rebuilt_state_export and kvmem_rebuilt_state_import "
+                "are mutually exclusive");
+        }
+        if (!g.kvmem_rebuilt_state_capture_key.empty() &&
+            (!g.kvmem_rebuilt_state_export_key.empty() ||
+             !g.kvmem_rebuilt_state_import_key.empty() ||
+             !g.kvmem_rebuilt_state_seed_key.empty())) {
+            throw std::invalid_argument(
+                "kvmem_rebuilt_state_capture cannot be combined with other "
+                "rebuilt-state operations");
+        }
+        if (!g.kvmem_rebuilt_state_seed_key.empty() &&
+            g.kvmem_rebuilt_state_export_key.empty()) {
+            throw std::invalid_argument(
+                "kvmem_rebuilt_state_seed requires kvmem_rebuilt_state_export");
+        }
+        if (!g.kvmem_rebuilt_state_export_key.empty() && g.max_tokens != 0) {
+            throw std::invalid_argument(
+                "kvmem_rebuilt_state_export requires max_tokens=0");
+        }
         return g;
     };
 
@@ -2273,11 +2328,33 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
         std::string prompt;
+        std::vector<uint32_t> exact_prompt_tokens;
         if (req.contains("prompt") && req["prompt"].is_string()) {
             prompt = req["prompt"].get<std::string>();
         } else if (req.contains("prompt") && req["prompt"].is_array() &&
                    !req["prompt"].empty() && req["prompt"][0].is_string()) {
             prompt = req["prompt"][0].get<std::string>();
+        } else if (req.contains("prompt") && req["prompt"].is_array() &&
+                   !req["prompt"].empty()) {
+            exact_prompt_tokens.reserve(req["prompt"].size());
+            for (const json &value : req["prompt"]) {
+                if (!value.is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "integer-array prompt must contain only token IDs");
+                    return;
+                }
+                const int64_t token = value.get<int64_t>();
+                if (token < 0 ||
+                    token > static_cast<int64_t>(
+                                std::numeric_limits<uint32_t>::max())) {
+                    set_error_response(
+                        res, 400,
+                        "integer-array prompt token ID is out of range");
+                    return;
+                }
+                exact_prompt_tokens.push_back(static_cast<uint32_t>(token));
+            }
         } else {
             res.status = 400;
             res.set_content(dump_json(json{{"error", "missing prompt"}}),
@@ -2295,7 +2372,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         (void)explicit_max_tokens;
         (void)requested_max_tokens;
-        const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
+        const size_t prompt_token_count = exact_prompt_tokens.empty()
+            ? usage_tokenizer.encode(prompt).size()
+            : exact_prompt_tokens.size();
         if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
             set_error_response(
                 res,
@@ -2307,6 +2386,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         GenerationOptions g = make_gen(req, prompt_token_count);
         g.raw_prompt = true; // /v1/completions sends raw text, no chat template
+        g.prompt_token_ids_override = std::move(exact_prompt_tokens);
         g.continuous_batching =
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);

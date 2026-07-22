@@ -98,6 +98,11 @@ struct EngineOptions {
     // Enabled by default for query-conditioned mean-k; the first-pass query is
     // still used for retrieval scoring, while decode consumes the replayed KV.
     bool kvmem_recompute_query = true;
+    // Preserve a construction-frame source K and rebuild a separate working K
+    // on every selection. Enabled by default so repeated re-RoPE never mutates
+    // the repository K; use --no-kvmem-immutable-k for legacy ablations and
+    // --kv-dtype fp8 for the practical lower-memory configuration.
+    bool kvmem_immutable_source_k = true;
     int kvmem_retrieval_blocks = 0; // 0 = derive from remaining budget
     int kvmem_profile_blocks = 0;   // 0 = derive from remaining budget
     double kvmem_gpu_memory_ratio = 0.50;
@@ -118,6 +123,11 @@ struct GenerationOptions {
     float repetition_penalty = 1.0f;
     uint64_t seed = 0;
     bool raw_prompt = false;
+    // Exact raw-token prompt override used by the /v1/completions integer-array
+    // form. Empty means tokenize the prompt string as usual. This avoids a
+    // decode/re-tokenize change at concatenated sparse-block boundaries in
+    // controlled representation experiments.
+    std::vector<uint32_t> prompt_token_ids_override;
     bool ignore_eos = false;
     // Internal serving flag: enqueue this request on the native continuous
     // batching worker when the backend supports it. CLI single-shot generation
@@ -165,6 +175,20 @@ struct GenerationOptions {
     uint32_t kvmem_context_begin = 0;
     uint32_t kvmem_context_end = 0;
     std::string kvmem_trace_tag;
+    // Experimental hybrid-state controls. Export dense-prefills its exact raw
+    // prompt and writes only DeltaNet recurrent/conv state. Capture writes the
+    // accumulated state restored at the final query-replay boundary, associating
+    // it with that request's exact selected source-token vector. Seed initializes
+    // a cold dense export request from such a captured state, so replaying the
+    // selected tokens applies ordinary DeltaNet updates on top of the accumulated
+    // history instead of replacing it. Import substitutes the resulting state
+    // after an ordinary KVMem selection and before final query replay. Empty keys
+    // keep the normal path byte-for-byte unchanged. Files are rooted under
+    // QW3_KVMEM_REBUILT_STATE_DIR; these are validated keys, never paths.
+    std::string kvmem_rebuilt_state_export_key;
+    std::string kvmem_rebuilt_state_import_key;
+    std::string kvmem_rebuilt_state_capture_key;
+    std::string kvmem_rebuilt_state_seed_key;
 };
 
 struct ModelInfo {

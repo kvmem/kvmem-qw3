@@ -43,6 +43,35 @@ double wall_seconds() {
     return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
 }
 
+// Vector-position counterpart of the executor's RoPE range diagnostic. The
+// continuous-batching paths feed ragged position arrays directly to CUDA, so
+// inspect the host mirror immediately before each Q/K RoPE launch pair. One
+// line summarizes one actual kernel pair without aborting or altering inputs.
+void trace_rope_positions_if_out_of_range(const char *source,
+                                          const std::vector<int32_t> &positions,
+                                          uint32_t limit,
+                                          int32_t layer,
+                                          uint32_t kernel_uses = 1) {
+    static const bool enabled = env_flag_enabled("QW3_ROPE_POSITION_TRACE");
+    if (!enabled || positions.empty() || limit == 0) return;
+    int32_t min_pos = std::numeric_limits<int32_t>::max();
+    int32_t max_pos = std::numeric_limits<int32_t>::min();
+    uint32_t out_of_range = 0;
+    for (int32_t pos : positions) {
+        min_pos = std::min(min_pos, pos);
+        max_pos = std::max(max_pos, pos);
+        if (pos < 0 || static_cast<uint32_t>(pos) >= limit) ++out_of_range;
+    }
+    if (out_of_range == 0) return;
+    static std::atomic<uint64_t> sequence{0};
+    const uint64_t seq = sequence.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[rope-position-oob] seq=cb-%llu source=%s min=%d max=%d "
+                 "oob_rows=%u rows=%zu limit=%u layer=%d uses=%u\n",
+                 static_cast<unsigned long long>(seq), source, min_pos, max_pos,
+                 out_of_range, positions.size(), limit, layer, kernel_uses);
+}
+
 void apply_token_penalties(std::vector<float> &logits,
                            const std::unordered_map<uint32_t, uint32_t> &seen,
                            float presence_penalty,
@@ -475,12 +504,76 @@ bool kvmem_clean_query_enabled() {
     return env_flag_enabled("QW3_KVMEM_CLEAN_QUERY");
 }
 
-// Controlled diagnostic: use the ordinary pressure-window query to choose the
-// final mean-K blocks, then rewind to the block containing the query and prefill
-// that short suffix again against the fixed final window. Default off.
+// Query replay is the default query-conditioned mean-K behavior: use the first
+// pass to select blocks, then rewind to the query's aligned boundary and prefill
+// that short suffix against the fixed final window. The environment override is
+// retained only for legacy ablations; EngineOptions defaults this to true.
 bool kvmem_recompute_query_enabled(bool configured_default) {
     return env_flag_enabled("QW3_KVMEM_RECOMPUTE_QUERY",
                             configured_default);
+}
+
+// Experimental recurrent-state artifacts are deliberately rooted under one
+// operator-provided directory. API requests carry only a server-validated key,
+// never an arbitrary filesystem path.
+std::string kvmem_rebuilt_state_path(const std::string &key) {
+    if (key.empty()) return {};
+    const char *dir = std::getenv("QW3_KVMEM_REBUILT_STATE_DIR");
+    if (!dir || !*dir) {
+        throw std::runtime_error(
+            "KVMem rebuilt-state request requires "
+            "QW3_KVMEM_REBUILT_STATE_DIR");
+    }
+    std::string base(dir);
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    if (base.empty()) {
+        throw std::runtime_error(
+            "QW3_KVMEM_REBUILT_STATE_DIR must not be the filesystem root");
+    }
+    return base + "/" + key + ".qw3-deltanet-state";
+}
+
+std::vector<uint32_t> kvmem_selected_source_tokens(
+    const std::vector<uint32_t> &prompt_tokens,
+    const std::vector<KvMemBlock> &blocks,
+    const std::vector<uint32_t> &selected_context) {
+    std::vector<uint32_t> out;
+    uint64_t total = 0;
+    uint32_t previous_end = 0;
+    bool first = true;
+    for (uint32_t id : selected_context) {
+        if (id >= blocks.size()) {
+            throw std::runtime_error(
+                "KVMem rebuilt-state selection contains an invalid block id");
+        }
+        const KvMemBlock &block = blocks[id];
+        const uint64_t end = static_cast<uint64_t>(block.orig_pos_start) +
+            block.n_tokens;
+        if (end > prompt_tokens.size()) {
+            throw std::runtime_error(
+                "KVMem rebuilt-state selected block exceeds the prompt tokens");
+        }
+        if (!first && block.orig_pos_start < previous_end) {
+            throw std::runtime_error(
+                "KVMem rebuilt-state selected blocks are not in source order");
+        }
+        first = false;
+        previous_end = static_cast<uint32_t>(end);
+        total += block.n_tokens;
+    }
+    if (total > std::numeric_limits<size_t>::max()) {
+        throw std::runtime_error(
+            "KVMem rebuilt-state selected token count overflows size_t");
+    }
+    out.reserve(static_cast<size_t>(total));
+    for (uint32_t id : selected_context) {
+        const KvMemBlock &block = blocks[id];
+        out.insert(out.end(),
+                   prompt_tokens.begin() + block.orig_pos_start,
+                   prompt_tokens.begin() + block.orig_pos_start +
+                       block.n_tokens);
+    }
+    return out;
 }
 
 // Cap on total physical KV pages pinned by the prefix cache. 0 = unlimited
@@ -1533,8 +1626,17 @@ public:
         }
 
         if (!tokenizer_) tokenizer_ = std::make_unique<QwenTokenizer>(model_->gguf());
-        const std::vector<int32_t> ids = tokenizer_->encode(prompt);
-        std::vector<uint32_t> prompt_tokens(ids.begin(), ids.end());
+        std::vector<uint32_t> prompt_tokens;
+        if (!options.prompt_token_ids_override.empty()) {
+            if (!reset_session) {
+                throw std::runtime_error(
+                    "exact prompt token override is unsupported for session append");
+            }
+            prompt_tokens = options.prompt_token_ids_override;
+        } else {
+            const std::vector<int32_t> ids = tokenizer_->encode(prompt);
+            prompt_tokens.assign(ids.begin(), ids.end());
+        }
         GenerationOptions effective_options = options;
         const uint32_t append_base = reset_session
             ? 0u : static_cast<uint32_t>(executor_->position());
@@ -1612,9 +1714,18 @@ public:
                 "persistent KVMem session append currently requires native MTP");
         }
 
+        const uint32_t mtp_route_rope_limit = model_->config().n_ctx_train;
+        const uint64_t mtp_route_logical_end =
+            static_cast<uint64_t>(prompt_tokens.size()) +
+            static_cast<uint64_t>(std::max(0, effective_options.max_tokens));
+        const bool mtp_route_positions_safe =
+            !options_.kvmem_enabled || !active_mtp ||
+            mtp_route_rope_limit == 0 ||
+            mtp_route_logical_end <= mtp_route_rope_limit;
         const bool route_continuous = reset_session &&
             effective_options.continuous_batching &&
-            (!active_mtp || continuous_batching_mtp_enabled());
+            (!active_mtp || continuous_batching_mtp_enabled()) &&
+            mtp_route_positions_safe;
 
         // kvmem × MTP on the continuous-batching path now runs through the
         // window-aware RAGGED verify route (build_continuous_mtp_verify_batch
@@ -2453,6 +2564,10 @@ private:
                             static_cast<uint32_t>(layer.k_rows),
                             standard_n_kv_heads, standard_head_dim,
                             standard_head_dim, eps));
+                        trace_rope_positions_if_out_of_range(
+                            "continuous_prefill.qk", batch.logical_positions,
+                            cfg.n_ctx_train, static_cast<int32_t>(il),
+                            /*kernel_uses=*/2);
                         require_ok(backend_.rope_partial_batch_positions(
                             *q_batch_, total_q,
                             static_cast<uint32_t>(layer.q_rows),
@@ -3381,6 +3496,10 @@ private:
                         *k_batch_, *layer.attn_k_norm, bsz,
                         static_cast<uint32_t>(layer.k_rows), standard_n_kv_heads,
                         standard_head_dim, standard_head_dim, eps));
+                    trace_rope_positions_if_out_of_range(
+                        "continuous_decode.qk", ragged_positions_h_,
+                        cfg.n_ctx_train, static_cast<int32_t>(il),
+                        /*kernel_uses=*/2);
                     require_ok(backend_.rope_partial_batch_positions(
                         *q_batch_, bsz, static_cast<uint32_t>(layer.q_rows),
                         standard_n_heads, q_stride, cfg.rope_dim,
@@ -4358,6 +4477,10 @@ private:
             }
             require_device_status(device_->copy_i32_from_host(
                 *cb_mtp_draft_positions_i32_, 0, rope_pos_h.data(), bsz));
+            trace_rope_positions_if_out_of_range(
+                "continuous_mtp_draft.qk", rope_pos_h, cfg.n_ctx_train,
+                static_cast<int32_t>(cfg.n_layers),
+                /*kernel_uses=*/2);
             require_device_status(device_->rope_partial_batch_positions(
                 *cb_mtp_q_batch_, bsz, q_stride, standard_n_heads,
                 2 * standard_head_dim, cfg.rope_dim,
@@ -5775,6 +5898,7 @@ private:
         bs_cfg.cpu_tier_bytes = options_.kvmem_cpu_bytes;
         bs_cfg.nvme_tier_bytes = options_.kvmem_nvme_bytes;
         bs_cfg.nvme_tier_dir = options_.kvmem_nvme_dir;
+        bs_cfg.immutable_source_k = options_.kvmem_immutable_source_k;
         if (options_.kvmem_method == "h2o") {
             bs_cfg.select_method = KvMemMethod::H2O;
         } else if (options_.kvmem_method == "recency") {
@@ -6798,6 +6922,10 @@ private:
     // and reuse proceeds as in the dense config.
     KvmemReuse kvmem_prefix_reuse(const std::vector<uint32_t> &prompt,
                                   const GenerationOptions &options) {
+        if (!options.kvmem_rebuilt_state_export_key.empty() ||
+            !options.kvmem_rebuilt_state_import_key.empty() ||
+            !options.kvmem_rebuilt_state_capture_key.empty() ||
+            !options.kvmem_rebuilt_state_seed_key.empty()) return {};
         if (!kvmem_prefix_cache_enabled()) return {};
         if (!executor_ || !executor_->kvmem_enabled()) return {};
         if (!kvmem_warm_valid_ || kvmem_warm_log_.empty()) return {};
@@ -7264,6 +7392,18 @@ private:
             throw std::runtime_error(
                 "KVMem transcript replay currently requires native MTP");
         }
+        const bool rebuilt_state_export =
+            !options.kvmem_rebuilt_state_export_key.empty();
+        const bool rebuilt_state_import =
+            !options.kvmem_rebuilt_state_import_key.empty();
+        const bool rebuilt_state_capture =
+            !options.kvmem_rebuilt_state_capture_key.empty();
+        const bool rebuilt_state_seed =
+            !options.kvmem_rebuilt_state_seed_key.empty();
+        if (rebuilt_state_export && options.max_tokens != 0) {
+            throw std::runtime_error(
+                "KVMem rebuilt-state export requires max_tokens=0");
+        }
         DeviceStatus st = device_->begin();
         if (!st.ok) throw std::runtime_error(st.message);
 
@@ -7292,6 +7432,23 @@ private:
         } else {
             executor_->reset_state();
             if (kvmem_prefix_cache_enabled()) kvmem_warm_valid_ = false;
+        }
+        if (rebuilt_state_seed) {
+            if (warm_reuse) {
+                throw std::runtime_error(
+                    "KVMem rebuilt-state seed requires a cold full prefill");
+            }
+            // A fresh server has not executed its first token yet, so the
+            // per-layer recurrent/conv tensors may still be lazily unallocated.
+            // Materialize them before validating the captured 64-layer state.
+            executor_->prepare_runtime_state();
+            executor_->kvmem_import_recurrent_state(
+                kvmem_rebuilt_state_path(
+                    options.kvmem_rebuilt_state_seed_key),
+                prompt_tokens);
+            log("native kvmem rebuilt-state seed (plain): key=" +
+                options.kvmem_rebuilt_state_seed_key +
+                " identity_tokens=" + std::to_string(prompt_tokens.size()));
         }
         const bool warm_capture =
             kvmem_prefix_cache_enabled() && executor_->kvmem_enabled();
@@ -7378,6 +7535,12 @@ private:
             executor_->block_store() &&
             executor_->block_store()->config().retrieval_method ==
                 KvMemRetrievalMethod::MeanK;
+        if ((rebuilt_state_import || rebuilt_state_capture) &&
+            !recompute_query) {
+            throw std::runtime_error(
+                "KVMem rebuilt-state import/capture requires an above-budget "
+                "query-conditioned mean-k request with query replay enabled");
+        }
         QwenExecutor::StateSnapshot query_replay_ckpt;
         uint32_t query_replay_begin = 0;
         if (recompute_query) {
@@ -7511,6 +7674,36 @@ private:
                 }
                 executor_->kvmem_begin_query_replay(
                     query_replay_ckpt, selected_context);
+                if (rebuilt_state_import || rebuilt_state_capture) {
+                    const std::vector<uint32_t> selected_source_tokens =
+                        kvmem_selected_source_tokens(
+                            prompt_tokens,
+                            executor_->block_store()->blocks(),
+                            selected_context);
+                    if (rebuilt_state_capture) {
+                        executor_->kvmem_export_recurrent_state(
+                            kvmem_rebuilt_state_path(
+                                options.kvmem_rebuilt_state_capture_key),
+                            selected_source_tokens);
+                        log("native kvmem rebuilt-state capture (plain): key=" +
+                            options.kvmem_rebuilt_state_capture_key +
+                            " identity_tokens=" +
+                            std::to_string(selected_source_tokens.size()) +
+                            " fixed_context_blocks=" +
+                            std::to_string(selected_context.size()));
+                    } else {
+                        executor_->kvmem_import_recurrent_state(
+                            kvmem_rebuilt_state_path(
+                                options.kvmem_rebuilt_state_import_key),
+                            selected_source_tokens);
+                        log("native kvmem rebuilt-state import (plain): key=" +
+                            options.kvmem_rebuilt_state_import_key +
+                            " source_tokens=" +
+                            std::to_string(selected_source_tokens.size()) +
+                            " fixed_context_blocks=" +
+                            std::to_string(selected_context.size()));
+                    }
+                }
                 do_prefill_range(query_replay_begin, prompt_tokens.size());
                 executor_->kvmem_end_query_replay();
                 log("native kvmem query replay (plain): boundary=" +
@@ -7533,6 +7726,26 @@ private:
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             warm_prompt_resumable = kvmem_all_gpu_identity();
+        }
+
+        if (rebuilt_state_export) {
+            if (warm_reuse) {
+                throw std::runtime_error(
+                    "KVMem rebuilt-state export requires a cold full prefill");
+            }
+            if (bs_on && kvmem_sel_budget > 0 &&
+                prompt_tokens.size() > kvmem_sel_budget) {
+                throw std::runtime_error(
+                    "KVMem rebuilt-state export source exceeds the dense "
+                    "KVMem selection budget");
+            }
+            executor_->kvmem_export_recurrent_state(
+                kvmem_rebuilt_state_path(
+                    options.kvmem_rebuilt_state_export_key),
+                prompt_tokens);
+            log("native kvmem rebuilt-state export (plain): key=" +
+                options.kvmem_rebuilt_state_export_key +
+                " source_tokens=" + std::to_string(prompt_tokens.size()));
         }
 
         // A zero completion budget is a real prefill-only transaction. Persist
@@ -7796,6 +8009,27 @@ private:
         // the CB per-request executors are excluded, so those paths are untouched.
         const bool transcript_replay_requested =
             !options.kvmem_replay_query_spans.empty();
+        const bool rebuilt_state_export =
+            !options.kvmem_rebuilt_state_export_key.empty();
+        const bool rebuilt_state_import =
+            !options.kvmem_rebuilt_state_import_key.empty();
+        const bool rebuilt_state_capture =
+            !options.kvmem_rebuilt_state_capture_key.empty();
+        const bool rebuilt_state_seed =
+            !options.kvmem_rebuilt_state_seed_key.empty();
+        if (rebuilt_state_export && options.max_tokens != 0) {
+            throw std::runtime_error(
+                "KVMem rebuilt-state export requires max_tokens=0");
+        }
+        if ((rebuilt_state_export || rebuilt_state_import ||
+             rebuilt_state_capture || rebuilt_state_seed) &&
+            (override_executor != nullptr || !reset_session ||
+             transcript_replay_requested ||
+             !options.kvmem_session_id.empty())) {
+            throw std::runtime_error(
+                "KVMem rebuilt-state diagnostics require a standalone "
+                "one-shot request");
+        }
         const bool api_session = !options.kvmem_session_id.empty() &&
             override_executor == nullptr;
         const KvmemReuse kvmem_ru =
@@ -7836,6 +8070,22 @@ private:
             executor_->reset_state();
             if (kvmem_warm_capture) kvmem_warm_valid_ = false;
         }
+        if (rebuilt_state_seed) {
+            if (kvmem_warm_reuse) {
+                throw std::runtime_error(
+                    "KVMem rebuilt-state seed requires a cold full prefill");
+            }
+            // See generate_plain: seed import can be the first operation on a
+            // freshly loaded executor, before forward() has allocated states.
+            executor_->prepare_runtime_state();
+            executor_->kvmem_import_recurrent_state(
+                kvmem_rebuilt_state_path(
+                    options.kvmem_rebuilt_state_seed_key),
+                prompt_tokens);
+            log("native kvmem rebuilt-state seed (mtp): key=" +
+                options.kvmem_rebuilt_state_seed_key +
+                " identity_tokens=" + std::to_string(prompt_tokens.size()));
+        }
 
         // kvmem × MTP (Phase C). When kvmem is enabled the verify path must
         // attend over the assembled window, which only the per-token
@@ -7867,6 +8117,19 @@ private:
             ? static_cast<uint32_t>(prompt_tokens.size())
             : static_cast<uint32_t>(executor_->position() +
                                     prompt_tokens.size());
+        // The target model switches to a compact KVMem window above budget, but
+        // the MTP prefix cache is still primed in the original logical frame.
+        // Never bake MTP Q/K at positions outside the model's trained context:
+        // doing so is neither needed for target-model correctness nor safely
+        // reversible later. Until MTP has its own compact-window rebuild, fall
+        // back to ordinary target-model decode for such requests.
+        const uint32_t mtp_rope_limit = model_->config().n_ctx_train;
+        const uint64_t mtp_logical_end =
+            static_cast<uint64_t>(logical_prompt_tokens) +
+            static_cast<uint64_t>(std::max(0, options.max_tokens));
+        const bool mtp_prefix_positions_safe =
+            !kvmem_on || mtp_rope_limit == 0 ||
+            mtp_logical_end <= mtp_rope_limit;
         const uint32_t api_append_base = api_session
             ? static_cast<uint32_t>(executor_->position()) : 0;
         const bool kvmem_below_budget =
@@ -7956,6 +8219,12 @@ private:
             dump == nullptr && executor_->block_store() &&
             executor_->block_store()->config().retrieval_method ==
                 KvMemRetrievalMethod::MeanK;
+        if ((rebuilt_state_import || rebuilt_state_capture) &&
+            !recompute_query) {
+            throw std::runtime_error(
+                "KVMem rebuilt-state import/capture requires an above-budget "
+                "query-conditioned mean-k request with query replay enabled");
+        }
         const uint32_t api_bt = kvmem_on && executor_->block_store()
             ? std::max<uint32_t>(
                   1, executor_->block_store()->config().block_tokens)
@@ -8101,7 +8370,17 @@ private:
         const uint32_t mtp_chain_len =
             std::min<uint32_t>(requested_mtp_chain_len, safe_mtp_chain_max);
         const uint32_t mtp_reject_limit = spec_mtp ? mtp_reject_budget(prompt_tokens.size()) : 0;
-        bool use_mtp_prefix = spec_mtp || mtp_prefix_enabled(options_);
+        bool use_mtp_prefix =
+            (spec_mtp || mtp_prefix_enabled(options_)) &&
+            mtp_prefix_positions_safe;
+        if (!mtp_prefix_positions_safe &&
+            (spec_mtp || trace_mtp || mtp_prefix_enabled(options_))) {
+            log("native mtp_position_guard: enabled=true logical_prompt_tokens=" +
+                std::to_string(logical_prompt_tokens) + " limit=" +
+                std::to_string(mtp_rope_limit) + " projected_logical_end=" +
+                std::to_string(mtp_logical_end) +
+                " action=disable_mtp_prefix_and_speculation");
+        }
         if (spec_mtp && mtp_chain_len != requested_mtp_chain_len) {
             std::ostringstream chain_msg;
             chain_msg << "native mtp_spec_config:"
@@ -9733,6 +10012,36 @@ private:
                 }
                 executor_->kvmem_begin_query_replay(
                     kvmem_query_replay_ckpt, selected_context);
+                if (rebuilt_state_import || rebuilt_state_capture) {
+                    const std::vector<uint32_t> selected_source_tokens =
+                        kvmem_selected_source_tokens(
+                            prompt_tokens,
+                            executor_->block_store()->blocks(),
+                            selected_context);
+                    if (rebuilt_state_capture) {
+                        executor_->kvmem_export_recurrent_state(
+                            kvmem_rebuilt_state_path(
+                                options.kvmem_rebuilt_state_capture_key),
+                            selected_source_tokens);
+                        log("native kvmem rebuilt-state capture (mtp): key=" +
+                            options.kvmem_rebuilt_state_capture_key +
+                            " identity_tokens=" +
+                            std::to_string(selected_source_tokens.size()) +
+                            " fixed_context_blocks=" +
+                            std::to_string(selected_context.size()));
+                    } else {
+                        executor_->kvmem_import_recurrent_state(
+                            kvmem_rebuilt_state_path(
+                                options.kvmem_rebuilt_state_import_key),
+                            selected_source_tokens);
+                        log("native kvmem rebuilt-state import (mtp): key=" +
+                            options.kvmem_rebuilt_state_import_key +
+                            " source_tokens=" +
+                            std::to_string(selected_source_tokens.size()) +
+                            " fixed_context_blocks=" +
+                            std::to_string(selected_context.size()));
+                    }
+                }
                 std::vector<uint32_t> replay_tokens;
                 if (api_session) {
                     if (kvmem_query_replay_begin < api_sequence_base ||
@@ -9819,6 +10128,25 @@ private:
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             kvmem_warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             kvmem_warm_prompt_resumable = kvmem_all_gpu_identity();
+        }
+        if (rebuilt_state_export) {
+            if (kvmem_warm_reuse) {
+                throw std::runtime_error(
+                    "KVMem rebuilt-state export requires a cold full prefill");
+            }
+            if (kvmem_on && kvmem_sel_budget > 0 &&
+                logical_prompt_tokens > kvmem_sel_budget) {
+                throw std::runtime_error(
+                    "KVMem rebuilt-state export source exceeds the dense "
+                    "KVMem selection budget");
+            }
+            executor_->kvmem_export_recurrent_state(
+                kvmem_rebuilt_state_path(
+                    options.kvmem_rebuilt_state_export_key),
+                prompt_tokens);
+            log("native kvmem rebuilt-state export (mtp): key=" +
+                options.kvmem_rebuilt_state_export_key +
+                " source_tokens=" + std::to_string(prompt_tokens.size()));
         }
         if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
             QwenExecutor::kvmem_timing_emit_delta("phase=prefill request=mtp",
@@ -10083,6 +10411,7 @@ private:
         };
 
         auto trace_mtp_chain = [&](uint32_t input_token, int target_index) {
+            if (!mtp_prefix_positions_safe) return;
             std::vector<NativeExecutorReport> chain = use_mtp_prefix
                 ? executor_->forward_mtp_draft_chain_with_prefix(input_token, mtp_chain_len)
                 : executor_->forward_mtp_draft_chain(input_token, mtp_chain_len);

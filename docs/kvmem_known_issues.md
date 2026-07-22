@@ -51,7 +51,8 @@ query。API 也支持顶层 `kvmem_query_span`，用于在一个 string-content 
 - `system` / `developer` control context 只依赖固定数量的 sink blocks；超出 sink 的部分不保证保留。
 - 普通路径只硬保留 sink/recent blocks。当前 query blocks 也参加 Top-K 竞争，没有独立的
   hard-pin invariant；只有实验性的 clean-query 路径调用 `kvmem_set_pin_from_block`。
-- query span 最多捕获 512 tokens，而且超长 query 当前保留的是最前面的 512 tokens。
+- query span 已取消原来的 512-token 静默截断；超长 query 会按实际长度增加显存与计算量，
+  但不再只保留开头部分。
 
 这会在以下场景中造成错误语义：
 
@@ -63,7 +64,7 @@ query。API 也支持顶层 `kvmem_query_span`，用于在一个 string-content 
 代码依据：
 
 - `src/qw3_server.cpp`: `kvmem_query_span` 和 last-user 自动 span 检测。
-- `src/qwen_executor.cpp`: `kvmem_set_query_span` 的 512-token cap；
+- `src/qwen_executor.cpp`: `kvmem_set_query_span` 的动态 query-row 分配；
   `kvmem_selection_with_pin`。
 - `src/kvmem_store.cpp`: `pick_topk_blocks` 只硬保留 sink/recent。
 - `src/qwen_native_backend.cpp`: 只有 clean-query PASS B 设置 `pin_from_block`。
@@ -311,14 +312,34 @@ de-RoPE，再 RoPE 到新窗口位置。单次映射的误差很小，但 transc
 - 这项证据证明旧路径存在真实的数值漂移，但尚不能证明它是十个真实样本的唯一或主要
   准确率根因；不常被选中的 gold block 可能只经历很少映射。
 
-正在验证的修复由 `QW3_KVMEM_IMMUTABLE_SOURCE_K=1` 隔离：repository K 作为不可变
+当前默认修复使用 immutable source K；`--no-kvmem-immutable-k` 保留旧原地路径用于
+消融，旧脚本也可使用 `QW3_KVMEM_IMMUTABLE_SOURCE_K=0|1` 覆盖。repository K 作为不可变
 source，每次 assembly 复制到额外 working K 后只做一次 source-frame -> window-frame
 映射；attention 读取 working K，tiering 原样保存 source K，V 仍为单副本。fp16 256K
-resident pool 额外占用约 8 GiB。默认路径暂不改变，等待 frozen 1/3/10 sample 阶梯测试。
+resident pool 额外占用约 8 GiB。为降低显存，开发分支已补齐 FP8 KVMem re-RoPE、
+window k-mean、attention-mass 与 content-k-mean CUDA 路径；配合 `--kv-dtype fp8` 时，
+额外 working K 约 4 GiB，source+working 每轮仍保持 one-shot deterministic。FP8 会引入
+一次性的量化误差，必须与 fp16 immutable 做真实样本准确率对照后才能设为推荐配置。
 
 若该修复不能恢复 gold-block-complete 的样本，下一根因应转向 source KV 的上下文构建
 质量（尤其是 pressure window 下构建的 hidden state）及 first-pass query 所依赖的上一轮
 临时窗口，而不是继续调 re-RoPE 数值精度。
+
+### KVMI-011A — MTP prefix used out-of-range logical RoPE positions
+
+**Status:** GUARDED / COMPACT REBUILD OPEN
+**Priority:** P0
+
+目标模型在 KVMem pressure 后使用压缩到 256K 内的 attention window，但旧 MTP prefix
+priming 仍按完整 trace 的逻辑位置写入 Q/K；1M trace 因而会让 MTP 先在 `>=256K` 的
+位置执行 RoPE，再尝试在最终 window assembly 中恢复。这不改变 target verifier 的理论
+正确性，但会降低 draft 质量，而且超范围 bake 不应被视为可靠、可逆的表示。
+
+当前保护策略是：KVMem 请求的 `logical_prompt + max_tokens` 可能超过 `n_ctx_train` 时，
+不再 prime/use MTP prefix，也不进入 continuous-MTP lane；decode 回退到 target model 的普通 windowed
+路径。executor 内还有第二层边界检查，防止遗漏调用源继续执行超范围 MTP RoPE。没有使用
+modulo/clamp，因为那会静默破坏相对位置。后续若要恢复超长请求的 speculative speedup，
+需要从最终 selected window 在紧凑位置重建 MTP prefix，而不是恢复超长位置的 MTP K。
 
 ### KVMI-012 — Selected attention window and recurrent state describe different histories
 

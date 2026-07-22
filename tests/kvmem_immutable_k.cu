@@ -8,6 +8,7 @@
 // to be identical to a single direct materialization from source.
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -28,6 +29,19 @@ bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    const int32_t *page_indices,
                                    uint32_t page_size, float theta,
                                    cudaStream_t stream);
+bool launch_rope_block_remap_paged_fp8(void *cache,
+                                       uint32_t n_tokens,
+                                       uint32_t n_kv_heads,
+                                       uint32_t per_pos_size,
+                                       uint32_t head_dim,
+                                       uint32_t rope_dim,
+                                       uint32_t win_base,
+                                       int32_t orig_base,
+                                       int32_t new_base,
+                                       const int32_t *page_indices,
+                                       uint32_t page_size,
+                                       float theta,
+                                       cudaStream_t stream);
 }
 
 #define CUDA_CHECK(call) do {                                             \
@@ -63,6 +77,30 @@ __global__ void bake_to_half(const float *raw, __half *out,
     out[off + i] = __float2half(v);
 }
 
+__global__ void bake_to_fp8(const float *raw, __nv_fp8_e4m3 *out,
+                            uint32_t rows, uint32_t heads,
+                            uint32_t head_dim, uint32_t rope_dim,
+                            int32_t base_pos, float theta) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t i = threadIdx.x;
+    const uint32_t half = rope_dim / 2;
+    if (row >= rows || head >= heads || i >= head_dim) return;
+    const uint64_t off =
+        (static_cast<uint64_t>(row) * heads + head) * head_dim;
+    float v = raw[off + i];
+    if (i < rope_dim) {
+        const uint32_t pair = i < half ? i : i - half;
+        const float x0 = raw[off + pair];
+        const float x1 = raw[off + pair + half];
+        const float inv = __powf(theta, -2.0f * float(pair) / float(rope_dim));
+        float s, c;
+        __sincosf(float(base_pos + int32_t(row)) * inv, &s, &c);
+        v = i < half ? x0 * c - x1 * s : x0 * s + x1 * c;
+    }
+    out[off + i] = __nv_fp8_e4m3(v);
+}
+
 static void remap(__half *cache, int32_t from, int32_t to,
                   const int32_t *pages) {
     constexpr uint32_t rows = 32;
@@ -75,6 +113,22 @@ static void remap(__half *cache, int32_t from, int32_t to,
             cache, true, rows, heads, heads * head_dim, head_dim, rope_dim,
             /*win_base=*/0, from, to, pages, page_size, theta, 0)) {
         std::fprintf(stderr, "RoPE remap launcher rejected test input\n");
+        std::exit(1);
+    }
+}
+
+static void remap_fp8(__nv_fp8_e4m3 *cache, int32_t from, int32_t to,
+                      const int32_t *pages) {
+    constexpr uint32_t rows = 32;
+    constexpr uint32_t heads = 4;
+    constexpr uint32_t head_dim = 256;
+    constexpr uint32_t rope_dim = 128;
+    constexpr uint32_t page_size = 16;
+    constexpr float theta = 1.0e7f;
+    if (!qw3::ported::launch_rope_block_remap_paged_fp8(
+            cache, rows, heads, heads * head_dim, head_dim, rope_dim,
+            /*win_base=*/0, from, to, pages, page_size, theta, 0)) {
+        std::fprintf(stderr, "FP8 RoPE remap launcher rejected test input\n");
         std::exit(1);
     }
 }
@@ -180,6 +234,52 @@ int main() {
                      "FAIL legacy control did not accumulate a measurable error\n");
         return 1;
     }
+
+    // Practical immutable mode uses FP8 source+working K to halve both the
+    // normal K/V pool and the extra working-K copy. Resetting working bytes
+    // from source before every lossy FP8 remap must still make the result
+    // exactly independent of the number of prior reselections.
+    constexpr size_t fp8_bytes = count * sizeof(__nv_fp8_e4m3);
+    __nv_fp8_e4m3 *d_source_fp8 = nullptr, *d_work_fp8 = nullptr;
+    __nv_fp8_e4m3 *d_reference_fp8 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_source_fp8, fp8_bytes));
+    CUDA_CHECK(cudaMalloc(&d_work_fp8, fp8_bytes));
+    CUDA_CHECK(cudaMalloc(&d_reference_fp8, fp8_bytes));
+    bake_to_fp8<<<dim3(rows, heads), head_dim>>>(
+        d_raw, d_source_fp8, rows, heads, head_dim, rope_dim, source_base,
+        theta);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<uint8_t> source_fp8_before(fp8_bytes);
+    CUDA_CHECK(cudaMemcpy(source_fp8_before.data(), d_source_fp8, fp8_bytes,
+                          cudaMemcpyDeviceToHost));
+    for (int turn = 0; turn < 1800; ++turn) {
+        const int32_t target = (turn == 1799)
+            ? 123456
+            : ((turn % 3) == 0 ? 0 : ((turn % 3) == 1 ? 200000 : 31));
+        CUDA_CHECK(cudaMemcpy(d_work_fp8, d_source_fp8, fp8_bytes,
+                              cudaMemcpyDeviceToDevice));
+        remap_fp8(d_work_fp8, source_base, target, d_pages);
+    }
+    CUDA_CHECK(cudaMemcpy(d_reference_fp8, d_source_fp8, fp8_bytes,
+                          cudaMemcpyDeviceToDevice));
+    remap_fp8(d_reference_fp8, source_base, 123456, d_pages);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<uint8_t> source_fp8_after(fp8_bytes), work_fp8(fp8_bytes),
+                         ref_fp8(fp8_bytes);
+    CUDA_CHECK(cudaMemcpy(source_fp8_after.data(), d_source_fp8, fp8_bytes,
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(work_fp8.data(), d_work_fp8, fp8_bytes,
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ref_fp8.data(), d_reference_fp8, fp8_bytes,
+                          cudaMemcpyDeviceToHost));
+    if (source_fp8_before != source_fp8_after || work_fp8 != ref_fp8) {
+        std::fprintf(stderr,
+                     "FAIL FP8 immutable reset is not one-shot deterministic\n");
+        return 1;
+    }
+    cudaFree(d_reference_fp8);
+    cudaFree(d_work_fp8);
+    cudaFree(d_source_fp8);
 
     cudaFree(d_pages);
     cudaFree(d_legacy);

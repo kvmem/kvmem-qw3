@@ -236,6 +236,12 @@ def main() -> int:
                 else {}
             ),
             **(
+                {"QW3_ROPE_POSITION_TRACE":
+                 os.environ["QW3_ROPE_POSITION_TRACE"]}
+                if "QW3_ROPE_POSITION_TRACE" in os.environ
+                else {}
+            ),
+            **(
                 {"QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP":
                  os.environ["QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP"]}
                 if "QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP" in os.environ

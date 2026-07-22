@@ -123,6 +123,10 @@ void usage(std::ostream &os) {
         "                        Requires the serve layer to mark the query span.\n"
         "  --no-kvmem-recompute-query  Do not replay the query after semantic\n"
         "                        reselection. Default: replay is enabled.\n"
+        "  --kvmem-immutable-k  Keep source K immutable and materialize a working K\n"
+        "                        per selection. Default: enabled. Use --kv-dtype fp8\n"
+        "                        to halve its KV/working-K memory versus fp16.\n"
+        "  --no-kvmem-immutable-k  Use the legacy in-place K re-RoPE path.\n"
         "  --kvmem-retrieval-blocks N  Quota policy retrieval blocks (0 = derive).\n"
         "  --kvmem-profile-blocks N    Quota policy profile blocks (0 = derive).\n"
         "  --kvmem-gpu-memory-ratio F  GPU memory fraction for KVMem KV cap.\n"
@@ -452,6 +456,10 @@ int main(int argc, char **argv) {
                 engine.kvmem_query_conditioned = true;
             } else if (arg == "--no-kvmem-recompute-query") {
                 engine.kvmem_recompute_query = false;
+            } else if (arg == "--kvmem-immutable-k") {
+                engine.kvmem_immutable_source_k = true;
+            } else if (arg == "--no-kvmem-immutable-k") {
+                engine.kvmem_immutable_source_k = false;
             } else if (arg == "--kvmem-retrieval-blocks") {
                 engine.kvmem_retrieval_blocks = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-profile-blocks") {

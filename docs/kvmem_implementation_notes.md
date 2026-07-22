@@ -697,8 +697,10 @@ thousands of times.  Each inverse/forward RoPE then starts from the previously
 rounded result, so the numerical error is cumulative and affects every later
 prefill/decode attention that reads the block, not only retrieval scoring.
 
-`QW3_KVMEM_IMMUTABLE_SOURCE_K=1` enables the drift-free construction path used
-by the LongMemEval-M repair experiment:
+The drift-free construction path is enabled by default. `--kvmem-immutable-k`
+can state that choice explicitly, while `--no-kvmem-immutable-k` selects the
+legacy in-place ablation. `QW3_KVMEM_IMMUTABLE_SOURCE_K=0|1` remains as a
+backward-compatible override for existing scripts:
 
 1. The bounded repository K is the immutable **source K**. `baked_pos` records
    the RoPE frame in which that source was constructed and is not changed by
@@ -728,11 +730,17 @@ Correctness guards/tests:
 - `qw3-kvmem-immutable-k` performs 1800 changing fp16 remaps. The immutable
   result is byte-identical to a one-shot source-to-final mapping, while its
   in-place control accumulates a measurable error.
+- The same test covers FP8 source/working K and requires 1800 reset+remap rounds
+  to be byte-identical to a one-shot FP8 materialization.
 
-The mode is deliberately environment-gated while the frozen ten-sample
-LongMemEval-M study is running. It currently requires fp16/fp32, a bounded
-tiered GPU pool, and leaves the MTP draft K on its existing path; target-model
-verification reads the drift-free main K, so draft K cannot change correctness.
+The mode requires fp16, fp32, or fp8 (q8 row-scale
+re-RoPE remains unsupported) and a bounded tiered GPU pool. FP8 is the practical
+memory configuration: source K, V, and working K are each one byte per element,
+so the extra working K is approximately 4 GiB at 256K instead of 8 GiB. The
+tradeoff is one-time FP8 quantization error; immutable reset still prevents that
+error from accumulating across reselections. For that reason KVMem rejects FP8
+unless immutable K is enabled; repeated in-place FP8 remaps are not a supported
+configuration.
 
 ### 6.5 MTP Window Mirror
 
@@ -745,6 +753,14 @@ MTP remains canonical or is primed lazily.
 The implementation therefore maintains `mtp_baked_pos_` separately and performs
 MTP re-RoPE using this MTP-specific baked position state. This avoids incorrectly
 rotating MTP keys based on the main cache's baked position.
+
+For KVMem requests whose projected `logical_prompt + max_tokens` exceeds
+`n_ctx_train`, MTP prefix priming/speculation is disabled and decode falls back to the target model's
+window-aware path. The main attention window already uses compact positions,
+whereas MTP prefix construction still uses original logical positions; the
+guard prevents any MTP Q/K RoPE call at `position >= n_ctx_train`. A future
+compact-window MTP rebuild may restore speculative acceleration without relying
+on out-of-range keys. Position modulo or clamping is intentionally not used.
 
 ## 7. Tiered KV Memory Management
 

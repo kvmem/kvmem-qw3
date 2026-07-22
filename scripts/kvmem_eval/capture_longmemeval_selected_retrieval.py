@@ -50,6 +50,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-base", default="http://127.0.0.1:8087/v1")
     parser.add_argument("--model", default="Qwen3.6-27B-Q8_0.gguf")
     parser.add_argument("--timeout-sec", type=float, default=7200.0)
+    parser.add_argument("--expected-immutable-source-k", type=int, choices=(0, 1))
+    parser.add_argument("--expected-block-tokens", type=int)
+    parser.add_argument("--expected-budget-blocks", type=int)
+    parser.add_argument("--expected-sink-blocks", type=int)
+    parser.add_argument("--expected-recent-blocks", type=int)
+    parser.add_argument("--expected-method")
+    parser.add_argument(
+        "--state-capture-prefix",
+        help="also capture accumulated query-boundary DeltaNet state under PREFIX-<id>",
+    )
+    parser.add_argument(
+        "--state-dir", type=Path,
+        help="artifact directory used by the server (required with --state-capture-prefix)",
+    )
     return parser.parse_args()
 
 
@@ -90,6 +104,28 @@ def dumped_tags(path: Path) -> list[str]:
     ]
 
 
+def dumped_metas(path: Path) -> list[dict[str, Any]]:
+    return [row for row in read_jsonl(path) if row.get("type") == "meta"]
+
+
+def validate_dump_meta(meta: dict[str, Any], args: argparse.Namespace) -> None:
+    fields = {
+        "immutable_source_k": args.expected_immutable_source_k,
+        "block_tokens": args.expected_block_tokens,
+        "budget_blocks": args.expected_budget_blocks,
+        "sink": args.expected_sink_blocks,
+        "recent": args.expected_recent_blocks,
+        "method": args.expected_method,
+    }
+    for name, expected in fields.items():
+        if expected is not None and meta.get(name) != expected:
+            raise RuntimeError(
+                f"captured retrieval {name} mismatch for "
+                f"{meta.get('trace_tag')}: expected={expected!r} "
+                f"actual={meta.get(name)!r}"
+            )
+
+
 def health_ok(api_base: str) -> bool:
     root = api_base.rstrip("/")
     if root.endswith("/v1"):
@@ -105,6 +141,10 @@ def health_ok(api_base: str) -> bool:
 
 def main() -> None:
     args = parse_args()
+    if bool(args.state_capture_prefix) != bool(args.state_dir):
+        raise RuntimeError(
+            "--state-capture-prefix and --state-dir must be provided together"
+        )
     samples = load_all(args.data)
     baseline_rows = read_jsonl(args.baseline)
     baseline_by_index = {int(row["subset_index"]): row for row in baseline_rows}
@@ -167,6 +207,8 @@ def main() -> None:
     if not health_ok(args.api_base):
         raise RuntimeError(f"qw3 server is not healthy at {args.api_base}")
     tags = dumped_tags(args.dump_file)
+    for meta in dumped_metas(args.dump_file):
+        validate_dump_meta(meta, args)
     expected_tags = [str(samples[index].question_id) for index in selected_indices]
     extras = sorted(set(tags) - set(expected_tags))
     duplicates = sorted(tag for tag in set(tags) if tags.count(tag) > 1)
@@ -185,6 +227,13 @@ def main() -> None:
         sample = samples[index]
         tag = sample.question_id
         if tag in completed:
+            if args.state_capture_prefix:
+                state_key = f"{args.state_capture_prefix}-{tag}"
+                state_path = args.state_dir / f"{state_key}.qw3-deltanet-state"
+                if not state_path.exists() or state_path.stat().st_size == 0:
+                    raise RuntimeError(
+                        f"capture dump exists but accumulated state is missing: {state_path}"
+                    )
             print(f"[skip] {position}/{len(selected_indices)} index={index} id={tag}", flush=True)
             continue
         messages = render_messages(sample)
@@ -205,6 +254,10 @@ def main() -> None:
             },
             "kvmem_trace_tag": tag,
         }
+        state_key = None
+        if args.state_capture_prefix:
+            state_key = f"{args.state_capture_prefix}-{tag}"
+            payload["kvmem_rebuilt_state_capture"] = state_key
         print(
             f"[capture] {position}/{len(selected_indices)} index={index} "
             f"id={tag} type={sample.question_type}",
@@ -226,6 +279,18 @@ def main() -> None:
             raise RuntimeError(
                 f"response completed but dump contains {tags_now.count(tag)} snapshots for {tag}"
             )
+        meta = next(
+            row for row in dumped_metas(args.dump_file)
+            if str(row.get("trace_tag")) == tag
+        )
+        validate_dump_meta(meta, args)
+        state_path = None
+        if state_key is not None:
+            state_path = args.state_dir / f"{state_key}.qw3-deltanet-state"
+            if not state_path.exists() or state_path.stat().st_size == 0:
+                raise RuntimeError(
+                    f"server did not publish accumulated state artifact {state_path}"
+                )
         completed.add(tag)
         if tag not in manifest_ids:
             choices = body.get("choices") or []
@@ -240,6 +305,9 @@ def main() -> None:
                     "elapsed_sec": elapsed,
                     "usage": body.get("usage"),
                     "finish_reason": choices[0].get("finish_reason") if choices else None,
+                    "state_capture_key": state_key,
+                    "state_capture_artifact": str(state_path) if state_path else None,
+                    "state_capture_bytes": state_path.stat().st_size if state_path else None,
                 },
             )
             manifest_ids.add(tag)

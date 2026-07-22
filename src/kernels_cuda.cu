@@ -246,9 +246,9 @@ bool launch_rope_block_remap(float *x, uint32_t n_tokens, uint32_t n_units,
                              uint32_t row_stride, float theta,
                              cudaStream_t stream);
 
-// Paged in-place re-RoPE on the stored cache. is_fp16 selects __half vs float
-// storage (q8 cache is not supported: re-RoPE on quantized K is lossy and the
-// block-sparse path requires fp16/fp32 KV). See kernel comment.
+// Paged in-place re-RoPE on the stored cache. This ABI selects __half vs float;
+// FP8 uses the separate launcher below. Q8 is unsupported because rotating an
+// int8 row also requires recomputing its shared scale. See kernel comment.
 bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    uint32_t n_tokens, uint32_t n_kv_heads,
                                    uint32_t per_pos_size, uint32_t head_dim,
@@ -257,6 +257,24 @@ bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    const int32_t *page_indices,
                                    uint32_t page_size, float theta,
                                    cudaStream_t stream);
+
+// FP8 variants are separate entry points so the existing fp16/fp32 ABI used by
+// the CUDA parity tests stays unchanged. Immutable-source K resets the working
+// FP8 cache from its source before each remap, so the lossy write is not
+// cumulative across reselections.
+bool launch_rope_block_remap_paged_fp8(void *cache,
+                                       uint32_t n_tokens,
+                                       uint32_t n_kv_heads,
+                                       uint32_t per_pos_size,
+                                       uint32_t head_dim,
+                                       uint32_t rope_dim,
+                                       uint32_t win_base,
+                                       int32_t orig_base,
+                                       int32_t new_base,
+                                       const int32_t *page_indices,
+                                       uint32_t page_size,
+                                       float theta,
+                                       cudaStream_t stream);
 
 // Batched analogue: re-RoPE n_blocks moved blocks in ONE launch (grid.z indexes
 // the block). Each block reads its own from_base[bz]/to_base[bz]/n_tokens[bz]
@@ -276,6 +294,13 @@ bool launch_rope_block_remap_paged_batched(void *cache, bool is_fp16,
                                            const int32_t *page_indices,
                                            uint32_t page_size, float theta,
                                            cudaStream_t stream);
+bool launch_rope_block_remap_paged_batched_fp8(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
 
 // Block-sparse selection signal (#40). See kernel comments.
 bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
@@ -284,6 +309,13 @@ bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
                               const int32_t *win_base, const int32_t *blk_tokens,
                               const int32_t *page_indices, uint32_t page_size,
                               cudaStream_t stream);
+bool launch_block_kmean_paged_fp8(void *k_cache, float *kbar,
+                                  uint32_t n_blocks, uint32_t n_kv_heads,
+                                  uint32_t per_pos_size, uint32_t head_dim,
+                                  const int32_t *win_base,
+                                  const int32_t *blk_tokens,
+                                  const int32_t *page_indices,
+                                  uint32_t page_size, cudaStream_t stream);
 bool launch_block_attn_score_step(float *accum, const float *q,
                                   const float *kbar, uint32_t q_stride,
                                   uint32_t n_blocks, uint32_t n_heads,
@@ -316,6 +348,13 @@ bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        uint32_t seq_len,
                                        float scale,
                                        cudaStream_t stream);
+bool launch_block_attention_mass_paged_fp8(
+        void *k_cache, float *mass, const float *q, uint32_t q_stride,
+        uint32_t n_window_blocks, uint32_t n_heads, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, uint32_t seq_len, float scale,
+        cudaStream_t stream);
 // Global content-frame KV retrieval index (#48). See kernel comments.
 bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       uint32_t n_blocks, uint32_t n_kv_heads,
@@ -325,6 +364,12 @@ bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       const int32_t *page_indices,
                                       uint32_t page_size, float theta,
                                       cudaStream_t stream);
+bool launch_block_kmean_content_paged_fp8(
+        void *k_cache, float *kbar, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *orig_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
 // Incremental content-frame index from the prefill K batch (#91). See kernel.
 bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint64_t kbar_block_base,
@@ -7029,18 +7074,26 @@ public:
             return {false, "rope_block_remap_paged_device page dtype mismatch"};
         }
         const bool is_fp16 = c.is_fp16();
+        const bool is_fp8 = c.is_fp8_kv();
         const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
                             !c.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            return {false, "rope_block_remap_paged_device requires fp16 or fp32 KV "
-                           "(q8/fp8 re-RoPE is lossy)"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "rope_block_remap_paged_device requires fp16, fp32, "
+                           "or fp8 KV (q8 re-RoPE is unsupported)"};
         }
         void *ptr = is_fp16 ? static_cast<void *>(c.ptr_h())
-                            : static_cast<void *>(c.ptr);
-        if (!ported::launch_rope_block_remap_paged(
-                ptr, is_fp16, n_tokens, n_kv_heads, per_pos_size, head_dim,
-                rope_dim, win_base, from_base, to_base, pages.ptr_i32(),
-                page_size, theta, exec_stream_)) {
+                            : is_fp8 ? static_cast<void *>(c.ptr_fp8())
+                                     : static_cast<void *>(c.ptr);
+        const bool launched = is_fp8
+            ? ported::launch_rope_block_remap_paged_fp8(
+                  ptr, n_tokens, n_kv_heads, per_pos_size, head_dim, rope_dim,
+                  win_base, from_base, to_base, pages.ptr_i32(), page_size,
+                  theta, exec_stream_)
+            : ported::launch_rope_block_remap_paged(
+                  ptr, is_fp16, n_tokens, n_kv_heads, per_pos_size, head_dim,
+                  rope_dim, win_base, from_base, to_base, pages.ptr_i32(),
+                  page_size, theta, exec_stream_);
+        if (!launched) {
             return {false, "rope_block_remap_paged launch failed"};
         }
         return launch_status("cuda rope_block_remap_paged_device");
@@ -7062,19 +7115,30 @@ public:
             return {false, "rope_block_remap_paged_batched_device page dtype mismatch"};
         }
         const bool is_fp16 = c.is_fp16();
+        const bool is_fp8 = c.is_fp8_kv();
         const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
                             !c.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            return {false, "rope_block_remap_paged_batched_device requires fp16 or "
-                           "fp32 KV (q8/fp8 re-RoPE is lossy)"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "rope_block_remap_paged_batched_device requires fp16, "
+                           "fp32, or fp8 KV (q8 re-RoPE is unsupported)"};
         }
         void *ptr = is_fp16 ? static_cast<void *>(c.ptr_h())
-                            : static_cast<void *>(c.ptr);
-        if (!ported::launch_rope_block_remap_paged_batched(
-                ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
-                head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
-                as_tensor(from_base).ptr_i32(), as_tensor(n_tokens).ptr_i32(),
-                pages.ptr_i32(), page_size, theta, exec_stream_)) {
+                            : is_fp8 ? static_cast<void *>(c.ptr_fp8())
+                                     : static_cast<void *>(c.ptr);
+        const bool launched = is_fp8
+            ? ported::launch_rope_block_remap_paged_batched_fp8(
+                  ptr, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
+                  head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
+                  as_tensor(from_base).ptr_i32(), as_tensor(n_tokens).ptr_i32(),
+                  pages.ptr_i32(), page_size, theta, exec_stream_)
+            : ported::launch_rope_block_remap_paged_batched(
+                  ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads,
+                  per_pos_size, head_dim, rope_dim,
+                  as_tensor(to_base).ptr_i32(),
+                  as_tensor(from_base).ptr_i32(),
+                  as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(), page_size,
+                  theta, exec_stream_);
+        if (!launched) {
             return {false, "rope_block_remap_paged_batched launch failed"};
         }
         return launch_status("cuda rope_block_remap_paged_batched_device");
@@ -7102,18 +7166,25 @@ public:
             return {false, "block_kmean_paged_device metadata dtype mismatch"};
         }
         const bool is_fp16 = c.is_fp16();
+        const bool is_fp8 = c.is_fp8_kv();
         const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
                             !c.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            // q8/fp8 K is fine to skip — selection just stays recency-weighted.
-            return {false, "block_kmean_paged_device requires fp16 or fp32 KV"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "block_kmean_paged_device requires fp16, fp32, or fp8 KV"};
         }
         const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
-                                  : static_cast<const void *>(c.ptr);
-        if (!ported::launch_block_kmean_paged(
-                const_cast<void *>(ptr), is_fp16, kb.ptr, n_blocks,
-                n_kv_heads, per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
-                pages.ptr_i32(), page_size, exec_stream_)) {
+                                  : is_fp8 ? static_cast<const void *>(c.ptr_fp8())
+                                           : static_cast<const void *>(c.ptr);
+        const bool launched = is_fp8
+            ? ported::launch_block_kmean_paged_fp8(
+                  const_cast<void *>(ptr), kb.ptr, n_blocks, n_kv_heads,
+                  per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
+                  pages.ptr_i32(), page_size, exec_stream_)
+            : ported::launch_block_kmean_paged(
+                  const_cast<void *>(ptr), is_fp16, kb.ptr, n_blocks,
+                  n_kv_heads, per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
+                  pages.ptr_i32(), page_size, exec_stream_);
+        if (!launched) {
             return {false, "block_kmean_paged launch failed"};
         }
         return launch_status("cuda block_kmean_paged_device");
@@ -7212,10 +7283,12 @@ public:
             return {false, "block_attention_mass_paged_device metadata dtype mismatch"};
         }
         const bool is_fp16 = kc.is_fp16();
+        const bool is_fp8 = kc.is_fp8_kv();
         const bool is_f32 = (kc.elem_size == sizeof(float)) && !kc.is_q8_kv() &&
                             !kc.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            return {false, "block_attention_mass_paged_device requires fp16 or fp32 KV"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "block_attention_mass_paged_device requires fp16, "
+                           "fp32, or fp8 KV"};
         }
         if (auto st = cuda_status(cudaMemsetAsync(m.ptr, 0,
                             static_cast<size_t>(buckets) * sizeof(float),
@@ -7224,12 +7297,20 @@ public:
             return st;
         }
         const void *ptr = is_fp16 ? static_cast<const void *>(kc.ptr_h())
-                                  : static_cast<const void *>(kc.ptr);
-        if (!ported::launch_block_attention_mass_paged(
-                const_cast<void *>(ptr), is_fp16, m.ptr, qt.ptr, q_stride,
-                n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
-                wb.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size, seq_len,
-                scale, exec_stream_)) {
+                                  : is_fp8 ? static_cast<const void *>(kc.ptr_fp8())
+                                           : static_cast<const void *>(kc.ptr);
+        const bool launched = is_fp8
+            ? ported::launch_block_attention_mass_paged_fp8(
+                  const_cast<void *>(ptr), m.ptr, qt.ptr, q_stride,
+                  n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
+                  wb.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size,
+                  seq_len, scale, exec_stream_)
+            : ported::launch_block_attention_mass_paged(
+                  const_cast<void *>(ptr), is_fp16, m.ptr, qt.ptr, q_stride,
+                  n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
+                  wb.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size,
+                  seq_len, scale, exec_stream_);
+        if (!launched) {
             return {false, "block_attention_mass_paged launch failed"};
         }
         return launch_status("cuda block_attention_mass_paged_device");
@@ -7260,18 +7341,27 @@ public:
             return {false, "block_kmean_content_paged_device metadata dtype mismatch"};
         }
         const bool is_fp16 = c.is_fp16();
+        const bool is_fp8 = c.is_fp8_kv();
         const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
                             !c.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            // q8/fp8 K can't be de-RoPE'd meaningfully — retrieval stays recency.
-            return {false, "block_kmean_content_paged_device requires fp16 or fp32 KV"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "block_kmean_content_paged_device requires fp16, "
+                           "fp32, or fp8 KV"};
         }
         const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
-                                  : static_cast<const void *>(c.ptr);
-        if (!ported::launch_block_kmean_content_paged(
-                const_cast<void *>(ptr), is_fp16, kb.ptr + out_elem_off, n_blocks,
-                n_kv_heads, per_pos_size, head_dim, rope_dim, ob.ptr_i32(),
-                bt.ptr_i32(), pages.ptr_i32(), page_size, theta, exec_stream_)) {
+                                  : is_fp8 ? static_cast<const void *>(c.ptr_fp8())
+                                           : static_cast<const void *>(c.ptr);
+        const bool launched = is_fp8
+            ? ported::launch_block_kmean_content_paged_fp8(
+                  const_cast<void *>(ptr), kb.ptr + out_elem_off, n_blocks,
+                  n_kv_heads, per_pos_size, head_dim, rope_dim, ob.ptr_i32(),
+                  bt.ptr_i32(), pages.ptr_i32(), page_size, theta, exec_stream_)
+            : ported::launch_block_kmean_content_paged(
+                  const_cast<void *>(ptr), is_fp16, kb.ptr + out_elem_off,
+                  n_blocks, n_kv_heads, per_pos_size, head_dim, rope_dim,
+                  ob.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size,
+                  theta, exec_stream_);
+        if (!launched) {
             return {false, "block_kmean_content_paged launch failed"};
         }
         return launch_status("cuda block_kmean_content_paged_device");
@@ -10006,6 +10096,48 @@ bool launch_rope_block_remap(float *x, uint32_t n_tokens, uint32_t n_units,
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool launch_block_attention_mass_paged_fp8(
+        void *k_cache, float *mass, const float *q, uint32_t q_stride,
+        uint32_t n_window_blocks, uint32_t n_heads, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, uint32_t seq_len, float scale,
+        cudaStream_t stream) {
+    if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || seq_len == 0) {
+        return true;
+    }
+    constexpr uint32_t threads = 256;
+    block_attention_mass_paged_kernel<__nv_fp8_e4m3>
+        <<<n_heads, threads, 0, stream>>>(
+            mass, q, q_stride,
+            static_cast<const __nv_fp8_e4m3 *>(k_cache), n_window_blocks,
+            n_heads, n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+            page_indices, page_size, seq_len, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_rope_block_remap_paged_fp8(void *cache,
+                                       uint32_t n_tokens,
+                                       uint32_t n_kv_heads,
+                                       uint32_t per_pos_size,
+                                       uint32_t head_dim,
+                                       uint32_t rope_dim,
+                                       uint32_t win_base,
+                                       int32_t orig_base,
+                                       int32_t new_base,
+                                       const int32_t *page_indices,
+                                       uint32_t page_size,
+                                       float theta,
+                                       cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_tokens == 0 || n_kv_heads == 0 || half == 0) return true;
+    dim3 grid(n_tokens, n_kv_heads);
+    rope_block_remap_paged_kernel<__nv_fp8_e4m3><<<grid, half, 0, stream>>>(
+        static_cast<__nv_fp8_e4m3 *>(cache), per_pos_size, head_dim, rope_dim,
+        win_base, orig_base, new_base, page_indices, page_size, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    uint32_t n_tokens, uint32_t n_kv_heads,
                                    uint32_t per_pos_size, uint32_t head_dim,
@@ -10057,6 +10189,25 @@ bool launch_rope_block_remap_paged_batched(void *cache, bool is_fp16,
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool launch_rope_block_remap_paged_batched_fp8(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0 || half == 0)
+        return true;
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    rope_block_remap_paged_batched_kernel<__nv_fp8_e4m3>
+        <<<grid, half, 0, stream>>>(
+            static_cast<__nv_fp8_e4m3 *>(cache), per_pos_size, head_dim,
+            rope_dim, to_base, from_base, n_tokens, page_indices, page_size,
+            theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
                               uint32_t n_blocks, uint32_t n_kv_heads,
                               uint32_t per_pos_size, uint32_t head_dim,
@@ -10074,6 +10225,21 @@ bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
             static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
             win_base, blk_tokens, page_indices, page_size);
     }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_paged_fp8(void *k_cache, float *kbar,
+                                  uint32_t n_blocks, uint32_t n_kv_heads,
+                                  uint32_t per_pos_size, uint32_t head_dim,
+                                  const int32_t *win_base,
+                                  const int32_t *blk_tokens,
+                                  const int32_t *page_indices,
+                                  uint32_t page_size, cudaStream_t stream) {
+    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_blocks, n_kv_heads);
+    block_kmean_paged_kernel<__nv_fp8_e4m3><<<grid, head_dim, 0, stream>>>(
+        static_cast<const __nv_fp8_e4m3 *>(k_cache), kbar, per_pos_size,
+        head_dim, win_base, blk_tokens, page_indices, page_size);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -10253,6 +10419,22 @@ bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
             static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
             rope_dim, orig_base, blk_tokens, page_indices, page_size, theta);
     }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_content_paged_fp8(
+        void *k_cache, float *kbar, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *orig_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream) {
+    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_blocks, n_kv_heads);
+    block_kmean_content_paged_kernel<__nv_fp8_e4m3>
+        <<<grid, head_dim, 0, stream>>>(
+            static_cast<const __nv_fp8_e4m3 *>(k_cache), kbar, per_pos_size,
+            head_dim, rope_dim, orig_base, blk_tokens, page_indices, page_size,
+            theta);
     return cudaGetLastError() == cudaSuccess;
 }
 

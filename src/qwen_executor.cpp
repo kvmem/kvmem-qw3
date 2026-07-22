@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -45,6 +46,32 @@ bool full_executor_trace_enabled() {
 
 bool paged_kv_prefill_for_local_cache_enabled() {
     return env_flag_enabled("QW3_PAGED_KV_PREFILL", true);
+}
+
+// Diagnostic-only guardrail for finding every execution path that feeds a
+// position outside the model's trained RoPE range into a RoPE/de-RoPE kernel.
+// It deliberately does not fail or change the position: the point of
+// QW3_ROPE_POSITION_TRACE=1 is to let a long request finish and produce a
+// complete source-labelled inventory before changing any position policy.
+void trace_rope_position_if_out_of_range(const char *source,
+                                         int64_t base_pos,
+                                         uint32_t n_tokens,
+                                         uint32_t limit,
+                                         int32_t layer = -1,
+                                         uint32_t kernel_uses = 1) {
+    static const bool enabled = env_flag_enabled("QW3_ROPE_POSITION_TRACE");
+    if (!enabled || n_tokens == 0 || limit == 0) return;
+    const int64_t end_pos = base_pos + static_cast<int64_t>(n_tokens);
+    if (base_pos >= 0 && end_pos <= static_cast<int64_t>(limit)) return;
+    static std::atomic<uint64_t> sequence{0};
+    const uint64_t seq = sequence.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[rope-position-oob] seq=%llu source=%s base=%lld "
+                 "end_exclusive=%lld tokens=%u limit=%u layer=%d uses=%u\n",
+                 static_cast<unsigned long long>(seq), source,
+                 static_cast<long long>(base_pos),
+                 static_cast<long long>(end_pos), n_tokens, limit, layer,
+                 kernel_uses);
 }
 
 struct QuerySpanOverlap {
@@ -1418,6 +1445,30 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             // the append-slot and (length-based) attention mask stay on attn_pos.
             const uint32_t rope_pos =
                 (bs && kvmem_no_rerope_) ? position_ : attn_pos;
+            uint32_t source_k_rope_pos = rope_pos;
+            if (kvmem_immutable_source_k_ && bs && block_store_ &&
+                !block_store_->blocks().empty()) {
+                const KvMemBlock &tail = block_store_->blocks().back();
+                const uint32_t bt = std::max<uint32_t>(
+                    1, block_store_->config().block_tokens);
+                const uint32_t block_end =
+                    static_cast<uint32_t>(tail.orig_pos_start) + bt;
+                if (tail.orig_pos_start < position_ && position_ < block_end) {
+                    const int64_t source_pos =
+                        tail.baked_pos +
+                        static_cast<int64_t>(position_ - tail.orig_pos_start);
+                    if (source_pos < 0 ||
+                        source_pos > static_cast<int64_t>(
+                                         std::numeric_limits<uint32_t>::max())) {
+                        throw std::runtime_error(
+                            "KVMem immutable partial-block source position overflow");
+                    }
+                    source_k_rope_pos = static_cast<uint32_t>(source_pos);
+                }
+            }
+            trace_rope_position_if_out_of_range(
+                "forward_one_token.qk", rope_pos, 1, cfg.n_ctx_train,
+                static_cast<int32_t>(il), /*kernel_uses=*/2);
             const DeviceTensor &pages_dev =
                 bs ? *window_pages_device_ : kv_page_indices_device();
             const uint32_t pages_count = bs ? window_page_count_ : kv_page_count();
@@ -1447,7 +1498,8 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                                                  cfg.rope_dim, rope_pos, cfg.rope_theta));
             require_status(backend_.rope_partial(*k_, standard_n_kv_heads,
                                                  standard_head_dim,
-                                                 cfg.rope_dim, rope_pos, cfg.rope_theta));
+                                                 cfg.rope_dim, rope_pos,
+                                                 cfg.rope_theta));
 
             // Above-budget QC content index for the generated token: de-RoPE the
             // freshly-baked K at its bake position into the content frame (position-
@@ -1464,6 +1516,14 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                 require_status(backend_.kv_append_batch_paged_device(
                     working_k_cache(il), *k_, attn_pos, per_pos, 1,
                     pages_dev, pages_count, kv_page_size()));
+                if (source_k_rope_pos != rope_pos) {
+                    require_status(backend_.rope_block_remap_paged_device(
+                        k_cache(il), 1, standard_n_kv_heads, per_pos,
+                        standard_head_dim, cfg.rope_dim, attn_pos,
+                        static_cast<int32_t>(rope_pos),
+                        static_cast<int32_t>(source_k_rope_pos), pages_dev,
+                        kv_page_size(), cfg.rope_theta));
+                }
             }
             require_status(backend_.kv_append_batch_paged_device(
                 v_cache(il), *v_, attn_pos, per_pos, 1,
@@ -1930,6 +1990,46 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         // attn_base_pos. Default OFF -> rope_base_pos == attn_base_pos (unchanged).
         const uint32_t rope_base_pos =
             (chunk_bs && kvmem_no_rerope_) ? base_pos : attn_base_pos;
+        // A reselection can move the working window while the source tail block
+        // is only partially filled.  The new attention rows still belong in the
+        // current window frame, but the source rows that complete that block must
+        // retain its original affine construction frame.  Record the short prefix
+        // that needs a one-time source-only correction after append (at most
+        // block_tokens-1 rows); the rest of this full-size chunk remains batched.
+        uint32_t immutable_partial_rows = 0;
+        uint32_t immutable_partial_source_pos = rope_base_pos;
+        if (kvmem_immutable_source_k_ && chunk_bs && block_store_ &&
+            !block_store_->blocks().empty()) {
+            const KvMemBlock &tail = block_store_->blocks().back();
+            const uint32_t bt = std::max<uint32_t>(
+                1, block_store_->config().block_tokens);
+            const uint32_t block_end =
+                static_cast<uint32_t>(tail.orig_pos_start) + bt;
+            if (tail.orig_pos_start < base_pos && base_pos < block_end) {
+                const int64_t source_pos =
+                    tail.baked_pos +
+                    static_cast<int64_t>(base_pos - tail.orig_pos_start);
+                if (source_pos < 0 ||
+                    source_pos > static_cast<int64_t>(
+                                     std::numeric_limits<uint32_t>::max())) {
+                    throw std::runtime_error(
+                        "KVMem immutable partial-block source position overflow");
+                }
+                immutable_partial_source_pos = static_cast<uint32_t>(source_pos);
+                if (immutable_partial_source_pos != rope_base_pos) {
+                    immutable_partial_rows =
+                        std::min<uint32_t>(batch, block_end - base_pos);
+                    if (std::getenv("QW3_KVMEM_TRACE")) {
+                        std::fprintf(
+                            stderr,
+                            "[bs-immutable-partial-append] true_base=%u rows=%u "
+                            "source_pos=%u window_pos=%u\n",
+                            base_pos, immutable_partial_rows,
+                            immutable_partial_source_pos, rope_base_pos);
+                    }
+                }
+            }
+        }
         const DeviceTensor &attn_pages_dev =
             chunk_bs ? *window_pages_device_ : kv_page_indices_device();
         const uint32_t attn_pages_count =
@@ -2070,6 +2170,10 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                  batch, core_stride, h_stride));
             if (record_ops) record(report, "layer." + std::to_string(il) + ".recurrent_output_batch");
         } else {
+            trace_rope_position_if_out_of_range(
+                "forward_n_tokens.qk", rope_base_pos, batch,
+                cfg.n_ctx_train, static_cast<int32_t>(il),
+                /*kernel_uses=*/2);
             {
                 DeviceTensor *outs[3] = {q_batch_.get(), k_batch_.get(), v_batch_.get()};
                 const DeviceWeight *ws[3] = {layer.attn_q, layer.attn_k, layer.attn_v};
@@ -2099,7 +2203,8 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                         batch, k_stride_buf,
                                                         standard_n_kv_heads,
                                                         standard_head_dim,
-                                                        cfg.rope_dim, rope_base_pos, cfg.rope_theta));
+                                                        cfg.rope_dim, rope_base_pos,
+                                                        cfg.rope_theta));
 
             // Query-conditioned KVMem (#80/#87): capture the in-span question Q
             // rows during prefill and de-RoPE into the content frame for boundary
@@ -2144,6 +2249,16 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                         working_k_cache(il), *k_batch_, attn_base_pos, per_pos,
                         batch, attn_pages_dev, attn_pages_count,
                         kv_page_size()));
+                    if (immutable_partial_rows > 0) {
+                        require_status(backend_.rope_block_remap_paged_device(
+                            k_cache(il), immutable_partial_rows,
+                            standard_n_kv_heads,
+                            per_pos, standard_head_dim, cfg.rope_dim,
+                            attn_base_pos,
+                            static_cast<int32_t>(rope_base_pos),
+                            static_cast<int32_t>(immutable_partial_source_pos),
+                            attn_pages_dev, kv_page_size(), cfg.rope_theta));
+                    }
                 }
                 require_status(backend_.kv_append_batch_paged_device(
                     v_cache(il), *v_batch_, attn_base_pos, per_pos, batch,
@@ -2246,7 +2361,9 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             // de-rotate (set_selection -> assemble, canonicalize-for-tier) —
             // cancels the real rotation. delta == 0 when not window-active or
             // under NO_REROPE, so this is a no-op below budget and byte-identical.
-            if (chunk_bs && kvmem_fix_bakedpos_ && block_store_) {
+            if (chunk_bs &&
+                (kvmem_fix_bakedpos_ || kvmem_immutable_source_k_) &&
+                block_store_) {
                 const int64_t delta = static_cast<int64_t>(rope_base_pos) -
                                       static_cast<int64_t>(base_pos);
                 if (delta != 0) {
@@ -2262,20 +2379,12 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                         }
                         const int64_t desired_bake =
                             static_cast<int64_t>(b.orig_pos_start) + delta;
-                        // A block has one affine RoPE frame (baked_pos + token
-                        // offset). Appending into a pre-existing partial block
-                        // after changing windows would give its old and new rows
-                        // different frames, which one baked_pos cannot describe.
-                        // Transcript replay is block-aligned specifically to
-                        // prevent this. Fail loudly in immutable mode if another
-                        // lifecycle violates that construction invariant.
                         if (kvmem_immutable_source_k_ &&
-                            b.orig_pos_start < base_pos &&
-                            b.baked_pos != desired_bake) {
-                            throw std::runtime_error(
-                                "KVMem immutable source K cannot append across "
-                                "a re-selection into a partial block; replay/"
-                                "checkpoint boundary must be block-aligned");
+                            b.orig_pos_start < base_pos) {
+                            // This was the pre-existing partial source block.
+                            // Its remaining rows were explicitly baked in the
+                            // existing frame above; never overwrite that frame.
+                            continue;
                         }
                         block_store_->set_block_baked_pos(
                             bi, desired_bake);
@@ -2584,6 +2693,11 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     }
 
     const QwenConfig &cfg = model_.config();
+    if (cfg.n_ctx_train > 0 && rope_pos >= cfg.n_ctx_train) {
+        report.missing_kernels.push_back(
+            "native MTP RoPE position exceeds the model context limit");
+        return report;
+    }
     const uint32_t standard_head_dim = cfg.head_dim;
     const uint32_t standard_n_heads = cfg.n_heads;
     const uint32_t standard_n_kv_heads = cfg.n_kv_heads;
@@ -2628,6 +2742,9 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                              standard_n_kv_heads,
                                              standard_head_dim,
                                              standard_head_dim, eps));
+    trace_rope_position_if_out_of_range(
+        "forward_mtp_draft_from.qk", rope_pos, 1, cfg.n_ctx_train,
+        static_cast<int32_t>(weights_.n_layers()), /*kernel_uses=*/2);
     require_status(backend_.rope_partial(*q_, standard_n_heads,
                                          2 * standard_head_dim,
                                          cfg.rope_dim, rope_pos, cfg.rope_theta));
@@ -3022,6 +3139,231 @@ void QwenExecutor::kvmem_end_query_replay() {
     }
 }
 
+namespace {
+
+constexpr uint64_t kRebuiltStateMagic = 0x3154535244335751ULL; // "QW3DRST1"
+constexpr uint32_t kRebuiltStateVersion = 1;
+
+template <typename T>
+void rebuilt_state_write(std::ofstream &out, const T &value,
+                         const std::string &path) {
+    out.write(reinterpret_cast<const char *>(&value), sizeof(T));
+    if (!out) {
+        throw std::runtime_error(
+            "failed to write KVMem rebuilt recurrent state: " + path);
+    }
+}
+
+template <typename T>
+void rebuilt_state_read(std::ifstream &in, T &value,
+                        const std::string &path) {
+    in.read(reinterpret_cast<char *>(&value), sizeof(T));
+    if (!in) {
+        throw std::runtime_error(
+            "truncated KVMem rebuilt recurrent state: " + path);
+    }
+}
+
+} // namespace
+
+void QwenExecutor::kvmem_export_recurrent_state(
+    const std::string &path,
+    const std::vector<uint32_t> &source_tokens) const {
+    if (path.empty()) {
+        throw std::runtime_error(
+            "KVMem rebuilt recurrent-state export path is empty");
+    }
+    const std::string tmp = path + ".tmp";
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error(
+            "cannot create KVMem rebuilt recurrent state: " + tmp);
+    }
+    rebuilt_state_write(out, kRebuiltStateMagic, tmp);
+    rebuilt_state_write(out, kRebuiltStateVersion, tmp);
+    const uint32_t layer_count =
+        static_cast<uint32_t>(recurrent_states_.size());
+    rebuilt_state_write(out, layer_count, tmp);
+    const uint64_t token_count = source_tokens.size();
+    rebuilt_state_write(out, token_count, tmp);
+    if (!source_tokens.empty()) {
+        out.write(reinterpret_cast<const char *>(source_tokens.data()),
+                  static_cast<std::streamsize>(source_tokens.size() *
+                                               sizeof(uint32_t)));
+        if (!out) {
+            throw std::runtime_error(
+                "failed to write rebuilt-state source tokens: " + tmp);
+        }
+    }
+
+    for (size_t il = 0; il < recurrent_states_.size(); ++il) {
+        const uint64_t recurrent_count =
+            recurrent_states_[il] ? recurrent_states_[il]->count : 0;
+        const uint64_t conv_count =
+            conv_states_[il] ? conv_states_[il]->count : 0;
+        rebuilt_state_write(out, recurrent_count, tmp);
+        rebuilt_state_write(out, conv_count, tmp);
+        if (recurrent_count > 0) {
+            std::vector<float> host(recurrent_count);
+            require_status(backend_.copy_to_host(
+                *recurrent_states_[il], host.data(), 0, recurrent_count));
+            out.write(reinterpret_cast<const char *>(host.data()),
+                      static_cast<std::streamsize>(host.size() * sizeof(float)));
+            if (!out) {
+                throw std::runtime_error(
+                    "failed to write rebuilt recurrent tensor: " + tmp);
+            }
+        }
+        if (conv_count > 0) {
+            std::vector<float> host(conv_count);
+            require_status(backend_.copy_to_host(
+                *conv_states_[il], host.data(), 0, conv_count));
+            out.write(reinterpret_cast<const char *>(host.data()),
+                      static_cast<std::streamsize>(host.size() * sizeof(float)));
+            if (!out) {
+                throw std::runtime_error(
+                    "failed to write rebuilt conv tensor: " + tmp);
+            }
+        }
+    }
+    out.flush();
+    if (!out) {
+        throw std::runtime_error(
+            "failed to flush KVMem rebuilt recurrent state: " + tmp);
+    }
+    out.close();
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        throw std::runtime_error(
+            "failed to publish KVMem rebuilt recurrent state: " + path);
+    }
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[bs-rebuilt-state] export path=%s tokens=%zu layers=%u\n",
+                     path.c_str(), source_tokens.size(), layer_count);
+    }
+}
+
+void QwenExecutor::kvmem_import_recurrent_state(
+    const std::string &path,
+    const std::vector<uint32_t> &expected_source_tokens) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error(
+            "cannot open KVMem rebuilt recurrent state: " + path);
+    }
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    uint32_t layer_count = 0;
+    uint64_t token_count = 0;
+    rebuilt_state_read(in, magic, path);
+    rebuilt_state_read(in, version, path);
+    rebuilt_state_read(in, layer_count, path);
+    rebuilt_state_read(in, token_count, path);
+    if (magic != kRebuiltStateMagic || version != kRebuiltStateVersion) {
+        throw std::runtime_error(
+            "unsupported KVMem rebuilt recurrent-state format: " + path);
+    }
+    if (layer_count != recurrent_states_.size()) {
+        throw std::runtime_error(
+            "KVMem rebuilt recurrent-state layer count mismatch: " + path);
+    }
+    if (token_count != expected_source_tokens.size()) {
+        throw std::runtime_error(
+            "KVMem rebuilt recurrent-state source token count mismatch: " +
+            path);
+    }
+    std::vector<uint32_t> source_tokens(static_cast<size_t>(token_count));
+    if (!source_tokens.empty()) {
+        in.read(reinterpret_cast<char *>(source_tokens.data()),
+                static_cast<std::streamsize>(source_tokens.size() *
+                                             sizeof(uint32_t)));
+        if (!in) {
+            throw std::runtime_error(
+                "truncated rebuilt-state source token vector: " + path);
+        }
+    }
+    if (source_tokens != expected_source_tokens) {
+        const auto mismatch = std::mismatch(
+            source_tokens.begin(), source_tokens.end(),
+            expected_source_tokens.begin(), expected_source_tokens.end());
+        const size_t index =
+            static_cast<size_t>(mismatch.first - source_tokens.begin());
+        throw std::runtime_error(
+            "KVMem rebuilt recurrent-state source token mismatch at index " +
+            std::to_string(index) + ": " + path);
+    }
+
+    // Validate every tensor shape and read the complete file into host buffers
+    // before mutating device state. A bad or mismatched artifact can therefore
+    // never leave a partially imported recurrent state behind.
+    struct LayerState {
+        std::vector<float> recurrent;
+        std::vector<float> conv;
+    };
+    std::vector<LayerState> layers(layer_count);
+    for (size_t il = 0; il < layer_count; ++il) {
+        uint64_t recurrent_count = 0;
+        uint64_t conv_count = 0;
+        rebuilt_state_read(in, recurrent_count, path);
+        rebuilt_state_read(in, conv_count, path);
+        const uint64_t expected_recurrent =
+            recurrent_states_[il] ? recurrent_states_[il]->count : 0;
+        const uint64_t expected_conv =
+            conv_states_[il] ? conv_states_[il]->count : 0;
+        if (recurrent_count != expected_recurrent ||
+            conv_count != expected_conv) {
+            throw std::runtime_error(
+                "KVMem rebuilt recurrent-state tensor shape mismatch at layer " +
+                std::to_string(il) + ": " + path);
+        }
+        layers[il].recurrent.resize(static_cast<size_t>(recurrent_count));
+        layers[il].conv.resize(static_cast<size_t>(conv_count));
+        if (recurrent_count > 0) {
+            in.read(reinterpret_cast<char *>(layers[il].recurrent.data()),
+                    static_cast<std::streamsize>(recurrent_count *
+                                                 sizeof(float)));
+            if (!in) {
+                throw std::runtime_error(
+                    "truncated rebuilt recurrent tensor at layer " +
+                    std::to_string(il) + ": " + path);
+            }
+        }
+        if (conv_count > 0) {
+            in.read(reinterpret_cast<char *>(layers[il].conv.data()),
+                    static_cast<std::streamsize>(conv_count * sizeof(float)));
+            if (!in) {
+                throw std::runtime_error(
+                    "truncated rebuilt conv tensor at layer " +
+                    std::to_string(il) + ": " + path);
+            }
+        }
+    }
+    char trailing = 0;
+    if (in.read(&trailing, 1)) {
+        throw std::runtime_error(
+            "KVMem rebuilt recurrent-state file has trailing bytes: " + path);
+    }
+
+    for (size_t il = 0; il < layer_count; ++il) {
+        if (recurrent_states_[il]) {
+            require_status(backend_.copy_bytes_from_host(
+                *recurrent_states_[il], 0, layers[il].recurrent.data(),
+                layers[il].recurrent.size() * sizeof(float)));
+        }
+        if (conv_states_[il]) {
+            require_status(backend_.copy_bytes_from_host(
+                *conv_states_[il], 0, layers[il].conv.data(),
+                layers[il].conv.size() * sizeof(float)));
+        }
+    }
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[bs-rebuilt-state] import path=%s tokens=%zu layers=%u\n",
+                     path.c_str(), expected_source_tokens.size(), layer_count);
+    }
+}
+
 void QwenExecutor::kvmem_reset_recurrent_state() {
     for (size_t i = 0; i < recurrent_states_.size(); ++i) {
         if (recurrent_states_[i]) {
@@ -3097,21 +3439,24 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             "of the KV page size (" + std::to_string(page_size) + ")");
     }
     KvMemStoreConfig effective = cfg;
-    // Opt-in while the construction experiment is being validated.  Keeping
-    // this out of the public CLI means all existing evaluation commands remain
-    // byte-for-byte on the legacy in-place path unless they explicitly export
-    // the environment flag.
-    kvmem_immutable_source_k_ =
-        env_flag_enabled("QW3_KVMEM_IMMUTABLE_SOURCE_K");
+    // Immutable source K is the default. The legacy environment override is
+    // still tri-state: an explicit false value disables it just like the CLI
+    // opt-out, while an unset variable preserves EngineOptions.
+    kvmem_immutable_source_k_ = env_flag_enabled(
+        "QW3_KVMEM_IMMUTABLE_SOURCE_K", effective.immutable_source_k);
     effective.immutable_source_k = kvmem_immutable_source_k_;
+    const char *kvmem_kv_dtype = std::getenv("QW3_KV_DTYPE");
+    if (!kvmem_immutable_source_k_ && kvmem_kv_dtype &&
+        std::strcmp(kvmem_kv_dtype, "fp8") == 0) {
+        throw std::runtime_error(
+            "KVMem fp8 requires --kvmem-immutable-k so lossy re-RoPE does "
+            "not accumulate across reselections");
+    }
     if (kvmem_immutable_source_k_) {
-        const char *dtype = std::getenv("QW3_KV_DTYPE");
-        if (dtype && (std::strcmp(dtype, "q8") == 0 ||
-                      std::strcmp(dtype, "fp8") == 0)) {
+        if (kvmem_kv_dtype && std::strcmp(kvmem_kv_dtype, "q8") == 0) {
             throw std::runtime_error(
-                "QW3_KVMEM_IMMUTABLE_SOURCE_K currently requires fp16 or "
-                "fp32 K because the RoPE remap kernel does not support "
-                "quantized KV storage");
+                "--kvmem-immutable-k currently requires fp16, "
+                "fp32, or fp8 K; q8 row-scale re-RoPE is unsupported");
         }
     }
     if (effective.gpu_memory_ratio < 0.0) effective.gpu_memory_ratio = 0.0;
@@ -3374,15 +3719,27 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     }
     if (kvmem_immutable_source_k_ && !kvmem_gpu_page_pool_) {
         throw std::runtime_error(
-            "QW3_KVMEM_IMMUTABLE_SOURCE_K requires the bounded tiered GPU "
+            "KVMem immutable K requires the bounded tiered GPU "
             "pool (configure CPU/NVMe spill and a context larger than the GPU "
             "resident pool)");
     }
     if (kvmem_immutable_source_k_) {
+        uint64_t working_k_bytes = 0;
+        for (const auto &cache : kvmem_work_k_cache_storage_) {
+            if (cache) {
+                working_k_bytes += cache->count *
+                    static_cast<uint64_t>(cache->elem_size);
+            }
+        }
         std::fprintf(stderr,
-                     "[kvmem-tier] immutable_source_k=1 working_k_bytes_per_block=%llu\n",
+                     "[kvmem-tier] immutable_source_k=1 "
+                     "working_k_bytes_per_block=%llu working_k_bytes=%llu "
+                     "working_k_gib=%.3f\n",
                      static_cast<unsigned long long>(
-                         immutable_work_k_block_bytes));
+                         immutable_work_k_block_bytes),
+                     static_cast<unsigned long long>(working_k_bytes),
+                     static_cast<double>(working_k_bytes) /
+                         (1024.0 * 1024.0 * 1024.0));
     }
     if (effective.cpu_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
         PinnedKvTierConfig pcfg;
@@ -3475,8 +3832,32 @@ void QwenExecutor::kvmem_register_append(uint32_t n_new_tokens) {
     if (!kvmem_enabled_ || !block_store_) return;
     if (n_new_tokens == 0) return;
     if (position_ <= kvmem_registered_pos_) return;
-    kvmem_register_until(std::min<uint32_t>(
-        position_, kvmem_registered_pos_ + n_new_tokens));
+    const uint32_t append_begin = kvmem_registered_pos_;
+    const uint32_t target = std::min<uint32_t>(
+        position_, kvmem_registered_pos_ + n_new_tokens);
+    kvmem_register_until(target);
+
+    // Decode/MTP callers register only after the accepted model rows have
+    // advanced both position_ and the active window tail.  Newly-created blocks
+    // therefore need their actual window construction frame recorded here;
+    // register_append's default orig_pos_start is only correct in the dense
+    // identity frame.  Never rewrite the pre-existing partial immutable block:
+    // forward_one_token/forward_n_tokens already source-corrected the rows that
+    // completed it into its original frame.
+    if (kvmem_active_ && (kvmem_fix_bakedpos_ || kvmem_immutable_source_k_)) {
+        const int64_t delta = static_cast<int64_t>(window_query_pos_) -
+                              static_cast<int64_t>(position_);
+        if (delta != 0) {
+            const auto &blocks = block_store_->blocks();
+            for (uint32_t bi = static_cast<uint32_t>(blocks.size());
+                 bi-- > 0;) {
+                const KvMemBlock &b = blocks[bi];
+                if (b.orig_pos_start < append_begin) break;
+                block_store_->set_block_baked_pos(
+                    bi, static_cast<int64_t>(b.orig_pos_start) + delta);
+            }
+        }
+    }
 }
 
 void QwenExecutor::kvmem_register_until(uint32_t target_pos) {
@@ -3711,6 +4092,14 @@ void QwenExecutor::kvmem_canonicalize_block_for_tier(uint32_t block_id) {
     // the spilled bytes are position-canonical.
     if (block.baked_pos != canonical) {
         const int64_t from = block.baked_pos;
+        const uint32_t standard_layers =
+            count_standard_attention_layers(cfg, weights_.n_layers());
+        trace_rope_position_if_out_of_range(
+            "kvmem_tier_canonicalize.main.from", from, block.n_tokens,
+            cfg.n_ctx_train, -1, standard_layers);
+        trace_rope_position_if_out_of_range(
+            "kvmem_tier_canonicalize.main.to", canonical, block.n_tokens,
+            cfg.n_ctx_train, -1, standard_layers);
         for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
             if (!cfg.is_standard_attention_layer(il)) continue;
             DeviceTensor &kc = k_cache(il);
@@ -3741,6 +4130,12 @@ void QwenExecutor::kvmem_canonicalize_block_for_tier(uint32_t block_id) {
         const int64_t mtp_from = mtp_baked_pos_[block_id];
         if (mtp_from != canonical) {
             if (kvmem_block_mtp_pages_resident(block)) {
+                trace_rope_position_if_out_of_range(
+                    "kvmem_tier_canonicalize.mtp.from", mtp_from,
+                    block.n_tokens, cfg.n_ctx_train);
+                trace_rope_position_if_out_of_range(
+                    "kvmem_tier_canonicalize.mtp.to", canonical,
+                    block.n_tokens, cfg.n_ctx_train);
                 require_status(backend_.rope_block_remap_paged_device(
                     mtp_k_cache(), block.n_tokens, cfg.n_kv_heads, per_pos,
                     cfg.head_dim, cfg.rope_dim,
@@ -4340,8 +4735,16 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     bs_remap_from_host_.clear();
     bs_remap_ntok_host_.clear();
     uint32_t max_block_tokens = 0;
+    const uint32_t standard_remap_layers =
+        count_standard_attention_layers(cfg, weights_.n_layers());
     for (const KvMemRemap &rm : plan.remaps) {
         if (rm.skip) continue;
+        trace_rope_position_if_out_of_range(
+            "kvmem_assemble.main.from", rm.from_base, rm.n_tokens,
+            cfg.n_ctx_train, -1, standard_remap_layers);
+        trace_rope_position_if_out_of_range(
+            "kvmem_assemble.main.to", rm.to_base, rm.n_tokens,
+            cfg.n_ctx_train, -1, standard_remap_layers);
         bs_remap_to_host_.push_back(rm.to_base);
         bs_remap_from_host_.push_back(rm.from_base);
         bs_remap_ntok_host_.push_back(static_cast<int32_t>(rm.n_tokens));
@@ -4398,6 +4801,12 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
         for (const KvMemRemap &rm : plan.remaps) {
             const int64_t mtp_from = mtp_baked_pos_[rm.block_id];
             if (mtp_from == static_cast<int64_t>(rm.to_base)) continue;  // skip
+            trace_rope_position_if_out_of_range(
+                "kvmem_assemble.mtp.from", mtp_from, rm.n_tokens,
+                cfg.n_ctx_train);
+            trace_rope_position_if_out_of_range(
+                "kvmem_assemble.mtp.to", rm.to_base, rm.n_tokens,
+                cfg.n_ctx_train);
             bs_mtp_remap_to_host_.push_back(rm.to_base);
             bs_mtp_remap_from_host_.push_back(static_cast<int32_t>(mtp_from));
             bs_mtp_remap_ntok_host_.push_back(static_cast<int32_t>(rm.n_tokens));
@@ -5200,6 +5609,9 @@ void QwenExecutor::kvmem_build_content_index() {
     for (uint32_t i = 0; i < n_blocks; ++i) {
         g_orig_base_host_[i] = static_cast<int32_t>(blocks[i].orig_pos_start);
         g_blk_tokens_host_[i] = static_cast<int32_t>(blocks[i].n_tokens);
+        trace_rope_position_if_out_of_range(
+            "kvmem_build_content_index.kmean", blocks[i].orig_pos_start,
+            blocks[i].n_tokens, cfg.n_ctx_train, bs_score_layer_);
     }
 
     if (n_blocks > g_kbar_global_capacity_) {
@@ -5249,6 +5661,12 @@ void QwenExecutor::kvmem_build_content_index() {
             }
             bool all_ok = true;
             for (uint32_t s = 0; s < L && all_ok; ++s) {
+                for (const KvMemBlock &block : blocks) {
+                    trace_rope_position_if_out_of_range(
+                        "kvmem_build_content_index.kmean_multi",
+                        block.orig_pos_start, block.n_tokens, cfg.n_ctx_train,
+                        static_cast<int32_t>(std_layers_[s]));
+                }
                 auto ml = backend_.block_kmean_content_paged_device(
                     k_cache(std_layers_[s]), *g_kbar_multi_,
                     n_blocks, n_kv_heads, per_pos, head_dim, cfg.rope_dim,
@@ -5271,6 +5689,9 @@ void QwenExecutor::kvmem_snapshot_content_query(uint32_t layer_index) {
     if (!g_content_ready_) return;
     if (static_cast<int32_t>(layer_index) != bs_score_layer_) return;
     const QwenConfig &cfg = model_.config();
+    trace_rope_position_if_out_of_range(
+        "kvmem_snapshot_content_query.derope", window_query_pos_, 1,
+        cfg.n_ctx_train, static_cast<int32_t>(layer_index));
     auto st = backend_.derope_query_device(
         *g_query_content_, *q_, /*q_stride=*/2 * cfg.head_dim,
         cfg.n_heads, cfg.head_dim, cfg.rope_dim,
@@ -5960,6 +6381,11 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
     // the true bake position; rope_base_pos carries that (== base_pos otherwise),
     // so the captured query lands in the same content frame as the k̄ index.
     const int32_t start_pos = static_cast<int32_t>(rope_base_pos + r0);
+    const int32_t actual_layer = slot < std_layers_.size()
+        ? static_cast<int32_t>(std_layers_[slot]) : -1;
+    trace_rope_position_if_out_of_range(
+        "kvmem_capture_query_multi.derope", start_pos, cnt,
+        cfg.n_ctx_train, actual_layer);
     auto st = backend_.derope_query_multi_device(
         *g_query_multi_, *q_batch_, q_elem_off, out_elem_off,
         q_token_stride, q_head_stride, cnt, n_heads, head_dim,
@@ -6086,6 +6512,11 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     const uint64_t kbar_block_base =
         static_cast<uint64_t>(slot) * stride_blocks + first_block;
     DeviceStatus st;
+    const int32_t actual_layer = slot < std_layers_.size()
+        ? static_cast<int32_t>(std_layers_[slot]) : -1;
+    trace_rope_position_if_out_of_range(
+        "kvmem_capture_kbar_multi.derope", rope_base_pos, batch,
+        cfg.n_ctx_train, actual_layer);
     if (off == 0) {
         // Preserve the original aligned kernel. Besides keeping ordinary cold
         // prefill byte-identical, overwrite semantics are exactly what a replayed
@@ -6114,6 +6545,9 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
         const uint64_t out_base_elem =
             (static_cast<uint64_t>(slot) * kvmem_qc_total_tokens_ + base_pos) *
             n_kv_heads * head_dim;
+        trace_rope_position_if_out_of_range(
+            "kvmem_capture_kbar_multi.raw_derope", rope_base_pos,
+            store_rows, cfg.n_ctx_train, actual_layer);
         (void)backend_.derope_store_content_batch_device(
             *k_batch_, *g_kraw_multi_, out_base_elem, k_token_stride, store_rows,
             n_kv_heads, head_dim, cfg.rope_dim,
@@ -6226,6 +6660,9 @@ void QwenExecutor::kvmem_decode_capture_stage(uint32_t layer_index,
     // content frame and stage it at slot-row i. k_ is [n_kv_heads, head_dim].
     const uint64_t out_base =
         (static_cast<uint64_t>(slot) * bt + i) * per_pos;
+    trace_rope_position_if_out_of_range(
+        "kvmem_decode_capture_stage.derope", rope_pos, 1,
+        cfg.n_ctx_train, static_cast<int32_t>(layer_index));
     (void)backend_.derope_store_content_batch_device(
         *k_, *g_kbar_decode_stage_, out_base, /*k_stride=*/per_pos, /*batch=*/1,
         n_kv_heads, head_dim, cfg.rope_dim, static_cast<int32_t>(rope_pos),
@@ -6768,6 +7205,13 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
     }
 
     const QwenConfig &cfg = model_.config();
+    if (cfg.n_ctx_train > 0 &&
+        static_cast<uint64_t>(base_position) + tokens.size() >
+            cfg.n_ctx_train) {
+        report.missing_kernels.push_back(
+            "native MTP prefix RoPE positions exceed the model context limit");
+        return report;
+    }
     const QwenLayerWeights &layer = mtp->layer;
     const uint32_t standard_head_dim = cfg.head_dim;
     const uint32_t standard_n_heads = cfg.n_heads;
@@ -6841,6 +7285,10 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
                                                    standard_n_kv_heads,
                                                    standard_head_dim,
                                                    standard_head_dim, eps));
+    trace_rope_position_if_out_of_range(
+        "prime_mtp_prefix_from_last_batch.qk", base_position, batch,
+        cfg.n_ctx_train, static_cast<int32_t>(weights_.n_layers()),
+        /*kernel_uses=*/2);
     require_status(backend_.rope_partial_batch(*mtp_q_batch_,
                                                batch, q_stride_buf,
                                                standard_n_heads,
