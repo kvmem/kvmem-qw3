@@ -155,11 +155,9 @@ enum class KvMemDeltaNetLayerPolicy : uint8_t { Even = 0, Late = 1 };
 // is not complete instead of silently falling back.
 enum class KvMemOptimizationLevel : uint8_t {
     KvmemInit = 0,
-    Opt1 = 1,  // heat-aware CPU admission/eviction
-    Opt2 = 2,  // synchronous inclusive SSD backing / clean stage-out
-    Opt3 = 3,  // async write-through + pageable CPU cache / pinned slabs
-    Opt4 = 4,  // bulk asynchronous stage-in
-    Opt5 = 5,  // layer-stripe stage-in/query-replay overlap
+    Opt1 = 1,  // reduce SSD load volume: heat-aware CPU cache
+    Opt2 = 2,  // reduce stage-out: inclusive + bounded async writes
+    Opt3 = 3,  // reduce stage-in: coalesced reads + read/H2D overlap
 };
 
 struct KvMemStoreConfig {
@@ -298,6 +296,7 @@ public:
     void set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot);
     void set_block_ssd_backing(uint32_t block_id, int32_t nvme_slot,
                                bool clean);
+    void set_block_io_in_flight(uint32_t block_id, bool in_flight);
     void set_block_baked_pos(uint32_t block_id, int64_t baked_pos);
     void record_block_rerope(uint32_t block_id, int64_t baked_pos);
 

@@ -6038,10 +6038,6 @@ private:
             bs_cfg.optimization_level = KvMemOptimizationLevel::Opt2;
         } else if (options_.kvmem_optimization_level == "opt_3") {
             bs_cfg.optimization_level = KvMemOptimizationLevel::Opt3;
-        } else if (options_.kvmem_optimization_level == "opt_4") {
-            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt4;
-        } else if (options_.kvmem_optimization_level == "opt_5") {
-            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt5;
         } else {
             bs_cfg.optimization_level = KvMemOptimizationLevel::KvmemInit;
         }

@@ -30,15 +30,25 @@ python3 scripts/kvmem_eval/run_kvmem_eval.py \
   --dry-run
 ```
 
-`kvmem_init` is the frozen compatibility path. `opt_1` changes only CPU-tier
-cache admission: blocks repeatedly selected by semantic retrieval are retained
-ahead of one-pass streaming blocks. `opt_2` adds the synchronous inclusive-SSD
-reference path: once a block has a clean SSD record, GPU and CPU promotions no
-longer delete it, and a later stage-out can release GPU pages without repeating
-D2H or disk writes. It requires an NVMe arena large enough for one spill record
-per possible context block. These profiles do not change retrieval scores,
-selected block IDs, or KV values. `opt_3` through `opt_5` are reserved rollout
-levels and are rejected until their implementations are complete.
+`kvmem_init` is the frozen compatibility path. The three cumulative
+optimization profiles are deliberately grouped by the bottleneck they target:
+
+| Level | Added behavior | Primary objective |
+|---|---|---|
+| `opt_1` | heat-aware CPU admission and eviction | reduce the number of bytes loaded from SSD |
+| `opt_2` | inclusive clean SSD backing, a bounded asynchronous positional-write queue, and recyclable pageable slabs | reduce stage-out latency |
+| `opt_3` | coalesced positional reads and two preallocated/recycled pinned read slabs that pipeline SSD reads with H2D | reduce stage-in latency |
+
+Inclusive backing requires an NVMe arena large enough for one spill record per
+possible context block. These profiles do not change retrieval scores, selected
+block IDs, or KV values.
+
+The portable defaults are 64 MiB I/O slabs and write queue depth 8: `opt_2`
+prewarms at most 512 MiB pageable write staging and `opt_3` adds 128 MiB pinned
+read staging. After
+profiling a different host, override them with `QW3_KVMEM_IO_SLAB_MIB` and
+`QW3_KVMEM_WRITE_QUEUE_DEPTH`; both values are range-checked and the queue
+remains bounded.
 
 The frozen ten-sample query-replay launcher accepts the same switch:
 
@@ -52,10 +62,13 @@ KVMEM_OPT_LEVEL=opt_1 TAG=query_replay_opt1 \
 
 Use `QW3_KVMEM_PERF_TRACE=1` for timed reselection stages. In `opt_1`, the
 server also emits `[kvmem-cache]` rows containing incoming CPU hit rate,
-admissions, rejected admissions, and evictions. In `opt_2`,
-`stage_out_clean_blocks` and `stage_out_clean_avoided_gib` quantify reuse of
-inclusive SSD backing. The first write remains synchronous in this reference
-level; asynchronous prefill write-through belongs to the next level.
+admissions, rejected admissions, and evictions. In `opt_2`, the trace reports
+clean-backing reuse, async gather/submission/backpressure, and completed write
+bytes/syscalls. In `opt_3`, it additionally reports bulk read batches,
+positional-I/O syscalls, read wait time, and H2D enqueue/wait time.
+
+The matched implementation benchmark and raw artifact tags are recorded in
+[`docs/kvmem_storage_optimization_benchmark_20260723.md`](../../docs/kvmem_storage_optimization_benchmark_20260723.md).
 
 ## Inspect a configuration
 

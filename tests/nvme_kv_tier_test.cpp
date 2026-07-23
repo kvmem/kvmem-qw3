@@ -3,8 +3,11 @@
 
 #include "qw3/nvme_kv_tier.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -85,10 +88,87 @@ static void test_evicting_place() {
     CHECK(out == c);
 }
 
+static void test_coalesced_batch_io() {
+    NvmeKvTierConfig cfg;
+    cfg.dir = temp_dir();
+    cfg.total_bytes = 64 * 8;
+    cfg.slot_bytes = 64;
+    NvmeKvTier t(cfg);
+
+    std::vector<uint8_t> input(64 * 3), output(64 * 3, 0);
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<uint8_t>((i * 17) & 0xff);
+    }
+    std::vector<NvmeIoSpan> spans;
+    for (uint32_t block = 0; block < 3; ++block) {
+        const auto p = t.place_block(100 + block);
+        CHECK(p.slot == static_cast<int32_t>(block));
+        spans.push_back(NvmeIoSpan{
+            p.slot, static_cast<uint64_t>(block) * 64, 64});
+    }
+
+    NvmeBatchIoStats writes;
+    t.write_spans(spans, input.data(), input.size(), &writes);
+    CHECK(writes.bytes == input.size());
+    CHECK(writes.syscalls == 1);
+
+    NvmeBatchIoStats reads;
+    t.read_spans(spans, output.data(), output.size(), &reads);
+    CHECK(reads.bytes == output.size());
+    CHECK(reads.syscalls == 1);
+    CHECK(output == input);
+}
+
+static void test_concurrent_positional_batches() {
+    NvmeKvTierConfig cfg;
+    cfg.dir = temp_dir();
+    cfg.total_bytes = 64 * 8;
+    cfg.slot_bytes = 64;
+    NvmeKvTier t(cfg);
+
+    std::vector<uint8_t> a(64 * 3, 0x35);
+    std::vector<uint8_t> b(64 * 3, 0xca);
+    std::vector<uint8_t> output(64 * 6, 0);
+    std::vector<NvmeIoSpan> a_spans;
+    std::vector<NvmeIoSpan> b_spans;
+    for (uint32_t block = 0; block < 6; ++block) {
+        const auto p = t.place_block(200 + block);
+        CHECK(p.slot == static_cast<int32_t>(block));
+        auto &spans = block < 3 ? a_spans : b_spans;
+        spans.push_back(NvmeIoSpan{
+            p.slot, static_cast<uint64_t>(block % 3) * 64, 64});
+    }
+
+    auto aw = std::async(std::launch::async, [&]() {
+        t.write_spans(a_spans, a.data(), a.size());
+    });
+    auto bw = std::async(std::launch::async, [&]() {
+        t.write_spans(b_spans, b.data(), b.size());
+    });
+    aw.get();
+    bw.get();
+
+    std::vector<NvmeIoSpan> all;
+    for (uint32_t slot = 0; slot < 6; ++slot) {
+        all.push_back(NvmeIoSpan{
+            static_cast<int32_t>(slot),
+            static_cast<uint64_t>(slot) * 64, 64});
+    }
+    NvmeBatchIoStats reads;
+    t.read_spans(all, output.data(), output.size(), &reads);
+    CHECK(reads.syscalls == 1);
+    CHECK(std::equal(a.begin(), a.end(), output.begin()));
+    CHECK(std::equal(
+        b.begin(), b.end(), output.begin() +
+            static_cast<std::ptrdiff_t>(a.size())));
+}
+
 int main() {
     test_disabled();
     test_write_read_release();
     test_evicting_place();
+    test_coalesced_batch_io();
+    test_concurrent_positional_batches();
 
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);

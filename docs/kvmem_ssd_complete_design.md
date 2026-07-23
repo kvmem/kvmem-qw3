@@ -1114,24 +1114,30 @@ GPU-resident index placement is then valuable if VRAM permits.
 
 ## 18. Rollout plan
 
-The executable A/B levels are intentionally finer-grained than the production
-phases below:
+The executable A/B levels group related mechanisms by the latency source they
+target:
 
 | Runtime level | Current meaning |
 |---|---|
 | `kvmem_init` | frozen exclusive-tier compatibility path |
-| `opt_1` | heat-aware CPU admission and eviction |
-| `opt_2` | synchronous inclusive-SSD correctness reference; clean repeated stage-out |
-| `opt_3` | reserved for asynchronous prefill write-through and pageable CPU cache |
-| `opt_4` | reserved for bulk read slabs, H2D, and GPU scatter |
-| `opt_5` | reserved for stripe readiness and query-replay overlap |
+| `opt_1` | reduce SSD load volume with heat-aware CPU admission and eviction |
+| `opt_2` | reduce stage-out latency with inclusive SSD backing, a bounded asynchronous positional-write queue, and recyclable pageable slabs |
+| `opt_3` | reduce stage-in latency with coalesced positional reads and a two-slab preallocated/recycled SSD-read/H2D pipeline |
 
 An unimplemented level must fail during configuration. It must never silently
-fall back to an earlier path, because that would invalidate latency
-comparisons. The current `opt_2` persists the existing immutable spill record
-(V plus any configured tiered MTP payload); raw-K SSD authority and asynchronous
-write-through remain Phase 2 work rather than being implied by this reference
-level.
+fall back to an earlier path, because that would invalidate latency comparisons.
+The current `opt_2` persists the existing immutable spill record (V plus any
+configured tiered MTP payload) asynchronously when a block is staged out.
+Persisting every completed prefill block before pressure selection, striped
+layer readiness, and layer-by-layer replay overlap remain production follow-up
+work rather than being implied by these three experimental levels.
+
+The defaults are 64 MiB slabs and write queue depth 8. This bounds the
+prewarmed pageable write pool at 512 MiB; `opt_3` adds two pinned read slabs
+(128 MiB by default). They are portable
+runtime settings, not device constants: `QW3_KVMEM_IO_SLAB_MIB` and
+`QW3_KVMEM_WRITE_QUEUE_DEPTH` can be calibrated per host, are range-checked,
+and preserve bounded memory/backpressure.
 
 ### Phase 0: preserve baseline
 

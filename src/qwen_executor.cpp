@@ -83,10 +83,32 @@ const char *kvmem_optimization_level_name(KvMemOptimizationLevel level) {
         case KvMemOptimizationLevel::Opt1: return "opt_1";
         case KvMemOptimizationLevel::Opt2: return "opt_2";
         case KvMemOptimizationLevel::Opt3: return "opt_3";
-        case KvMemOptimizationLevel::Opt4: return "opt_4";
-        case KvMemOptimizationLevel::Opt5: return "opt_5";
     }
     return "unknown";
+}
+
+size_t kvmem_env_size(const char *name, size_t fallback,
+                      size_t minimum, size_t maximum) {
+    const char *value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0') return fallback;
+    return std::max(minimum, std::min(
+        maximum, static_cast<size_t>(parsed)));
+}
+
+size_t kvmem_io_slab_bytes() {
+    static const size_t value =
+        kvmem_env_size("QW3_KVMEM_IO_SLAB_MIB", 64, 4, 256) *
+        1024ull * 1024ull;
+    return value;
+}
+
+size_t kvmem_write_queue_depth() {
+    static const size_t value =
+        kvmem_env_size("QW3_KVMEM_WRITE_QUEUE_DEPTH", 8, 1, 32);
+    return value;
 }
 
 // Diagnostic-only guardrail for finding every execution path that feeds a
@@ -435,6 +457,13 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
 }
 
 QwenExecutor::~QwenExecutor() {
+    try {
+        kvmem_reap_pending_writes(/*wait_all=*/true);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+                     "[kvmem-io] pending write failed during destruction: %s\n",
+                     e.what());
+    }
     if (kvmem_attn_trace_file_) {
         std::fclose(kvmem_attn_trace_file_);
         kvmem_attn_trace_file_ = nullptr;
@@ -618,6 +647,7 @@ QwenExecutor::KvStateSnapshot QwenExecutor::kv_state_snapshot() const {
 }
 
 void QwenExecutor::reset_state() {
+    kvmem_reap_pending_writes(/*wait_all=*/true);
     for (auto &s : recurrent_states_) {
         if (s) (void) backend_.zero_tensor(*s);
     }
@@ -1300,7 +1330,8 @@ void QwenExecutor::kvmem_evict_cpu_for_raw(uint64_t bytes) {
             KvMemOptimizationLevel::Opt2;
         const KvMemBlock &victim_block = block_store_->blocks()[victim];
         const bool clean_backing =
-            inclusive && victim_block.ssd_clean &&
+            inclusive &&
+            (victim_block.ssd_clean || victim_block.in_flight) &&
             victim_block.nvme_slot >= 0 &&
             kvmem_nvme_tier_->block_slot(victim) ==
                 victim_block.nvme_slot;
@@ -3755,6 +3786,9 @@ void QwenExecutor::kvmem_begin_query_replay(
     // selection assembled in the window and frees precisely the pool capacity
     // that the replayed suffix will consume.
     (void)kvmem_set_selection(context_block_ids);
+    // The suffix block IDs are about to be recycled. Finish bounded async SSD
+    // ownership first so an old-generation write cannot land after truncation.
+    kvmem_reap_pending_writes(/*wait_all=*/true);
 
     // Restore only the model-compute state at the boundary. restore_state() is
     // intentionally not used: it also restores the OLD pressure-window length,
@@ -4161,6 +4195,9 @@ std::vector<int32_t> QwenExecutor::kv_physical_pages() const {
 // ---- Block-sparse KV attention ------------------------------------------
 
 void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
+    kvmem_reap_pending_writes(/*wait_all=*/true);
+    kvmem_free_write_slabs_.clear();
+    kvmem_free_read_slabs_.clear();
     // v1 requires block_tokens to be a positive multiple of the KV page size so
     // every block boundary is page-aligned: the window packs selected blocks
     // contiguously, and a non-aligned block would split a physical page across
@@ -4174,11 +4211,11 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             "of the KV page size (" + std::to_string(page_size) + ")");
     }
     KvMemStoreConfig effective = cfg;
-    if (effective.optimization_level > KvMemOptimizationLevel::Opt2) {
+    if (effective.optimization_level > KvMemOptimizationLevel::Opt3) {
         throw std::runtime_error(
             "--kvmem-optimization-level requests an optimization level that "
             "is reserved but not implemented in this build; use kvmem_init or "
-            "opt_1 or opt_2");
+            "opt_1, opt_2, or opt_3");
     }
     if (effective.optimization_level >= KvMemOptimizationLevel::Opt2 &&
         (effective.nvme_tier_bytes == 0 ||
@@ -4691,12 +4728,18 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     std::fprintf(
         stderr,
         "[kvmem-opt] level=%s cpu_cache_policy=%s "
-        "ssd_backing=%s implemented_max=opt_2\n",
+        "stage_out=%s stage_in=%s io_slab_mib=%zu write_qd=%zu "
+        "read_qd=2 implemented_max=opt_3\n",
         kvmem_optimization_level_name(effective.optimization_level),
         effective.optimization_level >= KvMemOptimizationLevel::Opt1
             ? "heat-aware" : "legacy-lru",
         effective.optimization_level >= KvMemOptimizationLevel::Opt2
-            ? "inclusive-sync" : "exclusive");
+            ? "inclusive-async" : "exclusive-sync",
+        effective.optimization_level >= KvMemOptimizationLevel::Opt3
+            ? "coalesced-pipelined" : "per-block",
+        static_cast<size_t>(
+            kvmem_io_slab_bytes() / (1024ull * 1024ull)),
+        kvmem_write_queue_depth());
     if (effective.nvme_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
         if (effective.nvme_tier_dir.empty()) {
             throw std::runtime_error(
@@ -4707,6 +4750,53 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         ncfg.total_bytes = effective.nvme_tier_bytes;
         ncfg.slot_bytes = effective.estimated_block_bytes;
         kvmem_nvme_tier_ = std::make_unique<NvmeKvTier>(std::move(ncfg));
+        if (effective.optimization_level >=
+            KvMemOptimizationLevel::Opt2) {
+            const uint64_t warm0 = kvmem_steady_ns();
+            const size_t slab_bytes = kvmem_io_slab_bytes();
+            const size_t slab_count = kvmem_write_queue_depth();
+            for (size_t i = 0; i < slab_count; ++i) {
+                auto slab =
+                    std::make_shared<std::vector<uint8_t>>();
+                // resize value-initializes every page, moving allocation and
+                // first-touch faults out of the reselection critical path.
+                slab->resize(slab_bytes);
+                slab->clear();
+                kvmem_free_write_slabs_.push_back(std::move(slab));
+            }
+            std::fprintf(
+                stderr,
+                "[kvmem-io] write_slab_pool slabs=%zu slab_mib=%zu "
+                "pageable_mib=%zu warmup_ms=%.3f\n",
+                slab_count,
+                static_cast<size_t>(
+                    slab_bytes / (1024ull * 1024ull)),
+                static_cast<size_t>(
+                    slab_count * slab_bytes / (1024ull * 1024ull)),
+                (kvmem_steady_ns() - warm0) / 1.0e6);
+        }
+        if (effective.optimization_level >=
+            KvMemOptimizationLevel::Opt3) {
+            const uint64_t warm0 = kvmem_steady_ns();
+            const size_t slab_bytes = kvmem_io_slab_bytes();
+            constexpr size_t kReadSlabs = 2;
+            for (size_t i = 0; i < kReadSlabs; ++i) {
+                kvmem_free_read_slabs_.push_back(
+                    backend_.host_buffer(
+                        slab_bytes, "kvmem_stagein_read_slab"));
+            }
+            std::fprintf(
+                stderr,
+                "[kvmem-io] read_slab_pool slabs=%zu slab_mib=%zu "
+                "pinned_mib=%zu warmup_ms=%.3f\n",
+                kReadSlabs,
+                static_cast<size_t>(
+                    slab_bytes / (1024ull * 1024ull)),
+                static_cast<size_t>(
+                    kReadSlabs * slab_bytes /
+                    (1024ull * 1024ull)),
+                (kvmem_steady_ns() - warm0) / 1.0e6);
+        }
     }
     // Capacity guarantee for the bounded GPU pool. When the pool engaged
     // (gpu_blocks < ctx_blocks, so a >budget prompt must spill), every history
@@ -4828,6 +4918,7 @@ void QwenExecutor::kvmem_register_until(uint32_t target_pos) {
 
 void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
     if (!kvmem_enabled_ || !block_store_) return;
+    kvmem_reap_pending_writes(/*wait_all=*/true);
     // Rewind the block table to `token_pos` tokens. restore_state() has already
     // rewound position/KV-pages/recurrent/window; this reconciles the block
     // store + tier slots + selection indices, which restore_state does not touch.
@@ -5329,6 +5420,68 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
     kvmem_finish_prefetch();
 }
 
+void QwenExecutor::kvmem_submit_prefetch_nvme_batches() {
+    if (!kvmem_prefetch_.bulk_nvme || !kvmem_nvme_tier_) return;
+    constexpr size_t kMaxInflightReadBatches = 2;
+    const uint64_t read_slab_target_bytes = kvmem_io_slab_bytes();
+    while (kvmem_prefetch_.nvme_batches.size() <
+               kMaxInflightReadBatches &&
+           kvmem_prefetch_.next_nvme_read <
+               kvmem_prefetch_.nvme_reads.size()) {
+        const size_t begin = kvmem_prefetch_.next_nvme_read;
+        size_t end = begin;
+        uint64_t batch_bytes = 0;
+        while (end < kvmem_prefetch_.nvme_reads.size()) {
+            const uint64_t bytes =
+                kvmem_prefetch_.nvme_reads[end].bytes;
+            if (end > begin &&
+                batch_bytes + bytes > read_slab_target_bytes) {
+                break;
+            }
+            kvmem_prefetch_.nvme_reads[end].batch_offset = batch_bytes;
+            batch_bytes += bytes;
+            ++end;
+        }
+        KvMemPrefetchNvmeBatch batch;
+        batch.read_begin = begin;
+        batch.read_end = end;
+        for (auto it = kvmem_free_read_slabs_.begin();
+             it != kvmem_free_read_slabs_.end(); ++it) {
+            if ((*it)->bytes >= batch_bytes) {
+                batch.buffer = std::move(*it);
+                kvmem_free_read_slabs_.erase(it);
+                break;
+            }
+        }
+        if (!batch.buffer) {
+            batch.buffer = backend_.host_buffer(
+                batch_bytes, "kvmem_stagein_read_slab");
+        }
+        batch.spans.reserve(end - begin);
+        for (size_t i = begin; i < end; ++i) {
+            const KvMemPrefetchNvmeRead &read =
+                kvmem_prefetch_.nvme_reads[i];
+            batch.spans.push_back(
+                NvmeIoSpan{read.slot, read.batch_offset, read.bytes});
+        }
+        NvmeKvTier *tier = kvmem_nvme_tier_.get();
+        void *buffer = batch.buffer->data;
+        auto spans = batch.spans;
+        batch.future = std::async(
+            std::launch::async,
+            [tier, buffer, batch_bytes, spans = std::move(spans)]() {
+                NvmeBatchIoStats stats;
+                const uint64_t t0 = kvmem_steady_ns();
+                tier->read_spans(spans, buffer, batch_bytes, &stats);
+                stats.duration_ns = kvmem_steady_ns() - t0;
+                return stats;
+            });
+        kvmem_prefetch_.next_nvme_read = end;
+        ++kvmem_prefetch_.perf.nvme_read_batches;
+        kvmem_prefetch_.nvme_batches.push_back(std::move(batch));
+    }
+}
+
 void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     if (!block_store_) return;
     if (kvmem_prefetch_.active) {
@@ -5341,6 +5494,27 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     kvmem_prefetch_.active = true;
     if (perf_trace) {
         kvmem_prefetch_.perf.start_enter_ns = t_in0;
+    }
+    bool needs_pending_write = false;
+    if (!kvmem_pending_writes_.empty()) {
+        const auto &blocks = block_store_->blocks();
+        for (const KvMemRemap &rm : plan.remaps) {
+            if (rm.block_id < blocks.size() &&
+                blocks[rm.block_id].tier == KvTier::SSD &&
+                blocks[rm.block_id].in_flight) {
+                needs_pending_write = true;
+                break;
+            }
+        }
+    }
+    if (needs_pending_write) {
+        const uint64_t wait0 =
+            perf_trace ? kvmem_steady_ns() : 0;
+        kvmem_reap_pending_writes(/*wait_all=*/true);
+        if (perf_trace) {
+            kvmem_prefetch_.perf.pending_write_wait_ns +=
+                kvmem_steady_ns() - wait0;
+        }
     }
     // Local-position MTP stores historical V independently of the prefix
     // builder's current tail, so restore it even when an accepted token has
@@ -5355,6 +5529,9 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
         (kvmem_mtp_local_positions_ ||
          kvmem_mtp_prefix_covers_registered());
     const bool stage_mtp_pages = kvmem_prefetch_.stage_mtp_pages;
+    kvmem_prefetch_.bulk_nvme =
+        block_store_->config().optimization_level >=
+        KvMemOptimizationLevel::Opt3;
     try {
         const auto &blocks = block_store_->blocks();
         require_status(backend_.begin_kv_transfer_to_device());
@@ -5391,7 +5568,14 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                 KvMemPrefetchNvmeRead read;
                 read.block_id = rm.block_id;
                 read.bytes = bytes;
-                read.buffer.resize(bytes);
+                read.slot = kvmem_nvme_tier_->block_slot(rm.block_id);
+                if (read.slot < 0) {
+                    throw std::runtime_error(
+                        "KVMem NVMe stage-in missing backing slot");
+                }
+                if (!kvmem_prefetch_.bulk_nvme) {
+                    read.buffer.resize(bytes);
+                }
                 kvmem_prefetch_.nvme_reads.push_back(std::move(read));
                 if (perf_trace) {
                     ++kvmem_prefetch_.perf.nvme_blocks;
@@ -5438,22 +5622,28 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
             }
         }
         if (!kvmem_prefetch_.nvme_reads.empty()) {
-            NvmeKvTier *tier = kvmem_nvme_tier_.get();
-            std::vector<KvMemPrefetchNvmeRead> *reads =
-                &kvmem_prefetch_.nvme_reads;
-            uint64_t *read_ns = &kvmem_prefetch_.perf.nvme_read_ns;
-            kvmem_prefetch_.nvme_future = std::async(
-                std::launch::async, [tier, reads, read_ns, perf_trace]() {
-                    const uint64_t t0 =
-                        perf_trace ? kvmem_steady_ns() : 0;
-                    for (KvMemPrefetchNvmeRead &read : *reads) {
-                        tier->read_block(read.block_id, read.buffer.data(),
-                                         read.bytes);
-                    }
-                    if (perf_trace) {
-                        *read_ns = kvmem_steady_ns() - t0;
-                    }
-                });
+            if (kvmem_prefetch_.bulk_nvme) {
+                kvmem_submit_prefetch_nvme_batches();
+            } else {
+                NvmeKvTier *tier = kvmem_nvme_tier_.get();
+                std::vector<KvMemPrefetchNvmeRead> *reads =
+                    &kvmem_prefetch_.nvme_reads;
+                uint64_t *read_ns = &kvmem_prefetch_.perf.nvme_read_ns;
+                kvmem_prefetch_.nvme_future = std::async(
+                    std::launch::async,
+                    [tier, reads, read_ns, perf_trace]() {
+                        const uint64_t t0 =
+                            perf_trace ? kvmem_steady_ns() : 0;
+                        for (KvMemPrefetchNvmeRead &read : *reads) {
+                            tier->read_block(
+                                read.block_id, read.buffer.data(),
+                                read.bytes);
+                        }
+                        if (perf_trace) {
+                            *read_ns = kvmem_steady_ns() - t0;
+                        }
+                    });
+            }
         }
     } catch (...) {
         kvmem_prefetch_ = KvMemPrefetchState{};
@@ -5479,7 +5669,80 @@ void QwenExecutor::kvmem_finish_prefetch() {
     uint32_t staged = 0;
     const bool stage_mtp_pages = kvmem_prefetch_.stage_mtp_pages;
     try {
-        if (kvmem_prefetch_.nvme_future.valid()) {
+        if (kvmem_prefetch_.bulk_nvme) {
+            while (!kvmem_prefetch_.nvme_batches.empty()) {
+                KvMemPrefetchNvmeBatch batch =
+                    std::move(kvmem_prefetch_.nvme_batches.front());
+                kvmem_prefetch_.nvme_batches.pop_front();
+                const uint64_t t_wait0 =
+                    perf_trace ? kvmem_steady_ns() : 0;
+                NvmeBatchIoStats io = batch.future.get();
+                if (perf_trace) {
+                    kvmem_prefetch_.perf.nvme_wait_ns +=
+                        kvmem_steady_ns() - t_wait0;
+                    kvmem_prefetch_.perf.nvme_read_ns += io.duration_ns;
+                    kvmem_prefetch_.perf.nvme_read_syscalls += io.syscalls;
+                }
+                const size_t read_begin = batch.read_begin;
+                const size_t read_end = batch.read_end;
+                HostBuffer *host = batch.buffer.get();
+                const uint64_t t_nvme_h2d0 =
+                    perf_trace ? kvmem_steady_ns() : 0;
+                const auto &blocks = block_store_->blocks();
+                for (size_t i = read_begin; i < read_end; ++i) {
+                    KvMemPrefetchNvmeRead &read =
+                        kvmem_prefetch_.nvme_reads[i];
+                    const KvMemBlock &block = blocks[read.block_id];
+                    const uint32_t page_size = kv_pages_.page_size;
+                    const uint32_t first_page =
+                        block.orig_pos_start / page_size;
+                    const uint32_t last_page =
+                        (block.orig_pos_start + block.n_tokens - 1) /
+                        page_size;
+                    for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+                        (void)kv_pages_.ensure_logical_page_resident(
+                            backend_, lp);
+                        if (stage_mtp_pages) {
+                            (void)mtp_kv_pages_.ensure_logical_page_resident(
+                                backend_, lp);
+                        }
+                    }
+                    const uint8_t *src =
+                        static_cast<const uint8_t *>(host->data) +
+                        read.batch_offset;
+                    kvmem_copy_block_from_host(
+                        block, src, read.bytes, stage_mtp_pages);
+                    kvmem_prefetch_.queued_h2d = true;
+                    kvmem_prefetch_.blocks.push_back(
+                        KvMemPrefetchBlock{read.block_id, KvTier::SSD});
+                }
+                if (perf_trace) {
+                    kvmem_prefetch_.perf.nvme_h2d_enqueue_ns +=
+                        kvmem_steady_ns() - t_nvme_h2d0;
+                }
+                if (kvmem_prefetch_.queued_h2d) {
+                    const uint64_t t_h2d_wait0 =
+                        perf_trace ? kvmem_steady_ns() : 0;
+                    require_status(backend_.wait_kv_transfer());
+                    if (perf_trace) {
+                        kvmem_prefetch_.perf.h2d_wait_ns +=
+                            kvmem_steady_ns() - t_h2d_wait0;
+                    }
+                    kvmem_prefetch_.queued_h2d = false;
+                }
+                if (batch.buffer &&
+                    kvmem_free_read_slabs_.size() < 2) {
+                    kvmem_free_read_slabs_.push_back(
+                        std::move(batch.buffer));
+                }
+                // The second read submitted at start remained outstanding
+                // during this slab's H2D. Refill the just-freed queue slot only
+                // after returning its pinned slab, so later batches reuse the
+                // same bounded buffers instead of paying cudaHostAlloc in the
+                // stage-in critical path.
+                kvmem_submit_prefetch_nvme_batches();
+            }
+        } else if (kvmem_prefetch_.nvme_future.valid()) {
             const uint64_t t_wait0 =
                 perf_trace ? kvmem_steady_ns() : 0;
             kvmem_prefetch_.nvme_future.get();
@@ -5488,7 +5751,8 @@ void QwenExecutor::kvmem_finish_prefetch() {
                     kvmem_steady_ns() - t_wait0;
             }
         }
-        if (!kvmem_prefetch_.nvme_reads.empty()) {
+        if (!kvmem_prefetch_.bulk_nvme &&
+            !kvmem_prefetch_.nvme_reads.empty()) {
             const uint64_t t_nvme_h2d0 =
                 perf_trace ? kvmem_steady_ns() : 0;
             const auto &blocks = block_store_->blocks();
@@ -5567,6 +5831,102 @@ void QwenExecutor::kvmem_finish_prefetch() {
     }
 }
 
+void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
+    using namespace std::chrono_literals;
+    while (!kvmem_pending_writes_.empty()) {
+        KvMemPendingWriteBatch &front = kvmem_pending_writes_.front();
+        if (!wait_all &&
+            front.future.wait_for(0ms) != std::future_status::ready) {
+            break;
+        }
+        NvmeBatchIoStats stats;
+        try {
+            stats = front.future.get();
+        } catch (...) {
+            if (block_store_) {
+                for (uint32_t id : front.block_ids) {
+                    block_store_->set_block_io_in_flight(id, false);
+                }
+            }
+            kvmem_pending_writes_.pop_front();
+            throw;
+        }
+        if (block_store_ && kvmem_nvme_tier_) {
+            for (size_t i = 0; i < front.block_ids.size(); ++i) {
+                const uint32_t id = front.block_ids[i];
+                if (id >= block_store_->block_count() ||
+                    i >= front.spans.size()) {
+                    continue;
+                }
+                const int32_t slot = front.spans[i].slot;
+                if (kvmem_nvme_tier_->block_slot(id) == slot) {
+                    block_store_->set_block_ssd_backing(id, slot, true);
+                }
+                block_store_->set_block_io_in_flight(id, false);
+            }
+        }
+        kvmem_async_write_completed_bytes_ += stats.bytes;
+        kvmem_async_write_completed_syscalls_ += stats.syscalls;
+        kvmem_async_write_completed_ns_ += stats.duration_ns;
+        std::shared_ptr<std::vector<uint8_t>> completed_buffer =
+            std::move(front.buffer);
+        kvmem_pending_writes_.pop_front();
+        if (completed_buffer &&
+            kvmem_free_write_slabs_.size() <
+                kvmem_write_queue_depth()) {
+            completed_buffer->clear();
+            kvmem_free_write_slabs_.push_back(
+                std::move(completed_buffer));
+        }
+    }
+}
+
+void QwenExecutor::kvmem_submit_write_batch(
+        std::shared_ptr<std::vector<uint8_t>> buffer,
+        std::vector<NvmeIoSpan> spans,
+        std::vector<uint32_t> block_ids) {
+    if (!buffer || buffer->empty() || spans.empty()) return;
+    if (!kvmem_nvme_tier_) {
+        throw std::runtime_error(
+            "KVMem async write submission has no NVMe tier");
+    }
+    // QD=8 is the portable default because it saturates the profiled device
+    // without a large queue. Deployments can tune the bounded queue through
+    // QW3_KVMEM_WRITE_QUEUE_DEPTH after running profile_kvmem_storage.py.
+    const size_t max_inflight_batches = kvmem_write_queue_depth();
+    const uint64_t wait0 = kvmem_steady_ns();
+    if (kvmem_pending_writes_.size() >= max_inflight_batches) {
+        kvmem_pending_writes_.front().future.wait();
+        kvmem_reap_pending_writes(/*wait_all=*/false);
+    }
+    kvmem_last_stage_out_perf_.async_backpressure_ns +=
+        kvmem_steady_ns() - wait0;
+
+    NvmeKvTier *tier = kvmem_nvme_tier_.get();
+    KvMemPendingWriteBatch pending;
+    pending.buffer = std::move(buffer);
+    pending.spans = std::move(spans);
+    pending.block_ids = std::move(block_ids);
+    pending.submit_ns = kvmem_steady_ns();
+    auto worker_buffer = pending.buffer;
+    auto worker_spans = pending.spans;
+    pending.future = std::async(
+        std::launch::async,
+        [tier, worker_buffer, worker_spans = std::move(worker_spans)]() {
+            NvmeBatchIoStats stats;
+            const uint64_t t0 = kvmem_steady_ns();
+            tier->write_spans(
+                worker_spans, worker_buffer->data(),
+                static_cast<uint64_t>(worker_buffer->size()), &stats);
+            stats.duration_ns = kvmem_steady_ns() - t0;
+            return stats;
+        });
+    kvmem_last_stage_out_perf_.async_submitted_bytes +=
+        pending.buffer->size();
+    ++kvmem_last_stage_out_perf_.async_batches;
+    kvmem_pending_writes_.push_back(std::move(pending));
+}
+
 void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
     kvmem_last_stage_out_perf_ = KvMemStageOutPerf{};
     if (!block_store_ || block_ids.empty()) return;
@@ -5579,6 +5939,83 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
     const bool inclusive =
         block_store_->config().optimization_level >=
         KvMemOptimizationLevel::Opt2;
+    if (inclusive) {
+        kvmem_reap_pending_writes(/*wait_all=*/false);
+    }
+    const uint64_t write_slab_target_bytes = kvmem_io_slab_bytes();
+    std::shared_ptr<std::vector<uint8_t>> write_buffer;
+    std::vector<NvmeIoSpan> write_spans;
+    std::vector<uint32_t> write_blocks;
+    auto submit_write_slab = [&]() {
+        if (!write_buffer || write_spans.empty()) return;
+        const uint64_t t0 = kvmem_steady_ns();
+        kvmem_submit_write_batch(
+            std::move(write_buffer), std::move(write_spans),
+            std::move(write_blocks));
+        kvmem_last_stage_out_perf_.async_submit_ns +=
+            kvmem_steady_ns() - t0;
+        write_buffer.reset();
+        write_spans.clear();
+        write_blocks.clear();
+    };
+    auto queue_ssd_write = [&](uint32_t block_id, const uint8_t *src,
+                               uint64_t bytes) {
+        if (!kvmem_nvme_tier_) {
+            throw std::runtime_error(
+                "KVMem opt_2 async stage-out has no NVMe tier");
+        }
+        const NvmeSlotPlacement p =
+            kvmem_nvme_tier_->place_block(block_id);
+        if (p.slot < 0) {
+            throw std::runtime_error(
+                "KVMem opt_2 inclusive NVMe tier is full");
+        }
+        if (write_buffer && !write_spans.empty() &&
+            write_buffer->size() + bytes > write_slab_target_bytes) {
+            submit_write_slab();
+        }
+        if (!write_buffer) {
+            if (kvmem_free_write_slabs_.empty() &&
+                !kvmem_pending_writes_.empty()) {
+                const uint64_t wait0 =
+                    perf_trace ? kvmem_steady_ns() : 0;
+                if (kvmem_pending_writes_.size() >=
+                    kvmem_write_queue_depth()) {
+                    kvmem_pending_writes_.front().future.wait();
+                }
+                kvmem_reap_pending_writes(/*wait_all=*/false);
+                if (perf_trace) {
+                    kvmem_last_stage_out_perf_.async_backpressure_ns +=
+                        kvmem_steady_ns() - wait0;
+                }
+            }
+            if (!kvmem_free_write_slabs_.empty()) {
+                write_buffer =
+                    std::move(kvmem_free_write_slabs_.front());
+                kvmem_free_write_slabs_.pop_front();
+                write_buffer->clear();
+            } else {
+                write_buffer =
+                    std::make_shared<std::vector<uint8_t>>();
+            }
+            write_buffer->reserve(static_cast<size_t>(
+                std::max<uint64_t>(write_slab_target_bytes, bytes)));
+        }
+        const uint64_t offset = write_buffer->size();
+        const uint64_t t_gather0 =
+            perf_trace ? kvmem_steady_ns() : 0;
+        write_buffer->insert(
+            write_buffer->end(), src, src + static_cast<size_t>(bytes));
+        if (perf_trace) {
+            kvmem_last_stage_out_perf_.async_gather_ns +=
+                kvmem_steady_ns() - t_gather0;
+        }
+        write_spans.push_back(NvmeIoSpan{p.slot, offset, bytes});
+        write_blocks.push_back(block_id);
+        block_store_->set_block_ssd_backing(block_id, p.slot, false);
+        block_store_->set_block_io_in_flight(block_id, true);
+        return p.slot;
+    };
     auto release_gpu_pages = [&](const KvMemBlock &block) {
         const uint32_t page_size = kv_pages_.page_size;
         const uint32_t first_page = block.orig_pos_start / page_size;
@@ -5597,12 +6034,12 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
         const KvMemBlock &block = blocks[block_id];
         if (!kvmem_block_pages_resident(block)) continue;
         const uint64_t src_bytes = kvmem_block_spill_bytes(block);
-        if (inclusive && block.ssd_clean) {
+        if (inclusive && (block.ssd_clean || block.in_flight)) {
             if (!kvmem_nvme_tier_ || block.nvme_slot < 0 ||
                 kvmem_nvme_tier_->block_slot(block_id) != block.nvme_slot) {
                 throw std::runtime_error(
-                    "KVMem opt_2 block is marked SSD-clean without matching "
-                    "inclusive backing");
+                    "KVMem opt_2 block has clean/pending SSD backing without "
+                    "a matching inclusive slot");
             }
             int32_t cpu_slot = -1;
             if (kvmem_cpu_tier_) {
@@ -5666,21 +6103,7 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
         int32_t cpu_slot = -1;
         int32_t nvme_slot = -1;
         if (inclusive) {
-            if (!kvmem_nvme_tier_) {
-                throw std::runtime_error(
-                    "KVMem opt_2 inclusive SSD backing requires an enabled "
-                    "NVMe tier");
-            }
-            const uint64_t t_nvme0 =
-                perf_trace ? kvmem_steady_ns() : 0;
-            kvmem_nvme_tier_->write_block(block_id, src, src_bytes);
-            if (perf_trace) {
-                kvmem_last_stage_out_perf_.nvme_write_ns +=
-                    kvmem_steady_ns() - t_nvme0;
-            }
-            nvme_slot = kvmem_nvme_tier_->block_slot(block_id);
-            block_store_->set_block_ssd_backing(
-                block_id, nvme_slot, true);
+            nvme_slot = queue_ssd_write(block_id, src, src_bytes);
         }
         if (kvmem_cpu_tier_) {
             PinnedSlotPlacement placement;
@@ -5721,12 +6144,14 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                             "KVMem CPU eviction lost its slot backing");
                     }
                     const KvMemBlock &victim_block = blocks[victim];
-                    const bool victim_clean =
-                        inclusive && victim_block.ssd_clean &&
+                    const bool victim_backed =
+                        inclusive &&
+                        (victim_block.ssd_clean ||
+                         victim_block.in_flight) &&
                         victim_block.nvme_slot >= 0 &&
                         kvmem_nvme_tier_->block_slot(victim) ==
                             victim_block.nvme_slot;
-                    if (!victim_clean) {
+                    if (!victim_backed) {
                         const uint64_t t_nvme0 =
                             perf_trace ? kvmem_steady_ns() : 0;
                         kvmem_nvme_tier_->write_block(
@@ -5747,7 +6172,7 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                                      "slot=%d bytes=%llu ssd_write=%d\n",
                                      victim, kvmem_nvme_tier_->block_slot(victim),
                                      static_cast<unsigned long long>(victim_bytes),
-                                     victim_clean ? 0 : 1);
+                                     victim_backed ? 0 : 1);
                     }
                     if (inclusive) {
                         block_store_->set_block_cpu_copy(victim, -1);
@@ -5836,6 +6261,7 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                          released_pages);
         }
     }
+    submit_write_slab();
     if (perf_trace) {
         kvmem_last_stage_out_perf_.total_ns =
             kvmem_steady_ns() - t_out0;
@@ -6570,10 +6996,19 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             "stage_out_disk_write_ms=%.3f stage_out_blocks=%u "
             "stage_out_gib=%.3f stage_out_clean_blocks=%u "
             "stage_out_clean_avoided_gib=%.3f "
+            "stage_out_async_submit_ms=%.3f "
+            "stage_out_async_gather_ms=%.3f "
+            "stage_out_async_backpressure_ms=%.3f "
+            "stage_out_async_batches=%u stage_out_async_gib=%.3f "
+            "pending_write_batches=%zu async_completed_write_ms=%.3f "
+            "async_completed_write_gib=%.3f "
+            "async_completed_write_syscalls=%llu "
             "prefetch_submit_ms=%.3f overlap_gap_ms=%.3f "
             "prefetch_finish_ms=%.3f stage_in_wall_ms=%.3f "
+            "pending_write_wait_ms=%.3f "
             "cpu_h2d_enqueue_ms=%.3f nvme_read_ms=%.3f "
             "nvme_wait_ms=%.3f nvme_hidden_ms=%.3f "
+            "nvme_read_batches=%u nvme_read_syscalls=%llu "
             "nvme_h2d_enqueue_ms=%.3f h2d_wait_ms=%.3f "
             "cpu_in_blocks=%u cpu_in_gib=%.3f "
             "nvme_in_blocks=%u nvme_in_gib=%.3f "
@@ -6592,12 +7027,25 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             out.nvme_write_ns * ns_to_ms, out.blocks,
             out.bytes * bytes_to_gib, out.clean_blocks,
             out.clean_bytes_avoided * bytes_to_gib,
+            out.async_submit_ns * ns_to_ms,
+            out.async_gather_ns * ns_to_ms,
+            out.async_backpressure_ns * ns_to_ms,
+            out.async_batches,
+            out.async_submitted_bytes * bytes_to_gib,
+            kvmem_pending_writes_.size(),
+            kvmem_async_write_completed_ns_ * ns_to_ms,
+            kvmem_async_write_completed_bytes_ * bytes_to_gib,
+            static_cast<unsigned long long>(
+                kvmem_async_write_completed_syscalls_),
             submit_ns * ns_to_ms,
             overlap_gap_ns * ns_to_ms, finish_ns * ns_to_ms,
             stage_in_wall_ns * ns_to_ms,
+            in.pending_write_wait_ns * ns_to_ms,
             in.cpu_h2d_enqueue_ns * ns_to_ms,
             in.nvme_read_ns * ns_to_ms, in.nvme_wait_ns * ns_to_ms,
             nvme_hidden_ns * ns_to_ms,
+            in.nvme_read_batches,
+            static_cast<unsigned long long>(in.nvme_read_syscalls),
             in.nvme_h2d_enqueue_ns * ns_to_ms,
             in.h2d_wait_ns * ns_to_ms, in.cpu_blocks,
             in.cpu_bytes * bytes_to_gib, in.nvme_blocks,
@@ -6708,9 +7156,18 @@ uint32_t QwenExecutor::kvmem_set_selection(
             "stage_out_d2h_ms=%.3f stage_out_disk_write_ms=%.3f "
             "stage_out_blocks=%u stage_out_gib=%.3f "
             "stage_out_clean_blocks=%u stage_out_clean_avoided_gib=%.3f "
+            "stage_out_async_submit_ms=%.3f "
+            "stage_out_async_gather_ms=%.3f "
+            "stage_out_async_backpressure_ms=%.3f "
+            "stage_out_async_batches=%u stage_out_async_gib=%.3f "
+            "pending_write_batches=%zu async_completed_write_ms=%.3f "
+            "async_completed_write_gib=%.3f "
+            "async_completed_write_syscalls=%llu "
             "prefetch_submit_ms=%.3f overlap_gap_ms=%.3f "
-            "prefetch_finish_ms=%.3f cpu_h2d_enqueue_ms=%.3f "
+            "prefetch_finish_ms=%.3f pending_write_wait_ms=%.3f "
+            "cpu_h2d_enqueue_ms=%.3f "
             "nvme_read_ms=%.3f nvme_wait_ms=%.3f nvme_hidden_ms=%.3f "
+            "nvme_read_batches=%u nvme_read_syscalls=%llu "
             "nvme_h2d_enqueue_ms=%.3f h2d_wait_ms=%.3f "
             "cpu_in_blocks=%u cpu_in_gib=%.3f "
             "nvme_in_blocks=%u nvme_in_gib=%.3f "
@@ -6725,11 +7182,24 @@ uint32_t QwenExecutor::kvmem_set_selection(
             out.nvme_write_ns * ns_to_ms, out.blocks,
             out.bytes * bytes_to_gib, out.clean_blocks,
             out.clean_bytes_avoided * bytes_to_gib,
+            out.async_submit_ns * ns_to_ms,
+            out.async_gather_ns * ns_to_ms,
+            out.async_backpressure_ns * ns_to_ms,
+            out.async_batches,
+            out.async_submitted_bytes * bytes_to_gib,
+            kvmem_pending_writes_.size(),
+            kvmem_async_write_completed_ns_ * ns_to_ms,
+            kvmem_async_write_completed_bytes_ * bytes_to_gib,
+            static_cast<unsigned long long>(
+                kvmem_async_write_completed_syscalls_),
             submit_ns * ns_to_ms,
             overlap_gap_ns * ns_to_ms, finish_ns * ns_to_ms,
+            in.pending_write_wait_ns * ns_to_ms,
             in.cpu_h2d_enqueue_ns * ns_to_ms,
             in.nvme_read_ns * ns_to_ms, in.nvme_wait_ns * ns_to_ms,
             nvme_hidden_ns * ns_to_ms,
+            in.nvme_read_batches,
+            static_cast<unsigned long long>(in.nvme_read_syscalls),
             in.nvme_h2d_enqueue_ns * ns_to_ms,
             in.h2d_wait_ns * ns_to_ms, in.cpu_blocks,
             in.cpu_bytes * bytes_to_gib, in.nvme_blocks,

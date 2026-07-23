@@ -8,6 +8,7 @@
 #include "qw3/pinned_kv_tier.hpp"
 
 #include <cstdio>
+#include <deque>
 #include <future>
 #include <memory>
 #include <string>
@@ -842,7 +843,16 @@ private:
     struct KvMemPrefetchNvmeRead {
         uint32_t block_id = 0;
         uint64_t bytes = 0;
+        int32_t slot = -1;
+        uint64_t batch_offset = 0;
         std::vector<uint8_t> buffer;
+    };
+    struct KvMemPrefetchNvmeBatch {
+        size_t read_begin = 0;
+        size_t read_end = 0;
+        std::unique_ptr<HostBuffer> buffer;
+        std::vector<NvmeIoSpan> spans;
+        std::future<NvmeBatchIoStats> future;
     };
     struct KvMemPrefetchPerf {
         uint64_t start_enter_ns = 0;
@@ -852,10 +862,13 @@ private:
         uint64_t cpu_h2d_enqueue_ns = 0;
         uint64_t nvme_read_ns = 0;
         uint64_t nvme_wait_ns = 0;
+        uint64_t pending_write_wait_ns = 0;
         uint64_t nvme_h2d_enqueue_ns = 0;
         uint64_t h2d_wait_ns = 0;
         uint64_t cpu_bytes = 0;
         uint64_t nvme_bytes = 0;
+        uint64_t nvme_read_syscalls = 0;
+        uint32_t nvme_read_batches = 0;
         uint32_t cpu_blocks = 0;
         uint32_t nvme_blocks = 0;
     };
@@ -869,6 +882,9 @@ private:
         std::vector<KvMemPrefetchBlock> blocks;
         std::vector<KvMemPrefetchNvmeRead> nvme_reads;
         std::future<void> nvme_future;
+        bool bulk_nvme = false;
+        size_t next_nvme_read = 0;
+        std::deque<KvMemPrefetchNvmeBatch> nvme_batches;
         KvMemPrefetchPerf perf;
     };
     struct KvMemStageOutPerf {
@@ -882,6 +898,18 @@ private:
         uint32_t nvme_blocks = 0;
         uint32_t clean_blocks = 0;
         uint64_t clean_bytes_avoided = 0;
+        uint64_t async_submit_ns = 0;
+        uint64_t async_gather_ns = 0;
+        uint64_t async_backpressure_ns = 0;
+        uint64_t async_submitted_bytes = 0;
+        uint32_t async_batches = 0;
+    };
+    struct KvMemPendingWriteBatch {
+        std::shared_ptr<std::vector<uint8_t>> buffer;
+        std::vector<NvmeIoSpan> spans;
+        std::vector<uint32_t> block_ids;
+        std::future<NvmeBatchIoStats> future;
+        uint64_t submit_ns = 0;
     };
     struct KvMemReselectPerf {
         bool active = false;
@@ -894,6 +922,20 @@ private:
     KvMemPrefetchPerf kvmem_last_prefetch_perf_;
     KvMemStageOutPerf kvmem_last_stage_out_perf_;
     KvMemReselectPerf kvmem_reselect_perf_;
+    std::deque<KvMemPendingWriteBatch> kvmem_pending_writes_;
+    // Completed write slabs are recycled instead of repeatedly allocating and
+    // faulting 64 MiB pageable buffers on the stage-out critical path.
+    std::deque<std::shared_ptr<std::vector<uint8_t>>>
+        kvmem_free_write_slabs_;
+    std::deque<std::unique_ptr<HostBuffer>> kvmem_free_read_slabs_;
+    uint64_t kvmem_async_write_completed_bytes_ = 0;
+    uint64_t kvmem_async_write_completed_syscalls_ = 0;
+    uint64_t kvmem_async_write_completed_ns_ = 0;
+    void kvmem_submit_write_batch(
+        std::shared_ptr<std::vector<uint8_t>> buffer,
+        std::vector<NvmeIoSpan> spans,
+        std::vector<uint32_t> block_ids);
+    void kvmem_reap_pending_writes(bool wait_all);
     bool kvmem_pending_reselect_ = false;
     KvMemPlan kvmem_pending_plan_;
     // Attention query position within the assembled window (== sum of selected
@@ -905,6 +947,7 @@ private:
     void kvmem_stage_in(const KvMemPlan &plan);
     void kvmem_start_prefetch(const KvMemPlan &plan);
     void kvmem_finish_prefetch();
+    void kvmem_submit_prefetch_nvme_batches();
     void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
     bool kvmem_block_pages_resident(const KvMemBlock &block) const;
     bool kvmem_block_mtp_pages_resident(const KvMemBlock &block) const;

@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--update-mode", choices=("step", "interval"), default="step")
     ap.add_argument(
         "--optimization-level",
-        choices=("kvmem_init", "opt_1", "opt_2", "opt_3", "opt_4", "opt_5"),
+        choices=("kvmem_init", "opt_1", "opt_2", "opt_3"),
         default="kvmem_init",
         help="monotonic KVMem storage/tiering profile used for matched A/B runs")
     ap.add_argument("--query-conditioned", action=argparse.BooleanOptionalAction,

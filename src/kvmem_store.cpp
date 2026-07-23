@@ -118,6 +118,11 @@ void KvMemStore::set_block_ssd_backing(uint32_t block_id, int32_t nvme_slot,
     b.ssd_clean = clean && nvme_slot >= 0;
 }
 
+void KvMemStore::set_block_io_in_flight(uint32_t block_id, bool in_flight) {
+    if (block_id >= block_count()) return;
+    blocks_[block_id].in_flight = in_flight;
+}
+
 void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {
     if (block_id >= block_count()) return;
     blocks_[block_id].baked_pos = baked_pos;

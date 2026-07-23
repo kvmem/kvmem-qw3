@@ -119,8 +119,9 @@ void usage(std::ostream &os) {
 #endif
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
         "  --kvmem-optimization-level L  Monotonic storage/tiering A/B profile:\n"
-        "                        kvmem_init|opt_1|opt_2|opt_3|opt_4|opt_5.\n"
-        "                        Currently implemented: kvmem_init, opt_1, opt_2.\n"
+        "                        kvmem_init|opt_1|opt_2|opt_3.\n"
+        "                        opt_1 reduces SSD load volume; opt_2 reduces\n"
+        "                        stage-out; opt_3 reduces stage-in.\n"
         "                        Default: kvmem_init.\n"
         "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
         "                        final user message (the question) instead of recency.\n"
@@ -460,11 +461,10 @@ int main(int argc, char **argv) {
                 engine.kvmem_optimization_level = need(arg);
                 const std::string &level = engine.kvmem_optimization_level;
                 if (level != "kvmem_init" && level != "opt_1" &&
-                    level != "opt_2" && level != "opt_3" &&
-                    level != "opt_4" && level != "opt_5") {
+                    level != "opt_2" && level != "opt_3") {
                     throw std::runtime_error(
                         "--kvmem-optimization-level must be "
-                        "kvmem_init|opt_1|opt_2|opt_3|opt_4|opt_5");
+                        "kvmem_init|opt_1|opt_2|opt_3");
                 }
             } else if (arg == "--kvmem-query-conditioned") {
                 engine.kvmem_query_conditioned = true;
