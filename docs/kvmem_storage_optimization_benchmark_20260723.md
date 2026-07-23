@@ -157,6 +157,65 @@ artifacts are:
 - `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_opt3_pagecachefix_s20_20260724_serve.log`
 - `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_opt3_pagecachefix_s20_20260724_eval_20260723_161120.jsonl`
 
+The subsequent ten-sample run exposed two additional cold-request lifetime
+issues which are independent of the tier policy:
+
+- demand-allocated immutable raw-K chunks survived `reset_state()` and were
+  accumulated across unrelated samples;
+- after those chunks and sparse spill records were freed, glibc could retain
+  the large freed arenas in the process heap.
+
+Cold reset now truncates raw-K storage to zero, clears its validity maps, and
+calls `malloc_trim(0)` after releasing the large host allocations. Warm prefix
+restore does not call this cold-reset path. Runtime memory accounting across the
+previously failing second-to-third-sample boundary showed anonymous memory fall
+to 3.25 GiB, process RSS to 29.1 GiB, and system `MemAvailable` rise to 113 GiB.
+The complete ten-sample run then finished without an OOM.
+
+## Ten-sample LongMemEval-M accuracy gate
+
+The frozen sample indices were `4,6,20,27,34,36,51,60,68,86`. The production
+configuration used 224K selected context, a 32K generation reserve, block size
+32, mean-k, query replay, immutable raw K, MTP-4, and `opt_3`. All samples were
+about one million prompt tokens.
+
+| Run | Correct | Per-sample vector | Client/judge errors | Truncated |
+|---|---:|---|---:|---:|
+| historical pre-raw-K immutable baseline | 6/10 | `TFTTFTTFTF` | 0 | 0 |
+| current `opt_3` full run | 5/10 | `TFTTFFTFTF` | 0 | 0 |
+
+All ten current requests captured their complete query span, all ten used
+mean-k, and none used a scorer fallback. The only changed verdict was sample
+index 36 (`question_id=07b6f563`): the historical response explicitly recalled
+`iPhone 13 Pro`, whereas the current response produced generic phone-accessory
+advice.
+
+Two controls isolate this difference from the storage optimizations:
+
+1. repeating index 36 with `opt_3` produced the same generic answer and failed
+   again, so it was not temperature-0.6 sampling noise;
+2. repeating it with the current `kvmem_init` profile also produced the same
+   generic answer and failed.
+
+Therefore Opt1--Opt3 did not cause the observed answer change. It predates these
+profiles and belongs to the earlier immutable raw-K / inference-semantics
+refactor. This gate establishes storage-profile parity for the observed
+regression, but it does **not** claim byte-identical answer parity with the
+older working-K implementation.
+
+The index-36 control also demonstrates why page-cache policy must be frozen in
+performance comparisons. Its current `opt_3` TTFT was 619.96 s and an
+unbounded-cache `kvmem_init` run reported 615.88 s. The latter did not release
+the roughly 30 GiB SSD backing ranges from Linux page cache and is therefore
+not a memory-bounded physical-I/O baseline. The controlled table above forces
+the same writeback/`DONTNEED` policy for every profile.
+
+Accuracy artifacts:
+
+- `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_opt3_cpu65_trimfix_query_replay10_20260724_eval_20260723_181112.jsonl`
+- `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_opt3_sample36_repeat1_20260724_eval_20260723_201015.jsonl`
+- `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_init_sample36_control_20260724_eval_20260723_202335.jsonl`
+
 ## Correctness and artifacts
 
 - CTest: 12/12 passed.
