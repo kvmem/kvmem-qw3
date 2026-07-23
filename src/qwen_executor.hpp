@@ -880,6 +880,8 @@ private:
         uint32_t blocks = 0;
         uint32_t cpu_blocks = 0;
         uint32_t nvme_blocks = 0;
+        uint32_t clean_blocks = 0;
+        uint64_t clean_bytes_avoided = 0;
     };
     struct KvMemReselectPerf {
         bool active = false;

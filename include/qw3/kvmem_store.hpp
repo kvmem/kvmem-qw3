@@ -37,10 +37,14 @@ struct KvMemBlock {
     uint32_t block_id = 0;          // dense index in append order (0,1,2,...)
     uint32_t orig_pos_start = 0;    // first original token position in block
     uint32_t n_tokens = 0;          // tokens in this block (<= block_tokens)
-    KvTier   tier = KvTier::GPU;    // where the block's KV currently lives
+    KvTier   tier = KvTier::GPU;    // active copy; opt_2 may retain other copies
     int32_t  gpu_slot = -1;         // future physical GPU block/page slot
     int32_t  cpu_slot = -1;         // CPU pinned tier slot, -1 if absent
     int32_t  nvme_slot = -1;        // NVMe tier slot, -1 if absent
+    // opt_2 and later use inclusive backing: tier names the active copy used
+    // for the next transition, while cpu_slot/nvme_slot may describe additional
+    // clean copies. Legacy levels retain the original exclusive semantics.
+    bool     ssd_clean = false;      // nvme_slot contains the current spill bytes
     bool     dirty_gpu = false;     // GPU copy newer than backing copy
     bool     in_flight = false;     // async copy/verification owns this block
 
@@ -152,8 +156,8 @@ enum class KvMemDeltaNetLayerPolicy : uint8_t { Even = 0, Late = 1 };
 enum class KvMemOptimizationLevel : uint8_t {
     KvmemInit = 0,
     Opt1 = 1,  // heat-aware CPU admission/eviction
-    Opt2 = 2,  // inclusive SSD write-through / clean stage-out
-    Opt3 = 3,  // pageable CPU cache + bounded pinned slabs
+    Opt2 = 2,  // synchronous inclusive SSD backing / clean stage-out
+    Opt3 = 3,  // async write-through + pageable CPU cache / pinned slabs
     Opt4 = 4,  // bulk asynchronous stage-in
     Opt5 = 5,  // layer-stripe stage-in/query-replay overlap
 };
@@ -288,6 +292,12 @@ public:
     void set_block_tier(uint32_t block_id, KvTier tier,
                         int32_t cpu_slot = -1,
                         int32_t nvme_slot = -1);
+    // Inclusive-copy metadata used by opt_2+. These do not change which tier is
+    // active, so evicting a CPU cache copy cannot accidentally mark a still-live
+    // GPU block cold.
+    void set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot);
+    void set_block_ssd_backing(uint32_t block_id, int32_t nvme_slot,
+                               bool clean);
     void set_block_baked_pos(uint32_t block_id, int64_t baked_pos);
     void record_block_rerope(uint32_t block_id, int64_t baked_pos);
 

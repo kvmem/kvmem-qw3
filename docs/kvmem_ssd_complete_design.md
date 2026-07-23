@@ -1114,6 +1114,25 @@ GPU-resident index placement is then valuable if VRAM permits.
 
 ## 18. Rollout plan
 
+The executable A/B levels are intentionally finer-grained than the production
+phases below:
+
+| Runtime level | Current meaning |
+|---|---|
+| `kvmem_init` | frozen exclusive-tier compatibility path |
+| `opt_1` | heat-aware CPU admission and eviction |
+| `opt_2` | synchronous inclusive-SSD correctness reference; clean repeated stage-out |
+| `opt_3` | reserved for asynchronous prefill write-through and pageable CPU cache |
+| `opt_4` | reserved for bulk read slabs, H2D, and GPU scatter |
+| `opt_5` | reserved for stripe readiness and query-replay overlap |
+
+An unimplemented level must fail during configuration. It must never silently
+fall back to an earlier path, because that would invalidate latency
+comparisons. The current `opt_2` persists the existing immutable spill record
+(V plus any configured tiered MTP payload); raw-K SSD authority and asynchronous
+write-through remain Phase 2 work rather than being implied by this reference
+level.
+
 ### Phase 0: preserve baseline
 
 - freeze current sync behavior and sample-wise accuracy outputs;

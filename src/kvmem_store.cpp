@@ -81,14 +81,41 @@ void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
     if (block_id >= block_count()) return;
     KvMemBlock &b = blocks_[block_id];
     b.tier = tier;
+    if (cfg_.optimization_level >= KvMemOptimizationLevel::Opt2) {
+        if (tier == KvTier::GPU) {
+            // GPU becomes active, but clean CPU/SSD cache copies remain valid.
+            if (cpu_slot >= 0) b.cpu_slot = cpu_slot;
+            if (nvme_slot >= 0) b.nvme_slot = nvme_slot;
+        } else {
+            b.gpu_slot = -1;
+            b.cpu_slot = cpu_slot;
+            if (nvme_slot >= 0) b.nvme_slot = nvme_slot;
+        }
+        return;
+    }
     if (tier == KvTier::GPU) {
         b.cpu_slot = -1;
         b.nvme_slot = -1;
+        b.ssd_clean = false;
     } else {
         b.gpu_slot = -1;
         b.cpu_slot = cpu_slot;
         b.nvme_slot = nvme_slot;
+        b.ssd_clean = tier == KvTier::SSD && nvme_slot >= 0;
     }
+}
+
+void KvMemStore::set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot) {
+    if (block_id >= block_count()) return;
+    blocks_[block_id].cpu_slot = cpu_slot;
+}
+
+void KvMemStore::set_block_ssd_backing(uint32_t block_id, int32_t nvme_slot,
+                                       bool clean) {
+    if (block_id >= block_count()) return;
+    KvMemBlock &b = blocks_[block_id];
+    b.nvme_slot = nvme_slot;
+    b.ssd_clean = clean && nvme_slot >= 0;
 }
 
 void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {

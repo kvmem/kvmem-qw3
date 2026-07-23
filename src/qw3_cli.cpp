@@ -120,7 +120,7 @@ void usage(std::ostream &os) {
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
         "  --kvmem-optimization-level L  Monotonic storage/tiering A/B profile:\n"
         "                        kvmem_init|opt_1|opt_2|opt_3|opt_4|opt_5.\n"
-        "                        Currently implemented: kvmem_init, opt_1.\n"
+        "                        Currently implemented: kvmem_init, opt_1, opt_2.\n"
         "                        Default: kvmem_init.\n"
         "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
         "                        final user message (the question) instead of recency.\n"

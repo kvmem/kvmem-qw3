@@ -408,6 +408,35 @@ static void test_tier_metadata() {
     CHECK(s.blocks()[1].baked_pos == 0);
 }
 
+static void test_inclusive_tier_metadata() {
+    KvMemStoreConfig cfg;
+    cfg.optimization_level = KvMemOptimizationLevel::Opt2;
+    KvMemStore s(cfg);
+    s.register_append(128 * 2);
+
+    // First spill leaves both a CPU cache copy and clean SSD backing.
+    s.set_block_ssd_backing(1, 3, true);
+    s.set_block_tier(1, KvTier::CPU, 7, 3);
+    CHECK(s.blocks()[1].tier == KvTier::CPU);
+    CHECK(s.blocks()[1].cpu_slot == 7);
+    CHECK(s.blocks()[1].nvme_slot == 3);
+    CHECK(s.blocks()[1].ssd_clean);
+
+    // Promotion makes GPU active without discarding either clean copy.
+    s.set_block_tier(1, KvTier::GPU);
+    CHECK(s.blocks()[1].tier == KvTier::GPU);
+    CHECK(s.blocks()[1].cpu_slot == 7);
+    CHECK(s.blocks()[1].nvme_slot == 3);
+    CHECK(s.blocks()[1].ssd_clean);
+
+    // A CPU-cache eviction must not change active GPU residency.
+    s.set_block_cpu_copy(1, -1);
+    CHECK(s.blocks()[1].tier == KvTier::GPU);
+    CHECK(s.blocks()[1].cpu_slot == -1);
+    CHECK(s.blocks()[1].nvme_slot == 3);
+    CHECK(s.blocks()[1].ssd_clean);
+}
+
 static void test_truncate_to() {
     KvMemStoreConfig cfg; cfg.block_tokens = 128;
 
@@ -551,6 +580,7 @@ int main() {
     test_topk_all_fit();
     test_topk_empty();
     test_tier_metadata();
+    test_inclusive_tier_metadata();
     test_truncate_to();
     test_deltanet_config_and_scores();
 

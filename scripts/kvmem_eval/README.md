@@ -32,10 +32,13 @@ python3 scripts/kvmem_eval/run_kvmem_eval.py \
 
 `kvmem_init` is the frozen compatibility path. `opt_1` changes only CPU-tier
 cache admission: blocks repeatedly selected by semantic retrieval are retained
-ahead of one-pass streaming blocks. It does not change retrieval scores,
-selected block IDs, KV values, or model outputs when the same blocks are
-resident. `opt_2` through `opt_5` are reserved rollout levels and are rejected
-until their implementations are complete.
+ahead of one-pass streaming blocks. `opt_2` adds the synchronous inclusive-SSD
+reference path: once a block has a clean SSD record, GPU and CPU promotions no
+longer delete it, and a later stage-out can release GPU pages without repeating
+D2H or disk writes. It requires an NVMe arena large enough for one spill record
+per possible context block. These profiles do not change retrieval scores,
+selected block IDs, or KV values. `opt_3` through `opt_5` are reserved rollout
+levels and are rejected until their implementations are complete.
 
 The frozen ten-sample query-replay launcher accepts the same switch:
 
@@ -49,7 +52,10 @@ KVMEM_OPT_LEVEL=opt_1 TAG=query_replay_opt1 \
 
 Use `QW3_KVMEM_PERF_TRACE=1` for timed reselection stages. In `opt_1`, the
 server also emits `[kvmem-cache]` rows containing incoming CPU hit rate,
-admissions, rejected admissions, and evictions.
+admissions, rejected admissions, and evictions. In `opt_2`,
+`stage_out_clean_blocks` and `stage_out_clean_avoided_gib` quantify reuse of
+inclusive SSD backing. The first write remains synchronous in this reference
+level; asynchronous prefill write-through belongs to the next level.
 
 ## Inspect a configuration
 

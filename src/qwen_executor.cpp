@@ -77,6 +77,18 @@ bool paged_kv_prefill_for_local_cache_enabled() {
     return env_flag_enabled("QW3_PAGED_KV_PREFILL", true);
 }
 
+const char *kvmem_optimization_level_name(KvMemOptimizationLevel level) {
+    switch (level) {
+        case KvMemOptimizationLevel::KvmemInit: return "kvmem_init";
+        case KvMemOptimizationLevel::Opt1: return "opt_1";
+        case KvMemOptimizationLevel::Opt2: return "opt_2";
+        case KvMemOptimizationLevel::Opt3: return "opt_3";
+        case KvMemOptimizationLevel::Opt4: return "opt_4";
+        case KvMemOptimizationLevel::Opt5: return "opt_5";
+    }
+    return "unknown";
+}
+
 // Diagnostic-only guardrail for finding every execution path that feeds a
 // position outside the model's trained RoPE range into a RoPE/de-RoPE kernel.
 // It deliberately does not fail or change the position: the point of
@@ -1283,18 +1295,43 @@ void QwenExecutor::kvmem_evict_cpu_for_raw(uint64_t bytes) {
         }
         const uint64_t victim_bytes =
             kvmem_block_spill_bytes(block_store_->blocks()[victim]);
-        kvmem_nvme_tier_->write_block(victim, src, victim_bytes);
-        block_store_->set_block_tier(
-            victim, KvTier::SSD, -1,
-            kvmem_nvme_tier_->block_slot(victim));
+        const bool inclusive =
+            block_store_->config().optimization_level >=
+            KvMemOptimizationLevel::Opt2;
+        const KvMemBlock &victim_block = block_store_->blocks()[victim];
+        const bool clean_backing =
+            inclusive && victim_block.ssd_clean &&
+            victim_block.nvme_slot >= 0 &&
+            kvmem_nvme_tier_->block_slot(victim) ==
+                victim_block.nvme_slot;
+        if (!clean_backing) {
+            kvmem_nvme_tier_->write_block(victim, src, victim_bytes);
+            if (inclusive) {
+                block_store_->set_block_ssd_backing(
+                    victim, kvmem_nvme_tier_->block_slot(victim), true);
+            }
+        }
         kvmem_cpu_tier_->release_block(victim);
         kvmem_release_cpu_slot(slot);
+        if (inclusive) {
+            block_store_->set_block_cpu_copy(victim, -1);
+            if (!kvmem_block_pages_resident(victim_block)) {
+                block_store_->set_block_tier(
+                    victim, KvTier::SSD, -1,
+                    kvmem_nvme_tier_->block_slot(victim));
+            }
+        } else {
+            block_store_->set_block_tier(
+                victim, KvTier::SSD, -1,
+                kvmem_nvme_tier_->block_slot(victim));
+        }
         if (kvmem_tier_trace_enabled()) {
             std::fprintf(
                 stderr,
                 "[kvmem-tier] raw_k_budget_evict block=%u to=nvme "
+                "ssd_write=%d "
                 "raw_bytes=%llu cpu_spill_bytes=%llu budget_bytes=%llu\n",
-                victim,
+                victim, clean_backing ? 0 : 1,
                 static_cast<unsigned long long>(
                     kvmem_raw_k_mirror_bytes_ +
                     kvmem_raw_mtp_k_mirror_bytes_),
@@ -4137,11 +4174,18 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             "of the KV page size (" + std::to_string(page_size) + ")");
     }
     KvMemStoreConfig effective = cfg;
-    if (effective.optimization_level > KvMemOptimizationLevel::Opt1) {
+    if (effective.optimization_level > KvMemOptimizationLevel::Opt2) {
         throw std::runtime_error(
             "--kvmem-optimization-level requests an optimization level that "
             "is reserved but not implemented in this build; use kvmem_init or "
-            "opt_1");
+            "opt_1 or opt_2");
+    }
+    if (effective.optimization_level >= KvMemOptimizationLevel::Opt2 &&
+        (effective.nvme_tier_bytes == 0 ||
+         effective.nvme_tier_dir.empty())) {
+        throw std::runtime_error(
+            "KVMem opt_2 inclusive backing requires --kvmem-nvme-dir and "
+            "a positive --kvmem-nvme-gb");
     }
     // Immutable source K is the default. The legacy environment override is
     // still tri-state: an explicit false value disables it just like the CLI
@@ -4149,6 +4193,12 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_immutable_source_k_ = env_flag_enabled(
         "QW3_KVMEM_IMMUTABLE_SOURCE_K", effective.immutable_source_k);
     effective.immutable_source_k = kvmem_immutable_source_k_;
+    if (effective.optimization_level >= KvMemOptimizationLevel::Opt2 &&
+        !kvmem_immutable_source_k_) {
+        throw std::runtime_error(
+            "KVMem opt_2 inclusive clean backing requires immutable raw K; "
+            "remove --no-kvmem-immutable-k");
+    }
     const char *kvmem_kv_dtype = std::getenv("QW3_KV_DTYPE");
     if (!kvmem_immutable_source_k_ && kvmem_kv_dtype &&
         std::strcmp(kvmem_kv_dtype, "fp8") == 0) {
@@ -4641,11 +4691,12 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     std::fprintf(
         stderr,
         "[kvmem-opt] level=%s cpu_cache_policy=%s "
-        "implemented_max=opt_1\n",
-        effective.optimization_level == KvMemOptimizationLevel::Opt1
-            ? "opt_1" : "kvmem_init",
+        "ssd_backing=%s implemented_max=opt_2\n",
+        kvmem_optimization_level_name(effective.optimization_level),
         effective.optimization_level >= KvMemOptimizationLevel::Opt1
-            ? "heat-aware" : "legacy-lru");
+            ? "heat-aware" : "legacy-lru",
+        effective.optimization_level >= KvMemOptimizationLevel::Opt2
+            ? "inclusive-sync" : "exclusive");
     if (effective.nvme_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
         if (effective.nvme_tier_dir.empty()) {
             throw std::runtime_error(
@@ -4685,8 +4736,13 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 : 0;
         const uint64_t nvme_slots =
             kvmem_nvme_tier_ ? kvmem_nvme_tier_->slot_count() : 0;
-        const uint64_t spill_have_blocks = cpu_slots + nvme_slots;
-        if (spill_have_blocks < spill_needed_blocks) {
+        const bool inclusive =
+            effective.optimization_level >= KvMemOptimizationLevel::Opt2;
+        const uint64_t required_blocks =
+            inclusive ? cap_ctx_blocks : spill_needed_blocks;
+        const uint64_t available_blocks =
+            inclusive ? nvme_slots : cpu_slots + nvme_slots;
+        if (available_blocks < required_blocks) {
             auto gib = [&](uint64_t blocks) {
                 char buf[32];
                 const double v =
@@ -4696,14 +4752,25 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 std::snprintf(buf, sizeof(buf), "%.2f", v);
                 return std::string(buf);
             };
+            if (inclusive) {
+                throw std::runtime_error(
+                    "kvmem: opt_2 inclusive SSD backing is too small. A "
+                    "prompt near --ctx can create " +
+                    std::to_string(cap_ctx_blocks) + " blocks (" +
+                    gib(cap_ctx_blocks) +
+                    " GiB of spill records), but NVMe provides only " +
+                    std::to_string(nvme_slots) + " slots (" +
+                    gib(nvme_slots) +
+                    " GiB). Raise --kvmem-nvme-gb or lower --ctx.");
+            }
             throw std::runtime_error(
                 "kvmem: spill tiers too small for the bounded GPU pool. A prompt "
                 "near --ctx (" + std::to_string(cap_ctx_blocks) + " blocks) would "
                 "spill up to " + std::to_string(spill_needed_blocks) + " blocks (" +
                 gib(spill_needed_blocks) + " GiB) into CPU+NVMe beyond the " +
                 std::to_string(cap_budget_blocks) + "-block GPU selection budget, "
-                "but only " + std::to_string(spill_have_blocks) + " spill slots (" +
-                gib(spill_have_blocks) + " GiB: cpu=" + std::to_string(cpu_slots) +
+                "but only " + std::to_string(available_blocks) + " spill slots (" +
+                gib(available_blocks) + " GiB: cpu=" + std::to_string(cpu_slots) +
                 " + nvme=" + std::to_string(nvme_slots) + ") are configured. A long "
                 "query-conditioned prefill would exhaust the GPU page pool. Raise "
                 "--kvmem-cpu-gb and/or add --kvmem-nvme-dir + --kvmem-nvme-gb, or "
@@ -5464,14 +5531,21 @@ void QwenExecutor::kvmem_finish_prefetch() {
             }
         }
         staged = static_cast<uint32_t>(kvmem_prefetch_.blocks.size());
+        const bool inclusive =
+            block_store_->config().optimization_level >=
+            KvMemOptimizationLevel::Opt2;
         for (const KvMemPrefetchBlock &pb : kvmem_prefetch_.blocks) {
             if (pb.from == KvTier::CPU && kvmem_cpu_tier_) {
-                const int32_t slot =
-                    kvmem_cpu_tier_->block_slot(pb.block_id);
-                kvmem_cpu_tier_->release_block(pb.block_id);
-                kvmem_release_cpu_slot(slot);
+                if (!inclusive) {
+                    const int32_t slot =
+                        kvmem_cpu_tier_->block_slot(pb.block_id);
+                    kvmem_cpu_tier_->release_block(pb.block_id);
+                    kvmem_release_cpu_slot(slot);
+                }
             } else if (pb.from == KvTier::SSD && kvmem_nvme_tier_) {
-                kvmem_nvme_tier_->release_block(pb.block_id);
+                if (!inclusive) {
+                    kvmem_nvme_tier_->release_block(pb.block_id);
+                }
             }
             block_store_->set_block_tier(pb.block_id, KvTier::GPU);
         }
@@ -5502,11 +5576,69 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
     const uint64_t t_out0 = tm ? kvmem_steady_ns() : 0;
     uint32_t staged_out = 0;
     const auto &blocks = block_store_->blocks();
+    const bool inclusive =
+        block_store_->config().optimization_level >=
+        KvMemOptimizationLevel::Opt2;
+    auto release_gpu_pages = [&](const KvMemBlock &block) {
+        const uint32_t page_size = kv_pages_.page_size;
+        const uint32_t first_page = block.orig_pos_start / page_size;
+        const uint32_t last_page =
+            (block.orig_pos_start + block.n_tokens - 1) / page_size;
+        kv_pages_.release_logical_pages(
+            backend_, first_page, last_page - first_page + 1);
+        if (kvmem_mtp_tiered_) {
+            mtp_kv_pages_.release_logical_pages(
+                backend_, first_page, last_page - first_page + 1);
+        }
+        return last_page - first_page + 1;
+    };
     for (uint32_t block_id : block_ids) {
         if (block_id >= blocks.size()) continue;
         const KvMemBlock &block = blocks[block_id];
         if (!kvmem_block_pages_resident(block)) continue;
         const uint64_t src_bytes = kvmem_block_spill_bytes(block);
+        if (inclusive && block.ssd_clean) {
+            if (!kvmem_nvme_tier_ || block.nvme_slot < 0 ||
+                kvmem_nvme_tier_->block_slot(block_id) != block.nvme_slot) {
+                throw std::runtime_error(
+                    "KVMem opt_2 block is marked SSD-clean without matching "
+                    "inclusive backing");
+            }
+            int32_t cpu_slot = -1;
+            if (kvmem_cpu_tier_) {
+                const int32_t cached =
+                    kvmem_cpu_tier_->block_slot(block_id);
+                if (cached >= 0 && kvmem_cpu_slot_data(cached)) {
+                    cpu_slot = cached;
+                }
+            }
+            const uint32_t released_pages = release_gpu_pages(block);
+            block_store_->set_block_tier(
+                block_id, cpu_slot >= 0 ? KvTier::CPU : KvTier::SSD,
+                cpu_slot, block.nvme_slot);
+            ++staged_out;
+            if (perf_trace) {
+                ++kvmem_last_stage_out_perf_.blocks;
+                ++kvmem_last_stage_out_perf_.clean_blocks;
+                kvmem_last_stage_out_perf_.clean_bytes_avoided += src_bytes;
+                if (cpu_slot >= 0) {
+                    ++kvmem_last_stage_out_perf_.cpu_blocks;
+                } else {
+                    ++kvmem_last_stage_out_perf_.nvme_blocks;
+                }
+            }
+            if (kvmem_tier_trace_enabled()) {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-tier] stage_out_clean block=%u to=%s "
+                    "cpu_slot=%d nvme_slot=%d avoided_bytes=%llu pages=%u\n",
+                    block_id, cpu_slot >= 0 ? "cpu" : "nvme", cpu_slot,
+                    block.nvme_slot,
+                    static_cast<unsigned long long>(src_bytes),
+                    released_pages);
+            }
+            continue;
+        }
         // D2H into pinned host memory so the block's K/V page copies queue
         // asynchronously on the copy stream (a pageable buffer would serialize
         // them through the driver's bounce buffer).
@@ -5533,6 +5665,23 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
         bool placed = false;
         int32_t cpu_slot = -1;
         int32_t nvme_slot = -1;
+        if (inclusive) {
+            if (!kvmem_nvme_tier_) {
+                throw std::runtime_error(
+                    "KVMem opt_2 inclusive SSD backing requires an enabled "
+                    "NVMe tier");
+            }
+            const uint64_t t_nvme0 =
+                perf_trace ? kvmem_steady_ns() : 0;
+            kvmem_nvme_tier_->write_block(block_id, src, src_bytes);
+            if (perf_trace) {
+                kvmem_last_stage_out_perf_.nvme_write_ns +=
+                    kvmem_steady_ns() - t_nvme0;
+            }
+            nvme_slot = kvmem_nvme_tier_->block_slot(block_id);
+            block_store_->set_block_ssd_backing(
+                block_id, nvme_slot, true);
+        }
         if (kvmem_cpu_tier_) {
             PinnedSlotPlacement placement;
             if (kvmem_sparse_cpu_tier_) {
@@ -5571,23 +5720,50 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                         throw std::runtime_error(
                             "KVMem CPU eviction lost its slot backing");
                     }
-                    const uint64_t t_nvme0 =
-                        perf_trace ? kvmem_steady_ns() : 0;
-                    kvmem_nvme_tier_->write_block(
-                        victim, victim_src, victim_bytes);
-                    if (perf_trace) {
-                        kvmem_last_stage_out_perf_.nvme_write_ns +=
-                            kvmem_steady_ns() - t_nvme0;
+                    const KvMemBlock &victim_block = blocks[victim];
+                    const bool victim_clean =
+                        inclusive && victim_block.ssd_clean &&
+                        victim_block.nvme_slot >= 0 &&
+                        kvmem_nvme_tier_->block_slot(victim) ==
+                            victim_block.nvme_slot;
+                    if (!victim_clean) {
+                        const uint64_t t_nvme0 =
+                            perf_trace ? kvmem_steady_ns() : 0;
+                        kvmem_nvme_tier_->write_block(
+                            victim, victim_src, victim_bytes);
+                        if (perf_trace) {
+                            kvmem_last_stage_out_perf_.nvme_write_ns +=
+                                kvmem_steady_ns() - t_nvme0;
+                        }
+                        if (inclusive) {
+                            block_store_->set_block_ssd_backing(
+                                victim,
+                                kvmem_nvme_tier_->block_slot(victim), true);
+                        }
                     }
                     if (kvmem_tier_trace_enabled()) {
                         std::fprintf(stderr,
-                                     "[kvmem-tier] cpu_evict block=%u to=nvme slot=%d bytes=%llu\n",
+                                     "[kvmem-tier] cpu_evict block=%u to=nvme "
+                                     "slot=%d bytes=%llu ssd_write=%d\n",
                                      victim, kvmem_nvme_tier_->block_slot(victim),
-                                     static_cast<unsigned long long>(victim_bytes));
+                                     static_cast<unsigned long long>(victim_bytes),
+                                     victim_clean ? 0 : 1);
                     }
-                    block_store_->set_block_tier(
-                        victim, KvTier::SSD, -1,
-                        kvmem_nvme_tier_->block_slot(victim));
+                    if (inclusive) {
+                        block_store_->set_block_cpu_copy(victim, -1);
+                        if (kvmem_block_pages_resident(victim_block)) {
+                            block_store_->set_block_tier(
+                                victim, KvTier::GPU);
+                        } else {
+                            block_store_->set_block_tier(
+                                victim, KvTier::SSD, -1,
+                                kvmem_nvme_tier_->block_slot(victim));
+                        }
+                    } else {
+                        block_store_->set_block_tier(
+                            victim, KvTier::SSD, -1,
+                            kvmem_nvme_tier_->block_slot(victim));
+                    }
                 }
                 uint8_t *dst = kvmem_cpu_slot_data(placement.slot);
                 if (!dst) {
@@ -5606,12 +5782,14 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
             }
         }
         if (!placed && kvmem_nvme_tier_) {
-            const uint64_t t_nvme0 =
-                perf_trace ? kvmem_steady_ns() : 0;
-            kvmem_nvme_tier_->write_block(block_id, src, src_bytes);
-            if (perf_trace) {
-                kvmem_last_stage_out_perf_.nvme_write_ns +=
-                    kvmem_steady_ns() - t_nvme0;
+            if (!inclusive) {
+                const uint64_t t_nvme0 =
+                    perf_trace ? kvmem_steady_ns() : 0;
+                kvmem_nvme_tier_->write_block(block_id, src, src_bytes);
+                if (perf_trace) {
+                    kvmem_last_stage_out_perf_.nvme_write_ns +=
+                        kvmem_steady_ns() - t_nvme0;
+                }
             }
             placed = true;
             nvme_slot = kvmem_nvme_tier_->block_slot(block_id);
@@ -5645,16 +5823,7 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                 ++kvmem_last_stage_out_perf_.nvme_blocks;
             }
         }
-        const uint32_t page_size = kv_pages_.page_size;
-        const uint32_t first_page = block.orig_pos_start / page_size;
-        const uint32_t last_page =
-            (block.orig_pos_start + block.n_tokens - 1) / page_size;
-        kv_pages_.release_logical_pages(backend_, first_page,
-                                        last_page - first_page + 1);
-        if (kvmem_mtp_tiered_) {
-            mtp_kv_pages_.release_logical_pages(backend_, first_page,
-                                                last_page - first_page + 1);
-        }
+        const uint32_t released_pages = release_gpu_pages(block);
         block_store_->set_block_tier(
             block_id, cpu_slot >= 0 ? KvTier::CPU : KvTier::SSD,
             cpu_slot, nvme_slot);
@@ -5664,7 +5833,7 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                          block_id, cpu_slot >= 0 ? "cpu" : "nvme",
                          cpu_slot >= 0 ? cpu_slot : nvme_slot,
                          static_cast<unsigned long long>(src_bytes),
-                         last_page - first_page + 1);
+                         released_pages);
         }
     }
     if (perf_trace) {
@@ -6399,7 +6568,8 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             "selection_ms=%.3f stage_out_ms=%.3f "
             "stage_out_d2h_ms=%.3f stage_out_cpu_copy_ms=%.3f "
             "stage_out_disk_write_ms=%.3f stage_out_blocks=%u "
-            "stage_out_gib=%.3f "
+            "stage_out_gib=%.3f stage_out_clean_blocks=%u "
+            "stage_out_clean_avoided_gib=%.3f "
             "prefetch_submit_ms=%.3f overlap_gap_ms=%.3f "
             "prefetch_finish_ms=%.3f stage_in_wall_ms=%.3f "
             "cpu_h2d_enqueue_ms=%.3f nvme_read_ms=%.3f "
@@ -6420,7 +6590,9 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             out.canonicalize_and_d2h_ns * ns_to_ms,
             out.cpu_copy_ns * ns_to_ms,
             out.nvme_write_ns * ns_to_ms, out.blocks,
-            out.bytes * bytes_to_gib, submit_ns * ns_to_ms,
+            out.bytes * bytes_to_gib, out.clean_blocks,
+            out.clean_bytes_avoided * bytes_to_gib,
+            submit_ns * ns_to_ms,
             overlap_gap_ns * ns_to_ms, finish_ns * ns_to_ms,
             stage_in_wall_ns * ns_to_ms,
             in.cpu_h2d_enqueue_ns * ns_to_ms,
@@ -6449,9 +6621,8 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
                 "incoming=%zu cpu_hits=%u ssd_misses=%u "
                 "incoming_cpu_hit_rate=%.6f selection_epochs=%llu "
                 "admissions=%llu admission_rejections=%llu evictions=%llu\n",
-                block_store_->config().optimization_level >=
-                        KvMemOptimizationLevel::Opt1
-                    ? "opt_1" : "kvmem_init",
+                kvmem_optimization_level_name(
+                    block_store_->config().optimization_level),
                 retained, incoming, in.cpu_blocks, in.nvme_blocks,
                 cpu_hit_rate,
                 static_cast<unsigned long long>(cache.selection_epochs),
@@ -6536,6 +6707,7 @@ uint32_t QwenExecutor::kvmem_set_selection(
             "stage_out=%zu selection_ms=%.3f stage_out_ms=%.3f "
             "stage_out_d2h_ms=%.3f stage_out_disk_write_ms=%.3f "
             "stage_out_blocks=%u stage_out_gib=%.3f "
+            "stage_out_clean_blocks=%u stage_out_clean_avoided_gib=%.3f "
             "prefetch_submit_ms=%.3f overlap_gap_ms=%.3f "
             "prefetch_finish_ms=%.3f cpu_h2d_enqueue_ms=%.3f "
             "nvme_read_ms=%.3f nvme_wait_ms=%.3f nvme_hidden_ms=%.3f "
@@ -6551,7 +6723,9 @@ uint32_t QwenExecutor::kvmem_set_selection(
             selection_ns * ns_to_ms, out.total_ns * ns_to_ms,
             out.canonicalize_and_d2h_ns * ns_to_ms,
             out.nvme_write_ns * ns_to_ms, out.blocks,
-            out.bytes * bytes_to_gib, submit_ns * ns_to_ms,
+            out.bytes * bytes_to_gib, out.clean_blocks,
+            out.clean_bytes_avoided * bytes_to_gib,
+            submit_ns * ns_to_ms,
             overlap_gap_ns * ns_to_ms, finish_ns * ns_to_ms,
             in.cpu_h2d_enqueue_ns * ns_to_ms,
             in.nvme_read_ns * ns_to_ms, in.nvme_wait_ns * ns_to_ms,
