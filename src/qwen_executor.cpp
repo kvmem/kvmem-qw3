@@ -14,6 +14,10 @@
 #include <stdexcept>
 #include <utility>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 namespace qw3 {
 namespace {
 
@@ -678,6 +682,9 @@ void QwenExecutor::reset_state() {
     mtp_window_pages_host_.clear();
     mtp_window_page_count_ = 0;
     window_query_pos_ = 0;
+    const uint64_t cold_reset_raw_bytes =
+        kvmem_raw_k_mirror_bytes_ + kvmem_raw_mtp_k_mirror_bytes_;
+    const uint64_t cold_reset_sparse_bytes = kvmem_cpu_sparse_bytes_;
     if (kvmem_cpu_tier_) kvmem_cpu_tier_->clear();
     if (kvmem_sparse_cpu_tier_) {
         for (auto &slot : kvmem_cpu_sparse_slots_) slot.reset();
@@ -703,6 +710,31 @@ void QwenExecutor::reset_state() {
               kvmem_raw_k_valid_tokens_.end(), uint8_t{0});
     std::fill(kvmem_raw_mtp_k_valid_tokens_.begin(),
               kvmem_raw_mtp_k_valid_tokens_.end(), uint8_t{0});
+#if defined(__GLIBC__)
+    // glibc can adapt its mmap threshold upward after these large, repeated
+    // allocations. Subsequent raw-K chunks / sparse spill blocks may then come
+    // from heap arenas; delete[] makes them reusable but does not necessarily
+    // return their pages to the OS. At a cold request boundary no KVMem host
+    // allocation is live, so trim those free arena pages now. This is not used
+    // by warm-prefix restore/truncate and therefore cannot discard reusable
+    // prefix state.
+    const int cold_reset_trimmed =
+        (cold_reset_raw_bytes != 0 || cold_reset_sparse_bytes != 0)
+            ? ::malloc_trim(0)
+            : 0;
+#else
+    const int cold_reset_trimmed = -1;
+#endif
+    if ((cold_reset_raw_bytes != 0 || cold_reset_sparse_bytes != 0) &&
+        kvmem_tier_trace_enabled()) {
+        std::fprintf(
+            stderr,
+            "[kvmem-tier] cold_reset_host_release raw_bytes=%llu "
+            "sparse_bytes=%llu allocator_trim=%d\n",
+            static_cast<unsigned long long>(cold_reset_raw_bytes),
+            static_cast<unsigned long long>(cold_reset_sparse_bytes),
+            cold_reset_trimmed);
+    }
     kvmem_raw_decode_block_start_ = -1;
     kvmem_raw_decode_first_row_ = 0;
     kvmem_raw_decode_rows_ = 0;
