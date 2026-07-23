@@ -3,8 +3,8 @@
 本文档记录 KVMem 当前仍未解决的问题，供后续实现、回归测试和实验解释使用。
 它只记录当前仍需处理的事项；已经修复的问题单独列在文末，避免重复诊断。
 
-- 快照日期：2026-07-21
-- 代码基线：`4a8c6f3`
+- 快照日期：2026-07-23
+- 代码基线：`7665d25` 之后的 immutable raw-K / MTP compact-position 工作树
 - 默认重点路径：`fp16 KV + query-conditioned mean-k + step update`
 - 状态约定：`OPEN` 表示尚未修复，`RESEARCH` 表示属于算法研究问题而非明确的实现错误，
   `LIMITATION` 表示已知但暂未支持的配置或性能限制。
@@ -22,8 +22,8 @@
 | --- | --- | --- | --- | --- |
 | KVMI-001 | P0 | Correctness/API | OPEN | 缺少完整的 context/query/control message 语义和硬保留机制 |
 | KVMI-002 | P1 | Correctness | OPEN | 多轮 prefix reuse 下 partial block 的 mean-key 索引可能过期或缺失 |
-| KVMI-003 | P1 | Correctness | OPEN | query span 跨越 prefix checkpoint 时不能完整重新捕获 |
-| KVMI-004 | P1 | Correctness/Observability | OPEN | scorer 失败时会静默 fallback，配置与实际执行可能不一致 |
+| KVMI-003 | P1 | Correctness | FIXED / RUNTIME VALIDATED | warm prefix checkpoint 受 query replay 边界约束，完整 query 可重新捕获 |
+| KVMI-004 | P1 | Correctness/Observability | IMPLEMENTED / PARTIAL RUNTIME VALIDATION | scorer fallback 已记录 requested/used/reason，成功与 missing-query 降级已实测 |
 | KVMI-005 | P1 | Scalability | OPEN | per-token ExactMass 仍有 shared-memory block 上限和不可接受的显存增长 |
 | KVMI-006 | P1 | Experiment integrity | OPEN | 默认测试二进制尚未包含最新 prefill-pressure 修复 |
 | KVMI-007 | P2 | Retrieval quality | RESEARCH | mean-k 会稀释和碎片化长 session 中的相关证据 |
@@ -31,13 +31,14 @@
 | KVMI-009 | P3 | Compatibility/Performance | LIMITATION | q8/fp8、layered MTP、同步 NVMe 写和 host selector 等限制 |
 | KVMI-010 | P3 | Documentation | OPEN | README 和部分方法文档仍描述已经删除的旧 CLI 语义 |
 | KVMI-011 | P0 | Correctness/Numerics | FIX PROTOTYPE | fp16 K 反复原地 re-RoPE 会累积漂移；immutable source K 正在真实样本验证 |
+| KVMI-011A | P0 | Correctness/Position | IMPLEMENTED / GPU VALIDATION PENDING | MTP logical position 与 compact RoPE position 已分离 |
 | KVMI-012 | P0 | Correctness/Hybrid state | RESEARCH | normal-attention blocks 重选后，DeltaNet recurrent state 仍来自原时间线 checkpoint |
 
 ## 2. Detailed Issues
 
 ### KVMI-001 — Message semantics and hard pinning
 
-**Status:** OPEN
+**Status:** IMPLEMENTED / PARTIAL RUNTIME VALIDATION
 **Priority:** P0
 
 当前 server 的自动策略是把最后一个普通 `user` message 的完整 content 当作 retrieval
@@ -116,27 +117,52 @@ block 均需达到数值一致性。
 
 ### KVMI-003 — Query span crossing a reused checkpoint
 
-**Status:** OPEN
+**Status:** FIXED / RUNTIME VALIDATED
 **Priority:** P1
 
-prefix reuse 只重新 prefill checkpoint `C` 之后的 suffix。当前 reuse 选择没有验证
-`C <= query_begin`。若新的显式 query span 完全位于 checkpoint 前，或横跨 checkpoint，
-prefix 中的 query rows 无法重新捕获，`g_query_multi_ready` 可能保持 false，随后进入较弱的
-fallback scorer。
+旧实现存在两个相互关联的问题：
+
+- prefix reuse 只重新 prefill checkpoint `C` 之后的 suffix，但 reuse 选择没有验证
+  checkpoint 是否早于 query；
+- warm reuse/capture 又被 query replay 的入口条件无条件排除，即使 checkpoint 足够早，
+  query 也不会在最终 semantic window 下重新计算。
+
+修复后先计算 query 的 block-aligned replay boundary
+`B = floor(query_begin / block_tokens) * block_tokens`，并把 checkpoint 选择约束为
+`C <= min(longest_common_prefix, B)`。若 P/M checkpoint 均晚于 B，则明确 cold prefill，
+因为 recurrent state 不能从较晚 checkpoint 反向恢复到 B。
+
+在满足 `C <= B` 后，warm reuse/capture 可以执行普通 query replay：
+
+```text
+restore C
+-> prefill [C,B)
+-> capture replay snapshot at B
+-> prefill [B,end) and select
+-> retain selected context, roll back to B
+-> replay [B,end)
+-> decode
+```
+
+warm prompt checkpoint P 和 replay boundary B 不再通过互斥 `else-if` 处理。若 `P <= B`，
+P 在第一次 prefill 时捕获；若 `P > B`，P 必须在最终 selected-context replay 中捕获，
+避免保存随后会被 replay 覆盖的 pressure-window 状态。plain 和 MTP 路径均执行相同规则。
+retrieval 前和 replay 后还会强校验 captured query token 数，禁止残缺 query 静默进入 scorer。
 
 正常的“在历史后新增一个独立短 user query”流程通常满足 `query_begin >= C`。2026-07-15
 的 30-sample last-user 测试中，30 次 prefix hit 的最终 query 均完整捕获；warm-up 和最终
 query 合计 60/60 次 `qcap ready`，server error 为 0。因此这是一个已确认的代码边界缺口，
 但不是当前标准实验协议中的高频问题。
 
-代码依据：`src/qwen_native_backend.cpp::kvmem_prefix_reuse`。
+2026-07-23 的单样本两轮 LongMemEval-S plain 与 MTP smoke 均覆盖了两类双边界时序：
 
-建议修复：只有在 `checkpoint <= query_begin` 时允许 reuse；否则选择不晚于 query begin
-的 checkpoint，若不存在则 cold prefill。未来若缓存 query rows，也必须按本次请求的 span
-identity 验证后才能复用。
+- 第一轮 `P > B`：首次 capture 为 12/12，最终 replay 为 12/12；
+- 第二轮 `P = B = 109408`：warm prefix 命中，首次 capture 与最终 replay 均为 51/51；
+- 两条生成路径的两轮 scorer 均为
+  `requested=mean-k used=mean-k fallback=0`。
 
-关闭条件：覆盖 query 完全在 suffix、完全在 prefix、横跨 P、横跨 M 四类测试，并验证
-scorer 实际使用完整 query token 数。
+代码依据：`src/qwen_native_backend.cpp::kvmem_prefix_reuse`、plain/MTP query replay
+prefill 分支，以及 `QwenExecutor::kvmem_query_capture_complete`。
 
 ### KVMI-004 — Silent scorer fallback
 
@@ -145,7 +171,7 @@ scorer 实际使用完整 query token 数。
 
 `kvmem_prepare_reselect` 在 query/index/kernel 不可用时，会从配置的 mean-k 或 per-token
 scorer 回退到 single last-token content scorer，再进一步依赖 window-local profile/recency。
-默认输出没有统一记录 requested scorer、actual scorer 和 fallback reason。
+旧默认输出没有统一记录 requested scorer、actual scorer 和 fallback reason。
 
 因此看到“reselection 被调用”或请求中配置了 `--kvmem-retrieval-method mean-k`，并不能单独
 证明 mean-k 确实完成了本次打分。q8/fp8 dtype、incomplete query capture、ExactMass shmem
@@ -157,22 +183,48 @@ cap、buffer 未 ready 或 kernel error 都可能改变实际 scorer。
 - `src/qwen_executor.cpp::kvmem_retrieval_score_mean_softmax`。
 - `src/qwen_executor.cpp::kvmem_retrieval_score_exactmass`。
 
-建议修复：每次 reselect 记录结构化字段：
+当前工作树已在每次 retrieval reselect 维护完整的 scorer 降级链：
 
 ```text
-scorer_requested
-scorer_used
-fallback_reason
-query_tokens_expected
-query_tokens_captured
+deltanet -> mean-k -> single-token-content -> window-profile
+mean-k/per-token -> single-token-content -> window-profile
+```
+
+每一级 scorer 都返回稳定的 failure reason code；backend kernel/copy 失败还附带经过
+单行规范化的 `DeviceStatus.message`。只要 requested/used 不同，server stderr 无条件输出
+一条 `[kvmem-scorer]`；成功事件仅在 `QW3_KVMEM_TRACE=1` 时输出，避免普通请求产生大量
+日志。记录字段为：
+
+```text
+requested
+used
+reason
+query_expected
+query_captured
+query_ready
 indexed_blocks
+source_blocks
 selected_blocks
 ```
 
-这些字段应进入 server log、timing/trace summary，并可选进入 API usage metadata。实验模式
-可提供 `QW3_KVMEM_REQUIRE_SCORER=mean-k`，一旦 scorer 不匹配就 fail-fast。
+启用 `QW3_KVMEM_DUMP_SCORES` 时，相同的 requested/used/reason 和 query capture 数也写入
+retrieval dump meta。全量 12 个 build tests 已通过。尚未完成的是构造真实 warm-crossing、
+kernel failure 和 ExactMass failure 请求，逐个验证日志 reason；API usage metadata 和
+`QW3_KVMEM_REQUIRE_SCORER=mean-k` fail-fast 仍是可选后续。
 
-关闭条件：所有 fallback 分支都有稳定 reason code，并有测试确认不会静默改变 scorer。
+2026-07-23 的 660-token/256-token-budget 本地 smoke 已覆盖两条运行时路径：
+
+```text
+[kvmem-scorer] ... requested=mean-k used=mean-k fallback=0 reason=none
+query_expected=12 query_captured=12 query_ready=1 indexed_blocks=21 ...
+
+[kvmem-scorer] ... requested=mean-k used=window-profile fallback=1
+reason=mean-k:query_span_missing,single-token-content:single_query_not_ready
+query_expected=0 query_captured=0 query_ready=0 ...
+```
+
+关闭条件：用真实请求覆盖 mean-k success、incomplete query、index unavailable、
+single-token failure 和 ExactMass kernel failure，确认每条降级只产生一个正确记录。
 
 ### KVMI-005 — ExactMass scalability
 
@@ -312,14 +364,12 @@ de-RoPE，再 RoPE 到新窗口位置。单次映射的误差很小，但 transc
 - 这项证据证明旧路径存在真实的数值漂移，但尚不能证明它是十个真实样本的唯一或主要
   准确率根因；不常被选中的 gold block 可能只经历很少映射。
 
-当前默认修复使用 immutable source K；`--no-kvmem-immutable-k` 保留旧原地路径用于
-消融，旧脚本也可使用 `QW3_KVMEM_IMMUTABLE_SOURCE_K=0|1` 覆盖。repository K 作为不可变
-source，每次 assembly 复制到额外 working K 后只做一次 source-frame -> window-frame
-映射；attention 读取 working K，tiering 原样保存 source K，V 仍为单副本。fp16 256K
-resident pool 额外占用约 8 GiB。为降低显存，开发分支已补齐 FP8 KVMem re-RoPE、
-window k-mean、attention-mass 与 content-k-mean CUDA 路径；配合 `--kv-dtype fp8` 时，
-额外 working K 约 4 GiB，source+working 每轮仍保持 one-shot deterministic。FP8 会引入
-一次性的量化误差，必须与 fp16 immutable 做真实样本准确率对照后才能设为推荐配置。
+当前默认修复已改为 immutable raw-K：标准层在 RoPE 前把 raw-K 保存到 CPU，GPU 仅保留
+一份活动 K/V。小幅重选继续做增量 re-RoPE；冷加载、累计 32 次旋转或累计位置位移达到
+262144 token 后，从 CPU raw-K 大块 H2D，并在 GPU 上 scatter + 一次 RoPE。标准层
+CPU/NVMe spill 只保存 V，去除了旧方案在 GPU 上额外的完整 working-K（fp16 256K
+约 8 GiB）。`--kvmem-cpu-gb` 现在包含 raw-K mirror；Qwen3.6-27B fp16 每 256K
+真实上下文约需 8 GiB CPU raw-K。
 
 若该修复不能恢复 gold-block-complete 的样本，下一根因应转向 source KV 的上下文构建
 质量（尤其是 pressure window 下构建的 hidden state）及 first-pass query 所依赖的上一轮
@@ -327,7 +377,7 @@ window k-mean、attention-mass 与 content-k-mean CUDA 路径；配合 `--kv-dty
 
 ### KVMI-011A — MTP prefix used out-of-range logical RoPE positions
 
-**Status:** GUARDED / COMPACT REBUILD OPEN
+**Status:** IMPLEMENTED / GPU VALIDATION PENDING
 **Priority:** P0
 
 目标模型在 KVMem pressure 后使用压缩到 256K 内的 attention window，但旧 MTP prefix
@@ -335,11 +385,32 @@ priming 仍按完整 trace 的逻辑位置写入 Q/K；1M trace 因而会让 MTP
 位置执行 RoPE，再尝试在最终 window assembly 中恢复。这不改变 target verifier 的理论
 正确性，但会降低 draft 质量，而且超范围 bake 不应被视为可靠、可逆的表示。
 
-当前保护策略是：KVMem 请求的 `logical_prompt + max_tokens` 可能超过 `n_ctx_train` 时，
-不再 prime/use MTP prefix，也不进入 continuous-MTP lane；decode 回退到 target model 的普通 windowed
-路径。executor 内还有第二层边界检查，防止遗漏调用源继续执行超范围 MTP RoPE。没有使用
-modulo/clamp，因为那会静默破坏相对位置。后续若要恢复超长请求的 speculative speedup，
-需要从最终 selected window 在紧凑位置重建 MTP prefix，而不是恢复超长位置的 MTP K。
+当前修复把 MTP 的两类位置显式分开：
+
+- logical position 仅用于完整 trace 的 token/page identity，可以达到 1M；
+- MTP Q/K 的 RoPE position 使用 target chunk 实际采用的 compact window 坐标，必须
+  小于 `n_ctx_train`。
+
+MTP prefix 在 RoPE 前捕获 raw-K，并按 logical token position 保存到 CPU。每次
+reselection 不再对已经旋转的 MTP K 做“超长位置 -> window position”的逆旋转，而是把
+selected raw-K 批量 H2D，在 `to_base` 上一次性 RoPE 并 scatter 到 MTP window pages。
+MTP 的 CPU/NVMe block record 因此只保存 V。prefill pressure stage-out 延迟到同一批
+MTP prefix capture 完成，避免 target KV 已写入、MTP KV 尚未写入时提前驱逐。
+
+decode reselection 的异步 prefetch 可能早于 accepted-token prefix rebuild 启动；修复后
+local-position 模式无条件恢复历史 MTP V，并把本次 prefetch 是否包含 MTP pages 固定到
+prefetch state，不再依赖短暂为假的 `mtp_prefix_len >= registered_pos`。否则 CPU tier
+的 V 会在 prepare 阶段被静默跳过，而 finish 阶段已经无法补载。
+
+executor 配置时要求 `kvmem_budget + gen_budget <= n_ctx_train`，backend 同时检查请求的
+`kvmem_budget + max_tokens`；query replay 的 pinned suffix 现在占用 Top-K 内部槽位，
+不再在完整 Top-K 之后追加并扩大 window。draft chain 还会按剩余 compact position
+动态截断。target prefill/verify/decode、MTP batch/single prime 和 raw materialization
+都有第二层范围检查。`QW3_KVMEM_MTP_LOCAL_POSITIONS=0` 可恢复旧路径做 A/B。没有使用
+logical position modulo/clamp。
+
+尚未完成的是正在占用 GPU 的旧 10-sample 实验结束后的 CUDA parity/smoke，以及
+LongMemEval-M frozen-10 的真实准确率复测；因此这里暂不标记为 CLOSED。
 
 ### KVMI-012 — Selected attention window and recurrent state describe different histories
 
@@ -435,6 +506,7 @@ LongMemEval-S 与默认 one-shot/multi-turn 回归。
 | mean-k scorer 超过 8192 blocks 后 fallback | 已新增 exact tiled two-dot path；8192/8193 CUDA parity tests 已覆盖 |
 | `recent_blocks=0` 隐式保留 `budget/4` | 已修复；zero 现在表示不硬保留 suffix |
 | warm query 使用 suffix-relative/absolute 坐标混淆 | `716ee65` 已修复；标准 30-sample multi-turn 测试无 server error |
+| warm prefix 跳过 query replay / checkpoint 截断 query | checkpoint 现在满足 `C <= B`；plain/MTP warm replay 已接通并完成真实两轮 smoke |
 | 旧 warm-query CUDA illegal memory access | 修复 query absolute-coordinate capture 后未在标准协议中复现 |
 | prefill pressure 受上一轮 semantic selection 影响 | `119ce05` 源代码已修复；canonical binary 更新另由 KVMI-006 跟踪 |
 | large-context CUDA garbage output | 已修复并记录于 `docs/BUG_SUMMARY_large_ctx_garbage.md` |
@@ -451,14 +523,15 @@ LongMemEval-S 与默认 one-shot/multi-turn 回归。
   capture ready、60 次 mean-k scoring、0 server errors；aggregate accuracy 25/30 = 83.33%，
   与 one-shot 25/30 相同，但逐样本结果并非完全一致。
 - 上述测试没有覆盖 KVMI-001 的通用 message pinning、KVMI-002 的所有 misalignment、
-  KVMI-003 的跨 checkpoint query 和 KVMI-005 的大规模 ExactMass。
+  KVMI-003 中 checkpoint 晚于 B 时的完整 cold-output parity，或 KVMI-005 的大规模
+  ExactMass。KVMI-003 的 boundary picker 已由编译期用例覆盖，真实 smoke 覆盖 P>B 和 P=B。
 
 ## 5. Recommended Implementation Order
 
 1. **KVMI-011 + KVMI-012**：完成 frozen LongMemEval-M KV-construction/recurrent-state
    A/B，收敛不需要全量 selected-token prefill 的正确构建路径。
 2. **KVMI-001**：实现 message-aware query/context/pin 语义和 hard-pin invariant。
-3. **KVMI-002 + KVMI-003**：修复 warm continuation 的 partial-block index 和 checkpoint guard。
+3. **KVMI-002**：修复 warm continuation 的 partial-block mean-key index。
 4. **KVMI-004**：让每次 scorer/fallback 可验证，并为实验提供 require-scorer 模式。
 5. **KVMI-006**：更新 canonical binary 和实验 provenance。
 6. **KVMI-007**：实现 neighbor/session/header-aware retrieval，并先做 oracle 分解。

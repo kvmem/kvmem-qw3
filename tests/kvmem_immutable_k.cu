@@ -1,11 +1,10 @@
-// Immutable-source K construction regression.
+// Immutable raw-K construction regression.
 //
 // A long transcript can reselect the same fp16 block thousands of times.  The
 // legacy in-place recipe repeatedly applies inverse/forward RoPE to the rounded
-// result.  The immutable recipe copies source K into working K and applies
-// exactly one source-frame -> window-frame transform on every assembly.  This
-// test exercises 1800 changing selections and requires the final working bytes
-// to be identical to a single direct materialization from source.
+// result. The raw-K recipe periodically rebuilds the single active GPU K from
+// an unrotated CPU mirror. This test covers both the new raw scatter+RoPE
+// primitive and the drift that motivates periodic refresh.
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -42,6 +41,14 @@ bool launch_rope_block_remap_paged_fp8(void *cache,
                                        uint32_t page_size,
                                        float theta,
                                        cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
 }
 
 #define CUDA_CHECK(call) do {                                             \
@@ -99,6 +106,31 @@ __global__ void bake_to_fp8(const float *raw, __nv_fp8_e4m3 *out,
         v = i < half ? x0 * c - x1 * s : x0 * s + x1 * c;
     }
     out[off + i] = __nv_fp8_e4m3(v);
+}
+
+__global__ void bake_half_to_half(const __half *raw, __half *out,
+                                  uint32_t rows, uint32_t heads,
+                                  uint32_t head_dim, uint32_t rope_dim,
+                                  int32_t base_pos, float theta) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t i = threadIdx.x;
+    const uint32_t half = rope_dim / 2;
+    if (row >= rows || head >= heads || i >= head_dim) return;
+    const uint64_t off =
+        (static_cast<uint64_t>(row) * heads + head) * head_dim;
+    float v = __half2float(raw[off + i]);
+    if (i < rope_dim) {
+        const uint32_t pair = i < half ? i : i - half;
+        const float x0 = __half2float(raw[off + pair]);
+        const float x1 = __half2float(raw[off + pair + half]);
+        const float inv =
+            __powf(theta, -2.0f * float(pair) / float(rope_dim));
+        float s, c;
+        __sincosf(float(base_pos + int32_t(row)) * inv, &s, &c);
+        v = i < half ? x0 * c - x1 * s : x0 * s + x1 * c;
+    }
+    out[off + i] = __float2half(v);
 }
 
 static void remap(__half *cache, int32_t from, int32_t to,
@@ -169,6 +201,61 @@ int main() {
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_pages, pages, sizeof(pages),
                           cudaMemcpyHostToDevice));
+
+    // Packed unrotated fp16 raw K -> arbitrary paged window slot + one RoPE.
+    // The result must match a direct bake from the same rounded raw values.
+    __half *d_raw_half = nullptr, *d_scatter_cache = nullptr;
+    __half *d_scatter_ref = nullptr;
+    int32_t *d_pages4 = nullptr, *d_to = nullptr, *d_ntok = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_raw_half, bytes));
+    CUDA_CHECK(cudaMalloc(&d_scatter_cache, bytes * 2));
+    CUDA_CHECK(cudaMalloc(&d_scatter_ref, bytes));
+    CUDA_CHECK(cudaMalloc(&d_pages4, 4 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_to, sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_ntok, sizeof(int32_t)));
+    bake_to_half<<<dim3(rows, heads), head_dim>>>(
+        d_raw, d_raw_half, rows, heads, head_dim, /*rope_dim=*/0,
+        /*base_pos=*/0, theta);
+    const int32_t pages4[4] = {0, 1, 2, 3};
+    const int32_t scatter_to = 32;
+    const int32_t scatter_ntok = rows;
+    CUDA_CHECK(cudaMemcpy(d_pages4, pages4, sizeof(pages4),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_to, &scatter_to, sizeof(scatter_to),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ntok, &scatter_ntok, sizeof(scatter_ntok),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_scatter_cache, 0, bytes * 2));
+    if (!qw3::ported::launch_raw_k_scatter_rope_paged_batched(
+            d_scatter_cache, d_raw_half, true, 0, 1, rows, heads,
+            heads * head_dim, head_dim, rope_dim, d_to, d_ntok, d_pages4,
+            16, theta, 0)) {
+        std::fprintf(stderr, "raw K scatter launcher rejected test input\n");
+        return 1;
+    }
+    bake_half_to_half<<<dim3(rows, heads), head_dim>>>(
+        d_raw_half, d_scatter_ref, rows, heads, head_dim, rope_dim,
+        scatter_to, theta);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<__half> scatter_got(count), scatter_ref(count);
+    CUDA_CHECK(cudaMemcpy(scatter_got.data(), d_scatter_cache + count,
+                          bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scatter_ref.data(), d_scatter_ref, bytes,
+                          cudaMemcpyDeviceToHost));
+    if (std::memcmp(scatter_got.data(), scatter_ref.data(), bytes) != 0) {
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < count; ++i) {
+            max_abs = std::max(
+                max_abs,
+                std::fabs(__half2float(scatter_got[i]) -
+                          __half2float(scatter_ref[i])));
+        }
+        std::fprintf(stderr,
+                     "FAIL raw scatter differs from direct bake max_abs=%.8f\n",
+                     max_abs);
+        return 1;
+    }
+
     bake_to_half<<<dim3(rows, heads), head_dim>>>(
         d_raw, d_source, rows, heads, head_dim, rope_dim, source_base, theta);
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -281,6 +368,12 @@ int main() {
     cudaFree(d_work_fp8);
     cudaFree(d_source_fp8);
 
+    cudaFree(d_ntok);
+    cudaFree(d_to);
+    cudaFree(d_pages4);
+    cudaFree(d_scatter_ref);
+    cudaFree(d_scatter_cache);
+    cudaFree(d_raw_half);
     cudaFree(d_pages);
     cudaFree(d_legacy);
     cudaFree(d_reference);

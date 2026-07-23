@@ -1,6 +1,7 @@
 #include "qw3/kvmem_store.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace qw3 {
 
@@ -98,7 +99,13 @@ void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {
 void KvMemStore::record_block_rerope(uint32_t block_id, int64_t baked_pos) {
     if (block_id >= block_count()) return;
     KvMemBlock &block = blocks_[block_id];
-    if (block.baked_pos != baked_pos) ++block.remap_count;
+    if (block.baked_pos != baked_pos) {
+        ++block.remap_count;
+        const uint64_t delta = static_cast<uint64_t>(
+            block.baked_pos > baked_pos ? block.baked_pos - baked_pos
+                                        : baked_pos - block.baked_pos);
+        block.remap_abs_delta += delta;
+    }
     block.baked_pos = baked_pos;
 }
 
@@ -126,6 +133,11 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
 }
 
 std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
+    return pick_topk_blocks({});
+}
+
+std::vector<uint32_t> KvMemStore::pick_topk_blocks(
+        const std::vector<uint32_t> &mandatory_blocks) const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
@@ -151,6 +163,12 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
         if (id < n && !kept[id]) { kept[id] = true; ++kept_count; }
     };
     for (uint32_t i = 0; i < sink && kept_count < budget; ++i) keep(i);
+    for (uint32_t id : mandatory_blocks) keep(id);
+    if (kept_count > budget) {
+        throw std::runtime_error(
+            "KVMem mandatory selection plus sink blocks exceeds the "
+            "configured selection budget");
+    }
     for (uint32_t i = 0; i < recent && kept_count < budget; ++i) {
         keep(n - 1 - i);
     }
@@ -277,6 +295,7 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
     uint32_t window_pos = 0;
     for (uint32_t id : selected_ids) {
         KvMemBlock &b = blocks_[id];
+        const bool cold = b.tier != KvTier::GPU;
         if (!b.in_working_set) plan.stage_in.push_back(id);
 
         KvMemRemap rm;
@@ -285,13 +304,47 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
         rm.from_base = static_cast<int32_t>(b.baked_pos);   // de-rotate source
         rm.to_base = static_cast<int32_t>(window_pos);      // new window slot
         rm.skip = (b.baked_pos == static_cast<int64_t>(window_pos));
+        if (cfg_.immutable_source_k && !rm.skip) {
+            const uint64_t delta = static_cast<uint64_t>(
+                b.baked_pos > static_cast<int64_t>(window_pos)
+                    ? b.baked_pos - static_cast<int64_t>(window_pos)
+                    : static_cast<int64_t>(window_pos) - b.baked_pos);
+            const bool remap_limit =
+                cfg_.immutable_refresh_remaps > 0 &&
+                b.remap_count >= cfg_.immutable_refresh_remaps;
+            const bool delta_limit =
+                cfg_.immutable_refresh_abs_delta_tokens > 0 &&
+                (b.remap_abs_delta >=
+                     cfg_.immutable_refresh_abs_delta_tokens ||
+                 delta >= cfg_.immutable_refresh_abs_delta_tokens -
+                              std::min<uint64_t>(
+                                  b.remap_abs_delta,
+                                  cfg_.immutable_refresh_abs_delta_tokens));
+            const bool baked_out_of_range =
+                cfg_.immutable_max_baked_position > 0 &&
+                (b.baked_pos < 0 ||
+                 static_cast<uint64_t>(b.baked_pos) + b.n_tokens >
+                     cfg_.immutable_max_baked_position);
+            rm.raw_refresh =
+                cold || remap_limit || delta_limit || baked_out_of_range;
+        }
         plan.remaps.push_back(rm);
 
         b.in_working_set = true;
-        if (!cfg_.immutable_source_k) {
-            if (!rm.skip) ++b.remap_count;
-            b.baked_pos = static_cast<int64_t>(window_pos);
+        if (!rm.skip) {
+            const uint64_t delta = static_cast<uint64_t>(
+                b.baked_pos > static_cast<int64_t>(window_pos)
+                    ? b.baked_pos - static_cast<int64_t>(window_pos)
+                    : static_cast<int64_t>(window_pos) - b.baked_pos);
+            if (rm.raw_refresh) {
+                b.remap_count = 0;
+                b.remap_abs_delta = 0;
+            } else {
+                ++b.remap_count;
+                b.remap_abs_delta += delta;
+            }
         }
+        b.baked_pos = static_cast<int64_t>(window_pos);
         window_pos += b.n_tokens;
     }
     plan.total_window_tokens = window_pos;

@@ -225,6 +225,12 @@ def main() -> int:
             "QW3_PREFILL_FA2_NSPLIT": "1",
             "QW3_KVMEM_TIMING": "1",
             **(
+                {"QW3_KVMEM_PERF_TRACE":
+                 os.environ["QW3_KVMEM_PERF_TRACE"]}
+                if "QW3_KVMEM_PERF_TRACE" in os.environ
+                else {}
+            ),
+            **(
                 {"QW3_KVMEM_RECOMPUTE_QUERY": os.environ["QW3_KVMEM_RECOMPUTE_QUERY"]}
                 if "QW3_KVMEM_RECOMPUTE_QUERY" in os.environ
                 else {}

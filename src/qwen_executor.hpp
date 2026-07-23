@@ -218,8 +218,21 @@ public:
     NativeExecutorReport prime_mtp_prefix_from_last_batch(const std::vector<uint32_t> &tokens,
                                                           uint32_t base_position,
                                                           uint32_t batch_min_override = 0);
+    // KVMem long-context variant: logical_base_position identifies the
+    // append/page-table location, while rope_base_position is the compact
+    // selected-window coordinate used by MTP Q/K.  Keeping these separate is
+    // what prevents a million-token session from ever entering MTP RoPE.
+    NativeExecutorReport prime_mtp_prefix_from_last_batch_at(
+        const std::vector<uint32_t> &tokens,
+        uint32_t logical_base_position,
+        uint32_t rope_base_position,
+        uint32_t batch_min_override = 0);
     NativeExecutorReport prime_mtp_prefix_from_current(uint32_t token,
                                                        uint32_t base_position);
+    NativeExecutorReport prime_mtp_prefix_from_current_at(
+        uint32_t token,
+        uint32_t logical_position,
+        uint32_t rope_position);
     NativeExecutorReport replay_tokens_with_mtp_prefix(const std::vector<uint32_t> &tokens,
                                                        uint32_t base_position,
                                                        bool rebuild_prefix,
@@ -227,6 +240,32 @@ public:
                                                        uint64_t *prefix_ops = nullptr);
     void commit_mtp_prefix(uint32_t prefix_len);
     void commit_mtp_prefix_from_current_hidden(uint32_t prefix_len);
+    // MTP prefix construction happens immediately after the target-model
+    // chunk and needs that chunk's exact compact RoPE frame.
+    uint32_t last_forward_logical_base() const {
+        return last_forward_logical_base_;
+    }
+    uint32_t last_forward_rope_base() const {
+        return last_forward_rope_base_;
+    }
+    uint32_t last_forward_rows() const { return last_forward_rows_; }
+    bool kvmem_mtp_local_positions() const {
+        return kvmem_mtp_local_positions_;
+    }
+    // RoPE coordinate used by the most recently committed target token. The
+    // logical position may be far beyond the native context, while this value
+    // stays inside the current selected window.
+    uint32_t last_committed_rope_position() const {
+        if (kvmem_active_) {
+            return window_query_pos_ > 0 ? window_query_pos_ - 1 : 0;
+        }
+        return position_ > 0 ? position_ - 1 : 0;
+    }
+    // Pressure stage-out normally runs at the end of forward_n_tokens.  MTP
+    // prefix capture must run first so an evicted block never records an empty
+    // MTP tail.  These calls are inert outside bounded KVMem.
+    void kvmem_set_defer_prefill_pressure(bool enabled);
+    void kvmem_finish_deferred_prefill_pressure();
     StateSnapshot snapshot_state();
     void capture_state(StateSnapshot &snapshot);
     void restore_state(const StateSnapshot &snapshot);
@@ -319,6 +358,18 @@ public:
                               uint32_t prompt_tokens,
                               bool preserve_content_index = false,
                               bool capture_content_without_query = false); // before prefill
+    uint32_t kvmem_query_expected_tokens() const {
+        return kvmem_query_end_ > kvmem_query_begin_
+            ? kvmem_query_end_ - kvmem_query_begin_ : 0;
+    }
+    uint32_t kvmem_query_captured_tokens() const {
+        return g_query_multi_count_;
+    }
+    bool kvmem_query_capture_complete() const {
+        const uint32_t expected = kvmem_query_expected_tokens();
+        return expected > 0 && g_query_multi_ready_ &&
+            g_query_multi_count_ >= expected;
+    }
     // Publish the incrementally captured mean-K index for the CURRENT logical
     // prefix, even though the full teacher-forced transcript has not yet been
     // consumed. Used only by experimental transcript replay before an
@@ -387,6 +438,8 @@ public:
         bool     cpu_tier = false;
         uint64_t cpu_used_bytes = 0;
         uint64_t cpu_capacity_bytes = 0;
+        uint64_t cpu_raw_k_bytes = 0;
+        uint64_t cpu_spill_bytes = 0;
         bool     nvme_tier = false;
         uint64_t nvme_used_bytes = 0;
         uint64_t nvme_capacity_bytes = 0;
@@ -562,7 +615,6 @@ private:
     uint32_t kv_page_count() const { return kv_pages_.count(); }
     uint32_t kv_page_size() const { return kv_pages_.page_size; }
     DeviceTensor &k_cache(uint32_t layer);
-    DeviceTensor &working_k_cache(uint32_t layer);
     DeviceTensor &attention_k_cache(uint32_t layer);
     DeviceTensor &v_cache(uint32_t layer);
     DeviceTensor &mtp_k_cache();
@@ -648,11 +700,6 @@ private:
     std::unique_ptr<KvPhysicalPageAllocator> kvmem_gpu_page_pool_;
     std::vector<std::unique_ptr<DeviceTensor>> kvmem_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> kvmem_v_cache_storage_;
-    // Optional RoPE working copy.  Source K remains in kvmem_k_cache_storage_
-    // at the frame in which it was first constructed/tiered; attention reads
-    // this copy after a one-shot source->window materialization per assembly.
-    // V is position independent and therefore needs no duplicate.
-    std::vector<std::unique_ptr<DeviceTensor>> kvmem_work_k_cache_storage_;
     KvCacheStorage kvmem_kv_cache_view_;
     // Bounded GPU page pool for the MTP layer's KV, sibling of
     // kvmem_gpu_page_pool_. Engaged only on the single-request internal-MTP
@@ -693,6 +740,9 @@ private:
 
     uint32_t kv_ctx_size_ = 0;
     uint32_t position_ = 0;
+    uint32_t last_forward_logical_base_ = 0;
+    uint32_t last_forward_rope_base_ = 0;
+    uint32_t last_forward_rows_ = 0;
     int      prefill_chunk_override_ = -1;
     KvPageTable kv_pages_;
 
@@ -711,11 +761,13 @@ private:
     // window substitution. Cleared by reset_state().
     bool kvmem_active_ = false;
     bool kvmem_immutable_source_k_ = false;
+    bool kvmem_mtp_local_positions_ = false;
+    bool kvmem_defer_prefill_pressure_ = false;
+    uint32_t kvmem_deferred_prefill_tokens_ = 0;
     std::unique_ptr<KvMemStore> block_store_;
-    // Window page table: the selected blocks' ORIGINAL physical pages, in
-    // ascending (window) order. These alias kv_pages_ slots. In legacy mode
-    // re-RoPE rebakes source K in place; in immutable-source mode the same page
-    // indices address a separate working K tensor and source K is untouched.
+    // Window page table: selected blocks' physical pages in ascending order.
+    // There is exactly one GPU K/V copy; immutable mode bounds its re-RoPE
+    // drift with an authoritative unrotated CPU raw-K mirror.
     std::vector<int32_t> window_pages_host_;
     std::unique_ptr<DeviceTensor> window_pages_device_;
     uint32_t window_page_count_ = 0;
@@ -740,6 +792,49 @@ private:
     // through an internal bounce buffer, which was the dominant stage-out cost.
     // Lazily grown to one block.
     std::unique_ptr<HostBuffer> kvmem_stage_pinned_;
+    // Immutable-K v3: unrotated K is authoritative in demand-allocated,
+    // pageable CPU chunks. A chunk stores
+    // [standard_layer, token-within-chunk, per_pos]; this preserves the old
+    // layer-major semantics without reserving --ctx worth of physical RAM at
+    // configure time. GPU stores only the current active/window-baked K.
+    // Capture/materialization still use modest pinned bounce buffers.
+    uint32_t kvmem_raw_k_chunk_tokens_ = 2048;
+    std::vector<std::unique_ptr<uint8_t[]>> kvmem_raw_k_chunks_;
+    uint64_t kvmem_raw_k_mirror_bytes_ = 0;
+    uint64_t kvmem_raw_k_row_bytes_ = 0;
+    std::vector<uint8_t> kvmem_raw_k_valid_tokens_;
+    std::vector<uint32_t> kvmem_raw_layers_;
+    std::vector<int32_t> kvmem_raw_layer_slot_;
+    std::vector<std::unique_ptr<DeviceTensor>> kvmem_raw_capture_dev_;
+    uint32_t kvmem_raw_capture_rows_ = 0;
+    std::unique_ptr<HostBuffer> kvmem_raw_capture_host_;
+    std::unique_ptr<DeviceTensor> kvmem_raw_transfer_dev_;
+    std::unique_ptr<HostBuffer> kvmem_raw_transfer_host_;
+    uint32_t kvmem_raw_transfer_blocks_ = 0;
+    uint32_t kvmem_raw_transfer_block_cap_ = 128;
+    int64_t kvmem_raw_decode_block_start_ = -1;
+    uint32_t kvmem_raw_decode_first_row_ = 0;
+    uint32_t kvmem_raw_decode_rows_ = 0;
+    // The MTP head is one additional standard-attention layer.  In the
+    // long-context local-position path its unrotated K is authoritative here;
+    // the GPU MTP K cache is only a materialized selected-window view.  MTP V
+    // remains in the ordinary CPU/NVMe spill record because it has no RoPE.
+    std::vector<std::unique_ptr<uint8_t[]>> kvmem_raw_mtp_k_chunks_;
+    uint64_t kvmem_raw_mtp_k_mirror_bytes_ = 0;
+    std::vector<uint8_t> kvmem_raw_mtp_k_valid_tokens_;
+    std::unique_ptr<DeviceTensor> kvmem_raw_mtp_capture_dev_;
+    uint32_t kvmem_raw_mtp_capture_rows_ = 0;
+    std::unique_ptr<HostBuffer> kvmem_raw_mtp_capture_host_;
+    std::unique_ptr<DeviceTensor> kvmem_raw_mtp_transfer_dev_;
+    std::unique_ptr<HostBuffer> kvmem_raw_mtp_transfer_host_;
+    // Immutable mode shares one strict host-memory budget between the
+    // demand-allocated raw-K authority and a pageable, sparse CPU V cache.
+    // Long-lived pageable storage avoids pinning tens of GiB; bounded pinned
+    // staging is handled independently by the transfer path.
+    bool kvmem_sparse_cpu_tier_ = false;
+    uint64_t kvmem_cpu_budget_bytes_ = 0;
+    uint64_t kvmem_cpu_sparse_bytes_ = 0;
+    std::vector<std::unique_ptr<uint8_t[]>> kvmem_cpu_sparse_slots_;
     struct KvMemPrefetchBlock {
         uint32_t block_id = 0;
         KvTier from = KvTier::GPU;
@@ -749,14 +844,54 @@ private:
         uint64_t bytes = 0;
         std::vector<uint8_t> buffer;
     };
+    struct KvMemPrefetchPerf {
+        uint64_t start_enter_ns = 0;
+        uint64_t start_exit_ns = 0;
+        uint64_t finish_enter_ns = 0;
+        uint64_t finish_exit_ns = 0;
+        uint64_t cpu_h2d_enqueue_ns = 0;
+        uint64_t nvme_read_ns = 0;
+        uint64_t nvme_wait_ns = 0;
+        uint64_t nvme_h2d_enqueue_ns = 0;
+        uint64_t h2d_wait_ns = 0;
+        uint64_t cpu_bytes = 0;
+        uint64_t nvme_bytes = 0;
+        uint32_t cpu_blocks = 0;
+        uint32_t nvme_blocks = 0;
+    };
     struct KvMemPrefetchState {
         bool active = false;
         bool queued_h2d = false;
+        // Frozen when prefetch starts.  In local-position MTP mode historical
+        // V is an independently tiered source and must be restored even while
+        // the newest accepted-token MTP prefix is temporarily catching up.
+        bool stage_mtp_pages = false;
         std::vector<KvMemPrefetchBlock> blocks;
         std::vector<KvMemPrefetchNvmeRead> nvme_reads;
         std::future<void> nvme_future;
+        KvMemPrefetchPerf perf;
+    };
+    struct KvMemStageOutPerf {
+        uint64_t total_ns = 0;
+        uint64_t canonicalize_and_d2h_ns = 0;
+        uint64_t cpu_copy_ns = 0;
+        uint64_t nvme_write_ns = 0;
+        uint64_t bytes = 0;
+        uint32_t blocks = 0;
+        uint32_t cpu_blocks = 0;
+        uint32_t nvme_blocks = 0;
+    };
+    struct KvMemReselectPerf {
+        bool active = false;
+        uint64_t sequence = 0;
+        uint64_t start_ns = 0;
+        uint64_t selection_ns = 0;
+        uint64_t stage_out_ns = 0;
     };
     KvMemPrefetchState kvmem_prefetch_;
+    KvMemPrefetchPerf kvmem_last_prefetch_perf_;
+    KvMemStageOutPerf kvmem_last_stage_out_perf_;
+    KvMemReselectPerf kvmem_reselect_perf_;
     bool kvmem_pending_reselect_ = false;
     KvMemPlan kvmem_pending_plan_;
     // Attention query position within the assembled window (== sum of selected
@@ -777,6 +912,19 @@ private:
     uint8_t *kvmem_cpu_data();
     const uint8_t *kvmem_cpu_data() const;
     uint64_t kvmem_cpu_bytes() const;
+    uint8_t *kvmem_cpu_slot_data(int32_t slot);
+    const uint8_t *kvmem_cpu_slot_data(int32_t slot) const;
+    bool kvmem_cpu_budget_has(uint64_t bytes) const;
+    bool kvmem_reserve_cpu_slot(int32_t slot);
+    void kvmem_release_cpu_slot(int32_t slot);
+    void kvmem_evict_cpu_for_raw(uint64_t bytes);
+    void kvmem_ensure_raw_k_chunks(uint32_t base, uint32_t rows,
+                                   bool mtp);
+    void kvmem_write_raw_k(uint32_t layer_slot, uint32_t base,
+                           const uint8_t *src, uint32_t rows, bool mtp);
+    void kvmem_read_raw_k(uint32_t layer_slot, uint32_t base,
+                          uint8_t *dst, uint32_t rows, bool mtp) const;
+    void kvmem_truncate_raw_k(uint32_t token_pos);
     void kvmem_canonicalize_block_for_tier(uint32_t block_id);
     // Grow mtp_baked_pos_ to cover every registered block, initializing new
     // entries to their true (canonical) first position. No-op unless the MTP
@@ -793,10 +941,12 @@ private:
     // (grows if needed). Returns the buffer base pointer.
     uint8_t *kvmem_ensure_stage_pinned(uint64_t bytes);
     void kvmem_copy_block_from_host(const KvMemBlock &block,
-                                    const std::vector<uint8_t> &src);
+                                    const std::vector<uint8_t> &src,
+                                    bool stage_mtp_pages);
     void kvmem_copy_block_from_host(const KvMemBlock &block,
                                     const void *src,
-                                    uint64_t bytes);
+                                    uint64_t bytes,
+                                    bool stage_mtp_pages);
     void sync_window_pages_device(uint32_t have_pages);
     void sync_mtp_window_pages_device(uint32_t have_pages);
     // Grow the window page table by the trailing physical page so a decode
@@ -813,6 +963,30 @@ private:
     void kvmem_extend_mtp_window_for_decode_n(uint32_t n,
                                               uint32_t true_base_pos);
     void kvmem_register_until(uint32_t target_pos);
+    std::unique_ptr<DeviceTensor> kvmem_alloc_raw_k_tensor(
+        uint64_t count, const char *label);
+    // Mean-K is a persistent derivative of the KV cache, so store it at the
+    // same precision as K (fp16/fp8/fp32) instead of unconditionally expanding
+    // it to fp32. Accumulation in the builders/scorers remains fp32.
+    std::unique_ptr<DeviceTensor> kvmem_alloc_mean_index_tensor(
+        uint64_t count, const char *label);
+    void kvmem_ensure_raw_capture_capacity(uint32_t rows);
+    void kvmem_capture_raw_k_batch(uint32_t layer, const DeviceTensor &raw_k,
+                                   uint32_t batch);
+    void kvmem_capture_raw_k_decode(uint32_t layer,
+                                    const DeviceTensor &raw_k,
+                                    uint32_t row);
+    void kvmem_flush_raw_k_capture(uint32_t true_base, uint32_t first_row,
+                                   uint32_t rows);
+    void kvmem_flush_raw_k_decode();
+    void kvmem_materialize_raw_k(
+        const std::vector<const KvMemRemap *> &refreshes);
+    void kvmem_ensure_raw_mtp_capture_capacity(uint32_t rows);
+    void kvmem_capture_raw_mtp_k(const DeviceTensor &raw_k,
+                                 uint32_t logical_base,
+                                 uint32_t rows,
+                                 uint32_t src_row = 0);
+    void kvmem_materialize_raw_mtp_k(const KvMemPlan &plan);
 
     // ---- Cumulative-attention selection signal (#40, low-intrusion) -------
     // Per-window-block representative K (mean baked K) + a GPU-resident
@@ -883,14 +1057,15 @@ private:
     // policy used for the eviction itself.
     void kvmem_prepare_content_index_before_first_selection();
     void kvmem_snapshot_content_query(uint32_t layer_index);  // per step
-    bool kvmem_retrieval_score();              // interval -> set_attn_scores
+    bool kvmem_retrieval_score(
+        std::string *failure_reason = nullptr);  // interval -> set_attn_scores
     bool g_content_ready_ = false;                    // g_kbar_ holds the index
     bool g_query_ready_ = false;                       // g_query_content_ is live
     uint32_t g_indexed_blocks_ = 0;                    // blocks covered by the index
     uint32_t g_kbar_global_capacity_ = 0;              // allocated block capacity
     std::vector<int32_t> g_orig_base_host_;            // block_id -> true first pos
     std::vector<int32_t> g_blk_tokens_host_;           // block_id -> token count
-    std::unique_ptr<DeviceTensor> g_kbar_;             // [blocks, n_kv_heads, head_dim] fp32, by block_id
+    std::unique_ptr<DeviceTensor> g_kbar_;             // [blocks, n_kv_heads, head_dim], KV dtype, by block_id
     std::unique_ptr<DeviceTensor> g_score_dev_;        // [blocks] fp32
     std::unique_ptr<DeviceTensor> g_query_content_;    // [n_heads, head_dim] fp32 (content frame)
     std::unique_ptr<DeviceTensor> g_orig_base_dev_;    // [blocks] int32
@@ -945,7 +1120,9 @@ private:
     // token, head) softmax of q·k̄ OVER PAGES on the cheap per-block mean key.
     // mask_mode: -1 = honor env QW3_KVMEM_MASK_KEPT (default), 0 = force no mask,
     // 1 = force mask of the always-kept sink/recent bands (used by the dump sweep).
-    bool kvmem_retrieval_score_mean_softmax(int mask_mode = -1);  // boundary, softmax-over-pages
+    bool kvmem_retrieval_score_mean_softmax(
+        int mask_mode = -1,
+        std::string *failure_reason = nullptr);  // boundary, softmax-over-pages
     bool kvmem_no_rerope_ = false;                             // env: skip re-RoPE collapse (true-pos test)
     bool kvmem_fix_bakedpos_ = true;                           // record window bake pos for window-baked chunks (env off-switch QW3_KVMEM_FIX_BAKEDPOS=0)
 
@@ -956,7 +1133,8 @@ private:
     // over-pages (exp of the diluted per-block mean key). Keeps the RAW per-token
     // de-RoPE'd keys in g_kraw_multi_ (~7.4 GB fp32), allocated/captured ONLY when
     // per-token is selected. kvmem_qc_pertoken_ mirrors the retrieval_method enum.
-    bool kvmem_retrieval_score_exactmass();                    // boundary, raw-key ExactMass
+    bool kvmem_retrieval_score_exactmass(
+        std::string *failure_reason = nullptr);  // boundary, raw-key ExactMass
     bool kvmem_qc_pertoken_ = false;                           // retrieval_method == PerToken
     uint32_t kvmem_qc_total_tokens_ = 0;                       // total prompt tokens (kraw stride)
     std::unique_ptr<DeviceTensor> g_kraw_multi_;              // [L, total_tokens, n_kv_heads, head_dim] fp32
@@ -966,7 +1144,7 @@ private:
     uint32_t kvmem_query_span_ = 0;                            // S (span length, == capacity)
     std::vector<int32_t> std_layer_slot_;                      // il -> slot 0..L-1, or -1
     std::vector<uint32_t> std_layers_;                         // slot -> il
-    std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_subblocks, n_kv_heads, head_dim] fp32
+    std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_subblocks, n_kv_heads, head_dim], KV dtype
     bool g_kbar_multi_ready_ = false;                          // g_kbar_multi_ holds the index
     uint32_t g_kbar_multi_blocks_ = 0;                         // blocks covered (per layer)
     uint32_t g_kbar_multi_capacity_ = 0;                       // allocated block capacity (per layer)
@@ -990,7 +1168,8 @@ private:
     void kvmem_capture_deltanet_query(uint32_t dn_slot, uint32_t chunk_off,
                                       uint32_t batch, uint32_t base_pos,
                                       const DeviceTensor &conv_out, uint32_t conv_stride);
-    bool kvmem_retrieval_score_deltanet();                     // boundary DeltaNet-state scorer
+    bool kvmem_retrieval_score_deltanet(
+        std::string *failure_reason = nullptr);  // boundary DeltaNet-state scorer
     std::vector<uint32_t> dn_layers_;                          // dn_slot -> layer id (recurrent)
     std::vector<int32_t> dn_layer_slot_;                       // il -> dn_slot 0..L_dn-1, or -1
     uint32_t kvmem_dn_num_layers_ = 0;                         // L_dn (selected DeltaNet-layer count)

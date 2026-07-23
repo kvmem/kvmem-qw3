@@ -108,44 +108,50 @@ static void test_selection_diff_and_remap() {
     CHECK(s.blocks()[3].remap_count == 2);
 }
 
-static void test_immutable_source_selection_keeps_construction_bake() {
+static void test_immutable_source_selection_uses_bounded_delta_remaps() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 32;
     cfg.immutable_source_k = true;
     KvMemStore s(cfg);
     s.register_append(32 * 6);
 
-    // Source block 4 was constructed in its original frame.  Selecting it into
-    // slot 1 materializes working K from 128 -> 32 without mutating source
-    // metadata.
+    // A resident block uses one cheap in-place delta remap and records its new
+    // active GPU frame.
     auto p1 = s.set_selection({0, 4});
     CHECK(p1.remaps.size() == 2);
     CHECK(p1.remaps[1].block_id == 4);
     CHECK(p1.remaps[1].from_base == 128);
     CHECK(p1.remaps[1].to_base == 32);
     CHECK(!p1.remaps[1].skip);
-    CHECK(s.blocks()[4].baked_pos == 128);
-    CHECK(s.blocks()[4].remap_count == 0);
+    CHECK(!p1.remaps[1].raw_refresh);
+    CHECK(s.blocks()[4].baked_pos == 32);
+    CHECK(s.blocks()[4].remap_count == 1);
 
-    // A different selection moves the same block to slot 2.  The plan must
-    // still start at the immutable construction frame, not at the prior window
-    // slot.  This is the property that prevents cumulative fp16 re-RoPE drift.
+    // A different selection starts at the current active frame.
     auto p2 = s.set_selection({0, 2, 4});
     CHECK(p2.remaps.size() == 3);
     CHECK(p2.remaps[2].block_id == 4);
-    CHECK(p2.remaps[2].from_base == 128);
+    CHECK(p2.remaps[2].from_base == 32);
     CHECK(p2.remaps[2].to_base == 64);
-    CHECK(s.blocks()[4].baked_pos == 128);
+    CHECK(s.blocks()[4].baked_pos == 64);
+    CHECK(s.blocks()[4].remap_count == 2);
+
+    // A large displacement crosses the default 256K token threshold and is
+    // rebuilt from raw K, resetting the drift counters.
+    s.set_block_baked_pos(4, 777);
+    s.record_block_rerope(4, 300000);
+    auto p3 = s.set_selection({0, 4});
+    CHECK(p3.remaps[1].from_base == 300000);
+    CHECK(p3.remaps[1].to_base == 32);
+    CHECK(p3.remaps[1].raw_refresh);
+    CHECK(s.blocks()[4].baked_pos == 32);
     CHECK(s.blocks()[4].remap_count == 0);
 
-    // Window-baked source K created by a later prefill chunk is also immutable:
-    // its recorded construction position remains the source of every future
-    // one-shot materialization.
-    s.set_block_baked_pos(4, 777);
-    auto p3 = s.set_selection({0, 4});
-    CHECK(p3.remaps[1].from_base == 777);
-    CHECK(p3.remaps[1].to_base == 32);
-    CHECK(s.blocks()[4].baked_pos == 777);
+    // A block loaded from CPU/NVMe is always rebuilt because its GPU K slot is
+    // newly allocated and has no valid active bake.
+    s.set_block_tier(3, KvTier::CPU, 0, -1);
+    auto p4 = s.set_selection({0, 3});
+    CHECK(p4.remaps[1].raw_refresh);
 }
 
 static void test_stage_in_uses_tier_residency() {
@@ -219,6 +225,33 @@ static void test_topk_zero_recent_keeps_no_suffix() {
     CHECK(std::find(sel.begin(), sel.end(), 5) != sel.end());
     CHECK(std::find(sel.begin(), sel.end(), 6) != sel.end());
     CHECK(std::find(sel.begin(), sel.end(), 9) == sel.end());
+}
+
+static void test_topk_mandatory_blocks_stay_inside_budget() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.select_budget = 32 * 4;  // four blocks including mandatory suffix
+    cfg.sink_blocks = 1;
+    cfg.recent_blocks = 0;
+    KvMemStore s(cfg);
+    s.register_append(32 * 10);
+
+    std::vector<double> scores(10, 0.0);
+    scores[2] = 100.0;
+    scores[3] = 90.0;
+    scores[4] = 80.0;
+    // The low-scoring query suffix must replace ordinary top-k candidates,
+    // never extend the compact window to six blocks.
+    scores[8] = -10.0;
+    scores[9] = -20.0;
+    s.set_retrieval_scores(scores);
+    const auto sel = s.pick_topk_blocks({8, 9});
+    CHECK(sel.size() == 4);
+    CHECK(std::find(sel.begin(), sel.end(), 0) != sel.end());
+    CHECK(std::find(sel.begin(), sel.end(), 2) != sel.end());
+    CHECK(std::find(sel.begin(), sel.end(), 8) != sel.end());
+    CHECK(std::find(sel.begin(), sel.end(), 9) != sel.end());
+    CHECK(std::find(sel.begin(), sel.end(), 3) == sel.end());
 }
 
 static void test_prefill_pressure_sink_full_recent_tail() {
@@ -507,10 +540,11 @@ static void test_deltanet_config_and_scores() {
 int main() {
     test_register_append();
     test_selection_diff_and_remap();
-    test_immutable_source_selection_keeps_construction_bake();
+    test_immutable_source_selection_uses_bounded_delta_remaps();
     test_stage_in_uses_tier_residency();
     test_topk_budget_sink_recent();
     test_topk_zero_recent_keeps_no_suffix();
+    test_topk_mandatory_blocks_stay_inside_budget();
     test_prefill_pressure_sink_full_recent_tail();
     test_prefill_pressure_edges();
     test_quota_policy_sink_recent_retrieval_profile();

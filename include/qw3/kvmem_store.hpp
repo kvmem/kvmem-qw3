@@ -51,10 +51,12 @@ struct KvMemBlock {
     // de-rotate(baked_pos)+re-rotate(new) pass (rope_block_remap_paged), reusing
     // the same __sincosf. With fp16 KV, however, every non-noop remap rounds the
     // result again; a long multi-turn trace can therefore accumulate error. The
-    // counter is diagnostics for the immutable-source-K redesign and has no
-    // influence on selection.
+    // counters drive the raw-K refresh policy in immutable-source mode: small
+    // moves are applied in-place, while a block is rebuilt from the CPU raw-K
+    // mirror after too many rotations or too much cumulative displacement.
     int64_t  baked_pos = -1;        // -1 until first registered (then orig_pos_start)
     uint32_t remap_count = 0;       // number of non-noop in-place re-RoPE moves
+    uint64_t remap_abs_delta = 0;   // sum(abs(to_base-from_base)) since raw rebuild
     bool     in_working_set = false;
 
     // Cumulative attention quality (built-in top-k selection signal, #40).
@@ -77,6 +79,10 @@ struct KvMemRemap {
     int32_t  from_base = 0;   // current bake position (de-rotate source)
     int32_t  to_base = 0;     // assigned in-window first-token position
     bool     skip = false;    // from_base == to_base: no kernel needed
+    // Rebuild this block from the unrotated CPU raw-K mirror instead of
+    // applying another lossy in-place de-RoPE/re-RoPE pass. Always true for a
+    // cold stage-in and when either refresh threshold is reached.
+    bool     raw_refresh = false;
 };
 
 // One block removed by truncate_to, carrying the tier slots the executor must
@@ -156,11 +162,18 @@ struct KvMemStoreConfig {
     KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
 
-    // Experimental drift-free K construction.  The executor keeps the
-    // historical/source K immutable and materializes a separate working K for
-    // each selected window.  In this mode baked_pos describes the source K's
-    // construction frame and set_selection() must never overwrite it.
+    // Drift-bounded K construction. The executor stores unrotated historical K
+    // in a CPU mirror and keeps only one active K copy on GPU. Small window
+    // moves use an in-place delta rotation; cold blocks and blocks crossing a
+    // refresh threshold are rebuilt from raw K in one H2D + scatter/RoPE pass.
     bool immutable_source_k = false;
+    // Engine-level MTP prefix/speculation is enabled for this executor. Kept
+    // explicit so non-MTP KVMem runs do not allocate/tier an unused MTP cache
+    // or reserve an unnecessary MTP raw-K mirror.
+    bool mtp_enabled = false;
+    uint32_t immutable_refresh_remaps = 32;
+    uint64_t immutable_refresh_abs_delta_tokens = 262144;
+    uint64_t immutable_max_baked_position = 262144;
 
     // Archived experimental DeltaNet retrieval. Not exposed by the CLI and not
     // recommended for production; retained for future research and reproducibility.
@@ -227,6 +240,12 @@ public:
     // keeping the first `sink_blocks` and last `recent_blocks` blocks. Returns
     // selected block IDs in ascending (window) order. Honors the budget.
     std::vector<uint32_t> pick_topk_blocks() const;
+    // Same selector with additional mandatory block IDs. Mandatory blocks
+    // consume ordinary top-k slots; they are never appended beyond the budget.
+    // This is used by query replay so its suffix stays present without growing
+    // the active RoPE window past `select_budget`.
+    std::vector<uint32_t> pick_topk_blocks(
+        const std::vector<uint32_t> &mandatory_blocks) const;
 
     // Deterministic working set used only while a long prefill is under memory
     // pressure. Keep the configured sink prefix, then fill every remaining
@@ -259,11 +278,11 @@ public:
     void record_block_rerope(uint32_t block_id, int64_t baked_pos);
 
     // Diff `selected_ids` against current GPU residency / working-set state and produce the
-    // stage-in/out lists + the window remap plan. In the legacy mode each remap
-    // de-rotates from the block's CURRENT bake position and re-rotates in place,
-    // then commits the new baked_pos. With immutable_source_k, baked_pos remains
-    // the source K's construction frame and each plan remaps a freshly copied
-    // working K from that immutable frame. `selected_ids` need not be sorted;
+    // stage-in/out lists + the window remap plan. Each remap starts from the
+    // block's CURRENT GPU bake position. In immutable_source_k mode a cold
+    // stage-in or a block exceeding the configured drift thresholds is marked
+    // raw_refresh and rebuilt from the CPU raw-K mirror; otherwise the move is
+    // an in-place delta rotation. `selected_ids` need not be sorted;
     // it is sorted ascending internally so window order is deterministic (sink
     // first ... recent last). Blocks are packed contiguously from window pos 0.
     KvMemPlan set_selection(std::vector<uint32_t> selected_ids);

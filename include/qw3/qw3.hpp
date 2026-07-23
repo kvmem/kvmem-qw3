@@ -98,10 +98,9 @@ struct EngineOptions {
     // Enabled by default for query-conditioned mean-k; the first-pass query is
     // still used for retrieval scoring, while decode consumes the replayed KV.
     bool kvmem_recompute_query = true;
-    // Preserve a construction-frame source K and rebuild a separate working K
-    // on every selection. Enabled by default so repeated re-RoPE never mutates
-    // the repository K; use --no-kvmem-immutable-k for legacy ablations and
-    // --kv-dtype fp8 for the practical lower-memory configuration.
+    // Preserve unrotated K in a CPU mirror and keep one active GPU K copy.
+    // Cold/periodic refreshes rebuild from raw K; small moves use delta RoPE.
+    // Enabled by default; use --no-kvmem-immutable-k for legacy ablations.
     bool kvmem_immutable_source_k = true;
     int kvmem_retrieval_blocks = 0; // 0 = derive from remaining budget
     int kvmem_profile_blocks = 0;   // 0 = derive from remaining budget

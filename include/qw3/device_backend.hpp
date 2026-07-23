@@ -779,6 +779,25 @@ public:
                 "rope_block_remap_paged_batched_device requires backend override"};
     }
 
+    // Materialize packed, unrotated raw K into arbitrary paged window slots and
+    // apply RoPE exactly once at each destination position. `raw_k` is laid out
+    // [n_blocks, max_n_tokens, per_pos_size] beginning at raw_element_offset.
+    // This is the drift-free cold/periodic refresh path for immutable K.
+    virtual DeviceStatus raw_k_scatter_rope_paged_batched_device(
+            DeviceTensor &k_cache, const DeviceTensor &raw_k,
+            uint64_t raw_element_offset, uint32_t n_blocks,
+            uint32_t max_n_tokens, uint32_t n_kv_heads,
+            uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+            const DeviceTensor &to_base, const DeviceTensor &n_tokens,
+            const DeviceTensor &page_indices, uint32_t page_size, float theta) {
+        (void)k_cache; (void)raw_k; (void)raw_element_offset; (void)n_blocks;
+        (void)max_n_tokens; (void)n_kv_heads; (void)per_pos_size;
+        (void)head_dim; (void)rope_dim; (void)to_base; (void)n_tokens;
+        (void)page_indices; (void)page_size; (void)theta;
+        return {false,
+                "raw_k_scatter_rope_paged_batched_device requires backend override"};
+    }
+
     // Block-sparse cumulative-attention selection signal (#40). Both are
     // no-ops on backends without an override (selection falls back to recency).
     //

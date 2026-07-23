@@ -27,6 +27,12 @@ python3 scripts/kvmem_eval/run_kvmem_eval.py \
 Dry-run prints the server command, evaluation command, git commit, environment
 flags, output paths, and expected judge without starting any process.
 
+For a stage-by-stage reselection profile, export
+`QW3_KVMEM_PERF_TRACE=1`. The server log then contains
+`[kvmem-reselect-perf]` rows for both prefill-pressure (`kind=explicit`) and
+query-conditioned (`kind=semantic`) selections. This diagnostic synchronizes
+timed GPU regions; do not use it for an uninstrumented throughput baseline.
+
 ## Fast lifecycle smoke
 
 ```bash
@@ -82,3 +88,44 @@ audit verifies every ingest request returned `finish_reason=prefill_only`, and
 records the session index, phase, fragment token count, selection mode, and
 latency. Server-side `QW3_KVMEM_TRACE=1` logs the absolute query span, semantic
 selection, aligned query replay, and retained session checkpoint.
+
+## BEAM-10M
+
+`run_beam_10m.py` evaluates the official 10M-token BEAM conversations. Each
+history is sent once as a prefill-only request. Probing questions then restore
+the same immutable history checkpoint through `--kvmem-prefix-cache`; generated
+answers never enter the next question's context.
+
+Download conversation 1 through the Hugging Face mirror. The downloader
+explicitly unsets lowercase and uppercase HTTP(S)/ALL proxy variables before
+opening a network connection:
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u all_proxy -u ALL_PROXY \
+  uv run --no-project --with pyarrow --with requests \
+  python scripts/kvmem_eval/download_beam_10m.py --conversations 1
+```
+
+Inspect the real sample without launching qw3:
+
+```bash
+python scripts/kvmem_eval/run_beam_10m.py \
+  --data /data/chaidi/kvmem_eval/data/beam_10m \
+  --conversation-ids 1 --dry-run
+
+DRY_RUN=1 scripts/kvmem_eval/run_beam_10m_kvmem.sh
+```
+
+Run all 20 probing questions for conversation 1:
+
+```bash
+scripts/kvmem_eval/run_beam_10m_kvmem.sh
+```
+
+The runner writes an append-safe per-question JSONL, a request audit, a summary,
+and a BEAM-compatible JSON containing `llm_response`. The launcher enables
+prefix-cache tracing and fails unless every question restored a warm KVMem
+checkpoint. Use BEAM's official type-specific evaluator on the compatible JSON;
+`--no-judge` only disables the LongMemEval judge in the generic process
+orchestrator.

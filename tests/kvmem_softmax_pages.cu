@@ -5,6 +5,8 @@
 // large path against a host reference including kept-band masking and subblocks.
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 #include <cmath>
@@ -16,10 +18,23 @@
 
 namespace qw3 {
 namespace ported {
+enum class KbarDType : uint32_t {
+    F32 = 0,
+    F16 = 1,
+    FP8 = 2,
+};
 bool launch_block_attn_score_softmax_pages(
     float *score, const float *q_multi, const float *kbar_multi,
     uint32_t n_layers, uint32_t n_tokens, uint32_t q_layer_stride,
     uint32_t n_blocks, uint32_t kbar_layer_stride, uint32_t n_heads,
+    uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    uint32_t excl_lo_end, uint32_t excl_hi_begin, uint32_t n_subblocks,
+    uint32_t reduce_max, cudaStream_t stream);
+bool launch_block_attn_score_softmax_pages_typed(
+    float *score, const float *q_multi, const void *kbar_multi,
+    KbarDType kbar_dtype, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t q_layer_stride, uint32_t n_blocks,
+    uint32_t kbar_layer_stride, uint32_t n_heads,
     uint32_t n_kv_heads, uint32_t head_dim, float scale,
     uint32_t excl_lo_end, uint32_t excl_hi_begin, uint32_t n_subblocks,
     uint32_t reduce_max, cudaStream_t stream);
@@ -43,6 +58,26 @@ struct Case {
     uint32_t excl_hi;
     bool reduce_max;
 };
+
+template <typename T>
+__global__ void quantize_kbar(const float *src, T *dst, uint64_t count) {
+    for (uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+         i < count;
+         i += static_cast<uint64_t>(blockDim.x) * gridDim.x) {
+        dst[i] = T(src[i]);
+    }
+}
+
+template <typename T>
+__global__ void dequantize_kbar(const T *src, float *dst, uint64_t count) {
+    for (uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+         i < count;
+         i += static_cast<uint64_t>(blockDim.x) * gridDim.x) {
+        dst[i] = static_cast<float>(src[i]);
+    }
+}
 
 static std::vector<float> host_reference(
         const std::vector<float> &q,
@@ -146,6 +181,54 @@ static std::vector<float> run_gpu(
     return out;
 }
 
+template <typename T>
+static std::vector<float> run_gpu_typed(
+        float *d_score,
+        const float *d_q,
+        const float *d_kbar,
+        uint64_t k_count,
+        qw3::ported::KbarDType dtype,
+        uint32_t layers,
+        uint32_t tokens,
+        uint32_t q_stride,
+        uint32_t blocks,
+        uint32_t kbar_stride,
+        uint32_t heads,
+        uint32_t kv_heads,
+        uint32_t dim,
+        float scale,
+        const Case &tc,
+        std::vector<float> *quantized_host) {
+    T *d_typed = nullptr;
+    float *d_dequant = nullptr;
+    CHECK(cudaMalloc(&d_typed, k_count * sizeof(T)));
+    CHECK(cudaMalloc(&d_dequant, k_count * sizeof(float)));
+    const uint32_t threads = 256;
+    const uint32_t grid = static_cast<uint32_t>(
+        std::min<uint64_t>((k_count + threads - 1) / threads, 65535));
+    quantize_kbar<<<grid, threads>>>(d_kbar, d_typed, k_count);
+    dequantize_kbar<<<grid, threads>>>(d_typed, d_dequant, k_count);
+    CHECK(cudaGetLastError());
+    quantized_host->resize(k_count);
+    CHECK(cudaMemcpy(quantized_host->data(), d_dequant,
+                     k_count * sizeof(float), cudaMemcpyDeviceToHost));
+    if (!qw3::ported::launch_block_attn_score_softmax_pages_typed(
+            d_score, d_q, d_typed, dtype, layers, tokens, q_stride, blocks,
+            kbar_stride, heads, kv_heads, dim, scale, tc.excl_lo, tc.excl_hi,
+            tc.subblocks, tc.reduce_max ? 1u : 0u, 0)) {
+        std::fprintf(stderr, "typed launcher rejected blocks=%u subblocks=%u\n",
+                     blocks, tc.subblocks);
+        std::exit(1);
+    }
+    CHECK(cudaDeviceSynchronize());
+    std::vector<float> out(blocks);
+    CHECK(cudaMemcpy(out.data(), d_score, blocks * sizeof(float),
+                     cudaMemcpyDeviceToHost));
+    CHECK(cudaFree(d_dequant));
+    CHECK(cudaFree(d_typed));
+    return out;
+}
+
 static void compare(const char *label,
                     const std::vector<float> &a,
                     const std::vector<float> &b,
@@ -217,6 +300,35 @@ static void run_case(const Case &tc) {
         std::snprintf(label, sizeof(label), "tiled-vs-fused B=%u ns=%u max=%u",
                       tc.blocks, tc.subblocks, tc.reduce_max ? 1u : 0u);
         compare(label, tiled, fused, 3e-6, 3e-3);
+    }
+
+    // Exercise the production low-precision index readers on both sides of the
+    // fused/tiled dispatch boundary. The host reference uses the dequantized
+    // stored values, isolating implementation correctness from expected
+    // quantization error.
+    if (tc.subblocks == 1 && (tc.blocks == 512 || tc.blocks == 8193)) {
+        std::vector<float> qk;
+        std::vector<float> f16 = run_gpu_typed<__half>(
+            d_score, d_q, d_kbar, k_count, qw3::ported::KbarDType::F16,
+            layers, tokens, q_stride, tc.blocks, kbar_stride, heads,
+            kv_heads, dim, scale, tc, &qk);
+        std::vector<float> qref = host_reference(
+            q, qk, layers, tokens, q_stride, tc.blocks, kbar_stride, heads,
+            kv_heads, dim, scale, tc.excl_lo, tc.excl_hi, tc.subblocks,
+            tc.reduce_max);
+        std::snprintf(label, sizeof(label), "fp16-vs-host B=%u", tc.blocks);
+        compare(label, f16, qref, 3e-6, 3e-3);
+
+        std::vector<float> fp8 = run_gpu_typed<__nv_fp8_e4m3>(
+            d_score, d_q, d_kbar, k_count, qw3::ported::KbarDType::FP8,
+            layers, tokens, q_stride, tc.blocks, kbar_stride, heads,
+            kv_heads, dim, scale, tc, &qk);
+        qref = host_reference(
+            q, qk, layers, tokens, q_stride, tc.blocks, kbar_stride, heads,
+            kv_heads, dim, scale, tc.excl_lo, tc.excl_hi, tc.subblocks,
+            tc.reduce_max);
+        std::snprintf(label, sizeof(label), "fp8-vs-host B=%u", tc.blocks);
+        compare(label, fp8, qref, 3e-6, 3e-3);
     }
 
     CHECK(cudaFree(d_q));

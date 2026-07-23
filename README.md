@@ -945,7 +945,7 @@ KVMem CLI parameters:
 | `--kvmem-block-tokens N` | `128` | KV block granularity in tokens. Must be a positive multiple of the KV page size. |
 | `--kvmem-budget N` | `131072` | Maximum selected working-set window per selection, in tokens. Approximate selected block count is `budget / block_tokens`. |
 | `--kvmem-sink-blocks N` | `1` | Always keep the first N blocks for attention-sink behavior. |
-| `--kvmem-recent-blocks N` | `0` | Always keep the most recent N blocks. `0` lets KVMem derive the recent allocation. |
+| `--kvmem-recent-blocks N` | `0` | Always keep the most recent N blocks. `0` keeps no suffix block unconditionally. |
 | `--kvmem-method M` | `retrieval` | Selection signal: `retrieval`, `h2o`, or `recency`. |
 | `--kvmem-retrieval-method M` | `mean_attention` | Retrieval scorer: `mean_attention` or `content_mean`. |
 | `--kvmem-query-conditioned` | off | Score blocks by the multi-token mean of the final user message (the question) against each block's mean-k, instead of falling back to a recency window. Default-OFF, byte-identical when unset. Required for the LongMemEval benchmark below. |
@@ -954,10 +954,12 @@ KVMem CLI parameters:
 | `--kvmem-profile-blocks N` | `0` | Quota-policy profile block count. `0` derives from remaining budget. |
 | `--kvmem-update-mode M` | `interval` | Reselect cadence: `interval` or `step`. `step` selects after prefill and does not automatically reselect during decode. |
 | `--kvmem-interval N` | `64` | Decode tokens between reselections when `--kvmem-update-mode interval` is used. |
+| `--kvmem-immutable-k` | on | Store unrotated standard-layer K in CPU memory, keep one active GPU K copy, and periodically rebuild from raw K to bound re-RoPE drift. With MTP, the same raw-K authority keeps MTP RoPE inside the compact window. |
+| `--no-kvmem-immutable-k` | off | Legacy ablation: no CPU raw-K mirror; repeatedly remap the active GPU K in place. |
 | `--kvmem-gpu-memory-ratio F` | `0.50` | Approximate fraction of GPU memory that KVMem may use for its bounded GPU KV pool. |
 | `--kvmem-gpu-high-watermark F` | `0.95` | GPU tier high-watermark knob reserved for tiering policy. Leave at default for normal tests. |
 | `--kvmem-gpu-low-watermark F` | `0.85` | GPU tier low-watermark knob reserved for tiering policy. Leave at default for normal tests. |
-| `--kvmem-cpu-gb F` | `0` | CPU tier budget in GiB. `0` disables CPU tier runtime page release. |
+| `--kvmem-cpu-gb F` | `0` | Total KVMem CPU budget in GiB. Immutable mode reserves its raw-K mirror first and uses the remainder for the pinned V tier. |
 | `--kvmem-cpu-bytes N` | `0` | Legacy byte-level CPU tier budget. Prefer `--kvmem-cpu-gb` for manual runs. |
 | `--kvmem-nvme-dir DIR` | unset | Directory for the NVMe backing file. Required when NVMe tier budget is nonzero. |
 | `--kvmem-nvme-gb F` | `0` | NVMe tier budget in GiB. Requires `--kvmem-nvme-dir`. |
@@ -973,6 +975,12 @@ Useful KVMem environment variables:
 |---|---|
 | `QW3_KVMEM_TIER_TRACE=1` | Print tier events such as `stage_out`, `stage_in`, `cpu_evict`, `stage_in_async_read`, and `bounded_gpu_pool`. Recommended when testing CPU/NVMe offload. |
 | `QW3_KVMEM_TRACE=1` | Print selection/retrieval diagnostics. This can be verbose. |
+| `QW3_KVMEM_PERF_TRACE=1` | Print one detailed timing row for every pressure/semantic reselection, including I/O bytes, async-read time versus actual wait, overlap gap, H2D, stage-out subphases, and assemble. Diagnostic only: it synchronizes timed GPU regions. |
+| `QW3_KVMEM_IMMUTABLE_REFRESH_REMAPS=N` | Rebuild a block from CPU raw-K after N accumulated delta rotations. Default: 32; 0 disables this threshold. |
+| `QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS=N` | Rebuild after N accumulated absolute position-token displacement. Default: 262144; 0 disables this threshold. |
+| `QW3_KVMEM_IMMUTABLE_MAX_BAKED_POSITION=N` | Force raw rebuild when the current GPU K was baked beyond this position. Default: the model's native context limit. |
+| `QW3_KVMEM_RAW_K_TRANSFER_BLOCKS=N` | Raw-K CPU gather/H2D batch size in blocks. Default: 128. |
+| `QW3_KVMEM_MTP_LOCAL_POSITIONS=0|1` | Separate MTP logical page identity from compact RoPE coordinates and materialize selected MTP K from unrotated CPU raw K. Default: `1` with immutable K; `0` is the legacy long-position A/B path. |
 | `QW3_KVMEM_ATTN_TRACE=/path/to/file.jsonl` | Dump KVMem attention-mass traces for analysis. This is expensive and should not be enabled for normal serving. |
 | `QW3_KVMEM_ATTN_TRACE_INTERVAL=N` | Sampling interval for `QW3_KVMEM_ATTN_TRACE`; default is every token. |
 | `QW3_KVMEM_QC_SOFTMAX=1` | Query-conditioned scorer: use softmax-over-pages (accumulated attention mass per block) instead of the default sum-of-ReLU. A/B knob; does not change which blocks survive the budget cut (see the retrieval finding below). |
@@ -980,8 +988,16 @@ Useful KVMem environment variables:
 | `QW3_KVMEM_QC_LAYERS=N` | Cap the number of normal-attention layers used by the query-conditioned scorer (debug). |
 | `QW3_KVMEM_NO_REROPE=1` | Skip the position-collapse re-RoPE in window assembly; selected blocks keep their true-position rotation. Diagnostic only — run with MTP off (the MTP draft position site is not rewired). |
 
+For mean-K retrieval, index storage follows `--kv-dtype`: `fp16` means IEEE
+binary16 (`__half`, not BF16), `fp8` means E4M3, and scoring/softmax
+accumulation remains FP32.
+
 Compatibility notes:
 
+- Local-position KVMem MTP requires
+  `--kvmem-budget + --kvmem-gen-budget <= model context limit`. Query-replay
+  suffix blocks are charged inside `--kvmem-budget`, so they do not silently
+  expand the compact RoPE window.
 - Single-request KVMem + MTP is supported.
 - KVMem + continuous batching is supported without MTP.
 - KVMem + continuous batching + MTP is guarded with a hard error in the

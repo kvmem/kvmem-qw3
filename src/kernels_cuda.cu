@@ -302,7 +302,28 @@ bool launch_rope_block_remap_paged_batched_fp8(
         const int32_t *page_indices, uint32_t page_size, float theta,
         cudaStream_t stream);
 
+bool launch_raw_k_scatter_rope_paged_batched(
+        void *cache, const void *raw_k, bool is_fp16, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
+
 // Block-sparse selection signal (#40). See kernel comments.
+enum class KbarDType : uint32_t {
+    F32 = 0,
+    F16 = 1,
+    FP8 = 2,
+};
+
 bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
                               uint32_t n_blocks, uint32_t n_kv_heads,
                               uint32_t per_pos_size, uint32_t head_dim,
@@ -316,11 +337,22 @@ bool launch_block_kmean_paged_fp8(void *k_cache, float *kbar,
                                   const int32_t *blk_tokens,
                                   const int32_t *page_indices,
                                   uint32_t page_size, cudaStream_t stream);
+bool launch_block_kmean_paged_typed(
+        void *k_cache, bool cache_is_fp16, bool cache_is_fp8, void *kbar,
+        KbarDType kbar_dtype, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, cudaStream_t stream);
 bool launch_block_attn_score_step(float *accum, const float *q,
                                   const float *kbar, uint32_t q_stride,
                                   uint32_t n_blocks, uint32_t n_heads,
                                   uint32_t n_kv_heads, uint32_t head_dim,
                                   float scale, cudaStream_t stream);
+bool launch_block_attn_score_step_typed(
+        float *accum, const float *q, const void *kbar,
+        KbarDType kbar_dtype, uint32_t q_stride, uint32_t n_blocks,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        float scale, cudaStream_t stream);
 bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            const float *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
@@ -334,6 +366,14 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            uint32_t n_subblocks,
                                            uint32_t reduce_max,
                                            cudaStream_t stream);
+bool launch_block_attn_score_softmax_pages_typed(
+        float *score, const float *q_multi, const void *kbar_multi,
+        KbarDType kbar_dtype, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t n_blocks,
+        uint32_t kbar_layer_stride, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t n_subblocks, uint32_t reduce_max, cudaStream_t stream);
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        const float *q, uint32_t q_stride,
                                        uint32_t n_window_blocks,
@@ -370,6 +410,13 @@ bool launch_block_kmean_content_paged_fp8(
         const int32_t *orig_base, const int32_t *blk_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
         cudaStream_t stream);
+bool launch_block_kmean_content_paged_typed(
+        void *k_cache, bool cache_is_fp16, bool cache_is_fp8, void *kbar,
+        KbarDType kbar_dtype, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *orig_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
 // Incremental content-frame index from the prefill K batch (#91). See kernel.
 bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint64_t kbar_block_base,
@@ -379,6 +426,13 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint32_t rope_dim, int32_t rope_base,
                                       float theta, uint32_t n_subblocks,
                                       cudaStream_t stream);
+bool launch_block_kmean_content_batch_typed(
+        const float *k_batch, void *kbar, KbarDType kbar_dtype,
+        uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+        uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+        int32_t rope_base, float theta, uint32_t n_subblocks,
+        cudaStream_t stream);
 bool launch_block_kmean_content_batch_merge(
     const float *k_batch, float *kbar, uint64_t kbar_block_base,
     uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
@@ -386,6 +440,13 @@ bool launch_block_kmean_content_batch_merge(
     uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
     int32_t rope_base, float theta, uint32_t n_subblocks,
     cudaStream_t stream);
+bool launch_block_kmean_content_batch_merge_typed(
+    const float *k_batch, void *kbar, KbarDType kbar_dtype,
+    uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+    uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+    uint32_t first_block_token_offset, uint32_t n_kv_heads,
+    uint32_t head_dim, uint32_t rope_dim, int32_t rope_base,
+    float theta, uint32_t n_subblocks, cudaStream_t stream);
 // Raw-key store (per-token retrieval): store each de-RoPE'd K row (no mean).
 bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
                                        uint64_t out_base_elem, uint32_t k_stride,
@@ -3098,6 +3159,50 @@ __global__ void rope_block_remap_paged_batched_kernel(
     base[i + half] = static_cast<T>(d0 * sn + d1 * cn);
 }
 
+// Rebuild paged K from an unrotated packed source. Unlike the delta-remap
+// kernel above, this writes every head dimension: the RoPE prefix is rotated
+// directly from raw values and the non-RoPE suffix is copied unchanged.
+template <typename T>
+__global__ void raw_k_scatter_rope_paged_batched_kernel(
+        T *cache, const T *raw_k, uint64_t raw_element_offset,
+        uint32_t max_n_tokens, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta) {
+    const uint32_t bz = blockIdx.z;
+    const uint32_t tok = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (tok >= static_cast<uint32_t>(n_tokens[bz]) || d >= head_dim) return;
+
+    const uint64_t src_row =
+        (static_cast<uint64_t>(bz) * max_n_tokens + tok) * per_pos_size +
+        static_cast<uint64_t>(unit) * head_dim;
+    const T *src = raw_k + raw_element_offset + src_row;
+    const uint32_t logical_pos =
+        static_cast<uint32_t>(to_base[bz]) + tok;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(logical_pos, page_indices, page_size);
+    T *dst = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+             static_cast<uint64_t>(unit) * head_dim;
+
+    if (d >= rope_dim) {
+        dst[d] = src[d];
+        return;
+    }
+    const uint32_t half = rope_dim / 2;
+    const uint32_t pair = d < half ? d : d - half;
+    const float x0 = static_cast<float>(src[pair]);
+    const float x1 = static_cast<float>(src[pair + half]);
+    const float inv_freq = __powf(
+        theta, -2.0f * static_cast<float>(pair) /
+                   static_cast<float>(rope_dim));
+    float s, c;
+    __sincosf(static_cast<float>(logical_pos) * inv_freq, &s, &c);
+    const float out = d < half ? (x0 * c - x1 * s)
+                               : (x0 * s + x1 * c);
+    dst[d] = static_cast<T>(out);
+}
+
 // ---- Block-sparse cumulative-attention selection signal (#40) -----------
 //
 // Low-intrusion: instead of materializing the attention score matrix (the
@@ -3116,9 +3221,9 @@ __global__ void rope_block_remap_paged_batched_kernel(
 // layout [n_blocks_w, n_kv_heads, head_dim].
 __device__ __forceinline__ uint32_t kv_physical_pos_from_pages(
         uint32_t logical_pos, const int32_t *page_indices, uint32_t page_size);
-template <typename T>
+template <typename T, typename KbarT>
 __global__ void block_kmean_paged_kernel(const T *k_cache,
-                                         float *kbar,
+                                         KbarT *kbar,
                                          uint32_t per_pos_size,
                                          uint32_t head_dim,
                                          const int32_t *win_base,
@@ -3140,7 +3245,8 @@ __global__ void block_kmean_paged_kernel(const T *k_cache,
         acc += static_cast<float>(row[d]);
     }
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
-    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] = acc * inv;
+    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] =
+        static_cast<KbarT>(acc * inv);
 }
 
 // block_attn_score_step_kernel: for the current decode token's RoPE-baked Q,
@@ -3148,9 +3254,10 @@ __global__ void block_kmean_paged_kernel(const T *k_cache,
 // max(0, scale * (q_head . k̄_block[kv_head])). One CUDA block per window block
 // (no cross-block atomics needed; each writes its own accum slot). blockDim =
 // head_dim threads doing a shared-memory dot reduction per head.
+template <typename KbarT>
 __global__ void block_attn_score_step_kernel(float *accum,
                                              const float *q,
-                                             const float *kbar,
+                                             const KbarT *kbar,
                                              uint32_t q_stride,
                                              uint32_t n_heads,
                                              uint32_t n_kv_heads,
@@ -3165,7 +3272,10 @@ __global__ void block_attn_score_step_kernel(float *accum,
         const uint32_t kvh = qh / group;
         const float qv = (d < head_dim) ? q[qh * q_stride + d] : 0.0f;
         const float kv = (d < head_dim)
-            ? kbar[(static_cast<uint64_t>(w) * n_kv_heads + kvh) * head_dim + d]
+            ? static_cast<float>(
+                  kbar[(static_cast<uint64_t>(w) * n_kv_heads + kvh) *
+                           head_dim +
+                       d])
             : 0.0f;
         red[d] = qv * kv;
         __syncthreads();
@@ -3194,9 +3304,11 @@ __global__ void block_attn_score_step_kernel(float *accum,
 // sub-block's mass (max over sub-blocks) instead of the sum, so score[w] =
 // Σ_t mean_l mean_h max_sb softmax(scale·(q·k̄_{w,sb})) — MaxSim late interaction.
 // reduce_max is a no-op at n_subblocks==1 (single sub-block => max == sum).
-__global__ void block_attn_score_softmax_pages_kernel(float *score,
+template <typename KbarT>
+__global__ void block_attn_score_softmax_pages_kernel(
+                                                      float *score,
                                                       const float *q_multi,
-                                                      const float *kbar_multi,
+                                                      const KbarT *kbar_multi,
                                                       uint32_t n_layers,
                                                       uint32_t n_tokens,
                                                       uint32_t q_layer_stride,
@@ -3233,7 +3345,7 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
     // (ctx_blocks) so preserved [0,D) slices stay valid as the block count grows.
     // n_blocks remains the loop/count bound. Callers that don't fix-stride pass
     // kbar_layer_stride == n_blocks (byte-identical).
-    const float *kbar_l =
+    const KbarT *kbar_l =
         kbar_multi +
         static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks * n_kv_heads *
             head_dim;
@@ -3256,10 +3368,12 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
                 s_logit[p] = -INFINITY;
                 continue;
             }
-            const float *kbar_row =
+            const KbarT *kbar_row =
                 kbar_l + (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; ++d) dot += qr[d] * kbar_row[d];
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                dot += qr[d] * static_cast<float>(kbar_row[d]);
+            }
             s_logit[p] = dot * scale;
         }
         __syncthreads();
@@ -3317,11 +3431,12 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
 constexpr uint32_t kSoftmaxPagesTile = 512;
 constexpr uint32_t kSoftmaxPagesThreads = 128;
 
+template <typename KbarT>
 __global__ void block_attn_softmax_pages_partial_lse_kernel(
         float *partial_max,
         float *partial_sum,
         const float *q_multi,
-        const float *kbar_multi,
+        const KbarT *kbar_multi,
         uint32_t n_distributions,
         uint32_t n_tiles,
         uint32_t n_tokens,
@@ -3358,7 +3473,7 @@ __global__ void block_attn_softmax_pages_partial_lse_kernel(
     const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
     const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
     const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
-    const float *kbar_l =
+    const KbarT *kbar_l =
         kbar_multi +
         static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks *
             n_kv_heads * head_dim;
@@ -3368,10 +3483,12 @@ __global__ void block_attn_softmax_pages_partial_lse_kernel(
         const uint32_t w = p / n_subblocks;
         float logit = -INFINITY;
         if (w >= excl_lo_end && w < excl_hi_begin) {
-            const float *kbar_row =
+            const KbarT *kbar_row =
                 kbar_l + (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; ++d) dot += qr[d] * kbar_row[d];
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                dot += qr[d] * static_cast<float>(kbar_row[d]);
+            }
             logit = dot * scale;
         }
         logits[p - p0] = logit;
@@ -3449,10 +3566,11 @@ __global__ void block_attn_softmax_pages_merge_lse_kernel(
     }
 }
 
+template <typename KbarT>
 __global__ void block_attn_softmax_pages_recompute_kernel(
         float *score,
         const float *q_multi,
-        const float *kbar_multi,
+        const KbarT *kbar_multi,
         const float *global_max,
         const float *global_sum,
         uint32_t n_layers,
@@ -3481,7 +3599,7 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
     for (uint32_t l = 0; l < n_layers; ++l) {
         const float *q_l =
             q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
-        const float *kbar_l =
+        const KbarT *kbar_l =
             kbar_multi +
             static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks *
                 n_kv_heads * head_dim;
@@ -3497,12 +3615,13 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
                 float block_mass = 0.0f;
                 for (uint32_t sb = 0; sb < n_subblocks; ++sb) {
                     const uint32_t p = w * n_subblocks + sb;
-                    const float *kbar_row =
+                    const KbarT *kbar_row =
                         kbar_l +
                         (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
                     float dot = 0.0f;
-                    for (uint32_t d = 0; d < head_dim; ++d)
-                        dot += qr[d] * kbar_row[d];
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        dot += qr[d] * static_cast<float>(kbar_row[d]);
+                    }
                     const float mass = __expf(dot * scale - m) / denom;
                     if (reduce_max && n_subblocks > 1)
                         block_mass = fmaxf(block_mass, mass);
@@ -3642,11 +3761,11 @@ __global__ void block_attention_mass_paged_kernel(float *mass,
 // the first rope_dim of each head; dims beyond rope_dim pass through. Built ONCE
 // from the pristine post-prefill cache (blocks baked at true positions) and then
 // immutable — never rebuilt as blocks are re-RoPE'd into windows during assembly.
-// grid = (n_blocks, n_kv_heads), block = head_dim threads. Output kbar fp32,
-// layout [n_blocks, n_kv_heads, head_dim] indexed by block_id.
-template <typename T>
+// grid = (n_blocks, n_kv_heads), block = head_dim threads. Accumulation is fp32;
+// the persistent output follows the configured KV dtype.
+template <typename T, typename KbarT>
 __global__ void block_kmean_content_paged_kernel(const T *k_cache,
-                                                 float *kbar,
+                                                 KbarT *kbar,
                                                  uint32_t per_pos_size,
                                                  uint32_t head_dim,
                                                  uint32_t rope_dim,
@@ -3694,7 +3813,8 @@ __global__ void block_kmean_content_paged_kernel(const T *k_cache,
         acc += deroped;
     }
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
-    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] = acc * inv;
+    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] =
+        static_cast<KbarT>(acc * inv);
 }
 
 // block_kmean_content_batch_kernel (#91): build per-block content mean-Keys for
@@ -3716,8 +3836,9 @@ __global__ void block_kmean_content_paged_kernel(const T *k_cache,
 // block never straddles two chunks; the final chunk's last block may be partial.
 // grid = (n_blocks_chunk, n_kv_heads), block = head_dim threads. Writes the slot
 // slice at global block (kbar_block_base + j), layout [.., n_kv_heads, head_dim].
+template <typename KbarT>
 __global__ void block_kmean_content_batch_kernel(const float *k_batch,
-                                                 float *kbar,
+                                                 KbarT *kbar,
                                                  uint64_t kbar_block_base,
                                                  uint32_t k_stride,
                                                  uint32_t batch,
@@ -3773,7 +3894,8 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     const uint32_t n = r_hi - r_lo;
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
     const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
-    kbar[(blk * gridDim.y + h) * head_dim + d] = acc * inv;
+    kbar[(blk * gridDim.y + h) * head_dim + d] =
+        static_cast<KbarT>(acc * inv);
 }
 
 // Exact incremental variant for a chunk whose first row begins inside an
@@ -3781,8 +3903,9 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
 // have previously contributed to kbar. Merge their existing mean with the new
 // rows by exact prefix/new counts. An aligned replay passes offset=0, which
 // overwrites every replayed block and invalidates stale first-pass means.
+template <typename KbarT>
 __global__ void block_kmean_content_batch_merge_kernel(
-        const float *k_batch, float *kbar, uint64_t kbar_block_base,
+        const float *k_batch, KbarT *kbar, uint64_t kbar_block_base,
         uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
         uint32_t first_block_token_offset, uint32_t head_dim,
         uint32_t rope_dim, int32_t rope_base, float theta,
@@ -3846,8 +3969,9 @@ __global__ void block_kmean_content_batch_merge_kernel(
     const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
     const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
     const float prior_sum = prior > 0
-        ? kbar[out] * static_cast<float>(prior) : 0.0f;
-    kbar[out] = (prior_sum + acc) / static_cast<float>(prior + added);
+        ? static_cast<float>(kbar[out]) * static_cast<float>(prior) : 0.0f;
+    kbar[out] = static_cast<KbarT>(
+        (prior_sum + acc) / static_cast<float>(prior + added));
 }
 
 // derope_store_content_batch_kernel (MaxSim, raw-key retrieval): like
@@ -7144,6 +7268,68 @@ public:
         return launch_status("cuda rope_block_remap_paged_batched_device");
     }
 
+    DeviceStatus raw_k_scatter_rope_paged_batched_device(
+            DeviceTensor &k_cache, const DeviceTensor &raw_k,
+            uint64_t raw_element_offset, uint32_t n_blocks,
+            uint32_t max_n_tokens, uint32_t n_kv_heads,
+            uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+            const DeviceTensor &to_base, const DeviceTensor &n_tokens,
+            const DeviceTensor &page_indices, uint32_t page_size,
+            float theta) override {
+        if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return {};
+        if (page_size == 0) {
+            return {false,
+                    "raw_k_scatter_rope_paged_batched_device page_size=0"};
+        }
+        auto &dst = as_tensor(k_cache);
+        const auto &src = as_tensor(raw_k);
+        const auto &pages = as_tensor(page_indices);
+        if (dst.elem_size != src.elem_size ||
+            dst.is_fp16() != src.is_fp16() ||
+            dst.is_fp8_kv() != src.is_fp8_kv()) {
+            return {false, "raw K/cache dtype mismatch"};
+        }
+        if (pages.elem_size != sizeof(int32_t)) {
+            return {false, "raw K scatter page dtype mismatch"};
+        }
+        const bool is_fp16 = dst.is_fp16();
+        const bool is_fp8 = dst.is_fp8_kv();
+        const bool is_f32 = dst.elem_size == sizeof(float) &&
+                            !dst.is_q8_kv() && !dst.is_fp8_kv();
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false,
+                    "raw K scatter requires fp16, fp32, or fp8 KV"};
+        }
+        const uint64_t needed =
+            raw_element_offset +
+            static_cast<uint64_t>(n_blocks) * max_n_tokens * per_pos_size;
+        if (needed > src.count) {
+            return {false, "raw K scatter source is too small"};
+        }
+        void *dst_ptr = is_fp16 ? static_cast<void *>(dst.ptr_h())
+                                : is_fp8 ? static_cast<void *>(dst.ptr_fp8())
+                                         : static_cast<void *>(dst.ptr);
+        const void *src_ptr =
+            is_fp16 ? static_cast<const void *>(src.ptr_h())
+                    : is_fp8 ? static_cast<const void *>(src.ptr_fp8())
+                             : static_cast<const void *>(src.ptr);
+        const bool launched = is_fp8
+            ? ported::launch_raw_k_scatter_rope_paged_batched_fp8(
+                  dst_ptr, src_ptr, raw_element_offset, n_blocks,
+                  max_n_tokens, n_kv_heads, per_pos_size, head_dim, rope_dim,
+                  as_tensor(to_base).ptr_i32(),
+                  as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(), page_size,
+                  theta, exec_stream_)
+            : ported::launch_raw_k_scatter_rope_paged_batched(
+                  dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
+                  max_n_tokens, n_kv_heads, per_pos_size, head_dim, rope_dim,
+                  as_tensor(to_base).ptr_i32(),
+                  as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(), page_size,
+                  theta, exec_stream_);
+        if (!launched) return {false, "raw K scatter launch failed"};
+        return launch_status("cuda raw_k_scatter_rope_paged_batched_device");
+    }
+
     DeviceStatus block_kmean_paged_device(const DeviceTensor &k_cache,
                                           DeviceTensor &kbar,
                                           uint32_t n_blocks,
@@ -7175,15 +7361,15 @@ public:
         const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
                                   : is_fp8 ? static_cast<const void *>(c.ptr_fp8())
                                            : static_cast<const void *>(c.ptr);
-        const bool launched = is_fp8
-            ? ported::launch_block_kmean_paged_fp8(
-                  const_cast<void *>(ptr), kb.ptr, n_blocks, n_kv_heads,
-                  per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
-                  pages.ptr_i32(), page_size, exec_stream_)
-            : ported::launch_block_kmean_paged(
-                  const_cast<void *>(ptr), is_fp16, kb.ptr, n_blocks,
-                  n_kv_heads, per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
-                  pages.ptr_i32(), page_size, exec_stream_);
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        const bool launched = ported::launch_block_kmean_paged_typed(
+            const_cast<void *>(ptr), is_fp16, is_fp8,
+            static_cast<void *>(kb.ptr), kbar_dtype, n_blocks, n_kv_heads,
+            per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
+            pages.ptr_i32(), page_size, exec_stream_);
         if (!launched) {
             return {false, "block_kmean_paged launch failed"};
         }
@@ -7203,8 +7389,12 @@ public:
         auto &a = as_tensor(accum);
         const auto &qt = as_tensor(q);
         const auto &kb = as_tensor(kbar);
-        if (!ported::launch_block_attn_score_step(
-                a.ptr, qt.ptr, kb.ptr, q_stride, n_blocks,
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        if (!ported::launch_block_attn_score_step_typed(
+                a.ptr, qt.ptr, kb.ptr, kbar_dtype, q_stride, n_blocks,
                 n_heads, n_kv_heads, head_dim, scale, exec_stream_)) {
             return {false, "block_attn_score_step launch failed"};
         }
@@ -7234,8 +7424,13 @@ public:
         auto &sc = as_tensor(score);
         const auto &qm = as_tensor(q_multi);
         const auto &kb = as_tensor(kbar_multi);
-        if (!ported::launch_block_attn_score_softmax_pages(
-                sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        if (!ported::launch_block_attn_score_softmax_pages_typed(
+                sc.ptr, qm.ptr, kb.ptr, kbar_dtype, n_layers, n_tokens,
+                q_layer_stride,
                 n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
                 excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, exec_stream_)) {
             return {false, "block_attn_score_softmax_pages launch failed"};
@@ -7351,16 +7546,17 @@ public:
         const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
                                   : is_fp8 ? static_cast<const void *>(c.ptr_fp8())
                                            : static_cast<const void *>(c.ptr);
-        const bool launched = is_fp8
-            ? ported::launch_block_kmean_content_paged_fp8(
-                  const_cast<void *>(ptr), kb.ptr + out_elem_off, n_blocks,
-                  n_kv_heads, per_pos_size, head_dim, rope_dim, ob.ptr_i32(),
-                  bt.ptr_i32(), pages.ptr_i32(), page_size, theta, exec_stream_)
-            : ported::launch_block_kmean_content_paged(
-                  const_cast<void *>(ptr), is_fp16, kb.ptr + out_elem_off,
-                  n_blocks, n_kv_heads, per_pos_size, head_dim, rope_dim,
-                  ob.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size,
-                  theta, exec_stream_);
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        void *kbar_out = reinterpret_cast<uint8_t *>(kb.ptr) +
+                         out_elem_off * kb.elem_size;
+        const bool launched = ported::launch_block_kmean_content_paged_typed(
+            const_cast<void *>(ptr), is_fp16, is_fp8, kbar_out, kbar_dtype,
+            n_blocks, n_kv_heads, per_pos_size, head_dim, rope_dim,
+            ob.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size, theta,
+            exec_stream_);
         if (!launched) {
             return {false, "block_kmean_content_paged launch failed"};
         }
@@ -7386,12 +7582,17 @@ public:
         }
         const auto &kbt = as_tensor(k_batch);
         auto &kb = as_tensor(kbar);
-        if (kbt.elem_size != sizeof(float) || kb.elem_size != sizeof(float)) {
-            return {false, "block_kmean_content_batch_device requires fp32 buffers"};
+        if (kbt.elem_size != sizeof(float)) {
+            return {false, "block_kmean_content_batch_device requires fp32 K input"};
         }
         const float *k_ptr = kbt.ptr + static_cast<uint64_t>(src_row_off) * k_stride;
-        if (!ported::launch_block_kmean_content_batch(
-                k_ptr, kb.ptr, kbar_block_base, n_blocks_chunk, k_stride, batch,
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        if (!ported::launch_block_kmean_content_batch_typed(
+                k_ptr, kb.ptr, kbar_dtype, kbar_block_base, n_blocks_chunk,
+                k_stride, batch,
                 blk_tokens, n_kv_heads, head_dim, rope_dim, rope_base, theta,
                 n_subblocks, exec_stream_)) {
             return {false, "block_kmean_content_batch launch failed"};
@@ -7412,16 +7613,21 @@ public:
         }
         const auto &kbt = as_tensor(k_batch);
         auto &kb = as_tensor(kbar);
-        if (kbt.elem_size != sizeof(float) || kb.elem_size != sizeof(float)) {
+        if (kbt.elem_size != sizeof(float)) {
             return {false,
-                    "block_kmean_content_batch_merge_device requires fp32 buffers"};
+                    "block_kmean_content_batch_merge_device requires fp32 K input"};
         }
         if (first_block_token_offset >= blk_tokens) {
             return {false,
                     "block_kmean_content_batch_merge_device offset out of range"};
         }
-        if (!ported::launch_block_kmean_content_batch_merge(
-                kbt.ptr, kb.ptr, kbar_block_base, n_blocks_chunk, k_stride,
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        if (!ported::launch_block_kmean_content_batch_merge_typed(
+                kbt.ptr, kb.ptr, kbar_dtype, kbar_block_base,
+                n_blocks_chunk, k_stride,
                 batch, blk_tokens, first_block_token_offset, n_kv_heads,
                 head_dim, rope_dim, rope_base, theta, n_subblocks,
                 exec_stream_)) {
@@ -10208,24 +10414,128 @@ bool launch_rope_block_remap_paged_batched_fp8(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool launch_raw_k_scatter_rope_paged_batched(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream) {
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return true;
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    if (is_fp16) {
+        raw_k_scatter_rope_paged_batched_kernel<__half>
+            <<<grid, head_dim, 0, stream>>>(
+                static_cast<__half *>(cache),
+                static_cast<const __half *>(raw_k), raw_element_offset,
+                max_n_tokens, per_pos_size, head_dim, rope_dim, to_base,
+                n_tokens, page_indices, page_size, theta);
+    } else {
+        raw_k_scatter_rope_paged_batched_kernel<float>
+            <<<grid, head_dim, 0, stream>>>(
+                static_cast<float *>(cache),
+                static_cast<const float *>(raw_k), raw_element_offset,
+                max_n_tokens, per_pos_size, head_dim, rope_dim, to_base,
+                n_tokens, page_indices, page_size, theta);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_raw_k_scatter_rope_paged_batched_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream) {
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return true;
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    raw_k_scatter_rope_paged_batched_kernel<__nv_fp8_e4m3>
+        <<<grid, head_dim, 0, stream>>>(
+            static_cast<__nv_fp8_e4m3 *>(cache),
+            static_cast<const __nv_fp8_e4m3 *>(raw_k), raw_element_offset,
+            max_n_tokens, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+            page_indices, page_size, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename CacheT, typename KbarT>
+bool launch_block_kmean_paged_impl(
+        const CacheT *k_cache, KbarT *kbar, uint32_t n_blocks,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        const int32_t *win_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        cudaStream_t stream) {
+    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_blocks, n_kv_heads);
+    block_kmean_paged_kernel<CacheT, KbarT><<<grid, head_dim, 0, stream>>>(
+        k_cache, kbar, per_pos_size, head_dim, win_base, blk_tokens,
+        page_indices, page_size);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename CacheT>
+bool launch_block_kmean_paged_output(
+        const CacheT *k_cache, void *kbar, KbarDType dtype,
+        uint32_t n_blocks, uint32_t n_kv_heads, uint32_t per_pos_size,
+        uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, cudaStream_t stream) {
+    switch (dtype) {
+        case KbarDType::F32:
+            return launch_block_kmean_paged_impl(
+                k_cache, static_cast<float *>(kbar), n_blocks, n_kv_heads,
+                per_pos_size, head_dim, win_base, blk_tokens, page_indices,
+                page_size, stream);
+        case KbarDType::F16:
+            return launch_block_kmean_paged_impl(
+                k_cache, static_cast<__half *>(kbar), n_blocks, n_kv_heads,
+                per_pos_size, head_dim, win_base, blk_tokens, page_indices,
+                page_size, stream);
+        case KbarDType::FP8:
+            return launch_block_kmean_paged_impl(
+                k_cache, static_cast<__nv_fp8_e4m3 *>(kbar), n_blocks,
+                n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+                page_indices, page_size, stream);
+    }
+    return false;
+}
+
+bool launch_block_kmean_paged_typed(
+        void *k_cache, bool cache_is_fp16, bool cache_is_fp8, void *kbar,
+        KbarDType kbar_dtype, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, cudaStream_t stream) {
+    if (cache_is_fp8) {
+        return launch_block_kmean_paged_output(
+            static_cast<const __nv_fp8_e4m3 *>(k_cache), kbar, kbar_dtype,
+            n_blocks, n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+            page_indices, page_size, stream);
+    }
+    if (cache_is_fp16) {
+        return launch_block_kmean_paged_output(
+            static_cast<const __half *>(k_cache), kbar, kbar_dtype, n_blocks,
+            n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+            page_indices, page_size, stream);
+    }
+    return launch_block_kmean_paged_output(
+        static_cast<const float *>(k_cache), kbar, kbar_dtype, n_blocks,
+        n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+        page_indices, page_size, stream);
+}
+
 bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
                               uint32_t n_blocks, uint32_t n_kv_heads,
                               uint32_t per_pos_size, uint32_t head_dim,
                               const int32_t *win_base, const int32_t *blk_tokens,
                               const int32_t *page_indices, uint32_t page_size,
                               cudaStream_t stream) {
-    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
-    dim3 grid(n_blocks, n_kv_heads);
-    if (is_fp16) {
-        block_kmean_paged_kernel<__half><<<grid, head_dim, 0, stream>>>(
-            static_cast<const __half *>(k_cache), kbar, per_pos_size, head_dim,
-            win_base, blk_tokens, page_indices, page_size);
-    } else {
-        block_kmean_paged_kernel<float><<<grid, head_dim, 0, stream>>>(
-            static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
-            win_base, blk_tokens, page_indices, page_size);
-    }
-    return cudaGetLastError() == cudaSuccess;
+    return launch_block_kmean_paged_typed(
+        k_cache, is_fp16, false, kbar, KbarDType::F32, n_blocks, n_kv_heads,
+        per_pos_size, head_dim, win_base, blk_tokens, page_indices, page_size,
+        stream);
 }
 
 bool launch_block_kmean_paged_fp8(void *k_cache, float *kbar,
@@ -10235,12 +10545,48 @@ bool launch_block_kmean_paged_fp8(void *k_cache, float *kbar,
                                   const int32_t *blk_tokens,
                                   const int32_t *page_indices,
                                   uint32_t page_size, cudaStream_t stream) {
-    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
-    dim3 grid(n_blocks, n_kv_heads);
-    block_kmean_paged_kernel<__nv_fp8_e4m3><<<grid, head_dim, 0, stream>>>(
-        static_cast<const __nv_fp8_e4m3 *>(k_cache), kbar, per_pos_size,
-        head_dim, win_base, blk_tokens, page_indices, page_size);
+    return launch_block_kmean_paged_typed(
+        k_cache, false, true, kbar, KbarDType::F32, n_blocks, n_kv_heads,
+        per_pos_size, head_dim, win_base, blk_tokens, page_indices, page_size,
+        stream);
+}
+
+template <typename KbarT>
+bool launch_block_attn_score_step_impl(
+        float *accum, const float *q, const KbarT *kbar,
+        uint32_t q_stride, uint32_t n_blocks, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        cudaStream_t stream) {
+    if (n_blocks == 0 || n_heads == 0 || head_dim == 0) return true;
+    // Round threads up to a power of two >= head_dim for the shared reduction.
+    uint32_t threads = 1;
+    while (threads < head_dim) threads <<= 1;
+    const size_t shmem = static_cast<size_t>(threads) * sizeof(float);
+    block_attn_score_step_kernel<KbarT><<<n_blocks, threads, shmem, stream>>>(
+        accum, q, kbar, q_stride, n_heads, n_kv_heads, head_dim, scale);
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attn_score_step_typed(
+        float *accum, const float *q, const void *kbar,
+        KbarDType kbar_dtype, uint32_t q_stride, uint32_t n_blocks,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        float scale, cudaStream_t stream) {
+    switch (kbar_dtype) {
+        case KbarDType::F32:
+            return launch_block_attn_score_step_impl(
+                accum, q, static_cast<const float *>(kbar), q_stride,
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, stream);
+        case KbarDType::F16:
+            return launch_block_attn_score_step_impl(
+                accum, q, static_cast<const __half *>(kbar), q_stride,
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, stream);
+        case KbarDType::FP8:
+            return launch_block_attn_score_step_impl(
+                accum, q, static_cast<const __nv_fp8_e4m3 *>(kbar), q_stride,
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, stream);
+    }
+    return false;
 }
 
 bool launch_block_attn_score_step(float *accum, const float *q,
@@ -10248,18 +10594,16 @@ bool launch_block_attn_score_step(float *accum, const float *q,
                                   uint32_t n_blocks, uint32_t n_heads,
                                   uint32_t n_kv_heads, uint32_t head_dim,
                                   float scale, cudaStream_t stream) {
-    if (n_blocks == 0 || n_heads == 0 || head_dim == 0) return true;
-    // Round threads up to a power of two >= head_dim for the shared reduction.
-    uint32_t threads = 1;
-    while (threads < head_dim) threads <<= 1;
-    const size_t shmem = static_cast<size_t>(threads) * sizeof(float);
-    block_attn_score_step_kernel<<<n_blocks, threads, shmem, stream>>>(
-        accum, q, kbar, q_stride, n_heads, n_kv_heads, head_dim, scale);
-    return cudaGetLastError() == cudaSuccess;
+    return launch_block_attn_score_step_typed(
+        accum, q, kbar, KbarDType::F32, q_stride, n_blocks, n_heads,
+        n_kv_heads, head_dim, scale, stream);
 }
 
-bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
-                                           const float *kbar_multi,
+template <typename KbarT>
+bool launch_block_attn_score_softmax_pages_impl(
+                                           float *score,
+                                           const float *q_multi,
+                                           const KbarT *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
                                            uint32_t q_layer_stride,
                                            uint32_t n_blocks,
@@ -10295,7 +10639,8 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
     if (total64 <= kMaxPages && !force_tiled) {
         const uint32_t grid = n_layers * n_tokens;
         const size_t shmem = static_cast<size_t>(total64) * sizeof(float);
-        block_attn_score_softmax_pages_kernel<<<grid, threads, shmem, stream>>>(
+        block_attn_score_softmax_pages_kernel<KbarT>
+            <<<grid, threads, shmem, stream>>>(
             score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
             n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
             excl_lo_end, excl_hi_begin, ns, reduce_max);
@@ -10332,7 +10677,7 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
     float *global_max = partial_sum + n_jobs;
     float *global_sum = global_max + n_distributions64;
 
-    block_attn_softmax_pages_partial_lse_kernel<<<
+        block_attn_softmax_pages_partial_lse_kernel<KbarT><<<
         static_cast<uint32_t>(n_jobs), kSoftmaxPagesThreads, 0, stream>>>(
         partial_max, partial_sum, q_multi, kbar_multi, n_distributions,
         n_tiles, n_tokens, q_layer_stride, n_blocks, kbar_layer_stride,
@@ -10348,7 +10693,7 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
     if (err == cudaSuccess) {
         const uint32_t score_grid =
             (n_blocks + kSoftmaxPagesThreads - 1) / kSoftmaxPagesThreads;
-        block_attn_softmax_pages_recompute_kernel<<<
+        block_attn_softmax_pages_recompute_kernel<KbarT><<<
             score_grid, kSoftmaxPagesThreads, 0, stream>>>(
             score, q_multi, kbar_multi, global_max, global_sum, n_layers,
             n_tokens, q_layer_stride, n_blocks, kbar_layer_stride, n_heads,
@@ -10366,6 +10711,52 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                          (1024.0 * 1024.0));
     }
     return err == cudaSuccess && free_err == cudaSuccess;
+}
+
+bool launch_block_attn_score_softmax_pages_typed(
+        float *score, const float *q_multi, const void *kbar_multi,
+        KbarDType kbar_dtype, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t n_blocks,
+        uint32_t kbar_layer_stride, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t n_subblocks, uint32_t reduce_max, cudaStream_t stream) {
+    switch (kbar_dtype) {
+        case KbarDType::F32:
+            return launch_block_attn_score_softmax_pages_impl(
+                score, q_multi, static_cast<const float *>(kbar_multi),
+                n_layers, n_tokens, q_layer_stride, n_blocks,
+                kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, stream);
+        case KbarDType::F16:
+            return launch_block_attn_score_softmax_pages_impl(
+                score, q_multi, static_cast<const __half *>(kbar_multi),
+                n_layers, n_tokens, q_layer_stride, n_blocks,
+                kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, stream);
+        case KbarDType::FP8:
+            return launch_block_attn_score_softmax_pages_impl(
+                score, q_multi,
+                static_cast<const __nv_fp8_e4m3 *>(kbar_multi), n_layers,
+                n_tokens, q_layer_stride, n_blocks, kbar_layer_stride,
+                n_heads, n_kv_heads, head_dim, scale, excl_lo_end,
+                excl_hi_begin, n_subblocks, reduce_max, stream);
+    }
+    return false;
+}
+
+bool launch_block_attn_score_softmax_pages(
+        float *score, const float *q_multi, const float *kbar_multi,
+        uint32_t n_layers, uint32_t n_tokens, uint32_t q_layer_stride,
+        uint32_t n_blocks, uint32_t kbar_layer_stride, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t n_subblocks, uint32_t reduce_max, cudaStream_t stream) {
+    return launch_block_attn_score_softmax_pages_typed(
+        score, q_multi, kbar_multi, KbarDType::F32, n_layers, n_tokens,
+        q_layer_stride, n_blocks, kbar_layer_stride, n_heads, n_kv_heads,
+        head_dim, scale, excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
+        stream);
 }
 
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
@@ -10400,6 +10791,74 @@ bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
     return cudaGetLastError() == cudaSuccess;
 }
 
+template <typename CacheT, typename KbarT>
+bool launch_block_kmean_content_paged_impl(
+        const CacheT *k_cache, KbarT *kbar, uint32_t n_blocks,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *orig_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, float theta, cudaStream_t stream) {
+    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_blocks, n_kv_heads);
+    block_kmean_content_paged_kernel<CacheT, KbarT>
+        <<<grid, head_dim, 0, stream>>>(
+            k_cache, kbar, per_pos_size, head_dim, rope_dim, orig_base,
+            blk_tokens, page_indices, page_size, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename CacheT>
+bool launch_block_kmean_content_paged_output(
+        const CacheT *k_cache, void *kbar, KbarDType dtype,
+        uint32_t n_blocks, uint32_t n_kv_heads, uint32_t per_pos_size,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *orig_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, float theta, cudaStream_t stream) {
+    switch (dtype) {
+        case KbarDType::F32:
+            return launch_block_kmean_content_paged_impl(
+                k_cache, static_cast<float *>(kbar), n_blocks, n_kv_heads,
+                per_pos_size, head_dim, rope_dim, orig_base, blk_tokens,
+                page_indices, page_size, theta, stream);
+        case KbarDType::F16:
+            return launch_block_kmean_content_paged_impl(
+                k_cache, static_cast<__half *>(kbar), n_blocks, n_kv_heads,
+                per_pos_size, head_dim, rope_dim, orig_base, blk_tokens,
+                page_indices, page_size, theta, stream);
+        case KbarDType::FP8:
+            return launch_block_kmean_content_paged_impl(
+                k_cache, static_cast<__nv_fp8_e4m3 *>(kbar), n_blocks,
+                n_kv_heads, per_pos_size, head_dim, rope_dim, orig_base,
+                blk_tokens, page_indices, page_size, theta, stream);
+    }
+    return false;
+}
+
+bool launch_block_kmean_content_paged_typed(
+        void *k_cache, bool cache_is_fp16, bool cache_is_fp8, void *kbar,
+        KbarDType kbar_dtype, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *orig_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream) {
+    if (cache_is_fp8) {
+        return launch_block_kmean_content_paged_output(
+            static_cast<const __nv_fp8_e4m3 *>(k_cache), kbar, kbar_dtype,
+            n_blocks, n_kv_heads, per_pos_size, head_dim, rope_dim, orig_base,
+            blk_tokens, page_indices, page_size, theta, stream);
+    }
+    if (cache_is_fp16) {
+        return launch_block_kmean_content_paged_output(
+            static_cast<const __half *>(k_cache), kbar, kbar_dtype, n_blocks,
+            n_kv_heads, per_pos_size, head_dim, rope_dim, orig_base,
+            blk_tokens, page_indices, page_size, theta, stream);
+    }
+    return launch_block_kmean_content_paged_output(
+        static_cast<const float *>(k_cache), kbar, kbar_dtype, n_blocks,
+        n_kv_heads, per_pos_size, head_dim, rope_dim, orig_base, blk_tokens,
+        page_indices, page_size, theta, stream);
+}
+
 bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       uint32_t n_blocks, uint32_t n_kv_heads,
                                       uint32_t per_pos_size, uint32_t head_dim,
@@ -10408,18 +10867,10 @@ bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       const int32_t *page_indices,
                                       uint32_t page_size, float theta,
                                       cudaStream_t stream) {
-    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
-    dim3 grid(n_blocks, n_kv_heads);
-    if (is_fp16) {
-        block_kmean_content_paged_kernel<__half><<<grid, head_dim, 0, stream>>>(
-            static_cast<const __half *>(k_cache), kbar, per_pos_size, head_dim,
-            rope_dim, orig_base, blk_tokens, page_indices, page_size, theta);
-    } else {
-        block_kmean_content_paged_kernel<float><<<grid, head_dim, 0, stream>>>(
-            static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
-            rope_dim, orig_base, blk_tokens, page_indices, page_size, theta);
-    }
-    return cudaGetLastError() == cudaSuccess;
+    return launch_block_kmean_content_paged_typed(
+        k_cache, is_fp16, false, kbar, KbarDType::F32, n_blocks, n_kv_heads,
+        per_pos_size, head_dim, rope_dim, orig_base, blk_tokens, page_indices,
+        page_size, theta, stream);
 }
 
 bool launch_block_kmean_content_paged_fp8(
@@ -10428,37 +10879,73 @@ bool launch_block_kmean_content_paged_fp8(
         const int32_t *orig_base, const int32_t *blk_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
         cudaStream_t stream) {
-    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
-    dim3 grid(n_blocks, n_kv_heads);
-    block_kmean_content_paged_kernel<__nv_fp8_e4m3>
-        <<<grid, head_dim, 0, stream>>>(
-            static_cast<const __nv_fp8_e4m3 *>(k_cache), kbar, per_pos_size,
-            head_dim, rope_dim, orig_base, blk_tokens, page_indices, page_size,
-            theta);
-    return cudaGetLastError() == cudaSuccess;
+    return launch_block_kmean_content_paged_typed(
+        k_cache, false, true, kbar, KbarDType::F32, n_blocks, n_kv_heads,
+        per_pos_size, head_dim, rope_dim, orig_base, blk_tokens, page_indices,
+        page_size, theta, stream);
 }
 
-bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
-                                      uint64_t kbar_block_base,
-                                      uint32_t n_blocks_chunk, uint32_t k_stride,
-                                      uint32_t batch, uint32_t blk_tokens,
-                                      uint32_t n_kv_heads, uint32_t head_dim,
-                                      uint32_t rope_dim, int32_t rope_base,
-                                      float theta, uint32_t n_subblocks,
-                                      cudaStream_t stream) {
+template <typename KbarT>
+bool launch_block_kmean_content_batch_impl(
+        const float *k_batch, KbarT *kbar, uint64_t kbar_block_base,
+        uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+        uint32_t blk_tokens, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t rope_dim, int32_t rope_base, float theta,
+        uint32_t n_subblocks, cudaStream_t stream) {
     if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 || batch == 0) {
         return true;
     }
     const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
     dim3 grid(n_blocks_chunk * ns, n_kv_heads);
-    block_kmean_content_batch_kernel<<<grid, head_dim, 0, stream>>>(
+    block_kmean_content_batch_kernel<KbarT><<<grid, head_dim, 0, stream>>>(
         k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens, head_dim,
         rope_dim, rope_base, theta, ns);
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool launch_block_kmean_content_batch_merge(
+bool launch_block_kmean_content_batch_typed(
+        const float *k_batch, void *kbar, KbarDType kbar_dtype,
+        uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+        uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+        int32_t rope_base, float theta, uint32_t n_subblocks,
+        cudaStream_t stream) {
+    switch (kbar_dtype) {
+        case KbarDType::F32:
+            return launch_block_kmean_content_batch_impl(
+                k_batch, static_cast<float *>(kbar), kbar_block_base,
+                n_blocks_chunk, k_stride, batch, blk_tokens, n_kv_heads,
+                head_dim, rope_dim, rope_base, theta, n_subblocks, stream);
+        case KbarDType::F16:
+            return launch_block_kmean_content_batch_impl(
+                k_batch, static_cast<__half *>(kbar), kbar_block_base,
+                n_blocks_chunk, k_stride, batch, blk_tokens, n_kv_heads,
+                head_dim, rope_dim, rope_base, theta, n_subblocks, stream);
+        case KbarDType::FP8:
+            return launch_block_kmean_content_batch_impl(
+                k_batch, static_cast<__nv_fp8_e4m3 *>(kbar),
+                kbar_block_base, n_blocks_chunk, k_stride, batch, blk_tokens,
+                n_kv_heads, head_dim, rope_dim, rope_base, theta, n_subblocks,
+                stream);
+    }
+    return false;
+}
+
+bool launch_block_kmean_content_batch(
         const float *k_batch, float *kbar, uint64_t kbar_block_base,
+        uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+        uint32_t blk_tokens, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t rope_dim, int32_t rope_base, float theta,
+        uint32_t n_subblocks, cudaStream_t stream) {
+    return launch_block_kmean_content_batch_typed(
+        k_batch, kbar, KbarDType::F32, kbar_block_base, n_blocks_chunk,
+        k_stride, batch, blk_tokens, n_kv_heads, head_dim, rope_dim,
+        rope_base, theta, n_subblocks, stream);
+}
+
+template <typename KbarT>
+bool launch_block_kmean_content_batch_merge_impl(
+        const float *k_batch, KbarT *kbar, uint64_t kbar_block_base,
         uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
         uint32_t blk_tokens, uint32_t first_block_token_offset,
         uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
@@ -10471,10 +10958,54 @@ bool launch_block_kmean_content_batch_merge(
     if (first_block_token_offset >= blk_tokens) return false;
     const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
     dim3 grid(n_blocks_chunk * ns, n_kv_heads);
-    block_kmean_content_batch_merge_kernel<<<grid, head_dim, 0, stream>>>(
+    block_kmean_content_batch_merge_kernel<KbarT>
+        <<<grid, head_dim, 0, stream>>>(
         k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens,
         first_block_token_offset, head_dim, rope_dim, rope_base, theta, ns);
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_content_batch_merge_typed(
+        const float *k_batch, void *kbar, KbarDType kbar_dtype,
+        uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+        uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+        uint32_t first_block_token_offset, uint32_t n_kv_heads,
+        uint32_t head_dim, uint32_t rope_dim, int32_t rope_base,
+        float theta, uint32_t n_subblocks, cudaStream_t stream) {
+    switch (kbar_dtype) {
+        case KbarDType::F32:
+            return launch_block_kmean_content_batch_merge_impl(
+                k_batch, static_cast<float *>(kbar), kbar_block_base,
+                n_blocks_chunk, k_stride, batch, blk_tokens,
+                first_block_token_offset, n_kv_heads, head_dim, rope_dim,
+                rope_base, theta, n_subblocks, stream);
+        case KbarDType::F16:
+            return launch_block_kmean_content_batch_merge_impl(
+                k_batch, static_cast<__half *>(kbar), kbar_block_base,
+                n_blocks_chunk, k_stride, batch, blk_tokens,
+                first_block_token_offset, n_kv_heads, head_dim, rope_dim,
+                rope_base, theta, n_subblocks, stream);
+        case KbarDType::FP8:
+            return launch_block_kmean_content_batch_merge_impl(
+                k_batch, static_cast<__nv_fp8_e4m3 *>(kbar),
+                kbar_block_base, n_blocks_chunk, k_stride, batch, blk_tokens,
+                first_block_token_offset, n_kv_heads, head_dim, rope_dim,
+                rope_base, theta, n_subblocks, stream);
+    }
+    return false;
+}
+
+bool launch_block_kmean_content_batch_merge(
+        const float *k_batch, float *kbar, uint64_t kbar_block_base,
+        uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+        uint32_t blk_tokens, uint32_t first_block_token_offset,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+        int32_t rope_base, float theta, uint32_t n_subblocks,
+        cudaStream_t stream) {
+    return launch_block_kmean_content_batch_merge_typed(
+        k_batch, kbar, KbarDType::F32, kbar_block_base, n_blocks_chunk,
+        k_stride, batch, blk_tokens, first_block_token_offset, n_kv_heads,
+        head_dim, rope_dim, rope_base, theta, n_subblocks, stream);
 }
 
 bool launch_derope_store_content_batch(const float *k_batch, float *kraw,

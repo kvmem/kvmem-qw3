@@ -21,6 +21,35 @@ void require_status(const DeviceStatus &st) {
     if (!st.ok) throw std::runtime_error(st.message);
 }
 
+bool scorer_unavailable(std::string *failure_reason, const char *reason) {
+    if (failure_reason) *failure_reason = reason;
+    return false;
+}
+
+bool scorer_backend_unavailable(std::string *failure_reason,
+                                const char *reason,
+                                const DeviceStatus &status) {
+    if (!failure_reason) return false;
+    *failure_reason = reason;
+    if (!status.message || !*status.message) return false;
+    failure_reason->push_back('(');
+    constexpr size_t kMaxDetail = 160;
+    size_t emitted = 0;
+    for (const char *p = status.message; *p && emitted < kMaxDetail; ++p) {
+        const char ch = *p;
+        const unsigned char u = static_cast<unsigned char>(ch);
+        const bool keep = (u >= 'a' && u <= 'z') ||
+                          (u >= 'A' && u <= 'Z') ||
+                          (u >= '0' && u <= '9') ||
+                          ch == '.' || ch == '_' || ch == '-' ||
+                          ch == '/' || ch == ':';
+        failure_reason->push_back(keep ? ch : '_');
+        ++emitted;
+    }
+    failure_reason->push_back(')');
+    return false;
+}
+
 uint64_t tensor_rows(const GgufTensorInfo &tensor) {
     if (tensor.dims.size() < 2) return 1;
     uint64_t rows = 1;
@@ -175,6 +204,14 @@ bool kvmem_mtp_tier_enabled() {
     return env_flag_enabled("QW3_KVMEM_MTP_TIER", true);
 }
 
+// Long-context MTP path (default ON with immutable K). Logical token/page
+// identities remain monotonic, but every MTP Q/K is baked directly in the
+// compact KVMem window frame and historical MTP K is rebuilt from an unrotated
+// CPU authority. QW3_KVMEM_MTP_LOCAL_POSITIONS=0 keeps the legacy path for A/B.
+bool kvmem_mtp_local_positions_enabled() {
+    return env_flag_enabled("QW3_KVMEM_MTP_LOCAL_POSITIONS", true);
+}
+
 // ---- KVMem component timing (env QW3_KVMEM_TIMING; OFF by default) ---------
 // Process-global wall-clock accumulators for the tier/selection components so
 // the latency-breakdown harness can attribute TTFT/TBT to retrieval (selection
@@ -184,6 +221,17 @@ bool kvmem_mtp_tier_enabled() {
 // perturbs throughput, so throughput must be measured WITHOUT this flag.
 bool kvmem_timing_flag() {
     return env_flag_enabled("QW3_KVMEM_TIMING");
+}
+
+// Emit one detailed line per semantic re-selection. Unlike the cumulative
+// QW3_KVMEM_TIMING counters, this records how much of an asynchronous prefetch
+// actually ran before finish_reselect() had to wait for it.
+bool kvmem_perf_trace_flag() {
+    return env_flag_enabled("QW3_KVMEM_PERF_TRACE");
+}
+
+bool kvmem_measure_timing_flag() {
+    return kvmem_timing_flag() || kvmem_perf_trace_flag();
 }
 
 struct KvMemTimingTotals {
@@ -309,10 +357,19 @@ QwenExecutor::KvMemTierUsage QwenExecutor::kvmem_tier_usage() const {
     }
     if (kvmem_cpu_tier_) {
         u.cpu_tier = true;
-        u.cpu_used_bytes =
+        u.cpu_spill_bytes =
             static_cast<uint64_t>(kvmem_cpu_tier_->used_slots()) * u.block_bytes;
-        u.cpu_capacity_bytes =
-            static_cast<uint64_t>(kvmem_cpu_tier_->slot_count()) * u.block_bytes;
+        u.cpu_raw_k_bytes =
+            kvmem_raw_k_mirror_bytes_ + kvmem_raw_mtp_k_mirror_bytes_;
+        if (kvmem_sparse_cpu_tier_) {
+            u.cpu_used_bytes = u.cpu_raw_k_bytes + kvmem_cpu_sparse_bytes_;
+            u.cpu_capacity_bytes = kvmem_cpu_budget_bytes_;
+        } else {
+            u.cpu_used_bytes = u.cpu_spill_bytes;
+            u.cpu_capacity_bytes =
+                static_cast<uint64_t>(kvmem_cpu_tier_->slot_count()) *
+                u.block_bytes;
+        }
     }
     if (kvmem_nvme_tier_) {
         u.nvme_tier = true;
@@ -490,19 +547,7 @@ DeviceTensor &QwenExecutor::k_cache(uint32_t layer) {
     return *k_cache_[layer];
 }
 
-DeviceTensor &QwenExecutor::working_k_cache(uint32_t layer) {
-    if (layer >= kvmem_work_k_cache_storage_.size() ||
-        !kvmem_work_k_cache_storage_[layer]) {
-        throw std::runtime_error("KVMem working K cache missing for layer " +
-                                 std::to_string(layer));
-    }
-    return *kvmem_work_k_cache_storage_[layer];
-}
-
 DeviceTensor &QwenExecutor::attention_k_cache(uint32_t layer) {
-    if (kvmem_immutable_source_k_ && kvmem_active_) {
-        return working_k_cache(layer);
-    }
     return k_cache(layer);
 }
 
@@ -581,17 +626,36 @@ void QwenExecutor::reset_state() {
     kvmem_registered_pos_ = 0;
     kvmem_query_replay_active_ = false;
     kvmem_keep_selected_prefill_ = false;
+    kvmem_defer_prefill_pressure_ = false;
+    kvmem_deferred_prefill_tokens_ = 0;
+    last_forward_logical_base_ = 0;
+    last_forward_rope_base_ = 0;
+    last_forward_rows_ = 0;
     window_pages_host_.clear();
     window_page_count_ = 0;
     mtp_window_pages_host_.clear();
     mtp_window_page_count_ = 0;
     window_query_pos_ = 0;
     if (kvmem_cpu_tier_) kvmem_cpu_tier_->clear();
+    if (kvmem_sparse_cpu_tier_) {
+        for (auto &slot : kvmem_cpu_sparse_slots_) slot.reset();
+        kvmem_cpu_sparse_bytes_ = 0;
+    }
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
     kvmem_stage_pinned_.reset();
     kvmem_prefetch_ = KvMemPrefetchState{};
+    kvmem_last_prefetch_perf_ = KvMemPrefetchPerf{};
+    kvmem_last_stage_out_perf_ = KvMemStageOutPerf{};
+    kvmem_reselect_perf_ = KvMemReselectPerf{};
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};
+    // Keep raw mirror validity across a reset: the plain prefix-cache can adopt
+    // a previously computed prefix without re-running its layers. A cold prompt
+    // overwrites every registered token before it can be selected, while a
+    // prefix hit needs these existing raw rows for a later periodic refresh.
+    kvmem_raw_decode_block_start_ = -1;
+    kvmem_raw_decode_first_row_ = 0;
+    kvmem_raw_decode_rows_ = 0;
     // Cumulative-attention selection signal: drop the live interval; buffers stay
     // allocated (reused next session). bs_score_layer_ is model-fixed, keep it.
     bs_score_ready_ = false;
@@ -1066,12 +1130,8 @@ void QwenExecutor::allocate_kvmem_gpu_cache(uint64_t physical_slots) {
 
     kvmem_k_cache_storage_.clear();
     kvmem_v_cache_storage_.clear();
-    kvmem_work_k_cache_storage_.clear();
     kvmem_k_cache_storage_.resize(weights_.n_layers());
     kvmem_v_cache_storage_.resize(weights_.n_layers());
-    if (kvmem_immutable_source_k_) {
-        kvmem_work_k_cache_storage_.resize(weights_.n_layers());
-    }
     kvmem_kv_cache_view_.physical_slots = physical_slots;
     kvmem_kv_cache_view_.k_cache.assign(weights_.n_layers(), nullptr);
     kvmem_kv_cache_view_.v_cache.assign(weights_.n_layers(), nullptr);
@@ -1082,49 +1142,675 @@ void QwenExecutor::allocate_kvmem_gpu_cache(uint64_t physical_slots) {
             "kvmem_bounded_k_cache_l" + std::to_string(il);
         const std::string vlabel =
             "kvmem_bounded_v_cache_l" + std::to_string(il);
-        const std::string wklabel =
-            "kvmem_working_k_cache_l" + std::to_string(il);
         if (kv_use_q8) {
             kvmem_k_cache_storage_[il] = backend_.tensor_q8_kv(
                 kv_per_pos * physical_slots, cfg.head_dim, klabel.c_str());
             kvmem_v_cache_storage_[il] = backend_.tensor_q8_kv(
                 kv_per_pos * physical_slots, cfg.head_dim, vlabel.c_str());
-            if (kvmem_immutable_source_k_) {
-                kvmem_work_k_cache_storage_[il] = backend_.tensor_q8_kv(
-                    kv_per_pos * physical_slots, cfg.head_dim, wklabel.c_str());
-            }
         } else if (kv_use_fp8) {
             kvmem_k_cache_storage_[il] = backend_.tensor_fp8_kv(
                 kv_per_pos * physical_slots, klabel.c_str());
             kvmem_v_cache_storage_[il] = backend_.tensor_fp8_kv(
                 kv_per_pos * physical_slots, vlabel.c_str());
-            if (kvmem_immutable_source_k_) {
-                kvmem_work_k_cache_storage_[il] = backend_.tensor_fp8_kv(
-                    kv_per_pos * physical_slots, wklabel.c_str());
-            }
         } else if (kv_use_fp16) {
             kvmem_k_cache_storage_[il] = backend_.tensor_f16(
                 kv_per_pos * physical_slots, klabel.c_str());
             kvmem_v_cache_storage_[il] = backend_.tensor_f16(
                 kv_per_pos * physical_slots, vlabel.c_str());
-            if (kvmem_immutable_source_k_) {
-                kvmem_work_k_cache_storage_[il] = backend_.tensor_f16(
-                    kv_per_pos * physical_slots, wklabel.c_str());
-            }
         } else {
             kvmem_k_cache_storage_[il] = backend_.tensor_f32(
                 kv_per_pos * physical_slots, klabel.c_str());
             kvmem_v_cache_storage_[il] = backend_.tensor_f32(
                 kv_per_pos * physical_slots, vlabel.c_str());
-            if (kvmem_immutable_source_k_) {
-                kvmem_work_k_cache_storage_[il] = backend_.tensor_f32(
-                    kv_per_pos * physical_slots, wklabel.c_str());
-            }
         }
         kvmem_kv_cache_view_.k_cache[il] = kvmem_k_cache_storage_[il].get();
         kvmem_kv_cache_view_.v_cache[il] = kvmem_v_cache_storage_[il].get();
     }
     external_kv_cache_ = &kvmem_kv_cache_view_;
+}
+
+std::unique_ptr<DeviceTensor> QwenExecutor::kvmem_alloc_raw_k_tensor(
+        uint64_t count, const char *label) {
+    const char *dtype = std::getenv("QW3_KV_DTYPE");
+    if (dtype && std::strcmp(dtype, "fp32") == 0) {
+        return backend_.tensor_f32(count, label);
+    }
+    if (dtype && std::strcmp(dtype, "fp8") == 0) {
+        return backend_.tensor_fp8_kv(count, label);
+    }
+    if (dtype && std::strcmp(dtype, "q8") == 0) {
+        throw std::runtime_error(
+            "immutable raw-K capture does not support q8 row-scale storage");
+    }
+    return backend_.tensor_f16(count, label);
+}
+
+std::unique_ptr<DeviceTensor> QwenExecutor::kvmem_alloc_mean_index_tensor(
+        uint64_t count, const char *label) {
+    const char *dtype = std::getenv("QW3_KV_DTYPE");
+    if (dtype && std::strcmp(dtype, "fp32") == 0) {
+        return backend_.tensor_f32(count, label);
+    }
+    if (dtype && std::strcmp(dtype, "fp8") == 0) {
+        return backend_.tensor_fp8_kv(count, label);
+    }
+    // `--kv-dtype fp16` is IEEE binary16 (`__half`), not bfloat16.
+    // q8 has a per-row scale and cannot represent a standalone mean vector
+    // with the current tensor interface, so retain fp16 for that legacy mode.
+    return backend_.tensor_f16(count, label);
+}
+
+bool QwenExecutor::kvmem_cpu_budget_has(uint64_t bytes) const {
+    if (!kvmem_sparse_cpu_tier_) return true;
+    const uint64_t used = kvmem_raw_k_mirror_bytes_ +
+                          kvmem_raw_mtp_k_mirror_bytes_ +
+                          kvmem_cpu_sparse_bytes_;
+    return used <= kvmem_cpu_budget_bytes_ &&
+           bytes <= kvmem_cpu_budget_bytes_ - used;
+}
+
+uint8_t *QwenExecutor::kvmem_cpu_slot_data(int32_t slot) {
+    if (slot < 0 || !kvmem_cpu_tier_) return nullptr;
+    if (kvmem_sparse_cpu_tier_) {
+        const size_t i = static_cast<size_t>(slot);
+        return i < kvmem_cpu_sparse_slots_.size()
+            ? kvmem_cpu_sparse_slots_[i].get()
+            : nullptr;
+    }
+    uint8_t *base = kvmem_cpu_data();
+    return base ? base + kvmem_cpu_tier_->slot_offset(slot) : nullptr;
+}
+
+const uint8_t *QwenExecutor::kvmem_cpu_slot_data(int32_t slot) const {
+    if (slot < 0 || !kvmem_cpu_tier_) return nullptr;
+    if (kvmem_sparse_cpu_tier_) {
+        const size_t i = static_cast<size_t>(slot);
+        return i < kvmem_cpu_sparse_slots_.size()
+            ? kvmem_cpu_sparse_slots_[i].get()
+            : nullptr;
+    }
+    const uint8_t *base = kvmem_cpu_data();
+    return base ? base + kvmem_cpu_tier_->slot_offset(slot) : nullptr;
+}
+
+bool QwenExecutor::kvmem_reserve_cpu_slot(int32_t slot) {
+    if (!kvmem_sparse_cpu_tier_) return kvmem_cpu_slot_data(slot) != nullptr;
+    if (slot < 0 || !block_store_) return false;
+    const size_t i = static_cast<size_t>(slot);
+    if (i >= kvmem_cpu_sparse_slots_.size()) return false;
+    if (kvmem_cpu_sparse_slots_[i]) return true;
+    const uint64_t bytes = block_store_->config().estimated_block_bytes;
+    if (bytes == 0 || !kvmem_cpu_budget_has(bytes)) return false;
+    auto storage = std::make_unique<uint8_t[]>(static_cast<size_t>(bytes));
+    kvmem_cpu_sparse_slots_[i] = std::move(storage);
+    kvmem_cpu_sparse_bytes_ += bytes;
+    return true;
+}
+
+void QwenExecutor::kvmem_release_cpu_slot(int32_t slot) {
+    if (!kvmem_sparse_cpu_tier_ || slot < 0 || !block_store_) return;
+    const size_t i = static_cast<size_t>(slot);
+    if (i >= kvmem_cpu_sparse_slots_.size() ||
+        !kvmem_cpu_sparse_slots_[i]) {
+        return;
+    }
+    const uint64_t bytes = block_store_->config().estimated_block_bytes;
+    kvmem_cpu_sparse_slots_[i].reset();
+    kvmem_cpu_sparse_bytes_ =
+        bytes <= kvmem_cpu_sparse_bytes_ ? kvmem_cpu_sparse_bytes_ - bytes : 0;
+}
+
+void QwenExecutor::kvmem_evict_cpu_for_raw(uint64_t bytes) {
+    if (!kvmem_sparse_cpu_tier_ || kvmem_cpu_budget_has(bytes)) return;
+    if (!kvmem_cpu_tier_ || !kvmem_nvme_tier_ || !block_store_) {
+        throw std::runtime_error(
+            "KVMem immutable raw-K growth exhausted --kvmem-cpu-gb; "
+            "configure an NVMe tier or raise the CPU budget");
+    }
+    while (!kvmem_cpu_budget_has(bytes)) {
+        const int32_t victim_i = kvmem_cpu_tier_->lru_victim();
+        if (victim_i < 0) {
+            throw std::runtime_error(
+                "KVMem immutable raw-K alone exhausted --kvmem-cpu-gb");
+        }
+        const uint32_t victim = static_cast<uint32_t>(victim_i);
+        const int32_t slot = kvmem_cpu_tier_->block_slot(victim);
+        const uint8_t *src = kvmem_cpu_slot_data(slot);
+        if (slot < 0 || !src ||
+            victim >= block_store_->blocks().size()) {
+            throw std::runtime_error(
+                "KVMem sparse CPU tier lost an LRU block while growing raw-K");
+        }
+        const uint64_t victim_bytes =
+            kvmem_block_spill_bytes(block_store_->blocks()[victim]);
+        kvmem_nvme_tier_->write_block(victim, src, victim_bytes);
+        block_store_->set_block_tier(
+            victim, KvTier::SSD, -1,
+            kvmem_nvme_tier_->block_slot(victim));
+        kvmem_cpu_tier_->release_block(victim);
+        kvmem_release_cpu_slot(slot);
+        if (kvmem_tier_trace_enabled()) {
+            std::fprintf(
+                stderr,
+                "[kvmem-tier] raw_k_budget_evict block=%u to=nvme "
+                "raw_bytes=%llu cpu_spill_bytes=%llu budget_bytes=%llu\n",
+                victim,
+                static_cast<unsigned long long>(
+                    kvmem_raw_k_mirror_bytes_ +
+                    kvmem_raw_mtp_k_mirror_bytes_),
+                static_cast<unsigned long long>(kvmem_cpu_sparse_bytes_),
+                static_cast<unsigned long long>(kvmem_cpu_budget_bytes_));
+        }
+    }
+}
+
+void QwenExecutor::kvmem_ensure_raw_k_chunks(
+        uint32_t base, uint32_t rows, bool mtp) {
+    if (rows == 0) return;
+    const uint64_t end = static_cast<uint64_t>(base) + rows;
+    if (end > kv_ctx_size_ || kvmem_raw_k_chunk_tokens_ == 0 ||
+        kvmem_raw_k_row_bytes_ == 0) {
+        throw std::runtime_error("immutable raw-K chunk range is invalid");
+    }
+    auto &chunks = mtp ? kvmem_raw_mtp_k_chunks_ : kvmem_raw_k_chunks_;
+    const uint32_t first = base / kvmem_raw_k_chunk_tokens_;
+    const uint32_t last =
+        static_cast<uint32_t>((end - 1) / kvmem_raw_k_chunk_tokens_);
+    const uint64_t layers = mtp ? 1 : kvmem_raw_layers_.size();
+    const uint64_t chunk_bytes =
+        layers * kvmem_raw_k_chunk_tokens_ * kvmem_raw_k_row_bytes_;
+    if (last >= chunks.size() ||
+        chunk_bytes > static_cast<uint64_t>(
+            std::numeric_limits<size_t>::max())) {
+        throw std::runtime_error("immutable raw-K chunk allocation is too large");
+    }
+    for (uint32_t chunk = first; chunk <= last; ++chunk) {
+        if (chunks[chunk]) continue;
+        kvmem_evict_cpu_for_raw(chunk_bytes);
+        if (!kvmem_cpu_budget_has(chunk_bytes)) {
+            throw std::runtime_error(
+                "immutable raw-K chunk exceeds the configured CPU budget");
+        }
+        auto storage =
+            std::make_unique<uint8_t[]>(static_cast<size_t>(chunk_bytes));
+        chunks[chunk] = std::move(storage);
+        if (mtp) {
+            kvmem_raw_mtp_k_mirror_bytes_ += chunk_bytes;
+        } else {
+            kvmem_raw_k_mirror_bytes_ += chunk_bytes;
+        }
+    }
+}
+
+void QwenExecutor::kvmem_write_raw_k(
+        uint32_t layer_slot, uint32_t base, const uint8_t *src,
+        uint32_t rows, bool mtp) {
+    if (rows == 0) return;
+    kvmem_ensure_raw_k_chunks(base, rows, mtp);
+    auto &chunks = mtp ? kvmem_raw_mtp_k_chunks_ : kvmem_raw_k_chunks_;
+    uint32_t pos = base;
+    uint32_t left = rows;
+    while (left > 0) {
+        const uint32_t chunk = pos / kvmem_raw_k_chunk_tokens_;
+        const uint32_t within = pos % kvmem_raw_k_chunk_tokens_;
+        const uint32_t take =
+            std::min(left, kvmem_raw_k_chunk_tokens_ - within);
+        const uint64_t layer_base = mtp
+            ? 0
+            : static_cast<uint64_t>(layer_slot) *
+                  kvmem_raw_k_chunk_tokens_;
+        uint8_t *dst = chunks[chunk].get() +
+            (layer_base + within) * kvmem_raw_k_row_bytes_;
+        const uint64_t bytes =
+            static_cast<uint64_t>(take) * kvmem_raw_k_row_bytes_;
+        std::memcpy(dst, src, static_cast<size_t>(bytes));
+        src += bytes;
+        pos += take;
+        left -= take;
+    }
+}
+
+void QwenExecutor::kvmem_read_raw_k(
+        uint32_t layer_slot, uint32_t base, uint8_t *dst,
+        uint32_t rows, bool mtp) const {
+    if (rows == 0) return;
+    const auto &chunks =
+        mtp ? kvmem_raw_mtp_k_chunks_ : kvmem_raw_k_chunks_;
+    uint32_t pos = base;
+    uint32_t left = rows;
+    while (left > 0) {
+        const uint32_t chunk = pos / kvmem_raw_k_chunk_tokens_;
+        const uint32_t within = pos % kvmem_raw_k_chunk_tokens_;
+        const uint32_t take =
+            std::min(left, kvmem_raw_k_chunk_tokens_ - within);
+        if (chunk >= chunks.size() || !chunks[chunk]) {
+            throw std::runtime_error(
+                "immutable raw-K read references an unallocated chunk");
+        }
+        const uint64_t layer_base = mtp
+            ? 0
+            : static_cast<uint64_t>(layer_slot) *
+                  kvmem_raw_k_chunk_tokens_;
+        const uint8_t *src = chunks[chunk].get() +
+            (layer_base + within) * kvmem_raw_k_row_bytes_;
+        const uint64_t bytes =
+            static_cast<uint64_t>(take) * kvmem_raw_k_row_bytes_;
+        std::memcpy(dst, src, static_cast<size_t>(bytes));
+        dst += bytes;
+        pos += take;
+        left -= take;
+    }
+}
+
+void QwenExecutor::kvmem_truncate_raw_k(uint32_t token_pos) {
+    auto release_suffix = [&](auto &chunks, uint64_t chunk_bytes,
+                              uint64_t &allocated_bytes) {
+        const uint32_t first =
+            (token_pos + kvmem_raw_k_chunk_tokens_ - 1) /
+            kvmem_raw_k_chunk_tokens_;
+        for (uint32_t i = first; i < chunks.size(); ++i) {
+            if (!chunks[i]) continue;
+            chunks[i].reset();
+            allocated_bytes = chunk_bytes <= allocated_bytes
+                ? allocated_bytes - chunk_bytes
+                : 0;
+        }
+    };
+    if (kvmem_raw_k_chunk_tokens_ == 0) return;
+    const uint64_t main_chunk_bytes =
+        static_cast<uint64_t>(kvmem_raw_layers_.size()) *
+        kvmem_raw_k_chunk_tokens_ * kvmem_raw_k_row_bytes_;
+    const uint64_t mtp_chunk_bytes =
+        static_cast<uint64_t>(kvmem_raw_k_chunk_tokens_) *
+        kvmem_raw_k_row_bytes_;
+    release_suffix(kvmem_raw_k_chunks_, main_chunk_bytes,
+                   kvmem_raw_k_mirror_bytes_);
+    release_suffix(kvmem_raw_mtp_k_chunks_, mtp_chunk_bytes,
+                   kvmem_raw_mtp_k_mirror_bytes_);
+}
+
+void QwenExecutor::kvmem_ensure_raw_capture_capacity(uint32_t rows) {
+    if (!kvmem_immutable_source_k_ || rows == 0) return;
+    if (rows <= kvmem_raw_capture_rows_ &&
+        kvmem_raw_capture_dev_.size() == kvmem_raw_layers_.size() &&
+        kvmem_raw_capture_host_) {
+        return;
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint64_t per_pos =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    kvmem_raw_capture_rows_ = std::max(rows, kvmem_raw_capture_rows_);
+    kvmem_raw_capture_dev_.clear();
+    kvmem_raw_capture_dev_.reserve(kvmem_raw_layers_.size());
+    for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
+        const std::string label =
+            "kvmem_raw_k_capture_l" +
+            std::to_string(kvmem_raw_layers_[slot]);
+        kvmem_raw_capture_dev_.push_back(kvmem_alloc_raw_k_tensor(
+            static_cast<uint64_t>(kvmem_raw_capture_rows_) * per_pos,
+            label.c_str()));
+    }
+    const uint64_t host_bytes =
+        static_cast<uint64_t>(kvmem_raw_layers_.size()) *
+        kvmem_raw_capture_rows_ * kvmem_raw_k_row_bytes_;
+    kvmem_raw_capture_host_ =
+        backend_.host_buffer(host_bytes, "kvmem_raw_k_capture_host");
+}
+
+void QwenExecutor::kvmem_capture_raw_k_batch(
+        uint32_t layer, const DeviceTensor &raw_k, uint32_t batch) {
+    if (!kvmem_immutable_source_k_ || batch == 0 ||
+        layer >= kvmem_raw_layer_slot_.size()) {
+        return;
+    }
+    const int32_t slot = kvmem_raw_layer_slot_[layer];
+    if (slot < 0) return;
+    const QwenConfig &cfg = model_.config();
+    const uint32_t per_pos = cfg.n_kv_heads * cfg.head_dim;
+    require_status(backend_.kv_append_batch(
+        *kvmem_raw_capture_dev_[static_cast<uint32_t>(slot)], raw_k,
+        /*base_pos=*/0, per_pos, batch));
+}
+
+void QwenExecutor::kvmem_capture_raw_k_decode(
+        uint32_t layer, const DeviceTensor &raw_k, uint32_t row) {
+    if (!kvmem_immutable_source_k_ ||
+        layer >= kvmem_raw_layer_slot_.size()) {
+        return;
+    }
+    const int32_t slot = kvmem_raw_layer_slot_[layer];
+    if (slot < 0) return;
+    const QwenConfig &cfg = model_.config();
+    const uint32_t per_pos = cfg.n_kv_heads * cfg.head_dim;
+    require_status(backend_.kv_append(
+        *kvmem_raw_capture_dev_[static_cast<uint32_t>(slot)], raw_k,
+        row, per_pos));
+}
+
+void QwenExecutor::kvmem_flush_raw_k_capture(
+        uint32_t true_base, uint32_t first_row, uint32_t rows) {
+    if (!kvmem_immutable_source_k_ || rows == 0) return;
+    if (!kvmem_raw_capture_host_ ||
+        true_base + rows > kv_ctx_size_ ||
+        first_row + rows > kvmem_raw_capture_rows_) {
+        throw std::runtime_error("immutable raw-K capture range is invalid");
+    }
+    const uint64_t row_bytes = kvmem_raw_k_row_bytes_;
+    const uint64_t layer_bytes = static_cast<uint64_t>(rows) * row_bytes;
+    require_status(backend_.begin_kv_transfer_from_device());
+    for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
+        require_status(backend_.copy_bytes_to_host_async(
+            *kvmem_raw_capture_dev_[slot],
+            static_cast<uint8_t *>(kvmem_raw_capture_host_->data) +
+                static_cast<uint64_t>(slot) * layer_bytes,
+            static_cast<uint64_t>(first_row) * row_bytes, layer_bytes));
+    }
+    require_status(backend_.wait_kv_transfer());
+    for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
+        const uint8_t *src =
+            static_cast<const uint8_t *>(kvmem_raw_capture_host_->data) +
+            static_cast<uint64_t>(slot) * layer_bytes;
+        kvmem_write_raw_k(slot, true_base, src, rows, /*mtp=*/false);
+    }
+    std::fill(kvmem_raw_k_valid_tokens_.begin() + true_base,
+              kvmem_raw_k_valid_tokens_.begin() + true_base + rows,
+              static_cast<uint8_t>(1));
+}
+
+void QwenExecutor::kvmem_flush_raw_k_decode() {
+    if (!kvmem_immutable_source_k_ ||
+        kvmem_raw_decode_block_start_ < 0 ||
+        kvmem_raw_decode_rows_ == 0) {
+        return;
+    }
+    const uint32_t true_base =
+        static_cast<uint32_t>(kvmem_raw_decode_block_start_) +
+        kvmem_raw_decode_first_row_;
+    kvmem_flush_raw_k_capture(true_base, kvmem_raw_decode_first_row_,
+                              kvmem_raw_decode_rows_);
+    kvmem_raw_decode_block_start_ = -1;
+    kvmem_raw_decode_first_row_ = 0;
+    kvmem_raw_decode_rows_ = 0;
+}
+
+void QwenExecutor::kvmem_materialize_raw_k(
+        const std::vector<const KvMemRemap *> &refreshes) {
+    if (refreshes.empty()) return;
+    if (kvmem_raw_k_chunks_.empty() || !window_pages_device_) {
+        throw std::runtime_error("immutable raw-K materialization is unavailable");
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t bt = block_store_->config().block_tokens;
+    const uint64_t per_pos =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    const uint64_t block_elems = static_cast<uint64_t>(bt) * per_pos;
+    const uint64_t block_bytes = static_cast<uint64_t>(bt) *
+                                 kvmem_raw_k_row_bytes_;
+    const uint32_t cap = std::max<uint32_t>(
+        1, kvmem_raw_transfer_block_cap_);
+
+    for (uint32_t begin = 0; begin < refreshes.size(); begin += cap) {
+        const uint32_t n = std::min<uint32_t>(
+            cap, static_cast<uint32_t>(refreshes.size()) - begin);
+        const uint64_t total_elems =
+            static_cast<uint64_t>(kvmem_raw_layers_.size()) * n * block_elems;
+        const uint64_t total_bytes =
+            static_cast<uint64_t>(kvmem_raw_layers_.size()) * n * block_bytes;
+        if (!kvmem_raw_transfer_dev_ ||
+            kvmem_raw_transfer_dev_->count < total_elems) {
+            kvmem_raw_transfer_dev_ =
+                kvmem_alloc_raw_k_tensor(total_elems,
+                                         "kvmem_raw_k_transfer_device");
+            kvmem_raw_transfer_host_ =
+                backend_.host_buffer(total_bytes,
+                                     "kvmem_raw_k_transfer_host");
+            kvmem_raw_transfer_blocks_ = n;
+        }
+        uint8_t *packed =
+            static_cast<uint8_t *>(kvmem_raw_transfer_host_->data);
+        bs_remap_to_host_.clear();
+        bs_remap_ntok_host_.clear();
+        uint32_t max_tokens = 0;
+        for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
+            for (uint32_t j = 0; j < n; ++j) {
+                const KvMemRemap &rm = *refreshes[begin + j];
+                const KvMemBlock &block =
+                    block_store_->blocks()[rm.block_id];
+                for (uint32_t t = 0; t < rm.n_tokens; ++t) {
+                    const uint32_t pos = block.orig_pos_start + t;
+                    if (pos >= kvmem_raw_k_valid_tokens_.size() ||
+                        !kvmem_raw_k_valid_tokens_[pos]) {
+                        throw std::runtime_error(
+                            "immutable raw-K block contains uncaptured token " +
+                            std::to_string(pos));
+                    }
+                }
+                uint8_t *dst = packed +
+                    (static_cast<uint64_t>(slot) * n + j) * block_bytes;
+                const uint64_t valid_bytes =
+                    static_cast<uint64_t>(rm.n_tokens) *
+                    kvmem_raw_k_row_bytes_;
+                kvmem_read_raw_k(
+                    slot, block.orig_pos_start, dst, rm.n_tokens,
+                    /*mtp=*/false);
+                if (valid_bytes < block_bytes) {
+                    std::memset(dst + valid_bytes, 0,
+                                static_cast<size_t>(block_bytes - valid_bytes));
+                }
+            }
+        }
+        for (uint32_t j = 0; j < n; ++j) {
+            const KvMemRemap &rm = *refreshes[begin + j];
+            bs_remap_to_host_.push_back(rm.to_base);
+            bs_remap_ntok_host_.push_back(
+                static_cast<int32_t>(rm.n_tokens));
+            max_tokens = std::max(max_tokens, rm.n_tokens);
+        }
+        if (n > bs_remap_capacity_) {
+            bs_remap_capacity_ = n;
+            bs_remap_to_dev_ =
+                backend_.tensor_i32(n, "bs_remap_to");
+            bs_remap_from_dev_ =
+                backend_.tensor_i32(n, "bs_remap_from");
+            bs_remap_ntok_dev_ =
+                backend_.tensor_i32(n, "bs_remap_ntok");
+        }
+        require_status(backend_.copy_i32_from_host(
+            *bs_remap_to_dev_, 0, bs_remap_to_host_.data(), n));
+        require_status(backend_.copy_i32_from_host(
+            *bs_remap_ntok_dev_, 0, bs_remap_ntok_host_.data(), n));
+        require_status(backend_.copy_bytes_from_host(
+            *kvmem_raw_transfer_dev_, 0, packed, total_bytes));
+        if (std::getenv("QW3_KVMEM_TRACE") ||
+            kvmem_tier_trace_enabled()) {
+            std::fprintf(
+                stderr,
+                "[kvmem-raw-k] refresh_blocks=%u packed_bytes=%llu "
+                "first_block=%u\n",
+                n, static_cast<unsigned long long>(total_bytes),
+                refreshes[begin]->block_id);
+        }
+        for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
+            require_status(
+                backend_.raw_k_scatter_rope_paged_batched_device(
+                    k_cache(kvmem_raw_layers_[slot]),
+                    *kvmem_raw_transfer_dev_,
+                    static_cast<uint64_t>(slot) * n * block_elems,
+                    n, bt, cfg.n_kv_heads,
+                    static_cast<uint32_t>(per_pos), cfg.head_dim,
+                    cfg.rope_dim, *bs_remap_to_dev_,
+                    *bs_remap_ntok_dev_, *window_pages_device_,
+                    kv_pages_.page_size, cfg.rope_theta));
+        }
+    }
+}
+
+void QwenExecutor::kvmem_ensure_raw_mtp_capture_capacity(uint32_t rows) {
+    if (!kvmem_mtp_local_positions_ || rows == 0) return;
+    if (rows <= kvmem_raw_mtp_capture_rows_ &&
+        kvmem_raw_mtp_capture_dev_ && kvmem_raw_mtp_capture_host_) {
+        return;
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint64_t per_pos =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    kvmem_raw_mtp_capture_rows_ =
+        std::max(rows, kvmem_raw_mtp_capture_rows_);
+    kvmem_raw_mtp_capture_dev_ = kvmem_alloc_raw_k_tensor(
+        static_cast<uint64_t>(kvmem_raw_mtp_capture_rows_) * per_pos,
+        "kvmem_raw_mtp_k_capture");
+    kvmem_raw_mtp_capture_host_ = backend_.host_buffer(
+        static_cast<uint64_t>(kvmem_raw_mtp_capture_rows_) *
+            kvmem_raw_k_row_bytes_,
+        "kvmem_raw_mtp_k_capture_host");
+}
+
+void QwenExecutor::kvmem_capture_raw_mtp_k(
+        const DeviceTensor &raw_k,
+        uint32_t logical_base,
+        uint32_t rows,
+        uint32_t src_row) {
+    if (!kvmem_mtp_local_positions_ || rows == 0) return;
+    if (src_row != 0) {
+        throw std::runtime_error(
+            "immutable MTP raw-K capture requires a zero-based source batch");
+    }
+    if (logical_base + rows > kv_ctx_size_) {
+        throw std::runtime_error(
+            "immutable MTP raw-K capture range is invalid");
+    }
+    kvmem_ensure_raw_mtp_capture_capacity(rows);
+    const QwenConfig &cfg = model_.config();
+    const uint32_t per_pos = cfg.n_kv_heads * cfg.head_dim;
+    require_status(backend_.kv_append_batch(
+        *kvmem_raw_mtp_capture_dev_, raw_k,
+        /*base_pos=*/0, per_pos, rows));
+    const uint64_t bytes =
+        static_cast<uint64_t>(rows) * kvmem_raw_k_row_bytes_;
+    require_status(backend_.begin_kv_transfer_from_device());
+    require_status(backend_.copy_bytes_to_host_async(
+        *kvmem_raw_mtp_capture_dev_,
+        kvmem_raw_mtp_capture_host_->data, 0, bytes));
+    require_status(backend_.wait_kv_transfer());
+    kvmem_write_raw_k(
+        /*layer_slot=*/0, logical_base,
+        static_cast<const uint8_t *>(kvmem_raw_mtp_capture_host_->data),
+        rows, /*mtp=*/true);
+    std::fill(
+        kvmem_raw_mtp_k_valid_tokens_.begin() + logical_base,
+        kvmem_raw_mtp_k_valid_tokens_.begin() + logical_base + rows,
+        static_cast<uint8_t>(1));
+}
+
+void QwenExecutor::kvmem_materialize_raw_mtp_k(
+        const KvMemPlan &plan) {
+    if (!kvmem_mtp_local_positions_ || plan.remaps.empty()) return;
+    if (kvmem_raw_mtp_k_chunks_.empty() || !mtp_window_pages_device_) {
+        throw std::runtime_error(
+            "immutable MTP raw-K materialization is unavailable");
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t bt = block_store_->config().block_tokens;
+    const uint64_t per_pos =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    const uint64_t block_elems = static_cast<uint64_t>(bt) * per_pos;
+    const uint64_t block_bytes =
+        static_cast<uint64_t>(bt) * kvmem_raw_k_row_bytes_;
+    const uint32_t cap = std::max<uint32_t>(
+        1, kvmem_raw_transfer_block_cap_);
+    const auto &blocks = block_store_->blocks();
+
+    for (uint32_t begin = 0; begin < plan.remaps.size(); begin += cap) {
+        const uint32_t n = std::min<uint32_t>(
+            cap, static_cast<uint32_t>(plan.remaps.size()) - begin);
+        const uint64_t elems = static_cast<uint64_t>(n) * block_elems;
+        const uint64_t bytes = static_cast<uint64_t>(n) * block_bytes;
+        if (!kvmem_raw_mtp_transfer_dev_ ||
+            kvmem_raw_mtp_transfer_dev_->count < elems) {
+            kvmem_raw_mtp_transfer_dev_ = kvmem_alloc_raw_k_tensor(
+                elems, "kvmem_raw_mtp_k_transfer_device");
+            kvmem_raw_mtp_transfer_host_ = backend_.host_buffer(
+                bytes, "kvmem_raw_mtp_k_transfer_host");
+        }
+
+        uint8_t *packed = static_cast<uint8_t *>(
+            kvmem_raw_mtp_transfer_host_->data);
+        bs_mtp_remap_to_host_.clear();
+        bs_mtp_remap_ntok_host_.clear();
+        uint32_t max_tokens = 0;
+        for (uint32_t j = 0; j < n; ++j) {
+            const KvMemRemap &rm = plan.remaps[begin + j];
+            const KvMemBlock &block = blocks[rm.block_id];
+            if (cfg.n_ctx_train > 0 &&
+                static_cast<uint64_t>(rm.to_base) + rm.n_tokens >
+                    cfg.n_ctx_train) {
+                throw std::runtime_error(
+                    "immutable MTP raw-K materialization exceeds the model "
+                    "context limit");
+            }
+            for (uint32_t t = 0; t < rm.n_tokens; ++t) {
+                const uint32_t pos = block.orig_pos_start + t;
+                if (pos >= kvmem_raw_mtp_k_valid_tokens_.size() ||
+                    !kvmem_raw_mtp_k_valid_tokens_[pos]) {
+                    throw std::runtime_error(
+                        "immutable MTP raw-K block contains uncaptured token " +
+                        std::to_string(pos));
+                }
+            }
+            uint8_t *dst =
+                packed + static_cast<uint64_t>(j) * block_bytes;
+            const uint64_t valid_bytes =
+                static_cast<uint64_t>(rm.n_tokens) *
+                kvmem_raw_k_row_bytes_;
+            kvmem_read_raw_k(
+                /*layer_slot=*/0, block.orig_pos_start, dst,
+                rm.n_tokens, /*mtp=*/true);
+            if (valid_bytes < block_bytes) {
+                std::memset(dst + valid_bytes, 0,
+                            static_cast<size_t>(block_bytes - valid_bytes));
+            }
+            bs_mtp_remap_to_host_.push_back(rm.to_base);
+            bs_mtp_remap_ntok_host_.push_back(
+                static_cast<int32_t>(rm.n_tokens));
+            max_tokens = std::max(max_tokens, rm.n_tokens);
+        }
+        if (n > bs_mtp_remap_capacity_) {
+            bs_mtp_remap_capacity_ = n;
+            bs_mtp_remap_to_dev_ = backend_.tensor_i32(
+                n, "bs_mtp_remap_to");
+            bs_mtp_remap_from_dev_ = backend_.tensor_i32(
+                n, "bs_mtp_remap_from");
+            bs_mtp_remap_ntok_dev_ = backend_.tensor_i32(
+                n, "bs_mtp_remap_ntok");
+        }
+        require_status(backend_.copy_i32_from_host(
+            *bs_mtp_remap_to_dev_, 0,
+            bs_mtp_remap_to_host_.data(), n));
+        require_status(backend_.copy_i32_from_host(
+            *bs_mtp_remap_ntok_dev_, 0,
+            bs_mtp_remap_ntok_host_.data(), n));
+        require_status(backend_.copy_bytes_from_host(
+            *kvmem_raw_mtp_transfer_dev_, 0, packed, bytes));
+        require_status(
+            backend_.raw_k_scatter_rope_paged_batched_device(
+                mtp_k_cache(), *kvmem_raw_mtp_transfer_dev_,
+                /*src_elem_offset=*/0, n, bt, cfg.n_kv_heads,
+                static_cast<uint32_t>(per_pos), cfg.head_dim,
+                cfg.rope_dim, *bs_mtp_remap_to_dev_,
+                *bs_mtp_remap_ntok_dev_,
+                *mtp_window_pages_device_,
+                mtp_kv_pages_.page_size, cfg.rope_theta));
+        if (std::getenv("QW3_KVMEM_TRACE") ||
+            kvmem_tier_trace_enabled()) {
+            std::fprintf(
+                stderr,
+                "[kvmem-raw-mtp-k] refresh_blocks=%u packed_bytes=%llu "
+                "first_block=%u max_rope_end=%u\n",
+                n, static_cast<unsigned long long>(bytes),
+                plan.remaps[begin].block_id,
+                bs_mtp_remap_to_host_.back() + max_tokens);
+        }
+    }
 }
 
 void QwenExecutor::allocate_kvmem_mtp_gpu_cache(uint64_t physical_slots) {
@@ -1372,8 +2058,28 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     const bool global_trace_this_token =
         compute_logits && global_attn_trace_sample_now();
 
+    if (kvmem_immutable_source_k_) {
+        const uint32_t bt = std::max<uint32_t>(
+            1, block_store_ ? block_store_->config().block_tokens : 1);
+        kvmem_ensure_raw_capture_capacity(bt);
+    }
     require_status(backend_.begin());
     begin_record_timing(executor_trace_timing_enabled());
+    if (kvmem_immutable_source_k_) {
+        const uint32_t bt = std::max<uint32_t>(
+            1, block_store_->config().block_tokens);
+        const int64_t block_start =
+            static_cast<int64_t>((position_ / bt) * bt);
+        if (kvmem_raw_decode_block_start_ >= 0 &&
+            kvmem_raw_decode_block_start_ != block_start) {
+            kvmem_flush_raw_k_decode();
+        }
+        if (kvmem_raw_decode_block_start_ < 0) {
+            kvmem_raw_decode_block_start_ = block_start;
+            kvmem_raw_decode_first_row_ = position_ % bt;
+            kvmem_raw_decode_rows_ = 0;
+        }
+    }
 
     // CUDA-graph capture path: skip on the first token (warm-up: every
     // backend-side scratch buffer needs to be sized before we record
@@ -1449,26 +2155,11 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             // the append-slot and (length-based) attention mask stay on attn_pos.
             const uint32_t rope_pos =
                 (bs && kvmem_no_rerope_) ? position_ : attn_pos;
-            uint32_t source_k_rope_pos = rope_pos;
-            if (kvmem_immutable_source_k_ && bs && block_store_ &&
-                !block_store_->blocks().empty()) {
-                const KvMemBlock &tail = block_store_->blocks().back();
-                const uint32_t bt = std::max<uint32_t>(
-                    1, block_store_->config().block_tokens);
-                const uint32_t block_end =
-                    static_cast<uint32_t>(tail.orig_pos_start) + bt;
-                if (tail.orig_pos_start < position_ && position_ < block_end) {
-                    const int64_t source_pos =
-                        tail.baked_pos +
-                        static_cast<int64_t>(position_ - tail.orig_pos_start);
-                    if (source_pos < 0 ||
-                        source_pos > static_cast<int64_t>(
-                                         std::numeric_limits<uint32_t>::max())) {
-                        throw std::runtime_error(
-                            "KVMem immutable partial-block source position overflow");
-                    }
-                    source_k_rope_pos = static_cast<uint32_t>(source_pos);
-                }
+            if (kvmem_mtp_local_positions_ && cfg.n_ctx_train > 0 &&
+                rope_pos >= cfg.n_ctx_train) {
+                throw std::runtime_error(
+                    "KVMem target decode RoPE position exceeds the model "
+                    "context limit in local-position MTP mode");
             }
             trace_rope_position_if_out_of_range(
                 "forward_one_token.qk", rope_pos, 1, cfg.n_ctx_train,
@@ -1494,6 +2185,10 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
                                                      standard_n_kv_heads,
                                                      standard_head_dim,
                                                      standard_head_dim, eps));
+            if (kvmem_immutable_source_k_) {
+                kvmem_capture_raw_k_decode(
+                    il, *k_, position_ % block_store_->config().block_tokens);
+            }
 
             // Partial RoPE on the first rope_dim of each head's first segment.
             // Baked at the window position when block-sparse is active.
@@ -1516,19 +2211,6 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             require_status(backend_.kv_append_batch_paged_device(
                 k_cache(il), *k_, attn_pos, per_pos, 1,
                 pages_dev, pages_count, kv_page_size()));
-            if (kvmem_immutable_source_k_ && bs) {
-                require_status(backend_.kv_append_batch_paged_device(
-                    working_k_cache(il), *k_, attn_pos, per_pos, 1,
-                    pages_dev, pages_count, kv_page_size()));
-                if (source_k_rope_pos != rope_pos) {
-                    require_status(backend_.rope_block_remap_paged_device(
-                        k_cache(il), 1, standard_n_kv_heads, per_pos,
-                        standard_head_dim, cfg.rope_dim, attn_pos,
-                        static_cast<int32_t>(rope_pos),
-                        static_cast<int32_t>(source_k_rope_pos), pages_dev,
-                        kv_page_size(), cfg.rope_theta));
-                }
-            }
             require_status(backend_.kv_append_batch_paged_device(
                 v_cache(il), *v_, attn_pos, per_pos, 1,
                 pages_dev, pages_count, kv_page_size()));
@@ -1597,6 +2279,17 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             require_status(backend_.add(*h_, *h_, *ffn_out_));
         }
         record(report, "layer." + std::to_string(il) + ".ffn");
+    }
+
+    if (kvmem_immutable_source_k_) {
+        const uint32_t bt = block_store_->config().block_tokens;
+        const uint32_t row = position_ % bt;
+        if (kvmem_raw_decode_rows_ == 0) {
+            kvmem_raw_decode_first_row_ = row;
+        }
+        kvmem_raw_decode_rows_ =
+            row - kvmem_raw_decode_first_row_ + 1;
+        if (row + 1 == bt) kvmem_flush_raw_k_decode();
     }
 
     if (!compute_logits) {
@@ -1897,6 +2590,9 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     if (chunk_size > total) chunk_size = total;
     if (chunk_size == 0) chunk_size = total;
     ensure_batch_scratch(chunk_size);
+    if (kvmem_immutable_source_k_) {
+        kvmem_ensure_raw_capture_capacity(chunk_size);
+    }
 
     const QwenConfig &cfg = model_.config();
     const uint32_t head_k_dim = cfg.head_k_dim();
@@ -1927,6 +2623,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
 
     require_status(backend_.begin());
     begin_record_timing(full_executor_trace_enabled());
+    if (kvmem_immutable_source_k_) kvmem_flush_raw_k_decode();
 
     // MTP rollback support: when state_checkpoints is requested, the recurrent
     // layers below snapshot their per-token DeltaNet + conv state into the
@@ -1966,6 +2663,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     bool capture_warmup_pending = true;
 
     uint32_t last_chunk_batch = 0;
+    last_forward_rows_ = 0;
     for (uint32_t chunk_off = 0; chunk_off < total; chunk_off += chunk_size) {
         const uint32_t batch = std::min(chunk_size, total - chunk_off);
         last_chunk_batch = batch;
@@ -1994,46 +2692,9 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         // attn_base_pos. Default OFF -> rope_base_pos == attn_base_pos (unchanged).
         const uint32_t rope_base_pos =
             (chunk_bs && kvmem_no_rerope_) ? base_pos : attn_base_pos;
-        // A reselection can move the working window while the source tail block
-        // is only partially filled.  The new attention rows still belong in the
-        // current window frame, but the source rows that complete that block must
-        // retain its original affine construction frame.  Record the short prefix
-        // that needs a one-time source-only correction after append (at most
-        // block_tokens-1 rows); the rest of this full-size chunk remains batched.
-        uint32_t immutable_partial_rows = 0;
-        uint32_t immutable_partial_source_pos = rope_base_pos;
-        if (kvmem_immutable_source_k_ && chunk_bs && block_store_ &&
-            !block_store_->blocks().empty()) {
-            const KvMemBlock &tail = block_store_->blocks().back();
-            const uint32_t bt = std::max<uint32_t>(
-                1, block_store_->config().block_tokens);
-            const uint32_t block_end =
-                static_cast<uint32_t>(tail.orig_pos_start) + bt;
-            if (tail.orig_pos_start < base_pos && base_pos < block_end) {
-                const int64_t source_pos =
-                    tail.baked_pos +
-                    static_cast<int64_t>(base_pos - tail.orig_pos_start);
-                if (source_pos < 0 ||
-                    source_pos > static_cast<int64_t>(
-                                     std::numeric_limits<uint32_t>::max())) {
-                    throw std::runtime_error(
-                        "KVMem immutable partial-block source position overflow");
-                }
-                immutable_partial_source_pos = static_cast<uint32_t>(source_pos);
-                if (immutable_partial_source_pos != rope_base_pos) {
-                    immutable_partial_rows =
-                        std::min<uint32_t>(batch, block_end - base_pos);
-                    if (std::getenv("QW3_KVMEM_TRACE")) {
-                        std::fprintf(
-                            stderr,
-                            "[bs-immutable-partial-append] true_base=%u rows=%u "
-                            "source_pos=%u window_pos=%u\n",
-                            base_pos, immutable_partial_rows,
-                            immutable_partial_source_pos, rope_base_pos);
-                    }
-                }
-            }
-        }
+        last_forward_logical_base_ = base_pos;
+        last_forward_rope_base_ = rope_base_pos;
+        last_forward_rows_ = batch;
         const DeviceTensor &attn_pages_dev =
             chunk_bs ? *window_pages_device_ : kv_page_indices_device();
         const uint32_t attn_pages_count =
@@ -2174,6 +2835,13 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                  batch, core_stride, h_stride));
             if (record_ops) record(report, "layer." + std::to_string(il) + ".recurrent_output_batch");
         } else {
+            if (kvmem_mtp_local_positions_ && cfg.n_ctx_train > 0 &&
+                static_cast<uint64_t>(rope_base_pos) + batch >
+                    cfg.n_ctx_train) {
+                throw std::runtime_error(
+                    "KVMem target prefill/verify RoPE range exceeds the model "
+                    "context limit in local-position MTP mode");
+            }
             trace_rope_position_if_out_of_range(
                 "forward_n_tokens.qk", rope_base_pos, batch,
                 cfg.n_ctx_train, static_cast<int32_t>(il),
@@ -2197,6 +2865,9 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                             standard_n_kv_heads,
                                                             standard_head_dim,
                                                             standard_head_dim, eps));
+            if (kvmem_immutable_source_k_) {
+                kvmem_capture_raw_k_batch(il, *k_batch_, batch);
+            }
 
             require_status(backend_.rope_partial_batch(*q_batch_,
                                                         batch, q_stride_buf,
@@ -2248,22 +2919,6 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 require_status(backend_.kv_append_batch_paged_device(
                     k_cache(il), *k_batch_, attn_base_pos, per_pos, batch,
                     attn_pages_dev, attn_pages_count, kv_page_size()));
-                if (kvmem_immutable_source_k_ && chunk_bs) {
-                    require_status(backend_.kv_append_batch_paged_device(
-                        working_k_cache(il), *k_batch_, attn_base_pos, per_pos,
-                        batch, attn_pages_dev, attn_pages_count,
-                        kv_page_size()));
-                    if (immutable_partial_rows > 0) {
-                        require_status(backend_.rope_block_remap_paged_device(
-                            k_cache(il), immutable_partial_rows,
-                            standard_n_kv_heads,
-                            per_pos, standard_head_dim, cfg.rope_dim,
-                            attn_base_pos,
-                            static_cast<int32_t>(rope_base_pos),
-                            static_cast<int32_t>(immutable_partial_source_pos),
-                            attn_pages_dev, kv_page_size(), cfg.rope_theta));
-                    }
-                }
                 require_status(backend_.kv_append_batch_paged_device(
                     v_cache(il), *v_batch_, attn_base_pos, per_pos, batch,
                     attn_pages_dev, attn_pages_count, kv_page_size()));
@@ -2355,6 +3010,9 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         if (record_ops) record(report, "layer." + std::to_string(il) + ".ffn_batch");
         }
 
+        if (kvmem_immutable_source_k_) {
+            kvmem_flush_raw_k_capture(base_pos, 0, batch);
+        }
         if (chunk_bs) window_query_pos_ += batch;
         if (kvmem_gpu_page_pool_ && !mtp_single_chunk) {
             kvmem_register_until(base_pos + batch);
@@ -2383,19 +3041,17 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                         }
                         const int64_t desired_bake =
                             static_cast<int64_t>(b.orig_pos_start) + delta;
-                        if (kvmem_immutable_source_k_ &&
-                            b.orig_pos_start < base_pos) {
-                            // This was the pre-existing partial source block.
-                            // Its remaining rows were explicitly baked in the
-                            // existing frame above; never overwrite that frame.
-                            continue;
-                        }
                         block_store_->set_block_baked_pos(
                             bi, desired_bake);
                     }
                 }
             }
-            kvmem_maybe_prefill_offload(batch);
+            if (kvmem_defer_prefill_pressure_) {
+                kvmem_deferred_prefill_tokens_ =
+                    std::max(kvmem_deferred_prefill_tokens_, batch);
+            } else {
+                kvmem_maybe_prefill_offload(batch);
+            }
         }
 
         if (try_capture) {
@@ -2546,6 +3202,12 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
     // When kvmem is off this branch is bypassed and the draft is byte-identical
     // to the legacy true-frame path below.
     const bool window_mode = kvmem_active_;
+    const uint32_t rope_limit = model_.config().n_ctx_train;
+    if (window_mode && rope_limit > 0) {
+        if (window_query_pos_ >= rope_limit) return reports;
+        max_tokens = std::min<uint32_t>(
+            max_tokens, rope_limit - window_query_pos_);
+    }
     const uint32_t pre_window_pages = mtp_window_page_count_;
     uint32_t current = token_id;
     for (uint32_t i = 0; i < max_tokens; ++i) {
@@ -2606,6 +3268,12 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
     // window frame here too while preserving on-device argmax chaining (the
     // argmax buffer / token_source are independent of the KV frame).
     const bool window_mode = kvmem_active_;
+    const uint32_t rope_limit = model_.config().n_ctx_train;
+    if (window_mode && rope_limit > 0) {
+        if (window_query_pos_ >= rope_limit) return {};
+        max_tokens = std::min<uint32_t>(
+            max_tokens, rope_limit - window_query_pos_);
+    }
     const uint32_t pre_window_pages = mtp_window_page_count_;
     std::vector<NativeExecutorReport> reports;
     reports.reserve(max_tokens);
@@ -2746,6 +3414,14 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                              standard_n_kv_heads,
                                              standard_head_dim,
                                              standard_head_dim, eps));
+    // Prefix priming is the one point where the MTP head's projected K exists
+    // before RoPE.  Keep that position-free value as the immutable authority;
+    // selected-window K is reconstructed from it at the current compact slot.
+    // Draft-chain rows (window_frame=true, kv_only=false) are speculative and
+    // must never overwrite the accepted-prefix authority.
+    if (kvmem_mtp_local_positions_ && kv_only && !window_frame) {
+        kvmem_capture_raw_mtp_k(*k_, cache_pos, 1);
+    }
     trace_rope_position_if_out_of_range(
         "forward_mtp_draft_from.qk", rope_pos, 1, cfg.n_ctx_train,
         static_cast<int32_t>(weights_.n_layers()), /*kernel_uses=*/2);
@@ -3096,11 +3772,23 @@ void QwenExecutor::kvmem_begin_query_replay(
     for (const KvMemDroppedBlock &d : dropped) {
         if (d.cpu_slot >= 0 && kvmem_cpu_tier_) {
             kvmem_cpu_tier_->release_block(d.block_id);
+            kvmem_release_cpu_slot(d.cpu_slot);
         }
         if (d.nvme_slot >= 0 && kvmem_nvme_tier_) {
             kvmem_nvme_tier_->release_block(d.block_id);
         }
     }
+    if (boundary.position < kvmem_raw_k_valid_tokens_.size()) {
+        std::fill(
+            kvmem_raw_k_valid_tokens_.begin() + boundary.position,
+            kvmem_raw_k_valid_tokens_.end(), static_cast<uint8_t>(0));
+    }
+    if (boundary.position < kvmem_raw_mtp_k_valid_tokens_.size()) {
+        std::fill(
+            kvmem_raw_mtp_k_valid_tokens_.begin() + boundary.position,
+            kvmem_raw_mtp_k_valid_tokens_.end(), static_cast<uint8_t>(0));
+    }
+    kvmem_truncate_raw_k(boundary.position);
     if (mtp_baked_pos_.size() > block_store_->block_count()) {
         mtp_baked_pos_.resize(block_store_->block_count());
     }
@@ -3481,30 +4169,135 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     const QwenConfig &model_cfg = model_.config();
     const uint32_t standard_layers =
         count_standard_attention_layers(model_cfg, weights_.n_layers());
+    if (kvmem_immutable_source_k_) {
+        effective.immutable_max_baked_position = model_cfg.n_ctx_train;
+        if (const char *env =
+                std::getenv("QW3_KVMEM_IMMUTABLE_REFRESH_REMAPS")) {
+            const long long v = std::atoll(env);
+            if (v >= 0) {
+                effective.immutable_refresh_remaps =
+                    static_cast<uint32_t>(v);
+            }
+        }
+        if (const char *env =
+                std::getenv("QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS")) {
+            const long long v = std::atoll(env);
+            if (v >= 0) {
+                effective.immutable_refresh_abs_delta_tokens =
+                    static_cast<uint64_t>(v);
+            }
+        }
+        if (const char *env =
+                std::getenv("QW3_KVMEM_IMMUTABLE_MAX_BAKED_POSITION")) {
+            const long long v = std::atoll(env);
+            if (v >= 0) {
+                effective.immutable_max_baked_position =
+                    static_cast<uint64_t>(v);
+            }
+        }
+    }
     // If MTP tiering will engage (predicate mirrored exactly in the pool-engage
     // block below), the MTP layer rides the same per-block blobs as a trailing
     // segment, so the CPU/NVMe slot_bytes must budget for one extra layer. This
     // MUST agree with kvmem_block_spill_bytes' layer count or the copy-in guard
     // (src_bytes < expected) trips.
     const bool mtp_will_tier =
-        weights_.mtp() != nullptr && external_mtp_kv_cache_ == nullptr &&
+        effective.mtp_enabled && weights_.mtp() != nullptr &&
+        external_mtp_kv_cache_ == nullptr &&
         kvmem_mtp_tier_enabled();
-    effective.estimated_block_bytes =
-        estimate_kvmem_block_bytes(model_cfg,
-                                   standard_layers + (mtp_will_tier ? 1u : 0u),
+    kvmem_mtp_local_positions_ =
+        kvmem_immutable_source_k_ && mtp_will_tier &&
+        kvmem_mtp_local_positions_enabled();
+    if (kvmem_mtp_local_positions_ && model_cfg.n_ctx_train > 0 &&
+        static_cast<uint64_t>(effective.select_budget) +
+                effective.gen_budget >
+            model_cfg.n_ctx_train) {
+        throw std::runtime_error(
+            "KVMem local-position MTP requires --kvmem-budget + "
+            "--kvmem-gen-budget to fit inside the model context limit (" +
+            std::to_string(effective.select_budget) + " + " +
+            std::to_string(effective.gen_budget) + " > " +
+            std::to_string(model_cfg.n_ctx_train) + ")");
+    }
+    const uint64_t standard_kv_block_bytes =
+        estimate_kvmem_block_bytes(model_cfg, standard_layers,
                                    effective.block_tokens);
-    // Tier slots hold source K+V only.  GPU residency additionally holds one
-    // working K for every standard-attention layer in immutable mode.  Use the
-    // exact source-K byte share when sizing the pool against the VRAM ceiling;
-    // do not inflate estimated_block_bytes, because that value also defines the
-    // CPU/NVMe spill record layout.
-    const uint64_t immutable_work_k_block_bytes =
-        kvmem_immutable_source_k_
-            ? estimate_kvmem_block_bytes(model_cfg, standard_layers,
-                                         effective.block_tokens) / 2u
-            : 0u;
+    const uint64_t mtp_kv_block_bytes = mtp_will_tier
+        ? estimate_kvmem_block_bytes(model_cfg, 1, effective.block_tokens)
+        : 0;
+    // The raw-K CPU mirror owns standard-layer K in immutable mode, so ordinary
+    // CPU/NVMe tier records contain standard-layer V only. Local-position MTP
+    // likewise stores raw K separately and spills only V; the legacy MTP path
+    // retains K+V records.
+    const uint64_t mtp_spill_block_bytes =
+        kvmem_mtp_local_positions_
+            ? mtp_kv_block_bytes / 2u  // immutable MTP raw-K lives separately
+            : mtp_kv_block_bytes;
+    effective.estimated_block_bytes = kvmem_immutable_source_k_
+        ? standard_kv_block_bytes / 2u + mtp_spill_block_bytes
+        : standard_kv_block_bytes + mtp_spill_block_bytes;
     const uint64_t gpu_resident_block_bytes =
-        effective.estimated_block_bytes + immutable_work_k_block_bytes;
+        standard_kv_block_bytes + mtp_kv_block_bytes;
+
+    uint64_t raw_k_mirror_max_bytes = 0;
+    uint64_t raw_k_row_bytes = 0;
+    uint64_t raw_mtp_k_mirror_max_bytes = 0;
+    uint64_t capacity_cpu_tier_bytes = effective.cpu_tier_bytes;
+    if (kvmem_immutable_source_k_) {
+        if (const char *env =
+                std::getenv("QW3_KVMEM_RAW_K_CHUNK_TOKENS")) {
+            const long long v = std::atoll(env);
+            if (v > 0) {
+                kvmem_raw_k_chunk_tokens_ = static_cast<uint32_t>(
+                    std::min<long long>(
+                        v, std::numeric_limits<uint32_t>::max()));
+            }
+        }
+        kvmem_raw_k_chunk_tokens_ = std::max<uint32_t>(
+            effective.block_tokens, kvmem_raw_k_chunk_tokens_);
+        kvmem_raw_k_chunk_tokens_ =
+            ((kvmem_raw_k_chunk_tokens_ + effective.block_tokens - 1) /
+             effective.block_tokens) * effective.block_tokens;
+        uint64_t elem_bytes = 2;
+        if (kvmem_kv_dtype && std::strcmp(kvmem_kv_dtype, "fp32") == 0) {
+            elem_bytes = 4;
+        } else if (kvmem_kv_dtype &&
+                   std::strcmp(kvmem_kv_dtype, "fp8") == 0) {
+            elem_bytes = 1;
+        }
+        raw_k_row_bytes =
+            static_cast<uint64_t>(model_cfg.n_kv_heads) *
+            model_cfg.head_dim * elem_bytes;
+        const uint64_t raw_chunk_count =
+            (static_cast<uint64_t>(kv_ctx_size_) +
+             kvmem_raw_k_chunk_tokens_ - 1) /
+            kvmem_raw_k_chunk_tokens_;
+        const uint64_t padded_raw_tokens =
+            raw_chunk_count * kvmem_raw_k_chunk_tokens_;
+        raw_k_mirror_max_bytes =
+            static_cast<uint64_t>(standard_layers) * padded_raw_tokens *
+            raw_k_row_bytes;
+        if (kvmem_mtp_local_positions_) {
+            raw_mtp_k_mirror_max_bytes =
+                padded_raw_tokens * raw_k_row_bytes;
+        }
+        const uint64_t raw_authority_bytes =
+            raw_k_mirror_max_bytes + raw_mtp_k_mirror_max_bytes;
+        if (effective.cpu_tier_bytes < raw_authority_bytes) {
+            throw std::runtime_error(
+                "KVMem immutable raw-K chunks can grow to " +
+                std::to_string(raw_authority_bytes) +
+                " CPU bytes, exceeding --kvmem-cpu-gb (" +
+                std::to_string(effective.cpu_tier_bytes) +
+                " bytes). Raise --kvmem-cpu-gb, lower --ctx, or use fp8 KV.");
+        }
+        // Runtime raw-K and CPU V blocks share the full host budget dynamically.
+        // Capacity validation still reserves the worst-case raw-K authority:
+        // when a prompt reaches --ctx, only this remainder is guaranteed to be
+        // available to the CPU spill cache and all other V blocks need NVMe.
+        capacity_cpu_tier_bytes =
+            effective.cpu_tier_bytes - raw_authority_bytes;
+    }
     const uint64_t total_device_bytes = backend_.total_device_bytes();
     if (effective.gpu_memory_ratio > 0.0 &&
         total_device_bytes > 0 &&
@@ -3669,8 +4462,36 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_gpu_page_pool_.reset();
     kvmem_k_cache_storage_.clear();
     kvmem_v_cache_storage_.clear();
-    kvmem_work_k_cache_storage_.clear();
     kvmem_kv_cache_view_ = KvCacheStorage{};
+    kvmem_raw_k_chunks_.clear();
+    kvmem_raw_k_mirror_bytes_ = 0;
+    kvmem_raw_k_row_bytes_ = 0;
+    kvmem_raw_k_valid_tokens_.clear();
+    kvmem_raw_layers_.clear();
+    kvmem_raw_layer_slot_.clear();
+    kvmem_raw_capture_dev_.clear();
+    kvmem_raw_capture_rows_ = 0;
+    kvmem_raw_capture_host_.reset();
+    kvmem_raw_transfer_dev_.reset();
+    kvmem_raw_transfer_host_.reset();
+    kvmem_raw_transfer_blocks_ = 0;
+    kvmem_raw_decode_block_start_ = -1;
+    kvmem_raw_decode_first_row_ = 0;
+    kvmem_raw_decode_rows_ = 0;
+    kvmem_raw_mtp_k_chunks_.clear();
+    kvmem_raw_mtp_k_mirror_bytes_ = 0;
+    kvmem_raw_mtp_k_valid_tokens_.clear();
+    kvmem_raw_mtp_capture_dev_.reset();
+    kvmem_raw_mtp_capture_rows_ = 0;
+    kvmem_raw_mtp_capture_host_.reset();
+    kvmem_raw_mtp_transfer_dev_.reset();
+    kvmem_raw_mtp_transfer_host_.reset();
+    kvmem_sparse_cpu_tier_ = false;
+    kvmem_cpu_budget_bytes_ = 0;
+    kvmem_cpu_sparse_bytes_ = 0;
+    kvmem_cpu_sparse_slots_.clear();
+    kvmem_defer_prefill_pressure_ = false;
+    kvmem_deferred_prefill_tokens_ = 0;
     // Tear down any MTP tiering from a prior config. Release pages back to the
     // (still-live) MTP pool and detach the allocator BEFORE destroying the pool
     // so reset() never touches a freed allocator. mtp_scratch_ready_/mtp_*_cache_
@@ -3708,8 +4529,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             // Give the MTP layer its own bounded sibling pool so its KV rides
             // the same GPU->CPU->NVMe tiering as the 16 std layers instead of a
             // dense full-context cache. Single-request internal-MTP path only.
-            if (weights_.mtp() && !external_mtp_kv_cache_ &&
-                kvmem_mtp_tier_enabled()) {
+            if (mtp_will_tier) {
                 kvmem_mtp_gpu_page_pool_ = std::make_unique<LocalKvPagePool>(
                     pool_pages, page_size, "mtp");
                 mtp_kv_pages_.set_allocator(kvmem_mtp_gpu_page_pool_.get());
@@ -3734,22 +4554,58 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             "resident pool)");
     }
     if (kvmem_immutable_source_k_) {
-        uint64_t working_k_bytes = 0;
-        for (const auto &cache : kvmem_work_k_cache_storage_) {
-            if (cache) {
-                working_k_bytes += cache->count *
-                    static_cast<uint64_t>(cache->elem_size);
+        kvmem_raw_layers_.reserve(standard_layers);
+        kvmem_raw_layer_slot_.assign(weights_.n_layers(), -1);
+        for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+            if (!model_cfg.is_standard_attention_layer(il)) continue;
+            kvmem_raw_layer_slot_[il] =
+                static_cast<int32_t>(kvmem_raw_layers_.size());
+            kvmem_raw_layers_.push_back(il);
+        }
+        kvmem_raw_k_row_bytes_ = raw_k_row_bytes;
+        const uint64_t raw_chunk_count =
+            (static_cast<uint64_t>(kv_ctx_size_) +
+             kvmem_raw_k_chunk_tokens_ - 1) /
+            kvmem_raw_k_chunk_tokens_;
+        kvmem_raw_k_chunks_.resize(
+            static_cast<size_t>(raw_chunk_count));
+        kvmem_raw_k_valid_tokens_.assign(kv_ctx_size_, 0);
+        if (kvmem_mtp_local_positions_) {
+            kvmem_raw_mtp_k_chunks_.resize(
+                static_cast<size_t>(raw_chunk_count));
+            kvmem_raw_mtp_k_valid_tokens_.assign(kv_ctx_size_, 0);
+        }
+        if (const char *env =
+                std::getenv("QW3_KVMEM_RAW_K_TRANSFER_BLOCKS")) {
+            const long long v = std::atoll(env);
+            if (v > 0) {
+                kvmem_raw_transfer_block_cap_ =
+                    static_cast<uint32_t>(v);
             }
         }
         std::fprintf(stderr,
                      "[kvmem-tier] immutable_source_k=1 "
-                     "working_k_bytes_per_block=%llu working_k_bytes=%llu "
-                     "working_k_gib=%.3f\n",
+                     "gpu_working_k_bytes=0 raw_k_alloc=demand "
+                     "raw_k_chunk_tokens=%u raw_k_max_bytes=%llu "
+                     "raw_mtp_k_max_bytes=%llu raw_k_allocated_bytes=0 "
+                     "mtp_local_positions=%d cpu_shared_budget_bytes=%llu "
+                     "cpu_spill_floor_bytes=%llu "
+                     "refresh_remaps=%u refresh_tokens=%llu max_baked_pos=%llu\n",
+                     kvmem_raw_k_chunk_tokens_,
                      static_cast<unsigned long long>(
-                         immutable_work_k_block_bytes),
-                     static_cast<unsigned long long>(working_k_bytes),
-                     static_cast<double>(working_k_bytes) /
-                         (1024.0 * 1024.0 * 1024.0));
+                         raw_k_mirror_max_bytes),
+                     static_cast<unsigned long long>(
+                         raw_mtp_k_mirror_max_bytes),
+                     kvmem_mtp_local_positions_ ? 1 : 0,
+                     static_cast<unsigned long long>(
+                         effective.cpu_tier_bytes),
+                     static_cast<unsigned long long>(
+                         capacity_cpu_tier_bytes),
+                     effective.immutable_refresh_remaps,
+                     static_cast<unsigned long long>(
+                         effective.immutable_refresh_abs_delta_tokens),
+                     static_cast<unsigned long long>(
+                         effective.immutable_max_baked_position));
     }
     if (effective.cpu_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
         PinnedKvTierConfig pcfg;
@@ -3757,12 +4613,19 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         pcfg.slot_bytes = effective.estimated_block_bytes;
         kvmem_cpu_tier_ = std::make_unique<PinnedKvTier>(pcfg);
         if (kvmem_cpu_tier_->enabled()) {
-            const uint64_t buf_bytes =
-                static_cast<uint64_t>(kvmem_cpu_tier_->slot_count()) *
-                pcfg.slot_bytes;
-            kvmem_cpu_bytes_ = host_tier_pool_
-                ? host_tier_pool_->acquire(buf_bytes, "kvmem_cpu_tier")
-                : backend_.host_buffer(buf_bytes, "kvmem_cpu_tier");
+            if (kvmem_immutable_source_k_) {
+                kvmem_sparse_cpu_tier_ = true;
+                kvmem_cpu_budget_bytes_ = effective.cpu_tier_bytes;
+                kvmem_cpu_sparse_slots_.resize(
+                    kvmem_cpu_tier_->slot_count());
+            } else {
+                const uint64_t buf_bytes =
+                    static_cast<uint64_t>(kvmem_cpu_tier_->slot_count()) *
+                    pcfg.slot_bytes;
+                kvmem_cpu_bytes_ = host_tier_pool_
+                    ? host_tier_pool_->acquire(buf_bytes, "kvmem_cpu_tier")
+                    : backend_.host_buffer(buf_bytes, "kvmem_cpu_tier");
+            }
         }
     }
     if (effective.nvme_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
@@ -3798,7 +4661,10 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 ? cap_ctx_blocks - cap_budget_blocks
                 : 0;
         const uint64_t cpu_slots =
-            kvmem_cpu_tier_ ? kvmem_cpu_tier_->slot_count() : 0;
+            effective.estimated_block_bytes > 0
+                ? capacity_cpu_tier_bytes /
+                      effective.estimated_block_bytes
+                : 0;
         const uint64_t nvme_slots =
             kvmem_nvme_tier_ ? kvmem_nvme_tier_->slot_count() : 0;
         const uint64_t spill_have_blocks = cpu_slots + nvme_slots;
@@ -3851,9 +4717,7 @@ void QwenExecutor::kvmem_register_append(uint32_t n_new_tokens) {
     // advanced both position_ and the active window tail.  Newly-created blocks
     // therefore need their actual window construction frame recorded here;
     // register_append's default orig_pos_start is only correct in the dense
-    // identity frame.  Never rewrite the pre-existing partial immutable block:
-    // forward_one_token/forward_n_tokens already source-corrected the rows that
-    // completed it into its original frame.
+    // identity frame.
     if (kvmem_active_ && (kvmem_fix_bakedpos_ || kvmem_immutable_source_k_)) {
         const int64_t delta = static_cast<int64_t>(window_query_pos_) -
                               static_cast<int64_t>(position_);
@@ -3883,11 +4747,28 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
     // rewound position/KV-pages/recurrent/window; this reconciles the block
     // store + tier slots + selection indices, which restore_state does not touch.
     std::vector<KvMemDroppedBlock> dropped = block_store_->truncate_to(token_pos);
+    if (token_pos < kvmem_raw_k_valid_tokens_.size()) {
+        std::fill(kvmem_raw_k_valid_tokens_.begin() + token_pos,
+                  kvmem_raw_k_valid_tokens_.end(),
+                  static_cast<uint8_t>(0));
+    }
+    if (token_pos < kvmem_raw_mtp_k_valid_tokens_.size()) {
+        std::fill(kvmem_raw_mtp_k_valid_tokens_.begin() + token_pos,
+                  kvmem_raw_mtp_k_valid_tokens_.end(),
+                  static_cast<uint8_t>(0));
+    }
+    kvmem_truncate_raw_k(token_pos);
+    kvmem_raw_decode_block_start_ = -1;
+    kvmem_raw_decode_first_row_ = 0;
+    kvmem_raw_decode_rows_ = 0;
     // Release CPU/NVMe tier slots for dropped blocks. GPU pages are NOT released
     // here: restore_state's truncate_to_logical_pages already freed the physical
     // pages for positions >= token_pos, so a second release would double-free.
     for (const KvMemDroppedBlock &d : dropped) {
-        if (d.cpu_slot >= 0 && kvmem_cpu_tier_) kvmem_cpu_tier_->release_block(d.block_id);
+        if (d.cpu_slot >= 0 && kvmem_cpu_tier_) {
+            kvmem_cpu_tier_->release_block(d.block_id);
+            kvmem_release_cpu_slot(d.cpu_slot);
+        }
         if (d.nvme_slot >= 0 && kvmem_nvme_tier_) kvmem_nvme_tier_->release_block(d.block_id);
     }
     // Invalidate the per-session selection indices so a stale index over the old
@@ -3967,6 +4848,19 @@ void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
     kvmem_reselect_prefill_pressure();
 }
 
+void QwenExecutor::kvmem_set_defer_prefill_pressure(bool enabled) {
+    kvmem_defer_prefill_pressure_ = enabled;
+    if (!enabled && kvmem_deferred_prefill_tokens_ > 0) {
+        kvmem_finish_deferred_prefill_pressure();
+    }
+}
+
+void QwenExecutor::kvmem_finish_deferred_prefill_pressure() {
+    const uint32_t pending = kvmem_deferred_prefill_tokens_;
+    kvmem_deferred_prefill_tokens_ = 0;
+    if (pending > 0) kvmem_maybe_prefill_offload(pending);
+}
+
 void QwenExecutor::sync_window_pages_device(uint32_t have_pages) {
     if (have_pages == 0) return;
     if (!window_pages_device_) {
@@ -4003,10 +4897,9 @@ uint64_t QwenExecutor::kvmem_kv_page_bytes() const {
         break;
     }
     if (!sample) return 0;
-    if (sample->elem_size == 1) {
-        throw std::runtime_error(
-            "KVMem CPU offload does not yet support 1-byte KV dtypes");
-    }
+    // q8 is rejected at immutable-mode configuration because of row scales;
+    // the remaining one-byte cache type is fp8, whose raw bytes can be tiered
+    // exactly like fp16/fp32.
     return elems * static_cast<uint64_t>(sample->elem_size);
 }
 
@@ -4061,15 +4954,14 @@ uint64_t QwenExecutor::kvmem_block_spill_bytes(const KvMemBlock &block) const {
     const uint32_t last_page =
         (block.orig_pos_start + block.n_tokens - 1) / page_size;
     const uint32_t n_pages = last_page - first_page + 1;
-    // Tiered MTP appends one extra layer's K+V as a trailing segment after the 16
-    // standard-attention layers, so its blob is 17/16 the size. Must match the
-    // configure-time estimate (mtp_will_tier) exactly or the stage-in size guard
-    // trips.
-    const uint64_t layers =
-        static_cast<uint64_t>(
-            count_standard_attention_layers(cfg, weights_.n_layers())) +
-        (kvmem_mtp_tiered_ ? 1ull : 0ull);
-    return page_bytes * n_pages * layers * 2ull;
+    const uint64_t standard_layers = static_cast<uint64_t>(
+        count_standard_attention_layers(cfg, weights_.n_layers()));
+    const uint64_t standard_copies =
+        standard_layers * (kvmem_immutable_source_k_ ? 1ull : 2ull);
+    const uint64_t mtp_copies = kvmem_mtp_tiered_
+        ? (kvmem_mtp_local_positions_ ? 1ull : 2ull)
+        : 0ull;
+    return page_bytes * n_pages * (standard_copies + mtp_copies);
 }
 
 uint8_t *QwenExecutor::kvmem_cpu_data() {
@@ -4105,7 +4997,7 @@ void QwenExecutor::kvmem_canonicalize_block_for_tier(uint32_t block_id) {
     // Main standard-attention layers: de-rotate from block.baked_pos (which
     // tracks the main cache's window slot) back to the block's true position so
     // the spilled bytes are position-canonical.
-    if (block.baked_pos != canonical) {
+    if (!kvmem_immutable_source_k_ && block.baked_pos != canonical) {
         const int64_t from = block.baked_pos;
         const uint32_t standard_layers =
             count_standard_attention_layers(cfg, weights_.n_layers());
@@ -4133,14 +5025,13 @@ void QwenExecutor::kvmem_canonicalize_block_for_tier(uint32_t block_id) {
                          block.orig_pos_start);
         }
     }
-    // MTP head: de-rotate from its OWN baked position. During prefill main K is
-    // packed to window slots while MTP stays canonical, so main.baked_pos and the
-    // MTP bake diverge; using it here would double-rotate an already-canonical MTP
-    // K. mtp_baked_pos_ is the MTP-specific truth. A block can be evicted before
-    // its MTP tail is primed (mid-prefill offload), in which case there is no
-    // resident MTP K to de-rotate — just advance the bake so the zero-staged pages
-    // read back canonical.
-    if (kvmem_mtp_tiered_) {
+    // Legacy MTP head: de-rotate from its OWN baked position. During prefill
+    // main K is packed to window slots while MTP stays canonical, so
+    // main.baked_pos and the MTP bake diverge; using it here would double-rotate
+    // an already-canonical MTP K. mtp_baked_pos_ is the MTP-specific truth.
+    // Local-position mode never canonicalizes a rotated MTP K: its raw CPU
+    // mirror is authoritative and only V is spilled below.
+    if (kvmem_mtp_tiered_ && !kvmem_mtp_local_positions_) {
         kvmem_sync_mtp_baked_pos();
         const int64_t mtp_from = mtp_baked_pos_[block_id];
         if (mtp_from != canonical) {
@@ -4207,20 +5098,20 @@ void QwenExecutor::kvmem_copy_block_to_host_ptr(const KvMemBlock &block,
             const uint64_t byte_offset =
                 static_cast<uint64_t>(physical_page) * page_size * per_pos *
                 static_cast<uint64_t>(kc.elem_size);
-            require_status(backend_.copy_bytes_to_host_async(kc, out, byte_offset,
-                                                             page_bytes));
-            out += page_bytes;
+            if (!kvmem_immutable_source_k_) {
+                require_status(backend_.copy_bytes_to_host_async(
+                    kc, out, byte_offset, page_bytes));
+                out += page_bytes;
+            }
             require_status(backend_.copy_bytes_to_host_async(vc, out, byte_offset,
                                                              page_bytes));
             out += page_bytes;
         }
     }
-    // Trailing MTP segment (Design B): the MTP head's K then V per page, appended
-    // after the 16 std layers. A block can be evicted before its MTP tail was
-    // primed (mid-prefill offload); those pages stage as zeros — they carry no
-    // data, are never read (the mid-prefill MTP window is throwaway and rebuilt
-    // post-prefill), and keeping the blob size fixed preserves the CPU/NVMe slot
-    // layout and the stage-in size guard.
+    // Trailing MTP segment. In legacy mode this is K then V per page. With
+    // local-position MTP, K is never spilled: the position-free CPU mirror is
+    // authoritative and assemble materializes it directly at the selected
+    // compact positions, so the tier record contains V only.
     if (kvmem_mtp_tiered_) {
         DeviceTensor &mk = mtp_k_cache();
         DeviceTensor &mv = mtp_v_cache();
@@ -4234,15 +5125,24 @@ void QwenExecutor::kvmem_copy_block_to_host_ptr(const KvMemBlock &block,
                 const uint64_t byte_offset =
                     static_cast<uint64_t>(physical_page) * page_size * per_pos *
                     static_cast<uint64_t>(mk.elem_size);
-                require_status(backend_.copy_bytes_to_host_async(
-                    mk, out, byte_offset, page_bytes));
-                out += page_bytes;
+                if (!kvmem_mtp_local_positions_) {
+                    require_status(backend_.copy_bytes_to_host_async(
+                        mk, out, byte_offset, page_bytes));
+                    out += page_bytes;
+                }
                 require_status(backend_.copy_bytes_to_host_async(
                     mv, out, byte_offset, page_bytes));
                 out += page_bytes;
             } else {
-                std::memset(out, 0, page_bytes);
-                out += page_bytes;
+                if (kvmem_mtp_local_positions_) {
+                    throw std::runtime_error(
+                        "KVMem local-position MTP attempted to spill a block "
+                        "before its V page was primed");
+                }
+                if (!kvmem_mtp_local_positions_) {
+                    std::memset(out, 0, page_bytes);
+                    out += page_bytes;
+                }
                 std::memset(out, 0, page_bytes);
                 out += page_bytes;
             }
@@ -4259,12 +5159,15 @@ uint8_t *QwenExecutor::kvmem_ensure_stage_pinned(uint64_t bytes) {
 }
 
 void QwenExecutor::kvmem_copy_block_from_host(
-        const KvMemBlock &block, const std::vector<uint8_t> &src) {
-    kvmem_copy_block_from_host(block, src.data(), src.size());
+        const KvMemBlock &block, const std::vector<uint8_t> &src,
+        bool stage_mtp_pages) {
+    kvmem_copy_block_from_host(block, src.data(), src.size(),
+                               stage_mtp_pages);
 }
 
 void QwenExecutor::kvmem_copy_block_from_host(
-        const KvMemBlock &block, const void *src, uint64_t src_bytes) {
+        const KvMemBlock &block, const void *src, uint64_t src_bytes,
+        bool stage_mtp_pages) {
     if (block.n_tokens == 0) return;
     const QwenConfig &cfg = model_.config();
     const uint64_t page_bytes = kvmem_kv_page_bytes();
@@ -4296,19 +5199,20 @@ void QwenExecutor::kvmem_copy_block_from_host(
             const uint64_t byte_offset =
                 static_cast<uint64_t>(physical_page) * page_size * per_pos *
                 static_cast<uint64_t>(kc.elem_size);
-            require_status(backend_.copy_bytes_from_host_async(kc, byte_offset, in,
-                                                               page_bytes));
-            in += page_bytes;
+            if (!kvmem_immutable_source_k_) {
+                require_status(backend_.copy_bytes_from_host_async(
+                    kc, byte_offset, in, page_bytes));
+                in += page_bytes;
+            }
             require_status(backend_.copy_bytes_from_host_async(vc, byte_offset, in,
                                                                page_bytes));
             in += page_bytes;
         }
     }
-    // Trailing MTP segment: land the MTP head's K then V into its page table,
-    // which the stage-in residency loop has already made resident. The spilled
-    // bytes are position-canonical (stage-out canonicalized MTP to orig), matching
-    // mtp_baked_pos_ so the following assemble re-RoPEs from the right base.
-    if (kvmem_mtp_prefix_covers_registered()) {
+    // Trailing MTP segment: legacy records contain K then V; local-position
+    // records contain V only. Raw MTP K is materialized after stage-in, directly
+    // into the selected window frame.
+    if (stage_mtp_pages) {
         DeviceTensor &mk = mtp_k_cache();
         DeviceTensor &mv = mtp_v_cache();
         if (mk.elem_size != mv.elem_size) {
@@ -4323,9 +5227,11 @@ void QwenExecutor::kvmem_copy_block_from_host(
             const uint64_t byte_offset =
                 static_cast<uint64_t>(physical_page) * page_size * per_pos *
                 static_cast<uint64_t>(mk.elem_size);
-            require_status(backend_.copy_bytes_from_host_async(mk, byte_offset, in,
-                                                               page_bytes));
-            in += page_bytes;
+            if (!kvmem_mtp_local_positions_) {
+                require_status(backend_.copy_bytes_from_host_async(
+                    mk, byte_offset, in, page_bytes));
+                in += page_bytes;
+            }
             require_status(backend_.copy_bytes_from_host_async(mv, byte_offset, in,
                                                                page_bytes));
             in += page_bytes;
@@ -4343,19 +5249,27 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     if (kvmem_prefetch_.active) {
         throw std::runtime_error("KVMem prefetch already active");
     }
-    const bool tm = kvmem_timing_flag();
+    const bool perf_trace = kvmem_perf_trace_flag();
+    const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_in0 = tm ? kvmem_steady_ns() : 0;
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_prefetch_.active = true;
-    // Only restore the sibling MTP pages when the prefix builder has caught up
-    // with every registered main-KV block.  For a request whose MTP path is
-    // disabled by the RoPE-position guard, mtp_kv_pages_ is intentionally empty.
-    // Calling ensure_logical_page_resident() on that empty sparse table for a
-    // selected historical block would allocate every intervening logical page
-    // (a dense prefix) and exhaust the bounded MTP pool around block 8192.
-    // This predicate is deliberately identical to kvmem_assemble's
-    // build_mtp_window gate: a lagging/absent MTP window is never consumed.
-    const bool stage_mtp_pages = kvmem_mtp_prefix_covers_registered();
+    if (perf_trace) {
+        kvmem_prefetch_.perf.start_enter_ns = t_in0;
+    }
+    // Local-position MTP stores historical V independently of the prefix
+    // builder's current tail, so restore it even when an accepted token has
+    // already been registered and its MTP prefix is about to be replayed. The
+    // old coverage gate caused CPU-resident V to be silently skipped in this
+    // prepare -> replay -> finish interval. Legacy MTP retains the gate: if its
+    // prefix path was disabled, the sparse MTP table is intentionally empty and
+    // ensuring a far historical logical page would densely allocate every
+    // intervening page and exhaust the bounded pool.
+    kvmem_prefetch_.stage_mtp_pages =
+        kvmem_mtp_tiered_ &&
+        (kvmem_mtp_local_positions_ ||
+         kvmem_mtp_prefix_covers_registered());
+    const bool stage_mtp_pages = kvmem_prefetch_.stage_mtp_pages;
     try {
         const auto &blocks = block_store_->blocks();
         require_status(backend_.begin_kv_transfer_to_device());
@@ -4372,18 +5286,19 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                 if (!kvmem_cpu_tier_) {
                     throw std::runtime_error("KVMem CPU stage-in has no CPU tier");
                 }
-                if (!kvmem_cpu_data()) {
-                    throw std::runtime_error("KVMem CPU stage-in has no CPU backing buffer");
-                }
                 const int32_t slot = kvmem_cpu_tier_->block_slot(rm.block_id);
                 if (slot < 0) {
                     throw std::runtime_error("KVMem CPU stage-in missing CPU slot");
                 }
-                const uint64_t offset = kvmem_cpu_tier_->slot_offset(slot);
-                if (offset + bytes > kvmem_cpu_bytes()) {
-                    throw std::runtime_error("KVMem CPU tier slot read out of range");
+                stage_src = kvmem_cpu_slot_data(slot);
+                if (!stage_src) {
+                    throw std::runtime_error(
+                        "KVMem CPU stage-in has no CPU slot backing");
                 }
-                stage_src = kvmem_cpu_data() + offset;
+                if (perf_trace) {
+                    ++kvmem_prefetch_.perf.cpu_blocks;
+                    kvmem_prefetch_.perf.cpu_bytes += bytes;
+                }
             } else if (block.tier == KvTier::SSD) {
                 if (!kvmem_nvme_tier_) {
                     throw std::runtime_error("KVMem NVMe stage-in has no NVMe tier");
@@ -4393,6 +5308,10 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                 read.bytes = bytes;
                 read.buffer.resize(bytes);
                 kvmem_prefetch_.nvme_reads.push_back(std::move(read));
+                if (perf_trace) {
+                    ++kvmem_prefetch_.perf.nvme_blocks;
+                    kvmem_prefetch_.perf.nvme_bytes += bytes;
+                }
                 if (kvmem_tier_trace_enabled()) {
                     std::fprintf(stderr,
                                  "[kvmem-tier] stage_in_async_read block=%u from=nvme bytes=%llu\n",
@@ -4404,6 +5323,8 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                 throw std::runtime_error(
                     "KVMem stage-in requested a non-resident block with no backing tier");
             }
+            const uint64_t t_cpu_enqueue0 =
+                perf_trace ? kvmem_steady_ns() : 0;
             const uint32_t page_size = kv_pages_.page_size;
             const uint32_t first_page = block.orig_pos_start / page_size;
             const uint32_t last_page =
@@ -4414,7 +5335,12 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                     (void)mtp_kv_pages_.ensure_logical_page_resident(backend_, lp);
                 }
             }
-            kvmem_copy_block_from_host(block, stage_src, stage_bytes);
+            kvmem_copy_block_from_host(block, stage_src, stage_bytes,
+                                       stage_mtp_pages);
+            if (perf_trace) {
+                kvmem_prefetch_.perf.cpu_h2d_enqueue_ns +=
+                    kvmem_steady_ns() - t_cpu_enqueue0;
+            }
             kvmem_prefetch_.queued_h2d = true;
             kvmem_prefetch_.blocks.push_back(KvMemPrefetchBlock{rm.block_id,
                                                                 block.tier});
@@ -4430,17 +5356,26 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
             NvmeKvTier *tier = kvmem_nvme_tier_.get();
             std::vector<KvMemPrefetchNvmeRead> *reads =
                 &kvmem_prefetch_.nvme_reads;
+            uint64_t *read_ns = &kvmem_prefetch_.perf.nvme_read_ns;
             kvmem_prefetch_.nvme_future = std::async(
-                std::launch::async, [tier, reads]() {
+                std::launch::async, [tier, reads, read_ns, perf_trace]() {
+                    const uint64_t t0 =
+                        perf_trace ? kvmem_steady_ns() : 0;
                     for (KvMemPrefetchNvmeRead &read : *reads) {
                         tier->read_block(read.block_id, read.buffer.data(),
                                          read.bytes);
+                    }
+                    if (perf_trace) {
+                        *read_ns = kvmem_steady_ns() - t0;
                     }
                 });
         }
     } catch (...) {
         kvmem_prefetch_ = KvMemPrefetchState{};
         throw;
+    }
+    if (perf_trace) {
+        kvmem_prefetch_.perf.start_exit_ns = kvmem_steady_ns();
     }
     if (tm) {
         kvmem_timing_totals().stage_in_ns.fetch_add(
@@ -4450,15 +5385,27 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
 
 void QwenExecutor::kvmem_finish_prefetch() {
     if (!kvmem_prefetch_.active) return;
-    const bool tm = kvmem_timing_flag();
+    const bool perf_trace = kvmem_perf_trace_flag();
+    const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_in0 = tm ? kvmem_steady_ns() : 0;
+    if (perf_trace) {
+        kvmem_prefetch_.perf.finish_enter_ns = t_in0;
+    }
     uint32_t staged = 0;
-    const bool stage_mtp_pages = kvmem_mtp_prefix_covers_registered();
+    const bool stage_mtp_pages = kvmem_prefetch_.stage_mtp_pages;
     try {
         if (kvmem_prefetch_.nvme_future.valid()) {
+            const uint64_t t_wait0 =
+                perf_trace ? kvmem_steady_ns() : 0;
             kvmem_prefetch_.nvme_future.get();
+            if (perf_trace) {
+                kvmem_prefetch_.perf.nvme_wait_ns +=
+                    kvmem_steady_ns() - t_wait0;
+            }
         }
         if (!kvmem_prefetch_.nvme_reads.empty()) {
+            const uint64_t t_nvme_h2d0 =
+                perf_trace ? kvmem_steady_ns() : 0;
             const auto &blocks = block_store_->blocks();
             for (KvMemPrefetchNvmeRead &read : kvmem_prefetch_.nvme_reads) {
                 const KvMemBlock &block = blocks[read.block_id];
@@ -4473,7 +5420,7 @@ void QwenExecutor::kvmem_finish_prefetch() {
                     }
                 }
                 kvmem_copy_block_from_host(block, read.buffer.data(),
-                                           read.bytes);
+                                           read.bytes, stage_mtp_pages);
                 kvmem_prefetch_.queued_h2d = true;
                 kvmem_prefetch_.blocks.push_back(
                     KvMemPrefetchBlock{read.block_id, KvTier::SSD});
@@ -4484,14 +5431,27 @@ void QwenExecutor::kvmem_finish_prefetch() {
                                  static_cast<unsigned long long>(read.bytes));
                 }
             }
+            if (perf_trace) {
+                kvmem_prefetch_.perf.nvme_h2d_enqueue_ns +=
+                    kvmem_steady_ns() - t_nvme_h2d0;
+            }
         }
         if (kvmem_prefetch_.queued_h2d) {
+            const uint64_t t_h2d_wait0 =
+                perf_trace ? kvmem_steady_ns() : 0;
             require_status(backend_.wait_kv_transfer());
+            if (perf_trace) {
+                kvmem_prefetch_.perf.h2d_wait_ns +=
+                    kvmem_steady_ns() - t_h2d_wait0;
+            }
         }
         staged = static_cast<uint32_t>(kvmem_prefetch_.blocks.size());
         for (const KvMemPrefetchBlock &pb : kvmem_prefetch_.blocks) {
             if (pb.from == KvTier::CPU && kvmem_cpu_tier_) {
+                const int32_t slot =
+                    kvmem_cpu_tier_->block_slot(pb.block_id);
                 kvmem_cpu_tier_->release_block(pb.block_id);
+                kvmem_release_cpu_slot(slot);
             } else if (pb.from == KvTier::SSD && kvmem_nvme_tier_) {
                 kvmem_nvme_tier_->release_block(pb.block_id);
             }
@@ -4500,6 +5460,10 @@ void QwenExecutor::kvmem_finish_prefetch() {
     } catch (...) {
         kvmem_prefetch_ = KvMemPrefetchState{};
         throw;
+    }
+    if (perf_trace) {
+        kvmem_prefetch_.perf.finish_exit_ns = kvmem_steady_ns();
+        kvmem_last_prefetch_perf_ = kvmem_prefetch_.perf;
     }
     kvmem_prefetch_ = KvMemPrefetchState{};
     if (tm) {
@@ -4512,9 +5476,11 @@ void QwenExecutor::kvmem_finish_prefetch() {
 }
 
 void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
+    kvmem_last_stage_out_perf_ = KvMemStageOutPerf{};
     if (!block_store_ || block_ids.empty()) return;
     if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) return;
-    const bool tm = kvmem_timing_flag();
+    const bool perf_trace = kvmem_perf_trace_flag();
+    const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_out0 = tm ? kvmem_steady_ns() : 0;
     uint32_t staged_out = 0;
     const auto &blocks = block_store_->blocks();
@@ -4527,25 +5493,40 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
         // asynchronously on the copy stream (a pageable buffer would serialize
         // them through the driver's bounce buffer).
         uint8_t *src = kvmem_ensure_stage_pinned(src_bytes);
-        // Immutable source K is already in its one true construction frame;
-        // spilling it verbatim preserves that frame and avoids another lossy
-        // fp16 de-RoPE/re-RoPE write.  baked_pos travels with the block metadata
-        // and is used as the source frame after stage-in.
-        if (!kvmem_immutable_source_k_) {
-            kvmem_canonicalize_block_for_tier(block_id);
+        // Standard K is omitted from immutable spill records. Legacy tiered MTP
+        // K still needs independent canonicalization; local-position MTP skips
+        // it and spills V only because raw MTP K is authoritative elsewhere.
+        const uint64_t t_d2h0 =
+            perf_trace ? kvmem_steady_ns() : 0;
+        kvmem_canonicalize_block_for_tier(block_id);
+        if (kvmem_mtp_local_positions_ &&
+            !kvmem_block_mtp_pages_resident(block)) {
+            throw std::runtime_error(
+                "KVMem local-position MTP attempted to stage out a block "
+                "before its V pages were primed");
         }
         require_status(backend_.begin_kv_transfer_from_device());
         kvmem_copy_block_to_host_ptr(block, src);
         require_status(backend_.wait_kv_transfer());
+        if (perf_trace) {
+            kvmem_last_stage_out_perf_.canonicalize_and_d2h_ns +=
+                kvmem_steady_ns() - t_d2h0;
+        }
         bool placed = false;
         int32_t cpu_slot = -1;
         int32_t nvme_slot = -1;
         if (kvmem_cpu_tier_) {
-            if (!kvmem_cpu_data()) {
-                throw std::runtime_error("KVMem CPU stage-out has no CPU backing buffer");
-            }
             PinnedSlotPlacement placement;
-            if (kvmem_nvme_tier_) {
+            if (kvmem_sparse_cpu_tier_) {
+                if (kvmem_cpu_budget_has(src_bytes)) {
+                    placement = kvmem_cpu_tier_->place_block(block_id);
+                    if (placement.slot >= 0 &&
+                        !kvmem_reserve_cpu_slot(placement.slot)) {
+                        kvmem_cpu_tier_->release_block(block_id);
+                        placement = PinnedSlotPlacement{};
+                    }
+                }
+            } else if (kvmem_nvme_tier_) {
                 placement = kvmem_cpu_tier_->place_block_evicting(block_id);
             } else {
                 placement = kvmem_cpu_tier_->place_block(block_id);
@@ -4556,11 +5537,20 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                         static_cast<uint32_t>(placement.evicted_block);
                     const uint64_t victim_bytes =
                         kvmem_block_spill_bytes(blocks[victim]);
-                    const uint64_t victim_offset =
-                        kvmem_cpu_tier_->slot_offset(placement.slot);
+                    const uint8_t *victim_src =
+                        kvmem_cpu_slot_data(placement.slot);
+                    if (!victim_src) {
+                        throw std::runtime_error(
+                            "KVMem CPU eviction lost its slot backing");
+                    }
+                    const uint64_t t_nvme0 =
+                        perf_trace ? kvmem_steady_ns() : 0;
                     kvmem_nvme_tier_->write_block(
-                        victim, kvmem_cpu_data() + victim_offset,
-                        victim_bytes);
+                        victim, victim_src, victim_bytes);
+                    if (perf_trace) {
+                        kvmem_last_stage_out_perf_.nvme_write_ns +=
+                            kvmem_steady_ns() - t_nvme0;
+                    }
                     if (kvmem_tier_trace_enabled()) {
                         std::fprintf(stderr,
                                      "[kvmem-tier] cpu_evict block=%u to=nvme slot=%d bytes=%llu\n",
@@ -4571,16 +5561,30 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                         victim, KvTier::SSD, -1,
                         kvmem_nvme_tier_->block_slot(victim));
                 }
-                const uint64_t offset = kvmem_cpu_tier_->slot_offset(placement.slot);
-                if (offset + src_bytes > kvmem_cpu_bytes()) {
-                    throw std::runtime_error("KVMem CPU tier slot write out of range");
+                uint8_t *dst = kvmem_cpu_slot_data(placement.slot);
+                if (!dst) {
+                    throw std::runtime_error(
+                        "KVMem CPU tier slot has no writable backing");
                 }
-                std::memcpy(kvmem_cpu_data() + offset, src, src_bytes);
+                const uint64_t t_copy0 =
+                    perf_trace ? kvmem_steady_ns() : 0;
+                std::memcpy(dst, src, src_bytes);
+                if (perf_trace) {
+                    kvmem_last_stage_out_perf_.cpu_copy_ns +=
+                        kvmem_steady_ns() - t_copy0;
+                }
                 placed = true;
                 cpu_slot = placement.slot;
             }
-        } else if (kvmem_nvme_tier_) {
+        }
+        if (!placed && kvmem_nvme_tier_) {
+            const uint64_t t_nvme0 =
+                perf_trace ? kvmem_steady_ns() : 0;
             kvmem_nvme_tier_->write_block(block_id, src, src_bytes);
+            if (perf_trace) {
+                kvmem_last_stage_out_perf_.nvme_write_ns +=
+                    kvmem_steady_ns() - t_nvme0;
+            }
             placed = true;
             nvme_slot = kvmem_nvme_tier_->block_slot(block_id);
         }
@@ -4604,6 +5608,15 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
             continue;
         }
         ++staged_out;
+        if (perf_trace) {
+            ++kvmem_last_stage_out_perf_.blocks;
+            kvmem_last_stage_out_perf_.bytes += src_bytes;
+            if (cpu_slot >= 0) {
+                ++kvmem_last_stage_out_perf_.cpu_blocks;
+            } else {
+                ++kvmem_last_stage_out_perf_.nvme_blocks;
+            }
+        }
         const uint32_t page_size = kv_pages_.page_size;
         const uint32_t first_page = block.orig_pos_start / page_size;
         const uint32_t last_page =
@@ -4626,6 +5639,10 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                          last_page - first_page + 1);
         }
     }
+    if (perf_trace) {
+        kvmem_last_stage_out_perf_.total_ns =
+            kvmem_steady_ns() - t_out0;
+    }
     if (tm) {
         KvMemTimingTotals &t = kvmem_timing_totals();
         t.stage_out_ns.fetch_add(kvmem_steady_ns() - t_out0,
@@ -4636,12 +5653,20 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
 }
 
 void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
-    const bool tm = kvmem_timing_flag();
+    const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_asm0 = tm ? kvmem_steady_ns() : 0;
     const QwenConfig &cfg = model_.config();
     const uint32_t page_size = kv_pages_.page_size;
     const uint32_t per_pos =
         static_cast<uint32_t>(cfg.n_kv_heads) * cfg.head_dim;
+    if (kvmem_mtp_local_positions_ && cfg.n_ctx_train > 0 &&
+        static_cast<uint64_t>(plan.total_window_tokens) +
+                block_store_->config().gen_budget >
+            cfg.n_ctx_train) {
+        throw std::runtime_error(
+            "KVMem assembled window plus generation reserve exceeds the "
+            "model context limit in local-position MTP mode");
+    }
 
     // Build the window page-index list = each selected block's ORIGINAL
     // physical pages, in window (ascending block-id) order, packed contiguously
@@ -4724,27 +5749,6 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
         t_pages = kvmem_steady_ns();
     }
 
-    // Drift-free construction: reset every working K tensor from the immutable
-    // source in one contiguous D2D copy per standard layer.  Copying the entire
-    // bounded pool trades a few high-bandwidth transfers for only O(layers)
-    // launches; a per-selected-page gather would require tens of thousands of
-    // tiny copies on the 224K/32-token configuration.  The subsequent batched
-    // re-RoPE writes working K only.
-    if (kvmem_immutable_source_k_) {
-        for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
-            if (!cfg.is_standard_attention_layer(il)) continue;
-            DeviceTensor &source = k_cache(il);
-            DeviceTensor &working = working_k_cache(il);
-            if (source.count != working.count ||
-                source.elem_size != working.elem_size) {
-                throw std::runtime_error(
-                    "KVMem immutable source/working K shape mismatch");
-            }
-            require_status(backend_.copy_d2d(
-                working, source, /*src_offset=*/0, source.count));
-        }
-    }
-
     // Re-RoPE each moved block in place, per standard attention layer. Skipped
     // blocks (already baked at their window slot) issue no kernel. Collect all
     // moved (non-skip) blocks once and upload their {to_base, from_base,
@@ -4759,10 +5763,15 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     bs_remap_from_host_.clear();
     bs_remap_ntok_host_.clear();
     uint32_t max_block_tokens = 0;
+    std::vector<const KvMemRemap *> raw_refreshes;
     const uint32_t standard_remap_layers =
         count_standard_attention_layers(cfg, weights_.n_layers());
     for (const KvMemRemap &rm : plan.remaps) {
         if (rm.skip) continue;
+        if (rm.raw_refresh) {
+            raw_refreshes.push_back(&rm);
+            continue;
+        }
         trace_rope_position_if_out_of_range(
             "kvmem_assemble.main.from", rm.from_base, rm.n_tokens,
             cfg.n_ctx_train, -1, standard_remap_layers);
@@ -4780,6 +5789,14 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     // then runs with the true query position (driven from base_pos/position_ in the
     // forward paths, not window_query_pos_), so relative distances are preserved.
     // Slots/page-table stay contiguous (addressing only). Default OFF -> byte-identical.
+    if (!raw_refreshes.empty()) {
+        if (kvmem_no_rerope_) {
+            throw std::runtime_error(
+                "immutable raw-K refresh is incompatible with "
+                "QW3_KVMEM_NO_REROPE");
+        }
+        kvmem_materialize_raw_k(raw_refreshes);
+    }
     if (n_moved > 0 && !kvmem_no_rerope_) {
         if (n_moved > bs_remap_capacity_) {
             bs_remap_capacity_ = n_moved;
@@ -4797,26 +5814,26 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
             *bs_remap_ntok_dev_, 0, bs_remap_ntok_host_.data(), n_moved));
         for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
             if (!cfg.is_standard_attention_layer(il)) continue;
-            DeviceTensor &kc = kvmem_immutable_source_k_
-                ? working_k_cache(il)
-                : k_cache(il);
             require_status(backend_.rope_block_remap_paged_batched_device(
-                kc, n_moved, max_block_tokens, cfg.n_kv_heads, per_pos,
+                k_cache(il), n_moved, max_block_tokens,
+                cfg.n_kv_heads, per_pos,
                 cfg.head_dim, cfg.rope_dim, *bs_remap_to_dev_,
                 *bs_remap_from_dev_, *bs_remap_ntok_dev_, *window_pages_device_,
                 page_size, cfg.rope_theta));
         }
     }
-    // MTP draft head: one extra standard-attention layer with its own K cache and
-    // its own re-RoPE. Its moved-set is NOT main's: MTP tracks a separate bake
-    // (mtp_baked_pos_) because during prefill main K is packed to window slots
-    // while MTP stays canonical, so a block can be a main-skip but an MTP-move (or
-    // vice versa). Build the MTP {to,from,ntok} from mtp_baked_pos_, launch once
-    // over the MTP window page table, then commit every selected block's new MTP
-    // bake. Only when the MTP window is built (spec decode, priming caught up) and
-    // re-RoPE is enabled; identity budgets leave every block MTP-canonical so the
-    // moved-set is empty and no kernel fires (byte-identical to a non-tiered build).
-    if (build_mtp_window && !kvmem_no_rerope_) {
+    // MTP draft head: in immutable local-position mode, never transform a
+    // previously rotated working K. Rebuild every selected K directly from the
+    // position-free CPU authority at rm.to_base. This also makes the result
+    // independent of how often the block was selected or spilled. The legacy
+    // path below retains the MTP-specific baked-position bookkeeping.
+    if (build_mtp_window && kvmem_mtp_local_positions_) {
+        kvmem_materialize_raw_mtp_k(plan);
+        kvmem_sync_mtp_baked_pos();
+        for (const KvMemRemap &rm : plan.remaps) {
+            mtp_baked_pos_[rm.block_id] = static_cast<int64_t>(rm.to_base);
+        }
+    } else if (build_mtp_window && !kvmem_no_rerope_) {
         kvmem_sync_mtp_baked_pos();
         bs_mtp_remap_to_host_.clear();
         bs_mtp_remap_from_host_.clear();
@@ -4951,7 +5968,17 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     if (kvmem_pending_reselect_) {
         throw std::runtime_error("KVMem reselect already prepared");
     }
-    const bool tm = kvmem_timing_flag();
+    const bool perf_trace = kvmem_perf_trace_flag();
+    if (perf_trace) {
+        static std::atomic<uint64_t> reselect_sequence{0};
+        kvmem_reselect_perf_ = KvMemReselectPerf{};
+        kvmem_reselect_perf_.active = true;
+        kvmem_reselect_perf_.sequence =
+            reselect_sequence.fetch_add(1, std::memory_order_relaxed);
+        kvmem_reselect_perf_.start_ns = kvmem_steady_ns();
+    }
+    if (kvmem_immutable_source_k_) kvmem_flush_raw_k_decode();
+    const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_sel0 = tm ? kvmem_steady_ns() : 0;
     const KvMemMethod method = block_store_->config().select_method;
     // Build the global content-frame index once, from the pristine post-prefill
@@ -4975,6 +6002,18 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     //               index/query isn't live (q8/fp8, or first selection).
     //   H2O       — window-local cumulative attention heat only.
     //   Recency   — no learned signal; pick_topk keeps sink + recent only.
+    const char *scorer_requested = "none";
+    const char *scorer_used = "none";
+    std::string scorer_fallback_reason;
+    auto add_scorer_failure = [&](const char *scorer,
+                                  const std::string &reason) {
+        if (!scorer_fallback_reason.empty()) {
+            scorer_fallback_reason.push_back(',');
+        }
+        scorer_fallback_reason += scorer;
+        scorer_fallback_reason.push_back(':');
+        scorer_fallback_reason += reason.empty() ? "unknown_failure" : reason;
+    };
     switch (method) {
         case KvMemMethod::Retrieval:
             // Preserve the just-finished step's window-local profile before
@@ -4987,22 +6026,52 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             //   mean-k    -> softmax-over-pages on the per-block mean key (default).
             // Either falls back to the single last-token content scorer if its
             // buffer isn't live (e.g. no query span, or the shmem page cap is hit).
-            if (kvmem_qc_deltanet_ && kvmem_dn_ready_) {
+            if (kvmem_qc_deltanet_) {
                 // DeltaNet-state retrieval (deltanet_retrieval.md). Falls back to
                 // mean-k / single-token content scoring if its capture isn't live.
-                bool scored = kvmem_retrieval_score_deltanet();
+                scorer_requested = "deltanet";
+                std::string reason;
+                bool scored = kvmem_retrieval_score_deltanet(&reason);
+                if (scored) scorer_used = "deltanet";
                 if (!scored) {
-                    if (kvmem_query_end_ > kvmem_query_begin_ && g_query_multi_ready_)
-                        scored = kvmem_retrieval_score_mean_softmax();
-                    if (!scored) (void)kvmem_retrieval_score();
+                    add_scorer_failure("deltanet", reason);
+                    reason.clear();
+                    scored = kvmem_retrieval_score_mean_softmax(-1, &reason);
+                    if (scored) {
+                        scorer_used = "mean-k";
+                    } else {
+                        add_scorer_failure("mean-k", reason);
+                    }
                 }
-            } else if (kvmem_query_end_ > kvmem_query_begin_ && g_query_multi_ready_) {
-                bool scored = false;
-                if (kvmem_qc_pertoken_) scored = kvmem_retrieval_score_exactmass();
-                else                    scored = kvmem_retrieval_score_mean_softmax();
-                if (!scored) (void)kvmem_retrieval_score();
+                if (!scored) {
+                    reason.clear();
+                    scored = kvmem_retrieval_score(&reason);
+                    if (scored) {
+                        scorer_used = "single-token-content";
+                    } else {
+                        add_scorer_failure("single-token-content", reason);
+                        scorer_used = "window-profile";
+                    }
+                }
             } else {
-                (void)kvmem_retrieval_score();
+                scorer_requested = kvmem_qc_pertoken_ ? "per-token" : "mean-k";
+                std::string reason;
+                bool scored = kvmem_qc_pertoken_
+                    ? kvmem_retrieval_score_exactmass(&reason)
+                    : kvmem_retrieval_score_mean_softmax(-1, &reason);
+                if (scored) {
+                    scorer_used = scorer_requested;
+                } else {
+                    add_scorer_failure(scorer_requested, reason);
+                    reason.clear();
+                    scored = kvmem_retrieval_score(&reason);
+                    if (scored) {
+                        scorer_used = "single-token-content";
+                    } else {
+                        add_scorer_failure("single-token-content", reason);
+                        scorer_used = "window-profile";
+                    }
+                }
             }
             break;
         case KvMemMethod::H2O:
@@ -5016,6 +6085,48 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     }
     kvmem_pending_plan_ =
         block_store_->set_selection(kvmem_selection_with_pin());
+    if (method == KvMemMethod::Retrieval) {
+        const bool fallback =
+            std::strcmp(scorer_requested, scorer_used) != 0;
+        if (fallback || std::getenv("QW3_KVMEM_TRACE")) {
+            static std::atomic<uint64_t> scorer_event_sequence{0};
+            const uint64_t seq =
+                scorer_event_sequence.fetch_add(1, std::memory_order_relaxed);
+            uint32_t selected_blocks = 0;
+            for (const KvMemBlock &block : block_store_->blocks()) {
+                selected_blocks += block.in_working_set ? 1u : 0u;
+            }
+            const uint32_t query_expected =
+                kvmem_query_end_ > kvmem_query_begin_
+                    ? kvmem_query_end_ - kvmem_query_begin_
+                    : 0;
+            uint32_t indexed_blocks = 0;
+            if (std::strcmp(scorer_used, "per-token") == 0 ||
+                std::strcmp(scorer_used, "deltanet") == 0) {
+                indexed_blocks = kvmem_qc_total_blocks_;
+            } else if (std::strcmp(scorer_used, "mean-k") == 0) {
+                indexed_blocks = g_kbar_multi_blocks_;
+            } else if (std::strcmp(scorer_used,
+                                   "single-token-content") == 0) {
+                indexed_blocks = g_indexed_blocks_;
+            }
+            std::fprintf(
+                stderr,
+                "[kvmem-scorer] seq=%llu tag=%s position=%u "
+                "requested=%s used=%s fallback=%d reason=%s "
+                "query_expected=%u query_captured=%u query_ready=%d "
+                "indexed_blocks=%u source_blocks=%u selected_blocks=%u\n",
+                static_cast<unsigned long long>(seq),
+                kvmem_trace_tag_.empty() ? "-" : kvmem_trace_tag_.c_str(),
+                position_, scorer_requested, scorer_used, fallback ? 1 : 0,
+                scorer_fallback_reason.empty()
+                    ? "none"
+                    : scorer_fallback_reason.c_str(),
+                query_expected, g_query_multi_count_,
+                g_query_multi_ready_ ? 1 : 0, indexed_blocks,
+                block_store_->block_count(), selected_blocks);
+        }
+    }
     // DIAGNOSTIC (default OFF): dump the per-block retrieval ranking + selection
     // so an offline tool can locate evidence and compare selected history spans.
     // Gated on QW3_KVMEM_DUMP_SCORES (a file path); normal runs are unchanged.
@@ -5068,6 +6179,10 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                         "\"prompt_tokens\":%zu,"
                         "\"budget_blocks\":%u,\"recent\":%u,\"sink\":%u,"
                         "\"block_tokens\":%u,\"method\":\"%s\",\"mask\":%d,"
+                        "\"scorer_requested\":\"%s\","
+                        "\"scorer_used\":\"%s\","
+                        "\"scorer_fallback_reason\":\"%s\","
+                        "\"query_expected\":%u,\"query_captured\":%u,"
                         "\"qc_total_blocks\":%u,\"qc_captured_blocks\":%u,"
                         "\"trace_event\":%u,\"trace_events\":%u,"
                         "\"index_ready\":%d,\"query_ready\":%d,"
@@ -5081,6 +6196,14 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                         kvmem_qc_deltanet_ ? "deltanet" :
                             (kvmem_qc_pertoken_ ? "per-token" : "mean-k"),
                         mask_label,
+                        scorer_requested, scorer_used,
+                        scorer_fallback_reason.empty()
+                            ? "none"
+                            : scorer_fallback_reason.c_str(),
+                        kvmem_query_end_ > kvmem_query_begin_
+                            ? kvmem_query_end_ - kvmem_query_begin_
+                            : 0,
+                        g_query_multi_count_,
                         kvmem_qc_total_blocks_, kvmem_qc_captured_blocks_,
                         kvmem_trace_event_index_, kvmem_trace_event_count_,
                         index_ready ? 1 : 0,
@@ -5151,10 +6274,14 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     }
     if (tm) {
         require_status(backend_.synchronize());
+        const uint64_t t_sel1 = kvmem_steady_ns();
         KvMemTimingTotals &t = kvmem_timing_totals();
-        t.retrieval_ns.fetch_add(kvmem_steady_ns() - t_sel0,
+        t.retrieval_ns.fetch_add(t_sel1 - t_sel0,
                                  std::memory_order_relaxed);
         t.retrieval_calls.fetch_add(1, std::memory_order_relaxed);
+        if (perf_trace) {
+            kvmem_reselect_perf_.selection_ns = t_sel1 - t_sel0;
+        }
     }
     // Free the evicted blocks' GPU pages BEFORE staging in the resurrected ones.
     // A query-conditioned reselect can swap a large fraction of the working set
@@ -5184,6 +6311,10 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     };
     trace_pool("before_stage_out");
     kvmem_stage_out(kvmem_pending_plan_.stage_out);
+    if (perf_trace) {
+        kvmem_reselect_perf_.stage_out_ns =
+            kvmem_last_stage_out_perf_.total_ns;
+    }
     trace_pool("after_stage_out");
     kvmem_start_prefetch(kvmem_pending_plan_);
     trace_pool("after_start_prefetch");
@@ -5193,10 +6324,82 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
 
 uint32_t QwenExecutor::kvmem_finish_reselect() {
     if (!kvmem_pending_reselect_) return window_query_pos_;
+    const bool perf_trace =
+        kvmem_perf_trace_flag() && kvmem_reselect_perf_.active;
     kvmem_finish_prefetch();
+    const uint64_t t_assemble0 =
+        perf_trace ? kvmem_steady_ns() : 0;
     kvmem_assemble(kvmem_pending_plan_);
+    const uint64_t t_done =
+        perf_trace ? kvmem_steady_ns() : 0;
+    if (perf_trace) {
+        const KvMemPrefetchPerf &in = kvmem_last_prefetch_perf_;
+        const KvMemStageOutPerf &out = kvmem_last_stage_out_perf_;
+        const double ns_to_ms = 1.0 / 1.0e6;
+        const double bytes_to_gib =
+            1.0 / (1024.0 * 1024.0 * 1024.0);
+        const uint64_t submit_ns =
+            in.start_exit_ns >= in.start_enter_ns
+                ? in.start_exit_ns - in.start_enter_ns : 0;
+        const uint64_t overlap_gap_ns =
+            in.finish_enter_ns >= in.start_exit_ns
+                ? in.finish_enter_ns - in.start_exit_ns : 0;
+        const uint64_t finish_ns =
+            in.finish_exit_ns >= in.finish_enter_ns
+                ? in.finish_exit_ns - in.finish_enter_ns : 0;
+        const uint64_t stage_in_wall_ns =
+            in.finish_exit_ns >= in.start_enter_ns
+                ? in.finish_exit_ns - in.start_enter_ns : 0;
+        const uint64_t nvme_hidden_ns =
+            in.nvme_read_ns > in.nvme_wait_ns
+                ? in.nvme_read_ns - in.nvme_wait_ns : 0;
+        const uint64_t total_ns =
+            t_done >= kvmem_reselect_perf_.start_ns
+                ? t_done - kvmem_reselect_perf_.start_ns : 0;
+        std::fprintf(
+            stderr,
+            "[kvmem-reselect-perf] kind=semantic seq=%llu tag=%s position=%u "
+            "source_blocks=%u selected_blocks=%zu remaps=%zu stage_out=%zu "
+            "selection_ms=%.3f stage_out_ms=%.3f "
+            "stage_out_d2h_ms=%.3f stage_out_cpu_copy_ms=%.3f "
+            "stage_out_disk_write_ms=%.3f stage_out_blocks=%u "
+            "stage_out_gib=%.3f "
+            "prefetch_submit_ms=%.3f overlap_gap_ms=%.3f "
+            "prefetch_finish_ms=%.3f stage_in_wall_ms=%.3f "
+            "cpu_h2d_enqueue_ms=%.3f nvme_read_ms=%.3f "
+            "nvme_wait_ms=%.3f nvme_hidden_ms=%.3f "
+            "nvme_h2d_enqueue_ms=%.3f h2d_wait_ms=%.3f "
+            "cpu_in_blocks=%u cpu_in_gib=%.3f "
+            "nvme_in_blocks=%u nvme_in_gib=%.3f "
+            "assemble_ms=%.3f total_ms=%.3f\n",
+            static_cast<unsigned long long>(
+                kvmem_reselect_perf_.sequence),
+            kvmem_trace_tag_.empty() ? "-" : kvmem_trace_tag_.c_str(),
+            position_, block_store_->block_count(),
+            kvmem_pending_plan_.remaps.size(),
+            kvmem_pending_plan_.remaps.size(),
+            kvmem_pending_plan_.stage_out.size(),
+            kvmem_reselect_perf_.selection_ns * ns_to_ms,
+            kvmem_reselect_perf_.stage_out_ns * ns_to_ms,
+            out.canonicalize_and_d2h_ns * ns_to_ms,
+            out.cpu_copy_ns * ns_to_ms,
+            out.nvme_write_ns * ns_to_ms, out.blocks,
+            out.bytes * bytes_to_gib, submit_ns * ns_to_ms,
+            overlap_gap_ns * ns_to_ms, finish_ns * ns_to_ms,
+            stage_in_wall_ns * ns_to_ms,
+            in.cpu_h2d_enqueue_ns * ns_to_ms,
+            in.nvme_read_ns * ns_to_ms, in.nvme_wait_ns * ns_to_ms,
+            nvme_hidden_ns * ns_to_ms,
+            in.nvme_h2d_enqueue_ns * ns_to_ms,
+            in.h2d_wait_ns * ns_to_ms, in.cpu_blocks,
+            in.cpu_bytes * bytes_to_gib, in.nvme_blocks,
+            in.nvme_bytes * bytes_to_gib,
+            (t_done - t_assemble0) * ns_to_ms,
+            total_ns * ns_to_ms);
+    }
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};
+    kvmem_reselect_perf_ = KvMemReselectPerf{};
     return window_query_pos_;
 }
 
@@ -5207,7 +6410,15 @@ uint32_t QwenExecutor::kvmem_set_selection(
     if (kvmem_pending_reselect_) {
         throw std::runtime_error("KVMem explicit selection during pending reselect");
     }
+    const bool perf_trace = kvmem_perf_trace_flag();
+    const uint64_t t_all0 =
+        perf_trace ? kvmem_steady_ns() : 0;
+    if (kvmem_immutable_source_k_) kvmem_flush_raw_k_decode();
+    const uint64_t t_select0 =
+        perf_trace ? kvmem_steady_ns() : 0;
     KvMemPlan plan = block_store_->set_selection(block_ids);
+    const uint64_t selection_ns =
+        perf_trace ? kvmem_steady_ns() - t_select0 : 0;
     // Evict before staging in (same pool-headroom invariant as the deferred
     // prepare/finish path): a large working-set swap would otherwise exhaust the
     // bounded GPU page pool when start_prefetch allocates ahead of stage_out.
@@ -5231,7 +6442,63 @@ uint32_t QwenExecutor::kvmem_set_selection(
     kvmem_start_prefetch(plan);
     trace_pool("after_start_prefetch");
     kvmem_finish_prefetch();
+    const uint64_t t_assemble0 =
+        perf_trace ? kvmem_steady_ns() : 0;
     kvmem_assemble(plan);
+    if (perf_trace) {
+        static std::atomic<uint64_t> explicit_sequence{0};
+        const uint64_t done = kvmem_steady_ns();
+        const KvMemPrefetchPerf &in = kvmem_last_prefetch_perf_;
+        const KvMemStageOutPerf &out = kvmem_last_stage_out_perf_;
+        const uint64_t submit_ns =
+            in.start_exit_ns >= in.start_enter_ns
+                ? in.start_exit_ns - in.start_enter_ns : 0;
+        const uint64_t overlap_gap_ns =
+            in.finish_enter_ns >= in.start_exit_ns
+                ? in.finish_enter_ns - in.start_exit_ns : 0;
+        const uint64_t finish_ns =
+            in.finish_exit_ns >= in.finish_enter_ns
+                ? in.finish_exit_ns - in.finish_enter_ns : 0;
+        const uint64_t nvme_hidden_ns =
+            in.nvme_read_ns > in.nvme_wait_ns
+                ? in.nvme_read_ns - in.nvme_wait_ns : 0;
+        constexpr double ns_to_ms = 1.0 / 1.0e6;
+        constexpr double bytes_to_gib =
+            1.0 / (1024.0 * 1024.0 * 1024.0);
+        std::fprintf(
+            stderr,
+            "[kvmem-reselect-perf] kind=explicit seq=%llu tag=%s "
+            "position=%u source_blocks=%u selected_blocks=%zu remaps=%zu "
+            "stage_out=%zu selection_ms=%.3f stage_out_ms=%.3f "
+            "stage_out_d2h_ms=%.3f stage_out_disk_write_ms=%.3f "
+            "stage_out_blocks=%u stage_out_gib=%.3f "
+            "prefetch_submit_ms=%.3f overlap_gap_ms=%.3f "
+            "prefetch_finish_ms=%.3f cpu_h2d_enqueue_ms=%.3f "
+            "nvme_read_ms=%.3f nvme_wait_ms=%.3f nvme_hidden_ms=%.3f "
+            "nvme_h2d_enqueue_ms=%.3f h2d_wait_ms=%.3f "
+            "cpu_in_blocks=%u cpu_in_gib=%.3f "
+            "nvme_in_blocks=%u nvme_in_gib=%.3f "
+            "assemble_ms=%.3f total_ms=%.3f\n",
+            static_cast<unsigned long long>(
+                explicit_sequence.fetch_add(1, std::memory_order_relaxed)),
+            kvmem_trace_tag_.empty() ? "-" : kvmem_trace_tag_.c_str(),
+            position_, block_store_->block_count(), plan.remaps.size(),
+            plan.remaps.size(), plan.stage_out.size(),
+            selection_ns * ns_to_ms, out.total_ns * ns_to_ms,
+            out.canonicalize_and_d2h_ns * ns_to_ms,
+            out.nvme_write_ns * ns_to_ms, out.blocks,
+            out.bytes * bytes_to_gib, submit_ns * ns_to_ms,
+            overlap_gap_ns * ns_to_ms, finish_ns * ns_to_ms,
+            in.cpu_h2d_enqueue_ns * ns_to_ms,
+            in.nvme_read_ns * ns_to_ms, in.nvme_wait_ns * ns_to_ms,
+            nvme_hidden_ns * ns_to_ms,
+            in.nvme_h2d_enqueue_ns * ns_to_ms,
+            in.h2d_wait_ns * ns_to_ms, in.cpu_blocks,
+            in.cpu_bytes * bytes_to_gib, in.nvme_blocks,
+            in.nvme_bytes * bytes_to_gib,
+            (done - t_assemble0) * ns_to_ms,
+            (done - t_all0) * ns_to_ms);
+    }
     return window_query_pos_;
 }
 
@@ -5675,7 +6942,7 @@ void QwenExecutor::kvmem_build_content_index() {
 
     if (n_blocks > g_kbar_global_capacity_) {
         g_kbar_global_capacity_ = n_blocks;
-        g_kbar_ = backend_.tensor_f32(
+        g_kbar_ = kvmem_alloc_mean_index_tensor(
             static_cast<uint64_t>(g_kbar_global_capacity_) * n_kv_heads * head_dim,
             "g_kbar");
         g_score_dev_ = backend_.tensor_f32(g_kbar_global_capacity_, "g_score");
@@ -5716,7 +6983,9 @@ void QwenExecutor::kvmem_build_content_index() {
             if (!g_kbar_multi_ || n_blocks > g_kbar_multi_capacity_ ||
                 g_kbar_multi_->count < per_layer * L) {
                 g_kbar_multi_capacity_ = n_blocks;
-                g_kbar_multi_ = backend_.tensor_f32(per_layer * L, "g_kbar_multi");
+                g_kbar_multi_ =
+                    kvmem_alloc_mean_index_tensor(per_layer * L,
+                                                  "g_kbar_multi");
             }
             bool all_ok = true;
             for (uint32_t s = 0; s < L && all_ok; ++s) {
@@ -5764,9 +7033,23 @@ void QwenExecutor::kvmem_snapshot_content_query(uint32_t layer_index) {
 // store's per-block score. pick_topk then ranks globally and can resurrect a
 // block dropped from the window. Returns false if anything is not live (caller
 // then keeps the window-local heat signal).
-bool QwenExecutor::kvmem_retrieval_score() {
-    if (!g_content_ready_ || !g_query_ready_ || !block_store_) return false;
-    if (g_indexed_blocks_ == 0) return false;
+bool QwenExecutor::kvmem_retrieval_score(std::string *failure_reason) {
+    if (failure_reason) failure_reason->clear();
+    if (!block_store_) {
+        return scorer_unavailable(failure_reason, "block_store_unavailable");
+    }
+    if (!g_content_ready_) {
+        return scorer_unavailable(failure_reason,
+                                  "single_content_index_not_ready");
+    }
+    if (!g_query_ready_) {
+        return scorer_unavailable(failure_reason,
+                                  "single_query_not_ready");
+    }
+    if (g_indexed_blocks_ == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "single_index_has_zero_blocks");
+    }
     const QwenConfig &cfg = model_.config();
     // Content-frame Q . k̄ has no 1/sqrt(d) softmax scale to honor (it is a bare
     // similarity rank), so use scale = 1.
@@ -5776,13 +7059,15 @@ bool QwenExecutor::kvmem_retrieval_score() {
             /*q_stride=*/cfg.head_dim, g_indexed_blocks_,
             cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, /*scale=*/1.0f);
         !st.ok) {
-        return false;
+        return scorer_backend_unavailable(
+            failure_reason, "single_scorer_kernel_failed", st);
     }
     std::vector<float> score(g_indexed_blocks_, 0.0f);
     if (auto st = backend_.copy_to_host(*g_score_dev_, score.data(), 0,
                                         g_indexed_blocks_);
         !st.ok) {
-        return false;
+        return scorer_backend_unavailable(
+            failure_reason, "single_score_d2h_failed", st);
     }
     // Bare content-similarity ranks (Q·k̄); softmax is monotonic so top-k selection
     // is identical with or without it — feed the raw scores straight through.
@@ -5940,14 +7225,37 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     kvmem_qc_layer_stride_blocks_ = stride_blocks;
     const uint64_t per_layer = static_cast<uint64_t>(stride_blocks) *
                                kvmem_qc_n_subblocks_ * n_kv_heads * head_dim;
-    // Per-layer content index [L, stride_blocks, n_subblocks, n_kv_heads, head_dim]
-    // fp32 (n_subblocks==1 for plain mean-k -> the original layout).
+    // Per-layer content index [L, stride_blocks, n_subblocks, n_kv_heads,
+    // head_dim]. Storage follows the KV dtype (fp16 or fp8 in production);
+    // builders and scorers still accumulate in fp32.
     bool freshly_allocated = false;
     if (!g_kbar_multi_ || stride_blocks > g_kbar_multi_capacity_ ||
         g_kbar_multi_->count < per_layer * L) {
         g_kbar_multi_capacity_ = stride_blocks;
-        g_kbar_multi_ = backend_.tensor_f32(per_layer * L, "g_kbar_multi");
+        g_kbar_multi_ =
+            kvmem_alloc_mean_index_tensor(per_layer * L, "g_kbar_multi");
         freshly_allocated = true;
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            const char *kv_dtype = std::getenv("QW3_KV_DTYPE");
+            const char *index_dtype =
+                kv_dtype && std::strcmp(kv_dtype, "fp32") == 0 ? "fp32" :
+                kv_dtype && std::strcmp(kv_dtype, "fp8") == 0 ? "fp8_e4m3" :
+                "fp16";
+            const uint64_t elements = per_layer * L;
+            const uint64_t bytes =
+                elements * static_cast<uint64_t>(g_kbar_multi_->elem_size);
+            std::fprintf(
+                stderr,
+                "[bs-kbar-index] dtype=%s elem_bytes=%u layers=%u "
+                "stride_blocks=%u subblocks=%u elements=%llu bytes=%llu "
+                "gib=%.3f\n",
+                index_dtype, g_kbar_multi_->elem_size, L, stride_blocks,
+                kvmem_qc_n_subblocks_,
+                static_cast<unsigned long long>(elements),
+                static_cast<unsigned long long>(bytes),
+                static_cast<double>(bytes) /
+                    (1024.0 * 1024.0 * 1024.0));
+        }
     }
     // Resume seeding keeps the exact token prefix represented by the existing
     // index. A suffix beginning mid-block now merges its new K rows with that
@@ -5995,7 +7303,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // slot-0 copy at capture completion. Size them for the full block count.
     if (total_blocks > g_kbar_global_capacity_) {
         g_kbar_global_capacity_ = total_blocks;
-        g_kbar_ = backend_.tensor_f32(per_layer, "g_kbar");
+        g_kbar_ = kvmem_alloc_mean_index_tensor(per_layer, "g_kbar");
         g_score_dev_ = backend_.tensor_f32(g_kbar_global_capacity_, "g_score");
         g_orig_base_dev_ = backend_.tensor_i32(g_kbar_global_capacity_, "g_orig_base");
         g_blk_tokens_dev_ = backend_.tensor_i32(g_kbar_global_capacity_, "g_blk_tokens");
@@ -6275,12 +7583,28 @@ void QwenExecutor::kvmem_capture_deltanet_query(uint32_t dn_slot,
 //   s_j = Σ_l w_l · RMSnorm_j[ TopKMean_h( TopKMean_t( d_j·||E_j^T q_t||_2 ) ) ]
 // with d_j = exp(G_M - G_j) (or 1 when deltanet_decay is off). Returns false
 // (caller falls back to mean-k) if the capture isn't live.
-bool QwenExecutor::kvmem_retrieval_score_deltanet() {
-    if (!block_store_ || !kvmem_qc_deltanet_) return false;
-    if (!kvmem_dn_ready_ || kvmem_dn_num_layers_ == 0) return false;
+bool QwenExecutor::kvmem_retrieval_score_deltanet(
+        std::string *failure_reason) {
+    if (failure_reason) failure_reason->clear();
+    if (!block_store_) {
+        return scorer_unavailable(failure_reason, "block_store_unavailable");
+    }
+    if (!kvmem_qc_deltanet_) {
+        return scorer_unavailable(failure_reason,
+                                  "deltanet_not_configured");
+    }
+    if (!kvmem_dn_ready_) {
+        return scorer_unavailable(failure_reason,
+                                  "deltanet_capture_not_ready");
+    }
+    if (kvmem_dn_num_layers_ == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "deltanet_has_zero_layers");
+    }
     if (!g_deltanet_snap_ || !g_deltanet_decaysum_ || !g_deltanet_decay_d_ ||
         !g_deltanet_q_ || !g_deltanet_r_) {
-        return false;
+        return scorer_unavailable(failure_reason,
+                                  "deltanet_buffer_unavailable");
     }
     const QwenConfig &cfg = model_.config();
     const uint32_t L = kvmem_dn_num_layers_;
@@ -6290,7 +7614,18 @@ bool QwenExecutor::kvmem_retrieval_score_deltanet() {
     const uint32_t dk = cfg.head_k_dim();
     const uint32_t nkh = cfg.num_k_heads();
     const uint32_t M = std::min(kvmem_dn_qcount_, kvmem_query_span_);
-    if (nb == 0 || vh == 0 || M == 0) return false;
+    if (nb == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "deltanet_index_has_zero_blocks");
+    }
+    if (vh == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "deltanet_has_zero_value_heads");
+    }
+    if (M == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "deltanet_query_capture_empty");
+    }
     const KvMemStoreConfig &bc = block_store_->config();
     const uint32_t topk_q = std::max<uint32_t>(1u, bc.deltanet_topk_q);
     const uint32_t topk_h = std::max<uint32_t>(1u, bc.deltanet_topk_h);
@@ -6308,7 +7643,8 @@ bool QwenExecutor::kvmem_retrieval_score_deltanet() {
     if (auto cp = backend_.copy_to_host(*g_deltanet_decaysum_, decaysum.data(), 0,
                                         decaysum.size());
         !cp.ok) {
-        return false;
+        return scorer_backend_unavailable(
+            failure_reason, "deltanet_decaysum_d2h_failed", cp);
     }
     std::vector<float> decay_d(small_per_layer * L, 1.0f);
     if (bc.deltanet_decay) {
@@ -6333,7 +7669,8 @@ bool QwenExecutor::kvmem_retrieval_score_deltanet() {
             *g_deltanet_decay_d_, /*byte_offset=*/0, decay_d.data(),
             decay_d.size() * sizeof(float));
         !cp.ok) {
-        return false;
+        return scorer_backend_unavailable(
+            failure_reason, "deltanet_decay_h2d_failed", cp);
     }
 
     // Per-layer block/head scores r[l,blk,vh] via the GPU scorer.
@@ -6348,7 +7685,8 @@ bool QwenExecutor::kvmem_retrieval_score_deltanet() {
                 /*q_off=*/static_cast<uint64_t>(l) * q_per_layer,
                 nb, nkh, vh, dv, dk, M, topk_q);
             !st.ok) {
-            return false;
+            return scorer_backend_unavailable(
+                failure_reason, "deltanet_scorer_kernel_failed", st);
         }
     }
 
@@ -6357,7 +7695,8 @@ bool QwenExecutor::kvmem_retrieval_score_deltanet() {
     std::vector<float> r(small_per_layer * L, 0.0f);
     if (auto cp = backend_.copy_to_host(*g_deltanet_r_, r.data(), 0, r.size());
         !cp.ok) {
-        return false;
+        return scorer_backend_unavailable(
+            failure_reason, "deltanet_score_d2h_failed", cp);
     }
     std::vector<double> layer_block(static_cast<uint64_t>(L) * nb, 0.0);
     for (uint32_t l = 0; l < L; ++l) {
@@ -6504,21 +7843,26 @@ void QwenExecutor::kvmem_restore_clean_query() {
     }
 }
 
-// pick_topk_blocks() unioned with the pinned tail [pin_from, block_count()). When no
-// pin is set (0xffffffff, the default cleared by reset_state) this returns
-// pick_topk_blocks() verbatim -> byte-identical selection. set_selection sorts the
-// ids internally, so the appended pinned ids need not be ordered.
+// Query replay requires its suffix [pin_from, block_count()) to survive the
+// semantic selection. These blocks consume ordinary top-k slots: appending them
+// after a full top-k would grow the active window beyond select_budget and could
+// drive target/MTP RoPE past n_ctx_train near the end of the generation reserve.
+// With no pin (the default cleared by reset_state), preserve the ordinary
+// selector byte-for-byte.
 std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
-    std::vector<uint32_t> sel = block_store_->pick_topk_blocks();
-    if (kvmem_qc_pin_from_block_ == 0xffffffffu) return sel;
-    const uint32_t nb = block_store_->block_count();
-    if (kvmem_qc_pin_from_block_ >= nb) return sel;
-    std::vector<bool> in_sel(nb, false);
-    for (uint32_t id : sel) if (id < nb) in_sel[id] = true;
-    for (uint32_t id = kvmem_qc_pin_from_block_; id < nb; ++id) {
-        if (!in_sel[id]) sel.push_back(id);
+    if (kvmem_qc_pin_from_block_ == 0xffffffffu) {
+        return block_store_->pick_topk_blocks();
     }
-    return sel;
+    const uint32_t nb = block_store_->block_count();
+    if (kvmem_qc_pin_from_block_ >= nb) {
+        return block_store_->pick_topk_blocks();
+    }
+    std::vector<uint32_t> mandatory;
+    mandatory.reserve(nb - kvmem_qc_pin_from_block_);
+    for (uint32_t id = kvmem_qc_pin_from_block_; id < nb; ++id) {
+        mandatory.push_back(id);
+    }
+    return block_store_->pick_topk_blocks(mandatory);
 }
 
 // During prefill at every normal-attention layer: build the per-layer content
@@ -6794,18 +8138,54 @@ void QwenExecutor::kvmem_decode_capture_finalize() {
 // no host-side inv_lm divide or extra normalization tail. Returns false (caller falls
 // back to the single last-token scorer) if the index/query isn't live or the kernel
 // rejects the page count. See docs/kvmem_utility_eval_plan.md.
-bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
-    if (!block_store_) return false;
-    if (!g_kbar_multi_ready_ || g_kbar_multi_blocks_ == 0) return false;
-    if (!g_query_multi_ || !g_query_multi_ready_ || g_query_multi_count_ == 0)
-        return false;
-    if (!g_score_dev_) return false;
+bool QwenExecutor::kvmem_retrieval_score_mean_softmax(
+        int mask_mode, std::string *failure_reason) {
+    if (failure_reason) failure_reason->clear();
+    if (!block_store_) {
+        return scorer_unavailable(failure_reason, "block_store_unavailable");
+    }
+    if (kvmem_query_end_ <= kvmem_query_begin_ ||
+        kvmem_query_span_ == 0) {
+        return scorer_unavailable(failure_reason, "query_span_missing");
+    }
+    if (!g_kbar_multi_ready_) {
+        return scorer_unavailable(failure_reason,
+                                  "mean_k_index_not_ready");
+    }
+    if (g_kbar_multi_blocks_ == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "mean_k_index_has_zero_blocks");
+    }
+    if (!g_query_multi_) {
+        return scorer_unavailable(failure_reason,
+                                  "query_buffer_unavailable");
+    }
+    if (!g_query_multi_ready_ ||
+        g_query_multi_count_ < kvmem_query_span_) {
+        return scorer_unavailable(failure_reason,
+                                  "query_capture_incomplete");
+    }
+    if (g_query_multi_count_ == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "query_capture_empty");
+    }
+    if (!g_score_dev_) {
+        return scorer_unavailable(failure_reason,
+                                  "score_buffer_unavailable");
+    }
     const QwenConfig &cfg = model_.config();
     const uint32_t L = kvmem_qc_num_layers_;
     const uint32_t M = g_query_multi_count_;
     const uint32_t S = kvmem_query_span_;       // per-layer row stride in g_query_multi_
     const uint32_t nb = g_kbar_multi_blocks_;
-    if (L == 0 || nb > g_kbar_global_capacity_) return false;  // g_score_dev_ sizing
+    if (L == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "mean_k_has_zero_layers");
+    }
+    if (nb > g_kbar_global_capacity_) {
+        return scorer_unavailable(failure_reason,
+                                  "indexed_blocks_exceed_score_capacity");
+    }
 
     // Per-(layer, question token, head) softmax over pages: score[w] comes back
     // already equal to the accumulated attention mass each page receives, so there
@@ -6863,12 +8243,14 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
             excl_lo_end, excl_hi_begin, /*n_subblocks=*/kvmem_qc_n_subblocks_,
             /*reduce_max=*/kvmem_qc_subblock_max_ ? 1u : 0u);
         !st.ok) {
-        return false;
+        return scorer_backend_unavailable(
+            failure_reason, "mean_k_scorer_kernel_failed", st);
     }
     std::vector<float> score(nb, 0.0f);
     if (auto cp = backend_.copy_to_host(*g_score_dev_, score.data(), 0, nb);
         !cp.ok) {
-        return false;
+        return scorer_backend_unavailable(
+            failure_reason, "mean_k_score_d2h_failed", cp);
     }
     std::vector<double> best(block_store_->block_count(), 0.0);
     for (uint32_t id = 0; id < nb && id < best.size(); ++id) {
@@ -6895,24 +8277,70 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(int mask_mode) {
 // normalization tail; the masses (mean over L·M·n_heads of each block's softmax
 // mass) are set as the scores directly. Returns false (caller falls back) if the
 // raw-key buffer / query isn't live or the kernel rejects nb (shmem cap).
-bool QwenExecutor::kvmem_retrieval_score_exactmass() {
-    if (!block_store_) return false;
-    if (!g_kraw_multi_ || !g_kraw_multi_ready_) return false;
-    if (kvmem_qc_total_tokens_ == 0 || kvmem_qc_total_blocks_ == 0) return false;
-    if (!g_query_multi_ || !g_query_multi_ready_ || g_query_multi_count_ == 0)
-        return false;
-    if (!g_score_dev_) return false;
+bool QwenExecutor::kvmem_retrieval_score_exactmass(
+        std::string *failure_reason) {
+    if (failure_reason) failure_reason->clear();
+    if (!block_store_) {
+        return scorer_unavailable(failure_reason, "block_store_unavailable");
+    }
+    if (kvmem_query_end_ <= kvmem_query_begin_ ||
+        kvmem_query_span_ == 0) {
+        return scorer_unavailable(failure_reason, "query_span_missing");
+    }
+    if (!g_kraw_multi_) {
+        return scorer_unavailable(failure_reason,
+                                  "exactmass_raw_key_buffer_unavailable");
+    }
+    if (!g_kraw_multi_ready_) {
+        return scorer_unavailable(failure_reason,
+                                  "exactmass_raw_key_index_not_ready");
+    }
+    if (kvmem_qc_total_tokens_ == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "exactmass_index_has_zero_tokens");
+    }
+    if (kvmem_qc_total_blocks_ == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "exactmass_index_has_zero_blocks");
+    }
+    if (!g_query_multi_) {
+        return scorer_unavailable(failure_reason,
+                                  "query_buffer_unavailable");
+    }
+    if (!g_query_multi_ready_ ||
+        g_query_multi_count_ < kvmem_query_span_) {
+        return scorer_unavailable(failure_reason,
+                                  "query_capture_incomplete");
+    }
+    if (g_query_multi_count_ == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "query_capture_empty");
+    }
+    if (!g_score_dev_) {
+        return scorer_unavailable(failure_reason,
+                                  "score_buffer_unavailable");
+    }
     const QwenConfig &cfg = model_.config();
     const uint32_t L = kvmem_qc_num_layers_;
     const uint32_t M = g_query_multi_count_;
     const uint32_t S = kvmem_query_span_;       // per-layer row stride in g_query_multi_
     const uint32_t nb = kvmem_qc_total_blocks_;
     const uint32_t total_tokens = kvmem_qc_total_tokens_;
-    if (L == 0 || nb > g_kbar_global_capacity_) return false;  // g_score_dev_ sizing
+    if (L == 0) {
+        return scorer_unavailable(failure_reason,
+                                  "exactmass_has_zero_layers");
+    }
+    if (nb > g_kbar_global_capacity_) {
+        return scorer_unavailable(failure_reason,
+                                  "indexed_blocks_exceed_score_capacity");
+    }
     const uint32_t bt =
         std::max<uint32_t>(block_store_->config().block_tokens, 1u);
 
-    if (auto st = backend_.zero_tensor(*g_score_dev_); !st.ok) return false;
+    if (auto st = backend_.zero_tensor(*g_score_dev_); !st.ok) {
+        return scorer_backend_unavailable(
+            failure_reason, "score_buffer_zero_failed", st);
+    }
 
     // scale = 1/sqrt(head_dim) (true softmax temperature). Each CTA emits a softmax
     // distribution over blocks; head_w averages over the per-(layer, query token,
@@ -6934,13 +8362,15 @@ bool QwenExecutor::kvmem_retrieval_score_exactmass() {
                 /*kraw_elem_off=*/static_cast<uint64_t>(slot) * kraw_layer_elems,
                 /*group_mean=*/0u);
             !st.ok) {
-            return false;  // shmem cap / launch error -> caller falls back
+            return scorer_backend_unavailable(
+                failure_reason, "exactmass_scorer_kernel_failed", st);
         }
     }
     std::vector<float> score(nb, 0.0f);
     if (auto st = backend_.copy_to_host(*g_score_dev_, score.data(), 0, nb);
         !st.ok) {
-        return false;
+        return scorer_backend_unavailable(
+            failure_reason, "exactmass_score_d2h_failed", st);
     }
     // The kernel already normalized (softmax mass averaged over L·M·n_heads), so the
     // scores ARE the block distribution: no inv_lm, no extra normalization tail.
@@ -7086,22 +8516,37 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
 
 NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_current(uint32_t token,
                                                                  uint32_t base_position) {
+    return prime_mtp_prefix_from_current_at(
+        token, base_position, base_position);
+}
+
+NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_current_at(
+        uint32_t token,
+        uint32_t logical_position,
+        uint32_t rope_position) {
     NativeExecutorReport report;
     ensure_mtp_scratch();
-    if (base_position >= kv_ctx_size_) {
+    if (logical_position >= kv_ctx_size_) {
         report.missing_kernels.push_back("native MTP prefix KV cache is too small");
         return report;
     }
-    if (base_position > 0 && base_position > mtp_prefix_len_) {
+    const QwenConfig &cfg = model_.config();
+    if (cfg.n_ctx_train > 0 && rope_position >= cfg.n_ctx_train) {
+        report.missing_kernels.push_back(
+            "native MTP prefix RoPE position exceeds the model context limit");
+        return report;
+    }
+    if (logical_position > 0 && logical_position > mtp_prefix_len_) {
         report.missing_kernels.push_back("native MTP prefix chunks are not contiguous");
         return report;
     }
 
-    const DeviceTensor &h_input = (base_position == 0) ? *mtp_zero_h_ : *mtp_prefix_h_;
+    const DeviceTensor &h_input =
+        (logical_position == 0) ? *mtp_zero_h_ : *mtp_prefix_h_;
     NativeExecutorReport step = forward_mtp_draft_from(token, h_input,
-                                                       base_position,
-                                                       base_position,
-                                                       base_position + 1,
+                                                       rope_position,
+                                                       logical_position,
+                                                       rope_position + 1,
                                                        /*compute_logits=*/false,
                                                        /*argmax_out=*/nullptr,
                                                        /*argmax_out_index=*/0,
@@ -7115,7 +8560,8 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_current(uint32_t token,
         return report;
     }
     require_status(backend_.copy_d2d(*mtp_prefix_h_, *h_, 0, h_->count));
-    mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_, base_position + 1);
+    mtp_prefix_len_ =
+        std::max<uint32_t>(mtp_prefix_len_, logical_position + 1);
     report.ok = true;
     return report;
 }
@@ -7148,8 +8594,12 @@ NativeExecutorReport QwenExecutor::replay_tokens_with_mtp_prefix(
 
             if (rebuild_prefix) {
                 const double t0 = steady_seconds();
-                NativeExecutorReport prefix =
-                    prime_mtp_prefix_from_current(tokens[i], base_position + i);
+                const uint32_t logical_pos = base_position + i;
+                NativeExecutorReport prefix = kvmem_mtp_local_positions_
+                    ? prime_mtp_prefix_from_current_at(
+                          tokens[i], logical_pos,
+                          last_committed_rope_position())
+                    : prime_mtp_prefix_from_current(tokens[i], logical_pos);
                 if (prefix_seconds) *prefix_seconds += steady_seconds() - t0;
                 if (prefix_ops) *prefix_ops += prefix.ops_executed;
                 if (!prefix.ok) {
@@ -7173,6 +8623,15 @@ NativeExecutorReport QwenExecutor::replay_tokens_with_mtp_prefix(
 NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::vector<uint32_t> &tokens,
                                                                     uint32_t base_position,
                                                                     uint32_t batch_min_override) {
+    return prime_mtp_prefix_from_last_batch_at(
+        tokens, base_position, base_position, batch_min_override);
+}
+
+NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
+        const std::vector<uint32_t> &tokens,
+        uint32_t logical_base_position,
+        uint32_t rope_base_position,
+        uint32_t batch_min_override) {
     NativeExecutorReport report;
     if (tokens.empty()) {
         report.ok = true;
@@ -7183,12 +8642,22 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
         report.missing_kernels.push_back("native MTP prefix requires the last target batch hidden states");
         return report;
     }
-    if (base_position + tokens.size() > kv_ctx_size_) {
+    if (static_cast<uint64_t>(logical_base_position) + tokens.size() >
+        kv_ctx_size_) {
         report.missing_kernels.push_back("native MTP prefix KV cache is too small");
         return report;
     }
-    if (base_position > 0 && base_position > mtp_prefix_len_) {
+    if (logical_base_position > 0 &&
+        logical_base_position > mtp_prefix_len_) {
         report.missing_kernels.push_back("native MTP prefix chunks are not contiguous");
+        return report;
+    }
+    const QwenConfig &cfg = model_.config();
+    if (cfg.n_ctx_train > 0 &&
+        static_cast<uint64_t>(rope_base_position) + tokens.size() >
+            cfg.n_ctx_train) {
+        report.missing_kernels.push_back(
+            "native MTP prefix RoPE positions exceed the model context limit");
         return report;
     }
 
@@ -7197,9 +8666,10 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
     auto prime_sequential = [&]() -> NativeExecutorReport {
         NativeExecutorReport seq_report;
         for (uint32_t i = 0; i < batch; ++i) {
-            const uint32_t pos = base_position + i;
+            const uint32_t logical_pos = logical_base_position + i;
+            const uint32_t rope_pos = rope_base_position + i;
             const DeviceTensor *h_input = mtp_zero_h_.get();
-            if (pos > 0) {
+            if (logical_pos > 0) {
                 if (i == 0) {
                     h_input = mtp_prefix_h_.get();
                 } else {
@@ -7211,7 +8681,9 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
             }
 
             NativeExecutorReport step = forward_mtp_draft_from(tokens[i], *h_input,
-                                                               pos, pos, pos + 1,
+                                                               rope_pos,
+                                                               logical_pos,
+                                                               rope_pos + 1,
                                                                /*compute_logits=*/false,
                                                                /*argmax_out=*/nullptr,
                                                                /*argmax_out_index=*/0,
@@ -7228,7 +8700,8 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
         require_status(backend_.copy_d2d(*mtp_prefix_h_, *h_batch_,
                                          static_cast<uint64_t>(batch - 1) * h_stride,
                                          h_stride));
-        mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_, base_position + batch);
+        mtp_prefix_len_ = std::max<uint32_t>(
+            mtp_prefix_len_, logical_base_position + batch);
         seq_report.ok = true;
         return seq_report;
     };
@@ -7263,14 +8736,6 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
         return report;
     }
 
-    const QwenConfig &cfg = model_.config();
-    if (cfg.n_ctx_train > 0 &&
-        static_cast<uint64_t>(base_position) + tokens.size() >
-            cfg.n_ctx_train) {
-        report.missing_kernels.push_back(
-            "native MTP prefix RoPE positions exceed the model context limit");
-        return report;
-    }
     const QwenLayerWeights &layer = mtp->layer;
     const uint32_t standard_head_dim = cfg.head_dim;
     const uint32_t standard_n_heads = cfg.n_heads;
@@ -7292,7 +8757,8 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
     begin_record_timing(full_executor_trace_enabled());
 
     DeviceTensor &h_inputs = *mtp_h_input_batch_;
-    const DeviceTensor &first_h = (base_position == 0) ? *mtp_zero_h_ : *mtp_prefix_h_;
+    const DeviceTensor &first_h =
+        (logical_base_position == 0) ? *mtp_zero_h_ : *mtp_prefix_h_;
     require_status(backend_.pack_mtp_prefix_hinputs(h_inputs, first_h, *h_batch_,
                                                     batch, h_stride));
     record(report, "mtp.prefix_hinput_batch");
@@ -7344,22 +8810,27 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
                                                    standard_n_kv_heads,
                                                    standard_head_dim,
                                                    standard_head_dim, eps));
+    kvmem_capture_raw_mtp_k(
+        *mtp_k_batch_, logical_base_position, batch);
     trace_rope_position_if_out_of_range(
-        "prime_mtp_prefix_from_last_batch.qk", base_position, batch,
+        "prime_mtp_prefix_from_last_batch.qk", rope_base_position, batch,
         cfg.n_ctx_train, static_cast<int32_t>(weights_.n_layers()),
         /*kernel_uses=*/2);
     require_status(backend_.rope_partial_batch(*mtp_q_batch_,
                                                batch, q_stride_buf,
                                                standard_n_heads,
                                                2 * standard_head_dim,
-                                               cfg.rope_dim, base_position, cfg.rope_theta));
+                                               cfg.rope_dim, rope_base_position,
+                                               cfg.rope_theta));
     require_status(backend_.rope_partial_batch(*mtp_k_batch_,
                                                batch, k_stride_buf,
                                                standard_n_kv_heads,
                                                standard_head_dim,
-                                               cfg.rope_dim, base_position, cfg.rope_theta));
+                                               cfg.rope_dim, rope_base_position,
+                                               cfg.rope_theta));
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-    mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, base_position, batch);
+    mtp_kv_pages_.ensure_pages(
+        backend_, kv_ctx_size_, logical_base_position, batch);
     if (external_mtp_kv_cache_) {
         mtp_kv_pages_.validate_physical_capacity(
             external_mtp_kv_cache_->physical_slots, "external MTP");
@@ -7372,18 +8843,20 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
     DeviceTensor &mtp_v = mtp_v_cache();
     if (use_paged_prefix) {
         require_status(backend_.kv_append_batch_paged_device(
-            mtp_k, *mtp_k_batch_, base_position, per_pos, batch,
+            mtp_k, *mtp_k_batch_, logical_base_position, per_pos, batch,
             mtp_kv_pages_.device_indices(), mtp_kv_pages_.count(),
             mtp_kv_pages_.page_size));
         require_status(backend_.kv_append_batch_paged_device(
-            mtp_v, *mtp_v_batch_, base_position, per_pos, batch,
+            mtp_v, *mtp_v_batch_, logical_base_position, per_pos, batch,
             mtp_kv_pages_.device_indices(), mtp_kv_pages_.count(),
             mtp_kv_pages_.page_size));
     } else {
         require_status(backend_.kv_append_batch(mtp_k, *mtp_k_batch_,
-                                                base_position, per_pos, batch));
+                                                logical_base_position,
+                                                per_pos, batch));
         require_status(backend_.kv_append_batch(mtp_v, *mtp_v_batch_,
-                                                base_position, per_pos, batch));
+                                                logical_base_position,
+                                                per_pos, batch));
     }
     record(report, "mtp.kv_append_batch");
 
@@ -7403,7 +8876,8 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch(const std::v
     require_status(backend_.copy_d2d(*mtp_prefix_h_, *h_batch_,
                                      static_cast<uint64_t>(batch - 1) * h_stride,
                                      h_stride));
-    mtp_prefix_len_ = std::max<uint32_t>(mtp_prefix_len_, base_position + batch);
+    mtp_prefix_len_ = std::max<uint32_t>(
+        mtp_prefix_len_, logical_base_position + batch);
     report.ok = true;
     return report;
 }
