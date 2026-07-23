@@ -24,6 +24,8 @@ NVME_DIR=${NVME_DIR:-/tmp/qw3_kvmem_eval_nvme/$TAG}
 SERVER_LOG=${SERVER_LOG:-$LOG_ROOT/${TAG}_server.log}
 RUN_LOG=${RUN_LOG:-$LOG_ROOT/${TAG}_runner.log}
 PID_FILE=${PID_FILE:-$LOG_ROOT/${TAG}.pid}
+LIMIT=${LIMIT:-}
+EXPECTED=${EXPECTED:-${LIMIT:-100}}
 
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy=127.0.0.1,localhost
@@ -39,6 +41,19 @@ if [[ "$NVME_GB" != "0" && "$NVME_GB" != "0.0" ]]; then
     --kvmem-nvme-gb "$NVME_GB"
     --kvmem-nvme-dir "$NVME_DIR"
   )
+fi
+
+limit_args=()
+if [[ -n "$LIMIT" ]]; then
+  if [[ ! "$LIMIT" =~ ^[1-9][0-9]*$ ]] || (( LIMIT > 100 )); then
+    echo "LIMIT must be an integer in [1, 100], got: $LIMIT" >&2
+    exit 2
+  fi
+  limit_args+=(--limit "$LIMIT")
+fi
+if [[ ! "$EXPECTED" =~ ^[1-9][0-9]*$ ]] || (( EXPECTED > 100 )); then
+  echo "EXPECTED must be an integer in [1, 100], got: $EXPECTED" >&2
+  exit 2
 fi
 
 server_pid=""
@@ -128,15 +143,20 @@ fi
   --timeout-sec 7200 --max-sample-sec 7200 --attempts 3 \
   --enable-thinking --seed 20260722 \
   --kvmem-retrieval-trace-metadata \
+  "${limit_args[@]}" \
   2>&1 | tee -a "$RUN_LOG"
 
-"$ROOT/.venv/bin/python" - "$RESULT_ROOT/validation_report.json" <<'PY'
+"$ROOT/.venv/bin/python" - "$RESULT_ROOT/validation_report.json" "$EXPECTED" <<'PY'
 import json
 import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
-if (not report.get("passed") or report.get("answers_unique") != 100
-        or report.get("eval_unique") != 100):
+expected = int(sys.argv[2])
+if (not report.get("passed") or report.get("answers_unique") != expected
+        or report.get("eval_unique") != expected):
     raise SystemExit(f"AgentLongBench validation failed: {report}")
-print("AgentLongBench validation passed: 100 answers and 100 evaluations")
+print(
+    f"AgentLongBench validation passed: {expected} answers "
+    f"and {expected} evaluations"
+)
 PY
