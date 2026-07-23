@@ -42,8 +42,10 @@ static void test_write_read_release() {
     cfg.dir = temp_dir();
     cfg.total_bytes = 256;
     cfg.slot_bytes = 64;
+    cfg.drop_page_cache = true;
     NvmeKvTier t(cfg);
     CHECK(t.enabled());
+    CHECK(t.drops_page_cache());
     CHECK(t.slot_count() == 4);
 
     std::vector<uint8_t> a(64), b(64), out(64);
@@ -93,7 +95,9 @@ static void test_coalesced_batch_io() {
     cfg.dir = temp_dir();
     cfg.total_bytes = 64 * 8;
     cfg.slot_bytes = 64;
+    cfg.drop_page_cache = true;
     NvmeKvTier t(cfg);
+    CHECK(t.drops_page_cache());
 
     std::vector<uint8_t> input(64 * 3), output(64 * 3, 0);
     for (size_t i = 0; i < input.size(); ++i) {
@@ -111,11 +115,15 @@ static void test_coalesced_batch_io() {
     t.write_spans(spans, input.data(), input.size(), &writes);
     CHECK(writes.bytes == input.size());
     CHECK(writes.syscalls == 1);
+    CHECK(writes.cache_drop_bytes == input.size());
+    CHECK(writes.cache_drop_failures == 0);
 
     NvmeBatchIoStats reads;
     t.read_spans(spans, output.data(), output.size(), &reads);
     CHECK(reads.bytes == output.size());
     CHECK(reads.syscalls == 1);
+    CHECK(reads.cache_drop_bytes == output.size());
+    CHECK(reads.cache_drop_failures == 0);
     CHECK(output == input);
 }
 

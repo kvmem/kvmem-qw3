@@ -7,8 +7,10 @@
 // different host workers. Batch spans coalesce adjacent full records into one
 // syscall when both their file offsets and buffer ranges are contiguous.
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
@@ -28,6 +30,12 @@ struct NvmeKvTierConfig {
     std::string dir;
     uint64_t total_bytes = 0;
     uint64_t slot_bytes = 0;
+    // Buffered I/O otherwise keeps a second copy of the SSD arena in the
+    // kernel page cache.  For long contexts that copy can be tens of GiB and
+    // defeats the explicit CPU-tier memory budget.  When enabled, completed
+    // writes are range-written back and both reads and writes are advised
+    // DONTNEED after the user buffer owns the data.
+    bool drop_page_cache = false;
 };
 
 struct NvmeSlotPlacement {
@@ -45,6 +53,8 @@ struct NvmeBatchIoStats {
     uint64_t bytes = 0;
     uint64_t syscalls = 0;
     uint64_t duration_ns = 0;
+    uint64_t cache_drop_bytes = 0;
+    uint64_t cache_drop_failures = 0;
 };
 
 class NvmeKvTier {
@@ -83,6 +93,7 @@ public:
     uint32_t slot_count() const { return slot_count_; }
     uint64_t slot_bytes() const { return cfg_.slot_bytes; }
     const std::string &path() const { return path_; }
+    bool drops_page_cache() const { return cfg_.drop_page_cache; }
 
     uint32_t free_slots() const {
         std::lock_guard<std::mutex> lock(meta_mu_);
@@ -183,12 +194,20 @@ public:
     // positional methods do not touch metadata and are safe on worker threads.
     void write_slot(int32_t slot, const void *data, uint64_t bytes) const {
         validate_slot_io(slot, data, bytes, "write");
-        pwrite_all(data, bytes, slot_offset(slot));
+        const uint64_t offset = slot_offset(slot);
+        pwrite_all(data, bytes, offset);
+        if (cfg_.drop_page_cache) {
+            (void) drop_cached_range(offset, bytes, /*write=*/true);
+        }
     }
 
     void read_slot(int32_t slot, void *data, uint64_t bytes) const {
         validate_slot_io(slot, data, bytes, "read");
-        pread_all(data, bytes, slot_offset(slot));
+        const uint64_t offset = slot_offset(slot);
+        pread_all(data, bytes, offset);
+        if (cfg_.drop_page_cache) {
+            (void) drop_cached_range(offset, bytes, /*write=*/false);
+        }
     }
 
     void write_spans(const std::vector<NvmeIoSpan> &spans,
@@ -337,12 +356,86 @@ private:
                 pread_all(base + first.buffer_offset, merged_bytes,
                           slot_offset(first.slot));
             }
+            if (cfg_.drop_page_cache) {
+                const uint64_t file_offset = slot_offset(first.slot);
+                const bool dropped =
+                    drop_cached_range(file_offset, merged_bytes, write);
+                if (stats) {
+                    if (dropped) {
+                        stats->cache_drop_bytes += merged_bytes;
+                    } else {
+                        ++stats->cache_drop_failures;
+                    }
+                }
+            }
             if (stats) {
                 stats->bytes += merged_bytes;
                 ++stats->syscalls;
             }
             i = j;
         }
+    }
+
+    bool drop_cached_range(uint64_t offset, uint64_t bytes,
+                           bool write) const {
+        if (bytes == 0) return true;
+        if (write) {
+#if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE) && \
+    defined(SYNC_FILE_RANGE_WAIT_BEFORE) && \
+    defined(SYNC_FILE_RANGE_WAIT_AFTER)
+            int rc;
+            do {
+                rc = ::sync_file_range(
+                    fd_, static_cast<off64_t>(offset),
+                    static_cast<off64_t>(bytes),
+                    SYNC_FILE_RANGE_WAIT_BEFORE |
+                        SYNC_FILE_RANGE_WRITE |
+                        SYNC_FILE_RANGE_WAIT_AFTER);
+            } while (rc != 0 && errno == EINTR);
+            if (rc != 0) {
+                warn_cache_drop_failure("range-writeback", errno);
+                return false;
+            }
+#else
+            // Portable fallback. It flushes the whole file rather than one
+            // range, so serialize concurrent batches to avoid redundant
+            // fdatasync storms. Linux uses sync_file_range above.
+            std::lock_guard<std::mutex> lock(cache_drop_mu_);
+            int rc;
+            do {
+                rc = ::fdatasync(fd_);
+            } while (rc != 0 && errno == EINTR);
+            if (rc != 0) {
+                warn_cache_drop_failure("fdatasync", errno);
+                return false;
+            }
+#endif
+        }
+#if defined(POSIX_FADV_DONTNEED)
+        const int advise = ::posix_fadvise(
+            fd_, static_cast<off_t>(offset), static_cast<off_t>(bytes),
+            POSIX_FADV_DONTNEED);
+        if (advise != 0) {
+            warn_cache_drop_failure("posix-fadvise-dontneed", advise);
+        }
+        return advise == 0;
+#else
+        (void) offset;
+        warn_cache_drop_failure("posix-fadvise-unavailable", ENOTSUP);
+        return false;
+#endif
+    }
+
+    void warn_cache_drop_failure(const char *phase, int error) const {
+        bool expected = false;
+        if (!cache_drop_warned_.compare_exchange_strong(expected, true)) {
+            return;
+        }
+        std::fprintf(
+            stderr,
+            "[kvmem-io] page_cache_drop_degraded=1 phase=%s error=%d "
+            "message=%s action=continue-with-kernel-page-cache\n",
+            phase, error, std::strerror(error));
     }
 
     void touch_locked(uint32_t block_id) {
@@ -364,6 +457,8 @@ private:
     std::string path_;
     int fd_ = -1;
     mutable std::mutex meta_mu_;
+    mutable std::mutex cache_drop_mu_;
+    mutable std::atomic<bool> cache_drop_warned_{false};
     std::vector<int32_t> free_slots_;
     std::unordered_map<uint32_t, int32_t> block_to_slot_;
     std::vector<uint32_t> lru_;

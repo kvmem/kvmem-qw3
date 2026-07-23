@@ -8,7 +8,7 @@ This benchmark validates the consolidated storage profiles:
 |---|---|---|
 | `kvmem_init` | frozen exclusive-tier path | compatibility baseline |
 | `opt_1` | heat-aware CPU admission/eviction | reduce SSD load volume |
-| `opt_2` | inclusive SSD backing, bounded async writes, recycled pageable write slabs | reduce stage-out latency |
+| `opt_2` | inclusive SSD backing, bounded async writes, recycled pageable write slabs, writeback + page-cache release | reduce stage-out latency without duplicating the SSD arena in RAM |
 | `opt_3` | coalesced reads, two recycled pinned read slabs, SSD-read/H2D pipeline | reduce stage-in latency |
 
 The levels are cumulative. Retrieval scores, selected block IDs, and KV
@@ -51,31 +51,39 @@ Common configuration:
 - one output token, so the result measures prefill/reselection rather than
   decode.
 
-### Final semantic reselection
+### Final semantic reselection (memory-bounded physical-I/O comparison)
+
+All four rows below use the same memory-bounded policy. `opt_2` and `opt_3`
+enable it by default; the compatibility `kvmem_init` and `opt_1` rows set
+`QW3_KVMEM_DROP_PAGE_CACHE=1` explicitly. Completed write ranges are written
+back and advised `POSIX_FADV_DONTNEED`; completed read ranges are likewise
+released after their user-space buffer is populated. This prevents the kernel
+page cache from becoming an unbudgeted second copy of the SSD tier.
 
 | Profile | SSD-in blocks | Stage-out | Stage-in wall | Assemble | Reselect total | TTFT |
 |---|---:|---:|---:|---:|---:|---:|
-| `kvmem_init` | 393 | 540.2 ms | 160.1 ms | 318.8 ms | 1066.6 ms | 54.465 s |
-| `opt_1` | 446 | 593.2 ms | 164.2 ms | 323.2 ms | 1128.4 ms | 54.641 s |
-| `opt_2` | 446 | 308.2 ms | 275.1 ms | 370.1 ms | 1001.2 ms | 53.590 s |
-| `opt_3` | 446 | 225.6 ms | 84.4 ms | 274.3 ms | 632.2 ms | 53.204 s |
+| `kvmem_init` | 393 | 1353.3 ms | 562.3 ms | 338.0 ms | 2301.2 ms | 57.030 s |
+| `opt_1` | 446 | 1486.5 ms | 655.8 ms | 378.1 ms | 2568.3 ms | 57.602 s |
+| `opt_2` | 446 | 451.1 ms | 651.7 ms | 335.7 ms | 1486.3 ms | 53.912 s |
+| `opt_3` | 446 | 541.5 ms | 538.4 ms | 337.4 ms | 1465.1 ms | 53.806 s |
 
 Against `kvmem_init`, cumulative `opt_3`:
 
-- reduces the large-swap stage-out wall time by 58.2%;
-- reduces stage-in wall time by 47.3%, despite loading 13.5% more SSD blocks;
-- reduces the complete semantic reselection by 40.7%;
-- reduces end-to-end TTFT by 1.26 seconds (2.3%). Long model prefill still
-  dominates the roughly 53-second TTFT.
+- reduces the large-swap stage-out wall time by 60.0%;
+- reduces stage-in wall time by 4.2%, despite loading 13.5% more SSD blocks;
+- reduces the complete semantic reselection by 36.3%;
+- reduces end-to-end TTFT by 3.22 seconds (5.7%). Long model prefill still
+  dominates the roughly 54-second TTFT.
 
 For the 446-block SSD input, `opt_3` issued 118 positional-I/O calls instead of
-one call per block. The seven read batches spent 61.0 ms in I/O, but only
-21.1 ms was exposed as wait; 39.9 ms (65.4%) overlapped H2D/other batch work.
+one call per block. The seven read batches spent 863.1 ms in aggregate worker
+I/O; only 452.1 ms was exposed as wait, while 411.0 ms (47.6%) overlapped
+H2D/other batch work. `opt_3` lowers stage-in by 17.4% relative to `opt_2`.
 
-The current tier file uses normal positional I/O, so recently written records
-may also benefit from the Linux page cache. The separate direct-I/O probe above
-is the physical-device reference; a future `O_DIRECT` backend is still needed
-for strict page-cache-independent production measurements.
+An earlier cached diagnostic measured a 632.2 ms total reselection, but it also
+allowed the whole backing file to remain in Linux page cache. That number is
+not a valid production comparison on a memory-bounded host and is superseded
+by the table above.
 
 ### Steady prefill-pressure stage-out
 
@@ -83,12 +91,12 @@ Mean of the last 20 pressure selections:
 
 | Profile | Stage-out | Complete pressure selection |
 |---|---:|---:|
-| `kvmem_init` | 21.08 ms | 25.44 ms |
-| `opt_1` | 27.03 ms | 31.51 ms |
-| `opt_2` | 7.64 ms | 11.88 ms |
-| `opt_3` | 4.86 ms | 9.17 ms |
+| `kvmem_init` | 53.12 ms | 57.40 ms |
+| `opt_1` | 60.30 ms | 64.55 ms |
+| `opt_2` | 7.89 ms | 12.15 ms |
+| `opt_3` | 4.59 ms | 8.90 ms |
 
-The cumulative final profile reduces steady stage-out by 76.9%. SSD writes run
+The cumulative final profile reduces steady stage-out by 91.4%. SSD writes run
 behind a bounded queue; they are not silently discarded. Trace fields expose
 submission time, buffer gather, backpressure, pending batches, completed bytes,
 syscalls, and worker duration.
@@ -120,6 +128,35 @@ aggregate stage-in by 15.7%; total reselection improves only 2.2% because
 selection, KV assembly/re-RoPE, CPU H2D, and query replay remain outside this
 optimization.
 
+## Long-context host-memory regression
+
+The first 2M-context, 224K-budget accuracy run completed two samples and then
+lost the server during sample index 20 at roughly 545K prompt tokens. The
+server log ended without a native exception. At that point the process could
+hold close to the configured 72 GiB CPU tier while the 35 GiB buffered SSD file
+was also eligible to remain in page cache. The failure signature and memory
+accounting were consistent with host-memory pressure.
+
+After enabling range writeback + page-cache release, the same sample was rerun
+unchanged:
+
+- prompt: 1,083,742 tokens;
+- KVMem: 224K context + 32K generation, block 32, mean-k, query replay,
+  immutable K, MTP-4;
+- SSD file at completion: 34 GiB;
+- observed system `Cached`: 26--29 GiB, dominated by the model mapping and not
+  proportional to SSD-file growth;
+- observed RSS near 946K prompt tokens: 82.1 GiB;
+- observed `MemAvailable` at the same point: 59.9 GiB;
+- result: completed normally, no truncation/error, official judge correct;
+- TTFT / total latency: 661.6 / 673.9 seconds.
+
+This is the stability gate that the cached implementation failed. The raw
+artifacts are:
+
+- `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_opt3_pagecachefix_s20_20260724_serve.log`
+- `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_opt3_pagecachefix_s20_20260724_eval_20260723_161120.jsonl`
+
 ## Correctness and artifacts
 
 - CTest: 12/12 passed.
@@ -129,10 +166,10 @@ optimization.
 
 Primary raw logs and result summaries:
 
-- `/tmp/qw3_opt_io_results/ioab_kvmem_init_cpu425_20260723_serve.log`
-- `/tmp/qw3_opt_io_results/ioab_opt_1_cpu425_20260723_serve.log`
-- `/tmp/qw3_opt_io_results/ioab_opt_2_final_cpu425_20260723_serve.log`
-- `/tmp/qw3_opt_io_results/ioab_opt_3_final_cpu425_20260723_serve.log`
+- `/tmp/qw3_opt_io_results/ioab_kvmem_init_nocache_cpu425_20260724_serve.log`
+- `/tmp/qw3_opt_io_results/ioab_opt_1_nocache_cpu425_20260724_serve.log`
+- `/tmp/qw3_opt_io_results/ioab_opt_2_pagecachefix_cpu425_20260724_serve.log`
+- `/tmp/qw3_opt_io_results/ioab_opt_3_pagecachefix_cpu425_20260724_serve.log`
 - `/tmp/qw3_opt_io_results/ioheat_kvmem_init_transcript70_mtp_20260723_serve.log`
 - `/tmp/qw3_opt_io_results/ioheat_opt_1_transcript70_mtp_20260723_serve.log`
 

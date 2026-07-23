@@ -4749,7 +4749,18 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         ncfg.dir = effective.nvme_tier_dir;
         ncfg.total_bytes = effective.nvme_tier_bytes;
         ncfg.slot_bytes = effective.estimated_block_bytes;
+        ncfg.drop_page_cache = env_flag_enabled(
+            "QW3_KVMEM_DROP_PAGE_CACHE",
+            effective.optimization_level >=
+                KvMemOptimizationLevel::Opt2);
         kvmem_nvme_tier_ = std::make_unique<NvmeKvTier>(std::move(ncfg));
+        std::fprintf(
+            stderr,
+            "[kvmem-io] page_cache_policy=%s reason=%s\n",
+            kvmem_nvme_tier_->drops_page_cache()
+                ? "writeback-and-drop-after-io" : "kernel-default",
+            kvmem_nvme_tier_->drops_page_cache()
+                ? "bound-host-memory" : "compatibility-baseline");
         if (effective.optimization_level >=
             KvMemOptimizationLevel::Opt2) {
             const uint64_t warm0 = kvmem_steady_ns();
