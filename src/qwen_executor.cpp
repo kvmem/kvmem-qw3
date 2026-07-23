@@ -107,9 +107,11 @@ static_assert(query_span_overlap(100, 16, 200, 220).count == 0);
 
 class LocalKvPagePool final : public KvPhysicalPageAllocator {
 public:
-    LocalKvPagePool(uint32_t total_pages, uint32_t page_size)
+    LocalKvPagePool(uint32_t total_pages, uint32_t page_size,
+                    const char *label)
         : total_pages_(std::max<uint32_t>(1, total_pages)),
           page_size_(std::max<uint32_t>(1, page_size)),
+          label_(label ? label : "unknown"),
           in_free_(total_pages_, true) {
         free_pages_.reserve(total_pages_);
         for (uint32_t i = 0; i < total_pages_; ++i) {
@@ -120,7 +122,8 @@ public:
     int32_t allocate_physical_page() override {
         if (free_pages_.empty()) {
             throw std::runtime_error(
-                "local KVMem GPU page pool exhausted: free=0 total=" +
+                "local KVMem GPU page pool exhausted: pool=" + label_ +
+                " free=0 total=" +
                 std::to_string(total_pages_) +
                 " page_size=" + std::to_string(page_size_));
         }
@@ -155,6 +158,7 @@ public:
 private:
     uint32_t total_pages_ = 0;
     uint32_t page_size_ = 0;
+    std::string label_;
     std::vector<int32_t> free_pages_;
     std::vector<bool> in_free_;
     uint32_t used_pages_ = 0;
@@ -3139,6 +3143,11 @@ void QwenExecutor::kvmem_end_query_replay() {
     }
 }
 
+// ARCHIVED (2026-07-23): the DeltaNet recurrent-state artifact implementation
+// was used only by the frozen LongMemEval-M rebuilt-state diagnostic. The public
+// request entry is disabled in qw3_server.cpp; compile this implementation out
+// as well so normal inference cannot perform state-file I/O or state replacement.
+#if 0
 namespace {
 
 constexpr uint64_t kRebuiltStateMagic = 0x3154535244335751ULL; // "QW3DRST1"
@@ -3363,6 +3372,7 @@ void QwenExecutor::kvmem_import_recurrent_state(
                      path.c_str(), expected_source_tokens.size(), layer_count);
     }
 }
+#endif
 
 void QwenExecutor::kvmem_reset_recurrent_state() {
     for (size_t i = 0; i < recurrent_states_.size(); ++i) {
@@ -3690,8 +3700,8 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 1, effective.block_tokens / std::max<uint32_t>(1, page_size));
             const uint32_t pool_pages = std::max<uint32_t>(
                 1, gpu_blocks * pages_per_block);
-            kvmem_gpu_page_pool_ =
-                std::make_unique<LocalKvPagePool>(pool_pages, page_size);
+            kvmem_gpu_page_pool_ = std::make_unique<LocalKvPagePool>(
+                pool_pages, page_size, "main");
             kv_pages_.set_allocator(kvmem_gpu_page_pool_.get());
             allocate_kvmem_gpu_cache(
                 static_cast<uint64_t>(pool_pages) * page_size);
@@ -3700,8 +3710,8 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             // dense full-context cache. Single-request internal-MTP path only.
             if (weights_.mtp() && !external_mtp_kv_cache_ &&
                 kvmem_mtp_tier_enabled()) {
-                kvmem_mtp_gpu_page_pool_ =
-                    std::make_unique<LocalKvPagePool>(pool_pages, page_size);
+                kvmem_mtp_gpu_page_pool_ = std::make_unique<LocalKvPagePool>(
+                    pool_pages, page_size, "mtp");
                 mtp_kv_pages_.set_allocator(kvmem_mtp_gpu_page_pool_.get());
                 kvmem_mtp_tiered_ = true;
                 allocate_kvmem_mtp_gpu_cache(
@@ -4025,6 +4035,11 @@ bool QwenExecutor::kvmem_block_mtp_pages_resident(const KvMemBlock &block) const
     return true;
 }
 
+bool QwenExecutor::kvmem_mtp_prefix_covers_registered() const {
+    return kvmem_mtp_tiered_ && mtp_scratch_ready_ &&
+           mtp_prefix_len_ >= kvmem_registered_pos_;
+}
+
 void QwenExecutor::kvmem_sync_mtp_baked_pos() {
     if (!block_store_) return;
     const auto &blocks = block_store_->blocks();
@@ -4293,7 +4308,7 @@ void QwenExecutor::kvmem_copy_block_from_host(
     // which the stage-in residency loop has already made resident. The spilled
     // bytes are position-canonical (stage-out canonicalized MTP to orig), matching
     // mtp_baked_pos_ so the following assemble re-RoPEs from the right base.
-    if (kvmem_mtp_tiered_) {
+    if (kvmem_mtp_prefix_covers_registered()) {
         DeviceTensor &mk = mtp_k_cache();
         DeviceTensor &mv = mtp_v_cache();
         if (mk.elem_size != mv.elem_size) {
@@ -4332,6 +4347,15 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     const uint64_t t_in0 = tm ? kvmem_steady_ns() : 0;
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_prefetch_.active = true;
+    // Only restore the sibling MTP pages when the prefix builder has caught up
+    // with every registered main-KV block.  For a request whose MTP path is
+    // disabled by the RoPE-position guard, mtp_kv_pages_ is intentionally empty.
+    // Calling ensure_logical_page_resident() on that empty sparse table for a
+    // selected historical block would allocate every intervening logical page
+    // (a dense prefix) and exhaust the bounded MTP pool around block 8192.
+    // This predicate is deliberately identical to kvmem_assemble's
+    // build_mtp_window gate: a lagging/absent MTP window is never consumed.
+    const bool stage_mtp_pages = kvmem_mtp_prefix_covers_registered();
     try {
         const auto &blocks = block_store_->blocks();
         require_status(backend_.begin_kv_transfer_to_device());
@@ -4386,7 +4410,7 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                 (block.orig_pos_start + block.n_tokens - 1) / page_size;
             for (uint32_t lp = first_page; lp <= last_page; ++lp) {
                 (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
-                if (kvmem_mtp_tiered_) {
+                if (stage_mtp_pages) {
                     (void)mtp_kv_pages_.ensure_logical_page_resident(backend_, lp);
                 }
             }
@@ -4429,6 +4453,7 @@ void QwenExecutor::kvmem_finish_prefetch() {
     const bool tm = kvmem_timing_flag();
     const uint64_t t_in0 = tm ? kvmem_steady_ns() : 0;
     uint32_t staged = 0;
+    const bool stage_mtp_pages = kvmem_mtp_prefix_covers_registered();
     try {
         if (kvmem_prefetch_.nvme_future.valid()) {
             kvmem_prefetch_.nvme_future.get();
@@ -4443,7 +4468,7 @@ void QwenExecutor::kvmem_finish_prefetch() {
                     (block.orig_pos_start + block.n_tokens - 1) / page_size;
                 for (uint32_t lp = first_page; lp <= last_page; ++lp) {
                     (void)kv_pages_.ensure_logical_page_resident(backend_, lp);
-                    if (kvmem_mtp_tiered_) {
+                    if (stage_mtp_pages) {
                         (void)mtp_kv_pages_.ensure_logical_page_resident(backend_, lp);
                     }
                 }
@@ -4639,8 +4664,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     // and it is rebuilt at the post-prefill reselect once priming has caught up.
     // So gate the mirror on the MTP cache covering all registered blocks; when it
     // lags, skip the build (the stale mirror is never read before the rebuild).
-    const bool build_mtp_window =
-        mtp_scratch_ready_ && mtp_prefix_len_ >= kvmem_registered_pos_;
+    const bool build_mtp_window = kvmem_mtp_prefix_covers_registered();
     if (build_mtp_window) mtp_window_pages_host_.clear();
     const auto &blocks = block_store_->blocks();
     // Per-window-block metadata for the cumulative-attention selection signal:
@@ -5143,8 +5167,26 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     // the two sets are disjoint and the evicted pages are never needed by the
     // stage-in. The post-eviction resident set is at most the window (<= budget
     // blocks <= pool), so the allocation always fits.
+    auto trace_pool = [&](const char *phase) {
+        if (!kvmem_tier_trace_enabled() || !kvmem_gpu_page_pool_) return;
+        std::fprintf(
+            stderr,
+            "[kvmem-tier] reselect_pool phase=%s remaps=%zu stage_out=%zu "
+            "main_used=%u main_free=%u mtp_used=%u mtp_free=%u\n",
+            phase, kvmem_pending_plan_.remaps.size(),
+            kvmem_pending_plan_.stage_out.size(),
+            kvmem_gpu_page_pool_->used_pages(),
+            kvmem_gpu_page_pool_->free_pages(),
+            kvmem_mtp_gpu_page_pool_
+                ? kvmem_mtp_gpu_page_pool_->used_pages() : 0,
+            kvmem_mtp_gpu_page_pool_
+                ? kvmem_mtp_gpu_page_pool_->free_pages() : 0);
+    };
+    trace_pool("before_stage_out");
     kvmem_stage_out(kvmem_pending_plan_.stage_out);
+    trace_pool("after_stage_out");
     kvmem_start_prefetch(kvmem_pending_plan_);
+    trace_pool("after_start_prefetch");
     kvmem_pending_reselect_ = true;
     return kvmem_pending_plan_.total_window_tokens;
 }
@@ -5169,8 +5211,25 @@ uint32_t QwenExecutor::kvmem_set_selection(
     // Evict before staging in (same pool-headroom invariant as the deferred
     // prepare/finish path): a large working-set swap would otherwise exhaust the
     // bounded GPU page pool when start_prefetch allocates ahead of stage_out.
+    auto trace_pool = [&](const char *phase) {
+        if (!kvmem_tier_trace_enabled() || !kvmem_gpu_page_pool_) return;
+        std::fprintf(
+            stderr,
+            "[kvmem-tier] explicit_select_pool phase=%s remaps=%zu "
+            "stage_out=%zu main_used=%u main_free=%u mtp_used=%u mtp_free=%u\n",
+            phase, plan.remaps.size(), plan.stage_out.size(),
+            kvmem_gpu_page_pool_->used_pages(),
+            kvmem_gpu_page_pool_->free_pages(),
+            kvmem_mtp_gpu_page_pool_
+                ? kvmem_mtp_gpu_page_pool_->used_pages() : 0,
+            kvmem_mtp_gpu_page_pool_
+                ? kvmem_mtp_gpu_page_pool_->free_pages() : 0);
+    };
+    trace_pool("before_stage_out");
     kvmem_stage_out(plan.stage_out);
+    trace_pool("after_stage_out");
     kvmem_start_prefetch(plan);
+    trace_pool("after_start_prefetch");
     kvmem_finish_prefetch();
     kvmem_assemble(plan);
     return window_query_pos_;

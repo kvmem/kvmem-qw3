@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# AgentLongBench-Long fixed 512K normal100 with ordinary KVMem only.
-# Query replay and immutable source K are explicit; DeltaNet rebuilt-state
-# capture/seed/export/import and MTP speculation are deliberately absent.
+# AgentLongBench-Long fixed 512K normal100 with ordinary KVMem + MTP-4.
+# Query replay, immutable source K, and MTP-4 are explicit; DeltaNet
+# rebuilt-state capture/seed/export/import is deliberately absent.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT=${PORT:-8087}
-TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_fp16_20260723}
+TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_20260723}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
 MODEL=${MODEL:-$ROOT/models/Qwen3.6-27B-Q8_0.gguf}
@@ -61,6 +61,7 @@ env \
     --kvmem-nvme-dir "$NVME_DIR" \
     --enable-thinking --thinking-budget 4096 \
     --prefill-chunk 2048 --temp 0.6 \
+    --native-mtp-speculate --mtp-chain 4 \
     --host 127.0.0.1 --port "$PORT" \
     >"$SERVER_LOG" 2>&1 &
 server_pid=$!
@@ -84,8 +85,10 @@ if [[ "$healthy" -ne 1 ]]; then
 fi
 
 if ! grep -q 'kvmem_recompute_query=1' "$SERVER_LOG" ||
-   ! grep -q 'kvmem_immutable_k=1' "$SERVER_LOG"; then
-  echo "server did not confirm query replay + immutable K" >&2
+   ! grep -q 'kvmem_immutable_k=1' "$SERVER_LOG" ||
+   ! grep -q 'mtp_chain=4' "$SERVER_LOG" ||
+   ! grep -q 'mtp_speculate=1' "$SERVER_LOG"; then
+  echo "server did not confirm query replay + immutable K + MTP-4" >&2
   exit 5
 fi
 if rg -q 'rebuilt-state|REBUILT_STATE' "$SERVER_LOG"; then
@@ -100,7 +103,7 @@ fi
   --output-root "$RESULT_ROOT" \
   --api-base "http://127.0.0.1:$PORT/v1" \
   --model "$(basename "$MODEL")" \
-  --method kvmem_mean_k_224k_b32_query_replay_immutable_fp16 \
+  --method kvmem_mean_k_224k_b32_query_replay_immutable_mtp4_fp16 \
   --temperature 0.6 --top-p 0.95 --max-tokens 32768 \
   --context-window 1048576 --context-safety-margin 16 \
   --timeout-sec 7200 --max-sample-sec 7200 --attempts 3 \

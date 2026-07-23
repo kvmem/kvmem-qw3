@@ -343,7 +343,7 @@ modulo/clamp，因为那会静默破坏相对位置。后续若要恢复超长�
 
 ### KVMI-012 — Selected attention window and recurrent state describe different histories
 
-**Status:** FIX CANDIDATE / FROZEN-10 VALIDATION IN PROGRESS
+**Status:** OPEN / DELTANET-STATE DEBUG ARCHIVED
 **Priority:** P0
 
 Qwen3.6 是 normal-attention 与 DeltaNet recurrent layers 的混合模型。KVMem 的 block
@@ -381,11 +381,33 @@ normal-attention K/V 和 DeltaNet state，因而它答对不能单独证明问�
   它已在 `031748ae` 正确回答 `4 -> 5`，并在 full10 的首条 Japan 回归正确回答
   `two weeks`。其余 frozen 样本仍在后台验证，尚不能将本 issue 标记为关闭。
 
+2026-07-22/23 又完成了两种 DeltaNet recurrent-state 对照，但结果不足以支持继续保留
+在线 debug 接口：
+
+- **replacement rebuilt-state**：保持 mean-K 选出的 normal-attention KV 不变，把相同
+  约 224K source tokens 按原顺序 dense prefill，并用所得 DeltaNet recurrent/conv
+  state 替换长 trace 的累计 state。脚本内联评分为 `1/10`；对完全相同的输出使用
+  DeepSeek V4 Pro 重评为 `6/10`。评分口径差异过大，不能把该结果解释为稳定修复。
+- **accumulated-state refresh**：先保留 query boundary 的累计 state，再把相同 selected
+  tokens 作为普通 DeltaNet updates 追加进去，结果为 `5/10`。它同样没有相对
+  query-replay 对照形成稳定、可归因的提升。
+- 每条约 229K selected tokens 的 state export 额外耗时约 `91 s`，artifact 大小约
+  `157,811,352 bytes`（`150.5 MiB`）；完整回答的平均 TTFT 约 `611 s`。
+
+因此 `kvmem_rebuilt_state_{export,import,capture,seed}` 请求入口现已明确拒绝，executor
+state 文件读写和 backend 注入分支均编译禁用；两条实验脚本也标为 archived。这里禁用的
+仅是 rebuilt-state debug/ablation，不是模型正常 DeltaNet forward，也不影响 mean-K、
+query replay 或 immutable source-K。历史实现仍可从 commit `9792a0a` 恢复。
+
 对应原始记录：
 
 - score dump：`/data/chaidi/kvmem_eval/results/longmemeval_m_transcript_sessionlocal_s9_scores_20260721.jsonl`
 - knowledge-update 修复：`/data/chaidi/kvmem_eval/results/longmemeval_m_transcript_blockrefresh32k_cachesink_tb4k_s9_20260721_eval_20260720_224550.jsonl`
 - full10：`/data/chaidi/kvmem_eval/results/longmemeval_m_transcript_blockrefresh32k_cachesink_tb4k_full10_20260721_eval_20260720_225437.jsonl`
+- replacement rebuilt-state：
+  `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_query_replay_immutable_rebuilt_state10_fixed_20260722`
+- accumulated-state refresh：
+  `/data/chaidi/kvmem_eval/results/longmemeval_m_k224k_query_replay_immutable_deltanet_refresh10_20260722`
 
 保留的默认关闭 A/B 隔离：
 

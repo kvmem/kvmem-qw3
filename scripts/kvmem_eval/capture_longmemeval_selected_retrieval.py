@@ -141,6 +141,10 @@ def health_ok(api_base: str) -> bool:
 
 def main() -> None:
     args = parse_args()
+    if args.state_capture_prefix:
+        raise SystemExit(
+            "--state-capture-prefix is archived and disabled; see KVMI-012"
+        )
     if bool(args.state_capture_prefix) != bool(args.state_dir):
         raise RuntimeError(
             "--state-capture-prefix and --state-dir must be provided together"

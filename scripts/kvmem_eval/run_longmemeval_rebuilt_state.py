@@ -305,6 +305,11 @@ def export_state(session: requests.Session, args: argparse.Namespace,
 
 def main() -> None:
     args = parse_args()
+    raise SystemExit(
+        "DeltaNet rebuilt-state debug is archived and disabled; see KVMI-012"
+    )
+
+    # Historical implementation retained below for commit-level reproducibility.
     args.output_root.mkdir(parents=True, exist_ok=True)
     args.state_dir.mkdir(parents=True, exist_ok=True)
     if os.environ.get("QW3_KVMEM_REBUILT_STATE_DIR") not in (None, str(args.state_dir)):

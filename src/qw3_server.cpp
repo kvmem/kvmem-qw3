@@ -68,11 +68,7 @@ std::string bytes_gib_label(uint64_t bytes) {
 }
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
-    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty() &&
-        g.kvmem_rebuilt_state_export_key.empty() &&
-        g.kvmem_rebuilt_state_import_key.empty() &&
-        g.kvmem_rebuilt_state_capture_key.empty() &&
-        g.kvmem_rebuilt_state_seed_key.empty();
+    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty();
 }
 
 json usage_json(size_t prompt_tokens, size_t completion_tokens) {
@@ -1287,6 +1283,37 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                  req.value("ignore_eos_token", g.ignore_eos));
         g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
         if (g.thinking_budget < 0) g.thinking_budget = 0;
+
+        // ARCHIVED DeltaNet-state debug entry (2026-07-23).
+        //
+        // The frozen LongMemEval-M error-10 experiments did not show a stable,
+        // attributable gain:
+        //   * replace accumulated recurrent state with a state rebuilt from the
+        //     selected 224K source tokens: 1/10 with the inline grader, but 6/10
+        //     when the same outputs were rejudged by DeepSeek V4 Pro;
+        //   * retain the accumulated state and replay the same selected tokens as
+        //     additional DeltaNet updates: 5/10 with the inline grader.
+        // Exporting one ~229K-token state also cost about 91 seconds and wrote a
+        // ~150.5 MiB artifact per sample. Because the score depended strongly on
+        // judge route and neither construction isolated a reliable improvement,
+        // export/import/capture/seed are no longer supported request controls.
+        // Keep rejecting the retired names instead of silently ignoring an old
+        // experiment script and accidentally reporting a normal KVMem result.
+        static constexpr const char *kArchivedRebuiltStateFields[] = {
+            "kvmem_rebuilt_state_export",
+            "kvmem_rebuilt_state_import",
+            "kvmem_rebuilt_state_capture",
+            "kvmem_rebuilt_state_seed",
+        };
+        for (const char *field : kArchivedRebuiltStateFields) {
+            if (req.contains(field)) {
+                throw std::invalid_argument(
+                    std::string(field) +
+                    " is archived and disabled; see KVMI-012");
+            }
+        }
+
+#if 0  // Archived DeltaNet recurrent-state debug parser; see note above.
         auto parse_rebuilt_state_key = [&](const char *field,
                                            std::string &out) {
             if (!req.contains(field)) return;
@@ -1336,6 +1363,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             throw std::invalid_argument(
                 "kvmem_rebuilt_state_export requires max_tokens=0");
         }
+#endif
         return g;
     };
 

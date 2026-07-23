@@ -513,9 +513,10 @@ bool kvmem_recompute_query_enabled(bool configured_default) {
                             configured_default);
 }
 
-// Experimental recurrent-state artifacts are deliberately rooted under one
-// operator-provided directory. API requests carry only a server-validated key,
-// never an arbitrary filesystem path.
+// ARCHIVED (2026-07-23): helper code for the DeltaNet recurrent-state artifact
+// experiment. The API entry and executor interchange methods are also compiled
+// out; retain this block only as local source history.
+#if 0
 std::string kvmem_rebuilt_state_path(const std::string &key) {
     if (key.empty()) return {};
     const char *dir = std::getenv("QW3_KVMEM_REBUILT_STATE_DIR");
@@ -575,6 +576,7 @@ std::vector<uint32_t> kvmem_selected_source_tokens(
     }
     return out;
 }
+#endif
 
 // Cap on total physical KV pages pinned by the prefix cache. 0 = unlimited
 // (bounded only by the pool). Used to trigger LRU eviction.
@@ -6922,10 +6924,12 @@ private:
     // and reuse proceeds as in the dense config.
     KvmemReuse kvmem_prefix_reuse(const std::vector<uint32_t> &prompt,
                                   const GenerationOptions &options) {
+#if 0  // Archived DeltaNet recurrent-state artifact requests.
         if (!options.kvmem_rebuilt_state_export_key.empty() ||
             !options.kvmem_rebuilt_state_import_key.empty() ||
             !options.kvmem_rebuilt_state_capture_key.empty() ||
             !options.kvmem_rebuilt_state_seed_key.empty()) return {};
+#endif
         if (!kvmem_prefix_cache_enabled()) return {};
         if (!executor_ || !executor_->kvmem_enabled()) return {};
         if (!kvmem_warm_valid_ || kvmem_warm_log_.empty()) return {};
@@ -7392,6 +7396,7 @@ private:
             throw std::runtime_error(
                 "KVMem transcript replay currently requires native MTP");
         }
+#if 0  // Archived DeltaNet recurrent-state artifact experiment.
         const bool rebuilt_state_export =
             !options.kvmem_rebuilt_state_export_key.empty();
         const bool rebuilt_state_import =
@@ -7404,6 +7409,7 @@ private:
             throw std::runtime_error(
                 "KVMem rebuilt-state export requires max_tokens=0");
         }
+#endif
         DeviceStatus st = device_->begin();
         if (!st.ok) throw std::runtime_error(st.message);
 
@@ -7433,6 +7439,7 @@ private:
             executor_->reset_state();
             if (kvmem_prefix_cache_enabled()) kvmem_warm_valid_ = false;
         }
+#if 0  // Archived DeltaNet recurrent-state seed.
         if (rebuilt_state_seed) {
             if (warm_reuse) {
                 throw std::runtime_error(
@@ -7450,6 +7457,7 @@ private:
                 options.kvmem_rebuilt_state_seed_key +
                 " identity_tokens=" + std::to_string(prompt_tokens.size()));
         }
+#endif
         const bool warm_capture =
             kvmem_prefix_cache_enabled() && executor_->kvmem_enabled();
 
@@ -7535,12 +7543,14 @@ private:
             executor_->block_store() &&
             executor_->block_store()->config().retrieval_method ==
                 KvMemRetrievalMethod::MeanK;
+#if 0  // Archived DeltaNet recurrent-state import/capture validation.
         if ((rebuilt_state_import || rebuilt_state_capture) &&
             !recompute_query) {
             throw std::runtime_error(
                 "KVMem rebuilt-state import/capture requires an above-budget "
                 "query-conditioned mean-k request with query replay enabled");
         }
+#endif
         QwenExecutor::StateSnapshot query_replay_ckpt;
         uint32_t query_replay_begin = 0;
         if (recompute_query) {
@@ -7674,6 +7684,7 @@ private:
                 }
                 executor_->kvmem_begin_query_replay(
                     query_replay_ckpt, selected_context);
+#if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =
                         kvmem_selected_source_tokens(
@@ -7704,6 +7715,7 @@ private:
                             std::to_string(selected_context.size()));
                     }
                 }
+#endif
                 do_prefill_range(query_replay_begin, prompt_tokens.size());
                 executor_->kvmem_end_query_replay();
                 log("native kvmem query replay (plain): boundary=" +
@@ -7728,6 +7740,7 @@ private:
             warm_prompt_resumable = kvmem_all_gpu_identity();
         }
 
+#if 0  // Archived DeltaNet recurrent-state export.
         if (rebuilt_state_export) {
             if (warm_reuse) {
                 throw std::runtime_error(
@@ -7747,6 +7760,7 @@ private:
                 options.kvmem_rebuilt_state_export_key +
                 " source_tokens=" + std::to_string(prompt_tokens.size()));
         }
+#endif
 
         // A zero completion budget is a real prefill-only transaction. Persist
         // the exact prompt-end state, but never initialize sampling, choose a
@@ -8009,6 +8023,7 @@ private:
         // the CB per-request executors are excluded, so those paths are untouched.
         const bool transcript_replay_requested =
             !options.kvmem_replay_query_spans.empty();
+#if 0  // Archived DeltaNet recurrent-state artifact experiment.
         const bool rebuilt_state_export =
             !options.kvmem_rebuilt_state_export_key.empty();
         const bool rebuilt_state_import =
@@ -8030,6 +8045,7 @@ private:
                 "KVMem rebuilt-state diagnostics require a standalone "
                 "one-shot request");
         }
+#endif
         const bool api_session = !options.kvmem_session_id.empty() &&
             override_executor == nullptr;
         const KvmemReuse kvmem_ru =
@@ -8070,6 +8086,7 @@ private:
             executor_->reset_state();
             if (kvmem_warm_capture) kvmem_warm_valid_ = false;
         }
+#if 0  // Archived DeltaNet recurrent-state seed.
         if (rebuilt_state_seed) {
             if (kvmem_warm_reuse) {
                 throw std::runtime_error(
@@ -8086,6 +8103,7 @@ private:
                 options.kvmem_rebuilt_state_seed_key +
                 " identity_tokens=" + std::to_string(prompt_tokens.size()));
         }
+#endif
 
         // kvmem × MTP (Phase C). When kvmem is enabled the verify path must
         // attend over the assembled window, which only the per-token
@@ -8219,12 +8237,14 @@ private:
             dump == nullptr && executor_->block_store() &&
             executor_->block_store()->config().retrieval_method ==
                 KvMemRetrievalMethod::MeanK;
+#if 0  // Archived DeltaNet recurrent-state import/capture validation.
         if ((rebuilt_state_import || rebuilt_state_capture) &&
             !recompute_query) {
             throw std::runtime_error(
                 "KVMem rebuilt-state import/capture requires an above-budget "
                 "query-conditioned mean-k request with query replay enabled");
         }
+#endif
         const uint32_t api_bt = kvmem_on && executor_->block_store()
             ? std::max<uint32_t>(
                   1, executor_->block_store()->config().block_tokens)
@@ -10012,6 +10032,7 @@ private:
                 }
                 executor_->kvmem_begin_query_replay(
                     kvmem_query_replay_ckpt, selected_context);
+#if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =
                         kvmem_selected_source_tokens(
@@ -10042,6 +10063,7 @@ private:
                             std::to_string(selected_context.size()));
                     }
                 }
+#endif
                 std::vector<uint32_t> replay_tokens;
                 if (api_session) {
                     if (kvmem_query_replay_begin < api_sequence_base ||
@@ -10129,6 +10151,7 @@ private:
             kvmem_warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             kvmem_warm_prompt_resumable = kvmem_all_gpu_identity();
         }
+#if 0  // Archived DeltaNet recurrent-state export.
         if (rebuilt_state_export) {
             if (kvmem_warm_reuse) {
                 throw std::runtime_error(
@@ -10148,6 +10171,7 @@ private:
                 options.kvmem_rebuilt_state_export_key +
                 " source_tokens=" + std::to_string(prompt_tokens.size()));
         }
+#endif
         if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
             QwenExecutor::kvmem_timing_emit_delta("phase=prefill request=mtp",
                                                   kvmem_tbase);

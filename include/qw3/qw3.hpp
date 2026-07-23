@@ -175,20 +175,15 @@ struct GenerationOptions {
     uint32_t kvmem_context_begin = 0;
     uint32_t kvmem_context_end = 0;
     std::string kvmem_trace_tag;
-    // Experimental hybrid-state controls. Export dense-prefills its exact raw
-    // prompt and writes only DeltaNet recurrent/conv state. Capture writes the
-    // accumulated state restored at the final query-replay boundary, associating
-    // it with that request's exact selected source-token vector. Seed initializes
-    // a cold dense export request from such a captured state, so replaying the
-    // selected tokens applies ordinary DeltaNet updates on top of the accumulated
-    // history instead of replacing it. Import substitutes the resulting state
-    // after an ordinary KVMem selection and before final query replay. Empty keys
-    // keep the normal path byte-for-byte unchanged. Files are rooted under
-    // QW3_KVMEM_REBUILT_STATE_DIR; these are validated keys, never paths.
+    // ARCHIVED (2026-07-23): the DeltaNet recurrent-state export/import debug
+    // interface is intentionally compiled out. See the request-parser note in
+    // qw3_server.cpp and KVMI-012 for the measured results and rationale.
+#if 0
     std::string kvmem_rebuilt_state_export_key;
     std::string kvmem_rebuilt_state_import_key;
     std::string kvmem_rebuilt_state_capture_key;
     std::string kvmem_rebuilt_state_seed_key;
+#endif
 };
 
 struct ModelInfo {

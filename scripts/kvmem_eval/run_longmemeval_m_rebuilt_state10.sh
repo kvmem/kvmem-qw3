@@ -2,7 +2,12 @@
 # Exact selected-normal-KV + rebuilt-DeltaNet-state control on the frozen ten
 # LongMemEval-M errors. It first captures the selection with the exact import
 # binary/configuration; historical retrieval dumps are intentionally never used.
+# ARCHIVED 2026-07-23: this debug interface is disabled in qw3. The original
+# script is retained only for commit-level reproducibility; see KVMI-012.
 set -euo pipefail
+
+echo "DeltaNet rebuilt-state debug is archived and disabled; see KVMI-012" >&2
+exit 2
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TAG=${TAG:-longmemeval_m_k224k_query_replay_immutable_rebuilt_state10_fixed_20260722}

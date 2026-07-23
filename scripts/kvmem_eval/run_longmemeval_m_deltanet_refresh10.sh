@@ -2,7 +2,12 @@
 # Accumulated-DeltaNet + selected-token refresh control on the frozen ten
 # LongMemEval-M errors. The original query-boundary recurrent/conv state is kept
 # as a seed; exact selected source tokens are then densely replayed on top of it.
+# ARCHIVED 2026-07-23: this debug interface is disabled in qw3. The original
+# script is retained only for commit-level reproducibility; see KVMI-012.
 set -euo pipefail
+
+echo "DeltaNet rebuilt-state debug is archived and disabled; see KVMI-012" >&2
+exit 2
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TAG=${TAG:-longmemeval_m_k224k_query_replay_immutable_deltanet_refresh10_20260722}
