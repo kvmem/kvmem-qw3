@@ -1,26 +1,45 @@
 #!/usr/bin/env bash
 # AgentLongBench-Long fixed 512K normal100 with ordinary KVMem + MTP-4.
-# Query replay, immutable source K, and MTP-4 are explicit; DeltaNet
-# rebuilt-state capture/seed/export/import is deliberately absent.
+# The default storage profile is CPU-only opt_1: a 640K logical context,
+# 224K selected context, 32K generation reserve, and no NVMe tier.  CTX,
+# CPU_GB, NVME_GB, NVME_DIR, and KVMEM_OPT_LEVEL remain overridable so the
+# earlier 1M + NVMe configuration can still be reproduced without editing
+# this launcher. Query replay, immutable source K, and MTP-4 are explicit;
+# DeltaNet rebuilt-state capture/seed/export/import is deliberately absent.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT=${PORT:-8087}
-TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_20260723}
+CTX=${CTX:-655360}
+CPU_GB=${CPU_GB:-64}
+NVME_GB=${NVME_GB:-0}
+KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
+TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_opt1_20260723}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
 MODEL=${MODEL:-$ROOT/models/Qwen3.6-27B-Q8_0.gguf}
 RESULT_ROOT=${RESULT_ROOT:-/data/chaidi/kvmem_eval/results/$TAG}
 LOG_ROOT=${LOG_ROOT:-/data/chaidi/kvmem_eval/logs}
-NVME_DIR=${NVME_DIR:-/data/chaidi/kvmem_eval/nvme/$TAG}
+NVME_DIR=${NVME_DIR:-/tmp/qw3_kvmem_eval_nvme/$TAG}
 SERVER_LOG=${SERVER_LOG:-$LOG_ROOT/${TAG}_server.log}
 RUN_LOG=${RUN_LOG:-$LOG_ROOT/${TAG}_runner.log}
 PID_FILE=${PID_FILE:-$LOG_ROOT/${TAG}.pid}
 
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy=127.0.0.1,localhost
-mkdir -p "$RESULT_ROOT" "$LOG_ROOT" "$NVME_DIR"
+mkdir -p "$RESULT_ROOT" "$LOG_ROOT"
 echo $$ >"$PID_FILE"
+
+tier_args=(
+  --kvmem-cpu-gb "$CPU_GB"
+)
+if [[ "$NVME_GB" != "0" && "$NVME_GB" != "0.0" ]]; then
+  mkdir -p "$NVME_DIR"
+  tier_args+=(
+    --kvmem-nvme-gb "$NVME_GB"
+    --kvmem-nvme-dir "$NVME_DIR"
+  )
+fi
 
 server_pid=""
 cleanup() {
@@ -50,15 +69,15 @@ env \
   QW3_PREFILL_FA2_NSPLIT=1 \
   "$ROOT/build/qw3" serve \
     --model "$MODEL" \
-    --ctx 1048576 --kv-dtype fp16 \
+    --ctx "$CTX" --kv-dtype fp16 \
     --kvmem --kvmem-block-tokens 32 \
     --kvmem-budget 229376 --kvmem-gen-budget 32768 \
     --kvmem-sink-blocks 8 --kvmem-recent-blocks 0 \
     --kvmem-method retrieval --kvmem-retrieval-method mean-k \
     --kvmem-update-mode step --kvmem-query-conditioned \
     --kvmem-immutable-k --kvmem-gpu-memory-ratio 0.51 \
-    --kvmem-cpu-gb 64 --kvmem-nvme-gb 256 \
-    --kvmem-nvme-dir "$NVME_DIR" \
+    --kvmem-optimization-level "$KVMEM_OPT_LEVEL" \
+    "${tier_args[@]}" \
     --enable-thinking --thinking-budget 4096 \
     --prefill-chunk 2048 --temp 0.6 \
     --native-mtp-speculate --mtp-chain 4 \
@@ -105,7 +124,7 @@ fi
   --model "$(basename "$MODEL")" \
   --method kvmem_mean_k_224k_b32_query_replay_immutable_mtp4_fp16 \
   --temperature 0.6 --top-p 0.95 --max-tokens 32768 \
-  --context-window 1048576 --context-safety-margin 16 \
+  --context-window "$CTX" --context-safety-margin 16 \
   --timeout-sec 7200 --max-sample-sec 7200 --attempts 3 \
   --enable-thinking --seed 20260722 \
   --kvmem-retrieval-trace-metadata \
