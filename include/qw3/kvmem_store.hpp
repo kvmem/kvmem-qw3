@@ -145,6 +145,18 @@ enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMea
 enum class KvMemSubblockReduce : uint8_t { Sum = 0, Max = 1 };
 enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
 enum class KvMemDeltaNetLayerPolicy : uint8_t { Even = 0, Late = 1 };
+// Monotonic research profiles for storage/tiering performance comparisons.
+// KvmemInit is the committed compatibility baseline. Each later level contains
+// all earlier optimizations; a build must reject a level whose implementation
+// is not complete instead of silently falling back.
+enum class KvMemOptimizationLevel : uint8_t {
+    KvmemInit = 0,
+    Opt1 = 1,  // heat-aware CPU admission/eviction
+    Opt2 = 2,  // inclusive SSD write-through / clean stage-out
+    Opt3 = 3,  // pageable CPU cache + bounded pinned slabs
+    Opt4 = 4,  // bulk asynchronous stage-in
+    Opt5 = 5,  // layer-stripe stage-in/query-replay overlap
+};
 
 struct KvMemStoreConfig {
     uint32_t block_tokens = 128;     // --kvmem-block-tokens
@@ -161,6 +173,8 @@ struct KvMemStoreConfig {
                                      // (SubBlockMeanK only; 1 => plain mean-k)
     KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
+    KvMemOptimizationLevel optimization_level =
+        KvMemOptimizationLevel::KvmemInit;
 
     // Drift-bounded K construction. The executor stores unrotated historical K
     // in a CPU mirror and keeps only one active K copy on GPU. Small window

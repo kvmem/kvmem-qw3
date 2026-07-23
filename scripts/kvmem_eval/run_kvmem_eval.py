@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--subblocks", type=int, default=4)
     ap.add_argument("--subblock-reduce", choices=("max", "sum"), default="max")
     ap.add_argument("--update-mode", choices=("step", "interval"), default="step")
+    ap.add_argument(
+        "--optimization-level",
+        choices=("kvmem_init", "opt_1", "opt_2", "opt_3", "opt_4", "opt_5"),
+        default="kvmem_init",
+        help="monotonic KVMem storage/tiering profile used for matched A/B runs")
     ap.add_argument("--query-conditioned", action=argparse.BooleanOptionalAction,
                     default=True)
     ap.add_argument("--gpu-memory-ratio", type=float, default=0.5)
@@ -115,6 +120,7 @@ def build_commands(args: argparse.Namespace) -> tuple[list[str], list[str], Path
         "--kvmem-method", args.method,
         "--kvmem-retrieval-method", args.retrieval_method,
         "--kvmem-update-mode", args.update_mode,
+        "--kvmem-optimization-level", args.optimization_level,
         "--kvmem-gpu-memory-ratio", str(args.gpu_memory_ratio),
         "--kvmem-cpu-gb", str(args.cpu_gb),
         "--kvmem-nvme-gb", str(args.nvme_gb),

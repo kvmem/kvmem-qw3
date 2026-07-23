@@ -13,6 +13,44 @@ Historical shell scripts under `/data/chaidi/kvmem_eval` are retained unchanged
 for reproducing old results. New parameter sweeps should use this runner instead
 of copying those scripts.
 
+## Storage optimization A/B levels
+
+The reusable runner exposes the storage optimization profile without changing
+the model, prompt, retrieval, or judge configuration:
+
+```bash
+python3 scripts/kvmem_eval/run_kvmem_eval.py \
+  --tag storage_init \
+  --optimization-level kvmem_init \
+  --dry-run
+
+python3 scripts/kvmem_eval/run_kvmem_eval.py \
+  --tag storage_opt1 \
+  --optimization-level opt_1 \
+  --dry-run
+```
+
+`kvmem_init` is the frozen compatibility path. `opt_1` changes only CPU-tier
+cache admission: blocks repeatedly selected by semantic retrieval are retained
+ahead of one-pass streaming blocks. It does not change retrieval scores,
+selected block IDs, KV values, or model outputs when the same blocks are
+resident. `opt_2` through `opt_5` are reserved rollout levels and are rejected
+until their implementations are complete.
+
+The frozen ten-sample query-replay launcher accepts the same switch:
+
+```bash
+KVMEM_OPT_LEVEL=kvmem_init TAG=query_replay_init \
+  scripts/kvmem_eval/run_longmemeval_m_query_replay10.sh
+
+KVMEM_OPT_LEVEL=opt_1 TAG=query_replay_opt1 \
+  scripts/kvmem_eval/run_longmemeval_m_query_replay10.sh
+```
+
+Use `QW3_KVMEM_PERF_TRACE=1` for timed reselection stages. In `opt_1`, the
+server also emits `[kvmem-cache]` rows containing incoming CPU hit rate,
+admissions, rejected admissions, and evictions.
+
 ## Inspect a configuration
 
 ```bash

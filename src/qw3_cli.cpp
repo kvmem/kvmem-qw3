@@ -118,6 +118,10 @@ void usage(std::ostream &os) {
         "  --kvmem-deltanet-topk-h N  TopKMean over DeltaNet heads. Default: 4.\n"
 #endif
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
+        "  --kvmem-optimization-level L  Monotonic storage/tiering A/B profile:\n"
+        "                        kvmem_init|opt_1|opt_2|opt_3|opt_4|opt_5.\n"
+        "                        Currently implemented: kvmem_init, opt_1.\n"
+        "                        Default: kvmem_init.\n"
         "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
         "                        final user message (the question) instead of recency.\n"
         "                        Requires the serve layer to mark the query span.\n"
@@ -451,6 +455,16 @@ int main(int argc, char **argv) {
                     engine.kvmem_update_mode != "step") {
                     throw std::runtime_error(
                         "--kvmem-update-mode must be interval|step");
+                }
+            } else if (arg == "--kvmem-optimization-level") {
+                engine.kvmem_optimization_level = need(arg);
+                const std::string &level = engine.kvmem_optimization_level;
+                if (level != "kvmem_init" && level != "opt_1" &&
+                    level != "opt_2" && level != "opt_3" &&
+                    level != "opt_4" && level != "opt_5") {
+                    throw std::runtime_error(
+                        "--kvmem-optimization-level must be "
+                        "kvmem_init|opt_1|opt_2|opt_3|opt_4|opt_5");
                 }
             } else if (arg == "--kvmem-query-conditioned") {
                 engine.kvmem_query_conditioned = true;

@@ -1129,6 +1129,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_block_tokens=" << engine.kvmem_block_tokens << "\n"
               << "  kvmem_budget=" << engine.kvmem_budget << "\n"
               << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
+              << "  kvmem_optimization_level="
+              << engine.kvmem_optimization_level << "\n"
               << "  kvmem_query_conditioned="
               << yesno(engine.kvmem_query_conditioned) << "\n"
               << "  kvmem_recompute_query="

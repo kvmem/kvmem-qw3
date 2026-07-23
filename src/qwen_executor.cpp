@@ -4137,6 +4137,12 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             "of the KV page size (" + std::to_string(page_size) + ")");
     }
     KvMemStoreConfig effective = cfg;
+    if (effective.optimization_level > KvMemOptimizationLevel::Opt1) {
+        throw std::runtime_error(
+            "--kvmem-optimization-level requests an optimization level that "
+            "is reserved but not implemented in this build; use kvmem_init or "
+            "opt_1");
+    }
     // Immutable source K is the default. The legacy environment override is
     // still tri-state: an explicit false value disables it just like the CLI
     // opt-out, while an unset variable preserves EngineOptions.
@@ -4611,6 +4617,10 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         PinnedKvTierConfig pcfg;
         pcfg.total_bytes = effective.cpu_tier_bytes;
         pcfg.slot_bytes = effective.estimated_block_bytes;
+        pcfg.cache_policy =
+            effective.optimization_level >= KvMemOptimizationLevel::Opt1
+                ? PinnedKvCachePolicy::HeatAware
+                : PinnedKvCachePolicy::LegacyLru;
         kvmem_cpu_tier_ = std::make_unique<PinnedKvTier>(pcfg);
         if (kvmem_cpu_tier_->enabled()) {
             if (kvmem_immutable_source_k_) {
@@ -4628,6 +4638,14 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             }
         }
     }
+    std::fprintf(
+        stderr,
+        "[kvmem-opt] level=%s cpu_cache_policy=%s "
+        "implemented_max=opt_1\n",
+        effective.optimization_level == KvMemOptimizationLevel::Opt1
+            ? "opt_1" : "kvmem_init",
+        effective.optimization_level >= KvMemOptimizationLevel::Opt1
+            ? "heat-aware" : "legacy-lru");
     if (effective.nvme_tier_bytes > 0 && effective.estimated_block_bytes > 0) {
         if (effective.nvme_tier_dir.empty()) {
             throw std::runtime_error(
@@ -5525,6 +5543,16 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
                         kvmem_cpu_tier_->release_block(block_id);
                         placement = PinnedSlotPlacement{};
                     }
+                } else if (
+                    kvmem_nvme_tier_ &&
+                    block_store_->config().optimization_level >=
+                        KvMemOptimizationLevel::Opt1) {
+                    // Shared raw-K + spill accounting can exhaust the physical
+                    // CPU byte budget before the tier's logical slot range is
+                    // full. Reuse a cold resident's already allocated buffer;
+                    // a colder candidate is rejected and falls through to SSD.
+                    placement =
+                        kvmem_cpu_tier_->place_block_replacing(block_id);
                 }
             } else if (kvmem_nvme_tier_) {
                 placement = kvmem_cpu_tier_->place_block_evicting(block_id);
@@ -6085,6 +6113,14 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     }
     kvmem_pending_plan_ =
         block_store_->set_selection(kvmem_selection_with_pin());
+    if (kvmem_cpu_tier_ &&
+        block_store_->config().optimization_level >=
+            KvMemOptimizationLevel::Opt1) {
+        kvmem_cpu_tier_->begin_selection_epoch();
+        for (const KvMemRemap &rm : kvmem_pending_plan_.remaps) {
+            kvmem_cpu_tier_->record_selected(rm.block_id);
+        }
+    }
     if (method == KvMemMethod::Retrieval) {
         const bool fallback =
             std::strcmp(scorer_requested, scorer_used) != 0;
@@ -6396,6 +6432,34 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             in.nvme_bytes * bytes_to_gib,
             (t_done - t_assemble0) * ns_to_ms,
             total_ns * ns_to_ms);
+        if (kvmem_cpu_tier_) {
+            const PinnedKvCacheStats &cache = kvmem_cpu_tier_->stats();
+            const size_t incoming = kvmem_pending_plan_.stage_in.size();
+            const size_t retained =
+                kvmem_pending_plan_.remaps.size() >= incoming
+                    ? kvmem_pending_plan_.remaps.size() - incoming
+                    : 0;
+            const double cpu_hit_rate = incoming > 0
+                ? static_cast<double>(in.cpu_blocks) /
+                      static_cast<double>(incoming)
+                : 1.0;
+            std::fprintf(
+                stderr,
+                "[kvmem-cache] level=%s kind=semantic retained=%zu "
+                "incoming=%zu cpu_hits=%u ssd_misses=%u "
+                "incoming_cpu_hit_rate=%.6f selection_epochs=%llu "
+                "admissions=%llu admission_rejections=%llu evictions=%llu\n",
+                block_store_->config().optimization_level >=
+                        KvMemOptimizationLevel::Opt1
+                    ? "opt_1" : "kvmem_init",
+                retained, incoming, in.cpu_blocks, in.nvme_blocks,
+                cpu_hit_rate,
+                static_cast<unsigned long long>(cache.selection_epochs),
+                static_cast<unsigned long long>(cache.admissions),
+                static_cast<unsigned long long>(
+                    cache.admission_rejections),
+                static_cast<unsigned long long>(cache.evictions));
+        }
     }
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};

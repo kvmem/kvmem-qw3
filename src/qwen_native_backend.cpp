@@ -6032,6 +6032,19 @@ private:
         bs_cfg.update_mode = options_.kvmem_update_mode == "step"
             ? KvMemUpdateMode::Step
             : KvMemUpdateMode::Interval;
+        if (options_.kvmem_optimization_level == "opt_1") {
+            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt1;
+        } else if (options_.kvmem_optimization_level == "opt_2") {
+            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt2;
+        } else if (options_.kvmem_optimization_level == "opt_3") {
+            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt3;
+        } else if (options_.kvmem_optimization_level == "opt_4") {
+            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt4;
+        } else if (options_.kvmem_optimization_level == "opt_5") {
+            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt5;
+        } else {
+            bs_cfg.optimization_level = KvMemOptimizationLevel::KvmemInit;
+        }
         exec.set_kvmem_enabled(true);
         exec.configure_kvmem(bs_cfg);
     }

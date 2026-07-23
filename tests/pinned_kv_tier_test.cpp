@@ -142,6 +142,76 @@ static void test_lru_order() {
     CHECK(t.block_slot(1) == -1);
 }
 
+static void test_heat_aware_admission() {
+    PinnedKvTierConfig cfg;
+    cfg.total_bytes = 16ull * 1024 * 1024;
+    cfg.slot_bytes = 8ull * 1024 * 1024;       // 2 slots
+    cfg.cache_policy = PinnedKvCachePolicy::HeatAware;
+    PinnedKvTier t(cfg);
+    CHECK(t.place_block(1).slot == 0);
+    CHECK(t.place_block(2).slot == 1);
+
+    // Both residents have semantic reuse evidence. A one-pass streaming block
+    // bypasses CPU instead of displacing either hot block.
+    t.begin_selection_epoch();
+    t.record_selected(1);
+    t.record_selected(2);
+    auto rejected = t.place_block_evicting(3);
+    CHECK(rejected.slot == -1);
+    CHECK(rejected.evicted_block == -1);
+    CHECK(t.block_slot(1) == 0);
+    CHECK(t.block_slot(2) == 1);
+    CHECK(t.block_slot(3) == -1);
+    CHECK(t.stats().admission_rejections == 1);
+
+    // Repeated selection makes block 3 hotter than the old residents, so its
+    // next stage-out is admitted and evicts the LRU resident.
+    t.begin_selection_epoch();
+    t.record_selected(3);
+    t.begin_selection_epoch();
+    t.record_selected(3);
+    auto admitted = t.place_block_evicting(3);
+    CHECK(admitted.slot >= 0);
+    CHECK(admitted.evicted_block >= 0);
+    CHECK(t.block_slot(3) == admitted.slot);
+    CHECK(t.stats().evictions == 1);
+    CHECK(t.stats().selection_epochs == 3);
+}
+
+static void test_heat_aware_replacement_before_logical_full() {
+    PinnedKvTierConfig cfg;
+    cfg.total_bytes = 24ull * 1024 * 1024;
+    cfg.slot_bytes = 8ull * 1024 * 1024;       // 3 logical slots
+    cfg.cache_policy = PinnedKvCachePolicy::HeatAware;
+    PinnedKvTier t(cfg);
+    CHECK(t.place_block(1).slot == 0);
+    CHECK(t.place_block(2).slot == 1);
+    CHECK(t.free_slots() == 1);
+
+    // Immutable raw-K buffers can exhaust the shared CPU byte budget while the
+    // logical tier still has a free slot. A cold candidate must bypass CPU.
+    t.begin_selection_epoch();
+    t.record_selected(1);
+    t.record_selected(2);
+    auto rejected = t.place_block_replacing(3);
+    CHECK(rejected.slot == -1);
+    CHECK(rejected.evicted_block == -1);
+    CHECK(t.free_slots() == 1);
+
+    // Repeated semantic reuse promotes the candidate. It reuses an allocated
+    // resident slot and does not consume the unavailable logical free slot.
+    t.begin_selection_epoch();
+    t.record_selected(3);
+    t.begin_selection_epoch();
+    t.record_selected(3);
+    auto admitted = t.place_block_replacing(3);
+    CHECK(admitted.slot >= 0);
+    CHECK(admitted.evicted_block >= 0);
+    CHECK(t.block_slot(3) == admitted.slot);
+    CHECK(t.free_slots() == 1);
+    CHECK(t.used_slots() == 2);
+}
+
 int main() {
     test_sizing();
     test_disabled();
@@ -149,6 +219,8 @@ int main() {
     test_full_no_evict();
     test_full_with_explicit_evict();
     test_lru_order();
+    test_heat_aware_admission();
+    test_heat_aware_replacement_before_logical_full();
 
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);

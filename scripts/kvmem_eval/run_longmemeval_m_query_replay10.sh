@@ -10,6 +10,7 @@ TAG=${TAG:-longmemeval_m_k224k_query_replay10_20260720}
 PORT=${PORT:-8087}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/longmemeval_m_102.jsonl}
 INDICES=${INDICES:-4,6,20,27,34,36,51,60,68,86}
+KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-kvmem_init}
 
 if [[ -z ${DEEPSEEK_API_KEY:-} ]]; then
   echo "DEEPSEEK_API_KEY is required for the paired accuracy run" >&2
@@ -30,6 +31,7 @@ env \
     --block-tokens 32 --budget 229376 --gen-budget 32768 \
     --sink-blocks 8 --recent-blocks 0 \
     --method retrieval --retrieval-method mean-k --update-mode step \
+    --optimization-level "$KVMEM_OPT_LEVEL" \
     --query-conditioned --gpu-memory-ratio 0.51 \
     --cpu-gb 64 --nvme-gb 256 \
     --thinking --thinking-budget 4096 \

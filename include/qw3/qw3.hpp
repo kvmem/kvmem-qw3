@@ -80,6 +80,10 @@ struct EngineOptions {
     int kvmem_subblocks = 4;      // sub-block means per block (sub-block-mean-k only)
     std::string kvmem_subblock_reduce = "max"; // sub-block score reduction: max or sum
     std::string kvmem_update_mode = "interval"; // interval or step
+    // Monotonic storage/tiering A/B profile. kvmem_init preserves the committed
+    // compatibility implementation; opt_1 first enables heat-aware CPU cache
+    // admission. Higher levels are enabled only as their implementations land.
+    std::string kvmem_optimization_level = "kvmem_init";
     // Archived experimental DeltaNet retrieval. These programmatic fields remain
     // for reproducibility, but the corresponding CLI is disabled and the method
     // is not recommended. See docs/kvmem_deltanet_retrieval_experimental.md.
