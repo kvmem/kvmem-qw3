@@ -691,10 +691,18 @@ void QwenExecutor::reset_state() {
     kvmem_reselect_perf_ = KvMemReselectPerf{};
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};
-    // Keep raw mirror validity across a reset: the plain prefix-cache can adopt
-    // a previously computed prefix without re-running its layers. A cold prompt
-    // overwrites every registered token before it can be selected, while a
-    // prefix hit needs these existing raw rows for a later periodic refresh.
+    // reset_state() is the cold-request boundary. Warm prefix continuation uses
+    // restore_state()+kvmem_truncate_to() and deliberately does not come through
+    // here, so no raw-K authority belongs to the next request. Keeping the
+    // demand-allocated chunks alive retained up to --kvmem-cpu-gb of anonymous
+    // memory across independent requests and could OOM a long-lived server.
+    // Preserve only the pre-sized pointer/validity vectors; release their
+    // physical contents and let the next cold prefill allocate on demand.
+    kvmem_truncate_raw_k(0);
+    std::fill(kvmem_raw_k_valid_tokens_.begin(),
+              kvmem_raw_k_valid_tokens_.end(), uint8_t{0});
+    std::fill(kvmem_raw_mtp_k_valid_tokens_.begin(),
+              kvmem_raw_mtp_k_valid_tokens_.end(), uint8_t{0});
     kvmem_raw_decode_block_start_ = -1;
     kvmem_raw_decode_first_row_ = 0;
     kvmem_raw_decode_rows_ = 0;
