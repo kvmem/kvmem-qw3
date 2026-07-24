@@ -258,6 +258,16 @@ size_t kvmem_cpu_gather_threads() {
     return value;
 }
 
+size_t kvmem_overlap_stagein_threads() {
+    // V comes from sparse CPU spill slabs and is measurably less bandwidth
+    // efficient than block-major raw K. During overlap it is normally the
+    // critical branch, so give it more workers than the raw-K gather.
+    static const size_t value =
+        kvmem_env_size(
+            "QW3_KVMEM_OVERLAP_STAGEIN_THREADS", 8, 1, 16);
+    return value;
+}
+
 size_t kvmem_cpu_stageout_threads() {
     static const size_t value =
         kvmem_env_size("QW3_KVMEM_CPU_STAGEOUT_THREADS", 4, 1, 16);
@@ -1122,6 +1132,58 @@ int32_t QwenExecutor::KvPageTable::ensure_logical_page_resident(
         *device_pages, logical_page, &pages[logical_page], 1));
     device_synced = std::max<uint32_t>(device_synced, logical_page + 1);
     return pages[logical_page];
+}
+
+void QwenExecutor::KvPageTable::ensure_logical_page_ranges_resident(
+        DeviceBackend &backend,
+        const std::vector<std::pair<uint32_t, uint32_t>> &ranges) {
+    if (ranges.empty()) return;
+    uint32_t upload_begin = max_pages;
+    uint32_t upload_end = 0;
+    for (const auto &[logical_start, count] : ranges) {
+        if (count == 0) continue;
+        const uint64_t end64 =
+            static_cast<uint64_t>(logical_start) + count;
+        if (logical_start >= max_pages || end64 > max_pages) {
+            throw std::runtime_error(
+                "KV logical page range exceeds page capacity");
+        }
+        const uint32_t end = static_cast<uint32_t>(end64);
+        while (pages.size() < end) {
+            const uint32_t lp = static_cast<uint32_t>(pages.size());
+            const int32_t physical_page =
+                allocator ? allocator->allocate_physical_page()
+                          : allocate_physical_page(lp);
+            pages.push_back(physical_page);
+            owned.push_back(true);
+        }
+        for (uint32_t lp = logical_start; lp < end; ++lp) {
+            if (pages[lp] >= 0) continue;
+            const int32_t physical_page =
+                allocator ? allocator->allocate_physical_page()
+                          : allocate_physical_page(lp);
+            pages[lp] = physical_page;
+            if (owned.size() < pages.size()) {
+                owned.resize(pages.size(), true);
+            }
+            owned[lp] = true;
+        }
+        upload_begin = std::min(upload_begin, logical_start);
+        upload_end = std::max(upload_end, end);
+    }
+    if (upload_begin >= upload_end) return;
+    // If the logical vector grew past the previously published prefix, include
+    // that gap too; advancing device_synced across an uninitialized gap would
+    // make a later ensure_pages() incorrectly treat it as resident on device.
+    upload_begin = std::min(upload_begin, device_synced);
+    if (!device_pages) {
+        device_pages = backend.tensor_i32(
+            std::max<uint32_t>(max_pages, 1), "kv_page_indices");
+    }
+    require_status(backend.copy_i32_from_host(
+        *device_pages, upload_begin, pages.data() + upload_begin,
+        upload_end - upload_begin));
+    device_synced = std::max(device_synced, upload_end);
 }
 
 void QwenExecutor::KvPageTable::release_logical_pages(
@@ -2170,7 +2232,9 @@ void QwenExecutor::kvmem_materialize_raw_k(
             : static_cast<uint32_t>(kvmem_raw_layers_.size());
         const uint32_t gather_workers = kvmem_raw_pipeline_enabled_
             ? std::min<uint32_t>(
-                  kvmem_cpu_gather_threads(), work_items)
+                  static_cast<uint32_t>(
+                      kvmem_cpu_gather_threads()),
+                  work_items)
             : 1u;
         auto gather_item = [&](uint32_t item) {
             if (kvmem_raw_k_block_major_) {
@@ -2491,7 +2555,10 @@ void QwenExecutor::kvmem_materialize_raw_mtp_k(
             }
         };
         const uint32_t gather_workers = kvmem_raw_pipeline_enabled_
-            ? std::min<uint32_t>(kvmem_cpu_gather_threads(), n)
+            ? std::min<uint32_t>(
+                  static_cast<uint32_t>(
+                      kvmem_cpu_gather_threads()),
+                  n)
             : 1u;
         if (gather_workers <= 1u) {
             for (uint32_t j = 0; j < n; ++j) gather_block(j);
@@ -5623,6 +5690,31 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         kvmem_cpu_worker_pool_ =
             std::make_unique<KvmemCpuWorkerPool>(max_cpu_workers - 1);
     }
+    kvmem_stagein_worker_pool_.reset();
+    kvmem_stagein_assembly_overlap_enabled_ =
+        persistent_cpu_pool &&
+        pipelined_h2d &&
+        kvmem_immutable_source_k_ &&
+        !has_ssd &&
+        env_flag_enabled(
+            "QW3_KVMEM_OVERLAP_STAGEIN_ASSEMBLY", true);
+    if (kvmem_stagein_assembly_overlap_enabled_) {
+        // The async stage-in caller is one participant. Profiling this
+        // dual-socket EPYC showed that two workers leave
+        // each sparse memcpy stream under-filled: restricting both sides to
+        // two made the overlapped wall time exceed the original serial sum.
+        // V spill gathering also remains the critical branch at 4+4, so use
+        // eight V workers by default while raw K retains four. Both settings
+        // are bounded and independently tunable.
+        const size_t stagein_workers =
+            kvmem_overlap_stagein_threads();
+        if (stagein_workers > 1) {
+            kvmem_stagein_worker_pool_ =
+                std::make_unique<KvmemCpuWorkerPool>(
+                    stagein_workers - 1);
+        }
+    }
+    kvmem_stagein_assembly_overlap_active_ = false;
     kvmem_prefill_writeback_enabled_ =
         async_ssd_write &&
         kvmem_immutable_source_k_ &&
@@ -5637,6 +5729,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         "io_slab_mib=%zu write_qd=%zu read_qd=2 "
         "cpu_gather_threads=%zu cpu_stageout_threads=%zu "
         "persistent_cpu_pool=%d persistent_cpu_workers=%zu "
+        "stagein_assembly_overlap=%d overlap_cpu_workers=%u "
         "implemented_max=opt_3\n",
         kvmem_optimization_level_name(effective.optimization_level),
         effective.optimization_level >= KvMemOptimizationLevel::Opt1
@@ -5654,7 +5747,13 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         persistent_cpu_pool ? 1 : 0,
         kvmem_cpu_worker_pool_
             ? kvmem_cpu_worker_pool_->max_workers()
-            : 0);
+            : 0,
+        kvmem_stagein_assembly_overlap_enabled_ ? 1 : 0,
+        kvmem_stagein_assembly_overlap_enabled_
+            ? static_cast<unsigned>(
+                  kvmem_cpu_gather_threads() +
+                  kvmem_overlap_stagein_threads())
+            : 0u);
     if (kvmem_prefill_writeback_enabled_) {
         const uint64_t warm0 = kvmem_steady_ns();
         const size_t slab_bytes = kvmem_io_slab_bytes();
@@ -6416,7 +6515,15 @@ void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
         // continues concurrently on the CUDA copy stream.
         const size_t read_count = end - begin;
         const size_t worker_count = std::min(
-            kvmem_cpu_gather_threads(), read_count);
+            kvmem_stagein_assembly_overlap_active_
+                ? kvmem_overlap_stagein_threads()
+                : kvmem_cpu_gather_threads(),
+            read_count);
+        KvmemCpuWorkerPool *stagein_pool =
+            kvmem_stagein_assembly_overlap_active_ &&
+                    kvmem_stagein_worker_pool_
+                ? kvmem_stagein_worker_pool_.get()
+                : kvmem_cpu_worker_pool_.get();
         for (size_t i = begin; i < end; ++i) {
             if (!kvmem_cpu_slot_data(
                     kvmem_prefetch_.cpu_reads[i].slot)) {
@@ -6436,8 +6543,8 @@ void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
         };
         if (worker_count <= 1) {
             gather_range(begin, end);
-        } else if (kvmem_cpu_worker_pool_) {
-            kvmem_cpu_worker_pool_->run(
+        } else if (stagein_pool) {
+            stagein_pool->run(
                 worker_count, worker_count,
                 [&](size_t worker) {
                     const size_t first =
@@ -6506,11 +6613,12 @@ void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
                 (block.orig_pos_start + block.n_tokens - 1) /
                 page_size;
             for (uint32_t lp = first_page; lp <= last_page; ++lp) {
-                (void)kv_pages_.ensure_logical_page_resident(
-                    backend_, lp);
-                if (stage_mtp_pages) {
-                    (void)mtp_kv_pages_.ensure_logical_page_resident(
-                        backend_, lp);
+                if (!kv_pages_.logical_page_resident(lp) ||
+                    (stage_mtp_pages &&
+                     !mtp_kv_pages_.logical_page_resident(lp))) {
+                    throw std::runtime_error(
+                        "KVMem packed CPU stage-in target page was not "
+                        "bulk-allocated");
                 }
             }
             pages_per_target += last_page - first_page + 1;
@@ -6790,7 +6898,55 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
                              static_cast<unsigned long long>(bytes));
             }
         }
-        if (!kvmem_prefetch_.cpu_reads.empty()) {
+        if ((kvmem_prefetch_.bulk_cpu &&
+             !kvmem_prefetch_.cpu_reads.empty()) ||
+            (kvmem_prefetch_.bulk_nvme &&
+             !kvmem_prefetch_.nvme_reads.empty())) {
+            // Publish all incoming page mappings in one compact upload. This
+            // is required for the CPU overlap (assembly reads an immutable
+            // page vector), and also removes thousands of redundant scalar
+            // page-table H2D uploads from ordinary opt_3 stage-in.
+            std::vector<std::pair<uint32_t, uint32_t>> page_ranges;
+            page_ranges.reserve(
+                kvmem_prefetch_.cpu_reads.size() +
+                kvmem_prefetch_.nvme_reads.size());
+            auto add_range = [&](uint32_t block_id) {
+                const KvMemBlock &block = blocks[block_id];
+                const uint32_t page_size = kv_pages_.page_size;
+                const uint32_t first_page =
+                    block.orig_pos_start / page_size;
+                const uint32_t last_page =
+                    (block.orig_pos_start + block.n_tokens - 1) /
+                    page_size;
+                page_ranges.emplace_back(
+                    first_page, last_page - first_page + 1);
+            };
+            if (kvmem_prefetch_.bulk_cpu) {
+                for (const KvMemPrefetchCpuRead &read :
+                     kvmem_prefetch_.cpu_reads) {
+                    add_range(read.block_id);
+                }
+            }
+            if (kvmem_prefetch_.bulk_nvme) {
+                for (const KvMemPrefetchNvmeRead &read :
+                     kvmem_prefetch_.nvme_reads) {
+                    add_range(read.block_id);
+                }
+            }
+            kv_pages_.ensure_logical_page_ranges_resident(
+                backend_, page_ranges);
+            if (stage_mtp_pages) {
+                mtp_kv_pages_.ensure_logical_page_ranges_resident(
+                    backend_, page_ranges);
+            }
+        }
+        // In the unified CPU-only pipeline, do not gather the first two V
+        // slabs on the request thread. Starting them here left a measured
+        // ~26 ms/reselection serial prefix before raw-K assembly could begin.
+        // kvmem_finish_prefetch() runs on the dedicated stage-in caller and
+        // submits the same bounded two-slab queue there instead.
+        if (!kvmem_prefetch_.cpu_reads.empty() &&
+            !kvmem_stagein_assembly_overlap_enabled_) {
             kvmem_submit_prefetch_cpu_batches();
         }
         if (!kvmem_prefetch_.nvme_reads.empty()) {
@@ -6842,6 +6998,11 @@ void QwenExecutor::kvmem_finish_prefetch() {
     const bool stage_mtp_pages = kvmem_prefetch_.stage_mtp_pages;
     try {
         if (kvmem_prefetch_.bulk_cpu) {
+            if (kvmem_prefetch_.cpu_batches.empty() &&
+                kvmem_prefetch_.next_cpu_read <
+                    kvmem_prefetch_.cpu_reads.size()) {
+                kvmem_submit_prefetch_cpu_batches();
+            }
             while (!kvmem_prefetch_.cpu_batches.empty()) {
                 KvMemPrefetchCpuBatch batch =
                     std::move(kvmem_prefetch_.cpu_batches.front());
@@ -6913,11 +7074,12 @@ void QwenExecutor::kvmem_finish_prefetch() {
                         (block.orig_pos_start + block.n_tokens - 1) /
                         page_size;
                     for (uint32_t lp = first_page; lp <= last_page; ++lp) {
-                        (void)kv_pages_.ensure_logical_page_resident(
-                            backend_, lp);
-                        if (stage_mtp_pages) {
-                            (void)mtp_kv_pages_.ensure_logical_page_resident(
-                                backend_, lp);
+                        if (!kv_pages_.logical_page_resident(lp) ||
+                            (stage_mtp_pages &&
+                             !mtp_kv_pages_.logical_page_resident(lp))) {
+                            throw std::runtime_error(
+                                "KVMem packed NVMe stage-in target page was "
+                                "not bulk-allocated");
                         }
                     }
                     const uint8_t *src =
@@ -9125,10 +9287,53 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
     if (!kvmem_pending_reselect_) return window_query_pos_;
     const bool perf_trace =
         kvmem_perf_trace_flag() && kvmem_reselect_perf_.active;
-    kvmem_finish_prefetch();
-    const uint64_t t_assemble0 =
-        perf_trace ? kvmem_steady_ns() : 0;
-    kvmem_assemble(kvmem_pending_plan_);
+    const bool overlap_stagein_assembly =
+        kvmem_stagein_assembly_overlap_enabled_ &&
+        kvmem_raw_pipeline_enabled_ &&
+        kvmem_prefetch_.active &&
+        kvmem_prefetch_.bulk_cpu &&
+        !kvmem_prefetch_.cpu_reads.empty() &&
+        kvmem_prefetch_.nvme_reads.empty();
+    const uint64_t overlap_wall0 =
+        perf_trace && overlap_stagein_assembly
+            ? kvmem_steady_ns() : 0;
+    uint64_t t_assemble0 = 0;
+    uint64_t t_assemble_done = 0;
+    if (overlap_stagein_assembly) {
+        kvmem_stagein_assembly_overlap_active_ = true;
+        std::future<void> stagein_future;
+        try {
+            stagein_future = std::async(
+                std::launch::async,
+                [this]() { kvmem_finish_prefetch(); });
+        } catch (...) {
+            kvmem_stagein_assembly_overlap_active_ = false;
+            throw;
+        }
+        std::exception_ptr assemble_error;
+        std::exception_ptr stagein_error;
+        try {
+            t_assemble0 = perf_trace ? kvmem_steady_ns() : 0;
+            kvmem_assemble(kvmem_pending_plan_);
+            t_assemble_done = perf_trace ? kvmem_steady_ns() : 0;
+        } catch (...) {
+            assemble_error = std::current_exception();
+            t_assemble_done = perf_trace ? kvmem_steady_ns() : 0;
+        }
+        try {
+            stagein_future.get();
+        } catch (...) {
+            stagein_error = std::current_exception();
+        }
+        kvmem_stagein_assembly_overlap_active_ = false;
+        if (stagein_error) std::rethrow_exception(stagein_error);
+        if (assemble_error) std::rethrow_exception(assemble_error);
+    } else {
+        kvmem_finish_prefetch();
+        t_assemble0 = perf_trace ? kvmem_steady_ns() : 0;
+        kvmem_assemble(kvmem_pending_plan_);
+        t_assemble_done = perf_trace ? kvmem_steady_ns() : 0;
+    }
     const uint64_t t_done =
         perf_trace ? kvmem_steady_ns() : 0;
     if (perf_trace) {
@@ -9182,6 +9387,7 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             "nvme_h2d_enqueue_ms=%.3f h2d_wait_ms=%.3f "
             "cpu_in_blocks=%u cpu_in_gib=%.3f "
             "nvme_in_blocks=%u nvme_in_gib=%.3f "
+            "stagein_assembly_overlap=%d overlap_wall_ms=%.3f "
             "assemble_ms=%.3f total_ms=%.3f\n",
             static_cast<unsigned long long>(
                 kvmem_reselect_perf_.sequence),
@@ -9223,7 +9429,11 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             in.h2d_wait_ns * ns_to_ms, in.cpu_blocks,
             in.cpu_bytes * bytes_to_gib, in.nvme_blocks,
             in.nvme_bytes * bytes_to_gib,
-            (t_done - t_assemble0) * ns_to_ms,
+            overlap_stagein_assembly ? 1 : 0,
+            overlap_stagein_assembly
+                ? (t_done - overlap_wall0) * ns_to_ms
+                : 0.0,
+            (t_assemble_done - t_assemble0) * ns_to_ms,
             total_ns * ns_to_ms);
         if (kvmem_cpu_tier_) {
             const PinnedKvCacheStats &cache = kvmem_cpu_tier_->stats();
@@ -9297,10 +9507,53 @@ uint32_t QwenExecutor::kvmem_set_selection(
     trace_pool("after_stage_out");
     kvmem_start_prefetch(plan);
     trace_pool("after_start_prefetch");
-    kvmem_finish_prefetch();
-    const uint64_t t_assemble0 =
-        perf_trace ? kvmem_steady_ns() : 0;
-    kvmem_assemble(plan);
+    const bool overlap_stagein_assembly =
+        kvmem_stagein_assembly_overlap_enabled_ &&
+        kvmem_raw_pipeline_enabled_ &&
+        kvmem_prefetch_.active &&
+        kvmem_prefetch_.bulk_cpu &&
+        !kvmem_prefetch_.cpu_reads.empty() &&
+        kvmem_prefetch_.nvme_reads.empty();
+    const uint64_t overlap_wall0 =
+        perf_trace && overlap_stagein_assembly
+            ? kvmem_steady_ns() : 0;
+    uint64_t t_assemble0 = 0;
+    uint64_t t_assemble_done = 0;
+    if (overlap_stagein_assembly) {
+        kvmem_stagein_assembly_overlap_active_ = true;
+        std::future<void> stagein_future;
+        try {
+            stagein_future = std::async(
+                std::launch::async,
+                [this]() { kvmem_finish_prefetch(); });
+        } catch (...) {
+            kvmem_stagein_assembly_overlap_active_ = false;
+            throw;
+        }
+        std::exception_ptr assemble_error;
+        std::exception_ptr stagein_error;
+        try {
+            t_assemble0 = perf_trace ? kvmem_steady_ns() : 0;
+            kvmem_assemble(plan);
+            t_assemble_done = perf_trace ? kvmem_steady_ns() : 0;
+        } catch (...) {
+            assemble_error = std::current_exception();
+            t_assemble_done = perf_trace ? kvmem_steady_ns() : 0;
+        }
+        try {
+            stagein_future.get();
+        } catch (...) {
+            stagein_error = std::current_exception();
+        }
+        kvmem_stagein_assembly_overlap_active_ = false;
+        if (stagein_error) std::rethrow_exception(stagein_error);
+        if (assemble_error) std::rethrow_exception(assemble_error);
+    } else {
+        kvmem_finish_prefetch();
+        t_assemble0 = perf_trace ? kvmem_steady_ns() : 0;
+        kvmem_assemble(plan);
+        t_assemble_done = perf_trace ? kvmem_steady_ns() : 0;
+    }
     if (perf_trace) {
         static std::atomic<uint64_t> explicit_sequence{0};
         const uint64_t done = kvmem_steady_ns();
@@ -9345,6 +9598,7 @@ uint32_t QwenExecutor::kvmem_set_selection(
             "nvme_h2d_enqueue_ms=%.3f h2d_wait_ms=%.3f "
             "cpu_in_blocks=%u cpu_in_gib=%.3f "
             "nvme_in_blocks=%u nvme_in_gib=%.3f "
+            "stagein_assembly_overlap=%d overlap_wall_ms=%.3f "
             "assemble_ms=%.3f total_ms=%.3f\n",
             static_cast<unsigned long long>(
                 explicit_sequence.fetch_add(1, std::memory_order_relaxed)),
@@ -9381,7 +9635,11 @@ uint32_t QwenExecutor::kvmem_set_selection(
             in.h2d_wait_ns * ns_to_ms, in.cpu_blocks,
             in.cpu_bytes * bytes_to_gib, in.nvme_blocks,
             in.nvme_bytes * bytes_to_gib,
-            (done - t_assemble0) * ns_to_ms,
+            overlap_stagein_assembly ? 1 : 0,
+            overlap_stagein_assembly
+                ? (done - overlap_wall0) * ns_to_ms
+                : 0.0,
+            (t_assemble_done - t_assemble0) * ns_to_ms,
             (done - t_all0) * ns_to_ms);
     }
     return window_query_pos_;

@@ -591,6 +591,11 @@ private:
         bool logical_page_resident(uint32_t logical_page) const;
         int32_t ensure_logical_page_resident(DeviceBackend &backend,
                                              uint32_t logical_page);
+        // Allocate many incoming ranges and publish all page-table changes
+        // with one compact H2D upload.
+        void ensure_logical_page_ranges_resident(
+            DeviceBackend &backend,
+            const std::vector<std::pair<uint32_t, uint32_t>> &ranges);
         void release_logical_pages(DeviceBackend &backend,
                                    uint32_t logical_start,
                                    uint32_t count);
@@ -804,6 +809,13 @@ private:
     // implementation opaque here avoids exposing synchronization details in
     // the executor interface.
     std::unique_ptr<KvmemCpuWorkerPool> kvmem_cpu_worker_pool_;
+    // When CPU V stage-in overlaps immutable raw-K materialization, each side
+    // gets an independent queue. This avoids serializing on the primary pool's
+    // run mutex and lets sparse V gathering use more workers than block-major
+    // raw K when V is the measured critical branch.
+    std::unique_ptr<KvmemCpuWorkerPool> kvmem_stagein_worker_pool_;
+    bool kvmem_stagein_assembly_overlap_enabled_ = false;
+    bool kvmem_stagein_assembly_overlap_active_ = false;
     // CPU-only opt_2/3 may retain a clean spill record after CPU->GPU stage-in.
     // This turns a later eviction of the same block into metadata/page release
     // instead of another GPU->CPU copy. It is enabled only when the CPU budget,
