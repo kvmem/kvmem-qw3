@@ -16,6 +16,7 @@ NVME_GB=${NVME_GB:-0}
 KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
 KVMEM_BUDGET=${KVMEM_BUDGET:-229376}
 GEN_BUDGET=${GEN_BUDGET:-32768}
+KV_DTYPE=${KV_DTYPE:-fp16}
 TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_opt1_20260723}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
@@ -28,7 +29,12 @@ RUN_LOG=${RUN_LOG:-$LOG_ROOT/${TAG}_runner.log}
 PID_FILE=${PID_FILE:-$LOG_ROOT/${TAG}.pid}
 LIMIT=${LIMIT:-}
 EXPECTED=${EXPECTED:-${LIMIT:-100}}
-METHOD=${METHOD:-kvmem_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_fp16}
+METHOD=${METHOD:-kvmem_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_${KV_DTYPE}}
+
+if [[ "$KV_DTYPE" != "fp16" && "$KV_DTYPE" != "fp8" ]]; then
+  echo "KV_DTYPE must be fp16 or fp8, got: $KV_DTYPE" >&2
+  exit 2
+fi
 
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy=127.0.0.1,localhost
@@ -88,7 +94,7 @@ env \
   QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
   "$ROOT/build/qw3" serve \
     --model "$MODEL" \
-    --ctx "$CTX" --kv-dtype fp16 \
+    --ctx "$CTX" --kv-dtype "$KV_DTYPE" \
     --kvmem --kvmem-block-tokens 32 \
     --kvmem-budget "$KVMEM_BUDGET" --kvmem-gen-budget "$GEN_BUDGET" \
     --kvmem-sink-blocks 8 --kvmem-recent-blocks 0 \

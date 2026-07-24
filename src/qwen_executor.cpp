@@ -8952,7 +8952,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     // always keeps the sink + recent windows):
     //   Retrieval — global content similarity (can resurrect dropped blocks);
     //               falls back to the window-local heat fold when the
-    //               index/query isn't live (q8/fp8, or first selection).
+    //               index/query isn't live (q8, or first selection). FP8 has
+    //               a typed mean-index and scoring path.
     //   H2O       — window-local cumulative attention heat only.
     //   Recency   — no learned signal; pick_topk keeps sink + recent only.
     const char *scorer_requested = "none";
@@ -9782,9 +9783,8 @@ void QwenExecutor::kvmem_recompute_kbar() {
         *bs_blk_tokens_dev_, 0, bs_blk_tokens_host_.data(), bs_window_blocks_));
     require_status(backend_.zero_tensor(*bs_score_accum_));
 
-    // k̄ needs fp16/fp32 K; q8/fp8 caches can't be averaged meaningfully here,
-    // so selection silently stays recency-weighted (the kernel returns an error
-    // we tolerate).
+    // q8's row-scale representation is not supported by the mean builder.
+    // fp8 is supported directly (accumulation remains fp32), as are fp16/fp32.
     auto st = backend_.block_kmean_paged_device(
         attention_k_cache(static_cast<uint32_t>(bs_score_layer_)), *bs_kbar_,
         bs_window_blocks_, n_kv_heads, per_pos, head_dim,
@@ -10044,8 +10044,8 @@ void QwenExecutor::global_trace_attention_layer(uint32_t layer_index,
 // de-RoPE'ing by their original position would no longer match the stored phase.
 // The content mean is position-invariant, so building it once and keeping it is
 // correct for the whole session. Reads through the FULL repository page table.
-// q8/fp8 caches can't be de-RoPE'd → index stays unbuilt, retrieval falls back to
-// the window-local heat signal.
+    // q8 caches cannot be de-RoPE'd and therefore leave this index unbuilt.
+    // fp8 uses the typed de-RoPE/mean kernel and remains a full retrieval path.
 void QwenExecutor::kvmem_build_content_index() {
     g_content_ready_ = false;
     if (!block_store_) return;
