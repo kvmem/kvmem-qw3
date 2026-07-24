@@ -17,6 +17,8 @@
 
 namespace qw3 {
 
+class KvmemCpuWorkerPool;
+
 struct NativeExecutorReport {
     bool ok = false;
     uint64_t ops_executed = 0;
@@ -797,6 +799,11 @@ private:
     std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
     std::unique_ptr<HostBuffer> kvmem_cpu_bytes_;
+    // Optional per-executor persistent workers for the many small parallel
+    // gather/scatter jobs issued by long-context reselection. Keeping the
+    // implementation opaque here avoids exposing synchronization details in
+    // the executor interface.
+    std::unique_ptr<KvmemCpuWorkerPool> kvmem_cpu_worker_pool_;
     // CPU-only opt_2/3 may retain a clean spill record after CPU->GPU stage-in.
     // This turns a later eviction of the same block into metadata/page release
     // instead of another GPU->CPU copy. It is enabled only when the CPU budget,

@@ -5,9 +5,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -21,6 +23,129 @@
 #endif
 
 namespace qw3 {
+
+class KvmemCpuWorkerPool {
+public:
+    explicit KvmemCpuWorkerPool(size_t helper_count) {
+        threads_.reserve(helper_count);
+        for (size_t index = 0; index < helper_count; ++index) {
+            threads_.emplace_back([this, index]() { worker_loop(index); });
+        }
+    }
+
+    ~KvmemCpuWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+            ++generation_;
+        }
+        work_cv_.notify_all();
+        for (std::thread &thread : threads_) {
+            if (thread.joinable()) thread.join();
+        }
+    }
+
+    KvmemCpuWorkerPool(const KvmemCpuWorkerPool &) = delete;
+    KvmemCpuWorkerPool &operator=(const KvmemCpuWorkerPool &) = delete;
+
+    size_t max_workers() const { return threads_.size() + 1; }
+
+    void run(size_t task_count, size_t requested_workers,
+             const std::function<void(size_t)> &task) {
+        if (task_count == 0) return;
+        const size_t workers = std::min(
+            {requested_workers, task_count, max_workers()});
+        if (workers <= 1) {
+            for (size_t i = 0; i < task_count; ++i) task(i);
+            return;
+        }
+
+        // Executor calls are presently serialized, but retain an explicit run
+        // mutex so future prefetch/assembly overlap cannot publish two jobs
+        // into the same pool concurrently.
+        std::lock_guard<std::mutex> run_lock(run_mu_);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            task_ = task;
+            task_count_ = task_count;
+            next_task_.store(0, std::memory_order_relaxed);
+            active_helpers_ = workers - 1;
+            completed_helpers_ = 0;
+            error_ = nullptr;
+            ++generation_;
+        }
+        work_cv_.notify_all();
+        consume_tasks();
+
+        std::exception_ptr error;
+        {
+            std::unique_lock<std::mutex> lock(mu_);
+            done_cv_.wait(lock, [&]() {
+                return completed_helpers_ == active_helpers_;
+            });
+            error = error_;
+            task_ = {};
+        }
+        if (error) std::rethrow_exception(error);
+    }
+
+private:
+    void record_error(std::exception_ptr error) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!error_) error_ = std::move(error);
+        next_task_.store(task_count_, std::memory_order_relaxed);
+    }
+
+    void consume_tasks() {
+        try {
+            for (;;) {
+                const size_t index =
+                    next_task_.fetch_add(1, std::memory_order_relaxed);
+                if (index >= task_count_) break;
+                task_(index);
+            }
+        } catch (...) {
+            record_error(std::current_exception());
+        }
+    }
+
+    void worker_loop(size_t helper_index) {
+        uint64_t observed_generation = 0;
+        std::unique_lock<std::mutex> lock(mu_);
+        for (;;) {
+            work_cv_.wait(lock, [&]() {
+                return stop_ || generation_ != observed_generation;
+            });
+            if (stop_) return;
+            observed_generation = generation_;
+            const bool active = helper_index < active_helpers_;
+            lock.unlock();
+            if (active) consume_tasks();
+            lock.lock();
+            if (active) {
+                ++completed_helpers_;
+                if (completed_helpers_ == active_helpers_) {
+                    done_cv_.notify_one();
+                }
+            }
+        }
+    }
+
+    std::mutex run_mu_;
+    std::mutex mu_;
+    std::condition_variable work_cv_;
+    std::condition_variable done_cv_;
+    std::vector<std::thread> threads_;
+    std::function<void(size_t)> task_;
+    std::atomic<size_t> next_task_{0};
+    size_t task_count_ = 0;
+    size_t active_helpers_ = 0;
+    size_t completed_helpers_ = 0;
+    uint64_t generation_ = 0;
+    bool stop_ = false;
+    std::exception_ptr error_;
+};
+
 namespace {
 
 void require_status(const DeviceStatus &st) {
@@ -2058,6 +2183,12 @@ void QwenExecutor::kvmem_materialize_raw_k(
             for (uint32_t item = 0; item < work_items; ++item) {
                 gather_item(item);
             }
+        } else if (kvmem_cpu_worker_pool_) {
+            kvmem_cpu_worker_pool_->run(
+                work_items, gather_workers,
+                [&](size_t item) {
+                    gather_item(static_cast<uint32_t>(item));
+                });
         } else {
             std::atomic<uint32_t> next_item{0};
             std::exception_ptr gather_error;
@@ -2364,6 +2495,12 @@ void QwenExecutor::kvmem_materialize_raw_mtp_k(
             : 1u;
         if (gather_workers <= 1u) {
             for (uint32_t j = 0; j < n; ++j) gather_block(j);
+        } else if (kvmem_cpu_worker_pool_) {
+            kvmem_cpu_worker_pool_->run(
+                n, gather_workers,
+                [&](size_t j) {
+                    gather_block(static_cast<uint32_t>(j));
+                });
         } else {
             std::atomic<uint32_t> next_block{0};
             std::exception_ptr gather_error;
@@ -5475,6 +5612,17 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     const bool pipelined_h2d =
         effective.optimization_level >= KvMemOptimizationLevel::Opt3;
     const bool coalesced_ssd_read = pipelined_h2d && has_ssd;
+    kvmem_cpu_worker_pool_.reset();
+    const size_t max_cpu_workers = std::max(
+        kvmem_cpu_gather_threads(), kvmem_cpu_stageout_threads());
+    const bool persistent_cpu_pool =
+        (async_d2h || pipelined_h2d) &&
+        max_cpu_workers > 1 &&
+        env_flag_enabled("QW3_KVMEM_PERSISTENT_CPU_POOL", true);
+    if (persistent_cpu_pool) {
+        kvmem_cpu_worker_pool_ =
+            std::make_unique<KvmemCpuWorkerPool>(max_cpu_workers - 1);
+    }
     kvmem_prefill_writeback_enabled_ =
         async_ssd_write &&
         kvmem_immutable_source_k_ &&
@@ -5488,6 +5636,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         "prefill_writeback=%d "
         "io_slab_mib=%zu write_qd=%zu read_qd=2 "
         "cpu_gather_threads=%zu cpu_stageout_threads=%zu "
+        "persistent_cpu_pool=%d persistent_cpu_workers=%zu "
         "implemented_max=opt_3\n",
         kvmem_optimization_level_name(effective.optimization_level),
         effective.optimization_level >= KvMemOptimizationLevel::Opt1
@@ -5501,7 +5650,11 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             kvmem_io_slab_bytes() / (1024ull * 1024ull)),
         kvmem_write_queue_depth(),
         kvmem_cpu_gather_threads(),
-        kvmem_cpu_stageout_threads());
+        kvmem_cpu_stageout_threads(),
+        persistent_cpu_pool ? 1 : 0,
+        kvmem_cpu_worker_pool_
+            ? kvmem_cpu_worker_pool_->max_workers()
+            : 0);
     if (kvmem_prefill_writeback_enabled_) {
         const uint64_t warm0 = kvmem_steady_ns();
         const size_t slab_bytes = kvmem_io_slab_bytes();
@@ -6283,6 +6436,16 @@ void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
         };
         if (worker_count <= 1) {
             gather_range(begin, end);
+        } else if (kvmem_cpu_worker_pool_) {
+            kvmem_cpu_worker_pool_->run(
+                worker_count, worker_count,
+                [&](size_t worker) {
+                    const size_t first =
+                        begin + read_count * worker / worker_count;
+                    const size_t last =
+                        begin + read_count * (worker + 1) / worker_count;
+                    gather_range(first, last);
+                });
         } else {
             std::vector<std::thread> workers;
             workers.reserve(worker_count);
@@ -7548,6 +7711,9 @@ void QwenExecutor::kvmem_stage_out_cpu_batched(
             for (size_t i = 0; i < batch.tasks.size(); ++i) {
                 scatter_task(i);
             }
+        } else if (kvmem_cpu_worker_pool_) {
+            kvmem_cpu_worker_pool_->run(
+                batch.tasks.size(), scatter_workers, scatter_task);
         } else {
             std::atomic<size_t> next_task{0};
             auto worker = [&]() {
