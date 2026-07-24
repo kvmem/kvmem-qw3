@@ -7,6 +7,7 @@
 #include "qw3/nvme_kv_tier.hpp"
 #include "qw3/pinned_kv_tier.hpp"
 
+#include <array>
 #include <cstdio>
 #include <deque>
 #include <future>
@@ -827,6 +828,28 @@ private:
     std::unique_ptr<HostBuffer> kvmem_raw_transfer_host_;
     uint32_t kvmem_raw_transfer_blocks_ = 0;
     uint32_t kvmem_raw_transfer_block_cap_ = 128;
+    struct RawMaterializeSlot {
+        std::unique_ptr<DeviceTensor> device;
+        std::unique_ptr<HostBuffer> host;
+        std::unique_ptr<DeviceTransferFence> h2d_done;
+        std::unique_ptr<DeviceTransferFence> compute_done;
+        uint64_t device_elements = 0;
+        uint64_t host_bytes = 0;
+    };
+    std::array<RawMaterializeSlot, 2> kvmem_raw_pipeline_slots_;
+    bool kvmem_raw_pipeline_enabled_ = false;
+    uint64_t kvmem_assembly_raw_gather_ns_ = 0;
+    uint64_t kvmem_assembly_raw_h2d_submit_ns_ = 0;
+    uint64_t kvmem_assembly_raw_h2d_wait_ns_ = 0;
+    uint64_t kvmem_assembly_raw_bytes_ = 0;
+    uint32_t kvmem_assembly_raw_batches_ = 0;
+    // Assembly optimization: a persistent FP32 [position, RoPE pair, sin/cos]
+    // table preserves the legacy de-rotate/re-rotate arithmetic while sharing
+    // transcendental results across KV heads and attention layers.
+    bool kvmem_rope_table_enabled_ = false;
+    bool kvmem_rope_table_explicit_ = false;
+    uint32_t kvmem_rope_table_positions_ = 0;
+    std::unique_ptr<DeviceTensor> kvmem_rope_sincos_;
     int64_t kvmem_raw_decode_block_start_ = -1;
     uint32_t kvmem_raw_decode_first_row_ = 0;
     uint32_t kvmem_raw_decode_rows_ = 0;
@@ -1124,6 +1147,7 @@ private:
     void kvmem_flush_raw_k_decode();
     void kvmem_materialize_raw_k(
         const std::vector<const KvMemRemap *> &refreshes);
+    void kvmem_ensure_rope_sincos_table();
     void kvmem_ensure_raw_mtp_capture_capacity(uint32_t rows);
     void kvmem_capture_raw_mtp_k(const DeviceTensor &raw_k,
                                  uint32_t logical_base,

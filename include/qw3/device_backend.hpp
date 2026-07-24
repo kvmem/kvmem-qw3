@@ -779,13 +779,27 @@ public:
             uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
             uint32_t rope_dim, const DeviceTensor &to_base,
             const DeviceTensor &from_base, const DeviceTensor &n_tokens,
-            const DeviceTensor &page_indices, uint32_t page_size, float theta) {
+            const DeviceTensor &page_indices, uint32_t page_size, float theta,
+            const DeviceTensor *rope_sincos = nullptr,
+            uint32_t rope_table_positions = 0) {
         (void)k_cache; (void)n_blocks; (void)max_n_tokens; (void)n_kv_heads;
         (void)per_pos_size; (void)head_dim; (void)rope_dim; (void)to_base;
         (void)from_base; (void)n_tokens; (void)page_indices; (void)page_size;
-        (void)theta;
+        (void)theta; (void)rope_sincos; (void)rope_table_positions;
         return {false,
                 "rope_block_remap_paged_batched_device requires backend override"};
+    }
+
+    // Build a persistent FP32 table laid out as
+    // [position, rope_dim / 2, {sin, cos}].  KVMem assembly reuses it across
+    // every KV head and standard-attention layer, eliminating billions of
+    // duplicate powf/sincosf calls while retaining the legacy rotation math.
+    virtual DeviceStatus build_rope_sincos_table_device(
+            DeviceTensor &table, uint32_t positions, uint32_t rope_dim,
+            float theta) {
+        (void)table; (void)positions; (void)rope_dim; (void)theta;
+        return {false,
+                "build_rope_sincos_table_device requires backend override"};
     }
 
     // Materialize packed, unrotated raw K into arbitrary paged window slots and
@@ -798,11 +812,14 @@ public:
             uint32_t max_n_tokens, uint32_t n_kv_heads,
             uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
             const DeviceTensor &to_base, const DeviceTensor &n_tokens,
-            const DeviceTensor &page_indices, uint32_t page_size, float theta) {
+            const DeviceTensor &page_indices, uint32_t page_size, float theta,
+            const DeviceTensor *rope_sincos = nullptr,
+            uint32_t rope_table_positions = 0) {
         (void)k_cache; (void)raw_k; (void)raw_element_offset; (void)n_blocks;
         (void)max_n_tokens; (void)n_kv_heads; (void)per_pos_size;
         (void)head_dim; (void)rope_dim; (void)to_base; (void)n_tokens;
         (void)page_indices; (void)page_size; (void)theta;
+        (void)rope_sincos; (void)rope_table_positions;
         return {false,
                 "raw_k_scatter_rope_paged_batched_device requires backend override"};
     }
@@ -1548,6 +1565,25 @@ public:
             std::unique_ptr<DeviceTransferFence> &fence) {
         fence.reset();
         return wait_kv_transfer();
+    }
+    // Cross-stream ordering used by raw-K materialization. The CUDA backend
+    // records an event on exec_stream after scatter/RoPE and lets the copy
+    // stream wait before reusing that staging slot. Conversely, exec_stream
+    // waits on the H2D event without synchronizing the host.
+    virtual DeviceStatus record_execution_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) {
+        fence.reset();
+        return synchronize();
+    }
+    virtual DeviceStatus execution_wait_for_kv_transfer(
+            const std::unique_ptr<DeviceTransferFence> &fence) {
+        (void)fence;
+        return {};
+    }
+    virtual DeviceStatus kv_transfer_wait_for_execution(
+            std::unique_ptr<DeviceTransferFence> &fence) {
+        fence.reset();
+        return {};
     }
     virtual DeviceStatus wait_kv_transfer_fence(
             std::unique_ptr<DeviceTransferFence> &fence) {

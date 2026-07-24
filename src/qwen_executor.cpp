@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -1763,6 +1764,45 @@ void QwenExecutor::kvmem_flush_raw_k_decode() {
     kvmem_raw_decode_rows_ = 0;
 }
 
+void QwenExecutor::kvmem_ensure_rope_sincos_table() {
+    if (!kvmem_rope_table_enabled_ || kvmem_rope_sincos_) return;
+    const QwenConfig &cfg = model_.config();
+    if (kvmem_rope_table_positions_ == 0 || cfg.rope_dim == 0 ||
+        (cfg.rope_dim % 2u) != 0) {
+        throw std::runtime_error("KVMem RoPE table has an invalid shape");
+    }
+    const uint64_t floats =
+        static_cast<uint64_t>(kvmem_rope_table_positions_) *
+        (cfg.rope_dim / 2u) * 2u;
+    auto table =
+        backend_.scratch_f32(floats, "kvmem_rope_sincos_table");
+    const DeviceStatus st = backend_.build_rope_sincos_table_device(
+        *table, kvmem_rope_table_positions_, cfg.rope_dim, cfg.rope_theta);
+    if (!st.ok) {
+        if (kvmem_rope_table_explicit_) {
+            throw std::runtime_error(
+                std::string("explicit KVMem table assembly failed: ") +
+                st.message);
+        }
+        kvmem_rope_table_enabled_ = false;
+        kvmem_rope_table_positions_ = 0;
+        std::fprintf(
+            stderr,
+            "[kvmem-assembly] mode=legacy table_fallback_reason=%s\n",
+            st.message);
+        return;
+    }
+    kvmem_rope_sincos_ = std::move(table);
+    std::fprintf(
+        stderr,
+        "[kvmem-assembly] mode=%s positions=%u rope_pairs=%u "
+        "table_bytes=%llu raw_transfer_buffers=%u\n",
+        kvmem_raw_pipeline_enabled_ ? "pipeline" : "table",
+        kvmem_rope_table_positions_, cfg.rope_dim / 2u,
+        static_cast<unsigned long long>(floats * sizeof(float)),
+        kvmem_raw_pipeline_enabled_ ? 2u : 1u);
+}
+
 void QwenExecutor::kvmem_materialize_raw_k(
         const std::vector<const KvMemRemap *> &refreshes) {
     if (refreshes.empty()) return;
@@ -1780,41 +1820,90 @@ void QwenExecutor::kvmem_materialize_raw_k(
         1, kvmem_raw_transfer_block_cap_);
 
     for (uint32_t begin = 0; begin < refreshes.size(); begin += cap) {
+        RawMaterializeSlot *pipeline_slot = nullptr;
+        if (kvmem_raw_pipeline_enabled_) {
+            pipeline_slot =
+                &kvmem_raw_pipeline_slots_[(begin / cap) % 2u];
+            const uint64_t wait0 = kvmem_steady_ns();
+            require_status(backend_.wait_kv_transfer_fence(
+                pipeline_slot->h2d_done));
+            kvmem_assembly_raw_h2d_wait_ns_ +=
+                kvmem_steady_ns() - wait0;
+            require_status(backend_.kv_transfer_wait_for_execution(
+                pipeline_slot->compute_done));
+        }
         const uint32_t n = std::min<uint32_t>(
             cap, static_cast<uint32_t>(refreshes.size()) - begin);
         const uint64_t total_elems =
             static_cast<uint64_t>(kvmem_raw_layers_.size()) * n * block_elems;
         const uint64_t total_bytes =
             static_cast<uint64_t>(kvmem_raw_layers_.size()) * n * block_bytes;
-        if (!kvmem_raw_transfer_dev_ ||
-            kvmem_raw_transfer_dev_->count < total_elems) {
-            kvmem_raw_transfer_dev_ =
-                kvmem_alloc_raw_k_tensor(total_elems,
-                                         "kvmem_raw_k_transfer_device");
-            kvmem_raw_transfer_host_ =
-                backend_.host_buffer(total_bytes,
-                                     "kvmem_raw_k_transfer_host");
-            kvmem_raw_transfer_blocks_ = n;
+        DeviceTensor *transfer_dev = nullptr;
+        HostBuffer *transfer_host = nullptr;
+        if (pipeline_slot) {
+            const uint64_t capacity_elems =
+                static_cast<uint64_t>(kvmem_raw_layers_.size()) *
+                cap * block_elems;
+            const uint64_t capacity_bytes =
+                static_cast<uint64_t>(kvmem_raw_layers_.size()) *
+                cap * block_bytes;
+            if (!pipeline_slot->device) {
+                pipeline_slot->device = kvmem_alloc_raw_k_tensor(
+                    capacity_elems, "kvmem_raw_k_pipeline_device");
+                pipeline_slot->host = backend_.host_buffer(
+                    capacity_bytes, "kvmem_raw_k_pipeline_host");
+                pipeline_slot->device_elements = capacity_elems;
+                pipeline_slot->host_bytes = capacity_bytes;
+                // Typed tensor construction zero-initializes on exec_stream.
+                // Order the first copy-stream overwrite after that init.
+                require_status(backend_.record_execution_fence(
+                    pipeline_slot->compute_done));
+                require_status(backend_.kv_transfer_wait_for_execution(
+                    pipeline_slot->compute_done));
+            }
+            transfer_dev = pipeline_slot->device.get();
+            transfer_host = pipeline_slot->host.get();
+        } else {
+            if (!kvmem_raw_transfer_dev_ ||
+                kvmem_raw_transfer_dev_->count < total_elems) {
+                kvmem_raw_transfer_dev_ =
+                    kvmem_alloc_raw_k_tensor(
+                        total_elems, "kvmem_raw_k_transfer_device");
+                kvmem_raw_transfer_host_ =
+                    backend_.host_buffer(
+                        total_bytes, "kvmem_raw_k_transfer_host");
+                kvmem_raw_transfer_blocks_ = n;
+            }
+            transfer_dev = kvmem_raw_transfer_dev_.get();
+            transfer_host = kvmem_raw_transfer_host_.get();
         }
         uint8_t *packed =
-            static_cast<uint8_t *>(kvmem_raw_transfer_host_->data);
+            static_cast<uint8_t *>(transfer_host->data);
+        const uint64_t gather0 = kvmem_steady_ns();
         bs_remap_to_host_.clear();
         bs_remap_ntok_host_.clear();
         uint32_t max_tokens = 0;
-        for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
+        // Validity is block-global, not layer-specific. The legacy loop
+        // repeated this check for every standard-attention layer.
+        for (uint32_t j = 0; j < n; ++j) {
+            const KvMemRemap &rm = *refreshes[begin + j];
+            const KvMemBlock &block =
+                block_store_->blocks()[rm.block_id];
+            for (uint32_t t = 0; t < rm.n_tokens; ++t) {
+                const uint32_t pos = block.orig_pos_start + t;
+                if (pos >= kvmem_raw_k_valid_tokens_.size() ||
+                    !kvmem_raw_k_valid_tokens_[pos]) {
+                    throw std::runtime_error(
+                        "immutable raw-K block contains uncaptured token " +
+                        std::to_string(pos));
+                }
+            }
+        }
+        auto gather_layer = [&](uint32_t slot) {
             for (uint32_t j = 0; j < n; ++j) {
                 const KvMemRemap &rm = *refreshes[begin + j];
                 const KvMemBlock &block =
                     block_store_->blocks()[rm.block_id];
-                for (uint32_t t = 0; t < rm.n_tokens; ++t) {
-                    const uint32_t pos = block.orig_pos_start + t;
-                    if (pos >= kvmem_raw_k_valid_tokens_.size() ||
-                        !kvmem_raw_k_valid_tokens_[pos]) {
-                        throw std::runtime_error(
-                            "immutable raw-K block contains uncaptured token " +
-                            std::to_string(pos));
-                    }
-                }
                 uint8_t *dst = packed +
                     (static_cast<uint64_t>(slot) * n + j) * block_bytes;
                 const uint64_t valid_bytes =
@@ -1828,7 +1917,48 @@ void QwenExecutor::kvmem_materialize_raw_k(
                                 static_cast<size_t>(block_bytes - valid_bytes));
                 }
             }
+        };
+        const uint32_t gather_workers = kvmem_raw_pipeline_enabled_
+            ? std::min<uint32_t>(
+                  kvmem_cpu_gather_threads(),
+                  static_cast<uint32_t>(kvmem_raw_layers_.size()))
+            : 1u;
+        if (gather_workers <= 1u) {
+            for (uint32_t slot = 0;
+                 slot < kvmem_raw_layers_.size(); ++slot) {
+                gather_layer(slot);
+            }
+        } else {
+            std::atomic<uint32_t> next_layer{0};
+            std::exception_ptr gather_error;
+            std::mutex gather_error_mu;
+            auto worker = [&]() {
+                try {
+                    for (;;) {
+                        const uint32_t slot =
+                            next_layer.fetch_add(
+                                1, std::memory_order_relaxed);
+                        if (slot >= kvmem_raw_layers_.size()) break;
+                        gather_layer(slot);
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(gather_error_mu);
+                    if (!gather_error) {
+                        gather_error = std::current_exception();
+                    }
+                }
+            };
+            std::vector<std::thread> threads;
+            threads.reserve(gather_workers - 1u);
+            for (uint32_t i = 1; i < gather_workers; ++i) {
+                threads.emplace_back(worker);
+            }
+            worker();
+            for (auto &thread : threads) thread.join();
+            if (gather_error) std::rethrow_exception(gather_error);
         }
+        kvmem_assembly_raw_gather_ns_ +=
+            kvmem_steady_ns() - gather0;
         for (uint32_t j = 0; j < n; ++j) {
             const KvMemRemap &rm = *refreshes[begin + j];
             bs_remap_to_host_.push_back(rm.to_base);
@@ -1849,8 +1979,23 @@ void QwenExecutor::kvmem_materialize_raw_k(
             *bs_remap_to_dev_, 0, bs_remap_to_host_.data(), n));
         require_status(backend_.copy_i32_from_host(
             *bs_remap_ntok_dev_, 0, bs_remap_ntok_host_.data(), n));
-        require_status(backend_.copy_bytes_from_host(
-            *kvmem_raw_transfer_dev_, 0, packed, total_bytes));
+        const uint64_t h2d0 = kvmem_steady_ns();
+        if (pipeline_slot) {
+            require_status(backend_.begin_kv_transfer_to_device());
+            require_status(backend_.copy_bytes_from_host_async(
+                *transfer_dev, 0, packed, total_bytes));
+            require_status(backend_.record_kv_transfer_fence(
+                pipeline_slot->h2d_done));
+            require_status(backend_.execution_wait_for_kv_transfer(
+                pipeline_slot->h2d_done));
+        } else {
+            require_status(backend_.copy_bytes_from_host(
+                *transfer_dev, 0, packed, total_bytes));
+        }
+        kvmem_assembly_raw_h2d_submit_ns_ +=
+            kvmem_steady_ns() - h2d0;
+        kvmem_assembly_raw_bytes_ += total_bytes;
+        ++kvmem_assembly_raw_batches_;
         if (std::getenv("QW3_KVMEM_TRACE") ||
             kvmem_tier_trace_enabled()) {
             std::fprintf(
@@ -1864,13 +2009,19 @@ void QwenExecutor::kvmem_materialize_raw_k(
             require_status(
                 backend_.raw_k_scatter_rope_paged_batched_device(
                     k_cache(kvmem_raw_layers_[slot]),
-                    *kvmem_raw_transfer_dev_,
+                    *transfer_dev,
                     static_cast<uint64_t>(slot) * n * block_elems,
                     n, bt, cfg.n_kv_heads,
                     static_cast<uint32_t>(per_pos), cfg.head_dim,
                     cfg.rope_dim, *bs_remap_to_dev_,
                     *bs_remap_ntok_dev_, *window_pages_device_,
-                    kv_pages_.page_size, cfg.rope_theta));
+                    kv_pages_.page_size, cfg.rope_theta,
+                    kvmem_rope_sincos_.get(),
+                    kvmem_rope_table_positions_));
+        }
+        if (pipeline_slot) {
+            require_status(backend_.record_execution_fence(
+                pipeline_slot->compute_done));
         }
     }
 }
@@ -1946,25 +2097,85 @@ void QwenExecutor::kvmem_materialize_raw_mtp_k(
     const uint64_t block_elems = static_cast<uint64_t>(bt) * per_pos;
     const uint64_t block_bytes =
         static_cast<uint64_t>(bt) * kvmem_raw_k_row_bytes_;
-    const uint32_t cap = std::max<uint32_t>(
+    const uint32_t base_cap = std::max<uint32_t>(
         1, kvmem_raw_transfer_block_cap_);
+    // Reuse the main pipeline's byte-sized slots. One MTP block carries only
+    // one layer, so the same ~128 MiB slot can hold standard_layer_count times
+    // as many blocks and avoids 50 tiny synchronized H2D batches.
+    const uint32_t cap = kvmem_raw_pipeline_enabled_
+        ? base_cap * std::max<uint32_t>(
+              1, static_cast<uint32_t>(kvmem_raw_layers_.size()))
+        : base_cap;
     const auto &blocks = block_store_->blocks();
 
     for (uint32_t begin = 0; begin < plan.remaps.size(); begin += cap) {
+        RawMaterializeSlot *pipeline_slot = nullptr;
+        if (kvmem_raw_pipeline_enabled_) {
+            pipeline_slot =
+                &kvmem_raw_pipeline_slots_[(begin / cap) % 2u];
+            const uint64_t wait0 = kvmem_steady_ns();
+            require_status(backend_.wait_kv_transfer_fence(
+                pipeline_slot->h2d_done));
+            kvmem_assembly_raw_h2d_wait_ns_ +=
+                kvmem_steady_ns() - wait0;
+            require_status(backend_.kv_transfer_wait_for_execution(
+                pipeline_slot->compute_done));
+        }
         const uint32_t n = std::min<uint32_t>(
             cap, static_cast<uint32_t>(plan.remaps.size()) - begin);
         const uint64_t elems = static_cast<uint64_t>(n) * block_elems;
         const uint64_t bytes = static_cast<uint64_t>(n) * block_bytes;
-        if (!kvmem_raw_mtp_transfer_dev_ ||
-            kvmem_raw_mtp_transfer_dev_->count < elems) {
-            kvmem_raw_mtp_transfer_dev_ = kvmem_alloc_raw_k_tensor(
-                elems, "kvmem_raw_mtp_k_transfer_device");
-            kvmem_raw_mtp_transfer_host_ = backend_.host_buffer(
-                bytes, "kvmem_raw_mtp_k_transfer_host");
+        DeviceTensor *transfer_dev = nullptr;
+        HostBuffer *transfer_host = nullptr;
+        if (pipeline_slot) {
+            const uint64_t capacity_elems =
+                static_cast<uint64_t>(
+                    std::max<uint32_t>(
+                        1, static_cast<uint32_t>(
+                               kvmem_raw_layers_.size()))) *
+                base_cap * block_elems;
+            const uint64_t capacity_bytes =
+                static_cast<uint64_t>(
+                    std::max<uint32_t>(
+                        1, static_cast<uint32_t>(
+                               kvmem_raw_layers_.size()))) *
+                base_cap * block_bytes;
+            if (!pipeline_slot->device) {
+                pipeline_slot->device = kvmem_alloc_raw_k_tensor(
+                    capacity_elems, "kvmem_raw_k_pipeline_device");
+                pipeline_slot->host = backend_.host_buffer(
+                    capacity_bytes, "kvmem_raw_k_pipeline_host");
+                pipeline_slot->device_elements = capacity_elems;
+                pipeline_slot->host_bytes = capacity_bytes;
+                require_status(backend_.record_execution_fence(
+                    pipeline_slot->compute_done));
+                require_status(backend_.kv_transfer_wait_for_execution(
+                    pipeline_slot->compute_done));
+            }
+            if (pipeline_slot->device->count < elems ||
+                !pipeline_slot->host ||
+                pipeline_slot->host->bytes < bytes) {
+                throw std::runtime_error(
+                    "KVMem raw MTP pipeline slot is smaller than its "
+                    "main-layer byte capacity");
+            }
+            transfer_dev = pipeline_slot->device.get();
+            transfer_host = pipeline_slot->host.get();
+        } else {
+            if (!kvmem_raw_mtp_transfer_dev_ ||
+                kvmem_raw_mtp_transfer_dev_->count < elems) {
+                kvmem_raw_mtp_transfer_dev_ = kvmem_alloc_raw_k_tensor(
+                    elems, "kvmem_raw_mtp_k_transfer_device");
+                kvmem_raw_mtp_transfer_host_ = backend_.host_buffer(
+                    bytes, "kvmem_raw_mtp_k_transfer_host");
+            }
+            transfer_dev = kvmem_raw_mtp_transfer_dev_.get();
+            transfer_host = kvmem_raw_mtp_transfer_host_.get();
         }
 
         uint8_t *packed = static_cast<uint8_t *>(
-            kvmem_raw_mtp_transfer_host_->data);
+            transfer_host->data);
+        const uint64_t gather0 = kvmem_steady_ns();
         bs_mtp_remap_to_host_.clear();
         bs_mtp_remap_ntok_host_.clear();
         uint32_t max_tokens = 0;
@@ -1987,6 +2198,14 @@ void QwenExecutor::kvmem_materialize_raw_mtp_k(
                         std::to_string(pos));
                 }
             }
+            bs_mtp_remap_to_host_.push_back(rm.to_base);
+            bs_mtp_remap_ntok_host_.push_back(
+                static_cast<int32_t>(rm.n_tokens));
+            max_tokens = std::max(max_tokens, rm.n_tokens);
+        }
+        auto gather_block = [&](uint32_t j) {
+            const KvMemRemap &rm = plan.remaps[begin + j];
+            const KvMemBlock &block = blocks[rm.block_id];
             uint8_t *dst =
                 packed + static_cast<uint64_t>(j) * block_bytes;
             const uint64_t valid_bytes =
@@ -1999,11 +2218,42 @@ void QwenExecutor::kvmem_materialize_raw_mtp_k(
                 std::memset(dst + valid_bytes, 0,
                             static_cast<size_t>(block_bytes - valid_bytes));
             }
-            bs_mtp_remap_to_host_.push_back(rm.to_base);
-            bs_mtp_remap_ntok_host_.push_back(
-                static_cast<int32_t>(rm.n_tokens));
-            max_tokens = std::max(max_tokens, rm.n_tokens);
+        };
+        const uint32_t gather_workers = kvmem_raw_pipeline_enabled_
+            ? std::min<uint32_t>(kvmem_cpu_gather_threads(), n)
+            : 1u;
+        if (gather_workers <= 1u) {
+            for (uint32_t j = 0; j < n; ++j) gather_block(j);
+        } else {
+            std::atomic<uint32_t> next_block{0};
+            std::exception_ptr gather_error;
+            std::mutex gather_error_mu;
+            auto worker = [&]() {
+                try {
+                    for (;;) {
+                        const uint32_t j = next_block.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (j >= n) break;
+                        gather_block(j);
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(gather_error_mu);
+                    if (!gather_error) {
+                        gather_error = std::current_exception();
+                    }
+                }
+            };
+            std::vector<std::thread> threads;
+            threads.reserve(gather_workers - 1u);
+            for (uint32_t i = 1; i < gather_workers; ++i) {
+                threads.emplace_back(worker);
+            }
+            worker();
+            for (auto &thread : threads) thread.join();
+            if (gather_error) std::rethrow_exception(gather_error);
         }
+        kvmem_assembly_raw_gather_ns_ +=
+            kvmem_steady_ns() - gather0;
         if (n > bs_mtp_remap_capacity_) {
             bs_mtp_remap_capacity_ = n;
             bs_mtp_remap_to_dev_ = backend_.tensor_i32(
@@ -2019,17 +2269,38 @@ void QwenExecutor::kvmem_materialize_raw_mtp_k(
         require_status(backend_.copy_i32_from_host(
             *bs_mtp_remap_ntok_dev_, 0,
             bs_mtp_remap_ntok_host_.data(), n));
-        require_status(backend_.copy_bytes_from_host(
-            *kvmem_raw_mtp_transfer_dev_, 0, packed, bytes));
+        const uint64_t h2d0 = kvmem_steady_ns();
+        if (pipeline_slot) {
+            require_status(backend_.begin_kv_transfer_to_device());
+            require_status(backend_.copy_bytes_from_host_async(
+                *transfer_dev, 0, packed, bytes));
+            require_status(backend_.record_kv_transfer_fence(
+                pipeline_slot->h2d_done));
+            require_status(backend_.execution_wait_for_kv_transfer(
+                pipeline_slot->h2d_done));
+        } else {
+            require_status(backend_.copy_bytes_from_host(
+                *transfer_dev, 0, packed, bytes));
+        }
+        kvmem_assembly_raw_h2d_submit_ns_ +=
+            kvmem_steady_ns() - h2d0;
+        kvmem_assembly_raw_bytes_ += bytes;
+        ++kvmem_assembly_raw_batches_;
         require_status(
             backend_.raw_k_scatter_rope_paged_batched_device(
-                mtp_k_cache(), *kvmem_raw_mtp_transfer_dev_,
+                mtp_k_cache(), *transfer_dev,
                 /*src_elem_offset=*/0, n, bt, cfg.n_kv_heads,
                 static_cast<uint32_t>(per_pos), cfg.head_dim,
                 cfg.rope_dim, *bs_mtp_remap_to_dev_,
                 *bs_mtp_remap_ntok_dev_,
                 *mtp_window_pages_device_,
-                mtp_kv_pages_.page_size, cfg.rope_theta));
+                mtp_kv_pages_.page_size, cfg.rope_theta,
+                kvmem_rope_sincos_.get(),
+                kvmem_rope_table_positions_));
+        if (pipeline_slot) {
+            require_status(backend_.record_execution_fence(
+                pipeline_slot->compute_done));
+        }
         if (std::getenv("QW3_KVMEM_TRACE") ||
             kvmem_tier_trace_enabled()) {
             std::fprintf(
@@ -4406,6 +4677,43 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_immutable_source_k_ = env_flag_enabled(
         "QW3_KVMEM_IMMUTABLE_SOURCE_K", effective.immutable_source_k);
     effective.immutable_source_k = kvmem_immutable_source_k_;
+    kvmem_rope_sincos_.reset();
+    kvmem_rope_table_positions_ = 0;
+    kvmem_rope_table_explicit_ = false;
+    kvmem_raw_pipeline_enabled_ = false;
+    for (auto &slot : kvmem_raw_pipeline_slots_) {
+        slot = RawMaterializeSlot{};
+    }
+    kvmem_rope_table_enabled_ =
+        kvmem_immutable_source_k_ &&
+        std::strcmp(backend_.name(), "cuda-device") == 0;
+    // Opt3 is the end-to-end transfer pipeline profile.  Once immutable raw K
+    // is available, make the corresponding two-slot gather/H2D/scatter
+    // assembly pipeline part of that profile as well.  Lower profiles keep
+    // the bitwise-equivalent table path without the extra staging slot.
+    kvmem_raw_pipeline_enabled_ =
+        kvmem_rope_table_enabled_ &&
+        effective.optimization_level >= KvMemOptimizationLevel::Opt3;
+    if (const char *mode = std::getenv("QW3_KVMEM_ASSEMBLY_MODE")) {
+        kvmem_rope_table_explicit_ = true;
+        if (std::strcmp(mode, "legacy") == 0) {
+            kvmem_rope_table_enabled_ = false;
+            kvmem_raw_pipeline_enabled_ = false;
+        } else if (std::strcmp(mode, "table") == 0 ||
+                   std::strcmp(mode, "pipeline") == 0) {
+            if (!kvmem_immutable_source_k_) {
+                throw std::runtime_error(
+                    "KVMem table assembly currently requires immutable "
+                    "source K so out-of-table baked positions can be rebuilt");
+            }
+            kvmem_rope_table_enabled_ = true;
+            kvmem_raw_pipeline_enabled_ =
+                std::strcmp(mode, "pipeline") == 0;
+        } else {
+            throw std::runtime_error(
+                "QW3_KVMEM_ASSEMBLY_MODE must be legacy, table, or pipeline");
+        }
+    }
     if (effective.optimization_level >= KvMemOptimizationLevel::Opt2 &&
         effective.nvme_tier_bytes > 0 &&
         !kvmem_immutable_source_k_) {
@@ -4465,6 +4773,20 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                     static_cast<uint64_t>(v);
             }
         }
+    }
+    if (kvmem_rope_table_enabled_) {
+        const uint64_t max_position = std::min<uint64_t>(
+            kv_ctx_size_,
+            std::max<uint64_t>(
+                effective.select_budget,
+                effective.immutable_max_baked_position));
+        if (max_position == 0 ||
+            max_position > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(
+                "KVMem RoPE table position range is invalid");
+        }
+        kvmem_rope_table_positions_ =
+            static_cast<uint32_t>(max_position);
     }
     // If MTP tiering will engage (predicate mirrored exactly in the pool-engage
     // block below), the MTP layer rides the same per-block blobs as a trailing
@@ -7691,7 +8013,13 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
 void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_asm0 = tm ? kvmem_steady_ns() : 0;
+    kvmem_assembly_raw_gather_ns_ = 0;
+    kvmem_assembly_raw_h2d_submit_ns_ = 0;
+    kvmem_assembly_raw_h2d_wait_ns_ = 0;
+    kvmem_assembly_raw_bytes_ = 0;
+    kvmem_assembly_raw_batches_ = 0;
     const QwenConfig &cfg = model_.config();
+    kvmem_ensure_rope_sincos_table();
     const uint32_t page_size = kv_pages_.page_size;
     const uint32_t per_pos =
         static_cast<uint32_t>(cfg.n_kv_heads) * cfg.head_dim;
@@ -7804,7 +8132,19 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
         count_standard_attention_layers(cfg, weights_.n_layers());
     for (const KvMemRemap &rm : plan.remaps) {
         if (rm.skip) continue;
-        if (rm.raw_refresh) {
+        if (kvmem_rope_sincos_ &&
+            (rm.to_base < 0 ||
+             static_cast<uint64_t>(rm.to_base) + rm.n_tokens >
+                 kvmem_rope_table_positions_)) {
+            throw std::runtime_error(
+                "KVMem destination position exceeds the assembly RoPE table");
+        }
+        const bool table_source_oob =
+            kvmem_rope_sincos_ &&
+            (rm.from_base < 0 ||
+             static_cast<uint64_t>(rm.from_base) + rm.n_tokens >
+                 kvmem_rope_table_positions_);
+        if (rm.raw_refresh || table_source_oob) {
             raw_refreshes.push_back(&rm);
             continue;
         }
@@ -7855,7 +8195,8 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 cfg.n_kv_heads, per_pos,
                 cfg.head_dim, cfg.rope_dim, *bs_remap_to_dev_,
                 *bs_remap_from_dev_, *bs_remap_ntok_dev_, *window_pages_device_,
-                page_size, cfg.rope_theta));
+                page_size, cfg.rope_theta, kvmem_rope_sincos_.get(),
+                kvmem_rope_table_positions_));
         }
     }
     // MTP draft head: in immutable local-position mode, never transform a
@@ -7942,6 +8283,32 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                                      std::memory_order_relaxed);
         t.assemble_ns.fetch_add(t_end - t_asm0, std::memory_order_relaxed);
         t.assemble_calls.fetch_add(1, std::memory_order_relaxed);
+        if (kvmem_perf_trace_flag()) {
+            std::fprintf(
+                stderr,
+                "[kvmem-assembly-perf] mode=%s total_ms=%.3f "
+                "pages_ms=%.3f rerope_ms=%.3f kbar_ms=%.3f "
+                "raw_gather_ms=%.3f raw_h2d_submit_ms=%.3f "
+                "raw_h2d_wait_ms=%.3f raw_bytes=%llu raw_batches=%u "
+                "raw_refresh_blocks=%zu inplace_blocks=%u "
+                "mtp_blocks=%zu\n",
+                kvmem_raw_pipeline_enabled_
+                    ? "pipeline"
+                    : (kvmem_rope_sincos_ ? "table" : "legacy"),
+                (t_end - t_asm0) / 1.0e6,
+                (t_pages - t_asm0) / 1.0e6,
+                (t_rerope - t_pages) / 1.0e6,
+                (t_end - t_rerope) / 1.0e6,
+                kvmem_assembly_raw_gather_ns_ / 1.0e6,
+                kvmem_assembly_raw_h2d_submit_ns_ / 1.0e6,
+                kvmem_assembly_raw_h2d_wait_ns_ / 1.0e6,
+                static_cast<unsigned long long>(
+                    kvmem_assembly_raw_bytes_),
+                kvmem_assembly_raw_batches_, raw_refreshes.size(), n_moved,
+                build_mtp_window && kvmem_mtp_local_positions_
+                    ? plan.remaps.size()
+                    : 0);
+        }
     }
 }
 

@@ -980,6 +980,8 @@ Useful KVMem environment variables:
 | `QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS=N` | Rebuild after N accumulated absolute position-token displacement. Default: 262144; 0 disables this threshold. |
 | `QW3_KVMEM_IMMUTABLE_MAX_BAKED_POSITION=N` | Force raw rebuild when the current GPU K was baked beyond this position. Default: the model's native context limit. |
 | `QW3_KVMEM_RAW_K_TRANSFER_BLOCKS=N` | Raw-K CPU gather/H2D batch size in blocks. Default: 128. |
+| `QW3_KVMEM_ASSEMBLY_MODE=legacy\|table\|pipeline` | Select the immutable-K assembly implementation for A/B tests. `legacy` computes transcendental RoPE values in each remap kernel; `table` uses one cached FP32 sin/cos table; `pipeline` additionally overlaps two-slot CPU gather, H2D, and GPU scatter. Opt3 defaults to `pipeline`; lower profiles default to `table`. |
+| `QW3_KVMEM_CPU_GATHER_THREADS=N` | CPU workers used to gather immutable raw-K into contiguous pinned transfer buffers. Default: 4 in pipeline mode and 1 otherwise. |
 | `QW3_KVMEM_MTP_LOCAL_POSITIONS=0|1` | Separate MTP logical page identity from compact RoPE coordinates and materialize selected MTP K from unrotated CPU raw K. Default: `1` with immutable K; `0` is the legacy long-position A/B path. |
 | `QW3_KVMEM_ATTN_TRACE=/path/to/file.jsonl` | Dump KVMem attention-mass traces for analysis. This is expensive and should not be enabled for normal serving. |
 | `QW3_KVMEM_ATTN_TRACE_INTERVAL=N` | Sampling interval for `QW3_KVMEM_ATTN_TRACE`; default is every token. |

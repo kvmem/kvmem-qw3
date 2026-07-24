@@ -301,6 +301,25 @@ bool launch_rope_block_remap_paged_batched_fp8(
         const int32_t *from_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
         cudaStream_t stream);
+bool launch_build_rope_sincos_table(
+        float *table, uint32_t positions, uint32_t rope_dim, float theta,
+        cudaStream_t stream);
+bool launch_rope_block_remap_paged_batched_table(
+        void *cache, bool is_fp16, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *from_base,
+        const int32_t *n_tokens, const int32_t *page_indices,
+        uint32_t page_size, const float *rope_sincos,
+        uint32_t rope_table_positions, cudaStream_t stream);
+bool launch_rope_block_remap_paged_batched_table_fp8(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream);
 
 bool launch_raw_k_scatter_rope_paged_batched(
         void *cache, const void *raw_k, bool is_fp16, uint64_t raw_element_offset,
@@ -315,6 +334,23 @@ bool launch_raw_k_scatter_rope_paged_batched_fp8(
         uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_table(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_table_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
         cudaStream_t stream);
 
 // Block-sparse selection signal (#40). See kernel comments.
@@ -3216,6 +3252,122 @@ __global__ void raw_k_scatter_rope_paged_batched_kernel(
     dst[d] = static_cast<T>(out);
 }
 
+// Persistent KVMem assembly table. Each entry is the exact FP32 result of the
+// legacy per-element powf/sincosf sequence:
+//   [position, rope_pair] -> {sin(position * inv_freq), cos(...)}.
+// Keeping FP32 values preserves the old rotation arithmetic while allowing all
+// heads and all standard-attention layers to share the transcendental work.
+__global__ void build_rope_sincos_table_kernel(
+        float2 *table, uint32_t positions, uint32_t half, uint32_t rope_dim,
+        float theta) {
+    const uint64_t linear =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t total = static_cast<uint64_t>(positions) * half;
+    if (linear >= total) return;
+    const uint32_t pair = static_cast<uint32_t>(linear % half);
+    const uint32_t pos = static_cast<uint32_t>(linear / half);
+    const float inv_freq = __powf(
+        theta, -2.0f * static_cast<float>(pair) /
+                   static_cast<float>(rope_dim));
+    float s, c;
+    __sincosf(static_cast<float>(pos) * inv_freq, &s, &c);
+    table[linear] = make_float2(s, c);
+}
+
+template <typename T>
+__global__ void rope_block_remap_paged_batched_table_kernel(
+        T *cache, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float2 *rope_sincos, uint32_t rope_table_positions) {
+    const uint32_t bz = blockIdx.z;
+    const uint32_t tok = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t pair = threadIdx.x;
+    const uint32_t half = rope_dim / 2;
+    if (pair >= half ||
+        tok >= static_cast<uint32_t>(n_tokens[bz])) return;
+    const int32_t orig_base = from_base[bz];
+    const int32_t new_base = to_base[bz];
+    if (orig_base == new_base) return;
+    const int64_t orig_pos64 = static_cast<int64_t>(orig_base) + tok;
+    const int64_t new_pos64 = static_cast<int64_t>(new_base) + tok;
+    // The executor validates these ranges and promotes an out-of-table move to
+    // immutable raw refresh. Retain a defensive guard for direct launcher use.
+    if (orig_pos64 < 0 || new_pos64 < 0 ||
+        static_cast<uint64_t>(orig_pos64) >= rope_table_positions ||
+        static_cast<uint64_t>(new_pos64) >= rope_table_positions) {
+        return;
+    }
+    const uint32_t new_pos = static_cast<uint32_t>(new_pos64);
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(new_pos, page_indices, page_size);
+    T *base = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+              static_cast<uint64_t>(unit) * head_dim;
+    const float2 old_sc =
+        rope_sincos[static_cast<uint64_t>(orig_pos64) * half + pair];
+    const float2 new_sc =
+        rope_sincos[static_cast<uint64_t>(new_pos) * half + pair];
+    const float so = old_sc.x;
+    const float co = old_sc.y;
+    const float sn = new_sc.x;
+    const float cn = new_sc.y;
+    const float x0 = static_cast<float>(base[pair]);
+    const float x1 = static_cast<float>(base[pair + half]);
+    const float d0 = x0 * co + x1 * so;
+    const float d1 = -x0 * so + x1 * co;
+    base[pair] = static_cast<T>(d0 * cn - d1 * sn);
+    base[pair + half] = static_cast<T>(d0 * sn + d1 * cn);
+}
+
+template <typename T>
+__global__ void raw_k_scatter_rope_paged_batched_table_kernel(
+        T *cache, const T *raw_k, uint64_t raw_element_offset,
+        uint32_t max_n_tokens, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float2 *rope_sincos, uint32_t rope_table_positions) {
+    const uint32_t bz = blockIdx.z;
+    const uint32_t tok = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    if (tok >= static_cast<uint32_t>(n_tokens[bz])) return;
+
+    const uint64_t src_row =
+        (static_cast<uint64_t>(bz) * max_n_tokens + tok) * per_pos_size +
+        static_cast<uint64_t>(unit) * head_dim;
+    const T *src = raw_k + raw_element_offset + src_row;
+    const int64_t logical_pos64 =
+        static_cast<int64_t>(to_base[bz]) + tok;
+    if (logical_pos64 < 0 ||
+        static_cast<uint64_t>(logical_pos64) >= rope_table_positions) {
+        return;
+    }
+    const uint32_t logical_pos = static_cast<uint32_t>(logical_pos64);
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(logical_pos, page_indices, page_size);
+    T *dst = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+             static_cast<uint64_t>(unit) * head_dim;
+
+    const uint32_t half = rope_dim / 2;
+    if (lane < half) {
+        const float x0 = static_cast<float>(src[lane]);
+        const float x1 = static_cast<float>(src[lane + half]);
+        const float2 sc =
+            rope_sincos[static_cast<uint64_t>(logical_pos) * half + lane];
+        dst[lane] =
+            static_cast<T>(x0 * sc.y - x1 * sc.x);
+        dst[lane + half] =
+            static_cast<T>(x0 * sc.x + x1 * sc.y);
+    }
+    // General partial-RoPE support. Qwen3.6 has head_dim=rope_dim, but keeping
+    // this loop makes the table path equivalent for models with a suffix.
+    for (uint32_t d = rope_dim + lane; d < head_dim; d += blockDim.x) {
+        dst[d] = src[d];
+    }
+}
+
 // ---- Block-sparse cumulative-attention selection signal (#40) -----------
 //
 // Low-intrusion: instead of materializing the attention score matrix (the
@@ -4976,6 +5128,59 @@ public:
             return st;
         }
         fence = std::move(marker);
+        return {};
+    }
+
+    DeviceStatus record_execution_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (!exec_stream_) return {false, "CUDA exec stream is unavailable"};
+        auto marker = std::make_unique<CudaKvTransferFence>();
+        if (auto st = cuda_status(
+                cudaEventCreateWithFlags(
+                    &marker->event, cudaEventDisableTiming),
+                "KVMem exec fence create"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaEventRecord(marker->event, exec_stream_),
+                "KVMem exec fence record"); !st.ok) {
+            return st;
+        }
+        fence = std::move(marker);
+        return {};
+    }
+
+    DeviceStatus execution_wait_for_kv_transfer(
+            const std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (!fence) return {};
+        if (!exec_stream_) return {false, "CUDA exec stream is unavailable"};
+        const auto *marker =
+            dynamic_cast<const CudaKvTransferFence *>(fence.get());
+        if (!marker || !marker->event) {
+            return {false, "KVMem transfer fence has no CUDA event"};
+        }
+        return cuda_status(
+            cudaStreamWaitEvent(exec_stream_, marker->event, 0),
+            "KVMem exec wait H2D event");
+    }
+
+    DeviceStatus kv_transfer_wait_for_execution(
+            std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (!fence) return {};
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        auto *marker =
+            dynamic_cast<CudaKvTransferFence *>(fence.get());
+        if (!marker || !marker->event) {
+            return {false, "KVMem execution fence has no CUDA event"};
+        }
+        if (auto st = cuda_status(
+                cudaStreamWaitEvent(kv_copy_stream_, marker->event, 0),
+                "KVMem H2D wait exec event"); !st.ok) {
+            return st;
+        }
+        // CUDA permits destroying a recorded event before completion; its
+        // resources are released asynchronously after queued waits finish.
+        fence.reset();
         return {};
     }
 
@@ -7312,7 +7517,8 @@ public:
             uint32_t rope_dim, const DeviceTensor &to_base,
             const DeviceTensor &from_base, const DeviceTensor &n_tokens,
             const DeviceTensor &page_indices, uint32_t page_size,
-            float theta) override {
+            float theta, const DeviceTensor *rope_sincos,
+            uint32_t rope_table_positions) override {
         if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return {};
         if (page_size == 0)
             return {false, "rope_block_remap_paged_batched_device page_size=0"};
@@ -7332,23 +7538,69 @@ public:
         void *ptr = is_fp16 ? static_cast<void *>(c.ptr_h())
                             : is_fp8 ? static_cast<void *>(c.ptr_fp8())
                                      : static_cast<void *>(c.ptr);
-        const bool launched = is_fp8
-            ? ported::launch_rope_block_remap_paged_batched_fp8(
-                  ptr, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
-                  head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
-                  as_tensor(from_base).ptr_i32(), as_tensor(n_tokens).ptr_i32(),
-                  pages.ptr_i32(), page_size, theta, exec_stream_)
-            : ported::launch_rope_block_remap_paged_batched(
-                  ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads,
-                  per_pos_size, head_dim, rope_dim,
-                  as_tensor(to_base).ptr_i32(),
-                  as_tensor(from_base).ptr_i32(),
-                  as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(), page_size,
-                  theta, exec_stream_);
+        const float *table_ptr = nullptr;
+        if (rope_sincos) {
+            const auto &table = as_tensor(*rope_sincos);
+            const uint64_t needed =
+                static_cast<uint64_t>(rope_table_positions) *
+                (rope_dim / 2u) * 2u;
+            if (table.elem_size != sizeof(float) || table.count < needed) {
+                return {false, "KVMem RoPE table dtype/size mismatch"};
+            }
+            table_ptr = table.ptr;
+        }
+        const bool launched = table_ptr
+            ? (is_fp8
+                ? ported::launch_rope_block_remap_paged_batched_table_fp8(
+                      ptr, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
+                      head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(from_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, table_ptr, rope_table_positions, exec_stream_)
+                : ported::launch_rope_block_remap_paged_batched_table(
+                      ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads,
+                      per_pos_size, head_dim, rope_dim,
+                      as_tensor(to_base).ptr_i32(),
+                      as_tensor(from_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, table_ptr, rope_table_positions, exec_stream_))
+            : (is_fp8
+                ? ported::launch_rope_block_remap_paged_batched_fp8(
+                      ptr, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
+                      head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(from_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, exec_stream_)
+                : ported::launch_rope_block_remap_paged_batched(
+                      ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads,
+                      per_pos_size, head_dim, rope_dim,
+                      as_tensor(to_base).ptr_i32(),
+                      as_tensor(from_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, exec_stream_));
         if (!launched) {
             return {false, "rope_block_remap_paged_batched launch failed"};
         }
         return launch_status("cuda rope_block_remap_paged_batched_device");
+    }
+
+    DeviceStatus build_rope_sincos_table_device(
+            DeviceTensor &table, uint32_t positions, uint32_t rope_dim,
+            float theta) override {
+        if (positions == 0 || rope_dim == 0 || (rope_dim % 2u) != 0) {
+            return {false, "invalid KVMem RoPE table shape"};
+        }
+        auto &out = as_tensor(table);
+        const uint64_t needed =
+            static_cast<uint64_t>(positions) * (rope_dim / 2u) * 2u;
+        if (out.elem_size != sizeof(float) || out.count < needed) {
+            return {false, "KVMem RoPE table tensor is too small"};
+        }
+        if (!ported::launch_build_rope_sincos_table(
+                out.ptr, positions, rope_dim, theta, exec_stream_)) {
+            return {false, "KVMem RoPE table build launch failed"};
+        }
+        return launch_status("cuda build_rope_sincos_table_device");
     }
 
     DeviceStatus raw_k_scatter_rope_paged_batched_device(
@@ -7358,7 +7610,8 @@ public:
             uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
             const DeviceTensor &to_base, const DeviceTensor &n_tokens,
             const DeviceTensor &page_indices, uint32_t page_size,
-            float theta) override {
+            float theta, const DeviceTensor *rope_sincos,
+            uint32_t rope_table_positions) override {
         if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return {};
         if (page_size == 0) {
             return {false,
@@ -7396,19 +7649,45 @@ public:
             is_fp16 ? static_cast<const void *>(src.ptr_h())
                     : is_fp8 ? static_cast<const void *>(src.ptr_fp8())
                              : static_cast<const void *>(src.ptr);
-        const bool launched = is_fp8
-            ? ported::launch_raw_k_scatter_rope_paged_batched_fp8(
-                  dst_ptr, src_ptr, raw_element_offset, n_blocks,
-                  max_n_tokens, n_kv_heads, per_pos_size, head_dim, rope_dim,
-                  as_tensor(to_base).ptr_i32(),
-                  as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(), page_size,
-                  theta, exec_stream_)
-            : ported::launch_raw_k_scatter_rope_paged_batched(
-                  dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
-                  max_n_tokens, n_kv_heads, per_pos_size, head_dim, rope_dim,
-                  as_tensor(to_base).ptr_i32(),
-                  as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(), page_size,
-                  theta, exec_stream_);
+        const float *table_ptr = nullptr;
+        if (rope_sincos) {
+            const auto &table = as_tensor(*rope_sincos);
+            const uint64_t table_needed =
+                static_cast<uint64_t>(rope_table_positions) *
+                (rope_dim / 2u) * 2u;
+            if (table.elem_size != sizeof(float) ||
+                table.count < table_needed) {
+                return {false, "KVMem raw scatter RoPE table mismatch"};
+            }
+            table_ptr = table.ptr;
+        }
+        const bool launched = table_ptr
+            ? (is_fp8
+                ? ported::launch_raw_k_scatter_rope_paged_batched_table_fp8(
+                      dst_ptr, src_ptr, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, table_ptr, rope_table_positions, exec_stream_)
+                : ported::launch_raw_k_scatter_rope_paged_batched_table(
+                      dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, table_ptr, rope_table_positions, exec_stream_))
+            : (is_fp8
+                ? ported::launch_raw_k_scatter_rope_paged_batched_fp8(
+                      dst_ptr, src_ptr, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, exec_stream_)
+                : ported::launch_raw_k_scatter_rope_paged_batched(
+                      dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, exec_stream_));
         if (!launched) return {false, "raw K scatter launch failed"};
         return launch_status("cuda raw_k_scatter_rope_paged_batched_device");
     }
@@ -10787,6 +11066,78 @@ bool launch_rope_block_remap_paged_batched_fp8(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool launch_build_rope_sincos_table(
+        float *table, uint32_t positions, uint32_t rope_dim, float theta,
+        cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (positions == 0 || half == 0) return true;
+    constexpr uint32_t threads = 256;
+    const uint64_t total = static_cast<uint64_t>(positions) * half;
+    const uint32_t blocks =
+        static_cast<uint32_t>((total + threads - 1) / threads);
+    build_rope_sincos_table_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<float2 *>(table), positions, half, rope_dim, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename T>
+bool launch_rope_block_remap_paged_batched_table_typed(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0 ||
+        half == 0) {
+        return true;
+    }
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    rope_block_remap_paged_batched_table_kernel<T>
+        <<<grid, half, 0, stream>>>(
+            static_cast<T *>(cache), per_pos_size, head_dim, rope_dim,
+            to_base, from_base, n_tokens, page_indices, page_size,
+            reinterpret_cast<const float2 *>(rope_sincos),
+            rope_table_positions);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_rope_block_remap_paged_batched_table(
+        void *cache, bool is_fp16, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *from_base,
+        const int32_t *n_tokens, const int32_t *page_indices,
+        uint32_t page_size, const float *rope_sincos,
+        uint32_t rope_table_positions, cudaStream_t stream) {
+    if (is_fp16) {
+        return launch_rope_block_remap_paged_batched_table_typed<__half>(
+            cache, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
+            head_dim, rope_dim, to_base, from_base, n_tokens, page_indices,
+            page_size, rope_sincos, rope_table_positions, stream);
+    }
+    return launch_rope_block_remap_paged_batched_table_typed<float>(
+        cache, n_blocks, max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+        rope_dim, to_base, from_base, n_tokens, page_indices, page_size,
+        rope_sincos, rope_table_positions, stream);
+}
+
+bool launch_rope_block_remap_paged_batched_table_fp8(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream) {
+    return launch_rope_block_remap_paged_batched_table_typed<__nv_fp8_e4m3>(
+        cache, n_blocks, max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+        rope_dim, to_base, from_base, n_tokens, page_indices, page_size,
+        rope_sincos, rope_table_positions, stream);
+}
+
 bool launch_raw_k_scatter_rope_paged_batched(
         void *cache, const void *raw_k, bool is_fp16,
         uint64_t raw_element_offset, uint32_t n_blocks,
@@ -10831,6 +11182,68 @@ bool launch_raw_k_scatter_rope_paged_batched_fp8(
             max_n_tokens, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
             page_indices, page_size, theta);
     return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename T>
+bool launch_raw_k_scatter_rope_paged_batched_table_typed(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0 ||
+        half == 0) {
+        return true;
+    }
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    raw_k_scatter_rope_paged_batched_table_kernel<T>
+        <<<grid, half, 0, stream>>>(
+            static_cast<T *>(cache), static_cast<const T *>(raw_k),
+            raw_element_offset, max_n_tokens, per_pos_size, head_dim,
+            rope_dim, to_base, n_tokens, page_indices, page_size,
+            reinterpret_cast<const float2 *>(rope_sincos),
+            rope_table_positions);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_raw_k_scatter_rope_paged_batched_table(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream) {
+    if (is_fp16) {
+        return launch_raw_k_scatter_rope_paged_batched_table_typed<__half>(
+            cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+            n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+            page_indices, page_size, rope_sincos, rope_table_positions,
+            stream);
+    }
+    return launch_raw_k_scatter_rope_paged_batched_table_typed<float>(
+        cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+        n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+        page_indices, page_size, rope_sincos, rope_table_positions, stream);
+}
+
+bool launch_raw_k_scatter_rope_paged_batched_table_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream) {
+    return launch_raw_k_scatter_rope_paged_batched_table_typed<
+        __nv_fp8_e4m3>(
+        cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+        n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+        page_indices, page_size, rope_sincos, rope_table_positions, stream);
 }
 
 template <typename CacheT, typename KbarT>

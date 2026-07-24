@@ -49,6 +49,18 @@ bool launch_raw_k_scatter_rope_paged_batched(
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
         cudaStream_t stream);
+bool launch_build_rope_sincos_table(
+        float *table, uint32_t positions, uint32_t rope_dim, float theta,
+        cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_table(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream);
 }
 
 #define CUDA_CHECK(call) do {                                             \
@@ -205,10 +217,12 @@ int main() {
     // Packed unrotated fp16 raw K -> arbitrary paged window slot + one RoPE.
     // The result must match a direct bake from the same rounded raw values.
     __half *d_raw_half = nullptr, *d_scatter_cache = nullptr;
+    __half *d_scatter_table_cache = nullptr;
     __half *d_scatter_ref = nullptr;
     int32_t *d_pages4 = nullptr, *d_to = nullptr, *d_ntok = nullptr;
     CUDA_CHECK(cudaMalloc(&d_raw_half, bytes));
     CUDA_CHECK(cudaMalloc(&d_scatter_cache, bytes * 2));
+    CUDA_CHECK(cudaMalloc(&d_scatter_table_cache, bytes * 2));
     CUDA_CHECK(cudaMalloc(&d_scatter_ref, bytes));
     CUDA_CHECK(cudaMalloc(&d_pages4, 4 * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&d_to, sizeof(int32_t)));
@@ -226,6 +240,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_ntok, &scatter_ntok, sizeof(scatter_ntok),
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_scatter_cache, 0, bytes * 2));
+    CUDA_CHECK(cudaMemset(d_scatter_table_cache, 0, bytes * 2));
     if (!qw3::ported::launch_raw_k_scatter_rope_paged_batched(
             d_scatter_cache, d_raw_half, true, 0, 1, rows, heads,
             heads * head_dim, head_dim, rope_dim, d_to, d_ntok, d_pages4,
@@ -233,15 +248,36 @@ int main() {
         std::fprintf(stderr, "raw K scatter launcher rejected test input\n");
         return 1;
     }
+    constexpr uint32_t rope_table_positions = scatter_to + rows;
+    float *d_rope_table = nullptr;
+    const uint64_t rope_table_floats =
+        static_cast<uint64_t>(rope_table_positions) *
+        (rope_dim / 2u) * 2u;
+    CUDA_CHECK(cudaMalloc(
+        &d_rope_table, rope_table_floats * sizeof(float)));
+    if (!qw3::ported::launch_build_rope_sincos_table(
+            d_rope_table, rope_table_positions, rope_dim, theta, 0) ||
+        !qw3::ported::launch_raw_k_scatter_rope_paged_batched_table(
+            d_scatter_table_cache, d_raw_half, true, 0, 1, rows, heads,
+            heads * head_dim, head_dim, rope_dim, d_to, d_ntok, d_pages4,
+            16, d_rope_table, rope_table_positions, 0)) {
+        std::fprintf(
+            stderr, "table raw K scatter launcher rejected test input\n");
+        return 1;
+    }
     bake_half_to_half<<<dim3(rows, heads), head_dim>>>(
         d_raw_half, d_scatter_ref, rows, heads, head_dim, rope_dim,
         scatter_to, theta);
     CUDA_CHECK(cudaDeviceSynchronize());
-    std::vector<__half> scatter_got(count), scatter_ref(count);
+    std::vector<__half> scatter_got(count), scatter_table_got(count);
+    std::vector<__half> scatter_ref(count);
     CUDA_CHECK(cudaMemcpy(scatter_got.data(), d_scatter_cache + count,
                           bytes, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(scatter_ref.data(), d_scatter_ref, bytes,
                           cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        scatter_table_got.data(), d_scatter_table_cache + count, bytes,
+        cudaMemcpyDeviceToHost));
     if (std::memcmp(scatter_got.data(), scatter_ref.data(), bytes) != 0) {
         float max_abs = 0.0f;
         for (size_t i = 0; i < count; ++i) {
@@ -253,6 +289,21 @@ int main() {
         std::fprintf(stderr,
                      "FAIL raw scatter differs from direct bake max_abs=%.8f\n",
                      max_abs);
+        return 1;
+    }
+    if (std::memcmp(
+            scatter_table_got.data(), scatter_ref.data(), bytes) != 0) {
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < count; ++i) {
+            max_abs = std::max(
+                max_abs,
+                std::fabs(__half2float(scatter_table_got[i]) -
+                          __half2float(scatter_ref[i])));
+        }
+        std::fprintf(
+            stderr,
+            "FAIL table raw scatter differs from direct bake max_abs=%.8f\n",
+            max_abs);
         return 1;
     }
 
@@ -372,6 +423,8 @@ int main() {
     cudaFree(d_to);
     cudaFree(d_pages4);
     cudaFree(d_scatter_ref);
+    cudaFree(d_rope_table);
+    cudaFree(d_scatter_table_cache);
     cudaFree(d_scatter_cache);
     cudaFree(d_raw_half);
     cudaFree(d_pages);
