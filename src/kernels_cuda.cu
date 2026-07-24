@@ -327,14 +327,14 @@ bool launch_raw_k_scatter_rope_paged_batched(
         uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
-        cudaStream_t stream);
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
 bool launch_raw_k_scatter_rope_paged_batched_fp8(
         void *cache, const void *raw_k, uint64_t raw_element_offset,
         uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
         uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
-        cudaStream_t stream);
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
 bool launch_raw_k_scatter_rope_paged_batched_table(
         void *cache, const void *raw_k, bool is_fp16,
         uint64_t raw_element_offset, uint32_t n_blocks,
@@ -343,7 +343,7 @@ bool launch_raw_k_scatter_rope_paged_batched_table(
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size,
         const float *rope_sincos, uint32_t rope_table_positions,
-        cudaStream_t stream);
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
 bool launch_raw_k_scatter_rope_paged_batched_table_fp8(
         void *cache, const void *raw_k, uint64_t raw_element_offset,
         uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
@@ -351,7 +351,7 @@ bool launch_raw_k_scatter_rope_paged_batched_table_fp8(
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size,
         const float *rope_sincos, uint32_t rope_table_positions,
-        cudaStream_t stream);
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
 
 // Block-sparse selection signal (#40). See kernel comments.
 enum class KbarDType : uint32_t {
@@ -401,15 +401,18 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            uint32_t excl_hi_begin,
                                            uint32_t n_subblocks,
                                            uint32_t reduce_max,
+                                           uint32_t accumulate,
                                            cudaStream_t stream);
 bool launch_block_attn_score_softmax_pages_typed(
-        float *score, const float *q_multi, const void *kbar_multi,
-        KbarDType kbar_dtype, uint32_t n_layers, uint32_t n_tokens,
+        float *score, const void *q_multi, bool query_is_fp16,
+        const void *kbar_multi, KbarDType kbar_dtype,
+        uint32_t n_layers, uint32_t n_tokens,
         uint32_t q_layer_stride, uint32_t n_blocks,
         uint32_t kbar_layer_stride, uint32_t n_heads,
         uint32_t n_kv_heads, uint32_t head_dim, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
-        uint32_t n_subblocks, uint32_t reduce_max, cudaStream_t stream);
+        uint32_t n_subblocks, uint32_t reduce_max, uint32_t accumulate,
+        cudaStream_t stream);
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        const float *q, uint32_t q_stride,
                                        uint32_t n_window_blocks,
@@ -521,6 +524,12 @@ bool launch_derope_query_multi(float *q_multi, const float *q,
                                uint32_t cnt, uint32_t n_heads, uint32_t head_dim,
                                uint32_t rope_dim, int32_t start_pos, float theta,
                                cudaStream_t stream);
+bool launch_derope_query_multi_f16(void *q_multi, const float *q,
+                                   uint32_t q_token_stride,
+                                   uint32_t q_head_stride, uint32_t cnt,
+                                   uint32_t n_heads, uint32_t head_dim,
+                                   uint32_t rope_dim, int32_t start_pos,
+                                   float theta, cudaStream_t stream);
 }
 
 #if QW3_ENABLE_FLASHINFER
@@ -3214,6 +3223,7 @@ __global__ void rope_block_remap_paged_batched_kernel(
 template <typename T>
 __global__ void raw_k_scatter_rope_paged_batched_kernel(
         T *cache, const T *raw_k, uint64_t raw_element_offset,
+        uint64_t raw_block_stride_elements,
         uint32_t max_n_tokens, uint32_t per_pos_size, uint32_t head_dim,
         uint32_t rope_dim, const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta) {
@@ -3223,8 +3233,12 @@ __global__ void raw_k_scatter_rope_paged_batched_kernel(
     const uint32_t d = threadIdx.x;
     if (tok >= static_cast<uint32_t>(n_tokens[bz]) || d >= head_dim) return;
 
+    const uint64_t block_stride = raw_block_stride_elements != 0
+        ? raw_block_stride_elements
+        : static_cast<uint64_t>(max_n_tokens) * per_pos_size;
     const uint64_t src_row =
-        (static_cast<uint64_t>(bz) * max_n_tokens + tok) * per_pos_size +
+        static_cast<uint64_t>(bz) * block_stride +
+        static_cast<uint64_t>(tok) * per_pos_size +
         static_cast<uint64_t>(unit) * head_dim;
     const T *src = raw_k + raw_element_offset + src_row;
     const uint32_t logical_pos =
@@ -3324,6 +3338,7 @@ __global__ void rope_block_remap_paged_batched_table_kernel(
 template <typename T>
 __global__ void raw_k_scatter_rope_paged_batched_table_kernel(
         T *cache, const T *raw_k, uint64_t raw_element_offset,
+        uint64_t raw_block_stride_elements,
         uint32_t max_n_tokens, uint32_t per_pos_size, uint32_t head_dim,
         uint32_t rope_dim, const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size,
@@ -3334,8 +3349,12 @@ __global__ void raw_k_scatter_rope_paged_batched_table_kernel(
     const uint32_t lane = threadIdx.x;
     if (tok >= static_cast<uint32_t>(n_tokens[bz])) return;
 
+    const uint64_t block_stride = raw_block_stride_elements != 0
+        ? raw_block_stride_elements
+        : static_cast<uint64_t>(max_n_tokens) * per_pos_size;
     const uint64_t src_row =
-        (static_cast<uint64_t>(bz) * max_n_tokens + tok) * per_pos_size +
+        static_cast<uint64_t>(bz) * block_stride +
+        static_cast<uint64_t>(tok) * per_pos_size +
         static_cast<uint64_t>(unit) * head_dim;
     const T *src = raw_k + raw_element_offset + src_row;
     const int64_t logical_pos64 =
@@ -3469,10 +3488,10 @@ __global__ void block_attn_score_step_kernel(float *accum,
 // sub-block's mass (max over sub-blocks) instead of the sum, so score[w] =
 // Σ_t mean_l mean_h max_sb softmax(scale·(q·k̄_{w,sb})) — MaxSim late interaction.
 // reduce_max is a no-op at n_subblocks==1 (single sub-block => max == sum).
-template <typename KbarT>
+template <typename QueryT, typename KbarT>
 __global__ void block_attn_score_softmax_pages_kernel(
                                                       float *score,
-                                                      const float *q_multi,
+                                                      const QueryT *q_multi,
                                                       const KbarT *kbar_multi,
                                                       uint32_t n_layers,
                                                       uint32_t n_tokens,
@@ -3514,7 +3533,8 @@ __global__ void block_attn_score_softmax_pages_kernel(
         kbar_multi +
         static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks * n_kv_heads *
             head_dim;
-    const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
+    const QueryT *q_l =
+        q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
     // Per-head weight: each (layer,token) contributes mean over heads, and the
     // grid sum over layers must end up as a mean over L. n_tokens is summed (not
     // averaged) so the final score accumulates one unit of mass per query token.
@@ -3522,7 +3542,8 @@ __global__ void block_attn_score_softmax_pages_kernel(
                                  static_cast<float>(n_heads));
     for (uint32_t qh = 0; qh < n_heads; ++qh) {
         const uint32_t kvh = qh / group;
-        const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+        const QueryT *qr =
+            q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
         // logit[p] = scale * dot(q[l,t,qh], k̄[l,w,sb,kvh]) for every sub-block.
         // Sub-blocks of a block in the always-kept sink/recent bands
         // [0,excl_lo_end) / [excl_hi_begin,n_blocks) are masked to -inf so their
@@ -3537,7 +3558,8 @@ __global__ void block_attn_score_softmax_pages_kernel(
                 kbar_l + (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
             float dot = 0.0f;
             for (uint32_t d = 0; d < head_dim; ++d) {
-                dot += qr[d] * static_cast<float>(kbar_row[d]);
+                dot += static_cast<float>(qr[d]) *
+                       static_cast<float>(kbar_row[d]);
             }
             s_logit[p] = dot * scale;
         }
@@ -3596,11 +3618,11 @@ __global__ void block_attn_score_softmax_pages_kernel(
 constexpr uint32_t kSoftmaxPagesTile = 512;
 constexpr uint32_t kSoftmaxPagesThreads = 128;
 
-template <typename KbarT>
+template <typename QueryT, typename KbarT>
 __global__ void block_attn_softmax_pages_partial_lse_kernel(
         float *partial_max,
         float *partial_sum,
-        const float *q_multi,
+        const QueryT *q_multi,
         const KbarT *kbar_multi,
         uint32_t n_distributions,
         uint32_t n_tiles,
@@ -3636,8 +3658,10 @@ __global__ void block_attn_softmax_pages_partial_lse_kernel(
     __shared__ float reduce[kSoftmaxPagesThreads];
 
     const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
-    const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
-    const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+    const QueryT *q_l =
+        q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
+    const QueryT *qr =
+        q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
     const KbarT *kbar_l =
         kbar_multi +
         static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks *
@@ -3652,7 +3676,8 @@ __global__ void block_attn_softmax_pages_partial_lse_kernel(
                 kbar_l + (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
             float dot = 0.0f;
             for (uint32_t d = 0; d < head_dim; ++d) {
-                dot += qr[d] * static_cast<float>(kbar_row[d]);
+                dot += static_cast<float>(qr[d]) *
+                       static_cast<float>(kbar_row[d]);
             }
             logit = dot * scale;
         }
@@ -3731,10 +3756,196 @@ __global__ void block_attn_softmax_pages_merge_lse_kernel(
     }
 }
 
-template <typename KbarT>
+// Single-dot scalable scorer. The old tiled path above computes every Q·K twice
+// to avoid storing logits. That is memory-frugal but becomes the dominant cost
+// for long retrieval queries. This path materializes only a bounded batch of
+// distributions, normalizes it, accumulates its block mass, then reuses the
+// same workspace for the next batch. Each dot is computed exactly once.
+//
+// Four warps cooperate on one 512-page tile. A warp owns one page at a time and
+// reads its head_dim elements contiguously, unlike the correctness-first
+// two-dot kernel where adjacent threads read different page rows. This keeps
+// Kbar loads coalesced while preserving FP32 dot accumulation.
+template <typename QueryT, typename KbarT>
+__global__ void block_attn_softmax_pages_logits_kernel(
+        float *logits,
+        const QueryT *q_multi,
+        const KbarT *kbar_multi,
+        uint32_t distribution_base,
+        uint32_t distribution_count,
+        uint32_t n_tiles,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t n_blocks,
+        uint32_t kbar_layer_stride,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin,
+        uint32_t n_subblocks) {
+    const uint64_t job = blockIdx.x;
+    const uint32_t local_dist =
+        static_cast<uint32_t>(job / n_tiles);
+    const uint32_t tile = static_cast<uint32_t>(
+        job - static_cast<uint64_t>(local_dist) * n_tiles);
+    if (local_dist >= distribution_count) return;
+
+    const uint32_t dist = distribution_base + local_dist;
+    const uint32_t qh = dist % n_heads;
+    const uint32_t lt = dist / n_heads;
+    const uint32_t t = lt % n_tokens;
+    const uint32_t l = lt / n_tokens;
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint32_t kvh = qh / group;
+    const uint32_t total = n_blocks * n_subblocks;
+    const uint32_t p0 = tile * kSoftmaxPagesTile;
+    const uint32_t p1 = min(p0 + kSoftmaxPagesTile, total);
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    constexpr uint32_t kWarps =
+        kSoftmaxPagesThreads / 32;
+
+    const uint64_t qrow =
+        static_cast<uint64_t>(n_heads) * head_dim;
+    const QueryT *q_l =
+        q_multi +
+        static_cast<uint64_t>(l) * q_layer_stride * qrow;
+    const QueryT *qr =
+        q_l +
+        (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+    const KbarT *kbar_l =
+        kbar_multi +
+        static_cast<uint64_t>(l) * kbar_layer_stride *
+            n_subblocks * n_kv_heads * head_dim;
+    float *out =
+        logits + static_cast<uint64_t>(local_dist) * total;
+
+    for (uint32_t p = p0 + warp; p < p1; p += kWarps) {
+        const uint32_t w = p / n_subblocks;
+        float dot = 0.0f;
+        if (w >= excl_lo_end && w < excl_hi_begin) {
+            const KbarT *kbar_row =
+                kbar_l +
+                (static_cast<uint64_t>(p) * n_kv_heads + kvh) *
+                    head_dim;
+            for (uint32_t d = lane; d < head_dim; d += 32) {
+                dot += static_cast<float>(qr[d]) *
+                       static_cast<float>(kbar_row[d]);
+            }
+#pragma unroll
+            for (uint32_t offset = 16; offset > 0; offset >>= 1) {
+                dot += __shfl_down_sync(0xffffffffu, dot, offset);
+            }
+        }
+        if (lane == 0) {
+            out[p] =
+                (w >= excl_lo_end && w < excl_hi_begin)
+                    ? dot * scale : -INFINITY;
+        }
+    }
+}
+
+// One CTA computes the global row max and denominator. Logits remain unchanged;
+// the accumulation kernel applies exp(logit-max)/sum once, so no second dot and
+// no extra normalized-logit write are needed.
+__global__ void block_attn_softmax_pages_norm_kernel(
+        float *row_max,
+        float *row_inv_sum,
+        const float *logits,
+        uint32_t distribution_count,
+        uint32_t total) {
+    const uint32_t dist = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (dist >= distribution_count) return;
+    __shared__ float reduce[kSoftmaxPagesThreads];
+    const float *row =
+        logits + static_cast<uint64_t>(dist) * total;
+
+    float local_max = -INFINITY;
+    for (uint32_t p = tid; p < total; p += blockDim.x) {
+        local_max = fmaxf(local_max, row[p]);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            reduce[tid] =
+                fmaxf(reduce[tid], reduce[tid + s]);
+        }
+        __syncthreads();
+    }
+    const float m = reduce[0];
+    float local_sum = 0.0f;
+    if (isfinite(m)) {
+        for (uint32_t p = tid; p < total; p += blockDim.x) {
+            local_sum += __expf(row[p] - m);
+        }
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        row_max[dist] = m;
+        row_inv_sum[dist] =
+            reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    }
+}
+
+// One thread owns one output block, so batches accumulate deterministically
+// without atomics. Threads in a warp read adjacent block logits for each
+// distribution, giving coalesced global-memory access.
+__global__ void block_attn_softmax_pages_accumulate_logits_kernel(
+        float *score,
+        const float *logits,
+        const float *row_max,
+        const float *row_inv_sum,
+        uint32_t distribution_count,
+        uint32_t n_blocks,
+        uint32_t n_subblocks,
+        uint32_t reduce_max,
+        float distribution_weight,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin) {
+    const uint32_t w =
+        blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_blocks || w < excl_lo_end ||
+        w >= excl_hi_begin) {
+        return;
+    }
+    const uint32_t total = n_blocks * n_subblocks;
+    float accum = 0.0f;
+    for (uint32_t dist = 0; dist < distribution_count; ++dist) {
+        const float inv = row_inv_sum[dist];
+        if (!(inv > 0.0f)) continue;
+        const float m = row_max[dist];
+        const float *row =
+            logits + static_cast<uint64_t>(dist) * total +
+            static_cast<uint64_t>(w) * n_subblocks;
+        float mass = 0.0f;
+        if (reduce_max && n_subblocks > 1) {
+            for (uint32_t sb = 0; sb < n_subblocks; ++sb) {
+                mass = fmaxf(
+                    mass, __expf(row[sb] - m) * inv);
+            }
+        } else {
+            for (uint32_t sb = 0; sb < n_subblocks; ++sb) {
+                mass += __expf(row[sb] - m) * inv;
+            }
+        }
+        accum += mass;
+    }
+    score[w] += accum * distribution_weight;
+}
+
+template <typename QueryT, typename KbarT>
 __global__ void block_attn_softmax_pages_recompute_kernel(
         float *score,
-        const float *q_multi,
+        const QueryT *q_multi,
         const KbarT *kbar_multi,
         const float *global_max,
         const float *global_sum,
@@ -3754,7 +3965,6 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
     const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= n_blocks) return;
     if (w < excl_lo_end || w >= excl_hi_begin) {
-        score[w] = 0.0f;
         return;
     }
 
@@ -3762,7 +3972,7 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
     const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
     float accum = 0.0f;
     for (uint32_t l = 0; l < n_layers; ++l) {
-        const float *q_l =
+        const QueryT *q_l =
             q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
         const KbarT *kbar_l =
             kbar_multi +
@@ -3775,7 +3985,7 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
                 if (!(denom > 0.0f)) continue;
                 const float m = global_max[dist];
                 const uint32_t kvh = qh / group;
-                const float *qr =
+                const QueryT *qr =
                     q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
                 float block_mass = 0.0f;
                 for (uint32_t sb = 0; sb < n_subblocks; ++sb) {
@@ -3785,7 +3995,8 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
                         (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
                     float dot = 0.0f;
                     for (uint32_t d = 0; d < head_dim; ++d) {
-                        dot += qr[d] * static_cast<float>(kbar_row[d]);
+                        dot += static_cast<float>(qr[d]) *
+                               static_cast<float>(kbar_row[d]);
                     }
                     const float mass = __expf(dot * scale - m) / denom;
                     if (reduce_max && n_subblocks > 1)
@@ -3797,8 +4008,8 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
             }
         }
     }
-    score[w] = accum / (static_cast<float>(n_layers) *
-                        static_cast<float>(n_heads));
+    score[w] += accum / (static_cast<float>(n_layers) *
+                         static_cast<float>(n_heads));
 }
 
 __device__ __forceinline__ uint32_t kvmem_window_bucket_for_pos(
@@ -4382,7 +4593,7 @@ __global__ void derope_query_kernel(float *q_content,
 // q + r*q_token_stride, head qh at + qh*q_head_stride (attn-Q is the first
 // head_dim of each 2*head_dim unit). Token r is RoPE-baked at start_pos+r.
 // grid = (n_heads, cnt), block = head_dim threads.
-__global__ void derope_query_multi_kernel(float *q_multi,
+__global__ void derope_query_multi_kernel(void *q_multi,
                                           const float *q,
                                           uint32_t q_token_stride,
                                           uint32_t q_head_stride,
@@ -4390,7 +4601,8 @@ __global__ void derope_query_multi_kernel(float *q_multi,
                                           uint32_t head_dim,
                                           uint32_t rope_dim,
                                           int32_t start_pos,
-                                          float theta) {
+                                          float theta,
+                                          bool output_fp16) {
     const uint32_t r = blockIdx.y;
     const uint32_t qh = blockIdx.x;
     const uint32_t d = threadIdx.x;
@@ -4418,7 +4630,13 @@ __global__ void derope_query_multi_kernel(float *q_multi,
     } else {
         deroped = row[d];
     }
-    q_multi[(static_cast<uint64_t>(r) * n_heads + qh) * head_dim + d] = deroped;
+    const uint64_t out =
+        (static_cast<uint64_t>(r) * n_heads + qh) * head_dim + d;
+    if (output_fp16) {
+        static_cast<__half *>(q_multi)[out] = __float2half_rn(deroped);
+    } else {
+        static_cast<float *>(q_multi)[out] = deroped;
+    }
 }
 
 __global__ void kv_append_kernel(float *cache,
@@ -7611,7 +7829,8 @@ public:
             const DeviceTensor &to_base, const DeviceTensor &n_tokens,
             const DeviceTensor &page_indices, uint32_t page_size,
             float theta, const DeviceTensor *rope_sincos,
-            uint32_t rope_table_positions) override {
+            uint32_t rope_table_positions,
+            uint64_t raw_block_stride_elements) override {
         if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return {};
         if (page_size == 0) {
             return {false,
@@ -7636,9 +7855,17 @@ public:
             return {false,
                     "raw K scatter requires fp16, fp32, or fp8 KV"};
         }
+        const uint64_t packed_block_elements =
+            static_cast<uint64_t>(max_n_tokens) * per_pos_size;
+        const uint64_t block_stride = raw_block_stride_elements != 0
+            ? raw_block_stride_elements : packed_block_elements;
+        if (block_stride < packed_block_elements) {
+            return {false, "raw K scatter block stride is too small"};
+        }
         const uint64_t needed =
             raw_element_offset +
-            static_cast<uint64_t>(n_blocks) * max_n_tokens * per_pos_size;
+            static_cast<uint64_t>(n_blocks - 1) * block_stride +
+            packed_block_elements;
         if (needed > src.count) {
             return {false, "raw K scatter source is too small"};
         }
@@ -7668,26 +7895,28 @@ public:
                       max_n_tokens, n_kv_heads, per_pos_size, head_dim,
                       rope_dim, as_tensor(to_base).ptr_i32(),
                       as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
-                      page_size, table_ptr, rope_table_positions, exec_stream_)
+                      page_size, table_ptr, rope_table_positions,
+                      block_stride, exec_stream_)
                 : ported::launch_raw_k_scatter_rope_paged_batched_table(
                       dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
                       max_n_tokens, n_kv_heads, per_pos_size, head_dim,
                       rope_dim, as_tensor(to_base).ptr_i32(),
                       as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
-                      page_size, table_ptr, rope_table_positions, exec_stream_))
+                      page_size, table_ptr, rope_table_positions,
+                      block_stride, exec_stream_))
             : (is_fp8
                 ? ported::launch_raw_k_scatter_rope_paged_batched_fp8(
                       dst_ptr, src_ptr, raw_element_offset, n_blocks,
                       max_n_tokens, n_kv_heads, per_pos_size, head_dim,
                       rope_dim, as_tensor(to_base).ptr_i32(),
                       as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
-                      page_size, theta, exec_stream_)
+                      page_size, theta, block_stride, exec_stream_)
                 : ported::launch_raw_k_scatter_rope_paged_batched(
                       dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
                       max_n_tokens, n_kv_heads, per_pos_size, head_dim,
                       rope_dim, as_tensor(to_base).ptr_i32(),
                       as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
-                      page_size, theta, exec_stream_));
+                      page_size, theta, block_stride, exec_stream_));
         if (!launched) return {false, "raw K scatter launch failed"};
         return launch_status("cuda raw_k_scatter_rope_paged_batched_device");
     }
@@ -7778,7 +8007,8 @@ public:
                                                        uint32_t excl_lo_end,
                                                        uint32_t excl_hi_begin,
                                                        uint32_t n_subblocks,
-                                                       uint32_t reduce_max) override {
+                                                       uint32_t reduce_max,
+                                                       uint32_t accumulate) override {
         if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
             head_dim == 0) {
             return {};
@@ -7791,10 +8021,12 @@ public:
                            : kb.is_fp16() ? ported::KbarDType::F16
                                          : ported::KbarDType::F32;
         if (!ported::launch_block_attn_score_softmax_pages_typed(
-                sc.ptr, qm.ptr, kb.ptr, kbar_dtype, n_layers, n_tokens,
+                sc.ptr, qm.ptr, qm.is_fp16(), kb.ptr, kbar_dtype,
+                n_layers, n_tokens,
                 q_layer_stride,
                 n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
-                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, exec_stream_)) {
+                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, accumulate,
+                exec_stream_)) {
             return {false, "block_attn_score_softmax_pages launch failed"};
         }
         return launch_status("cuda block_attn_score_softmax_pages_device");
@@ -8145,10 +8377,16 @@ public:
         if (cnt == 0 || n_heads == 0 || head_dim == 0) return {};
         auto &qm = as_tensor(q_multi);
         const auto &qt = as_tensor(q);
-        if (!ported::launch_derope_query_multi(
-                qm.ptr + out_elem_offset, qt.ptr + q_elem_offset,
-                q_token_stride, q_head_stride, cnt, n_heads, head_dim, rope_dim,
-                start_pos, theta, exec_stream_)) {
+        const bool ok = qm.is_fp16()
+            ? ported::launch_derope_query_multi_f16(
+                  qm.ptr_h() + out_elem_offset, qt.ptr + q_elem_offset,
+                  q_token_stride, q_head_stride, cnt, n_heads, head_dim,
+                  rope_dim, start_pos, theta, exec_stream_)
+            : ported::launch_derope_query_multi(
+                  qm.ptr + out_elem_offset, qt.ptr + q_elem_offset,
+                  q_token_stride, q_head_stride, cnt, n_heads, head_dim,
+                  rope_dim, start_pos, theta, exec_stream_);
+        if (!ok) {
             return {false, "derope_query_multi launch failed"};
         }
         return launch_status("cuda derope_query_multi_device");
@@ -11145,7 +11383,7 @@ bool launch_raw_k_scatter_rope_paged_batched(
         uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
-        cudaStream_t stream) {
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
     if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return true;
     dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
     if (is_fp16) {
@@ -11153,15 +11391,17 @@ bool launch_raw_k_scatter_rope_paged_batched(
             <<<grid, head_dim, 0, stream>>>(
                 static_cast<__half *>(cache),
                 static_cast<const __half *>(raw_k), raw_element_offset,
-                max_n_tokens, per_pos_size, head_dim, rope_dim, to_base,
-                n_tokens, page_indices, page_size, theta);
+                raw_block_stride_elements, max_n_tokens, per_pos_size,
+                head_dim, rope_dim, to_base, n_tokens, page_indices,
+                page_size, theta);
     } else {
         raw_k_scatter_rope_paged_batched_kernel<float>
             <<<grid, head_dim, 0, stream>>>(
                 static_cast<float *>(cache),
                 static_cast<const float *>(raw_k), raw_element_offset,
-                max_n_tokens, per_pos_size, head_dim, rope_dim, to_base,
-                n_tokens, page_indices, page_size, theta);
+                raw_block_stride_elements, max_n_tokens, per_pos_size,
+                head_dim, rope_dim, to_base, n_tokens, page_indices,
+                page_size, theta);
     }
     return cudaGetLastError() == cudaSuccess;
 }
@@ -11172,15 +11412,15 @@ bool launch_raw_k_scatter_rope_paged_batched_fp8(
         uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
-        cudaStream_t stream) {
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
     if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return true;
     dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
     raw_k_scatter_rope_paged_batched_kernel<__nv_fp8_e4m3>
         <<<grid, head_dim, 0, stream>>>(
             static_cast<__nv_fp8_e4m3 *>(cache),
             static_cast<const __nv_fp8_e4m3 *>(raw_k), raw_element_offset,
-            max_n_tokens, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
-            page_indices, page_size, theta);
+            raw_block_stride_elements, max_n_tokens, per_pos_size, head_dim,
+            rope_dim, to_base, n_tokens, page_indices, page_size, theta);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -11192,7 +11432,7 @@ bool launch_raw_k_scatter_rope_paged_batched_table_typed(
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size,
         const float *rope_sincos, uint32_t rope_table_positions,
-        cudaStream_t stream) {
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
     const uint32_t half = rope_dim / 2;
     if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0 ||
         half == 0) {
@@ -11202,8 +11442,9 @@ bool launch_raw_k_scatter_rope_paged_batched_table_typed(
     raw_k_scatter_rope_paged_batched_table_kernel<T>
         <<<grid, half, 0, stream>>>(
             static_cast<T *>(cache), static_cast<const T *>(raw_k),
-            raw_element_offset, max_n_tokens, per_pos_size, head_dim,
-            rope_dim, to_base, n_tokens, page_indices, page_size,
+            raw_element_offset, raw_block_stride_elements, max_n_tokens,
+            per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+            page_indices, page_size,
             reinterpret_cast<const float2 *>(rope_sincos),
             rope_table_positions);
     return cudaGetLastError() == cudaSuccess;
@@ -11217,18 +11458,19 @@ bool launch_raw_k_scatter_rope_paged_batched_table(
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size,
         const float *rope_sincos, uint32_t rope_table_positions,
-        cudaStream_t stream) {
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
     if (is_fp16) {
         return launch_raw_k_scatter_rope_paged_batched_table_typed<__half>(
             cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
             n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
             page_indices, page_size, rope_sincos, rope_table_positions,
-            stream);
+            raw_block_stride_elements, stream);
     }
     return launch_raw_k_scatter_rope_paged_batched_table_typed<float>(
         cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
         n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
-        page_indices, page_size, rope_sincos, rope_table_positions, stream);
+        page_indices, page_size, rope_sincos, rope_table_positions,
+        raw_block_stride_elements, stream);
 }
 
 bool launch_raw_k_scatter_rope_paged_batched_table_fp8(
@@ -11238,12 +11480,13 @@ bool launch_raw_k_scatter_rope_paged_batched_table_fp8(
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size,
         const float *rope_sincos, uint32_t rope_table_positions,
-        cudaStream_t stream) {
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
     return launch_raw_k_scatter_rope_paged_batched_table_typed<
         __nv_fp8_e4m3>(
         cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
         n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
-        page_indices, page_size, rope_sincos, rope_table_positions, stream);
+        page_indices, page_size, rope_sincos, rope_table_positions,
+        raw_block_stride_elements, stream);
 }
 
 template <typename CacheT, typename KbarT>
@@ -11385,10 +11628,10 @@ bool launch_block_attn_score_step(float *accum, const float *q,
         n_kv_heads, head_dim, scale, stream);
 }
 
-template <typename KbarT>
+template <typename QueryT, typename KbarT>
 bool launch_block_attn_score_softmax_pages_impl(
                                            float *score,
-                                           const float *q_multi,
+                                           const QueryT *q_multi,
                                            const KbarT *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
                                            uint32_t q_layer_stride,
@@ -11400,6 +11643,7 @@ bool launch_block_attn_score_softmax_pages_impl(
                                            uint32_t excl_hi_begin,
                                            uint32_t n_subblocks,
                                            uint32_t reduce_max,
+                                           uint32_t accumulate,
                                            cudaStream_t stream) {
     if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
         head_dim == 0) {
@@ -11419,13 +11663,15 @@ bool launch_block_attn_score_softmax_pages_impl(
     }();
     // score[] is accumulated across the grid -> must start at zero. It stays
     // per-block (n_blocks entries); sub-block masses are summed in by the kernel.
-    cudaMemsetAsync(score, 0, static_cast<size_t>(n_blocks) * sizeof(float),
-                    stream);
+    if (!accumulate) {
+        cudaMemsetAsync(score, 0, static_cast<size_t>(n_blocks) * sizeof(float),
+                        stream);
+    }
     constexpr uint32_t threads = 128;
     if (total64 <= kMaxPages && !force_tiled) {
         const uint32_t grid = n_layers * n_tokens;
         const size_t shmem = static_cast<size_t>(total64) * sizeof(float);
-        block_attn_score_softmax_pages_kernel<KbarT>
+        block_attn_score_softmax_pages_kernel<QueryT, KbarT>
             <<<grid, threads, shmem, stream>>>(
             score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
             n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
@@ -11443,10 +11689,115 @@ bool launch_block_attn_score_softmax_pages_impl(
         (total + kSoftmaxPagesTile - 1) / kSoftmaxPagesTile;
     const uint64_t n_distributions64 =
         static_cast<uint64_t>(n_layers) * n_tokens * n_heads;
-    const uint64_t n_jobs = n_distributions64 * n_tiles;
-    if (n_distributions64 > UINT32_MAX || n_jobs > 0x7fffffffu) return false;
+    if (n_distributions64 > UINT32_MAX) return false;
     const uint32_t n_distributions = static_cast<uint32_t>(n_distributions64);
 
+    // Keep the original two-dot implementation as an explicit A/B baseline.
+    // The production default materializes only a bounded distribution batch,
+    // computes each dot once, then reuses the workspace.
+    const bool use_two_dot = []() {
+        const char *v =
+            std::getenv("QW3_KVMEM_SOFTMAX_PAGES_SCALABLE");
+        return v &&
+               (std::strcmp(v, "two_dot") == 0 ||
+                std::strcmp(v, "legacy") == 0);
+    }();
+    if (!use_two_dot) {
+        uint64_t workspace_bytes = 64ull * 1024ull * 1024ull;
+        if (const char *v =
+                std::getenv("QW3_KVMEM_SOFTMAX_LOGITS_MIB")) {
+            const unsigned long long mib = std::strtoull(v, nullptr, 10);
+            if (mib > 0 && mib <= 4096) {
+                workspace_bytes =
+                    static_cast<uint64_t>(mib) * 1024ull * 1024ull;
+            }
+        }
+        const uint64_t max_logits_floats =
+            std::max<uint64_t>(total, workspace_bytes / sizeof(float));
+        const uint32_t distributions_per_batch =
+            static_cast<uint32_t>(std::max<uint64_t>(
+                1, std::min<uint64_t>(
+                       n_distributions,
+                       max_logits_floats / total)));
+        const uint64_t logits_floats =
+            static_cast<uint64_t>(distributions_per_batch) * total;
+        const uint64_t workspace_floats =
+            logits_floats +
+            2ull * distributions_per_batch;
+        if (workspace_floats > SIZE_MAX / sizeof(float)) return false;
+        float *workspace = nullptr;
+        if (cudaMallocAsync(
+                reinterpret_cast<void **>(&workspace),
+                static_cast<size_t>(workspace_floats) * sizeof(float),
+                stream) != cudaSuccess) {
+            return false;
+        }
+        float *logits = workspace;
+        float *row_max = logits + logits_floats;
+        float *row_inv_sum =
+            row_max + distributions_per_batch;
+        const float distribution_weight =
+            1.0f /
+            (static_cast<float>(n_layers) *
+             static_cast<float>(n_heads));
+        cudaError_t err = cudaSuccess;
+        uint32_t batches = 0;
+        for (uint32_t base = 0; base < n_distributions;) {
+            const uint32_t count = std::min(
+                distributions_per_batch,
+                n_distributions - base);
+            const uint64_t jobs =
+                static_cast<uint64_t>(count) * n_tiles;
+            if (jobs > 0x7fffffffu) {
+                err = cudaErrorInvalidConfiguration;
+                break;
+            }
+            block_attn_softmax_pages_logits_kernel<QueryT, KbarT><<<
+                static_cast<uint32_t>(jobs),
+                kSoftmaxPagesThreads, 0, stream>>>(
+                logits, q_multi, kbar_multi, base, count,
+                n_tiles, n_tokens, q_layer_stride, n_blocks,
+                kbar_layer_stride, n_heads, n_kv_heads,
+                head_dim, scale, excl_lo_end, excl_hi_begin, ns);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) break;
+            block_attn_softmax_pages_norm_kernel<<<
+                count, kSoftmaxPagesThreads, 0, stream>>>(
+                row_max, row_inv_sum, logits, count, total);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) break;
+            const uint32_t score_grid =
+                (n_blocks + kSoftmaxPagesThreads - 1) /
+                kSoftmaxPagesThreads;
+            block_attn_softmax_pages_accumulate_logits_kernel<<<
+                score_grid, kSoftmaxPagesThreads, 0, stream>>>(
+                score, logits, row_max, row_inv_sum, count,
+                n_blocks, ns, reduce_max, distribution_weight,
+                excl_lo_end, excl_hi_begin);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) break;
+            base += count;
+            ++batches;
+        }
+        const cudaError_t free_err =
+            cudaFreeAsync(workspace, stream);
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[bs-mean-softmax] scorer_path=tiled-one-dot "
+                "pages=%u blocks=%u distributions=%u tiles=%u "
+                "distribution_batch=%u batches=%u workspace=%.2f MiB\n",
+                total, n_blocks, n_distributions, n_tiles,
+                distributions_per_batch, batches,
+                static_cast<double>(
+                    workspace_floats * sizeof(float)) /
+                    (1024.0 * 1024.0));
+        }
+        return err == cudaSuccess && free_err == cudaSuccess;
+    }
+
+    const uint64_t n_jobs = n_distributions64 * n_tiles;
+    if (n_jobs > 0x7fffffffu) return false;
     // [partial max, partial sum] per (distribution,tile), followed by the merged
     // [global max, global sum] per distribution. cudaMallocAsync keeps allocation
     // stream ordered and lets the CUDA pool reuse this ~few-MiB workspace.
@@ -11463,7 +11814,7 @@ bool launch_block_attn_score_softmax_pages_impl(
     float *global_max = partial_sum + n_jobs;
     float *global_sum = global_max + n_distributions64;
 
-        block_attn_softmax_pages_partial_lse_kernel<KbarT><<<
+        block_attn_softmax_pages_partial_lse_kernel<QueryT, KbarT><<<
         static_cast<uint32_t>(n_jobs), kSoftmaxPagesThreads, 0, stream>>>(
         partial_max, partial_sum, q_multi, kbar_multi, n_distributions,
         n_tiles, n_tokens, q_layer_stride, n_blocks, kbar_layer_stride,
@@ -11479,7 +11830,7 @@ bool launch_block_attn_score_softmax_pages_impl(
     if (err == cudaSuccess) {
         const uint32_t score_grid =
             (n_blocks + kSoftmaxPagesThreads - 1) / kSoftmaxPagesThreads;
-        block_attn_softmax_pages_recompute_kernel<KbarT><<<
+        block_attn_softmax_pages_recompute_kernel<QueryT, KbarT><<<
             score_grid, kSoftmaxPagesThreads, 0, stream>>>(
             score, q_multi, kbar_multi, global_max, global_sum, n_layers,
             n_tokens, q_layer_stride, n_blocks, kbar_layer_stride, n_heads,
@@ -11500,33 +11851,66 @@ bool launch_block_attn_score_softmax_pages_impl(
 }
 
 bool launch_block_attn_score_softmax_pages_typed(
-        float *score, const float *q_multi, const void *kbar_multi,
-        KbarDType kbar_dtype, uint32_t n_layers, uint32_t n_tokens,
+        float *score, const void *q_multi, bool query_is_fp16,
+        const void *kbar_multi, KbarDType kbar_dtype,
+        uint32_t n_layers, uint32_t n_tokens,
         uint32_t q_layer_stride, uint32_t n_blocks,
         uint32_t kbar_layer_stride, uint32_t n_heads,
         uint32_t n_kv_heads, uint32_t head_dim, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
-        uint32_t n_subblocks, uint32_t reduce_max, cudaStream_t stream) {
+        uint32_t n_subblocks, uint32_t reduce_max, uint32_t accumulate,
+        cudaStream_t stream) {
+    if (query_is_fp16) {
+        const auto *query = static_cast<const __half *>(q_multi);
+        switch (kbar_dtype) {
+            case KbarDType::F32:
+                return launch_block_attn_score_softmax_pages_impl(
+                    score, query, static_cast<const float *>(kbar_multi),
+                    n_layers, n_tokens, q_layer_stride, n_blocks,
+                    kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                    excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
+                    accumulate, stream);
+            case KbarDType::F16:
+                return launch_block_attn_score_softmax_pages_impl(
+                    score, query, static_cast<const __half *>(kbar_multi),
+                    n_layers, n_tokens, q_layer_stride, n_blocks,
+                    kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                    excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
+                    accumulate, stream);
+            case KbarDType::FP8:
+                return launch_block_attn_score_softmax_pages_impl(
+                    score, query,
+                    static_cast<const __nv_fp8_e4m3 *>(kbar_multi),
+                    n_layers, n_tokens, q_layer_stride, n_blocks,
+                    kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                    excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
+                    accumulate, stream);
+        }
+        return false;
+    }
+    const auto *query = static_cast<const float *>(q_multi);
     switch (kbar_dtype) {
         case KbarDType::F32:
             return launch_block_attn_score_softmax_pages_impl(
-                score, q_multi, static_cast<const float *>(kbar_multi),
+                score, query, static_cast<const float *>(kbar_multi),
                 n_layers, n_tokens, q_layer_stride, n_blocks,
                 kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
-                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, stream);
+                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, accumulate,
+                stream);
         case KbarDType::F16:
             return launch_block_attn_score_softmax_pages_impl(
-                score, q_multi, static_cast<const __half *>(kbar_multi),
+                score, query, static_cast<const __half *>(kbar_multi),
                 n_layers, n_tokens, q_layer_stride, n_blocks,
                 kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
-                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, stream);
+                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, accumulate,
+                stream);
         case KbarDType::FP8:
             return launch_block_attn_score_softmax_pages_impl(
-                score, q_multi,
+                score, query,
                 static_cast<const __nv_fp8_e4m3 *>(kbar_multi), n_layers,
                 n_tokens, q_layer_stride, n_blocks, kbar_layer_stride,
                 n_heads, n_kv_heads, head_dim, scale, excl_lo_end,
-                excl_hi_begin, n_subblocks, reduce_max, stream);
+                excl_hi_begin, n_subblocks, reduce_max, accumulate, stream);
     }
     return false;
 }
@@ -11537,12 +11921,14 @@ bool launch_block_attn_score_softmax_pages(
         uint32_t n_blocks, uint32_t kbar_layer_stride, uint32_t n_heads,
         uint32_t n_kv_heads, uint32_t head_dim, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
-        uint32_t n_subblocks, uint32_t reduce_max, cudaStream_t stream) {
+        uint32_t n_subblocks, uint32_t reduce_max, uint32_t accumulate,
+        cudaStream_t stream) {
     return launch_block_attn_score_softmax_pages_typed(
-        score, q_multi, kbar_multi, KbarDType::F32, n_layers, n_tokens,
+        score, q_multi, /*query_is_fp16=*/false, kbar_multi,
+        KbarDType::F32, n_layers, n_tokens,
         q_layer_stride, n_blocks, kbar_layer_stride, n_heads, n_kv_heads,
         head_dim, scale, excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
-        stream);
+        accumulate, stream);
 }
 
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
@@ -11852,7 +12238,21 @@ bool launch_derope_query_multi(float *q_multi, const float *q,
     dim3 grid(n_heads, cnt);
     derope_query_multi_kernel<<<grid, head_dim, 0, stream>>>(
         q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim, rope_dim,
-        start_pos, theta);
+        start_pos, theta, /*output_fp16=*/false);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_derope_query_multi_f16(void *q_multi, const float *q,
+                                   uint32_t q_token_stride,
+                                   uint32_t q_head_stride, uint32_t cnt,
+                                   uint32_t n_heads, uint32_t head_dim,
+                                   uint32_t rope_dim, int32_t start_pos,
+                                   float theta, cudaStream_t stream) {
+    if (cnt == 0 || n_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_heads, cnt);
+    derope_query_multi_kernel<<<grid, head_dim, 0, stream>>>(
+        q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim, rope_dim,
+        start_pos, theta, /*output_fp16=*/true);
     return cudaGetLastError() == cudaSuccess;
 }
 

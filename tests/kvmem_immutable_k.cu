@@ -48,7 +48,7 @@ bool launch_raw_k_scatter_rope_paged_batched(
         uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
-        cudaStream_t stream);
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
 bool launch_build_rope_sincos_table(
         float *table, uint32_t positions, uint32_t rope_dim, float theta,
         cudaStream_t stream);
@@ -60,7 +60,7 @@ bool launch_raw_k_scatter_rope_paged_batched_table(
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size,
         const float *rope_sincos, uint32_t rope_table_positions,
-        cudaStream_t stream);
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
 }
 
 #define CUDA_CHECK(call) do {                                             \
@@ -244,7 +244,7 @@ int main() {
     if (!qw3::ported::launch_raw_k_scatter_rope_paged_batched(
             d_scatter_cache, d_raw_half, true, 0, 1, rows, heads,
             heads * head_dim, head_dim, rope_dim, d_to, d_ntok, d_pages4,
-            16, theta, 0)) {
+            16, theta, /*raw_block_stride_elements=*/0, 0)) {
         std::fprintf(stderr, "raw K scatter launcher rejected test input\n");
         return 1;
     }
@@ -260,7 +260,8 @@ int main() {
         !qw3::ported::launch_raw_k_scatter_rope_paged_batched_table(
             d_scatter_table_cache, d_raw_half, true, 0, 1, rows, heads,
             heads * head_dim, head_dim, rope_dim, d_to, d_ntok, d_pages4,
-            16, d_rope_table, rope_table_positions, 0)) {
+            16, d_rope_table, rope_table_positions,
+            /*raw_block_stride_elements=*/0, 0)) {
         std::fprintf(
             stderr, "table raw K scatter launcher rejected test input\n");
         return 1;
@@ -306,6 +307,54 @@ int main() {
             max_abs);
         return 1;
     }
+
+    // Block-major assembly packs [block, layer, token, element]. Select layer
+    // 1 from two blocks using a 2*block stride; block 1 must still match the
+    // same direct bake at destination position 32.
+    __half *d_raw_strided = nullptr;
+    int32_t *d_to2 = nullptr, *d_ntok2 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_raw_strided, bytes * 4));
+    CUDA_CHECK(cudaMalloc(&d_to2, 2 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_ntok2, 2 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(d_raw_strided, 0, bytes * 4));
+    CUDA_CHECK(cudaMemcpy(
+        d_raw_strided + count, d_raw_half, bytes,
+        cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        d_raw_strided + 3 * count, d_raw_half, bytes,
+        cudaMemcpyDeviceToDevice));
+    const int32_t scatter_to2[2] = {0, scatter_to};
+    const int32_t scatter_ntok2[2] = {rows, rows};
+    CUDA_CHECK(cudaMemcpy(
+        d_to2, scatter_to2, sizeof(scatter_to2),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        d_ntok2, scatter_ntok2, sizeof(scatter_ntok2),
+        cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_scatter_table_cache, 0, bytes * 2));
+    if (!qw3::ported::launch_raw_k_scatter_rope_paged_batched_table(
+            d_scatter_table_cache, d_raw_strided, true,
+            /*layer_offset=*/count, /*n_blocks=*/2, rows, heads,
+            heads * head_dim, head_dim, rope_dim, d_to2, d_ntok2,
+            d_pages4, 16, d_rope_table, rope_table_positions,
+            /*raw_block_stride_elements=*/2 * count, 0)) {
+        std::fprintf(
+            stderr, "strided raw K scatter launcher rejected test input\n");
+        return 1;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(
+        scatter_table_got.data(), d_scatter_table_cache + count,
+        bytes, cudaMemcpyDeviceToHost));
+    if (std::memcmp(
+            scatter_table_got.data(), scatter_ref.data(), bytes) != 0) {
+        std::fprintf(
+            stderr, "FAIL strided raw scatter differs from direct bake\n");
+        return 1;
+    }
+    cudaFree(d_ntok2);
+    cudaFree(d_to2);
+    cudaFree(d_raw_strided);
 
     bake_to_half<<<dim3(rows, heads), head_dim>>>(
         d_raw, d_source, rows, heads, head_dim, rope_dim, source_base, theta);

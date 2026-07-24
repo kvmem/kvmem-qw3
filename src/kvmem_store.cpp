@@ -336,7 +336,7 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
         rm.from_base = static_cast<int32_t>(b.baked_pos);   // de-rotate source
         rm.to_base = static_cast<int32_t>(window_pos);      // new window slot
         rm.skip = (b.baked_pos == static_cast<int64_t>(window_pos));
-        if (cfg_.immutable_source_k && !rm.skip) {
+        if (cfg_.immutable_source_k && (cold || !rm.skip)) {
             const uint64_t delta = static_cast<uint64_t>(
                 b.baked_pos > static_cast<int64_t>(window_pos)
                     ? b.baked_pos - static_cast<int64_t>(window_pos)

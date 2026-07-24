@@ -803,8 +803,10 @@ public:
     }
 
     // Materialize packed, unrotated raw K into arbitrary paged window slots and
-    // apply RoPE exactly once at each destination position. `raw_k` is laid out
-    // [n_blocks, max_n_tokens, per_pos_size] beginning at raw_element_offset.
+    // apply RoPE exactly once at each destination position. `raw_k` begins at
+    // raw_element_offset; raw_block_stride_elements==0 means the compatibility
+    // layout [n_blocks,max_n_tokens,per_pos_size]. A non-zero stride supports
+    // block-major, layer-interleaved assembly buffers without a CPU transpose.
     // This is the drift-free cold/periodic refresh path for immutable K.
     virtual DeviceStatus raw_k_scatter_rope_paged_batched_device(
             DeviceTensor &k_cache, const DeviceTensor &raw_k,
@@ -814,12 +816,14 @@ public:
             const DeviceTensor &to_base, const DeviceTensor &n_tokens,
             const DeviceTensor &page_indices, uint32_t page_size, float theta,
             const DeviceTensor *rope_sincos = nullptr,
-            uint32_t rope_table_positions = 0) {
+            uint32_t rope_table_positions = 0,
+            uint64_t raw_block_stride_elements = 0) {
         (void)k_cache; (void)raw_k; (void)raw_element_offset; (void)n_blocks;
         (void)max_n_tokens; (void)n_kv_heads; (void)per_pos_size;
         (void)head_dim; (void)rope_dim; (void)to_base; (void)n_tokens;
         (void)page_indices; (void)page_size; (void)theta;
         (void)rope_sincos; (void)rope_table_positions;
+        (void)raw_block_stride_elements;
         return {false,
                 "raw_k_scatter_rope_paged_batched_device requires backend override"};
     }
@@ -1099,11 +1103,12 @@ public:
                                                                uint32_t excl_lo_end = 0,
                                                                uint32_t excl_hi_begin = UINT32_MAX,
                                                                uint32_t n_subblocks = 1,
-                                                               uint32_t reduce_max = 0) {
+                                                               uint32_t reduce_max = 0,
+                                                               uint32_t accumulate = 0) {
         (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
         (void)q_layer_stride; (void)n_blocks; (void)kbar_layer_stride; (void)n_heads;
         (void)n_kv_heads; (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
-        (void)n_subblocks; (void)reduce_max;
+        (void)n_subblocks; (void)reduce_max; (void)accumulate;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 

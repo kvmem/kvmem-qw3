@@ -797,6 +797,12 @@ private:
     std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
     std::unique_ptr<HostBuffer> kvmem_cpu_bytes_;
+    // CPU-only opt_2/3 may retain a clean spill record after CPU->GPU stage-in.
+    // This turns a later eviction of the same block into metadata/page release
+    // instead of another GPU->CPU copy. It is enabled only when the CPU budget,
+    // after reserving worst-case immutable raw-K storage, can back every context
+    // block; smaller-memory configurations retain exclusive CPU semantics.
+    bool kvmem_inclusive_cpu_backing_ = false;
     // Shared recycler for the pinned CPU-tier buffer. When set (continuous-
     // batching path), configure_kvmem borrows the buffer from here instead of
     // cudaHostAlloc-ing per request; the destructor returns it. Borrowed, owned
@@ -809,12 +815,14 @@ private:
     // Lazily grown to one block.
     std::unique_ptr<HostBuffer> kvmem_stage_pinned_;
     // Immutable-K v3: unrotated K is authoritative in demand-allocated,
-    // pageable CPU chunks. A chunk stores
-    // [standard_layer, token-within-chunk, per_pos]; this preserves the old
-    // layer-major semantics without reserving --ctx worth of physical RAM at
-    // configure time. GPU stores only the current active/window-baked K.
+    // pageable CPU chunks. The compatibility layout is
+    // [standard_layer, token-within-chunk, per_pos]. The optimized layout is
+    // [block-within-chunk, standard_layer, token-within-block, per_pos], so
+    // assembly gathers one ~MiB block instead of 16 independent 64 KiB layer
+    // slices. GPU stores only the current active/window-baked K.
     // Capture/materialization still use modest pinned bounce buffers.
     uint32_t kvmem_raw_k_chunk_tokens_ = 2048;
+    bool kvmem_raw_k_block_major_ = false;
     std::vector<std::unique_ptr<uint8_t[]>> kvmem_raw_k_chunks_;
     uint64_t kvmem_raw_k_mirror_bytes_ = 0;
     uint64_t kvmem_raw_k_row_bytes_ = 0;
@@ -1250,16 +1258,41 @@ private:
                                    uint32_t batch, uint32_t base_pos,
                                    uint32_t rope_base_pos,
                                    uint32_t q_token_stride);
+    // Long retrieval queries are captured through two bounded GPU/pinned
+    // bounce slots into pageable host memory, then streamed back in token
+    // chunks for scoring. This keeps GPU use O(chunk) instead of O(L*S).
+    struct QueryCaptureSlot {
+        std::unique_ptr<DeviceTensor> device;
+        std::unique_ptr<HostBuffer> pinned;
+        std::unique_ptr<DeviceTransferFence> copy_done;
+        uint64_t capacity_elems = 0;
+        uint64_t dst_elem_offset = 0;
+        uint64_t elem_count = 0;
+        bool pending = false;
+    };
+    void kvmem_drain_query_capture_slot(uint32_t slot);
+    void kvmem_drain_query_capture();
+    bool kvmem_score_host_query_chunks(
+        uint32_t n_blocks, uint32_t kbar_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        std::string *failure_reason);
     uint32_t kvmem_query_begin_ = 0;
     uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
     uint32_t g_query_multi_count_ = 0;                         // rows captured so far (per slot)
-    uint64_t g_query_multi_capacity_ = 0;                      // allocated rows across layers
+    uint64_t g_query_multi_capacity_ = 0;                      // GPU rows: full query (legacy) or score chunk
     bool g_query_multi_ready_ = false;                         // all span rows captured
     // Persistent API sessions build the mean-K content index while ingesting
     // history, before a retrieval query exists. This flag keeps K capture live
     // when query_begin==query_end; query capture/scoring remain disabled.
     bool kvmem_qc_capture_active_ = false;
-    std::unique_ptr<DeviceTensor> g_query_multi_;              // [L, S, n_heads, head_dim] fp32
+    std::unique_ptr<DeviceTensor> g_query_multi_;              // [L,S,H,D], FP16 mean-K or legacy FP32
+    bool kvmem_query_host_capture_ = false;
+    std::unique_ptr<uint16_t[]> g_query_multi_host_;           // pageable [L,S,H,D] fp16 bits
+    uint64_t g_query_multi_host_capacity_ = 0;                 // elements, not rows
+    std::array<QueryCaptureSlot, 2> g_query_capture_slots_;
+    uint32_t g_query_capture_next_slot_ = 0;
+    std::unique_ptr<HostBuffer> g_query_score_pinned_;         // packed [L,C,H,D]
+    uint64_t g_query_score_pinned_capacity_ = 0;               // bytes
     // Clean-query prefill (task #50). The PASS-A isolated-question query is stashed
     // here; it is NOT touched by reset_state so it survives the pass boundary.
     std::unique_ptr<DeviceTensor> g_query_multi_clean_;        // [L, S, n_heads, head_dim] fp32
