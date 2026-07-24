@@ -243,28 +243,49 @@ bool run_batch_prefill_paged_typed(
     // tmp_v/tmp_s and merges them via VariableLengthMergeStates internally.
     const bool allow_split_kv =
         (float_workspace != nullptr && float_workspace_bytes > 0);
-    cudaError_t plan_st = flashinfer::PrefillPlan<int32_t>(
-        float_workspace, float_workspace_bytes,
-        plan_int_workspace,
-        plan_host_workspace,
-        plan_int_workspace_bytes,
-        plan_info,
-        qo_indptr_h,
-        kv_indptr_h,
-        batch,
-        1,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        head_dim,
-        page_size,
-        false,
-        sizeof(half),
-        -1,
-        0,
-        /*disable_split_kv=*/!allow_split_kv,
-        0,
-        stream);
+    float *active_float_workspace = float_workspace;
+    size_t active_float_workspace_bytes = float_workspace_bytes;
+    auto plan = [&](bool disable_split_kv) {
+        return flashinfer::PrefillPlan<int32_t>(
+            disable_split_kv ? nullptr : active_float_workspace,
+            disable_split_kv ? 0 : active_float_workspace_bytes,
+            plan_int_workspace,
+            plan_host_workspace,
+            plan_int_workspace_bytes,
+            plan_info,
+            qo_indptr_h,
+            kv_indptr_h,
+            batch,
+            1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            head_dim,
+            page_size,
+            false,
+            sizeof(half),
+            -1,
+            0,
+            disable_split_kv,
+            0,
+            stream);
+    };
+    cudaError_t plan_st = cudaErrorInvalidValue;
+    try {
+        plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
+    } catch (const std::exception &) {
+        // FlashInfer's aligned workspace allocator throws when a requested
+        // split plan does not fit. Correctness does not require splitting:
+        // retry with the non-split planner instead of failing the request.
+        active_float_workspace = nullptr;
+        active_float_workspace_bytes = 0;
+        plan_info = {};
+        try {
+            plan_st = plan(/*disable_split_kv=*/true);
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
     if (plan_st != cudaSuccess) return false;
 
     int32_t *q_indptr_d = int_workspace;
@@ -324,9 +345,9 @@ bool run_batch_prefill_paged_typed(
             reinterpret_cast<char *>(plan_i32) + plan_info.block_valid_mask_offset);
         params.total_num_rows = nullptr;
         tmp_v = reinterpret_cast<typename Params::DTypeO *>(
-            reinterpret_cast<char *>(float_workspace) + plan_info.v_offset);
+            reinterpret_cast<char *>(active_float_workspace) + plan_info.v_offset);
         tmp_s = reinterpret_cast<float *>(
-            reinterpret_cast<char *>(float_workspace) + plan_info.s_offset);
+            reinterpret_cast<char *>(active_float_workspace) + plan_info.s_offset);
     } else {
         params.partition_kv = false;
         params.total_num_rows = nullptr;
@@ -425,28 +446,46 @@ bool run_batch_prefill_paged_ragged_typed(
     // them via VariableLengthMergeStates (mirrors the non-ragged verify path).
     const bool allow_split_kv =
         (float_workspace != nullptr && float_workspace_bytes > 0);
-    cudaError_t plan_st = flashinfer::PrefillPlan<int32_t>(
-        float_workspace, float_workspace_bytes,
-        int_workspace,
-        host_int_workspace,
-        int_workspace_bytes,
-        plan_info,
-        const_cast<int32_t *>(q_indptr_host),
-        const_cast<int32_t *>(page_indptr_host),
-        total_q,
-        batch,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        head_dim,
-        page_size,
-        false,
-        sizeof(half),
-        -1,
-        0,
-        /*disable_split_kv=*/!allow_split_kv,
-        0,
-        stream);
+    float *active_float_workspace = float_workspace;
+    size_t active_float_workspace_bytes = float_workspace_bytes;
+    auto plan = [&](bool disable_split_kv) {
+        return flashinfer::PrefillPlan<int32_t>(
+            disable_split_kv ? nullptr : active_float_workspace,
+            disable_split_kv ? 0 : active_float_workspace_bytes,
+            int_workspace,
+            host_int_workspace,
+            int_workspace_bytes,
+            plan_info,
+            const_cast<int32_t *>(q_indptr_host),
+            const_cast<int32_t *>(page_indptr_host),
+            total_q,
+            batch,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            head_dim,
+            page_size,
+            false,
+            sizeof(half),
+            -1,
+            0,
+            disable_split_kv,
+            0,
+            stream);
+    };
+    cudaError_t plan_st = cudaErrorInvalidValue;
+    try {
+        plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
+    } catch (const std::exception &) {
+        active_float_workspace = nullptr;
+        active_float_workspace_bytes = 0;
+        plan_info = {};
+        try {
+            plan_st = plan(/*disable_split_kv=*/true);
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
     if (plan_st != cudaSuccess) return false;
 
     auto paged_kv = flashinfer::paged_kv_t<TKV, int32_t>(
@@ -498,9 +537,9 @@ bool run_batch_prefill_paged_ragged_typed(
             reinterpret_cast<char *>(plan_i32) + plan_info.block_valid_mask_offset);
         params.total_num_rows = nullptr;
         tmp_v = reinterpret_cast<typename Params::DTypeO *>(
-            reinterpret_cast<char *>(float_workspace) + plan_info.v_offset);
+            reinterpret_cast<char *>(active_float_workspace) + plan_info.v_offset);
         tmp_s = reinterpret_cast<float *>(
-            reinterpret_cast<char *>(float_workspace) + plan_info.s_offset);
+            reinterpret_cast<char *>(active_float_workspace) + plan_info.s_offset);
     } else {
         params.partition_kv = false;
         params.total_num_rows = nullptr;

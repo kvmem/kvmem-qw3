@@ -483,6 +483,13 @@ public:
     // can grab >100 pages at once, so a "only when nearly empty" trigger would
     // let the pool exhaust mid-chunk and throw). No-op when not bounded/tiered.
     void kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens);
+    // SSD Opt2+ write-through producer. Call only after every KV source for
+    // [0, completed_pos) is durable (for local-position MTP this means after
+    // prime_mtp_prefix_from_last_batch). Full newly-completed blocks are packed
+    // to pinned slabs on the copy stream without changing GPU residency; their
+    // D2H overlaps the following prefill chunk and SSD persistence follows in
+    // the existing bounded background writer.
+    void kvmem_prefill_writeback(uint32_t completed_pos);
 
     // Assemble the deterministic long-prefill working set: configured sink
     // prefix plus the newest blocks filling the rest of the selection budget.
@@ -584,6 +591,13 @@ private:
         void release_logical_pages(DeviceBackend &backend,
                                    uint32_t logical_start,
                                    uint32_t count);
+        // Release many disjoint logical ranges with one allocator update and
+        // one compact page-table upload spanning the touched interval. This
+        // avoids one tiny pageable H2D operation per KVMem block during a
+        // batched stage-out.
+        void release_logical_page_ranges(
+            DeviceBackend &backend,
+            const std::vector<std::pair<uint32_t, uint32_t>> &ranges);
         int32_t allocate_physical_page(uint32_t logical_page) const;
         // Install pre-existing (pinned, cache-owned) physical pages as logical
         // pages [0..shared.size()) without allocating. Must be called on a
@@ -830,12 +844,22 @@ private:
     std::unique_ptr<HostBuffer> kvmem_raw_mtp_transfer_host_;
     // Immutable mode shares one strict host-memory budget between the
     // demand-allocated raw-K authority and a pageable, sparse CPU V cache.
-    // Long-lived pageable storage avoids pinning tens of GiB; bounded pinned
-    // staging is handled independently by the transfer path.
+    // Sparse slots are backed by lazy ~64 MiB pageable slabs: this avoids one
+    // mmap-sized allocation per block without pinning tens of GiB. Empty slabs
+    // are released, and their full allocation (not just live slots) is charged
+    // to the shared budget. Bounded pinned staging is handled independently.
     bool kvmem_sparse_cpu_tier_ = false;
     uint64_t kvmem_cpu_budget_bytes_ = 0;
     uint64_t kvmem_cpu_sparse_bytes_ = 0;
-    std::vector<std::unique_ptr<uint8_t[]>> kvmem_cpu_sparse_slots_;
+    struct KvMemCpuSparseSlab {
+        std::unique_ptr<uint8_t[]> data;
+        uint32_t live_slots = 0;
+        uint32_t capacity_slots = 0;
+    };
+    std::vector<KvMemCpuSparseSlab> kvmem_cpu_sparse_slabs_;
+    std::vector<uint8_t> kvmem_cpu_sparse_slot_live_;
+    uint32_t kvmem_cpu_sparse_slots_per_slab_ = 1;
+    uint64_t kvmem_cpu_sparse_slot_bytes_ = 0;
     struct KvMemPrefetchBlock {
         uint32_t block_id = 0;
         KvTier from = KvTier::GPU;
@@ -846,6 +870,20 @@ private:
         int32_t slot = -1;
         uint64_t batch_offset = 0;
         std::vector<uint8_t> buffer;
+    };
+    struct KvMemPrefetchCpuRead {
+        uint32_t block_id = 0;
+        uint64_t bytes = 0;
+        int32_t slot = -1;
+        uint64_t batch_offset = 0;
+    };
+    struct KvMemPrefetchCpuBatch {
+        size_t read_begin = 0;
+        size_t read_end = 0;
+        std::unique_ptr<HostBuffer> buffer;
+        std::vector<int32_t> src_page_indices;
+        std::vector<int32_t> dst_page_indices;
+        std::unique_ptr<DeviceTransferFence> fence;
     };
     struct KvMemPrefetchNvmeBatch {
         size_t read_begin = 0;
@@ -859,7 +897,9 @@ private:
         uint64_t start_exit_ns = 0;
         uint64_t finish_enter_ns = 0;
         uint64_t finish_exit_ns = 0;
+        uint64_t cpu_gather_ns = 0;
         uint64_t cpu_h2d_enqueue_ns = 0;
+        uint64_t cpu_h2d_wait_ns = 0;
         uint64_t nvme_read_ns = 0;
         uint64_t nvme_wait_ns = 0;
         uint64_t pending_write_wait_ns = 0;
@@ -868,6 +908,7 @@ private:
         uint64_t cpu_bytes = 0;
         uint64_t nvme_bytes = 0;
         uint64_t nvme_read_syscalls = 0;
+        uint32_t cpu_h2d_batches = 0;
         uint32_t nvme_read_batches = 0;
         uint32_t cpu_blocks = 0;
         uint32_t nvme_blocks = 0;
@@ -880,6 +921,10 @@ private:
         // the newest accepted-token MTP prefix is temporarily catching up.
         bool stage_mtp_pages = false;
         std::vector<KvMemPrefetchBlock> blocks;
+        std::vector<KvMemPrefetchCpuRead> cpu_reads;
+        bool bulk_cpu = false;
+        size_t next_cpu_read = 0;
+        std::deque<KvMemPrefetchCpuBatch> cpu_batches;
         std::vector<KvMemPrefetchNvmeRead> nvme_reads;
         std::future<void> nvme_future;
         bool bulk_nvme = false;
@@ -905,10 +950,32 @@ private:
         uint32_t async_batches = 0;
     };
     struct KvMemPendingWriteBatch {
+        struct CpuCopy {
+            uint32_t block_id = 0;
+            int32_t slot = -1;
+            uint8_t *dst = nullptr;
+            uint64_t buffer_offset = 0;
+            uint64_t bytes = 0;
+        };
         std::shared_ptr<std::vector<uint8_t>> buffer;
+        std::shared_ptr<HostBuffer> pinned_buffer;
+        uint64_t buffer_bytes = 0;
+        bool proactive = false;
         std::vector<NvmeIoSpan> spans;
         std::vector<uint32_t> block_ids;
+        std::vector<CpuCopy> cpu_copies;
         std::future<NvmeBatchIoStats> future;
+        uint64_t submit_ns = 0;
+    };
+    struct KvMemProactiveD2hBatch {
+        std::shared_ptr<HostBuffer> buffer;
+        uint64_t bytes = 0;
+        uint32_t completed_pos = 0;
+        std::vector<NvmeIoSpan> spans;
+        std::vector<uint32_t> block_ids;
+        std::vector<int32_t> src_page_indices;
+        std::vector<int32_t> dst_page_indices;
+        std::unique_ptr<DeviceTransferFence> fence;
         uint64_t submit_ns = 0;
     };
     struct KvMemReselectPerf {
@@ -927,7 +994,29 @@ private:
     // faulting 64 MiB pageable buffers on the stage-out critical path.
     std::deque<std::shared_ptr<std::vector<uint8_t>>>
         kvmem_free_write_slabs_;
+    // SSD prefill write-through owns two chunk-sized slab sets by default.
+    // With 64 MiB I/O slabs a 2048-token chunk of the current model occupies
+    // two slabs, so four slabs are needed to avoid recycling the previous
+    // chunk's SSD-owned storage before the next D2H can start. A slab remains
+    // alive through D2H and its background SSD write, so GPU residency can be
+    // retained while persistence progresses independently.
+    std::deque<std::shared_ptr<HostBuffer>>
+        kvmem_free_writeback_slabs_;
+    size_t kvmem_writeback_slab_count_ = 0;
+    std::deque<KvMemProactiveD2hBatch>
+        kvmem_proactive_d2h_batches_;
+    bool kvmem_prefill_writeback_enabled_ = false;
+    uint32_t kvmem_writeback_next_block_ = 0;
+    uint64_t kvmem_writeback_d2h_bytes_ = 0;
+    uint64_t kvmem_writeback_d2h_wait_ns_ = 0;
+    uint32_t kvmem_writeback_d2h_batches_ = 0;
+    uint32_t kvmem_writeback_blocks_ = 0;
+    // Two pinned D2H slabs are enough to overlap CPU scatter of batch N with
+    // the copy-stream transfer of batch N+1. They are allocated only for
+    // CPU-only opt_2/3 profiles; SSD profiles keep their existing writer path.
+    std::deque<std::unique_ptr<HostBuffer>> kvmem_free_stageout_slabs_;
     std::deque<std::unique_ptr<HostBuffer>> kvmem_free_read_slabs_;
+    size_t kvmem_read_slab_count_ = 0;
     uint64_t kvmem_async_write_completed_bytes_ = 0;
     uint64_t kvmem_async_write_completed_syscalls_ = 0;
     uint64_t kvmem_async_write_completed_ns_ = 0;
@@ -935,6 +1024,12 @@ private:
         std::shared_ptr<std::vector<uint8_t>> buffer,
         std::vector<NvmeIoSpan> spans,
         std::vector<uint32_t> block_ids);
+    void kvmem_submit_pinned_write_batch(
+        std::shared_ptr<HostBuffer> buffer, uint64_t bytes,
+        std::vector<NvmeIoSpan> spans,
+        std::vector<uint32_t> block_ids,
+        std::vector<KvMemPendingWriteBatch::CpuCopy> cpu_copies);
+    void kvmem_finish_proactive_d2h(bool wait_all);
     void kvmem_reap_pending_writes(bool wait_all);
     bool kvmem_pending_reselect_ = false;
     KvMemPlan kvmem_pending_plan_;
@@ -947,7 +1042,10 @@ private:
     void kvmem_stage_in(const KvMemPlan &plan);
     void kvmem_start_prefetch(const KvMemPlan &plan);
     void kvmem_finish_prefetch();
+    void kvmem_submit_prefetch_cpu_batches();
     void kvmem_submit_prefetch_nvme_batches();
+    void kvmem_stage_out_cpu_batched(
+        const std::vector<uint32_t> &block_ids);
     void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
     bool kvmem_block_pages_resident(const KvMemBlock &block) const;
     bool kvmem_block_mtp_pages_resident(const KvMemBlock &block) const;

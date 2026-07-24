@@ -55,6 +55,9 @@ struct NvmeBatchIoStats {
     uint64_t duration_ns = 0;
     uint64_t cache_drop_bytes = 0;
     uint64_t cache_drop_failures = 0;
+    uint64_t cpu_copy_bytes = 0;
+    uint64_t cpu_copy_ns = 0;
+    uint32_t cpu_copy_blocks = 0;
 };
 
 class NvmeKvTier {

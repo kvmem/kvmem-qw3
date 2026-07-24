@@ -911,6 +911,19 @@ PrefillAttnKernel prefill_attn_kernel_choice() {
     return choice;
 }
 
+uint64_t flashinfer_prefill_float_workspace_elements() {
+    static const uint64_t elements = []() {
+        uint64_t mib = 512;
+        if (const char *env =
+                std::getenv("QW3_FLASHINFER_PREFILL_WORKSPACE_MIB")) {
+            const long long parsed = std::atoll(env);
+            if (parsed >= 0) mib = static_cast<uint64_t>(parsed);
+        }
+        return (mib << 20) / sizeof(float);
+    }();
+    return elements;
+}
+
 // Min batch (= number of prefill queries) at which we switch to the tiled
 // kernel. Below this the per-query split-K kernel wins (more parallelism per
 // query). Override with QW3_PREFILL_ATTN_MIN_BATCH.
@@ -4813,8 +4826,34 @@ __global__ void attention_norm_mid_kernel(float *mid,
     mid[head * head_dim + tid] = v[kvh * head_dim + tid] * (1.0f / (1.0f + expf(-gate)));
 }
 
+// Scatter one target tensor's pages from a packed H2D slab. Page payloads and
+// CUDA allocations are at least 16-byte aligned, so uint4 keeps the kernel
+// bandwidth-bound while a two-dimensional grid supports pages larger than one
+// CTA. src/dst page arrays are target-major and already point at this target's
+// slice.
+__global__ void packed_kv_page_scatter_kernel(
+        uint4 *dst, const uint4 *src,
+        const int32_t *src_pages, const int32_t *dst_pages,
+        uint32_t pages, uint32_t uint4_per_page) {
+    const uint32_t page = blockIdx.x;
+    const uint32_t unit =
+        blockIdx.y * blockDim.x + threadIdx.x;
+    if (page >= pages || unit >= uint4_per_page) return;
+    const uint64_t src_idx =
+        static_cast<uint64_t>(src_pages[page]) * uint4_per_page + unit;
+    const uint64_t dst_idx =
+        static_cast<uint64_t>(dst_pages[page]) * uint4_per_page + unit;
+    dst[dst_idx] = src[src_idx];
+}
+
 class CudaDeviceBackend final : public DeviceBackend {
     static constexpr uint32_t kFlashInferBatchPrefillHostSlots = 8;
+    struct CudaKvTransferFence final : DeviceTransferFence {
+        cudaEvent_t event = nullptr;
+        ~CudaKvTransferFence() override {
+            if (event) cudaEventDestroy(event);
+        }
+    };
 public:
     explicit CudaDeviceBackend(LinearBackend linear_backend)
         : linear_backend_(linear_backend) {}
@@ -4830,6 +4869,14 @@ public:
         }
         if (dequant_stream_) cudaStreamDestroy(dequant_stream_);
         if (kv_copy_exec_ready_) cudaEventDestroy(kv_copy_exec_ready_);
+        // Packed storage may still be referenced by the non-blocking KV copy
+        // stream. Stream destruction synchronizes too, but doing it explicitly
+        // lets us free the shared stage only after all gather/scatter work and
+        // its terminal H2D/D2H have completed.
+        if (kv_copy_stream_) cudaStreamSynchronize(kv_copy_stream_);
+        if (kv_packed_stage_) cudaFree(kv_packed_stage_);
+        if (kv_packed_src_pages_) cudaFree(kv_packed_src_pages_);
+        if (kv_packed_dst_pages_) cudaFree(kv_packed_dst_pages_);
         if (kv_copy_stream_) cudaStreamDestroy(kv_copy_stream_);
         if (graph_instance_) cudaGraphExecDestroy(graph_instance_);
         if (exec_stream_) cudaStreamDestroy(exec_stream_);
@@ -4911,6 +4958,42 @@ public:
         if (!kv_copy_stream_) return {};
         return cuda_status(cudaStreamSynchronize(kv_copy_stream_),
                            "KVMem copy stream synchronize");
+    }
+
+    DeviceStatus record_kv_transfer_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        auto marker = std::make_unique<CudaKvTransferFence>();
+        if (auto st = cuda_status(
+                cudaEventCreateWithFlags(
+                    &marker->event, cudaEventDisableTiming),
+                "KVMem transfer fence create"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaEventRecord(marker->event, kv_copy_stream_),
+                "KVMem transfer fence record"); !st.ok) {
+            return st;
+        }
+        fence = std::move(marker);
+        return {};
+    }
+
+    DeviceStatus wait_kv_transfer_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (!fence) return {};
+        auto *marker =
+            dynamic_cast<CudaKvTransferFence *>(fence.get());
+        if (!marker || !marker->event) {
+            return {false, "KVMem transfer fence has no CUDA event"};
+        }
+        if (auto st = cuda_status(
+                cudaEventSynchronize(marker->event),
+                "KVMem transfer fence synchronize"); !st.ok) {
+            return st;
+        }
+        fence.reset();
+        return {};
     }
 
     DeviceStatus end() override {
@@ -9100,11 +9183,12 @@ public:
             // Float scratch for FlashInfer split-KV partial-output merge. The
             // planner partitions the long KV stream across many CTAs (verify is
             // batch~5 vs base grid 4 CTAs), writes per-chunk partial O+LSE here,
-            // then merges via VariableLengthMergeStates. 512 MiB covers the
-            // worst case (24 heads × ~94 padded_batch × 128 cta_tile_q × 256
-            // head_dim × 4B ≈ 282 MiB); overflow degrades gracefully to a
-            // disable-split plan + batch-decode fallback.
-            const uint64_t float_elems = 128ull << 20;  // 512 MiB
+            // then merges via VariableLengthMergeStates. The default 512 MiB
+            // covers large multi-request batches; single-request deployments
+            // can cap it with QW3_FLASHINFER_PREFILL_WORKSPACE_MIB. If the
+            // planner cannot fit a split plan it safely uses a non-split plan.
+            const uint64_t float_elems =
+                flashinfer_prefill_float_workspace_elements();
             if (auto st = ensure_flashinfer_batch_prefill_workspace(
                     q_elems, o_elems, meta_i32_elems, float_elems); !st.ok) {
                 return st;
@@ -9226,7 +9310,8 @@ public:
             // batch is only a few query rows per request but each attends a
             // long KV, so without splitting the grid starves (~n_kv_heads CTAs)
             // and co-batching concurrent requests yields no attention speedup.
-            const uint64_t float_elems = 128ull << 20;  // 512 MiB scratch
+            const uint64_t float_elems =
+                flashinfer_prefill_float_workspace_elements();
             if (auto st = ensure_flashinfer_batch_prefill_workspace(
                     q_elems, o_elems, meta_i32_elems, float_elems); !st.ok) {
                 return st;
@@ -10051,6 +10136,289 @@ public:
                            "copy_bytes_from_host async");
     }
 
+    DeviceStatus copy_packed_pages_from_host_async(
+            const void *host, uint64_t host_bytes,
+            const std::vector<DeviceTensor *> &targets,
+            const int32_t *src_page_indices,
+            const int32_t *dst_page_indices,
+            uint32_t pages_per_target,
+            uint64_t page_bytes) override {
+        if (host_bytes == 0 || targets.empty() ||
+            pages_per_target == 0) {
+            return {};
+        }
+        if (!host || !src_page_indices || !dst_page_indices) {
+            return {false, "packed KV scatter received null storage"};
+        }
+        if (page_bytes == 0 || page_bytes % sizeof(uint4) != 0 ||
+            host_bytes % page_bytes != 0) {
+            return {false,
+                    "packed KV scatter requires uint4-aligned pages"};
+        }
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        const uint64_t index_count =
+            static_cast<uint64_t>(targets.size()) *
+            pages_per_target;
+        const uint64_t packed_pages = host_bytes / page_bytes;
+        for (size_t t = 0; t < targets.size(); ++t) {
+            if (!targets[t]) {
+                return {false, "packed KV scatter target is null"};
+            }
+            const auto &target = as_tensor(*targets[t]);
+            const uint64_t target_bytes =
+                target.count * static_cast<uint64_t>(target.elem_size);
+            const uint64_t target_pages = target_bytes / page_bytes;
+            const uint64_t base =
+                static_cast<uint64_t>(t) * pages_per_target;
+            for (uint32_t p = 0; p < pages_per_target; ++p) {
+                const int32_t src_page =
+                    src_page_indices[base + p];
+                const int32_t dst_page =
+                    dst_page_indices[base + p];
+                if (src_page < 0 || dst_page < 0 ||
+                    static_cast<uint64_t>(src_page) >= packed_pages ||
+                    static_cast<uint64_t>(dst_page) >= target_pages) {
+                    return {false,
+                            "packed KV scatter page index out of range"};
+                }
+            }
+        }
+        if (host_bytes > kv_packed_stage_capacity_ ||
+            index_count > kv_packed_page_capacity_) {
+            // Reallocation must not invalidate storage referenced by an older
+            // queued slab. In steady state the first 64 MiB batch establishes
+            // both capacities and this synchronization is never revisited.
+            if (auto st = cuda_status(
+                    cudaStreamSynchronize(kv_copy_stream_),
+                    "packed KV scatter resize synchronize"); !st.ok) {
+                return st;
+            }
+        }
+        if (host_bytes > kv_packed_stage_capacity_) {
+            if (kv_packed_stage_) cudaFree(kv_packed_stage_);
+            kv_packed_stage_ = nullptr;
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_stage_,
+                               static_cast<size_t>(host_bytes)),
+                    "packed KV scatter stage alloc"); !st.ok) {
+                kv_packed_stage_capacity_ = 0;
+                return st;
+            }
+            kv_packed_stage_capacity_ = host_bytes;
+        }
+        if (index_count > kv_packed_page_capacity_) {
+            if (kv_packed_src_pages_) cudaFree(kv_packed_src_pages_);
+            if (kv_packed_dst_pages_) cudaFree(kv_packed_dst_pages_);
+            kv_packed_src_pages_ = nullptr;
+            kv_packed_dst_pages_ = nullptr;
+            const size_t bytes =
+                static_cast<size_t>(index_count) * sizeof(int32_t);
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_src_pages_, bytes),
+                    "packed KV scatter src-index alloc"); !st.ok) {
+                kv_packed_page_capacity_ = 0;
+                return st;
+            }
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_dst_pages_, bytes),
+                    "packed KV scatter dst-index alloc"); !st.ok) {
+                cudaFree(kv_packed_src_pages_);
+                kv_packed_src_pages_ = nullptr;
+                kv_packed_page_capacity_ = 0;
+                return st;
+            }
+            kv_packed_page_capacity_ = index_count;
+        }
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_stage_, host,
+                    static_cast<size_t>(host_bytes),
+                    cudaMemcpyHostToDevice, kv_copy_stream_),
+                "packed KV slab H2D"); !st.ok) {
+            return st;
+        }
+        const size_t indices_bytes =
+            static_cast<size_t>(index_count) * sizeof(int32_t);
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_src_pages_, src_page_indices,
+                    indices_bytes, cudaMemcpyHostToDevice,
+                    kv_copy_stream_),
+                "packed KV src-index H2D"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_dst_pages_, dst_page_indices,
+                    indices_bytes, cudaMemcpyHostToDevice,
+                    kv_copy_stream_),
+                "packed KV dst-index H2D"); !st.ok) {
+            return st;
+        }
+
+        const uint32_t uint4_per_page =
+            static_cast<uint32_t>(page_bytes / sizeof(uint4));
+        constexpr uint32_t kThreads = 256;
+        const dim3 grid(
+            pages_per_target,
+            (uint4_per_page + kThreads - 1) / kThreads);
+        for (size_t t = 0; t < targets.size(); ++t) {
+            auto &target = as_tensor(*targets[t]);
+            const int32_t *src_pages =
+                kv_packed_src_pages_ + t * pages_per_target;
+            const int32_t *dst_pages =
+                kv_packed_dst_pages_ + t * pages_per_target;
+            packed_kv_page_scatter_kernel<<<
+                grid, kThreads, 0, kv_copy_stream_>>>(
+                reinterpret_cast<uint4 *>(target.ptr),
+                reinterpret_cast<const uint4 *>(kv_packed_stage_),
+                src_pages, dst_pages, pages_per_target,
+                uint4_per_page);
+        }
+        return launch_status("packed KV page scatter");
+    }
+
+    DeviceStatus copy_packed_pages_to_host_async(
+            void *host, uint64_t host_bytes,
+            const std::vector<DeviceTensor *> &targets,
+            const int32_t *src_page_indices,
+            const int32_t *dst_page_indices,
+            uint32_t pages_per_target,
+            uint64_t page_bytes) override {
+        if (host_bytes == 0 || targets.empty() ||
+            pages_per_target == 0) {
+            return {};
+        }
+        if (!host || !src_page_indices || !dst_page_indices) {
+            return {false, "packed KV gather received null storage"};
+        }
+        if (page_bytes == 0 || page_bytes % sizeof(uint4) != 0 ||
+            host_bytes % page_bytes != 0) {
+            return {false,
+                    "packed KV gather requires uint4-aligned pages"};
+        }
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        const uint64_t index_count =
+            static_cast<uint64_t>(targets.size()) *
+            pages_per_target;
+        const uint64_t packed_pages = host_bytes / page_bytes;
+        for (size_t t = 0; t < targets.size(); ++t) {
+            if (!targets[t]) {
+                return {false, "packed KV gather source is null"};
+            }
+            const auto &target = as_tensor(*targets[t]);
+            const uint64_t target_bytes =
+                target.count * static_cast<uint64_t>(target.elem_size);
+            const uint64_t target_pages = target_bytes / page_bytes;
+            const uint64_t base =
+                static_cast<uint64_t>(t) * pages_per_target;
+            for (uint32_t p = 0; p < pages_per_target; ++p) {
+                const int32_t src_page =
+                    src_page_indices[base + p];
+                const int32_t dst_page =
+                    dst_page_indices[base + p];
+                if (src_page < 0 || dst_page < 0 ||
+                    static_cast<uint64_t>(src_page) >= target_pages ||
+                    static_cast<uint64_t>(dst_page) >= packed_pages) {
+                    return {false,
+                            "packed KV gather page index out of range"};
+                }
+            }
+        }
+        if (host_bytes > kv_packed_stage_capacity_ ||
+            index_count > kv_packed_page_capacity_) {
+            // The staging allocation is shared with packed stage-in. Do not
+            // resize storage that may still be referenced by queued work.
+            if (auto st = cuda_status(
+                    cudaStreamSynchronize(kv_copy_stream_),
+                    "packed KV gather resize synchronize"); !st.ok) {
+                return st;
+            }
+        }
+        if (host_bytes > kv_packed_stage_capacity_) {
+            if (kv_packed_stage_) cudaFree(kv_packed_stage_);
+            kv_packed_stage_ = nullptr;
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_stage_,
+                               static_cast<size_t>(host_bytes)),
+                    "packed KV gather stage alloc"); !st.ok) {
+                kv_packed_stage_capacity_ = 0;
+                return st;
+            }
+            kv_packed_stage_capacity_ = host_bytes;
+        }
+        if (index_count > kv_packed_page_capacity_) {
+            if (kv_packed_src_pages_) cudaFree(kv_packed_src_pages_);
+            if (kv_packed_dst_pages_) cudaFree(kv_packed_dst_pages_);
+            kv_packed_src_pages_ = nullptr;
+            kv_packed_dst_pages_ = nullptr;
+            const size_t bytes =
+                static_cast<size_t>(index_count) * sizeof(int32_t);
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_src_pages_, bytes),
+                    "packed KV gather src-index alloc"); !st.ok) {
+                kv_packed_page_capacity_ = 0;
+                return st;
+            }
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_dst_pages_, bytes),
+                    "packed KV gather dst-index alloc"); !st.ok) {
+                cudaFree(kv_packed_src_pages_);
+                kv_packed_src_pages_ = nullptr;
+                kv_packed_page_capacity_ = 0;
+                return st;
+            }
+            kv_packed_page_capacity_ = index_count;
+        }
+        const size_t indices_bytes =
+            static_cast<size_t>(index_count) * sizeof(int32_t);
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_src_pages_, src_page_indices,
+                    indices_bytes, cudaMemcpyHostToDevice,
+                    kv_copy_stream_),
+                "packed KV gather src-index H2D"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_dst_pages_, dst_page_indices,
+                    indices_bytes, cudaMemcpyHostToDevice,
+                    kv_copy_stream_),
+                "packed KV gather dst-index H2D"); !st.ok) {
+            return st;
+        }
+
+        const uint32_t uint4_per_page =
+            static_cast<uint32_t>(page_bytes / sizeof(uint4));
+        constexpr uint32_t kThreads = 256;
+        const dim3 grid(
+            pages_per_target,
+            (uint4_per_page + kThreads - 1) / kThreads);
+        for (size_t t = 0; t < targets.size(); ++t) {
+            const auto &target = as_tensor(*targets[t]);
+            const int32_t *src_pages =
+                kv_packed_src_pages_ + t * pages_per_target;
+            const int32_t *dst_pages =
+                kv_packed_dst_pages_ + t * pages_per_target;
+            packed_kv_page_scatter_kernel<<<
+                grid, kThreads, 0, kv_copy_stream_>>>(
+                reinterpret_cast<uint4 *>(kv_packed_stage_),
+                reinterpret_cast<const uint4 *>(target.ptr),
+                src_pages, dst_pages, pages_per_target,
+                uint4_per_page);
+        }
+        if (auto st = launch_status("packed KV page gather"); !st.ok) {
+            return st;
+        }
+        return cuda_status(cudaMemcpyAsync(
+                               host, kv_packed_stage_,
+                               static_cast<size_t>(host_bytes),
+                               cudaMemcpyDeviceToHost,
+                               kv_copy_stream_),
+                           "packed KV slab D2H");
+    }
+
     DeviceStatus copy_d2d(DeviceTensor &dst,
                           const DeviceTensor &src,
                           uint64_t src_offset,
@@ -10198,6 +10566,11 @@ private:
     cudaEvent_t  hgemm_done_[2]   = {nullptr, nullptr};
     cudaStream_t kv_copy_stream_ = nullptr;
     cudaEvent_t kv_copy_exec_ready_ = nullptr;
+    void *kv_packed_stage_ = nullptr;
+    uint64_t kv_packed_stage_capacity_ = 0;
+    int32_t *kv_packed_src_pages_ = nullptr;
+    int32_t *kv_packed_dst_pages_ = nullptr;
+    uint64_t kv_packed_page_capacity_ = 0;
     // Q8_1 staging buffer for the ported mmvq path. Reused across calls;
     // grows on demand. Bytes hold (batch * blocks_per_row) block_q8_1 = 36 B.
     void   *q8_1_scratch_ = nullptr;

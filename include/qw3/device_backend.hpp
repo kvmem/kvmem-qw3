@@ -56,6 +56,15 @@ struct HostBuffer {
     bool pinned = false;
 };
 
+// Opaque completion marker for the dedicated KV transfer stream. CUDA records
+// a cudaEvent behind all copies queued so far; synchronous/mock backends use
+// the default implementation below, which drains the transfer immediately and
+// returns a null marker. Keeping the marker backend-owned lets the executor
+// pipeline two pinned slabs without leaking CUDA types into the public header.
+struct DeviceTransferFence {
+    virtual ~DeviceTransferFence() = default;
+};
+
 class DeviceBackend {
 public:
     virtual ~DeviceBackend() = default;
@@ -1535,6 +1544,16 @@ public:
     virtual DeviceStatus begin_kv_transfer_from_device() { return {}; }
     virtual DeviceStatus begin_kv_transfer_to_device() { return {}; }
     virtual DeviceStatus wait_kv_transfer() { return {}; }
+    virtual DeviceStatus record_kv_transfer_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) {
+        fence.reset();
+        return wait_kv_transfer();
+    }
+    virtual DeviceStatus wait_kv_transfer_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) {
+        fence.reset();
+        return {};
+    }
     virtual DeviceStatus copy_bytes_to_host_async(const DeviceTensor &x,
                                                   void *host,
                                                   uint64_t byte_offset,
@@ -1555,6 +1574,43 @@ public:
                                                     const void *host,
                                                     uint64_t byte_count) {
         return copy_bytes_from_host(x, byte_offset, host, byte_count);
+    }
+
+    // CPU-tier stage-in fast path. `host` contains a packed slab of KV pages.
+    // One H2D moves the slab into a reusable backend staging allocation, then
+    // one scatter kernel per target tensor writes its pages to arbitrary
+    // physical cache slots. src/dst_page_indices are target-major arrays with
+    // target_count * pages_per_target int32 entries and must remain alive until
+    // the following KV-transfer fence completes.
+    virtual DeviceStatus copy_packed_pages_from_host_async(
+            const void *host, uint64_t host_bytes,
+            const std::vector<DeviceTensor *> &targets,
+            const int32_t *src_page_indices,
+            const int32_t *dst_page_indices,
+            uint32_t pages_per_target,
+            uint64_t page_bytes) {
+        (void)host; (void)host_bytes; (void)targets;
+        (void)src_page_indices; (void)dst_page_indices;
+        (void)pages_per_target; (void)page_bytes;
+        return {false,
+                "copy_packed_pages_from_host_async not implemented"};
+    }
+
+    // Symmetric CPU-tier stage-out path: gather arbitrary physical cache pages
+    // into the backend's packed staging allocation on the KV copy stream, then
+    // issue one contiguous D2H into `host`.
+    virtual DeviceStatus copy_packed_pages_to_host_async(
+            void *host, uint64_t host_bytes,
+            const std::vector<DeviceTensor *> &targets,
+            const int32_t *src_page_indices,
+            const int32_t *dst_page_indices,
+            uint32_t pages_per_target,
+            uint64_t page_bytes) {
+        (void)host; (void)host_bytes; (void)targets;
+        (void)src_page_indices; (void)dst_page_indices;
+        (void)pages_per_target; (void)page_bytes;
+        return {false,
+                "copy_packed_pages_to_host_async not implemented"};
     }
 
     // Device-to-device copy: dst[0..count) = src[src_offset..src_offset+count).

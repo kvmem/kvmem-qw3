@@ -156,8 +156,8 @@ enum class KvMemDeltaNetLayerPolicy : uint8_t { Even = 0, Late = 1 };
 enum class KvMemOptimizationLevel : uint8_t {
     KvmemInit = 0,
     Opt1 = 1,  // reduce SSD load volume: heat-aware CPU cache
-    Opt2 = 2,  // reduce stage-out: inclusive + bounded async writes
-    Opt3 = 3,  // reduce stage-in: coalesced reads + read/H2D overlap
+    Opt2 = 2,  // reduce stage-out: batched D2H; async SSD writes when present
+    Opt3 = 3,  // reduce stage-in: pinned H2D pipeline; coalesced SSD reads
 };
 
 struct KvMemStoreConfig {

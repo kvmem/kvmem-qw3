@@ -355,37 +355,73 @@ Rules:
 
 Write-through is the most important latency change.
 
-For a 2048-token prefill chunk:
+With immutable source K and local-position MTP, tier records contain the 16
+normal-attention V pages plus one MTP V page. Raw K remains in its independent
+position-free source store and is not duplicated in the SSD record. For the
+current Qwen3.6-27B configuration:
 
 ```text
 2048 tokens / 32 = 64 complete blocks
-64 * 2.125 MiB = 136 MiB of raw-K+V
+1 block = 17 * 64 KiB = 1.0625 MiB
+1 chunk = 64 * 1.0625 MiB = 68 MiB
 ```
 
-Pipeline:
+The implemented `opt_2`/`opt_3` SSD pipeline is:
 
 ```text
-compute prefill chunk N
-  || pack complete blocks from chunk N-1 on GPU
-  || D2H packed stripes N-2 into a write slab
-  || SSD writes slab N-3
+MAIN + MTP compute chunk N
+  || packed gather + D2H for chunk N-1
+  || SSD write for chunk N-2
 ```
 
-Implementation:
+At the MAIN+MTP completion boundary for each chunk:
 
-1. Retain raw K in the bounded pre-RoPE capture buffers already used by
-   immutable K.
-2. Launch a GPU gather kernel that packs raw K plus paged V into stripe order.
-3. Copy one large packed range into a pinned write slab.
-4. As soon as D2H completes, submit aligned stripe writes.
-5. Optionally copy admitted records from the write slab into pageable CPU cache
-   slots.
-6. Mark SSD clean on successful completion and recycle the slab.
+1. find newly completed full blocks;
+2. GPU-gather their paged V into one contiguous device staging range;
+3. enqueue one D2H per slab on the dedicated KV copy stream;
+4. retain the original GPU pages, so later prefill is unaffected;
+5. at the next chunk boundary, wait only for any uncovered D2H tail, reserve
+   any heat-aware CPU-cache destinations, then hand the pinned slab to a
+   bounded background worker;
+6. in that worker, populate admitted CPU-cache records and issue the positional
+   SSD writes while the next GPU prefill chunk runs;
+7. mark the block `in_flight` only after D2H owns a complete copy;
+8. allow pressure selection to release the GPU page immediately when either an
+   in-flight slab or clean SSD copy exists;
+9. publish CPU-copy metadata and mark SSD clean only after the worker
+   completes.
+
+Four 64 MiB pinned slabs are the portable default. A 2048-token chunk occupies
+two slabs (68 MiB), so four slabs form two chunk-sized sets: one may remain
+owned by SSD writes while the next receives D2H. Override the bounded pool with
+`QW3_KVMEM_WRITEBACK_SLABS` (2 through 16) and the common slab size with
+`QW3_KVMEM_IO_SLAB_MIB`.
+
+This path is enabled by default only when all of the following are true:
+
+- optimization level is `opt_2` or `opt_3`;
+- an SSD tier exists;
+- immutable source K is enabled;
+- MTP is absent or uses local-position K.
+
+Set `QW3_KVMEM_PREFILL_WRITEBACK=0` for a matched compatibility baseline.
+Set `QW3_KVMEM_PREFILL_CPU_ADMIT=0` only when measuring an SSD-only profile;
+the production default retains CPU admission so proactive write-through does
+not turn later CPU hits into SSD reads.
+Legacy mutable-K or baked-position MTP configurations continue through the
+selection-time stage-out path because a non-destructive write-through copy
+cannot canonicalize their working K in place.
+
+In `opt_3`, CPU hits and SSD misses remain separate producers but may appear in
+the same selection. CPU records use packed gather/H2D while SSD records use
+coalesced reads. The mixed configuration preallocates two 64 MiB pinned read
+slabs for each producer, avoiding dynamic pinned allocation when one pipeline
+temporarily consumes the other one's buffers.
 
 At 3K prefill tokens/s, KV production is:
 
 ```text
-3000 * 68 KiB = 199.2 MiB/s
+3000 * 34 KiB = 99.6 MiB/s
 ```
 
 The current SSD sustained more than 1.5 GiB/s even in the conservative
@@ -401,6 +437,13 @@ If SSD writeback falls behind:
 
 Partial tail blocks stay GPU-resident. They are packed when full or when an
 explicit session checkpoint requests a drain.
+
+With `QW3_KVMEM_PERF_TRACE=1`, `[kvmem-writeback]` records show:
+
+- `event=d2h_submit`: completed position, block count, and bytes;
+- `event=ssd_submit`: exposed D2H wait and the elapsed overlap window;
+- `event=ssd_complete`: device write duration, queue depth, and whether the
+  batch came from prefill write-through or pressure fallback.
 
 ## 8. Exact mean-K index at 10M
 

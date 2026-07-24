@@ -5076,13 +5076,16 @@ private:
                             }
                             throw;
                         }
-                        if (mtp_local) {
-                            a.executor
-                                ->kvmem_finish_deferred_prefill_pressure();
-                        }
                         if (!prefix.ok) {
                             throw std::runtime_error(
                                 "MTP prefix priming failed in batched lane");
+                        }
+                        a.executor->kvmem_prefill_writeback(
+                            a.executor->last_forward_logical_base() +
+                            static_cast<uint32_t>(chunk.size()));
+                        if (mtp_local) {
+                            a.executor
+                                ->kvmem_finish_deferred_prefill_pressure();
                         }
                     } else if (mtp_local) {
                         a.executor->kvmem_set_defer_prefill_pressure(false);
@@ -8702,7 +8705,7 @@ private:
         // above budget the bounded GPU pool caps the width, which the priming
         // loop now honors instead of forcing a re-split that disabled the path.
         constexpr uint32_t kMtpPrefillChunk = 4096;
-        if (use_mtp_prefix) {
+        if (use_mtp_prefix && executor_->prefill_chunk_override() < 0) {
             executor_->set_prefill_chunk_override(static_cast<int>(kMtpPrefillChunk));
         }
 
@@ -8737,11 +8740,6 @@ private:
                 }
                 throw;
             }
-            // The target rows and MTP K/V for this chunk are now both durable.
-            // Pressure selection may safely spill pages only after this point.
-            if (mtp_local_positions) {
-                executor_->kvmem_finish_deferred_prefill_pressure();
-            }
             if (!mtp.ok) {
                 std::ostringstream msg;
                 msg << "native mtp_prefix: ok=false"
@@ -8756,6 +8754,16 @@ private:
                     executor_->kvmem_set_defer_prefill_pressure(false);
                 }
                 return;
+            }
+            // The target rows and MTP K/V for this chunk are now both durable.
+            // Start SSD write-through before pressure selection: the new D2H
+            // remains non-destructive and can overlap the next MAIN prefill.
+            executor_->kvmem_prefill_writeback(
+                base_position +
+                static_cast<uint32_t>(tokens.size()));
+            // Pressure selection may safely spill pages only after this point.
+            if (mtp_local_positions) {
+                executor_->kvmem_finish_deferred_prefill_pressure();
             }
             mtp_prefix_tokens += static_cast<uint32_t>(tokens.size());
             mtp_prefix_ops += mtp.ops_executed;

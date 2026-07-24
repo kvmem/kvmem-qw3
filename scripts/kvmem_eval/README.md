@@ -36,19 +36,35 @@ optimization profiles are deliberately grouped by the bottleneck they target:
 | Level | Added behavior | Primary objective |
 |---|---|---|
 | `opt_1` | heat-aware CPU admission and eviction | reduce the number of bytes loaded from SSD |
-| `opt_2` | inclusive clean SSD backing, a bounded asynchronous positional-write queue, and recyclable pageable slabs | reduce stage-out latency |
-| `opt_3` | coalesced positional reads and two preallocated/recycled pinned read slabs that pipeline SSD reads with H2D | reduce stage-in latency |
+| `opt_2` | GPU-gather pages into contiguous slabs and batch D2H; with SSD, proactively write completed prefill blocks in the background, retain inclusive clean backing, and use bounded asynchronous positional writes | reduce stage-out latency |
+| `opt_3` | CPU slots are gathered into two pinned slabs, copied by one H2D per slab, then GPU-scattered to cache pages; with SSD, also coalesce reads and pipeline SSD reads with H2D | reduce stage-in latency |
 
-Inclusive backing requires an NVMe arena large enough for one spill record per
+`opt_2` and `opt_3` work with CPU-only storage. In that mode CPU spill remains
+exclusive so the tier only needs enough slots for non-resident blocks; retaining
+every promoted CPU copy would otherwise require one CPU slot for every possible
+context block and can deadlock a full working-set swap. When NVMe is configured,
+inclusive SSD backing requires an arena large enough for one spill record per
 possible context block. These profiles do not change retrieval scores, selected
 block IDs, or KV values.
 
-The portable defaults are 64 MiB I/O slabs and write queue depth 8: `opt_2`
-prewarms at most 512 MiB pageable write staging and `opt_3` adds 128 MiB pinned
-read staging. After
+The portable default is a 64 MiB slab. CPU-only `opt_2` prewarms two pinned D2H
+slabs (128 MiB), and `opt_3` adds two pinned gather/H2D slabs (128 MiB). A
+reusable GPU staging slab adds at most 64 MiB and is shared by both directions.
+With SSD, `opt_2` instead prewarms at most 512 MiB pageable write staging at the
+default queue depth 8. It also prewarms four 64 MiB pinned write-through slabs:
+for the current model a 2048-token immutable-K+MTP chunk occupies about 68 MiB,
+so this is a two-chunk buffer. `opt_3` additionally uses the two pinned read
+slabs per active read producer (two for CPU-only or SSD-only, four when CPU
+hits and SSD misses may coexist). After
 profiling a different host, override them with `QW3_KVMEM_IO_SLAB_MIB` and
 `QW3_KVMEM_WRITE_QUEUE_DEPTH`; both values are range-checked and the queue
-remains bounded.
+remains bounded. CPU gather defaults to four worker threads and can be tuned
+from 1 through 16 with `QW3_KVMEM_CPU_GATHER_THREADS`. The SSD write-through
+pool can be tuned from two through sixteen slabs with
+`QW3_KVMEM_WRITEBACK_SLABS`, or disabled for a matched baseline with
+`QW3_KVMEM_PREFILL_WRITEBACK=0`. The completed D2H slab also feeds the existing
+heat-aware CPU cache by default; `QW3_KVMEM_PREFILL_CPU_ADMIT=0` is an
+SSD-only diagnostic mode.
 
 The frozen ten-sample query-replay launcher accepts the same switch:
 
@@ -62,13 +78,21 @@ KVMEM_OPT_LEVEL=opt_1 TAG=query_replay_opt1 \
 
 Use `QW3_KVMEM_PERF_TRACE=1` for timed reselection stages. In `opt_1`, the
 server also emits `[kvmem-cache]` rows containing incoming CPU hit rate,
-admissions, rejected admissions, and evictions. In `opt_2`, the trace reports
-clean-backing reuse, async gather/submission/backpressure, and completed write
-bytes/syscalls. In `opt_3`, it additionally reports bulk read batches,
-positional-I/O syscalls, read wait time, and H2D enqueue/wait time.
+admissions, rejected admissions, and evictions. In CPU-only `opt_2`, the trace
+reports packed D2H batch count/bytes, exposed fence wait, and CPU scatter time;
+its SSD mode additionally reports clean-backing reuse and completed write
+bytes/syscalls. SSD mode also emits `[kvmem-writeback]` D2H-submit, SSD-submit,
+and SSD-complete events, including the D2H tail that remained exposed after the
+next prefill chunk. In `opt_3`, the trace reports CPU gather, packed H2D
+batch/enqueue/wait times; SSD mode additionally reports bulk read batches,
+positional-I/O syscalls, and read wait time.
 
 The matched implementation benchmark and raw artifact tags are recorded in
 [`docs/kvmem_storage_optimization_benchmark_20260723.md`](../../docs/kvmem_storage_optimization_benchmark_20260723.md).
+The CPU-only packed D2H/H2D and GPU gather/scatter comparison is in
+[`docs/kvmem_cpu_transfer_optimization_benchmark_20260724.md`](../../docs/kvmem_cpu_transfer_optimization_benchmark_20260724.md).
+The SSD prefill write-through and mixed CPU+SSD pipeline benchmark is in
+[`docs/kvmem_ssd_writeback_benchmark_20260724.md`](../../docs/kvmem_ssd_writeback_benchmark_20260724.md).
 
 ## Inspect a configuration
 

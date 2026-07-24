@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# AgentLongBench-Long fixed 512K normal100 with ordinary KVMem + MTP-4.
-# The default storage profile is CPU-only opt_1: a 640K logical context,
-# 224K selected context, 32K generation reserve, and no NVMe tier.  CTX,
-# CPU_GB, NVME_GB, NVME_DIR, and KVMEM_OPT_LEVEL remain overridable so the
-# earlier 1M + NVMe configuration can still be reproduced without editing
-# this launcher. Query replay, immutable source K, and MTP-4 are explicit;
-# DeltaNet rebuilt-state capture/seed/export/import is deliberately absent.
+# Role-preserving AgentLongBench 512K normal100 turn-ingest experiment.
+#
+# This launcher is intentionally separate from the canonical one-shot runner.
+# It starts a generic qw3 KVMem server, while the Python harness owns turn
+# splitting, capacity timing, retrieval-query choice, and teacher-forced
+# history ingest.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PORT=${PORT:-8087}
+PORT=${PORT:-18087}
 CTX=${CTX:-655360}
+KVMEM_BUDGET=${KVMEM_BUDGET:-204800}
+GEN_BUDGET=${GEN_BUDGET:-32768}
+ACTIVE_CAPACITY=${ACTIVE_CAPACITY:-$((KVMEM_BUDGET + GEN_BUDGET))}
 CPU_GB=${CPU_GB:-64}
 NVME_GB=${NVME_GB:-0}
 KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
-KVMEM_BUDGET=${KVMEM_BUDGET:-229376}
-GEN_BUDGET=${GEN_BUDGET:-32768}
-TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_opt1_20260723}
+TAG=${TAG:-agentlongbench_512k_normal100_turn_ingest_k200k_g32k_b32_20260724}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
 MODEL=${MODEL:-$ROOT/models/Qwen3.6-27B-Q8_0.gguf}
@@ -28,16 +28,14 @@ RUN_LOG=${RUN_LOG:-$LOG_ROOT/${TAG}_runner.log}
 PID_FILE=${PID_FILE:-$LOG_ROOT/${TAG}.pid}
 LIMIT=${LIMIT:-}
 EXPECTED=${EXPECTED:-${LIMIT:-100}}
-METHOD=${METHOD:-kvmem_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_fp16}
+METHOD=${METHOD:-kvmem_turn_ingest_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_fp16}
 
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy=127.0.0.1,localhost
 mkdir -p "$RESULT_ROOT" "$LOG_ROOT"
 echo $$ >"$PID_FILE"
 
-tier_args=(
-  --kvmem-cpu-gb "$CPU_GB"
-)
+tier_args=(--kvmem-cpu-gb "$CPU_GB")
 if [[ "$NVME_GB" != "0" && "$NVME_GB" != "0.0" ]]; then
   mkdir -p "$NVME_DIR"
   tier_args+=(
@@ -58,6 +56,10 @@ if [[ ! "$EXPECTED" =~ ^[1-9][0-9]*$ ]] || (( EXPECTED > 100 )); then
   echo "EXPECTED must be an integer in [1, 100], got: $EXPECTED" >&2
   exit 2
 fi
+if (( ACTIVE_CAPACITY != KVMEM_BUDGET + GEN_BUDGET )); then
+  echo "warning: ACTIVE_CAPACITY=$ACTIVE_CAPACITY differs from budget sum " \
+       "$((KVMEM_BUDGET + GEN_BUDGET))" >&2
+fi
 
 server_pid=""
 cleanup() {
@@ -74,9 +76,6 @@ if curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
   exit 3
 fi
 
-# `env -u` is part of the experiment invariant: this run must never seed,
-# capture, export, or import a rebuilt DeltaNet state. The evaluator likewise
-# sends only kvmem_query_span/context-span metadata.
 env \
   -u QW3_KVMEM_REBUILT_STATE_DIR \
   QW3_KVMEM_RECOMPUTE_QUERY=1 \
@@ -90,7 +89,8 @@ env \
     --model "$MODEL" \
     --ctx "$CTX" --kv-dtype fp16 \
     --kvmem --kvmem-block-tokens 32 \
-    --kvmem-budget "$KVMEM_BUDGET" --kvmem-gen-budget "$GEN_BUDGET" \
+    --kvmem-budget "$KVMEM_BUDGET" \
+    --kvmem-gen-budget "$GEN_BUDGET" \
     --kvmem-sink-blocks 8 --kvmem-recent-blocks 0 \
     --kvmem-method retrieval --kvmem-retrieval-method mean-k \
     --kvmem-update-mode step --kvmem-query-conditioned \
@@ -129,24 +129,20 @@ if ! grep -q 'kvmem_recompute_query=1' "$SERVER_LOG" ||
   echo "server did not confirm query replay + immutable K + MTP-4" >&2
   exit 5
 fi
-if rg -q 'rebuilt-state|REBUILT_STATE' "$SERVER_LOG"; then
-  echo "rebuilt-state activity unexpectedly appeared in server log" >&2
-  exit 5
-fi
 
-"$ROOT/.venv/bin/python" "$ROOT/scripts/kvmem_eval/run_agentlongbench_kvmem.py" \
+"$ROOT/.venv/bin/python" \
+  "$ROOT/scripts/kvmem_eval/run_agentlongbench_turn_ingest.py" \
   --benchmark-repo /home/chaidi/AgentLongBench_Motivation \
-  --dataset "$DATA" --manifest "$MANIFEST" --allow-custom-subset \
-  --benchmark-name AgentLongBench-512K-normal100 \
+  --dataset "$DATA" \
+  --manifest "$MANIFEST" \
   --output-root "$RESULT_ROOT" \
   --api-base "http://127.0.0.1:$PORT/v1" \
   --model "$(basename "$MODEL")" \
   --method "$METHOD" \
+  --active-capacity "$ACTIVE_CAPACITY" \
   --temperature 0.6 --top-p 0.95 --max-tokens 32768 \
-  --context-window "$CTX" --context-safety-margin 16 \
   --timeout-sec 7200 --max-sample-sec 7200 --attempts 3 \
   --enable-thinking --seed 20260722 \
-  --kvmem-retrieval-trace-metadata \
   "${limit_args[@]}" \
   2>&1 | tee -a "$RUN_LOG"
 
@@ -156,11 +152,14 @@ import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
 expected = int(sys.argv[2])
-if (not report.get("passed") or report.get("answers_unique") != expected
-        or report.get("eval_unique") != expected):
-    raise SystemExit(f"AgentLongBench validation failed: {report}")
+if (
+    not report.get("passed")
+    or report.get("answers_unique") != expected
+    or report.get("eval_unique") != expected
+):
+    raise SystemExit(f"AgentLongBench turn-ingest validation failed: {report}")
 print(
-    f"AgentLongBench validation passed: {expected} answers "
+    f"AgentLongBench turn-ingest validation passed: {expected} answers "
     f"and {expected} evaluations"
 )
 PY
