@@ -8096,6 +8096,75 @@ public:
         return status;
     }
 
+    bool can_defer_recurrent_projection_outputs(
+            const DeviceWeight *const *weights,
+            uint32_t fanout,
+            uint32_t batch,
+            uint32_t num_k_heads,
+            uint32_t num_v_heads,
+            uint32_t head_k_dim,
+            uint32_t head_v_dim,
+            uint32_t proj_count,
+            uint32_t proj_stride,
+            uint32_t gate_stride,
+            uint32_t alpha_stride,
+            uint32_t beta_stride,
+            bool state_checkpoints,
+            bool deltanet_capture) const override {
+#ifndef QW3_ENABLE_GDN_SM120_AOT
+        (void)weights;
+        (void)fanout;
+        (void)batch;
+        (void)num_k_heads;
+        (void)num_v_heads;
+        (void)head_k_dim;
+        (void)head_v_dim;
+        (void)proj_count;
+        (void)proj_stride;
+        (void)gate_stride;
+        (void)alpha_stride;
+        (void)beta_stride;
+        (void)state_checkpoints;
+        (void)deltanet_capture;
+        return false;
+#else
+        // Lazy recurrent metadata is currently emitted only by the fused
+        // BF16 RMSNorm -> FP8 mixed-fanout route, whose dispatch requires
+        // batch > 256. Smaller trailing prefill chunks must materialize.
+        if (!weights || fanout != 4 || batch <= 256 ||
+            state_checkpoints || deltanet_capture ||
+            !fp8_lazy_recurrent_pair_enabled() ||
+            recurrent_kernel_choice() != RecurrentKernel::Sm120Aot ||
+            !gdn_sm120_fused_io_enabled() ||
+            !parallel_prefill_conv_enabled() ||
+            head_k_dim != 128 || head_v_dim != 128 ||
+            proj_count !=
+                2u * num_k_heads * head_k_dim +
+                    num_v_heads * head_v_dim ||
+            proj_stride < proj_count ||
+            gate_stride < num_v_heads * head_v_dim ||
+            alpha_stride != beta_stride) {
+            return false;
+        }
+        for (uint32_t i = 0; i < fanout; ++i) {
+            if (!weights[i]) return false;
+            const auto &weight = as_weight(*weights[i]);
+            if (weight.type != WeightType::FP8_E4M3 &&
+                weight.type != WeightType::BF16) {
+                return false;
+            }
+        }
+        const auto &proj = as_weight(*weights[0]);
+        const auto &gate = as_weight(*weights[1]);
+        return proj.type == WeightType::FP8_E4M3 &&
+               gate.type == WeightType::FP8_E4M3 &&
+               proj.fp8_packed_second == &gate &&
+               proj.fp8_packed_rows == proj.rows + gate.rows &&
+               proj.rows == proj_count &&
+               gate.rows >= num_v_heads * head_v_dim;
+#endif
+    }
+
     DeviceStatus rms_norm_q8_0_matmul_attention_fanout(
             DeviceTensor &normalized,
             DeviceTensor *const *outs,
@@ -11419,6 +11488,19 @@ public:
         const bool consume_lazy_pair =
             lazy_pair && use_sm120_aot &&
             gdn_sm120_fused_io_enabled() && use_parallel_conv;
+        const uintptr_t p_begin = reinterpret_cast<uintptr_t>(p.ptr);
+        const uintptr_t p_end =
+            p_begin + static_cast<uintptr_t>(p.count) * p.elem_size;
+        const uintptr_t g_begin = reinterpret_cast<uintptr_t>(g.ptr);
+        const uintptr_t g_end =
+            g_begin + static_cast<uintptr_t>(g.count) * g.elem_size;
+        const bool projection_storage_overlaps =
+            p_begin < g_end && g_begin < p_end;
+        if (!consume_lazy_pair && projection_storage_overlaps) {
+            return {
+                false,
+                "recurrent compact projection views require lazy consumption"};
+        }
         if (lazy_pair && !consume_lazy_pair) {
             const uint64_t elements =
                 static_cast<uint64_t>(batch) *

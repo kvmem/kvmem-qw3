@@ -437,6 +437,42 @@ public:
             x, norm_weight, batch, in_stride, eps);
     }
 
+    // True when the recurrent projection fanout will leave `proj` and `gate`
+    // as backend-owned lazy results that recurrent_batch consumes without
+    // writing either output tensor. Executors may then use overlapping
+    // metadata-only views for those two outputs. The default is conservative.
+    virtual bool can_defer_recurrent_projection_outputs(
+            const DeviceWeight *const *weights,
+            uint32_t fanout,
+            uint32_t batch,
+            uint32_t num_k_heads,
+            uint32_t num_v_heads,
+            uint32_t head_k_dim,
+            uint32_t head_v_dim,
+            uint32_t proj_count,
+            uint32_t proj_stride,
+            uint32_t gate_stride,
+            uint32_t alpha_stride,
+            uint32_t beta_stride,
+            bool state_checkpoints,
+            bool deltanet_capture) const {
+        (void)weights;
+        (void)fanout;
+        (void)batch;
+        (void)num_k_heads;
+        (void)num_v_heads;
+        (void)head_k_dim;
+        (void)head_v_dim;
+        (void)proj_count;
+        (void)proj_stride;
+        (void)gate_stride;
+        (void)alpha_stride;
+        (void)beta_stride;
+        (void)state_checkpoints;
+        (void)deltanet_capture;
+        return false;
+    }
+
     // Attention projections can defer FP8 output scaling until Q/K
     // normalization and FP8 V-cache append consume the values.
     virtual DeviceStatus rms_norm_q8_0_matmul_attention_fanout(

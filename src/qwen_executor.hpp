@@ -546,6 +546,7 @@ private:
     void ensure_batch_scratch(uint32_t batch);
     void ensure_ffn_mid_batch_scratch();
     void ensure_ffn_gate_up_batch_scratch();
+    void ensure_recurrent_materialization_batch_scratch(uint32_t active_batch);
 
     bool scratch_ready_ = false;
     std::unique_ptr<DeviceTensor> h_;
@@ -567,6 +568,8 @@ private:
     uint32_t ffn_batch_stride_ = 0;
     uint32_t ffn_mid_batch_capacity_ = 0;
     uint32_t ffn_gate_up_batch_capacity_ = 0;
+    uint32_t recurrent_materialization_batch_capacity_ = 0;
+    bool compact_lazy_recurrent_arena_ = false;
     // Declared before its views so normal reverse-order destruction releases
     // every non-owning view before the backing allocation.
     std::unique_ptr<DeviceTensor> batch_scratch_arena_;
@@ -579,6 +582,8 @@ private:
     std::unique_ptr<DeviceTensor> ffn_out_batch_;
     std::unique_ptr<DeviceTensor> proj_batch_;
     std::unique_ptr<DeviceTensor> gate_proj_batch_;
+    std::unique_ptr<DeviceTensor> proj_batch_materialized_;
+    std::unique_ptr<DeviceTensor> gate_proj_batch_materialized_;
     std::unique_ptr<DeviceTensor> alpha_batch_;
     std::unique_ptr<DeviceTensor> beta_batch_;
     std::unique_ptr<DeviceTensor> core_batch_;
