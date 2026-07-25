@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 namespace qw3 {
 namespace flashinfer_adapter {
@@ -533,6 +534,117 @@ bool run_batch_prefill_paged_ragged_typed(
 }
 
 } // namespace
+
+bool batch_prefill_paged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        uint32_t n_pages,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t base_seq_len,
+        uint32_t batch) {
+    int_workspace_bytes = 0;
+    float_workspace_bytes = 0;
+    if (batch == 0 || page_size == 0 || n_heads == 0 ||
+        n_kv_heads == 0 || n_heads % n_kv_heads != 0) {
+        return false;
+    }
+    const uint32_t kv_len = base_seq_len + batch;
+    const uint32_t need_pages =
+        std::max<uint32_t>((kv_len + page_size - 1U) / page_size, 1U);
+    if (need_pages > n_pages ||
+        batch > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
+        need_pages >
+            static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+
+    int32_t qo_indptr_h[2] = {0, static_cast<int32_t>(batch)};
+    int32_t kv_indptr_h[2] = {0, static_cast<int32_t>(need_pages)};
+    size_t plan_int_bytes = 0;
+    const cudaError_t status =
+        flashinfer::PrefillPlanWorkspaceSize<int32_t>(
+            float_workspace_bytes,
+            plan_int_bytes,
+            qo_indptr_h,
+            kv_indptr_h,
+            batch,
+            1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            head_dim,
+            page_size,
+            false,
+            sizeof(half),
+            -1,
+            0,
+            /*disable_split_kv=*/false,
+            0,
+            nullptr);
+    if (status != cudaSuccess ||
+        plan_int_bytes >
+            std::numeric_limits<size_t>::max() -
+                kPagedPrefillPrefixI32 * sizeof(int32_t)) {
+        int_workspace_bytes = 0;
+        float_workspace_bytes = 0;
+        return false;
+    }
+    int_workspace_bytes =
+        kPagedPrefillPrefixI32 * sizeof(int32_t) + plan_int_bytes;
+    return true;
+}
+
+bool batch_prefill_paged_ragged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim) {
+    int_workspace_bytes = 0;
+    float_workspace_bytes = 0;
+    if (!q_indptr_host || !page_indptr_host || batch == 0 ||
+        total_q == 0 || page_size == 0 || n_heads == 0 ||
+        n_kv_heads == 0 || n_heads % n_kv_heads != 0 ||
+        q_indptr_host[0] != 0 ||
+        q_indptr_host[batch] != static_cast<int32_t>(total_q) ||
+        page_indptr_host[0] != 0 || page_indptr_host[batch] <= 0) {
+        return false;
+    }
+    const cudaError_t status =
+        flashinfer::PrefillPlanWorkspaceSize<int32_t>(
+            float_workspace_bytes,
+            int_workspace_bytes,
+            const_cast<int32_t *>(q_indptr_host),
+            const_cast<int32_t *>(page_indptr_host),
+            total_q,
+            batch,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            head_dim,
+            page_size,
+            false,
+            sizeof(half),
+            -1,
+            0,
+            /*disable_split_kv=*/false,
+            0,
+            nullptr);
+    if (status != cudaSuccess) {
+        int_workspace_bytes = 0;
+        float_workspace_bytes = 0;
+        return false;
+    }
+    return true;
+}
 
 bool launch_prefill_f16q_f16kv_gated(
         float *out,

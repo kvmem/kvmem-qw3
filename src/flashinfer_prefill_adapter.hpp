@@ -11,6 +11,31 @@
 namespace qw3 {
 namespace flashinfer_adapter {
 
+// Query the exact scheduler workspace required by the same FlashInfer plan
+// used by the corresponding launch function.
+bool batch_prefill_paged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        uint32_t n_pages,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t base_seq_len,
+        uint32_t batch);
+
+bool batch_prefill_paged_ragged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim);
+
 // FlashInfer single-prefill adapter. Two variants share the same Q/KV layout:
 //   q:   FP32 [batch, n_heads, q_stride] — Q in the first head_dim slots,
 //        sigmoid gate in the next head_dim slots (qw3 / qw3_ly convention).

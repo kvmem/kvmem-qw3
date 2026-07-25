@@ -402,6 +402,29 @@ bool launch_derope_query_multi(float *q_multi, const float *q,
 
 #if QW3_ENABLE_FLASHINFER
 namespace flashinfer_adapter {
+bool batch_prefill_paged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        uint32_t n_pages,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t base_seq_len,
+        uint32_t batch);
+
+bool batch_prefill_paged_ragged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim);
+
 bool launch_prefill_f16q_f16kv(
         float *out,
         __half *q_f16,
@@ -6443,6 +6466,41 @@ public:
             static_cast<double>(fp4_gemm_workspace_capacity_) / kMiB,
             static_cast<double>(output_staging_bytes) / kMiB,
             shared_linear_output_workspace_enabled() ? 1 : 0);
+        std::fprintf(
+            stderr,
+            "[qw3] CUDA attention workspace: fattn=%.2f MiB "
+            "cublas_q=%.2f MiB cublas_scores=%.2f MiB gqa=%.2f MiB "
+            "fi_decode_o=%.2f MiB fi_decode_tmp=%.2f MiB "
+            "fi_batch_decode_o=%.2f MiB fi_batch_decode_v=%.2f MiB "
+            "fi_batch_decode_s=%.2f MiB fi_batch_decode_meta=%.2f MiB "
+            "fi_batch_prefill_q=%.2f MiB fi_batch_prefill_o=%.2f MiB "
+            "fi_batch_prefill_meta=%.2f MiB fi_batch_prefill_float=%.2f MiB\n",
+            static_cast<double>(fattn_scratch_capacity_) / kMiB,
+            static_cast<double>(
+                prefill_attn_q_fp16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                prefill_attn_scores_fp16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(prefill_gqa_scratch_capacity_) / kMiB,
+            static_cast<double>(
+                flashinfer_decode_o_f16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_decode_tmp_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_decode_o_f16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_decode_tmp_v_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_decode_tmp_s_capacity_ * sizeof(float)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_decode_meta_i32_capacity_ * sizeof(int32_t)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_prefill_q_f16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_prefill_o_f16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_prefill_meta_i32_capacity_ * sizeof(int32_t)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_prefill_float_capacity_ * sizeof(float)) / kMiB);
     }
 
     // -- CUDA graph capture for decode --
@@ -13423,6 +13481,18 @@ public:
         return {};
     }
 
+    static bool flashinfer_prefill_exact_workspace_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_FLASHINFER_PREFILL_EXACT_WORKSPACE");
+            return !value || !*value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        return enabled;
+    }
+
     DeviceStatus acquire_flashinfer_batch_prefill_host_workspace(void **host_workspace) {
         const uint32_t slot = flashinfer_batch_prefill_meta_next_slot_
             % kFlashInferBatchPrefillHostSlots;
@@ -14447,15 +14517,23 @@ public:
             const uint64_t q_elems =
                 static_cast<uint64_t>(batch) * n_heads * head_dim;
             const uint64_t o_elems = q_elems;
-            const uint64_t meta_i32_elems = 1u << 20;  // 4 MiB scheduler/prefix workspace.
-            // Float scratch for FlashInfer split-KV partial-output merge. The
-            // planner partitions the long KV stream across many CTAs (verify is
-            // batch~5 vs base grid 4 CTAs), writes per-chunk partial O+LSE here,
-            // then merges via VariableLengthMergeStates. 512 MiB covers the
-            // worst case (24 heads × ~94 padded_batch × 128 cta_tile_q × 256
-            // head_dim × 4B ≈ 282 MiB); overflow degrades gracefully to a
-            // disable-split plan + batch-decode fallback.
-            const uint64_t float_elems = 128ull << 20;  // 512 MiB
+            size_t meta_bytes = 4ull << 20;
+            size_t float_bytes = 512ull << 20;
+            if (flashinfer_prefill_exact_workspace_enabled()) {
+                size_t exact_meta_bytes = 0;
+                size_t exact_float_bytes = 0;
+                if (flashinfer_adapter::batch_prefill_paged_workspace_bytes(
+                        exact_meta_bytes, exact_float_bytes,
+                        n_pages, page_size, n_heads, n_kv_heads, head_dim,
+                        base_seq_len, batch)) {
+                    meta_bytes = exact_meta_bytes;
+                    float_bytes = exact_float_bytes;
+                }
+            }
+            const uint64_t meta_i32_elems =
+                (meta_bytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+            const uint64_t float_elems =
+                (float_bytes + sizeof(float) - 1) / sizeof(float);
             if (auto st = ensure_flashinfer_batch_prefill_workspace(
                     q_elems, o_elems, meta_i32_elems, float_elems); !st.ok) {
                 return st;
@@ -14572,12 +14650,24 @@ public:
             const uint64_t q_elems =
                 static_cast<uint64_t>(total_q) * n_heads * head_dim;
             const uint64_t o_elems = q_elems;
-            const uint64_t meta_i32_elems = 1u << 20;
-            // Enable FlashInfer split-KV for the ragged MTP verify batch: the
-            // batch is only a few query rows per request but each attends a
-            // long KV, so without splitting the grid starves (~n_kv_heads CTAs)
-            // and co-batching concurrent requests yields no attention speedup.
-            const uint64_t float_elems = 128ull << 20;  // 512 MiB scratch
+            size_t meta_bytes = 4ull << 20;
+            size_t float_bytes = 512ull << 20;
+            if (flashinfer_prefill_exact_workspace_enabled()) {
+                size_t exact_meta_bytes = 0;
+                size_t exact_float_bytes = 0;
+                if (flashinfer_adapter::
+                        batch_prefill_paged_ragged_workspace_bytes(
+                            exact_meta_bytes, exact_float_bytes,
+                            q_indptr_host, page_indptr_host, batch, total_q,
+                            page_size, n_heads, n_kv_heads, head_dim)) {
+                    meta_bytes = exact_meta_bytes;
+                    float_bytes = exact_float_bytes;
+                }
+            }
+            const uint64_t meta_i32_elems =
+                (meta_bytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+            const uint64_t float_elems =
+                (float_bytes + sizeof(float) - 1) / sizeof(float);
             if (auto st = ensure_flashinfer_batch_prefill_workspace(
                     q_elems, o_elems, meta_i32_elems, float_elems); !st.ok) {
                 return st;
