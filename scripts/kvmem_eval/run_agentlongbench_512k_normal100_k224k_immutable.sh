@@ -17,13 +17,7 @@ KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
 KVMEM_BUDGET=${KVMEM_BUDGET:-229376}
 GEN_BUDGET=${GEN_BUDGET:-32768}
 KV_DTYPE=${KV_DTYPE:-fp16}
-if [[ -z "${PREFILL_CHUNK:-}" ]]; then
-  if [[ "$KV_DTYPE" == "fp8" ]]; then
-    PREFILL_CHUNK=8192
-  else
-    PREFILL_CHUNK=2048
-  fi
-fi
+PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_opt1_20260723}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}

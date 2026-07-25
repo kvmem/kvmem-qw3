@@ -223,12 +223,12 @@ New runs define `ttft_sec` as the earliest non-empty token across the
 are not rewritten; when comparing old results, use the minimum of their
 `first_reasoning_sec` and `first_content_sec`.
 
-## Selected production profile
+## Default profile after the memory/accuracy review
 
 For the full FP8 AgentLongBench runs:
 
 - `--kv-dtype fp8`;
-- `--prefill-chunk 8192`;
+- `--prefill-chunk 2048`;
 - `--kvmem-budget 229376` (224K context) plus a 32K generation reserve;
 - `--kvmem-optimization-level opt_3`;
 - plan reuse enabled (default);
@@ -236,6 +236,14 @@ For the full FP8 AgentLongBench runs:
 - CPU tier preferred; SSD used only if the logical source exceeds safe host
   capacity.
 
-At 200K, the profile preserves roughly 4.7 GiB GPU headroom below the 48 GiB
-target on the fixed sample.  The accuracy-preserving 224K FP8 control remains
-below 48 GiB as well, with an observed peak of about 43--44 GiB.
+The 8192-token measurements above remain useful performance data, but 8192 is
+no longer the default: its throughput improvement did not justify the larger
+prefill scratch and reduced memory headroom, especially when sharing the GPU
+with a second experiment.  Callers may still request 4096 or 8192 explicitly
+for an isolated benchmark.
+
+At 200K, the FP8 profile preserves roughly 4.7 GiB GPU headroom below the
+48 GiB target on the fixed sample.  The accuracy-preserving 224K FP8 control
+also remained below 48 GiB in the earlier 8192-token measurement, with an
+observed peak of about 43--44 GiB; the 2048-token default uses less prefill
+scratch.

@@ -1280,7 +1280,8 @@ private:
     uint32_t g_kbar_global_capacity_ = 0;              // allocated block capacity
     std::vector<int32_t> g_orig_base_host_;            // block_id -> true first pos
     std::vector<int32_t> g_blk_tokens_host_;           // block_id -> token count
-    std::unique_ptr<DeviceTensor> g_kbar_;             // [blocks, n_kv_heads, head_dim], KV dtype, by block_id
+    std::unique_ptr<DeviceTensor> g_kbar_;             // [blocks, n_kv_heads, head_dim],
+                                                       // FP16 production index, by block_id
     std::unique_ptr<DeviceTensor> g_score_dev_;        // [blocks] fp32
     std::unique_ptr<DeviceTensor> g_query_content_;    // [n_heads, head_dim] fp32 (content frame)
     std::unique_ptr<DeviceTensor> g_orig_base_dev_;    // [blocks] int32
@@ -1384,7 +1385,9 @@ private:
     uint32_t kvmem_query_span_ = 0;                            // S (span length, == capacity)
     std::vector<int32_t> std_layer_slot_;                      // il -> slot 0..L-1, or -1
     std::vector<uint32_t> std_layers_;                         // slot -> il
-    std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_subblocks, n_kv_heads, head_dim], KV dtype
+    std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_subblocks,
+                                                               // n_kv_heads, head_dim],
+                                                               // FP16 production index
     bool g_kbar_multi_ready_ = false;                          // g_kbar_multi_ holds the index
     uint32_t g_kbar_multi_blocks_ = 0;                         // blocks covered (per layer)
     uint32_t g_kbar_multi_capacity_ = 0;                       // allocated block capacity (per layer)

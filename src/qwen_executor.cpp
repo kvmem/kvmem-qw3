@@ -1569,12 +1569,12 @@ std::unique_ptr<DeviceTensor> QwenExecutor::kvmem_alloc_mean_index_tensor(
     if (dtype && std::strcmp(dtype, "fp32") == 0) {
         return backend_.tensor_f32(count, label);
     }
-    if (dtype && std::strcmp(dtype, "fp8") == 0) {
-        return backend_.tensor_fp8_kv(count, label);
-    }
-    // `--kv-dtype fp16` is IEEE binary16 (`__half`), not bfloat16.
-    // q8 has a per-row scale and cannot represent a standalone mean vector
-    // with the current tensor interface, so retain fp16 for that legacy mode.
+    // Keep the retrieval index in IEEE binary16 (`__half`, not bfloat16)
+    // independently of the active KV-cache dtype. In particular, FP8 K/V may
+    // reduce the resident cache footprint, but quantizing the already-averaged
+    // mean-K vectors a second time changes retrieval rankings. q8 also has a
+    // per-row scale and cannot represent a standalone mean vector through the
+    // current tensor interface, so it uses the same FP16 index.
     return backend_.tensor_f16(count, label);
 }
 
@@ -10946,7 +10946,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // turns (server-side session continuation). This decouples "where layer l's
     // slice starts" from "how many blocks this turn scores" (total_blocks). The
     // scorer + incremental capture both key on this stride; the buffer is
-    // over-allocated to the ctx cap once (≈64 MiB at 262144 ctx) and never
+    // over-allocated to the ctx cap once (≈256 MiB at 262144 ctx with the
+    // 16-layer FP16 mean index used by Qwen3.6-27B) and never
     // reallocates as the session grows. Clamp up so a prompt longer than the
     // configured ctx can't under-size the stride.
     const uint32_t ctx_blocks = (kv_ctx_size_ + bt - 1) / bt;
@@ -10964,8 +10965,9 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     const uint64_t per_layer = static_cast<uint64_t>(stride_blocks) *
                                kvmem_qc_n_subblocks_ * n_kv_heads * head_dim;
     // Per-layer content index [L, stride_blocks, n_subblocks, n_kv_heads,
-    // head_dim]. Storage follows the KV dtype (fp16 or fp8 in production);
-    // builders and scorers still accumulate in fp32.
+    // head_dim]. Production storage is always FP16 even when the active KV
+    // cache is FP8; builders and scorers still accumulate in FP32. FP32 KV is
+    // retained as a diagnostic full-precision index mode.
     bool freshly_allocated = false;
     if (!g_kbar_multi_ || stride_blocks > g_kbar_multi_capacity_ ||
         g_kbar_multi_->count < per_layer * L) {
@@ -10974,11 +10976,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
             kvmem_alloc_mean_index_tensor(per_layer * L, "g_kbar_multi");
         freshly_allocated = true;
         if (std::getenv("QW3_KVMEM_TRACE")) {
-            const char *kv_dtype = std::getenv("QW3_KV_DTYPE");
             const char *index_dtype =
-                kv_dtype && std::strcmp(kv_dtype, "fp32") == 0 ? "fp32" :
-                kv_dtype && std::strcmp(kv_dtype, "fp8") == 0 ? "fp8_e4m3" :
-                "fp16";
+                g_kbar_multi_->elem_size == sizeof(float) ? "fp32" : "fp16";
             const uint64_t elements = per_layer * L;
             const uint64_t bytes =
                 elements * static_cast<uint64_t>(g_kbar_multi_->elem_size);

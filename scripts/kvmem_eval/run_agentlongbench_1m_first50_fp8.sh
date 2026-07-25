@@ -26,7 +26,7 @@ exec env \
   KVMEM_BUDGET="${KVMEM_BUDGET:-229376}" \
   GEN_BUDGET="${GEN_BUDGET:-32768}" \
   KV_DTYPE="${KV_DTYPE:-fp8}" \
-  PREFILL_CHUNK="${PREFILL_CHUNK:-8192}" \
+  PREFILL_CHUNK="${PREFILL_CHUNK:-2048}" \
   DATA="${DATA:-/home/chaidi/AgentLongBench-Long/DeepseekMillion/samples.jsonl}" \
   MANIFEST="${MANIFEST:-/home/chaidi/AgentLongBench-Long/DeepseekMillion/manifest.jsonl}" \
   LIMIT="$LIMIT" \
