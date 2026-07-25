@@ -17,6 +17,7 @@ QUESTION_IDS=${QUESTION_IDS:-}
 TAG_PREFIX=${TAG_PREFIX:-agentlongbench_512k_fp8_accuracy_control_20260725}
 WAIT_SESSION=${WAIT_SESSION:-}
 WAIT_VALIDATION=${WAIT_VALIDATION:-}
+CELLS=${CELLS:-fp16:2048,fp16:8192,fp8:2048,fp8:8192}
 
 if [[ -z "$QUESTION_IDS" ]]; then
   echo "QUESTION_IDS must be a comma-separated stable-sample-ID list" >&2
@@ -74,9 +75,13 @@ run_cell() {
   echo "[$(date --iso-8601=seconds)] complete $cell"
 }
 
-run_cell fp16 2048
-run_cell fp16 8192
-run_cell fp8 2048
-run_cell fp8 8192
+IFS=',' read -r -a cells <<<"$CELLS"
+for cell in "${cells[@]}"; do
+  if [[ ! "$cell" =~ ^(fp16|fp8):([1-9][0-9]*)$ ]]; then
+    echo "invalid CELLS entry: $cell (expected fp16:CHUNK or fp8:CHUNK)" >&2
+    exit 2
+  fi
+  run_cell "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+done
 
-echo "[$(date --iso-8601=seconds)] all four accuracy-control cells completed"
+echo "[$(date --iso-8601=seconds)] requested accuracy-control cells completed: $CELLS"
