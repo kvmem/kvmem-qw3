@@ -330,10 +330,14 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
       external_kv_cache_(external_kv_cache),
       external_mtp_kv_cache_(external_mtp_kv_cache),
       kv_ctx_size_(kv_ctx_size) {
-    nvfp4_bf16_main_ =
-        weights_.uses_nvfp4() &&
+    const bool bf16_weight_path =
+        (weights_.uses_nvfp4() &&
+         env_flag_enabled("QW3_NVFP4_BF16_MAIN", true)) ||
+        (weights_.uses_q8() &&
+         env_flag_enabled("QW3_Q8_BF16_MAIN", true));
+    bf16_main_ =
+        bf16_weight_path &&
         backend_.supports_bf16_activations() &&
-        env_flag_enabled("QW3_NVFP4_BF16_MAIN", true) &&
         !env_flag_enabled("QW3_CONTINUOUS_BATCHING");
     kv_pages_.configure(kv_ctx_size_, kv_page_allocator);
     mtp_kv_pages_.configure(kv_ctx_size_, mtp_kv_page_allocator);
@@ -911,7 +915,7 @@ void QwenExecutor::ensure_scratch() {
     }
 
     auto main_tensor = [this](uint64_t count, const char *label) {
-        return nvfp4_bf16_main_
+        return bf16_main_
             ? backend_.tensor_bf16(count, label)
             : backend_.tensor_f32(count, label);
     };
@@ -1115,10 +1119,10 @@ void QwenExecutor::ensure_mtp_scratch() {
     mtp_concat_ = backend_.tensor_f32(static_cast<uint64_t>(2) * cfg.n_embd, "mtp_concat");
     mtp_attn_out_ = backend_.tensor_f32(cfg.n_embd, "mtp_attn_out");
     mtp_ffn_out_ = backend_.tensor_f32(cfg.n_embd, "mtp_ffn_out");
-    mtp_zero_h_ = nvfp4_bf16_main_
+    mtp_zero_h_ = bf16_main_
         ? backend_.tensor_bf16(cfg.n_embd, "mtp_zero_h")
         : backend_.tensor_f32(cfg.n_embd, "mtp_zero_h");
-    mtp_prefix_h_ = nvfp4_bf16_main_
+    mtp_prefix_h_ = bf16_main_
         ? backend_.tensor_bf16(cfg.n_embd, "mtp_prefix_h")
         : backend_.tensor_f32(cfg.n_embd, "mtp_prefix_h");
     (void) backend_.zero_tensor(*mtp_zero_h_);
@@ -1217,7 +1221,7 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
 
     const uint64_t B = batch;
     auto main_tensor = [this](uint64_t count, const char *label) {
-        return nvfp4_bf16_main_
+        return bf16_main_
             ? backend_.tensor_bf16(count, label)
             : backend_.tensor_f32(count, label);
     };

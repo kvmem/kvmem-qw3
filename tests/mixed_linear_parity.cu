@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -121,6 +122,81 @@ void test_bf16(qw3::DeviceBackend &backend) {
         }
     }
     require_close(got, expected, 0.03f, 0.003f, "BF16 linear");
+}
+
+void test_q8_bf16_paths(qw3::DeviceBackend &backend) {
+    constexpr uint32_t rows = 128;
+    constexpr uint32_t cols = 512;
+    constexpr uint32_t batch = 1024;
+    constexpr float weight_value = 0.5f;
+
+    std::vector<uint8_t> packed(
+        static_cast<size_t>(rows) * (cols / 32) * 34);
+    const __half scale = __float2half(weight_value);
+    for (size_t block = 0; block < packed.size() / 34; ++block) {
+        uint8_t *dst = packed.data() + block * 34;
+        std::memcpy(dst, &scale, sizeof(scale));
+        std::memset(dst + 2, 1, 32);
+    }
+    auto weight = backend.weight_q8_0(
+        packed.data(), rows, cols, "q8_bf16.weight");
+
+    std::vector<float> single_input(cols, 0.25f);
+    auto single_x = backend.tensor_f32(cols, "q8_bf16.single_x");
+    require(backend.copy_bytes_from_host(
+                *single_x, 0, single_input.data(),
+                single_input.size() * sizeof(float)),
+            "copy Q8 BF16 single input");
+
+    const float single_expected =
+        cols * weight_value * single_input.front();
+    auto single_out = backend.tensor_bf16(rows, "q8_bf16.single_out");
+    require(backend.q8_0_matvec(*single_out, *weight, *single_x),
+            "Q8 BF16 matvec");
+    require_close(
+        copy_bf16_to_float(backend, *single_out),
+        std::vector<float>(rows, single_expected),
+        0.1f, 0.005f, "Q8 BF16 matvec");
+
+    auto residual = backend.tensor_bf16(rows, "q8_bf16.residual");
+    std::vector<__nv_bfloat16> residual_host(
+        rows, __float2bfloat16(2.0f));
+    require(backend.copy_bytes_from_host(
+                *residual, 0, residual_host.data(),
+                residual_host.size() * sizeof(__nv_bfloat16)),
+            "copy Q8 BF16 residual");
+    require(backend.q8_0_matvec_add(*residual, *weight, *single_x),
+            "Q8 BF16 fused residual add");
+    require_close(
+        copy_bf16_to_float(backend, *residual),
+        std::vector<float>(rows, 2.0f + single_expected),
+        0.1f, 0.005f, "Q8 BF16 fused residual add");
+
+    std::vector<float> batch_input(static_cast<size_t>(batch) * cols);
+    std::vector<float> expected(static_cast<size_t>(batch) * rows);
+    for (uint32_t item = 0; item < batch; ++item) {
+        const float value = static_cast<float>(item + 1) / 64.0f;
+        std::fill(batch_input.begin() + static_cast<size_t>(item) * cols,
+                  batch_input.begin() + static_cast<size_t>(item + 1) * cols,
+                  value);
+        std::fill(expected.begin() + static_cast<size_t>(item) * rows,
+                  expected.begin() + static_cast<size_t>(item + 1) * rows,
+                  cols * weight_value * value);
+    }
+    auto batch_x = backend.tensor_f32(
+        batch_input.size(), "q8_bf16.batch_x");
+    auto batch_out = backend.tensor_bf16(
+        expected.size(), "q8_bf16.batch_out");
+    require(backend.copy_bytes_from_host(
+                *batch_x, 0, batch_input.data(),
+                batch_input.size() * sizeof(float)),
+            "copy Q8 BF16 batch input");
+    require(backend.q8_0_matmul(
+                *batch_out, *weight, *batch_x, batch, cols, rows),
+            "Q8 BF16 batch matmul");
+    require_close(
+        copy_bf16_to_float(backend, *batch_out), expected,
+        0.25f, 0.01f, "Q8 BF16 batch matmul");
 }
 
 void test_fp8_shape(qw3::DeviceBackend &backend, uint32_t batch) {
@@ -1155,6 +1231,7 @@ int main(int argc, char **argv) {
     auto backend = qw3::make_cuda_device_backend(qw3::LinearBackend::Auto);
     require(backend->begin(), "backend begin");
     test_bf16(*backend);
+    test_q8_bf16_paths(*backend);
     test_fp8_shape(*backend, 4);
     test_fp8_shape(*backend, 128);
     test_fp8_shape(*backend, 512);

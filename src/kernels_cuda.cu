@@ -63,6 +63,10 @@ bool launch_mmvq_q8_0(
         const uint8_t *weight, const void *y_q8_1, float *dst,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
+bool launch_mmvq_q8_0_bf16(
+        const uint8_t *weight, const void *y_q8_1, __nv_bfloat16 *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
 bool launch_mmvq_q8_0_two(
         const uint8_t *weight0, const uint8_t *weight1, const void *y_q8_1,
         float *dst0, float *dst1,
@@ -75,6 +79,10 @@ bool launch_mmvq_q8_0_silu_mul(
         cudaStream_t stream);
 bool launch_mmvq_q8_0_add(
         const uint8_t *weight, const void *y_q8_1, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
+bool launch_mmvq_q8_0_add_bf16(
+        const uint8_t *weight, const void *y_q8_1, __nv_bfloat16 *dst,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
 // Fused 4-weight fanout: concatenate the 4 weights' row-spaces into ONE grid
@@ -6205,6 +6213,7 @@ public:
         if (mixed_out_bf16_) cudaFree(mixed_out_bf16_);
         if (nvfp4_pair_out_f32_) cudaFree(nvfp4_pair_out_f32_);
         if (fp8_out_f32_) cudaFree(fp8_out_f32_);
+        if (q8_out_f32_) cudaFree(q8_out_f32_);
         for (int i = 0; i < 2; ++i) {
             if (w_fp16_workspace_[i]) cudaFree(w_fp16_workspace_[i]);
             if (dequant_done_[i]) cudaEventDestroy(dequant_done_[i]);
@@ -6972,6 +6981,42 @@ public:
         if (w.type != WeightType::Q8_0) {
             return {false, "mixed-precision linear kernel is not initialized"};
         }
+        if (o.is_bf16() &&
+            matvec_kernel_choice() == MatvecKernel::Ported &&
+            (w.cols % 32) == 0) {
+            if (auto st = ensure_q8_1_scratch(
+                    /*batch=*/1, static_cast<uint32_t>(w.cols)); !st.ok) {
+                return st;
+            }
+            if (!ported::launch_quantize_q8_1(
+                    input.ptr, q8_1_scratch_,
+                    /*batch=*/1, static_cast<uint32_t>(w.cols),
+                    /*stride_x_row=*/static_cast<uint32_t>(w.cols),
+                    exec_stream_)) {
+                return {false, "ported quantize_q8_1 BF16 launch failed"};
+            }
+            if (!ported::launch_mmvq_q8_0_bf16(
+                    static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                    o.ptr_bf16(), static_cast<uint32_t>(w.rows),
+                    static_cast<uint32_t>(w.cols), /*batch=*/1,
+                    /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                    exec_stream_)) {
+                return {false, "ported mmvq_q8_0 BF16 launch failed"};
+            }
+            return launch_status("cuda q8_0_matvec ported BF16");
+        }
+        float *q8_out = o.ptr;
+        if (o.is_bf16()) {
+            if (auto st = ensure_q8_output_workspace(w.rows); !st.ok) {
+                return st;
+            }
+            q8_out = q8_out_f32_;
+        }
+        auto finish_q8 = [&](DeviceStatus st) {
+            if (!st.ok || !o.is_bf16()) return st;
+            return convert_q8_output_bf16(
+                o.ptr_bf16(), static_cast<uint64_t>(w.rows));
+        };
         // The cuBLAS-Sgemv-on-F32-dequant-cache path was an early shortcut. It
         // reads 4x more bytes per matvec (F32 cache vs Q8 weight) so even though
         // it uses tensor cores, it loses to a properly tuned Q8 kernel for the
@@ -7001,11 +7046,11 @@ public:
                                         input.ptr,
                                         1,
                                         &beta,
-                                        o.ptr,
+                                        q8_out,
                                         1),
                             "cublasSgemv q8_0_matvec");
                         sgemv_st.ok) {
-                        return {};
+                        return finish_q8({});
                     }
                 }
                 // cache build or sgemv failed: drop the error state and
@@ -7022,7 +7067,9 @@ public:
         // Shmem budget per layout:
         //   - DP4A path  : cols * 1 (i8) + blocks * 4 (f32 scale per block)
         //   - F32 fallback: cols * 4 (f32 staging)
-        return dispatch_q8_matvec(o.ptr, w, input.ptr, /*batch=*/1, /*in_stride=*/0, /*out_stride=*/0);
+        return finish_q8(dispatch_q8_matvec(
+            q8_out, w, input.ptr, /*batch=*/1,
+            /*in_stride=*/0, /*out_stride=*/0));
     }
 
     DeviceStatus q8_0_matvec_fanout(DeviceTensor *const *outs,
@@ -7986,12 +8033,18 @@ public:
                                           in_stride, exec_stream_)) {
             return {false, "matmul_add quantize_q8_1 launch failed"};
         }
-        if (ported::launch_mmvq_q8_0_add(static_cast<const uint8_t *>(w.ptr),
-                                         q8_1_scratch_, o.ptr,
-                                         static_cast<uint32_t>(w.rows),
-                                         static_cast<uint32_t>(w.cols),
-                                         batch, out_stride,
-                                         exec_stream_)) {
+        const bool launched = o.is_bf16()
+            ? ported::launch_mmvq_q8_0_add_bf16(
+                  static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                  o.ptr_bf16(), static_cast<uint32_t>(w.rows),
+                  static_cast<uint32_t>(w.cols), batch, out_stride,
+                  exec_stream_)
+            : ported::launch_mmvq_q8_0_add(
+                  static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                  o.ptr, static_cast<uint32_t>(w.rows),
+                  static_cast<uint32_t>(w.cols), batch, out_stride,
+                  exec_stream_);
+        if (launched) {
             return launch_status("cuda q8_0_matmul_add small_batch_inplace");
         }
         return DeviceBackend::q8_0_matmul_add(out, residual, matmul_tmp,
@@ -8093,13 +8146,20 @@ public:
                                           exec_stream_)) {
             return {false, "matvec_add quantize_q8_1 launch failed"};
         }
-        if (!ported::launch_mmvq_q8_0_add(static_cast<const uint8_t *>(w.ptr),
-                                          q8_1_scratch_, o.ptr,
-                                          static_cast<uint32_t>(w.rows),
-                                          static_cast<uint32_t>(w.cols),
-                                          /*batch=*/1,
-                                          /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
-                                          exec_stream_)) {
+        const bool launched = o.is_bf16()
+            ? ported::launch_mmvq_q8_0_add_bf16(
+                  static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                  o.ptr_bf16(), static_cast<uint32_t>(w.rows),
+                  static_cast<uint32_t>(w.cols), /*batch=*/1,
+                  /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                  exec_stream_)
+            : ported::launch_mmvq_q8_0_add(
+                  static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                  o.ptr, static_cast<uint32_t>(w.rows),
+                  static_cast<uint32_t>(w.cols), /*batch=*/1,
+                  /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                  exec_stream_);
+        if (!launched) {
             return {false, "mmvq_q8_0_add launch failed"};
         }
         return launch_status("cuda q8_0_matvec_add");
@@ -8618,6 +8678,19 @@ public:
         if (w.type != WeightType::Q8_0) {
             return {false, "mixed-precision linear kernel is not initialized"};
         }
+        const uint64_t q8_out_count =
+            static_cast<uint64_t>(batch) * out_stride;
+        float *q8_out = o.ptr;
+        if (o.is_bf16()) {
+            if (auto st = ensure_q8_output_workspace(q8_out_count); !st.ok) {
+                return st;
+            }
+            q8_out = q8_out_f32_;
+        }
+        auto finish_q8 = [&](DeviceStatus st) {
+            if (!st.ok || !o.is_bf16()) return st;
+            return convert_q8_output_bf16(o.ptr_bf16(), q8_out_count);
+        };
         // For prefill batches the dp4a matvec stops being bandwidth-bound and
         // tensor-core MMA wins by 10x+. batch < mma_min_batch() (default 8)
         // falls through to dispatch_q8_matvec: batch==1 is the dp4a decode
@@ -8635,18 +8708,21 @@ public:
                 (mk == MatmulKernel::Mmq) ||
                 (mk == MatmulKernel::Auto && matmul_auto_use_mmq(batch));
             if (try_mmq && (w.cols % 32) == 0) {
-                if (auto st = mmq_q8(o.ptr, w, input.ptr, batch); st.ok) return st;
+                if (auto st = mmq_q8(q8_out, w, input.ptr, batch); st.ok) {
+                    return finish_q8(st);
+                }
             }
             if (!hgemm_disabled()) {
-                DeviceStatus st = hgemm_q8(o.ptr, w, input.ptr, batch);
-                if (st.ok) return st;
+                DeviceStatus st = hgemm_q8(q8_out, w, input.ptr, batch);
+                if (st.ok) return finish_q8(st);
             }
             // Fall through to dp4a when HGEMM is disabled or errors (e.g.
             // OOM allocating cache). Continuous batching sets
             // QW3_DISABLE_HGEMM=1 so the batched path never silently routes
             // through cuBLAS HGEMM.
         }
-        return dispatch_q8_matvec(o.ptr, w, input.ptr, batch, in_stride, out_stride);
+        return finish_q8(dispatch_q8_matvec(
+            q8_out, w, input.ptr, batch, in_stride, out_stride));
     }
 
 private:
@@ -10480,6 +10556,29 @@ private:
             q8_1_mmq_scratch_capacity_ = need;
         }
         return {};
+    }
+
+    DeviceStatus ensure_q8_output_workspace(uint64_t count) {
+        if (q8_out_f32_capacity_ >= count) return {};
+        if (q8_out_f32_) cudaFree(q8_out_f32_);
+        if (auto st = cuda_status(
+                cudaMalloc(&q8_out_f32_, count * sizeof(float)),
+                "Q8 FP32 output workspace alloc"); !st.ok) {
+            q8_out_f32_ = nullptr;
+            q8_out_f32_capacity_ = 0;
+            return st;
+        }
+        q8_out_f32_capacity_ = count;
+        return {};
+    }
+
+    DeviceStatus convert_q8_output_bf16(__nv_bfloat16 *out, uint64_t count) {
+        const unsigned threads = 256;
+        const unsigned blocks =
+            static_cast<unsigned>((count + threads - 1) / threads);
+        fp32_to_bf16_kernel<<<blocks, threads, 0, exec_stream_>>>(
+            out, q8_out_f32_, count);
+        return launch_status("Q8 FP32->BF16 output");
     }
 
     // Returns true when the activation needs to be staged in the
@@ -15316,6 +15415,8 @@ private:
     uint64_t nvfp4_pair_out_f32_capacity_ = 0;  // elements
     float *fp8_out_f32_ = nullptr;
     uint64_t fp8_out_f32_capacity_ = 0;  // elements
+    float *q8_out_f32_ = nullptr;
+    uint64_t q8_out_f32_capacity_ = 0;  // elements
     bool lazy_recurrent_pair_requested_ = false;
     bool lazy_attention_fanout_requested_ = false;
     bool fp8_bf16_epilogue_failed_ = false;

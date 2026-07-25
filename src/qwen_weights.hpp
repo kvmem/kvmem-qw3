@@ -83,6 +83,7 @@ public:
     const QwenMtpWeights *mtp() const { return mtp_.present ? &mtp_ : nullptr; }
     uint32_t n_layers() const { return static_cast<uint32_t>(layers_.size()); }
     bool uses_nvfp4() const { return uses_nvfp4_; }
+    bool uses_q8() const { return uses_q8_; }
 
     uint64_t total_bytes_uploaded() const { return uploaded_bytes_; }
     uint64_t tensor_count() const { return owned_.size(); }
@@ -102,6 +103,7 @@ private:
     QwenMtpWeights mtp_;
     uint64_t uploaded_bytes_ = 0;
     bool uses_nvfp4_ = false;
+    bool uses_q8_ = false;
 };
 
 } // namespace qw3

@@ -329,6 +329,8 @@ DeviceWeight *QwenWeights::bind(const ModelTensorInfo *tensor) {
     DeviceWeight *raw = weight.get();
     if (raw->format == DeviceWeightFormat::NVFP4_E2M1) {
         uses_nvfp4_ = true;
+    } else if (raw->format == DeviceWeightFormat::Q8_0) {
+        uses_q8_ = true;
     }
     owned_.push_back(std::move(weight));
     by_tensor_.emplace(tensor, raw);

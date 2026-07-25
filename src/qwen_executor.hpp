@@ -541,7 +541,7 @@ private:
     const QwenNativeModel &model_;
     const QwenWeights &weights_;
     DeviceBackend &backend_;
-    bool nvfp4_bf16_main_ = false;
+    bool bf16_main_ = false;
 
     void ensure_batch_scratch(uint32_t batch);
 
