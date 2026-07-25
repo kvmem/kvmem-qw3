@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -518,7 +520,7 @@ json coerce_value_by_schema(const std::string &value, const json &schema) {
 // Find the JSON-schema "properties" map for a named function in an OpenAI
 // tools array. Returns nullptr when the tool, its parameters, or its properties
 // are absent, in which case parameters are left as raw strings.
-const json *find_tool_properties(const json *tools, const std::string &name) {
+const json *find_tool_definition(const json *tools, const std::string &name) {
     if (!tools || !tools->is_array()) return nullptr;
     for (const auto &t : *tools) {
         if (!t.is_object()) continue;
@@ -527,16 +529,308 @@ const json *find_tool_properties(const json *tools, const std::string &name) {
                              : &t;
         if (!fn->is_object()) continue;
         if (fn->value("name", std::string()) != name) continue;
-        if (!fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
-            return nullptr;
-        }
-        const json &params = (*fn)["parameters"];
-        if (params.contains("properties") && params["properties"].is_object()) {
-            return &params["properties"];
-        }
-        return nullptr;
+        return fn;
     }
     return nullptr;
+}
+
+const json *find_tool_properties(const json *tools, const std::string &name) {
+    const json *fn = find_tool_definition(tools, name);
+    if (!fn || !fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
+        return nullptr;
+    }
+    const json &params = (*fn)["parameters"];
+    if (params.contains("properties") && params["properties"].is_object()) {
+        return &params["properties"];
+    }
+    return nullptr;
+}
+
+bool tool_name_allowed(const json *tools, const std::string &name) {
+    return !tools || !tools->is_array() || find_tool_definition(tools, name) != nullptr;
+}
+
+std::string strip_tool_control_tokens(std::string text) {
+    // Some Qwen generations leak chat-template control tokens inside the
+    // tool block. They are framing noise, not part of the tool name/arguments.
+    for (const char *token : {"<|im_start|>", "<|im_end|>", "<|assistant|>",
+                              "<|tool|>"}) {
+        size_t pos = 0;
+        while ((pos = text.find(token, pos)) != std::string::npos) {
+            text.erase(pos, std::string(token).size());
+        }
+    }
+    return text;
+}
+
+std::string trim_single_newlines(std::string value) {
+    if (!value.empty() && value.front() == '\n') value.erase(value.begin());
+    if (!value.empty() && value.front() == '\r') value.erase(value.begin());
+    if (!value.empty() && value.back() == '\n') value.pop_back();
+    if (!value.empty() && value.back() == '\r') value.pop_back();
+    return value;
+}
+
+std::string normalized_identifier(std::string value) {
+    std::string out;
+    for (const unsigned char c : value) {
+        if (std::isalnum(c) || c == '_' || c == '-') {
+            out.push_back(static_cast<char>(std::tolower(c)));
+        }
+    }
+    return out;
+}
+
+std::string snake_case_identifier(const std::string &value) {
+    std::string out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if (std::isupper(c) && i > 0) out.push_back('_');
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+std::string schema_property_name(const json *props, const std::string &raw_key) {
+    if (!props || !props->is_object()) return trim_ascii_ws(raw_key);
+    const std::string wanted = normalized_identifier(raw_key);
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        if (normalized_identifier(it.key()) == wanted) return it.key();
+    }
+    return trim_ascii_ws(raw_key);
+}
+
+void add_tool_argument(json &args, const json *props,
+                       const std::string &raw_key, std::string value) {
+    const std::string key = schema_property_name(props, raw_key);
+    if (key.empty()) return;
+    value = trim_single_newlines(std::move(value));
+    if (props && props->contains(key) && (*props)[key].is_object()) {
+        args[key] = coerce_value_by_schema(value, (*props)[key]);
+    } else {
+        args[key] = value;
+    }
+}
+
+void parse_parameter_tags(const std::string &block, const json *props, json &args) {
+    size_t pos = 0;
+    while ((pos = block.find("<parameter=", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<parameter=").size();
+        const size_t key1 = block.find('>', key0);
+        if (key1 == std::string::npos) break;
+        const size_t value0 = key1 + 1;
+        const size_t value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1 + std::string("</parameter>").size();
+    }
+}
+
+void parse_arg_key_value_tags(const std::string &block, const json *props, json &args) {
+    size_t pos = 0;
+    while ((pos = block.find("<arg_key>", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<arg_key>").size();
+        const size_t key1 = block.find("</arg_key>", key0);
+        if (key1 == std::string::npos) break;
+        const size_t value_tag = block.find("<arg_value>", key1);
+        if (value_tag == std::string::npos) break;
+        const size_t value0 = value_tag + std::string("<arg_value>").size();
+        size_t value1 = block.find("</arg_value>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</tool_call>", value0);
+        if (value1 == std::string::npos) value1 = block.size();
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1;
+    }
+}
+
+void parse_loose_parameter_tags(const std::string &block, const json *props, json &args) {
+    // Handles variants such as <parameter>lines>[680, 720] where the model
+    // omitted the '=' and used the next '>' as the key/value separator.
+    size_t pos = 0;
+    while ((pos = block.find("<parameter>", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<parameter>").size();
+        const size_t key1 = block.find('>', key0);
+        if (key1 == std::string::npos) break;
+        const size_t value0 = key1 + 1;
+        size_t value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</tool_call>", value0);
+        if (value1 == std::string::npos) value1 = block.size();
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1;
+    }
+}
+
+void parse_schema_named_tags(const std::string &block, const json *props, json &args) {
+    if (!props || !props->is_object()) return;
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        const std::string key = it.key();
+        const std::string snake_key = snake_case_identifier(key);
+        const std::vector<std::string> tag_names =
+            snake_key == key ? std::vector<std::string>{key}
+                              : std::vector<std::string>{key, snake_key};
+        for (const std::string &tag_name : tag_names) {
+            const std::string open = "<" + tag_name + ">";
+            size_t pos = 0;
+            while ((pos = block.find(open, pos)) != std::string::npos) {
+                const size_t value0 = pos + open.size();
+                const std::string close = "</" + tag_name + ">";
+                size_t value1 = block.find(close, value0);
+                if (value1 == std::string::npos) {
+                    // A seen malformed form uses <file_path>value<parameter>...
+                    // rather than a matching closing tag. Limit recovery to
+                    // the next tool/parameter delimiter so code text cannot swallow
+                    // the rest of the request.
+                    value1 = block.find("<parameter", value0);
+                    const size_t arg_key = block.find("<arg_key>", value0);
+                    if (value1 == std::string::npos ||
+                        (arg_key != std::string::npos && arg_key < value1)) {
+                        value1 = arg_key;
+                    }
+                    const size_t end = block.find("</tool_call>", value0);
+                    if (value1 == std::string::npos ||
+                        (end != std::string::npos && end < value1)) {
+                        value1 = end;
+                    }
+                    if (value1 == std::string::npos) value1 = block.size();
+                }
+                if (value1 == std::string::npos) break;
+                add_tool_argument(args, props, key, block.substr(value0, value1 - value0));
+                pos = value1 + (block.compare(value1, close.size(), close) == 0
+                                    ? close.size() : 1);
+            }
+        }
+    }
+}
+
+std::string tool_name_from_prefix(const std::string &inner, const json *tools) {
+    const std::string text = trim_ascii_ws(inner);
+    size_t pos = 0;
+    while (pos < text.size() &&
+           !(std::isalnum(static_cast<unsigned char>(text[pos])) ||
+             text[pos] == '_' || text[pos] == '-')) {
+        ++pos;
+    }
+    if (pos == text.size()) return {};
+    size_t end = pos;
+    while (end < text.size() &&
+           (std::isalnum(static_cast<unsigned char>(text[end])) ||
+            text[end] == '_' || text[end] == '-')) {
+        ++end;
+    }
+    std::string candidate = text.substr(pos, end - pos);
+    if (candidate == "function") {
+        while (end < text.size() && (text[end] == ' ' || text[end] == '=' ||
+                                     text[end] == '<' || text[end] == '>')) {
+            ++end;
+        }
+        const size_t name0 = end;
+        while (end < text.size() &&
+               (std::isalnum(static_cast<unsigned char>(text[end])) ||
+                text[end] == '_' || text[end] == '-')) {
+            ++end;
+        }
+        candidate = text.substr(name0, end - name0);
+    }
+    return tool_name_allowed(tools, candidate) ? candidate : std::string();
+}
+
+std::string tool_name_from_marker(const std::string &inner, const json *tools) {
+    for (const std::string &marker : {"<function=", "function=", "function_"}) {
+        size_t pos = inner.find(marker);
+        if (pos == std::string::npos) continue;
+        pos += marker.size();
+        size_t end = pos;
+        while (end < inner.size() &&
+               (std::isalnum(static_cast<unsigned char>(inner[end])) ||
+                inner[end] == '_' || inner[end] == '-')) {
+            ++end;
+        }
+        const std::string candidate = inner.substr(pos, end - pos);
+        if (tool_name_allowed(tools, candidate)) return candidate;
+    }
+    return tool_name_from_prefix(inner, tools);
+}
+
+std::string infer_tool_name_from_arguments(const json *tools, const json &args) {
+    if (!tools || !tools->is_array() || !args.is_object() || args.empty()) return {};
+    std::string match;
+    size_t best_required = 0;
+    bool tied = false;
+    for (const auto &tool : *tools) {
+        if (!tool.is_object()) continue;
+        const json *fn = (tool.contains("function") && tool["function"].is_object())
+                             ? &tool["function"] : &tool;
+        if (!fn->is_object() || !fn->contains("name") ||
+            !fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
+            continue;
+        }
+        const json &required = (*fn)["parameters"].value("required", json::array());
+        if (!required.is_array() || required.empty()) continue;
+        bool all_present = true;
+        for (const auto &key : required) {
+            if (!key.is_string() || !args.contains(key.get<std::string>())) {
+                all_present = false;
+                break;
+            }
+        }
+        if (all_present) {
+            const size_t required_count = required.size();
+            if (required_count > best_required) {
+                best_required = required_count;
+                match = fn->value("name", std::string());
+                tied = false;
+            } else if (required_count == best_required) {
+                tied = true;
+            }
+        }
+    }
+    return tied ? std::string() : match;
+}
+
+bool parse_tool_call_block(const std::string &inner, const json *tools,
+                           std::vector<json> &calls) {
+    if (parse_json_tool_call_text(inner, calls)) return true;
+
+    const std::string normalized = strip_tool_control_tokens(inner);
+    std::string name = tool_name_from_marker(normalized, tools);
+    const json *props = find_tool_properties(tools, name);
+    json args = json::object();
+    parse_parameter_tags(normalized, props, args);
+    parse_arg_key_value_tags(normalized, props, args);
+    parse_loose_parameter_tags(normalized, props, args);
+    parse_schema_named_tags(normalized, props, args);
+
+    // A few generations place a JSON object directly after function_edit>.
+    // Parse it only when it starts at an object boundary; arbitrary code text
+    // must never be interpreted as tool arguments.
+    if (name.empty() || args.empty()) {
+        const size_t object0 = normalized.find('{');
+        const size_t object1 = normalized.rfind('}');
+        if (object0 != std::string::npos && object1 > object0) {
+            std::vector<json> parsed;
+            if (parse_json_tool_call_text(
+                    "{\"name\":" + dump_json(name) +
+                    ",\"arguments\":" +
+                        normalized.substr(object0, object1 - object0 + 1) + "}",
+                    parsed) && !parsed.empty()) {
+                if (!name.empty() || parsed.front().contains("function")) {
+                    calls.push_back(parsed.front());
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (name.empty()) name = infer_tool_name_from_arguments(tools, args);
+    if (name.empty() || !tool_name_allowed(tools, name)) return false;
+    calls.push_back(make_tool_call_json(name, args));
+    return true;
 }
 
 std::vector<json> parse_tool_calls_xml(const std::string &text,
@@ -548,65 +842,9 @@ std::vector<json> parse_tool_calls_xml(const std::string &text,
         if (tc0 == std::string::npos) break;
         const size_t tc1 = text.find("</tool_call>", tc0);
         if (tc1 == std::string::npos) break;
-        const std::string block = text.substr(tc0, tc1 - tc0);
         const size_t inner0 = tc0 + std::string("<tool_call>").size();
         const std::string inner = text.substr(inner0, tc1 - inner0);
-        const size_t fn0 = block.find("<function=");
-        if (fn0 == std::string::npos) {
-            (void)parse_json_tool_call_text(inner, calls);
-            pos = tc1 + std::string("</tool_call>").size();
-            continue;
-        }
-        const size_t name0 = fn0 + std::string("<function=").size();
-        const size_t name1 = block.find(">", name0);
-        if (name1 == std::string::npos) {
-            pos = tc1 + std::string("</tool_call>").size();
-            continue;
-        }
-        const std::string name = block.substr(name0, name1 - name0);
-        const json *props = find_tool_properties(tools, name);
-        json args = json::object();
-        size_t pp = name1 + 1;
-        bool saw_parameter = false;
-        while (true) {
-            const size_t p0 = block.find("<parameter=", pp);
-            if (p0 == std::string::npos) break;
-            const size_t key0 = p0 + std::string("<parameter=").size();
-            const size_t key1 = block.find(">", key0);
-            if (key1 == std::string::npos) break;
-            const size_t v0 = key1 + 1;
-            const size_t v1 = block.find("</parameter>", v0);
-            if (v1 == std::string::npos) break;
-            std::string value = block.substr(v0, v1 - v0);
-            if (!value.empty() && value.front() == '\n') value.erase(value.begin());
-            if (!value.empty() && value.back() == '\n') value.pop_back();
-            const std::string key = block.substr(key0, key1 - key0);
-            if (props && props->contains(key) && (*props)[key].is_object()) {
-                args[key] = coerce_value_by_schema(value, (*props)[key]);
-            } else {
-                args[key] = value;
-            }
-            saw_parameter = true;
-            pp = v1 + std::string("</parameter>").size();
-        }
-        if (!saw_parameter) {
-            const size_t body0 = name1 + 1;
-            const size_t body1 = block.find("</function>", body0);
-            if (body1 != std::string::npos) {
-                const std::string body = block.substr(body0, body1 - body0);
-                std::vector<json> parsed;
-                if (parse_json_tool_call_text(
-                        "{\"name\":" + dump_json(name) +
-                        ",\"arguments\":" + trim_ascii_ws(body) + "}",
-                        parsed) &&
-                    !parsed.empty()) {
-                    calls.push_back(parsed.front());
-                    pos = tc1 + std::string("</tool_call>").size();
-                    continue;
-                }
-            }
-        }
-        calls.push_back(make_tool_call_json(name, args));
+        (void)parse_tool_call_block(inner, tools, calls);
         pos = tc1 + std::string("</tool_call>").size();
     }
     return calls;
@@ -941,6 +1179,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                      "(non-continuous-batching) serve route; it is inert while "
                      "--continuous-batching is active\n";
     }
+    if (cfg.kvmem_query_replay &&
+        (!engine.kvmem_enabled || !engine.kvmem_query_conditioned)) {
+        throw std::runtime_error(
+            "--kvmem-query-replay requires --kvmem and "
+            "--kvmem-query-conditioned");
+    }
+    if (cfg.kvmem_query_replay && cfg.continuous_batching) {
+        std::cerr << "[qw3-serve] note: --kvmem-query-replay is currently "
+                     "single-request only; it is inert while "
+                     "--continuous-batching is active\n";
+    }
 
     // The backend still reads several low-level toggles from process config.
     // Keep that as an internal bridge; the user-facing API is the explicit CLI
@@ -964,6 +1213,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     // executor read it). Tracing left to QW3_KVMEM_PREFIX_CACHE_TRACE opt-in.
     setenv_bool("QW3_KVMEM_PREFIX_CACHE",
                 cfg.kvmem_prefix_cache && engine.kvmem_enabled);
+    setenv_bool("QW3_KVMEM_QUERY_REPLAY",
+                cfg.kvmem_query_replay && engine.kvmem_enabled &&
+                    engine.kvmem_query_conditioned && !cfg.continuous_batching);
     setenv_bool("QW3_MTP_SPECULATE", engine.native_mtp_speculate);
     setenv_value("QW3_MTP_POLICY", engine.mtp_policy);
     if (engine.mtp_adaptive_min_chain > 0) {
@@ -1058,6 +1310,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
               << "  kvmem_query_conditioned="
               << yesno(engine.kvmem_query_conditioned) << "\n"
+              << "  kvmem_query_replay="
+              << yesno(cfg.kvmem_query_replay && !cfg.continuous_batching) << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
               << "  kvmem_sink_blocks=" << engine.kvmem_sink_blocks << "\n"
@@ -1079,8 +1333,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
     Engine eng(engine);
-    GgufFile usage_gguf(engine.model_path);
-    QwenTokenizer usage_tokenizer(usage_gguf);
+    std::unique_ptr<GgufFile> usage_gguf;
+    std::unique_ptr<QwenTokenizer> usage_tokenizer_owner;
+    if (std::filesystem::is_directory(engine.model_path)) {
+        usage_tokenizer_owner = std::make_unique<QwenTokenizer>(engine.model_path);
+    } else {
+        usage_gguf = std::make_unique<GgufFile>(engine.model_path);
+        usage_tokenizer_owner = std::make_unique<QwenTokenizer>(*usage_gguf);
+    }
+    QwenTokenizer &usage_tokenizer = *usage_tokenizer_owner;
     const std::string model_id = basename_of(engine.model_path);
     std::cerr << "[qw3-serve] model loaded; id=" << model_id << "\n";
 
@@ -1167,6 +1428,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.seed = req.value("seed", g.seed);
         g.ignore_eos = req.value("ignore_eos",
                                  req.value("ignore_eos_token", g.ignore_eos));
+        g.recover_thinking_eos = req.value("recover_thinking_eos", enable_thinking);
         g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
         if (g.thinking_budget < 0) g.thinking_budget = 0;
         return g;

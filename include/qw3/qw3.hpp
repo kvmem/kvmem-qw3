@@ -104,6 +104,10 @@ struct GenerationOptions {
     uint64_t seed = 0;
     bool raw_prompt = false;
     bool ignore_eos = false;
+    // Serving compatibility: if generation is still inside an open <think>
+    // block, replace a sampled EOS with the tokenizer's </think> token and
+    // continue decoding. EOS remains a normal stop after thinking closes.
+    bool recover_thinking_eos = false;
     // Internal serving flag: enqueue this request on the native continuous
     // batching worker when the backend supports it. CLI single-shot generation
     // leaves this false and keeps the original synchronous path.

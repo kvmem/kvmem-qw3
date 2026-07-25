@@ -20,7 +20,7 @@ void require_status(const DeviceStatus &st) {
     if (!st.ok) throw std::runtime_error(st.message);
 }
 
-uint64_t tensor_rows(const GgufTensorInfo &tensor) {
+uint64_t tensor_rows(const ModelTensorInfo &tensor) {
     if (tensor.dims.size() < 2) return 1;
     uint64_t rows = 1;
     for (size_t i = 1; i < tensor.dims.size(); ++i) rows *= tensor.dims[i];
@@ -330,6 +330,11 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
       external_kv_cache_(external_kv_cache),
       external_mtp_kv_cache_(external_mtp_kv_cache),
       kv_ctx_size_(kv_ctx_size) {
+    nvfp4_bf16_main_ =
+        weights_.uses_nvfp4() &&
+        backend_.supports_bf16_activations() &&
+        env_flag_enabled("QW3_NVFP4_BF16_MAIN", true) &&
+        !env_flag_enabled("QW3_CONTINUOUS_BATCHING");
     kv_pages_.configure(kv_ctx_size_, kv_page_allocator);
     mtp_kv_pages_.configure(kv_ctx_size_, mtp_kv_page_allocator);
 }
@@ -543,6 +548,7 @@ void QwenExecutor::reset_state() {
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};
+    kvmem_prefill_reselect_suppressed_ = false;
     // Cumulative-attention selection signal: drop the live interval; buffers stay
     // allocated (reused next session). bs_score_layer_ is model-fixed, keep it.
     bs_score_ready_ = false;
@@ -904,13 +910,18 @@ void QwenExecutor::ensure_scratch() {
         if (l.v_rows > max_v) max_v = l.v_rows;
     }
 
-    h_ = backend_.tensor_f32(cfg.n_embd, "h");
+    auto main_tensor = [this](uint64_t count, const char *label) {
+        return nvfp4_bf16_main_
+            ? backend_.tensor_bf16(count, label)
+            : backend_.tensor_f32(count, label);
+    };
+    h_ = main_tensor(cfg.n_embd, "h");
     norm_ = backend_.tensor_f32(cfg.n_embd, "norm");
-    attn_out_ = backend_.tensor_f32(cfg.n_embd, "attn_out");
+    attn_out_ = main_tensor(cfg.n_embd, "attn_out");
     ffn_gate_ = backend_.tensor_f32(std::max<uint64_t>(max_ffn, 1), "ffn_gate");
     ffn_up_ = backend_.tensor_f32(std::max<uint64_t>(max_ffn, 1), "ffn_up");
     ffn_mid_ = backend_.tensor_f32(std::max<uint64_t>(max_ffn, 1), "ffn_mid");
-    ffn_out_ = backend_.tensor_f32(cfg.n_embd, "ffn_out");
+    ffn_out_ = main_tensor(cfg.n_embd, "ffn_out");
     if (max_recurrent_qkv > 0) proj_ = backend_.tensor_f32(max_recurrent_qkv, "recurrent_proj");
     if (max_recurrent_value > 0) gate_proj_ = backend_.tensor_f32(max_recurrent_value, "recurrent_gate");
     if (max_recurrent_value > 0) core_ = backend_.tensor_f32(max_recurrent_value, "recurrent_core");
@@ -987,7 +998,7 @@ void QwenExecutor::ensure_scratch() {
         }
     }
 
-    const GgufTensorInfo *head = model_.output();
+    const ModelTensorInfo *head = model_.output();
     logits_ = backend_.tensor_f32(tensor_rows(*head), "logits");
 
     scratch_ready_ = true;
@@ -1102,8 +1113,14 @@ void QwenExecutor::ensure_mtp_scratch() {
     mtp_enorm_ = backend_.tensor_f32(cfg.n_embd, "mtp_enorm");
     mtp_hnorm_ = backend_.tensor_f32(cfg.n_embd, "mtp_hnorm");
     mtp_concat_ = backend_.tensor_f32(static_cast<uint64_t>(2) * cfg.n_embd, "mtp_concat");
-    mtp_zero_h_ = backend_.tensor_f32(cfg.n_embd, "mtp_zero_h");
-    mtp_prefix_h_ = backend_.tensor_f32(cfg.n_embd, "mtp_prefix_h");
+    mtp_attn_out_ = backend_.tensor_f32(cfg.n_embd, "mtp_attn_out");
+    mtp_ffn_out_ = backend_.tensor_f32(cfg.n_embd, "mtp_ffn_out");
+    mtp_zero_h_ = nvfp4_bf16_main_
+        ? backend_.tensor_bf16(cfg.n_embd, "mtp_zero_h")
+        : backend_.tensor_f32(cfg.n_embd, "mtp_zero_h");
+    mtp_prefix_h_ = nvfp4_bf16_main_
+        ? backend_.tensor_bf16(cfg.n_embd, "mtp_prefix_h")
+        : backend_.tensor_f32(cfg.n_embd, "mtp_prefix_h");
     (void) backend_.zero_tensor(*mtp_zero_h_);
 
     const uint64_t kv_per_pos = static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
@@ -1199,13 +1216,18 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
     }
 
     const uint64_t B = batch;
-    h_batch_       = backend_.tensor_f32(B * cfg.n_embd,             "h_batch");
+    auto main_tensor = [this](uint64_t count, const char *label) {
+        return nvfp4_bf16_main_
+            ? backend_.tensor_bf16(count, label)
+            : backend_.tensor_f32(count, label);
+    };
+    h_batch_       = main_tensor(B * cfg.n_embd,                     "h_batch");
     norm_batch_    = backend_.tensor_f32(B * cfg.n_embd,             "norm_batch");
-    attn_out_batch_= backend_.tensor_f32(B * cfg.n_embd,             "attn_out_batch");
+    attn_out_batch_= main_tensor(B * cfg.n_embd,                     "attn_out_batch");
     ffn_gate_batch_= backend_.tensor_f32(B * std::max<uint64_t>(max_ffn, 1), "ffn_gate_batch");
     ffn_up_batch_  = backend_.tensor_f32(B * std::max<uint64_t>(max_ffn, 1), "ffn_up_batch");
     ffn_mid_batch_ = backend_.tensor_f32(B * std::max<uint64_t>(max_ffn, 1), "ffn_mid_batch");
-    ffn_out_batch_ = backend_.tensor_f32(B * cfg.n_embd,             "ffn_out_batch");
+    ffn_out_batch_ = main_tensor(B * cfg.n_embd,                     "ffn_out_batch");
     if (max_rqkv  > 0) proj_batch_      = backend_.tensor_f32(B * max_rqkv,  "proj_batch");
     if (max_rqkv  > 0) conv_out_batch_  = backend_.tensor_f32(B * max_rqkv,  "conv_out_batch");
     if (max_rvalue> 0) gate_proj_batch_ = backend_.tensor_f32(B * max_rvalue,"gate_proj_batch");
@@ -1291,6 +1313,9 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     const uint32_t standard_n_heads = cfg.n_heads;
     const uint32_t standard_n_kv_heads = cfg.n_kv_heads;
     const float eps = cfg.rms_eps;
+    const bool use_paged_decode =
+        kvmem_enabled_ || has_external_kv_cache() ||
+        paged_kv_prefill_for_local_cache_enabled();
     const bool kvmem_trace_this_token =
         compute_logits && kvmem_attn_trace_sample_now();
     const bool global_trace_this_token =
@@ -1299,15 +1324,17 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     require_status(backend_.begin());
     begin_record_timing(executor_trace_timing_enabled());
 
-    // CUDA-graph capture path: skip on the first token (warm-up: every
-    // backend-side scratch buffer needs to be sized before we record
-    // pointers into a graph). Also disabled whenever we're inside an MTP
-    // verify/replay pass (compute_logits == false) — the captured topology
-    // assumes the full LM-head argmax tail runs, which the no-logits path
-    // skips, so re-using a stale graph would be incorrect.
-    // Paged KV currently uploads the host page table during append/attention;
-    // keep decode eager until page tables are device-resident across steps.
-    const bool try_capture = false;
+    // Opt-in CUDA graph path. The first token sizes all lazy workspaces; later
+    // tokens are captured with their current token/position arguments and
+    // update the existing executable graph before replay. Paged KV and timed
+    // executor traces are not capture-safe yet.
+    const bool try_capture =
+        env_flag_enabled("QW3_GRAPH") &&
+        !decode_graph_warmup_pending_ &&
+        compute_logits &&
+        !use_paged_decode &&
+        !executor_trace_timing_enabled() &&
+        backend_.begin_capture();
 
     require_status(backend_.q8_0_get_row(*h_, weights_.token_embd(), token_id));
     record(report, "token_embedding_lookup");
@@ -1386,23 +1413,15 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             // Per-head RMS norm using the shared head_dim-vector. Q is laid
             // out as [n_heads, 2, head_dim] so the per-unit stride is 2 *
             // head_dim and we normalize only the first head_dim (attn-Q).
-            require_status(backend_.rmsnorm_per_head(*q_, *layer.attn_q_norm,
-                                                     standard_n_heads,
-                                                     2 * standard_head_dim,
-                                                     standard_head_dim, eps));
-            require_status(backend_.rmsnorm_per_head(*k_, *layer.attn_k_norm,
-                                                     standard_n_kv_heads,
-                                                     standard_head_dim,
-                                                     standard_head_dim, eps));
-
-            // Partial RoPE on the first rope_dim of each head's first segment.
-            // Baked at the window position when block-sparse is active.
-            require_status(backend_.rope_partial(*q_, standard_n_heads,
-                                                 2 * standard_head_dim,
-                                                 cfg.rope_dim, rope_pos, cfg.rope_theta));
-            require_status(backend_.rope_partial(*k_, standard_n_kv_heads,
-                                                 standard_head_dim,
-                                                 cfg.rope_dim, rope_pos, cfg.rope_theta));
+            // Fuse both per-head RMS norms with both partial RoPE transforms.
+            // Q's second head_dim segment is the output gate and remains
+            // untouched.
+            require_status(backend_.rmsnorm_rope_qk(
+                *q_, *k_, *layer.attn_q_norm, *layer.attn_k_norm,
+                standard_n_heads, standard_n_kv_heads,
+                2 * standard_head_dim, standard_head_dim,
+                standard_head_dim, cfg.rope_dim, rope_pos,
+                cfg.rope_theta, eps));
 
             // Above-budget QC content index for the generated token: de-RoPE the
             // freshly-baked K at its bake position into the content frame (position-
@@ -1412,24 +1431,42 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
 
             // Append K and V to the live cache.
             const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
-            require_status(backend_.kv_append_batch_paged_device(
-                k_cache(il), *k_, attn_pos, per_pos, 1,
-                pages_dev, pages_count, kv_page_size()));
-            require_status(backend_.kv_append_batch_paged_device(
-                v_cache(il), *v_, attn_pos, per_pos, 1,
-                pages_dev, pages_count, kv_page_size()));
-            record(report, "layer." + std::to_string(il) + ".kv_append_paged");
-
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
-            require_status(backend_.attention_decode_batch_paged_gated_device(
-                *mid_, *q_, 2 * standard_head_dim,
-                k_cache(il), v_cache(il),
-                pages_dev, pages_count, kv_page_size(),
-                standard_n_heads, standard_n_kv_heads, standard_head_dim,
-                attn_pos, 1,
-                standard_n_heads * 2 * standard_head_dim,
-                standard_n_heads * standard_head_dim, scale));
-            record(report, "layer." + std::to_string(il) + ".attention_sdpa_paged");
+            if (use_paged_decode) {
+                require_status(backend_.kv_append_batch_paged_device(
+                    k_cache(il), *k_, attn_pos, per_pos, 1,
+                    pages_dev, pages_count, kv_page_size()));
+                require_status(backend_.kv_append_batch_paged_device(
+                    v_cache(il), *v_, attn_pos, per_pos, 1,
+                    pages_dev, pages_count, kv_page_size()));
+                record(report, "layer." + std::to_string(il) + ".kv_append_paged");
+
+                require_status(backend_.attention_decode_batch_paged_gated_device(
+                    *mid_, *q_, 2 * standard_head_dim,
+                    k_cache(il), v_cache(il),
+                    pages_dev, pages_count, kv_page_size(),
+                    standard_n_heads, standard_n_kv_heads, standard_head_dim,
+                    attn_pos, 1,
+                    standard_n_heads * 2 * standard_head_dim,
+                    standard_n_heads * standard_head_dim, scale));
+                record(report, "layer." + std::to_string(il) + ".attention_sdpa_paged");
+            } else {
+                require_status(backend_.kv_append(
+                    k_cache(il), *k_, attn_pos, per_pos));
+                require_status(backend_.kv_append(
+                    v_cache(il), *v_, attn_pos, per_pos));
+                record(report, "layer." + std::to_string(il) + ".kv_append");
+
+                require_status(backend_.attention_decode(
+                    *mid_, *scores_, *q_, 2 * standard_head_dim,
+                    k_cache(il), v_cache(il),
+                    standard_n_heads, standard_n_kv_heads,
+                    standard_head_dim, attn_pos + 1, scale));
+                require_status(backend_.apply_attn_gate(
+                    *mid_, *q_, 2 * standard_head_dim,
+                    standard_n_heads, standard_head_dim));
+                record(report, "layer." + std::to_string(il) + ".attention_sdpa");
+            }
 
             if (global_trace_this_token) {
                 global_trace_attention_layer(
@@ -1530,7 +1567,7 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     if (global_trace_this_token) ++global_attn_trace_sample_;
     report.argmax_token = best.token;
     report.argmax_logit = best.logit;
-    report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
+    report.argmax_text = model_.token_text(static_cast<uint32_t>(best.token));
     record(report, "lm_head_argmax");
     report.ok = true;
     return report;
@@ -1897,9 +1934,6 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
 
         for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
         const QwenLayerWeights &layer = weights_.layer(il);
-        require_status(backend_.rms_norm_batch(*norm_batch_, *h_batch_, *layer.attn_norm,
-                                                batch, h_stride, eps));
-        if (record_ops) record(report, "layer." + std::to_string(il) + ".attn_norm_batch");
 
         if (layer.recurrent) {
             {
@@ -1909,9 +1943,11 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                              layer.ssm_alpha, layer.ssm_beta};
                 const uint32_t strides[4] = {proj_stride, gate_proj_stride,
                                              alpha_stride, beta_stride};
-                require_status(backend_.q8_0_matmul_fanout(outs, ws, strides, 4,
-                                                           *norm_batch_, batch, h_stride));
+                require_status(backend_.rms_norm_q8_0_matmul_recurrent_fanout(
+                    *norm_batch_, outs, ws, strides, 4,
+                    *h_batch_, *layer.attn_norm, batch, h_stride, eps));
             }
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".attn_norm_batch");
             if (record_ops) record(report, "layer." + std::to_string(il) + ".recurrent_projections_batch");
             if (!recurrent_states_[il] || !conv_states_[il] || !conv_out_batch_) {
                 throw std::runtime_error("recurrent state not allocated for layer " + std::to_string(il));
@@ -2024,9 +2060,20 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 DeviceTensor *outs[3] = {q_batch_.get(), k_batch_.get(), v_batch_.get()};
                 const DeviceWeight *ws[3] = {layer.attn_q, layer.attn_k, layer.attn_v};
                 const uint32_t strides[3] = {q_stride_buf, k_stride_buf, v_stride_buf};
-                require_status(backend_.q8_0_matmul_fanout(outs, ws, strides, 3,
-                                                           *norm_batch_, batch, h_stride));
+                if (v_cache(il).dtype == DeviceTensorDType::FP8_E4M3) {
+                    require_status(
+                        backend_.rms_norm_q8_0_matmul_attention_fanout(
+                            *norm_batch_, outs, ws, strides, 3,
+                            *h_batch_, *layer.attn_norm, batch,
+                            h_stride, eps));
+                } else {
+                    require_status(backend_.rms_norm_q8_0_matmul_fanout(
+                        *norm_batch_, outs, ws, strides, 3,
+                        *h_batch_, *layer.attn_norm, batch,
+                        h_stride, eps));
+                }
             }
+            if (record_ops) record(report, "layer." + std::to_string(il) + ".attn_norm_batch");
             if (record_ops) record(report, "layer." + std::to_string(il) + ".attention_qkv_projection_batch");
 
             require_status(backend_.rmsnorm_per_head_batch(*q_batch_, *layer.attn_q_norm,
@@ -2101,7 +2148,11 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
             if (use_paged_prefill) {
-                if (batch == 1) {
+                // MTP verify/replay is a tiny causal batch. The paged batch
+                // decode adapter uses split-K per row and is substantially
+                // faster than the paged prefill planner over a long cache.
+                // Real prompt prefill remains on the prefill path.
+                if (batch == 1 || (mtp_single_chunk && batch <= 8)) {
                     require_status(backend_.attention_decode_batch_paged_gated_device(
                         *mid_batch_, *q_batch_, 2 * standard_head_dim,
                         k_cache(il), v_cache(il),
@@ -2156,23 +2207,41 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                       static_cast<uint64_t>(batch) * h_stride));
         if (record_ops) record(report, "layer." + std::to_string(il) + ".attn_residual_batch");
 
-        require_status(backend_.rms_norm_batch(*norm_batch_, *h_batch_, *layer.ffn_norm,
-                                                batch, h_stride, eps));
-        if (record_ops) record(report, "layer." + std::to_string(il) + ".ffn_norm_batch");
-
-        require_status(backend_.q8_0_matmul(*ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
-                                             batch, h_stride, ffn_stride));
-        require_status(backend_.q8_0_matmul(*ffn_up_batch_, *layer.ffn_up, *norm_batch_,
-                                             batch, h_stride, ffn_stride));
-        // Batched scratch buffers are capacity-sized; only the active `batch`
-        // rows hold valid data. silu_mul/add over the full o.count would
-        // process batch_capacity_ rows (e.g. the 2048-wide prefill chunk) for
-        // a 2..5-row verify batch — that elementwise overhead, not the matmul,
-        // was the verify FFN's dominant cost. Cap to batch rows via *_n.
-        require_status(backend_.silu_mul_n(*ffn_mid_batch_, *ffn_gate_batch_, *ffn_up_batch_,
-                                           static_cast<uint64_t>(batch) * ffn_stride));
-        require_status(backend_.q8_0_matmul(*ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
-                                             batch, ffn_stride, h_stride));
+        DeviceStatus fused_ffn = backend_.nvfp4_ffn_prefill(
+            *ffn_out_batch_, *layer.ffn_gate, *layer.ffn_up,
+            *layer.ffn_down, *layer.ffn_norm, *h_batch_, batch, h_stride,
+            ffn_stride, h_stride, eps);
+        if (!fused_ffn.ok) {
+            require_status(backend_.rms_norm_batch(
+                *norm_batch_, *h_batch_, *layer.ffn_norm,
+                batch, h_stride, eps));
+            if (record_ops) {
+                record(report, "layer." + std::to_string(il) +
+                                   ".ffn_norm_batch");
+            }
+            DeviceStatus fused_swiglu = backend_.q8_0_matmul_silu_mul(
+                *ffn_mid_batch_, *layer.ffn_gate, *layer.ffn_up,
+                *norm_batch_, batch, h_stride, ffn_stride);
+            if (!fused_swiglu.ok) {
+                require_status(backend_.q8_0_matmul(
+                    *ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
+                    batch, h_stride, ffn_stride));
+                require_status(backend_.q8_0_matmul(
+                    *ffn_up_batch_, *layer.ffn_up, *norm_batch_,
+                    batch, h_stride, ffn_stride));
+                // Batched scratch buffers are capacity-sized; process only active
+                // rows when the weight format does not support fused SwiGLU.
+                require_status(backend_.silu_mul_n(
+                    *ffn_mid_batch_, *ffn_gate_batch_, *ffn_up_batch_,
+                    static_cast<uint64_t>(batch) * ffn_stride));
+            }
+            require_status(backend_.q8_0_matmul(
+                *ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
+                batch, ffn_stride, h_stride));
+        } else if (record_ops) {
+            record(report, "layer." + std::to_string(il) +
+                               ".nvfp4_fused_ffn_batch");
+        }
         require_status(backend_.add_n(*h_batch_, *h_batch_, *ffn_out_batch_,
                                       static_cast<uint64_t>(batch) * h_stride));
         if (record_ops) record(report, "layer." + std::to_string(il) + ".ffn_batch");
@@ -2278,7 +2347,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         const DeviceArgmax &best = row_argmaxes->back();
         report.argmax_token = best.token;
         report.argmax_logit = best.logit;
-        report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
+        report.argmax_text = model_.token_text(static_cast<uint32_t>(best.token));
         record(report, "lm_head_argmax_batch");
         report.ok = true;
         return report;
@@ -2293,7 +2362,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
     position_ += total;
     report.argmax_token = best.token;
     report.argmax_logit = best.logit;
-    report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
+    report.argmax_text = model_.token_text(static_cast<uint32_t>(best.token));
     record(report, "lm_head_argmax");
     report.ok = true;
     return report;
@@ -2640,8 +2709,9 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     // h += W_out * mid (fused matvec+add with eager fallback, mirroring the
     // main decode path).
     if (auto st = backend_.q8_0_matvec_add(*mtp_h_, *layer.attn_output, *mid_); !st.ok) {
-        require_status(backend_.q8_0_matvec(*attn_out_, *layer.attn_output, *mid_));
-        require_status(backend_.add(*mtp_h_, *mtp_h_, *attn_out_));
+        require_status(backend_.q8_0_matvec(
+            *mtp_attn_out_, *layer.attn_output, *mid_));
+        require_status(backend_.add(*mtp_h_, *mtp_h_, *mtp_attn_out_));
     }
     record(report, "mtp.attn_residual");
 
@@ -2656,8 +2726,9 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
         require_status(backend_.silu_mul(*ffn_mid_, *ffn_gate_, *ffn_up_));
     }
     if (auto st = backend_.q8_0_matvec_add(*mtp_h_, *layer.ffn_down, *ffn_mid_); !st.ok) {
-        require_status(backend_.q8_0_matvec(*ffn_out_, *layer.ffn_down, *ffn_mid_));
-        require_status(backend_.add(*mtp_h_, *mtp_h_, *ffn_out_));
+        require_status(backend_.q8_0_matvec(
+            *mtp_ffn_out_, *layer.ffn_down, *ffn_mid_));
+        require_status(backend_.add(*mtp_h_, *mtp_h_, *mtp_ffn_out_));
     }
     record(report, "mtp.ffn");
 
@@ -2681,7 +2752,7 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     if (!argmax_out) {
         report.argmax_token = best.token;
         report.argmax_logit = best.logit;
-        report.argmax_text = model_.gguf().token_text(static_cast<uint32_t>(best.token));
+        report.argmax_text = model_.token_text(static_cast<uint32_t>(best.token));
     }
     record(report, "mtp.lm_head_argmax");
     report.ok = true;
@@ -2711,6 +2782,7 @@ void QwenExecutor::capture_state(StateSnapshot &snapshot) {
     ensure_scratch();
     snapshot.position = position_;
     snapshot.kv_logical_pages = kv_pages_.count();
+    snapshot.mtp_kv_logical_pages = mtp_kv_pages_.count();
     snapshot.mtp_prefix_len = mtp_prefix_len_;
     snapshot.kvmem_registered_pos = kvmem_registered_pos_;
     // kvmem window state (inert unless kvmem is active for this session).
@@ -2718,10 +2790,24 @@ void QwenExecutor::capture_state(StateSnapshot &snapshot) {
     snapshot.window_query_pos = window_query_pos_;
     snapshot.window_page_count = window_page_count_;
     if (h_) {
-        if (!snapshot.h || snapshot.h->count != h_->count) {
-            snapshot.h = backend_.scratch_f32(h_->count, "snapshot_h");
+        if (!snapshot.h || snapshot.h->count != h_->count ||
+            snapshot.h->dtype != h_->dtype) {
+            snapshot.h =
+                backend_.scratch_like(*h_, h_->count, "snapshot_h");
         }
         require_status(backend_.copy_d2d(*snapshot.h, *h_, 0, h_->count));
+    }
+    if (mtp_prefix_h_) {
+        if (!snapshot.mtp_prefix_h ||
+            snapshot.mtp_prefix_h->count != mtp_prefix_h_->count ||
+            snapshot.mtp_prefix_h->dtype != mtp_prefix_h_->dtype) {
+            snapshot.mtp_prefix_h = backend_.scratch_like(
+                *mtp_prefix_h_, mtp_prefix_h_->count,
+                "snapshot_mtp_prefix_h");
+        }
+        require_status(backend_.copy_d2d(*snapshot.mtp_prefix_h,
+                                         *mtp_prefix_h_, 0,
+                                         mtp_prefix_h_->count));
     }
     if (snapshot.recurrent_states.size() != recurrent_states_.size()) {
         snapshot.recurrent_states.resize(recurrent_states_.size());
@@ -2762,6 +2848,11 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
     if (snapshot.h && h_) {
         require_status(backend_.copy_d2d(*h_, *snapshot.h, 0, h_->count));
     }
+    if (snapshot.mtp_prefix_h && mtp_prefix_h_) {
+        require_status(backend_.copy_d2d(*mtp_prefix_h_,
+                                         *snapshot.mtp_prefix_h, 0,
+                                         mtp_prefix_h_->count));
+    }
     for (size_t i = 0; i < recurrent_states_.size(); ++i) {
         if (recurrent_states_[i] && i < snapshot.recurrent_states.size() &&
             snapshot.recurrent_states[i]) {
@@ -2779,6 +2870,7 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
     position_ = snapshot.position;
     kvmem_registered_pos_ = snapshot.kvmem_registered_pos;
     kv_pages_.truncate_to_logical_pages(snapshot.kv_logical_pages);
+    mtp_kv_pages_.truncate_to_logical_pages(snapshot.mtp_kv_logical_pages);
     mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_,
                                          snapshot.mtp_prefix_len);
     // Roll the kvmem window back to where it was at capture. Verify/decode only
@@ -3269,6 +3361,7 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
 
 void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
     if (!kvmem_enabled_ || !block_store_ || !kvmem_gpu_page_pool_) return;
+    if (kvmem_prefill_reselect_suppressed_) return;
     if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) return;
     const KvMemStoreConfig &cfg = block_store_->config();
     if (cfg.estimated_block_bytes == 0 || cfg.block_tokens == 0) return;
@@ -4939,7 +5032,8 @@ bool QwenExecutor::kvmem_retrieval_score() {
 // in-span Q rows during prefill. begin==end (default) leaves everything inert
 // -> the single-token retrieval / recency path runs unchanged.
 void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
-                                        uint32_t prompt_tokens) {
+                                        uint32_t prompt_tokens,
+                                        uint32_t index_tokens) {
     // Consume + clear the resume base up front (set by the preceding
     // kvmem_truncate_to on a session-continuation turn). It is only USED when a
     // span is active below (above-budget QC); on a cold/below-budget call it is
@@ -4987,8 +5081,13 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // so each (layer, chunk) slice lands at a stable offset. Pre-size all buffers
     // for the full block count so capture + scoring never reallocate mid-prefill.
     if (!block_store_ || prompt_tokens == 0) return;
+    // Query replay ranks historical blocks only. Its query span remains in the
+    // full prompt coordinate frame, while the content index deliberately ends
+    // at the query boundary so it is complete before the final replay begins.
+    const uint32_t indexed_tokens = index_tokens > 0 ? index_tokens : prompt_tokens;
+    if (indexed_tokens == 0) return;
     const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
-    const uint32_t total_blocks = (prompt_tokens + bt - 1) / bt;
+    const uint32_t total_blocks = (indexed_tokens + bt - 1) / bt;
     if (total_blocks == 0) return;
     kvmem_qc_total_blocks_ = total_blocks;
     // Sub-block mean-k (SubBlockMeanK): capture this many equal, non-overlapping
@@ -5041,7 +5140,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // K batch) — keeps its prior-turn mean (a small, bounded ranking approximation;
     // KV bytes are always exact). A cold/diverged turn (resume_base==0) or a fresh
     // allocation zeroes the whole index so any un-captured block ranks at 0.0.
-    if (resume_base > 0 && resume_base <= prompt_tokens && !freshly_allocated) {
+    if (resume_base > 0 && resume_base <= indexed_tokens && !freshly_allocated) {
         kvmem_qc_captured_blocks_ = (resume_base + bt - 1) / bt;  // ceil
     } else {
         require_status(backend_.zero_tensor(*g_kbar_multi_));
@@ -5052,9 +5151,9 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // layers) this is ~7.4 GB, so it is allocated ONLY under --kvmem-retrieval-method
     // per-token (the default mean-k path pays zero).
     if (kvmem_qc_pertoken_) {
-        kvmem_qc_total_tokens_ = prompt_tokens;
+        kvmem_qc_total_tokens_ = indexed_tokens;
         const uint64_t kraw_per_layer =
-            static_cast<uint64_t>(prompt_tokens) * n_kv_heads * head_dim;
+            static_cast<uint64_t>(indexed_tokens) * n_kv_heads * head_dim;
         const uint64_t kraw_total = kraw_per_layer * L;
         if (!g_kraw_multi_ || g_kraw_multi_->count < kraw_total) {
             g_kraw_multi_ = backend_.tensor_f32(kraw_total, "g_kraw_multi");
@@ -5062,7 +5161,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
         if (std::getenv("QW3_KVMEM_TRACE")) {
             std::fprintf(stderr,
                 "[bs-exactmass] alloc g_kraw_multi: L=%u total_tokens=%u -> %.2f GiB\n",
-                L, prompt_tokens,
+                         L, indexed_tokens,
                 static_cast<double>(kraw_total) * sizeof(float) / (1024.0*1024.0*1024.0));
         }
     }
@@ -5119,6 +5218,19 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
             // Zero the snapshot + decay accumulators so uncaptured blocks read 0.
             require_status(backend_.zero_tensor(*g_deltanet_snap_));
             require_status(backend_.zero_tensor(*g_deltanet_decaysum_));
+        }
+    }
+    // A rewind exactly to the replay boundary already preserved every indexed
+    // context block. No suffix capture will run before selection, so publish the
+    // preserved index now instead of waiting for kvmem_capture_kbar_multi().
+    if (!freshly_allocated &&
+        kvmem_qc_captured_blocks_ >= kvmem_qc_total_blocks_) {
+        g_content_ready_ = true;
+        g_indexed_blocks_ = kvmem_qc_total_blocks_;
+        g_kbar_multi_ready_ = true;
+        g_kbar_multi_blocks_ = kvmem_qc_total_blocks_;
+        if (kvmem_qc_pertoken_ && g_kraw_multi_) {
+            g_kraw_multi_ready_ = true;
         }
     }
 }
@@ -5503,8 +5615,10 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
 // Clean-query prefill (task #50). After a PASS-A prefill of the question tokens in
 // isolation, g_query_multi_ holds the recency-free de-RoPE'd query. Copy it into a
 // persistent buffer that the reset_state between the two passes will not clear.
-void QwenExecutor::kvmem_stash_clean_query() {
-    if (!g_query_multi_ || g_query_multi_count_ == 0) return;
+bool QwenExecutor::kvmem_stash_query() {
+    if (!g_query_multi_ || !g_query_multi_ready_ || g_query_multi_count_ == 0) {
+        return false;
+    }
     const uint64_t n = g_query_multi_->count;
     if (!g_query_multi_clean_ || g_query_multi_clean_->count < n) {
         g_query_multi_clean_ = backend_.tensor_f32(n, "g_query_multi_clean");
@@ -5512,17 +5626,18 @@ void QwenExecutor::kvmem_stash_clean_query() {
     require_status(backend_.copy_d2d(*g_query_multi_clean_, *g_query_multi_, 0, n));
     g_query_multi_clean_count_ = g_query_multi_count_;
     if (std::getenv("QW3_KVMEM_TRACE")) {
-        std::fprintf(stderr, "[bs-cleanq] stash rows=%u elems=%llu\n",
+        std::fprintf(stderr, "[bs-query-stash] stash rows=%u elems=%llu\n",
                      g_query_multi_clean_count_,
                      static_cast<unsigned long long>(n));
     }
+    return true;
 }
 
 // Restore the stashed clean query into g_query_multi_ and mark it ready, so the
 // (mid-prefill and decode-time) reselects rank blocks by the recency-free query.
 // g_query_multi_ is re-allocated at the same [L,S,...] size in PASS B, so the copy
 // count matches; clamp to the smaller of the two just in case.
-void QwenExecutor::kvmem_restore_clean_query() {
+void QwenExecutor::kvmem_restore_stashed_query() {
     if (!g_query_multi_clean_ || g_query_multi_clean_count_ == 0 || !g_query_multi_)
         return;
     const uint64_t n =
@@ -5531,9 +5646,32 @@ void QwenExecutor::kvmem_restore_clean_query() {
     g_query_multi_count_ = g_query_multi_clean_count_;
     g_query_multi_ready_ = true;
     if (std::getenv("QW3_KVMEM_TRACE")) {
-        std::fprintf(stderr, "[bs-cleanq] restore rows=%u\n",
+        std::fprintf(stderr, "[bs-query-stash] restore rows=%u\n",
                      g_query_multi_count_);
     }
+}
+
+void QwenExecutor::kvmem_stash_clean_query() {
+    (void)kvmem_stash_query();
+}
+
+void QwenExecutor::kvmem_restore_clean_query() {
+    kvmem_restore_stashed_query();
+}
+
+void QwenExecutor::kvmem_reset_query_capture() {
+    g_query_multi_count_ = 0;
+    g_query_multi_ready_ = false;
+    kvmem_dn_qcount_ = 0;
+    kvmem_dn_ready_ = false;
+}
+
+bool QwenExecutor::kvmem_query_selection_ready() const {
+    if (kvmem_qc_deltanet_) return kvmem_dn_ready_;
+    const bool index_ready = kvmem_qc_pertoken_
+        ? g_kraw_multi_ready_
+        : g_kbar_multi_ready_;
+    return index_ready && g_query_multi_ready_ && g_query_multi_count_ > 0;
 }
 
 // pick_topk_blocks() unioned with the pinned tail [pin_from, block_count()). When no

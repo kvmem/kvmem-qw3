@@ -48,6 +48,7 @@ public:
         bool ready = false;
         uint32_t position = 0;
         uint32_t kv_logical_pages = 0;
+        uint32_t mtp_kv_logical_pages = 0;
         uint32_t mtp_prefix_len = 0;
         uint32_t kvmem_registered_pos = 0;
         // kvmem window state: when kvmem is active the assembled window advances
@@ -62,6 +63,10 @@ public:
         uint32_t window_query_pos = 0;
         uint32_t window_page_count = 0;
         std::unique_ptr<DeviceTensor> h;
+        // prime_mtp_prefix_from_last_batch consumes the previous target hidden
+        // row from mtp_prefix_h_. Restoring only mtp_prefix_len would leave this
+        // row at the discarded suffix after a query replay.
+        std::unique_ptr<DeviceTensor> mtp_prefix_h;
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
         std::vector<std::unique_ptr<DeviceTensor>> conv_states;
     };
@@ -291,7 +296,8 @@ public:
     // per-layer content index (#91) can size its per-layer stride before the first
     // K chunk is captured. (Public: backend-invoked.)
     void kvmem_set_query_span(uint32_t begin, uint32_t end,
-                              uint32_t prompt_tokens);          // before prefill
+                              uint32_t prompt_tokens,
+                              uint32_t index_tokens = 0);       // before prefill
     // Clean-query prefill (task #50, QW3_KVMEM_CLEAN_QUERY). Backend-invoked.
     // stash: after a PASS-A isolated question prefill, copy the captured de-RoPE'd
     // query into a persistent buffer that survives reset_state. restore: copy it
@@ -301,6 +307,14 @@ public:
     // tail); 0xffffffff (default, set by reset_state) => no pin => byte-identical.
     void kvmem_stash_clean_query();
     void kvmem_restore_clean_query();
+    // Query-replay variants of the same persistent query buffer. The neutral
+    // names avoid tying replay to the isolated clean-query feature. reset keeps
+    // the historical content index live while allowing the final replay to
+    // replace the provisional Q used for selection.
+    bool kvmem_stash_query();
+    void kvmem_restore_stashed_query();
+    void kvmem_reset_query_capture();
+    bool kvmem_query_selection_ready() const;
     void kvmem_set_pin_from_block(uint32_t b) { kvmem_qc_pin_from_block_ = b; }
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
     // it per executor. Set before configure_kvmem(); the pool must outlive this
@@ -386,6 +400,13 @@ public:
     // can grab >100 pages at once, so a "only when nearly empty" trigger would
     // let the pool exhaust mid-chunk and throw). No-op when not bounded/tiered.
     void kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens);
+    // Query replay owns the working-set transition at its checkpoint boundary.
+    // The GPU pool includes generation headroom for this short tail, so suppress
+    // pressure-driven mid-tail reselection while provisional/final query chunks
+    // run; otherwise the selected set could change again without another replay.
+    void kvmem_set_prefill_reselect_suppressed(bool suppressed) {
+        kvmem_prefill_reselect_suppressed_ = suppressed;
+    }
 
     // Re-select the working set from the built-in cumulative-attention top-k
     // and assemble it: re-RoPE each moved block in place (per attention layer)
@@ -520,6 +541,7 @@ private:
     const QwenNativeModel &model_;
     const QwenWeights &weights_;
     DeviceBackend &backend_;
+    bool nvfp4_bf16_main_ = false;
 
     void ensure_batch_scratch(uint32_t batch);
 
@@ -598,6 +620,8 @@ private:
     std::unique_ptr<DeviceTensor> mtp_enorm_;
     std::unique_ptr<DeviceTensor> mtp_hnorm_;
     std::unique_ptr<DeviceTensor> mtp_concat_;
+    std::unique_ptr<DeviceTensor> mtp_attn_out_;
+    std::unique_ptr<DeviceTensor> mtp_ffn_out_;
     std::unique_ptr<DeviceTensor> mtp_k_cache_;
     std::unique_ptr<DeviceTensor> mtp_v_cache_;
     std::unique_ptr<DeviceTensor> mtp_zero_h_;
@@ -873,6 +897,7 @@ private:
     // per-token is selected. kvmem_qc_pertoken_ mirrors the retrieval_method enum.
     bool kvmem_retrieval_score_exactmass();                    // boundary, raw-key ExactMass
     bool kvmem_qc_pertoken_ = false;                           // retrieval_method == PerToken
+    bool kvmem_prefill_reselect_suppressed_ = false;
     uint32_t kvmem_qc_total_tokens_ = 0;                       // total prompt tokens (kraw stride)
     std::unique_ptr<DeviceTensor> g_kraw_multi_;              // [L, total_tokens, n_kv_heads, head_dim] fp32
     bool g_kraw_multi_ready_ = false;                          // g_kraw_multi_ holds raw keys

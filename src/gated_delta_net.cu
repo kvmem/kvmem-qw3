@@ -184,6 +184,25 @@ gated_delta_net_kernel(
     }
 }
 
+bool launch_gdn_prep(
+        float *alpha_inout,
+        float *beta_inout,
+        const float *dt_bias,
+        const float *ssm_a,
+        uint32_t T,
+        uint32_t num_v_heads,
+        uint32_t alpha_stride,
+        uint32_t beta_stride,
+        bool prep_decay,
+        cudaStream_t stream) {
+    const uint32_t threads = 32;
+    const dim3 grid(T, (num_v_heads + threads - 1) / threads);
+    prep_g_sigmoid_beta_kernel<<<grid, threads, 0, stream>>>(
+        alpha_inout, beta_inout, dt_bias, ssm_a,
+        T, num_v_heads, alpha_stride, beta_stride, prep_decay);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 // qw3-facing launcher. Returns true on success; false if S_v is unsupported.
 bool launch_gated_delta_net(
         float *       alpha_inout,        // raw alpha -> overwritten with g/log_g
@@ -212,12 +231,11 @@ bool launch_gated_delta_net(
     }
 
     // Step 1: prep alpha/beta in-place.
-    {
-        const uint32_t threads = 32;
-        const dim3 grid(T, (num_v_heads + threads - 1) / threads);
-        prep_g_sigmoid_beta_kernel<<<grid, threads, 0, stream>>>(
+    if (!launch_gdn_prep(
             alpha_inout, beta_inout, dt_bias, ssm_a,
-            T, num_v_heads, gb_row_stride, gb_row_stride, prep_decay);
+            T, num_v_heads, gb_row_stride, gb_row_stride,
+            prep_decay, stream)) {
+        return false;
     }
 
     // Step 2: ported delta kernel.

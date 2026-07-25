@@ -7,6 +7,11 @@
 #include "qw3/device_backend.hpp"
 #include "qw3/tokenizer.hpp"
 
+#ifdef QW3_ENABLE_CUDA
+#include <cuda_profiler_api.h>
+#include <cuda_runtime_api.h>
+#endif
+
 #include <sys/resource.h>
 
 #include <algorithm>
@@ -473,6 +478,35 @@ bool kvmem_prefix_cache_trace_enabled() {
 // the mid-prefill window otherwise bakes into it. Default off -> byte-identical.
 bool kvmem_clean_query_enabled() {
     return env_flag_enabled("QW3_KVMEM_CLEAN_QUERY");
+}
+
+// Query-only checkpoint/replay. The context is prefilled once, the final user
+// query is run provisionally to capture its Q rows, then replayed from its
+// boundary under the globally retrieved working set. Default off.
+bool kvmem_query_replay_enabled() {
+    return env_flag_enabled("QW3_KVMEM_QUERY_REPLAY");
+}
+
+std::vector<uint32_t> kvmem_selected_block_ids(const QwenExecutor *executor) {
+    std::vector<uint32_t> ids;
+    if (!executor || !executor->block_store()) return ids;
+    for (const KvMemBlock &block : executor->block_store()->blocks()) {
+        if (block.in_working_set) ids.push_back(block.block_id);
+    }
+    return ids;
+}
+
+uint32_t kvmem_selection_additions(const std::vector<uint32_t> &before,
+                                   const std::vector<uint32_t> &after) {
+    uint32_t additions = 0;
+    size_t i = 0;
+    size_t j = 0;
+    while (j < after.size()) {
+        while (i < before.size() && before[i] < after[j]) ++i;
+        if (i == before.size() || before[i] != after[j]) ++additions;
+        ++j;
+    }
+    return additions;
 }
 
 // Cap on total physical KV pages pinned by the prefix cache. 0 = unlimited
@@ -1191,8 +1225,12 @@ public:
         options_ = options;
 
         const double t0 = wall_seconds();
-        model_ = std::make_unique<QwenNativeModel>(std::make_unique<GgufFile>(options.model_path));
-        tokenizer_ = std::make_unique<QwenTokenizer>(model_->gguf());
+        model_ = std::make_unique<QwenNativeModel>(open_model_source(options.model_path));
+        if (const GgufFile *gguf = model_->source().gguf()) {
+            tokenizer_ = std::make_unique<QwenTokenizer>(*gguf);
+        } else {
+            tokenizer_ = std::make_unique<QwenTokenizer>(model_->source().model_directory());
+        }
         const double t_gguf = wall_seconds();
 
         // Device backend + weight uploads are now part of load(), not
@@ -1201,7 +1239,7 @@ public:
         if (options_.native_kernels != "cuda") {
             // mock/cpu kernels are no longer wired here; we still let load()
             // complete so callers that just want to inspect the plan can do so.
-            log("native load: gguf=" + fmt_seconds(t_gguf - t0) +
+            log("native load: model=" + fmt_seconds(t_gguf - t0) +
                 " (skipped device init: native-kernels=" + options_.native_kernels + ")");
             return;
         }
@@ -1478,7 +1516,14 @@ public:
             throw std::runtime_error("qwen-native backend was not fully initialized in load()");
         }
 
-        if (!tokenizer_) tokenizer_ = std::make_unique<QwenTokenizer>(model_->gguf());
+        if (!tokenizer_) {
+            if (const GgufFile *gguf = model_->source().gguf()) {
+                tokenizer_ = std::make_unique<QwenTokenizer>(*gguf);
+            } else {
+                tokenizer_ =
+                    std::make_unique<QwenTokenizer>(model_->source().model_directory());
+            }
+        }
         const std::vector<int32_t> ids = tokenizer_->encode(prompt);
         std::vector<uint32_t> prompt_tokens(ids.begin(), ids.end());
         GenerationOptions effective_options = options;
@@ -1628,11 +1673,17 @@ private:
         int budget = 0;          // max tokens inside <think>; 0 disables
         bool open = false;       // a <think> block is currently open
         int close_id = -1;       // tokenizer id of "</think>" (-1 = unavailable)
+        int eos_id = -1;         // tokenizer EOS id, used for recovery
         int think_tokens = 0;    // tokens generated so far inside the block
         bool forced = false;     // currently feeding forced close tokens
+        bool recover_eos = false; // replace EOS while the think block is open
         std::deque<uint32_t> forced_queue; // remaining forced tokens to feed
 
         bool active() const { return budget > 0 && close_id >= 0; }
+        bool can_recover_eos(uint32_t token) const {
+            return recover_eos && open && close_id >= 0 &&
+                   eos_id >= 0 && token == static_cast<uint32_t>(eos_id);
+        }
     };
 
     struct ContinuousBatchActive {
@@ -2225,21 +2276,26 @@ private:
                             throw std::runtime_error(
                                 "ragged prefill recurrent layer shape unavailable");
                         }
-                        require_ok(backend_.rms_norm_batch(
-                            *norm_batch_, *hidden_batch_, *layer.attn_norm,
-                            total_q, hidden, eps));
-                        require_ok(backend_.q8_0_matmul(
-                            *recurrent_proj_batch_, *layer.attn_qkv,
-                            *norm_batch_, total_q, hidden, proj_stride));
-                        require_ok(backend_.q8_0_matmul(
-                            *recurrent_gate_batch_, *layer.attn_gate,
-                            *norm_batch_, total_q, hidden, gate_stride));
-                        require_ok(backend_.q8_0_matmul(
-                            *recurrent_alpha_batch_, *layer.ssm_alpha,
-                            *norm_batch_, total_q, hidden, alpha_stride));
-                        require_ok(backend_.q8_0_matmul(
-                            *recurrent_beta_batch_, *layer.ssm_beta,
-                            *norm_batch_, total_q, hidden, beta_stride));
+                        DeviceTensor *projection_outs[4] = {
+                            recurrent_proj_batch_.get(),
+                            recurrent_gate_batch_.get(),
+                            recurrent_alpha_batch_.get(),
+                            recurrent_beta_batch_.get(),
+                        };
+                        const DeviceWeight *projection_weights[4] = {
+                            layer.attn_qkv, layer.attn_gate,
+                            layer.ssm_alpha, layer.ssm_beta,
+                        };
+                        const uint32_t projection_strides[4] = {
+                            proj_stride, gate_stride,
+                            alpha_stride, beta_stride,
+                        };
+                        require_ok(
+                            backend_.rms_norm_q8_0_matmul_fanout(
+                                *norm_batch_, projection_outs,
+                                projection_weights, projection_strides, 4,
+                                *hidden_batch_, *layer.attn_norm,
+                                total_q, hidden, eps));
                         for (uint32_t row = 0; row < bsz; ++row) {
                             ContinuousBatchActive &a =
                                 prefilling[outputs[row].prefill_index];
@@ -2348,9 +2404,6 @@ private:
                             std::max(wall_seconds() - t_recurrent0, 0.0);
                     } else {
                         const double t_attention0 = wall_seconds();
-                        require_ok(backend_.rms_norm_batch(
-                            *norm_batch_, *hidden_batch_, *layer.attn_norm,
-                            total_q, hidden, eps));
                         DeviceTensor *qkv_outs[3] = {
                             q_batch_.get(), k_batch_.get(), v_batch_.get()
                         };
@@ -2362,9 +2415,11 @@ private:
                             static_cast<uint32_t>(layer.k_rows),
                             static_cast<uint32_t>(layer.v_rows),
                         };
-                        require_ok(backend_.q8_0_matmul_fanout(
-                            qkv_outs, qkv_ws, qkv_strides, 3,
-                            *norm_batch_, total_q, hidden));
+                        require_ok(
+                            backend_.rms_norm_q8_0_matmul_fanout(
+                                *norm_batch_, qkv_outs, qkv_ws,
+                                qkv_strides, 3, *hidden_batch_,
+                                *layer.attn_norm, total_q, hidden, eps));
                         require_ok(backend_.rmsnorm_per_head_batch(
                             *q_batch_, *layer.attn_q_norm, total_q,
                             static_cast<uint32_t>(layer.q_rows),
@@ -2433,24 +2488,37 @@ private:
                     }
 
                     const double t_ffn0 = wall_seconds();
-                    require_ok(backend_.rms_norm_batch(
-                        *norm_batch_, *hidden_batch_, *layer.ffn_norm,
-                        total_q, hidden, eps));
-                    require_ok(backend_.q8_0_matmul(
-                        *ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
-                        total_q, hidden,
-                        static_cast<uint32_t>(layer.ffn_dim)));
-                    require_ok(backend_.q8_0_matmul(
-                        *ffn_up_batch_, *layer.ffn_up, *norm_batch_,
-                        total_q, hidden,
-                        static_cast<uint32_t>(layer.ffn_dim)));
-                    require_ok(backend_.silu_mul_n(
-                        *ffn_mid_batch_, *ffn_gate_batch_, *ffn_up_batch_,
-                        static_cast<uint64_t>(total_q) * layer.ffn_dim));
-                    require_ok(backend_.q8_0_matmul(
-                        *ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
-                        total_q, static_cast<uint32_t>(layer.ffn_dim),
-                        hidden));
+                    const uint32_t ffn =
+                        static_cast<uint32_t>(layer.ffn_dim);
+                    DeviceStatus fused_ffn = backend_.nvfp4_ffn_prefill(
+                        *ffn_out_batch_, *layer.ffn_gate, *layer.ffn_up,
+                        *layer.ffn_down, *layer.ffn_norm, *hidden_batch_,
+                        total_q, hidden, ffn, hidden, eps);
+                    if (!fused_ffn.ok) {
+                        require_ok(backend_.rms_norm_batch(
+                            *norm_batch_, *hidden_batch_, *layer.ffn_norm,
+                            total_q, hidden, eps));
+                        DeviceStatus fused_swiglu =
+                            backend_.q8_0_matmul_silu_mul(
+                                *ffn_mid_batch_, *layer.ffn_gate,
+                                *layer.ffn_up, *norm_batch_, total_q,
+                                hidden, ffn);
+                        if (!fused_swiglu.ok) {
+                            require_ok(backend_.q8_0_matmul(
+                                *ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
+                                total_q, hidden, ffn));
+                            require_ok(backend_.q8_0_matmul(
+                                *ffn_up_batch_, *layer.ffn_up, *norm_batch_,
+                                total_q, hidden, ffn));
+                            require_ok(backend_.silu_mul_n(
+                                *ffn_mid_batch_, *ffn_gate_batch_,
+                                *ffn_up_batch_,
+                                static_cast<uint64_t>(total_q) * ffn));
+                        }
+                        require_ok(backend_.q8_0_matmul(
+                            *ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
+                            total_q, ffn, hidden));
+                    }
                     require_ok(backend_.add_n(
                         *hidden_batch_, *hidden_batch_, *ffn_out_batch_,
                         static_cast<uint64_t>(total_q) * hidden));
@@ -2549,7 +2617,7 @@ private:
                             out.report.argmax_token = last.token;
                             out.report.argmax_logit = last.logit;
                             out.report.argmax_text =
-                                model_.gguf().token_text(
+                                model_.token_text(
                                     static_cast<uint32_t>(last.token));
                         }
                     }
@@ -2561,7 +2629,7 @@ private:
                         out.report.argmax_token = argmaxes[i].token;
                         out.report.argmax_logit = argmaxes[i].logit;
                         out.report.argmax_text =
-                            model_.gguf().token_text(
+                            model_.token_text(
                                 static_cast<uint32_t>(argmaxes[i].token));
                     }
                 }
@@ -3163,21 +3231,26 @@ private:
                             conv_state_stride == 0) {
                             throw std::runtime_error("recurrent layer shape unavailable");
                         }
-                        require_ok(backend_.rms_norm_batch(
-                            *norm_batch_, *hidden_batch_, *layer.attn_norm,
-                            bsz, hidden, eps));
-                        require_ok(backend_.q8_0_matmul(
-                            *recurrent_proj_batch_, *layer.attn_qkv,
-                            *norm_batch_, bsz, hidden, proj_stride));
-                        require_ok(backend_.q8_0_matmul(
-                            *recurrent_gate_batch_, *layer.attn_gate,
-                            *norm_batch_, bsz, hidden, gate_stride));
-                        require_ok(backend_.q8_0_matmul(
-                            *recurrent_alpha_batch_, *layer.ssm_alpha,
-                            *norm_batch_, bsz, hidden, alpha_stride));
-                        require_ok(backend_.q8_0_matmul(
-                            *recurrent_beta_batch_, *layer.ssm_beta,
-                            *norm_batch_, bsz, hidden, beta_stride));
+                        DeviceTensor *projection_outs[4] = {
+                            recurrent_proj_batch_.get(),
+                            recurrent_gate_batch_.get(),
+                            recurrent_alpha_batch_.get(),
+                            recurrent_beta_batch_.get(),
+                        };
+                        const DeviceWeight *projection_weights[4] = {
+                            layer.attn_qkv, layer.attn_gate,
+                            layer.ssm_alpha, layer.ssm_beta,
+                        };
+                        const uint32_t projection_strides[4] = {
+                            proj_stride, gate_stride,
+                            alpha_stride, beta_stride,
+                        };
+                        require_ok(
+                            backend_.rms_norm_q8_0_matmul_fanout(
+                                *norm_batch_, projection_outs,
+                                projection_weights, projection_strides, 4,
+                                *hidden_batch_, *layer.attn_norm,
+                                bsz, hidden, eps));
                         const double t_state_pack0 = wall_seconds();
                         for (uint32_t row = 0; row < bsz; ++row) {
                             ContinuousBatchActive &a = active[outputs[row].active_index];
@@ -3249,24 +3322,37 @@ private:
                         recurrent_state_s +=
                             std::max(wall_seconds() - t_state_unpack0, 0.0);
                         const double t_ffn0 = wall_seconds();
-                        require_ok(backend_.rms_norm_batch(
-                            *norm_batch_, *hidden_batch_, *layer.ffn_norm,
-                            bsz, hidden, eps));
-                        require_ok(backend_.q8_0_matmul(
-                            *ffn_gate_batch_, *layer.ffn_gate,
-                            *norm_batch_, bsz, hidden,
-                            static_cast<uint32_t>(layer.ffn_dim)));
-                        require_ok(backend_.q8_0_matmul(
-                            *ffn_up_batch_, *layer.ffn_up,
-                            *norm_batch_, bsz, hidden,
-                            static_cast<uint32_t>(layer.ffn_dim)));
-                        require_ok(backend_.silu_mul_n(
-                            *ffn_mid_batch_, *ffn_gate_batch_, *ffn_up_batch_,
-                            static_cast<uint64_t>(bsz) * layer.ffn_dim));
-                        require_ok(backend_.q8_0_matmul(
-                            *ffn_out_batch_, *layer.ffn_down,
-                            *ffn_mid_batch_, bsz,
-                            static_cast<uint32_t>(layer.ffn_dim), hidden));
+                        const uint32_t ffn =
+                            static_cast<uint32_t>(layer.ffn_dim);
+                        DeviceStatus fused_ffn = backend_.nvfp4_ffn_prefill(
+                            *ffn_out_batch_, *layer.ffn_gate, *layer.ffn_up,
+                            *layer.ffn_down, *layer.ffn_norm, *hidden_batch_,
+                            bsz, hidden, ffn, hidden, eps);
+                        if (!fused_ffn.ok) {
+                            require_ok(backend_.rms_norm_batch(
+                                *norm_batch_, *hidden_batch_, *layer.ffn_norm,
+                                bsz, hidden, eps));
+                            DeviceStatus fused_swiglu =
+                                backend_.q8_0_matmul_silu_mul(
+                                    *ffn_mid_batch_, *layer.ffn_gate,
+                                    *layer.ffn_up, *norm_batch_, bsz,
+                                    hidden, ffn);
+                            if (!fused_swiglu.ok) {
+                                require_ok(backend_.q8_0_matmul(
+                                    *ffn_gate_batch_, *layer.ffn_gate,
+                                    *norm_batch_, bsz, hidden, ffn));
+                                require_ok(backend_.q8_0_matmul(
+                                    *ffn_up_batch_, *layer.ffn_up,
+                                    *norm_batch_, bsz, hidden, ffn));
+                                require_ok(backend_.silu_mul_n(
+                                    *ffn_mid_batch_, *ffn_gate_batch_,
+                                    *ffn_up_batch_,
+                                    static_cast<uint64_t>(bsz) * ffn));
+                            }
+                            require_ok(backend_.q8_0_matmul(
+                                *ffn_out_batch_, *layer.ffn_down,
+                                *ffn_mid_batch_, bsz, ffn, hidden));
+                        }
                         require_ok(backend_.add_n(
                             *hidden_batch_, *hidden_batch_, *ffn_out_batch_,
                             static_cast<uint64_t>(bsz) * hidden));
@@ -3277,9 +3363,6 @@ private:
                     }
 
                     const double t_attention0 = wall_seconds();
-                    require_ok(backend_.rms_norm_batch(
-                        *norm_batch_, *hidden_batch_, *layer.attn_norm,
-                        bsz, hidden, eps));
                     DeviceTensor *qkv_outs[3] = {
                         q_batch_.get(), k_batch_.get(), v_batch_.get()
                     };
@@ -3292,9 +3375,11 @@ private:
                         static_cast<uint32_t>(layer.v_rows),
                     };
                     const double t_qkv0 = wall_seconds();
-                    require_ok(backend_.q8_0_matmul_fanout(
-                        qkv_outs, qkv_ws, qkv_strides, 3,
-                        *norm_batch_, bsz, hidden));
+                    require_ok(
+                        backend_.rms_norm_q8_0_matmul_fanout(
+                            *norm_batch_, qkv_outs, qkv_ws,
+                            qkv_strides, 3, *hidden_batch_,
+                            *layer.attn_norm, bsz, hidden, eps));
                     require_ok(backend_.rmsnorm_per_head_batch(
                         *q_batch_, *layer.attn_q_norm, bsz,
                         static_cast<uint32_t>(layer.q_rows), standard_n_heads,
@@ -3356,21 +3441,37 @@ private:
                         std::max(wall_seconds() - t_attention0, 0.0);
 
                     const double t_ffn0 = wall_seconds();
-                    require_ok(backend_.rms_norm_batch(
-                        *norm_batch_, *hidden_batch_, *layer.ffn_norm,
-                        bsz, hidden, eps));
-                    require_ok(backend_.q8_0_matmul(
-                        *ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
-                        bsz, hidden, static_cast<uint32_t>(layer.ffn_dim)));
-                    require_ok(backend_.q8_0_matmul(
-                        *ffn_up_batch_, *layer.ffn_up, *norm_batch_,
-                        bsz, hidden, static_cast<uint32_t>(layer.ffn_dim)));
-                    require_ok(backend_.silu_mul_n(
-                        *ffn_mid_batch_, *ffn_gate_batch_, *ffn_up_batch_,
-                        static_cast<uint64_t>(bsz) * layer.ffn_dim));
-                    require_ok(backend_.q8_0_matmul(
-                        *ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
-                        bsz, static_cast<uint32_t>(layer.ffn_dim), hidden));
+                    const uint32_t ffn =
+                        static_cast<uint32_t>(layer.ffn_dim);
+                    DeviceStatus fused_ffn = backend_.nvfp4_ffn_prefill(
+                        *ffn_out_batch_, *layer.ffn_gate, *layer.ffn_up,
+                        *layer.ffn_down, *layer.ffn_norm, *hidden_batch_,
+                        bsz, hidden, ffn, hidden, eps);
+                    if (!fused_ffn.ok) {
+                        require_ok(backend_.rms_norm_batch(
+                            *norm_batch_, *hidden_batch_, *layer.ffn_norm,
+                            bsz, hidden, eps));
+                        DeviceStatus fused_swiglu =
+                            backend_.q8_0_matmul_silu_mul(
+                                *ffn_mid_batch_, *layer.ffn_gate,
+                                *layer.ffn_up, *norm_batch_, bsz,
+                                hidden, ffn);
+                        if (!fused_swiglu.ok) {
+                            require_ok(backend_.q8_0_matmul(
+                                *ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
+                                bsz, hidden, ffn));
+                            require_ok(backend_.q8_0_matmul(
+                                *ffn_up_batch_, *layer.ffn_up, *norm_batch_,
+                                bsz, hidden, ffn));
+                            require_ok(backend_.silu_mul_n(
+                                *ffn_mid_batch_, *ffn_gate_batch_,
+                                *ffn_up_batch_,
+                                static_cast<uint64_t>(bsz) * ffn));
+                        }
+                        require_ok(backend_.q8_0_matmul(
+                            *ffn_out_batch_, *layer.ffn_down, *ffn_mid_batch_,
+                            bsz, ffn, hidden));
+                    }
                     require_ok(backend_.add_n(
                         *hidden_batch_, *hidden_batch_, *ffn_out_batch_,
                         static_cast<uint64_t>(bsz) * hidden));
@@ -3404,7 +3505,7 @@ private:
                     outputs[row].report.argmax_token = argmaxes[row].token;
                     outputs[row].report.argmax_logit = argmaxes[row].logit;
                     outputs[row].report.argmax_text =
-                        model_.gguf().token_text(
+                        model_.token_text(
                             static_cast<uint32_t>(argmaxes[row].token));
                     outputs[row].report.ok = true;
                     outputs[row].report.ops_executed += 1;
@@ -3522,7 +3623,7 @@ private:
                     outputs[row].report.argmax_token = argmaxes[row].token;
                     outputs[row].report.argmax_logit = argmaxes[row].logit;
                     outputs[row].report.argmax_text =
-                        model_.gguf().token_text(
+                        model_.token_text(
                             static_cast<uint32_t>(argmaxes[row].token));
                     outputs[row].report.ok = true;
                     outputs[row].report.ops_executed += 3;
@@ -4325,24 +4426,46 @@ private:
                 *layer.attn_output, *cb_mtp_mid_batch_, bsz, mid_stride,
                 hidden));
             trace_stage("ffn");
-            require_device_status(device_->rms_norm_batch(
-                *cb_mtp_norm_batch_, *cb_mtp_h_batch_, *layer.ffn_norm,
-                bsz, hidden, eps));
-            DeviceTensor *ffn_outs[2] = {
-                cb_mtp_ffn_gate_batch_.get(), cb_mtp_ffn_up_batch_.get()
-            };
-            const DeviceWeight *ffn_ws[2] = {layer.ffn_gate, layer.ffn_up};
-            const uint32_t ffn_strides[2] = {ffn_stride, ffn_stride};
-            require_device_status(device_->q8_0_matmul_fanout(
-                ffn_outs, ffn_ws, ffn_strides, 2, *cb_mtp_norm_batch_,
-                bsz, hidden));
-            require_device_status(device_->silu_mul_n(
-                *cb_mtp_ffn_mid_batch_, *cb_mtp_ffn_gate_batch_,
-                *cb_mtp_ffn_up_batch_, static_cast<uint64_t>(bsz) * ffn_stride));
-            require_device_status(device_->q8_0_matmul_add(
-                *cb_mtp_h_batch_, *cb_mtp_h_batch_, *cb_mtp_ffn_out_batch_,
-                *layer.ffn_down, *cb_mtp_ffn_mid_batch_, bsz, ffn_stride,
-                hidden));
+            DeviceStatus fused_ffn = device_->nvfp4_ffn_prefill(
+                *cb_mtp_ffn_out_batch_, *layer.ffn_gate, *layer.ffn_up,
+                *layer.ffn_down, *layer.ffn_norm, *cb_mtp_h_batch_,
+                bsz, hidden, ffn_stride, hidden, eps);
+            if (!fused_ffn.ok) {
+                require_device_status(device_->rms_norm_batch(
+                    *cb_mtp_norm_batch_, *cb_mtp_h_batch_,
+                    *layer.ffn_norm, bsz, hidden, eps));
+                DeviceStatus fused_swiglu = device_->q8_0_matmul_silu_mul(
+                    *cb_mtp_ffn_mid_batch_, *layer.ffn_gate, *layer.ffn_up,
+                    *cb_mtp_norm_batch_, bsz, hidden, ffn_stride);
+                if (!fused_swiglu.ok) {
+                    DeviceTensor *ffn_outs[2] = {
+                        cb_mtp_ffn_gate_batch_.get(),
+                        cb_mtp_ffn_up_batch_.get()
+                    };
+                    const DeviceWeight *ffn_ws[2] = {
+                        layer.ffn_gate, layer.ffn_up
+                    };
+                    const uint32_t ffn_strides[2] = {
+                        ffn_stride, ffn_stride
+                    };
+                    require_device_status(device_->q8_0_matmul_fanout(
+                        ffn_outs, ffn_ws, ffn_strides, 2,
+                        *cb_mtp_norm_batch_, bsz, hidden));
+                    require_device_status(device_->silu_mul_n(
+                        *cb_mtp_ffn_mid_batch_, *cb_mtp_ffn_gate_batch_,
+                        *cb_mtp_ffn_up_batch_,
+                        static_cast<uint64_t>(bsz) * ffn_stride));
+                }
+                require_device_status(device_->q8_0_matmul_add(
+                    *cb_mtp_h_batch_, *cb_mtp_h_batch_,
+                    *cb_mtp_ffn_out_batch_, *layer.ffn_down,
+                    *cb_mtp_ffn_mid_batch_, bsz, ffn_stride, hidden));
+            } else {
+                require_device_status(device_->add_n(
+                    *cb_mtp_h_batch_, *cb_mtp_h_batch_,
+                    *cb_mtp_ffn_out_batch_,
+                    static_cast<uint64_t>(bsz) * hidden));
+            }
             require_device_status(device_->rms_norm_batch(
                 *cb_mtp_norm_batch_, *cb_mtp_h_batch_, *mtp->shared_head_norm,
                 bsz, hidden, eps));
@@ -4374,7 +4497,7 @@ private:
                 step.report.argmax_token = step.output_token;
                 step.report.argmax_logit = step.output_logit;
                 if (step.output_token >= 0) {
-                    step.report.argmax_text = model_->gguf().token_text(
+                    step.report.argmax_text = model_->token_text(
                         static_cast<uint32_t>(step.output_token));
                 }
                 step.report.ops_executed = 1;
@@ -4716,7 +4839,7 @@ private:
                     outputs[j].report.argmax_logit = last.logit;
                     if (last.token >= 0) {
                         outputs[j].report.argmax_text =
-                            model_->gguf().token_text(
+                            model_->token_text(
                                 static_cast<uint32_t>(last.token));
                     }
                 }
@@ -4726,9 +4849,11 @@ private:
         auto should_stop = [&](const ContinuousBatchActive &a,
                                uint32_t token) {
             return a.req && !a.req->options.ignore_eos &&
-                   token == static_cast<uint32_t>(eos);
+                   token == static_cast<uint32_t>(eos) &&
+                   !a.budget.can_recover_eos(token);
         };
         auto emit = [&](ContinuousBatchActive &a, uint32_t token) {
+            recover_thinking_eos(a.budget, token);
             if (!a.req || a.decoded >= a.req->options.max_tokens ||
                 should_stop(a, token)) {
                 return false;
@@ -6847,7 +6972,8 @@ private:
         dst.kv_logical_pages = src.kv_logical_pages;
         dst.mtp_prefix_len = src.mtp_prefix_len;
         if (src.h) {
-            dst.h = device_->scratch_f32(src.h->count, "prefix_clone_h");
+            dst.h = device_->scratch_like(
+                *src.h, src.h->count, "prefix_clone_h");
             prefix_require_ok(device_->copy_d2d(*dst.h, *src.h, 0, src.h->count));
         }
         dst.recurrent_states.resize(src.recurrent_states.size());
@@ -7104,7 +7230,11 @@ private:
         state = ThinkingBudgetState{};
         state.budget = options.thinking_budget;
         state.open = options.thinking_open;
-        if (state.budget > 0 && tokenizer_) {
+        state.recover_eos = options.recover_thinking_eos && !options.ignore_eos;
+        if (tokenizer_) {
+            state.eos_id = tokenizer_->eos_id();
+        }
+        if ((state.budget > 0 || state.recover_eos) && tokenizer_) {
             state.close_id = tokenizer_->token_id("</think>");
         }
     }
@@ -7127,13 +7257,14 @@ private:
     // Account for a token the model just committed. Detects a natural </think>
     // close (stops counting) and otherwise advances the in-think counter.
     void budget_observe(ThinkingBudgetState &state, uint32_t token) const {
-        if (!state.active() || !state.open) return;
+        if (!state.open || state.close_id < 0) return;
         if (static_cast<int>(token) == state.close_id) {
             state.open = false;
             state.forced = false;
             state.forced_queue.clear();
             return;
         }
+        if (!state.active()) return;
         ++state.think_tokens;
     }
 
@@ -7143,6 +7274,12 @@ private:
     // override is active. The caller emits the returned token and feeds it back
     // into the model so the KV cache stays consistent.
     uint32_t budget_next_feed(ThinkingBudgetState &state, uint32_t proposed) const {
+        if (state.can_recover_eos(proposed)) {
+            state.open = false;
+            state.forced = false;
+            state.forced_queue.clear();
+            return static_cast<uint32_t>(state.close_id);
+        }
         if (!state.active()) return proposed;
         if (state.forced_queue.empty() && state.open && !state.forced &&
             state.think_tokens >= state.budget) {
@@ -7165,6 +7302,14 @@ private:
         const uint32_t chosen = budget_next_feed(state, proposed);
         budget_observe(state, chosen);
         return chosen;
+    }
+
+    void recover_thinking_eos(ThinkingBudgetState &state, uint32_t &token) const {
+        if (!state.can_recover_eos(token)) return;
+        token = static_cast<uint32_t>(state.close_id);
+        state.open = false;
+        state.forced = false;
+        state.forced_queue.clear();
     }
 
     // True when an open <think> block has spent its budget and the forced
@@ -7237,6 +7382,28 @@ private:
         const bool qc_active =
             (options.kvmem_query_end > options.kvmem_query_begin) &&
             kvmem_sel_budget > 0 && prompt_tokens.size() > kvmem_sel_budget;
+        const uint32_t query_replay_base = executor_->position();
+        const bool query_replay =
+            kvmem_query_replay_enabled() && executor_->kvmem_enabled() &&
+            qc_active && dump == nullptr &&
+            options.kvmem_query_begin > 0 &&
+            options.kvmem_query_begin >= query_replay_base &&
+            options.kvmem_query_end <= prompt_tokens.size() &&
+            prompt_tokens.size() - options.kvmem_query_begin <=
+                executor_->block_store()->config().gen_budget &&
+            executor_->block_store()->config().retrieval_method !=
+                KvMemRetrievalMethod::DeltaNet;
+        if (kvmem_query_replay_enabled() && !query_replay) {
+            std::ostringstream rmsg;
+            rmsg << "native kvmem query-replay skipped (plain): base="
+                 << query_replay_base << " span=[" << options.kvmem_query_begin
+                 << "," << options.kvmem_query_end << ") prompt="
+                 << prompt_tokens.size() << " gen_budget="
+                 << (executor_->block_store()
+                         ? executor_->block_store()->config().gen_budget
+                         : 0);
+            log(rmsg.str());
+        }
 
         // Query-conditioned KVMem (#82): mark the question token span BEFORE
         // prefill (mirrors generate_mtp). Only active above budget; below budget
@@ -7244,6 +7411,7 @@ private:
         // cannot carry a stale span from a prior over-budget turn into the
         // identity path.
         if (executor_->kvmem_enabled() && qc_active) {
+            executor_->kvmem_set_pin_from_block(0xffffffffu);
             executor_->kvmem_set_query_span(options.kvmem_query_begin,
                                             options.kvmem_query_end,
                                             static_cast<uint32_t>(prompt_tokens.size()));
@@ -7260,6 +7428,20 @@ private:
         }
 
         const double t_prefill_start = wall_seconds();
+#ifdef QW3_ENABLE_CUDA
+        const bool profile_cuda_prefill =
+            env_flag_enabled("QW3_CUDA_PROFILE_PREFILL");
+        if (profile_cuda_prefill) {
+            st = device_->synchronize();
+            if (!st.ok) throw std::runtime_error(st.message);
+            const cudaError_t profile_st = cudaProfilerStart();
+            if (profile_st != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("cudaProfilerStart failed: ") +
+                    cudaGetErrorString(profile_st));
+            }
+        }
+#endif
         uint64_t prefill_ops = 0;
         NativeExecutorReport step;
         // On warm reuse the [0,reuse_m) prefix is already resident (restored
@@ -7286,7 +7468,8 @@ private:
         bool warm_prompt_resumable = false;
         uint32_t ckpt_split = 0;
         bool do_boundary_capture = false;
-        if (warm_capture && executor_->kvmem_enabled() && !qc_pertoken_here) {
+        if (warm_capture && executor_->kvmem_enabled() && !qc_pertoken_here &&
+            !query_replay) {
             const uint32_t bt = executor_->block_store()
                                     ? executor_->block_store()->config().block_tokens
                                     : 256;
@@ -7300,14 +7483,28 @@ private:
         }
         // Prefill the global range [gbegin, gend) of prompt_tokens. Factored out so
         // the block-boundary checkpoint can split the prompt prefill at `split`.
-        auto do_prefill_range = [&](size_t gbegin, size_t gend) {
+        auto do_prefill_range = [&](size_t gbegin, size_t gend,
+                                    bool compute_final_logits) {
             if (gbegin >= gend) return;
             std::vector<uint32_t> seg(prompt_tokens.begin() + static_cast<std::ptrdiff_t>(gbegin),
                                       prompt_tokens.begin() + static_cast<std::ptrdiff_t>(gend));
-            step = executor_->forward_n_tokens(seg, gend == prompt_tokens.size());
+            step = executor_->forward_n_tokens(
+                seg, compute_final_logits && gend == prompt_tokens.size());
             if (!step.ok) throw std::runtime_error("prefill failed");
             prefill_ops += step.ops_executed;
         };
+        auto do_query_prefill_range = [&](size_t gbegin, size_t gend,
+                                          bool compute_final_logits) {
+            executor_->kvmem_set_prefill_reselect_suppressed(true);
+            try {
+                do_prefill_range(gbegin, gend, compute_final_logits);
+            } catch (...) {
+                executor_->kvmem_set_prefill_reselect_suppressed(false);
+                throw;
+            }
+            executor_->kvmem_set_prefill_reselect_suppressed(false);
+        };
+        bool query_replay_applied = false;
         if (dump) {
             for (size_t pi = prefill_begin; pi < prompt_tokens.size(); ++pi) {
                 step = executor_->forward_one_token(prompt_tokens[pi]);
@@ -7317,9 +7514,93 @@ private:
                              static_cast<int32_t>(prompt_tokens[pi]),
                              *executor_, *tokenizer_);
             }
+        } else if (query_replay) {
+            const uint32_t qb = options.kvmem_query_begin;
+            const uint32_t qe = options.kvmem_query_end;
+            const uint32_t bt = executor_->block_store()->config().block_tokens;
+            const double checkpoint_start = wall_seconds();
+
+            // Establish the pre-query state and its current (fallback/recency)
+            // working set. This is the only state the replay rewinds to.
+            do_prefill_range(prefill_begin, qb, /*compute_final_logits=*/false);
+            executor_->kvmem_register_append(qb - static_cast<uint32_t>(prefill_begin));
+            executor_->kvmem_reselect();
+            const std::vector<uint32_t> selected_before =
+                kvmem_selected_block_ids(executor_.get());
+            QwenExecutor::StateSnapshot query_checkpoint;
+            executor_->capture_state(query_checkpoint);
+            const double checkpoint_end = wall_seconds();
+
+            // Provisional query: capture Q under the current working set. Its
+            // target/DeltaNet state and logits are discarded if capture succeeds.
+            const double provisional_start = wall_seconds();
+            do_query_prefill_range(qb, prompt_tokens.size(),
+                                   /*compute_final_logits=*/true);
+            const double provisional_end = wall_seconds();
+            if (executor_->kvmem_stash_query()) {
+                const double restore_start = wall_seconds();
+                executor_->restore_state(query_checkpoint);
+                executor_->kvmem_truncate_to(qb);
+                // Keep the query in full-prompt coordinates, but publish only the
+                // historical [0,qb) content index for the boundary selection.
+                executor_->kvmem_set_query_span(
+                    qb, qe, static_cast<uint32_t>(prompt_tokens.size()), qb);
+                executor_->kvmem_restore_stashed_query();
+                executor_->kvmem_set_pin_from_block(qb / std::max<uint32_t>(bt, 1));
+                const bool index_ready = executor_->kvmem_query_selection_ready();
+                const QwenExecutor::KvMemTimingSnapshot select_t0 =
+                    QwenExecutor::kvmem_timing_snapshot();
+                const double select_start = wall_seconds();
+                executor_->kvmem_reselect();
+                const double select_end = wall_seconds();
+                const QwenExecutor::KvMemTimingSnapshot select_t1 =
+                    QwenExecutor::kvmem_timing_snapshot();
+                const std::vector<uint32_t> selected_after =
+                    kvmem_selected_block_ids(executor_.get());
+                const uint32_t additions =
+                    kvmem_selection_additions(selected_before, selected_after);
+
+                // The final replay must capture a fresh Q for later interval
+                // reselects; otherwise the provisional Q would remain latched.
+                executor_->kvmem_reset_query_capture();
+                const double replay_start = wall_seconds();
+                do_query_prefill_range(qb, prompt_tokens.size(),
+                                       /*compute_final_logits=*/true);
+                executor_->kvmem_register_append(
+                    static_cast<uint32_t>(prompt_tokens.size()) - qb);
+                const double replay_end = wall_seconds();
+                query_replay_applied = true;
+
+                std::ostringstream rmsg;
+                rmsg << std::fixed << std::setprecision(3)
+                     << "native kvmem query-replay (plain): span=[" << qb << ","
+                     << qe << ") tail=" << (prompt_tokens.size() - qb)
+                     << " checkpoint_ms=" << (checkpoint_end - checkpoint_start) * 1e3
+                     << " provisional_ms=" << (provisional_end - provisional_start) * 1e3
+                     << " restore_ms=" << (select_start - restore_start) * 1e3
+                     << " select_ms=" << (select_end - select_start) * 1e3
+                     << " replay_ms=" << (replay_end - replay_start) * 1e3
+                     << " selected=" << selected_after.size()
+                     << " replaced=" << additions
+                     << " replace_rate="
+                     << (selected_after.empty()
+                             ? 0.0
+                             : static_cast<double>(additions) / selected_after.size())
+                     << " stage_in="
+                     << (select_t1.stage_in_blocks - select_t0.stage_in_blocks)
+                     << " stage_out="
+                     << (select_t1.stage_out_blocks - select_t0.stage_out_blocks)
+                     << " index_ready=" << (index_ready ? 1 : 0)
+                     << " final_pos=" << executor_->position();
+                log(rmsg.str());
+            } else {
+                log("native kvmem query-replay (plain): provisional query capture "
+                    "was incomplete; keeping the single-pass result");
+            }
         } else if (do_boundary_capture) {
             // First segment [prefill_begin, split): advance recurrent state to B.
-            do_prefill_range(prefill_begin, ckpt_split);
+            do_prefill_range(prefill_begin, ckpt_split,
+                             /*compute_final_logits=*/false);
             // Register + reselect so the store/window describe exactly `split`
             // tokens, then stage ckpt_P at the block boundary (recurrent state is
             // captured here, physically at B).
@@ -7339,11 +7620,25 @@ private:
             warm_prompt_resumable = qc_active ? executor_->kvmem_has_tiers()
                                               : kvmem_all_gpu_identity();
             // Second segment [split, P): finish the prompt.
-            do_prefill_range(ckpt_split, prompt_tokens.size());
+            do_prefill_range(ckpt_split, prompt_tokens.size(),
+                             /*compute_final_logits=*/true);
         } else {
-            do_prefill_range(prefill_begin, prompt_tokens.size());
+            do_prefill_range(prefill_begin, prompt_tokens.size(),
+                             /*compute_final_logits=*/true);
         }
         const double t_prefill_end = wall_seconds();
+#ifdef QW3_ENABLE_CUDA
+        if (profile_cuda_prefill) {
+            st = device_->synchronize();
+            if (!st.ok) throw std::runtime_error(st.message);
+            const cudaError_t profile_st = cudaProfilerStop();
+            if (profile_st != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("cudaProfilerStop failed: ") +
+                    cudaGetErrorString(profile_st));
+            }
+        }
+#endif
 
         // Block-sparse: register the prefilled prompt as context blocks and
         // assemble the first working set. Under the default all-fit budget this
@@ -7355,16 +7650,18 @@ private:
         const int bs_interval =
             std::max(1, options_.kvmem_interval);
         if (bs_on) {
-            // Register the tokens not yet in the store so it lands at prompt.size().
-            // Already registered before this point: reuse_m (warm restore) plus the
-            // first segment when a block-boundary ckpt_P split ran.
-            const uint32_t already =
-                do_boundary_capture ? ckpt_split
-                                    : static_cast<uint32_t>(prefill_begin);
-            const uint32_t reg_n =
-                static_cast<uint32_t>(prompt_tokens.size()) - already;
-            executor_->kvmem_register_append(reg_n);
-            executor_->kvmem_reselect();
+            if (!query_replay_applied) {
+                // Register the tokens not yet in the store so it lands at
+                // prompt.size(). Already registered before this point: reuse_m
+                // plus a possible block-boundary checkpoint segment.
+                const uint32_t already =
+                    do_boundary_capture ? ckpt_split
+                                        : static_cast<uint32_t>(prefill_begin);
+                const uint32_t reg_n =
+                    static_cast<uint32_t>(prompt_tokens.size()) - already;
+                executor_->kvmem_register_append(reg_n);
+                executor_->kvmem_reselect();
+            }
         }
 
         // kvmem prefix cache: fallback prompt-end (P) checkpoint. When the
@@ -7425,9 +7722,13 @@ private:
         uint32_t next_token = static_cast<uint32_t>(pick_next(seed_argmax));
         next_token = budget_apply(budget, next_token);
         uint64_t decode_ops = 0;
+        std::unordered_map<std::string, TraceStats> decode_trace;
+        uint64_t decode_trace_steps = 0;
         int decoded = 0;
         const auto should_stop_eos = [&]() {
-            return !options.ignore_eos && next_token == static_cast<uint32_t>(eos);
+            return !options.ignore_eos &&
+                   next_token == static_cast<uint32_t>(eos) &&
+                   !budget.can_recover_eos(next_token);
         };
         if (options.max_tokens > 0 && !should_stop_eos()) {
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
@@ -7441,12 +7742,30 @@ private:
         // next turn's preserved [0,D) slices cover the response too (Gap A). No-op
         // unless kvmem + above budget + mean-k (guards inside begin()).
         executor_->kvmem_decode_capture_begin();
+#ifdef QW3_ENABLE_CUDA
+        const bool profile_cuda_decode =
+            env_flag_enabled("QW3_CUDA_PROFILE_DECODE");
+        if (profile_cuda_decode) {
+            st = device_->synchronize();
+            if (!st.ok) throw std::runtime_error(st.message);
+            const cudaError_t profile_st = cudaProfilerStart();
+            if (profile_st != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("cudaProfilerStart failed: ") +
+                    cudaGetErrorString(profile_st));
+            }
+        }
+#endif
         for (int i = 0; i + 1 < options.max_tokens; ++i) {
             if (should_stop_eos()) break;
             const uint32_t feed = next_token;
             step = executor_->forward_one_token(feed);
             if (!step.ok) throw std::runtime_error("decode failed");
             decode_ops += step.ops_executed;
+            if (decode_trace_enabled() && !step.elapsed_us.empty()) {
+                accumulate_trace(decode_trace, step);
+                ++decode_trace_steps;
+            }
             // Block-sparse: the token just decoded grew the context by one.
             // Register it, and reselect the working set on the interval
             // boundary (the agent-step cadence is approximated here by a fixed
@@ -7478,6 +7797,18 @@ private:
             if (warm_capture) gen_tokens.push_back(next_token);
             ++decoded;
         }
+#ifdef QW3_ENABLE_CUDA
+        if (profile_cuda_decode) {
+            st = device_->synchronize();
+            if (!st.ok) throw std::runtime_error(st.message);
+            const cudaError_t profile_st = cudaProfilerStop();
+            if (profile_st != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("cudaProfilerStop failed: ") +
+                    cudaGetErrorString(profile_st));
+            }
+        }
+#endif
         // Flush any trailing partial block's mean into the content index.
         executor_->kvmem_decode_capture_finalize();
         const double t_decode_end = wall_seconds();
@@ -7547,6 +7878,9 @@ private:
                 << " prefilled=" << (prompt_tokens.size() - reuse_m);
         }
         log(msg.str());
+        if (decode_trace_enabled() && !decode_trace.empty()) {
+            log_decode_trace(decode_trace, decode_trace_steps);
+        }
 
         return generated;
     }
@@ -7663,6 +7997,29 @@ private:
         const bool qc_active =
             (options.kvmem_query_end > options.kvmem_query_begin) &&
             kvmem_sel_budget > 0 && prompt_tokens.size() > kvmem_sel_budget;
+        const uint32_t query_replay_base = executor_->position();
+        const bool query_replay =
+            kvmem_query_replay_enabled() && kvmem_on && qc_active &&
+            reset_session && override_executor == nullptr && dump == nullptr &&
+            options.kvmem_query_begin > 0 &&
+            options.kvmem_query_begin >= query_replay_base &&
+            options.kvmem_query_end <= prompt_tokens.size() &&
+            prompt_tokens.size() - options.kvmem_query_begin <=
+                executor_->block_store()->config().gen_budget &&
+            executor_->block_store()->config().retrieval_method !=
+                KvMemRetrievalMethod::DeltaNet;
+        if (kvmem_query_replay_enabled() && reset_session &&
+            override_executor == nullptr && !query_replay) {
+            std::ostringstream rmsg;
+            rmsg << "native kvmem query-replay skipped (mtp): base="
+                 << query_replay_base << " span=[" << options.kvmem_query_begin
+                 << "," << options.kvmem_query_end << ") prompt="
+                 << prompt_tokens.size() << " gen_budget="
+                 << (executor_->block_store()
+                         ? executor_->block_store()->config().gen_budget
+                         : 0);
+            log(rmsg.str());
+        }
         // Clean-query prefill (task #50). Engage only above budget with a span, when
         // the flag is on, and NOT on a warm-reuse / prefix-cache-capture turn (those
         // own the prefill split) nor the logit-dump path. warm_reuse/warm_capture are
@@ -7670,7 +8027,8 @@ private:
         // excluded too. When off, everything below is byte-identical to today.
         const bool clean_query =
             kvmem_on && qc_active && kvmem_clean_query_enabled() &&
-            !kvmem_warm_reuse && !kvmem_warm_capture && dump == nullptr;
+            !query_replay && !kvmem_warm_reuse && !kvmem_warm_capture &&
+            dump == nullptr;
         if (clean_query) {
             // PASS A: capture the query from the question tokens ALONE. The question
             // prefills at positions 0..S attending only over itself + sink, so the
@@ -7701,6 +8059,7 @@ private:
         // no reset_state) cannot carry a stale span from a prior over-budget turn
         // into the identity path.
         if (kvmem_on && qc_active) {
+            executor_->kvmem_set_pin_from_block(0xffffffffu);
             executor_->kvmem_set_query_span(options.kvmem_query_begin,
                                             options.kvmem_query_end,
                                             static_cast<uint32_t>(prompt_tokens.size()));
@@ -7845,7 +8204,8 @@ private:
         bool kvmem_warm_prompt_resumable = false;
         uint32_t kvmem_ckpt_split = 0;
         bool kvmem_do_boundary_capture = false;
-        if (kvmem_warm_capture && kvmem_on && !kvmem_qc_pertoken_here) {
+        if (kvmem_warm_capture && kvmem_on && !kvmem_qc_pertoken_here &&
+            !query_replay) {
             const uint32_t bt = executor_->block_store()
                                     ? executor_->block_store()->config().block_tokens
                                     : 256;
@@ -7870,13 +8230,15 @@ private:
         // so the block-boundary checkpoint can split the prompt prefill at `split`
         // (capture recurrent state there) and resume the tail without duplicating
         // the two prefill flavors (internal-chunking vs MTP-prefix priming).
-        auto do_prefill_range = [&](size_t lbegin, size_t lend) {
+        auto do_prefill_range = [&](size_t lbegin, size_t lend,
+                                    bool compute_final_logits) {
             if (lbegin >= lend) return;
             if (!use_mtp_prefix) {
                 std::vector<uint32_t> seg(prefill_tokens.begin() + static_cast<std::ptrdiff_t>(lbegin),
                                           prefill_tokens.begin() + static_cast<std::ptrdiff_t>(lend));
                 const double t_chunk_start = wall_seconds();
-                step = executor_->forward_n_tokens(seg, lend == prefill_tokens.size());
+                step = executor_->forward_n_tokens(
+                    seg, compute_final_logits && lend == prefill_tokens.size());
                 if (!step.ok) throw std::runtime_error("prefill failed");
                 const double t_chunk_end = wall_seconds();
                 prefill_ops += step.ops_executed;
@@ -7899,7 +8261,8 @@ private:
                     std::vector<uint32_t> chunk(prefill_tokens.begin() + static_cast<std::ptrdiff_t>(offset),
                                                 prefill_tokens.begin() + static_cast<std::ptrdiff_t>(end));
                     const double t_chunk_start = wall_seconds();
-                    const bool need_logits = end == prefill_tokens.size();
+                    const bool need_logits =
+                        compute_final_logits && end == prefill_tokens.size();
                     step = executor_->forward_n_tokens(chunk, need_logits);
                     if (!step.ok) throw std::runtime_error("prefill failed");
                     prime_mtp_prefix(chunk, prefill_base + static_cast<uint32_t>(offset));
@@ -7915,6 +8278,18 @@ private:
                 }
             }
         };
+        auto do_query_prefill_range = [&](size_t lbegin, size_t lend,
+                                          bool compute_final_logits) {
+            executor_->kvmem_set_prefill_reselect_suppressed(true);
+            try {
+                do_prefill_range(lbegin, lend, compute_final_logits);
+            } catch (...) {
+                executor_->kvmem_set_prefill_reselect_suppressed(false);
+                throw;
+            }
+            executor_->kvmem_set_prefill_reselect_suppressed(false);
+        };
+        bool query_replay_applied = false;
         if (dump) {
             if (use_mtp_prefix) {
                 log("native mtp_prefix: ok=false reason=\"dump logits path does not expose batch hidden rows\"");
@@ -7928,11 +8303,88 @@ private:
                              static_cast<int32_t>(prompt_tokens[pi]),
                              *executor_, *tokenizer_);
             }
+        } else if (query_replay) {
+            const uint32_t qb = options.kvmem_query_begin;
+            const uint32_t qe = options.kvmem_query_end;
+            const uint32_t bt = executor_->block_store()->config().block_tokens;
+            const size_t query_local = qb - prefill_base;
+            const double checkpoint_start = wall_seconds();
+
+            do_prefill_range(0, query_local, /*compute_final_logits=*/false);
+            executor_->kvmem_register_append(qb - prefill_base);
+            executor_->kvmem_reselect();
+            const std::vector<uint32_t> selected_before =
+                kvmem_selected_block_ids(executor_);
+            QwenExecutor::StateSnapshot query_checkpoint;
+            executor_->capture_state(query_checkpoint);
+            const double checkpoint_end = wall_seconds();
+
+            const double provisional_start = wall_seconds();
+            do_query_prefill_range(query_local, prefill_tokens.size(),
+                                   /*compute_final_logits=*/true);
+            const double provisional_end = wall_seconds();
+            if (executor_->kvmem_stash_query()) {
+                const double restore_start = wall_seconds();
+                executor_->restore_state(query_checkpoint);
+                executor_->kvmem_truncate_to(qb);
+                executor_->kvmem_set_query_span(
+                    qb, qe, static_cast<uint32_t>(prompt_tokens.size()), qb);
+                executor_->kvmem_restore_stashed_query();
+                executor_->kvmem_set_pin_from_block(qb / std::max<uint32_t>(bt, 1));
+                const bool index_ready = executor_->kvmem_query_selection_ready();
+                const QwenExecutor::KvMemTimingSnapshot select_t0 =
+                    QwenExecutor::kvmem_timing_snapshot();
+                const double select_start = wall_seconds();
+                executor_->kvmem_reselect();
+                const double select_end = wall_seconds();
+                const QwenExecutor::KvMemTimingSnapshot select_t1 =
+                    QwenExecutor::kvmem_timing_snapshot();
+                const std::vector<uint32_t> selected_after =
+                    kvmem_selected_block_ids(executor_);
+                const uint32_t additions =
+                    kvmem_selection_additions(selected_before, selected_after);
+
+                executor_->kvmem_reset_query_capture();
+                const double replay_start = wall_seconds();
+                do_query_prefill_range(query_local, prefill_tokens.size(),
+                                       /*compute_final_logits=*/true);
+                executor_->kvmem_register_append(
+                    static_cast<uint32_t>(prompt_tokens.size()) - qb);
+                const double replay_end = wall_seconds();
+                query_replay_applied = true;
+
+                std::ostringstream rmsg;
+                rmsg << std::fixed << std::setprecision(3)
+                     << "native kvmem query-replay (mtp): span=[" << qb << ","
+                     << qe << ") tail=" << (prompt_tokens.size() - qb)
+                     << " checkpoint_ms=" << (checkpoint_end - checkpoint_start) * 1e3
+                     << " provisional_ms=" << (provisional_end - provisional_start) * 1e3
+                     << " restore_ms=" << (select_start - restore_start) * 1e3
+                     << " select_ms=" << (select_end - select_start) * 1e3
+                     << " replay_ms=" << (replay_end - replay_start) * 1e3
+                     << " selected=" << selected_after.size()
+                     << " replaced=" << additions
+                     << " replace_rate="
+                     << (selected_after.empty()
+                             ? 0.0
+                             : static_cast<double>(additions) / selected_after.size())
+                     << " stage_in="
+                     << (select_t1.stage_in_blocks - select_t0.stage_in_blocks)
+                     << " stage_out="
+                     << (select_t1.stage_out_blocks - select_t0.stage_out_blocks)
+                     << " index_ready=" << (index_ready ? 1 : 0)
+                     << " final_pos=" << executor_->position();
+                log(rmsg.str());
+            } else {
+                log("native kvmem query-replay (mtp): provisional query capture "
+                    "was incomplete; keeping the single-pass result");
+            }
         } else if (kvmem_do_boundary_capture) {
             const size_t split_local =
                 kvmem_ckpt_split - static_cast<uint32_t>(kvmem_prefill_begin);
             // First segment [prefill_base, split): advance recurrent state to B.
-            do_prefill_range(0, split_local);
+            do_prefill_range(0, split_local,
+                             /*compute_final_logits=*/false);
             // Register + reselect so the store/window describe exactly `split`
             // tokens, then stage ckpt_P at the block boundary. The recurrent state
             // is captured here, physically at B — it cannot be rewound from a later
@@ -7948,7 +8400,8 @@ private:
             kvmem_warm_prompt_resumable = qc_active ? executor_->kvmem_has_tiers()
                                                     : kvmem_all_gpu_identity();
             // Second segment [split, P): finish the prompt.
-            do_prefill_range(split_local, prefill_tokens.size());
+            do_prefill_range(split_local, prefill_tokens.size(),
+                             /*compute_final_logits=*/true);
         } else if (clean_query) {
             // PASS B (task #50). Split the prefill at the question boundary qb.
             const uint32_t bt = executor_->block_store()
@@ -7960,7 +8413,7 @@ private:
             // rows (none lie in [qb,qe) yet) — g_query_multi_ready_ stays false, so
             // any automatic pool-fill offload here falls back to recency (staging
             // only; the position-invariant content index is what selection reads).
-            do_prefill_range(0, qb);
+            do_prefill_range(0, qb, /*compute_final_logits=*/false);
             // Register context blocks, restore the clean query stashed in PASS A,
             // pin the question + generated tail (survives every reselect), then
             // reselect: the CLEAN query scores the context and assembles the decode
@@ -7973,9 +8426,11 @@ private:
             // selected context at bounded window positions). This recaptures a
             // recency-contaminated query into g_query_multi_ — overwritten by the
             // restore in the post-prefill block before any decode-time reselect.
-            do_prefill_range(qb, prefill_tokens.size());
+            do_prefill_range(qb, prefill_tokens.size(),
+                             /*compute_final_logits=*/true);
         } else {
-            do_prefill_range(0, prefill_tokens.size());
+            do_prefill_range(0, prefill_tokens.size(),
+                             /*compute_final_logits=*/true);
         }
         const double t_prefill_end = wall_seconds();
 
@@ -7994,7 +8449,13 @@ private:
         // the first working set (mirrors generate_plain). Under the default
         // all-fit budget this is an identity selection so the window equals the
         // true cache and MTP verify stays byte-identical to plain MTP.
-        if (kvmem_on && clean_query) {
+        if (kvmem_on && query_replay_applied) {
+            // The final replay already appended and registered the query under
+            // the selected window. A second selection here would require another
+            // replay to keep the hybrid recurrent state consistent.
+            kvmem_registered_pos = executor_->position();
+            kvmem_last_reselect_pos = executor_->position();
+        } else if (kvmem_on && clean_query) {
             // PASS B tail: the context blocks were registered + selected mid-prefill
             // (the reselect at qb IS the decode window; the question is its live
             // tail). Register only the question blocks, then restore the clean query
@@ -8352,9 +8813,11 @@ private:
         }
 
         auto should_stop_mtp_eos = [&](uint32_t token) -> bool {
-            return !options.ignore_eos && token == static_cast<uint32_t>(eos);
+            return !options.ignore_eos && token == static_cast<uint32_t>(eos) &&
+                   !budget.can_recover_eos(token);
         };
-        auto emit_generated_token = [&](uint32_t token) -> bool {
+        auto emit_generated_token = [&](uint32_t &token) -> bool {
+            recover_thinking_eos(budget, token);
             if (decoded >= options.max_tokens || should_stop_mtp_eos(token)) return false;
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
             generated += piece;
@@ -8461,7 +8924,8 @@ private:
                         log(mtp_msg.str());
                     }
                     if (!mtp.ok || mtp.argmax_token < 0 ||
-                        should_stop_mtp_eos(static_cast<uint32_t>(mtp.argmax_token))) {
+                        should_stop_mtp_eos(static_cast<uint32_t>(mtp.argmax_token)) ||
+                        budget.can_recover_eos(static_cast<uint32_t>(mtp.argmax_token))) {
                         break;
                     }
                     drafts.push_back(static_cast<uint32_t>(mtp.argmax_token));

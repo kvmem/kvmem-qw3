@@ -29,6 +29,7 @@ namespace qw3 {
 class QwenTokenizer {
 public:
     explicit QwenTokenizer(const GgufFile &gguf);
+    explicit QwenTokenizer(const std::string &hf_model_directory);
 
     std::vector<int32_t> encode(const std::string &text, bool add_bos = false) const;
     std::string decode(const std::vector<int32_t> &ids) const;
@@ -52,6 +53,7 @@ public:
 
 private:
     void build_byte_maps();
+    void finish_initialization();
     std::vector<std::string> pre_tokenize(const std::string &text) const;
     std::vector<int32_t> bpe_piece(const std::string &piece) const;
 
