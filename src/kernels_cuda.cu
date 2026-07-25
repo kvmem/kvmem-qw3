@@ -1190,6 +1190,7 @@ struct CudaTensor final : DeviceTensor {
 enum class WeightType {
     F32,
     BF16,
+    BF16_HOST,
     FP8_E4M3,
     Q8_0,
     NVFP4_E2M1,
@@ -1223,11 +1224,17 @@ struct CudaWeight final : DeviceWeight {
         switch (t) {
             case WeightType::F32: format = DeviceWeightFormat::F32; break;
             case WeightType::BF16: format = DeviceWeightFormat::BF16; break;
+            case WeightType::BF16_HOST: format = DeviceWeightFormat::BF16; break;
             case WeightType::FP8_E4M3: format = DeviceWeightFormat::FP8_E4M3; break;
             case WeightType::Q8_0: format = DeviceWeightFormat::Q8_0; break;
             case WeightType::NVFP4_E2M1: format = DeviceWeightFormat::NVFP4_E2M1; break;
         }
         label = name ? name : "weight";
+        if (t == WeightType::BF16_HOST) {
+            ptr = const_cast<void *>(src);
+            owns_ptr = false;
+            return;
+        }
         cudaMalloc(&ptr, static_cast<size_t>(bytes));
         if (t == WeightType::Q8_0) {
             // Repack from interleaved 34-byte blocks [d; qs[32]] into the
@@ -6241,11 +6248,29 @@ struct Fp8LtPlan {
 
 class CudaDeviceBackend final : public DeviceBackend {
     static constexpr uint32_t kFlashInferBatchPrefillHostSlots = 8;
+    static constexpr uint32_t kHostEmbeddingSlots = 2;
+    struct HostEmbeddingSlot {
+        void *host = nullptr;
+        size_t host_capacity = 0;
+        __nv_bfloat16 *device = nullptr;
+        size_t device_capacity = 0;
+        cudaEvent_t ready = nullptr;
+        bool in_flight = false;
+    };
 public:
     explicit CudaDeviceBackend(LinearBackend linear_backend)
         : linear_backend_(linear_backend) {}
 
     ~CudaDeviceBackend() override {
+        for (HostEmbeddingSlot &slot : host_embedding_slots_) {
+            if (slot.in_flight && slot.ready) {
+                (void)cudaEventSynchronize(slot.ready);
+            }
+            if (slot.device) cudaFree(slot.device);
+            if (slot.host) cudaFreeHost(slot.host);
+            if (slot.ready) cudaEventDestroy(slot.ready);
+        }
+        if (host_embedding_argmax_) cudaFreeHost(host_embedding_argmax_);
         fp8_lt_plans_.clear();
         if (cublas_handle_) cublasDestroy(cublas_handle_);
         if (cublaslt_handle_) cublasLtDestroy(cublaslt_handle_);
@@ -6746,6 +6771,24 @@ public:
                                             rows, cols, WeightType::BF16, label);
     }
 
+    std::unique_ptr<DeviceWeight> weight_bf16_host(
+            const void *data,
+            uint64_t rows,
+            uint64_t cols,
+            const char *label) override {
+        if (!data || rows == 0 || cols == 0 ||
+            rows > std::numeric_limits<uint64_t>::max() / cols ||
+            rows * cols >
+                std::numeric_limits<uint64_t>::max() / sizeof(__nv_bfloat16)) {
+            throw std::runtime_error(
+                std::string("invalid host BF16 weight: ") +
+                (label ? label : "weight"));
+        }
+        return std::make_unique<CudaWeight>(
+            data, rows * cols * sizeof(__nv_bfloat16),
+            rows, cols, WeightType::BF16_HOST, label);
+    }
+
     std::unique_ptr<DeviceWeight> weight_fp8_e4m3(const void *data,
                                                    const void *scale_data,
                                                    uint64_t scale_count,
@@ -7010,9 +7053,154 @@ public:
         return {};
     }
 
+    DeviceStatus acquire_host_embedding_slot(
+            size_t bytes,
+            bool need_device_staging,
+            HostEmbeddingSlot **out) {
+        if (!out || bytes == 0) {
+            return {false, "invalid host embedding staging request"};
+        }
+        HostEmbeddingSlot &slot =
+            host_embedding_slots_[
+                host_embedding_next_slot_++ % kHostEmbeddingSlots];
+        if (slot.in_flight) {
+            if (auto st = cuda_status(
+                    cudaEventSynchronize(slot.ready),
+                    "host embedding staging wait"); !st.ok) {
+                return st;
+            }
+            slot.in_flight = false;
+        }
+        if (!slot.ready) {
+            if (auto st = cuda_status(
+                    cudaEventCreateWithFlags(&slot.ready,
+                                             cudaEventDisableTiming),
+                    "host embedding staging event"); !st.ok) {
+                return st;
+            }
+        }
+        if (slot.host_capacity < bytes) {
+            if (slot.host) cudaFreeHost(slot.host);
+            slot.host = nullptr;
+            slot.host_capacity = 0;
+            if (auto st = cuda_status(
+                    cudaHostAlloc(&slot.host, bytes, cudaHostAllocDefault),
+                    "host embedding pinned staging alloc"); !st.ok) {
+                return st;
+            }
+            slot.host_capacity = bytes;
+        }
+        if (need_device_staging && slot.device_capacity < bytes) {
+            if (slot.device) cudaFree(slot.device);
+            slot.device = nullptr;
+            slot.device_capacity = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(&slot.device, bytes),
+                    "host embedding BF16 device staging alloc"); !st.ok) {
+                return st;
+            }
+            slot.device_capacity = bytes;
+        }
+        *out = &slot;
+        return {};
+    }
+
+    DeviceStatus copy_host_bf16_rows(
+            CudaTensor &out,
+            const CudaWeight &weight,
+            const uint64_t *rows,
+            uint32_t batch) {
+        if (batch == 0) return {};
+        if (!exec_stream_) {
+            return {false, "host embedding lookup requires an active CUDA stream"};
+        }
+        if (weight.type != WeightType::BF16_HOST || !weight.ptr || !rows) {
+            return {false, "invalid host BF16 embedding lookup"};
+        }
+        if (!out.is_bf16() &&
+            (out.dtype != DeviceTensorDType::F32 ||
+             out.elem_size != sizeof(float))) {
+            return {false, "host BF16 embedding output must be BF16 or FP32"};
+        }
+        if (weight.cols >
+            std::numeric_limits<uint64_t>::max() /
+                static_cast<uint64_t>(batch)) {
+            return {false, "host BF16 embedding lookup size overflow"};
+        }
+        const uint64_t elements =
+            static_cast<uint64_t>(batch) * weight.cols;
+        if (out.count < elements ||
+            elements > std::numeric_limits<size_t>::max() /
+                           sizeof(__nv_bfloat16)) {
+            return {false, "host BF16 embedding output is too small"};
+        }
+        const size_t row_bytes =
+            static_cast<size_t>(weight.cols) * sizeof(__nv_bfloat16);
+        const size_t bytes =
+            static_cast<size_t>(elements) * sizeof(__nv_bfloat16);
+        HostEmbeddingSlot *slot = nullptr;
+        if (auto st = acquire_host_embedding_slot(
+                bytes, !out.is_bf16(), &slot); !st.ok) {
+            return st;
+        }
+
+        const auto *source = static_cast<const uint8_t *>(weight.ptr);
+        auto *staging = static_cast<uint8_t *>(slot->host);
+        for (uint32_t i = 0; i < batch; ++i) {
+            if (rows[i] >= weight.rows) {
+                return {false, "host BF16 embedding row is out of range"};
+            }
+            std::memcpy(
+                staging + static_cast<size_t>(i) * row_bytes,
+                source + static_cast<size_t>(rows[i]) * row_bytes,
+                row_bytes);
+        }
+
+        void *device_dst = out.is_bf16()
+            ? static_cast<void *>(out.ptr_bf16())
+            : static_cast<void *>(slot->device);
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(device_dst, slot->host, bytes,
+                                cudaMemcpyHostToDevice, exec_stream_),
+                "host BF16 embedding H2D"); !st.ok) {
+            return st;
+        }
+
+        DeviceStatus convert_status;
+        if (!out.is_bf16()) {
+            constexpr uint32_t threads = 256;
+            const uint64_t blocks64 = (elements + threads - 1) / threads;
+            if (blocks64 >
+                static_cast<uint64_t>(
+                    std::numeric_limits<unsigned>::max())) {
+                convert_status =
+                    {false, "host BF16 embedding conversion grid is too large"};
+            } else {
+                bf16_to_fp32_kernel<<<
+                    static_cast<unsigned>(blocks64), threads, 0,
+                    exec_stream_>>>(
+                    out.ptr, slot->device, elements);
+                convert_status =
+                    launch_status("host BF16 embedding convert to FP32");
+            }
+        }
+
+        if (auto st = cuda_status(
+                cudaEventRecord(slot->ready, exec_stream_),
+                "host embedding staging record"); !st.ok) {
+            (void)cudaStreamSynchronize(exec_stream_);
+            return st;
+        }
+        slot->in_flight = true;
+        return convert_status;
+    }
+
     DeviceStatus q8_0_get_row(DeviceTensor &out, const DeviceWeight &weight, uint64_t row) override {
         const auto &w = as_weight(weight);
         auto &o = as_tensor(out);
+        if (w.type == WeightType::BF16_HOST) {
+            return copy_host_bf16_rows(o, w, &row, 1);
+        }
         if (w.type == WeightType::BF16) {
             if (o.is_bf16()) {
                 bf16_get_row_bf16_kernel<<<
@@ -7056,6 +7244,39 @@ public:
         auto &o = as_tensor(out);
         const auto &a = as_argmax_buffer(argmaxes);
         if (index >= a.count) return {false, "q8_0_get_row_from_argmax index oob"};
+        if (w.type == WeightType::BF16_HOST) {
+            if (!host_embedding_argmax_) {
+                if (auto st = cuda_status(
+                        cudaHostAlloc(
+                            reinterpret_cast<void **>(
+                                &host_embedding_argmax_),
+                            sizeof(ArgmaxPair), cudaHostAllocDefault),
+                        "host embedding argmax staging alloc"); !st.ok) {
+                    return st;
+                }
+            }
+            if (auto st = cuda_status(
+                    cudaMemcpyAsync(
+                        host_embedding_argmax_, a.ptr + index,
+                        sizeof(ArgmaxPair), cudaMemcpyDeviceToHost,
+                        exec_stream_),
+                    "host embedding argmax D2H"); !st.ok) {
+                return st;
+            }
+            if (auto st = cuda_status(
+                    cudaStreamSynchronize(exec_stream_),
+                    "host embedding argmax sync"); !st.ok) {
+                return st;
+            }
+            if (host_embedding_argmax_->index < 0 ||
+                static_cast<uint64_t>(host_embedding_argmax_->index) >=
+                    w.rows) {
+                return {false, "host BF16 embedding argmax is out of range"};
+            }
+            const uint64_t row =
+                static_cast<uint64_t>(host_embedding_argmax_->index);
+            return copy_host_bf16_rows(o, w, &row, 1);
+        }
         if (w.type == WeightType::BF16) {
             bf16_get_row_from_argmax_kernel<<<
                 static_cast<unsigned>((w.cols + 255) / 256), 256, 0, exec_stream_>>>(
@@ -7083,6 +7304,9 @@ public:
         if (batch == 0) return {};
         const auto &w = as_weight(weight);
         auto &o = as_tensor(out);
+        if (w.type == WeightType::BF16_HOST) {
+            return copy_host_bf16_rows(o, w, rows, batch);
+        }
         // Upload row indices to device (small, one transfer).
         if (rows_buf_capacity_ < batch) {
             if (rows_buf_) cudaFree(rows_buf_);
@@ -15746,6 +15970,9 @@ private:
     std::vector<std::unique_ptr<Fp8LtPlan>> fp8_lt_plans_;
     uint64_t *rows_buf_ = nullptr;
     uint32_t  rows_buf_capacity_ = 0;
+    HostEmbeddingSlot host_embedding_slots_[kHostEmbeddingSlots];
+    uint32_t host_embedding_next_slot_ = 0;
+    ArgmaxPair *host_embedding_argmax_ = nullptr;
     // Input-side FP16 staging buffer for HGEMM (X is FP32 in our stack but
     // cuBLAS HGEMM needs FP16). Resized lazily to fit the largest (batch *
     // cols) matmul seen so far.

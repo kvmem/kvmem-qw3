@@ -69,7 +69,8 @@ struct QwenMtpWeights {
 
 class QwenWeights {
 public:
-    QwenWeights(const QwenNativeModel &model, DeviceBackend &backend);
+    QwenWeights(const QwenNativeModel &model, DeviceBackend &backend,
+                bool cpu_embedding = false);
     ~QwenWeights();
 
     QwenWeights(const QwenWeights &) = delete;
@@ -86,10 +87,12 @@ public:
     bool uses_q8() const { return uses_q8_; }
 
     uint64_t total_bytes_uploaded() const { return uploaded_bytes_; }
+    uint64_t host_resident_bytes() const { return host_resident_bytes_; }
     uint64_t tensor_count() const { return owned_.size(); }
 
 private:
     DeviceWeight *bind(const ModelTensorInfo *tensor);
+    DeviceWeight *bind_host_bf16(const ModelTensorInfo *tensor);
     QwenLayerWeights bind_layer(const QwenLayerTensors &src);
 
     const QwenNativeModel &model_;
@@ -102,6 +105,7 @@ private:
     std::vector<QwenLayerWeights> layers_;
     QwenMtpWeights mtp_;
     uint64_t uploaded_bytes_ = 0;
+    uint64_t host_resident_bytes_ = 0;
     bool uses_nvfp4_ = false;
     bool uses_q8_ = false;
 };

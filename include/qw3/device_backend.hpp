@@ -207,6 +207,18 @@ public:
         (void)data; (void)rows; (void)cols; (void)label;
         throw std::runtime_error("BF16 weights are not supported by this backend");
     }
+    // Host-resident BF16 lookup weight. This is intended for sparse row
+    // access (token embeddings), not matmul. CUDA backends can gather the
+    // requested rows into pinned staging memory and transfer only those rows.
+    virtual std::unique_ptr<DeviceWeight> weight_bf16_host(
+            const void *data,
+            uint64_t rows,
+            uint64_t cols,
+            const char *label) {
+        (void)data; (void)rows; (void)cols; (void)label;
+        throw std::runtime_error(
+            "host-resident BF16 weights are not supported by this backend");
+    }
     virtual std::unique_ptr<DeviceWeight> weight_fp8_e4m3(const void *data,
                                                            const void *scale_data,
                                                            uint64_t scale_count,

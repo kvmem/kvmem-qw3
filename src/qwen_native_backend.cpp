@@ -1255,7 +1255,8 @@ public:
         if (!st.ok) throw std::runtime_error(std::string("device begin failed: ") + st.message);
 
         const double t_begin = wall_seconds();
-        weights_ = std::make_unique<QwenWeights>(*model_, *device_);
+        weights_ = std::make_unique<QwenWeights>(
+            *model_, *device_, options_.cpu_embedding);
         st = device_->synchronize();
         if (!st.ok) throw std::runtime_error(std::string("weight upload sync failed: ") + st.message);
         const double t_weights = wall_seconds();
@@ -1291,12 +1292,16 @@ public:
         if (!st.ok) throw std::runtime_error(std::string("device end failed: ") + st.message);
 
         const double mib = static_cast<double>(weights_->total_bytes_uploaded()) / (1024.0 * 1024.0);
+        const double host_mib =
+            static_cast<double>(weights_->host_resident_bytes()) /
+            (1024.0 * 1024.0);
         std::ostringstream msg;
         msg << "native load: gguf=" << fmt_seconds(t_gguf - t0)
             << " device_init=" << fmt_seconds(t_begin - t_gguf)
             << " weights_upload=" << fmt_seconds(t_weights - t_begin)
             << " tensors=" << weights_->tensor_count()
             << " size=" << std::fixed << std::setprecision(1) << mib << " MiB"
+            << " host_resident=" << host_mib << " MiB"
             << " backend=" << linear_backend_name(linear_backend);
         log(msg.str());
     }

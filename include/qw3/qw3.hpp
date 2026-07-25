@@ -27,6 +27,10 @@ struct EngineOptions {
     int native_token_id = 0;
     std::string native_kernels = "cuda";
     std::string native_linear_backend = "auto";
+    // Keep a BF16 input embedding table in its mapped host checkpoint and
+    // stage only selected rows to CUDA. Opt-in because it trades a small
+    // host-gather / PCIe cost for substantially lower device memory use.
+    bool cpu_embedding = false;
     // Diagnostics: when non-empty, write a JSONL line per generated step
     // with the prompt tokens, decoded token, and top-k logits.
     std::string dump_logits_path;

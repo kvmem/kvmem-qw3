@@ -79,6 +79,9 @@ void usage(std::ostream &os) {
         "  --native-heavy        Compatibility flag; native generation is enabled by default\n"
         "  --native-kernels NAME cuda. Default: cuda\n"
         "  --native-linear-backend NAME auto, cublas, or custom. Default: auto\n"
+        "  --cpu-embedding       Keep a BF16 input embedding table on CPU and\n"
+        "                        transfer only selected rows. Requires a separate\n"
+        "                        LM head. Default: off.\n"
         "  --native-mtp-trace    Run one optional MTP draft-head diagnostic\n"
         "  --native-mtp-chain N  Diagnostic MTP draft chain length. Default: 1\n"
         "  --native-mtp-prefix   Populate diagnostic MTP prefix KV before drafts\n"
@@ -343,6 +346,8 @@ int main(int argc, char **argv) {
                 engine.native_kernels = need(arg);
             } else if (arg == "--native-linear-backend") {
                 engine.native_linear_backend = need(arg);
+            } else if (arg == "--cpu-embedding") {
+                engine.cpu_embedding = true;
             } else if (arg == "--native-mtp-trace") {
                 engine.native_mtp_trace = true;
             } else if (arg == "--native-mtp-chain") {

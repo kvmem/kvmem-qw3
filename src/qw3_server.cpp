@@ -1253,6 +1253,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  model=" << engine.model_path << "\n"
               << "  backend=" << backend_kind_name(engine.backend) << "\n"
               << "  native_kernels=" << engine.native_kernels << "\n"
+              << "  cpu_embedding=" << yesno(engine.cpu_embedding) << "\n"
               << "  ctx=" << engine.ctx_size << "\n"
               << "  batch=" << engine.batch_size << "\n"
               << "  prefill_chunk=" << engine.prefill_chunk << "\n"

@@ -83,6 +83,84 @@ std::vector<float> copy_bf16_to_float(qw3::DeviceBackend &backend,
     return result;
 }
 
+void test_host_bf16_embedding(qw3::DeviceBackend &backend) {
+    constexpr uint32_t rows = 17;
+    constexpr uint32_t cols = 96;
+    constexpr uint32_t batch = 5;
+    std::vector<__nv_bfloat16> table(
+        static_cast<size_t>(rows) * cols);
+    for (uint32_t row = 0; row < rows; ++row) {
+        for (uint32_t col = 0; col < cols; ++col) {
+            const float value =
+                static_cast<float>(
+                    static_cast<int>((row * 13 + col * 7) % 101) - 50) /
+                32.0f;
+            table[static_cast<size_t>(row) * cols + col] =
+                __float2bfloat16(value);
+        }
+    }
+    auto weight = backend.weight_bf16_host(
+        table.data(), rows, cols, "host_embedding.weight");
+
+    auto expected_rows = [&](const uint64_t *indices, uint32_t count) {
+        std::vector<float> expected(static_cast<size_t>(count) * cols);
+        for (uint32_t item = 0; item < count; ++item) {
+            for (uint32_t col = 0; col < cols; ++col) {
+                expected[static_cast<size_t>(item) * cols + col] =
+                    __bfloat162float(
+                        table[static_cast<size_t>(indices[item]) * cols +
+                              col]);
+            }
+        }
+        return expected;
+    };
+
+    const uint64_t single_row = 11;
+    auto single_f32 = backend.tensor_f32(cols, "host_embedding.single_f32");
+    require(backend.q8_0_get_row(*single_f32, *weight, single_row),
+            "host BF16 single FP32 lookup");
+    std::vector<float> single_f32_result(cols);
+    require(backend.copy_to_host(
+                *single_f32, single_f32_result.data(), 0, cols),
+            "copy host BF16 single FP32 result");
+    require_close(single_f32_result, expected_rows(&single_row, 1),
+                  0.0f, 0.0f, "host BF16 single FP32 lookup");
+
+    auto single_bf16 =
+        backend.tensor_bf16(cols, "host_embedding.single_bf16");
+    require(backend.q8_0_get_row(*single_bf16, *weight, single_row),
+            "host BF16 single BF16 lookup");
+    require_close(copy_bf16_to_float(backend, *single_bf16),
+                  expected_rows(&single_row, 1),
+                  0.0f, 0.0f, "host BF16 single BF16 lookup");
+
+    const uint64_t batch_rows[batch] = {7, 2, 16, 0, 7};
+    auto batch_f32 = backend.tensor_f32(
+        static_cast<uint64_t>(batch) * cols,
+        "host_embedding.batch_f32");
+    require(backend.q8_0_get_rows_batch(
+                *batch_f32, *weight, batch_rows, batch),
+            "host BF16 batch FP32 lookup");
+    std::vector<float> batch_f32_result(
+        static_cast<size_t>(batch) * cols);
+    require(backend.copy_to_host(
+                *batch_f32, batch_f32_result.data(), 0,
+                batch_f32_result.size()),
+            "copy host BF16 batch FP32 result");
+    require_close(batch_f32_result, expected_rows(batch_rows, batch),
+                  0.0f, 0.0f, "host BF16 batch FP32 lookup");
+
+    auto batch_bf16 = backend.tensor_bf16(
+        static_cast<uint64_t>(batch) * cols,
+        "host_embedding.batch_bf16");
+    require(backend.q8_0_get_rows_batch(
+                *batch_bf16, *weight, batch_rows, batch),
+            "host BF16 batch BF16 lookup");
+    require_close(copy_bf16_to_float(backend, *batch_bf16),
+                  expected_rows(batch_rows, batch),
+                  0.0f, 0.0f, "host BF16 batch BF16 lookup");
+}
+
 void test_bf16(qw3::DeviceBackend &backend) {
     constexpr uint32_t rows = 128;
     constexpr uint32_t cols = 128;
@@ -1230,6 +1308,7 @@ void test_nvfp4_checkpoint(qw3::DeviceBackend &backend, const char *model_path) 
 int main(int argc, char **argv) {
     auto backend = qw3::make_cuda_device_backend(qw3::LinearBackend::Auto);
     require(backend->begin(), "backend begin");
+    test_host_bf16_embedding(*backend);
     test_bf16(*backend);
     test_q8_bf16_paths(*backend);
     test_fp8_shape(*backend, 4);

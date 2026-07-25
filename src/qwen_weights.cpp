@@ -167,14 +167,21 @@ PreparedTensor prepare_tensor(const ModelTensorInfo &tensor) {
 
 } // namespace
 
-QwenWeights::QwenWeights(const QwenNativeModel &model, DeviceBackend &backend)
+QwenWeights::QwenWeights(const QwenNativeModel &model, DeviceBackend &backend,
+                         bool cpu_embedding)
     : model_(model), backend_(backend) {
     const NativePlanInfo &plan = model_.plan();
     if (!plan.supported) {
         throw std::runtime_error("native model plan is incomplete; cannot upload weights");
     }
 
-    token_embd_ = bind(model_.token_embedding());
+    if (cpu_embedding && model_.output() == model_.token_embedding()) {
+        throw std::runtime_error(
+            "--cpu-embedding requires a separate output/LM-head weight");
+    }
+    token_embd_ = cpu_embedding
+        ? bind_host_bf16(model_.token_embedding())
+        : bind(model_.token_embedding());
     output_norm_ = bind(model_.output_norm());
     output_ = bind(model_.output());
     if (!token_embd_ || !output_norm_ || !output_) {
@@ -332,6 +339,34 @@ DeviceWeight *QwenWeights::bind(const ModelTensorInfo *tensor) {
     } else if (raw->format == DeviceWeightFormat::Q8_0) {
         uses_q8_ = true;
     }
+    owned_.push_back(std::move(weight));
+    by_tensor_.emplace(tensor, raw);
+    return raw;
+}
+
+DeviceWeight *QwenWeights::bind_host_bf16(const ModelTensorInfo *tensor) {
+    if (!tensor) return nullptr;
+    auto it = by_tensor_.find(tensor);
+    if (it != by_tensor_.end()) return it->second;
+    if (tensor->type != ModelTensorType::BF16 || tensor->add_one ||
+        tensor->negative_exp || tensor->reorder != ModelTensorReorder::None) {
+        throw std::runtime_error(
+            "--cpu-embedding requires an untransformed BF16 token embedding: " +
+            tensor->name);
+    }
+    const uint64_t rows = tensor_rows(*tensor);
+    const uint64_t cols = tensor_cols(*tensor);
+    if (!tensor->data || cols == 0 ||
+        rows > std::numeric_limits<uint64_t>::max() / cols ||
+        rows * cols > std::numeric_limits<uint64_t>::max() / sizeof(uint16_t) ||
+        tensor->bytes != rows * cols * sizeof(uint16_t)) {
+        throw std::runtime_error(
+            "invalid BF16 token embedding storage: " + tensor->name);
+    }
+    std::unique_ptr<DeviceWeight> weight = backend_.weight_bf16_host(
+        tensor->data, rows, cols, tensor_label(*tensor));
+    host_resident_bytes_ += tensor->bytes;
+    DeviceWeight *raw = weight.get();
     owned_.push_back(std::move(weight));
     by_tensor_.emplace(tensor, raw);
     return raw;

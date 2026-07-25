@@ -215,6 +215,12 @@ weights. NVFP4 uses FlashInfer's SM120 CUTLASS kernel and is enabled
 automatically only for a `120a` CUDA build; Q8 and non-Blackwell FlashInfer
 builds do not compile this adapter.
 
+For memory-constrained GPUs, `--cpu-embedding` keeps an untied BF16 input
+embedding table in the checkpoint's host mapping. Prefill gathers the selected
+token rows through a double-buffered pinned staging area, and decode transfers
+one row per token. The LM head and all compute weights remain on GPU. The flag
+is opt-in and rejects checkpoints whose input embedding is also the LM head.
+
 For the FlashInfer wheel layout used by the `vllm` environment:
 
 ```sh
