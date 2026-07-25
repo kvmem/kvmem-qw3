@@ -1023,6 +1023,7 @@ private:
         uint32_t completed_pos = 0;
         std::vector<NvmeIoSpan> spans;
         std::vector<uint32_t> block_ids;
+        std::vector<KvMemPendingWriteBatch::CpuCopy> cpu_copies;
         std::vector<int32_t> src_page_indices;
         std::vector<int32_t> dst_page_indices;
         std::unique_ptr<DeviceTransferFence> fence;
@@ -1077,6 +1078,10 @@ private:
     void kvmem_submit_pinned_write_batch(
         std::shared_ptr<HostBuffer> buffer, uint64_t bytes,
         std::vector<NvmeIoSpan> spans,
+        std::vector<uint32_t> block_ids,
+        std::vector<KvMemPendingWriteBatch::CpuCopy> cpu_copies);
+    void kvmem_submit_pinned_cpu_copy_batch(
+        std::shared_ptr<HostBuffer> buffer, uint64_t bytes,
         std::vector<uint32_t> block_ids,
         std::vector<KvMemPendingWriteBatch::CpuCopy> cpu_copies);
     void kvmem_finish_proactive_d2h(bool wait_all);

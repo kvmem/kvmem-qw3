@@ -5715,8 +5715,12 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         }
     }
     kvmem_stagein_assembly_overlap_active_ = false;
+    const bool proactive_cpu_writeback =
+        async_d2h &&
+        !has_ssd &&
+        kvmem_inclusive_cpu_backing_;
     kvmem_prefill_writeback_enabled_ =
-        async_ssd_write &&
+        (async_ssd_write || proactive_cpu_writeback) &&
         kvmem_immutable_source_k_ &&
         (!kvmem_mtp_tiered_ || kvmem_mtp_local_positions_) &&
         env_flag_enabled("QW3_KVMEM_PREFILL_WRITEBACK", true);
@@ -5725,7 +5729,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         "[kvmem-opt] level=%s cpu_cache_policy=%s "
         "async_d2h=%d inclusive_cpu=%d async_ssd_write=%d "
         "pipelined_cpu_h2d=%d coalesced_ssd_read=%d "
-        "prefill_writeback=%d "
+        "prefill_writeback=%d prefill_writeback_target=%s "
         "io_slab_mib=%zu write_qd=%zu read_qd=2 "
         "cpu_gather_threads=%zu cpu_stageout_threads=%zu "
         "persistent_cpu_pool=%d persistent_cpu_workers=%zu "
@@ -5739,6 +5743,8 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         async_ssd_write ? 1 : 0,
         pipelined_h2d ? 1 : 0, coalesced_ssd_read ? 1 : 0,
         kvmem_prefill_writeback_enabled_ ? 1 : 0,
+        kvmem_prefill_writeback_enabled_
+            ? (has_ssd ? "ssd" : "cpu") : "off",
         static_cast<size_t>(
             kvmem_io_slab_bytes() / (1024ull * 1024ull)),
         kvmem_write_queue_depth(),
@@ -7228,6 +7234,19 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
                     block_store_->set_block_io_in_flight(id, false);
                 }
             }
+            if (kvmem_cpu_tier_) {
+                for (const auto &copy : front.cpu_copies) {
+                    if (kvmem_cpu_tier_->block_slot(copy.block_id) ==
+                        copy.slot) {
+                        kvmem_cpu_tier_->release_block(copy.block_id);
+                        kvmem_release_cpu_slot(copy.slot);
+                        if (block_store_) {
+                            block_store_->set_block_cpu_copy(
+                                copy.block_id, -1);
+                        }
+                    }
+                }
+            }
             kvmem_pending_writes_.pop_front();
             throw;
         }
@@ -7244,9 +7263,10 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
                 }
                 block_store_->set_block_io_in_flight(id, false);
             }
+        }
+        if (block_store_ && kvmem_cpu_tier_) {
             for (const auto &copy : front.cpu_copies) {
-                if (copy.block_id >= block_store_->block_count() ||
-                    !kvmem_cpu_tier_) {
+                if (copy.block_id >= block_store_->block_count()) {
                     continue;
                 }
                 if (kvmem_cpu_tier_->block_slot(copy.block_id) ==
@@ -7262,6 +7282,13 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
                             copy.slot, block.nvme_slot);
                     }
                 }
+                // SSD write-back clears this above when its durable write
+                // completes. CPU-only proactive write-back has no SSD loop, so
+                // publish the clean CPU authority here.
+                if (!kvmem_nvme_tier_) {
+                    block_store_->set_block_io_in_flight(
+                        copy.block_id, false);
+                }
             }
         }
         kvmem_async_write_completed_bytes_ += stats.bytes;
@@ -7273,6 +7300,7 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
             std::move(front.pinned_buffer);
         const uint64_t completed_bytes = front.buffer_bytes;
         const bool completed_proactive = front.proactive;
+        const bool completed_cpu_only = front.spans.empty();
         const uint32_t completed_blocks =
             static_cast<uint32_t>(front.block_ids.size());
         kvmem_pending_writes_.pop_front();
@@ -7292,10 +7320,11 @@ void QwenExecutor::kvmem_reap_pending_writes(bool wait_all) {
         if (kvmem_perf_trace_flag() && completed_bytes > 0) {
             std::fprintf(
                 stderr,
-                "[kvmem-writeback] event=ssd_complete blocks=%u "
+                "[kvmem-writeback] event=%s_complete blocks=%u "
                 "bytes=%llu duration_ms=%.3f pending_ssd=%zu "
                 "source=%s cpu_copy_blocks=%u "
                 "cpu_copy_mib=%.3f cpu_copy_ms=%.3f\n",
+                completed_cpu_only ? "cpu" : "ssd",
                 completed_blocks,
                 static_cast<unsigned long long>(completed_bytes),
                 stats.duration_ns / 1.0e6,
@@ -7429,6 +7458,74 @@ void QwenExecutor::kvmem_submit_pinned_write_batch(
     kvmem_pending_writes_.push_back(std::move(pending));
 }
 
+void QwenExecutor::kvmem_submit_pinned_cpu_copy_batch(
+        std::shared_ptr<HostBuffer> buffer, uint64_t bytes,
+        std::vector<uint32_t> block_ids,
+        std::vector<KvMemPendingWriteBatch::CpuCopy> cpu_copies) {
+    if (!buffer || !buffer->data || bytes == 0 ||
+        block_ids.empty() || cpu_copies.empty()) {
+        return;
+    }
+    if (bytes > buffer->bytes) {
+        throw std::runtime_error(
+            "KVMem proactive CPU write-back exceeds its pinned slab");
+    }
+    if (!kvmem_cpu_tier_ || kvmem_nvme_tier_) {
+        throw std::runtime_error(
+            "KVMem proactive CPU copy requires a CPU-only tier");
+    }
+
+    // Bound both worker count and pinned-slab ownership. In the normal
+    // double-buffered pipeline the oldest scatter finishes during the next
+    // prefill chunk, so this wait is normally zero.
+    const size_t max_inflight_batches =
+        std::max<size_t>(1, kvmem_writeback_slab_count_);
+    const uint64_t wait0 = kvmem_steady_ns();
+    if (kvmem_pending_writes_.size() >= max_inflight_batches) {
+        kvmem_pending_writes_.front().future.wait();
+        kvmem_reap_pending_writes(/*wait_all=*/false);
+    }
+    kvmem_last_stage_out_perf_.async_backpressure_ns +=
+        kvmem_steady_ns() - wait0;
+
+    KvMemPendingWriteBatch pending;
+    pending.pinned_buffer = std::move(buffer);
+    pending.buffer_bytes = bytes;
+    pending.proactive = true;
+    pending.block_ids = std::move(block_ids);
+    pending.cpu_copies = std::move(cpu_copies);
+    pending.submit_ns = kvmem_steady_ns();
+    auto worker_buffer = pending.pinned_buffer;
+    auto worker_cpu_copies = pending.cpu_copies;
+    pending.future = std::async(
+        std::launch::async,
+        [worker_buffer,
+         worker_cpu_copies = std::move(worker_cpu_copies)]() {
+            NvmeBatchIoStats stats;
+            const uint64_t t0 = kvmem_steady_ns();
+            uint64_t copied = 0;
+            for (const auto &copy : worker_cpu_copies) {
+                std::memcpy(
+                    copy.dst,
+                    static_cast<const uint8_t *>(
+                        worker_buffer->data) +
+                        copy.buffer_offset,
+                    static_cast<size_t>(copy.bytes));
+                copied += copy.bytes;
+            }
+            stats.bytes = copied;
+            stats.cpu_copy_bytes = copied;
+            stats.cpu_copy_blocks =
+                static_cast<uint32_t>(worker_cpu_copies.size());
+            stats.cpu_copy_ns = kvmem_steady_ns() - t0;
+            stats.duration_ns = stats.cpu_copy_ns;
+            return stats;
+        });
+    kvmem_last_stage_out_perf_.async_submitted_bytes += bytes;
+    ++kvmem_last_stage_out_perf_.async_batches;
+    kvmem_pending_writes_.push_back(std::move(pending));
+}
+
 void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
     // Publish any already-completed CPU cache copies before admission makes an
     // eviction decision for the next chunk.
@@ -7447,9 +7544,38 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
             kvmem_steady_ns() - wait0;
         kvmem_writeback_d2h_wait_ns_ += wait_ns;
 
-        if (!block_store_ || !kvmem_nvme_tier_) {
+        if (!block_store_) {
             throw std::runtime_error(
-                "KVMem proactive D2H completed after its SSD tier reset");
+                "KVMem proactive D2H completed after its block store reset");
+        }
+        if (!kvmem_nvme_tier_) {
+            if (!kvmem_cpu_tier_ ||
+                !kvmem_inclusive_cpu_backing_ ||
+                batch.cpu_copies.size() != batch.block_ids.size()) {
+                throw std::runtime_error(
+                    "KVMem proactive CPU D2H lost its inclusive backing");
+            }
+            const uint32_t block_count =
+                static_cast<uint32_t>(batch.block_ids.size());
+            const uint64_t bytes = batch.bytes;
+            const uint32_t completed_pos = batch.completed_pos;
+            kvmem_submit_pinned_cpu_copy_batch(
+                std::move(batch.buffer), bytes,
+                std::move(batch.block_ids),
+                std::move(batch.cpu_copies));
+            if (kvmem_perf_trace_flag()) {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-writeback] event=cpu_submit "
+                    "completed_pos=%u blocks=%u bytes=%llu "
+                    "d2h_wait_ms=%.3f overlap_window_ms=%.3f "
+                    "pending_cpu=%zu\n",
+                    completed_pos, block_count,
+                    static_cast<unsigned long long>(bytes),
+                    wait_ns / 1.0e6, overlap_window_ms,
+                    kvmem_pending_writes_.size());
+            }
+            continue;
         }
         uint64_t cpu_copy_bytes = 0;
         std::vector<KvMemPendingWriteBatch::CpuCopy>
@@ -7583,7 +7709,8 @@ void QwenExecutor::kvmem_finish_proactive_d2h(bool wait_all) {
 
 void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
     if (!kvmem_prefill_writeback_enabled_ || !block_store_ ||
-        !kvmem_nvme_tier_ || kvmem_query_replay_active_) {
+        (!kvmem_nvme_tier_ && !kvmem_cpu_tier_) ||
+        kvmem_query_replay_active_) {
         return;
     }
     // Batch N's D2H was allowed to overlap the just-finished prefill chunk.
@@ -7607,7 +7734,10 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
         }
         ++kvmem_writeback_next_block_;
         if (!kvmem_block_pages_resident(block) ||
-            block.ssd_clean || block.in_flight) {
+            block.ssd_clean || block.in_flight ||
+            (!kvmem_nvme_tier_ && block.cpu_slot >= 0 &&
+             kvmem_cpu_tier_->block_slot(id) == block.cpu_slot &&
+             kvmem_cpu_slot_data(block.cpu_slot))) {
             continue;
         }
         if (kvmem_mtp_tiered_ &&
@@ -7680,16 +7810,43 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
                 throw std::runtime_error(
                     "KVMem proactive block exceeds its D2H slab");
             }
-            const NvmeSlotPlacement placement =
-                kvmem_nvme_tier_->place_block(id);
-            if (placement.slot < 0) {
-                throw std::runtime_error(
-                    "KVMem proactive write-back exhausted the SSD arena");
+            if (kvmem_nvme_tier_) {
+                const NvmeSlotPlacement placement =
+                    kvmem_nvme_tier_->place_block(id);
+                if (placement.slot < 0) {
+                    throw std::runtime_error(
+                        "KVMem proactive write-back exhausted the SSD arena");
+                }
+                batch.spans.push_back(
+                    NvmeIoSpan{placement.slot, batch.bytes, bytes});
+            } else {
+                PinnedSlotPlacement placement =
+                    kvmem_cpu_tier_->place_block(id);
+                if (placement.slot < 0 ||
+                    (kvmem_sparse_cpu_tier_ &&
+                     !kvmem_reserve_cpu_slot(placement.slot))) {
+                    if (placement.slot >= 0) {
+                        kvmem_cpu_tier_->release_block(id);
+                    }
+                    throw std::runtime_error(
+                        "KVMem proactive CPU write-back exhausted its "
+                        "inclusive tier");
+                }
+                uint8_t *dst =
+                    kvmem_cpu_slot_data(placement.slot);
+                if (!dst) {
+                    kvmem_cpu_tier_->release_block(id);
+                    kvmem_release_cpu_slot(placement.slot);
+                    throw std::runtime_error(
+                        "KVMem proactive CPU write-back lost its slot");
+                }
+                batch.cpu_copies.push_back(
+                    KvMemPendingWriteBatch::CpuCopy{
+                        id, placement.slot, dst, batch.bytes, bytes});
+                block_store_->set_block_io_in_flight(id, true);
             }
             block_offsets.push_back(batch.bytes);
             batch.block_ids.push_back(id);
-            batch.spans.push_back(
-                NvmeIoSpan{placement.slot, batch.bytes, bytes});
             batch.bytes += bytes;
             ++candidate;
         }
@@ -7745,15 +7902,38 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
         for (const PackedTarget &target : packed_targets) {
             target_tensors.push_back(target.tensor);
         }
-        require_status(
-            backend_.begin_kv_transfer_from_device());
-        require_status(backend_.copy_packed_pages_to_host_async(
-            batch.buffer->data, batch.bytes, target_tensors,
-            batch.src_page_indices.data(),
-            batch.dst_page_indices.data(),
-            pages_per_target, page_bytes));
-        require_status(
-            backend_.record_kv_transfer_fence(batch.fence));
+        try {
+            require_status(
+                backend_.begin_kv_transfer_from_device());
+            require_status(backend_.copy_packed_pages_to_host_async(
+                batch.buffer->data, batch.bytes, target_tensors,
+                batch.src_page_indices.data(),
+                batch.dst_page_indices.data(),
+                pages_per_target, page_bytes));
+            require_status(
+                backend_.record_kv_transfer_fence(batch.fence));
+        } catch (...) {
+            if (!kvmem_nvme_tier_) {
+                for (const auto &copy : batch.cpu_copies) {
+                    block_store_->set_block_io_in_flight(
+                        copy.block_id, false);
+                    if (kvmem_cpu_tier_->block_slot(copy.block_id) ==
+                        copy.slot) {
+                        kvmem_cpu_tier_->release_block(copy.block_id);
+                        kvmem_release_cpu_slot(copy.slot);
+                        block_store_->set_block_cpu_copy(
+                            copy.block_id, -1);
+                    }
+                }
+            }
+            if (batch.buffer &&
+                kvmem_free_writeback_slabs_.size() <
+                    kvmem_writeback_slab_count_) {
+                kvmem_free_writeback_slabs_.push_back(
+                    std::move(batch.buffer));
+            }
+            throw;
+        }
 
         kvmem_writeback_d2h_bytes_ += batch.bytes;
         kvmem_writeback_blocks_ +=
@@ -7763,9 +7943,10 @@ void QwenExecutor::kvmem_prefill_writeback(uint32_t completed_pos) {
             std::fprintf(
                 stderr,
                 "[kvmem-writeback] event=d2h_submit completed_pos=%u "
-                "blocks=%zu bytes=%llu pending_d2h=%zu\n",
+                "blocks=%zu bytes=%llu target=%s pending_d2h=%zu\n",
                 completed_pos, batch.block_ids.size(),
                 static_cast<unsigned long long>(batch.bytes),
+                kvmem_nvme_tier_ ? "ssd" : "cpu",
                 kvmem_proactive_d2h_batches_.size() + 1);
         }
         kvmem_proactive_d2h_batches_.push_back(
@@ -8189,6 +8370,15 @@ void QwenExecutor::kvmem_stage_out(const std::vector<uint32_t> &block_ids) {
     if (block_store_->config().optimization_level >=
             KvMemOptimizationLevel::Opt2 &&
         kvmem_cpu_tier_ && !kvmem_nvme_tier_) {
+        if (kvmem_prefill_writeback_enabled_) {
+            // A CPU slot is not authoritative until both the proactive D2H
+            // fence and the pinned-to-pageable scatter have completed. Drain
+            // that bounded pipeline before the clean-eviction fast path
+            // inspects the CPU tier. Normally both phases were hidden by the
+            // following prefill chunk and these waits are already ready.
+            kvmem_finish_proactive_d2h(/*wait_all=*/true);
+            kvmem_reap_pending_writes(/*wait_all=*/true);
+        }
         kvmem_stage_out_cpu_batched(block_ids);
         return;
     }
