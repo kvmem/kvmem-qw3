@@ -811,14 +811,18 @@ QwenExecutor::KvStateSnapshot QwenExecutor::kv_state_snapshot() const {
 }
 
 void QwenExecutor::reset_state() {
+    const uint64_t cold_reset_start_ns = kvmem_steady_ns();
     kvmem_finish_proactive_d2h(/*wait_all=*/true);
+    const uint64_t cold_reset_after_proactive_ns = kvmem_steady_ns();
     kvmem_reap_pending_writes(/*wait_all=*/true);
+    const uint64_t cold_reset_after_pending_ns = kvmem_steady_ns();
     for (auto &s : recurrent_states_) {
         if (s) (void) backend_.zero_tensor(*s);
     }
     for (auto &s : conv_states_) {
         if (s) (void) backend_.zero_tensor(*s);
     }
+    const uint64_t cold_reset_after_state_zero_ns = kvmem_steady_ns();
     // KV caches stay allocated; just reset the position so the next forward
     // overwrites slot 0 (the seq_len passed to attention_decode is position+1).
     position_ = 0;
@@ -826,6 +830,7 @@ void QwenExecutor::reset_state() {
     mtp_kv_pages_.reset();
     mtp_prefix_len_ = 0;
     decode_graph_warmup_pending_ = true;
+    const uint64_t cold_reset_after_page_reset_ns = kvmem_steady_ns();
     // Block-sparse runtime state is per-session: drop the working set + window
     // table. The block store itself (configured selection params) is kept; a
     // fresh register_append sequence rebuilds the block table for the new run.
@@ -849,17 +854,30 @@ void QwenExecutor::reset_state() {
     const uint64_t cold_reset_raw_bytes =
         kvmem_raw_k_mirror_bytes_ + kvmem_raw_mtp_k_mirror_bytes_;
     const uint64_t cold_reset_sparse_bytes = kvmem_cpu_sparse_bytes_;
+    // Opt3 keeps the bounded host allocation topology warm across independent
+    // requests. The contents are never reused as cache authority: clear() and
+    // the validity maps below invalidate every block/token. Only the backing
+    // allocations survive, capped by --kvmem-cpu-gb. This avoids repeatedly
+    // freeing, trimming, faulting, and rebuilding tens of GiB on the request
+    // thread. Lower optimization levels retain the compatibility behavior, and
+    // deployments that prefer minimum idle RSS can explicitly disable it.
+    const bool retain_cold_host =
+        block_store_ && kvmem_sparse_cpu_tier_ &&
+        block_store_->config().optimization_level >=
+            KvMemOptimizationLevel::Opt3 &&
+        env_flag_enabled("QW3_KVMEM_RETAIN_COLD_HOST", true);
     if (kvmem_cpu_tier_) kvmem_cpu_tier_->clear();
     if (kvmem_sparse_cpu_tier_) {
         for (auto &slab : kvmem_cpu_sparse_slabs_) {
-            slab.data.reset();
             slab.live_slots = 0;
+            if (!retain_cold_host) slab.data.reset();
         }
         std::fill(kvmem_cpu_sparse_slot_live_.begin(),
                   kvmem_cpu_sparse_slot_live_.end(), uint8_t{0});
-        kvmem_cpu_sparse_bytes_ = 0;
+        if (!retain_cold_host) kvmem_cpu_sparse_bytes_ = 0;
     }
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
+    const uint64_t cold_reset_after_tier_clear_ns = kvmem_steady_ns();
     kvmem_stage_pinned_.reset();
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_last_prefetch_perf_ = KvMemPrefetchPerf{};
@@ -874,12 +892,10 @@ void QwenExecutor::reset_state() {
     kvmem_pending_plan_ = KvMemPlan{};
     // reset_state() is the cold-request boundary. Warm prefix continuation uses
     // restore_state()+kvmem_truncate_to() and deliberately does not come through
-    // here, so no raw-K authority belongs to the next request. Keeping the
-    // demand-allocated chunks alive retained up to --kvmem-cpu-gb of anonymous
-    // memory across independent requests and could OOM a long-lived server.
-    // Preserve only the pre-sized pointer/validity vectors; release their
-    // physical contents and let the next cold prefill allocate on demand.
-    kvmem_truncate_raw_k(0);
+    // here, so no raw-K authority belongs to the next request. Opt3 may retain
+    // the bounded allocations as an invalid buffer pool; lower levels release
+    // their physical contents and allocate again on demand.
+    if (!retain_cold_host) kvmem_truncate_raw_k(0);
     std::fill(kvmem_raw_k_valid_tokens_.begin(),
               kvmem_raw_k_valid_tokens_.end(), uint8_t{0});
     std::fill(kvmem_raw_mtp_k_valid_tokens_.begin(),
@@ -893,22 +909,14 @@ void QwenExecutor::reset_state() {
     // by warm-prefix restore/truncate and therefore cannot discard reusable
     // prefix state.
     const int cold_reset_trimmed =
+        !retain_cold_host &&
         (cold_reset_raw_bytes != 0 || cold_reset_sparse_bytes != 0)
             ? ::malloc_trim(0)
             : 0;
 #else
     const int cold_reset_trimmed = -1;
 #endif
-    if ((cold_reset_raw_bytes != 0 || cold_reset_sparse_bytes != 0) &&
-        kvmem_tier_trace_enabled()) {
-        std::fprintf(
-            stderr,
-            "[kvmem-tier] cold_reset_host_release raw_bytes=%llu "
-            "sparse_bytes=%llu allocator_trim=%d\n",
-            static_cast<unsigned long long>(cold_reset_raw_bytes),
-            static_cast<unsigned long long>(cold_reset_sparse_bytes),
-            cold_reset_trimmed);
-    }
+    const uint64_t cold_reset_after_host_release_ns = kvmem_steady_ns();
     kvmem_raw_decode_block_start_ = -1;
     kvmem_raw_decode_first_row_ = 0;
     kvmem_raw_decode_rows_ = 0;
@@ -969,6 +977,36 @@ void QwenExecutor::reset_state() {
     kvmem_attn_trace_sample_ = 0;
     global_attn_trace_seen_tokens_ = 0;
     global_attn_trace_sample_ = 0;
+    const uint64_t cold_reset_end_ns = kvmem_steady_ns();
+    if ((cold_reset_raw_bytes != 0 || cold_reset_sparse_bytes != 0) &&
+        (kvmem_tier_trace_enabled() || kvmem_timing_flag())) {
+        const auto ms = [](uint64_t begin, uint64_t end) {
+            return (end - begin) / 1.0e6;
+        };
+        std::fprintf(
+            stderr,
+            "[kvmem-tier] cold_reset_host_release raw_bytes=%llu "
+            "sparse_bytes=%llu retain=%d allocator_trim=%d total_ms=%.3f "
+            "proactive_ms=%.3f pending_ms=%.3f state_zero_ms=%.3f "
+            "page_reset_ms=%.3f tier_clear_ms=%.3f host_release_ms=%.3f "
+            "metadata_ms=%.3f\n",
+            static_cast<unsigned long long>(cold_reset_raw_bytes),
+            static_cast<unsigned long long>(cold_reset_sparse_bytes),
+            retain_cold_host ? 1 : 0,
+            cold_reset_trimmed,
+            ms(cold_reset_start_ns, cold_reset_end_ns),
+            ms(cold_reset_start_ns, cold_reset_after_proactive_ns),
+            ms(cold_reset_after_proactive_ns, cold_reset_after_pending_ns),
+            ms(cold_reset_after_pending_ns,
+               cold_reset_after_state_zero_ns),
+            ms(cold_reset_after_state_zero_ns,
+               cold_reset_after_page_reset_ns),
+            ms(cold_reset_after_page_reset_ns,
+               cold_reset_after_tier_clear_ns),
+            ms(cold_reset_after_tier_clear_ns,
+               cold_reset_after_host_release_ns),
+            ms(cold_reset_after_host_release_ns, cold_reset_end_ns));
+    }
 }
 
 void QwenExecutor::KvPageTable::configure(uint32_t ctx_size,
@@ -1671,6 +1709,26 @@ void QwenExecutor::kvmem_evict_cpu_for_raw(uint64_t bytes) {
     kvmem_finish_proactive_d2h(/*wait_all=*/true);
     kvmem_reap_pending_writes(/*wait_all=*/true);
     while (!kvmem_cpu_budget_has(bytes)) {
+        // Opt3 can retain empty spill slabs across cold requests. They are
+        // allocation-cache capacity, not live KV authority, so raw-K growth may
+        // reclaim them before evicting a current request's resident block.
+        bool reclaimed_empty_slab = false;
+        for (auto it = kvmem_cpu_sparse_slabs_.rbegin();
+             it != kvmem_cpu_sparse_slabs_.rend(); ++it) {
+            if (it->live_slots != 0 || !it->data) continue;
+            const uint64_t slab_bytes =
+                static_cast<uint64_t>(it->capacity_slots) *
+                kvmem_cpu_sparse_slot_bytes_;
+            it->data.reset();
+            kvmem_cpu_sparse_bytes_ =
+                slab_bytes <= kvmem_cpu_sparse_bytes_
+                    ? kvmem_cpu_sparse_bytes_ - slab_bytes
+                    : 0;
+            reclaimed_empty_slab = true;
+            break;
+        }
+        if (reclaimed_empty_slab) continue;
+
         // With capacity-qualified CPU-only inclusive backing, a CPU record for
         // a GPU-resident block is merely a clean cache copy. Raw-K authority has
         // priority: discard such a redundant copy without any I/O. This is a
