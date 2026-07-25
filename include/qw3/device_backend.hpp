@@ -170,6 +170,25 @@ public:
     virtual std::unique_ptr<DeviceTensor> scratch_f32(uint64_t count, const char *label) {
         return tensor_f32(count, label);
     }
+    // Optional non-owning view into an existing tensor allocation. Offsets are
+    // expressed in bytes so one FP32 arena can host FP32 and BF16 scratch
+    // tensors. The backing storage must outlive every returned view.
+    virtual bool supports_tensor_views() const { return false; }
+    virtual std::unique_ptr<DeviceTensor> tensor_view(
+            DeviceTensor &storage,
+            uint64_t byte_offset,
+            uint64_t count,
+            uint32_t elem_size,
+            DeviceTensorDType dtype,
+            const char *label) {
+        (void)storage;
+        (void)byte_offset;
+        (void)count;
+        (void)elem_size;
+        (void)dtype;
+        (void)label;
+        return nullptr;
+    }
     virtual std::unique_ptr<DeviceTensor> scratch_like(
             const DeviceTensor &source,
             uint64_t count,

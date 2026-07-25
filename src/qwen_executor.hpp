@@ -260,8 +260,8 @@ public:
     std::vector<int32_t> kv_physical_pages() const;
     uint32_t kv_page_size_public() const { return kv_pages_.page_size; }
 
-    // Per-token batch-scratch footprint in bytes (sum of all *_batch_ tensors
-    // at batch=1). Used to size prefill chunks against free device memory.
+    // Conservative per-token batch-scratch footprint in bytes. Used to size
+    // prefill chunks against free device memory.
     uint64_t per_token_scratch_bytes() const;
 
     // Prefill chunk override: -1 = use env / built-in default (512), 0 =
@@ -567,6 +567,9 @@ private:
     uint32_t ffn_batch_stride_ = 0;
     uint32_t ffn_mid_batch_capacity_ = 0;
     uint32_t ffn_gate_up_batch_capacity_ = 0;
+    // Declared before its views so normal reverse-order destruction releases
+    // every non-owning view before the backing allocation.
+    std::unique_ptr<DeviceTensor> batch_scratch_arena_;
     std::unique_ptr<DeviceTensor> h_batch_;
     std::unique_ptr<DeviceTensor> norm_batch_;
     std::unique_ptr<DeviceTensor> attn_out_batch_;

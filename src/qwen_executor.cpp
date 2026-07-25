@@ -1219,30 +1219,239 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
         if (l.recurrent_value_dim > max_rvalue) max_rvalue = l.recurrent_value_dim;
     }
 
+    // Drop all views before replacing their backing allocation. Separately
+    // allocated fallback buffers are also released and will grow lazily if a
+    // later layer actually needs them.
+    h_batch_.reset();
+    norm_batch_.reset();
+    attn_out_batch_.reset();
+    ffn_gate_batch_.reset();
+    ffn_up_batch_.reset();
+    ffn_mid_batch_.reset();
+    ffn_out_batch_.reset();
+    proj_batch_.reset();
+    gate_proj_batch_.reset();
+    alpha_batch_.reset();
+    beta_batch_.reset();
+    core_batch_.reset();
+    q_batch_.reset();
+    k_batch_.reset();
+    v_batch_.reset();
+    mid_batch_.reset();
+    conv_out_batch_.reset();
+    batch_scratch_arena_.reset();
+    batch_capacity_ = 0;
+    ffn_mid_batch_capacity_ = 0;
+    ffn_gate_up_batch_capacity_ = 0;
+
     const uint64_t B = batch;
     auto main_tensor = [this](uint64_t count, const char *label) {
         return bf16_main_
             ? backend_.tensor_bf16(count, label)
             : backend_.tensor_f32(count, label);
     };
-    h_batch_       = main_tensor(B * cfg.n_embd,                     "h_batch");
-    norm_batch_    = backend_.tensor_f32(B * cfg.n_embd,             "norm_batch");
-    attn_out_batch_= main_tensor(B * cfg.n_embd,                     "attn_out_batch");
     ffn_batch_stride_ = static_cast<uint32_t>(
         std::max<uint64_t>(max_ffn, 1));
-    ffn_out_batch_ = main_tensor(B * cfg.n_embd,                     "ffn_out_batch");
-    if (max_rqkv  > 0) proj_batch_      = backend_.tensor_f32(B * max_rqkv,  "proj_batch");
-    if (max_rqkv  > 0) conv_out_batch_  = backend_.tensor_f32(B * max_rqkv,  "conv_out_batch");
-    if (max_rvalue> 0) gate_proj_batch_ = backend_.tensor_f32(B * max_rvalue,"gate_proj_batch");
-    if (max_rvalue> 0) core_batch_      = backend_.tensor_f32(B * max_rvalue,"core_batch");
-    if (cfg.num_v_heads() > 0) {
-        alpha_batch_ = backend_.tensor_f32(B * cfg.num_v_heads(),    "alpha_batch");
-        beta_batch_  = backend_.tensor_f32(B * cfg.num_v_heads(),    "beta_batch");
+
+    const bool use_scratch_arena =
+        backend_.supports_tensor_views() &&
+        env_flag_enabled("QW3_PREFILL_SCRATCH_ARENA", true);
+    if (use_scratch_arena) {
+        constexpr uint64_t kArenaAlignment = 256;
+        auto align_up = [](uint64_t value) {
+            return (value + kArenaAlignment - 1) &
+                   ~(kArenaAlignment - 1);
+        };
+        auto reserve = [&](uint64_t &cursor, uint64_t bytes) {
+            cursor = align_up(cursor);
+            const uint64_t offset = cursor;
+            cursor += bytes;
+            return offset;
+        };
+        auto f32_bytes = [B](uint64_t width) {
+            return B * width * sizeof(float);
+        };
+
+        const uint32_t main_elem_size =
+            bf16_main_ ? sizeof(uint16_t) : sizeof(float);
+        const DeviceTensorDType main_dtype =
+            bf16_main_ ? DeviceTensorDType::BF16 : DeviceTensorDType::F32;
+        const uint64_t main_count = B * cfg.n_embd;
+
+        uint64_t cursor = 0;
+        const uint64_t h_off =
+            reserve(cursor, main_count * main_elem_size);
+        const uint64_t norm_off =
+            reserve(cursor, f32_bytes(cfg.n_embd));
+        // Attention and FFN outputs are never live at the same time.
+        const uint64_t output_off =
+            reserve(cursor, main_count * main_elem_size);
+        const uint64_t phase_off = align_up(cursor);
+
+        uint64_t recurrent_cursor = 0;
+        const uint64_t proj_off =
+            reserve(recurrent_cursor, f32_bytes(max_rqkv));
+        const uint64_t conv_out_off =
+            reserve(recurrent_cursor, f32_bytes(max_rqkv));
+        const uint64_t gate_proj_off =
+            reserve(recurrent_cursor, f32_bytes(max_rvalue));
+        const uint64_t core_off =
+            reserve(recurrent_cursor, f32_bytes(max_rvalue));
+        const uint64_t alpha_off =
+            reserve(recurrent_cursor, f32_bytes(cfg.num_v_heads()));
+        const uint64_t beta_off =
+            reserve(recurrent_cursor, f32_bytes(cfg.num_v_heads()));
+        const uint64_t recurrent_bytes = align_up(recurrent_cursor);
+
+        uint64_t attention_cursor = 0;
+        const uint64_t q_off =
+            reserve(attention_cursor, f32_bytes(max_q));
+        const uint64_t k_off =
+            reserve(attention_cursor, f32_bytes(max_k));
+        const uint64_t v_off =
+            reserve(attention_cursor, f32_bytes(max_v));
+        const uint64_t mid_count =
+            B * static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
+        const uint64_t mid_off =
+            reserve(attention_cursor, mid_count * sizeof(float));
+        const uint64_t attention_bytes = align_up(attention_cursor);
+
+        const uint64_t ffn_mid_count =
+            B * static_cast<uint64_t>(ffn_batch_stride_);
+        const uint64_t ffn_mid_bytes =
+            align_up(ffn_mid_count * sizeof(float));
+        const uint64_t phase_bytes =
+            std::max({recurrent_bytes, attention_bytes, ffn_mid_bytes});
+        const uint64_t arena_bytes = align_up(phase_off + phase_bytes);
+        // Match the historical independently allocated tensor semantics:
+        // some backend fallbacks conservatively expect untouched capacity
+        // rows to begin at zero even though active rows are overwritten.
+        batch_scratch_arena_ = backend_.tensor_f32(
+            (arena_bytes + sizeof(float) - 1) / sizeof(float),
+            "prefill_batch_scratch_arena");
+
+        auto view = [&](uint64_t byte_offset,
+                        uint64_t count,
+                        uint32_t elem_size,
+                        DeviceTensorDType dtype,
+                        const char *label) {
+            auto result = backend_.tensor_view(
+                *batch_scratch_arena_, byte_offset, count,
+                elem_size, dtype, label);
+            if (!result) {
+                throw std::runtime_error(
+                    std::string("device backend failed to create tensor view: ") +
+                    label);
+            }
+            return result;
+        };
+        auto f32_view = [&](uint64_t byte_offset,
+                            uint64_t count,
+                            const char *label) {
+            return view(byte_offset, count, sizeof(float),
+                        DeviceTensorDType::F32, label);
+        };
+
+        h_batch_ = view(h_off, main_count, main_elem_size,
+                        main_dtype, "h_batch");
+        norm_batch_ = f32_view(
+            norm_off, B * cfg.n_embd, "norm_batch");
+        attn_out_batch_ = view(
+            output_off, main_count, main_elem_size,
+            main_dtype, "attn_out_batch");
+        ffn_out_batch_ = view(
+            output_off, main_count, main_elem_size,
+            main_dtype, "ffn_out_batch");
+
+        if (max_rqkv > 0) {
+            proj_batch_ = f32_view(
+                phase_off + proj_off, B * max_rqkv, "proj_batch");
+            conv_out_batch_ = f32_view(
+                phase_off + conv_out_off, B * max_rqkv,
+                "conv_out_batch");
+        }
+        if (max_rvalue > 0) {
+            gate_proj_batch_ = f32_view(
+                phase_off + gate_proj_off, B * max_rvalue,
+                "gate_proj_batch");
+            core_batch_ = f32_view(
+                phase_off + core_off, B * max_rvalue, "core_batch");
+        }
+        if (cfg.num_v_heads() > 0) {
+            alpha_batch_ = f32_view(
+                phase_off + alpha_off, B * cfg.num_v_heads(),
+                "alpha_batch");
+            beta_batch_ = f32_view(
+                phase_off + beta_off, B * cfg.num_v_heads(),
+                "beta_batch");
+        }
+        if (max_q > 0) {
+            q_batch_ = f32_view(
+                phase_off + q_off, B * max_q, "q_batch");
+        }
+        if (max_k > 0) {
+            k_batch_ = f32_view(
+                phase_off + k_off, B * max_k, "k_batch");
+        }
+        if (max_v > 0) {
+            v_batch_ = f32_view(
+                phase_off + v_off, B * max_v, "v_batch");
+        }
+        mid_batch_ = f32_view(
+            phase_off + mid_off, mid_count, "mid_batch");
+        ffn_mid_batch_ = f32_view(
+            phase_off, ffn_mid_count, "ffn_mid_batch");
+        ffn_mid_batch_capacity_ = batch;
+
+        if (std::getenv("QW3_PREFILL_ARENA_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[qw3] prefill scratch arena: batch=%u total=%.2f MiB "
+                "persistent=%.2f MiB phase=%.2f MiB\n",
+                batch,
+                static_cast<double>(arena_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(phase_off) / (1024.0 * 1024.0),
+                static_cast<double>(phase_bytes) / (1024.0 * 1024.0));
+        }
+    } else {
+        h_batch_ = main_tensor(B * cfg.n_embd, "h_batch");
+        norm_batch_ = backend_.tensor_f32(
+            B * cfg.n_embd, "norm_batch");
+        attn_out_batch_ = main_tensor(
+            B * cfg.n_embd, "attn_out_batch");
+        ffn_out_batch_ = main_tensor(
+            B * cfg.n_embd, "ffn_out_batch");
+        if (max_rqkv > 0) {
+            proj_batch_ = backend_.tensor_f32(
+                B * max_rqkv, "proj_batch");
+            conv_out_batch_ = backend_.tensor_f32(
+                B * max_rqkv, "conv_out_batch");
+        }
+        if (max_rvalue > 0) {
+            gate_proj_batch_ = backend_.tensor_f32(
+                B * max_rvalue, "gate_proj_batch");
+            core_batch_ = backend_.tensor_f32(
+                B * max_rvalue, "core_batch");
+        }
+        if (cfg.num_v_heads() > 0) {
+            alpha_batch_ = backend_.tensor_f32(
+                B * cfg.num_v_heads(), "alpha_batch");
+            beta_batch_ = backend_.tensor_f32(
+                B * cfg.num_v_heads(), "beta_batch");
+        }
+        if (max_q > 0) {
+            q_batch_ = backend_.tensor_f32(B * max_q, "q_batch");
+        }
+        if (max_k > 0) {
+            k_batch_ = backend_.tensor_f32(B * max_k, "k_batch");
+        }
+        if (max_v > 0) {
+            v_batch_ = backend_.tensor_f32(B * max_v, "v_batch");
+        }
+        mid_batch_ = backend_.tensor_f32(
+            B * static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim,
+            "mid_batch");
     }
-    if (max_q > 0) q_batch_ = backend_.tensor_f32(B * max_q, "q_batch");
-    if (max_k > 0) k_batch_ = backend_.tensor_f32(B * max_k, "k_batch");
-    if (max_v > 0) v_batch_ = backend_.tensor_f32(B * max_v, "v_batch");
-    mid_batch_ = backend_.tensor_f32(B * static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim, "mid_batch");
 
     batch_capacity_ = batch;
 }
@@ -1287,17 +1496,35 @@ uint64_t QwenExecutor::per_token_scratch_bytes() const {
         if (l.recurrent_qkv_dim > max_rqkv) max_rqkv = l.recurrent_qkv_dim;
         if (l.recurrent_value_dim > max_rvalue) max_rvalue = l.recurrent_value_dim;
     }
+    const uint64_t ffn = std::max<uint64_t>(max_ffn, 1);
+    const bool use_scratch_arena =
+        backend_.supports_tensor_views() &&
+        env_flag_enabled("QW3_PREFILL_SCRATCH_ARENA", true);
+    if (use_scratch_arena) {
+        const uint64_t recurrent =
+            2 * max_rqkv + 2 * max_rvalue + 2 * cfg.num_v_heads();
+        const uint64_t attention =
+            max_q + max_k + max_v +
+            static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
+        const uint64_t phase = std::max({recurrent, attention, ffn});
+        const uint64_t main_elem_size =
+            bf16_main_ ? sizeof(uint16_t) : sizeof(float);
+        // h + shared attention/FFN output, FP32 norm, the largest phase
+        // workspace, plus worst-case lazy gate/up fallback allocations.
+        return 2 * static_cast<uint64_t>(cfg.n_embd) * main_elem_size +
+               static_cast<uint64_t>(cfg.n_embd) * sizeof(float) +
+               (phase + 2 * ffn) * sizeof(float);
+    }
+
     uint64_t per_tok = 0;
-    per_tok += 3 * cfg.n_embd;                                    // h, norm, attn_out
-    per_tok += 3 * std::max<uint64_t>(max_ffn, 1);                // ffn_gate, ffn_up, ffn_mid
-    per_tok += cfg.n_embd;                                        // ffn_out
-    if (max_rqkv  > 0) per_tok += 2 * max_rqkv;                   // proj, conv_out
-    if (max_rvalue> 0) per_tok += 2 * max_rvalue;                 // gate_proj, core
-    if (cfg.num_v_heads() > 0) per_tok += 2 * cfg.num_v_heads();  // alpha, beta
-    if (max_q > 0) per_tok += max_q;
-    if (max_k > 0) per_tok += max_k;
-    if (max_v > 0) per_tok += max_v;
-    per_tok += static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim; // mid
+    per_tok += 3 * cfg.n_embd;                     // h, norm, attn_out
+    per_tok += 3 * ffn;                            // gate, up, mid
+    per_tok += cfg.n_embd;                         // ffn_out
+    per_tok += 2 * max_rqkv;                       // proj, conv_out
+    per_tok += 2 * max_rvalue;                     // gate_proj, core
+    per_tok += 2 * cfg.num_v_heads();              // alpha, beta
+    per_tok += max_q + max_k + max_v;
+    per_tok += static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
     return per_tok * sizeof(float);
 }
 

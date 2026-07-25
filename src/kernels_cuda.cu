@@ -1017,6 +1017,7 @@ __device__ float fp16_to_f32_device(uint16_t h) {
 struct CudaTensor final : DeviceTensor {
     float *ptr = nullptr;
     std::string label;
+    bool owns_ptr = true;
     // Q8 KV-cache support: when q8_kv is true, `ptr` is reinterpreted as an
     // int8 quant plane and `scale` holds one fp16 scale per quant row (a row
     // is `q8_row_elems` int8 values sharing a single max-abs scale). Scales
@@ -1068,8 +1069,32 @@ struct CudaTensor final : DeviceTensor {
             }
         }
     }
+    CudaTensor(CudaTensor &storage,
+               uint64_t byte_offset,
+               uint64_t n,
+               uint32_t elem_bytes,
+               DeviceTensorDType storage_dtype,
+               const char *name) {
+        if (elem_bytes == 0) {
+            throw std::invalid_argument("CUDA tensor view element size is zero");
+        }
+        const uint64_t storage_bytes =
+            storage.count * static_cast<uint64_t>(storage.elem_size);
+        const uint64_t view_bytes = n * static_cast<uint64_t>(elem_bytes);
+        if (byte_offset > storage_bytes ||
+            view_bytes > storage_bytes - byte_offset) {
+            throw std::out_of_range("CUDA tensor view exceeds backing storage");
+        }
+        count = n;
+        elem_size = elem_bytes;
+        dtype = storage_dtype;
+        label = name ? name : "tensor_view";
+        ptr = reinterpret_cast<float *>(
+            reinterpret_cast<uint8_t *>(storage.ptr) + byte_offset);
+        owns_ptr = false;
+    }
     ~CudaTensor() override {
-        if (ptr) cudaFree(ptr);
+        if (ptr && owns_ptr) cudaFree(ptr);
         if (scale) cudaFree(scale);
     }
     // Attach a Q8 scale plane. `n` int8 elements grouped into rows of
@@ -6476,6 +6501,23 @@ public:
     std::unique_ptr<DeviceTensor> scratch_f32(uint64_t count, const char *label) override {
         return std::make_unique<CudaTensor>(count, label, sizeof(float),
                                             /*zero_initialize=*/false);
+    }
+
+    bool supports_tensor_views() const override { return true; }
+
+    std::unique_ptr<DeviceTensor> tensor_view(
+            DeviceTensor &storage,
+            uint64_t byte_offset,
+            uint64_t count,
+            uint32_t elem_size,
+            DeviceTensorDType dtype,
+            const char *label) override {
+        auto &backing = as_tensor(storage);
+        if (backing.q8_kv || backing.fp8_kv || backing.scale) {
+            return nullptr;
+        }
+        return std::make_unique<CudaTensor>(
+            backing, byte_offset, count, elem_size, dtype, label);
     }
 
     std::unique_ptr<HostBuffer> host_buffer(uint64_t bytes,
