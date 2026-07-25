@@ -580,7 +580,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        bool *plan_cache_hit_out);
 
 bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         float *out,
@@ -606,7 +607,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        bool *plan_cache_hit_out);
 
 bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
         float *out,
@@ -9715,6 +9717,7 @@ public:
                 !st.ok) {
                 return st;
             }
+            bool plan_cache_hit = false;
             const bool launched = kc.is_fp8_kv()
                 ? flashinfer_adapter::launch_batch_prefill_paged_f16q_fp8kv_gated(
                     o.ptr,
@@ -9730,7 +9733,7 @@ public:
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
-                    scale, exec_stream_)
+                    scale, exec_stream_, &plan_cache_hit)
                 : flashinfer_adapter::launch_batch_prefill_paged_f16q_f16kv_gated(
                     o.ptr,
                     flashinfer_batch_prefill_q_f16_,
@@ -9745,11 +9748,17 @@ public:
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
-                    scale, exec_stream_);
+                    scale, exec_stream_, &plan_cache_hit);
             if (launched) {
-                if (auto st = record_flashinfer_batch_prefill_host_workspace();
-                    !st.ok) {
-                    return st;
+                // A cache hit does not read or write the acquired host plan
+                // buffer. Leave it immediately reusable instead of fencing it
+                // behind this layer's entire attention launch.
+                if (!plan_cache_hit) {
+                    if (auto st =
+                            record_flashinfer_batch_prefill_host_workspace();
+                        !st.ok) {
+                        return st;
+                    }
                 }
                 return launch_status("cuda attention_prefill_batch flashinfer paged gated");
             }

@@ -17,6 +17,13 @@ KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
 KVMEM_BUDGET=${KVMEM_BUDGET:-229376}
 GEN_BUDGET=${GEN_BUDGET:-32768}
 KV_DTYPE=${KV_DTYPE:-fp16}
+if [[ -z "${PREFILL_CHUNK:-}" ]]; then
+  if [[ "$KV_DTYPE" == "fp8" ]]; then
+    PREFILL_CHUNK=8192
+  else
+    PREFILL_CHUNK=2048
+  fi
+fi
 TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_opt1_20260723}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
@@ -33,6 +40,10 @@ METHOD=${METHOD:-kvmem_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_$
 
 if [[ "$KV_DTYPE" != "fp16" && "$KV_DTYPE" != "fp8" ]]; then
   echo "KV_DTYPE must be fp16 or fp8, got: $KV_DTYPE" >&2
+  exit 2
+fi
+if [[ ! "$PREFILL_CHUNK" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PREFILL_CHUNK must be a positive integer, got: $PREFILL_CHUNK" >&2
   exit 2
 fi
 
@@ -104,7 +115,7 @@ env \
     --kvmem-optimization-level "$KVMEM_OPT_LEVEL" \
     "${tier_args[@]}" \
     --enable-thinking --thinking-budget 4096 \
-    --prefill-chunk 2048 --temp 0.6 \
+    --prefill-chunk "$PREFILL_CHUNK" --temp 0.6 \
     --native-mtp-speculate --mtp-chain 4 \
     --host 127.0.0.1 --port "$PORT" \
     >"$SERVER_LOG" 2>&1 &

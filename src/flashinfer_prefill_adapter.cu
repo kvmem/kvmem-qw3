@@ -8,6 +8,8 @@
 #include <flashinfer/pos_enc.cuh>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 
@@ -146,6 +148,63 @@ bool run_prefill_typed(
 
 constexpr uint32_t kPagedPrefillPrefixI32 = 16;
 
+bool paged_prefill_plan_cache_enabled() {
+    const char *env = std::getenv("QW3_FLASHINFER_PLAN_CACHE");
+    return env == nullptr ||
+           (std::strcmp(env, "0") != 0 &&
+            std::strcmp(env, "false") != 0 &&
+            std::strcmp(env, "off") != 0);
+}
+
+// Every normal-attention layer in one prefill chunk has the same scheduling
+// shape and shares the same persistent FlashInfer workspaces. PrefillPlan is
+// independent of the actual K/V page IDs, but the old path rebuilt and
+// re-uploaded that identical plan once per layer. Cache only an immediately
+// reusable workspace/shape tuple; a changed chunk length, KV-page count,
+// workspace, stream, or dtype instantiation is a miss and replans normally.
+struct PagedPrefillPlanCache {
+    bool valid = false;
+    int32_t *int_workspace = nullptr;
+    size_t int_workspace_bytes = 0;
+    float *requested_float_workspace = nullptr;
+    size_t requested_float_workspace_bytes = 0;
+    float *active_float_workspace = nullptr;
+    size_t active_float_workspace_bytes = 0;
+    cudaStream_t stream = nullptr;
+    uint32_t batch = 0;
+    uint32_t need_pages = 0;
+    uint32_t n_heads = 0;
+    uint32_t n_kv_heads = 0;
+    uint32_t head_dim = 0;
+    uint32_t page_size = 0;
+    bool allow_split_kv = false;
+    uint64_t consecutive_hits = 0;
+    uint64_t total_hits = 0;
+    uint64_t total_misses = 0;
+    flashinfer::PrefillPlanInfo plan_info;
+
+    bool matches(
+            int32_t *iw, size_t iw_bytes,
+            float *fw, size_t fw_bytes, cudaStream_t s,
+            uint32_t b, uint32_t pages, uint32_t nh,
+            uint32_t nkh, uint32_t hd, uint32_t ps,
+            bool allow_split) const {
+        return valid &&
+               int_workspace == iw &&
+               int_workspace_bytes == iw_bytes &&
+               requested_float_workspace == fw &&
+               requested_float_workspace_bytes == fw_bytes &&
+               stream == s &&
+               batch == b &&
+               need_pages == pages &&
+               n_heads == nh &&
+               n_kv_heads == nkh &&
+               head_dim == hd &&
+               page_size == ps &&
+               allow_split_kv == allow_split;
+    }
+};
+
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, typename Params, typename Variant>
 cudaError_t dispatch_batch_prefill_paged(Params params,
                                          typename Params::DTypeO *tmp_v,
@@ -186,7 +245,9 @@ bool run_batch_prefill_paged_typed(
         float scale,
         cudaStream_t stream,
         unsigned &threads_out,
-        unsigned &blocks_out) {
+        unsigned &blocks_out,
+        bool *plan_cache_hit_out) {
+    if (plan_cache_hit_out) *plan_cache_hit_out = false;
     if (out == nullptr || q_f16 == nullptr || o_f16 == nullptr ||
         int_workspace == nullptr || host_int_workspace == nullptr ||
         q == nullptr || k_cache == nullptr || v_cache == nullptr ||
@@ -245,6 +306,16 @@ bool run_batch_prefill_paged_typed(
         (float_workspace != nullptr && float_workspace_bytes > 0);
     float *active_float_workspace = float_workspace;
     size_t active_float_workspace_bytes = float_workspace_bytes;
+    static thread_local PagedPrefillPlanCache plan_cache;
+    const bool use_plan_cache = paged_prefill_plan_cache_enabled();
+    const bool plan_cache_hit =
+        use_plan_cache &&
+        plan_cache.matches(
+            int_workspace, int_workspace_bytes,
+            float_workspace, float_workspace_bytes, stream,
+            batch, need_pages, n_heads, n_kv_heads, head_dim,
+            page_size, allow_split_kv);
+    if (plan_cache_hit_out) *plan_cache_hit_out = plan_cache_hit;
     auto plan = [&](bool disable_split_kv) {
         return flashinfer::PrefillPlan<int32_t>(
             disable_split_kv ? nullptr : active_float_workspace,
@@ -270,23 +341,68 @@ bool run_batch_prefill_paged_typed(
             0,
             stream);
     };
-    cudaError_t plan_st = cudaErrorInvalidValue;
-    try {
-        plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
-    } catch (const std::exception &) {
-        // FlashInfer's aligned workspace allocator throws when a requested
-        // split plan does not fit. Correctness does not require splitting:
-        // retry with the non-split planner instead of failing the request.
-        active_float_workspace = nullptr;
-        active_float_workspace_bytes = 0;
-        plan_info = {};
+    if (plan_cache_hit) {
+        ++plan_cache.consecutive_hits;
+        ++plan_cache.total_hits;
+        plan_info = plan_cache.plan_info;
+        active_float_workspace = plan_cache.active_float_workspace;
+        active_float_workspace_bytes =
+            plan_cache.active_float_workspace_bytes;
+    } else {
+        if (plan_cache.valid &&
+            std::getenv("QW3_FLASHINFER_PLAN_CACHE_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[flashinfer-plan-cache] tkv_bytes=%zu hits=%llu "
+                "total_hits=%llu total_misses=%llu batch=%u pages=%u\n",
+                sizeof(TKV),
+                static_cast<unsigned long long>(
+                    plan_cache.consecutive_hits),
+                static_cast<unsigned long long>(plan_cache.total_hits),
+                static_cast<unsigned long long>(
+                    plan_cache.total_misses),
+                plan_cache.batch, plan_cache.need_pages);
+        }
+        plan_cache.consecutive_hits = 0;
+        ++plan_cache.total_misses;
+        cudaError_t plan_st = cudaErrorInvalidValue;
         try {
-            plan_st = plan(/*disable_split_kv=*/true);
+            plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
         } catch (const std::exception &) {
-            return false;
+            // FlashInfer's aligned workspace allocator throws when a requested
+            // split plan does not fit. Correctness does not require splitting:
+            // retry with the non-split planner instead of failing the request.
+            active_float_workspace = nullptr;
+            active_float_workspace_bytes = 0;
+            plan_info = {};
+            try {
+                plan_st = plan(/*disable_split_kv=*/true);
+            } catch (const std::exception &) {
+                return false;
+            }
+        }
+        if (plan_st != cudaSuccess) return false;
+        if (use_plan_cache) {
+            plan_cache.valid = true;
+            plan_cache.int_workspace = int_workspace;
+            plan_cache.int_workspace_bytes = int_workspace_bytes;
+            plan_cache.requested_float_workspace = float_workspace;
+            plan_cache.requested_float_workspace_bytes =
+                float_workspace_bytes;
+            plan_cache.active_float_workspace = active_float_workspace;
+            plan_cache.active_float_workspace_bytes =
+                active_float_workspace_bytes;
+            plan_cache.stream = stream;
+            plan_cache.batch = batch;
+            plan_cache.need_pages = need_pages;
+            plan_cache.n_heads = n_heads;
+            plan_cache.n_kv_heads = n_kv_heads;
+            plan_cache.head_dim = head_dim;
+            plan_cache.page_size = page_size;
+            plan_cache.allow_split_kv = allow_split_kv;
+            plan_cache.plan_info = plan_info;
         }
     }
-    if (plan_st != cudaSuccess) return false;
 
     int32_t *q_indptr_d = int_workspace;
     int32_t *page_indptr_d = int_workspace + 2;
@@ -631,12 +747,11 @@ bool launch_prefill_f16q_fp8kv(
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream) {
     unsigned threads = 0, blocks = 0;
-    if (!run_prefill_typed<half, __nv_fp8_e4m3, half>(
-            q_f16, o_f16, q, q_stride, k_cache, v_cache,
-            n_heads, n_kv_heads, head_dim, batch, base_seq_len,
-            q_batch_stride, scale, stream, threads, blocks)) {
-        return false;
-    }
+    const bool launched = run_prefill_typed<half, __nv_fp8_e4m3, half>(
+        q_f16, o_f16, q, q_stride, k_cache, v_cache,
+        n_heads, n_kv_heads, head_dim, batch, base_seq_len,
+        q_batch_stride, scale, stream, threads, blocks);
+    if (!launched) return false;
     if (batch == 0) return true;
     unpack_kernel<half><<<blocks, threads, 0, stream>>>(
         out, o_f16, batch, n_heads, head_dim, out_batch_stride);
@@ -667,14 +782,16 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        bool *plan_cache_hit_out) {
     unsigned threads = 0, blocks = 0;
     if (!run_batch_prefill_paged_typed<half>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
             int_workspace_bytes, float_workspace, float_workspace_bytes,
             q, q_stride, k_cache, v_cache, page_indices,
             n_pages, page_size, n_heads, n_kv_heads, head_dim, base_seq_len,
-            batch, q_batch_stride, out_batch_stride, scale, stream, threads, blocks)) {
+            batch, q_batch_stride, out_batch_stride, scale, stream, threads,
+            blocks, plan_cache_hit_out)) {
         return false;
     }
     unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
@@ -707,16 +824,19 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        bool *plan_cache_hit_out) {
     unsigned threads = 0, blocks = 0;
-    if (!run_batch_prefill_paged_typed<__nv_fp8_e4m3>(
+    if (plan_cache_hit_out) *plan_cache_hit_out = false;
+    const bool launched =
+        run_batch_prefill_paged_typed<__nv_fp8_e4m3>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
             int_workspace_bytes, float_workspace, float_workspace_bytes,
             q, q_stride, k_cache, v_cache, page_indices,
-            n_pages, page_size, n_heads, n_kv_heads, head_dim, base_seq_len,
-            batch, q_batch_stride, out_batch_stride, scale, stream, threads, blocks)) {
-        return false;
-    }
+            n_pages, page_size, n_heads, n_kv_heads, head_dim,
+            base_seq_len, batch, q_batch_stride, out_batch_stride,
+            scale, stream, threads, blocks, plan_cache_hit_out);
+    if (!launched) return false;
     unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
         out, o_f16, q, q_stride, batch, n_heads, head_dim,
         q_batch_stride, out_batch_stride);

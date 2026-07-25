@@ -284,6 +284,13 @@ public:
                                   const std::vector<uint32_t> &context_block_ids,
                                   bool reset_recurrent_state = false);
     void kvmem_end_query_replay();
+    // Use otherwise-idle generation-reserve pages to bring a bounded set of
+    // CPU-resident, historically hot blocks back to GPU while the first-pass
+    // query suffix is being prefetched.  This is advisory only: semantic
+    // selection still scores every source block and non-hits are released from
+    // their clean inclusive backing.  The replay suffix size is used to reserve
+    // enough pages for its ordinary prefill.
+    void kvmem_start_query_prefetch(uint32_t replay_suffix_tokens);
     // ARCHIVED (2026-07-23): diagnostic DeltaNet state interchange. Retained
     // below only as source history; it is not part of the compiled executor API.
 #if 0
@@ -785,6 +792,11 @@ private:
     bool kvmem_active_ = false;
     bool kvmem_immutable_source_k_ = false;
     bool kvmem_mtp_local_positions_ = false;
+    // Opt3 incremental MTP assembly: retained blocks follow the same bounded
+    // in-place re-RoPE policy as main K; cold/periodic-refresh blocks still
+    // rebuild exactly from immutable raw K. Environment-off switch preserves
+    // the all-raw-rebuild compatibility path.
+    bool kvmem_mtp_incremental_assembly_ = false;
     bool kvmem_defer_prefill_pressure_ = false;
     uint32_t kvmem_deferred_prefill_tokens_ = 0;
     std::unique_ptr<KvMemStore> block_store_;
@@ -982,6 +994,10 @@ private:
         std::deque<KvMemPrefetchNvmeBatch> nvme_batches;
         KvMemPrefetchPerf perf;
     };
+    bool kvmem_query_prefetch_enabled_ = false;
+    bool kvmem_query_prefetch_active_ = false;
+    std::vector<uint32_t> kvmem_query_prefetch_blocks_;
+    uint64_t kvmem_query_prefetch_start_ns_ = 0;
     struct KvMemStageOutPerf {
         uint64_t total_ns = 0;
         uint64_t canonicalize_and_d2h_ns = 0;

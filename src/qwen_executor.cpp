@@ -832,6 +832,9 @@ void QwenExecutor::reset_state() {
     kvmem_active_ = false;
     kvmem_registered_pos_ = 0;
     kvmem_query_replay_active_ = false;
+    kvmem_query_prefetch_active_ = false;
+    kvmem_query_prefetch_blocks_.clear();
+    kvmem_query_prefetch_start_ns_ = 0;
     kvmem_keep_selected_prefill_ = false;
     kvmem_defer_prefill_pressure_ = false;
     kvmem_deferred_prefill_tokens_ = 0;
@@ -4689,6 +4692,136 @@ void QwenExecutor::kvmem_end_query_replay() {
     }
 }
 
+void QwenExecutor::kvmem_start_query_prefetch(
+        uint32_t replay_suffix_tokens) {
+    auto trace_skip = [&](const char *reason) {
+        if (kvmem_perf_trace_flag() || std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[kvmem-query-prefetch] phase=skip reason=%s "
+                "enabled=%d prefetch_active=%d pending_reselect=%d "
+                "suffix_tokens=%u\n",
+                reason, kvmem_query_prefetch_enabled_ ? 1 : 0,
+                kvmem_prefetch_.active ? 1 : 0,
+                kvmem_pending_reselect_ ? 1 : 0,
+                replay_suffix_tokens);
+        }
+    };
+    if (!kvmem_query_prefetch_enabled_ || !block_store_ ||
+        !kvmem_gpu_page_pool_ || !kvmem_cpu_tier_ ||
+        kvmem_prefetch_.active || kvmem_pending_reselect_ ||
+        replay_suffix_tokens == 0) {
+        trace_skip("prerequisite");
+        return;
+    }
+
+    const KvMemStoreConfig &cfg = block_store_->config();
+    const uint32_t page_size = std::max<uint32_t>(1, kv_pages_.page_size);
+    const uint32_t pages_per_block =
+        std::max<uint32_t>(1, cfg.block_tokens / page_size);
+    uint32_t free_pages = kvmem_gpu_page_pool_->free_pages();
+    if (kvmem_mtp_gpu_page_pool_) {
+        free_pages = std::min(
+            free_pages, kvmem_mtp_gpu_page_pool_->free_pages());
+    }
+    // The suffix is appended after prefetch starts. Keep all of its pages plus
+    // one full block as allocator slack; speculative pages may use only the
+    // remaining generation reserve.
+    const uint32_t suffix_pages =
+        (replay_suffix_tokens + page_size - 1) / page_size;
+    const uint64_t reserve_pages =
+        static_cast<uint64_t>(suffix_pages) + pages_per_block;
+    if (free_pages <= reserve_pages) {
+        trace_skip("no_generation_reserve_pages");
+        return;
+    }
+    uint32_t candidate_page_budget =
+        free_pages - static_cast<uint32_t>(reserve_pages);
+    const uint32_t max_blocks = std::max<uint32_t>(
+        1, env_uint32_or("QW3_KVMEM_QUERY_PREFETCH_BLOCKS", 512));
+
+    struct Candidate {
+        uint32_t block_id = 0;
+        double score = 0.0;
+    };
+    std::vector<Candidate> ranked;
+    const auto &blocks = block_store_->blocks();
+    ranked.reserve(blocks.size());
+    for (const KvMemBlock &b : blocks) {
+        if (b.tier != KvTier::CPU || b.cpu_slot < 0 ||
+            kvmem_block_pages_resident(b)) {
+            continue;
+        }
+        // profile_score is query-independent and therefore available before
+        // the first-pass query has produced its semantic mean-K score. The
+        // recency tie-break makes the choice deterministic when no heat has
+        // yet been accumulated.
+        ranked.push_back(Candidate{b.block_id, b.profile_score});
+    }
+    std::sort(
+        ranked.begin(), ranked.end(),
+        [](const Candidate &a, const Candidate &b) {
+            if (a.score != b.score) return a.score > b.score;
+            return a.block_id > b.block_id;
+        });
+
+    KvMemPlan advisory;
+    advisory.remaps.reserve(
+        std::min<size_t>(ranked.size(), max_blocks));
+    for (const Candidate &candidate : ranked) {
+        if (advisory.remaps.size() >= max_blocks) break;
+        const KvMemBlock &block = blocks[candidate.block_id];
+        const uint32_t first_page = block.orig_pos_start / page_size;
+        const uint32_t last_page =
+            (block.orig_pos_start + block.n_tokens - 1) / page_size;
+        const uint32_t block_pages = last_page - first_page + 1;
+        if (block_pages > candidate_page_budget) continue;
+        candidate_page_budget -= block_pages;
+        KvMemRemap rm;
+        rm.block_id = candidate.block_id;
+        rm.n_tokens = block.n_tokens;
+        advisory.remaps.push_back(rm);
+    }
+    if (advisory.remaps.empty()) {
+        trace_skip(ranked.empty()
+                       ? "no_cpu_candidates"
+                       : "candidate_page_budget");
+        return;
+    }
+
+    kvmem_query_prefetch_blocks_.clear();
+    kvmem_query_prefetch_blocks_.reserve(advisory.remaps.size());
+    for (const KvMemRemap &rm : advisory.remaps) {
+        kvmem_query_prefetch_blocks_.push_back(rm.block_id);
+    }
+    kvmem_query_prefetch_start_ns_ = kvmem_steady_ns();
+    kvmem_query_prefetch_active_ = true;
+    try {
+        kvmem_start_prefetch(advisory);
+        // Ordinary semantic stage-in defers CPU gathering so a separate
+        // assembly worker can start first. Here the overlap partner is the
+        // upcoming query prefill, so enqueue the bounded first two slabs now.
+        if (kvmem_prefetch_.bulk_cpu &&
+            !kvmem_prefetch_.cpu_reads.empty()) {
+            kvmem_submit_prefetch_cpu_batches();
+        }
+    } catch (...) {
+        kvmem_query_prefetch_active_ = false;
+        kvmem_query_prefetch_blocks_.clear();
+        kvmem_query_prefetch_start_ns_ = 0;
+        throw;
+    }
+    if (kvmem_perf_trace_flag() || std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(
+            stderr,
+            "[kvmem-query-prefetch] phase=start candidates=%zu "
+            "suffix_tokens=%u free_pages=%u reserved_pages=%llu\n",
+            kvmem_query_prefetch_blocks_.size(), replay_suffix_tokens,
+            free_pages,
+            static_cast<unsigned long long>(reserve_pages));
+    }
+}
+
 // ARCHIVED (2026-07-23): the DeltaNet recurrent-state artifact implementation
 // was used only by the frozen LongMemEval-M rebuilt-state diagnostic. The public
 // request entry is disabled in qw3_server.cpp; compile this implementation out
@@ -4990,6 +5123,12 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_free_stageout_slabs_.clear();
     kvmem_free_read_slabs_.clear();
     kvmem_prefill_writeback_enabled_ = false;
+    kvmem_query_prefetch_enabled_ = false;
+    kvmem_query_prefetch_active_ = false;
+    kvmem_query_prefetch_blocks_.clear();
+    kvmem_query_prefetch_start_ns_ = 0;
+    kvmem_inclusive_cpu_backing_ = false;
+    kvmem_mtp_incremental_assembly_ = false;
     kvmem_writeback_slab_count_ = 0;
     kvmem_read_slab_count_ = 0;
     kvmem_writeback_next_block_ = 0;
@@ -5145,6 +5284,10 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_mtp_local_positions_ =
         kvmem_immutable_source_k_ && mtp_will_tier &&
         kvmem_mtp_local_positions_enabled();
+    kvmem_mtp_incremental_assembly_ =
+        kvmem_mtp_local_positions_ &&
+        effective.optimization_level >= KvMemOptimizationLevel::Opt3 &&
+        env_flag_enabled("QW3_KVMEM_MTP_INCREMENTAL_ASSEMBLY", true);
     if (kvmem_mtp_local_positions_ && model_cfg.n_ctx_train > 0 &&
         static_cast<uint64_t>(effective.select_budget) +
                 effective.gen_budget >
@@ -5389,6 +5532,9 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_cpu_bytes_.reset();
     kvmem_stage_pinned_.reset();
     kvmem_prefetch_ = KvMemPrefetchState{};
+    kvmem_query_prefetch_active_ = false;
+    kvmem_query_prefetch_blocks_.clear();
+    kvmem_query_prefetch_start_ns_ = 0;
     kvmem_pending_reselect_ = false;
     kvmem_pending_plan_ = KvMemPlan{};
     kvmem_registered_pos_ = 0;
@@ -5715,6 +5861,16 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         }
     }
     kvmem_stagein_assembly_overlap_active_ = false;
+    kvmem_query_prefetch_enabled_ =
+        pipelined_h2d &&
+        kvmem_inclusive_cpu_backing_ &&
+        kvmem_gpu_page_pool_ != nullptr &&
+        kvmem_cpu_tier_ != nullptr &&
+        // Query-first-pass prefetch is advisory and workload-dependent. On the
+        // 512K profile it hid its own 144 ms, but 197/410 transferred blocks
+        // were unused and ordinary stage-in was already hidden by raw-K
+        // assembly, so enabling it by default only increased PCIe/CPU traffic.
+        env_flag_enabled("QW3_KVMEM_QUERY_PREFETCH", false);
     const bool proactive_cpu_writeback =
         async_d2h &&
         !has_ssd &&
@@ -5734,6 +5890,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         "cpu_gather_threads=%zu cpu_stageout_threads=%zu "
         "persistent_cpu_pool=%d persistent_cpu_workers=%zu "
         "stagein_assembly_overlap=%d overlap_cpu_workers=%u "
+        "mtp_incremental_assembly=%d query_prefetch=%d "
         "implemented_max=opt_3\n",
         kvmem_optimization_level_name(effective.optimization_level),
         effective.optimization_level >= KvMemOptimizationLevel::Opt1
@@ -5759,7 +5916,9 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             ? static_cast<unsigned>(
                   kvmem_cpu_gather_threads() +
                   kvmem_overlap_stagein_threads())
-            : 0u);
+            : 0u,
+        kvmem_mtp_incremental_assembly_ ? 1 : 0,
+        kvmem_query_prefetch_enabled_ ? 1 : 0);
     if (kvmem_prefill_writeback_enabled_) {
         const uint64_t warm0 = kvmem_steady_ns();
         const size_t slab_bytes = kvmem_io_slab_bytes();
@@ -6039,7 +6198,7 @@ void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
     // headroom for the replacement suffix; a pressure reselect here would
     // silently replace that fixed selection with sink+recent and invalidate the
     // controlled experiment.
-    if (kvmem_query_replay_active_) return;
+    if (kvmem_query_replay_active_ || kvmem_query_prefetch_active_) return;
     if (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) return;
     const KvMemStoreConfig &cfg = block_store_->config();
     if (cfg.estimated_block_bytes == 0 || cfg.block_tokens == 0) return;
@@ -8928,6 +9087,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     // independent of how often the block was selected or spilled. The legacy
     // path below retains the MTP-specific baked-position bookkeeping.
     uint32_t mtp_rebuild_blocks = 0;
+    uint32_t mtp_inplace_blocks = 0;
     if (build_mtp_window && kvmem_mtp_local_positions_) {
         kvmem_sync_mtp_baked_pos();
         std::vector<uint8_t> newly_selected(blocks.size(), 0);
@@ -8936,19 +9096,85 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
         }
         KvMemPlan mtp_rebuild_plan;
         mtp_rebuild_plan.remaps.reserve(plan.remaps.size());
+        // Raw MTP materialization uses the persistent bs_mtp_remap_* vectors
+        // as its own per-batch scratch. Keep the incremental lists local until
+        // that path completes, then publish them for the in-place launch.
+        std::vector<int32_t> mtp_incremental_to;
+        std::vector<int32_t> mtp_incremental_from;
+        std::vector<int32_t> mtp_incremental_ntok;
+        mtp_incremental_to.reserve(plan.remaps.size());
+        mtp_incremental_from.reserve(plan.remaps.size());
+        mtp_incremental_ntok.reserve(plan.remaps.size());
+        uint32_t max_mtp_block_tokens = 0;
         for (const KvMemRemap &rm : plan.remaps) {
-            const bool needs_rebuild =
-                rm.block_id >= mtp_baked_pos_.size() ||
+            const int64_t mtp_from = mtp_baked_pos_[rm.block_id];
+            if (mtp_from == static_cast<int64_t>(rm.to_base)) continue;
+            const bool source_out_of_range =
+                cfg.n_ctx_train > 0 &&
+                (mtp_from < 0 ||
+                 static_cast<uint64_t>(mtp_from) + rm.n_tokens >
+                     cfg.n_ctx_train);
+            const bool exact_rebuild =
+                !kvmem_mtp_incremental_assembly_ ||
+                kvmem_no_rerope_ ||
                 newly_selected[rm.block_id] ||
-                mtp_baked_pos_[rm.block_id] !=
-                    static_cast<int64_t>(rm.to_base);
-            if (needs_rebuild) {
+                rm.raw_refresh ||
+                source_out_of_range;
+            if (exact_rebuild) {
                 mtp_rebuild_plan.remaps.push_back(rm);
+                continue;
             }
+            trace_rope_position_if_out_of_range(
+                "kvmem_assemble.mtp_incremental.from", mtp_from,
+                rm.n_tokens, cfg.n_ctx_train);
+            trace_rope_position_if_out_of_range(
+                "kvmem_assemble.mtp_incremental.to", rm.to_base,
+                rm.n_tokens, cfg.n_ctx_train);
+            mtp_incremental_to.push_back(rm.to_base);
+            mtp_incremental_from.push_back(
+                static_cast<int32_t>(mtp_from));
+            mtp_incremental_ntok.push_back(
+                static_cast<int32_t>(rm.n_tokens));
+            max_mtp_block_tokens =
+                std::max(max_mtp_block_tokens, rm.n_tokens);
         }
         mtp_rebuild_blocks =
             static_cast<uint32_t>(mtp_rebuild_plan.remaps.size());
         kvmem_materialize_raw_mtp_k(mtp_rebuild_plan);
+        bs_mtp_remap_to_host_ = std::move(mtp_incremental_to);
+        bs_mtp_remap_from_host_ = std::move(mtp_incremental_from);
+        bs_mtp_remap_ntok_host_ = std::move(mtp_incremental_ntok);
+        mtp_inplace_blocks =
+            static_cast<uint32_t>(bs_mtp_remap_to_host_.size());
+        if (mtp_inplace_blocks > 0) {
+            if (mtp_inplace_blocks > bs_mtp_remap_capacity_) {
+                bs_mtp_remap_capacity_ = mtp_inplace_blocks;
+                bs_mtp_remap_to_dev_ = backend_.tensor_i32(
+                    bs_mtp_remap_capacity_, "bs_mtp_remap_to");
+                bs_mtp_remap_from_dev_ = backend_.tensor_i32(
+                    bs_mtp_remap_capacity_, "bs_mtp_remap_from");
+                bs_mtp_remap_ntok_dev_ = backend_.tensor_i32(
+                    bs_mtp_remap_capacity_, "bs_mtp_remap_ntok");
+            }
+            require_status(backend_.copy_i32_from_host(
+                *bs_mtp_remap_to_dev_, 0, bs_mtp_remap_to_host_.data(),
+                mtp_inplace_blocks));
+            require_status(backend_.copy_i32_from_host(
+                *bs_mtp_remap_from_dev_, 0,
+                bs_mtp_remap_from_host_.data(), mtp_inplace_blocks));
+            require_status(backend_.copy_i32_from_host(
+                *bs_mtp_remap_ntok_dev_, 0,
+                bs_mtp_remap_ntok_host_.data(), mtp_inplace_blocks));
+            require_status(
+                backend_.rope_block_remap_paged_batched_device(
+                    mtp_k_cache(), mtp_inplace_blocks,
+                    max_mtp_block_tokens, cfg.n_kv_heads, per_pos,
+                    cfg.head_dim, cfg.rope_dim, *bs_mtp_remap_to_dev_,
+                    *bs_mtp_remap_from_dev_, *bs_mtp_remap_ntok_dev_,
+                    *mtp_window_pages_device_, page_size, cfg.rope_theta,
+                    kvmem_rope_sincos_.get(),
+                    kvmem_rope_table_positions_));
+        }
         for (const KvMemRemap &rm : plan.remaps) {
             mtp_baked_pos_[rm.block_id] = static_cast<int64_t>(rm.to_base);
         }
@@ -9033,7 +9259,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 "raw_gather_ms=%.3f raw_h2d_submit_ms=%.3f "
                 "raw_h2d_wait_ms=%.3f raw_bytes=%llu raw_batches=%u "
                 "raw_refresh_blocks=%zu inplace_blocks=%u "
-                "mtp_blocks=%u\n",
+                "mtp_blocks=%u mtp_inplace_blocks=%u\n",
                 kvmem_raw_pipeline_enabled_
                     ? "pipeline"
                     : (kvmem_rope_sincos_ ? "table" : "legacy"),
@@ -9047,7 +9273,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 static_cast<unsigned long long>(
                     kvmem_assembly_raw_bytes_),
                 kvmem_assembly_raw_batches_, raw_refreshes.size(), n_moved,
-                mtp_rebuild_blocks);
+                mtp_rebuild_blocks, mtp_inplace_blocks);
         }
     }
 }
@@ -9110,6 +9336,20 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     if (block_store_->block_count() == 0) return 0;
     if (kvmem_pending_reselect_) {
         throw std::runtime_error("KVMem reselect already prepared");
+    }
+    const bool had_query_prefetch = kvmem_query_prefetch_active_;
+    const uint64_t query_prefetch_start_ns =
+        kvmem_query_prefetch_start_ns_;
+    if (had_query_prefetch) {
+        try {
+            kvmem_finish_prefetch();
+        } catch (...) {
+            kvmem_query_prefetch_active_ = false;
+            kvmem_query_prefetch_blocks_.clear();
+            kvmem_query_prefetch_start_ns_ = 0;
+            throw;
+        }
+        kvmem_query_prefetch_active_ = false;
     }
     const bool perf_trace = kvmem_perf_trace_flag();
     if (perf_trace) {
@@ -9229,6 +9469,33 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     }
     kvmem_pending_plan_ =
         block_store_->set_selection(kvmem_selection_with_pin());
+    if (had_query_prefetch) {
+        uint32_t hits = 0;
+        for (uint32_t id : kvmem_query_prefetch_blocks_) {
+            if (id < block_store_->block_count() &&
+                block_store_->blocks()[id].in_working_set) {
+                ++hits;
+            }
+        }
+        if (perf_trace || std::getenv("QW3_KVMEM_TRACE")) {
+            const double elapsed_ms =
+                query_prefetch_start_ns > 0
+                    ? (kvmem_steady_ns() - query_prefetch_start_ns) / 1.0e6
+                    : 0.0;
+            std::fprintf(
+                stderr,
+                "[kvmem-query-prefetch] phase=finish candidates=%zu "
+                "hits=%u hit_rate=%.6f elapsed_ms=%.3f\n",
+                kvmem_query_prefetch_blocks_.size(), hits,
+                kvmem_query_prefetch_blocks_.empty()
+                    ? 0.0
+                    : static_cast<double>(hits) /
+                          kvmem_query_prefetch_blocks_.size(),
+                elapsed_ms);
+        }
+        kvmem_query_prefetch_blocks_.clear();
+        kvmem_query_prefetch_start_ns_ = 0;
+    }
     if (kvmem_cpu_tier_ &&
         block_store_->config().optimization_level >=
             KvMemOptimizationLevel::Opt1) {

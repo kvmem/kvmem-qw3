@@ -82,7 +82,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        bool *plan_cache_hit_out);
 
 bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         float *out,
@@ -108,7 +109,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        bool *plan_cache_hit_out);
 
 bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
         float *out,

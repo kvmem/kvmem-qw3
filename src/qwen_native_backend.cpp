@@ -7785,6 +7785,9 @@ private:
                 do_prefill_range(prefill_begin, query_replay_begin);
             }
             executor_->capture_state(query_replay_ckpt);
+            executor_->kvmem_start_query_prefetch(
+                static_cast<uint32_t>(
+                    prompt_tokens.size() - query_replay_begin));
             do_prefill_range(query_replay_begin, prompt_tokens.size());
         } else if (do_boundary_capture) {
             // First segment [prefill_begin, split): advance recurrent state to B.
@@ -10287,12 +10290,19 @@ private:
                     do_prefill_range(0, replay_local);
                 }
                 executor_->capture_state(kvmem_query_replay_ckpt);
+                executor_->kvmem_start_query_prefetch(
+                    static_cast<uint32_t>(
+                        prefill_tokens.size() - replay_local));
                 do_prefill_range(replay_local,
                                  prefill_tokens.size());
             } else {
                 // The aligned boundary is in the previous request's trailing
                 // partial block. Its snapshot was restored from the API
                 // session checkpoint above; first-pass only the new fragment.
+                // That fragment is still useful overlap time for advisory
+                // stage-in, even though no new replay snapshot is needed here.
+                executor_->kvmem_start_query_prefetch(
+                    static_cast<uint32_t>(prefill_tokens.size()));
                 do_prefill_range(0, prefill_tokens.size());
             }
         } else {
