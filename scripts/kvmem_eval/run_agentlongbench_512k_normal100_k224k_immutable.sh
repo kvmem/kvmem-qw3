@@ -36,6 +36,7 @@ RUN_LOG=${RUN_LOG:-$LOG_ROOT/${TAG}_runner.log}
 PID_FILE=${PID_FILE:-$LOG_ROOT/${TAG}.pid}
 LIMIT=${LIMIT:-}
 EXPECTED=${EXPECTED:-${LIMIT:-100}}
+QUESTION_IDS=${QUESTION_IDS:-}
 METHOD=${METHOD:-kvmem_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_${KV_DTYPE}}
 BENCHMARK_NAME=${BENCHMARK_NAME:-AgentLongBench-512K-normal100}
 
@@ -65,12 +66,26 @@ if [[ "$NVME_GB" != "0" && "$NVME_GB" != "0.0" ]]; then
 fi
 
 limit_args=()
+if [[ -n "$LIMIT" && -n "$QUESTION_IDS" ]]; then
+  echo "LIMIT and QUESTION_IDS are mutually exclusive" >&2
+  exit 2
+fi
 if [[ -n "$LIMIT" ]]; then
   if [[ ! "$LIMIT" =~ ^[1-9][0-9]*$ ]] || (( LIMIT > 100 )); then
     echo "LIMIT must be an integer in [1, 100], got: $LIMIT" >&2
     exit 2
   fi
   limit_args+=(--limit "$LIMIT")
+fi
+if [[ -n "$QUESTION_IDS" ]]; then
+  IFS=',' read -r -a question_ids <<<"$QUESTION_IDS"
+  for question_id in "${question_ids[@]}"; do
+    if [[ -z "$question_id" ]]; then
+      echo "QUESTION_IDS contains an empty comma-separated ID" >&2
+      exit 2
+    fi
+    limit_args+=(--question-id "$question_id")
+  done
 fi
 if [[ ! "$EXPECTED" =~ ^[1-9][0-9]*$ ]] || (( EXPECTED > 100 )); then
   echo "EXPECTED must be an integer in [1, 100], got: $EXPECTED" >&2
