@@ -13,6 +13,35 @@ Historical shell scripts under `/data/chaidi/kvmem_eval` are retained unchanged
 for reproducing old results. New parameter sweeps should use this runner instead
 of copying those scripts.
 
+## Utility evaluation ledger
+
+Every accuracy run, including smoke tests, partial failures, rejudges, and
+derived retry/merge experiments, is indexed in
+[`docs/kvmem_utility_evaluation.md`](../../docs/kvmem_utility_evaluation.md).
+The accompanying
+[`docs/kvmem_utility_evaluation_registry.json`](../../docs/kvmem_utility_evaluation_registry.json)
+stores exact sample IDs, an ordered-ID fingerprint, parameters, result paths,
+and artifact type.
+
+An accuracy runner must preserve a unique tag, its exact `run_config.json`,
+dataset/manifest or selected sample IDs, raw answers, per-sample evaluation,
+summary, validation report, and server log. Rejudging never overwrites the
+original evaluation; derived retry merges and text-replay controls must identify
+their source artifacts.
+
+After every accuracy test, refresh and validate the ledger from the repository
+root:
+
+```bash
+python3 scripts/kvmem_eval/update_utility_evaluation.py
+python3 scripts/kvmem_eval/update_utility_evaluation.py --check
+```
+
+The Markdown and JSON files are generated. Add only curated labels or historical
+caveats to `scripts/kvmem_eval/utility_eval_overrides.json`; do not hand-edit
+generated rows. The scanner copies only whitelisted configuration fields, so API
+keys and arbitrary log contents cannot enter the registry.
+
 ## Storage optimization A/B levels
 
 The reusable runner exposes the storage optimization profile without changing
