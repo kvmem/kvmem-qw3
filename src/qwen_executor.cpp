@@ -1292,7 +1292,8 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
                     layer.attn_qkv, layer.attn_gate,
                     layer.ssm_alpha, layer.ssm_beta};
                 if (!backend_.can_defer_recurrent_projection_outputs(
-                        ws, 4, batch, cfg.num_k_heads(), cfg.num_v_heads(),
+                        ws, 4, *layer.attn_norm, bf16_main_, cfg.n_embd,
+                        batch, cfg.num_k_heads(), cfg.num_v_heads(),
                         cfg.head_k_dim(), cfg.head_v_dim_ssm(),
                         static_cast<uint32_t>(layer.recurrent_qkv_dim),
                         static_cast<uint32_t>(max_rqkv),
@@ -1499,31 +1500,33 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
     batch_capacity_ = batch;
 }
 
-void QwenExecutor::ensure_ffn_mid_batch_scratch() {
-    if (batch_capacity_ == 0 || ffn_batch_stride_ == 0) {
+void QwenExecutor::ensure_ffn_mid_batch_scratch(uint32_t active_batch) {
+    if (batch_capacity_ == 0 || active_batch == 0 ||
+        active_batch > batch_capacity_ || ffn_batch_stride_ == 0) {
         throw std::runtime_error(
             "FFN mid scratch requested before batch scratch");
     }
-    if (ffn_mid_batch_capacity_ >= batch_capacity_) return;
+    if (ffn_mid_batch_capacity_ >= active_batch) return;
 
     const uint64_t count =
-        static_cast<uint64_t>(batch_capacity_) * ffn_batch_stride_;
+        static_cast<uint64_t>(active_batch) * ffn_batch_stride_;
     ffn_mid_batch_ = backend_.tensor_f32(count, "ffn_mid_batch");
-    ffn_mid_batch_capacity_ = batch_capacity_;
+    ffn_mid_batch_capacity_ = active_batch;
 }
 
-void QwenExecutor::ensure_ffn_gate_up_batch_scratch() {
-    if (batch_capacity_ == 0 || ffn_batch_stride_ == 0) {
+void QwenExecutor::ensure_ffn_gate_up_batch_scratch(uint32_t active_batch) {
+    if (batch_capacity_ == 0 || active_batch == 0 ||
+        active_batch > batch_capacity_ || ffn_batch_stride_ == 0) {
         throw std::runtime_error(
             "FFN gate/up scratch requested before batch scratch");
     }
-    if (ffn_gate_up_batch_capacity_ >= batch_capacity_) return;
+    if (ffn_gate_up_batch_capacity_ >= active_batch) return;
 
     const uint64_t count =
-        static_cast<uint64_t>(batch_capacity_) * ffn_batch_stride_;
+        static_cast<uint64_t>(active_batch) * ffn_batch_stride_;
     ffn_gate_batch_ = backend_.tensor_f32(count, "ffn_gate_batch");
     ffn_up_batch_ = backend_.tensor_f32(count, "ffn_up_batch");
-    ffn_gate_up_batch_capacity_ = batch_capacity_;
+    ffn_gate_up_batch_capacity_ = active_batch;
 }
 
 void QwenExecutor::ensure_recurrent_materialization_batch_scratch(
@@ -2273,7 +2276,8 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 layer.ssm_alpha, layer.ssm_beta};
             if (compact_lazy_recurrent_arena_ &&
                 !backend_.can_defer_recurrent_projection_outputs(
-                    ws, 4, batch, num_k_heads, num_v_heads,
+                    ws, 4, *layer.attn_norm, bf16_main_, cfg.n_embd,
+                    batch, num_k_heads, num_v_heads,
                     head_k_dim, head_v_dim,
                     static_cast<uint32_t>(layer.recurrent_qkv_dim),
                     proj_stride, gate_proj_stride,
@@ -2561,7 +2565,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                     fused_ffn.message ? fused_ffn.message : "(unknown)");
                 traced_nvfp4_ffn_fallback = true;
             }
-            ensure_ffn_mid_batch_scratch();
+            ensure_ffn_mid_batch_scratch(batch);
             require_status(backend_.rms_norm_batch(
                 *norm_batch_, *h_batch_, *layer.ffn_norm,
                 batch, h_stride, eps));
@@ -2573,7 +2577,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 *ffn_mid_batch_, *layer.ffn_gate, *layer.ffn_up,
                 *norm_batch_, batch, h_stride, ffn_stride);
             if (!fused_swiglu.ok) {
-                ensure_ffn_gate_up_batch_scratch();
+                ensure_ffn_gate_up_batch_scratch(batch);
                 require_status(backend_.q8_0_matmul(
                     *ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
                     batch, h_stride, ffn_stride));

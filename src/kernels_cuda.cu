@@ -8099,6 +8099,9 @@ public:
     bool can_defer_recurrent_projection_outputs(
             const DeviceWeight *const *weights,
             uint32_t fanout,
+            const DeviceWeight &norm_weight,
+            bool input_is_bf16,
+            uint32_t input_stride,
             uint32_t batch,
             uint32_t num_k_heads,
             uint32_t num_v_heads,
@@ -8114,6 +8117,9 @@ public:
 #ifndef QW3_ENABLE_GDN_SM120_AOT
         (void)weights;
         (void)fanout;
+        (void)norm_weight;
+        (void)input_is_bf16;
+        (void)input_stride;
         (void)batch;
         (void)num_k_heads;
         (void)num_v_heads;
@@ -8133,6 +8139,8 @@ public:
         // batch > 256. Smaller trailing prefill chunks must materialize.
         if (!weights || fanout != 4 || batch <= 256 ||
             state_checkpoints || deltanet_capture ||
+            !input_is_bf16 || !fp8_fused_rms_quant_enabled() ||
+            !fp8_fanout_scale_fusion_enabled() ||
             !fp8_lazy_recurrent_pair_enabled() ||
             recurrent_kernel_choice() != RecurrentKernel::Sm120Aot ||
             !gdn_sm120_fused_io_enabled() ||
@@ -8148,20 +8156,32 @@ public:
         }
         for (uint32_t i = 0; i < fanout; ++i) {
             if (!weights[i]) return false;
-            const auto &weight = as_weight(*weights[i]);
-            if (weight.type != WeightType::FP8_E4M3 &&
-                weight.type != WeightType::BF16) {
-                return false;
-            }
         }
+        const auto &norm = as_weight(norm_weight);
         const auto &proj = as_weight(*weights[0]);
         const auto &gate = as_weight(*weights[1]);
-        return proj.type == WeightType::FP8_E4M3 &&
+        const auto &alpha = as_weight(*weights[2]);
+        const auto &beta = as_weight(*weights[3]);
+        return norm.type == WeightType::F32 &&
+               norm.cols == input_stride &&
+               proj.type == WeightType::FP8_E4M3 &&
                gate.type == WeightType::FP8_E4M3 &&
+               alpha.type == WeightType::BF16 &&
+               beta.type == WeightType::BF16 &&
+               proj.cols == input_stride &&
+               gate.cols == input_stride &&
+               alpha.cols == input_stride &&
+               beta.cols == input_stride &&
                proj.fp8_packed_second == &gate &&
                proj.fp8_packed_rows == proj.rows + gate.rows &&
                proj.rows == proj_count &&
-               gate.rows >= num_v_heads * head_v_dim;
+               gate.rows >= num_v_heads * head_v_dim &&
+               alpha.rows == num_v_heads &&
+               beta.rows == num_v_heads &&
+               proj_stride >= proj.rows &&
+               gate_stride >= gate.rows &&
+               alpha_stride >= alpha.rows &&
+               beta_stride >= beta.rows;
 #endif
     }
 

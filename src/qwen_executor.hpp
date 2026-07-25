@@ -544,8 +544,8 @@ private:
     bool bf16_main_ = false;
 
     void ensure_batch_scratch(uint32_t batch);
-    void ensure_ffn_mid_batch_scratch();
-    void ensure_ffn_gate_up_batch_scratch();
+    void ensure_ffn_mid_batch_scratch(uint32_t active_batch);
+    void ensure_ffn_gate_up_batch_scratch(uint32_t active_batch);
     void ensure_recurrent_materialization_batch_scratch(uint32_t active_batch);
 
     bool scratch_ready_ = false;

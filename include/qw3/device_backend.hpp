@@ -444,6 +444,9 @@ public:
     virtual bool can_defer_recurrent_projection_outputs(
             const DeviceWeight *const *weights,
             uint32_t fanout,
+            const DeviceWeight &norm_weight,
+            bool input_is_bf16,
+            uint32_t input_stride,
             uint32_t batch,
             uint32_t num_k_heads,
             uint32_t num_v_heads,
@@ -458,6 +461,9 @@ public:
             bool deltanet_capture) const {
         (void)weights;
         (void)fanout;
+        (void)norm_weight;
+        (void)input_is_bf16;
+        (void)input_stride;
         (void)batch;
         (void)num_k_heads;
         (void)num_v_heads;
