@@ -308,7 +308,17 @@ def chat_completion(
                 reasoning.append(reasoning_piece)
     total = time.perf_counter() - started
     completion_tokens = usage.get("completion_tokens")
-    ttft = first_content if first_content is not None else first_reasoning
+    # TTFT is the first non-empty streamed model token, regardless of whether
+    # the API exposes it as reasoning_content or final content. Prefer neither
+    # channel: thinking-enabled samples may emit thousands of reasoning tokens
+    # before the first visible answer token. The old content-first expression
+    # mislabeled that whole decode interval as TTFT.
+    first_token_candidates = [
+        value
+        for value in (first_content, first_reasoning)
+        if value is not None
+    ]
+    ttft = min(first_token_candidates) if first_token_candidates else None
     decode_elapsed = total - (ttft or 0.0)
     return {
         "hypothesis": "".join(content).strip(),
@@ -318,6 +328,7 @@ def chat_completion(
         "finish_reason": finish_reason,
         "timing": {
             "ttft_sec": ttft,
+            "content_ttft_sec": first_content,
             "first_content_sec": first_content,
             "first_reasoning_sec": first_reasoning,
             "total_sec": total,

@@ -173,6 +173,56 @@ Artifacts:
 - FP8 224K, sensitive samples 3, 4, and 5:
   `/data/chaidi/kvmem_eval/results/agentlongbench_512k_ab_fp8_k224k_chunk8192_opt3_key3_20260725`
 
+## Cold-request host allocation reuse
+
+Independent requests used to release all demand-allocated sparse CPU slabs and
+immutable raw-K chunks, then call `malloc_trim(0)`.  The next long request
+would fault and rebuild the same bounded allocation topology.  `opt_3` now
+invalidates all block mappings, live-slot flags, and raw-K validity while
+retaining only the backing allocations.  The retained physical bytes remain
+strictly bounded by `--kvmem-cpu-gb`; raw-K growth can reclaim an empty retained
+spill slab.  `QW3_KVMEM_RETAIN_COLD_HOST=0` restores minimum-idle-RSS behavior.
+
+A direct long-request/short-request reset probe measured:
+
+| Cold reset mode | Total | Tier clear | Host release/trim |
+|---|---:|---:|---:|
+| release allocations | 1121.602 ms | 574.564 ms | 546.149 ms |
+| retain invalid buffers | 2.373 ms | 1.089 ms | 0.477 ms |
+
+The matched two-sample AgentLongBench run preserved both outputs and both
+official scores.  On the second sample, content-first latency fell from
+334.138 to 330.947 seconds, while native prefill varied from 284.827 to
+282.518 seconds.  The direct reset probe is therefore the reliable isolated
+effect: about 1.119 seconds per independent long request, roughly 0.3% of a
+512K request.  This is a small but generic allocator-churn reduction, not the
+previously suspected 49-second bottleneck.
+
+Artifacts:
+
+- two-sample retained-buffer A/B:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_ab_fp8_k224k_chunk8192_opt3_retainhost_first2_20260725`
+- retained reset phase log:
+  `/data/chaidi/kvmem_eval/logs/agentlongbench_512k_cold_reset_diag_fp8_k224k_opt3_20260725_server.log`
+- release/trim reset phase log:
+  `/data/chaidi/kvmem_eval/logs/agentlongbench_512k_cold_reset_diag_fp8_k224k_opt3_noretain_20260725_server.log`
+
+## TTFT metric correction
+
+The AgentLongBench runner previously documented `ttft_sec` as the first
+streaming delta but implemented a content-first choice: if final-answer content
+eventually appeared, it ignored an earlier reasoning delta.  For a sample with
+46.8 seconds of streamed reasoning, this made `ttft_sec` look about 48 seconds
+larger than native prefill even though the first reasoning token arrived at the
+expected time.
+
+New runs define `ttft_sec` as the earliest non-empty token across the
+`reasoning_content` and `content` channels.  `content_ttft_sec` and the existing
+`first_content_sec` retain answer-visible latency, while
+`first_reasoning_sec` remains separately available.  Historical result files
+are not rewritten; when comparing old results, use the minimum of their
+`first_reasoning_sec` and `first_content_sec`.
+
 ## Selected production profile
 
 For the full FP8 AgentLongBench runs:
