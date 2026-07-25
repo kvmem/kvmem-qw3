@@ -37,6 +37,7 @@ PID_FILE=${PID_FILE:-$LOG_ROOT/${TAG}.pid}
 LIMIT=${LIMIT:-}
 EXPECTED=${EXPECTED:-${LIMIT:-100}}
 METHOD=${METHOD:-kvmem_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_${KV_DTYPE}}
+BENCHMARK_NAME=${BENCHMARK_NAME:-AgentLongBench-512K-normal100}
 
 if [[ "$KV_DTYPE" != "fp16" && "$KV_DTYPE" != "fp8" ]]; then
   echo "KV_DTYPE must be fp16 or fp8, got: $KV_DTYPE" >&2
@@ -154,7 +155,7 @@ fi
 "$ROOT/.venv/bin/python" "$ROOT/scripts/kvmem_eval/run_agentlongbench_kvmem.py" \
   --benchmark-repo /home/chaidi/AgentLongBench_Motivation \
   --dataset "$DATA" --manifest "$MANIFEST" --allow-custom-subset \
-  --benchmark-name AgentLongBench-512K-normal100 \
+  --benchmark-name "$BENCHMARK_NAME" \
   --output-root "$RESULT_ROOT" \
   --api-base "http://127.0.0.1:$PORT/v1" \
   --model "$(basename "$MODEL")" \
