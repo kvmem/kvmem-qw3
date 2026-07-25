@@ -1228,9 +1228,8 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
     h_batch_       = main_tensor(B * cfg.n_embd,                     "h_batch");
     norm_batch_    = backend_.tensor_f32(B * cfg.n_embd,             "norm_batch");
     attn_out_batch_= main_tensor(B * cfg.n_embd,                     "attn_out_batch");
-    ffn_gate_batch_= backend_.tensor_f32(B * std::max<uint64_t>(max_ffn, 1), "ffn_gate_batch");
-    ffn_up_batch_  = backend_.tensor_f32(B * std::max<uint64_t>(max_ffn, 1), "ffn_up_batch");
-    ffn_mid_batch_ = backend_.tensor_f32(B * std::max<uint64_t>(max_ffn, 1), "ffn_mid_batch");
+    ffn_batch_stride_ = static_cast<uint32_t>(
+        std::max<uint64_t>(max_ffn, 1));
     ffn_out_batch_ = main_tensor(B * cfg.n_embd,                     "ffn_out_batch");
     if (max_rqkv  > 0) proj_batch_      = backend_.tensor_f32(B * max_rqkv,  "proj_batch");
     if (max_rqkv  > 0) conv_out_batch_  = backend_.tensor_f32(B * max_rqkv,  "conv_out_batch");
@@ -1246,6 +1245,33 @@ void QwenExecutor::ensure_batch_scratch(uint32_t batch) {
     mid_batch_ = backend_.tensor_f32(B * static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim, "mid_batch");
 
     batch_capacity_ = batch;
+}
+
+void QwenExecutor::ensure_ffn_mid_batch_scratch() {
+    if (batch_capacity_ == 0 || ffn_batch_stride_ == 0) {
+        throw std::runtime_error(
+            "FFN mid scratch requested before batch scratch");
+    }
+    if (ffn_mid_batch_capacity_ >= batch_capacity_) return;
+
+    const uint64_t count =
+        static_cast<uint64_t>(batch_capacity_) * ffn_batch_stride_;
+    ffn_mid_batch_ = backend_.tensor_f32(count, "ffn_mid_batch");
+    ffn_mid_batch_capacity_ = batch_capacity_;
+}
+
+void QwenExecutor::ensure_ffn_gate_up_batch_scratch() {
+    if (batch_capacity_ == 0 || ffn_batch_stride_ == 0) {
+        throw std::runtime_error(
+            "FFN gate/up scratch requested before batch scratch");
+    }
+    if (ffn_gate_up_batch_capacity_ >= batch_capacity_) return;
+
+    const uint64_t count =
+        static_cast<uint64_t>(batch_capacity_) * ffn_batch_stride_;
+    ffn_gate_batch_ = backend_.tensor_f32(count, "ffn_gate_batch");
+    ffn_up_batch_ = backend_.tensor_f32(count, "ffn_up_batch");
+    ffn_gate_up_batch_capacity_ = batch_capacity_;
 }
 
 uint64_t QwenExecutor::per_token_scratch_bytes() const {
@@ -1839,7 +1865,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         return static_cast<uint32_t>(t->count / batch_capacity_);
     };
     const uint32_t h_stride = row_stride(h_batch_.get());
-    const uint32_t ffn_stride = row_stride(ffn_gate_batch_.get());
+    const uint32_t ffn_stride = ffn_batch_stride_;
     const uint32_t q_stride_buf = q_batch_ ? row_stride(q_batch_.get()) : 0;
     const uint32_t k_stride_buf = k_batch_ ? row_stride(k_batch_.get()) : 0;
     const uint32_t v_stride_buf = v_batch_ ? row_stride(v_batch_.get()) : 0;
@@ -2216,6 +2242,17 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             *layer.ffn_down, *layer.ffn_norm, *h_batch_, batch, h_stride,
             ffn_stride, h_stride, eps);
         if (!fused_ffn.ok) {
+            static bool traced_nvfp4_ffn_fallback = false;
+            if (!traced_nvfp4_ffn_fallback &&
+                std::getenv("QW3_NVFP4_FUSED_FFN_TRACE")) {
+                std::fprintf(
+                    stderr,
+                    "[nvfp4] fused FFN fallback: layer=%u batch=%u reason=%s\n",
+                    il, batch,
+                    fused_ffn.message ? fused_ffn.message : "(unknown)");
+                traced_nvfp4_ffn_fallback = true;
+            }
+            ensure_ffn_mid_batch_scratch();
             require_status(backend_.rms_norm_batch(
                 *norm_batch_, *h_batch_, *layer.ffn_norm,
                 batch, h_stride, eps));
@@ -2227,6 +2264,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 *ffn_mid_batch_, *layer.ffn_gate, *layer.ffn_up,
                 *norm_batch_, batch, h_stride, ffn_stride);
             if (!fused_swiglu.ok) {
+                ensure_ffn_gate_up_batch_scratch();
                 require_status(backend_.q8_0_matmul(
                     *ffn_gate_batch_, *layer.ffn_gate, *norm_batch_,
                     batch, h_stride, ffn_stride));

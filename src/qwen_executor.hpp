@@ -544,6 +544,8 @@ private:
     bool bf16_main_ = false;
 
     void ensure_batch_scratch(uint32_t batch);
+    void ensure_ffn_mid_batch_scratch();
+    void ensure_ffn_gate_up_batch_scratch();
 
     bool scratch_ready_ = false;
     std::unique_ptr<DeviceTensor> h_;
@@ -562,6 +564,9 @@ private:
     // Batched scratch for forward_n_tokens. Sized to `batch_capacity_` rows
     // each. Allocated on demand (and grown lazily) by ensure_batch_scratch.
     uint32_t batch_capacity_ = 0;
+    uint32_t ffn_batch_stride_ = 0;
+    uint32_t ffn_mid_batch_capacity_ = 0;
+    uint32_t ffn_gate_up_batch_capacity_ = 0;
     std::unique_ptr<DeviceTensor> h_batch_;
     std::unique_ptr<DeviceTensor> norm_batch_;
     std::unique_ptr<DeviceTensor> attn_out_batch_;
