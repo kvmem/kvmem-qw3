@@ -136,17 +136,56 @@ A true native paged FP8 path therefore requires a separately developed and
 validated architecture-specific kernel.  No unbuildable adapter or dormant
 architecture branch is committed.
 
+## Accuracy control: 200K versus 224K
+
+The performance microbenchmarks above intentionally used a 200K selected
+context so they could compare dtype and chunk size below a fixed 48 GiB GPU
+limit.  That budget must not be treated as the production accuracy setting.
+An initial FP8 full-run attempt exposed a large retrieval-budget effect:
+
+| Configuration | Evaluated subset | Correct | `finish_reason=length` |
+|---|---:|---:|---:|
+| FP8, 200K, chunk 8192, current binary | first 8 | 2/8 | 2/8 |
+| FP16, 224K, earlier full-run artifact | same first 8 | 6/8 | 0/8 |
+
+The following matched controls isolate the cause:
+
+- FP16, 200K, current binary: the third sample repeats tool calls until the
+  32K generation limit and is incorrect.
+- FP16, 224K, current binary: the same third sample stops normally and is
+  correct.
+- FP8, 224K, current binary: the three sensitive samples at original
+  positions 3, 4, and 5 are all correct and stop normally.
+
+Therefore the regression is caused by reducing the semantic selection budget
+from 224K to 200K, not by FP8, the 8192-token prefill chunk, or the current
+performance optimizations.  The incomplete 200K run is preserved as a budget
+ablation and is not resumed.
+
+Artifacts:
+
+- FP8 200K, first eight before the run was stopped:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_normal100_k200k_g32k_b32_qr_immutable_mtp4_fp8_cpu64_opt3_full100_v2_20260725`
+- FP16 200K, first three:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_ab_fp16_k200k_chunk8192_opt3_first8_20260725`
+- FP16 224K, sensitive sample 3:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_ab_fp16_k224k_chunk8192_opt3_sample3_20260725`
+- FP8 224K, sensitive samples 3, 4, and 5:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_ab_fp8_k224k_chunk8192_opt3_key3_20260725`
+
 ## Selected production profile
 
 For the full FP8 AgentLongBench runs:
 
 - `--kv-dtype fp8`;
 - `--prefill-chunk 8192`;
+- `--kvmem-budget 229376` (224K context) plus a 32K generation reserve;
 - `--kvmem-optimization-level opt_3`;
 - plan reuse enabled (default);
 - query speculative prefetch disabled (default);
 - CPU tier preferred; SSD used only if the logical source exceeds safe host
   capacity.
 
-This profile preserves a roughly 4.7 GiB GPU headroom below the 48 GiB target
-on the fixed sample.
+At 200K, the profile preserves roughly 4.7 GiB GPU headroom below the 48 GiB
+target on the fixed sample.  The accuracy-preserving 224K FP8 control remains
+below 48 GiB as well, with an observed peak of about 43--44 GiB.
