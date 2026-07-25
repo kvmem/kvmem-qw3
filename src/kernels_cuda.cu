@@ -6235,9 +6235,15 @@ public:
         if (x_fp4_workspace_) cudaFree(x_fp4_workspace_);
         if (x_fp4_scales_) cudaFree(x_fp4_scales_);
         if (fp4_gemm_workspace_) cudaFree(fp4_gemm_workspace_);
-        if (mixed_out_bf16_) cudaFree(mixed_out_bf16_);
+        if (shared_linear_output_workspace_enabled()) {
+            if (linear_output_workspace_) cudaFree(linear_output_workspace_);
+        } else if (mixed_out_bf16_) {
+            cudaFree(mixed_out_bf16_);
+        }
         if (nvfp4_pair_out_f32_) cudaFree(nvfp4_pair_out_f32_);
-        if (fp8_out_f32_) cudaFree(fp8_out_f32_);
+        if (!shared_linear_output_workspace_enabled() && fp8_out_f32_) {
+            cudaFree(fp8_out_f32_);
+        }
         if (q8_out_f32_) cudaFree(q8_out_f32_);
         for (int i = 0; i < 2; ++i) {
             if (w_fp16_workspace_[i]) cudaFree(w_fp16_workspace_[i]);
@@ -6336,7 +6342,9 @@ public:
     }
 
     DeviceStatus end() override {
-        return synchronize();
+        DeviceStatus status = synchronize();
+        if (status.ok) trace_workspace_capacities();
+        return status;
     }
 
     DeviceStatus synchronize() override {
@@ -6367,6 +6375,74 @@ public:
             return 0;
         }
         return static_cast<uint64_t>(total_b);
+    }
+
+    void trace_workspace_capacities() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_CUDA_WORKSPACE_TRACE");
+            return value && *value &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "off") != 0 &&
+                   std::strcmp(value, "false") != 0;
+        }();
+        if (!enabled) return;
+
+        const uint64_t output_staging_bytes =
+            shared_linear_output_workspace_enabled()
+                ? linear_output_workspace_capacity_
+                : mixed_out_bf16_capacity_ * sizeof(__nv_bfloat16) +
+                      fp8_out_f32_capacity_ * sizeof(float);
+        const uint64_t linear_bytes =
+            x_bf16_capacity_ * sizeof(__nv_bfloat16) +
+            x_fp8_capacity_ * sizeof(__nv_fp8_e4m3) +
+            static_cast<uint64_t>(x_fp8_scale_capacity_) * sizeof(float) +
+            x_fp4_workspace_capacity_ +
+            x_fp4_scales_capacity_ +
+            fp4_gemm_workspace_capacity_ +
+            output_staging_bytes +
+            nvfp4_pair_out_f32_capacity_ * sizeof(float) +
+            q8_out_f32_capacity_ * sizeof(float) +
+            q8_1_scratch_capacity_ +
+            q8_1_mmq_scratch_capacity_ +
+            cublaslt_workspace_bytes_;
+        const uint64_t attention_bytes =
+            fattn_scratch_capacity_ +
+            prefill_attn_q_fp16_capacity_ * sizeof(__half) +
+            prefill_attn_scores_fp16_capacity_ * sizeof(__half) +
+            prefill_gqa_scratch_capacity_ +
+            flashinfer_decode_o_f16_capacity_ * sizeof(__half) +
+            flashinfer_decode_tmp_capacity_ * sizeof(__half) +
+            flashinfer_batch_decode_o_f16_capacity_ * sizeof(__half) +
+            flashinfer_batch_decode_tmp_v_capacity_ * sizeof(__half) +
+            flashinfer_batch_decode_tmp_s_capacity_ * sizeof(float) +
+            flashinfer_batch_decode_meta_i32_capacity_ * sizeof(int32_t) +
+            flashinfer_batch_prefill_q_f16_capacity_ * sizeof(__half) +
+            flashinfer_batch_prefill_o_f16_capacity_ * sizeof(__half) +
+            flashinfer_batch_prefill_meta_i32_capacity_ * sizeof(int32_t) +
+            flashinfer_batch_prefill_float_capacity_ * sizeof(float);
+        const uint64_t total_bytes = linear_bytes + attention_bytes;
+        if (total_bytes == workspace_trace_last_bytes_) return;
+        workspace_trace_last_bytes_ = total_bytes;
+
+        constexpr double kMiB = 1024.0 * 1024.0;
+        std::fprintf(
+            stderr,
+            "[qw3] CUDA workspace: total=%.2f MiB linear=%.2f MiB "
+            "attention=%.2f MiB fp8_x=%.2f MiB fp8_out=%.2f MiB "
+            "mixed_bf16=%.2f MiB fp4_x=%.2f MiB fp4_scales=%.2f MiB "
+            "fp4_gemm=%.2f MiB output_staging=%.2f MiB shared=%d\n",
+            static_cast<double>(total_bytes) / kMiB,
+            static_cast<double>(linear_bytes) / kMiB,
+            static_cast<double>(attention_bytes) / kMiB,
+            static_cast<double>(x_fp8_capacity_) / kMiB,
+            static_cast<double>(fp8_out_f32_capacity_ * sizeof(float)) / kMiB,
+            static_cast<double>(
+                mixed_out_bf16_capacity_ * sizeof(__nv_bfloat16)) / kMiB,
+            static_cast<double>(x_fp4_workspace_capacity_) / kMiB,
+            static_cast<double>(x_fp4_scales_capacity_) / kMiB,
+            static_cast<double>(fp4_gemm_workspace_capacity_) / kMiB,
+            static_cast<double>(output_staging_bytes) / kMiB,
+            shared_linear_output_workspace_enabled() ? 1 : 0);
     }
 
     // -- CUDA graph capture for decode --
@@ -8940,7 +9016,16 @@ private:
             x_fp8_scale_capacity_ = batch;
         }
         const uint64_t out_count = static_cast<uint64_t>(batch) * rows;
-        if (fp8_out_f32_capacity_ < out_count) {
+        if (shared_linear_output_workspace_enabled()) {
+            if (fp8_out_f32_capacity_ < out_count) {
+                if (auto st = ensure_shared_linear_output_workspace(
+                        static_cast<size_t>(out_count) * sizeof(float));
+                    !st.ok) {
+                    return st;
+                }
+                fp8_out_f32_capacity_ = out_count;
+            }
+        } else if (fp8_out_f32_capacity_ < out_count) {
             if (fp8_out_f32_) cudaFree(fp8_out_f32_);
             if (auto st = cuda_status(cudaMalloc(&fp8_out_f32_,
                                                  static_cast<size_t>(out_count) * sizeof(float)),
@@ -8951,17 +9036,8 @@ private:
             }
             fp8_out_f32_capacity_ = out_count;
         }
-        if (mixed_out_bf16_capacity_ < out_count) {
-            if (mixed_out_bf16_) cudaFree(mixed_out_bf16_);
-            if (auto st = cuda_status(cudaMalloc(&mixed_out_bf16_,
-                                                 static_cast<size_t>(out_count) *
-                                                     sizeof(__nv_bfloat16)),
-                                      "mixed BF16 output alloc"); !st.ok) {
-                mixed_out_bf16_ = nullptr;
-                mixed_out_bf16_capacity_ = 0;
-                return st;
-            }
-            mixed_out_bf16_capacity_ = out_count;
+        if (!shared_linear_output_workspace_enabled()) {
+            return ensure_mixed_bf16_output(out_count);
         }
         return {};
     }
@@ -10359,6 +10435,16 @@ private:
 
     DeviceStatus ensure_mixed_bf16_output(uint64_t count) {
         if (mixed_out_bf16_capacity_ >= count) return {};
+        if (shared_linear_output_workspace_enabled()) {
+            if (auto st = ensure_shared_linear_output_workspace(
+                    static_cast<size_t>(count) *
+                        sizeof(__nv_bfloat16));
+                !st.ok) {
+                return st;
+            }
+            mixed_out_bf16_capacity_ = count;
+            return {};
+        }
         if (mixed_out_bf16_) cudaFree(mixed_out_bf16_);
         if (auto st = cuda_status(
                 cudaMalloc(&mixed_out_bf16_,
@@ -10369,6 +10455,40 @@ private:
             return st;
         }
         mixed_out_bf16_capacity_ = count;
+        return {};
+    }
+
+    static bool shared_linear_output_workspace_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_SHARED_LINEAR_OUTPUT_WORKSPACE");
+            return !value || !*value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        return enabled;
+    }
+
+    DeviceStatus ensure_shared_linear_output_workspace(size_t bytes) {
+        if (linear_output_workspace_capacity_ < bytes) {
+            if (linear_output_workspace_) cudaFree(linear_output_workspace_);
+            linear_output_workspace_ = nullptr;
+            linear_output_workspace_capacity_ = 0;
+            mixed_out_bf16_ = nullptr;
+            fp8_out_f32_ = nullptr;
+            if (auto st = cuda_status(
+                    cudaMalloc(&linear_output_workspace_, bytes),
+                    "shared linear output workspace alloc"); !st.ok) {
+                mixed_out_bf16_capacity_ = 0;
+                fp8_out_f32_capacity_ = 0;
+                return st;
+            }
+            linear_output_workspace_capacity_ = bytes;
+        }
+        mixed_out_bf16_ =
+            static_cast<__nv_bfloat16 *>(linear_output_workspace_);
+        fp8_out_f32_ = static_cast<float *>(linear_output_workspace_);
         return {};
     }
 
@@ -15451,6 +15571,10 @@ private:
     size_t x_fp4_scales_capacity_ = 0;
     void *fp4_gemm_workspace_ = nullptr;
     size_t fp4_gemm_workspace_capacity_ = 0;
+    // FP8 projection output and NVFP4 BF16 FFN staging are consumed in
+    // separate phases on exec_stream_, so the larger allocation can back both.
+    void *linear_output_workspace_ = nullptr;
+    size_t linear_output_workspace_capacity_ = 0;
     __nv_bfloat16 *mixed_out_bf16_ = nullptr;
     uint64_t mixed_out_bf16_capacity_ = 0;  // elements
     float *nvfp4_pair_out_f32_ = nullptr;
@@ -15464,6 +15588,7 @@ private:
     bool fp8_bf16_epilogue_failed_ = false;
     bool fp8_cutlass_bf16_failed_ = false;
     bool fp8_cutlass_f32_failed_ = false;
+    uint64_t workspace_trace_last_bytes_ = std::numeric_limits<uint64_t>::max();
     // Weight-side FP16 dequant scratch for HGEMM. Two ping-pong buffers, each
     // sized to the largest single Q8_0 weight (~150 MB on Qwen 3.6 27B). The
     // dequant of W_{n+1} runs on `dequant_stream_` concurrently with the
