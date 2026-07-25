@@ -1255,8 +1255,13 @@ public:
         if (!st.ok) throw std::runtime_error(std::string("device begin failed: ") + st.message);
 
         const double t_begin = wall_seconds();
+        const bool load_mtp =
+            options_.native_mtp_trace || mtp_trace_enabled() ||
+            mtp_speculate_enabled(options_) ||
+            (options_.native_mtp_chain_set &&
+             options_.native_mtp_chain > 0);
         weights_ = std::make_unique<QwenWeights>(
-            *model_, *device_, options_.cpu_embedding);
+            *model_, *device_, options_.cpu_embedding, load_mtp);
         st = device_->synchronize();
         if (!st.ok) throw std::runtime_error(std::string("weight upload sync failed: ") + st.message);
         const double t_weights = wall_seconds();
@@ -1302,6 +1307,9 @@ public:
             << " tensors=" << weights_->tensor_count()
             << " size=" << std::fixed << std::setprecision(1) << mib << " MiB"
             << " host_resident=" << host_mib << " MiB"
+            << " mtp_weights="
+            << (weights_->mtp() ? "loaded"
+                                : (load_mtp ? "unavailable" : "skipped"))
             << " backend=" << linear_backend_name(linear_backend);
         log(msg.str());
     }

@@ -221,6 +221,10 @@ token rows through a double-buffered pinned staging area, and decode transfers
 one row per token. The LM head and all compute weights remain on GPU. The flag
 is opt-in and rejects checkpoints whose input embedding is also the LM head.
 
+When MTP is disabled (`--mtp-chain 0`, the serving default), qwen-native also
+skips uploading the unused MTP draft weights. Enabling MTP or its diagnostic
+trace automatically restores those weights at model load.
+
 For the FlashInfer wheel layout used by the `vllm` environment:
 
 ```sh

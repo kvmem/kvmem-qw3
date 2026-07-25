@@ -168,7 +168,7 @@ PreparedTensor prepare_tensor(const ModelTensorInfo &tensor) {
 } // namespace
 
 QwenWeights::QwenWeights(const QwenNativeModel &model, DeviceBackend &backend,
-                         bool cpu_embedding)
+                         bool cpu_embedding, bool load_mtp)
     : model_(model), backend_(backend) {
     const NativePlanInfo &plan = model_.plan();
     if (!plan.supported) {
@@ -193,15 +193,17 @@ QwenWeights::QwenWeights(const QwenNativeModel &model, DeviceBackend &backend,
         layers_.push_back(bind_layer(src));
     }
 
-    if (const QwenMtpTensors *src = model_.mtp()) {
-        mtp_.present = true;
-        mtp_.layer = bind_layer(src->layer);
-        mtp_.eh_proj = bind(src->eh_proj);
-        mtp_.embed_tokens = bind(src->embed_tokens);
-        mtp_.enorm = bind(src->enorm);
-        mtp_.hnorm = bind(src->hnorm);
-        mtp_.shared_head_head = bind(src->shared_head_head);
-        mtp_.shared_head_norm = bind(src->shared_head_norm);
+    if (load_mtp) {
+        if (const QwenMtpTensors *src = model_.mtp()) {
+            mtp_.present = true;
+            mtp_.layer = bind_layer(src->layer);
+            mtp_.eh_proj = bind(src->eh_proj);
+            mtp_.embed_tokens = bind(src->embed_tokens);
+            mtp_.enorm = bind(src->enorm);
+            mtp_.hnorm = bind(src->hnorm);
+            mtp_.shared_head_head = bind(src->shared_head_head);
+            mtp_.shared_head_norm = bind(src->shared_head_norm);
+        }
     }
 }
 

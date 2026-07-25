@@ -70,7 +70,7 @@ struct QwenMtpWeights {
 class QwenWeights {
 public:
     QwenWeights(const QwenNativeModel &model, DeviceBackend &backend,
-                bool cpu_embedding = false);
+                bool cpu_embedding = false, bool load_mtp = true);
     ~QwenWeights();
 
     QwenWeights(const QwenWeights &) = delete;
