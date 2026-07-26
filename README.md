@@ -249,6 +249,12 @@ runtime variation. The `--ctx` limit includes both prompt and generated tokens,
 so their combined length must remain at or below 98,304. Exact headroom varies
 with the CUDA build, driver, and GPU.
 
+As an upper-end capacity setting, `--ctx 114688` (112K tokens) can be tried
+with all other options above unchanged. Its estimated peak is approximately
+23.13 GiB, leaving about 0.87 GiB on a nominal 24 GiB device. Keep the GPU free
+of other workloads and treat 112K as a limit-oriented setting rather than the
+default recommendation; 96K retains safer runtime headroom.
+
 For the FlashInfer wheel layout used by the `vllm` environment:
 
 ```sh
