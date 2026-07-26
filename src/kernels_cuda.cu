@@ -259,9 +259,9 @@ bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    cudaStream_t stream);
 
 // FP8 variants are separate entry points so the existing fp16/fp32 ABI used by
-// the CUDA parity tests stays unchanged. Immutable-source K resets the working
-// FP8 cache from its source before each remap, so the lossy write is not
-// cumulative across reselections.
+// the CUDA parity tests stays unchanged. Immutable-source K periodically resets
+// the working FP8 cache after a dtype-aware bounded number of resident remaps,
+// so lossy writes cannot accumulate without limit across reselections.
 bool launch_rope_block_remap_paged_fp8(void *cache,
                                        uint32_t n_tokens,
                                        uint32_t n_kv_heads,

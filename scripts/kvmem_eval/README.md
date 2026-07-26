@@ -239,3 +239,43 @@ prefix-cache tracing and fails unless every question restored a warm KVMem
 checkpoint. Use BEAM's official type-specific evaluator on the compatible JSON;
 `--no-judge` only disables the LongMemEval judge in the generic process
 orchestrator.
+
+## Core performance ablation
+
+The production path enables Proactive Stage-out, Hierarchical Reuse, and
+Packed Rematerialization by default. A controlled run disables one group with
+the repeatable server option:
+
+```bash
+--kvmem-optimize-off proactive-stage-out
+--kvmem-optimize-off hierarchical-reuse
+--kvmem-optimize-off packed-rematerialization
+```
+
+`--kvmem-optimize-off all` disables all three groups. It cannot be combined
+with another value. The older `--kvmem-optimization-level` profiles are
+deprecated reproducibility modes and cannot be combined with the new option.
+Startup emits one `[kvmem-opt-status]` record per group; an unavailable
+requested optimization produces an explicit error instead of silently
+falling back.
+
+Run the matched 512K single-sample matrix with:
+
+```bash
+scripts/kvmem_eval/run_agentlongbench_perf_ab.sh
+```
+
+The four sequential cells form a cumulative ablation:
+
+```text
+all-off
+  -> proactive-stage-out
+  -> proactive-stage-out + hierarchical-reuse
+  -> all-on (+ packed-rematerialization)
+```
+
+This makes each adjacent difference attributable to the newly enabled group.
+The cells use deterministic decoding by default and fail if an optimization
+changes the generated answer. `summarize_kvmem_perf_ablation.py` aggregates
+TTFT, stage-out, stage-in, assembly, total reselection time, GPU reuse, and
+peak GPU memory into JSON and Markdown artifacts.

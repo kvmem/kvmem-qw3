@@ -112,6 +112,8 @@ static void test_immutable_source_selection_uses_bounded_delta_remaps() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 32;
     cfg.immutable_source_k = true;
+    cfg.immutable_refresh_remaps = 2;
+    cfg.immutable_refresh_abs_delta_tokens = 0;
     KvMemStore s(cfg);
     s.register_append(32 * 6);
 
@@ -136,12 +138,10 @@ static void test_immutable_source_selection_uses_bounded_delta_remaps() {
     CHECK(s.blocks()[4].baked_pos == 64);
     CHECK(s.blocks()[4].remap_count == 2);
 
-    // A large displacement crosses the default 256K token threshold and is
+    // The next move crosses the configured two-write count limit and is
     // rebuilt from raw K, resetting the drift counters.
-    s.set_block_baked_pos(4, 777);
-    s.record_block_rerope(4, 300000);
     auto p3 = s.set_selection({0, 4});
-    CHECK(p3.remaps[1].from_base == 300000);
+    CHECK(p3.remaps[1].from_base == 64);
     CHECK(p3.remaps[1].to_base == 32);
     CHECK(p3.remaps[1].raw_refresh);
     CHECK(s.blocks()[4].baked_pos == 32);
@@ -152,6 +152,52 @@ static void test_immutable_source_selection_uses_bounded_delta_remaps() {
     s.set_block_tier(3, KvTier::CPU, 0, -1);
     auto p4 = s.set_selection({0, 3});
     CHECK(p4.remaps[1].raw_refresh);
+    CHECK(!p4.remaps[1].skip);
+}
+
+static void test_cold_immutable_same_position_rebuilds_k() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.immutable_source_k = true;
+    KvMemStore s(cfg);
+    s.register_append(32 * 4);
+
+    // Block 2 was previously compacted to slot 1, then evicted. Its recorded
+    // bake equals the next target slot, but its working K no longer resides on
+    // GPU. The plan must rebuild K from raw authority instead of skipping.
+    (void)s.set_selection({0, 1});
+    s.set_block_baked_pos(2, 32);
+    s.set_block_tier(2, KvTier::CPU, 0, -1);
+    const auto plan = s.set_selection({0, 2});
+    CHECK(plan.stage_in.size() == 1);
+    CHECK(plan.stage_in[0] == 2);
+    CHECK(plan.remaps.size() == 2);
+    CHECK(plan.remaps[1].from_base == 32);
+    CHECK(plan.remaps[1].to_base == 32);
+    CHECK(!plan.remaps[1].working_k_resident);
+    CHECK(plan.remaps[1].raw_refresh);
+    CHECK(!plan.remaps[1].skip);
+}
+
+static void test_default_profile_reuses_moved_resident_k() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.immutable_source_k = true;
+    CHECK(!cfg.legacy_optimization_profile);
+    KvMemStore s(cfg);
+    s.register_append(32 * 4);
+
+    // Block 2 remains physically resident but moves from original position 64
+    // to compact position 32. Default profiles use the bounded in-place
+    // re-RoPE path and retain raw K as the periodic reset authority.
+    const auto plan = s.set_selection({0, 2});
+    CHECK(plan.remaps.size() == 2);
+    CHECK(plan.remaps[1].working_k_resident);
+    CHECK(plan.remaps[1].from_base == 64);
+    CHECK(plan.remaps[1].to_base == 32);
+    CHECK(!plan.remaps[1].raw_refresh);
+    CHECK(!plan.remaps[1].skip);
+    CHECK(s.blocks()[2].remap_count == 1);
 }
 
 static void test_stage_in_uses_tier_residency() {
@@ -168,6 +214,50 @@ static void test_stage_in_uses_tier_residency() {
     CHECK(plan2.stage_in.size() == 1);
     CHECK(plan2.stage_in[0] == 1);
     CHECK(plan2.stage_out.empty());
+}
+
+static void test_hierarchical_reuse_ablation_forces_full_reload() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.immutable_source_k = true;
+    cfg.hierarchical_reuse = false;
+    KvMemStore s(cfg);
+    s.register_append(32 * 5);
+
+    // Even though blocks 0 and 2 remain selected, the ablation deliberately
+    // stages every GPU block out and reloads the complete selected set.
+    auto first = s.set_selection({0, 2, 4});
+    CHECK(first.selection_overlap_blocks == 0);
+    CHECK(first.gpu_reused_blocks == 0);
+    CHECK(first.stage_out.size() == 5);
+    CHECK(first.stage_in.size() == 3);
+    for (const KvMemRemap &rm : first.remaps) {
+        CHECK(!rm.working_k_resident);
+        CHECK(rm.raw_refresh);
+        CHECK(!rm.skip);
+    }
+
+    // Simulate the executor publishing the selected blocks back on GPU, then
+    // reselect the same logical set. Natural overlap is observable, but actual
+    // GPU reuse remains zero and all three blocks travel through the tiers.
+    for (uint32_t id : first.stage_out) {
+        s.set_block_tier(id, KvTier::CPU, static_cast<int32_t>(id), -1);
+    }
+    for (uint32_t id : std::vector<uint32_t>{0, 2, 4}) {
+        s.set_block_tier(id, KvTier::GPU);
+    }
+    auto second = s.set_selection({0, 2, 4});
+    CHECK(second.selection_overlap_blocks == 3);
+    CHECK(second.gpu_reused_blocks == 0);
+    CHECK(second.retained_position_stable == 3);
+    CHECK(second.retained_position_moved == 0);
+    CHECK(second.stage_out.size() == 3);
+    CHECK(second.stage_in.size() == 3);
+    for (const KvMemRemap &rm : second.remaps) {
+        CHECK(!rm.working_k_resident);
+        CHECK(rm.raw_refresh);
+        CHECK(!rm.skip);
+    }
 }
 
 static void test_topk_budget_sink_recent() {
@@ -570,7 +660,10 @@ int main() {
     test_register_append();
     test_selection_diff_and_remap();
     test_immutable_source_selection_uses_bounded_delta_remaps();
+    test_cold_immutable_same_position_rebuilds_k();
+    test_default_profile_reuses_moved_resident_k();
     test_stage_in_uses_tier_residency();
+    test_hierarchical_reuse_ablation_forces_full_reload();
     test_topk_budget_sink_recent();
     test_topk_zero_recent_keeps_no_suffix();
     test_topk_mandatory_blocks_stay_inside_budget();

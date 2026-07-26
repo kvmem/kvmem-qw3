@@ -9,6 +9,11 @@ arguments, limitations, and paper-relevant interpretation of the implementation.
 > **Active issue tracker:** unresolved correctness bugs, retrieval-quality
 > limitations, compatibility gaps, validation evidence, and recommended repair
 > order are maintained in `docs/kvmem_known_issues.md`.
+>
+> **GPU memory optimization record:** the current bounded-page-pool design,
+> immutable raw-K layout, FP8/FP16 dtype split, scratch/workspace reductions,
+> measured GPU peaks, recommended 48 GiB profiles, and remaining 10M-context
+> scaling limits are maintained in `docs/kvmem_gpu_memory_optimization.md`.
 
 The implementation is centered around three ideas:
 

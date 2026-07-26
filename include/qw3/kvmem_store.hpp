@@ -74,15 +74,18 @@ struct KvMemBlock {
 // One block's remap instruction for the executor: the block's K is currently
 // baked in place at from_base; re-bake it to to_base (its new window slot).
 // Fed to rope_block_remap_paged per attention layer during assembly. `skip` is
-// set when from_base == to_base (the block already sits in the right window
-// slot) so the executor issues no kernel — the dominant case across rounds with
-// stable selection.
+// set only when a valid working K remains resident and from_base == to_base.
+// A cold immutable block must be rebuilt from raw K even at the same position.
 struct KvMemRemap {
     uint32_t block_id = 0;
     uint32_t n_tokens = 0;
     int32_t  from_base = 0;   // current bake position (de-rotate source)
     int32_t  to_base = 0;     // assigned in-window first-token position
-    bool     skip = false;    // from_base == to_base: no kernel needed
+    // True when the rotated working K survived on GPU at planning time.
+    // This is deliberately distinct from KvMemPlan::stage_in, which tracks a
+    // logical working-set transition and may include still-resident pages.
+    bool     working_k_resident = false;
+    bool     skip = false;    // resident valid K already baked at to_base
     // Rebuild this block from the unrotated CPU raw-K mirror instead of
     // applying another lossy in-place de-RoPE/re-RoPE pass. Always true for a
     // cold stage-in and when either refresh threshold is reached.
@@ -102,13 +105,21 @@ struct KvMemDroppedBlock {
 
 // Result of diffing a new selection against the current working set.
 struct KvMemPlan {
-    std::vector<uint32_t> stage_in;   // selected blocks not currently resident
+    // Blocks newly entering the logical working set. The executor may avoid a
+    // physical transfer when their GPU pages are still resident.
+    std::vector<uint32_t> stage_in;
     std::vector<uint32_t> stage_out;  // resident blocks no longer selected
     // Full remap plan for the new working set, in window order. The executor
     // assembles the kernel page-index list from these blocks in this order and
     // sets the query position to total_window_tokens.
     std::vector<KvMemRemap> remaps;
     uint32_t total_window_tokens = 0;  // sum of n_tokens over selected blocks
+    // Natural overlap is reported even in the reuse-off ablation, where the
+    // executor deliberately reloads blocks that it could otherwise retain.
+    uint32_t selection_overlap_blocks = 0;
+    uint32_t gpu_reused_blocks = 0;
+    uint32_t retained_position_stable = 0;
+    uint32_t retained_position_moved = 0;
 };
 
 // Which signal ranks the middle (non-sink/recent) blocks each reselection.
@@ -177,17 +188,26 @@ struct KvMemStoreConfig {
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
     KvMemOptimizationLevel optimization_level =
         KvMemOptimizationLevel::KvmemInit;
+    // New paper-facing controls. Native serving defaults all three to true.
+    // legacy_optimization_profile is set only when the deprecated cumulative
+    // --kvmem-optimization-level CLI was explicitly requested.
+    bool legacy_optimization_profile = false;
+    bool proactive_stage_out = true;
+    bool hierarchical_reuse = true;
+    bool packed_rematerialization = true;
 
     // Drift-bounded K construction. The executor stores unrotated historical K
-    // in a CPU mirror and keeps only one active K copy on GPU. Small window
+    // in a CPU mirror and keeps only one active K copy on GPU. Resident window
     // moves use an in-place delta rotation; cold blocks and blocks crossing a
-    // refresh threshold are rebuilt from raw K in one H2D + scatter/RoPE pass.
+    // refresh threshold are rebuilt from raw K in one H2D + scatter/RoPE
+    // pass. Native serving uses a conservative count limit of 8 for both FP16
+    // and FP8; controlled experiments may override it.
     bool immutable_source_k = false;
     // Engine-level MTP prefix/speculation is enabled for this executor. Kept
     // explicit so non-MTP KVMem runs do not allocate/tier an unused MTP cache
     // or reserve an unnecessary MTP raw-K mirror.
     bool mtp_enabled = false;
-    uint32_t immutable_refresh_remaps = 32;
+    uint32_t immutable_refresh_remaps = 8;
     uint64_t immutable_refresh_abs_delta_tokens = 262144;
     uint64_t immutable_max_baked_position = 262144;
 
@@ -303,9 +323,9 @@ public:
     // Diff `selected_ids` against current GPU residency / working-set state and produce the
     // stage-in/out lists + the window remap plan. Each remap starts from the
     // block's CURRENT GPU bake position. In immutable_source_k mode a cold
-    // stage-in or a block exceeding the configured drift thresholds is marked
-    // raw_refresh and rebuilt from the CPU raw-K mirror; otherwise the move is
-    // an in-place delta rotation. `selected_ids` need not be sorted;
+    // stage-in or a resident block exceeding the configured drift thresholds
+    // is marked raw_refresh and rebuilt from the CPU raw-K mirror; otherwise a
+    // resident move is an in-place delta rotation. `selected_ids` need not be sorted;
     // it is sorted ascending internally so window order is deterministic (sink
     // first ... recent last). Blocks are packed contiguously from window pos 0.
     KvMemPlan set_selection(std::vector<uint32_t> selected_ids);

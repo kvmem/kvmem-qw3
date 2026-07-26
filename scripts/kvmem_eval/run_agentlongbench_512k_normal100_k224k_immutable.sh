@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # AgentLongBench-Long fixed 512K normal100 with ordinary KVMem + MTP-4.
-# The default storage profile is CPU-only opt_1: a 640K logical context,
-# 224K selected context, 32K generation reserve, and no NVMe tier.  CTX,
-# CPU_GB, NVME_GB, NVME_DIR, and KVMEM_OPT_LEVEL remain overridable so the
-# earlier 1M + NVMe configuration can still be reproduced without editing
-# this launcher. Query replay, immutable source K, and MTP-4 are explicit;
-# DeltaNet rebuilt-state capture/seed/export/import is deliberately absent.
+# The default storage profile enables all three paper-facing optimizations:
+# proactive-stage-out, hierarchical-reuse, and packed-rematerialization.
+# KVMEM_OPTIMIZE_OFF is an optional comma-separated launcher convenience that
+# expands to repeatable --kvmem-optimize-off arguments. KVMEM_OPT_LEVEL remains
+# available only to reproduce a deprecated cumulative legacy profile and cannot
+# be combined with KVMEM_OPTIMIZE_OFF. Query replay, immutable source K, and
+# MTP-4 are explicit; DeltaNet rebuilt-state state is deliberately absent.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -13,12 +14,15 @@ PORT=${PORT:-8087}
 CTX=${CTX:-655360}
 CPU_GB=${CPU_GB:-64}
 NVME_GB=${NVME_GB:-0}
-KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
+KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-}
+KVMEM_OPTIMIZE_OFF=${KVMEM_OPTIMIZE_OFF:-}
 KVMEM_BUDGET=${KVMEM_BUDGET:-229376}
 GEN_BUDGET=${GEN_BUDGET:-32768}
 KV_DTYPE=${KV_DTYPE:-fp16}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
-TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_opt1_20260723}
+TEMP=${TEMP:-0.6}
+THINKING_BUDGET=${THINKING_BUDGET:-4096}
+TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_all_on}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
 MODEL=${MODEL:-$ROOT/models/Qwen3.6-27B-Q8_0.gguf}
@@ -42,6 +46,10 @@ if [[ ! "$PREFILL_CHUNK" =~ ^[1-9][0-9]*$ ]]; then
   echo "PREFILL_CHUNK must be a positive integer, got: $PREFILL_CHUNK" >&2
   exit 2
 fi
+if [[ ! "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]]; then
+  echo "THINKING_BUDGET must be a positive integer, got: $THINKING_BUDGET" >&2
+  exit 2
+fi
 
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy=127.0.0.1,localhost
@@ -57,6 +65,34 @@ if [[ "$NVME_GB" != "0" && "$NVME_GB" != "0.0" ]]; then
     --kvmem-nvme-gb "$NVME_GB"
     --kvmem-nvme-dir "$NVME_DIR"
   )
+fi
+
+optimization_args=()
+if [[ -n "$KVMEM_OPT_LEVEL" && -n "$KVMEM_OPTIMIZE_OFF" ]]; then
+  echo "KVMEM_OPT_LEVEL and KVMEM_OPTIMIZE_OFF are mutually exclusive" >&2
+  exit 2
+fi
+if [[ -n "$KVMEM_OPT_LEVEL" ]]; then
+  case "$KVMEM_OPT_LEVEL" in
+    kvmem_init|opt_1|opt_2|opt_3) ;;
+    *)
+      echo "invalid legacy KVMEM_OPT_LEVEL: $KVMEM_OPT_LEVEL" >&2
+      exit 2
+      ;;
+  esac
+  optimization_args+=(--kvmem-optimization-level "$KVMEM_OPT_LEVEL")
+elif [[ -n "$KVMEM_OPTIMIZE_OFF" ]]; then
+  IFS=',' read -r -a optimize_off_names <<<"$KVMEM_OPTIMIZE_OFF"
+  for name in "${optimize_off_names[@]}"; do
+    case "$name" in
+      proactive-stage-out|hierarchical-reuse|packed-rematerialization|all) ;;
+      *)
+        echo "invalid KVMEM_OPTIMIZE_OFF entry: $name" >&2
+        exit 2
+        ;;
+    esac
+    optimization_args+=(--kvmem-optimize-off "$name")
+  done
 fi
 
 limit_args=()
@@ -122,10 +158,10 @@ env \
     --kvmem-method retrieval --kvmem-retrieval-method mean-k \
     --kvmem-update-mode step --kvmem-query-conditioned \
     --kvmem-immutable-k --kvmem-gpu-memory-ratio 0.51 \
-    --kvmem-optimization-level "$KVMEM_OPT_LEVEL" \
+    "${optimization_args[@]}" \
     "${tier_args[@]}" \
-    --enable-thinking --thinking-budget 4096 \
-    --prefill-chunk "$PREFILL_CHUNK" --temp 0.6 \
+    --enable-thinking --thinking-budget "$THINKING_BUDGET" \
+    --prefill-chunk "$PREFILL_CHUNK" --temp "$TEMP" \
     --native-mtp-speculate --mtp-chain 4 \
     --host 127.0.0.1 --port "$PORT" \
     >"$SERVER_LOG" 2>&1 &
@@ -161,6 +197,23 @@ if rg -q 'rebuilt-state|REBUILT_STATE' "$SERVER_LOG"; then
   exit 5
 fi
 
+server_ready_gpu_mib=$(
+  nvidia-smi --query-compute-apps=pid,used_memory \
+    --format=csv,noheader,nounits 2>/dev/null |
+  awk -F',' -v pid="$server_pid" '
+    {
+      gsub(/[[:space:]]/, "", $1)
+      gsub(/[[:space:]]/, "", $2)
+      if ($1 == pid) {
+        print $2
+        exit
+      }
+    }
+  '
+)
+echo "[gpu-memory] phase=server_ready pid=$server_pid used_mib=${server_ready_gpu_mib:-unknown}" |
+  tee -a "$RUN_LOG"
+
 "$ROOT/.venv/bin/python" "$ROOT/scripts/kvmem_eval/run_agentlongbench_kvmem.py" \
   --benchmark-repo /home/chaidi/AgentLongBench_Motivation \
   --dataset "$DATA" --manifest "$MANIFEST" --allow-custom-subset \
@@ -169,7 +222,7 @@ fi
   --api-base "http://127.0.0.1:$PORT/v1" \
   --model "$(basename "$MODEL")" \
   --method "$METHOD" \
-  --temperature 0.6 --top-p 0.95 --max-tokens 32768 \
+  --temperature "$TEMP" --top-p 0.95 --max-tokens 32768 \
   --context-window "$CTX" --context-safety-margin 16 \
   --timeout-sec 7200 --max-sample-sec 7200 --attempts 3 \
   --enable-thinking --seed 20260722 \

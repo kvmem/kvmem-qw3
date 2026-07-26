@@ -310,6 +310,14 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
 
     std::vector<bool> now_selected(block_count(), false);
     for (uint32_t id : selected_ids) now_selected[id] = true;
+    std::vector<bool> was_in_working_set(block_count(), false);
+    for (const KvMemBlock &b : blocks_) {
+        was_in_working_set[b.block_id] = b.in_working_set;
+        if (b.in_working_set && now_selected[b.block_id]) {
+            ++plan.selection_overlap_blocks;
+        }
+    }
+    const bool force_full_reload = !cfg_.hierarchical_reuse;
 
     // Stage-out: any GPU-resident block that is not selected. On the first
     // post-prefill selection, many cold blocks were never in the prior working
@@ -317,7 +325,8 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
     // Their cache pages keep whatever bake they currently hold (baked_pos
     // unchanged); a future re-selection will de-rotate from there.
     for (auto &b : blocks_) {
-        if (b.tier == KvTier::GPU && !now_selected[b.block_id]) {
+        if (b.tier == KvTier::GPU &&
+            (!now_selected[b.block_id] || force_full_reload)) {
             plan.stage_out.push_back(b.block_id);
             b.in_working_set = false;
         }
@@ -327,7 +336,17 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
     uint32_t window_pos = 0;
     for (uint32_t id : selected_ids) {
         KvMemBlock &b = blocks_[id];
-        const bool cold = b.tier != KvTier::GPU;
+        const bool naturally_reusable =
+            was_in_working_set[id] && b.tier == KvTier::GPU;
+        if (naturally_reusable) {
+            if (b.baked_pos == static_cast<int64_t>(window_pos)) {
+                ++plan.retained_position_stable;
+            } else {
+                ++plan.retained_position_moved;
+            }
+            if (!force_full_reload) ++plan.gpu_reused_blocks;
+        }
+        const bool cold = b.tier != KvTier::GPU || force_full_reload;
         if (!b.in_working_set) plan.stage_in.push_back(id);
 
         KvMemRemap rm;
@@ -335,8 +354,17 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
         rm.n_tokens = b.n_tokens;
         rm.from_base = static_cast<int32_t>(b.baked_pos);   // de-rotate source
         rm.to_base = static_cast<int32_t>(window_pos);      // new window slot
-        rm.skip = (b.baked_pos == static_cast<int64_t>(window_pos));
-        if (cfg_.immutable_source_k && (cold || !rm.skip)) {
+        rm.working_k_resident = !cold;
+        const bool same_position =
+            b.baked_pos == static_cast<int64_t>(window_pos);
+        // A cold immutable block has no valid rotated working K on GPU: the
+        // tier record intentionally stores V but uses the position-free raw-K
+        // mirror as K authority. Even when its compact position is unchanged,
+        // it must be rematerialized after stage-in. Position equality alone is
+        // therefore insufficient to skip assembly.
+        rm.skip = same_position &&
+                  (!cfg_.immutable_source_k || rm.working_k_resident);
+        if (cfg_.immutable_source_k && (cold || !same_position)) {
             const uint64_t delta = static_cast<uint64_t>(
                 b.baked_pos > static_cast<int64_t>(window_pos)
                     ? b.baked_pos - static_cast<int64_t>(window_pos)
@@ -359,6 +387,10 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
                      cfg_.immutable_max_baked_position);
             rm.raw_refresh =
                 cold || remap_limit || delta_limit || baked_out_of_range;
+        }
+        if (rm.skip && rm.raw_refresh) {
+            throw std::logic_error(
+                "KVMem remap cannot both skip K assembly and refresh raw K");
         }
         plan.remaps.push_back(rm);
 

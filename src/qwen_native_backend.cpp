@@ -6035,14 +6035,60 @@ private:
         bs_cfg.update_mode = options_.kvmem_update_mode == "step"
             ? KvMemUpdateMode::Step
             : KvMemUpdateMode::Interval;
-        if (options_.kvmem_optimization_level == "opt_1") {
-            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt1;
-        } else if (options_.kvmem_optimization_level == "opt_2") {
-            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt2;
-        } else if (options_.kvmem_optimization_level == "opt_3") {
-            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt3;
+        if (options_.kvmem_optimization_level_explicit) {
+            if (!options_.kvmem_optimize_off.empty()) {
+                throw std::runtime_error(
+                    "--kvmem-optimization-level cannot be combined with "
+                    "--kvmem-optimize-off");
+            }
+            bs_cfg.legacy_optimization_profile = true;
+            if (options_.kvmem_optimization_level == "opt_1") {
+                bs_cfg.optimization_level = KvMemOptimizationLevel::Opt1;
+            } else if (options_.kvmem_optimization_level == "opt_2") {
+                bs_cfg.optimization_level = KvMemOptimizationLevel::Opt2;
+            } else if (options_.kvmem_optimization_level == "opt_3") {
+                bs_cfg.optimization_level = KvMemOptimizationLevel::Opt3;
+            } else {
+                bs_cfg.optimization_level =
+                    KvMemOptimizationLevel::KvmemInit;
+            }
+            bs_cfg.proactive_stage_out =
+                bs_cfg.optimization_level >= KvMemOptimizationLevel::Opt2;
+            // GPU set-difference reuse historically applied at every level;
+            // Opt1 only changed the CPU replacement policy.
+            bs_cfg.hierarchical_reuse = true;
+            bs_cfg.packed_rematerialization =
+                bs_cfg.optimization_level >= KvMemOptimizationLevel::Opt3;
+            std::fprintf(
+                stderr,
+                "[kvmem-opt-warning] --kvmem-optimization-level=%s is a "
+                "deprecated compatibility profile; omit it for the "
+                "default all-on configuration\n",
+                options_.kvmem_optimization_level.c_str());
         } else {
-            bs_cfg.optimization_level = KvMemOptimizationLevel::KvmemInit;
+            // Opt3 supplies the common bounded tiering infrastructure. The
+            // three paper-facing groups below are independently disabled
+            // without changing correctness mechanisms or storage budgets.
+            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt3;
+            bs_cfg.proactive_stage_out = true;
+            bs_cfg.hierarchical_reuse = true;
+            bs_cfg.packed_rematerialization = true;
+            for (const std::string &name : options_.kvmem_optimize_off) {
+                if (name == "all") {
+                    bs_cfg.proactive_stage_out = false;
+                    bs_cfg.hierarchical_reuse = false;
+                    bs_cfg.packed_rematerialization = false;
+                } else if (name == "proactive-stage-out") {
+                    bs_cfg.proactive_stage_out = false;
+                } else if (name == "hierarchical-reuse") {
+                    bs_cfg.hierarchical_reuse = false;
+                } else if (name == "packed-rematerialization") {
+                    bs_cfg.packed_rematerialization = false;
+                } else {
+                    throw std::runtime_error(
+                        "unknown KVMem optimize-off group: " + name);
+                }
+            }
         }
         exec.set_kvmem_enabled(true);
         exec.configure_kvmem(bs_cfg);

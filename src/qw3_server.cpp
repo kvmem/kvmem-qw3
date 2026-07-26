@@ -1068,6 +1068,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         setenv_value("QW3_CONTINUOUS_BATCHING_MTP_KV_POOL_PAGES", cfg.mtp_kv_pool_pages);
     }
 
+    std::string kvmem_optimize_off = "none";
+    if (!engine.kvmem_optimize_off.empty()) {
+        kvmem_optimize_off.clear();
+        for (const std::string &name : engine.kvmem_optimize_off) {
+            if (!kvmem_optimize_off.empty()) kvmem_optimize_off += ",";
+            kvmem_optimize_off += name;
+        }
+    }
+    const char *kvmem_performance_mode =
+        engine.kvmem_optimization_level_explicit
+            ? "legacy"
+            : (engine.kvmem_optimize_off.empty()
+                   ? "default-all-on" : "feature-ablation");
     std::cerr << "[qw3-serve] effective serving parameters:\n"
               << "  host=" << cfg.host << "\n"
               << "  port=" << cfg.port << "\n"
@@ -1129,8 +1142,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_block_tokens=" << engine.kvmem_block_tokens << "\n"
               << "  kvmem_budget=" << engine.kvmem_budget << "\n"
               << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
+              << "  kvmem_performance_mode="
+              << kvmem_performance_mode << "\n"
               << "  kvmem_optimization_level="
-              << engine.kvmem_optimization_level << "\n"
+              << engine.kvmem_optimization_level
+              << (engine.kvmem_optimization_level_explicit
+                      ? "(legacy-explicit)" : "(common-infrastructure)")
+              << "\n"
+              << "  kvmem_optimize_off=" << kvmem_optimize_off << "\n"
               << "  kvmem_query_conditioned="
               << yesno(engine.kvmem_query_conditioned) << "\n"
               << "  kvmem_recompute_query="

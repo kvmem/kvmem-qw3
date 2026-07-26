@@ -3,8 +3,9 @@
 本文档记录 KVMem 当前仍未解决的问题，供后续实现、回归测试和实验解释使用。
 它只记录当前仍需处理的事项；已经修复的问题单独列在文末，避免重复诊断。
 
-- 快照日期：2026-07-23
-- 代码基线：`7665d25` 之后的 immutable raw-K / MTP compact-position 工作树
+- 快照日期：2026-07-26
+- 代码基线：`codex/kvmem-storage-optimizations` 当前 immutable raw-K /
+  MTP compact-position / tiered-I/O 工作树
 - 默认重点路径：`fp16 KV + query-conditioned mean-k + step update`
 - 状态约定：`OPEN` 表示尚未修复，`RESEARCH` 表示属于算法研究问题而非明确的实现错误，
   `LIMITATION` 表示已知但暂未支持的配置或性能限制。
@@ -20,18 +21,18 @@
 
 | ID | Priority | Type | Status | Summary |
 | --- | --- | --- | --- | --- |
-| KVMI-001 | P0 | Correctness/API | OPEN | 缺少完整的 context/query/control message 语义和硬保留机制 |
+| KVMI-001 | P0 | Correctness/API | IMPLEMENTED / PARTIAL RUNTIME VALIDATION | 缺少完整的 context/query/control message 语义和硬保留机制 |
 | KVMI-002 | P1 | Correctness | OPEN | 多轮 prefix reuse 下 partial block 的 mean-key 索引可能过期或缺失 |
 | KVMI-003 | P1 | Correctness | FIXED / RUNTIME VALIDATED | warm prefix checkpoint 受 query replay 边界约束，完整 query 可重新捕获 |
 | KVMI-004 | P1 | Correctness/Observability | IMPLEMENTED / PARTIAL RUNTIME VALIDATION | scorer fallback 已记录 requested/used/reason，成功与 missing-query 降级已实测 |
 | KVMI-005 | P1 | Scalability | OPEN | per-token ExactMass 仍有 shared-memory block 上限和不可接受的显存增长 |
-| KVMI-006 | P1 | Experiment integrity | OPEN | 默认测试二进制尚未包含最新 prefill-pressure 修复 |
+| KVMI-006 | P1 | Experiment integrity | FIXED | 默认测试二进制尚未包含最新 prefill-pressure 修复 |
 | KVMI-007 | P2 | Retrieval quality | RESEARCH | mean-k 会稀释和碎片化长 session 中的相关证据 |
 | KVMI-008 | P2 | Retrieval quality | RESEARCH | retrieval query hidden state 会受临时 prefill pressure window 影响 |
 | KVMI-009 | P3 | Compatibility/Performance | LIMITATION | q8/fp8、layered MTP、同步 NVMe 写和 host selector 等限制 |
 | KVMI-010 | P3 | Documentation | OPEN | README 和部分方法文档仍描述已经删除的旧 CLI 语义 |
-| KVMI-011 | P0 | Correctness/Numerics | FIX PROTOTYPE | fp16 K 反复原地 re-RoPE 会累积漂移；immutable source K 正在真实样本验证 |
-| KVMI-011A | P0 | Correctness/Position | IMPLEMENTED / GPU VALIDATION PENDING | MTP logical position 与 compact RoPE position 已分离 |
+| KVMI-011 | P0 | Correctness/Numerics | IMPLEMENTED / PARTIAL REAL-SAMPLE VALIDATION | fp16/fp8 K 反复原地 re-RoPE 会累积漂移；immutable raw-K 提供有界重置 |
+| KVMI-011A | P0 | Correctness/Position | IMPLEMENTED / RUNTIME VALIDATED | MTP logical position 与 compact RoPE position 已分离 |
 | KVMI-012 | P0 | Correctness/Hybrid state | RESEARCH | normal-attention blocks 重选后，DeltaNet recurrent state 仍来自原时间线 checkpoint |
 
 ## 2. Detailed Issues
@@ -166,7 +167,7 @@ prefill 分支，以及 `QwenExecutor::kvmem_query_capture_complete`。
 
 ### KVMI-004 — Silent scorer fallback
 
-**Status:** OPEN
+**Status:** IMPLEMENTED / PARTIAL RUNTIME VALIDATION
 **Priority:** P1
 
 `kvmem_prepare_reselect` 在 query/index/kernel 不可用时，会从配置的 mean-k 或 per-token
@@ -254,7 +255,7 @@ cold prefill。
 
 ### KVMI-006 — Canonical binary is older than the pressure-policy fix
 
-**Status:** OPEN
+**Status:** FIXED
 **Priority:** P1
 
 源代码提交 `119ce05` 已实现 deterministic sink+full-recent-tail prefill-pressure policy，并有
@@ -264,12 +265,14 @@ cold prefill。
 
 这不是未修复的源代码 bug，而是实验发布/可复现性问题。
 
-建议修复：
+已完成：
 
-1. 重新构建 canonical `build/qw3` 并运行完整 KVMem tests。
-2. 所有 eval scripts 支持统一的 `QW3_BIN` override，避免硬编码。
-3. 每次实验在 `run_config.json` 中记录 git commit、binary mtime/hash 和关键环境变量。
-4. 对最新 binary 再运行一次 multi-turn pressure regression；单轮 AgentLongBench 不能覆盖该问题。
+1. canonical `build/qw3` 已在 2026-07-26 重新构建，完整 12 项测试通过。
+2. 最新 binary 已完成 512K AgentLongBench prefill、pressure selection、query replay、
+   immutable raw-K 和 MTP-4 的真实请求验证。
+
+仍建议后续增强实验 provenance：所有 eval scripts 支持统一的 `QW3_BIN` override，并在
+`run_config.json` 中记录 git commit、binary hash 和关键环境变量。
 
 ### KVMI-007 — Fragmented retrieval and mean-key dilution
 
@@ -346,7 +349,7 @@ LongMemEval-S 500 samples 上从默认路径的 77.2% 降到 57.0%，不能作�
 
 ### KVMI-011 — Repeated in-place fp16 re-RoPE changes historical K
 
-**Status:** FIX PROTOTYPE / REAL-SAMPLE VALIDATION
+**Status:** IMPLEMENTED / PARTIAL REAL-SAMPLE VALIDATION
 **Priority:** P0
 
 默认 window assembly 会直接修改 repository 中的 fp16 K：从当前 `baked_pos`
@@ -365,11 +368,17 @@ de-RoPE，再 RoPE 到新窗口位置。单次映射的误差很小，但 transc
   准确率根因；不常被选中的 gold block 可能只经历很少映射。
 
 当前默认修复已改为 immutable raw-K：标准层在 RoPE 前把 raw-K 保存到 CPU，GPU 仅保留
-一份活动 K/V。小幅重选继续做增量 re-RoPE；冷加载、累计 32 次旋转或累计位置位移达到
+一份活动 K/V。小幅重选继续做增量 re-RoPE；冷加载、累计 8 次旋转或累计位置位移达到
 262144 token 后，从 CPU raw-K 大块 H2D，并在 GPU 上 scatter + 一次 RoPE。标准层
 CPU/NVMe spill 只保存 V，去除了旧方案在 GPU 上额外的完整 working-K（fp16 256K
 约 8 GiB）。`--kvmem-cpu-gb` 现在包含 raw-K mirror；Qwen3.6-27B fp16 每 256K
 真实上下文约需 8 GiB CPU raw-K。
+
+2026-07-26 使用生产 CUDA kernel 的数值 sweep 与 512K AgentLongBench 控制实验进一步
+确认了阈值需求：FP16 连续 32 次原位 re-RoPE 在 `temperature=0` 下把一个 canonical
+正确样本从答案 `1` 改为 `0`；canonical raw-K 重建恢复正确答案。FP8 的 8 次配置在配对
+样本上与 canonical 输出一致。基于该结果，FP16 和 FP8 的默认计数阈值统一为 8；环境
+覆盖只保留给受控实验。
 
 若该修复不能恢复 gold-block-complete 的样本，下一根因应转向 source KV 的上下文构建
 质量（尤其是 pressure window 下构建的 hidden state）及 first-pass query 所依赖的上一轮
@@ -377,7 +386,7 @@ CPU/NVMe spill 只保存 V，去除了旧方案在 GPU 上额外的完整 workin
 
 ### KVMI-011A — MTP prefix used out-of-range logical RoPE positions
 
-**Status:** IMPLEMENTED / GPU VALIDATION PENDING
+**Status:** IMPLEMENTED / RUNTIME VALIDATED
 **Priority:** P0
 
 目标模型在 KVMem pressure 后使用压缩到 256K 内的 attention window，但旧 MTP prefix
@@ -409,8 +418,10 @@ executor 配置时要求 `kvmem_budget + gen_budget <= n_ctx_train`，backend �
 都有第二层范围检查。`QW3_KVMEM_MTP_LOCAL_POSITIONS=0` 可恢复旧路径做 A/B。没有使用
 logical position modulo/clamp。
 
-尚未完成的是正在占用 GPU 的旧 10-sample 实验结束后的 CUDA parity/smoke，以及
-LongMemEval-M frozen-10 的真实准确率复测；因此这里暂不标记为 CLOSED。
+CUDA parity、完整 12 项 build tests，以及多轮 512K AgentLongBench 的 pressure
+selection/query replay/MTP-4 请求均已通过；运行日志确认 compact MTP position 未超过
+模型的 256K 原生范围。LongMemEval-M frozen-10 的完整准确率复测仍属于后续质量评估，
+不再是位置安全修复的代码阻塞项。
 
 ### KVMI-012 — Selected attention window and recurrent state describe different histories
 

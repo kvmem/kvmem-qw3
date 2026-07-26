@@ -129,6 +129,11 @@ if(QW3_BUILD_TESTS)
         set_property(TARGET qw3-rope-remap-batched-parity PROPERTY CUDA_STANDARD_REQUIRED ON)
         add_test(NAME qw3-rope-remap-batched-parity COMMAND qw3-rope-remap-batched-parity)
 
+        add_executable(qw3-rope-remap-drift tests/rope_remap_drift.cu)
+        target_link_libraries(qw3-rope-remap-drift PRIVATE qw3_core)
+        set_property(TARGET qw3-rope-remap-drift PROPERTY CUDA_STANDARD 17)
+        set_property(TARGET qw3-rope-remap-drift PROPERTY CUDA_STANDARD_REQUIRED ON)
+
         add_executable(qw3-kvmem-deltanet-score tests/kvmem_deltanet_score.cu)
         target_link_libraries(qw3-kvmem-deltanet-score PRIVATE qw3_core)
         set_property(TARGET qw3-kvmem-deltanet-score PROPERTY CUDA_STANDARD 17)
