@@ -225,6 +225,30 @@ When MTP is disabled (`--mtp-chain 0`, the serving default), qwen-native also
 skips uploading the unused MTP draft weights. Enabling MTP or its diagnostic
 trace automatically restores those weights at model load.
 
+#### Recommended 24 GiB NVFP4 profile
+
+For the Unsloth Qwen3.6-27B-NVFP4 checkpoint on a 24 GiB GPU, prefer
+single-request serving with CPU-resident input embeddings, FP8 KV cache, a
+96K-token context, 1024-token prefill chunks, and MTP disabled:
+
+```sh
+./build-cu13/qw3 serve \
+  --model /path/to/Qwen3.6-27B-NVFP4 \
+  --host 127.0.0.1 --port 18080 \
+  --ctx 98304 \
+  --kv-dtype fp8 \
+  --prefill-chunk 1024 \
+  --cpu-embedding \
+  --mtp-chain 0 \
+  --no-continuous-batching
+```
+
+This profile reached a measured peak of approximately 22.63 GiB with a
+96,490-token prompt, leaving about 1.37 GiB of a nominal 24 GiB device for
+runtime variation. The `--ctx` limit includes both prompt and generated tokens,
+so their combined length must remain at or below 98,304. Exact headroom varies
+with the CUDA build, driver, and GPU.
+
 For the FlashInfer wheel layout used by the `vllm` environment:
 
 ```sh
