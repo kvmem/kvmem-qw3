@@ -94,10 +94,10 @@ or still-mutable blocks are not treated as clean.
 
 Proactive writeback does not primarily reduce the number of bytes that must
 eventually be stored.  Instead, it removes those bytes from the inference
-critical path.  In our controlled CPU-only experiment, aggregate stage-out
-decreased from \(2{,}786\)~ms to \(50\)~ms.  On the matched 512K-context
-sample, aggregate stage-out decreased from \(4{,}579\)~ms to \(39\)~ms,
-turning pressure-time eviction into an almost metadata-only operation.
+critical path.  In our controlled CPU-only 512K-context experiment, aggregate
+stage-out across 12 reselections decreased from \(3.645\)~s to \(0.268\)~s,
+a \(92.7\%\) reduction, turning pressure-time eviction into an almost
+metadata-only operation.
 
 \subsection{Retrieval-Aware Hierarchical Reuse}
 \label{sec:retrieval-aware-hierarchical-reuse}
@@ -245,11 +245,11 @@ correctness, KVMem does not repeatedly apply positional deltas to a
 low-precision working K; position changes are reconstructed from the
 immutable raw-K authority.
 
-In our controlled CPU stage-in experiment, packed transfer reduced stage-in
-from \(1{,}583\)~ms to \(359\)~ms and reduced H2D submission time from
-\(1{,}518\)~ms to \(43.5\)~ms.  The full rematerialization pipeline reduced
-final KV assembly and re-RoPE from \(2{,}032\)~ms to \(687\)~ms, a
-\(2.96\times\) speedup.
+In our controlled CPU-only 512K-context experiment, adding packed
+rematerialization after proactive writeback and hierarchical reuse reduced
+aggregate stage-in wall time from \(1.613\)~s to \(0.310\)~s.  Aggregate KV
+assembly and re-RoPE decreased from \(28.478\)~s to \(7.901\)~s, a
+\(3.60\times\) speedup across 12 reselections.
 
 \subsection{End-to-End Working-Set Update}
 \label{sec:end-to-end-working-set-update}
@@ -273,8 +273,9 @@ The optimizations address orthogonal components of KVMem overhead:
         transfer and reconstruction of the remaining misses.
 \end{itemize}
 On the current controlled 512K-context workload, the measured KVMem management
-overhead decreased from approximately \(7.21\)~s to \(1.03\)~s, an
-\(85.7\%\) reduction.  Lower-level mechanisms such as scalable one-dot
+overhead across 12 reselections decreased from \(63.957\)~s to \(8.488\)~s,
+an \(86.7\%\) reduction and a \(7.53\times\) speedup.  End-to-end TTFT
+decreased from \(341.844\)~s to \(287.176\)~s.  Lower-level mechanisms such as scalable one-dot
 retrieval scoring, coalesced SSD I/O, persistent worker pools, and prefill-plan
 reuse support the scalability of this pipeline, but are implementation details
 rather than separate high-level optimizations.

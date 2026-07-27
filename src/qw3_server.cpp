@@ -1517,11 +1517,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 return;
             }
         }
+        const bool has_kvmem_query =
+            req.contains("kvmem_query_span") ||
+            req.contains("kvmem_query_message_range");
         if (kvmem_reselect_mode == KvMemReselectMode::Force &&
-            !req.contains("kvmem_query_span")) {
+            !has_kvmem_query) {
             set_error_response(
                 res, 400,
-                "kvmem_reselect=force requires kvmem_query_span");
+                "kvmem_reselect=force requires kvmem_query_span or "
+                "kvmem_query_message_range");
             return;
         }
         if (kvmem_reselect_mode == KvMemReselectMode::Force &&
@@ -1532,10 +1536,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
         if (kvmem_reselect_mode == KvMemReselectMode::Off &&
-            req.contains("kvmem_query_span")) {
+            has_kvmem_query) {
             set_error_response(
                 res, 400,
-                "kvmem_query_span cannot be used with kvmem_reselect=off");
+                "KVMem query metadata cannot be used with "
+                "kvmem_reselect=off");
+            return;
+        }
+        if (req.contains("kvmem_query_span") &&
+            req.contains("kvmem_query_message_range")) {
+            set_error_response(
+                res, 400,
+                "kvmem_query_span and kvmem_query_message_range are "
+                "mutually exclusive");
             return;
         }
         const bool enable_thinking =
@@ -1608,6 +1621,137 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.kvmem_prefill_window_mode = kvmem_prefill_window_mode;
         g.kvmem_session_id = kvmem_session_id;
 
+        // One-shot selected-context cache refresh ablation. This never uses
+        // trace dumps or cross-request artifacts: the native backend performs
+        // the long prefill, freezes the final selection, and rebuilds that
+        // compact context inside the same request. Keep it explicitly gated so
+        // production clients cannot opt into an expensive representation test.
+        if (req.contains("kvmem_inline_refresh")) {
+            if (!engine.kvmem_enabled) {
+                set_error_response(
+                    res, 400, "kvmem_inline_refresh requires --kvmem");
+                return;
+            }
+            if (!env_flag_enabled("QW3_KVMEM_ENABLE_INLINE_REFRESH")) {
+                set_error_response(
+                    res, 403,
+                    "kvmem_inline_refresh is disabled; set "
+                    "QW3_KVMEM_ENABLE_INLINE_REFRESH=1 for controlled "
+                    "diagnostics");
+                return;
+            }
+            if (!req["kvmem_inline_refresh"].is_string()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_inline_refresh must be \"kv_only\" or "
+                    "\"kv_and_state\"");
+                return;
+            }
+            const std::string mode =
+                req["kvmem_inline_refresh"].get<std::string>();
+            if (mode == "kv_only") {
+                g.kvmem_inline_refresh = KvMemInlineRefreshMode::KvOnly;
+            } else if (mode == "kv_and_state") {
+                g.kvmem_inline_refresh =
+                    KvMemInlineRefreshMode::KvAndState;
+            } else {
+                set_error_response(
+                    res, 400,
+                    "kvmem_inline_refresh must be \"kv_only\" or "
+                    "\"kv_and_state\"");
+                return;
+            }
+            if (transcript_replay || !kvmem_session_id.empty()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_inline_refresh requires a standalone one-shot "
+                    "request");
+                return;
+            }
+            std::cerr << "[qw3-serve] KVMem INLINE REFRESH enabled mode="
+                      << mode << " prompt_tokens=" << prompt_token_count
+                      << "\n";
+        }
+
+        // Diagnostics-only oracle selection. The benchmark caller supplies
+        // exact rendered-prompt token spans after verifying tokenizer parity.
+        // Keeping this behind an explicit environment gate prevents a normal
+        // API client from accidentally turning gold provenance into a product
+        // feature or contaminating production evaluations.
+        if (req.contains("kvmem_oracle_token_spans")) {
+            if (!engine.kvmem_enabled) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_oracle_token_spans requires --kvmem");
+                return;
+            }
+            if (transcript_replay) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_oracle_token_spans is a final-query-only control "
+                    "and cannot be combined with kvmem_transcript_replay");
+                return;
+            }
+            if (!env_flag_enabled("QW3_KVMEM_ENABLE_ORACLE")) {
+                set_error_response(
+                    res, 403,
+                    "kvmem_oracle_token_spans is disabled; set "
+                    "QW3_KVMEM_ENABLE_ORACLE=1 for controlled diagnostics");
+                return;
+            }
+            const json &spans = req["kvmem_oracle_token_spans"];
+            if (!spans.is_array() || spans.empty() || spans.size() > 64) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_oracle_token_spans must be an array of 1..64 spans");
+                return;
+            }
+            for (const json &span : spans) {
+                if (!span.is_object() || !span.contains("begin") ||
+                    !span.contains("end") ||
+                    !span["begin"].is_number_integer() ||
+                    !span["end"].is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "each kvmem_oracle_token_spans entry requires integer "
+                        "begin and end");
+                    return;
+                }
+                const int64_t begin = span["begin"].get<int64_t>();
+                const int64_t end = span["end"].get<int64_t>();
+                if (begin < 0 || end <= begin ||
+                    end > static_cast<int64_t>(prompt_token_count)) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_oracle_token_spans entry is outside the "
+                        "rendered prompt");
+                    return;
+                }
+                g.kvmem_oracle_token_spans.push_back(
+                    GenerationOptions::KvMemOracleTokenSpan{
+                        static_cast<uint32_t>(begin),
+                        static_cast<uint32_t>(end)});
+            }
+            if (req.contains("kvmem_oracle_only")) {
+                if (!req["kvmem_oracle_only"].is_boolean()) {
+                    set_error_response(
+                        res, 400, "kvmem_oracle_only must be a boolean");
+                    return;
+                }
+                g.kvmem_oracle_only =
+                    req["kvmem_oracle_only"].get<bool>();
+            }
+            std::cerr << "[qw3-serve] KVMem ORACLE enabled spans="
+                      << g.kvmem_oracle_token_spans.size()
+                      << " only=" << (g.kvmem_oracle_only ? 1 : 0)
+                      << " prompt_tokens=" << prompt_token_count << "\n";
+        } else if (req.contains("kvmem_oracle_only")) {
+            set_error_response(
+                res, 400,
+                "kvmem_oracle_only requires kvmem_oracle_token_spans");
+            return;
+        }
+
         // Query-conditioned KVMem: mark the final user message's token span so
         // the executor selects the decode window by multi-token mean relevance
         // to the question instead of recency. Computed by render-twice-and-diff
@@ -1621,6 +1765,89 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             kvmem_reselect_mode != KvMemReselectMode::Off) {
             const json &msgs = req["messages"];
             bool explicit_span = false;
+
+            // Experimental whole-round query. Unlike kvmem_query_span, which
+            // marks bytes inside one message, this half-open message range can
+            // cover a role-preserving user/assistant/tool round. Re-rendering
+            // with those messages removed and taking the token LCP/LCS keeps
+            // the mapping exact across chat-template control tokens. The
+            // ordinary API path never sends this field.
+            if (req.contains("kvmem_query_message_range")) {
+                const json &range = req["kvmem_query_message_range"];
+                if (!range.is_object() ||
+                    !range.contains("message_begin") ||
+                    !range.contains("message_end") ||
+                    !range["message_begin"].is_number_integer() ||
+                    !range["message_end"].is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_message_range requires integer "
+                        "message_begin and message_end");
+                    return;
+                }
+                const int64_t message_begin =
+                    range["message_begin"].get<int64_t>();
+                const int64_t message_end =
+                    range["message_end"].get<int64_t>();
+                if (message_begin < 0 || message_end <= message_begin ||
+                    message_end > static_cast<int64_t>(msgs.size())) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_message_range is outside messages[]");
+                    return;
+                }
+                if (transcript_replay) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_message_range cannot be combined with "
+                        "kvmem_transcript_replay");
+                    return;
+                }
+
+                json msgs_empty = json::array();
+                for (size_t i = 0; i < msgs.size(); ++i) {
+                    if (i < static_cast<size_t>(message_begin) ||
+                        i >= static_cast<size_t>(message_end)) {
+                        msgs_empty.push_back(msgs[i]);
+                    }
+                }
+                const std::string empty_prompt = render_messages(
+                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    /*message_spans=*/nullptr,
+                    /*add_generation_prompt=*/!prefill_only);
+                const std::vector<int32_t> tok_empty =
+                    usage_tokenizer.encode(empty_prompt);
+                size_t qb = 0;
+                const size_t prefix_max =
+                    std::min(prompt_token_ids.size(), tok_empty.size());
+                while (qb < prefix_max &&
+                       prompt_token_ids[qb] == tok_empty[qb]) {
+                    ++qb;
+                }
+                size_t suffix = 0;
+                while (suffix < prompt_token_ids.size() - qb &&
+                       suffix < tok_empty.size() - qb &&
+                       prompt_token_ids[prompt_token_ids.size() - 1 - suffix] ==
+                           tok_empty[tok_empty.size() - 1 - suffix]) {
+                    ++suffix;
+                }
+                const size_t qe = prompt_token_ids.size() - suffix;
+                if (qe <= qb) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_message_range maps to an empty token "
+                        "span");
+                    return;
+                }
+                g.kvmem_query_begin = static_cast<uint32_t>(qb);
+                g.kvmem_query_end = static_cast<uint32_t>(qe);
+                explicit_span = true;
+                std::cerr
+                    << "[qw3-serve] kvmem explicit query message range ["
+                    << message_begin << "," << message_end << ") -> tokens ["
+                    << qb << "," << qe << ") of "
+                    << prompt_token_ids.size() << "\n";
+            }
 
             // Experimental role-preserving transcript replay. Render-time byte
             // spans are converted to exact token spans in one linear pass over

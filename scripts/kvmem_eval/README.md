@@ -279,3 +279,8 @@ The cells use deterministic decoding by default and fail if an optimization
 changes the generated answer. `summarize_kvmem_perf_ablation.py` aggregates
 TTFT, stage-out, stage-in, assembly, total reselection time, GPU reuse, and
 peak GPU memory into JSON and Markdown artifacts.
+
+The canonical 512K results, exact metric definitions, hardware and runtime
+parameters, complete implemented-optimization inventory, raw artifact paths,
+memory control, and reproduction notes are recorded in
+`docs/kvmem_performance_evaluation_20260726.md`.

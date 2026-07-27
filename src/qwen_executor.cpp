@@ -968,6 +968,8 @@ void QwenExecutor::reset_state() {
     // stash. It is instead overwritten by the next PASS-A stash and only ever read
     // after a stash within the same request.
     kvmem_qc_pin_from_block_ = 0xffffffffu;
+    kvmem_oracle_token_spans_.clear();
+    kvmem_oracle_only_ = false;
     kvmem_trace_event_index_ = 0;
     kvmem_trace_event_count_ = 0;
     if (block_store_) {
@@ -4588,6 +4590,44 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
             static_cast<uint32_t>(mtp_window_pages_host_.size()));
         if (mtp_window_pages_host_.size() > mtp_window_page_count_) {
             mtp_window_pages_host_.resize(mtp_window_page_count_);
+        }
+    }
+}
+
+void QwenExecutor::restore_recurrent_state(const StateSnapshot &snapshot) {
+    if (!snapshot.ready) {
+        throw std::runtime_error(
+            "cannot restore recurrent state from an empty snapshot");
+    }
+    ensure_scratch();
+    if (snapshot.recurrent_states.size() != recurrent_states_.size() ||
+        snapshot.conv_states.size() != conv_states_.size()) {
+        throw std::runtime_error(
+            "recurrent-state snapshot layer count mismatch");
+    }
+    for (size_t i = 0; i < recurrent_states_.size(); ++i) {
+        if (recurrent_states_[i]) {
+            if (!snapshot.recurrent_states[i] ||
+                snapshot.recurrent_states[i]->count !=
+                    recurrent_states_[i]->count) {
+                throw std::runtime_error(
+                    "recurrent-state snapshot tensor mismatch at layer " +
+                    std::to_string(i));
+            }
+            require_status(backend_.copy_d2d(
+                *recurrent_states_[i], *snapshot.recurrent_states[i], 0,
+                recurrent_states_[i]->count));
+        }
+        if (conv_states_[i]) {
+            if (!snapshot.conv_states[i] ||
+                snapshot.conv_states[i]->count != conv_states_[i]->count) {
+                throw std::runtime_error(
+                    "conv-state snapshot tensor mismatch at layer " +
+                    std::to_string(i));
+            }
+            require_status(backend_.copy_d2d(
+                *conv_states_[i], *snapshot.conv_states[i], 0,
+                conv_states_[i]->count));
         }
     }
 }
@@ -9948,12 +9988,12 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             if (can_sweep) {
                 if (kvmem_retrieval_score_mean_softmax(0)) {
                     kvmem_pending_plan_ =
-                        block_store_->set_selection(block_store_->pick_topk_blocks());
+                        block_store_->set_selection(kvmem_selection_with_pin());
                     dump_snapshot(0);
                 }
                 if (kvmem_retrieval_score_mean_softmax(1)) {
                     kvmem_pending_plan_ =
-                        block_store_->set_selection(block_store_->pick_topk_blocks());
+                        block_store_->set_selection(kvmem_selection_with_pin());
                     dump_snapshot(1);
                 }
                 // Restore production-consistent scoring/selection.
@@ -11888,18 +11928,79 @@ void QwenExecutor::kvmem_restore_clean_query() {
 // drive target/MTP RoPE past n_ctx_train near the end of the generation reserve.
 // With no pin (the default cleared by reset_state), preserve the ordinary
 // selector byte-for-byte.
+void QwenExecutor::kvmem_set_oracle_token_spans(
+        const std::vector<std::pair<uint32_t, uint32_t>> &spans,
+        bool oracle_only) {
+    kvmem_oracle_token_spans_.clear();
+    kvmem_oracle_only_ = oracle_only && !spans.empty();
+    kvmem_oracle_token_spans_.reserve(spans.size());
+    for (const auto &[begin, end] : spans) {
+        if (end <= begin) {
+            throw std::runtime_error(
+                "KVMem oracle token spans must be non-empty");
+        }
+        kvmem_oracle_token_spans_.emplace_back(begin, end);
+    }
+    if (!kvmem_oracle_token_spans_.empty() &&
+        std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr, "[bs-oracle] configured token_spans=%zu\n",
+                     kvmem_oracle_token_spans_.size());
+    }
+}
+
 std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
-    if (kvmem_qc_pin_from_block_ == 0xffffffffu) {
+    if (kvmem_qc_pin_from_block_ == 0xffffffffu &&
+        kvmem_oracle_token_spans_.empty()) {
         return block_store_->pick_topk_blocks();
     }
     const uint32_t nb = block_store_->block_count();
-    if (kvmem_qc_pin_from_block_ >= nb) {
-        return block_store_->pick_topk_blocks();
-    }
     std::vector<uint32_t> mandatory;
-    mandatory.reserve(nb - kvmem_qc_pin_from_block_);
-    for (uint32_t id = kvmem_qc_pin_from_block_; id < nb; ++id) {
-        mandatory.push_back(id);
+    if (kvmem_qc_pin_from_block_ < nb) {
+        mandatory.reserve(nb - kvmem_qc_pin_from_block_);
+        for (uint32_t id = kvmem_qc_pin_from_block_; id < nb; ++id) {
+            mandatory.push_back(id);
+        }
+    }
+    if (!kvmem_oracle_token_spans_.empty()) {
+        const uint32_t bt =
+            std::max<uint32_t>(1, block_store_->config().block_tokens);
+        for (const auto &[begin, end] : kvmem_oracle_token_spans_) {
+            const uint32_t first = begin / bt;
+            const uint32_t last = (end - 1) / bt;
+            if (first >= nb) continue;
+            const uint32_t capped_last = std::min(last, nb - 1);
+            for (uint32_t id = first; id <= capped_last; ++id) {
+                mandatory.push_back(id);
+            }
+        }
+        std::sort(mandatory.begin(), mandatory.end());
+        mandatory.erase(std::unique(mandatory.begin(), mandatory.end()),
+                        mandatory.end());
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(stderr,
+                         "[bs-oracle] materialized_blocks=%u mandatory=%zu\n",
+                         nb, mandatory.size());
+        }
+    }
+    if (kvmem_oracle_only_) {
+        const uint32_t sink =
+            std::min(block_store_->config().sink_blocks, nb);
+        for (uint32_t id = 0; id < sink; ++id) {
+            mandatory.push_back(id);
+        }
+        std::sort(mandatory.begin(), mandatory.end());
+        mandatory.erase(std::unique(mandatory.begin(), mandatory.end()),
+                        mandatory.end());
+        if (mandatory.size() > block_store_->budget_blocks()) {
+            throw std::runtime_error(
+                "KVMem oracle-only selection exceeds the configured budget");
+        }
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(stderr,
+                         "[bs-oracle] mode=only selected=%zu sink=%u\n",
+                         mandatory.size(), sink);
+        }
+        return mandatory;
     }
     return block_store_->pick_topk_blocks(mandatory);
 }

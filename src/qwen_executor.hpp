@@ -273,6 +273,11 @@ public:
     StateSnapshot snapshot_state();
     void capture_state(StateSnapshot &snapshot);
     void restore_state(const StateSnapshot &snapshot);
+    // Restore only the hybrid model's recurrent/conv tensors. Position, hidden
+    // state, normal-attention K/V, page tables, and KVMem selection stay live.
+    // Used by the gated inline-refresh ablation to isolate standard-KV refresh
+    // from recurrent-state refresh without disk artifacts.
+    void restore_recurrent_state(const StateSnapshot &snapshot);
     // Diagnostic query replay: after the ordinary post-prefill semantic
     // selection has been computed, keep that exact context selection, rewind
     // only the suffix beginning at a block-aligned query boundary, restore the
@@ -407,6 +412,12 @@ public:
     void kvmem_stash_clean_query();
     void kvmem_restore_clean_query();
     void kvmem_set_pin_from_block(uint32_t b) { kvmem_qc_pin_from_block_ = b; }
+    // Diagnostics-only oracle selection. Spans use logical prompt-token
+    // coordinates; every currently materialized block that overlaps a span is
+    // mandatory, but still consumes the configured selection budget.
+    void kvmem_set_oracle_token_spans(
+        const std::vector<std::pair<uint32_t, uint32_t>> &spans,
+        bool oracle_only = false);
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
     // it per executor. Set before configure_kvmem(); the pool must outlive this
     // executor. No-op effect when kvmem or the CPU tier is off.
@@ -1342,6 +1353,9 @@ private:
     // 0xffffffff => no pin. pick_topk result is unioned with [pin,block_count) in
     // kvmem_selection_with_pin() before set_selection at every reselect site.
     uint32_t kvmem_qc_pin_from_block_ = 0xffffffffu;
+    std::vector<std::pair<uint32_t, uint32_t>>
+        kvmem_oracle_token_spans_;
+    bool kvmem_oracle_only_ = false;
     std::vector<uint32_t> kvmem_selection_with_pin();
 
     // ---- Per-normal-attention-layer multi-layer selection (#85-#90) --------

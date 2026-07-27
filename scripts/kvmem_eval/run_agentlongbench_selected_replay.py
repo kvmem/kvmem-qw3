@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-base", default="http://127.0.0.1:8087/v1")
     parser.add_argument("--model", default="Qwen3.6-27B-Q8_0.gguf")
     parser.add_argument("--method", default="kvmem_selected_text_dense_replay")
+    parser.add_argument("--benchmark-name", default="AgentLongBench-selected-text")
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--max-tokens", type=int, default=32768)
@@ -155,9 +156,17 @@ def prepare_replays(
     prepared: list[dict[str, Any]] = []
     for delivery_index, snapshot in enumerate(snapshots, start=1):
         meta = snapshot["meta"]
-        sid = str(meta["trace_tag"])
+        trace_tag = str(meta["trace_tag"])
+        sid = trace_tag
+        # Controlled oracle captures suffix the request tag so their dump can
+        # coexist with an ordinary capture.  Dataset/evaluation IDs remain the
+        # underlying stable sample ID.
+        if sid not in samples and sid.endswith(".oracle"):
+            sid = sid[: -len(".oracle")]
         if sid not in samples:
-            raise RuntimeError(f"dataset is missing dump sample {sid}")
+            raise RuntimeError(
+                f"dataset is missing dump sample {trace_tag}"
+            )
         sample = samples[sid]
         prompt = canonical.full_context_prompt(sample)
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -252,6 +261,7 @@ def prepare_replays(
             {
                 "delivery_index": delivery_index,
                 "stable_sample_id": sid,
+                "dump_trace_tag": trace_tag,
                 "sample": sample,
                 "prompt_sha256": prompt_hash,
                 "original_prompt_tokens": len(rendered_ids),
@@ -378,6 +388,7 @@ def main() -> None:
     audit_keys = [
         "delivery_index",
         "stable_sample_id",
+        "dump_trace_tag",
         "prompt_sha256",
         "original_prompt_tokens",
         "selected_block_count",
@@ -448,7 +459,13 @@ def main() -> None:
                 max(1, args.context_window - len(server_ids) - args.context_safety_margin),
             )
             row = {
-                **runner.base_row(index, len(prepared), sample, args.method),
+                **runner.base_row(
+                    index,
+                    len(prepared),
+                    sample,
+                    args.method,
+                    args.benchmark_name,
+                ),
                 "prompt_mode": "raw_dense_replay_of_decoded_kvmem_selected_window",
                 "prompt_sha256": item["replay_prompt_sha256"],
                 "prompt_tokens": len(server_ids),
@@ -549,7 +566,12 @@ def main() -> None:
             flush=True,
         )
         runner.write_progress(args.output_root, selected_samples, index)
-    runner.write_final(args.output_root, selected_samples, args.method)
+    runner.write_final(
+        args.output_root,
+        selected_samples,
+        args.method,
+        args.benchmark_name,
+    )
     print(f"[complete] results={args.output_root}", flush=True)
 
 

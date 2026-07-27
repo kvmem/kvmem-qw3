@@ -13,9 +13,13 @@ CTX=${CTX:-655360}
 KVMEM_BUDGET=${KVMEM_BUDGET:-204800}
 GEN_BUDGET=${GEN_BUDGET:-32768}
 ACTIVE_CAPACITY=${ACTIVE_CAPACITY:-$((KVMEM_BUDGET + GEN_BUDGET))}
+KV_DTYPE=${KV_DTYPE:-fp16}
 CPU_GB=${CPU_GB:-64}
 NVME_GB=${NVME_GB:-0}
+GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.51}
 KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
+IMMUTABLE_REFRESH_TOKENS=${IMMUTABLE_REFRESH_TOKENS:-0}
+THINKING_BUDGET=${THINKING_BUDGET:-4096}
 TAG=${TAG:-agentlongbench_512k_normal100_turn_ingest_k200k_g32k_b32_20260724}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
@@ -29,6 +33,7 @@ PID_FILE=${PID_FILE:-$LOG_ROOT/${TAG}.pid}
 LIMIT=${LIMIT:-}
 EXPECTED=${EXPECTED:-${LIMIT:-100}}
 METHOD=${METHOD:-kvmem_turn_ingest_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_fp16}
+ROUND_QUERY=${ROUND_QUERY:-first_user}
 
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy=127.0.0.1,localhost
@@ -80,6 +85,7 @@ env \
   -u QW3_KVMEM_REBUILT_STATE_DIR \
   QW3_KVMEM_RECOMPUTE_QUERY=1 \
   QW3_KVMEM_IMMUTABLE_SOURCE_K=1 \
+  QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS="$IMMUTABLE_REFRESH_TOKENS" \
   QW3_KVMEM_TRACE=1 \
   QW3_KVMEM_TIMING=1 \
   QW3_FATTN_NSPLIT=1 \
@@ -87,17 +93,17 @@ env \
   QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
   "$ROOT/build/qw3" serve \
     --model "$MODEL" \
-    --ctx "$CTX" --kv-dtype fp16 \
+    --ctx "$CTX" --kv-dtype "$KV_DTYPE" \
     --kvmem --kvmem-block-tokens 32 \
     --kvmem-budget "$KVMEM_BUDGET" \
     --kvmem-gen-budget "$GEN_BUDGET" \
     --kvmem-sink-blocks 8 --kvmem-recent-blocks 0 \
     --kvmem-method retrieval --kvmem-retrieval-method mean-k \
     --kvmem-update-mode step --kvmem-query-conditioned \
-    --kvmem-immutable-k --kvmem-gpu-memory-ratio 0.51 \
+    --kvmem-immutable-k --kvmem-gpu-memory-ratio "$GPU_MEMORY_RATIO" \
     --kvmem-optimization-level "$KVMEM_OPT_LEVEL" \
     "${tier_args[@]}" \
-    --enable-thinking --thinking-budget 4096 \
+    --enable-thinking --thinking-budget "$THINKING_BUDGET" \
     --prefill-chunk 2048 --temp 0.6 \
     --native-mtp-speculate --mtp-chain 4 \
     --host 127.0.0.1 --port "$PORT" \
@@ -140,6 +146,7 @@ fi
   --model "$(basename "$MODEL")" \
   --method "$METHOD" \
   --active-capacity "$ACTIVE_CAPACITY" \
+  --round-query "$ROUND_QUERY" \
   --temperature 0.6 --top-p 0.95 --max-tokens 32768 \
   --timeout-sec 7200 --max-sample-sec 7200 --attempts 3 \
   --enable-thinking --seed 20260722 \

@@ -25,6 +25,16 @@ enum class KvMemPrefillWindowMode {
     KeepSelected,
 };
 
+// Diagnostics-only, one-shot selected-context rebuild. Off is the production
+// default. KvOnly refreshes normal-attention K/V in the compact selected
+// context while restoring the historical recurrent/conv state at the query
+// boundary; KvAndState rebuilds both representations from the selected text.
+enum class KvMemInlineRefreshMode {
+    Off,
+    KvOnly,
+    KvAndState,
+};
+
 struct EngineOptions {
     std::string model_path;
     BackendKind backend = BackendKind::QwenNative;
@@ -183,6 +193,26 @@ struct GenerationOptions {
     uint32_t kvmem_context_begin = 0;
     uint32_t kvmem_context_end = 0;
     std::string kvmem_trace_tag;
+    // Diagnostics-only oracle control. Each half-open span is expressed in
+    // already-rendered prompt-token coordinates and forces every overlapping
+    // historical KVMem block into the ordinary fixed-size selection budget.
+    // The server accepts this field only when QW3_KVMEM_ENABLE_ORACLE=1.
+    // Empty is the production/default path and leaves selection byte-identical.
+    struct KvMemOracleTokenSpan {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+    };
+    std::vector<KvMemOracleTokenSpan> kvmem_oracle_token_spans;
+    // When true, the final-query diagnostic selection contains only sink,
+    // oracle-overlapping, and pinned query-tail blocks. Ordinary retrieval
+    // candidates do not fill the unused budget.
+    bool kvmem_oracle_only = false;
+    // Diagnostics-only one-request ablation. After the ordinary long-context
+    // prefill and final semantic selection, replay exactly the selected source
+    // tokens in compact order and replace the answer-producing cache in memory.
+    // The server accepts this only behind QW3_KVMEM_ENABLE_INLINE_REFRESH=1.
+    KvMemInlineRefreshMode kvmem_inline_refresh =
+        KvMemInlineRefreshMode::Off;
     // ARCHIVED (2026-07-23): the DeltaNet recurrent-state export/import debug
     // interface is intentionally compiled out. See the request-parser note in
     // qw3_server.cpp and KVMI-012 for the measured results and rationale.

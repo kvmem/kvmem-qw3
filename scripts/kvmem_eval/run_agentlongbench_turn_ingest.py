@@ -86,6 +86,15 @@ def parse_args() -> argparse.Namespace:
             "generation reserve"
         ),
     )
+    parser.add_argument(
+        "--round-query",
+        choices=("first_user", "whole_round"),
+        default="first_user",
+        help=(
+            "query used for each above-capacity turn reselection; "
+            "whole_round is an experimental role-preserving ablation"
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--max-tokens", type=int, default=32768)
@@ -231,6 +240,7 @@ class SessionClient:
         reselect: str,
         prefill_window: str,
         query_span: dict[str, int] | None,
+        query_message_range: dict[str, int] | None,
         trace_tag: str,
     ) -> tuple[dict[str, Any], float]:
         payload: dict[str, Any] = {
@@ -249,6 +259,8 @@ class SessionClient:
         }
         if query_span is not None:
             payload["kvmem_query_span"] = query_span
+        if query_message_range is not None:
+            payload["kvmem_query_message_range"] = query_message_range
         if self.args.seed is not None:
             payload["seed"] = self.args.seed
         request = urllib.request.Request(
@@ -309,6 +321,7 @@ def prefill(
     reselect: str,
     prefill_window: str,
     query_span: dict[str, int] | None = None,
+    query_message_range: dict[str, int] | None = None,
 ) -> int:
     trace_tag = (
         f"alb-{sid[:20]}-a{attempt}-t{turn_index}-{phase}"
@@ -321,6 +334,7 @@ def prefill(
         reselect=reselect,
         prefill_window=prefill_window,
         query_span=query_span,
+        query_message_range=query_message_range,
         trace_tag=trace_tag,
     )
     answer, reasoning, finish_reason, prompt_tokens, completion_tokens = (
@@ -352,6 +366,7 @@ def prefill(
             "message_count": len(messages),
             "roles": [message["role"] for message in messages],
             "query_span": query_span,
+            "query_message_range": query_message_range,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "finish_reason": finish_reason,
@@ -429,6 +444,28 @@ def run_sample(
 
         if first_pressure_turn is None:
             first_pressure_turn = turn_index
+        if args.round_query == "whole_round":
+            logical_prompt_tokens += prefill(
+                client,
+                audit,
+                turn,
+                sid=sid,
+                session_id=session_id,
+                attempt=attempt,
+                turn_index=turn_index,
+                phase="whole_round_retrieval",
+                operation="append",
+                reselect="force",
+                prefill_window="pressure",
+                query_message_range={
+                    "message_begin": 0,
+                    "message_end": len(turn),
+                },
+            )
+            semantic_reselections += 1
+            prefill_request_count += 1
+            continue
+
         user = turn[0]
         user_content = str(user.get("content") or "")
         if not user_content:
@@ -483,6 +520,7 @@ def run_sample(
         reselect="force",
         prefill_window="pressure",
         query_span=final_span,
+        query_message_range=None,
         trace_tag=final_trace_tag,
     )
     total_latency = time.perf_counter() - final_started
@@ -534,6 +572,7 @@ def run_sample(
         "semantic_reselections": semantic_reselections,
         "prefill_request_count": prefill_request_count,
         "history_role_sha256": history_sha256(messages),
+        "round_query": args.round_query,
     }
 
 
@@ -592,8 +631,16 @@ def main() -> None:
         "prompt_mode": "role_preserving_incremental_turn_ingest",
         "turn_policy": "first_user_message_starts_each_logical_turn",
         "pressure_policy": "prior_logical_tokens_gte_active_capacity",
-        "retrieval_query_policy": "full_first_user_content",
-        "post_reselection_policy": "turn_remainder_keep_selected",
+        "retrieval_query_policy": (
+            "full_role_preserving_round"
+            if args.round_query == "whole_round"
+            else "full_first_user_content"
+        ),
+        "post_reselection_policy": (
+            "whole_round_query_replay"
+            if args.round_query == "whole_round"
+            else "turn_remainder_keep_selected"
+        ),
         "final_query_policy": "separate_user_message_force_reselect",
         "dataset_system_policy": "replace_with_canonical_task_system",
         "dataset": str(args.dataset),
@@ -606,6 +653,7 @@ def main() -> None:
         "api_base": args.api_base,
         "model": args.model,
         "active_capacity": args.active_capacity,
+        "round_query": args.round_query,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "max_tokens": args.max_tokens,

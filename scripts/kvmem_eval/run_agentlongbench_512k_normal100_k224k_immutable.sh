@@ -18,8 +18,13 @@ KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-}
 KVMEM_OPTIMIZE_OFF=${KVMEM_OPTIMIZE_OFF:-}
 KVMEM_BUDGET=${KVMEM_BUDGET:-229376}
 GEN_BUDGET=${GEN_BUDGET:-32768}
+KVMEM_BLOCK_TOKENS=${KVMEM_BLOCK_TOKENS:-32}
+KVMEM_RETRIEVAL_METHOD=${KVMEM_RETRIEVAL_METHOD:-mean-k}
+KVMEM_SUBBLOCKS=${KVMEM_SUBBLOCKS:-1}
+KVMEM_SUBBLOCK_REDUCE=${KVMEM_SUBBLOCK_REDUCE:-max}
 KV_DTYPE=${KV_DTYPE:-fp16}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
+GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.51}
 TEMP=${TEMP:-0.6}
 THINKING_BUDGET=${THINKING_BUDGET:-4096}
 TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_all_on}
@@ -41,6 +46,23 @@ BENCHMARK_NAME=${BENCHMARK_NAME:-AgentLongBench-512K-normal100}
 if [[ "$KV_DTYPE" != "fp16" && "$KV_DTYPE" != "fp8" ]]; then
   echo "KV_DTYPE must be fp16 or fp8, got: $KV_DTYPE" >&2
   exit 2
+fi
+if [[ "$KVMEM_RETRIEVAL_METHOD" != "mean-k" &&
+      "$KVMEM_RETRIEVAL_METHOD" != "per-token" &&
+      "$KVMEM_RETRIEVAL_METHOD" != "sub-block-mean-k" ]]; then
+  echo "invalid KVMEM_RETRIEVAL_METHOD: $KVMEM_RETRIEVAL_METHOD" >&2
+  exit 2
+fi
+if [[ "$KVMEM_RETRIEVAL_METHOD" == "sub-block-mean-k" ]]; then
+  if [[ ! "$KVMEM_SUBBLOCKS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "KVMEM_SUBBLOCKS must be a positive integer, got: $KVMEM_SUBBLOCKS" >&2
+    exit 2
+  fi
+  if [[ "$KVMEM_SUBBLOCK_REDUCE" != "max" &&
+        "$KVMEM_SUBBLOCK_REDUCE" != "sum" ]]; then
+    echo "KVMEM_SUBBLOCK_REDUCE must be max or sum, got: $KVMEM_SUBBLOCK_REDUCE" >&2
+    exit 2
+  fi
 fi
 if [[ ! "$PREFILL_CHUNK" =~ ^[1-9][0-9]*$ ]]; then
   echo "PREFILL_CHUNK must be a positive integer, got: $PREFILL_CHUNK" >&2
@@ -71,6 +93,16 @@ optimization_args=()
 if [[ -n "$KVMEM_OPT_LEVEL" && -n "$KVMEM_OPTIMIZE_OFF" ]]; then
   echo "KVMEM_OPT_LEVEL and KVMEM_OPTIMIZE_OFF are mutually exclusive" >&2
   exit 2
+fi
+
+retrieval_args=(
+  --kvmem-retrieval-method "$KVMEM_RETRIEVAL_METHOD"
+)
+if [[ "$KVMEM_RETRIEVAL_METHOD" == "sub-block-mean-k" ]]; then
+  retrieval_args+=(
+    --kvmem-subblocks "$KVMEM_SUBBLOCKS"
+    --kvmem-subblock-reduce "$KVMEM_SUBBLOCK_REDUCE"
+  )
 fi
 if [[ -n "$KVMEM_OPT_LEVEL" ]]; then
   case "$KVMEM_OPT_LEVEL" in
@@ -152,12 +184,12 @@ env \
   "$ROOT/build/qw3" serve \
     --model "$MODEL" \
     --ctx "$CTX" --kv-dtype "$KV_DTYPE" \
-    --kvmem --kvmem-block-tokens 32 \
+    --kvmem --kvmem-block-tokens "$KVMEM_BLOCK_TOKENS" \
     --kvmem-budget "$KVMEM_BUDGET" --kvmem-gen-budget "$GEN_BUDGET" \
     --kvmem-sink-blocks 8 --kvmem-recent-blocks 0 \
-    --kvmem-method retrieval --kvmem-retrieval-method mean-k \
+    --kvmem-method retrieval "${retrieval_args[@]}" \
     --kvmem-update-mode step --kvmem-query-conditioned \
-    --kvmem-immutable-k --kvmem-gpu-memory-ratio 0.51 \
+    --kvmem-immutable-k --kvmem-gpu-memory-ratio "$GPU_MEMORY_RATIO" \
     "${optimization_args[@]}" \
     "${tier_args[@]}" \
     --enable-thinking --thinking-budget "$THINKING_BUDGET" \

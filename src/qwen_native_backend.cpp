@@ -43,6 +43,15 @@ double wall_seconds() {
     return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
 }
 
+// Query replay only requires a fixed-stride, position-invariant Mean-K source
+// index. Sub-block Mean-K has the same property: it stores a fixed number of
+// equal sub-block means per physical block and differs only in boundary scoring.
+// Per-token and DeltaNet retrieval still use incompatible capture/state layouts.
+bool kvmem_query_replay_retrieval_supported(KvMemRetrievalMethod method) {
+    return method == KvMemRetrievalMethod::MeanK ||
+           method == KvMemRetrievalMethod::SubBlockMeanK;
+}
+
 // Vector-position counterpart of the executor's RoPE range diagnostic. The
 // continuous-batching paths feed ragged position arrays directly to CUDA, so
 // inspect the host mirror immediately before each Q/K RoPE launch pair. One
@@ -511,6 +520,79 @@ bool kvmem_clean_query_enabled() {
 bool kvmem_recompute_query_enabled(bool configured_default) {
     return env_flag_enabled("QW3_KVMEM_RECOMPUTE_QUERY",
                             configured_default);
+}
+
+const char *kvmem_inline_refresh_name(KvMemInlineRefreshMode mode) {
+    switch (mode) {
+    case KvMemInlineRefreshMode::Off: return "off";
+    case KvMemInlineRefreshMode::KvOnly: return "kv_only";
+    case KvMemInlineRefreshMode::KvAndState: return "kv_and_state";
+    }
+    return "unknown";
+}
+
+class ScopedKvmemDisable {
+public:
+    explicit ScopedKvmemDisable(QwenExecutor *executor)
+        : executor_(executor),
+          was_enabled_(executor_ && executor_->kvmem_enabled()) {
+        if (executor_) executor_->set_kvmem_enabled(false);
+    }
+    ~ScopedKvmemDisable() {
+        if (executor_) executor_->set_kvmem_enabled(was_enabled_);
+    }
+    ScopedKvmemDisable(const ScopedKvmemDisable &) = delete;
+    ScopedKvmemDisable &operator=(const ScopedKvmemDisable &) = delete;
+
+private:
+    QwenExecutor *executor_ = nullptr;
+    bool was_enabled_ = false;
+};
+
+std::vector<uint32_t> kvmem_gather_selected_source_tokens(
+    const std::vector<uint32_t> &prompt_tokens,
+    const std::vector<KvMemBlock> &blocks,
+    const std::vector<uint32_t> &selected_context) {
+    std::vector<uint32_t> out;
+    uint64_t total = 0;
+    uint32_t previous_end = 0;
+    bool first = true;
+    for (uint32_t id : selected_context) {
+        if (id >= blocks.size()) {
+            throw std::runtime_error(
+                "KVMem inline refresh selection contains an invalid block id");
+        }
+        const KvMemBlock &block = blocks[id];
+        const uint64_t end = static_cast<uint64_t>(block.orig_pos_start) +
+            block.n_tokens;
+        if (end > prompt_tokens.size()) {
+            throw std::runtime_error(
+                "KVMem inline refresh block exceeds the prompt tokens");
+        }
+        if (!first && block.orig_pos_start < previous_end) {
+            throw std::runtime_error(
+                "KVMem inline refresh blocks are not in source order");
+        }
+        first = false;
+        previous_end = static_cast<uint32_t>(end);
+        total += block.n_tokens;
+    }
+    if (total > std::numeric_limits<size_t>::max()) {
+        throw std::runtime_error(
+            "KVMem inline refresh token count overflows size_t");
+    }
+    out.reserve(static_cast<size_t>(total));
+    for (uint32_t id : selected_context) {
+        const KvMemBlock &block = blocks[id];
+        out.insert(
+            out.end(),
+            prompt_tokens.begin() +
+                static_cast<std::ptrdiff_t>(block.orig_pos_start),
+            prompt_tokens.begin() +
+                static_cast<std::ptrdiff_t>(block.orig_pos_start +
+                                            block.n_tokens));
+    }
+    return out;
 }
 
 // ARCHIVED (2026-07-23): helper code for the DeltaNet recurrent-state artifact
@@ -3823,7 +3905,10 @@ private:
     static bool continuous_batch_request_supported(const GenerationOptions &options,
                                                    const DumpStream *dump) {
         return dump == nullptr && options.max_tokens >= 0 &&
-               options.kvmem_replay_query_spans.empty();
+               options.kvmem_replay_query_spans.empty() &&
+               options.kvmem_oracle_token_spans.empty() &&
+               options.kvmem_inline_refresh ==
+                   KvMemInlineRefreshMode::Off;
     }
 
     void start_continuous_batch_worker() {
@@ -7086,6 +7171,12 @@ private:
             !options.kvmem_rebuilt_state_capture_key.empty() ||
             !options.kvmem_rebuilt_state_seed_key.empty()) return {};
 #endif
+        // Oracle selection is a cold, controlled representation experiment.
+        // Do not let an earlier request's checkpoint/working set become another
+        // variable in the direct-KV result.
+        if (!options.kvmem_oracle_token_spans.empty()) return {};
+        if (options.kvmem_inline_refresh !=
+            KvMemInlineRefreshMode::Off) return {};
         if (!kvmem_prefix_cache_enabled()) return {};
         if (!executor_ || !executor_->kvmem_enabled()) return {};
         if (!kvmem_warm_valid_ || kvmem_warm_log_.empty()) return {};
@@ -7599,6 +7690,16 @@ private:
             throw std::runtime_error(
                 "KVMem transcript replay currently requires native MTP");
         }
+        const bool inline_refresh =
+            options.kvmem_inline_refresh !=
+            KvMemInlineRefreshMode::Off;
+        if (inline_refresh &&
+            (dump != nullptr || !options.kvmem_session_id.empty())) {
+            throw std::runtime_error(
+                "KVMem inline refresh requires a standalone one-shot "
+                "request without logit dumping");
+        }
+        std::unique_ptr<ScopedKvmemDisable> inline_refresh_guard;
 #if 0  // Archived DeltaNet recurrent-state artifact experiment.
         const bool rebuilt_state_export =
             !options.kvmem_rebuilt_state_export_key.empty();
@@ -7666,7 +7767,8 @@ private:
         }
 #endif
         const bool warm_capture =
-            kvmem_prefix_cache_enabled() && executor_->kvmem_enabled();
+            !inline_refresh && kvmem_prefix_cache_enabled() &&
+            executor_->kvmem_enabled();
 
         // "Operating dense" predicate: below budget the store keeps every block
         // GPU-resident in identity order, so selection/QC are no-ops and the
@@ -7747,8 +7849,13 @@ private:
             executor_->kvmem_enabled() && qc_active &&
             kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
             dump == nullptr && executor_->block_store() &&
-            executor_->block_store()->config().retrieval_method ==
-                KvMemRetrievalMethod::MeanK;
+            kvmem_query_replay_retrieval_supported(
+                executor_->block_store()->config().retrieval_method);
+        if (inline_refresh && !recompute_query) {
+            throw std::runtime_error(
+                "KVMem inline refresh requires an above-budget, "
+                "query-conditioned mean-k request with query replay enabled");
+        }
 #if 0  // Archived DeltaNet recurrent-state import/capture validation.
         if ((rebuilt_state_import || rebuilt_state_capture) &&
             !recompute_query) {
@@ -7873,6 +7980,25 @@ private:
         int bs_steps_since_reselect = 0;
         const int bs_interval =
             std::max(1, options_.kvmem_interval);
+        // Diagnostics-only control: the oracle must alter exactly one thing —
+        // the answer-producing semantic selection.  Installing it before
+        // prefill would also force those blocks into pressure windows and change
+        // how later historical K/V is constructed.
+        auto kvmem_final_query_reselect = [&]() {
+            if (options.kvmem_oracle_token_spans.empty()) {
+                executor_->kvmem_reselect();
+                return;
+            }
+            std::vector<std::pair<uint32_t, uint32_t>> oracle_spans;
+            oracle_spans.reserve(options.kvmem_oracle_token_spans.size());
+            for (const auto &span : options.kvmem_oracle_token_spans) {
+                oracle_spans.emplace_back(span.begin, span.end);
+            }
+            executor_->kvmem_set_oracle_token_spans(
+                oracle_spans, options.kvmem_oracle_only);
+            executor_->kvmem_reselect();
+            executor_->kvmem_set_oracle_token_spans({});
+        };
         if (bs_on) {
             // Register the tokens not yet in the store so it lands at prompt.size().
             // Already registered before this point: reuse_m (warm restore) plus the
@@ -7906,7 +8032,7 @@ private:
                     executor_->kvmem_set_pin_from_block(
                         query_replay_begin / bt);
                 }
-                executor_->kvmem_reselect();
+                kvmem_final_query_reselect();
             }
             if (recompute_query &&
                 options.kvmem_reselect_mode != KvMemReselectMode::Off) {
@@ -7927,8 +8053,92 @@ private:
                         "KVMem query replay requires every replay-suffix block "
                         "to be present in the final selection");
                 }
-                executor_->kvmem_begin_query_replay(
-                    query_replay_ckpt, selected_context);
+                if (inline_refresh) {
+                    std::vector<uint32_t> refreshed_tokens =
+                        kvmem_gather_selected_source_tokens(
+                            prompt_tokens, blocks, selected_context);
+                    const size_t selected_prefix_tokens =
+                        refreshed_tokens.size();
+                    refreshed_tokens.insert(
+                        refreshed_tokens.end(),
+                        prompt_tokens.begin() +
+                            static_cast<std::ptrdiff_t>(query_replay_begin),
+                        prompt_tokens.end());
+                    if (refreshed_tokens.empty() ||
+                        refreshed_tokens.size() >
+                            executor_->kv_ctx_size()) {
+                        throw std::runtime_error(
+                            "KVMem inline refresh compact prompt is empty or "
+                            "exceeds the executor context");
+                    }
+
+                    // From here through decode, run the compact cache as a
+                    // normal dense cache. The guard restores the configured
+                    // KVMem switch on every return/exception, while reset_state
+                    // discards only this request's now-unneeded million-token
+                    // store.
+                    inline_refresh_guard =
+                        std::make_unique<ScopedKvmemDisable>(executor_.get());
+                    executor_->reset_state();
+                    if (options.kvmem_inline_refresh ==
+                        KvMemInlineRefreshMode::KvOnly) {
+                        if (selected_prefix_tokens == 0) {
+                            throw std::runtime_error(
+                                "KVMem inline KV-only refresh selected no "
+                                "historical context tokens");
+                        }
+                        std::vector<uint32_t> prefix(
+                            refreshed_tokens.begin(),
+                            refreshed_tokens.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    selected_prefix_tokens));
+                        NativeExecutorReport prefix_step =
+                            executor_->forward_n_tokens(prefix, false);
+                        if (!prefix_step.ok) {
+                            throw std::runtime_error(
+                                "KVMem inline refresh prefix prefill failed");
+                        }
+                        prefill_ops += prefix_step.ops_executed;
+                        executor_->restore_recurrent_state(
+                            query_replay_ckpt);
+                        std::vector<uint32_t> suffix(
+                            refreshed_tokens.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    selected_prefix_tokens),
+                            refreshed_tokens.end());
+                        step = executor_->forward_n_tokens(
+                            suffix, options.max_tokens > 0);
+                        if (!step.ok) {
+                            throw std::runtime_error(
+                                "KVMem inline refresh query prefill failed");
+                        }
+                        prefill_ops += step.ops_executed;
+                    } else {
+                        step = executor_->forward_n_tokens(
+                            refreshed_tokens, options.max_tokens > 0);
+                        if (!step.ok) {
+                            throw std::runtime_error(
+                                "KVMem inline refresh compact prefill failed");
+                        }
+                        prefill_ops += step.ops_executed;
+                    }
+                    log("native kvmem inline refresh (plain): mode=" +
+                        std::string(kvmem_inline_refresh_name(
+                            options.kvmem_inline_refresh)) +
+                        " source_prompt_tokens=" +
+                        std::to_string(prompt_tokens.size()) +
+                        " selected_prefix_tokens=" +
+                        std::to_string(selected_prefix_tokens) +
+                        " query_suffix_tokens=" +
+                        std::to_string(prompt_tokens.size() -
+                                       query_replay_begin) +
+                        " compact_prompt_tokens=" +
+                        std::to_string(refreshed_tokens.size()) +
+                        " fixed_context_blocks=" +
+                        std::to_string(selected_context.size()));
+                } else {
+                    executor_->kvmem_begin_query_replay(
+                        query_replay_ckpt, selected_context);
 #if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =
@@ -8005,6 +8215,7 @@ private:
                                     : "none") +
                     " fixed_context_blocks=" +
                     std::to_string(selected_context.size()));
+                }
             }
         }
 
@@ -8303,6 +8514,18 @@ private:
         // the CB per-request executors are excluded, so those paths are untouched.
         const bool transcript_replay_requested =
             !options.kvmem_replay_query_spans.empty();
+        const bool inline_refresh =
+            options.kvmem_inline_refresh !=
+            KvMemInlineRefreshMode::Off;
+        if (inline_refresh &&
+            (override_executor != nullptr || !reset_session ||
+             transcript_replay_requested ||
+             !options.kvmem_session_id.empty() || dump != nullptr)) {
+            throw std::runtime_error(
+                "KVMem inline refresh requires a standalone one-shot MTP "
+                "request without logit dumping");
+        }
+        std::unique_ptr<ScopedKvmemDisable> inline_refresh_guard;
 #if 0  // Archived DeltaNet recurrent-state artifact experiment.
         const bool rebuilt_state_export =
             !options.kvmem_rebuilt_state_export_key.empty();
@@ -8338,6 +8561,7 @@ private:
         const bool kvmem_warm_capture =
             reset_session && override_executor == nullptr &&
             !transcript_replay_requested && !api_session &&
+            !inline_refresh &&
             kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
         DeviceStatus st;
@@ -8535,8 +8759,13 @@ private:
             kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
             !transcript_replay && !clean_query &&
             dump == nullptr && executor_->block_store() &&
-            executor_->block_store()->config().retrieval_method ==
-                KvMemRetrievalMethod::MeanK;
+            kvmem_query_replay_retrieval_supported(
+                executor_->block_store()->config().retrieval_method);
+        if (inline_refresh && !recompute_query) {
+            throw std::runtime_error(
+                "KVMem inline refresh requires an above-budget, "
+                "query-conditioned mean-k request with query replay enabled");
+        }
 #if 0  // Archived DeltaNet recurrent-state import/capture validation.
         if ((rebuilt_state_import || rebuilt_state_capture) &&
             !recompute_query) {
@@ -8595,6 +8824,25 @@ private:
             log("native kvmem clean-query PASS A: captured isolated query over "
                 + std::to_string(qtoks.size()) + " question tokens");
         }
+        // Oracle spans are intentionally NOT installed here.  Real-history
+        // prefill, including every pressure selection, must remain identical to
+        // the non-oracle run.  They are scoped around the single final-query
+        // semantic selection below.
+        auto kvmem_final_query_reselect = [&]() {
+            if (options.kvmem_oracle_token_spans.empty()) {
+                executor_->kvmem_reselect();
+                return;
+            }
+            std::vector<std::pair<uint32_t, uint32_t>> oracle_spans;
+            oracle_spans.reserve(options.kvmem_oracle_token_spans.size());
+            for (const auto &span : options.kvmem_oracle_token_spans) {
+                oracle_spans.emplace_back(span.begin, span.end);
+            }
+            executor_->kvmem_set_oracle_token_spans(
+                oracle_spans, options.kvmem_oracle_only);
+            executor_->kvmem_reselect();
+            executor_->kvmem_set_oracle_token_spans({});
+        };
         // Query-conditioned KVMem (#82): mark the question token span BEFORE
         // prefill so the executor captures the in-span Q rows during prefill and
         // ranks blocks by the multi-token mean at the boundary. Only active above
@@ -10296,7 +10544,7 @@ private:
             executor_->kvmem_register_append(qb);
             executor_->kvmem_restore_clean_query();
             executor_->kvmem_set_pin_from_block(qb / bt);
-            executor_->kvmem_reselect();
+            kvmem_final_query_reselect();
             // [qb, P): prefill the question into the active window (attends over the
             // selected context at bounded window positions). This recaptures a
             // recency-contaminated query into g_query_multi_ — overwritten by the
@@ -10438,7 +10686,7 @@ private:
                     executor_->kvmem_set_pin_from_block(
                         kvmem_query_replay_begin / bt);
                 }
-                executor_->kvmem_reselect();
+                kvmem_final_query_reselect();
             }
             if (recompute_query &&
                 options.kvmem_reselect_mode != KvMemReselectMode::Off) {
@@ -10463,8 +10711,67 @@ private:
                         "KVMem query replay requires every replay-suffix block "
                         "to be present in the final selection");
                 }
-                executor_->kvmem_begin_query_replay(
-                    kvmem_query_replay_ckpt, selected_context);
+                if (inline_refresh) {
+                    std::vector<uint32_t> refreshed_tokens =
+                        kvmem_gather_selected_source_tokens(
+                            prompt_tokens, blocks, selected_context);
+                    const size_t selected_prefix_tokens =
+                        refreshed_tokens.size();
+                    refreshed_tokens.insert(
+                        refreshed_tokens.end(),
+                        prompt_tokens.begin() +
+                            static_cast<std::ptrdiff_t>(
+                                kvmem_query_replay_begin),
+                        prompt_tokens.end());
+                    if (refreshed_tokens.empty() ||
+                        refreshed_tokens.size() >
+                            executor_->kv_ctx_size()) {
+                        throw std::runtime_error(
+                            "KVMem inline refresh compact prompt is empty or "
+                            "exceeds the executor context");
+                    }
+
+                    inline_refresh_guard =
+                        std::make_unique<ScopedKvmemDisable>(executor_);
+                    executor_->reset_state();
+                    if (options.kvmem_inline_refresh ==
+                        KvMemInlineRefreshMode::KvOnly) {
+                        if (selected_prefix_tokens == 0) {
+                            throw std::runtime_error(
+                                "KVMem inline KV-only refresh selected no "
+                                "historical context tokens");
+                        }
+                        do_prefill_vector(
+                            refreshed_tokens, 0, 0,
+                            selected_prefix_tokens);
+                        executor_->restore_recurrent_state(
+                            kvmem_query_replay_ckpt);
+                        do_prefill_vector(
+                            refreshed_tokens, 0,
+                            selected_prefix_tokens,
+                            refreshed_tokens.size());
+                    } else {
+                        do_prefill_vector(
+                            refreshed_tokens, 0, 0,
+                            refreshed_tokens.size());
+                    }
+                    log("native kvmem inline refresh (mtp): mode=" +
+                        std::string(kvmem_inline_refresh_name(
+                            options.kvmem_inline_refresh)) +
+                        " source_prompt_tokens=" +
+                        std::to_string(prompt_tokens.size()) +
+                        " selected_prefix_tokens=" +
+                        std::to_string(selected_prefix_tokens) +
+                        " query_suffix_tokens=" +
+                        std::to_string(prompt_tokens.size() -
+                                       kvmem_query_replay_begin) +
+                        " compact_prompt_tokens=" +
+                        std::to_string(refreshed_tokens.size()) +
+                        " fixed_context_blocks=" +
+                        std::to_string(selected_context.size()));
+                } else {
+                    executor_->kvmem_begin_query_replay(
+                        kvmem_query_replay_ckpt, selected_context);
 #if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =
@@ -10580,6 +10887,7 @@ private:
                                     : "none") +
                     " fixed_context_blocks=" +
                     std::to_string(selected_context.size()));
+                }
             }
             kvmem_registered_pos = executor_->position();
             kvmem_last_reselect_pos = executor_->position();

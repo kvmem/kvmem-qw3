@@ -14,6 +14,12 @@ arguments, limitations, and paper-relevant interpretation of the implementation.
 > immutable raw-K layout, FP8/FP16 dtype split, scratch/workspace reductions,
 > measured GPU peaks, recommended 48 GiB profiles, and remaining 10M-context
 > scaling limits are maintained in `docs/kvmem_gpu_memory_optimization.md`.
+>
+> **Performance evaluation record:** the controlled 512K ablation methodology,
+> exact runtime parameters, stage-in/stage-out/assembly breakdown, GPU-memory
+> control, complete implemented-optimization inventory, raw artifact paths,
+> and reproduction commands are maintained in
+> `docs/kvmem_performance_evaluation_20260726.md`.
 
 The implementation is centered around three ideas:
 
@@ -25,8 +31,9 @@ The implementation is centered around three ideas:
    model-internal query/key signals, with the default query-conditioned method
    using a mean-key index and a block-level softmax scorer.
 3. Tiered KV memory management: KVMem stores the full recoverable KV state across
-   a bounded GPU page pool, CPU pinned memory, and NVMe storage, while assembling
-   only a selected working set for attention.
+   a bounded GPU page pool, demand-allocated CPU memory, and NVMe storage, while
+   using bounded pinned slabs for transfer and assembling only a selected
+   working set for attention.
 
 The most important implementation files are:
 
@@ -39,8 +46,9 @@ The most important implementation files are:
   tiered I/O orchestration.
 - `src/kernels_cuda.cu`: CUDA kernels for mean-key construction, softmax-over-page
   retrieval scoring, exact-mass scoring, de-RoPE, and batched re-RoPE.
-- `include/qw3/pinned_kv_tier.hpp`: CPU pinned-memory tier metadata and LRU slot
-  allocator.
+- `include/qw3/pinned_kv_tier.hpp`: CPU-tier metadata, heat-aware/LRU admission,
+  and logical slot allocator; immutable mode may back those slots with sparse
+  pageable slabs rather than pinning the entire tier.
 - `include/qw3/nvme_kv_tier.hpp`: NVMe slot metadata and backing-file I/O.
 - `include/qw3/device_backend.hpp`: backend abstraction for page-table operations,
   raw byte copies, KVMem kernels, and the reusable pinned host buffer pool.
@@ -83,22 +91,26 @@ KVMem distinguishes three positions for a block:
 - The assigned window position: the compact position range used in the currently
   selected attention window.
 
-After prefill, a newly registered block is canonical: `baked_pos == orig_pos_start`.
-When a selected block is placed into a compact window, its keys may be re-RoPEd
-in place from `baked_pos` to the new window position. This makes the selected
-window stay within the model's normal positional range. Before a block is spilled
-to CPU or NVMe, it is re-canonicalized back to its original position. Therefore
-lower tiers store true-position KV bytes, not window-position bytes.
+After prefill, a newly registered block is canonical:
+`baked_pos == orig_pos_start`. When a selected block is placed into a compact
+window, its keys may be re-RoPEd in place from `baked_pos` to the new window
+position. This makes the selected window stay within the model's normal
+positional range. In the current default immutable mode, position-free raw K
+in CPU memory is authoritative, active GPU K is a disposable materialization,
+and ordinary CPU/NVMe block records contain V rather than another K copy. The
+legacy mutable-K path instead re-canonicalizes K before spilling it.
 
 This gives the implementation an important invariant:
 
-> GPU-resident blocks may be baked either at original positions or at current
-> window positions, and `baked_pos` records which. CPU/NVMe-resident blocks are
-> stored in canonical original-position form.
+> GPU-resident working K may be baked either at original positions or at current
+> window positions, and `baked_pos` records which. Immutable mode reconstructs
+> K from position-free CPU raw K and restores V from CPU/NVMe; the legacy mode
+> stores spilled K in canonical original-position form.
 
-This invariant makes later stage-in and remap safe: a recalled block can always
-be restored to GPU and then re-RoPEd from its recorded baked position to the next
-selected window slot.
+This invariant makes later stage-in and remap safe: a recalled immutable block
+is baked exactly once from raw K at its target slot, while a still-resident block
+may use bounded in-place delta rotation before the refresh threshold forces a
+raw rebuild.
 
 ## 2. Core Data Structures
 
@@ -346,13 +358,11 @@ This matters because the code relies on cancellation of RoPE numerical error:
 if a vector was originally baked with a certain trigonometric approximation,
 de-RoPE with the same convention recovers a stable content representation.
 
-Mean-key storage follows `QW3_KV_DTYPE`: FP16 KV uses IEEE binary16
-(`__half`, not BF16), FP8 KV uses unscaled E4M3, and FP32 KV keeps FP32.
-Builders, dot products, softmax statistics, and score accumulation remain
-FP32. This halves the index bytes for the normal FP16 configuration without
-changing its accumulation precision. FP8 halves them again, but a partial
-block mean merged across prefill boundaries is quantized after every update;
-the FP8 path therefore needs an accuracy A/B before production use.
+Production mean-key storage is IEEE FP16 (`__half`, not BF16), independently
+of whether active K/V uses FP16 or FP8 E4M3. FP32 KV keeps a diagnostic FP32
+index mode. Builders, dot products, softmax statistics, and score accumulation
+remain FP32. FP16 halves index bytes relative to FP32 without quantizing the
+already averaged vector as aggressively as the reverted FP8-index experiment.
 
 ### 4.3 Incremental Index Construction During Prefill
 
@@ -1428,18 +1438,24 @@ it more directly but uses much more memory.
 
 ### 12.2 KV Dtype Restrictions
 
-Query-conditioned mean-K now stores and scores FP32, FP16, and FP8 E4M3
-indices. FP16 is the conservative default; FP8 reduces memory further but
-introduces visible incremental-merge quantization. q8 KV still lacks the
-row-scale representation needed by standalone mean vectors, so its mean index
-uses FP16 and q8 re-RoPE remains unsupported.
+The production query-conditioned mean-K index is IEEE FP16, independently of
+whether active K/V uses FP16 or FP8 E4M3. Builders, dot products, softmax
+statistics, and score accumulation remain FP32; FP32 index storage is retained
+only as a diagnostic full-precision mode. An earlier FP8-index experiment was
+reverted because quantizing an already averaged mean vector changed retrieval
+rankings. q8 KV likewise uses the FP16 mean index, while q8 re-RoPE remains
+unsupported because its row-scale format cannot use the current standalone
+raw-K/remap representation.
 
-### 12.3 Synchronous NVMe Writes
+### 12.3 NVMe I/O Backend Boundary
 
-NVMe reads are overlapped during stage-in through background threads, but writes
-in `NvmeKvTier::write_block` are synchronous. In current usage, stage-out is
-still bounded by this design. More advanced asynchronous I/O could improve
-stage-out behavior.
+The low-level `NvmeKvTier` API uses buffered positional `pread`/`pwrite`.
+Adjacent file and buffer spans are coalesced, while upper-level background
+workers overlap those blocking syscalls with prefill, CPU admission, and raw-K
+assembly. Consequently low-level I/O is synchronous per worker, but proactive
+stage-out is not normally synchronous on the model-compute critical path.
+`sync_file_range`/`POSIX_FADV_DONTNEED` bound kernel page-cache duplication.
+`io_uring`, `O_DIRECT`, and GPUDirect Storage are not implemented yet.
 
 ### 12.4 Host-Side Selector
 
@@ -1469,17 +1485,20 @@ The original fused mean-k softmax scorer stored every block/sub-block logit in
 one CTA's dynamic shared memory. It therefore accepted at most 8192 pages and
 could not preserve the same scoring semantics on million-token LongMemEval-M
 prompts with 32-token blocks. The fused kernel remains the fast path at or below
-8192 pages. Larger inputs now use an exact tiled two-dot implementation:
+8192 pages. Larger inputs now use an exact tiled one-dot implementation:
 
-1. compute per-tile softmax maxima and sums;
-2. merge them into one global log-sum-exp state per layer/query/head;
-3. recompute logits and accumulate normalized mass into block scores.
+1. compute and store each tiled \(Q\cdot\bar K\) logit once in bounded device
+   workspace;
+2. reduce the stored logits to the global max/sum state for each
+   layer/query/head distribution;
+3. normalize the same stored logits and accumulate block mass.
 
-The scalable path uses workspace proportional to the number of distributions
-and tiles, rather than the total logits. CUDA parity tests cover the 8192/8193
-boundary, kept-band masking, sub-block reductions, and comparison with both the
-fused kernel and a host reference. The largest observed relative error in those
-tests was approximately `4.8e-7`.
+The workspace scales with one bounded query/distribution batch rather than the
+full request's score matrix. The former exact tiled two-dot implementation
+(tile LSE, global LSE merge, then dot recomputation) remains available as an
+explicit A/B baseline. CUDA parity tests cover the 8192/8193 boundary,
+kept-band masking, sub-block reductions, and comparison with the fused kernel,
+the two-dot baseline, and a host reference.
 
 A 2026-07-14 diagnostic used 10 LongMemEval-M samples with a 2M context limit,
 200K selected-token budget, 32-token blocks, 8 sink blocks, query-conditioned
