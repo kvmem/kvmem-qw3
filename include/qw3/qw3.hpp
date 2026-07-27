@@ -169,6 +169,12 @@ struct NativePlanInfo {
 
 using TokenCallback = std::function<void(const std::string &)>;
 
+// Return false to cooperatively stop generation after the current token. This
+// lets streaming servers release decode resources promptly after a client
+// disconnects or a stop sequence is observed.
+using CancellableTokenCallback =
+    std::function<bool(const std::string &)>;
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -184,6 +190,10 @@ public:
     void generate_stream(const std::string &prompt,
                          const GenerationOptions &options,
                          const TokenCallback &on_text);
+    void generate_stream_cancellable(
+        const std::string &prompt,
+        const GenerationOptions &options,
+        const CancellableTokenCallback &on_text);
 
 private:
     struct Impl;

@@ -1,6 +1,7 @@
 #include "server.hpp"
 
 #include "env_flags.hpp"
+#include "tool_call_stream.hpp"
 #include "qw3/qw3.hpp"
 #include "qw3/gguf.hpp"
 #include "qw3/tokenizer.hpp"
@@ -24,6 +25,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace qw3 {
@@ -850,9 +852,9 @@ std::vector<json> parse_tool_calls_xml(const std::string &text,
     return calls;
 }
 
-json tool_call_delta(const json &calls) {
+json tool_call_delta(const json &calls, size_t begin = 0) {
     json deltas = json::array();
-    for (size_t i = 0; i < calls.size(); ++i) {
+    for (size_t i = begin; i < calls.size(); ++i) {
         const json &call = calls[i];
         json d = {
             {"index", static_cast<int>(i)},
@@ -868,6 +870,224 @@ json tool_call_delta(const json &calls) {
     }
     return json{{"tool_calls", deltas}};
 }
+
+bool schema_is_plain_string(const json &schema) {
+    return schema.is_object() && schema.contains("type") &&
+           schema["type"].is_string() &&
+           schema["type"].get<std::string>() == "string";
+}
+
+bool tool_has_only_string_properties(const json *tools,
+                                     const std::string &name) {
+    const json *props = find_tool_properties(tools, name);
+    if (!props || !props->is_object() || props->empty()) return false;
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        if (!schema_is_plain_string(it.value())) return false;
+    }
+    return true;
+}
+
+json incremental_tool_start_delta(size_t index,
+                                  const std::string &id,
+                                  const std::string &name,
+                                  const std::string &arguments) {
+    return json{{"tool_calls", json::array({json{
+        {"index", static_cast<int>(index)},
+        {"id", id},
+        {"type", "function"},
+        {"function", json{{"name", name},
+                          {"arguments", arguments}}}
+    }})}};
+}
+
+json incremental_tool_arguments_delta(size_t index,
+                                      const std::string &arguments) {
+    return json{{"tool_calls", json::array({json{
+        {"index", static_cast<int>(index)},
+        {"function", json{{"arguments", arguments}}}
+    }})}};
+}
+
+class IncrementalToolCallStream {
+public:
+    explicit IncrementalToolCallStream(const json *tools) : tools_(tools) {}
+
+    void feed(const std::string &text) {
+        if (abandoned_ || fatal_ || parser_.complete()) return;
+        std::vector<detail::ToolCallStreamEvent> events;
+        if (!parser_.feed(text, events)) {
+            parser_failed();
+            return;
+        }
+        process(events);
+    }
+
+    void finish() {
+        if (abandoned_ || fatal_) return;
+        std::vector<detail::ToolCallStreamEvent> events;
+        if (!parser_.finish(events)) {
+            parser_failed();
+            return;
+        }
+        process(events);
+    }
+
+    bool streaming() const { return streaming_; }
+    bool abandoned() const { return abandoned_; }
+    bool fatal() const { return fatal_; }
+    bool complete() const { return complete_; }
+    bool start_pending() const { return start_pending_; }
+    size_t pending_size() const { return pending_arguments_.size(); }
+    const std::string &error() const { return error_; }
+
+    json take_start_delta() {
+        start_pending_ = false;
+        const std::string fragment = take_pending_arguments();
+        return incremental_tool_start_delta(0, call_id_, name_, fragment);
+    }
+
+    json take_arguments_delta() {
+        return incremental_tool_arguments_delta(0, take_pending_arguments());
+    }
+
+    bool validate(const std::vector<json> &calls, std::string &reason) const {
+        if (!streaming_ || fatal_ || !complete_) {
+            reason = fatal_ ? error_ : "canonical stream did not complete";
+            return false;
+        }
+        if (calls.empty() || !calls.front().is_object() ||
+            !calls.front().contains("function") ||
+            !calls.front()["function"].is_object()) {
+            reason = "full parser did not produce the streamed tool call";
+            return false;
+        }
+        const json &fn = calls.front()["function"];
+        if (fn.value("name", std::string()) != name_) {
+            reason = "streamed and fully parsed function names differ";
+            return false;
+        }
+        try {
+            const json streamed = json::parse(arguments_all_);
+            const json parsed =
+                json::parse(fn.value("arguments", std::string("{}")));
+            if (streamed != parsed) {
+                reason = "streamed and fully parsed arguments differ";
+                return false;
+            }
+        } catch (const std::exception &e) {
+            reason = std::string("argument validation failed: ") + e.what();
+            return false;
+        }
+        return true;
+    }
+
+private:
+    void parser_failed() {
+        if (streaming_) {
+            fatal_ = true;
+            error_ = parser_.error();
+        } else {
+            abandoned_ = true;
+        }
+    }
+
+    void append_arguments(const std::string &text) {
+        arguments_all_ += text;
+        pending_arguments_ += text;
+    }
+
+    std::string take_pending_arguments() {
+        std::string out;
+        out.swap(pending_arguments_);
+        return out;
+    }
+
+    void fail(std::string message) {
+        fatal_ = true;
+        error_ = std::move(message);
+    }
+
+    void process(const std::vector<detail::ToolCallStreamEvent> &events) {
+        for (const detail::ToolCallStreamEvent &event : events) {
+            if (abandoned_ || fatal_) return;
+            switch (event.kind) {
+                case detail::ToolCallStreamEventKind::ToolStart:
+                    name_ = event.value;
+                    if (!tool_name_allowed(tools_, name_) ||
+                        !tool_has_only_string_properties(tools_, name_)) {
+                        abandoned_ = true;
+                        return;
+                    }
+                    call_id_ = gen_id("call_");
+                    streaming_ = true;
+                    start_pending_ = true;
+                    append_arguments("{");
+                    break;
+                case detail::ToolCallStreamEventKind::ParameterStart: {
+                    if (!streaming_ || parameter_open_) {
+                        fail("invalid incremental parameter start");
+                        return;
+                    }
+                    const json *props = find_tool_properties(tools_, name_);
+                    parameter_name_ =
+                        schema_property_name(props, event.value);
+                    if (parameter_name_.empty() ||
+                        !seen_parameters_.insert(parameter_name_).second) {
+                        fail("empty or duplicate incremental parameter");
+                        return;
+                    }
+                    if (!first_parameter_) append_arguments(",");
+                    first_parameter_ = false;
+                    append_arguments(dump_json(json(parameter_name_)) + ":\"");
+                    parameter_open_ = true;
+                    break;
+                }
+                case detail::ToolCallStreamEventKind::ParameterData:
+                    if (!parameter_open_) {
+                        fail("incremental parameter data outside a parameter");
+                        return;
+                    }
+                    append_arguments(
+                        detail::json_string_fragment(event.value));
+                    break;
+                case detail::ToolCallStreamEventKind::ParameterEnd:
+                    if (!parameter_open_) {
+                        fail("incremental parameter end without a parameter");
+                        return;
+                    }
+                    append_arguments("\"");
+                    parameter_name_.clear();
+                    parameter_open_ = false;
+                    break;
+                case detail::ToolCallStreamEventKind::ToolEnd:
+                    if (!streaming_ || parameter_open_) {
+                        fail("incremental tool ended inside a parameter");
+                        return;
+                    }
+                    append_arguments("}");
+                    complete_ = true;
+                    break;
+            }
+        }
+    }
+
+    const json *tools_ = nullptr;
+    detail::CanonicalToolCallStreamParser parser_;
+    std::string name_;
+    std::string call_id_;
+    std::string parameter_name_;
+    std::string arguments_all_;
+    std::string pending_arguments_;
+    std::string error_;
+    std::unordered_set<std::string> seen_parameters_;
+    bool streaming_ = false;
+    bool abandoned_ = false;
+    bool fatal_ = false;
+    bool complete_ = false;
+    bool start_pending_ = false;
+    bool parameter_open_ = false;
+    bool first_parameter_ = true;
+};
 
 std::string tool_calls_debug_summary(const std::vector<json> &calls) {
     json summary = json::array();
@@ -922,9 +1142,8 @@ std::string tools_debug_summary(const json &tools) {
 // Streaming tool-call detection. The model may emit natural-language reasoning
 // before a <tool_call> block (the Hermes prompt at render_messages explicitly
 // allows this), so the stream cannot be classified once on its first token.
-// Instead content streams incrementally until a <tool_call> marker appears
-// anywhere, at which point the caller switches to buffering and parses the call
-// from the full accumulated text.
+// Content streams until a marker appears; canonical string arguments then stream
+// as OpenAI deltas, while recovery formats remain buffered for the full parser.
 //
 // Returns how many leading bytes of `text` are safe to emit as content right
 // now. If a complete "<tool_call>" marker is present, returns its byte offset
@@ -1291,6 +1510,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  mtp_paged_prefix=" << yesno(cfg.mtp_paged_prefix) << "\n"
               << "  prefix_cache="
               << yesno(cfg.prefix_cache && cfg.continuous_batching) << "\n"
+              << "  tool_argument_streaming=canonical-string\n"
               << "  matmul=mmq\n"
               << "  disable_hgemm=1\n"
               << "  default_max_tokens="
@@ -1558,6 +1778,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const json tools_schema = tools ? *tools : json();
 
         if (stream) {
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [&, prompt, g, stops, id, created, rid, enable_thinking,
@@ -1572,13 +1794,20 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     size_t completion_tokens = 0;
                     bool stopped = false;
                     bool client_closed = false;
+                    auto last_stream_write = std::chrono::steady_clock::now();
                     auto send_raw = [&](const std::string &s) {
                         if (client_closed) return false;
+                        if (sink.is_writable && !sink.is_writable()) {
+                            client_closed = true;
+                            stopped = true;
+                            return false;
+                        }
                         if (!sink.write(s.data(), s.size())) {
                             client_closed = true;
                             stopped = true;
                             return false;
                         }
+                        last_stream_write = std::chrono::steady_clock::now();
                         return true;
                     };
                     auto send_delta = [&](const json &delta) {
@@ -1590,7 +1819,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"delta", delta},
                                 {"finish_reason", nullptr}}})}};
                         const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        send_raw(s);
+                        return send_raw(s);
                     };
                     auto send_role = [&]() {
                         json chunk = {
@@ -1661,17 +1890,77 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         if (tool_request) {
                             // The model may stream natural-language reasoning
                             // before a <tool_call> block (the Hermes prompt
-                            // explicitly allows this), so we cannot classify the
-                            // response on its first token. Stream content
-                            // incrementally while scanning for a <tool_call>
-                            // marker anywhere; once it appears, stop streaming
-                            // and buffer the remainder so the full call is parsed
-                            // at the end from the accumulated text.
-                            bool buffering_tool = forced_tool_request;
+                            // explicitly allows this). Once a canonical call for
+                            // a string-only schema appears, transcode its XML
+                            // parameters into standard OpenAI argument deltas.
+                            // Recovery syntaxes stay on the full-buffer parser.
+                            bool buffering_tool = false;
                             bool streamed_content = false;
                             std::string content_pending;
-                            eng.generate_stream(prompt, g, [&](const std::string &piece) {
-                                if (stopped) return;
+                            std::string forced_prefix;
+                            const json *stream_tools =
+                                tools_schema.is_array() ? &tools_schema : nullptr;
+                            IncrementalToolCallStream incremental(stream_tools);
+                            auto last_tool_delta =
+                                std::chrono::steady_clock::now();
+                            size_t next_progress_tokens = 1024;
+                            constexpr size_t kArgumentFlushBytes = 1024;
+                            constexpr auto kArgumentFlushInterval =
+                                std::chrono::milliseconds(500);
+                            constexpr auto kToolHeartbeatInterval =
+                                std::chrono::seconds(2);
+
+                            auto flush_incremental = [&](bool force) {
+                                if (!incremental.streaming() || client_closed) return;
+                                if (incremental.start_pending()) {
+                                    send_delta(incremental.take_start_delta());
+                                    last_tool_delta =
+                                        std::chrono::steady_clock::now();
+                                }
+                                const auto now = std::chrono::steady_clock::now();
+                                if (incremental.pending_size() > 0 &&
+                                    (force ||
+                                     incremental.pending_size() >=
+                                         kArgumentFlushBytes ||
+                                     now - last_tool_delta >=
+                                         kArgumentFlushInterval)) {
+                                    send_delta(incremental.take_arguments_delta());
+                                    last_tool_delta = now;
+                                }
+                            };
+                            auto service_tool_stream = [&]() {
+                                flush_incremental(false);
+                                const auto now = std::chrono::steady_clock::now();
+                                if (!client_closed &&
+                                    now - last_stream_write >=
+                                        kToolHeartbeatInterval) {
+                                    // Empty OpenAI deltas are protocol-safe and
+                                    // keep read-idle timers alive even when the
+                                    // full tool call must remain buffered.
+                                    send_delta(json::object());
+                                }
+                                if (completion_tokens >= next_progress_tokens) {
+                                    const double elapsed =
+                                        std::chrono::duration<double>(
+                                            now - t0).count();
+                                    std::cerr << "[qw3-serve] #" << rid
+                                              << " tool_buffer_progress tokens="
+                                              << completion_tokens
+                                              << " chars=" << acc.size()
+                                              << " elapsed=" << elapsed << "s"
+                                              << " incremental="
+                                              << (incremental.streaming()
+                                                      ? "true" : "false")
+                                              << "\n";
+                                    do {
+                                        next_progress_tokens += 1024;
+                                    } while (completion_tokens >=
+                                             next_progress_tokens);
+                                }
+                            };
+
+                            eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
+                                if (stopped || client_closed) return false;
                                 ++completion_tokens;
                                 acc += piece;
                                 std::string emit = take_complete_utf8(utf8_pending, piece);
@@ -1688,25 +1977,74 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         emit = take_complete_utf8(utf8_pending, emit);
                                     }
                                 }
-                                if (buffering_tool || emit.empty()) return;
-                                content_pending += emit;
-                                bool marker_found = false;
-                                const size_t safe =
-                                    tool_call_safe_emit_len(content_pending, marker_found);
-                                if (safe > 0) {
-                                    emit_text(content_pending.substr(0, safe));
-                                    streamed_content = true;
-                                    content_pending.erase(0, safe);
+                                if (buffering_tool) {
+                                    if (!emit.empty()) incremental.feed(emit);
+                                } else if (!emit.empty()) {
+                                    content_pending += emit;
+                                    bool marker_found = false;
+                                    const size_t safe =
+                                        tool_call_safe_emit_len(
+                                            content_pending, marker_found);
+                                    if (safe > 0) {
+                                        const std::string prefix =
+                                            content_pending.substr(0, safe);
+                                        if (forced_tool_request) {
+                                            forced_prefix += prefix;
+                                        } else {
+                                            emit_text(prefix);
+                                            streamed_content = true;
+                                        }
+                                        content_pending.erase(0, safe);
+                                    }
+                                    if (marker_found) {
+                                        if (forced_tool_request &&
+                                            !forced_prefix.empty()) {
+                                            emit_text(forced_prefix);
+                                            forced_prefix.clear();
+                                            streamed_content = true;
+                                        }
+                                        buffering_tool = true;
+                                        // content_pending begins with the marker
+                                        // and may already include part of the
+                                        // function/first parameter.
+                                        incremental.feed(content_pending);
+                                        content_pending.clear();
+                                    }
                                 }
-                                if (marker_found) {
-                                    // Remainder from the marker onward is the
-                                    // tool call; reparse from `acc` at the end.
-                                    buffering_tool = true;
-                                    content_pending.clear();
+                                if (incremental.fatal()) {
+                                    stopped = true;
                                 }
+                                if (buffering_tool &&
+                                    !incremental.fatal()) {
+                                    service_tool_stream();
+                                }
+                                return !stopped && !client_closed;
                             });
+
+                            if (client_closed) {
+                                std::cerr << "[qw3-serve] #" << rid
+                                          << " chat(stream tools) chars="
+                                          << acc.size()
+                                          << " completion_tokens="
+                                          << completion_tokens
+                                          << " prompt_tokens="
+                                          << prompt_token_count
+                                          << " route=" << route
+                                          << " buffered_tool="
+                                          << (buffering_tool ? "true" : "false")
+                                          << " client_closed=true\n";
+                                return true;
+                            }
+
                             if (buffering_tool) {
-                                std::string text = take_complete_utf8(utf8_pending, acc);
+                                incremental.finish();
+                                if (incremental.fatal()) {
+                                    throw std::runtime_error(
+                                        "incremental tool stream failed: " +
+                                        incremental.error());
+                                }
+                                std::string text =
+                                    take_complete_utf8(utf8_pending, acc);
                                 text += flush_utf8_pending(utf8_pending, false);
                                 const std::string framed =
                                     enable_thinking ? ("<think>\n" + text) : text;
@@ -1715,20 +2053,49 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         framed,
                                         tools_schema.is_array() ? &tools_schema
                                                                 : nullptr);
-                                const ReasoningSplit split = split_reasoning(framed);
-                                // Only emit reasoning/content from the buffered
-                                // text when we did NOT already stream it
-                                // incrementally before the marker, to avoid
-                                // duplicating deltas.
-                                if (!streamed_content && !split.reasoning.empty()) {
-                                    send_delta(json{{"reasoning_content", split.reasoning}});
+                                const ReasoningSplit split =
+                                    split_reasoning(framed);
+                                // Prefix reasoning/content was already emitted
+                                // before the first tool delta whenever present.
+                                if (!streamed_content &&
+                                    !split.reasoning.empty()) {
+                                    send_delta(json{
+                                        {"reasoning_content", split.reasoning}});
                                 }
                                 if (!tool_calls.empty()) {
+                                    if (incremental.streaming()) {
+                                        std::string validation_error;
+                                        if (!incremental.validate(
+                                                tool_calls,
+                                                validation_error)) {
+                                            throw std::runtime_error(
+                                                "incremental tool validation "
+                                                "failed: " +
+                                                validation_error);
+                                        }
+                                        // Delay the final closing fragment until
+                                        // the full parser confirms that the
+                                        // streamed arguments are equivalent.
+                                        flush_incremental(true);
+                                        // The first call has already streamed.
+                                        // Preserve the existing multi-call
+                                        // behavior for any later calls.
+                                        if (tool_calls.size() > 1) {
+                                            send_delta(
+                                                tool_call_delta(tool_calls, 1));
+                                        }
+                                    } else {
+                                        send_delta(
+                                            tool_call_delta(tool_calls));
+                                    }
                                     std::cerr << "[qw3-serve] #" << rid
                                               << " tool_calls="
-                                              << tool_calls_debug_summary(tool_calls)
+                                              << tool_calls_debug_summary(
+                                                     tool_calls)
+                                              << " incremental="
+                                              << (incremental.streaming()
+                                                      ? "true" : "false")
                                               << "\n";
-                                    send_delta(tool_call_delta(tool_calls));
                                     send_done("tool_calls");
                                 } else {
                                     std::string preview = split.content.empty()
@@ -1741,13 +2108,27 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     std::cerr << "[qw3-serve] #" << rid
                                               << " tool_parse_empty preview="
                                               << dump_json(preview) << "\n";
-                                    if (!streamed_content && !split.content.empty()) {
-                                        send_delta(json{{"content", split.content}});
+                                    if (incremental.streaming()) {
+                                        throw std::runtime_error(
+                                            "incremental tool stream produced "
+                                            "no complete tool call");
+                                    }
+                                    if (!streamed_content &&
+                                        !split.content.empty()) {
+                                        send_delta(
+                                            json{{"content", split.content}});
                                     }
                                     send_done("stop");
                                 }
                             } else {
-                                if (!content_pending.empty()) emit_text(content_pending);
+                                if (forced_tool_request) {
+                                    forced_prefix += content_pending;
+                                    if (!forced_prefix.empty()) {
+                                        emit_text(forced_prefix);
+                                    }
+                                } else if (!content_pending.empty()) {
+                                    emit_text(content_pending);
+                                }
                                 finish_text_stream();
                                 send_done("stop");
                             }
@@ -1757,12 +2138,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                       << " prompt_tokens=" << prompt_token_count
                                       << " route=" << route
                                       << " buffered_tool=" << (buffering_tool ? "true" : "false")
-                                      << (client_closed ? " client_closed=true" : "")
+                                      << " incremental_tool="
+                                      << (incremental.streaming() ? "true" : "false")
                                       << "\n";
                             return true;
                         }
-                        eng.generate_stream(prompt, g, [&](const std::string &piece) {
-                            if (stopped) return;
+                        eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
+                            if (stopped || client_closed) return false;
                             ++completion_tokens;
                             acc += piece;
                             std::string emit = take_complete_utf8(utf8_pending, piece);
@@ -1781,6 +2163,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             if (!emit.empty()) {
                                 emit_text(emit);
                             }
+                            return !stopped && !client_closed;
                         });
                         finish_text_stream();
                         send_done(stopped ? "stop" : "stop");
@@ -1818,15 +2201,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         size_t completion_tokens = 0;
         try {
             if (g.continuous_batching) {
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             }
         } catch (const std::exception &e) {
@@ -1929,15 +2314,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         size_t completion_tokens = 0;
         try {
             if (g.continuous_batching) {
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             }
         } catch (const std::exception &e) {

@@ -42,6 +42,20 @@ std::string Engine::generate(const std::string &prompt, const GenerationOptions 
 void Engine::generate_stream(const std::string &prompt,
                              const GenerationOptions &options,
                              const TokenCallback &on_text) {
+    impl_->backend->generate(
+        prompt, options,
+        on_text ? CancellableTokenCallback(
+                      [&on_text](const std::string &text) {
+                          on_text(text);
+                          return true;
+                      })
+                : CancellableTokenCallback{});
+}
+
+void Engine::generate_stream_cancellable(
+        const std::string &prompt,
+        const GenerationOptions &options,
+        const CancellableTokenCallback &on_text) {
     impl_->backend->generate(prompt, options, on_text);
 }
 

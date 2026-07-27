@@ -1404,7 +1404,8 @@ public:
 
             MtpGenStats stats;
             const bool reset = (ti == 0);
-            (void)generate_mtp(chunk, gen, TokenCallback{}, /*dump=*/nullptr,
+            (void)generate_mtp(chunk, gen, CancellableTokenCallback{},
+                               /*dump=*/nullptr,
                                /*spec_mtp=*/true, /*trace_mtp=*/false,
                                /*override_executor=*/nullptr,
                                /*manage_device_scope=*/true,
@@ -1520,7 +1521,7 @@ public:
 
     std::string generate(const std::string &prompt,
                          const GenerationOptions &options,
-                         const TokenCallback &on_text) override {
+                         const CancellableTokenCallback &on_text) override {
         if (!model_) throw std::runtime_error("qwen-native backend is not loaded");
         if (options_.native_kernels != "cuda") {
             throw std::runtime_error("qwen-native now uses a device-resident executor; use --native-kernels cuda");
@@ -1648,7 +1649,7 @@ private:
         uint64_t id = 0;
         std::vector<uint32_t> prompt_tokens;
         GenerationOptions options;
-        TokenCallback on_text;
+        CancellableTokenCallback on_text;
         uint64_t reserved_tokens = 0;
         bool budget_released = false;
         bool spec_mtp = false;
@@ -1709,6 +1710,7 @@ private:
         ThinkingBudgetState budget;
         uint32_t next_token = 0;
         int decoded = 0;
+        bool stream_cancelled = false;
         uint32_t prefill_offset = 0;
         uint64_t prefill_ops = 0;
         uint64_t decode_ops = 0;
@@ -3741,7 +3743,7 @@ private:
 
     std::string generate_continuous_batched(const std::vector<uint32_t> &prompt_tokens,
                                             const GenerationOptions &options,
-                                            const TokenCallback &on_text) {
+                                            const CancellableTokenCallback &on_text) {
         start_continuous_batch_worker();
         auto req = std::make_shared<ContinuousBatchRequest>();
         req->id = ++cb_request_counter_;
@@ -4874,13 +4876,16 @@ private:
             const std::string piece =
                 tokenizer_->decode_one(static_cast<int32_t>(token));
             a.req->generated += piece;
-            if (a.req->on_text) a.req->on_text(piece);
             budget_observe(a.budget, token);
             // Track committed tokens so the next verify batch's penalties
             // (presence/repetition) see the running output. No-op for greedy
             // (penalties unused), so greedy MTP stays byte-identical.
             ++a.seen_tokens[token];
             ++a.decoded;
+            if (a.req->on_text && !a.req->on_text(piece)) {
+                a.stream_cancelled = true;
+                return false;
+            }
             return true;
         };
 
@@ -4992,7 +4997,8 @@ private:
                     !should_stop(a, a.next_token)) {
                     emit(a, a.next_token);
                 }
-                if (a.decoded >= req->options.max_tokens ||
+                if (a.stream_cancelled ||
+                    a.decoded >= req->options.max_tokens ||
                     should_stop(a, a.next_token)) {
                     finish_continuous_active(a);
                 } else {
@@ -5102,7 +5108,8 @@ private:
                 draft_rows.reserve(mtp_active.size());
                 for (size_t row = 0; row < mtp_active.size(); ++row) {
                     ContinuousBatchActive &a = mtp_active[row];
-                    if (!a.req || a.decoded >= a.req->options.max_tokens ||
+                    if (!a.req || a.stream_cancelled ||
+                        a.decoded >= a.req->options.max_tokens ||
                         should_stop(a, a.next_token)) {
                         continue;
                     }
@@ -5695,7 +5702,8 @@ private:
                         for (uint32_t i = 0; i < accepted; ++i) {
                             if (!emit(a, job.drafts[i])) break;
                         }
-                        if (a.decoded >= a.req->options.max_tokens) continue;
+                        if (a.stream_cancelled ||
+                            a.decoded >= a.req->options.max_tokens) continue;
                         if (all_accepted && !do_sample) {
                             // Greedy: bonus token is the final row's argmax.
                             // (Sampling already drew the bonus into `target`
@@ -5717,7 +5725,8 @@ private:
                 }
                 for (size_t i = mtp_active.size(); i > 0; --i) {
                     ContinuousBatchActive &a = mtp_active[i - 1];
-                    if (!a.req || a.decoded >= a.req->options.max_tokens ||
+                    if (!a.req || a.stream_cancelled ||
+                        a.decoded >= a.req->options.max_tokens ||
                         should_stop(a, a.next_token)) {
                         const MtpStats &s = stats[i - 1];
                         const double decode_s =
@@ -6106,8 +6115,10 @@ private:
                 return;
             }
 
-            emit_continuous_token(a, a.next_token);
-            if (a.decoded >= a.req->options.max_tokens) {
+            const bool emitted =
+                emit_continuous_token(a, a.next_token);
+            if (!emitted ||
+                a.decoded >= a.req->options.max_tokens) {
                 finish_continuous_active(a);
             } else {
                 active.push_back(std::move(a));
@@ -6482,8 +6493,10 @@ private:
                 continue;
             }
 
-            emit_continuous_token(a, a.next_token);
-            if (a.decoded >= a.req->options.max_tokens) {
+            const bool emitted =
+                emit_continuous_token(a, a.next_token);
+            if (!emitted ||
+                a.decoded >= a.req->options.max_tokens) {
                 finish_continuous_active(a);
             } else {
                 active.push_back(std::move(a));
@@ -6753,8 +6766,8 @@ private:
                     a.req.reset();
                     continue;
                 }
-                emit_continuous_token(a, a.next_token);
-                if (a.decoded >= a.req->options.max_tokens) {
+                if (!emit_continuous_token(a, a.next_token) ||
+                    a.decoded >= a.req->options.max_tokens) {
                     finish_continuous_active(a);
                     a.req.reset();
                     continue;
@@ -6804,12 +6817,16 @@ private:
         return token >= 0 ? token : fallback_argmax;
     }
 
-    void emit_continuous_token(ContinuousBatchActive &a, uint32_t token) {
+    bool emit_continuous_token(ContinuousBatchActive &a, uint32_t token) {
         const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
         a.req->generated += piece;
-        if (a.req->on_text) a.req->on_text(piece);
         ++a.seen_tokens[token];
         ++a.decoded;
+        if (a.req->on_text && !a.req->on_text(piece)) {
+            a.stream_cancelled = true;
+            return false;
+        }
+        return true;
     }
 
     // ---- Prefix cache methods (Phase 1) -----------------------------------
@@ -7213,6 +7230,7 @@ private:
             << " batch_steps=" << cb_decode_batches_.load()
             << " batch_tokens=" << cb_decode_tokens_.load()
             << " max_batch=" << cb_decode_max_batch_.load();
+        if (a.stream_cancelled) msg << " cancelled=true";
         log(msg.str());
         if (QwenExecutor::kvmem_timing_enabled()) {
             std::string tag = "phase=decode request=" + std::to_string(a.req->id);
@@ -7337,7 +7355,7 @@ private:
     // chunking + graph capture live inside the executor.
     std::string generate_plain(const std::vector<uint32_t> &prompt_tokens,
                                const GenerationOptions &options,
-                               const TokenCallback &on_text,
+                               const CancellableTokenCallback &on_text,
                                DumpStream *dump) {
         DeviceStatus st = device_->begin();
         if (!st.ok) throw std::runtime_error(st.message);
@@ -7738,6 +7756,7 @@ private:
         std::unordered_map<std::string, TraceStats> decode_trace;
         uint64_t decode_trace_steps = 0;
         int decoded = 0;
+        bool stream_cancelled = false;
         const auto should_stop_eos = [&]() {
             return !options.ignore_eos &&
                    next_token == static_cast<uint32_t>(eos) &&
@@ -7746,10 +7765,10 @@ private:
         if (options.max_tokens > 0 && !should_stop_eos()) {
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
             generated += piece;
-            if (on_text) on_text(piece);
             ++seen_tokens[next_token];
             if (warm_capture) gen_tokens.push_back(next_token);
             ++decoded;
+            if (on_text && !on_text(piece)) stream_cancelled = true;
         }
         // Above-budget QC: index generated tokens as decode produces them so the
         // next turn's preserved [0,D) slices cover the response too (Gap A). No-op
@@ -7769,7 +7788,9 @@ private:
             }
         }
 #endif
-        for (int i = 0; i + 1 < options.max_tokens; ++i) {
+        for (int i = 0;
+             i + 1 < options.max_tokens && !stream_cancelled;
+             ++i) {
             if (should_stop_eos()) break;
             const uint32_t feed = next_token;
             step = executor_->forward_one_token(feed);
@@ -7805,10 +7826,10 @@ private:
             if (should_stop_eos()) break;
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
             generated += piece;
-            if (on_text) on_text(piece);
             ++seen_tokens[next_token];
             if (warm_capture) gen_tokens.push_back(next_token);
             ++decoded;
+            if (on_text && !on_text(piece)) stream_cancelled = true;
         }
 #ifdef QW3_ENABLE_CUDA
         if (profile_cuda_decode) {
@@ -7837,7 +7858,7 @@ private:
         // position() beyond the log can't happen on the plain path, but guard it
         // (invalidate) rather than capture an inconsistent checkpoint. Captured
         // inside the device scope since capture_state issues device copies.
-        if (warm_capture) {
+        if (warm_capture && !stream_cancelled) {
             kvmem_warm_log_ = prompt_tokens;
             kvmem_warm_log_.insert(kvmem_warm_log_.end(),
                                    gen_tokens.begin(), gen_tokens.end());
@@ -7864,6 +7885,8 @@ private:
             } else {
                 kvmem_warm_valid_ = false;
             }
+        } else if (stream_cancelled) {
+            kvmem_warm_valid_ = false;
         }
 
         st = device_->end();
@@ -7890,6 +7913,7 @@ private:
             msg << " kvmem_reuse=" << reuse_m
                 << " prefilled=" << (prompt_tokens.size() - reuse_m);
         }
+        if (stream_cancelled) msg << " cancelled=true";
         log(msg.str());
         if (decode_trace_enabled() && !decode_trace.empty()) {
             log_decode_trace(decode_trace, decode_trace_steps);
@@ -7926,7 +7950,7 @@ private:
     // incrementally (the new turn's chunk is appended at the running position).
     std::string generate_mtp(std::vector<uint32_t> &prompt_tokens,
                              const GenerationOptions &options,
-                             const TokenCallback &on_text,
+                             const CancellableTokenCallback &on_text,
                              DumpStream *dump,
                              bool spec_mtp,
                              bool trace_mtp,
@@ -8598,6 +8622,7 @@ private:
             return wall_seconds();
         };
         int decoded = 0;
+        bool stream_cancelled = false;
         struct PendingMtpChain {
             int start_index = 0;
             int input_token = -1;
@@ -8834,13 +8859,16 @@ private:
             if (decoded >= options.max_tokens || should_stop_mtp_eos(token)) return false;
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
             generated += piece;
-            if (on_text) on_text(piece);
             budget_observe(budget, token);
             // Track committed tokens for the next accept test's penalties (no-op
             // for greedy without penalties, keeping that path byte-identical).
             if (mtp_need_logits_pick) ++mtp_seen[token];
             if (kvmem_warm_capture) gen_tokens.push_back(token);
             ++decoded;
+            if (on_text && !on_text(piece)) {
+                stream_cancelled = true;
+                return false;
+            }
             return true;
         };
 
@@ -8853,7 +8881,9 @@ private:
         uint64_t plain_decode_forwards = 0;
         const bool decode_as_batch = decode_as_batch_enabled();
         auto run_plain_decode_remaining = [&]() {
-            while (decoded < options.max_tokens && !should_stop_mtp_eos(next_token)) {
+            while (!stream_cancelled &&
+                   decoded < options.max_tokens &&
+                   !should_stop_mtp_eos(next_token)) {
                 const uint32_t feed = next_token;
                 // kvmem requires the window-aware per-token path: the batched
                 // forward_n_tokens attends over true positions, not the window.
@@ -8892,6 +8922,7 @@ private:
 
         if (run_spec_mtp) {
             while (run_spec_mtp &&
+                   !stream_cancelled &&
                    decoded < options.max_tokens &&
                    !should_stop_mtp_eos(next_token)) {
                 // Once the thinking budget is exhausted, stop speculating and
@@ -9151,7 +9182,8 @@ private:
                     for (uint32_t i = 0; i < accepted; ++i) {
                         if (!emit_generated_token(drafts[i])) break;
                     }
-                    if (decoded >= options.max_tokens) break;
+                    if (stream_cancelled ||
+                        decoded >= options.max_tokens) break;
                     // Greedy: the bonus token is the final row's argmax. The accept
                     // test already drew the bonus into target_token whenever logits
                     // were picked (sampling or penalties), so only recompute it on the
@@ -9257,7 +9289,8 @@ private:
                     for (uint32_t i = 0; i < accepted; ++i) {
                         if (!emit_generated_token(drafts[i])) break;
                     }
-                    if (decoded >= options.max_tokens) break;
+                    if (stream_cancelled ||
+                        decoded >= options.max_tokens) break;
                     next_token = static_cast<uint32_t>(target_token);
                     if (!emit_generated_token(next_token)) break;
                     if (mtp_spec_rejected > mtp_reject_limit) {
@@ -9283,7 +9316,7 @@ private:
                 // attention uses the KVMem window.
             }
         }
-        if (!run_spec_mtp) {
+        if (!run_spec_mtp && !stream_cancelled) {
             const double t_plain_start = mtp_phase_time();
             run_plain_decode_remaining();
             if (spec_mtp) {
@@ -9299,7 +9332,7 @@ private:
         // to KV but not emitted because max_tokens was hit) invalidates the warm
         // state instead of capturing an inconsistent checkpoint. Captured inside
         // the device scope since capture_state issues device copies.
-        if (kvmem_warm_capture) {
+        if (kvmem_warm_capture && !stream_cancelled) {
             kvmem_warm_log_ = prompt_tokens;
             kvmem_warm_log_.insert(kvmem_warm_log_.end(),
                                    gen_tokens.begin(), gen_tokens.end());
@@ -9326,6 +9359,8 @@ private:
             } else {
                 kvmem_warm_valid_ = false;
             }
+        } else if (stream_cancelled) {
+            kvmem_warm_valid_ = false;
         }
 
         if (manage_device_scope) {
@@ -9361,6 +9396,7 @@ private:
             msg << " kvmem_reuse=" << kvmem_reuse_m
                 << " prefilled=" << (prompt_tokens.size() - kvmem_reuse_m);
         }
+        if (stream_cancelled) msg << " cancelled=true";
         log(msg.str());
         if (kvmem_on && QwenExecutor::kvmem_timing_enabled()) {
             QwenExecutor::kvmem_timing_emit_delta("phase=decode request=mtp",

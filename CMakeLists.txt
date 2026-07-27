@@ -109,6 +109,7 @@ add_library(qw3_core
     src/qwen_weights.cpp
     src/qwen_config.cpp
     src/kvmem_store.cpp
+    src/tool_call_stream.cpp
     src/tokenizer.cpp
 )
 
@@ -231,6 +232,12 @@ if(QW3_BUILD_TESTS)
     add_executable(qw3-kvmem-store tests/kvmem_store_test.cpp)
     target_link_libraries(qw3-kvmem-store PRIVATE qw3_core)
     add_test(NAME qw3-kvmem-store COMMAND qw3-kvmem-store)
+
+    add_executable(qw3-tool-call-stream tests/tool_call_stream_test.cpp)
+    target_include_directories(qw3-tool-call-stream PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(qw3-tool-call-stream PRIVATE qw3_core)
+    add_test(NAME qw3-tool-call-stream COMMAND qw3-tool-call-stream)
 
     add_executable(qw3-pinned-kv-tier tests/pinned_kv_tier_test.cpp)
     target_link_libraries(qw3-pinned-kv-tier PRIVATE qw3_core)
