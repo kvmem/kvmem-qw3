@@ -4907,9 +4907,8 @@ private:
                         << " mode=batched_verify";
                     log(msg.str());
                 }
-                constexpr uint32_t kMtpPrefillChunk = 4096;
                 a.executor->set_prefill_chunk_override(
-                    static_cast<int>(kMtpPrefillChunk));
+                    options_.prefill_chunk);
                 NativeExecutorReport step;
                 uint64_t prefill_ops = 0;
                 if (QwenExecutor::kvmem_timing_enabled()) {
@@ -4932,11 +4931,13 @@ private:
                 const size_t prefill_start = std::min<size_t>(
                     a.prefill_offset, req->prompt_tokens.size());
                 for (size_t offset = prefill_start;
-                     offset < req->prompt_tokens.size();
-                     offset += kMtpPrefillChunk) {
-                    const size_t end = std::min(
-                        req->prompt_tokens.size(),
-                        offset + static_cast<size_t>(kMtpPrefillChunk));
+                     offset < req->prompt_tokens.size();) {
+                    const uint32_t remaining = static_cast<uint32_t>(
+                        req->prompt_tokens.size() - offset);
+                    const uint32_t width = std::max<uint32_t>(
+                        1, a.executor->effective_prefill_chunk_size(remaining));
+                    const size_t end =
+                        offset + std::min<size_t>(remaining, width);
                     std::vector<uint32_t> chunk(
                         req->prompt_tokens.begin() +
                             static_cast<std::ptrdiff_t>(offset),
@@ -4955,6 +4956,7 @@ private:
                                 "MTP prefix priming failed in batched lane");
                         }
                     }
+                    offset = end;
                 }
                 // Seeding only ever reuses a strict prefix (hit_len <
                 // prompt_len), so prefill_start < prompt_len and the loop ran at
@@ -8173,13 +8175,11 @@ private:
         // forward_n_tokens would use internally (effective_prefill_chunk_size),
         // so each backend chunk is processed as a single batch and
         // prime_mtp_prefix_from_last_batch sees the whole chunk's hidden rows.
-        // Keeping the 4096 override as the base means below-budget chunks stay
-        // 4096 (byte-identical to before, since the pool cap is inactive there);
-        // above budget the bounded GPU pool caps the width, which the priming
-        // loop now honors instead of forcing a re-split that disabled the path.
-        constexpr uint32_t kMtpPrefillChunk = 4096;
+        // Keep the configured prefill chunk as the base. Above budget the
+        // bounded GPU pool may still cap the width, which the priming loop
+        // honors instead of forcing a re-split that would disable the path.
         if (use_mtp_prefix) {
-            executor_->set_prefill_chunk_override(static_cast<int>(kMtpPrefillChunk));
+            executor_->set_prefill_chunk_override(options_.prefill_chunk);
         }
 
         uint32_t mtp_prefix_tokens = 0;
@@ -8288,9 +8288,9 @@ private:
                 for (size_t offset = lbegin; offset < lend;) {
                     const uint32_t remaining = static_cast<uint32_t>(lend - offset);
                     // Width forward_n_tokens will actually run as one internal
-                    // chunk: 4096 (the override base) below budget, pool-capped
+                    // chunk: the configured override below budget, pool-capped
                     // above budget. Matching it keeps prime_mtp_prefix's batch
-                    // == the chunk it was primed for.
+                    // equal to the chunk it was primed for.
                     const uint32_t width = std::max<uint32_t>(
                         1, executor_->effective_prefill_chunk_size(remaining));
                     const size_t end =
