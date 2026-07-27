@@ -52,6 +52,7 @@ public:
         bool ready = false;
         uint32_t position = 0;
         uint32_t kv_logical_pages = 0;
+        uint32_t mtp_kv_logical_pages = 0;
         uint32_t mtp_prefix_len = 0;
         uint32_t kvmem_registered_pos = 0;
         // kvmem window state: when kvmem is active the assembled window advances
@@ -66,6 +67,10 @@ public:
         uint32_t window_query_pos = 0;
         uint32_t window_page_count = 0;
         std::unique_ptr<DeviceTensor> h;
+        // prime_mtp_prefix_from_last_batch consumes the previous target hidden
+        // row from mtp_prefix_h_. Restoring only mtp_prefix_len would leave this
+        // row at the discarded suffix after a query replay.
+        std::unique_ptr<DeviceTensor> mtp_prefix_h;
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
         std::vector<std::unique_ptr<DeviceTensor>> conv_states;
     };
@@ -335,8 +340,8 @@ public:
     std::vector<int32_t> kv_physical_pages() const;
     uint32_t kv_page_size_public() const { return kv_pages_.page_size; }
 
-    // Per-token batch-scratch footprint in bytes (sum of all *_batch_ tensors
-    // at batch=1). Used to size prefill chunks against free device memory.
+    // Conservative per-token batch-scratch footprint in bytes. Used to size
+    // prefill chunks against free device memory.
     uint64_t per_token_scratch_bytes() const;
 
     // Prefill chunk override: -1 = use env / built-in default (512), 0 =
@@ -372,6 +377,7 @@ public:
     // K chunk is captured. (Public: backend-invoked.)
     void kvmem_set_query_span(uint32_t begin, uint32_t end,
                               uint32_t prompt_tokens,
+                              uint32_t index_tokens = 0,
                               bool preserve_content_index = false,
                               bool capture_content_without_query = false); // before prefill
     uint32_t kvmem_query_expected_tokens() const {
@@ -411,6 +417,14 @@ public:
     // tail); 0xffffffff (default, set by reset_state) => no pin => byte-identical.
     void kvmem_stash_clean_query();
     void kvmem_restore_clean_query();
+    // Query-replay variants of the same persistent query buffer. The neutral
+    // names avoid tying replay to the isolated clean-query feature. reset keeps
+    // the historical content index live while allowing the final replay to
+    // replace the provisional Q used for selection.
+    bool kvmem_stash_query();
+    void kvmem_restore_stashed_query();
+    void kvmem_reset_query_capture();
+    bool kvmem_query_selection_ready() const;
     void kvmem_set_pin_from_block(uint32_t b) { kvmem_qc_pin_from_block_ = b; }
     // Diagnostics-only oracle selection. Spans use logical prompt-token
     // coordinates; every currently materialized block that overlaps a span is
@@ -529,6 +543,13 @@ public:
     // the semantic context with sink+recent.
     void kvmem_set_keep_selected_prefill(bool keep) {
         kvmem_keep_selected_prefill_ = keep;
+    }
+    // Query replay owns the working-set transition at its checkpoint boundary.
+    // The GPU pool includes generation headroom for this short tail, so suppress
+    // pressure-driven mid-tail reselection while provisional/final query chunks
+    // run; otherwise the selected set could change again without another replay.
+    void kvmem_set_prefill_reselect_suppressed(bool suppressed) {
+        kvmem_prefill_reselect_suppressed_ = suppressed;
     }
 
     // Re-select the working set from the built-in cumulative-attention top-k
@@ -677,8 +698,12 @@ private:
     const QwenNativeModel &model_;
     const QwenWeights &weights_;
     DeviceBackend &backend_;
+    bool bf16_main_ = false;
 
     void ensure_batch_scratch(uint32_t batch);
+    void ensure_ffn_mid_batch_scratch(uint32_t active_batch);
+    void ensure_ffn_gate_up_batch_scratch(uint32_t active_batch);
+    void ensure_recurrent_materialization_batch_scratch(uint32_t active_batch);
 
     bool scratch_ready_ = false;
     std::unique_ptr<DeviceTensor> h_;
@@ -697,6 +722,14 @@ private:
     // Batched scratch for forward_n_tokens. Sized to `batch_capacity_` rows
     // each. Allocated on demand (and grown lazily) by ensure_batch_scratch.
     uint32_t batch_capacity_ = 0;
+    uint32_t ffn_batch_stride_ = 0;
+    uint32_t ffn_mid_batch_capacity_ = 0;
+    uint32_t ffn_gate_up_batch_capacity_ = 0;
+    uint32_t recurrent_materialization_batch_capacity_ = 0;
+    bool compact_lazy_recurrent_arena_ = false;
+    // Declared before its views so normal reverse-order destruction releases
+    // every non-owning view before the backing allocation.
+    std::unique_ptr<DeviceTensor> batch_scratch_arena_;
     std::unique_ptr<DeviceTensor> h_batch_;
     std::unique_ptr<DeviceTensor> norm_batch_;
     std::unique_ptr<DeviceTensor> attn_out_batch_;
@@ -706,6 +739,8 @@ private:
     std::unique_ptr<DeviceTensor> ffn_out_batch_;
     std::unique_ptr<DeviceTensor> proj_batch_;
     std::unique_ptr<DeviceTensor> gate_proj_batch_;
+    std::unique_ptr<DeviceTensor> proj_batch_materialized_;
+    std::unique_ptr<DeviceTensor> gate_proj_batch_materialized_;
     std::unique_ptr<DeviceTensor> alpha_batch_;
     std::unique_ptr<DeviceTensor> beta_batch_;
     std::unique_ptr<DeviceTensor> core_batch_;
@@ -755,6 +790,8 @@ private:
     std::unique_ptr<DeviceTensor> mtp_enorm_;
     std::unique_ptr<DeviceTensor> mtp_hnorm_;
     std::unique_ptr<DeviceTensor> mtp_concat_;
+    std::unique_ptr<DeviceTensor> mtp_attn_out_;
+    std::unique_ptr<DeviceTensor> mtp_ffn_out_;
     std::unique_ptr<DeviceTensor> mtp_k_cache_;
     std::unique_ptr<DeviceTensor> mtp_v_cache_;
     std::unique_ptr<DeviceTensor> mtp_zero_h_;
@@ -1391,6 +1428,7 @@ private:
     bool kvmem_retrieval_score_exactmass(
         std::string *failure_reason = nullptr);  // boundary, raw-key ExactMass
     bool kvmem_qc_pertoken_ = false;                           // retrieval_method == PerToken
+    bool kvmem_prefill_reselect_suppressed_ = false;
     uint32_t kvmem_qc_total_tokens_ = 0;                       // total prompt tokens (kraw stride)
     std::unique_ptr<DeviceTensor> g_kraw_multi_;              // [L, total_tokens, n_kv_heads, head_dim] fp32
     bool g_kraw_multi_ready_ = false;                          // g_kraw_multi_ holds raw keys

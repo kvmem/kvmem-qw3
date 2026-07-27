@@ -40,6 +40,10 @@ struct ServerConfig {
     // shared executor warm across requests and prefills only the new suffix when
     // a prompt strictly extends the prior request (prompt+response).
     bool kvmem_prefix_cache = false;
+    // Query-only checkpoint/replay for hybrid KVMem. The final user query is
+    // replayed under its retrieved working set so recurrent state observes the
+    // selected normal-attention context. Off by default.
+    bool kvmem_query_replay = false;
     int max_active = 2;
     int max_pending = 128;
     int prefill_burst = 0;

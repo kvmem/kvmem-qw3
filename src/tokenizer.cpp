@@ -1,11 +1,16 @@
 #include "qw3/tokenizer.hpp"
 
+#include "tokenizer_internal.hpp"
+#include "json.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <locale>
 #include <stdexcept>
@@ -13,6 +18,8 @@
 
 namespace qw3 {
 namespace {
+
+using json = nlohmann::json;
 
 // UTF-8 helpers operating on byte strings.
 
@@ -172,6 +179,125 @@ QwenTokenizer::QwenTokenizer(const GgufFile &gguf) {
         add_bos_ = ab->second.bool_value;
     }
 
+    finish_initialization();
+}
+
+QwenTokenizer::QwenTokenizer(const std::string &hf_model_directory) {
+    const std::filesystem::path directory(hf_model_directory);
+    std::ifstream tokenizer_in(directory / "tokenizer.json");
+    if (!tokenizer_in) {
+        throw std::runtime_error("cannot open HF tokenizer.json in " + hf_model_directory);
+    }
+    json tokenizer;
+    tokenizer_in >> tokenizer;
+    if (!tokenizer.contains("model") ||
+        !tokenizer.at("model").contains("vocab") ||
+        !tokenizer.at("model").contains("merges")) {
+        throw std::runtime_error("HF tokenizer.json is missing BPE vocab/merges");
+    }
+
+    const json &vocab = tokenizer.at("model").at("vocab");
+    int32_t max_id = -1;
+    for (const auto &entry : vocab.items()) {
+        max_id = std::max(max_id, entry.value().get<int32_t>());
+    }
+    if (tokenizer.contains("added_tokens")) {
+        for (const json &entry : tokenizer.at("added_tokens")) {
+            max_id = std::max(max_id, entry.at("id").get<int32_t>());
+        }
+    }
+    if (max_id < 0) throw std::runtime_error("HF tokenizer vocabulary is empty");
+    tokens_.resize(static_cast<size_t>(max_id) + 1);
+    for (const auto &entry : vocab.items()) {
+        tokens_.at(static_cast<size_t>(entry.value().get<int32_t>())) = entry.key();
+    }
+    if (tokenizer.contains("added_tokens")) {
+        for (const json &entry : tokenizer.at("added_tokens")) {
+            tokens_.at(static_cast<size_t>(entry.at("id").get<int32_t>())) =
+                entry.at("content").get<std::string>();
+        }
+    }
+
+    const json &merges = tokenizer.at("model").at("merges");
+    merge_rank_.reserve(merges.size() * 2);
+    for (size_t i = 0; i < merges.size(); ++i) {
+        std::string left;
+        std::string right;
+        if (merges.at(i).is_string()) {
+            const std::string line = merges.at(i).get<std::string>();
+            const size_t split = line.find(' ');
+            if (split == std::string::npos) continue;
+            left = line.substr(0, split);
+            right = line.substr(split + 1);
+        } else if (merges.at(i).is_array() && merges.at(i).size() == 2) {
+            left = merges.at(i).at(0).get<std::string>();
+            right = merges.at(i).at(1).get<std::string>();
+        } else {
+            continue;
+        }
+        merge_rank_.emplace(std::make_pair(std::move(left), std::move(right)),
+                            static_cast<int32_t>(i));
+    }
+
+    std::ifstream config_in(directory / "config.json");
+    if (!config_in) throw std::runtime_error("cannot open HF model config for tokenizer ids");
+    json config;
+    config_in >> config;
+    const json &text = config.at("text_config");
+    bos_id_ = text.value("bos_token_id", 0);
+    eos_id_ = text.value("eos_token_id", 0);
+
+    // The model config uses <|endoftext|> as its generic EOS, while chat
+    // generation terminates on <|im_end|>. Prefer the tokenizer's named EOS
+    // so the id always follows the actual vocabulary instead of a hard-coded
+    // checkpoint-specific number.
+    std::ifstream tokenizer_config_in(directory / "tokenizer_config.json");
+    if (tokenizer_config_in) {
+        json tokenizer_config;
+        tokenizer_config_in >> tokenizer_config;
+        if (tokenizer_config.contains("eos_token")) {
+            const json &eos = tokenizer_config.at("eos_token");
+            std::string eos_text;
+            if (eos.is_string()) {
+                eos_text = eos.get<std::string>();
+            } else if (eos.is_object() && eos.contains("content") &&
+                       eos.at("content").is_string()) {
+                eos_text = eos.at("content").get<std::string>();
+            }
+            if (!eos_text.empty()) {
+                const auto it = std::find(tokens_.begin(), tokens_.end(), eos_text);
+                if (it != tokens_.end()) {
+                    eos_id_ = static_cast<int32_t>(std::distance(tokens_.begin(), it));
+                }
+            }
+        }
+    } else {
+        std::ifstream generation_in(directory / "generation_config.json");
+        if (generation_in) {
+            json generation;
+            generation_in >> generation;
+            if (generation.contains("eos_token_id")) {
+                const json &eos = generation.at("eos_token_id");
+                if (eos.is_number_integer()) {
+                    eos_id_ = eos.get<int32_t>();
+                } else if (eos.is_array() && !eos.empty() &&
+                           eos.front().is_number_integer()) {
+                    eos_id_ = eos.front().get<int32_t>();
+                }
+            }
+        }
+    }
+    add_bos_ = false;
+    finish_initialization();
+}
+
+void QwenTokenizer::finish_initialization() {
+    token_to_id_.clear();
+    token_to_id_.reserve(tokens_.size() * 2);
+    for (size_t i = 0; i < tokens_.size(); ++i) {
+        if (!tokens_[i].empty()) token_to_id_.emplace(tokens_[i], static_cast<int32_t>(i));
+    }
+
     build_byte_maps();
 
     // Pull every Qwen-style special token directly from the vocab.
@@ -214,8 +340,9 @@ std::string QwenTokenizer::bytes_to_chars(const std::string &bytes) const {
     return out;
 }
 
-std::vector<std::string> QwenTokenizer::pre_tokenize(const std::string &text) const {
-    // Exact Qwen3.5 pre-tokenizer control flow, matching llama.cpp's optimized
+std::vector<std::string> detail::qwen_pre_tokenize(const std::string &text) {
+    // Exact Unicode-aware pre-tokenizer control flow, matching llama.cpp's
+    // optimized implementation of the Qwen tokenizer Split regex:
     // implementation of:
     //   (?i:'s|'t|'re|'ve|'m|'ll|'d)
     //   | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
@@ -223,7 +350,7 @@ std::vector<std::string> QwenTokenizer::pre_tokenize(const std::string &text) co
     //   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
     //   | \s*[\r\n]+ | \s+(?!\S) | \s+
     //
-    // Two details are important for long JSON/tool traces: Qwen3.5 isolates
+    // Two details are important for long JSON/tool traces: Qwen isolates
     // every numeric codepoint (not 1-3 digit groups), and a whitespace run
     // before more text leaves its final space for the next token.  The old
     // approximation got both wrong and drifted by 10-16% on AgentLongBench.
@@ -427,7 +554,7 @@ std::vector<int32_t> QwenTokenizer::encode(const std::string &text, bool add_bos
             if (pos != std::string::npos && pos < end) end = pos;
         }
         const std::string chunk = text.substr(i, end - i);
-        for (const std::string &piece : pre_tokenize(chunk)) {
+        for (const std::string &piece : detail::qwen_pre_tokenize(chunk)) {
             const std::vector<int32_t> ids = bpe_piece(piece);
             out.insert(out.end(), ids.begin(), ids.end());
         }

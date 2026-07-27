@@ -15,12 +15,21 @@ public:
     virtual void load(const EngineOptions &options) = 0;
     virtual std::string generate(const std::string &prompt,
                                  const GenerationOptions &options,
-                                 const TokenCallback &on_text) = 0;
+                                 const CancellableTokenCallback &on_text) = 0;
     virtual std::string generate_session(const std::string &prompt_fragment,
                                          const GenerationOptions &options,
                                          const TokenCallback &on_text,
                                          bool reset) {
-        if (reset) return generate(prompt_fragment, options, on_text);
+        if (reset) {
+            return generate(
+                prompt_fragment, options,
+                on_text ? CancellableTokenCallback(
+                              [on_text](const std::string &piece) {
+                                  on_text(piece);
+                                  return true;
+                              })
+                        : CancellableTokenCallback{});
+        }
         throw std::runtime_error(
             "persistent session append is unsupported by this backend");
     }

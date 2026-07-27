@@ -28,6 +28,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <type_traits>
 
@@ -170,12 +171,31 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     return d_w * d_x * static_cast<float>(sumi);
 }
 
-template <int NCOLS_DST>
+__device__ __forceinline__ void q8_store(float *dst, uint64_t index, float value) {
+    dst[index] = value;
+}
+
+__device__ __forceinline__ void q8_store(
+        __nv_bfloat16 *dst, uint64_t index, float value) {
+    dst[index] = __float2bfloat16_rn(value);
+}
+
+__device__ __forceinline__ void q8_add_store(
+        float *dst, uint64_t index, float value) {
+    dst[index] += value;
+}
+
+__device__ __forceinline__ void q8_add_store(
+        __nv_bfloat16 *dst, uint64_t index, float value) {
+    dst[index] = __float2bfloat16_rn(__bfloat162float(dst[index]) + value);
+}
+
+template <int NCOLS_DST, typename DstT>
 __launch_bounds__(q8_mmvq_nwarps<NCOLS_DST>() * Q8_VEC_WARP_SIZE, 1)
 __global__ void mul_mat_vec_q8_0_kernel(
         const uint8_t *    __restrict__ vx,         // weight: rows × (cols/32)*34 bytes
         const block_q8_1 * __restrict__ vy,         // activation
-        float *            __restrict__ dst,        // [ncols_dst, rows]
+        DstT *             __restrict__ dst,        // [ncols_dst, rows]
         uint32_t cols,                              // == ncols_x
         uint32_t rows,                              // == nrows_x  (used for bounds)
         uint32_t stride_y_row,                      // blocks per activation row
@@ -252,7 +272,8 @@ __global__ void mul_mat_vec_q8_0_kernel(
         if (threadIdx.x < rows_per_cuda_block) {
             const uint64_t row_idx = static_cast<uint64_t>(row0 + threadIdx.x);
             if (rows_per_cuda_block == 1 || row_idx < rows) {
-                dst[j * stride_dst_row + row_idx] = tmp[j][threadIdx.x];
+                q8_store(dst, j * static_cast<uint64_t>(stride_dst_row) + row_idx,
+                         tmp[j][threadIdx.x]);
             }
         }
     }
@@ -504,12 +525,12 @@ __global__ void mul_mat_vec_q8_0_silu_mul_kernel(
 // Eliminates the per-layer add_kernel launch and the round-trip on the
 // attn_out / ffn_out intermediate buffers (saves 128 launches/token).
 
-template <int NCOLS_DST>
+template <int NCOLS_DST, typename DstT>
 __launch_bounds__(q8_mmvq_nwarps<NCOLS_DST>() * Q8_VEC_WARP_SIZE, 1)
 __global__ void mul_mat_vec_q8_0_add_kernel(
         const uint8_t *    __restrict__ vx,
         const block_q8_1 * __restrict__ vy,
-        float *            __restrict__ dst,
+        DstT *             __restrict__ dst,
         uint32_t cols,
         uint32_t rows,
         uint32_t stride_y_row,
@@ -576,8 +597,9 @@ __global__ void mul_mat_vec_q8_0_add_kernel(
         if (threadIdx.x < rows_per_cuda_block) {
             const uint64_t row_idx = static_cast<uint64_t>(row0 + threadIdx.x);
             if (rows_per_cuda_block == 1 || row_idx < rows) {
-                // Read-modify-write: dst += W*x.
-                dst[j * stride_dst_row + row_idx] += tmp[j][threadIdx.x];
+                q8_add_store(
+                    dst, j * static_cast<uint64_t>(stride_dst_row) + row_idx,
+                    tmp[j][threadIdx.x]);
             }
         }
     }
@@ -738,10 +760,11 @@ bool launch_quantize_mmq_q8_1(
 //   dst           : float [batch, rows], stride_dst_row floats per batch row.
 //   batch         : number of activation rows (== ncols_dst). 1..8 supported.
 //   stride_dst_row: floats per dst batch row (typically rows).
-bool launch_mmvq_q8_0(
+template <typename DstT>
+bool launch_mmvq_q8_0_typed(
         const uint8_t * weight,
         const void *    y_q8_1,
-        float *         dst,
+        DstT *          dst,
         uint32_t        rows,
         uint32_t        cols,
         uint32_t        batch,
@@ -758,7 +781,7 @@ bool launch_mmvq_q8_0(
         const uint32_t nblocks  = (rows + RPB - 1) / RPB;
         const dim3 grid(nblocks, 1, 1);
         const dim3 block(Q8_VEC_WARP_SIZE, NWARPS, 1);
-        mul_mat_vec_q8_0_kernel<NCOLS_DST><<<grid, block, 0, stream>>>(
+        mul_mat_vec_q8_0_kernel<NCOLS_DST, DstT><<<grid, block, 0, stream>>>(
             weight,
             reinterpret_cast<const block_q8_1 *>(y_q8_1),
             dst,
@@ -777,6 +800,22 @@ bool launch_mmvq_q8_0(
         default: return false;
     }
     return true;
+}
+
+bool launch_mmvq_q8_0(
+        const uint8_t *weight, const void *y_q8_1, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch,
+        uint32_t stride_dst_row, cudaStream_t stream) {
+    return launch_mmvq_q8_0_typed(
+        weight, y_q8_1, dst, rows, cols, batch, stride_dst_row, stream);
+}
+
+bool launch_mmvq_q8_0_bf16(
+        const uint8_t *weight, const void *y_q8_1, __nv_bfloat16 *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch,
+        uint32_t stride_dst_row, cudaStream_t stream) {
+    return launch_mmvq_q8_0_typed(
+        weight, y_q8_1, dst, rows, cols, batch, stride_dst_row, stream);
 }
 
 // Fused two-weight matvec: gate+up FFN at decode. Caller must guarantee
@@ -871,10 +910,11 @@ bool launch_mmvq_q8_0_silu_mul(
 
 // Fused matvec + add (residual). Writes dst = dst + W*x. Used for attn_output
 // and ffn_down where the result is immediately summed into the residual stream.
-bool launch_mmvq_q8_0_add(
+template <typename DstT>
+bool launch_mmvq_q8_0_add_typed(
         const uint8_t * weight,
         const void *    y_q8_1,
-        float *         dst,
+        DstT *          dst,
         uint32_t        rows,
         uint32_t        cols,
         uint32_t        batch,
@@ -891,7 +931,7 @@ bool launch_mmvq_q8_0_add(
         const uint32_t nblocks  = (rows + RPB - 1) / RPB;
         const dim3 grid(nblocks, 1, 1);
         const dim3 block(Q8_VEC_WARP_SIZE, NWARPS, 1);
-        mul_mat_vec_q8_0_add_kernel<NCOLS_DST><<<grid, block, 0, stream>>>(
+        mul_mat_vec_q8_0_add_kernel<NCOLS_DST, DstT><<<grid, block, 0, stream>>>(
             weight,
             reinterpret_cast<const block_q8_1 *>(y_q8_1),
             dst,
@@ -910,6 +950,22 @@ bool launch_mmvq_q8_0_add(
         default: return false;
     }
     return true;
+}
+
+bool launch_mmvq_q8_0_add(
+        const uint8_t *weight, const void *y_q8_1, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch,
+        uint32_t stride_dst_row, cudaStream_t stream) {
+    return launch_mmvq_q8_0_add_typed(
+        weight, y_q8_1, dst, rows, cols, batch, stride_dst_row, stream);
+}
+
+bool launch_mmvq_q8_0_add_bf16(
+        const uint8_t *weight, const void *y_q8_1, __nv_bfloat16 *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch,
+        uint32_t stride_dst_row, cudaStream_t stream) {
+    return launch_mmvq_q8_0_add_typed(
+        weight, y_q8_1, dst, rows, cols, batch, stride_dst_row, stream);
 }
 
 // mul_mat_vec_q8_0_fanout4_batch_kernel: four Q8_0 weights × one shared Q8_1
@@ -1058,5 +1114,4 @@ bool launch_mmvq_q8_0_fanout4_batch(
 
 } // namespace ported
 } // namespace qw3
-
 

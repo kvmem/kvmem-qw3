@@ -20,9 +20,9 @@ namespace {
 
 void usage(std::ostream &os) {
     os <<
-        "Usage: qw3 --model MODEL.gguf -p PROMPT [options]\n"
-        "       qw3 serve --model MODEL.gguf [--port 8080] [options]\n"
-        "       qw3 kvmem-session --model MODEL.gguf [--session-ladder L] [options]\n"
+        "Usage: qw3 --model MODEL -p PROMPT [options]\n"
+        "       qw3 serve --model MODEL [--port 8080] [options]\n"
+        "       qw3 kvmem-session --model MODEL [--session-ladder L] [options]\n"
         "\n"
         "Serve (OpenAI-compatible HTTP API; loads model once, serves forever).\n"
         "  Default is the conservative baseline: one request at a time, FP16 KV,\n"
@@ -71,7 +71,7 @@ void usage(std::ostream &os) {
         "  --llama-cli PATH      llama.cpp llama-completion binary. Default: llama-completion\n"
         "  --llama-completion PATH\n"
         "                        Alias for --llama-cli\n"
-        "  -m, --model FILE      GGUF model path\n"
+        "  -m, --model PATH      GGUF file or HF safetensors model directory\n"
         "  -c, --ctx N           Context size. Default: 262144\n"
         "  -t, --threads N       llama.cpp CPU helper threads\n"
         "  -ngl N                GPU layers passed to llama.cpp. Default: -1\n"
@@ -79,6 +79,9 @@ void usage(std::ostream &os) {
         "  --native-heavy        Compatibility flag; native generation is enabled by default\n"
         "  --native-kernels NAME cuda. Default: cuda\n"
         "  --native-linear-backend NAME auto, cublas, or custom. Default: auto\n"
+        "  --cpu-embedding       Keep a BF16 input embedding table on CPU and\n"
+        "                        transfer only selected rows. Requires a separate\n"
+        "                        LM head. Default: off.\n"
         "  --native-mtp-trace    Run one optional MTP draft-head diagnostic\n"
         "  --native-mtp-chain N  Diagnostic MTP draft chain length. Default: 1\n"
         "  --native-mtp-prefix   Populate diagnostic MTP prefix KV before drafts\n"
@@ -151,6 +154,9 @@ void usage(std::ostream &os) {
         "                        new suffix when a prompt strictly extends the prior\n"
         "                        request (prompt+response). Requires --kvmem.\n"
         "                        Default: off.\n"
+        "  --kvmem-query-replay  Replay the final user query after query-conditioned\n"
+        "                        block selection. Requires --kvmem and\n"
+        "                        --kvmem-query-conditioned. Default: off.\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
@@ -353,6 +359,8 @@ int main(int argc, char **argv) {
                 engine.native_kernels = need(arg);
             } else if (arg == "--native-linear-backend") {
                 engine.native_linear_backend = need(arg);
+            } else if (arg == "--cpu-embedding") {
+                engine.cpu_embedding = true;
             } else if (arg == "--native-mtp-trace") {
                 engine.native_mtp_trace = true;
             } else if (arg == "--native-mtp-chain") {
@@ -608,6 +616,8 @@ int main(int argc, char **argv) {
                 serve_cfg.prefix_cache = true;
             } else if (arg == "--kvmem-prefix-cache") {
                 serve_cfg.kvmem_prefix_cache = true;
+            } else if (arg == "--kvmem-query-replay") {
+                serve_cfg.kvmem_query_replay = true;
             } else if (arg == "--kv-dtype") {
                 const std::string dt = need(arg);
                 if (dt != "fp16" && dt != "fp32" && dt != "q8" && dt != "fp8") {
