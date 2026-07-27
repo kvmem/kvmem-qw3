@@ -1231,8 +1231,11 @@ std::string render_messages(const json &messages, const json *tools,
         if (!m.is_object() || i < num_sys) continue;
         const std::string role = m.value("role", "");
         if (role == "system" || role == "developer") continue;
+        const std::string rendered_content =
+            m.contains("content") ? render_content(m["content"]) : "";
+        // Tool results can contain byte-sensitive content such as source code.
         const std::string content =
-            trim_ascii_ws(m.contains("content") ? render_content(m["content"]) : "");
+            role == "tool" ? rendered_content : trim_ascii_ws(rendered_content);
         if (role == "user") {
             prompt += "<|im_start|>user\n" + content + "<|im_end|>\n";
         } else if (role == "assistant") {

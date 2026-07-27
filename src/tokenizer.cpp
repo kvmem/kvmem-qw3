@@ -1,5 +1,6 @@
 #include "qw3/tokenizer.hpp"
 
+#include "tokenizer_internal.hpp"
 #include "json.hpp"
 
 #include <algorithm>
@@ -93,7 +94,6 @@ std::vector<uint32_t> gpt2_bytes_to_unicode_table() {
 bool ascii_digit(uint8_t c) { return c >= '0' && c <= '9'; }
 bool ascii_alpha(uint8_t c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 bool ascii_space(uint8_t c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; }
-bool ascii_newline(uint8_t c) { return c == '\r' || c == '\n'; }
 
 bool cp_is_cjk(uint32_t cp) {
     // CJK Unified, CJK Ext A, Hiragana, Katakana, Hangul, fullwidth forms.
@@ -318,25 +318,33 @@ std::string QwenTokenizer::bytes_to_chars(const std::string &bytes) const {
     return out;
 }
 
-std::vector<std::string> QwenTokenizer::pre_tokenize(const std::string &text) const {
-    // Qwen / GPT-style pre-tokenizer (simplified port). The exact upstream
-    // regex is:
-    //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3}
-    //   | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
-    // We mirror the high-level shape: digits (max 3), CJK runs, letter runs
-    // (with optional single leading-space "joiner"), punctuation runs, and
-    // whitespace handling, working on UTF-8 codepoints.
+std::vector<std::string> detail::qwen_pre_tokenize(const std::string &text) {
+    // Manual port of the Split regex stored in the Qwen3.6 tokenizer.json:
+    //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
+    //   ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+    // In particular, \s+(?!\S) backtracks before a following non-space. For
+    // an indented word this emits all but the final whitespace codepoint, then
+    // the optional joiner attaches that final codepoint to the word. Keeping
+    // this split exact is important: BPE merges never cross piece boundaries.
     std::vector<std::string> pieces;
     const size_t len = text.size();
     size_t pos = 0;
     while (pos < len) {
         const size_t start = pos;
-        const uint8_t c0 = static_cast<uint8_t>(text[pos]);
+        size_t cp_end = pos;
+        const uint32_t cp = utf8_decode(text, cp_end);
+        const bool is_letter = cp_is_letter(cp) || cp_is_cjk(cp);
+        const bool is_number =
+            cp < 0x80 && ascii_digit(static_cast<uint8_t>(cp));
 
         // English contractions ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
-        if (c0 == '\'' && pos + 1 < len) {
-            const char a = text[pos + 1];
-            const char b = pos + 2 < len ? text[pos + 2] : '\0';
+        if (cp == '\'' && pos + 1 < len) {
+            const char a = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(text[pos + 1])));
+            const char b = pos + 2 < len
+                ? static_cast<char>(
+                      std::tolower(static_cast<unsigned char>(text[pos + 2])))
+                : '\0';
             if (a == 's' || a == 't' || a == 'm' || a == 'd') {
                 pos += 2; pieces.push_back(text.substr(start, pos - start)); continue;
             }
@@ -345,116 +353,112 @@ std::vector<std::string> QwenTokenizer::pre_tokenize(const std::string &text) co
             }
         }
 
-        // Digits: up to 3 contiguous decimal digits at a time.
-        if (ascii_digit(c0)) {
-            int n = 0;
-            while (pos < len && ascii_digit(static_cast<uint8_t>(text[pos])) && n < 3) {
-                ++pos; ++n;
-            }
-            pieces.push_back(text.substr(start, pos - start)); continue;
-        }
-
-        // Optional joiner + letter run: matches "[^\r\n\p{L}\p{N}]?\p{L}+".
-        // This is the rule that turns " world" into a single piece. It must
-        // run before any whitespace collapsing.
-        {
-            size_t cp_end_lk = pos;
-            const uint32_t cp_lk = utf8_decode(text, cp_end_lk);
-            // Try with the current codepoint as the leading joiner.
-            const bool joinerable = !ascii_newline(static_cast<uint8_t>(c0)) &&
-                                    !cp_is_letter(cp_lk) &&
-                                    !(cp_lk < 0x80 && ascii_digit(static_cast<uint8_t>(cp_lk)));
-            if (joinerable && cp_end_lk < len) {
-                size_t after = cp_end_lk;
-                const uint32_t next_cp = utf8_decode(text, after);
-                if (cp_is_letter(next_cp)) {
-                    pos = cp_end_lk;
-                    while (pos < len) {
-                        size_t e2 = pos;
-                        const uint32_t cp2 = utf8_decode(text, e2);
-                        if (!cp_is_letter(cp2)) break;
-                        pos = e2;
-                    }
-                    pieces.push_back(text.substr(start, pos - start));
-                    continue;
-                }
-            }
-            if (cp_is_letter(cp_lk)) {
-                pos = cp_end_lk;
-                while (pos < len) {
-                    size_t e2 = pos;
-                    const uint32_t cp2 = utf8_decode(text, e2);
-                    if (!cp_is_letter(cp2)) break;
-                    pos = e2;
-                }
-                pieces.push_back(text.substr(start, pos - start));
-                continue;
+        // Optional non-newline/non-letter/non-number joiner + letter run.
+        size_t letters_start = pos;
+        if (!is_letter && !is_number && cp != '\r' && cp != '\n' &&
+            cp_end < len) {
+            size_t next_end = cp_end;
+            const uint32_t next = utf8_decode(text, next_end);
+            if (cp_is_letter(next) || cp_is_cjk(next)) {
+                letters_start = cp_end;
             }
         }
-
-        // CJK runs.
-        {
-            size_t cp_end = pos;
-            const uint32_t cp = utf8_decode(text, cp_end);
-            if (cp_is_cjk(cp)) {
-                do {
-                    pos = cp_end;
-                    if (pos >= len) break;
-                    size_t next_end = pos;
-                    const uint32_t next_cp = utf8_decode(text, next_end);
-                    if (!cp_is_cjk(next_cp)) break;
-                    cp_end = next_end;
-                } while (pos < len);
-                pieces.push_back(text.substr(start, pos - start));
-                continue;
-            }
-        }
-
-        // Whitespace handling: pull newlines as their own run; otherwise
-        // emit the whole whitespace block (after consuming the optional
-        // leading-space joiner above didn't apply, this is a pure-space
-        // tail that does not precede a letter, so it stays as-is).
-        if (ascii_space(c0)) {
-            size_t p = pos;
-            size_t last_nl_end = 0;
-            while (p < len && ascii_space(static_cast<uint8_t>(text[p]))) {
-                if (ascii_newline(static_cast<uint8_t>(text[p]))) last_nl_end = p + 1;
-                ++p;
-            }
-            if (last_nl_end > 0) {
-                pos = last_nl_end;
-            } else {
-                pos = p;
+        if (is_letter || letters_start != pos) {
+            pos = is_letter ? cp_end : letters_start;
+            while (pos < len) {
+                size_t next_end = pos;
+                const uint32_t next = utf8_decode(text, next_end);
+                if (!(cp_is_letter(next) || cp_is_cjk(next))) break;
+                pos = next_end;
             }
             pieces.push_back(text.substr(start, pos - start));
             continue;
         }
 
-        // Punctuation / symbol run (optional single leading space).
+        // The checkpoint regex isolates each Unicode number. The current
+        // model's coding paths are overwhelmingly ASCII, which is the exact
+        // category handled here.
+        if (is_number) {
+            pos = cp_end;
+            pieces.push_back(text.substr(start, pos - start));
+            continue;
+        }
+
+        // Optional literal space + punctuation/symbol run, followed by any
+        // immediately adjacent CR/LF characters.
+        size_t symbol_pos = pos;
+        if (cp == ' ' && cp_end < len) {
+            size_t next_end = cp_end;
+            const uint32_t next = utf8_decode(text, next_end);
+            const bool next_letter = cp_is_letter(next) || cp_is_cjk(next);
+            const bool next_number =
+                next < 0x80 && ascii_digit(static_cast<uint8_t>(next));
+            if (!cp_is_space(next) && !next_letter && !next_number) {
+                symbol_pos = cp_end;
+            }
+        }
         {
-            size_t punct_pos = pos;
-            if (c0 == ' ') {
-                size_t e = punct_pos; utf8_decode(text, e); punct_pos = e;
+            size_t run = symbol_pos;
+            while (run < len) {
+                size_t next_end = run;
+                const uint32_t next = utf8_decode(text, next_end);
+                const bool next_letter = cp_is_letter(next) || cp_is_cjk(next);
+                const bool next_number =
+                    next < 0x80 && ascii_digit(static_cast<uint8_t>(next));
+                if (cp_is_space(next) || next_letter || next_number) break;
+                run = next_end;
             }
-            const size_t punct_run_start = punct_pos;
-            while (punct_pos < len) {
-                size_t e2 = punct_pos;
-                const uint32_t cp2 = utf8_decode(text, e2);
-                if (cp_is_letter(cp2) || cp_is_space(cp2) || cp_is_cjk(cp2) ||
-                    (cp2 < 0x80 && ascii_digit(static_cast<uint8_t>(cp2)))) break;
-                punct_pos = e2;
-            }
-            if (punct_pos > punct_run_start) {
-                while (punct_pos < len && ascii_newline(static_cast<uint8_t>(text[punct_pos]))) ++punct_pos;
-                pos = punct_pos;
+            if (run > symbol_pos) {
+                while (run < len) {
+                    size_t next_end = run;
+                    const uint32_t next = utf8_decode(text, next_end);
+                    if (next != '\r' && next != '\n') break;
+                    run = next_end;
+                }
+                pos = run;
                 pieces.push_back(text.substr(start, pos - start));
                 continue;
             }
         }
 
-        // Fallback: consume one codepoint.
-        size_t cp_end = pos;
-        utf8_decode(text, cp_end);
+        if (cp_is_space(cp)) {
+            // First implement \s*[\r\n]+ by consuming through the last
+            // newline in the contiguous whitespace run.
+            size_t run = pos;
+            size_t second_last_end = pos;
+            size_t whitespace_count = 0;
+            size_t last_newline_end = 0;
+            while (run < len) {
+                size_t next_end = run;
+                const uint32_t next = utf8_decode(text, next_end);
+                if (!cp_is_space(next)) break;
+                second_last_end = run;
+                ++whitespace_count;
+                if (next == '\r' || next == '\n') {
+                    last_newline_end = next_end;
+                }
+                run = next_end;
+            }
+            if (last_newline_end != 0) {
+                pos = last_newline_end;
+                pieces.push_back(text.substr(start, pos - start));
+                continue;
+            }
+
+            // \s+(?!\S) consumes the whole terminal run. Before a non-space,
+            // its negative lookahead forces one-codepoint backtracking.
+            if (run == len || whitespace_count == 1) {
+                pos = run;
+            } else {
+                pos = second_last_end;
+            }
+            pieces.push_back(text.substr(start, pos - start));
+            continue;
+        }
+
+        // Fallback: consume one codepoint. The regex should already cover all
+        // valid Unicode categories, but preserving bytes is safer than
+        // dropping an unclassified character.
         pos = cp_end > pos ? cp_end : pos + 1;
         pieces.push_back(text.substr(start, pos - start));
     }
@@ -535,7 +539,7 @@ std::vector<int32_t> QwenTokenizer::encode(const std::string &text, bool add_bos
             if (pos != std::string::npos && pos < end) end = pos;
         }
         const std::string chunk = text.substr(i, end - i);
-        for (const std::string &piece : pre_tokenize(chunk)) {
+        for (const std::string &piece : detail::qwen_pre_tokenize(chunk)) {
             const std::vector<int32_t> ids = bpe_piece(piece);
             out.insert(out.end(), ids.begin(), ids.end());
         }

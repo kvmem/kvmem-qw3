@@ -239,6 +239,14 @@ if(QW3_BUILD_TESTS)
     target_link_libraries(qw3-tool-call-stream PRIVATE qw3_core)
     add_test(NAME qw3-tool-call-stream COMMAND qw3-tool-call-stream)
 
+    add_executable(qw3-tokenizer-pretokenizer
+        tests/tokenizer_pretokenizer_test.cpp)
+    target_include_directories(qw3-tokenizer-pretokenizer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(qw3-tokenizer-pretokenizer PRIVATE qw3_core)
+    add_test(NAME qw3-tokenizer-pretokenizer
+        COMMAND qw3-tokenizer-pretokenizer)
+
     add_executable(qw3-pinned-kv-tier tests/pinned_kv_tier_test.cpp)
     target_link_libraries(qw3-pinned-kv-tier PRIVATE qw3_core)
     add_test(NAME qw3-pinned-kv-tier COMMAND qw3-pinned-kv-tier)
