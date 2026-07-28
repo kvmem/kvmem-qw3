@@ -74,6 +74,41 @@ public:
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
         std::vector<std::unique_ptr<DeviceTensor>> conv_states;
     };
+    // Host-resident counterpart used by long-lived prefix checkpoints. The
+    // recurrent and conv tensors are already FP32 on device, so storing their
+    // raw bytes on the host is lossless. Hidden tensors retain their native
+    // dtype. One contiguous pinned allocation avoids both persistent snapshot
+    // VRAM and per-request host allocation churn.
+    struct HostStateSnapshot {
+        struct TensorSlice {
+            uint64_t offset = 0;
+            uint64_t count = 0;
+            uint64_t bytes = 0;
+            uint32_t elem_size = 0;
+            DeviceTensorDType dtype = DeviceTensorDType::F32;
+
+            bool present() const { return bytes != 0; }
+        };
+
+        bool ready = false;
+        uint32_t position = 0;
+        uint32_t kv_logical_pages = 0;
+        uint32_t mtp_kv_logical_pages = 0;
+        uint32_t mtp_prefix_len = 0;
+        uint32_t kvmem_registered_pos = 0;
+        bool kvmem_active = false;
+        uint32_t window_query_pos = 0;
+        uint32_t window_page_count = 0;
+        TensorSlice h;
+        TensorSlice mtp_prefix_h;
+        std::vector<TensorSlice> recurrent_states;
+        std::vector<TensorSlice> conv_states;
+        std::unique_ptr<HostBuffer> storage;
+        uint64_t payload_bytes = 0;
+
+        uint64_t host_bytes() const { return payload_bytes; }
+        bool host_pinned() const { return storage && storage->pinned; }
+    };
     struct StateCheckpointSet {
         bool ready = false;
         uint32_t base_position = 0;
@@ -278,6 +313,8 @@ public:
     StateSnapshot snapshot_state();
     void capture_state(StateSnapshot &snapshot);
     void restore_state(const StateSnapshot &snapshot);
+    void capture_state_to_host(HostStateSnapshot &snapshot);
+    void restore_state_from_host(const HostStateSnapshot &snapshot);
     // Restore only the hybrid model's recurrent/conv tensors. Position, hidden
     // state, normal-attention K/V, page tables, and KVMem selection stay live.
     // Used by the gated inline-refresh ablation to isolate standard-KV refresh
@@ -666,6 +703,14 @@ private:
     void begin_record_timing(bool enabled) const;
     void record(NativeExecutorReport &report, const std::string &op) const;
     void ensure_scratch();
+    void restore_state_bookkeeping(uint32_t position,
+                                   uint32_t kv_logical_pages,
+                                   uint32_t mtp_kv_logical_pages,
+                                   uint32_t mtp_prefix_len,
+                                   uint32_t kvmem_registered_pos,
+                                   bool kvmem_active,
+                                   uint32_t window_query_pos,
+                                   uint32_t window_page_count);
     void allocate_kvmem_gpu_cache(uint64_t physical_slots);
     void allocate_kvmem_mtp_gpu_cache(uint64_t physical_slots);
     void ensure_mtp_scratch();

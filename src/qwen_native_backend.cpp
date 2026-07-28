@@ -7917,10 +7917,12 @@ private:
         const uint32_t reuse_m = ru.c;
         const bool warm_reuse = reuse_m > 0;
         if (warm_reuse) {
-            executor_->restore_state(ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
-                                                    : kvmem_warm_ckpt_end_);
-            // restore_state rewound position/KV/recurrent/window to C but not the
-            // block store (still at the prior turn's end M). Rewind it to C.
+            executor_->restore_state_from_host(
+                ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
+                               : kvmem_warm_ckpt_end_);
+            // restore_state_from_host rewound position/KV/recurrent/window to C
+            // but not the block store (still at the prior turn's end M). Rewind
+            // it to C.
             executor_->kvmem_truncate_to(reuse_m);
             if (kvmem_prefix_cache_trace_enabled()) {
                 std::ostringstream tmsg;
@@ -8169,7 +8171,7 @@ private:
                     ckpt_split - static_cast<uint32_t>(prefill_begin));
                 executor_->kvmem_reselect_prefill_pressure();
                 kvmem_warm_valid_ = false;
-                executor_->capture_state(kvmem_warm_ckpt_prompt_);
+                executor_->capture_state_to_host(kvmem_warm_ckpt_prompt_);
                 warm_prompt_pos = ckpt_split;
                 warm_prompt_resumable =
                     qc_active ? executor_->kvmem_has_tiers()
@@ -8278,7 +8280,7 @@ private:
                 ckpt_split - static_cast<uint32_t>(prefill_begin));
             executor_->kvmem_reselect_prefill_pressure();
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
-            executor_->capture_state(kvmem_warm_ckpt_prompt_);
+            executor_->capture_state_to_host(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = ckpt_split;
             warm_checkpoint_staged = true;
             // Below budget: the strict all-GPU-identity precondition (every block
@@ -8521,7 +8523,7 @@ private:
                     executor_->kvmem_register_append(
                         ckpt_split - query_replay_begin);
                     kvmem_warm_valid_ = false;
-                    executor_->capture_state(kvmem_warm_ckpt_prompt_);
+                    executor_->capture_state_to_host(kvmem_warm_ckpt_prompt_);
                     warm_prompt_pos = ckpt_split;
                     warm_prompt_resumable =
                         qc_active ? executor_->kvmem_has_tiers()
@@ -8568,7 +8570,7 @@ private:
         // block store / window / registered_pos all describe exactly P tokens.
         if (warm_capture && !warm_checkpoint_staged) {
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
-            executor_->capture_state(kvmem_warm_ckpt_prompt_);
+            executor_->capture_state_to_host(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             warm_prompt_resumable = kvmem_all_gpu_identity();
         }
@@ -8604,7 +8606,7 @@ private:
                 const size_t pos = executor_->position();
                 if (pos <= kvmem_warm_log_.size()) {
                     kvmem_warm_log_.resize(pos);
-                    executor_->capture_state(kvmem_warm_ckpt_end_);
+                    executor_->capture_state_to_host(kvmem_warm_ckpt_end_);
                     kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
                     kvmem_warm_prompt_pos_ = warm_prompt_pos;
                     kvmem_warm_prompt_resumable_ = warm_prompt_resumable;
@@ -8797,7 +8799,7 @@ private:
             const size_t pos = executor_->position();
             if (pos <= kvmem_warm_log_.size()) {
                 kvmem_warm_log_.resize(pos);
-                executor_->capture_state(kvmem_warm_ckpt_end_);
+                executor_->capture_state_to_host(kvmem_warm_ckpt_end_);
                 // Commit the staged prompt-end (P) checkpoint alongside the
                 // turn-end (M) one; flip all warm fields together so a mid-decode
                 // throw leaves the prior turn's warm state intact.
@@ -8957,11 +8959,12 @@ private:
         if (kvmem_warm_reuse) {
             // Resume at the chosen checkpoint (M=turn-end or P=prompt-end), then
             // rewind the block store / tier slots / stale selection index to
-            // exactly reuse_m tokens (restore_state rewinds position + KV pages +
-            // recurrent state + window, but NOT the block store). Suffix-only
-            // prefill below then re-prefills [reuse_m, prompt.end()).
-            executor_->restore_state(kvmem_ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
-                                                          : kvmem_warm_ckpt_end_);
+            // exactly reuse_m tokens (restore_state_from_host rewinds position +
+            // KV pages + recurrent state + window, but NOT the block store).
+            // Suffix-only prefill below then re-prefills [reuse_m, prompt.end()).
+            executor_->restore_state_from_host(
+                kvmem_ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
+                                     : kvmem_warm_ckpt_end_);
             executor_->kvmem_truncate_to(kvmem_reuse_m);
             if (kvmem_prefix_cache_trace_enabled()) {
                 std::ostringstream tmsg;
@@ -9791,7 +9794,7 @@ private:
             executor_->kvmem_register_append(static_cast<uint32_t>(split_local));
             executor_->kvmem_reselect_prefill_pressure();
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
-            executor_->capture_state(kvmem_warm_ckpt_prompt_);
+            executor_->capture_state_to_host(kvmem_warm_ckpt_prompt_);
             kvmem_warm_prompt_pos = kvmem_ckpt_split;
             kvmem_warm_checkpoint_staged = true;
             // Below budget: strict all-GPU-identity. Above budget: identity never
@@ -11087,7 +11090,7 @@ private:
                         kvmem_ckpt_split - prefill_absolute_base);
                     executor_->kvmem_reselect_prefill_pressure();
                     kvmem_warm_valid_ = false;
-                    executor_->capture_state(kvmem_warm_ckpt_prompt_);
+                    executor_->capture_state_to_host(kvmem_warm_ckpt_prompt_);
                     kvmem_warm_prompt_pos = kvmem_ckpt_split;
                     kvmem_warm_prompt_resumable =
                         qc_active ? executor_->kvmem_has_tiers()
@@ -11357,7 +11360,7 @@ private:
                     executor_->kvmem_register_append(
                         kvmem_ckpt_split - kvmem_query_replay_begin);
                     kvmem_warm_valid_ = false;
-                    executor_->capture_state(kvmem_warm_ckpt_prompt_);
+                    executor_->capture_state_to_host(kvmem_warm_ckpt_prompt_);
                     kvmem_warm_prompt_pos = kvmem_ckpt_split;
                     kvmem_warm_prompt_resumable =
                         qc_active ? executor_->kvmem_has_tiers()
@@ -11449,7 +11452,7 @@ private:
         // describes exactly P tokens (block store + window + registered_pos).
         if (kvmem_warm_capture && !kvmem_warm_checkpoint_staged) {
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
-            executor_->capture_state(kvmem_warm_ckpt_prompt_);
+            executor_->capture_state_to_host(kvmem_warm_ckpt_prompt_);
             kvmem_warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             kvmem_warm_prompt_resumable = kvmem_all_gpu_identity();
         }
@@ -11492,7 +11495,7 @@ private:
                 const size_t pos = executor_->position();
                 if (pos <= kvmem_warm_log_.size()) {
                     kvmem_warm_log_.resize(pos);
-                    executor_->capture_state(kvmem_warm_ckpt_end_);
+                    executor_->capture_state_to_host(kvmem_warm_ckpt_end_);
                     kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
                     kvmem_warm_prompt_pos_ = kvmem_warm_prompt_pos;
                     kvmem_warm_prompt_resumable_ =
@@ -12375,7 +12378,7 @@ private:
             const size_t pos = executor_->position();
             if (pos <= kvmem_warm_log_.size()) {
                 kvmem_warm_log_.resize(pos);
-                executor_->capture_state(kvmem_warm_ckpt_end_);
+                executor_->capture_state_to_host(kvmem_warm_ckpt_end_);
                 // Commit the staged prompt-end (P) checkpoint alongside the
                 // turn-end (M) one; flip all warm fields together so a mid-decode
                 // throw leaves the prior turn's warm state intact.
@@ -12850,10 +12853,10 @@ private:
     // Keeps the plain-route shared executor_ warm across requests. kvmem_warm_log_
     // is the full token sequence of the last request (prompt + committed decode
     // tokens). Two resume checkpoints of that request are kept (a small ladder):
-    //   kvmem_warm_ckpt_end_    -- capture_state at turn end (position M, after
+    //   kvmem_warm_ckpt_end_    -- host snapshot at turn end (position M, after
     //                              decode). Reuse here needs the whole warm log
     //                              to be a token prefix of the new prompt.
-    //   kvmem_warm_ckpt_prompt_ -- capture_state at prompt end (position P, after
+    //   kvmem_warm_ckpt_prompt_ -- host snapshot at prompt end (position P, after
     //                              the post-prefill reselect, before decode). Lets
     //                              a new prompt that diverges INSIDE the prior
     //                              response region [P,M) still resume at P and
@@ -12865,8 +12868,8 @@ private:
     // longest common token prefix) and C < prompt.size(), restore it, rewind the
     // block store to C (kvmem_truncate_to), and prefill [C,end).
     std::vector<uint32_t> kvmem_warm_log_;
-    QwenExecutor::StateSnapshot kvmem_warm_ckpt_end_;
-    QwenExecutor::StateSnapshot kvmem_warm_ckpt_prompt_;
+    QwenExecutor::HostStateSnapshot kvmem_warm_ckpt_end_;
+    QwenExecutor::HostStateSnapshot kvmem_warm_ckpt_prompt_;
     uint32_t kvmem_warm_prompt_pos_ = 0;   // P (position of ckpt_prompt_)
     uint32_t kvmem_warm_end_pos_ = 0;      // M (position of ckpt_end_)
     bool kvmem_warm_prompt_resumable_ = false;  // ckpt_prompt_ safe to resume

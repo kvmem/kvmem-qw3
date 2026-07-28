@@ -5021,6 +5021,108 @@ void QwenExecutor::capture_state(StateSnapshot &snapshot) {
     snapshot.ready = true;
 }
 
+void QwenExecutor::capture_state_to_host(HostStateSnapshot &snapshot) {
+    const bool trace =
+        env_flag_enabled("QW3_KVMEM_PREFIX_CACHE_TRACE");
+    const uint64_t capture_start_ns = trace ? kvmem_steady_ns() : 0;
+    ensure_scratch();
+    snapshot.ready = false;
+    snapshot.position = position_;
+    snapshot.kv_logical_pages = kv_pages_.count();
+    snapshot.mtp_kv_logical_pages = mtp_kv_pages_.count();
+    snapshot.mtp_prefix_len = mtp_prefix_len_;
+    snapshot.kvmem_registered_pos = kvmem_registered_pos_;
+    snapshot.kvmem_active = kvmem_active_;
+    snapshot.window_query_pos = window_query_pos_;
+    snapshot.window_page_count = window_page_count_;
+
+    uint64_t cursor = 0;
+    auto add_tensor = [&](const DeviceTensor *tensor,
+                          HostStateSnapshot::TensorSlice &slice) {
+        slice = {};
+        if (!tensor || tensor->count == 0) return;
+        constexpr uint64_t kHostAlignment = 256;
+        if (cursor > std::numeric_limits<uint64_t>::max() -
+                         (kHostAlignment - 1)) {
+            throw std::runtime_error("host state snapshot layout overflow");
+        }
+        cursor = (cursor + kHostAlignment - 1) & ~(kHostAlignment - 1);
+        if (tensor->elem_size == 0 ||
+            tensor->count >
+                std::numeric_limits<uint64_t>::max() / tensor->elem_size) {
+            throw std::runtime_error("host state snapshot tensor size overflow");
+        }
+        const uint64_t bytes =
+            tensor->count * static_cast<uint64_t>(tensor->elem_size);
+        if (cursor > std::numeric_limits<uint64_t>::max() - bytes) {
+            throw std::runtime_error("host state snapshot payload overflow");
+        }
+        slice.offset = cursor;
+        slice.count = tensor->count;
+        slice.bytes = bytes;
+        slice.elem_size = tensor->elem_size;
+        slice.dtype = tensor->dtype;
+        cursor += bytes;
+    };
+
+    add_tensor(h_.get(), snapshot.h);
+    add_tensor(mtp_prefix_h_.get(), snapshot.mtp_prefix_h);
+    snapshot.recurrent_states.resize(recurrent_states_.size());
+    snapshot.conv_states.resize(conv_states_.size());
+    for (size_t i = 0; i < recurrent_states_.size(); ++i) {
+        add_tensor(recurrent_states_[i].get(), snapshot.recurrent_states[i]);
+        add_tensor(conv_states_[i].get(), snapshot.conv_states[i]);
+    }
+
+    if (!snapshot.storage || snapshot.storage->bytes < cursor) {
+        snapshot.storage =
+            backend_.host_buffer(cursor, "prefix_state_snapshot");
+    }
+    if (cursor > 0 &&
+        (!snapshot.storage || !snapshot.storage->data ||
+         snapshot.storage->bytes < cursor)) {
+        throw std::runtime_error("host state snapshot allocation is incomplete");
+    }
+
+    auto *host = snapshot.storage
+        ? static_cast<uint8_t *>(snapshot.storage->data)
+        : nullptr;
+    auto copy_tensor = [&](const DeviceTensor *tensor,
+                           const HostStateSnapshot::TensorSlice &slice) {
+        if (!slice.present()) return;
+        require_status(backend_.copy_bytes_to_host_async(
+            *tensor, host + slice.offset, 0, slice.bytes));
+    };
+
+    require_status(backend_.begin_kv_transfer_from_device());
+    try {
+        copy_tensor(h_.get(), snapshot.h);
+        copy_tensor(mtp_prefix_h_.get(), snapshot.mtp_prefix_h);
+        for (size_t i = 0; i < recurrent_states_.size(); ++i) {
+            copy_tensor(recurrent_states_[i].get(),
+                        snapshot.recurrent_states[i]);
+            copy_tensor(conv_states_[i].get(), snapshot.conv_states[i]);
+        }
+        require_status(backend_.wait_kv_transfer());
+    } catch (...) {
+        (void) backend_.wait_kv_transfer();
+        throw;
+    }
+    snapshot.payload_bytes = cursor;
+    snapshot.ready = true;
+    if (trace) {
+        const double elapsed_ms =
+            static_cast<double>(kvmem_steady_ns() - capture_start_ns) / 1e6;
+        std::fprintf(
+            stderr,
+            "[qw3] kvmem prefix-cache host snapshot capture: pos=%u "
+            "bytes=%llu pinned=%d elapsed_ms=%.3f\n",
+            snapshot.position,
+            static_cast<unsigned long long>(snapshot.payload_bytes),
+            snapshot.host_pinned() ? 1 : 0, elapsed_ms);
+    }
+}
+
 void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
     if (!snapshot.ready) {
         throw std::runtime_error("cannot restore an empty QwenExecutor snapshot");
@@ -5048,21 +5150,130 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
                                              0, conv_states_[i]->count));
         }
     }
-    position_ = snapshot.position;
-    kvmem_registered_pos_ = snapshot.kvmem_registered_pos;
-    kv_pages_.truncate_to_logical_pages(snapshot.kv_logical_pages);
-    mtp_kv_pages_.truncate_to_logical_pages(snapshot.mtp_kv_logical_pages);
-    mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_,
-                                         snapshot.mtp_prefix_len);
+    restore_state_bookkeeping(snapshot.position,
+                              snapshot.kv_logical_pages,
+                              snapshot.mtp_kv_logical_pages,
+                              snapshot.mtp_prefix_len,
+                              snapshot.kvmem_registered_pos,
+                              snapshot.kvmem_active,
+                              snapshot.window_query_pos,
+                              snapshot.window_page_count);
+}
+
+void QwenExecutor::restore_state_from_host(
+        const HostStateSnapshot &snapshot) {
+    const bool trace =
+        env_flag_enabled("QW3_KVMEM_PREFIX_CACHE_TRACE");
+    const uint64_t restore_start_ns = trace ? kvmem_steady_ns() : 0;
+    if (!snapshot.ready) {
+        throw std::runtime_error(
+            "cannot restore an empty host QwenExecutor snapshot");
+    }
+    ensure_scratch();
+    if (!snapshot.storage ||
+        snapshot.payload_bytes > snapshot.storage->bytes ||
+        (snapshot.payload_bytes > 0 && !snapshot.storage->data)) {
+        throw std::runtime_error("host QwenExecutor snapshot storage is invalid");
+    }
+    if (snapshot.recurrent_states.size() != recurrent_states_.size() ||
+        snapshot.conv_states.size() != conv_states_.size()) {
+        throw std::runtime_error("host state snapshot layer count mismatch");
+    }
+
+    auto validate_tensor = [&](const DeviceTensor *tensor,
+                               const HostStateSnapshot::TensorSlice &slice,
+                               const char *label) {
+        if (!slice.present()) return;
+        if (!tensor || tensor->count != slice.count ||
+            tensor->elem_size != slice.elem_size ||
+            tensor->dtype != slice.dtype ||
+            slice.offset > snapshot.payload_bytes ||
+            slice.bytes > snapshot.payload_bytes - slice.offset) {
+            throw std::runtime_error(
+                std::string("host state snapshot tensor mismatch: ") + label);
+        }
+    };
+    validate_tensor(h_.get(), snapshot.h, "hidden");
+    validate_tensor(mtp_prefix_h_.get(), snapshot.mtp_prefix_h,
+                    "mtp_prefix_hidden");
+    for (size_t i = 0; i < recurrent_states_.size(); ++i) {
+        validate_tensor(recurrent_states_[i].get(),
+                        snapshot.recurrent_states[i], "recurrent");
+        validate_tensor(conv_states_[i].get(), snapshot.conv_states[i],
+                        "conv");
+    }
+
+    const auto *host =
+        static_cast<const uint8_t *>(snapshot.storage->data);
+    auto copy_tensor = [&](DeviceTensor *tensor,
+                           const HostStateSnapshot::TensorSlice &slice) {
+        if (!slice.present()) return;
+        require_status(backend_.copy_bytes_from_host_async(
+            *tensor, 0, host + slice.offset, slice.bytes));
+    };
+
+    std::unique_ptr<DeviceTransferFence> execution_ready;
+    require_status(backend_.record_execution_fence(execution_ready));
+    require_status(backend_.begin_kv_transfer_to_device());
+    require_status(backend_.kv_transfer_wait_for_execution(execution_ready));
+    try {
+        copy_tensor(h_.get(), snapshot.h);
+        copy_tensor(mtp_prefix_h_.get(), snapshot.mtp_prefix_h);
+        for (size_t i = 0; i < recurrent_states_.size(); ++i) {
+            copy_tensor(recurrent_states_[i].get(),
+                        snapshot.recurrent_states[i]);
+            copy_tensor(conv_states_[i].get(), snapshot.conv_states[i]);
+        }
+        require_status(backend_.wait_kv_transfer());
+    } catch (...) {
+        (void) backend_.wait_kv_transfer();
+        throw;
+    }
+
+    restore_state_bookkeeping(snapshot.position,
+                              snapshot.kv_logical_pages,
+                              snapshot.mtp_kv_logical_pages,
+                              snapshot.mtp_prefix_len,
+                              snapshot.kvmem_registered_pos,
+                              snapshot.kvmem_active,
+                              snapshot.window_query_pos,
+                              snapshot.window_page_count);
+    if (trace) {
+        const double elapsed_ms =
+            static_cast<double>(kvmem_steady_ns() - restore_start_ns) / 1e6;
+        std::fprintf(
+            stderr,
+            "[qw3] kvmem prefix-cache host snapshot restore: pos=%u "
+            "bytes=%llu pinned=%d elapsed_ms=%.3f\n",
+            snapshot.position,
+            static_cast<unsigned long long>(snapshot.payload_bytes),
+            snapshot.host_pinned() ? 1 : 0, elapsed_ms);
+    }
+}
+
+void QwenExecutor::restore_state_bookkeeping(
+        uint32_t position,
+        uint32_t kv_logical_pages,
+        uint32_t mtp_kv_logical_pages,
+        uint32_t mtp_prefix_len,
+        uint32_t kvmem_registered_pos,
+        bool kvmem_active,
+        uint32_t window_query_pos,
+        uint32_t window_page_count) {
+    position_ = position;
+    kvmem_registered_pos_ = kvmem_registered_pos;
+    kv_pages_.truncate_to_logical_pages(kv_logical_pages);
+    mtp_kv_pages_.truncate_to_logical_pages(mtp_kv_logical_pages);
+    mtp_prefix_len_ = std::min<uint32_t>(mtp_prefix_len_, mtp_prefix_len);
     // Roll the kvmem window back to where it was at capture. Verify/decode only
     // ever appends pages at the window tail (kvmem_extend_window_for_decode), so
     // truncating the host page list + count and restoring window_query_pos_ is
     // sufficient: the surviving window slots keep their original re-RoPE bake.
     // No device re-upload is needed — the appended tail pages are simply no
     // longer addressed (window_page_count_ caps what attention/append read).
-    if (snapshot.kvmem_active) {
-        window_query_pos_ = snapshot.window_query_pos;
-        window_page_count_ = snapshot.window_page_count;
+    if (kvmem_active) {
+        window_query_pos_ = window_query_pos;
+        window_page_count_ = window_page_count;
         if (window_pages_host_.size() > window_page_count_) {
             window_pages_host_.resize(window_page_count_);
         }
