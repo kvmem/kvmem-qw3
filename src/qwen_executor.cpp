@@ -1462,13 +1462,38 @@ void QwenExecutor::ensure_scratch() {
                 conv_dim * (cfg.ssm_conv_kernel - 1), clbl.c_str());
         }
     }
-    scores_ = backend_.tensor_f32(static_cast<uint64_t>(cfg.n_heads) * std::max<uint32_t>(kv_ctx_size_, 1), "attn_scores");
-
     // Per-layer KV cache for the standard-attention layers only.
     const uint64_t kv_per_pos = static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
     const uint64_t kv_physical_slots =
         external_kv_cache_ ? external_kv_cache_->physical_slots
                            : kv_pages_.physical_slots();
+    // Main attention only reaches the score-materializing fallback on a dense
+    // cache; paged paths address at most the bounded physical KV pool. MTP can
+    // still use the legacy dense cache when its paged/tiered path is disabled,
+    // so preserve full logical-context capacity for that compatibility mode.
+    const bool dense_mtp_scores =
+        weights_.mtp() != nullptr &&
+        external_mtp_kv_cache_ == nullptr &&
+        !kvmem_mtp_tiered_ &&
+        !mtp_paged_prefix_enabled();
+    const uint64_t score_slots = dense_mtp_scores
+        ? std::max<uint64_t>(kv_ctx_size_, 1)
+        : std::max<uint64_t>(kv_physical_slots, 1);
+    scores_ = backend_.tensor_f32(
+        static_cast<uint64_t>(cfg.n_heads) * score_slots, "attn_scores");
+    if (kvmem_tier_trace_enabled()) {
+        std::fprintf(
+            stderr,
+            "[kvmem-tier] attn_scores logical_slots=%u physical_slots=%llu "
+            "allocated_slots=%llu bytes=%llu dense_mtp_fallback=%d\n",
+            kv_ctx_size_,
+            static_cast<unsigned long long>(kv_physical_slots),
+            static_cast<unsigned long long>(score_slots),
+            static_cast<unsigned long long>(
+                static_cast<uint64_t>(cfg.n_heads) * score_slots *
+                sizeof(float)),
+            dense_mtp_scores ? 1 : 0);
+    }
     // Default KV cache dtype: FP16 (2x bandwidth at long context, ~equal
     // greedy-token output). Force back to FP32 with QW3_KV_DTYPE=fp32, or down
     // to per-row int8 (one fp16 scale per head_dim row) with QW3_KV_DTYPE=q8.
