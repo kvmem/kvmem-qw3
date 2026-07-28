@@ -20,13 +20,15 @@ namespace qw3 {
  * Implementation notes:
  *  - GPT-2's byte->unicode mapping is applied so that raw UTF-8 bytes are
  *    representable as printable characters that appear in the vocab.
- *  - The pre-tokenizer implements Qwen3.5's Unicode-aware control flow:
+ *  - The pre-tokenizer implements Qwen's Unicode-aware control flow:
  *    single numeric codepoints, letter/combining-mark runs with an optional
  *    joiner, punctuation runs, and the regex's lookahead-sensitive whitespace
- *    split. Long-prompt token counts are regression-checked against llama.cpp. */
+ *    split. Exact piece boundaries matter because BPE merges never cross
+ *    pre-tokenized pieces. */
 class QwenTokenizer {
 public:
     explicit QwenTokenizer(const GgufFile &gguf);
+    explicit QwenTokenizer(const std::string &hf_model_directory);
 
     std::vector<int32_t> encode(const std::string &text, bool add_bos = false) const;
     std::string decode(const std::vector<int32_t> &ids) const;
@@ -50,7 +52,7 @@ public:
 
 private:
     void build_byte_maps();
-    std::vector<std::string> pre_tokenize(const std::string &text) const;
+    void finish_initialization();
     std::vector<int32_t> bpe_piece(const std::string &piece) const;
 
     // size_t pair hasher

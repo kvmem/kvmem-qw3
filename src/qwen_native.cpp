@@ -19,14 +19,28 @@ void add_op(std::vector<std::string> &ops, const std::string &name) {
 
 } // namespace
 
-QwenNativeModel::QwenNativeModel(std::unique_ptr<GgufFile> gguf) : gguf_(std::move(gguf)) {
-    if (!gguf_) throw std::invalid_argument("QwenNativeModel requires GGUF");
-    config_ = std::make_unique<QwenConfig>(*gguf_);
+QwenNativeModel::QwenNativeModel(std::unique_ptr<GgufFile> gguf)
+    : QwenNativeModel(make_gguf_model_source(std::move(gguf))) {}
+
+QwenNativeModel::QwenNativeModel(std::unique_ptr<ModelSource> source)
+    : source_(std::move(source)) {
+    if (!source_) throw std::invalid_argument("QwenNativeModel requires a model source");
+    if (const GgufFile *file = source_->gguf()) {
+        config_ = std::make_unique<QwenConfig>(*file);
+    } else {
+        config_ = std::make_unique<QwenConfig>(source_->model_directory());
+    }
     bind();
 }
 
 const GgufFile &QwenNativeModel::gguf() const {
-    return *gguf_;
+    const GgufFile *file = source_->gguf();
+    if (!file) throw std::runtime_error("model source is not GGUF");
+    return *file;
+}
+
+const ModelSource &QwenNativeModel::source() const {
+    return *source_;
 }
 
 const NativePlanInfo &QwenNativeModel::plan() const {
@@ -45,20 +59,25 @@ const QwenMtpTensors *QwenNativeModel::mtp() const {
     return mtp_.present ? &mtp_ : nullptr;
 }
 
-const GgufTensorInfo *QwenNativeModel::token_embedding() const {
+const ModelTensorInfo *QwenNativeModel::token_embedding() const {
     return token_embd_;
 }
 
-const GgufTensorInfo *QwenNativeModel::output_norm() const {
+const ModelTensorInfo *QwenNativeModel::output_norm() const {
     return output_norm_;
 }
 
-const GgufTensorInfo *QwenNativeModel::output() const {
+const ModelTensorInfo *QwenNativeModel::output() const {
     return output_;
 }
 
-const GgufTensorInfo *QwenNativeModel::optional_tensor(const std::string &name) {
-    return gguf_->find_tensor(name);
+std::string QwenNativeModel::token_text(uint32_t token) const {
+    const GgufFile *file = source_->gguf();
+    return file ? file->token_text(token) : std::string();
+}
+
+const ModelTensorInfo *QwenNativeModel::optional_tensor(const std::string &name) {
+    return source_->find_tensor(name);
 }
 
 void QwenNativeModel::add_missing(const std::string &name) {
@@ -69,16 +88,16 @@ void QwenNativeModel::add_mtp_missing(const std::string &name) {
     plan_.mtp_missing_tensors.push_back(name);
 }
 
-const GgufTensorInfo *QwenNativeModel::require_tensor(const std::string &name) {
-    const GgufTensorInfo *t = optional_tensor(name);
+const ModelTensorInfo *QwenNativeModel::require_tensor(const std::string &name) {
+    const ModelTensorInfo *t = optional_tensor(name);
     if (!t) add_missing(name);
     count_bound(t);
     return t;
 }
 
-const GgufTensorInfo *QwenNativeModel::require_any_tensor(const std::vector<std::string> &names) {
+const ModelTensorInfo *QwenNativeModel::require_any_tensor(const std::vector<std::string> &names) {
     for (const std::string &name : names) {
-        const GgufTensorInfo *t = optional_tensor(name);
+        const ModelTensorInfo *t = optional_tensor(name);
         if (t) {
             count_bound(t);
             return t;
@@ -93,18 +112,18 @@ const GgufTensorInfo *QwenNativeModel::require_any_tensor(const std::vector<std:
     return nullptr;
 }
 
-void QwenNativeModel::count_bound(const GgufTensorInfo *tensor) {
+void QwenNativeModel::count_bound(const ModelTensorInfo *tensor) {
     if (tensor) plan_.n_bound_tensors++;
 }
 
-void QwenNativeModel::count_mtp_bound(const GgufTensorInfo *tensor) {
+void QwenNativeModel::count_mtp_bound(const ModelTensorInfo *tensor) {
     if (!tensor) return;
     count_bound(tensor);
     plan_.mtp_bound_tensors++;
 }
 
 void QwenNativeModel::bind() {
-    const ModelInfo info = gguf_->model_info();
+    const ModelSourceInfo &info = source_->info();
     plan_.architecture = info.architecture;
     plan_.n_layers = config_->n_layers;
     plan_.n_total_layers = config_->block_count;
@@ -114,8 +133,7 @@ void QwenNativeModel::bind() {
     plan_.n_kv_heads = config_->n_kv_heads;
     plan_.n_ctx_train = config_->n_ctx_train;
     plan_.n_tensors = info.tensor_count;
-
-    for (const GgufTensorInfo &t : gguf_->tensors()) plan_.tensor_bytes += t.bytes;
+    plan_.tensor_bytes = info.tensor_bytes;
 
     if (plan_.architecture != "qwen35" && plan_.architecture != "qwen3") {
         plan_.missing_tensors.push_back("unsupported architecture: " + plan_.architecture);
@@ -222,15 +240,15 @@ void QwenNativeModel::bind_mtp() {
         return;
     }
 
-    auto require_mtp_tensor = [this](const std::string &name) -> const GgufTensorInfo * {
-        const GgufTensorInfo *t = optional_tensor(name);
+    auto require_mtp_tensor = [this](const std::string &name) -> const ModelTensorInfo * {
+        const ModelTensorInfo *t = optional_tensor(name);
         if (!t) add_mtp_missing(name);
         count_mtp_bound(t);
         return t;
     };
-    auto require_mtp_any_tensor = [this](const std::vector<std::string> &names) -> const GgufTensorInfo * {
+    auto require_mtp_any_tensor = [this](const std::vector<std::string> &names) -> const ModelTensorInfo * {
         for (const std::string &name : names) {
-            const GgufTensorInfo *t = optional_tensor(name);
+            const ModelTensorInfo *t = optional_tensor(name);
             if (t) {
                 count_mtp_bound(t);
                 return t;
@@ -244,8 +262,8 @@ void QwenNativeModel::bind_mtp() {
         add_mtp_missing(ss.str());
         return nullptr;
     };
-    auto optional_mtp_tensor = [this](const std::string &name) -> const GgufTensorInfo * {
-        const GgufTensorInfo *t = optional_tensor(name);
+    auto optional_mtp_tensor = [this](const std::string &name) -> const ModelTensorInfo * {
+        const ModelTensorInfo *t = optional_tensor(name);
         count_mtp_bound(t);
         return t;
     };
@@ -317,8 +335,7 @@ std::string QwenNativeModel::describe_plan() const {
 }
 
 NativePlanInfo inspect_native_plan(const std::string &path) {
-    auto gguf = std::make_unique<GgufFile>(path);
-    QwenNativeModel model(std::move(gguf));
+    QwenNativeModel model(open_model_source(path));
     return model.plan();
 }
 

@@ -1,6 +1,7 @@
 #include "server.hpp"
 
 #include "env_flags.hpp"
+#include "tool_call_stream.hpp"
 #include "qw3/qw3.hpp"
 #include "qw3/gguf.hpp"
 #include "qw3/kvmem_store.hpp"
@@ -18,12 +19,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace qw3 {
@@ -548,7 +552,7 @@ json coerce_value_by_schema(const std::string &value, const json &schema) {
 // Find the JSON-schema "properties" map for a named function in an OpenAI
 // tools array. Returns nullptr when the tool, its parameters, or its properties
 // are absent, in which case parameters are left as raw strings.
-const json *find_tool_properties(const json *tools, const std::string &name) {
+const json *find_tool_definition(const json *tools, const std::string &name) {
     if (!tools || !tools->is_array()) return nullptr;
     for (const auto &t : *tools) {
         if (!t.is_object()) continue;
@@ -557,16 +561,308 @@ const json *find_tool_properties(const json *tools, const std::string &name) {
                              : &t;
         if (!fn->is_object()) continue;
         if (fn->value("name", std::string()) != name) continue;
-        if (!fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
-            return nullptr;
-        }
-        const json &params = (*fn)["parameters"];
-        if (params.contains("properties") && params["properties"].is_object()) {
-            return &params["properties"];
-        }
-        return nullptr;
+        return fn;
     }
     return nullptr;
+}
+
+const json *find_tool_properties(const json *tools, const std::string &name) {
+    const json *fn = find_tool_definition(tools, name);
+    if (!fn || !fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
+        return nullptr;
+    }
+    const json &params = (*fn)["parameters"];
+    if (params.contains("properties") && params["properties"].is_object()) {
+        return &params["properties"];
+    }
+    return nullptr;
+}
+
+bool tool_name_allowed(const json *tools, const std::string &name) {
+    return !tools || !tools->is_array() || find_tool_definition(tools, name) != nullptr;
+}
+
+std::string strip_tool_control_tokens(std::string text) {
+    // Some Qwen generations leak chat-template control tokens inside the
+    // tool block. They are framing noise, not part of the tool name/arguments.
+    for (const char *token : {"<|im_start|>", "<|im_end|>", "<|assistant|>",
+                              "<|tool|>"}) {
+        size_t pos = 0;
+        while ((pos = text.find(token, pos)) != std::string::npos) {
+            text.erase(pos, std::string(token).size());
+        }
+    }
+    return text;
+}
+
+std::string trim_single_newlines(std::string value) {
+    if (!value.empty() && value.front() == '\n') value.erase(value.begin());
+    if (!value.empty() && value.front() == '\r') value.erase(value.begin());
+    if (!value.empty() && value.back() == '\n') value.pop_back();
+    if (!value.empty() && value.back() == '\r') value.pop_back();
+    return value;
+}
+
+std::string normalized_identifier(std::string value) {
+    std::string out;
+    for (const unsigned char c : value) {
+        if (std::isalnum(c) || c == '_' || c == '-') {
+            out.push_back(static_cast<char>(std::tolower(c)));
+        }
+    }
+    return out;
+}
+
+std::string snake_case_identifier(const std::string &value) {
+    std::string out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if (std::isupper(c) && i > 0) out.push_back('_');
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+std::string schema_property_name(const json *props, const std::string &raw_key) {
+    if (!props || !props->is_object()) return trim_ascii_ws(raw_key);
+    const std::string wanted = normalized_identifier(raw_key);
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        if (normalized_identifier(it.key()) == wanted) return it.key();
+    }
+    return trim_ascii_ws(raw_key);
+}
+
+void add_tool_argument(json &args, const json *props,
+                       const std::string &raw_key, std::string value) {
+    const std::string key = schema_property_name(props, raw_key);
+    if (key.empty()) return;
+    value = trim_single_newlines(std::move(value));
+    if (props && props->contains(key) && (*props)[key].is_object()) {
+        args[key] = coerce_value_by_schema(value, (*props)[key]);
+    } else {
+        args[key] = value;
+    }
+}
+
+void parse_parameter_tags(const std::string &block, const json *props, json &args) {
+    size_t pos = 0;
+    while ((pos = block.find("<parameter=", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<parameter=").size();
+        const size_t key1 = block.find('>', key0);
+        if (key1 == std::string::npos) break;
+        const size_t value0 = key1 + 1;
+        const size_t value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1 + std::string("</parameter>").size();
+    }
+}
+
+void parse_arg_key_value_tags(const std::string &block, const json *props, json &args) {
+    size_t pos = 0;
+    while ((pos = block.find("<arg_key>", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<arg_key>").size();
+        const size_t key1 = block.find("</arg_key>", key0);
+        if (key1 == std::string::npos) break;
+        const size_t value_tag = block.find("<arg_value>", key1);
+        if (value_tag == std::string::npos) break;
+        const size_t value0 = value_tag + std::string("<arg_value>").size();
+        size_t value1 = block.find("</arg_value>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</tool_call>", value0);
+        if (value1 == std::string::npos) value1 = block.size();
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1;
+    }
+}
+
+void parse_loose_parameter_tags(const std::string &block, const json *props, json &args) {
+    // Handles variants such as <parameter>lines>[680, 720] where the model
+    // omitted the '=' and used the next '>' as the key/value separator.
+    size_t pos = 0;
+    while ((pos = block.find("<parameter>", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<parameter>").size();
+        const size_t key1 = block.find('>', key0);
+        if (key1 == std::string::npos) break;
+        const size_t value0 = key1 + 1;
+        size_t value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</tool_call>", value0);
+        if (value1 == std::string::npos) value1 = block.size();
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1;
+    }
+}
+
+void parse_schema_named_tags(const std::string &block, const json *props, json &args) {
+    if (!props || !props->is_object()) return;
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        const std::string key = it.key();
+        const std::string snake_key = snake_case_identifier(key);
+        const std::vector<std::string> tag_names =
+            snake_key == key ? std::vector<std::string>{key}
+                              : std::vector<std::string>{key, snake_key};
+        for (const std::string &tag_name : tag_names) {
+            const std::string open = "<" + tag_name + ">";
+            size_t pos = 0;
+            while ((pos = block.find(open, pos)) != std::string::npos) {
+                const size_t value0 = pos + open.size();
+                const std::string close = "</" + tag_name + ">";
+                size_t value1 = block.find(close, value0);
+                if (value1 == std::string::npos) {
+                    // A seen malformed form uses <file_path>value<parameter>...
+                    // rather than a matching closing tag. Limit recovery to
+                    // the next tool/parameter delimiter so code text cannot swallow
+                    // the rest of the request.
+                    value1 = block.find("<parameter", value0);
+                    const size_t arg_key = block.find("<arg_key>", value0);
+                    if (value1 == std::string::npos ||
+                        (arg_key != std::string::npos && arg_key < value1)) {
+                        value1 = arg_key;
+                    }
+                    const size_t end = block.find("</tool_call>", value0);
+                    if (value1 == std::string::npos ||
+                        (end != std::string::npos && end < value1)) {
+                        value1 = end;
+                    }
+                    if (value1 == std::string::npos) value1 = block.size();
+                }
+                if (value1 == std::string::npos) break;
+                add_tool_argument(args, props, key, block.substr(value0, value1 - value0));
+                pos = value1 + (block.compare(value1, close.size(), close) == 0
+                                    ? close.size() : 1);
+            }
+        }
+    }
+}
+
+std::string tool_name_from_prefix(const std::string &inner, const json *tools) {
+    const std::string text = trim_ascii_ws(inner);
+    size_t pos = 0;
+    while (pos < text.size() &&
+           !(std::isalnum(static_cast<unsigned char>(text[pos])) ||
+             text[pos] == '_' || text[pos] == '-')) {
+        ++pos;
+    }
+    if (pos == text.size()) return {};
+    size_t end = pos;
+    while (end < text.size() &&
+           (std::isalnum(static_cast<unsigned char>(text[end])) ||
+            text[end] == '_' || text[end] == '-')) {
+        ++end;
+    }
+    std::string candidate = text.substr(pos, end - pos);
+    if (candidate == "function") {
+        while (end < text.size() && (text[end] == ' ' || text[end] == '=' ||
+                                     text[end] == '<' || text[end] == '>')) {
+            ++end;
+        }
+        const size_t name0 = end;
+        while (end < text.size() &&
+               (std::isalnum(static_cast<unsigned char>(text[end])) ||
+                text[end] == '_' || text[end] == '-')) {
+            ++end;
+        }
+        candidate = text.substr(name0, end - name0);
+    }
+    return tool_name_allowed(tools, candidate) ? candidate : std::string();
+}
+
+std::string tool_name_from_marker(const std::string &inner, const json *tools) {
+    for (const std::string &marker : {"<function=", "function=", "function_"}) {
+        size_t pos = inner.find(marker);
+        if (pos == std::string::npos) continue;
+        pos += marker.size();
+        size_t end = pos;
+        while (end < inner.size() &&
+               (std::isalnum(static_cast<unsigned char>(inner[end])) ||
+                inner[end] == '_' || inner[end] == '-')) {
+            ++end;
+        }
+        const std::string candidate = inner.substr(pos, end - pos);
+        if (tool_name_allowed(tools, candidate)) return candidate;
+    }
+    return tool_name_from_prefix(inner, tools);
+}
+
+std::string infer_tool_name_from_arguments(const json *tools, const json &args) {
+    if (!tools || !tools->is_array() || !args.is_object() || args.empty()) return {};
+    std::string match;
+    size_t best_required = 0;
+    bool tied = false;
+    for (const auto &tool : *tools) {
+        if (!tool.is_object()) continue;
+        const json *fn = (tool.contains("function") && tool["function"].is_object())
+                             ? &tool["function"] : &tool;
+        if (!fn->is_object() || !fn->contains("name") ||
+            !fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
+            continue;
+        }
+        const json &required = (*fn)["parameters"].value("required", json::array());
+        if (!required.is_array() || required.empty()) continue;
+        bool all_present = true;
+        for (const auto &key : required) {
+            if (!key.is_string() || !args.contains(key.get<std::string>())) {
+                all_present = false;
+                break;
+            }
+        }
+        if (all_present) {
+            const size_t required_count = required.size();
+            if (required_count > best_required) {
+                best_required = required_count;
+                match = fn->value("name", std::string());
+                tied = false;
+            } else if (required_count == best_required) {
+                tied = true;
+            }
+        }
+    }
+    return tied ? std::string() : match;
+}
+
+bool parse_tool_call_block(const std::string &inner, const json *tools,
+                           std::vector<json> &calls) {
+    if (parse_json_tool_call_text(inner, calls)) return true;
+
+    const std::string normalized = strip_tool_control_tokens(inner);
+    std::string name = tool_name_from_marker(normalized, tools);
+    const json *props = find_tool_properties(tools, name);
+    json args = json::object();
+    parse_parameter_tags(normalized, props, args);
+    parse_arg_key_value_tags(normalized, props, args);
+    parse_loose_parameter_tags(normalized, props, args);
+    parse_schema_named_tags(normalized, props, args);
+
+    // A few generations place a JSON object directly after function_edit>.
+    // Parse it only when it starts at an object boundary; arbitrary code text
+    // must never be interpreted as tool arguments.
+    if (name.empty() || args.empty()) {
+        const size_t object0 = normalized.find('{');
+        const size_t object1 = normalized.rfind('}');
+        if (object0 != std::string::npos && object1 > object0) {
+            std::vector<json> parsed;
+            if (parse_json_tool_call_text(
+                    "{\"name\":" + dump_json(name) +
+                    ",\"arguments\":" +
+                        normalized.substr(object0, object1 - object0 + 1) + "}",
+                    parsed) && !parsed.empty()) {
+                if (!name.empty() || parsed.front().contains("function")) {
+                    calls.push_back(parsed.front());
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (name.empty()) name = infer_tool_name_from_arguments(tools, args);
+    if (name.empty() || !tool_name_allowed(tools, name)) return false;
+    calls.push_back(make_tool_call_json(name, args));
+    return true;
 }
 
 std::vector<json> parse_tool_calls_xml(const std::string &text,
@@ -578,73 +874,17 @@ std::vector<json> parse_tool_calls_xml(const std::string &text,
         if (tc0 == std::string::npos) break;
         const size_t tc1 = text.find("</tool_call>", tc0);
         if (tc1 == std::string::npos) break;
-        const std::string block = text.substr(tc0, tc1 - tc0);
         const size_t inner0 = tc0 + std::string("<tool_call>").size();
         const std::string inner = text.substr(inner0, tc1 - inner0);
-        const size_t fn0 = block.find("<function=");
-        if (fn0 == std::string::npos) {
-            (void)parse_json_tool_call_text(inner, calls);
-            pos = tc1 + std::string("</tool_call>").size();
-            continue;
-        }
-        const size_t name0 = fn0 + std::string("<function=").size();
-        const size_t name1 = block.find(">", name0);
-        if (name1 == std::string::npos) {
-            pos = tc1 + std::string("</tool_call>").size();
-            continue;
-        }
-        const std::string name = block.substr(name0, name1 - name0);
-        const json *props = find_tool_properties(tools, name);
-        json args = json::object();
-        size_t pp = name1 + 1;
-        bool saw_parameter = false;
-        while (true) {
-            const size_t p0 = block.find("<parameter=", pp);
-            if (p0 == std::string::npos) break;
-            const size_t key0 = p0 + std::string("<parameter=").size();
-            const size_t key1 = block.find(">", key0);
-            if (key1 == std::string::npos) break;
-            const size_t v0 = key1 + 1;
-            const size_t v1 = block.find("</parameter>", v0);
-            if (v1 == std::string::npos) break;
-            std::string value = block.substr(v0, v1 - v0);
-            if (!value.empty() && value.front() == '\n') value.erase(value.begin());
-            if (!value.empty() && value.back() == '\n') value.pop_back();
-            const std::string key = block.substr(key0, key1 - key0);
-            if (props && props->contains(key) && (*props)[key].is_object()) {
-                args[key] = coerce_value_by_schema(value, (*props)[key]);
-            } else {
-                args[key] = value;
-            }
-            saw_parameter = true;
-            pp = v1 + std::string("</parameter>").size();
-        }
-        if (!saw_parameter) {
-            const size_t body0 = name1 + 1;
-            const size_t body1 = block.find("</function>", body0);
-            if (body1 != std::string::npos) {
-                const std::string body = block.substr(body0, body1 - body0);
-                std::vector<json> parsed;
-                if (parse_json_tool_call_text(
-                        "{\"name\":" + dump_json(name) +
-                        ",\"arguments\":" + trim_ascii_ws(body) + "}",
-                        parsed) &&
-                    !parsed.empty()) {
-                    calls.push_back(parsed.front());
-                    pos = tc1 + std::string("</tool_call>").size();
-                    continue;
-                }
-            }
-        }
-        calls.push_back(make_tool_call_json(name, args));
+        (void)parse_tool_call_block(inner, tools, calls);
         pos = tc1 + std::string("</tool_call>").size();
     }
     return calls;
 }
 
-json tool_call_delta(const json &calls) {
+json tool_call_delta(const json &calls, size_t begin = 0) {
     json deltas = json::array();
-    for (size_t i = 0; i < calls.size(); ++i) {
+    for (size_t i = begin; i < calls.size(); ++i) {
         const json &call = calls[i];
         json d = {
             {"index", static_cast<int>(i)},
@@ -660,6 +900,224 @@ json tool_call_delta(const json &calls) {
     }
     return json{{"tool_calls", deltas}};
 }
+
+bool schema_is_plain_string(const json &schema) {
+    return schema.is_object() && schema.contains("type") &&
+           schema["type"].is_string() &&
+           schema["type"].get<std::string>() == "string";
+}
+
+bool tool_has_only_string_properties(const json *tools,
+                                     const std::string &name) {
+    const json *props = find_tool_properties(tools, name);
+    if (!props || !props->is_object() || props->empty()) return false;
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        if (!schema_is_plain_string(it.value())) return false;
+    }
+    return true;
+}
+
+json incremental_tool_start_delta(size_t index,
+                                  const std::string &id,
+                                  const std::string &name,
+                                  const std::string &arguments) {
+    return json{{"tool_calls", json::array({json{
+        {"index", static_cast<int>(index)},
+        {"id", id},
+        {"type", "function"},
+        {"function", json{{"name", name},
+                          {"arguments", arguments}}}
+    }})}};
+}
+
+json incremental_tool_arguments_delta(size_t index,
+                                      const std::string &arguments) {
+    return json{{"tool_calls", json::array({json{
+        {"index", static_cast<int>(index)},
+        {"function", json{{"arguments", arguments}}}
+    }})}};
+}
+
+class IncrementalToolCallStream {
+public:
+    explicit IncrementalToolCallStream(const json *tools) : tools_(tools) {}
+
+    void feed(const std::string &text) {
+        if (abandoned_ || fatal_ || parser_.complete()) return;
+        std::vector<detail::ToolCallStreamEvent> events;
+        if (!parser_.feed(text, events)) {
+            parser_failed();
+            return;
+        }
+        process(events);
+    }
+
+    void finish() {
+        if (abandoned_ || fatal_) return;
+        std::vector<detail::ToolCallStreamEvent> events;
+        if (!parser_.finish(events)) {
+            parser_failed();
+            return;
+        }
+        process(events);
+    }
+
+    bool streaming() const { return streaming_; }
+    bool abandoned() const { return abandoned_; }
+    bool fatal() const { return fatal_; }
+    bool complete() const { return complete_; }
+    bool start_pending() const { return start_pending_; }
+    size_t pending_size() const { return pending_arguments_.size(); }
+    const std::string &error() const { return error_; }
+
+    json take_start_delta() {
+        start_pending_ = false;
+        const std::string fragment = take_pending_arguments();
+        return incremental_tool_start_delta(0, call_id_, name_, fragment);
+    }
+
+    json take_arguments_delta() {
+        return incremental_tool_arguments_delta(0, take_pending_arguments());
+    }
+
+    bool validate(const std::vector<json> &calls, std::string &reason) const {
+        if (!streaming_ || fatal_ || !complete_) {
+            reason = fatal_ ? error_ : "canonical stream did not complete";
+            return false;
+        }
+        if (calls.empty() || !calls.front().is_object() ||
+            !calls.front().contains("function") ||
+            !calls.front()["function"].is_object()) {
+            reason = "full parser did not produce the streamed tool call";
+            return false;
+        }
+        const json &fn = calls.front()["function"];
+        if (fn.value("name", std::string()) != name_) {
+            reason = "streamed and fully parsed function names differ";
+            return false;
+        }
+        try {
+            const json streamed = json::parse(arguments_all_);
+            const json parsed =
+                json::parse(fn.value("arguments", std::string("{}")));
+            if (streamed != parsed) {
+                reason = "streamed and fully parsed arguments differ";
+                return false;
+            }
+        } catch (const std::exception &e) {
+            reason = std::string("argument validation failed: ") + e.what();
+            return false;
+        }
+        return true;
+    }
+
+private:
+    void parser_failed() {
+        if (streaming_) {
+            fatal_ = true;
+            error_ = parser_.error();
+        } else {
+            abandoned_ = true;
+        }
+    }
+
+    void append_arguments(const std::string &text) {
+        arguments_all_ += text;
+        pending_arguments_ += text;
+    }
+
+    std::string take_pending_arguments() {
+        std::string out;
+        out.swap(pending_arguments_);
+        return out;
+    }
+
+    void fail(std::string message) {
+        fatal_ = true;
+        error_ = std::move(message);
+    }
+
+    void process(const std::vector<detail::ToolCallStreamEvent> &events) {
+        for (const detail::ToolCallStreamEvent &event : events) {
+            if (abandoned_ || fatal_) return;
+            switch (event.kind) {
+                case detail::ToolCallStreamEventKind::ToolStart:
+                    name_ = event.value;
+                    if (!tool_name_allowed(tools_, name_) ||
+                        !tool_has_only_string_properties(tools_, name_)) {
+                        abandoned_ = true;
+                        return;
+                    }
+                    call_id_ = gen_id("call_");
+                    streaming_ = true;
+                    start_pending_ = true;
+                    append_arguments("{");
+                    break;
+                case detail::ToolCallStreamEventKind::ParameterStart: {
+                    if (!streaming_ || parameter_open_) {
+                        fail("invalid incremental parameter start");
+                        return;
+                    }
+                    const json *props = find_tool_properties(tools_, name_);
+                    parameter_name_ =
+                        schema_property_name(props, event.value);
+                    if (parameter_name_.empty() ||
+                        !seen_parameters_.insert(parameter_name_).second) {
+                        fail("empty or duplicate incremental parameter");
+                        return;
+                    }
+                    if (!first_parameter_) append_arguments(",");
+                    first_parameter_ = false;
+                    append_arguments(dump_json(json(parameter_name_)) + ":\"");
+                    parameter_open_ = true;
+                    break;
+                }
+                case detail::ToolCallStreamEventKind::ParameterData:
+                    if (!parameter_open_) {
+                        fail("incremental parameter data outside a parameter");
+                        return;
+                    }
+                    append_arguments(
+                        detail::json_string_fragment(event.value));
+                    break;
+                case detail::ToolCallStreamEventKind::ParameterEnd:
+                    if (!parameter_open_) {
+                        fail("incremental parameter end without a parameter");
+                        return;
+                    }
+                    append_arguments("\"");
+                    parameter_name_.clear();
+                    parameter_open_ = false;
+                    break;
+                case detail::ToolCallStreamEventKind::ToolEnd:
+                    if (!streaming_ || parameter_open_) {
+                        fail("incremental tool ended inside a parameter");
+                        return;
+                    }
+                    append_arguments("}");
+                    complete_ = true;
+                    break;
+            }
+        }
+    }
+
+    const json *tools_ = nullptr;
+    detail::CanonicalToolCallStreamParser parser_;
+    std::string name_;
+    std::string call_id_;
+    std::string parameter_name_;
+    std::string arguments_all_;
+    std::string pending_arguments_;
+    std::string error_;
+    std::unordered_set<std::string> seen_parameters_;
+    bool streaming_ = false;
+    bool abandoned_ = false;
+    bool fatal_ = false;
+    bool complete_ = false;
+    bool start_pending_ = false;
+    bool parameter_open_ = false;
+    bool first_parameter_ = true;
+};
 
 std::string tool_calls_debug_summary(const std::vector<json> &calls) {
     json summary = json::array();
@@ -714,9 +1172,8 @@ std::string tools_debug_summary(const json &tools) {
 // Streaming tool-call detection. The model may emit natural-language reasoning
 // before a <tool_call> block (the Hermes prompt at render_messages explicitly
 // allows this), so the stream cannot be classified once on its first token.
-// Instead content streams incrementally until a <tool_call> marker appears
-// anywhere, at which point the caller switches to buffering and parses the call
-// from the full accumulated text.
+// Content streams until a marker appears; canonical string arguments then stream
+// as OpenAI deltas, while recovery formats remain buffered for the full parser.
 //
 // Returns how many leading bytes of `text` are safe to emit as content right
 // now. If a complete "<tool_call>" marker is present, returns its byte offset
@@ -815,8 +1272,11 @@ std::string render_messages(
         if (!m.is_object() || i < num_sys) continue;
         const std::string role = m.value("role", "");
         if (role == "system" || role == "developer") continue;
+        const std::string rendered_content =
+            m.contains("content") ? render_content(m["content"]) : "";
+        // Tool results can contain byte-sensitive content such as source code.
         const std::string content =
-            trim_ascii_ws(m.contains("content") ? render_content(m["content"]) : "");
+            role == "tool" ? rendered_content : trim_ascii_ws(rendered_content);
         if (role == "user") {
             const size_t segment_begin = prompt.size();
             prompt += "<|im_start|>user\n";
@@ -1015,6 +1475,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                      "(non-continuous-batching) serve route; it is inert while "
                      "--continuous-batching is active\n";
     }
+    if (cfg.kvmem_query_replay &&
+        (!engine.kvmem_enabled || !engine.kvmem_query_conditioned)) {
+        throw std::runtime_error(
+            "--kvmem-query-replay requires --kvmem and "
+            "--kvmem-query-conditioned");
+    }
+    if (cfg.kvmem_query_replay && cfg.continuous_batching) {
+        std::cerr << "[qw3-serve] note: --kvmem-query-replay is currently "
+                     "single-request only; it is inert while "
+                     "--continuous-batching is active\n";
+    }
 
     // The backend still reads several low-level toggles from process config.
     // Keep that as an internal bridge; the user-facing API is the explicit CLI
@@ -1038,6 +1509,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     // executor read it). Tracing left to QW3_KVMEM_PREFIX_CACHE_TRACE opt-in.
     setenv_bool("QW3_KVMEM_PREFIX_CACHE",
                 cfg.kvmem_prefix_cache && engine.kvmem_enabled);
+    setenv_bool("QW3_KVMEM_QUERY_REPLAY",
+                cfg.kvmem_query_replay && engine.kvmem_enabled &&
+                    engine.kvmem_query_conditioned && !cfg.continuous_batching);
     setenv_bool("QW3_MTP_SPECULATE", engine.native_mtp_speculate);
     setenv_value("QW3_MTP_POLICY", engine.mtp_policy);
     if (engine.mtp_adaptive_min_chain > 0) {
@@ -1104,6 +1578,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  model=" << engine.model_path << "\n"
               << "  backend=" << backend_kind_name(engine.backend) << "\n"
               << "  native_kernels=" << engine.native_kernels << "\n"
+              << "  cpu_embedding=" << yesno(engine.cpu_embedding) << "\n"
               << "  ctx=" << engine.ctx_size << "\n"
               << "  batch=" << engine.batch_size << "\n"
               << "  prefill_chunk=" << engine.prefill_chunk << "\n"
@@ -1141,6 +1616,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  mtp_paged_prefix=" << yesno(cfg.mtp_paged_prefix) << "\n"
               << "  prefix_cache="
               << yesno(cfg.prefix_cache && cfg.continuous_batching) << "\n"
+              << "  tool_argument_streaming=canonical-string\n"
               << "  matmul=mmq\n"
               << "  disable_hgemm=1\n"
               << "  default_max_tokens="
@@ -1173,6 +1649,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << yesno(engine.kvmem_recompute_query) << "\n"
               << "  kvmem_immutable_k="
               << yesno(engine.kvmem_immutable_source_k) << "\n"
+              << "  kvmem_query_replay="
+              << yesno(cfg.kvmem_query_replay && !cfg.continuous_batching) << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
               << "  kvmem_sink="
@@ -1204,8 +1682,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
     Engine eng(engine);
-    GgufFile usage_gguf(engine.model_path);
-    QwenTokenizer usage_tokenizer(usage_gguf);
+    std::unique_ptr<GgufFile> usage_gguf;
+    std::unique_ptr<QwenTokenizer> usage_tokenizer_owner;
+    if (std::filesystem::is_directory(engine.model_path)) {
+        usage_tokenizer_owner = std::make_unique<QwenTokenizer>(engine.model_path);
+    } else {
+        usage_gguf = std::make_unique<GgufFile>(engine.model_path);
+        usage_tokenizer_owner = std::make_unique<QwenTokenizer>(*usage_gguf);
+    }
+    QwenTokenizer &usage_tokenizer = *usage_tokenizer_owner;
     const std::string model_id = basename_of(engine.model_path);
     std::cerr << "[qw3-serve] model loaded; id=" << model_id << "\n";
 
@@ -1329,6 +1814,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.seed = req.value("seed", g.seed);
         g.ignore_eos = req.value("ignore_eos",
                                  req.value("ignore_eos_token", g.ignore_eos));
+        g.recover_thinking_eos = req.value("recover_thinking_eos", enable_thinking);
         g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
         if (g.thinking_budget < 0) g.thinking_budget = 0;
 
@@ -2279,6 +2765,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const json tools_schema = tools ? *tools : json();
 
         if (stream) {
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [&, prompt, g, stops, id, created, rid, enable_thinking,
@@ -2294,13 +2782,20 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     size_t completion_tokens = 0;
                     bool stopped = false;
                     bool client_closed = false;
+                    auto last_stream_write = std::chrono::steady_clock::now();
                     auto send_raw = [&](const std::string &s) {
                         if (client_closed) return false;
+                        if (sink.is_writable && !sink.is_writable()) {
+                            client_closed = true;
+                            stopped = true;
+                            return false;
+                        }
                         if (!sink.write(s.data(), s.size())) {
                             client_closed = true;
                             stopped = true;
                             return false;
                         }
+                        last_stream_write = std::chrono::steady_clock::now();
                         return true;
                     };
                     auto send_delta = [&](const json &delta) {
@@ -2312,7 +2807,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"delta", delta},
                                 {"finish_reason", nullptr}}})}};
                         const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        send_raw(s);
+                        return send_raw(s);
                     };
                     auto send_role = [&]() {
                         json chunk = {
@@ -2353,12 +2848,18 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         sink.done();
                     };
                     try {
-                        auto generate_request = [&](const auto &callback) {
+                        auto generate_request =
+                            [&](const CancellableTokenCallback &callback) {
                             if (kvmem_session_request) {
                                 eng.generate_session_stream(
-                                    prompt, g, callback, kvmem_session_reset);
+                                    prompt, g,
+                                    [&](const std::string &piece) {
+                                        (void)callback(piece);
+                                    },
+                                    kvmem_session_reset);
                             } else {
-                                eng.generate_stream(prompt, g, callback);
+                                eng.generate_stream_cancellable(
+                                    prompt, g, callback);
                             }
                         };
                         send_role();
@@ -2391,17 +2892,77 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         if (tool_request) {
                             // The model may stream natural-language reasoning
                             // before a <tool_call> block (the Hermes prompt
-                            // explicitly allows this), so we cannot classify the
-                            // response on its first token. Stream content
-                            // incrementally while scanning for a <tool_call>
-                            // marker anywhere; once it appears, stop streaming
-                            // and buffer the remainder so the full call is parsed
-                            // at the end from the accumulated text.
-                            bool buffering_tool = forced_tool_request;
+                            // explicitly allows this). Once a canonical call for
+                            // a string-only schema appears, transcode its XML
+                            // parameters into standard OpenAI argument deltas.
+                            // Recovery syntaxes stay on the full-buffer parser.
+                            bool buffering_tool = false;
                             bool streamed_content = false;
                             std::string content_pending;
+                            std::string forced_prefix;
+                            const json *stream_tools =
+                                tools_schema.is_array() ? &tools_schema : nullptr;
+                            IncrementalToolCallStream incremental(stream_tools);
+                            auto last_tool_delta =
+                                std::chrono::steady_clock::now();
+                            size_t next_progress_tokens = 1024;
+                            constexpr size_t kArgumentFlushBytes = 1024;
+                            constexpr auto kArgumentFlushInterval =
+                                std::chrono::milliseconds(500);
+                            constexpr auto kToolHeartbeatInterval =
+                                std::chrono::seconds(2);
+
+                            auto flush_incremental = [&](bool force) {
+                                if (!incremental.streaming() || client_closed) return;
+                                if (incremental.start_pending()) {
+                                    send_delta(incremental.take_start_delta());
+                                    last_tool_delta =
+                                        std::chrono::steady_clock::now();
+                                }
+                                const auto now = std::chrono::steady_clock::now();
+                                if (incremental.pending_size() > 0 &&
+                                    (force ||
+                                     incremental.pending_size() >=
+                                         kArgumentFlushBytes ||
+                                     now - last_tool_delta >=
+                                         kArgumentFlushInterval)) {
+                                    send_delta(incremental.take_arguments_delta());
+                                    last_tool_delta = now;
+                                }
+                            };
+                            auto service_tool_stream = [&]() {
+                                flush_incremental(false);
+                                const auto now = std::chrono::steady_clock::now();
+                                if (!client_closed &&
+                                    now - last_stream_write >=
+                                        kToolHeartbeatInterval) {
+                                    // Empty OpenAI deltas are protocol-safe and
+                                    // keep read-idle timers alive even when the
+                                    // full tool call must remain buffered.
+                                    send_delta(json::object());
+                                }
+                                if (completion_tokens >= next_progress_tokens) {
+                                    const double elapsed =
+                                        std::chrono::duration<double>(
+                                            now - t0).count();
+                                    std::cerr << "[qw3-serve] #" << rid
+                                              << " tool_buffer_progress tokens="
+                                              << completion_tokens
+                                              << " chars=" << acc.size()
+                                              << " elapsed=" << elapsed << "s"
+                                              << " incremental="
+                                              << (incremental.streaming()
+                                                      ? "true" : "false")
+                                              << "\n";
+                                    do {
+                                        next_progress_tokens += 1024;
+                                    } while (completion_tokens >=
+                                             next_progress_tokens);
+                                }
+                            };
+
                             generate_request([&](const std::string &piece) {
-                                if (stopped) return;
+                                if (stopped || client_closed) return false;
                                 ++completion_tokens;
                                 acc += piece;
                                 std::string emit = take_complete_utf8(utf8_pending, piece);
@@ -2418,25 +2979,74 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         emit = take_complete_utf8(utf8_pending, emit);
                                     }
                                 }
-                                if (buffering_tool || emit.empty()) return;
-                                content_pending += emit;
-                                bool marker_found = false;
-                                const size_t safe =
-                                    tool_call_safe_emit_len(content_pending, marker_found);
-                                if (safe > 0) {
-                                    emit_text(content_pending.substr(0, safe));
-                                    streamed_content = true;
-                                    content_pending.erase(0, safe);
+                                if (buffering_tool) {
+                                    if (!emit.empty()) incremental.feed(emit);
+                                } else if (!emit.empty()) {
+                                    content_pending += emit;
+                                    bool marker_found = false;
+                                    const size_t safe =
+                                        tool_call_safe_emit_len(
+                                            content_pending, marker_found);
+                                    if (safe > 0) {
+                                        const std::string prefix =
+                                            content_pending.substr(0, safe);
+                                        if (forced_tool_request) {
+                                            forced_prefix += prefix;
+                                        } else {
+                                            emit_text(prefix);
+                                            streamed_content = true;
+                                        }
+                                        content_pending.erase(0, safe);
+                                    }
+                                    if (marker_found) {
+                                        if (forced_tool_request &&
+                                            !forced_prefix.empty()) {
+                                            emit_text(forced_prefix);
+                                            forced_prefix.clear();
+                                            streamed_content = true;
+                                        }
+                                        buffering_tool = true;
+                                        // content_pending begins with the marker
+                                        // and may already include part of the
+                                        // function/first parameter.
+                                        incremental.feed(content_pending);
+                                        content_pending.clear();
+                                    }
                                 }
-                                if (marker_found) {
-                                    // Remainder from the marker onward is the
-                                    // tool call; reparse from `acc` at the end.
-                                    buffering_tool = true;
-                                    content_pending.clear();
+                                if (incremental.fatal()) {
+                                    stopped = true;
                                 }
+                                if (buffering_tool &&
+                                    !incremental.fatal()) {
+                                    service_tool_stream();
+                                }
+                                return !stopped && !client_closed;
                             });
+
+                            if (client_closed) {
+                                std::cerr << "[qw3-serve] #" << rid
+                                          << " chat(stream tools) chars="
+                                          << acc.size()
+                                          << " completion_tokens="
+                                          << completion_tokens
+                                          << " prompt_tokens="
+                                          << prompt_token_count
+                                          << " route=" << route
+                                          << " buffered_tool="
+                                          << (buffering_tool ? "true" : "false")
+                                          << " client_closed=true\n";
+                                return true;
+                            }
+
                             if (buffering_tool) {
-                                std::string text = take_complete_utf8(utf8_pending, acc);
+                                incremental.finish();
+                                if (incremental.fatal()) {
+                                    throw std::runtime_error(
+                                        "incremental tool stream failed: " +
+                                        incremental.error());
+                                }
+                                std::string text =
+                                    take_complete_utf8(utf8_pending, acc);
                                 text += flush_utf8_pending(utf8_pending, false);
                                 const std::string framed =
                                     enable_thinking ? ("<think>\n" + text) : text;
@@ -2445,20 +3055,49 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         framed,
                                         tools_schema.is_array() ? &tools_schema
                                                                 : nullptr);
-                                const ReasoningSplit split = split_reasoning(framed);
-                                // Only emit reasoning/content from the buffered
-                                // text when we did NOT already stream it
-                                // incrementally before the marker, to avoid
-                                // duplicating deltas.
-                                if (!streamed_content && !split.reasoning.empty()) {
-                                    send_delta(json{{"reasoning_content", split.reasoning}});
+                                const ReasoningSplit split =
+                                    split_reasoning(framed);
+                                // Prefix reasoning/content was already emitted
+                                // before the first tool delta whenever present.
+                                if (!streamed_content &&
+                                    !split.reasoning.empty()) {
+                                    send_delta(json{
+                                        {"reasoning_content", split.reasoning}});
                                 }
                                 if (!tool_calls.empty()) {
+                                    if (incremental.streaming()) {
+                                        std::string validation_error;
+                                        if (!incremental.validate(
+                                                tool_calls,
+                                                validation_error)) {
+                                            throw std::runtime_error(
+                                                "incremental tool validation "
+                                                "failed: " +
+                                                validation_error);
+                                        }
+                                        // Delay the final closing fragment until
+                                        // the full parser confirms that the
+                                        // streamed arguments are equivalent.
+                                        flush_incremental(true);
+                                        // The first call has already streamed.
+                                        // Preserve the existing multi-call
+                                        // behavior for any later calls.
+                                        if (tool_calls.size() > 1) {
+                                            send_delta(
+                                                tool_call_delta(tool_calls, 1));
+                                        }
+                                    } else {
+                                        send_delta(
+                                            tool_call_delta(tool_calls));
+                                    }
                                     std::cerr << "[qw3-serve] #" << rid
                                               << " tool_calls="
-                                              << tool_calls_debug_summary(tool_calls)
+                                              << tool_calls_debug_summary(
+                                                     tool_calls)
+                                              << " incremental="
+                                              << (incremental.streaming()
+                                                      ? "true" : "false")
                                               << "\n";
-                                    send_delta(tool_call_delta(tool_calls));
                                     send_done("tool_calls");
                                 } else {
                                     std::string preview = split.content.empty()
@@ -2471,14 +3110,28 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     std::cerr << "[qw3-serve] #" << rid
                                               << " tool_parse_empty preview="
                                               << dump_json(preview) << "\n";
-                                    if (!streamed_content && !split.content.empty()) {
-                                        send_delta(json{{"content", split.content}});
+                                    if (incremental.streaming()) {
+                                        throw std::runtime_error(
+                                            "incremental tool stream produced "
+                                            "no complete tool call");
+                                    }
+                                    if (!streamed_content &&
+                                        !split.content.empty()) {
+                                        send_delta(
+                                            json{{"content", split.content}});
                                     }
                                     send_done(generation_finish_reason(
                                         stopped, completion_tokens, g.max_tokens));
                                 }
                             } else {
-                                if (!content_pending.empty()) emit_text(content_pending);
+                                if (forced_tool_request) {
+                                    forced_prefix += content_pending;
+                                    if (!forced_prefix.empty()) {
+                                        emit_text(forced_prefix);
+                                    }
+                                } else if (!content_pending.empty()) {
+                                    emit_text(content_pending);
+                                }
                                 finish_text_stream();
                                 send_done(generation_finish_reason(
                                     stopped, completion_tokens, g.max_tokens));
@@ -2489,12 +3142,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                       << " prompt_tokens=" << prompt_token_count
                                       << " route=" << route
                                       << " buffered_tool=" << (buffering_tool ? "true" : "false")
-                                      << (client_closed ? " client_closed=true" : "")
+                                      << " incremental_tool="
+                                      << (incremental.streaming() ? "true" : "false")
                                       << "\n";
                             return true;
                         }
                         generate_request([&](const std::string &piece) {
-                            if (stopped) return;
+                            if (stopped || client_closed) return false;
                             ++completion_tokens;
                             acc += piece;
                             std::string emit = take_complete_utf8(utf8_pending, piece);
@@ -2513,6 +3167,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             if (!emit.empty()) {
                                 emit_text(emit);
                             }
+                            return !stopped && !client_closed;
                         });
                         finish_text_stream();
                         send_done(generation_finish_reason(
@@ -2558,15 +3213,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         text += piece;
                     }, kvmem_session_reset);
             } else if (g.continuous_batching) {
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             }
         } catch (const std::exception &e) {
@@ -2706,15 +3363,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         size_t completion_tokens = 0;
         try {
             if (g.continuous_batching) {
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             }
         } catch (const std::exception &e) {

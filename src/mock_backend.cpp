@@ -19,7 +19,7 @@ public:
 
     std::string generate(const std::string &prompt,
                          const GenerationOptions &options,
-                         const TokenCallback &on_text) override {
+                         const CancellableTokenCallback &on_text) override {
         (void)options;
         std::ostringstream out;
         out << "[mock backend] prompt_chars=" << prompt.size()

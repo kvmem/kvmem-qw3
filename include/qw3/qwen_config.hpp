@@ -51,6 +51,7 @@ struct QwenConfig {
     bool     add_bos = false;
 
     explicit QwenConfig(const GgufFile &gguf);
+    explicit QwenConfig(const std::string &hf_model_directory);
 
     bool is_standard_attention_layer(uint32_t i) const {
         if (full_attention_interval == 0) return false;

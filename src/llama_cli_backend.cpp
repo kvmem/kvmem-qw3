@@ -84,7 +84,7 @@ public:
 
     std::string generate(const std::string &prompt,
                          const GenerationOptions &gen,
-                         const TokenCallback &on_text) override {
+                         const CancellableTokenCallback &on_text) override {
         const std::string prompt_file = make_prompt_file(prompt);
         const std::string binary = resolve_completion_binary(options_.llama_cli_path);
         std::ostringstream cmd;
@@ -113,10 +113,14 @@ public:
 
         std::string result;
         std::array<char, 4096> buf{};
+        bool cancelled = false;
         while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
             std::string chunk(buf.data());
             result += chunk;
-            if (on_text) on_text(chunk);
+            if (on_text && !on_text(chunk)) {
+                cancelled = true;
+                break;
+            }
         }
 
         const int status = pclose(pipe);
@@ -124,7 +128,8 @@ public:
         if (status == -1) {
             throw std::runtime_error("failed to close llama.cpp executable process");
         }
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (!cancelled &&
+            (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
             std::ostringstream err;
             err << "llama.cpp executable failed with status " << status;
             throw std::runtime_error(err.str());
