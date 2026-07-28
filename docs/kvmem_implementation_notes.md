@@ -160,8 +160,14 @@ The configuration includes:
 - `block_tokens`: block granularity.
 - `select_budget`: maximum selected window tokens.
 - `sink_blocks`: prefix blocks always kept.
-- `recent_blocks`: suffix blocks always kept; zero means no suffix blocks are
-  kept unconditionally.
+- `sink_blocks` / `recent_blocks`: resolved physical prefix/suffix bands. By
+  default they are derived after `block_tokens` is known from token targets:
+  sink=`clamp(1% × budget, 1K, 2K)` and
+  recent=`clamp(8% × budget, 4K, 16K)`, each rounded up to complete blocks.
+  Explicit `--kvmem-{sink,recent}-tokens` overrides the corresponding automatic
+  target; the legacy block flags remain mutually-exclusive compatibility
+  overrides. Explicit `--kvmem-recent-blocks 0` means no suffix blocks are kept
+  unconditionally.
 - `select_method`: retrieval, H2O/profile, or recency.
 - `select_policy`: top-k or quota.
 - `retrieval_method`: `mean-k` or `per-token`.

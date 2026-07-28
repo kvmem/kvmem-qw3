@@ -4,7 +4,8 @@
 This is a retrieval-only probe.  It sends the canonical FullContext prompt with
 ``max_tokens=1`` because the final query-conditioned selection is complete
 before the first generated token.  The server must be launched with
-``QW3_KVMEM_DUMP_SCORES`` pointing at ``--dump-file``.
+``QW3_KVMEM_DUMP_SCORES`` or ``QW3_KVMEM_DUMP_LAYER_SCORES`` pointing at
+``--dump-file``.
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ def dumped_tags(path: Path) -> list[str]:
                 raise RuntimeError(
                     f"invalid dump JSON {path}:{line_number}: {exc}"
                 ) from exc
-            if row.get("type") == "meta" and row.get("trace_tag"):
+            if row.get("type") in {"meta", "sample"} and row.get("trace_tag"):
                 tags.append(str(row["trace_tag"]))
     return tags
 
@@ -191,7 +192,9 @@ def main() -> None:
         if tags_now.count(sid) != 1:
             raise RuntimeError(
                 f"server completed but dump has {tags_now.count(sid)} records "
-                f"for {sid}; verify QW3_KVMEM_DUMP_SCORES={args.dump_file}"
+                "for "
+                f"{sid}; verify QW3_KVMEM_DUMP_SCORES or "
+                f"QW3_KVMEM_DUMP_LAYER_SCORES={args.dump_file}"
             )
         completed.add(sid)
         if sid not in manifest_ids:

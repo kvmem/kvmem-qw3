@@ -78,8 +78,16 @@ struct EngineOptions {
     int kvmem_budget = 131072;    // max window tokens kept per selection
     int kvmem_gen_budget = 32768; // GPU pool reserve for generated tokens; also caps max_tokens
     int kvmem_interval = 64;      // decode steps between reselections
-    int kvmem_sink_blocks = 1;           // always-kept prefix blocks
-    int kvmem_recent_blocks = 0;         // always-kept suffix blocks (0 = none)
+    // Always-kept prefix/suffix allocation. Negative means derive from the
+    // KVMem token budget after block_tokens is known:
+    //   sink   = clamp(1% of budget, 1K, 2K)
+    //   recent = clamp(8% of budget, 4K, 16K)
+    // Explicit token and block forms are mutually exclusive per band. The
+    // block fields remain for exact reproduction of older experiments.
+    int kvmem_sink_blocks = -1;
+    int kvmem_recent_blocks = -1;
+    int kvmem_sink_tokens = -1;
+    int kvmem_recent_tokens = -1;
     // Selection signal that ranks the middle blocks each reselection:
     // "retrieval" (default, global content similarity, can resurrect dropped
     // blocks), "h2o" (window-local cumulative attention heat, retention only),

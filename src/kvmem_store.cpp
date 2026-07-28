@@ -1,9 +1,132 @@
 #include "qw3/kvmem_store.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace qw3 {
+
+namespace {
+
+uint32_t ceil_div_u32(uint32_t value, uint32_t divisor) {
+    if (value == 0) return 0;
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(value) + divisor - 1) / divisor);
+}
+
+uint32_t clamp_u32(uint32_t value, uint32_t lo, uint32_t hi) {
+    return std::min(std::max(value, lo), hi);
+}
+
+uint32_t ceil_percent(uint32_t value, uint32_t percent) {
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(value) * percent + 99u) / 100u);
+}
+
+}  // namespace
+
+KvMemKeepAllocation resolve_kvmem_keep_allocation(
+        uint32_t block_tokens,
+        uint32_t select_budget,
+        int64_t sink_blocks,
+        int64_t recent_blocks,
+        int64_t sink_tokens,
+        int64_t recent_tokens) {
+    if (block_tokens == 0) {
+        throw std::runtime_error(
+            "KVMem keep allocation requires block_tokens > 0");
+    }
+    if (select_budget < block_tokens) {
+        throw std::runtime_error(
+            "KVMem selection budget must contain at least one block");
+    }
+    if (sink_blocks >= 0 && sink_tokens >= 0) {
+        throw std::runtime_error(
+            "KVMem sink allocation cannot specify both blocks and tokens");
+    }
+    if (recent_blocks >= 0 && recent_tokens >= 0) {
+        throw std::runtime_error(
+            "KVMem recent allocation cannot specify both blocks and tokens");
+    }
+
+    KvMemKeepAllocation out;
+    const uint32_t budget_blocks = select_budget / block_tokens;
+
+    auto resolve_band = [&](int64_t explicit_blocks,
+                            int64_t explicit_tokens,
+                            uint32_t auto_tokens,
+                            const char *name,
+                            uint32_t &target_tokens,
+                            uint32_t &blocks,
+                            uint32_t &effective_tokens,
+                            KvMemKeepSource &source) {
+        if (explicit_blocks >= 0) {
+            if (static_cast<uint64_t>(explicit_blocks) >
+                std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error(
+                    std::string("KVMem ") + name +
+                    " block allocation is too large");
+            }
+            blocks = static_cast<uint32_t>(explicit_blocks);
+            const uint64_t tokens =
+                static_cast<uint64_t>(blocks) * block_tokens;
+            if (tokens > std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error(
+                    std::string("KVMem ") + name +
+                    " block allocation overflows token accounting");
+            }
+            target_tokens = static_cast<uint32_t>(tokens);
+            effective_tokens = target_tokens;
+            source = KvMemKeepSource::Blocks;
+            return;
+        }
+
+        const uint64_t requested = explicit_tokens >= 0
+            ? static_cast<uint64_t>(explicit_tokens)
+            : static_cast<uint64_t>(auto_tokens);
+        if (requested > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(
+                std::string("KVMem ") + name +
+                " token allocation is too large");
+        }
+        target_tokens = static_cast<uint32_t>(requested);
+        blocks = ceil_div_u32(target_tokens, block_tokens);
+        const uint64_t rounded_tokens =
+            static_cast<uint64_t>(blocks) * block_tokens;
+        if (rounded_tokens > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(
+                std::string("KVMem ") + name +
+                " rounded token allocation overflows accounting");
+        }
+        effective_tokens = static_cast<uint32_t>(rounded_tokens);
+        source = explicit_tokens >= 0
+            ? KvMemKeepSource::Tokens
+            : KvMemKeepSource::Auto;
+    };
+
+    const uint32_t auto_sink_tokens =
+        clamp_u32(ceil_percent(select_budget, 1), 1024, 2048);
+    const uint32_t auto_recent_tokens =
+        clamp_u32(ceil_percent(select_budget, 8), 4096, 16384);
+    resolve_band(
+        sink_blocks, sink_tokens, auto_sink_tokens, "sink",
+        out.sink_target_tokens, out.sink_blocks,
+        out.sink_effective_tokens, out.sink_source);
+    resolve_band(
+        recent_blocks, recent_tokens, auto_recent_tokens, "recent",
+        out.recent_target_tokens, out.recent_blocks,
+        out.recent_effective_tokens, out.recent_source);
+
+    if (out.sink_blocks > budget_blocks ||
+        out.recent_blocks > budget_blocks ||
+        static_cast<uint64_t>(out.sink_blocks) + out.recent_blocks >
+            budget_blocks) {
+        throw std::runtime_error(
+            "KVMem sink + recent allocation exceeds the selection budget");
+    }
+    return out;
+}
 
 void KvMemStore::register_append(uint32_t n_new_tokens) {
     if (n_new_tokens == 0) return;

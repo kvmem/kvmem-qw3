@@ -8010,7 +8010,9 @@ public:
                                                        uint32_t excl_hi_begin,
                                                        uint32_t n_subblocks,
                                                        uint32_t reduce_max,
-                                                       uint32_t accumulate) override {
+                                                       uint32_t accumulate,
+                                                       uint64_t q_elem_off,
+                                                       uint64_t kbar_elem_off) override {
         if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
             head_dim == 0) {
             return {};
@@ -8018,12 +8020,38 @@ public:
         auto &sc = as_tensor(score);
         const auto &qm = as_tensor(q_multi);
         const auto &kb = as_tensor(kbar_multi);
+        const uint64_t q_row_elems =
+            static_cast<uint64_t>(n_heads) * head_dim;
+        const uint64_t q_rows_needed =
+            static_cast<uint64_t>(n_layers - 1) * q_layer_stride +
+            n_tokens;
+        const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
+        const uint64_t kbar_block_elems =
+            static_cast<uint64_t>(ns) * n_kv_heads * head_dim;
+        const uint64_t kbar_blocks_needed =
+            static_cast<uint64_t>(n_layers - 1) * kbar_layer_stride +
+            n_blocks;
+        if (q_elem_off > qm.count || kbar_elem_off > kb.count ||
+            q_row_elems == 0 || kbar_block_elems == 0 ||
+            q_rows_needed > (qm.count - q_elem_off) / q_row_elems ||
+            kbar_blocks_needed >
+                (kb.count - kbar_elem_off) / kbar_block_elems) {
+            return {false, "block_attn_score_softmax_pages element offset out of range"};
+        }
+        const auto *q_bytes =
+            reinterpret_cast<const unsigned char *>(qm.ptr);
+        const auto *kbar_bytes =
+            reinterpret_cast<const unsigned char *>(kb.ptr);
+        const void *q_ptr =
+            q_bytes + static_cast<size_t>(q_elem_off) * qm.elem_size;
+        const void *kbar_ptr =
+            kbar_bytes + static_cast<size_t>(kbar_elem_off) * kb.elem_size;
         const ported::KbarDType kbar_dtype =
             kb.is_fp8_kv() ? ported::KbarDType::FP8
                            : kb.is_fp16() ? ported::KbarDType::F16
                                          : ported::KbarDType::F32;
         if (!ported::launch_block_attn_score_softmax_pages_typed(
-                sc.ptr, qm.ptr, qm.is_fp16(), kb.ptr, kbar_dtype,
+                sc.ptr, q_ptr, qm.is_fp16(), kbar_ptr, kbar_dtype,
                 n_layers, n_tokens,
                 q_layer_stride,
                 n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,

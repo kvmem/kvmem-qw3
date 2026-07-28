@@ -160,6 +160,35 @@ enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMea
 enum class KvMemSubblockReduce : uint8_t { Sum = 0, Max = 1 };
 enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
 enum class KvMemDeltaNetLayerPolicy : uint8_t { Even = 0, Late = 1 };
+
+enum class KvMemKeepSource : uint8_t {
+    Auto = 0,
+    Tokens = 1,
+    Blocks = 2,
+};
+
+struct KvMemKeepAllocation {
+    uint32_t sink_target_tokens = 0;
+    uint32_t recent_target_tokens = 0;
+    uint32_t sink_blocks = 0;
+    uint32_t recent_blocks = 0;
+    uint32_t sink_effective_tokens = 0;
+    uint32_t recent_effective_tokens = 0;
+    KvMemKeepSource sink_source = KvMemKeepSource::Auto;
+    KvMemKeepSource recent_source = KvMemKeepSource::Auto;
+};
+
+// Resolve token-based always-kept bands after both the selection budget and
+// physical block size are known. A negative explicit value means "auto".
+// Explicit token and block values are mutually exclusive for each band.
+KvMemKeepAllocation resolve_kvmem_keep_allocation(
+    uint32_t block_tokens,
+    uint32_t select_budget,
+    int64_t sink_blocks,
+    int64_t recent_blocks,
+    int64_t sink_tokens,
+    int64_t recent_tokens);
+
 // Monotonic research profiles for storage/tiering performance comparisons.
 // KvmemInit is the committed compatibility baseline. Each later level contains
 // all earlier optimizations; a build must reject a level whose implementation

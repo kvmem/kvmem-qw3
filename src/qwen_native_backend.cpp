@@ -6060,10 +6060,16 @@ private:
             static_cast<uint32_t>(std::max(1, options_.kvmem_budget));
         bs_cfg.gen_budget =
             static_cast<uint32_t>(std::max(1, options_.kvmem_gen_budget));
-        bs_cfg.sink_blocks =
-            static_cast<uint32_t>(std::max(0, options_.kvmem_sink_blocks));
-        bs_cfg.recent_blocks =
-            static_cast<uint32_t>(std::max(0, options_.kvmem_recent_blocks));
+        const KvMemKeepAllocation keep =
+            resolve_kvmem_keep_allocation(
+                bs_cfg.block_tokens,
+                bs_cfg.select_budget,
+                options_.kvmem_sink_blocks,
+                options_.kvmem_recent_blocks,
+                options_.kvmem_sink_tokens,
+                options_.kvmem_recent_tokens);
+        bs_cfg.sink_blocks = keep.sink_blocks;
+        bs_cfg.recent_blocks = keep.recent_blocks;
         bs_cfg.retrieval_blocks =
             static_cast<uint32_t>(std::max(0, options_.kvmem_retrieval_blocks));
         bs_cfg.profile_blocks =

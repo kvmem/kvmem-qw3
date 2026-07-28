@@ -241,6 +241,37 @@ def evidence_for_sample(
             )
         return answer, verification, "membership evidence for both target rounds"
 
+    if task == "Find Target Offsets(Tool)":
+        round_number = int(sample_field(sample, "i_round"))
+        tool = preceding_tool(records, feedback_record(records, round_number))
+        guess = str(sample_field(sample, "guess_name"))
+        answers = [str(value) for value in sample_field(sample, "answer")]
+        start = tool["content"].find(guess)
+        if start < 0:
+            raise RuntimeError(
+                f"round {round_number} tool result is missing guess {guess!r}"
+            )
+        cursor = start + len(guess)
+        for answer in answers:
+            found = tool["content"].find(answer, cursor)
+            if found < 0:
+                raise RuntimeError(
+                    f"round {round_number} result is missing successor "
+                    f"{answer!r} after {guess!r}"
+                )
+            cursor = found + len(answer)
+        answer_span = subspan(
+            tool,
+            start,
+            cursor,
+            f"round_{round_number}_guess_and_successors",
+        )
+        return (
+            [answer_span],
+            [whole_content(tool, f"round_{round_number}_complete_tool_result")],
+            "guessed item through the two requested successors",
+        )
+
     if task == "Count Correctness(Env)":
         round_number = int(sample_field(sample, "round"))
         span = sections_span(

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <vector>
 
 using namespace qw3;
@@ -315,6 +316,98 @@ static void test_topk_zero_recent_keeps_no_suffix() {
     CHECK(std::find(sel.begin(), sel.end(), 5) != sel.end());
     CHECK(std::find(sel.begin(), sel.end(), 6) != sel.end());
     CHECK(std::find(sel.begin(), sel.end(), 9) == sel.end());
+}
+
+static void test_budget_scaled_keep_allocation() {
+    {
+        const auto keep = resolve_kvmem_keep_allocation(
+            /*block_tokens=*/32,
+            /*select_budget=*/32 * 1024,
+            /*sink_blocks=*/-1,
+            /*recent_blocks=*/-1,
+            /*sink_tokens=*/-1,
+            /*recent_tokens=*/-1);
+        CHECK(keep.sink_target_tokens == 1024);
+        CHECK(keep.recent_target_tokens == 4096);
+        CHECK(keep.sink_blocks == 32);
+        CHECK(keep.recent_blocks == 128);
+        CHECK(keep.sink_effective_tokens == 1024);
+        CHECK(keep.recent_effective_tokens == 4096);
+        CHECK(keep.sink_source == KvMemKeepSource::Auto);
+        CHECK(keep.recent_source == KvMemKeepSource::Auto);
+    }
+    {
+        const auto keep = resolve_kvmem_keep_allocation(
+            /*block_tokens=*/512,
+            /*select_budget=*/224 * 1024,
+            -1, -1, -1, -1);
+        CHECK(keep.sink_target_tokens == 2048);
+        CHECK(keep.recent_target_tokens == 16384);
+        CHECK(keep.sink_blocks == 4);
+        CHECK(keep.recent_blocks == 32);
+    }
+    {
+        const auto keep = resolve_kvmem_keep_allocation(
+            /*block_tokens=*/1024,
+            /*select_budget=*/224 * 1024,
+            -1, -1, -1, -1);
+        CHECK(keep.sink_blocks == 2);
+        CHECK(keep.recent_blocks == 16);
+    }
+    {
+        // Explicit block values preserve historical experiments byte-for-byte.
+        const auto keep = resolve_kvmem_keep_allocation(
+            /*block_tokens=*/512,
+            /*select_budget=*/224 * 1024,
+            /*sink_blocks=*/8,
+            /*recent_blocks=*/0,
+            /*sink_tokens=*/-1,
+            /*recent_tokens=*/-1);
+        CHECK(keep.sink_blocks == 8);
+        CHECK(keep.recent_blocks == 0);
+        CHECK(keep.sink_effective_tokens == 4096);
+        CHECK(keep.recent_effective_tokens == 0);
+        CHECK(keep.sink_source == KvMemKeepSource::Blocks);
+        CHECK(keep.recent_source == KvMemKeepSource::Blocks);
+    }
+    {
+        // Explicit token values are rounded up independently of block size.
+        const auto keep = resolve_kvmem_keep_allocation(
+            /*block_tokens=*/512,
+            /*select_budget=*/32 * 1024,
+            /*sink_blocks=*/-1,
+            /*recent_blocks=*/-1,
+            /*sink_tokens=*/1025,
+            /*recent_tokens=*/4097);
+        CHECK(keep.sink_blocks == 3);
+        CHECK(keep.recent_blocks == 9);
+        CHECK(keep.sink_effective_tokens == 1536);
+        CHECK(keep.recent_effective_tokens == 4608);
+        CHECK(keep.sink_source == KvMemKeepSource::Tokens);
+        CHECK(keep.recent_source == KvMemKeepSource::Tokens);
+    }
+
+    bool conflict_threw = false;
+    try {
+        (void)resolve_kvmem_keep_allocation(
+            32, 32 * 1024,
+            /*sink_blocks=*/1, /*recent_blocks=*/-1,
+            /*sink_tokens=*/1024, /*recent_tokens=*/-1);
+    } catch (const std::runtime_error &) {
+        conflict_threw = true;
+    }
+    CHECK(conflict_threw);
+
+    bool budget_threw = false;
+    try {
+        (void)resolve_kvmem_keep_allocation(
+            1024, 32 * 1024,
+            /*sink_blocks=*/20, /*recent_blocks=*/20,
+            /*sink_tokens=*/-1, /*recent_tokens=*/-1);
+    } catch (const std::runtime_error &) {
+        budget_threw = true;
+    }
+    CHECK(budget_threw);
 }
 
 static void test_topk_mandatory_blocks_stay_inside_budget() {
@@ -666,6 +759,7 @@ int main() {
     test_hierarchical_reuse_ablation_forces_full_reload();
     test_topk_budget_sink_recent();
     test_topk_zero_recent_keeps_no_suffix();
+    test_budget_scaled_keep_allocation();
     test_topk_mandatory_blocks_stay_inside_budget();
     test_prefill_pressure_sink_full_recent_tail();
     test_prefill_pressure_edges();

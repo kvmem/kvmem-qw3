@@ -22,7 +22,9 @@
     "agentlongbench_kvmem_64k_b32_lmeparams_thinking4k_trace_20260716",
     "agentlongbench_512k_cross_task16_k224k_b32_20260720_original",
     "agentlongbench_512k_cross_task16_k224k_b32_20260720_query_replay",
-    "agentlongbench_512k_normal100_k224k_fp16_length_retry1_merged_20260725"
+    "agentlongbench_512k_normal100_k224k_fp16_length_retry1_merged_20260725",
+    "agentlongbench_1m_ds50_k224k_g32k_b32_meank_kvfp8_idxqfp16_canonical_refresh1_t06_think8k_cpu_all_on_gpuratio050_20260726_235009",
+    "agentlongbench_1m_full50_k224k_g32k_b1024_sb32max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727"
   ],
   "runs": {
     "kvmem_500_eval_20260703_164509": {
@@ -100,6 +102,18 @@
     "agentlongbench_512k_normal100_k224k_fp16_length_retry1_merged_20260725": {
       "label": "AgentLongBench 512K 100 条，FP16，失败样本重试合并",
       "note": "派生最终结果：以同配置重试替换原运行中 5 个 length 样本后重新执行官方评测；仍有 3 个 length。"
+    },
+    "agentlongbench_1m_ds50_k224k_g32k_b32_meank_kvfp8_idxqfp16_canonical_refresh1_t06_think8k_cpu_all_on_gpuratio050_20260726_235009": {
+      "label": "AgentLongBench 1M 50 条，B32 Mean-K",
+      "note": "1M canonical50 的细粒度 block 基线；与 B1024/SB32-Max、B512/SB16-Max 使用相同样本 ID。"
+    },
+    "agentlongbench_1m_full50_k224k_g32k_b1024_sb32max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727": {
+      "label": "AgentLongBench 1M 50 条，B1024/SB32-Max",
+      "note": "1024-token physical block，32 个 32-token subblock 取 max；全量 50 条验证通过。"
+    },
+    "agentlongbench_1m_full50_k224k_g32k_b512_sb16max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727": {
+      "label": "AgentLongBench 1M 50 条，B512/SB16-Max",
+      "note": "512-token physical block，16 个 32-token subblock 取 max；未生成通过的 validation_report 前只能引用为进行中结果。"
     }
   }
 }

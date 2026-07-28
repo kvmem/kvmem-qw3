@@ -10005,6 +10005,200 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             }
         }
     }
+    // DIAGNOSTIC (default OFF): score the same live query/index once per normal
+    // attention layer and preserve each layer's complete block ranking. This is
+    // deliberately done after the production selection: it never mutates the
+    // block store's retrieval scores or selection, and costs one additional
+    // all-layer scorer pass rather than repeating the long prefill L times.
+    //
+    // The diagnostic currently requires the ordinary full-device query buffer.
+    // AgentLongBench's final questions are well below the 256-token threshold;
+    // unusually long queries use the host-streaming scorer and are skipped with
+    // an explicit message instead of silently dumping incomplete layer scores.
+    if (const char *layer_dump_path =
+            std::getenv("QW3_KVMEM_DUMP_LAYER_SCORES")) {
+        static uint32_t kvmem_layer_dump_seq = 0;
+        static uint32_t kvmem_layer_dump_last_qb = 0xffffffffu;
+        static uint32_t kvmem_layer_dump_last_qe = 0xffffffffu;
+        static std::string kvmem_layer_dump_last_tag;
+        const bool request_is_new = !kvmem_trace_tag_.empty()
+            ? kvmem_trace_tag_ != kvmem_layer_dump_last_tag
+            : (kvmem_query_begin_ != kvmem_layer_dump_last_qb ||
+               kvmem_query_end_ != kvmem_layer_dump_last_qe);
+        const bool final_trace_event = kvmem_trace_event_count_ == 0 ||
+            kvmem_trace_event_index_ + 1 == kvmem_trace_event_count_;
+        const bool mean_k_ready =
+            !kvmem_qc_deltanet_ && !kvmem_qc_pertoken_ &&
+            g_kbar_multi_ready_ && g_query_multi_ready_ &&
+            g_kbar_multi_blocks_ > 0 && g_query_multi_count_ > 0 &&
+            g_score_dev_;
+        const bool supported =
+            mean_k_ready && !kvmem_query_host_capture_ &&
+            std::strcmp(scorer_used, "mean-k") == 0;
+        const bool span_is_new = supported && final_trace_event &&
+            kvmem_query_end_ > kvmem_query_begin_ && request_is_new;
+        if (mean_k_ready && !supported && request_is_new && final_trace_event &&
+            kvmem_query_end_ > kvmem_query_begin_) {
+            std::fprintf(
+                stderr,
+                "[kvmem-layer-dump] skipped tag=%s reason=%s\n",
+                kvmem_trace_tag_.empty() ? "-" : kvmem_trace_tag_.c_str(),
+                kvmem_query_host_capture_
+                    ? "host_streaming_query_not_supported"
+                    : "mean_k_query_or_index_not_ready");
+        }
+        if (span_is_new) {
+            const QwenConfig &model_cfg = model_.config();
+            const KvMemStoreConfig &store_cfg = block_store_->config();
+            const auto &blocks = block_store_->blocks();
+            const uint32_t L = kvmem_qc_num_layers_;
+            const uint32_t M = g_query_multi_count_;
+            const uint32_t S = kvmem_query_span_;
+            const uint32_t nb = g_kbar_multi_blocks_;
+            const uint32_t ns = std::max<uint32_t>(
+                1, kvmem_qc_n_subblocks_);
+            const uint32_t kbar_stride =
+                kvmem_qc_layer_stride_blocks_ != 0
+                    ? kvmem_qc_layer_stride_blocks_
+                    : nb;
+            const float sm_scale =
+                1.0f / std::sqrt(static_cast<float>(model_cfg.head_dim));
+
+            uint32_t excl_lo_end = 0;
+            uint32_t excl_hi_begin = UINT32_MAX;
+            const char *mask_env = std::getenv("QW3_KVMEM_MASK_KEPT");
+            const bool mask_on =
+                !(mask_env && std::string(mask_env) == "0");
+            const uint32_t budget = block_store_->budget_blocks();
+            if (mask_on && budget > 0 && nb > budget) {
+                const uint32_t sink =
+                    std::min(store_cfg.sink_blocks, nb);
+                const uint32_t recent =
+                    std::min(store_cfg.recent_blocks, nb);
+                if (sink + recent < nb) {
+                    excl_lo_end = sink;
+                    excl_hi_begin = nb - recent;
+                }
+            }
+
+            std::vector<std::vector<float>> layer_scores;
+            layer_scores.reserve(L);
+            std::string failure;
+            for (uint32_t slot = 0; slot < L; ++slot) {
+                const uint64_t q_elem_off =
+                    static_cast<uint64_t>(slot) * S *
+                    model_cfg.n_heads * model_cfg.head_dim;
+                const uint64_t kbar_elem_off =
+                    static_cast<uint64_t>(slot) * kbar_stride * ns *
+                    model_cfg.n_kv_heads * model_cfg.head_dim;
+                if (auto st =
+                        backend_.block_attn_score_softmax_pages_device(
+                            *g_score_dev_, *g_query_multi_,
+                            *g_kbar_multi_,
+                            /*n_layers=*/1, M,
+                            /*q_layer_stride=*/S, nb,
+                            /*kbar_layer_stride=*/kbar_stride,
+                            model_cfg.n_heads, model_cfg.n_kv_heads,
+                            model_cfg.head_dim, sm_scale,
+                            excl_lo_end, excl_hi_begin, ns,
+                            kvmem_qc_subblock_max_ ? 1u : 0u,
+                            /*accumulate=*/0, q_elem_off,
+                            kbar_elem_off);
+                    !st.ok) {
+                    failure = "layer_" + std::to_string(slot) +
+                        "_score_failed:" + st.message;
+                    break;
+                }
+                std::vector<float> score(nb, 0.0f);
+                if (auto cp = backend_.copy_to_host(
+                        *g_score_dev_, score.data(), 0, nb);
+                    !cp.ok) {
+                    failure = "layer_" + std::to_string(slot) +
+                        "_d2h_failed:" + cp.message;
+                    break;
+                }
+                layer_scores.push_back(std::move(score));
+            }
+
+            if (!failure.empty()) {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-layer-dump] failed tag=%s reason=%s\n",
+                    kvmem_trace_tag_.empty()
+                        ? "-" : kvmem_trace_tag_.c_str(),
+                    failure.c_str());
+            } else if (std::FILE *f =
+                           std::fopen(layer_dump_path, "a")) {
+                uint32_t selected = 0;
+                for (const auto &block : blocks) {
+                    selected += block.in_working_set ? 1u : 0u;
+                }
+                std::fprintf(
+                    f,
+                    "{\"type\":\"sample\",\"schema_version\":"
+                    "\"qw3_kvmem_layer_score_dump.v1\",\"seq\":%u,"
+                    "\"trace_tag\":\"%s\",\"block_count\":%u,"
+                    "\"layer_count\":%u,\"query_begin\":%u,"
+                    "\"query_end\":%u,\"prompt_tokens\":%zu,"
+                    "\"budget_blocks\":%u,\"selected\":%u,"
+                    "\"sink\":%u,\"recent\":%u,\"pin_from_block\":%u,"
+                    "\"block_tokens\":%u,\"subblocks\":%u,"
+                    "\"subblock_reduce\":\"%s\","
+                    "\"mask_excl_lo_end\":%u,"
+                    "\"mask_excl_hi_begin\":%u,\"blocks\":[",
+                    kvmem_layer_dump_seq, kvmem_trace_tag_.c_str(), nb,
+                    L, kvmem_query_begin_, kvmem_query_end_,
+                    kvmem_trace_prompt_tokens_.size(), budget, selected,
+                    store_cfg.sink_blocks, store_cfg.recent_blocks,
+                    kvmem_qc_pin_from_block_, store_cfg.block_tokens, ns,
+                    kvmem_qc_subblock_max_ ? "max" : "sum",
+                    excl_lo_end, excl_hi_begin);
+                for (uint32_t id = 0; id < nb; ++id) {
+                    if (id != 0) std::fputc(',', f);
+                    const auto &block = blocks[id];
+                    std::fprintf(
+                        f, "[%u,%u,%u,%u]", block.block_id,
+                        block.orig_pos_start, block.n_tokens,
+                        block.in_working_set ? 1u : 0u);
+                }
+                std::fprintf(f, "]}\n");
+                for (uint32_t slot = 0; slot < L; ++slot) {
+                    const int32_t actual_layer =
+                        slot < std_layers_.size()
+                            ? static_cast<int32_t>(std_layers_[slot])
+                            : -1;
+                    std::fprintf(
+                        f,
+                        "{\"type\":\"layer\",\"seq\":%u,\"slot\":%u,"
+                        "\"layer\":%d,\"scores\":[",
+                        kvmem_layer_dump_seq, slot, actual_layer);
+                    const auto &score = layer_scores[slot];
+                    for (uint32_t id = 0; id < nb; ++id) {
+                        if (id != 0) std::fputc(',', f);
+                        std::fprintf(f, "%.9g", score[id]);
+                    }
+                    std::fprintf(f, "]}\n");
+                }
+                std::fclose(f);
+                std::fprintf(
+                    stderr,
+                    "[kvmem-layer-dump] wrote tag=%s layers=%u blocks=%u "
+                    "path=%s\n",
+                    kvmem_trace_tag_.empty()
+                        ? "-" : kvmem_trace_tag_.c_str(),
+                    L, nb, layer_dump_path);
+                kvmem_layer_dump_last_qb = kvmem_query_begin_;
+                kvmem_layer_dump_last_qe = kvmem_query_end_;
+                kvmem_layer_dump_last_tag = kvmem_trace_tag_;
+                ++kvmem_layer_dump_seq;
+            } else {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-layer-dump] failed to open path=%s\n",
+                    layer_dump_path);
+            }
+        }
+    }
     if (tm) {
         require_status(backend_.synchronize());
         const uint64_t t_sel1 = kvmem_steady_ns();
@@ -11037,7 +11231,9 @@ void QwenExecutor::kvmem_set_trace_metadata(
     const bool valid_context_span = context_end > context_begin &&
         context_end <= prompt_tokens.size();
     const bool whole_prompt_trace = context_begin == 0 && context_end == 0;
-    if (std::getenv("QW3_KVMEM_DUMP_SCORES") && !trace_tag.empty() &&
+    if ((std::getenv("QW3_KVMEM_DUMP_SCORES") ||
+         std::getenv("QW3_KVMEM_DUMP_LAYER_SCORES")) &&
+        !trace_tag.empty() &&
         (valid_context_span || whole_prompt_trace)) {
         kvmem_trace_prompt_tokens_ = prompt_tokens;
     } else {

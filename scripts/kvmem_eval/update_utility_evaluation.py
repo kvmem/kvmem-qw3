@@ -28,7 +28,15 @@ DEFAULT_OVERRIDES = Path(__file__).with_name("utility_eval_overrides.json")
 DEFAULT_AGENT_BASELINES = Path("/home/chaidi/AgentLongBench_Motivation/outputs")
 DEFAULT_LONGMEM_BASELINES = Path("/home/chaidi/kvmem_eval/KVMem_Motivation/outputs")
 
-ID_KEYS = ("question_id", "sample_id", "id", "index", "instance_id", "task_id")
+ID_KEYS = (
+    "stable_sample_id",
+    "question_id",
+    "sample_id",
+    "id",
+    "index",
+    "instance_id",
+    "task_id",
+)
 CORRECT_KEYS = ("correct", "is_correct", "exact_correct")
 PARAM_KEYS = (
     "model",

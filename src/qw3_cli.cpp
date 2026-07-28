@@ -98,8 +98,13 @@ void usage(std::ostream &os) {
         "                        size). Default: 128.\n"
         "  --kvmem-budget N  Max window tokens kept per selection. Default: 131072.\n"
         "  --kvmem-interval N  Decode steps between reselections. Default: 64.\n"
-        "  --kvmem-sink-blocks N    Always-kept prefix blocks. Default: 1.\n"
-        "  --kvmem-recent-blocks N  Always-kept suffix blocks (0 = none). Default: 0.\n"
+        "  --kvmem-sink-tokens N    Always-kept prefix tokens (rounded to blocks).\n"
+        "  --kvmem-recent-tokens N  Always-kept suffix tokens (rounded to blocks).\n"
+        "                        Defaults derive from --kvmem-budget: sink=clamp(1%,\n"
+        "                        1K,2K), recent=clamp(8%,4K,16K).\n"
+        "  --kvmem-sink-blocks N    Compatibility override in physical blocks.\n"
+        "  --kvmem-recent-blocks N  Compatibility override in physical blocks.\n"
+        "                        Token and block forms are mutually exclusive.\n"
         "  --kvmem-method M  Block selection signal: retrieval|h2o|recency.\n"
         "                        Default: retrieval.\n"
         "  --kvmem-select-policy M  Selection policy: topk|quota. Default: topk.\n"
@@ -391,10 +396,54 @@ int main(int argc, char **argv) {
                 engine.kvmem_gen_budget = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-interval") {
                 engine.kvmem_interval = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-sink-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-sink-tokens must be >= 0");
+                }
+                if (engine.kvmem_sink_blocks >= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-sink-tokens cannot be combined with "
+                        "--kvmem-sink-blocks");
+                }
+                engine.kvmem_sink_tokens = value;
+            } else if (arg == "--kvmem-recent-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-recent-tokens must be >= 0");
+                }
+                if (engine.kvmem_recent_blocks >= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-recent-tokens cannot be combined with "
+                        "--kvmem-recent-blocks");
+                }
+                engine.kvmem_recent_tokens = value;
             } else if (arg == "--kvmem-sink-blocks") {
-                engine.kvmem_sink_blocks = parse_int(need(arg), arg);
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-sink-blocks must be >= 0");
+                }
+                if (engine.kvmem_sink_tokens >= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-sink-blocks cannot be combined with "
+                        "--kvmem-sink-tokens");
+                }
+                engine.kvmem_sink_blocks = value;
             } else if (arg == "--kvmem-recent-blocks") {
-                engine.kvmem_recent_blocks = parse_int(need(arg), arg);
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-recent-blocks must be >= 0");
+                }
+                if (engine.kvmem_recent_tokens >= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-recent-blocks cannot be combined with "
+                        "--kvmem-recent-tokens");
+                }
+                engine.kvmem_recent_blocks = value;
             } else if (arg == "--kvmem-method") {
                 engine.kvmem_method = need(arg);
                 if (engine.kvmem_method != "retrieval" &&

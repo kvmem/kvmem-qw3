@@ -1104,11 +1104,14 @@ public:
                                                                uint32_t excl_hi_begin = UINT32_MAX,
                                                                uint32_t n_subblocks = 1,
                                                                uint32_t reduce_max = 0,
-                                                               uint32_t accumulate = 0) {
+                                                               uint32_t accumulate = 0,
+                                                               uint64_t q_elem_off = 0,
+                                                               uint64_t kbar_elem_off = 0) {
         (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
         (void)q_layer_stride; (void)n_blocks; (void)kbar_layer_stride; (void)n_heads;
         (void)n_kv_heads; (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
-        (void)n_subblocks; (void)reduce_max; (void)accumulate;
+        (void)n_subblocks; (void)reduce_max; (void)accumulate; (void)q_elem_off;
+        (void)kbar_elem_off;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 

@@ -3,6 +3,7 @@
 #include "env_flags.hpp"
 #include "qw3/qw3.hpp"
 #include "qw3/gguf.hpp"
+#include "qw3/kvmem_store.hpp"
 #include "qw3/tokenizer.hpp"
 
 // Vendored single-header deps (included as SYSTEM headers via CMake so their
@@ -1081,6 +1082,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             ? "legacy"
             : (engine.kvmem_optimize_off.empty()
                    ? "default-all-on" : "feature-ablation");
+    const KvMemKeepAllocation kvmem_keep =
+        resolve_kvmem_keep_allocation(
+            static_cast<uint32_t>(std::max(1, engine.kvmem_block_tokens)),
+            static_cast<uint32_t>(std::max(1, engine.kvmem_budget)),
+            engine.kvmem_sink_blocks,
+            engine.kvmem_recent_blocks,
+            engine.kvmem_sink_tokens,
+            engine.kvmem_recent_tokens);
+    auto keep_source_name = [](KvMemKeepSource source) {
+        switch (source) {
+            case KvMemKeepSource::Tokens: return "tokens";
+            case KvMemKeepSource::Blocks: return "blocks";
+            case KvMemKeepSource::Auto: return "auto";
+        }
+        return "unknown";
+    };
     std::cerr << "[qw3-serve] effective serving parameters:\n"
               << "  host=" << cfg.host << "\n"
               << "  port=" << cfg.port << "\n"
@@ -1158,8 +1175,18 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << yesno(engine.kvmem_immutable_source_k) << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
-              << "  kvmem_sink_blocks=" << engine.kvmem_sink_blocks << "\n"
-              << "  kvmem_recent_blocks=" << engine.kvmem_recent_blocks << "\n"
+              << "  kvmem_sink="
+              << kvmem_keep.sink_effective_tokens << " tokens / "
+              << kvmem_keep.sink_blocks << " blocks"
+              << " (target=" << kvmem_keep.sink_target_tokens
+              << ", source=" << keep_source_name(kvmem_keep.sink_source)
+              << ")\n"
+              << "  kvmem_recent="
+              << kvmem_keep.recent_effective_tokens << " tokens / "
+              << kvmem_keep.recent_blocks << " blocks"
+              << " (target=" << kvmem_keep.recent_target_tokens
+              << ", source=" << keep_source_name(kvmem_keep.recent_source)
+              << ")\n"
               << "  kvmem_gpu_memory_ratio=" << engine.kvmem_gpu_memory_ratio << "\n"
               << "  kvmem_cpu_tier=" << engine.kvmem_cpu_bytes
               << " bytes (" << bytes_gib_label(engine.kvmem_cpu_bytes) << ")\n"

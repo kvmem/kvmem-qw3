@@ -944,8 +944,10 @@ KVMem CLI parameters:
 | `--kvmem` | off | Enable KVMem block-sparse KV attention. Without this flag the normal forward path is used. |
 | `--kvmem-block-tokens N` | `128` | KV block granularity in tokens. Must be a positive multiple of the KV page size. |
 | `--kvmem-budget N` | `131072` | Maximum selected working-set window per selection, in tokens. Approximate selected block count is `budget / block_tokens`. |
-| `--kvmem-sink-blocks N` | `1` | Always keep the first N blocks for attention-sink behavior. |
-| `--kvmem-recent-blocks N` | `0` | Always keep the most recent N blocks. `0` keeps no suffix block unconditionally. |
+| `--kvmem-sink-tokens N` | auto | Always-kept prefix target in tokens, rounded up to physical blocks. The automatic target is `clamp(1% × budget, 1K, 2K)`. |
+| `--kvmem-recent-tokens N` | auto | Always-kept suffix target in tokens, rounded up to physical blocks. The automatic target is `clamp(8% × budget, 4K, 16K)`. |
+| `--kvmem-sink-blocks N` | unset | Compatibility override in physical blocks. Mutually exclusive with `--kvmem-sink-tokens`. |
+| `--kvmem-recent-blocks N` | unset | Compatibility override in physical blocks. Mutually exclusive with `--kvmem-recent-tokens`; `0` explicitly keeps no suffix. |
 | `--kvmem-method M` | `retrieval` | Selection signal: `retrieval`, `h2o`, or `recency`. |
 | `--kvmem-retrieval-method M` | `mean_attention` | Retrieval scorer: `mean_attention` or `content_mean`. |
 | `--kvmem-query-conditioned` | off | Score blocks by the multi-token mean of the final user message (the question) against each block's mean-k, instead of falling back to a recency window. Default-OFF, byte-identical when unset. Required for the LongMemEval benchmark below. |
