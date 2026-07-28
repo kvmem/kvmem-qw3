@@ -53,7 +53,9 @@ The source implementation includes:
 - memory-budget-capped layer selection, including even and late-layer policies;
 - score-dump and answer-session block-recall diagnostics.
 
-The original design discussion remains in `deltanet_retrieval.md`; this document
+The original design discussion remains in
+[`kvmem_deltanet_retrieval_design.md`](kvmem_deltanet_retrieval_design.md);
+this document
 records the implementation outcome and current product decision.
 
 ## Experimental Findings

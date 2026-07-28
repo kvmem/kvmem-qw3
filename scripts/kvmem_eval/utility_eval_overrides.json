@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "headline_runs": [
+    "kvmem_500_eval_20260703_164509",
+    "lme_s_baseline_eval_20260704_160401",
+    "s500_32k_r05_current_eval_20260706_235207",
+    "s500_64k_r05_current_eval_20260706_150214",
+    "s500_32k_subblock4_eval_20260707_130225",
+    "s500_32k_pertoken_eval_20260708_135930",
+    "s500_32k_bt32_meank_unified_eval_20260712_143132",
+    "m102_2m_k224k_g32k_bt32_meank_r051_20260719_eval_20260719_063739",
+    "longmemeval_m_k224k_selected_text_control10_20260720",
+    "longmemeval_m_k224k_query_replay10_20260720_eval_20260720_054323",
+    "longmemeval_m_k224k_query_replay_immutable10_20260722_101213_eval_20260722_021400",
+    "longmemeval_m_k224k_query_replay_immutable_deltanet_refresh10_20260722",
+    "agentlongbench_baseline_fullcontext",
+    "agentlongbench_baseline_slidingwindow",
+    "agentlongbench_baseline_compactonly",
+    "agentlongbench_baseline_compactrag",
+    "agentlongbench_kvmem_32k_b32_exactparity_20260716",
+    "agentlongbench_kvmem_32k_b32_lmeparams_thinking4k_20260716",
+    "agentlongbench_kvmem_64k_b32_lmeparams_thinking4k_trace_20260716",
+    "agentlongbench_512k_cross_task16_k224k_b32_20260720_original",
+    "agentlongbench_512k_cross_task16_k224k_b32_20260720_query_replay",
+    "agentlongbench_512k_normal100_k224k_fp16_length_retry1_merged_20260725",
+    "agentlongbench_1m_ds50_k224k_g32k_b32_meank_kvfp8_idxqfp16_canonical_refresh1_t06_think8k_cpu_all_on_gpuratio050_20260726_235009",
+    "agentlongbench_1m_full50_k224k_g32k_b1024_sb32max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727"
+  ],
+  "runs": {
+    "kvmem_500_eval_20260703_164509": {
+      "label": "LongMemEval-S 早期 500 样本基线"
+    },
+    "lme_s_baseline_eval_20260704_160401": {
+      "label": "LongMemEval-S 500 样本复测基线"
+    },
+    "s500_32k_r05_current_eval_20260706_235207": {
+      "label": "LongMemEval-S，K=32K，早期统一参数"
+    },
+    "s500_64k_r05_current_eval_20260706_150214": {
+      "label": "LongMemEval-S，K=64K"
+    },
+    "s500_32k_subblock4_eval_20260707_130225": {
+      "label": "LongMemEval-S，K=32K，sub-block=4"
+    },
+    "s500_32k_pertoken_eval_20260708_135930": {
+      "label": "LongMemEval-S，K=32K，per-token"
+    },
+    "s500_32k_bt32_meank_unified_eval_20260712_143132": {
+      "label": "LongMemEval-S，K=32K，block=32，mean-k",
+      "note": "当前统一 runner 的 500 样本主结果。"
+    },
+    "s500_32k_bt16_meank_restart_eval_20260713_022205": {
+      "note": "历史 summary 的评分结果异常，不能把 2.4% 当作有效模型准确率；后续同一批 295 条重评为 86.10%。"
+    },
+    "s500_32k_bt16_meank_resume205_eval_20260713_080826": {
+      "note": "原始评分异常；应同时查看对应的 V4 Pro rejudge，而不是单独引用该行。"
+    },
+    "m102_2m_k224k_g32k_bt32_meank_r051_20260719_eval_20260719_063739": {
+      "label": "LongMemEval-M 102 样本，K=224K/G=32K"
+    },
+    "longmemeval_m_k224k_selected_text_control10_20260720": {
+      "label": "LongMemEval-M 错误 10 条，selected-text fresh prefill",
+      "note": "派生控制实验：固定 KVMem 已选 source tokens，解码成文本后重新 dense prefill；不是一次新的 retrieval 运行。"
+    },
+    "longmemeval_m_k224k_query_replay10_20260720_eval_20260720_054323": {
+      "label": "LongMemEval-M 错误 10 条，query replay"
+    },
+    "longmemeval_m_k224k_query_replay_immutable10_20260722_101213_eval_20260722_021400": {
+      "label": "LongMemEval-M 错误 10 条，query replay + immutable KV"
+    },
+    "longmemeval_m_k224k_query_replay_immutable_deltanet_refresh10_20260722": {
+      "label": "LongMemEval-M 错误 10 条，DeltaNet selected-state refresh",
+      "note": "研究性消融，DeltaNet rebuilt/refresh 已停用，不属于推荐默认配置。"
+    },
+    "agentlongbench_baseline_fullcontext": {
+      "label": "AgentLongBench 原仓库：FullContext"
+    },
+    "agentlongbench_baseline_slidingwindow": {
+      "label": "AgentLongBench 原仓库：Sliding Window 32K"
+    },
+    "agentlongbench_baseline_compactonly": {
+      "label": "AgentLongBench 原仓库：Compact only"
+    },
+    "agentlongbench_baseline_compactrag": {
+      "label": "AgentLongBench 原仓库：Compact + RAG"
+    },
+    "agentlongbench_kvmem_32k_b32_exactparity_20260716": {
+      "label": "AgentLongBench 250，K=32K，不开启 thinking"
+    },
+    "agentlongbench_kvmem_32k_b32_lmeparams_thinking4k_20260716": {
+      "label": "AgentLongBench 250，K=32K，thinking=4K"
+    },
+    "agentlongbench_kvmem_64k_b32_lmeparams_thinking4k_trace_20260716": {
+      "label": "AgentLongBench 250，K=64K，thinking=4K"
+    },
+    "agentlongbench_512k_cross_task16_k224k_b32_20260720_original": {
+      "label": "AgentLongBench 512K cross-task 16，原始"
+    },
+    "agentlongbench_512k_cross_task16_k224k_b32_20260720_query_replay": {
+      "label": "AgentLongBench 512K cross-task 16，query replay"
+    },
+    "agentlongbench_512k_normal100_k224k_fp16_length_retry1_merged_20260725": {
+      "label": "AgentLongBench 512K 100 条，FP16，失败样本重试合并",
+      "note": "派生最终结果：以同配置重试替换原运行中 5 个 length 样本后重新执行官方评测；仍有 3 个 length。"
+    },
+    "agentlongbench_1m_ds50_k224k_g32k_b32_meank_kvfp8_idxqfp16_canonical_refresh1_t06_think8k_cpu_all_on_gpuratio050_20260726_235009": {
+      "label": "AgentLongBench 1M 50 条，B32 Mean-K",
+      "note": "1M canonical50 的细粒度 block 基线；与 B1024/SB32-Max、B512/SB16-Max 使用相同样本 ID。"
+    },
+    "agentlongbench_1m_full50_k224k_g32k_b1024_sb32max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727": {
+      "label": "AgentLongBench 1M 50 条，B1024/SB32-Max",
+      "note": "1024-token physical block，32 个 32-token subblock 取 max；全量 50 条验证通过。"
+    },
+    "agentlongbench_1m_full50_k224k_g32k_b512_sb16max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727": {
+      "label": "AgentLongBench 1M 50 条，B512/SB16-Max",
+      "note": "512-token physical block，16 个 32-token subblock 取 max；未生成通过的 validation_report 前只能引用为进行中结果。"
+    }
+  }
+}

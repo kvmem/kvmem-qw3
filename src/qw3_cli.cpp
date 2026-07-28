@@ -20,9 +20,9 @@ namespace {
 
 void usage(std::ostream &os) {
     os <<
-        "Usage: qw3 --model MODEL.gguf -p PROMPT [options]\n"
-        "       qw3 serve --model MODEL.gguf [--port 8080] [options]\n"
-        "       qw3 kvmem-session --model MODEL.gguf [--session-ladder L] [options]\n"
+        "Usage: qw3 --model MODEL -p PROMPT [options]\n"
+        "       qw3 serve --model MODEL [--port 8080] [options]\n"
+        "       qw3 kvmem-session --model MODEL [--session-ladder L] [options]\n"
         "\n"
         "Serve (OpenAI-compatible HTTP API; loads model once, serves forever).\n"
         "  Default is the conservative baseline: one request at a time, FP16 KV,\n"
@@ -71,7 +71,7 @@ void usage(std::ostream &os) {
         "  --llama-cli PATH      llama.cpp llama-completion binary. Default: llama-completion\n"
         "  --llama-completion PATH\n"
         "                        Alias for --llama-cli\n"
-        "  -m, --model FILE      GGUF model path\n"
+        "  -m, --model PATH      GGUF file or HF safetensors model directory\n"
         "  -c, --ctx N           Context size. Default: 262144\n"
         "  -t, --threads N       llama.cpp CPU helper threads\n"
         "  -ngl N                GPU layers passed to llama.cpp. Default: -1\n"
@@ -79,6 +79,9 @@ void usage(std::ostream &os) {
         "  --native-heavy        Compatibility flag; native generation is enabled by default\n"
         "  --native-kernels NAME cuda. Default: cuda\n"
         "  --native-linear-backend NAME auto, cublas, or custom. Default: auto\n"
+        "  --cpu-embedding       Keep a BF16 input embedding table on CPU and\n"
+        "                        transfer only selected rows. Requires a separate\n"
+        "                        LM head. Default: off.\n"
         "  --native-mtp-trace    Run one optional MTP draft-head diagnostic\n"
         "  --native-mtp-chain N  Diagnostic MTP draft chain length. Default: 1\n"
         "  --native-mtp-prefix   Populate diagnostic MTP prefix KV before drafts\n"
@@ -98,8 +101,13 @@ void usage(std::ostream &os) {
         "                        size). Default: 128.\n"
         "  --kvmem-budget N  Max window tokens kept per selection. Default: 131072.\n"
         "  --kvmem-interval N  Decode steps between reselections. Default: 64.\n"
-        "  --kvmem-sink-blocks N    Always-kept prefix blocks. Default: 1.\n"
-        "  --kvmem-recent-blocks N  Always-kept suffix blocks (0 = none). Default: 0.\n"
+        "  --kvmem-sink-tokens N    Always-kept prefix tokens (rounded to blocks).\n"
+        "  --kvmem-recent-tokens N  Always-kept suffix tokens (rounded to blocks).\n"
+        "                        Defaults derive from --kvmem-budget: sink=clamp(1%,\n"
+        "                        1K,2K), recent=clamp(8%,4K,16K).\n"
+        "  --kvmem-sink-blocks N    Compatibility override in physical blocks.\n"
+        "  --kvmem-recent-blocks N  Compatibility override in physical blocks.\n"
+        "                        Token and block forms are mutually exclusive.\n"
         "  --kvmem-method M  Block selection signal: retrieval|h2o|recency.\n"
         "                        Default: retrieval.\n"
         "  --kvmem-select-policy M  Selection policy: topk|quota. Default: topk.\n"
@@ -118,9 +126,22 @@ void usage(std::ostream &os) {
         "  --kvmem-deltanet-topk-h N  TopKMean over DeltaNet heads. Default: 4.\n"
 #endif
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
+        "  --kvmem-optimization-level L  Deprecated cumulative compatibility profile:\n"
+        "                        kvmem_init|opt_1|opt_2|opt_3.\n"
+        "                        Cannot be combined with --kvmem-optimize-off.\n"
+        "  --kvmem-optimize-off NAME  Disable one default-on performance group.\n"
+        "                        Repeatable. NAME is proactive-stage-out,\n"
+        "                        hierarchical-reuse, packed-rematerialization,\n"
+        "                        or all. Default: none (all groups enabled).\n"
         "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
         "                        final user message (the question) instead of recency.\n"
         "                        Requires the serve layer to mark the query span.\n"
+        "  --no-kvmem-recompute-query  Do not replay the query after semantic\n"
+        "                        reselection. Default: replay is enabled.\n"
+        "  --kvmem-immutable-k  Keep unrotated K in a CPU mirror and one active GPU\n"
+        "                        K copy; periodically rebuild to bound re-RoPE drift.\n"
+        "                        Default: enabled.\n"
+        "  --no-kvmem-immutable-k  Use the legacy in-place K re-RoPE path.\n"
         "  --kvmem-retrieval-blocks N  Quota policy retrieval blocks (0 = derive).\n"
         "  --kvmem-profile-blocks N    Quota policy profile blocks (0 = derive).\n"
         "  --kvmem-gpu-memory-ratio F  GPU memory fraction for KVMem KV cap.\n"
@@ -138,6 +159,9 @@ void usage(std::ostream &os) {
         "                        new suffix when a prompt strictly extends the prior\n"
         "                        request (prompt+response). Requires --kvmem.\n"
         "                        Default: off.\n"
+        "  --kvmem-query-replay  Replay the final user query after query-conditioned\n"
+        "                        block selection. Requires --kvmem and\n"
+        "                        --kvmem-query-conditioned. Default: off.\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
@@ -340,6 +364,8 @@ int main(int argc, char **argv) {
                 engine.native_kernels = need(arg);
             } else if (arg == "--native-linear-backend") {
                 engine.native_linear_backend = need(arg);
+            } else if (arg == "--cpu-embedding") {
+                engine.cpu_embedding = true;
             } else if (arg == "--native-mtp-trace") {
                 engine.native_mtp_trace = true;
             } else if (arg == "--native-mtp-chain") {
@@ -378,10 +404,54 @@ int main(int argc, char **argv) {
                 engine.kvmem_gen_budget = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-interval") {
                 engine.kvmem_interval = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-sink-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-sink-tokens must be >= 0");
+                }
+                if (engine.kvmem_sink_blocks >= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-sink-tokens cannot be combined with "
+                        "--kvmem-sink-blocks");
+                }
+                engine.kvmem_sink_tokens = value;
+            } else if (arg == "--kvmem-recent-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-recent-tokens must be >= 0");
+                }
+                if (engine.kvmem_recent_blocks >= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-recent-tokens cannot be combined with "
+                        "--kvmem-recent-blocks");
+                }
+                engine.kvmem_recent_tokens = value;
             } else if (arg == "--kvmem-sink-blocks") {
-                engine.kvmem_sink_blocks = parse_int(need(arg), arg);
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-sink-blocks must be >= 0");
+                }
+                if (engine.kvmem_sink_tokens >= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-sink-blocks cannot be combined with "
+                        "--kvmem-sink-tokens");
+                }
+                engine.kvmem_sink_blocks = value;
             } else if (arg == "--kvmem-recent-blocks") {
-                engine.kvmem_recent_blocks = parse_int(need(arg), arg);
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--kvmem-recent-blocks must be >= 0");
+                }
+                if (engine.kvmem_recent_tokens >= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-recent-blocks cannot be combined with "
+                        "--kvmem-recent-tokens");
+                }
+                engine.kvmem_recent_blocks = value;
             } else if (arg == "--kvmem-method") {
                 engine.kvmem_method = need(arg);
                 if (engine.kvmem_method != "retrieval" &&
@@ -446,8 +516,41 @@ int main(int argc, char **argv) {
                     throw std::runtime_error(
                         "--kvmem-update-mode must be interval|step");
                 }
+            } else if (arg == "--kvmem-optimization-level") {
+                engine.kvmem_optimization_level = need(arg);
+                engine.kvmem_optimization_level_explicit = true;
+                const std::string &level = engine.kvmem_optimization_level;
+                if (level != "kvmem_init" && level != "opt_1" &&
+                    level != "opt_2" && level != "opt_3") {
+                    throw std::runtime_error(
+                        "--kvmem-optimization-level must be "
+                        "kvmem_init|opt_1|opt_2|opt_3");
+                }
+            } else if (arg == "--kvmem-optimize-off") {
+                const std::string name = need(arg);
+                if (name != "proactive-stage-out" &&
+                    name != "hierarchical-reuse" &&
+                    name != "packed-rematerialization" &&
+                    name != "all") {
+                    throw std::runtime_error(
+                        "--kvmem-optimize-off must be "
+                        "proactive-stage-out|hierarchical-reuse|"
+                        "packed-rematerialization|all");
+                }
+                bool duplicate = false;
+                for (const std::string &existing :
+                     engine.kvmem_optimize_off) {
+                    duplicate |= existing == name;
+                }
+                if (!duplicate) engine.kvmem_optimize_off.push_back(name);
             } else if (arg == "--kvmem-query-conditioned") {
                 engine.kvmem_query_conditioned = true;
+            } else if (arg == "--no-kvmem-recompute-query") {
+                engine.kvmem_recompute_query = false;
+            } else if (arg == "--kvmem-immutable-k") {
+                engine.kvmem_immutable_source_k = true;
+            } else if (arg == "--no-kvmem-immutable-k") {
+                engine.kvmem_immutable_source_k = false;
             } else if (arg == "--kvmem-retrieval-blocks") {
                 engine.kvmem_retrieval_blocks = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-profile-blocks") {
@@ -562,6 +665,8 @@ int main(int argc, char **argv) {
                 serve_cfg.prefix_cache = true;
             } else if (arg == "--kvmem-prefix-cache") {
                 serve_cfg.kvmem_prefix_cache = true;
+            } else if (arg == "--kvmem-query-replay") {
+                serve_cfg.kvmem_query_replay = true;
             } else if (arg == "--kv-dtype") {
                 const std::string dt = need(arg);
                 if (dt != "fp16" && dt != "fp32" && dt != "q8" && dt != "fp8") {
@@ -587,6 +692,22 @@ int main(int argc, char **argv) {
             } else {
                 throw std::runtime_error("unknown argument: " + arg);
             }
+        }
+
+        if (engine.kvmem_optimization_level_explicit &&
+            !engine.kvmem_optimize_off.empty()) {
+            throw std::runtime_error(
+                "--kvmem-optimization-level is a deprecated compatibility "
+                "profile and cannot be combined with --kvmem-optimize-off");
+        }
+        bool optimize_all_off = false;
+        for (const std::string &name : engine.kvmem_optimize_off) {
+            optimize_all_off |= name == "all";
+        }
+        if (optimize_all_off && engine.kvmem_optimize_off.size() != 1) {
+            throw std::runtime_error(
+                "--kvmem-optimize-off all cannot be combined with another "
+                "--kvmem-optimize-off value");
         }
 
         if (inspect || dump_tensors) {

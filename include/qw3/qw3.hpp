@@ -14,6 +14,27 @@ enum class BackendKind {
     QwenNative,
 };
 
+enum class KvMemReselectMode {
+    Auto,
+    Force,
+    Off,
+};
+
+enum class KvMemPrefillWindowMode {
+    Pressure,
+    KeepSelected,
+};
+
+// Diagnostics-only, one-shot selected-context rebuild. Off is the production
+// default. KvOnly refreshes normal-attention K/V in the compact selected
+// context while restoring the historical recurrent/conv state at the query
+// boundary; KvAndState rebuilds both representations from the selected text.
+enum class KvMemInlineRefreshMode {
+    Off,
+    KvOnly,
+    KvAndState,
+};
+
 struct EngineOptions {
     std::string model_path;
     BackendKind backend = BackendKind::QwenNative;
@@ -27,6 +48,10 @@ struct EngineOptions {
     int native_token_id = 0;
     std::string native_kernels = "cuda";
     std::string native_linear_backend = "auto";
+    // Keep a BF16 input embedding table in its mapped host checkpoint and
+    // stage only selected rows to CUDA. Opt-in because it trades a small
+    // host-gather / PCIe cost for substantially lower device memory use.
+    bool cpu_embedding = false;
     // Diagnostics: when non-empty, write a JSONL line per generated step
     // with the prompt tokens, decoded token, and top-k logits.
     std::string dump_logits_path;
@@ -57,8 +82,16 @@ struct EngineOptions {
     int kvmem_budget = 131072;    // max window tokens kept per selection
     int kvmem_gen_budget = 32768; // GPU pool reserve for generated tokens; also caps max_tokens
     int kvmem_interval = 64;      // decode steps between reselections
-    int kvmem_sink_blocks = 1;           // always-kept prefix blocks
-    int kvmem_recent_blocks = 0;         // always-kept suffix blocks (0 = none)
+    // Always-kept prefix/suffix allocation. Negative means derive from the
+    // KVMem token budget after block_tokens is known:
+    //   sink   = clamp(1% of budget, 1K, 2K)
+    //   recent = clamp(8% of budget, 4K, 16K)
+    // Explicit token and block forms are mutually exclusive per band. The
+    // block fields remain for exact reproduction of older experiments.
+    int kvmem_sink_blocks = -1;
+    int kvmem_recent_blocks = -1;
+    int kvmem_sink_tokens = -1;
+    int kvmem_recent_tokens = -1;
     // Selection signal that ranks the middle blocks each reselection:
     // "retrieval" (default, global content similarity, can resurrect dropped
     // blocks), "h2o" (window-local cumulative attention heat, retention only),
@@ -69,6 +102,15 @@ struct EngineOptions {
     int kvmem_subblocks = 4;      // sub-block means per block (sub-block-mean-k only)
     std::string kvmem_subblock_reduce = "max"; // sub-block score reduction: max or sum
     std::string kvmem_update_mode = "interval"; // interval or step
+    // Deprecated cumulative storage/tiering profile. It is consulted only
+    // when the CLI explicitly passes --kvmem-optimization-level; otherwise
+    // common Opt3 infrastructure backs the independent default-on groups.
+    std::string kvmem_optimization_level = "opt_3";
+    bool kvmem_optimization_level_explicit = false;
+    // Repeatable paper-ablation switch. Empty means all optimizations on.
+    // Valid names: proactive-stage-out, hierarchical-reuse,
+    // packed-rematerialization, or all.
+    std::vector<std::string> kvmem_optimize_off;
     // Archived experimental DeltaNet retrieval. These programmatic fields remain
     // for reproducibility, but the corresponding CLI is disabled and the method
     // is not recommended. See docs/kvmem_deltanet_retrieval_experimental.md.
@@ -83,6 +125,14 @@ struct EngineOptions {
     // (mean over question tokens) instead of recency. Default OFF -> behavior is
     // byte-identical to the recency/single-token retrieval path.
     bool kvmem_query_conditioned = false;
+    // Re-prefill the query suffix against the just-selected semantic window.
+    // Enabled by default for query-conditioned mean-k; the first-pass query is
+    // still used for retrieval scoring, while decode consumes the replayed KV.
+    bool kvmem_recompute_query = true;
+    // Preserve unrotated K in a CPU mirror and keep one active GPU K copy.
+    // Cold/periodic refreshes rebuild from raw K; small moves use delta RoPE.
+    // Enabled by default; use --no-kvmem-immutable-k for legacy ablations.
+    bool kvmem_immutable_source_k = true;
     int kvmem_retrieval_blocks = 0; // 0 = derive from remaining budget
     int kvmem_profile_blocks = 0;   // 0 = derive from remaining budget
     double kvmem_gpu_memory_ratio = 0.50;
@@ -103,7 +153,16 @@ struct GenerationOptions {
     float repetition_penalty = 1.0f;
     uint64_t seed = 0;
     bool raw_prompt = false;
+    // Exact raw-token prompt override used by the /v1/completions integer-array
+    // form. Empty means tokenize the prompt string as usual. This avoids a
+    // decode/re-tokenize change at concatenated sparse-block boundaries in
+    // controlled representation experiments.
+    std::vector<uint32_t> prompt_token_ids_override;
     bool ignore_eos = false;
+    // Serving compatibility: if generation is still inside an open <think>
+    // block, replace a sampled EOS with the tokenizer's </think> token and
+    // continue decoding. EOS remains a normal stop after thinking closes.
+    bool recover_thinking_eos = false;
     // Internal serving flag: enqueue this request on the native continuous
     // batching worker when the backend supports it. CLI single-shot generation
     // leaves this false and keeps the original synchronous path.
@@ -116,12 +175,69 @@ struct GenerationOptions {
     // Whether the prompt already opened a <think> block (enable_thinking). The
     // budget counter only runs while a think block is open.
     bool thinking_open = false;
+    // Generic multi-request KVMem controls. These describe inference behavior;
+    // dataset/session parsing remains entirely in the caller.
+    KvMemReselectMode kvmem_reselect_mode = KvMemReselectMode::Auto;
+    KvMemPrefillWindowMode kvmem_prefill_window_mode =
+        KvMemPrefillWindowMode::Pressure;
+    std::string kvmem_session_id;
     // Query-conditioned KVMem: half-open token span [begin,end) of the prompt
     // that is the user's question. The executor captures these query rows during
     // prefill and uses them for multi-token block selection. begin==end (default)
     // means no span -> the recency/single-token path runs unchanged.
     uint32_t kvmem_query_begin = 0;
     uint32_t kvmem_query_end = 0;
+    // Experimental transcript replay: every span is a user query that arrived
+    // after the KVMem working-set + generation reserve was already full. During
+    // prefill the backend reselects at each span, replays that query against the
+    // new window, then teacher-forces the recorded response. Only the final span
+    // is followed by decode. Empty keeps the normal one-shot path unchanged.
+    struct KvMemReplayQuerySpan {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+    };
+    std::vector<KvMemReplayQuerySpan> kvmem_replay_query_spans;
+    // Optional transcript-construction boundaries. Each value is the first
+    // token of an independent historical session, before block alignment. The
+    // session-local canonical-KV experiment uses these boundaries to prevent a
+    // block's hidden state from inheriting unrelated preceding sessions.
+    std::vector<uint32_t> kvmem_replay_session_starts;
+    // Optional diagnostics-only metadata. The context span identifies the
+    // flattened benchmark history inside the rendered prompt, while trace_tag
+    // provides a stable request/sample key for offline retrieval analysis.
+    // These fields never participate in scoring or block selection.
+    uint32_t kvmem_context_begin = 0;
+    uint32_t kvmem_context_end = 0;
+    std::string kvmem_trace_tag;
+    // Diagnostics-only oracle control. Each half-open span is expressed in
+    // already-rendered prompt-token coordinates and forces every overlapping
+    // historical KVMem block into the ordinary fixed-size selection budget.
+    // The server accepts this field only when QW3_KVMEM_ENABLE_ORACLE=1.
+    // Empty is the production/default path and leaves selection byte-identical.
+    struct KvMemOracleTokenSpan {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+    };
+    std::vector<KvMemOracleTokenSpan> kvmem_oracle_token_spans;
+    // When true, the final-query diagnostic selection contains only sink,
+    // oracle-overlapping, and pinned query-tail blocks. Ordinary retrieval
+    // candidates do not fill the unused budget.
+    bool kvmem_oracle_only = false;
+    // Diagnostics-only one-request ablation. After the ordinary long-context
+    // prefill and final semantic selection, replay exactly the selected source
+    // tokens in compact order and replace the answer-producing cache in memory.
+    // The server accepts this only behind QW3_KVMEM_ENABLE_INLINE_REFRESH=1.
+    KvMemInlineRefreshMode kvmem_inline_refresh =
+        KvMemInlineRefreshMode::Off;
+    // ARCHIVED (2026-07-23): the DeltaNet recurrent-state export/import debug
+    // interface is intentionally compiled out. See the request-parser note in
+    // qw3_server.cpp and KVMI-012 for the measured results and rationale.
+#if 0
+    std::string kvmem_rebuilt_state_export_key;
+    std::string kvmem_rebuilt_state_import_key;
+    std::string kvmem_rebuilt_state_capture_key;
+    std::string kvmem_rebuilt_state_seed_key;
+#endif
 };
 
 struct ModelInfo {
@@ -161,6 +277,12 @@ struct NativePlanInfo {
 
 using TokenCallback = std::function<void(const std::string &)>;
 
+// Return false to cooperatively stop generation after the current token. This
+// lets streaming servers release decode resources promptly after a client
+// disconnects or a stop sequence is observed.
+using CancellableTokenCallback =
+    std::function<bool(const std::string &)>;
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -176,6 +298,17 @@ public:
     void generate_stream(const std::string &prompt,
                          const GenerationOptions &options,
                          const TokenCallback &on_text);
+    // Append a prompt fragment to one persistent native KVMem session. `reset`
+    // starts/replaces the session; false continues from the executor's live
+    // token/KV/recurrent state without re-tokenizing an earlier prefix.
+    void generate_session_stream(const std::string &prompt_fragment,
+                                 const GenerationOptions &options,
+                                 const TokenCallback &on_text,
+                                 bool reset);
+    void generate_stream_cancellable(
+        const std::string &prompt,
+        const GenerationOptions &options,
+        const CancellableTokenCallback &on_text);
 
 private:
     struct Impl;

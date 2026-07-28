@@ -1,8 +1,10 @@
 #include "server.hpp"
 
 #include "env_flags.hpp"
+#include "tool_call_stream.hpp"
 #include "qw3/qw3.hpp"
 #include "qw3/gguf.hpp"
+#include "qw3/kvmem_store.hpp"
 #include "qw3/tokenizer.hpp"
 
 // Vendored single-header deps (included as SYSTEM headers via CMake so their
@@ -17,11 +19,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace qw3 {
@@ -67,13 +73,41 @@ std::string bytes_gib_label(uint64_t bytes) {
 }
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
-    return g.max_tokens >= 0;
+    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty();
 }
 
 json usage_json(size_t prompt_tokens, size_t completion_tokens) {
     return json{{"prompt_tokens", prompt_tokens},
                 {"completion_tokens", completion_tokens},
                 {"total_tokens", prompt_tokens + completion_tokens}};
+}
+
+bool parse_explicit_max_tokens(const json &req, bool &present, int &value,
+                               std::string &error) {
+    const char *key = nullptr;
+    if (req.contains("max_tokens")) {
+        key = "max_tokens";
+    } else if (req.contains("max_completion_tokens")) {
+        key = "max_completion_tokens";
+    }
+    present = key != nullptr;
+    if (!present) return true;
+    const json &field = req[key];
+    if (!field.is_number_integer()) {
+        error = std::string(key) + " must be an integer";
+        return false;
+    }
+    const int64_t raw = field.get<int64_t>();
+    if (raw < 0) {
+        error = std::string(key) + " must be >= 0";
+        return false;
+    }
+    if (raw > std::numeric_limits<int>::max()) {
+        error = std::string(key) + " is too large";
+        return false;
+    }
+    value = static_cast<int>(raw);
+    return true;
 }
 
 std::string basename_of(const std::string &path) {
@@ -518,7 +552,7 @@ json coerce_value_by_schema(const std::string &value, const json &schema) {
 // Find the JSON-schema "properties" map for a named function in an OpenAI
 // tools array. Returns nullptr when the tool, its parameters, or its properties
 // are absent, in which case parameters are left as raw strings.
-const json *find_tool_properties(const json *tools, const std::string &name) {
+const json *find_tool_definition(const json *tools, const std::string &name) {
     if (!tools || !tools->is_array()) return nullptr;
     for (const auto &t : *tools) {
         if (!t.is_object()) continue;
@@ -527,16 +561,308 @@ const json *find_tool_properties(const json *tools, const std::string &name) {
                              : &t;
         if (!fn->is_object()) continue;
         if (fn->value("name", std::string()) != name) continue;
-        if (!fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
-            return nullptr;
-        }
-        const json &params = (*fn)["parameters"];
-        if (params.contains("properties") && params["properties"].is_object()) {
-            return &params["properties"];
-        }
-        return nullptr;
+        return fn;
     }
     return nullptr;
+}
+
+const json *find_tool_properties(const json *tools, const std::string &name) {
+    const json *fn = find_tool_definition(tools, name);
+    if (!fn || !fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
+        return nullptr;
+    }
+    const json &params = (*fn)["parameters"];
+    if (params.contains("properties") && params["properties"].is_object()) {
+        return &params["properties"];
+    }
+    return nullptr;
+}
+
+bool tool_name_allowed(const json *tools, const std::string &name) {
+    return !tools || !tools->is_array() || find_tool_definition(tools, name) != nullptr;
+}
+
+std::string strip_tool_control_tokens(std::string text) {
+    // Some Qwen generations leak chat-template control tokens inside the
+    // tool block. They are framing noise, not part of the tool name/arguments.
+    for (const char *token : {"<|im_start|>", "<|im_end|>", "<|assistant|>",
+                              "<|tool|>"}) {
+        size_t pos = 0;
+        while ((pos = text.find(token, pos)) != std::string::npos) {
+            text.erase(pos, std::string(token).size());
+        }
+    }
+    return text;
+}
+
+std::string trim_single_newlines(std::string value) {
+    if (!value.empty() && value.front() == '\n') value.erase(value.begin());
+    if (!value.empty() && value.front() == '\r') value.erase(value.begin());
+    if (!value.empty() && value.back() == '\n') value.pop_back();
+    if (!value.empty() && value.back() == '\r') value.pop_back();
+    return value;
+}
+
+std::string normalized_identifier(std::string value) {
+    std::string out;
+    for (const unsigned char c : value) {
+        if (std::isalnum(c) || c == '_' || c == '-') {
+            out.push_back(static_cast<char>(std::tolower(c)));
+        }
+    }
+    return out;
+}
+
+std::string snake_case_identifier(const std::string &value) {
+    std::string out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if (std::isupper(c) && i > 0) out.push_back('_');
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+std::string schema_property_name(const json *props, const std::string &raw_key) {
+    if (!props || !props->is_object()) return trim_ascii_ws(raw_key);
+    const std::string wanted = normalized_identifier(raw_key);
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        if (normalized_identifier(it.key()) == wanted) return it.key();
+    }
+    return trim_ascii_ws(raw_key);
+}
+
+void add_tool_argument(json &args, const json *props,
+                       const std::string &raw_key, std::string value) {
+    const std::string key = schema_property_name(props, raw_key);
+    if (key.empty()) return;
+    value = trim_single_newlines(std::move(value));
+    if (props && props->contains(key) && (*props)[key].is_object()) {
+        args[key] = coerce_value_by_schema(value, (*props)[key]);
+    } else {
+        args[key] = value;
+    }
+}
+
+void parse_parameter_tags(const std::string &block, const json *props, json &args) {
+    size_t pos = 0;
+    while ((pos = block.find("<parameter=", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<parameter=").size();
+        const size_t key1 = block.find('>', key0);
+        if (key1 == std::string::npos) break;
+        const size_t value0 = key1 + 1;
+        const size_t value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1 + std::string("</parameter>").size();
+    }
+}
+
+void parse_arg_key_value_tags(const std::string &block, const json *props, json &args) {
+    size_t pos = 0;
+    while ((pos = block.find("<arg_key>", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<arg_key>").size();
+        const size_t key1 = block.find("</arg_key>", key0);
+        if (key1 == std::string::npos) break;
+        const size_t value_tag = block.find("<arg_value>", key1);
+        if (value_tag == std::string::npos) break;
+        const size_t value0 = value_tag + std::string("<arg_value>").size();
+        size_t value1 = block.find("</arg_value>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</tool_call>", value0);
+        if (value1 == std::string::npos) value1 = block.size();
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1;
+    }
+}
+
+void parse_loose_parameter_tags(const std::string &block, const json *props, json &args) {
+    // Handles variants such as <parameter>lines>[680, 720] where the model
+    // omitted the '=' and used the next '>' as the key/value separator.
+    size_t pos = 0;
+    while ((pos = block.find("<parameter>", pos)) != std::string::npos) {
+        const size_t key0 = pos + std::string("<parameter>").size();
+        const size_t key1 = block.find('>', key0);
+        if (key1 == std::string::npos) break;
+        const size_t value0 = key1 + 1;
+        size_t value1 = block.find("</parameter>", value0);
+        if (value1 == std::string::npos) value1 = block.find("</tool_call>", value0);
+        if (value1 == std::string::npos) value1 = block.size();
+        if (value1 == std::string::npos) break;
+        add_tool_argument(args, props, block.substr(key0, key1 - key0),
+                          block.substr(value0, value1 - value0));
+        pos = value1;
+    }
+}
+
+void parse_schema_named_tags(const std::string &block, const json *props, json &args) {
+    if (!props || !props->is_object()) return;
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        const std::string key = it.key();
+        const std::string snake_key = snake_case_identifier(key);
+        const std::vector<std::string> tag_names =
+            snake_key == key ? std::vector<std::string>{key}
+                              : std::vector<std::string>{key, snake_key};
+        for (const std::string &tag_name : tag_names) {
+            const std::string open = "<" + tag_name + ">";
+            size_t pos = 0;
+            while ((pos = block.find(open, pos)) != std::string::npos) {
+                const size_t value0 = pos + open.size();
+                const std::string close = "</" + tag_name + ">";
+                size_t value1 = block.find(close, value0);
+                if (value1 == std::string::npos) {
+                    // A seen malformed form uses <file_path>value<parameter>...
+                    // rather than a matching closing tag. Limit recovery to
+                    // the next tool/parameter delimiter so code text cannot swallow
+                    // the rest of the request.
+                    value1 = block.find("<parameter", value0);
+                    const size_t arg_key = block.find("<arg_key>", value0);
+                    if (value1 == std::string::npos ||
+                        (arg_key != std::string::npos && arg_key < value1)) {
+                        value1 = arg_key;
+                    }
+                    const size_t end = block.find("</tool_call>", value0);
+                    if (value1 == std::string::npos ||
+                        (end != std::string::npos && end < value1)) {
+                        value1 = end;
+                    }
+                    if (value1 == std::string::npos) value1 = block.size();
+                }
+                if (value1 == std::string::npos) break;
+                add_tool_argument(args, props, key, block.substr(value0, value1 - value0));
+                pos = value1 + (block.compare(value1, close.size(), close) == 0
+                                    ? close.size() : 1);
+            }
+        }
+    }
+}
+
+std::string tool_name_from_prefix(const std::string &inner, const json *tools) {
+    const std::string text = trim_ascii_ws(inner);
+    size_t pos = 0;
+    while (pos < text.size() &&
+           !(std::isalnum(static_cast<unsigned char>(text[pos])) ||
+             text[pos] == '_' || text[pos] == '-')) {
+        ++pos;
+    }
+    if (pos == text.size()) return {};
+    size_t end = pos;
+    while (end < text.size() &&
+           (std::isalnum(static_cast<unsigned char>(text[end])) ||
+            text[end] == '_' || text[end] == '-')) {
+        ++end;
+    }
+    std::string candidate = text.substr(pos, end - pos);
+    if (candidate == "function") {
+        while (end < text.size() && (text[end] == ' ' || text[end] == '=' ||
+                                     text[end] == '<' || text[end] == '>')) {
+            ++end;
+        }
+        const size_t name0 = end;
+        while (end < text.size() &&
+               (std::isalnum(static_cast<unsigned char>(text[end])) ||
+                text[end] == '_' || text[end] == '-')) {
+            ++end;
+        }
+        candidate = text.substr(name0, end - name0);
+    }
+    return tool_name_allowed(tools, candidate) ? candidate : std::string();
+}
+
+std::string tool_name_from_marker(const std::string &inner, const json *tools) {
+    for (const std::string &marker : {"<function=", "function=", "function_"}) {
+        size_t pos = inner.find(marker);
+        if (pos == std::string::npos) continue;
+        pos += marker.size();
+        size_t end = pos;
+        while (end < inner.size() &&
+               (std::isalnum(static_cast<unsigned char>(inner[end])) ||
+                inner[end] == '_' || inner[end] == '-')) {
+            ++end;
+        }
+        const std::string candidate = inner.substr(pos, end - pos);
+        if (tool_name_allowed(tools, candidate)) return candidate;
+    }
+    return tool_name_from_prefix(inner, tools);
+}
+
+std::string infer_tool_name_from_arguments(const json *tools, const json &args) {
+    if (!tools || !tools->is_array() || !args.is_object() || args.empty()) return {};
+    std::string match;
+    size_t best_required = 0;
+    bool tied = false;
+    for (const auto &tool : *tools) {
+        if (!tool.is_object()) continue;
+        const json *fn = (tool.contains("function") && tool["function"].is_object())
+                             ? &tool["function"] : &tool;
+        if (!fn->is_object() || !fn->contains("name") ||
+            !fn->contains("parameters") || !(*fn)["parameters"].is_object()) {
+            continue;
+        }
+        const json &required = (*fn)["parameters"].value("required", json::array());
+        if (!required.is_array() || required.empty()) continue;
+        bool all_present = true;
+        for (const auto &key : required) {
+            if (!key.is_string() || !args.contains(key.get<std::string>())) {
+                all_present = false;
+                break;
+            }
+        }
+        if (all_present) {
+            const size_t required_count = required.size();
+            if (required_count > best_required) {
+                best_required = required_count;
+                match = fn->value("name", std::string());
+                tied = false;
+            } else if (required_count == best_required) {
+                tied = true;
+            }
+        }
+    }
+    return tied ? std::string() : match;
+}
+
+bool parse_tool_call_block(const std::string &inner, const json *tools,
+                           std::vector<json> &calls) {
+    if (parse_json_tool_call_text(inner, calls)) return true;
+
+    const std::string normalized = strip_tool_control_tokens(inner);
+    std::string name = tool_name_from_marker(normalized, tools);
+    const json *props = find_tool_properties(tools, name);
+    json args = json::object();
+    parse_parameter_tags(normalized, props, args);
+    parse_arg_key_value_tags(normalized, props, args);
+    parse_loose_parameter_tags(normalized, props, args);
+    parse_schema_named_tags(normalized, props, args);
+
+    // A few generations place a JSON object directly after function_edit>.
+    // Parse it only when it starts at an object boundary; arbitrary code text
+    // must never be interpreted as tool arguments.
+    if (name.empty() || args.empty()) {
+        const size_t object0 = normalized.find('{');
+        const size_t object1 = normalized.rfind('}');
+        if (object0 != std::string::npos && object1 > object0) {
+            std::vector<json> parsed;
+            if (parse_json_tool_call_text(
+                    "{\"name\":" + dump_json(name) +
+                    ",\"arguments\":" +
+                        normalized.substr(object0, object1 - object0 + 1) + "}",
+                    parsed) && !parsed.empty()) {
+                if (!name.empty() || parsed.front().contains("function")) {
+                    calls.push_back(parsed.front());
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (name.empty()) name = infer_tool_name_from_arguments(tools, args);
+    if (name.empty() || !tool_name_allowed(tools, name)) return false;
+    calls.push_back(make_tool_call_json(name, args));
+    return true;
 }
 
 std::vector<json> parse_tool_calls_xml(const std::string &text,
@@ -548,73 +874,17 @@ std::vector<json> parse_tool_calls_xml(const std::string &text,
         if (tc0 == std::string::npos) break;
         const size_t tc1 = text.find("</tool_call>", tc0);
         if (tc1 == std::string::npos) break;
-        const std::string block = text.substr(tc0, tc1 - tc0);
         const size_t inner0 = tc0 + std::string("<tool_call>").size();
         const std::string inner = text.substr(inner0, tc1 - inner0);
-        const size_t fn0 = block.find("<function=");
-        if (fn0 == std::string::npos) {
-            (void)parse_json_tool_call_text(inner, calls);
-            pos = tc1 + std::string("</tool_call>").size();
-            continue;
-        }
-        const size_t name0 = fn0 + std::string("<function=").size();
-        const size_t name1 = block.find(">", name0);
-        if (name1 == std::string::npos) {
-            pos = tc1 + std::string("</tool_call>").size();
-            continue;
-        }
-        const std::string name = block.substr(name0, name1 - name0);
-        const json *props = find_tool_properties(tools, name);
-        json args = json::object();
-        size_t pp = name1 + 1;
-        bool saw_parameter = false;
-        while (true) {
-            const size_t p0 = block.find("<parameter=", pp);
-            if (p0 == std::string::npos) break;
-            const size_t key0 = p0 + std::string("<parameter=").size();
-            const size_t key1 = block.find(">", key0);
-            if (key1 == std::string::npos) break;
-            const size_t v0 = key1 + 1;
-            const size_t v1 = block.find("</parameter>", v0);
-            if (v1 == std::string::npos) break;
-            std::string value = block.substr(v0, v1 - v0);
-            if (!value.empty() && value.front() == '\n') value.erase(value.begin());
-            if (!value.empty() && value.back() == '\n') value.pop_back();
-            const std::string key = block.substr(key0, key1 - key0);
-            if (props && props->contains(key) && (*props)[key].is_object()) {
-                args[key] = coerce_value_by_schema(value, (*props)[key]);
-            } else {
-                args[key] = value;
-            }
-            saw_parameter = true;
-            pp = v1 + std::string("</parameter>").size();
-        }
-        if (!saw_parameter) {
-            const size_t body0 = name1 + 1;
-            const size_t body1 = block.find("</function>", body0);
-            if (body1 != std::string::npos) {
-                const std::string body = block.substr(body0, body1 - body0);
-                std::vector<json> parsed;
-                if (parse_json_tool_call_text(
-                        "{\"name\":" + dump_json(name) +
-                        ",\"arguments\":" + trim_ascii_ws(body) + "}",
-                        parsed) &&
-                    !parsed.empty()) {
-                    calls.push_back(parsed.front());
-                    pos = tc1 + std::string("</tool_call>").size();
-                    continue;
-                }
-            }
-        }
-        calls.push_back(make_tool_call_json(name, args));
+        (void)parse_tool_call_block(inner, tools, calls);
         pos = tc1 + std::string("</tool_call>").size();
     }
     return calls;
 }
 
-json tool_call_delta(const json &calls) {
+json tool_call_delta(const json &calls, size_t begin = 0) {
     json deltas = json::array();
-    for (size_t i = 0; i < calls.size(); ++i) {
+    for (size_t i = begin; i < calls.size(); ++i) {
         const json &call = calls[i];
         json d = {
             {"index", static_cast<int>(i)},
@@ -630,6 +900,224 @@ json tool_call_delta(const json &calls) {
     }
     return json{{"tool_calls", deltas}};
 }
+
+bool schema_is_plain_string(const json &schema) {
+    return schema.is_object() && schema.contains("type") &&
+           schema["type"].is_string() &&
+           schema["type"].get<std::string>() == "string";
+}
+
+bool tool_has_only_string_properties(const json *tools,
+                                     const std::string &name) {
+    const json *props = find_tool_properties(tools, name);
+    if (!props || !props->is_object() || props->empty()) return false;
+    for (auto it = props->begin(); it != props->end(); ++it) {
+        if (!schema_is_plain_string(it.value())) return false;
+    }
+    return true;
+}
+
+json incremental_tool_start_delta(size_t index,
+                                  const std::string &id,
+                                  const std::string &name,
+                                  const std::string &arguments) {
+    return json{{"tool_calls", json::array({json{
+        {"index", static_cast<int>(index)},
+        {"id", id},
+        {"type", "function"},
+        {"function", json{{"name", name},
+                          {"arguments", arguments}}}
+    }})}};
+}
+
+json incremental_tool_arguments_delta(size_t index,
+                                      const std::string &arguments) {
+    return json{{"tool_calls", json::array({json{
+        {"index", static_cast<int>(index)},
+        {"function", json{{"arguments", arguments}}}
+    }})}};
+}
+
+class IncrementalToolCallStream {
+public:
+    explicit IncrementalToolCallStream(const json *tools) : tools_(tools) {}
+
+    void feed(const std::string &text) {
+        if (abandoned_ || fatal_ || parser_.complete()) return;
+        std::vector<detail::ToolCallStreamEvent> events;
+        if (!parser_.feed(text, events)) {
+            parser_failed();
+            return;
+        }
+        process(events);
+    }
+
+    void finish() {
+        if (abandoned_ || fatal_) return;
+        std::vector<detail::ToolCallStreamEvent> events;
+        if (!parser_.finish(events)) {
+            parser_failed();
+            return;
+        }
+        process(events);
+    }
+
+    bool streaming() const { return streaming_; }
+    bool abandoned() const { return abandoned_; }
+    bool fatal() const { return fatal_; }
+    bool complete() const { return complete_; }
+    bool start_pending() const { return start_pending_; }
+    size_t pending_size() const { return pending_arguments_.size(); }
+    const std::string &error() const { return error_; }
+
+    json take_start_delta() {
+        start_pending_ = false;
+        const std::string fragment = take_pending_arguments();
+        return incremental_tool_start_delta(0, call_id_, name_, fragment);
+    }
+
+    json take_arguments_delta() {
+        return incremental_tool_arguments_delta(0, take_pending_arguments());
+    }
+
+    bool validate(const std::vector<json> &calls, std::string &reason) const {
+        if (!streaming_ || fatal_ || !complete_) {
+            reason = fatal_ ? error_ : "canonical stream did not complete";
+            return false;
+        }
+        if (calls.empty() || !calls.front().is_object() ||
+            !calls.front().contains("function") ||
+            !calls.front()["function"].is_object()) {
+            reason = "full parser did not produce the streamed tool call";
+            return false;
+        }
+        const json &fn = calls.front()["function"];
+        if (fn.value("name", std::string()) != name_) {
+            reason = "streamed and fully parsed function names differ";
+            return false;
+        }
+        try {
+            const json streamed = json::parse(arguments_all_);
+            const json parsed =
+                json::parse(fn.value("arguments", std::string("{}")));
+            if (streamed != parsed) {
+                reason = "streamed and fully parsed arguments differ";
+                return false;
+            }
+        } catch (const std::exception &e) {
+            reason = std::string("argument validation failed: ") + e.what();
+            return false;
+        }
+        return true;
+    }
+
+private:
+    void parser_failed() {
+        if (streaming_) {
+            fatal_ = true;
+            error_ = parser_.error();
+        } else {
+            abandoned_ = true;
+        }
+    }
+
+    void append_arguments(const std::string &text) {
+        arguments_all_ += text;
+        pending_arguments_ += text;
+    }
+
+    std::string take_pending_arguments() {
+        std::string out;
+        out.swap(pending_arguments_);
+        return out;
+    }
+
+    void fail(std::string message) {
+        fatal_ = true;
+        error_ = std::move(message);
+    }
+
+    void process(const std::vector<detail::ToolCallStreamEvent> &events) {
+        for (const detail::ToolCallStreamEvent &event : events) {
+            if (abandoned_ || fatal_) return;
+            switch (event.kind) {
+                case detail::ToolCallStreamEventKind::ToolStart:
+                    name_ = event.value;
+                    if (!tool_name_allowed(tools_, name_) ||
+                        !tool_has_only_string_properties(tools_, name_)) {
+                        abandoned_ = true;
+                        return;
+                    }
+                    call_id_ = gen_id("call_");
+                    streaming_ = true;
+                    start_pending_ = true;
+                    append_arguments("{");
+                    break;
+                case detail::ToolCallStreamEventKind::ParameterStart: {
+                    if (!streaming_ || parameter_open_) {
+                        fail("invalid incremental parameter start");
+                        return;
+                    }
+                    const json *props = find_tool_properties(tools_, name_);
+                    parameter_name_ =
+                        schema_property_name(props, event.value);
+                    if (parameter_name_.empty() ||
+                        !seen_parameters_.insert(parameter_name_).second) {
+                        fail("empty or duplicate incremental parameter");
+                        return;
+                    }
+                    if (!first_parameter_) append_arguments(",");
+                    first_parameter_ = false;
+                    append_arguments(dump_json(json(parameter_name_)) + ":\"");
+                    parameter_open_ = true;
+                    break;
+                }
+                case detail::ToolCallStreamEventKind::ParameterData:
+                    if (!parameter_open_) {
+                        fail("incremental parameter data outside a parameter");
+                        return;
+                    }
+                    append_arguments(
+                        detail::json_string_fragment(event.value));
+                    break;
+                case detail::ToolCallStreamEventKind::ParameterEnd:
+                    if (!parameter_open_) {
+                        fail("incremental parameter end without a parameter");
+                        return;
+                    }
+                    append_arguments("\"");
+                    parameter_name_.clear();
+                    parameter_open_ = false;
+                    break;
+                case detail::ToolCallStreamEventKind::ToolEnd:
+                    if (!streaming_ || parameter_open_) {
+                        fail("incremental tool ended inside a parameter");
+                        return;
+                    }
+                    append_arguments("}");
+                    complete_ = true;
+                    break;
+            }
+        }
+    }
+
+    const json *tools_ = nullptr;
+    detail::CanonicalToolCallStreamParser parser_;
+    std::string name_;
+    std::string call_id_;
+    std::string parameter_name_;
+    std::string arguments_all_;
+    std::string pending_arguments_;
+    std::string error_;
+    std::unordered_set<std::string> seen_parameters_;
+    bool streaming_ = false;
+    bool abandoned_ = false;
+    bool fatal_ = false;
+    bool complete_ = false;
+    bool start_pending_ = false;
+    bool parameter_open_ = false;
+    bool first_parameter_ = true;
+};
 
 std::string tool_calls_debug_summary(const std::vector<json> &calls) {
     json summary = json::array();
@@ -684,9 +1172,8 @@ std::string tools_debug_summary(const json &tools) {
 // Streaming tool-call detection. The model may emit natural-language reasoning
 // before a <tool_call> block (the Hermes prompt at render_messages explicitly
 // allows this), so the stream cannot be classified once on its first token.
-// Instead content streams incrementally until a <tool_call> marker appears
-// anywhere, at which point the caller switches to buffering and parses the call
-// from the full accumulated text.
+// Content streams until a marker appears; canonical string arguments then stream
+// as OpenAI deltas, while recovery formats remain buffered for the full parser.
 //
 // Returns how many leading bytes of `text` are safe to emit as content right
 // now. If a complete "<tool_call>" marker is present, returns its byte offset
@@ -715,9 +1202,20 @@ size_t tool_call_safe_emit_len(const std::string &text, bool &marker_found) {
 // Qwen XML tool calls, and tool results become user-side <tool_response> blocks.
 // The final assistant header (+ thinking prefill or empty-think block) is
 // appended for generation.
-std::string render_messages(const json &messages, const json *tools,
-                            bool enable_thinking,
-                            const std::string &forced_tool_name = {}) {
+struct RenderedMessageSpan {
+    size_t message_index = 0;
+    std::string role;
+    size_t segment_begin = 0;
+    size_t segment_end = 0;
+    size_t content_begin = 0;
+    size_t content_end = 0;
+};
+
+std::string render_messages(
+        const json &messages, const json *tools, bool enable_thinking,
+        const std::string &forced_tool_name = {},
+        std::vector<RenderedMessageSpan> *message_spans = nullptr,
+        bool add_generation_prompt = true) {
     size_t num_sys = 0;
     std::string merged_system;
     if (messages.is_array() && !messages.empty() && messages[0].is_object()) {
@@ -774,11 +1272,25 @@ std::string render_messages(const json &messages, const json *tools,
         if (!m.is_object() || i < num_sys) continue;
         const std::string role = m.value("role", "");
         if (role == "system" || role == "developer") continue;
+        const std::string rendered_content =
+            m.contains("content") ? render_content(m["content"]) : "";
+        // Tool results can contain byte-sensitive content such as source code.
         const std::string content =
-            trim_ascii_ws(m.contains("content") ? render_content(m["content"]) : "");
+            role == "tool" ? rendered_content : trim_ascii_ws(rendered_content);
         if (role == "user") {
-            prompt += "<|im_start|>user\n" + content + "<|im_end|>\n";
+            const size_t segment_begin = prompt.size();
+            prompt += "<|im_start|>user\n";
+            const size_t content_begin = prompt.size();
+            prompt += content;
+            const size_t content_end = prompt.size();
+            prompt += "<|im_end|>\n";
+            if (message_spans) {
+                message_spans->push_back(RenderedMessageSpan{
+                    i, role, segment_begin, prompt.size(), content_begin,
+                    content_end});
+            }
         } else if (role == "assistant") {
+            const size_t segment_begin = prompt.size();
             std::string assistant_content = content;
             std::string reasoning_content;
             if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
@@ -792,7 +1304,7 @@ std::string render_messages(const json &messages, const json *tools,
                 }
             }
             prompt += "<|im_start|>assistant\n";
-            if (i > last_query_index) {
+            if (add_generation_prompt && i > last_query_index) {
                 prompt += "<think>\n" + reasoning_content + "\n</think>\n\n";
             }
             prompt += assistant_content;
@@ -811,6 +1323,10 @@ std::string render_messages(const json &messages, const json *tools,
                 }
             }
             prompt += "<|im_end|>\n";
+            if (message_spans) {
+                message_spans->push_back(RenderedMessageSpan{
+                    i, role, segment_begin, prompt.size(), 0, 0});
+            }
         } else if (role == "tool") {
             const bool prev_tool =
                 i > 0 && messages[i - 1].is_object() &&
@@ -824,11 +1340,13 @@ std::string render_messages(const json &messages, const json *tools,
         }
     }
 
-    prompt += "<|im_start|>assistant\n";
-    if (enable_thinking) {
-        prompt += "<think>\n";
-    } else {
-        prompt += "<think>\n\n</think>\n\n";
+    if (add_generation_prompt) {
+        prompt += "<|im_start|>assistant\n";
+        if (enable_thinking) {
+            prompt += "<think>\n";
+        } else {
+            prompt += "<think>\n\n</think>\n\n";
+        }
     }
     return prompt;
 }
@@ -847,6 +1365,22 @@ bool apply_stops(std::string &text, const std::vector<std::string> &stops) {
         return true;
     }
     return false;
+}
+
+const char *generation_finish_reason(bool stop_matched,
+                                     size_t completion_tokens,
+                                     int max_tokens) {
+    // The engine returns normally both when it emits EOS and when it exhausts
+    // max_tokens. A client stop string takes precedence; otherwise reaching
+    // the configured token ceiling is OpenAI's "length", while an earlier
+    // normal return is EOS and therefore "stop".
+    if (max_tokens == 0) return "prefill_only";
+    if (stop_matched) return "stop";
+    if (max_tokens > 0 &&
+        completion_tokens >= static_cast<size_t>(max_tokens)) {
+        return "length";
+    }
+    return "stop";
 }
 
 std::vector<std::string> parse_stops(const json &req) {
@@ -941,6 +1475,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                      "(non-continuous-batching) serve route; it is inert while "
                      "--continuous-batching is active\n";
     }
+    if (cfg.kvmem_query_replay &&
+        (!engine.kvmem_enabled || !engine.kvmem_query_conditioned)) {
+        throw std::runtime_error(
+            "--kvmem-query-replay requires --kvmem and "
+            "--kvmem-query-conditioned");
+    }
+    if (cfg.kvmem_query_replay && cfg.continuous_batching) {
+        std::cerr << "[qw3-serve] note: --kvmem-query-replay is currently "
+                     "single-request only; it is inert while "
+                     "--continuous-batching is active\n";
+    }
 
     // The backend still reads several low-level toggles from process config.
     // Keep that as an internal bridge; the user-facing API is the explicit CLI
@@ -964,6 +1509,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     // executor read it). Tracing left to QW3_KVMEM_PREFIX_CACHE_TRACE opt-in.
     setenv_bool("QW3_KVMEM_PREFIX_CACHE",
                 cfg.kvmem_prefix_cache && engine.kvmem_enabled);
+    setenv_bool("QW3_KVMEM_QUERY_REPLAY",
+                cfg.kvmem_query_replay && engine.kvmem_enabled &&
+                    engine.kvmem_query_conditioned && !cfg.continuous_batching);
     setenv_bool("QW3_MTP_SPECULATE", engine.native_mtp_speculate);
     setenv_value("QW3_MTP_POLICY", engine.mtp_policy);
     if (engine.mtp_adaptive_min_chain > 0) {
@@ -995,12 +1543,42 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         setenv_value("QW3_CONTINUOUS_BATCHING_MTP_KV_POOL_PAGES", cfg.mtp_kv_pool_pages);
     }
 
+    std::string kvmem_optimize_off = "none";
+    if (!engine.kvmem_optimize_off.empty()) {
+        kvmem_optimize_off.clear();
+        for (const std::string &name : engine.kvmem_optimize_off) {
+            if (!kvmem_optimize_off.empty()) kvmem_optimize_off += ",";
+            kvmem_optimize_off += name;
+        }
+    }
+    const char *kvmem_performance_mode =
+        engine.kvmem_optimization_level_explicit
+            ? "legacy"
+            : (engine.kvmem_optimize_off.empty()
+                   ? "default-all-on" : "feature-ablation");
+    const KvMemKeepAllocation kvmem_keep =
+        resolve_kvmem_keep_allocation(
+            static_cast<uint32_t>(std::max(1, engine.kvmem_block_tokens)),
+            static_cast<uint32_t>(std::max(1, engine.kvmem_budget)),
+            engine.kvmem_sink_blocks,
+            engine.kvmem_recent_blocks,
+            engine.kvmem_sink_tokens,
+            engine.kvmem_recent_tokens);
+    auto keep_source_name = [](KvMemKeepSource source) {
+        switch (source) {
+            case KvMemKeepSource::Tokens: return "tokens";
+            case KvMemKeepSource::Blocks: return "blocks";
+            case KvMemKeepSource::Auto: return "auto";
+        }
+        return "unknown";
+    };
     std::cerr << "[qw3-serve] effective serving parameters:\n"
               << "  host=" << cfg.host << "\n"
               << "  port=" << cfg.port << "\n"
               << "  model=" << engine.model_path << "\n"
               << "  backend=" << backend_kind_name(engine.backend) << "\n"
               << "  native_kernels=" << engine.native_kernels << "\n"
+              << "  cpu_embedding=" << yesno(engine.cpu_embedding) << "\n"
               << "  ctx=" << engine.ctx_size << "\n"
               << "  batch=" << engine.batch_size << "\n"
               << "  prefill_chunk=" << engine.prefill_chunk << "\n"
@@ -1038,6 +1616,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  mtp_paged_prefix=" << yesno(cfg.mtp_paged_prefix) << "\n"
               << "  prefix_cache="
               << yesno(cfg.prefix_cache && cfg.continuous_batching) << "\n"
+              << "  tool_argument_streaming=canonical-string\n"
               << "  matmul=mmq\n"
               << "  disable_hgemm=1\n"
               << "  default_max_tokens="
@@ -1056,12 +1635,36 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_block_tokens=" << engine.kvmem_block_tokens << "\n"
               << "  kvmem_budget=" << engine.kvmem_budget << "\n"
               << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
+              << "  kvmem_performance_mode="
+              << kvmem_performance_mode << "\n"
+              << "  kvmem_optimization_level="
+              << engine.kvmem_optimization_level
+              << (engine.kvmem_optimization_level_explicit
+                      ? "(legacy-explicit)" : "(common-infrastructure)")
+              << "\n"
+              << "  kvmem_optimize_off=" << kvmem_optimize_off << "\n"
               << "  kvmem_query_conditioned="
               << yesno(engine.kvmem_query_conditioned) << "\n"
+              << "  kvmem_recompute_query="
+              << yesno(engine.kvmem_recompute_query) << "\n"
+              << "  kvmem_immutable_k="
+              << yesno(engine.kvmem_immutable_source_k) << "\n"
+              << "  kvmem_query_replay="
+              << yesno(cfg.kvmem_query_replay && !cfg.continuous_batching) << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
-              << "  kvmem_sink_blocks=" << engine.kvmem_sink_blocks << "\n"
-              << "  kvmem_recent_blocks=" << engine.kvmem_recent_blocks << "\n"
+              << "  kvmem_sink="
+              << kvmem_keep.sink_effective_tokens << " tokens / "
+              << kvmem_keep.sink_blocks << " blocks"
+              << " (target=" << kvmem_keep.sink_target_tokens
+              << ", source=" << keep_source_name(kvmem_keep.sink_source)
+              << ")\n"
+              << "  kvmem_recent="
+              << kvmem_keep.recent_effective_tokens << " tokens / "
+              << kvmem_keep.recent_blocks << " blocks"
+              << " (target=" << kvmem_keep.recent_target_tokens
+              << ", source=" << keep_source_name(kvmem_keep.recent_source)
+              << ")\n"
               << "  kvmem_gpu_memory_ratio=" << engine.kvmem_gpu_memory_ratio << "\n"
               << "  kvmem_cpu_tier=" << engine.kvmem_cpu_bytes
               << " bytes (" << bytes_gib_label(engine.kvmem_cpu_bytes) << ")\n"
@@ -1079,8 +1682,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
     Engine eng(engine);
-    GgufFile usage_gguf(engine.model_path);
-    QwenTokenizer usage_tokenizer(usage_gguf);
+    std::unique_ptr<GgufFile> usage_gguf;
+    std::unique_ptr<QwenTokenizer> usage_tokenizer_owner;
+    if (std::filesystem::is_directory(engine.model_path)) {
+        usage_tokenizer_owner = std::make_unique<QwenTokenizer>(engine.model_path);
+    } else {
+        usage_gguf = std::make_unique<GgufFile>(engine.model_path);
+        usage_tokenizer_owner = std::make_unique<QwenTokenizer>(*usage_gguf);
+    }
+    QwenTokenizer &usage_tokenizer = *usage_tokenizer_owner;
     const std::string model_id = basename_of(engine.model_path);
     std::cerr << "[qw3-serve] model loaded; id=" << model_id << "\n";
 
@@ -1104,6 +1714,38 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         res.set_content(dump_json(out), "application/json");
     });
 
+    // llama.cpp-compatible tokenizer-count endpoint.  AgentLongBench's
+    // canonical worker uses this to size the generation request before it
+    // calls /v1/chat/completions.  Returning only count by default avoids
+    // serializing a 100K-250K element token-id array for long prompts; the
+    // opt-in return_tokens mode exists for tokenizer-parity validation.
+    auto handle_tokenize = [&](const httplib::Request &hreq,
+                               httplib::Response &res) {
+        json req;
+        try {
+            req = json::parse(hreq.body);
+        } catch (const std::exception &e) {
+            res.status = 400;
+            res.set_content(
+                dump_json(json{{"error", std::string("invalid JSON: ") + e.what()}}),
+                "application/json");
+            return;
+        }
+        if (!req.contains("content") || !req["content"].is_string()) {
+            res.status = 400;
+            res.set_content(dump_json(json{{"error", "missing string content"}}),
+                            "application/json");
+            return;
+        }
+        const std::string content = req["content"].get<std::string>();
+        const std::vector<int32_t> tokens = usage_tokenizer.encode(content);
+        json out{{"count", tokens.size()}};
+        if (req.value("return_tokens", false)) out["tokens"] = tokens;
+        res.set_content(dump_json(out), "application/json");
+    };
+    svr.Post("/tokenize", handle_tokenize);
+    svr.Post("/v1/tokenize", handle_tokenize);
+
     // Build GenerationOptions from common OpenAI fields. Sampling defaults to
     // the Qwen3-recommended preset for the request's thinking mode (see below);
     // any field the client sends overrides it.
@@ -1120,17 +1762,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         const int remaining_ctx =
             std::max(1, engine.ctx_size - static_cast<int>(prompt_token_count));
-        const bool has_max_tokens =
-            req.contains("max_tokens") || req.contains("max_completion_tokens");
+        bool has_max_tokens = false;
+        int requested_max_tokens = 0;
+        std::string max_tokens_error;
+        if (!parse_explicit_max_tokens(req, has_max_tokens,
+                                       requested_max_tokens,
+                                       max_tokens_error)) {
+            throw std::invalid_argument(max_tokens_error);
+        }
         if (has_max_tokens) {
-            g.max_tokens = req.value("max_tokens",
-                                     req.value("max_completion_tokens", remaining_ctx));
-            if (g.max_tokens <= 0) g.max_tokens = remaining_ctx;
+            // 0 has an intentional, first-class meaning: execute the complete
+            // prefill/state-update path without entering sampling or decode.
+            g.max_tokens = requested_max_tokens;
         } else {
             g.max_tokens = cfg.default_max_tokens_set
                 ? cfg.default_generation.max_tokens
                 : remaining_ctx;
-            if (g.max_tokens <= 0) g.max_tokens = remaining_ctx;
         }
         if (cfg.default_max_tokens_set &&
             cfg.default_generation.max_tokens > 0 &&
@@ -1167,8 +1814,90 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.seed = req.value("seed", g.seed);
         g.ignore_eos = req.value("ignore_eos",
                                  req.value("ignore_eos_token", g.ignore_eos));
+        g.recover_thinking_eos = req.value("recover_thinking_eos", enable_thinking);
         g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
         if (g.thinking_budget < 0) g.thinking_budget = 0;
+
+        // ARCHIVED DeltaNet-state debug entry (2026-07-23).
+        //
+        // The frozen LongMemEval-M error-10 experiments did not show a stable,
+        // attributable gain:
+        //   * replace accumulated recurrent state with a state rebuilt from the
+        //     selected 224K source tokens: 1/10 with the inline grader, but 6/10
+        //     when the same outputs were rejudged by DeepSeek V4 Pro;
+        //   * retain the accumulated state and replay the same selected tokens as
+        //     additional DeltaNet updates: 5/10 with the inline grader.
+        // Exporting one ~229K-token state also cost about 91 seconds and wrote a
+        // ~150.5 MiB artifact per sample. Because the score depended strongly on
+        // judge route and neither construction isolated a reliable improvement,
+        // export/import/capture/seed are no longer supported request controls.
+        // Keep rejecting the retired names instead of silently ignoring an old
+        // experiment script and accidentally reporting a normal KVMem result.
+        static constexpr const char *kArchivedRebuiltStateFields[] = {
+            "kvmem_rebuilt_state_export",
+            "kvmem_rebuilt_state_import",
+            "kvmem_rebuilt_state_capture",
+            "kvmem_rebuilt_state_seed",
+        };
+        for (const char *field : kArchivedRebuiltStateFields) {
+            if (req.contains(field)) {
+                throw std::invalid_argument(
+                    std::string(field) +
+                    " is archived and disabled; see KVMI-012");
+            }
+        }
+
+#if 0  // Archived DeltaNet recurrent-state debug parser; see note above.
+        auto parse_rebuilt_state_key = [&](const char *field,
+                                           std::string &out) {
+            if (!req.contains(field)) return;
+            if (!req[field].is_string()) {
+                throw std::invalid_argument(std::string(field) +
+                                            " must be a string key");
+            }
+            out = req[field].get<std::string>();
+            const bool valid = !out.empty() && out.size() <= 128 &&
+                std::all_of(out.begin(), out.end(), [](unsigned char c) {
+                    return std::isalnum(c) || c == '-' || c == '_' || c == '.';
+                });
+            if (!valid) {
+                throw std::invalid_argument(
+                    std::string(field) +
+                    " must contain 1..128 characters from [A-Za-z0-9_.-]");
+            }
+        };
+        parse_rebuilt_state_key("kvmem_rebuilt_state_export",
+                                g.kvmem_rebuilt_state_export_key);
+        parse_rebuilt_state_key("kvmem_rebuilt_state_import",
+                                g.kvmem_rebuilt_state_import_key);
+        parse_rebuilt_state_key("kvmem_rebuilt_state_capture",
+                                g.kvmem_rebuilt_state_capture_key);
+        parse_rebuilt_state_key("kvmem_rebuilt_state_seed",
+                                g.kvmem_rebuilt_state_seed_key);
+        if (!g.kvmem_rebuilt_state_export_key.empty() &&
+            !g.kvmem_rebuilt_state_import_key.empty()) {
+            throw std::invalid_argument(
+                "kvmem_rebuilt_state_export and kvmem_rebuilt_state_import "
+                "are mutually exclusive");
+        }
+        if (!g.kvmem_rebuilt_state_capture_key.empty() &&
+            (!g.kvmem_rebuilt_state_export_key.empty() ||
+             !g.kvmem_rebuilt_state_import_key.empty() ||
+             !g.kvmem_rebuilt_state_seed_key.empty())) {
+            throw std::invalid_argument(
+                "kvmem_rebuilt_state_capture cannot be combined with other "
+                "rebuilt-state operations");
+        }
+        if (!g.kvmem_rebuilt_state_seed_key.empty() &&
+            g.kvmem_rebuilt_state_export_key.empty()) {
+            throw std::invalid_argument(
+                "kvmem_rebuilt_state_seed requires kvmem_rebuilt_state_export");
+        }
+        if (!g.kvmem_rebuilt_state_export_key.empty() && g.max_tokens != 0) {
+            throw std::invalid_argument(
+                "kvmem_rebuilt_state_export requires max_tokens=0");
+        }
+#endif
         return g;
     };
 
@@ -1187,6 +1916,152 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             res.status = 400;
             res.set_content(dump_json(json{{"error", "missing messages[]"}}),
                             "application/json");
+            return;
+        }
+        bool explicit_max_tokens = false;
+        int requested_max_tokens = 0;
+        std::string max_tokens_error;
+        if (!parse_explicit_max_tokens(req, explicit_max_tokens,
+                                       requested_max_tokens,
+                                       max_tokens_error)) {
+            set_error_response(res, 400, max_tokens_error);
+            return;
+        }
+        const bool prefill_only = explicit_max_tokens
+            ? requested_max_tokens == 0
+            : (cfg.default_max_tokens_set &&
+               cfg.default_generation.max_tokens == 0);
+        KvMemReselectMode kvmem_reselect_mode = KvMemReselectMode::Auto;
+        if (req.contains("kvmem_reselect")) {
+            if (!req["kvmem_reselect"].is_string()) {
+                set_error_response(res, 400,
+                                   "kvmem_reselect must be auto|force|off");
+                return;
+            }
+            const std::string mode = req["kvmem_reselect"].get<std::string>();
+            if (mode == "auto") {
+                kvmem_reselect_mode = KvMemReselectMode::Auto;
+            } else if (mode == "force") {
+                kvmem_reselect_mode = KvMemReselectMode::Force;
+            } else if (mode == "off") {
+                kvmem_reselect_mode = KvMemReselectMode::Off;
+            } else {
+                set_error_response(res, 400,
+                                   "kvmem_reselect must be auto|force|off");
+                return;
+            }
+        }
+        KvMemPrefillWindowMode kvmem_prefill_window_mode =
+            KvMemPrefillWindowMode::Pressure;
+        if (req.contains("kvmem_prefill_window")) {
+            if (!req["kvmem_prefill_window"].is_string()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_prefill_window must be pressure|keep_selected");
+                return;
+            }
+            const std::string mode =
+                req["kvmem_prefill_window"].get<std::string>();
+            if (mode == "pressure") {
+                kvmem_prefill_window_mode =
+                    KvMemPrefillWindowMode::Pressure;
+            } else if (mode == "keep_selected") {
+                kvmem_prefill_window_mode =
+                    KvMemPrefillWindowMode::KeepSelected;
+            } else {
+                set_error_response(
+                    res, 400,
+                    "kvmem_prefill_window must be pressure|keep_selected");
+                return;
+            }
+        }
+        bool kvmem_session_request = false;
+        bool kvmem_session_reset = false;
+        std::string kvmem_session_id;
+        std::string kvmem_session_op;
+        if (req.contains("kvmem_session_id") ||
+            req.contains("kvmem_session_op")) {
+            if (!req.contains("kvmem_session_id") ||
+                !req["kvmem_session_id"].is_string() ||
+                req["kvmem_session_id"].get<std::string>().empty()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_id must be a non-empty string");
+                return;
+            }
+            if (!req.contains("kvmem_session_op") ||
+                !req["kvmem_session_op"].is_string()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_op must be start|append|finish");
+                return;
+            }
+            kvmem_session_id = req["kvmem_session_id"].get<std::string>();
+            kvmem_session_op = req["kvmem_session_op"].get<std::string>();
+            if (kvmem_session_op != "start" &&
+                kvmem_session_op != "append" &&
+                kvmem_session_op != "finish") {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_op must be start|append|finish");
+                return;
+            }
+            if (!engine.kvmem_enabled) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_* requires --kvmem");
+                return;
+            }
+            kvmem_session_request = true;
+            kvmem_session_reset = kvmem_session_op == "start";
+            if (kvmem_session_op != "finish" && !prefill_only) {
+                set_error_response(
+                    res, 400,
+                    "kvmem session start/append requires max_tokens=0");
+                return;
+            }
+            if (kvmem_session_reset &&
+                kvmem_prefill_window_mode ==
+                    KvMemPrefillWindowMode::KeepSelected) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_prefill_window=keep_selected requires an active "
+                    "session selection");
+                return;
+            }
+        }
+        const bool has_kvmem_query =
+            req.contains("kvmem_query_span") ||
+            req.contains("kvmem_query_message_range");
+        if (kvmem_reselect_mode == KvMemReselectMode::Force &&
+            !has_kvmem_query) {
+            set_error_response(
+                res, 400,
+                "kvmem_reselect=force requires kvmem_query_span or "
+                "kvmem_query_message_range");
+            return;
+        }
+        if (kvmem_reselect_mode == KvMemReselectMode::Force &&
+            !engine.kvmem_query_conditioned) {
+            set_error_response(
+                res, 400,
+                "kvmem_reselect=force requires --kvmem-query-conditioned");
+            return;
+        }
+        if (kvmem_reselect_mode == KvMemReselectMode::Off &&
+            has_kvmem_query) {
+            set_error_response(
+                res, 400,
+                "KVMem query metadata cannot be used with "
+                "kvmem_reselect=off");
+            return;
+        }
+        if (req.contains("kvmem_query_span") &&
+            req.contains("kvmem_query_message_range")) {
+            set_error_response(
+                res, 400,
+                "kvmem_query_span and kvmem_query_message_range are "
+                "mutually exclusive");
             return;
         }
         const bool enable_thinking =
@@ -1212,9 +2087,37 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
             std::cerr << "\n";
         }
-        const std::string prompt =
-            render_messages(req["messages"], tools, enable_thinking, forced_tool_name);
-        const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
+        bool transcript_replay = false;
+        if (req.contains("kvmem_transcript_replay")) {
+            if (!req["kvmem_transcript_replay"].is_boolean()) {
+                set_error_response(res, 400,
+                                   "kvmem_transcript_replay must be a boolean");
+                return;
+            }
+            transcript_replay = req["kvmem_transcript_replay"].get<bool>();
+        }
+        if (transcript_replay &&
+            (!engine.kvmem_enabled || !engine.kvmem_query_conditioned)) {
+            set_error_response(
+                res, 400,
+                "kvmem_transcript_replay requires --kvmem and "
+                "--kvmem-query-conditioned");
+            return;
+        }
+        if (transcript_replay && engine.kvmem_retrieval_method != "mean-k") {
+            set_error_response(
+                res, 400,
+                "kvmem_transcript_replay currently requires mean-k retrieval");
+            return;
+        }
+        std::vector<RenderedMessageSpan> rendered_message_spans;
+        const std::string prompt = render_messages(
+            req["messages"], tools, enable_thinking, forced_tool_name,
+            transcript_replay ? &rendered_message_spans : nullptr,
+            /*add_generation_prompt=*/!prefill_only);
+        const std::vector<int32_t> prompt_token_ids =
+            usage_tokenizer.encode(prompt);
+        const size_t prompt_token_count = prompt_token_ids.size();
         if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
             set_error_response(
                 res,
@@ -1227,6 +2130,140 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         GenerationOptions g = make_gen(req, prompt_token_count, enable_thinking);
         g.raw_prompt = true; // prompt is already chat-framed
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
+        g.kvmem_reselect_mode = kvmem_reselect_mode;
+        g.kvmem_prefill_window_mode = kvmem_prefill_window_mode;
+        g.kvmem_session_id = kvmem_session_id;
+
+        // One-shot selected-context cache refresh ablation. This never uses
+        // trace dumps or cross-request artifacts: the native backend performs
+        // the long prefill, freezes the final selection, and rebuilds that
+        // compact context inside the same request. Keep it explicitly gated so
+        // production clients cannot opt into an expensive representation test.
+        if (req.contains("kvmem_inline_refresh")) {
+            if (!engine.kvmem_enabled) {
+                set_error_response(
+                    res, 400, "kvmem_inline_refresh requires --kvmem");
+                return;
+            }
+            if (!env_flag_enabled("QW3_KVMEM_ENABLE_INLINE_REFRESH")) {
+                set_error_response(
+                    res, 403,
+                    "kvmem_inline_refresh is disabled; set "
+                    "QW3_KVMEM_ENABLE_INLINE_REFRESH=1 for controlled "
+                    "diagnostics");
+                return;
+            }
+            if (!req["kvmem_inline_refresh"].is_string()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_inline_refresh must be \"kv_only\" or "
+                    "\"kv_and_state\"");
+                return;
+            }
+            const std::string mode =
+                req["kvmem_inline_refresh"].get<std::string>();
+            if (mode == "kv_only") {
+                g.kvmem_inline_refresh = KvMemInlineRefreshMode::KvOnly;
+            } else if (mode == "kv_and_state") {
+                g.kvmem_inline_refresh =
+                    KvMemInlineRefreshMode::KvAndState;
+            } else {
+                set_error_response(
+                    res, 400,
+                    "kvmem_inline_refresh must be \"kv_only\" or "
+                    "\"kv_and_state\"");
+                return;
+            }
+            if (transcript_replay || !kvmem_session_id.empty()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_inline_refresh requires a standalone one-shot "
+                    "request");
+                return;
+            }
+            std::cerr << "[qw3-serve] KVMem INLINE REFRESH enabled mode="
+                      << mode << " prompt_tokens=" << prompt_token_count
+                      << "\n";
+        }
+
+        // Diagnostics-only oracle selection. The benchmark caller supplies
+        // exact rendered-prompt token spans after verifying tokenizer parity.
+        // Keeping this behind an explicit environment gate prevents a normal
+        // API client from accidentally turning gold provenance into a product
+        // feature or contaminating production evaluations.
+        if (req.contains("kvmem_oracle_token_spans")) {
+            if (!engine.kvmem_enabled) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_oracle_token_spans requires --kvmem");
+                return;
+            }
+            if (transcript_replay) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_oracle_token_spans is a final-query-only control "
+                    "and cannot be combined with kvmem_transcript_replay");
+                return;
+            }
+            if (!env_flag_enabled("QW3_KVMEM_ENABLE_ORACLE")) {
+                set_error_response(
+                    res, 403,
+                    "kvmem_oracle_token_spans is disabled; set "
+                    "QW3_KVMEM_ENABLE_ORACLE=1 for controlled diagnostics");
+                return;
+            }
+            const json &spans = req["kvmem_oracle_token_spans"];
+            if (!spans.is_array() || spans.empty() || spans.size() > 64) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_oracle_token_spans must be an array of 1..64 spans");
+                return;
+            }
+            for (const json &span : spans) {
+                if (!span.is_object() || !span.contains("begin") ||
+                    !span.contains("end") ||
+                    !span["begin"].is_number_integer() ||
+                    !span["end"].is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "each kvmem_oracle_token_spans entry requires integer "
+                        "begin and end");
+                    return;
+                }
+                const int64_t begin = span["begin"].get<int64_t>();
+                const int64_t end = span["end"].get<int64_t>();
+                if (begin < 0 || end <= begin ||
+                    end > static_cast<int64_t>(prompt_token_count)) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_oracle_token_spans entry is outside the "
+                        "rendered prompt");
+                    return;
+                }
+                g.kvmem_oracle_token_spans.push_back(
+                    GenerationOptions::KvMemOracleTokenSpan{
+                        static_cast<uint32_t>(begin),
+                        static_cast<uint32_t>(end)});
+            }
+            if (req.contains("kvmem_oracle_only")) {
+                if (!req["kvmem_oracle_only"].is_boolean()) {
+                    set_error_response(
+                        res, 400, "kvmem_oracle_only must be a boolean");
+                    return;
+                }
+                g.kvmem_oracle_only =
+                    req["kvmem_oracle_only"].get<bool>();
+            }
+            std::cerr << "[qw3-serve] KVMem ORACLE enabled spans="
+                      << g.kvmem_oracle_token_spans.size()
+                      << " only=" << (g.kvmem_oracle_only ? 1 : 0)
+                      << " prompt_tokens=" << prompt_token_count << "\n";
+        } else if (req.contains("kvmem_oracle_only")) {
+            set_error_response(
+                res, 400,
+                "kvmem_oracle_only requires kvmem_oracle_token_spans");
+            return;
+        }
 
         // Query-conditioned KVMem: mark the final user message's token span so
         // the executor selects the decode window by multi-token mean relevance
@@ -1237,28 +2274,416 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         // suffix fall in the shared prefix/suffix). Only when the server was
         // launched with --kvmem-query-conditioned; otherwise the span stays empty
         // and selection is byte-identical to the single-token / recency path.
-        if (engine.kvmem_query_conditioned) {
+        if (engine.kvmem_query_conditioned &&
+            kvmem_reselect_mode != KvMemReselectMode::Off) {
             const json &msgs = req["messages"];
-            const size_t lqi = last_query_index_for_template(msgs);
-            if (lqi < msgs.size() && msgs[lqi].is_object() &&
-                msgs[lqi].value("role", "") == "user") {
-                json msgs_empty = msgs;
-                msgs_empty[lqi]["content"] = "";
+            bool explicit_span = false;
+
+            // Experimental whole-round query. Unlike kvmem_query_span, which
+            // marks bytes inside one message, this half-open message range can
+            // cover a role-preserving user/assistant/tool round. Re-rendering
+            // with those messages removed and taking the token LCP/LCS keeps
+            // the mapping exact across chat-template control tokens. The
+            // ordinary API path never sends this field.
+            if (req.contains("kvmem_query_message_range")) {
+                const json &range = req["kvmem_query_message_range"];
+                if (!range.is_object() ||
+                    !range.contains("message_begin") ||
+                    !range.contains("message_end") ||
+                    !range["message_begin"].is_number_integer() ||
+                    !range["message_end"].is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_message_range requires integer "
+                        "message_begin and message_end");
+                    return;
+                }
+                const int64_t message_begin =
+                    range["message_begin"].get<int64_t>();
+                const int64_t message_end =
+                    range["message_end"].get<int64_t>();
+                if (message_begin < 0 || message_end <= message_begin ||
+                    message_end > static_cast<int64_t>(msgs.size())) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_message_range is outside messages[]");
+                    return;
+                }
+                if (transcript_replay) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_message_range cannot be combined with "
+                        "kvmem_transcript_replay");
+                    return;
+                }
+
+                json msgs_empty = json::array();
+                for (size_t i = 0; i < msgs.size(); ++i) {
+                    if (i < static_cast<size_t>(message_begin) ||
+                        i >= static_cast<size_t>(message_end)) {
+                        msgs_empty.push_back(msgs[i]);
+                    }
+                }
                 const std::string empty_prompt = render_messages(
-                    msgs_empty, tools, enable_thinking, forced_tool_name);
+                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    /*message_spans=*/nullptr,
+                    /*add_generation_prompt=*/!prefill_only);
+                const std::vector<int32_t> tok_empty =
+                    usage_tokenizer.encode(empty_prompt);
+                size_t qb = 0;
+                const size_t prefix_max =
+                    std::min(prompt_token_ids.size(), tok_empty.size());
+                while (qb < prefix_max &&
+                       prompt_token_ids[qb] == tok_empty[qb]) {
+                    ++qb;
+                }
+                size_t suffix = 0;
+                while (suffix < prompt_token_ids.size() - qb &&
+                       suffix < tok_empty.size() - qb &&
+                       prompt_token_ids[prompt_token_ids.size() - 1 - suffix] ==
+                           tok_empty[tok_empty.size() - 1 - suffix]) {
+                    ++suffix;
+                }
+                const size_t qe = prompt_token_ids.size() - suffix;
+                if (qe <= qb) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_message_range maps to an empty token "
+                        "span");
+                    return;
+                }
+                g.kvmem_query_begin = static_cast<uint32_t>(qb);
+                g.kvmem_query_end = static_cast<uint32_t>(qe);
+                explicit_span = true;
+                std::cerr
+                    << "[qw3-serve] kvmem explicit query message range ["
+                    << message_begin << "," << message_end << ") -> tokens ["
+                    << qb << "," << qe << ") of "
+                    << prompt_token_ids.size() << "\n";
+            }
+
+            // Experimental role-preserving transcript replay. Render-time byte
+            // spans are converted to exact token spans in one linear pass over
+            // message segments. Segment boundaries are Qwen special-token
+            // boundaries; verify compositional tokenization against the full
+            // prompt before accepting the mapping. Only user messages that
+            // ARRIVE after select_budget + gen_budget is already full become
+            // replay/reselection events.
+            if (transcript_replay) {
+                std::vector<int32_t> rebuilt;
+                rebuilt.reserve(prompt_token_ids.size());
+                size_t byte_cursor = 0;
+                size_t token_cursor = 0;
+                const uint64_t pressure_threshold =
+                    static_cast<uint64_t>(std::max(0, engine.kvmem_budget)) +
+                    static_cast<uint64_t>(std::max(0, engine.kvmem_gen_budget));
+                for (const RenderedMessageSpan &span : rendered_message_spans) {
+                    const std::string gap = prompt.substr(
+                        byte_cursor, span.segment_begin - byte_cursor);
+                    const std::vector<int32_t> gap_tokens =
+                        usage_tokenizer.encode(gap);
+                    rebuilt.insert(rebuilt.end(), gap_tokens.begin(), gap_tokens.end());
+                    token_cursor += gap_tokens.size();
+
+                    const std::string segment = prompt.substr(
+                        span.segment_begin, span.segment_end - span.segment_begin);
+                    const std::vector<int32_t> segment_tokens =
+                        usage_tokenizer.encode(segment);
+                    const size_t segment_token_begin = token_cursor;
+                    if (span.message_index < msgs.size() &&
+                        msgs[span.message_index].is_object() &&
+                        msgs[span.message_index].contains(
+                            "kvmem_session_start")) {
+                        const json &marker =
+                            msgs[span.message_index]["kvmem_session_start"];
+                        if (!marker.is_boolean()) {
+                            set_error_response(
+                                res, 400,
+                                "message kvmem_session_start must be a boolean");
+                            return;
+                        }
+                        if (marker.get<bool>()) {
+                            g.kvmem_replay_session_starts.push_back(
+                                static_cast<uint32_t>(segment_token_begin));
+                        }
+                    }
+                    if (span.role == "user") {
+                        std::string empty_segment = segment;
+                        const size_t local_content_begin =
+                            span.content_begin - span.segment_begin;
+                        const size_t local_content_end =
+                            span.content_end - span.segment_begin;
+                        empty_segment.erase(
+                            local_content_begin,
+                            local_content_end - local_content_begin);
+                        const std::vector<int32_t> empty_tokens =
+                            usage_tokenizer.encode(empty_segment);
+                        size_t local_qb = 0;
+                        const size_t prefix_max =
+                            std::min(segment_tokens.size(), empty_tokens.size());
+                        while (local_qb < prefix_max &&
+                               segment_tokens[local_qb] == empty_tokens[local_qb]) {
+                            ++local_qb;
+                        }
+                        size_t suffix = 0;
+                        while (suffix < segment_tokens.size() - local_qb &&
+                               suffix < empty_tokens.size() - local_qb &&
+                               segment_tokens[segment_tokens.size() - 1 - suffix] ==
+                                   empty_tokens[empty_tokens.size() - 1 - suffix]) {
+                            ++suffix;
+                        }
+                        const size_t local_qe = segment_tokens.size() - suffix;
+                        if (local_qe > local_qb &&
+                            segment_token_begin >= pressure_threshold) {
+                            g.kvmem_replay_query_spans.push_back(
+                                GenerationOptions::KvMemReplayQuerySpan{
+                                    static_cast<uint32_t>(segment_token_begin +
+                                                          local_qb),
+                                    static_cast<uint32_t>(segment_token_begin +
+                                                          local_qe)});
+                        }
+                    }
+                    rebuilt.insert(rebuilt.end(), segment_tokens.begin(),
+                                   segment_tokens.end());
+                    token_cursor += segment_tokens.size();
+                    byte_cursor = span.segment_end;
+                }
+                const std::vector<int32_t> tail_tokens =
+                    usage_tokenizer.encode(prompt.substr(byte_cursor));
+                rebuilt.insert(rebuilt.end(), tail_tokens.begin(), tail_tokens.end());
+                if (rebuilt != prompt_token_ids) {
+                    set_error_response(
+                        res, 500,
+                        "kvmem_transcript_replay token-span mapping was not "
+                        "compositional at message boundaries");
+                    return;
+                }
+                if (g.kvmem_replay_query_spans.empty()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_transcript_replay found no user query arriving "
+                        "after the KVMem pressure threshold");
+                    return;
+                }
+                const auto &last = g.kvmem_replay_query_spans.back();
+                g.kvmem_query_begin = last.begin;
+                g.kvmem_query_end = last.end;
+                explicit_span = true;
+                std::cerr << "[qw3-serve] kvmem transcript replay: events="
+                          << g.kvmem_replay_query_spans.size()
+                          << " sessions="
+                          << g.kvmem_replay_session_starts.size()
+                          << " threshold=" << pressure_threshold
+                          << " first=[" << g.kvmem_replay_query_spans.front().begin
+                          << "," << g.kvmem_replay_query_spans.front().end << ")"
+                          << " last=[" << last.begin << "," << last.end << ")"
+                          << " prompt_tokens=" << prompt_token_count << "\n";
+            }
+
+            // Optional diagnostics-only sample key. Restrict it to a compact,
+            // JSON-safe alphabet because the executor's score dump is written
+            // directly with fprintf. It is never consumed by retrieval logic.
+            if (req.contains("kvmem_trace_tag")) {
+                if (!req["kvmem_trace_tag"].is_string()) {
+                    set_error_response(res, 400,
+                                       "kvmem_trace_tag must be a string");
+                    return;
+                }
+                const std::string tag = req["kvmem_trace_tag"].get<std::string>();
+                const bool tag_ok = !tag.empty() && tag.size() <= 128 &&
+                    std::all_of(tag.begin(), tag.end(), [](unsigned char c) {
+                        return std::isalnum(c) || c == '-' || c == '_' ||
+                               c == '.' || c == ':';
+                    });
+                if (!tag_ok) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_trace_tag must be 1..128 characters from "
+                        "[A-Za-z0-9_.:-]");
+                    return;
+                }
+                g.kvmem_trace_tag = tag;
+            }
+
+            // Optional diagnostics-only span for the benchmark history. It is
+            // mapped from UTF-8 content bytes to exact rendered-prompt tokens by
+            // the same remove-and-diff procedure used for the query span. The
+            // resulting bounds are exported with selected KVMem blocks, enabling
+            // offline projection into the RAG history coordinate system.
+            if (req.contains("kvmem_context_span")) {
+                const json &span = req["kvmem_context_span"];
+                if (!span.is_object() || !span.contains("message_index") ||
+                    !span.contains("content_start") ||
+                    !span.contains("content_end") ||
+                    !span["message_index"].is_number_integer() ||
+                    !span["content_start"].is_number_integer() ||
+                    !span["content_end"].is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_context_span requires integer message_index, "
+                        "content_start, and content_end");
+                    return;
+                }
+                const int64_t message_index = span["message_index"].get<int64_t>();
+                const int64_t content_start = span["content_start"].get<int64_t>();
+                const int64_t content_end = span["content_end"].get<int64_t>();
+                if (message_index < 0 ||
+                    message_index >= static_cast<int64_t>(msgs.size()) ||
+                    !msgs[static_cast<size_t>(message_index)].is_object() ||
+                    !msgs[static_cast<size_t>(message_index)].contains("content") ||
+                    !msgs[static_cast<size_t>(message_index)]["content"].is_string()) {
+                    set_error_response(res, 400,
+                                       "kvmem_context_span message_index does not "
+                                       "reference a string-content message");
+                    return;
+                }
+                const std::string content =
+                    msgs[static_cast<size_t>(message_index)]["content"]
+                        .get<std::string>();
+                if (content_start < 0 || content_end <= content_start ||
+                    content_end > static_cast<int64_t>(content.size())) {
+                    set_error_response(res, 400,
+                                       "kvmem_context_span content offsets are "
+                                       "outside the message content");
+                    return;
+                }
+                json msgs_empty = msgs;
+                std::string content_empty = content;
+                content_empty.erase(static_cast<size_t>(content_start),
+                                    static_cast<size_t>(content_end - content_start));
+                msgs_empty[static_cast<size_t>(message_index)]["content"] =
+                    std::move(content_empty);
+                const std::string empty_prompt = render_messages(
+                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    /*message_spans=*/nullptr,
+                    /*add_generation_prompt=*/!prefill_only);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
-                if (tok_full.size() > tok_empty.size()) {
-                    size_t qb = 0;
-                    const size_t maxn = tok_empty.size();
-                    while (qb < maxn && tok_full[qb] == tok_empty[qb]) ++qb;
-                    const size_t qe = qb + (tok_full.size() - tok_empty.size());
+                size_t cb = 0;
+                const size_t prefix_max = std::min(tok_full.size(), tok_empty.size());
+                while (cb < prefix_max && tok_full[cb] == tok_empty[cb]) ++cb;
+                size_t suffix = 0;
+                while (suffix < tok_full.size() - cb &&
+                       suffix < tok_empty.size() - cb &&
+                       tok_full[tok_full.size() - 1 - suffix] ==
+                           tok_empty[tok_empty.size() - 1 - suffix]) {
+                    ++suffix;
+                }
+                const size_t ce = tok_full.size() - suffix;
+                if (ce <= cb) {
+                    set_error_response(res, 400,
+                                       "kvmem_context_span maps to an empty token span");
+                    return;
+                }
+                g.kvmem_context_begin = static_cast<uint32_t>(cb);
+                g.kvmem_context_end = static_cast<uint32_t>(ce);
+                if (std::getenv("QW3_KVMEM_TRACE")) {
+                    std::cerr << "[qw3-serve] kvmem context span [" << cb
+                              << "," << ce << ") of " << tok_full.size()
+                              << " prompt tokens, tag="
+                              << (g.kvmem_trace_tag.empty() ? "(none)"
+                                                           : g.kvmem_trace_tag)
+                              << "\n";
+                }
+            }
+
+            // Optional API extension for benchmarks whose exact canonical
+            // prompt is one long user message containing both history and the
+            // final question.  Offsets are UTF-8 byte offsets into that
+            // message's content.  Removing only the marked substring and
+            // comparing the two chat renderings preserves the exact model
+            // prompt while still identifying the true retrieval query.
+            if (req.contains("kvmem_query_span")) {
+                const json &span = req["kvmem_query_span"];
+                if (!span.is_object() || !span.contains("message_index") ||
+                    !span.contains("content_start") ||
+                    !span.contains("content_end") ||
+                    !span["message_index"].is_number_integer() ||
+                    !span["content_start"].is_number_integer() ||
+                    !span["content_end"].is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_query_span requires integer message_index, "
+                        "content_start, and content_end");
+                    return;
+                }
+                const int64_t message_index = span["message_index"].get<int64_t>();
+                const int64_t content_start = span["content_start"].get<int64_t>();
+                const int64_t content_end = span["content_end"].get<int64_t>();
+                if (message_index < 0 ||
+                    message_index >= static_cast<int64_t>(msgs.size()) ||
+                    !msgs[static_cast<size_t>(message_index)].is_object() ||
+                    !msgs[static_cast<size_t>(message_index)].contains("content") ||
+                    !msgs[static_cast<size_t>(message_index)]["content"].is_string()) {
+                    set_error_response(res, 400,
+                                       "kvmem_query_span message_index does not "
+                                       "reference a string-content message");
+                    return;
+                }
+                const std::string content =
+                    msgs[static_cast<size_t>(message_index)]["content"]
+                        .get<std::string>();
+                if (content_start < 0 || content_end <= content_start ||
+                    content_end > static_cast<int64_t>(content.size())) {
+                    set_error_response(res, 400,
+                                       "kvmem_query_span content offsets are "
+                                       "outside the message content");
+                    return;
+                }
+
+                json msgs_empty = msgs;
+                std::string content_empty = content;
+                content_empty.erase(static_cast<size_t>(content_start),
+                                    static_cast<size_t>(content_end - content_start));
+                msgs_empty[static_cast<size_t>(message_index)]["content"] =
+                    std::move(content_empty);
+                const std::string empty_prompt = render_messages(
+                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    /*message_spans=*/nullptr,
+                    /*add_generation_prompt=*/!prefill_only);
+                const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
+                const std::vector<int32_t> tok_empty =
+                    usage_tokenizer.encode(empty_prompt);
+                size_t qb = 0;
+                const size_t prefix_max = std::min(tok_full.size(), tok_empty.size());
+                while (qb < prefix_max && tok_full[qb] == tok_empty[qb]) ++qb;
+                size_t suffix = 0;
+                while (suffix < tok_full.size() - qb &&
+                       suffix < tok_empty.size() - qb &&
+                       tok_full[tok_full.size() - 1 - suffix] ==
+                           tok_empty[tok_empty.size() - 1 - suffix]) {
+                    ++suffix;
+                }
+                const size_t qe = tok_full.size() - suffix;
+                if (qe > qb) {
                     g.kvmem_query_begin = static_cast<uint32_t>(qb);
                     g.kvmem_query_end = static_cast<uint32_t>(qe);
-                    std::cerr << "[qw3-serve] kvmem query span [" << qb << ","
-                              << qe << ") of " << tok_full.size()
-                              << " prompt tokens\n";
+                    if (transcript_replay) {
+                        // The transcript mapper initially records the complete
+                        // arriving user-message content. An explicit subspan on
+                        // that final message is the actual retrieval query, so
+                        // keep the answer-producing replay event and the global
+                        // query coordinates identical. Intermediate historical
+                        // user events retain their complete-message spans.
+                        if (g.kvmem_replay_query_spans.empty()) {
+                            set_error_response(
+                                res, 400,
+                                "explicit transcript query span has no final "
+                                "replay event");
+                            return;
+                        }
+                        g.kvmem_replay_query_spans.back().begin =
+                            static_cast<uint32_t>(qb);
+                        g.kvmem_replay_query_spans.back().end =
+                            static_cast<uint32_t>(qe);
+                    }
+                    explicit_span = true;
+                    std::cerr << "[qw3-serve] kvmem explicit query span ["
+                              << qb << "," << qe << ") of " << tok_full.size()
+                              << " prompt tokens, message=" << message_index
+                              << " content_bytes=[" << content_start << ","
+                              << content_end << ")\n";
                     if (std::getenv("QW3_KVMEM_TRACE")) {
                         const std::vector<int32_t> slice(
                             tok_full.begin() + static_cast<long>(qb),
@@ -1270,11 +2695,56 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     }
                 }
             }
+
+            // Existing default behavior is deliberately unchanged when the
+            // explicit field is absent: use the complete final user message.
+            if (!explicit_span && !req.contains("kvmem_query_span")) {
+                const size_t lqi = last_query_index_for_template(msgs);
+                if (lqi < msgs.size() && msgs[lqi].is_object() &&
+                    msgs[lqi].value("role", "") == "user") {
+                    json msgs_empty = msgs;
+                    msgs_empty[lqi]["content"] = "";
+                    const std::string empty_prompt = render_messages(
+                        msgs_empty, tools, enable_thinking, forced_tool_name,
+                        /*message_spans=*/nullptr,
+                        /*add_generation_prompt=*/!prefill_only);
+                    const std::vector<int32_t> tok_full =
+                        usage_tokenizer.encode(prompt);
+                    const std::vector<int32_t> tok_empty =
+                        usage_tokenizer.encode(empty_prompt);
+                    if (tok_full.size() > tok_empty.size()) {
+                        size_t qb = 0;
+                        const size_t maxn = tok_empty.size();
+                        while (qb < maxn && tok_full[qb] == tok_empty[qb]) ++qb;
+                        const size_t qe =
+                            qb + (tok_full.size() - tok_empty.size());
+                        g.kvmem_query_begin = static_cast<uint32_t>(qb);
+                        g.kvmem_query_end = static_cast<uint32_t>(qe);
+                        std::cerr << "[qw3-serve] kvmem query span [" << qb
+                                  << "," << qe << ") of " << tok_full.size()
+                                  << " prompt tokens\n";
+                        if (std::getenv("QW3_KVMEM_TRACE")) {
+                            const std::vector<int32_t> slice(
+                                tok_full.begin() + static_cast<long>(qb),
+                                tok_full.begin() + static_cast<long>(qe));
+                            std::string txt = usage_tokenizer.decode(slice);
+                            if (txt.size() > 200)
+                                txt = txt.substr(0, 200) + "...";
+                            std::cerr
+                                << "[qw3-serve] kvmem query span text: \""
+                                << txt << "\"\n";
+                        }
+                    }
+                }
+            }
         }
         g.continuous_batching =
+            !kvmem_session_request &&
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);
-        const std::string route = g.continuous_batching ? "continuous" : "plain";
+        const std::string route = kvmem_session_request
+            ? ("session-" + kvmem_session_op)
+            : (g.continuous_batching ? "continuous" : "plain");
         const std::string fallback_reason =
             g.continuous_batching ? "" :
             (serve_continuous_batching_enabled() ? "request_unsupported" : "disabled");
@@ -1295,12 +2765,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const json tools_schema = tools ? *tools : json();
 
         if (stream) {
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [&, prompt, g, stops, id, created, rid, enable_thinking,
                  tool_request, forced_tool_request, tools_schema,
                  stream_include_usage, prompt_token_count, route,
-                 fallback_reason](size_t, httplib::DataSink &sink) {
+                 fallback_reason, kvmem_session_request,
+                 kvmem_session_reset](size_t, httplib::DataSink &sink) {
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
                     if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
@@ -1309,13 +2782,20 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     size_t completion_tokens = 0;
                     bool stopped = false;
                     bool client_closed = false;
+                    auto last_stream_write = std::chrono::steady_clock::now();
                     auto send_raw = [&](const std::string &s) {
                         if (client_closed) return false;
+                        if (sink.is_writable && !sink.is_writable()) {
+                            client_closed = true;
+                            stopped = true;
+                            return false;
+                        }
                         if (!sink.write(s.data(), s.size())) {
                             client_closed = true;
                             stopped = true;
                             return false;
                         }
+                        last_stream_write = std::chrono::steady_clock::now();
                         return true;
                     };
                     auto send_delta = [&](const json &delta) {
@@ -1327,7 +2807,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"delta", delta},
                                 {"finish_reason", nullptr}}})}};
                         const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        send_raw(s);
+                        return send_raw(s);
                     };
                     auto send_role = [&]() {
                         json chunk = {
@@ -1368,8 +2848,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         sink.done();
                     };
                     try {
+                        auto generate_request =
+                            [&](const CancellableTokenCallback &callback) {
+                            if (kvmem_session_request) {
+                                eng.generate_session_stream(
+                                    prompt, g,
+                                    [&](const std::string &piece) {
+                                        (void)callback(piece);
+                                    },
+                                    kvmem_session_reset);
+                            } else {
+                                eng.generate_stream_cancellable(
+                                    prompt, g, callback);
+                            }
+                        };
                         send_role();
-                        if (enable_thinking) {
+                        if (enable_thinking && g.max_tokens > 0) {
                             send_delta(json{{"reasoning_content", ""}});
                         }
                         auto emit_text = [&](const std::string &text) {
@@ -1398,17 +2892,77 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         if (tool_request) {
                             // The model may stream natural-language reasoning
                             // before a <tool_call> block (the Hermes prompt
-                            // explicitly allows this), so we cannot classify the
-                            // response on its first token. Stream content
-                            // incrementally while scanning for a <tool_call>
-                            // marker anywhere; once it appears, stop streaming
-                            // and buffer the remainder so the full call is parsed
-                            // at the end from the accumulated text.
-                            bool buffering_tool = forced_tool_request;
+                            // explicitly allows this). Once a canonical call for
+                            // a string-only schema appears, transcode its XML
+                            // parameters into standard OpenAI argument deltas.
+                            // Recovery syntaxes stay on the full-buffer parser.
+                            bool buffering_tool = false;
                             bool streamed_content = false;
                             std::string content_pending;
-                            eng.generate_stream(prompt, g, [&](const std::string &piece) {
-                                if (stopped) return;
+                            std::string forced_prefix;
+                            const json *stream_tools =
+                                tools_schema.is_array() ? &tools_schema : nullptr;
+                            IncrementalToolCallStream incremental(stream_tools);
+                            auto last_tool_delta =
+                                std::chrono::steady_clock::now();
+                            size_t next_progress_tokens = 1024;
+                            constexpr size_t kArgumentFlushBytes = 1024;
+                            constexpr auto kArgumentFlushInterval =
+                                std::chrono::milliseconds(500);
+                            constexpr auto kToolHeartbeatInterval =
+                                std::chrono::seconds(2);
+
+                            auto flush_incremental = [&](bool force) {
+                                if (!incremental.streaming() || client_closed) return;
+                                if (incremental.start_pending()) {
+                                    send_delta(incremental.take_start_delta());
+                                    last_tool_delta =
+                                        std::chrono::steady_clock::now();
+                                }
+                                const auto now = std::chrono::steady_clock::now();
+                                if (incremental.pending_size() > 0 &&
+                                    (force ||
+                                     incremental.pending_size() >=
+                                         kArgumentFlushBytes ||
+                                     now - last_tool_delta >=
+                                         kArgumentFlushInterval)) {
+                                    send_delta(incremental.take_arguments_delta());
+                                    last_tool_delta = now;
+                                }
+                            };
+                            auto service_tool_stream = [&]() {
+                                flush_incremental(false);
+                                const auto now = std::chrono::steady_clock::now();
+                                if (!client_closed &&
+                                    now - last_stream_write >=
+                                        kToolHeartbeatInterval) {
+                                    // Empty OpenAI deltas are protocol-safe and
+                                    // keep read-idle timers alive even when the
+                                    // full tool call must remain buffered.
+                                    send_delta(json::object());
+                                }
+                                if (completion_tokens >= next_progress_tokens) {
+                                    const double elapsed =
+                                        std::chrono::duration<double>(
+                                            now - t0).count();
+                                    std::cerr << "[qw3-serve] #" << rid
+                                              << " tool_buffer_progress tokens="
+                                              << completion_tokens
+                                              << " chars=" << acc.size()
+                                              << " elapsed=" << elapsed << "s"
+                                              << " incremental="
+                                              << (incremental.streaming()
+                                                      ? "true" : "false")
+                                              << "\n";
+                                    do {
+                                        next_progress_tokens += 1024;
+                                    } while (completion_tokens >=
+                                             next_progress_tokens);
+                                }
+                            };
+
+                            generate_request([&](const std::string &piece) {
+                                if (stopped || client_closed) return false;
                                 ++completion_tokens;
                                 acc += piece;
                                 std::string emit = take_complete_utf8(utf8_pending, piece);
@@ -1425,25 +2979,74 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         emit = take_complete_utf8(utf8_pending, emit);
                                     }
                                 }
-                                if (buffering_tool || emit.empty()) return;
-                                content_pending += emit;
-                                bool marker_found = false;
-                                const size_t safe =
-                                    tool_call_safe_emit_len(content_pending, marker_found);
-                                if (safe > 0) {
-                                    emit_text(content_pending.substr(0, safe));
-                                    streamed_content = true;
-                                    content_pending.erase(0, safe);
+                                if (buffering_tool) {
+                                    if (!emit.empty()) incremental.feed(emit);
+                                } else if (!emit.empty()) {
+                                    content_pending += emit;
+                                    bool marker_found = false;
+                                    const size_t safe =
+                                        tool_call_safe_emit_len(
+                                            content_pending, marker_found);
+                                    if (safe > 0) {
+                                        const std::string prefix =
+                                            content_pending.substr(0, safe);
+                                        if (forced_tool_request) {
+                                            forced_prefix += prefix;
+                                        } else {
+                                            emit_text(prefix);
+                                            streamed_content = true;
+                                        }
+                                        content_pending.erase(0, safe);
+                                    }
+                                    if (marker_found) {
+                                        if (forced_tool_request &&
+                                            !forced_prefix.empty()) {
+                                            emit_text(forced_prefix);
+                                            forced_prefix.clear();
+                                            streamed_content = true;
+                                        }
+                                        buffering_tool = true;
+                                        // content_pending begins with the marker
+                                        // and may already include part of the
+                                        // function/first parameter.
+                                        incremental.feed(content_pending);
+                                        content_pending.clear();
+                                    }
                                 }
-                                if (marker_found) {
-                                    // Remainder from the marker onward is the
-                                    // tool call; reparse from `acc` at the end.
-                                    buffering_tool = true;
-                                    content_pending.clear();
+                                if (incremental.fatal()) {
+                                    stopped = true;
                                 }
+                                if (buffering_tool &&
+                                    !incremental.fatal()) {
+                                    service_tool_stream();
+                                }
+                                return !stopped && !client_closed;
                             });
+
+                            if (client_closed) {
+                                std::cerr << "[qw3-serve] #" << rid
+                                          << " chat(stream tools) chars="
+                                          << acc.size()
+                                          << " completion_tokens="
+                                          << completion_tokens
+                                          << " prompt_tokens="
+                                          << prompt_token_count
+                                          << " route=" << route
+                                          << " buffered_tool="
+                                          << (buffering_tool ? "true" : "false")
+                                          << " client_closed=true\n";
+                                return true;
+                            }
+
                             if (buffering_tool) {
-                                std::string text = take_complete_utf8(utf8_pending, acc);
+                                incremental.finish();
+                                if (incremental.fatal()) {
+                                    throw std::runtime_error(
+                                        "incremental tool stream failed: " +
+                                        incremental.error());
+                                }
+                                std::string text =
+                                    take_complete_utf8(utf8_pending, acc);
                                 text += flush_utf8_pending(utf8_pending, false);
                                 const std::string framed =
                                     enable_thinking ? ("<think>\n" + text) : text;
@@ -1452,20 +3055,49 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         framed,
                                         tools_schema.is_array() ? &tools_schema
                                                                 : nullptr);
-                                const ReasoningSplit split = split_reasoning(framed);
-                                // Only emit reasoning/content from the buffered
-                                // text when we did NOT already stream it
-                                // incrementally before the marker, to avoid
-                                // duplicating deltas.
-                                if (!streamed_content && !split.reasoning.empty()) {
-                                    send_delta(json{{"reasoning_content", split.reasoning}});
+                                const ReasoningSplit split =
+                                    split_reasoning(framed);
+                                // Prefix reasoning/content was already emitted
+                                // before the first tool delta whenever present.
+                                if (!streamed_content &&
+                                    !split.reasoning.empty()) {
+                                    send_delta(json{
+                                        {"reasoning_content", split.reasoning}});
                                 }
                                 if (!tool_calls.empty()) {
+                                    if (incremental.streaming()) {
+                                        std::string validation_error;
+                                        if (!incremental.validate(
+                                                tool_calls,
+                                                validation_error)) {
+                                            throw std::runtime_error(
+                                                "incremental tool validation "
+                                                "failed: " +
+                                                validation_error);
+                                        }
+                                        // Delay the final closing fragment until
+                                        // the full parser confirms that the
+                                        // streamed arguments are equivalent.
+                                        flush_incremental(true);
+                                        // The first call has already streamed.
+                                        // Preserve the existing multi-call
+                                        // behavior for any later calls.
+                                        if (tool_calls.size() > 1) {
+                                            send_delta(
+                                                tool_call_delta(tool_calls, 1));
+                                        }
+                                    } else {
+                                        send_delta(
+                                            tool_call_delta(tool_calls));
+                                    }
                                     std::cerr << "[qw3-serve] #" << rid
                                               << " tool_calls="
-                                              << tool_calls_debug_summary(tool_calls)
+                                              << tool_calls_debug_summary(
+                                                     tool_calls)
+                                              << " incremental="
+                                              << (incremental.streaming()
+                                                      ? "true" : "false")
                                               << "\n";
-                                    send_delta(tool_call_delta(tool_calls));
                                     send_done("tool_calls");
                                 } else {
                                     std::string preview = split.content.empty()
@@ -1478,15 +3110,31 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     std::cerr << "[qw3-serve] #" << rid
                                               << " tool_parse_empty preview="
                                               << dump_json(preview) << "\n";
-                                    if (!streamed_content && !split.content.empty()) {
-                                        send_delta(json{{"content", split.content}});
+                                    if (incremental.streaming()) {
+                                        throw std::runtime_error(
+                                            "incremental tool stream produced "
+                                            "no complete tool call");
                                     }
-                                    send_done("stop");
+                                    if (!streamed_content &&
+                                        !split.content.empty()) {
+                                        send_delta(
+                                            json{{"content", split.content}});
+                                    }
+                                    send_done(generation_finish_reason(
+                                        stopped, completion_tokens, g.max_tokens));
                                 }
                             } else {
-                                if (!content_pending.empty()) emit_text(content_pending);
+                                if (forced_tool_request) {
+                                    forced_prefix += content_pending;
+                                    if (!forced_prefix.empty()) {
+                                        emit_text(forced_prefix);
+                                    }
+                                } else if (!content_pending.empty()) {
+                                    emit_text(content_pending);
+                                }
                                 finish_text_stream();
-                                send_done("stop");
+                                send_done(generation_finish_reason(
+                                    stopped, completion_tokens, g.max_tokens));
                             }
                             std::cerr << "[qw3-serve] #" << rid
                                       << " chat(stream tools) chars=" << acc.size()
@@ -1494,12 +3142,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                       << " prompt_tokens=" << prompt_token_count
                                       << " route=" << route
                                       << " buffered_tool=" << (buffering_tool ? "true" : "false")
-                                      << (client_closed ? " client_closed=true" : "")
+                                      << " incremental_tool="
+                                      << (incremental.streaming() ? "true" : "false")
                                       << "\n";
                             return true;
                         }
-                        eng.generate_stream(prompt, g, [&](const std::string &piece) {
-                            if (stopped) return;
+                        generate_request([&](const std::string &piece) {
+                            if (stopped || client_closed) return false;
                             ++completion_tokens;
                             acc += piece;
                             std::string emit = take_complete_utf8(utf8_pending, piece);
@@ -1518,9 +3167,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             if (!emit.empty()) {
                                 emit_text(emit);
                             }
+                            return !stopped && !client_closed;
                         });
                         finish_text_stream();
-                        send_done(stopped ? "stop" : "stop");
+                        send_done(generation_finish_reason(
+                            stopped, completion_tokens, g.max_tokens));
                         std::cerr << "[qw3-serve] #" << rid
                                   << " chat(stream) completion_tokens="
                                   << completion_tokens
@@ -1554,16 +3205,25 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         std::string text;
         size_t completion_tokens = 0;
         try {
-            if (g.continuous_batching) {
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+            if (kvmem_session_request) {
+                std::lock_guard<std::mutex> lk(gen_mu);
+                eng.generate_session_stream(
+                    prompt, g, [&](const std::string &piece) {
+                        ++completion_tokens;
+                        text += piece;
+                    }, kvmem_session_reset);
+            } else if (g.continuous_batching) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             }
         } catch (const std::exception &e) {
@@ -1572,7 +3232,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             set_error_response(res, status_for_exception(e), e.what());
             return;
         }
-        if (enable_thinking) text = "<think>\n" + text;
+        if (enable_thinking && g.max_tokens > 0) text = "<think>\n" + text;
         std::string utf8_pending;
         text = take_complete_utf8(utf8_pending, text);
         text += flush_utf8_pending(utf8_pending, false);
@@ -1596,7 +3256,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         if (!split.reasoning.empty()) {
             message["reasoning_content"] = split.reasoning;
         }
-        std::string finish = stopped ? "stop" : "stop";
+        std::string finish = generation_finish_reason(
+            stopped, completion_tokens, g.max_tokens);
         if (!tool_calls.empty()) {
             std::cerr << "[qw3-serve] #" << rid
                       << " tool_calls=" << tool_calls_debug_summary(tool_calls)
@@ -1627,18 +3288,53 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
         std::string prompt;
+        std::vector<uint32_t> exact_prompt_tokens;
         if (req.contains("prompt") && req["prompt"].is_string()) {
             prompt = req["prompt"].get<std::string>();
         } else if (req.contains("prompt") && req["prompt"].is_array() &&
                    !req["prompt"].empty() && req["prompt"][0].is_string()) {
             prompt = req["prompt"][0].get<std::string>();
+        } else if (req.contains("prompt") && req["prompt"].is_array() &&
+                   !req["prompt"].empty()) {
+            exact_prompt_tokens.reserve(req["prompt"].size());
+            for (const json &value : req["prompt"]) {
+                if (!value.is_number_integer()) {
+                    set_error_response(
+                        res, 400,
+                        "integer-array prompt must contain only token IDs");
+                    return;
+                }
+                const int64_t token = value.get<int64_t>();
+                if (token < 0 ||
+                    token > static_cast<int64_t>(
+                                std::numeric_limits<uint32_t>::max())) {
+                    set_error_response(
+                        res, 400,
+                        "integer-array prompt token ID is out of range");
+                    return;
+                }
+                exact_prompt_tokens.push_back(static_cast<uint32_t>(token));
+            }
         } else {
             res.status = 400;
             res.set_content(dump_json(json{{"error", "missing prompt"}}),
                             "application/json");
             return;
         }
-        const size_t prompt_token_count = usage_tokenizer.encode(prompt).size();
+        bool explicit_max_tokens = false;
+        int requested_max_tokens = 0;
+        std::string max_tokens_error;
+        if (!parse_explicit_max_tokens(req, explicit_max_tokens,
+                                       requested_max_tokens,
+                                       max_tokens_error)) {
+            set_error_response(res, 400, max_tokens_error);
+            return;
+        }
+        (void)explicit_max_tokens;
+        (void)requested_max_tokens;
+        const size_t prompt_token_count = exact_prompt_tokens.empty()
+            ? usage_tokenizer.encode(prompt).size()
+            : exact_prompt_tokens.size();
         if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
             set_error_response(
                 res,
@@ -1650,6 +3346,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         GenerationOptions g = make_gen(req, prompt_token_count);
         g.raw_prompt = true; // /v1/completions sends raw text, no chat template
+        g.prompt_token_ids_override = std::move(exact_prompt_tokens);
         g.continuous_batching =
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);
@@ -1666,15 +3363,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         size_t completion_tokens = 0;
         try {
             if (g.continuous_batching) {
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
-                eng.generate_stream(prompt, g, [&](const std::string &piece) {
+                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
+                    return true;
                 });
             }
         } catch (const std::exception &e) {
@@ -1701,7 +3400,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             {"model", model_id},
             {"choices", json::array({json{
                 {"index", 0}, {"text", text}, {"logprobs", nullptr},
-                {"finish_reason", stopped ? "stop" : "length"}}})},
+                {"finish_reason", generation_finish_reason(
+                    stopped, completion_tokens, g.max_tokens)}}})},
             {"usage", usage_json(prompt_token_count, completion_tokens)}};
         res.set_content(dump_json(out), "application/json");
     });

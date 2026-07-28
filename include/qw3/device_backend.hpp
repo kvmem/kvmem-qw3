@@ -5,6 +5,7 @@
 #include <new>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,18 +26,37 @@ struct DeviceStatus {
     const char *message = "";
 };
 
+enum class DeviceTensorDType {
+    F32,
+    F16,
+    BF16,
+    I32,
+    Q8_KV,
+    FP8_E4M3,
+};
+
 struct DeviceTensor {
     virtual ~DeviceTensor() = default;
     uint64_t count = 0;
     // Element size in bytes (4 for FP32, 2 for FP16). Default keeps
     // backwards compatibility with the historical FP32-only behaviour.
     uint32_t elem_size = 4;
+    DeviceTensorDType dtype = DeviceTensorDType::F32;
+};
+
+enum class DeviceWeightFormat {
+    F32,
+    BF16,
+    FP8_E4M3,
+    Q8_0,
+    NVFP4_E2M1,
 };
 
 struct DeviceWeight {
     virtual ~DeviceWeight() = default;
     uint64_t rows = 0;
     uint64_t cols = 0;
+    DeviceWeightFormat format = DeviceWeightFormat::F32;
 };
 
 struct DeviceArgmax {
@@ -54,6 +74,15 @@ struct HostBuffer {
     void *data = nullptr;
     uint64_t bytes = 0;
     bool pinned = false;
+};
+
+// Opaque completion marker for the dedicated KV transfer stream. CUDA records
+// a cudaEvent behind all copies queued so far; synchronous/mock backends use
+// the default implementation below, which drains the transfer immediately and
+// returns a null marker. Keeping the marker backend-owned lets the executor
+// pipeline two pinned slabs without leaking CUDA types into the public header.
+struct DeviceTransferFence {
+    virtual ~DeviceTransferFence() = default;
 };
 
 class DeviceBackend {
@@ -89,6 +118,11 @@ public:
     virtual DeviceStatus replay_graph() { return {}; }
 
     virtual std::unique_ptr<DeviceTensor> tensor_f32(uint64_t count, const char *label) = 0;
+    virtual bool supports_bf16_activations() const { return false; }
+    virtual std::unique_ptr<DeviceTensor> tensor_bf16(uint64_t count,
+                                                       const char *label) {
+        return tensor_f32(count, label);
+    }
     virtual std::unique_ptr<HostBuffer> host_buffer(uint64_t bytes,
                                                     const char *label) {
         (void)label;
@@ -145,8 +179,100 @@ public:
     virtual std::unique_ptr<DeviceTensor> scratch_f32(uint64_t count, const char *label) {
         return tensor_f32(count, label);
     }
+    // Optional non-owning view into an existing tensor allocation. Offsets are
+    // expressed in bytes so one FP32 arena can host FP32 and BF16 scratch
+    // tensors. The backing storage must outlive every returned view.
+    virtual bool supports_tensor_views() const { return false; }
+    virtual std::unique_ptr<DeviceTensor> tensor_view(
+            DeviceTensor &storage,
+            uint64_t byte_offset,
+            uint64_t count,
+            uint32_t elem_size,
+            DeviceTensorDType dtype,
+            const char *label) {
+        (void)storage;
+        (void)byte_offset;
+        (void)count;
+        (void)elem_size;
+        (void)dtype;
+        (void)label;
+        return nullptr;
+    }
+    virtual std::unique_ptr<DeviceTensor> scratch_like(
+            const DeviceTensor &source,
+            uint64_t count,
+            const char *label) {
+        if (source.dtype == DeviceTensorDType::BF16) {
+            return tensor_bf16(count, label);
+        }
+        return scratch_f32(count, label);
+    }
     virtual std::unique_ptr<DeviceWeight> weight_f32(const float *data, uint64_t count, const char *label) = 0;
     virtual std::unique_ptr<DeviceWeight> weight_q8_0(const void *data, uint64_t rows, uint64_t cols, const char *label) = 0;
+    virtual std::unique_ptr<DeviceWeight> weight_bf16(const void *data,
+                                                       uint64_t rows,
+                                                       uint64_t cols,
+                                                       const char *label) {
+        (void)data; (void)rows; (void)cols; (void)label;
+        throw std::runtime_error("BF16 weights are not supported by this backend");
+    }
+    // Host-resident BF16 lookup weight. This is intended for sparse row
+    // access (token embeddings), not matmul. CUDA backends can gather the
+    // requested rows into pinned staging memory and transfer only those rows.
+    virtual std::unique_ptr<DeviceWeight> weight_bf16_host(
+            const void *data,
+            uint64_t rows,
+            uint64_t cols,
+            const char *label) {
+        (void)data; (void)rows; (void)cols; (void)label;
+        throw std::runtime_error(
+            "host-resident BF16 weights are not supported by this backend");
+    }
+    virtual std::unique_ptr<DeviceWeight> weight_fp8_e4m3(const void *data,
+                                                           const void *scale_data,
+                                                           uint64_t scale_count,
+                                                           uint64_t rows,
+                                                           uint64_t cols,
+                                                           const char *label) {
+        (void)data; (void)scale_data; (void)scale_count;
+        (void)rows; (void)cols; (void)label;
+        throw std::runtime_error("FP8 weights are not supported by this backend");
+    }
+    virtual std::unique_ptr<DeviceWeight> weight_nvfp4_e2m1(
+            const void *packed_data,
+            const void *scale_data,
+            uint64_t scale_rows,
+            uint64_t scale_cols,
+            float input_global_scale_divisor,
+            float weight_global_scale_divisor,
+            uint64_t rows,
+            uint64_t cols,
+            const char *label) {
+        (void)packed_data; (void)scale_data; (void)scale_rows; (void)scale_cols;
+        (void)input_global_scale_divisor; (void)weight_global_scale_divisor;
+        (void)rows; (void)cols; (void)label;
+        throw std::runtime_error("NVFP4 weights are not supported by this backend");
+    }
+
+    // Optionally replace two separately allocated FP8 weights with one
+    // contiguous allocation while preserving both logical DeviceWeight
+    // handles. Backends can then issue one larger GEMM for shared-input
+    // fanouts without retaining a duplicate packed copy.
+    virtual DeviceStatus prepare_fp8_fanout_pair(DeviceWeight &first,
+                                                  DeviceWeight &second) {
+        (void)first;
+        (void)second;
+        return {};
+    }
+
+    // Optionally make two NVFP4 weights contiguous so a shared-input fanout
+    // can run as one larger Tensor Core GEMM.
+    virtual DeviceStatus prepare_nvfp4_fanout_pair(DeviceWeight &first,
+                                                    DeviceWeight &second) {
+        (void)first;
+        (void)second;
+        return {};
+    }
 
     virtual DeviceStatus q8_0_get_row(DeviceTensor &out, const DeviceWeight &weight, uint64_t row) = 0;
     virtual DeviceStatus q8_0_get_row_from_argmax(DeviceTensor &out,
@@ -195,6 +321,42 @@ public:
                                               const DeviceTensor &x) {
         (void)out; (void)weight_gate; (void)weight_up; (void)x;
         return {false, "q8_0_matvec_silu_mul not implemented by this backend"};
+    }
+
+    // Batched counterpart used by MTP verification. Backends may compute the
+    // gate/up projections together and write only the final SwiGLU output.
+    virtual DeviceStatus q8_0_matmul_silu_mul(DeviceTensor &out,
+                                              const DeviceWeight &weight_gate,
+                                              const DeviceWeight &weight_up,
+                                              const DeviceTensor &x,
+                                              uint32_t batch,
+                                              uint32_t in_stride,
+                                              uint32_t out_stride) {
+        (void)out; (void)weight_gate; (void)weight_up; (void)x;
+        (void)batch; (void)in_stride; (void)out_stride;
+        return {false, "q8_0_matmul_silu_mul not implemented by this backend"};
+    }
+
+    // Optimized NVFP4 prefill FFN:
+    // out = W_down * (silu(W_gate * x) * (W_up * x)).
+    // The CUDA backend keeps the gate/up result in BF16 and directly quantizes
+    // SwiGLU into the down projection input. Unsupported formats and small
+    // batches return !ok so callers can use the generic three-op path.
+    virtual DeviceStatus nvfp4_ffn_prefill(DeviceTensor &out,
+                                           const DeviceWeight &weight_gate,
+                                           const DeviceWeight &weight_up,
+                                           const DeviceWeight &weight_down,
+                                           const DeviceWeight &norm_weight,
+                                           const DeviceTensor &x,
+                                           uint32_t batch,
+                                           uint32_t in_stride,
+                                           uint32_t ffn_stride,
+                                           uint32_t out_stride,
+                                           float norm_eps) {
+        (void)out; (void)weight_gate; (void)weight_up; (void)weight_down;
+        (void)norm_weight; (void)x; (void)batch; (void)in_stride;
+        (void)ffn_stride; (void)out_stride; (void)norm_eps;
+        return {false, "NVFP4 fused prefill FFN not implemented by this backend"};
     }
 
     // Run several Q8_0 matvecs that share the same input vector x. The MMVQ
@@ -253,6 +415,109 @@ public:
         return {};
     }
 
+    // RMSNorm followed by several linear projections that share the normalized
+    // activation. CUDA can fuse normalization with input quantization; other
+    // backends retain the exact two-operation behavior through this fallback.
+    virtual DeviceStatus rms_norm_q8_0_matmul_fanout(
+            DeviceTensor &normalized,
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            uint32_t fanout,
+            const DeviceTensor &x,
+            const DeviceWeight &norm_weight,
+            uint32_t batch,
+            uint32_t in_stride,
+            float eps) {
+        if (auto st = rms_norm_batch(
+                normalized, x, norm_weight, batch, in_stride, eps);
+            !st.ok) {
+            return st;
+        }
+        return q8_0_matmul_fanout(
+            outs, weights, out_strides, fanout,
+            normalized, batch, in_stride);
+    }
+
+    // Recurrent projections may leave a compatible packed FP8 QKV/gate pair
+    // in backend-owned storage for immediate consumption by recurrent_batch.
+    // Other backends and unsupported routes materialize the normal outputs.
+    virtual DeviceStatus rms_norm_q8_0_matmul_recurrent_fanout(
+            DeviceTensor &normalized,
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            uint32_t fanout,
+            const DeviceTensor &x,
+            const DeviceWeight &norm_weight,
+            uint32_t batch,
+            uint32_t in_stride,
+            float eps) {
+        return rms_norm_q8_0_matmul_fanout(
+            normalized, outs, weights, out_strides, fanout,
+            x, norm_weight, batch, in_stride, eps);
+    }
+
+    // True when the recurrent projection fanout will leave `proj` and `gate`
+    // as backend-owned lazy results that recurrent_batch consumes without
+    // writing either output tensor. Executors may then use overlapping
+    // metadata-only views for those two outputs. The default is conservative.
+    virtual bool can_defer_recurrent_projection_outputs(
+            const DeviceWeight *const *weights,
+            uint32_t fanout,
+            const DeviceWeight &norm_weight,
+            bool input_is_bf16,
+            uint32_t input_stride,
+            uint32_t batch,
+            uint32_t num_k_heads,
+            uint32_t num_v_heads,
+            uint32_t head_k_dim,
+            uint32_t head_v_dim,
+            uint32_t proj_count,
+            uint32_t proj_stride,
+            uint32_t gate_stride,
+            uint32_t alpha_stride,
+            uint32_t beta_stride,
+            bool state_checkpoints,
+            bool deltanet_capture) const {
+        (void)weights;
+        (void)fanout;
+        (void)norm_weight;
+        (void)input_is_bf16;
+        (void)input_stride;
+        (void)batch;
+        (void)num_k_heads;
+        (void)num_v_heads;
+        (void)head_k_dim;
+        (void)head_v_dim;
+        (void)proj_count;
+        (void)proj_stride;
+        (void)gate_stride;
+        (void)alpha_stride;
+        (void)beta_stride;
+        (void)state_checkpoints;
+        (void)deltanet_capture;
+        return false;
+    }
+
+    // Attention projections can defer FP8 output scaling until Q/K
+    // normalization and FP8 V-cache append consume the values.
+    virtual DeviceStatus rms_norm_q8_0_matmul_attention_fanout(
+            DeviceTensor &normalized,
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            uint32_t fanout,
+            const DeviceTensor &x,
+            const DeviceWeight &norm_weight,
+            uint32_t batch,
+            uint32_t in_stride,
+            float eps) {
+        return rms_norm_q8_0_matmul_fanout(
+            normalized, outs, weights, out_strides, fanout,
+            x, norm_weight, batch, in_stride, eps);
+    }
+
     // Batched fused matmul + residual add: out = residual + W*x. `matmul_tmp`
     // is scratch used to hold W*x before the add. Default keeps the two-step
     // path (matmul into tmp, then add); backends may fuse the residual add
@@ -266,6 +531,89 @@ public:
                                          uint32_t in_stride,
                                          uint32_t out_stride) {
         if (auto st = q8_0_matmul(matmul_tmp, weight, x, batch, in_stride, out_stride); !st.ok) return st;
+        return add(out, residual, matmul_tmp);
+    }
+
+    // Format-neutral linear operations. Their defaults preserve the original
+    // Q8_0 behavior exactly; mixed-precision backends override only these
+    // entry points and dispatch on DeviceWeight::format.
+    virtual DeviceStatus linear_get_row(DeviceTensor &out,
+                                        const DeviceWeight &weight,
+                                        uint64_t row) {
+        return q8_0_get_row(out, weight, row);
+    }
+    virtual DeviceStatus linear_get_row_from_argmax(DeviceTensor &out,
+                                                     const DeviceWeight &weight,
+                                                     const DeviceArgmaxBuffer &argmaxes,
+                                                     uint32_t index) {
+        return q8_0_get_row_from_argmax(out, weight, argmaxes, index);
+    }
+    virtual DeviceStatus linear_get_rows_batch(DeviceTensor &out,
+                                                const DeviceWeight &weight,
+                                                const uint64_t *rows,
+                                                uint32_t batch) {
+        return q8_0_get_rows_batch(out, weight, rows, batch);
+    }
+    virtual DeviceStatus linear_matvec(DeviceTensor &out,
+                                       const DeviceWeight &weight,
+                                       const DeviceTensor &x) {
+        return q8_0_matvec(out, weight, x);
+    }
+    virtual DeviceStatus linear_matvec_add(DeviceTensor &accum,
+                                           const DeviceWeight &weight,
+                                           const DeviceTensor &x) {
+        return q8_0_matvec_add(accum, weight, x);
+    }
+    virtual DeviceStatus linear_matvec_silu_mul(DeviceTensor &out,
+                                                const DeviceWeight &weight_gate,
+                                                const DeviceWeight &weight_up,
+                                                const DeviceTensor &x) {
+        return q8_0_matvec_silu_mul(out, weight_gate, weight_up, x);
+    }
+    virtual DeviceStatus linear_matvec_fanout(DeviceTensor *const *outs,
+                                              const DeviceWeight *const *weights,
+                                              uint32_t n,
+                                              const DeviceTensor &x) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (auto st = linear_matvec(*outs[i], *weights[i], x); !st.ok) return st;
+        }
+        return {};
+    }
+    virtual DeviceStatus linear_matmul(DeviceTensor &out,
+                                       const DeviceWeight &weight,
+                                       const DeviceTensor &x,
+                                       uint32_t batch,
+                                       uint32_t in_stride,
+                                       uint32_t out_stride) {
+        return q8_0_matmul(out, weight, x, batch, in_stride, out_stride);
+    }
+    virtual DeviceStatus linear_matmul_fanout(DeviceTensor *const *outs,
+                                              const DeviceWeight *const *weights,
+                                              const uint32_t *out_strides,
+                                              uint32_t n,
+                                              const DeviceTensor &x,
+                                              uint32_t batch,
+                                              uint32_t in_stride) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (auto st = linear_matmul(*outs[i], *weights[i], x, batch,
+                                        in_stride, out_strides[i]); !st.ok) {
+                return st;
+            }
+        }
+        return {};
+    }
+    virtual DeviceStatus linear_matmul_add(DeviceTensor &out,
+                                           const DeviceTensor &residual,
+                                           DeviceTensor &matmul_tmp,
+                                           const DeviceWeight &weight,
+                                           const DeviceTensor &x,
+                                           uint32_t batch,
+                                           uint32_t in_stride,
+                                           uint32_t out_stride) {
+        if (auto st = linear_matmul(matmul_tmp, weight, x, batch,
+                                    in_stride, out_stride); !st.ok) {
+            return st;
+        }
         return add(out, residual, matmul_tmp);
     }
 
@@ -408,7 +756,7 @@ public:
                                           uint32_t checkpoint_count = 0,
                                           // DeltaNet retrieval block-boundary state
                                           // capture (kvmem retrieval_method==deltanet;
-                                          // see deltanet_retrieval.md). When
+                                          // see docs/kvmem_deltanet_retrieval_design.md). When
                                           // dn_state_snap != nullptr the CUDA backend
                                           // captures S_j per block into dn_state_snap
                                           // (offset dn_layer_snap_off) and accumulates
@@ -627,6 +975,37 @@ public:
                                       uint32_t pos,
                                       float theta) = 0;
 
+    // Decode-only Q/K preparation. CUDA backends can combine both per-head
+    // RMS norms and both RoPE transforms into one launch.
+    virtual DeviceStatus rmsnorm_rope_qk(DeviceTensor &q,
+                                         DeviceTensor &k,
+                                         const DeviceWeight &q_weight,
+                                         const DeviceWeight &k_weight,
+                                         uint32_t n_q_heads,
+                                         uint32_t n_kv_heads,
+                                         uint32_t q_head_stride,
+                                         uint32_t k_head_stride,
+                                         uint32_t head_dim,
+                                         uint32_t rope_dim,
+                                         uint32_t pos,
+                                         float theta,
+                                         float eps) {
+        if (auto st = rmsnorm_per_head(
+                q, q_weight, n_q_heads, q_head_stride, head_dim, eps); !st.ok) {
+            return st;
+        }
+        if (auto st = rmsnorm_per_head(
+                k, k_weight, n_kv_heads, k_head_stride, head_dim, eps); !st.ok) {
+            return st;
+        }
+        if (auto st = rope_partial(
+                q, n_q_heads, q_head_stride, rope_dim, pos, theta); !st.ok) {
+            return st;
+        }
+        return rope_partial(
+            k, n_kv_heads, k_head_stride, rope_dim, pos, theta);
+    }
+
     // Batched partial RoPE. Token i in the batch (0-indexed) is rotated at
     // position `base_pos + i`. x layout: [batch, batch_stride].
     virtual DeviceStatus rope_partial_batch(DeviceTensor &x,
@@ -770,13 +1149,53 @@ public:
             uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
             uint32_t rope_dim, const DeviceTensor &to_base,
             const DeviceTensor &from_base, const DeviceTensor &n_tokens,
-            const DeviceTensor &page_indices, uint32_t page_size, float theta) {
+            const DeviceTensor &page_indices, uint32_t page_size, float theta,
+            const DeviceTensor *rope_sincos = nullptr,
+            uint32_t rope_table_positions = 0) {
         (void)k_cache; (void)n_blocks; (void)max_n_tokens; (void)n_kv_heads;
         (void)per_pos_size; (void)head_dim; (void)rope_dim; (void)to_base;
         (void)from_base; (void)n_tokens; (void)page_indices; (void)page_size;
-        (void)theta;
+        (void)theta; (void)rope_sincos; (void)rope_table_positions;
         return {false,
                 "rope_block_remap_paged_batched_device requires backend override"};
+    }
+
+    // Build a persistent FP32 table laid out as
+    // [position, rope_dim / 2, {sin, cos}].  KVMem assembly reuses it across
+    // every KV head and standard-attention layer, eliminating billions of
+    // duplicate powf/sincosf calls while retaining the legacy rotation math.
+    virtual DeviceStatus build_rope_sincos_table_device(
+            DeviceTensor &table, uint32_t positions, uint32_t rope_dim,
+            float theta) {
+        (void)table; (void)positions; (void)rope_dim; (void)theta;
+        return {false,
+                "build_rope_sincos_table_device requires backend override"};
+    }
+
+    // Materialize packed, unrotated raw K into arbitrary paged window slots and
+    // apply RoPE exactly once at each destination position. `raw_k` begins at
+    // raw_element_offset; raw_block_stride_elements==0 means the compatibility
+    // layout [n_blocks,max_n_tokens,per_pos_size]. A non-zero stride supports
+    // block-major, layer-interleaved assembly buffers without a CPU transpose.
+    // This is the drift-free cold/periodic refresh path for immutable K.
+    virtual DeviceStatus raw_k_scatter_rope_paged_batched_device(
+            DeviceTensor &k_cache, const DeviceTensor &raw_k,
+            uint64_t raw_element_offset, uint32_t n_blocks,
+            uint32_t max_n_tokens, uint32_t n_kv_heads,
+            uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+            const DeviceTensor &to_base, const DeviceTensor &n_tokens,
+            const DeviceTensor &page_indices, uint32_t page_size, float theta,
+            const DeviceTensor *rope_sincos = nullptr,
+            uint32_t rope_table_positions = 0,
+            uint64_t raw_block_stride_elements = 0) {
+        (void)k_cache; (void)raw_k; (void)raw_element_offset; (void)n_blocks;
+        (void)max_n_tokens; (void)n_kv_heads; (void)per_pos_size;
+        (void)head_dim; (void)rope_dim; (void)to_base; (void)n_tokens;
+        (void)page_indices; (void)page_size; (void)theta;
+        (void)rope_sincos; (void)rope_table_positions;
+        (void)raw_block_stride_elements;
+        return {false,
+                "raw_k_scatter_rope_paged_batched_device requires backend override"};
     }
 
     // Block-sparse cumulative-attention selection signal (#40). Both are
@@ -924,6 +1343,35 @@ public:
         return {false, "block_kmean_content_batch_device requires backend override"};
     }
 
+    // Incremental counterpart used when a logical block is produced by several
+    // prefill calls (multi-turn transcript replay / resumed sessions). The first
+    // input row belongs at `first_block_token_offset` in the first destination
+    // block. Existing means for [0, offset) are merged by their exact row count;
+    // later blocks are overwritten from an empty prefix.
+    virtual DeviceStatus block_kmean_content_batch_merge_device(
+            const DeviceTensor &k_batch,
+            DeviceTensor &kbar,
+            uint64_t kbar_block_base,
+            uint32_t n_blocks_chunk,
+            uint32_t k_stride,
+            uint32_t batch,
+            uint32_t blk_tokens,
+            uint32_t first_block_token_offset,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            uint32_t rope_dim,
+            int32_t rope_base,
+            float theta,
+            uint32_t n_subblocks = 1) {
+        (void)k_batch; (void)kbar; (void)kbar_block_base;
+        (void)n_blocks_chunk; (void)k_stride; (void)batch;
+        (void)blk_tokens; (void)first_block_token_offset;
+        (void)n_kv_heads; (void)head_dim; (void)rope_dim;
+        (void)rope_base; (void)theta; (void)n_subblocks;
+        return {false,
+                "block_kmean_content_batch_merge_device requires backend override"};
+    }
+
     // derope_store_content_batch_device (#104, raw-key MaxSim): like
     // block_kmean_content_batch_device but STORES each de-RoPE'd K row instead of
     // averaging — fills kraw (fp32 [.., n_kv_heads, head_dim]) so the MaxSim scorer
@@ -1025,11 +1473,15 @@ public:
                                                                uint32_t excl_lo_end = 0,
                                                                uint32_t excl_hi_begin = UINT32_MAX,
                                                                uint32_t n_subblocks = 1,
-                                                               uint32_t reduce_max = 0) {
+                                                               uint32_t reduce_max = 0,
+                                                               uint32_t accumulate = 0,
+                                                               uint64_t q_elem_off = 0,
+                                                               uint64_t kbar_elem_off = 0) {
         (void)score; (void)q_multi; (void)kbar_multi; (void)n_layers; (void)n_tokens;
         (void)q_layer_stride; (void)n_blocks; (void)kbar_layer_stride; (void)n_heads;
         (void)n_kv_heads; (void)head_dim; (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
-        (void)n_subblocks; (void)reduce_max;
+        (void)n_subblocks; (void)reduce_max; (void)accumulate; (void)q_elem_off;
+        (void)kbar_elem_off;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 
@@ -1054,7 +1506,8 @@ public:
     }
 
     // deltanet_block_score_device: DeltaNet-retrieval per-layer block scorer
-    // (kvmem retrieval_method==deltanet; see deltanet_retrieval.md §5-8). For one
+    // (kvmem retrieval_method==deltanet; see
+    // docs/kvmem_deltanet_retrieval_design.md §5-8). For one
     // DeltaNet layer, computes r[blk,vh] = TopKMean_t( d[blk,vh] *
     // ||(S_j - a_j S_{j-1})^T q_t||_2 ) into r_out[blk,vh]. dn_snap holds S_j per
     // block ([blocks, v_heads, d_v, d_k]); decaysum holds each block's in-block
@@ -1487,6 +1940,35 @@ public:
     virtual DeviceStatus begin_kv_transfer_from_device() { return {}; }
     virtual DeviceStatus begin_kv_transfer_to_device() { return {}; }
     virtual DeviceStatus wait_kv_transfer() { return {}; }
+    virtual DeviceStatus record_kv_transfer_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) {
+        fence.reset();
+        return wait_kv_transfer();
+    }
+    // Cross-stream ordering used by raw-K materialization. The CUDA backend
+    // records an event on exec_stream after scatter/RoPE and lets the copy
+    // stream wait before reusing that staging slot. Conversely, exec_stream
+    // waits on the H2D event without synchronizing the host.
+    virtual DeviceStatus record_execution_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) {
+        fence.reset();
+        return synchronize();
+    }
+    virtual DeviceStatus execution_wait_for_kv_transfer(
+            const std::unique_ptr<DeviceTransferFence> &fence) {
+        (void)fence;
+        return {};
+    }
+    virtual DeviceStatus kv_transfer_wait_for_execution(
+            std::unique_ptr<DeviceTransferFence> &fence) {
+        fence.reset();
+        return {};
+    }
+    virtual DeviceStatus wait_kv_transfer_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) {
+        fence.reset();
+        return {};
+    }
     virtual DeviceStatus copy_bytes_to_host_async(const DeviceTensor &x,
                                                   void *host,
                                                   uint64_t byte_offset,
@@ -1507,6 +1989,43 @@ public:
                                                     const void *host,
                                                     uint64_t byte_count) {
         return copy_bytes_from_host(x, byte_offset, host, byte_count);
+    }
+
+    // CPU-tier stage-in fast path. `host` contains a packed slab of KV pages.
+    // One H2D moves the slab into a reusable backend staging allocation, then
+    // one scatter kernel per target tensor writes its pages to arbitrary
+    // physical cache slots. src/dst_page_indices are target-major arrays with
+    // target_count * pages_per_target int32 entries and must remain alive until
+    // the following KV-transfer fence completes.
+    virtual DeviceStatus copy_packed_pages_from_host_async(
+            const void *host, uint64_t host_bytes,
+            const std::vector<DeviceTensor *> &targets,
+            const int32_t *src_page_indices,
+            const int32_t *dst_page_indices,
+            uint32_t pages_per_target,
+            uint64_t page_bytes) {
+        (void)host; (void)host_bytes; (void)targets;
+        (void)src_page_indices; (void)dst_page_indices;
+        (void)pages_per_target; (void)page_bytes;
+        return {false,
+                "copy_packed_pages_from_host_async not implemented"};
+    }
+
+    // Symmetric CPU-tier stage-out path: gather arbitrary physical cache pages
+    // into the backend's packed staging allocation on the KV copy stream, then
+    // issue one contiguous D2H into `host`.
+    virtual DeviceStatus copy_packed_pages_to_host_async(
+            void *host, uint64_t host_bytes,
+            const std::vector<DeviceTensor *> &targets,
+            const int32_t *src_page_indices,
+            const int32_t *dst_page_indices,
+            uint32_t pages_per_target,
+            uint64_t page_bytes) {
+        (void)host; (void)host_bytes; (void)targets;
+        (void)src_page_indices; (void)dst_page_indices;
+        (void)pages_per_target; (void)page_bytes;
+        return {false,
+                "copy_packed_pages_to_host_async not implemented"};
     }
 
     // Device-to-device copy: dst[0..count) = src[src_offset..src_offset+count).

@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Role-preserving AgentLongBench 512K normal100 turn-ingest experiment.
+#
+# This launcher is intentionally separate from the canonical one-shot runner.
+# It starts a generic qw3 KVMem server, while the Python harness owns turn
+# splitting, capacity timing, retrieval-query choice, and teacher-forced
+# history ingest.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+PORT=${PORT:-18087}
+CTX=${CTX:-655360}
+KVMEM_BUDGET=${KVMEM_BUDGET:-204800}
+GEN_BUDGET=${GEN_BUDGET:-32768}
+ACTIVE_CAPACITY=${ACTIVE_CAPACITY:-$((KVMEM_BUDGET + GEN_BUDGET))}
+KV_DTYPE=${KV_DTYPE:-fp16}
+CPU_GB=${CPU_GB:-64}
+NVME_GB=${NVME_GB:-0}
+GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.51}
+KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
+IMMUTABLE_REFRESH_TOKENS=${IMMUTABLE_REFRESH_TOKENS:-0}
+THINKING_BUDGET=${THINKING_BUDGET:-4096}
+TAG=${TAG:-agentlongbench_512k_normal100_turn_ingest_k200k_g32k_b32_20260724}
+DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
+MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
+MODEL=${MODEL:-$ROOT/models/Qwen3.6-27B-Q8_0.gguf}
+RESULT_ROOT=${RESULT_ROOT:-/data/chaidi/kvmem_eval/results/$TAG}
+LOG_ROOT=${LOG_ROOT:-/data/chaidi/kvmem_eval/logs}
+NVME_DIR=${NVME_DIR:-/tmp/qw3_kvmem_eval_nvme/$TAG}
+SERVER_LOG=${SERVER_LOG:-$LOG_ROOT/${TAG}_server.log}
+RUN_LOG=${RUN_LOG:-$LOG_ROOT/${TAG}_runner.log}
+PID_FILE=${PID_FILE:-$LOG_ROOT/${TAG}.pid}
+LIMIT=${LIMIT:-}
+EXPECTED=${EXPECTED:-${LIMIT:-100}}
+METHOD=${METHOD:-kvmem_turn_ingest_mean_k_${KVMEM_BUDGET}t_b32_query_replay_immutable_mtp4_fp16}
+ROUND_QUERY=${ROUND_QUERY:-first_user}
+
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy=127.0.0.1,localhost
+mkdir -p "$RESULT_ROOT" "$LOG_ROOT"
+echo $$ >"$PID_FILE"
+
+tier_args=(--kvmem-cpu-gb "$CPU_GB")
+if [[ "$NVME_GB" != "0" && "$NVME_GB" != "0.0" ]]; then
+  mkdir -p "$NVME_DIR"
+  tier_args+=(
+    --kvmem-nvme-gb "$NVME_GB"
+    --kvmem-nvme-dir "$NVME_DIR"
+  )
+fi
+
+limit_args=()
+if [[ -n "$LIMIT" ]]; then
+  if [[ ! "$LIMIT" =~ ^[1-9][0-9]*$ ]] || (( LIMIT > 100 )); then
+    echo "LIMIT must be an integer in [1, 100], got: $LIMIT" >&2
+    exit 2
+  fi
+  limit_args+=(--limit "$LIMIT")
+fi
+if [[ ! "$EXPECTED" =~ ^[1-9][0-9]*$ ]] || (( EXPECTED > 100 )); then
+  echo "EXPECTED must be an integer in [1, 100], got: $EXPECTED" >&2
+  exit 2
+fi
+if (( ACTIVE_CAPACITY != KVMEM_BUDGET + GEN_BUDGET )); then
+  echo "warning: ACTIVE_CAPACITY=$ACTIVE_CAPACITY differs from budget sum " \
+       "$((KVMEM_BUDGET + GEN_BUDGET))" >&2
+fi
+
+server_pid=""
+cleanup() {
+  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+}
+trap cleanup EXIT INT TERM
+
+if curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  echo "port $PORT already has a healthy server; refusing to disturb it" >&2
+  exit 3
+fi
+
+env \
+  -u QW3_KVMEM_REBUILT_STATE_DIR \
+  QW3_KVMEM_RECOMPUTE_QUERY=1 \
+  QW3_KVMEM_IMMUTABLE_SOURCE_K=1 \
+  QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS="$IMMUTABLE_REFRESH_TOKENS" \
+  QW3_KVMEM_TRACE=1 \
+  QW3_KVMEM_TIMING=1 \
+  QW3_FATTN_NSPLIT=1 \
+  QW3_PREFILL_FA2_NSPLIT=1 \
+  QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
+  "$ROOT/build/qw3" serve \
+    --model "$MODEL" \
+    --ctx "$CTX" --kv-dtype "$KV_DTYPE" \
+    --kvmem --kvmem-block-tokens 32 \
+    --kvmem-budget "$KVMEM_BUDGET" \
+    --kvmem-gen-budget "$GEN_BUDGET" \
+    --kvmem-sink-blocks 8 --kvmem-recent-blocks 0 \
+    --kvmem-method retrieval --kvmem-retrieval-method mean-k \
+    --kvmem-update-mode step --kvmem-query-conditioned \
+    --kvmem-immutable-k --kvmem-gpu-memory-ratio "$GPU_MEMORY_RATIO" \
+    --kvmem-optimization-level "$KVMEM_OPT_LEVEL" \
+    "${tier_args[@]}" \
+    --enable-thinking --thinking-budget "$THINKING_BUDGET" \
+    --prefill-chunk 2048 --temp 0.6 \
+    --native-mtp-speculate --mtp-chain 4 \
+    --host 127.0.0.1 --port "$PORT" \
+    >"$SERVER_LOG" 2>&1 &
+server_pid=$!
+
+healthy=0
+for _ in $(seq 1 300); do
+  if curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    healthy=1
+    break
+  fi
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    echo "qw3 exited during startup; see $SERVER_LOG" >&2
+    tail -100 "$SERVER_LOG" >&2 || true
+    exit 4
+  fi
+  sleep 2
+done
+if [[ "$healthy" -ne 1 ]]; then
+  echo "qw3 health timeout; see $SERVER_LOG" >&2
+  exit 4
+fi
+
+if ! grep -q 'kvmem_recompute_query=1' "$SERVER_LOG" ||
+   ! grep -q 'kvmem_immutable_k=1' "$SERVER_LOG" ||
+   ! grep -q 'mtp_chain=4' "$SERVER_LOG" ||
+   ! grep -q 'mtp_speculate=1' "$SERVER_LOG"; then
+  echo "server did not confirm query replay + immutable K + MTP-4" >&2
+  exit 5
+fi
+
+"$ROOT/.venv/bin/python" \
+  "$ROOT/scripts/kvmem_eval/run_agentlongbench_turn_ingest.py" \
+  --benchmark-repo /home/chaidi/AgentLongBench_Motivation \
+  --dataset "$DATA" \
+  --manifest "$MANIFEST" \
+  --output-root "$RESULT_ROOT" \
+  --api-base "http://127.0.0.1:$PORT/v1" \
+  --model "$(basename "$MODEL")" \
+  --method "$METHOD" \
+  --active-capacity "$ACTIVE_CAPACITY" \
+  --round-query "$ROUND_QUERY" \
+  --temperature 0.6 --top-p 0.95 --max-tokens 32768 \
+  --timeout-sec 7200 --max-sample-sec 7200 --attempts 3 \
+  --enable-thinking --seed 20260722 \
+  "${limit_args[@]}" \
+  2>&1 | tee -a "$RUN_LOG"
+
+"$ROOT/.venv/bin/python" - "$RESULT_ROOT/validation_report.json" "$EXPECTED" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = int(sys.argv[2])
+if (
+    not report.get("passed")
+    or report.get("answers_unique") != expected
+    or report.get("eval_unique") != expected
+):
+    raise SystemExit(f"AgentLongBench turn-ingest validation failed: {report}")
+print(
+    f"AgentLongBench turn-ingest validation passed: {expected} answers "
+    f"and {expected} evaluations"
+)
+PY

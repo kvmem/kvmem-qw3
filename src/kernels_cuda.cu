@@ -1,7 +1,9 @@
 #include "qw3/device_backend.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cublasLt.h>
 #include <cublas_v2.h>
 
 #include <algorithm>
@@ -17,6 +19,16 @@
 #include <vector>
 
 #include "cuda_helpers.cuh"
+#ifdef QW3_ENABLE_NVFP4
+#include "fp8_scaled_mm_adapter.hpp"
+#include "nvfp4_linear_adapter.hpp"
+#endif
+#ifdef QW3_ENABLE_GDN_SM120_AOT
+#include "gdn_sm120_aot_adapter.hpp"
+#endif
+#ifdef QW3_ENABLE_RMS_FP4_SM120_AOT
+#include "rms_fp4_sm120_aot_adapter.hpp"
+#endif
 
 namespace qw3 {
 
@@ -34,6 +46,12 @@ bool launch_gated_delta_net(
         bool prep_decay, float *state_checkpoints,
         uint32_t checkpoint_count,
         cudaStream_t stream);
+bool launch_gdn_prep(
+        float *alpha_inout, float *beta_inout,
+        const float *dt_bias, const float *ssm_a,
+        uint32_t T, uint32_t num_v_heads,
+        uint32_t alpha_stride, uint32_t beta_stride,
+        bool prep_decay, cudaStream_t stream);
 
 // Ported Q8_0 mmvq launchers (src/mmvq_q8.cu).
 size_t q8_1_scratch_bytes(uint32_t batch, uint32_t cols);
@@ -43,6 +61,10 @@ bool launch_quantize_q8_1(
         cudaStream_t stream);
 bool launch_mmvq_q8_0(
         const uint8_t *weight, const void *y_q8_1, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
+bool launch_mmvq_q8_0_bf16(
+        const uint8_t *weight, const void *y_q8_1, __nv_bfloat16 *dst,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
 bool launch_mmvq_q8_0_two(
@@ -57,6 +79,10 @@ bool launch_mmvq_q8_0_silu_mul(
         cudaStream_t stream);
 bool launch_mmvq_q8_0_add(
         const uint8_t *weight, const void *y_q8_1, float *dst,
+        uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
+        cudaStream_t stream);
+bool launch_mmvq_q8_0_add_bf16(
+        const uint8_t *weight, const void *y_q8_1, __nv_bfloat16 *dst,
         uint32_t rows, uint32_t cols, uint32_t batch, uint32_t stride_dst_row,
         cudaStream_t stream);
 // Fused 4-weight fanout: concatenate the 4 weights' row-spaces into ONE grid
@@ -246,9 +272,9 @@ bool launch_rope_block_remap(float *x, uint32_t n_tokens, uint32_t n_units,
                              uint32_t row_stride, float theta,
                              cudaStream_t stream);
 
-// Paged in-place re-RoPE on the stored cache. is_fp16 selects __half vs float
-// storage (q8 cache is not supported: re-RoPE on quantized K is lossy and the
-// block-sparse path requires fp16/fp32 KV). See kernel comment.
+// Paged in-place re-RoPE on the stored cache. This ABI selects __half vs float;
+// FP8 uses the separate launcher below. Q8 is unsupported because rotating an
+// int8 row also requires recomputing its shared scale. See kernel comment.
 bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    uint32_t n_tokens, uint32_t n_kv_heads,
                                    uint32_t per_pos_size, uint32_t head_dim,
@@ -257,6 +283,24 @@ bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    const int32_t *page_indices,
                                    uint32_t page_size, float theta,
                                    cudaStream_t stream);
+
+// FP8 variants are separate entry points so the existing fp16/fp32 ABI used by
+// the CUDA parity tests stays unchanged. Immutable-source K periodically resets
+// the working FP8 cache after a dtype-aware bounded number of resident remaps,
+// so lossy writes cannot accumulate without limit across reselections.
+bool launch_rope_block_remap_paged_fp8(void *cache,
+                                       uint32_t n_tokens,
+                                       uint32_t n_kv_heads,
+                                       uint32_t per_pos_size,
+                                       uint32_t head_dim,
+                                       uint32_t rope_dim,
+                                       uint32_t win_base,
+                                       int32_t orig_base,
+                                       int32_t new_base,
+                                       const int32_t *page_indices,
+                                       uint32_t page_size,
+                                       float theta,
+                                       cudaStream_t stream);
 
 // Batched analogue: re-RoPE n_blocks moved blocks in ONE launch (grid.z indexes
 // the block). Each block reads its own from_base[bz]/to_base[bz]/n_tokens[bz]
@@ -276,19 +320,101 @@ bool launch_rope_block_remap_paged_batched(void *cache, bool is_fp16,
                                            const int32_t *page_indices,
                                            uint32_t page_size, float theta,
                                            cudaStream_t stream);
+bool launch_rope_block_remap_paged_batched_fp8(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
+bool launch_build_rope_sincos_table(
+        float *table, uint32_t positions, uint32_t rope_dim, float theta,
+        cudaStream_t stream);
+bool launch_rope_block_remap_paged_batched_table(
+        void *cache, bool is_fp16, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *from_base,
+        const int32_t *n_tokens, const int32_t *page_indices,
+        uint32_t page_size, const float *rope_sincos,
+        uint32_t rope_table_positions, cudaStream_t stream);
+bool launch_rope_block_remap_paged_batched_table_fp8(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream);
+
+bool launch_raw_k_scatter_rope_paged_batched(
+        void *cache, const void *raw_k, bool is_fp16, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_table(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_table_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        uint64_t raw_block_stride_elements, cudaStream_t stream);
 
 // Block-sparse selection signal (#40). See kernel comments.
+enum class KbarDType : uint32_t {
+    F32 = 0,
+    F16 = 1,
+    FP8 = 2,
+};
+
 bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
                               uint32_t n_blocks, uint32_t n_kv_heads,
                               uint32_t per_pos_size, uint32_t head_dim,
                               const int32_t *win_base, const int32_t *blk_tokens,
                               const int32_t *page_indices, uint32_t page_size,
                               cudaStream_t stream);
+bool launch_block_kmean_paged_fp8(void *k_cache, float *kbar,
+                                  uint32_t n_blocks, uint32_t n_kv_heads,
+                                  uint32_t per_pos_size, uint32_t head_dim,
+                                  const int32_t *win_base,
+                                  const int32_t *blk_tokens,
+                                  const int32_t *page_indices,
+                                  uint32_t page_size, cudaStream_t stream);
+bool launch_block_kmean_paged_typed(
+        void *k_cache, bool cache_is_fp16, bool cache_is_fp8, void *kbar,
+        KbarDType kbar_dtype, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, cudaStream_t stream);
 bool launch_block_attn_score_step(float *accum, const float *q,
                                   const float *kbar, uint32_t q_stride,
                                   uint32_t n_blocks, uint32_t n_heads,
                                   uint32_t n_kv_heads, uint32_t head_dim,
                                   float scale, cudaStream_t stream);
+bool launch_block_attn_score_step_typed(
+        float *accum, const float *q, const void *kbar,
+        KbarDType kbar_dtype, uint32_t q_stride, uint32_t n_blocks,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        float scale, cudaStream_t stream);
 bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            const float *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
@@ -301,7 +427,18 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            uint32_t excl_hi_begin,
                                            uint32_t n_subblocks,
                                            uint32_t reduce_max,
+                                           uint32_t accumulate,
                                            cudaStream_t stream);
+bool launch_block_attn_score_softmax_pages_typed(
+        float *score, const void *q_multi, bool query_is_fp16,
+        const void *kbar_multi, KbarDType kbar_dtype,
+        uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t n_blocks,
+        uint32_t kbar_layer_stride, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t n_subblocks, uint32_t reduce_max, uint32_t accumulate,
+        cudaStream_t stream);
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        const float *q, uint32_t q_stride,
                                        uint32_t n_window_blocks,
@@ -316,6 +453,13 @@ bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
                                        uint32_t seq_len,
                                        float scale,
                                        cudaStream_t stream);
+bool launch_block_attention_mass_paged_fp8(
+        void *k_cache, float *mass, const float *q, uint32_t q_stride,
+        uint32_t n_window_blocks, uint32_t n_heads, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, uint32_t seq_len, float scale,
+        cudaStream_t stream);
 // Global content-frame KV retrieval index (#48). See kernel comments.
 bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       uint32_t n_blocks, uint32_t n_kv_heads,
@@ -325,6 +469,19 @@ bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       const int32_t *page_indices,
                                       uint32_t page_size, float theta,
                                       cudaStream_t stream);
+bool launch_block_kmean_content_paged_fp8(
+        void *k_cache, float *kbar, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *orig_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
+bool launch_block_kmean_content_paged_typed(
+        void *k_cache, bool cache_is_fp16, bool cache_is_fp8, void *kbar,
+        KbarDType kbar_dtype, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *orig_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream);
 // Incremental content-frame index from the prefill K batch (#91). See kernel.
 bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint64_t kbar_block_base,
@@ -334,6 +491,27 @@ bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
                                       uint32_t rope_dim, int32_t rope_base,
                                       float theta, uint32_t n_subblocks,
                                       cudaStream_t stream);
+bool launch_block_kmean_content_batch_typed(
+        const float *k_batch, void *kbar, KbarDType kbar_dtype,
+        uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+        uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+        int32_t rope_base, float theta, uint32_t n_subblocks,
+        cudaStream_t stream);
+bool launch_block_kmean_content_batch_merge(
+    const float *k_batch, float *kbar, uint64_t kbar_block_base,
+    uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+    uint32_t blk_tokens, uint32_t first_block_token_offset,
+    uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+    int32_t rope_base, float theta, uint32_t n_subblocks,
+    cudaStream_t stream);
+bool launch_block_kmean_content_batch_merge_typed(
+    const float *k_batch, void *kbar, KbarDType kbar_dtype,
+    uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+    uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+    uint32_t first_block_token_offset, uint32_t n_kv_heads,
+    uint32_t head_dim, uint32_t rope_dim, int32_t rope_base,
+    float theta, uint32_t n_subblocks, cudaStream_t stream);
 // Raw-key store (per-token retrieval): store each de-RoPE'd K row (no mean).
 bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
                                        uint64_t out_base_elem, uint32_t k_stride,
@@ -372,10 +550,39 @@ bool launch_derope_query_multi(float *q_multi, const float *q,
                                uint32_t cnt, uint32_t n_heads, uint32_t head_dim,
                                uint32_t rope_dim, int32_t start_pos, float theta,
                                cudaStream_t stream);
+bool launch_derope_query_multi_f16(void *q_multi, const float *q,
+                                   uint32_t q_token_stride,
+                                   uint32_t q_head_stride, uint32_t cnt,
+                                   uint32_t n_heads, uint32_t head_dim,
+                                   uint32_t rope_dim, int32_t start_pos,
+                                   float theta, cudaStream_t stream);
 }
 
 #if QW3_ENABLE_FLASHINFER
 namespace flashinfer_adapter {
+bool batch_prefill_paged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        uint32_t n_pages,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t base_seq_len,
+        uint32_t batch);
+
+bool batch_prefill_paged_ragged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim);
+
 bool launch_prefill_f16q_f16kv(
         float *out,
         __half *q_f16,
@@ -422,7 +629,8 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        bool *plan_cache_hit_out);
 
 bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         float *out,
@@ -448,7 +656,8 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        bool *plan_cache_hit_out);
 
 bool launch_batch_prefill_paged_ragged_f16q_f16kv_gated(
         float *out,
@@ -619,16 +828,26 @@ bool launch_batch_decode_f32q_fp8kv_gated(
 namespace {
 
 // Runtime selector for the recurrent (DeltaNet) kernel. Read once on first
-// use. Default is the ported kernel (warp-shuffle reductions, register-
-// resident state). Set QW3_RECURRENT_KERNEL=qw3 to fall back to the original
-// shmem-reduction kernel — kept around for future exploration of why the
-// algorithmic mapping matters this much.
-enum class RecurrentKernel { Qw3, Ported };
+// use. SM120 AOT builds default to the chunk-parallel GDN prefill kernel;
+// other builds retain the ported warp kernel. Explicit "ported" and "qw3"
+// values remain available for regression and compatibility testing.
+enum class RecurrentKernel { Qw3, Ported, Sm120Aot };
 RecurrentKernel recurrent_kernel_choice() {
     static const RecurrentKernel choice = []() {
         const char *env = std::getenv("QW3_RECURRENT_KERNEL");
         if (env && std::strcmp(env, "qw3") == 0) return RecurrentKernel::Qw3;
+        if (env && std::strcmp(env, "ported") == 0) {
+            return RecurrentKernel::Ported;
+        }
+#ifdef QW3_ENABLE_GDN_SM120_AOT
+        if (env && (std::strcmp(env, "sm120-aot") == 0 ||
+                    std::strcmp(env, "flashinfer") == 0)) {
+            return RecurrentKernel::Sm120Aot;
+        }
+        return RecurrentKernel::Sm120Aot;
+#else
         return RecurrentKernel::Ported;
+#endif
     }();
     return choice;
 }
@@ -693,6 +912,12 @@ bool env_flag_enabled_local(const char *name, bool default_value) {
            std::strcmp(raw, "false") != 0 &&
            std::strcmp(raw, "off") != 0 &&
            std::strcmp(raw, "no") != 0;
+}
+
+bool parallel_prefill_conv_enabled() {
+    static const bool enabled =
+        env_flag_enabled_local("QW3_PARALLEL_PREFILL_CONV", true);
+    return enabled;
 }
 
 uint32_t env_uint32_or_local(const char *name, uint32_t fallback) {
@@ -796,6 +1021,19 @@ PrefillAttnKernel prefill_attn_kernel_choice() {
 #endif
     }();
     return choice;
+}
+
+uint64_t flashinfer_prefill_float_workspace_elements() {
+    static const uint64_t elements = []() {
+        uint64_t mib = 512;
+        if (const char *env =
+                std::getenv("QW3_FLASHINFER_PREFILL_WORKSPACE_MIB")) {
+            const long long parsed = std::atoll(env);
+            if (parsed >= 0) mib = static_cast<uint64_t>(parsed);
+        }
+        return (mib << 20) / sizeof(float);
+    }();
+    return elements;
 }
 
 // Min batch (= number of prefill queries) at which we switch to the tiled
@@ -975,6 +1213,7 @@ __device__ float fp16_to_f32_device(uint16_t h) {
 struct CudaTensor final : DeviceTensor {
     float *ptr = nullptr;
     std::string label;
+    bool owns_ptr = true;
     // Q8 KV-cache support: when q8_kv is true, `ptr` is reinterpreted as an
     // int8 quant plane and `scale` holds one fp16 scale per quant row (a row
     // is `q8_row_elems` int8 values sharing a single max-abs scale). Scales
@@ -991,10 +1230,19 @@ struct CudaTensor final : DeviceTensor {
     uint32_t q8_row_elems = 0;
     __half *scale = nullptr;
     uint64_t scale_count = 0;
+    const float *lazy_fp8_raw = nullptr;
+    const float *lazy_fp8_activation_scales = nullptr;
+    const float *lazy_fp8_weight_scales = nullptr;
+    uint32_t lazy_fp8_batch = 0;
+    uint32_t lazy_fp8_raw_stride = 0;
+    uint32_t lazy_fp8_row_offset = 0;
+    uint32_t lazy_fp8_rows = 0;
     CudaTensor(uint64_t n, const char *name, uint32_t elem_bytes = sizeof(float),
-               bool zero_initialize = true) {
+               bool zero_initialize = true,
+               DeviceTensorDType storage_dtype = DeviceTensorDType::F32) {
         count = n;
         elem_size = elem_bytes;
+        dtype = storage_dtype;
         label = name ? name : "tensor";
         const size_t bytes = static_cast<size_t>(n) * elem_bytes;
         cudaError_t err = cudaMalloc(&ptr, bytes);
@@ -1017,8 +1265,32 @@ struct CudaTensor final : DeviceTensor {
             }
         }
     }
+    CudaTensor(CudaTensor &storage,
+               uint64_t byte_offset,
+               uint64_t n,
+               uint32_t elem_bytes,
+               DeviceTensorDType storage_dtype,
+               const char *name) {
+        if (elem_bytes == 0) {
+            throw std::invalid_argument("CUDA tensor view element size is zero");
+        }
+        const uint64_t storage_bytes =
+            storage.count * static_cast<uint64_t>(storage.elem_size);
+        const uint64_t view_bytes = n * static_cast<uint64_t>(elem_bytes);
+        if (byte_offset > storage_bytes ||
+            view_bytes > storage_bytes - byte_offset) {
+            throw std::out_of_range("CUDA tensor view exceeds backing storage");
+        }
+        count = n;
+        elem_size = elem_bytes;
+        dtype = storage_dtype;
+        label = name ? name : "tensor_view";
+        ptr = reinterpret_cast<float *>(
+            reinterpret_cast<uint8_t *>(storage.ptr) + byte_offset);
+        owns_ptr = false;
+    }
     ~CudaTensor() override {
-        if (ptr) cudaFree(ptr);
+        if (ptr && owns_ptr) cudaFree(ptr);
         if (scale) cudaFree(scale);
     }
     // Attach a Q8 scale plane. `n` int8 elements grouped into rows of
@@ -1046,10 +1318,43 @@ struct CudaTensor final : DeviceTensor {
             cudaMemset(scale, 0, sbytes);
         }
     }
-    bool is_fp16() const { return elem_size == sizeof(__half) && !fp8_kv; }
+    bool is_fp16() const { return dtype == DeviceTensorDType::F16; }
+    bool is_bf16() const { return dtype == DeviceTensorDType::BF16; }
     bool is_q8_kv() const { return q8_kv; }
     bool is_fp8_kv() const { return fp8_kv; }
+    bool is_lazy_fp8_linear() const {
+        return lazy_fp8_raw && lazy_fp8_activation_scales &&
+               lazy_fp8_weight_scales && lazy_fp8_rows > 0;
+    }
+    void clear_lazy_fp8_linear() {
+        lazy_fp8_raw = nullptr;
+        lazy_fp8_activation_scales = nullptr;
+        lazy_fp8_weight_scales = nullptr;
+        lazy_fp8_batch = 0;
+        lazy_fp8_raw_stride = 0;
+        lazy_fp8_row_offset = 0;
+        lazy_fp8_rows = 0;
+    }
+    void set_lazy_fp8_linear(
+            const float *raw,
+            const float *activation_scales,
+            const float *weight_scales,
+            uint32_t batch,
+            uint32_t raw_stride,
+            uint32_t row_offset,
+            uint32_t rows) {
+        lazy_fp8_raw = raw;
+        lazy_fp8_activation_scales = activation_scales;
+        lazy_fp8_weight_scales = weight_scales;
+        lazy_fp8_batch = batch;
+        lazy_fp8_raw_stride = raw_stride;
+        lazy_fp8_row_offset = row_offset;
+        lazy_fp8_rows = rows;
+    }
     __half *ptr_h() const { return reinterpret_cast<__half *>(ptr); }
+    __nv_bfloat16 *ptr_bf16() const {
+        return reinterpret_cast<__nv_bfloat16 *>(ptr);
+    }
     int8_t *ptr_i8() const { return reinterpret_cast<int8_t *>(ptr); }
     int32_t *ptr_i32() const { return reinterpret_cast<int32_t *>(ptr); }
     __nv_fp8_e4m3 *ptr_fp8() const { return reinterpret_cast<__nv_fp8_e4m3 *>(ptr); }
@@ -1057,13 +1362,31 @@ struct CudaTensor final : DeviceTensor {
 
 enum class WeightType {
     F32,
+    BF16,
+    BF16_HOST,
+    FP8_E4M3,
     Q8_0,
+    NVFP4_E2M1,
 };
 
 struct CudaWeight final : DeviceWeight {
     void *ptr = nullptr;
+    void *scale = nullptr;
+    float *input_scale = nullptr;
+    float *global_scale = nullptr;
+    float input_scale_host = 0.0f;
+    float global_scale_host = 0.0f;
     float *q8_f32_cache = nullptr;
+    float *bf16_f32_cache = nullptr;
+    __nv_bfloat16 *f32_bf16_cache = nullptr;
     uint64_t bytes = 0;
+    uint64_t scale_bytes = 0;
+    bool owns_ptr = true;
+    bool owns_scale = true;
+    const CudaWeight *fp8_packed_second = nullptr;
+    uint64_t fp8_packed_rows = 0;
+    const CudaWeight *nvfp4_packed_second = nullptr;
+    uint64_t nvfp4_packed_rows = 0;
     WeightType type = WeightType::F32;
     std::string label;
     CudaWeight(const void *src, uint64_t nbytes, uint64_t r, uint64_t c, WeightType t, const char *name) {
@@ -1071,7 +1394,20 @@ struct CudaWeight final : DeviceWeight {
         cols = c;
         bytes = nbytes;
         type = t;
+        switch (t) {
+            case WeightType::F32: format = DeviceWeightFormat::F32; break;
+            case WeightType::BF16: format = DeviceWeightFormat::BF16; break;
+            case WeightType::BF16_HOST: format = DeviceWeightFormat::BF16; break;
+            case WeightType::FP8_E4M3: format = DeviceWeightFormat::FP8_E4M3; break;
+            case WeightType::Q8_0: format = DeviceWeightFormat::Q8_0; break;
+            case WeightType::NVFP4_E2M1: format = DeviceWeightFormat::NVFP4_E2M1; break;
+        }
         label = name ? name : "weight";
+        if (t == WeightType::BF16_HOST) {
+            ptr = const_cast<void *>(src);
+            owns_ptr = false;
+            return;
+        }
         cudaMalloc(&ptr, static_cast<size_t>(bytes));
         if (t == WeightType::Q8_0) {
             // Repack from interleaved 34-byte blocks [d; qs[32]] into the
@@ -1105,10 +1441,37 @@ struct CudaWeight final : DeviceWeight {
         } else {
             cudaMemcpy(ptr, src, static_cast<size_t>(bytes), cudaMemcpyHostToDevice);
         }
+        if (t == WeightType::F32 &&
+            label.find("norm.weight") != std::string::npos) {
+            const uint64_t count = r * c;
+            std::vector<__nv_bfloat16> staged(static_cast<size_t>(count));
+            const auto *source = static_cast<const float *>(src);
+            for (uint64_t i = 0; i < count; ++i) {
+                staged[static_cast<size_t>(i)] =
+                    __float2bfloat16(source[i]);
+            }
+            if (cudaMalloc(
+                    &f32_bf16_cache,
+                    count * sizeof(__nv_bfloat16)) == cudaSuccess) {
+                cudaMemcpy(
+                    f32_bf16_cache,
+                    staged.data(),
+                    count * sizeof(__nv_bfloat16),
+                    cudaMemcpyHostToDevice);
+            } else {
+                f32_bf16_cache = nullptr;
+                cudaGetLastError();
+            }
+        }
     }
     ~CudaWeight() override {
+        if (global_scale) cudaFree(global_scale);
+        if (input_scale) cudaFree(input_scale);
+        if (scale && owns_scale) cudaFree(scale);
+        if (bf16_f32_cache) cudaFree(bf16_f32_cache);
+        if (f32_bf16_cache) cudaFree(f32_bf16_cache);
         if (q8_f32_cache) cudaFree(q8_f32_cache);
-        if (ptr) cudaFree(ptr);
+        if (ptr && owns_ptr) cudaFree(ptr);
     }
 };
 
@@ -1135,6 +1498,27 @@ __global__ void add_kernel(float *out, const float *a, const float *b, uint64_t 
         *reinterpret_cast<float4 *>(out + i4) = r;
     } else {
         for (uint64_t i = i4; i < n; ++i) out[i] = a[i] + b[i];
+    }
+}
+
+__global__ void add_bf16_kernel(__nv_bfloat16 *out,
+                                const __nv_bfloat16 *a,
+                                const __nv_bfloat16 *b,
+                                uint64_t n) {
+    const uint64_t i =
+        (static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 2;
+    if (i + 1 < n) {
+        const __nv_bfloat162 av =
+            *reinterpret_cast<const __nv_bfloat162 *>(a + i);
+        const __nv_bfloat162 bv =
+            *reinterpret_cast<const __nv_bfloat162 *>(b + i);
+        const float2 af = __bfloat1622float2(av);
+        const float2 bf = __bfloat1622float2(bv);
+        *reinterpret_cast<__nv_bfloat162 *>(out + i) =
+            __floats2bfloat162_rn(af.x + bf.x, af.y + bf.y);
+    } else if (i < n) {
+        out[i] = __float2bfloat16(
+            __bfloat162float(a[i]) + __bfloat162float(b[i]));
     }
 }
 
@@ -1372,6 +1756,38 @@ __global__ void silu_mul_kernel(float *out, const float *gate, const float *up, 
     }
 }
 
+__global__ void silu_mul_bf16_pair_kernel(float *out,
+                                          const __nv_bfloat16 *pair,
+                                          uint64_t n) {
+    const uint64_t index =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= n) return;
+    const float gate = __bfloat162float(pair[index]);
+    const float up = __bfloat162float(pair[n + index]);
+    out[index] = (gate / (1.0f + __expf(-gate))) * up;
+}
+
+__global__ void silu_mul_f32_pair_batch_kernel(
+        float *out,
+        const float *pair,
+        uint32_t batch,
+        uint32_t width,
+        uint32_t out_stride) {
+    const uint64_t index =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(batch) * width;
+    if (index >= count) return;
+    const uint32_t row = static_cast<uint32_t>(index / width);
+    const uint32_t col =
+        static_cast<uint32_t>(index - static_cast<uint64_t>(row) * width);
+    const float *pair_row =
+        pair + static_cast<uint64_t>(row) * 2u * width;
+    const float gate = pair_row[col];
+    const float up = pair_row[width + col];
+    out[static_cast<uint64_t>(row) * out_stride + col] =
+        (gate / (1.0f + __expf(-gate))) * up;
+}
+
 // Single-row RMS norm: 1 block per row, 1024 threads, vectorized float4 loads,
 // 32-wide warp shuffles for the reduction (shmem only across warps).
 template <uint32_t BLOCK_THREADS>
@@ -1439,6 +1855,50 @@ __global__ void rms_norm_kernel_vec(float *__restrict__ out,
     }
 }
 
+template <uint32_t BLOCK_THREADS>
+__global__ void rms_norm_bf16_to_f32_kernel(
+        float *__restrict__ out,
+        const __nv_bfloat16 *__restrict__ x,
+        const float *__restrict__ weight,
+        uint64_t n,
+        float eps) {
+    constexpr uint32_t WARP_SIZE = 32;
+    constexpr uint32_t NWARPS = BLOCK_THREADS / WARP_SIZE;
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid % WARP_SIZE;
+    const uint32_t warp = tid / WARP_SIZE;
+    const __nv_bfloat16 *x_row = x + static_cast<uint64_t>(row) * n;
+    float *out_row = out + static_cast<uint64_t>(row) * n;
+
+    float sum = 0.0f;
+    for (uint64_t i = tid; i < n; i += BLOCK_THREADS) {
+        const float value = __bfloat162float(x_row[i]);
+        sum = fmaf(value, value, sum);
+    }
+#pragma unroll
+    for (int delta = WARP_SIZE / 2; delta > 0; delta >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, delta);
+    }
+    __shared__ float warp_sums[NWARPS];
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < NWARPS ? warp_sums[lane] : 0.0f;
+#pragma unroll
+        for (int delta = WARP_SIZE / 2; delta > 0; delta >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, delta);
+        }
+        if (lane == 0) warp_sums[0] = sum;
+    }
+    __syncthreads();
+    const float scale =
+        rsqrtf(warp_sums[0] / static_cast<float>(n) + eps);
+    for (uint64_t i = tid; i < n; i += BLOCK_THREADS) {
+        out_row[i] = __bfloat162float(x_row[i]) * scale * weight[i];
+    }
+}
+
 // Fallback for the unaligned / very-small-n case.
 __global__ void rms_norm_kernel(float *out, const float *x, const float *weight, uint64_t n, float eps) {
     const uint32_t b = blockIdx.x;
@@ -1470,6 +1930,27 @@ __global__ void q8_get_row_kernel(float *out, const uint8_t *weight, uint64_t ro
     const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + block);
     const int8_t   q  = qs_plane[block * 32 + inb];
     out[i] = fp16_to_f32_device(dh) * static_cast<float>(q);
+}
+
+__global__ void q8_get_row_bf16_kernel(__nv_bfloat16 *out,
+                                       const uint8_t *weight,
+                                       uint64_t row,
+                                       uint64_t cols) {
+    const uint64_t i =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    const uint64_t blocks_per_row = cols / 32;
+    const uint64_t block = i / 32;
+    const uint64_t inb = i % 32;
+    const uint8_t *row_base = weight + row * blocks_per_row * 34;
+    const __half *d_plane = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t *qs_plane =
+        qw3::cuda_helpers::q8_qs_plane(row_base, blocks_per_row);
+    const uint16_t dh =
+        *reinterpret_cast<const uint16_t *>(d_plane + block);
+    out[i] = __float2bfloat16(
+        fp16_to_f32_device(dh) *
+        static_cast<float>(qs_plane[block * 32 + inb]));
 }
 
 __global__ void q8_get_row_from_argmax_kernel(float *out,
@@ -1519,6 +2000,87 @@ __global__ void q8_get_rows_batch_kernel(float *out,
     const uint16_t dh = *reinterpret_cast<const uint16_t *>(d_plane + block);
     const int8_t   q  = qs_plane[block * 32 + inb];
     out[static_cast<uint64_t>(b) * cols + i] = fp16_to_f32_device(dh) * static_cast<float>(q);
+}
+
+__global__ void q8_get_rows_batch_bf16_kernel(
+        __nv_bfloat16 *out,
+        const uint8_t *weight,
+        const uint64_t *rows_buf,
+        uint64_t cols) {
+    const uint32_t b = blockIdx.x;
+    const uint64_t row = rows_buf[b];
+    const uint64_t i =
+        static_cast<uint64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    const uint64_t blocks_per_row = cols / 32;
+    const uint64_t block = i / 32;
+    const uint64_t inb = i % 32;
+    const uint8_t *row_base = weight + row * blocks_per_row * 34;
+    const __half *d_plane = qw3::cuda_helpers::q8_d_plane(row_base);
+    const int8_t *qs_plane =
+        qw3::cuda_helpers::q8_qs_plane(row_base, blocks_per_row);
+    const uint16_t dh =
+        *reinterpret_cast<const uint16_t *>(d_plane + block);
+    out[static_cast<uint64_t>(b) * cols + i] = __float2bfloat16(
+        fp16_to_f32_device(dh) *
+        static_cast<float>(qs_plane[block * 32 + inb]));
+}
+
+__global__ void bf16_get_row_kernel(float *out,
+                                    const __nv_bfloat16 *weight,
+                                    uint64_t row,
+                                    uint64_t cols) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < cols) out[i] = __bfloat162float(weight[row * cols + i]);
+}
+
+__global__ void bf16_get_row_bf16_kernel(__nv_bfloat16 *out,
+                                         const __nv_bfloat16 *weight,
+                                         uint64_t row,
+                                         uint64_t cols) {
+    const uint64_t i =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < cols) out[i] = weight[row * cols + i];
+}
+
+__global__ void bf16_get_row_from_argmax_kernel(float *out,
+                                                const __nv_bfloat16 *weight,
+                                                const ArgmaxPair *argmaxes,
+                                                uint32_t argmax_index,
+                                                uint64_t rows,
+                                                uint64_t cols) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    const int token = argmaxes[argmax_index].index;
+    out[i] = token >= 0 && static_cast<uint64_t>(token) < rows
+        ? __bfloat162float(weight[static_cast<uint64_t>(token) * cols + i])
+        : 0.0f;
+}
+
+__global__ void bf16_get_rows_batch_kernel(float *out,
+                                           const __nv_bfloat16 *weight,
+                                           const uint64_t *rows_buf,
+                                           uint64_t cols) {
+    const uint32_t b = blockIdx.x;
+    const uint64_t i = static_cast<uint64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    if (i < cols) {
+        out[static_cast<uint64_t>(b) * cols + i] =
+            __bfloat162float(weight[rows_buf[b] * cols + i]);
+    }
+}
+
+__global__ void bf16_get_rows_batch_bf16_kernel(
+        __nv_bfloat16 *out,
+        const __nv_bfloat16 *weight,
+        const uint64_t *rows_buf,
+        uint64_t cols) {
+    const uint32_t b = blockIdx.x;
+    const uint64_t i =
+        static_cast<uint64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    if (i < cols) {
+        out[static_cast<uint64_t>(b) * cols + i] =
+            weight[rows_buf[b] * cols + i];
+    }
 }
 
 // Multi-row Q8_0 matvec with DP4A. Each block:
@@ -1855,6 +2417,755 @@ __global__ void fp32_to_fp16_kernel(__half *out, const float *in, uint64_t n) {
             out[j] = __float2half(in[j]);
         }
     }
+}
+
+__global__ void fp32_to_bf16_kernel(__nv_bfloat16 *out, const float *in, uint64_t n) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(in[i]);
+}
+
+__global__ void bf16_to_fp32_kernel(float *out, const __nv_bfloat16 *in, uint64_t n) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __bfloat162float(in[i]);
+}
+
+__global__ void bf16_to_fp32_strided_kernel(float *out,
+                                            const __nv_bfloat16 *in,
+                                            uint32_t rows,
+                                            uint32_t cols,
+                                            uint32_t out_stride) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(rows) * cols;
+    if (index >= count) return;
+    const uint32_t row = static_cast<uint32_t>(index / cols);
+    const uint32_t col = static_cast<uint32_t>(index % cols);
+    out[static_cast<uint64_t>(row) * out_stride + col] = __bfloat162float(in[index]);
+}
+
+__global__ void pack_mtp_prefix_bf16_to_f32_kernel(
+        float *dst,
+        const __nv_bfloat16 *first,
+        const __nv_bfloat16 *h_batch,
+        uint32_t batch,
+        uint32_t h_stride) {
+    const uint64_t index =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(batch) * h_stride;
+    if (index >= count) return;
+    const uint32_t row = static_cast<uint32_t>(index / h_stride);
+    const uint32_t col = static_cast<uint32_t>(index % h_stride);
+    const __nv_bfloat16 value =
+        row == 0 ? first[col]
+                 : h_batch[static_cast<uint64_t>(row - 1) * h_stride + col];
+    dst[index] = __bfloat162float(value);
+}
+
+__global__ void fp32_to_fp8_per_row_kernel(__nv_fp8_e4m3 *out,
+                                           float *scales,
+                                           const float *in,
+                                           uint32_t rows,
+                                           uint32_t cols,
+                                           uint32_t stride) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kWarps = 8;
+    __shared__ float warp_max[kWarps];
+    __shared__ float row_scale;
+    float amax = 0.0f;
+    const float *src = in + static_cast<uint64_t>(row) * stride;
+    auto *dst = out + static_cast<uint64_t>(row) * cols;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        amax = fmaxf(amax, fabsf(src[col]));
+    }
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffU, amax, offset));
+    }
+    if (lane == 0) warp_max[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        amax = lane < kWarps ? warp_max[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            amax = fmaxf(
+                amax, __shfl_down_sync(0xffffffffU, amax, offset));
+        }
+        if (lane == 0) {
+            row_scale = amax > 0.0f ? amax / 448.0f : 1.0f;
+            scales[row] = row_scale;
+        }
+    }
+    __syncthreads();
+    const float scale = row_scale;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        dst[col] = __nv_fp8_e4m3(src[col] / scale);
+    }
+}
+
+template <uint32_t BLOCK_THREADS>
+__global__ void rms_norm_bf16_to_fp8_per_row_kernel(
+        __nv_fp8_e4m3 *__restrict__ out,
+        float *__restrict__ scales,
+        __nv_bfloat16 *__restrict__ normalized_bf16,
+        const __nv_bfloat16 *__restrict__ in,
+        const float *__restrict__ weight,
+        uint32_t cols,
+        float eps) {
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kWarps = BLOCK_THREADS / kWarpSize;
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid % kWarpSize;
+    const uint32_t warp = tid / kWarpSize;
+    const auto *src = in + static_cast<uint64_t>(row) * cols;
+    auto *dst = out + static_cast<uint64_t>(row) * cols;
+    __shared__ float warp_values[kWarps];
+    __shared__ float inverse_rms;
+    __shared__ float row_scale;
+
+    float sum = 0.0f;
+    for (uint32_t col = tid; col < cols; col += BLOCK_THREADS) {
+        const float value = __bfloat162float(src[col]);
+        sum = fmaf(value, value, sum);
+    }
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffU, sum, offset);
+    }
+    if (lane == 0) warp_values[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < kWarps ? warp_values[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffU, sum, offset);
+        }
+        if (lane == 0) {
+            inverse_rms =
+                rsqrtf(sum / static_cast<float>(cols) + eps);
+        }
+    }
+    __syncthreads();
+
+    float amax = 0.0f;
+    const float norm_scale = inverse_rms;
+    for (uint32_t col = tid; col < cols; col += BLOCK_THREADS) {
+        const float normalized =
+            __bfloat162float(src[col]) * norm_scale * weight[col];
+        amax = fmaxf(amax, fabsf(normalized));
+    }
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        amax = fmaxf(
+            amax, __shfl_down_sync(0xffffffffU, amax, offset));
+    }
+    if (lane == 0) warp_values[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        amax = lane < kWarps ? warp_values[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            amax = fmaxf(
+                amax, __shfl_down_sync(0xffffffffU, amax, offset));
+        }
+        if (lane == 0) {
+            row_scale = amax > 0.0f ? amax / 448.0f : 1.0f;
+            scales[row] = row_scale;
+        }
+    }
+    __syncthreads();
+
+    const float quant_scale = row_scale;
+    for (uint32_t col = tid; col < cols; col += BLOCK_THREADS) {
+        const float normalized =
+            __bfloat162float(src[col]) * norm_scale * weight[col];
+        dst[col] = __nv_fp8_e4m3(normalized / quant_scale);
+        if (normalized_bf16) {
+            normalized_bf16[
+                static_cast<uint64_t>(row) * cols + col] =
+                __float2bfloat16(normalized);
+        }
+    }
+}
+
+__global__ void fp32_to_fp8_bf16_per_row_kernel(
+        __nv_fp8_e4m3 *fp8_out,
+        float *scales,
+        __nv_bfloat16 *bf16_out,
+        const float *in,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t stride) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kWarps = 8;
+    __shared__ float warp_max[kWarps];
+    __shared__ float row_scale;
+    float amax = 0.0f;
+    const float *src = in + static_cast<uint64_t>(row) * stride;
+    auto *fp8_dst = fp8_out + static_cast<uint64_t>(row) * cols;
+    auto *bf16_dst = bf16_out + static_cast<uint64_t>(row) * stride;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = src[col];
+        amax = fmaxf(amax, fabsf(value));
+        bf16_dst[col] = __float2bfloat16(value);
+    }
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffffU, amax, offset));
+    }
+    if (lane == 0) warp_max[warp] = amax;
+    __syncthreads();
+    if (warp == 0) {
+        amax = lane < kWarps ? warp_max[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            amax = fmaxf(
+                amax, __shfl_down_sync(0xffffffffU, amax, offset));
+        }
+        if (lane == 0) {
+            row_scale = amax > 0.0f ? amax / 448.0f : 1.0f;
+            scales[row] = row_scale;
+        }
+    }
+    __syncthreads();
+    const float scale = row_scale;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        fp8_dst[col] = __nv_fp8_e4m3(src[col] / scale);
+    }
+}
+
+__global__ void fp8_weight_f32_matvec_kernel(float *out,
+                                             const __nv_fp8_e4m3 *weight,
+                                             const float *weight_scales,
+                                             const float *input,
+                                             uint32_t rows,
+                                             uint32_t cols,
+                                             uint32_t batch,
+                                             uint32_t input_stride,
+                                             uint32_t output_stride) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t item = blockIdx.y;
+    if (row >= rows || item >= batch) return;
+    const auto *weight_row = weight + static_cast<uint64_t>(row) * cols;
+    const float *input_row = input + static_cast<uint64_t>(item) * input_stride;
+    float sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        sum += static_cast<float>(weight_row[col]) * input_row[col];
+    }
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kWarps = 8;
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+    }
+    __shared__ float warp_sums[kWarps];
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < kWarps ? warp_sums[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        }
+        if (lane == 0) {
+            out[static_cast<uint64_t>(item) * output_stride + row] =
+                sum * weight_scales[row];
+        }
+    }
+}
+
+__global__ void fp8_weight_f32_matvec_add_kernel(
+        float *out,
+        const __nv_fp8_e4m3 *weight,
+        const float *weight_scales,
+        const float *input,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t batch,
+        uint32_t input_stride,
+        uint32_t output_stride) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t item = blockIdx.y;
+    if (row >= rows || item >= batch) return;
+    const auto *weight_row = weight + static_cast<uint64_t>(row) * cols;
+    const float *input_row = input + static_cast<uint64_t>(item) * input_stride;
+    float sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        sum += static_cast<float>(weight_row[col]) * input_row[col];
+    }
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kWarps = 8;
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+    }
+    __shared__ float warp_sums[kWarps];
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < kWarps ? warp_sums[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        }
+        if (lane == 0) {
+            out[static_cast<uint64_t>(item) * output_stride + row] +=
+                sum * weight_scales[row];
+        }
+    }
+}
+
+template <bool Add>
+__global__ void fp8_weight_f32_matvec_vec2_kernel(
+        float *out,
+        const __nv_fp8_e4m3 *weight,
+        const float *weight_scales,
+        const float *input,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t batch,
+        uint32_t input_stride,
+        uint32_t output_stride) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t item = blockIdx.y;
+    if (row >= rows || item >= batch) return;
+    const auto *weight_row = weight + static_cast<uint64_t>(row) * cols;
+    const float *input_row =
+        input + static_cast<uint64_t>(item) * input_stride;
+    float sum = 0.0f;
+    for (uint32_t col = threadIdx.x * 2;
+         col < cols;
+         col += blockDim.x * 2) {
+        __nv_fp8x2_e4m3 packed;
+        packed.__x = *reinterpret_cast<const __nv_fp8x2_storage_t *>(
+            weight_row + col);
+        const float2 weight_values = static_cast<float2>(packed);
+        const float2 input_values =
+            *reinterpret_cast<const float2 *>(input_row + col);
+        sum = fmaf(weight_values.x, input_values.x, sum);
+        sum = fmaf(weight_values.y, input_values.y, sum);
+    }
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kMaxWarps = 32;
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+    const uint32_t warps = blockDim.x / kWarpSize;
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+    }
+    __shared__ float warp_sums[kMaxWarps];
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < warps ? warp_sums[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        }
+        if (lane == 0) {
+            const uint64_t index =
+                static_cast<uint64_t>(item) * output_stride + row;
+            const float value = sum * weight_scales[row];
+            if constexpr (Add) {
+                out[index] += value;
+            } else {
+                out[index] = value;
+            }
+        }
+    }
+}
+
+template <bool Add>
+__global__ void fp8_weight_f32_matvec_bf16_vec2_kernel(
+        __nv_bfloat16 *out,
+        const __nv_fp8_e4m3 *weight,
+        const float *weight_scales,
+        const float *input,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t batch,
+        uint32_t input_stride,
+        uint32_t output_stride) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t item = blockIdx.y;
+    if (row >= rows || item >= batch) return;
+    const auto *weight_row = weight + static_cast<uint64_t>(row) * cols;
+    const float *input_row =
+        input + static_cast<uint64_t>(item) * input_stride;
+    float sum = 0.0f;
+    for (uint32_t col = threadIdx.x * 2;
+         col < cols;
+         col += blockDim.x * 2) {
+        __nv_fp8x2_e4m3 packed;
+        packed.__x = *reinterpret_cast<const __nv_fp8x2_storage_t *>(
+            weight_row + col);
+        const float2 weight_values = static_cast<float2>(packed);
+        const float2 input_values =
+            *reinterpret_cast<const float2 *>(input_row + col);
+        sum = fmaf(weight_values.x, input_values.x, sum);
+        sum = fmaf(weight_values.y, input_values.y, sum);
+    }
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kMaxWarps = 32;
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+    const uint32_t warps = blockDim.x / kWarpSize;
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+    }
+    __shared__ float warp_sums[kMaxWarps];
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        sum = lane < warps ? warp_sums[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        }
+        if (lane == 0) {
+            const uint64_t index =
+                static_cast<uint64_t>(item) * output_stride + row;
+            float value = sum * weight_scales[row];
+            if constexpr (Add) {
+                value += __bfloat162float(out[index]);
+            }
+            out[index] = __float2bfloat16_rn(value);
+        }
+    }
+}
+
+__global__ void fp8_weight_f32_matvec_pair_vec2_kernel(
+        float *out0,
+        float *out1,
+        const __nv_fp8_e4m3 *weight0,
+        const __nv_fp8_e4m3 *weight1,
+        const float *weight_scales0,
+        const float *weight_scales1,
+        const float *input,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const auto *weight_row0 =
+        weight0 + static_cast<uint64_t>(row) * cols;
+    const auto *weight_row1 =
+        weight1 + static_cast<uint64_t>(row) * cols;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (uint32_t col = threadIdx.x * 2;
+         col < cols;
+         col += blockDim.x * 2) {
+        __nv_fp8x2_e4m3 packed0;
+        __nv_fp8x2_e4m3 packed1;
+        packed0.__x = *reinterpret_cast<const __nv_fp8x2_storage_t *>(
+            weight_row0 + col);
+        packed1.__x = *reinterpret_cast<const __nv_fp8x2_storage_t *>(
+            weight_row1 + col);
+        const float2 weight_values0 = static_cast<float2>(packed0);
+        const float2 weight_values1 = static_cast<float2>(packed1);
+        const float2 input_values =
+            *reinterpret_cast<const float2 *>(input + col);
+        sum0 = fmaf(weight_values0.x, input_values.x, sum0);
+        sum0 = fmaf(weight_values0.y, input_values.y, sum0);
+        sum1 = fmaf(weight_values1.x, input_values.x, sum1);
+        sum1 = fmaf(weight_values1.y, input_values.y, sum1);
+    }
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kMaxWarps = 32;
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+    const uint32_t warps = blockDim.x / kWarpSize;
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffU, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffU, sum1, offset);
+    }
+    __shared__ float warp_sums0[kMaxWarps];
+    __shared__ float warp_sums1[kMaxWarps];
+    if (lane == 0) {
+        warp_sums0[warp] = sum0;
+        warp_sums1[warp] = sum1;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        sum0 = lane < warps ? warp_sums0[lane] : 0.0f;
+        sum1 = lane < warps ? warp_sums1[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            sum0 += __shfl_down_sync(0xffffffffU, sum0, offset);
+            sum1 += __shfl_down_sync(0xffffffffU, sum1, offset);
+        }
+        if (lane == 0) {
+            out0[row] = sum0 * weight_scales0[row];
+            out1[row] = sum1 * weight_scales1[row];
+        }
+    }
+}
+
+__global__ void bf16_weight_bf16_matvec_pair_kernel(
+        float *out0,
+        float *out1,
+        const __nv_bfloat16 *weight0,
+        const __nv_bfloat16 *weight1,
+        const __nv_bfloat16 *input,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const auto *weight_row0 =
+        weight0 + static_cast<uint64_t>(row) * cols;
+    const auto *weight_row1 =
+        weight1 + static_cast<uint64_t>(row) * cols;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (uint32_t col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = __bfloat162float(input[col]);
+        sum0 += __bfloat162float(weight_row0[col]) * value;
+        sum1 += __bfloat162float(weight_row1[col]) * value;
+    }
+    constexpr uint32_t kWarpSize = 32;
+    constexpr uint32_t kWarps = 8;
+    const uint32_t lane = threadIdx.x % kWarpSize;
+    const uint32_t warp = threadIdx.x / kWarpSize;
+#pragma unroll
+    for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+        sum0 += __shfl_down_sync(0xffffffffU, sum0, offset);
+        sum1 += __shfl_down_sync(0xffffffffU, sum1, offset);
+    }
+    __shared__ float warp_sums0[kWarps];
+    __shared__ float warp_sums1[kWarps];
+    if (lane == 0) {
+        warp_sums0[warp] = sum0;
+        warp_sums1[warp] = sum1;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        sum0 = lane < kWarps ? warp_sums0[lane] : 0.0f;
+        sum1 = lane < kWarps ? warp_sums1[lane] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            sum0 += __shfl_down_sync(0xffffffffU, sum0, offset);
+            sum1 += __shfl_down_sync(0xffffffffU, sum1, offset);
+        }
+        if (lane == 0) {
+            out0[row] = sum0;
+            out1[row] = sum1;
+        }
+    }
+}
+
+__global__ void fp8_outer_scale_kernel(float *out,
+                                       const float *unscaled,
+                                       const float *activation_scales,
+                                       const float *weight_scales,
+                                       uint32_t batch,
+                                       uint32_t rows,
+                                       uint32_t output_stride) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(batch) * rows;
+    if (index >= count) return;
+    const uint32_t item = static_cast<uint32_t>(index / rows);
+    const uint32_t row = static_cast<uint32_t>(index % rows);
+    out[static_cast<uint64_t>(item) * output_stride + row] =
+        unscaled[index] * activation_scales[item] * weight_scales[row];
+}
+
+__global__ void fp8_outer_scale_add_kernel(float *out,
+                                           const float *unscaled,
+                                           const float *activation_scales,
+                                           const float *weight_scales,
+                                           uint32_t batch,
+                                           uint32_t rows,
+                                           uint32_t output_stride) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(batch) * rows;
+    if (index >= count) return;
+    const uint32_t item = static_cast<uint32_t>(index / rows);
+    const uint32_t row = static_cast<uint32_t>(index % rows);
+    const uint64_t output_index =
+        static_cast<uint64_t>(item) * output_stride + row;
+    out[output_index] +=
+        unscaled[index] * activation_scales[item] * weight_scales[row];
+}
+
+template <bool Add>
+__global__ void fp8_outer_scale_bf16_kernel(
+        __nv_bfloat16 *out,
+        const float *unscaled,
+        const float *activation_scales,
+        const float *weight_scales,
+        uint32_t batch,
+        uint32_t rows,
+        uint32_t output_stride) {
+    const uint64_t index =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(batch) * rows;
+    if (index >= count) return;
+    const uint32_t item = static_cast<uint32_t>(index / rows);
+    const uint32_t row = static_cast<uint32_t>(index % rows);
+    const uint64_t output_index =
+        static_cast<uint64_t>(item) * output_stride + row;
+    float value =
+        unscaled[index] * activation_scales[item] * weight_scales[row];
+    if constexpr (Add) {
+        value += __bfloat162float(out[output_index]);
+    }
+    out[output_index] = __float2bfloat16_rn(value);
+}
+
+__global__ void fp8_outer_scale_fanout4_kernel(
+        float *out0,
+        float *out1,
+        float *out2,
+        float *out3,
+        const float *unscaled,
+        const float *activation_scales,
+        const float *weight_scales0,
+        const float *weight_scales1,
+        const float *weight_scales2,
+        const float *weight_scales3,
+        uint32_t batch,
+        uint32_t rows0,
+        uint32_t rows1,
+        uint32_t rows2,
+        uint32_t rows3,
+        uint32_t stride0,
+        uint32_t stride1,
+        uint32_t stride2,
+        uint32_t stride3) {
+    const uint64_t index =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count0 = static_cast<uint64_t>(batch) * rows0;
+    const uint64_t count1 = static_cast<uint64_t>(batch) * rows1;
+    const uint64_t count2 = static_cast<uint64_t>(batch) * rows2;
+    const uint64_t count3 = static_cast<uint64_t>(batch) * rows3;
+    if (index >= count0 + count1 + count2 + count3) return;
+
+    float *out = out0;
+    const float *weight_scales = weight_scales0;
+    uint32_t rows = rows0;
+    uint32_t stride = stride0;
+    uint64_t local = index;
+    if (local >= count0) {
+        local -= count0;
+        out = out1;
+        weight_scales = weight_scales1;
+        rows = rows1;
+        stride = stride1;
+        if (local >= count1) {
+            local -= count1;
+            out = out2;
+            weight_scales = weight_scales2;
+            rows = rows2;
+            stride = stride2;
+            if (local >= count2) {
+                local -= count2;
+                out = out3;
+                weight_scales = weight_scales3;
+                rows = rows3;
+                stride = stride3;
+            }
+        }
+    }
+
+    const uint32_t item = static_cast<uint32_t>(local / rows);
+    const uint32_t row = static_cast<uint32_t>(local % rows);
+    out[static_cast<uint64_t>(item) * stride + row] =
+        unscaled[index] * activation_scales[item] * weight_scales[row];
+}
+
+__global__ void fp8_outer_scale_silu_mul_kernel(
+        float *gate_inout,
+        const float *up_unscaled,
+        const float *activation_scales,
+        const float *up_weight_scales,
+        uint32_t batch,
+        uint32_t rows,
+        uint32_t output_stride) {
+    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(batch) * rows;
+    if (index >= count) return;
+    const uint32_t item = static_cast<uint32_t>(index / rows);
+    const uint32_t row = static_cast<uint32_t>(index % rows);
+    const uint64_t output_index =
+        static_cast<uint64_t>(item) * output_stride + row;
+    const float gate = gate_inout[output_index];
+    const float up =
+        up_unscaled[index] * activation_scales[item] * up_weight_scales[row];
+    gate_inout[output_index] = (gate / (1.0f + expf(-gate))) * up;
+}
+
+__global__ void fp8_outer_scale_pair_silu_mul_kernel(
+        float *out,
+        const float *pair_unscaled,
+        const float *activation_scales,
+        const float *gate_weight_scales,
+        const float *up_weight_scales,
+        uint32_t batch,
+        uint32_t rows,
+        uint32_t output_stride) {
+    const uint64_t index =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(batch) * rows;
+    if (index >= count) return;
+    const uint32_t item = static_cast<uint32_t>(index / rows);
+    const uint32_t row = static_cast<uint32_t>(index % rows);
+    const float activation_scale = activation_scales[item];
+    const uint64_t pair_stride = static_cast<uint64_t>(rows) * 2;
+    const uint64_t pair_base = static_cast<uint64_t>(item) * pair_stride;
+    const float gate =
+        pair_unscaled[pair_base + row] *
+        activation_scale * gate_weight_scales[row];
+    const float up =
+        pair_unscaled[pair_base + rows + row] *
+        activation_scale * up_weight_scales[row];
+    out[static_cast<uint64_t>(item) * output_stride + row] =
+        (gate / (1.0f + expf(-gate))) * up;
+}
+
+__global__ void fp8_outer_scale_packed_pair_kernel(
+        float *out0,
+        float *out1,
+        const float *pair_unscaled,
+        const float *activation_scales,
+        const float *weight_scales0,
+        const float *weight_scales1,
+        uint32_t batch,
+        uint32_t rows0,
+        uint32_t rows1,
+        uint32_t stride0,
+        uint32_t stride1) {
+    const uint64_t index =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint32_t pair_rows = rows0 + rows1;
+    const uint64_t count = static_cast<uint64_t>(batch) * pair_rows;
+    if (index >= count) return;
+    const uint32_t item = static_cast<uint32_t>(index / pair_rows);
+    const uint32_t pair_row = static_cast<uint32_t>(index % pair_rows);
+    const float activation_scale = activation_scales[item];
+    if (pair_row < rows0) {
+        out0[static_cast<uint64_t>(item) * stride0 + pair_row] =
+            pair_unscaled[index] *
+            activation_scale * weight_scales0[pair_row];
+        return;
+    }
+    const uint32_t row = pair_row - rows0;
+    out1[static_cast<uint64_t>(item) * stride1 + row] =
+        pair_unscaled[index] *
+        activation_scale * weight_scales1[row];
 }
 
 // Per-row causal softmax for the cuBLAS-based prefill attention path.
@@ -2227,6 +3538,324 @@ __global__ void recurrent_conv_batch_kernel(float *out,         // [T, *] stride
     #pragma unroll
     for (uint32_t i = 0; i + 1 < CONV_K; ++i) st[i] = st_buf[i];
 }
+
+// Long-prefill causal conv. The recurrent implementation above assigns one
+// thread to a channel and serializes the entire token dimension. This variant
+// divides tokens into independent tiles because every output only reads the
+// immutable input plus the initial (CONV_K-1)-token state.
+template <uint32_t CONV_K, uint32_t TOKEN_TILE>
+__global__ void recurrent_conv_prefill_parallel_kernel(
+        float *out,             // [T, *] stride out_stride
+        const float *state,     // initial [conv_dim, conv_k-1]
+        const float *proj,      // [T, *] stride proj_stride
+        const float *conv_w,    // [conv_dim, conv_k]
+        uint32_t T,
+        uint32_t conv_dim,
+        uint32_t proj_stride,
+        uint32_t out_stride) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+
+    const uint32_t t_begin = blockIdx.y * TOKEN_TILE;
+    const uint32_t t_end = min(T, t_begin + TOKEN_TILE);
+    const float *w = conv_w + static_cast<uint64_t>(c) * CONV_K;
+    const float *initial = state + static_cast<uint64_t>(c) * (CONV_K - 1);
+
+    float w_buf[CONV_K];
+    #pragma unroll
+    for (uint32_t k = 0; k < CONV_K; ++k) w_buf[k] = w[k];
+
+    for (uint32_t t = t_begin; t < t_end; ++t) {
+        float acc = w_buf[CONV_K - 1] *
+                    proj[static_cast<uint64_t>(t) * proj_stride + c];
+        #pragma unroll
+        for (uint32_t k = 0; k + 1 < CONV_K; ++k) {
+            const int64_t source_t =
+                static_cast<int64_t>(t) + k - (CONV_K - 1);
+            const float x = source_t >= 0
+                ? proj[static_cast<uint64_t>(source_t) * proj_stride + c]
+                : initial[source_t + (CONV_K - 1)];
+            acc += w_buf[k] * x;
+        }
+        out[static_cast<uint64_t>(t) * out_stride + c] =
+            acc / (1.0f + expf(-acc));
+    }
+}
+
+template <uint32_t CONV_K>
+__global__ void recurrent_conv_prefill_state_kernel(
+        float *state,
+        const float *proj,
+        uint32_t T,
+        uint32_t conv_dim,
+        uint32_t proj_stride) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+
+    float *st = state + static_cast<uint64_t>(c) * (CONV_K - 1);
+    // Ascending writes are safe when T < CONV_K-1: every old-state source has
+    // a strictly larger index than its destination.
+    #pragma unroll
+    for (uint32_t i = 0; i + 1 < CONV_K; ++i) {
+        const int64_t source_t =
+            static_cast<int64_t>(T) - (CONV_K - 1) + i;
+        st[i] = source_t >= 0
+            ? proj[static_cast<uint64_t>(source_t) * proj_stride + c]
+            : st[source_t + (CONV_K - 1)];
+    }
+}
+
+__device__ __forceinline__ float recurrent_lazy_fp8_value(
+        const float *raw,
+        const float *activation_scales,
+        const float *weight_scales,
+        uint32_t raw_stride,
+        uint32_t row_offset,
+        uint32_t t,
+        uint32_t c) {
+    return raw[static_cast<uint64_t>(t) * raw_stride + row_offset + c] *
+           activation_scales[t] * weight_scales[c];
+}
+
+template <uint32_t CONV_K, uint32_t TOKEN_TILE>
+__global__ void recurrent_conv_prefill_parallel_lazy_fp8_kernel(
+        float *out,
+        const float *state,
+        const float *raw,
+        const float *activation_scales,
+        const float *weight_scales,
+        const float *conv_w,
+        uint32_t T,
+        uint32_t conv_dim,
+        uint32_t raw_stride,
+        uint32_t row_offset,
+        uint32_t out_stride) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+
+    const uint32_t t_begin = blockIdx.y * TOKEN_TILE;
+    const uint32_t t_end = min(T, t_begin + TOKEN_TILE);
+    const float *w = conv_w + static_cast<uint64_t>(c) * CONV_K;
+    const float *initial =
+        state + static_cast<uint64_t>(c) * (CONV_K - 1);
+
+    float history[CONV_K - 1];
+    #pragma unroll
+    for (uint32_t i = 0; i + 1 < CONV_K; ++i) {
+        const int64_t source_t =
+            static_cast<int64_t>(t_begin) - (CONV_K - 1) + i;
+        history[i] = source_t >= 0
+            ? recurrent_lazy_fp8_value(
+                  raw, activation_scales, weight_scales,
+                  raw_stride, row_offset,
+                  static_cast<uint32_t>(source_t), c)
+            : initial[source_t + (CONV_K - 1)];
+    }
+
+    float w_buf[CONV_K];
+    #pragma unroll
+    for (uint32_t i = 0; i < CONV_K; ++i) w_buf[i] = w[i];
+
+    for (uint32_t t = t_begin; t < t_end; ++t) {
+        const float current = recurrent_lazy_fp8_value(
+            raw, activation_scales, weight_scales,
+            raw_stride, row_offset, t, c);
+        float acc = w_buf[CONV_K - 1] * current;
+        #pragma unroll
+        for (uint32_t i = 0; i + 1 < CONV_K; ++i) {
+            acc += w_buf[i] * history[i];
+        }
+        out[static_cast<uint64_t>(t) * out_stride + c] =
+            acc / (1.0f + expf(-acc));
+        #pragma unroll
+        for (uint32_t i = 0; i + 2 < CONV_K; ++i) {
+            history[i] = history[i + 1];
+        }
+        history[CONV_K - 2] = current;
+    }
+}
+
+template <uint32_t CONV_K>
+__global__ void recurrent_conv_prefill_state_lazy_fp8_kernel(
+        float *state,
+        const float *raw,
+        const float *activation_scales,
+        const float *weight_scales,
+        uint32_t T,
+        uint32_t conv_dim,
+        uint32_t raw_stride,
+        uint32_t row_offset) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+
+    float *st = state + static_cast<uint64_t>(c) * (CONV_K - 1);
+    #pragma unroll
+    for (uint32_t i = 0; i + 1 < CONV_K; ++i) {
+        const int64_t source_t =
+            static_cast<int64_t>(T) - (CONV_K - 1) + i;
+        st[i] = source_t >= 0
+            ? recurrent_lazy_fp8_value(
+                  raw, activation_scales, weight_scales,
+                  raw_stride, row_offset,
+                  static_cast<uint32_t>(source_t), c)
+            : st[source_t + (CONV_K - 1)];
+    }
+}
+
+#ifdef QW3_ENABLE_GDN_SM120_AOT
+__global__ void recurrent_norm_pack_gdn_bf16_kernel(
+        __nv_bfloat16 *q,
+        __nv_bfloat16 *k,
+        __nv_bfloat16 *v,
+        const float *packed_qkv,
+        uint32_t T,
+        uint32_t num_k_heads,
+        uint32_t num_v_heads,
+        uint32_t head_dim,
+        uint32_t packed_stride,
+        float eps) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (t >= T || head >= num_v_heads || d >= head_dim) return;
+
+    const uint32_t q_width = num_k_heads * head_dim;
+    const uint32_t v_width = num_v_heads * head_dim;
+    const uint64_t packed_base =
+        static_cast<uint64_t>(t) * packed_stride;
+
+    if (head < num_k_heads) {
+        __shared__ float q_sq[128];
+        __shared__ float k_sq[128];
+        const uint32_t head_offset = head * head_dim + d;
+        const float q_value = packed_qkv[packed_base + head_offset];
+        const float k_value =
+            packed_qkv[packed_base + q_width + head_offset];
+        q_sq[d] = q_value * q_value;
+        k_sq[d] = k_value * k_value;
+        __syncthreads();
+        for (uint32_t step = 64; step > 0; step >>= 1) {
+            if (d < step) {
+                q_sq[d] += q_sq[d + step];
+                k_sq[d] += k_sq[d + step];
+            }
+            __syncthreads();
+        }
+        const uint64_t output_offset =
+            static_cast<uint64_t>(t) * q_width + head_offset;
+        q[output_offset] =
+            __float2bfloat16_rn(q_value * rsqrtf(q_sq[0] + eps));
+        k[output_offset] =
+            __float2bfloat16_rn(k_value * rsqrtf(k_sq[0] + eps));
+    }
+
+    const uint32_t v_offset = head * head_dim + d;
+    v[static_cast<uint64_t>(t) * v_width + v_offset] =
+        __float2bfloat16_rn(
+            packed_qkv[packed_base + 2u * q_width + v_offset]);
+}
+
+__global__ void recurrent_pack_gdn_bf16_kernel(
+        __nv_bfloat16 *q,
+        __nv_bfloat16 *k,
+        __nv_bfloat16 *v,
+        const float *packed_qkv,
+        uint32_t T,
+        uint32_t q_elems_per_token,
+        uint32_t k_elems_per_token,
+        uint32_t v_elems_per_token,
+        uint32_t packed_stride) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t d = blockIdx.y * blockDim.x + threadIdx.x;
+    const uint32_t packed_elems =
+        q_elems_per_token + k_elems_per_token + v_elems_per_token;
+    if (t >= T || d >= packed_elems) return;
+
+    const float value =
+        packed_qkv[static_cast<uint64_t>(t) * packed_stride + d];
+    if (d < q_elems_per_token) {
+        q[static_cast<uint64_t>(t) * q_elems_per_token + d] =
+            __float2bfloat16(value);
+    } else if (d < q_elems_per_token + k_elems_per_token) {
+        const uint32_t kd = d - q_elems_per_token;
+        k[static_cast<uint64_t>(t) * k_elems_per_token + kd] =
+            __float2bfloat16(value);
+    } else {
+        const uint32_t vd = d - q_elems_per_token - k_elems_per_token;
+        v[static_cast<uint64_t>(t) * v_elems_per_token + vd] =
+            __float2bfloat16(value);
+    }
+}
+
+__global__ void recurrent_unpack_gdn_bf16_kernel(
+        float *out,
+        const __nv_bfloat16 *in,
+        uint32_t T,
+        uint32_t width,
+        uint32_t out_stride) {
+    const uint64_t index =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t count = static_cast<uint64_t>(T) * width;
+    if (index >= count) return;
+    const uint32_t t = static_cast<uint32_t>(index / width);
+    const uint32_t d = static_cast<uint32_t>(index - static_cast<uint64_t>(t) * width);
+    out[static_cast<uint64_t>(t) * out_stride + d] =
+        __bfloat162float(in[index]);
+}
+
+__global__ void recurrent_norm_gate_gdn_bf16_kernel(
+        float *core,
+        const __nv_bfloat16 *gdn_out,
+        const float *gate,
+        const float *gate_raw,
+        const float *gate_activation_scales,
+        const float *gate_weight_scales,
+        const float *norm_w,
+        uint32_t T,
+        uint32_t num_v_heads,
+        uint32_t head_v_dim,
+        uint32_t core_stride,
+        uint32_t gate_stride,
+        uint32_t gate_raw_stride,
+        uint32_t gate_row_offset,
+        float eps) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t vh = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (t >= T || vh >= num_v_heads || d >= head_v_dim) return;
+
+    __shared__ float sq[256];
+    const uint32_t width = num_v_heads * head_v_dim;
+    const uint32_t head_offset = vh * head_v_dim + d;
+    const float value = __bfloat162float(
+        gdn_out[static_cast<uint64_t>(t) * width + head_offset]);
+    sq[d] = value * value;
+    __syncthreads();
+    for (uint32_t step = blockDim.x / 2; step > 0; step >>= 1) {
+        if (d < step) sq[d] += sq[d + step];
+        __syncthreads();
+    }
+
+    const float scale =
+        rsqrtf(sq[0] / static_cast<float>(head_v_dim) + eps);
+    const float z = gate_raw
+        ? gate_raw[static_cast<uint64_t>(t) * gate_raw_stride +
+                   gate_row_offset + head_offset] *
+              gate_activation_scales[t] *
+              gate_weight_scales[head_offset]
+        : gate[static_cast<uint64_t>(t) * gate_stride + head_offset];
+    core[static_cast<uint64_t>(t) * core_stride + head_offset] =
+        value * scale * norm_w[d] * (z / (1.0f + expf(-z)));
+}
+
+__global__ void recurrent_set_cu_seqlens_kernel(
+        int64_t *cu_seqlens, uint32_t T) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        cu_seqlens[0] = 0;
+        cu_seqlens[1] = T;
+    }
+}
+#endif
 
 template <uint32_t CONV_K>
 __global__ void recurrent_conv_independent_batch_kernel(
@@ -2861,6 +4490,56 @@ __global__ void rmsnorm_per_head_kernel(float *x,
     for (uint32_t i = tid; i < head_dim; i += blockDim.x) base[i] = base[i] * scale * w[i];
 }
 
+__global__ void rmsnorm_per_head_lazy_fp8_kernel(
+        float *out,
+        const float *raw,
+        const float *activation_scales,
+        const float *linear_weight_scales,
+        const float *norm_weight,
+        uint32_t batch,
+        uint32_t batch_stride,
+        uint32_t n_units,
+        uint32_t per_unit_stride,
+        uint32_t head_dim,
+        uint32_t raw_stride,
+        uint32_t row_offset,
+        float eps) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (token >= batch || unit >= n_units) return;
+
+    __shared__ float sums[256];
+    const uint32_t unit_offset = unit * per_unit_stride;
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
+        const uint32_t channel = unit_offset + i;
+        const float value =
+            raw[static_cast<uint64_t>(token) * raw_stride +
+                row_offset + channel] *
+            activation_scales[token] * linear_weight_scales[channel];
+        sum += value * value;
+    }
+    sums[tid] = sum;
+    __syncthreads();
+    for (uint32_t step = blockDim.x / 2; step > 0; step >>= 1) {
+        if (tid < step) sums[tid] += sums[tid + step];
+        __syncthreads();
+    }
+    const float norm_scale =
+        rsqrtf(sums[0] / static_cast<float>(head_dim) + eps);
+
+    for (uint32_t i = tid; i < per_unit_stride; i += blockDim.x) {
+        const uint32_t channel = unit_offset + i;
+        float value =
+            raw[static_cast<uint64_t>(token) * raw_stride +
+                row_offset + channel] *
+            activation_scales[token] * linear_weight_scales[channel];
+        if (i < head_dim) value *= norm_scale * norm_weight[i];
+        out[static_cast<uint64_t>(token) * batch_stride + channel] = value;
+    }
+}
+
 __global__ void rope_partial_kernel(float *x,
                                     uint32_t n_units,
                                     uint32_t per_unit_stride,
@@ -2883,6 +4562,64 @@ __global__ void rope_partial_kernel(float *x,
     const float x1 = base[i + half];
     base[i]        = x0 * c - x1 * s;
     base[i + half] = x0 * s + x1 * c;
+}
+
+__global__ void rmsnorm_rope_qk_kernel(float *q,
+                                       float *k,
+                                       const float *q_weight,
+                                       const float *k_weight,
+                                       uint32_t n_q_heads,
+                                       uint32_t n_kv_heads,
+                                       uint32_t q_head_stride,
+                                       uint32_t k_head_stride,
+                                       uint32_t head_dim,
+                                       uint32_t rope_dim,
+                                       uint32_t pos,
+                                       float theta,
+                                       float eps) {
+    const uint32_t unit = blockIdx.x;
+    const bool is_q = unit < n_q_heads;
+    const uint32_t head = is_q ? unit : unit - n_q_heads;
+    if ((!is_q && head >= n_kv_heads) || threadIdx.x >= 256) return;
+
+    float *base = is_q
+        ? q + static_cast<uint64_t>(head) * q_head_stride
+        : k + static_cast<uint64_t>(head) * k_head_stride;
+    const float *weight = is_q ? q_weight : k_weight;
+    __shared__ float scratch[256];
+    const uint32_t tid = threadIdx.x;
+
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
+        sum += base[i] * base[i];
+    }
+    scratch[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    const float norm_scale =
+        rsqrtf(scratch[0] / static_cast<float>(head_dim) + eps);
+    for (uint32_t i = tid; i < head_dim; i += blockDim.x) {
+        base[i] = base[i] * norm_scale * weight[i];
+    }
+    __syncthreads();
+
+    const uint32_t half = rope_dim / 2;
+    if (tid >= half) return;
+    const float inv_freq =
+        __powf(theta,
+               -2.0f * static_cast<float>(tid) /
+                   static_cast<float>(rope_dim));
+    float sin_value;
+    float cos_value;
+    __sincosf(static_cast<float>(pos) * inv_freq,
+              &sin_value, &cos_value);
+    const float x0 = base[tid];
+    const float x1 = base[tid + half];
+    base[tid] = x0 * cos_value - x1 * sin_value;
+    base[tid + half] = x0 * sin_value + x1 * cos_value;
 }
 
 __global__ void rope_partial_positions_kernel(float *x,
@@ -3046,6 +4783,176 @@ __global__ void rope_block_remap_paged_batched_kernel(
     base[i + half] = static_cast<T>(d0 * sn + d1 * cn);
 }
 
+// Rebuild paged K from an unrotated packed source. Unlike the delta-remap
+// kernel above, this writes every head dimension: the RoPE prefix is rotated
+// directly from raw values and the non-RoPE suffix is copied unchanged.
+template <typename T>
+__global__ void raw_k_scatter_rope_paged_batched_kernel(
+        T *cache, const T *raw_k, uint64_t raw_element_offset,
+        uint64_t raw_block_stride_elements,
+        uint32_t max_n_tokens, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta) {
+    const uint32_t bz = blockIdx.z;
+    const uint32_t tok = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (tok >= static_cast<uint32_t>(n_tokens[bz]) || d >= head_dim) return;
+
+    const uint64_t block_stride = raw_block_stride_elements != 0
+        ? raw_block_stride_elements
+        : static_cast<uint64_t>(max_n_tokens) * per_pos_size;
+    const uint64_t src_row =
+        static_cast<uint64_t>(bz) * block_stride +
+        static_cast<uint64_t>(tok) * per_pos_size +
+        static_cast<uint64_t>(unit) * head_dim;
+    const T *src = raw_k + raw_element_offset + src_row;
+    const uint32_t logical_pos =
+        static_cast<uint32_t>(to_base[bz]) + tok;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(logical_pos, page_indices, page_size);
+    T *dst = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+             static_cast<uint64_t>(unit) * head_dim;
+
+    if (d >= rope_dim) {
+        dst[d] = src[d];
+        return;
+    }
+    const uint32_t half = rope_dim / 2;
+    const uint32_t pair = d < half ? d : d - half;
+    const float x0 = static_cast<float>(src[pair]);
+    const float x1 = static_cast<float>(src[pair + half]);
+    const float inv_freq = __powf(
+        theta, -2.0f * static_cast<float>(pair) /
+                   static_cast<float>(rope_dim));
+    float s, c;
+    __sincosf(static_cast<float>(logical_pos) * inv_freq, &s, &c);
+    const float out = d < half ? (x0 * c - x1 * s)
+                               : (x0 * s + x1 * c);
+    dst[d] = static_cast<T>(out);
+}
+
+// Persistent KVMem assembly table. Each entry is the exact FP32 result of the
+// legacy per-element powf/sincosf sequence:
+//   [position, rope_pair] -> {sin(position * inv_freq), cos(...)}.
+// Keeping FP32 values preserves the old rotation arithmetic while allowing all
+// heads and all standard-attention layers to share the transcendental work.
+__global__ void build_rope_sincos_table_kernel(
+        float2 *table, uint32_t positions, uint32_t half, uint32_t rope_dim,
+        float theta) {
+    const uint64_t linear =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t total = static_cast<uint64_t>(positions) * half;
+    if (linear >= total) return;
+    const uint32_t pair = static_cast<uint32_t>(linear % half);
+    const uint32_t pos = static_cast<uint32_t>(linear / half);
+    const float inv_freq = __powf(
+        theta, -2.0f * static_cast<float>(pair) /
+                   static_cast<float>(rope_dim));
+    float s, c;
+    __sincosf(static_cast<float>(pos) * inv_freq, &s, &c);
+    table[linear] = make_float2(s, c);
+}
+
+template <typename T>
+__global__ void rope_block_remap_paged_batched_table_kernel(
+        T *cache, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float2 *rope_sincos, uint32_t rope_table_positions) {
+    const uint32_t bz = blockIdx.z;
+    const uint32_t tok = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t pair = threadIdx.x;
+    const uint32_t half = rope_dim / 2;
+    if (pair >= half ||
+        tok >= static_cast<uint32_t>(n_tokens[bz])) return;
+    const int32_t orig_base = from_base[bz];
+    const int32_t new_base = to_base[bz];
+    if (orig_base == new_base) return;
+    const int64_t orig_pos64 = static_cast<int64_t>(orig_base) + tok;
+    const int64_t new_pos64 = static_cast<int64_t>(new_base) + tok;
+    // The executor validates these ranges and promotes an out-of-table move to
+    // immutable raw refresh. Retain a defensive guard for direct launcher use.
+    if (orig_pos64 < 0 || new_pos64 < 0 ||
+        static_cast<uint64_t>(orig_pos64) >= rope_table_positions ||
+        static_cast<uint64_t>(new_pos64) >= rope_table_positions) {
+        return;
+    }
+    const uint32_t new_pos = static_cast<uint32_t>(new_pos64);
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(new_pos, page_indices, page_size);
+    T *base = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+              static_cast<uint64_t>(unit) * head_dim;
+    const float2 old_sc =
+        rope_sincos[static_cast<uint64_t>(orig_pos64) * half + pair];
+    const float2 new_sc =
+        rope_sincos[static_cast<uint64_t>(new_pos) * half + pair];
+    const float so = old_sc.x;
+    const float co = old_sc.y;
+    const float sn = new_sc.x;
+    const float cn = new_sc.y;
+    const float x0 = static_cast<float>(base[pair]);
+    const float x1 = static_cast<float>(base[pair + half]);
+    const float d0 = x0 * co + x1 * so;
+    const float d1 = -x0 * so + x1 * co;
+    base[pair] = static_cast<T>(d0 * cn - d1 * sn);
+    base[pair + half] = static_cast<T>(d0 * sn + d1 * cn);
+}
+
+template <typename T>
+__global__ void raw_k_scatter_rope_paged_batched_table_kernel(
+        T *cache, const T *raw_k, uint64_t raw_element_offset,
+        uint64_t raw_block_stride_elements,
+        uint32_t max_n_tokens, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float2 *rope_sincos, uint32_t rope_table_positions) {
+    const uint32_t bz = blockIdx.z;
+    const uint32_t tok = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    if (tok >= static_cast<uint32_t>(n_tokens[bz])) return;
+
+    const uint64_t block_stride = raw_block_stride_elements != 0
+        ? raw_block_stride_elements
+        : static_cast<uint64_t>(max_n_tokens) * per_pos_size;
+    const uint64_t src_row =
+        static_cast<uint64_t>(bz) * block_stride +
+        static_cast<uint64_t>(tok) * per_pos_size +
+        static_cast<uint64_t>(unit) * head_dim;
+    const T *src = raw_k + raw_element_offset + src_row;
+    const int64_t logical_pos64 =
+        static_cast<int64_t>(to_base[bz]) + tok;
+    if (logical_pos64 < 0 ||
+        static_cast<uint64_t>(logical_pos64) >= rope_table_positions) {
+        return;
+    }
+    const uint32_t logical_pos = static_cast<uint32_t>(logical_pos64);
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(logical_pos, page_indices, page_size);
+    T *dst = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+             static_cast<uint64_t>(unit) * head_dim;
+
+    const uint32_t half = rope_dim / 2;
+    if (lane < half) {
+        const float x0 = static_cast<float>(src[lane]);
+        const float x1 = static_cast<float>(src[lane + half]);
+        const float2 sc =
+            rope_sincos[static_cast<uint64_t>(logical_pos) * half + lane];
+        dst[lane] =
+            static_cast<T>(x0 * sc.y - x1 * sc.x);
+        dst[lane + half] =
+            static_cast<T>(x0 * sc.x + x1 * sc.y);
+    }
+    // General partial-RoPE support. Qwen3.6 has head_dim=rope_dim, but keeping
+    // this loop makes the table path equivalent for models with a suffix.
+    for (uint32_t d = rope_dim + lane; d < head_dim; d += blockDim.x) {
+        dst[d] = src[d];
+    }
+}
+
 // ---- Block-sparse cumulative-attention selection signal (#40) -----------
 //
 // Low-intrusion: instead of materializing the attention score matrix (the
@@ -3064,9 +4971,9 @@ __global__ void rope_block_remap_paged_batched_kernel(
 // layout [n_blocks_w, n_kv_heads, head_dim].
 __device__ __forceinline__ uint32_t kv_physical_pos_from_pages(
         uint32_t logical_pos, const int32_t *page_indices, uint32_t page_size);
-template <typename T>
+template <typename T, typename KbarT>
 __global__ void block_kmean_paged_kernel(const T *k_cache,
-                                         float *kbar,
+                                         KbarT *kbar,
                                          uint32_t per_pos_size,
                                          uint32_t head_dim,
                                          const int32_t *win_base,
@@ -3088,7 +4995,8 @@ __global__ void block_kmean_paged_kernel(const T *k_cache,
         acc += static_cast<float>(row[d]);
     }
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
-    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] = acc * inv;
+    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] =
+        static_cast<KbarT>(acc * inv);
 }
 
 // block_attn_score_step_kernel: for the current decode token's RoPE-baked Q,
@@ -3096,9 +5004,10 @@ __global__ void block_kmean_paged_kernel(const T *k_cache,
 // max(0, scale * (q_head . k̄_block[kv_head])). One CUDA block per window block
 // (no cross-block atomics needed; each writes its own accum slot). blockDim =
 // head_dim threads doing a shared-memory dot reduction per head.
+template <typename KbarT>
 __global__ void block_attn_score_step_kernel(float *accum,
                                              const float *q,
-                                             const float *kbar,
+                                             const KbarT *kbar,
                                              uint32_t q_stride,
                                              uint32_t n_heads,
                                              uint32_t n_kv_heads,
@@ -3113,7 +5022,10 @@ __global__ void block_attn_score_step_kernel(float *accum,
         const uint32_t kvh = qh / group;
         const float qv = (d < head_dim) ? q[qh * q_stride + d] : 0.0f;
         const float kv = (d < head_dim)
-            ? kbar[(static_cast<uint64_t>(w) * n_kv_heads + kvh) * head_dim + d]
+            ? static_cast<float>(
+                  kbar[(static_cast<uint64_t>(w) * n_kv_heads + kvh) *
+                           head_dim +
+                       d])
             : 0.0f;
         red[d] = qv * kv;
         __syncthreads();
@@ -3142,9 +5054,11 @@ __global__ void block_attn_score_step_kernel(float *accum,
 // sub-block's mass (max over sub-blocks) instead of the sum, so score[w] =
 // Σ_t mean_l mean_h max_sb softmax(scale·(q·k̄_{w,sb})) — MaxSim late interaction.
 // reduce_max is a no-op at n_subblocks==1 (single sub-block => max == sum).
-__global__ void block_attn_score_softmax_pages_kernel(float *score,
-                                                      const float *q_multi,
-                                                      const float *kbar_multi,
+template <typename QueryT, typename KbarT>
+__global__ void block_attn_score_softmax_pages_kernel(
+                                                      float *score,
+                                                      const QueryT *q_multi,
+                                                      const KbarT *kbar_multi,
                                                       uint32_t n_layers,
                                                       uint32_t n_tokens,
                                                       uint32_t q_layer_stride,
@@ -3181,11 +5095,12 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
     // (ctx_blocks) so preserved [0,D) slices stay valid as the block count grows.
     // n_blocks remains the loop/count bound. Callers that don't fix-stride pass
     // kbar_layer_stride == n_blocks (byte-identical).
-    const float *kbar_l =
+    const KbarT *kbar_l =
         kbar_multi +
         static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks * n_kv_heads *
             head_dim;
-    const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
+    const QueryT *q_l =
+        q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
     // Per-head weight: each (layer,token) contributes mean over heads, and the
     // grid sum over layers must end up as a mean over L. n_tokens is summed (not
     // averaged) so the final score accumulates one unit of mass per query token.
@@ -3193,7 +5108,8 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
                                  static_cast<float>(n_heads));
     for (uint32_t qh = 0; qh < n_heads; ++qh) {
         const uint32_t kvh = qh / group;
-        const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+        const QueryT *qr =
+            q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
         // logit[p] = scale * dot(q[l,t,qh], k̄[l,w,sb,kvh]) for every sub-block.
         // Sub-blocks of a block in the always-kept sink/recent bands
         // [0,excl_lo_end) / [excl_hi_begin,n_blocks) are masked to -inf so their
@@ -3204,10 +5120,13 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
                 s_logit[p] = -INFINITY;
                 continue;
             }
-            const float *kbar_row =
+            const KbarT *kbar_row =
                 kbar_l + (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; ++d) dot += qr[d] * kbar_row[d];
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                dot += static_cast<float>(qr[d]) *
+                       static_cast<float>(kbar_row[d]);
+            }
             s_logit[p] = dot * scale;
         }
         __syncthreads();
@@ -3265,11 +5184,12 @@ __global__ void block_attn_score_softmax_pages_kernel(float *score,
 constexpr uint32_t kSoftmaxPagesTile = 512;
 constexpr uint32_t kSoftmaxPagesThreads = 128;
 
+template <typename QueryT, typename KbarT>
 __global__ void block_attn_softmax_pages_partial_lse_kernel(
         float *partial_max,
         float *partial_sum,
-        const float *q_multi,
-        const float *kbar_multi,
+        const QueryT *q_multi,
+        const KbarT *kbar_multi,
         uint32_t n_distributions,
         uint32_t n_tiles,
         uint32_t n_tokens,
@@ -3304,9 +5224,11 @@ __global__ void block_attn_softmax_pages_partial_lse_kernel(
     __shared__ float reduce[kSoftmaxPagesThreads];
 
     const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
-    const float *q_l = q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
-    const float *qr = q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
-    const float *kbar_l =
+    const QueryT *q_l =
+        q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
+    const QueryT *qr =
+        q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+    const KbarT *kbar_l =
         kbar_multi +
         static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks *
             n_kv_heads * head_dim;
@@ -3316,10 +5238,13 @@ __global__ void block_attn_softmax_pages_partial_lse_kernel(
         const uint32_t w = p / n_subblocks;
         float logit = -INFINITY;
         if (w >= excl_lo_end && w < excl_hi_begin) {
-            const float *kbar_row =
+            const KbarT *kbar_row =
                 kbar_l + (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; ++d) dot += qr[d] * kbar_row[d];
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                dot += static_cast<float>(qr[d]) *
+                       static_cast<float>(kbar_row[d]);
+            }
             logit = dot * scale;
         }
         logits[p - p0] = logit;
@@ -3397,10 +5322,197 @@ __global__ void block_attn_softmax_pages_merge_lse_kernel(
     }
 }
 
+// Single-dot scalable scorer. The old tiled path above computes every Q·K twice
+// to avoid storing logits. That is memory-frugal but becomes the dominant cost
+// for long retrieval queries. This path materializes only a bounded batch of
+// distributions, normalizes it, accumulates its block mass, then reuses the
+// same workspace for the next batch. Each dot is computed exactly once.
+//
+// Four warps cooperate on one 512-page tile. A warp owns one page at a time and
+// reads its head_dim elements contiguously, unlike the correctness-first
+// two-dot kernel where adjacent threads read different page rows. This keeps
+// Kbar loads coalesced while preserving FP32 dot accumulation.
+template <typename QueryT, typename KbarT>
+__global__ void block_attn_softmax_pages_logits_kernel(
+        float *logits,
+        const QueryT *q_multi,
+        const KbarT *kbar_multi,
+        uint32_t distribution_base,
+        uint32_t distribution_count,
+        uint32_t n_tiles,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t n_blocks,
+        uint32_t kbar_layer_stride,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin,
+        uint32_t n_subblocks) {
+    const uint64_t job = blockIdx.x;
+    const uint32_t local_dist =
+        static_cast<uint32_t>(job / n_tiles);
+    const uint32_t tile = static_cast<uint32_t>(
+        job - static_cast<uint64_t>(local_dist) * n_tiles);
+    if (local_dist >= distribution_count) return;
+
+    const uint32_t dist = distribution_base + local_dist;
+    const uint32_t qh = dist % n_heads;
+    const uint32_t lt = dist / n_heads;
+    const uint32_t t = lt % n_tokens;
+    const uint32_t l = lt / n_tokens;
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint32_t kvh = qh / group;
+    const uint32_t total = n_blocks * n_subblocks;
+    const uint32_t p0 = tile * kSoftmaxPagesTile;
+    const uint32_t p1 = min(p0 + kSoftmaxPagesTile, total);
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    constexpr uint32_t kWarps =
+        kSoftmaxPagesThreads / 32;
+
+    const uint64_t qrow =
+        static_cast<uint64_t>(n_heads) * head_dim;
+    const QueryT *q_l =
+        q_multi +
+        static_cast<uint64_t>(l) * q_layer_stride * qrow;
+    const QueryT *qr =
+        q_l +
+        (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
+    const KbarT *kbar_l =
+        kbar_multi +
+        static_cast<uint64_t>(l) * kbar_layer_stride *
+            n_subblocks * n_kv_heads * head_dim;
+    float *out =
+        logits + static_cast<uint64_t>(local_dist) * total;
+
+    for (uint32_t p = p0 + warp; p < p1; p += kWarps) {
+        const uint32_t w = p / n_subblocks;
+        float dot = 0.0f;
+        if (w >= excl_lo_end && w < excl_hi_begin) {
+            const KbarT *kbar_row =
+                kbar_l +
+                (static_cast<uint64_t>(p) * n_kv_heads + kvh) *
+                    head_dim;
+            for (uint32_t d = lane; d < head_dim; d += 32) {
+                dot += static_cast<float>(qr[d]) *
+                       static_cast<float>(kbar_row[d]);
+            }
+#pragma unroll
+            for (uint32_t offset = 16; offset > 0; offset >>= 1) {
+                dot += __shfl_down_sync(0xffffffffu, dot, offset);
+            }
+        }
+        if (lane == 0) {
+            out[p] =
+                (w >= excl_lo_end && w < excl_hi_begin)
+                    ? dot * scale : -INFINITY;
+        }
+    }
+}
+
+// One CTA computes the global row max and denominator. Logits remain unchanged;
+// the accumulation kernel applies exp(logit-max)/sum once, so no second dot and
+// no extra normalized-logit write are needed.
+__global__ void block_attn_softmax_pages_norm_kernel(
+        float *row_max,
+        float *row_inv_sum,
+        const float *logits,
+        uint32_t distribution_count,
+        uint32_t total) {
+    const uint32_t dist = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (dist >= distribution_count) return;
+    __shared__ float reduce[kSoftmaxPagesThreads];
+    const float *row =
+        logits + static_cast<uint64_t>(dist) * total;
+
+    float local_max = -INFINITY;
+    for (uint32_t p = tid; p < total; p += blockDim.x) {
+        local_max = fmaxf(local_max, row[p]);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            reduce[tid] =
+                fmaxf(reduce[tid], reduce[tid + s]);
+        }
+        __syncthreads();
+    }
+    const float m = reduce[0];
+    float local_sum = 0.0f;
+    if (isfinite(m)) {
+        for (uint32_t p = tid; p < total; p += blockDim.x) {
+            local_sum += __expf(row[p] - m);
+        }
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        row_max[dist] = m;
+        row_inv_sum[dist] =
+            reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    }
+}
+
+// One thread owns one output block, so batches accumulate deterministically
+// without atomics. Threads in a warp read adjacent block logits for each
+// distribution, giving coalesced global-memory access.
+__global__ void block_attn_softmax_pages_accumulate_logits_kernel(
+        float *score,
+        const float *logits,
+        const float *row_max,
+        const float *row_inv_sum,
+        uint32_t distribution_count,
+        uint32_t n_blocks,
+        uint32_t n_subblocks,
+        uint32_t reduce_max,
+        float distribution_weight,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin) {
+    const uint32_t w =
+        blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_blocks || w < excl_lo_end ||
+        w >= excl_hi_begin) {
+        return;
+    }
+    const uint32_t total = n_blocks * n_subblocks;
+    float accum = 0.0f;
+    for (uint32_t dist = 0; dist < distribution_count; ++dist) {
+        const float inv = row_inv_sum[dist];
+        if (!(inv > 0.0f)) continue;
+        const float m = row_max[dist];
+        const float *row =
+            logits + static_cast<uint64_t>(dist) * total +
+            static_cast<uint64_t>(w) * n_subblocks;
+        float mass = 0.0f;
+        if (reduce_max && n_subblocks > 1) {
+            for (uint32_t sb = 0; sb < n_subblocks; ++sb) {
+                mass = fmaxf(
+                    mass, __expf(row[sb] - m) * inv);
+            }
+        } else {
+            for (uint32_t sb = 0; sb < n_subblocks; ++sb) {
+                mass += __expf(row[sb] - m) * inv;
+            }
+        }
+        accum += mass;
+    }
+    score[w] += accum * distribution_weight;
+}
+
+template <typename QueryT, typename KbarT>
 __global__ void block_attn_softmax_pages_recompute_kernel(
         float *score,
-        const float *q_multi,
-        const float *kbar_multi,
+        const QueryT *q_multi,
+        const KbarT *kbar_multi,
         const float *global_max,
         const float *global_sum,
         uint32_t n_layers,
@@ -3419,7 +5531,6 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
     const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= n_blocks) return;
     if (w < excl_lo_end || w >= excl_hi_begin) {
-        score[w] = 0.0f;
         return;
     }
 
@@ -3427,9 +5538,9 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
     const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
     float accum = 0.0f;
     for (uint32_t l = 0; l < n_layers; ++l) {
-        const float *q_l =
+        const QueryT *q_l =
             q_multi + static_cast<uint64_t>(l) * q_layer_stride * qrow;
-        const float *kbar_l =
+        const KbarT *kbar_l =
             kbar_multi +
             static_cast<uint64_t>(l) * kbar_layer_stride * n_subblocks *
                 n_kv_heads * head_dim;
@@ -3440,17 +5551,19 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
                 if (!(denom > 0.0f)) continue;
                 const float m = global_max[dist];
                 const uint32_t kvh = qh / group;
-                const float *qr =
+                const QueryT *qr =
                     q_l + (static_cast<uint64_t>(t) * n_heads + qh) * head_dim;
                 float block_mass = 0.0f;
                 for (uint32_t sb = 0; sb < n_subblocks; ++sb) {
                     const uint32_t p = w * n_subblocks + sb;
-                    const float *kbar_row =
+                    const KbarT *kbar_row =
                         kbar_l +
                         (static_cast<uint64_t>(p) * n_kv_heads + kvh) * head_dim;
                     float dot = 0.0f;
-                    for (uint32_t d = 0; d < head_dim; ++d)
-                        dot += qr[d] * kbar_row[d];
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        dot += static_cast<float>(qr[d]) *
+                               static_cast<float>(kbar_row[d]);
+                    }
                     const float mass = __expf(dot * scale - m) / denom;
                     if (reduce_max && n_subblocks > 1)
                         block_mass = fmaxf(block_mass, mass);
@@ -3461,8 +5574,8 @@ __global__ void block_attn_softmax_pages_recompute_kernel(
             }
         }
     }
-    score[w] = accum / (static_cast<float>(n_layers) *
-                        static_cast<float>(n_heads));
+    score[w] += accum / (static_cast<float>(n_layers) *
+                         static_cast<float>(n_heads));
 }
 
 __device__ __forceinline__ uint32_t kvmem_window_bucket_for_pos(
@@ -3590,11 +5703,11 @@ __global__ void block_attention_mass_paged_kernel(float *mass,
 // the first rope_dim of each head; dims beyond rope_dim pass through. Built ONCE
 // from the pristine post-prefill cache (blocks baked at true positions) and then
 // immutable — never rebuilt as blocks are re-RoPE'd into windows during assembly.
-// grid = (n_blocks, n_kv_heads), block = head_dim threads. Output kbar fp32,
-// layout [n_blocks, n_kv_heads, head_dim] indexed by block_id.
-template <typename T>
+// grid = (n_blocks, n_kv_heads), block = head_dim threads. Accumulation is fp32;
+// the persistent output follows the configured KV dtype.
+template <typename T, typename KbarT>
 __global__ void block_kmean_content_paged_kernel(const T *k_cache,
-                                                 float *kbar,
+                                                 KbarT *kbar,
                                                  uint32_t per_pos_size,
                                                  uint32_t head_dim,
                                                  uint32_t rope_dim,
@@ -3642,7 +5755,8 @@ __global__ void block_kmean_content_paged_kernel(const T *k_cache,
         acc += deroped;
     }
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
-    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] = acc * inv;
+    kbar[(static_cast<uint64_t>(w) * gridDim.y + h) * head_dim + d] =
+        static_cast<KbarT>(acc * inv);
 }
 
 // block_kmean_content_batch_kernel (#91): build per-block content mean-Keys for
@@ -3664,8 +5778,9 @@ __global__ void block_kmean_content_paged_kernel(const T *k_cache,
 // block never straddles two chunks; the final chunk's last block may be partial.
 // grid = (n_blocks_chunk, n_kv_heads), block = head_dim threads. Writes the slot
 // slice at global block (kbar_block_base + j), layout [.., n_kv_heads, head_dim].
+template <typename KbarT>
 __global__ void block_kmean_content_batch_kernel(const float *k_batch,
-                                                 float *kbar,
+                                                 KbarT *kbar,
                                                  uint64_t kbar_block_base,
                                                  uint32_t k_stride,
                                                  uint32_t batch,
@@ -3721,7 +5836,84 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     const uint32_t n = r_hi - r_lo;
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
     const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
-    kbar[(blk * gridDim.y + h) * head_dim + d] = acc * inv;
+    kbar[(blk * gridDim.y + h) * head_dim + d] =
+        static_cast<KbarT>(acc * inv);
+}
+
+// Exact incremental variant for a chunk whose first row begins inside an
+// already-indexed logical block. `first_block_token_offset` rows of that block
+// have previously contributed to kbar. Merge their existing mean with the new
+// rows by exact prefix/new counts. An aligned replay passes offset=0, which
+// overwrites every replayed block and invalidates stale first-pass means.
+template <typename KbarT>
+__global__ void block_kmean_content_batch_merge_kernel(
+        const float *k_batch, KbarT *kbar, uint64_t kbar_block_base,
+        uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+        uint32_t first_block_token_offset, uint32_t head_dim,
+        uint32_t rope_dim, int32_t rope_base, float theta,
+        uint32_t n_subblocks) {
+    const uint32_t combined = blockIdx.x;
+    const uint32_t j = combined / n_subblocks;
+    const uint32_t sb = combined % n_subblocks;
+    const uint32_t h = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (d >= head_dim) return;
+
+    // Coordinates are relative to the first destination block; incoming row r
+    // occupies coordinate first_block_token_offset+r.
+    const uint32_t sub_tokens =
+        (blk_tokens + n_subblocks - 1) / n_subblocks;
+    const uint32_t sb_lo = j * blk_tokens + sb * sub_tokens;
+    const uint32_t block_hi = (j + 1) * blk_tokens;
+    const uint32_t sb_hi = min(sb_lo + sub_tokens, block_hi);
+    const uint32_t incoming_lo = first_block_token_offset;
+    const uint32_t incoming_hi = incoming_lo + batch;
+    const uint32_t overlap_lo = max(sb_lo, incoming_lo);
+    const uint32_t overlap_hi = min(sb_hi, incoming_hi);
+    if (overlap_lo >= overlap_hi) return;
+
+    // Only the first destination block can contain an existing prefix. This
+    // generic intersection naturally yields zero for later blocks/sub-blocks.
+    const uint32_t prefix_hi = min(first_block_token_offset, sb_hi);
+    const uint32_t prior = prefix_hi > sb_lo ? prefix_hi - sb_lo : 0u;
+    const uint32_t r_lo = overlap_lo - incoming_lo;
+    const uint32_t r_hi = overlap_hi - incoming_lo;
+    const uint32_t half = rope_dim / 2;
+    float acc = 0.0f;
+    for (uint32_t r = r_lo; r < r_hi; ++r) {
+        const float *row = k_batch + static_cast<uint64_t>(r) * k_stride +
+                           static_cast<uint64_t>(h) * head_dim;
+        const int32_t pos = rope_base + static_cast<int32_t>(r);
+        float deroped;
+        if (d < half) {
+            const float inv_freq = __powf(
+                theta, -2.0f * static_cast<float>(d) /
+                           static_cast<float>(rope_dim));
+            const float ang = static_cast<float>(pos) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            deroped = row[d] * c + row[d + half] * s;
+        } else if (d < rope_dim) {
+            const uint32_t i = d - half;
+            const float inv_freq = __powf(
+                theta, -2.0f * static_cast<float>(i) /
+                           static_cast<float>(rope_dim));
+            const float ang = static_cast<float>(pos) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            deroped = -row[d - half] * s + row[d] * c;
+        } else {
+            deroped = row[d];
+        }
+        acc += deroped;
+    }
+    const uint32_t added = r_hi - r_lo;
+    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
+    const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
+    const float prior_sum = prior > 0
+        ? static_cast<float>(kbar[out]) * static_cast<float>(prior) : 0.0f;
+    kbar[out] = static_cast<KbarT>(
+        (prior_sum + acc) / static_cast<float>(prior + added));
 }
 
 // derope_store_content_batch_kernel (MaxSim, raw-key retrieval): like
@@ -3967,7 +6159,7 @@ __global__ void derope_query_kernel(float *q_content,
 // q + r*q_token_stride, head qh at + qh*q_head_stride (attn-Q is the first
 // head_dim of each 2*head_dim unit). Token r is RoPE-baked at start_pos+r.
 // grid = (n_heads, cnt), block = head_dim threads.
-__global__ void derope_query_multi_kernel(float *q_multi,
+__global__ void derope_query_multi_kernel(void *q_multi,
                                           const float *q,
                                           uint32_t q_token_stride,
                                           uint32_t q_head_stride,
@@ -3975,7 +6167,8 @@ __global__ void derope_query_multi_kernel(float *q_multi,
                                           uint32_t head_dim,
                                           uint32_t rope_dim,
                                           int32_t start_pos,
-                                          float theta) {
+                                          float theta,
+                                          bool output_fp16) {
     const uint32_t r = blockIdx.y;
     const uint32_t qh = blockIdx.x;
     const uint32_t d = threadIdx.x;
@@ -4003,7 +6196,13 @@ __global__ void derope_query_multi_kernel(float *q_multi,
     } else {
         deroped = row[d];
     }
-    q_multi[(static_cast<uint64_t>(r) * n_heads + qh) * head_dim + d] = deroped;
+    const uint64_t out =
+        (static_cast<uint64_t>(r) * n_heads + qh) * head_dim + d;
+    if (output_fp16) {
+        static_cast<__half *>(q_multi)[out] = __float2half_rn(deroped);
+    } else {
+        static_cast<float *>(q_multi)[out] = deroped;
+    }
 }
 
 __global__ void kv_append_kernel(float *cache,
@@ -4125,21 +6324,28 @@ __global__ void kv_append_paged_ragged_kernel_f16(__half *cache,
         __float2half(src_row[i]);
 }
 
-// FP8 (e4m3) quantize-on-write. Raw e4m3, NO scale: each element is cast
-// straight to __nv_fp8_e4m3 (fixed ±448 range, 3-bit mantissa). Mirrors the
-// fp16 path's layout exactly (element index = (base_pos+b)*per_pos_size + i),
-// so the FlashInfer attention adapters can read it as a contiguous fp8 plane.
+// FP8 (e4m3) quantize-on-write. Raw e4m3, NO scale. Convert and store pairs
+// with the native float2 -> fp8x2 operation; the odd tail remains scalar for
+// generality even though supported attention dimensions are all even.
 __global__ void kv_append_kernel_fp8(__nv_fp8_e4m3 *cache,
                                      const float *src,
                                      uint32_t base_pos,
                                      uint32_t per_pos_size,
                                      uint32_t src_stride) {
     const uint32_t b = blockIdx.x;
-    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    const uint32_t i =
+        2U * (blockIdx.y * blockDim.x + threadIdx.x);
     if (i >= per_pos_size) return;
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
-    cache[static_cast<uint64_t>(base_pos + b) * per_pos_size + i] =
-        __nv_fp8_e4m3(src_row[i]);
+    __nv_fp8_e4m3 *dst =
+        cache + static_cast<uint64_t>(base_pos + b) * per_pos_size + i;
+    if (i + 1U < per_pos_size) {
+        const float2 pair = make_float2(src_row[i], src_row[i + 1U]);
+        *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) =
+            __nv_cvt_float2_to_fp8x2(pair, __NV_SATFINITE, __NV_E4M3);
+    } else {
+        dst[0] = __nv_fp8_e4m3(src_row[i]);
+    }
 }
 
 __global__ void kv_append_paged_kernel_fp8(__nv_fp8_e4m3 *cache,
@@ -4150,13 +6356,94 @@ __global__ void kv_append_paged_kernel_fp8(__nv_fp8_e4m3 *cache,
                                            const int32_t *page_indices,
                                            uint32_t page_size) {
     const uint32_t b = blockIdx.x;
-    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    const uint32_t i =
+        2U * (blockIdx.y * blockDim.x + threadIdx.x);
     if (i >= per_pos_size) return;
     const uint32_t physical_pos =
         kv_physical_pos_from_pages(base_logical_pos + b, page_indices, page_size);
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
-    cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] =
-        __nv_fp8_e4m3(src_row[i]);
+    __nv_fp8_e4m3 *dst =
+        cache + static_cast<uint64_t>(physical_pos) * per_pos_size + i;
+    if (i + 1U < per_pos_size) {
+        const float2 pair = make_float2(src_row[i], src_row[i + 1U]);
+        *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) =
+            __nv_cvt_float2_to_fp8x2(pair, __NV_SATFINITE, __NV_E4M3);
+    } else {
+        dst[0] = __nv_fp8_e4m3(src_row[i]);
+    }
+}
+
+__global__ void kv_append_lazy_linear_kernel_fp8(
+        __nv_fp8_e4m3 *cache,
+        const float *raw,
+        const float *activation_scales,
+        const float *weight_scales,
+        uint32_t base_pos,
+        uint32_t per_pos_size,
+        uint32_t raw_stride,
+        uint32_t row_offset) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t i =
+        2U * (blockIdx.y * blockDim.x + threadIdx.x);
+    if (i >= per_pos_size) return;
+    const uint64_t raw_base =
+        static_cast<uint64_t>(token) * raw_stride + row_offset;
+    const float activation_scale = activation_scales[token];
+    __nv_fp8_e4m3 *dst =
+        cache + static_cast<uint64_t>(base_pos + token) *
+                    per_pos_size + i;
+    const float value0 =
+        raw[raw_base + i] * activation_scale * weight_scales[i];
+    if (i + 1U < per_pos_size) {
+        const float value1 =
+            raw[raw_base + i + 1U] * activation_scale *
+            weight_scales[i + 1U];
+        *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) =
+            __nv_cvt_float2_to_fp8x2(
+                make_float2(value0, value1),
+                __NV_SATFINITE, __NV_E4M3);
+    } else {
+        dst[0] = __nv_fp8_e4m3(value0);
+    }
+}
+
+__global__ void kv_append_paged_lazy_linear_kernel_fp8(
+        __nv_fp8_e4m3 *cache,
+        const float *raw,
+        const float *activation_scales,
+        const float *weight_scales,
+        uint32_t base_logical_pos,
+        uint32_t per_pos_size,
+        uint32_t raw_stride,
+        uint32_t row_offset,
+        const int32_t *page_indices,
+        uint32_t page_size) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t i =
+        2U * (blockIdx.y * blockDim.x + threadIdx.x);
+    if (i >= per_pos_size) return;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(
+            base_logical_pos + token, page_indices, page_size);
+    const uint64_t raw_base =
+        static_cast<uint64_t>(token) * raw_stride + row_offset;
+    const float activation_scale = activation_scales[token];
+    __nv_fp8_e4m3 *dst =
+        cache + static_cast<uint64_t>(physical_pos) *
+                    per_pos_size + i;
+    const float value0 =
+        raw[raw_base + i] * activation_scale * weight_scales[i];
+    if (i + 1U < per_pos_size) {
+        const float value1 =
+            raw[raw_base + i + 1U] * activation_scale *
+            weight_scales[i + 1U];
+        *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) =
+            __nv_cvt_float2_to_fp8x2(
+                make_float2(value0, value1),
+                __NV_SATFINITE, __NV_E4M3);
+    } else {
+        dst[0] = __nv_fp8_e4m3(value0);
+    }
 }
 
 __global__ void kv_append_paged_ragged_kernel_fp8(__nv_fp8_e4m3 *cache,
@@ -4168,15 +6455,23 @@ __global__ void kv_append_paged_ragged_kernel_fp8(__nv_fp8_e4m3 *cache,
                                                   const int32_t *page_indptr,
                                                   uint32_t page_size) {
     const uint32_t b = blockIdx.x;
-    const uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    const uint32_t i =
+        2U * (blockIdx.y * blockDim.x + threadIdx.x);
     if (i >= per_pos_size) return;
     const uint32_t logical_pos = static_cast<uint32_t>(logical_positions[b]);
     const uint32_t physical_pos =
         kv_physical_pos_from_ragged_pages(b, logical_pos, page_indices,
                                           page_indptr, page_size);
     const float *src_row = src + static_cast<uint64_t>(b) * src_stride;
-    cache[static_cast<uint64_t>(physical_pos) * per_pos_size + i] =
-        __nv_fp8_e4m3(src_row[i]);
+    __nv_fp8_e4m3 *dst =
+        cache + static_cast<uint64_t>(physical_pos) * per_pos_size + i;
+    if (i + 1U < per_pos_size) {
+        const float2 pair = make_float2(src_row[i], src_row[i + 1U]);
+        *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) =
+            __nv_cvt_float2_to_fp8x2(pair, __NV_SATFINITE, __NV_E4M3);
+    } else {
+        dst[0] = __nv_fp8_e4m3(src_row[i]);
+    }
 }
 
 // Q8 quantize-on-write. One block per (token b, quant-row). A quant row is
@@ -4314,7 +6609,10 @@ __global__ void expand_flashinfer_page_indices_kernel(int32_t *dst,
     const uint32_t begin = static_cast<uint32_t>(page_indptr[b]);
     const uint32_t end = static_cast<uint32_t>(page_indptr[b + 1]);
     for (uint32_t i = threadIdx.x; i < end - begin; i += blockDim.x) {
-        dst[begin + i] = logical_pages[begin + i];
+        // Every verifier row is a longer view of the same physical-page
+        // prefix. `begin` is an offset in the expanded destination, not in
+        // the original page table.
+        dst[begin + i] = logical_pages[i];
     }
 }
 
@@ -4563,16 +6861,99 @@ __global__ void attention_norm_mid_kernel(float *mid,
     mid[head * head_dim + tid] = v[kvh * head_dim + tid] * (1.0f / (1.0f + expf(-gate)));
 }
 
+// Scatter one target tensor's pages from a packed H2D slab. Page payloads and
+// CUDA allocations are at least 16-byte aligned, so uint4 keeps the kernel
+// bandwidth-bound while a two-dimensional grid supports pages larger than one
+// CTA. src/dst page arrays are target-major and already point at this target's
+// slice.
+__global__ void packed_kv_page_scatter_kernel(
+        uint4 *dst, const uint4 *src,
+        const int32_t *src_pages, const int32_t *dst_pages,
+        uint32_t pages, uint32_t uint4_per_page) {
+    const uint32_t page = blockIdx.x;
+    const uint32_t unit =
+        blockIdx.y * blockDim.x + threadIdx.x;
+    if (page >= pages || unit >= uint4_per_page) return;
+    const uint64_t src_idx =
+        static_cast<uint64_t>(src_pages[page]) * uint4_per_page + unit;
+    const uint64_t dst_idx =
+        static_cast<uint64_t>(dst_pages[page]) * uint4_per_page + unit;
+    dst[dst_idx] = src[src_idx];
+}
+
+struct Fp8LtPlan {
+    uint64_t rows = 0;
+    uint64_t cols = 0;
+    uint32_t batch = 0;
+    bool outer_scale = false;
+    cudaDataType_t output_type = CUDA_R_32F;
+    cublasLtMatmulDesc_t operation = nullptr;
+    cublasLtMatrixLayout_t weight_layout = nullptr;
+    cublasLtMatrixLayout_t input_layout = nullptr;
+    cublasLtMatrixLayout_t output_layout = nullptr;
+    cublasLtMatmulAlgo_t algorithm{};
+
+    ~Fp8LtPlan() {
+        if (output_layout) cublasLtMatrixLayoutDestroy(output_layout);
+        if (input_layout) cublasLtMatrixLayoutDestroy(input_layout);
+        if (weight_layout) cublasLtMatrixLayoutDestroy(weight_layout);
+        if (operation) cublasLtMatmulDescDestroy(operation);
+    }
+};
+
 class CudaDeviceBackend final : public DeviceBackend {
     static constexpr uint32_t kFlashInferBatchPrefillHostSlots = 8;
+    static constexpr uint32_t kHostEmbeddingSlots = 2;
+    struct CudaKvTransferFence final : DeviceTransferFence {
+        cudaEvent_t event = nullptr;
+        ~CudaKvTransferFence() override {
+            if (event) cudaEventDestroy(event);
+        }
+    };
+    struct HostEmbeddingSlot {
+        void *host = nullptr;
+        size_t host_capacity = 0;
+        __nv_bfloat16 *device = nullptr;
+        size_t device_capacity = 0;
+        cudaEvent_t ready = nullptr;
+        bool in_flight = false;
+    };
 public:
     explicit CudaDeviceBackend(LinearBackend linear_backend)
         : linear_backend_(linear_backend) {}
 
     ~CudaDeviceBackend() override {
+        for (HostEmbeddingSlot &slot : host_embedding_slots_) {
+            if (slot.in_flight && slot.ready) {
+                (void)cudaEventSynchronize(slot.ready);
+            }
+            if (slot.device) cudaFree(slot.device);
+            if (slot.host) cudaFreeHost(slot.host);
+            if (slot.ready) cudaEventDestroy(slot.ready);
+        }
+        if (host_embedding_argmax_) cudaFreeHost(host_embedding_argmax_);
+        fp8_lt_plans_.clear();
         if (cublas_handle_) cublasDestroy(cublas_handle_);
+        if (cublaslt_handle_) cublasLtDestroy(cublaslt_handle_);
+        if (cublaslt_workspace_) cudaFree(cublaslt_workspace_);
         if (rows_buf_) cudaFree(rows_buf_);
         if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
+        if (x_bf16_workspace_) cudaFree(x_bf16_workspace_);
+        if (x_fp8_workspace_) cudaFree(x_fp8_workspace_);
+        if (x_fp8_scales_) cudaFree(x_fp8_scales_);
+        if (x_fp4_workspace_) cudaFree(x_fp4_workspace_);
+        if (x_fp4_scales_) cudaFree(x_fp4_scales_);
+        if (fp4_gemm_workspace_) cudaFree(fp4_gemm_workspace_);
+        if (shared_linear_output_workspace_enabled()) {
+            if (linear_output_workspace_) cudaFree(linear_output_workspace_);
+        } else if (mixed_out_bf16_) {
+            cudaFree(mixed_out_bf16_);
+        }
+        if (nvfp4_pair_out_f32_) cudaFree(nvfp4_pair_out_f32_);
+        if (!shared_linear_output_workspace_enabled() && fp8_out_f32_) {
+            cudaFree(fp8_out_f32_);
+        }
+        if (q8_out_f32_) cudaFree(q8_out_f32_);
         for (int i = 0; i < 2; ++i) {
             if (w_fp16_workspace_[i]) cudaFree(w_fp16_workspace_[i]);
             if (dequant_done_[i]) cudaEventDestroy(dequant_done_[i]);
@@ -4580,6 +6961,14 @@ public:
         }
         if (dequant_stream_) cudaStreamDestroy(dequant_stream_);
         if (kv_copy_exec_ready_) cudaEventDestroy(kv_copy_exec_ready_);
+        // Packed storage may still be referenced by the non-blocking KV copy
+        // stream. Stream destruction synchronizes too, but doing it explicitly
+        // lets us free the shared stage only after all gather/scatter work and
+        // its terminal H2D/D2H have completed.
+        if (kv_copy_stream_) cudaStreamSynchronize(kv_copy_stream_);
+        if (kv_packed_stage_) cudaFree(kv_packed_stage_);
+        if (kv_packed_src_pages_) cudaFree(kv_packed_src_pages_);
+        if (kv_packed_dst_pages_) cudaFree(kv_packed_dst_pages_);
         if (kv_copy_stream_) cudaStreamDestroy(kv_copy_stream_);
         if (graph_instance_) cudaGraphExecDestroy(graph_instance_);
         if (exec_stream_) cudaStreamDestroy(exec_stream_);
@@ -4599,6 +6988,12 @@ public:
         if (flashinfer_batch_prefill_o_f16_) cudaFree(flashinfer_batch_prefill_o_f16_);
         if (flashinfer_batch_prefill_meta_i32_) cudaFree(flashinfer_batch_prefill_meta_i32_);
         if (flashinfer_batch_prefill_float_) cudaFree(flashinfer_batch_prefill_float_);
+#ifdef QW3_ENABLE_GDN_SM120_AOT
+        if (gdn_sm120_bf16_) cudaFree(gdn_sm120_bf16_);
+        if (gdn_sm120_initial_state_) cudaFree(gdn_sm120_initial_state_);
+        if (gdn_sm120_cu_seqlens_) cudaFree(gdn_sm120_cu_seqlens_);
+        if (gdn_sm120_tensormaps_) cudaFree(gdn_sm120_tensormaps_);
+#endif
         for (uint32_t i = 0; i < kFlashInferBatchPrefillHostSlots; ++i) {
             if (flashinfer_batch_prefill_meta_events_[i]) {
                 cudaEventDestroy(flashinfer_batch_prefill_meta_events_[i]);
@@ -4663,8 +7058,99 @@ public:
                            "KVMem copy stream synchronize");
     }
 
+    DeviceStatus record_kv_transfer_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        auto marker = std::make_unique<CudaKvTransferFence>();
+        if (auto st = cuda_status(
+                cudaEventCreateWithFlags(
+                    &marker->event, cudaEventDisableTiming),
+                "KVMem transfer fence create"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaEventRecord(marker->event, kv_copy_stream_),
+                "KVMem transfer fence record"); !st.ok) {
+            return st;
+        }
+        fence = std::move(marker);
+        return {};
+    }
+
+    DeviceStatus record_execution_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (!exec_stream_) return {false, "CUDA exec stream is unavailable"};
+        auto marker = std::make_unique<CudaKvTransferFence>();
+        if (auto st = cuda_status(
+                cudaEventCreateWithFlags(
+                    &marker->event, cudaEventDisableTiming),
+                "KVMem exec fence create"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaEventRecord(marker->event, exec_stream_),
+                "KVMem exec fence record"); !st.ok) {
+            return st;
+        }
+        fence = std::move(marker);
+        return {};
+    }
+
+    DeviceStatus execution_wait_for_kv_transfer(
+            const std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (!fence) return {};
+        if (!exec_stream_) return {false, "CUDA exec stream is unavailable"};
+        const auto *marker =
+            dynamic_cast<const CudaKvTransferFence *>(fence.get());
+        if (!marker || !marker->event) {
+            return {false, "KVMem transfer fence has no CUDA event"};
+        }
+        return cuda_status(
+            cudaStreamWaitEvent(exec_stream_, marker->event, 0),
+            "KVMem exec wait H2D event");
+    }
+
+    DeviceStatus kv_transfer_wait_for_execution(
+            std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (!fence) return {};
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        auto *marker =
+            dynamic_cast<CudaKvTransferFence *>(fence.get());
+        if (!marker || !marker->event) {
+            return {false, "KVMem execution fence has no CUDA event"};
+        }
+        if (auto st = cuda_status(
+                cudaStreamWaitEvent(kv_copy_stream_, marker->event, 0),
+                "KVMem H2D wait exec event"); !st.ok) {
+            return st;
+        }
+        // CUDA permits destroying a recorded event before completion; its
+        // resources are released asynchronously after queued waits finish.
+        fence.reset();
+        return {};
+    }
+
+    DeviceStatus wait_kv_transfer_fence(
+            std::unique_ptr<DeviceTransferFence> &fence) override {
+        if (!fence) return {};
+        auto *marker =
+            dynamic_cast<CudaKvTransferFence *>(fence.get());
+        if (!marker || !marker->event) {
+            return {false, "KVMem transfer fence has no CUDA event"};
+        }
+        if (auto st = cuda_status(
+                cudaEventSynchronize(marker->event),
+                "KVMem transfer fence synchronize"); !st.ok) {
+            return st;
+        }
+        fence.reset();
+        return {};
+    }
+
     DeviceStatus end() override {
-        return synchronize();
+        DeviceStatus status = synchronize();
+        if (status.ok) trace_workspace_capacities();
+        return status;
     }
 
     DeviceStatus synchronize() override {
@@ -4695,6 +7181,109 @@ public:
             return 0;
         }
         return static_cast<uint64_t>(total_b);
+    }
+
+    void trace_workspace_capacities() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_CUDA_WORKSPACE_TRACE");
+            return value && *value &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "off") != 0 &&
+                   std::strcmp(value, "false") != 0;
+        }();
+        if (!enabled) return;
+
+        const uint64_t output_staging_bytes =
+            shared_linear_output_workspace_enabled()
+                ? linear_output_workspace_capacity_
+                : mixed_out_bf16_capacity_ * sizeof(__nv_bfloat16) +
+                      fp8_out_f32_capacity_ * sizeof(float);
+        const uint64_t linear_bytes =
+            x_bf16_capacity_ * sizeof(__nv_bfloat16) +
+            x_fp8_capacity_ * sizeof(__nv_fp8_e4m3) +
+            static_cast<uint64_t>(x_fp8_scale_capacity_) * sizeof(float) +
+            x_fp4_workspace_capacity_ +
+            x_fp4_scales_capacity_ +
+            fp4_gemm_workspace_capacity_ +
+            output_staging_bytes +
+            nvfp4_pair_out_f32_capacity_ * sizeof(float) +
+            q8_out_f32_capacity_ * sizeof(float) +
+            q8_1_scratch_capacity_ +
+            q8_1_mmq_scratch_capacity_ +
+            cublaslt_workspace_bytes_;
+        const uint64_t attention_bytes =
+            fattn_scratch_capacity_ +
+            prefill_attn_q_fp16_capacity_ * sizeof(__half) +
+            prefill_attn_scores_fp16_capacity_ * sizeof(__half) +
+            prefill_gqa_scratch_capacity_ +
+            flashinfer_decode_o_f16_capacity_ * sizeof(__half) +
+            flashinfer_decode_tmp_capacity_ * sizeof(__half) +
+            flashinfer_batch_decode_o_f16_capacity_ * sizeof(__half) +
+            flashinfer_batch_decode_tmp_v_capacity_ * sizeof(__half) +
+            flashinfer_batch_decode_tmp_s_capacity_ * sizeof(float) +
+            flashinfer_batch_decode_meta_i32_capacity_ * sizeof(int32_t) +
+            flashinfer_batch_prefill_q_f16_capacity_ * sizeof(__half) +
+            flashinfer_batch_prefill_o_f16_capacity_ * sizeof(__half) +
+            flashinfer_batch_prefill_meta_i32_capacity_ * sizeof(int32_t) +
+            flashinfer_batch_prefill_float_capacity_ * sizeof(float);
+        const uint64_t total_bytes = linear_bytes + attention_bytes;
+        if (total_bytes == workspace_trace_last_bytes_) return;
+        workspace_trace_last_bytes_ = total_bytes;
+
+        constexpr double kMiB = 1024.0 * 1024.0;
+        std::fprintf(
+            stderr,
+            "[qw3] CUDA workspace: total=%.2f MiB linear=%.2f MiB "
+            "attention=%.2f MiB fp8_x=%.2f MiB fp8_out=%.2f MiB "
+            "mixed_bf16=%.2f MiB fp4_x=%.2f MiB fp4_scales=%.2f MiB "
+            "fp4_gemm=%.2f MiB output_staging=%.2f MiB shared=%d\n",
+            static_cast<double>(total_bytes) / kMiB,
+            static_cast<double>(linear_bytes) / kMiB,
+            static_cast<double>(attention_bytes) / kMiB,
+            static_cast<double>(x_fp8_capacity_) / kMiB,
+            static_cast<double>(fp8_out_f32_capacity_ * sizeof(float)) / kMiB,
+            static_cast<double>(
+                mixed_out_bf16_capacity_ * sizeof(__nv_bfloat16)) / kMiB,
+            static_cast<double>(x_fp4_workspace_capacity_) / kMiB,
+            static_cast<double>(x_fp4_scales_capacity_) / kMiB,
+            static_cast<double>(fp4_gemm_workspace_capacity_) / kMiB,
+            static_cast<double>(output_staging_bytes) / kMiB,
+            shared_linear_output_workspace_enabled() ? 1 : 0);
+        std::fprintf(
+            stderr,
+            "[qw3] CUDA attention workspace: fattn=%.2f MiB "
+            "cublas_q=%.2f MiB cublas_scores=%.2f MiB gqa=%.2f MiB "
+            "fi_decode_o=%.2f MiB fi_decode_tmp=%.2f MiB "
+            "fi_batch_decode_o=%.2f MiB fi_batch_decode_v=%.2f MiB "
+            "fi_batch_decode_s=%.2f MiB fi_batch_decode_meta=%.2f MiB "
+            "fi_batch_prefill_q=%.2f MiB fi_batch_prefill_o=%.2f MiB "
+            "fi_batch_prefill_meta=%.2f MiB fi_batch_prefill_float=%.2f MiB\n",
+            static_cast<double>(fattn_scratch_capacity_) / kMiB,
+            static_cast<double>(
+                prefill_attn_q_fp16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                prefill_attn_scores_fp16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(prefill_gqa_scratch_capacity_) / kMiB,
+            static_cast<double>(
+                flashinfer_decode_o_f16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_decode_tmp_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_decode_o_f16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_decode_tmp_v_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_decode_tmp_s_capacity_ * sizeof(float)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_decode_meta_i32_capacity_ * sizeof(int32_t)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_prefill_q_f16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_prefill_o_f16_capacity_ * sizeof(__half)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_prefill_meta_i32_capacity_ * sizeof(int32_t)) / kMiB,
+            static_cast<double>(
+                flashinfer_batch_prefill_float_capacity_ * sizeof(float)) / kMiB);
     }
 
     // -- CUDA graph capture for decode --
@@ -4795,8 +7384,18 @@ public:
         return std::make_unique<CudaTensor>(count, label);
     }
 
+    bool supports_bf16_activations() const override { return true; }
+
+    std::unique_ptr<DeviceTensor> tensor_bf16(uint64_t count,
+                                               const char *label) override {
+        return std::make_unique<CudaTensor>(
+            count, label, sizeof(__nv_bfloat16), true,
+            DeviceTensorDType::BF16);
+    }
+
     std::unique_ptr<DeviceTensor> tensor_i32(uint64_t count, const char *label) override {
-        return std::make_unique<CudaTensor>(count, label, sizeof(int32_t));
+        return std::make_unique<CudaTensor>(
+            count, label, sizeof(int32_t), true, DeviceTensorDType::I32);
     }
 
     DeviceStatus copy_i32_from_host(DeviceTensor &dst,
@@ -4819,6 +7418,23 @@ public:
     std::unique_ptr<DeviceTensor> scratch_f32(uint64_t count, const char *label) override {
         return std::make_unique<CudaTensor>(count, label, sizeof(float),
                                             /*zero_initialize=*/false);
+    }
+
+    bool supports_tensor_views() const override { return true; }
+
+    std::unique_ptr<DeviceTensor> tensor_view(
+            DeviceTensor &storage,
+            uint64_t byte_offset,
+            uint64_t count,
+            uint32_t elem_size,
+            DeviceTensorDType dtype,
+            const char *label) override {
+        auto &backing = as_tensor(storage);
+        if (backing.q8_kv || backing.fp8_kv || backing.scale) {
+            return nullptr;
+        }
+        return std::make_unique<CudaTensor>(
+            backing, byte_offset, count, elem_size, dtype, label);
     }
 
     std::unique_ptr<HostBuffer> host_buffer(uint64_t bytes,
@@ -4852,12 +7468,16 @@ public:
     }
 
     std::unique_ptr<DeviceTensor> tensor_f16(uint64_t count, const char *label) override {
-        return std::make_unique<CudaTensor>(count, label, /*elem_bytes=*/sizeof(__half));
+        return std::make_unique<CudaTensor>(
+            count, label, /*elem_bytes=*/sizeof(__half), true,
+            DeviceTensorDType::F16);
     }
 
     std::unique_ptr<DeviceTensor> tensor_q8_kv(uint64_t count, uint32_t row_elems,
                                                const char *label) override {
-        auto t = std::make_unique<CudaTensor>(count, label, /*elem_bytes=*/sizeof(int8_t));
+        auto t = std::make_unique<CudaTensor>(
+            count, label, /*elem_bytes=*/sizeof(int8_t), true,
+            DeviceTensorDType::Q8_KV);
         t->make_q8_kv(row_elems);
         return t;
     }
@@ -4867,7 +7487,9 @@ public:
         // Raw e4m3: 1 byte/elem, no scale plane. FlashInfer's generic
         // prefill/decode templates upcast fp8->half internally.
         auto t = std::make_unique<CudaTensor>(count, label,
-                                              /*elem_bytes=*/sizeof(__nv_fp8_e4m3));
+                                              /*elem_bytes=*/sizeof(__nv_fp8_e4m3),
+                                              true,
+                                              DeviceTensorDType::FP8_E4M3);
         t->fp8_kv = true;
         return t;
     }
@@ -4880,11 +7502,495 @@ public:
         return std::make_unique<CudaWeight>(data, rows * (cols / 32) * 34, rows, cols, WeightType::Q8_0, label);
     }
 
+    std::unique_ptr<DeviceWeight> weight_bf16(const void *data,
+                                               uint64_t rows,
+                                               uint64_t cols,
+                                               const char *label) override {
+        const std::string name = label ? label : "weight";
+        const bool is_ssm_a = name.size() >= 6 &&
+            name.compare(name.size() - 6, 6, ".ssm_a") == 0;
+        const bool consumed_as_f32 =
+            name.find("norm.weight") != std::string::npos ||
+            is_ssm_a ||
+            name.find("ssm_conv1d.weight") != std::string::npos ||
+            name.find("ssm_dt.bias") != std::string::npos;
+        if (consumed_as_f32) {
+            const uint64_t count = rows * cols;
+            const auto *src = static_cast<const uint16_t *>(data);
+            std::vector<float> staged(static_cast<size_t>(count));
+            for (uint64_t i = 0; i < count; ++i) {
+                const uint32_t bits = static_cast<uint32_t>(src[i]) << 16;
+                std::memcpy(&staged[static_cast<size_t>(i)], &bits, sizeof(bits));
+            }
+            return std::make_unique<CudaWeight>(staged.data(), count * sizeof(float),
+                                                rows, cols, WeightType::F32, label);
+        }
+        return std::make_unique<CudaWeight>(data, rows * cols * sizeof(__nv_bfloat16),
+                                            rows, cols, WeightType::BF16, label);
+    }
+
+    std::unique_ptr<DeviceWeight> weight_bf16_host(
+            const void *data,
+            uint64_t rows,
+            uint64_t cols,
+            const char *label) override {
+        if (!data || rows == 0 || cols == 0 ||
+            rows > std::numeric_limits<uint64_t>::max() / cols ||
+            rows * cols >
+                std::numeric_limits<uint64_t>::max() / sizeof(__nv_bfloat16)) {
+            throw std::runtime_error(
+                std::string("invalid host BF16 weight: ") +
+                (label ? label : "weight"));
+        }
+        return std::make_unique<CudaWeight>(
+            data, rows * cols * sizeof(__nv_bfloat16),
+            rows, cols, WeightType::BF16_HOST, label);
+    }
+
+    std::unique_ptr<DeviceWeight> weight_fp8_e4m3(const void *data,
+                                                   const void *scale_data,
+                                                   uint64_t scale_count,
+                                                   uint64_t rows,
+                                                   uint64_t cols,
+                                                   const char *label) override {
+        if (!scale_data || scale_count != rows) {
+            throw std::runtime_error(std::string("FP8 per-channel scale shape mismatch: ") +
+                                     (label ? label : "weight"));
+        }
+        auto weight = std::make_unique<CudaWeight>(data, rows * cols, rows, cols,
+                                                    WeightType::FP8_E4M3, label);
+        weight->scale_bytes = rows * sizeof(float);
+        cudaMalloc(&weight->scale, static_cast<size_t>(weight->scale_bytes));
+        cudaMemcpy(weight->scale, scale_data, static_cast<size_t>(weight->scale_bytes),
+                   cudaMemcpyHostToDevice);
+        return weight;
+    }
+
+    DeviceStatus prepare_fp8_fanout_pair(DeviceWeight &first,
+                                          DeviceWeight &second) override {
+        auto &a = const_cast<CudaWeight &>(as_weight(first));
+        auto &b = const_cast<CudaWeight &>(as_weight(second));
+        const char *value = std::getenv("QW3_FP8_PACKED_PAIR");
+        if (value &&
+            (std::strcmp(value, "0") == 0 ||
+             std::strcmp(value, "off") == 0 ||
+             std::strcmp(value, "false") == 0)) {
+            return {};
+        }
+        if (a.type != WeightType::FP8_E4M3 ||
+            b.type != WeightType::FP8_E4M3 ||
+            a.cols != b.cols || !a.ptr || !b.ptr ||
+            !a.scale || !b.scale) {
+            return {false, "invalid FP8 fanout pair"};
+        }
+        if (a.fp8_packed_second == &b) return {};
+        if (a.fp8_packed_second || b.fp8_packed_second ||
+            !a.owns_ptr || !b.owns_ptr ||
+            !a.owns_scale || !b.owns_scale) {
+            return {false, "FP8 weight is already part of another packed pair"};
+        }
+
+        void *packed_ptr = nullptr;
+        void *packed_scale = nullptr;
+        const size_t total_bytes =
+            static_cast<size_t>(a.bytes + b.bytes);
+        const size_t total_scale_bytes =
+            static_cast<size_t>(a.scale_bytes + b.scale_bytes);
+        if (auto st = cuda_status(
+                cudaMalloc(&packed_ptr, total_bytes),
+                "FP8 packed pair weight alloc"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaMalloc(&packed_scale, total_scale_bytes),
+                "FP8 packed pair scale alloc"); !st.ok) {
+            cudaFree(packed_ptr);
+            return st;
+        }
+        auto copy_or_cleanup = [&](cudaError_t status,
+                                   const char *label) -> DeviceStatus {
+            if (status == cudaSuccess) return {};
+            cudaFree(packed_scale);
+            cudaFree(packed_ptr);
+            return cuda_status(status, label);
+        };
+        if (auto st = copy_or_cleanup(
+                cudaMemcpy(packed_ptr, a.ptr,
+                           static_cast<size_t>(a.bytes),
+                           cudaMemcpyDeviceToDevice),
+                "FP8 packed pair first weight copy"); !st.ok) {
+            return st;
+        }
+        if (auto st = copy_or_cleanup(
+                cudaMemcpy(static_cast<uint8_t *>(packed_ptr) + a.bytes,
+                           b.ptr, static_cast<size_t>(b.bytes),
+                           cudaMemcpyDeviceToDevice),
+                "FP8 packed pair second weight copy"); !st.ok) {
+            return st;
+        }
+        if (auto st = copy_or_cleanup(
+                cudaMemcpy(packed_scale, a.scale,
+                           static_cast<size_t>(a.scale_bytes),
+                           cudaMemcpyDeviceToDevice),
+                "FP8 packed pair first scale copy"); !st.ok) {
+            return st;
+        }
+        if (auto st = copy_or_cleanup(
+                cudaMemcpy(static_cast<uint8_t *>(packed_scale) +
+                               a.scale_bytes,
+                           b.scale, static_cast<size_t>(b.scale_bytes),
+                           cudaMemcpyDeviceToDevice),
+                "FP8 packed pair second scale copy"); !st.ok) {
+            return st;
+        }
+
+        cudaFree(a.ptr);
+        cudaFree(b.ptr);
+        cudaFree(a.scale);
+        cudaFree(b.scale);
+        a.ptr = packed_ptr;
+        a.scale = packed_scale;
+        a.fp8_packed_second = &b;
+        a.fp8_packed_rows = a.rows + b.rows;
+        b.ptr = static_cast<uint8_t *>(packed_ptr) + a.bytes;
+        b.scale = static_cast<uint8_t *>(packed_scale) + a.scale_bytes;
+        b.owns_ptr = false;
+        b.owns_scale = false;
+        return {};
+    }
+
+    std::unique_ptr<DeviceWeight> weight_nvfp4_e2m1(
+            const void *packed_data,
+            const void *scale_data,
+            uint64_t scale_rows,
+            uint64_t scale_cols,
+            float input_global_scale_divisor,
+            float weight_global_scale_divisor,
+            uint64_t rows,
+            uint64_t cols,
+            const char *label) override {
+        if (!packed_data || !scale_data || scale_rows != rows || scale_cols != cols / 16 ||
+            rows % 128 != 0 || scale_cols % 4 != 0 || cols % 32 != 0 ||
+            !(input_global_scale_divisor > 0.0f) ||
+            !(weight_global_scale_divisor > 0.0f)) {
+            throw std::runtime_error(std::string("unsupported NVFP4 weight shape/scales: ") +
+                                     (label ? label : "weight"));
+        }
+        auto weight = std::make_unique<CudaWeight>(packed_data, rows * cols / 2,
+                                                    rows, cols,
+                                                    WeightType::NVFP4_E2M1, label);
+
+        // CUTLASS block-scaled MMA consumes the 128x4 interleaved scale
+        // layout. Checkpoints store a conventional [N, K/16] row-major plane.
+        std::vector<uint8_t> swizzled(static_cast<size_t>(scale_rows * scale_cols), 0);
+        const auto *src = static_cast<const uint8_t *>(scale_data);
+        const uint64_t tiles_k = scale_cols / 4;
+        for (uint64_t row = 0; row < scale_rows; ++row) {
+            for (uint64_t col = 0; col < scale_cols; ++col) {
+                const uint64_t tile = ((row / 128) * tiles_k + col / 4) * 512;
+                const uint64_t dst = tile + (row % 32) * 16 +
+                                     ((row % 128) / 32) * 4 + col % 4;
+                swizzled[static_cast<size_t>(dst)] =
+                    src[static_cast<size_t>(row * scale_cols + col)];
+            }
+        }
+        weight->scale_bytes = scale_rows * scale_cols;
+        cudaMalloc(&weight->scale, static_cast<size_t>(weight->scale_bytes));
+        cudaMemcpy(weight->scale, swizzled.data(), static_cast<size_t>(weight->scale_bytes),
+                   cudaMemcpyHostToDevice);
+
+        const float alpha = 1.0f /
+            (input_global_scale_divisor * weight_global_scale_divisor);
+        weight->input_scale_host = input_global_scale_divisor;
+        weight->global_scale_host = alpha;
+        cudaMalloc(&weight->input_scale, sizeof(float));
+        cudaMemcpy(weight->input_scale, &input_global_scale_divisor, sizeof(float),
+                   cudaMemcpyHostToDevice);
+        cudaMalloc(&weight->global_scale, sizeof(float));
+        cudaMemcpy(weight->global_scale, &alpha, sizeof(float), cudaMemcpyHostToDevice);
+        return weight;
+    }
+
+    DeviceStatus prepare_nvfp4_fanout_pair(DeviceWeight &first,
+                                            DeviceWeight &second) override {
+        auto &a = const_cast<CudaWeight &>(as_weight(first));
+        auto &b = const_cast<CudaWeight &>(as_weight(second));
+        const char *value = std::getenv("QW3_NVFP4_PACKED_PAIR");
+        if (value &&
+            (std::strcmp(value, "0") == 0 ||
+             std::strcmp(value, "off") == 0 ||
+             std::strcmp(value, "false") == 0)) {
+            return {};
+        }
+        if (a.type != WeightType::NVFP4_E2M1 ||
+            b.type != WeightType::NVFP4_E2M1 ||
+            a.cols != b.cols || !a.ptr || !b.ptr ||
+            !a.scale || !b.scale) {
+            return {false, "invalid NVFP4 fanout pair"};
+        }
+        // A fused CUTLASS GEMM has one activation quantizer and one alpha.
+        // Keep exact behavior by packing only pairs whose checkpoint scales
+        // agree, as Qwen 3.6 gate/up projections do.
+        if (a.input_scale_host != b.input_scale_host ||
+            a.global_scale_host != b.global_scale_host) {
+            return {};
+        }
+        if (a.nvfp4_packed_second == &b) return {};
+        if (a.nvfp4_packed_second || b.nvfp4_packed_second ||
+            !a.owns_ptr || !b.owns_ptr ||
+            !a.owns_scale || !b.owns_scale) {
+            return {false, "NVFP4 weight is already part of another packed pair"};
+        }
+
+        void *packed_ptr = nullptr;
+        void *packed_scale = nullptr;
+        const size_t total_bytes =
+            static_cast<size_t>(a.bytes + b.bytes);
+        const size_t total_scale_bytes =
+            static_cast<size_t>(a.scale_bytes + b.scale_bytes);
+        if (auto st = cuda_status(
+                cudaMalloc(&packed_ptr, total_bytes),
+                "NVFP4 packed pair weight alloc"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaMalloc(&packed_scale, total_scale_bytes),
+                "NVFP4 packed pair scale alloc"); !st.ok) {
+            cudaFree(packed_ptr);
+            return st;
+        }
+        auto copy_or_cleanup = [&](cudaError_t status,
+                                   const char *label) -> DeviceStatus {
+            if (status == cudaSuccess) return {};
+            cudaFree(packed_scale);
+            cudaFree(packed_ptr);
+            return cuda_status(status, label);
+        };
+        if (auto st = copy_or_cleanup(
+                cudaMemcpy(packed_ptr, a.ptr,
+                           static_cast<size_t>(a.bytes),
+                           cudaMemcpyDeviceToDevice),
+                "NVFP4 packed pair first weight copy"); !st.ok) {
+            return st;
+        }
+        if (auto st = copy_or_cleanup(
+                cudaMemcpy(static_cast<uint8_t *>(packed_ptr) + a.bytes,
+                           b.ptr, static_cast<size_t>(b.bytes),
+                           cudaMemcpyDeviceToDevice),
+                "NVFP4 packed pair second weight copy"); !st.ok) {
+            return st;
+        }
+        if (auto st = copy_or_cleanup(
+                cudaMemcpy(packed_scale, a.scale,
+                           static_cast<size_t>(a.scale_bytes),
+                           cudaMemcpyDeviceToDevice),
+                "NVFP4 packed pair first scale copy"); !st.ok) {
+            return st;
+        }
+        if (auto st = copy_or_cleanup(
+                cudaMemcpy(static_cast<uint8_t *>(packed_scale) +
+                               a.scale_bytes,
+                           b.scale, static_cast<size_t>(b.scale_bytes),
+                           cudaMemcpyDeviceToDevice),
+                "NVFP4 packed pair second scale copy"); !st.ok) {
+            return st;
+        }
+
+        cudaFree(a.ptr);
+        cudaFree(b.ptr);
+        cudaFree(a.scale);
+        cudaFree(b.scale);
+        a.ptr = packed_ptr;
+        a.scale = packed_scale;
+        a.nvfp4_packed_second = &b;
+        a.nvfp4_packed_rows = a.rows + b.rows;
+        b.ptr = static_cast<uint8_t *>(packed_ptr) + a.bytes;
+        b.scale = static_cast<uint8_t *>(packed_scale) + a.scale_bytes;
+        b.owns_ptr = false;
+        b.owns_scale = false;
+        return {};
+    }
+
+    DeviceStatus acquire_host_embedding_slot(
+            size_t bytes,
+            bool need_device_staging,
+            HostEmbeddingSlot **out) {
+        if (!out || bytes == 0) {
+            return {false, "invalid host embedding staging request"};
+        }
+        HostEmbeddingSlot &slot =
+            host_embedding_slots_[
+                host_embedding_next_slot_++ % kHostEmbeddingSlots];
+        if (slot.in_flight) {
+            if (auto st = cuda_status(
+                    cudaEventSynchronize(slot.ready),
+                    "host embedding staging wait"); !st.ok) {
+                return st;
+            }
+            slot.in_flight = false;
+        }
+        if (!slot.ready) {
+            if (auto st = cuda_status(
+                    cudaEventCreateWithFlags(&slot.ready,
+                                             cudaEventDisableTiming),
+                    "host embedding staging event"); !st.ok) {
+                return st;
+            }
+        }
+        if (slot.host_capacity < bytes) {
+            if (slot.host) cudaFreeHost(slot.host);
+            slot.host = nullptr;
+            slot.host_capacity = 0;
+            if (auto st = cuda_status(
+                    cudaHostAlloc(&slot.host, bytes, cudaHostAllocDefault),
+                    "host embedding pinned staging alloc"); !st.ok) {
+                return st;
+            }
+            slot.host_capacity = bytes;
+        }
+        if (need_device_staging && slot.device_capacity < bytes) {
+            if (slot.device) cudaFree(slot.device);
+            slot.device = nullptr;
+            slot.device_capacity = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(&slot.device, bytes),
+                    "host embedding BF16 device staging alloc"); !st.ok) {
+                return st;
+            }
+            slot.device_capacity = bytes;
+        }
+        *out = &slot;
+        return {};
+    }
+
+    DeviceStatus copy_host_bf16_rows(
+            CudaTensor &out,
+            const CudaWeight &weight,
+            const uint64_t *rows,
+            uint32_t batch) {
+        if (batch == 0) return {};
+        if (!exec_stream_) {
+            return {false, "host embedding lookup requires an active CUDA stream"};
+        }
+        if (weight.type != WeightType::BF16_HOST || !weight.ptr || !rows) {
+            return {false, "invalid host BF16 embedding lookup"};
+        }
+        if (!out.is_bf16() &&
+            (out.dtype != DeviceTensorDType::F32 ||
+             out.elem_size != sizeof(float))) {
+            return {false, "host BF16 embedding output must be BF16 or FP32"};
+        }
+        if (weight.cols >
+            std::numeric_limits<uint64_t>::max() /
+                static_cast<uint64_t>(batch)) {
+            return {false, "host BF16 embedding lookup size overflow"};
+        }
+        const uint64_t elements =
+            static_cast<uint64_t>(batch) * weight.cols;
+        if (out.count < elements ||
+            elements > std::numeric_limits<size_t>::max() /
+                           sizeof(__nv_bfloat16)) {
+            return {false, "host BF16 embedding output is too small"};
+        }
+        const size_t row_bytes =
+            static_cast<size_t>(weight.cols) * sizeof(__nv_bfloat16);
+        const size_t bytes =
+            static_cast<size_t>(elements) * sizeof(__nv_bfloat16);
+        HostEmbeddingSlot *slot = nullptr;
+        if (auto st = acquire_host_embedding_slot(
+                bytes, !out.is_bf16(), &slot); !st.ok) {
+            return st;
+        }
+
+        const auto *source = static_cast<const uint8_t *>(weight.ptr);
+        auto *staging = static_cast<uint8_t *>(slot->host);
+        for (uint32_t i = 0; i < batch; ++i) {
+            if (rows[i] >= weight.rows) {
+                return {false, "host BF16 embedding row is out of range"};
+            }
+            std::memcpy(
+                staging + static_cast<size_t>(i) * row_bytes,
+                source + static_cast<size_t>(rows[i]) * row_bytes,
+                row_bytes);
+        }
+
+        void *device_dst = out.is_bf16()
+            ? static_cast<void *>(out.ptr_bf16())
+            : static_cast<void *>(slot->device);
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(device_dst, slot->host, bytes,
+                                cudaMemcpyHostToDevice, exec_stream_),
+                "host BF16 embedding H2D"); !st.ok) {
+            return st;
+        }
+
+        DeviceStatus convert_status;
+        if (!out.is_bf16()) {
+            constexpr uint32_t threads = 256;
+            const uint64_t blocks64 = (elements + threads - 1) / threads;
+            if (blocks64 >
+                static_cast<uint64_t>(
+                    std::numeric_limits<unsigned>::max())) {
+                convert_status =
+                    {false, "host BF16 embedding conversion grid is too large"};
+            } else {
+                bf16_to_fp32_kernel<<<
+                    static_cast<unsigned>(blocks64), threads, 0,
+                    exec_stream_>>>(
+                    out.ptr, slot->device, elements);
+                convert_status =
+                    launch_status("host BF16 embedding convert to FP32");
+            }
+        }
+
+        if (auto st = cuda_status(
+                cudaEventRecord(slot->ready, exec_stream_),
+                "host embedding staging record"); !st.ok) {
+            (void)cudaStreamSynchronize(exec_stream_);
+            return st;
+        }
+        slot->in_flight = true;
+        return convert_status;
+    }
+
     DeviceStatus q8_0_get_row(DeviceTensor &out, const DeviceWeight &weight, uint64_t row) override {
         const auto &w = as_weight(weight);
         auto &o = as_tensor(out);
-        q8_get_row_kernel<<<static_cast<unsigned>((w.cols + 255) / 256), 256, 0, exec_stream_>>>(
-            o.ptr, static_cast<const uint8_t *>(w.ptr), row, w.cols);
+        if (w.type == WeightType::BF16_HOST) {
+            return copy_host_bf16_rows(o, w, &row, 1);
+        }
+        if (w.type == WeightType::BF16) {
+            if (o.is_bf16()) {
+                bf16_get_row_bf16_kernel<<<
+                    static_cast<unsigned>((w.cols + 255) / 256), 256,
+                    0, exec_stream_>>>(
+                    o.ptr_bf16(),
+                    static_cast<const __nv_bfloat16 *>(w.ptr),
+                    row, w.cols);
+            } else {
+                bf16_get_row_kernel<<<
+                    static_cast<unsigned>((w.cols + 255) / 256), 256,
+                    0, exec_stream_>>>(
+                    o.ptr, static_cast<const __nv_bfloat16 *>(w.ptr),
+                    row, w.cols);
+            }
+            return launch_status("cuda bf16_get_row");
+        }
+        if (w.type != WeightType::Q8_0) {
+            return {false, "row lookup requires Q8_0 or BF16 weight"};
+        }
+        if (o.is_bf16()) {
+            q8_get_row_bf16_kernel<<<
+                static_cast<unsigned>((w.cols + 255) / 256), 256,
+                0, exec_stream_>>>(
+                o.ptr_bf16(), static_cast<const uint8_t *>(w.ptr),
+                row, w.cols);
+        } else {
+            q8_get_row_kernel<<<
+                static_cast<unsigned>((w.cols + 255) / 256), 256,
+                0, exec_stream_>>>(
+                o.ptr, static_cast<const uint8_t *>(w.ptr), row, w.cols);
+        }
         return launch_status("cuda q8_0_get_row");
     }
 
@@ -4896,6 +8002,49 @@ public:
         auto &o = as_tensor(out);
         const auto &a = as_argmax_buffer(argmaxes);
         if (index >= a.count) return {false, "q8_0_get_row_from_argmax index oob"};
+        if (w.type == WeightType::BF16_HOST) {
+            if (!host_embedding_argmax_) {
+                if (auto st = cuda_status(
+                        cudaHostAlloc(
+                            reinterpret_cast<void **>(
+                                &host_embedding_argmax_),
+                            sizeof(ArgmaxPair), cudaHostAllocDefault),
+                        "host embedding argmax staging alloc"); !st.ok) {
+                    return st;
+                }
+            }
+            if (auto st = cuda_status(
+                    cudaMemcpyAsync(
+                        host_embedding_argmax_, a.ptr + index,
+                        sizeof(ArgmaxPair), cudaMemcpyDeviceToHost,
+                        exec_stream_),
+                    "host embedding argmax D2H"); !st.ok) {
+                return st;
+            }
+            if (auto st = cuda_status(
+                    cudaStreamSynchronize(exec_stream_),
+                    "host embedding argmax sync"); !st.ok) {
+                return st;
+            }
+            if (host_embedding_argmax_->index < 0 ||
+                static_cast<uint64_t>(host_embedding_argmax_->index) >=
+                    w.rows) {
+                return {false, "host BF16 embedding argmax is out of range"};
+            }
+            const uint64_t row =
+                static_cast<uint64_t>(host_embedding_argmax_->index);
+            return copy_host_bf16_rows(o, w, &row, 1);
+        }
+        if (w.type == WeightType::BF16) {
+            bf16_get_row_from_argmax_kernel<<<
+                static_cast<unsigned>((w.cols + 255) / 256), 256, 0, exec_stream_>>>(
+                o.ptr, static_cast<const __nv_bfloat16 *>(w.ptr), a.ptr, index,
+                w.rows, w.cols);
+            return launch_status("cuda bf16_get_row_from_argmax");
+        }
+        if (w.type != WeightType::Q8_0) {
+            return {false, "argmax row lookup requires Q8_0 or BF16 weight"};
+        }
         q8_get_row_from_argmax_kernel<<<static_cast<unsigned>((w.cols + 255) / 256), 256, 0, exec_stream_>>>(
             o.ptr,
             static_cast<const uint8_t *>(w.ptr),
@@ -4913,6 +8062,9 @@ public:
         if (batch == 0) return {};
         const auto &w = as_weight(weight);
         auto &o = as_tensor(out);
+        if (w.type == WeightType::BF16_HOST) {
+            return copy_host_bf16_rows(o, w, rows, batch);
+        }
         // Upload row indices to device (small, one transfer).
         if (rows_buf_capacity_ < batch) {
             if (rows_buf_) cudaFree(rows_buf_);
@@ -4923,8 +8075,32 @@ public:
         const unsigned threads = 256;
         const unsigned by = static_cast<unsigned>((w.cols + threads - 1) / threads);
         dim3 grid(batch, by);
-        q8_get_rows_batch_kernel<<<grid, threads, 0, exec_stream_>>>(o.ptr, static_cast<const uint8_t *>(w.ptr),
-                                                    rows_buf_, w.cols);
+        if (w.type == WeightType::BF16) {
+            if (o.is_bf16()) {
+                bf16_get_rows_batch_bf16_kernel<<<
+                    grid, threads, 0, exec_stream_>>>(
+                    o.ptr_bf16(),
+                    static_cast<const __nv_bfloat16 *>(w.ptr),
+                    rows_buf_, w.cols);
+            } else {
+                bf16_get_rows_batch_kernel<<<grid, threads, 0, exec_stream_>>>(
+                    o.ptr, static_cast<const __nv_bfloat16 *>(w.ptr),
+                    rows_buf_, w.cols);
+            }
+            return launch_status("cuda bf16_get_rows_batch");
+        }
+        if (w.type != WeightType::Q8_0) {
+            return {false, "batched row lookup requires Q8_0 or BF16 weight"};
+        }
+        if (o.is_bf16()) {
+            q8_get_rows_batch_bf16_kernel<<<grid, threads, 0, exec_stream_>>>(
+                o.ptr_bf16(), static_cast<const uint8_t *>(w.ptr),
+                rows_buf_, w.cols);
+        } else {
+            q8_get_rows_batch_kernel<<<grid, threads, 0, exec_stream_>>>(
+                o.ptr, static_cast<const uint8_t *>(w.ptr),
+                rows_buf_, w.cols);
+        }
         return launch_status("cuda q8_0_get_rows_batch");
     }
 
@@ -4932,6 +8108,73 @@ public:
         auto &w = const_cast<CudaWeight &>(as_weight(weight));
         auto &o = as_tensor(out);
         const auto &input = as_tensor(x);
+        if (w.type == WeightType::BF16) {
+            return bf16_matmul(o.ptr, w, input.ptr, 1,
+                               static_cast<uint32_t>(w.cols),
+                               static_cast<uint32_t>(w.rows));
+        }
+        if (w.type == WeightType::FP8_E4M3) {
+            if (o.is_bf16()) {
+                return fp8_matmul_bf16(
+                    o.ptr_bf16(), w, input.ptr, 1,
+                    static_cast<uint32_t>(w.cols),
+                    static_cast<uint32_t>(w.rows));
+            }
+            return fp8_matmul(o.ptr, w, input.ptr, 1,
+                              static_cast<uint32_t>(w.cols),
+                              static_cast<uint32_t>(w.rows));
+        }
+        if (w.type == WeightType::NVFP4_E2M1) {
+            if (o.is_bf16()) {
+                return nvfp4_matmul_bf16(
+                    o.ptr_bf16(), w, input.ptr, 1,
+                    static_cast<uint32_t>(w.cols),
+                    static_cast<uint32_t>(w.rows));
+            }
+            return nvfp4_matmul(
+                o.ptr, w, input.ptr, 1,
+                static_cast<uint32_t>(w.cols),
+                static_cast<uint32_t>(w.rows));
+        }
+        if (w.type != WeightType::Q8_0) {
+            return {false, "mixed-precision linear kernel is not initialized"};
+        }
+        if (o.is_bf16() &&
+            matvec_kernel_choice() == MatvecKernel::Ported &&
+            (w.cols % 32) == 0) {
+            if (auto st = ensure_q8_1_scratch(
+                    /*batch=*/1, static_cast<uint32_t>(w.cols)); !st.ok) {
+                return st;
+            }
+            if (!ported::launch_quantize_q8_1(
+                    input.ptr, q8_1_scratch_,
+                    /*batch=*/1, static_cast<uint32_t>(w.cols),
+                    /*stride_x_row=*/static_cast<uint32_t>(w.cols),
+                    exec_stream_)) {
+                return {false, "ported quantize_q8_1 BF16 launch failed"};
+            }
+            if (!ported::launch_mmvq_q8_0_bf16(
+                    static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                    o.ptr_bf16(), static_cast<uint32_t>(w.rows),
+                    static_cast<uint32_t>(w.cols), /*batch=*/1,
+                    /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                    exec_stream_)) {
+                return {false, "ported mmvq_q8_0 BF16 launch failed"};
+            }
+            return launch_status("cuda q8_0_matvec ported BF16");
+        }
+        float *q8_out = o.ptr;
+        if (o.is_bf16()) {
+            if (auto st = ensure_q8_output_workspace(w.rows); !st.ok) {
+                return st;
+            }
+            q8_out = q8_out_f32_;
+        }
+        auto finish_q8 = [&](DeviceStatus st) {
+            if (!st.ok || !o.is_bf16()) return st;
+            return convert_q8_output_bf16(
+                o.ptr_bf16(), static_cast<uint64_t>(w.rows));
+        };
         // The cuBLAS-Sgemv-on-F32-dequant-cache path was an early shortcut. It
         // reads 4x more bytes per matvec (F32 cache vs Q8 weight) so even though
         // it uses tensor cores, it loses to a properly tuned Q8 kernel for the
@@ -4961,11 +8204,11 @@ public:
                                         input.ptr,
                                         1,
                                         &beta,
-                                        o.ptr,
+                                        q8_out,
                                         1),
                             "cublasSgemv q8_0_matvec");
                         sgemv_st.ok) {
-                        return {};
+                        return finish_q8({});
                     }
                 }
                 // cache build or sgemv failed: drop the error state and
@@ -4982,7 +8225,9 @@ public:
         // Shmem budget per layout:
         //   - DP4A path  : cols * 1 (i8) + blocks * 4 (f32 scale per block)
         //   - F32 fallback: cols * 4 (f32 staging)
-        return dispatch_q8_matvec(o.ptr, w, input.ptr, /*batch=*/1, /*in_stride=*/0, /*out_stride=*/0);
+        return finish_q8(dispatch_q8_matvec(
+            q8_out, w, input.ptr, /*batch=*/1,
+            /*in_stride=*/0, /*out_stride=*/0));
     }
 
     DeviceStatus q8_0_matvec_fanout(DeviceTensor *const *outs,
@@ -4997,8 +8242,347 @@ public:
         // doesn't, fall back to per-call dispatch.
         const uint64_t cols = as_weight(*weights[0]).cols;
         bool same_cols = true;
+        bool all_q8 = as_weight(*weights[0]).type == WeightType::Q8_0;
+        uint32_t fp8_count =
+            as_weight(*weights[0]).type == WeightType::FP8_E4M3 ? 1U : 0U;
+        uint32_t bf16_count =
+            as_weight(*weights[0]).type == WeightType::BF16 ? 1U : 0U;
+        bool all_nvfp4 =
+            as_weight(*weights[0]).type == WeightType::NVFP4_E2M1;
+        const float nvfp4_input_scale =
+            as_weight(*weights[0]).input_scale_host;
         for (uint32_t i = 1; i < n; ++i) {
             if (as_weight(*weights[i]).cols != cols) { same_cols = false; break; }
+            all_q8 = all_q8 && as_weight(*weights[i]).type == WeightType::Q8_0;
+            fp8_count +=
+                as_weight(*weights[i]).type == WeightType::FP8_E4M3 ? 1U : 0U;
+            bf16_count +=
+                as_weight(*weights[i]).type == WeightType::BF16 ? 1U : 0U;
+            all_nvfp4 =
+                all_nvfp4 &&
+                as_weight(*weights[i]).type == WeightType::NVFP4_E2M1 &&
+                as_weight(*weights[i]).input_scale_host == nvfp4_input_scale;
+        }
+#ifdef QW3_ENABLE_NVFP4
+        if (all_nvfp4 && same_cols && (cols % 64) == 0 &&
+            nvfp4_small_pair_mmvq_enabled()) {
+            if (auto st = quantize_nvfp4_activation(
+                    as_weight(*weights[0]), input.ptr, 1,
+                    static_cast<uint32_t>(cols)); !st.ok) {
+                return st;
+            }
+            if (n == 2) {
+                const auto &w0 = as_weight(*weights[0]);
+                const auto &w1 = as_weight(*weights[1]);
+                if (w0.rows == w1.rows) {
+                    auto &o0 = as_tensor(*outs[0]);
+                    auto &o1 = as_tensor(*outs[1]);
+                    if (nvfp4_adapter::launch_small_pair_f32(
+                            o0.ptr, o1.ptr,
+                            x_fp4_workspace_, x_fp4_scales_,
+                            w0.ptr, w0.scale, w0.global_scale,
+                            w1.ptr, w1.scale, w1.global_scale,
+                            1, static_cast<uint32_t>(w0.rows),
+                            static_cast<uint32_t>(cols),
+                            static_cast<uint32_t>(w0.rows),
+                            static_cast<uint32_t>(w1.rows),
+                            false, exec_stream_)) {
+                        return launch_status("NVFP4 matvec fanout pair");
+                    }
+                    return {false, "NVFP4 matvec fanout pair launch failed"};
+                }
+            }
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto &w = as_weight(*weights[i]);
+                auto &o = as_tensor(*outs[i]);
+                if (!nvfp4_adapter::launch_small_f32(
+                        o.ptr, x_fp4_workspace_, x_fp4_scales_,
+                        w.ptr, w.scale, w.global_scale,
+                        1, static_cast<uint32_t>(w.rows),
+                        static_cast<uint32_t>(w.cols),
+                        static_cast<uint32_t>(w.rows),
+                        false, exec_stream_)) {
+                    return {false, "NVFP4 matvec fanout launch failed"};
+                }
+            }
+            return launch_status("NVFP4 matvec fanout");
+        }
+#endif
+        if (fp8_count > 0 && same_cols && fp8_small_cublaslt_enabled() &&
+            (fp8_count == n || fp8_mixed_fanout_enabled())) {
+            const uint32_t custom_max_rows =
+                fp8_fanout_custom_max_rows();
+            int32_t direct_pair_first = -1;
+            int32_t direct_pair_second = -1;
+            if (custom_max_rows > 0 &&
+                fp8_direct_pair_enabled()) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    const auto &first = as_weight(*weights[i]);
+                    if (first.type != WeightType::FP8_E4M3 ||
+                        first.rows > custom_max_rows ||
+                        !first.fp8_packed_second) {
+                        continue;
+                    }
+                    for (uint32_t j = 0; j < n; ++j) {
+                        const auto &second = as_weight(*weights[j]);
+                        if (&second == first.fp8_packed_second &&
+                            second.type == WeightType::FP8_E4M3 &&
+                            second.rows == first.rows &&
+                            second.cols == first.cols) {
+                            direct_pair_first = static_cast<int32_t>(i);
+                            direct_pair_second = static_cast<int32_t>(j);
+                            break;
+                        }
+                    }
+                    if (direct_pair_first >= 0) break;
+                }
+            }
+            int32_t direct_attention_q = -1;
+            if (n == 3 && fp8_count == 3 &&
+                direct_pair_first >= 0 &&
+                fp8_attention_q_direct_enabled()) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    if (static_cast<int32_t>(i) == direct_pair_first ||
+                        static_cast<int32_t>(i) == direct_pair_second) {
+                        continue;
+                    }
+                    const auto &candidate = as_weight(*weights[i]);
+                    if (candidate.type == WeightType::FP8_E4M3 &&
+                        candidate.rows <=
+                            fp8_attention_q_direct_max_rows()) {
+                        direct_attention_q = static_cast<int32_t>(i);
+                    }
+                    break;
+                }
+            }
+            uint32_t cublas_fp8_count = 0;
+            uint32_t max_cublas_rows = 0;
+            uint32_t total_cublas_rows = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto &w = as_weight(*weights[i]);
+                const bool direct =
+                    static_cast<int32_t>(i) == direct_pair_first ||
+                    static_cast<int32_t>(i) == direct_pair_second ||
+                    static_cast<int32_t>(i) == direct_attention_q;
+                if (w.type == WeightType::FP8_E4M3 &&
+                    !direct &&
+                    (custom_max_rows == 0 || w.rows > custom_max_rows)) {
+                    max_cublas_rows = std::max(
+                        max_cublas_rows, static_cast<uint32_t>(w.rows));
+                    total_cublas_rows += static_cast<uint32_t>(w.rows);
+                    ++cublas_fp8_count;
+                }
+            }
+            const bool fuse_fp8_scale =
+                n <= 4 && cublas_fp8_count >= 2 &&
+                cublas_fp8_count <= 4 &&
+                fp8_fanout_scale_fusion_enabled();
+            int32_t packed_pair_first = -1;
+            int32_t packed_pair_second = -1;
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto &first = as_weight(*weights[i]);
+                if (first.type != WeightType::FP8_E4M3 ||
+                    first.rows <= custom_max_rows ||
+                    !first.fp8_packed_second) {
+                    continue;
+                }
+                for (uint32_t j = 0; j < n; ++j) {
+                    const auto &second = as_weight(*weights[j]);
+                    if (&second == first.fp8_packed_second &&
+                        second.type == WeightType::FP8_E4M3 &&
+                        second.rows > custom_max_rows &&
+                        first.fp8_packed_rows ==
+                            first.rows + second.rows) {
+                        packed_pair_first = static_cast<int32_t>(i);
+                        packed_pair_second = static_cast<int32_t>(j);
+                        break;
+                    }
+                }
+                if (packed_pair_first >= 0) break;
+            }
+            const bool shared_bf16_input = bf16_count > 1;
+            const bool fused_fp8_bf16_input =
+                shared_bf16_input &&
+                fp8_fused_bf16_quant_enabled();
+            if (cublas_fp8_count > 0) {
+                if (auto st = fp8_quantize_activation(
+                        input.ptr, 1, static_cast<uint32_t>(cols),
+                        static_cast<uint32_t>(cols),
+                        fuse_fp8_scale
+                            ? total_cublas_rows
+                            : max_cublas_rows,
+                        fused_fp8_bf16_input); !st.ok) {
+                    return st;
+                }
+            }
+            if (shared_bf16_input &&
+                (!fused_fp8_bf16_input || cublas_fp8_count == 0)) {
+                if (auto st = bf16_convert_activation(
+                        input.ptr, 1, static_cast<uint32_t>(cols));
+                    !st.ok) {
+                    return st;
+                }
+            }
+            uint32_t bf16_pair_indices[2] = {};
+            uint32_t bf16_pair_count = 0;
+            const uint32_t bf16_pair_max_rows =
+                bf16_small_pair_max_rows();
+            if (shared_bf16_input && bf16_pair_max_rows > 0) {
+                for (uint32_t i = 0; i < n && bf16_pair_count < 2; ++i) {
+                    if (as_weight(*weights[i]).type == WeightType::BF16) {
+                        bf16_pair_indices[bf16_pair_count++] = i;
+                    }
+                }
+            }
+            bool fused_bf16_pair = false;
+            if (bf16_pair_count == 2 && bf16_count == 2) {
+                const auto &w0 =
+                    as_weight(*weights[bf16_pair_indices[0]]);
+                const auto &w1 =
+                    as_weight(*weights[bf16_pair_indices[1]]);
+                fused_bf16_pair =
+                    w0.rows == w1.rows && w0.cols == w1.cols &&
+                    w0.rows <= bf16_pair_max_rows;
+                if (fused_bf16_pair) {
+                    bf16_weight_bf16_matvec_pair_kernel<<<
+                        static_cast<uint32_t>(w0.rows), 256, 0,
+                        exec_stream_>>>(
+                        as_tensor(*outs[bf16_pair_indices[0]]).ptr,
+                        as_tensor(*outs[bf16_pair_indices[1]]).ptr,
+                        static_cast<const __nv_bfloat16 *>(w0.ptr),
+                        static_cast<const __nv_bfloat16 *>(w1.ptr),
+                        x_bf16_workspace_,
+                        static_cast<uint32_t>(w0.rows),
+                        static_cast<uint32_t>(w0.cols));
+                    if (auto st = launch_status(
+                            "BF16 small pair matvec"); !st.ok) {
+                        return st;
+                    }
+                }
+            }
+            uint32_t fp8_indices[4] = {};
+            uint64_t fp8_offsets[4] = {};
+            uint32_t fp8_slot = 0;
+            uint64_t fp8_offset = 0;
+            if (direct_pair_first >= 0) {
+                const uint32_t first_index =
+                    static_cast<uint32_t>(direct_pair_first);
+                const uint32_t second_index =
+                    static_cast<uint32_t>(direct_pair_second);
+                const auto &first = as_weight(*weights[first_index]);
+                const auto &second = as_weight(*weights[second_index]);
+                fp8_weight_f32_matvec_pair_vec2_kernel<<<
+                    static_cast<uint32_t>(first.rows),
+                    fp8_direct_pair_threads(), 0,
+                    exec_stream_>>>(
+                    as_tensor(*outs[first_index]).ptr,
+                    as_tensor(*outs[second_index]).ptr,
+                    static_cast<const __nv_fp8_e4m3 *>(first.ptr),
+                    static_cast<const __nv_fp8_e4m3 *>(second.ptr),
+                    static_cast<const float *>(first.scale),
+                    static_cast<const float *>(second.scale),
+                    input.ptr,
+                    static_cast<uint32_t>(first.rows),
+                    static_cast<uint32_t>(first.cols));
+                if (auto st = launch_status(
+                        "FP8 direct pair vec2 matvec"); !st.ok) {
+                    return st;
+                }
+            }
+            if (packed_pair_first >= 0 && fuse_fp8_scale) {
+                const uint32_t first_index =
+                    static_cast<uint32_t>(packed_pair_first);
+                const uint32_t second_index =
+                    static_cast<uint32_t>(packed_pair_second);
+                const auto &first = as_weight(*weights[first_index]);
+                const auto &second = as_weight(*weights[second_index]);
+                fp8_indices[0] = first_index;
+                fp8_offsets[0] = 0;
+                fp8_indices[1] = second_index;
+                fp8_offsets[1] = first.rows;
+                fp8_slot = 2;
+                fp8_offset = first.rows + second.rows;
+                if (auto st = cublaslt_fp8_matmul_view(
+                        fp8_out_f32_, first.ptr, first.scale,
+                        first.rows + second.rows, first.cols,
+                        1, 0.0f, false); !st.ok) {
+                    return st;
+                }
+            }
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto &w = as_weight(*weights[i]);
+                if (w.type == WeightType::FP8_E4M3) {
+                    auto &o = as_tensor(*outs[i]);
+                    if (static_cast<int32_t>(i) == direct_pair_first ||
+                        static_cast<int32_t>(i) == direct_pair_second ||
+                        static_cast<int32_t>(i) == packed_pair_first ||
+                        static_cast<int32_t>(i) == packed_pair_second) {
+                        continue;
+                    } else if (static_cast<int32_t>(i) ==
+                               direct_attention_q) {
+                        if (auto st = fp8_matvec_f32_direct(
+                                o.ptr, w, input.ptr, false,
+                                fp8_attention_q_direct_threads()); !st.ok) {
+                            return st;
+                        }
+                    } else if (custom_max_rows > 0 &&
+                        w.rows <= custom_max_rows) {
+                        if (auto st = fp8_matvec_f32_direct(
+                                o.ptr, w, input.ptr, false); !st.ok) {
+                            return st;
+                        }
+                    } else if (fuse_fp8_scale) {
+                        fp8_indices[fp8_slot] = i;
+                        fp8_offsets[fp8_slot] = fp8_offset;
+                        if (auto st = cublaslt_fp8_matmul(
+                                fp8_out_f32_ + fp8_offset, w, 1, 0.0f,
+                                false); !st.ok) {
+                            return st;
+                        }
+                        fp8_offset += w.rows;
+                        ++fp8_slot;
+                    } else {
+                        if (auto st = fp8_matmul_quantized(
+                                o.ptr, w, 1,
+                                static_cast<uint32_t>(w.rows)); !st.ok) {
+                            return st;
+                        }
+                    }
+                } else if (w.type == WeightType::BF16 &&
+                           fused_bf16_pair &&
+                           (i == bf16_pair_indices[0] ||
+                            i == bf16_pair_indices[1])) {
+                    continue;
+                } else if (w.type == WeightType::BF16 &&
+                           shared_bf16_input) {
+                    auto &o = as_tensor(*outs[i]);
+                    if (auto st = bf16_matmul_converted(
+                            o.ptr, w, 1, static_cast<uint32_t>(cols),
+                            static_cast<uint32_t>(w.rows)); !st.ok) {
+                        return st;
+                    }
+                } else {
+                    if (auto st = q8_0_matvec(*outs[i], *weights[i], x); !st.ok) {
+                        return st;
+                    }
+                }
+            }
+            if (fuse_fp8_scale) {
+                uint32_t strides[4] = {};
+                for (uint32_t i = 0; i < n && i < 4; ++i) {
+                    strides[i] =
+                        static_cast<uint32_t>(as_weight(*weights[i]).rows);
+                }
+                if (auto st = fp8_scale_fanout4(
+                        outs, weights, strides, fp8_indices, fp8_offsets,
+                        fp8_slot, 1); !st.ok) {
+                    return st;
+                }
+            }
+            return {};
+        }
+        if (!all_q8) {
+            return DeviceBackend::q8_0_matvec_fanout(outs, weights, n, x);
         }
         const bool fast_path = same_cols && (cols % 32) == 0 &&
                                matvec_kernel_choice() == MatvecKernel::Ported;
@@ -5078,8 +8662,234 @@ public:
         const auto &input = as_tensor(x);
         const uint64_t cols = as_weight(*weights[0]).cols;
         bool same_cols = true;
+        bool all_q8 = as_weight(*weights[0]).type == WeightType::Q8_0;
+        uint32_t fp8_count =
+            as_weight(*weights[0]).type == WeightType::FP8_E4M3 ? 1U : 0U;
+        uint32_t bf16_count =
+            as_weight(*weights[0]).type == WeightType::BF16 ? 1U : 0U;
+        bool all_nvfp4 =
+            as_weight(*weights[0]).type == WeightType::NVFP4_E2M1;
+        const float nvfp4_input_scale =
+            as_weight(*weights[0]).input_scale_host;
         for (uint32_t i = 1; i < n; ++i) {
             if (as_weight(*weights[i]).cols != cols) { same_cols = false; break; }
+            all_q8 = all_q8 && as_weight(*weights[i]).type == WeightType::Q8_0;
+            fp8_count +=
+                as_weight(*weights[i]).type == WeightType::FP8_E4M3 ? 1U : 0U;
+            bf16_count +=
+                as_weight(*weights[i]).type == WeightType::BF16 ? 1U : 0U;
+            all_nvfp4 =
+                all_nvfp4 &&
+                as_weight(*weights[i]).type == WeightType::NVFP4_E2M1 &&
+                as_weight(*weights[i]).input_scale_host == nvfp4_input_scale;
+        }
+#ifdef QW3_ENABLE_NVFP4
+        if (all_nvfp4 && same_cols && batch == 1 &&
+            nvfp4_small_pair_mmvq_enabled() &&
+            (cols % 64) == 0 && in_stride == cols) {
+            if (auto st = quantize_nvfp4_activation(
+                    as_weight(*weights[0]), input.ptr, batch,
+                    in_stride); !st.ok) {
+                return st;
+            }
+            if (n == 2) {
+                const auto &w0 = as_weight(*weights[0]);
+                const auto &w1 = as_weight(*weights[1]);
+                if (w0.rows == w1.rows) {
+                    auto &o0 = as_tensor(*outs[0]);
+                    auto &o1 = as_tensor(*outs[1]);
+                    if (nvfp4_adapter::launch_small_pair_f32(
+                            o0.ptr, o1.ptr,
+                            x_fp4_workspace_, x_fp4_scales_,
+                            w0.ptr, w0.scale, w0.global_scale,
+                            w1.ptr, w1.scale, w1.global_scale,
+                            batch, static_cast<uint32_t>(w0.rows),
+                            static_cast<uint32_t>(cols),
+                            out_strides[0], out_strides[1],
+                            false, exec_stream_)) {
+                        return launch_status("NVFP4 matmul fanout pair");
+                    }
+                    return {false, "NVFP4 matmul fanout pair launch failed"};
+                }
+            }
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto &w = as_weight(*weights[i]);
+                auto &o = as_tensor(*outs[i]);
+                if (!nvfp4_adapter::launch_small_f32(
+                        o.ptr, x_fp4_workspace_, x_fp4_scales_,
+                        w.ptr, w.scale, w.global_scale,
+                        batch, static_cast<uint32_t>(w.rows),
+                        static_cast<uint32_t>(w.cols), out_strides[i],
+                        false, exec_stream_)) {
+                    return {false, "NVFP4 matmul fanout launch failed"};
+                }
+            }
+            return launch_status("NVFP4 matmul fanout");
+        }
+#endif
+        if (fp8_count > 0 && same_cols &&
+            (fp8_count == n || fp8_mixed_fanout_enabled()) &&
+            (batch > 8 || fp8_small_cublaslt_enabled())) {
+            uint32_t max_rows = 0;
+            uint32_t total_fp8_rows = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto &w = as_weight(*weights[i]);
+                if (w.type == WeightType::FP8_E4M3) {
+                    max_rows = std::max(
+                        max_rows, static_cast<uint32_t>(w.rows));
+                    total_fp8_rows += static_cast<uint32_t>(w.rows);
+                }
+            }
+            const bool fuse_fp8_scale =
+                fp8_count >= 2 && fp8_count <= 4 &&
+                fp8_fanout_scale_fusion_enabled();
+            int32_t packed_pair_first = -1;
+            int32_t packed_pair_second = -1;
+            if (fuse_fp8_scale) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    const auto &first = as_weight(*weights[i]);
+                    if (first.type != WeightType::FP8_E4M3 ||
+                        !first.fp8_packed_second) {
+                        continue;
+                    }
+                    for (uint32_t j = 0; j < n; ++j) {
+                        const auto &second = as_weight(*weights[j]);
+                        if (&second == first.fp8_packed_second &&
+                            second.type == WeightType::FP8_E4M3 &&
+                            first.fp8_packed_rows ==
+                                first.rows + second.rows) {
+                            packed_pair_first = static_cast<int32_t>(i);
+                            packed_pair_second = static_cast<int32_t>(j);
+                            break;
+                        }
+                    }
+                    if (packed_pair_first >= 0) break;
+                }
+            }
+            const bool shared_bf16_input = bf16_count > 1;
+            const bool fused_fp8_bf16_input =
+                batch == 1 && shared_bf16_input &&
+                fp8_fused_bf16_quant_enabled();
+            if (auto st = fp8_quantize_activation(
+                    input.ptr, batch, static_cast<uint32_t>(cols),
+                    in_stride,
+                    fuse_fp8_scale ? total_fp8_rows : max_rows,
+                    fused_fp8_bf16_input); !st.ok) {
+                return st;
+            }
+            if (fp8_count == n) {
+                return fp8_matmul_fanout_quantized(
+                    outs, weights, out_strides, n, batch);
+            }
+            if (shared_bf16_input && !fused_fp8_bf16_input) {
+                if (auto st = bf16_convert_activation(
+                        input.ptr, batch, in_stride); !st.ok) {
+                    return st;
+                }
+            }
+            uint32_t fp8_indices[4] = {};
+            uint64_t fp8_offsets[4] = {};
+            uint32_t fp8_slot = 0;
+            uint64_t fp8_offset = 0;
+            if (packed_pair_first >= 0) {
+                const uint32_t first_index =
+                    static_cast<uint32_t>(packed_pair_first);
+                const uint32_t second_index =
+                    static_cast<uint32_t>(packed_pair_second);
+                const auto &first = as_weight(
+                    *weights[first_index]);
+                const auto &second = as_weight(
+                    *weights[second_index]);
+                if (auto st = cublaslt_fp8_matmul_view(
+                        fp8_out_f32_, first.ptr, first.scale,
+                        first.rows + second.rows, first.cols,
+                        batch, 0.0f, false); !st.ok) {
+                    return st;
+                }
+                const uint64_t count =
+                    static_cast<uint64_t>(batch) *
+                    (first.rows + second.rows);
+                const unsigned threads = 256;
+                const unsigned blocks = static_cast<unsigned>(
+                    (count + threads - 1) / threads);
+                fp8_outer_scale_packed_pair_kernel<<<
+                    blocks, threads, 0, exec_stream_>>>(
+                    as_tensor(*outs[first_index]).ptr,
+                    as_tensor(*outs[second_index]).ptr,
+                    fp8_out_f32_, x_fp8_scales_,
+                    static_cast<const float *>(first.scale),
+                    static_cast<const float *>(second.scale),
+                    batch,
+                    static_cast<uint32_t>(first.rows),
+                    static_cast<uint32_t>(second.rows),
+                    out_strides[first_index],
+                    out_strides[second_index]);
+                if (auto st = launch_status(
+                        "FP8 packed pair batched output scaling");
+                    !st.ok) {
+                    return st;
+                }
+            }
+            for (uint32_t i = 0; i < n; ++i) {
+                const auto &w = as_weight(*weights[i]);
+                if (w.type == WeightType::FP8_E4M3) {
+                    auto &o = as_tensor(*outs[i]);
+                    if (static_cast<int32_t>(i) == packed_pair_first ||
+                        static_cast<int32_t>(i) == packed_pair_second) {
+                        continue;
+                    } else if (packed_pair_first >= 0) {
+                        if (auto st = fp8_matmul_quantized(
+                                o.ptr, w, batch, out_strides[i]); !st.ok) {
+                            return st;
+                        }
+                    } else if (fuse_fp8_scale) {
+                        fp8_indices[fp8_slot] = i;
+                        fp8_offsets[fp8_slot] = fp8_offset;
+                        if (auto st = cublaslt_fp8_matmul(
+                                fp8_out_f32_ + fp8_offset, w, batch,
+                                0.0f, false); !st.ok) {
+                            return st;
+                        }
+                        fp8_offset +=
+                            static_cast<uint64_t>(batch) * w.rows;
+                        ++fp8_slot;
+                    } else {
+                        if (auto st = fp8_matmul_quantized(
+                                o.ptr, w, batch, out_strides[i]); !st.ok) {
+                            return st;
+                        }
+                    }
+                } else if (w.type == WeightType::BF16 &&
+                           shared_bf16_input) {
+                    auto &o = as_tensor(*outs[i]);
+                    if (auto st = bf16_matmul_converted(
+                            o.ptr, w, batch, in_stride,
+                            out_strides[i]); !st.ok) {
+                        return st;
+                    }
+                } else {
+                    if (auto st = q8_0_matmul(
+                            *outs[i], *weights[i], x, batch,
+                            in_stride, out_strides[i]); !st.ok) {
+                        return st;
+                    }
+                }
+            }
+            if (packed_pair_first >= 0) {
+                return {};
+            }
+            if (fuse_fp8_scale) {
+                if (auto st = fp8_scale_fanout4(
+                        outs, weights, out_strides, fp8_indices,
+                        fp8_offsets, fp8_slot, batch); !st.ok) {
+                    return st;
+                }
+            }
+            return {};
+        }
+        if (!all_q8) {
+            return DeviceBackend::q8_0_matmul_fanout(outs, weights, out_strides,
+                                                     n, x, batch, in_stride);
         }
         // Fast path only for the column-batched MMVQ verify regime (batch 2..8,
         // shared activation width, ported matvec). batch==1 has its own
@@ -5145,6 +8955,247 @@ public:
         return launch_status("cuda q8_0_matmul_fanout");
     }
 
+    DeviceStatus rms_norm_q8_0_matmul_fanout(
+            DeviceTensor &normalized,
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            uint32_t fanout,
+            const DeviceTensor &x,
+            const DeviceWeight &norm_weight,
+            uint32_t batch,
+            uint32_t in_stride,
+            float eps) override {
+        const auto &input = as_tensor(x);
+        const auto &norm = as_weight(norm_weight);
+        bool compatible =
+            fp8_fused_rms_quant_enabled() &&
+            batch > 256 && fanout >= 2 && fanout <= 4 &&
+            input.is_bf16() && norm.type == WeightType::F32 &&
+            norm.cols == in_stride &&
+            input.count >= static_cast<uint64_t>(batch) * in_stride;
+        uint32_t total_rows = 0;
+        uint32_t fp8_count = 0;
+        uint32_t bf16_count = 0;
+        for (uint32_t i = 0; compatible && i < fanout; ++i) {
+            const auto &w = as_weight(*weights[i]);
+            const auto &out = as_tensor(*outs[i]);
+            compatible =
+                (w.type == WeightType::FP8_E4M3 ||
+                 w.type == WeightType::BF16) &&
+                w.cols == in_stride &&
+                out_strides[i] >= w.rows &&
+                out.count >= static_cast<uint64_t>(batch) *
+                                 out_strides[i];
+            if (w.type == WeightType::FP8_E4M3) {
+                ++fp8_count;
+                total_rows += static_cast<uint32_t>(w.rows);
+            } else if (w.type == WeightType::BF16) {
+                ++bf16_count;
+            }
+        }
+        compatible = compatible && fp8_count > 0;
+        if (!compatible) {
+            return DeviceBackend::rms_norm_q8_0_matmul_fanout(
+                normalized, outs, weights, out_strides, fanout,
+                x, norm_weight, batch, in_stride, eps);
+        }
+        if (auto st = ensure_fp8_linear_workspace(
+                batch, in_stride, total_rows);
+            !st.ok) {
+            return st;
+        }
+        if (bf16_count > 0) {
+            if (auto st = ensure_bf16_activation_workspace(
+                    static_cast<uint64_t>(batch) * in_stride);
+                !st.ok) {
+                return st;
+            }
+        }
+        const uint32_t threads = fp8_fused_rms_threads();
+        if (threads == 256) {
+            rms_norm_bf16_to_fp8_per_row_kernel<256><<<
+                batch, 256, 0, exec_stream_>>>(
+                x_fp8_workspace_, x_fp8_scales_,
+                bf16_count > 0 ? x_bf16_workspace_ : nullptr,
+                input.ptr_bf16(),
+                static_cast<const float *>(norm.ptr), in_stride, eps);
+        } else if (threads == 512) {
+            rms_norm_bf16_to_fp8_per_row_kernel<512><<<
+                batch, 512, 0, exec_stream_>>>(
+                x_fp8_workspace_, x_fp8_scales_,
+                bf16_count > 0 ? x_bf16_workspace_ : nullptr,
+                input.ptr_bf16(),
+                static_cast<const float *>(norm.ptr), in_stride, eps);
+        } else {
+            rms_norm_bf16_to_fp8_per_row_kernel<1024><<<
+                batch, 1024, 0, exec_stream_>>>(
+                x_fp8_workspace_, x_fp8_scales_,
+                bf16_count > 0 ? x_bf16_workspace_ : nullptr,
+                input.ptr_bf16(),
+                static_cast<const float *>(norm.ptr), in_stride, eps);
+        }
+        if (auto st = launch_status(
+                "fused BF16 RMSNorm to FP8 activation quantization");
+            !st.ok) {
+            return st;
+        }
+        if (bf16_count == 0) {
+            return fp8_matmul_fanout_quantized(
+                outs, weights, out_strides, fanout, batch);
+        }
+        return fp8_bf16_matmul_fanout_quantized(
+            outs, weights, out_strides, fanout, batch,
+            fp8_count, bf16_count);
+    }
+
+    DeviceStatus rms_norm_q8_0_matmul_recurrent_fanout(
+            DeviceTensor &normalized,
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            uint32_t fanout,
+            const DeviceTensor &x,
+            const DeviceWeight &norm_weight,
+            uint32_t batch,
+            uint32_t in_stride,
+            float eps) override {
+        for (uint32_t i = 0; i < fanout; ++i) {
+            as_tensor(*outs[i]).clear_lazy_fp8_linear();
+        }
+        const bool previous = lazy_recurrent_pair_requested_;
+        lazy_recurrent_pair_requested_ =
+            fp8_lazy_recurrent_pair_enabled() && batch >= 64;
+        DeviceStatus status = rms_norm_q8_0_matmul_fanout(
+            normalized, outs, weights, out_strides, fanout,
+            x, norm_weight, batch, in_stride, eps);
+        lazy_recurrent_pair_requested_ = previous;
+        if (!status.ok) {
+            for (uint32_t i = 0; i < fanout; ++i) {
+                as_tensor(*outs[i]).clear_lazy_fp8_linear();
+            }
+        }
+        return status;
+    }
+
+    bool can_defer_recurrent_projection_outputs(
+            const DeviceWeight *const *weights,
+            uint32_t fanout,
+            const DeviceWeight &norm_weight,
+            bool input_is_bf16,
+            uint32_t input_stride,
+            uint32_t batch,
+            uint32_t num_k_heads,
+            uint32_t num_v_heads,
+            uint32_t head_k_dim,
+            uint32_t head_v_dim,
+            uint32_t proj_count,
+            uint32_t proj_stride,
+            uint32_t gate_stride,
+            uint32_t alpha_stride,
+            uint32_t beta_stride,
+            bool state_checkpoints,
+            bool deltanet_capture) const override {
+#ifndef QW3_ENABLE_GDN_SM120_AOT
+        (void)weights;
+        (void)fanout;
+        (void)norm_weight;
+        (void)input_is_bf16;
+        (void)input_stride;
+        (void)batch;
+        (void)num_k_heads;
+        (void)num_v_heads;
+        (void)head_k_dim;
+        (void)head_v_dim;
+        (void)proj_count;
+        (void)proj_stride;
+        (void)gate_stride;
+        (void)alpha_stride;
+        (void)beta_stride;
+        (void)state_checkpoints;
+        (void)deltanet_capture;
+        return false;
+#else
+        // Lazy recurrent metadata is currently emitted only by the fused
+        // BF16 RMSNorm -> FP8 mixed-fanout route, whose dispatch requires
+        // batch > 256. Smaller trailing prefill chunks must materialize.
+        if (!weights || fanout != 4 || batch <= 256 ||
+            state_checkpoints || deltanet_capture ||
+            !input_is_bf16 || !fp8_fused_rms_quant_enabled() ||
+            !fp8_fanout_scale_fusion_enabled() ||
+            !fp8_lazy_recurrent_pair_enabled() ||
+            recurrent_kernel_choice() != RecurrentKernel::Sm120Aot ||
+            !gdn_sm120_fused_io_enabled() ||
+            !parallel_prefill_conv_enabled() ||
+            head_k_dim != 128 || head_v_dim != 128 ||
+            proj_count !=
+                2u * num_k_heads * head_k_dim +
+                    num_v_heads * head_v_dim ||
+            proj_stride < proj_count ||
+            gate_stride < num_v_heads * head_v_dim ||
+            alpha_stride != beta_stride) {
+            return false;
+        }
+        for (uint32_t i = 0; i < fanout; ++i) {
+            if (!weights[i]) return false;
+        }
+        const auto &norm = as_weight(norm_weight);
+        const auto &proj = as_weight(*weights[0]);
+        const auto &gate = as_weight(*weights[1]);
+        const auto &alpha = as_weight(*weights[2]);
+        const auto &beta = as_weight(*weights[3]);
+        return norm.type == WeightType::F32 &&
+               norm.cols == input_stride &&
+               proj.type == WeightType::FP8_E4M3 &&
+               gate.type == WeightType::FP8_E4M3 &&
+               alpha.type == WeightType::BF16 &&
+               beta.type == WeightType::BF16 &&
+               proj.cols == input_stride &&
+               gate.cols == input_stride &&
+               alpha.cols == input_stride &&
+               beta.cols == input_stride &&
+               proj.fp8_packed_second == &gate &&
+               proj.fp8_packed_rows == proj.rows + gate.rows &&
+               proj.rows == proj_count &&
+               gate.rows >= num_v_heads * head_v_dim &&
+               alpha.rows == num_v_heads &&
+               beta.rows == num_v_heads &&
+               proj_stride >= proj.rows &&
+               gate_stride >= gate.rows &&
+               alpha_stride >= alpha.rows &&
+               beta_stride >= beta.rows;
+#endif
+    }
+
+    DeviceStatus rms_norm_q8_0_matmul_attention_fanout(
+            DeviceTensor &normalized,
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            uint32_t fanout,
+            const DeviceTensor &x,
+            const DeviceWeight &norm_weight,
+            uint32_t batch,
+            uint32_t in_stride,
+            float eps) override {
+        for (uint32_t i = 0; i < fanout; ++i) {
+            as_tensor(*outs[i]).clear_lazy_fp8_linear();
+        }
+        const bool previous = lazy_attention_fanout_requested_;
+        lazy_attention_fanout_requested_ =
+            fp8_lazy_attention_fanout_enabled() && batch >= 64;
+        DeviceStatus status = rms_norm_q8_0_matmul_fanout(
+            normalized, outs, weights, out_strides, fanout,
+            x, norm_weight, batch, in_stride, eps);
+        lazy_attention_fanout_requested_ = previous;
+        if (!status.ok) {
+            for (uint32_t i = 0; i < fanout; ++i) {
+                as_tensor(*outs[i]).clear_lazy_fp8_linear();
+            }
+        }
+        return status;
+    }
+
     DeviceStatus q8_0_matmul_add(DeviceTensor &out,
                                  const DeviceTensor &residual,
                                  DeviceTensor &matmul_tmp,
@@ -5157,6 +9208,56 @@ public:
         const auto &r = as_tensor(residual);
         const auto &w = as_weight(weight);
         const auto &input = as_tensor(x);
+
+#ifdef QW3_ENABLE_NVFP4
+        if (w.type == WeightType::NVFP4_E2M1) {
+            const bool nvfp4_fast_path =
+                nvfp4_small_single_mmvq_enabled() &&
+                o.ptr == r.ptr &&
+                batch == 1 &&
+                in_stride == w.cols &&
+                out_stride >= w.rows &&
+                o.count >= static_cast<uint64_t>(batch) * out_stride;
+            if (!nvfp4_fast_path) {
+                return DeviceBackend::q8_0_matmul_add(
+                    out, residual, matmul_tmp, weight, x,
+                    batch, in_stride, out_stride);
+            }
+            if (auto st = quantize_nvfp4_activation(
+                    w, input.ptr, batch, in_stride); !st.ok) {
+                return st;
+            }
+            const bool launched = o.is_bf16()
+                ? nvfp4_adapter::launch_small_bf16(
+                      o.ptr_bf16(), x_fp4_workspace_, x_fp4_scales_,
+                      w.ptr, w.scale, w.global_scale,
+                      batch, static_cast<uint32_t>(w.rows),
+                      static_cast<uint32_t>(w.cols), out_stride,
+                      true, exec_stream_)
+                : nvfp4_adapter::launch_small_f32(
+                      o.ptr, x_fp4_workspace_, x_fp4_scales_,
+                      w.ptr, w.scale, w.global_scale,
+                      batch, static_cast<uint32_t>(w.rows),
+                      static_cast<uint32_t>(w.cols), out_stride,
+                      true, exec_stream_);
+            if (!launched) {
+                return {false, "NVFP4 fused matmul add launch failed"};
+            }
+            return launch_status("NVFP4 fused matmul add");
+        }
+#endif
+        if (w.type == WeightType::FP8_E4M3 &&
+            o.is_bf16() && r.is_bf16() && o.ptr == r.ptr &&
+            in_stride == w.cols && out_stride >= w.rows) {
+            return fp8_matmul_bf16(
+                o.ptr_bf16(), w, input.ptr, batch,
+                in_stride, out_stride, true);
+        }
+        if (w.type != WeightType::Q8_0) {
+            return DeviceBackend::q8_0_matmul_add(out, residual, matmul_tmp,
+                                                  weight, x, batch,
+                                                  in_stride, out_stride);
+        }
 
         const bool fast_path =
             o.ptr == r.ptr &&
@@ -5179,12 +9280,18 @@ public:
                                           in_stride, exec_stream_)) {
             return {false, "matmul_add quantize_q8_1 launch failed"};
         }
-        if (ported::launch_mmvq_q8_0_add(static_cast<const uint8_t *>(w.ptr),
-                                         q8_1_scratch_, o.ptr,
-                                         static_cast<uint32_t>(w.rows),
-                                         static_cast<uint32_t>(w.cols),
-                                         batch, out_stride,
-                                         exec_stream_)) {
+        const bool launched = o.is_bf16()
+            ? ported::launch_mmvq_q8_0_add_bf16(
+                  static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                  o.ptr_bf16(), static_cast<uint32_t>(w.rows),
+                  static_cast<uint32_t>(w.cols), batch, out_stride,
+                  exec_stream_)
+            : ported::launch_mmvq_q8_0_add(
+                  static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                  o.ptr, static_cast<uint32_t>(w.rows),
+                  static_cast<uint32_t>(w.cols), batch, out_stride,
+                  exec_stream_);
+        if (launched) {
             return launch_status("cuda q8_0_matmul_add small_batch_inplace");
         }
         return DeviceBackend::q8_0_matmul_add(out, residual, matmul_tmp,
@@ -5205,10 +9312,75 @@ public:
             const char *e = std::getenv("QW3_FUSE_ADD");
             return !(e && std::string(e) == "off");
         }();
+        const auto &w = as_weight(weight);
+#ifdef QW3_ENABLE_NVFP4
+        if (w.type == WeightType::NVFP4_E2M1) {
+            if (!fuse || !nvfp4_small_single_mmvq_enabled()) {
+                return DeviceBackend::q8_0_matvec_add(accum, weight, x);
+            }
+            auto &o = as_tensor(accum);
+            const auto &input = as_tensor(x);
+            if (auto st = quantize_nvfp4_activation(
+                    w, input.ptr, 1, static_cast<uint32_t>(w.cols)); !st.ok) {
+                return st;
+            }
+            const bool launched = o.is_bf16()
+                ? nvfp4_adapter::launch_small_bf16(
+                      o.ptr_bf16(), x_fp4_workspace_, x_fp4_scales_,
+                      w.ptr, w.scale, w.global_scale,
+                      1, static_cast<uint32_t>(w.rows),
+                      static_cast<uint32_t>(w.cols),
+                      static_cast<uint32_t>(w.rows),
+                      true, exec_stream_)
+                : nvfp4_adapter::launch_small_f32(
+                      o.ptr, x_fp4_workspace_, x_fp4_scales_,
+                      w.ptr, w.scale, w.global_scale,
+                      1, static_cast<uint32_t>(w.rows),
+                      static_cast<uint32_t>(w.cols),
+                      static_cast<uint32_t>(w.rows),
+                      true, exec_stream_);
+            if (!launched) {
+                return {false, "NVFP4 fused matvec add launch failed"};
+            }
+            return launch_status("NVFP4 fused matvec add");
+        }
+#endif
+        if (w.type == WeightType::FP8_E4M3 &&
+            fuse && fp8_small_cublaslt_enabled()) {
+            auto &o = as_tensor(accum);
+            const auto &input = as_tensor(x);
+            const uint32_t custom_max_cols =
+                fp8_matvec_add_custom_max_cols();
+            if (custom_max_cols > 0 && w.cols <= custom_max_cols) {
+                return o.is_bf16()
+                    ? fp8_matvec_bf16_direct(
+                          o.ptr_bf16(), w, input.ptr, true)
+                    : fp8_matvec_f32_direct(
+                          o.ptr, w, input.ptr, true);
+            }
+            if (auto st = fp8_quantize_activation(
+                    input.ptr, 1, static_cast<uint32_t>(w.cols),
+                    static_cast<uint32_t>(w.cols),
+                    static_cast<uint32_t>(w.rows)); !st.ok) {
+                return st;
+            }
+            if (o.is_bf16()) {
+                if (auto st = cublaslt_fp8_matmul(w, 1); !st.ok) {
+                    return st;
+                }
+                return fp8_scale_output_bf16(
+                    o.ptr_bf16(), w, 1,
+                    static_cast<uint32_t>(w.rows), true);
+            }
+            return fp8_matmul_quantized(
+                o.ptr, w, 1, static_cast<uint32_t>(w.rows), true);
+        }
+        if (w.type != WeightType::Q8_0) {
+            return {false, "fused matvec add is only available for Q8_0"};
+        }
         if (!fuse) {
             return DeviceBackend::q8_0_matvec_add(accum, weight, x);
         }
-        const auto &w = as_weight(weight);
         if (matvec_kernel_choice() != MatvecKernel::Ported || (w.cols % 32) != 0) {
             return DeviceBackend::q8_0_matvec_add(accum, weight, x);
         }
@@ -5221,13 +9393,20 @@ public:
                                           exec_stream_)) {
             return {false, "matvec_add quantize_q8_1 launch failed"};
         }
-        if (!ported::launch_mmvq_q8_0_add(static_cast<const uint8_t *>(w.ptr),
-                                          q8_1_scratch_, o.ptr,
-                                          static_cast<uint32_t>(w.rows),
-                                          static_cast<uint32_t>(w.cols),
-                                          /*batch=*/1,
-                                          /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
-                                          exec_stream_)) {
+        const bool launched = o.is_bf16()
+            ? ported::launch_mmvq_q8_0_add_bf16(
+                  static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                  o.ptr_bf16(), static_cast<uint32_t>(w.rows),
+                  static_cast<uint32_t>(w.cols), /*batch=*/1,
+                  /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                  exec_stream_)
+            : ported::launch_mmvq_q8_0_add(
+                  static_cast<const uint8_t *>(w.ptr), q8_1_scratch_,
+                  o.ptr, static_cast<uint32_t>(w.rows),
+                  static_cast<uint32_t>(w.cols), /*batch=*/1,
+                  /*stride_dst_row=*/static_cast<uint32_t>(w.rows),
+                  exec_stream_);
+        if (!launched) {
             return {false, "mmvq_q8_0_add launch failed"};
         }
         return launch_status("cuda q8_0_matvec_add");
@@ -5242,11 +9421,159 @@ public:
             const char *e = std::getenv("QW3_FUSE_SILU_MUL");
             return !(e && std::string(e) == "off");
         }();
+        const auto &wg = as_weight(weight_gate);
+        const auto &wu = as_weight(weight_up);
+#ifdef QW3_ENABLE_NVFP4
+        if (wg.type == WeightType::NVFP4_E2M1 &&
+            wu.type == WeightType::NVFP4_E2M1) {
+            if (!fuse || wg.rows != wu.rows || wg.cols != wu.cols ||
+                wg.input_scale_host != wu.input_scale_host) {
+                return DeviceBackend::q8_0_matvec_silu_mul(
+                    out, weight_gate, weight_up, x);
+            }
+            auto &o = as_tensor(out);
+            const auto &input = as_tensor(x);
+            const bool packed_cutlass_pair =
+                nvfp4_cutlass_pair_enabled() &&
+                wg.nvfp4_packed_second == &wu &&
+                wg.nvfp4_packed_rows == wg.rows + wu.rows &&
+                wg.global_scale_host == wu.global_scale_host;
+            if (packed_cutlass_pair) {
+                const uint32_t pair_rows =
+                    static_cast<uint32_t>(wg.rows + wu.rows);
+                if (auto st = ensure_nvfp4_activation_workspace(
+                        1, static_cast<uint32_t>(wg.cols)); !st.ok) {
+                    return st;
+                }
+                if (auto st = ensure_nvfp4_gemm_workspace(
+                        1, pair_rows, static_cast<uint32_t>(wg.cols)); !st.ok) {
+                    return st;
+                }
+                if (nvfp4_cutlass_bf16_output_enabled()) {
+                    if (auto st = ensure_mixed_bf16_output(pair_rows); !st.ok) {
+                        return st;
+                    }
+                    if (!nvfp4_adapter::launch_bf16(
+                            mixed_out_bf16_,
+                            x_fp4_workspace_, x_fp4_scales_,
+                            fp4_gemm_workspace_, fp4_gemm_workspace_capacity_,
+                            input.ptr, static_cast<uint32_t>(wg.cols),
+                            wg.ptr, wg.scale, wg.input_scale, wg.global_scale,
+                            1, pair_rows, static_cast<uint32_t>(wg.cols),
+                            exec_stream_)) {
+                        return {false, "NVFP4 packed-pair BF16 CUTLASS GEMM failed"};
+                    }
+                    const unsigned blocks =
+                        static_cast<unsigned>((wg.rows + 255) / 256);
+                    silu_mul_bf16_pair_kernel<<<
+                        blocks, 256, 0, exec_stream_>>>(
+                            o.ptr, mixed_out_bf16_, wg.rows);
+                } else {
+                    if (auto st = ensure_nvfp4_pair_output(pair_rows); !st.ok) {
+                        return st;
+                    }
+                    if (!nvfp4_adapter::launch(
+                            nvfp4_pair_out_f32_,
+                            x_fp4_workspace_, x_fp4_scales_,
+                            fp4_gemm_workspace_, fp4_gemm_workspace_capacity_,
+                            input.ptr, static_cast<uint32_t>(wg.cols),
+                            wg.ptr, wg.scale, wg.input_scale, wg.global_scale,
+                            1, pair_rows, static_cast<uint32_t>(wg.cols),
+                            exec_stream_)) {
+                        return {false, "NVFP4 packed-pair CUTLASS GEMM failed"};
+                    }
+                    const uint64_t threads_total = (wg.rows + 3) / 4;
+                    const unsigned blocks =
+                        static_cast<unsigned>((threads_total + 255) / 256);
+                    silu_mul_kernel<<<blocks, 256, 0, exec_stream_>>>(
+                        o.ptr, nvfp4_pair_out_f32_,
+                        nvfp4_pair_out_f32_ + wg.rows, wg.rows);
+                }
+                return launch_status("NVFP4 packed-pair CUTLASS SwiGLU");
+            }
+            if (!nvfp4_small_pair_mmvq_enabled()) {
+                return DeviceBackend::q8_0_matvec_silu_mul(
+                    out, weight_gate, weight_up, x);
+            }
+            if (auto st = quantize_nvfp4_activation(
+                    wg, input.ptr, 1,
+                    static_cast<uint32_t>(wg.cols)); !st.ok) {
+                return st;
+            }
+            if (!nvfp4_adapter::launch_small_pair_f32(
+                    o.ptr, nullptr,
+                    x_fp4_workspace_, x_fp4_scales_,
+                    wg.ptr, wg.scale, wg.global_scale,
+                    wu.ptr, wu.scale, wu.global_scale,
+                    1, static_cast<uint32_t>(wg.rows),
+                    static_cast<uint32_t>(wg.cols),
+                    static_cast<uint32_t>(wg.rows), 0,
+                    true, exec_stream_)) {
+                return {false, "NVFP4 fused SwiGLU launch failed"};
+            }
+            return launch_status("NVFP4 fused SwiGLU");
+        }
+#endif
+        if (wg.type == WeightType::FP8_E4M3 &&
+            wu.type == WeightType::FP8_E4M3 &&
+            fuse && fp8_small_cublaslt_enabled() &&
+            wg.rows == wu.rows && wg.cols == wu.cols) {
+            auto &o = as_tensor(out);
+            const auto &input = as_tensor(x);
+            const bool packed_pair =
+                wg.fp8_packed_second == &wu &&
+                wg.fp8_packed_rows == wg.rows + wu.rows;
+            if (auto st = fp8_quantize_activation(
+                    input.ptr, 1, static_cast<uint32_t>(wg.cols),
+                    static_cast<uint32_t>(wg.cols),
+                    static_cast<uint32_t>(
+                        packed_pair ? wg.rows + wu.rows : wg.rows));
+                !st.ok) {
+                return st;
+            }
+            if (packed_pair) {
+                if (auto st = cublaslt_fp8_matmul_view(
+                        fp8_out_f32_, wg.ptr, wg.scale,
+                        wg.rows + wu.rows, wg.cols,
+                        1, 0.0f, false); !st.ok) {
+                    return st;
+                }
+                const uint64_t count = wg.rows;
+                const unsigned threads = 256;
+                const unsigned blocks =
+                    static_cast<unsigned>((count + threads - 1) / threads);
+                fp8_outer_scale_pair_silu_mul_kernel<<<
+                    blocks, threads, 0, exec_stream_>>>(
+                    o.ptr, fp8_out_f32_, x_fp8_scales_,
+                    static_cast<const float *>(wg.scale),
+                    static_cast<const float *>(wu.scale),
+                    1, static_cast<uint32_t>(wg.rows),
+                    static_cast<uint32_t>(wg.rows));
+                return launch_status("FP8 packed-pair fused SwiGLU");
+            }
+            if (auto st = fp8_matmul_quantized(
+                    o.ptr, wg, 1, static_cast<uint32_t>(wg.rows)); !st.ok) {
+                return st;
+            }
+            if (auto st = cublaslt_fp8_matmul(wu, 1); !st.ok) return st;
+            const uint64_t count = wg.rows;
+            const unsigned threads = 256;
+            const unsigned blocks =
+                static_cast<unsigned>((count + threads - 1) / threads);
+            fp8_outer_scale_silu_mul_kernel<<<blocks, threads, 0, exec_stream_>>>(
+                o.ptr, fp8_out_f32_, x_fp8_scales_,
+                static_cast<const float *>(wu.scale), 1,
+                static_cast<uint32_t>(wg.rows),
+                static_cast<uint32_t>(wg.rows));
+            return launch_status("FP8 fused SwiGLU");
+        }
+        if (wg.type != WeightType::Q8_0 ||
+            wu.type != WeightType::Q8_0) {
+            return {false, "fused SwiGLU matvec is only available for Q8_0"};
+        }
         if (!fuse) {
             return DeviceBackend::q8_0_matvec_silu_mul(out, weight_gate, weight_up, x);
         }
-        const auto &wg = as_weight(weight_gate);
-        const auto &wu = as_weight(weight_up);
         if (wg.rows != wu.rows || wg.cols != wu.cols ||
             matvec_kernel_choice() != MatvecKernel::Ported || (wg.cols % 32) != 0) {
             return DeviceBackend::q8_0_matvec_silu_mul(out, weight_gate, weight_up, x);
@@ -5274,6 +9601,297 @@ public:
         return launch_status("cuda q8_0_matvec_silu_mul");
     }
 
+    DeviceStatus q8_0_matmul_silu_mul(DeviceTensor &out,
+                                      const DeviceWeight &weight_gate,
+                                      const DeviceWeight &weight_up,
+                                      const DeviceTensor &x,
+                                      uint32_t batch,
+                                      uint32_t in_stride,
+                                      uint32_t out_stride) override {
+        auto &o = as_tensor(out);
+        const auto &wg = as_weight(weight_gate);
+        const auto &wu = as_weight(weight_up);
+        const auto &input = as_tensor(x);
+        if (batch == 0) return {};
+#ifdef QW3_ENABLE_NVFP4
+        if (wg.type == WeightType::NVFP4_E2M1 &&
+            wu.type == WeightType::NVFP4_E2M1 &&
+            nvfp4_cutlass_pair_enabled() &&
+            wg.nvfp4_packed_second == &wu &&
+            wg.nvfp4_packed_rows == wg.rows + wu.rows &&
+            wg.rows == wu.rows && wg.cols == wu.cols &&
+            wg.input_scale_host == wu.input_scale_host &&
+            wg.global_scale_host == wu.global_scale_host &&
+            in_stride >= wg.cols && out_stride >= wg.rows) {
+            const uint32_t pair_rows =
+                static_cast<uint32_t>(wg.rows + wu.rows);
+            const uint32_t inner_cols = static_cast<uint32_t>(wg.cols);
+            if (auto st = ensure_nvfp4_activation_workspace(
+                    batch, inner_cols); !st.ok) {
+                return st;
+            }
+            if (auto st = ensure_nvfp4_gemm_workspace(
+                    batch, pair_rows, inner_cols); !st.ok) {
+                return st;
+            }
+            const uint64_t pair_count =
+                static_cast<uint64_t>(batch) * pair_rows;
+            if (auto st = ensure_nvfp4_pair_output(pair_count); !st.ok) {
+                return st;
+            }
+            if (!nvfp4_adapter::launch(
+                    nvfp4_pair_out_f32_,
+                    x_fp4_workspace_, x_fp4_scales_,
+                    fp4_gemm_workspace_, fp4_gemm_workspace_capacity_,
+                    input.ptr, in_stride,
+                    wg.ptr, wg.scale, wg.input_scale, wg.global_scale,
+                    batch, pair_rows, inner_cols, exec_stream_)) {
+                return {false, "NVFP4 packed-pair prefill GEMM failed"};
+            }
+            const uint64_t output_count =
+                static_cast<uint64_t>(batch) * wg.rows;
+            const unsigned threads = 256;
+            const unsigned blocks = static_cast<unsigned>(
+                (output_count + threads - 1) / threads);
+            silu_mul_f32_pair_batch_kernel<<<
+                blocks, threads, 0, exec_stream_>>>(
+                o.ptr, nvfp4_pair_out_f32_, batch,
+                static_cast<uint32_t>(wg.rows), out_stride);
+            return launch_status("NVFP4 packed-pair prefill SwiGLU");
+        }
+#endif
+        const bool fp8_packed_swiglu_enabled =
+            batch <= 8 ? fp8_small_cublaslt_enabled()
+                       : fp8_prefill_packed_swiglu_enabled();
+        if (!fp8_packed_swiglu_enabled ||
+            wg.type != WeightType::FP8_E4M3 ||
+            wu.type != WeightType::FP8_E4M3 ||
+            wg.fp8_packed_second != &wu ||
+            wg.fp8_packed_rows != wg.rows + wu.rows ||
+            wg.rows != wu.rows || wg.cols != wu.cols ||
+            in_stride < wg.cols || out_stride < wg.rows) {
+            return {
+                false,
+                "batched fused SwiGLU requires a packed FP8 gate/up pair"};
+        }
+        if (auto st = fp8_quantize_activation(
+                input.ptr, batch, static_cast<uint32_t>(wg.cols),
+                in_stride,
+                static_cast<uint32_t>(wg.rows + wu.rows)); !st.ok) {
+            return st;
+        }
+        if (auto st = cublaslt_fp8_matmul_view(
+                fp8_out_f32_, wg.ptr, wg.scale,
+                wg.rows + wu.rows, wg.cols,
+                batch, 0.0f, false); !st.ok) {
+            return st;
+        }
+        const uint64_t count = static_cast<uint64_t>(batch) * wg.rows;
+        const unsigned threads = 256;
+        const unsigned blocks =
+            static_cast<unsigned>((count + threads - 1) / threads);
+        fp8_outer_scale_pair_silu_mul_kernel<<<
+            blocks, threads, 0, exec_stream_>>>(
+            o.ptr, fp8_out_f32_, x_fp8_scales_,
+            static_cast<const float *>(wg.scale),
+            static_cast<const float *>(wu.scale),
+            batch, static_cast<uint32_t>(wg.rows), out_stride);
+        return launch_status("FP8 batched fused SwiGLU");
+    }
+
+    DeviceStatus nvfp4_ffn_prefill(DeviceTensor &out,
+                                   const DeviceWeight &weight_gate,
+                                   const DeviceWeight &weight_up,
+                                   const DeviceWeight &weight_down,
+                                   const DeviceWeight &norm_weight,
+                                   const DeviceTensor &x,
+                                   uint32_t batch,
+                                   uint32_t in_stride,
+                                   uint32_t ffn_stride,
+                                   uint32_t out_stride,
+                                   float norm_eps) override {
+#ifndef QW3_ENABLE_NVFP4
+        (void)out; (void)weight_gate; (void)weight_up; (void)weight_down;
+        (void)norm_weight; (void)x; (void)batch; (void)in_stride;
+        (void)ffn_stride; (void)out_stride; (void)norm_eps;
+        return {false, "NVFP4 fused prefill FFN requires an NVFP4 build"};
+#else
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_NVFP4_FUSED_FFN_PREFILL");
+            return !value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        static const uint32_t min_batch = []() {
+            const char *value =
+                std::getenv("QW3_NVFP4_FUSED_FFN_MIN_BATCH");
+            if (!value || !*value) return 128U;
+            const unsigned long parsed = std::strtoul(value, nullptr, 10);
+            return parsed > 0 && parsed <= UINT32_MAX
+                       ? static_cast<uint32_t>(parsed)
+                       : 128U;
+        }();
+        if (!enabled || batch < min_batch) {
+            return {false, "NVFP4 fused prefill FFN disabled for this batch"};
+        }
+
+        auto &o = as_tensor(out);
+        const auto &input = as_tensor(x);
+        const auto &wg = as_weight(weight_gate);
+        const auto &wu = as_weight(weight_up);
+        const auto &wd = as_weight(weight_down);
+        const auto &wn = as_weight(norm_weight);
+        if (wg.type != WeightType::NVFP4_E2M1 ||
+            wu.type != WeightType::NVFP4_E2M1 ||
+            wd.type != WeightType::NVFP4_E2M1 ||
+            wn.type != WeightType::F32 ||
+            !nvfp4_cutlass_pair_enabled() ||
+            wg.nvfp4_packed_second != &wu ||
+            wg.nvfp4_packed_rows != wg.rows + wu.rows ||
+            wg.rows != wu.rows || wg.cols != wu.cols ||
+            wd.cols != wg.rows ||
+            wg.input_scale_host != wu.input_scale_host ||
+            wg.global_scale_host != wu.global_scale_host ||
+            !wd.scale || !wd.input_scale || !wd.global_scale ||
+            !wn.ptr || wn.rows * wn.cols < wg.cols ||
+            in_stride != wg.cols || ffn_stride != wg.rows ||
+            out_stride != wd.rows) {
+            return {false, "NVFP4 fused prefill FFN shape or format mismatch"};
+        }
+
+        const uint32_t hidden = static_cast<uint32_t>(wg.cols);
+        const uint32_t ffn = static_cast<uint32_t>(wg.rows);
+        const uint32_t pair_rows = 2U * ffn;
+        const uint32_t down_rows = static_cast<uint32_t>(wd.rows);
+
+        // Allocate all potentially growing workspaces before the first GEMM.
+        // Growing one after launch would make cudaFree synchronize the stream
+        // during the first layer.
+        if (auto st = ensure_nvfp4_activation_workspace(
+                batch, std::max(hidden, ffn)); !st.ok) {
+            return st;
+        }
+        if (auto st = ensure_nvfp4_gemm_workspace(
+                batch, pair_rows, hidden); !st.ok) {
+            return st;
+        }
+        if (auto st = ensure_nvfp4_gemm_workspace(
+                batch, down_rows, ffn); !st.ok) {
+            return st;
+        }
+        const uint64_t pair_count =
+            static_cast<uint64_t>(batch) * pair_rows;
+        if (auto st = ensure_mixed_bf16_output(pair_count); !st.ok) {
+            return st;
+        }
+
+        bool rms_quantized = false;
+#ifdef QW3_ENABLE_RMS_FP4_SM120_AOT
+        bool flashinfer_rms_attempted = false;
+        static const bool flashinfer_rms_enabled = []() {
+            const char *value =
+                std::getenv("QW3_NVFP4_FLASHINFER_RMS_QUANT");
+            return !value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        static const uint32_t flashinfer_rms_min_batch = []() {
+            const char *value =
+                std::getenv("QW3_NVFP4_FLASHINFER_RMS_MIN_BATCH");
+            if (!value || !*value) return 256U;
+            const unsigned long parsed = std::strtoul(value, nullptr, 10);
+            return parsed > 0 && parsed <= UINT32_MAX
+                       ? static_cast<uint32_t>(parsed)
+                       : 256U;
+        }();
+        if (flashinfer_rms_enabled && input.is_bf16() &&
+            batch >= flashinfer_rms_min_batch && hidden == 5120 &&
+            wn.f32_bf16_cache) {
+            flashinfer_rms_attempted = true;
+            rms_quantized = rms_fp4_sm120_aot::launch(
+                x_fp4_workspace_,
+                x_fp4_scales_,
+                input.ptr_bf16(),
+                wn.f32_bf16_cache,
+                wg.input_scale,
+                batch,
+                hidden,
+                norm_eps,
+                exec_stream_);
+        }
+        static const bool flashinfer_rms_trace = []() {
+            const char *value =
+                std::getenv("QW3_NVFP4_FLASHINFER_RMS_TRACE");
+            return value && *value && std::strcmp(value, "0") != 0;
+        }();
+        static bool flashinfer_rms_trace_emitted = false;
+        if (flashinfer_rms_trace && !flashinfer_rms_trace_emitted &&
+            batch >= flashinfer_rms_min_batch) {
+            std::fprintf(
+                stderr,
+                "[nvfp4] RMSNorm+quant route: batch=%u hidden=%u "
+                "input_bf16=%d norm_bf16=%d attempted=%d selected=%s\n",
+                batch,
+                hidden,
+                input.is_bf16() ? 1 : 0,
+                wn.f32_bf16_cache ? 1 : 0,
+                flashinfer_rms_attempted ? 1 : 0,
+                rms_quantized ? "flashinfer-aot" : "legacy");
+            flashinfer_rms_trace_emitted = true;
+        }
+#endif
+        if (!rms_quantized) {
+            rms_quantized = input.is_bf16()
+                ? nvfp4_adapter::quantize_rms_norm_activation_bf16(
+                      x_fp4_workspace_, x_fp4_scales_, input.ptr_bf16(),
+                      static_cast<const float *>(wn.ptr), wg.input_scale,
+                      batch, hidden, norm_eps,
+                      /*clear_padded_scales=*/false, exec_stream_)
+                : nvfp4_adapter::quantize_rms_norm_activation(
+                      x_fp4_workspace_, x_fp4_scales_, input.ptr,
+                      static_cast<const float *>(wn.ptr), wg.input_scale,
+                      batch, hidden, norm_eps,
+                      /*clear_padded_scales=*/false, exec_stream_);
+        }
+        if (!rms_quantized) {
+            return {false, "NVFP4 fused prefill RMSNorm quantization failed"};
+        }
+        if (!nvfp4_adapter::launch_prequantized_bf16(
+                mixed_out_bf16_,
+                fp4_gemm_workspace_, fp4_gemm_workspace_capacity_,
+                x_fp4_workspace_, x_fp4_scales_,
+                wg.ptr, wg.scale, wg.global_scale,
+                batch, pair_rows, hidden, exec_stream_)) {
+            return {false, "NVFP4 fused prefill gate/up GEMM failed"};
+        }
+
+        if (!nvfp4_adapter::quantize_silu_mul_bf16_pair(
+                x_fp4_workspace_, x_fp4_scales_, mixed_out_bf16_,
+                wd.input_scale, batch, ffn,
+                /*clear_padded_scales=*/false, exec_stream_)) {
+            return {false, "NVFP4 fused prefill SwiGLU quantization failed"};
+        }
+
+        const bool down_launched = o.is_bf16()
+            ? nvfp4_adapter::launch_prequantized_bf16(
+                  o.ptr_bf16(), fp4_gemm_workspace_,
+                  fp4_gemm_workspace_capacity_,
+                  x_fp4_workspace_, x_fp4_scales_, wd.ptr, wd.scale,
+                  wd.global_scale, batch, down_rows, ffn, exec_stream_)
+            : nvfp4_adapter::launch_prequantized(
+                  o.ptr, fp4_gemm_workspace_,
+                  fp4_gemm_workspace_capacity_,
+                  x_fp4_workspace_, x_fp4_scales_, wd.ptr, wd.scale,
+                  wd.global_scale, batch, down_rows, ffn, exec_stream_);
+        if (!down_launched) {
+            return {false, "NVFP4 fused prefill down GEMM failed"};
+        }
+        return launch_status("NVFP4 fused prefill FFN");
+#endif
+    }
+
     DeviceStatus q8_0_matmul(DeviceTensor &out,
                              const DeviceWeight &weight,
                              const DeviceTensor &x,
@@ -5284,6 +9902,42 @@ public:
         auto &o = as_tensor(out);
         const auto &input = as_tensor(x);
         if (batch == 0) return {};
+        if (w.type == WeightType::BF16) {
+            return bf16_matmul(o.ptr, w, input.ptr, batch, in_stride, out_stride);
+        }
+        if (w.type == WeightType::FP8_E4M3) {
+            if (o.is_bf16()) {
+                return fp8_matmul_bf16(
+                    o.ptr_bf16(), w, input.ptr, batch,
+                    in_stride, out_stride);
+            }
+            return fp8_matmul(o.ptr, w, input.ptr, batch, in_stride, out_stride);
+        }
+        if (w.type == WeightType::NVFP4_E2M1) {
+            if (o.is_bf16()) {
+                return nvfp4_matmul_bf16(
+                    o.ptr_bf16(), w, input.ptr, batch,
+                    in_stride, out_stride);
+            }
+            return nvfp4_matmul(
+                o.ptr, w, input.ptr, batch, in_stride, out_stride);
+        }
+        if (w.type != WeightType::Q8_0) {
+            return {false, "mixed-precision linear kernel is not initialized"};
+        }
+        const uint64_t q8_out_count =
+            static_cast<uint64_t>(batch) * out_stride;
+        float *q8_out = o.ptr;
+        if (o.is_bf16()) {
+            if (auto st = ensure_q8_output_workspace(q8_out_count); !st.ok) {
+                return st;
+            }
+            q8_out = q8_out_f32_;
+        }
+        auto finish_q8 = [&](DeviceStatus st) {
+            if (!st.ok || !o.is_bf16()) return st;
+            return convert_q8_output_bf16(o.ptr_bf16(), q8_out_count);
+        };
         // For prefill batches the dp4a matvec stops being bandwidth-bound and
         // tensor-core MMA wins by 10x+. batch < mma_min_batch() (default 8)
         // falls through to dispatch_q8_matvec: batch==1 is the dp4a decode
@@ -5301,21 +9955,1682 @@ public:
                 (mk == MatmulKernel::Mmq) ||
                 (mk == MatmulKernel::Auto && matmul_auto_use_mmq(batch));
             if (try_mmq && (w.cols % 32) == 0) {
-                if (auto st = mmq_q8(o.ptr, w, input.ptr, batch); st.ok) return st;
+                if (auto st = mmq_q8(q8_out, w, input.ptr, batch); st.ok) {
+                    return finish_q8(st);
+                }
             }
             if (!hgemm_disabled()) {
-                DeviceStatus st = hgemm_q8(o.ptr, w, input.ptr, batch);
-                if (st.ok) return st;
+                DeviceStatus st = hgemm_q8(q8_out, w, input.ptr, batch);
+                if (st.ok) return finish_q8(st);
             }
             // Fall through to dp4a when HGEMM is disabled or errors (e.g.
             // OOM allocating cache). Continuous batching sets
             // QW3_DISABLE_HGEMM=1 so the batched path never silently routes
             // through cuBLAS HGEMM.
         }
-        return dispatch_q8_matvec(o.ptr, w, input.ptr, batch, in_stride, out_stride);
+        return finish_q8(dispatch_q8_matvec(
+            q8_out, w, input.ptr, batch, in_stride, out_stride));
     }
 
 private:
+#ifdef QW3_ENABLE_GDN_SM120_AOT
+    DeviceStatus ensure_gdn_sm120_workspace(
+            uint32_t batch,
+            uint32_t num_k_heads,
+            uint32_t num_v_heads,
+            uint32_t head_dim) {
+        const uint64_t k_width =
+            static_cast<uint64_t>(num_k_heads) * head_dim;
+        const uint64_t v_width =
+            static_cast<uint64_t>(num_v_heads) * head_dim;
+        const uint64_t bf16_elems =
+            static_cast<uint64_t>(batch) * (2u * k_width + 2u * v_width);
+        if (gdn_sm120_bf16_capacity_ < bf16_elems) {
+            if (gdn_sm120_bf16_) cudaFree(gdn_sm120_bf16_);
+            gdn_sm120_bf16_ = nullptr;
+            gdn_sm120_bf16_capacity_ = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(
+                        &gdn_sm120_bf16_,
+                        static_cast<size_t>(bf16_elems) *
+                            sizeof(__nv_bfloat16)),
+                    "SM120 GDN BF16 workspace alloc"); !st.ok) {
+                return st;
+            }
+            gdn_sm120_bf16_capacity_ = bf16_elems;
+        }
+
+        const uint64_t state_elems =
+            static_cast<uint64_t>(num_v_heads) * head_dim * head_dim;
+        if (gdn_sm120_initial_state_capacity_ < state_elems) {
+            if (gdn_sm120_initial_state_) cudaFree(gdn_sm120_initial_state_);
+            gdn_sm120_initial_state_ = nullptr;
+            gdn_sm120_initial_state_capacity_ = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(
+                        &gdn_sm120_initial_state_,
+                        static_cast<size_t>(state_elems) * sizeof(float)),
+                    "SM120 GDN initial-state workspace alloc"); !st.ok) {
+                return st;
+            }
+            gdn_sm120_initial_state_capacity_ = state_elems;
+        }
+
+        if (!gdn_sm120_cu_seqlens_) {
+            if (auto st = cuda_status(
+                    cudaMalloc(&gdn_sm120_cu_seqlens_, 2 * sizeof(int64_t)),
+                    "SM120 GDN cu_seqlens alloc"); !st.ok) {
+                return st;
+            }
+        }
+
+        int device = 0;
+        int sm_count = 0;
+        if (auto st = cuda_status(cudaGetDevice(&device),
+                                  "SM120 GDN get device"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaDeviceGetAttribute(
+                    &sm_count, cudaDevAttrMultiProcessorCount, device),
+                "SM120 GDN get SM count"); !st.ok) {
+            return st;
+        }
+        const uint32_t tensormaps_bytes =
+            static_cast<uint32_t>(sm_count) * 128u;
+        if (gdn_sm120_tensormaps_capacity_ < tensormaps_bytes) {
+            if (gdn_sm120_tensormaps_) cudaFree(gdn_sm120_tensormaps_);
+            gdn_sm120_tensormaps_ = nullptr;
+            gdn_sm120_tensormaps_capacity_ = 0;
+            if (auto st = cuda_status(
+                    cudaMalloc(&gdn_sm120_tensormaps_, tensormaps_bytes),
+                    "SM120 GDN tensormaps alloc"); !st.ok) {
+                return st;
+            }
+            gdn_sm120_tensormaps_capacity_ = tensormaps_bytes;
+        }
+        return {};
+    }
+#endif
+
+    DeviceStatus ensure_bf16_activation_workspace(uint64_t x_elems) {
+        if (x_bf16_capacity_ >= x_elems) return {};
+        if (x_bf16_workspace_) cudaFree(x_bf16_workspace_);
+        if (auto st = cuda_status(cudaMalloc(
+                &x_bf16_workspace_,
+                static_cast<size_t>(x_elems) *
+                    sizeof(__nv_bfloat16)),
+                "bf16 x workspace alloc"); !st.ok) {
+            x_bf16_workspace_ = nullptr;
+            x_bf16_capacity_ = 0;
+            return st;
+        }
+        x_bf16_capacity_ = x_elems;
+        return {};
+    }
+
+    DeviceStatus bf16_convert_activation(const float *x_ptr,
+                                         uint32_t batch,
+                                         uint32_t in_stride) {
+        const uint64_t x_elems = static_cast<uint64_t>(batch) * in_stride;
+        if (auto st = ensure_bf16_activation_workspace(x_elems);
+            !st.ok) return st;
+        const unsigned threads = 256;
+        const unsigned blocks = static_cast<unsigned>((x_elems + threads - 1) / threads);
+        fp32_to_bf16_kernel<<<blocks, threads, 0, exec_stream_>>>(
+            x_bf16_workspace_, x_ptr, x_elems);
+        return launch_status("bf16 x conversion");
+    }
+
+    DeviceStatus bf16_matmul_converted(float *out_ptr,
+                                       const CudaWeight &w,
+                                       uint32_t batch,
+                                       uint32_t in_stride,
+                                       uint32_t out_stride) {
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        return cublas_status(
+            cublasGemmEx(cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+                         static_cast<int>(w.rows), static_cast<int>(batch),
+                         static_cast<int>(w.cols), &alpha,
+                         w.ptr, CUDA_R_16BF, static_cast<int>(w.cols),
+                         x_bf16_workspace_, CUDA_R_16BF, static_cast<int>(in_stride),
+                         &beta, out_ptr, CUDA_R_32F, static_cast<int>(out_stride),
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            "cublasGemmEx bf16 linear");
+    }
+
+    DeviceStatus bf16_matmul(float *out_ptr,
+                             const CudaWeight &w,
+                             const float *x_ptr,
+                             uint32_t batch,
+                             uint32_t in_stride,
+                             uint32_t out_stride) {
+        if (batch == 0) return {};
+        if (in_stride < w.cols || out_stride < w.rows) {
+            return {false, "BF16 matmul stride is smaller than matrix dimensions"};
+        }
+        if (auto st = bf16_convert_activation(
+                x_ptr, batch, in_stride); !st.ok) {
+            return st;
+        }
+        return bf16_matmul_converted(
+            out_ptr, w, batch, in_stride, out_stride);
+    }
+
+    DeviceStatus ensure_fp8_linear_workspace(uint32_t batch,
+                                             uint32_t cols,
+                                             uint32_t rows) {
+        const uint64_t x_count = static_cast<uint64_t>(batch) * cols;
+        if (x_fp8_capacity_ < x_count) {
+            if (x_fp8_workspace_) cudaFree(x_fp8_workspace_);
+            if (auto st = cuda_status(cudaMalloc(&x_fp8_workspace_,
+                                                 static_cast<size_t>(x_count)),
+                                      "fp8 activation workspace alloc"); !st.ok) {
+                x_fp8_workspace_ = nullptr;
+                x_fp8_capacity_ = 0;
+                return st;
+            }
+            x_fp8_capacity_ = x_count;
+        }
+        if (x_fp8_scale_capacity_ < batch) {
+            if (x_fp8_scales_) cudaFree(x_fp8_scales_);
+            if (auto st = cuda_status(cudaMalloc(&x_fp8_scales_,
+                                                 static_cast<size_t>(batch) * sizeof(float)),
+                                      "fp8 activation scales alloc"); !st.ok) {
+                x_fp8_scales_ = nullptr;
+                x_fp8_scale_capacity_ = 0;
+                return st;
+            }
+            x_fp8_scale_capacity_ = batch;
+        }
+        const uint64_t out_count = static_cast<uint64_t>(batch) * rows;
+        if (shared_linear_output_workspace_enabled()) {
+            if (fp8_out_f32_capacity_ < out_count) {
+                if (auto st = ensure_shared_linear_output_workspace(
+                        static_cast<size_t>(out_count) * sizeof(float));
+                    !st.ok) {
+                    return st;
+                }
+                fp8_out_f32_capacity_ = out_count;
+            }
+        } else if (fp8_out_f32_capacity_ < out_count) {
+            if (fp8_out_f32_) cudaFree(fp8_out_f32_);
+            if (auto st = cuda_status(cudaMalloc(&fp8_out_f32_,
+                                                 static_cast<size_t>(out_count) * sizeof(float)),
+                                      "FP8 FP32 output alloc"); !st.ok) {
+                fp8_out_f32_ = nullptr;
+                fp8_out_f32_capacity_ = 0;
+                return st;
+            }
+            fp8_out_f32_capacity_ = out_count;
+        }
+        if (!shared_linear_output_workspace_enabled()) {
+            return ensure_mixed_bf16_output(out_count);
+        }
+        return {};
+    }
+
+    DeviceStatus ensure_cublaslt_fp8() {
+        if (!cublaslt_handle_) {
+            if (auto st = cublas_status(cublasLtCreate(&cublaslt_handle_),
+                                        "cublasLtCreate"); !st.ok) {
+                return st;
+            }
+        }
+        constexpr size_t kWorkspaceBytes = 32ULL * 1024ULL * 1024ULL;
+        if (!cublaslt_workspace_) {
+            if (auto st = cuda_status(cudaMalloc(&cublaslt_workspace_, kWorkspaceBytes),
+                                      "cuBLASLt FP8 workspace alloc"); !st.ok) {
+                return st;
+            }
+            cublaslt_workspace_bytes_ = kWorkspaceBytes;
+        }
+        return {};
+    }
+
+    DeviceStatus fp8_lt_plan(uint64_t rows,
+                             uint64_t cols,
+                             uint32_t batch,
+                             bool outer_scale,
+                             cudaDataType_t output_type,
+                             Fp8LtPlan *&out_plan) {
+        if (auto st = ensure_cublaslt_fp8(); !st.ok) return st;
+        for (const auto &plan : fp8_lt_plans_) {
+            if (plan->rows == rows &&
+                plan->cols == cols &&
+                plan->batch == batch &&
+                plan->outer_scale == outer_scale &&
+                plan->output_type == output_type) {
+                out_plan = plan.get();
+                return {};
+            }
+        }
+
+        auto plan = std::make_unique<Fp8LtPlan>();
+        plan->rows = rows;
+        plan->cols = cols;
+        plan->batch = batch;
+        plan->outer_scale = outer_scale;
+        plan->output_type = output_type;
+        cublasLtMatmulPreference_t preference = nullptr;
+        DeviceStatus result{};
+
+        auto check = [&](cublasStatus_t status, const char *label) {
+            if (status == CUBLAS_STATUS_SUCCESS) return true;
+            result = cublas_status(status, label);
+            return false;
+        };
+
+        do {
+            if (!check(cublasLtMatmulDescCreate(
+                           &plan->operation, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+                       "cublasLtMatmulDescCreate FP8")) break;
+
+            const cublasOperation_t trans_a = CUBLAS_OP_T;
+            const cublasOperation_t trans_b = CUBLAS_OP_N;
+            if (!check(cublasLtMatmulDescSetAttribute(
+                           plan->operation, CUBLASLT_MATMUL_DESC_TRANSA,
+                           &trans_a, sizeof(trans_a)),
+                       "cuBLASLt FP8 transA")) break;
+            if (!check(cublasLtMatmulDescSetAttribute(
+                           plan->operation, CUBLASLT_MATMUL_DESC_TRANSB,
+                           &trans_b, sizeof(trans_b)),
+                       "cuBLASLt FP8 transB")) break;
+            if (outer_scale) {
+                const int32_t scale_mode =
+                    CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+                if (!check(cublasLtMatmulDescSetAttribute(
+                               plan->operation,
+                               CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                               &scale_mode, sizeof(scale_mode)),
+                           "cuBLASLt FP8 A outer scale mode")) break;
+                if (!check(cublasLtMatmulDescSetAttribute(
+                               plan->operation,
+                               CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                               &scale_mode, sizeof(scale_mode)),
+                           "cuBLASLt FP8 B outer scale mode")) break;
+            }
+
+            // The buffers are row-major [N,K] and [batch,K]. Viewing them as
+            // column-major [K,N] and [K,batch] gives the Blackwell-required
+            // TN operation without transposing or repacking either operand.
+            if (!check(cublasLtMatrixLayoutCreate(
+                           &plan->weight_layout, CUDA_R_8F_E4M3,
+                           cols, rows, static_cast<int64_t>(cols)),
+                       "cuBLASLt FP8 A layout")) break;
+            if (!check(cublasLtMatrixLayoutCreate(
+                           &plan->input_layout, CUDA_R_8F_E4M3,
+                           cols, batch, static_cast<int64_t>(cols)),
+                       "cuBLASLt FP8 B layout")) break;
+            if (!check(cublasLtMatrixLayoutCreate(
+                           &plan->output_layout, output_type,
+                           rows, batch, static_cast<int64_t>(rows)),
+                       "cuBLASLt FP8 output layout")) break;
+            if (!check(cublasLtMatmulPreferenceCreate(&preference),
+                       "cublasLtMatmulPreferenceCreate FP8")) break;
+            if (!check(cublasLtMatmulPreferenceSetAttribute(
+                           preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                           &cublaslt_workspace_bytes_,
+                           sizeof(cublaslt_workspace_bytes_)),
+                       "cuBLASLt FP8 workspace preference")) break;
+
+            cublasLtMatmulHeuristicResult_t heuristic{};
+            int algorithm_count = 0;
+            if (!check(cublasLtMatmulAlgoGetHeuristic(
+                           cublaslt_handle_, plan->operation,
+                           plan->weight_layout, plan->input_layout,
+                           plan->output_layout, plan->output_layout,
+                           preference, 1, &heuristic, &algorithm_count),
+                       "cuBLASLt FP8 heuristic")) break;
+            if (algorithm_count == 0 ||
+                heuristic.state != CUBLAS_STATUS_SUCCESS) {
+                result = {false, "cuBLASLt found no TN FP8 algorithm"};
+                break;
+            }
+            plan->algorithm = heuristic.algo;
+        } while (false);
+
+        if (preference) cublasLtMatmulPreferenceDestroy(preference);
+        if (!result.ok) return result;
+        out_plan = plan.get();
+        fp8_lt_plans_.push_back(std::move(plan));
+        return {};
+    }
+
+    DeviceStatus cublaslt_fp8_matmul(float *out_ptr,
+                                     const CudaWeight &w,
+                                     uint32_t batch,
+                                     float beta,
+                                     bool outer_scale) {
+        return cublaslt_fp8_matmul_view(
+            out_ptr, w.ptr, w.scale, w.rows, w.cols,
+            batch, beta, outer_scale);
+    }
+
+    DeviceStatus cublaslt_fp8_matmul_view(void *out_ptr,
+                                          const void *weight_ptr,
+                                          const void *weight_scale,
+                                          uint64_t rows,
+                                          uint64_t cols,
+                                          uint32_t batch,
+                                          float beta,
+                                          bool outer_scale,
+                                          cudaDataType_t output_type =
+                                              CUDA_R_32F) {
+        Fp8LtPlan *plan = nullptr;
+        if (auto st = fp8_lt_plan(
+                rows, cols, batch, outer_scale, output_type, plan); !st.ok) {
+            return st;
+        }
+        if (outer_scale) {
+            const void *activation_scale = x_fp8_scales_;
+            if (auto st = cublas_status(
+                    cublasLtMatmulDescSetAttribute(
+                        plan->operation, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                        &weight_scale, sizeof(weight_scale)),
+                    "cuBLASLt FP8 A outer scale pointer"); !st.ok) {
+                return st;
+            }
+            if (auto st = cublas_status(
+                    cublasLtMatmulDescSetAttribute(
+                        plan->operation, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                        &activation_scale, sizeof(activation_scale)),
+                    "cuBLASLt FP8 B outer scale pointer"); !st.ok) {
+                return st;
+            }
+        }
+        const float alpha = 1.0f;
+        return cublas_status(
+            cublasLtMatmul(
+                cublaslt_handle_, plan->operation,
+                &alpha, weight_ptr, plan->weight_layout,
+                x_fp8_workspace_, plan->input_layout,
+                &beta, out_ptr, plan->output_layout,
+                out_ptr, plan->output_layout,
+                &plan->algorithm,
+                cublaslt_workspace_, cublaslt_workspace_bytes_,
+                exec_stream_),
+            "cuBLASLt TN FP8 matmul");
+    }
+
+    DeviceStatus cublaslt_fp8_matmul(const CudaWeight &w,
+                                     uint32_t batch) {
+        return cublaslt_fp8_matmul(
+            fp8_out_f32_, w, batch, 0.0f, false);
+    }
+
+    static bool fp8_small_cublaslt_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_SMALL_CUBLASLT");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_prefill_packed_swiglu_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_FP8_PREFILL_PACKED_SWIGLU");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool gdn_sm120_fused_io_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_GDN_SM120_FUSED_IO");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_lazy_recurrent_pair_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_FP8_LAZY_RECURRENT_PAIR");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_lazy_attention_fanout_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_FP8_LAZY_ATTENTION_FANOUT");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_cublaslt_outer_scale_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_CUBLASLT_OUTER_SCALE");
+            return value &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "off") != 0 &&
+                   std::strcmp(value, "false") != 0;
+        }();
+        return enabled;
+    }
+
+    static bool fp8_bf16_epilogue_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_BF16_EPILOGUE");
+            return value &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "off") != 0 &&
+                   std::strcmp(value, "false") != 0;
+        }();
+        return enabled;
+    }
+
+    static bool fp8_cutlass_bf16_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_CUTLASS_BF16");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_cutlass_f32_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_CUTLASS_F32");
+            return value &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "off") != 0 &&
+                   std::strcmp(value, "false") != 0;
+        }();
+        return enabled;
+    }
+
+    static bool fp8_fused_rms_quant_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_FUSED_RMS_QUANT");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static uint32_t fp8_fused_rms_threads() {
+        static const uint32_t threads = []() {
+            const char *value =
+                std::getenv("QW3_FP8_FUSED_RMS_THREADS");
+            if (!value || *value == '\0') return 512U;
+            const uint32_t parsed =
+                static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+            return parsed == 256 || parsed == 1024 ? parsed : 512U;
+        }();
+        return threads;
+    }
+
+    static bool fp8_mixed_fanout_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_MIXED_FANOUT");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_fanout_scale_fusion_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_FP8_FANOUT_SCALE_FUSION");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static uint32_t fp8_fanout_custom_max_rows() {
+        static const uint32_t threshold = []() {
+            const char *value =
+                std::getenv("QW3_FP8_FANOUT_CUSTOM_MAX_ROWS");
+            if (!value || *value == '\0') return 2048U;
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0') return 2048U;
+            return static_cast<uint32_t>(std::min<unsigned long>(
+                parsed, std::numeric_limits<uint32_t>::max()));
+        }();
+        return threshold;
+    }
+
+    static uint32_t fp8_matvec_add_custom_max_cols() {
+        static const uint32_t threshold = []() {
+            const char *value =
+                std::getenv("QW3_FP8_MATVEC_ADD_CUSTOM_MAX_COLS");
+            if (!value || *value == '\0') return 8192U;
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0') return 8192U;
+            return static_cast<uint32_t>(std::min<unsigned long>(
+                parsed, std::numeric_limits<uint32_t>::max()));
+        }();
+        return threshold;
+    }
+
+    static uint32_t bf16_small_pair_max_rows() {
+        static const uint32_t threshold = []() {
+            const char *value =
+                std::getenv("QW3_BF16_SMALL_PAIR_MAX_ROWS");
+            if (!value || *value == '\0') return 128U;
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0') return 128U;
+            return static_cast<uint32_t>(std::min<unsigned long>(
+                parsed, std::numeric_limits<uint32_t>::max()));
+        }();
+        return threshold;
+    }
+
+    static bool fp8_direct_vec2_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_DIRECT_VEC2");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_direct_pair_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_DIRECT_PAIR");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_attention_q_direct_enabled() {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FP8_ATTN_Q_DIRECT");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static bool fp8_fused_bf16_quant_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_FP8_FUSED_BF16_QUANT");
+            return !(value &&
+                     (std::strcmp(value, "0") == 0 ||
+                      std::strcmp(value, "off") == 0 ||
+                      std::strcmp(value, "false") == 0));
+        }();
+        return enabled;
+    }
+
+    static uint32_t fp8_attention_q_direct_max_rows() {
+        static const uint32_t threshold = []() {
+            const char *value =
+                std::getenv("QW3_FP8_ATTN_Q_DIRECT_MAX_ROWS");
+            if (!value || *value == '\0') return 16384U;
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0') return 16384U;
+            return static_cast<uint32_t>(std::min<unsigned long>(
+                parsed, std::numeric_limits<uint32_t>::max()));
+        }();
+        return threshold;
+    }
+
+    static uint32_t fp8_attention_q_direct_threads() {
+        static const uint32_t threads = []() {
+            const char *value =
+                std::getenv("QW3_FP8_ATTN_Q_DIRECT_THREADS");
+            if (!value || *value == '\0') return 128U;
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' ||
+                (parsed != 128 && parsed != 256 && parsed != 512)) {
+                return 128U;
+            }
+            return static_cast<uint32_t>(parsed);
+        }();
+        return threads;
+    }
+
+    static uint32_t fp8_direct_threads() {
+        static const uint32_t threads = []() {
+            const char *value = std::getenv("QW3_FP8_DIRECT_THREADS");
+            if (!value || *value == '\0') return 256U;
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' ||
+                (parsed != 128 && parsed != 256 && parsed != 512)) {
+                return 256U;
+            }
+            return static_cast<uint32_t>(parsed);
+        }();
+        return threads;
+    }
+
+    static uint32_t fp8_direct_pair_threads() {
+        static const uint32_t threads = []() {
+            const char *value =
+                std::getenv("QW3_FP8_DIRECT_PAIR_THREADS");
+            if (!value || *value == '\0') return 256U;
+            char *end = nullptr;
+            const unsigned long parsed = std::strtoul(value, &end, 10);
+            if (end == value || *end != '\0' ||
+                (parsed != 128 && parsed != 256 && parsed != 512)) {
+                return 256U;
+            }
+            return static_cast<uint32_t>(parsed);
+        }();
+        return threads;
+    }
+
+    DeviceStatus fp8_matvec_f32_direct(float *out_ptr,
+                                       const CudaWeight &w,
+                                       const float *x_ptr,
+                                       bool add,
+                                       uint32_t threads_override = 0) {
+        const dim3 grid(static_cast<uint32_t>(w.rows), 1);
+        if (fp8_direct_vec2_enabled() && w.rows >= 4096 &&
+            (w.cols % 2) == 0) {
+            const uint32_t threads =
+                threads_override ? threads_override : fp8_direct_threads();
+            if (add) {
+                fp8_weight_f32_matvec_vec2_kernel<true><<<
+                    grid, threads, 0, exec_stream_>>>(
+                    out_ptr,
+                    static_cast<const __nv_fp8_e4m3 *>(w.ptr),
+                    static_cast<const float *>(w.scale), x_ptr,
+                    static_cast<uint32_t>(w.rows),
+                    static_cast<uint32_t>(w.cols),
+                    1, static_cast<uint32_t>(w.cols),
+                    static_cast<uint32_t>(w.rows));
+            } else {
+                fp8_weight_f32_matvec_vec2_kernel<false><<<
+                    grid, threads, 0, exec_stream_>>>(
+                    out_ptr,
+                    static_cast<const __nv_fp8_e4m3 *>(w.ptr),
+                    static_cast<const float *>(w.scale), x_ptr,
+                    static_cast<uint32_t>(w.rows),
+                    static_cast<uint32_t>(w.cols),
+                    1, static_cast<uint32_t>(w.cols),
+                    static_cast<uint32_t>(w.rows));
+            }
+            return launch_status(add ? "FP8 direct vec2 matvec add"
+                                     : "FP8 direct vec2 matvec");
+        }
+        if (add) {
+            fp8_weight_f32_matvec_add_kernel<<<
+                grid, 256, 0, exec_stream_>>>(
+                out_ptr, static_cast<const __nv_fp8_e4m3 *>(w.ptr),
+                static_cast<const float *>(w.scale), x_ptr,
+                static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols),
+                1, static_cast<uint32_t>(w.cols),
+                static_cast<uint32_t>(w.rows));
+        } else {
+            fp8_weight_f32_matvec_kernel<<<
+                grid, 256, 0, exec_stream_>>>(
+                out_ptr, static_cast<const __nv_fp8_e4m3 *>(w.ptr),
+                static_cast<const float *>(w.scale), x_ptr,
+                static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols),
+                1, static_cast<uint32_t>(w.cols),
+                static_cast<uint32_t>(w.rows));
+        }
+        return launch_status(add ? "FP8 direct matvec add"
+                                 : "FP8 direct matvec");
+    }
+
+    DeviceStatus fp8_matvec_bf16_direct(__nv_bfloat16 *out_ptr,
+                                        const CudaWeight &w,
+                                        const float *x_ptr,
+                                        bool add,
+                                        uint32_t threads_override = 0) {
+        if ((w.cols % 2) != 0) {
+            return {false, "FP8 BF16 direct matvec requires even cols"};
+        }
+        const dim3 grid(static_cast<uint32_t>(w.rows), 1);
+        const uint32_t threads =
+            threads_override ? threads_override : fp8_direct_threads();
+        if (add) {
+            fp8_weight_f32_matvec_bf16_vec2_kernel<true><<<
+                grid, threads, 0, exec_stream_>>>(
+                out_ptr,
+                static_cast<const __nv_fp8_e4m3 *>(w.ptr),
+                static_cast<const float *>(w.scale), x_ptr,
+                static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols),
+                1, static_cast<uint32_t>(w.cols),
+                static_cast<uint32_t>(w.rows));
+        } else {
+            fp8_weight_f32_matvec_bf16_vec2_kernel<false><<<
+                grid, threads, 0, exec_stream_>>>(
+                out_ptr,
+                static_cast<const __nv_fp8_e4m3 *>(w.ptr),
+                static_cast<const float *>(w.scale), x_ptr,
+                static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols),
+                1, static_cast<uint32_t>(w.cols),
+                static_cast<uint32_t>(w.rows));
+        }
+        return launch_status(add ? "FP8 direct BF16 matvec add"
+                                 : "FP8 direct BF16 matvec");
+    }
+
+    DeviceStatus fp8_scale_fanout4(
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            const uint32_t *indices,
+            const uint64_t *offsets,
+            uint32_t count,
+            uint32_t batch) {
+        if (count < 2 || count > 4 || batch == 0) {
+            return {false, "invalid FP8 scale fanout shape"};
+        }
+        float *out[4] = {nullptr, nullptr, nullptr, nullptr};
+        const float *scales[4] = {nullptr, nullptr, nullptr, nullptr};
+        uint32_t rows[4] = {0, 0, 0, 0};
+        uint32_t strides[4] = {0, 0, 0, 0};
+        uint64_t total = 0;
+        for (uint32_t slot = 0; slot < count; ++slot) {
+            const uint32_t index = indices[slot];
+            const auto &w = as_weight(*weights[index]);
+            out[slot] = as_tensor(*outs[index]).ptr;
+            scales[slot] = static_cast<const float *>(w.scale);
+            rows[slot] = static_cast<uint32_t>(w.rows);
+            strides[slot] = out_strides[index];
+            if (offsets[slot] != total) {
+                return {false, "non-contiguous FP8 fanout scratch"};
+            }
+            total += static_cast<uint64_t>(batch) * rows[slot];
+        }
+        const unsigned threads = 256;
+        const unsigned blocks =
+            static_cast<unsigned>((total + threads - 1) / threads);
+        fp8_outer_scale_fanout4_kernel<<<blocks, threads, 0, exec_stream_>>>(
+            out[0], out[1], out[2], out[3],
+            fp8_out_f32_, x_fp8_scales_,
+            scales[0], scales[1], scales[2], scales[3],
+            batch, rows[0], rows[1], rows[2], rows[3],
+            strides[0], strides[1], strides[2], strides[3]);
+        return launch_status("FP8 fused fanout output scaling");
+    }
+
+    DeviceStatus fp8_matmul_fanout_quantized(
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            uint32_t count,
+            uint32_t batch) {
+        if (count == 0 || batch == 0) return {};
+        uint32_t total_rows = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto &w = as_weight(*weights[i]);
+            if (w.type != WeightType::FP8_E4M3) {
+                return {false, "quantized FP8 fanout received non-FP8 weight"};
+            }
+            total_rows += static_cast<uint32_t>(w.rows);
+        }
+        const uint32_t cols =
+            static_cast<uint32_t>(as_weight(*weights[0]).cols);
+        if (auto st = ensure_fp8_linear_workspace(
+                batch, cols, total_rows);
+            !st.ok) {
+            return st;
+        }
+
+        const bool fuse_scale =
+            count >= 2 && count <= 4 &&
+            fp8_fanout_scale_fusion_enabled();
+        int32_t packed_first = -1;
+        int32_t packed_second = -1;
+        if (fuse_scale) {
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto &first = as_weight(*weights[i]);
+                if (!first.fp8_packed_second) continue;
+                for (uint32_t j = 0; j < count; ++j) {
+                    const auto &second = as_weight(*weights[j]);
+                    if (&second == first.fp8_packed_second &&
+                        first.fp8_packed_rows ==
+                            first.rows + second.rows) {
+                        packed_first = static_cast<int32_t>(i);
+                        packed_second = static_cast<int32_t>(j);
+                        break;
+                    }
+                }
+                if (packed_first >= 0) break;
+            }
+        }
+
+        if (packed_first >= 0) {
+            const uint32_t first_index =
+                static_cast<uint32_t>(packed_first);
+            const uint32_t second_index =
+                static_cast<uint32_t>(packed_second);
+            const auto &first = as_weight(*weights[first_index]);
+            const auto &second = as_weight(*weights[second_index]);
+            if (auto st = cublaslt_fp8_matmul_view(
+                    fp8_out_f32_, first.ptr, first.scale,
+                    first.rows + second.rows, first.cols,
+                    batch, 0.0f, false);
+                !st.ok) {
+                return st;
+            }
+            if (lazy_attention_fanout_requested_ && count == 3) {
+                const uint32_t pair_rows =
+                    static_cast<uint32_t>(first.rows + second.rows);
+                as_tensor(*outs[first_index]).set_lazy_fp8_linear(
+                    fp8_out_f32_, x_fp8_scales_,
+                    static_cast<const float *>(first.scale),
+                    batch, pair_rows, 0,
+                    static_cast<uint32_t>(first.rows));
+                as_tensor(*outs[second_index]).set_lazy_fp8_linear(
+                    fp8_out_f32_, x_fp8_scales_,
+                    static_cast<const float *>(second.scale),
+                    batch, pair_rows, static_cast<uint32_t>(first.rows),
+                    static_cast<uint32_t>(second.rows));
+
+                uint64_t offset =
+                    static_cast<uint64_t>(batch) * pair_rows;
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (static_cast<int32_t>(i) == packed_first ||
+                        static_cast<int32_t>(i) == packed_second) {
+                        continue;
+                    }
+                    const auto &w = as_weight(*weights[i]);
+                    float *raw = fp8_out_f32_ + offset;
+                    if (auto st = cublaslt_fp8_matmul(
+                            raw, w, batch, 0.0f, false); !st.ok) {
+                        return st;
+                    }
+                    as_tensor(*outs[i]).set_lazy_fp8_linear(
+                        raw, x_fp8_scales_,
+                        static_cast<const float *>(w.scale),
+                        batch, static_cast<uint32_t>(w.rows), 0,
+                        static_cast<uint32_t>(w.rows));
+                    offset += static_cast<uint64_t>(batch) * w.rows;
+                }
+                return {};
+            }
+            const uint64_t elements =
+                static_cast<uint64_t>(batch) *
+                (first.rows + second.rows);
+            constexpr unsigned threads = 256;
+            const unsigned blocks = static_cast<unsigned>(
+                (elements + threads - 1) / threads);
+            fp8_outer_scale_packed_pair_kernel<<<
+                blocks, threads, 0, exec_stream_>>>(
+                as_tensor(*outs[first_index]).ptr,
+                as_tensor(*outs[second_index]).ptr,
+                fp8_out_f32_, x_fp8_scales_,
+                static_cast<const float *>(first.scale),
+                static_cast<const float *>(second.scale),
+                batch,
+                static_cast<uint32_t>(first.rows),
+                static_cast<uint32_t>(second.rows),
+                out_strides[first_index],
+                out_strides[second_index]);
+            if (auto st = launch_status(
+                    "FP8 packed pair batched output scaling");
+                !st.ok) {
+                return st;
+            }
+            for (uint32_t i = 0; i < count; ++i) {
+                if (static_cast<int32_t>(i) == packed_first ||
+                    static_cast<int32_t>(i) == packed_second) {
+                    continue;
+                }
+                const auto &w = as_weight(*weights[i]);
+                if (auto st = fp8_matmul_quantized(
+                        as_tensor(*outs[i]).ptr, w, batch,
+                        out_strides[i]);
+                    !st.ok) {
+                    return st;
+                }
+            }
+            return {};
+        }
+
+        if (!fuse_scale) {
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto &w = as_weight(*weights[i]);
+                if (auto st = fp8_matmul_quantized(
+                        as_tensor(*outs[i]).ptr, w, batch,
+                        out_strides[i]);
+                    !st.ok) {
+                    return st;
+                }
+            }
+            return {};
+        }
+
+        uint32_t indices[4] = {};
+        uint64_t offsets[4] = {};
+        uint64_t offset = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto &w = as_weight(*weights[i]);
+            indices[i] = i;
+            offsets[i] = offset;
+            if (auto st = cublaslt_fp8_matmul(
+                    fp8_out_f32_ + offset, w, batch, 0.0f, false);
+                !st.ok) {
+                return st;
+            }
+            offset += static_cast<uint64_t>(batch) * w.rows;
+        }
+        return fp8_scale_fanout4(
+            outs, weights, out_strides, indices, offsets, count, batch);
+    }
+
+    DeviceStatus fp8_bf16_matmul_fanout_quantized(
+            DeviceTensor *const *outs,
+            const DeviceWeight *const *weights,
+            const uint32_t *out_strides,
+            uint32_t count,
+            uint32_t batch,
+            uint32_t fp8_count,
+            uint32_t bf16_count) {
+        if (count == 0 || batch == 0) return {};
+        if (fp8_count == 0 || fp8_count + bf16_count != count) {
+            return {false, "invalid staged FP8/BF16 fanout"};
+        }
+        const bool fuse_scale =
+            fp8_count >= 2 && fp8_count <= 4 &&
+            fp8_fanout_scale_fusion_enabled();
+        int32_t packed_first = -1;
+        int32_t packed_second = -1;
+        if (fuse_scale) {
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto &first = as_weight(*weights[i]);
+                if (first.type != WeightType::FP8_E4M3 ||
+                    !first.fp8_packed_second) {
+                    continue;
+                }
+                for (uint32_t j = 0; j < count; ++j) {
+                    const auto &second = as_weight(*weights[j]);
+                    if (second.type == WeightType::FP8_E4M3 &&
+                        &second == first.fp8_packed_second &&
+                        first.fp8_packed_rows ==
+                            first.rows + second.rows) {
+                        packed_first = static_cast<int32_t>(i);
+                        packed_second = static_cast<int32_t>(j);
+                        break;
+                    }
+                }
+                if (packed_first >= 0) break;
+            }
+        }
+
+        if (packed_first >= 0) {
+            const uint32_t first_index =
+                static_cast<uint32_t>(packed_first);
+            const uint32_t second_index =
+                static_cast<uint32_t>(packed_second);
+            const auto &first = as_weight(*weights[first_index]);
+            const auto &second = as_weight(*weights[second_index]);
+            if (auto st = cublaslt_fp8_matmul_view(
+                    fp8_out_f32_, first.ptr, first.scale,
+                    first.rows + second.rows, first.cols,
+                    batch, 0.0f, false);
+                !st.ok) {
+                return st;
+            }
+            if (lazy_recurrent_pair_requested_) {
+                const uint32_t pair_rows =
+                    static_cast<uint32_t>(first.rows + second.rows);
+                as_tensor(*outs[first_index]).set_lazy_fp8_linear(
+                    fp8_out_f32_, x_fp8_scales_,
+                    static_cast<const float *>(first.scale),
+                    batch, pair_rows, 0,
+                    static_cast<uint32_t>(first.rows));
+                as_tensor(*outs[second_index]).set_lazy_fp8_linear(
+                    fp8_out_f32_, x_fp8_scales_,
+                    static_cast<const float *>(second.scale),
+                    batch, pair_rows, static_cast<uint32_t>(first.rows),
+                    static_cast<uint32_t>(second.rows));
+            } else {
+                const uint64_t elements =
+                    static_cast<uint64_t>(batch) *
+                    (first.rows + second.rows);
+                constexpr unsigned threads = 256;
+                const unsigned blocks = static_cast<unsigned>(
+                    (elements + threads - 1) / threads);
+                fp8_outer_scale_packed_pair_kernel<<<
+                    blocks, threads, 0, exec_stream_>>>(
+                    as_tensor(*outs[first_index]).ptr,
+                    as_tensor(*outs[second_index]).ptr,
+                    fp8_out_f32_, x_fp8_scales_,
+                    static_cast<const float *>(first.scale),
+                    static_cast<const float *>(second.scale),
+                    batch,
+                    static_cast<uint32_t>(first.rows),
+                    static_cast<uint32_t>(second.rows),
+                    out_strides[first_index],
+                    out_strides[second_index]);
+                if (auto st = launch_status(
+                        "FP8 packed pair batched output scaling");
+                    !st.ok) {
+                    return st;
+                }
+            }
+        }
+
+        uint32_t indices[4] = {};
+        uint64_t offsets[4] = {};
+        uint32_t slots = 0;
+        uint64_t offset = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto &w = as_weight(*weights[i]);
+            auto &out = as_tensor(*outs[i]);
+            if (w.type == WeightType::BF16) {
+                if (auto st = bf16_matmul_converted(
+                        out.ptr, w, batch,
+                        static_cast<uint32_t>(w.cols),
+                        out_strides[i]);
+                    !st.ok) {
+                    return st;
+                }
+                continue;
+            }
+            if (w.type != WeightType::FP8_E4M3) {
+                return {false, "staged fanout received unsupported weight"};
+            }
+            if (static_cast<int32_t>(i) == packed_first ||
+                static_cast<int32_t>(i) == packed_second) {
+                continue;
+            }
+            if (packed_first >= 0 || !fuse_scale) {
+                if (auto st = fp8_matmul_quantized(
+                        out.ptr, w, batch, out_strides[i]);
+                    !st.ok) {
+                    return st;
+                }
+                continue;
+            }
+            indices[slots] = i;
+            offsets[slots] = offset;
+            if (auto st = cublaslt_fp8_matmul(
+                    fp8_out_f32_ + offset, w, batch, 0.0f, false);
+                !st.ok) {
+                return st;
+            }
+            offset += static_cast<uint64_t>(batch) * w.rows;
+            ++slots;
+        }
+        if (packed_first >= 0 || !fuse_scale) return {};
+        return fp8_scale_fanout4(
+            outs, weights, out_strides, indices, offsets, slots, batch);
+    }
+
+    DeviceStatus fp8_quantize_activation(const float *x_ptr,
+                                         uint32_t batch,
+                                         uint32_t cols,
+                                         uint32_t in_stride,
+                                         uint32_t max_rows,
+                                         bool emit_bf16 = false) {
+        if (auto st = ensure_fp8_linear_workspace(
+                batch, cols, max_rows); !st.ok) {
+            return st;
+        }
+        if (emit_bf16) {
+            const uint64_t x_elems =
+                static_cast<uint64_t>(batch) * in_stride;
+            if (auto st = ensure_bf16_activation_workspace(x_elems);
+                !st.ok) {
+                return st;
+            }
+            fp32_to_fp8_bf16_per_row_kernel<<<
+                batch, 256, 0, exec_stream_>>>(
+                x_fp8_workspace_, x_fp8_scales_,
+                x_bf16_workspace_, x_ptr,
+                batch, cols, in_stride);
+            return launch_status(
+                "FP8 dynamic quantization with BF16 staging");
+        }
+        fp32_to_fp8_per_row_kernel<<<batch, 256, 0, exec_stream_>>>(
+            x_fp8_workspace_, x_fp8_scales_, x_ptr,
+            batch, cols, in_stride);
+        return launch_status("FP8 dynamic activation quantization");
+    }
+
+    DeviceStatus fp8_scale_output(float *out_ptr,
+                                  const CudaWeight &w,
+                                  uint32_t batch,
+                                  uint32_t out_stride,
+                                  bool add) {
+        const uint64_t out_count = static_cast<uint64_t>(batch) * w.rows;
+        const unsigned threads = 256;
+        const unsigned blocks =
+            static_cast<unsigned>((out_count + threads - 1) / threads);
+        if (add) {
+            fp8_outer_scale_add_kernel<<<blocks, threads, 0, exec_stream_>>>(
+                out_ptr, fp8_out_f32_, x_fp8_scales_,
+                static_cast<const float *>(w.scale), batch,
+                static_cast<uint32_t>(w.rows), out_stride);
+        } else {
+            fp8_outer_scale_kernel<<<blocks, threads, 0, exec_stream_>>>(
+                out_ptr, fp8_out_f32_, x_fp8_scales_,
+                static_cast<const float *>(w.scale), batch,
+                static_cast<uint32_t>(w.rows), out_stride);
+        }
+        return launch_status(add ? "FP8 output scaling add"
+                                 : "FP8 output scaling");
+    }
+
+    DeviceStatus fp8_scale_output_bf16(__nv_bfloat16 *out_ptr,
+                                       const CudaWeight &w,
+                                       uint32_t batch,
+                                       uint32_t out_stride,
+                                       bool add) {
+        const uint64_t out_count = static_cast<uint64_t>(batch) * w.rows;
+        const unsigned threads = 256;
+        const unsigned blocks =
+            static_cast<unsigned>((out_count + threads - 1) / threads);
+        if (add) {
+            fp8_outer_scale_bf16_kernel<true><<<
+                blocks, threads, 0, exec_stream_>>>(
+                out_ptr, fp8_out_f32_, x_fp8_scales_,
+                static_cast<const float *>(w.scale), batch,
+                static_cast<uint32_t>(w.rows), out_stride);
+        } else {
+            fp8_outer_scale_bf16_kernel<false><<<
+                blocks, threads, 0, exec_stream_>>>(
+                out_ptr, fp8_out_f32_, x_fp8_scales_,
+                static_cast<const float *>(w.scale), batch,
+                static_cast<uint32_t>(w.rows), out_stride);
+        }
+        return launch_status(add ? "FP8 BF16 output scaling add"
+                                 : "FP8 BF16 output scaling");
+    }
+
+    DeviceStatus fp8_matmul_quantized(float *out_ptr,
+                                      const CudaWeight &w,
+                                      uint32_t batch,
+                                      uint32_t out_stride,
+                                      bool add = false) {
+#if defined(QW3_ENABLE_NVFP4)
+        if (!add &&
+            batch > 256 &&
+            out_stride == w.rows &&
+            fp8_cutlass_f32_enabled() &&
+            !fp8_cutlass_f32_failed_) {
+            if (auto st = ensure_cublaslt_fp8(); !st.ok) {
+                return st;
+            }
+            const bool launched = fp8_scaled_mm_adapter::launch_f32(
+                out_ptr, x_fp8_workspace_, w.ptr,
+                x_fp8_scales_, static_cast<const float *>(w.scale),
+                batch, static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols),
+                cublaslt_workspace_, cublaslt_workspace_bytes_,
+                exec_stream_);
+            if (launched) {
+                return launch_status("CUTLASS FP8 scaled FP32 matmul");
+            }
+            fp8_cutlass_f32_failed_ = true;
+            (void) cudaGetLastError();
+        }
+#endif
+        if (out_stride == w.rows && fp8_cublaslt_outer_scale_enabled()) {
+            DeviceStatus direct = cublaslt_fp8_matmul(
+                out_ptr, w, batch, add ? 1.0f : 0.0f, true);
+            if (direct.ok) return direct;
+            (void) cudaGetLastError();
+        }
+        if (auto st = cublaslt_fp8_matmul(w, batch); !st.ok) return st;
+        return fp8_scale_output(out_ptr, w, batch, out_stride, add);
+    }
+
+    DeviceStatus fp8_matmul(float *out_ptr,
+                            const CudaWeight &w,
+                            const float *x_ptr,
+                            uint32_t batch,
+                            uint32_t in_stride,
+                            uint32_t out_stride) {
+        if (batch == 0) return {};
+        if (!cublas_handle_ || !w.scale || in_stride < w.cols || out_stride < w.rows) {
+            return {false, "invalid FP8 matmul state or strides"};
+        }
+        if (batch <= 8 && !fp8_small_cublaslt_enabled()) {
+            const dim3 grid(static_cast<uint32_t>(w.rows), batch);
+            fp8_weight_f32_matvec_kernel<<<grid, 256, 0, exec_stream_>>>(
+                out_ptr, static_cast<const __nv_fp8_e4m3 *>(w.ptr),
+                static_cast<const float *>(w.scale), x_ptr,
+                static_cast<uint32_t>(w.rows), static_cast<uint32_t>(w.cols),
+                batch, in_stride, out_stride);
+            return launch_status("FP8 small-batch matvec");
+        }
+        if (auto st = fp8_quantize_activation(
+                x_ptr, batch, static_cast<uint32_t>(w.cols), in_stride,
+                static_cast<uint32_t>(w.rows)); !st.ok) {
+            return st;
+        }
+        return fp8_matmul_quantized(out_ptr, w, batch, out_stride);
+    }
+
+    DeviceStatus fp8_matmul_bf16(__nv_bfloat16 *out_ptr,
+                                 const CudaWeight &w,
+                                 const float *x_ptr,
+                                 uint32_t batch,
+                                 uint32_t in_stride,
+                                 uint32_t out_stride,
+                                 bool add = false) {
+        if (batch == 0) return {};
+        if (!cublas_handle_ || !w.scale ||
+            in_stride < w.cols || out_stride < w.rows) {
+            return {false, "invalid FP8 BF16 matmul state or strides"};
+        }
+        if (batch <= 8 && !fp8_small_cublaslt_enabled() &&
+            batch == 1 && in_stride == w.cols && out_stride == w.rows) {
+            return fp8_matvec_bf16_direct(out_ptr, w, x_ptr, add);
+        }
+        if (auto st = fp8_quantize_activation(
+                x_ptr, batch, static_cast<uint32_t>(w.cols), in_stride,
+                static_cast<uint32_t>(w.rows)); !st.ok) {
+            return st;
+        }
+#if defined(QW3_ENABLE_NVFP4)
+        if (!add &&
+            batch > 256 &&
+            in_stride == w.cols &&
+            out_stride == w.rows &&
+            fp8_cutlass_bf16_enabled() &&
+            !fp8_cutlass_bf16_failed_) {
+            if (auto st = ensure_cublaslt_fp8(); !st.ok) {
+                return st;
+            }
+            const bool launched = fp8_scaled_mm_adapter::launch_bf16(
+                out_ptr, x_fp8_workspace_, w.ptr,
+                x_fp8_scales_, static_cast<const float *>(w.scale),
+                batch, static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols),
+                cublaslt_workspace_, cublaslt_workspace_bytes_,
+                exec_stream_);
+            if (launched) {
+                return launch_status("CUTLASS FP8 scaled BF16 matmul");
+            }
+            fp8_cutlass_bf16_failed_ = true;
+            (void) cudaGetLastError();
+        }
+#endif
+        if (out_stride == w.rows &&
+            fp8_bf16_epilogue_enabled() &&
+            !fp8_bf16_epilogue_failed_) {
+            DeviceStatus direct = cublaslt_fp8_matmul_view(
+                out_ptr, w.ptr, w.scale, w.rows, w.cols, batch,
+                add ? 1.0f : 0.0f, true, CUDA_R_16BF);
+            if (direct.ok) return direct;
+            fp8_bf16_epilogue_failed_ = true;
+            (void) cudaGetLastError();
+        }
+        if (auto st = cublaslt_fp8_matmul(w, batch); !st.ok) {
+            return st;
+        }
+        return fp8_scale_output_bf16(
+            out_ptr, w, batch, out_stride, add);
+    }
+
+    static bool nvfp4_small_mmvq_route_enabled(const char *name,
+                                               bool default_value) {
+        const char *value = std::getenv(name);
+        if (!value || *value == '\0') {
+            value = std::getenv("QW3_NVFP4_SMALL_MMVQ");
+        }
+        if (!value || *value == '\0') return default_value;
+        return std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0;
+    }
+
+    static bool nvfp4_small_single_mmvq_enabled() {
+        static const bool enabled = nvfp4_small_mmvq_route_enabled(
+            "QW3_NVFP4_SMALL_SINGLE", false);
+        return enabled;
+    }
+
+    static bool nvfp4_small_pair_mmvq_enabled() {
+        static const bool enabled = nvfp4_small_mmvq_route_enabled(
+            "QW3_NVFP4_SMALL_PAIR", true);
+        return enabled;
+    }
+
+    static bool nvfp4_cutlass_pair_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_NVFP4_FUSED_CUTLASS_PAIR");
+            return !value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        return enabled;
+    }
+
+    DeviceStatus ensure_nvfp4_activation_workspace(uint32_t batch,
+                                                   uint32_t cols) {
+#ifndef QW3_ENABLE_NVFP4
+        (void)batch;
+        (void)cols;
+        return {false, "NVFP4 requires an SM120a FlashInfer/CUTLASS build"};
+#else
+        const size_t packed_bytes =
+            nvfp4_adapter::packed_activation_bytes(batch, cols);
+        const size_t scale_bytes =
+            nvfp4_adapter::activation_scale_bytes(batch, cols);
+        if (x_fp4_workspace_capacity_ < packed_bytes) {
+            if (x_fp4_workspace_) cudaFree(x_fp4_workspace_);
+            if (auto st = cuda_status(cudaMalloc(&x_fp4_workspace_, packed_bytes),
+                                      "NVFP4 activation alloc"); !st.ok) {
+                x_fp4_workspace_ = nullptr;
+                x_fp4_workspace_capacity_ = 0;
+                return st;
+            }
+            x_fp4_workspace_capacity_ = packed_bytes;
+        }
+        if (x_fp4_scales_capacity_ < scale_bytes) {
+            if (x_fp4_scales_) cudaFree(x_fp4_scales_);
+            if (auto st = cuda_status(cudaMalloc(&x_fp4_scales_, scale_bytes),
+                                      "NVFP4 activation scales alloc"); !st.ok) {
+                x_fp4_scales_ = nullptr;
+                x_fp4_scales_capacity_ = 0;
+                return st;
+            }
+            x_fp4_scales_capacity_ = scale_bytes;
+        }
+        return {};
+#endif
+    }
+
+    DeviceStatus quantize_nvfp4_activation(const CudaWeight &w,
+                                           const float *x_ptr,
+                                           uint32_t batch,
+                                           uint32_t in_stride) {
+#ifndef QW3_ENABLE_NVFP4
+        (void)w;
+        (void)x_ptr;
+        (void)batch;
+        (void)in_stride;
+        return {false, "NVFP4 requires an SM120a FlashInfer/CUTLASS build"};
+#else
+        if (auto st = ensure_nvfp4_activation_workspace(
+                batch, static_cast<uint32_t>(w.cols)); !st.ok) {
+            return st;
+        }
+        if (!nvfp4_adapter::quantize_activation(
+                x_fp4_workspace_, x_fp4_scales_, x_ptr, w.input_scale,
+                batch, static_cast<uint32_t>(w.cols), in_stride,
+                false, exec_stream_)) {
+            return {false, "NVFP4 small-batch activation quantization failed"};
+        }
+        return {};
+#endif
+    }
+
+    DeviceStatus ensure_nvfp4_gemm_workspace(uint32_t batch,
+                                             uint32_t rows,
+                                             uint32_t cols) {
+#ifndef QW3_ENABLE_NVFP4
+        (void)batch;
+        (void)rows;
+        (void)cols;
+        return {false, "NVFP4 requires an SM120a FlashInfer/CUTLASS build"};
+#else
+        size_t required = 0;
+        try {
+            required = nvfp4_adapter::workspace_bytes(batch, rows, cols);
+        } catch (const std::runtime_error &) {
+            return {false, "FlashInfer rejected the NVFP4 GEMM shape"};
+        }
+        if (fp4_gemm_workspace_capacity_ < required) {
+            if (fp4_gemm_workspace_) cudaFree(fp4_gemm_workspace_);
+            if (auto st = cuda_status(
+                    cudaMalloc(&fp4_gemm_workspace_, required),
+                    "NVFP4 GEMM workspace alloc"); !st.ok) {
+                fp4_gemm_workspace_ = nullptr;
+                fp4_gemm_workspace_capacity_ = 0;
+                return st;
+            }
+            fp4_gemm_workspace_capacity_ = required;
+        }
+        return {};
+#endif
+    }
+
+    DeviceStatus ensure_nvfp4_pair_output(uint64_t count) {
+        if (nvfp4_pair_out_f32_capacity_ >= count) return {};
+        if (nvfp4_pair_out_f32_) cudaFree(nvfp4_pair_out_f32_);
+        if (auto st = cuda_status(
+                cudaMalloc(&nvfp4_pair_out_f32_,
+                           static_cast<size_t>(count) * sizeof(float)),
+                "NVFP4 pair output alloc"); !st.ok) {
+            nvfp4_pair_out_f32_ = nullptr;
+            nvfp4_pair_out_f32_capacity_ = 0;
+            return st;
+        }
+        nvfp4_pair_out_f32_capacity_ = count;
+        return {};
+    }
+
+    DeviceStatus nvfp4_matmul(float *out_ptr,
+                              const CudaWeight &w,
+                              const float *x_ptr,
+                              uint32_t batch,
+                              uint32_t in_stride,
+                              uint32_t out_stride) {
+#ifndef QW3_ENABLE_NVFP4
+        (void)out_ptr; (void)w; (void)x_ptr; (void)batch;
+        (void)in_stride; (void)out_stride;
+        return {false, "NVFP4 requires an SM120a FlashInfer/CUTLASS build"};
+#else
+        if (batch == 0) return {};
+        if (!w.scale || !w.input_scale || !w.global_scale ||
+            in_stride < w.cols || out_stride < w.rows) {
+            return {false, "invalid NVFP4 matmul state or strides"};
+        }
+        if (auto st = ensure_nvfp4_activation_workspace(
+                batch, static_cast<uint32_t>(w.cols)); !st.ok) {
+            return st;
+        }
+        if (batch == 1 && nvfp4_small_single_mmvq_enabled()) {
+            if (auto st = quantize_nvfp4_activation(
+                    w, x_ptr, batch, in_stride); !st.ok) return st;
+            if (!nvfp4_adapter::launch_small_f32(
+                    out_ptr, x_fp4_workspace_, x_fp4_scales_,
+                    w.ptr, w.scale, w.global_scale,
+                    batch, static_cast<uint32_t>(w.rows),
+                    static_cast<uint32_t>(w.cols), out_stride,
+                    false, exec_stream_)) {
+                return {false, "NVFP4 small-batch MMVQ launch failed"};
+            }
+            return launch_status("NVFP4 small-batch MMVQ");
+        }
+
+        if (auto st = ensure_nvfp4_gemm_workspace(
+                batch, static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols)); !st.ok) {
+            return st;
+        }
+        if (batch == 1 && nvfp4_cutlass_bf16_output_enabled()) {
+            if (auto st = ensure_mixed_bf16_output(w.rows); !st.ok) return st;
+            if (!nvfp4_adapter::launch_bf16(
+                    mixed_out_bf16_, x_fp4_workspace_, x_fp4_scales_,
+                    fp4_gemm_workspace_, fp4_gemm_workspace_capacity_,
+                    x_ptr, in_stride, w.ptr, w.scale, w.input_scale, w.global_scale,
+                    batch, static_cast<uint32_t>(w.rows),
+                    static_cast<uint32_t>(w.cols), exec_stream_)) {
+                return {false, "FlashInfer NVFP4 BF16 GEMM launch failed"};
+            }
+            const unsigned threads = 256;
+            const unsigned blocks =
+                static_cast<unsigned>((w.rows + threads - 1) / threads);
+            bf16_to_fp32_kernel<<<blocks, threads, 0, exec_stream_>>>(
+                out_ptr, mixed_out_bf16_, w.rows);
+        } else if (!nvfp4_adapter::launch(
+                       out_ptr, x_fp4_workspace_, x_fp4_scales_,
+                       fp4_gemm_workspace_, fp4_gemm_workspace_capacity_,
+                       x_ptr, in_stride, w.ptr, w.scale, w.input_scale,
+                       w.global_scale, batch, static_cast<uint32_t>(w.rows),
+                       static_cast<uint32_t>(w.cols), exec_stream_)) {
+            return {false, "FlashInfer NVFP4 quantization/GEMM launch failed"};
+        }
+        return launch_status("NVFP4 FP32 GEMM");
+#endif
+    }
+
+    DeviceStatus nvfp4_matmul_bf16(__nv_bfloat16 *out_ptr,
+                                   const CudaWeight &w,
+                                   const float *x_ptr,
+                                   uint32_t batch,
+                                   uint32_t in_stride,
+                                   uint32_t out_stride) {
+#ifndef QW3_ENABLE_NVFP4
+        (void)out_ptr; (void)w; (void)x_ptr; (void)batch;
+        (void)in_stride; (void)out_stride;
+        return {false, "NVFP4 requires an SM120a FlashInfer/CUTLASS build"};
+#else
+        if (batch == 0) return {};
+        if (!out_ptr || !w.scale || !w.input_scale || !w.global_scale ||
+            in_stride < w.cols || out_stride < w.rows) {
+            return {false, "invalid NVFP4 BF16 matmul state or strides"};
+        }
+        if (auto st = ensure_nvfp4_activation_workspace(
+                batch, static_cast<uint32_t>(w.cols)); !st.ok) {
+            return st;
+        }
+        if (batch <= 8 && nvfp4_small_single_mmvq_enabled()) {
+            if (auto st = quantize_nvfp4_activation(
+                    w, x_ptr, batch, in_stride); !st.ok) {
+                return st;
+            }
+            if (!nvfp4_adapter::launch_small_bf16(
+                    out_ptr, x_fp4_workspace_, x_fp4_scales_,
+                    w.ptr, w.scale, w.global_scale,
+                    batch, static_cast<uint32_t>(w.rows),
+                    static_cast<uint32_t>(w.cols), out_stride,
+                    false, exec_stream_)) {
+                return {false, "NVFP4 small-batch BF16 MMVQ launch failed"};
+            }
+            return launch_status("NVFP4 small-batch BF16 MMVQ");
+        }
+        if (auto st = ensure_nvfp4_gemm_workspace(
+                batch, static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols)); !st.ok) {
+            return st;
+        }
+        if (!nvfp4_adapter::launch_bf16(
+                out_ptr, x_fp4_workspace_, x_fp4_scales_,
+                fp4_gemm_workspace_, fp4_gemm_workspace_capacity_,
+                x_ptr, in_stride, w.ptr, w.scale, w.input_scale,
+                w.global_scale, batch, static_cast<uint32_t>(w.rows),
+                static_cast<uint32_t>(w.cols), exec_stream_)) {
+            return {false, "FlashInfer NVFP4 BF16 GEMM launch failed"};
+        }
+        return launch_status("NVFP4 BF16 GEMM");
+#endif
+    }
+
+    DeviceStatus ensure_mixed_bf16_output(uint64_t count) {
+        if (mixed_out_bf16_capacity_ >= count) return {};
+        if (shared_linear_output_workspace_enabled()) {
+            if (auto st = ensure_shared_linear_output_workspace(
+                    static_cast<size_t>(count) *
+                        sizeof(__nv_bfloat16));
+                !st.ok) {
+                return st;
+            }
+            mixed_out_bf16_capacity_ = count;
+            return {};
+        }
+        if (mixed_out_bf16_) cudaFree(mixed_out_bf16_);
+        if (auto st = cuda_status(
+                cudaMalloc(&mixed_out_bf16_,
+                           static_cast<size_t>(count) * sizeof(__nv_bfloat16)),
+                "NVFP4 BF16 output alloc"); !st.ok) {
+            mixed_out_bf16_ = nullptr;
+            mixed_out_bf16_capacity_ = 0;
+            return st;
+        }
+        mixed_out_bf16_capacity_ = count;
+        return {};
+    }
+
+    static bool shared_linear_output_workspace_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_SHARED_LINEAR_OUTPUT_WORKSPACE");
+            return !value || !*value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        return enabled;
+    }
+
+    DeviceStatus ensure_shared_linear_output_workspace(size_t bytes) {
+        if (linear_output_workspace_capacity_ < bytes) {
+            if (linear_output_workspace_) cudaFree(linear_output_workspace_);
+            linear_output_workspace_ = nullptr;
+            linear_output_workspace_capacity_ = 0;
+            mixed_out_bf16_ = nullptr;
+            fp8_out_f32_ = nullptr;
+            if (auto st = cuda_status(
+                    cudaMalloc(&linear_output_workspace_, bytes),
+                    "shared linear output workspace alloc"); !st.ok) {
+                mixed_out_bf16_capacity_ = 0;
+                fp8_out_f32_capacity_ = 0;
+                return st;
+            }
+            linear_output_workspace_capacity_ = bytes;
+        }
+        mixed_out_bf16_ =
+            static_cast<__nv_bfloat16 *>(linear_output_workspace_);
+        fp8_out_f32_ = static_cast<float *>(linear_output_workspace_);
+        return {};
+    }
+
+    static bool nvfp4_cutlass_bf16_output_enabled() {
+        static const bool enabled = []() {
+            const char *env =
+                std::getenv("QW3_NVFP4_CUTLASS_OUTPUT_BF16");
+            return env && std::string(env) != "0" &&
+                   std::string(env) != "off";
+        }();
+        return enabled;
+    }
+
     DeviceStatus ensure_kv_copy_stream() {
         if (!exec_stream_) {
             if (auto st = begin(); !st.ok) return st;
@@ -5532,6 +11847,29 @@ private:
             q8_1_mmq_scratch_capacity_ = need;
         }
         return {};
+    }
+
+    DeviceStatus ensure_q8_output_workspace(uint64_t count) {
+        if (q8_out_f32_capacity_ >= count) return {};
+        if (q8_out_f32_) cudaFree(q8_out_f32_);
+        if (auto st = cuda_status(
+                cudaMalloc(&q8_out_f32_, count * sizeof(float)),
+                "Q8 FP32 output workspace alloc"); !st.ok) {
+            q8_out_f32_ = nullptr;
+            q8_out_f32_capacity_ = 0;
+            return st;
+        }
+        q8_out_f32_capacity_ = count;
+        return {};
+    }
+
+    DeviceStatus convert_q8_output_bf16(__nv_bfloat16 *out, uint64_t count) {
+        const unsigned threads = 256;
+        const unsigned blocks =
+            static_cast<unsigned>((count + threads - 1) / threads);
+        fp32_to_bf16_kernel<<<blocks, threads, 0, exec_stream_>>>(
+            out, q8_out_f32_, count);
+        return launch_status("Q8 FP32->BF16 output");
     }
 
     // Returns true when the activation needs to be staged in the
@@ -5755,6 +12093,16 @@ public:
         const auto &input = as_tensor(x);
         const auto &w = as_weight(weight);
         const uint64_t n = input.count;
+        if (o.is_bf16()) {
+            return {false, "cuda rms_norm BF16 output is not implemented"};
+        }
+        if (input.is_bf16()) {
+            rms_norm_bf16_to_f32_kernel<1024><<<
+                1, 1024, 0, exec_stream_>>>(
+                o.ptr, input.ptr_bf16(),
+                static_cast<const float *>(w.ptr), n, eps);
+            return launch_status("cuda rms_norm bf16_to_f32");
+        }
         // Vectorized path: float4-aligned and big enough to make a 1024-thread
         // block worth launching. Otherwise fall back to the scalar kernel.
         const bool can_vec = (n % 4 == 0)
@@ -5783,6 +12131,16 @@ public:
         const auto &input = as_tensor(x);
         const auto &w = as_weight(weight);
         if (batch == 0) return {};
+        if (o.is_bf16()) {
+            return {false, "cuda rms_norm_batch BF16 output is not implemented"};
+        }
+        if (input.is_bf16()) {
+            rms_norm_bf16_to_f32_kernel<1024><<<
+                batch, 1024, 0, exec_stream_>>>(
+                o.ptr, input.ptr_bf16(),
+                static_cast<const float *>(w.ptr), n, eps);
+            return launch_status("cuda rms_norm_batch bf16_to_f32");
+        }
         // Prefer the vectorized 1024-thread kernel when alignment + size allow.
         // Same constraints as the single-row path; batch is handled via gridDim.x.
         const bool can_vec = (n % 4 == 0)
@@ -5812,6 +12170,34 @@ public:
         const auto &bb = as_tensor(b);
         if (count > o.count || count > aa.count || count > bb.count) {
             return {false, "cuda add_n count exceeds tensor size"};
+        }
+        if (o.is_bf16() || aa.is_bf16() || bb.is_bf16()) {
+            auto report_dtype_mismatch = [&]() {
+                std::fprintf(
+                    stderr,
+                    "[qw3] add_n dtype mismatch: out=%s(%s) lhs=%s(%s) rhs=%s(%s)\n",
+                    o.label.c_str(), o.is_bf16() ? "bf16" : "f32",
+                    aa.label.c_str(), aa.is_bf16() ? "bf16" : "f32",
+                    bb.label.c_str(), bb.is_bf16() ? "bf16" : "f32");
+            };
+            if (!o.is_bf16()) {
+                report_dtype_mismatch();
+                return {false, "cuda add_n BF16 input with FP32 output"};
+            }
+            if (!aa.is_bf16()) {
+                report_dtype_mismatch();
+                return {false, "cuda add_n BF16 output with FP32 lhs"};
+            }
+            if (!bb.is_bf16()) {
+                report_dtype_mismatch();
+                return {false, "cuda add_n BF16 output with FP32 rhs"};
+            }
+            const uint64_t pairs = (count + 1) / 2;
+            const unsigned blocks =
+                static_cast<unsigned>((pairs + 255) / 256);
+            add_bf16_kernel<<<blocks, 256, 0, exec_stream_>>>(
+                o.ptr_bf16(), aa.ptr_bf16(), bb.ptr_bf16(), count);
+            return launch_status("cuda add bf16");
         }
         const uint64_t threads_total = (count + 3) / 4;
         const unsigned blocks = static_cast<unsigned>((threads_total + 255) / 256);
@@ -5891,20 +12277,58 @@ public:
         recurrent_conv_kernel<<<static_cast<unsigned>((p.count + 255) / 256), 256, 0, exec_stream_>>>(
             conv_buf, cs.ptr, p.ptr, static_cast<const float *>(cw.ptr),
             static_cast<uint32_t>(p.count), conv_kernel_size);
-        l2_norm_128_kernel<<<num_k_heads, 128, 0, exec_stream_>>>(conv_buf, num_k_heads, head_k_dim, eps);
-        l2_norm_128_kernel<<<num_k_heads, 128, 0, exec_stream_>>>(conv_buf + num_k_heads * head_k_dim, num_k_heads, head_k_dim, eps);
-        dim3 grid(num_v_heads, head_v_dim);
-        deltanet_kernel<<<grid, 128, 0, exec_stream_>>>(c.ptr,
-                                       s.ptr,
-                                       conv_buf,
-                                       a.ptr,
-                                       b.ptr,
-                                       static_cast<const float *>(aw.ptr),
-                                       static_cast<const float *>(dt.ptr),
-                                       num_k_heads,
-                                       num_v_heads,
-                                       head_k_dim,
-                                       head_v_dim);
+        static const bool fuse_qk_norm = []() {
+            const char *value = std::getenv("QW3_FUSED_RECURRENT_QK_NORM");
+            return !value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        if (fuse_qk_norm) {
+            const dim3 qk_grid(1, num_k_heads);
+            l2_norm_128_qk_batch_kernel<<<qk_grid, 128, 0, exec_stream_>>>(
+                conv_buf, num_k_heads, head_k_dim,
+                /*T=*/1, static_cast<uint32_t>(p.count),
+                /*q_offset=*/0, num_k_heads * head_k_dim, eps);
+        } else {
+            l2_norm_128_kernel<<<num_k_heads, 128, 0, exec_stream_>>>(
+                conv_buf, num_k_heads, head_k_dim, eps);
+            l2_norm_128_kernel<<<num_k_heads, 128, 0, exec_stream_>>>(
+                conv_buf + num_k_heads * head_k_dim,
+                num_k_heads, head_k_dim, eps);
+        }
+        bool used_ported = false;
+        if (recurrent_kernel_choice() == RecurrentKernel::Ported &&
+            head_k_dim == head_v_dim) {
+            auto &a_mut = const_cast<CudaTensor &>(a);
+            auto &b_mut = const_cast<CudaTensor &>(b);
+            used_ported = ported::launch_gated_delta_net(
+                a_mut.ptr, b_mut.ptr,
+                static_cast<const float *>(dt.ptr),
+                static_cast<const float *>(aw.ptr),
+                conv_buf,
+                /*q_offset=*/0,
+                /*k_offset=*/num_k_heads * head_k_dim,
+                /*v_offset=*/2u * num_k_heads * head_k_dim,
+                s.ptr, c.ptr,
+                /*T=*/1,
+                num_k_heads, num_v_heads, head_k_dim,
+                static_cast<uint32_t>(p.count),
+                num_v_heads,
+                static_cast<uint32_t>(c.count),
+                /*prep_decay=*/true,
+                /*state_checkpoints=*/nullptr,
+                /*checkpoint_count=*/0,
+                exec_stream_);
+        }
+        if (!used_ported) {
+            dim3 grid(num_v_heads, head_v_dim);
+            deltanet_kernel<<<grid, 128, 0, exec_stream_>>>(
+                c.ptr, s.ptr, conv_buf, a.ptr, b.ptr,
+                static_cast<const float *>(aw.ptr),
+                static_cast<const float *>(dt.ptr),
+                num_k_heads, num_v_heads, head_k_dim, head_v_dim);
+        }
         recurrent_norm_gate_kernel<<<num_v_heads, head_v_dim, 0, exec_stream_>>>(c.ptr, g.ptr, static_cast<const float *>(nw.ptr), num_v_heads, head_v_dim, eps);
         return launch_status("cuda recurrent_single_token");
     }
@@ -6031,76 +12455,400 @@ public:
         const bool dn_capture =
             dn_snap != nullptr && dn_decay != nullptr && dn_block_tokens > 0;
 
-        // 1. Conv (batched): one kernel call processes T sequential conv
-        //    steps per channel, with the small state window kept in registers.
-        //    Output written to cout (row stride = proj_stride to mirror the
-        //    proj input layout; valid prefix is proj_count elements/row).
+        bool use_sm120_aot = false;
+#ifdef QW3_ENABLE_GDN_SM120_AOT
+        const uint32_t recurrent_q_width = num_k_heads * head_k_dim;
+        const uint32_t recurrent_v_width = num_v_heads * head_v_dim;
+        const uint32_t recurrent_qkv_width =
+            2u * recurrent_q_width + recurrent_v_width;
+        use_sm120_aot =
+            recurrent_kernel_choice() == RecurrentKernel::Sm120Aot &&
+            !want_checkpoint && !dn_capture && batch >= 64 &&
+            head_k_dim == 128 && head_v_dim == 128 &&
+            proj_count == recurrent_qkv_width &&
+            alpha_stride == beta_stride;
+#endif
+
+        // 1. Conv. Checkpoint capture requires sequential state snapshots.
+        //    Normal long prefill uses token tiles so the sequence dimension
+        //    runs in parallel. Output row stride mirrors the proj layout.
         const unsigned conv_threads = 256;
         const unsigned conv_blocks = static_cast<unsigned>((proj_count + conv_threads - 1) / conv_threads);
+        constexpr uint32_t conv_token_tile = 64;
+        const dim3 parallel_conv_grid(
+            conv_blocks, (batch + conv_token_tile - 1) / conv_token_tile);
+        const bool use_parallel_conv =
+            !want_checkpoint && parallel_prefill_conv_enabled();
+        const bool lazy_pair =
+            p.is_lazy_fp8_linear() && g.is_lazy_fp8_linear() &&
+            p.lazy_fp8_raw == g.lazy_fp8_raw &&
+            p.lazy_fp8_activation_scales ==
+                g.lazy_fp8_activation_scales &&
+            p.lazy_fp8_batch == batch && g.lazy_fp8_batch == batch &&
+            p.lazy_fp8_rows == proj_count &&
+            g.lazy_fp8_rows >= num_v_heads * head_v_dim;
+        const bool consume_lazy_pair =
+            lazy_pair && use_sm120_aot &&
+            gdn_sm120_fused_io_enabled() && use_parallel_conv;
+        const uintptr_t p_begin = reinterpret_cast<uintptr_t>(p.ptr);
+        const uintptr_t p_end =
+            p_begin + static_cast<uintptr_t>(p.count) * p.elem_size;
+        const uintptr_t g_begin = reinterpret_cast<uintptr_t>(g.ptr);
+        const uintptr_t g_end =
+            g_begin + static_cast<uintptr_t>(g.count) * g.elem_size;
+        const bool projection_storage_overlaps =
+            p_begin < g_end && g_begin < p_end;
+        if (!consume_lazy_pair && projection_storage_overlaps) {
+            return {
+                false,
+                "recurrent compact projection views require lazy consumption"};
+        }
+        if (lazy_pair && !consume_lazy_pair) {
+            const uint64_t elements =
+                static_cast<uint64_t>(batch) *
+                (p.lazy_fp8_rows + g.lazy_fp8_rows);
+            constexpr unsigned threads = 256;
+            const unsigned blocks = static_cast<unsigned>(
+                (elements + threads - 1) / threads);
+            fp8_outer_scale_packed_pair_kernel<<<
+                blocks, threads, 0, exec_stream_>>>(
+                p.ptr, g.ptr, p.lazy_fp8_raw,
+                p.lazy_fp8_activation_scales,
+                p.lazy_fp8_weight_scales,
+                g.lazy_fp8_weight_scales,
+                batch, p.lazy_fp8_rows, g.lazy_fp8_rows,
+                proj_stride, gate_stride);
+            if (auto st = launch_status(
+                    "materialize lazy recurrent FP8 pair"); !st.ok) {
+                return st;
+            }
+        }
         switch (conv_kernel_size) {
             case 3:
-                recurrent_conv_batch_kernel<3>
-                    <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
-                                                    static_cast<const float *>(cw.ptr),
-                                                    want_checkpoint ? conv_ckpt->ptr : nullptr,
-                                                    batch, proj_count, proj_stride, proj_stride,
-                                                    effective_checkpoint_count);
+                if (use_parallel_conv) {
+                    if (consume_lazy_pair) {
+                        recurrent_conv_prefill_parallel_lazy_fp8_kernel<
+                            3, conv_token_tile><<<
+                            parallel_conv_grid, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.lazy_fp8_raw,
+                            p.lazy_fp8_activation_scales,
+                            p.lazy_fp8_weight_scales,
+                            static_cast<const float *>(cw.ptr),
+                            batch, proj_count, p.lazy_fp8_raw_stride,
+                            p.lazy_fp8_row_offset, proj_stride);
+                        recurrent_conv_prefill_state_lazy_fp8_kernel<3><<<
+                            conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cs.ptr, p.lazy_fp8_raw,
+                            p.lazy_fp8_activation_scales,
+                            p.lazy_fp8_weight_scales,
+                            batch, proj_count, p.lazy_fp8_raw_stride,
+                            p.lazy_fp8_row_offset);
+                    } else {
+                        recurrent_conv_prefill_parallel_kernel<
+                            3, conv_token_tile><<<
+                            parallel_conv_grid, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.ptr,
+                            static_cast<const float *>(cw.ptr),
+                            batch, proj_count, proj_stride, proj_stride);
+                        recurrent_conv_prefill_state_kernel<3><<<
+                            conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cs.ptr, p.ptr, batch, proj_count, proj_stride);
+                    }
+                } else {
+                    recurrent_conv_batch_kernel<3>
+                        <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.ptr, static_cast<const float *>(cw.ptr),
+                            want_checkpoint ? conv_ckpt->ptr : nullptr,
+                            batch, proj_count, proj_stride, proj_stride,
+                            effective_checkpoint_count);
+                }
                 break;
             case 4:
-                recurrent_conv_batch_kernel<4>
-                    <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
-                                                    static_cast<const float *>(cw.ptr),
-                                                    want_checkpoint ? conv_ckpt->ptr : nullptr,
-                                                    batch, proj_count, proj_stride, proj_stride,
-                                                    effective_checkpoint_count);
+                if (use_parallel_conv) {
+                    if (consume_lazy_pair) {
+                        recurrent_conv_prefill_parallel_lazy_fp8_kernel<
+                            4, conv_token_tile><<<
+                            parallel_conv_grid, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.lazy_fp8_raw,
+                            p.lazy_fp8_activation_scales,
+                            p.lazy_fp8_weight_scales,
+                            static_cast<const float *>(cw.ptr),
+                            batch, proj_count, p.lazy_fp8_raw_stride,
+                            p.lazy_fp8_row_offset, proj_stride);
+                        recurrent_conv_prefill_state_lazy_fp8_kernel<4><<<
+                            conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cs.ptr, p.lazy_fp8_raw,
+                            p.lazy_fp8_activation_scales,
+                            p.lazy_fp8_weight_scales,
+                            batch, proj_count, p.lazy_fp8_raw_stride,
+                            p.lazy_fp8_row_offset);
+                    } else {
+                        recurrent_conv_prefill_parallel_kernel<
+                            4, conv_token_tile><<<
+                            parallel_conv_grid, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.ptr,
+                            static_cast<const float *>(cw.ptr),
+                            batch, proj_count, proj_stride, proj_stride);
+                        recurrent_conv_prefill_state_kernel<4><<<
+                            conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cs.ptr, p.ptr, batch, proj_count, proj_stride);
+                    }
+                } else {
+                    recurrent_conv_batch_kernel<4>
+                        <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.ptr, static_cast<const float *>(cw.ptr),
+                            want_checkpoint ? conv_ckpt->ptr : nullptr,
+                            batch, proj_count, proj_stride, proj_stride,
+                            effective_checkpoint_count);
+                }
                 break;
             case 5:
-                recurrent_conv_batch_kernel<5>
-                    <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
-                                                    static_cast<const float *>(cw.ptr),
-                                                    want_checkpoint ? conv_ckpt->ptr : nullptr,
-                                                    batch, proj_count, proj_stride, proj_stride,
-                                                    effective_checkpoint_count);
+                if (use_parallel_conv) {
+                    if (consume_lazy_pair) {
+                        recurrent_conv_prefill_parallel_lazy_fp8_kernel<
+                            5, conv_token_tile><<<
+                            parallel_conv_grid, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.lazy_fp8_raw,
+                            p.lazy_fp8_activation_scales,
+                            p.lazy_fp8_weight_scales,
+                            static_cast<const float *>(cw.ptr),
+                            batch, proj_count, p.lazy_fp8_raw_stride,
+                            p.lazy_fp8_row_offset, proj_stride);
+                        recurrent_conv_prefill_state_lazy_fp8_kernel<5><<<
+                            conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cs.ptr, p.lazy_fp8_raw,
+                            p.lazy_fp8_activation_scales,
+                            p.lazy_fp8_weight_scales,
+                            batch, proj_count, p.lazy_fp8_raw_stride,
+                            p.lazy_fp8_row_offset);
+                    } else {
+                        recurrent_conv_prefill_parallel_kernel<
+                            5, conv_token_tile><<<
+                            parallel_conv_grid, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.ptr,
+                            static_cast<const float *>(cw.ptr),
+                            batch, proj_count, proj_stride, proj_stride);
+                        recurrent_conv_prefill_state_kernel<5><<<
+                            conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cs.ptr, p.ptr, batch, proj_count, proj_stride);
+                    }
+                } else {
+                    recurrent_conv_batch_kernel<5>
+                        <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.ptr, static_cast<const float *>(cw.ptr),
+                            want_checkpoint ? conv_ckpt->ptr : nullptr,
+                            batch, proj_count, proj_stride, proj_stride,
+                            effective_checkpoint_count);
+                }
                 break;
             case 7:
-                recurrent_conv_batch_kernel<7>
-                    <<<conv_blocks, conv_threads, 0, exec_stream_>>>(cout.ptr, cs.ptr, p.ptr,
-                                                    static_cast<const float *>(cw.ptr),
-                                                    want_checkpoint ? conv_ckpt->ptr : nullptr,
-                                                    batch, proj_count, proj_stride, proj_stride,
-                                                    effective_checkpoint_count);
+                if (use_parallel_conv) {
+                    if (consume_lazy_pair) {
+                        recurrent_conv_prefill_parallel_lazy_fp8_kernel<
+                            7, conv_token_tile><<<
+                            parallel_conv_grid, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.lazy_fp8_raw,
+                            p.lazy_fp8_activation_scales,
+                            p.lazy_fp8_weight_scales,
+                            static_cast<const float *>(cw.ptr),
+                            batch, proj_count, p.lazy_fp8_raw_stride,
+                            p.lazy_fp8_row_offset, proj_stride);
+                        recurrent_conv_prefill_state_lazy_fp8_kernel<7><<<
+                            conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cs.ptr, p.lazy_fp8_raw,
+                            p.lazy_fp8_activation_scales,
+                            p.lazy_fp8_weight_scales,
+                            batch, proj_count, p.lazy_fp8_raw_stride,
+                            p.lazy_fp8_row_offset);
+                    } else {
+                        recurrent_conv_prefill_parallel_kernel<
+                            7, conv_token_tile><<<
+                            parallel_conv_grid, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.ptr,
+                            static_cast<const float *>(cw.ptr),
+                            batch, proj_count, proj_stride, proj_stride);
+                        recurrent_conv_prefill_state_kernel<7><<<
+                            conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cs.ptr, p.ptr, batch, proj_count, proj_stride);
+                    }
+                } else {
+                    recurrent_conv_batch_kernel<7>
+                        <<<conv_blocks, conv_threads, 0, exec_stream_>>>(
+                            cout.ptr, cs.ptr, p.ptr, static_cast<const float *>(cw.ptr),
+                            want_checkpoint ? conv_ckpt->ptr : nullptr,
+                            batch, proj_count, proj_stride, proj_stride,
+                            effective_checkpoint_count);
+                }
                 break;
             default:
                 return {false, "recurrent_batch: unsupported conv_kernel_size (expected 3/4/5/7)"};
         }
-        if (auto st = launch_status("recurrent_conv_batch_kernel"); !st.ok) return st;
+        if (auto st = launch_status(use_parallel_conv
+                ? "recurrent_conv_prefill_parallel_kernel"
+                : "recurrent_conv_batch_kernel"); !st.ok) return st;
 
-        // 2. L2 norm for Q and K (batched across T). The conv-output buffer
-        //    shares the proj layout (row stride = proj_stride).
-        dim3 ln_grid(batch, num_k_heads);
-        const uint32_t q_off = 0;
-        const uint32_t k_off = num_k_heads * head_k_dim;
-        if (want_checkpoint) {
-            l2_norm_128_qk_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
-                cout.ptr, num_k_heads, head_k_dim,
-                batch, proj_stride, q_off, k_off, eps);
-            if (auto st = launch_status("l2_norm_128_qk_batch_kernel"); !st.ok) return st;
-        } else {
-            l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
-                                                       batch, proj_stride, q_off, eps);
-            l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(cout.ptr, num_k_heads, head_k_dim,
-                                                       batch, proj_stride, k_off, eps);
-            if (auto st = launch_status("l2_norm_128_batch_kernel"); !st.ok) return st;
+        // 2. L2 norm for Q and K (batched across T). The SM120 path folds
+        //    this into its BF16 input pack to avoid materializing normalized
+        //    FP32 Q/K solely for the adapter.
+        if (!use_sm120_aot || !gdn_sm120_fused_io_enabled()) {
+            dim3 ln_grid(batch, num_k_heads);
+            const uint32_t q_off = 0;
+            const uint32_t k_off = num_k_heads * head_k_dim;
+            if (want_checkpoint) {
+                l2_norm_128_qk_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
+                    cout.ptr, num_k_heads, head_k_dim,
+                    batch, proj_stride, q_off, k_off, eps);
+                if (auto st = launch_status(
+                        "l2_norm_128_qk_batch_kernel"); !st.ok) {
+                    return st;
+                }
+            } else {
+                l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
+                    cout.ptr, num_k_heads, head_k_dim, batch, proj_stride,
+                    q_off, eps);
+                l2_norm_128_batch_kernel<<<ln_grid, 128, 0, exec_stream_>>>(
+                    cout.ptr, num_k_heads, head_k_dim, batch, proj_stride,
+                    k_off, eps);
+                if (auto st = launch_status(
+                        "l2_norm_128_batch_kernel"); !st.ok) {
+                    return st;
+                }
+            }
         }
 
-        // 3. DeltaNet (batched). Two implementations selected at runtime via
-        //    QW3_RECURRENT_KERNEL: "qw3" (default) is the original kernel,
-        //    "ported" dispatches the warp-shuffle kernel from llama.cpp.
-        //    Both produce mathematically equivalent state updates and
-        //    outputs; the ported version uses register-resident state and
-        //    warp-level reductions, removing __syncthreads() from the inner
-        //    loop.
-        if (recurrent_kernel_choice() == RecurrentKernel::Ported && !dn_capture) {
+        // 3. DeltaNet (batched). The SM120 AOT path is a chunk-parallel
+        //    FlashInfer CuTe-DSL kernel. It is currently restricted to normal
+        //    prefill because KVMem capture needs per-block state snapshots.
+        bool used_sm120_aot = false;
+        bool used_sm120_fused_post = false;
+#ifdef QW3_ENABLE_GDN_SM120_AOT
+        if (use_sm120_aot) {
+            if (auto st = ensure_gdn_sm120_workspace(
+                    batch, num_k_heads, num_v_heads, head_k_dim);
+                !st.ok) {
+                return st;
+            }
+
+            __nv_bfloat16 *q_bf16 = gdn_sm120_bf16_;
+            __nv_bfloat16 *k_bf16 =
+                q_bf16 + static_cast<uint64_t>(batch) * recurrent_q_width;
+            __nv_bfloat16 *v_bf16 =
+                k_bf16 + static_cast<uint64_t>(batch) * recurrent_q_width;
+            __nv_bfloat16 *out_bf16 =
+                v_bf16 + static_cast<uint64_t>(batch) * recurrent_v_width;
+
+            if (gdn_sm120_fused_io_enabled()) {
+                const dim3 norm_pack_grid(batch, num_v_heads);
+                recurrent_norm_pack_gdn_bf16_kernel<<<
+                    norm_pack_grid, head_k_dim, 0, exec_stream_>>>(
+                    q_bf16, k_bf16, v_bf16, cout.ptr,
+                    batch, num_k_heads, num_v_heads, head_k_dim,
+                    proj_stride, eps);
+                if (auto st = launch_status(
+                        "recurrent_norm_pack_gdn_bf16_kernel"); !st.ok) {
+                    return st;
+                }
+            } else {
+                const dim3 pack_grid(
+                    batch, (recurrent_qkv_width + 255u) / 256u);
+                recurrent_pack_gdn_bf16_kernel<<<
+                    pack_grid, 256, 0, exec_stream_>>>(
+                    q_bf16, k_bf16, v_bf16, cout.ptr,
+                    batch, recurrent_q_width, recurrent_q_width,
+                    recurrent_v_width, proj_stride);
+                if (auto st = launch_status(
+                        "recurrent_pack_gdn_bf16_kernel"); !st.ok) {
+                    return st;
+                }
+            }
+
+            if (!ported::launch_gdn_prep(
+                    const_cast<CudaTensor &>(a).ptr,
+                    const_cast<CudaTensor &>(b).ptr,
+                    static_cast<const float *>(dt.ptr),
+                    static_cast<const float *>(aw.ptr),
+                    batch, num_v_heads, alpha_stride, beta_stride,
+                    true, exec_stream_)) {
+                return {false, "SM120 GDN alpha/beta prep failed"};
+            }
+
+            const uint64_t state_elems =
+                static_cast<uint64_t>(num_v_heads) *
+                head_v_dim * head_k_dim;
+            if (auto st = cuda_status(
+                    cudaMemcpyAsync(
+                        gdn_sm120_initial_state_, s.ptr,
+                        static_cast<size_t>(state_elems) * sizeof(float),
+                        cudaMemcpyDeviceToDevice, exec_stream_),
+                    "SM120 GDN initial-state copy"); !st.ok) {
+                return st;
+            }
+            recurrent_set_cu_seqlens_kernel<<<1, 1, 0, exec_stream_>>>(
+                gdn_sm120_cu_seqlens_, batch);
+            if (auto st = launch_status(
+                    "recurrent_set_cu_seqlens_kernel"); !st.ok) {
+                return st;
+            }
+
+            const bool ok = gdn_sm120_aot::launch(
+                out_bf16, s.ptr,
+                q_bf16, k_bf16, v_bf16,
+                gdn_sm120_initial_state_,
+                const_cast<CudaTensor &>(a).ptr,
+                const_cast<CudaTensor &>(b).ptr,
+                gdn_sm120_cu_seqlens_,
+                gdn_sm120_tensormaps_,
+                gdn_sm120_tensormaps_capacity_,
+                batch, num_k_heads, num_k_heads, num_v_heads,
+                head_k_dim,
+                rsqrtf(static_cast<float>(head_k_dim)),
+                exec_stream_);
+            if (!ok) return {false, "SM120 GDN AOT launch failed"};
+
+            if (gdn_sm120_fused_io_enabled()) {
+                const dim3 norm_gate_grid(batch, num_v_heads);
+                recurrent_norm_gate_gdn_bf16_kernel<<<
+                    norm_gate_grid, head_v_dim, 0, exec_stream_>>>(
+                    c.ptr, out_bf16, g.ptr,
+                    consume_lazy_pair ? g.lazy_fp8_raw : nullptr,
+                    consume_lazy_pair
+                        ? g.lazy_fp8_activation_scales : nullptr,
+                    consume_lazy_pair
+                        ? g.lazy_fp8_weight_scales : nullptr,
+                    static_cast<const float *>(nw.ptr),
+                    batch, num_v_heads, head_v_dim,
+                    core_stride, gate_stride,
+                    consume_lazy_pair ? g.lazy_fp8_raw_stride : 0,
+                    consume_lazy_pair ? g.lazy_fp8_row_offset : 0,
+                    eps);
+                if (auto st = launch_status(
+                        "recurrent_norm_gate_gdn_bf16_kernel"); !st.ok) {
+                    return st;
+                }
+                used_sm120_fused_post = true;
+            } else {
+                const uint64_t out_elems =
+                    static_cast<uint64_t>(batch) * recurrent_v_width;
+                const uint32_t unpack_blocks =
+                    static_cast<uint32_t>((out_elems + 255u) / 256u);
+                recurrent_unpack_gdn_bf16_kernel<<<
+                    unpack_blocks, 256, 0, exec_stream_>>>(
+                    c.ptr, out_bf16, batch, recurrent_v_width, core_stride);
+                if (auto st = launch_status(
+                        "recurrent_unpack_gdn_bf16_kernel"); !st.ok) {
+                    return st;
+                }
+            }
+            used_sm120_aot = true;
+        }
+#endif
+
+        // The ported fallback keeps one state column in a warp's registers
+        // and iterates tokens sequentially. The original qw3 kernel uses
+        // shared-memory reductions and also supports KVMem state capture.
+        if (used_sm120_aot) {
+            // Output and final state were produced above.
+        } else if (recurrent_kernel_choice() == RecurrentKernel::Ported && !dn_capture) {
             // Ported kernel requires head_k_dim == head_v_dim (square state).
             if (head_k_dim != head_v_dim) {
                 return {false, "recurrent_batch: ported kernel requires head_k_dim == head_v_dim"};
@@ -6190,12 +12938,16 @@ public:
         }
 
         // 4. RMSnorm + gate, batched over T.
-        dim3 ng_grid(batch, num_v_heads);
-        recurrent_norm_gate_batch_kernel<<<ng_grid, head_v_dim, 0, exec_stream_>>>(c.ptr, g.ptr,
-                                                                  static_cast<const float *>(nw.ptr),
-                                                                  batch, num_v_heads, head_v_dim,
-                                                                  core_stride, gate_stride, eps);
-        return launch_status("recurrent_norm_gate_batch_kernel");
+        if (!used_sm120_fused_post) {
+            dim3 ng_grid(batch, num_v_heads);
+            recurrent_norm_gate_batch_kernel<<<
+                ng_grid, head_v_dim, 0, exec_stream_>>>(
+                c.ptr, g.ptr, static_cast<const float *>(nw.ptr),
+                batch, num_v_heads, head_v_dim,
+                core_stride, gate_stride, eps);
+            return launch_status("recurrent_norm_gate_batch_kernel");
+        }
+        return {};
     }
 
     DeviceStatus recurrent_batch_independent(DeviceTensor &core,
@@ -6703,6 +13455,24 @@ public:
         auto &t = as_tensor(x);
         const auto &w = as_weight(weight);
         dim3 grid(batch, n_units);
+        if (t.is_lazy_fp8_linear() &&
+            t.lazy_fp8_batch == batch &&
+            t.lazy_fp8_rows >= n_units * per_unit_stride &&
+            batch_stride >= n_units * per_unit_stride) {
+            rmsnorm_per_head_lazy_fp8_kernel<<<
+                grid, 256, 0, exec_stream_>>>(
+                t.ptr, t.lazy_fp8_raw,
+                t.lazy_fp8_activation_scales,
+                t.lazy_fp8_weight_scales,
+                static_cast<const float *>(w.ptr),
+                batch, batch_stride, n_units, per_unit_stride,
+                head_dim, t.lazy_fp8_raw_stride,
+                t.lazy_fp8_row_offset, eps);
+            DeviceStatus status =
+                launch_status("cuda lazy FP8 rmsnorm_per_head_batch");
+            if (status.ok) t.clear_lazy_fp8_linear();
+            return status;
+        }
         rmsnorm_per_head_kernel<<<grid, 256, 0, exec_stream_>>>(t.ptr,
                                                 static_cast<const float *>(w.ptr),
                                                 n_units, per_unit_stride, head_dim, batch_stride, eps);
@@ -6721,6 +13491,46 @@ public:
         dim3 grid(1, n_units);
         rope_partial_kernel<<<grid, half, 0, exec_stream_>>>(t.ptr, n_units, per_unit_stride, rope_dim, pos, /*batch_stride=*/0, theta);
         return launch_status("cuda rope_partial");
+    }
+
+    DeviceStatus rmsnorm_rope_qk(DeviceTensor &q,
+                                 DeviceTensor &k,
+                                 const DeviceWeight &q_weight,
+                                 const DeviceWeight &k_weight,
+                                 uint32_t n_q_heads,
+                                 uint32_t n_kv_heads,
+                                 uint32_t q_head_stride,
+                                 uint32_t k_head_stride,
+                                 uint32_t head_dim,
+                                 uint32_t rope_dim,
+                                 uint32_t pos,
+                                 float theta,
+                                 float eps) override {
+        static const bool enabled = []() {
+            const char *value = std::getenv("QW3_FUSED_QK_NORM_ROPE");
+            return !value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        if (!enabled || head_dim > 256 || rope_dim > head_dim ||
+            (rope_dim & 1U) != 0) {
+            return DeviceBackend::rmsnorm_rope_qk(
+                q, k, q_weight, k_weight, n_q_heads, n_kv_heads,
+                q_head_stride, k_head_stride, head_dim, rope_dim,
+                pos, theta, eps);
+        }
+        auto &q_tensor = as_tensor(q);
+        auto &k_tensor = as_tensor(k);
+        const auto &qw = as_weight(q_weight);
+        const auto &kw = as_weight(k_weight);
+        rmsnorm_rope_qk_kernel<<<n_q_heads + n_kv_heads, 256, 0, exec_stream_>>>(
+            q_tensor.ptr, k_tensor.ptr,
+            static_cast<const float *>(qw.ptr),
+            static_cast<const float *>(kw.ptr),
+            n_q_heads, n_kv_heads, q_head_stride, k_head_stride,
+            head_dim, rope_dim, pos, theta, eps);
+        return launch_status("cuda rmsnorm_rope_qk");
     }
 
     DeviceStatus rope_partial_batch(DeviceTensor &x,
@@ -6779,7 +13589,10 @@ public:
             kv_append_kernel_q8<<<qgrid, row_elems, row_elems * sizeof(float), exec_stream_>>>(
                 c.ptr_i8(), c.scale, s.ptr, pos, per_pos_size, row_elems, /*src_stride=*/0);
         } else if (c.is_fp8_kv()) {
-            kv_append_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(c.ptr_fp8(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
+            const unsigned fp8_blocks =
+                ((per_pos_size + 1U) / 2U + threads - 1U) / threads;
+            kv_append_kernel_fp8<<<dim3(1, fp8_blocks), threads, 0, exec_stream_>>>(
+                c.ptr_fp8(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
         } else if (c.is_fp16()) {
             kv_append_kernel_f16<<<grid, threads, 0, exec_stream_>>>(c.ptr_h(), s.ptr, pos, per_pos_size, /*src_stride=*/0);
         } else {
@@ -6795,7 +13608,7 @@ public:
                                  uint32_t batch) override {
         if (batch == 0) return {};
         auto &c = as_tensor(cache);
-        const auto &s = as_tensor(src);
+        auto &s = const_cast<CudaTensor &>(as_tensor(src));
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(batch, blocks);
@@ -6805,8 +13618,27 @@ public:
             dim3 qgrid(batch, rows);
             kv_append_kernel_q8<<<qgrid, row_elems, row_elems * sizeof(float), exec_stream_>>>(
                 c.ptr_i8(), c.scale, s.ptr, base_pos, per_pos_size, row_elems, per_pos_size);
+        } else if (c.is_fp8_kv() && s.is_lazy_fp8_linear() &&
+                   s.lazy_fp8_batch == batch &&
+                   s.lazy_fp8_rows >= per_pos_size) {
+            const unsigned fp8_blocks =
+                ((per_pos_size + 1U) / 2U + threads - 1U) / threads;
+            kv_append_lazy_linear_kernel_fp8<<<
+                dim3(batch, fp8_blocks), threads, 0, exec_stream_>>>(
+                c.ptr_fp8(), s.lazy_fp8_raw,
+                s.lazy_fp8_activation_scales,
+                s.lazy_fp8_weight_scales,
+                base_pos, per_pos_size,
+                s.lazy_fp8_raw_stride, s.lazy_fp8_row_offset);
+            DeviceStatus status =
+                launch_status("cuda lazy FP8 kv_append_batch");
+            if (status.ok) s.clear_lazy_fp8_linear();
+            return status;
         } else if (c.is_fp8_kv()) {
-            kv_append_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(c.ptr_fp8(), s.ptr, base_pos, per_pos_size, per_pos_size);
+            const unsigned fp8_blocks =
+                ((per_pos_size + 1U) / 2U + threads - 1U) / threads;
+            kv_append_kernel_fp8<<<dim3(batch, fp8_blocks), threads, 0, exec_stream_>>>(
+                c.ptr_fp8(), s.ptr, base_pos, per_pos_size, per_pos_size);
         } else if (c.is_fp16()) {
             kv_append_kernel_f16<<<grid, threads, 0, exec_stream_>>>(c.ptr_h(), s.ptr, base_pos, per_pos_size, per_pos_size);
         } else {
@@ -6855,7 +13687,7 @@ public:
         if (auto st = ensure_kv_page_indices(page_indices, n_pages); !st.ok) return st;
 
         auto &c = as_tensor(cache);
-        const auto &s = as_tensor(src);
+        auto &s = const_cast<CudaTensor &>(as_tensor(src));
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(batch, blocks);
@@ -6866,8 +13698,27 @@ public:
             kv_append_paged_kernel_q8<<<qgrid, row_elems, row_elems * sizeof(float), exec_stream_>>>(
                 c.ptr_i8(), c.scale, s.ptr, base_logical_pos, per_pos_size,
                 row_elems, per_pos_size, kv_page_indices_i32_, page_size);
+        } else if (c.is_fp8_kv() && s.is_lazy_fp8_linear() &&
+                   s.lazy_fp8_batch == batch &&
+                   s.lazy_fp8_rows >= per_pos_size) {
+            const unsigned fp8_blocks =
+                ((per_pos_size + 1U) / 2U + threads - 1U) / threads;
+            kv_append_paged_lazy_linear_kernel_fp8<<<
+                dim3(batch, fp8_blocks), threads, 0, exec_stream_>>>(
+                c.ptr_fp8(), s.lazy_fp8_raw,
+                s.lazy_fp8_activation_scales,
+                s.lazy_fp8_weight_scales,
+                base_logical_pos, per_pos_size,
+                s.lazy_fp8_raw_stride, s.lazy_fp8_row_offset,
+                kv_page_indices_i32_, page_size);
+            DeviceStatus status =
+                launch_status("cuda lazy FP8 kv_append_batch_paged");
+            if (status.ok) s.clear_lazy_fp8_linear();
+            return status;
         } else if (c.is_fp8_kv()) {
-            kv_append_paged_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(
+            const unsigned fp8_blocks =
+                ((per_pos_size + 1U) / 2U + threads - 1U) / threads;
+            kv_append_paged_kernel_fp8<<<dim3(batch, fp8_blocks), threads, 0, exec_stream_>>>(
                 c.ptr_fp8(), s.ptr, base_logical_pos, per_pos_size, per_pos_size,
                 kv_page_indices_i32_, page_size);
         } else if (c.is_fp16()) {
@@ -6900,7 +13751,7 @@ public:
         if (pages.count < n_pages) return {false, "kv_append_batch_paged_device page tensor too small"};
 
         auto &c = as_tensor(cache);
-        const auto &s = as_tensor(src);
+        auto &s = const_cast<CudaTensor &>(as_tensor(src));
         const unsigned threads = 256;
         const unsigned blocks = (per_pos_size + threads - 1) / threads;
         dim3 grid(batch, blocks);
@@ -6911,8 +13762,27 @@ public:
             kv_append_paged_kernel_q8<<<qgrid, row_elems, row_elems * sizeof(float), exec_stream_>>>(
                 c.ptr_i8(), c.scale, s.ptr, base_logical_pos, per_pos_size,
                 row_elems, per_pos_size, pages.ptr_i32(), page_size);
+        } else if (c.is_fp8_kv() && s.is_lazy_fp8_linear() &&
+                   s.lazy_fp8_batch == batch &&
+                   s.lazy_fp8_rows >= per_pos_size) {
+            const unsigned fp8_blocks =
+                ((per_pos_size + 1U) / 2U + threads - 1U) / threads;
+            kv_append_paged_lazy_linear_kernel_fp8<<<
+                dim3(batch, fp8_blocks), threads, 0, exec_stream_>>>(
+                c.ptr_fp8(), s.lazy_fp8_raw,
+                s.lazy_fp8_activation_scales,
+                s.lazy_fp8_weight_scales,
+                base_logical_pos, per_pos_size,
+                s.lazy_fp8_raw_stride, s.lazy_fp8_row_offset,
+                pages.ptr_i32(), page_size);
+            DeviceStatus status =
+                launch_status("cuda lazy FP8 kv_append_batch_paged_device");
+            if (status.ok) s.clear_lazy_fp8_linear();
+            return status;
         } else if (c.is_fp8_kv()) {
-            kv_append_paged_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(
+            const unsigned fp8_blocks =
+                ((per_pos_size + 1U) / 2U + threads - 1U) / threads;
+            kv_append_paged_kernel_fp8<<<dim3(batch, fp8_blocks), threads, 0, exec_stream_>>>(
                 c.ptr_fp8(), s.ptr, base_logical_pos, per_pos_size, per_pos_size,
                 pages.ptr_i32(), page_size);
         } else if (c.is_fp16()) {
@@ -6948,18 +13818,26 @@ public:
             return {false, "rope_block_remap_paged_device page dtype mismatch"};
         }
         const bool is_fp16 = c.is_fp16();
+        const bool is_fp8 = c.is_fp8_kv();
         const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
                             !c.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            return {false, "rope_block_remap_paged_device requires fp16 or fp32 KV "
-                           "(q8/fp8 re-RoPE is lossy)"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "rope_block_remap_paged_device requires fp16, fp32, "
+                           "or fp8 KV (q8 re-RoPE is unsupported)"};
         }
         void *ptr = is_fp16 ? static_cast<void *>(c.ptr_h())
-                            : static_cast<void *>(c.ptr);
-        if (!ported::launch_rope_block_remap_paged(
-                ptr, is_fp16, n_tokens, n_kv_heads, per_pos_size, head_dim,
-                rope_dim, win_base, from_base, to_base, pages.ptr_i32(),
-                page_size, theta, exec_stream_)) {
+                            : is_fp8 ? static_cast<void *>(c.ptr_fp8())
+                                     : static_cast<void *>(c.ptr);
+        const bool launched = is_fp8
+            ? ported::launch_rope_block_remap_paged_fp8(
+                  ptr, n_tokens, n_kv_heads, per_pos_size, head_dim, rope_dim,
+                  win_base, from_base, to_base, pages.ptr_i32(), page_size,
+                  theta, exec_stream_)
+            : ported::launch_rope_block_remap_paged(
+                  ptr, is_fp16, n_tokens, n_kv_heads, per_pos_size, head_dim,
+                  rope_dim, win_base, from_base, to_base, pages.ptr_i32(),
+                  page_size, theta, exec_stream_);
+        if (!launched) {
             return {false, "rope_block_remap_paged launch failed"};
         }
         return launch_status("cuda rope_block_remap_paged_device");
@@ -6971,7 +13849,8 @@ public:
             uint32_t rope_dim, const DeviceTensor &to_base,
             const DeviceTensor &from_base, const DeviceTensor &n_tokens,
             const DeviceTensor &page_indices, uint32_t page_size,
-            float theta) override {
+            float theta, const DeviceTensor *rope_sincos,
+            uint32_t rope_table_positions) override {
         if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return {};
         if (page_size == 0)
             return {false, "rope_block_remap_paged_batched_device page_size=0"};
@@ -6981,22 +13860,179 @@ public:
             return {false, "rope_block_remap_paged_batched_device page dtype mismatch"};
         }
         const bool is_fp16 = c.is_fp16();
+        const bool is_fp8 = c.is_fp8_kv();
         const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
                             !c.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            return {false, "rope_block_remap_paged_batched_device requires fp16 or "
-                           "fp32 KV (q8/fp8 re-RoPE is lossy)"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "rope_block_remap_paged_batched_device requires fp16, "
+                           "fp32, or fp8 KV (q8 re-RoPE is unsupported)"};
         }
         void *ptr = is_fp16 ? static_cast<void *>(c.ptr_h())
-                            : static_cast<void *>(c.ptr);
-        if (!ported::launch_rope_block_remap_paged_batched(
-                ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
-                head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
-                as_tensor(from_base).ptr_i32(), as_tensor(n_tokens).ptr_i32(),
-                pages.ptr_i32(), page_size, theta, exec_stream_)) {
+                            : is_fp8 ? static_cast<void *>(c.ptr_fp8())
+                                     : static_cast<void *>(c.ptr);
+        const float *table_ptr = nullptr;
+        if (rope_sincos) {
+            const auto &table = as_tensor(*rope_sincos);
+            const uint64_t needed =
+                static_cast<uint64_t>(rope_table_positions) *
+                (rope_dim / 2u) * 2u;
+            if (table.elem_size != sizeof(float) || table.count < needed) {
+                return {false, "KVMem RoPE table dtype/size mismatch"};
+            }
+            table_ptr = table.ptr;
+        }
+        const bool launched = table_ptr
+            ? (is_fp8
+                ? ported::launch_rope_block_remap_paged_batched_table_fp8(
+                      ptr, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
+                      head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(from_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, table_ptr, rope_table_positions, exec_stream_)
+                : ported::launch_rope_block_remap_paged_batched_table(
+                      ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads,
+                      per_pos_size, head_dim, rope_dim,
+                      as_tensor(to_base).ptr_i32(),
+                      as_tensor(from_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, table_ptr, rope_table_positions, exec_stream_))
+            : (is_fp8
+                ? ported::launch_rope_block_remap_paged_batched_fp8(
+                      ptr, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
+                      head_dim, rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(from_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, exec_stream_)
+                : ported::launch_rope_block_remap_paged_batched(
+                      ptr, is_fp16, n_blocks, max_n_tokens, n_kv_heads,
+                      per_pos_size, head_dim, rope_dim,
+                      as_tensor(to_base).ptr_i32(),
+                      as_tensor(from_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, exec_stream_));
+        if (!launched) {
             return {false, "rope_block_remap_paged_batched launch failed"};
         }
         return launch_status("cuda rope_block_remap_paged_batched_device");
+    }
+
+    DeviceStatus build_rope_sincos_table_device(
+            DeviceTensor &table, uint32_t positions, uint32_t rope_dim,
+            float theta) override {
+        if (positions == 0 || rope_dim == 0 || (rope_dim % 2u) != 0) {
+            return {false, "invalid KVMem RoPE table shape"};
+        }
+        auto &out = as_tensor(table);
+        const uint64_t needed =
+            static_cast<uint64_t>(positions) * (rope_dim / 2u) * 2u;
+        if (out.elem_size != sizeof(float) || out.count < needed) {
+            return {false, "KVMem RoPE table tensor is too small"};
+        }
+        if (!ported::launch_build_rope_sincos_table(
+                out.ptr, positions, rope_dim, theta, exec_stream_)) {
+            return {false, "KVMem RoPE table build launch failed"};
+        }
+        return launch_status("cuda build_rope_sincos_table_device");
+    }
+
+    DeviceStatus raw_k_scatter_rope_paged_batched_device(
+            DeviceTensor &k_cache, const DeviceTensor &raw_k,
+            uint64_t raw_element_offset, uint32_t n_blocks,
+            uint32_t max_n_tokens, uint32_t n_kv_heads,
+            uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+            const DeviceTensor &to_base, const DeviceTensor &n_tokens,
+            const DeviceTensor &page_indices, uint32_t page_size,
+            float theta, const DeviceTensor *rope_sincos,
+            uint32_t rope_table_positions,
+            uint64_t raw_block_stride_elements) override {
+        if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return {};
+        if (page_size == 0) {
+            return {false,
+                    "raw_k_scatter_rope_paged_batched_device page_size=0"};
+        }
+        auto &dst = as_tensor(k_cache);
+        const auto &src = as_tensor(raw_k);
+        const auto &pages = as_tensor(page_indices);
+        if (dst.elem_size != src.elem_size ||
+            dst.is_fp16() != src.is_fp16() ||
+            dst.is_fp8_kv() != src.is_fp8_kv()) {
+            return {false, "raw K/cache dtype mismatch"};
+        }
+        if (pages.elem_size != sizeof(int32_t)) {
+            return {false, "raw K scatter page dtype mismatch"};
+        }
+        const bool is_fp16 = dst.is_fp16();
+        const bool is_fp8 = dst.is_fp8_kv();
+        const bool is_f32 = dst.elem_size == sizeof(float) &&
+                            !dst.is_q8_kv() && !dst.is_fp8_kv();
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false,
+                    "raw K scatter requires fp16, fp32, or fp8 KV"};
+        }
+        const uint64_t packed_block_elements =
+            static_cast<uint64_t>(max_n_tokens) * per_pos_size;
+        const uint64_t block_stride = raw_block_stride_elements != 0
+            ? raw_block_stride_elements : packed_block_elements;
+        if (block_stride < packed_block_elements) {
+            return {false, "raw K scatter block stride is too small"};
+        }
+        const uint64_t needed =
+            raw_element_offset +
+            static_cast<uint64_t>(n_blocks - 1) * block_stride +
+            packed_block_elements;
+        if (needed > src.count) {
+            return {false, "raw K scatter source is too small"};
+        }
+        void *dst_ptr = is_fp16 ? static_cast<void *>(dst.ptr_h())
+                                : is_fp8 ? static_cast<void *>(dst.ptr_fp8())
+                                         : static_cast<void *>(dst.ptr);
+        const void *src_ptr =
+            is_fp16 ? static_cast<const void *>(src.ptr_h())
+                    : is_fp8 ? static_cast<const void *>(src.ptr_fp8())
+                             : static_cast<const void *>(src.ptr);
+        const float *table_ptr = nullptr;
+        if (rope_sincos) {
+            const auto &table = as_tensor(*rope_sincos);
+            const uint64_t table_needed =
+                static_cast<uint64_t>(rope_table_positions) *
+                (rope_dim / 2u) * 2u;
+            if (table.elem_size != sizeof(float) ||
+                table.count < table_needed) {
+                return {false, "KVMem raw scatter RoPE table mismatch"};
+            }
+            table_ptr = table.ptr;
+        }
+        const bool launched = table_ptr
+            ? (is_fp8
+                ? ported::launch_raw_k_scatter_rope_paged_batched_table_fp8(
+                      dst_ptr, src_ptr, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, table_ptr, rope_table_positions,
+                      block_stride, exec_stream_)
+                : ported::launch_raw_k_scatter_rope_paged_batched_table(
+                      dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, table_ptr, rope_table_positions,
+                      block_stride, exec_stream_))
+            : (is_fp8
+                ? ported::launch_raw_k_scatter_rope_paged_batched_fp8(
+                      dst_ptr, src_ptr, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, block_stride, exec_stream_)
+                : ported::launch_raw_k_scatter_rope_paged_batched(
+                      dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, block_stride, exec_stream_));
+        if (!launched) return {false, "raw K scatter launch failed"};
+        return launch_status("cuda raw_k_scatter_rope_paged_batched_device");
     }
 
     DeviceStatus block_kmean_paged_device(const DeviceTensor &k_cache,
@@ -7021,18 +14057,25 @@ public:
             return {false, "block_kmean_paged_device metadata dtype mismatch"};
         }
         const bool is_fp16 = c.is_fp16();
+        const bool is_fp8 = c.is_fp8_kv();
         const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
                             !c.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            // q8/fp8 K is fine to skip — selection just stays recency-weighted.
-            return {false, "block_kmean_paged_device requires fp16 or fp32 KV"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "block_kmean_paged_device requires fp16, fp32, or fp8 KV"};
         }
         const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
-                                  : static_cast<const void *>(c.ptr);
-        if (!ported::launch_block_kmean_paged(
-                const_cast<void *>(ptr), is_fp16, kb.ptr, n_blocks,
-                n_kv_heads, per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
-                pages.ptr_i32(), page_size, exec_stream_)) {
+                                  : is_fp8 ? static_cast<const void *>(c.ptr_fp8())
+                                           : static_cast<const void *>(c.ptr);
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        const bool launched = ported::launch_block_kmean_paged_typed(
+            const_cast<void *>(ptr), is_fp16, is_fp8,
+            static_cast<void *>(kb.ptr), kbar_dtype, n_blocks, n_kv_heads,
+            per_pos_size, head_dim, wb.ptr_i32(), bt.ptr_i32(),
+            pages.ptr_i32(), page_size, exec_stream_);
+        if (!launched) {
             return {false, "block_kmean_paged launch failed"};
         }
         return launch_status("cuda block_kmean_paged_device");
@@ -7051,8 +14094,12 @@ public:
         auto &a = as_tensor(accum);
         const auto &qt = as_tensor(q);
         const auto &kb = as_tensor(kbar);
-        if (!ported::launch_block_attn_score_step(
-                a.ptr, qt.ptr, kb.ptr, q_stride, n_blocks,
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        if (!ported::launch_block_attn_score_step_typed(
+                a.ptr, qt.ptr, kb.ptr, kbar_dtype, q_stride, n_blocks,
                 n_heads, n_kv_heads, head_dim, scale, exec_stream_)) {
             return {false, "block_attn_score_step launch failed"};
         }
@@ -7074,7 +14121,10 @@ public:
                                                        uint32_t excl_lo_end,
                                                        uint32_t excl_hi_begin,
                                                        uint32_t n_subblocks,
-                                                       uint32_t reduce_max) override {
+                                                       uint32_t reduce_max,
+                                                       uint32_t accumulate,
+                                                       uint64_t q_elem_off,
+                                                       uint64_t kbar_elem_off) override {
         if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
             head_dim == 0) {
             return {};
@@ -7082,10 +14132,43 @@ public:
         auto &sc = as_tensor(score);
         const auto &qm = as_tensor(q_multi);
         const auto &kb = as_tensor(kbar_multi);
-        if (!ported::launch_block_attn_score_softmax_pages(
-                sc.ptr, qm.ptr, kb.ptr, n_layers, n_tokens, q_layer_stride,
+        const uint64_t q_row_elems =
+            static_cast<uint64_t>(n_heads) * head_dim;
+        const uint64_t q_rows_needed =
+            static_cast<uint64_t>(n_layers - 1) * q_layer_stride +
+            n_tokens;
+        const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
+        const uint64_t kbar_block_elems =
+            static_cast<uint64_t>(ns) * n_kv_heads * head_dim;
+        const uint64_t kbar_blocks_needed =
+            static_cast<uint64_t>(n_layers - 1) * kbar_layer_stride +
+            n_blocks;
+        if (q_elem_off > qm.count || kbar_elem_off > kb.count ||
+            q_row_elems == 0 || kbar_block_elems == 0 ||
+            q_rows_needed > (qm.count - q_elem_off) / q_row_elems ||
+            kbar_blocks_needed >
+                (kb.count - kbar_elem_off) / kbar_block_elems) {
+            return {false, "block_attn_score_softmax_pages element offset out of range"};
+        }
+        const auto *q_bytes =
+            reinterpret_cast<const unsigned char *>(qm.ptr);
+        const auto *kbar_bytes =
+            reinterpret_cast<const unsigned char *>(kb.ptr);
+        const void *q_ptr =
+            q_bytes + static_cast<size_t>(q_elem_off) * qm.elem_size;
+        const void *kbar_ptr =
+            kbar_bytes + static_cast<size_t>(kbar_elem_off) * kb.elem_size;
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        if (!ported::launch_block_attn_score_softmax_pages_typed(
+                sc.ptr, q_ptr, qm.is_fp16(), kbar_ptr, kbar_dtype,
+                n_layers, n_tokens,
+                q_layer_stride,
                 n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
-                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, exec_stream_)) {
+                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, accumulate,
+                exec_stream_)) {
             return {false, "block_attn_score_softmax_pages launch failed"};
         }
         return launch_status("cuda block_attn_score_softmax_pages_device");
@@ -7131,10 +14214,12 @@ public:
             return {false, "block_attention_mass_paged_device metadata dtype mismatch"};
         }
         const bool is_fp16 = kc.is_fp16();
+        const bool is_fp8 = kc.is_fp8_kv();
         const bool is_f32 = (kc.elem_size == sizeof(float)) && !kc.is_q8_kv() &&
                             !kc.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            return {false, "block_attention_mass_paged_device requires fp16 or fp32 KV"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "block_attention_mass_paged_device requires fp16, "
+                           "fp32, or fp8 KV"};
         }
         if (auto st = cuda_status(cudaMemsetAsync(m.ptr, 0,
                             static_cast<size_t>(buckets) * sizeof(float),
@@ -7143,12 +14228,20 @@ public:
             return st;
         }
         const void *ptr = is_fp16 ? static_cast<const void *>(kc.ptr_h())
-                                  : static_cast<const void *>(kc.ptr);
-        if (!ported::launch_block_attention_mass_paged(
-                const_cast<void *>(ptr), is_fp16, m.ptr, qt.ptr, q_stride,
-                n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
-                wb.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size, seq_len,
-                scale, exec_stream_)) {
+                                  : is_fp8 ? static_cast<const void *>(kc.ptr_fp8())
+                                           : static_cast<const void *>(kc.ptr);
+        const bool launched = is_fp8
+            ? ported::launch_block_attention_mass_paged_fp8(
+                  const_cast<void *>(ptr), m.ptr, qt.ptr, q_stride,
+                  n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
+                  wb.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size,
+                  seq_len, scale, exec_stream_)
+            : ported::launch_block_attention_mass_paged(
+                  const_cast<void *>(ptr), is_fp16, m.ptr, qt.ptr, q_stride,
+                  n_window_blocks, n_heads, n_kv_heads, per_pos_size, head_dim,
+                  wb.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size,
+                  seq_len, scale, exec_stream_);
+        if (!launched) {
             return {false, "block_attention_mass_paged launch failed"};
         }
         return launch_status("cuda block_attention_mass_paged_device");
@@ -7179,18 +14272,28 @@ public:
             return {false, "block_kmean_content_paged_device metadata dtype mismatch"};
         }
         const bool is_fp16 = c.is_fp16();
+        const bool is_fp8 = c.is_fp8_kv();
         const bool is_f32 = (c.elem_size == sizeof(float)) && !c.is_q8_kv() &&
                             !c.is_fp8_kv();
-        if (!is_fp16 && !is_f32) {
-            // q8/fp8 K can't be de-RoPE'd meaningfully — retrieval stays recency.
-            return {false, "block_kmean_content_paged_device requires fp16 or fp32 KV"};
+        if (!is_fp16 && !is_fp8 && !is_f32) {
+            return {false, "block_kmean_content_paged_device requires fp16, "
+                           "fp32, or fp8 KV"};
         }
         const void *ptr = is_fp16 ? static_cast<const void *>(c.ptr_h())
-                                  : static_cast<const void *>(c.ptr);
-        if (!ported::launch_block_kmean_content_paged(
-                const_cast<void *>(ptr), is_fp16, kb.ptr + out_elem_off, n_blocks,
-                n_kv_heads, per_pos_size, head_dim, rope_dim, ob.ptr_i32(),
-                bt.ptr_i32(), pages.ptr_i32(), page_size, theta, exec_stream_)) {
+                                  : is_fp8 ? static_cast<const void *>(c.ptr_fp8())
+                                           : static_cast<const void *>(c.ptr);
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        void *kbar_out = reinterpret_cast<uint8_t *>(kb.ptr) +
+                         out_elem_off * kb.elem_size;
+        const bool launched = ported::launch_block_kmean_content_paged_typed(
+            const_cast<void *>(ptr), is_fp16, is_fp8, kbar_out, kbar_dtype,
+            n_blocks, n_kv_heads, per_pos_size, head_dim, rope_dim,
+            ob.ptr_i32(), bt.ptr_i32(), pages.ptr_i32(), page_size, theta,
+            exec_stream_);
+        if (!launched) {
             return {false, "block_kmean_content_paged launch failed"};
         }
         return launch_status("cuda block_kmean_content_paged_device");
@@ -7215,17 +14318,58 @@ public:
         }
         const auto &kbt = as_tensor(k_batch);
         auto &kb = as_tensor(kbar);
-        if (kbt.elem_size != sizeof(float) || kb.elem_size != sizeof(float)) {
-            return {false, "block_kmean_content_batch_device requires fp32 buffers"};
+        if (kbt.elem_size != sizeof(float)) {
+            return {false, "block_kmean_content_batch_device requires fp32 K input"};
         }
         const float *k_ptr = kbt.ptr + static_cast<uint64_t>(src_row_off) * k_stride;
-        if (!ported::launch_block_kmean_content_batch(
-                k_ptr, kb.ptr, kbar_block_base, n_blocks_chunk, k_stride, batch,
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        if (!ported::launch_block_kmean_content_batch_typed(
+                k_ptr, kb.ptr, kbar_dtype, kbar_block_base, n_blocks_chunk,
+                k_stride, batch,
                 blk_tokens, n_kv_heads, head_dim, rope_dim, rope_base, theta,
                 n_subblocks, exec_stream_)) {
             return {false, "block_kmean_content_batch launch failed"};
         }
         return launch_status("cuda block_kmean_content_batch_device");
+    }
+
+    DeviceStatus block_kmean_content_batch_merge_device(
+            const DeviceTensor &k_batch, DeviceTensor &kbar,
+            uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+            uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+            uint32_t first_block_token_offset, uint32_t n_kv_heads,
+            uint32_t head_dim, uint32_t rope_dim, int32_t rope_base,
+            float theta, uint32_t n_subblocks = 1) override {
+        if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 ||
+            batch == 0) {
+            return {};
+        }
+        const auto &kbt = as_tensor(k_batch);
+        auto &kb = as_tensor(kbar);
+        if (kbt.elem_size != sizeof(float)) {
+            return {false,
+                    "block_kmean_content_batch_merge_device requires fp32 K input"};
+        }
+        if (first_block_token_offset >= blk_tokens) {
+            return {false,
+                    "block_kmean_content_batch_merge_device offset out of range"};
+        }
+        const ported::KbarDType kbar_dtype =
+            kb.is_fp8_kv() ? ported::KbarDType::FP8
+                           : kb.is_fp16() ? ported::KbarDType::F16
+                                         : ported::KbarDType::F32;
+        if (!ported::launch_block_kmean_content_batch_merge_typed(
+                kbt.ptr, kb.ptr, kbar_dtype, kbar_block_base,
+                n_blocks_chunk, k_stride,
+                batch, blk_tokens, first_block_token_offset, n_kv_heads,
+                head_dim, rope_dim, rope_base, theta, n_subblocks,
+                exec_stream_)) {
+            return {false, "block_kmean_content_batch_merge launch failed"};
+        }
+        return launch_status("cuda block_kmean_content_batch_merge_device");
     }
 
     DeviceStatus derope_store_content_batch_device(const DeviceTensor &k_batch,
@@ -7375,10 +14519,16 @@ public:
         if (cnt == 0 || n_heads == 0 || head_dim == 0) return {};
         auto &qm = as_tensor(q_multi);
         const auto &qt = as_tensor(q);
-        if (!ported::launch_derope_query_multi(
-                qm.ptr + out_elem_offset, qt.ptr + q_elem_offset,
-                q_token_stride, q_head_stride, cnt, n_heads, head_dim, rope_dim,
-                start_pos, theta, exec_stream_)) {
+        const bool ok = qm.is_fp16()
+            ? ported::launch_derope_query_multi_f16(
+                  qm.ptr_h() + out_elem_offset, qt.ptr + q_elem_offset,
+                  q_token_stride, q_head_stride, cnt, n_heads, head_dim,
+                  rope_dim, start_pos, theta, exec_stream_)
+            : ported::launch_derope_query_multi(
+                  qm.ptr + out_elem_offset, qt.ptr + q_elem_offset,
+                  q_token_stride, q_head_stride, cnt, n_heads, head_dim,
+                  rope_dim, start_pos, theta, exec_stream_);
+        if (!ok) {
             return {false, "derope_query_multi launch failed"};
         }
         return launch_status("cuda derope_query_multi_device");
@@ -7429,7 +14579,9 @@ public:
                 per_pos_size, row_elems, src_stride, pages.ptr_i32(),
                 indptr.ptr_i32(), page_size);
         } else if (c.is_fp8_kv()) {
-            kv_append_paged_ragged_kernel_fp8<<<grid, threads, 0, exec_stream_>>>(
+            const unsigned fp8_blocks =
+                ((per_pos_size + 1U) / 2U + threads - 1U) / threads;
+            kv_append_paged_ragged_kernel_fp8<<<dim3(batch, fp8_blocks), threads, 0, exec_stream_>>>(
                 c.ptr_fp8(), s.ptr, positions.ptr_i32(), per_pos_size,
                 src_stride, pages.ptr_i32(), indptr.ptr_i32(), page_size);
         } else if (c.is_fp16()) {
@@ -7691,6 +14843,18 @@ public:
             }
         }
         return {};
+    }
+
+    static bool flashinfer_prefill_exact_workspace_enabled() {
+        static const bool enabled = []() {
+            const char *value =
+                std::getenv("QW3_FLASHINFER_PREFILL_EXACT_WORKSPACE");
+            return !value || !*value ||
+                   (std::strcmp(value, "0") != 0 &&
+                    std::strcmp(value, "off") != 0 &&
+                    std::strcmp(value, "false") != 0);
+        }();
+        return enabled;
     }
 
     DeviceStatus acquire_flashinfer_batch_prefill_host_workspace(void **host_workspace) {
@@ -8113,21 +15277,50 @@ public:
         }
 
 #if QW3_ENABLE_FLASHINFER
-        // FP8 (e4m3) KV batch attention (prefill + MTP verify): route to
-        // FlashInfer's generic single-prefill template (upcasts fp8->half
-        // internally, fp16 MMA). Raw e4m3, no scale. Fires unconditionally
-        // regardless of prefill_attn_kernel_choice() / prefill_attn_min_batch()
-        // because there is NO fp8 fallback kernel in qw3 — the fp16 paths below
-        // are gated on kv_fp16 and the vec/native kernels would misread the
-        // 1-byte plane. head_dim must be 256 (the only config the adapter
-        // instantiates). Fail loudly otherwise. NOTE: small MTP-verify batches
-        // over a long KV under-parallelize this kernel (the same reason the
-        // fp16 path falls to the vec decode below min_batch); MTP+fp8 is a
-        // deferred optimization, fp16 MTP is unaffected.
+        // FP8 (e4m3) KV batch attention. A tiny causal batch is the MTP verify
+        // shape, not a throughput-oriented prefill: issue one stream-K decode
+        // per row so each query gets enough CTAs over a long KV. The launches
+        // share staging safely because they are ordered on exec_stream_.
+        // Larger batches retain FlashInfer single-prefill below.
         if (kc.is_fp8_kv()) {
             if (head_dim != 256) {
                 return {false, "fp8 KV batch attention requires head_dim=256 (FlashInfer adapter)"};
             }
+            constexpr uint32_t kFp8DecodeBatchMax = 8;
+            if (batch <= kFp8DecodeBatchMax) {
+                const uint64_t o_elems =
+                    static_cast<uint64_t>(n_heads) * head_dim;
+                const uint64_t tmp_elems =
+                    flashinfer_adapter::decode_f32q_f16kv_tmp_elements(
+                        n_heads, head_dim, base_seq_len + batch);
+                if (auto st =
+                        ensure_flashinfer_decode_workspace(o_elems, tmp_elems);
+                    !st.ok) {
+                    return st;
+                }
+                for (uint32_t b = 0; b < batch; ++b) {
+                    if (!flashinfer_adapter::launch_decode_f32q_fp8kv(
+                            o.ptr + static_cast<uint64_t>(b) * out_batch_stride,
+                            flashinfer_decode_o_f16_,
+                            tmp_elems > 0 ? flashinfer_decode_tmp_ : nullptr,
+                            qq.ptr + static_cast<uint64_t>(b) * q_batch_stride,
+                            q_stride, kc.ptr, vc.ptr,
+                            n_heads, n_kv_heads, head_dim,
+                            base_seq_len + b + 1U, scale, exec_stream_)) {
+                        return {false, "flashinfer fp8 MTP decode launcher refused"};
+                    }
+                }
+                constexpr unsigned threads = 256;
+                const unsigned blocks =
+                    static_cast<unsigned>((o_elems + threads - 1) / threads);
+                apply_attn_gate_kernel<<<dim3(batch, blocks), threads, 0,
+                                         exec_stream_>>>(
+                    o.ptr, qq.ptr, q_stride, n_heads, head_dim,
+                    q_batch_stride, out_batch_stride);
+                return launch_status(
+                    "cuda attention_decode_batch flashinfer fp8 split-k rows");
+            }
+
             const size_t pack_bytes =
                 static_cast<size_t>(batch) * n_heads * head_dim * sizeof(__half);
             const size_t need = 2 * pack_bytes;
@@ -8688,15 +15881,29 @@ public:
             const uint64_t q_elems =
                 static_cast<uint64_t>(batch) * n_heads * head_dim;
             const uint64_t o_elems = q_elems;
-            const uint64_t meta_i32_elems = 1u << 20;  // 4 MiB scheduler/prefix workspace.
+            size_t meta_bytes = 4ull << 20;
+            size_t float_bytes =
+                flashinfer_prefill_float_workspace_elements() * sizeof(float);
             // Float scratch for FlashInfer split-KV partial-output merge. The
             // planner partitions the long KV stream across many CTAs (verify is
             // batch~5 vs base grid 4 CTAs), writes per-chunk partial O+LSE here,
-            // then merges via VariableLengthMergeStates. 512 MiB covers the
-            // worst case (24 heads × ~94 padded_batch × 128 cta_tile_q × 256
-            // head_dim × 4B ≈ 282 MiB); overflow degrades gracefully to a
-            // disable-split plan + batch-decode fallback.
-            const uint64_t float_elems = 128ull << 20;  // 512 MiB
+            // then merges via VariableLengthMergeStates. Size from the exact
+            // plan when available, while retaining the configured workspace cap.
+            if (flashinfer_prefill_exact_workspace_enabled()) {
+                size_t exact_meta_bytes = 0;
+                size_t exact_float_bytes = 0;
+                if (flashinfer_adapter::batch_prefill_paged_workspace_bytes(
+                        exact_meta_bytes, exact_float_bytes,
+                        n_pages, page_size, n_heads, n_kv_heads, head_dim,
+                        base_seq_len, batch)) {
+                    meta_bytes = exact_meta_bytes;
+                    float_bytes = std::min(float_bytes, exact_float_bytes);
+                }
+            }
+            const uint64_t meta_i32_elems =
+                (meta_bytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+            const uint64_t float_elems =
+                (float_bytes + sizeof(float) - 1) / sizeof(float);
             if (auto st = ensure_flashinfer_batch_prefill_workspace(
                     q_elems, o_elems, meta_i32_elems, float_elems); !st.ok) {
                 return st;
@@ -8706,6 +15913,7 @@ public:
                 !st.ok) {
                 return st;
             }
+            bool plan_cache_hit = false;
             const bool launched = kc.is_fp8_kv()
                 ? flashinfer_adapter::launch_batch_prefill_paged_f16q_fp8kv_gated(
                     o.ptr,
@@ -8721,7 +15929,7 @@ public:
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
-                    scale, exec_stream_)
+                    scale, exec_stream_, &plan_cache_hit)
                 : flashinfer_adapter::launch_batch_prefill_paged_f16q_f16kv_gated(
                     o.ptr,
                     flashinfer_batch_prefill_q_f16_,
@@ -8736,11 +15944,17 @@ public:
                     qq.ptr, q_stride, kc.ptr, vc.ptr, pages.ptr_i32(),
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
-                    scale, exec_stream_);
+                    scale, exec_stream_, &plan_cache_hit);
             if (launched) {
-                if (auto st = record_flashinfer_batch_prefill_host_workspace();
-                    !st.ok) {
-                    return st;
+                // A cache hit does not read or write the acquired host plan
+                // buffer. Leave it immediately reusable instead of fencing it
+                // behind this layer's entire attention launch.
+                if (!plan_cache_hit) {
+                    if (auto st =
+                            record_flashinfer_batch_prefill_host_workspace();
+                        !st.ok) {
+                        return st;
+                    }
                 }
                 return launch_status("cuda attention_prefill_batch flashinfer paged gated");
             }
@@ -8813,12 +16027,29 @@ public:
             const uint64_t q_elems =
                 static_cast<uint64_t>(total_q) * n_heads * head_dim;
             const uint64_t o_elems = q_elems;
-            const uint64_t meta_i32_elems = 1u << 20;
+            size_t meta_bytes = 4ull << 20;
+            size_t float_bytes =
+                flashinfer_prefill_float_workspace_elements() * sizeof(float);
             // Enable FlashInfer split-KV for the ragged MTP verify batch: the
             // batch is only a few query rows per request but each attends a
             // long KV, so without splitting the grid starves (~n_kv_heads CTAs)
             // and co-batching concurrent requests yields no attention speedup.
-            const uint64_t float_elems = 128ull << 20;  // 512 MiB scratch
+            if (flashinfer_prefill_exact_workspace_enabled()) {
+                size_t exact_meta_bytes = 0;
+                size_t exact_float_bytes = 0;
+                if (flashinfer_adapter::
+                        batch_prefill_paged_ragged_workspace_bytes(
+                            exact_meta_bytes, exact_float_bytes,
+                            q_indptr_host, page_indptr_host, batch, total_q,
+                            page_size, n_heads, n_kv_heads, head_dim)) {
+                    meta_bytes = exact_meta_bytes;
+                    float_bytes = std::min(float_bytes, exact_float_bytes);
+                }
+            }
+            const uint64_t meta_i32_elems =
+                (meta_bytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+            const uint64_t float_elems =
+                (float_bytes + sizeof(float) - 1) / sizeof(float);
             if (auto st = ensure_flashinfer_batch_prefill_workspace(
                     q_elems, o_elems, meta_i32_elems, float_elems); !st.ok) {
                 return st;
@@ -9615,7 +16846,12 @@ public:
                                       uint64_t byte_offset,
                                       const void *host,
                                       uint64_t byte_count) override {
-        if (auto st = begin_kv_transfer_to_device(); !st.ok) return st;
+        // This is the synchronous convenience API. A freshly allocated tensor
+        // may still have its zero-initialization queued on exec_stream_; order
+        // the transfer stream after that work before uploading host data.
+        // Explicit async KVMem callers retain the fence-based overlap path via
+        // copy_bytes_from_host_async().
+        if (auto st = begin_kv_transfer_from_device(); !st.ok) return st;
         if (auto st = copy_bytes_from_host_async(x, byte_offset, host, byte_count);
             !st.ok) return st;
         return wait_kv_transfer();
@@ -9641,6 +16877,289 @@ public:
                                            cudaMemcpyHostToDevice,
                                            kv_copy_stream_),
                            "copy_bytes_from_host async");
+    }
+
+    DeviceStatus copy_packed_pages_from_host_async(
+            const void *host, uint64_t host_bytes,
+            const std::vector<DeviceTensor *> &targets,
+            const int32_t *src_page_indices,
+            const int32_t *dst_page_indices,
+            uint32_t pages_per_target,
+            uint64_t page_bytes) override {
+        if (host_bytes == 0 || targets.empty() ||
+            pages_per_target == 0) {
+            return {};
+        }
+        if (!host || !src_page_indices || !dst_page_indices) {
+            return {false, "packed KV scatter received null storage"};
+        }
+        if (page_bytes == 0 || page_bytes % sizeof(uint4) != 0 ||
+            host_bytes % page_bytes != 0) {
+            return {false,
+                    "packed KV scatter requires uint4-aligned pages"};
+        }
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        const uint64_t index_count =
+            static_cast<uint64_t>(targets.size()) *
+            pages_per_target;
+        const uint64_t packed_pages = host_bytes / page_bytes;
+        for (size_t t = 0; t < targets.size(); ++t) {
+            if (!targets[t]) {
+                return {false, "packed KV scatter target is null"};
+            }
+            const auto &target = as_tensor(*targets[t]);
+            const uint64_t target_bytes =
+                target.count * static_cast<uint64_t>(target.elem_size);
+            const uint64_t target_pages = target_bytes / page_bytes;
+            const uint64_t base =
+                static_cast<uint64_t>(t) * pages_per_target;
+            for (uint32_t p = 0; p < pages_per_target; ++p) {
+                const int32_t src_page =
+                    src_page_indices[base + p];
+                const int32_t dst_page =
+                    dst_page_indices[base + p];
+                if (src_page < 0 || dst_page < 0 ||
+                    static_cast<uint64_t>(src_page) >= packed_pages ||
+                    static_cast<uint64_t>(dst_page) >= target_pages) {
+                    return {false,
+                            "packed KV scatter page index out of range"};
+                }
+            }
+        }
+        if (host_bytes > kv_packed_stage_capacity_ ||
+            index_count > kv_packed_page_capacity_) {
+            // Reallocation must not invalidate storage referenced by an older
+            // queued slab. In steady state the first 64 MiB batch establishes
+            // both capacities and this synchronization is never revisited.
+            if (auto st = cuda_status(
+                    cudaStreamSynchronize(kv_copy_stream_),
+                    "packed KV scatter resize synchronize"); !st.ok) {
+                return st;
+            }
+        }
+        if (host_bytes > kv_packed_stage_capacity_) {
+            if (kv_packed_stage_) cudaFree(kv_packed_stage_);
+            kv_packed_stage_ = nullptr;
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_stage_,
+                               static_cast<size_t>(host_bytes)),
+                    "packed KV scatter stage alloc"); !st.ok) {
+                kv_packed_stage_capacity_ = 0;
+                return st;
+            }
+            kv_packed_stage_capacity_ = host_bytes;
+        }
+        if (index_count > kv_packed_page_capacity_) {
+            if (kv_packed_src_pages_) cudaFree(kv_packed_src_pages_);
+            if (kv_packed_dst_pages_) cudaFree(kv_packed_dst_pages_);
+            kv_packed_src_pages_ = nullptr;
+            kv_packed_dst_pages_ = nullptr;
+            const size_t bytes =
+                static_cast<size_t>(index_count) * sizeof(int32_t);
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_src_pages_, bytes),
+                    "packed KV scatter src-index alloc"); !st.ok) {
+                kv_packed_page_capacity_ = 0;
+                return st;
+            }
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_dst_pages_, bytes),
+                    "packed KV scatter dst-index alloc"); !st.ok) {
+                cudaFree(kv_packed_src_pages_);
+                kv_packed_src_pages_ = nullptr;
+                kv_packed_page_capacity_ = 0;
+                return st;
+            }
+            kv_packed_page_capacity_ = index_count;
+        }
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_stage_, host,
+                    static_cast<size_t>(host_bytes),
+                    cudaMemcpyHostToDevice, kv_copy_stream_),
+                "packed KV slab H2D"); !st.ok) {
+            return st;
+        }
+        const size_t indices_bytes =
+            static_cast<size_t>(index_count) * sizeof(int32_t);
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_src_pages_, src_page_indices,
+                    indices_bytes, cudaMemcpyHostToDevice,
+                    kv_copy_stream_),
+                "packed KV src-index H2D"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_dst_pages_, dst_page_indices,
+                    indices_bytes, cudaMemcpyHostToDevice,
+                    kv_copy_stream_),
+                "packed KV dst-index H2D"); !st.ok) {
+            return st;
+        }
+
+        const uint32_t uint4_per_page =
+            static_cast<uint32_t>(page_bytes / sizeof(uint4));
+        constexpr uint32_t kThreads = 256;
+        const dim3 grid(
+            pages_per_target,
+            (uint4_per_page + kThreads - 1) / kThreads);
+        for (size_t t = 0; t < targets.size(); ++t) {
+            auto &target = as_tensor(*targets[t]);
+            const int32_t *src_pages =
+                kv_packed_src_pages_ + t * pages_per_target;
+            const int32_t *dst_pages =
+                kv_packed_dst_pages_ + t * pages_per_target;
+            packed_kv_page_scatter_kernel<<<
+                grid, kThreads, 0, kv_copy_stream_>>>(
+                reinterpret_cast<uint4 *>(target.ptr),
+                reinterpret_cast<const uint4 *>(kv_packed_stage_),
+                src_pages, dst_pages, pages_per_target,
+                uint4_per_page);
+        }
+        return launch_status("packed KV page scatter");
+    }
+
+    DeviceStatus copy_packed_pages_to_host_async(
+            void *host, uint64_t host_bytes,
+            const std::vector<DeviceTensor *> &targets,
+            const int32_t *src_page_indices,
+            const int32_t *dst_page_indices,
+            uint32_t pages_per_target,
+            uint64_t page_bytes) override {
+        if (host_bytes == 0 || targets.empty() ||
+            pages_per_target == 0) {
+            return {};
+        }
+        if (!host || !src_page_indices || !dst_page_indices) {
+            return {false, "packed KV gather received null storage"};
+        }
+        if (page_bytes == 0 || page_bytes % sizeof(uint4) != 0 ||
+            host_bytes % page_bytes != 0) {
+            return {false,
+                    "packed KV gather requires uint4-aligned pages"};
+        }
+        if (auto st = ensure_kv_copy_stream(); !st.ok) return st;
+        const uint64_t index_count =
+            static_cast<uint64_t>(targets.size()) *
+            pages_per_target;
+        const uint64_t packed_pages = host_bytes / page_bytes;
+        for (size_t t = 0; t < targets.size(); ++t) {
+            if (!targets[t]) {
+                return {false, "packed KV gather source is null"};
+            }
+            const auto &target = as_tensor(*targets[t]);
+            const uint64_t target_bytes =
+                target.count * static_cast<uint64_t>(target.elem_size);
+            const uint64_t target_pages = target_bytes / page_bytes;
+            const uint64_t base =
+                static_cast<uint64_t>(t) * pages_per_target;
+            for (uint32_t p = 0; p < pages_per_target; ++p) {
+                const int32_t src_page =
+                    src_page_indices[base + p];
+                const int32_t dst_page =
+                    dst_page_indices[base + p];
+                if (src_page < 0 || dst_page < 0 ||
+                    static_cast<uint64_t>(src_page) >= target_pages ||
+                    static_cast<uint64_t>(dst_page) >= packed_pages) {
+                    return {false,
+                            "packed KV gather page index out of range"};
+                }
+            }
+        }
+        if (host_bytes > kv_packed_stage_capacity_ ||
+            index_count > kv_packed_page_capacity_) {
+            // The staging allocation is shared with packed stage-in. Do not
+            // resize storage that may still be referenced by queued work.
+            if (auto st = cuda_status(
+                    cudaStreamSynchronize(kv_copy_stream_),
+                    "packed KV gather resize synchronize"); !st.ok) {
+                return st;
+            }
+        }
+        if (host_bytes > kv_packed_stage_capacity_) {
+            if (kv_packed_stage_) cudaFree(kv_packed_stage_);
+            kv_packed_stage_ = nullptr;
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_stage_,
+                               static_cast<size_t>(host_bytes)),
+                    "packed KV gather stage alloc"); !st.ok) {
+                kv_packed_stage_capacity_ = 0;
+                return st;
+            }
+            kv_packed_stage_capacity_ = host_bytes;
+        }
+        if (index_count > kv_packed_page_capacity_) {
+            if (kv_packed_src_pages_) cudaFree(kv_packed_src_pages_);
+            if (kv_packed_dst_pages_) cudaFree(kv_packed_dst_pages_);
+            kv_packed_src_pages_ = nullptr;
+            kv_packed_dst_pages_ = nullptr;
+            const size_t bytes =
+                static_cast<size_t>(index_count) * sizeof(int32_t);
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_src_pages_, bytes),
+                    "packed KV gather src-index alloc"); !st.ok) {
+                kv_packed_page_capacity_ = 0;
+                return st;
+            }
+            if (auto st = cuda_status(
+                    cudaMalloc(&kv_packed_dst_pages_, bytes),
+                    "packed KV gather dst-index alloc"); !st.ok) {
+                cudaFree(kv_packed_src_pages_);
+                kv_packed_src_pages_ = nullptr;
+                kv_packed_page_capacity_ = 0;
+                return st;
+            }
+            kv_packed_page_capacity_ = index_count;
+        }
+        const size_t indices_bytes =
+            static_cast<size_t>(index_count) * sizeof(int32_t);
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_src_pages_, src_page_indices,
+                    indices_bytes, cudaMemcpyHostToDevice,
+                    kv_copy_stream_),
+                "packed KV gather src-index H2D"); !st.ok) {
+            return st;
+        }
+        if (auto st = cuda_status(
+                cudaMemcpyAsync(
+                    kv_packed_dst_pages_, dst_page_indices,
+                    indices_bytes, cudaMemcpyHostToDevice,
+                    kv_copy_stream_),
+                "packed KV gather dst-index H2D"); !st.ok) {
+            return st;
+        }
+
+        const uint32_t uint4_per_page =
+            static_cast<uint32_t>(page_bytes / sizeof(uint4));
+        constexpr uint32_t kThreads = 256;
+        const dim3 grid(
+            pages_per_target,
+            (uint4_per_page + kThreads - 1) / kThreads);
+        for (size_t t = 0; t < targets.size(); ++t) {
+            const auto &target = as_tensor(*targets[t]);
+            const int32_t *src_pages =
+                kv_packed_src_pages_ + t * pages_per_target;
+            const int32_t *dst_pages =
+                kv_packed_dst_pages_ + t * pages_per_target;
+            packed_kv_page_scatter_kernel<<<
+                grid, kThreads, 0, kv_copy_stream_>>>(
+                reinterpret_cast<uint4 *>(kv_packed_stage_),
+                reinterpret_cast<const uint4 *>(target.ptr),
+                src_pages, dst_pages, pages_per_target,
+                uint4_per_page);
+        }
+        if (auto st = launch_status("packed KV page gather"); !st.ok) {
+            return st;
+        }
+        return cuda_status(cudaMemcpyAsync(
+                               host, kv_packed_stage_,
+                               static_cast<size_t>(host_bytes),
+                               cudaMemcpyDeviceToHost,
+                               kv_copy_stream_),
+                           "packed KV slab D2H");
     }
 
     DeviceStatus copy_d2d(DeviceTensor &dst,
@@ -9679,6 +17198,25 @@ public:
         const auto &first = as_tensor(first_h);
         const auto &h = as_tensor(h_batch);
         if (batch == 0 || h_stride == 0) return {};
+        if (!d.is_bf16() && d.elem_size == sizeof(float) &&
+            first.is_bf16() && h.is_bf16()) {
+            if (first.count < h_stride) {
+                return {false, "pack_mtp_prefix_hinputs first_h oob"};
+            }
+            if (d.count < static_cast<uint64_t>(batch) * h_stride ||
+                (batch > 1 &&
+                 h.count < static_cast<uint64_t>(batch - 1) * h_stride)) {
+                return {false, "pack_mtp_prefix_hinputs BF16 source oob"};
+            }
+            const uint64_t count = static_cast<uint64_t>(batch) * h_stride;
+            const unsigned blocks =
+                static_cast<unsigned>((count + 255) / 256);
+            pack_mtp_prefix_bf16_to_f32_kernel<<<
+                blocks, 256, 0, exec_stream_>>>(
+                d.ptr, first.ptr_bf16(), h.ptr_bf16(),
+                batch, h_stride);
+            return launch_status("pack_mtp_prefix_hinputs bf16_to_f32");
+        }
         if (d.elem_size != first.elem_size || d.elem_size != h.elem_size) {
             return {false, "pack_mtp_prefix_hinputs dtype mismatch"};
         }
@@ -9770,13 +17308,50 @@ public:
 private:
     LinearBackend linear_backend_ = LinearBackend::Auto;
     cublasHandle_t cublas_handle_ = nullptr;
+    cublasLtHandle_t cublaslt_handle_ = nullptr;
+    void *cublaslt_workspace_ = nullptr;
+    size_t cublaslt_workspace_bytes_ = 0;
+    std::vector<std::unique_ptr<Fp8LtPlan>> fp8_lt_plans_;
     uint64_t *rows_buf_ = nullptr;
     uint32_t  rows_buf_capacity_ = 0;
+    HostEmbeddingSlot host_embedding_slots_[kHostEmbeddingSlots];
+    uint32_t host_embedding_next_slot_ = 0;
+    ArgmaxPair *host_embedding_argmax_ = nullptr;
     // Input-side FP16 staging buffer for HGEMM (X is FP32 in our stack but
     // cuBLAS HGEMM needs FP16). Resized lazily to fit the largest (batch *
     // cols) matmul seen so far.
     __half *x_fp16_workspace_ = nullptr;
     uint64_t x_fp16_capacity_ = 0;  // elements
+    __nv_bfloat16 *x_bf16_workspace_ = nullptr;
+    uint64_t x_bf16_capacity_ = 0;  // elements
+    __nv_fp8_e4m3 *x_fp8_workspace_ = nullptr;
+    uint64_t x_fp8_capacity_ = 0;  // elements
+    float *x_fp8_scales_ = nullptr;
+    uint32_t x_fp8_scale_capacity_ = 0;
+    void *x_fp4_workspace_ = nullptr;
+    size_t x_fp4_workspace_capacity_ = 0;
+    void *x_fp4_scales_ = nullptr;
+    size_t x_fp4_scales_capacity_ = 0;
+    void *fp4_gemm_workspace_ = nullptr;
+    size_t fp4_gemm_workspace_capacity_ = 0;
+    // FP8 projection output and NVFP4 BF16 FFN staging are consumed in
+    // separate phases on exec_stream_, so the larger allocation can back both.
+    void *linear_output_workspace_ = nullptr;
+    size_t linear_output_workspace_capacity_ = 0;
+    __nv_bfloat16 *mixed_out_bf16_ = nullptr;
+    uint64_t mixed_out_bf16_capacity_ = 0;  // elements
+    float *nvfp4_pair_out_f32_ = nullptr;
+    uint64_t nvfp4_pair_out_f32_capacity_ = 0;  // elements
+    float *fp8_out_f32_ = nullptr;
+    uint64_t fp8_out_f32_capacity_ = 0;  // elements
+    float *q8_out_f32_ = nullptr;
+    uint64_t q8_out_f32_capacity_ = 0;  // elements
+    bool lazy_recurrent_pair_requested_ = false;
+    bool lazy_attention_fanout_requested_ = false;
+    bool fp8_bf16_epilogue_failed_ = false;
+    bool fp8_cutlass_bf16_failed_ = false;
+    bool fp8_cutlass_f32_failed_ = false;
+    uint64_t workspace_trace_last_bytes_ = std::numeric_limits<uint64_t>::max();
     // Weight-side FP16 dequant scratch for HGEMM. Two ping-pong buffers, each
     // sized to the largest single Q8_0 weight (~150 MB on Qwen 3.6 27B). The
     // dequant of W_{n+1} runs on `dequant_stream_` concurrently with the
@@ -9790,6 +17365,11 @@ private:
     cudaEvent_t  hgemm_done_[2]   = {nullptr, nullptr};
     cudaStream_t kv_copy_stream_ = nullptr;
     cudaEvent_t kv_copy_exec_ready_ = nullptr;
+    void *kv_packed_stage_ = nullptr;
+    uint64_t kv_packed_stage_capacity_ = 0;
+    int32_t *kv_packed_src_pages_ = nullptr;
+    int32_t *kv_packed_dst_pages_ = nullptr;
+    uint64_t kv_packed_page_capacity_ = 0;
     // Q8_1 staging buffer for the ported mmvq path. Reused across calls;
     // grows on demand. Bytes hold (batch * blocks_per_row) block_q8_1 = 36 B.
     void   *q8_1_scratch_ = nullptr;
@@ -9838,6 +17418,15 @@ private:
     uint64_t flashinfer_batch_prefill_meta_i32_capacity_ = 0;  // elements
     float *flashinfer_batch_prefill_float_ = nullptr;
     uint64_t flashinfer_batch_prefill_float_capacity_ = 0;  // elements
+#ifdef QW3_ENABLE_GDN_SM120_AOT
+    __nv_bfloat16 *gdn_sm120_bf16_ = nullptr;
+    uint64_t gdn_sm120_bf16_capacity_ = 0;
+    float *gdn_sm120_initial_state_ = nullptr;
+    uint64_t gdn_sm120_initial_state_capacity_ = 0;
+    int64_t *gdn_sm120_cu_seqlens_ = nullptr;
+    uint8_t *gdn_sm120_tensormaps_ = nullptr;
+    uint32_t gdn_sm120_tensormaps_capacity_ = 0;
+#endif
     void *flashinfer_batch_prefill_meta_hosts_[kFlashInferBatchPrefillHostSlots] = {};
     uint64_t flashinfer_batch_prefill_meta_host_capacities_[kFlashInferBatchPrefillHostSlots] = {};
     cudaEvent_t flashinfer_batch_prefill_meta_events_[kFlashInferBatchPrefillHostSlots] = {};
@@ -9894,6 +17483,48 @@ bool launch_rope_block_remap(float *x, uint32_t n_tokens, uint32_t n_units,
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool launch_block_attention_mass_paged_fp8(
+        void *k_cache, float *mass, const float *q, uint32_t q_stride,
+        uint32_t n_window_blocks, uint32_t n_heads, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, uint32_t seq_len, float scale,
+        cudaStream_t stream) {
+    if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || seq_len == 0) {
+        return true;
+    }
+    constexpr uint32_t threads = 256;
+    block_attention_mass_paged_kernel<__nv_fp8_e4m3>
+        <<<n_heads, threads, 0, stream>>>(
+            mass, q, q_stride,
+            static_cast<const __nv_fp8_e4m3 *>(k_cache), n_window_blocks,
+            n_heads, n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+            page_indices, page_size, seq_len, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_rope_block_remap_paged_fp8(void *cache,
+                                       uint32_t n_tokens,
+                                       uint32_t n_kv_heads,
+                                       uint32_t per_pos_size,
+                                       uint32_t head_dim,
+                                       uint32_t rope_dim,
+                                       uint32_t win_base,
+                                       int32_t orig_base,
+                                       int32_t new_base,
+                                       const int32_t *page_indices,
+                                       uint32_t page_size,
+                                       float theta,
+                                       cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_tokens == 0 || n_kv_heads == 0 || half == 0) return true;
+    dim3 grid(n_tokens, n_kv_heads);
+    rope_block_remap_paged_kernel<__nv_fp8_e4m3><<<grid, half, 0, stream>>>(
+        static_cast<__nv_fp8_e4m3 *>(cache), per_pos_size, head_dim, rope_dim,
+        win_base, orig_base, new_base, page_indices, page_size, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool launch_rope_block_remap_paged(void *cache, bool is_fp16,
                                    uint32_t n_tokens, uint32_t n_kv_heads,
                                    uint32_t per_pos_size, uint32_t head_dim,
@@ -9945,24 +17576,337 @@ bool launch_rope_block_remap_paged_batched(void *cache, bool is_fp16,
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool launch_rope_block_remap_paged_batched_fp8(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0 || half == 0)
+        return true;
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    rope_block_remap_paged_batched_kernel<__nv_fp8_e4m3>
+        <<<grid, half, 0, stream>>>(
+            static_cast<__nv_fp8_e4m3 *>(cache), per_pos_size, head_dim,
+            rope_dim, to_base, from_base, n_tokens, page_indices, page_size,
+            theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_build_rope_sincos_table(
+        float *table, uint32_t positions, uint32_t rope_dim, float theta,
+        cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (positions == 0 || half == 0) return true;
+    constexpr uint32_t threads = 256;
+    const uint64_t total = static_cast<uint64_t>(positions) * half;
+    const uint32_t blocks =
+        static_cast<uint32_t>((total + threads - 1) / threads);
+    build_rope_sincos_table_kernel<<<blocks, threads, 0, stream>>>(
+        reinterpret_cast<float2 *>(table), positions, half, rope_dim, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename T>
+bool launch_rope_block_remap_paged_batched_table_typed(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0 ||
+        half == 0) {
+        return true;
+    }
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    rope_block_remap_paged_batched_table_kernel<T>
+        <<<grid, half, 0, stream>>>(
+            static_cast<T *>(cache), per_pos_size, head_dim, rope_dim,
+            to_base, from_base, n_tokens, page_indices, page_size,
+            reinterpret_cast<const float2 *>(rope_sincos),
+            rope_table_positions);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_rope_block_remap_paged_batched_table(
+        void *cache, bool is_fp16, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *from_base,
+        const int32_t *n_tokens, const int32_t *page_indices,
+        uint32_t page_size, const float *rope_sincos,
+        uint32_t rope_table_positions, cudaStream_t stream) {
+    if (is_fp16) {
+        return launch_rope_block_remap_paged_batched_table_typed<__half>(
+            cache, n_blocks, max_n_tokens, n_kv_heads, per_pos_size,
+            head_dim, rope_dim, to_base, from_base, n_tokens, page_indices,
+            page_size, rope_sincos, rope_table_positions, stream);
+    }
+    return launch_rope_block_remap_paged_batched_table_typed<float>(
+        cache, n_blocks, max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+        rope_dim, to_base, from_base, n_tokens, page_indices, page_size,
+        rope_sincos, rope_table_positions, stream);
+}
+
+bool launch_rope_block_remap_paged_batched_table_fp8(
+        void *cache, uint32_t n_blocks, uint32_t max_n_tokens,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base,
+        const int32_t *from_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        cudaStream_t stream) {
+    return launch_rope_block_remap_paged_batched_table_typed<__nv_fp8_e4m3>(
+        cache, n_blocks, max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+        rope_dim, to_base, from_base, n_tokens, page_indices, page_size,
+        rope_sincos, rope_table_positions, stream);
+}
+
+bool launch_raw_k_scatter_rope_paged_batched(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return true;
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    if (is_fp16) {
+        raw_k_scatter_rope_paged_batched_kernel<__half>
+            <<<grid, head_dim, 0, stream>>>(
+                static_cast<__half *>(cache),
+                static_cast<const __half *>(raw_k), raw_element_offset,
+                raw_block_stride_elements, max_n_tokens, per_pos_size,
+                head_dim, rope_dim, to_base, n_tokens, page_indices,
+                page_size, theta);
+    } else {
+        raw_k_scatter_rope_paged_batched_kernel<float>
+            <<<grid, head_dim, 0, stream>>>(
+                static_cast<float *>(cache),
+                static_cast<const float *>(raw_k), raw_element_offset,
+                raw_block_stride_elements, max_n_tokens, per_pos_size,
+                head_dim, rope_dim, to_base, n_tokens, page_indices,
+                page_size, theta);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_raw_k_scatter_rope_paged_batched_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return true;
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    raw_k_scatter_rope_paged_batched_kernel<__nv_fp8_e4m3>
+        <<<grid, head_dim, 0, stream>>>(
+            static_cast<__nv_fp8_e4m3 *>(cache),
+            static_cast<const __nv_fp8_e4m3 *>(raw_k), raw_element_offset,
+            raw_block_stride_elements, max_n_tokens, per_pos_size, head_dim,
+            rope_dim, to_base, n_tokens, page_indices, page_size, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename T>
+bool launch_raw_k_scatter_rope_paged_batched_table_typed(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
+    const uint32_t half = rope_dim / 2;
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0 ||
+        half == 0) {
+        return true;
+    }
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    raw_k_scatter_rope_paged_batched_table_kernel<T>
+        <<<grid, half, 0, stream>>>(
+            static_cast<T *>(cache), static_cast<const T *>(raw_k),
+            raw_element_offset, raw_block_stride_elements, max_n_tokens,
+            per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+            page_indices, page_size,
+            reinterpret_cast<const float2 *>(rope_sincos),
+            rope_table_positions);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_raw_k_scatter_rope_paged_batched_table(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
+    if (is_fp16) {
+        return launch_raw_k_scatter_rope_paged_batched_table_typed<__half>(
+            cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+            n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+            page_indices, page_size, rope_sincos, rope_table_positions,
+            raw_block_stride_elements, stream);
+    }
+    return launch_raw_k_scatter_rope_paged_batched_table_typed<float>(
+        cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+        n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+        page_indices, page_size, rope_sincos, rope_table_positions,
+        raw_block_stride_elements, stream);
+}
+
+bool launch_raw_k_scatter_rope_paged_batched_table_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        const float *rope_sincos, uint32_t rope_table_positions,
+        uint64_t raw_block_stride_elements, cudaStream_t stream) {
+    return launch_raw_k_scatter_rope_paged_batched_table_typed<
+        __nv_fp8_e4m3>(
+        cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+        n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+        page_indices, page_size, rope_sincos, rope_table_positions,
+        raw_block_stride_elements, stream);
+}
+
+template <typename CacheT, typename KbarT>
+bool launch_block_kmean_paged_impl(
+        const CacheT *k_cache, KbarT *kbar, uint32_t n_blocks,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        const int32_t *win_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size,
+        cudaStream_t stream) {
+    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_blocks, n_kv_heads);
+    block_kmean_paged_kernel<CacheT, KbarT><<<grid, head_dim, 0, stream>>>(
+        k_cache, kbar, per_pos_size, head_dim, win_base, blk_tokens,
+        page_indices, page_size);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename CacheT>
+bool launch_block_kmean_paged_output(
+        const CacheT *k_cache, void *kbar, KbarDType dtype,
+        uint32_t n_blocks, uint32_t n_kv_heads, uint32_t per_pos_size,
+        uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, cudaStream_t stream) {
+    switch (dtype) {
+        case KbarDType::F32:
+            return launch_block_kmean_paged_impl(
+                k_cache, static_cast<float *>(kbar), n_blocks, n_kv_heads,
+                per_pos_size, head_dim, win_base, blk_tokens, page_indices,
+                page_size, stream);
+        case KbarDType::F16:
+            return launch_block_kmean_paged_impl(
+                k_cache, static_cast<__half *>(kbar), n_blocks, n_kv_heads,
+                per_pos_size, head_dim, win_base, blk_tokens, page_indices,
+                page_size, stream);
+        case KbarDType::FP8:
+            return launch_block_kmean_paged_impl(
+                k_cache, static_cast<__nv_fp8_e4m3 *>(kbar), n_blocks,
+                n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+                page_indices, page_size, stream);
+    }
+    return false;
+}
+
+bool launch_block_kmean_paged_typed(
+        void *k_cache, bool cache_is_fp16, bool cache_is_fp8, void *kbar,
+        KbarDType kbar_dtype, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, const int32_t *win_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, cudaStream_t stream) {
+    if (cache_is_fp8) {
+        return launch_block_kmean_paged_output(
+            static_cast<const __nv_fp8_e4m3 *>(k_cache), kbar, kbar_dtype,
+            n_blocks, n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+            page_indices, page_size, stream);
+    }
+    if (cache_is_fp16) {
+        return launch_block_kmean_paged_output(
+            static_cast<const __half *>(k_cache), kbar, kbar_dtype, n_blocks,
+            n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+            page_indices, page_size, stream);
+    }
+    return launch_block_kmean_paged_output(
+        static_cast<const float *>(k_cache), kbar, kbar_dtype, n_blocks,
+        n_kv_heads, per_pos_size, head_dim, win_base, blk_tokens,
+        page_indices, page_size, stream);
+}
+
 bool launch_block_kmean_paged(void *k_cache, bool is_fp16, float *kbar,
                               uint32_t n_blocks, uint32_t n_kv_heads,
                               uint32_t per_pos_size, uint32_t head_dim,
                               const int32_t *win_base, const int32_t *blk_tokens,
                               const int32_t *page_indices, uint32_t page_size,
                               cudaStream_t stream) {
-    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
-    dim3 grid(n_blocks, n_kv_heads);
-    if (is_fp16) {
-        block_kmean_paged_kernel<__half><<<grid, head_dim, 0, stream>>>(
-            static_cast<const __half *>(k_cache), kbar, per_pos_size, head_dim,
-            win_base, blk_tokens, page_indices, page_size);
-    } else {
-        block_kmean_paged_kernel<float><<<grid, head_dim, 0, stream>>>(
-            static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
-            win_base, blk_tokens, page_indices, page_size);
-    }
+    return launch_block_kmean_paged_typed(
+        k_cache, is_fp16, false, kbar, KbarDType::F32, n_blocks, n_kv_heads,
+        per_pos_size, head_dim, win_base, blk_tokens, page_indices, page_size,
+        stream);
+}
+
+bool launch_block_kmean_paged_fp8(void *k_cache, float *kbar,
+                                  uint32_t n_blocks, uint32_t n_kv_heads,
+                                  uint32_t per_pos_size, uint32_t head_dim,
+                                  const int32_t *win_base,
+                                  const int32_t *blk_tokens,
+                                  const int32_t *page_indices,
+                                  uint32_t page_size, cudaStream_t stream) {
+    return launch_block_kmean_paged_typed(
+        k_cache, false, true, kbar, KbarDType::F32, n_blocks, n_kv_heads,
+        per_pos_size, head_dim, win_base, blk_tokens, page_indices, page_size,
+        stream);
+}
+
+template <typename KbarT>
+bool launch_block_attn_score_step_impl(
+        float *accum, const float *q, const KbarT *kbar,
+        uint32_t q_stride, uint32_t n_blocks, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        cudaStream_t stream) {
+    if (n_blocks == 0 || n_heads == 0 || head_dim == 0) return true;
+    // Round threads up to a power of two >= head_dim for the shared reduction.
+    uint32_t threads = 1;
+    while (threads < head_dim) threads <<= 1;
+    const size_t shmem = static_cast<size_t>(threads) * sizeof(float);
+    block_attn_score_step_kernel<KbarT><<<n_blocks, threads, shmem, stream>>>(
+        accum, q, kbar, q_stride, n_heads, n_kv_heads, head_dim, scale);
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attn_score_step_typed(
+        float *accum, const float *q, const void *kbar,
+        KbarDType kbar_dtype, uint32_t q_stride, uint32_t n_blocks,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        float scale, cudaStream_t stream) {
+    switch (kbar_dtype) {
+        case KbarDType::F32:
+            return launch_block_attn_score_step_impl(
+                accum, q, static_cast<const float *>(kbar), q_stride,
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, stream);
+        case KbarDType::F16:
+            return launch_block_attn_score_step_impl(
+                accum, q, static_cast<const __half *>(kbar), q_stride,
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, stream);
+        case KbarDType::FP8:
+            return launch_block_attn_score_step_impl(
+                accum, q, static_cast<const __nv_fp8_e4m3 *>(kbar), q_stride,
+                n_blocks, n_heads, n_kv_heads, head_dim, scale, stream);
+    }
+    return false;
 }
 
 bool launch_block_attn_score_step(float *accum, const float *q,
@@ -9970,18 +17914,16 @@ bool launch_block_attn_score_step(float *accum, const float *q,
                                   uint32_t n_blocks, uint32_t n_heads,
                                   uint32_t n_kv_heads, uint32_t head_dim,
                                   float scale, cudaStream_t stream) {
-    if (n_blocks == 0 || n_heads == 0 || head_dim == 0) return true;
-    // Round threads up to a power of two >= head_dim for the shared reduction.
-    uint32_t threads = 1;
-    while (threads < head_dim) threads <<= 1;
-    const size_t shmem = static_cast<size_t>(threads) * sizeof(float);
-    block_attn_score_step_kernel<<<n_blocks, threads, shmem, stream>>>(
-        accum, q, kbar, q_stride, n_heads, n_kv_heads, head_dim, scale);
-    return cudaGetLastError() == cudaSuccess;
+    return launch_block_attn_score_step_typed(
+        accum, q, kbar, KbarDType::F32, q_stride, n_blocks, n_heads,
+        n_kv_heads, head_dim, scale, stream);
 }
 
-bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
-                                           const float *kbar_multi,
+template <typename QueryT, typename KbarT>
+bool launch_block_attn_score_softmax_pages_impl(
+                                           float *score,
+                                           const QueryT *q_multi,
+                                           const KbarT *kbar_multi,
                                            uint32_t n_layers, uint32_t n_tokens,
                                            uint32_t q_layer_stride,
                                            uint32_t n_blocks,
@@ -9992,6 +17934,7 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                                            uint32_t excl_hi_begin,
                                            uint32_t n_subblocks,
                                            uint32_t reduce_max,
+                                           uint32_t accumulate,
                                            cudaStream_t stream) {
     if (n_blocks == 0 || n_layers == 0 || n_tokens == 0 || n_heads == 0 ||
         head_dim == 0) {
@@ -10011,13 +17954,16 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
     }();
     // score[] is accumulated across the grid -> must start at zero. It stays
     // per-block (n_blocks entries); sub-block masses are summed in by the kernel.
-    cudaMemsetAsync(score, 0, static_cast<size_t>(n_blocks) * sizeof(float),
-                    stream);
+    if (!accumulate) {
+        cudaMemsetAsync(score, 0, static_cast<size_t>(n_blocks) * sizeof(float),
+                        stream);
+    }
     constexpr uint32_t threads = 128;
     if (total64 <= kMaxPages && !force_tiled) {
         const uint32_t grid = n_layers * n_tokens;
         const size_t shmem = static_cast<size_t>(total64) * sizeof(float);
-        block_attn_score_softmax_pages_kernel<<<grid, threads, shmem, stream>>>(
+        block_attn_score_softmax_pages_kernel<QueryT, KbarT>
+            <<<grid, threads, shmem, stream>>>(
             score, q_multi, kbar_multi, n_layers, n_tokens, q_layer_stride,
             n_blocks, kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
             excl_lo_end, excl_hi_begin, ns, reduce_max);
@@ -10034,10 +17980,115 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
         (total + kSoftmaxPagesTile - 1) / kSoftmaxPagesTile;
     const uint64_t n_distributions64 =
         static_cast<uint64_t>(n_layers) * n_tokens * n_heads;
-    const uint64_t n_jobs = n_distributions64 * n_tiles;
-    if (n_distributions64 > UINT32_MAX || n_jobs > 0x7fffffffu) return false;
+    if (n_distributions64 > UINT32_MAX) return false;
     const uint32_t n_distributions = static_cast<uint32_t>(n_distributions64);
 
+    // Keep the original two-dot implementation as an explicit A/B baseline.
+    // The production default materializes only a bounded distribution batch,
+    // computes each dot once, then reuses the workspace.
+    const bool use_two_dot = []() {
+        const char *v =
+            std::getenv("QW3_KVMEM_SOFTMAX_PAGES_SCALABLE");
+        return v &&
+               (std::strcmp(v, "two_dot") == 0 ||
+                std::strcmp(v, "legacy") == 0);
+    }();
+    if (!use_two_dot) {
+        uint64_t workspace_bytes = 64ull * 1024ull * 1024ull;
+        if (const char *v =
+                std::getenv("QW3_KVMEM_SOFTMAX_LOGITS_MIB")) {
+            const unsigned long long mib = std::strtoull(v, nullptr, 10);
+            if (mib > 0 && mib <= 4096) {
+                workspace_bytes =
+                    static_cast<uint64_t>(mib) * 1024ull * 1024ull;
+            }
+        }
+        const uint64_t max_logits_floats =
+            std::max<uint64_t>(total, workspace_bytes / sizeof(float));
+        const uint32_t distributions_per_batch =
+            static_cast<uint32_t>(std::max<uint64_t>(
+                1, std::min<uint64_t>(
+                       n_distributions,
+                       max_logits_floats / total)));
+        const uint64_t logits_floats =
+            static_cast<uint64_t>(distributions_per_batch) * total;
+        const uint64_t workspace_floats =
+            logits_floats +
+            2ull * distributions_per_batch;
+        if (workspace_floats > SIZE_MAX / sizeof(float)) return false;
+        float *workspace = nullptr;
+        if (cudaMallocAsync(
+                reinterpret_cast<void **>(&workspace),
+                static_cast<size_t>(workspace_floats) * sizeof(float),
+                stream) != cudaSuccess) {
+            return false;
+        }
+        float *logits = workspace;
+        float *row_max = logits + logits_floats;
+        float *row_inv_sum =
+            row_max + distributions_per_batch;
+        const float distribution_weight =
+            1.0f /
+            (static_cast<float>(n_layers) *
+             static_cast<float>(n_heads));
+        cudaError_t err = cudaSuccess;
+        uint32_t batches = 0;
+        for (uint32_t base = 0; base < n_distributions;) {
+            const uint32_t count = std::min(
+                distributions_per_batch,
+                n_distributions - base);
+            const uint64_t jobs =
+                static_cast<uint64_t>(count) * n_tiles;
+            if (jobs > 0x7fffffffu) {
+                err = cudaErrorInvalidConfiguration;
+                break;
+            }
+            block_attn_softmax_pages_logits_kernel<QueryT, KbarT><<<
+                static_cast<uint32_t>(jobs),
+                kSoftmaxPagesThreads, 0, stream>>>(
+                logits, q_multi, kbar_multi, base, count,
+                n_tiles, n_tokens, q_layer_stride, n_blocks,
+                kbar_layer_stride, n_heads, n_kv_heads,
+                head_dim, scale, excl_lo_end, excl_hi_begin, ns);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) break;
+            block_attn_softmax_pages_norm_kernel<<<
+                count, kSoftmaxPagesThreads, 0, stream>>>(
+                row_max, row_inv_sum, logits, count, total);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) break;
+            const uint32_t score_grid =
+                (n_blocks + kSoftmaxPagesThreads - 1) /
+                kSoftmaxPagesThreads;
+            block_attn_softmax_pages_accumulate_logits_kernel<<<
+                score_grid, kSoftmaxPagesThreads, 0, stream>>>(
+                score, logits, row_max, row_inv_sum, count,
+                n_blocks, ns, reduce_max, distribution_weight,
+                excl_lo_end, excl_hi_begin);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) break;
+            base += count;
+            ++batches;
+        }
+        const cudaError_t free_err =
+            cudaFreeAsync(workspace, stream);
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[bs-mean-softmax] scorer_path=tiled-one-dot "
+                "pages=%u blocks=%u distributions=%u tiles=%u "
+                "distribution_batch=%u batches=%u workspace=%.2f MiB\n",
+                total, n_blocks, n_distributions, n_tiles,
+                distributions_per_batch, batches,
+                static_cast<double>(
+                    workspace_floats * sizeof(float)) /
+                    (1024.0 * 1024.0));
+        }
+        return err == cudaSuccess && free_err == cudaSuccess;
+    }
+
+    const uint64_t n_jobs = n_distributions64 * n_tiles;
+    if (n_jobs > 0x7fffffffu) return false;
     // [partial max, partial sum] per (distribution,tile), followed by the merged
     // [global max, global sum] per distribution. cudaMallocAsync keeps allocation
     // stream ordered and lets the CUDA pool reuse this ~few-MiB workspace.
@@ -10054,7 +18105,7 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
     float *global_max = partial_sum + n_jobs;
     float *global_sum = global_max + n_distributions64;
 
-    block_attn_softmax_pages_partial_lse_kernel<<<
+        block_attn_softmax_pages_partial_lse_kernel<QueryT, KbarT><<<
         static_cast<uint32_t>(n_jobs), kSoftmaxPagesThreads, 0, stream>>>(
         partial_max, partial_sum, q_multi, kbar_multi, n_distributions,
         n_tiles, n_tokens, q_layer_stride, n_blocks, kbar_layer_stride,
@@ -10070,7 +18121,7 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
     if (err == cudaSuccess) {
         const uint32_t score_grid =
             (n_blocks + kSoftmaxPagesThreads - 1) / kSoftmaxPagesThreads;
-        block_attn_softmax_pages_recompute_kernel<<<
+        block_attn_softmax_pages_recompute_kernel<QueryT, KbarT><<<
             score_grid, kSoftmaxPagesThreads, 0, stream>>>(
             score, q_multi, kbar_multi, global_max, global_sum, n_layers,
             n_tokens, q_layer_stride, n_blocks, kbar_layer_stride, n_heads,
@@ -10088,6 +18139,87 @@ bool launch_block_attn_score_softmax_pages(float *score, const float *q_multi,
                          (1024.0 * 1024.0));
     }
     return err == cudaSuccess && free_err == cudaSuccess;
+}
+
+bool launch_block_attn_score_softmax_pages_typed(
+        float *score, const void *q_multi, bool query_is_fp16,
+        const void *kbar_multi, KbarDType kbar_dtype,
+        uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t n_blocks,
+        uint32_t kbar_layer_stride, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t n_subblocks, uint32_t reduce_max, uint32_t accumulate,
+        cudaStream_t stream) {
+    if (query_is_fp16) {
+        const auto *query = static_cast<const __half *>(q_multi);
+        switch (kbar_dtype) {
+            case KbarDType::F32:
+                return launch_block_attn_score_softmax_pages_impl(
+                    score, query, static_cast<const float *>(kbar_multi),
+                    n_layers, n_tokens, q_layer_stride, n_blocks,
+                    kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                    excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
+                    accumulate, stream);
+            case KbarDType::F16:
+                return launch_block_attn_score_softmax_pages_impl(
+                    score, query, static_cast<const __half *>(kbar_multi),
+                    n_layers, n_tokens, q_layer_stride, n_blocks,
+                    kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                    excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
+                    accumulate, stream);
+            case KbarDType::FP8:
+                return launch_block_attn_score_softmax_pages_impl(
+                    score, query,
+                    static_cast<const __nv_fp8_e4m3 *>(kbar_multi),
+                    n_layers, n_tokens, q_layer_stride, n_blocks,
+                    kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                    excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
+                    accumulate, stream);
+        }
+        return false;
+    }
+    const auto *query = static_cast<const float *>(q_multi);
+    switch (kbar_dtype) {
+        case KbarDType::F32:
+            return launch_block_attn_score_softmax_pages_impl(
+                score, query, static_cast<const float *>(kbar_multi),
+                n_layers, n_tokens, q_layer_stride, n_blocks,
+                kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, accumulate,
+                stream);
+        case KbarDType::F16:
+            return launch_block_attn_score_softmax_pages_impl(
+                score, query, static_cast<const __half *>(kbar_multi),
+                n_layers, n_tokens, q_layer_stride, n_blocks,
+                kbar_layer_stride, n_heads, n_kv_heads, head_dim, scale,
+                excl_lo_end, excl_hi_begin, n_subblocks, reduce_max, accumulate,
+                stream);
+        case KbarDType::FP8:
+            return launch_block_attn_score_softmax_pages_impl(
+                score, query,
+                static_cast<const __nv_fp8_e4m3 *>(kbar_multi), n_layers,
+                n_tokens, q_layer_stride, n_blocks, kbar_layer_stride,
+                n_heads, n_kv_heads, head_dim, scale, excl_lo_end,
+                excl_hi_begin, n_subblocks, reduce_max, accumulate, stream);
+    }
+    return false;
+}
+
+bool launch_block_attn_score_softmax_pages(
+        float *score, const float *q_multi, const float *kbar_multi,
+        uint32_t n_layers, uint32_t n_tokens, uint32_t q_layer_stride,
+        uint32_t n_blocks, uint32_t kbar_layer_stride, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t n_subblocks, uint32_t reduce_max, uint32_t accumulate,
+        cudaStream_t stream) {
+    return launch_block_attn_score_softmax_pages_typed(
+        score, q_multi, /*query_is_fp16=*/false, kbar_multi,
+        KbarDType::F32, n_layers, n_tokens,
+        q_layer_stride, n_blocks, kbar_layer_stride, n_heads, n_kv_heads,
+        head_dim, scale, excl_lo_end, excl_hi_begin, n_subblocks, reduce_max,
+        accumulate, stream);
 }
 
 bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
@@ -10122,6 +18254,74 @@ bool launch_block_attention_mass_paged(void *k_cache, bool is_fp16, float *mass,
     return cudaGetLastError() == cudaSuccess;
 }
 
+template <typename CacheT, typename KbarT>
+bool launch_block_kmean_content_paged_impl(
+        const CacheT *k_cache, KbarT *kbar, uint32_t n_blocks,
+        uint32_t n_kv_heads, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *orig_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, float theta, cudaStream_t stream) {
+    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_blocks, n_kv_heads);
+    block_kmean_content_paged_kernel<CacheT, KbarT>
+        <<<grid, head_dim, 0, stream>>>(
+            k_cache, kbar, per_pos_size, head_dim, rope_dim, orig_base,
+            blk_tokens, page_indices, page_size, theta);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <typename CacheT>
+bool launch_block_kmean_content_paged_output(
+        const CacheT *k_cache, void *kbar, KbarDType dtype,
+        uint32_t n_blocks, uint32_t n_kv_heads, uint32_t per_pos_size,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *orig_base,
+        const int32_t *blk_tokens, const int32_t *page_indices,
+        uint32_t page_size, float theta, cudaStream_t stream) {
+    switch (dtype) {
+        case KbarDType::F32:
+            return launch_block_kmean_content_paged_impl(
+                k_cache, static_cast<float *>(kbar), n_blocks, n_kv_heads,
+                per_pos_size, head_dim, rope_dim, orig_base, blk_tokens,
+                page_indices, page_size, theta, stream);
+        case KbarDType::F16:
+            return launch_block_kmean_content_paged_impl(
+                k_cache, static_cast<__half *>(kbar), n_blocks, n_kv_heads,
+                per_pos_size, head_dim, rope_dim, orig_base, blk_tokens,
+                page_indices, page_size, theta, stream);
+        case KbarDType::FP8:
+            return launch_block_kmean_content_paged_impl(
+                k_cache, static_cast<__nv_fp8_e4m3 *>(kbar), n_blocks,
+                n_kv_heads, per_pos_size, head_dim, rope_dim, orig_base,
+                blk_tokens, page_indices, page_size, theta, stream);
+    }
+    return false;
+}
+
+bool launch_block_kmean_content_paged_typed(
+        void *k_cache, bool cache_is_fp16, bool cache_is_fp8, void *kbar,
+        KbarDType kbar_dtype, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *orig_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream) {
+    if (cache_is_fp8) {
+        return launch_block_kmean_content_paged_output(
+            static_cast<const __nv_fp8_e4m3 *>(k_cache), kbar, kbar_dtype,
+            n_blocks, n_kv_heads, per_pos_size, head_dim, rope_dim, orig_base,
+            blk_tokens, page_indices, page_size, theta, stream);
+    }
+    if (cache_is_fp16) {
+        return launch_block_kmean_content_paged_output(
+            static_cast<const __half *>(k_cache), kbar, kbar_dtype, n_blocks,
+            n_kv_heads, per_pos_size, head_dim, rope_dim, orig_base,
+            blk_tokens, page_indices, page_size, theta, stream);
+    }
+    return launch_block_kmean_content_paged_output(
+        static_cast<const float *>(k_cache), kbar, kbar_dtype, n_blocks,
+        n_kv_heads, per_pos_size, head_dim, rope_dim, orig_base, blk_tokens,
+        page_indices, page_size, theta, stream);
+}
+
 bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       uint32_t n_blocks, uint32_t n_kv_heads,
                                       uint32_t per_pos_size, uint32_t head_dim,
@@ -10130,37 +18330,145 @@ bool launch_block_kmean_content_paged(void *k_cache, bool is_fp16, float *kbar,
                                       const int32_t *page_indices,
                                       uint32_t page_size, float theta,
                                       cudaStream_t stream) {
-    if (n_blocks == 0 || n_kv_heads == 0 || head_dim == 0) return true;
-    dim3 grid(n_blocks, n_kv_heads);
-    if (is_fp16) {
-        block_kmean_content_paged_kernel<__half><<<grid, head_dim, 0, stream>>>(
-            static_cast<const __half *>(k_cache), kbar, per_pos_size, head_dim,
-            rope_dim, orig_base, blk_tokens, page_indices, page_size, theta);
-    } else {
-        block_kmean_content_paged_kernel<float><<<grid, head_dim, 0, stream>>>(
-            static_cast<const float *>(k_cache), kbar, per_pos_size, head_dim,
-            rope_dim, orig_base, blk_tokens, page_indices, page_size, theta);
-    }
-    return cudaGetLastError() == cudaSuccess;
+    return launch_block_kmean_content_paged_typed(
+        k_cache, is_fp16, false, kbar, KbarDType::F32, n_blocks, n_kv_heads,
+        per_pos_size, head_dim, rope_dim, orig_base, blk_tokens, page_indices,
+        page_size, theta, stream);
 }
 
-bool launch_block_kmean_content_batch(const float *k_batch, float *kbar,
-                                      uint64_t kbar_block_base,
-                                      uint32_t n_blocks_chunk, uint32_t k_stride,
-                                      uint32_t batch, uint32_t blk_tokens,
-                                      uint32_t n_kv_heads, uint32_t head_dim,
-                                      uint32_t rope_dim, int32_t rope_base,
-                                      float theta, uint32_t n_subblocks,
-                                      cudaStream_t stream) {
+bool launch_block_kmean_content_paged_fp8(
+        void *k_cache, float *kbar, uint32_t n_blocks, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *orig_base, const int32_t *blk_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        cudaStream_t stream) {
+    return launch_block_kmean_content_paged_typed(
+        k_cache, false, true, kbar, KbarDType::F32, n_blocks, n_kv_heads,
+        per_pos_size, head_dim, rope_dim, orig_base, blk_tokens, page_indices,
+        page_size, theta, stream);
+}
+
+template <typename KbarT>
+bool launch_block_kmean_content_batch_impl(
+        const float *k_batch, KbarT *kbar, uint64_t kbar_block_base,
+        uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+        uint32_t blk_tokens, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t rope_dim, int32_t rope_base, float theta,
+        uint32_t n_subblocks, cudaStream_t stream) {
     if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 || batch == 0) {
         return true;
     }
     const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
     dim3 grid(n_blocks_chunk * ns, n_kv_heads);
-    block_kmean_content_batch_kernel<<<grid, head_dim, 0, stream>>>(
+    block_kmean_content_batch_kernel<KbarT><<<grid, head_dim, 0, stream>>>(
         k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens, head_dim,
         rope_dim, rope_base, theta, ns);
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_content_batch_typed(
+        const float *k_batch, void *kbar, KbarDType kbar_dtype,
+        uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+        uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+        int32_t rope_base, float theta, uint32_t n_subblocks,
+        cudaStream_t stream) {
+    switch (kbar_dtype) {
+        case KbarDType::F32:
+            return launch_block_kmean_content_batch_impl(
+                k_batch, static_cast<float *>(kbar), kbar_block_base,
+                n_blocks_chunk, k_stride, batch, blk_tokens, n_kv_heads,
+                head_dim, rope_dim, rope_base, theta, n_subblocks, stream);
+        case KbarDType::F16:
+            return launch_block_kmean_content_batch_impl(
+                k_batch, static_cast<__half *>(kbar), kbar_block_base,
+                n_blocks_chunk, k_stride, batch, blk_tokens, n_kv_heads,
+                head_dim, rope_dim, rope_base, theta, n_subblocks, stream);
+        case KbarDType::FP8:
+            return launch_block_kmean_content_batch_impl(
+                k_batch, static_cast<__nv_fp8_e4m3 *>(kbar),
+                kbar_block_base, n_blocks_chunk, k_stride, batch, blk_tokens,
+                n_kv_heads, head_dim, rope_dim, rope_base, theta, n_subblocks,
+                stream);
+    }
+    return false;
+}
+
+bool launch_block_kmean_content_batch(
+        const float *k_batch, float *kbar, uint64_t kbar_block_base,
+        uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+        uint32_t blk_tokens, uint32_t n_kv_heads, uint32_t head_dim,
+        uint32_t rope_dim, int32_t rope_base, float theta,
+        uint32_t n_subblocks, cudaStream_t stream) {
+    return launch_block_kmean_content_batch_typed(
+        k_batch, kbar, KbarDType::F32, kbar_block_base, n_blocks_chunk,
+        k_stride, batch, blk_tokens, n_kv_heads, head_dim, rope_dim,
+        rope_base, theta, n_subblocks, stream);
+}
+
+template <typename KbarT>
+bool launch_block_kmean_content_batch_merge_impl(
+        const float *k_batch, KbarT *kbar, uint64_t kbar_block_base,
+        uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+        uint32_t blk_tokens, uint32_t first_block_token_offset,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+        int32_t rope_base, float theta, uint32_t n_subblocks,
+        cudaStream_t stream) {
+    if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 ||
+        batch == 0) {
+        return true;
+    }
+    if (first_block_token_offset >= blk_tokens) return false;
+    const uint32_t ns = n_subblocks == 0 ? 1u : n_subblocks;
+    dim3 grid(n_blocks_chunk * ns, n_kv_heads);
+    block_kmean_content_batch_merge_kernel<KbarT>
+        <<<grid, head_dim, 0, stream>>>(
+        k_batch, kbar, kbar_block_base, k_stride, batch, blk_tokens,
+        first_block_token_offset, head_dim, rope_dim, rope_base, theta, ns);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_kmean_content_batch_merge_typed(
+        const float *k_batch, void *kbar, KbarDType kbar_dtype,
+        uint64_t kbar_block_base, uint32_t n_blocks_chunk,
+        uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
+        uint32_t first_block_token_offset, uint32_t n_kv_heads,
+        uint32_t head_dim, uint32_t rope_dim, int32_t rope_base,
+        float theta, uint32_t n_subblocks, cudaStream_t stream) {
+    switch (kbar_dtype) {
+        case KbarDType::F32:
+            return launch_block_kmean_content_batch_merge_impl(
+                k_batch, static_cast<float *>(kbar), kbar_block_base,
+                n_blocks_chunk, k_stride, batch, blk_tokens,
+                first_block_token_offset, n_kv_heads, head_dim, rope_dim,
+                rope_base, theta, n_subblocks, stream);
+        case KbarDType::F16:
+            return launch_block_kmean_content_batch_merge_impl(
+                k_batch, static_cast<__half *>(kbar), kbar_block_base,
+                n_blocks_chunk, k_stride, batch, blk_tokens,
+                first_block_token_offset, n_kv_heads, head_dim, rope_dim,
+                rope_base, theta, n_subblocks, stream);
+        case KbarDType::FP8:
+            return launch_block_kmean_content_batch_merge_impl(
+                k_batch, static_cast<__nv_fp8_e4m3 *>(kbar),
+                kbar_block_base, n_blocks_chunk, k_stride, batch, blk_tokens,
+                first_block_token_offset, n_kv_heads, head_dim, rope_dim,
+                rope_base, theta, n_subblocks, stream);
+    }
+    return false;
+}
+
+bool launch_block_kmean_content_batch_merge(
+        const float *k_batch, float *kbar, uint64_t kbar_block_base,
+        uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
+        uint32_t blk_tokens, uint32_t first_block_token_offset,
+        uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
+        int32_t rope_base, float theta, uint32_t n_subblocks,
+        cudaStream_t stream) {
+    return launch_block_kmean_content_batch_merge_typed(
+        k_batch, kbar, KbarDType::F32, kbar_block_base, n_blocks_chunk,
+        k_stride, batch, blk_tokens, first_block_token_offset, n_kv_heads,
+        head_dim, rope_dim, rope_base, theta, n_subblocks, stream);
 }
 
 bool launch_derope_store_content_batch(const float *k_batch, float *kraw,
@@ -10221,7 +18529,21 @@ bool launch_derope_query_multi(float *q_multi, const float *q,
     dim3 grid(n_heads, cnt);
     derope_query_multi_kernel<<<grid, head_dim, 0, stream>>>(
         q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim, rope_dim,
-        start_pos, theta);
+        start_pos, theta, /*output_fp16=*/false);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_derope_query_multi_f16(void *q_multi, const float *q,
+                                   uint32_t q_token_stride,
+                                   uint32_t q_head_stride, uint32_t cnt,
+                                   uint32_t n_heads, uint32_t head_dim,
+                                   uint32_t rope_dim, int32_t start_pos,
+                                   float theta, cudaStream_t stream) {
+    if (cnt == 0 || n_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_heads, cnt);
+    derope_query_multi_kernel<<<grid, head_dim, 0, stream>>>(
+        q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim, rope_dim,
+        start_pos, theta, /*output_fp16=*/true);
     return cudaGetLastError() == cudaSuccess;
 }
 

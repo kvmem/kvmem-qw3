@@ -1,0 +1,281 @@
+% Section 4.3
+\section{Efficient KV Working-Set Management}
+\label{sec:efficient-kv-working-set-management}
+
+KVMem extends the effective context capacity of a model by dynamically
+managing historical KV blocks across GPU memory, CPU memory, and SSD.  Upon a
+new query, KVMem retrieves a query-dependent subset of the historical blocks
+and arranges them into a compact KV working set on the GPU.  A na\"ive
+implementation of this design introduces three sources of overhead.  First,
+blocks removed from the GPU must be synchronously written to a lower tier,
+which places stage-out on the critical path of inference.  Second, consecutive
+retrievals often select overlapping working sets, so rebuilding each working
+set from scratch causes redundant stage-in traffic.  Third, the blocks that
+must be loaded are physically scattered in host memory and still need to be
+materialized at their new compact positions before they can be consumed by
+attention.
+
+We address these overheads with three complementary optimizations:
+\emph{Proactive Chunk Writeback}, \emph{Retrieval-Aware Hierarchical Reuse},
+and \emph{Packed and Pipelined KV Rematerialization}.  They respectively hide
+stage-out, reduce the amount of data that must be loaded, and accelerate the
+transfer and reconstruction of unavoidable misses.
+
+\subsection{Proactive Chunk Writeback}
+\label{sec:proactive-chunk-writeback}
+
+\paragraph{Synchronous eviction bottleneck.}
+In a na\"ive implementation, a KV block remains GPU-only until the active
+working set reaches its capacity limit.  To reuse the corresponding GPU page,
+the system must synchronously gather the block, transfer it from GPU to CPU,
+scatter it into host storage, optionally write it to SSD, and only then release
+the GPU page.  The pressure-selection path is therefore serialized as
+\begin{equation}
+  T_{\mathrm{evict}} =
+  T_{\mathrm{gather}} +
+  T_{\mathrm{D2H}} +
+  T_{\mathrm{CPU\ scatter}} +
+  T_{\mathrm{SSD}},
+  \label{eq:synchronous-eviction}
+\end{equation}
+where the SSD term is present only when the CPU tier cannot retain the block.
+The model cannot continue to use the reclaimed page until this sequence has
+completed.
+
+This synchronization is unnecessary for completed KV blocks.  Transformer KV
+state is append-only: once all tokens of a prefill block have been processed,
+the contents of that block no longer change.  Although the block may remain in
+the active GPU working set, a lower-tier copy can be created before the block
+is actually selected for eviction.
+
+\paragraph{Background writeback.}
+KVMem proactively writes back completed blocks at prefill-chunk boundaries.
+After prefill chunk \(n\) has completed, the system starts a packed D2H
+transfer for the newly completed blocks.  CPU scatter and optional SSD
+persistence proceed in background workers while the GPU computes prefill
+chunk \(n+1\).  The resulting schedule is
+\begin{equation}
+\begin{split}
+  &\text{complete chunk } n
+  \;\rightarrow\; \text{start writeback of chunk } n,\\
+  &\text{compute chunk } n+1
+  \;\parallel\; \text{D2H, CPU admission, and SSD persistence}.
+\end{split}
+\label{eq:proactive-writeback-schedule}
+\end{equation}
+Because a prefill chunk typically provides a substantially longer compute
+window than the packed D2H and host-side copy, most of the writeback work is
+hidden by subsequent model computation.
+
+KVMem explicitly tracks the ownership of every block through the following
+state transitions:
+\begin{equation}
+  \text{GPU-only}
+  \;\rightarrow\;
+  \text{backing-in-flight}
+  \;\rightarrow\;
+  \text{clean CPU/SSD backing}
+  \;\rightarrow\;
+  \text{GPU page releasable}.
+  \label{eq:writeback-ownership}
+\end{equation}
+While a block is in the backing-in-flight state, its GPU page remains the
+authoritative copy and cannot be reused.  The page becomes releasable only
+after the transfer and lower-tier admission have completed.  Consequently, a
+later pressure selection can evict a clean block by updating ownership and
+page-table metadata, without performing another D2H transfer.
+
+The writeback pipeline uses a bounded number of pinned slabs and a bounded
+worker queue.  This prevents background persistence from becoming an
+unbounded host-memory copy of the KV history.  If background workers fall
+behind, pressure selection waits only for the incomplete records needed for
+the current eviction, providing correctness-preserving backpressure.  Partial
+or still-mutable blocks are not treated as clean.
+
+Proactive writeback does not primarily reduce the number of bytes that must
+eventually be stored.  Instead, it removes those bytes from the inference
+critical path.  In our controlled CPU-only 512K-context experiment, aggregate
+stage-out across 12 reselections decreased from \(3.645\)~s to \(0.268\)~s,
+a \(92.7\%\) reduction, turning pressure-time eviction into an almost
+metadata-only operation.
+
+\subsection{Retrieval-Aware Hierarchical Reuse}
+\label{sec:retrieval-aware-hierarchical-reuse}
+
+\paragraph{Redundant loading across reselections.}
+Let \(W_{t-1}\) and \(W_t\) denote the KV working sets selected by two
+consecutive queries.  Reconstructing \(W_t\) from a lower tier would transfer
+\(\lvert W_t\rvert\) blocks even when the two selections overlap.  Instead,
+KVMem decomposes the update into retained, incoming, and outgoing blocks:
+\begin{align}
+  R_t &= W_t \cap W_{t-1}, \label{eq:retained-set}\\
+  L_t &= W_t \setminus W_{t-1}, \label{eq:load-set}\\
+  E_t &= W_{t-1} \setminus W_t. \label{eq:evict-set}
+\end{align}
+Only \(L_t\), rather than the complete \(W_t\), is a candidate for lower-tier
+stage-in.
+
+\paragraph{GPU working-set delta reuse.}
+KVMem preserves the physical GPU pages of blocks in \(R_t\) whenever possible,
+loads only blocks in \(L_t\), and releases or demotes blocks in \(E_t\).  More
+generally, if \(G_{t-1}\) is the set of blocks currently resident on the GPU,
+the required stage-in set is
+\begin{equation}
+  L_t^{\mathrm{physical}} = W_t \setminus G_{t-1}.
+  \label{eq:physical-load-set}
+\end{equation}
+This delta update reduces transfer volume without changing retrieval scores or
+the selected block IDs.
+
+Physical residency and positional validity are distinct.  If a retained block
+occupies the same compact position in the new working set, both its K and V
+pages can be reused directly.  If its compact position changes, V remains
+reusable because it is position independent, whereas K must be rematerialized
+for the new position.  KVMem reconstructs such K blocks from a
+position-independent, immutable raw-K authority instead of repeatedly
+rotating a low-precision working K.  A moved block therefore avoids a complete
+KV reload, although it may still incur raw-K transfer and re-RoPE work during
+materialization.
+
+\paragraph{Retrieval-aware CPU residency.}
+GPU reuse cannot serve blocks that have already left the active working set.
+For a GPU miss, latency depends strongly on whether the block is found in CPU
+memory or must be read from SSD.  Conventional LRU replacement is poorly
+matched to KVMem because its access sequence is generated by semantic
+retrieval rather than by ordinary temporal locality.  A block that has not
+been touched recently may still be repeatedly relevant to future queries,
+while a recently produced block may never be selected again.
+
+KVMem therefore uses retrieval history as a residency signal.  The CPU
+admission and eviction policy considers whether a block was selected in recent
+selection epochs, how frequently it has been selected, and whether it belongs
+to a sink, recent, or explicitly pinned region.  Repeatedly selected hot
+blocks are preferentially retained in CPU memory, while semantically cold
+blocks are preferentially demoted to SSD.  This policy changes only the
+physical source of a selected block; it does not bias or modify semantic
+ranking.
+
+The resulting hierarchy resolves every selected block in the following order:
+\begin{enumerate}
+  \item a GPU hit reuses the existing page and requires no data transfer;
+  \item a CPU hit requires only CPU-to-GPU transfer;
+  \item an SSD miss is read into CPU memory and then transferred to the GPU.
+\end{enumerate}
+This organization first eliminates redundant transfers through GPU delta
+reuse, and then reduces slow-tier traffic through retrieval-aware CPU
+residency.  In a trace containing 171 reselections, the heat-aware policy
+reduced the number of SSD-loaded blocks from \(6{,}170\) to \(2{,}690\), a
+\(56.4\%\) reduction in SSD traffic, and reduced aggregate stage-in from
+\(6.000\)~s to \(5.058\)~s.
+
+\subsection{Packed and Pipelined KV Rematerialization}
+\label{sec:packed-pipelined-rematerialization}
+
+\paragraph{Sparse transfer bottleneck.}
+Hierarchical reuse minimizes the set of blocks that must be loaded, but the
+remaining misses are physically scattered across host-memory slots, and their
+destination GPU pages are also non-contiguous.  Issuing one H2D operation per
+block results in many small PCIe transactions, repeated DMA setup, frequent
+CUDA API calls, and poor effective link bandwidth.
+
+Moreover, transfer completion is not the true completion point of KVMem
+stage-in.  The immutable raw K stored by KVMem is independent of the final
+compact position.  After selection, K must be placed in its destination page
+and have RoPE applied for its new compact position before it can participate in
+attention.  We therefore define rematerialization as the complete conversion
+from scattered historical blocks to an executable compact KV working set.
+
+\paragraph{Packed transfer.}
+KVMem decouples logical block placement from physical PCIe transfer
+granularity.  Multiple CPU workers gather scattered source blocks into a
+contiguous pinned slab.  The system then performs a large contiguous H2D
+transfer into a GPU staging buffer, followed by a GPU kernel that scatters the
+records into their destination KV pages:
+\begin{equation}
+\begin{split}
+  \text{scattered CPU blocks}
+  &\;\rightarrow\; \text{contiguous pinned slab}\\
+  &\;\rightarrow\; \text{bulk H2D}\\
+  &\;\rightarrow\; \text{GPU page scatter}.
+\end{split}
+\label{eq:packed-stagein}
+\end{equation}
+CPU gather and GPU scatter add local memory operations, but these operations
+are substantially cheaper than thousands of small PCIe submissions.  For SSD
+misses, physically adjacent records are first coalesced into larger reads and
+then enter the same packed H2D path.
+
+\paragraph{Pipelined, position-aware reconstruction.}
+Raw-K rematerialization is divided into three stages: CPU gathering, H2D
+transfer, and GPU scatter with re-RoPE.  KVMem uses double-buffered pinned host
+slabs and GPU staging buffers to process different batches concurrently:
+\begin{equation}
+\begin{split}
+  &\text{CPU gather of batch } n+1\\
+  &\qquad\parallel\; \text{H2D of batch } n\\
+  &\qquad\parallel\; \text{GPU scatter/re-RoPE of batch } n-1.
+\end{split}
+\label{eq:rematerialization-pipeline}
+\end{equation}
+Cross-stream CUDA events protect buffer reuse without introducing a
+device-wide synchronization at every batch.
+
+The immutable raw-K authority uses a block-major layout so that the data needed
+for one block is contiguous across the relevant layers, reducing random host
+access during gathering.  The GPU rematerialization kernel uses a precomputed
+RoPE sine/cosine table, avoiding repeated \texttt{powf} and \texttt{sincosf}
+evaluation.  MTP rematerialization uses larger transfer batches to reduce
+small-kernel and small-DMA overhead.  In addition, V stage-in and raw-K
+materialization are scheduled concurrently when their data dependencies allow
+it.
+
+After pipeline warm-up, the exposed latency approaches
+\begin{equation}
+  T_{\mathrm{remat}} \approx
+  \max\!\left(
+    T_{\mathrm{CPU\ gather}},
+    T_{\mathrm{H2D}},
+    T_{\mathrm{scatter+RoPE}}
+  \right)
+  + T_{\mathrm{startup/drain}},
+  \label{eq:pipelined-rematerialization-time}
+\end{equation}
+rather than the sum of the three main stages.  To preserve numerical
+correctness, KVMem does not repeatedly apply positional deltas to a
+low-precision working K; position changes are reconstructed from the
+immutable raw-K authority.
+
+In our controlled CPU-only 512K-context experiment, adding packed
+rematerialization after proactive writeback and hierarchical reuse reduced
+aggregate stage-in wall time from \(1.613\)~s to \(0.310\)~s.  Aggregate KV
+assembly and re-RoPE decreased from \(28.478\)~s to \(7.901\)~s, a
+\(3.60\times\) speedup across 12 reselections.
+
+\subsection{End-to-End Working-Set Update}
+\label{sec:end-to-end-working-set-update}
+
+The three optimizations form one end-to-end working-set-management pipeline.
+As prefill produces stable KV blocks, Proactive Chunk Writeback creates clean
+lower-tier copies in the background.  When a new query produces \(W_t\),
+Retrieval-Aware Hierarchical Reuse preserves GPU hits, resolves remaining
+blocks from the CPU whenever possible, and accesses SSD only for cold misses.
+Packed and Pipelined KV Rematerialization then converts those unavoidable
+misses into bulk transfers and overlaps data movement with position-aware KV
+reconstruction.  Finally, outgoing GPU pages with completed clean backing are
+released without synchronous writeback.
+
+The optimizations address orthogonal components of KVMem overhead:
+\begin{itemize}
+  \item \textbf{Proactive Chunk Writeback} hides data movement out of the GPU;
+  \item \textbf{Retrieval-Aware Hierarchical Reuse} reduces the data that must
+        be loaded;
+  \item \textbf{Packed and Pipelined KV Rematerialization} accelerates the
+        transfer and reconstruction of the remaining misses.
+\end{itemize}
+On the current controlled 512K-context workload, the measured KVMem management
+overhead across 12 reselections decreased from \(63.957\)~s to \(8.488\)~s,
+an \(86.7\%\) reduction and a \(7.53\times\) speedup.  End-to-end TTFT
+decreased from \(341.844\)~s to \(287.176\)~s.  Lower-level mechanisms such as scalable one-dot
+retrieval scoring, coalesced SSD I/O, persistent worker pools, and prefill-plan
+reuse support the scalability of this pipeline, but are implementation details
+rather than separate high-level optimizations.

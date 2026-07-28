@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
                     default=ROOT / "models/Qwen3.6-27B-Q8_0.gguf")
     ap.add_argument("--data", type=Path,
                     default=Path("/data/chaidi/kvmem_eval/data/longmemeval_s.json"))
+    ap.add_argument(
+        "--eval-script", type=Path,
+        default=ROOT / "scripts/kvmem_eval/run_eval.py",
+        help="evaluation client to run after the server is healthy; default "
+             "keeps the canonical one-shot harness unchanged")
     ap.add_argument("--out-dir", type=Path,
                     default=Path("/data/chaidi/kvmem_eval/results"))
     ap.add_argument("--host", default="127.0.0.1")
@@ -64,6 +69,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--subblocks", type=int, default=4)
     ap.add_argument("--subblock-reduce", choices=("max", "sum"), default="max")
     ap.add_argument("--update-mode", choices=("step", "interval"), default="step")
+    ap.add_argument(
+        "--optimization-level",
+        choices=("kvmem_init", "opt_1", "opt_2", "opt_3"),
+        default="kvmem_init",
+        help="monotonic KVMem storage/tiering profile used for matched A/B runs")
     ap.add_argument("--query-conditioned", action=argparse.BooleanOptionalAction,
                     default=True)
     ap.add_argument("--gpu-memory-ratio", type=float, default=0.5)
@@ -110,6 +120,7 @@ def build_commands(args: argparse.Namespace) -> tuple[list[str], list[str], Path
         "--kvmem-method", args.method,
         "--kvmem-retrieval-method", args.retrieval_method,
         "--kvmem-update-mode", args.update_mode,
+        "--kvmem-optimization-level", args.optimization_level,
         "--kvmem-gpu-memory-ratio", str(args.gpu_memory_ratio),
         "--kvmem-cpu-gb", str(args.cpu_gb),
         "--kvmem-nvme-gb", str(args.nvme_gb),
@@ -133,7 +144,7 @@ def build_commands(args: argparse.Namespace) -> tuple[list[str], list[str], Path
 
     base_url = f"http://{args.host}:{args.port}/v1"
     evaluation = [
-        sys.executable, str(ROOT / "scripts/kvmem_eval/run_eval.py"),
+        sys.executable, str(args.eval_script),
         "--data", str(args.data),
         "--use-all",
         "--base-url", base_url,
@@ -219,6 +230,123 @@ def main() -> int:
             "QW3_FATTN_NSPLIT": "1",
             "QW3_PREFILL_FA2_NSPLIT": "1",
             "QW3_KVMEM_TIMING": "1",
+            **(
+                {"QW3_KVMEM_PERF_TRACE":
+                 os.environ["QW3_KVMEM_PERF_TRACE"]}
+                if "QW3_KVMEM_PERF_TRACE" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_RECOMPUTE_QUERY": os.environ["QW3_KVMEM_RECOMPUTE_QUERY"]}
+                if "QW3_KVMEM_RECOMPUTE_QUERY" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_IMMUTABLE_SOURCE_K":
+                 os.environ["QW3_KVMEM_IMMUTABLE_SOURCE_K"]}
+                if "QW3_KVMEM_IMMUTABLE_SOURCE_K" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_ROPE_POSITION_TRACE":
+                 os.environ["QW3_ROPE_POSITION_TRACE"]}
+                if "QW3_ROPE_POSITION_TRACE" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP"]}
+                if "QW3_KVMEM_TRANSCRIPT_QUERY_BOOTSTRAP" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_STABLE_INGEST":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_STABLE_INGEST"]}
+                if "QW3_KVMEM_TRANSCRIPT_STABLE_INGEST" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_STABLE_FAST":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_STABLE_FAST"]}
+                if "QW3_KVMEM_TRANSCRIPT_STABLE_FAST" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_RESET_FINAL_RECURRENT":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_RESET_FINAL_RECURRENT"]}
+                if "QW3_KVMEM_TRANSCRIPT_RESET_FINAL_RECURRENT" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_RESET_EACH_RECURRENT":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_RESET_EACH_RECURRENT"]}
+                if "QW3_KVMEM_TRANSCRIPT_RESET_EACH_RECURRENT" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_SESSION_LOCAL":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_SESSION_LOCAL"]}
+                if "QW3_KVMEM_TRANSCRIPT_SESSION_LOCAL" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_EXACT_QUESTION":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_EXACT_QUESTION"]}
+                if "QW3_KVMEM_TRANSCRIPT_EXACT_QUESTION" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_TOKENS":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_REFRESH_TOKENS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_TOKENS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_CACHED_TOKENS":
+                 os.environ[
+                     "QW3_KVMEM_TRANSCRIPT_REFRESH_CACHED_TOKENS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_CACHED_TOKENS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_MEANK":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_REFRESH_MEANK"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_MEANK" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_RELEVANCE_ORDER":
+                 os.environ[
+                     "QW3_KVMEM_TRANSCRIPT_REFRESH_RELEVANCE_ORDER"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_RELEVANCE_ORDER" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_BLOCKS":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_REFRESH_BLOCKS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_BLOCKS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_CORE_TOKENS":
+                 os.environ["QW3_KVMEM_TRANSCRIPT_REFRESH_CORE_TOKENS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_CORE_TOKENS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_NEIGHBOR_BLOCKS":
+                 os.environ[
+                     "QW3_KVMEM_TRANSCRIPT_REFRESH_NEIGHBOR_BLOCKS"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_NEIGHBOR_BLOCKS" in os.environ
+                else {}
+            ),
+            **(
+                {"QW3_KVMEM_TRANSCRIPT_REFRESH_SESSION_EXPAND":
+                 os.environ[
+                     "QW3_KVMEM_TRANSCRIPT_REFRESH_SESSION_EXPAND"]}
+                if "QW3_KVMEM_TRANSCRIPT_REFRESH_SESSION_EXPAND" in os.environ
+                else {}
+            ),
         },
     }
 
@@ -233,8 +361,10 @@ def main() -> int:
     if not args.binary.is_file():
         print(f"ERROR: qw3 binary not found: {args.binary}", file=sys.stderr)
         return 2
-    if not args.model.is_file() or not args.data.is_file():
-        print("ERROR: model or dataset path does not exist", file=sys.stderr)
+    if (not args.model.is_file() or not args.data.is_file() or
+            not args.eval_script.is_file()):
+        print("ERROR: model, dataset, or eval script does not exist",
+              file=sys.stderr)
         return 2
     if not port_is_free(args.host, args.port):
         print(f"ERROR: listen address is already in use: {args.host}:{args.port}",

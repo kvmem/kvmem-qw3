@@ -1,8 +1,132 @@
 #include "qw3/kvmem_store.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <string>
 
 namespace qw3 {
+
+namespace {
+
+uint32_t ceil_div_u32(uint32_t value, uint32_t divisor) {
+    if (value == 0) return 0;
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(value) + divisor - 1) / divisor);
+}
+
+uint32_t clamp_u32(uint32_t value, uint32_t lo, uint32_t hi) {
+    return std::min(std::max(value, lo), hi);
+}
+
+uint32_t ceil_percent(uint32_t value, uint32_t percent) {
+    return static_cast<uint32_t>(
+        (static_cast<uint64_t>(value) * percent + 99u) / 100u);
+}
+
+}  // namespace
+
+KvMemKeepAllocation resolve_kvmem_keep_allocation(
+        uint32_t block_tokens,
+        uint32_t select_budget,
+        int64_t sink_blocks,
+        int64_t recent_blocks,
+        int64_t sink_tokens,
+        int64_t recent_tokens) {
+    if (block_tokens == 0) {
+        throw std::runtime_error(
+            "KVMem keep allocation requires block_tokens > 0");
+    }
+    if (select_budget < block_tokens) {
+        throw std::runtime_error(
+            "KVMem selection budget must contain at least one block");
+    }
+    if (sink_blocks >= 0 && sink_tokens >= 0) {
+        throw std::runtime_error(
+            "KVMem sink allocation cannot specify both blocks and tokens");
+    }
+    if (recent_blocks >= 0 && recent_tokens >= 0) {
+        throw std::runtime_error(
+            "KVMem recent allocation cannot specify both blocks and tokens");
+    }
+
+    KvMemKeepAllocation out;
+    const uint32_t budget_blocks = select_budget / block_tokens;
+
+    auto resolve_band = [&](int64_t explicit_blocks,
+                            int64_t explicit_tokens,
+                            uint32_t auto_tokens,
+                            const char *name,
+                            uint32_t &target_tokens,
+                            uint32_t &blocks,
+                            uint32_t &effective_tokens,
+                            KvMemKeepSource &source) {
+        if (explicit_blocks >= 0) {
+            if (static_cast<uint64_t>(explicit_blocks) >
+                std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error(
+                    std::string("KVMem ") + name +
+                    " block allocation is too large");
+            }
+            blocks = static_cast<uint32_t>(explicit_blocks);
+            const uint64_t tokens =
+                static_cast<uint64_t>(blocks) * block_tokens;
+            if (tokens > std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error(
+                    std::string("KVMem ") + name +
+                    " block allocation overflows token accounting");
+            }
+            target_tokens = static_cast<uint32_t>(tokens);
+            effective_tokens = target_tokens;
+            source = KvMemKeepSource::Blocks;
+            return;
+        }
+
+        const uint64_t requested = explicit_tokens >= 0
+            ? static_cast<uint64_t>(explicit_tokens)
+            : static_cast<uint64_t>(auto_tokens);
+        if (requested > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(
+                std::string("KVMem ") + name +
+                " token allocation is too large");
+        }
+        target_tokens = static_cast<uint32_t>(requested);
+        blocks = ceil_div_u32(target_tokens, block_tokens);
+        const uint64_t rounded_tokens =
+            static_cast<uint64_t>(blocks) * block_tokens;
+        if (rounded_tokens > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(
+                std::string("KVMem ") + name +
+                " rounded token allocation overflows accounting");
+        }
+        effective_tokens = static_cast<uint32_t>(rounded_tokens);
+        source = explicit_tokens >= 0
+            ? KvMemKeepSource::Tokens
+            : KvMemKeepSource::Auto;
+    };
+
+    const uint32_t auto_sink_tokens =
+        clamp_u32(ceil_percent(select_budget, 1), 1024, 2048);
+    const uint32_t auto_recent_tokens =
+        clamp_u32(ceil_percent(select_budget, 8), 4096, 16384);
+    resolve_band(
+        sink_blocks, sink_tokens, auto_sink_tokens, "sink",
+        out.sink_target_tokens, out.sink_blocks,
+        out.sink_effective_tokens, out.sink_source);
+    resolve_band(
+        recent_blocks, recent_tokens, auto_recent_tokens, "recent",
+        out.recent_target_tokens, out.recent_blocks,
+        out.recent_effective_tokens, out.recent_source);
+
+    if (out.sink_blocks > budget_blocks ||
+        out.recent_blocks > budget_blocks ||
+        static_cast<uint64_t>(out.sink_blocks) + out.recent_blocks >
+            budget_blocks) {
+        throw std::runtime_error(
+            "KVMem sink + recent allocation exceeds the selection budget");
+    }
+    return out;
+}
 
 void KvMemStore::register_append(uint32_t n_new_tokens) {
     if (n_new_tokens == 0) return;
@@ -80,14 +204,46 @@ void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
     if (block_id >= block_count()) return;
     KvMemBlock &b = blocks_[block_id];
     b.tier = tier;
+    if (cfg_.optimization_level >= KvMemOptimizationLevel::Opt2) {
+        if (tier == KvTier::GPU) {
+            // GPU becomes active, but clean CPU/SSD cache copies remain valid.
+            if (cpu_slot >= 0) b.cpu_slot = cpu_slot;
+            if (nvme_slot >= 0) b.nvme_slot = nvme_slot;
+        } else {
+            b.gpu_slot = -1;
+            b.cpu_slot = cpu_slot;
+            if (nvme_slot >= 0) b.nvme_slot = nvme_slot;
+        }
+        return;
+    }
     if (tier == KvTier::GPU) {
         b.cpu_slot = -1;
         b.nvme_slot = -1;
+        b.ssd_clean = false;
     } else {
         b.gpu_slot = -1;
         b.cpu_slot = cpu_slot;
         b.nvme_slot = nvme_slot;
+        b.ssd_clean = tier == KvTier::SSD && nvme_slot >= 0;
     }
+}
+
+void KvMemStore::set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot) {
+    if (block_id >= block_count()) return;
+    blocks_[block_id].cpu_slot = cpu_slot;
+}
+
+void KvMemStore::set_block_ssd_backing(uint32_t block_id, int32_t nvme_slot,
+                                       bool clean) {
+    if (block_id >= block_count()) return;
+    KvMemBlock &b = blocks_[block_id];
+    b.nvme_slot = nvme_slot;
+    b.ssd_clean = clean && nvme_slot >= 0;
+}
+
+void KvMemStore::set_block_io_in_flight(uint32_t block_id, bool in_flight) {
+    if (block_id >= block_count()) return;
+    blocks_[block_id].in_flight = in_flight;
 }
 
 void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {
@@ -95,7 +251,48 @@ void KvMemStore::set_block_baked_pos(uint32_t block_id, int64_t baked_pos) {
     blocks_[block_id].baked_pos = baked_pos;
 }
 
+void KvMemStore::record_block_rerope(uint32_t block_id, int64_t baked_pos) {
+    if (block_id >= block_count()) return;
+    KvMemBlock &block = blocks_[block_id];
+    if (block.baked_pos != baked_pos) {
+        ++block.remap_count;
+        const uint64_t delta = static_cast<uint64_t>(
+            block.baked_pos > baked_pos ? block.baked_pos - baked_pos
+                                        : baked_pos - block.baked_pos);
+        block.remap_abs_delta += delta;
+    }
+    block.baked_pos = baked_pos;
+}
+
+std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
+    const uint32_t n = block_count();
+    std::vector<uint32_t> selected;
+    if (n == 0) return selected;
+
+    const uint32_t budget = budget_blocks();
+    if (budget == 0 || n <= budget) {
+        selected.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) selected.push_back(i);
+        return selected;
+    }
+
+    const uint32_t sink = std::min({cfg_.sink_blocks, budget, n});
+    const uint32_t tail = budget - sink;
+    selected.reserve(budget);
+    for (uint32_t i = 0; i < sink; ++i) selected.push_back(i);
+    // n > budget guarantees `tail_begin >= sink`, so the prefix and suffix do
+    // not overlap and the result contains exactly `budget` ascending IDs.
+    const uint32_t tail_begin = n - tail;
+    for (uint32_t i = tail_begin; i < n; ++i) selected.push_back(i);
+    return selected;
+}
+
 std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
+    return pick_topk_blocks({});
+}
+
+std::vector<uint32_t> KvMemStore::pick_topk_blocks(
+        const std::vector<uint32_t> &mandatory_blocks) const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
@@ -121,6 +318,12 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
         if (id < n && !kept[id]) { kept[id] = true; ++kept_count; }
     };
     for (uint32_t i = 0; i < sink && kept_count < budget; ++i) keep(i);
+    for (uint32_t id : mandatory_blocks) keep(id);
+    if (kept_count > budget) {
+        throw std::runtime_error(
+            "KVMem mandatory selection plus sink blocks exceeds the "
+            "configured selection budget");
+    }
     for (uint32_t i = 0; i < recent && kept_count < budget; ++i) {
         keep(n - 1 - i);
     }
@@ -230,6 +433,14 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
 
     std::vector<bool> now_selected(block_count(), false);
     for (uint32_t id : selected_ids) now_selected[id] = true;
+    std::vector<bool> was_in_working_set(block_count(), false);
+    for (const KvMemBlock &b : blocks_) {
+        was_in_working_set[b.block_id] = b.in_working_set;
+        if (b.in_working_set && now_selected[b.block_id]) {
+            ++plan.selection_overlap_blocks;
+        }
+    }
+    const bool force_full_reload = !cfg_.hierarchical_reuse;
 
     // Stage-out: any GPU-resident block that is not selected. On the first
     // post-prefill selection, many cold blocks were never in the prior working
@@ -237,7 +448,8 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
     // Their cache pages keep whatever bake they currently hold (baked_pos
     // unchanged); a future re-selection will de-rotate from there.
     for (auto &b : blocks_) {
-        if (b.tier == KvTier::GPU && !now_selected[b.block_id]) {
+        if (b.tier == KvTier::GPU &&
+            (!now_selected[b.block_id] || force_full_reload)) {
             plan.stage_out.push_back(b.block_id);
             b.in_working_set = false;
         }
@@ -247,6 +459,17 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
     uint32_t window_pos = 0;
     for (uint32_t id : selected_ids) {
         KvMemBlock &b = blocks_[id];
+        const bool naturally_reusable =
+            was_in_working_set[id] && b.tier == KvTier::GPU;
+        if (naturally_reusable) {
+            if (b.baked_pos == static_cast<int64_t>(window_pos)) {
+                ++plan.retained_position_stable;
+            } else {
+                ++plan.retained_position_moved;
+            }
+            if (!force_full_reload) ++plan.gpu_reused_blocks;
+        }
+        const bool cold = b.tier != KvTier::GPU || force_full_reload;
         if (!b.in_working_set) plan.stage_in.push_back(id);
 
         KvMemRemap rm;
@@ -254,10 +477,60 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
         rm.n_tokens = b.n_tokens;
         rm.from_base = static_cast<int32_t>(b.baked_pos);   // de-rotate source
         rm.to_base = static_cast<int32_t>(window_pos);      // new window slot
-        rm.skip = (b.baked_pos == static_cast<int64_t>(window_pos));
+        rm.working_k_resident = !cold;
+        const bool same_position =
+            b.baked_pos == static_cast<int64_t>(window_pos);
+        // A cold immutable block has no valid rotated working K on GPU: the
+        // tier record intentionally stores V but uses the position-free raw-K
+        // mirror as K authority. Even when its compact position is unchanged,
+        // it must be rematerialized after stage-in. Position equality alone is
+        // therefore insufficient to skip assembly.
+        rm.skip = same_position &&
+                  (!cfg_.immutable_source_k || rm.working_k_resident);
+        if (cfg_.immutable_source_k && (cold || !same_position)) {
+            const uint64_t delta = static_cast<uint64_t>(
+                b.baked_pos > static_cast<int64_t>(window_pos)
+                    ? b.baked_pos - static_cast<int64_t>(window_pos)
+                    : static_cast<int64_t>(window_pos) - b.baked_pos);
+            const bool remap_limit =
+                cfg_.immutable_refresh_remaps > 0 &&
+                b.remap_count >= cfg_.immutable_refresh_remaps;
+            const bool delta_limit =
+                cfg_.immutable_refresh_abs_delta_tokens > 0 &&
+                (b.remap_abs_delta >=
+                     cfg_.immutable_refresh_abs_delta_tokens ||
+                 delta >= cfg_.immutable_refresh_abs_delta_tokens -
+                              std::min<uint64_t>(
+                                  b.remap_abs_delta,
+                                  cfg_.immutable_refresh_abs_delta_tokens));
+            const bool baked_out_of_range =
+                cfg_.immutable_max_baked_position > 0 &&
+                (b.baked_pos < 0 ||
+                 static_cast<uint64_t>(b.baked_pos) + b.n_tokens >
+                     cfg_.immutable_max_baked_position);
+            rm.raw_refresh =
+                cold || remap_limit || delta_limit || baked_out_of_range;
+        }
+        if (rm.skip && rm.raw_refresh) {
+            throw std::logic_error(
+                "KVMem remap cannot both skip K assembly and refresh raw K");
+        }
         plan.remaps.push_back(rm);
 
         b.in_working_set = true;
+        if (!rm.skip) {
+            const uint64_t delta = static_cast<uint64_t>(
+                b.baked_pos > static_cast<int64_t>(window_pos)
+                    ? b.baked_pos - static_cast<int64_t>(window_pos)
+                    : static_cast<int64_t>(window_pos) - b.baked_pos);
+            if (rm.raw_refresh) {
+                b.remap_count = 0;
+                b.remap_abs_delta = 0;
+            } else {
+                ++b.remap_count;
+                b.remap_abs_delta += delta;
+            }
+        }
         b.baked_pos = static_cast<int64_t>(window_pos);
         window_pos += b.n_tokens;
     }

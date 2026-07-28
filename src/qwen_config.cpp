@@ -1,9 +1,16 @@
 #include "qw3/qwen_config.hpp"
 
+#include "json.hpp"
+
+#include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 
 namespace qw3 {
 namespace {
+
+using json = nlohmann::json;
 
 const GgufValue &require(const GgufFile &gguf, const std::string &key) {
     const auto &meta = gguf.metadata();
@@ -98,6 +105,60 @@ QwenConfig::QwenConfig(const GgufFile &gguf) {
     if (const auto *b = optional(gguf, "tokenizer.ggml.bos_token_id")) bos_id = as_u32(*b);
     if (const auto *e = optional(gguf, "tokenizer.ggml.eos_token_id")) eos_id = as_u32(*e);
     if (const auto *ab = optional(gguf, "tokenizer.ggml.add_bos_token")) add_bos = ab->bool_value;
+}
+
+QwenConfig::QwenConfig(const std::string &hf_model_directory) {
+    const std::filesystem::path path =
+        std::filesystem::path(hf_model_directory) / "config.json";
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open HF config: " + path.string());
+    json root;
+    in >> root;
+    if (!root.contains("text_config")) {
+        throw std::runtime_error("HF Qwen config is missing text_config");
+    }
+    const json &text = root.at("text_config");
+    if (text.value("model_type", std::string()) != "qwen3_5_text") {
+        throw std::runtime_error("unsupported HF text model type: " +
+                                 text.value("model_type", std::string()));
+    }
+
+    architecture = "qwen35";
+    n_layers = text.at("num_hidden_layers").get<uint32_t>();
+    nextn_predict_layers = root.value(
+        "mtp_num_hidden_layers", text.value("mtp_num_hidden_layers", uint32_t{0}));
+    block_count = n_layers + nextn_predict_layers;
+    n_embd = text.at("hidden_size").get<uint32_t>();
+    n_ff = text.at("intermediate_size").get<uint32_t>();
+    n_ctx_train = text.at("max_position_embeddings").get<uint32_t>();
+    n_heads = text.at("num_attention_heads").get<uint32_t>();
+    n_kv_heads = text.at("num_key_value_heads").get<uint32_t>();
+    head_dim = text.at("head_dim").get<uint32_t>();
+    head_v_dim = head_dim;
+    rms_eps = text.value("rms_norm_eps", 1e-6f);
+
+    const float partial_rotary = text.value("partial_rotary_factor", 1.0f);
+    rope_dim = static_cast<uint32_t>(std::lround(head_dim * partial_rotary));
+    if (text.contains("rope_parameters")) {
+        rope_theta = text.at("rope_parameters").value("rope_theta", 1e7f);
+    }
+
+    ssm_conv_kernel = text.at("linear_conv_kernel_dim").get<uint32_t>();
+    ssm_group_count = text.at("linear_num_key_heads").get<uint32_t>();
+    ssm_time_step_rank = text.at("linear_num_value_heads").get<uint32_t>();
+    ssm_state_size = text.at("linear_key_head_dim").get<uint32_t>();
+    const uint32_t value_dim = text.at("linear_value_head_dim").get<uint32_t>();
+    if (value_dim != ssm_state_size) {
+        throw std::runtime_error("qwen-native requires equal DeltaNet key/value head dims");
+    }
+    ssm_inner_size = 2 * ssm_group_count * ssm_state_size +
+                     ssm_time_step_rank * value_dim;
+    full_attention_interval = text.at("full_attention_interval").get<uint32_t>();
+
+    vocab_size = text.at("vocab_size").get<uint32_t>();
+    bos_id = text.value("bos_token_id", uint32_t{0});
+    eos_id = text.value("eos_token_id", uint32_t{0});
+    add_bos = false;
 }
 
 } // namespace qw3

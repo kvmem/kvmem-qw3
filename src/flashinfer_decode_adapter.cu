@@ -13,6 +13,42 @@
 #include <cstring>
 #include <cstdint>
 
+// FlashInfer's generic float <- FP8 vec_cast currently converts one element at
+// a time. Decode consumes K/V as float vectors, so use the hardware packed
+// FP8x2 -> FP16x2 conversion and widen the pair together. This keeps the same
+// numerical path (FP8 is exactly representable in FP16) while halving the FP8
+// conversion instruction count on SM90+.
+namespace flashinfer {
+template <>
+struct vec_cast<float, __nv_fp8_e4m3> {
+    template <size_t VecSize>
+    FLASHINFER_INLINE static void cast(float *dst,
+                                       const __nv_fp8_e4m3 *src) {
+        static_assert(VecSize % 2 == 0, "FP8 packed conversion needs pairs");
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#pragma unroll
+        for (size_t i = 0; i < VecSize / 2; ++i) {
+            uint32_t h2_bits;
+            const uint16_t fp8x2 =
+                reinterpret_cast<const uint16_t *>(src)[i];
+            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;"
+                         : "=r"(h2_bits)
+                         : "h"(fp8x2));
+            dst[2 * i] =
+                __half2float(reinterpret_cast<const half *>(&h2_bits)[0]);
+            dst[2 * i + 1] =
+                __half2float(reinterpret_cast<const half *>(&h2_bits)[1]);
+        }
+#else
+#pragma unroll
+        for (size_t i = 0; i < VecSize; ++i) {
+            dst[i] = static_cast<float>(src[i]);
+        }
+#endif
+    }
+};
+}  // namespace flashinfer
+
 namespace qw3 {
 namespace flashinfer_adapter {
 namespace {
@@ -88,7 +124,9 @@ __global__ void unpack_gate_batch_kernel(float *out,
 
 constexpr uint32_t decode_num_threads(uint32_t group_size, uint32_t sizeof_dtype, uint32_t bdx) {
     const uint32_t heuristic =
-        (group_size == 8U) ? ((sizeof_dtype == 1U) ? 256U : 512U) : 128U;
+        (group_size == 8U)
+            ? ((sizeof_dtype == 1U) ? 256U : 512U)
+            : ((group_size == 6U && sizeof_dtype == 1U) ? 192U : 128U);
     return heuristic > bdx * group_size ? heuristic : bdx * group_size;
 }
 
@@ -314,7 +352,8 @@ cudaError_t launch_batch_decode_group_size(Params params,
     constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HeadDim / 32UL);
     constexpr uint32_t bdx = HeadDim / vec_size;
     constexpr uint32_t bdy = GroupSize;
-    constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+    constexpr uint32_t num_threads =
+        decode_num_threads(GroupSize, sizeof(DTypeKV), bdx);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GroupSize == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
     constexpr uint32_t smem_size =

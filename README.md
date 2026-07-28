@@ -206,6 +206,143 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+### NVFP4 / FP8 safetensors
+
+The native backend also accepts a Hugging Face model directory containing a
+`compressed-tensors` Qwen3.5/Qwen3.6 checkpoint. Mixed checkpoints may combine
+NVFP4 W4A4 group-16 MLP weights, FP8 W8A8 projections, and BF16 fallback
+weights. NVFP4 uses FlashInfer's SM120 CUTLASS kernel and is enabled
+automatically only for a `120a` CUDA build; Q8 and non-Blackwell FlashInfer
+builds do not compile this adapter.
+
+For memory-constrained GPUs, `--cpu-embedding` keeps an untied BF16 input
+embedding table in the checkpoint's host mapping. Prefill gathers the selected
+token rows through a double-buffered pinned staging area, and decode transfers
+one row per token. The LM head and all compute weights remain on GPU. The flag
+is opt-in and rejects checkpoints whose input embedding is also the LM head.
+
+When MTP is disabled (`--mtp-chain 0`, the serving default), qwen-native also
+skips uploading the unused MTP draft weights. Enabling MTP or its diagnostic
+trace automatically restores those weights at model load.
+
+#### Recommended 24 GiB NVFP4 profile
+
+For the Unsloth Qwen3.6-27B-NVFP4 checkpoint on a 24 GiB GPU, prefer
+single-request serving with CPU-resident input embeddings, FP8 KV cache, a
+96K-token context, 1024-token prefill chunks, and MTP disabled:
+
+```sh
+./build-cu13/qw3 serve \
+  --model /path/to/Qwen3.6-27B-NVFP4 \
+  --host 127.0.0.1 --port 18080 \
+  --ctx 98304 \
+  --kv-dtype fp8 \
+  --prefill-chunk 1024 \
+  --cpu-embedding \
+  --mtp-chain 0 \
+  --no-continuous-batching
+```
+
+This profile reached a measured peak of approximately 22.63 GiB with a
+96,490-token prompt, leaving about 1.37 GiB of a nominal 24 GiB device for
+runtime variation. The `--ctx` limit includes both prompt and generated tokens,
+so their combined length must remain at or below 98,304. Exact headroom varies
+with the CUDA build, driver, and GPU.
+
+As an upper-end capacity setting, `--ctx 114688` (112K tokens) can be tried
+with all other options above unchanged. Its estimated peak is approximately
+23.13 GiB, leaving about 0.87 GiB on a nominal 24 GiB device. Keep the GPU free
+of other workloads and treat 112K as a limit-oriented setting rather than the
+default recommendation; 96K retains safer runtime headroom.
+
+For the FlashInfer wheel layout used by the `vllm` environment:
+
+```sh
+FI_DATA=/path/to/vllm/lib/python3.12/site-packages/flashinfer/data
+cmake -S . -B build-flashinfer -DCMAKE_BUILD_TYPE=Release \
+  -DQW3_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real \
+  -DQW3_ENABLE_FLASHINFER=ON \
+  -DQW3_FLASHINFER_INCLUDE_DIR="$FI_DATA/include" \
+  -DQW3_FLASHINFER_CUTLASS_INCLUDE_DIR="$FI_DATA/cutlass/include"
+cmake --build build-flashinfer -j
+
+./build-flashinfer/qw3 serve \
+  --model /path/to/Qwen3.6-27B-NVFP4 \
+  --host 127.0.0.1 --port 18080 --mtp-chain 4
+```
+
+SM120 builds can optionally use FlashInfer's CuTe-DSL chunked GDN kernel for
+long prefill. Export the Qw3-specific modulo-head variant, then point CMake at
+the generated object and the CuTe DSL runtime:
+
+```sh
+PYTHONPATH=/path/to/flashinfer-main \
+  /path/to/cuda13/python scripts/export_gdn_sm120_aot.py \
+  --output-dir build-cu13/gdn-sm120-aot
+
+cmake -S . -B build-cu13 \
+  -DQW3_GDN_SM120_AOT_DIR="$PWD/build-cu13/gdn-sm120-aot" \
+  -DQW3_CUTE_DSL_RUNTIME_DIR=/path/to/nvidia_cutlass_dsl/lib
+cmake --build build-cu13 -j
+
+./build-cu13/qw3 serve \
+  --model /path/to/Qwen3.6-27B-NVFP4
+```
+
+The AOT route applies only to regular prefill batches of at least 64 tokens.
+Decode, MTP checkpointing, and KVMem DeltaNet capture retain the existing
+recurrent kernel. It is the default when the build includes the AOT object and
+also accelerates compatible Q8 models. Set `QW3_RECURRENT_KERNEL=ported` to
+restore the previous recurrent prefill path.
+
+NVFP4 builds can additionally AOT-compile FlashInfer's fused BF16
+RMSNorm-plus-FP4-quantization kernel. The exported kernel is specialized for
+the model hidden size:
+
+```sh
+/path/to/cuda13/python scripts/export_rms_fp4_sm120_aot.py \
+  --hidden-size 5120 \
+  --output-dir build-cu13/rms-fp4-sm120-aot
+
+cmake -S . -B build-cu13 \
+  -DQW3_RMS_FP4_SM120_AOT_DIR="$PWD/build-cu13/rms-fp4-sm120-aot" \
+  -DQW3_CUTE_DSL_RUNTIME_DIR=/path/to/nvidia_cutlass_dsl/lib
+cmake --build build-cu13 -j
+```
+
+When present, this route is used for compatible BF16 NVFP4 prefill batches of
+at least 256 tokens. Smaller batches and decode retain the existing kernel, and
+an unsupported launch falls back automatically. Set
+`QW3_NVFP4_FLASHINFER_RMS_QUANT=0` to disable it.
+
+On RTX Pro 6000 Blackwell, the default single-request decode policy uses the
+fastest measured hybrid route: one packed gate/up CUTLASS FP4 Tensor Core
+GEMM, the tuned CUTLASS FP4 down-projection kernel, and cuBLASLt FP8 Tensor
+Cores for the mixed checkpoint's FP8 projections. The residual stream and
+final attention/FFN projection outputs use BF16 storage while normalization,
+attention, and recurrent state calculations remain FP32. The equivalent
+explicit settings are:
+
+```sh
+QW3_NVFP4_SMALL_SINGLE=0 \
+QW3_NVFP4_FUSED_CUTLASS_PAIR=1 \
+QW3_NVFP4_VLLM_TACTICS=1 \
+QW3_NVFP4_BF16_MAIN=1 \
+QW3_FP8_SMALL_CUBLASLT=1 \
+./build-flashinfer/qw3 serve \
+  --model /path/to/Qwen3.6-27B-NVFP4 \
+  --host 127.0.0.1 --port 18080
+```
+
+Mixed FP8/BF16 recurrent fanouts share both activation conversions by default.
+On the Qwen 3.6 `10240/6144/48/48 x 5120` projection shapes, shared FP8
+scaling plus the fused small BF16 pair reduced the single-layer microbenchmark
+from about `0.101 ms` to `0.050 ms`; set `QW3_FP8_MIXED_FANOUT=0` to restore
+per-projection dispatch for comparison.
+
+The GGUF/Q8 model path and kernels remain unchanged; the loader selects the
+model source from whether `--model` names a file or a directory.
+
 Tested with CUDA 12.x / 13.x. For non-Blackwell targets, swap
 `CMAKE_CUDA_ARCHITECTURES` accordingly (e.g. `90` for Hopper, `89` for Ada).
 The default of `120a-real` matters — JIT'd Ampere PTX leaves measurable
@@ -864,7 +1001,42 @@ sub-path, or recovering from regressions:
 | `QW3_PREFILL_FA2_NSPLIT`    | adaptive | FA2 v2 prefill split-KV: `{1,2,4}`. Default heuristic picks NSPLIT=2 at chunk=512 (under-saturated grid), NSPLIT=1 otherwise. |
 | `QW3_FUSE_SILU_MUL`         | `1`     | `0` reverts FFN gate+up+silu+mul to two matvecs + a separate silu_mul. |
 | `QW3_FUSE_ADD`              | `1`     | `0` reverts attn_output / ffn_down to plain matvec + separate add. |
-| `QW3_GRAPH`                 | `1`     | `0` disables CUDA graph capture of decode. |
+| `QW3_NVFP4_SMALL_MMVQ`      | per-route | Global override for both batch-1 NVFP4 routes. `0` selects FlashInfer/CUTLASS; `1` selects packed-FP4 DP4A. The more specific variables below take precedence. Batch 2+ always uses native FP4 MMA. |
+| `QW3_NVFP4_SMALL_SINGLE`    | `0`     | Per-projection override. `0` routes batch-1 down projections through the FlashInfer/CUTLASS FP4 Tensor Core path; `1` restores the packed-FP4 DP4A path. |
+| `QW3_NVFP4_SMALL_PAIR`      | `1`     | Fallback gate/up override used when a compatible packed CUTLASS pair is unavailable. `1` retains the fused packed-FP4 gate+up/SwiGLU DP4A path. |
+| `QW3_NVFP4_FUSED_CUTLASS_PAIR` | `1` | Pack compatible NVFP4 gate/up weights contiguously and issue one native FP4 Tensor Core GEMM followed by SwiGLU. Set `0` to restore the DP4A pair route. |
+| `QW3_NVFP4_VLLM_TACTICS`   | `1`     | Use the SM120 batch-1 CUTLASS tactics selected by FlashInfer/vLLM autotuning for Qwen3.6-27B shapes: swapped A/B, 128x32x256 without Stream-K for packed gate/up, and 128x32x128 with Stream-K for down projections. |
+| `QW3_NVFP4_BF16_MAIN`      | `1`     | Store the single-request NVFP4 model's hidden/residual stream and final FP8/NVFP4 projection outputs in BF16. RMSNorm reductions, attention, DeltaNet state, and logits remain FP32. Set `0` for the former all-FP32 activation path. Continuous batching currently keeps the FP32 path. |
+| `QW3_Q8_BF16_MAIN`         | `1`     | Store the single-request Q8 model's hidden/residual stream and final Q8 projection outputs in BF16 while keeping linear accumulation, RMSNorm reductions, attention, DeltaNet state, and logits in FP32. Set `0` for the former all-FP32 activation path. Continuous batching currently keeps the FP32 path. |
+| `QW3_NVFP4_FLASHINFER_RMS_QUANT` | `1` when built | Use the optional SM120 FlashInfer CuTe-DSL AOT kernel for fused BF16 RMSNorm and NVFP4 activation quantization. Set `0` to restore the built-in kernel. |
+| `QW3_NVFP4_FLASHINFER_RMS_MIN_BATCH` | `256` | Minimum prefill batch size for the optional fused FlashInfer RMSNorm/quantization route. |
+| `QW3_NVFP4_CUTLASS_OUTPUT_BF16` | `0` | Experimental BF16 CUTLASS epilogue for packed gate/up. It is disabled because the additional conversion/SwiGLU path is slower than the FP32 epilogue on SM120. |
+| `QW3_FUSED_QK_NORM_ROPE`    | `1`     | Fuse decode-time Q/K per-head RMSNorm and partial RoPE into one CUDA launch on full-attention layers. Set `0` to restore four separate launches. |
+| `QW3_FUSED_RECURRENT_QK_NORM` | `1`   | Fuse recurrent decode Q/K L2 normalization into one CUDA launch per DeltaNet layer. Set `0` to restore separate Q and K launches. |
+| `QW3_FP8_SMALL_CUBLASLT`    | `1`     | `1` routes FP8 batch 1-8 linears through native cuBLASLt FP8 Tensor Cores, caches per-shape plans, shares activation quantization across fanout projections, and fuses SwiGLU/output scaling/residual add. |
+| `QW3_FP8_PREFILL_PACKED_SWIGLU` | `1` | Use one packed cuBLASLt FP8 GEMM plus fused output scaling/SwiGLU for compatible gate/up projections at prefill batch sizes above 8. Set `0` to restore separate gate/up projections. |
+| `QW3_GDN_SM120_FUSED_IO` | `1` | Fuse recurrent Q/K L2 normalization into the SM120 BF16 Q/K/V pack and fuse the BF16 GDN output conversion with RMSNorm/gating. FP32 recurrent state and checkpoint paths are unchanged. Set `0` to restore separate normalization, pack, unpack, and gate kernels. |
+| `QW3_FP8_LAZY_RECURRENT_PAIR` | `1` | Keep a compatible recurrent FP8 QKV/gate pair in packed GEMM storage and apply its token/channel scales inside the causal convolution and final gate consumer. Unsupported, checkpoint, and DeltaNet-capture paths materialize the original FP32 outputs. |
+| `QW3_FP8_LAZY_ATTENTION_FANOUT` | `1` | With FP8 KV cache, defer full-attention Q/K/V output scaling: Q/K normalize directly from scaled raw GEMM views and V scales directly into the FP8 KV cache. Other KV dtypes retain materialized FP32 projections. |
+| `QW3_FP8_MIXED_FANOUT`      | `1`     | Share FP8 activation quantization and BF16 input conversion inside mixed FP8/BF16 fanouts such as Qwen 3.6 recurrent projections. Set `0` for the legacy per-projection dispatch. |
+| `QW3_FP8_FANOUT_SCALE_FUSION` | `1`   | Combine per-row output scaling for 2-4 FP8 projections sharing one activation into one CUDA kernel. Set `0` to restore one scaling launch per projection. |
+| `QW3_FP8_CUTLASS_BF16` | `1` | Use the SM120 CUTLASS FP8 GEMM epilogue to apply activation/weight scales and write BF16 directly for compatible large prefill projections. Set `0` to restore cuBLASLt plus a separate scaling kernel. |
+| `QW3_FP8_FUSED_RMS_QUANT` | `1` | Fuse BF16 RMSNorm with dynamic FP8 activation quantization for large attention and recurrent projection fanouts. Mixed recurrent fanouts also emit their shared BF16 activation in the same pass. Set `0` to restore separate RMSNorm, FP8 quantization, and FP32-to-BF16 kernels. |
+| `QW3_FP8_FUSED_RMS_THREADS` | `512` | Thread count for the fused RMSNorm/FP8 quantization kernel: `256`, `512`, or `1024`. SM120 profiling selects 512 by default. |
+| `QW3_FP8_PACKED_PAIR` | `1` | Pack compatible FP8 projection pairs (FFN gate/up and recurrent QKV/gate) contiguously at model load so one cuBLASLt GEMM can produce both outputs. This does not increase steady-state model memory; set `0` to keep separate allocations and GEMMs. |
+| `QW3_FP8_DIRECT_VEC2` | `1` | Convert two adjacent E4M3 values per instruction in direct FP8-weight/F32-activation decode GEMVs. Set `0` to use scalar FP8 conversion. |
+| `QW3_FP8_DIRECT_PAIR` | `1` | Fuse compatible small FP8 projection pairs such as attention K/V into one direct decode launch. Set `0` to launch each projection separately. |
+| `QW3_FP8_DIRECT_THREADS` | `256` | Threads per block for direct vec2 FP8 decode GEMVs. Supported values: 128, 256, 512. |
+| `QW3_FP8_DIRECT_PAIR_THREADS` | `256` | Threads per block for fused direct FP8 projection pairs. Supported values: 128, 256, 512. |
+| `QW3_FP8_ATTN_Q_DIRECT` | `1` | Route the large Q projection through the direct FP8 decode GEMV when a three-way attention fanout also contains a prepared direct K/V pair. This shape-specific route does not affect recurrent QKV/gate fanouts. |
+| `QW3_FP8_ATTN_Q_DIRECT_MAX_ROWS` | `16384` | Maximum Q-projection row count eligible for the shape-specific direct attention route. |
+| `QW3_FP8_ATTN_Q_DIRECT_THREADS` | `128` | Threads per block for the direct attention-Q FP8 GEMV. Supported values: 128, 256, 512. |
+| `QW3_FP8_FUSED_BF16_QUANT` | `1` | In batch-1 mixed FP8/BF16 fanouts, stage the BF16 activation while the FP8 dynamic-quantization kernel scans the shared FP32 input. Set `0` to restore a separate FP32-to-BF16 conversion launch. Batch 2+ keeps the separate conversion path, which is faster at those shapes. |
+| `QW3_FP8_FANOUT_CUSTOM_MAX_ROWS` | `2048` | In batch-1 FP8 fanouts, use the direct FP8-weight/F32-activation GEMV for projections at or below this row count while larger projections stay on cuBLASLt. Set `0` to route every projection through cuBLASLt. |
+| `QW3_FP8_MATVEC_ADD_CUSTOM_MAX_COLS` | `8192` | Use the fused direct FP8-weight/F32-activation matvec+residual kernel for batch-1 output projections at or below this input width. Set `0` to retain dynamic activation quantization plus cuBLASLt. |
+| `QW3_BF16_SMALL_PAIR_MAX_ROWS` | `128` | Fuse a pair of same-shape batch-1 BF16 projections into one direct kernel at or below this row count, reusing the shared BF16 activation. Set `0` to retain two cuBLAS calls. |
+| `QW3_FP8_CUBLASLT_OUTER_SCALE` | `0`  | Experimental cuBLASLt outer-vector scaling that applies activation and weight scales in the GEMM. It removes post-scale kernels but is slower for current batch-1 SM120 shapes. |
+| `QW3_GRAPH`                 | `0`     | Experimental per-token CUDA graph capture/update for non-paged decode. Enable with `1`; it is not the persistent static graph used by vLLM and is slower on the current NVFP4 path. |
 | `QW3_HGEMM_X_CACHE`         | `1`     | `0` disables FP16 input reuse across consecutive HGEMMs sharing an input. |
 | `QW3_KV_DTYPE`              | `fp16` | KV cache dtype for env-driven paths. `fp16` is the baseline/default, `fp8` uses raw e4m3 KV cache storage, `fp32` is parity-only, and `q8` is experimental. CLI `--kv-dtype` overrides this for service/local runs that expose the flag. |
 | `QW3_MATMUL`                | `auto` CLI / `mmq` serve | Per-call: batch ≥ 8 → MMQ (v8 at batch ≥ 128 for 128×128 tile, v7 below for 64×64 + occupancy). `hgemm` forces cuBLAS HGEMM with FP16 dequant scratch (uses ~3 GiB extra at chunk=2048); `mmq` forces MMQ unconditionally. |
@@ -944,8 +1116,10 @@ KVMem CLI parameters:
 | `--kvmem` | off | Enable KVMem block-sparse KV attention. Without this flag the normal forward path is used. |
 | `--kvmem-block-tokens N` | `128` | KV block granularity in tokens. Must be a positive multiple of the KV page size. |
 | `--kvmem-budget N` | `131072` | Maximum selected working-set window per selection, in tokens. Approximate selected block count is `budget / block_tokens`. |
-| `--kvmem-sink-blocks N` | `1` | Always keep the first N blocks for attention-sink behavior. |
-| `--kvmem-recent-blocks N` | `0` | Always keep the most recent N blocks. `0` lets KVMem derive the recent allocation. |
+| `--kvmem-sink-tokens N` | auto | Always-kept prefix target in tokens, rounded up to physical blocks. The automatic target is `clamp(1% × budget, 1K, 2K)`. |
+| `--kvmem-recent-tokens N` | auto | Always-kept suffix target in tokens, rounded up to physical blocks. The automatic target is `clamp(8% × budget, 4K, 16K)`. |
+| `--kvmem-sink-blocks N` | unset | Compatibility override in physical blocks. Mutually exclusive with `--kvmem-sink-tokens`. |
+| `--kvmem-recent-blocks N` | unset | Compatibility override in physical blocks. Mutually exclusive with `--kvmem-recent-tokens`; `0` explicitly keeps no suffix. |
 | `--kvmem-method M` | `retrieval` | Selection signal: `retrieval`, `h2o`, or `recency`. |
 | `--kvmem-retrieval-method M` | `mean_attention` | Retrieval scorer: `mean_attention` or `content_mean`. |
 | `--kvmem-query-conditioned` | off | Score blocks by the multi-token mean of the final user message (the question) against each block's mean-k, instead of falling back to a recency window. Default-OFF, byte-identical when unset. Required for the LongMemEval benchmark below. |
@@ -954,10 +1128,12 @@ KVMem CLI parameters:
 | `--kvmem-profile-blocks N` | `0` | Quota-policy profile block count. `0` derives from remaining budget. |
 | `--kvmem-update-mode M` | `interval` | Reselect cadence: `interval` or `step`. `step` selects after prefill and does not automatically reselect during decode. |
 | `--kvmem-interval N` | `64` | Decode tokens between reselections when `--kvmem-update-mode interval` is used. |
+| `--kvmem-immutable-k` | on | Store unrotated standard-layer K in CPU memory, keep one active GPU K copy, and periodically rebuild from raw K to bound re-RoPE drift. With MTP, the same raw-K authority keeps MTP RoPE inside the compact window. |
+| `--no-kvmem-immutable-k` | off | Legacy ablation: no CPU raw-K mirror; repeatedly remap the active GPU K in place. |
 | `--kvmem-gpu-memory-ratio F` | `0.50` | Approximate fraction of GPU memory that KVMem may use for its bounded GPU KV pool. |
 | `--kvmem-gpu-high-watermark F` | `0.95` | GPU tier high-watermark knob reserved for tiering policy. Leave at default for normal tests. |
 | `--kvmem-gpu-low-watermark F` | `0.85` | GPU tier low-watermark knob reserved for tiering policy. Leave at default for normal tests. |
-| `--kvmem-cpu-gb F` | `0` | CPU tier budget in GiB. `0` disables CPU tier runtime page release. |
+| `--kvmem-cpu-gb F` | `0` | Total KVMem CPU budget in GiB. Immutable mode reserves its raw-K mirror first and uses the remainder for the pinned V tier. |
 | `--kvmem-cpu-bytes N` | `0` | Legacy byte-level CPU tier budget. Prefer `--kvmem-cpu-gb` for manual runs. |
 | `--kvmem-nvme-dir DIR` | unset | Directory for the NVMe backing file. Required when NVMe tier budget is nonzero. |
 | `--kvmem-nvme-gb F` | `0` | NVMe tier budget in GiB. Requires `--kvmem-nvme-dir`. |
@@ -973,6 +1149,14 @@ Useful KVMem environment variables:
 |---|---|
 | `QW3_KVMEM_TIER_TRACE=1` | Print tier events such as `stage_out`, `stage_in`, `cpu_evict`, `stage_in_async_read`, and `bounded_gpu_pool`. Recommended when testing CPU/NVMe offload. |
 | `QW3_KVMEM_TRACE=1` | Print selection/retrieval diagnostics. This can be verbose. |
+| `QW3_KVMEM_PERF_TRACE=1` | Print one detailed timing row for every pressure/semantic reselection, including I/O bytes, async-read time versus actual wait, overlap gap, H2D, stage-out subphases, and assemble. Diagnostic only: it synchronizes timed GPU regions. |
+| `QW3_KVMEM_IMMUTABLE_REFRESH_REMAPS=N` | Rebuild a block from CPU raw-K after N accumulated delta rotations. Default: 32; 0 disables this threshold. |
+| `QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS=N` | Rebuild after N accumulated absolute position-token displacement. Default: 262144; 0 disables this threshold. |
+| `QW3_KVMEM_IMMUTABLE_MAX_BAKED_POSITION=N` | Force raw rebuild when the current GPU K was baked beyond this position. Default: the model's native context limit. |
+| `QW3_KVMEM_RAW_K_TRANSFER_BLOCKS=N` | Raw-K CPU gather/H2D batch size in blocks. Default: 128. |
+| `QW3_KVMEM_ASSEMBLY_MODE=legacy\|table\|pipeline` | Select the immutable-K assembly implementation for A/B tests. `legacy` computes transcendental RoPE values in each remap kernel; `table` uses one cached FP32 sin/cos table; `pipeline` additionally overlaps two-slot CPU gather, H2D, and GPU scatter. Opt3 defaults to `pipeline`; lower profiles default to `table`. |
+| `QW3_KVMEM_CPU_GATHER_THREADS=N` | CPU workers used to gather immutable raw-K into contiguous pinned transfer buffers. Default: 4 in pipeline mode and 1 otherwise. |
+| `QW3_KVMEM_MTP_LOCAL_POSITIONS=0|1` | Separate MTP logical page identity from compact RoPE coordinates and materialize selected MTP K from unrotated CPU raw K. Default: `1` with immutable K; `0` is the legacy long-position A/B path. |
 | `QW3_KVMEM_ATTN_TRACE=/path/to/file.jsonl` | Dump KVMem attention-mass traces for analysis. This is expensive and should not be enabled for normal serving. |
 | `QW3_KVMEM_ATTN_TRACE_INTERVAL=N` | Sampling interval for `QW3_KVMEM_ATTN_TRACE`; default is every token. |
 | `QW3_KVMEM_QC_SOFTMAX=1` | Query-conditioned scorer: use softmax-over-pages (accumulated attention mass per block) instead of the default sum-of-ReLU. A/B knob; does not change which blocks survive the budget cut (see the retrieval finding below). |
@@ -980,8 +1164,16 @@ Useful KVMem environment variables:
 | `QW3_KVMEM_QC_LAYERS=N` | Cap the number of normal-attention layers used by the query-conditioned scorer (debug). |
 | `QW3_KVMEM_NO_REROPE=1` | Skip the position-collapse re-RoPE in window assembly; selected blocks keep their true-position rotation. Diagnostic only — run with MTP off (the MTP draft position site is not rewired). |
 
+For mean-K retrieval, index storage follows `--kv-dtype`: `fp16` means IEEE
+binary16 (`__half`, not BF16), `fp8` means E4M3, and scoring/softmax
+accumulation remains FP32.
+
 Compatibility notes:
 
+- Local-position KVMem MTP requires
+  `--kvmem-budget + --kvmem-gen-budget <= model context limit`. Query-replay
+  suffix blocks are charged inside `--kvmem-budget`, so they do not silently
+  expand the compact RoPE window.
 - Single-request KVMem + MTP is supported.
 - KVMem + continuous batching is supported without MTP.
 - KVMem + continuous batching + MTP is guarded with a hard error in the
@@ -998,7 +1190,7 @@ accuracy on a 102-sample LongMemEval-S subset (17 per question type × 6 types:
 `single-session-{user,assistant,preference}`, `multi-session`,
 `temporal-reasoning`, `knowledge-update`). It hits `qw3 serve` **only** through the
 OpenAI HTTP API; grading uses a DeepSeek answer-equivalence judge
-(`evaluate_qa_deepseek.py`). No eval logic lives in qw3 C++.
+(`scripts/kvmem_eval/evaluate_qa_deepseek.py`). No eval logic lives in qw3 C++.
 
 Data: build the subset from the public `xiaowu0162/longmemeval` dataset
 (`scripts/kvmem_eval/dataset.py`), or point `--data` at your own JSONL with the same
@@ -1036,7 +1228,7 @@ Outputs land in `/data/chaidi/kvmem_eval/results/<tag>_eval_<ts>{,_hyp,_summary}
    hardcode or commit it):
 
 ```sh
-DEEPSEEK_API_KEY=... python3 evaluate_qa_deepseek.py \
+DEEPSEEK_API_KEY=... python3 scripts/kvmem_eval/evaluate_qa_deepseek.py \
   --hyp-file /data/chaidi/kvmem_eval/results/<tag>_eval_<ts>_hyp.jsonl \
   --ref-file selected_12_samples.jsonl \
   --output   /data/chaidi/kvmem_eval/results/<tag>_eval_<ts>_graded.jsonl

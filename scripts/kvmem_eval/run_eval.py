@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -27,12 +28,12 @@ try:
     from .client import Qw3Client
     from .dataset import QUESTION_TYPES, build_subset, load_all
     from .judge import DeepSeekJudge
-    from .prompt import render_messages
+    from .prompt import render_messages, render_transcript_messages
 except ImportError:  # allow running as a loose module
     from client import Qw3Client  # type: ignore
     from dataset import QUESTION_TYPES, build_subset, load_all  # type: ignore
     from judge import DeepSeekJudge  # type: ignore
-    from prompt import render_messages  # type: ignore
+    from prompt import render_messages, render_transcript_messages  # type: ignore
 
 
 # Overall reference baselines from docs/motivation_experiment_summary_en.md §4.1
@@ -73,6 +74,11 @@ def parse_args() -> argparse.Namespace:
                     help="disable server-side thinking (default: thinking ON, matches baseline)")
     ap.add_argument("--no-judge", action="store_true",
                     help="skip DeepSeek grading (model-only run; e.g. smoke without a key)")
+    ap.add_argument(
+        "--transcript-replay", action="store_true",
+        help="experimental role-preserving LongMemEval replay: after the "
+             "KVMem pressure threshold, reselect at every user query and "
+             "teacher-force the recorded assistant responses")
     ap.add_argument("--read-timeout", type=float, default=3600.0)
     ap.add_argument("--tag", default="kvmem",
                     help="label embedded in the output filenames")
@@ -120,7 +126,7 @@ def main() -> int:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     jsonl_path = args.out_dir / f"{args.tag}_eval_{ts}.jsonl"
     summary_path = args.out_dir / f"{args.tag}_eval_{ts}_summary.json"
-    # Hypotheses file in the schema the provided evaluate_qa_deepseek.py expects
+    # Hypotheses file in the schema evaluate_qa_deepseek.py expects.
     # (--hyp-file: one {question_id, hypothesis} object per line). The reference
     # file for that judge is the original samples JSONL (--ref-file).
     hyp_path = args.out_dir / f"{args.tag}_eval_{ts}_hyp.jsonl"
@@ -140,7 +146,27 @@ def main() -> int:
     with jsonl_path.open("w", encoding="utf-8") as out, \
             hyp_path.open("w", encoding="utf-8") as hyp_out:
         for pos, (idx, s) in enumerate(samples):
-            res = client.chat(render_messages(s))
+            messages = (render_transcript_messages(s) if args.transcript_replay
+                        else render_messages(s))
+            extra_body = None
+            if args.transcript_replay:
+                extra_body = {
+                    "kvmem_transcript_replay": True,
+                    "kvmem_trace_tag": f"lme-{s.question_id}",
+                }
+                if os.environ.get("QW3_KVMEM_TRANSCRIPT_EXACT_QUESTION") == "1":
+                    final_content = str(messages[-1]["content"])
+                    question_begin = final_content.rfind(s.question)
+                    if question_begin < 0:
+                        raise RuntimeError(
+                            "final transcript message does not contain the "
+                            f"exact question for {s.question_id}")
+                    extra_body["kvmem_query_span"] = {
+                        "message_index": len(messages) - 1,
+                        "content_start": question_begin,
+                        "content_end": question_begin + len(s.question),
+                    }
+            res = client.chat(messages, extra_body=extra_body)
             total_by_type[s.question_type] = total_by_type.get(s.question_type, 0) + 1
 
             verdict = None
@@ -172,6 +198,9 @@ def main() -> int:
                 "gold": s.answer,
                 "answer": res.answer,
                 "reasoning_chars": len(res.reasoning),
+                **({"reasoning": res.reasoning}
+                   if os.environ.get("QW3_EVAL_STORE_REASONING") == "1"
+                   else {}),
                 "correct": verdict,
                 "judge_raw": judge_raw,
                 "judge_error": judge_err,
@@ -220,6 +249,7 @@ def main() -> int:
         "temperature": args.temperature,
         "top_p": args.top_p,
         "max_tokens": args.max_tokens,
+        "transcript_replay": args.transcript_replay,
         "judged": judge is not None,
         "judge_model": (judge.model if judge is not None else None),
         "n_samples": n_done,
@@ -261,7 +291,10 @@ def main() -> int:
     print(f"  summary    : {summary_path}")
     if args.no_judge:
         print("\n  grade with the provided judge:")
-        print(f"    python3 evaluate_qa_deepseek.py --hyp-file {hyp_path} \\")
+        print(
+            "    python3 scripts/kvmem_eval/evaluate_qa_deepseek.py "
+            f"--hyp-file {hyp_path} \\"
+        )
         print(f"      --ref-file {args.data} --output {args.out_dir}/{args.tag}_eval_{ts}_graded.jsonl")
     return 0
 

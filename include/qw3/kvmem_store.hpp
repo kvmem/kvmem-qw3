@@ -37,10 +37,14 @@ struct KvMemBlock {
     uint32_t block_id = 0;          // dense index in append order (0,1,2,...)
     uint32_t orig_pos_start = 0;    // first original token position in block
     uint32_t n_tokens = 0;          // tokens in this block (<= block_tokens)
-    KvTier   tier = KvTier::GPU;    // where the block's KV currently lives
+    KvTier   tier = KvTier::GPU;    // active copy; opt_2 may retain other copies
     int32_t  gpu_slot = -1;         // future physical GPU block/page slot
     int32_t  cpu_slot = -1;         // CPU pinned tier slot, -1 if absent
     int32_t  nvme_slot = -1;        // NVMe tier slot, -1 if absent
+    // opt_2 and later use inclusive backing: tier names the active copy used
+    // for the next transition, while cpu_slot/nvme_slot may describe additional
+    // clean copies. Legacy levels retain the original exclusive semantics.
+    bool     ssd_clean = false;      // nvme_slot contains the current spill bytes
     bool     dirty_gpu = false;     // GPU copy newer than backing copy
     bool     in_flight = false;     // async copy/verification owns this block
 
@@ -49,11 +53,14 @@ struct KvMemBlock {
     // prefill a block is baked at its true sequential position == orig_pos_start.
     // Each assembly remaps IN PLACE from baked_pos to the new window slot via a
     // de-rotate(baked_pos)+re-rotate(new) pass (rope_block_remap_paged), reusing
-    // the same __sincosf so the prior bake's error cancels. All window slots are
-    // <=128k (the regime production already runs in), so repeated in-place
-    // remaps stay clean; fp16 storage drift is ~1 ULP/remap, bounded by skipping
-    // no-op remaps (baked_pos already == new slot).
+    // the same __sincosf. With fp16 KV, however, every non-noop remap rounds the
+    // result again; a long multi-turn trace can therefore accumulate error. The
+    // counters drive the raw-K refresh policy in immutable-source mode: small
+    // moves are applied in-place, while a block is rebuilt from the CPU raw-K
+    // mirror after too many rotations or too much cumulative displacement.
     int64_t  baked_pos = -1;        // -1 until first registered (then orig_pos_start)
+    uint32_t remap_count = 0;       // number of non-noop in-place re-RoPE moves
+    uint64_t remap_abs_delta = 0;   // sum(abs(to_base-from_base)) since raw rebuild
     bool     in_working_set = false;
 
     // Cumulative attention quality (built-in top-k selection signal, #40).
@@ -67,15 +74,22 @@ struct KvMemBlock {
 // One block's remap instruction for the executor: the block's K is currently
 // baked in place at from_base; re-bake it to to_base (its new window slot).
 // Fed to rope_block_remap_paged per attention layer during assembly. `skip` is
-// set when from_base == to_base (the block already sits in the right window
-// slot) so the executor issues no kernel — the dominant case across rounds with
-// stable selection.
+// set only when a valid working K remains resident and from_base == to_base.
+// A cold immutable block must be rebuilt from raw K even at the same position.
 struct KvMemRemap {
     uint32_t block_id = 0;
     uint32_t n_tokens = 0;
     int32_t  from_base = 0;   // current bake position (de-rotate source)
     int32_t  to_base = 0;     // assigned in-window first-token position
-    bool     skip = false;    // from_base == to_base: no kernel needed
+    // True when the rotated working K survived on GPU at planning time.
+    // This is deliberately distinct from KvMemPlan::stage_in, which tracks a
+    // logical working-set transition and may include still-resident pages.
+    bool     working_k_resident = false;
+    bool     skip = false;    // resident valid K already baked at to_base
+    // Rebuild this block from the unrotated CPU raw-K mirror instead of
+    // applying another lossy in-place de-RoPE/re-RoPE pass. Always true for a
+    // cold stage-in and when either refresh threshold is reached.
+    bool     raw_refresh = false;
 };
 
 // One block removed by truncate_to, carrying the tier slots the executor must
@@ -91,13 +105,21 @@ struct KvMemDroppedBlock {
 
 // Result of diffing a new selection against the current working set.
 struct KvMemPlan {
-    std::vector<uint32_t> stage_in;   // selected blocks not currently resident
+    // Blocks newly entering the logical working set. The executor may avoid a
+    // physical transfer when their GPU pages are still resident.
+    std::vector<uint32_t> stage_in;
     std::vector<uint32_t> stage_out;  // resident blocks no longer selected
     // Full remap plan for the new working set, in window order. The executor
     // assembles the kernel page-index list from these blocks in this order and
     // sets the query position to total_window_tokens.
     std::vector<KvMemRemap> remaps;
     uint32_t total_window_tokens = 0;  // sum of n_tokens over selected blocks
+    // Natural overlap is reported even in the reuse-off ablation, where the
+    // executor deliberately reloads blocks that it could otherwise retain.
+    uint32_t selection_overlap_blocks = 0;
+    uint32_t gpu_reused_blocks = 0;
+    uint32_t retained_position_stable = 0;
+    uint32_t retained_position_moved = 0;
 };
 
 // Which signal ranks the middle (non-sink/recent) blocks each reselection.
@@ -125,7 +147,8 @@ enum class KvMemSelectPolicy : uint8_t { TopK = 0, Quota = 1 };
 //              block's NET EDIT to the DeltaNet
 //              recurrent state (E_j = S_j - a_j S_{j-1}) read by the current
 //              DeltaNet query, aggregated over query tokens / heads / layers with
-//              a per-layer RMS normalization (see deltanet_retrieval.md). Unlike
+//              a per-layer RMS normalization (see
+//              docs/kvmem_deltanet_retrieval_design.md). Unlike
 //              the mean-k / per-token scorers (which read standard-attention keys)
 //              this reads the RECURRENT layers' state increments.
 enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMeanK = 2, DeltaNet = 3 };
@@ -138,6 +161,45 @@ enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMea
 enum class KvMemSubblockReduce : uint8_t { Sum = 0, Max = 1 };
 enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
 enum class KvMemDeltaNetLayerPolicy : uint8_t { Even = 0, Late = 1 };
+
+enum class KvMemKeepSource : uint8_t {
+    Auto = 0,
+    Tokens = 1,
+    Blocks = 2,
+};
+
+struct KvMemKeepAllocation {
+    uint32_t sink_target_tokens = 0;
+    uint32_t recent_target_tokens = 0;
+    uint32_t sink_blocks = 0;
+    uint32_t recent_blocks = 0;
+    uint32_t sink_effective_tokens = 0;
+    uint32_t recent_effective_tokens = 0;
+    KvMemKeepSource sink_source = KvMemKeepSource::Auto;
+    KvMemKeepSource recent_source = KvMemKeepSource::Auto;
+};
+
+// Resolve token-based always-kept bands after both the selection budget and
+// physical block size are known. A negative explicit value means "auto".
+// Explicit token and block values are mutually exclusive for each band.
+KvMemKeepAllocation resolve_kvmem_keep_allocation(
+    uint32_t block_tokens,
+    uint32_t select_budget,
+    int64_t sink_blocks,
+    int64_t recent_blocks,
+    int64_t sink_tokens,
+    int64_t recent_tokens);
+
+// Monotonic research profiles for storage/tiering performance comparisons.
+// KvmemInit is the committed compatibility baseline. Each later level contains
+// all earlier optimizations; a build must reject a level whose implementation
+// is not complete instead of silently falling back.
+enum class KvMemOptimizationLevel : uint8_t {
+    KvmemInit = 0,
+    Opt1 = 1,  // reduce SSD load volume: heat-aware CPU cache
+    Opt2 = 2,  // reduce stage-out: batched D2H; async SSD writes when present
+    Opt3 = 3,  // reduce stage-in: pinned H2D pipeline; coalesced SSD reads
+};
 
 struct KvMemStoreConfig {
     uint32_t block_tokens = 128;     // --kvmem-block-tokens
@@ -154,6 +216,30 @@ struct KvMemStoreConfig {
                                      // (SubBlockMeanK only; 1 => plain mean-k)
     KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
+    KvMemOptimizationLevel optimization_level =
+        KvMemOptimizationLevel::KvmemInit;
+    // New paper-facing controls. Native serving defaults all three to true.
+    // legacy_optimization_profile is set only when the deprecated cumulative
+    // --kvmem-optimization-level CLI was explicitly requested.
+    bool legacy_optimization_profile = false;
+    bool proactive_stage_out = true;
+    bool hierarchical_reuse = true;
+    bool packed_rematerialization = true;
+
+    // Drift-bounded K construction. The executor stores unrotated historical K
+    // in a CPU mirror and keeps only one active K copy on GPU. Resident window
+    // moves use an in-place delta rotation; cold blocks and blocks crossing a
+    // refresh threshold are rebuilt from raw K in one H2D + scatter/RoPE
+    // pass. Native serving uses a conservative count limit of 8 for both FP16
+    // and FP8; controlled experiments may override it.
+    bool immutable_source_k = false;
+    // Engine-level MTP prefix/speculation is enabled for this executor. Kept
+    // explicit so non-MTP KVMem runs do not allocate/tier an unused MTP cache
+    // or reserve an unnecessary MTP raw-K mirror.
+    bool mtp_enabled = false;
+    uint32_t immutable_refresh_remaps = 8;
+    uint64_t immutable_refresh_abs_delta_tokens = 262144;
+    uint64_t immutable_max_baked_position = 262144;
 
     // Archived experimental DeltaNet retrieval. Not exposed by the CLI and not
     // recommended for production; retained for future research and reproducibility.
@@ -220,6 +306,19 @@ public:
     // keeping the first `sink_blocks` and last `recent_blocks` blocks. Returns
     // selected block IDs in ascending (window) order. Honors the budget.
     std::vector<uint32_t> pick_topk_blocks() const;
+    // Same selector with additional mandatory block IDs. Mandatory blocks
+    // consume ordinary top-k slots; they are never appended beyond the budget.
+    // This is used by query replay so its suffix stays present without growing
+    // the active RoPE window past `select_budget`.
+    std::vector<uint32_t> pick_topk_blocks(
+        const std::vector<uint32_t> &mandatory_blocks) const;
+
+    // Deterministic working set used only while a long prefill is under memory
+    // pressure. Keep the configured sink prefix, then fill every remaining
+    // budget slot with the newest blocks. This deliberately ignores all
+    // retrieval/profile/attention scores and also ignores `recent_blocks`:
+    // "recent" here means the full newest tail left after reserving the sink.
+    std::vector<uint32_t> pick_prefill_pressure_blocks() const;
 
     // Accumulate per-block attention quality (decode side-channel, #40). `scores`
     // is indexed by block_id; entries beyond block_count() are ignored.
@@ -241,13 +340,22 @@ public:
     void set_block_tier(uint32_t block_id, KvTier tier,
                         int32_t cpu_slot = -1,
                         int32_t nvme_slot = -1);
+    // Inclusive-copy metadata used by opt_2+. These do not change which tier is
+    // active, so evicting a CPU cache copy cannot accidentally mark a still-live
+    // GPU block cold.
+    void set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot);
+    void set_block_ssd_backing(uint32_t block_id, int32_t nvme_slot,
+                               bool clean);
+    void set_block_io_in_flight(uint32_t block_id, bool in_flight);
     void set_block_baked_pos(uint32_t block_id, int64_t baked_pos);
+    void record_block_rerope(uint32_t block_id, int64_t baked_pos);
 
     // Diff `selected_ids` against current GPU residency / working-set state and produce the
-    // stage-in/out lists + the window remap plan. Each remap de-rotates from the
-    // block's CURRENT bake position and re-rotates to its new window slot (in
-    // place, no copy); blocks already in the right slot get skip=true. Updates
-    // each block's baked_pos / in_working_set. `selected_ids` need not be sorted;
+    // stage-in/out lists + the window remap plan. Each remap starts from the
+    // block's CURRENT GPU bake position. In immutable_source_k mode a cold
+    // stage-in or a resident block exceeding the configured drift thresholds
+    // is marked raw_refresh and rebuilt from the CPU raw-K mirror; otherwise a
+    // resident move is an in-place delta rotation. `selected_ids` need not be sorted;
     // it is sorted ascending internally so window order is deterministic (sink
     // first ... recent last). Blocks are packed contiguously from window pos 0.
     KvMemPlan set_selection(std::vector<uint32_t> selected_ids);

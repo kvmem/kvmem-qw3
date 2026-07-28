@@ -8,8 +8,11 @@
 #include <flashinfer/pos_enc.cuh>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 namespace qw3 {
 namespace flashinfer_adapter {
@@ -146,6 +149,63 @@ bool run_prefill_typed(
 
 constexpr uint32_t kPagedPrefillPrefixI32 = 16;
 
+bool paged_prefill_plan_cache_enabled() {
+    const char *env = std::getenv("QW3_FLASHINFER_PLAN_CACHE");
+    return env == nullptr ||
+           (std::strcmp(env, "0") != 0 &&
+            std::strcmp(env, "false") != 0 &&
+            std::strcmp(env, "off") != 0);
+}
+
+// Every normal-attention layer in one prefill chunk has the same scheduling
+// shape and shares the same persistent FlashInfer workspaces. PrefillPlan is
+// independent of the actual K/V page IDs, but the old path rebuilt and
+// re-uploaded that identical plan once per layer. Cache only an immediately
+// reusable workspace/shape tuple; a changed chunk length, KV-page count,
+// workspace, stream, or dtype instantiation is a miss and replans normally.
+struct PagedPrefillPlanCache {
+    bool valid = false;
+    int32_t *int_workspace = nullptr;
+    size_t int_workspace_bytes = 0;
+    float *requested_float_workspace = nullptr;
+    size_t requested_float_workspace_bytes = 0;
+    float *active_float_workspace = nullptr;
+    size_t active_float_workspace_bytes = 0;
+    cudaStream_t stream = nullptr;
+    uint32_t batch = 0;
+    uint32_t need_pages = 0;
+    uint32_t n_heads = 0;
+    uint32_t n_kv_heads = 0;
+    uint32_t head_dim = 0;
+    uint32_t page_size = 0;
+    bool allow_split_kv = false;
+    uint64_t consecutive_hits = 0;
+    uint64_t total_hits = 0;
+    uint64_t total_misses = 0;
+    flashinfer::PrefillPlanInfo plan_info;
+
+    bool matches(
+            int32_t *iw, size_t iw_bytes,
+            float *fw, size_t fw_bytes, cudaStream_t s,
+            uint32_t b, uint32_t pages, uint32_t nh,
+            uint32_t nkh, uint32_t hd, uint32_t ps,
+            bool allow_split) const {
+        return valid &&
+               int_workspace == iw &&
+               int_workspace_bytes == iw_bytes &&
+               requested_float_workspace == fw &&
+               requested_float_workspace_bytes == fw_bytes &&
+               stream == s &&
+               batch == b &&
+               need_pages == pages &&
+               n_heads == nh &&
+               n_kv_heads == nkh &&
+               head_dim == hd &&
+               page_size == ps &&
+               allow_split_kv == allow_split;
+    }
+};
+
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, typename Params, typename Variant>
 cudaError_t dispatch_batch_prefill_paged(Params params,
                                          typename Params::DTypeO *tmp_v,
@@ -186,7 +246,9 @@ bool run_batch_prefill_paged_typed(
         float scale,
         cudaStream_t stream,
         unsigned &threads_out,
-        unsigned &blocks_out) {
+        unsigned &blocks_out,
+        bool *plan_cache_hit_out) {
+    if (plan_cache_hit_out) *plan_cache_hit_out = false;
     if (out == nullptr || q_f16 == nullptr || o_f16 == nullptr ||
         int_workspace == nullptr || host_int_workspace == nullptr ||
         q == nullptr || k_cache == nullptr || v_cache == nullptr ||
@@ -243,29 +305,105 @@ bool run_batch_prefill_paged_typed(
     // tmp_v/tmp_s and merges them via VariableLengthMergeStates internally.
     const bool allow_split_kv =
         (float_workspace != nullptr && float_workspace_bytes > 0);
-    cudaError_t plan_st = flashinfer::PrefillPlan<int32_t>(
-        float_workspace, float_workspace_bytes,
-        plan_int_workspace,
-        plan_host_workspace,
-        plan_int_workspace_bytes,
-        plan_info,
-        qo_indptr_h,
-        kv_indptr_h,
-        batch,
-        1,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        head_dim,
-        page_size,
-        false,
-        sizeof(half),
-        -1,
-        0,
-        /*disable_split_kv=*/!allow_split_kv,
-        0,
-        stream);
-    if (plan_st != cudaSuccess) return false;
+    float *active_float_workspace = float_workspace;
+    size_t active_float_workspace_bytes = float_workspace_bytes;
+    static thread_local PagedPrefillPlanCache plan_cache;
+    const bool use_plan_cache = paged_prefill_plan_cache_enabled();
+    const bool plan_cache_hit =
+        use_plan_cache &&
+        plan_cache.matches(
+            int_workspace, int_workspace_bytes,
+            float_workspace, float_workspace_bytes, stream,
+            batch, need_pages, n_heads, n_kv_heads, head_dim,
+            page_size, allow_split_kv);
+    if (plan_cache_hit_out) *plan_cache_hit_out = plan_cache_hit;
+    auto plan = [&](bool disable_split_kv) {
+        return flashinfer::PrefillPlan<int32_t>(
+            disable_split_kv ? nullptr : active_float_workspace,
+            disable_split_kv ? 0 : active_float_workspace_bytes,
+            plan_int_workspace,
+            plan_host_workspace,
+            plan_int_workspace_bytes,
+            plan_info,
+            qo_indptr_h,
+            kv_indptr_h,
+            batch,
+            1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            head_dim,
+            page_size,
+            false,
+            sizeof(half),
+            -1,
+            0,
+            disable_split_kv,
+            0,
+            stream);
+    };
+    if (plan_cache_hit) {
+        ++plan_cache.consecutive_hits;
+        ++plan_cache.total_hits;
+        plan_info = plan_cache.plan_info;
+        active_float_workspace = plan_cache.active_float_workspace;
+        active_float_workspace_bytes =
+            plan_cache.active_float_workspace_bytes;
+    } else {
+        if (plan_cache.valid &&
+            std::getenv("QW3_FLASHINFER_PLAN_CACHE_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[flashinfer-plan-cache] tkv_bytes=%zu hits=%llu "
+                "total_hits=%llu total_misses=%llu batch=%u pages=%u\n",
+                sizeof(TKV),
+                static_cast<unsigned long long>(
+                    plan_cache.consecutive_hits),
+                static_cast<unsigned long long>(plan_cache.total_hits),
+                static_cast<unsigned long long>(
+                    plan_cache.total_misses),
+                plan_cache.batch, plan_cache.need_pages);
+        }
+        plan_cache.consecutive_hits = 0;
+        ++plan_cache.total_misses;
+        cudaError_t plan_st = cudaErrorInvalidValue;
+        try {
+            plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
+        } catch (const std::exception &) {
+            // FlashInfer's aligned workspace allocator throws when a requested
+            // split plan does not fit. Correctness does not require splitting:
+            // retry with the non-split planner instead of failing the request.
+            active_float_workspace = nullptr;
+            active_float_workspace_bytes = 0;
+            plan_info = {};
+            try {
+                plan_st = plan(/*disable_split_kv=*/true);
+            } catch (const std::exception &) {
+                return false;
+            }
+        }
+        if (plan_st != cudaSuccess) return false;
+        if (use_plan_cache) {
+            plan_cache.valid = true;
+            plan_cache.int_workspace = int_workspace;
+            plan_cache.int_workspace_bytes = int_workspace_bytes;
+            plan_cache.requested_float_workspace = float_workspace;
+            plan_cache.requested_float_workspace_bytes =
+                float_workspace_bytes;
+            plan_cache.active_float_workspace = active_float_workspace;
+            plan_cache.active_float_workspace_bytes =
+                active_float_workspace_bytes;
+            plan_cache.stream = stream;
+            plan_cache.batch = batch;
+            plan_cache.need_pages = need_pages;
+            plan_cache.n_heads = n_heads;
+            plan_cache.n_kv_heads = n_kv_heads;
+            plan_cache.head_dim = head_dim;
+            plan_cache.page_size = page_size;
+            plan_cache.allow_split_kv = allow_split_kv;
+            plan_cache.plan_info = plan_info;
+        }
+    }
 
     int32_t *q_indptr_d = int_workspace;
     int32_t *page_indptr_d = int_workspace + 2;
@@ -324,9 +462,9 @@ bool run_batch_prefill_paged_typed(
             reinterpret_cast<char *>(plan_i32) + plan_info.block_valid_mask_offset);
         params.total_num_rows = nullptr;
         tmp_v = reinterpret_cast<typename Params::DTypeO *>(
-            reinterpret_cast<char *>(float_workspace) + plan_info.v_offset);
+            reinterpret_cast<char *>(active_float_workspace) + plan_info.v_offset);
         tmp_s = reinterpret_cast<float *>(
-            reinterpret_cast<char *>(float_workspace) + plan_info.s_offset);
+            reinterpret_cast<char *>(active_float_workspace) + plan_info.s_offset);
     } else {
         params.partition_kv = false;
         params.total_num_rows = nullptr;
@@ -425,28 +563,46 @@ bool run_batch_prefill_paged_ragged_typed(
     // them via VariableLengthMergeStates (mirrors the non-ragged verify path).
     const bool allow_split_kv =
         (float_workspace != nullptr && float_workspace_bytes > 0);
-    cudaError_t plan_st = flashinfer::PrefillPlan<int32_t>(
-        float_workspace, float_workspace_bytes,
-        int_workspace,
-        host_int_workspace,
-        int_workspace_bytes,
-        plan_info,
-        const_cast<int32_t *>(q_indptr_host),
-        const_cast<int32_t *>(page_indptr_host),
-        total_q,
-        batch,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        head_dim,
-        page_size,
-        false,
-        sizeof(half),
-        -1,
-        0,
-        /*disable_split_kv=*/!allow_split_kv,
-        0,
-        stream);
+    float *active_float_workspace = float_workspace;
+    size_t active_float_workspace_bytes = float_workspace_bytes;
+    auto plan = [&](bool disable_split_kv) {
+        return flashinfer::PrefillPlan<int32_t>(
+            disable_split_kv ? nullptr : active_float_workspace,
+            disable_split_kv ? 0 : active_float_workspace_bytes,
+            int_workspace,
+            host_int_workspace,
+            int_workspace_bytes,
+            plan_info,
+            const_cast<int32_t *>(q_indptr_host),
+            const_cast<int32_t *>(page_indptr_host),
+            total_q,
+            batch,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            head_dim,
+            page_size,
+            false,
+            sizeof(half),
+            -1,
+            0,
+            disable_split_kv,
+            0,
+            stream);
+    };
+    cudaError_t plan_st = cudaErrorInvalidValue;
+    try {
+        plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
+    } catch (const std::exception &) {
+        active_float_workspace = nullptr;
+        active_float_workspace_bytes = 0;
+        plan_info = {};
+        try {
+            plan_st = plan(/*disable_split_kv=*/true);
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
     if (plan_st != cudaSuccess) return false;
 
     auto paged_kv = flashinfer::paged_kv_t<TKV, int32_t>(
@@ -498,9 +654,9 @@ bool run_batch_prefill_paged_ragged_typed(
             reinterpret_cast<char *>(plan_i32) + plan_info.block_valid_mask_offset);
         params.total_num_rows = nullptr;
         tmp_v = reinterpret_cast<typename Params::DTypeO *>(
-            reinterpret_cast<char *>(float_workspace) + plan_info.v_offset);
+            reinterpret_cast<char *>(active_float_workspace) + plan_info.v_offset);
         tmp_s = reinterpret_cast<float *>(
-            reinterpret_cast<char *>(float_workspace) + plan_info.s_offset);
+            reinterpret_cast<char *>(active_float_workspace) + plan_info.s_offset);
     } else {
         params.partition_kv = false;
         params.total_num_rows = nullptr;
@@ -532,7 +688,226 @@ bool run_batch_prefill_paged_ragged_typed(
     return st == cudaSuccess;
 }
 
+bool checked_workspace_alloc(size_t &offset,
+                             size_t count,
+                             size_t element_bytes,
+                             size_t alignment) {
+    if (alignment == 0 || count > std::numeric_limits<size_t>::max() / element_bytes) {
+        return false;
+    }
+    const size_t bytes = count * element_bytes;
+    const size_t padding = (alignment - (offset % alignment)) % alignment;
+    if (offset > std::numeric_limits<size_t>::max() - padding ||
+        offset + padding > std::numeric_limits<size_t>::max() - bytes) {
+        return false;
+    }
+    offset += padding + bytes;
+    return true;
+}
+
+bool checked_workspace_mul(size_t lhs, size_t rhs, size_t &result) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        return false;
+    }
+    result = lhs * rhs;
+    return true;
+}
+
+// FlashInfer's planner exposes the scheduling primitive used by PrefillPlan,
+// but older compatible headers do not yet expose PrefillPlanWorkspaceSize.
+// Mirror PrefillPlan's allocation sequence so workspace sizing works with both
+// header revisions while remaining exact for the plan that will be launched.
+cudaError_t prefill_plan_workspace_size(
+        size_t &float_workspace_bytes,
+        size_t &int_workspace_bytes,
+        int32_t *qo_indptr_h,
+        int32_t *kv_indptr_h,
+        uint32_t total_num_rows,
+        uint32_t batch_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t page_size) {
+    if (!qo_indptr_h || !kv_indptr_h || batch_size == 0 ||
+        n_kv_heads == 0 || n_heads % n_kv_heads != 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    int device = 0;
+    int num_sms = 0;
+    cudaError_t status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    status = cudaDeviceGetAttribute(
+        &num_sms, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) return status;
+
+    const int64_t available_ctas =
+        std::max<int64_t>(0, static_cast<int64_t>(num_sms) * 2);
+    const uint32_t max_batch_size_if_split = static_cast<uint32_t>(
+        available_ctas / static_cast<int64_t>(n_kv_heads));
+
+    try {
+        auto split_plan = flashinfer::PrefillSplitQOKVIndptr<int32_t>(
+            qo_indptr_h,
+            kv_indptr_h,
+            total_num_rows,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            page_size,
+            max_batch_size_if_split,
+            /*enable_cuda_graph=*/false,
+            /*window_left=*/-1,
+            /*fixed_split_size=*/0,
+            /*disable_split_kv=*/false);
+
+        const bool split_kv = std::get<0>(split_plan);
+        const size_t padded_batch_size = std::get<2>(split_plan);
+        const size_t cta_tile_q = std::get<3>(split_plan);
+
+        size_t int_bytes = 0;
+        if (!checked_workspace_alloc(
+                int_bytes, padded_batch_size, sizeof(int32_t), 16) ||
+            !checked_workspace_alloc(
+                int_bytes, padded_batch_size, sizeof(int32_t), 16) ||
+            !checked_workspace_alloc(
+                int_bytes, padded_batch_size, sizeof(int32_t), 16) ||
+            !checked_workspace_alloc(
+                int_bytes, static_cast<size_t>(batch_size) + 1,
+                sizeof(int32_t), 16) ||
+            !checked_workspace_alloc(
+                int_bytes, 1, sizeof(int32_t), 1)) {
+            return cudaErrorInvalidValue;
+        }
+
+        size_t float_bytes = 0;
+        if (split_kv) {
+            size_t partial_rows = 0;
+            size_t partial_values = 0;
+            if (!checked_workspace_mul(
+                    n_heads, padded_batch_size, partial_rows) ||
+                !checked_workspace_mul(
+                    partial_rows, cta_tile_q, partial_rows) ||
+                !checked_workspace_mul(
+                    partial_rows, head_dim, partial_values) ||
+                !checked_workspace_alloc(
+                    float_bytes, partial_values, sizeof(float), 16) ||
+                !checked_workspace_alloc(
+                    float_bytes, partial_rows, sizeof(float), 16) ||
+                !checked_workspace_alloc(
+                    int_bytes, static_cast<size_t>(total_num_rows) + 1,
+                    sizeof(int32_t), 16) ||
+                !checked_workspace_alloc(
+                    int_bytes, padded_batch_size, sizeof(bool), 16)) {
+                return cudaErrorInvalidValue;
+            }
+        }
+
+        int_workspace_bytes = int_bytes;
+        float_workspace_bytes = float_bytes;
+        return cudaSuccess;
+    } catch (const std::exception &) {
+        return cudaErrorInvalidValue;
+    }
+}
+
 } // namespace
+
+bool batch_prefill_paged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        uint32_t n_pages,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        uint32_t base_seq_len,
+        uint32_t batch) {
+    int_workspace_bytes = 0;
+    float_workspace_bytes = 0;
+    if (batch == 0 || page_size == 0 || n_heads == 0 ||
+        n_kv_heads == 0 || n_heads % n_kv_heads != 0) {
+        return false;
+    }
+    const uint32_t kv_len = base_seq_len + batch;
+    const uint32_t need_pages =
+        std::max<uint32_t>((kv_len + page_size - 1U) / page_size, 1U);
+    if (need_pages > n_pages ||
+        batch > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
+        need_pages >
+            static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+
+    int32_t qo_indptr_h[2] = {0, static_cast<int32_t>(batch)};
+    int32_t kv_indptr_h[2] = {0, static_cast<int32_t>(need_pages)};
+    size_t plan_int_bytes = 0;
+    const cudaError_t status =
+        prefill_plan_workspace_size(
+            float_workspace_bytes,
+            plan_int_bytes,
+            qo_indptr_h,
+            kv_indptr_h,
+            batch,
+            1,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            /*page_size=*/page_size);
+    if (status != cudaSuccess ||
+        plan_int_bytes >
+            std::numeric_limits<size_t>::max() -
+                kPagedPrefillPrefixI32 * sizeof(int32_t)) {
+        int_workspace_bytes = 0;
+        float_workspace_bytes = 0;
+        return false;
+    }
+    int_workspace_bytes =
+        kPagedPrefillPrefixI32 * sizeof(int32_t) + plan_int_bytes;
+    return true;
+}
+
+bool batch_prefill_paged_ragged_workspace_bytes(
+        size_t &int_workspace_bytes,
+        size_t &float_workspace_bytes,
+        const int32_t *q_indptr_host,
+        const int32_t *page_indptr_host,
+        uint32_t batch,
+        uint32_t total_q,
+        uint32_t page_size,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim) {
+    int_workspace_bytes = 0;
+    float_workspace_bytes = 0;
+    if (!q_indptr_host || !page_indptr_host || batch == 0 ||
+        total_q == 0 || page_size == 0 || n_heads == 0 ||
+        n_kv_heads == 0 || n_heads % n_kv_heads != 0 ||
+        q_indptr_host[0] != 0 ||
+        q_indptr_host[batch] != static_cast<int32_t>(total_q) ||
+        page_indptr_host[0] != 0 || page_indptr_host[batch] <= 0) {
+        return false;
+    }
+    const cudaError_t status =
+        prefill_plan_workspace_size(
+            float_workspace_bytes,
+            int_workspace_bytes,
+            const_cast<int32_t *>(q_indptr_host),
+            const_cast<int32_t *>(page_indptr_host),
+            total_q,
+            batch,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            page_size);
+    if (status != cudaSuccess) {
+        int_workspace_bytes = 0;
+        float_workspace_bytes = 0;
+        return false;
+    }
+    return true;
+}
 
 bool launch_prefill_f16q_f16kv_gated(
         float *out,
@@ -592,12 +967,11 @@ bool launch_prefill_f16q_fp8kv(
         uint32_t q_batch_stride, uint32_t out_batch_stride,
         float scale, cudaStream_t stream) {
     unsigned threads = 0, blocks = 0;
-    if (!run_prefill_typed<half, __nv_fp8_e4m3, half>(
-            q_f16, o_f16, q, q_stride, k_cache, v_cache,
-            n_heads, n_kv_heads, head_dim, batch, base_seq_len,
-            q_batch_stride, scale, stream, threads, blocks)) {
-        return false;
-    }
+    const bool launched = run_prefill_typed<half, __nv_fp8_e4m3, half>(
+        q_f16, o_f16, q, q_stride, k_cache, v_cache,
+        n_heads, n_kv_heads, head_dim, batch, base_seq_len,
+        q_batch_stride, scale, stream, threads, blocks);
+    if (!launched) return false;
     if (batch == 0) return true;
     unpack_kernel<half><<<blocks, threads, 0, stream>>>(
         out, o_f16, batch, n_heads, head_dim, out_batch_stride);
@@ -628,14 +1002,16 @@ bool launch_batch_prefill_paged_f16q_f16kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        bool *plan_cache_hit_out) {
     unsigned threads = 0, blocks = 0;
     if (!run_batch_prefill_paged_typed<half>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
             int_workspace_bytes, float_workspace, float_workspace_bytes,
             q, q_stride, k_cache, v_cache, page_indices,
             n_pages, page_size, n_heads, n_kv_heads, head_dim, base_seq_len,
-            batch, q_batch_stride, out_batch_stride, scale, stream, threads, blocks)) {
+            batch, q_batch_stride, out_batch_stride, scale, stream, threads,
+            blocks, plan_cache_hit_out)) {
         return false;
     }
     unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
@@ -668,16 +1044,19 @@ bool launch_batch_prefill_paged_f16q_fp8kv_gated(
         uint32_t q_batch_stride,
         uint32_t out_batch_stride,
         float scale,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        bool *plan_cache_hit_out) {
     unsigned threads = 0, blocks = 0;
-    if (!run_batch_prefill_paged_typed<__nv_fp8_e4m3>(
+    if (plan_cache_hit_out) *plan_cache_hit_out = false;
+    const bool launched =
+        run_batch_prefill_paged_typed<__nv_fp8_e4m3>(
             out, q_f16, o_f16, int_workspace, host_int_workspace,
             int_workspace_bytes, float_workspace, float_workspace_bytes,
             q, q_stride, k_cache, v_cache, page_indices,
-            n_pages, page_size, n_heads, n_kv_heads, head_dim, base_seq_len,
-            batch, q_batch_stride, out_batch_stride, scale, stream, threads, blocks)) {
-        return false;
-    }
+            n_pages, page_size, n_heads, n_kv_heads, head_dim,
+            base_seq_len, batch, q_batch_stride, out_batch_stride,
+            scale, stream, threads, blocks, plan_cache_hit_out);
+    if (!launched) return false;
     unpack_gate_kernel<half><<<blocks, threads, 0, stream>>>(
         out, o_f16, q, q_stride, batch, n_heads, head_dim,
         q_batch_stride, out_batch_stride);

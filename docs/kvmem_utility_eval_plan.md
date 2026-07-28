@@ -1,5 +1,41 @@
 # Plan: KVMem utility evaluation (external Python over qw3's OpenAI API)
 
+## UPDATE 2026-07-15 — message/query contract for one-shot and warm-up tests
+
+The current query-conditioned server treats the last ordinary `user` message as
+the retrieval query. LongMemEval-S therefore uses three messages:
+
+```text
+system: evaluation instruction + question date
+user:   complete dated conversation history (retrieval corpus)
+user:   short final question (retrieval query)
+```
+
+All new experiments must preserve the same structural contract. In particular,
+a warm-up request that sends a long context as a user message must append a
+separate short user query, for example:
+
+```text
+user: <long context>
+user: Please remember the information above and reply with a brief confirmation.
+```
+
+The warm-up confirmation is deliberately a real query under today's automatic
+policy. It prevents the long context itself from becoming the capped query span
+and causes the current query-gated incremental mean-key path to index the whole
+prompt. A subsequent turn appends the real question as the newest user message;
+that question then replaces the confirmation as the retrieval query. If the
+warm-up assistant response is included in the continued transcript, it is
+historical context, not the next query.
+
+This protocol does not guarantee that warm reuse is numerically identical to a
+one-shot request: the confirmation query can affect the warm-up selection. It is
+the practical first-stage convention for experiments. The planned API design
+(`last-user`, `explicit`, and `context-only` modes plus message-index metadata) is
+recorded in `docs/kvmem_implementation_notes.md` section 4.4.1. `last-user` is the
+initial target; explicit message roles and query-independent context indexing are
+follow-up work.
+
 ## UPDATE 2026-07-01 — query-conditioned scorers consolidated to two CLI methods
 
 The `QW3_KVMEM_QC_*` env-flag zoo (softmax-pages, sum-of-ReLU multilayer, single-layer,

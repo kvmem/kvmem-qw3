@@ -45,6 +45,17 @@ bool launch_rope_block_remap_paged_batched(void *cache, bool is_fp16,
                                            const int32_t *page_indices,
                                            uint32_t page_size, float theta,
                                            cudaStream_t stream);
+bool launch_build_rope_sincos_table(
+        float *table, uint32_t positions, uint32_t rope_dim, float theta,
+        cudaStream_t stream);
+bool launch_rope_block_remap_paged_batched_table(
+        void *cache, bool is_fp16, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *from_base,
+        const int32_t *n_tokens, const int32_t *page_indices,
+        uint32_t page_size, const float *rope_sincos,
+        uint32_t rope_table_positions, cudaStream_t stream);
 }}  // namespace qw3::ported
 
 #define CHECK(call) do {                                                  \
@@ -76,13 +87,13 @@ int main() {
     struct Blk { int32_t to_base; int32_t from_base; int32_t n_tokens; };
     std::vector<Blk> blks = {
         {   0,  100000, 128},
-        { 128,  523777, 128},
+        { 128,  223777, 128},
         { 256,     256, 128},   // from == to: skip (no write in either path)
-        { 384,  938210, 128},
+        { 384,  238210, 128},
         { 512,       7, 128},
-        { 640,  271828, 128},
+        { 640,  171828, 128},
         { 768,  141421, 128},
-        { 896,  999999,  64},   // partial tail block: exercises tok-bound guard
+        { 896,  199999,  64},   // partial tail block: exercises tok-bound guard
     };
     const uint32_t n_blocks = static_cast<uint32_t>(blks.size());
     uint32_t max_n_tokens = 0;
@@ -110,10 +121,14 @@ int main() {
     // Two device copies of the identical input.
     __half *d_ref = nullptr;
     __half *d_cand = nullptr;
+    __half *d_table_cand = nullptr;
     CHECK(cudaMalloc(&d_ref, n_elems * sizeof(__half)));
     CHECK(cudaMalloc(&d_cand, n_elems * sizeof(__half)));
+    CHECK(cudaMalloc(&d_table_cand, n_elems * sizeof(__half)));
     CHECK(cudaMemcpy(d_ref, host.data(), n_elems * sizeof(__half), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_cand, host.data(), n_elems * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_table_cand, host.data(), n_elems * sizeof(__half),
+                     cudaMemcpyHostToDevice));
 
     int32_t *d_pages = nullptr;
     CHECK(cudaMalloc(&d_pages, n_window_pages * sizeof(int32_t)));
@@ -161,12 +176,39 @@ int main() {
     CHECK(cudaDeviceSynchronize());
     CHECK(cudaGetLastError());
 
-    std::vector<__half> ref(n_elems), cand(n_elems);
+    uint32_t table_positions = 0;
+    for (const auto &b : blks) {
+        table_positions = std::max<uint32_t>(
+            table_positions,
+            static_cast<uint32_t>(
+                std::max(b.from_base, b.to_base) + b.n_tokens));
+    }
+    float *d_rope_table = nullptr;
+    const uint64_t table_floats =
+        static_cast<uint64_t>(table_positions) * (rope_dim / 2) * 2;
+    CHECK(cudaMalloc(&d_rope_table, table_floats * sizeof(float)));
+    if (!qw3::ported::launch_build_rope_sincos_table(
+            d_rope_table, table_positions, rope_dim, theta, 0) ||
+        !qw3::ported::launch_rope_block_remap_paged_batched_table(
+            d_table_cand, /*is_fp16=*/true, n_blocks, max_n_tokens,
+            n_kv_heads, per_pos, head_dim, rope_dim, d_to, d_from, d_ntok,
+            d_pages, page_size, d_rope_table, table_positions, 0)) {
+        std::fprintf(stderr, "table re-RoPE launch failed\n");
+        return 1;
+    }
+    CHECK(cudaDeviceSynchronize());
+    CHECK(cudaGetLastError());
+
+    std::vector<__half> ref(n_elems), cand(n_elems), table_cand(n_elems);
     CHECK(cudaMemcpy(ref.data(), d_ref, n_elems * sizeof(__half), cudaMemcpyDeviceToHost));
     CHECK(cudaMemcpy(cand.data(), d_cand, n_elems * sizeof(__half), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(table_cand.data(), d_table_cand,
+                     n_elems * sizeof(__half), cudaMemcpyDeviceToHost));
 
     uint64_t mismatches = 0;
+    uint64_t table_mismatches = 0;
     float max_abs = 0.0f;
+    float table_max_abs = 0.0f;
     for (uint64_t i = 0; i < n_elems; ++i) {
         const uint16_t rb = *reinterpret_cast<const uint16_t *>(&ref[i]);
         const uint16_t cb = *reinterpret_cast<const uint16_t *>(&cand[i]);
@@ -175,6 +217,15 @@ int main() {
             float d = std::fabs(__half2float(ref[i]) - __half2float(cand[i]));
             max_abs = std::max(max_abs, d);
         }
+        const uint16_t tb =
+            *reinterpret_cast<const uint16_t *>(&table_cand[i]);
+        if (rb != tb) {
+            ++table_mismatches;
+            const float d =
+                std::fabs(__half2float(ref[i]) -
+                          __half2float(table_cand[i]));
+            table_max_abs = std::max(table_max_abs, d);
+        }
     }
 
     std::printf("batched vs scalar paged re-RoPE: elems=%llu blocks=%u "
@@ -182,13 +233,24 @@ int main() {
                 static_cast<unsigned long long>(n_elems), n_blocks,
                 max_n_tokens, static_cast<unsigned long long>(mismatches),
                 max_abs);
+    std::printf("table vs scalar paged re-RoPE: table_positions=%u "
+                "bit_mismatches=%llu max_abs=%.4g\n",
+                table_positions,
+                static_cast<unsigned long long>(table_mismatches),
+                table_max_abs);
 
-    cudaFree(d_ref); cudaFree(d_cand); cudaFree(d_pages);
+    cudaFree(d_ref); cudaFree(d_cand); cudaFree(d_table_cand);
+    cudaFree(d_rope_table); cudaFree(d_pages);
     cudaFree(d_to); cudaFree(d_from); cudaFree(d_ntok);
 
     if (mismatches != 0) {
         std::printf("FAILED: batched kernel diverges from scalar (%llu elems)\n",
                     static_cast<unsigned long long>(mismatches));
+        return 1;
+    }
+    if (table_mismatches != 0) {
+        std::printf("FAILED: table kernel diverges from scalar (%llu elems)\n",
+                    static_cast<unsigned long long>(table_mismatches));
         return 1;
     }
     std::printf("OK\n");

@@ -1,4 +1,4 @@
-# 基于 DeltaNet 的历史块召回方案
+# KVMem：基于 DeltaNet 的历史块召回方案
 
 ## 1. 核心思路
 
