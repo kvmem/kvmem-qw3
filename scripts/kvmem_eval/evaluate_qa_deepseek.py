@@ -1,3 +1,5 @@
+"""Grade LongMemEval answers with a DeepSeek-compatible chat API."""
+
 from __future__ import annotations
 
 import argparse

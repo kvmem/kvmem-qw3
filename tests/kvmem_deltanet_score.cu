@@ -1,4 +1,5 @@
-// DeltaNet-state retrieval scoring parity test (deltanet_retrieval.md).
+// DeltaNet-state retrieval scoring parity test
+// (docs/kvmem_deltanet_retrieval_design.md).
 //
 // Validates the two DeltaNet-retrieval CUDA kernels against a plain host
 // reference on small synthetic inputs:

@@ -4061,7 +4061,8 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 conv_state_checkpoint = state_checkpoints->conv_states[il].get();
             }
             // DeltaNet-state retrieval capture (retrieval_method==deltanet;
-            // deltanet_retrieval.md). For a selected DeltaNet layer with an active
+            // docs/kvmem_deltanet_retrieval_design.md). For a selected DeltaNet
+            // layer with an active
             // question span, snapshot S_j per block + accumulate the in-block
             // log-decay so the reselect boundary can score blocks by their state
             // edits. Inert (nullptr) otherwise -> byte-identical to the base path.
@@ -10169,7 +10170,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             // Either falls back to the single last-token content scorer if its
             // buffer isn't live (e.g. no query span, or the shmem page cap is hit).
             if (kvmem_qc_deltanet_) {
-                // DeltaNet-state retrieval (deltanet_retrieval.md). Falls back to
+                // DeltaNet-state retrieval
+                // (docs/kvmem_deltanet_retrieval_design.md). Falls back to
                 // mean-k / single-token content scoring if its capture isn't live.
                 scorer_requested = "deltanet";
                 std::string reason;
@@ -11989,7 +11991,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
             static_cast<uint64_t>(cfg.n_heads) * head_dim, "g_query_content");
     }
 
-    // DeltaNet-state retrieval buffers (deltanet_retrieval.md). Allocated only
+    // DeltaNet-state retrieval buffers
+    // (docs/kvmem_deltanet_retrieval_design.md). Allocated only
     // when the deltanet method is selected. Sized for the full block count.
     if (kvmem_qc_deltanet_) {
         kvmem_resolve_deltanet_layers();
@@ -12134,7 +12137,8 @@ void QwenExecutor::kvmem_resolve_std_layers() {
 }
 
 // Resolve the DeltaNet (recurrent) layer subset that feeds DeltaNet-state
-// retrieval (deltanet_retrieval.md). The per-block state edit E_j is a d_v*d_k
+// retrieval (docs/kvmem_deltanet_retrieval_design.md). The per-block state edit
+// E_j is a d_v*d_k
 // fp32 matrix per (layer, head), so the number of DeltaNet layers is capped by a
 // memory budget: pick evenly-spaced recurrent layers up to the configured count
 // (deltanet_layers, 0 => half the DeltaNet layers), then clamp so the E_j
@@ -12266,7 +12270,8 @@ void QwenExecutor::kvmem_capture_deltanet_query(uint32_t dn_slot,
     }
 }
 
-// DeltaNet-state retrieval boundary scorer (deltanet_retrieval.md §4-10). Folds
+// DeltaNet-state retrieval boundary scorer
+// (docs/kvmem_deltanet_retrieval_design.md §4-10). Folds
 // the captured per-block state edits E_j = S_j - a_j S_{j-1}, in-block decays a_j,
 // and DeltaNet queries into the per-block score:
 //   s_j = Σ_l w_l · RMSnorm_j[ TopKMean_h( TopKMean_t( d_j·||E_j^T q_t||_2 ) ) ]

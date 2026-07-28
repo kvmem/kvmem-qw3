@@ -1449,7 +1449,8 @@ private:
     // ---- DeltaNet-state retrieval (--kvmem-retrieval-method deltanet) --------
     // Scores each historical block by the net EDIT it made to the DeltaNet
     // recurrent state (E_j = S_j - a_j S_{j-1}) read by the current DeltaNet query
-    // (see deltanet_retrieval.md). Full per-block state edits are large (d_v*d_k
+    // (see docs/kvmem_deltanet_retrieval_design.md). Full per-block state edits
+    // are large (d_v*d_k
     // fp32 per head per layer), so only a memory-budget-capped subset of the 48
     // DeltaNet layers feeds the score (dn_layers_/dn_layer_slot_, evenly spaced).
     // During prefill the qw3 delta kernel snapshots S_j per block into

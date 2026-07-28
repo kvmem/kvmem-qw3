@@ -1,4 +1,6 @@
-All done. Full build is clean and all 9 tests pass (including the new DeltaNet scoring parity test). Let me give a final summary.
+# DeltaNet retrieval implementation summary
+
+Full build is clean and all 9 tests pass (including the new DeltaNet scoring parity test).
 # Todos
 [â] Add KvMemRetrievalMethod::DeltaNet enum + config fields (deltanet layers, mem budget, decay, topk_q/topk_h) in kvmem_store.hpp
 [â] Plumb flags through EngineOptions (qw3.hpp), CLI parse (qw3_cli.cpp), string->enum + config in qwen_native_backend.cpp
@@ -10,7 +12,10 @@ All done. Full build is clean and all 9 tests pass (including the new DeltaNet s
 [â] Build and verify compilation + run tests
 All steps are complete. The build is clean and all 9 tests pass (including the 2 new ones). Here's a summary of what was implemented.
 Summary
-Implemented the DeltaNet-state block-recall method from deltanet_retrieval.md as a new --kvmem-retrieval-method deltanet scorer, using the memory-budget-driven layer selection we agreed on.
+Implemented the DeltaNet-state block-recall method from
+`kvmem_deltanet_retrieval_design.md` as a new
+`--kvmem-retrieval-method deltanet` scorer, using the memory-budget-driven
+layer selection we agreed on.
 What it does
 Scores each historical KV block by the net edit it made to the DeltaNet recurrent state (E_j = S_j â a_jÂ·S_{j-1}), read by the current DeltaNet query, aggregated per doc Â§10:
 s_j = Î£_l w_l Â· RMSnorm_j[ TopKMean_h( TopKMean_t( d_jÂ·âE_jáµ q_tââ ) ) ]

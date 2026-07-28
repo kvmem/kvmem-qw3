@@ -1190,7 +1190,7 @@ accuracy on a 102-sample LongMemEval-S subset (17 per question type × 6 types:
 `single-session-{user,assistant,preference}`, `multi-session`,
 `temporal-reasoning`, `knowledge-update`). It hits `qw3 serve` **only** through the
 OpenAI HTTP API; grading uses a DeepSeek answer-equivalence judge
-(`evaluate_qa_deepseek.py`). No eval logic lives in qw3 C++.
+(`scripts/kvmem_eval/evaluate_qa_deepseek.py`). No eval logic lives in qw3 C++.
 
 Data: build the subset from the public `xiaowu0162/longmemeval` dataset
 (`scripts/kvmem_eval/dataset.py`), or point `--data` at your own JSONL with the same
@@ -1228,7 +1228,7 @@ Outputs land in `/data/chaidi/kvmem_eval/results/<tag>_eval_<ts>{,_hyp,_summary}
    hardcode or commit it):
 
 ```sh
-DEEPSEEK_API_KEY=... python3 evaluate_qa_deepseek.py \
+DEEPSEEK_API_KEY=... python3 scripts/kvmem_eval/evaluate_qa_deepseek.py \
   --hyp-file /data/chaidi/kvmem_eval/results/<tag>_eval_<ts>_hyp.jsonl \
   --ref-file selected_12_samples.jsonl \
   --output   /data/chaidi/kvmem_eval/results/<tag>_eval_<ts>_graded.jsonl

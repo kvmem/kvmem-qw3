@@ -756,7 +756,7 @@ public:
                                           uint32_t checkpoint_count = 0,
                                           // DeltaNet retrieval block-boundary state
                                           // capture (kvmem retrieval_method==deltanet;
-                                          // see deltanet_retrieval.md). When
+                                          // see docs/kvmem_deltanet_retrieval_design.md). When
                                           // dn_state_snap != nullptr the CUDA backend
                                           // captures S_j per block into dn_state_snap
                                           // (offset dn_layer_snap_off) and accumulates
@@ -1506,7 +1506,8 @@ public:
     }
 
     // deltanet_block_score_device: DeltaNet-retrieval per-layer block scorer
-    // (kvmem retrieval_method==deltanet; see deltanet_retrieval.md §5-8). For one
+    // (kvmem retrieval_method==deltanet; see
+    // docs/kvmem_deltanet_retrieval_design.md §5-8). For one
     // DeltaNet layer, computes r[blk,vh] = TopKMean_t( d[blk,vh] *
     // ||(S_j - a_j S_{j-1})^T q_t||_2 ) into r_out[blk,vh]. dn_snap holds S_j per
     // block ([blocks, v_heads, d_v, d_k]); decaysum holds each block's in-block

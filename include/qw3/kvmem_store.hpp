@@ -147,7 +147,8 @@ enum class KvMemSelectPolicy : uint8_t { TopK = 0, Quota = 1 };
 //              block's NET EDIT to the DeltaNet
 //              recurrent state (E_j = S_j - a_j S_{j-1}) read by the current
 //              DeltaNet query, aggregated over query tokens / heads / layers with
-//              a per-layer RMS normalization (see deltanet_retrieval.md). Unlike
+//              a per-layer RMS normalization (see
+//              docs/kvmem_deltanet_retrieval_design.md). Unlike
 //              the mean-k / per-token scorers (which read standard-attention keys)
 //              this reads the RECURRENT layers' state increments.
 enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMeanK = 2, DeltaNet = 3 };

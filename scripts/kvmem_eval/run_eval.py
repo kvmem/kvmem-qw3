@@ -126,7 +126,7 @@ def main() -> int:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     jsonl_path = args.out_dir / f"{args.tag}_eval_{ts}.jsonl"
     summary_path = args.out_dir / f"{args.tag}_eval_{ts}_summary.json"
-    # Hypotheses file in the schema the provided evaluate_qa_deepseek.py expects
+    # Hypotheses file in the schema evaluate_qa_deepseek.py expects.
     # (--hyp-file: one {question_id, hypothesis} object per line). The reference
     # file for that judge is the original samples JSONL (--ref-file).
     hyp_path = args.out_dir / f"{args.tag}_eval_{ts}_hyp.jsonl"
@@ -291,7 +291,10 @@ def main() -> int:
     print(f"  summary    : {summary_path}")
     if args.no_judge:
         print("\n  grade with the provided judge:")
-        print(f"    python3 evaluate_qa_deepseek.py --hyp-file {hyp_path} \\")
+        print(
+            "    python3 scripts/kvmem_eval/evaluate_qa_deepseek.py "
+            f"--hyp-file {hyp_path} \\"
+        )
         print(f"      --ref-file {args.data} --output {args.out_dir}/{args.tag}_eval_{ts}_graded.jsonl")
     return 0
 
