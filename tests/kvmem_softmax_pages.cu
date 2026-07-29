@@ -41,6 +41,30 @@ bool launch_block_attn_score_softmax_pages_typed(
     uint32_t n_kv_heads, uint32_t head_dim, float scale,
     uint32_t excl_lo_end, uint32_t excl_hi_begin, uint32_t n_subblocks,
     uint32_t reduce_max, uint32_t accumulate, cudaStream_t stream);
+bool launch_block_attn_softmax_pages_stream_lse_typed(
+    float *global_max, float *global_sum,
+    const void *q_multi, bool query_is_fp16,
+    const __half *kbar_tile,
+    uint32_t n_layers, uint32_t n_tokens,
+    uint32_t q_layer_stride, uint32_t tile_blocks,
+    uint32_t kbar_layer_stride, uint32_t global_block_base,
+    uint32_t global_n_blocks, uint32_t n_heads,
+    uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    uint32_t excl_lo_end, uint32_t excl_hi_begin,
+    uint32_t n_subblocks, uint32_t initialize,
+    cudaStream_t stream);
+bool launch_block_attn_softmax_pages_stream_score_typed(
+    float *score, const void *q_multi, bool query_is_fp16,
+    const __half *kbar_tile,
+    const float *global_max, const float *global_sum,
+    uint32_t n_layers, uint32_t n_tokens,
+    uint32_t q_layer_stride, uint32_t tile_blocks,
+    uint32_t kbar_layer_stride, uint32_t global_block_base,
+    uint32_t global_n_blocks, uint32_t n_heads,
+    uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    uint32_t excl_lo_end, uint32_t excl_hi_begin,
+    uint32_t n_subblocks, uint32_t reduce_max,
+    cudaStream_t stream);
 }
 }
 
@@ -458,6 +482,145 @@ static void run_fp16_query_chunk_test() {
     CHECK(cudaFree(d_q));
 }
 
+static void run_host_index_stream_test() {
+    constexpr uint32_t layers = 2;
+    constexpr uint32_t tokens = 3;
+    constexpr uint32_t blocks = 1301;
+    constexpr uint32_t kbar_stride = blocks + 11;
+    constexpr uint32_t tile_blocks = 512;
+    constexpr uint32_t heads = 4;
+    constexpr uint32_t kv_heads = 2;
+    constexpr uint32_t dim = 8;
+    constexpr uint32_t excl_lo = 7;
+    constexpr uint32_t excl_hi = blocks - 13;
+    constexpr uint32_t subblocks = 1;
+    const uint64_t row = static_cast<uint64_t>(heads) * dim;
+    const uint64_t block_elems =
+        static_cast<uint64_t>(subblocks) * kv_heads * dim;
+    const uint64_t q_count =
+        static_cast<uint64_t>(layers) * tokens * row;
+    const uint64_t k_count =
+        static_cast<uint64_t>(layers) * kbar_stride * block_elems;
+    const uint64_t stage_count =
+        static_cast<uint64_t>(layers) * tile_blocks * block_elems;
+    const uint64_t distributions =
+        static_cast<uint64_t>(layers) * tokens * heads;
+
+    std::mt19937 rng(90210);
+    std::normal_distribution<float> nd(0.0f, 0.35f);
+    std::vector<__half> q16(q_count), k16(k_count);
+    std::vector<float> q(q_count), k(k_count);
+    for (uint64_t i = 0; i < q_count; ++i) {
+        q16[i] = __float2half(nd(rng));
+        q[i] = __half2float(q16[i]);
+    }
+    for (uint64_t i = 0; i < k_count; ++i) {
+        k16[i] = __float2half(nd(rng));
+        k[i] = __half2float(k16[i]);
+    }
+
+    __half *d_q = nullptr;
+    __half *d_k = nullptr;
+    __half *d_stage = nullptr;
+    float *d_score = nullptr;
+    float *d_stream_score = nullptr;
+    float *d_max = nullptr;
+    float *d_sum = nullptr;
+    CHECK(cudaMalloc(&d_q, q_count * sizeof(__half)));
+    CHECK(cudaMalloc(&d_k, k_count * sizeof(__half)));
+    CHECK(cudaMalloc(&d_stage, stage_count * sizeof(__half)));
+    CHECK(cudaMalloc(&d_score, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&d_stream_score, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&d_max, distributions * sizeof(float)));
+    CHECK(cudaMalloc(&d_sum, distributions * sizeof(float)));
+    CHECK(cudaMemcpy(d_q, q16.data(), q_count * sizeof(__half),
+                     cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_k, k16.data(), k_count * sizeof(__half),
+                     cudaMemcpyHostToDevice));
+
+    if (!qw3::ported::launch_block_attn_score_softmax_pages_typed(
+            d_score, d_q, /*query_is_fp16=*/true, d_k,
+            qw3::ported::KbarDType::F16, layers, tokens, tokens,
+            blocks, kbar_stride, heads, kv_heads, dim,
+            1.0f / std::sqrt(static_cast<float>(dim)),
+            excl_lo, excl_hi, subblocks, /*reduce_max=*/0,
+            /*accumulate=*/0, /*stream=*/0)) {
+        std::fprintf(stderr, "full FP16 reference launcher rejected\n");
+        std::exit(1);
+    }
+    CHECK(cudaMemset(d_stream_score, 0, blocks * sizeof(float)));
+
+    std::vector<__half> packed(stage_count);
+    auto upload_tile = [&](uint32_t base, uint32_t count) {
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            const uint64_t src =
+                (static_cast<uint64_t>(layer) * kbar_stride + base) *
+                block_elems;
+            const uint64_t dst =
+                static_cast<uint64_t>(layer) * tile_blocks * block_elems;
+            std::memcpy(packed.data() + dst, k16.data() + src,
+                        static_cast<size_t>(count * block_elems) *
+                            sizeof(__half));
+        }
+        CHECK(cudaMemcpy(d_stage, packed.data(),
+                         stage_count * sizeof(__half),
+                         cudaMemcpyHostToDevice));
+    };
+    bool first = true;
+    for (uint32_t base = 0; base < blocks; base += tile_blocks) {
+        const uint32_t count =
+            std::min<uint32_t>(tile_blocks, blocks - base);
+        upload_tile(base, count);
+        if (!qw3::ported::launch_block_attn_softmax_pages_stream_lse_typed(
+                d_max, d_sum, d_q, /*query_is_fp16=*/true, d_stage,
+                layers, tokens, tokens, count, tile_blocks, base, blocks,
+                heads, kv_heads, dim,
+                1.0f / std::sqrt(static_cast<float>(dim)),
+                excl_lo, excl_hi, subblocks, first ? 1u : 0u, 0)) {
+            std::fprintf(stderr, "stream LSE launcher rejected base=%u\n", base);
+            std::exit(1);
+        }
+        CHECK(cudaDeviceSynchronize());
+        first = false;
+    }
+    for (uint32_t base = 0; base < blocks; base += tile_blocks) {
+        const uint32_t count =
+            std::min<uint32_t>(tile_blocks, blocks - base);
+        upload_tile(base, count);
+        if (!qw3::ported::launch_block_attn_softmax_pages_stream_score_typed(
+                d_stream_score, d_q, /*query_is_fp16=*/true, d_stage,
+                d_max, d_sum, layers, tokens, tokens, count,
+                tile_blocks, base, blocks, heads, kv_heads, dim,
+                1.0f / std::sqrt(static_cast<float>(dim)),
+                excl_lo, excl_hi, subblocks, /*reduce_max=*/0, 0)) {
+            std::fprintf(stderr, "stream score launcher rejected base=%u\n", base);
+            std::exit(1);
+        }
+        CHECK(cudaDeviceSynchronize());
+    }
+
+    std::vector<float> full(blocks), streamed(blocks);
+    CHECK(cudaMemcpy(full.data(), d_score, blocks * sizeof(float),
+                     cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(streamed.data(), d_stream_score,
+                     blocks * sizeof(float), cudaMemcpyDeviceToHost));
+    const std::vector<float> host = host_reference(
+        q, k, layers, tokens, tokens, blocks, kbar_stride,
+        heads, kv_heads, dim,
+        1.0f / std::sqrt(static_cast<float>(dim)),
+        excl_lo, excl_hi, subblocks, false);
+    compare("host-index-stream-vs-full", streamed, full, 3e-6, 3e-3);
+    compare("host-index-stream-vs-host", streamed, host, 3e-6, 3e-3);
+
+    CHECK(cudaFree(d_sum));
+    CHECK(cudaFree(d_max));
+    CHECK(cudaFree(d_stream_score));
+    CHECK(cudaFree(d_score));
+    CHECK(cudaFree(d_stage));
+    CHECK(cudaFree(d_k));
+    CHECK(cudaFree(d_q));
+}
+
 static float benchmark_path(float *d_score,
                             const float *d_q,
                             const __half *d_kbar,
@@ -570,6 +733,7 @@ int main(int argc, char **argv) {
     run_case({4100, 2, 3, 4095, false});
     run_case({4100, 2, 3, 4095, true});
     run_fp16_query_chunk_test();
+    run_host_index_stream_test();
     unsetenv("QW3_KVMEM_SOFTMAX_PAGES_FORCE_TILED");
     unsetenv("QW3_KVMEM_SOFTMAX_PAGES_SCALABLE");
     std::printf("[kvmem-softmax-pages] PASS\n");

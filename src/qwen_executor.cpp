@@ -10733,7 +10733,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
             g_kbar_multi_blocks_ > 0 && g_query_multi_count_ > 0 &&
             g_score_dev_;
         const bool supported =
-            mean_k_ready && !kvmem_query_host_capture_ &&
+            mean_k_ready && !kvmem_mean_index_host_ &&
+            !kvmem_query_host_capture_ &&
             std::strcmp(scorer_used, "mean-k") == 0;
         const bool span_is_new = supported && final_trace_event &&
             kvmem_query_end_ > kvmem_query_begin_ && request_is_new;
@@ -10745,7 +10746,9 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                 kvmem_trace_tag_.empty() ? "-" : kvmem_trace_tag_.c_str(),
                 kvmem_query_host_capture_
                     ? "host_streaming_query_not_supported"
-                    : "mean_k_query_or_index_not_ready");
+                    : kvmem_mean_index_host_
+                        ? "host_mean_index_layer_dump_not_supported"
+                        : "mean_k_query_or_index_not_ready");
         }
         if (span_is_new) {
             const QwenConfig &model_cfg = model_.config();
@@ -11769,12 +11772,16 @@ void QwenExecutor::kvmem_build_content_index() {
 
     if (n_blocks > g_kbar_global_capacity_) {
         g_kbar_global_capacity_ = n_blocks;
-        g_kbar_ = kvmem_alloc_mean_index_tensor(
-            static_cast<uint64_t>(g_kbar_global_capacity_) * n_kv_heads * head_dim,
-            "g_kbar");
         g_score_dev_ = backend_.tensor_f32(g_kbar_global_capacity_, "g_score");
         g_orig_base_dev_ = backend_.tensor_i32(g_kbar_global_capacity_, "g_orig_base");
         g_blk_tokens_dev_ = backend_.tensor_i32(g_kbar_global_capacity_, "g_blk_tokens");
+    }
+    const uint64_t single_index_elems =
+        static_cast<uint64_t>(g_kbar_global_capacity_) *
+        n_kv_heads * head_dim;
+    if (!g_kbar_ || g_kbar_->count < single_index_elems) {
+        g_kbar_ = kvmem_alloc_mean_index_tensor(
+            single_index_elems, "g_kbar");
     }
     if (!g_query_content_) {
         g_query_content_ = backend_.tensor_f32(
@@ -11877,6 +11884,10 @@ bool QwenExecutor::kvmem_retrieval_score(std::string *failure_reason) {
         return scorer_unavailable(failure_reason,
                                   "single_index_has_zero_blocks");
     }
+    if (!g_kbar_ || !g_score_dev_ || !g_query_content_) {
+        return scorer_unavailable(
+            failure_reason, "single_index_buffers_unavailable");
+    }
     const QwenConfig &cfg = model_.config();
     // Content-frame Q . k̄ has no 1/sqrt(d) softmax scale to honor (it is a bare
     // similarity rank), so use scale = 1.
@@ -11966,6 +11977,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     const uint32_t preserved_captured_tokens = kvmem_qc_captured_tokens_;
     const uint32_t preserved_stride_blocks = kvmem_qc_layer_stride_blocks_;
     const uint32_t preserved_subblocks = kvmem_qc_n_subblocks_;
+    const bool preserved_host_index = kvmem_mean_index_host_;
     kvmem_query_begin_ = begin;
     kvmem_query_end_ = end;
     g_query_multi_count_ = 0;
@@ -11988,11 +12000,28 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     }
     g_kraw_multi_ready_ = false;
     kvmem_qc_total_tokens_ = 0;
-    if (!kvmem_qc_capture_active_) return;
+    if (!kvmem_qc_capture_active_) {
+        kvmem_mean_index_host_ = false;
+        return;
+    }
     const QwenConfig &cfg = model_.config();
     // Resolve the normal-attention layer set (pins bs_score_layer_ as a side
     // effect) and read the env A/B knobs so capture/scoring agree on L this run.
     kvmem_resolve_std_layers();
+    const char *kv_dtype = std::getenv("QW3_KV_DTYPE");
+    const bool fp32_mean_index =
+        kv_dtype && std::strcmp(kv_dtype, "fp32") == 0;
+    const bool use_host_mean_index =
+        env_flag_enabled("QW3_KVMEM_MEAN_K_HOST", true) &&
+        std::strcmp(backend_.name(), "cuda-device") == 0 &&
+        !fp32_mean_index && !kvmem_qc_pertoken_ && !kvmem_qc_deltanet_ &&
+        !env_flag_enabled("QW3_KVMEM_CLEAN_QUERY");
+    if (preserve_content_index &&
+        preserved_host_index != use_host_mean_index) {
+        throw std::runtime_error(
+            "KVMem transcript replay cannot change mean-K storage backend");
+    }
+    kvmem_mean_index_host_ = use_host_mean_index;
     // g_query_multi_ holds the per-layer de-RoPE'd question rows, laid out
     // [L, S, n_heads, head_dim] (S = span length, per-layer row stride). Allocate
     // by the exact L*S so a tiny question only costs tens of MB.
@@ -12117,21 +12146,16 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     }
     const uint32_t n_kv_heads = cfg.n_kv_heads;
     const uint32_t head_dim = cfg.head_dim;
-    // Fixed per-layer stride for g_kbar_multi_: pin it at the session's ctx block
-    // capacity (ceil(kv_ctx_size_/block_tokens)) so preserved [0,D) index slices
-    // stay at a stable per-layer offset as the block count grows across resumed
-    // turns (server-side session continuation). This decouples "where layer l's
-    // slice starts" from "how many blocks this turn scores" (total_blocks). The
-    // scorer + incremental capture both key on this stride; the buffer is
-    // over-allocated to the ctx cap once (≈256 MiB at 262144 ctx with the
-    // 16-layer FP16 mean index used by Qwen3.6-27B) and never
-    // reallocates as the session grows. Clamp up so a prompt longer than the
-    // configured ctx can't under-size the stride.
+    // Pin the per-layer mean-K stride at the session's ctx block capacity
+    // (ceil(kv_ctx_size_/block_tokens)) so preserved [0,D) slices stay at a
+    // stable offset as the block count grows across resumed turns. This applies
+    // to both the CPU authority and the legacy full-device index.
     const uint32_t ctx_blocks = (kv_ctx_size_ + bt - 1) / bt;
     const uint32_t stride_blocks = std::max(ctx_blocks, total_blocks);
     if (preserve_content_index &&
         (kvmem_qc_pertoken_ || kvmem_qc_deltanet_ ||
-         !g_kbar_multi_ || preserved_stride_blocks != stride_blocks ||
+         !kvmem_has_mean_index_storage() ||
+         preserved_stride_blocks != stride_blocks ||
          preserved_subblocks != kvmem_qc_n_subblocks_ ||
          stride_blocks > g_kbar_multi_capacity_)) {
         throw std::runtime_error(
@@ -12146,29 +12170,70 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // cache is FP8; builders and scorers still accumulate in FP32. FP32 KV is
     // retained as a diagnostic full-precision index mode.
     bool freshly_allocated = false;
-    if (!g_kbar_multi_ || stride_blocks > g_kbar_multi_capacity_ ||
-        g_kbar_multi_->count < per_layer * L) {
-        g_kbar_multi_capacity_ = stride_blocks;
-        g_kbar_multi_ =
-            kvmem_alloc_mean_index_tensor(per_layer * L, "g_kbar_multi");
-        freshly_allocated = true;
+    const uint64_t index_elements = per_layer * L;
+    if (kvmem_mean_index_host_) {
+        if (!g_kbar_multi_host_ ||
+            g_kbar_multi_host_capacity_ < index_elements ||
+            stride_blocks > g_kbar_multi_capacity_) {
+            g_kbar_multi_host_.reset(new uint16_t[index_elements]);
+            g_kbar_multi_host_capacity_ = index_elements;
+            g_kbar_multi_capacity_ = stride_blocks;
+            freshly_allocated = true;
+        }
+        // Release a legacy full-device authority. The bounded stage below is
+        // the only GPU mean-K allocation retained by this path.
+        g_kbar_multi_.reset();
+        const uint32_t max_tile_blocks =
+            std::max<uint32_t>(
+                1u, 512u / std::max<uint32_t>(1u, kvmem_qc_n_subblocks_));
+        const uint32_t requested_tile = env_uint32_or(
+            "QW3_KVMEM_MEAN_K_TILE_BLOCKS", max_tile_blocks);
+        kvmem_ensure_host_mean_stage(std::min<uint32_t>(
+            stride_blocks,
+            std::max<uint32_t>(
+                1u, std::min(requested_tile, max_tile_blocks))));
         if (std::getenv("QW3_KVMEM_TRACE")) {
-            const char *index_dtype =
-                g_kbar_multi_->elem_size == sizeof(float) ? "fp32" : "fp16";
-            const uint64_t elements = per_layer * L;
-            const uint64_t bytes =
-                elements * static_cast<uint64_t>(g_kbar_multi_->elem_size);
+            const uint64_t host_bytes = index_elements * sizeof(uint16_t);
+            const uint64_t stage_bytes =
+                g_kbar_multi_stage_
+                    ? g_kbar_multi_stage_->count *
+                          static_cast<uint64_t>(g_kbar_multi_stage_->elem_size)
+                    : 0;
             std::fprintf(
                 stderr,
-                "[bs-kbar-index] dtype=%s elem_bytes=%u layers=%u "
-                "stride_blocks=%u subblocks=%u elements=%llu bytes=%llu "
-                "gib=%.3f\n",
-                index_dtype, g_kbar_multi_->elem_size, L, stride_blocks,
-                kvmem_qc_n_subblocks_,
-                static_cast<unsigned long long>(elements),
-                static_cast<unsigned long long>(bytes),
-                static_cast<double>(bytes) /
-                    (1024.0 * 1024.0 * 1024.0));
+                "[bs-kbar-index] storage=cpu dtype=fp16 layers=%u "
+                "stride_blocks=%u subblocks=%u host_mib=%.2f "
+                "stage_blocks=%u gpu_stage_mib=%.2f\n",
+                L, stride_blocks, kvmem_qc_n_subblocks_,
+                static_cast<double>(host_bytes) / (1024.0 * 1024.0),
+                g_kbar_multi_stage_blocks_,
+                static_cast<double>(stage_bytes) / (1024.0 * 1024.0));
+        }
+    } else {
+        if (!g_kbar_multi_ || stride_blocks > g_kbar_multi_capacity_ ||
+            g_kbar_multi_->count < index_elements) {
+            g_kbar_multi_capacity_ = stride_blocks;
+            g_kbar_multi_ =
+                kvmem_alloc_mean_index_tensor(index_elements, "g_kbar_multi");
+            freshly_allocated = true;
+            if (std::getenv("QW3_KVMEM_TRACE")) {
+                const char *index_dtype =
+                    g_kbar_multi_->elem_size == sizeof(float) ? "fp32" : "fp16";
+                const uint64_t bytes =
+                    index_elements *
+                    static_cast<uint64_t>(g_kbar_multi_->elem_size);
+                std::fprintf(
+                    stderr,
+                    "[bs-kbar-index] storage=gpu dtype=%s elem_bytes=%u "
+                    "layers=%u stride_blocks=%u subblocks=%u "
+                    "elements=%llu bytes=%llu gib=%.3f\n",
+                    index_dtype, g_kbar_multi_->elem_size, L, stride_blocks,
+                    kvmem_qc_n_subblocks_,
+                    static_cast<unsigned long long>(index_elements),
+                    static_cast<unsigned long long>(bytes),
+                    static_cast<double>(bytes) /
+                        (1024.0 * 1024.0 * 1024.0));
+            }
         }
     }
     // Resume seeding keeps the exact token prefix represented by the existing
@@ -12189,7 +12254,11 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
         kvmem_qc_captured_blocks_ = (resume_base + bt - 1) / bt;
     } else {
         kvmem_qc_captured_tokens_ = 0;
-        require_status(backend_.zero_tensor(*g_kbar_multi_));
+        // The host authority is intentionally left uninitialized: only the
+        // exact captured prefix is ever published or scored.
+        if (!kvmem_mean_index_host_) {
+            require_status(backend_.zero_tensor(*g_kbar_multi_));
+        }
     }
     // Raw-key ExactMass (per-token method): keep the full per-token de-RoPE'd K
     // (no mean) so the scorer can softmax over a block's tokens. Layout
@@ -12217,10 +12286,16 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // slot-0 copy at capture completion. Size them for the full block count.
     if (total_blocks > g_kbar_global_capacity_) {
         g_kbar_global_capacity_ = total_blocks;
-        g_kbar_ = kvmem_alloc_mean_index_tensor(per_layer, "g_kbar");
         g_score_dev_ = backend_.tensor_f32(g_kbar_global_capacity_, "g_score");
         g_orig_base_dev_ = backend_.tensor_i32(g_kbar_global_capacity_, "g_orig_base");
         g_blk_tokens_dev_ = backend_.tensor_i32(g_kbar_global_capacity_, "g_blk_tokens");
+    }
+    if (kvmem_mean_index_host_) {
+        // The multi-layer scorer is authoritative in host mode. Keeping the
+        // legacy single-layer proxy would retain another stride-sized index.
+        g_kbar_.reset();
+    } else if (!g_kbar_ || g_kbar_->count < per_layer) {
+        g_kbar_ = kvmem_alloc_mean_index_tensor(per_layer, "g_kbar");
     }
     if (!g_query_content_) {
         g_query_content_ = backend_.tensor_f32(
@@ -12282,8 +12357,140 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     }
 }
 
+bool QwenExecutor::kvmem_has_mean_index_storage() const {
+    return kvmem_mean_index_host_
+        ? static_cast<bool>(g_kbar_multi_host_)
+        : static_cast<bool>(g_kbar_multi_);
+}
+
+void QwenExecutor::kvmem_ensure_host_mean_stage(uint32_t min_blocks) {
+    if (!kvmem_mean_index_host_ || min_blocks == 0) return;
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
+    const uint32_t ns = std::max<uint32_t>(kvmem_qc_n_subblocks_, 1u);
+    const uint64_t block_elems =
+        static_cast<uint64_t>(ns) * cfg.n_kv_heads * cfg.head_dim;
+    if (!g_kbar_multi_stage_ ||
+        g_kbar_multi_stage_blocks_ < min_blocks ||
+        g_kbar_multi_stage_->count <
+            static_cast<uint64_t>(layers) * min_blocks * block_elems) {
+        g_kbar_multi_stage_blocks_ = min_blocks;
+        const uint64_t elems =
+            static_cast<uint64_t>(layers) * min_blocks * block_elems;
+        g_kbar_multi_stage_ =
+            backend_.tensor_f16(elems, "g_kbar_multi_host_stage");
+    }
+    const uint64_t packed_bytes =
+        static_cast<uint64_t>(layers) * min_blocks * block_elems *
+        sizeof(uint16_t);
+    if (!g_kbar_multi_bounce_ ||
+        g_kbar_multi_bounce_capacity_ < packed_bytes) {
+        g_kbar_multi_bounce_ =
+            backend_.host_buffer(packed_bytes, "g_kbar_multi_host_bounce");
+        g_kbar_multi_bounce_capacity_ = packed_bytes;
+    }
+}
+
+// Pack a fixed-stride CPU authority slice into the compact GPU stage. The copy
+// helper orders the transfer after the prior execution-stream tile before it
+// returns, so one stage can be reused without races.
+void QwenExecutor::kvmem_load_host_mean_tile(uint32_t first_block,
+                                             uint32_t block_count) {
+    if (!kvmem_mean_index_host_ || !g_kbar_multi_host_ ||
+        block_count == 0) {
+        return;
+    }
+    if (first_block > kvmem_qc_layer_stride_blocks_ ||
+        block_count > kvmem_qc_layer_stride_blocks_ - first_block) {
+        throw std::runtime_error("KVMem host mean-K tile is out of range");
+    }
+    kvmem_ensure_host_mean_stage(block_count);
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
+    const uint64_t block_elems =
+        static_cast<uint64_t>(
+            std::max<uint32_t>(kvmem_qc_n_subblocks_, 1u)) *
+        cfg.n_kv_heads * cfg.head_dim;
+    const uint64_t copy_layer_elems =
+        static_cast<uint64_t>(block_count) * block_elems;
+    const uint64_t stage_layer_elems =
+        static_cast<uint64_t>(g_kbar_multi_stage_blocks_) * block_elems;
+    auto *packed =
+        static_cast<uint16_t *>(g_kbar_multi_bounce_->data);
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        const uint64_t src =
+            (static_cast<uint64_t>(layer) *
+                 kvmem_qc_layer_stride_blocks_ +
+             first_block) *
+            block_elems;
+        std::memcpy(
+            packed + static_cast<uint64_t>(layer) * stage_layer_elems,
+            g_kbar_multi_host_.get() + src,
+            static_cast<size_t>(copy_layer_elems) * sizeof(uint16_t));
+    }
+    const uint64_t bytes =
+        static_cast<uint64_t>(layers) * stage_layer_elems *
+        sizeof(uint16_t);
+    require_status(backend_.copy_bytes_from_host(
+        *g_kbar_multi_stage_, /*byte_offset=*/0,
+        g_kbar_multi_bounce_->data, bytes));
+}
+
+// Drain a freshly built compact GPU capture range back into the fixed-stride
+// CPU authority. All layer copies share one pinned packed bounce.
+void QwenExecutor::kvmem_store_host_mean_capture(uint32_t first_block,
+                                                 uint32_t block_count) {
+    if (!kvmem_mean_index_host_ || !g_kbar_multi_host_ ||
+        !g_kbar_multi_stage_ || block_count == 0) {
+        return;
+    }
+    if (block_count > g_kbar_multi_stage_blocks_ ||
+        first_block > kvmem_qc_layer_stride_blocks_ ||
+        block_count > kvmem_qc_layer_stride_blocks_ - first_block) {
+        throw std::runtime_error("KVMem host mean-K capture is out of range");
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
+    const uint64_t block_elems =
+        static_cast<uint64_t>(
+            std::max<uint32_t>(kvmem_qc_n_subblocks_, 1u)) *
+        cfg.n_kv_heads * cfg.head_dim;
+    const uint64_t layer_elems =
+        static_cast<uint64_t>(block_count) * block_elems;
+    const uint64_t layer_bytes = layer_elems * sizeof(uint16_t);
+    kvmem_ensure_host_mean_stage(block_count);
+    auto *packed =
+        static_cast<uint16_t *>(g_kbar_multi_bounce_->data);
+    require_status(backend_.begin_kv_transfer_from_device());
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        const uint64_t src_byte =
+            static_cast<uint64_t>(layer) *
+            g_kbar_multi_stage_blocks_ * block_elems *
+            sizeof(uint16_t);
+        require_status(backend_.copy_bytes_to_host_async(
+            *g_kbar_multi_stage_,
+            packed + static_cast<uint64_t>(layer) * layer_elems,
+            src_byte, layer_bytes));
+    }
+    require_status(backend_.wait_kv_transfer());
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        const uint64_t dst =
+            (static_cast<uint64_t>(layer) *
+                 kvmem_qc_layer_stride_blocks_ +
+             first_block) *
+            block_elems;
+        std::memcpy(
+            g_kbar_multi_host_.get() + dst,
+            packed + static_cast<uint64_t>(layer) * layer_elems,
+            static_cast<size_t>(layer_bytes));
+    }
+}
+
 bool QwenExecutor::kvmem_publish_captured_prefix(uint32_t scoreable_tokens) {
-    if (!kvmem_enabled_ || !block_store_ || !g_kbar_multi_) return false;
+    if (!kvmem_enabled_ || !block_store_ ||
+        !kvmem_has_mean_index_storage()) {
+        return false;
+    }
     if (kvmem_qc_pertoken_ || kvmem_qc_deltanet_) return false;
     const uint32_t bt = std::max<uint32_t>(
         1, block_store_->config().block_tokens);
@@ -12301,7 +12508,8 @@ bool QwenExecutor::kvmem_publish_captured_prefix(uint32_t scoreable_tokens) {
     const uint64_t per_pos =
         static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
     const uint64_t slot0_elems = static_cast<uint64_t>(n_blocks) * per_pos;
-    if (kvmem_qc_n_subblocks_ == 1 && g_kbar_ &&
+    if (!kvmem_mean_index_host_ &&
+        kvmem_qc_n_subblocks_ == 1 && g_kbar_ && g_kbar_multi_ &&
         g_kbar_->count >= slot0_elems) {
         require_status(backend_.copy_d2d(*g_kbar_, *g_kbar_multi_, 0,
                                          slot0_elems));
@@ -12967,7 +13175,10 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
                                             uint32_t rope_base_pos,
                                             uint32_t k_token_stride) {
     if (!kvmem_qc_capture_active_) return;
-    if (!g_kbar_multi_ || !k_batch_ || g_kbar_multi_ready_) return;
+    if (!kvmem_has_mean_index_storage() || !k_batch_ ||
+        g_kbar_multi_ready_) {
+        return;
+    }
     if (kvmem_qc_total_blocks_ == 0 || !block_store_) return;
     const QwenConfig &cfg = model_.config();
     const uint32_t n_kv_heads = cfg.n_kv_heads;
@@ -12996,8 +13207,21 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
         kvmem_qc_total_blocks_ - first_block);
     if (n_blocks_chunk == 0) return;
     const uint64_t per_pos = static_cast<uint64_t>(n_kv_heads) * head_dim;
+    if (kvmem_mean_index_host_) {
+        kvmem_ensure_host_mean_stage(n_blocks_chunk);
+        // A resumed suffix can begin inside a previously captured block. Seed
+        // every layer's old first-block mean before the merge kernels update it.
+        if (off != 0 && slot == 0) {
+            kvmem_load_host_mean_tile(first_block, /*block_count=*/1);
+        }
+    }
+    DeviceTensor *capture_index = kvmem_mean_index_host_
+        ? g_kbar_multi_stage_.get() : g_kbar_multi_.get();
+    const uint32_t capture_stride = kvmem_mean_index_host_
+        ? g_kbar_multi_stage_blocks_ : stride_blocks;
     const uint64_t kbar_block_base =
-        static_cast<uint64_t>(slot) * stride_blocks + first_block;
+        static_cast<uint64_t>(slot) * capture_stride +
+        (kvmem_mean_index_host_ ? 0u : first_block);
     DeviceStatus st;
     const int32_t actual_layer = slot < std_layers_.size()
         ? static_cast<int32_t>(std_layers_[slot]) : -1;
@@ -13009,13 +13233,13 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
         // prefill byte-identical, overwrite semantics are exactly what a replayed
         // suffix needs after rollback.
         st = backend_.block_kmean_content_batch_device(
-            *k_batch_, *g_kbar_multi_, kbar_block_base, n_blocks_chunk,
+            *k_batch_, *capture_index, kbar_block_base, n_blocks_chunk,
             k_token_stride, batch, bt, n_kv_heads, head_dim, cfg.rope_dim,
             static_cast<int32_t>(rope_base_pos), cfg.rope_theta,
             /*src_row_off=*/0, /*n_subblocks=*/kvmem_qc_n_subblocks_);
     } else {
         st = backend_.block_kmean_content_batch_merge_device(
-            *k_batch_, *g_kbar_multi_, kbar_block_base, n_blocks_chunk,
+            *k_batch_, *capture_index, kbar_block_base, n_blocks_chunk,
             k_token_stride, batch, bt, off, n_kv_heads, head_dim,
             cfg.rope_dim, static_cast<int32_t>(rope_base_pos), cfg.rope_theta,
             /*n_subblocks=*/kvmem_qc_n_subblocks_);
@@ -13044,6 +13268,9 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     // destination range. captured_blocks remains a diagnostic ceil(prefix/bt).
     const uint32_t L = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
     if (slot + 1 != L) return;
+    if (kvmem_mean_index_host_) {
+        kvmem_store_host_mean_capture(first_block, n_blocks_chunk);
+    }
     kvmem_qc_captured_tokens_ = base_pos + batch;
     kvmem_qc_captured_blocks_ =
         (kvmem_qc_captured_tokens_ + bt - 1) / bt;
@@ -13060,7 +13287,9 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     // sub-block mode, guarded at the shmem-cap check).
     const uint64_t per_layer =
         static_cast<uint64_t>(kvmem_qc_total_blocks_) * per_pos;
-    if (kvmem_qc_n_subblocks_ == 1 && g_kbar_ && g_kbar_->count >= per_layer) {
+    if (!kvmem_mean_index_host_ &&
+        kvmem_qc_n_subblocks_ == 1 && g_kbar_ && g_kbar_multi_ &&
+        g_kbar_->count >= per_layer) {
         (void)backend_.copy_d2d(*g_kbar_, *g_kbar_multi_, /*src_offset=*/0,
                                 per_layer);
     }
@@ -13090,7 +13319,10 @@ void QwenExecutor::kvmem_decode_capture_begin() {
     decode_stage_rows_ = 0;
     decode_stage_block_ = 0;
     if (!kvmem_enabled_ || !block_store_) return;
-    if (!g_kbar_multi_ || kvmem_qc_layer_stride_blocks_ == 0) return;
+    if (!kvmem_has_mean_index_storage() ||
+        kvmem_qc_layer_stride_blocks_ == 0) {
+        return;
+    }
     if (kvmem_qc_pertoken_) return;                       // per-token index not fixed-stride
     if (kvmem_qc_n_subblocks_ > 1) return;                // sub-block index: decode capture is a follow-up
     if (kvmem_query_end_ <= kvmem_query_begin_) return;   // no QC span -> below budget / dense
@@ -13107,7 +13339,10 @@ void QwenExecutor::kvmem_decode_capture_begin() {
 // layer of a token that completes a block, the block is meaned into g_kbar_multi_.
 void QwenExecutor::kvmem_decode_capture_stage(uint32_t layer_index,
                                               uint32_t rope_pos) {
-    if (!kvmem_decode_capture_on_ || !k_ || !g_kbar_multi_) return;
+    if (!kvmem_decode_capture_on_ || !k_ ||
+        !kvmem_has_mean_index_storage()) {
+        return;
+    }
     const int32_t slot = (static_cast<size_t>(layer_index) < std_layer_slot_.size())
                              ? std_layer_slot_[layer_index] : -1;
     if (slot < 0) return;
@@ -13176,7 +13411,10 @@ void QwenExecutor::kvmem_decode_capture_stage(uint32_t layer_index,
 // seeding, which trusts these preserved slices.
 void QwenExecutor::kvmem_capture_decode_block(uint32_t true_block_index,
                                               uint32_t rows) {
-    if (!g_kbar_decode_stage_ || !g_kbar_multi_ || rows == 0) return;
+    if (!g_kbar_decode_stage_ || !kvmem_has_mean_index_storage() ||
+        rows == 0) {
+        return;
+    }
     if (true_block_index >= kvmem_qc_layer_stride_blocks_) return;
     const QwenConfig &cfg = model_.config();
     const uint32_t n_kv_heads = cfg.n_kv_heads;
@@ -13185,19 +13423,31 @@ void QwenExecutor::kvmem_capture_decode_block(uint32_t true_block_index,
     const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
     const uint32_t L = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
     const uint32_t stride = kvmem_qc_layer_stride_blocks_;
+    if (kvmem_mean_index_host_) {
+        kvmem_ensure_host_mean_stage(/*min_blocks=*/1);
+    }
+    DeviceTensor *capture_index = kvmem_mean_index_host_
+        ? g_kbar_multi_stage_.get() : g_kbar_multi_.get();
+    const uint32_t capture_stride = kvmem_mean_index_host_
+        ? g_kbar_multi_stage_blocks_ : stride;
     for (uint32_t s = 0; s < L; ++s) {
         const uint64_t kbar_block_base =
-            static_cast<uint64_t>(s) * stride + true_block_index;
+            static_cast<uint64_t>(s) * capture_stride +
+            (kvmem_mean_index_host_ ? 0u : true_block_index);
         (void)backend_.block_kmean_content_batch_device(
-            *g_kbar_decode_stage_, *g_kbar_multi_, kbar_block_base,
+            *g_kbar_decode_stage_, *capture_index, kbar_block_base,
             /*n_blocks_chunk=*/1, /*k_stride=*/per_pos, /*batch=*/rows,
             /*blk_tokens=*/bt, n_kv_heads, head_dim, /*rope_dim=*/0,
             /*rope_base=*/0, cfg.rope_theta, /*src_row_off=*/s * bt);
     }
+    if (kvmem_mean_index_host_) {
+        kvmem_store_host_mean_capture(true_block_index, /*block_count=*/1);
+    }
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
-            "[bs-decode-cap] block=%u rows=%u -> g_kbar_multi_ (L=%u stride=%u)\n",
-            true_block_index, rows, L, stride);
+            "[bs-decode-cap] block=%u rows=%u -> %s mean-K (L=%u stride=%u)\n",
+            true_block_index, rows,
+            kvmem_mean_index_host_ ? "CPU" : "GPU", L, stride);
     }
 }
 
@@ -13344,14 +13594,208 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
     return true;
 }
 
+bool QwenExecutor::kvmem_score_host_mean_index(
+        uint32_t n_blocks, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        std::string *failure_reason) {
+    if (!kvmem_mean_index_host_ || !g_kbar_multi_host_ ||
+        !g_kbar_multi_stage_ || !g_query_multi_ || !g_score_dev_ ||
+        (kvmem_query_host_capture_ && !g_query_multi_host_)) {
+        return scorer_unavailable(
+            failure_reason, "host_mean_index_stream_unavailable");
+    }
+    kvmem_drain_query_capture();
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = kvmem_qc_num_layers_;
+    const uint32_t tokens = g_query_multi_count_;
+    const uint32_t source_stride = kvmem_query_span_;
+    if (layers == 0 || tokens == 0 || tokens > source_stride ||
+        n_blocks == 0) {
+        return scorer_unavailable(
+            failure_reason, "host_mean_index_stream_shape_invalid");
+    }
+    const uint32_t ns =
+        std::max<uint32_t>(1u, kvmem_qc_n_subblocks_);
+    const uint32_t max_tile_blocks = std::max<uint32_t>(1u, 512u / ns);
+    const uint32_t requested_tile = env_uint32_or(
+        "QW3_KVMEM_MEAN_K_TILE_BLOCKS", max_tile_blocks);
+    const uint32_t tile_blocks = std::min<uint32_t>(
+        n_blocks,
+        std::max<uint32_t>(
+            1u, std::min(requested_tile, max_tile_blocks)));
+    kvmem_ensure_host_mean_stage(tile_blocks);
+
+    const uint32_t chunk_tokens = std::min<uint32_t>(
+        tokens, env_uint32_or("QW3_KVMEM_QUERY_SCORE_CHUNK", 256));
+    const uint64_t row_elems =
+        static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
+    if (kvmem_query_host_capture_) {
+        const uint64_t max_stage_elems =
+            static_cast<uint64_t>(layers) * chunk_tokens * row_elems;
+        if (g_query_multi_->elem_size != sizeof(uint16_t) ||
+            g_query_multi_->count < max_stage_elems) {
+            g_query_multi_ = backend_.tensor_f16(
+                max_stage_elems, "g_query_score_stage");
+            g_query_multi_capacity_ =
+                static_cast<uint64_t>(layers) * chunk_tokens;
+        }
+        const uint64_t max_stage_bytes =
+            max_stage_elems * sizeof(uint16_t);
+        if (!g_query_score_pinned_ ||
+            g_query_score_pinned_capacity_ < max_stage_bytes) {
+            g_query_score_pinned_ =
+                backend_.host_buffer(max_stage_bytes,
+                                     "g_query_score_bounce");
+            g_query_score_pinned_capacity_ = max_stage_bytes;
+        }
+    }
+
+    if (auto st = backend_.zero_tensor(*g_score_dev_); !st.ok) {
+        return scorer_backend_unavailable(
+            failure_reason, "host_mean_score_zero_failed", st);
+    }
+
+    uint64_t query_copied_bytes = 0;
+    uint64_t index_copied_bytes = 0;
+    uint64_t query_gather_ns = 0;
+    uint32_t query_chunks = 0;
+    uint32_t tile_visits = 0;
+    const uint64_t total_begin = kvmem_steady_ns();
+    for (uint32_t token_base = 0; token_base < tokens;) {
+        const uint32_t count =
+            std::min<uint32_t>(chunk_tokens, tokens - token_base);
+        uint32_t q_layer_stride = source_stride;
+        uint64_t q_elem_off =
+            static_cast<uint64_t>(token_base) * row_elems;
+        if (kvmem_query_host_capture_) {
+            const uint64_t chunk_layer_elems =
+                static_cast<uint64_t>(count) * row_elems;
+            const uint64_t chunk_elems =
+                static_cast<uint64_t>(layers) * chunk_layer_elems;
+            const uint64_t chunk_bytes =
+                chunk_elems * sizeof(uint16_t);
+            const uint64_t gather_begin = kvmem_steady_ns();
+            auto *packed =
+                static_cast<uint16_t *>(g_query_score_pinned_->data);
+            for (uint32_t layer = 0; layer < layers; ++layer) {
+                const uint64_t src =
+                    (static_cast<uint64_t>(layer) * source_stride +
+                     token_base) * row_elems;
+                const uint64_t dst =
+                    static_cast<uint64_t>(layer) * chunk_layer_elems;
+                std::memcpy(
+                    packed + dst, g_query_multi_host_.get() + src,
+                    static_cast<size_t>(chunk_layer_elems) *
+                        sizeof(uint16_t));
+            }
+            query_gather_ns += kvmem_steady_ns() - gather_begin;
+            require_status(backend_.copy_bytes_from_host(
+                *g_query_multi_, /*byte_offset=*/0,
+                g_query_score_pinned_->data, chunk_bytes));
+            query_copied_bytes += chunk_bytes;
+            q_layer_stride = count;
+            q_elem_off = 0;
+        }
+
+        const uint64_t distributions =
+            static_cast<uint64_t>(layers) * count * cfg.n_heads;
+        if (!g_kbar_stream_max_ || !g_kbar_stream_sum_ ||
+            g_kbar_stream_lse_capacity_ < distributions) {
+            g_kbar_stream_max_ =
+                backend_.tensor_f32(distributions,
+                                    "g_kbar_stream_global_max");
+            g_kbar_stream_sum_ =
+                backend_.tensor_f32(distributions,
+                                    "g_kbar_stream_global_sum");
+            g_kbar_stream_lse_capacity_ = distributions;
+        }
+
+        bool first_tile = true;
+        for (uint32_t block_base = 0; block_base < n_blocks;
+             block_base += tile_blocks) {
+            const uint32_t count_blocks =
+                std::min<uint32_t>(tile_blocks,
+                                   n_blocks - block_base);
+            kvmem_load_host_mean_tile(block_base, count_blocks);
+            if (auto st =
+                    backend_.block_attn_softmax_pages_stream_lse_device(
+                        *g_kbar_stream_max_, *g_kbar_stream_sum_,
+                        *g_query_multi_, *g_kbar_multi_stage_,
+                        layers, count, q_layer_stride, count_blocks,
+                        g_kbar_multi_stage_blocks_, block_base, n_blocks,
+                        cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale,
+                        excl_lo_end, excl_hi_begin, ns,
+                        first_tile ? 1u : 0u, q_elem_off);
+                !st.ok) {
+                return scorer_backend_unavailable(
+                    failure_reason, "host_mean_lse_pass_failed", st);
+            }
+            first_tile = false;
+            index_copied_bytes +=
+                static_cast<uint64_t>(layers) *
+                g_kbar_multi_stage_blocks_ * ns *
+                cfg.n_kv_heads * cfg.head_dim * sizeof(uint16_t);
+            ++tile_visits;
+        }
+        for (uint32_t block_base = 0; block_base < n_blocks;
+             block_base += tile_blocks) {
+            const uint32_t count_blocks =
+                std::min<uint32_t>(tile_blocks,
+                                   n_blocks - block_base);
+            kvmem_load_host_mean_tile(block_base, count_blocks);
+            if (auto st =
+                    backend_.block_attn_softmax_pages_stream_score_device(
+                        *g_score_dev_, *g_query_multi_,
+                        *g_kbar_multi_stage_, *g_kbar_stream_max_,
+                        *g_kbar_stream_sum_, layers, count,
+                        q_layer_stride, count_blocks,
+                        g_kbar_multi_stage_blocks_, block_base, n_blocks,
+                        cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, scale,
+                        excl_lo_end, excl_hi_begin, ns,
+                        kvmem_qc_subblock_max_ ? 1u : 0u,
+                        q_elem_off);
+                !st.ok) {
+                return scorer_backend_unavailable(
+                    failure_reason, "host_mean_score_pass_failed", st);
+            }
+            index_copied_bytes +=
+                static_cast<uint64_t>(layers) *
+                g_kbar_multi_stage_blocks_ * ns *
+                cfg.n_kv_heads * cfg.head_dim * sizeof(uint16_t);
+            ++tile_visits;
+        }
+        token_base += count;
+        ++query_chunks;
+    }
+    require_status(backend_.synchronize());
+    const uint64_t total_ns = kvmem_steady_ns() - total_begin;
+    if (std::getenv("QW3_KVMEM_TRACE") ||
+        kvmem_perf_trace_flag()) {
+        std::fprintf(
+            stderr,
+            "[bs-kbar-host-score] exact=1 dtype=fp16 layers=%u "
+            "tokens=%u blocks=%u subblocks=%u tile_blocks=%u "
+            "query_chunks=%u tile_visits=%u query_h2d_mib=%.2f "
+            "index_h2d_mib=%.2f gather_ms=%.3f total_ms=%.3f\n",
+            layers, tokens, n_blocks, ns, tile_blocks,
+            query_chunks, tile_visits,
+            static_cast<double>(query_copied_bytes) /
+                (1024.0 * 1024.0),
+            static_cast<double>(index_copied_bytes) /
+                (1024.0 * 1024.0),
+            query_gather_ns / 1.0e6, total_ns / 1.0e6);
+    }
+    return true;
+}
+
 // Query-conditioned MEAN-K scoring at the reselect boundary (--kvmem-retrieval-method
 // mean-k, default): per (layer, question token, query head) softmax the q·k̄ dot
 // products OVER PAGES so blocks compete, then accumulate that attention mass over the
-// query tokens. Uses the cheap per-block mean-key buffer (g_kbar_multi_, ~28 MB), one
-// fused launch + one D2H. The kernel's softmax IS the block distribution, so there is
-// no host-side inv_lm divide or extra normalization tail. Returns false (caller falls
-// back to the single last-token scorer) if the index/query isn't live or the kernel
-// rejects the page count. See docs/kvmem_utility_eval_plan.md.
+// query tokens. The default CUDA path streams the CPU FP16 mean-key authority
+// through a bounded GPU tile; the legacy path scores the full-device index in one
+// launch. The kernel's softmax IS the block distribution, so there is no host-side
+// inv_lm divide or extra normalization tail. Returns false if the index/query is
+// unavailable or the selected backend rejects the shape.
 bool QwenExecutor::kvmem_retrieval_score_mean_softmax(
         int mask_mode, std::string *failure_reason) {
     if (failure_reason) failure_reason->clear();
@@ -13452,7 +13896,13 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(
     // a growing block count); otherwise it equals nb (byte-identical legacy layout).
     const uint32_t kbar_stride =
         kvmem_qc_layer_stride_blocks_ != 0 ? kvmem_qc_layer_stride_blocks_ : nb;
-    if (kvmem_query_host_capture_) {
+    if (kvmem_mean_index_host_) {
+        if (!kvmem_score_host_mean_index(
+                nb, sm_scale, excl_lo_end, excl_hi_begin,
+                failure_reason)) {
+            return false;
+        }
+    } else if (kvmem_query_host_capture_) {
         if (!kvmem_score_host_query_chunks(
                 nb, kbar_stride, sm_scale, excl_lo_end,
                 excl_hi_begin, failure_reason)) {

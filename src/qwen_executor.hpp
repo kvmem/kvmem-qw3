@@ -1410,6 +1410,16 @@ private:
         uint32_t n_blocks, uint32_t kbar_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         std::string *failure_reason);
+    bool kvmem_score_host_mean_index(
+        uint32_t n_blocks, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        std::string *failure_reason);
+    void kvmem_ensure_host_mean_stage(uint32_t min_blocks);
+    void kvmem_load_host_mean_tile(uint32_t first_block,
+                                   uint32_t block_count);
+    void kvmem_store_host_mean_capture(uint32_t first_block,
+                                       uint32_t block_count);
+    bool kvmem_has_mean_index_storage() const;
     uint32_t kvmem_query_begin_ = 0;
     uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
     uint32_t g_query_multi_count_ = 0;                         // rows captured so far (per slot)
@@ -1485,7 +1495,19 @@ private:
     std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_subblocks,
                                                                // n_kv_heads, head_dim],
                                                                // FP16 production index
-    bool g_kbar_multi_ready_ = false;                          // g_kbar_multi_ holds the index
+    // CUDA mean-K defaults to a pageable FP16 authority plus a bounded packed
+    // GPU tile. QW3_KVMEM_MEAN_K_HOST=0 restores the legacy full-GPU index.
+    bool kvmem_mean_index_host_ = false;
+    std::unique_ptr<uint16_t[]> g_kbar_multi_host_;
+    uint64_t g_kbar_multi_host_capacity_ = 0;                 // FP16 elements
+    std::unique_ptr<DeviceTensor> g_kbar_multi_stage_;        // [L,tile,...] fp16
+    std::unique_ptr<HostBuffer> g_kbar_multi_bounce_;         // pinned packed tile
+    uint64_t g_kbar_multi_bounce_capacity_ = 0;               // bytes
+    uint32_t g_kbar_multi_stage_blocks_ = 0;                  // per-layer stride
+    std::unique_ptr<DeviceTensor> g_kbar_stream_max_;         // [L,Q,H] fp32
+    std::unique_ptr<DeviceTensor> g_kbar_stream_sum_;         // [L,Q,H] fp32
+    uint64_t g_kbar_stream_lse_capacity_ = 0;                 // distributions
+    bool g_kbar_multi_ready_ = false;                          // selected mean-K authority is complete
     uint32_t g_kbar_multi_blocks_ = 0;                         // blocks covered (per layer)
     uint32_t g_kbar_multi_capacity_ = 0;                       // allocated block capacity (per layer)
     uint32_t kvmem_qc_n_subblocks_ = 1;                        // sub-block means per block (SubBlockMeanK; 1 = plain mean-k)

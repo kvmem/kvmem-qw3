@@ -1485,6 +1485,84 @@ public:
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
     }
 
+    // Host-resident mean-K streaming scorer, pass 1. `kbar_tile` contains a
+    // packed [L, kbar_layer_stride, n_subblocks, n_kv_heads, head_dim] FP16 tile
+    // whose first `tile_blocks` entries correspond to global blocks beginning at
+    // `global_block_base`. Each launch online-merges this tile's log-sum-exp into
+    // [L*n_tokens*n_heads] global_max/global_sum. The first tile initializes the
+    // state; later tiles merge it. Keeping the normalization state on device lets
+    // the executor stream an arbitrarily large CPU index without approximating
+    // the global softmax.
+    virtual DeviceStatus block_attn_softmax_pages_stream_lse_device(
+            DeviceTensor &global_max,
+            DeviceTensor &global_sum,
+            const DeviceTensor &q_multi,
+            const DeviceTensor &kbar_tile,
+            uint32_t n_layers,
+            uint32_t n_tokens,
+            uint32_t q_layer_stride,
+            uint32_t tile_blocks,
+            uint32_t kbar_layer_stride,
+            uint32_t global_block_base,
+            uint32_t global_n_blocks,
+            uint32_t n_heads,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            float scale,
+            uint32_t excl_lo_end = 0,
+            uint32_t excl_hi_begin = UINT32_MAX,
+            uint32_t n_subblocks = 1,
+            uint32_t initialize = 0,
+            uint64_t q_elem_off = 0,
+            uint64_t kbar_elem_off = 0) {
+        (void)global_max; (void)global_sum; (void)q_multi; (void)kbar_tile;
+        (void)n_layers; (void)n_tokens; (void)q_layer_stride; (void)tile_blocks;
+        (void)kbar_layer_stride; (void)global_block_base; (void)global_n_blocks;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale;
+        (void)excl_lo_end; (void)excl_hi_begin; (void)n_subblocks;
+        (void)initialize; (void)q_elem_off; (void)kbar_elem_off;
+        return {false,
+                "block_attn_softmax_pages_stream_lse_device requires backend override"};
+    }
+
+    // Host-resident mean-K streaming scorer, pass 2. Recomputes this tile's
+    // logits against the pass-1 global normalization and accumulates exact block
+    // masses into the corresponding global score slice. Tiles write disjoint
+    // blocks; repeated query chunks accumulate in stream order.
+    virtual DeviceStatus block_attn_softmax_pages_stream_score_device(
+            DeviceTensor &score,
+            const DeviceTensor &q_multi,
+            const DeviceTensor &kbar_tile,
+            const DeviceTensor &global_max,
+            const DeviceTensor &global_sum,
+            uint32_t n_layers,
+            uint32_t n_tokens,
+            uint32_t q_layer_stride,
+            uint32_t tile_blocks,
+            uint32_t kbar_layer_stride,
+            uint32_t global_block_base,
+            uint32_t global_n_blocks,
+            uint32_t n_heads,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            float scale,
+            uint32_t excl_lo_end = 0,
+            uint32_t excl_hi_begin = UINT32_MAX,
+            uint32_t n_subblocks = 1,
+            uint32_t reduce_max = 0,
+            uint64_t q_elem_off = 0,
+            uint64_t kbar_elem_off = 0) {
+        (void)score; (void)q_multi; (void)kbar_tile; (void)global_max;
+        (void)global_sum; (void)n_layers; (void)n_tokens;
+        (void)q_layer_stride; (void)tile_blocks; (void)kbar_layer_stride;
+        (void)global_block_base; (void)global_n_blocks; (void)n_heads;
+        (void)n_kv_heads; (void)head_dim; (void)scale; (void)excl_lo_end;
+        (void)excl_hi_begin; (void)n_subblocks; (void)reduce_max;
+        (void)q_elem_off; (void)kbar_elem_off;
+        return {false,
+                "block_attn_softmax_pages_stream_score_device requires backend override"};
+    }
+
     // deltanet_pack_query_device: pack one DeltaNet layer's in-span query rows
     // (kvmem retrieval_method==deltanet). The conv output `conv_out` holds the
     // L2-normalized DeltaNet Q in the first num_k_heads*head_k_dim of each row
