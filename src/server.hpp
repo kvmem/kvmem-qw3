@@ -2,10 +2,23 @@
 
 #include "qw3/qw3.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
 namespace qw3 {
+
+namespace detail {
+
+inline void append_historical_thinking(
+        std::string &prompt, const std::string &reasoning_content,
+        bool preserve_thinking, size_t message_index,
+        size_t last_query_index) {
+    if (!preserve_thinking && message_index <= last_query_index) return;
+    prompt += "<think>\n" + reasoning_content + "\n</think>\n\n";
+}
+
+} // namespace detail
 
 // Configuration for the OpenAI-compatible HTTP server. The model itself is
 // loaded once (from EngineOptions) and reused across all requests. Defaults are
@@ -58,6 +71,12 @@ struct ServerConfig {
     // <think>\n\n</think> block (brief working, no long CoT), matching the eval
     // harness expectation.
     bool enable_thinking_default = false;
+    // Preserve every historical assistant reasoning_content block when
+    // rebuilding a chat prompt. This matches Qwen3.6's preserve_thinking
+    // template option and allows exact multi-turn prefix-cache reuse. Requests
+    // may override it with preserve_thinking or
+    // chat_template_kwargs.preserve_thinking.
+    bool preserve_thinking_default = false;
     // Default thinking budget (max tokens inside <think>) when a chat request
     // omits `thinking_budget`. 0 disables the cap.
     int thinking_budget_default = 0;

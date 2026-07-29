@@ -572,6 +572,13 @@ Notes:
   MTP is off. `N>0` enables MTP speculation.
 - Use `--max-active N` to raise or lower continuous-batching concurrency once
   `--continuous-batching` is enabled.
+- Use `--preserve-thinking` for multi-turn clients that return assistant
+  `reasoning_content` (including OpenCode). It applies Qwen3.6's
+  `preserve_thinking` template behavior, so later prompts retain the exact
+  historical `<think>...</think>` blocks and can reuse their prefix KV. The
+  retained reasoning consumes context; the default is off. A request can
+  override the server default with top-level `"preserve_thinking": true` or
+  `"chat_template_kwargs": {"preserve_thinking": true}`.
 - Use `--kv-page-size N`, `--kv-pool-pages N`, and `--mtp-kv-pool-pages N` to
   tune the paged-KV pool. `0` pool pages means auto.
 - Enable **prefix caching** (lossless page-aligned KV reuse across requests that

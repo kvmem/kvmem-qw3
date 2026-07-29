@@ -110,6 +110,37 @@ bool parse_explicit_max_tokens(const json &req, bool &present, int &value,
     return true;
 }
 
+bool parse_preserve_thinking(const json &req, bool default_value, bool &value,
+                             std::string &error) {
+    value = default_value;
+    if (req.contains("chat_template_kwargs") &&
+        !req["chat_template_kwargs"].is_null()) {
+        const json &kwargs = req["chat_template_kwargs"];
+        if (!kwargs.is_object()) {
+            error = "chat_template_kwargs must be an object";
+            return false;
+        }
+        if (kwargs.contains("preserve_thinking")) {
+            if (!kwargs["preserve_thinking"].is_boolean()) {
+                error =
+                    "chat_template_kwargs.preserve_thinking must be a boolean";
+                return false;
+            }
+            value = kwargs["preserve_thinking"].get<bool>();
+        }
+    }
+    // A top-level value is the direct qw3 API and takes precedence over the
+    // Hugging Face/vLLM-compatible chat_template_kwargs form.
+    if (req.contains("preserve_thinking")) {
+        if (!req["preserve_thinking"].is_boolean()) {
+            error = "preserve_thinking must be a boolean";
+            return false;
+        }
+        value = req["preserve_thinking"].get<bool>();
+    }
+    return true;
+}
+
 std::string basename_of(const std::string &path) {
     const size_t slash = path.find_last_of("/\\");
     return slash == std::string::npos ? path : path.substr(slash + 1);
@@ -1213,6 +1244,7 @@ struct RenderedMessageSpan {
 
 std::string render_messages(
         const json &messages, const json *tools, bool enable_thinking,
+        bool preserve_thinking,
         const std::string &forced_tool_name = {},
         std::vector<RenderedMessageSpan> *message_spans = nullptr,
         bool add_generation_prompt = true) {
@@ -1304,9 +1336,9 @@ std::string render_messages(
                 }
             }
             prompt += "<|im_start|>assistant\n";
-            if (add_generation_prompt && i > last_query_index) {
-                prompt += "<think>\n" + reasoning_content + "\n</think>\n\n";
-            }
+            detail::append_historical_thinking(
+                prompt, reasoning_content, preserve_thinking, i,
+                last_query_index);
             prompt += assistant_content;
             if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
                 bool first_tool_call = true;
@@ -1626,6 +1658,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "\n"
               << "  enable_thinking_default="
               << yesno(cfg.enable_thinking_default) << "\n"
+              << "  preserve_thinking_default="
+              << yesno(cfg.preserve_thinking_default) << "\n"
               << "  thinking_budget_default="
               << (cfg.thinking_budget_default > 0
                       ? std::to_string(cfg.thinking_budget_default)
@@ -2066,6 +2100,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         const bool enable_thinking =
             req.value("enable_thinking", cfg.enable_thinking_default);
+        bool preserve_thinking = cfg.preserve_thinking_default;
+        std::string preserve_thinking_error;
+        if (!parse_preserve_thinking(
+                req, cfg.preserve_thinking_default, preserve_thinking,
+                preserve_thinking_error)) {
+            set_error_response(res, 400, preserve_thinking_error);
+            return;
+        }
         const json *raw_tools = req.contains("tools") ? &req["tools"] : nullptr;
         const bool tool_choice_none =
             req.contains("tool_choice") && req["tool_choice"].is_string() &&
@@ -2112,7 +2154,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         std::vector<RenderedMessageSpan> rendered_message_spans;
         const std::string prompt = render_messages(
-            req["messages"], tools, enable_thinking, forced_tool_name,
+            req["messages"], tools, enable_thinking, preserve_thinking,
+            forced_tool_name,
             transcript_replay ? &rendered_message_spans : nullptr,
             /*add_generation_prompt=*/!prefill_only);
         const std::vector<int32_t> prompt_token_ids =
@@ -2325,7 +2368,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     }
                 }
                 const std::string empty_prompt = render_messages(
-                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    msgs_empty, tools, enable_thinking, preserve_thinking,
+                    forced_tool_name,
                     /*message_spans=*/nullptr,
                     /*add_generation_prompt=*/!prefill_only);
                 const std::vector<int32_t> tok_empty =
@@ -2554,7 +2598,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 msgs_empty[static_cast<size_t>(message_index)]["content"] =
                     std::move(content_empty);
                 const std::string empty_prompt = render_messages(
-                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    msgs_empty, tools, enable_thinking, preserve_thinking,
+                    forced_tool_name,
                     /*message_spans=*/nullptr,
                     /*add_generation_prompt=*/!prefill_only);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
@@ -2639,7 +2684,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 msgs_empty[static_cast<size_t>(message_index)]["content"] =
                     std::move(content_empty);
                 const std::string empty_prompt = render_messages(
-                    msgs_empty, tools, enable_thinking, forced_tool_name,
+                    msgs_empty, tools, enable_thinking, preserve_thinking,
+                    forced_tool_name,
                     /*message_spans=*/nullptr,
                     /*add_generation_prompt=*/!prefill_only);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
@@ -2705,7 +2751,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     json msgs_empty = msgs;
                     msgs_empty[lqi]["content"] = "";
                     const std::string empty_prompt = render_messages(
-                        msgs_empty, tools, enable_thinking, forced_tool_name,
+                        msgs_empty, tools, enable_thinking,
+                        preserve_thinking, forced_tool_name,
                         /*message_spans=*/nullptr,
                         /*add_generation_prompt=*/!prefill_only);
                     const std::vector<int32_t> tok_full =
