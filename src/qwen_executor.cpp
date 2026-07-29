@@ -3273,10 +3273,17 @@ uint64_t QwenExecutor::per_token_scratch_bytes() const {
         const uint64_t main_elem_size =
             bf16_main_ ? sizeof(uint16_t) : sizeof(float);
         // h + shared attention/FFN output, FP32 norm, the largest phase
-        // workspace, plus worst-case lazy gate/up fallback allocations.
+        // workspace, plus worst-case lazy gate/up fallback allocations. BF16
+        // main activations need one additional FP32 hidden-width row set while
+        // priming the MTP prefix.
+        const uint64_t mtp_prefix_work =
+            bf16_main_ && weights_.mtp()
+                ? static_cast<uint64_t>(cfg.n_embd) * sizeof(float)
+                : 0;
         return 2 * static_cast<uint64_t>(cfg.n_embd) * main_elem_size +
                static_cast<uint64_t>(cfg.n_embd) * sizeof(float) +
-               (phase + 2 * ffn) * sizeof(float);
+               (phase + 2 * ffn) * sizeof(float) +
+               mtp_prefix_work;
     }
 
     uint64_t per_tok = 0;
@@ -3288,6 +3295,9 @@ uint64_t QwenExecutor::per_token_scratch_bytes() const {
     per_tok += 2 * cfg.num_v_heads();              // alpha, beta
     per_tok += max_q + max_k + max_v;
     per_tok += static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
+    if (bf16_main_ && weights_.mtp()) {
+        per_tok += cfg.n_embd;
+    }
     return per_tok * sizeof(float);
 }
 
@@ -14410,9 +14420,8 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
     // buffer is dead until the next target chunk.  Reuse those buffers instead
     // of keeping a second, capacity-sized MTP scratch set resident for the
     // whole request (about 0.8 GiB at batch=2048 on Qwen3.6-27B).
-    if (!norm_batch_ || !attn_out_batch_ || !ffn_out_batch_ ||
-        !proj_batch_ || !gate_proj_batch_ || !q_batch_ || !k_batch_ ||
-        !v_batch_) {
+    if (!norm_batch_ || !attn_out_batch_ || !proj_batch_ ||
+        !gate_proj_batch_ || !q_batch_ || !k_batch_ || !v_batch_) {
         report.missing_kernels.push_back(
             "native MTP batch prefix requires target-prefill scratch");
         return report;
@@ -14427,15 +14436,34 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
     auto target_row_stride = [this](const DeviceTensor *t) -> uint32_t {
         return static_cast<uint32_t>(t->count / batch_capacity_);
     };
-    const uint32_t mtp_h_stride = target_row_stride(attn_out_batch_.get());
+    DeviceTensor *mtp_work = attn_out_batch_.get();
+    const uint64_t mtp_work_count =
+        static_cast<uint64_t>(batch) * cfg.n_embd;
+    if (mtp_work->dtype != DeviceTensorDType::F32 ||
+        mtp_work->elem_size != sizeof(float)) {
+        if (!mtp_prefix_work_f32_ ||
+            mtp_prefix_work_f32_->count < mtp_work_count) {
+            mtp_prefix_work_f32_ = backend_.scratch_f32(
+                mtp_work_count, "mtp_prefix_work_f32");
+        }
+        mtp_work = mtp_prefix_work_f32_.get();
+    }
+    if (!mtp_work || mtp_work->count < mtp_work_count ||
+        mtp_work->dtype != DeviceTensorDType::F32 ||
+        mtp_work->elem_size != sizeof(float)) {
+        report.missing_kernels.push_back(
+            "native MTP batch prefix requires FP32 hidden scratch");
+        return report;
+    }
+
+    const uint32_t mtp_h_stride = cfg.n_embd;
     const uint32_t concat_stride = target_row_stride(proj_batch_.get());
     const uint32_t q_stride_buf = target_row_stride(q_batch_.get());
     const uint32_t k_stride_buf = target_row_stride(k_batch_.get());
     const uint32_t v_stride_buf = target_row_stride(v_batch_.get());
 
     DeviceTensor &h_inputs = *norm_batch_;
-    DeviceTensor &mtp_h = *attn_out_batch_;
-    DeviceTensor &mtp_norm = *ffn_out_batch_;
+    DeviceTensor &mtp_h = *mtp_work;
     DeviceTensor &mtp_concat = *proj_batch_;
     DeviceTensor &mtp_enorm = *gate_proj_batch_;
     DeviceTensor &mtp_q = *q_batch_;
@@ -14453,10 +14481,10 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
 
     std::vector<uint64_t> rows(batch);
     for (uint32_t i = 0; i < batch; ++i) rows[i] = tokens[i];
-    require_status(backend_.q8_0_get_rows_batch(mtp_norm, *mtp->embed_tokens,
+    require_status(backend_.q8_0_get_rows_batch(mtp_h, *mtp->embed_tokens,
                                                 rows.data(), batch));
     record(report, "mtp.token_embedding_lookup_batch");
-    require_status(backend_.rms_norm_batch(mtp_enorm, mtp_norm,
+    require_status(backend_.rms_norm_batch(mtp_enorm, mtp_h,
                                            *mtp->enorm, batch, h_stride, eps));
     record(report, "mtp.enorm_batch");
     require_status(backend_.rms_norm_batch(mtp_h, h_inputs,
@@ -14477,7 +14505,9 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
                                         batch, concat_stride, mtp_h_stride));
     record(report, "mtp.eh_proj_batch");
 
-    require_status(backend_.rms_norm_batch(mtp_norm, mtp_h,
+    // The packed MTP hidden inputs are dead after hnorm, so their FP32 buffer
+    // can hold the attention norm without an additional capacity-sized scratch.
+    require_status(backend_.rms_norm_batch(h_inputs, mtp_h,
                                            *layer.attn_norm, batch, mtp_h_stride, eps));
     record(report, "mtp.attn_norm_batch");
     {
@@ -14485,7 +14515,7 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
         const DeviceWeight *ws[3] = {layer.attn_q, layer.attn_k, layer.attn_v};
         const uint32_t strides[3] = {q_stride_buf, k_stride_buf, v_stride_buf};
         require_status(backend_.q8_0_matmul_fanout(outs, ws, strides, 3,
-                                                   mtp_norm, batch, mtp_h_stride));
+                                                   h_inputs, batch, mtp_h_stride));
     }
     record(report, "mtp.attention_qkv_projection_batch");
     require_status(backend_.rmsnorm_per_head_batch(mtp_q, *layer.attn_q_norm,

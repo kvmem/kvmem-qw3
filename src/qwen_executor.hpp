@@ -841,6 +841,9 @@ private:
     std::unique_ptr<DeviceTensor> mtp_v_cache_;
     std::unique_ptr<DeviceTensor> mtp_zero_h_;
     std::unique_ptr<DeviceTensor> mtp_prefix_h_;
+    // Lazily allocated only when the target prefill output is BF16. The MTP
+    // prefix path requires one packed FP32 hidden row set for RMSNorm and GEMM.
+    std::unique_ptr<DeviceTensor> mtp_prefix_work_f32_;
     KvPageTable mtp_kv_pages_;
     uint32_t mtp_batch_capacity_ = 0;
     std::unique_ptr<DeviceTensor> mtp_h_input_batch_;
