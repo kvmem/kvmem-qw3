@@ -98,9 +98,23 @@ struct EngineOptions {
     // or "recency" (sink + recent windows only, no learned signal).
     std::string kvmem_method = "retrieval";
     std::string kvmem_select_policy = "topk"; // topk or quota
-    std::string kvmem_retrieval_method = "mean-k"; // supported CLI: mean-k, per-token, sub-block-mean-k
+    std::string kvmem_retrieval_method = "mean-k"; // mean-k, per-token, sub-block-mean-k, key-direction-fixed4
+    // Placement of the all-layer mean-K retrieval index. "gpu" preserves the
+    // resident compatibility path; "cpu" keeps the full FP16 index in pageable
+    // host memory and streams fixed-size tiles through bounded GPU staging.
+    std::string kvmem_index_placement = "gpu"; // gpu or cpu
+    int kvmem_index_staging_mb = 64;           // per GPU/host staging slot
     int kvmem_subblocks = 4;      // sub-block means per block (sub-block-mean-k only)
     std::string kvmem_subblock_reduce = "max"; // sub-block score reduction: max or sum
+    // Optional logical retrieval grouping. "round" consumes caller-supplied
+    // round spans; "message" consumes supplied spans for flattened benchmarks
+    // or derives spans from ordinary Chat API messages. Both score at the
+    // configured sub-block granularity and materialize complete groups.
+    std::string kvmem_semantic_expansion = "none"; // none|round|message
+    // Existing MaxSim or globally normalized attention mass divided by the
+    // number of scoring slices raised to alpha.
+    std::string kvmem_group_score_reduce = "max";
+    double kvmem_group_length_alpha = 0.5;
     std::string kvmem_update_mode = "interval"; // interval or step
     // Deprecated cumulative storage/tiering profile. It is consulted only
     // when the CLI explicitly passes --kvmem-optimization-level; otherwise
@@ -141,6 +155,10 @@ struct EngineOptions {
     uint64_t kvmem_cpu_bytes = 0;
     uint64_t kvmem_nvme_bytes = 0;
     std::string kvmem_nvme_dir;
+    // Store immutable raw-K in a dedicated SSD backing arena. Disabled by
+    // default for compatibility; enable for contexts whose raw-K authority
+    // exceeds the CPU tier budget.
+    bool kvmem_raw_k_nvme = false;
 };
 
 struct GenerationOptions {
@@ -197,6 +215,15 @@ struct GenerationOptions {
         uint32_t end = 0;
     };
     std::vector<KvMemReplayQuerySpan> kvmem_replay_query_spans;
+    // Optional variable-length logical retrieval groups in rendered-prompt
+    // token coordinates. Populated by the serving layer in round/message
+    // semantic-expansion mode. The model/KV storage remains fixed-block; these
+    // spans affect semantic score reduction and selection only.
+    struct KvMemRetrievalGroupSpan {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+    };
+    std::vector<KvMemRetrievalGroupSpan> kvmem_retrieval_group_spans;
     // Optional transcript-construction boundaries. Each value is the first
     // token of an independent historical session, before block alignment. The
     // session-local canonical-KV experiment uses these boundaries to prevent a

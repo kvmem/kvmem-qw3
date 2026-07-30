@@ -361,7 +361,7 @@ def main() -> int:
     if not args.binary.is_file():
         print(f"ERROR: qw3 binary not found: {args.binary}", file=sys.stderr)
         return 2
-    if (not args.model.is_file() or not args.data.is_file() or
+    if (not args.model.is_file() or not args.data.exists() or
             not args.eval_script.is_file()):
         print("ERROR: model, dataset, or eval script does not exist",
               file=sys.stderr)

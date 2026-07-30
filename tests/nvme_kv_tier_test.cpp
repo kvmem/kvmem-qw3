@@ -1,5 +1,5 @@
 // NvmeKvTier host-logic test. Covers slot sizing, block residency, read/write,
-// explicit LRU eviction, and release/reuse.
+// explicit LRU eviction, release/reuse, and crash-safe backing-file cleanup.
 
 #include "qw3/nvme_kv_tier.hpp"
 
@@ -10,6 +10,8 @@
 #include <future>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace qw3;
 
@@ -47,6 +49,9 @@ static void test_write_read_release() {
     CHECK(t.enabled());
     CHECK(t.drops_page_cache());
     CHECK(t.slot_count() == 4);
+    // The open descriptor remains usable, but the cache has no directory
+    // entry and therefore cannot survive process exit as a stale large file.
+    CHECK(::access(t.path().c_str(), F_OK) != 0);
 
     std::vector<uint8_t> a(64), b(64), out(64);
     for (size_t i = 0; i < a.size(); ++i) {
@@ -66,6 +71,39 @@ static void test_write_read_release() {
     t.release_block(10);
     CHECK(t.block_slot(10) == -1);
     CHECK(t.free_slots() == 4);
+}
+
+static void test_slot_ranges_and_file_names() {
+    NvmeKvTierConfig cfg;
+    cfg.dir = temp_dir();
+    cfg.file_name = "qw3_raw_k_range_test.bin";
+    cfg.total_bytes = 256;
+    cfg.slot_bytes = 128;
+    NvmeKvTier t(cfg);
+    CHECK(t.enabled());
+    CHECK(t.path().find(cfg.file_name) != std::string::npos);
+    CHECK(::access(t.path().c_str(), F_OK) != 0);
+
+    const auto p = t.place_block(7);
+    CHECK(p.slot == 0);
+    std::vector<uint8_t> main(80, 0x31);
+    std::vector<uint8_t> mtp(24, 0x92);
+    std::vector<uint8_t> main_out(main.size(), 0);
+    std::vector<uint8_t> mtp_out(mtp.size(), 0);
+    t.write_slot_range(p.slot, 0, main.data(), main.size());
+    t.write_slot_range(p.slot, 96, mtp.data(), mtp.size());
+    t.read_slot_range(p.slot, 0, main_out.data(), main_out.size());
+    t.read_slot_range(p.slot, 96, mtp_out.data(), mtp_out.size());
+    CHECK(main_out == main);
+    CHECK(mtp_out == mtp);
+
+    bool rejected = false;
+    try {
+        t.read_slot_range(p.slot, 120, mtp_out.data(), mtp_out.size());
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    CHECK(rejected);
 }
 
 static void test_evicting_place() {
@@ -174,6 +212,7 @@ static void test_concurrent_positional_batches() {
 int main() {
     test_disabled();
     test_write_read_release();
+    test_slot_ranges_and_file_names();
     test_evicting_place();
     test_coalesced_batch_io();
     test_concurrent_positional_batches();

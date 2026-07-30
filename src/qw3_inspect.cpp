@@ -11,6 +11,13 @@
 
 namespace {
 
+void print_hex(const std::string &text) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    for (const unsigned char byte : text) {
+        std::cout << kHex[byte >> 4] << kHex[byte & 0x0f];
+    }
+}
+
 void print_value(const qw3::GgufValue &v) {
     using T = qw3::GgufValueType;
     switch (v.type) {
@@ -55,6 +62,8 @@ void print_value(const qw3::GgufValue &v) {
 int main(int argc, char **argv) {
     bool dump_meta = false;
     bool tokenize_stdin = false;
+    bool count_tokens_stdin = false;
+    bool tokenize_pieces_stdin = false;
     std::string path;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -62,21 +71,51 @@ int main(int argc, char **argv) {
             dump_meta = true;
         } else if (a == "--tokenize-stdin") {
             tokenize_stdin = true;
+        } else if (a == "--count-tokens-stdin") {
+            count_tokens_stdin = true;
+        } else if (a == "--tokenize-pieces-stdin") {
+            tokenize_pieces_stdin = true;
         } else {
             path = a;
         }
     }
     if (path.empty()) {
-        std::cerr << "Usage: qw3-inspect [--meta|--tokenize-stdin] MODEL.gguf\n";
+        std::cerr << "Usage: qw3-inspect "
+                     "[--meta|--tokenize-stdin|--count-tokens-stdin|"
+                     "--tokenize-pieces-stdin] "
+                     "MODEL.gguf\n";
         return 2;
     }
     try {
-        if (tokenize_stdin) {
+        if (tokenize_stdin || count_tokens_stdin || tokenize_pieces_stdin) {
             const qw3::GgufFile gguf(path);
             const qw3::QwenTokenizer tokenizer(gguf);
             const std::string input((std::istreambuf_iterator<char>(std::cin)),
                                     std::istreambuf_iterator<char>());
             const std::vector<int32_t> ids = tokenizer.encode(input);
+            if (count_tokens_stdin) {
+                std::cout << ids.size() << '\n';
+                return 0;
+            }
+            if (tokenize_pieces_stdin) {
+                size_t byte_offset = 0;
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    const std::string piece = tokenizer.decode_one(ids[i]);
+                    std::cout << i << '\t' << ids[i] << '\t'
+                              << byte_offset << '\t'
+                              << byte_offset + piece.size() << '\t';
+                    print_hex(piece);
+                    std::cout << '\n';
+                    byte_offset += piece.size();
+                }
+                if (byte_offset != input.size()) {
+                    std::cerr << "qw3-inspect: decoded token pieces cover "
+                              << byte_offset << " bytes, input has "
+                              << input.size() << " bytes\n";
+                    return 1;
+                }
+                return 0;
+            }
             std::cout << '[';
             for (size_t i = 0; i < ids.size(); ++i) {
                 if (i) std::cout << ',';

@@ -112,8 +112,25 @@ void usage(std::ostream &os) {
         "                        Default: retrieval.\n"
         "  --kvmem-select-policy M  Selection policy: topk|quota. Default: topk.\n"
         "  --kvmem-retrieval-method M  Query-conditioned scorer: mean-k|per-token|\n"
-        "                        sub-block-mean-k. Default: mean-k\n"
+        "                        sub-block-mean-k|key-direction-fixed4.\n"
+        "                        The fixed4 method clusters each 32-token block's\n"
+        "                        content Keys into four direction prototypes.\n"
+        "                        Default: mean-k\n"
         "                        (needs --kvmem-query-conditioned).\n"
+        "  --kvmem-index-placement P  Mean-K index placement: gpu|cpu.\n"
+        "                        CPU mode streams the exact FP16 index through\n"
+        "                        bounded GPU staging. Default: gpu.\n"
+        "  --kvmem-index-staging-mb N  Per-slot CPU/GPU mean-K staging size.\n"
+        "                        Two slots are allocated. Default: 64 MiB.\n"
+        "  --kvmem-semantic-expansion M  Complete-group materialization:\n"
+        "                        none|round|message. Message spans are derived from\n"
+        "                        Chat messages or supplied by flattened benchmarks.\n"
+        "  --kvmem-group-score-reduce M  Logical-group score: max or\n"
+        "                        length-normalized-mass. Default: max.\n"
+        "  --kvmem-group-length-alpha F  Length exponent for normalized mass.\n"
+        "                        0=raw mass, 1=mean density. Default: 0.5.\n"
+        "  --kvmem-round-retrieval  Compatibility alias for\n"
+        "                        --kvmem-semantic-expansion round.\n"
 #if 0  // Experimental DeltaNet retrieval is archived; see docs/kvmem_deltanet_retrieval_experimental.md.
         "  --kvmem-deltanet-layers N  DeltaNet-retrieval layer count (0 = derive from\n"
         "                        --kvmem-deltanet-mem-budget-gb). deltanet method only.\n"
@@ -154,6 +171,9 @@ void usage(std::ostream &os) {
         "  --kvmem-nvme-dir DIR  Directory for KVMem NVMe backing file.\n"
         "  --kvmem-nvme-gb F     NVMe tier budget in GiB. Requires --kvmem-nvme-dir.\n"
         "  --kvmem-nvme-bytes N  NVMe tier budget in bytes (legacy alias).\n"
+        "  --kvmem-raw-k-nvme    Reserve NVMe capacity for immutable raw-K and use\n"
+        "                        CPU raw-K chunks as a bounded cache. Default: off.\n"
+        "  --no-kvmem-raw-k-nvme Keep the complete raw-K authority in CPU memory.\n"
         "  --kvmem-prefix-cache  Serve plain (non-CB) route only: keep the shared\n"
         "                        executor warm across requests and prefill only the\n"
         "                        new suffix when a prompt strictly extends the prior\n"
@@ -471,10 +491,28 @@ int main(int argc, char **argv) {
                 engine.kvmem_retrieval_method = need(arg);
                 if (engine.kvmem_retrieval_method != "mean-k" &&
                     engine.kvmem_retrieval_method != "per-token" &&
-                    engine.kvmem_retrieval_method != "sub-block-mean-k") {
+                    engine.kvmem_retrieval_method != "sub-block-mean-k" &&
+                    engine.kvmem_retrieval_method !=
+                        "key-direction-fixed4") {
                     throw std::runtime_error(
                         "--kvmem-retrieval-method must be "
-                        "mean-k|per-token|sub-block-mean-k");
+                        "mean-k|per-token|sub-block-mean-k|"
+                        "key-direction-fixed4");
+                }
+            } else if (arg == "--kvmem-index-placement") {
+                engine.kvmem_index_placement = need(arg);
+                if (engine.kvmem_index_placement != "gpu" &&
+                    engine.kvmem_index_placement != "cpu") {
+                    throw std::runtime_error(
+                        "--kvmem-index-placement must be gpu|cpu");
+                }
+            } else if (arg == "--kvmem-index-staging-mb") {
+                engine.kvmem_index_staging_mb =
+                    parse_int(need(arg), arg);
+                if (engine.kvmem_index_staging_mb <= 0 ||
+                    engine.kvmem_index_staging_mb > 4096) {
+                    throw std::runtime_error(
+                        "--kvmem-index-staging-mb must be in [1,4096]");
                 }
 #if 0  // Archived experimental CLI; implementation remains for future research.
             } else if (arg == "--kvmem-deltanet-layers") {
@@ -508,6 +546,40 @@ int main(int argc, char **argv) {
                     engine.kvmem_subblock_reduce != "sum") {
                     throw std::runtime_error(
                         "--kvmem-subblock-reduce must be max|sum");
+                }
+            } else if (arg == "--kvmem-round-retrieval") {
+                if (engine.kvmem_semantic_expansion != "none" &&
+                    engine.kvmem_semantic_expansion != "round") {
+                    throw std::runtime_error(
+                        "--kvmem-round-retrieval conflicts with "
+                        "--kvmem-semantic-expansion message");
+                }
+                engine.kvmem_semantic_expansion = "round";
+            } else if (arg == "--kvmem-semantic-expansion") {
+                engine.kvmem_semantic_expansion = need(arg);
+                if (engine.kvmem_semantic_expansion != "none" &&
+                    engine.kvmem_semantic_expansion != "round" &&
+                    engine.kvmem_semantic_expansion != "message") {
+                    throw std::runtime_error(
+                        "--kvmem-semantic-expansion must be "
+                        "none|round|message");
+                }
+            } else if (arg == "--kvmem-group-score-reduce") {
+                engine.kvmem_group_score_reduce = need(arg);
+                if (engine.kvmem_group_score_reduce != "max" &&
+                    engine.kvmem_group_score_reduce !=
+                        "length-normalized-mass") {
+                    throw std::runtime_error(
+                        "--kvmem-group-score-reduce must be "
+                        "max|length-normalized-mass");
+                }
+            } else if (arg == "--kvmem-group-length-alpha") {
+                engine.kvmem_group_length_alpha =
+                    parse_float(need(arg), arg);
+                if (engine.kvmem_group_length_alpha < 0.0 ||
+                    engine.kvmem_group_length_alpha > 1.0) {
+                    throw std::runtime_error(
+                        "--kvmem-group-length-alpha must be in [0,1]");
                 }
             } else if (arg == "--kvmem-update-mode") {
                 engine.kvmem_update_mode = need(arg);
@@ -571,6 +643,10 @@ int main(int argc, char **argv) {
                 engine.kvmem_nvme_bytes = parse_gib_bytes(need(arg), arg);
             } else if (arg == "--kvmem-nvme-bytes") {
                 engine.kvmem_nvme_bytes = parse_u64(need(arg), arg);
+            } else if (arg == "--kvmem-raw-k-nvme") {
+                engine.kvmem_raw_k_nvme = true;
+            } else if (arg == "--no-kvmem-raw-k-nvme") {
+                engine.kvmem_raw_k_nvme = false;
             } else if (arg == "--verbose") {
                 engine.verbose = true;
             } else if (arg == "-p" || arg == "--prompt") {

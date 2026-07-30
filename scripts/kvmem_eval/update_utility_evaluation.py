@@ -60,6 +60,8 @@ PARAM_KEYS = (
     "mtp",
     "mtp_chain",
     "subblock",
+    "round_retrieval",
+    "round_padding",
     "recent_blocks",
     "sink_blocks",
     "transcript_replay",
@@ -200,6 +202,15 @@ def extract_params(*configs: dict[str, Any]) -> dict[str, Any]:
         "enable_thinking": ("enable_thinking", "thinking"),
         "immutable_kv": ("immutable_kv", "immutable"),
         "mtp_chain": ("mtp_chain", "mtp_chain_length"),
+        "round_retrieval": (
+            "round_retrieval",
+            "kvmem_round_retrieval",
+            "kvmem_round_only",
+        ),
+        "round_padding": (
+            "round_padding",
+            "kvmem_round_padding",
+        ),
     }
     for config in configs:
         if not isinstance(config, dict):
@@ -415,6 +426,8 @@ def parse_log_params(path: Path | None) -> dict[str, Any]:
         "retrieval_method": re.compile(r"kvmem_retrieval_method=([A-Za-z0-9_-]+)"),
         "optimization_level": re.compile(r"kvmem_optimization_level=([A-Za-z0-9_-]+)"),
         "gpu_memory_utilization": re.compile(r"gpu_(?:memory_)?(?:utilization|ratio)=([0-9.]+)"),
+        "round_retrieval": re.compile(r"kvmem_round_retrieval=(\d+)"),
+        "subblock": re.compile(r"\[bs-subblock\].*n_subblocks=(\d+)"),
     }
     try:
         with path.open(encoding="utf-8", errors="replace") as stream:
@@ -425,9 +438,15 @@ def parse_log_params(path: Path | None) -> dict[str, Any]:
                     match = regex.search(line)
                     if match:
                         raw = match.group(1)
-                        params[key] = float(raw) if "." in raw and raw.replace(".", "", 1).isdigit() else (
-                            int(raw) if raw.isdigit() else raw
-                        )
+                        if key == "round_retrieval":
+                            params[key] = raw == "1"
+                        else:
+                            params[key] = (
+                                float(raw)
+                                if "." in raw
+                                and raw.replace(".", "", 1).isdigit()
+                                else int(raw) if raw.isdigit() else raw
+                            )
     except OSError:
         return {}
     return params
@@ -564,9 +583,12 @@ def parse_flat_summary(
 
 
 def parse_agent_dir(
-    directory: Path, logs: dict[str, Path], manifests: dict[str, Path]
+    directory: Path,
+    logs: dict[str, Path],
+    manifests: dict[str, Path],
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    run_id = directory.name
+    run_id = run_id or directory.name
     config_path = directory / "run_config.json"
     summary_path = directory / "accuracy_summary.json"
     eval_path = directory / "eval.jsonl"
@@ -811,9 +833,18 @@ def collect(
             artifact = canonical_path(value)
             if artifact:
                 covered.add(artifact)
-    agent_dirs = sorted({path.parent for path in results_root.glob("*/accuracy_summary.json")})
+    # A/B launchers may keep each independently valid arm one directory below
+    # a shared experiment root.  Discover exactly one extra level while
+    # deliberately excluding deeper per-sample replay trees.
+    agent_dirs = sorted({
+        path.parent
+        for pattern in ("*/accuracy_summary.json", "*/*/accuracy_summary.json")
+        for path in results_root.glob(pattern)
+    })
     for directory in agent_dirs:
-        row = parse_agent_dir(directory, logs, manifests)
+        relative_parts = directory.relative_to(results_root).parts
+        run_id = "_".join(relative_parts)
+        row = parse_agent_dir(directory, logs, manifests, run_id)
         rows.append(row)
         for value in row["artifacts"].values():
             artifact = canonical_path(value)
@@ -937,6 +968,8 @@ def compact_params(params: dict[str, Any]) -> str:
         ("immutable_kv", "immutable"),
         ("mtp", "MTP"),
         ("subblock", "subblock"),
+        ("round_retrieval", "round-only"),
+        ("round_padding", "round-pad"),
     ):
         value = params.get(key)
         if value is True:

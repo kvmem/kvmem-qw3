@@ -1343,6 +1343,36 @@ public:
         return {false, "block_kmean_content_batch_device requires backend override"};
     }
 
+    // Hierarchical Fixed-4 non-contiguous Key-direction prototypes. Split each
+    // logical block into contiguous 32-token slices; for every slice,
+    // normal-attention layer, and KV head, de-RoPE the freshly produced Keys,
+    // choose four farthest-first cosine directions, assign every token to its
+    // nearest direction, and store the four cluster means in the same layout
+    // consumed by the existing sub-block scorer. Experimental CUDA path.
+    virtual DeviceStatus block_kdirection_fixed4_batch_device(
+            const DeviceTensor &k_batch,
+            DeviceTensor &kbar,
+            uint64_t kbar_block_base,
+            uint32_t n_blocks_chunk,
+            uint32_t k_stride,
+            uint32_t batch,
+            uint32_t blk_tokens,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            uint32_t rope_dim,
+            int32_t rope_base,
+            float theta,
+            uint32_t src_row_off = 0) {
+        (void)k_batch; (void)kbar; (void)kbar_block_base;
+        (void)n_blocks_chunk; (void)k_stride; (void)batch;
+        (void)blk_tokens; (void)n_kv_heads; (void)head_dim;
+        (void)rope_dim; (void)rope_base; (void)theta;
+        (void)src_row_off;
+        return {
+            false,
+            "block_kdirection_fixed4_batch_device requires backend override"};
+    }
+
     // Incremental counterpart used when a logical block is produced by several
     // prefill calls (multi-turn transcript replay / resumed sessions). The first
     // input row belongs at `first_block_token_offset` in the first destination
@@ -1483,6 +1513,170 @@ public:
         (void)n_subblocks; (void)reduce_max; (void)accumulate; (void)q_elem_off;
         (void)kbar_elem_off;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
+    }
+
+
+    // Variable-length logical-group variant used by semantic retrieval.
+    // Fine-grained logits and the global softmax are identical to
+    // block_attn_score_softmax_pages_device. For every query
+    // (layer,token,head), however, the device either takes a MaxSim or sums the
+    // normalized attention mass over each group's half-open flattened sub-block
+    // range [group_begin[g],group_end[g]). Length normalization is applied by
+    // the executor after this raw group reduction.
+    virtual DeviceStatus block_attn_score_softmax_groups_device(
+        DeviceTensor &score,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &kbar_multi,
+        const DeviceTensor &group_begin,
+        const DeviceTensor &group_end,
+        uint32_t n_groups,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t n_blocks,
+        uint32_t kbar_layer_stride,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end = 0,
+        uint32_t excl_hi_begin = UINT32_MAX,
+        uint32_t n_subblocks = 1,
+        uint32_t group_reduce_mass = 0,
+        uint32_t accumulate = 0,
+        uint64_t q_elem_off = 0,
+        uint64_t kbar_elem_off = 0) {
+        (void)score; (void)q_multi; (void)kbar_multi;
+        (void)group_begin; (void)group_end; (void)n_groups;
+        (void)n_layers; (void)n_tokens; (void)q_layer_stride;
+        (void)n_blocks; (void)kbar_layer_stride; (void)n_heads;
+        (void)n_kv_heads; (void)head_dim; (void)scale;
+        (void)excl_lo_end; (void)excl_hi_begin; (void)n_subblocks;
+        (void)group_reduce_mass;
+        (void)accumulate; (void)q_elem_off; (void)kbar_elem_off;
+        return {false,
+                "block_attn_score_softmax_groups_device requires backend override"};
+    }
+
+    // Exact CPU-streamed mean-K scoring primitives. The full index remains in
+    // host memory; callers copy one [L,tile_blocks,n_subblocks,Hkv,D] tile into
+    // kbar_tile and invoke these methods in two passes. Pass 1 online-merges
+    // per-distribution log-sum-exp state across tiles. Pass 2 recomputes the
+    // dots and writes normalized block scores at global_block_base.
+    virtual DeviceStatus block_attn_stream_lse_device(
+        DeviceTensor &global_max,
+        DeviceTensor &global_sum,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &kbar_tile,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t tile_blocks,
+        uint32_t kbar_layer_stride,
+        uint32_t global_block_base,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin,
+        uint32_t n_subblocks,
+        uint32_t initialize) {
+        (void)global_max; (void)global_sum; (void)q_multi; (void)kbar_tile;
+        (void)n_layers; (void)n_tokens; (void)q_layer_stride;
+        (void)tile_blocks; (void)kbar_layer_stride;
+        (void)global_block_base; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale; (void)excl_lo_end;
+        (void)excl_hi_begin; (void)n_subblocks; (void)initialize;
+        return {false,
+                "block_attn_stream_lse_device requires backend override"};
+    }
+
+    virtual DeviceStatus block_attn_stream_score_device(
+        DeviceTensor &score,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &kbar_tile,
+        const DeviceTensor &global_max,
+        const DeviceTensor &global_sum,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t tile_blocks,
+        uint32_t kbar_layer_stride,
+        uint32_t global_block_base,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin,
+        uint32_t n_subblocks,
+        uint32_t reduce_max,
+        uint32_t accumulate) {
+        (void)score; (void)q_multi; (void)kbar_tile;
+        (void)global_max; (void)global_sum; (void)n_layers;
+        (void)n_tokens; (void)q_layer_stride; (void)tile_blocks;
+        (void)kbar_layer_stride; (void)global_block_base;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim;
+        (void)scale; (void)excl_lo_end; (void)excl_hi_begin;
+        (void)n_subblocks; (void)reduce_max; (void)accumulate;
+        return {false,
+                "block_attn_stream_score_device requires backend override"};
+    }
+
+    // Semantic-group pass-2 counterpart. group_dist is
+    // [n_groups, n_layers*n_tokens*n_heads] fp32 and is zeroed by the caller
+    // before the first tile. Each tile updates either the probability sum or
+    // MaxSim value for every (group,distribution); finalize reduces the
+    // distribution dimension into the ordinary per-group score vector.
+    virtual DeviceStatus block_attn_stream_group_update_device(
+        DeviceTensor &group_dist,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &kbar_tile,
+        const DeviceTensor &global_max,
+        const DeviceTensor &global_sum,
+        const DeviceTensor &group_begin,
+        const DeviceTensor &group_end,
+        uint32_t n_groups,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t tile_blocks,
+        uint32_t kbar_layer_stride,
+        uint32_t global_block_base,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end,
+        uint32_t excl_hi_begin,
+        uint32_t n_subblocks,
+        uint32_t group_reduce_mass) {
+        (void)group_dist; (void)q_multi; (void)kbar_tile;
+        (void)global_max; (void)global_sum;
+        (void)group_begin; (void)group_end; (void)n_groups;
+        (void)n_layers; (void)n_tokens; (void)q_layer_stride;
+        (void)tile_blocks; (void)kbar_layer_stride;
+        (void)global_block_base; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale; (void)excl_lo_end;
+        (void)excl_hi_begin; (void)n_subblocks;
+        (void)group_reduce_mass;
+        return {false,
+                "block_attn_stream_group_update_device requires backend override"};
+    }
+
+    virtual DeviceStatus block_attn_stream_group_finalize_device(
+        DeviceTensor &score,
+        const DeviceTensor &group_dist,
+        uint32_t n_groups,
+        uint32_t n_distributions,
+        float distribution_weight,
+        uint32_t accumulate) {
+        (void)score; (void)group_dist; (void)n_groups;
+        (void)n_distributions; (void)distribution_weight;
+        (void)accumulate;
+        return {false,
+                "block_attn_stream_group_finalize_device requires backend override"};
     }
 
     // deltanet_pack_query_device: pack one DeltaNet layer's in-span query rows

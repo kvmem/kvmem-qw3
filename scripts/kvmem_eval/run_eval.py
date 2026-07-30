@@ -28,12 +28,20 @@ try:
     from .client import Qw3Client
     from .dataset import QUESTION_TYPES, build_subset, load_all
     from .judge import DeepSeekJudge
-    from .prompt import render_messages, render_transcript_messages
+    from .prompt import (
+        render_messages,
+        render_messages_with_group_spans,
+        render_transcript_messages,
+    )
 except ImportError:  # allow running as a loose module
     from client import Qw3Client  # type: ignore
     from dataset import QUESTION_TYPES, build_subset, load_all  # type: ignore
     from judge import DeepSeekJudge  # type: ignore
-    from prompt import render_messages, render_transcript_messages  # type: ignore
+    from prompt import (  # type: ignore
+        render_messages,
+        render_messages_with_group_spans,
+        render_transcript_messages,
+    )
 
 
 # Overall reference baselines from docs/motivation_experiment_summary_en.md §4.1
@@ -79,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         help="experimental role-preserving LongMemEval replay: after the "
              "KVMem pressure threshold, reselect at every user query and "
              "teacher-force the recorded assistant responses")
+    ap.add_argument(
+        "--kvmem-message-expansion", action="store_true",
+        help="keep the standard flattened LongMemEval prompt unchanged, but "
+             "send each original history turn as an explicit KVMem semantic "
+             "retrieval group (requires a message-expansion server)")
     ap.add_argument("--read-timeout", type=float, default=3600.0)
     ap.add_argument("--tag", default="kvmem",
                     help="label embedded in the output filenames")
@@ -97,6 +110,11 @@ def select_samples(subset, args):
 
 def main() -> int:
     args = parse_args()
+    if args.transcript_replay and args.kvmem_message_expansion:
+        raise SystemExit(
+            "--transcript-replay and --kvmem-message-expansion are mutually "
+            "exclusive: the former changes request lifecycle while the latter "
+            "is a controlled one-shot prompt experiment")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     loaded = load_all(args.data)
@@ -146,8 +164,14 @@ def main() -> int:
     with jsonl_path.open("w", encoding="utf-8") as out, \
             hyp_path.open("w", encoding="utf-8") as hyp_out:
         for pos, (idx, s) in enumerate(samples):
-            messages = (render_transcript_messages(s) if args.transcript_replay
-                        else render_messages(s))
+            retrieval_group_spans = None
+            if args.transcript_replay:
+                messages = render_transcript_messages(s)
+            elif args.kvmem_message_expansion:
+                messages, retrieval_group_spans = (
+                    render_messages_with_group_spans(s))
+            else:
+                messages = render_messages(s)
             extra_body = None
             if args.transcript_replay:
                 extra_body = {
@@ -166,6 +190,11 @@ def main() -> int:
                         "content_start": question_begin,
                         "content_end": question_begin + len(s.question),
                     }
+            elif retrieval_group_spans is not None:
+                extra_body = {
+                    "kvmem_trace_tag": f"lme-{s.question_id}",
+                    "kvmem_retrieval_group_spans": retrieval_group_spans,
+                }
             res = client.chat(messages, extra_body=extra_body)
             total_by_type[s.question_type] = total_by_type.get(s.question_type, 0) + 1
 
@@ -211,6 +240,10 @@ def main() -> int:
                 "prompt_tokens": res.prompt_tokens,
                 "completion_tokens": res.completion_tokens,
                 "client_error": res.error,
+                "kvmem_message_expansion": args.kvmem_message_expansion,
+                "kvmem_semantic_groups": (
+                    len(retrieval_group_spans)
+                    if retrieval_group_spans is not None else None),
             }
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             out.flush()
@@ -250,6 +283,7 @@ def main() -> int:
         "top_p": args.top_p,
         "max_tokens": args.max_tokens,
         "transcript_replay": args.transcript_replay,
+        "kvmem_message_expansion": args.kvmem_message_expansion,
         "judged": judge is not None,
         "judge_model": (judge.model if judge is not None else None),
         "n_samples": n_done,

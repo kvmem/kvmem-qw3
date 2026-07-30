@@ -1328,6 +1328,7 @@ std::string render_messages(
                     i, role, segment_begin, prompt.size(), 0, 0});
             }
         } else if (role == "tool") {
+            const size_t segment_begin = prompt.size();
             const bool prev_tool =
                 i > 0 && messages[i - 1].is_object() &&
                 messages[i - 1].value("role", "") == "tool";
@@ -1335,8 +1336,17 @@ std::string render_messages(
                 i + 1 < messages.size() && messages[i + 1].is_object() &&
                 messages[i + 1].value("role", "") == "tool";
             if (!prev_tool) prompt += "<|im_start|>user";
-            prompt += "\n<tool_response>\n" + content + "\n</tool_response>";
+            prompt += "\n<tool_response>\n";
+            const size_t content_begin = prompt.size();
+            prompt += content;
+            const size_t content_end = prompt.size();
+            prompt += "\n</tool_response>";
             if (!next_tool) prompt += "<|im_end|>\n";
+            if (message_spans) {
+                message_spans->push_back(RenderedMessageSpan{
+                    i, role, segment_begin, prompt.size(), content_begin,
+                    content_end});
+            }
         }
     }
 
@@ -1649,10 +1659,23 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << yesno(engine.kvmem_recompute_query) << "\n"
               << "  kvmem_immutable_k="
               << yesno(engine.kvmem_immutable_source_k) << "\n"
+              << "  kvmem_raw_k_nvme="
+              << yesno(engine.kvmem_raw_k_nvme) << "\n"
               << "  kvmem_query_replay="
               << yesno(cfg.kvmem_query_replay && !cfg.continuous_batching) << "\n"
               << "  kvmem_method=" << engine.kvmem_method << "\n"
               << "  kvmem_retrieval_method=" << engine.kvmem_retrieval_method << "\n"
+              << "  kvmem_index_placement=" << engine.kvmem_index_placement << "\n"
+              << "  kvmem_index_staging_mb="
+              << engine.kvmem_index_staging_mb << "\n"
+              << "  kvmem_semantic_expansion="
+              << engine.kvmem_semantic_expansion << "\n"
+              << "  kvmem_round_retrieval="
+              << yesno(engine.kvmem_semantic_expansion == "round") << "\n"
+              << "  kvmem_group_score_reduce="
+              << engine.kvmem_group_score_reduce << "\n"
+              << "  kvmem_group_length_alpha="
+              << engine.kvmem_group_length_alpha << "\n"
               << "  kvmem_sink="
               << kvmem_keep.sink_effective_tokens << " tokens / "
               << kvmem_keep.sink_blocks << " blocks"
@@ -2111,13 +2134,21 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
         std::vector<RenderedMessageSpan> rendered_message_spans;
+        const bool explicit_retrieval_groups =
+            req.contains("kvmem_retrieval_group_spans");
+        const bool auto_message_groups =
+            engine.kvmem_semantic_expansion == "message" &&
+            !explicit_retrieval_groups;
+        const bool map_retrieval_groups =
+            explicit_retrieval_groups || auto_message_groups;
         const std::string prompt = render_messages(
             req["messages"], tools, enable_thinking, forced_tool_name,
-            transcript_replay ? &rendered_message_spans : nullptr,
+            (transcript_replay || map_retrieval_groups)
+                ? &rendered_message_spans : nullptr,
             /*add_generation_prompt=*/!prefill_only);
-        const std::vector<int32_t> prompt_token_ids =
+        std::vector<int32_t> prompt_token_ids =
             usage_tokenizer.encode(prompt);
-        const size_t prompt_token_count = prompt_token_ids.size();
+        size_t prompt_token_count = prompt_token_ids.size();
         if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
             set_error_response(
                 res,
@@ -2133,6 +2164,233 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.kvmem_reselect_mode = kvmem_reselect_mode;
         g.kvmem_prefill_window_mode = kvmem_prefill_window_mode;
         g.kvmem_session_id = kvmem_session_id;
+
+        // Optional semantic retrieval groups. Flattened benchmarks supply byte
+        // spans inside one user message; ordinary Chat requests in message mode
+        // derive complete rendered-message spans automatically. All boundaries
+        // are mapped to prompt tokens in one O(prompt_tokens) decode pass.
+        if (map_retrieval_groups) {
+            if (!engine.kvmem_enabled ||
+                engine.kvmem_semantic_expansion == "none") {
+                set_error_response(
+                    res, 400,
+                    "kvmem_retrieval_group_spans requires --kvmem and "
+                    "--kvmem-semantic-expansion round|message");
+                return;
+            }
+
+            struct RequestedGroup {
+                size_t begin = 0;
+                size_t end = 0;
+            };
+            std::vector<RequestedGroup> requested;
+            if (explicit_retrieval_groups) {
+                const json &spans =
+                    req["kvmem_retrieval_group_spans"];
+                if (!spans.is_array() || spans.empty() ||
+                    spans.size() > 65535) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_retrieval_group_spans must be an array of "
+                        "1..65535 spans");
+                    return;
+                }
+                requested.reserve(spans.size());
+                size_t previous_abs_end = 0;
+                for (const json &span : spans) {
+                    if (!span.is_object() ||
+                        !span.contains("message_index") ||
+                        !span.contains("content_start") ||
+                        !span.contains("content_end") ||
+                        !span["message_index"].is_number_integer() ||
+                        !span["content_start"].is_number_integer() ||
+                        !span["content_end"].is_number_integer()) {
+                        set_error_response(
+                            res, 400,
+                            "each kvmem_retrieval_group_spans entry requires "
+                            "integer message_index, content_start, and "
+                            "content_end");
+                        return;
+                    }
+                    const int64_t message_index =
+                        span["message_index"].get<int64_t>();
+                    const int64_t content_start =
+                        span["content_start"].get<int64_t>();
+                    const int64_t content_end =
+                        span["content_end"].get<int64_t>();
+                    if (message_index < 0 ||
+                        message_index >=
+                            static_cast<int64_t>(req["messages"].size()) ||
+                        content_start < 0 || content_end <= content_start) {
+                        set_error_response(
+                            res, 400,
+                            "kvmem retrieval group content span is invalid");
+                        return;
+                    }
+                    const RenderedMessageSpan *rendered = nullptr;
+                    for (const RenderedMessageSpan &candidate :
+                         rendered_message_spans) {
+                        if (candidate.message_index ==
+                            static_cast<size_t>(message_index)) {
+                            rendered = &candidate;
+                            break;
+                        }
+                    }
+                    const json &message =
+                        req["messages"][static_cast<size_t>(message_index)];
+                    if (!rendered || rendered->role != "user" ||
+                        !message.is_object() ||
+                        !message.contains("content") ||
+                        !message["content"].is_string()) {
+                        set_error_response(
+                            res, 400,
+                            "explicit retrieval groups currently require "
+                            "spans inside string-content user messages");
+                        return;
+                    }
+                    const std::string raw_content =
+                        message["content"].get<std::string>();
+                    size_t trim_begin = 0;
+                    while (trim_begin < raw_content.size() &&
+                           (raw_content[trim_begin] == ' ' ||
+                            raw_content[trim_begin] == '\n' ||
+                            raw_content[trim_begin] == '\r' ||
+                            raw_content[trim_begin] == '\t')) {
+                        ++trim_begin;
+                    }
+                    size_t trim_end = raw_content.size();
+                    while (trim_end > trim_begin &&
+                           (raw_content[trim_end - 1] == ' ' ||
+                            raw_content[trim_end - 1] == '\n' ||
+                            raw_content[trim_end - 1] == '\r' ||
+                            raw_content[trim_end - 1] == '\t')) {
+                        --trim_end;
+                    }
+                    if (content_start <
+                            static_cast<int64_t>(trim_begin) ||
+                        content_end >
+                            static_cast<int64_t>(trim_end)) {
+                        set_error_response(
+                            res, 400,
+                            "kvmem retrieval group span falls in whitespace "
+                            "removed by the chat renderer");
+                        return;
+                    }
+                    const size_t abs_begin =
+                        rendered->content_begin +
+                        static_cast<size_t>(content_start) - trim_begin;
+                    const size_t abs_end =
+                        rendered->content_begin +
+                        static_cast<size_t>(content_end) - trim_begin;
+                    if (abs_end > rendered->content_end ||
+                        (!requested.empty() &&
+                         abs_begin < previous_abs_end)) {
+                        set_error_response(
+                            res, 400,
+                            "kvmem retrieval group spans must be sorted and "
+                            "non-overlapping in rendered prompt order");
+                        return;
+                    }
+                    requested.push_back({abs_begin, abs_end});
+                    previous_abs_end = abs_end;
+                }
+            } else {
+                const size_t final_query =
+                    last_query_index_for_template(req["messages"]);
+                requested.reserve(rendered_message_spans.size());
+                for (const RenderedMessageSpan &span :
+                     rendered_message_spans) {
+                    // The final user query is pinned/replayed independently and
+                    // must not become a historical retrieval candidate.
+                    if (span.message_index >= final_query ||
+                        span.segment_end <= span.segment_begin) {
+                        continue;
+                    }
+                    requested.push_back(
+                        {span.segment_begin, span.segment_end});
+                }
+                if (requested.empty()) {
+                    set_error_response(
+                        res, 400,
+                        "message semantic expansion found no historical "
+                        "messages; flattened prompts must provide "
+                        "kvmem_retrieval_group_spans");
+                    return;
+                }
+            }
+
+            std::vector<size_t> token_bytes;
+            token_bytes.reserve(prompt_token_ids.size() + 1);
+            token_bytes.push_back(0);
+            size_t decoded_bytes = 0;
+            bool decode_matches = true;
+            for (int32_t token : prompt_token_ids) {
+                const std::string piece =
+                    usage_tokenizer.decode_one(token);
+                if (decoded_bytes + piece.size() > prompt.size() ||
+                    prompt.compare(decoded_bytes, piece.size(), piece) != 0) {
+                    decode_matches = false;
+                    break;
+                }
+                decoded_bytes += piece.size();
+                token_bytes.push_back(decoded_bytes);
+            }
+            if (!decode_matches || decoded_bytes != prompt.size()) {
+                set_error_response(
+                    res, 500,
+                    "could not map semantic group byte spans through tokenizer "
+                    "pieces exactly");
+                return;
+            }
+
+            uint32_t rounded_boundaries = 0;
+            for (const RequestedGroup &group : requested) {
+                const auto begin_it = std::upper_bound(
+                    token_bytes.begin(), token_bytes.end(),
+                    group.begin);
+                const size_t token_begin =
+                    begin_it == token_bytes.begin()
+                        ? 0
+                        : static_cast<size_t>(
+                              begin_it - token_bytes.begin() - 1);
+                const auto end_it = std::lower_bound(
+                    token_bytes.begin(), token_bytes.end(),
+                    group.end);
+                const size_t token_end = static_cast<size_t>(
+                    end_it - token_bytes.begin());
+                if (token_begin >= token_end ||
+                    token_end > prompt_token_ids.size()) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem retrieval group maps to an empty token span");
+                    return;
+                }
+                rounded_boundaries +=
+                    token_bytes[token_begin] == group.begin ? 0u : 1u;
+                rounded_boundaries +=
+                    token_bytes[token_end] == group.end ? 0u : 1u;
+                const uint32_t begin_u32 =
+                    static_cast<uint32_t>(token_begin);
+                const uint32_t end_u32 =
+                    static_cast<uint32_t>(token_end);
+                // Outward rounding can make two adjacent byte groups overlap
+                // by one BPE token. Preserve that bounded overlap for scoring;
+                // only the original byte spans are required to be disjoint.
+                g.kvmem_retrieval_group_spans.push_back(
+                    GenerationOptions::KvMemRetrievalGroupSpan{
+                        begin_u32, end_u32});
+            }
+            std::cerr
+                << "[qw3-serve] KVMem semantic retrieval mode="
+                << engine.kvmem_semantic_expansion << " groups="
+                << g.kvmem_retrieval_group_spans.size()
+                << " rounded_boundaries=" << rounded_boundaries
+                << " token_span=["
+                << g.kvmem_retrieval_group_spans.front().begin
+                << ","
+                << g.kvmem_retrieval_group_spans.back().end
+                << ") prompt_tokens=" << prompt_token_count << "\n";
+        }
 
         // One-shot selected-context cache refresh ablation. This never uses
         // trace dumps or cross-request artifacts: the native backend performs
@@ -2738,6 +2996,248 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 }
             }
         }
+
+        // Controlled round-alignment experiment. The request's byte spans are
+        // first mapped through the canonical, unmodified prompt above so query
+        // and group coordinates remain auditable. We then insert an ordinary
+        // newline token before the first round (to align its absolute start)
+        // and after every real round (to align the next start). Group score
+        // spans continue to cover only real source tokens; fixed-block
+        // materialization naturally includes the trailing newline fillers but
+        // can no longer include tokens from the adjacent round.
+        //
+        // This is intentionally an exact-token override rather than appending
+        // newline text and re-tokenizing: BPE could merge textual whitespace
+        // and silently produce a different filler count. It is standalone and
+        // opt-in because the filler tokens are visible to the model (there is
+        // no internal causal-padding mask) and therefore form an accuracy
+        // ablation, not an API formatting default.
+        if (req.contains("kvmem_round_padding")) {
+            if (!req["kvmem_round_padding"].is_number_integer()) {
+                set_error_response(
+                    res, 400, "kvmem_round_padding must be an integer");
+                return;
+            }
+            const int64_t requested_alignment =
+                req["kvmem_round_padding"].get<int64_t>();
+            if (requested_alignment <= 0 ||
+                requested_alignment >
+                    static_cast<int64_t>(
+                        std::numeric_limits<uint32_t>::max())) {
+                set_error_response(
+                    res, 400, "kvmem_round_padding must be positive");
+                return;
+            }
+            if (!map_retrieval_groups ||
+                g.kvmem_retrieval_group_spans.empty()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_round_padding requires "
+                    "kvmem_retrieval_group_spans");
+                return;
+            }
+            if (requested_alignment != engine.kvmem_block_tokens) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_round_padding must equal --kvmem-block-tokens "
+                    "for exclusive round blocks");
+                return;
+            }
+            if (transcript_replay || kvmem_session_request ||
+                req.contains("kvmem_oracle_token_spans") ||
+                req.contains("kvmem_inline_refresh")) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_round_padding currently supports only standalone "
+                    "round-retrieval requests without replay/oracle/refresh");
+                return;
+            }
+
+            const std::vector<int32_t> newline_tokens =
+                usage_tokenizer.encode("\n");
+            if (newline_tokens.size() != 1 ||
+                usage_tokenizer.decode_one(newline_tokens.front()) != "\n") {
+                set_error_response(
+                    res, 500,
+                    "tokenizer has no exact one-token newline for "
+                    "kvmem_round_padding");
+                return;
+            }
+            const int32_t newline_token = newline_tokens.front();
+            const uint32_t alignment =
+                static_cast<uint32_t>(requested_alignment);
+            const auto original_groups =
+                g.kvmem_retrieval_group_spans;
+            for (size_t i = 1; i < original_groups.size(); ++i) {
+                if (original_groups[i - 1].end !=
+                    original_groups[i].begin) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_round_padding requires exact, gap-free token "
+                        "round boundaries (no BPE overlap/rounding)");
+                    return;
+                }
+            }
+
+            struct PaddingInsertion {
+                uint32_t original_boundary = 0;
+                uint32_t count = 0;
+            };
+            std::vector<PaddingInsertion> insertions;
+            insertions.reserve(original_groups.size() + 1);
+            std::vector<int32_t> aligned_tokens;
+            const uint64_t worst_extra =
+                static_cast<uint64_t>(original_groups.size() + 1) *
+                (alignment - 1u);
+            if (static_cast<uint64_t>(prompt_token_ids.size()) +
+                    worst_extra >
+                std::numeric_limits<size_t>::max()) {
+                set_error_response(
+                    res, 413, "round padding size overflows host indexing");
+                return;
+            }
+            aligned_tokens.reserve(
+                prompt_token_ids.size() +
+                static_cast<size_t>(worst_extra));
+
+            auto append_source = [&](uint32_t begin, uint32_t end) {
+                aligned_tokens.insert(
+                    aligned_tokens.end(),
+                    prompt_token_ids.begin() +
+                        static_cast<std::ptrdiff_t>(begin),
+                    prompt_token_ids.begin() +
+                        static_cast<std::ptrdiff_t>(end));
+            };
+            auto append_padding = [&](uint32_t original_boundary,
+                                      uint32_t count) {
+                if (count == 0) return;
+                aligned_tokens.insert(
+                    aligned_tokens.end(), count, newline_token);
+                insertions.push_back(
+                    PaddingInsertion{original_boundary, count});
+            };
+
+            const uint32_t first_begin = original_groups.front().begin;
+            const uint32_t last_end = original_groups.back().end;
+            if (last_end > prompt_token_ids.size()) {
+                set_error_response(
+                    res, 500,
+                    "round padding group exceeds the tokenized prompt");
+                return;
+            }
+            append_source(0, first_begin);
+            const uint32_t prefix_padding = static_cast<uint32_t>(
+                (alignment - aligned_tokens.size() % alignment) %
+                alignment);
+            append_padding(first_begin, prefix_padding);
+
+            std::vector<GenerationOptions::KvMemRetrievalGroupSpan>
+                aligned_groups;
+            aligned_groups.reserve(original_groups.size());
+            uint32_t cursor = first_begin;
+            uint64_t round_padding = 0;
+            uint32_t min_padding = alignment;
+            uint32_t max_padding = 0;
+            for (const auto &group : original_groups) {
+                if (group.begin != cursor || group.end <= group.begin ||
+                    group.end > prompt_token_ids.size()) {
+                    set_error_response(
+                        res, 500,
+                        "round padding received inconsistent token groups");
+                    return;
+                }
+                const uint32_t aligned_begin =
+                    static_cast<uint32_t>(aligned_tokens.size());
+                if (aligned_begin % alignment != 0) {
+                    set_error_response(
+                        res, 500,
+                        "round padding failed to align a group start");
+                    return;
+                }
+                append_source(group.begin, group.end);
+                const uint32_t aligned_end =
+                    static_cast<uint32_t>(aligned_tokens.size());
+                aligned_groups.push_back(
+                    GenerationOptions::KvMemRetrievalGroupSpan{
+                        aligned_begin, aligned_end});
+                const uint32_t pad = static_cast<uint32_t>(
+                    (alignment - aligned_tokens.size() % alignment) %
+                    alignment);
+                append_padding(group.end, pad);
+                round_padding += pad;
+                min_padding = std::min(min_padding, pad);
+                max_padding = std::max(max_padding, pad);
+                cursor = group.end;
+            }
+            append_source(last_end,
+                          static_cast<uint32_t>(prompt_token_ids.size()));
+
+            auto map_boundary_after_padding =
+                [&](uint32_t original) -> uint32_t {
+                uint64_t mapped = original;
+                for (const PaddingInsertion &insertion : insertions) {
+                    if (insertion.original_boundary > original) break;
+                    mapped += insertion.count;
+                }
+                if (mapped > std::numeric_limits<uint32_t>::max()) {
+                    throw std::runtime_error(
+                        "round padding mapped token position overflows u32");
+                }
+                return static_cast<uint32_t>(mapped);
+            };
+            if (g.kvmem_query_end > g.kvmem_query_begin) {
+                g.kvmem_query_begin =
+                    map_boundary_after_padding(g.kvmem_query_begin);
+                g.kvmem_query_end =
+                    map_boundary_after_padding(g.kvmem_query_end);
+            }
+            if (g.kvmem_context_end > g.kvmem_context_begin) {
+                g.kvmem_context_begin =
+                    map_boundary_after_padding(g.kvmem_context_begin);
+                g.kvmem_context_end =
+                    map_boundary_after_padding(g.kvmem_context_end);
+            }
+            g.kvmem_retrieval_group_spans =
+                std::move(aligned_groups);
+            prompt_token_ids = std::move(aligned_tokens);
+            prompt_token_count = prompt_token_ids.size();
+            if (prompt_token_count >=
+                static_cast<size_t>(engine.ctx_size)) {
+                set_error_response(
+                    res, 413,
+                    "round-padded prompt exceeds KV context: "
+                    "prompt_tokens=" +
+                        std::to_string(prompt_token_count) +
+                        " ctx=" + std::to_string(engine.ctx_size));
+                return;
+            }
+            const int remaining_ctx = std::max(
+                1, engine.ctx_size -
+                       static_cast<int>(prompt_token_count));
+            if (g.max_tokens > remaining_ctx) {
+                std::cerr
+                    << "[qw3-serve] capping request max_tokens from "
+                    << g.max_tokens << " to " << remaining_ctx
+                    << " after round padding\n";
+                g.max_tokens = remaining_ctx;
+            }
+            g.prompt_token_ids_override.assign(
+                prompt_token_ids.begin(), prompt_token_ids.end());
+            std::cerr
+                << "[qw3-serve] KVMem round padding alignment="
+                << alignment << " newline_token=" << newline_token
+                << " groups=" << original_groups.size()
+                << " prefix_padding=" << prefix_padding
+                << " round_padding=" << round_padding
+                << " per_round_min=" << min_padding
+                << " per_round_max=" << max_padding
+                << " total_added="
+                << (prefix_padding + round_padding)
+                << " prompt_tokens=" << prompt_token_count
+                << " query_span=[" << g.kvmem_query_begin << ","
+                << g.kvmem_query_end << ")\n";
+        }
+
         g.continuous_batching =
             !kvmem_session_request &&
             serve_continuous_batching_enabled() &&

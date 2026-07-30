@@ -5,8 +5,9 @@ The experiment keeps the ordinary KVMem mean-K selection and direct historical
 KV reuse, but forces the complete task-grounded message chain into the same
 fixed selection budget.  Nothing is decoded to text or densely re-prefilled.
 
-This first implementation intentionally supports local-evidence tasks only.
-For Count Frequency(Tool), it forces the contiguous chain:
+This implementation intentionally supports local-evidence tasks only.  For
+Count Frequency(Tool) it forces one contiguous chain, and for Find
+Duplicates(Tool) it forces both target-round chains:
 
     assistant tool call -> tool result -> assistant answer -> Round N feedback
 
@@ -98,11 +99,10 @@ def token_span_for_chars(
     return min(positions), max(positions) + 1
 
 
-def count_frequency_tool_chain(
-    sample: dict[str, Any],
+def round_message_chain(
     records: list[dict[str, Any]],
+    round_number: int,
 ) -> tuple[int, int, dict[str, Any]]:
-    round_number = int(sample["round"])
     feedback = feedback_record(records, round_number)
     tool = preceding_tool(records, feedback)
     record_pos = {
@@ -129,6 +129,40 @@ def count_frequency_tool_chain(
             "feedback_message_index": int(feedback["message_index"]),
         },
     )
+
+
+def sample_field(sample: dict[str, Any], key: str) -> Any:
+    if key in sample:
+        return sample[key]
+    raw = sample.get("raw")
+    if isinstance(raw, dict) and key in raw:
+        return raw[key]
+    raise KeyError(key)
+
+
+def oracle_message_chains(
+    sample: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> list[tuple[int, int, dict[str, Any]]]:
+    task = str(sample.get("task_type") or sample.get("question_type") or "")
+    if task == "Count Frequency(Tool)":
+        rounds = [int(sample_field(sample, "round"))]
+    elif task == "Find Duplicates(Tool)":
+        rounds = [
+            int(sample_field(sample, "i_round")),
+            int(sample_field(sample, "j_round")),
+        ]
+    else:
+        raise RuntimeError(
+            "direct-KV local oracle supports Count Frequency(Tool) and "
+            f"Find Duplicates(Tool), not {task!r}"
+        )
+    chains = [round_message_chain(records, value) for value in rounds]
+    chains.sort(key=lambda item: (item[0], item[1]))
+    for previous, current in zip(chains, chains[1:]):
+        if current[0] < previous[1]:
+            raise RuntimeError("oracle target-round message chains overlap")
+    return chains
 
 
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -201,15 +235,9 @@ def main() -> None:
 
     for index, sid in enumerate(ids, start=1):
         sample = samples[sid]
-        if str(sample.get("task_type") or "") != "Count Frequency(Tool)":
-            raise RuntimeError(
-                f"first oracle control only supports Count Frequency(Tool): {sid}"
-            )
         prompt = canonical.full_context_prompt(sample)
         records = message_records(canonical, sample, prompt)
-        char_begin, char_end, chain = count_frequency_tool_chain(
-            sample, records
-        )
+        char_chains = oracle_message_chains(sample, records)
         rendered = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=False,
@@ -226,11 +254,14 @@ def main() -> None:
         )
         prompt_ids = [int(value) for value in encoded["input_ids"]]
         offsets = [(int(a), int(b)) for a, b in encoded["offset_mapping"]]
-        token_begin, token_end = token_span_for_chars(
-            offsets,
-            prompt_start + char_begin,
-            prompt_start + char_end,
-        )
+        token_spans = [
+            token_span_for_chars(
+                offsets,
+                prompt_start + char_begin,
+                prompt_start + char_end,
+            )
+            for char_begin, char_end, _ in char_chains
+        ]
         # /tokenize accepts an already-rendered string.  Sending the canonical
         # user content here would omit chat-template control tokens and produce
         # a small but fatal coordinate offset.
@@ -267,7 +298,8 @@ def main() -> None:
             },
             "kvmem_trace_tag": trace_tag,
             "kvmem_oracle_token_spans": [
-                {"begin": token_begin, "end": token_end}
+                {"begin": begin, "end": end}
+                for begin, end in token_spans
             ],
         }
         if args.oracle_only:
@@ -276,8 +308,8 @@ def main() -> None:
             payload["kvmem_inline_refresh"] = args.inline_refresh
         print(
             f"[oracle] {index}/{len(ids)} {sid} "
-            f"prompt={len(prompt_ids)} span=[{token_begin},{token_end}) "
-            f"tokens={token_end-token_begin}",
+            f"prompt={len(prompt_ids)} spans={token_spans} "
+            f"tokens={sum(end-begin for begin, end in token_spans)}",
             flush=True,
         )
         started = time.perf_counter()
@@ -308,8 +340,11 @@ def main() -> None:
             oracle_blocks = [
                 block
                 for block in snapshots[trace_tag]["blocks"]
-                if int(block["p0"]) < token_end
-                and int(block["p0"]) + int(block["nt"]) > token_begin
+                if any(
+                    int(block["p0"]) < end
+                    and int(block["p0"]) + int(block["nt"]) > begin
+                    for begin, end in token_spans
+                )
             ]
             if not oracle_blocks:
                 raise RuntimeError(
@@ -340,8 +375,11 @@ def main() -> None:
                     for block in selected_blocks
                     if int(block["b"]) >= sink_blocks
                     and not (
-                        int(block["p0"]) < token_end
-                        and int(block["p0"]) + int(block["nt"]) > token_begin
+                        any(
+                            int(block["p0"]) < end
+                            and int(block["p0"]) + int(block["nt"]) > begin
+                            for begin, end in token_spans
+                        )
                     )
                     and int(block["b"]) < pin_from_block
                 ]
@@ -398,12 +436,13 @@ def main() -> None:
                 "prompt_sha256": hashlib.sha256(
                     prompt.encode("utf-8")
                 ).hexdigest(),
-                "oracle_token_span": [token_begin, token_end],
-                "oracle_span_tokens": token_end - token_begin,
-                "oracle_first_block_32": token_begin // 32,
-                "oracle_last_block_32": (token_end - 1) // 32,
-                "oracle_block_count_32": (
-                    (token_end - 1) // 32 - token_begin // 32 + 1
+                "oracle_token_spans": [list(span) for span in token_spans],
+                "oracle_span_tokens": sum(
+                    end - begin for begin, end in token_spans
+                ),
+                "oracle_block_count_32": sum(
+                    (end - 1) // 32 - begin // 32 + 1
+                    for begin, end in token_spans
                 ),
                 "oracle_selected_verified": oracle_selected_verified,
                 "oracle_selected_block_count": (
@@ -414,7 +453,7 @@ def main() -> None:
                     len(selected_blocks) if oracle_selected_verified else None
                 ),
                 "inline_refresh": args.inline_refresh,
-                "chain": chain,
+                "chains": [chain for _, _, chain in char_chains],
                 "elapsed_sec": elapsed,
                 "correct": eval_row.get("correct"),
                 "score": eval_row.get("score"),

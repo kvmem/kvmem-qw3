@@ -38,21 +38,63 @@ SYSTEM_INSTRUCTION = (
 )
 
 
-def render_history(sample: Sample) -> str:
-    """Render all haystack sessions as a single dated, role-labeled text block."""
+def render_history_with_message_spans(
+    sample: Sample,
+) -> tuple[str, list[tuple[int, int]]]:
+    """Render history and return UTF-8 byte spans for its original messages.
+
+    LongMemEval's standard full-context prompt intentionally flattens the whole
+    history into one OpenAI user message.  KVMem semantic expansion must still
+    see the original turn boundaries rather than treating that million-token
+    wrapper as one indivisible group.  The first turn in each session owns the
+    dated session header; later turns own one complete ``User:``/``Assistant:``
+    line.  The returned byte offsets are relative to the rendered history and
+    do not change its text.
+    """
     lines: list[str] = []
+    group_line_ranges: list[tuple[int, int]] = []
     dates = sample.haystack_dates
     for idx, session in enumerate(sample.haystack_sessions):
         date = dates[idx] if idx < len(dates) else ""
         header = f"=== Conversation on {date} ===" if date else f"=== Conversation {idx + 1} ==="
+        header_line = len(lines)
         lines.append(header)
+        first_turn = True
         for turn in session:
             role = str(turn.get("role", "")).strip().lower()
             content = str(turn.get("content", "")).strip()
             speaker = "User" if role == "user" else "Assistant"
+            turn_line = len(lines)
             lines.append(f"{speaker}: {content}")
+            group_line_ranges.append(
+                (header_line, turn_line) if first_turn else (turn_line, turn_line))
+            first_turn = False
+        if first_turn:
+            # Empty sessions are unusual, but their dated header still carries
+            # semantic information and must not become an unselectable island.
+            group_line_ranges.append((header_line, header_line))
         lines.append("")  # blank line between sessions
-    return "\n".join(lines).rstrip()
+    history = "\n".join(lines).rstrip()
+
+    line_byte_starts: list[int] = []
+    byte_cursor = 0
+    for line_idx, line in enumerate(lines):
+        line_byte_starts.append(byte_cursor)
+        byte_cursor += len(line.encode("utf-8"))
+        if line_idx + 1 < len(lines):
+            byte_cursor += 1  # the ASCII newline inserted by str.join
+
+    spans: list[tuple[int, int]] = []
+    for first_line, last_line in group_line_ranges:
+        begin = line_byte_starts[first_line]
+        end = line_byte_starts[last_line] + len(lines[last_line].encode("utf-8"))
+        spans.append((begin, end))
+    return history, spans
+
+
+def render_history(sample: Sample) -> str:
+    """Render all haystack sessions as a single dated, role-labeled text block."""
+    return render_history_with_message_spans(sample)[0]
 
 
 def render_messages(sample: Sample) -> list[dict[str, Any]]:
@@ -75,6 +117,29 @@ def render_messages(sample: Sample) -> list[dict[str, Any]]:
         {"role": "user", "content": history_user},
         {"role": "user", "content": question_user},
     ]
+
+
+def render_messages_with_group_spans(
+    sample: Sample,
+) -> tuple[list[dict[str, Any]], list[dict[str, int]]]:
+    """Build the standard prompt plus original-message semantic group spans.
+
+    The messages are byte-for-byte identical to :func:`render_messages`.  Each
+    explicit group points into message 1 (the flattened history user message)
+    using UTF-8 byte offsets, which is the coordinate system consumed by the
+    C++ OpenAI-compatible server.
+    """
+    messages = render_messages(sample)
+    _, history_spans = render_history_with_message_spans(sample)
+    groups = [
+        {
+            "message_index": 1,
+            "content_start": begin,
+            "content_end": end,
+        }
+        for begin, end in history_spans
+    ]
+    return messages, groups
 
 
 def render_transcript_messages(sample: Sample) -> list[dict[str, Any]]:

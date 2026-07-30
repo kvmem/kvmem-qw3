@@ -63,6 +63,43 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="send diagnostics-only context span and stable sample trace tag",
     )
+    parser.add_argument(
+        "--kvmem-round-only",
+        action="store_true",
+        help=(
+            "group the canonical flattened history into complete rounds and "
+            "send kvmem_retrieval_group_spans; requires a server launched "
+            "with --kvmem-round-retrieval"
+        ),
+    )
+    parser.add_argument(
+        "--kvmem-message-expansion",
+        action="store_true",
+        help=(
+            "group the canonical flattened history into complete rendered "
+            "messages and send kvmem_retrieval_group_spans; requires "
+            "--kvmem-semantic-expansion message on the server"
+        ),
+    )
+    parser.add_argument(
+        "--kvmem-inline-refresh",
+        choices=("kv_only", "kv_and_state"),
+        help=(
+            "diagnostic one-shot refresh of the final selected context; "
+            "requires QW3_KVMEM_ENABLE_INLINE_REFRESH=1 on the server"
+        ),
+    )
+    parser.add_argument(
+        "--kvmem-round-padding",
+        type=int,
+        default=0,
+        metavar="TOKENS",
+        help=(
+            "experimental token-level newline alignment for round retrieval; "
+            "0 disables it, otherwise the server pads every round to this "
+            "token multiple (normally the KVMem block size)"
+        ),
+    )
     parser.add_argument("--seed", type=int)
     return parser.parse_args()
 
@@ -221,11 +258,113 @@ def history_byte_span(
     return byte_start, byte_end
 
 
+def round_byte_spans(
+    canonical: Any, sample: dict[str, Any], prompt: str
+) -> list[tuple[int, int]]:
+    """Partition the canonical flattened history into complete round spans.
+
+    AgentLongBench closes each round with a user feedback message. A round thus
+    contains the assistant reasoning/tool call, tool result, candidate answer,
+    and the feedback that labels that answer. The first round can contain only
+    the initial assistant candidate plus feedback. Newline separators are
+    assigned to the following round so the spans form an exact, gap-free
+    partition of the history bytes.
+    """
+    raw = sample.get("raw") if isinstance(sample.get("raw"), dict) else {}
+    messages = sample.get("messages") or raw.get("messages") or []
+    rendered: list[tuple[dict[str, Any], str]] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            continue
+        rendered.append((message, canonical.message_to_text(message)))
+    if not rendered:
+        raise RuntimeError("sample has no non-system history messages")
+
+    history_begin, history_end = history_byte_span(canonical, sample, prompt)
+    history_parts: list[str] = []
+    local_cursor = 0
+    group_begin = 0
+    local_groups: list[tuple[int, int]] = []
+    user_messages = 0
+    for index, (message, text) in enumerate(rendered):
+        if index > 0:
+            history_parts.append("\n")
+            local_cursor += 1
+        history_parts.append(text)
+        local_cursor += len(text.encode("utf-8"))
+        if isinstance(message, dict) and message.get("role") == "user":
+            if local_cursor <= group_begin:
+                raise RuntimeError("empty AgentLongBench round")
+            local_groups.append((group_begin, local_cursor))
+            group_begin = local_cursor
+            user_messages += 1
+
+    history = "".join(history_parts)
+    expected_bytes = history_end - history_begin
+    if len(history.encode("utf-8")) != expected_bytes:
+        raise RuntimeError("round reconstruction does not match history byte span")
+    if group_begin < local_cursor:
+        # Defensive support for a trailing assistant/tool segment. It belongs
+        # to the final chronological round rather than becoming a partial
+        # independently retrievable unit.
+        if not local_groups:
+            raise RuntimeError("history contains no user round boundary")
+        local_groups[-1] = (local_groups[-1][0], local_cursor)
+    if not local_groups or len(local_groups) != user_messages:
+        raise RuntimeError("could not derive AgentLongBench round boundaries")
+    if local_groups[0][0] != 0 or local_groups[-1][1] != local_cursor:
+        raise RuntimeError("round spans do not cover the complete history")
+    for previous, current in zip(local_groups, local_groups[1:]):
+        if previous[1] != current[0]:
+            raise RuntimeError("round spans contain a gap or overlap")
+    return [
+        (history_begin + begin, history_begin + end)
+        for begin, end in local_groups
+    ]
+
+
+def message_byte_spans(
+    canonical: Any, sample: dict[str, Any], prompt: str
+) -> list[tuple[int, int]]:
+    """Partition canonical flattened history into complete message spans.
+
+    Newline separators are assigned to the following message, matching the
+    round-span convention. The result is gap-free, ordered, and generic across
+    roles; it is derived by the benchmark runner rather than hard-coded in
+    KVMem.
+    """
+    raw = sample.get("raw") if isinstance(sample.get("raw"), dict) else {}
+    messages = sample.get("messages") or raw.get("messages") or []
+    lines = [
+        canonical.message_to_text(message)
+        for message in messages
+        if not (isinstance(message, dict) and message.get("role") == "system")
+    ]
+    if not lines:
+        raise RuntimeError("sample has no non-system history messages")
+    history_begin, history_end = history_byte_span(canonical, sample, prompt)
+    cursor = 0
+    local_groups: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        begin = cursor
+        if index > 0:
+            cursor += 1  # the canonical "\n".join separator
+        cursor += len(line.encode("utf-8"))
+        local_groups.append((begin, cursor))
+    if cursor != history_end - history_begin:
+        raise RuntimeError("message reconstruction does not match history span")
+    return [
+        (history_begin + begin, history_begin + end)
+        for begin, end in local_groups
+    ]
+
+
 def chat_completion(
     args: argparse.Namespace,
     prompt: str,
     query_span: tuple[int, int],
     context_span: tuple[int, int] | None,
+    retrieval_group_spans: list[tuple[int, int]] | None,
     trace_tag: str | None,
     request_max_tokens: int,
 ) -> dict[str, Any]:
@@ -251,6 +390,19 @@ def chat_completion(
             "content_end": context_span[1],
         }
         payload["kvmem_trace_tag"] = trace_tag
+    if retrieval_group_spans is not None:
+        payload["kvmem_retrieval_group_spans"] = [
+            {
+                "message_index": 0,
+                "content_start": begin,
+                "content_end": end,
+            }
+            for begin, end in retrieval_group_spans
+        ]
+        if args.kvmem_round_padding > 0:
+            payload["kvmem_round_padding"] = args.kvmem_round_padding
+    if args.kvmem_inline_refresh is not None:
+        payload["kvmem_inline_refresh"] = args.kvmem_inline_refresh
     if args.seed is not None:
         payload["seed"] = args.seed
     request = urllib.request.Request(
@@ -287,6 +439,10 @@ def chat_completion(
                 event = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            if event.get("error"):
+                raise RuntimeError(
+                    f"qw3 stream error: {event['error']}"
+                )
             if isinstance(event.get("usage"), dict):
                 usage = event["usage"]
             choices = event.get("choices") or []
@@ -307,6 +463,10 @@ def chat_completion(
                     first_reasoning = time.perf_counter() - started
                 reasoning.append(reasoning_piece)
     total = time.perf_counter() - started
+    if finish_reason == "error":
+        raise RuntimeError(
+            "qw3 stream ended with finish_reason=error"
+        )
     completion_tokens = usage.get("completion_tokens")
     # TTFT is the first non-empty streamed model token, regardless of whether
     # the API exposes it as reasoning_content or final content. Prefer neither
@@ -478,6 +638,17 @@ def write_final(
 
 def main() -> None:
     args = parse_args()
+    if args.kvmem_round_padding < 0:
+        raise RuntimeError("--kvmem-round-padding must be >= 0")
+    if args.kvmem_round_padding > 0 and not args.kvmem_round_only:
+        raise RuntimeError(
+            "--kvmem-round-padding requires --kvmem-round-only"
+        )
+    if args.kvmem_round_only and args.kvmem_message_expansion:
+        raise RuntimeError(
+            "--kvmem-round-only and --kvmem-message-expansion are "
+            "mutually exclusive"
+        )
     canonical = load_canonical_module(args.benchmark_repo)
     samples = read_jsonl(args.dataset)
     canonical_manifest = read_jsonl(args.manifest)
@@ -534,6 +705,10 @@ def main() -> None:
         "context_window": args.context_window,
         "enable_thinking": args.enable_thinking,
         "kvmem_retrieval_trace_metadata": args.kvmem_retrieval_trace_metadata,
+        "kvmem_round_only": args.kvmem_round_only,
+        "kvmem_message_expansion": args.kvmem_message_expansion,
+        "kvmem_round_padding": args.kvmem_round_padding,
+        "kvmem_inline_refresh": args.kvmem_inline_refresh,
         "seed": args.seed,
         "allow_custom_subset": args.allow_custom_subset,
         "selected_samples": len(samples),
@@ -553,6 +728,10 @@ def main() -> None:
             "context_window",
             "enable_thinking",
             "kvmem_retrieval_trace_metadata",
+            "kvmem_round_only",
+            "kvmem_message_expansion",
+            "kvmem_round_padding",
+            "kvmem_inline_refresh",
             "seed",
             "allow_custom_subset",
             "selected_samples",
@@ -560,7 +739,13 @@ def main() -> None:
         if any(
             (
                 previous.get(key, False)
-                if key == "kvmem_retrieval_trace_metadata"
+                if key
+                in {
+                    "kvmem_retrieval_trace_metadata",
+                    "kvmem_round_only",
+                    "kvmem_message_expansion",
+                    "kvmem_round_padding",
+                }
                 else previous.get(key)
             )
             != config.get(key)
@@ -596,6 +781,19 @@ def main() -> None:
                 if args.kvmem_retrieval_trace_metadata
                 else None
             )
+            if args.kvmem_round_only:
+                retrieval_group_spans = round_byte_spans(
+                    canonical, sample, prompt
+                )
+                semantic_group_kind = "round"
+            elif args.kvmem_message_expansion:
+                retrieval_group_spans = message_byte_spans(
+                    canonical, sample, prompt
+                )
+                semantic_group_kind = "message"
+            else:
+                retrieval_group_spans = None
+                semantic_group_kind = None
             prompt_tokens = tokenize_count(args.api_base, prompt, args.timeout_sec)
             request_max_tokens = min(
                 args.max_tokens,
@@ -619,7 +817,26 @@ def main() -> None:
                 "temperature": args.temperature,
                 "top_p": args.top_p,
                 "enable_thinking": args.enable_thinking,
+                "kvmem_inline_refresh": args.kvmem_inline_refresh,
             }
+            if retrieval_group_spans is not None:
+                group_lengths = [
+                    end - begin for begin, end in retrieval_group_spans
+                ]
+                row["kvmem_semantic_group_kind"] = semantic_group_kind
+                row["kvmem_semantic_groups"] = len(retrieval_group_spans)
+                row["kvmem_semantic_group_bytes_min"] = min(group_lengths)
+                row["kvmem_semantic_group_bytes_max"] = max(group_lengths)
+                if semantic_group_kind == "round":
+                    # Preserve historical result-schema fields.
+                    row["kvmem_round_groups"] = len(
+                        retrieval_group_spans
+                    )
+                    row["kvmem_round_group_bytes_min"] = min(group_lengths)
+                    row["kvmem_round_group_bytes_max"] = max(group_lengths)
+                    row["kvmem_round_padding_alignment"] = (
+                        args.kvmem_round_padding
+                    )
             if context_span is not None:
                 row["kvmem_context_span_content_bytes"] = list(context_span)
                 row["kvmem_trace_tag"] = sid
@@ -643,9 +860,25 @@ def main() -> None:
                         prompt,
                         query_span,
                         context_span,
+                        retrieval_group_spans,
                         sid if context_span is not None else None,
                         request_max_tokens,
                     )
+                    actual_prompt_tokens = (
+                        result.get("usage", {}).get("prompt_tokens")
+                        if isinstance(result.get("usage"), dict)
+                        else None
+                    )
+                    if isinstance(actual_prompt_tokens, int):
+                        row["actual_prompt_tokens"] = actual_prompt_tokens
+                        # This delta includes both any experimental round
+                        # padding and the server's chat-template framing.  Do
+                        # not label it as padding alone: for the current Qwen
+                        # template an unpadded request still has a 10-token
+                        # framing delta.
+                        row["actual_prompt_tokens_minus_canonical"] = (
+                            actual_prompt_tokens - prompt_tokens
+                        )
                     answer = {**row, **result, "answered_at": now_iso()}
                     append_jsonl(output["answers"], answer)
                     answers[sid] = answer

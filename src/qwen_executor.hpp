@@ -432,6 +432,8 @@ public:
     void kvmem_set_oracle_token_spans(
         const std::vector<std::pair<uint32_t, uint32_t>> &spans,
         bool oracle_only = false);
+    void kvmem_set_retrieval_group_spans(
+        const std::vector<std::pair<uint32_t, uint32_t>> &spans);
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
     // it per executor. Set before configure_kvmem(); the pool must outlive this
     // executor. No-op effect when kvmem or the CPU tier is off.
@@ -479,6 +481,8 @@ public:
         bool     nvme_tier = false;
         uint64_t nvme_used_bytes = 0;
         uint64_t nvme_capacity_bytes = 0;
+        uint64_t nvme_raw_k_bytes = 0;
+        uint64_t nvme_spill_bytes = 0;
     };
     KvMemTierUsage kvmem_tier_usage() const;
     // Extend the assembled window so `n` verify tokens can append at the window
@@ -525,6 +529,11 @@ public:
     // D2H overlaps the following prefill chunk and SSD persistence follows in
     // the existing bounded background writer.
     void kvmem_prefill_writeback(uint32_t completed_pos);
+    // Publish the partially-filled raw-K writeback slab and wait for every
+    // submitted raw-K SSD batch. Prefix checkpoints call this before capturing
+    // replay state so no staging buffer owned by the checkpoint can be reused
+    // by a later suffix.
+    void kvmem_sync_raw_k_persistence();
 
     // Assemble the deterministic long-prefill working set: configured sink
     // prefix plus the newest blocks filling the rest of the selection budget.
@@ -863,6 +872,10 @@ private:
     uint32_t mtp_window_page_count_ = 0;
     std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
+    // Dedicated immutable raw-K arena. Slots are permanent per raw chunk for
+    // the lifetime of a session; unlike the V tier they are never LRU-reused
+    // while their token range remains valid.
+    std::unique_ptr<NvmeKvTier> kvmem_raw_k_nvme_tier_;
     std::unique_ptr<HostBuffer> kvmem_cpu_bytes_;
     // Optional per-executor persistent workers for the many small parallel
     // gather/scatter jobs issued by long-context reselection. Keeping the
@@ -905,12 +918,60 @@ private:
     std::vector<std::unique_ptr<uint8_t[]>> kvmem_raw_k_chunks_;
     uint64_t kvmem_raw_k_mirror_bytes_ = 0;
     uint64_t kvmem_raw_k_row_bytes_ = 0;
+    uint64_t kvmem_raw_k_chunk_bytes_ = 0;
+    uint64_t kvmem_raw_mtp_k_chunk_bytes_ = 0;
+    bool kvmem_raw_k_nvme_enabled_ = false;
+    std::vector<uint8_t> kvmem_raw_k_nvme_backed_;
+    std::vector<uint8_t> kvmem_raw_mtp_k_nvme_backed_;
+    std::vector<uint8_t> kvmem_raw_k_dirty_;
+    std::vector<uint8_t> kvmem_raw_mtp_k_dirty_;
+    std::vector<uint8_t> kvmem_raw_k_write_pending_;
+    uint64_t kvmem_raw_k_nvme_read_bytes_ = 0;
+    uint64_t kvmem_raw_k_nvme_write_bytes_ = 0;
+    uint64_t kvmem_raw_k_nvme_write_syscalls_ = 0;
+    uint64_t kvmem_raw_k_nvme_write_ns_ = 0;
     std::vector<uint8_t> kvmem_raw_k_valid_tokens_;
+    // Offline diagnostic only: when QW3_KVMEM_DUMP_RAW_K points to a file,
+    // dump one explicitly requested token window from the immutable,
+    // content-frame K authority. Normal inference never enters this path.
+    bool kvmem_raw_k_debug_dump_done_ = false;
     std::vector<uint32_t> kvmem_raw_layers_;
     std::vector<int32_t> kvmem_raw_layer_slot_;
-    std::vector<std::unique_ptr<DeviceTensor>> kvmem_raw_capture_dev_;
+    std::array<std::vector<std::unique_ptr<DeviceTensor>>, 2>
+        kvmem_raw_capture_dev_;
+    std::array<std::unique_ptr<DeviceTransferFence>, 2>
+        kvmem_raw_capture_d2h_done_;
+    uint32_t kvmem_raw_capture_active_slot_ = 0;
     uint32_t kvmem_raw_capture_rows_ = 0;
     std::unique_ptr<HostBuffer> kvmem_raw_capture_host_;
+    // Completed raw chunks flow through two fixed pinned slots. Full aligned
+    // prefill chunks D2H directly into the current slot in block-major SSD
+    // layout and record a transfer fence only when the batch is submitted.
+    // The background writer waits that fence before touching the slot. CPU
+    // cache publication happens when the completed slot is reaped, immediately
+    // before staging reuse, so steady-state prefill does not synchronize after
+    // every D2H. Several consecutive records share one slot so
+    // NvmeKvTier::write_spans coalesces them into one large pwrite + one range
+    // writeback.
+    struct RawWritebackSlot {
+        std::unique_ptr<HostBuffer> host;
+        std::unique_ptr<DeviceTransferFence> d2h_done;
+        uint64_t capacity_bytes = 0;
+        uint64_t used_bytes = 0;
+        std::vector<uint32_t> chunks;
+        std::vector<NvmeIoSpan> spans;
+        std::future<NvmeBatchIoStats> future;
+        bool in_flight = false;
+        uint64_t submit_ns = 0;
+    };
+    std::array<RawWritebackSlot, 2> kvmem_raw_writeback_slots_;
+    uint32_t kvmem_raw_writeback_fill_slot_ = 0;
+    uint32_t kvmem_raw_writeback_chunks_per_slot_ = 0;
+    uint64_t kvmem_raw_writeback_record_bytes_ = 0;
+    std::vector<int8_t> kvmem_raw_writeback_chunk_slot_;
+    std::vector<uint64_t> kvmem_raw_writeback_chunk_offset_;
+    std::vector<uint8_t> kvmem_raw_writeback_main_ready_;
+    std::vector<uint8_t> kvmem_raw_writeback_mtp_ready_;
     std::unique_ptr<DeviceTensor> kvmem_raw_transfer_dev_;
     std::unique_ptr<HostBuffer> kvmem_raw_transfer_host_;
     uint32_t kvmem_raw_transfer_blocks_ = 0;
@@ -947,7 +1008,11 @@ private:
     std::vector<std::unique_ptr<uint8_t[]>> kvmem_raw_mtp_k_chunks_;
     uint64_t kvmem_raw_mtp_k_mirror_bytes_ = 0;
     std::vector<uint8_t> kvmem_raw_mtp_k_valid_tokens_;
-    std::unique_ptr<DeviceTensor> kvmem_raw_mtp_capture_dev_;
+    std::array<std::unique_ptr<DeviceTensor>, 2>
+        kvmem_raw_mtp_capture_dev_;
+    std::array<std::unique_ptr<DeviceTransferFence>, 2>
+        kvmem_raw_mtp_capture_d2h_done_;
+    uint32_t kvmem_raw_mtp_capture_active_slot_ = 0;
     uint32_t kvmem_raw_mtp_capture_rows_ = 0;
     std::unique_ptr<HostBuffer> kvmem_raw_mtp_capture_host_;
     std::unique_ptr<DeviceTensor> kvmem_raw_mtp_transfer_dev_;
@@ -1180,12 +1245,32 @@ private:
     bool kvmem_reserve_cpu_slot(int32_t slot);
     void kvmem_release_cpu_slot(int32_t slot);
     void kvmem_evict_cpu_for_raw(uint64_t bytes);
+    bool kvmem_evict_one_raw_k_chunk();
     void kvmem_ensure_raw_k_chunks(uint32_t base, uint32_t rows,
                                    bool mtp);
     void kvmem_write_raw_k(uint32_t layer_slot, uint32_t base,
                            const uint8_t *src, uint32_t rows, bool mtp);
     void kvmem_read_raw_k(uint32_t layer_slot, uint32_t base,
-                          uint8_t *dst, uint32_t rows, bool mtp) const;
+                          uint8_t *dst, uint32_t rows, bool mtp);
+    void kvmem_read_raw_k_block(uint32_t base, uint32_t rows,
+                                uint8_t *dst, bool mtp);
+    void kvmem_maybe_dump_raw_k_window();
+    void kvmem_persist_raw_k_chunk(uint32_t chunk, bool mtp);
+    void kvmem_persist_completed_raw_k_chunks(
+        uint32_t base, uint32_t rows, bool mtp);
+    bool kvmem_reserve_raw_k_writeback_record(
+        uint32_t chunk, uint32_t &slot_index, uint64_t &record_offset);
+    bool kvmem_copy_raw_k_chunk_to_writeback(uint32_t chunk);
+    void kvmem_submit_raw_k_writeback_slot(uint32_t slot_index);
+    void kvmem_reap_raw_k_writes(bool wait_all);
+    void kvmem_flush_raw_k_writes(bool wait_all);
+    void kvmem_wait_raw_k_chunk_write(uint32_t chunk);
+    bool kvmem_try_direct_raw_k_d2h(
+        uint32_t true_base, uint32_t first_row, uint32_t rows);
+    bool kvmem_try_direct_raw_mtp_k_d2h(
+        const DeviceTensor &raw_k, uint32_t logical_base,
+        uint32_t rows);
+    bool kvmem_raw_k_chunk_complete(uint32_t chunk, bool mtp) const;
     void kvmem_truncate_raw_k(uint32_t token_pos);
     void kvmem_canonicalize_block_for_tier(uint32_t block_id);
     // Grow mtp_baked_pos_ to cover every registered block, initializing new
@@ -1233,6 +1318,7 @@ private:
     std::unique_ptr<DeviceTensor> kvmem_alloc_mean_index_tensor(
         uint64_t count, const char *label);
     void kvmem_ensure_raw_capture_capacity(uint32_t rows);
+    void kvmem_prepare_raw_capture_slot();
     void kvmem_capture_raw_k_batch(uint32_t layer, const DeviceTensor &raw_k,
                                    uint32_t batch);
     void kvmem_capture_raw_k_decode(uint32_t layer,
@@ -1415,6 +1501,7 @@ private:
     bool kvmem_retrieval_score_mean_softmax(
         int mask_mode = -1,
         std::string *failure_reason = nullptr);  // boundary, softmax-over-pages
+    bool kvmem_prepare_round_score_groups(uint32_t n_blocks);
     bool kvmem_no_rerope_ = false;                             // env: skip re-RoPE collapse (true-pos test)
     bool kvmem_fix_bakedpos_ = true;                           // record window bake pos for window-baked chunks (env off-switch QW3_KVMEM_FIX_BAKEDPOS=0)
 
@@ -1435,6 +1522,15 @@ private:
     int32_t kvmem_qc_layer_cap_ = -1;                          // env: cap L (-1 = all std layers)
     uint32_t kvmem_qc_num_layers_ = 0;                         // L (resolved std-layer count)
     uint32_t kvmem_query_span_ = 0;                            // S (span length, == capacity)
+    std::vector<std::pair<uint32_t, uint32_t>>
+        kvmem_retrieval_group_spans_;
+    std::vector<int32_t> kvmem_round_group_begin_host_;
+    std::vector<int32_t> kvmem_round_group_end_host_;
+    std::unique_ptr<DeviceTensor> kvmem_round_group_begin_dev_;
+    std::unique_ptr<DeviceTensor> kvmem_round_group_end_dev_;
+    std::unique_ptr<DeviceTensor> kvmem_group_score_dev_;
+    uint32_t kvmem_round_group_capacity_ = 0;
+    std::vector<double> kvmem_round_group_scores_;
     std::vector<int32_t> std_layer_slot_;                      // il -> slot 0..L-1, or -1
     std::vector<uint32_t> std_layers_;                         // slot -> il
     std::unique_ptr<DeviceTensor> g_kbar_multi_;              // [L, blocks, n_subblocks,
@@ -1445,6 +1541,59 @@ private:
     uint32_t g_kbar_multi_capacity_ = 0;                       // allocated block capacity (per layer)
     uint32_t kvmem_qc_n_subblocks_ = 1;                        // sub-block means per block (SubBlockMeanK; 1 = plain mean-k)
     bool kvmem_qc_subblock_max_ = true;                        // sub-block reduction: true=max over sub-blocks (MaxSim), false=sum (mass). No-op at n_subblocks==1.
+
+    // CPU-offloaded mean-K index (--kvmem-index-placement cpu). The canonical
+    // full index keeps the same fixed-stride layer-major byte layout as
+    // g_kbar_multi_, but lives in pageable host memory. Two fixed-size pinned
+    // host/device slots serve both incremental prefill D2H capture and exact
+    // two-pass retrieval H2D streaming.
+    struct MeanIndexStageSlot {
+        std::unique_ptr<DeviceTensor> device;
+        std::unique_ptr<HostBuffer> host;
+        std::unique_ptr<DeviceTransferFence> transfer_done;
+        std::unique_ptr<DeviceTransferFence> compute_done;
+        bool capture_pending = false;
+        uint32_t capture_first_block = 0;
+        uint32_t capture_blocks = 0;
+        uint32_t capture_layer_stride = 0;
+        uint64_t capture_bytes = 0;
+    };
+    std::unique_ptr<uint8_t[]> g_kbar_multi_host_;
+    uint64_t g_kbar_multi_host_capacity_bytes_ = 0;
+    uint64_t g_kbar_multi_host_bytes_ = 0;
+    uint32_t g_kbar_multi_host_elem_size_ = 0;
+    std::array<MeanIndexStageSlot, 2> g_kbar_stream_slots_;
+    uint32_t g_kbar_stream_tile_blocks_ = 0;
+    uint64_t g_kbar_stream_slot_bytes_ = 0;
+    uint32_t g_kbar_capture_next_slot_ = 0;
+    int32_t g_kbar_capture_active_slot_ = -1;
+    std::unique_ptr<DeviceTensor> g_kbar_stream_global_max_;
+    std::unique_ptr<DeviceTensor> g_kbar_stream_global_sum_;
+    uint64_t g_kbar_stream_distribution_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> g_kbar_stream_group_dist_;
+    uint64_t g_kbar_stream_group_dist_capacity_ = 0;
+    bool kvmem_mean_index_cpu() const;
+    bool kvmem_mean_index_available() const;
+    void kvmem_prepare_cpu_mean_index(uint64_t elements, uint32_t layers,
+                                      uint32_t stride_blocks,
+                                      bool preserve_content_index);
+    void kvmem_drain_mean_index_capture_slot(uint32_t slot);
+    void kvmem_drain_mean_index_capture();
+    uint32_t kvmem_begin_mean_index_capture(uint32_t first_block,
+                                            uint32_t n_blocks,
+                                            bool seed_partial);
+    void kvmem_finish_mean_index_capture(uint32_t slot,
+                                         uint32_t first_block,
+                                         uint32_t n_blocks);
+    void kvmem_pack_mean_index_tile(uint32_t first_block,
+                                    uint32_t n_blocks,
+                                    MeanIndexStageSlot &slot);
+    bool kvmem_score_cpu_mean_index(
+        uint32_t n_blocks, uint32_t scale_query_tokens,
+        uint32_t q_layer_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        bool round_mode, uint32_t accumulate,
+        std::string *failure_reason);
 
     // ---- DeltaNet-state retrieval (--kvmem-retrieval-method deltanet) --------
     // Scores each historical block by the net EDIT it made to the DeltaNet

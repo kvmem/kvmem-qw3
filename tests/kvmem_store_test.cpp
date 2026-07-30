@@ -749,6 +749,67 @@ static void test_deltanet_config_and_scores() {
     for (size_t i = 1; i < sel.size(); ++i) CHECK(sel[i] > sel[i - 1]);
 }
 
+static void test_round_groups_are_selected_whole() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.select_budget = 32 * 8;
+    cfg.sink_blocks = 1;
+    cfg.recent_blocks = 1;
+    cfg.semantic_expansion = KvMemSemanticExpansion::Round;
+    cfg.group_score_reduce =
+        KvMemGroupScoreReduce::LengthNormalizedMass;
+    cfg.group_length_norm_alpha = 0.5;
+    KvMemStore s(cfg);
+    s.register_append(32 * 20);
+
+    // Four variable-length groups. Group 1 is hottest and overlaps blocks
+    // [4,7]; group 2 is next and overlaps [8,10]. Sink block 0 and recent block
+    // 19 leave six slots, so group 1 must be admitted whole and group 2 skipped
+    // rather than partially selected.
+    const std::vector<std::pair<uint32_t, uint32_t>> groups{
+        {32, 32 * 4},
+        {32 * 4 + 3, 32 * 8 - 5},
+        {32 * 8, 32 * 11},
+        {32 * 12, 32 * 14},
+    };
+    const std::vector<double> scores{1.0, 10.0, 9.0, 2.0};
+    const auto selected = s.pick_semantic_groups(groups, scores);
+    CHECK(selected.size() <= 8);
+    CHECK(std::find(selected.begin(), selected.end(), 0) != selected.end());
+    CHECK(std::find(selected.begin(), selected.end(), 19) != selected.end());
+    for (uint32_t id = 4; id <= 7; ++id) {
+        CHECK(std::find(selected.begin(), selected.end(), id) != selected.end());
+    }
+    // The second-ranked group cannot fit after the first: none of its unique
+    // blocks may leak in through a partial admission.
+    for (uint32_t id = 8; id <= 10; ++id) {
+        CHECK(std::find(selected.begin(), selected.end(), id) == selected.end());
+    }
+}
+
+static void test_round_groups_charge_shared_boundary_once() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 64;
+    cfg.select_budget = 64 * 4;
+    cfg.sink_blocks = 0;
+    cfg.recent_blocks = 0;
+    KvMemStore s(cfg);
+    s.register_append(64 * 8);
+
+    // Both groups overlap block 2. Their union is blocks [1,3], not four
+    // blocks, so both fit and the shared physical transfer is charged once.
+    const std::vector<std::pair<uint32_t, uint32_t>> groups{
+        {64, 64 * 2 + 10},
+        {64 * 2 + 10, 64 * 4},
+    };
+    const auto selected =
+        s.pick_semantic_groups(groups, std::vector<double>{2.0, 1.0}, {7});
+    CHECK(selected.size() == 4);
+    for (uint32_t id : {1u, 2u, 3u, 7u}) {
+        CHECK(std::find(selected.begin(), selected.end(), id) != selected.end());
+    }
+}
+
 int main() {
     test_register_append();
     test_selection_diff_and_remap();
@@ -770,6 +831,8 @@ int main() {
     test_inclusive_tier_metadata();
     test_truncate_to();
     test_deltanet_config_and_scores();
+    test_round_groups_are_selected_whole();
+    test_round_groups_charge_shared_boundary_once();
 
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);

@@ -28,6 +28,11 @@ namespace qw3 {
 
 struct NvmeKvTierConfig {
     std::string dir;
+    // Separate logical tiers may share one directory while retaining
+    // independent anonymous backing files. The directory entry is unlinked
+    // immediately after open, so this is a collision-avoidance/debug label,
+    // not a persistent cache name.
+    std::string file_name = "qw3_kvmem_nvme.bin";
     uint64_t total_bytes = 0;
     uint64_t slot_bytes = 0;
     // Buffered I/O otherwise keeps a second copy of the SSD arena in the
@@ -70,13 +75,32 @@ public:
         if (slot_count_ == 0 || cfg_.dir.empty()) return;
 
         ensure_dir(cfg_.dir);
-        path_ = cfg_.dir + "/qw3_kvmem_nvme.bin";
+        if (cfg_.file_name.empty() ||
+            cfg_.file_name.find('/') != std::string::npos) {
+            throw std::runtime_error(
+                "NVMe KV tier file_name must be a non-empty basename");
+        }
+        path_ = cfg_.dir + "/" + cfg_.file_name;
         fd_ = ::open(path_.c_str(), O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC,
                      0644);
         if (fd_ < 0) {
             throw std::runtime_error(
                 "failed to open NVMe KV tier file: " + path_ + ": " +
                 std::strerror(errno));
+        }
+        // The backing store is an ephemeral cache, never a recoverable
+        // checkpoint. Unlink it immediately while retaining the open file
+        // descriptor: all positional I/O continues to work, but the filesystem
+        // reclaims the blocks automatically when the process closes the fd,
+        // including abnormal exits and SIGKILL. This also prevents stale
+        // qw3_kvmem_nvme.bin files from accumulating across evaluations.
+        if (::unlink(path_.c_str()) != 0) {
+            const int unlink_error = errno;
+            ::close(fd_);
+            fd_ = -1;
+            throw std::runtime_error(
+                "failed to make NVMe KV tier file ephemeral: " + path_ +
+                ": " + std::strerror(unlink_error));
         }
         free_slots_.reserve(slot_count_);
         for (uint32_t i = 0; i < slot_count_; ++i) {
@@ -196,8 +220,14 @@ public:
     // The slot must already have been reserved with place_block(). These raw
     // positional methods do not touch metadata and are safe on worker threads.
     void write_slot(int32_t slot, const void *data, uint64_t bytes) const {
-        validate_slot_io(slot, data, bytes, "write");
-        const uint64_t offset = slot_offset(slot);
+        write_slot_range(slot, 0, data, bytes);
+    }
+
+    void write_slot_range(int32_t slot, uint64_t slot_byte_offset,
+                          const void *data, uint64_t bytes) const {
+        validate_slot_range_io(
+            slot, slot_byte_offset, data, bytes, "write");
+        const uint64_t offset = slot_offset(slot) + slot_byte_offset;
         pwrite_all(data, bytes, offset);
         if (cfg_.drop_page_cache) {
             (void) drop_cached_range(offset, bytes, /*write=*/true);
@@ -205,8 +235,14 @@ public:
     }
 
     void read_slot(int32_t slot, void *data, uint64_t bytes) const {
-        validate_slot_io(slot, data, bytes, "read");
-        const uint64_t offset = slot_offset(slot);
+        read_slot_range(slot, 0, data, bytes);
+    }
+
+    void read_slot_range(int32_t slot, uint64_t slot_byte_offset,
+                         void *data, uint64_t bytes) const {
+        validate_slot_range_io(
+            slot, slot_byte_offset, data, bytes, "read");
+        const uint64_t offset = slot_offset(slot) + slot_byte_offset;
         pread_all(data, bytes, offset);
         if (cfg_.drop_page_cache) {
             (void) drop_cached_range(offset, bytes, /*write=*/false);
@@ -263,6 +299,17 @@ private:
         if (slot < 0 || static_cast<uint32_t>(slot) >= slot_count_) {
             throw std::runtime_error(
                 std::string("NVMe ") + op + " has invalid slot");
+        }
+    }
+
+    void validate_slot_range_io(int32_t slot, uint64_t slot_byte_offset,
+                                const void *data, uint64_t bytes,
+                                const char *op) const {
+        validate_slot_io(slot, data, bytes, op);
+        if (slot_byte_offset > cfg_.slot_bytes ||
+            bytes > cfg_.slot_bytes - slot_byte_offset) {
+            throw std::runtime_error(
+                std::string("NVMe ") + op + " range exceeds slot size");
         }
     }
 

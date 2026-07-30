@@ -41,6 +41,54 @@ bool launch_block_attn_score_softmax_pages_typed(
     uint32_t n_kv_heads, uint32_t head_dim, float scale,
     uint32_t excl_lo_end, uint32_t excl_hi_begin, uint32_t n_subblocks,
     uint32_t reduce_max, uint32_t accumulate, cudaStream_t stream);
+bool launch_block_attn_score_softmax_groups_typed(
+    float *score, const void *q_multi, bool query_is_fp16,
+    const void *kbar_multi, KbarDType kbar_dtype,
+    const int32_t *group_begin, const int32_t *group_end,
+    uint32_t n_groups, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t q_layer_stride, uint32_t n_blocks,
+    uint32_t kbar_layer_stride, uint32_t n_heads,
+    uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    uint32_t excl_lo_end, uint32_t excl_hi_begin,
+    uint32_t n_subblocks, uint32_t group_reduce_mass,
+    uint32_t accumulate, cudaStream_t stream);
+bool launch_block_attn_stream_lse_typed(
+    float *global_max, float *global_sum,
+    const void *q_multi, bool query_is_fp16,
+    const void *kbar_tile, KbarDType kbar_dtype,
+    uint32_t n_layers, uint32_t n_tokens, uint32_t q_layer_stride,
+    uint32_t tile_blocks, uint32_t kbar_layer_stride,
+    uint32_t global_block_base, uint32_t n_heads,
+    uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    uint32_t excl_lo_end, uint32_t excl_hi_begin,
+    uint32_t n_subblocks, uint32_t initialize, cudaStream_t stream);
+bool launch_block_attn_stream_score_typed(
+    float *score, const void *q_multi, bool query_is_fp16,
+    const void *kbar_tile, KbarDType kbar_dtype,
+    const float *global_max, const float *global_sum,
+    uint32_t n_layers, uint32_t n_tokens, uint32_t q_layer_stride,
+    uint32_t tile_blocks, uint32_t kbar_layer_stride,
+    uint32_t global_block_base, uint32_t n_heads,
+    uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    uint32_t excl_lo_end, uint32_t excl_hi_begin,
+    uint32_t n_subblocks, uint32_t reduce_max,
+    uint32_t accumulate, cudaStream_t stream);
+bool launch_block_attn_stream_group_update_typed(
+    float *group_dist, const void *q_multi, bool query_is_fp16,
+    const void *kbar_tile, KbarDType kbar_dtype,
+    const float *global_max, const float *global_sum,
+    const int32_t *group_begin, const int32_t *group_end,
+    uint32_t n_groups, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t q_layer_stride, uint32_t tile_blocks,
+    uint32_t kbar_layer_stride, uint32_t global_block_base,
+    uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+    float scale, uint32_t excl_lo_end, uint32_t excl_hi_begin,
+    uint32_t n_subblocks, uint32_t group_reduce_mass,
+    cudaStream_t stream);
+bool launch_block_attn_stream_group_finalize(
+    float *score, const float *group_dist, uint32_t n_groups,
+    uint32_t n_distributions, float distribution_weight,
+    uint32_t accumulate, cudaStream_t stream);
 }
 }
 
@@ -263,6 +311,223 @@ static void compare(const char *label,
     }
 }
 
+static void run_streamed_index_test(bool reduce_max) {
+    constexpr uint32_t layers = 2;
+    constexpr uint32_t tokens = 5;
+    constexpr uint32_t heads = 4;
+    constexpr uint32_t kv_heads = 2;
+    constexpr uint32_t dim = 8;
+    constexpr uint32_t blocks = 257;
+    constexpr uint32_t subblocks = 3;
+    constexpr uint32_t tile_capacity = 61;
+    constexpr uint32_t excl_lo = 2;
+    constexpr uint32_t excl_hi = blocks - 3;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dim));
+    const uint64_t q_count =
+        static_cast<uint64_t>(layers) * tokens * heads * dim;
+    const uint64_t block_elems =
+        static_cast<uint64_t>(subblocks) * kv_heads * dim;
+    const uint64_t k_count =
+        static_cast<uint64_t>(layers) * blocks * block_elems;
+    const uint32_t distributions = layers * tokens * heads;
+
+    std::mt19937 rng(7713 + (reduce_max ? 1 : 0));
+    std::normal_distribution<float> nd(0.0f, 0.35f);
+    std::vector<__half> q(q_count), kbar(k_count);
+    for (__half &value : q) value = __float2half(nd(rng));
+    for (__half &value : kbar) value = __float2half(nd(rng));
+
+    __half *d_q = nullptr;
+    __half *d_kbar = nullptr;
+    __half *d_tile = nullptr;
+    float *d_resident = nullptr;
+    float *d_streamed = nullptr;
+    float *d_max = nullptr;
+    float *d_sum = nullptr;
+    CHECK(cudaMalloc(&d_q, q_count * sizeof(__half)));
+    CHECK(cudaMalloc(&d_kbar, k_count * sizeof(__half)));
+    CHECK(cudaMalloc(
+        &d_tile, static_cast<uint64_t>(layers) * tile_capacity *
+                     block_elems * sizeof(__half)));
+    CHECK(cudaMalloc(&d_resident, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&d_streamed, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&d_max, distributions * sizeof(float)));
+    CHECK(cudaMalloc(&d_sum, distributions * sizeof(float)));
+    CHECK(cudaMemcpy(
+        d_q, q.data(), q_count * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(
+        d_kbar, kbar.data(), k_count * sizeof(__half),
+        cudaMemcpyHostToDevice));
+
+    if (!qw3::ported::launch_block_attn_score_softmax_pages_typed(
+            d_resident, d_q, /*query_is_fp16=*/true, d_kbar,
+            qw3::ported::KbarDType::F16, layers, tokens, tokens,
+            blocks, blocks, heads, kv_heads, dim, scale,
+            excl_lo, excl_hi, subblocks, reduce_max ? 1u : 0u,
+            /*accumulate=*/0, /*stream=*/0)) {
+        std::fprintf(stderr, "resident FP16 scorer rejected streamed test\n");
+        std::exit(1);
+    }
+
+    std::vector<__half> packed(
+        static_cast<uint64_t>(layers) * tile_capacity * block_elems);
+    auto load_tile = [&](uint32_t first, uint32_t count) {
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            std::memcpy(
+                packed.data() +
+                    static_cast<uint64_t>(layer) * count * block_elems,
+                kbar.data() +
+                    (static_cast<uint64_t>(layer) * blocks + first) *
+                        block_elems,
+                static_cast<size_t>(count * block_elems) *
+                    sizeof(__half));
+        }
+        CHECK(cudaMemcpy(
+            d_tile, packed.data(),
+            static_cast<size_t>(layers) * count * block_elems *
+                sizeof(__half),
+            cudaMemcpyHostToDevice));
+    };
+    const uint32_t tiles =
+        (blocks + tile_capacity - 1) / tile_capacity;
+    for (uint32_t tile = 0; tile < tiles; ++tile) {
+        const uint32_t first = tile * tile_capacity;
+        const uint32_t count =
+            std::min(tile_capacity, blocks - first);
+        load_tile(first, count);
+        if (!qw3::ported::launch_block_attn_stream_lse_typed(
+                d_max, d_sum, d_q, /*query_is_fp16=*/true, d_tile,
+                qw3::ported::KbarDType::F16, layers, tokens, tokens,
+                count, count, first, heads, kv_heads, dim, scale,
+                excl_lo, excl_hi, subblocks,
+                /*initialize=*/tile == 0 ? 1u : 0u, /*stream=*/0)) {
+            std::fprintf(stderr, "streamed LSE scorer rejected tile\n");
+            std::exit(1);
+        }
+    }
+    for (uint32_t tile = 0; tile < tiles; ++tile) {
+        const uint32_t first = tile * tile_capacity;
+        const uint32_t count =
+            std::min(tile_capacity, blocks - first);
+        load_tile(first, count);
+        if (!qw3::ported::launch_block_attn_stream_score_typed(
+                d_streamed, d_q, /*query_is_fp16=*/true, d_tile,
+                qw3::ported::KbarDType::F16, d_max, d_sum,
+                layers, tokens, tokens, count, count, first,
+                heads, kv_heads, dim, scale, excl_lo, excl_hi,
+                subblocks, reduce_max ? 1u : 0u,
+                /*accumulate=*/0, /*stream=*/0)) {
+            std::fprintf(stderr, "streamed score scorer rejected tile\n");
+            std::exit(1);
+        }
+    }
+    CHECK(cudaDeviceSynchronize());
+    std::vector<float> resident(blocks), streamed(blocks);
+    CHECK(cudaMemcpy(
+        resident.data(), d_resident, blocks * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(
+        streamed.data(), d_streamed, blocks * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    compare(
+        reduce_max ? "streamed-fp16-subblock-max"
+                   : "streamed-fp16-subblock-sum",
+        streamed, resident, 3e-6, 3e-3);
+
+    // Existing semantic expansion can produce groups that cross staging-tile
+    // boundaries. Verify both its max and mass reductions use the same global
+    // softmax normalization as the resident scorer.
+    const std::vector<int32_t> group_begin{
+        static_cast<int32_t>(subblocks),
+        static_cast<int32_t>(tile_capacity * subblocks - 7),
+        static_cast<int32_t>(2 * tile_capacity * subblocks - 11),
+        static_cast<int32_t>(4 * tile_capacity * subblocks - 5)};
+    const std::vector<int32_t> group_end{
+        static_cast<int32_t>(tile_capacity * subblocks + 9),
+        static_cast<int32_t>(2 * tile_capacity * subblocks + 13),
+        static_cast<int32_t>(4 * tile_capacity * subblocks + 17),
+        static_cast<int32_t>(blocks * subblocks - subblocks)};
+    const uint32_t groups =
+        static_cast<uint32_t>(group_begin.size());
+    int32_t *d_group_begin = nullptr;
+    int32_t *d_group_end = nullptr;
+    float *d_group_dist = nullptr;
+    CHECK(cudaMalloc(&d_group_begin, groups * sizeof(int32_t)));
+    CHECK(cudaMalloc(&d_group_end, groups * sizeof(int32_t)));
+    CHECK(cudaMalloc(
+        &d_group_dist,
+        static_cast<uint64_t>(groups) * distributions * sizeof(float)));
+    CHECK(cudaMemcpy(
+        d_group_begin, group_begin.data(), groups * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(
+        d_group_end, group_end.data(), groups * sizeof(int32_t),
+        cudaMemcpyHostToDevice));
+    for (uint32_t reduce_mass : {0u, 1u}) {
+        if (!qw3::ported::launch_block_attn_score_softmax_groups_typed(
+                d_resident, d_q, /*query_is_fp16=*/true, d_kbar,
+                qw3::ported::KbarDType::F16, d_group_begin, d_group_end,
+                groups, layers, tokens, tokens, blocks, blocks,
+                heads, kv_heads, dim, scale, excl_lo, excl_hi,
+                subblocks, reduce_mass, /*accumulate=*/0, /*stream=*/0)) {
+            std::fprintf(stderr, "resident group scorer rejected streamed test\n");
+            std::exit(1);
+        }
+        CHECK(cudaMemset(
+            d_group_dist, 0,
+            static_cast<uint64_t>(groups) * distributions *
+                sizeof(float)));
+        for (uint32_t tile = 0; tile < tiles; ++tile) {
+            const uint32_t first = tile * tile_capacity;
+            const uint32_t count =
+                std::min(tile_capacity, blocks - first);
+            load_tile(first, count);
+            if (!qw3::ported::launch_block_attn_stream_group_update_typed(
+                    d_group_dist, d_q, /*query_is_fp16=*/true, d_tile,
+                    qw3::ported::KbarDType::F16, d_max, d_sum,
+                    d_group_begin, d_group_end, groups, layers,
+                    tokens, tokens, count, count, first, heads,
+                    kv_heads, dim, scale, excl_lo, excl_hi,
+                    subblocks, reduce_mass, /*stream=*/0)) {
+                std::fprintf(
+                    stderr, "streamed group scorer rejected tile\n");
+                std::exit(1);
+            }
+        }
+        if (!qw3::ported::launch_block_attn_stream_group_finalize(
+                d_streamed, d_group_dist, groups, distributions,
+                1.0f / static_cast<float>(layers * heads),
+                /*accumulate=*/0, /*stream=*/0)) {
+            std::fprintf(stderr, "streamed group finalize rejected\n");
+            std::exit(1);
+        }
+        CHECK(cudaDeviceSynchronize());
+        resident.resize(groups);
+        streamed.resize(groups);
+        CHECK(cudaMemcpy(
+            resident.data(), d_resident, groups * sizeof(float),
+            cudaMemcpyDeviceToHost));
+        CHECK(cudaMemcpy(
+            streamed.data(), d_streamed, groups * sizeof(float),
+            cudaMemcpyDeviceToHost));
+        compare(
+            reduce_mass ? "streamed-fp16-groups-mass"
+                        : "streamed-fp16-groups-max",
+            streamed, resident, 3e-6, 3e-3);
+    }
+
+    CHECK(cudaFree(d_group_dist));
+    CHECK(cudaFree(d_group_end));
+    CHECK(cudaFree(d_group_begin));
+    CHECK(cudaFree(d_sum));
+    CHECK(cudaFree(d_max));
+    CHECK(cudaFree(d_streamed));
+    CHECK(cudaFree(d_resident));
+    CHECK(cudaFree(d_tile));
+    CHECK(cudaFree(d_kbar));
+    CHECK(cudaFree(d_q));
+}
+
 static void run_case(const Case &tc) {
     constexpr uint32_t layers = 2;
     constexpr uint32_t tokens = 3;
@@ -458,6 +723,172 @@ static void run_fp16_query_chunk_test() {
     CHECK(cudaFree(d_q));
 }
 
+static std::vector<float> host_group_reference(
+        const std::vector<float> &q,
+        const std::vector<float> &kbar,
+        const std::vector<int32_t> &group_begin,
+        const std::vector<int32_t> &group_end,
+        uint32_t layers, uint32_t tokens, uint32_t q_stride,
+        uint32_t blocks, uint32_t kbar_stride, uint32_t heads,
+        uint32_t kv_heads, uint32_t dim, float scale,
+        uint32_t excl_lo, uint32_t excl_hi, uint32_t subblocks,
+        bool reduce_mass) {
+    const uint32_t total = blocks * subblocks;
+    const uint32_t head_group = heads / kv_heads;
+    std::vector<double> logits(total);
+    std::vector<double> accum(group_begin.size(), 0.0);
+    for (uint32_t l = 0; l < layers; ++l) {
+        for (uint32_t t = 0; t < tokens; ++t) {
+            for (uint32_t h = 0; h < heads; ++h) {
+                const uint32_t kh = h / head_group;
+                double row_max = -INFINITY;
+                for (uint32_t p = 0; p < total; ++p) {
+                    const uint32_t w = p / subblocks;
+                    if (w < excl_lo || w >= excl_hi) {
+                        logits[p] = -INFINITY;
+                        continue;
+                    }
+                    double dot = 0.0;
+                    for (uint32_t d = 0; d < dim; ++d) {
+                        const uint64_t qi =
+                            ((static_cast<uint64_t>(l) * q_stride + t) *
+                                 heads + h) * dim + d;
+                        const uint64_t ki =
+                            (((static_cast<uint64_t>(l) * kbar_stride *
+                                   subblocks + p) *
+                                  kv_heads + kh) * dim) + d;
+                        dot += static_cast<double>(q[qi]) * kbar[ki];
+                    }
+                    logits[p] = dot * scale;
+                    row_max = std::max(row_max, logits[p]);
+                }
+                double sum = 0.0;
+                for (double value : logits) {
+                    if (std::isfinite(value)) {
+                        sum += std::exp(value - row_max);
+                    }
+                }
+                if (!(sum > 0.0)) continue;
+                for (uint32_t g = 0; g < group_begin.size(); ++g) {
+                    double mass = 0.0;
+                    for (int32_t p = group_begin[g];
+                         p < group_end[g]; ++p) {
+                        if (p >= 0 &&
+                            static_cast<uint32_t>(p) < total) {
+                            const double probability =
+                                std::exp(logits[p] - row_max) / sum;
+                            mass = reduce_mass
+                                ? mass + probability
+                                : std::max(mass, probability);
+                        }
+                    }
+                    accum[g] += mass;
+                }
+            }
+        }
+    }
+    const double weight =
+        1.0 / (static_cast<double>(layers) * heads);
+    std::vector<float> result(accum.size());
+    for (uint32_t g = 0; g < accum.size(); ++g) {
+        result[g] = static_cast<float>(accum[g] * weight);
+    }
+    return result;
+}
+
+static void run_round_group_test(
+        uint32_t blocks, uint32_t subblocks, bool reduce_mass) {
+    constexpr uint32_t layers = 2;
+    constexpr uint32_t tokens = 5;
+    constexpr uint32_t q_stride = tokens;
+    constexpr uint32_t heads = 4;
+    constexpr uint32_t kv_heads = 2;
+    constexpr uint32_t dim = 8;
+    const uint32_t kbar_stride = blocks + 3;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dim));
+    const uint32_t total = blocks * subblocks;
+    const std::vector<int32_t> group_begin{
+        static_cast<int32_t>(subblocks),
+        static_cast<int32_t>(total / 5),
+        static_cast<int32_t>(total / 2 - 1),
+        static_cast<int32_t>(total * 3 / 4)};
+    const std::vector<int32_t> group_end{
+        static_cast<int32_t>(total / 5 + 3),
+        static_cast<int32_t>(total / 2 + 2),
+        static_cast<int32_t>(total * 3 / 4 + 5),
+        static_cast<int32_t>(total - subblocks)};
+    const uint64_t q_count =
+        static_cast<uint64_t>(layers) * q_stride * heads * dim;
+    const uint64_t k_count =
+        static_cast<uint64_t>(layers) * kbar_stride * subblocks *
+        kv_heads * dim;
+    std::mt19937 rng(9917 + blocks + subblocks);
+    std::normal_distribution<float> nd(0.0f, 0.35f);
+    std::vector<float> q(q_count), kbar(k_count);
+    for (float &value : q) value = nd(rng);
+    for (float &value : kbar) value = nd(rng);
+
+    float *d_q = nullptr;
+    float *d_kbar = nullptr;
+    float *d_score = nullptr;
+    int32_t *d_group_begin = nullptr;
+    int32_t *d_group_end = nullptr;
+    CHECK(cudaMalloc(&d_q, q_count * sizeof(float)));
+    CHECK(cudaMalloc(&d_kbar, k_count * sizeof(float)));
+    CHECK(cudaMalloc(&d_score, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&d_group_begin,
+                     group_begin.size() * sizeof(int32_t)));
+    CHECK(cudaMalloc(&d_group_end,
+                     group_end.size() * sizeof(int32_t)));
+    CHECK(cudaMemcpy(d_q, q.data(), q_count * sizeof(float),
+                     cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_kbar, kbar.data(), k_count * sizeof(float),
+                     cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_group_begin, group_begin.data(),
+                     group_begin.size() * sizeof(int32_t),
+                     cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_group_end, group_end.data(),
+                     group_end.size() * sizeof(int32_t),
+                     cudaMemcpyHostToDevice));
+
+    if (!qw3::ported::launch_block_attn_score_softmax_groups_typed(
+            d_score, d_q, false, d_kbar,
+            qw3::ported::KbarDType::F32,
+            d_group_begin, d_group_end,
+            static_cast<uint32_t>(group_begin.size()),
+            layers, tokens, q_stride, blocks, kbar_stride,
+            heads, kv_heads, dim, scale,
+            /*excl_lo_end=*/1, /*excl_hi_begin=*/blocks - 1,
+            subblocks, reduce_mass ? 1u : 0u,
+            /*accumulate=*/0, /*stream=*/0)) {
+        std::fprintf(stderr,
+                     "round group launcher rejected B=%u ns=%u\n",
+                     blocks, subblocks);
+        std::exit(1);
+    }
+    CHECK(cudaDeviceSynchronize());
+    std::vector<float> actual(group_begin.size());
+    CHECK(cudaMemcpy(actual.data(), d_score,
+                     actual.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost));
+    const std::vector<float> expected = host_group_reference(
+        q, kbar, group_begin, group_end,
+        layers, tokens, q_stride, blocks, kbar_stride,
+        heads, kv_heads, dim, scale, 1, blocks - 1, subblocks,
+        reduce_mass);
+    char label[96];
+    std::snprintf(label, sizeof(label),
+                  "semantic-groups-vs-host B=%u ns=%u reduce=%s",
+                  blocks, subblocks, reduce_mass ? "mass" : "max");
+    compare(label, actual, expected, 3e-6, 3e-3);
+
+    CHECK(cudaFree(d_group_end));
+    CHECK(cudaFree(d_group_begin));
+    CHECK(cudaFree(d_score));
+    CHECK(cudaFree(d_kbar));
+    CHECK(cudaFree(d_q));
+}
+
 static float benchmark_path(float *d_score,
                             const float *d_q,
                             const __half *d_kbar,
@@ -570,6 +1001,16 @@ int main(int argc, char **argv) {
     run_case({4100, 2, 3, 4095, false});
     run_case({4100, 2, 3, 4095, true});
     run_fp16_query_chunk_test();
+    run_round_group_test(/*blocks=*/16, /*subblocks=*/4,
+                         /*reduce_mass=*/false);
+    run_round_group_test(/*blocks=*/16, /*subblocks=*/4,
+                         /*reduce_mass=*/true);
+    run_round_group_test(/*blocks=*/600, /*subblocks=*/16,
+                         /*reduce_mass=*/false);
+    run_round_group_test(/*blocks=*/600, /*subblocks=*/16,
+                         /*reduce_mass=*/true);
+    run_streamed_index_test(/*reduce_max=*/false);
+    run_streamed_index_test(/*reduce_max=*/true);
     unsetenv("QW3_KVMEM_SOFTMAX_PAGES_FORCE_TILED");
     unsetenv("QW3_KVMEM_SOFTMAX_PAGES_SCALABLE");
     std::printf("[kvmem-softmax-pages] PASS\n");

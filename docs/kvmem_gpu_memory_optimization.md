@@ -225,15 +225,18 @@ CPU raw-K
 
 #### 代价与边界
 
-这一改动是显存向 CPU 内存的迁移，不是系统总内存凭空消失：
+这一改动是显存向 CPU/SSD 分层的迁移，不是系统总内存凭空消失：
 
 - Qwen3.6-27B FP16 raw-K 每 256K 真实上下文约占 8 GiB CPU 内存；
-- raw-K 当前按需分配在 CPU；
+- 默认兼容路径仍按需分配完整 CPU raw-K；
+- `--kvmem-raw-k-nvme` 将 SSD 设为完整 raw-K backing，CPU chunk
+  变为受 `--kvmem-cpu-gb` 限制的缓存；
 - V 和其他 tiered KV 可以进入 NVMe；
-- raw-K 本身还没有完整的 NVMe authority/offload 实现。
+- cold selected raw-K 按物理 block 范围直接读入双缓冲 staging，不加载完整
+  2048-token chunk。
 
-因此，10M 上下文的 raw-K 仍可能需要数百 GiB CPU 内存。未来需要给 raw-K
-增加 NVMe 分层、块级索引和预测预取。
+因此，10M 上下文不再要求数百 GiB CPU raw-K；代价是 SSD authority 容量和
+cold-block 读取延迟。后续仍需用 io_uring/固定 buffer 和预测预取进一步隐藏 I/O。
 
 相关实现与证据：
 
@@ -660,7 +663,7 @@ active KV 已按 KVMem budget 有界，但 mean-K index stride 按完整 context
 - 只把当前打分 tile 搬到 GPU；
 - 热块索引常驻 GPU、冷块索引放 CPU/NVMe。
 
-### 7.2 Immutable raw-K 仍随完整历史占用 CPU
+### 7.2 Immutable raw-K 的 SSD authority
 
 raw-K 约为 32 KiB/token：
 
@@ -670,13 +673,24 @@ raw-K 约为 32 KiB/token：
 10M  -> 约 305 GiB CPU
 ```
 
-当前 raw-K 还不能像 V 一样完整进入 NVMe tier。要支持10M，需要：
+默认关闭 `--kvmem-raw-k-nvme` 时，raw-K 仍随完整历史占用 CPU。开启后：
 
-- raw-K chunk 的 NVMe authority；
-- CPU 热块缓存；
-- retrieval完成后的预测预取；
-- packed sequential read；
-- raw-K H2D 与 query replay/assembly 重叠。
+- admission 从总 NVMe budget 先保留完整 raw-K arena；
+- CPU 成为有界 raw-K/V cache；
+- 完整对齐 chunk 直接 D2H 到两个固定 pinned record slot；
+- main/MTP GPU raw-capture tensor 都固定为两组，轮回复用时通过 stream
+  event 建立依赖，避免下一 chunk 覆盖尚未完成 D2H 的源；
+- 每批只记录 CUDA transfer fence，不在每个 chunk 后同步 host；后台写线程先
+  等 fence，CPU cache copy 在 slot 回收前才发布；
+- 默认每个 slot 合并最多三个连续 FP8+MTP record，由后台线程执行一次
+  大块 `pwrite` 和一次 range writeback；
+- staging slot 复用、prefix checkpoint、truncate/reset 或 in-flight chunk
+  冷淘汰时才等待；dirty partial chunk 仍在淘汰前同步落盘；
+- retrieval 后只读取 selected raw-K block；
+- 固定 pinned/device staging 与 GPU scatter/RoPE 继续双缓冲。
+
+10M FP8 + local-position MTP 的 raw-K authority 约 162.13 GiB，V authority
+也约 162.13 GiB；因此 360 GiB NVMe 配额可留出约 35 GiB 余量。
 
 ### 7.3 CUDA allocator 和 runtime 高水位
 

@@ -1,6 +1,8 @@
 #include "qw3/kvmem_store.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -413,6 +415,122 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks(
     selected.reserve(kept_count);
     for (uint32_t i = 0; i < n; ++i) {
         if (kept[i]) selected.push_back(i);
+    }
+    return selected;
+}
+
+std::vector<uint32_t> KvMemStore::pick_semantic_groups(
+        const std::vector<std::pair<uint32_t, uint32_t>> &groups,
+        const std::vector<double> &group_scores,
+        const std::vector<uint32_t> &mandatory_blocks) const {
+    const uint32_t n = block_count();
+    std::vector<uint32_t> selected;
+    if (n == 0) return selected;
+    if (groups.size() != group_scores.size()) {
+        throw std::runtime_error(
+            "KVMem semantic group spans/scores size mismatch");
+    }
+
+    const uint32_t budget = budget_blocks();
+    if (budget == 0 || n <= budget) {
+        selected.reserve(n);
+        for (uint32_t id = 0; id < n; ++id) selected.push_back(id);
+        return selected;
+    }
+
+    std::vector<uint8_t> kept(n, 0);
+    uint32_t kept_count = 0;
+    auto keep = [&](uint32_t id) {
+        if (id < n && !kept[id]) {
+            kept[id] = 1;
+            ++kept_count;
+        }
+    };
+
+    const uint32_t sink = std::min(cfg_.sink_blocks, n);
+    const uint32_t recent = std::min(cfg_.recent_blocks, n);
+    for (uint32_t id = 0; id < sink && kept_count < budget; ++id) keep(id);
+    for (uint32_t id : mandatory_blocks) keep(id);
+    if (kept_count > budget) {
+        throw std::runtime_error(
+            "KVMem mandatory semantic selection plus sink blocks exceeds the "
+            "configured selection budget");
+    }
+    for (uint32_t i = 0; i < recent && kept_count < budget; ++i) {
+        keep(n - 1 - i);
+    }
+
+    struct Candidate {
+        uint32_t group = 0;
+        uint32_t first = 0;
+        uint32_t last = 0;
+        double score = 0.0;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(groups.size());
+    const uint32_t bt = std::max<uint32_t>(1, cfg_.block_tokens);
+    const uint64_t covered_tokens =
+        static_cast<uint64_t>(blocks_.back().orig_pos_start) +
+        blocks_.back().n_tokens;
+    for (uint32_t g = 0; g < groups.size(); ++g) {
+        const uint32_t begin = groups[g].first;
+        const uint32_t end = groups[g].second;
+        if (end <= begin || begin >= covered_tokens) continue;
+        const uint32_t capped_end = static_cast<uint32_t>(
+            std::min<uint64_t>(end, covered_tokens));
+        const uint32_t first = begin / bt;
+        const uint32_t last = (capped_end - 1) / bt;
+        if (first >= n) continue;
+        candidates.push_back(Candidate{
+            g, first, std::min(last, n - 1), group_scores[g]});
+    }
+
+    // GPU has already reduced fine-grained sub-block scores to one score per
+    // logical group. Sorting O(groups log groups) is negligible for normal
+    // conversation histories. Recency is the deterministic tie-break.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate &a, const Candidate &b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.group > b.group;
+              });
+
+    uint32_t selected_groups = 0;
+    uint32_t skipped_for_budget = 0;
+    for (const Candidate &candidate : candidates) {
+        uint32_t new_blocks = 0;
+        for (uint32_t id = candidate.first; id <= candidate.last; ++id) {
+            new_blocks += kept[id] ? 0u : 1u;
+        }
+        if (new_blocks > budget - kept_count) {
+            ++skipped_for_budget;
+            continue;
+        }
+        for (uint32_t id = candidate.first; id <= candidate.last; ++id) {
+            keep(id);
+        }
+        ++selected_groups;
+        if (kept_count == budget) break;
+    }
+
+    selected.reserve(kept_count);
+    for (uint32_t id = 0; id < n; ++id) {
+        if (kept[id]) selected.push_back(id);
+    }
+    if (std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(
+            stderr,
+            "[bs-semantic-select] mode=%s reduce=%s alpha=%.3f "
+            "groups=%zu candidates=%zu selected_groups=%u "
+            "selected_blocks=%u budget_blocks=%u skipped_for_budget=%u "
+            "unused_blocks=%u\n",
+            cfg_.semantic_expansion == KvMemSemanticExpansion::Message
+                ? "message" : "round",
+            cfg_.group_score_reduce ==
+                    KvMemGroupScoreReduce::LengthNormalizedMass
+                ? "length-normalized-mass" : "max",
+            cfg_.group_length_norm_alpha,
+            groups.size(), candidates.size(), selected_groups, kept_count,
+            budget, skipped_for_budget, budget - kept_count);
     }
     return selected;
 }

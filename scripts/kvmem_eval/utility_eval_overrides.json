@@ -114,6 +114,23 @@
     "agentlongbench_1m_full50_k224k_g32k_b512_sb16max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727": {
       "label": "AgentLongBench 1M 50 条，B512/SB16-Max",
       "note": "512-token physical block，16 个 32-token subblock 取 max；未生成通过的 validation_report 前只能引用为进行中结果。"
+    },
+    "agentlongbench_1m_round_only_smoke_20260728_140900": {
+      "label": "AgentLongBench 1M round-only 启动失败（无效）",
+      "status": "invalid-infrastructure",
+      "note": "基础设施失败：默认 Q8 BF16 主激活与 MTP prefix scratch 复用触发不支持的 BF16 RMSNorm 输出，SSE finish_reason=error 被旧 runner 误记为空答案并评分为 0；该行不能作为准确率结果。"
+    },
+    "agentlongbench_1m_round_only_smoke_20260728_141500": {
+      "label": "AgentLongBench 1M round-only 单样本 smoke",
+      "note": "469 个 round 全部参与 MaxSim；最终整组选中 74 个 round/448 个物理 blocks，scorer fallback=0。该样本由同配置 B512/SB16-Max 基线的错误答案 0 恢复为正确答案 1，但 temperature=0.6 且 reasoning 含猜测，只能作为端到端 smoke，不能外推总体提升。"
+    },
+    "agentlongbench_1m_round_padding_ab_20260728_162830_padding32": {
+      "label": "AgentLongBench 1M round-only，换行补齐 B32 smoke",
+      "note": "受控 A/B 的 padding arm：469 个 round 共插入 7,371 个单-token 换行（原 prompt 的 0.72%），所有 round 起点按 32-token 物理边界对齐，最终选中 78 个 round/7,168 blocks，fallback=0。该样本官方分数 0；审计确认目标 Round 235 的 148 个 blocks 覆盖为 0/148，故失败属于 retrieval miss，不能用于判断补齐后的 KV 表示质量。"
+    },
+    "agentlongbench_1m_round_padding_ab_20260728_162830_unpadded": {
+      "label": "AgentLongBench 1M round-only，未补齐 B32 对照 smoke",
+      "note": "与 padding arm 完全相同的单样本对照，仅关闭换行补齐；最终选中 81 个 round/7,162 blocks，fallback=0，官方分数 1。审计同样确认目标 Round 235 覆盖为 0/148；因此正确答案更可能是计数答案 1 的偶然猜中，不能解释为未补齐检索更好。"
     }
   }
 }

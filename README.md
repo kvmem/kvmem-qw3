@@ -1128,15 +1128,17 @@ KVMem CLI parameters:
 | `--kvmem-profile-blocks N` | `0` | Quota-policy profile block count. `0` derives from remaining budget. |
 | `--kvmem-update-mode M` | `interval` | Reselect cadence: `interval` or `step`. `step` selects after prefill and does not automatically reselect during decode. |
 | `--kvmem-interval N` | `64` | Decode tokens between reselections when `--kvmem-update-mode interval` is used. |
-| `--kvmem-immutable-k` | on | Store unrotated standard-layer K in CPU memory, keep one active GPU K copy, and periodically rebuild from raw K to bound re-RoPE drift. With MTP, the same raw-K authority keeps MTP RoPE inside the compact window. |
+| `--kvmem-immutable-k` | on | Store unrotated standard-layer K in a CPU authority/cache, keep one active GPU K copy, and periodically rebuild from raw K to bound re-RoPE drift. With MTP, the same raw-K authority keeps MTP RoPE inside the compact window. |
 | `--no-kvmem-immutable-k` | off | Legacy ablation: no CPU raw-K mirror; repeatedly remap the active GPU K in place. |
+| `--kvmem-raw-k-nvme` | off | Reserve a fixed raw-K authority arena from the configured NVMe budget. CPU raw-K chunks become a bounded cache; full prefill chunks D2H into two fixed pinned writeback slots without a per-chunk host wait, consecutive records are coalesced and written on background workers after their CUDA fence, and cold selected blocks are read directly into packed staging without loading their complete chunk. Requires immutable K, CPU staging/cache capacity, and NVMe directory/budget. |
+| `--no-kvmem-raw-k-nvme` | on | Keep the complete immutable raw-K authority in CPU memory (compatibility default). |
 | `--kvmem-gpu-memory-ratio F` | `0.50` | Approximate fraction of GPU memory that KVMem may use for its bounded GPU KV pool. |
 | `--kvmem-gpu-high-watermark F` | `0.95` | GPU tier high-watermark knob reserved for tiering policy. Leave at default for normal tests. |
 | `--kvmem-gpu-low-watermark F` | `0.85` | GPU tier low-watermark knob reserved for tiering policy. Leave at default for normal tests. |
-| `--kvmem-cpu-gb F` | `0` | Total KVMem CPU budget in GiB. Immutable mode reserves its raw-K mirror first and uses the remainder for the pinned V tier. |
+| `--kvmem-cpu-gb F` | `0` | Total KVMem CPU budget in GiB. Without raw-K NVMe, immutable mode reserves its complete raw-K mirror first. With raw-K NVMe, this bounds the shared raw-K/V CPU cache. |
 | `--kvmem-cpu-bytes N` | `0` | Legacy byte-level CPU tier budget. Prefer `--kvmem-cpu-gb` for manual runs. |
 | `--kvmem-nvme-dir DIR` | unset | Directory for the NVMe backing file. Required when NVMe tier budget is nonzero. |
-| `--kvmem-nvme-gb F` | `0` | NVMe tier budget in GiB. Requires `--kvmem-nvme-dir`. |
+| `--kvmem-nvme-gb F` | `0` | Total NVMe tier budget in GiB. With `--kvmem-raw-k-nvme`, raw-K capacity is reserved first and the remainder backs ordinary V spill records. Requires `--kvmem-nvme-dir`. |
 | `--kvmem-nvme-bytes N` | `0` | Legacy byte-level NVMe tier budget. Prefer `--kvmem-nvme-gb` for manual runs. |
 
 `--kvmem-cpu-gb` and `--kvmem-nvme-gb` use GiB units
@@ -1154,6 +1156,7 @@ Useful KVMem environment variables:
 | `QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS=N` | Rebuild after N accumulated absolute position-token displacement. Default: 262144; 0 disables this threshold. |
 | `QW3_KVMEM_IMMUTABLE_MAX_BAKED_POSITION=N` | Force raw rebuild when the current GPU K was baked beyond this position. Default: the model's native context limit. |
 | `QW3_KVMEM_RAW_K_TRANSFER_BLOCKS=N` | Raw-K CPU gather/H2D batch size in blocks. Default: 128. |
+| `QW3_KVMEM_IO_SLAB_MIB=N` | Target size of each fixed KVMem I/O slab. The raw-K NVMe writer allocates two pinned slots and packs as many complete records as fit in each slot (three 34 MiB records at the 128 MiB default for Qwen3.6-27B FP8+MTP). |
 | `QW3_KVMEM_ASSEMBLY_MODE=legacy\|table\|pipeline` | Select the immutable-K assembly implementation for A/B tests. `legacy` computes transcendental RoPE values in each remap kernel; `table` uses one cached FP32 sin/cos table; `pipeline` additionally overlaps two-slot CPU gather, H2D, and GPU scatter. Opt3 defaults to `pipeline`; lower profiles default to `table`. |
 | `QW3_KVMEM_CPU_GATHER_THREADS=N` | CPU workers used to gather immutable raw-K into contiguous pinned transfer buffers. Default: 4 in pipeline mode and 1 otherwise. |
 | `QW3_KVMEM_MTP_LOCAL_POSITIONS=0|1` | Separate MTP logical page identity from compact RoPE coordinates and materialize selected MTP K from unrotated CPU raw K. Default: `1` with immutable K; `0` is the legacy long-position A/B path. |

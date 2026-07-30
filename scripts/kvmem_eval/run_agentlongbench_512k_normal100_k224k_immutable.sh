@@ -49,7 +49,8 @@ if [[ "$KV_DTYPE" != "fp16" && "$KV_DTYPE" != "fp8" ]]; then
 fi
 if [[ "$KVMEM_RETRIEVAL_METHOD" != "mean-k" &&
       "$KVMEM_RETRIEVAL_METHOD" != "per-token" &&
-      "$KVMEM_RETRIEVAL_METHOD" != "sub-block-mean-k" ]]; then
+      "$KVMEM_RETRIEVAL_METHOD" != "sub-block-mean-k" &&
+      "$KVMEM_RETRIEVAL_METHOD" != "key-direction-fixed4" ]]; then
   echo "invalid KVMEM_RETRIEVAL_METHOD: $KVMEM_RETRIEVAL_METHOD" >&2
   exit 2
 fi
@@ -178,6 +179,7 @@ env \
   QW3_KVMEM_IMMUTABLE_SOURCE_K=1 \
   QW3_KVMEM_TRACE=1 \
   QW3_KVMEM_TIMING=1 \
+  QW3_Q8_BF16_MAIN=0 \
   QW3_FATTN_NSPLIT=1 \
   QW3_PREFILL_FA2_NSPLIT=1 \
   QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \

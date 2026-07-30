@@ -1,0 +1,6 @@
+# Full gold/verification coverage but incorrect under the 2026-07-29
+# AgentLongBench-1M message-expansion + length-normalized-mass run.
+2167e18164c2bfeffc68feb4ebc9e7a66204e04c167289a9643cfcebc267f021
+e7c806d2ed22f4130debda87a1fb9c74b7fec97d28173420dd2d313e19927705
+a63e5201b2e859dade699bb81841a27730edcf9561c562458fa8bf9be9c9ecc9
+cad128acfc7c410134bcd250e4036a9d6a337abfb4a6674a6a086f55e7ae71cc

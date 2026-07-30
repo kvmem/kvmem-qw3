@@ -6178,6 +6178,8 @@ private:
                                  << " cpu_raw_k=" << tu.cpu_raw_k_bytes
                                  << " cpu_spill=" << tu.cpu_spill_bytes
                                  << " nvme_used=" << tu.nvme_used_bytes
+                                 << " nvme_raw_k=" << tu.nvme_raw_k_bytes
+                                 << " nvme_spill=" << tu.nvme_spill_bytes
                                  << " nvme_cap=" << tu.nvme_capacity_bytes;
                             log(tmsg.str());
                         }
@@ -6236,6 +6238,7 @@ private:
         bs_cfg.cpu_tier_bytes = options_.kvmem_cpu_bytes;
         bs_cfg.nvme_tier_bytes = options_.kvmem_nvme_bytes;
         bs_cfg.nvme_tier_dir = options_.kvmem_nvme_dir;
+        bs_cfg.raw_k_nvme = options_.kvmem_raw_k_nvme;
         bs_cfg.immutable_source_k = options_.kvmem_immutable_source_k;
         bs_cfg.mtp_enabled =
             mtp_prefix_enabled(options_) || mtp_speculate_enabled(options_);
@@ -6252,11 +6255,34 @@ private:
         bs_cfg.retrieval_method =
             options_.kvmem_retrieval_method == "per-token"
                 ? KvMemRetrievalMethod::PerToken
-                : (options_.kvmem_retrieval_method == "sub-block-mean-k"
+                : (options_.kvmem_retrieval_method == "sub-block-mean-k" ||
+                   options_.kvmem_retrieval_method ==
+                       "key-direction-fixed4"
                        ? KvMemRetrievalMethod::SubBlockMeanK
                        : (options_.kvmem_retrieval_method == "deltanet"
                               ? KvMemRetrievalMethod::DeltaNet
                               : KvMemRetrievalMethod::MeanK));
+        bs_cfg.index_placement =
+            options_.kvmem_index_placement == "cpu"
+                ? KvMemIndexPlacement::CPU
+                : KvMemIndexPlacement::GPU;
+        bs_cfg.index_staging_bytes =
+            static_cast<uint64_t>(
+                std::max(1, options_.kvmem_index_staging_mb)) *
+            1024ull * 1024ull;
+        if (bs_cfg.index_placement == KvMemIndexPlacement::CPU &&
+            (bs_cfg.retrieval_method == KvMemRetrievalMethod::PerToken ||
+             bs_cfg.retrieval_method == KvMemRetrievalMethod::DeltaNet)) {
+            throw std::runtime_error(
+                "--kvmem-index-placement cpu currently supports "
+                "mean-k and sub-block-mean-k retrieval");
+        }
+        if (bs_cfg.index_placement == KvMemIndexPlacement::CPU &&
+            !options_.kvmem_query_conditioned) {
+            throw std::runtime_error(
+                "--kvmem-index-placement cpu requires "
+                "--kvmem-query-conditioned");
+        }
         bs_cfg.deltanet_layers =
             static_cast<uint32_t>(std::max(0, options_.kvmem_deltanet_layers));
         bs_cfg.deltanet_layer_policy =
@@ -6271,14 +6297,72 @@ private:
             static_cast<uint32_t>(std::max(1, options_.kvmem_deltanet_topk_q));
         bs_cfg.deltanet_topk_h =
             static_cast<uint32_t>(std::max(1, options_.kvmem_deltanet_topk_h));
+        const bool key_direction_fixed4 =
+            options_.kvmem_retrieval_method == "key-direction-fixed4";
         bs_cfg.n_subblocks =
-            bs_cfg.retrieval_method == KvMemRetrievalMethod::SubBlockMeanK
-                ? static_cast<uint32_t>(std::max(1, options_.kvmem_subblocks))
-                : 1u;
+            key_direction_fixed4
+                ? (bs_cfg.block_tokens / 32u) * 4u
+                : (bs_cfg.retrieval_method ==
+                           KvMemRetrievalMethod::SubBlockMeanK
+                       ? static_cast<uint32_t>(
+                             std::max(1, options_.kvmem_subblocks))
+                       : 1u);
+        bs_cfg.prototype_mode =
+            key_direction_fixed4
+                ? KvMemPrototypeMode::KeyDirectionFixed4
+                : KvMemPrototypeMode::Contiguous;
         bs_cfg.subblock_reduce =
             options_.kvmem_subblock_reduce == "sum"
                 ? KvMemSubblockReduce::Sum
                 : KvMemSubblockReduce::Max;
+        if (key_direction_fixed4 &&
+            (bs_cfg.block_tokens < 32 ||
+             bs_cfg.block_tokens % 32 != 0 ||
+             bs_cfg.subblock_reduce != KvMemSubblockReduce::Max)) {
+            throw std::runtime_error(
+                "--kvmem-retrieval-method key-direction-fixed4 currently "
+                "requires --kvmem-block-tokens to be a multiple of 32 and "
+                "--kvmem-subblock-reduce max");
+        }
+        if (options_.kvmem_semantic_expansion == "round") {
+            bs_cfg.semantic_expansion = KvMemSemanticExpansion::Round;
+        } else if (options_.kvmem_semantic_expansion == "message") {
+            bs_cfg.semantic_expansion = KvMemSemanticExpansion::Message;
+        } else {
+            bs_cfg.semantic_expansion = KvMemSemanticExpansion::None;
+        }
+        bs_cfg.group_score_reduce =
+            options_.kvmem_group_score_reduce == "length-normalized-mass"
+                ? KvMemGroupScoreReduce::LengthNormalizedMass
+                : KvMemGroupScoreReduce::Max;
+        bs_cfg.group_length_norm_alpha =
+            options_.kvmem_group_length_alpha;
+        if (bs_cfg.group_length_norm_alpha < 0.0 ||
+            bs_cfg.group_length_norm_alpha > 1.0) {
+            throw std::runtime_error(
+                "--kvmem-group-length-alpha must be in [0,1]");
+        }
+        if (bs_cfg.semantic_expansion == KvMemSemanticExpansion::None &&
+            bs_cfg.group_score_reduce ==
+                KvMemGroupScoreReduce::LengthNormalizedMass) {
+            throw std::runtime_error(
+                "--kvmem-group-score-reduce length-normalized-mass requires "
+                "--kvmem-semantic-expansion round|message");
+        }
+        if (bs_cfg.semantic_expansion != KvMemSemanticExpansion::None &&
+            bs_cfg.retrieval_method != KvMemRetrievalMethod::SubBlockMeanK) {
+            throw std::runtime_error(
+                "--kvmem-semantic-expansion requires "
+                "--kvmem-retrieval-method sub-block-mean-k");
+        }
+        if (bs_cfg.semantic_expansion == KvMemSemanticExpansion::Message) {
+            if (bs_cfg.block_tokens % bs_cfg.n_subblocks != 0 ||
+                bs_cfg.block_tokens / bs_cfg.n_subblocks != 32) {
+                throw std::runtime_error(
+                    "--kvmem-semantic-expansion message requires 32-token "
+                    "scoring slices: block_tokens / subblocks must equal 32");
+            }
+        }
         bs_cfg.update_mode = options_.kvmem_update_mode == "step"
             ? KvMemUpdateMode::Step
             : KvMemUpdateMode::Interval;
@@ -7985,6 +8069,15 @@ private:
                 options.kvmem_context_begin,
                 options.kvmem_context_end,
                 prompt_tokens);
+            std::vector<std::pair<uint32_t, uint32_t>> retrieval_groups;
+            retrieval_groups.reserve(
+                options.kvmem_retrieval_group_spans.size());
+            for (const auto &span :
+                 options.kvmem_retrieval_group_spans) {
+                retrieval_groups.emplace_back(span.begin, span.end);
+            }
+            executor_->kvmem_set_retrieval_group_spans(
+                retrieval_groups);
         }
         const uint32_t query_replay_base = executor_->position();
         const bool query_replay =
@@ -9129,6 +9222,15 @@ private:
                 options.kvmem_context_begin,
                 options.kvmem_context_end,
                 prompt_tokens);
+            std::vector<std::pair<uint32_t, uint32_t>> retrieval_groups;
+            retrieval_groups.reserve(
+                options.kvmem_retrieval_group_spans.size());
+            for (const auto &span :
+                 options.kvmem_retrieval_group_spans) {
+                retrieval_groups.emplace_back(span.begin, span.end);
+            }
+            executor_->kvmem_set_retrieval_group_spans(
+                retrieval_groups);
         }
         const uint32_t query_replay_base = executor_->position();
         const bool query_replay =
@@ -12452,6 +12554,8 @@ private:
                  << " cpu_raw_k=" << tu.cpu_raw_k_bytes
                  << " cpu_spill=" << tu.cpu_spill_bytes
                  << " nvme_used=" << tu.nvme_used_bytes
+                 << " nvme_raw_k=" << tu.nvme_raw_k_bytes
+                 << " nvme_spill=" << tu.nvme_spill_bytes
                  << " nvme_cap=" << tu.nvme_capacity_bytes;
             log(tmsg.str());
         }

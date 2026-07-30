@@ -152,6 +152,17 @@ enum class KvMemSelectPolicy : uint8_t { TopK = 0, Quota = 1 };
 //              the mean-k / per-token scorers (which read standard-attention keys)
 //              this reads the RECURRENT layers' state increments.
 enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMeanK = 2, DeltaNet = 3 };
+// How the multiple Mean-K representatives inside one logical block are formed.
+// Contiguous preserves the existing equal-width sub-block implementation.
+// KeyDirectionFixed4 partitions a logical retrieval block into contiguous
+// 32-token slices, then clusters each layer/KV-head slice's content-frame Keys
+// into four non-contiguous direction groups. A B-token retrieval block therefore
+// stores (B/32)*4 representatives; the scorer can MaxSim-reduce all of them back
+// to the one logical/materialization block.
+enum class KvMemPrototypeMode : uint8_t {
+    Contiguous = 0,
+    KeyDirectionFixed4 = 1,
+};
 // Sub-block score reduction (--kvmem-subblock-reduce; SubBlockMeanK only):
 // Sum aggregates a block's sub-block softmax masses (average attention the block
 // receives); Max scores a block by its single best sub-block (MaxSim-style late
@@ -159,6 +170,19 @@ enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMea
 // layers) so a concentrated relevant sub-region wins instead of being averaged
 // down. At n_subblocks == 1 the two are identical (one sub-block per block).
 enum class KvMemSubblockReduce : uint8_t { Sum = 0, Max = 1 };
+// Logical semantic-group reduction. Max preserves the existing per-query
+// MaxSim behavior. LengthNormalizedMass first sums the globally normalized
+// 32-token attention mass inside the group, then divides the accumulated group
+// score by group_length^group_length_norm_alpha on the host.
+enum class KvMemGroupScoreReduce : uint8_t {
+    Max = 0,
+    LengthNormalizedMass = 1,
+};
+enum class KvMemSemanticExpansion : uint8_t {
+    None = 0,
+    Round = 1,
+    Message = 2,
+};
 enum class KvMemUpdateMode : uint8_t { Interval = 0, Step = 1 };
 enum class KvMemDeltaNetLayerPolicy : uint8_t { Even = 0, Late = 1 };
 
@@ -201,6 +225,11 @@ enum class KvMemOptimizationLevel : uint8_t {
     Opt3 = 3,  // reduce stage-in: pinned H2D pipeline; coalesced SSD reads
 };
 
+enum class KvMemIndexPlacement : uint8_t {
+    GPU = 0,
+    CPU = 1,
+};
+
 struct KvMemStoreConfig {
     uint32_t block_tokens = 128;     // --kvmem-block-tokens
     uint32_t select_budget = 131072; // --kvmem-budget (max window tokens)
@@ -212,9 +241,17 @@ struct KvMemStoreConfig {
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
+    KvMemIndexPlacement index_placement = KvMemIndexPlacement::GPU;
+    uint64_t index_staging_bytes = 64ull * 1024ull * 1024ull;
     uint32_t n_subblocks = 1;        // --kvmem-subblocks; sub-block means per block
                                      // (SubBlockMeanK only; 1 => plain mean-k)
+    KvMemPrototypeMode prototype_mode = KvMemPrototypeMode::Contiguous;
     KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
+    KvMemSemanticExpansion semantic_expansion =
+        KvMemSemanticExpansion::None;
+    KvMemGroupScoreReduce group_score_reduce =
+        KvMemGroupScoreReduce::Max;
+    double group_length_norm_alpha = 0.5;
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
     KvMemOptimizationLevel optimization_level =
         KvMemOptimizationLevel::KvmemInit;
@@ -273,6 +310,10 @@ struct KvMemStoreConfig {
     uint64_t cpu_tier_bytes = 0;
     uint64_t nvme_tier_bytes = 0;
     std::string nvme_tier_dir;
+    // Reserve the first part of --kvmem-nvme-* for an immutable raw-K
+    // authority. CPU raw-K chunks then become a bounded cache and cold selected
+    // blocks stream directly from SSD into the existing packed staging slabs.
+    bool raw_k_nvme = false;
 };
 
 class KvMemStore {
@@ -312,6 +353,18 @@ public:
     // the active RoPE window past `select_budget`.
     std::vector<uint32_t> pick_topk_blocks(
         const std::vector<uint32_t> &mandatory_blocks) const;
+
+    // Select complete variable-length logical groups under the ordinary
+    // fixed-physical-block budget. `groups` are half-open token spans in the
+    // original prompt and `group_scores` contains one GPU-reduced semantic score
+    // per span. Sink/recent/mandatory blocks are charged first. A selected
+    // group contributes every physical block it overlaps; adjacent groups may
+    // share a boundary block, which is charged once. Groups that do not fit are
+    // skipped rather than partially materialized.
+    std::vector<uint32_t> pick_semantic_groups(
+        const std::vector<std::pair<uint32_t, uint32_t>> &groups,
+        const std::vector<double> &group_scores,
+        const std::vector<uint32_t> &mandatory_blocks = {}) const;
 
     // Deterministic working set used only while a long prefill is under memory
     // pressure. Keep the configured sink prefix, then fill every remaining

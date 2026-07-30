@@ -1023,18 +1023,50 @@ profiling history.
 
 At 10M fp16 tokens, immutable raw K alone is approximately 324 GiB and
 historical V is of similar order. A 72 GiB CPU budget cannot keep raw K
-authoritative in DRAM, so demand allocation by itself is not sufficient. The
-next storage format must make raw-K chunks tierable:
+authoritative in DRAM, so demand allocation by itself is not sufficient.
+
+The first raw-K SSD tier was implemented on 2026-07-29 behind
+`--kvmem-raw-k-nvme`:
 
 ```text
 raw-K chunk: CPU-resident | disk-resident | prefetching
 V block:     GPU-resident | CPU-resident | disk-resident | prefetching
 ```
 
-Cold raw-K chunks and V blocks should use one block-addressable disk repository
-with an in-memory location table. Selected raw K and V can then be fetched by
-the same extent planner. CPU DRAM becomes a cache, not a requirement that scales
-with logical context length.
+The configured NVMe budget is split at admission: a fixed-capacity anonymous
+arena reserves every padded raw-K chunk, and the remainder is used by the
+ordinary V tier. Main and local-position MTP raw K share one fixed chunk record.
+Completed chunks use a bounded asynchronous write-through pipeline; dirty
+partial chunks are persisted before CPU eviction. Full aligned prefill chunks
+D2H directly into one of two fixed pinned slots in the final block-major record
+layout. Submission records a CUDA transfer fence instead of synchronizing the
+host after every chunk. The background writer waits that fence before touching
+the pinned bytes. Main and MTP raw-K capture tensors each have two fixed GPU
+generations, preventing the next prefill chunk from overwriting a D2H source;
+reuse queues its prior fence as an execution-stream dependency instead of
+blocking the host. The pageable CPU-cache copy is
+published only after the future completes, immediately before that pinned slot
+can be reused. At the default 128 MiB slab target, one slot packs three
+34 MiB FP8+MTP records.
+`write_spans` coalesces adjacent records into one large `pwrite` and one range
+writeback while the GPU computes later chunks. A slot is waited only when both
+staging slots are owned by SSD, CPU-cache pressure requires recycling one,
+or at correctness boundaries such as prefix checkpoint, truncate, reset, and
+cold eviction of an in-flight chunk. When the shared CPU budget is full, cold
+raw-K chunks can be released instead of making raw-K memory scale with logical
+context length.
+
+Selected cold raw K is read by exact physical block range directly into the
+existing two-slot pinned/device staging pipeline. A 256-token FP8 block across
+16 standard layers is a 4 MiB read; the implementation does not reload its
+complete 32 MiB/2048-token raw chunk. The SSD files use the same
+open-then-immediate-unlink lifecycle as the V arena and leave no stale cache
+after normal exit, exceptions, or `SIGKILL`.
+
+The remaining SSD work is latency/throughput hardening rather than capacity
+correctness: replace the bounded `std::async` positional writer with io_uring
+fixed-buffer batches for both writeback and scattered raw-block reads, and make
+raw-K/V share one global extent planner.
 
 The SSD prefetch pipeline should be:
 
@@ -1403,6 +1435,211 @@ operations with independent compute.
 KVMem does not wait until prefill completes to evict cold blocks. It monitors
 free pages and triggers reselect/offload before the next prefill chunk can
 exhaust the bounded pool.
+
+### 10.9 Three Core Efficiency Optimization Groups
+
+This subsection consolidates the three paper-facing efficiency groups and their
+controlled ablation from
+`docs/kvmem_performance_evaluation_20260726.md`. It is the implementation-level
+definition of the groups. The numerical results remain a historical measurement
+of commit `062b403`, not a new measurement of the current worktree.
+
+`--kvmem-optimize-off` controls only these three groups. In particular,
+`--kvmem-optimize-off all` does not disable KVMem and does not restore an early
+historical implementation. It retains correctness and scalability
+infrastructure such as immutable raw-K, the bounded GPU page pool, page-table
+assembly, capacity checks, and the common asynchronous transfer machinery.
+
+The four controlled cells are:
+
+| Cell | `--kvmem-optimize-off` | Proactive stage-out | Hierarchical reuse | Packed rematerialization |
+|---|---|---:|---:|---:|
+| `all-off` | `all` | off | off | off |
+| `proactive-only` | `hierarchical-reuse,packed-rematerialization` | on | off | off |
+| `proactive-plus-reuse` | `packed-rematerialization` | on | on | off |
+| `all-on` | omitted | on | on | on |
+
+Adjacent cells add exactly one group:
+
+```text
+all-off
+  -> + proactive-stage-out
+  -> + hierarchical-reuse
+  -> + packed-rematerialization
+```
+
+#### 10.9.1 Proactive Stage-Out
+
+**Problem.** Waiting until a pressure boundary to create lower-tier backing
+places GPU gather, D2H, CPU admission, and optional SSD persistence directly on
+the prefill critical path.
+
+**Implementation.**
+
+- After a completed prefill chunk is safe to read, KVMem starts creating clean
+  lower-tier backing for blocks that may subsequently be evicted.
+- GPU pages are gathered into a bounded staging buffer and copied in packed D2H
+  batches through a fixed number of pinned host slabs.
+- CPU-tier admission runs asynchronously. When SSD is configured, persistence
+  can continue in background workers without holding the model-compute thread.
+- Each block records whether its lower-tier copy is clean and authoritative.
+  Pressure eviction can then release an already-backed GPU page by changing
+  ownership metadata rather than copying the block again.
+- The page cannot be recycled until both its final attention reader and any
+  outstanding D2H operation have completed.
+
+This group therefore changes *when* stage-out work is performed and how much of
+it is visible at the pressure boundary. It does not reduce the number of blocks
+that the next semantic window needs to stage in.
+
+#### 10.9.2 Hierarchical Reuse
+
+**Problem.** Consecutive semantic selections normally overlap. Evicting every
+old working-set block and loading every new selected block repeats transfers for
+KV pages that are already resident and valid.
+
+**Implementation.**
+
+- `KvMemStore::set_selection` computes the set difference between the previous
+  and next selected block IDs.
+- Blocks in the intersection retain their physical GPU pages and are not
+  included in stage-out, stage-in, or raw-K refresh plans unless their compact
+  position requires separate rematerialization.
+- Only blocks entering the working set are loaded from a lower tier.
+- Clean CPU/SSD backing is inclusive: retaining a GPU page does not invalidate
+  its lower-tier copy.
+- CPU admission is retrieval/heat/frequency aware. Hot or repeatedly selected
+  blocks are preferentially retained in CPU memory, while SSD serves colder
+  misses.
+- The selected IDs are restored to chronological order before page-table
+  assembly, so reuse does not change attention order.
+
+This group primarily reduces transferred *volume*. It is distinct from making
+an individual PCIe or SSD transfer faster.
+
+#### 10.9.3 Packed Rematerialization
+
+**Problem.** A selected window may contain thousands of scattered historical
+blocks. Per-block CPU copies, H2D calls, scatter operations, and re-RoPE launches
+make cold stage-in and assembly launch-bound and synchronization-heavy.
+
+**Implementation.**
+
+- Immutable raw-K uses a block-major host layout so rows for many selected
+  blocks can be gathered efficiently.
+- Persistent CPU workers gather scattered host blocks into contiguous pinned
+  slabs.
+- Each slab is transferred with a bulk H2D operation into a bounded reusable
+  device buffer.
+- CUDA kernels scatter the slab into arbitrary physical KV pages and apply RoPE
+  for the new compact positions in batches.
+- Double-buffered staging overlaps CPU gather for batch `N+1`, H2D for batch
+  `N`, and GPU scatter/re-RoPE for the preceding batch.
+- V stage-in can overlap raw-K assembly rather than serializing both streams.
+- Adjacent SSD file and buffer spans are coalesced before positional reads.
+- A precomputed FP32 RoPE sin/cos table removes repeated `powf`/`sincosf` work
+  from the rematerialization kernel.
+
+This group reduces both exposed stage-in time and assembly time. It does not
+change the selected block IDs or retrieval scores.
+
+#### 10.9.4 Control and Capability Boundaries
+
+The main control and validation points are:
+
+- CLI parsing: `src/qw3_cli.cpp`;
+- default all-on behavior and deprecated legacy-profile mapping:
+  `src/qwen_native_backend.cpp`;
+- effective-capability checks and `[kvmem-opt-status]` reporting:
+  `src/qwen_executor.cpp`;
+- selection difference, GPU reuse, and raw-refresh plan construction:
+  `src/kvmem_store.cpp`.
+
+In the independent, non-legacy configuration path, a requested group must
+either be supported or be reported as not applicable when the complete context
+already remains GPU-resident. The implementation must not silently turn an
+`all-on` run into a different ablation cell.
+
+The following mechanisms are intentionally outside the three switches because
+they are correctness or common scalability foundations shared by every cell:
+
+- bounded GPU KV page allocation and page-table working-set assembly;
+- step/chunk-level scheduling and headroom-aware prefill chunking;
+- immutable raw-K authority and V-only lower-tier records;
+- demand-allocated host storage and bounded reusable transfer slabs;
+- split prepare/finish scheduling and the common copy stream;
+- incremental mean-K indexing and the scalable mean-K scorer;
+- MTP bounded sibling pages and local-position correctness;
+- capacity validation and page-cache bounding.
+
+Likewise, query replay is an accuracy repair that adds compute, and canonical
+raw-K rebuilding is a correctness control. Neither is a fourth efficiency
+group.
+
+#### 10.9.5 Controlled Measurement at `062b403`
+
+The consolidated measurement used one 515,029-token AgentLongBench sample, a
+200K selected-context budget plus a 32K generation reserve, 32-token physical
+blocks, FP16 active KV, MTP-4, CPU tiering without SSD reads, and canonical
+raw-K reconstruction. Each request contained 12 measured reselection events.
+All four cells produced the same correct final answer.
+
+Request-level results:
+
+| Cell | TTFT (s) | Reselection within TTFT (s) | TTFT minus reselection (s) | Post-TTFT generation (s) | Full request (s) | Peak GPU (MiB) |
+|---|---:|---:|---:|---:|---:|---:|
+| `all-off` | 341.8 | 64.0 | 277.9 | 37.7 | 379.5 | 48,062 |
+| `proactive-only` | 337.8 | 58.8 | 279.0 | 37.3 | 375.1 | 48,004 |
+| `proactive-plus-reuse` | 309.9 | 30.7 | 279.2 | 37.8 | 347.7 | 48,004 |
+| `all-on` | 287.2 | 8.5 | 278.7 | 37.8 | 325.0 | 48,320 |
+
+The non-reselection portion of TTFT stayed within 277.9--279.2 seconds, which
+indicates that the model-prefill workload was stable across the four cells.
+From `all-off` to `all-on`:
+
+- reselection fell from 63.957 s to 8.488 s, an 86.73% reduction or 7.53x
+  working-set-management speedup;
+- TTFT fell from 341.844 s to 287.176 s, a 15.99% reduction;
+- full-request latency fell from 379.530 s to 324.973 s, a 14.37% reduction;
+- peak GPU memory increased by 258 MiB, or 0.54%.
+
+Reselection breakdown:
+
+| Cell | Selection (s) | Stage-out (s) | Stage-in wall (s) | Assembly (s) | Reselection total (s) | GPU reuse / natural overlap |
+|---|---:|---:|---:|---:|---:|---:|
+| `all-off` | 0.033 | 3.645 | 29.039 | 31.239 | 63.957 | 0% |
+| `proactive-only` | 0.039 | 0.268 | 28.995 | 28.992 | 58.843 | 0% |
+| `proactive-plus-reuse` | 0.053 | 0.042 | 1.613 | 28.478 | 30.730 | 100% |
+| `all-on` | 0.051 | 0.050 | 0.310 | 7.901 | 8.488 | 100% |
+
+The adjacent-cell attribution is:
+
+- **Proactive Stage-out:** stage-out fell from 3.645 s to 0.268 s, a 92.65%
+  reduction or 13.60x speedup. Stage-in remained about 29 seconds because this
+  group does not change the next working set.
+- **Hierarchical Reuse:** stage-in fell from 28.995 s to 1.613 s, a 94.44%
+  reduction. All 58,417 naturally overlapping block events remained on GPU,
+  and stage-in block events fell from 76,798 to 18,381.
+- **Packed Rematerialization:** assembly fell from 28.478 s to 7.901 s, a
+  72.26% reduction or 3.60x speedup; exposed stage-in wall time also fell from
+  1.613 s to 0.310 s.
+
+Even after all three groups were enabled, assembly accounted for approximately
+93.1% of measured reselection time in this canonical raw-K experiment. It was
+therefore the dominant remaining bottleneck for that historical configuration.
+This observation must not be combined directly with later bounded re-RoPE,
+FP8, different block sizes, or current runtime-workspace optimizations without
+a new controlled run.
+
+Detailed commands, hardware, raw result paths, metric definitions, and
+limitations remain in
+`docs/kvmem_performance_evaluation_20260726.md`. Supporting focused experiments
+are:
+
+- `docs/kvmem_cpu_proactive_writeback_benchmark_20260725.md`;
+- `docs/kvmem_cpu_transfer_optimization_benchmark_20260724.md`;
+- `docs/kvmem_assembly_rerope_optimization_benchmark_20260724.md`;
+- `docs/kvmem_ssd_writeback_benchmark_20260724.md`.
 
 ## 11. Correctness and Invariants
 
