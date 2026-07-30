@@ -10,9 +10,9 @@ namespace qw3 {
 // Configuration for the kvmem growth-profiling harness. Drives one persistent
 // process that prefills an initial long context and then keeps growing it
 // across "turns" (each turn appends a fresh document chunk and decodes a short
-// probe), measuring the sequential wall-clock cost of every micro-step
-// (selection -> stage-in -> stage-out -> assemble -> prefill -> decode) at each
-// ladder point. kvmem + step update-mode + MTP are forced on by run_kvmem_session.
+// probe), measuring mutually exclusive top-level phases at each ladder point.
+// Nested selection/I/O/assembly counters are also reported, but may overlap.
+// kvmem + step update-mode + MTP are forced on by run_kvmem_session.
 struct KvMemSessionConfig {
     // Cumulative context targets in tokens, e.g. {262144, 524288, 1048576,
     // 1572864, 2097152}. Each turn prefills the delta needed to bring the
@@ -20,6 +20,11 @@ struct KvMemSessionConfig {
     std::vector<uint64_t> ladder_tokens;
     // Tokens to decode (MTP) at each ladder point to sample steady-state TBT.
     int decode_tokens = 256;
+    // Final tokens of each synthetic append that act as an absolute-position
+    // retrieval query. Positive values enable query-conditioned selection and
+    // block-aligned query replay at every above-budget ladder point. Zero keeps
+    // the legacy fallback-score profiler.
+    int query_tokens = 32;
     // Decode-probe sampling. Default is greedy (temp=0) for a stable
     // steady-state throughput probe; --temp/--top-p/--top-k route the Qwen3
     // sampled path (MTP is distribution-lossless under temp>0).

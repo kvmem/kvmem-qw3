@@ -223,6 +223,8 @@ void usage(std::ostream &os) {
         "                        allowed. Must be strictly increasing.\n"
         "                        Default: 256K,512K,1M,1.5M,2M.\n"
         "  --session-decode-tokens N  MTP decode probe length per turn. Default: 256.\n"
+        "  --session-query-tokens N  Tail tokens used as retrieval query at each\n"
+        "                        ladder point. 0 disables query/replay. Default: 32.\n"
         "  --temp F              Decode-probe temperature. Default 0 (greedy);\n"
         "                        --temp>0 uses the Qwen3 sampled recipe.\n"
         "\n"
@@ -353,6 +355,7 @@ int main(int argc, char **argv) {
     std::vector<uint64_t> session_ladder = {262144, 524288, 1048576, 1572864,
                                             2097152};
     int session_decode_tokens = 256;
+    int session_query_tokens = 32;
 
     int arg_start = 1;
     if (argc > 1 && std::string(argv[1]) == "serve") {
@@ -808,6 +811,12 @@ int main(int argc, char **argv) {
                 if (session_decode_tokens <= 0) {
                     throw std::runtime_error("--session-decode-tokens must be > 0");
                 }
+            } else if (arg == "--session-query-tokens") {
+                session_query_tokens = parse_int(need(arg), arg);
+                if (session_query_tokens < 0) {
+                    throw std::runtime_error(
+                        "--session-query-tokens must be >= 0");
+                }
             } else {
                 throw std::runtime_error("unknown argument: " + arg);
             }
@@ -925,6 +934,11 @@ int main(int argc, char **argv) {
             qw3::KvMemSessionConfig sess;
             sess.ladder_tokens = session_ladder;
             sess.decode_tokens = session_decode_tokens;
+            sess.query_tokens = session_query_tokens;
+            if (session_query_tokens > 0) {
+                engine.kvmem_query_conditioned = true;
+                setenv("QW3_KVMEM_QUERY_REPLAY", "1", 1);
+            }
             // Default greedy; --temp opts the decode probe into the Qwen3
             // sampled recipe (top_p/top_k carry their gen defaults 0.95/20).
             if (serve_cfg.temperature_set) {

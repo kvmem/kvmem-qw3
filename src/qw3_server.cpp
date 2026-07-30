@@ -1932,6 +1932,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     svr.Post("/v1/chat/completions", [&](const httplib::Request &hreq,
                                          httplib::Response &res) {
+        const auto server_request_start = std::chrono::steady_clock::now();
         json req;
         try {
             req = json::parse(hreq.body);
@@ -1941,6 +1942,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             "application/json");
             return;
         }
+        const auto server_json_end = std::chrono::steady_clock::now();
         if (!req.contains("messages") || !req["messages"].is_array()) {
             res.status = 400;
             res.set_content(dump_json(json{{"error", "missing messages[]"}}),
@@ -2147,13 +2149,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             !explicit_retrieval_groups;
         const bool map_retrieval_groups =
             explicit_retrieval_groups || auto_message_groups;
+        const auto server_render_start = std::chrono::steady_clock::now();
         const std::string prompt = render_messages(
             req["messages"], tools, enable_thinking, forced_tool_name,
             (transcript_replay || map_retrieval_groups)
                 ? &rendered_message_spans : nullptr,
             /*add_generation_prompt=*/!prefill_only);
+        const auto server_render_end = std::chrono::steady_clock::now();
         std::vector<int32_t> prompt_token_ids =
             usage_tokenizer.encode(prompt);
+        const auto server_tokenize_end = std::chrono::steady_clock::now();
         size_t prompt_token_count = prompt_token_ids.size();
         if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
             set_error_response(
@@ -3263,7 +3268,67 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const std::string id = gen_id("chatcmpl-");
         const int64_t created = unix_now();
         const uint64_t rid = ++req_counter;
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto server_preprocess_end = std::chrono::steady_clock::now();
+        const auto t0 = server_preprocess_end;
+        auto log_server_accounting =
+            [rid, server_request_start, server_json_end,
+             server_render_start, server_render_end, server_tokenize_end,
+             server_preprocess_end](std::chrono::steady_clock::time_point
+                                       engine_start,
+                                   std::chrono::steady_clock::time_point
+                                       engine_end,
+                                   std::chrono::steady_clock::time_point
+                                       response_end,
+                                   bool streaming) {
+                auto ms = [](auto begin, auto end) {
+                    return std::chrono::duration<double, std::milli>(
+                               end - begin)
+                        .count();
+                };
+                const double total_ms =
+                    ms(server_request_start, response_end);
+                const double preprocess_ms =
+                    ms(server_request_start, server_preprocess_end);
+                const double queue_ms =
+                    ms(server_preprocess_end, engine_start);
+                const double engine_ms = ms(engine_start, engine_end);
+                const double response_ms = ms(engine_end, response_end);
+                const double sum_ms =
+                    preprocess_ms + queue_ms + engine_ms + response_ms;
+                const double json_ms =
+                    ms(server_request_start, server_json_end);
+                const double validate_ms =
+                    ms(server_json_end, server_render_start);
+                const double render_ms =
+                    ms(server_render_start, server_render_end);
+                const double tokenize_ms =
+                    ms(server_render_end, server_tokenize_end);
+                const double span_setup_ms =
+                    ms(server_tokenize_end, server_preprocess_end);
+                const double preprocess_sum_ms =
+                    json_ms + validate_ms + render_ms + tokenize_ms +
+                    span_setup_ms;
+                std::cerr << std::fixed << std::setprecision(3)
+                          << "[qw3-server-accounting]"
+                          << " rid=" << rid
+                          << " stream=" << (streaming ? 1 : 0)
+                          << " total_ms=" << total_ms
+                          << " preprocess_ms=" << preprocess_ms
+                          << " queue_ms=" << queue_ms
+                          << " engine_ms=" << engine_ms
+                          << " response_ms=" << response_ms
+                          << " sum_ms=" << sum_ms
+                          << " error_ms=" << (total_ms - sum_ms)
+                          << " pre_json_ms=" << json_ms
+                          << " pre_validate_ms=" << validate_ms
+                          << " pre_render_ms=" << render_ms
+                          << " pre_tokenize_ms=" << tokenize_ms
+                          << " pre_span_setup_ms=" << span_setup_ms
+                          << " pre_sum_ms=" << preprocess_sum_ms
+                          << " pre_error_ms="
+                          << (preprocess_ms - preprocess_sum_ms)
+                          << "\n";
+            };
 
         // The streaming content provider outlives this handler scope, so the
         // raw `tools` pointer into `req` would dangle. Capture a by-value copy
@@ -3275,11 +3340,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [&, prompt, g, stops, id, created, rid, enable_thinking,
+                [&, prompt, g, stops, id, created, rid, t0, enable_thinking,
                  tool_request, forced_tool_request, tools_schema,
                  stream_include_usage, prompt_token_count, route,
                  fallback_reason, kvmem_session_request,
-                 kvmem_session_reset](size_t, httplib::DataSink &sink) {
+                 kvmem_session_reset,
+                 log_server_accounting](size_t, httplib::DataSink &sink) {
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
                     if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
@@ -3288,6 +3354,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     size_t completion_tokens = 0;
                     bool stopped = false;
                     bool client_closed = false;
+                    auto engine_start = std::chrono::steady_clock::now();
+                    auto engine_end = engine_start;
                     auto last_stream_write = std::chrono::steady_clock::now();
                     auto send_raw = [&](const std::string &s) {
                         if (client_closed) return false;
@@ -3356,6 +3424,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     try {
                         auto generate_request =
                             [&](const CancellableTokenCallback &callback) {
+                            engine_start = std::chrono::steady_clock::now();
                             if (kvmem_session_request) {
                                 eng.generate_session_stream(
                                     prompt, g,
@@ -3367,6 +3436,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 eng.generate_stream_cancellable(
                                     prompt, g, callback);
                             }
+                            engine_end = std::chrono::steady_clock::now();
                         };
                         send_role();
                         if (enable_thinking && g.max_tokens > 0) {
@@ -3530,6 +3600,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             });
 
                             if (client_closed) {
+                                log_server_accounting(
+                                    engine_start, engine_end,
+                                    std::chrono::steady_clock::now(), true);
                                 std::cerr << "[qw3-serve] #" << rid
                                           << " chat(stream tools) chars="
                                           << acc.size()
@@ -3651,6 +3724,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                       << " incremental_tool="
                                       << (incremental.streaming() ? "true" : "false")
                                       << "\n";
+                            log_server_accounting(
+                                engine_start, engine_end,
+                                std::chrono::steady_clock::now(), true);
                             return true;
                         }
                         generate_request([&](const std::string &piece) {
@@ -3685,6 +3761,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                   << " route=" << route
                                   << (client_closed ? " client_closed=true" : "")
                                   << "\n";
+                        log_server_accounting(
+                            engine_start, engine_end,
+                            std::chrono::steady_clock::now(), true);
                         return true;
                     } catch (const std::exception &e) {
                         json chunk = {
@@ -3710,15 +3789,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
         std::string text;
         size_t completion_tokens = 0;
+        auto engine_start = std::chrono::steady_clock::now();
+        auto engine_end = engine_start;
         try {
             if (kvmem_session_request) {
                 std::lock_guard<std::mutex> lk(gen_mu);
+                engine_start = std::chrono::steady_clock::now();
                 eng.generate_session_stream(
                     prompt, g, [&](const std::string &piece) {
                         ++completion_tokens;
                         text += piece;
                     }, kvmem_session_reset);
             } else if (g.continuous_batching) {
+                engine_start = std::chrono::steady_clock::now();
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
@@ -3726,12 +3809,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
+                engine_start = std::chrono::steady_clock::now();
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     ++completion_tokens;
                     text += piece;
                     return true;
                 });
             }
+            engine_end = std::chrono::steady_clock::now();
         } catch (const std::exception &e) {
             std::cerr << "[qw3-serve] #" << rid << " chat error="
                       << e.what() << "\n";
@@ -3780,6 +3865,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 {"finish_reason", finish}}})},
             {"usage", usage_json(prompt_token_count, completion_tokens)}};
         res.set_content(dump_json(out), "application/json");
+        log_server_accounting(
+            engine_start, engine_end, std::chrono::steady_clock::now(), false);
     });
 
     svr.Post("/v1/completions", [&](const httplib::Request &hreq,

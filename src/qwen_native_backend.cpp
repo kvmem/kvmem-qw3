@@ -1567,6 +1567,14 @@ public:
         gen.top_k = cfg.top_k;
         gen.top_p = cfg.top_p;
         gen.ignore_eos = true;  // decode exactly decode_tokens (steady-state TBT)
+        if (cfg.query_tokens > 0) {
+            gen.kvmem_session_id = "kvmem-session-profile";
+            kvmem_api_session_active_ = true;
+            kvmem_api_session_id_ = gen.kvmem_session_id;
+            kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
+            kvmem_api_boundary_pos_ = 0;
+            kvmem_api_tail_tokens_.clear();
+        }
 
         struct TurnRow {
             size_t turn = 0;
@@ -1579,7 +1587,10 @@ public:
             // into prefill_s. Surfaced so step5's gross wall isn't opaque.
             double inpre_ms = 0;
             uint32_t inpre_stage_in_blocks = 0, inpre_stage_out_blocks = 0;
-            double prefill_s = 0, decode_s = 0, decode_tps = 0;
+            double total_s = 0, setup_s = 0, prefill_s = 0;
+            double postprefill_s = 0, decode_s = 0, finalize_s = 0;
+            double semantic_s = 0, query_replay_s = 0, post_other_s = 0;
+            double decode_tps = 0;
             int decoded = 0;
             double acceptance = 0;
             uint64_t kv_bytes = 0, gpu_used = 0, cpu_used = 0, nvme_used = 0;
@@ -1612,6 +1623,18 @@ public:
                 pool.begin() + static_cast<std::ptrdiff_t>(pool_cursor),
                 pool.begin() + static_cast<std::ptrdiff_t>(pool_cursor + delta));
             pool_cursor += delta;
+            if (cfg.query_tokens > 0) {
+                const uint64_t query_tokens = std::min<uint64_t>(
+                    static_cast<uint64_t>(cfg.query_tokens), delta);
+                gen.kvmem_query_begin =
+                    static_cast<uint32_t>(target - query_tokens);
+                gen.kvmem_query_end = static_cast<uint32_t>(target);
+                gen.kvmem_reselect_mode = KvMemReselectMode::Force;
+            } else {
+                gen.kvmem_query_begin = 0;
+                gen.kvmem_query_end = 0;
+                gen.kvmem_reselect_mode = KvMemReselectMode::Auto;
+            }
 
             const QwenExecutor::KvMemTimingSnapshot tbase =
                 QwenExecutor::kvmem_timing_snapshot();
@@ -1663,7 +1686,14 @@ public:
                 row.inpre_stage_in_blocks = b.stage_in_blocks - tbase.stage_in_blocks;
                 row.inpre_stage_out_blocks = b.stage_out_blocks - tbase.stage_out_blocks;
             }
+            row.total_s = stats.total_s;
+            row.setup_s = stats.setup_s;
             row.prefill_s = stats.prefill_s;
+            row.postprefill_s = stats.postprefill_s;
+            row.finalize_s = stats.finalize_s;
+            row.semantic_s = stats.semantic_reselect_s;
+            row.query_replay_s = stats.query_replay_s;
+            row.post_other_s = stats.post_other_s;
             // decode_s is already the pure decode loop -- generate_mtp now
             // excludes the post-prefill reselect (reported via stats.reselect_s).
             row.decode_s = std::max(stats.decode_s, 1.0e-9);
@@ -1693,29 +1723,39 @@ public:
                                row.decoded, row.acceptance, row.gpu_mib,
                                row.rss_mib, row.inpre_ms,
                                row.inpre_stage_in_blocks,
-                               row.inpre_stage_out_blocks);
+                               row.inpre_stage_out_blocks, row.total_s,
+                               row.setup_s, row.postprefill_s,
+                               row.finalize_s, row.semantic_s,
+                               row.query_replay_s, row.post_other_s);
             rows.push_back(row);
         }
 
         // Final summary table.
         std::ostringstream tbl;
         tbl << "\n=== kvmem-session SUMMARY (update_mode=step, MTP on) ===\n";
-        tbl << "  turn      ctx    delta   sel_ms  in_ms  out_ms  asm_ms"
-               "  prefill_s  pre_tok/s  decode_s  dec_tok/s  accept    KVgib  GPUgib  CPUgib  NVMEgib  pool  GPUmib  RSSmib\n";
+        tbl << "  turn      ctx    delta  total_s  setup_s  prefill_s"
+               "  post_s  decode_s  final_s  sum_err_ms  pre_tok/s"
+               "  dec_tok/s  accept    KVgib  GPUgib  CPUgib  NVMEgib"
+               "  pool  GPUmib  RSSmib\n";
         for (const TurnRow &r : rows) {
+            const double phase_sum =
+                r.setup_s + r.prefill_s + r.postprefill_s +
+                r.decode_s + r.finalize_s;
             tbl << "  " << std::setw(4) << r.turn
                 << std::setw(9) << r.ctx_tokens
                 << std::setw(9) << r.delta_tokens
                 << std::fixed << std::setprecision(2)
-                << std::setw(9) << r.sel_ms
-                << std::setw(7) << r.stage_in_ms
-                << std::setw(8) << r.stage_out_ms
-                << std::setw(8) << r.assemble_ms
+                << std::setw(9) << r.total_s
+                << std::setw(9) << r.setup_s
                 << std::setw(11) << r.prefill_s
+                << std::setw(8) << r.postprefill_s
+                << std::setw(10) << r.decode_s
+                << std::setw(9) << r.finalize_s
+                << std::setprecision(3)
+                << std::setw(12) << (r.total_s - phase_sum) * 1000.0
                 << std::setprecision(1)
                 << std::setw(11) << (r.delta_tokens / std::max(r.prefill_s, 1e-9))
                 << std::setprecision(2)
-                << std::setw(10) << r.decode_s
                 << std::setw(11) << r.decode_tps
                 << std::setprecision(4)
                 << std::setw(8) << r.acceptance
@@ -8983,9 +9023,16 @@ private:
     // growth harness (run_kvmem_session). Filled just before return when a
     // non-null stats_out is passed; default callers ignore it.
     struct MtpGenStats {
+        double total_s = 0.0;
+        double setup_s = 0.0;
         double prefill_s = 0.0;
+        double postprefill_s = 0.0;
         double decode_s = 0.0;   // PURE decode loop (post-prefill reselect excluded)
+        double finalize_s = 0.0;
         double reselect_s = 0.0; // post-prefill (decode-window) reselect wall clock
+        double semantic_reselect_s = 0.0;
+        double query_replay_s = 0.0;
+        double post_other_s = 0.0;
         int decoded = 0;
         uint64_t prompt_tokens = 0;
         double acceptance = 0.0;
@@ -9015,6 +9062,7 @@ private:
                              bool manage_device_scope = true,
                              bool reset_session = true,
                              MtpGenStats *stats_out = nullptr) {
+        const double t_native_start = wall_seconds();
         QwenExecutor *executor_ =
             override_executor != nullptr ? override_executor : this->executor_.get();
         if (!executor_) throw std::runtime_error("MTP executor unavailable");
@@ -9611,6 +9659,8 @@ private:
             mtp_prefix_ops += mtp.ops_executed;
         };
 
+        double post_semantic_reselect_s = 0.0;
+        double post_query_replay_s = 0.0;
         const double t_prefill_start = wall_seconds();
         const uint32_t prefill_base =
             static_cast<uint32_t>(executor_->position());
@@ -11337,10 +11387,14 @@ private:
                     executor_->kvmem_set_pin_from_block(
                         kvmem_query_replay_begin / bt);
                 }
+                const double t_semantic_start = wall_seconds();
                 kvmem_final_query_reselect();
+                post_semantic_reselect_s +=
+                    wall_seconds() - t_semantic_start;
             }
             if (recompute_query &&
                 options.kvmem_reselect_mode != KvMemReselectMode::Off) {
+                const double t_query_replay_start = wall_seconds();
                 // Freeze the exact semantic context selected above. Every block
                 // in the short replay suffix must already be selected; otherwise
                 // adding it during replay would change the retrieval result and
@@ -11539,6 +11593,8 @@ private:
                     " fixed_context_blocks=" +
                     std::to_string(selected_context.size()));
                 }
+                post_query_replay_s +=
+                    wall_seconds() - t_query_replay_start;
             }
             kvmem_registered_pos = executor_->position();
             kvmem_last_reselect_pos = executor_->position();
@@ -11617,6 +11673,55 @@ private:
         // plain MTP (kvmem off) the reselect block above is skipped, so this
         // equals t_prefill_end and decode_s stays byte-identical to before.
         const double t_reselect_end = wall_seconds();
+        auto emit_native_accounting = [&](double t_decode_done,
+                                          double t_native_done) {
+            const double setup_s =
+                std::max(t_prefill_start - t_native_start, 0.0);
+            const double prefill_s_direct =
+                std::max(t_prefill_end - t_prefill_start, 0.0);
+            const double postprefill_s =
+                std::max(t_reselect_end - t_prefill_end, 0.0);
+            const double decode_s_direct =
+                std::max(t_decode_done - t_reselect_end, 0.0);
+            const double finalize_s =
+                std::max(t_native_done - t_decode_done, 0.0);
+            const double accounted_s =
+                setup_s + prefill_s_direct + postprefill_s +
+                decode_s_direct + finalize_s;
+            const double total_s =
+                std::max(t_native_done - t_native_start, 0.0);
+            const double post_other_s = std::max(
+                postprefill_s - post_semantic_reselect_s -
+                    post_query_replay_s,
+                0.0);
+            if (stats_out) {
+                stats_out->total_s = total_s;
+                stats_out->setup_s = setup_s;
+                stats_out->postprefill_s = postprefill_s;
+                stats_out->finalize_s = finalize_s;
+                stats_out->semantic_reselect_s =
+                    post_semantic_reselect_s;
+                stats_out->query_replay_s = post_query_replay_s;
+                stats_out->post_other_s = post_other_s;
+            }
+            std::ostringstream amsg;
+            amsg << std::fixed << std::setprecision(3)
+                 << "[qw3-native-accounting]"
+                 << " total_ms=" << total_s * 1000.0
+                 << " setup_ms=" << setup_s * 1000.0
+                 << " prefill_ms=" << prefill_s_direct * 1000.0
+                 << " postprefill_ms=" << postprefill_s * 1000.0
+                 << " decode_ms=" << decode_s_direct * 1000.0
+                 << " finalize_ms=" << finalize_s * 1000.0
+                 << " sum_ms=" << accounted_s * 1000.0
+                 << " error_ms=" << (total_s - accounted_s) * 1000.0
+                 << " post_semantic_ms="
+                 << post_semantic_reselect_s * 1000.0
+                 << " post_query_replay_ms="
+                 << post_query_replay_s * 1000.0
+                 << " post_other_ms=" << post_other_s * 1000.0;
+            log(amsg.str());
+        };
 
         // Complete the state transaction here for max_tokens=0. In particular,
         // do not initialize the sampler, draft/verify machinery, or decode KV.
@@ -11650,6 +11755,8 @@ private:
                 st = device_->end();
                 if (!st.ok) throw std::runtime_error(st.message);
             }
+            const double t_native_end = wall_seconds();
+            emit_native_accounting(t_reselect_end, t_native_end);
             const double prefill_s =
                 std::max(t_prefill_end - t_prefill_start, 1e-9);
             const double reselect_s =
@@ -12537,6 +12644,8 @@ private:
             st = device_->end();
             if (!st.ok) throw std::runtime_error(st.message);
         }
+        const double t_native_end = wall_seconds();
+        emit_native_accounting(t_decode_end, t_native_end);
 
         const double prefill_s = std::max(t_prefill_end - t_prefill_start, 1e-9);
         // The post-prefill (decode-window) reselect sits between t_prefill_end
@@ -12849,28 +12958,61 @@ private:
                             int decoded, double acceptance, uint64_t gpu_mib,
                             uint64_t rss_mib, double inpre_ms = 0.0,
                             uint32_t inpre_stage_in_blocks = 0,
-                            uint32_t inpre_stage_out_blocks = 0) const {
+                            uint32_t inpre_stage_out_blocks = 0,
+                            double total_s = 0.0, double setup_s = 0.0,
+                            double postprefill_s = 0.0,
+                            double finalize_s = 0.0,
+                            double semantic_s = 0.0,
+                            double query_replay_s = 0.0,
+                            double post_other_s = 0.0) const {
         std::ostringstream m;
         m << std::fixed;
         m << "\n[kvmem-session] turn=" << turn
           << " ctx=" << ctx_tokens << "tok (+" << delta_tokens << ")"
           << " GPU=" << gpu_mib << "MiB RSS=" << rss_mib << "MiB\n";
         m << std::setprecision(3);
-        m << "  step1 selection (top-k retrieval)        = "
+        const double phase_sum_s =
+            setup_s + prefill_s + postprefill_s + decode_s + finalize_s;
+        m << "  total native execution                   = "
+          << std::setw(10) << total_s * 1000.0 << " ms\n";
+        m << "    phase1 setup                           = "
+          << std::setw(10) << setup_s * 1000.0 << " ms\n";
+        m << "    phase2 prefill (forward new chunk)     = "
+          << std::setw(10) << prefill_s * 1000.0 << " ms  ("
+          << std::setprecision(1)
+          << (delta_tokens / std::max(prefill_s, 1e-9))
+          << " tok/s)\n";
+        m << std::setprecision(3);
+        m << "    phase3 post-prefill/reselection        = "
+          << std::setw(10) << postprefill_s * 1000.0 << " ms\n";
+        m << "      semantic selection                   = "
+          << std::setw(10) << semantic_s * 1000.0 << " ms\n";
+        m << "      query replay                         = "
+          << std::setw(10) << query_replay_s * 1000.0 << " ms\n";
+        m << "      other                                = "
+          << std::setw(10) << post_other_s * 1000.0 << " ms\n";
+        m << "    phase4 decode (MTP, " << decoded << " tok)             = "
+          << std::setw(10) << decode_s * 1000.0 << " ms  ("
+          << std::setprecision(2) << decode_tps << " tok/s, accept="
+          << std::setprecision(4) << acceptance << ")\n";
+        m << std::setprecision(3);
+        m << "    phase5 finalize                        = "
+          << std::setw(10) << finalize_s * 1000.0 << " ms\n";
+        m << "    accounting error                       = "
+          << std::setw(10) << (total_s - phase_sum_s) * 1000.0
+          << " ms\n";
+        m << "  nested KVMem diagnostics (not additive; I/O may overlap)\n";
+        m << "    selection (top-k retrieval)            = "
           << std::setw(10) << sel_ms << " ms\n";
-        m << "  step2 stage-in   (CPU/NVMe -> GPU)        = "
+        m << "    stage-in   (CPU/NVMe -> GPU)           = "
           << std::setw(10) << stage_in_ms << " ms  (" << stage_in_blocks
           << " blk)\n";
-        m << "  step3 stage-out  (GPU -> CPU/NVMe evict)  = "
+        m << "    stage-out  (GPU -> CPU/NVMe evict)     = "
           << std::setw(10) << stage_out_ms << " ms  (" << stage_out_blocks
           << " blk)\n";
-        m << "  step4 assemble   (pages+re-RoPE+k-bar)    = "
+        m << "    assemble   (pages+re-RoPE+k-bar)       = "
           << std::setw(10) << assemble_ms << " ms  (pages=" << asm_pages_ms
           << " rerope=" << asm_rerope_ms << " kbar=" << asm_kbar_ms << ")\n";
-        m << "  step5 prefill    (forward new chunk)      = "
-          << std::setw(10) << (prefill_s * 1000.0) << " ms  ("
-          << std::setprecision(1) << (delta_tokens / std::max(prefill_s, 1e-9))
-          << " tok/s)\n";
         m << std::setprecision(3);
         // The bounded GPU pool can force kvmem stage-in/out mid-prefill; that
         // cost is INSIDE step5's wall above (not double-counted in steps 1-4,
@@ -12878,10 +13020,6 @@ private:
         m << "    +-- of which kvmem in-prefill offload   = "
           << std::setw(10) << inpre_ms << " ms  (in=" << inpre_stage_in_blocks
           << " out=" << inpre_stage_out_blocks << " blk)\n";
-        m << "  step6 decode     (MTP, " << decoded << " tok)            = "
-          << std::setw(10) << (decode_s * 1000.0) << " ms  ("
-          << std::setprecision(2) << decode_tps << " tok/s, accept="
-          << std::setprecision(4) << acceptance << ")";
         log(m.str());
     }
 
