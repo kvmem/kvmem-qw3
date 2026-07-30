@@ -1565,6 +1565,22 @@ private:
     std::array<std::unique_ptr<HostBuffer>, 2>
         g_adaptive_upload_pinned_;
     uint64_t g_adaptive_upload_pinned_capacity_ = 0;
+    std::array<std::unique_ptr<DeviceTransferFence>, 2>
+        g_adaptive_upload_done_;
+    uint32_t g_adaptive_upload_sequence_ = 0;
+    uint64_t g_adaptive_incremental_upload_bytes_ = 0;
+    uint64_t g_adaptive_incremental_pack_ns_ = 0;
+    uint64_t g_adaptive_incremental_wait_ns_ = 0;
+    struct AdaptiveGpuLayerArena {
+        std::unique_ptr<DeviceTensor> values;
+        std::unique_ptr<DeviceTensor> block_offsets;
+        std::unique_ptr<DeviceTensor> block_counts;
+        uint64_t capacity_rows = 0;
+        uint32_t prototype_count = 0;
+        uint32_t metadata_capacity = 0;
+    };
+    std::vector<AdaptiveGpuLayerArena>
+        g_adaptive_gpu_layer_arenas_;
     uint64_t g_adaptive_candidate_capacity_ = 0;
     uint64_t g_adaptive_residual_capacity_ = 0;
     uint32_t g_adaptive_total_prototypes_ = 0;
@@ -1644,6 +1660,9 @@ private:
         uint32_t slot, uint32_t first_block, uint32_t n_blocks_chunk,
         uint32_t batch, uint32_t k_token_stride,
         uint32_t rope_base_pos);
+    void kvmem_upload_adaptive_gpu_layer(
+        uint32_t layer, uint32_t first_prototype);
+    void kvmem_drain_adaptive_gpu_uploads();
     void kvmem_finalize_adaptive_index();
     bool kvmem_score_adaptive_index(
         uint32_t n_blocks, uint32_t n_tokens,
@@ -1656,6 +1675,11 @@ private:
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         uint32_t accumulate, std::string *failure_reason);
     bool kvmem_score_cpu_adaptive_index_layer_one_pass(
+        uint32_t n_blocks, uint32_t n_tokens,
+        uint32_t q_layer_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t accumulate, std::string *failure_reason);
+    bool kvmem_score_gpu_adaptive_index_layer_one_pass(
         uint32_t n_blocks, uint32_t n_tokens,
         uint32_t q_layer_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,

@@ -1022,6 +1022,13 @@ void QwenExecutor::reset_state() {
     g_adaptive_block_offsets_dev_.reset();
     g_adaptive_block_counts_dev_.reset();
     g_adaptive_prototype_blocks_dev_.reset();
+    kvmem_drain_adaptive_gpu_uploads();
+    g_adaptive_gpu_layer_arenas_.clear();
+    for (auto &done : g_adaptive_upload_done_) done.reset();
+    g_adaptive_upload_sequence_ = 0;
+    g_adaptive_incremental_upload_bytes_ = 0;
+    g_adaptive_incremental_pack_ns_ = 0;
+    g_adaptive_incremental_wait_ns_ = 0;
     g_adaptive_total_prototypes_ = 0;
     g_adaptive_max_layer_prototypes_ = 0;
     g_adaptive_index_dirty_ = false;
@@ -7518,6 +7525,13 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     g_adaptive_block_offsets_dev_.reset();
     g_adaptive_block_counts_dev_.reset();
     g_adaptive_prototype_blocks_dev_.reset();
+    kvmem_drain_adaptive_gpu_uploads();
+    g_adaptive_gpu_layer_arenas_.clear();
+    for (auto &done : g_adaptive_upload_done_) done.reset();
+    g_adaptive_upload_sequence_ = 0;
+    g_adaptive_incremental_upload_bytes_ = 0;
+    g_adaptive_incremental_pack_ns_ = 0;
+    g_adaptive_incremental_wait_ns_ = 0;
     for (auto &slot : g_adaptive_upload_pinned_) slot.reset();
     g_adaptive_upload_pinned_capacity_ = 0;
     g_adaptive_candidate_capacity_ = 0;
@@ -15151,10 +15165,170 @@ void QwenExecutor::kvmem_reset_adaptive_index(
         g_adaptive_block_offsets_dev_.reset();
         g_adaptive_block_counts_dev_.reset();
         g_adaptive_prototype_blocks_dev_.reset();
+        kvmem_drain_adaptive_gpu_uploads();
+        g_adaptive_gpu_layer_arenas_.clear();
+        for (auto &done : g_adaptive_upload_done_) {
+            done.reset();
+        }
+        g_adaptive_upload_sequence_ = 0;
+        g_adaptive_incremental_upload_bytes_ = 0;
+        g_adaptive_incremental_pack_ns_ = 0;
+        g_adaptive_incremental_wait_ns_ = 0;
         g_adaptive_total_prototypes_ = 0;
         g_adaptive_max_layer_prototypes_ = 0;
         g_adaptive_index_dirty_ = false;
     }
+}
+
+void QwenExecutor::kvmem_drain_adaptive_gpu_uploads() {
+    for (auto &done : g_adaptive_upload_done_) {
+        if (!done) continue;
+        const uint64_t wait_begin = kvmem_steady_ns();
+        require_status(
+            backend_.wait_kv_transfer_fence(done));
+        g_adaptive_incremental_wait_ns_ +=
+            kvmem_steady_ns() - wait_begin;
+    }
+}
+
+void QwenExecutor::kvmem_upload_adaptive_gpu_layer(
+        uint32_t layer, uint32_t first_prototype) {
+    if (!kvmem_adaptive_prototypes() ||
+        kvmem_mean_index_cpu() || !block_store_ ||
+        env_flag_enabled(
+            "QW3_KVMEM_ADAPTIVE_GPU_PACKED", false)) {
+        return;
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = kvmem_qc_num_layers_;
+    if (layer >= layers ||
+        layer >= g_adaptive_layer_values_host_.size() ||
+        layer >= g_adaptive_layer_parent_host_.size()) {
+        throw std::runtime_error(
+            "KVMem Adaptive incremental GPU layer is out of range");
+    }
+    if (g_adaptive_gpu_layer_arenas_.size() != layers) {
+        kvmem_drain_adaptive_gpu_uploads();
+        require_status(backend_.synchronize());
+        g_adaptive_gpu_layer_arenas_.clear();
+        g_adaptive_gpu_layer_arenas_.resize(layers);
+    }
+    const uint64_t row_elems =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    const uint64_t row_bytes =
+        row_elems * g_adaptive_index_elem_size_;
+    const uint64_t required_rows =
+        g_adaptive_layer_parent_host_[layer].size();
+    if (row_bytes == 0 ||
+        g_adaptive_layer_values_host_[layer].size() !=
+            required_rows * row_bytes ||
+        required_rows > UINT32_MAX) {
+        throw std::runtime_error(
+            "KVMem Adaptive incremental GPU layer is inconsistent");
+    }
+    AdaptiveGpuLayerArena &arena =
+        g_adaptive_gpu_layer_arenas_[layer];
+    constexpr uint64_t kArenaGrowthBytes =
+        64ull * 1024ull * 1024ull;
+    const uint64_t growth_rows =
+        std::max<uint64_t>(1, kArenaGrowthBytes / row_bytes);
+    if (!arena.values ||
+        arena.values->elem_size !=
+            g_adaptive_index_elem_size_ ||
+        arena.capacity_rows < required_rows) {
+        kvmem_drain_adaptive_gpu_uploads();
+        require_status(backend_.synchronize());
+        const uint64_t capacity_rows =
+            std::max<uint64_t>(
+                growth_rows,
+                ((required_rows + growth_rows - 1) /
+                 growth_rows) *
+                    growth_rows);
+        arena.values =
+            kvmem_alloc_mean_index_tensor(
+                capacity_rows * row_elems,
+                "g_adaptive_gpu_layer_values");
+        arena.capacity_rows = capacity_rows;
+        arena.prototype_count = 0;
+        first_prototype = 0;
+        // The tensor allocation/zeroing is ordered on the execution stream.
+        // Make the transfer stream observe it before the first suffix upload.
+        require_status(
+            backend_.begin_kv_transfer_from_device());
+    }
+    if (first_prototype > required_rows) {
+        throw std::runtime_error(
+            "KVMem Adaptive GPU dirty suffix is out of range");
+    }
+    if (first_prototype == required_rows) {
+        arena.prototype_count =
+            static_cast<uint32_t>(required_rows);
+        return;
+    }
+
+    const uint32_t upload_mib = std::clamp<uint32_t>(
+        env_uint32_or(
+            "QW3_KVMEM_ADAPTIVE_UPLOAD_MIB", 64),
+        8u, 256u);
+    const uint64_t upload_bytes =
+        static_cast<uint64_t>(upload_mib) *
+        1024ull * 1024ull;
+    if (g_adaptive_upload_pinned_capacity_ < upload_bytes ||
+        !g_adaptive_upload_pinned_[0] ||
+        !g_adaptive_upload_pinned_[1]) {
+        kvmem_drain_adaptive_gpu_uploads();
+        g_adaptive_upload_pinned_[0] =
+            backend_.host_buffer(
+                upload_bytes,
+                "g_adaptive_incremental_upload_0");
+        g_adaptive_upload_pinned_[1] =
+            backend_.host_buffer(
+                upload_bytes,
+                "g_adaptive_incremental_upload_1");
+        g_adaptive_upload_pinned_capacity_ = upload_bytes;
+    }
+    const auto &values =
+        g_adaptive_layer_values_host_[layer];
+    uint64_t source_byte =
+        static_cast<uint64_t>(first_prototype) *
+        row_bytes;
+    const uint64_t end_byte = required_rows * row_bytes;
+    while (source_byte < end_byte) {
+        const uint32_t slot =
+            g_adaptive_upload_sequence_++ & 1u;
+        if (g_adaptive_upload_done_[slot]) {
+            const uint64_t wait_begin = kvmem_steady_ns();
+            require_status(
+                backend_.wait_kv_transfer_fence(
+                    g_adaptive_upload_done_[slot]));
+            g_adaptive_incremental_wait_ns_ +=
+                kvmem_steady_ns() - wait_begin;
+        }
+        const uint64_t bytes =
+            std::min<uint64_t>(
+                upload_bytes, end_byte - source_byte);
+        const uint64_t pack_begin = kvmem_steady_ns();
+        std::memcpy(
+            g_adaptive_upload_pinned_[slot]->data,
+            values.data() + source_byte,
+            static_cast<size_t>(bytes));
+        g_adaptive_incremental_pack_ns_ +=
+            kvmem_steady_ns() - pack_begin;
+        require_status(
+            backend_.begin_kv_transfer_to_device());
+        require_status(
+            backend_.copy_bytes_from_host_async(
+                *arena.values, source_byte,
+                g_adaptive_upload_pinned_[slot]->data,
+                bytes));
+        require_status(
+            backend_.record_kv_transfer_fence(
+                g_adaptive_upload_done_[slot]));
+        g_adaptive_incremental_upload_bytes_ += bytes;
+        source_byte += bytes;
+    }
+    arena.prototype_count =
+        static_cast<uint32_t>(required_rows);
 }
 
 void QwenExecutor::kvmem_capture_adaptive_layer(
@@ -15326,6 +15500,7 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
             static_cast<int32_t>(count);
     }
     g_adaptive_index_dirty_ = true;
+    kvmem_upload_adaptive_gpu_layer(slot, truncate_proto);
 }
 
 void QwenExecutor::kvmem_finalize_adaptive_index() {
@@ -15338,6 +15513,25 @@ void QwenExecutor::kvmem_finalize_adaptive_index() {
                 stderr,
                 "[bs-adaptive-index] placement=cpu packed_reuse=1 "
                 "dirty=0 prototypes=%u\n",
+                g_adaptive_total_prototypes_);
+        }
+        return;
+    }
+    const bool incremental_gpu =
+        !kvmem_mean_index_cpu() &&
+        !env_flag_enabled(
+            "QW3_KVMEM_ADAPTIVE_GPU_PACKED", false);
+    if (incremental_gpu &&
+        !g_adaptive_index_dirty_ &&
+        g_adaptive_total_prototypes_ > 0 &&
+        g_adaptive_gpu_layer_arenas_.size() ==
+            kvmem_qc_num_layers_) {
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[bs-adaptive-index] placement=gpu "
+                "layout=per-layer-incremental reuse=1 dirty=0 "
+                "prototypes=%u\n",
                 g_adaptive_total_prototypes_);
         }
         return;
@@ -15451,6 +15645,92 @@ void QwenExecutor::kvmem_finalize_adaptive_index() {
                 (kvmem_steady_ns() - finalize_begin_ns) / 1.0e6,
                 block_store_->config().adaptive_gain_1to2,
                 block_store_->config().adaptive_gain_2to4);
+        }
+        return;
+    }
+    if (incremental_gpu) {
+        kvmem_drain_adaptive_gpu_uploads();
+        if (g_adaptive_gpu_layer_arenas_.size() != layers) {
+            throw std::runtime_error(
+                "KVMem Adaptive incremental GPU arenas are incomplete");
+        }
+        for (uint32_t l = 0; l < layers; ++l) {
+            AdaptiveGpuLayerArena &arena =
+                g_adaptive_gpu_layer_arenas_[l];
+            const uint64_t layer_count =
+                g_adaptive_layer_parent_host_[l].size();
+            if (!arena.values ||
+                arena.prototype_count != layer_count ||
+                arena.capacity_rows < layer_count) {
+                throw std::runtime_error(
+                    "KVMem Adaptive incremental GPU upload is incomplete");
+            }
+            if (!arena.block_offsets ||
+                arena.metadata_capacity < n_blocks) {
+                arena.block_offsets =
+                    backend_.tensor_i32(
+                        n_blocks,
+                        "g_adaptive_gpu_layer_offsets");
+                arena.block_counts =
+                    backend_.tensor_i32(
+                        n_blocks,
+                        "g_adaptive_gpu_layer_counts");
+                arena.metadata_capacity = n_blocks;
+            }
+        }
+        g_adaptive_packed_.reset();
+        g_adaptive_layer_offsets_dev_.reset();
+        g_adaptive_block_offsets_dev_.reset();
+        g_adaptive_block_counts_dev_.reset();
+        g_adaptive_prototype_blocks_dev_.reset();
+        g_adaptive_total_prototypes_ =
+            static_cast<uint32_t>(total);
+        g_adaptive_max_layer_prototypes_ = max_layer;
+        g_adaptive_index_dirty_ = false;
+        const uint64_t slices =
+            g_adaptive_p1_slices_ +
+            g_adaptive_p2_slices_ +
+            g_adaptive_p4_slices_;
+        const double avg = slices > 0
+            ? static_cast<double>(total) /
+                  static_cast<double>(slices)
+            : 0.0;
+        if (std::getenv("QW3_KVMEM_TRACE") ||
+            kvmem_perf_trace_flag()) {
+            uint64_t capacity_bytes = 0;
+            for (const auto &arena :
+                 g_adaptive_gpu_layer_arenas_) {
+                capacity_bytes +=
+                    arena.capacity_rows * prototype_row_bytes;
+            }
+            std::fprintf(
+                stderr,
+                "[bs-adaptive-index] placement=gpu "
+                "layout=per-layer-incremental layers=%u blocks=%u "
+                "prototypes=%u avg_p=%.3f p1=%llu p2=%llu p4=%llu "
+                "bytes=%llu gib=%.3f capacity_gib=%.3f "
+                "incremental_h2d_gib=%.3f pack_ms=%.3f "
+                "h2d_wait_ms=%.3f finalize_ms=%.3f\n",
+                layers, n_blocks, g_adaptive_total_prototypes_, avg,
+                static_cast<unsigned long long>(
+                    g_adaptive_p1_slices_),
+                static_cast<unsigned long long>(
+                    g_adaptive_p2_slices_),
+                static_cast<unsigned long long>(
+                    g_adaptive_p4_slices_),
+                static_cast<unsigned long long>(
+                    total * prototype_row_bytes),
+                static_cast<double>(
+                    total * prototype_row_bytes) /
+                    (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(capacity_bytes) /
+                    (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(
+                    g_adaptive_incremental_upload_bytes_) /
+                    (1024.0 * 1024.0 * 1024.0),
+                g_adaptive_incremental_pack_ns_ / 1.0e6,
+                g_adaptive_incremental_wait_ns_ / 1.0e6,
+                (kvmem_steady_ns() - finalize_begin_ns) / 1.0e6);
         }
         return;
     }
@@ -16008,6 +16288,7 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index_layer_one_pass(
                 *g_score_dev_, *g_query_multi_, *slot.values,
                 *slot.block_offsets, *slot.block_counts,
                 job.layer, layers, n_tokens, q_layer_stride,
+                /*prototype_row_offset=*/0,
                 job.prototype_count, job.block_count,
                 job.first_block, cfg.n_heads, cfg.n_kv_heads,
                 cfg.head_dim, scale);
@@ -16529,6 +16810,137 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index(
     return true;
 }
 
+bool QwenExecutor::kvmem_score_gpu_adaptive_index_layer_one_pass(
+        uint32_t n_blocks, uint32_t n_tokens,
+        uint32_t q_layer_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t accumulate, std::string *failure_reason) {
+    if (!kvmem_adaptive_prototypes() ||
+        kvmem_mean_index_cpu() || !block_store_ ||
+        env_flag_enabled(
+            "QW3_KVMEM_ADAPTIVE_GPU_PACKED", false) ||
+        !g_query_multi_ || !g_score_dev_) {
+        return scorer_unavailable(
+            failure_reason,
+            "gpu_adaptive_layer_index_unavailable");
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = kvmem_qc_num_layers_;
+    const uint32_t included_begin =
+        std::min(excl_lo_end, n_blocks);
+    const uint32_t included_end =
+        std::min(excl_hi_begin, n_blocks);
+    if (layers == 0 || included_begin >= included_end ||
+        g_adaptive_gpu_layer_arenas_.size() != layers ||
+        g_adaptive_block_offsets_host_.size() <
+            static_cast<uint64_t>(layers) *
+                g_adaptive_index_stride_blocks_ ||
+        g_adaptive_block_counts_host_.size() <
+            static_cast<uint64_t>(layers) *
+                g_adaptive_index_stride_blocks_) {
+        return scorer_unavailable(
+            failure_reason,
+            "gpu_adaptive_layer_index_shape_invalid");
+    }
+    if (!accumulate) {
+        require_status(backend_.zero_tensor(*g_score_dev_));
+    }
+    const uint32_t block_count =
+        included_end - included_begin;
+    std::vector<int32_t> offsets(block_count);
+    std::vector<int32_t> counts(block_count);
+    const uint64_t begin_ns = kvmem_steady_ns();
+    for (uint32_t l = 0; l < layers; ++l) {
+        AdaptiveGpuLayerArena &arena =
+            g_adaptive_gpu_layer_arenas_[l];
+        const uint64_t meta_base =
+            static_cast<uint64_t>(l) *
+                g_adaptive_index_stride_blocks_;
+        const int32_t begin_i32 =
+            g_adaptive_block_offsets_host_[
+                meta_base + included_begin];
+        const uint64_t last_meta =
+            meta_base + included_end - 1;
+        const int32_t last_offset_i32 =
+            g_adaptive_block_offsets_host_[last_meta];
+        const int32_t last_count_i32 =
+            g_adaptive_block_counts_host_[last_meta];
+        if (begin_i32 < 0 || last_offset_i32 < 0 ||
+            last_count_i32 < 0) {
+            return scorer_unavailable(
+                failure_reason,
+                "gpu_adaptive_layer_negative_metadata");
+        }
+        const uint64_t prototype_begin =
+            static_cast<uint32_t>(begin_i32);
+        const uint64_t prototype_end =
+            static_cast<uint64_t>(
+                static_cast<uint32_t>(last_offset_i32)) +
+            static_cast<uint32_t>(last_count_i32);
+        if (!arena.values || !arena.block_offsets ||
+            !arena.block_counts ||
+            arena.metadata_capacity < block_count ||
+            prototype_end < prototype_begin ||
+            prototype_end > arena.prototype_count ||
+            prototype_end - prototype_begin > UINT32_MAX) {
+            return scorer_unavailable(
+                failure_reason,
+                "gpu_adaptive_layer_metadata_oob");
+        }
+        const uint32_t prototype_count =
+            static_cast<uint32_t>(
+                prototype_end - prototype_begin);
+        if (prototype_count == 0) continue;
+        for (uint32_t b = 0; b < block_count; ++b) {
+            const uint64_t meta =
+                meta_base + included_begin + b;
+            offsets[b] =
+                g_adaptive_block_offsets_host_[meta] -
+                static_cast<int32_t>(prototype_begin);
+            counts[b] =
+                g_adaptive_block_counts_host_[meta];
+        }
+        require_status(
+            backend_.copy_i32_from_host(
+                *arena.block_offsets, 0,
+                offsets.data(), offsets.size()));
+        require_status(
+            backend_.copy_i32_from_host(
+                *arena.block_counts, 0,
+                counts.data(), counts.size()));
+        const DeviceStatus st =
+            backend_.block_attn_score_adaptive_layer_device(
+                *g_score_dev_, *g_query_multi_,
+                *arena.values, *arena.block_offsets,
+                *arena.block_counts, l, layers, n_tokens,
+                q_layer_stride,
+                static_cast<uint32_t>(prototype_begin),
+                prototype_count, block_count, included_begin,
+                cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
+                scale);
+        if (!st.ok) {
+            return scorer_backend_unavailable(
+                failure_reason,
+                "gpu_adaptive_layer_scorer_failed", st);
+        }
+    }
+    if (std::getenv("QW3_KVMEM_TRACE") ||
+        kvmem_perf_trace_flag()) {
+        std::fprintf(
+            stderr,
+            "[bs-adaptive-score] placement=gpu "
+            "layout=per-layer-incremental mode=layer-one-pass "
+            "layers=%u blocks=%u query_tokens=%u "
+            "gqa_group=%u submit_ms=%.3f\n",
+            layers, n_blocks, n_tokens,
+            cfg.n_kv_heads > 0
+                ? cfg.n_heads / cfg.n_kv_heads
+                : 0,
+            (kvmem_steady_ns() - begin_ns) / 1.0e6);
+    }
+    return true;
+}
+
 bool QwenExecutor::kvmem_score_adaptive_index(
         uint32_t n_blocks, uint32_t n_tokens,
         uint32_t q_layer_stride, float scale,
@@ -16539,6 +16951,13 @@ bool QwenExecutor::kvmem_score_adaptive_index(
     }
     if (kvmem_mean_index_cpu()) {
         return kvmem_score_cpu_adaptive_index(
+            n_blocks, n_tokens, q_layer_stride, scale,
+            excl_lo_end, excl_hi_begin, accumulate,
+            failure_reason);
+    }
+    if (!env_flag_enabled(
+            "QW3_KVMEM_ADAPTIVE_GPU_PACKED", false)) {
+        return kvmem_score_gpu_adaptive_index_layer_one_pass(
             n_blocks, n_tokens, q_layer_stride, scale,
             excl_lo_end, excl_hi_begin, accumulate,
             failure_reason);

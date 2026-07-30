@@ -1649,6 +1649,7 @@ public:
         uint32_t n_layers,
         uint32_t n_tokens,
         uint32_t q_layer_stride,
+        uint32_t prototype_row_offset,
         uint32_t prototype_count,
         uint32_t block_count,
         uint32_t global_block_base,
@@ -1659,7 +1660,8 @@ public:
         (void)score; (void)q_multi; (void)prototype_layer;
         (void)block_offsets; (void)block_counts;
         (void)layer; (void)n_layers; (void)n_tokens;
-        (void)q_layer_stride; (void)prototype_count;
+        (void)q_layer_stride; (void)prototype_row_offset;
+        (void)prototype_count;
         (void)block_count; (void)global_block_base;
         (void)n_heads; (void)n_kv_heads; (void)head_dim;
         (void)scale;

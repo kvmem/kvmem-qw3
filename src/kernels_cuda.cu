@@ -16386,6 +16386,7 @@ public:
             uint32_t n_layers,
             uint32_t n_tokens,
             uint32_t q_layer_stride,
+            uint32_t prototype_row_offset,
             uint32_t prototype_count,
             uint32_t block_count,
             uint32_t global_block_base,
@@ -16418,7 +16419,8 @@ public:
             bo.count < block_count || bc.count < block_count ||
             qm.count < q_rows * n_heads * head_dim ||
             pt.count <
-                static_cast<uint64_t>(prototype_count) *
+                (static_cast<uint64_t>(prototype_row_offset) +
+                 prototype_count) *
                     row_elems) {
             return {
                 false,
@@ -16429,8 +16431,14 @@ public:
                            : pt.is_fp16()
                                  ? ported::KbarDType::F16
                                  : ported::KbarDType::F32;
+        const auto *prototype_bytes =
+            reinterpret_cast<const unsigned char *>(pt.ptr);
+        const void *prototype_ptr =
+            prototype_bytes +
+            static_cast<uint64_t>(prototype_row_offset) *
+                row_elems * pt.elem_size;
         if (!ported::launch_block_attn_score_adaptive_layer_typed(
-                sc.ptr, qm.ptr, qm.is_fp16(), pt.ptr, dtype,
+                sc.ptr, qm.ptr, qm.is_fp16(), prototype_ptr, dtype,
                 bo.ptr_i32(), bc.ptr_i32(), layer, n_layers,
                 n_tokens, q_layer_stride, prototype_count,
                 block_count, global_block_base, n_heads,
