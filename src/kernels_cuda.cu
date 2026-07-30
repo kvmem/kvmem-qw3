@@ -6114,7 +6114,7 @@ __global__ void block_attn_adaptive_logits_gqa_kernel(
         uint32_t excl_lo_end,
         uint32_t excl_hi_begin,
         uint32_t max_layer_prototypes) {
-    static_assert(GqaGroup >= 2 && GqaGroup <= 4);
+    static_assert(GqaGroup >= 2 && GqaGroup <= 6);
     const uint64_t job = blockIdx.x;
     const uint32_t local_group =
         static_cast<uint32_t>(job / n_tiles);
@@ -6282,7 +6282,7 @@ __global__ void block_attn_adaptive_layer_logits_gqa_kernel(
         uint32_t n_kv_heads,
         uint32_t head_dim,
         float scale) {
-    static_assert(GqaGroup >= 2 && GqaGroup <= 4);
+    static_assert(GqaGroup >= 2 && GqaGroup <= 6);
     const uint64_t job = blockIdx.x;
     const uint32_t local_group =
         static_cast<uint32_t>(job / n_tiles);
@@ -6717,7 +6717,7 @@ __global__ void block_attn_stream_adaptive_lse_kernel(
 }
 
 // GQA-specialized CPU-offload pass 1. Query heads in one GQA group share the
-// same K prototype row, so form all two/three/four logits while that row is in
+// same K prototype row, so form all two/three/four/six logits while that row is in
 // registers. This preserves the per-query-head LSE exactly while avoiding
 // redundant prototype loads and CTA scheduling.
 template <typename QueryT, typename KbarT, uint32_t GqaGroup>
@@ -6728,7 +6728,7 @@ __global__ void block_attn_stream_adaptive_lse_gqa_kernel(
         uint32_t q_layer_stride, uint32_t prototype_count,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
         float scale, uint32_t initialize) {
-    static_assert(GqaGroup >= 2 && GqaGroup <= 4);
+    static_assert(GqaGroup >= 2 && GqaGroup <= 6);
     const uint32_t local_group = blockIdx.x;
     const uint32_t local_groups = n_tokens * n_kv_heads;
     const uint32_t tid = threadIdx.x;
@@ -6932,7 +6932,7 @@ __global__ void block_attn_stream_adaptive_score_gqa_kernel(
         uint32_t q_layer_stride, uint32_t tile_blocks,
         uint32_t global_block_base, uint32_t n_heads,
         uint32_t n_kv_heads, uint32_t head_dim, float scale) {
-    static_assert(GqaGroup >= 2 && GqaGroup <= 4);
+    static_assert(GqaGroup >= 2 && GqaGroup <= 6);
     const uint32_t local_block = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     if (layer >= n_layers || local_block >= tile_blocks) return;
@@ -21012,7 +21012,8 @@ bool launch_block_attn_score_softmax_adaptive_impl(
             !(gqa_env && std::strcmp(gqa_env, "0") == 0);
         const bool fuse_gqa =
             gqa_enabled &&
-            gqa_group >= 2u && gqa_group <= 4u &&
+            (gqa_group >= 2u && gqa_group <= 4u ||
+             gqa_group == 6u) &&
             n_heads % n_kv_heads == 0u &&
             distributions % gqa_group == 0u &&
             distributions_per_batch >= gqa_group;
@@ -21101,6 +21102,17 @@ bool launch_block_attn_score_softmax_adaptive_impl(
             } else if (batch_fuse_gqa && gqa_group == 4u) {
                 block_attn_adaptive_logits_gqa_kernel<
                     QueryT, KbarT, 4u><<<
+                    static_cast<uint32_t>(jobs),
+                    kSoftmaxPagesThreads, 0, stream>>>(
+                    logits, q_multi, packed_prototypes,
+                    layer_offsets, prototype_blocks,
+                    base, count, logits_tiles, n_tokens,
+                    q_layer_stride, n_heads, n_kv_heads,
+                    head_dim, scale, excl_lo_end, excl_hi_begin,
+                    max_layer_prototypes);
+            } else if (batch_fuse_gqa && gqa_group == 6u) {
+                block_attn_adaptive_logits_gqa_kernel<
+                    QueryT, KbarT, 6u><<<
                     static_cast<uint32_t>(jobs),
                     kSoftmaxPagesThreads, 0, stream>>>(
                     logits, q_multi, packed_prototypes,
@@ -21309,7 +21321,9 @@ bool launch_block_attn_score_adaptive_layer_impl(
     const bool gqa_enabled =
         !(gqa_env && std::strcmp(gqa_env, "0") == 0);
     const bool fuse_gqa =
-        gqa_enabled && gqa_group >= 2u && gqa_group <= 4u &&
+        gqa_enabled &&
+        ((gqa_group >= 2u && gqa_group <= 4u) ||
+         gqa_group == 6u) &&
         distributions_per_batch >= gqa_group;
     if (fuse_gqa) {
         distributions_per_batch =
@@ -21371,6 +21385,8 @@ bool launch_block_attn_score_adaptive_layer_impl(
             QW3_ADAPTIVE_LAYER_LOGITS_GQA(3u);
         } else if (batch_fuse_gqa && gqa_group == 4u) {
             QW3_ADAPTIVE_LAYER_LOGITS_GQA(4u);
+        } else if (batch_fuse_gqa && gqa_group == 6u) {
+            QW3_ADAPTIVE_LAYER_LOGITS_GQA(6u);
         } else {
             block_attn_adaptive_layer_logits_kernel<
                 QueryT, KbarT><<<
@@ -21480,6 +21496,8 @@ bool launch_block_attn_stream_adaptive_lse_impl(
         QW3_ADAPTIVE_STREAM_LSE_GQA(3u);
     } else if (gqa_group == 4u) {
         QW3_ADAPTIVE_STREAM_LSE_GQA(4u);
+    } else if (gqa_group == 6u) {
+        QW3_ADAPTIVE_STREAM_LSE_GQA(6u);
     } else {
         block_attn_stream_adaptive_lse_kernel<QueryT, KbarT><<<
             static_cast<uint32_t>(distributions64),
@@ -21562,6 +21580,8 @@ bool launch_block_attn_stream_adaptive_score_impl(
         QW3_ADAPTIVE_STREAM_SCORE_GQA(3u);
     } else if (gqa_group == 4u) {
         QW3_ADAPTIVE_STREAM_SCORE_GQA(4u);
+    } else if (gqa_group == 6u) {
+        QW3_ADAPTIVE_STREAM_SCORE_GQA(6u);
     } else {
         block_attn_stream_adaptive_score_kernel<QueryT, KbarT><<<
             tile_blocks, kSoftmaxPagesThreads, 0, stream>>>(

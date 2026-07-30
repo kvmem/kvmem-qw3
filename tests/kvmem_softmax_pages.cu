@@ -443,8 +443,10 @@ static void run_adaptive_scorer_test() {
     constexpr uint32_t tokens = 3;
     constexpr uint32_t q_stride = 5;
     constexpr uint32_t blocks = 73;
-    constexpr uint32_t heads = 4;
-    constexpr uint32_t kv_heads = 2;
+    // Match the production Qwen3.6-27B GQA ratio so packed, streamed, and
+    // per-layer Adaptive scorers all exercise the group-6 specialization.
+    constexpr uint32_t heads = 6;
+    constexpr uint32_t kv_heads = 1;
     constexpr uint32_t dim = 8;
     constexpr uint32_t excl_lo = 3;
     constexpr uint32_t excl_hi = blocks - 4;
