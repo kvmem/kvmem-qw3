@@ -221,6 +221,19 @@ for placement in ("gpu", "cpu"):
         "index_upload_ms": last_float(
             r"\[bs-adaptive-upload\].*?total_ms=([0-9.]+)", log
         ),
+        "incremental_h2d_gib": last_float(
+            r"\[bs-adaptive-index\].*?incremental_h2d_gib=([0-9.]+)",
+            log,
+        ),
+        "incremental_pack_ms": last_float(
+            r"\[bs-adaptive-index\].*?pack_ms=([0-9.]+)", log
+        ) if placement == "gpu" else None,
+        "incremental_h2d_wait_ms": last_float(
+            r"\[bs-adaptive-index\].*?h2d_wait_ms=([0-9.]+)", log
+        ) if placement == "gpu" else None,
+        "gpu_layer_score_submit_ms": last_float(
+            r"\[bs-adaptive-score\].*?submit_ms=([0-9.]+)", log
+        ),
         "score_ms": last_float(
             r"\[bs-mean-score-perf\].*?elapsed_ms=([0-9.]+)", log
         ),
@@ -297,6 +310,10 @@ for label, key, unit in (
     ("Prefill throughput", "prefill_tok_per_sec", "tok/s"),
     ("Index finalize", "index_finalize_ms", "ms"),
     ("Index upload", "index_upload_ms", "ms"),
+    ("Incremental index H2D", "incremental_h2d_gib", "GiB"),
+    ("Incremental host pack", "incremental_pack_ms", "ms"),
+    ("Incremental H2D wait", "incremental_h2d_wait_ms", "ms"),
+    ("GPU layer score submit", "gpu_layer_score_submit_ms", "ms"),
     ("Adaptive score", "score_ms", "ms"),
     ("CPU stream transfer", "stream_transferred_gib", "GiB"),
     ("Semantic reselection", "semantic_reselection_ms", "ms"),
