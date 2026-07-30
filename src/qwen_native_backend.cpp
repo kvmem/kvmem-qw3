@@ -11705,7 +11705,12 @@ private:
                 stats_out->post_other_s = post_other_s;
             }
             std::ostringstream amsg;
-            amsg << std::fixed << std::setprecision(3)
+            // Keep enough printed precision that consumers can independently
+            // verify total == sum(phases) without a millisecond-rounding
+            // discrepancy. The intervals themselves share exact adjacent
+            // boundaries; six decimal places here preserves nanosecond-scale
+            // accounting after conversion to milliseconds.
+            amsg << std::fixed << std::setprecision(6)
                  << "[qw3-native-accounting]"
                  << " total_ms=" << total_s * 1000.0
                  << " setup_ms=" << setup_s * 1000.0
@@ -12970,7 +12975,10 @@ private:
         m << "\n[kvmem-session] turn=" << turn
           << " ctx=" << ctx_tokens << "tok (+" << delta_tokens << ")"
           << " GPU=" << gpu_mib << "MiB RSS=" << rss_mib << "MiB\n";
-        m << std::setprecision(3);
+        // The report is machine parsed. Six decimal places ensure the printed
+        // components retain the same additive conservation as the underlying
+        // adjacent wall-clock intervals.
+        m << std::setprecision(6);
         const double phase_sum_s =
             setup_s + prefill_s + postprefill_s + decode_s + finalize_s;
         m << "  total native execution                   = "
@@ -12982,7 +12990,7 @@ private:
           << std::setprecision(1)
           << (delta_tokens / std::max(prefill_s, 1e-9))
           << " tok/s)\n";
-        m << std::setprecision(3);
+        m << std::setprecision(6);
         m << "    phase3 post-prefill/reselection        = "
           << std::setw(10) << postprefill_s * 1000.0 << " ms\n";
         m << "      semantic selection                   = "
@@ -12995,7 +13003,7 @@ private:
           << std::setw(10) << decode_s * 1000.0 << " ms  ("
           << std::setprecision(2) << decode_tps << " tok/s, accept="
           << std::setprecision(4) << acceptance << ")\n";
-        m << std::setprecision(3);
+        m << std::setprecision(6);
         m << "    phase5 finalize                        = "
           << std::setw(10) << finalize_s * 1000.0 << " ms\n";
         m << "    accounting error                       = "
@@ -13013,7 +13021,7 @@ private:
         m << "    assemble   (pages+re-RoPE+k-bar)       = "
           << std::setw(10) << assemble_ms << " ms  (pages=" << asm_pages_ms
           << " rerope=" << asm_rerope_ms << " kbar=" << asm_kbar_ms << ")\n";
-        m << std::setprecision(3);
+        m << std::setprecision(6);
         // The bounded GPU pool can force kvmem stage-in/out mid-prefill; that
         // cost is INSIDE step5's wall above (not double-counted in steps 1-4,
         // which are the post-prefill decode-window reselect only).

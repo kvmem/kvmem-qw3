@@ -3308,7 +3308,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 const double preprocess_sum_ms =
                     json_ms + validate_ms + render_ms + tokenize_ms +
                     span_setup_ms;
-                std::cerr << std::fixed << std::setprecision(3)
+                // Preserve additive request accounting in serialized logs;
+                // millisecond precision alone can make the displayed
+                // components differ by a rounding microsecond.
+                std::cerr << std::fixed << std::setprecision(6)
                           << "[qw3-server-accounting]"
                           << " rid=" << rid
                           << " stream=" << (streaming ? 1 : 0)

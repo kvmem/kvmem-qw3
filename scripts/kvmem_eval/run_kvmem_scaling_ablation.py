@@ -79,6 +79,41 @@ def write_summary(out_root: Path, results: Dict[str, dict]) -> None:
                 if off["postprefill_ms"] else 0.0),
         }
 
+    # Ordered, cumulative marginal contributions. Each adjacent pair differs
+    # by exactly one optimization while the workload and model stay fixed.
+    marginal_pairs = (
+        ("packed-rematerialization",
+         "all-on", "one-off-no-packed"),
+        ("hierarchical-reuse",
+         "one-off-no-packed", "two-off-proactive-only"),
+        ("proactive-stage-out",
+         "two-off-proactive-only", "all-off"),
+    )
+    marginal: dict = {}
+    for name, enabled_cell, disabled_cell in marginal_pairs:
+        if (enabled_cell not in summary["cells"] or
+                disabled_cell not in summary["cells"]):
+            continue
+        enabled = summary["cells"][enabled_cell]["totals"]
+        disabled = summary["cells"][disabled_cell]["totals"]
+        marginal[name] = {
+            "enabled_cell": enabled_cell,
+            "disabled_cell": disabled_cell,
+            "total_speedup": (
+                disabled["total_ms"] / enabled["total_ms"]
+                if enabled["total_ms"] else 0.0),
+            "total_reduction_pct": (
+                100.0 * (disabled["total_ms"] - enabled["total_ms"]) /
+                disabled["total_ms"] if disabled["total_ms"] else 0.0),
+            "prefill_speedup": (
+                disabled["prefill_ms"] / enabled["prefill_ms"]
+                if enabled["prefill_ms"] else 0.0),
+            "postprefill_speedup": (
+                disabled["postprefill_ms"] / enabled["postprefill_ms"]
+                if enabled["postprefill_ms"] else 0.0),
+        }
+    summary["comparisons"]["ordered_marginal"] = marginal
+
     (out_root / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -143,6 +178,49 @@ def write_summary(out_root: Path, results: Dict[str, dict]) -> None:
                 f"| {t.get('phase_error_ms', 0):.6f} "
                 f"| {t.get('prefill_tps', 0):.1f} "
                 f"| {t.get('gpu_mib', 0)} | {t.get('rss_mib', 0)} |")
+        lines.append("")
+
+        lines += [
+            "Nested KVMem diagnostics (not additive because asynchronous I/O "
+            "may overlap foreground compute):",
+            "",
+            "| context | retrieval | stage-in | stage-out | assembly | pages "
+            "| re-RoPE | k-bar | in-prefill KVMem |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for t in summary["cells"][cell]["turns"]:
+            lines.append(
+                f"| {t.get('ctx_tokens', 0)} "
+                f"| {t.get('sel_ms', 0)/1000:.6f} "
+                f"| {t.get('stage_in_ms', 0)/1000:.6f} "
+                f"| {t.get('stage_out_ms', 0)/1000:.6f} "
+                f"| {t.get('assemble_ms', 0)/1000:.6f} "
+                f"| {t.get('asm_pages_ms', 0)/1000:.6f} "
+                f"| {t.get('asm_rerope_ms', 0)/1000:.6f} "
+                f"| {t.get('asm_kbar_ms', 0)/1000:.6f} "
+                f"| {t.get('inprefill_offload_ms', 0)/1000:.6f} |")
+        lines.append("")
+
+    if marginal:
+        lines += [
+            "## Ordered marginal ablation",
+            "",
+            "Each row compares two adjacent cumulative cells differing by "
+            "one optimization. Results are order-dependent when optimizations "
+            "interact.",
+            "",
+            "| optimization restored | enabled cell | disabled cell | total "
+            "speedup | total reduction | prefill speedup | post speedup |",
+            "|---|---|---|---:|---:|---:|---:|",
+        ]
+        for name, values in marginal.items():
+            lines.append(
+                f"| {name} | {values['enabled_cell']} "
+                f"| {values['disabled_cell']} "
+                f"| {values['total_speedup']:.4f}x "
+                f"| {values['total_reduction_pct']:.3f}% "
+                f"| {values['prefill_speedup']:.4f}x "
+                f"| {values['postprefill_speedup']:.4f}x |")
         lines.append("")
 
     (out_root / "summary.md").write_text(
