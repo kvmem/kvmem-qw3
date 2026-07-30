@@ -80,6 +80,15 @@ bool launch_block_attn_stream_adaptive_score_typed(
     uint32_t global_block_base, uint32_t n_heads,
     uint32_t n_kv_heads, uint32_t head_dim, float scale,
     cudaStream_t stream);
+bool launch_block_attn_score_adaptive_layer_typed(
+    float *score, const void *q_multi, bool query_is_fp16,
+    const void *prototype_layer, KbarDType prototype_dtype,
+    const int32_t *block_offsets, const int32_t *block_counts,
+    uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t q_layer_stride, uint32_t prototype_count,
+    uint32_t block_count, uint32_t global_block_base,
+    uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+    float scale, cudaStream_t stream);
 bool launch_block_kdirection_adaptive_batch_typed(
     const float *k_batch, void *candidates, KbarDType candidate_dtype,
     float *residuals, uint32_t n_blocks_chunk, uint32_t k_stride,
@@ -559,9 +568,9 @@ static void run_adaptive_scorer_test() {
     CHECK(cudaMalloc(
         &d_global_sum, distributions * sizeof(float)));
     CHECK(cudaMalloc(
-        &d_tile_offsets, tile_blocks * sizeof(int32_t)));
+        &d_tile_offsets, blocks * sizeof(int32_t)));
     CHECK(cudaMalloc(
-        &d_tile_counts, tile_blocks * sizeof(int32_t)));
+        &d_tile_counts, blocks * sizeof(int32_t)));
     CHECK(cudaMemset(d_score, 0, blocks * sizeof(float)));
 
     for (uint32_t l = 0; l < layers; ++l) {
@@ -655,6 +664,65 @@ static void run_adaptive_scorer_test() {
     compare(
         "adaptive-streamed-vs-host", streamed, expected,
         3e-6, 3e-3);
+
+    CHECK(cudaMemset(d_score, 0, blocks * sizeof(float)));
+    const uint32_t included_blocks = excl_hi - excl_lo;
+    for (uint32_t l = 0; l < layers; ++l) {
+        const uint32_t meta_begin = l * blocks + excl_lo;
+        const uint32_t prototype_begin =
+            static_cast<uint32_t>(block_offsets[meta_begin]);
+        const uint32_t last_meta =
+            l * blocks + excl_hi - 1;
+        const uint32_t prototype_end =
+            static_cast<uint32_t>(block_offsets[last_meta]) +
+            static_cast<uint32_t>(block_counts[last_meta]);
+        const uint32_t layer_prototypes =
+            prototype_end - prototype_begin;
+        std::vector<int32_t> local_offsets(included_blocks);
+        std::vector<int32_t> local_counts(included_blocks);
+        for (uint32_t b = 0; b < included_blocks; ++b) {
+            local_offsets[b] =
+                block_offsets[meta_begin + b] -
+                static_cast<int32_t>(prototype_begin);
+            local_counts[b] = block_counts[meta_begin + b];
+        }
+        CHECK(cudaMemcpy(
+            d_tile_offsets, local_offsets.data(),
+            included_blocks * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(
+            d_tile_counts, local_counts.data(),
+            included_blocks * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+        const float *layer_values =
+            d_prototypes +
+            static_cast<uint64_t>(prototype_begin) *
+                kv_heads * dim;
+        if (!qw3::ported::
+                launch_block_attn_score_adaptive_layer_typed(
+                    d_score, d_q, /*query_is_fp16=*/false,
+                    layer_values, qw3::ported::KbarDType::F32,
+                    d_tile_offsets, d_tile_counts, l, layers,
+                    tokens, q_stride, layer_prototypes,
+                    included_blocks, excl_lo, heads, kv_heads,
+                    dim, scale, /*stream=*/0)) {
+            std::fprintf(
+                stderr,
+                "adaptive layer one-pass scorer rejected test\n");
+            std::exit(1);
+        }
+    }
+    CHECK(cudaDeviceSynchronize());
+    std::vector<float> layer_one_pass(blocks);
+    CHECK(cudaMemcpy(
+        layer_one_pass.data(), d_score, blocks * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    compare(
+        "adaptive-layer-one-pass-vs-packed",
+        layer_one_pass, actual, 3e-6, 3e-3);
+    compare(
+        "adaptive-layer-one-pass-vs-host",
+        layer_one_pass, expected, 3e-6, 3e-3);
 
     CHECK(cudaFree(d_tile_counts));
     CHECK(cudaFree(d_tile_offsets));

@@ -1655,6 +1655,11 @@ private:
         uint32_t q_layer_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         uint32_t accumulate, std::string *failure_reason);
+    bool kvmem_score_cpu_adaptive_index_layer_one_pass(
+        uint32_t n_blocks, uint32_t n_tokens,
+        uint32_t q_layer_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t accumulate, std::string *failure_reason);
 
     // ---- DeltaNet-state retrieval (--kvmem-retrieval-method deltanet) --------
     // Scores each historical block by the net EDIT it made to the DeltaNet

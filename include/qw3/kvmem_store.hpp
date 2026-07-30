@@ -231,6 +231,12 @@ enum class KvMemIndexPlacement : uint8_t {
     CPU = 1,
 };
 
+enum class KvMemAdaptiveScoreMode : uint8_t {
+    Auto = 0,
+    LayerOnePass = 1,
+    TiledTwoPass = 2,
+};
+
 struct KvMemStoreConfig {
     uint32_t block_tokens = 128;     // --kvmem-block-tokens
     uint32_t select_budget = 131072; // --kvmem-budget (max window tokens)
@@ -244,6 +250,8 @@ struct KvMemStoreConfig {
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
     KvMemIndexPlacement index_placement = KvMemIndexPlacement::GPU;
     uint64_t index_staging_bytes = 64ull * 1024ull * 1024ull;
+    KvMemAdaptiveScoreMode adaptive_score_mode =
+        KvMemAdaptiveScoreMode::Auto;
     uint32_t n_subblocks = 1;        // --kvmem-subblocks; sub-block means per block
                                      // (SubBlockMeanK only; 1 => plain mean-k)
     KvMemPrototypeMode prototype_mode = KvMemPrototypeMode::Contiguous;

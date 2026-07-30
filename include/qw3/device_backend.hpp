@@ -1635,6 +1635,39 @@ public:
             "block_attn_stream_adaptive_score_device requires backend override"};
     }
 
+    // One-transfer/one-dot Adaptive scorer for a complete normal-attention
+    // layer. `prototype_layer` and the block metadata use layer-local offsets;
+    // the result is accumulated into global block scores with normalization by
+    // the original all-layer/head distribution count.
+    virtual DeviceStatus block_attn_score_adaptive_layer_device(
+        DeviceTensor &score,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &prototype_layer,
+        const DeviceTensor &block_offsets,
+        const DeviceTensor &block_counts,
+        uint32_t layer,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t prototype_count,
+        uint32_t block_count,
+        uint32_t global_block_base,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale) {
+        (void)score; (void)q_multi; (void)prototype_layer;
+        (void)block_offsets; (void)block_counts;
+        (void)layer; (void)n_layers; (void)n_tokens;
+        (void)q_layer_stride; (void)prototype_count;
+        (void)block_count; (void)global_block_base;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim;
+        (void)scale;
+        return {
+            false,
+            "block_attn_score_adaptive_layer_device requires backend override"};
+    }
+
 
     // Variable-length logical-group variant used by semantic retrieval.
     // Fine-grained logits and the global softmax are identical to

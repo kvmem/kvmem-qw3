@@ -15706,11 +15706,385 @@ void QwenExecutor::kvmem_finalize_adaptive_index() {
     }
 }
 
+bool QwenExecutor::kvmem_score_cpu_adaptive_index_layer_one_pass(
+        uint32_t n_blocks, uint32_t n_tokens,
+        uint32_t q_layer_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t accumulate, std::string *failure_reason) {
+    if (!kvmem_adaptive_prototypes() ||
+        !kvmem_mean_index_cpu() || !block_store_ ||
+        !g_query_multi_ || !g_score_dev_ ||
+        n_blocks == 0 || n_tokens == 0 ||
+        g_adaptive_index_elem_size_ == 0 ||
+        g_adaptive_index_stride_blocks_ < n_blocks) {
+        return scorer_unavailable(
+            failure_reason,
+            "cpu_adaptive_layer_one_pass_unavailable");
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = kvmem_qc_num_layers_;
+    const uint32_t included_begin =
+        std::min(excl_lo_end, n_blocks);
+    const uint32_t included_end =
+        std::min(excl_hi_begin, n_blocks);
+    if (layers == 0 || included_begin >= included_end ||
+        g_adaptive_layer_values_host_.size() != layers ||
+        g_adaptive_layer_parent_host_.size() != layers ||
+        g_adaptive_block_offsets_host_.size() <
+            static_cast<uint64_t>(layers) *
+                g_adaptive_index_stride_blocks_ ||
+        g_adaptive_block_counts_host_.size() <
+            static_cast<uint64_t>(layers) *
+                g_adaptive_index_stride_blocks_) {
+        return scorer_unavailable(
+            failure_reason,
+            "cpu_adaptive_layer_one_pass_shape_invalid");
+    }
+    const uint64_t row_elems =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    const uint64_t row_bytes =
+        row_elems * g_adaptive_index_elem_size_;
+    if (row_bytes == 0) {
+        return scorer_unavailable(
+            failure_reason,
+            "cpu_adaptive_layer_one_pass_row_size_zero");
+    }
+
+    struct AdaptiveLayerJob {
+        uint32_t layer = 0;
+        uint32_t first_block = 0;
+        uint32_t block_count = 0;
+        uint32_t prototype_begin = 0;
+        uint32_t prototype_count = 0;
+    };
+    std::vector<AdaptiveLayerJob> jobs;
+    jobs.reserve(layers);
+    uint64_t max_prototypes = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        const uint64_t meta_base =
+            static_cast<uint64_t>(l) *
+            g_adaptive_index_stride_blocks_;
+        const int32_t begin_i32 =
+            g_adaptive_block_offsets_host_[
+                meta_base + included_begin];
+        const uint64_t last_meta =
+            meta_base + included_end - 1;
+        const int32_t last_offset_i32 =
+            g_adaptive_block_offsets_host_[last_meta];
+        const int32_t last_count_i32 =
+            g_adaptive_block_counts_host_[last_meta];
+        if (begin_i32 < 0 || last_offset_i32 < 0 ||
+            last_count_i32 < 0) {
+            return scorer_unavailable(
+                failure_reason,
+                "cpu_adaptive_layer_one_pass_negative_metadata");
+        }
+        const uint64_t begin =
+            static_cast<uint32_t>(begin_i32);
+        const uint64_t end =
+            static_cast<uint64_t>(
+                static_cast<uint32_t>(last_offset_i32)) +
+            static_cast<uint32_t>(last_count_i32);
+        const uint64_t layer_count =
+            g_adaptive_layer_parent_host_[l].size();
+        if (end < begin || end > layer_count ||
+            g_adaptive_layer_values_host_[l].size() !=
+                layer_count * row_bytes ||
+            end - begin > UINT32_MAX) {
+            return scorer_unavailable(
+                failure_reason,
+                "cpu_adaptive_layer_one_pass_metadata_oob");
+        }
+        if (end == begin) continue;
+        jobs.push_back({
+            l, included_begin, included_end - included_begin,
+            static_cast<uint32_t>(begin),
+            static_cast<uint32_t>(end - begin)});
+        max_prototypes =
+            std::max<uint64_t>(max_prototypes, end - begin);
+    }
+    if (jobs.empty() || max_prototypes == 0) {
+        return scorer_unavailable(
+            failure_reason,
+            "cpu_adaptive_layer_one_pass_no_jobs");
+    }
+    const uint64_t value_bytes =
+        max_prototypes * row_bytes;
+    // Auto mode bounds its temporary device footprint independently of the
+    // small tiled fallback slots. A real 1M Adaptive layer is ~220-250 MiB.
+    // Allocate only the observed maximum, never the full multi-layer index.
+    const uint64_t auto_cap_bytes =
+        std::max<uint64_t>(
+            block_store_->config().index_staging_bytes,
+            256ull * 1024ull * 1024ull);
+    if (value_bytes > auto_cap_bytes) {
+        return scorer_unavailable(
+            failure_reason,
+            "cpu_adaptive_layer_one_pass_exceeds_256mib_cap");
+    }
+    const uint64_t metadata_bytes =
+        static_cast<uint64_t>(included_end - included_begin) *
+        sizeof(int32_t);
+    if (value_bytes > UINT64_MAX - 2 * metadata_bytes) {
+        return scorer_unavailable(
+            failure_reason,
+            "cpu_adaptive_layer_one_pass_host_overflow");
+    }
+    const uint64_t host_bytes =
+        value_bytes + 2 * metadata_bytes;
+    const uint32_t block_capacity =
+        included_end - included_begin;
+    const bool rebuild_staging =
+        g_adaptive_stream_value_bytes_ != value_bytes ||
+        g_adaptive_stream_block_capacity_ < block_capacity ||
+        !g_adaptive_stream_slots_[0].values ||
+        !g_adaptive_stream_slots_[1].values;
+    if (rebuild_staging) {
+        for (auto &slot : g_adaptive_stream_slots_) {
+            if (slot.transfer_done) {
+                require_status(
+                    backend_.wait_kv_transfer_fence(
+                        slot.transfer_done));
+            }
+            require_status(backend_.synchronize());
+            slot.compute_done.reset();
+            slot.values =
+                kvmem_alloc_mean_index_tensor(
+                    max_prototypes * row_elems,
+                    "g_adaptive_layer_values");
+            slot.block_offsets =
+                backend_.tensor_i32(
+                    block_capacity,
+                    "g_adaptive_layer_block_offsets");
+            slot.block_counts =
+                backend_.tensor_i32(
+                    block_capacity,
+                    "g_adaptive_layer_block_counts");
+            slot.host =
+                backend_.host_buffer(
+                    host_bytes,
+                    "g_adaptive_layer_host");
+            if (!slot.host || slot.host->bytes < host_bytes) {
+                throw std::runtime_error(
+                    "KVMem Adaptive layer staging allocation failed");
+            }
+        }
+        g_adaptive_stream_value_bytes_ = value_bytes;
+        g_adaptive_stream_block_capacity_ = block_capacity;
+    }
+
+    if (!accumulate) {
+        require_status(backend_.zero_tensor(*g_score_dev_));
+    }
+    const size_t stream_workers = std::min<size_t>(
+        kvmem_cpu_gather_threads(),
+        std::max<uint64_t>(
+            1, value_bytes / (8ull * 1024ull * 1024ull)));
+    std::unique_ptr<KvmemCpuWorkerPool> local_stream_pool;
+    KvmemCpuWorkerPool *stream_pool =
+        kvmem_cpu_worker_pool_.get();
+    if (stream_workers > 1 && !stream_pool) {
+        local_stream_pool =
+            std::make_unique<KvmemCpuWorkerPool>(
+                stream_workers - 1);
+        stream_pool = local_stream_pool.get();
+    }
+
+    uint64_t pack_ns = 0;
+    uint64_t h2d_wait_ns = 0;
+    uint64_t transferred_bytes = 0;
+    const uint64_t begin_ns = kvmem_steady_ns();
+    auto submit = [&](uint32_t job_index) {
+        const AdaptiveLayerJob &job = jobs[job_index];
+        const uint32_t slot_index =
+            job_index %
+            static_cast<uint32_t>(
+                g_adaptive_stream_slots_.size());
+        AdaptiveIndexStageSlot &slot =
+            g_adaptive_stream_slots_[slot_index];
+        if (slot.transfer_done) {
+            const uint64_t wait_begin = kvmem_steady_ns();
+            require_status(
+                backend_.wait_kv_transfer_fence(
+                    slot.transfer_done));
+            h2d_wait_ns +=
+                kvmem_steady_ns() - wait_begin;
+        }
+        const uint64_t job_value_bytes =
+            static_cast<uint64_t>(job.prototype_count) *
+            row_bytes;
+        const uint64_t pack_begin = kvmem_steady_ns();
+        auto *host =
+            static_cast<uint8_t *>(slot.host->data);
+        const auto &values =
+            g_adaptive_layer_values_host_[job.layer];
+        const uint8_t *source =
+            values.data() +
+            static_cast<uint64_t>(job.prototype_begin) *
+                row_bytes;
+        const size_t workers = std::min<size_t>(
+            stream_workers,
+            std::max<uint64_t>(
+                1, job_value_bytes /
+                       (8ull * 1024ull * 1024ull)));
+        if (workers <= 1 || !stream_pool) {
+            std::memcpy(
+                host, source,
+                static_cast<size_t>(job_value_bytes));
+        } else {
+            const uint64_t part =
+                (job_value_bytes + workers - 1) / workers;
+            stream_pool->run(
+                workers, workers,
+                [&](size_t worker) {
+                    const uint64_t begin = worker * part;
+                    const uint64_t end =
+                        std::min<uint64_t>(
+                            job_value_bytes, begin + part);
+                    if (begin < end) {
+                        std::memcpy(
+                            host + begin, source + begin,
+                            static_cast<size_t>(end - begin));
+                    }
+                });
+        }
+        auto *offsets =
+            reinterpret_cast<int32_t *>(
+                host + value_bytes);
+        auto *counts =
+            reinterpret_cast<int32_t *>(
+                host + value_bytes + metadata_bytes);
+        const uint64_t meta_base =
+            static_cast<uint64_t>(job.layer) *
+                g_adaptive_index_stride_blocks_ +
+            job.first_block;
+        for (uint32_t b = 0; b < job.block_count; ++b) {
+            offsets[b] =
+                g_adaptive_block_offsets_host_[meta_base + b] -
+                static_cast<int32_t>(job.prototype_begin);
+            counts[b] =
+                g_adaptive_block_counts_host_[meta_base + b];
+        }
+        pack_ns += kvmem_steady_ns() - pack_begin;
+
+        require_status(
+            backend_.kv_transfer_wait_for_execution(
+                slot.compute_done));
+        require_status(
+            backend_.begin_kv_transfer_to_device());
+        require_status(
+            backend_.copy_bytes_from_host_async(
+                *slot.values, 0, host, job_value_bytes));
+        const uint64_t job_meta_bytes =
+            static_cast<uint64_t>(job.block_count) *
+            sizeof(int32_t);
+        require_status(
+            backend_.copy_bytes_from_host_async(
+                *slot.block_offsets, 0, offsets,
+                job_meta_bytes));
+        require_status(
+            backend_.copy_bytes_from_host_async(
+                *slot.block_counts, 0, counts,
+                job_meta_bytes));
+        require_status(
+            backend_.record_kv_transfer_fence(
+                slot.transfer_done));
+        transferred_bytes +=
+            job_value_bytes + 2 * job_meta_bytes;
+    };
+
+    submit(0);
+    if (jobs.size() > 1) submit(1);
+    for (uint32_t i = 0; i < jobs.size(); ++i) {
+        const AdaptiveLayerJob &job = jobs[i];
+        AdaptiveIndexStageSlot &slot =
+            g_adaptive_stream_slots_[
+                i % g_adaptive_stream_slots_.size()];
+        require_status(
+            backend_.execution_wait_for_kv_transfer(
+                slot.transfer_done));
+        const DeviceStatus st =
+            backend_.block_attn_score_adaptive_layer_device(
+                *g_score_dev_, *g_query_multi_, *slot.values,
+                *slot.block_offsets, *slot.block_counts,
+                job.layer, layers, n_tokens, q_layer_stride,
+                job.prototype_count, job.block_count,
+                job.first_block, cfg.n_heads, cfg.n_kv_heads,
+                cfg.head_dim, scale);
+        if (!st.ok) {
+            return scorer_backend_unavailable(
+                failure_reason,
+                "cpu_adaptive_layer_one_pass_score_failed",
+                st);
+        }
+        require_status(
+            backend_.record_execution_fence(
+                slot.compute_done));
+        if (i + 2 < jobs.size()) submit(i + 2);
+    }
+    require_status(backend_.synchronize());
+    if (std::getenv("QW3_KVMEM_TRACE") ||
+        kvmem_perf_trace_flag()) {
+        std::fprintf(
+            stderr,
+            "[bs-adaptive-stream] placement=cpu exact=1 "
+            "mode=layer-one-pass passes=1 layers=%u blocks=%u "
+            "query_tokens=%u jobs=%zu staging_mib=%.2f "
+            "gather_workers=%zu gqa_group=%u "
+            "transferred_gib=%.3f pack_ms=%.3f "
+            "h2d_wait_ms=%.3f total_ms=%.3f\n",
+            layers, n_blocks, n_tokens, jobs.size(),
+            static_cast<double>(value_bytes) /
+                (1024.0 * 1024.0),
+            stream_workers,
+            cfg.n_kv_heads > 0
+                ? cfg.n_heads / cfg.n_kv_heads
+                : 0,
+            static_cast<double>(transferred_bytes) /
+                (1024.0 * 1024.0 * 1024.0),
+            pack_ns / 1.0e6, h2d_wait_ns / 1.0e6,
+            (kvmem_steady_ns() - begin_ns) / 1.0e6);
+    }
+    return true;
+}
+
 bool QwenExecutor::kvmem_score_cpu_adaptive_index(
         uint32_t n_blocks, uint32_t n_tokens,
         uint32_t q_layer_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         uint32_t accumulate, std::string *failure_reason) {
+    const KvMemAdaptiveScoreMode score_mode =
+        block_store_
+            ? block_store_->config().adaptive_score_mode
+            : KvMemAdaptiveScoreMode::Auto;
+    if (score_mode !=
+        KvMemAdaptiveScoreMode::TiledTwoPass) {
+        std::string layer_failure;
+        if (kvmem_score_cpu_adaptive_index_layer_one_pass(
+                n_blocks, n_tokens, q_layer_stride, scale,
+                excl_lo_end, excl_hi_begin, accumulate,
+                &layer_failure)) {
+            return true;
+        }
+        if (score_mode ==
+            KvMemAdaptiveScoreMode::LayerOnePass) {
+            if (failure_reason) {
+                *failure_reason = layer_failure;
+            }
+            return false;
+        }
+        if (std::getenv("QW3_KVMEM_TRACE") ||
+            kvmem_perf_trace_flag()) {
+            std::fprintf(
+                stderr,
+                "[bs-adaptive-stream-fallback] "
+                "from=layer-one-pass to=tiled-two-pass "
+                "reason=%s\n",
+                layer_failure.empty()
+                    ? "unknown"
+                    : layer_failure.c_str());
+        }
+    }
     if (!kvmem_adaptive_prototypes() ||
         !kvmem_mean_index_cpu() || !block_store_ ||
         !g_query_multi_ || !g_score_dev_ ||

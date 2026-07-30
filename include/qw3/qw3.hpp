@@ -104,6 +104,11 @@ struct EngineOptions {
     // in pageable host memory and streams bounded tiles through the GPU.
     std::string kvmem_index_placement = "gpu"; // gpu or cpu
     int kvmem_index_staging_mb = 64;           // per GPU/host staging slot
+    // Adaptive CPU index scoring: auto uses a one-transfer/one-dot per-layer
+    // path when a layer fits the bounded staging cap, otherwise the exact
+    // two-pass tiled compatibility path.
+    std::string kvmem_adaptive_score_mode =
+        "auto"; // auto|layer-one-pass|tiled-two-pass
     int kvmem_subblocks = 4;      // sub-block means per block (sub-block-mean-k only)
     std::string kvmem_subblock_reduce = "max"; // sub-block score reduction: max or sum
     double kvmem_adaptive_gain_1to2 = 0.10;

@@ -6272,6 +6272,13 @@ private:
             static_cast<uint64_t>(
                 std::max(1, options_.kvmem_index_staging_mb)) *
             1024ull * 1024ull;
+        bs_cfg.adaptive_score_mode =
+            options_.kvmem_adaptive_score_mode == "layer-one-pass"
+                ? KvMemAdaptiveScoreMode::LayerOnePass
+                : options_.kvmem_adaptive_score_mode ==
+                          "tiled-two-pass"
+                      ? KvMemAdaptiveScoreMode::TiledTwoPass
+                      : KvMemAdaptiveScoreMode::Auto;
         if (bs_cfg.index_placement == KvMemIndexPlacement::CPU &&
             (bs_cfg.retrieval_method == KvMemRetrievalMethod::PerToken ||
              bs_cfg.retrieval_method == KvMemRetrievalMethod::DeltaNet)) {

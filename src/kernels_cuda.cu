@@ -589,6 +589,15 @@ bool launch_block_attn_stream_adaptive_score_typed(
         uint32_t global_block_base, uint32_t n_heads,
         uint32_t n_kv_heads, uint32_t head_dim, float scale,
         cudaStream_t stream);
+bool launch_block_attn_score_adaptive_layer_typed(
+        float *score, const void *q_multi, bool query_is_fp16,
+        const void *prototype_layer, KbarDType prototype_dtype,
+        const int32_t *block_offsets, const int32_t *block_counts,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t prototype_count,
+        uint32_t block_count, uint32_t global_block_base,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        float scale, cudaStream_t stream);
 bool launch_block_kmean_content_batch_merge(
     const float *k_batch, float *kbar, uint64_t kbar_block_base,
     uint32_t n_blocks_chunk, uint32_t k_stride, uint32_t batch,
@@ -6188,6 +6197,197 @@ __global__ void block_attn_adaptive_logits_gqa_kernel(
             }
         }
     }
+}
+
+// Complete-layer variant used by CPU-offloaded one-pass streaming and by the
+// per-layer GPU-resident arena. The staged prototype rows already exclude
+// sink/recent blocks, so no parent-id filtering is needed. Keeping the query's
+// original layer id preserves the [layer, token, head] capture layout while
+// allowing the logits workspace to contain just one layer.
+template <typename QueryT, typename KbarT>
+__global__ void block_attn_adaptive_layer_logits_kernel(
+        float *logits,
+        const QueryT *q_multi,
+        const KbarT *prototypes,
+        uint32_t layer,
+        uint32_t distribution_base,
+        uint32_t distribution_count,
+        uint32_t n_tiles,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t prototype_count,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale) {
+    const uint64_t job = blockIdx.x;
+    const uint32_t local_dist =
+        static_cast<uint32_t>(job / n_tiles);
+    const uint32_t tile = static_cast<uint32_t>(
+        job - static_cast<uint64_t>(local_dist) * n_tiles);
+    if (local_dist >= distribution_count) return;
+
+    const uint32_t dist = distribution_base + local_dist;
+    const uint32_t qh = dist % n_heads;
+    const uint32_t t = dist / n_heads;
+    const uint32_t group = n_heads / n_kv_heads;
+    const uint32_t kvh = qh / group;
+    const uint32_t p0 = tile * kSoftmaxPagesTile;
+    const uint32_t p1 =
+        min(p0 + kSoftmaxPagesTile, prototype_count);
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    constexpr uint32_t kWarps = kSoftmaxPagesThreads / 32;
+    const uint64_t qrow =
+        static_cast<uint64_t>(n_heads) * head_dim;
+    const QueryT *qr =
+        q_multi +
+        (static_cast<uint64_t>(layer) * q_layer_stride + t) * qrow +
+        static_cast<uint64_t>(qh) * head_dim;
+    float *out =
+        logits +
+        static_cast<uint64_t>(local_dist) * prototype_count;
+
+    for (uint32_t p = p0 + warp; p < p1; p += kWarps) {
+        const KbarT *kr =
+            prototypes +
+            (static_cast<uint64_t>(p) * n_kv_heads + kvh) *
+                head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = lane; d < head_dim; d += 32u) {
+            dot += static_cast<float>(qr[d]) *
+                   static_cast<float>(kr[d]);
+        }
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0) out[p] = dot * scale;
+    }
+}
+
+template <typename QueryT, typename KbarT, uint32_t GqaGroup>
+__global__ void block_attn_adaptive_layer_logits_gqa_kernel(
+        float *logits,
+        const QueryT *q_multi,
+        const KbarT *prototypes,
+        uint32_t layer,
+        uint32_t distribution_base,
+        uint32_t distribution_count,
+        uint32_t n_tiles,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t prototype_count,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale) {
+    static_assert(GqaGroup >= 2 && GqaGroup <= 4);
+    const uint64_t job = blockIdx.x;
+    const uint32_t local_group =
+        static_cast<uint32_t>(job / n_tiles);
+    const uint32_t tile = static_cast<uint32_t>(
+        job - static_cast<uint64_t>(local_group) * n_tiles);
+    const uint32_t local_dist0 = local_group * GqaGroup;
+    if (local_dist0 + GqaGroup > distribution_count) return;
+
+    const uint32_t dist0 = distribution_base + local_dist0;
+    const uint32_t qh0 = dist0 % n_heads;
+    const uint32_t t = dist0 / n_heads;
+    const uint32_t kvh = qh0 / GqaGroup;
+    if (kvh >= n_kv_heads || qh0 % GqaGroup != 0) return;
+    const uint32_t p0 = tile * kSoftmaxPagesTile;
+    const uint32_t p1 =
+        min(p0 + kSoftmaxPagesTile, prototype_count);
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    constexpr uint32_t kWarps = kSoftmaxPagesThreads / 32;
+    const uint64_t qrow =
+        static_cast<uint64_t>(n_heads) * head_dim;
+    const QueryT *qr0 =
+        q_multi +
+        (static_cast<uint64_t>(layer) * q_layer_stride + t) * qrow +
+        static_cast<uint64_t>(qh0) * head_dim;
+
+    for (uint32_t p = p0 + warp; p < p1; p += kWarps) {
+        const KbarT *kr =
+            prototypes +
+            (static_cast<uint64_t>(p) * n_kv_heads + kvh) *
+                head_dim;
+        float dot[GqaGroup] = {};
+        for (uint32_t d = lane; d < head_dim; d += 32u) {
+            const float k = static_cast<float>(kr[d]);
+#pragma unroll
+            for (uint32_t g = 0; g < GqaGroup; ++g) {
+                dot[g] +=
+                    static_cast<float>(
+                        qr0[static_cast<uint64_t>(g) * head_dim + d]) *
+                    k;
+            }
+        }
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+#pragma unroll
+            for (uint32_t g = 0; g < GqaGroup; ++g) {
+                dot[g] += __shfl_down_sync(
+                    0xffffffffu, dot[g], offset);
+            }
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (uint32_t g = 0; g < GqaGroup; ++g) {
+                logits[
+                    static_cast<uint64_t>(local_dist0 + g) *
+                        prototype_count +
+                    p] = dot[g] * scale;
+            }
+        }
+    }
+}
+
+__global__ void block_attn_adaptive_layer_accumulate_logits_kernel(
+        float *score,
+        const float *logits,
+        const float *row_max,
+        const float *row_inv_sum,
+        const int32_t *block_offsets,
+        const int32_t *block_counts,
+        uint32_t distribution_count,
+        uint32_t block_count,
+        uint32_t global_block_base,
+        uint32_t prototype_count,
+        float distribution_weight) {
+    const uint32_t w =
+        blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= block_count) return;
+    const uint32_t begin =
+        static_cast<uint32_t>(max(block_offsets[w], 0));
+    const uint32_t count =
+        static_cast<uint32_t>(max(block_counts[w], 0));
+    if (count == 0 || begin >= prototype_count ||
+        count > prototype_count - begin) {
+        return;
+    }
+    float accum = 0.0f;
+    for (uint32_t local_dist = 0;
+         local_dist < distribution_count; ++local_dist) {
+        const float inv = row_inv_sum[local_dist];
+        if (!(inv > 0.0f)) continue;
+        const float *row =
+            logits +
+            static_cast<uint64_t>(local_dist) * prototype_count +
+            begin;
+        float block_max = -INFINITY;
+        for (uint32_t i = 0; i < count; ++i) {
+            block_max = fmaxf(block_max, row[i]);
+        }
+        if (isfinite(block_max)) {
+            accum +=
+                __expf(block_max - row_max[local_dist]) * inv;
+        }
+    }
+    score[global_block_base + w] +=
+        accum * distribution_weight;
 }
 
 // Reduce one bounded logits batch into logical block scores. A thread owns one
@@ -16176,6 +16376,73 @@ public:
             "cuda block_attn_stream_adaptive_score_device");
     }
 
+    DeviceStatus block_attn_score_adaptive_layer_device(
+            DeviceTensor &score,
+            const DeviceTensor &q_multi,
+            const DeviceTensor &prototype_layer,
+            const DeviceTensor &block_offsets,
+            const DeviceTensor &block_counts,
+            uint32_t layer,
+            uint32_t n_layers,
+            uint32_t n_tokens,
+            uint32_t q_layer_stride,
+            uint32_t prototype_count,
+            uint32_t block_count,
+            uint32_t global_block_base,
+            uint32_t n_heads,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            float scale) override {
+        if (n_layers == 0 || prototype_count == 0 || block_count == 0 ||
+            n_tokens == 0) {
+            return {};
+        }
+        auto &sc = as_tensor(score);
+        const auto &qm = as_tensor(q_multi);
+        const auto &pt = as_tensor(prototype_layer);
+        const auto &bo = as_tensor(block_offsets);
+        const auto &bc = as_tensor(block_counts);
+        const uint64_t q_rows =
+            static_cast<uint64_t>(n_layers - 1) *
+                q_layer_stride +
+            n_tokens;
+        const uint64_t row_elems =
+            static_cast<uint64_t>(n_kv_heads) * head_dim;
+        if (layer >= n_layers ||
+            sc.elem_size != sizeof(float) ||
+            sc.count <
+                static_cast<uint64_t>(global_block_base) +
+                    block_count ||
+            bo.elem_size != sizeof(int32_t) ||
+            bc.elem_size != sizeof(int32_t) ||
+            bo.count < block_count || bc.count < block_count ||
+            qm.count < q_rows * n_heads * head_dim ||
+            pt.count <
+                static_cast<uint64_t>(prototype_count) *
+                    row_elems) {
+            return {
+                false,
+                "block_attn_score_adaptive_layer invalid tensor shape"};
+        }
+        const ported::KbarDType dtype =
+            pt.is_fp8_kv() ? ported::KbarDType::FP8
+                           : pt.is_fp16()
+                                 ? ported::KbarDType::F16
+                                 : ported::KbarDType::F32;
+        if (!ported::launch_block_attn_score_adaptive_layer_typed(
+                sc.ptr, qm.ptr, qm.is_fp16(), pt.ptr, dtype,
+                bo.ptr_i32(), bc.ptr_i32(), layer, n_layers,
+                n_tokens, q_layer_stride, prototype_count,
+                block_count, global_block_base, n_heads,
+                n_kv_heads, head_dim, scale, exec_stream_)) {
+            return {
+                false,
+                "block_attn_score_adaptive_layer launch failed"};
+        }
+        return launch_status(
+            "cuda block_attn_score_adaptive_layer_device");
+    }
+
     DeviceStatus block_attn_score_softmax_groups_device(
             DeviceTensor &score,
             const DeviceTensor &q_multi,
@@ -20978,6 +21245,196 @@ bool launch_block_attn_score_softmax_adaptive_typed(
         }
     }
 #undef QW3_ADAPTIVE_SCORE
+    return false;
+}
+
+template <typename QueryT, typename KbarT>
+bool launch_block_attn_score_adaptive_layer_impl(
+        float *score, const QueryT *q_multi,
+        const KbarT *prototype_layer,
+        const int32_t *block_offsets,
+        const int32_t *block_counts,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t prototype_count,
+        uint32_t block_count, uint32_t global_block_base,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        float scale, cudaStream_t stream) {
+    if (layer >= n_layers || n_tokens == 0 ||
+        prototype_count == 0 || block_count == 0 ||
+        n_heads == 0 || n_kv_heads == 0 || head_dim == 0 ||
+        n_heads % n_kv_heads != 0) {
+        return prototype_count == 0 || block_count == 0;
+    }
+    const uint64_t distributions64 =
+        static_cast<uint64_t>(n_tokens) * n_heads;
+    if (distributions64 == 0 || distributions64 > UINT32_MAX) {
+        return false;
+    }
+    const uint32_t distributions =
+        static_cast<uint32_t>(distributions64);
+    uint64_t workspace_bytes = 64ull * 1024ull * 1024ull;
+    const char *workspace_env =
+        std::getenv("QW3_KVMEM_ADAPTIVE_LOGITS_MIB");
+    if (!workspace_env || !*workspace_env) {
+        workspace_env =
+            std::getenv("QW3_KVMEM_SOFTMAX_LOGITS_MIB");
+    }
+    if (workspace_env && *workspace_env) {
+        const unsigned long long mib =
+            std::strtoull(workspace_env, nullptr, 10);
+        if (mib > 0 && mib <= 4096) {
+            workspace_bytes =
+                static_cast<uint64_t>(mib) * 1024ull * 1024ull;
+        }
+    }
+    const uint64_t max_logits_floats =
+        std::max<uint64_t>(
+            prototype_count, workspace_bytes / sizeof(float));
+    uint32_t distributions_per_batch =
+        static_cast<uint32_t>(std::max<uint64_t>(
+            1, std::min<uint64_t>(
+                   distributions,
+                   max_logits_floats / prototype_count)));
+    const uint32_t gqa_group = n_heads / n_kv_heads;
+    const char *gqa_env =
+        std::getenv("QW3_KVMEM_ADAPTIVE_GQA");
+    const bool gqa_enabled =
+        !(gqa_env && std::strcmp(gqa_env, "0") == 0);
+    const bool fuse_gqa =
+        gqa_enabled && gqa_group >= 2u && gqa_group <= 4u &&
+        distributions_per_batch >= gqa_group;
+    if (fuse_gqa) {
+        distributions_per_batch =
+            std::max<uint32_t>(
+                gqa_group,
+                (distributions_per_batch / gqa_group) *
+                    gqa_group);
+    }
+    const uint64_t logits_floats =
+        static_cast<uint64_t>(distributions_per_batch) *
+        prototype_count;
+    const uint64_t workspace_floats =
+        logits_floats + 2ull * distributions_per_batch;
+    if (workspace_floats > SIZE_MAX / sizeof(float)) return false;
+    float *workspace = nullptr;
+    if (cudaMallocAsync(
+            reinterpret_cast<void **>(&workspace),
+            static_cast<size_t>(workspace_floats) * sizeof(float),
+            stream) != cudaSuccess) {
+        return false;
+    }
+    float *logits = workspace;
+    float *row_max = logits + logits_floats;
+    float *row_inv_sum = row_max + distributions_per_batch;
+    const uint32_t logits_tiles =
+        (prototype_count + kSoftmaxPagesTile - 1) /
+        kSoftmaxPagesTile;
+    const float distribution_weight =
+        1.0f /
+        (static_cast<float>(n_layers) *
+         static_cast<float>(n_heads));
+    cudaError_t err = cudaSuccess;
+    for (uint32_t base = 0;
+         err == cudaSuccess && base < distributions;) {
+        const uint32_t count = std::min(
+            distributions_per_batch, distributions - base);
+        const bool batch_fuse_gqa =
+            fuse_gqa && base % gqa_group == 0u &&
+            count % gqa_group == 0u;
+        const uint64_t jobs =
+            static_cast<uint64_t>(
+                batch_fuse_gqa ? count / gqa_group : count) *
+            logits_tiles;
+        if (jobs > 0x7fffffffu) {
+            err = cudaErrorInvalidConfiguration;
+            break;
+        }
+#define QW3_ADAPTIVE_LAYER_LOGITS_GQA(G)                               \
+        block_attn_adaptive_layer_logits_gqa_kernel<                   \
+            QueryT, KbarT, G><<<                                       \
+            static_cast<uint32_t>(jobs),                              \
+            kSoftmaxPagesThreads, 0, stream>>>(                        \
+            logits, q_multi, prototype_layer, layer, base, count,     \
+            logits_tiles, n_tokens, q_layer_stride, prototype_count,  \
+            n_heads, n_kv_heads, head_dim, scale)
+        if (batch_fuse_gqa && gqa_group == 2u) {
+            QW3_ADAPTIVE_LAYER_LOGITS_GQA(2u);
+        } else if (batch_fuse_gqa && gqa_group == 3u) {
+            QW3_ADAPTIVE_LAYER_LOGITS_GQA(3u);
+        } else if (batch_fuse_gqa && gqa_group == 4u) {
+            QW3_ADAPTIVE_LAYER_LOGITS_GQA(4u);
+        } else {
+            block_attn_adaptive_layer_logits_kernel<
+                QueryT, KbarT><<<
+                static_cast<uint32_t>(jobs),
+                kSoftmaxPagesThreads, 0, stream>>>(
+                logits, q_multi, prototype_layer, layer,
+                base, count, logits_tiles, n_tokens,
+                q_layer_stride, prototype_count, n_heads,
+                n_kv_heads, head_dim, scale);
+        }
+#undef QW3_ADAPTIVE_LAYER_LOGITS_GQA
+        err = cudaGetLastError();
+        if (err != cudaSuccess) break;
+        block_attn_softmax_pages_norm_kernel<<<
+            count, kSoftmaxPagesThreads, 0, stream>>>(
+            row_max, row_inv_sum, logits, count,
+            prototype_count);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) break;
+        const uint32_t score_grid =
+            (block_count + kSoftmaxPagesThreads - 1) /
+            kSoftmaxPagesThreads;
+        block_attn_adaptive_layer_accumulate_logits_kernel<<<
+            score_grid, kSoftmaxPagesThreads, 0, stream>>>(
+            score, logits, row_max, row_inv_sum,
+            block_offsets, block_counts, count, block_count,
+            global_block_base, prototype_count,
+            distribution_weight);
+        err = cudaGetLastError();
+        base += count;
+    }
+    const cudaError_t free_err =
+        cudaFreeAsync(workspace, stream);
+    return err == cudaSuccess && free_err == cudaSuccess;
+}
+
+bool launch_block_attn_score_adaptive_layer_typed(
+        float *score, const void *q_multi, bool query_is_fp16,
+        const void *prototype_layer, KbarDType prototype_dtype,
+        const int32_t *block_offsets, const int32_t *block_counts,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t prototype_count,
+        uint32_t block_count, uint32_t global_block_base,
+        uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+        float scale, cudaStream_t stream) {
+#define QW3_ADAPTIVE_LAYER_SCORE(QT, KT)                               \
+    return launch_block_attn_score_adaptive_layer_impl<QT, KT>(       \
+        score, static_cast<const QT *>(q_multi),                       \
+        static_cast<const KT *>(prototype_layer), block_offsets,       \
+        block_counts, layer, n_layers, n_tokens, q_layer_stride,       \
+        prototype_count, block_count, global_block_base, n_heads,      \
+        n_kv_heads, head_dim, scale, stream)
+    if (query_is_fp16) {
+        switch (prototype_dtype) {
+            case KbarDType::F32:
+                QW3_ADAPTIVE_LAYER_SCORE(__half, float);
+            case KbarDType::F16:
+                QW3_ADAPTIVE_LAYER_SCORE(__half, __half);
+            case KbarDType::FP8:
+                QW3_ADAPTIVE_LAYER_SCORE(__half, __nv_fp8_e4m3);
+        }
+    } else {
+        switch (prototype_dtype) {
+            case KbarDType::F32:
+                QW3_ADAPTIVE_LAYER_SCORE(float, float);
+            case KbarDType::F16:
+                QW3_ADAPTIVE_LAYER_SCORE(float, __half);
+            case KbarDType::FP8:
+                QW3_ADAPTIVE_LAYER_SCORE(float, __nv_fp8_e4m3);
+        }
+    }
+#undef QW3_ADAPTIVE_LAYER_SCORE
     return false;
 }
 

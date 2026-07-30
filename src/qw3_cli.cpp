@@ -130,6 +130,10 @@ void usage(std::ostream &os) {
         "                        staging. Default: gpu.\n"
         "  --kvmem-index-staging-mb N  Per-slot CPU/GPU index staging size.\n"
         "                        Two slots are allocated. Default: 64 MiB.\n"
+        "  --kvmem-adaptive-score-mode M  CPU Adaptive scorer:\n"
+        "                        auto|layer-one-pass|tiled-two-pass.\n"
+        "                        Auto prefers one H2D transfer and one dot pass\n"
+        "                        per layer, with exact tiled fallback.\n"
         "  --kvmem-semantic-expansion M  Complete-group materialization:\n"
         "                        none|round|message. Message spans are derived from\n"
         "                        Chat messages or supplied by flattened benchmarks.\n"
@@ -541,6 +545,17 @@ int main(int argc, char **argv) {
                     engine.kvmem_index_staging_mb > 4096) {
                     throw std::runtime_error(
                         "--kvmem-index-staging-mb must be in [1,4096]");
+                }
+            } else if (arg == "--kvmem-adaptive-score-mode") {
+                engine.kvmem_adaptive_score_mode = need(arg);
+                if (engine.kvmem_adaptive_score_mode != "auto" &&
+                    engine.kvmem_adaptive_score_mode !=
+                        "layer-one-pass" &&
+                    engine.kvmem_adaptive_score_mode !=
+                        "tiled-two-pass") {
+                    throw std::runtime_error(
+                        "--kvmem-adaptive-score-mode must be "
+                        "auto|layer-one-pass|tiled-two-pass");
                 }
 #if 0  // Archived experimental CLI; implementation remains for future research.
             } else if (arg == "--kvmem-deltanet-layers") {

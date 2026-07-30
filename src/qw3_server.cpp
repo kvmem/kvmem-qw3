@@ -1672,6 +1672,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_index_placement=" << engine.kvmem_index_placement << "\n"
               << "  kvmem_index_staging_mb="
               << engine.kvmem_index_staging_mb << "\n"
+              << "  kvmem_adaptive_score_mode="
+              << engine.kvmem_adaptive_score_mode << "\n"
               << "  kvmem_semantic_expansion="
               << engine.kvmem_semantic_expansion << "\n"
               << "  kvmem_round_retrieval="
