@@ -8496,21 +8496,21 @@ void QwenExecutor::kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens) {
     const KvMemStoreConfig &cfg = block_store_->config();
     if (cfg.estimated_block_bytes == 0 || cfg.block_tokens == 0) return;
     const uint32_t page_size = std::max<uint32_t>(1, kv_pages_.page_size);
-    const uint32_t pages_per_block =
-        std::max<uint32_t>(1, cfg.block_tokens / page_size);
     const uint32_t free_pages = kvmem_gpu_page_pool_->free_pages();
-    const uint32_t keep_free_blocks =
-        std::max<uint32_t>(1, cfg.recent_blocks > 0 ? cfg.recent_blocks : 1);
-    // Reserve room for the next prefill append plus a recent-block cushion. The
-    // append grabs ceil(next_chunk_tokens / page_size) pages in one shot before
-    // any offload runs again, so offloading only once `free_pages` is down to the
-    // cushion would let that append exhaust the pool and throw. Trigger early
-    // enough that the upcoming chunk still fits.
+    // Reserve only enough pages for the next prefill append. `gen_budget`
+    // already sizes the physical pool above the selected context window, and
+    // recent blocks are part of that selected window; reserving another full
+    // recent band here double-counted them. With a 224K selection budget, 32K
+    // generation reserve, and a 2K chunk, that old extra 16K cushion forced a
+    // pressure reselect every 14K. The next-chunk-only guard keeps the append
+    // safe while restoring the intended ~30K interval (32K - 2K).
+    //
+    // The append grabs ceil(next_chunk_tokens / page_size) pages in one shot
+    // before any offload can run again, so trigger when exactly one chunk of
+    // free pages remains.
     const uint32_t next_chunk_pages =
         (next_chunk_tokens + page_size - 1) / page_size;
-    const uint32_t headroom_pages =
-        next_chunk_pages + keep_free_blocks * pages_per_block;
-    if (free_pages > headroom_pages) return;
+    if (free_pages > next_chunk_pages) return;
     if (kvmem_keep_selected_prefill_) {
         throw std::runtime_error(
             "KVMem keep-selected prefill exhausted the reserved GPU headroom; "
