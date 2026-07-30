@@ -1542,6 +1542,47 @@ private:
     uint32_t kvmem_qc_n_subblocks_ = 1;                        // sub-block means per block (SubBlockMeanK; 1 = plain mean-k)
     bool kvmem_qc_subblock_max_ = true;                        // sub-block reduction: true=max over sub-blocks (MaxSim), false=sum (mass). No-op at n_subblocks==1.
 
+    // Layer-major packed Adaptive index. Host vectors are appendable across
+    // prefix continuation and are the canonical authority for both placements.
+    // GPU placement finalizes a resident packed image; CPU placement streams
+    // block-aligned tiles through the bounded slots below.
+    std::vector<std::vector<uint8_t>> g_adaptive_layer_values_host_;
+    std::vector<std::vector<int32_t>> g_adaptive_layer_parent_host_;
+    std::vector<int32_t> g_adaptive_block_offsets_host_;
+    std::vector<int32_t> g_adaptive_block_counts_host_;
+    uint32_t g_adaptive_index_elem_size_ = 0;
+    uint32_t g_adaptive_index_stride_blocks_ = 0;
+    uint64_t g_adaptive_p1_slices_ = 0;
+    uint64_t g_adaptive_p2_slices_ = 0;
+    uint64_t g_adaptive_p4_slices_ = 0;
+    std::unique_ptr<DeviceTensor> g_adaptive_candidate_scratch_;
+    std::unique_ptr<DeviceTensor> g_adaptive_residual_scratch_;
+    std::unique_ptr<DeviceTensor> g_adaptive_packed_;
+    std::unique_ptr<DeviceTensor> g_adaptive_layer_offsets_dev_;
+    std::unique_ptr<DeviceTensor> g_adaptive_block_offsets_dev_;
+    std::unique_ptr<DeviceTensor> g_adaptive_block_counts_dev_;
+    std::unique_ptr<DeviceTensor> g_adaptive_prototype_blocks_dev_;
+    std::array<std::unique_ptr<HostBuffer>, 2>
+        g_adaptive_upload_pinned_;
+    uint64_t g_adaptive_upload_pinned_capacity_ = 0;
+    uint64_t g_adaptive_candidate_capacity_ = 0;
+    uint64_t g_adaptive_residual_capacity_ = 0;
+    uint32_t g_adaptive_total_prototypes_ = 0;
+    uint32_t g_adaptive_max_layer_prototypes_ = 0;
+    bool g_adaptive_index_dirty_ = false;
+    struct AdaptiveIndexStageSlot {
+        std::unique_ptr<DeviceTensor> values;
+        std::unique_ptr<DeviceTensor> block_offsets;
+        std::unique_ptr<DeviceTensor> block_counts;
+        std::unique_ptr<HostBuffer> host;
+        std::unique_ptr<DeviceTransferFence> transfer_done;
+        std::unique_ptr<DeviceTransferFence> compute_done;
+    };
+    std::array<AdaptiveIndexStageSlot, 2>
+        g_adaptive_stream_slots_;
+    uint64_t g_adaptive_stream_value_bytes_ = 0;
+    uint32_t g_adaptive_stream_block_capacity_ = 0;
+
     // CPU-offloaded mean-K index (--kvmem-index-placement cpu). The canonical
     // full index keeps the same fixed-stride layer-major byte layout as
     // g_kbar_multi_, but lives in pageable host memory. Two fixed-size pinned
@@ -1574,6 +1615,7 @@ private:
     uint64_t g_kbar_stream_group_dist_capacity_ = 0;
     bool kvmem_mean_index_cpu() const;
     bool kvmem_mean_index_available() const;
+    bool kvmem_adaptive_prototypes() const;
     void kvmem_prepare_cpu_mean_index(uint64_t elements, uint32_t layers,
                                       uint32_t stride_blocks,
                                       bool preserve_content_index);
@@ -1594,6 +1636,25 @@ private:
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         bool round_mode, uint32_t accumulate,
         std::string *failure_reason);
+    void kvmem_reset_adaptive_index(uint32_t layers,
+                                    uint32_t stride_blocks,
+                                    uint32_t elem_size,
+                                    bool preserve_content_index);
+    void kvmem_capture_adaptive_layer(
+        uint32_t slot, uint32_t first_block, uint32_t n_blocks_chunk,
+        uint32_t batch, uint32_t k_token_stride,
+        uint32_t rope_base_pos);
+    void kvmem_finalize_adaptive_index();
+    bool kvmem_score_adaptive_index(
+        uint32_t n_blocks, uint32_t n_tokens,
+        uint32_t q_layer_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t accumulate, std::string *failure_reason);
+    bool kvmem_score_cpu_adaptive_index(
+        uint32_t n_blocks, uint32_t n_tokens,
+        uint32_t q_layer_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        uint32_t accumulate, std::string *failure_reason);
 
     // ---- DeltaNet-state retrieval (--kvmem-retrieval-method deltanet) --------
     // Scores each historical block by the net EDIT it made to the DeltaNet

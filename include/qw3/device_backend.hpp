@@ -1373,6 +1373,33 @@ public:
             "block_kdirection_fixed4_batch_device requires backend override"};
     }
 
+    // Bounded dense scratch for Adaptive Key-direction capture. Every slice
+    // writes exact P=1, P=2, and P=4 candidates (seven rows total) plus
+    // per-head [E1,E2,E4] cosine residuals. The executor performs the threshold
+    // decision and persists only selected rows in a packed index.
+    virtual DeviceStatus block_kdirection_adaptive_batch_device(
+            const DeviceTensor &k_batch,
+            DeviceTensor &candidate_scratch,
+            DeviceTensor &residual_scratch,
+            uint32_t n_blocks_chunk,
+            uint32_t k_stride,
+            uint32_t batch,
+            uint32_t blk_tokens,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            uint32_t rope_dim,
+            int32_t rope_base,
+            float theta,
+            uint32_t src_row_off = 0) {
+        (void)k_batch; (void)candidate_scratch; (void)residual_scratch;
+        (void)n_blocks_chunk; (void)k_stride; (void)batch;
+        (void)blk_tokens; (void)n_kv_heads; (void)head_dim;
+        (void)rope_dim; (void)rope_base; (void)theta; (void)src_row_off;
+        return {
+            false,
+            "block_kdirection_adaptive_batch_device requires backend override"};
+    }
+
     // Incremental counterpart used when a logical block is produced by several
     // prefill calls (multi-turn transcript replay / resumed sessions). The first
     // input row belongs at `first_block_token_offset` in the first destination
@@ -1513,6 +1540,99 @@ public:
         (void)n_subblocks; (void)reduce_max; (void)accumulate; (void)q_elem_off;
         (void)kbar_elem_off;
         return {false, "block_attn_score_softmax_pages_device requires backend override"};
+    }
+
+    virtual DeviceStatus block_attn_score_softmax_adaptive_device(
+        DeviceTensor &score,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &packed_prototypes,
+        const DeviceTensor &layer_offsets,
+        const DeviceTensor &block_offsets,
+        const DeviceTensor &block_counts,
+        const DeviceTensor &prototype_blocks,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t n_blocks,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t excl_lo_end = 0,
+        uint32_t excl_hi_begin = UINT32_MAX,
+        uint32_t max_layer_prototypes = 0,
+        uint32_t accumulate = 0) {
+        (void)score; (void)q_multi; (void)packed_prototypes;
+        (void)layer_offsets; (void)block_offsets; (void)block_counts;
+        (void)prototype_blocks; (void)n_layers; (void)n_tokens;
+        (void)q_layer_stride; (void)n_blocks; (void)n_heads;
+        (void)n_kv_heads; (void)head_dim; (void)scale;
+        (void)excl_lo_end; (void)excl_hi_begin;
+        (void)max_layer_prototypes; (void)accumulate;
+        return {
+            false,
+            "block_attn_score_softmax_adaptive_device requires backend override"};
+    }
+
+    // CPU-offloaded Adaptive index streaming. The executor packs one
+    // layer/block-aligned prototype tile into bounded GPU staging. Pass 1
+    // incrementally merges the tile into the exact per-distribution LSE; pass
+    // 2 MaxSim-reduces the same tile's variable prototype runs into block
+    // scores. Replaying all tiles in both passes is mathematically identical
+    // to the resident packed scorer while bounding device index storage.
+    virtual DeviceStatus block_attn_stream_adaptive_lse_device(
+        DeviceTensor &global_max,
+        DeviceTensor &global_sum,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &prototype_tile,
+        uint32_t layer,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t prototype_count,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale,
+        uint32_t initialize) {
+        (void)global_max; (void)global_sum; (void)q_multi;
+        (void)prototype_tile; (void)layer; (void)n_layers;
+        (void)n_tokens; (void)q_layer_stride; (void)prototype_count;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale;
+        (void)initialize;
+        return {
+            false,
+            "block_attn_stream_adaptive_lse_device requires backend override"};
+    }
+
+    virtual DeviceStatus block_attn_stream_adaptive_score_device(
+        DeviceTensor &score,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &prototype_tile,
+        const DeviceTensor &block_offsets,
+        const DeviceTensor &block_counts,
+        const DeviceTensor &global_max,
+        const DeviceTensor &global_sum,
+        uint32_t layer,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t tile_blocks,
+        uint32_t global_block_base,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale) {
+        (void)score; (void)q_multi; (void)prototype_tile;
+        (void)block_offsets; (void)block_counts;
+        (void)global_max; (void)global_sum;
+        (void)layer; (void)n_layers; (void)n_tokens;
+        (void)q_layer_stride; (void)tile_blocks;
+        (void)global_block_base; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale;
+        return {
+            false,
+            "block_attn_stream_adaptive_score_device requires backend override"};
     }
 
 

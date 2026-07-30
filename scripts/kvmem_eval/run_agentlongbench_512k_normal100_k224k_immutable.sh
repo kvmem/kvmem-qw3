@@ -20,13 +20,18 @@ KVMEM_BUDGET=${KVMEM_BUDGET:-229376}
 GEN_BUDGET=${GEN_BUDGET:-32768}
 KVMEM_BLOCK_TOKENS=${KVMEM_BLOCK_TOKENS:-32}
 KVMEM_RETRIEVAL_METHOD=${KVMEM_RETRIEVAL_METHOD:-mean-k}
+KVMEM_INDEX_PLACEMENT=${KVMEM_INDEX_PLACEMENT:-gpu}
+KVMEM_INDEX_STAGING_MB=${KVMEM_INDEX_STAGING_MB:-64}
 KVMEM_SUBBLOCKS=${KVMEM_SUBBLOCKS:-1}
 KVMEM_SUBBLOCK_REDUCE=${KVMEM_SUBBLOCK_REDUCE:-max}
+KVMEM_ADAPTIVE_GAIN_1TO2=${KVMEM_ADAPTIVE_GAIN_1TO2:-0.10}
+KVMEM_ADAPTIVE_GAIN_2TO4=${KVMEM_ADAPTIVE_GAIN_2TO4:-0.06}
 KV_DTYPE=${KV_DTYPE:-fp16}
 PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.51}
 TEMP=${TEMP:-0.6}
 THINKING_BUDGET=${THINKING_BUDGET:-4096}
+MAX_TOKENS=${MAX_TOKENS:-32768}
 TAG=${TAG:-agentlongbench_512k_normal100_k224k_g32k_b32_qr_immutable_mtp4_fp16_cpu_all_on}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
@@ -50,8 +55,19 @@ fi
 if [[ "$KVMEM_RETRIEVAL_METHOD" != "mean-k" &&
       "$KVMEM_RETRIEVAL_METHOD" != "per-token" &&
       "$KVMEM_RETRIEVAL_METHOD" != "sub-block-mean-k" &&
-      "$KVMEM_RETRIEVAL_METHOD" != "key-direction-fixed4" ]]; then
+      "$KVMEM_RETRIEVAL_METHOD" != "key-direction-fixed4" &&
+      "$KVMEM_RETRIEVAL_METHOD" != "key-direction-adaptive" ]]; then
   echo "invalid KVMEM_RETRIEVAL_METHOD: $KVMEM_RETRIEVAL_METHOD" >&2
+  exit 2
+fi
+if [[ "$KVMEM_INDEX_PLACEMENT" != "gpu" &&
+      "$KVMEM_INDEX_PLACEMENT" != "cpu" ]]; then
+  echo "KVMEM_INDEX_PLACEMENT must be gpu or cpu, got: $KVMEM_INDEX_PLACEMENT" >&2
+  exit 2
+fi
+if [[ ! "$KVMEM_INDEX_STAGING_MB" =~ ^[1-9][0-9]*$ ]] ||
+   (( KVMEM_INDEX_STAGING_MB > 4096 )); then
+  echo "KVMEM_INDEX_STAGING_MB must be in [1,4096], got: $KVMEM_INDEX_STAGING_MB" >&2
   exit 2
 fi
 if [[ "$KVMEM_RETRIEVAL_METHOD" == "sub-block-mean-k" ]]; then
@@ -65,12 +81,28 @@ if [[ "$KVMEM_RETRIEVAL_METHOD" == "sub-block-mean-k" ]]; then
     exit 2
   fi
 fi
+if [[ "$KVMEM_RETRIEVAL_METHOD" == "key-direction-adaptive" ]]; then
+  if ! awk -v v="$KVMEM_ADAPTIVE_GAIN_1TO2" \
+      'BEGIN { exit !(v >= 0.0 && v <= 1.0) }'; then
+    echo "KVMEM_ADAPTIVE_GAIN_1TO2 must be in [0,1], got: $KVMEM_ADAPTIVE_GAIN_1TO2" >&2
+    exit 2
+  fi
+  if ! awk -v v="$KVMEM_ADAPTIVE_GAIN_2TO4" \
+      'BEGIN { exit !(v >= 0.0 && v <= 1.0) }'; then
+    echo "KVMEM_ADAPTIVE_GAIN_2TO4 must be in [0,1], got: $KVMEM_ADAPTIVE_GAIN_2TO4" >&2
+    exit 2
+  fi
+fi
 if [[ ! "$PREFILL_CHUNK" =~ ^[1-9][0-9]*$ ]]; then
   echo "PREFILL_CHUNK must be a positive integer, got: $PREFILL_CHUNK" >&2
   exit 2
 fi
 if [[ ! "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]]; then
   echo "THINKING_BUDGET must be a positive integer, got: $THINKING_BUDGET" >&2
+  exit 2
+fi
+if [[ ! "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_TOKENS must be a positive integer, got: $MAX_TOKENS" >&2
   exit 2
 fi
 
@@ -98,11 +130,19 @@ fi
 
 retrieval_args=(
   --kvmem-retrieval-method "$KVMEM_RETRIEVAL_METHOD"
+  --kvmem-index-placement "$KVMEM_INDEX_PLACEMENT"
+  --kvmem-index-staging-mb "$KVMEM_INDEX_STAGING_MB"
 )
 if [[ "$KVMEM_RETRIEVAL_METHOD" == "sub-block-mean-k" ]]; then
   retrieval_args+=(
     --kvmem-subblocks "$KVMEM_SUBBLOCKS"
     --kvmem-subblock-reduce "$KVMEM_SUBBLOCK_REDUCE"
+  )
+fi
+if [[ "$KVMEM_RETRIEVAL_METHOD" == "key-direction-adaptive" ]]; then
+  retrieval_args+=(
+    --kvmem-adaptive-gain-1to2 "$KVMEM_ADAPTIVE_GAIN_1TO2"
+    --kvmem-adaptive-gain-2to4 "$KVMEM_ADAPTIVE_GAIN_2TO4"
   )
 fi
 if [[ -n "$KVMEM_OPT_LEVEL" ]]; then
@@ -256,7 +296,7 @@ echo "[gpu-memory] phase=server_ready pid=$server_pid used_mib=${server_ready_gp
   --api-base "http://127.0.0.1:$PORT/v1" \
   --model "$(basename "$MODEL")" \
   --method "$METHOD" \
-  --temperature "$TEMP" --top-p 0.95 --max-tokens 32768 \
+  --temperature "$TEMP" --top-p 0.95 --max-tokens "$MAX_TOKENS" \
   --context-window "$CTX" --context-safety-margin 16 \
   --timeout-sec 7200 --max-sample-sec 7200 --attempts 3 \
   --enable-thinking --seed 20260722 \

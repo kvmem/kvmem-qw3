@@ -112,15 +112,23 @@ void usage(std::ostream &os) {
         "                        Default: retrieval.\n"
         "  --kvmem-select-policy M  Selection policy: topk|quota. Default: topk.\n"
         "  --kvmem-retrieval-method M  Query-conditioned scorer: mean-k|per-token|\n"
-        "                        sub-block-mean-k|key-direction-fixed4.\n"
-        "                        The fixed4 method clusters each 32-token block's\n"
-        "                        content Keys into four direction prototypes.\n"
+        "                        sub-block-mean-k|key-direction-fixed4|\n"
+        "                        key-direction-adaptive.\n"
+        "                        Fixed4 clusters every 32-token slice inside a\n"
+        "                        retrieval block into four direction prototypes.\n"
+        "                        Adaptive retains 1, 2, or 4 packed prototypes\n"
+        "                        according to normalized residual gain.\n"
+        "  --kvmem-adaptive-gain-1to2 F  Minimum fractional residual reduction\n"
+        "                        required to retain two prototypes. Default: 0.10.\n"
+        "  --kvmem-adaptive-gain-2to4 F  Minimum fractional residual reduction\n"
+        "                        required to retain four prototypes. Default: 0.06.\n"
         "                        Default: mean-k\n"
         "                        (needs --kvmem-query-conditioned).\n"
-        "  --kvmem-index-placement P  Mean-K index placement: gpu|cpu.\n"
-        "                        CPU mode streams the exact FP16 index through\n"
-        "                        bounded GPU staging. Default: gpu.\n"
-        "  --kvmem-index-staging-mb N  Per-slot CPU/GPU mean-K staging size.\n"
+        "  --kvmem-index-placement P  Retrieval index placement: gpu|cpu.\n"
+        "                        GPU keeps the complete Mean-K/Adaptive index;\n"
+        "                        CPU streams exact tiles through bounded GPU\n"
+        "                        staging. Default: gpu.\n"
+        "  --kvmem-index-staging-mb N  Per-slot CPU/GPU index staging size.\n"
         "                        Two slots are allocated. Default: 64 MiB.\n"
         "  --kvmem-semantic-expansion M  Complete-group materialization:\n"
         "                        none|round|message. Message spans are derived from\n"
@@ -493,11 +501,31 @@ int main(int argc, char **argv) {
                     engine.kvmem_retrieval_method != "per-token" &&
                     engine.kvmem_retrieval_method != "sub-block-mean-k" &&
                     engine.kvmem_retrieval_method !=
-                        "key-direction-fixed4") {
+                        "key-direction-fixed4" &&
+                    engine.kvmem_retrieval_method !=
+                        "key-direction-adaptive") {
                     throw std::runtime_error(
                         "--kvmem-retrieval-method must be "
                         "mean-k|per-token|sub-block-mean-k|"
-                        "key-direction-fixed4");
+                        "key-direction-fixed4|key-direction-adaptive");
+                }
+            } else if (arg == "--kvmem-adaptive-gain-1to2") {
+                engine.kvmem_adaptive_gain_1to2 =
+                    parse_float(need(arg), arg);
+                if (!std::isfinite(engine.kvmem_adaptive_gain_1to2) ||
+                    engine.kvmem_adaptive_gain_1to2 < 0.0 ||
+                    engine.kvmem_adaptive_gain_1to2 > 1.0) {
+                    throw std::runtime_error(
+                        "--kvmem-adaptive-gain-1to2 must be in [0,1]");
+                }
+            } else if (arg == "--kvmem-adaptive-gain-2to4") {
+                engine.kvmem_adaptive_gain_2to4 =
+                    parse_float(need(arg), arg);
+                if (!std::isfinite(engine.kvmem_adaptive_gain_2to4) ||
+                    engine.kvmem_adaptive_gain_2to4 < 0.0 ||
+                    engine.kvmem_adaptive_gain_2to4 > 1.0) {
+                    throw std::runtime_error(
+                        "--kvmem-adaptive-gain-2to4 must be in [0,1]");
                 }
             } else if (arg == "--kvmem-index-placement") {
                 engine.kvmem_index_placement = need(arg);

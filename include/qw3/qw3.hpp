@@ -98,14 +98,16 @@ struct EngineOptions {
     // or "recency" (sink + recent windows only, no learned signal).
     std::string kvmem_method = "retrieval";
     std::string kvmem_select_policy = "topk"; // topk or quota
-    std::string kvmem_retrieval_method = "mean-k"; // mean-k, per-token, sub-block-mean-k, key-direction-fixed4
-    // Placement of the all-layer mean-K retrieval index. "gpu" preserves the
-    // resident compatibility path; "cpu" keeps the full FP16 index in pageable
-    // host memory and streams fixed-size tiles through bounded GPU staging.
+    std::string kvmem_retrieval_method = "mean-k"; // mean-k, per-token, sub-block-mean-k, key-direction-fixed4, key-direction-adaptive
+    // Placement of the all-layer Mean-K/Adaptive retrieval index. "gpu"
+    // preserves the resident low-latency path; "cpu" keeps the full FP16 index
+    // in pageable host memory and streams bounded tiles through the GPU.
     std::string kvmem_index_placement = "gpu"; // gpu or cpu
     int kvmem_index_staging_mb = 64;           // per GPU/host staging slot
     int kvmem_subblocks = 4;      // sub-block means per block (sub-block-mean-k only)
     std::string kvmem_subblock_reduce = "max"; // sub-block score reduction: max or sum
+    double kvmem_adaptive_gain_1to2 = 0.10;
+    double kvmem_adaptive_gain_2to4 = 0.06;
     // Optional logical retrieval grouping. "round" consumes caller-supplied
     // round spans; "message" consumes supplied spans for flattened benchmarks
     // or derives spans from ordinary Chat API messages. Both score at the

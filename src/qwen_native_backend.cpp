@@ -6257,7 +6257,9 @@ private:
                 ? KvMemRetrievalMethod::PerToken
                 : (options_.kvmem_retrieval_method == "sub-block-mean-k" ||
                    options_.kvmem_retrieval_method ==
-                       "key-direction-fixed4"
+                       "key-direction-fixed4" ||
+                   options_.kvmem_retrieval_method ==
+                       "key-direction-adaptive"
                        ? KvMemRetrievalMethod::SubBlockMeanK
                        : (options_.kvmem_retrieval_method == "deltanet"
                               ? KvMemRetrievalMethod::DeltaNet
@@ -6275,7 +6277,8 @@ private:
              bs_cfg.retrieval_method == KvMemRetrievalMethod::DeltaNet)) {
             throw std::runtime_error(
                 "--kvmem-index-placement cpu currently supports "
-                "mean-k and sub-block-mean-k retrieval");
+                "mean-k, sub-block-mean-k, key-direction-fixed4, "
+                "and key-direction-adaptive retrieval");
         }
         if (bs_cfg.index_placement == KvMemIndexPlacement::CPU &&
             !options_.kvmem_query_conditioned) {
@@ -6299,8 +6302,10 @@ private:
             static_cast<uint32_t>(std::max(1, options_.kvmem_deltanet_topk_h));
         const bool key_direction_fixed4 =
             options_.kvmem_retrieval_method == "key-direction-fixed4";
+        const bool key_direction_adaptive =
+            options_.kvmem_retrieval_method == "key-direction-adaptive";
         bs_cfg.n_subblocks =
-            key_direction_fixed4
+            (key_direction_fixed4 || key_direction_adaptive)
                 ? (bs_cfg.block_tokens / 32u) * 4u
                 : (bs_cfg.retrieval_method ==
                            KvMemRetrievalMethod::SubBlockMeanK
@@ -6310,17 +6315,31 @@ private:
         bs_cfg.prototype_mode =
             key_direction_fixed4
                 ? KvMemPrototypeMode::KeyDirectionFixed4
+                : key_direction_adaptive
+                ? KvMemPrototypeMode::KeyDirectionAdaptive
                 : KvMemPrototypeMode::Contiguous;
+        bs_cfg.adaptive_gain_1to2 = options_.kvmem_adaptive_gain_1to2;
+        bs_cfg.adaptive_gain_2to4 = options_.kvmem_adaptive_gain_2to4;
+        if (!std::isfinite(bs_cfg.adaptive_gain_1to2) ||
+            !std::isfinite(bs_cfg.adaptive_gain_2to4) ||
+            bs_cfg.adaptive_gain_1to2 < 0.0 ||
+            bs_cfg.adaptive_gain_1to2 > 1.0 ||
+            bs_cfg.adaptive_gain_2to4 < 0.0 ||
+            bs_cfg.adaptive_gain_2to4 > 1.0) {
+            throw std::runtime_error(
+                "adaptive Key-direction gain thresholds must be finite "
+                "values in [0,1]");
+        }
         bs_cfg.subblock_reduce =
             options_.kvmem_subblock_reduce == "sum"
                 ? KvMemSubblockReduce::Sum
                 : KvMemSubblockReduce::Max;
-        if (key_direction_fixed4 &&
+        if ((key_direction_fixed4 || key_direction_adaptive) &&
             (bs_cfg.block_tokens < 32 ||
              bs_cfg.block_tokens % 32 != 0 ||
              bs_cfg.subblock_reduce != KvMemSubblockReduce::Max)) {
             throw std::runtime_error(
-                "--kvmem-retrieval-method key-direction-fixed4 currently "
+                "key-direction prototype retrieval currently "
                 "requires --kvmem-block-tokens to be a multiple of 32 and "
                 "--kvmem-subblock-reduce max");
         }
@@ -6330,6 +6349,12 @@ private:
             bs_cfg.semantic_expansion = KvMemSemanticExpansion::Message;
         } else {
             bs_cfg.semantic_expansion = KvMemSemanticExpansion::None;
+        }
+        if (key_direction_adaptive &&
+            bs_cfg.semantic_expansion != KvMemSemanticExpansion::None) {
+            throw std::runtime_error(
+                "key-direction-adaptive v1 does not yet support "
+                "--kvmem-semantic-expansion");
         }
         bs_cfg.group_score_reduce =
             options_.kvmem_group_score_reduce == "length-normalized-mass"

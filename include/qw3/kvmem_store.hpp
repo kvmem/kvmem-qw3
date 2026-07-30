@@ -156,12 +156,13 @@ enum class KvMemRetrievalMethod : uint8_t { MeanK = 0, PerToken = 1, SubBlockMea
 // Contiguous preserves the existing equal-width sub-block implementation.
 // KeyDirectionFixed4 partitions a logical retrieval block into contiguous
 // 32-token slices, then clusters each layer/KV-head slice's content-frame Keys
-// into four non-contiguous direction groups. A B-token retrieval block therefore
-// stores (B/32)*4 representatives; the scorer can MaxSim-reduce all of them back
-// to the one logical/materialization block.
+// into four non-contiguous direction groups. KeyDirectionAdaptive uses the same
+// deterministic farthest-first candidates but keeps 1, 2, or 4 representatives
+// according to normalized cosine-residual gains. Its persistent index is packed.
 enum class KvMemPrototypeMode : uint8_t {
     Contiguous = 0,
     KeyDirectionFixed4 = 1,
+    KeyDirectionAdaptive = 2,
 };
 // Sub-block score reduction (--kvmem-subblock-reduce; SubBlockMeanK only):
 // Sum aggregates a block's sub-block softmax masses (average attention the block
@@ -246,6 +247,8 @@ struct KvMemStoreConfig {
     uint32_t n_subblocks = 1;        // --kvmem-subblocks; sub-block means per block
                                      // (SubBlockMeanK only; 1 => plain mean-k)
     KvMemPrototypeMode prototype_mode = KvMemPrototypeMode::Contiguous;
+    double adaptive_gain_1to2 = 0.10;
+    double adaptive_gain_2to4 = 0.06;
     KvMemSubblockReduce subblock_reduce = KvMemSubblockReduce::Max; // --kvmem-subblock-reduce
     KvMemSemanticExpansion semantic_expansion =
         KvMemSemanticExpansion::None;
