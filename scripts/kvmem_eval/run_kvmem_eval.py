@@ -64,16 +64,25 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--method", choices=("retrieval", "h2o", "recency"),
                     default="retrieval")
     ap.add_argument("--retrieval-method",
-                    choices=("mean-k", "per-token", "sub-block-mean-k"),
+                    choices=("mean-k", "per-token", "sub-block-mean-k",
+                             "key-direction-fixed4",
+                             "key-direction-adaptive"),
                     default="mean-k")
     ap.add_argument("--subblocks", type=int, default=4)
     ap.add_argument("--subblock-reduce", choices=("max", "sum"), default="max")
+    ap.add_argument(
+        "--adaptive-gain-1to2", type=float, default=0.10,
+        help="minimum residual-reduction gain for adaptive 1->2 prototypes")
+    ap.add_argument(
+        "--adaptive-gain-2to4", type=float, default=0.06,
+        help="minimum residual-reduction gain for adaptive 2->4 prototypes")
     ap.add_argument("--update-mode", choices=("step", "interval"), default="step")
     ap.add_argument(
         "--optimization-level",
-        choices=("kvmem_init", "opt_1", "opt_2", "opt_3"),
+        choices=("default", "kvmem_init", "opt_1", "opt_2", "opt_3"),
         default="kvmem_init",
-        help="monotonic KVMem storage/tiering profile used for matched A/B runs")
+        help="monotonic KVMem storage/tiering profile used for matched A/B "
+             "runs; 'default' omits the deprecated compatibility flag")
     ap.add_argument("--query-conditioned", action=argparse.BooleanOptionalAction,
                     default=True)
     ap.add_argument("--gpu-memory-ratio", type=float, default=0.5)
@@ -120,7 +129,6 @@ def build_commands(args: argparse.Namespace) -> tuple[list[str], list[str], Path
         "--kvmem-method", args.method,
         "--kvmem-retrieval-method", args.retrieval_method,
         "--kvmem-update-mode", args.update_mode,
-        "--kvmem-optimization-level", args.optimization_level,
         "--kvmem-gpu-memory-ratio", str(args.gpu_memory_ratio),
         "--kvmem-cpu-gb", str(args.cpu_gb),
         "--kvmem-nvme-gb", str(args.nvme_gb),
@@ -136,6 +144,13 @@ def build_commands(args: argparse.Namespace) -> tuple[list[str], list[str], Path
     if args.retrieval_method == "sub-block-mean-k":
         server += ["--kvmem-subblocks", str(args.subblocks),
                    "--kvmem-subblock-reduce", args.subblock_reduce]
+    if args.retrieval_method == "key-direction-adaptive":
+        server += [
+            "--kvmem-adaptive-gain-1to2", str(args.adaptive_gain_1to2),
+            "--kvmem-adaptive-gain-2to4", str(args.adaptive_gain_2to4),
+        ]
+    if args.optimization_level != "default":
+        server += ["--kvmem-optimization-level", args.optimization_level]
     if args.thinking:
         server.append("--enable-thinking")
     if args.mtp:
