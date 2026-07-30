@@ -896,21 +896,199 @@ bool parse_tool_call_block(const std::string &inner, const json *tools,
     return true;
 }
 
-std::vector<json> parse_tool_calls_xml(const std::string &text,
-                                       const json *tools = nullptr) {
+bool json_schema_type_matches(const json &value, const std::string &type) {
+    if (type == "null") return value.is_null();
+    if (type == "boolean") return value.is_boolean();
+    if (type == "integer") return value.is_number_integer();
+    if (type == "number") return value.is_number();
+    if (type == "string") return value.is_string();
+    if (type == "array") return value.is_array();
+    if (type == "object") return value.is_object();
+    return true;
+}
+
+bool validate_json_schema_value(const json &value, const json &schema,
+                                const std::string &path,
+                                std::string &error) {
+    if (!schema.is_object()) return true;
+    if (schema.contains("const") && value != schema["const"]) {
+        error = path + " does not match const";
+        return false;
+    }
+    if (schema.contains("enum") && schema["enum"].is_array()) {
+        bool matched = false;
+        for (const auto &candidate : schema["enum"]) {
+            if (value == candidate) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            error = path + " is not an allowed enum value";
+            return false;
+        }
+    }
+    for (const char *key : {"anyOf", "oneOf"}) {
+        if (!schema.contains(key) || !schema[key].is_array()) continue;
+        size_t matches = 0;
+        for (const auto &sub : schema[key]) {
+            std::string ignored;
+            if (validate_json_schema_value(value, sub, path, ignored)) {
+                ++matches;
+            }
+        }
+        const bool ok = std::string(key) == "oneOf" ? matches == 1
+                                                     : matches > 0;
+        if (!ok) {
+            error = path + " does not satisfy " + key;
+            return false;
+        }
+    }
+    if (schema.contains("type")) {
+        const json &type = schema["type"];
+        bool matched = false;
+        if (type.is_string()) {
+            matched = json_schema_type_matches(
+                value, type.get<std::string>());
+        } else if (type.is_array()) {
+            for (const auto &candidate : type) {
+                if (candidate.is_string() &&
+                    json_schema_type_matches(
+                        value, candidate.get<std::string>())) {
+                    matched = true;
+                    break;
+                }
+            }
+        } else {
+            matched = true;
+        }
+        if (!matched) {
+            error = path + " has the wrong JSON type";
+            return false;
+        }
+    }
+    if (value.is_object()) {
+        const json &required = schema.value("required", json::array());
+        if (required.is_array()) {
+            for (const auto &key : required) {
+                if (key.is_string() &&
+                    !value.contains(key.get<std::string>())) {
+                    error = path + " is missing required property " +
+                            key.get<std::string>();
+                    return false;
+                }
+            }
+        }
+        const json *properties =
+            schema.contains("properties") && schema["properties"].is_object()
+                ? &schema["properties"] : nullptr;
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (properties && properties->contains(it.key())) {
+                if (!validate_json_schema_value(
+                        it.value(), (*properties)[it.key()],
+                        path + "." + it.key(), error)) {
+                    return false;
+                }
+            } else if (schema.contains("additionalProperties") &&
+                       schema["additionalProperties"].is_boolean() &&
+                       !schema["additionalProperties"].get<bool>()) {
+                error = path + " contains unknown property " + it.key();
+                return false;
+            }
+        }
+    }
+    if (value.is_array() && schema.contains("items") &&
+        schema["items"].is_object()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (!validate_json_schema_value(
+                    value[i], schema["items"],
+                    path + "[" + std::to_string(i) + "]", error)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool validate_tool_call(const json &call, const json *tools,
+                        std::string &error) {
+    if (!call.is_object() || !call.contains("function") ||
+        !call["function"].is_object()) {
+        error = "tool call is missing a function object";
+        return false;
+    }
+    const json &fn = call["function"];
+    const std::string name = fn.value("name", std::string());
+    if (name.empty() || !tool_name_allowed(tools, name)) {
+        error = "tool call has an unknown function name";
+        return false;
+    }
+    json args;
+    try {
+        args = json::parse(fn.value("arguments", std::string()));
+    } catch (const std::exception &e) {
+        error = std::string("tool arguments are not valid JSON: ") + e.what();
+        return false;
+    }
+    if (!args.is_object()) {
+        error = "tool arguments must be a JSON object";
+        return false;
+    }
+    const json *definition = find_tool_definition(tools, name);
+    if (definition && definition->contains("parameters")) {
+        return validate_json_schema_value(
+            args, (*definition)["parameters"], "arguments", error);
+    }
+    return true;
+}
+
+struct ToolParseResult {
     std::vector<json> calls;
+    bool intent_detected = false;
+    bool valid = true;
+    std::string error;
+};
+
+ToolParseResult parse_tool_calls_xml(const std::string &text,
+                                     const json *tools = nullptr) {
+    ToolParseResult result;
     size_t pos = 0;
     while (true) {
         const size_t tc0 = text.find("<tool_call>", pos);
         if (tc0 == std::string::npos) break;
+        result.intent_detected = true;
         const size_t tc1 = text.find("</tool_call>", tc0);
-        if (tc1 == std::string::npos) break;
+        if (tc1 == std::string::npos) {
+            result.valid = false;
+            result.error = "incomplete <tool_call> block";
+            break;
+        }
         const size_t inner0 = tc0 + std::string("<tool_call>").size();
         const std::string inner = text.substr(inner0, tc1 - inner0);
-        (void)parse_tool_call_block(inner, tools, calls);
+        std::vector<json> block_calls;
+        if (!parse_tool_call_block(inner, tools, block_calls) ||
+            block_calls.empty()) {
+            result.valid = false;
+            result.error = "tool block could not be parsed";
+            break;
+        }
+        for (const auto &call : block_calls) {
+            std::string validation_error;
+            if (!validate_tool_call(call, tools, validation_error)) {
+                result.valid = false;
+                result.error = std::move(validation_error);
+                break;
+            }
+            result.calls.push_back(call);
+        }
+        if (!result.valid) break;
         pos = tc1 + std::string("</tool_call>").size();
     }
-    return calls;
+    if (result.intent_detected && result.calls.empty() && result.valid) {
+        result.valid = false;
+        result.error = "tool intent produced no tool calls";
+    }
+    return result;
 }
 
 json tool_call_delta(const json &calls, size_t begin = 0) {
@@ -948,6 +1126,20 @@ bool tool_has_only_string_properties(const json *tools,
     return true;
 }
 
+bool tool_allows_incremental_additional_property(
+        const json *tools, const std::string &name) {
+    const json *definition = find_tool_definition(tools, name);
+    if (!definition || !definition->contains("parameters") ||
+        !(*definition)["parameters"].is_object()) {
+        return true;
+    }
+    const json &parameters = (*definition)["parameters"];
+    if (!parameters.contains("additionalProperties")) return true;
+    const json &additional = parameters["additionalProperties"];
+    if (additional.is_boolean()) return additional.get<bool>();
+    return schema_is_plain_string(additional);
+}
+
 json incremental_tool_start_delta(size_t index,
                                   const std::string &id,
                                   const std::string &name,
@@ -983,10 +1175,16 @@ public:
         process(events);
     }
 
-    void finish() {
+    void finish(bool allow_closure_repair,
+                std::string &synthesized_suffix) {
+        synthesized_suffix.clear();
         if (abandoned_ || fatal_) return;
         std::vector<detail::ToolCallStreamEvent> events;
-        if (!parser_.finish(events)) {
+        const bool ok = allow_closure_repair
+            ? parser_.finish_with_closure_repair(
+                  events, synthesized_suffix)
+            : parser_.finish(events);
+        if (!ok) {
             parser_failed();
             return;
         }
@@ -999,7 +1197,37 @@ public:
     bool complete() const { return complete_; }
     bool start_pending() const { return start_pending_; }
     size_t pending_size() const { return pending_arguments_.size(); }
+    size_t argument_size() const { return arguments_all_.size(); }
     const std::string &error() const { return error_; }
+
+    json finalized_call() const {
+        if (!complete_ || name_.empty() || call_id_.empty()) return json();
+        return json{
+            {"id", call_id_},
+            {"type", "function"},
+            {"function",
+             json{{"name", name_},
+                  {"arguments", arguments_all_}}}};
+    }
+
+    bool ready_to_commit() const {
+        if (!streaming_ || fatal_ || abandoned_) return false;
+        const json *definition = find_tool_definition(tools_, name_);
+        if (!definition || !definition->contains("parameters") ||
+            !(*definition)["parameters"].is_object()) {
+            return true;
+        }
+        const json &required =
+            (*definition)["parameters"].value("required", json::array());
+        if (!required.is_array()) return true;
+        for (const auto &key : required) {
+            if (key.is_string() &&
+                seen_parameters_.count(key.get<std::string>()) == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     json take_start_delta() {
         start_pending_ = false;
@@ -1092,9 +1320,14 @@ private:
                     const json *props = find_tool_properties(tools_, name_);
                     parameter_name_ =
                         schema_property_name(props, event.value);
+                    const bool known_parameter =
+                        props && props->contains(parameter_name_);
                     if (parameter_name_.empty() ||
+                        (!known_parameter &&
+                         !tool_allows_incremental_additional_property(
+                             tools_, name_)) ||
                         !seen_parameters_.insert(parameter_name_).second) {
-                        fail("empty or duplicate incremental parameter");
+                        fail("unknown, empty, or duplicate incremental parameter");
                         return;
                     }
                     if (!first_parameter_) append_arguments(",");
@@ -1381,6 +1614,22 @@ std::string render_messages(
         }
     }
     return prompt;
+}
+
+std::string render_tool_retry_prompt(
+        json messages, const json *tools, bool enable_thinking,
+        bool preserve_thinking, const std::string &forced_tool_name) {
+    messages.push_back(json{
+        {"role", "user"},
+        {"content",
+         "Your previous response attempted a tool call but its serialization "
+         "could not be parsed. Repeat the same intended tool action once using "
+         "the provided schema. Output one complete <tool_call> block with a "
+         "<function=...> tag and every required <parameter=...> block. Do not "
+         "write any prose before or after the tool call."}});
+    return render_messages(
+        messages, tools, enable_thinking, preserve_thinking,
+        forced_tool_name);
 }
 
 // Apply stop sequences: truncate `text` at the earliest occurrence of any stop
@@ -2810,6 +3059,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         // raw `tools` pointer into `req` would dangle. Capture a by-value copy
         // for schema-driven argument coercion inside the stream callback.
         const json tools_schema = tools ? *tools : json();
+        const json messages_schema = req["messages"];
 
         if (stream) {
             res.set_header("Cache-Control", "no-cache");
@@ -2820,13 +3070,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                  tool_request, forced_tool_request, tools_schema,
                  stream_include_usage, prompt_token_count, route,
                  fallback_reason, kvmem_session_request,
-                 kvmem_session_reset](size_t, httplib::DataSink &sink) {
+                 kvmem_session_reset, messages_schema, preserve_thinking,
+                 forced_tool_name, t0](size_t, httplib::DataSink &sink) {
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
                     if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
                     std::string utf8_pending;
                     ReasoningStreamSplitter reasoning_splitter(enable_thinking);
                     size_t completion_tokens = 0;
+                    size_t usage_prompt_tokens = prompt_token_count;
                     bool stopped = false;
                     bool client_closed = false;
                     auto last_stream_write = std::chrono::steady_clock::now();
@@ -2884,7 +3136,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"created", created},
                                 {"model", model_id},
                                 {"choices", json::array()},
-                                {"usage", usage_json(prompt_token_count,
+                                {"usage", usage_json(usage_prompt_tokens,
                                                      completion_tokens)}};
                             const std::string us =
                                 "data: " + dump_json(usage) + "\n\n";
@@ -2896,17 +3148,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     };
                     try {
                         auto generate_request =
-                            [&](const CancellableTokenCallback &callback) {
+                            [&](const std::string &attempt_prompt,
+                                const GenerationOptions &attempt_g,
+                                const CancellableTokenCallback &callback) {
                             if (kvmem_session_request) {
                                 eng.generate_session_stream(
-                                    prompt, g,
+                                    attempt_prompt, attempt_g,
                                     [&](const std::string &piece) {
                                         (void)callback(piece);
                                     },
                                     kvmem_session_reset);
                             } else {
                                 eng.generate_stream_cancellable(
-                                    prompt, g, callback);
+                                    attempt_prompt, attempt_g, callback);
                             }
                         };
                         send_role();
@@ -2945,6 +3199,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             // Recovery syntaxes stay on the full-buffer parser.
                             bool buffering_tool = false;
                             bool streamed_content = false;
+                            bool tool_delta_committed = false;
                             std::string content_pending;
                             std::string forced_prefix;
                             const json *stream_tools =
@@ -2954,13 +3209,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 std::chrono::steady_clock::now();
                             size_t next_progress_tokens = 1024;
                             constexpr size_t kArgumentFlushBytes = 1024;
+                            constexpr size_t kToolCommitBytes = 8192;
                             constexpr auto kArgumentFlushInterval =
                                 std::chrono::milliseconds(500);
                             constexpr auto kToolHeartbeatInterval =
                                 std::chrono::seconds(2);
 
                             auto flush_incremental = [&](bool force) {
-                                if (!incremental.streaming() || client_closed) return;
+                                if (!tool_delta_committed ||
+                                    !incremental.streaming() || client_closed) {
+                                    return;
+                                }
                                 if (incremental.start_pending()) {
                                     send_delta(incremental.take_start_delta());
                                     last_tool_delta =
@@ -2978,6 +3237,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 }
                             };
                             auto service_tool_stream = [&]() {
+                                if (!tool_delta_committed &&
+                                    incremental.argument_size() >=
+                                        kToolCommitBytes &&
+                                    incremental.ready_to_commit()) {
+                                    tool_delta_committed = true;
+                                    std::cerr << "[qw3-serve] #" << rid
+                                              << " tool_stream_commit bytes="
+                                              << incremental.argument_size()
+                                              << "\n";
+                                }
                                 flush_incremental(false);
                                 const auto now = std::chrono::steady_clock::now();
                                 if (!client_closed &&
@@ -3007,8 +3276,127 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                              next_progress_tokens);
                                 }
                             };
+                            auto retry_tool_call =
+                                [&](const std::string &first_error) {
+                                if (kvmem_session_request) {
+                                    throw std::runtime_error(
+                                        "tool_call_parse_error: retry is not "
+                                        "available for explicit KVMem sessions");
+                                }
+                                const std::string retry_prompt =
+                                    render_tool_retry_prompt(
+                                        messages_schema,
+                                        tools_schema.is_array()
+                                            ? &tools_schema : nullptr,
+                                        enable_thinking, preserve_thinking,
+                                        forced_tool_name);
+                                const size_t retry_prompt_tokens =
+                                    usage_tokenizer.encode(retry_prompt).size();
+                                if (retry_prompt_tokens >=
+                                    static_cast<size_t>(engine.ctx_size)) {
+                                    throw std::runtime_error(
+                                        "tool_call_parse_error: retry prompt "
+                                        "exceeds the KV context");
+                                }
+                                GenerationOptions retry_g = g;
+                                retry_g.max_tokens = std::min(
+                                    retry_g.max_tokens,
+                                    static_cast<int>(
+                                        engine.ctx_size -
+                                        retry_prompt_tokens));
+                                if (retry_g.max_tokens <= 0) {
+                                    throw std::runtime_error(
+                                        "tool_call_parse_error: no context "
+                                        "space remains for retry");
+                                }
+                                usage_prompt_tokens += retry_prompt_tokens;
+                                std::cerr << "[qw3-serve] #" << rid
+                                          << " tool_retry attempt=1 reason="
+                                          << dump_json(first_error)
+                                          << " prompt_tokens="
+                                          << retry_prompt_tokens << "\n";
 
-                            generate_request([&](const std::string &piece) {
+                                std::string retry_acc;
+                                bool retry_stopped = false;
+                                size_t retry_completion_tokens = 0;
+                                auto retry_last_write =
+                                    std::chrono::steady_clock::now();
+                                generate_request(
+                                    retry_prompt, retry_g,
+                                    [&](const std::string &piece) {
+                                        if (client_closed) return false;
+                                        ++completion_tokens;
+                                        ++retry_completion_tokens;
+                                        retry_acc += piece;
+                                        if (!stops.empty()) {
+                                            std::string probe = retry_acc;
+                                            if (apply_stops(probe, stops)) {
+                                                retry_acc = std::move(probe);
+                                                retry_stopped = true;
+                                                return false;
+                                            }
+                                        }
+                                        const auto now =
+                                            std::chrono::steady_clock::now();
+                                        if (now - retry_last_write >=
+                                            kToolHeartbeatInterval) {
+                                            send_delta(json::object());
+                                            retry_last_write = now;
+                                        }
+                                        return !client_closed;
+                                    });
+                                if (client_closed) return false;
+
+                                std::string retry_utf8;
+                                std::string retry_text =
+                                    take_complete_utf8(
+                                        retry_utf8, retry_acc);
+                                retry_text += flush_utf8_pending(
+                                    retry_utf8, false);
+                                const std::string retry_framed =
+                                    enable_thinking
+                                        ? ("<think>\n" + retry_text)
+                                        : retry_text;
+                                const ToolParseResult retry_result =
+                                    parse_tool_calls_xml(
+                                        retry_framed,
+                                        tools_schema.is_array()
+                                            ? &tools_schema : nullptr);
+                                if (!retry_result.intent_detected ||
+                                    !retry_result.valid ||
+                                    retry_result.calls.empty()) {
+                                    const std::string reason =
+                                        retry_result.error.empty()
+                                            ? "retry produced no tool call"
+                                            : retry_result.error;
+                                    throw std::runtime_error(
+                                        "tool_call_parse_error: retry failed: " +
+                                        reason);
+                                }
+                                const ReasoningSplit retry_split =
+                                    split_reasoning(retry_framed);
+                                if (!retry_split.reasoning.empty()) {
+                                    send_delta(json{{"reasoning_content",
+                                                     retry_split.reasoning}});
+                                }
+                                send_delta(
+                                    tool_call_delta(retry_result.calls));
+                                std::cerr << "[qw3-serve] #" << rid
+                                          << " tool_retry_success calls="
+                                          << tool_calls_debug_summary(
+                                                 retry_result.calls)
+                                          << " finish="
+                                          << generation_finish_reason(
+                                                 retry_stopped,
+                                                 retry_completion_tokens,
+                                                 retry_g.max_tokens)
+                                          << "\n";
+                                send_done("tool_calls");
+                                return true;
+                            };
+
+                            generate_request(
+                                prompt, g, [&](const std::string &piece) {
                                 if (stopped || client_closed) return false;
                                 ++completion_tokens;
                                 acc += piece;
@@ -3068,7 +3456,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     service_tool_stream();
                                 }
                                 return !stopped && !client_closed;
-                            });
+                                });
 
                             if (client_closed) {
                                 std::cerr << "[qw3-serve] #" << rid
@@ -3086,97 +3474,168 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             }
 
                             if (buffering_tool) {
-                                incremental.finish();
+                                const bool first_hit_length =
+                                    g.max_tokens > 0 &&
+                                    completion_tokens >=
+                                        static_cast<size_t>(g.max_tokens);
+                                std::string closure_suffix;
+                                if (!incremental.fatal()) {
+                                    incremental.finish(
+                                        tool_delta_committed &&
+                                            !first_hit_length,
+                                        closure_suffix);
+                                }
                                 if (incremental.fatal()) {
+                                    if (!tool_delta_committed) {
+                                        if (first_hit_length) {
+                                            throw std::runtime_error(
+                                                "tool_call_parse_error: tool "
+                                                "call was truncated at "
+                                                "max_tokens");
+                                        }
+                                        if (retry_tool_call(
+                                                incremental.error())) {
+                                            return true;
+                                        }
+                                        return true;
+                                    }
                                     throw std::runtime_error(
-                                        "incremental tool stream failed: " +
+                                        "tool_call_parse_error: committed "
+                                        "incremental stream failed: " +
                                         incremental.error());
                                 }
+
+                                std::string final_utf8_pending;
                                 std::string text =
-                                    take_complete_utf8(utf8_pending, acc);
-                                text += flush_utf8_pending(utf8_pending, false);
+                                    take_complete_utf8(
+                                        final_utf8_pending, acc);
+                                text += flush_utf8_pending(
+                                    final_utf8_pending, false);
                                 const std::string framed =
-                                    enable_thinking ? ("<think>\n" + text) : text;
-                                const std::vector<json> tool_calls =
-                                    parse_tool_calls_xml(
+                                    (enable_thinking
+                                         ? ("<think>\n" + text)
+                                         : text) +
+                                    closure_suffix;
+                                ToolParseResult parsed;
+                                if (!closure_suffix.empty()) {
+                                    parsed.intent_detected = true;
+                                    const json repaired_call =
+                                        incremental.finalized_call();
+                                    std::string validation_error;
+                                    if (repaired_call.is_null() ||
+                                        !validate_tool_call(
+                                            repaired_call,
+                                            tools_schema.is_array()
+                                                ? &tools_schema : nullptr,
+                                            validation_error)) {
+                                        parsed.valid = false;
+                                        parsed.error =
+                                            validation_error.empty()
+                                                ? "closure repair produced no "
+                                                  "complete tool call"
+                                                : validation_error;
+                                    } else {
+                                        parsed.calls.push_back(repaired_call);
+                                    }
+                                } else {
+                                    parsed = parse_tool_calls_xml(
                                         framed,
-                                        tools_schema.is_array() ? &tools_schema
-                                                                : nullptr);
+                                        tools_schema.is_array()
+                                            ? &tools_schema : nullptr);
+                                }
+                                if (!parsed.valid || parsed.calls.empty()) {
+                                    const std::string parse_error =
+                                        parsed.error.empty()
+                                            ? "tool intent produced no call"
+                                            : parsed.error;
+                                    if (!tool_delta_committed) {
+                                        if (first_hit_length) {
+                                            throw std::runtime_error(
+                                                "tool_call_parse_error: tool "
+                                                "call was truncated at "
+                                                "max_tokens");
+                                        }
+                                        if (retry_tool_call(parse_error)) {
+                                            return true;
+                                        }
+                                        return true;
+                                    }
+                                    throw std::runtime_error(
+                                        "tool_call_parse_error: committed "
+                                        "tool call failed validation: " +
+                                        parse_error);
+                                }
+
                                 const ReasoningSplit split =
                                     split_reasoning(framed);
-                                // Prefix reasoning/content was already emitted
-                                // before the first tool delta whenever present.
                                 if (!streamed_content &&
                                     !split.reasoning.empty()) {
                                     send_delta(json{
                                         {"reasoning_content", split.reasoning}});
                                 }
-                                if (!tool_calls.empty()) {
-                                    if (incremental.streaming()) {
-                                        std::string validation_error;
-                                        if (!incremental.validate(
-                                                tool_calls,
-                                                validation_error)) {
-                                            throw std::runtime_error(
-                                                "incremental tool validation "
-                                                "failed: " +
-                                                validation_error);
+                                if (incremental.streaming()) {
+                                    std::string validation_error;
+                                    if (!incremental.validate(
+                                            parsed.calls,
+                                            validation_error)) {
+                                        if (!tool_delta_committed) {
+                                            if (first_hit_length) {
+                                                throw std::runtime_error(
+                                                    "tool_call_parse_error: "
+                                                    "tool call was truncated "
+                                                    "at max_tokens");
+                                            }
+                                            if (retry_tool_call(
+                                                    validation_error)) {
+                                                return true;
+                                            }
+                                            return true;
                                         }
-                                        // Delay the final closing fragment until
-                                        // the full parser confirms that the
-                                        // streamed arguments are equivalent.
-                                        flush_incremental(true);
-                                        // The first call has already streamed.
-                                        // Preserve the existing multi-call
-                                        // behavior for any later calls.
-                                        if (tool_calls.size() > 1) {
-                                            send_delta(
-                                                tool_call_delta(tool_calls, 1));
-                                        }
-                                    } else {
-                                        send_delta(
-                                            tool_call_delta(tool_calls));
-                                    }
-                                    std::cerr << "[qw3-serve] #" << rid
-                                              << " tool_calls="
-                                              << tool_calls_debug_summary(
-                                                     tool_calls)
-                                              << " incremental="
-                                              << (incremental.streaming()
-                                                      ? "true" : "false")
-                                              << "\n";
-                                    send_done("tool_calls");
-                                } else {
-                                    std::string preview = split.content.empty()
-                                        ? framed : split.content;
-                                    if (preview.size() > 240) {
-                                        preview.resize(240);
-                                    }
-                                    std::replace(preview.begin(), preview.end(),
-                                                 '\n', ' ');
-                                    std::cerr << "[qw3-serve] #" << rid
-                                              << " tool_parse_empty preview="
-                                              << dump_json(preview) << "\n";
-                                    if (incremental.streaming()) {
                                         throw std::runtime_error(
-                                            "incremental tool stream produced "
-                                            "no complete tool call");
+                                            "tool_call_parse_error: "
+                                            "incremental/full parse mismatch: " +
+                                            validation_error);
                                     }
-                                    if (!streamed_content &&
-                                        !split.content.empty()) {
-                                        send_delta(
-                                            json{{"content", split.content}});
+                                    if (!tool_delta_committed) {
+                                        tool_delta_committed = true;
                                     }
-                                    send_done(generation_finish_reason(
-                                        stopped, completion_tokens, g.max_tokens));
+                                    flush_incremental(true);
+                                    if (parsed.calls.size() > 1) {
+                                        send_delta(tool_call_delta(
+                                            parsed.calls, 1));
+                                    }
+                                } else {
+                                    send_delta(
+                                        tool_call_delta(parsed.calls));
                                 }
+                                std::cerr << "[qw3-serve] #" << rid
+                                          << " tool_calls="
+                                          << tool_calls_debug_summary(
+                                                 parsed.calls)
+                                          << " incremental="
+                                          << (incremental.streaming()
+                                                  ? "true" : "false")
+                                          << " closure_repaired="
+                                          << (!closure_suffix.empty()
+                                                  ? "true" : "false")
+                                          << "\n";
+                                send_done("tool_calls");
+                            } else if (forced_tool_request) {
+                                if (g.max_tokens > 0 &&
+                                    completion_tokens >=
+                                        static_cast<size_t>(g.max_tokens)) {
+                                    throw std::runtime_error(
+                                        "tool_call_parse_error: forced tool "
+                                        "call was truncated at max_tokens");
+                                }
+                                if (retry_tool_call(
+                                        "forced tool choice produced no "
+                                        "<tool_call> block")) {
+                                    return true;
+                                }
+                                return true;
                             } else {
-                                if (forced_tool_request) {
-                                    forced_prefix += content_pending;
-                                    if (!forced_prefix.empty()) {
-                                        emit_text(forced_prefix);
-                                    }
-                                } else if (!content_pending.empty()) {
+                                if (!content_pending.empty()) {
                                     emit_text(content_pending);
                                 }
                                 finish_text_stream();
@@ -3194,7 +3653,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                       << "\n";
                             return true;
                         }
-                        generate_request([&](const std::string &piece) {
+                        generate_request(
+                            prompt, g, [&](const std::string &piece) {
                             if (stopped || client_closed) return false;
                             ++completion_tokens;
                             acc += piece;
@@ -3215,7 +3675,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 emit_text(emit);
                             }
                             return !stopped && !client_closed;
-                        });
+                            });
                         finish_text_stream();
                         send_done(generation_finish_reason(
                             stopped, completion_tokens, g.max_tokens));
@@ -3249,41 +3709,144 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
 
-        std::string text;
+        std::string raw_text;
         size_t completion_tokens = 0;
+        size_t final_completion_tokens = 0;
+        size_t usage_prompt_tokens = prompt_token_count;
+        int final_max_tokens = g.max_tokens;
+        std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
+        if (!g.continuous_batching) gen_lk.lock();
+        auto generate_buffered =
+            [&](const std::string &attempt_prompt,
+                const GenerationOptions &attempt_g,
+                std::string &output,
+                size_t &attempt_tokens,
+                bool session_request) {
+                if (session_request) {
+                    eng.generate_session_stream(
+                        attempt_prompt, attempt_g,
+                        [&](const std::string &piece) {
+                            ++attempt_tokens;
+                            output += piece;
+                        },
+                        kvmem_session_reset);
+                } else {
+                    eng.generate_stream_cancellable(
+                        attempt_prompt, attempt_g,
+                        [&](const std::string &piece) {
+                            ++attempt_tokens;
+                            output += piece;
+                            return true;
+                        });
+                }
+            };
         try {
-            if (kvmem_session_request) {
-                std::lock_guard<std::mutex> lk(gen_mu);
-                eng.generate_session_stream(
-                    prompt, g, [&](const std::string &piece) {
-                        ++completion_tokens;
-                        text += piece;
-                    }, kvmem_session_reset);
-            } else if (g.continuous_batching) {
-                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
-                    ++completion_tokens;
-                    text += piece;
-                    return true;
-                });
-            } else {
-                std::lock_guard<std::mutex> lk(gen_mu);
-                eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
-                    ++completion_tokens;
-                    text += piece;
-                    return true;
-                });
-            }
+            generate_buffered(
+                prompt, g, raw_text, final_completion_tokens,
+                kvmem_session_request);
+            completion_tokens = final_completion_tokens;
         } catch (const std::exception &e) {
             std::cerr << "[qw3-serve] #" << rid << " chat error="
                       << e.what() << "\n";
             set_error_response(res, status_for_exception(e), e.what());
             return;
         }
-        if (enable_thinking && g.max_tokens > 0) text = "<think>\n" + text;
-        std::string utf8_pending;
-        text = take_complete_utf8(utf8_pending, text);
-        text += flush_utf8_pending(utf8_pending, false);
-        const bool stopped = apply_stops(text, stops);
+        auto frame_output = [&](const std::string &raw, int max_tokens) {
+            std::string framed =
+                enable_thinking && max_tokens > 0
+                    ? ("<think>\n" + raw) : raw;
+            std::string pending;
+            framed = take_complete_utf8(pending, framed);
+            framed += flush_utf8_pending(pending, false);
+            return framed;
+        };
+        std::string text = frame_output(raw_text, g.max_tokens);
+        bool stopped = apply_stops(text, stops);
+        ToolParseResult parsed = parse_tool_calls_xml(text, tools);
+        const bool retry_needed =
+            tool_request &&
+            ((parsed.intent_detected && (!parsed.valid ||
+                                         parsed.calls.empty())) ||
+             (forced_tool_request && parsed.calls.empty()));
+        if (retry_needed) {
+            if (g.max_tokens > 0 &&
+                final_completion_tokens >=
+                    static_cast<size_t>(g.max_tokens)) {
+                set_error_response(
+                    res, 500,
+                    "tool_call_parse_error: tool call was truncated at "
+                    "max_tokens");
+                return;
+            }
+            if (kvmem_session_request) {
+                set_error_response(
+                    res, 500,
+                    "tool_call_parse_error: retry is not available for "
+                    "explicit KVMem sessions");
+                return;
+            }
+            try {
+                const std::string retry_prompt =
+                    render_tool_retry_prompt(
+                        messages_schema, tools, enable_thinking,
+                        preserve_thinking, forced_tool_name);
+                const size_t retry_prompt_tokens =
+                    usage_tokenizer.encode(retry_prompt).size();
+                if (retry_prompt_tokens >=
+                    static_cast<size_t>(engine.ctx_size)) {
+                    throw std::runtime_error(
+                        "retry prompt exceeds the KV context");
+                }
+                GenerationOptions retry_g = g;
+                retry_g.max_tokens = std::min(
+                    retry_g.max_tokens,
+                    static_cast<int>(
+                        engine.ctx_size - retry_prompt_tokens));
+                if (retry_g.max_tokens <= 0) {
+                    throw std::runtime_error(
+                        "no context space remains for retry");
+                }
+                std::cerr << "[qw3-serve] #" << rid
+                          << " tool_retry attempt=1 reason="
+                          << dump_json(
+                                 parsed.error.empty()
+                                     ? "forced tool choice produced no call"
+                                     : parsed.error)
+                          << " prompt_tokens=" << retry_prompt_tokens
+                          << "\n";
+                std::string retry_raw;
+                size_t retry_completion_tokens = 0;
+                generate_buffered(
+                    retry_prompt, retry_g, retry_raw,
+                    retry_completion_tokens, false);
+                completion_tokens += retry_completion_tokens;
+                usage_prompt_tokens += retry_prompt_tokens;
+                text = frame_output(retry_raw, retry_g.max_tokens);
+                stopped = apply_stops(text, stops);
+                parsed = parse_tool_calls_xml(text, tools);
+                if (!parsed.intent_detected || !parsed.valid ||
+                    parsed.calls.empty()) {
+                    throw std::runtime_error(
+                        parsed.error.empty()
+                            ? "retry produced no tool call"
+                            : parsed.error);
+                }
+                final_completion_tokens = retry_completion_tokens;
+                final_max_tokens = retry_g.max_tokens;
+                std::cerr << "[qw3-serve] #" << rid
+                          << " tool_retry_success calls="
+                          << tool_calls_debug_summary(parsed.calls)
+                          << "\n";
+            } catch (const std::exception &e) {
+                const std::string error =
+                    std::string("tool_call_parse_error: retry failed: ") +
+                    e.what();
+                std::cerr << "[qw3-serve] #" << rid << " " << error
+                          << "\n";
+                set_error_response(res, 500, error);
+                return;
+            }
+        }
         const double ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0)
@@ -3296,20 +3859,21 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             std::cerr << " fallback_reason=" << fallback_reason;
         }
         std::cerr << " " << ms << "ms\n";
-        const std::vector<json> tool_calls = parse_tool_calls_xml(text, tools);
         const ReasoningSplit split = split_reasoning(text);
         json message = json{{"role", "assistant"},
-                            {"content", tool_calls.empty() ? split.content : ""}};
+                            {"content", parsed.calls.empty()
+                                            ? split.content : ""}};
         if (!split.reasoning.empty()) {
             message["reasoning_content"] = split.reasoning;
         }
         std::string finish = generation_finish_reason(
-            stopped, completion_tokens, g.max_tokens);
-        if (!tool_calls.empty()) {
+            stopped, final_completion_tokens, final_max_tokens);
+        if (!parsed.calls.empty()) {
             std::cerr << "[qw3-serve] #" << rid
-                      << " tool_calls=" << tool_calls_debug_summary(tool_calls)
+                      << " tool_calls="
+                      << tool_calls_debug_summary(parsed.calls)
                       << "\n";
-            message["tool_calls"] = tool_calls;
+            message["tool_calls"] = parsed.calls;
             finish = "tool_calls";
         }
         json out = {
@@ -3319,7 +3883,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 {"index", 0},
                 {"message", message},
                 {"finish_reason", finish}}})},
-            {"usage", usage_json(prompt_token_count, completion_tokens)}};
+            {"usage", usage_json(usage_prompt_tokens, completion_tokens)}};
         res.set_content(dump_json(out), "application/json");
     });
 
