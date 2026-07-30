@@ -2128,6 +2128,37 @@ void QwenExecutor::kvmem_flush_raw_k_decode() {
     kvmem_raw_decode_rows_ = 0;
 }
 
+void QwenExecutor::kvmem_resolve_raw_k_decode_before_truncate(
+        uint32_t token_pos) {
+    auto clear_pending = [&]() {
+        kvmem_raw_decode_block_start_ = -1;
+        kvmem_raw_decode_first_row_ = 0;
+        kvmem_raw_decode_rows_ = 0;
+    };
+    if (!kvmem_immutable_source_k_ ||
+        kvmem_raw_decode_block_start_ < 0 ||
+        kvmem_raw_decode_rows_ == 0) {
+        clear_pending();
+        return;
+    }
+
+    const uint64_t pending_begin =
+        static_cast<uint64_t>(kvmem_raw_decode_block_start_) +
+        kvmem_raw_decode_first_row_;
+    const uint64_t pending_end =
+        pending_begin + kvmem_raw_decode_rows_;
+    const uint64_t keep_end =
+        std::min<uint64_t>(pending_end, token_pos);
+    if (keep_end > pending_begin) {
+        const uint32_t keep_rows =
+            static_cast<uint32_t>(keep_end - pending_begin);
+        kvmem_flush_raw_k_capture(
+            static_cast<uint32_t>(pending_begin),
+            kvmem_raw_decode_first_row_, keep_rows);
+    }
+    clear_pending();
+}
+
 void QwenExecutor::kvmem_ensure_rope_sincos_table() {
     if (!kvmem_rope_table_enabled_ || kvmem_rope_sincos_) return;
     const QwenConfig &cfg = model_.config();
@@ -7101,6 +7132,10 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
     if (!kvmem_enabled_ || !block_store_) return;
     kvmem_finish_proactive_d2h(/*wait_all=*/true);
     kvmem_reap_pending_writes(/*wait_all=*/true);
+    // A single-token decode may leave its immutable raw-K rows only in the
+    // device capture buffer. Preserve the portion that survives this rewind
+    // before invalidating the suffix and discarding the pending bookkeeping.
+    kvmem_resolve_raw_k_decode_before_truncate(token_pos);
     // Rewind the block table to `token_pos` tokens. restore_state() has already
     // rewound position/KV-pages/recurrent/window; this reconciles the block
     // store + tier slots + selection indices, which restore_state does not touch.
@@ -7118,9 +7153,6 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
                   static_cast<uint8_t>(0));
     }
     kvmem_truncate_raw_k(token_pos);
-    kvmem_raw_decode_block_start_ = -1;
-    kvmem_raw_decode_first_row_ = 0;
-    kvmem_raw_decode_rows_ = 0;
     // Release CPU/NVMe tier slots for dropped blocks. GPU pages are NOT released
     // here: restore_state's truncate_to_logical_pages already freed the physical
     // pages for positions >= token_pos, so a second release would double-free.
