@@ -10,6 +10,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${PYTHON:-python3}"
 TAG="${TAG:-s500_32k_bt32_keydir_adaptive_g010_006}"
 
+# The canonical 2026-07-12 Mean-K baseline predates the Q8 BF16 main-stream
+# optimization. Keep FP32 main activations so this experiment changes only the
+# retrieval method; it also avoids the known BF16/MTP-prefix scratch conflict.
+export QW3_Q8_BF16_MAIN="${QW3_Q8_BF16_MAIN:-0}"
+
 if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
   echo "DEEPSEEK_API_KEY must be set for the deepseek-v4-pro judge" >&2
   exit 2

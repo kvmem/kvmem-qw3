@@ -252,6 +252,11 @@ def main() -> int:
                 else {}
             ),
             **(
+                {"QW3_Q8_BF16_MAIN": os.environ["QW3_Q8_BF16_MAIN"]}
+                if "QW3_Q8_BF16_MAIN" in os.environ
+                else {}
+            ),
+            **(
                 {"QW3_KVMEM_RECOMPUTE_QUERY": os.environ["QW3_KVMEM_RECOMPUTE_QUERY"]}
                 if "QW3_KVMEM_RECOMPUTE_QUERY" in os.environ
                 else {}
