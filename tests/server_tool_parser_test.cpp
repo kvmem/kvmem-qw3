@@ -222,6 +222,19 @@ void test_latest_external_input_query() {
         2, 3, true);
 }
 
+void test_retry_usage_replaces_discarded_attempt() {
+    size_t prompt_tokens = 133842;
+    size_t completion_tokens = 7300;
+    qw3::replace_usage_with_retry(
+        133910, 812, prompt_tokens, completion_tokens);
+    const json usage = qw3::usage_json(prompt_tokens, completion_tokens);
+    if (usage.value("prompt_tokens", 0) != 133910 ||
+        usage.value("completion_tokens", 0) != 812 ||
+        usage.value("total_tokens", 0) != 134722) {
+        fail("internal retry work inflated response usage");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -231,6 +244,7 @@ int main() {
     test_incomplete_block_and_retry_prompt();
     test_incremental_commit_gate();
     test_latest_external_input_query();
+    test_retry_usage_replaces_discarded_attempt();
     std::cout << "server_tool_parser_test: ok\n";
     return 0;
 }

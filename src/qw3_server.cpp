@@ -82,6 +82,17 @@ json usage_json(size_t prompt_tokens, size_t completion_tokens) {
                 {"total_tokens", prompt_tokens + completion_tokens}};
 }
 
+void replace_usage_with_retry(size_t retry_prompt_tokens,
+                              size_t retry_completion_tokens,
+                              size_t &usage_prompt_tokens,
+                              size_t &usage_completion_tokens) {
+    // Standard OpenAI usage describes the attempt that produced the returned
+    // response. A discarded internal repair attempt is server compute, not an
+    // additional conversation turn, and must not inflate client context usage.
+    usage_prompt_tokens = retry_prompt_tokens;
+    usage_completion_tokens = retry_completion_tokens;
+}
+
 bool parse_explicit_max_tokens(const json &req, bool &present, int &value,
                                std::string &error) {
     const char *key = nullptr;
@@ -3376,7 +3387,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         "tool_call_parse_error: no context "
                                         "space remains for retry");
                                 }
-                                usage_prompt_tokens += retry_prompt_tokens;
                                 std::cerr << "[qw3-serve] #" << rid
                                           << " tool_retry attempt=1 reason="
                                           << dump_json(first_error)
@@ -3392,7 +3402,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     retry_prompt, retry_g,
                                     [&](const std::string &piece) {
                                         if (client_closed) return false;
-                                        ++completion_tokens;
                                         ++retry_completion_tokens;
                                         retry_acc += piece;
                                         if (!stops.empty()) {
@@ -3440,6 +3449,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         "tool_call_parse_error: retry failed: " +
                                         reason);
                                 }
+                                const size_t discarded_completion_tokens =
+                                    completion_tokens;
+                                replace_usage_with_retry(
+                                    retry_prompt_tokens,
+                                    retry_completion_tokens,
+                                    usage_prompt_tokens,
+                                    completion_tokens);
                                 const ReasoningSplit retry_split =
                                     split_reasoning(retry_framed);
                                 if (!retry_split.reasoning.empty()) {
@@ -3457,6 +3473,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                                  retry_stopped,
                                                  retry_completion_tokens,
                                                  retry_g.max_tokens)
+                                          << " usage_prompt_tokens="
+                                          << usage_prompt_tokens
+                                          << " usage_completion_tokens="
+                                          << completion_tokens
+                                          << " discarded_prompt_tokens="
+                                          << prompt_token_count
+                                          << " discarded_completion_tokens="
+                                          << discarded_completion_tokens
                                           << "\n";
                                 send_done("tool_calls");
                                 return true;
@@ -3886,8 +3910,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 generate_buffered(
                     retry_prompt, retry_g, retry_raw,
                     retry_completion_tokens, false);
-                completion_tokens += retry_completion_tokens;
-                usage_prompt_tokens += retry_prompt_tokens;
+                const size_t discarded_completion_tokens =
+                    completion_tokens;
+                replace_usage_with_retry(
+                    retry_prompt_tokens, retry_completion_tokens,
+                    usage_prompt_tokens, completion_tokens);
                 text = frame_output(retry_raw, retry_g.max_tokens);
                 stopped = apply_stops(text, stops);
                 parsed = parse_tool_calls_xml(text, tools);
@@ -3903,6 +3930,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 std::cerr << "[qw3-serve] #" << rid
                           << " tool_retry_success calls="
                           << tool_calls_debug_summary(parsed.calls)
+                          << " usage_prompt_tokens="
+                          << usage_prompt_tokens
+                          << " usage_completion_tokens="
+                          << completion_tokens
+                          << " discarded_prompt_tokens="
+                          << prompt_token_count
+                          << " discarded_completion_tokens="
+                          << discarded_completion_tokens
                           << "\n";
             } catch (const std::exception &e) {
                 const std::string error =
