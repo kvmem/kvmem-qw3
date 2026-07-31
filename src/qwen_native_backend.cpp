@@ -527,6 +527,48 @@ bool kvmem_recompute_query_enabled(bool configured_default) {
                             configured_default);
 }
 
+struct KvmemReplayCapacity {
+    bool fits = false;
+    uint32_t boundary = 0;
+    uint32_t suffix_blocks = 0;
+    uint32_t required_blocks = 0;
+    uint32_t budget_blocks = 0;
+};
+
+KvmemReplayCapacity kvmem_replay_capacity(
+        const QwenExecutor *executor, uint32_t query_begin,
+        uint32_t logical_prompt_end) {
+    KvmemReplayCapacity out;
+    if (!executor || !executor->block_store() ||
+        query_begin >= logical_prompt_end) {
+        return out;
+    }
+    const KvMemStore *store = executor->block_store();
+    const uint32_t bt =
+        std::max<uint32_t>(1, store->config().block_tokens);
+    out.boundary = (query_begin / bt) * bt;
+    out.budget_blocks = store->budget_blocks();
+    if (out.boundary == 0 || out.budget_blocks == 0) return out;
+
+    const uint64_t total_blocks =
+        (static_cast<uint64_t>(logical_prompt_end) + bt - 1) / bt;
+    const uint64_t boundary_block = out.boundary / bt;
+    if (boundary_block >= total_blocks) return out;
+    const uint64_t sink_blocks =
+        std::min<uint64_t>(store->config().sink_blocks, total_blocks);
+    const uint64_t suffix_blocks = total_blocks - boundary_block;
+    const uint64_t required_blocks =
+        boundary_block < sink_blocks
+            ? total_blocks
+            : sink_blocks + suffix_blocks;
+    out.suffix_blocks = static_cast<uint32_t>(
+        std::min<uint64_t>(suffix_blocks, UINT32_MAX));
+    out.required_blocks = static_cast<uint32_t>(
+        std::min<uint64_t>(required_blocks, UINT32_MAX));
+    out.fits = required_blocks <= out.budget_blocks;
+    return out;
+}
+
 const char *kvmem_inline_refresh_name(KvMemInlineRefreshMode mode) {
     switch (mode) {
     case KvMemInlineRefreshMode::Off: return "off";
@@ -8147,12 +8189,31 @@ private:
         // still declines (captured as a non-resumable P below).
         const bool qc_pertoken_here =
             qc_active && executor_->kvmem_qc_pertoken();
-        const bool recompute_query =
+        const bool recompute_query_requested =
             executor_->kvmem_enabled() && qc_active &&
             kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
             dump == nullptr && executor_->block_store() &&
             kvmem_query_replay_retrieval_supported(
                 executor_->block_store()->config().retrieval_method);
+        const KvmemReplayCapacity replay_capacity =
+            recompute_query_requested
+                ? kvmem_replay_capacity(
+                      executor_.get(), options.kvmem_query_begin,
+                      static_cast<uint32_t>(prompt_tokens.size()))
+                : KvmemReplayCapacity{};
+        const bool recompute_query =
+            recompute_query_requested && replay_capacity.fits;
+        if (recompute_query_requested && !recompute_query) {
+            log("native kvmem query replay fallback (plain): boundary=" +
+                std::to_string(replay_capacity.boundary) +
+                " suffix_blocks=" +
+                std::to_string(replay_capacity.suffix_blocks) +
+                " required_blocks=" +
+                std::to_string(replay_capacity.required_blocks) +
+                " budget_blocks=" +
+                std::to_string(replay_capacity.budget_blocks) +
+                " mode=single-pass-query-selection");
+        }
         if (inline_refresh && !recompute_query) {
             throw std::runtime_error(
                 "KVMem inline refresh requires an above-budget, "
@@ -9264,13 +9325,32 @@ private:
             kvmem_on && qc_active && kvmem_clean_query_enabled() &&
             !transcript_replay && !query_replay &&
             !kvmem_warm_reuse && !kvmem_warm_capture && dump == nullptr;
-        const bool recompute_query =
+        const bool recompute_query_requested =
             kvmem_on && qc_active &&
             kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
             !transcript_replay && !query_replay && !clean_query &&
             dump == nullptr && executor_->block_store() &&
             kvmem_query_replay_retrieval_supported(
                 executor_->block_store()->config().retrieval_method);
+        const KvmemReplayCapacity replay_capacity =
+            recompute_query_requested
+                ? kvmem_replay_capacity(
+                      executor_, options.kvmem_query_begin,
+                      logical_prompt_tokens)
+                : KvmemReplayCapacity{};
+        const bool recompute_query =
+            recompute_query_requested && replay_capacity.fits;
+        if (recompute_query_requested && !recompute_query) {
+            log("native kvmem query replay fallback (mtp): boundary=" +
+                std::to_string(replay_capacity.boundary) +
+                " suffix_blocks=" +
+                std::to_string(replay_capacity.suffix_blocks) +
+                " required_blocks=" +
+                std::to_string(replay_capacity.required_blocks) +
+                " budget_blocks=" +
+                std::to_string(replay_capacity.budget_blocks) +
+                " mode=single-pass-query-selection");
+        }
         if (inline_refresh && !recompute_query) {
             throw std::runtime_error(
                 "KVMem inline refresh requires an above-budget, "
