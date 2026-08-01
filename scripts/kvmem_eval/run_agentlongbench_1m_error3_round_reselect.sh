@@ -27,7 +27,9 @@ exec env \
   CPU_GB="${CPU_GB:-64}" \
   NVME_GB="${NVME_GB:-0}" \
   GPU_MEMORY_RATIO="${GPU_MEMORY_RATIO:-0.50}" \
-  KVMEM_OPT_LEVEL="${KVMEM_OPT_LEVEL:-opt_3}" \
+  KVMEM_OPT_STAGE_OUT="${KVMEM_OPT_STAGE_OUT:-on}" \
+  KVMEM_OPT_STAGE_IN="${KVMEM_OPT_STAGE_IN:-on}" \
+  KVMEM_OPT_PACK="${KVMEM_OPT_PACK:-on}" \
   IMMUTABLE_REFRESH_TOKENS=1 \
   THINKING_BUDGET=8192 \
   DATA=/home/chaidi/AgentLongBench-Long/DeepseekMillion/samples.jsonl \

@@ -35,7 +35,9 @@ args=(
   --gen-budget 32768
   --sink-blocks 1
   --retrieval-method mean-k
-  --optimization-level opt_3
+  --kvmem-opt-stage-out on
+  --kvmem-opt-stage-in on
+  --kvmem-opt-pack on
   --gpu-memory-ratio 0.49
   --cpu-gb "$CPU_GB"
   --nvme-gb "$NVME_GB"

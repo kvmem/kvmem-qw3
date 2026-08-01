@@ -123,15 +123,10 @@ struct EngineOptions {
     std::string kvmem_group_score_reduce = "max";
     double kvmem_group_length_alpha = 0.5;
     std::string kvmem_update_mode = "interval"; // interval or step
-    // Deprecated cumulative storage/tiering profile. It is consulted only
-    // when the CLI explicitly passes --kvmem-optimization-level; otherwise
-    // common Opt3 infrastructure backs the independent default-on groups.
-    std::string kvmem_optimization_level = "opt_3";
-    bool kvmem_optimization_level_explicit = false;
-    // Repeatable paper-ablation switch. Empty means all optimizations on.
-    // Valid names: proactive-stage-out, hierarchical-reuse,
-    // packed-rematerialization, or all.
-    std::vector<std::string> kvmem_optimize_off;
+    // Orthogonal performance-ablation controls. All default on.
+    bool kvmem_opt_stage_out = true;
+    bool kvmem_opt_stage_in = true;
+    bool kvmem_opt_pack = true;
     // Archived experimental DeltaNet retrieval. These programmatic fields remain
     // for reproducibility, but the corresponding CLI is disabled and the method
     // is not recommended. See docs/kvmem_deltanet_retrieval_experimental.md.

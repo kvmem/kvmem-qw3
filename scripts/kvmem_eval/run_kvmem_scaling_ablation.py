@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run the additive KVMem scaling/optimization ablation.
+"""Run the factorial KVMem scaling/optimization ablation.
 
 Each cell grows one persistent context through the same cumulative ladder.
 This avoids re-prefilling shorter prefixes from scratch and models a real
-long-lived agent session. The four cells disable zero, one, two, or all three
+long-lived agent session. The eight cells cover every combination of the three
 paper-facing storage optimizations while keeping model, precision, budgets,
 query replay, retrieval, CPU capacity, and NVMe capacity fixed.
 """
@@ -17,15 +17,18 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 
-CELLS: Dict[str, List[str]] = {
-    "all-on": [],
-    "one-off-no-packed": ["packed-rematerialization"],
-    "two-off-proactive-only": [
-        "hierarchical-reuse", "packed-rematerialization"],
-    "all-off": ["all"],
+CELLS: Dict[str, tuple[str, str, str]] = {
+    "all-off": ("off", "off", "off"),
+    "stage-out-only": ("on", "off", "off"),
+    "stage-in-only": ("off", "on", "off"),
+    "pack-only": ("off", "off", "on"),
+    "no-stage-out": ("off", "on", "on"),
+    "no-stage-in": ("on", "off", "on"),
+    "no-pack": ("on", "on", "off"),
+    "all-on": ("on", "on", "on"),
 }
 
 
@@ -50,7 +53,11 @@ def write_summary(out_root: Path, results: Dict[str, dict]) -> None:
         totals["post_sum_ms"] = post_sum_ms
         totals["post_error_ms"] = totals["postprefill_ms"] - post_sum_ms
         summary["cells"][cell] = {
-            "optimize_off": CELLS[cell],
+            "optimization_switches": {
+                "stage_out": CELLS[cell][0],
+                "stage_in": CELLS[cell][1],
+                "pack": CELLS[cell][2],
+            },
             "returncode": payload.get("returncode"),
             "wall_s": payload.get("wall_s"),
             "peak_gpu_proc_mib": payload.get("peak_gpu_proc_mib"),
@@ -82,12 +89,12 @@ def write_summary(out_root: Path, results: Dict[str, dict]) -> None:
     # Ordered, cumulative marginal contributions. Each adjacent pair differs
     # by exactly one optimization while the workload and model stay fixed.
     marginal_pairs = (
-        ("packed-rematerialization",
-         "all-on", "one-off-no-packed"),
-        ("hierarchical-reuse",
-         "one-off-no-packed", "two-off-proactive-only"),
-        ("proactive-stage-out",
-         "two-off-proactive-only", "all-off"),
+        ("pack",
+         "all-on", "no-pack"),
+        ("stage-in",
+         "no-pack", "stage-out-only"),
+        ("stage-out",
+         "stage-out-only", "all-off"),
     )
     marginal: dict = {}
     for name, enabled_cell, disabled_cell in marginal_pairs:
@@ -321,8 +328,12 @@ def main() -> int:
             "--timeout", str(args.timeout),
             "--out-json", str(out_json),
         ]
-        for name in CELLS[cell]:
-            cmd += ["--optimize-off", name]
+        stage_out, stage_in, pack = CELLS[cell]
+        cmd += [
+            "--opt-stage-out", stage_out,
+            "--opt-stage-in", stage_in,
+            "--opt-pack", pack,
+        ]
         (cell_dir / "command.txt").write_text(
             " ".join(cmd) + "\n", encoding="utf-8")
         print(f"[{time.strftime('%F %T')}] START {cell}", flush=True)

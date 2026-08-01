@@ -36,7 +36,9 @@ QW3_Q8_BF16_MAIN=0 \
   --kvmem-update-mode step \
   --kvmem-query-conditioned \
   --kvmem-immutable-k \
-  --kvmem-optimize-off proactive-stage-out \
+  --kvmem-opt-stage-out off \
+  --kvmem-opt-stage-in on \
+  --kvmem-opt-pack on \
   --kvmem-gpu-memory-ratio 0.5 \
   --kvmem-cpu-gb 40 \
   --enable-thinking \

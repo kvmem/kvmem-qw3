@@ -89,6 +89,15 @@ _SUMROW_RE = re.compile(
     r"([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+"
     r"([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+"
     r"([\d.eE+-]+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$")
+_QUERY_ROW_RE = re.compile(
+    r"\[kvmem-session-query\] turn=(\d+) query=(\d+) mode=(\w+) "
+    r"base=(\d+) span=\[(\d+),(\d+)\) final=(\d+) "
+    r"capture_ms=([\d.eE+-]+) restore_ms=([\d.eE+-]+) "
+    r"total_ms=([\d.eE+-]+) semantic_ms=([\d.eE+-]+) "
+    r"replay_ms=([\d.eE+-]+) decode_ms=([\d.eE+-]+) "
+    r"score_ms=([\d.eE+-]+) stage_in_ms=([\d.eE+-]+) "
+    r"stage_out_ms=([\d.eE+-]+) assemble_ms=([\d.eE+-]+) "
+    r"stage_in_blocks=(\d+) stage_out_blocks=(\d+) decoded=(\d+)")
 
 
 def _gib(nbytes: float) -> float:
@@ -252,6 +261,36 @@ def parse_summary(log: str) -> Dict[int, dict]:
     return out
 
 
+def parse_repeated_queries(log: str) -> List[dict]:
+    """Parse exact-milestone query probes emitted by kvmem-session."""
+    out: List[dict] = []
+    for match in _QUERY_ROW_RE.finditer(log):
+        g = match.groups()
+        out.append({
+            "turn": int(g[0]),
+            "query": int(g[1]),
+            "mode": g[2],
+            "base_pos": int(g[3]),
+            "query_begin": int(g[4]),
+            "query_end": int(g[5]),
+            "final_pos": int(g[6]),
+            "capture_ms": float(g[7]),
+            "restore_ms": float(g[8]),
+            "total_ms": float(g[9]),
+            "semantic_ms": float(g[10]),
+            "query_replay_ms": float(g[11]),
+            "decode_ms": float(g[12]),
+            "score_ms": float(g[13]),
+            "stage_in_ms": float(g[14]),
+            "stage_out_ms": float(g[15]),
+            "assemble_ms": float(g[16]),
+            "stage_in_blocks": int(g[17]),
+            "stage_out_blocks": int(g[18]),
+            "decoded": int(g[19]),
+        })
+    return out
+
+
 def fmt_ladder(targets: List[int]) -> str:
     def one(v: int) -> str:
         if v % (1024 * 1024) == 0:
@@ -275,6 +314,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--query-tokens", type=int, default=32,
                     help="tail tokens used as query per ladder point; 0 "
                          "disables query-conditioned selection/replay")
+    ap.add_argument("--repeat-queries", type=int, default=0,
+                    help="queries issued from every exact ladder checkpoint; "
+                         "0 keeps the legacy path")
+    ap.add_argument("--repeat-mode", choices=("frozen", "sequential"),
+                    default="frozen",
+                    help="restore the same milestone before every query or "
+                         "preserve earlier probe turns")
     ap.add_argument("--temp", type=float, default=0.0,
                     help="decode-probe temperature (0=greedy, default). temp>0 "
                          "routes the Qwen3 sampled recipe (top_p=0.95 top_k=20)")
@@ -302,10 +348,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="NVMe tier directory (default: a tmpdir, cleaned up)")
     ap.add_argument("--kv-dtype", default="fp16")
     ap.add_argument("--prefill-chunk", type=int, default=2048)
-    ap.add_argument("--optimize-off", action="append", default=[],
-                    choices=("proactive-stage-out", "hierarchical-reuse",
-                             "packed-rematerialization", "all"),
-                    help="repeatable KVMem optimization ablation")
+    ap.add_argument("--opt-stage-out", choices=("on", "off"), default="on")
+    ap.add_argument("--opt-stage-in", choices=("on", "off"), default="on")
+    ap.add_argument("--opt-pack", choices=("on", "off"), default="on")
     ap.add_argument("--raw-k-nvme", action="store_true",
                     help="store immutable raw-K authority in NVMe with a "
                          "bounded CPU cache")
@@ -322,6 +367,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="overall process timeout in seconds (default 4h)")
     ap.add_argument("--out-json", default="/tmp/qw3_kvmem_session_profile.json")
     args = ap.parse_args(argv)
+    if args.repeat_queries < 0:
+        raise SystemExit("--repeat-queries must be >= 0")
+    if args.repeat_queries > 0 and args.query_tokens <= 0:
+        raise SystemExit("--repeat-queries requires --query-tokens > 0")
 
     qw3 = Path(args.qw3)
     model = Path(args.model)
@@ -351,7 +400,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cmd = [
         str(qw3), "kvmem-session", "--model", str(model),
-        "--ctx", str(max_target + args.decode_tokens * len(targets) + 4096),
+        "--ctx", str(max_target +
+                     args.decode_tokens * len(targets) +
+                     args.repeat_queries *
+                     (args.query_tokens + args.decode_tokens) + 4096),
         "--session-ladder", fmt_ladder(targets),
         "--session-decode-tokens", str(args.decode_tokens),
         "--session-query-tokens", str(args.query_tokens),
@@ -371,10 +423,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--kvmem-index-staging-mb", str(args.index_staging_mb),
         "--kvmem-gpu-memory-ratio", str(args.gpu_ratio),
     ]
+    # Keep the default command line byte-compatible with older binaries and
+    # already-running ablation queues. The new flags are emitted only when the
+    # milestone fan-out is explicitly requested.
+    if args.repeat_queries > 0:
+        cmd += [
+            "--session-repeat-queries", str(args.repeat_queries),
+            "--session-repeat-mode", args.repeat_mode,
+        ]
     cmd += ["--no-kvmem-immutable-k" if args.no_immutable_k
             else "--kvmem-immutable-k"]
-    for name in args.optimize_off:
-        cmd += ["--kvmem-optimize-off", name]
+    cmd += [
+        "--kvmem-opt-stage-out", args.opt_stage_out,
+        "--kvmem-opt-stage-in", args.opt_stage_in,
+        "--kvmem-opt-pack", args.opt_pack,
+    ]
     if args.temp > 0.0:
         cmd += ["--temp", str(args.temp)]
     tiered = max_target >= args.tier_threshold
@@ -403,10 +466,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"model={model.name} ladder={fmt_ladder(targets)} "
           f"decode_tokens={args.decode_tokens} chain={args.chain} "
           f"query_tokens={args.query_tokens} window={args.window}tok "
+          f"repeat_queries={args.repeat_queries} "
+          f"repeat_mode={args.repeat_mode} "
           f"gen_budget={args.gen_budget} ratio={args.gpu_ratio} "
           f"kv={args.kv_dtype} retrieval={args.retrieval_method} "
           f"index={args.index_placement} "
-          f"optimize_off={args.optimize_off or ['none']}",
+          f"opt_stage_out={args.opt_stage_out} "
+          f"opt_stage_in={args.opt_stage_in} "
+          f"opt_pack={args.opt_pack}",
           flush=True)
     print(f"tiers={'cpu=%g/nvme=%g GiB' % (args.cpu_gb, args.nvme_gb) if tiered else 'GPU-pool-only'} "
           f"nvme_dir={nvme_dir if tiered else '-'}", flush=True)
@@ -440,6 +507,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     rc = proc.returncode
 
     turns = parse_turns(log)
+    repeated_queries = parse_repeated_queries(log)
     summary = parse_summary(log)
     for t in turns:
         s = summary.get(int(t["turn"]))
@@ -482,6 +550,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                   f"{t.get('gpu_mib',0):8d} {t.get('rss_mib',0):8d}",
                   flush=True)
 
+    if repeated_queries:
+        print(f"\n{'turn':>4s} {'q':>3s} {'mode':>10s} {'base':>10s} "
+              f"{'restore':>9s} {'total':>9s} {'semantic':>9s} "
+              f"{'replay':>9s} {'score':>8s} {'stagein':>8s} "
+              f"{'stageout':>9s} {'assemble':>9s}", flush=True)
+        for q in repeated_queries:
+            print(f"{q['turn']:4d} {q['query']:3d} {q['mode']:>10s} "
+                  f"{q['base_pos']:10d} {q['restore_ms']:9.3f} "
+                  f"{q['total_ms']:9.3f} {q['semantic_ms']:9.3f} "
+                  f"{q['query_replay_ms']:9.3f} {q['score_ms']:8.3f} "
+                  f"{q['stage_in_ms']:8.3f} {q['stage_out_ms']:9.3f} "
+                  f"{q['assemble_ms']:9.3f}", flush=True)
+
     out = {
         "args": vars(args),
         "cmd": cmd,
@@ -495,6 +576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "peak_host_rss_mib": sampler.peak_rss,
         "log_path": logf.name,
         "turns": turns,
+        "repeated_queries": repeated_queries,
     }
     Path(args.out_json).write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"\nwrote {args.out_json}", flush=True)

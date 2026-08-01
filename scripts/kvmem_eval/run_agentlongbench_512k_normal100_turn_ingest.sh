@@ -17,7 +17,9 @@ KV_DTYPE=${KV_DTYPE:-fp16}
 CPU_GB=${CPU_GB:-64}
 NVME_GB=${NVME_GB:-0}
 GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.51}
-KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
+KVMEM_OPT_STAGE_OUT=${KVMEM_OPT_STAGE_OUT:-off}
+KVMEM_OPT_STAGE_IN=${KVMEM_OPT_STAGE_IN:-on}
+KVMEM_OPT_PACK=${KVMEM_OPT_PACK:-off}
 IMMUTABLE_REFRESH_TOKENS=${IMMUTABLE_REFRESH_TOKENS:-0}
 THINKING_BUDGET=${THINKING_BUDGET:-4096}
 TAG=${TAG:-agentlongbench_512k_normal100_turn_ingest_k200k_g32k_b32_20260724}
@@ -101,7 +103,9 @@ env \
     --kvmem-method retrieval --kvmem-retrieval-method mean-k \
     --kvmem-update-mode step --kvmem-query-conditioned \
     --kvmem-immutable-k --kvmem-gpu-memory-ratio "$GPU_MEMORY_RATIO" \
-    --kvmem-optimization-level "$KVMEM_OPT_LEVEL" \
+    --kvmem-opt-stage-out "$KVMEM_OPT_STAGE_OUT" \
+    --kvmem-opt-stage-in "$KVMEM_OPT_STAGE_IN" \
+    --kvmem-opt-pack "$KVMEM_OPT_PACK" \
     "${tier_args[@]}" \
     --enable-thinking --thinking-budget "$THINKING_BUDGET" \
     --prefill-chunk 2048 --temp 0.6 \

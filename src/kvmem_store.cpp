@@ -206,7 +206,7 @@ void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
     if (block_id >= block_count()) return;
     KvMemBlock &b = blocks_[block_id];
     b.tier = tier;
-    if (cfg_.optimization_level >= KvMemOptimizationLevel::Opt2) {
+    if (cfg_.optimize_stage_out) {
         if (tier == KvTier::GPU) {
             // GPU becomes active, but clean CPU/SSD cache copies remain valid.
             if (cpu_slot >= 0) b.cpu_slot = cpu_slot;
@@ -558,7 +558,7 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
             ++plan.selection_overlap_blocks;
         }
     }
-    const bool force_full_reload = !cfg_.hierarchical_reuse;
+    const bool force_full_reload = !cfg_.optimize_stage_in;
 
     // Stage-out: any GPU-resident block that is not selected. On the first
     // post-prefill selection, many cold blocks were never in the prior working

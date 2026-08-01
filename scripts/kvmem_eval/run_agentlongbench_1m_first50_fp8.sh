@@ -14,7 +14,7 @@ BASE="$ROOT/scripts/kvmem_eval/run_agentlongbench_512k_normal100_k224k_immutable
 
 LIMIT=${LIMIT:-50}
 EXPECTED=${EXPECTED:-$LIMIT}
-TAG=${TAG:-agentlongbench_1m_first50_k224k_g32k_b32_qr_immutable_mtp4_fp8_cpu64_opt3_20260725}
+TAG=${TAG:-agentlongbench_1m_first50_k224k_g32k_b32_qr_immutable_mtp4_fp8_cpu64_allopt_20260725}
 
 exec env \
   TAG="$TAG" \
@@ -22,7 +22,9 @@ exec env \
   CTX="${CTX:-1200000}" \
   CPU_GB="${CPU_GB:-64}" \
   NVME_GB="${NVME_GB:-0}" \
-  KVMEM_OPT_LEVEL="${KVMEM_OPT_LEVEL:-opt_3}" \
+  KVMEM_OPT_STAGE_OUT="${KVMEM_OPT_STAGE_OUT:-on}" \
+  KVMEM_OPT_STAGE_IN="${KVMEM_OPT_STAGE_IN:-on}" \
+  KVMEM_OPT_PACK="${KVMEM_OPT_PACK:-on}" \
   KVMEM_BUDGET="${KVMEM_BUDGET:-229376}" \
   GEN_BUDGET="${GEN_BUDGET:-32768}" \
   KV_DTYPE="${KV_DTYPE:-fp8}" \
@@ -32,5 +34,5 @@ exec env \
   LIMIT="$LIMIT" \
   EXPECTED="$EXPECTED" \
   BENCHMARK_NAME="${BENCHMARK_NAME:-AgentLongBench-1M-DeepseekMillion-first50}" \
-  METHOD="${METHOD:-kvmem_mean_k_224k_b32_query_replay_immutable_mtp4_fp8_opt3}" \
+  METHOD="${METHOD:-kvmem_mean_k_224k_b32_query_replay_immutable_mtp4_fp8_allopt}" \
   "$BASE"

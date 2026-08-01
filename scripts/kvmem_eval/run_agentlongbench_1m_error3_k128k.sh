@@ -33,6 +33,7 @@ exec env \
   EXPECTED=3 \
   BENCHMARK_NAME=AgentLongBench-1M-error3-K128K \
   METHOD=kvmem_mean_k_k128k_g32k_b32_query_replay_immutable_refresh1_mtp4_fp8_t06_think8k \
-  KVMEM_OPT_LEVEL= \
-  KVMEM_OPTIMIZE_OFF= \
+  KVMEM_OPT_STAGE_OUT=on \
+  KVMEM_OPT_STAGE_IN=on \
+  KVMEM_OPT_PACK=on \
   "$BASE"

@@ -42,47 +42,45 @@ caveats to `scripts/kvmem_eval/utility_eval_overrides.json`; do not hand-edit
 generated rows. The scanner copies only whitelisted configuration fields, so API
 keys and arbitrary log contents cannot enter the registry.
 
-## Storage optimization A/B levels
+## Storage optimization factorial
 
-The reusable runner exposes the storage optimization profile without changing
-the model, prompt, retrieval, or judge configuration:
+The reusable runner exposes three independent switches without changing the
+model, prompt, retrieval, or judge configuration:
 
 ```bash
 python3 scripts/kvmem_eval/run_kvmem_eval.py \
-  --tag storage_init \
-  --optimization-level kvmem_init \
+  --tag storage_all_off \
+  --kvmem-opt-stage-out off \
+  --kvmem-opt-stage-in off \
+  --kvmem-opt-pack off \
   --dry-run
 
 python3 scripts/kvmem_eval/run_kvmem_eval.py \
-  --tag storage_opt1 \
-  --optimization-level opt_1 \
+  --tag storage_all_on \
+  --kvmem-opt-stage-out on \
+  --kvmem-opt-stage-in on \
+  --kvmem-opt-pack on \
   --dry-run
 ```
 
-`kvmem_init` is the frozen compatibility path. The three cumulative
-optimization profiles are deliberately grouped by the bottleneck they target:
-
-| Level | Added behavior | Primary objective |
+| Switch | Controlled behavior | Primary objective |
 |---|---|---|
-| `opt_1` | heat-aware CPU admission and eviction | reduce the number of bytes loaded from SSD |
-| `opt_2` | GPU-gather pages into contiguous slabs and batch D2H; with SSD, proactively write completed prefill blocks in the background, retain inclusive clean backing, and use bounded asynchronous positional writes | reduce stage-out latency |
-| `opt_3` | CPU slots are gathered into two pinned slabs, copied by one H2D per slab, then GPU-scattered to cache pages; with SSD, also coalesce reads and pipeline SSD reads with H2D | reduce stage-in latency |
+| Stage-out | proactive writeback and inclusive clean backing | hide GPU-to-lower-tier eviction |
+| Stage-in | GPU selection-delta reuse, incremental rematerialization, heat-aware CPU policy | reduce bytes loaded and rebuilt |
+| Pack | cross-block D2H/H2D, persistent CPU workers, coalesced SSD I/O, batched GPU scatter/re-RoPE | raise transfer bandwidth and reduce launch overhead |
 
-`opt_2` and `opt_3` work with CPU-only storage. In that mode CPU spill remains
-exclusive so the tier only needs enough slots for non-resident blocks; retaining
-every promoted CPU copy would otherwise require one CPU slot for every possible
-context block and can deadlock a full working-set swap. When NVMe is configured,
-inclusive SSD backing requires an arena large enough for one spill record per
-possible context block. These profiles do not change retrieval scores, selected
-block IDs, or KV values.
+All eight combinations are valid. Stage-out off uses reactive exclusive moves;
+Stage-in off forces the complete selected window through the tiers; Pack off
+uses one-block transfer/rematerialization batches. These switches do not change
+retrieval scores, selected block IDs, or KV precision.
 
-The portable default is a 64 MiB slab. CPU-only `opt_2` prewarms two pinned D2H
-slabs (128 MiB), and `opt_3` adds two pinned gather/H2D slabs (128 MiB). A
+The portable default is a 64 MiB slab. Pack prewarms two pinned D2H slabs
+(128 MiB) and two pinned gather/H2D slabs (128 MiB). A
 reusable GPU staging slab adds at most 64 MiB and is shared by both directions.
-With SSD, `opt_2` instead prewarms at most 512 MiB pageable write staging at the
+With SSD, Pack prewarms at most 512 MiB pageable write staging at the
 default queue depth 8. It also prewarms four 64 MiB pinned write-through slabs:
 for the current model a 2048-token immutable-K+MTP chunk occupies about 68 MiB,
-so this is a two-chunk buffer. `opt_3` additionally uses the two pinned read
+so this is a two-chunk buffer. Pack additionally uses the two pinned read
 slabs per active read producer (two for CPU-only or SSD-only, four when CPU
 hits and SSD misses may coexist). After
 profiling a different host, override them with `QW3_KVMEM_IO_SLAB_MIB` and
@@ -90,29 +88,28 @@ profiling a different host, override them with `QW3_KVMEM_IO_SLAB_MIB` and
 remains bounded. CPU gather defaults to four worker threads and can be tuned
 from 1 through 16 with `QW3_KVMEM_CPU_GATHER_THREADS`. The SSD write-through
 pool can be tuned from two through sixteen slabs with
-`QW3_KVMEM_WRITEBACK_SLABS`, or disabled for a matched baseline with
-`QW3_KVMEM_PREFILL_WRITEBACK=0`. The completed D2H slab also feeds the existing
-heat-aware CPU cache by default; `QW3_KVMEM_PREFILL_CPU_ADMIT=0` is an
-SSD-only diagnostic mode.
+`QW3_KVMEM_WRITEBACK_SLABS`.
 
 The frozen ten-sample query-replay launcher accepts the same switch:
 
 ```bash
-KVMEM_OPT_LEVEL=kvmem_init TAG=query_replay_init \
+KVMEM_OPT_STAGE_OUT=off KVMEM_OPT_STAGE_IN=off KVMEM_OPT_PACK=off \
+  TAG=query_replay_all_off \
   scripts/kvmem_eval/run_longmemeval_m_query_replay10.sh
 
-KVMEM_OPT_LEVEL=opt_1 TAG=query_replay_opt1 \
+KVMEM_OPT_STAGE_OUT=on KVMEM_OPT_STAGE_IN=on KVMEM_OPT_PACK=on \
+  TAG=query_replay_all_on \
   scripts/kvmem_eval/run_longmemeval_m_query_replay10.sh
 ```
 
-Use `QW3_KVMEM_PERF_TRACE=1` for timed reselection stages. In `opt_1`, the
-server also emits `[kvmem-cache]` rows containing incoming CPU hit rate,
-admissions, rejected admissions, and evictions. In CPU-only `opt_2`, the trace
+Use `QW3_KVMEM_PERF_TRACE=1` for timed reselection stages. The server emits
+`[kvmem-cache]` rows containing incoming CPU hit rate,
+admissions, rejected admissions, and evictions. In CPU-only mode, the trace
 reports packed D2H batch count/bytes, exposed fence wait, and CPU scatter time;
 its SSD mode additionally reports clean-backing reuse and completed write
 bytes/syscalls. SSD mode also emits `[kvmem-writeback]` D2H-submit, SSD-submit,
 and SSD-complete events, including the D2H tail that remained exposed after the
-next prefill chunk. In `opt_3`, the trace reports CPU gather, packed H2D
+next prefill chunk. Pack-on reports CPU gather, packed H2D
 batch/enqueue/wait times; SSD mode additionally reports bulk read batches,
 positional-I/O syscalls, and read wait time.
 
@@ -242,22 +239,23 @@ orchestrator.
 
 ## Core performance ablation
 
-The production path enables Proactive Stage-out, Hierarchical Reuse, and
-Packed Rematerialization by default. A controlled run disables one group with
-the repeatable server option:
+The production path enables three orthogonal groups by default. Set each
+group explicitly to `on` or `off`:
 
 ```bash
---kvmem-optimize-off proactive-stage-out
---kvmem-optimize-off hierarchical-reuse
---kvmem-optimize-off packed-rematerialization
+--kvmem-opt-stage-out on
+--kvmem-opt-stage-in on
+--kvmem-opt-pack on
 ```
 
-`--kvmem-optimize-off all` disables all three groups. It cannot be combined
-with another value. The older `--kvmem-optimization-level` profiles are
-deprecated reproducibility modes and cannot be combined with the new option.
-Startup emits one `[kvmem-opt-status]` record per group; an unavailable
-requested optimization produces an explicit error instead of silently
-falling back.
+Stage-out controls proactive writeback and inclusive clean backing. Stage-in
+controls selected-window delta reuse, incremental rematerialization, and the
+heat-aware CPU policy. Pack controls cross-block D2H/H2D, persistent CPU
+workers, coalesced SSD I/O, and batched GPU scatter/re-RoPE. The removed
+`--kvmem-optimization-level` and `--kvmem-optimize-off` interfaces are not
+accepted. Startup emits one `[kvmem-opt-status]` record per group; an
+unavailable requested optimization produces an explicit error instead of
+silently falling back.
 
 Run the matched 512K single-sample matrix with:
 
@@ -265,16 +263,17 @@ Run the matched 512K single-sample matrix with:
 scripts/kvmem_eval/run_agentlongbench_perf_ab.sh
 ```
 
-The four sequential cells form a cumulative ablation:
+By default the script runs all eight `on|off` combinations. The following
+four-cell path is also reported as an ordered marginal ablation:
 
 ```text
 all-off
-  -> proactive-stage-out
-  -> proactive-stage-out + hierarchical-reuse
-  -> all-on (+ packed-rematerialization)
+  -> stage-out-only
+  -> no-pack (stage-out + stage-in)
+  -> all-on (+ pack)
 ```
 
-This makes each adjacent difference attributable to the newly enabled group.
+The full matrix also reveals interactions that an ordered path can hide.
 The cells use deterministic decoding by default and fail if an optimization
 changes the generated answer. `summarize_kvmem_perf_ablation.py` aggregates
 TTFT, stage-out, stage-in, assembly, total reselection time, GPU reuse, and

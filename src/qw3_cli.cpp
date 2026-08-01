@@ -155,13 +155,14 @@ void usage(std::ostream &os) {
         "  --kvmem-deltanet-topk-h N  TopKMean over DeltaNet heads. Default: 4.\n"
 #endif
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
-        "  --kvmem-optimization-level L  Deprecated cumulative compatibility profile:\n"
-        "                        kvmem_init|opt_1|opt_2|opt_3.\n"
-        "                        Cannot be combined with --kvmem-optimize-off.\n"
-        "  --kvmem-optimize-off NAME  Disable one default-on performance group.\n"
-        "                        Repeatable. NAME is proactive-stage-out,\n"
-        "                        hierarchical-reuse, packed-rematerialization,\n"
-        "                        or all. Default: none (all groups enabled).\n"
+        "  --kvmem-opt-stage-out on|off  Proactive lower-tier writeback and\n"
+        "                        clean backing. Default: on.\n"
+        "  --kvmem-opt-stage-in on|off  GPU selection-delta reuse, incremental\n"
+        "                        rematerialization, and heat-aware CPU policy.\n"
+        "                        Default: on.\n"
+        "  --kvmem-opt-pack on|off  Cross-block D2H/H2D packing, persistent CPU\n"
+        "                        workers, coalesced SSD I/O, and batched GPU\n"
+        "                        scatter/re-RoPE. Default: on.\n"
         "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
         "                        final user message (the question) instead of recency.\n"
         "                        Requires the serve layer to mark the query span.\n"
@@ -225,6 +226,12 @@ void usage(std::ostream &os) {
         "  --session-decode-tokens N  MTP decode probe length per turn. Default: 256.\n"
         "  --session-query-tokens N  Tail tokens used as retrieval query at each\n"
         "                        ladder point. 0 disables query/replay. Default: 32.\n"
+        "  --session-repeat-queries N  At each exact ladder checkpoint, issue N\n"
+        "                        additional queries without re-prefilling history.\n"
+        "                        0 keeps the legacy one-query path. Default: 0.\n"
+        "  --session-repeat-mode M  Repeated-query state: frozen restores the same\n"
+        "                        checkpoint before every query; sequential keeps\n"
+        "                        prior probe turns. Default: frozen.\n"
         "  --temp F              Decode-probe temperature. Default 0 (greedy);\n"
         "                        --temp>0 uses the Qwen3 sampled recipe.\n"
         "\n"
@@ -356,6 +363,8 @@ int main(int argc, char **argv) {
                                             2097152};
     int session_decode_tokens = 256;
     int session_query_tokens = 32;
+    int session_repeat_queries = 0;
+    std::string session_repeat_mode = "frozen";
 
     int arg_start = 1;
     if (argc > 1 && std::string(argv[1]) == "serve") {
@@ -634,33 +643,22 @@ int main(int argc, char **argv) {
                     throw std::runtime_error(
                         "--kvmem-update-mode must be interval|step");
                 }
-            } else if (arg == "--kvmem-optimization-level") {
-                engine.kvmem_optimization_level = need(arg);
-                engine.kvmem_optimization_level_explicit = true;
-                const std::string &level = engine.kvmem_optimization_level;
-                if (level != "kvmem_init" && level != "opt_1" &&
-                    level != "opt_2" && level != "opt_3") {
+            } else if (arg == "--kvmem-opt-stage-out" ||
+                       arg == "--kvmem-opt-stage-in" ||
+                       arg == "--kvmem-opt-pack") {
+                const std::string value = need(arg);
+                if (value != "on" && value != "off") {
                     throw std::runtime_error(
-                        "--kvmem-optimization-level must be "
-                        "kvmem_init|opt_1|opt_2|opt_3");
+                        arg + " must be on|off");
                 }
-            } else if (arg == "--kvmem-optimize-off") {
-                const std::string name = need(arg);
-                if (name != "proactive-stage-out" &&
-                    name != "hierarchical-reuse" &&
-                    name != "packed-rematerialization" &&
-                    name != "all") {
-                    throw std::runtime_error(
-                        "--kvmem-optimize-off must be "
-                        "proactive-stage-out|hierarchical-reuse|"
-                        "packed-rematerialization|all");
+                const bool enabled = value == "on";
+                if (arg == "--kvmem-opt-stage-out") {
+                    engine.kvmem_opt_stage_out = enabled;
+                } else if (arg == "--kvmem-opt-stage-in") {
+                    engine.kvmem_opt_stage_in = enabled;
+                } else {
+                    engine.kvmem_opt_pack = enabled;
                 }
-                bool duplicate = false;
-                for (const std::string &existing :
-                     engine.kvmem_optimize_off) {
-                    duplicate |= existing == name;
-                }
-                if (!duplicate) engine.kvmem_optimize_off.push_back(name);
             } else if (arg == "--kvmem-query-conditioned") {
                 engine.kvmem_query_conditioned = true;
             } else if (arg == "--no-kvmem-recompute-query") {
@@ -817,25 +815,22 @@ int main(int argc, char **argv) {
                     throw std::runtime_error(
                         "--session-query-tokens must be >= 0");
                 }
+            } else if (arg == "--session-repeat-queries") {
+                session_repeat_queries = parse_int(need(arg), arg);
+                if (session_repeat_queries < 0) {
+                    throw std::runtime_error(
+                        "--session-repeat-queries must be >= 0");
+                }
+            } else if (arg == "--session-repeat-mode") {
+                session_repeat_mode = need(arg);
+                if (session_repeat_mode != "frozen" &&
+                    session_repeat_mode != "sequential") {
+                    throw std::runtime_error(
+                        "--session-repeat-mode must be frozen|sequential");
+                }
             } else {
                 throw std::runtime_error("unknown argument: " + arg);
             }
-        }
-
-        if (engine.kvmem_optimization_level_explicit &&
-            !engine.kvmem_optimize_off.empty()) {
-            throw std::runtime_error(
-                "--kvmem-optimization-level is a deprecated compatibility "
-                "profile and cannot be combined with --kvmem-optimize-off");
-        }
-        bool optimize_all_off = false;
-        for (const std::string &name : engine.kvmem_optimize_off) {
-            optimize_all_off |= name == "all";
-        }
-        if (optimize_all_off && engine.kvmem_optimize_off.size() != 1) {
-            throw std::runtime_error(
-                "--kvmem-optimize-off all cannot be combined with another "
-                "--kvmem-optimize-off value");
         }
 
         if (inspect || dump_tensors) {
@@ -926,6 +921,9 @@ int main(int argc, char **argv) {
                 max_target +
                 static_cast<uint64_t>(session_decode_tokens) *
                     session_ladder.size() +
+                static_cast<uint64_t>(session_repeat_queries) *
+                    static_cast<uint64_t>(session_query_tokens +
+                                          session_decode_tokens) +
                 4096;
             if (engine.ctx_size <= 0 ||
                 static_cast<uint64_t>(engine.ctx_size) < need_ctx) {
@@ -935,6 +933,13 @@ int main(int argc, char **argv) {
             sess.ladder_tokens = session_ladder;
             sess.decode_tokens = session_decode_tokens;
             sess.query_tokens = session_query_tokens;
+            sess.repeat_queries = session_repeat_queries;
+            sess.repeat_mode = session_repeat_mode;
+            if (session_repeat_queries > 0 && session_query_tokens <= 0) {
+                throw std::runtime_error(
+                    "--session-repeat-queries requires "
+                    "--session-query-tokens > 0");
+            }
             if (session_query_tokens > 0) {
                 engine.kvmem_query_conditioned = true;
                 setenv("QW3_KVMEM_QUERY_REPLAY", "1", 1);

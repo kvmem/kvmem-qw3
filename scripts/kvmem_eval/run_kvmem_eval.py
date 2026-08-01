@@ -77,12 +77,12 @@ def parse_args() -> argparse.Namespace:
         "--adaptive-gain-2to4", type=float, default=0.06,
         help="minimum residual-reduction gain for adaptive 2->4 prototypes")
     ap.add_argument("--update-mode", choices=("step", "interval"), default="step")
-    ap.add_argument(
-        "--optimization-level",
-        choices=("default", "kvmem_init", "opt_1", "opt_2", "opt_3"),
-        default="kvmem_init",
-        help="monotonic KVMem storage/tiering profile used for matched A/B "
-             "runs; 'default' omits the deprecated compatibility flag")
+    ap.add_argument("--kvmem-opt-stage-out", choices=("on", "off"),
+                    default="on")
+    ap.add_argument("--kvmem-opt-stage-in", choices=("on", "off"),
+                    default="on")
+    ap.add_argument("--kvmem-opt-pack", choices=("on", "off"),
+                    default="on")
     ap.add_argument("--query-conditioned", action=argparse.BooleanOptionalAction,
                     default=True)
     ap.add_argument("--gpu-memory-ratio", type=float, default=0.5)
@@ -149,8 +149,11 @@ def build_commands(args: argparse.Namespace) -> tuple[list[str], list[str], Path
             "--kvmem-adaptive-gain-1to2", str(args.adaptive_gain_1to2),
             "--kvmem-adaptive-gain-2to4", str(args.adaptive_gain_2to4),
         ]
-    if args.optimization_level != "default":
-        server += ["--kvmem-optimization-level", args.optimization_level]
+    server += [
+        "--kvmem-opt-stage-out", args.kvmem_opt_stage_out,
+        "--kvmem-opt-stage-in", args.kvmem_opt_stage_in,
+        "--kvmem-opt-pack", args.kvmem_opt_pack,
+    ]
     if args.thinking:
         server.append("--enable-thinking")
     if args.mtp:

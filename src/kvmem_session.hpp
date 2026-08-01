@@ -3,6 +3,7 @@
 #include "qw3/qw3.hpp"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace qw3 {
@@ -25,6 +26,14 @@ struct KvMemSessionConfig {
     // block-aligned query replay at every above-budget ladder point. Zero keeps
     // the legacy fallback-score profiler.
     int query_tokens = 32;
+    // Optional milestone fan-out. When positive, each ladder target is first
+    // ingested with max_tokens=0 and captured at the exact target position.
+    // The harness then issues this many synthetic queries from that checkpoint.
+    // "frozen" restores the same checkpoint before every query; "sequential"
+    // lets queries observe earlier probe turns. In both modes the checkpoint is
+    // restored after the probes so the next ladder delta remains exact.
+    int repeat_queries = 0;
+    std::string repeat_mode = "frozen"; // frozen|sequential
     // Decode-probe sampling. Default is greedy (temp=0) for a stable
     // steady-state throughput probe; --temp/--top-p/--top-k route the Qwen3
     // sampled path (MTP is distribution-lossless under temp>0).

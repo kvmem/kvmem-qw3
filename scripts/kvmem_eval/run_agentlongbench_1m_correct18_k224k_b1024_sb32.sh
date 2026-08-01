@@ -40,6 +40,7 @@ exec env \
   EXPECTED=18 \
   BENCHMARK_NAME=AgentLongBench-1M-canonical-correct18-K224K-B1024-SB32Max \
   METHOD=kvmem_subblock_mean_k_k224k_g32k_b1024_sb32max_query_replay_immutable_refresh1_mtp4_fp8_t06_think8k_regression \
-  KVMEM_OPT_LEVEL= \
-  KVMEM_OPTIMIZE_OFF= \
+  KVMEM_OPT_STAGE_OUT=on \
+  KVMEM_OPT_STAGE_IN=on \
+  KVMEM_OPT_PACK=on \
   "$BASE"

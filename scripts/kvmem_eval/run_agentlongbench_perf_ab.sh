@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Single-sample, sequential cumulative ablation of the three paper-facing
-# KVMem performance optimizations. Every cell uses the same binary, data row,
-# model configuration, storage budget, and deterministic decoding parameters.
+# Single-sample 2x2x2 factorial ablation of the three paper-facing KVMem
+# performance optimizations. Every cell uses the same binary, data row, model
+# configuration, storage budget, and deterministic decoding parameters.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -23,26 +23,24 @@ SUMMARY_LOG="$LOG_ROOT/${TAG_PREFIX}_ablation.log"
 SUMMARY_JSON="$RESULTS_ROOT/${TAG_PREFIX}_performance_summary.json"
 SUMMARY_MD="$RESULTS_ROOT/${TAG_PREFIX}_performance_summary.md"
 
-# Optional comma-separated subset for quick reruns. The default order adds one
-# optimization group at a time:
-#   all-off
-#   + proactive-stage-out
-#   + hierarchical-reuse
-#   + packed-rematerialization (all-on)
-CELLS=${CELLS:-all-off,proactive-only,proactive-plus-reuse,all-on}
+# Optional comma-separated subset for quick reruns. The default covers all
+# eight combinations. The cumulative path
+# all-off -> stage-out-only -> no-pack -> all-on remains available for ordered
+# marginal comparisons, while the other four cells expose interactions.
+CELLS=${CELLS:-all-off,stage-out-only,stage-in-only,pack-only,no-stage-out,no-stage-in,no-pack,all-on}
 
 mkdir -p "$LOG_ROOT" "$RESULTS_ROOT"
 
-cell_optimize_off() {
+cell_switches() {
   case "$1" in
-    all-off) printf '%s' "all" ;;
-    proactive-only)
-      printf '%s' "hierarchical-reuse,packed-rematerialization"
-      ;;
-    proactive-plus-reuse)
-      printf '%s' "packed-rematerialization"
-      ;;
-    all-on) printf '%s' "" ;;
+    all-off) printf '%s' "off off off" ;;
+    stage-out-only) printf '%s' "on off off" ;;
+    stage-in-only) printf '%s' "off on off" ;;
+    pack-only) printf '%s' "off off on" ;;
+    no-stage-out) printf '%s' "off on on" ;;
+    no-stage-in) printf '%s' "on off on" ;;
+    no-pack) printf '%s' "on on off" ;;
+    all-on) printf '%s' "on on on" ;;
     *)
       echo "unknown ablation cell: $1" >&2
       return 2
@@ -52,8 +50,8 @@ cell_optimize_off() {
 
 run_cell() {
   local cell=$1
-  local optimize_off
-  optimize_off=$(cell_optimize_off "$cell")
+  local stage_out stage_in pack
+  read -r stage_out stage_in pack <<<"$(cell_switches "$cell")"
   local tag="${TAG_PREFIX}_${cell}"
   local gpu_log="$LOG_ROOT/${tag}_gpu.csv"
   local monitor_pid=""
@@ -81,7 +79,7 @@ run_cell() {
   ) >"$gpu_log" 2>&1 &
   monitor_pid=$!
 
-  echo "[$(date --iso-8601=seconds)] START cell=$cell tag=$tag optimize_off=${optimize_off:-none}" |
+  echo "[$(date --iso-8601=seconds)] START cell=$cell tag=$tag stage_out=$stage_out stage_in=$stage_in pack=$pack" |
     tee -a "$SUMMARY_LOG"
   env \
     -u QW3_KVMEM_PREFILL_WRITEBACK \
@@ -99,8 +97,9 @@ run_cell() {
     TAG="$tag" \
     KV_DTYPE="$KV_DTYPE" \
     PREFILL_CHUNK="$PREFILL_CHUNK" \
-    KVMEM_OPT_LEVEL= \
-    KVMEM_OPTIMIZE_OFF="$optimize_off" \
+    KVMEM_OPT_STAGE_OUT="$stage_out" \
+    KVMEM_OPT_STAGE_IN="$stage_in" \
+    KVMEM_OPT_PACK="$pack" \
     KVMEM_BUDGET="$KVMEM_BUDGET" \
     GEN_BUDGET="$GEN_BUDGET" \
     TEMP="$TEMP" \

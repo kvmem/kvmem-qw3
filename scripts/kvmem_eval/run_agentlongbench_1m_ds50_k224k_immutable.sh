@@ -33,9 +33,10 @@ export METHOD=${METHOD:-kvmem_mean_k_k224k_g32k_b32_query_replay_immutable_mtp4_
 export LIMIT=${LIMIT:-50}
 export EXPECTED=${EXPECTED:-50}
 
-# Empty selectors mean the paper-facing performance optimizations are all on.
-export KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-}
-export KVMEM_OPTIMIZE_OFF=${KVMEM_OPTIMIZE_OFF:-}
+# Paper-facing performance optimizations default to all on.
+export KVMEM_OPT_STAGE_OUT=${KVMEM_OPT_STAGE_OUT:-on}
+export KVMEM_OPT_STAGE_IN=${KVMEM_OPT_STAGE_IN:-on}
+export KVMEM_OPT_PACK=${KVMEM_OPT_PACK:-on}
 
 # The DeepSeek CompactOnly, Compact+RAG, and sliding-window baselines all use
 # the same ordered 50 IDs. They are exactly the first 50 IDs of the frozen

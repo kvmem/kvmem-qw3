@@ -23,7 +23,9 @@ GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.51}
 CPU_GB=${CPU_GB:-66}
 NVME_GB=${NVME_GB:-256}
 NVME_DIR=${NVME_DIR:-/tmp/qw3_kvmem_eval_nvme_${TAG}}
-KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-opt_1}
+KVMEM_OPT_STAGE_OUT=${KVMEM_OPT_STAGE_OUT:-off}
+KVMEM_OPT_STAGE_IN=${KVMEM_OPT_STAGE_IN:-on}
+KVMEM_OPT_PACK=${KVMEM_OPT_PACK:-off}
 THINKING_BUDGET=${THINKING_BUDGET:-4096}
 
 JUDGE_ARGS=()
@@ -70,7 +72,9 @@ env \
     --budget "$KVMEM_BUDGET" --gen-budget "$GEN_BUDGET" \
     --sink-blocks 8 --recent-blocks 0 \
     --method retrieval --retrieval-method mean-k --update-mode step \
-    --optimization-level "$KVMEM_OPT_LEVEL" \
+    --kvmem-opt-stage-out "$KVMEM_OPT_STAGE_OUT" \
+    --kvmem-opt-stage-in "$KVMEM_OPT_STAGE_IN" \
+    --kvmem-opt-pack "$KVMEM_OPT_PACK" \
     --query-conditioned --gpu-memory-ratio "$GPU_MEMORY_RATIO" \
     --cpu-gb "$CPU_GB" --nvme-gb "$NVME_GB" --nvme-dir "$NVME_DIR" \
     --server-extra-arg=--kvmem-immutable-k \

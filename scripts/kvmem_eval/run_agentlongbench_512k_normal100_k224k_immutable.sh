@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # AgentLongBench-Long fixed 512K normal100 with ordinary KVMem + MTP-4.
-# The default storage profile enables all three paper-facing optimizations:
-# proactive-stage-out, hierarchical-reuse, and packed-rematerialization.
-# KVMEM_OPTIMIZE_OFF is an optional comma-separated launcher convenience that
-# expands to repeatable --kvmem-optimize-off arguments. KVMEM_OPT_LEVEL remains
-# available only to reproduce a deprecated cumulative legacy profile and cannot
-# be combined with KVMEM_OPTIMIZE_OFF. Query replay, immutable source K, and
-# MTP-4 are explicit; DeltaNet rebuilt-state state is deliberately absent.
+# The three orthogonal performance optimizations default to on and can be
+# controlled independently with KVMEM_OPT_STAGE_OUT/STAGE_IN/PACK=on|off.
+# Query replay, immutable source K, and MTP-4 are explicit; DeltaNet
+# rebuilt-state state is deliberately absent.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -14,8 +11,9 @@ PORT=${PORT:-8087}
 CTX=${CTX:-655360}
 CPU_GB=${CPU_GB:-64}
 NVME_GB=${NVME_GB:-0}
-KVMEM_OPT_LEVEL=${KVMEM_OPT_LEVEL:-}
-KVMEM_OPTIMIZE_OFF=${KVMEM_OPTIMIZE_OFF:-}
+KVMEM_OPT_STAGE_OUT=${KVMEM_OPT_STAGE_OUT:-on}
+KVMEM_OPT_STAGE_IN=${KVMEM_OPT_STAGE_IN:-on}
+KVMEM_OPT_PACK=${KVMEM_OPT_PACK:-on}
 KVMEM_BUDGET=${KVMEM_BUDGET:-229376}
 GEN_BUDGET=${GEN_BUDGET:-32768}
 KVMEM_BLOCK_TOKENS=${KVMEM_BLOCK_TOKENS:-32}
@@ -124,10 +122,18 @@ if [[ "$NVME_GB" != "0" && "$NVME_GB" != "0.0" ]]; then
 fi
 
 optimization_args=()
-if [[ -n "$KVMEM_OPT_LEVEL" && -n "$KVMEM_OPTIMIZE_OFF" ]]; then
-  echo "KVMEM_OPT_LEVEL and KVMEM_OPTIMIZE_OFF are mutually exclusive" >&2
-  exit 2
-fi
+for opt_value in \
+  "$KVMEM_OPT_STAGE_OUT" "$KVMEM_OPT_STAGE_IN" "$KVMEM_OPT_PACK"; do
+  if [[ "$opt_value" != "on" && "$opt_value" != "off" ]]; then
+    echo "KVMem optimization values must be on|off, got: $opt_value" >&2
+    exit 2
+  fi
+done
+optimization_args+=(
+  --kvmem-opt-stage-out "$KVMEM_OPT_STAGE_OUT"
+  --kvmem-opt-stage-in "$KVMEM_OPT_STAGE_IN"
+  --kvmem-opt-pack "$KVMEM_OPT_PACK"
+)
 
 retrieval_args=(
   --kvmem-retrieval-method "$KVMEM_RETRIEVAL_METHOD"
@@ -147,29 +153,6 @@ if [[ "$KVMEM_RETRIEVAL_METHOD" == "key-direction-adaptive" ]]; then
     --kvmem-adaptive-gain-2to4 "$KVMEM_ADAPTIVE_GAIN_2TO4"
   )
 fi
-if [[ -n "$KVMEM_OPT_LEVEL" ]]; then
-  case "$KVMEM_OPT_LEVEL" in
-    kvmem_init|opt_1|opt_2|opt_3) ;;
-    *)
-      echo "invalid legacy KVMEM_OPT_LEVEL: $KVMEM_OPT_LEVEL" >&2
-      exit 2
-      ;;
-  esac
-  optimization_args+=(--kvmem-optimization-level "$KVMEM_OPT_LEVEL")
-elif [[ -n "$KVMEM_OPTIMIZE_OFF" ]]; then
-  IFS=',' read -r -a optimize_off_names <<<"$KVMEM_OPTIMIZE_OFF"
-  for name in "${optimize_off_names[@]}"; do
-    case "$name" in
-      proactive-stage-out|hierarchical-reuse|packed-rematerialization|all) ;;
-      *)
-        echo "invalid KVMEM_OPTIMIZE_OFF entry: $name" >&2
-        exit 2
-        ;;
-    esac
-    optimization_args+=(--kvmem-optimize-off "$name")
-  done
-fi
-
 limit_args=()
 if [[ -n "$LIMIT" && -n "$QUESTION_IDS" ]]; then
   echo "LIMIT and QUESTION_IDS are mutually exclusive" >&2

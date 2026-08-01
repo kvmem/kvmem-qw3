@@ -64,7 +64,9 @@ run_cell() {
     TAG="$tag" \
     KV_DTYPE="$dtype" \
     PREFILL_CHUNK="$chunk" \
-    KVMEM_OPT_LEVEL=opt_3 \
+    KVMEM_OPT_STAGE_OUT=on \
+    KVMEM_OPT_STAGE_IN=on \
+    KVMEM_OPT_PACK=on \
     CPU_GB="$CPU_GB" \
     NVME_GB=0 \
     QUESTION_IDS="$QUESTION_IDS" \

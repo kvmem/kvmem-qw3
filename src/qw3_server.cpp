@@ -1553,19 +1553,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         setenv_value("QW3_CONTINUOUS_BATCHING_MTP_KV_POOL_PAGES", cfg.mtp_kv_pool_pages);
     }
 
-    std::string kvmem_optimize_off = "none";
-    if (!engine.kvmem_optimize_off.empty()) {
-        kvmem_optimize_off.clear();
-        for (const std::string &name : engine.kvmem_optimize_off) {
-            if (!kvmem_optimize_off.empty()) kvmem_optimize_off += ",";
-            kvmem_optimize_off += name;
-        }
-    }
-    const char *kvmem_performance_mode =
-        engine.kvmem_optimization_level_explicit
-            ? "legacy"
-            : (engine.kvmem_optimize_off.empty()
-                   ? "default-all-on" : "feature-ablation");
+    const bool kvmem_all_optimizations =
+        engine.kvmem_opt_stage_out &&
+        engine.kvmem_opt_stage_in &&
+        engine.kvmem_opt_pack;
     const KvMemKeepAllocation kvmem_keep =
         resolve_kvmem_keep_allocation(
             static_cast<uint32_t>(std::max(1, engine.kvmem_block_tokens)),
@@ -1646,13 +1637,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_budget=" << engine.kvmem_budget << "\n"
               << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
               << "  kvmem_performance_mode="
-              << kvmem_performance_mode << "\n"
-              << "  kvmem_optimization_level="
-              << engine.kvmem_optimization_level
-              << (engine.kvmem_optimization_level_explicit
-                      ? "(legacy-explicit)" : "(common-infrastructure)")
+              << (kvmem_all_optimizations
+                      ? "all-on" : "factorial-ablation")
               << "\n"
-              << "  kvmem_optimize_off=" << kvmem_optimize_off << "\n"
+              << "  kvmem_opt_stage_out="
+              << yesno(engine.kvmem_opt_stage_out) << "\n"
+              << "  kvmem_opt_stage_in="
+              << yesno(engine.kvmem_opt_stage_in) << "\n"
+              << "  kvmem_opt_pack="
+              << yesno(engine.kvmem_opt_pack) << "\n"
               << "  kvmem_query_conditioned="
               << yesno(engine.kvmem_query_conditioned) << "\n"
               << "  kvmem_recompute_query="

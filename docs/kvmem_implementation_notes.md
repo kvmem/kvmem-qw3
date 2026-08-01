@@ -20,6 +20,14 @@ arguments, limitations, and paper-relevant interpretation of the implementation.
 > control, complete implemented-optimization inventory, raw artifact paths,
 > and reproduction commands are maintained in
 > `docs/kvmem_performance_evaluation_20260726.md`.
+>
+> **Adaptive retrieval-index record:** Section 4.9 defines the retrieval
+> semantics of direction-adaptive multi-prototype indexing. CPU/GPU index
+> placement, one-pass scoring, incremental GPU upload, controlled 1M
+> measurements, and implementation-specific performance tuning are maintained
+> separately in `docs/kvmem_adaptive_index_optimization_20260730.md`; the
+> preceding placement baseline is preserved in
+> `docs/kvmem_adaptive_index_placement_ab_20260730.md`.
 
 The implementation is centered around three ideas:
 
@@ -44,8 +52,9 @@ The most important implementation files are:
 - `src/qwen_executor.cpp`: executor integration, query capture, mean-key index
   construction, retrieval scoring, window assembly, re-RoPE, stage-in/out, and
   tiered I/O orchestration.
-- `src/kernels_cuda.cu`: CUDA kernels for mean-key construction, softmax-over-page
-  retrieval scoring, exact-mass scoring, de-RoPE, and batched re-RoPE.
+- `src/kernels_cuda.cu`: CUDA kernels for mean-key and adaptive directional
+  prototype construction, prototype/page softmax retrieval scoring, exact-mass
+  scoring, de-RoPE, and batched re-RoPE.
 - `include/qw3/pinned_kv_tier.hpp`: CPU-tier metadata, heat-aware/LRU admission,
   and logical slot allocator; immutable mode may back those slots with sparse
   pageable slabs rather than pinning the entire tier.
@@ -170,7 +179,17 @@ The configuration includes:
   unconditionally.
 - `select_method`: retrieval, H2O/profile, or recency.
 - `select_policy`: top-k or quota.
-- `retrieval_method`: `mean-k` or `per-token`.
+- `retrieval_method`: `mean-k`, `per-token`, `sub-block-mean-k`,
+  `key-direction-fixed4`, or `key-direction-adaptive` at the public
+  configuration surface. The two Key-direction modes use the SubBlockMeanK
+  scorer family with a distinct `prototype_mode`.
+- `n_subblocks` and `subblock_reduce`: contiguous sub-block count and
+  sum/MaxSim reduction for SubBlockMeanK.
+- `adaptive_gain_1to2` and `adaptive_gain_2to4`: relative residual-gain
+  thresholds for Adaptive prototype counts.
+- `index_placement` and `adaptive_score_mode`: GPU/CPU packed-index placement
+  and layer-one-pass/tiled scoring policy. These change capacity and execution,
+  not retrieval semantics.
 - `update_mode`: interval or step.
 - GPU memory ratio and watermarks.
 - estimated GPU block capacity and block byte size.
@@ -201,8 +220,8 @@ The implementation uses these scheduling/update points:
 
 1. Before or during prefill:
    - Query-conditioned spans can be registered with `kvmem_set_query_span`.
-   - The executor allocates query and mean-key buffers for the expected prompt
-     length.
+   - The executor allocates query capture and Mean-K or Adaptive index state for
+     the expected prompt length.
    - If a new turn resumes an already sparse session, the inherited semantic
      window is normalized through `kvmem_prepare_prefill_window` before the
      first new token is evaluated.
@@ -210,7 +229,8 @@ The implementation uses these scheduling/update points:
    - Newly written tokens are registered into `KvMemStore` through
      `kvmem_register_until` / `kvmem_register_append`.
    - Query rows inside the marked question span are captured and de-RoPEd.
-   - Per-block content mean keys are captured from freshly produced K batches.
+   - Content-frame means or Adaptive directional prototype candidates are
+     captured from freshly produced K batches.
    - If a bounded GPU pool is close to exhaustion, KVMem triggers a deterministic
      in-prefill pressure selection/offload through
      `kvmem_maybe_prefill_offload`.
@@ -316,7 +336,7 @@ For method writing, this is the key argument:
 > the bounded-GPU invariant during very long prompt ingestion. Semantic
 > retrieval is reserved for the prefill-to-decode boundary.
 
-## 4. KV-Native Mean-K Retrieval
+## 4. KV-Native Mean-Key and Adaptive Prototype Retrieval
 
 ### 4.1 Problem
 
@@ -416,9 +436,12 @@ same content frame as the mean-key index. The captured buffer layout is:
 g_query_multi_[layer_slot, query_token, query_head, head_dim]
 ```
 
-The query span is capped at 512 tokens in the current implementation. The cap is
-a practical bound on retrieval overhead and memory. For most question-conditioned
-agent steps, the final user question is short relative to the context.
+The current implementation captures the complete marked query span. On the
+default CUDA Mean-K/Adaptive path, query rows are stored in FP16. Queries that
+fit the bounded scoring stage remain on GPU; a longer span is kept in pageable
+host memory and scored in bounded token chunks (256 tokens by default). Chunk
+scores accumulate into the same block-score buffer, so query streaming changes
+capacity and transfer scheduling rather than retrieval semantics.
 
 #### 4.4.1 Message-role policy and planned API metadata (2026-07-15)
 
@@ -610,7 +633,11 @@ The implementation exposes two main controls:
 - smaller `block_tokens`, which reduces dilution but increases block count,
 - larger `select_budget`, which keeps more candidate blocks.
 
-The per-token exact-mass method is a stronger but heavier alternative.
+The implementation now also exposes a middle point between one mean per
+32-token slice and full per-token ExactMass:
+`--kvmem-retrieval-method key-direction-adaptive`. It retains one, two, or four
+directional prototypes per slice and is detailed in Section 4.9. The per-token
+exact-mass method remains the stronger but heavier alternative.
 
 For paper writing, it is worth distinguishing:
 
@@ -622,7 +649,529 @@ This distinction is supported by the current evaluation notes in
 `docs/kvmem_utility_eval_plan.md`: all-block KVMem matches full-context behavior
 much more closely, while aggressive budget cuts expose retrieval recall limits.
 
-### 4.9 Fallbacks
+### 4.9 Adaptive Key-Direction Semantic Segmentation
+
+#### 4.9.1 Purpose and exact scope
+
+The contiguous sub-block Mean-K path reduces mean dilution by representing a
+large physical retrieval block with one mean for each contiguous 32-token
+slice. It still compresses every such slice to a single direction. If the slice
+contains several unrelated Key directions, its arithmetic mean can cancel or
+weaken a sparse direction that is highly relevant to the query.
+
+The current `key-direction-adaptive` path replaces that one-vector summary with
+a variable number of directional prototypes:
+
+```text
+physical retrieval block
+    -> contiguous 32-token slices
+    -> non-contiguous Key-direction groups inside each slice
+    -> 1, 2, or 4 retained prototype means per slice
+    -> packed per-layer retrieval index
+    -> prototype softmax and logical-block MaxSim
+```
+
+The term "semantic segmentation" has a specific operational meaning here. The
+method does not parse text, predict message boundaries, or produce contiguous
+semantic spans. Instead, it groups tokens whose model-internal content-frame
+Keys point in similar directions. These latent groups may be non-contiguous
+within the 32-token slice. A precise paper-facing name is therefore
+**adaptive Key-direction segmentation** or **latent Key-space semantic
+segmentation**, rather than generic text segmentation.
+
+This mechanism is also different from KVMem's separate `round` and `message`
+semantic-expansion modes. Adaptive Key-direction v1 does not currently compose
+with those modes.
+
+#### 4.9.2 Three levels of granularity
+
+It is important not to conflate three distinct units:
+
+1. **Physical/retrieval block.** This is the unit selected by the host policy
+   and transferred by stage-in/stage-out. Its size is `block_tokens`.
+2. **Directional slice.** Every physical block is divided into contiguous
+   32-token slices. Direction discovery is local to one slice.
+3. **Directional prototype.** A slice retains `P in {1, 2, 4}` prototype rows.
+   Each prototype row contains one vector for every KV head.
+
+For a full block of `B` tokens:
+
+```text
+num_slices = B / 32
+prototype_rows_per_layer_per_block =
+    sum over slices s of P[l, block, s]
+```
+
+Therefore a full 512-token block has 16 directional slices and between 16 and
+64 prototype rows per normal-attention layer. Selection and tier movement still
+operate on the 512-token physical block; the prototypes only refine its
+retrieval score.
+
+The implementation requires:
+
+```text
+block_tokens >= 32
+block_tokens % 32 == 0
+subblock_reduce == max
+```
+
+Although the configuration reserves a fixed-four upper bound,
+`(block_tokens / 32) * 4`, Adaptive persistent storage is variable length and
+contains only the selected rows.
+
+#### 4.9.3 Content-frame Key capture
+
+Direction discovery runs independently for every:
+
+```text
+(normal-attention layer, physical block, 32-token slice, KV head)
+```
+
+When a prefill chunk produces fresh FP32 `k_batch` rows, the adaptive capture
+kernel de-RoPEs each Key at the position at which it was baked:
+
+```text
+k_tilde[l,t,g] = deRoPE(K[l,t,g], position_t)
+```
+
+Dimensions outside `rope_dim` pass through unchanged. The resulting
+`k_tilde` vectors are position-independent content Keys, so clustering does not
+change when a selected block is later re-RoPEd to another compact-window
+position. Query capture applies the corresponding de-RoPE operation to Q,
+placing query vectors and prototypes in the same content frame.
+
+Adaptive capture is incremental across prefill chunks, but the current v1
+requires the indexed suffix to begin on a physical-block boundary. A mid-block
+adaptive merge is deliberately rejected rather than approximated. The last
+block and its last slice may be shorter than the configured full sizes.
+
+#### 4.9.4 Deterministic farthest-first direction discovery
+
+For one layer, slice, and KV head, let:
+
+```text
+K = {k_1, ..., k_n},  n <= 32
+```
+
+denote the de-RoPEd content Keys. Cosine similarity is used to discover
+directions:
+
+```text
+cos(a, b) = (a^T b) / (||a||_2 ||b||_2)
+```
+
+The first step computes the arithmetic slice mean:
+
+```text
+k_mean = (1 / n) * sum_t k_t
+```
+
+The first seed is not `k_mean` itself. It is the observed token Key whose
+direction is closest to the mean direction:
+
+```text
+s_1 = argmax_t cos(k_t, k_mean)
+```
+
+This makes the first seed a deterministic medoid-like observed direction while
+the `P=1` stored candidate remains the exact full-slice mean.
+
+Each later seed is chosen by farthest-first traversal. Given the current seed
+set `{s_1, ..., s_{j-1}}`, the kernel chooses the token whose nearest-seed
+cosine is smallest:
+
+```text
+s_j =
+    argmin_{t not already selected}
+    max_{r < j} cos(k_t, k_{s_r})
+```
+
+After adding a seed, every token retains the index and cosine of its closest
+seed. The procedure adds seed 2, then seeds 3 and 4. It is deterministic for a
+fixed input and preferentially exposes Key directions that are poorly covered
+by the directions already selected.
+
+This is not iterative k-means:
+
+- there is no random initialization;
+- there is no Lloyd iteration;
+- assignments are made against the observed seed directions;
+- the resulting cluster means are not fed back into another assignment pass.
+
+For method writing, "deterministic farthest-first spherical partitioning
+followed by mean aggregation" is more accurate than "adaptive k-means."
+
+#### 4.9.5 Nested `P=1`, `P=2`, and `P=4` candidates
+
+The kernel materializes three candidate representations for every slice:
+
+```text
+candidate row 0     : one exact full-slice mean
+candidate rows 1-2 : two means under the first two seeds
+candidate rows 3-6 : four means under all four seeds
+```
+
+This produces seven temporary rows:
+
+```text
+1 + 2 + 4 = 7
+```
+
+For `P=2` and `P=4`, token assignment is:
+
+```text
+a_P(t) = argmax_{j <= P} cos(k_t, k_{s_j})
+```
+
+and the stored prototype for direction group `j` is the exact arithmetic mean
+of the unnormalized content Keys assigned to it:
+
+```text
+C_{P,j} = {t : a_P(t) = j}
+
+c_{P,j} =
+    (1 / |C_{P,j}|) * sum_{t in C_{P,j}} k_t
+```
+
+Cosine-normalized directions are used only for seeding and assignment. The
+stored prototype is not unit-normalized because the retrieval scorer should
+retain the magnitude information in the attention-space Key mean. Prototype
+storage normally uses FP16; candidate construction, norms, residuals, dot
+accumulation, softmax statistics, and final score accumulation use FP32.
+
+The partitions are independent across KV heads. Prototype ordinal `j` for two
+different KV heads need not describe the same token subset. However, one
+prototype row stores the `j`-th vector for all KV heads, so all heads in one
+layer/slice must share the same selected prototype count `P`.
+
+#### 4.9.6 Cosine residual and hierarchical gain rule
+
+For each candidate count `P in {1, 2, 4}`, the capture kernel measures how well
+the selected seed directions cover the tokens:
+
+```text
+E_P[l,b,s,g] =
+    (1 / n) * sum_t
+    (1 - max_{j <= P} cos(k_t, k_{s_j}))
+```
+
+The implementation clamps numerical overshoot so each contribution is
+nonnegative. Empty slices in a partial block are marked with residual `-1` and
+are not added to the persistent index.
+
+A subtle but important detail is that `E_P` is a residual to the selected
+**seed directions**, not a reconstruction loss to the final prototype means.
+The seeds define the directional coverage criterion; the means define the
+stored retrieval representation.
+
+For every layer and slice, the host computes two relative residual reductions:
+
+```text
+G_1to2 =
+    max over KV heads g of
+    (E_1[g] - E_2[g]) / max(E_1[g], epsilon)
+
+G_2to4 =
+    max over KV heads g of
+    (E_2[g] - E_4[g]) / max(E_2[g], epsilon)
+
+epsilon = 1e-8
+```
+
+The maximum over KV heads is conservative: if any head has a direction that is
+substantially under-represented, the layer/slice retains the larger common
+prototype count.
+
+The hierarchical selection rule is:
+
+```text
+P = 1
+
+if G_1to2 >= tau_12:
+    P = 2
+    if G_2to4 >= tau_24:
+        P = 4
+```
+
+The defaults are:
+
+```text
+tau_12 = 0.10
+tau_24 = 0.06
+```
+
+Consequently:
+
+- the implementation selects only `1`, `2`, or `4`, never `3`;
+- `P=4` is considered only after the `1 -> 2` gain passes;
+- homogeneous slices remain at one mean;
+- slices with one additional useful direction retain two means;
+- slices with additional residual structure retain four means.
+
+This is best described as a **hierarchical relative residual-gain rule**. It
+models diminishing returns through staged gain tests and a lower second-stage
+threshold. It does not explicitly divide gain by the number of added
+prototypes: the `2 -> 4` transition adds two rows at once.
+
+#### 4.9.7 Host compaction and persistent packed index
+
+Candidate and residual tensors are bounded scratch for one prefill chunk and
+one normal-attention layer:
+
+```text
+candidates:
+    [chunk_block, slice, 7 candidate rows, KV head, head_dim]
+
+residuals:
+    [chunk_block, slice, KV head, {E_1, E_2, E_4}]
+```
+
+The scratch is reused by the next layer. After the capture kernel completes,
+the executor:
+
+1. synchronizes the completed layer because the scratch will be reused;
+2. copies its candidate rows and residuals to host;
+3. computes `G_1to2`, `G_2to4`, and the common `P`;
+4. copies only the corresponding `1`, `2`, or `4` candidate rows into the
+   layer's appendable canonical vector;
+5. records each prototype row's parent physical block;
+6. records variable `block_offset` and `block_count` metadata;
+7. marks the adaptive index dirty and publishes the new suffix according to
+   the configured index placement.
+
+The persistent representation is therefore:
+
+```text
+layer_values[layer][packed prototype row][KV head][head_dim]
+layer_parent[layer][packed prototype row] -> physical block
+block_offset[layer, block]                -> first prototype row
+block_count[layer, block]                 -> number of prototype rows
+```
+
+For a full block with `S = block_tokens / 32` slices:
+
+```text
+S <= block_count[layer, block] <= 4S
+```
+
+This packed layout is the main efficiency benefit of adaptivity relative to
+Fixed-4: the temporary builder always evaluates the bounded seven-row candidate
+set, but persistent capacity and online scoring scale with the prototypes that
+survive the gain rule.
+
+#### 4.9.8 Query-conditioned prototype scoring
+
+At a reselection boundary, each captured query vector competes against every
+included prototype from the corresponding normal-attention layer. Let:
+
+- `l` be a normal-attention layer;
+- `m` be a captured query token;
+- `h` be a query head;
+- `g(h)` be the KV head serving query head `h`;
+- `c[l,b,r,g(h)]` be prototype `r` belonging to physical block `b`;
+- `A_l` be all prototypes of the retrievable candidate blocks in layer `l`.
+
+The scorer computes attention-temperature logits:
+
+```text
+z[l,m,h,b,r] =
+    q[l,m,h]^T c[l,b,r,g(h)] / sqrt(head_dim)
+```
+
+It then forms one global prototype distribution for every
+`(layer, query token, query head)`:
+
+```text
+pi[l,m,h,b,r] =
+    exp(z[l,m,h,b,r])
+    / sum over (b',r') in A_l of exp(z[l,m,h,b',r'])
+```
+
+The softmax denominator is over prototypes, not first over blocks and not
+independently inside each 32-token slice. When the request is over budget, the
+always-kept sink and recent bands are excluded from the competitive denominator
+as long as a non-empty retrievable middle remains. The host selector preserves
+those bands independently.
+
+For each physical block, the scorer performs a document-side MaxSim over all
+of that block's prototypes from all of its 32-token slices:
+
+```text
+mass[l,m,h,b] =
+    max over r belonging to block b of pi[l,m,h,b,r]
+```
+
+The final score is:
+
+```text
+score[b] =
+    sum over query tokens m
+    mean over normal-attention layers l
+    mean over query heads h
+    mass[l,m,h,b]
+```
+
+The implementation sums rather than averages over query tokens. Every block in
+one request sees the same query length, so the common factor does not affect its
+within-request ranking.
+
+This reduction is deliberately MaxSim rather than prototype-mass summation. A
+block wins when at least one of its latent directions matches the query
+strongly; unrelated directions in the same block do not average that match
+away, and multiple mediocre directions are not simply added to overwhelm one
+strong direction in another block. Algebraically:
+
+```text
+max_r softmax(z_r)
+    = exp(max_r z_r - row_max) / sum_r' exp(z_r' - row_max)
+```
+
+so the CUDA scorer can find a block's maximum logit and emit one exponential
+per block/distribution after computing the exact global log-sum-exp.
+
+#### 4.9.9 End-to-end control flow
+
+The complete online path is:
+
+```text
+configure key-direction-adaptive
+    -> require 32-token-aligned block geometry and Max reduction
+    -> pre-size per-layer adaptive metadata
+
+for each aligned prefill chunk:
+    for each normal-attention layer:
+        consume freshly produced FP32 K rows
+        -> de-RoPE into the content frame
+        -> build 1/2/4 farthest-first candidates per 32-token slice/head
+        -> compute E_1/E_2/E_4
+        -> copy bounded layer scratch to host
+        -> choose P from relative residual gains
+        -> append selected means to the packed canonical layer index
+        -> publish/upload the dirty layer suffix when GPU placement is active
+
+during the marked query span:
+    capture and de-RoPE Q for every normal-attention layer/query head
+
+at semantic reselection:
+    finalize only outstanding adaptive index state
+    -> mask always-kept bands from competitive scoring
+    -> per layer/query token/query head:
+         dot against included prototypes
+         global softmax over prototypes
+         MaxSim-reduce prototypes to physical blocks
+    -> sum query-token contributions and average layer/head contributions
+    -> copy one score per physical block to host
+    -> run the unchanged global physical-block selector
+    -> stage in selected physical blocks
+    -> assemble and re-RoPE the selected attention window
+```
+
+The semantic choice of prototypes is made while the Keys are available during
+prefill. The later CPU/GPU index-placement choice changes where packed rows
+reside and how they are staged, but not which prototypes exist or how scores
+are defined.
+
+#### 4.9.10 GPU and CPU index placement
+
+Adaptive indexing has two production placements:
+
+- **GPU placement:** appendable host vectors remain the canonical construction
+  state, while each normal-attention layer has a growable GPU arena. Dirty
+  suffixes are uploaded incrementally after capture and can overlap later
+  prefill. Query-time finalization normally publishes only small metadata.
+- **CPU placement:** pageable host memory remains authoritative. At scoring
+  time, bounded layer-sized slots stage the index to GPU. Dot products,
+  softmax, and MaxSim still execute on GPU; this is CPU index capacity, not a
+  pure CPU retrieval scorer.
+
+The preferred layer-one-pass scorer stores a bounded logits batch, evaluates
+each staged prototype dot once, computes the exact layer softmax, and reduces
+prototype matches into block scores before reusing the layer slot. The
+tiled-two-pass path is retained as a compatibility fallback. GQA-specialized
+kernels reuse each KV-head prototype across its associated query heads.
+
+These placement/scorer optimizations preserve retrieval semantics. Their
+controlled results, including exact selected-block agreement between CPU and
+GPU placement, are recorded in
+`docs/kvmem_adaptive_index_optimization_20260730.md`.
+
+#### 4.9.11 Complexity and capacity
+
+Let:
+
+- `L` be the number of normal-attention layers;
+- `S` be the total number of non-empty 32-token slices;
+- `P[l,s] in {1,2,4}` be the selected count;
+- `N = sum_l sum_s P[l,s]` be total persistent prototype rows;
+- `H_kv`, `H_q`, and `d` be KV heads, query heads, and head dimension;
+- `M` be the captured query length.
+
+Persistent index storage is:
+
+```text
+O(N * H_kv * d)
+```
+
+where:
+
+```text
+L*S <= N <= 4*L*S
+```
+
+The single-mean 32-token baseline occupies the lower bound and Fixed-4 occupies
+the upper bound. Adaptive storage lies between them according to observed
+directional complexity.
+
+Ignoring batching and GQA reuse, prototype scoring work is:
+
+```text
+O(M * H_q * d * N)
+```
+
+Candidate construction always considers seven temporary rows per
+layer/slice/head, but its GPU scratch is bounded by the active prefill chunk and
+does not grow with the complete history. Persistent index bytes and retrieval
+dot products grow only with selected rows.
+
+#### 4.9.12 Correct interpretation and current boundaries
+
+The implementation supports the following claims:
+
+- it discovers multiple model-internal Key directions inside a local slice;
+- it groups potentially non-contiguous tokens without a separate embedding
+  model or text parser;
+- it adapts representation capacity with a hierarchical residual-gain rule;
+- it preserves sparse directional matches through block-side MaxSim;
+- it stores and scores only retained prototypes after bounded candidate
+  construction.
+
+The implementation does not support stronger claims that:
+
+- it learns explicit natural-language segment boundaries;
+- it runs or converges iterative k-means;
+- it chooses an arbitrary count from one through four;
+- it optimizes an explicit gain-per-added-byte objective;
+- it measures residual to the final centroid means;
+- each KV head shares the same token membership for prototype ordinal `j`.
+
+Current design trade-offs include:
+
+- the maximum gain across KV heads may retain extra rows because of one head;
+- prototype-level global softmax gives a slice with more retained directions
+  more competitors in the denominator and more opportunities to produce its
+  block's maximum;
+- MaxSim retains the strongest localized match but discards the additional
+  probability mass of multiple simultaneously relevant directions;
+- the adaptive count is query-independent and fixed during prefill;
+- v1 requires aligned capture and does not compose with round/message semantic
+  expansion.
+
+These are useful ablation dimensions rather than hidden implementation details:
+single-mean versus Fixed-4 versus Adaptive, alternative head aggregation,
+gain-threshold sweeps, MaxSim versus mass reduction, and query-independent
+versus query-aware prototype budgets.
+
+### 4.10 Fallbacks
 
 If query-conditioned mean-k is unavailable, KVMem falls back to other signals:
 
@@ -631,9 +1180,11 @@ If query-conditioned mean-k is unavailable, KVMem falls back to other signals:
 - Window-local H2O/profile scores if retrieval cannot run.
 - Recency-only selection when no learned/model-internal signal is available.
 
-Unsupported KV dtypes also matter. The mean-key/de-RoPE retrieval paths require
-fp16 or fp32 KV. q8/fp8 KV cannot be meaningfully de-RoPEd/averaged in the
-current implementation, so retrieval falls back to cheaper signals.
+Index construction consumes the freshly produced FP32 `k_batch`, so production
+FP8 active KV can use an FP16 Mean-K or Adaptive index; this is the configuration
+used by the current long-context evaluations. Legacy paths that attempt to
+reconstruct a content index by directly scanning an incompatible quantized
+paged-K representation remain unavailable and fall back explicitly.
 
 ## 5. Selection Policy
 
@@ -1351,7 +1902,7 @@ window every token.
 
 ## 9. H2O/Profile Scoring Side Channel
 
-Although the paper focus may be mean-k retrieval, the implementation also
+Although the paper focus is KV-native retrieval, the implementation also
 contains a lightweight profile signal similar in spirit to heavy-hitter
 retention.
 
@@ -1380,7 +1931,7 @@ worth emphasizing in a paper.
 
 ### 10.1 Retrieval Efficiency
 
-Mean-k retrieval stores block summaries instead of raw token keys:
+Single-mean retrieval stores block summaries instead of raw token keys:
 
 ```text
 O(num_layers * num_blocks * n_kv_heads * head_dim)
@@ -1395,6 +1946,21 @@ O(num_layers * num_tokens * n_kv_heads * head_dim)
 This makes query-conditioned retrieval feasible for long histories. The scorer
 uses one fused CUDA launch for the softmax-over-pages path and one host copy of
 the final block scores.
+
+Adaptive Key-direction retrieval preserves this compressed-index principle
+while allocating representation capacity according to local directional
+complexity. For `S` non-empty 32-token slices and selected counts
+`P[l,s] in {1,2,4}`, it stores:
+
+```text
+O((sum_l sum_s P[l,s]) * n_kv_heads * head_dim)
+```
+
+instead of the full per-token Key tensor. Its bounded builder evaluates seven
+candidate rows per active slice, but only selected rows enter the persistent
+packed index and later prototype dot products. GPU placement overlaps dirty
+suffix uploads with prefill; CPU placement keeps canonical capacity in pageable
+host memory and stages complete layers for exact GPU dot/softmax/MaxSim scoring.
 
 ### 10.2 Indexing During Prefill
 
@@ -1568,7 +2134,7 @@ they are correctness or common scalability foundations shared by every cell:
 - immutable raw-K authority and V-only lower-tier records;
 - demand-allocated host storage and bounded reusable transfer slabs;
 - split prepare/finish scheduling and the common copy stream;
-- incremental mean-K indexing and the scalable mean-K scorer;
+- incremental Mean-K/Adaptive indexing and scalable page/prototype scorers;
 - MTP bounded sibling pages and local-position correctness;
 - capacity validation and page-cache bounding.
 
@@ -1674,10 +2240,14 @@ preserves positional semantics while moving KV across tiers.
 
 ### 12.1 Mean-Key Dilution
 
-Mean-k can under-rank blocks where the relevant evidence is sparse. This is the
-primary algorithmic limitation of the current default retrieval method. Smaller
-blocks or larger budgets can reduce the problem; exact-mass retrieval addresses
-it more directly but uses much more memory.
+One mean can under-rank a slice where the relevant evidence is sparse. Smaller
+blocks or larger budgets reduce the problem, and Adaptive Key-direction
+segmentation mitigates it by retaining one, two, or four local direction means
+and applying block-side MaxSim. It does not eliminate approximation: grouping
+still occurs inside fixed 32-token slices, prototype counts are capped at four,
+the count is selected before the query is known, and MaxSim preserves only the
+strongest prototype mass for each query distribution. Exact-mass retrieval
+avoids prototype compression more directly but uses much more memory.
 
 ### 12.2 KV Dtype Restrictions
 
@@ -1851,10 +2421,14 @@ would attend to a historical KV block. Exact token-level KV scoring is expensive
 
 Solution:
 
-Construct a content-frame per-block mean-key index and score all blocks by
-query-conditioned softmax mass over mean keys. Use all standard-attention layers
-and all captured query tokens by default. Optionally support raw-key exact-mass
-retrieval for higher fidelity.
+Construct a content-frame Key index and score all historical blocks by
+query-conditioned softmax mass. The compact baseline stores contiguous mean
+Keys. Adaptive Key-direction segmentation divides each physical block into
+32-token slices, discovers non-contiguous directional groups with deterministic
+farthest-first traversal, and retains one, two, or four prototype means according
+to hierarchical cosine-residual gains. Use all standard-attention layers and
+all captured query tokens; reduce a block's variable prototype run with MaxSim.
+Optionally support raw-key exact-mass retrieval for higher fidelity.
 
 Key equations:
 
@@ -1869,12 +2443,37 @@ r_b =
     (q_{l,m,h}^T \bar{k}_{l,b',g(h)} / sqrt(d))_b
 ```
 
+Adaptive prototype construction:
+
+```text
+s_1 = argmax_t cos(k_t, mean_t k_t)
+
+s_j = argmin_t max_{r<j} cos(k_t, k_{s_r})
+
+E_P = mean_t (1 - max_{j<=P} cos(k_t, k_{s_j}))
+
+P in {1,2,4}, selected by relative E_1->E_2 and E_2->E_4 gains
+```
+
+Adaptive block score:
+
+```text
+pi[l,m,h,b,r] =
+    softmax over all included layer-l prototypes
+    (q[l,m,h]^T c[l,b,r,g(h)] / sqrt(d))
+
+r_b = sum_m mean_l mean_h max_{r in block b} pi[l,m,h,b,r]
+```
+
 Key implementation points:
 
 - `kvmem_capture_kbar_multi`
+- `kvmem_capture_adaptive_layer`
 - `kvmem_capture_query_multi`
 - `block_kmean_content_batch_kernel`
+- `block_kdirection_adaptive_batch_kernel`
 - `block_attn_score_softmax_pages_kernel`
+- `block_attn_adaptive_accumulate_logits_kernel`
 - `kvmem_retrieval_score_mean_softmax`
 
 ### 13.3 Tiered KV Memory Management
@@ -1906,7 +2505,9 @@ Key implementation points:
 ## 14. One-Sentence Summary
 
 KVMem implements a block-sparse, KV-native memory system in which each agent step
-selects a bounded set of historical KV blocks using query-conditioned mean-key
-retrieval, assembles them as a compact attention window through page-table
-aliasing and in-place re-RoPE, and preserves the remaining KV state across a
-GPU/CPU/NVMe hierarchy with canonical lower-tier storage.
+selects a bounded set of historical KV blocks using query-conditioned
+content-Key retrieval, optionally representing each 32-token slice with an
+adaptive set of latent Key-direction prototypes, assembles the selected blocks
+as a compact attention window through page-table aliasing and in-place re-RoPE,
+and preserves the remaining KV state across a GPU/CPU/NVMe hierarchy with
+canonical lower-tier storage.

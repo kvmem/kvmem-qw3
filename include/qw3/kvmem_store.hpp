@@ -37,13 +37,14 @@ struct KvMemBlock {
     uint32_t block_id = 0;          // dense index in append order (0,1,2,...)
     uint32_t orig_pos_start = 0;    // first original token position in block
     uint32_t n_tokens = 0;          // tokens in this block (<= block_tokens)
-    KvTier   tier = KvTier::GPU;    // active copy; opt_2 may retain other copies
+    KvTier   tier = KvTier::GPU;    // active copy; stage-out may retain clean copies
     int32_t  gpu_slot = -1;         // future physical GPU block/page slot
     int32_t  cpu_slot = -1;         // CPU pinned tier slot, -1 if absent
     int32_t  nvme_slot = -1;        // NVMe tier slot, -1 if absent
-    // opt_2 and later use inclusive backing: tier names the active copy used
-    // for the next transition, while cpu_slot/nvme_slot may describe additional
-    // clean copies. Legacy levels retain the original exclusive semantics.
+    // Inclusive mode retains clean lower-tier copies while GPU is active:
+    // tier names the active copy used for the next transition, while
+    // cpu_slot/nvme_slot may describe additional clean copies. Exclusive mode
+    // releases the source slot after promotion and keeps one authoritative copy.
     bool     ssd_clean = false;      // nvme_slot contains the current spill bytes
     bool     dirty_gpu = false;     // GPU copy newer than backing copy
     bool     in_flight = false;     // async copy/verification owns this block
@@ -215,17 +216,6 @@ KvMemKeepAllocation resolve_kvmem_keep_allocation(
     int64_t sink_tokens,
     int64_t recent_tokens);
 
-// Monotonic research profiles for storage/tiering performance comparisons.
-// KvmemInit is the committed compatibility baseline. Each later level contains
-// all earlier optimizations; a build must reject a level whose implementation
-// is not complete instead of silently falling back.
-enum class KvMemOptimizationLevel : uint8_t {
-    KvmemInit = 0,
-    Opt1 = 1,  // reduce SSD load volume: heat-aware CPU cache
-    Opt2 = 2,  // reduce stage-out: batched D2H; async SSD writes when present
-    Opt3 = 3,  // reduce stage-in: pinned H2D pipeline; coalesced SSD reads
-};
-
 enum class KvMemIndexPlacement : uint8_t {
     GPU = 0,
     CPU = 1,
@@ -264,15 +254,14 @@ struct KvMemStoreConfig {
         KvMemGroupScoreReduce::Max;
     double group_length_norm_alpha = 0.5;
     KvMemUpdateMode update_mode = KvMemUpdateMode::Interval;
-    KvMemOptimizationLevel optimization_level =
-        KvMemOptimizationLevel::KvmemInit;
-    // New paper-facing controls. Native serving defaults all three to true.
-    // legacy_optimization_profile is set only when the deprecated cumulative
-    // --kvmem-optimization-level CLI was explicitly requested.
-    bool legacy_optimization_profile = false;
-    bool proactive_stage_out = true;
-    bool hierarchical_reuse = true;
-    bool packed_rematerialization = true;
+    // Orthogonal performance controls. They must not alter retrieval,
+    // precision, immutable-K, query replay, or any other correctness policy:
+    //   stage-out: when completed GPU blocks are copied to a lower tier;
+    //   stage-in:  which selected blocks must be loaded/rematerialized;
+    //   pack:      how blocks are transferred (cross-block batches/pipelines).
+    bool optimize_stage_out = true;
+    bool optimize_stage_in = true;
+    bool optimize_pack = true;
 
     // Drift-bounded K construction. The executor stores unrotated historical K
     // in a CPU mirror and keeps only one active K copy on GPU. Resident window
@@ -404,7 +393,7 @@ public:
     void set_block_tier(uint32_t block_id, KvTier tier,
                         int32_t cpu_slot = -1,
                         int32_t nvme_slot = -1);
-    // Inclusive-copy metadata used by opt_2+. These do not change which tier is
+    // Inclusive-copy metadata used by stage-out. These do not change which tier is
     // active, so evicting a CPU cache copy cannot accidentally mark a still-live
     // GPU block cold.
     void set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot);

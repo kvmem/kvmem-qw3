@@ -1547,6 +1547,16 @@ public:
         if (cfg.ladder_tokens.empty()) {
             throw std::runtime_error("kvmem-session: empty ladder");
         }
+        if (cfg.repeat_queries < 0 ||
+            (cfg.repeat_queries > 0 && cfg.query_tokens <= 0)) {
+            throw std::runtime_error(
+                "kvmem-session repeated queries require query_tokens > 0");
+        }
+        if (cfg.repeat_mode != "frozen" &&
+            cfg.repeat_mode != "sequential") {
+            throw std::runtime_error(
+                "kvmem-session repeat mode must be frozen|sequential");
+        }
         if (!QwenExecutor::kvmem_timing_enabled()) {
             log("kvmem-session: WARNING QW3_KVMEM_TIMING not set; the "
                 "selection/stage/assemble breakdown will read as zero");
@@ -1556,10 +1566,16 @@ public:
         // largest ladder target. Each turn carves an exact token slice so the
         // running position lands precisely on each ladder point after prefill.
         const uint64_t max_target = cfg.ladder_tokens.back();
+        const uint64_t query_reserve = std::max<uint64_t>(
+            2048,
+            static_cast<uint64_t>(std::max(0, cfg.repeat_queries)) *
+                static_cast<uint64_t>(std::max(1, cfg.query_tokens)));
         std::vector<uint32_t> pool;
-        build_session_corpus(pool, max_target + 2048);
+        build_session_corpus(pool, max_target + query_reserve);
         log("kvmem-session: corpus pool tokens=" + std::to_string(pool.size()) +
-            " target_max=" + std::to_string(max_target));
+            " target_max=" + std::to_string(max_target) +
+            " repeat_queries=" + std::to_string(cfg.repeat_queries) +
+            " repeat_mode=" + cfg.repeat_mode);
 
         GenerationOptions gen;
         gen.max_tokens = std::max(1, cfg.decode_tokens);
@@ -1599,6 +1615,98 @@ public:
         };
         std::vector<TurnRow> rows;
 
+        struct QueryRow {
+            size_t turn = 0;
+            int query = 0;
+            std::string mode;
+            uint32_t base_pos = 0;
+            uint32_t query_begin = 0;
+            uint32_t query_end = 0;
+            uint32_t final_pos = 0;
+            double capture_ms = 0;
+            double restore_ms = 0;
+            double total_s = 0;
+            double semantic_s = 0;
+            double query_replay_s = 0;
+            double decode_s = 0;
+            double score_ms = 0;
+            double stage_in_ms = 0;
+            double stage_out_ms = 0;
+            double assemble_ms = 0;
+            uint32_t stage_in_blocks = 0;
+            uint32_t stage_out_blocks = 0;
+            int decoded = 0;
+        };
+        std::vector<QueryRow> query_rows;
+
+        // An executor snapshot alone is not a complete KVMem branch point:
+        // API-session query replay also owns a block-aligned recurrent checkpoint
+        // plus the unaligned tail, and semantic selection changes the resident
+        // working set. Keep all three so a frozen query starts from the same
+        // logical history and the same selected GPU window.
+        struct MilestoneState {
+            uint32_t position = 0;
+            QwenExecutor::StateSnapshot executor_state;
+            QwenExecutor::StateSnapshot api_boundary_state;
+            uint32_t api_boundary_pos = 0;
+            std::vector<uint32_t> api_tail_tokens;
+            std::vector<uint32_t> selected_blocks;
+        };
+        auto capture_milestone = [&](MilestoneState &state) {
+            const double start = wall_seconds();
+            DeviceStatus scope = device_->begin();
+            if (!scope.ok) throw std::runtime_error(scope.message);
+            bool scope_open = true;
+            try {
+                state.position = executor_->position();
+                executor_->capture_state(state.executor_state);
+                state.api_boundary_pos = kvmem_api_boundary_pos_;
+                state.api_tail_tokens = kvmem_api_tail_tokens_;
+                state.selected_blocks =
+                    kvmem_selected_block_ids(executor_.get());
+                state.api_boundary_state = kvmem_api_boundary_ckpt_.ready
+                    ? clone_milestone_state_snapshot(
+                          kvmem_api_boundary_ckpt_)
+                    : QwenExecutor::StateSnapshot{};
+                DeviceStatus done = device_->end();
+                scope_open = false;
+                if (!done.ok) throw std::runtime_error(done.message);
+            } catch (...) {
+                if (scope_open) (void)device_->end();
+                throw;
+            }
+            return (wall_seconds() - start) * 1.0e3;
+        };
+        auto restore_milestone = [&](const MilestoneState &state) {
+            const double start = wall_seconds();
+            DeviceStatus scope = device_->begin();
+            if (!scope.ok) throw std::runtime_error(scope.message);
+            bool scope_open = true;
+            try {
+                executor_->restore_state(state.executor_state);
+                executor_->kvmem_truncate_to(state.position);
+                if (!state.selected_blocks.empty()) {
+                    (void)executor_->kvmem_set_selection(
+                        state.selected_blocks);
+                }
+                kvmem_api_boundary_pos_ = state.api_boundary_pos;
+                kvmem_api_tail_tokens_ = state.api_tail_tokens;
+                kvmem_api_boundary_ckpt_ = state.api_boundary_state.ready
+                    ? clone_milestone_state_snapshot(
+                          state.api_boundary_state)
+                    : QwenExecutor::StateSnapshot{};
+                kvmem_api_session_active_ = true;
+                kvmem_api_session_id_ = "kvmem-session-profile";
+                DeviceStatus done = device_->end();
+                scope_open = false;
+                if (!done.ok) throw std::runtime_error(done.message);
+            } catch (...) {
+                if (scope_open) (void)device_->end();
+                throw;
+            }
+            return (wall_seconds() - start) * 1.0e3;
+        };
+
         size_t pool_cursor = 0;
         for (size_t ti = 0; ti < cfg.ladder_tokens.size(); ++ti) {
             const uint64_t target = cfg.ladder_tokens[ti];
@@ -1623,7 +1731,8 @@ public:
                 pool.begin() + static_cast<std::ptrdiff_t>(pool_cursor),
                 pool.begin() + static_cast<std::ptrdiff_t>(pool_cursor + delta));
             pool_cursor += delta;
-            if (cfg.query_tokens > 0) {
+            const bool milestone_queries = cfg.repeat_queries > 0;
+            if (cfg.query_tokens > 0 && !milestone_queries) {
                 const uint64_t query_tokens = std::min<uint64_t>(
                     static_cast<uint64_t>(cfg.query_tokens), delta);
                 gen.kvmem_query_begin =
@@ -1633,8 +1742,17 @@ public:
             } else {
                 gen.kvmem_query_begin = 0;
                 gen.kvmem_query_end = 0;
-                gen.kvmem_reselect_mode = KvMemReselectMode::Auto;
+                // Milestone fan-out captures the exact context prefix before
+                // any synthetic question or decode token is appended. History
+                // ingest still performs ordinary pressure selection as the GPU
+                // pool fills, but there is no final semantic reselect here.
+                gen.kvmem_reselect_mode = milestone_queries
+                    ? KvMemReselectMode::Off
+                    : KvMemReselectMode::Auto;
             }
+            gen.max_tokens = milestone_queries
+                ? 0
+                : std::max(1, cfg.decode_tokens);
 
             const QwenExecutor::KvMemTimingSnapshot tbase =
                 QwenExecutor::kvmem_timing_snapshot();
@@ -1728,6 +1846,113 @@ public:
                                row.finalize_s, row.semantic_s,
                                row.query_replay_s, row.post_other_s);
             rows.push_back(row);
+
+            if (milestone_queries) {
+                MilestoneState milestone;
+                const double capture_ms = capture_milestone(milestone);
+                if (milestone.position != target) {
+                    throw std::runtime_error(
+                        "kvmem-session milestone position does not match the "
+                        "requested ladder target");
+                }
+
+                const uint64_t query_pool_begin = max_target;
+                const uint64_t query_slots = std::max<uint64_t>(
+                    1, query_reserve /
+                           static_cast<uint64_t>(cfg.query_tokens));
+                for (int qi = 0; qi < cfg.repeat_queries; ++qi) {
+                    double restore_ms = 0.0;
+                    if (cfg.repeat_mode == "frozen" || qi == 0) {
+                        restore_ms = restore_milestone(milestone);
+                    }
+
+                    const uint32_t query_begin = executor_->position();
+                    const uint64_t slot =
+                        (static_cast<uint64_t>(ti) *
+                             static_cast<uint64_t>(cfg.repeat_queries) +
+                         static_cast<uint64_t>(qi)) %
+                        query_slots;
+                    const uint64_t qoff =
+                        query_pool_begin +
+                        slot * static_cast<uint64_t>(cfg.query_tokens);
+                    std::vector<uint32_t> query_chunk(
+                        pool.begin() + static_cast<std::ptrdiff_t>(qoff),
+                        pool.begin() + static_cast<std::ptrdiff_t>(
+                            qoff + static_cast<uint64_t>(cfg.query_tokens)));
+
+                    GenerationOptions qgen = gen;
+                    qgen.max_tokens = std::max(1, cfg.decode_tokens);
+                    qgen.kvmem_query_begin = query_begin;
+                    qgen.kvmem_query_end =
+                        query_begin + static_cast<uint32_t>(query_chunk.size());
+                    qgen.kvmem_reselect_mode = KvMemReselectMode::Force;
+
+                    const QwenExecutor::KvMemTimingSnapshot qt0 =
+                        QwenExecutor::kvmem_timing_snapshot();
+                    MtpGenStats qstats;
+                    (void)generate_mtp(
+                        query_chunk, qgen, CancellableTokenCallback{},
+                        /*dump=*/nullptr,
+                        /*spec_mtp=*/true, /*trace_mtp=*/false,
+                        /*override_executor=*/nullptr,
+                        /*manage_device_scope=*/true,
+                        /*reset_session=*/false, &qstats);
+                    const QwenExecutor::KvMemTimingSnapshot qt1 =
+                        QwenExecutor::kvmem_timing_snapshot();
+
+                    QueryRow qr;
+                    qr.turn = ti;
+                    qr.query = qi;
+                    qr.mode = cfg.repeat_mode;
+                    qr.base_pos = milestone.position;
+                    qr.query_begin = query_begin;
+                    qr.query_end = qgen.kvmem_query_end;
+                    qr.final_pos = executor_->position();
+                    qr.capture_ms = qi == 0 ? capture_ms : 0.0;
+                    qr.restore_ms = restore_ms;
+                    qr.total_s = qstats.total_s;
+                    qr.semantic_s = qstats.semantic_reselect_s;
+                    qr.query_replay_s = qstats.query_replay_s;
+                    qr.decode_s = qstats.decode_s;
+                    qr.score_ms = dms(qt1.retrieval_ns, qt0.retrieval_ns);
+                    qr.stage_in_ms = dms(qt1.stage_in_ns, qt0.stage_in_ns);
+                    qr.stage_out_ms = dms(qt1.stage_out_ns, qt0.stage_out_ns);
+                    qr.assemble_ms = dms(qt1.assemble_ns, qt0.assemble_ns);
+                    qr.stage_in_blocks =
+                        qt1.stage_in_blocks - qt0.stage_in_blocks;
+                    qr.stage_out_blocks =
+                        qt1.stage_out_blocks - qt0.stage_out_blocks;
+                    qr.decoded = qstats.decoded;
+                    query_rows.push_back(qr);
+
+                    std::ostringstream qmsg;
+                    qmsg << std::fixed << std::setprecision(3)
+                         << "[kvmem-session-query] turn=" << qr.turn
+                         << " query=" << qr.query
+                         << " mode=" << qr.mode
+                         << " base=" << qr.base_pos
+                         << " span=[" << qr.query_begin << ","
+                         << qr.query_end << ")"
+                         << " final=" << qr.final_pos
+                         << " capture_ms=" << qr.capture_ms
+                         << " restore_ms=" << qr.restore_ms
+                         << " total_ms=" << qr.total_s * 1.0e3
+                         << " semantic_ms=" << qr.semantic_s * 1.0e3
+                         << " replay_ms=" << qr.query_replay_s * 1.0e3
+                         << " decode_ms=" << qr.decode_s * 1.0e3
+                         << " score_ms=" << qr.score_ms
+                         << " stage_in_ms=" << qr.stage_in_ms
+                         << " stage_out_ms=" << qr.stage_out_ms
+                         << " assemble_ms=" << qr.assemble_ms
+                         << " stage_in_blocks=" << qr.stage_in_blocks
+                         << " stage_out_blocks=" << qr.stage_out_blocks
+                         << " decoded=" << qr.decoded;
+                    log(qmsg.str());
+                }
+                // Branch probes are diagnostics. Return to the exact milestone
+                // so the next ladder point prefills only its true context delta.
+                (void)restore_milestone(milestone);
+            }
         }
 
         // Final summary table.
@@ -1770,6 +1995,34 @@ public:
                 << "\n";
         }
         std::cerr << tbl.str();
+        if (!query_rows.empty()) {
+            std::ostringstream qtbl;
+            qtbl << "\n=== kvmem-session REPEATED QUERY SUMMARY ===\n";
+            qtbl << "  turn  query       mode       base      qbegin"
+                    "        qend  restore_ms  total_ms  semantic_ms"
+                    "  replay_ms  decode_ms  score_ms  stagein_ms"
+                    "  stageout_ms  assemble_ms  decoded\n";
+            for (const QueryRow &q : query_rows) {
+                qtbl << "  " << std::setw(4) << q.turn
+                     << std::setw(7) << q.query
+                     << std::setw(11) << q.mode
+                     << std::setw(11) << q.base_pos
+                     << std::setw(12) << q.query_begin
+                     << std::setw(12) << q.query_end
+                     << std::fixed << std::setprecision(3)
+                     << std::setw(12) << q.restore_ms
+                     << std::setw(10) << q.total_s * 1.0e3
+                     << std::setw(13) << q.semantic_s * 1.0e3
+                     << std::setw(11) << q.query_replay_s * 1.0e3
+                     << std::setw(11) << q.decode_s * 1.0e3
+                     << std::setw(10) << q.score_ms
+                     << std::setw(12) << q.stage_in_ms
+                     << std::setw(13) << q.stage_out_ms
+                     << std::setw(13) << q.assemble_ms
+                     << std::setw(9) << q.decoded << "\n";
+            }
+            std::cerr << qtbl.str();
+        }
         return 0;
     }
 
@@ -6438,61 +6691,9 @@ private:
         bs_cfg.update_mode = options_.kvmem_update_mode == "step"
             ? KvMemUpdateMode::Step
             : KvMemUpdateMode::Interval;
-        if (options_.kvmem_optimization_level_explicit) {
-            if (!options_.kvmem_optimize_off.empty()) {
-                throw std::runtime_error(
-                    "--kvmem-optimization-level cannot be combined with "
-                    "--kvmem-optimize-off");
-            }
-            bs_cfg.legacy_optimization_profile = true;
-            if (options_.kvmem_optimization_level == "opt_1") {
-                bs_cfg.optimization_level = KvMemOptimizationLevel::Opt1;
-            } else if (options_.kvmem_optimization_level == "opt_2") {
-                bs_cfg.optimization_level = KvMemOptimizationLevel::Opt2;
-            } else if (options_.kvmem_optimization_level == "opt_3") {
-                bs_cfg.optimization_level = KvMemOptimizationLevel::Opt3;
-            } else {
-                bs_cfg.optimization_level =
-                    KvMemOptimizationLevel::KvmemInit;
-            }
-            bs_cfg.proactive_stage_out =
-                bs_cfg.optimization_level >= KvMemOptimizationLevel::Opt2;
-            // GPU set-difference reuse historically applied at every level;
-            // Opt1 only changed the CPU replacement policy.
-            bs_cfg.hierarchical_reuse = true;
-            bs_cfg.packed_rematerialization =
-                bs_cfg.optimization_level >= KvMemOptimizationLevel::Opt3;
-            std::fprintf(
-                stderr,
-                "[kvmem-opt-warning] --kvmem-optimization-level=%s is a "
-                "deprecated compatibility profile; omit it for the "
-                "default all-on configuration\n",
-                options_.kvmem_optimization_level.c_str());
-        } else {
-            // Opt3 supplies the common bounded tiering infrastructure. The
-            // three paper-facing groups below are independently disabled
-            // without changing correctness mechanisms or storage budgets.
-            bs_cfg.optimization_level = KvMemOptimizationLevel::Opt3;
-            bs_cfg.proactive_stage_out = true;
-            bs_cfg.hierarchical_reuse = true;
-            bs_cfg.packed_rematerialization = true;
-            for (const std::string &name : options_.kvmem_optimize_off) {
-                if (name == "all") {
-                    bs_cfg.proactive_stage_out = false;
-                    bs_cfg.hierarchical_reuse = false;
-                    bs_cfg.packed_rematerialization = false;
-                } else if (name == "proactive-stage-out") {
-                    bs_cfg.proactive_stage_out = false;
-                } else if (name == "hierarchical-reuse") {
-                    bs_cfg.hierarchical_reuse = false;
-                } else if (name == "packed-rematerialization") {
-                    bs_cfg.packed_rematerialization = false;
-                } else {
-                    throw std::runtime_error(
-                        "unknown KVMem optimize-off group: " + name);
-                }
-            }
-        }
+        bs_cfg.optimize_stage_out = options_.kvmem_opt_stage_out;
+        bs_cfg.optimize_stage_in = options_.kvmem_opt_stage_in;
+        bs_cfg.optimize_pack = options_.kvmem_opt_pack;
         exec.set_kvmem_enabled(true);
         exec.configure_kvmem(bs_cfg);
     }
@@ -7705,6 +7906,30 @@ private:
         return dst;
     }
 
+    // Complete clone used by the in-process KVMem milestone harness. The
+    // continuous-batching prefix cache above intentionally clones only the
+    // recurrent seed associated with separately pinned main-KV pages; changing
+    // its shape would alter an unrelated production path. A milestone branch,
+    // in contrast, must preserve MTP, registration, and sparse-window metadata.
+    QwenExecutor::StateSnapshot clone_milestone_state_snapshot(
+            const QwenExecutor::StateSnapshot &src) {
+        QwenExecutor::StateSnapshot dst = clone_state_snapshot(src);
+        dst.mtp_kv_logical_pages = src.mtp_kv_logical_pages;
+        dst.kvmem_registered_pos = src.kvmem_registered_pos;
+        dst.kvmem_active = src.kvmem_active;
+        dst.window_query_pos = src.window_query_pos;
+        dst.window_page_count = src.window_page_count;
+        if (src.mtp_prefix_h) {
+            dst.mtp_prefix_h = device_->scratch_like(
+                *src.mtp_prefix_h, src.mtp_prefix_h->count,
+                "milestone_clone_mtp_h");
+            prefix_require_ok(device_->copy_d2d(
+                *dst.mtp_prefix_h, *src.mtp_prefix_h, 0,
+                src.mtp_prefix_h->count));
+        }
+        return dst;
+    }
+
     // Commit the page-aligned prefix [0..aligned_len) of a freshly-prefilled
     // request: snapshot recurrent state (already at aligned_len), pin the
     // prefix KV pages, mark them borrowed in the executor, and insert an entry.
@@ -8644,7 +8869,9 @@ private:
                         std::to_string(selected_context.size()));
                 } else {
                     executor_->kvmem_begin_query_replay(
-                        query_replay_ckpt, selected_context);
+                        query_replay_ckpt, selected_context,
+                        /*reset_recurrent_state=*/false,
+                        /*preserve_selected_context=*/true);
 #if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =
@@ -11112,7 +11339,8 @@ private:
                     replay_boundary, selected_context,
                     (transcript_reset_final_recurrent ||
                      transcript_reset_each_recurrent) &&
-                        ei + 1 == options.kvmem_replay_query_spans.size());
+                        ei + 1 == options.kvmem_replay_query_spans.size(),
+                    /*preserve_selected_context=*/true);
                 // If the next user query begins in the same 32-token block,
                 // save its boundary state WHILE replaying this event under the
                 // newly selected context. This avoids dropping the first query
@@ -11476,7 +11704,9 @@ private:
                         std::to_string(selected_context.size()));
                 } else {
                     executor_->kvmem_begin_query_replay(
-                        kvmem_query_replay_ckpt, selected_context);
+                        kvmem_query_replay_ckpt, selected_context,
+                        /*reset_recurrent_state=*/false,
+                        /*preserve_selected_context=*/true);
 #if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =

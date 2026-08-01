@@ -41,7 +41,9 @@ exec "$PYTHON" "$ROOT/scripts/kvmem_eval/run_kvmem_eval.py" \
   --adaptive-gain-1to2 0.10 \
   --adaptive-gain-2to4 0.06 \
   --update-mode step \
-  --optimization-level default \
+  --kvmem-opt-stage-out on \
+  --kvmem-opt-stage-in on \
+  --kvmem-opt-pack on \
   --query-conditioned \
   --gpu-memory-ratio 0.5 \
   --cpu-gb 64 \

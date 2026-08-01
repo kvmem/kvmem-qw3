@@ -184,7 +184,9 @@ static void test_default_profile_reuses_moved_resident_k() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 32;
     cfg.immutable_source_k = true;
-    CHECK(!cfg.legacy_optimization_profile);
+    CHECK(cfg.optimize_stage_out);
+    CHECK(cfg.optimize_stage_in);
+    CHECK(cfg.optimize_pack);
     KvMemStore s(cfg);
     s.register_append(32 * 4);
 
@@ -217,11 +219,11 @@ static void test_stage_in_uses_tier_residency() {
     CHECK(plan2.stage_out.empty());
 }
 
-static void test_hierarchical_reuse_ablation_forces_full_reload() {
+static void test_stage_in_ablation_forces_full_reload() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 32;
     cfg.immutable_source_k = true;
-    cfg.hierarchical_reuse = false;
+    cfg.optimize_stage_in = false;
     KvMemStore s(cfg);
     s.register_append(32 * 5);
 
@@ -593,7 +595,7 @@ static void test_tier_metadata() {
 
 static void test_inclusive_tier_metadata() {
     KvMemStoreConfig cfg;
-    cfg.optimization_level = KvMemOptimizationLevel::Opt2;
+    cfg.optimize_stage_out = true;
     KvMemStore s(cfg);
     s.register_append(128 * 2);
 
@@ -618,6 +620,64 @@ static void test_inclusive_tier_metadata() {
     CHECK(s.blocks()[1].cpu_slot == -1);
     CHECK(s.blocks()[1].nvme_slot == 3);
     CHECK(s.blocks()[1].ssd_clean);
+}
+
+static void test_stage_out_off_exclusive_tier_metadata() {
+    KvMemStoreConfig cfg;
+    cfg.optimize_stage_out = false;
+    KvMemStore s(cfg);
+    s.register_append(128 * 2);
+
+    // Stage-out-off uses exclusive move semantics. Promotion must drop every
+    // lower-tier handle.
+    s.set_block_tier(1, KvTier::SSD, -1, 3);
+    CHECK(s.blocks()[1].tier == KvTier::SSD);
+    CHECK(s.blocks()[1].nvme_slot == 3);
+    CHECK(s.blocks()[1].ssd_clean);
+    s.set_block_tier(1, KvTier::GPU);
+    CHECK(s.blocks()[1].tier == KvTier::GPU);
+    CHECK(s.blocks()[1].cpu_slot == -1);
+    CHECK(s.blocks()[1].nvme_slot == -1);
+    CHECK(!s.blocks()[1].ssd_clean);
+}
+
+static void test_factorial_optimization_controls_are_orthogonal() {
+    for (bool stage_out : {false, true}) {
+        for (bool stage_in : {false, true}) {
+            for (bool pack : {false, true}) {
+                KvMemStoreConfig cfg;
+                cfg.block_tokens = 32;
+                cfg.immutable_source_k = true;
+                cfg.optimize_stage_out = stage_out;
+                cfg.optimize_stage_in = stage_in;
+                cfg.optimize_pack = pack;
+
+                KvMemStore selection_store(cfg);
+                selection_store.register_append(32 * 3);
+                (void) selection_store.set_selection({0, 2});
+                const KvMemPlan plan =
+                    selection_store.set_selection({0, 2});
+                CHECK(plan.gpu_reused_blocks ==
+                      (stage_in ? 2u : 0u));
+                CHECK(plan.stage_in.size() ==
+                      (stage_in ? 0u : 2u));
+                CHECK(plan.stage_out.size() ==
+                      (stage_in ? 1u : 3u));
+
+                KvMemStore tier_store(cfg);
+                tier_store.register_append(32);
+                tier_store.set_block_ssd_backing(0, 9, true);
+                tier_store.set_block_tier(
+                    0, KvTier::SSD, -1, 9);
+                tier_store.set_block_tier(
+                    0, KvTier::GPU);
+                CHECK((tier_store.blocks()[0].nvme_slot >= 0) ==
+                      stage_out);
+                CHECK(tier_store.blocks()[0].ssd_clean ==
+                      stage_out);
+            }
+        }
+    }
 }
 
 static void test_truncate_to() {
@@ -817,7 +877,7 @@ int main() {
     test_cold_immutable_same_position_rebuilds_k();
     test_default_profile_reuses_moved_resident_k();
     test_stage_in_uses_tier_residency();
-    test_hierarchical_reuse_ablation_forces_full_reload();
+    test_stage_in_ablation_forces_full_reload();
     test_topk_budget_sink_recent();
     test_topk_zero_recent_keeps_no_suffix();
     test_budget_scaled_keep_allocation();
@@ -829,6 +889,8 @@ int main() {
     test_topk_empty();
     test_tier_metadata();
     test_inclusive_tier_metadata();
+    test_stage_out_off_exclusive_tier_metadata();
+    test_factorial_optimization_controls_are_orthogonal();
     test_truncate_to();
     test_deltanet_config_and_scores();
     test_round_groups_are_selected_whole();

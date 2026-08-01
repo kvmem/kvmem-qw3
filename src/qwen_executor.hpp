@@ -292,7 +292,8 @@ public:
     // window.  Default inference never calls this path.
     void kvmem_begin_query_replay(const StateSnapshot &boundary,
                                   const std::vector<uint32_t> &context_block_ids,
-                                  bool reset_recurrent_state = false);
+                                  bool reset_recurrent_state = false,
+                                  bool preserve_selected_context = false);
     void kvmem_end_query_replay();
     // Use otherwise-idle generation-reserve pages to bring a bounded set of
     // CPU-resident, historically hot blocks back to GPU while the first-pass
@@ -522,7 +523,7 @@ public:
     // can grab >100 pages at once, so a "only when nearly empty" trigger would
     // let the pool exhaust mid-chunk and throw). No-op when not bounded/tiered.
     void kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens);
-    // SSD Opt2+ write-through producer. Call only after every KV source for
+    // SSD stage-out write-through producer. Call only after every KV source for
     // [0, completed_pos) is durable (for local-position MTP this means after
     // prime_mtp_prefix_from_last_batch). Full newly-completed blocks are packed
     // to pinned slabs on the copy stream without changing GPU residency; their
@@ -849,7 +850,7 @@ private:
     bool kvmem_active_ = false;
     bool kvmem_immutable_source_k_ = false;
     bool kvmem_mtp_local_positions_ = false;
-    // Opt3 incremental MTP assembly: retained blocks follow the same bounded
+    // Experimental incremental MTP assembly: retained blocks follow the same bounded
     // in-place re-RoPE policy as main K; cold/periodic-refresh blocks still
     // rebuild exactly from immutable raw K. Environment-off switch preserves
     // the all-raw-rebuild compatibility path.
@@ -889,7 +890,7 @@ private:
     std::unique_ptr<KvmemCpuWorkerPool> kvmem_stagein_worker_pool_;
     bool kvmem_stagein_assembly_overlap_enabled_ = false;
     bool kvmem_stagein_assembly_overlap_active_ = false;
-    // CPU-only opt_2/3 may retain a clean spill record after CPU->GPU stage-in.
+    // Stage-out may retain a clean spill record after CPU->GPU stage-in.
     // This turns a later eviction of the same block into metadata/page release
     // instead of another GPU->CPU copy. It is enabled only when the CPU budget,
     // after reserving worst-case immutable raw-K storage, can back every context
@@ -1193,7 +1194,7 @@ private:
     uint32_t kvmem_writeback_blocks_ = 0;
     // Two pinned D2H slabs are enough to overlap CPU scatter of batch N with
     // the copy-stream transfer of batch N+1. They are allocated only for
-    // CPU-only opt_2/3 profiles; SSD profiles keep their existing writer path.
+    // CPU-only packed transfer; SSD keeps its write-through path.
     std::deque<std::unique_ptr<HostBuffer>> kvmem_free_stageout_slabs_;
     std::deque<std::unique_ptr<HostBuffer>> kvmem_free_read_slabs_;
     size_t kvmem_read_slab_count_ = 0;
@@ -1228,7 +1229,7 @@ private:
     void kvmem_finish_prefetch();
     void kvmem_submit_prefetch_cpu_batches();
     void kvmem_submit_prefetch_nvme_batches();
-    void kvmem_stage_out_cpu_batched(
+    void kvmem_stage_out_packed(
         const std::vector<uint32_t> &block_ids);
     void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
     bool kvmem_block_pages_resident(const KvMemBlock &block) const;
