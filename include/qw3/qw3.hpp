@@ -25,6 +25,33 @@ enum class KvMemPrefillWindowMode {
     KeepSelected,
 };
 
+enum class KvMemLocalCacheMode {
+    None,
+    Frozen,
+    Append,
+};
+
+// Request-visible metadata for a named, process-local KVMem checkpoint. The
+// checkpoint references the current executor's GPU/CPU/NVMe pool authority and
+// is therefore intentionally not portable across server restarts.
+struct KvMemLocalCacheInfo {
+    bool found = false;
+    std::string id;
+    std::string status; // ready|evicted|expired|failed
+    std::string scope = "local";
+    uint64_t version = 0;
+    uint32_t position = 0;
+    std::string fingerprint;
+    int64_t created_at = 0;
+    int64_t last_access_at = 0;
+    int64_t expires_at = 0; // 0 = no TTL
+    uint32_t selected_blocks = 0;
+    uint32_t total_blocks = 0;
+    uint64_t gpu_bytes = 0;
+    uint64_t cpu_bytes = 0;
+    uint64_t nvme_bytes = 0;
+};
+
 // Diagnostics-only, one-shot selected-context rebuild. Off is the production
 // default. KvOnly refreshes normal-attention K/V in the compact selected
 // context while restoring the historical recurrent/conv state at the query
@@ -204,6 +231,17 @@ struct GenerationOptions {
     KvMemPrefillWindowMode kvmem_prefill_window_mode =
         KvMemPrefillWindowMode::Pressure;
     std::string kvmem_session_id;
+    // Named process-local checkpoint control. A save captures the completed
+    // prefill-only request. A load restores that cache and treats this request's
+    // prompt as a continuation fragment. Frozen discards the branch after the
+    // request; Append atomically publishes version+1 after a prefill-only append.
+    std::string kvmem_cache_save_id;
+    std::string kvmem_cache_load_id;
+    KvMemLocalCacheMode kvmem_cache_load_mode =
+        KvMemLocalCacheMode::None;
+    uint64_t kvmem_cache_expected_version = 0;
+    bool kvmem_cache_expected_version_set = false;
+    uint64_t kvmem_cache_ttl_seconds = 0;
     // Query-conditioned KVMem: half-open token span [begin,end) of the prompt
     // that is the user's question. The executor captures these query rows during
     // prefill and uses them for multi-token block selection. begin==end (default)
@@ -337,6 +375,8 @@ public:
                                  const GenerationOptions &options,
                                  const TokenCallback &on_text,
                                  bool reset);
+    KvMemLocalCacheInfo kvmem_local_cache_info(const std::string &id);
+    bool erase_kvmem_local_cache(const std::string &id);
     void generate_stream_cancellable(
         const std::string &prompt,
         const GenerationOptions &options,

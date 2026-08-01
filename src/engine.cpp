@@ -66,6 +66,14 @@ void Engine::generate_session_stream(const std::string &prompt_fragment,
     impl_->backend->generate_session(prompt_fragment, options, on_text, reset);
 }
 
+KvMemLocalCacheInfo Engine::kvmem_local_cache_info(const std::string &id) {
+    return impl_->backend->kvmem_local_cache_info(id);
+}
+
+bool Engine::erase_kvmem_local_cache(const std::string &id) {
+    return impl_->backend->erase_kvmem_local_cache(id);
+}
+
 std::string render_qwen3_chat_prompt(const std::string &system,
                                      const std::string &user,
                                      bool enable_thinking) {

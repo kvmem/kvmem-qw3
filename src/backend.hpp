@@ -33,6 +33,15 @@ public:
         throw std::runtime_error(
             "persistent session append is unsupported by this backend");
     }
+    virtual KvMemLocalCacheInfo kvmem_local_cache_info(
+            const std::string &id) {
+        (void)id;
+        return {};
+    }
+    virtual bool erase_kvmem_local_cache(const std::string &id) {
+        (void)id;
+        return false;
+    }
 };
 
 std::unique_ptr<Backend> make_backend(BackendKind kind);

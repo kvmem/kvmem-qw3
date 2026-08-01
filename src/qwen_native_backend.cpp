@@ -681,6 +681,20 @@ std::vector<uint32_t> kvmem_selected_block_ids(const QwenExecutor *executor) {
     return ids;
 }
 
+// A pre-pressure identity window has no blocks marked `in_working_set`, even
+// though every registered block is active. A restorable checkpoint must make
+// that implicit identity state explicit; otherwise a frozen query's semantic
+// selection would leak into the next branch when the saved vector is empty.
+std::vector<uint32_t> kvmem_checkpoint_block_ids(
+        const QwenExecutor *executor) {
+    std::vector<uint32_t> ids = kvmem_selected_block_ids(executor);
+    if (!ids.empty() || !executor || !executor->block_store()) return ids;
+    const auto &blocks = executor->block_store()->blocks();
+    ids.reserve(blocks.size());
+    for (const KvMemBlock &block : blocks) ids.push_back(block.block_id);
+    return ids;
+}
+
 uint32_t kvmem_selection_additions(const std::vector<uint32_t> &before,
                                    const std::vector<uint32_t> &after) {
     uint32_t additions = 0;
@@ -1590,6 +1604,7 @@ public:
             kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
             kvmem_api_boundary_pos_ = 0;
             kvmem_api_tail_tokens_.clear();
+            kvmem_api_tokens_.clear();
         }
 
         struct TurnRow {
@@ -1651,6 +1666,7 @@ public:
             QwenExecutor::StateSnapshot api_boundary_state;
             uint32_t api_boundary_pos = 0;
             std::vector<uint32_t> api_tail_tokens;
+            std::vector<uint32_t> session_tokens;
             std::vector<uint32_t> selected_blocks;
         };
         auto capture_milestone = [&](MilestoneState &state) {
@@ -1663,8 +1679,9 @@ public:
                 executor_->capture_state(state.executor_state);
                 state.api_boundary_pos = kvmem_api_boundary_pos_;
                 state.api_tail_tokens = kvmem_api_tail_tokens_;
+                state.session_tokens = kvmem_api_tokens_;
                 state.selected_blocks =
-                    kvmem_selected_block_ids(executor_.get());
+                    kvmem_checkpoint_block_ids(executor_.get());
                 state.api_boundary_state = kvmem_api_boundary_ckpt_.ready
                     ? clone_milestone_state_snapshot(
                           kvmem_api_boundary_ckpt_)
@@ -1692,6 +1709,7 @@ public:
                 }
                 kvmem_api_boundary_pos_ = state.api_boundary_pos;
                 kvmem_api_tail_tokens_ = state.api_tail_tokens;
+                kvmem_api_tokens_ = state.session_tokens;
                 kvmem_api_boundary_ckpt_ = state.api_boundary_state.ready
                     ? clone_milestone_state_snapshot(
                           state.api_boundary_state)
@@ -2033,11 +2051,17 @@ public:
     std::string generate(const std::string &prompt,
                          const GenerationOptions &options,
                          const CancellableTokenCallback &on_text) override {
+        if (!options.kvmem_cache_save_id.empty() ||
+            !options.kvmem_cache_load_id.empty()) {
+            return generate_local_kvmem_cache(prompt, options, on_text);
+        }
+        invalidate_local_kvmem_caches("evicted");
         kvmem_api_session_active_ = false;
         kvmem_api_session_id_.clear();
         kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
         kvmem_api_boundary_pos_ = 0;
         kvmem_api_tail_tokens_.clear();
+        kvmem_api_tokens_.clear();
         return generate_internal(prompt, options, on_text,
                                  /*reset_session=*/true);
     }
@@ -2046,6 +2070,10 @@ public:
                                  const GenerationOptions &options,
                                  const TokenCallback &on_text,
                                  bool reset) override {
+        // The legacy live-session API has no cache version/CAS field. Letting
+        // it mutate a named checkpoint's shared executor lineage would leave
+        // the registry at a stale version, so explicitly invalidate first.
+        invalidate_local_kvmem_caches("evicted");
         if (!options_.kvmem_enabled) {
             throw std::runtime_error(
                 "persistent session append requires KVMem");
@@ -2066,6 +2094,7 @@ public:
             kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
             kvmem_api_boundary_pos_ = 0;
             kvmem_api_tail_tokens_.clear();
+            kvmem_api_tokens_.clear();
         } else if (!kvmem_api_session_active_ ||
                    kvmem_api_session_id_ != options.kvmem_session_id) {
             throw std::runtime_error(
@@ -2080,6 +2109,21 @@ public:
                           })
                     : CancellableTokenCallback{},
             /*reset_session=*/reset);
+    }
+
+    KvMemLocalCacheInfo kvmem_local_cache_info(
+            const std::string &id) override {
+        auto it = kvmem_local_caches_.find(id);
+        if (it == kvmem_local_caches_.end()) return {};
+        expire_local_kvmem_cache(it->second);
+        return local_kvmem_cache_info(it->second);
+    }
+
+    bool erase_kvmem_local_cache(const std::string &id) override {
+        auto it = kvmem_local_caches_.find(id);
+        if (it == kvmem_local_caches_.end()) return false;
+        evict_local_kvmem_cache(it->second, "evicted");
+        return true;
     }
 
     std::string generate_internal(const std::string &prompt,
@@ -2251,6 +2295,343 @@ public:
     }
 
 private:
+    struct LocalKvMemCacheEntry {
+        std::string id;
+        std::string status = "ready";
+        uint64_t version = 0;
+        uint32_t position = 0;
+        std::string fingerprint;
+        int64_t created_at = 0;
+        int64_t last_access_at = 0;
+        int64_t expires_at = 0;
+        QwenExecutor::StateSnapshot executor_state;
+        QwenExecutor::StateSnapshot api_boundary_state;
+        uint32_t api_boundary_pos = 0;
+        std::vector<uint32_t> api_tail_tokens;
+        std::vector<uint32_t> session_tokens;
+        std::vector<uint32_t> selected_blocks;
+        uint32_t total_blocks = 0;
+        QwenExecutor::KvMemTierUsage tier_usage;
+    };
+
+    static int64_t local_cache_unix_now() {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    static bool valid_local_kvmem_cache_id(const std::string &id) {
+        if (id.empty() || id.size() > 128) return false;
+        return std::all_of(id.begin(), id.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') ||
+                   (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') ||
+                   c == '-' || c == '_' || c == '.' || c == ':';
+        });
+    }
+
+    static std::string local_cache_fingerprint(
+            const std::vector<uint32_t> &tokens,
+            const EngineOptions &options, uint32_t position) {
+        // FNV-1a is an integrity/debug fingerprint, not an authentication
+        // primitive. Exact cache lookup is always the explicit ID + version.
+        uint64_t h = 1469598103934665603ULL;
+        auto mix_byte = [&](uint8_t value) {
+            h ^= static_cast<uint64_t>(value);
+            h *= 1099511628211ULL;
+        };
+        auto mix_u64 = [&](uint64_t value) {
+            for (int i = 0; i < 8; ++i) {
+                mix_byte(static_cast<uint8_t>(value & 0xffu));
+                value >>= 8;
+            }
+        };
+        auto mix_string = [&](const std::string &value) {
+            for (unsigned char c : value) mix_byte(c);
+            mix_byte(0);
+        };
+        mix_string(options.model_path);
+        mix_u64(static_cast<uint64_t>(options.ctx_size));
+        mix_u64(static_cast<uint64_t>(options.kvmem_block_tokens));
+        mix_u64(static_cast<uint64_t>(options.kvmem_budget));
+        mix_u64(static_cast<uint64_t>(options.kvmem_gen_budget));
+        mix_string(options.kvmem_retrieval_method);
+        mix_string(options.kvmem_index_placement);
+        mix_u64(position);
+        for (uint32_t token : tokens) mix_u64(token);
+        std::ostringstream out;
+        out << "fnv1a64:" << std::hex << std::setfill('0')
+            << std::setw(16) << h;
+        return out.str();
+    }
+
+    static KvMemLocalCacheInfo local_kvmem_cache_info(
+            const LocalKvMemCacheEntry &entry) {
+        KvMemLocalCacheInfo info;
+        info.found = true;
+        info.id = entry.id;
+        info.status = entry.status;
+        info.version = entry.version;
+        info.position = entry.position;
+        info.fingerprint = entry.fingerprint;
+        info.created_at = entry.created_at;
+        info.last_access_at = entry.last_access_at;
+        info.expires_at = entry.expires_at;
+        info.selected_blocks =
+            static_cast<uint32_t>(entry.selected_blocks.size());
+        info.total_blocks = entry.total_blocks;
+        info.gpu_bytes = entry.tier_usage.gpu_used_bytes;
+        info.cpu_bytes = entry.tier_usage.cpu_used_bytes;
+        info.nvme_bytes = entry.tier_usage.nvme_used_bytes;
+        return info;
+    }
+
+    static void evict_local_kvmem_cache(LocalKvMemCacheEntry &entry,
+                                        const char *status) {
+        entry.status = status;
+        entry.executor_state = QwenExecutor::StateSnapshot{};
+        entry.api_boundary_state = QwenExecutor::StateSnapshot{};
+        entry.api_tail_tokens.clear();
+        entry.session_tokens.clear();
+        entry.selected_blocks.clear();
+    }
+
+    static void expire_local_kvmem_cache(LocalKvMemCacheEntry &entry) {
+        if (entry.status == "ready" && entry.expires_at > 0 &&
+            local_cache_unix_now() >= entry.expires_at) {
+            evict_local_kvmem_cache(entry, "expired");
+        }
+    }
+
+    void invalidate_local_kvmem_caches(const char *status,
+                                       const std::string &except_id = {}) {
+        for (auto &[id, entry] : kvmem_local_caches_) {
+            if (!except_id.empty() && id == except_id) continue;
+            if (entry.status == "ready") {
+                evict_local_kvmem_cache(entry, status);
+            }
+        }
+    }
+
+    LocalKvMemCacheEntry &require_local_kvmem_cache(
+            const std::string &id, uint64_t expected_version,
+            bool expected_version_set) {
+        auto it = kvmem_local_caches_.find(id);
+        if (it == kvmem_local_caches_.end()) {
+            throw std::runtime_error(
+                "KVMem local cache not found: " + id);
+        }
+        expire_local_kvmem_cache(it->second);
+        if (it->second.status != "ready") {
+            throw std::runtime_error(
+                "KVMem local cache " + it->second.status + ": " + id);
+        }
+        if (expected_version_set &&
+            it->second.version != expected_version) {
+            throw std::runtime_error(
+                "KVMem local cache version conflict: id=" + id +
+                " expected=" + std::to_string(expected_version) +
+                " actual=" + std::to_string(it->second.version));
+        }
+        it->second.last_access_at = local_cache_unix_now();
+        return it->second;
+    }
+
+    void capture_local_kvmem_cache(const std::string &id, uint64_t version,
+                                   uint64_t ttl_seconds,
+                                   int64_t preserve_created_at = 0,
+                                   int64_t preserve_expires_at = 0) {
+        if (!executor_ || !executor_->kvmem_enabled()) {
+            throw std::runtime_error(
+                "KVMem local cache capture requires an active KVMem executor");
+        }
+        if (!kvmem_api_session_active_ ||
+            kvmem_api_session_id_ != id) {
+            throw std::runtime_error(
+                "KVMem local cache capture lost its active session");
+        }
+        LocalKvMemCacheEntry next;
+        next.id = id;
+        next.status = "ready";
+        next.version = version;
+        next.position = executor_->position();
+        const int64_t now = local_cache_unix_now();
+        next.created_at = preserve_created_at > 0
+            ? preserve_created_at : now;
+        next.last_access_at = now;
+        if (ttl_seconds > 0) {
+            const uint64_t bounded = std::min<uint64_t>(
+                ttl_seconds,
+                static_cast<uint64_t>(
+                    std::numeric_limits<int64_t>::max() - now));
+            next.expires_at = now + static_cast<int64_t>(bounded);
+        } else {
+            next.expires_at = preserve_expires_at;
+        }
+        next.api_boundary_pos = kvmem_api_boundary_pos_;
+        next.api_tail_tokens = kvmem_api_tail_tokens_;
+        next.session_tokens = kvmem_api_tokens_;
+        next.selected_blocks = kvmem_checkpoint_block_ids(executor_.get());
+        next.total_blocks = executor_->block_store()
+            ? executor_->block_store()->block_count() : 0;
+        next.tier_usage = executor_->kvmem_tier_usage();
+        next.fingerprint = local_cache_fingerprint(
+            next.session_tokens, options_, next.position);
+
+        DeviceStatus scope = device_->begin();
+        if (!scope.ok) throw std::runtime_error(scope.message);
+        bool scope_open = true;
+        try {
+            executor_->capture_state(next.executor_state);
+            next.api_boundary_state = kvmem_api_boundary_ckpt_.ready
+                ? clone_milestone_state_snapshot(kvmem_api_boundary_ckpt_)
+                : QwenExecutor::StateSnapshot{};
+            DeviceStatus done = device_->end();
+            scope_open = false;
+            if (!done.ok) throw std::runtime_error(done.message);
+        } catch (...) {
+            if (scope_open) (void)device_->end();
+            throw;
+        }
+        invalidate_local_kvmem_caches("evicted", id);
+        kvmem_local_caches_.insert_or_assign(id, std::move(next));
+        log("native kvmem local-cache SAVE id=" + id +
+            " version=" + std::to_string(version) +
+            " position=" + std::to_string(executor_->position()));
+    }
+
+    void restore_local_kvmem_cache(LocalKvMemCacheEntry &entry) {
+        DeviceStatus scope = device_->begin();
+        if (!scope.ok) throw std::runtime_error(scope.message);
+        bool scope_open = true;
+        try {
+            executor_->restore_state(entry.executor_state);
+            executor_->kvmem_truncate_to(entry.position);
+            if (!entry.selected_blocks.empty()) {
+                (void)executor_->kvmem_set_selection(entry.selected_blocks);
+            }
+            kvmem_api_boundary_pos_ = entry.api_boundary_pos;
+            kvmem_api_tail_tokens_ = entry.api_tail_tokens;
+            kvmem_api_tokens_ = entry.session_tokens;
+            kvmem_api_boundary_ckpt_ = entry.api_boundary_state.ready
+                ? clone_milestone_state_snapshot(entry.api_boundary_state)
+                : QwenExecutor::StateSnapshot{};
+            kvmem_api_session_active_ = true;
+            kvmem_api_session_id_ = entry.id;
+            DeviceStatus done = device_->end();
+            scope_open = false;
+            if (!done.ok) throw std::runtime_error(done.message);
+        } catch (...) {
+            if (scope_open) (void)device_->end();
+            throw;
+        }
+        log("native kvmem local-cache RESTORE id=" + entry.id +
+            " version=" + std::to_string(entry.version) +
+            " position=" + std::to_string(entry.position));
+    }
+
+    std::string generate_local_kvmem_cache(
+            const std::string &prompt, const GenerationOptions &options,
+            const CancellableTokenCallback &on_text) {
+        if (!options_.kvmem_enabled) {
+            throw std::runtime_error(
+                "KVMem local cache requires --kvmem");
+        }
+        const bool save = !options.kvmem_cache_save_id.empty();
+        const bool load = !options.kvmem_cache_load_id.empty();
+        if (save == load) {
+            throw std::invalid_argument(
+                "KVMem local cache request requires exactly one save or load");
+        }
+        const std::string &request_id = save
+            ? options.kvmem_cache_save_id : options.kvmem_cache_load_id;
+        if (!valid_local_kvmem_cache_id(request_id)) {
+            throw std::invalid_argument(
+                "KVMem local cache ID must be 1..128 characters from "
+                "[A-Za-z0-9_.:-]");
+        }
+        GenerationOptions effective = options;
+        effective.kvmem_cache_save_id.clear();
+        effective.kvmem_cache_load_id.clear();
+        effective.kvmem_cache_load_mode = KvMemLocalCacheMode::None;
+
+        if (save) {
+            if (options.max_tokens != 0) {
+                throw std::invalid_argument(
+                    "KVMem local cache save currently requires max_tokens=0");
+            }
+            if (options.kvmem_cache_ttl_seconds > 31536000) {
+                throw std::invalid_argument(
+                    "KVMem local cache TTL must be at most 31536000 seconds");
+            }
+            invalidate_local_kvmem_caches("evicted");
+            const std::string &id = options.kvmem_cache_save_id;
+            kvmem_api_session_active_ = true;
+            kvmem_api_session_id_ = id;
+            kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
+            kvmem_api_boundary_pos_ = 0;
+            kvmem_api_tail_tokens_.clear();
+            kvmem_api_tokens_.clear();
+            effective.kvmem_session_id = id;
+            std::string generated = generate_internal(
+                prompt, effective, on_text, /*reset_session=*/true);
+            capture_local_kvmem_cache(
+                id, /*version=*/1, options.kvmem_cache_ttl_seconds);
+            return generated;
+        }
+
+        const std::string &id = options.kvmem_cache_load_id;
+        if (options.kvmem_cache_load_mode == KvMemLocalCacheMode::None) {
+            throw std::invalid_argument(
+                "KVMem local cache load requires frozen or append mode");
+        }
+        if (options.kvmem_cache_load_mode == KvMemLocalCacheMode::Append) {
+            if (options.max_tokens != 0) {
+                throw std::invalid_argument(
+                    "KVMem local cache append currently requires "
+                    "max_tokens=0");
+            }
+            if (!options.kvmem_cache_expected_version_set) {
+                throw std::invalid_argument(
+                    "KVMem local cache append requires expected_version");
+            }
+        }
+        LocalKvMemCacheEntry &entry = require_local_kvmem_cache(
+            id, options.kvmem_cache_expected_version,
+            options.kvmem_cache_expected_version_set);
+        const uint64_t old_version = entry.version;
+        const int64_t created_at = entry.created_at;
+        const int64_t expires_at = entry.expires_at;
+        restore_local_kvmem_cache(entry);
+        effective.kvmem_session_id = id;
+        try {
+            std::string generated = generate_internal(
+                prompt, effective, on_text, /*reset_session=*/false);
+            if (options.kvmem_cache_load_mode ==
+                KvMemLocalCacheMode::Append) {
+                capture_local_kvmem_cache(
+                    id, old_version + 1, /*ttl_seconds=*/0,
+                    created_at, expires_at);
+            } else {
+                LocalKvMemCacheEntry &master = require_local_kvmem_cache(
+                    id, old_version, /*expected_version_set=*/true);
+                restore_local_kvmem_cache(master);
+            }
+            return generated;
+        } catch (...) {
+            auto it = kvmem_local_caches_.find(id);
+            if (it != kvmem_local_caches_.end() &&
+                it->second.status == "ready" &&
+                it->second.version == old_version) {
+                try {
+                    restore_local_kvmem_cache(it->second);
+                } catch (...) {
+                    evict_local_kvmem_cache(it->second, "failed");
+                }
+            }
+            throw;
+        }
+    }
+
     struct ContinuousBatchRequest {
         uint64_t id = 0;
         std::vector<uint32_t> prompt_tokens;
@@ -11858,6 +12239,13 @@ private:
                 api_sequence_tokens.begin() +
                     static_cast<std::ptrdiff_t>(tail_offset),
                 api_sequence_tokens.end());
+            if (reset_session) {
+                kvmem_api_tokens_ = prompt_tokens;
+            } else {
+                kvmem_api_tokens_.insert(kvmem_api_tokens_.end(),
+                                         prompt_tokens.begin(),
+                                         prompt_tokens.end());
+            }
             if (std::getenv("QW3_KVMEM_TRACE")) {
                 log("native kvmem api-session checkpoint: id=" +
                     options.kvmem_session_id + " boundary=" +
@@ -13404,6 +13792,15 @@ private:
     QwenExecutor::StateSnapshot kvmem_api_boundary_ckpt_;
     uint32_t kvmem_api_boundary_pos_ = 0;
     std::vector<uint32_t> kvmem_api_tail_tokens_;
+    // Canonical teacher-forced token history for named local-cache integrity
+    // metadata. This is host-only (4 bytes/token) and does not duplicate KV.
+    std::vector<uint32_t> kvmem_api_tokens_;
+
+    // Phase-1 request-level local checkpoint registry. Only one executor
+    // lineage can be ready at a time; a cold unrelated request evicts ready
+    // entries before reset_state clears their shared pool/tier authority.
+    std::unordered_map<std::string, LocalKvMemCacheEntry>
+        kvmem_local_caches_;
 
     std::vector<std::unique_ptr<DeviceTensor>> cb_k_cache_storage_;
     std::vector<std::unique_ptr<DeviceTensor>> cb_v_cache_storage_;

@@ -1,33 +1,246 @@
-# KVMem in-process milestone checkpoint benchmark
+# KVMem local checkpoint and milestone benchmark
 
-## Implementation status
+## Status
 
-The repository currently implements only the opt-in `kvmem-session` benchmark
-described in this document. Its milestone objects are private to one benchmark
-process and cannot be named, queried, or loaded by an HTTP request.
+Two related mechanisms are implemented:
 
-The request-level local cache API proposed below is a design only. In
-particular, the code does **not** currently contain:
+1. `qw3 kvmem-session` has private in-process milestones for repeated latency
+   probes at fixed context lengths.
+2. `/v1/chat/completions` exposes a named, process-local KVMem checkpoint API.
+   A client can prefill a history once, save it under an explicit ID, send only
+   a later query, and either discard that query branch (`frozen`) or publish a
+   prefill-only continuation (`append`).
 
-- a `freeze_to_local` or `kvmem_cache` request field;
-- a cache-ID registry or cache status endpoint;
-- hash-based cache lookup or validation;
-- a way to send only a new query and name a saved checkpoint;
-- TTL/LRU eviction, versioning, tenant isolation, or concurrent writers;
-- durable checkpoints that survive server restart.
+The request API is deliberately process-local. It retains executor state and
+references the existing GPU/CPU/NVMe KVMem pools; it does not serialize CUDA
+pointers or all model state into a portable file. It therefore does **not**
+survive a server restart. Persistent attach is a separate future phase.
 
-## Purpose
+## Request-level local checkpoints
 
-Long-context performance experiments previously issued one semantic query at
-each context length. A single observation mixes cold-start noise, block
-residency, retrieval variance, and query replay variance. The optional
-`kvmem-session` milestone mode prefills a context once, captures the exact
-logical state, and issues multiple queries without rebuilding the history.
+### Server requirements
 
-This is an in-process benchmark checkpoint. It is not yet a persistent
-cross-process checkpoint format.
+The server must run with ordinary KVMem and query-conditioned mean-k retrieval.
+Cache operations use the serialized plain request route, not continuous
+batching. No extra CLI switch is required for the API itself.
 
-## CLI
+For the Q8 GGUF used by the current smoke test, the complete command was:
+
+```bash
+QW3_Q8_BF16_MAIN=0 QW3_KVMEM_TRACE=1 ./build/qw3 serve \
+  --model ./models/Qwen3.6-27B-Q8_0.gguf \
+  --host 127.0.0.1 --port 18080 \
+  --ctx 131072 --prefill-chunk 2048 --mtp-chain 4 \
+  --kvmem --kvmem-block-tokens 512 \
+  --kvmem-budget 32768 --kvmem-gen-budget 32768 \
+  --kvmem-method retrieval --kvmem-retrieval-method mean-k \
+  --kvmem-query-conditioned --kvmem-index-placement gpu \
+  --kvmem-gpu-memory-ratio 0.5 --kvmem-cpu-gb 8 \
+  --kvmem-opt-stage-out off --kvmem-opt-stage-in on \
+  --kvmem-opt-pack on --temp 0
+```
+
+`QW3_Q8_BF16_MAIN=0` is a workaround for the existing Q8/BF16 batch RMSNorm
+limitation and is not part of the checkpoint design.
+
+### Save after prefill
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "...long history..."}
+  ],
+  "max_tokens": 0,
+  "kvmem_reselect": "off",
+  "kvmem_cache": {
+    "save": {
+      "id": "experiment-sample-001",
+      "scope": "local",
+      "when": "after_request",
+      "ttl_seconds": 86400
+    }
+  }
+}
+```
+
+The first implementation intentionally requires `max_tokens=0`. This gives an
+exact teacher-forced endpoint: the request prefills the messages without adding
+an assistant generation header, registers KVMem state, and publishes cache
+version 1 only after the request succeeds. `ttl_seconds` is optional, where 0
+means no TTL; the current maximum is one year.
+
+The explicit cache ID must contain 1–128 characters from
+`[A-Za-z0-9_.:-]`.
+
+### Frozen query
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "What is the final answer?"}
+  ],
+  "max_tokens": 32768,
+  "kvmem_reselect": "force",
+  "kvmem_query_message_range": {
+    "message_begin": 0,
+    "message_end": 1
+  },
+  "kvmem_cache": {
+    "load": {
+      "id": "experiment-sample-001",
+      "mode": "frozen",
+      "required": true,
+      "expected_version": 1
+    }
+  }
+}
+```
+
+Only the new query is transmitted. Its rendered tokens are appended at the
+saved logical position, semantic reselection and query replay run normally,
+and decoding produces an answer. When the request ends, the query/answer branch
+is discarded and the exact saved executor, recurrent, API-boundary, tail, pool,
+and selected-window state is restored. Repeated frozen queries therefore start
+from the same history version.
+
+`expected_version` is optional for frozen reads but recommended for controlled
+experiments. `required` is effectively always true: a missing, expired,
+evicted, or failed cache never silently falls back to full prefill.
+
+### Incremental append
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "...next teacher-forced history fragment..."}
+  ],
+  "max_tokens": 0,
+  "kvmem_cache": {
+    "load": {
+      "id": "experiment-sample-001",
+      "mode": "append",
+      "required": true,
+      "expected_version": 1
+    }
+  }
+}
+```
+
+Append restores version 1, prefills only the supplied suffix, and atomically
+replaces the registry entry with version 2. `expected_version` is mandatory;
+a stale writer receives HTTP 409. Append currently also requires
+`max_tokens=0`: generated assistant output cannot yet be used as the exact
+published continuation boundary. A caller should submit recorded user,
+assistant, and tool messages as teacher-forced history fragments.
+
+### Response metadata
+
+Both save and load responses include:
+
+```json
+{
+  "kvmem_cache": {
+    "id": "experiment-sample-001",
+    "version": 2,
+    "status": "ready",
+    "position": 52037,
+    "fingerprint": "fnv1a64:...",
+    "scope": "local",
+    "created_at": 1785,
+    "last_access_at": 1786,
+    "expires_at": null,
+    "selected_blocks": 64,
+    "total_blocks": 102,
+    "residency": {
+      "gpu_bytes": 1800404992,
+      "cpu_bytes": 1853882368,
+      "nvme_bytes": 0
+    }
+  }
+}
+```
+
+The FNV-1a value covers relevant model/KVMem configuration, logical position,
+and canonical history token IDs. It is diagnostic integrity metadata, not an
+authentication primitive and not the lookup key. Lookup uses explicit
+`id + version`.
+
+### Status and delete
+
+```text
+GET    /v1/kvmem/caches/{id}
+DELETE /v1/kvmem/caches/{id}
+```
+
+GET returns current metadata, including `ready`, `expired`, `evicted`, or
+`failed`. DELETE marks the cache evicted and releases its saved state. A later
+load is explicit failure, not a cold-prefill fallback.
+
+Load error mapping is:
+
+- 400: invalid operation or parameters;
+- 404: unknown ID;
+- 409: `expected_version` conflict;
+- 410: known but expired or evicted cache.
+
+### Registry contents and pool ownership
+
+A ready entry saves:
+
+- executor position, logical main/MTP pages, hidden state, MTP prefix state,
+  and DeltaNet recurrent/convolution state;
+- API block-aligned checkpoint, partial-block tail, and canonical session token
+  IDs;
+- selected KVMem block IDs and tier-usage metadata;
+- ID, version, TTL timestamps, position, and configuration fingerprint.
+
+Historical K/V, raw-K, mean-K indices, and tier manifests remain authoritative
+in the existing executor-owned GPU/CPU/NVMe pools. The cache entry references
+that lineage instead of duplicating all historical KV, so saving a 1M-token
+history does not create a second 1M-token KV allocation.
+
+The current executor and block store support one live lineage. Consequently,
+creating a different named cache, issuing an unrelated cold request, or using
+the legacy mutable session API evicts any previous ready named cache. Tombstone
+metadata remains queryable. Supporting multiple independent ready IDs requires
+block refcounts/copy-on-write and independent tier manifests; claiming that
+without those mechanisms would permit stale GPU/CPU/NVMe references.
+
+The HTTP server also serializes these operations with its generation mutex.
+There are no concurrent frozen readers or concurrent writers in this phase.
+
+### Reusable smoke test
+
+With a server running at port 18080:
+
+```bash
+python3 scripts/kvmem_local_cache_smoke.py \
+  --base-url http://127.0.0.1:18080/v1 \
+  --cache-id local-smoke-001 \
+  --history-repeats 5200
+```
+
+The script verifies save, two frozen queries, append to version 2, a frozen
+query against version 2, stale append rejection, status, and delete.
+
+The initial real-model validation used 52,023 prompt tokens:
+
+| Operation | Result | Wall time |
+|---|---:|---:|
+| Save | ready, v1, position 52,023 | 14.966 s |
+| Frozen query 1 | `CERULEAN-7319`, still v1/52,023 | 1.475 s |
+| Frozen query 2 | `CERULEAN-7319`, still v1/52,023 | 0.767 s |
+| Append | ready, v2, position 52,037 | completed |
+| Frozen query v2 | `amber` | completed |
+| Stale append expecting v1 | HTTP 409 | expected failure |
+
+Trace logs confirmed that suffix-relative query spans were shifted to the saved
+logical position, query replay ran, and mean-k retrieval reported no fallback.
+
+## Private `kvmem-session` milestone benchmark
+
+The request API above is for real experiment clients. The existing profiler is
+still useful for low-variance repeated timing at synthetic context ladders:
 
 ```bash
 ./build/qw3 kvmem-session \
@@ -40,47 +253,13 @@ cross-process checkpoint format.
   [ordinary KVMem options]
 ```
 
-New controls:
+- `frozen` restores the same private milestone before each probe.
+- `sequential` restores once and lets later probes see earlier probe turns.
+- Capture/restore includes the executor, block-aligned API checkpoint, tail and
+  complete host-side session token lineage, plus the selected working set.
+- Capture and restore time are reported separately from query `total_ms`.
 
-- `--session-repeat-queries N`: issue `N` queries at every ladder target. The
-  default is `0`, which preserves the original profiling path.
-- `--session-repeat-mode frozen`: restore the same milestone before every
-  query. This measures independent query latency on one fixed history.
-- `--session-repeat-mode sequential`: restore once, then let later probes see
-  earlier probe turns. This models a warm multi-query agent session.
-
-The Python driver exposes the same controls as `--repeat-queries` and
-`--repeat-mode`. It writes parsed rows to `repeated_queries` in the output JSON.
-
-## Exact lifecycle
-
-When repeated-query mode is enabled, each ladder point runs as follows:
-
-1. Incrementally ingest only the context delta with `max_tokens=0`.
-2. Do ordinary pressure selection while the bounded GPU pool fills, but do not
-   perform a synthetic final semantic selection during history ingest.
-3. Capture the milestone at the exact requested logical position.
-4. Save all state needed by an in-process branch:
-   - executor position and logical main/MTP page counts;
-   - hidden state, MTP prefix hidden state, DeltaNet recurrent and convolution
-     states;
-   - KVMem registration and compact-window metadata;
-   - the API session's block-aligned checkpoint and unaligned tail tokens;
-   - the selected working-set block IDs.
-5. Append a synthetic query, force semantic reselection, replay the query, and
-   decode the requested probe tokens.
-6. In `frozen` mode, restore step 4 before every query. In `sequential` mode,
-   continue from the preceding probe.
-7. Restore the milestone after all probes so the next ladder point appends only
-   its true context delta.
-
-Restoration truncates branch-only KVMem blocks and re-materializes the captured
-working set. Checkpoint capture and restore time are reported separately and
-are excluded from the query's `total_ms`.
-
-## Output
-
-Each probe emits one machine-parseable line:
+Each probe emits:
 
 ```text
 [kvmem-session-query] turn=... query=... mode=frozen base=... \
@@ -89,210 +268,24 @@ Each probe emits one machine-parseable line:
   stage_in_ms=... stage_out_ms=... assemble_ms=... decoded=...
 ```
 
-For each context length, report at least median, mean, p95, and standard
-deviation for total query time, semantic selection, query replay, retrieval
-score, stage-in, stage-out, and assembly. At least 20 queries are recommended.
+For each context length, report median, mean, p95, and standard deviation over
+at least 20 queries. Restoration deliberately skips full history prefill and
+pressure stage-out; it must not replace cold-prefill throughput experiments.
 
-## Compatibility and limitations
+## Future persistent attach
 
-- All new behavior is opt-in. With `repeat_queries=0`, the legacy profiler does
-  not receive the new CLI flags and keeps its previous prefill/decode lifecycle.
-- The checkpoint stores small model state on the device but does not duplicate
-  the complete historical KV. Historical blocks remain authoritative in the
-  existing GPU/CPU/NVMe tiers.
-- Frozen restoration fixes logical history and selected GPU working set. It does
-  not currently flush the OS page cache or erase lower-tier heat, so a separate
-  `canonical-cold` policy is still needed for controlled cold-I/O measurements.
-- The snapshot cannot survive process exit. Cross-process recovery requires a
-  durable manifest, persistent NVMe backing rather than the current ephemeral
-  unlinked file, model/config hashes, logical block-to-backing mappings, and GPU
-  re-materialization on attach.
-- Restored runs intentionally cannot replace full-prefill throughput or pressure
-  stage-out experiments, because those costs are skipped by restoration.
+Cross-restart recovery needs an append-only canonical backing store and a
+portable manifest recording high-watermark, logical block metadata, retrieval
+index offsets, recurrent/MTP tensors, model/config hashes, and selected block
+IDs. It must never serialize CUDA pointers, GPU physical-page IDs,
+pinned-host pointers, or live asynchronous-I/O handles.
 
-## Proposed request-level local freeze cache (not implemented)
+That phase also needs:
 
-### Objective
+- durable checkpoint file format and atomic manifest publication;
+- block reference counts/copy-on-write for multiple named histories;
+- attach-time compatibility validation and lazy active-window materialization;
+- quota/LRU policy, authentication/tenant isolation, and corruption handling.
 
-Allow an ordinary inference request to freeze its completed KVMem state under a
-local cache ID. Later requests can name that cache and send only a new query,
-without resending or re-prefilling the long history.
-
-The explicit cache ID is the primary lookup mechanism. A content fingerprint is
-secondary metadata for integrity checking and deduplication; it is not the
-normal access key.
-
-### Proposed save request
-
-For a prefill-only context ingest:
-
-```json
-{
-  "messages": [
-    {"role": "user", "content": "...long context..."}
-  ],
-  "max_tokens": 0,
-  "kvmem_cache": {
-    "save": {
-      "id": "experiment-sample-001",
-      "scope": "local",
-      "when": "after_request",
-      "ttl_seconds": 86400
-    }
-  }
-}
-```
-
-With `max_tokens=0`, `after_request` means the state immediately after prompt
-prefill. On a generating request, it means the state after successful decode
-and final KV/KVMem registration. The response should return authoritative cache
-metadata:
-
-```json
-{
-  "kvmem_cache": {
-    "id": "experiment-sample-001",
-    "version": 1,
-    "status": "ready",
-    "position": 1048576,
-    "fingerprint": "sha256:...",
-    "scope": "local"
-  }
-}
-```
-
-The server must not report `ready` until pending raw-K persistence, mean-K index
-capture, KVMem registration, and tier writes required by the checkpoint have
-reached a recoverable boundary.
-
-### Proposed query-only load request
-
-```json
-{
-  "messages": [
-    {"role": "user", "content": "What is the final answer?"}
-  ],
-  "max_tokens": 32768,
-  "kvmem_cache": {
-    "load": {
-      "id": "experiment-sample-001",
-      "mode": "frozen",
-      "required": true
-    }
-  }
-}
-```
-
-The server restores the named checkpoint, renders the supplied messages as a
-continuation suffix (without a second BOS/system prefix), performs semantic
-reselection and query replay, and decodes normally. The client does not resend
-the frozen history.
-
-`required=true` makes a missing, evicted, incompatible, or corrupt cache an
-explicit error. The server must not silently fall back to a full prefill because
-that would invalidate latency measurements and can change model behavior.
-
-### Load modes
-
-`frozen` is a read-only branch:
-
-```text
-checkpoint -> query A -> answer A -> discard branch
-checkpoint -> query B -> answer B -> discard branch
-```
-
-Each request starts from the same logical checkpoint. Query-specific retrieval
-and query replay still occur. The original checkpoint remains unchanged.
-
-`append` is an optimistic, sequential update:
-
-```text
-checkpoint v3 -> query -> answer -> atomically publish checkpoint v4
-```
-
-An append request should carry `expected_version`. Publishing succeeds only if
-the named cache is still at that version, preventing two concurrent requests
-from silently overwriting each other. The first implementation may atomically
-replace the old version rather than retain a version tree.
-
-### Identity, lookup, and fingerprints
-
-The recommended identity model is:
-
-```text
-explicit cache ID  -> lookup and lifecycle control
-version            -> ordered updates / compare-and-swap
-fingerprint        -> compatibility validation and deduplication
-```
-
-The fingerprint should cover at least:
-
-- model and tokenizer identity;
-- model/KVMem configuration that affects state interpretation;
-- canonical prefix token IDs and logical checkpoint position;
-- checkpoint format version.
-
-A random opaque server-generated ID is safest by default. A client-provided
-alias is useful for controlled experiments, but must be scoped to the
-authenticated tenant. Hash-only lookup is insufficient because it requires the
-caller to possess or recompute the full prefix, does not naturally represent
-sequential versions, and makes lifecycle control less explicit.
-
-### Proposed status endpoint
-
-```text
-GET /v1/kvmem/caches/{cache_id}
-```
-
-It should report `creating`, `ready`, `evicted`, `incompatible`, or `failed`,
-plus version, logical position, TTL, last-access time, and GPU/CPU/NVMe block
-residency. Cache IDs must be unguessable or authorization-scoped so one tenant
-cannot restore another tenant's history.
-
-### Local registry contents
-
-The registry entry needs to retain or reference:
-
-- executor and DeltaNet recurrent/conv state;
-- main/MTP logical page counts and MTP prefix state;
-- API block-aligned checkpoint and partial-block tail tokens;
-- KVMem registered position, active-window metadata, and selected block IDs;
-- references to historical GPU/CPU/NVMe block authority and retrieval indices;
-- configuration hashes, cache version, TTL, and refcounts.
-
-It should not duplicate the complete historical KV for every checkpoint. Frozen
-branches share immutable historical backing and allocate only branch suffix
-state. Append should use copy-on-write or atomic replacement.
-
-### Correctness constraints before implementation
-
-The current benchmark can truncate one private branch because it owns a single
-active milestone. A general cache registry cannot do that blindly: truncating
-one restored branch must not release blocks referenced by another saved cache.
-Named caches therefore require block/reference ownership or copy-on-write before
-multiple versions are exposed.
-
-The request layer must also define continuation tokenization explicitly. Sending
-only a new chat message must append the correct role/template tokens to the
-saved token stream; it must not add a new conversation BOS or duplicate system
-prompt. Cache restore must validate model, tokenizer, KV dtype, block geometry,
-retrieval method, and checkpoint format before touching executor state.
-
-### Suggested implementation phases
-
-1. Single-process registry, server-generated IDs, `save` plus read-only
-   `frozen` loads, explicit cache-miss errors, no version tree.
-2. Atomic `append` with `expected_version`, one current version per cache ID,
-   refcounted shared history, and TTL/LRU eviction.
-3. Status/delete endpoints, quotas, tenant isolation, metrics, and controlled
-   concurrent frozen readers.
-4. Persistent manifests and attach after process restart, as described below.
-
-## Next phase: persistent attach
-
-The persistent format should use one append-only canonical backing store shared
-by 1M/5M/10M manifests. A manifest records a high-watermark plus logical block
-metadata, retrieval-index offsets, recurrent/MTP state, configuration hashes,
-and selected block IDs. It must never serialize CUDA pointers, GPU physical page
-IDs, pinned-host pointers, or asynchronous I/O handles. Restore attaches the
-backing file and materializes only the active KVMem window.
+Until those are implemented, `scope=local` means the currently running qw3
+server process, not merely the same machine.
