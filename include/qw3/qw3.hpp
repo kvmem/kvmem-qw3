@@ -104,6 +104,9 @@ struct EngineOptions {
     // in pageable host memory and streams bounded tiles through the GPU.
     std::string kvmem_index_placement = "gpu"; // gpu or cpu
     int kvmem_index_staging_mb = 64;           // per GPU/host staging slot
+    // Host-side KVMem worker/memory locality. auto follows the active GPU's
+    // sysfs PCI locality; off preserves OS scheduling; node:N is an override.
+    std::string kvmem_numa_policy = "auto"; // auto|off|node:N
     // Adaptive CPU index scoring: auto uses a one-transfer/one-dot per-layer
     // path when a layer fits the bounded staging cap, otherwise the exact
     // two-pass tiled compatibility path.

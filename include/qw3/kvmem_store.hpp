@@ -240,6 +240,7 @@ struct KvMemStoreConfig {
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
     KvMemIndexPlacement index_placement = KvMemIndexPlacement::GPU;
     uint64_t index_staging_bytes = 64ull * 1024ull * 1024ull;
+    std::string numa_policy = "auto";
     KvMemAdaptiveScoreMode adaptive_score_mode =
         KvMemAdaptiveScoreMode::Auto;
     uint32_t n_subblocks = 1;        // --kvmem-subblocks; sub-block means per block

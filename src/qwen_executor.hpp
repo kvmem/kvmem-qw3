@@ -602,10 +602,9 @@ public:
         uint64_t assemble_pages_ns = 0;
         uint64_t assemble_rerope_ns = 0;
         uint64_t assemble_kbar_ns = 0;
-        // Subset of assemble_rerope_ns spent draining the final outstanding
-        // raw-K H2D / scatter-RoPE / MTP work.  Keeping this separate exposes
-        // pipeline tail bubbles without double-counting it in the conserved
-        // top-level timing.
+        // Terminal wait for all submitted page-table, raw-K H2D/scatter-RoPE,
+        // MTP and k-bar work. The assembly substeps report host submission
+        // intervals; this disjoint tail closes the conserved top-level wall.
         uint64_t assemble_final_drain_ns = 0;
         uint32_t retrieval_calls = 0;
         uint32_t stage_in_calls = 0;
@@ -893,6 +892,13 @@ private:
     // run mutex and lets sparse V gathering use more workers than block-major
     // raw K when V is the measured critical branch.
     std::unique_ptr<KvmemCpuWorkerPool> kvmem_stagein_worker_pool_;
+    // Runtime-resolved GPU-local CPU set. Empty means the portable unbound
+    // fallback. Helpers stay pinned; the executor thread is bound only while
+    // it participates in KVMem CPU packing/gather work.
+    std::vector<int> kvmem_numa_cpus_;
+    int kvmem_numa_node_ = -1;
+    std::string kvmem_numa_source_ = "disabled";
+    std::string kvmem_numa_pci_bus_id_;
     bool kvmem_stagein_assembly_overlap_enabled_ = false;
     bool kvmem_stagein_assembly_overlap_active_ = false;
     // Stage-out may retain a clean spill record after CPU->GPU stage-in.

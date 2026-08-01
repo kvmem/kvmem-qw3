@@ -342,6 +342,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--index-placement", choices=("gpu", "cpu"),
                     default="gpu")
     ap.add_argument("--index-staging-mb", type=int, default=64)
+    ap.add_argument("--numa-policy", default="auto",
+                    help="KVMem host locality: auto, off, or node:N")
     ap.add_argument("--gpu-ratio", type=float, default=0.5,
                     help="GPU KV-pool cap as a fraction of total device memory")
     ap.add_argument("--cpu-gb", type=float, default=64.0)
@@ -423,6 +425,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--kvmem-adaptive-gain-2to4", str(args.adaptive_gain_2to4),
         "--kvmem-index-placement", args.index_placement,
         "--kvmem-index-staging-mb", str(args.index_staging_mb),
+        "--kvmem-numa-policy", args.numa_policy,
         "--kvmem-gpu-memory-ratio", str(args.gpu_ratio),
     ]
     # Keep the default command line byte-compatible with older binaries and

@@ -99,6 +99,10 @@ public:
     // total bytes are used for KVMem ratio-based KV residency budgeting.
     virtual uint64_t free_device_bytes() const { return 0; }
     virtual uint64_t total_device_bytes() const { return 0; }
+    // PCI bus/device/function for topology-aware host-side I/O placement.
+    // CUDA returns the canonical domain:bus:device.function string; CPU/mock
+    // backends leave it empty so callers can fall back without special cases.
+    virtual std::string pci_bus_id() const { return {}; }
 
     // CUDA-graph capture hooks. Default impls are no-ops so non-CUDA backends
     // pass through. The intended pattern, used for the per-token decode loop:

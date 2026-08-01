@@ -8933,6 +8933,19 @@ public:
     explicit CudaDeviceBackend(LinearBackend linear_backend)
         : linear_backend_(linear_backend) {}
 
+    std::string pci_bus_id() const override {
+        int device = 0;
+        char id[32] = {};
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetPCIBusId(id, sizeof(id), device) != cudaSuccess) {
+            // Topology is an optimization hint. Clear a possible sticky CUDA
+            // error and let the executor use its portable unbound fallback.
+            (void)cudaGetLastError();
+            return {};
+        }
+        return std::string(id);
+    }
+
     ~CudaDeviceBackend() override {
         for (HostEmbeddingSlot &slot : host_embedding_slots_) {
             if (slot.in_flight && slot.ready) {

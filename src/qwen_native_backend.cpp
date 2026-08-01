@@ -6569,6 +6569,7 @@ private:
             static_cast<uint64_t>(
                 std::max(1, options_.kvmem_index_staging_mb)) *
             1024ull * 1024ull;
+        bs_cfg.numa_policy = options_.kvmem_numa_policy;
         bs_cfg.adaptive_score_mode =
             options_.kvmem_adaptive_score_mode == "layer-one-pass"
                 ? KvMemAdaptiveScoreMode::LayerOnePass
@@ -13253,7 +13254,7 @@ private:
         m << "    stage-out  (GPU -> CPU/NVMe evict)     = "
           << std::setw(10) << stage_out_ms << " ms  (" << stage_out_blocks
           << " blk)\n";
-        m << "    assemble   (pages+re-RoPE+k-bar)       = "
+        m << "    assemble   (submit phases + final drain) = "
           << std::setw(10) << assemble_ms << " ms  (pages=" << asm_pages_ms
           << " rerope=" << asm_rerope_ms
           << " final_drain=" << asm_final_drain_ms

@@ -18,15 +18,205 @@
 #include <thread>
 #include <utility>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
 
 namespace qw3 {
 
+namespace {
+
+std::string kvmem_read_first_line(const std::string &path) {
+    std::ifstream in(path);
+    std::string line;
+    if (in) std::getline(in, line);
+    return line;
+}
+
+std::vector<int> kvmem_parse_cpu_list(const std::string &text) {
+    std::vector<int> cpus;
+    std::istringstream input(text);
+    std::string item;
+    while (std::getline(input, item, ',')) {
+        const size_t dash = item.find('-');
+        try {
+            const int first = std::stoi(item.substr(0, dash));
+            const int last = dash == std::string::npos
+                ? first : std::stoi(item.substr(dash + 1));
+            if (first < 0 || last < first || last > 1048575) return {};
+            for (int cpu = first; cpu <= last; ++cpu) cpus.push_back(cpu);
+        } catch (...) {
+            return {};
+        }
+    }
+    std::sort(cpus.begin(), cpus.end());
+    cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+    return cpus;
+}
+
+std::string kvmem_format_cpu_list(const std::vector<int> &cpus) {
+    if (cpus.empty()) return "-";
+    std::ostringstream out;
+    for (size_t i = 0; i < cpus.size();) {
+        size_t j = i;
+        while (j + 1 < cpus.size() && cpus[j + 1] == cpus[j] + 1) ++j;
+        if (i != 0) out << ',';
+        out << cpus[i];
+        if (j != i) out << '-' << cpus[j];
+        i = j + 1;
+    }
+    return out.str();
+}
+
+std::vector<int> kvmem_filter_allowed_cpus(std::vector<int> cpus) {
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (pthread_getaffinity_np(
+            pthread_self(), sizeof(allowed), &allowed) == 0) {
+        cpus.erase(
+            std::remove_if(
+                cpus.begin(), cpus.end(), [&](int cpu) {
+                    return cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed);
+                }),
+            cpus.end());
+    }
+#endif
+    return cpus;
+}
+
+struct KvmemNumaPlacement {
+    int node = -1;
+    std::vector<int> cpus;
+    std::string source = "disabled";
+    std::string pci_bus_id;
+};
+
+std::string kvmem_sysfs_pci_bdf(std::string bdf) {
+    // nvidia-smi commonly prints an eight-digit domain while Linux sysfs uses
+    // four. CUDA versions differ, so accept both canonical spellings.
+    const size_t colon = bdf.find(':');
+    if (colon == 8 && bdf.substr(0, 4) == "0000") bdf.erase(0, 4);
+    return bdf;
+}
+
+KvmemNumaPlacement kvmem_resolve_numa_placement(
+        const DeviceBackend &backend, const std::string &policy) {
+    KvmemNumaPlacement out;
+    if (policy == "off" || policy.empty()) return out;
+    std::string cpulist_path;
+    if (policy.rfind("node:", 0) == 0) {
+        try {
+            out.node = std::stoi(policy.substr(5));
+        } catch (...) {
+            out.source = "invalid-override";
+            return out;
+        }
+        cpulist_path = "/sys/devices/system/node/node" +
+            std::to_string(out.node) + "/cpulist";
+        out.source = "explicit-node";
+    } else if (policy == "auto") {
+        out.pci_bus_id = kvmem_sysfs_pci_bdf(backend.pci_bus_id());
+        if (out.pci_bus_id.empty()) {
+            out.source = "no-device-topology";
+            return out;
+        }
+        const std::string root =
+            "/sys/bus/pci/devices/" + out.pci_bus_id;
+        cpulist_path = root + "/local_cpulist";
+        const std::string node = kvmem_read_first_line(root + "/numa_node");
+        try {
+            if (!node.empty()) out.node = std::stoi(node);
+        } catch (...) {
+            out.node = -1;
+        }
+        out.source = "gpu-pci-locality";
+    } else {
+        out.source = "invalid-policy";
+        return out;
+    }
+    out.cpus = kvmem_filter_allowed_cpus(
+        kvmem_parse_cpu_list(kvmem_read_first_line(cpulist_path)));
+    if (out.cpus.empty()) out.source += "-unavailable";
+    return out;
+}
+
+class KvmemThreadAffinityScope {
+public:
+    explicit KvmemThreadAffinityScope(const std::vector<int> &cpus) {
+#if defined(__linux__)
+        if (cpus.empty()) return;
+        CPU_ZERO(&previous_);
+        CPU_ZERO(&target_);
+        if (pthread_getaffinity_np(
+                pthread_self(), sizeof(previous_), &previous_) != 0) {
+            return;
+        }
+        for (int cpu : cpus) {
+            if (cpu >= 0 && cpu < CPU_SETSIZE &&
+                CPU_ISSET(cpu, &previous_)) {
+                CPU_SET(cpu, &target_);
+            }
+        }
+        if (CPU_COUNT(&target_) == 0 ||
+            CPU_EQUAL(&previous_, &target_)) {
+            return;
+        }
+        active_ = pthread_setaffinity_np(
+            pthread_self(), sizeof(target_), &target_) == 0;
+#else
+        (void)cpus;
+#endif
+    }
+
+    ~KvmemThreadAffinityScope() {
+#if defined(__linux__)
+        if (active_) {
+            (void)pthread_setaffinity_np(
+                pthread_self(), sizeof(previous_), &previous_);
+        }
+#endif
+    }
+
+private:
+#if defined(__linux__)
+    cpu_set_t previous_{};
+    cpu_set_t target_{};
+#endif
+    bool active_ = false;
+};
+
+void kvmem_pin_worker_thread(const std::vector<int> &cpus, size_t index) {
+#if defined(__linux__)
+    if (cpus.empty()) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    // One CPU per helper avoids migrations and spreads a pool deterministically
+    // across the GPU-local NUMA node. The caller thread remains an additional
+    // participant and is temporarily bound to the full local set by run().
+    const int cpu = cpus[index % cpus.size()];
+    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+        CPU_SET(cpu, &set);
+        (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    }
+#else
+    (void)cpus;
+    (void)index;
+#endif
+}
+
+}  // namespace
+
 class KvmemCpuWorkerPool {
 public:
-    explicit KvmemCpuWorkerPool(size_t helper_count) {
+    explicit KvmemCpuWorkerPool(
+            size_t helper_count, std::vector<int> preferred_cpus = {})
+        : preferred_cpus_(std::move(preferred_cpus)) {
         threads_.reserve(helper_count);
         for (size_t index = 0; index < helper_count; ++index) {
             threads_.emplace_back([this, index]() { worker_loop(index); });
@@ -64,6 +254,7 @@ public:
         // mutex so future prefetch/assembly overlap cannot publish two jobs
         // into the same pool concurrently.
         std::lock_guard<std::mutex> run_lock(run_mu_);
+        KvmemThreadAffinityScope affinity(preferred_cpus_);
         {
             std::lock_guard<std::mutex> lock(mu_);
             task_ = task;
@@ -110,6 +301,7 @@ private:
     }
 
     void worker_loop(size_t helper_index) {
+        kvmem_pin_worker_thread(preferred_cpus_, helper_index);
         uint64_t observed_generation = 0;
         std::unique_lock<std::mutex> lock(mu_);
         for (;;) {
@@ -136,6 +328,7 @@ private:
     std::condition_variable work_cv_;
     std::condition_variable done_cv_;
     std::vector<std::thread> threads_;
+    std::vector<int> preferred_cpus_;
     std::function<void(size_t)> task_;
     std::atomic<size_t> next_task_{0};
     size_t task_count_ = 0;
@@ -1723,6 +1916,7 @@ void QwenExecutor::kvmem_prepare_cpu_mean_index(
         uint64_t elements, uint32_t layers, uint32_t stride_blocks,
         bool preserve_content_index) {
     if (!kvmem_mean_index_cpu() || !block_store_) return;
+    KvmemThreadAffinityScope numa_scope(kvmem_numa_cpus_);
     kvmem_drain_mean_index_capture();
     const QwenConfig &cfg = model_.config();
     const uint32_t ns = std::max<uint32_t>(1, kvmem_qc_n_subblocks_);
@@ -2317,6 +2511,7 @@ void QwenExecutor::kvmem_persist_raw_k_chunk(
 }
 
 void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
+    KvmemThreadAffinityScope numa_scope(kvmem_numa_cpus_);
     for (uint32_t slot_index = 0;
          slot_index < kvmem_raw_writeback_slots_.size();
          ++slot_index) {
@@ -2802,6 +2997,7 @@ void QwenExecutor::kvmem_write_raw_k(
         uint32_t layer_slot, uint32_t base, const uint8_t *src,
         uint32_t rows, bool mtp) {
     if (rows == 0) return;
+    KvmemThreadAffinityScope numa_scope(kvmem_numa_cpus_);
     if (kvmem_raw_k_nvme_enabled_) {
         const uint64_t end =
             static_cast<uint64_t>(base) + rows;
@@ -6716,7 +6912,8 @@ void QwenExecutor::kvmem_start_query_prefetch(
         }
     };
     if (!kvmem_query_prefetch_enabled_ || !block_store_ ||
-        !kvmem_gpu_page_pool_ || !kvmem_cpu_tier_ ||
+        !kvmem_gpu_page_pool_ ||
+        (!kvmem_cpu_tier_ && !kvmem_nvme_tier_) ||
         kvmem_prefetch_.active || kvmem_pending_reselect_ ||
         replay_suffix_tokens == 0) {
         trace_skip("prerequisite");
@@ -6748,37 +6945,32 @@ void QwenExecutor::kvmem_start_query_prefetch(
     const uint32_t max_blocks = std::max<uint32_t>(
         1, env_uint32_or("QW3_KVMEM_QUERY_PREFETCH_BLOCKS", 512));
 
-    struct Candidate {
-        uint32_t block_id = 0;
-        double score = 0.0;
-    };
-    std::vector<Candidate> ranked;
+    std::vector<uint32_t> guaranteed;
     const auto &blocks = block_store_->blocks();
-    ranked.reserve(blocks.size());
-    for (const KvMemBlock &b : blocks) {
-        if (b.tier != KvTier::CPU || b.cpu_slot < 0 ||
-            kvmem_block_pages_resident(b)) {
-            continue;
-        }
-        // profile_score is query-independent and therefore available before
-        // the first-pass query has produced its semantic mean-K score. The
-        // recency tie-break makes the choice deterministic when no heat has
-        // yet been accumulated.
-        ranked.push_back(Candidate{b.block_id, b.profile_score});
+    const uint32_t block_count = static_cast<uint32_t>(blocks.size());
+    const uint32_t sink = std::min(cfg.sink_blocks, block_count);
+    const uint32_t recent = std::min(cfg.recent_blocks, block_count);
+    guaranteed.reserve(static_cast<size_t>(sink) + recent);
+    for (uint32_t id = 0; id < sink; ++id) guaranteed.push_back(id);
+    const uint32_t recent_begin = block_count - recent;
+    for (uint32_t id = recent_begin; id < block_count; ++id) {
+        if (id >= sink) guaranteed.push_back(id);
     }
-    std::sort(
-        ranked.begin(), ranked.end(),
-        [](const Candidate &a, const Candidate &b) {
-            if (a.score != b.score) return a.score > b.score;
-            return a.block_id > b.block_id;
-        });
 
     KvMemPlan advisory;
     advisory.remaps.reserve(
-        std::min<size_t>(ranked.size(), max_blocks));
-    for (const Candidate &candidate : ranked) {
+        std::min<size_t>(guaranteed.size(), max_blocks));
+    for (uint32_t block_id : guaranteed) {
         if (advisory.remaps.size() >= max_blocks) break;
-        const KvMemBlock &block = blocks[candidate.block_id];
+        const KvMemBlock &block = blocks[block_id];
+        if (kvmem_block_pages_resident(block)) continue;
+        const bool cpu_backed =
+            block.tier == KvTier::CPU && block.cpu_slot >= 0 &&
+            kvmem_cpu_tier_;
+        const bool ssd_backed =
+            block.tier == KvTier::SSD && block.nvme_slot >= 0 &&
+            kvmem_nvme_tier_;
+        if (!cpu_backed && !ssd_backed) continue;
         const uint32_t first_page = block.orig_pos_start / page_size;
         const uint32_t last_page =
             (block.orig_pos_start + block.n_tokens - 1) / page_size;
@@ -6786,13 +6978,13 @@ void QwenExecutor::kvmem_start_query_prefetch(
         if (block_pages > candidate_page_budget) continue;
         candidate_page_budget -= block_pages;
         KvMemRemap rm;
-        rm.block_id = candidate.block_id;
+        rm.block_id = block_id;
         rm.n_tokens = block.n_tokens;
         advisory.remaps.push_back(rm);
     }
     if (advisory.remaps.empty()) {
-        trace_skip(ranked.empty()
-                       ? "no_cpu_candidates"
+        trace_skip(guaranteed.empty()
+                       ? "no_guaranteed_candidates"
                        : "candidate_page_budget");
         return;
     }
@@ -6822,9 +7014,11 @@ void QwenExecutor::kvmem_start_query_prefetch(
     if (kvmem_perf_trace_flag() || std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(
             stderr,
-            "[kvmem-query-prefetch] phase=start candidates=%zu "
+            "[kvmem-query-prefetch] phase=start mode=guaranteed-bands "
+            "candidates=%zu sink=%u recent=%u "
             "suffix_tokens=%u free_pages=%u reserved_pages=%llu\n",
-            kvmem_query_prefetch_blocks_.size(), replay_suffix_tokens,
+            kvmem_query_prefetch_blocks_.size(), sink, recent,
+            replay_suffix_tokens,
             free_pages,
             static_cast<unsigned long long>(reserve_pages));
     }
@@ -7159,6 +7353,28 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             "of the KV page size (" + std::to_string(page_size) + ")");
     }
     KvMemStoreConfig effective = cfg;
+    const KvmemNumaPlacement numa =
+        kvmem_resolve_numa_placement(backend_, effective.numa_policy);
+    if (effective.numa_policy.rfind("node:", 0) == 0 &&
+        numa.cpus.empty()) {
+        throw std::runtime_error(
+            "KVMem explicit NUMA node has no CPUs available to this process: " +
+            effective.numa_policy);
+    }
+    kvmem_numa_cpus_ = numa.cpus;
+    kvmem_numa_node_ = numa.node;
+    kvmem_numa_source_ = numa.source;
+    kvmem_numa_pci_bus_id_ = numa.pci_bus_id;
+    std::fprintf(
+        stderr,
+        "[kvmem-numa] policy=%s source=%s node=%d pci=%s cpus=%s "
+        "active=%d\n",
+        effective.numa_policy.c_str(), kvmem_numa_source_.c_str(),
+        kvmem_numa_node_,
+        kvmem_numa_pci_bus_id_.empty()
+            ? "-" : kvmem_numa_pci_bus_id_.c_str(),
+        kvmem_format_cpu_list(kvmem_numa_cpus_).c_str(),
+        kvmem_numa_cpus_.empty() ? 0 : 1);
     static constexpr const char *kRemovedOptimizationEnvs[] = {
         "QW3_KVMEM_PREFILL_WRITEBACK",
         "QW3_KVMEM_ASSEMBLY_MODE",
@@ -8092,14 +8308,14 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         effective.optimize_pack && max_cpu_workers > 1;
     if (persistent_cpu_pool) {
         kvmem_cpu_worker_pool_ =
-            std::make_unique<KvmemCpuWorkerPool>(max_cpu_workers - 1);
+            std::make_unique<KvmemCpuWorkerPool>(
+                max_cpu_workers - 1, kvmem_numa_cpus_);
     }
     kvmem_stagein_worker_pool_.reset();
     kvmem_stagein_assembly_overlap_enabled_ =
         persistent_cpu_pool &&
         pipelined_h2d &&
-        kvmem_immutable_source_k_ &&
-        !has_ssd;
+        kvmem_immutable_source_k_;
     if (kvmem_stagein_assembly_overlap_enabled_) {
         // The async stage-in caller is one participant. Profiling this
         // dual-socket EPYC showed that two workers leave
@@ -8107,19 +8323,24 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         // two made the overlapped wall time exceed the original serial sum.
         // V spill gathering also remains the critical branch at 4+4, so use
         // eight V workers by default while raw K retains four. Both settings
-        // are bounded and independently tunable.
+        // are bounded and independently tunable. SSD uses the same bounded
+        // two-slab read pipeline: its V read/H2D branch runs concurrently with
+        // immutable raw-K read/gather/re-RoPE assembly instead of serializing
+        // both storage streams at the semantic boundary.
         const size_t stagein_workers =
             kvmem_overlap_stagein_threads();
         if (stagein_workers > 1) {
             kvmem_stagein_worker_pool_ =
                 std::make_unique<KvmemCpuWorkerPool>(
-                    stagein_workers - 1);
+                    stagein_workers - 1, kvmem_numa_cpus_);
         }
     }
     kvmem_stagein_assembly_overlap_active_ = false;
-    // Advisory first-pass prefetch was inaccurate on the measured workload
-    // and changes transferred bytes, so it is excluded from this factorial.
-    kvmem_query_prefetch_enabled_ = false;
+    // Query replay overlaps only guaranteed sink/recent stage-in. The previous
+    // profile-score advisory prefetch was removed because false positives
+    // changed transferred bytes and made the stage-in ablation unstable.
+    kvmem_query_prefetch_enabled_ =
+        effective.optimize_stage_in && effective.optimize_pack;
     const bool proactive_cpu_writeback =
         proactive_d2h &&
         !has_ssd &&
@@ -11484,7 +11705,10 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     }
     uint64_t t_pages = 0;
     if (tm) {
-        require_status(backend_.synchronize());
+        // Submission boundary only. Page-table copies and all following
+        // assembly kernels share the execution stream, so an intermediate
+        // device-wide barrier is unnecessary and prevents useful overlap with
+        // the independent stage-in transfer stream.
         t_pages = kvmem_steady_ns();
     }
 
@@ -11744,24 +11968,27 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     }
     uint64_t t_rerope = 0;
     if (tm) {
-        const uint64_t drain0 = kvmem_steady_ns();
-        require_status(backend_.synchronize());
         t_rerope = kvmem_steady_ns();
-        kvmem_assembly_final_drain_ns_ = t_rerope - drain0;
     }
     kvmem_active_ = true;
     // Rebuild the per-block representative K + reset the score accumulator for
     // the new interval (k̄ is read from the just-re-RoPE'd window K).
     kvmem_recompute_kbar();
     if (tm) {
+        // A single terminal drain establishes that the materialized context is
+        // ready before semantic reselection returns. It replaces the former
+        // three barriers (pages, re-RoPE, k-bar), preserving stream ordering
+        // while allowing their GPU work to pipeline continuously.
+        const uint64_t drain0 = kvmem_steady_ns();
         require_status(backend_.synchronize());
         const uint64_t t_end = kvmem_steady_ns();
+        kvmem_assembly_final_drain_ns_ = t_end - drain0;
         KvMemTimingTotals &t = kvmem_timing_totals();
         t.assemble_pages_ns.fetch_add(t_pages - t_asm0,
                                       std::memory_order_relaxed);
         t.assemble_rerope_ns.fetch_add(t_rerope - t_pages,
                                        std::memory_order_relaxed);
-        t.assemble_kbar_ns.fetch_add(t_end - t_rerope,
+        t.assemble_kbar_ns.fetch_add(drain0 - t_rerope,
                                      std::memory_order_relaxed);
         t.assemble_final_drain_ns.fetch_add(
             kvmem_assembly_final_drain_ns_, std::memory_order_relaxed);
@@ -11783,7 +12010,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 (t_end - t_asm0) / 1.0e6,
                 (t_pages - t_asm0) / 1.0e6,
                 (t_rerope - t_pages) / 1.0e6,
-                (t_end - t_rerope) / 1.0e6,
+                (drain0 - t_rerope) / 1.0e6,
                 kvmem_assembly_raw_gather_ns_ / 1.0e6,
                 kvmem_assembly_raw_h2d_submit_ns_ / 1.0e6,
                 kvmem_assembly_raw_h2d_wait_ns_ / 1.0e6,
@@ -11805,7 +12032,8 @@ void QwenExecutor::kvmem_prepare_content_index_before_first_selection() {
     if (!block_store_) return;
     const KvMemMethod method = block_store_->config().select_method;
     if (method == KvMemMethod::Retrieval && !g_content_ready_ &&
-        !kvmem_active_ && kvmem_query_end_ <= kvmem_query_begin_) {
+        !kvmem_active_ && kvmem_query_end_ <= kvmem_query_begin_ &&
+        !kvmem_qc_capture_active_) {
         kvmem_build_content_index();
     }
 }
@@ -12515,9 +12743,10 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
         kvmem_stagein_assembly_overlap_enabled_ &&
         kvmem_raw_pipeline_enabled_ &&
         kvmem_prefetch_.active &&
-        kvmem_prefetch_.bulk_cpu &&
-        !kvmem_prefetch_.cpu_reads.empty() &&
-        kvmem_prefetch_.nvme_reads.empty();
+        ((kvmem_prefetch_.bulk_cpu &&
+          !kvmem_prefetch_.cpu_reads.empty()) ||
+         (kvmem_prefetch_.bulk_nvme &&
+          !kvmem_prefetch_.nvme_reads.empty()));
     const uint64_t overlap_wall0 =
         perf_trace && overlap_stagein_assembly
             ? kvmem_steady_ns() : 0;
@@ -12780,9 +13009,10 @@ uint32_t QwenExecutor::kvmem_set_selection(
         kvmem_stagein_assembly_overlap_enabled_ &&
         kvmem_raw_pipeline_enabled_ &&
         kvmem_prefetch_.active &&
-        kvmem_prefetch_.bulk_cpu &&
-        !kvmem_prefetch_.cpu_reads.empty() &&
-        kvmem_prefetch_.nvme_reads.empty();
+        ((kvmem_prefetch_.bulk_cpu &&
+          !kvmem_prefetch_.cpu_reads.empty()) ||
+         (kvmem_prefetch_.bulk_nvme &&
+          !kvmem_prefetch_.nvme_reads.empty()));
     const uint64_t overlap_wall0 =
         perf_trace && overlap_stagein_assembly
             ? kvmem_steady_ns() : 0;
@@ -13324,6 +13554,24 @@ void QwenExecutor::global_trace_attention_layer(uint32_t layer_index,
 void QwenExecutor::kvmem_build_content_index() {
     g_content_ready_ = false;
     if (!block_store_) return;
+    // Session/history ingest may deliberately capture the query-conditioned
+    // per-layer index before a query exists. That incremental index has a
+    // different layout (CPU packed adaptive, CPU streamed mean-K, or the GPU
+    // multi-layer tensor) from this legacy single-layer paged snapshot. Never
+    // route it through the legacy builder: CPU/adaptive placement intentionally
+    // leaves g_kbar_ absent, and treating it as the legacy output is both
+    // unnecessary for pressure selection and an invalid device access.
+    if (kvmem_qc_capture_active_) {
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[bs-content-index] legacy_paged_skip=1 "
+                "reason=incremental_capture_active adaptive=%d cpu=%d\n",
+                kvmem_adaptive_prototypes() ? 1 : 0,
+                kvmem_mean_index_cpu() ? 1 : 0);
+        }
+        return;
+    }
     // Internal diagnostic (default off): force the legacy window-local recency
     // path by never building the global index. Lets validation A/B the two
     // selection policies at identical fp16 cache quality.
@@ -13848,10 +14096,26 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
             throw std::runtime_error(
                 "KVMem transcript replay unexpectedly reallocated its content index");
         }
-        kvmem_qc_captured_blocks_ =
-            std::min(preserved_captured_blocks, total_blocks);
-        kvmem_qc_captured_tokens_ =
-            std::min(preserved_captured_tokens, indexed_tokens);
+        // Ordinary growing-session ingest reaches here with a live capture
+        // cursor. Frozen-prefix/checkpoint restore is different:
+        // kvmem_truncate_to() deliberately invalidates the request-local cursor
+        // but publishes the surviving immutable prefix through resume_base.
+        // preserve_content_index still keeps the underlying mean-K/adaptive
+        // rows, so seed from that boundary instead of incorrectly restarting at
+        // token zero (which made the next suffix fail the contiguity check).
+        if (preserved_captured_tokens > 0) {
+            kvmem_qc_captured_blocks_ =
+                std::min(preserved_captured_blocks, total_blocks);
+            kvmem_qc_captured_tokens_ =
+                std::min(preserved_captured_tokens, indexed_tokens);
+        } else if (resume_base > 0 && resume_base <= indexed_tokens) {
+            kvmem_qc_captured_tokens_ = resume_base;
+            kvmem_qc_captured_blocks_ =
+                (resume_base + bt - 1) / bt;
+        } else {
+            kvmem_qc_captured_blocks_ = 0;
+            kvmem_qc_captured_tokens_ = 0;
+        }
     } else if (resume_base > 0 && resume_base <= indexed_tokens &&
                !freshly_allocated) {
         kvmem_qc_captured_tokens_ = resume_base;
@@ -14801,7 +15065,11 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     // kvmem_begin_query_replay and overwrites the suffix from that boundary.
     if (base_pos != kvmem_qc_captured_tokens_) {
         throw std::runtime_error(
-            "KVMem incremental mean-K capture is not contiguous");
+            "KVMem incremental mean-K capture is not contiguous: base_pos=" +
+            std::to_string(base_pos) + " captured_tokens=" +
+            std::to_string(kvmem_qc_captured_tokens_) + " batch=" +
+            std::to_string(batch) + " query_replay=" +
+            std::to_string(kvmem_query_replay_active_ ? 1 : 0));
     }
     const uint32_t off = base_pos % bt;
     const uint32_t first_block = base_pos / bt;
@@ -15578,6 +15846,7 @@ void QwenExecutor::kvmem_capture_adaptive_layer(
         uint32_t batch, uint32_t k_token_stride,
         uint32_t rope_base_pos) {
     if (!kvmem_adaptive_prototypes() || !block_store_ || !k_batch_) return;
+    KvmemThreadAffinityScope numa_scope(kvmem_numa_cpus_);
     const QwenConfig &cfg = model_.config();
     const uint32_t layers = kvmem_qc_num_layers_;
     const uint32_t bt =

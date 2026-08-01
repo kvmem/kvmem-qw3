@@ -130,6 +130,9 @@ void usage(std::ostream &os) {
         "                        staging. Default: gpu.\n"
         "  --kvmem-index-staging-mb N  Per-slot CPU/GPU index staging size.\n"
         "                        Two slots are allocated. Default: 64 MiB.\n"
+        "  --kvmem-numa-policy P  Host KVMem locality: auto|off|node:N.\n"
+        "                        Auto follows the active GPU PCI locality;\n"
+        "                        unsupported systems fall back to off.\n"
         "  --kvmem-adaptive-score-mode M  CPU Adaptive scorer:\n"
         "                        auto|layer-one-pass|tiled-two-pass.\n"
         "                        Auto prefers one H2D transfer and one dot pass\n"
@@ -557,6 +560,19 @@ int main(int argc, char **argv) {
                     engine.kvmem_index_staging_mb > 4096) {
                     throw std::runtime_error(
                         "--kvmem-index-staging-mb must be in [1,4096]");
+                }
+            } else if (arg == "--kvmem-numa-policy") {
+                engine.kvmem_numa_policy = need(arg);
+                const std::string &policy = engine.kvmem_numa_policy;
+                const bool node = policy.rfind("node:", 0) == 0 &&
+                    policy.size() > 5 &&
+                    std::all_of(policy.begin() + 5, policy.end(),
+                                [](unsigned char ch) {
+                                    return std::isdigit(ch) != 0;
+                                });
+                if (policy != "auto" && policy != "off" && !node) {
+                    throw std::runtime_error(
+                        "--kvmem-numa-policy must be auto|off|node:N");
                 }
             } else if (arg == "--kvmem-adaptive-score-mode") {
                 engine.kvmem_adaptive_score_mode = need(arg);

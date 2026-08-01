@@ -1663,6 +1663,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_adaptive_gain_2to4="
               << engine.kvmem_adaptive_gain_2to4 << "\n"
               << "  kvmem_index_placement=" << engine.kvmem_index_placement << "\n"
+              << "  kvmem_numa_policy=" << engine.kvmem_numa_policy << "\n"
               << "  kvmem_index_staging_mb="
               << engine.kvmem_index_staging_mb << "\n"
               << "  kvmem_adaptive_score_mode="
