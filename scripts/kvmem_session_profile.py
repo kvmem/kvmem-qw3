@@ -77,7 +77,8 @@ _S2_RE = re.compile(r"stage-in.*?=\s*([\d.eE+-]+) ms\s*\((\d+) blk\)")
 _S3_RE = re.compile(r"stage-out.*?=\s*([\d.eE+-]+) ms\s*\((\d+) blk\)")
 _S4_RE = re.compile(
     r"assemble.*?=\s*([\d.eE+-]+) ms\s*\(pages=([\d.eE+-]+) "
-    r"rerope=([\d.eE+-]+) kbar=([\d.eE+-]+)\)")
+    r"rerope=([\d.eE+-]+)(?: final_drain=([\d.eE+-]+))? "
+    r"kbar=([\d.eE+-]+)\)")
 # In-prefill forced-offload diagnostic (cost is INSIDE step5's wall).
 _S5B_RE = re.compile(
     r"in-prefill offload.*?=\s*([\d.eE+-]+) ms\s*\(in=(\d+) out=(\d+)")
@@ -206,7 +207,8 @@ def parse_turns(log: str) -> List[dict]:
             row["assemble_ms"] = float(m.group(1))
             row["asm_pages_ms"] = float(m.group(2))
             row["asm_rerope_ms"] = float(m.group(3))
-            row["asm_kbar_ms"] = float(m.group(4))
+            row["asm_final_drain_ms"] = float(m.group(4) or 0.0)
+            row["asm_kbar_ms"] = float(m.group(5))
         if (m := _S5B_RE.search(seg)):
             row["inprefill_offload_ms"] = float(m.group(1))
             row["inprefill_stage_in_blocks"] = int(m.group(2))

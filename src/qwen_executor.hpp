@@ -602,6 +602,11 @@ public:
         uint64_t assemble_pages_ns = 0;
         uint64_t assemble_rerope_ns = 0;
         uint64_t assemble_kbar_ns = 0;
+        // Subset of assemble_rerope_ns spent draining the final outstanding
+        // raw-K H2D / scatter-RoPE / MTP work.  Keeping this separate exposes
+        // pipeline tail bubbles without double-counting it in the conserved
+        // top-level timing.
+        uint64_t assemble_final_drain_ns = 0;
         uint32_t retrieval_calls = 0;
         uint32_t stage_in_calls = 0;
         uint32_t stage_out_calls = 0;
@@ -992,6 +997,7 @@ private:
     uint64_t kvmem_assembly_raw_h2d_wait_ns_ = 0;
     uint64_t kvmem_assembly_raw_bytes_ = 0;
     uint32_t kvmem_assembly_raw_batches_ = 0;
+    uint64_t kvmem_assembly_final_drain_ns_ = 0;
     // Assembly optimization: a persistent FP32 [position, RoPE pair, sin/cos]
     // table preserves the legacy de-rotate/re-rotate arithmetic while sharing
     // transcendental results across KV heads and attention layers.
@@ -1163,8 +1169,11 @@ private:
         bool active = false;
         uint64_t sequence = 0;
         uint64_t start_ns = 0;
+        uint64_t pre_score_ns = 0;
         uint64_t selection_ns = 0;
+        uint64_t selection_end_ns = 0;
         uint64_t stage_out_ns = 0;
+        uint64_t materialize_begin_ns = 0;
     };
     KvMemPrefetchState kvmem_prefetch_;
     KvMemPrefetchPerf kvmem_last_prefetch_perf_;

@@ -1597,7 +1597,8 @@ public:
             uint64_t ctx_tokens = 0;
             uint64_t delta_tokens = 0;
             double sel_ms = 0, stage_in_ms = 0, stage_out_ms = 0, assemble_ms = 0;
-            double asm_pages_ms = 0, asm_rerope_ms = 0, asm_kbar_ms = 0;
+            double asm_pages_ms = 0, asm_rerope_ms = 0;
+            double asm_final_drain_ms = 0, asm_kbar_ms = 0;
             uint32_t stage_in_blocks = 0, stage_out_blocks = 0;
             // kvmem work forced DURING prefill (bounded-pool offload), folded
             // into prefill_s. Surfaced so step5's gross wall isn't opaque.
@@ -1791,6 +1792,8 @@ public:
             row.assemble_ms = dms(tnow.assemble_ns, base.assemble_ns);
             row.asm_pages_ms = dms(tnow.assemble_pages_ns, base.assemble_pages_ns);
             row.asm_rerope_ms = dms(tnow.assemble_rerope_ns, base.assemble_rerope_ns);
+            row.asm_final_drain_ms = dms(tnow.assemble_final_drain_ns,
+                                         base.assemble_final_drain_ns);
             row.asm_kbar_ms = dms(tnow.assemble_kbar_ns, base.assemble_kbar_ns);
             row.stage_in_blocks = tnow.stage_in_blocks - base.stage_in_blocks;
             row.stage_out_blocks = tnow.stage_out_blocks - base.stage_out_blocks;
@@ -1835,7 +1838,8 @@ public:
             print_session_turn(row.turn, row.ctx_tokens, row.delta_tokens,
                                row.sel_ms, row.stage_in_ms, row.stage_out_ms,
                                row.assemble_ms, row.asm_pages_ms,
-                               row.asm_rerope_ms, row.asm_kbar_ms,
+                               row.asm_rerope_ms, row.asm_final_drain_ms,
+                               row.asm_kbar_ms,
                                row.stage_in_blocks, row.stage_out_blocks,
                                row.prefill_s, row.decode_s, row.decode_tps,
                                row.decoded, row.acceptance, row.gpu_mib,
@@ -13187,7 +13191,8 @@ private:
                             uint64_t delta_tokens, double sel_ms,
                             double stage_in_ms, double stage_out_ms,
                             double assemble_ms, double asm_pages_ms,
-                            double asm_rerope_ms, double asm_kbar_ms,
+                            double asm_rerope_ms, double asm_final_drain_ms,
+                            double asm_kbar_ms,
                             uint32_t stage_in_blocks, uint32_t stage_out_blocks,
                             double prefill_s, double decode_s, double decode_tps,
                             int decoded, double acceptance, uint64_t gpu_mib,
@@ -13250,7 +13255,9 @@ private:
           << " blk)\n";
         m << "    assemble   (pages+re-RoPE+k-bar)       = "
           << std::setw(10) << assemble_ms << " ms  (pages=" << asm_pages_ms
-          << " rerope=" << asm_rerope_ms << " kbar=" << asm_kbar_ms << ")\n";
+          << " rerope=" << asm_rerope_ms
+          << " final_drain=" << asm_final_drain_ms
+          << " kbar=" << asm_kbar_ms << ")\n";
         m << std::setprecision(6);
         // The bounded GPU pool can force kvmem stage-in/out mid-prefill; that
         // cost is INSIDE step5's wall above (not double-counted in steps 1-4,

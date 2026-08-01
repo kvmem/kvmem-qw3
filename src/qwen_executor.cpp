@@ -429,6 +429,7 @@ struct KvMemTimingTotals {
     std::atomic<uint64_t> assemble_pages_ns{0};
     std::atomic<uint64_t> assemble_rerope_ns{0};
     std::atomic<uint64_t> assemble_kbar_ns{0};
+    std::atomic<uint64_t> assemble_final_drain_ns{0};
     std::atomic<uint32_t> retrieval_calls{0};
     std::atomic<uint32_t> stage_in_calls{0};
     std::atomic<uint32_t> stage_out_calls{0};
@@ -436,6 +437,27 @@ struct KvMemTimingTotals {
     std::atomic<uint32_t> stage_in_blocks{0};
     std::atomic<uint32_t> stage_out_blocks{0};
 };
+
+uint64_t kvmem_selection_hash(const KvMemPlan &plan) {
+    // Stable FNV-1a over the materialized selection rather than std::hash,
+    // whose representation is implementation-defined.  Include compact
+    // positions and token counts so two equal block-ID sets with different
+    // window layouts cannot appear identical in an A/B trace.
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&](uint64_t value) {
+        for (uint32_t byte = 0; byte < 8; ++byte) {
+            hash ^= (value >> (byte * 8u)) & 0xffu;
+            hash *= 1099511628211ull;
+        }
+    };
+    mix(plan.remaps.size());
+    for (const KvMemRemap &rm : plan.remaps) {
+        mix(rm.block_id);
+        mix(static_cast<uint32_t>(rm.to_base));
+        mix(rm.n_tokens);
+    }
+    return hash;
+}
 
 KvMemTimingTotals &kvmem_timing_totals() {
     static KvMemTimingTotals totals;
@@ -505,6 +527,8 @@ QwenExecutor::KvMemTimingSnapshot QwenExecutor::kvmem_timing_snapshot() {
     s.assemble_pages_ns = t.assemble_pages_ns.load(std::memory_order_relaxed);
     s.assemble_rerope_ns = t.assemble_rerope_ns.load(std::memory_order_relaxed);
     s.assemble_kbar_ns = t.assemble_kbar_ns.load(std::memory_order_relaxed);
+    s.assemble_final_drain_ns =
+        t.assemble_final_drain_ns.load(std::memory_order_relaxed);
     s.retrieval_calls = t.retrieval_calls.load(std::memory_order_relaxed);
     s.stage_in_calls = t.stage_in_calls.load(std::memory_order_relaxed);
     s.stage_out_calls = t.stage_out_calls.load(std::memory_order_relaxed);
@@ -594,7 +618,8 @@ void QwenExecutor::kvmem_timing_emit_delta(const char *tag,
     std::fprintf(
         stderr,
         "[kvmem-timing] %s retrieval_ms=%.3f stage_in_ms=%.3f "
-        "stage_out_ms=%.3f assemble_ms=%.3f (pages=%.3f rerope=%.3f kbar=%.3f) "
+        "stage_out_ms=%.3f assemble_ms=%.3f "
+        "(pages=%.3f rerope=%.3f final_drain=%.3f kbar=%.3f) "
         "| retrieval=%u stage_in=%u(%ublk) "
         "stage_out=%u(%ublk) assemble=%u\n",
         tag ? tag : "",
@@ -604,6 +629,8 @@ void QwenExecutor::kvmem_timing_emit_delta(const char *tag,
         (now.assemble_ns - base.assemble_ns) / 1e6,
         (now.assemble_pages_ns - base.assemble_pages_ns) / 1e6,
         (now.assemble_rerope_ns - base.assemble_rerope_ns) / 1e6,
+        (now.assemble_final_drain_ns -
+         base.assemble_final_drain_ns) / 1e6,
         (now.assemble_kbar_ns - base.assemble_kbar_ns) / 1e6,
         now.retrieval_calls - base.retrieval_calls,
         now.stage_in_calls - base.stage_in_calls,
@@ -11365,6 +11392,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     kvmem_assembly_raw_h2d_wait_ns_ = 0;
     kvmem_assembly_raw_bytes_ = 0;
     kvmem_assembly_raw_batches_ = 0;
+    kvmem_assembly_final_drain_ns_ = 0;
     const QwenConfig &cfg = model_.config();
     kvmem_ensure_rope_sincos_table();
     const uint32_t page_size = kv_pages_.page_size;
@@ -11716,8 +11744,10 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     }
     uint64_t t_rerope = 0;
     if (tm) {
+        const uint64_t drain0 = kvmem_steady_ns();
         require_status(backend_.synchronize());
         t_rerope = kvmem_steady_ns();
+        kvmem_assembly_final_drain_ns_ = t_rerope - drain0;
     }
     kvmem_active_ = true;
     // Rebuild the per-block representative K + reset the score accumulator for
@@ -11733,6 +11763,8 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                                        std::memory_order_relaxed);
         t.assemble_kbar_ns.fetch_add(t_end - t_rerope,
                                      std::memory_order_relaxed);
+        t.assemble_final_drain_ns.fetch_add(
+            kvmem_assembly_final_drain_ns_, std::memory_order_relaxed);
         t.assemble_ns.fetch_add(t_end - t_asm0, std::memory_order_relaxed);
         t.assemble_calls.fetch_add(1, std::memory_order_relaxed);
         if (kvmem_perf_trace_flag()) {
@@ -11741,7 +11773,8 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 "[kvmem-assembly-perf] mode=%s total_ms=%.3f "
                 "pages_ms=%.3f rerope_ms=%.3f kbar_ms=%.3f "
                 "raw_gather_ms=%.3f raw_h2d_submit_ms=%.3f "
-                "raw_h2d_wait_ms=%.3f raw_bytes=%llu raw_batches=%u "
+                "raw_h2d_wait_ms=%.3f final_drain_ms=%.3f "
+                "raw_bytes=%llu raw_batches=%u "
                 "raw_refresh_blocks=%zu inplace_blocks=%u "
                 "mtp_blocks=%u mtp_inplace_blocks=%u\n",
                 kvmem_raw_pipeline_enabled_
@@ -11754,6 +11787,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 kvmem_assembly_raw_gather_ns_ / 1.0e6,
                 kvmem_assembly_raw_h2d_submit_ns_ / 1.0e6,
                 kvmem_assembly_raw_h2d_wait_ns_ / 1.0e6,
+                kvmem_assembly_final_drain_ns_ / 1.0e6,
                 static_cast<unsigned long long>(
                     kvmem_assembly_raw_bytes_),
                 kvmem_assembly_raw_batches_, raw_refreshes.size(), n_moved,
@@ -11847,6 +11881,10 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     if (kvmem_immutable_source_k_) kvmem_flush_raw_k_decode();
     const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_sel0 = tm ? kvmem_steady_ns() : 0;
+    if (perf_trace) {
+        kvmem_reselect_perf_.pre_score_ns =
+            t_sel0 - kvmem_reselect_perf_.start_ns;
+    }
     const KvMemMethod method = block_store_->config().select_method;
     // Build the global content-frame index once, from the pristine post-prefill
     // cache (every block still baked at its true position). After the first
@@ -12424,6 +12462,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
         t.retrieval_calls.fetch_add(1, std::memory_order_relaxed);
         if (perf_trace) {
             kvmem_reselect_perf_.selection_ns = t_sel1 - t_sel0;
+            kvmem_reselect_perf_.selection_end_ns = t_sel1;
         }
     }
     // Free the evicted blocks' GPU pages BEFORE staging in the resurrected ones.
@@ -12460,6 +12499,9 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     }
     trace_pool("after_stage_out");
     kvmem_start_prefetch(kvmem_pending_plan_);
+    if (perf_trace) {
+        kvmem_reselect_perf_.materialize_begin_ns = kvmem_steady_ns();
+    }
     trace_pool("after_start_prefetch");
     kvmem_pending_reselect_ = true;
     return kvmem_pending_plan_.total_window_tokens;
@@ -12542,11 +12584,39 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
         const uint64_t total_ns =
             t_done >= kvmem_reselect_perf_.start_ns
                 ? t_done - kvmem_reselect_perf_.start_ns : 0;
+        const uint64_t selection_wall_ns =
+            kvmem_reselect_perf_.selection_end_ns >=
+                    kvmem_reselect_perf_.start_ns
+                ? kvmem_reselect_perf_.selection_end_ns -
+                      kvmem_reselect_perf_.start_ns
+                : 0;
+        const uint64_t stage_out_submit_wall_ns =
+            kvmem_reselect_perf_.materialize_begin_ns >=
+                    kvmem_reselect_perf_.selection_end_ns
+                ? kvmem_reselect_perf_.materialize_begin_ns -
+                      kvmem_reselect_perf_.selection_end_ns
+                : 0;
+        const uint64_t materialize_wall_ns =
+            t_done >= kvmem_reselect_perf_.materialize_begin_ns
+                ? t_done - kvmem_reselect_perf_.materialize_begin_ns
+                : 0;
+        const uint64_t conserved_ns =
+            selection_wall_ns + stage_out_submit_wall_ns +
+            materialize_wall_ns;
+        const int64_t accounting_error_ns =
+            static_cast<int64_t>(total_ns) -
+            static_cast<int64_t>(conserved_ns);
+        const uint64_t selected_hash =
+            kvmem_selection_hash(kvmem_pending_plan_);
         std::fprintf(
             stderr,
             "[kvmem-reselect-perf] kind=semantic seq=%llu tag=%s position=%u "
-            "source_blocks=%u selected_blocks=%zu remaps=%zu stage_out=%zu "
-            "selection_ms=%.3f stage_out_ms=%.3f "
+            "source_blocks=%u selected_blocks=%zu selected_hash=%016llx "
+            "remaps=%zu stage_out=%zu "
+            "selection_ms=%.3f pre_score_ms=%.3f "
+            "selection_wall_ms=%.3f stage_out_submit_wall_ms=%.3f "
+            "materialize_wall_ms=%.3f accounting_error_ms=%.6f "
+            "stage_out_ms=%.3f "
             "stage_out_d2h_ms=%.3f stage_out_cpu_copy_ms=%.3f "
             "stage_out_disk_write_ms=%.3f stage_out_blocks=%u "
             "stage_out_gib=%.3f stage_out_clean_blocks=%u "
@@ -12576,9 +12646,15 @@ uint32_t QwenExecutor::kvmem_finish_reselect() {
             kvmem_trace_tag_.empty() ? "-" : kvmem_trace_tag_.c_str(),
             position_, block_store_->block_count(),
             kvmem_pending_plan_.remaps.size(),
+            static_cast<unsigned long long>(selected_hash),
             kvmem_pending_plan_.remaps.size(),
             kvmem_pending_plan_.stage_out.size(),
             kvmem_reselect_perf_.selection_ns * ns_to_ms,
+            kvmem_reselect_perf_.pre_score_ns * ns_to_ms,
+            selection_wall_ns * ns_to_ms,
+            stage_out_submit_wall_ns * ns_to_ms,
+            materialize_wall_ns * ns_to_ms,
+            accounting_error_ns * ns_to_ms,
             kvmem_reselect_perf_.stage_out_ns * ns_to_ms,
             out.canonicalize_and_d2h_ns * ns_to_ms,
             out.cpu_copy_ns * ns_to_ms,
