@@ -425,6 +425,15 @@ size_t kvmem_write_queue_depth() {
     return value;
 }
 
+size_t kvmem_read_queue_depth() {
+    // Four 128 MiB reads saturate the profiled NVMe without allocating beyond
+    // the mixed CPU+SSD read-slab pool. Callers clamp this request to the slabs
+    // actually provisioned, so a two-slab/SSD-only configuration remains QD=2.
+    static const size_t value =
+        kvmem_env_size("QW3_KVMEM_READ_QUEUE_DEPTH", 4, 1, 8);
+    return value;
+}
+
 size_t kvmem_writeback_slab_count() {
     // Four bounded slabs provide enough queue depth for alternating writeback
     // buffer sets. At the 128 MiB default, immutable MAIN V plus local-position
@@ -8440,7 +8449,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         "async_ssd_write=%d "
         "pipelined_cpu_h2d=%d coalesced_ssd_read=%d "
         "prefill_writeback=%d prefill_writeback_target=%s "
-        "io_slab_mib=%zu write_qd=%zu read_qd=2 "
+        "io_slab_mib=%zu write_qd=%zu read_qd=%zu "
         "cpu_gather_threads=%zu cpu_stageout_threads=%zu "
         "persistent_cpu_pool=%d persistent_cpu_workers=%zu "
         "stagein_assembly_overlap=%d overlap_cpu_workers=%u "
@@ -8464,6 +8473,7 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         static_cast<size_t>(
             kvmem_io_slab_bytes() / (1024ull * 1024ull)),
         kvmem_write_queue_depth(),
+        kvmem_read_queue_depth(),
         kvmem_cpu_gather_threads(),
         kvmem_cpu_stageout_threads(),
         persistent_cpu_pool ? 1 : 0,
@@ -9187,6 +9197,112 @@ void QwenExecutor::kvmem_stage_in(const KvMemPlan &plan) {
     kvmem_finish_prefetch();
 }
 
+void QwenExecutor::kvmem_enqueue_packed_stagein(
+        const std::vector<uint32_t> &block_ids,
+        const std::vector<uint64_t> &batch_offsets,
+        void *slab, uint64_t slab_bytes, bool stage_mtp_pages,
+        std::vector<int32_t> &src_page_indices,
+        std::vector<int32_t> &dst_page_indices) {
+    if (!block_store_ || block_ids.empty()) return;
+    if (block_ids.size() != batch_offsets.size()) {
+        throw std::runtime_error(
+            "KVMem packed stage-in metadata size mismatch");
+    }
+    struct PackedTarget {
+        DeviceTensor *tensor = nullptr;
+        bool mtp = false;
+    };
+    std::vector<PackedTarget> packed_targets;
+    packed_targets.reserve(kvmem_raw_layers_.size() * 2 + 2);
+    const QwenConfig &cfg = model_.config();
+    for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
+        if (!cfg.is_standard_attention_layer(il)) continue;
+        if (!kvmem_immutable_source_k_) {
+            packed_targets.push_back(PackedTarget{&k_cache(il), false});
+        }
+        packed_targets.push_back(PackedTarget{&v_cache(il), false});
+    }
+    if (stage_mtp_pages) {
+        if (!kvmem_mtp_local_positions_) {
+            packed_targets.push_back(PackedTarget{&mtp_k_cache(), true});
+        }
+        packed_targets.push_back(PackedTarget{&mtp_v_cache(), true});
+    }
+    if (packed_targets.empty()) {
+        throw std::runtime_error(
+            "KVMem packed stage-in has no target tensors");
+    }
+
+    const auto &blocks = block_store_->blocks();
+    uint32_t pages_per_target = 0;
+    for (uint32_t block_id : block_ids) {
+        if (block_id >= blocks.size()) {
+            throw std::runtime_error(
+                "KVMem packed stage-in references an unknown block");
+        }
+        const KvMemBlock &block = blocks[block_id];
+        const uint32_t first_page =
+            block.orig_pos_start / kv_pages_.page_size;
+        const uint32_t last_page =
+            (block.orig_pos_start + block.n_tokens - 1) /
+            kv_pages_.page_size;
+        for (uint32_t lp = first_page; lp <= last_page; ++lp) {
+            if (!kv_pages_.logical_page_resident(lp) ||
+                (stage_mtp_pages &&
+                 !mtp_kv_pages_.logical_page_resident(lp))) {
+                throw std::runtime_error(
+                    "KVMem packed stage-in target page was not "
+                    "bulk-allocated");
+            }
+        }
+        pages_per_target += last_page - first_page + 1;
+    }
+
+    src_page_indices.resize(
+        static_cast<size_t>(pages_per_target) * packed_targets.size());
+    dst_page_indices.resize(src_page_indices.size());
+    const uint64_t page_bytes = kvmem_kv_page_bytes();
+    for (size_t t = 0; t < packed_targets.size(); ++t) {
+        uint32_t page_entry = 0;
+        for (size_t i = 0; i < block_ids.size(); ++i) {
+            const KvMemBlock &block = blocks[block_ids[i]];
+            const uint32_t first_page =
+                block.orig_pos_start / kv_pages_.page_size;
+            const uint32_t last_page =
+                (block.orig_pos_start + block.n_tokens - 1) /
+                kv_pages_.page_size;
+            const uint32_t block_pages = last_page - first_page + 1;
+            if (batch_offsets[i] % page_bytes != 0) {
+                throw std::runtime_error(
+                    "KVMem packed stage-in block is not page-aligned");
+            }
+            const uint64_t target_src_base =
+                batch_offsets[i] / page_bytes +
+                static_cast<uint64_t>(t) * block_pages;
+            for (uint32_t p = 0; p < block_pages; ++p) {
+                const size_t index =
+                    t * pages_per_target + page_entry;
+                src_page_indices[index] =
+                    static_cast<int32_t>(target_src_base + p);
+                const uint32_t logical_page = first_page + p;
+                dst_page_indices[index] = packed_targets[t].mtp
+                    ? mtp_kv_pages_.pages[logical_page]
+                    : kv_pages_.pages[logical_page];
+                ++page_entry;
+            }
+        }
+    }
+    std::vector<DeviceTensor *> target_tensors;
+    target_tensors.reserve(packed_targets.size());
+    for (const PackedTarget &target : packed_targets) {
+        target_tensors.push_back(target.tensor);
+    }
+    require_status(backend_.copy_packed_pages_from_host_async(
+        slab, slab_bytes, target_tensors,
+        src_page_indices.data(), dst_page_indices.data(),
+        pages_per_target, page_bytes));
+}
+
 void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
     if (!kvmem_prefetch_.bulk_cpu || !kvmem_cpu_tier_ ||
         !block_store_) {
@@ -9196,7 +9312,6 @@ void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
     const uint64_t slab_target_bytes = kvmem_io_slab_bytes();
     const bool perf_trace = kvmem_perf_trace_flag();
     const bool stage_mtp_pages = kvmem_prefetch_.stage_mtp_pages;
-    const auto &blocks = block_store_->blocks();
     while (kvmem_prefetch_.cpu_batches.size() <
                kMaxInflightCpuBatches &&
            kvmem_prefetch_.next_cpu_read <
@@ -9302,109 +9417,20 @@ void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
 
         const uint64_t enqueue0 =
             perf_trace ? kvmem_steady_ns() : 0;
-        struct PackedTarget {
-            DeviceTensor *tensor = nullptr;
-            bool mtp = false;
-        };
-        std::vector<PackedTarget> packed_targets;
-        packed_targets.reserve(kvmem_raw_layers_.size() * 2 + 2);
-        const QwenConfig &cfg = model_.config();
-        for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
-            if (!cfg.is_standard_attention_layer(il)) continue;
-            if (!kvmem_immutable_source_k_) {
-                packed_targets.push_back(
-                    PackedTarget{&k_cache(il), false});
-            }
-            packed_targets.push_back(
-                PackedTarget{&v_cache(il), false});
-        }
-        if (stage_mtp_pages) {
-            if (!kvmem_mtp_local_positions_) {
-                packed_targets.push_back(
-                    PackedTarget{&mtp_k_cache(), true});
-            }
-            packed_targets.push_back(
-                PackedTarget{&mtp_v_cache(), true});
-        }
-        if (packed_targets.empty()) {
-            throw std::runtime_error(
-                "KVMem packed CPU stage-in has no target tensors");
-        }
-
-        uint32_t pages_per_target = 0;
+        std::vector<uint32_t> packed_block_ids;
+        std::vector<uint64_t> packed_offsets;
+        packed_block_ids.reserve(end - begin);
+        packed_offsets.reserve(end - begin);
         for (size_t i = begin; i < end; ++i) {
             const KvMemPrefetchCpuRead &read =
                 kvmem_prefetch_.cpu_reads[i];
-            const KvMemBlock &block = blocks[read.block_id];
-            const uint32_t page_size = kv_pages_.page_size;
-            const uint32_t first_page =
-                block.orig_pos_start / page_size;
-            const uint32_t last_page =
-                (block.orig_pos_start + block.n_tokens - 1) /
-                page_size;
-            for (uint32_t lp = first_page; lp <= last_page; ++lp) {
-                if (!kv_pages_.logical_page_resident(lp) ||
-                    (stage_mtp_pages &&
-                     !mtp_kv_pages_.logical_page_resident(lp))) {
-                    throw std::runtime_error(
-                        "KVMem packed CPU stage-in target page was not "
-                        "bulk-allocated");
-                }
-            }
-            pages_per_target += last_page - first_page + 1;
+            packed_block_ids.push_back(read.block_id);
+            packed_offsets.push_back(read.batch_offset);
         }
-        batch.src_page_indices.resize(
-            static_cast<size_t>(pages_per_target) *
-            packed_targets.size());
-        batch.dst_page_indices.resize(
-            batch.src_page_indices.size());
-        const uint64_t page_bytes = kvmem_kv_page_bytes();
-        for (size_t t = 0; t < packed_targets.size(); ++t) {
-            uint32_t page_entry = 0;
-            for (size_t i = begin; i < end; ++i) {
-                const KvMemPrefetchCpuRead &read =
-                    kvmem_prefetch_.cpu_reads[i];
-                const KvMemBlock &block = blocks[read.block_id];
-                const uint32_t page_size = kv_pages_.page_size;
-                const uint32_t first_page =
-                    block.orig_pos_start / page_size;
-                const uint32_t last_page =
-                    (block.orig_pos_start + block.n_tokens - 1) /
-                    page_size;
-                const uint32_t block_pages =
-                    last_page - first_page + 1;
-                if (read.batch_offset % page_bytes != 0) {
-                    throw std::runtime_error(
-                        "KVMem packed CPU stage-in block is not "
-                        "page-aligned");
-                }
-                const uint64_t target_src_base =
-                    read.batch_offset / page_bytes +
-                    static_cast<uint64_t>(t) * block_pages;
-                for (uint32_t p = 0; p < block_pages; ++p) {
-                    const size_t index =
-                        t * pages_per_target + page_entry;
-                    batch.src_page_indices[index] =
-                        static_cast<int32_t>(target_src_base + p);
-                    const uint32_t logical_page = first_page + p;
-                    batch.dst_page_indices[index] =
-                        packed_targets[t].mtp
-                            ? mtp_kv_pages_.pages[logical_page]
-                            : kv_pages_.pages[logical_page];
-                    ++page_entry;
-                }
-            }
-        }
-        std::vector<DeviceTensor *> target_tensors;
-        target_tensors.reserve(packed_targets.size());
-        for (const PackedTarget &target : packed_targets) {
-            target_tensors.push_back(target.tensor);
-        }
-        require_status(backend_.copy_packed_pages_from_host_async(
-            slab, batch_bytes, target_tensors,
-            batch.src_page_indices.data(),
-            batch.dst_page_indices.data(),
-            pages_per_target, page_bytes));
+        kvmem_enqueue_packed_stagein(
+            packed_block_ids, packed_offsets, slab, batch_bytes,
+            stage_mtp_pages, batch.src_page_indices,
+            batch.dst_page_indices);
         require_status(backend_.record_kv_transfer_fence(batch.fence));
         if (perf_trace) {
             kvmem_prefetch_.perf.cpu_h2d_enqueue_ns +=
@@ -9418,10 +9444,12 @@ void QwenExecutor::kvmem_submit_prefetch_cpu_batches() {
 
 void QwenExecutor::kvmem_submit_prefetch_nvme_batches() {
     if (!kvmem_prefetch_.bulk_nvme || !kvmem_nvme_tier_) return;
-    constexpr size_t kMaxInflightReadBatches = 2;
+    const size_t max_inflight_read_batches = std::min(
+        kvmem_read_queue_depth(),
+        std::max<size_t>(1, kvmem_read_slab_count_));
     const uint64_t read_slab_target_bytes = kvmem_io_slab_bytes();
     while (kvmem_prefetch_.nvme_batches.size() <
-               kMaxInflightReadBatches &&
+               max_inflight_read_batches &&
            kvmem_prefetch_.next_nvme_read <
                kvmem_prefetch_.nvme_reads.size()) {
         const size_t begin = kvmem_prefetch_.next_nvme_read;
@@ -9441,6 +9469,7 @@ void QwenExecutor::kvmem_submit_prefetch_nvme_batches() {
         KvMemPrefetchNvmeBatch batch;
         batch.read_begin = begin;
         batch.read_end = end;
+        batch.bytes = batch_bytes;
         for (auto it = kvmem_free_read_slabs_.begin();
              it != kvmem_free_read_slabs_.end(); ++it) {
             if ((*it)->bytes >= batch_bytes) {
@@ -9790,35 +9819,25 @@ void QwenExecutor::kvmem_finish_prefetch() {
                 HostBuffer *host = batch.buffer.get();
                 const uint64_t t_nvme_h2d0 =
                     perf_trace ? kvmem_steady_ns() : 0;
-                const auto &blocks = block_store_->blocks();
+                std::vector<uint32_t> packed_block_ids;
+                std::vector<uint64_t> packed_offsets;
+                packed_block_ids.reserve(read_end - read_begin);
+                packed_offsets.reserve(read_end - read_begin);
                 for (size_t i = read_begin; i < read_end; ++i) {
                     KvMemPrefetchNvmeRead &read =
                         kvmem_prefetch_.nvme_reads[i];
-                    const KvMemBlock &block = blocks[read.block_id];
-                    const uint32_t page_size = kv_pages_.page_size;
-                    const uint32_t first_page =
-                        block.orig_pos_start / page_size;
-                    const uint32_t last_page =
-                        (block.orig_pos_start + block.n_tokens - 1) /
-                        page_size;
-                    for (uint32_t lp = first_page; lp <= last_page; ++lp) {
-                        if (!kv_pages_.logical_page_resident(lp) ||
-                            (stage_mtp_pages &&
-                             !mtp_kv_pages_.logical_page_resident(lp))) {
-                            throw std::runtime_error(
-                                "KVMem packed NVMe stage-in target page was "
-                                "not bulk-allocated");
-                        }
-                    }
-                    const uint8_t *src =
-                        static_cast<const uint8_t *>(host->data) +
-                        read.batch_offset;
-                    kvmem_copy_block_from_host(
-                        block, src, read.bytes, stage_mtp_pages);
-                    kvmem_prefetch_.queued_h2d = true;
+                    packed_block_ids.push_back(read.block_id);
+                    packed_offsets.push_back(read.batch_offset);
                     kvmem_prefetch_.blocks.push_back(
                         KvMemPrefetchBlock{read.block_id, KvTier::SSD});
                 }
+                kvmem_enqueue_packed_stagein(
+                    packed_block_ids, packed_offsets, host->data,
+                    batch.bytes, stage_mtp_pages,
+                    batch.src_page_indices, batch.dst_page_indices);
+                require_status(
+                    backend_.record_kv_transfer_fence(batch.fence));
+                kvmem_prefetch_.queued_h2d = true;
                 if (perf_trace) {
                     kvmem_prefetch_.perf.nvme_h2d_enqueue_ns +=
                         kvmem_steady_ns() - t_nvme_h2d0;
@@ -9826,7 +9845,8 @@ void QwenExecutor::kvmem_finish_prefetch() {
                 if (kvmem_prefetch_.queued_h2d) {
                     const uint64_t t_h2d_wait0 =
                         perf_trace ? kvmem_steady_ns() : 0;
-                    require_status(backend_.wait_kv_transfer());
+                    require_status(
+                        backend_.wait_kv_transfer_fence(batch.fence));
                     if (perf_trace) {
                         kvmem_prefetch_.perf.h2d_wait_ns +=
                             kvmem_steady_ns() - t_h2d_wait0;

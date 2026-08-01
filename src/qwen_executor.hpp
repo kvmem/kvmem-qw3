@@ -1076,8 +1076,12 @@ private:
     struct KvMemPrefetchNvmeBatch {
         size_t read_begin = 0;
         size_t read_end = 0;
+        uint64_t bytes = 0;
         std::unique_ptr<HostBuffer> buffer;
         std::vector<NvmeIoSpan> spans;
+        std::vector<int32_t> src_page_indices;
+        std::vector<int32_t> dst_page_indices;
+        std::unique_ptr<DeviceTransferFence> fence;
         std::future<NvmeBatchIoStats> future;
     };
     struct KvMemPrefetchPerf {
@@ -1244,6 +1248,12 @@ private:
     void kvmem_finish_prefetch();
     void kvmem_submit_prefetch_cpu_batches();
     void kvmem_submit_prefetch_nvme_batches();
+    void kvmem_enqueue_packed_stagein(
+        const std::vector<uint32_t> &block_ids,
+        const std::vector<uint64_t> &batch_offsets,
+        void *slab, uint64_t slab_bytes, bool stage_mtp_pages,
+        std::vector<int32_t> &src_page_indices,
+        std::vector<int32_t> &dst_page_indices);
     void kvmem_stage_out_packed(
         const std::vector<uint32_t> &block_ids);
     void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
