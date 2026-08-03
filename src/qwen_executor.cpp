@@ -18958,12 +18958,29 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
     kvmem_drain_query_capture();
     const QwenConfig &cfg = model_.config();
     const uint32_t layers = kvmem_qc_num_layers_;
-    const uint32_t tokens = g_query_multi_count_;
+    const uint32_t captured_tokens = g_query_multi_count_;
+    const uint32_t requested_score_tokens = env_uint32_or(
+        "QW3_KVMEM_QUERY_SCORE_TOKENS", 0);
+    const uint32_t tokens = requested_score_tokens > 0
+        ? std::min(captured_tokens, requested_score_tokens)
+        : captured_tokens;
     const uint32_t source_stride = kvmem_query_span_;
-    if (layers == 0 || tokens == 0 || tokens > source_stride) {
+    if (layers == 0 || captured_tokens == 0 || tokens == 0 ||
+        captured_tokens > source_stride) {
         return scorer_unavailable(
             failure_reason, "host_query_stream_shape_invalid");
     }
+    const bool sampled_query = tokens < captured_tokens;
+    auto source_token = [&](uint32_t sampled) -> uint32_t {
+        if (!sampled_query) return sampled;
+        // Midpoint stratification covers the complete causal query rather than
+        // truncating either its instruction prefix or its final constraints.
+        // The full suffix is still replayed after retrieval; this affects only
+        // the score distributions used to choose historical blocks.
+        return static_cast<uint32_t>(
+            ((2ull * sampled + 1ull) * captured_tokens) /
+            (2ull * tokens));
+    };
     const char *score_chunk_env =
         std::getenv("QW3_KVMEM_QUERY_SCORE_CHUNK");
     const uint32_t configured_chunk = std::max<uint32_t>(
@@ -19048,15 +19065,31 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
         auto *packed =
             static_cast<uint16_t *>(g_query_score_pinned_->data);
         for (uint32_t layer = 0; layer < layers; ++layer) {
-            const uint64_t src =
-                (static_cast<uint64_t>(layer) * source_stride +
-                 token_base) * row_elems;
             const uint64_t dst =
                 static_cast<uint64_t>(layer) * chunk_layer_elems;
-            std::memcpy(
-                packed + dst, g_query_multi_host_.get() + src,
-                static_cast<size_t>(chunk_layer_elems) *
-                    sizeof(uint16_t));
+            if (!sampled_query) {
+                const uint64_t src =
+                    (static_cast<uint64_t>(layer) * source_stride +
+                     token_base) * row_elems;
+                std::memcpy(
+                    packed + dst, g_query_multi_host_.get() + src,
+                    static_cast<size_t>(chunk_layer_elems) *
+                        sizeof(uint16_t));
+            } else {
+                for (uint32_t t = 0; t < count; ++t) {
+                    const uint32_t src_token =
+                        source_token(token_base + t);
+                    const uint64_t src =
+                        (static_cast<uint64_t>(layer) * source_stride +
+                         src_token) * row_elems;
+                    std::memcpy(
+                        packed + dst +
+                            static_cast<uint64_t>(t) * row_elems,
+                        g_query_multi_host_.get() + src,
+                        static_cast<size_t>(row_elems) *
+                            sizeof(uint16_t));
+                }
+            }
         }
         gather_ns += kvmem_steady_ns() - gather_begin;
 
@@ -19148,9 +19181,12 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
         std::fprintf(
             stderr,
             "[bs-qscore-host] dtype=fp16 layers=%u tokens=%u "
+            "captured_tokens=%u sampling=%s "
             "chunk_tokens=%u configured_chunk=%u chunks=%u copied_mib=%.2f "
             "gather_ms=%.3f h2d_wait_ms=%.3f total_submit_ms=%.3f\n",
-            layers, tokens, chunk_tokens, configured_chunk, chunks,
+            layers, tokens, captured_tokens,
+            sampled_query ? "uniform-midpoint" : "none",
+            chunk_tokens, configured_chunk, chunks,
             static_cast<double>(copied_bytes) / (1024.0 * 1024.0),
             gather_ns / 1.0e6, h2d_wait_ns / 1.0e6,
             total_ns / 1.0e6);
