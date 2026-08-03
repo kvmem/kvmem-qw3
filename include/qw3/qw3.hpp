@@ -191,6 +191,22 @@ struct EngineOptions {
     // default for compatibility; enable for contexts whose raw-K authority
     // exceeds the CPU tier budget.
     bool kvmem_raw_k_nvme = false;
+    // Durable context archive (docs/kvmem_context_archive_design.md). When
+    // `kvmem_archive_dir` is set, the raw-K and V arenas live inside that
+    // directory instead of an ephemeral NVMe cache. "build" writes a new
+    // archive; "attach" opens a sealed one read-only, so several processes can
+    // run different retrieval or budget settings over the same context.
+    std::string kvmem_archive_dir;
+    std::string kvmem_archive_mode;  // "" | "build" | "attach"
+    // Prefix exposed by a dedicated archive-backed Serve process. Zero uses
+    // the complete sealed archive; non-zero values are snapped to a physical
+    // block boundary by the backend.
+    uint64_t kvmem_archive_tokens = 0;
+    // Distance between archived recurrent-state ladder points. Truncating an
+    // attached archive to an arbitrary length restores the nearest point at or
+    // below it and re-prefills the residual, so this trades archive size
+    // against worst-case truncation cost. 0 selects a default.
+    uint64_t kvmem_archive_ladder_tokens = 0;
 };
 
 struct GenerationOptions {

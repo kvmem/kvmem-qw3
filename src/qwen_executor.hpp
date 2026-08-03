@@ -3,6 +3,7 @@
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
 #include "qw3/device_backend.hpp"
+#include "qw3/kvmem_archive.hpp"
 #include "qw3/kvmem_store.hpp"
 #include "qw3/nvme_kv_tier.hpp"
 #include "qw3/pinned_kv_tier.hpp"
@@ -536,6 +537,43 @@ public:
     // by a later suffix.
     void kvmem_sync_raw_k_persistence();
 
+    // ---- Context archive (docs/kvmem_context_archive_design.md) ----
+    // Point this executor at a durable archive. Must be called before
+    // configure_kvmem(), which routes the raw-K and V arenas into the archive
+    // directory in durable + direct-mapped mode. `build` writes; otherwise the
+    // arenas are opened read-only and the context is attached rather than
+    // computed.
+    void kvmem_set_archive(KvMemArchive *archive, bool build,
+                           uint64_t checkpoint_interval_tokens);
+    bool kvmem_archive_attached() const {
+        return kvmem_archive_ != nullptr && !kvmem_archive_build_;
+    }
+    bool kvmem_archive_building() const {
+        return kvmem_archive_ != nullptr && kvmem_archive_build_;
+    }
+    // Token boundary the archive can be sealed at: the largest multiple of the
+    // raw-K chunk stride at or below the registered position. A partial chunk
+    // is never persistable, because a chunk is only written once every token in
+    // it is captured.
+    uint64_t kvmem_archive_sealable_tokens() const;
+    // Force every V block below `tokens` out to the archive arena and flush all
+    // raw-K writeback, then record what is durable in the validity bitmaps.
+    void kvmem_archive_persist_through(uint64_t tokens);
+    // Snapshot recurrent/conv/hidden state at the current position into the
+    // archive's ladder. The caller must have persisted through this position.
+    void kvmem_archive_capture_ladder(uint64_t position);
+    // Restore a ladder point into live executor state.
+    void kvmem_archive_restore_ladder(uint64_t position);
+    // Install an attached archive's first `tokens` tokens as this executor's
+    // history: block table, tier residency, raw-K validity, page table, and
+    // recurrent state from the nearest ladder point at or below `tokens`.
+    // Returns the position actually restored, which is <= tokens; the caller
+    // re-prefills the residual.
+    uint64_t kvmem_attach_archive(uint64_t tokens);
+    // Rebuild the retrieval index for blocks [0, blocks) from the raw-K
+    // authority. Used after an attach, where no prefill activations exist.
+    void kvmem_build_index_from_raw_k(uint32_t blocks);
+
     // Assemble the deterministic long-prefill working set: configured sink
     // prefix plus the newest blocks filling the rest of the selection budget.
     // Unlike kvmem_reselect(), this never runs or consumes a semantic scorer.
@@ -580,7 +618,8 @@ public:
     // (the external-selector hook; also used by tests to force a fixed set,
     // e.g. the identity all-blocks selection that must reproduce the plain
     // path byte-for-byte). Assembles the same way as kvmem_reselect.
-    uint32_t kvmem_set_selection(const std::vector<uint32_t> &block_ids);
+    uint32_t kvmem_set_selection(const std::vector<uint32_t> &block_ids,
+                                 bool force_raw_refresh = false);
 
     const KvMemStore *block_store() const { return block_store_.get(); }
 
@@ -881,6 +920,34 @@ private:
     // the lifetime of a session; unlike the V tier they are never LRU-reused
     // while their token range remains valid.
     std::unique_ptr<NvmeKvTier> kvmem_raw_k_nvme_tier_;
+
+    // Context archive. When set, the raw-K and V arenas above live inside the
+    // archive directory in durable + direct-mapped mode, so slot == chunk id
+    // and slot == block id respectively and no slot table has to be persisted.
+    KvMemArchive *kvmem_archive_ = nullptr;
+    bool kvmem_archive_build_ = false;
+    uint64_t kvmem_archive_ckpt_interval_ = 0;
+    uint64_t kvmem_archive_next_ckpt_ = 0;
+    uint64_t kvmem_archive_attached_tokens_ = 0;
+    // Scratch directory for the attached arenas' copy-on-write overlay. Empty
+    // while building, where the arenas are the writable thing.
+    std::string kvmem_archive_overlay_dir_;
+    // Scratch reused by the bulk index rebuild so a 10M-token attach does not
+    // reallocate once per batch.
+    std::unique_ptr<DeviceTensor> kvmem_index_rebuild_raw_dev_;
+    std::unique_ptr<DeviceTensor> kvmem_index_rebuild_f32_dev_;
+    std::unique_ptr<HostBuffer> kvmem_index_rebuild_host_;
+    // Full block-major raw-K chunk used by archive index rebuild. Reading one
+    // contiguous record per chunk avoids a layer-major pattern of small,
+    // strided NVMe reads; kvmem_index_rebuild_host_ remains the gathered
+    // layer-contiguous H2D staging buffer.
+    std::unique_ptr<HostBuffer> kvmem_index_rebuild_chunk_host_;
+    // While set, the prototype capture path reads these rows instead of the
+    // live prefill K batch and treats them as already being in the content
+    // frame, so the de-rotate becomes an identity. That makes an attached
+    // archive reproduce the same index the original prefill built, using the
+    // same kernels, for every prototype mode.
+    const DeviceTensor *kvmem_index_rebuild_source_ = nullptr;
     std::unique_ptr<HostBuffer> kvmem_cpu_bytes_;
     // Optional per-executor persistent workers for the many small parallel
     // gather/scatter jobs issued by long-context reselection. Keeping the
@@ -1097,6 +1164,13 @@ private:
         uint64_t pending_write_wait_ns = 0;
         uint64_t nvme_h2d_enqueue_ns = 0;
         uint64_t h2d_wait_ns = 0;
+        // Optional inclusive CPU-cache admission of clean SSD records.  The
+        // source is the already-read pinned NVMe slab, so this is a host copy
+        // rather than another storage read.  It normally overlaps the H2D of
+        // that same immutable slab.
+        uint64_t cpu_cache_admit_ns = 0;
+        uint64_t cpu_cache_admit_bytes = 0;
+        uint32_t cpu_cache_admit_blocks = 0;
         uint64_t cpu_bytes = 0;
         uint64_t nvme_bytes = 0;
         uint64_t nvme_read_syscalls = 0;
@@ -1627,6 +1701,8 @@ private:
     std::unique_ptr<DeviceTensor> g_adaptive_stream_block_max_;
     std::unique_ptr<DeviceTensor> g_adaptive_stream_block_sum_;
     uint64_t g_adaptive_stream_block_stats_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> g_adaptive_stream_logits_;
+    uint64_t g_adaptive_stream_logits_capacity_ = 0;
 
     // CPU-offloaded mean-K index (--kvmem-index-placement cpu). The canonical
     // full index keeps the same fixed-stride layer-major byte layout as

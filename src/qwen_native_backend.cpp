@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "env_flags.hpp"
+#include "kvmem_archive_cli.hpp"
 #include "kvmem_session.hpp"
 #include "qwen_executor.hpp"
 #include "qwen_native.hpp"
@@ -46,6 +47,38 @@ namespace {
 double wall_seconds() {
     using clk = std::chrono::steady_clock;
     return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
+}
+
+std::string trim_archive_question_ascii_ws(const std::string &text) {
+    const char *ws = " \t\n\r\f\v";
+    const size_t begin = text.find_first_not_of(ws);
+    if (begin == std::string::npos) return {};
+    const size_t end = text.find_last_not_of(ws);
+    return text.substr(begin, end - begin + 1);
+}
+
+std::string archive_json_escape(const std::string &text) {
+    std::ostringstream out;
+    for (unsigned char c : text) {
+        switch (c) {
+            case '\"': out << "\\\""; break;
+            case '\\': out << "\\\\"; break;
+            case '\b': out << "\\b"; break;
+            case '\f': out << "\\f"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    out << "\\u" << std::hex << std::setw(4)
+                        << std::setfill('0') << static_cast<unsigned>(c)
+                        << std::dec << std::setfill(' ');
+                } else {
+                    out << static_cast<char>(c);
+                }
+        }
+    }
+    return out.str();
 }
 
 // Query replay only requires a fixed-stride, position-invariant Mean-K source
@@ -712,6 +745,18 @@ uint32_t kvmem_selection_additions(const std::vector<uint32_t> &before,
 // (bounded only by the pool). Used to trigger LRU eviction.
 uint32_t prefix_cache_max_pages() {
     return env_uint32_or("QW3_PREFIX_CACHE_MAX_PAGES", 0);
+}
+
+// Leave this many complete KV pages behind the natural prompt boundary when
+// publishing a shared prefix.  The default remains zero for existing users.
+// A one-page guard is useful for independently rendered chat requests: BPE
+// tokenization close to the user-content suffix can change when a question is
+// appended, even if the byte prefix (including its separator) is identical.
+// Publishing one page earlier keeps the cache strictly inside the stable
+// token prefix while still reusing essentially the entire long context.
+uint32_t prefix_cache_commit_guard_pages() {
+    return std::min<uint32_t>(
+        16u, env_uint32_or("QW3_PREFIX_CACHE_COMMIT_GUARD_PAGES", 0));
 }
 
 bool prefix_cache_trace_enabled() {
@@ -1446,6 +1491,183 @@ public:
         return "qwen-native";
     }
 
+    // ---- Context archive (docs/kvmem_context_archive_design.md) ----
+
+    // Fields that fix the archive's byte layout or its numerics. Deliberately
+    // narrow: retrieval method, budgets, sub-block counts, index placement and
+    // every other policy knob are excluded so one archive can serve many
+    // different runtime configurations.
+    KvMemArchiveLayout kvmem_archive_layout(uint32_t block_tokens,
+                                            uint32_t raw_chunk_tokens) const {
+        const QwenConfig &cfg = model_->config();
+        KvMemArchiveLayout l;
+        l.architecture = cfg.architecture;
+        l.model_name = options_.model_path;
+        const size_t slash = l.model_name.find_last_of('/');
+        if (slash != std::string::npos) l.model_name = l.model_name.substr(slash + 1);
+        std::ifstream probe(options_.model_path,
+                            std::ios::binary | std::ios::ate);
+        l.model_bytes = probe ? static_cast<uint64_t>(probe.tellg()) : 0;
+        l.model_sha256 = kvmem_archive_model_sha256(options_.model_path);
+        l.n_layers = cfg.n_layers;
+        l.full_attention_interval = cfg.full_attention_interval;
+        for (uint32_t i = 0; i < cfg.n_layers; ++i) {
+            if (cfg.is_standard_attention_layer(i)) ++l.n_standard_layers;
+        }
+        l.n_kv_heads = cfg.n_kv_heads;
+        l.head_dim = cfg.head_dim;
+        l.head_v_dim = cfg.head_v_dim;
+        l.rope_dim = cfg.rope_dim;
+        l.rope_theta = cfg.rope_theta;
+        const char *dtype = std::getenv("QW3_KV_DTYPE");
+        l.kv_dtype = dtype ? dtype : "fp16";
+        l.block_tokens = block_tokens;
+        l.raw_chunk_tokens = raw_chunk_tokens;
+        l.kv_page_size = std::max<uint32_t>(
+            1, env_uint32_or("QW3_PAGED_KV_PAGE_SIZE", 16));
+        l.immutable_source_k = options_.kvmem_immutable_source_k;
+        l.raw_k_block_major = true;
+        l.mtp_archived = options_.native_mtp_chain_set &&
+                         options_.native_mtp_chain > 0;
+        const uint64_t elem_bytes = l.kv_dtype == "fp8"
+                                        ? 1
+                                        : (l.kv_dtype == "fp32" ? 4 : 2);
+        l.raw_k_row_bytes =
+            static_cast<uint64_t>(l.n_kv_heads) * l.head_dim * elem_bytes;
+        l.raw_chunk_bytes = static_cast<uint64_t>(l.n_standard_layers) *
+                            raw_chunk_tokens * l.raw_k_row_bytes;
+        l.mtp_chunk_bytes = l.mtp_archived
+            ? static_cast<uint64_t>(raw_chunk_tokens) * l.raw_k_row_bytes
+            : 0;
+        const uint32_t archived_v_layers =
+            l.n_standard_layers + (l.mtp_archived ? 1u : 0u);
+        l.v_block_bytes = static_cast<uint64_t>(archived_v_layers) *
+                          block_tokens * l.n_kv_heads * l.head_v_dim *
+                          elem_bytes;
+        return l;
+    }
+
+    // Provenance only. None of this constrains an attach; recording it is what
+    // makes an A/B run self-describing after the fact.
+    std::string kvmem_archive_policy_snapshot() const {
+        std::ostringstream out;
+        out << "budget=" << options_.kvmem_budget
+            << " gen_budget=" << options_.kvmem_gen_budget
+            << " interval=" << options_.kvmem_interval
+            << " method=" << options_.kvmem_method
+            << " retrieval=" << options_.kvmem_retrieval_method
+            << " index_placement=" << options_.kvmem_index_placement
+            << " subblocks=" << options_.kvmem_subblocks
+            << " ctx=" << options_.ctx_size;
+        return out.str();
+    }
+
+    void open_kvmem_archive(QwenExecutor &exec) {
+        if (options_.kvmem_archive_dir.empty()) return;
+        const bool build = options_.kvmem_archive_mode == "build";
+        if (!build && options_.kvmem_archive_mode != "attach") {
+            throw std::invalid_argument(
+                "--kvmem-archive-mode must be build or attach");
+        }
+        const uint32_t block_tokens =
+            static_cast<uint32_t>(std::max(1, options_.kvmem_block_tokens));
+        uint32_t raw_chunk_tokens =
+            env_uint32_or("QW3_KVMEM_RAW_K_CHUNK_TOKENS", 2048);
+        raw_chunk_tokens = std::max(raw_chunk_tokens, block_tokens);
+        raw_chunk_tokens =
+            ((raw_chunk_tokens + block_tokens - 1) / block_tokens) *
+            block_tokens;
+        const KvMemArchiveLayout layout =
+            kvmem_archive_layout(block_tokens, raw_chunk_tokens);
+        // Early v1 archives physically included MTP raw-K/V because archive
+        // commands always enable MTP, but their manifest described only the 16
+        // main attention layers. Accept that one precisely-defined legacy shape
+        // while all newly created v2 archives record the true physical stride.
+        auto legacy_v1_layout = [&]() {
+            KvMemArchiveLayout legacy = layout;
+            legacy.model_sha256.clear();
+            legacy.mtp_archived = false;
+            legacy.mtp_chunk_bytes = 0;
+            if (layout.mtp_archived) {
+                const uint64_t mtp_v_bytes =
+                    static_cast<uint64_t>(block_tokens) *
+                    layout.n_kv_heads * layout.head_v_dim *
+                    (layout.kv_dtype == "fp8"
+                         ? 1ull
+                         : (layout.kv_dtype == "fp32" ? 4ull : 2ull));
+                legacy.v_block_bytes -= mtp_v_bytes;
+            }
+            return legacy;
+        };
+        auto is_legacy_v1 = [&](const KvMemArchiveManifest &manifest) {
+            return manifest.format_version == 1 && layout.mtp_archived &&
+                   !manifest.layout.mtp_archived &&
+                   manifest.layout.explain_mismatch(
+                       legacy_v1_layout()).empty();
+        };
+        if (build) {
+            KvMemArchiveLayout build_layout = layout;
+            const std::string manifest_path =
+                options_.kvmem_archive_dir + "/" +
+                kvmem_archive_files::kManifest;
+            std::ifstream existing_manifest(manifest_path);
+            if (existing_manifest) {
+                const KvMemArchiveManifest existing =
+                    KvMemArchive::read_manifest(options_.kvmem_archive_dir);
+                if (is_legacy_v1(existing)) build_layout = existing.layout;
+            }
+            kvmem_archive_ = KvMemArchive::open_for_build(
+                options_.kvmem_archive_dir, build_layout,
+                kvmem_archive_policy_snapshot());
+        } else {
+            kvmem_archive_ =
+                KvMemArchive::attach(options_.kvmem_archive_dir);
+            const KvMemArchiveManifest &manifest =
+                kvmem_archive_->manifest();
+            const bool legacy_v1 = is_legacy_v1(manifest);
+            KvMemArchiveLayout compatible_layout = layout;
+            if (manifest.format_version < 3 &&
+                manifest.layout.model_sha256.empty()) {
+                compatible_layout.model_sha256.clear();
+            }
+            const std::string why = legacy_v1
+                ? std::string()
+                : manifest.layout.explain_mismatch(compatible_layout);
+            if (!why.empty()) {
+                throw std::runtime_error(
+                    "KVMem archive layout does not match this engine: " + why);
+            }
+            if (legacy_v1) {
+                auto file_bytes = [](const std::string &path) -> uint64_t {
+                    std::ifstream in(path, std::ios::binary | std::ios::ate);
+                    return in ? static_cast<uint64_t>(in.tellg()) : 0;
+                };
+                const uint64_t raw_record =
+                    layout.raw_chunk_bytes + layout.mtp_chunk_bytes;
+                const uint64_t raw_needed =
+                    static_cast<uint64_t>(manifest.raw_chunks) * raw_record;
+                const uint64_t v_needed =
+                    static_cast<uint64_t>(manifest.total_blocks) *
+                    layout.v_block_bytes;
+                if (file_bytes(kvmem_archive_->raw_k_path()) < raw_needed ||
+                    file_bytes(kvmem_archive_->v_path()) < v_needed) {
+                    throw std::runtime_error(
+                        "legacy v1 KVMem archive claims no MTP payload and its "
+                        "arena sizes do not prove the physical MTP segments");
+                }
+                log("archive attach: accepted legacy v1 manifest after "
+                    "validating physical MTP raw-K/V record strides");
+            }
+        }
+        uint64_t ladder = options_.kvmem_archive_ladder_tokens;
+        if (ladder == 0) ladder = static_cast<uint64_t>(raw_chunk_tokens) * 128;
+        ladder = std::max<uint64_t>(
+            raw_chunk_tokens,
+            (ladder / raw_chunk_tokens) * raw_chunk_tokens);
+        exec.kvmem_set_archive(kvmem_archive_.get(), build, ladder);
+        kvmem_archive_ladder_tokens_ = ladder;
+    }
+
     void load(const EngineOptions &options) override {
         if (options.model_path.empty()) {
             throw std::invalid_argument("qwen-native backend requires --model");
@@ -1497,6 +1719,9 @@ public:
         const uint32_t ctx_size = options_.ctx_size > 0 ? static_cast<uint32_t>(options_.ctx_size) : 4096u;
         executor_ = std::make_unique<QwenExecutor>(*model_, *weights_, *device_, ctx_size);
         executor_->set_prefill_chunk_override(options_.prefill_chunk);
+        // The archive owns the KV arenas, so it must exist before the tiers are
+        // created.
+        open_kvmem_archive(*executor_);
         configure_executor_kvmem(*executor_);
         executor_->reset_state();
         if (env_flag_enabled("QW3_CONTINUOUS_BATCHING")) {
@@ -1540,6 +1765,17 @@ public:
                                 : (load_mtp ? "unavailable" : "skipped"))
             << " backend=" << linear_backend_name(linear_backend);
         log(msg.str());
+        if (executor_->kvmem_archive_attached() &&
+            env_flag_enabled("QW3_KVMEM_ARCHIVE_SERVE")) {
+            KvMemArchiveRunConfig init;
+            init.tokens = options_.kvmem_archive_tokens;
+            init.verbose = false;
+            (void)run_kvmem_archive(init);
+            log("archive serve: frozen base ready tokens=" +
+                std::to_string(archive_query_base_prefix_tokens_) +
+                " selected_blocks=" +
+                std::to_string(archive_query_base_selection_.size()));
+        }
     }
 
     // ---- kvmem growth-profiling harness ----------------------------------
@@ -1550,6 +1786,744 @@ public:
     // breakdown (selection / stage-in / stage-out / assemble / prefill /
     // decode) plus a final summary table with tier residency. Requires kvmem
     // enabled (the free run_kvmem_session forces it on with update-mode=step).
+    int build_kvmem_archive(const KvMemArchiveBuildConfig &cfg) {
+        if (!model_ || !tokenizer_ || !device_ || !executor_) {
+            throw std::runtime_error(
+                "archive build: backend not fully loaded "
+                "(need --native-kernels cuda)");
+        }
+        if (!executor_->kvmem_archive_building()) {
+            throw std::runtime_error(
+                "archive build requires --kvmem-archive and "
+                "--kvmem-archive-mode build");
+        }
+
+        std::vector<uint32_t> corpus;
+        if (!cfg.token_input_path.empty()) {
+            if (!cfg.input_path.empty()) {
+                throw std::runtime_error(
+                    "archive build accepts only one of --archive-input and "
+                    "--archive-token-input");
+            }
+            std::ifstream in(cfg.token_input_path, std::ios::binary);
+            if (!in) {
+                throw std::runtime_error("cannot read archive token input: " +
+                                         cfg.token_input_path);
+            }
+            char magic[8] = {};
+            uint64_t count = 0;
+            char token_model_sha256[64] = {};
+            in.read(magic, sizeof(magic));
+            in.read(reinterpret_cast<char *>(&count), sizeof(count));
+            in.read(token_model_sha256, sizeof(token_model_sha256));
+            static constexpr char expected[8] = {
+                'Q', 'W', '3', 'T', 'O', 'K', '2', '\0'};
+            if (!in || !std::equal(std::begin(magic), std::end(magic),
+                                   std::begin(expected))) {
+                throw std::runtime_error(
+                    "invalid archive token input header: " +
+                    cfg.token_input_path);
+            }
+            const std::string token_digest(
+                token_model_sha256, sizeof(token_model_sha256));
+            const std::string archive_digest =
+                kvmem_archive_->manifest().layout.model_sha256;
+            if (token_digest != archive_digest) {
+                throw std::runtime_error(
+                    "archive token input was produced by a different model: " +
+                    cfg.token_input_path);
+            }
+            if (count > static_cast<uint64_t>(
+                            std::numeric_limits<size_t>::max() /
+                            sizeof(uint32_t))) {
+                throw std::runtime_error("archive token input is too large");
+            }
+            corpus.resize(static_cast<size_t>(count));
+            if (!corpus.empty()) {
+                in.read(reinterpret_cast<char *>(corpus.data()),
+                        static_cast<std::streamsize>(corpus.size() *
+                                                     sizeof(corpus[0])));
+            }
+            if (!in) {
+                throw std::runtime_error(
+                    "truncated archive token input: " + cfg.token_input_path);
+            }
+            char trailing = 0;
+            if (in.read(&trailing, 1)) {
+                throw std::runtime_error(
+                    "archive token input has trailing bytes: " +
+                    cfg.token_input_path);
+            }
+        } else if (cfg.input_path.empty()) {
+            build_session_corpus(corpus,
+                                 cfg.tokens > 0 ? cfg.tokens : 65536);
+        } else {
+            std::ifstream in(cfg.input_path, std::ios::binary);
+            if (!in) {
+                throw std::runtime_error("cannot read archive input: " +
+                                         cfg.input_path);
+            }
+            std::ostringstream text;
+            text << in.rdbuf();
+            const std::vector<int32_t> ids = tokenizer_->encode(text.str());
+            corpus.assign(ids.begin(), ids.end());
+        }
+        uint64_t target = cfg.tokens > 0
+                              ? std::min<uint64_t>(cfg.tokens, corpus.size())
+                              : corpus.size();
+
+        // Only a whole raw-K chunk is ever durable, so the archive's length is
+        // rounded down to the chunk stride and the remainder is dropped.
+        const uint32_t chunk_stride =
+            kvmem_archive_->manifest().layout.raw_chunk_tokens;
+        if (cfg.pad_final_chunk && target % chunk_stride != 0) {
+            if (cfg.tokens > 0 && cfg.tokens < corpus.size()) {
+                throw std::runtime_error(
+                    "--archive-pad-final-chunk cannot be combined with a "
+                    "shorter --archive-tokens prefix; omit --archive-tokens "
+                    "to preserve and pad the complete input");
+            }
+            const uint64_t original_target = target;
+            target = ((target + chunk_stride - 1) / chunk_stride) *
+                     chunk_stride;
+            const std::vector<int32_t> newline_ids = tokenizer_->encode("\n");
+            if (newline_ids.empty()) {
+                throw std::runtime_error(
+                    "tokenizer produced no token for archive newline padding");
+            }
+            corpus.reserve(static_cast<size_t>(target));
+            size_t pad_index = 0;
+            while (corpus.size() < target) {
+                corpus.push_back(static_cast<uint32_t>(
+                    newline_ids[pad_index % newline_ids.size()]));
+                ++pad_index;
+            }
+            log("archive build: padded corpus from " +
+                std::to_string(original_target) + " to " +
+                std::to_string(target) + " tokens with newline tokens");
+        } else {
+            target = (target / chunk_stride) * chunk_stride;
+        }
+        if (target == 0) {
+            throw std::runtime_error(
+                "archive build needs at least one full raw-K chunk (" +
+                std::to_string(chunk_stride) + " tokens); input has " +
+                std::to_string(corpus.size()));
+        }
+
+        // Resume where a previous run left off. Everything below the resume
+        // point is already durable, including its recurrent state.
+        uint64_t start = kvmem_archive_->resume_position();
+        if (start > target) {
+            throw std::runtime_error(
+                "cannot resume KVMem archive build to a shorter target (" +
+                std::to_string(target) + " tokens) than its durable ladder (" +
+                std::to_string(start) + "); use a new archive directory");
+        }
+        if (start > 0) {
+            // Refuse to splice a different corpus onto an existing durable
+            // prefix. Compare in bounded chunks so 10M-token resumes do not
+            // need a second full token copy.
+            constexpr uint64_t kVerifyTokens = 1ull << 20;
+            for (uint64_t off = 0; off < start; off += kVerifyTokens) {
+                const uint64_t n = std::min(kVerifyTokens, start - off);
+                const std::vector<uint32_t> archived =
+                    kvmem_archive_->read_tokens(off, n);
+                if (!std::equal(
+                        archived.begin(), archived.end(),
+                        corpus.begin() + static_cast<std::ptrdiff_t>(off))) {
+                    throw std::runtime_error(
+                        "cannot resume KVMem archive build: input token "
+                        "prefix differs before ladder position " +
+                        std::to_string(start));
+                }
+            }
+            log("archive build: resuming at " + std::to_string(start) +
+                " tokens");
+            executor_->kvmem_attach_archive(start);
+        }
+        // A crash can happen after tokens.bin was appended but before the
+        // ladder/manifest commit. Those bytes are not part of the resumable
+        // prefix and must be discarded before appending the same suffix again.
+        kvmem_archive_->truncate_tokens(start);
+
+        GenerationOptions gen;
+        gen.max_tokens = 0;  // ingest only; the archive never decodes
+        gen.kvmem_reselect_mode = KvMemReselectMode::Off;
+        gen.kvmem_query_begin = 0;
+        gen.kvmem_query_end = 0;
+        gen.kvmem_session_id = "kvmem-archive-build";
+        kvmem_api_session_active_ = true;
+        kvmem_api_session_id_ = gen.kvmem_session_id;
+        kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
+        kvmem_api_boundary_pos_ = 0;
+        kvmem_api_tail_tokens_.clear();
+        kvmem_api_tokens_.assign(
+            corpus.begin(),
+            corpus.begin() + static_cast<std::ptrdiff_t>(start));
+
+        if (start > 0) {
+            // A ladder restores model state and cold tier authority, but the
+            // interrupted live builder also had a concrete bounded attention
+            // window at this position. Recreate its deterministic pressure
+            // selection without invoking the semantic/content scorer, then
+            // establish the exact API turn boundary required by continuation.
+            DeviceStatus scope = device_->begin();
+            if (!scope.ok) throw std::runtime_error(scope.message);
+            bool scope_open = true;
+            try {
+                const KvMemStore *store = executor_->block_store();
+                if (!store) {
+                    throw std::runtime_error(
+                        "KVMem archive resume lost its block store");
+                }
+                const uint32_t bt =
+                    kvmem_archive_->manifest().layout.block_tokens;
+                executor_->kvmem_set_query_span(
+                    0, 0, static_cast<uint32_t>(start),
+                    /*index_tokens=*/0,
+                    /*preserve_content_index=*/false,
+                    /*capture_content_without_query=*/true);
+                executor_->kvmem_build_index_from_raw_k(
+                    static_cast<uint32_t>(start / bt));
+                const std::vector<uint32_t> selected =
+                    store->pick_prefill_pressure_blocks();
+                (void)executor_->kvmem_set_selection(
+                    selected, /*force_raw_refresh=*/true);
+                executor_->capture_state(kvmem_api_boundary_ckpt_);
+                kvmem_api_boundary_pos_ = static_cast<uint32_t>(start);
+                DeviceStatus done = device_->end();
+                scope_open = false;
+                if (!done.ok) throw std::runtime_error(done.message);
+            } catch (...) {
+                if (scope_open) (void)device_->end();
+                throw;
+            }
+        }
+
+        const uint64_t ladder = std::max<uint64_t>(
+            chunk_stride, kvmem_archive_ladder_tokens_);
+        const double t_start = wall_seconds();
+        uint64_t pos = start;
+        bool first_turn = (start == 0);
+        while (pos < target) {
+            const uint64_t next = std::min(target, pos + ladder);
+            std::vector<uint32_t> turn(
+                corpus.begin() + static_cast<std::ptrdiff_t>(pos),
+                corpus.begin() + static_cast<std::ptrdiff_t>(next));
+            MtpGenStats stats;
+            (void)generate_mtp(turn, gen, CancellableTokenCallback{},
+                               /*dump=*/nullptr,
+                               /*spec_mtp=*/true, /*trace_mtp=*/false,
+                               /*override_executor=*/nullptr,
+                               /*manage_device_scope=*/true,
+                               /*reset_session=*/first_turn, &stats);
+            first_turn = false;
+            pos = next;
+
+            DeviceStatus scope = device_->begin();
+            if (!scope.ok) throw std::runtime_error(scope.message);
+            try {
+                const uint64_t sealable =
+                    executor_->kvmem_archive_sealable_tokens();
+                executor_->kvmem_archive_persist_through(sealable);
+                // A durable ladder must define not only recurrent/hidden
+                // tensors but also the canonical active attention frame used
+                // by the next ingest turn. Without this normalization, an
+                // uninterrupted writer can retain its dense resident page
+                // layout while a resumed writer necessarily materializes the
+                // same bytes from raw-K/V into a compact window. The different
+                // attention reduction layout causes small numerical drift that
+                // crosses FP8 thresholds in later layers. Force both paths
+                // through the identical raw-authority reconstruction before
+                // publishing the ladder state.
+                const KvMemStore *store = executor_->block_store();
+                if (!store) {
+                    throw std::runtime_error(
+                        "KVMem archive build lost its block store");
+                }
+                const std::vector<uint32_t> checkpoint_selection =
+                    store->pick_prefill_pressure_blocks();
+                (void)executor_->kvmem_set_selection(
+                    checkpoint_selection, /*force_raw_refresh=*/true);
+                executor_->kvmem_archive_capture_ladder(sealable);
+                kvmem_archive_->append_tokens(
+                    turn.data(), static_cast<size_t>(turn.size()));
+                const uint32_t bt =
+                    kvmem_archive_->manifest().layout.block_tokens;
+                kvmem_archive_->checkpoint_metadata(
+                    sealable, static_cast<uint32_t>(sealable / bt),
+                    static_cast<uint32_t>(sealable / chunk_stride));
+                log("archive build: tokens=" + std::to_string(sealable) + "/" +
+                    std::to_string(target) + " elapsed=" +
+                    fmt_seconds(wall_seconds() - t_start));
+            } catch (...) {
+                (void)device_->end();
+                throw;
+            }
+            DeviceStatus done = device_->end();
+            if (!done.ok) throw std::runtime_error(done.message);
+        }
+
+        const uint32_t bt = kvmem_archive_->manifest().layout.block_tokens;
+        kvmem_archive_->seal(target, static_cast<uint32_t>(target / bt),
+                             static_cast<uint32_t>(target / chunk_stride));
+        log("archive build: sealed tokens=" + std::to_string(target) +
+            " blocks=" + std::to_string(target / bt) +
+            " chunks=" + std::to_string(target / chunk_stride) +
+            " ladder_points=" +
+            std::to_string(kvmem_archive_->manifest().ladder.size()) +
+            " total=" + fmt_seconds(wall_seconds() - t_start));
+        return 0;
+    }
+
+    int run_kvmem_archive(const KvMemArchiveRunConfig &cfg) {
+        if (!model_ || !tokenizer_ || !device_ || !executor_) {
+            throw std::runtime_error(
+                "archive query: backend not fully loaded "
+                "(need --native-kernels cuda)");
+        }
+        if (!executor_->kvmem_archive_attached()) {
+            throw std::runtime_error(
+                "archive query requires --kvmem-archive and "
+                "--kvmem-archive-mode attach");
+        }
+        archive_query_base_ready_ = false;
+        archive_query_base_state_ = QwenExecutor::StateSnapshot{};
+        archive_query_base_selection_.clear();
+        archive_query_base_tokens_.clear();
+        archive_query_base_pos_ = 0;
+        archive_query_base_prefix_tokens_ = 0;
+        const KvMemArchiveManifest &m = kvmem_archive_->manifest();
+        uint64_t want = cfg.tokens == 0
+                            ? m.total_tokens
+                            : std::min<uint64_t>(cfg.tokens, m.total_tokens);
+        // Questions append onto the prefix through the session path, which can
+        // only resume from a block boundary, so truncation snaps down to one.
+        const uint32_t block_tokens = std::max<uint32_t>(1, m.layout.block_tokens);
+        want = (want / block_tokens) * block_tokens;
+        if (want == 0) {
+            throw std::runtime_error(
+                "archive query: --archive-tokens must cover at least one "
+                "block (" + std::to_string(block_tokens) + " tokens)");
+        }
+
+        const double t_attach = wall_seconds();
+        DeviceStatus scope = device_->begin();
+        if (!scope.ok) throw std::runtime_error(scope.message);
+        uint64_t restored = 0;
+        try {
+            restored = executor_->kvmem_attach_archive(want);
+        } catch (...) {
+            (void)device_->end();
+            throw;
+        }
+        DeviceStatus done = device_->end();
+        if (!done.ok) throw std::runtime_error(done.message);
+        const double attach_s = wall_seconds() - t_attach;
+
+        // The residual between the nearest ladder point and the requested
+        // length is replayed from the archived token stream, which is why
+        // truncating to an arbitrary N stays cheap.
+        std::vector<uint32_t> residual;
+        if (want > restored) {
+            residual = kvmem_archive_->read_tokens(restored, want - restored);
+        }
+
+        kvmem_api_session_active_ = true;
+        kvmem_api_session_id_ = "kvmem-archive-query";
+        kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
+        kvmem_api_boundary_pos_ = 0;
+        kvmem_api_tail_tokens_.clear();
+        kvmem_api_tokens_ = kvmem_archive_->read_tokens(0, restored);
+
+        GenerationOptions gen;
+        gen.max_tokens = 0;
+        gen.kvmem_reselect_mode = KvMemReselectMode::Off;
+        gen.kvmem_session_id = kvmem_api_session_id_;
+        // The residual replay below is itself a session turn, so it needs the
+        // same boundary invariant the question turns do: the ladder point is
+        // chunk-aligned and therefore block-aligned, and the state we just
+        // restored is exactly the state at it.
+        if (restored > 0) {
+            scope = device_->begin();
+            if (!scope.ok) throw std::runtime_error(scope.message);
+            try {
+                executor_->capture_state(kvmem_api_boundary_ckpt_);
+            } catch (...) {
+                (void)device_->end();
+                throw;
+            }
+            done = device_->end();
+            if (!done.ok) throw std::runtime_error(done.message);
+            kvmem_api_boundary_pos_ = static_cast<uint32_t>(restored);
+        }
+
+        // The retrieval index is policy, not payload: it is rebuilt from the
+        // archived raw K, so this process is free to use a different retrieval
+        // method or sub-block count than the build did. It has to happen before
+        // the residual replay, because that replay is a session continuation and
+        // extends the content index rather than creating one.
+        const double t_index = wall_seconds();
+        const uint32_t bt = m.layout.block_tokens;
+        scope = device_->begin();
+        if (!scope.ok) throw std::runtime_error(scope.message);
+        try {
+            executor_->kvmem_set_query_span(
+                0, 0, static_cast<uint32_t>(restored), /*index_tokens=*/0,
+                /*preserve_content_index=*/false,
+                /*capture_content_without_query=*/true);
+            executor_->kvmem_build_index_from_raw_k(
+                static_cast<uint32_t>(restored / bt));
+        } catch (...) {
+            (void)device_->end();
+            throw;
+        }
+        done = device_->end();
+        if (!done.ok) throw std::runtime_error(done.message);
+        double index_s = wall_seconds() - t_index;
+
+        const double t_residual = wall_seconds();
+        double residual_s = 0.0;
+        if (!residual.empty()) {
+            // The ladder restores recurrent/hidden state and cold KV authority,
+            // not a live page window. A fresh build reaches the same boundary
+            // with its deterministic sink+recent pressure context available to
+            // the next chunk. Materialize that derived window before replaying
+            // the residual; otherwise its first attention chunk would see an
+            // all-absent page table and diverge despite byte-identical raw K/V.
+            scope = device_->begin();
+            if (!scope.ok) throw std::runtime_error(scope.message);
+            try {
+                executor_->kvmem_reselect_prefill_pressure();
+            } catch (...) {
+                (void)device_->end();
+                throw;
+            }
+            done = device_->end();
+            if (!done.ok) throw std::runtime_error(done.message);
+
+            MtpGenStats stats;
+            (void)generate_mtp(residual, gen, CancellableTokenCallback{},
+                               /*dump=*/nullptr, /*spec_mtp=*/true,
+                               /*trace_mtp=*/false,
+                               /*override_executor=*/nullptr,
+                               /*manage_device_scope=*/true,
+                               /*reset_session=*/false, &stats);
+            residual_s = wall_seconds() - t_residual;
+
+            // The incremental capture used while replaying a residual merges a
+            // boundary block and may be chunked differently from the dedicated
+            // bulk builder. Canonicalize the complete [0,want) index from the
+            // immutable raw-K authority so attach-to-N and a fresh build-N rank
+            // identical bytes through exactly the same reduction path.
+            const double t_canonical_index = wall_seconds();
+            scope = device_->begin();
+            if (!scope.ok) throw std::runtime_error(scope.message);
+            try {
+                executor_->kvmem_set_query_span(
+                    0, 0, static_cast<uint32_t>(want), /*index_tokens=*/0,
+                    /*preserve_content_index=*/false,
+                    /*capture_content_without_query=*/true);
+                executor_->kvmem_build_index_from_raw_k(
+                    static_cast<uint32_t>(want / bt));
+            } catch (...) {
+                (void)device_->end();
+                throw;
+            }
+            done = device_->end();
+            if (!done.ok) throw std::runtime_error(done.message);
+            index_s += wall_seconds() - t_canonical_index;
+        }
+
+        log("archive attach: requested=" + std::to_string(want) +
+            " ladder=" + std::to_string(restored) +
+            " residual=" + std::to_string(want - restored) +
+            " attach=" + fmt_seconds(attach_s) +
+            " replay=" + fmt_seconds(residual_s) +
+            " index=" + fmt_seconds(index_s));
+
+        // Every question starts from this same attached prefix. Capturing it
+        // once and restoring between questions is what makes the comparison
+        // between questions meaningful.
+        QwenExecutor::StateSnapshot base;
+        std::vector<uint32_t> base_selection;
+        scope = device_->begin();
+        if (!scope.ok) throw std::runtime_error(scope.message);
+        try {
+            // An attach with no residual has an all-cold page table, while a
+            // residual leaves only its recently replayed pages resident. Neither
+            // shape has an explicit working set, so it cannot be restored after
+            // the first semantic branch. Normalize the prefix once to the same
+            // sink+recent pressure window used by ordinary long-prefill execution;
+            // this gives every question a concrete, bounded base selection.
+            executor_->kvmem_reselect_prefill_pressure();
+            executor_->capture_state(base);
+            base_selection = kvmem_selected_block_ids(executor_.get());
+            if (base_selection.empty()) {
+                throw std::runtime_error(
+                    "archive query failed to establish a bounded base window");
+            }
+        } catch (...) {
+            (void)device_->end();
+            throw;
+        }
+        done = device_->end();
+        if (!done.ok) throw std::runtime_error(done.message);
+        const uint32_t base_pos = executor_->position();
+        const std::vector<uint32_t> base_tokens = kvmem_api_tokens_;
+        archive_query_base_state_ = std::move(base);
+        archive_query_base_selection_ = base_selection;
+        archive_query_base_tokens_ = base_tokens;
+        archive_query_base_pos_ = base_pos;
+        archive_query_base_prefix_tokens_ = want;
+        archive_query_base_ready_ = true;
+
+        std::ofstream results;
+        if (!cfg.results_path.empty()) {
+            results.open(cfg.results_path, std::ios::out | std::ios::trunc);
+            if (!results) {
+                throw std::runtime_error("cannot create archive results file: " +
+                                         cfg.results_path);
+            }
+        }
+
+        for (size_t qi = 0; qi < cfg.questions.size(); ++qi) {
+            if (qi > 0) {
+                scope = device_->begin();
+                if (!scope.ok) throw std::runtime_error(scope.message);
+                try {
+                    executor_->restore_state(archive_query_base_state_);
+                    executor_->kvmem_truncate_to(base_pos);
+                } catch (...) {
+                    (void)device_->end();
+                    throw;
+                }
+                done = device_->end();
+                if (!done.ok) throw std::runtime_error(done.message);
+                kvmem_api_tokens_ = base_tokens;
+                kvmem_api_tail_tokens_.clear();
+                kvmem_api_boundary_pos_ = base_pos;
+            }
+
+            // A previous branch may have re-baked retained working K in a
+            // different semantic window. Reconstruct the archive-prefix
+            // selection from its position-free raw-K authority before every
+            // question (including q0), so all branches start from byte-equivalent
+            // active K rather than accumulating inverse-RoPE roundoff or inheriting
+            // a prior branch's page/window state. V is position-invariant and is
+            // restored by ordinary tier materialization.
+            if (!base_selection.empty()) {
+                scope = device_->begin();
+                if (!scope.ok) throw std::runtime_error(scope.message);
+                try {
+                    (void)executor_->kvmem_set_selection(
+                        base_selection, /*force_raw_refresh=*/true);
+                    // The session path consumes this checkpoint when replaying
+                    // the query. Capture it only after the exact base window has
+                    // been reconstructed, for q0 as well as later branches.
+                    executor_->capture_state(kvmem_api_boundary_ckpt_);
+                } catch (...) {
+                    (void)device_->end();
+                    throw;
+                }
+                done = device_->end();
+                if (!done.ok) throw std::runtime_error(done.message);
+            }
+
+            std::string rendered_question = cfg.questions[qi];
+            std::string empty_question;
+            bool thinking_open = false;
+            if (cfg.question_format !=
+                KvMemArchiveRunConfig::QuestionFormat::Raw) {
+                const bool user_continuation =
+                    cfg.question_format == KvMemArchiveRunConfig::
+                        QuestionFormat::QwenUserContinuationNoThinking;
+                const std::string prefix = user_continuation
+                    ? "\n"
+                    : "<|im_start|>user\n";
+                const std::string suffix =
+                    cfg.question_format == KvMemArchiveRunConfig::
+                                               QuestionFormat::QwenChatThinking
+                        ? "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+                        : "<|im_end|>\n<|im_start|>assistant\n"
+                          "<think>\n\n</think>\n\n";
+                // Normal Chat Completions mirrors the server's ASCII trim.
+                // A continuation is different: its bytes are the remainder of
+                // an already-open canonical user message, so preserve leading
+                // and trailing whitespace exactly (benchmark templates use it).
+                const std::string content = user_continuation
+                    ? cfg.questions[qi]
+                    : trim_archive_question_ascii_ws(cfg.questions[qi]);
+                rendered_question = prefix + content + suffix;
+                empty_question = prefix + suffix;
+                thinking_open = cfg.question_format ==
+                    KvMemArchiveRunConfig::QuestionFormat::QwenChatThinking;
+            }
+
+            const std::vector<int32_t> ids =
+                tokenizer_->encode(rendered_question);
+            std::vector<uint32_t> q(ids.begin(), ids.end());
+            uint32_t query_begin = 0;
+            uint32_t query_end = static_cast<uint32_t>(q.size());
+            if (!empty_question.empty()) {
+                const std::vector<int32_t> empty_ids =
+                    tokenizer_->encode(empty_question);
+                size_t common_begin = 0;
+                const size_t common_limit =
+                    std::min(ids.size(), empty_ids.size());
+                while (common_begin < common_limit &&
+                       ids[common_begin] == empty_ids[common_begin]) {
+                    ++common_begin;
+                }
+                size_t common_suffix = 0;
+                while (common_suffix < ids.size() - common_begin &&
+                       common_suffix < empty_ids.size() - common_begin &&
+                       ids[ids.size() - 1 - common_suffix] ==
+                           empty_ids[empty_ids.size() - 1 - common_suffix]) {
+                    ++common_suffix;
+                }
+                query_begin = static_cast<uint32_t>(common_begin);
+                query_end = static_cast<uint32_t>(ids.size() - common_suffix);
+                if (query_end <= query_begin) {
+                    throw std::runtime_error(
+                        "archive chat question maps to an empty token span");
+                }
+            }
+            GenerationOptions qgen;
+            qgen.max_tokens = std::max(1, cfg.max_tokens);
+            qgen.temperature = cfg.temperature;
+            qgen.top_p = cfg.top_p;
+            qgen.top_k = cfg.top_k;
+            qgen.thinking_open = thinking_open;
+            qgen.thinking_budget = cfg.thinking_budget;
+            qgen.kvmem_session_id = kvmem_api_session_id_;
+            qgen.kvmem_reselect_mode = KvMemReselectMode::Force;
+            qgen.kvmem_query_begin = base_pos + query_begin;
+            qgen.kvmem_query_end = base_pos + query_end;
+            qgen.kvmem_trace_tag = "archive-q" + std::to_string(qi);
+
+            const double t_q = wall_seconds();
+            MtpGenStats stats;
+            const std::string answer = generate_mtp(
+                q, qgen, CancellableTokenCallback{}, /*dump=*/nullptr,
+                /*spec_mtp=*/true, /*trace_mtp=*/false,
+                /*override_executor=*/nullptr, /*manage_device_scope=*/true,
+                /*reset_session=*/false, &stats);
+            const double question_wall_s = wall_seconds() - t_q;
+            if (results) {
+                results << "{\"question_index\":" << qi
+                        << ",\"archive_tokens\":" << want
+                        << ",\"prompt_tokens\":" << q.size()
+                        << ",\"decoded_tokens\":" << stats.decoded
+                        << ",\"wall_s\":" << std::setprecision(9)
+                        << question_wall_s
+                        << ",\"prefill_s\":" << stats.prefill_s
+                        << ",\"decode_s\":" << stats.decode_s
+                        << ",\"question\":\""
+                        << archive_json_escape(cfg.questions[qi])
+                        << "\",\"answer\":\""
+                        << archive_json_escape(answer) << "\"}\n";
+                results.flush();
+            }
+            if (cfg.verbose) {
+                std::printf("\n[archive-q%zu] tokens=%llu prompt=%zu "
+                            "wall=%.3fs prefill=%.3fs decode=%.3fs "
+                            "decoded=%d\n%s\n",
+                            qi, static_cast<unsigned long long>(want),
+                            q.size(), question_wall_s, stats.prefill_s,
+                            stats.decode_s, stats.decoded, answer.c_str());
+                std::fflush(stdout);
+            }
+        }
+        return 0;
+    }
+
+    std::string generate_kvmem_archive_request(
+            const std::string &prompt,
+            const GenerationOptions &options,
+            const CancellableTokenCallback &on_text) {
+        if (!executor_ || !executor_->kvmem_archive_attached()) {
+            throw std::runtime_error(
+                "archive-backed request requires an attached KVMem archive");
+        }
+        if (!options.kvmem_cache_save_id.empty() ||
+            !options.kvmem_cache_load_id.empty() ||
+            !options.kvmem_session_id.empty()) {
+            throw std::invalid_argument(
+                "archive-backed requests are frozen branches and cannot be "
+                "combined with process-local cache or mutable session controls");
+        }
+        if (!options.kvmem_replay_query_spans.empty() ||
+            !options.kvmem_retrieval_group_spans.empty()) {
+            throw std::invalid_argument(
+                "archive-backed requests v1 do not accept transcript replay "
+                "or request-local historical retrieval groups");
+        }
+        if (!archive_query_base_ready_) {
+            KvMemArchiveRunConfig init;
+            init.tokens = options_.kvmem_archive_tokens;
+            init.verbose = false;
+            // An empty question list performs only attach/truncate, residual
+            // replay, index rebuild and frozen-base capture. The model and
+            // derived index then stay live for all HTTP requests.
+            (void)run_kvmem_archive(init);
+        }
+
+        DeviceStatus scope = device_->begin();
+        if (!scope.ok) throw std::runtime_error(scope.message);
+        bool scope_open = true;
+        try {
+            executor_->restore_state(archive_query_base_state_);
+            executor_->kvmem_truncate_to(archive_query_base_pos_);
+            (void)executor_->kvmem_set_selection(
+                archive_query_base_selection_,
+                /*force_raw_refresh=*/true);
+            executor_->capture_state(kvmem_api_boundary_ckpt_);
+            DeviceStatus done = device_->end();
+            scope_open = false;
+            if (!done.ok) throw std::runtime_error(done.message);
+        } catch (...) {
+            if (scope_open) (void)device_->end();
+            throw;
+        }
+        kvmem_api_session_active_ = true;
+        kvmem_api_session_id_ = "kvmem-archive-serve";
+        kvmem_api_boundary_pos_ = archive_query_base_pos_;
+        kvmem_api_tail_tokens_.clear();
+        kvmem_api_tokens_ = archive_query_base_tokens_;
+
+        std::vector<uint32_t> q;
+        if (!options.prompt_token_ids_override.empty()) {
+            q = options.prompt_token_ids_override;
+        } else {
+            const std::vector<int32_t> ids = tokenizer_->encode(prompt);
+            q.assign(ids.begin(), ids.end());
+        }
+        if (static_cast<uint64_t>(archive_query_base_pos_) + q.size() >=
+            static_cast<uint64_t>(std::max(1, options_.ctx_size))) {
+            throw std::invalid_argument(
+                "archive prefix plus request prompt exceeds --ctx");
+        }
+
+        GenerationOptions qgen = options;
+        qgen.kvmem_cache_save_id.clear();
+        qgen.kvmem_cache_load_id.clear();
+        qgen.kvmem_cache_load_mode = KvMemLocalCacheMode::None;
+        qgen.kvmem_session_id = kvmem_api_session_id_;
+        qgen.kvmem_reselect_mode = KvMemReselectMode::Force;
+        qgen.kvmem_query_begin = archive_query_base_pos_;
+        qgen.kvmem_query_end = archive_query_base_pos_ +
+            static_cast<uint32_t>(q.size());
+
+        MtpGenStats stats;
+        return generate_mtp(
+            q, qgen, on_text, /*dump=*/nullptr,
+            /*spec_mtp=*/true, /*trace_mtp=*/false,
+            /*override_executor=*/nullptr, /*manage_device_scope=*/true,
+            /*reset_session=*/false, &stats);
+    }
+
     int run_kvmem_session(const KvMemSessionConfig &cfg) {
         if (!model_ || !tokenizer_ || !device_ || !executor_) {
             throw std::runtime_error("kvmem-session: backend not fully loaded "
@@ -2051,6 +3025,9 @@ public:
     std::string generate(const std::string &prompt,
                          const GenerationOptions &options,
                          const CancellableTokenCallback &on_text) override {
+        if (executor_ && executor_->kvmem_archive_attached()) {
+            return generate_kvmem_archive_request(prompt, options, on_text);
+        }
         if (!options.kvmem_cache_save_id.empty() ||
             !options.kvmem_cache_load_id.empty()) {
             return generate_local_kvmem_cache(prompt, options, on_text);
@@ -7205,6 +8182,14 @@ private:
             if (page_size > 0 && prompt_len >= 2 * page_size) {
                 uint32_t commit_len = (prompt_len / page_size) * page_size;
                 if (commit_len >= prompt_len) commit_len -= page_size;
+                const uint64_t guard_tokens =
+                    static_cast<uint64_t>(prefix_cache_commit_guard_pages()) *
+                    static_cast<uint64_t>(page_size);
+                if (guard_tokens > 0) {
+                    commit_len = guard_tokens < commit_len
+                        ? commit_len - static_cast<uint32_t>(guard_tokens)
+                        : 0u;
+                }
                 if (commit_len > a.prefill_offset) {
                     a.prefix_commit_pending = true;
                     a.prefix_commit_len = commit_len;
@@ -13727,6 +14712,19 @@ private:
     // and after the executors that borrow from it.
     std::unique_ptr<HostTierBufferPool> cb_host_tier_pool_;
     std::unique_ptr<QwenWeights> weights_;
+    // Declared before executor_ so it is destroyed after it: the executor holds
+    // a borrowed pointer to the archive for as long as it can write.
+    std::unique_ptr<KvMemArchive> kvmem_archive_;
+    uint64_t kvmem_archive_ladder_tokens_ = 0;
+    // Frozen base shared by the dedicated archive-backed Serve path. Payload
+    // authority remains in the immutable archive; these are only the live
+    // recurrent/window checkpoint and host token/selection metadata.
+    QwenExecutor::StateSnapshot archive_query_base_state_;
+    std::vector<uint32_t> archive_query_base_selection_;
+    std::vector<uint32_t> archive_query_base_tokens_;
+    uint32_t archive_query_base_pos_ = 0;
+    uint64_t archive_query_base_prefix_tokens_ = 0;
+    bool archive_query_base_ready_ = false;
     std::unique_ptr<QwenExecutor> executor_;
     std::unique_ptr<QwenTokenizer> tokenizer_;
     std::unique_ptr<BatchedPrefillExecutor> cb_prefill_executor_;
@@ -13895,6 +14893,97 @@ int run_kvmem_session(EngineOptions engine, const KvMemSessionConfig &cfg) {
     QwenNativeBackend backend;
     backend.load(engine);
     return backend.run_kvmem_session(cfg);
+}
+
+namespace {
+
+// Both archive commands need the same immutable-K + fp8 + SSD-authority shape;
+// they differ only in whether the arenas are writable.
+void apply_archive_engine_defaults(EngineOptions &engine, const char *mode) {
+    engine.backend = BackendKind::QwenNative;
+    engine.native_heavy = true;
+    if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
+    if (engine.prefill_chunk < 0) engine.prefill_chunk = 2048;
+    engine.kvmem_enabled = true;
+    engine.kvmem_immutable_source_k = true;
+    engine.kvmem_raw_k_nvme = true;
+    engine.kvmem_archive_mode = mode;
+    if (!engine.native_mtp_chain_set || engine.native_mtp_chain <= 0) {
+        engine.native_mtp_chain = 4;
+        engine.native_mtp_chain_set = true;
+    }
+    engine.native_mtp_speculate = true;
+    setenv("QW3_MTP_SPECULATE", "1", 1);
+    setenv("QW3_MTP_POLICY",
+           engine.mtp_policy.empty() ? "fixed" : engine.mtp_policy.c_str(), 1);
+    // The archive format is fp8-only: 10M tokens is 305 GiB at fp8 and 610 GiB
+    // at fp16, and immutable-K is already mandatory for fp8.
+    setenv("QW3_KV_DTYPE", "fp8", 1);
+}
+
+} // namespace
+
+int run_kvmem_archive_build(EngineOptions engine,
+                            const KvMemArchiveBuildConfig &cfg) {
+    if (engine.kvmem_archive_dir.empty()) {
+        throw std::invalid_argument("archive build requires --kvmem-archive");
+    }
+    apply_archive_engine_defaults(engine, "build");
+    engine.kvmem_update_mode = "step";
+    if (cfg.ladder_tokens > 0) {
+        engine.kvmem_archive_ladder_tokens = cfg.ladder_tokens;
+    }
+    QwenNativeBackend backend;
+    backend.load(engine);
+    return backend.build_kvmem_archive(cfg);
+}
+
+int run_kvmem_archive_query(EngineOptions engine,
+                            const KvMemArchiveRunConfig &cfg) {
+    if (engine.kvmem_archive_dir.empty()) {
+        throw std::invalid_argument("archive query requires --kvmem-archive");
+    }
+    apply_archive_engine_defaults(engine, "attach");
+    engine.kvmem_query_conditioned = true;
+    engine.kvmem_update_mode = "step";
+    QwenNativeBackend backend;
+    backend.load(engine);
+    return backend.run_kvmem_archive(cfg);
+}
+
+int run_kvmem_archive_info(const std::string &dir) {
+    const KvMemArchiveManifest m = KvMemArchive::read_manifest(dir);
+    const KvMemArchiveLayout &l = m.layout;
+    std::printf("archive:        %s\n", dir.c_str());
+    std::printf("format_version: %u\n", m.format_version);
+    std::printf("sealed:         %s\n", m.sealed ? "yes" : "no");
+    std::printf("tokens:         %llu\n",
+                static_cast<unsigned long long>(m.total_tokens));
+    std::printf("blocks:         %u\n", m.total_blocks);
+    std::printf("raw_chunks:     %u\n", m.raw_chunks);
+    std::printf("ladder_points:  %zu\n", m.ladder.size());
+    if (!m.ladder.empty()) {
+        std::printf("ladder_stride:  %llu\n",
+                    static_cast<unsigned long long>(
+                        m.ladder.size() > 1 ? m.ladder[1] - m.ladder[0]
+                                            : m.ladder[0]));
+    }
+    std::printf("model:          %s (%llu bytes)\n", l.model_name.c_str(),
+                static_cast<unsigned long long>(l.model_bytes));
+    std::printf("model_sha256:   %s\n",
+                l.model_sha256.empty() ? "(legacy-unavailable)"
+                                       : l.model_sha256.c_str());
+    std::printf("kv_dtype:       %s\n", l.kv_dtype.c_str());
+    std::printf("block_tokens:   %u\n", l.block_tokens);
+    std::printf("chunk_tokens:   %u\n", l.raw_chunk_tokens);
+    std::printf("std_layers:     %u of %u\n", l.n_standard_layers, l.n_layers);
+    std::printf("raw_k_bytes:    %llu / chunk\n",
+                static_cast<unsigned long long>(l.raw_chunk_bytes));
+    std::printf("v_bytes:        %llu / block\n",
+                static_cast<unsigned long long>(l.v_block_bytes));
+    std::printf("layout_key:     %s\n", l.key().c_str());
+    std::printf("policy_at_build: %s\n", m.policy_snapshot.c_str());
+    return 0;
 }
 
 } // namespace qw3

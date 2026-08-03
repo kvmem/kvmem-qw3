@@ -535,7 +535,8 @@ std::vector<uint32_t> KvMemStore::pick_semantic_groups(
     return selected;
 }
 
-KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
+KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids,
+                                    bool force_raw_refresh) {
     // Sort + dedupe so window order is deterministic (ascending block_id =
     // original chronological order: sink first ... recent last).
     std::sort(selected_ids.begin(), selected_ids.end());
@@ -604,7 +605,8 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
         // it must be rematerialized after stage-in. Position equality alone is
         // therefore insufficient to skip assembly.
         rm.skip = same_position &&
-                  (!cfg_.immutable_source_k || rm.working_k_resident);
+                  (!cfg_.immutable_source_k || rm.working_k_resident) &&
+                  !force_raw_refresh;
         if (cfg_.immutable_source_k && (cold || !same_position)) {
             const uint64_t delta = static_cast<uint64_t>(
                 b.baked_pos > static_cast<int64_t>(window_pos)
@@ -628,6 +630,9 @@ KvMemPlan KvMemStore::set_selection(std::vector<uint32_t> selected_ids) {
                      cfg_.immutable_max_baked_position);
             rm.raw_refresh =
                 cold || remap_limit || delta_limit || baked_out_of_range;
+        }
+        if (cfg_.immutable_source_k && force_raw_refresh) {
+            rm.raw_refresh = true;
         }
         if (rm.skip && rm.raw_refresh) {
             throw std::logic_error(

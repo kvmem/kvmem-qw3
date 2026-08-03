@@ -4,6 +4,7 @@
 #include "tool_call_stream.hpp"
 #include "qw3/qw3.hpp"
 #include "qw3/gguf.hpp"
+#include "qw3/kvmem_archive.hpp"
 #include "qw3/kvmem_store.hpp"
 #include "qw3/tokenizer.hpp"
 
@@ -1475,6 +1476,35 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         cfg.kv_dtype != "q8" && cfg.kv_dtype != "fp8") {
         throw std::runtime_error("invalid --kv-dtype (want fp16|fp32|q8|fp8): " + cfg.kv_dtype);
     }
+    uint64_t archive_prefix_tokens = 0;
+    if (!engine.kvmem_archive_dir.empty()) {
+        const KvMemArchiveManifest manifest =
+            KvMemArchive::read_manifest(engine.kvmem_archive_dir);
+        if (!manifest.sealed) {
+            throw std::runtime_error(
+                "archive-backed serving requires a sealed archive");
+        }
+        archive_prefix_tokens = engine.kvmem_archive_tokens == 0
+            ? manifest.total_tokens
+            : std::min<uint64_t>(engine.kvmem_archive_tokens,
+                                 manifest.total_tokens);
+        const uint32_t bt = std::max<uint32_t>(1, manifest.layout.block_tokens);
+        archive_prefix_tokens = (archive_prefix_tokens / bt) * bt;
+        engine.kvmem_archive_tokens = archive_prefix_tokens;
+        if (archive_prefix_tokens == 0 ||
+            archive_prefix_tokens >=
+                static_cast<uint64_t>(std::max(1, engine.ctx_size))) {
+            throw std::runtime_error(
+                "archive-backed serving needs --ctx larger than its non-empty "
+                "attached prefix");
+        }
+        if (engine.kvmem_semantic_expansion != "none") {
+            throw std::runtime_error(
+                "archive-backed serving v1 requires "
+                "--kvmem-semantic-expansion none because the archive does not "
+                "persist message/round group metadata");
+        }
+    }
     if (engine.prefill_chunk < 0) {
         engine.prefill_chunk = 2048;
     }
@@ -1558,14 +1588,18 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     setenv_bool("QW3_CONTINUOUS_MTP_BATCHED_DRAFT", cfg.mtp_batched_draft);
     setenv_bool("QW3_MTP_PAGED_PREFIX", cfg.mtp_paged_prefix);
     // Prefix caching is only meaningful on the continuous-batching path; force
-    // it off otherwise. Page budget unlimited (0) is the tuned value. Tracing
-    // is a pure diagnostic with a safe off-default in the backend, so it is not
-    // clobbered here — leaving it lets a diagnostic harness opt in via
-    // QW3_PREFIX_CACHE_TRACE without a user-facing switch.
+    // it off otherwise. Page budget unlimited (0) remains the default, but do
+    // not clobber an explicit internal limit. Long-lived frozen-branch servers
+    // need that limit because every distinct prompt prefix also owns a hybrid
+    // recurrent-state snapshot, whose memory is not bounded by KV-pool pressure.
+    // Tracing is likewise an internal diagnostic and is intentionally left
+    // untouched.
     {
         const bool prefix_cache_on = cfg.prefix_cache && cfg.continuous_batching;
         setenv_bool("QW3_PREFIX_CACHE", prefix_cache_on);
-        setenv_value("QW3_PREFIX_CACHE_MAX_PAGES", 0);
+        if (std::getenv("QW3_PREFIX_CACHE_MAX_PAGES") == nullptr) {
+            setenv_value("QW3_PREFIX_CACHE_MAX_PAGES", 0);
+        }
     }
     // kvmem single-request prefix cache: plain-route warm reuse. Requires kvmem;
     // inert on the CB path (only generate_plain / generate_mtp on the shared
@@ -1576,6 +1610,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 cfg.kvmem_query_replay && engine.kvmem_enabled &&
                     engine.kvmem_query_conditioned && !cfg.continuous_batching);
     setenv_bool("QW3_MTP_SPECULATE", engine.native_mtp_speculate);
+    setenv_bool("QW3_KVMEM_ARCHIVE_SERVE",
+                !engine.kvmem_archive_dir.empty());
     setenv_value("QW3_MTP_POLICY", engine.mtp_policy);
     if (engine.mtp_adaptive_min_chain > 0) {
         setenv_value("QW3_MTP_ADAPTIVE_MIN_CHAIN",
@@ -1670,6 +1706,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  mtp_paged_prefix=" << yesno(cfg.mtp_paged_prefix) << "\n"
               << "  prefix_cache="
               << yesno(cfg.prefix_cache && cfg.continuous_batching) << "\n"
+              << "  prefix_cache_max_pages="
+              << std::getenv("QW3_PREFIX_CACHE_MAX_PAGES") << "\n"
               << "  tool_argument_streaming=canonical-string\n"
               << "  matmul=mmq\n"
               << "  disable_hgemm=1\n"
@@ -1754,7 +1792,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem_prefix_cache="
               << yesno(cfg.kvmem_prefix_cache && engine.kvmem_enabled &&
                        !cfg.continuous_batching)
-              << "\n";
+              << "\n"
+              << "  kvmem_archive="
+              << (engine.kvmem_archive_dir.empty()
+                      ? std::string("(disabled)")
+                      : engine.kvmem_archive_dir)
+              << "\n"
+              << "  kvmem_archive_tokens=" << archive_prefix_tokens << "\n";
 
     std::cerr << "[qw3-serve] loading model: " << engine.model_path << "\n";
     Engine eng(engine);
@@ -1866,8 +1910,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             if (!cfg.temperature_set) g.temperature = 0.7f;
             if (!cfg.top_p_set) g.top_p = 0.8f;
         }
-        const int remaining_ctx =
-            std::max(1, engine.ctx_size - static_cast<int>(prompt_token_count));
+        const uint64_t occupied = archive_prefix_tokens +
+            static_cast<uint64_t>(prompt_token_count);
+        const int remaining_ctx = occupied <
+                static_cast<uint64_t>(std::max(1, engine.ctx_size))
+            ? static_cast<int>(
+                  static_cast<uint64_t>(engine.ctx_size) - occupied)
+            : 0;
         bool has_max_tokens = false;
         int requested_max_tokens = 0;
         std::string max_tokens_error;
@@ -2375,11 +2424,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             usage_tokenizer.encode(prompt);
         const auto server_tokenize_end = std::chrono::steady_clock::now();
         size_t prompt_token_count = prompt_token_ids.size();
-        if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
+        if (archive_prefix_tokens + prompt_token_count >=
+            static_cast<uint64_t>(std::max(1, engine.ctx_size))) {
             set_error_response(
                 res,
                 413,
-                "prompt exceeds KV context: prompt_tokens=" +
+                "archive prefix plus prompt exceeds KV context: archive_tokens=" +
+                    std::to_string(archive_prefix_tokens) +
+                    " prompt_tokens=" +
                     std::to_string(prompt_token_count) +
                     " ctx=" + std::to_string(engine.ctx_size));
             return;
@@ -3455,11 +3507,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 std::move(aligned_groups);
             prompt_token_ids = std::move(aligned_tokens);
             prompt_token_count = prompt_token_ids.size();
-            if (prompt_token_count >=
-                static_cast<size_t>(engine.ctx_size)) {
+            if (archive_prefix_tokens + prompt_token_count >=
+                static_cast<uint64_t>(std::max(1, engine.ctx_size))) {
                 set_error_response(
                     res, 413,
-                    "round-padded prompt exceeds KV context: "
+                    "archive prefix plus round-padded prompt exceeds KV context: "
+                    "archive_tokens=" +
+                        std::to_string(archive_prefix_tokens) +
+                        " "
                     "prompt_tokens=" +
                         std::to_string(prompt_token_count) +
                         " ctx=" + std::to_string(engine.ctx_size));
@@ -3467,6 +3522,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
             const int remaining_ctx = std::max(
                 1, engine.ctx_size -
+                       static_cast<int>(archive_prefix_tokens) -
                        static_cast<int>(prompt_token_count));
             if (g.max_tokens > remaining_ctx) {
                 std::cerr
@@ -4197,11 +4253,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const size_t prompt_token_count = exact_prompt_tokens.empty()
             ? usage_tokenizer.encode(prompt).size()
             : exact_prompt_tokens.size();
-        if (prompt_token_count >= static_cast<size_t>(engine.ctx_size)) {
+        if (archive_prefix_tokens + prompt_token_count >=
+            static_cast<uint64_t>(std::max(1, engine.ctx_size))) {
             set_error_response(
                 res,
                 413,
-                "prompt exceeds KV context: prompt_tokens=" +
+                "archive prefix plus prompt exceeds KV context: archive_tokens=" +
+                    std::to_string(archive_prefix_tokens) +
+                    " prompt_tokens=" +
                     std::to_string(prompt_token_count) +
                     " ctx=" + std::to_string(engine.ctx_size));
             return;

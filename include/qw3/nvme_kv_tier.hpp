@@ -7,15 +7,19 @@
 // different host workers. Batch spans coalesce adjacent full records into one
 // syscall when both their file offsets and buffer ranges are contiguous.
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -35,6 +39,29 @@ struct NvmeKvTierConfig {
     std::string file_name = "qw3_kvmem_nvme.bin";
     uint64_t total_bytes = 0;
     uint64_t slot_bytes = 0;
+    // Context-archive modes. `durable` keeps the directory entry instead of
+    // unlinking it, so the arena survives the process; it also stops truncating
+    // an existing file so a build can be resumed. `direct_mapped` assigns
+    // slot == block_id and disables the free list and LRU eviction, which
+    // removes the need to persist any slot table. `read_only` opens the arena
+    // O_RDONLY so several processes can attach the same archive at once.
+    bool durable = false;
+    bool direct_mapped = false;
+    bool read_only = false;
+    // Reserve the complete arena before the first write. Archive builders know
+    // their maximum direct-mapped capacity up front; preallocation avoids
+    // interleaving raw-K and V extents into highly fragmented files and makes
+    // ENOSPC fail at startup rather than hours into a build. Unsupported file
+    // systems degrade to sparse growth with a warning.
+    bool preallocate = false;
+    // Copy-on-write overlay for a read-only arena. A session attached to a
+    // sealed archive still produces KV of its own (the residual re-prefill, the
+    // question, the decode), and evicting any of it needs somewhere to spill.
+    // Writes land in an ephemeral sparse file at the same slot offsets and
+    // subsequent reads of those slots come from the overlay, so the archive
+    // stays byte-identical and several sessions can diverge from it at once.
+    std::string overlay_dir;
+    std::string overlay_file_name = "qw3_kvmem_overlay.bin";
     // Buffered I/O otherwise keeps a second copy of the SSD arena in the
     // kernel page cache.  For long contexts that copy can be tens of GiB and
     // defeats the explicit CPU-tier memory budget.  When enabled, completed
@@ -81,27 +108,80 @@ public:
                 "NVMe KV tier file_name must be a non-empty basename");
         }
         path_ = cfg_.dir + "/" + cfg_.file_name;
-        fd_ = ::open(path_.c_str(), O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC,
-                     0644);
+        int flags = O_CLOEXEC;
+        if (cfg_.read_only) {
+            flags |= O_RDONLY;
+        } else {
+            flags |= O_CREAT | O_RDWR;
+            if (!cfg_.durable) flags |= O_TRUNC;
+        }
+        fd_ = ::open(path_.c_str(), flags, 0644);
         if (fd_ < 0) {
             throw std::runtime_error(
                 "failed to open NVMe KV tier file: " + path_ + ": " +
                 std::strerror(errno));
         }
-        // The backing store is an ephemeral cache, never a recoverable
-        // checkpoint. Unlink it immediately while retaining the open file
-        // descriptor: all positional I/O continues to work, but the filesystem
-        // reclaims the blocks automatically when the process closes the fd,
-        // including abnormal exits and SIGKILL. This also prevents stale
-        // qw3_kvmem_nvme.bin files from accumulating across evaluations.
-        if (::unlink(path_.c_str()) != 0) {
-            const int unlink_error = errno;
-            ::close(fd_);
-            fd_ = -1;
-            throw std::runtime_error(
-                "failed to make NVMe KV tier file ephemeral: " + path_ +
-                ": " + std::strerror(unlink_error));
+        if (cfg_.preallocate && !cfg_.read_only && cfg_.total_bytes > 0) {
+            if (cfg_.total_bytes > static_cast<uint64_t>(
+                    std::numeric_limits<off_t>::max())) {
+                ::close(fd_);
+                fd_ = -1;
+                throw std::runtime_error(
+                    "NVMe KV tier preallocation exceeds off_t: " + path_);
+            }
+#if defined(__linux__)
+            int rc;
+            do {
+                rc = ::posix_fallocate(
+                    fd_, 0, static_cast<off_t>(cfg_.total_bytes));
+            } while (rc == EINTR);
+            if (rc != 0 && rc != EOPNOTSUPP && rc != ENOSYS && rc != EINVAL) {
+                ::close(fd_);
+                fd_ = -1;
+                throw std::runtime_error(
+                    "failed to preallocate NVMe KV tier file: " + path_ +
+                    ": " + std::strerror(rc));
+            }
+            if (rc != 0) {
+                std::fprintf(stderr,
+                             "[kvmem-io] preallocate_degraded=1 path=%s "
+                             "bytes=%llu error=%d message=%s\n",
+                             path_.c_str(),
+                             static_cast<unsigned long long>(cfg_.total_bytes),
+                             rc, std::strerror(rc));
+            } else {
+                std::fprintf(stderr,
+                             "[kvmem-io] preallocated path=%s bytes=%llu\n",
+                             path_.c_str(),
+                             static_cast<unsigned long long>(cfg_.total_bytes));
+            }
+#else
+            std::fprintf(stderr,
+                         "[kvmem-io] preallocate_degraded=1 path=%s "
+                         "bytes=%llu error=unsupported-platform\n",
+                         path_.c_str(),
+                         static_cast<unsigned long long>(cfg_.total_bytes));
+#endif
         }
+        if (!cfg_.durable) {
+            // The backing store is an ephemeral cache, never a recoverable
+            // checkpoint. Unlink it immediately while retaining the open file
+            // descriptor: all positional I/O continues to work, but the
+            // filesystem reclaims the blocks automatically when the process
+            // closes the fd, including abnormal exits and SIGKILL. This also
+            // prevents stale qw3_kvmem_nvme.bin files from accumulating across
+            // evaluations.
+            if (::unlink(path_.c_str()) != 0) {
+                const int unlink_error = errno;
+                ::close(fd_);
+                fd_ = -1;
+                throw std::runtime_error(
+                    "failed to make NVMe KV tier file ephemeral: " + path_ +
+                    ": " + std::strerror(unlink_error));
+            }
+        }
+        if (cfg_.read_only && !cfg_.overlay_dir.empty()) open_overlay();
+        if (cfg_.direct_mapped) return;
         free_slots_.reserve(slot_count_);
         for (uint32_t i = 0; i < slot_count_; ++i) {
             free_slots_.push_back(
@@ -114,6 +194,7 @@ public:
 
     ~NvmeKvTier() {
         if (fd_ >= 0) ::close(fd_);
+        if (overlay_fd_ >= 0) ::close(overlay_fd_);
     }
 
     bool enabled() const { return fd_ >= 0 && slot_count_ > 0; }
@@ -121,9 +202,30 @@ public:
     uint64_t slot_bytes() const { return cfg_.slot_bytes; }
     const std::string &path() const { return path_; }
     bool drops_page_cache() const { return cfg_.drop_page_cache; }
+    bool direct_mapped() const { return cfg_.direct_mapped; }
+    bool read_only() const { return cfg_.read_only && overlay_fd_ < 0; }
+    bool has_overlay() const { return overlay_fd_ >= 0; }
+
+    // Declare block ids [begin,end) resident at their identity slots. Only
+    // meaningful for a direct-mapped arena, where an attached archive knows
+    // every block is present without replaying any placement history.
+    void mark_present_range(uint32_t begin, uint32_t end) {
+        if (!cfg_.direct_mapped) {
+            throw std::runtime_error(
+                "NVMe tier mark_present_range requires a direct-mapped arena");
+        }
+        std::lock_guard<std::mutex> lock(meta_mu_);
+        for (uint32_t id = begin; id < end && id < slot_count_; ++id) {
+            block_to_slot_[id] = static_cast<int32_t>(id);
+        }
+    }
 
     uint32_t free_slots() const {
         std::lock_guard<std::mutex> lock(meta_mu_);
+        if (cfg_.direct_mapped) {
+            return slot_count_ -
+                   static_cast<uint32_t>(block_to_slot_.size());
+        }
         return static_cast<uint32_t>(free_slots_.size());
     }
 
@@ -171,7 +273,7 @@ public:
         std::lock_guard<std::mutex> lock(meta_mu_);
         auto it = block_to_slot_.find(block_id);
         if (it == block_to_slot_.end()) return;
-        free_slots_.push_back(it->second);
+        if (!cfg_.direct_mapped) free_slots_.push_back(it->second);
         block_to_slot_.erase(it);
         erase_lru_locked(block_id);
     }
@@ -179,9 +281,11 @@ public:
     void clear() {
         std::lock_guard<std::mutex> lock(meta_mu_);
         free_slots_.clear();
-        for (uint32_t i = 0; i < slot_count_; ++i) {
-            free_slots_.push_back(
-                static_cast<int32_t>(slot_count_ - 1U - i));
+        if (!cfg_.direct_mapped) {
+            for (uint32_t i = 0; i < slot_count_; ++i) {
+                free_slots_.push_back(
+                    static_cast<int32_t>(slot_count_ - 1U - i));
+            }
         }
         block_to_slot_.clear();
         lru_.clear();
@@ -225,12 +329,25 @@ public:
 
     void write_slot_range(int32_t slot, uint64_t slot_byte_offset,
                           const void *data, uint64_t bytes) const {
+        if (read_only()) {
+            throw std::runtime_error(
+                "NVMe KV tier is attached read-only: " + path_);
+        }
         validate_slot_range_io(
             slot, slot_byte_offset, data, bytes, "write");
         const uint64_t offset = slot_offset(slot) + slot_byte_offset;
-        pwrite_all(data, bytes, offset);
+        if (overlay_fd_ >= 0) {
+            write_overlay_slot_range(slot, slot_byte_offset, data, bytes);
+            if (cfg_.drop_page_cache) {
+                (void) drop_cached_range(
+                    overlay_fd_, offset, bytes, /*write=*/true);
+            }
+            return;
+        }
+        const int fd = write_fd();
+        pwrite_all(fd, data, bytes, offset);
         if (cfg_.drop_page_cache) {
-            (void) drop_cached_range(offset, bytes, /*write=*/true);
+            (void) drop_cached_range(fd, offset, bytes, /*write=*/true);
         }
     }
 
@@ -243,15 +360,20 @@ public:
         validate_slot_range_io(
             slot, slot_byte_offset, data, bytes, "read");
         const uint64_t offset = slot_offset(slot) + slot_byte_offset;
-        pread_all(data, bytes, offset);
+        const int fd = read_fd(slot);
+        pread_all(fd, data, bytes, offset);
         if (cfg_.drop_page_cache) {
-            (void) drop_cached_range(offset, bytes, /*write=*/false);
+            (void) drop_cached_range(fd, offset, bytes, /*write=*/false);
         }
     }
 
     void write_spans(const std::vector<NvmeIoSpan> &spans,
                      const void *buffer, uint64_t buffer_bytes,
                      NvmeBatchIoStats *stats = nullptr) const {
+        if (read_only()) {
+            throw std::runtime_error(
+                "NVMe KV tier is attached read-only: " + path_);
+        }
         run_spans(spans, const_cast<void *>(buffer), buffer_bytes,
                   /*write=*/true, stats);
     }
@@ -315,6 +437,14 @@ private:
 
     NvmeSlotPlacement place_block_locked(uint32_t block_id) {
         NvmeSlotPlacement out;
+        if (cfg_.direct_mapped) {
+            // Identity placement. No free list, no LRU, and therefore no slot
+            // table to persist: a reader recovers the mapping from block_id.
+            if (block_id >= slot_count_) return out;
+            block_to_slot_[block_id] = static_cast<int32_t>(block_id);
+            out.slot = static_cast<int32_t>(block_id);
+            return out;
+        }
         auto it = block_to_slot_.find(block_id);
         if (it != block_to_slot_.end()) {
             out.slot = it->second;
@@ -330,12 +460,113 @@ private:
         return out;
     }
 
-    void pwrite_all(const void *data, uint64_t bytes, uint64_t offset) const {
+    void open_overlay() {
+        ensure_dir(cfg_.overlay_dir);
+        if (cfg_.overlay_file_name.empty() ||
+            cfg_.overlay_file_name.find('/') != std::string::npos) {
+            throw std::runtime_error(
+                "NVMe KV tier overlay_file_name must be a non-empty basename");
+        }
+        const std::string overlay_path =
+            cfg_.overlay_dir + "/" + cfg_.overlay_file_name;
+        overlay_fd_ = ::open(overlay_path.c_str(),
+                             O_CLOEXEC | O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (overlay_fd_ < 0) {
+            throw std::runtime_error(
+                "failed to open NVMe KV tier overlay file: " + overlay_path +
+                ": " + std::strerror(errno));
+        }
+        // Same rationale as the ephemeral arena: the overlay is scratch that
+        // must not outlive the process, and the file stays sparse so it costs
+        // only the slots the session actually diverges on.
+        if (::unlink(overlay_path.c_str()) != 0) {
+            const int unlink_error = errno;
+            ::close(overlay_fd_);
+            overlay_fd_ = -1;
+            throw std::runtime_error(
+                "failed to make NVMe KV tier overlay ephemeral: " +
+                overlay_path + ": " + std::strerror(unlink_error));
+        }
+        overlay_valid_ = std::unique_ptr<std::atomic<uint8_t>[]>(
+            new std::atomic<uint8_t>[slot_count_]);
+        for (uint32_t i = 0; i < slot_count_; ++i) {
+            overlay_valid_[i].store(0, std::memory_order_relaxed);
+        }
+    }
+
+    int write_fd() const { return overlay_fd_ >= 0 ? overlay_fd_ : fd_; }
+
+    int read_fd(int32_t slot) const {
+        if (overlay_fd_ < 0) return fd_;
+        uint8_t state = overlay_valid_[slot].load(std::memory_order_acquire);
+        while (state == kOverlayInitializing) {
+            std::this_thread::yield();
+            state = overlay_valid_[slot].load(std::memory_order_acquire);
+        }
+        return state == kOverlayValid ? overlay_fd_ : fd_;
+    }
+
+    void write_overlay_slot_range(int32_t slot, uint64_t slot_byte_offset,
+                                  const void *data, uint64_t bytes) const {
+        // The slot is the coherence unit. A short final block or an isolated
+        // main/MTP segment write must copy the untouched bytes from the archive
+        // before the overlay can become visible; otherwise sparse-file zeros
+        // would silently replace the other part of the record.
+        uint8_t state = overlay_valid_[slot].load(std::memory_order_acquire);
+        while (state != kOverlayValid) {
+            if (state == kOverlayBase) {
+                uint8_t expected = kOverlayBase;
+                if (overlay_valid_[slot].compare_exchange_strong(
+                        expected, kOverlayInitializing,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    try {
+                        const bool full_slot =
+                            slot_byte_offset == 0 && bytes == cfg_.slot_bytes;
+                        if (!full_slot) {
+                            constexpr uint64_t kCopyChunk = 1ull << 20;
+                            std::vector<uint8_t> scratch(static_cast<size_t>(
+                                std::min<uint64_t>(kCopyChunk,
+                                                   cfg_.slot_bytes)));
+                            for (uint64_t copied = 0;
+                                 copied < cfg_.slot_bytes;) {
+                                const uint64_t n = std::min<uint64_t>(
+                                    scratch.size(), cfg_.slot_bytes - copied);
+                                pread_all(fd_, scratch.data(), n,
+                                          slot_offset(slot) + copied);
+                                pwrite_all(overlay_fd_, scratch.data(), n,
+                                           slot_offset(slot) + copied);
+                                copied += n;
+                            }
+                        }
+                        pwrite_all(overlay_fd_, data, bytes,
+                                   slot_offset(slot) + slot_byte_offset);
+                        overlay_valid_[slot].store(
+                            kOverlayValid, std::memory_order_release);
+                    } catch (...) {
+                        overlay_valid_[slot].store(
+                            kOverlayBase, std::memory_order_release);
+                        throw;
+                    }
+                    return;
+                }
+                state = expected;
+                continue;
+            }
+            std::this_thread::yield();
+            state = overlay_valid_[slot].load(std::memory_order_acquire);
+        }
+        pwrite_all(overlay_fd_, data, bytes,
+                   slot_offset(slot) + slot_byte_offset);
+    }
+
+    void pwrite_all(int fd, const void *data, uint64_t bytes,
+                    uint64_t offset) const {
         const uint8_t *src = static_cast<const uint8_t *>(data);
         uint64_t done = 0;
         while (done < bytes) {
             const ssize_t n = ::pwrite(
-                fd_, src + done, static_cast<size_t>(bytes - done),
+                fd, src + done, static_cast<size_t>(bytes - done),
                 static_cast<off_t>(offset + done));
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) {
@@ -347,12 +578,13 @@ private:
         }
     }
 
-    void pread_all(void *data, uint64_t bytes, uint64_t offset) const {
+    void pread_all(int fd, void *data, uint64_t bytes,
+                   uint64_t offset) const {
         uint8_t *dst = static_cast<uint8_t *>(data);
         uint64_t done = 0;
         while (done < bytes) {
             const ssize_t n = ::pread(
-                fd_, dst + done, static_cast<size_t>(bytes - done),
+                fd, dst + done, static_cast<size_t>(bytes - done),
                 static_cast<off_t>(offset + done));
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) {
@@ -370,6 +602,25 @@ private:
         if (spans.empty()) return;
         if (!buffer) throw std::runtime_error("NVMe batch I/O null buffer");
         uint8_t *base = static_cast<uint8_t *>(buffer);
+        // Writes to a CoW arena need per-slot copy-up semantics when a span is
+        // shorter than the physical record. Overlay traffic is only the live
+        // suffix of an attached archive; retain coalescing for the much larger
+        // immutable-base read path below.
+        if (write && overlay_fd_ >= 0) {
+            for (const NvmeIoSpan &span : spans) {
+                if (span.buffer_offset + span.bytes > buffer_bytes) {
+                    throw std::runtime_error(
+                        "NVMe batch span exceeds buffer");
+                }
+                write_slot_range(span.slot, /*slot_byte_offset=*/0,
+                                 base + span.buffer_offset, span.bytes);
+                if (stats) {
+                    stats->bytes += span.bytes;
+                    ++stats->syscalls;
+                }
+            }
+            return;
+        }
         size_t i = 0;
         while (i < spans.size()) {
             const NvmeIoSpan &first = spans[i];
@@ -378,6 +629,7 @@ private:
             if (first.buffer_offset + first.bytes > buffer_bytes) {
                 throw std::runtime_error("NVMe batch span exceeds buffer");
             }
+            const int fd = write ? write_fd() : read_fd(first.slot);
             uint64_t merged_bytes = first.bytes;
             size_t j = i + 1;
             while (j < spans.size()) {
@@ -389,7 +641,12 @@ private:
                 const bool contiguous_buffer =
                     next.buffer_offset ==
                     spans[i].buffer_offset + merged_bytes;
-                if (!contiguous_file || !contiguous_buffer) break;
+                // Adjacent slots can sit in different files once an overlay is
+                // in play, and merging across that boundary would read the
+                // wrong bytes for one of them.
+                const bool same_file =
+                    write || read_fd(next.slot) == fd;
+                if (!contiguous_file || !contiguous_buffer || !same_file) break;
                 validate_slot_io(next.slot, base + next.buffer_offset,
                                  next.bytes, write ? "write" : "read");
                 if (next.buffer_offset + next.bytes > buffer_bytes) {
@@ -400,16 +657,16 @@ private:
                 ++j;
             }
             if (write) {
-                pwrite_all(base + first.buffer_offset, merged_bytes,
+                pwrite_all(fd, base + first.buffer_offset, merged_bytes,
                            slot_offset(first.slot));
             } else {
-                pread_all(base + first.buffer_offset, merged_bytes,
+                pread_all(fd, base + first.buffer_offset, merged_bytes,
                           slot_offset(first.slot));
             }
             if (cfg_.drop_page_cache) {
                 const uint64_t file_offset = slot_offset(first.slot);
                 const bool dropped =
-                    drop_cached_range(file_offset, merged_bytes, write);
+                    drop_cached_range(fd, file_offset, merged_bytes, write);
                 if (stats) {
                     if (dropped) {
                         stats->cache_drop_bytes += merged_bytes;
@@ -426,7 +683,7 @@ private:
         }
     }
 
-    bool drop_cached_range(uint64_t offset, uint64_t bytes,
+    bool drop_cached_range(int fd, uint64_t offset, uint64_t bytes,
                            bool write) const {
         if (bytes == 0) return true;
         if (write) {
@@ -436,7 +693,7 @@ private:
             int rc;
             do {
                 rc = ::sync_file_range(
-                    fd_, static_cast<off64_t>(offset),
+                    fd, static_cast<off64_t>(offset),
                     static_cast<off64_t>(bytes),
                     SYNC_FILE_RANGE_WAIT_BEFORE |
                         SYNC_FILE_RANGE_WRITE |
@@ -453,7 +710,7 @@ private:
             std::lock_guard<std::mutex> lock(cache_drop_mu_);
             int rc;
             do {
-                rc = ::fdatasync(fd_);
+                rc = ::fdatasync(fd);
             } while (rc != 0 && errno == EINTR);
             if (rc != 0) {
                 warn_cache_drop_failure("fdatasync", errno);
@@ -463,7 +720,7 @@ private:
         }
 #if defined(POSIX_FADV_DONTNEED)
         const int advise = ::posix_fadvise(
-            fd_, static_cast<off_t>(offset), static_cast<off_t>(bytes),
+            fd, static_cast<off_t>(offset), static_cast<off_t>(bytes),
             POSIX_FADV_DONTNEED);
         if (advise != 0) {
             warn_cache_drop_failure("posix-fadvise-dontneed", advise);
@@ -489,11 +746,15 @@ private:
     }
 
     void touch_locked(uint32_t block_id) {
+        // A direct-mapped arena never evicts, so maintaining recency would only
+        // pay the linear erase below once per access.
+        if (cfg_.direct_mapped) return;
         erase_lru_locked(block_id);
         lru_.push_back(block_id);
     }
 
     void erase_lru_locked(uint32_t block_id) {
+        if (cfg_.direct_mapped) return;
         for (auto it = lru_.begin(); it != lru_.end(); ++it) {
             if (*it == block_id) {
                 lru_.erase(it);
@@ -506,6 +767,11 @@ private:
     uint32_t slot_count_ = 0;
     std::string path_;
     int fd_ = -1;
+    int overlay_fd_ = -1;
+    static constexpr uint8_t kOverlayBase = 0;
+    static constexpr uint8_t kOverlayInitializing = 1;
+    static constexpr uint8_t kOverlayValid = 2;
+    std::unique_ptr<std::atomic<uint8_t>[]> overlay_valid_;
     mutable std::mutex meta_mu_;
     mutable std::mutex cache_drop_mu_;
     mutable std::atomic<bool> cache_drop_warned_{false};

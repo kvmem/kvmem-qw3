@@ -564,6 +564,9 @@ bool launch_block_kdirection_fixed4_batch_typed(
         uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
         uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
         int32_t rope_base, float theta, cudaStream_t stream);
+bool launch_widen_raw_k_to_f32(const void *src, KbarDType src_dtype,
+                               float *dst, uint64_t elems,
+                               cudaStream_t stream);
 bool launch_block_kdirection_adaptive_batch_typed(
         const float *k_batch, void *candidate_scratch,
         KbarDType candidate_dtype, float *residual_scratch,
@@ -599,6 +602,13 @@ bool launch_block_attn_stream_adaptive_block_stats_typed(
     uint32_t tile_blocks, uint32_t workspace_block_base,
     uint32_t workspace_block_stride, uint32_t n_heads,
     uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_gemm_reduce(
+    float *block_max, float *block_sum, const float *logits,
+    const int32_t *block_offsets, const int32_t *block_counts,
+    uint32_t n_tokens, uint32_t prototype_count, uint32_t tile_blocks,
+    uint32_t workspace_block_base, uint32_t workspace_block_stride,
+    uint32_t n_heads, uint32_t query_head_base, uint32_t gqa_group,
     cudaStream_t stream);
 bool launch_block_attn_stream_adaptive_finalize(
     float *score, const float *block_max, const float *block_sum,
@@ -7133,6 +7143,59 @@ __global__ void block_attn_stream_adaptive_block_stats_gqa_kernel(
                 block_max[out] = stats_max[g];
                 block_sum[out] = stats_sum[g];
             }
+        }
+    }
+}
+
+// Reduce the FP32 logits produced by one strided-batched GEMM.  The batch
+// dimension is the GQA group and every matrix is [prototype, query-token] in
+// column-major order, so each query distribution sees one contiguous row of
+// prototype logits.  Grid-stride traversal caps the CTA count for very long
+// histories while preserving coalesced block-metadata and workspace writes.
+__global__ void block_attn_stream_adaptive_gemm_reduce_kernel(
+        float *block_max, float *block_sum, const float *logits,
+        const int32_t *block_offsets, const int32_t *block_counts,
+        uint32_t n_tokens, uint32_t prototype_count,
+        uint32_t tile_blocks, uint32_t workspace_block_base,
+        uint32_t workspace_block_stride, uint32_t n_heads,
+        uint32_t query_head_base, uint32_t gqa_group) {
+    const uint64_t pairs =
+        static_cast<uint64_t>(n_tokens) * tile_blocks;
+    const uint64_t stride =
+        static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t pair =
+             static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         pair < pairs; pair += stride) {
+        const uint32_t t = static_cast<uint32_t>(pair / tile_blocks);
+        const uint32_t b = static_cast<uint32_t>(pair) - t * tile_blocks;
+        const uint32_t count =
+            static_cast<uint32_t>(max(block_counts[b], 0));
+        const uint32_t begin =
+            static_cast<uint32_t>(max(block_offsets[b], 0));
+        const uint32_t workspace_block = workspace_block_base + b;
+        for (uint32_t g = 0; g < gqa_group; ++g) {
+            float stats_max = -INFINITY;
+            float stats_sum = 0.0f;
+            const uint64_t logits_base =
+                (static_cast<uint64_t>(g) * n_tokens + t) *
+                prototype_count;
+            for (uint32_t i = 0; i < count; ++i) {
+                const float value = logits[logits_base + begin + i];
+                const float merged_max = fmaxf(stats_max, value);
+                stats_sum =
+                    (isfinite(stats_max)
+                         ? stats_sum * __expf(stats_max - merged_max)
+                         : 0.0f) +
+                    __expf(value - merged_max);
+                stats_max = merged_max;
+            }
+            const uint32_t dist =
+                t * n_heads + query_head_base + g;
+            const uint64_t out =
+                static_cast<uint64_t>(dist) * workspace_block_stride +
+                workspace_block;
+            block_max[out] = stats_max;
+            block_sum[out] = stats_sum;
         }
     }
 }
@@ -16680,6 +16743,136 @@ public:
             "cuda block_attn_stream_adaptive_block_stats_device");
     }
 
+    DeviceStatus block_attn_stream_adaptive_block_stats_gemm_device(
+            DeviceTensor &block_max,
+            DeviceTensor &block_sum,
+            DeviceTensor &logits,
+            const DeviceTensor &q_multi,
+            const DeviceTensor &prototype_tile,
+            const DeviceTensor &block_offsets,
+            const DeviceTensor &block_counts,
+            uint32_t layer,
+            uint32_t n_layers,
+            uint32_t n_tokens,
+            uint32_t q_layer_stride,
+            uint32_t prototype_count,
+            uint32_t tile_blocks,
+            uint32_t workspace_block_base,
+            uint32_t workspace_block_stride,
+            uint32_t n_heads,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            float scale) override {
+        if (prototype_count == 0 || tile_blocks == 0 || n_tokens == 0) {
+            return {};
+        }
+        if (n_layers == 0 || layer >= n_layers || n_heads == 0 ||
+            n_kv_heads == 0 || n_heads % n_kv_heads != 0 ||
+            head_dim == 0) {
+            return {
+                false,
+                "block_attn_stream_adaptive_block_stats_gemm invalid dimensions"};
+        }
+        auto &bm = as_tensor(block_max);
+        auto &bs = as_tensor(block_sum);
+        auto &lg = as_tensor(logits);
+        const auto &qm = as_tensor(q_multi);
+        const auto &pt = as_tensor(prototype_tile);
+        const auto &bo = as_tensor(block_offsets);
+        const auto &bc = as_tensor(block_counts);
+        const uint32_t gqa_group = n_heads / n_kv_heads;
+        const uint64_t local_distributions =
+            static_cast<uint64_t>(n_tokens) * n_heads;
+        const uint64_t workspace_entries =
+            local_distributions * workspace_block_stride;
+        const uint64_t q_rows =
+            static_cast<uint64_t>(n_layers - 1) * q_layer_stride +
+            n_tokens;
+        const uint64_t prototype_elems =
+            static_cast<uint64_t>(prototype_count) * n_kv_heads *
+            head_dim;
+        const uint64_t logits_per_head =
+            static_cast<uint64_t>(prototype_count) * n_tokens;
+        const uint64_t required_logits = logits_per_head * gqa_group;
+        if (workspace_block_base > workspace_block_stride ||
+            tile_blocks > workspace_block_stride - workspace_block_base ||
+            !qm.is_fp16() || !pt.is_fp16() ||
+            bm.elem_size != sizeof(float) ||
+            bs.elem_size != sizeof(float) ||
+            lg.elem_size != sizeof(float) ||
+            bm.count < workspace_entries || bs.count < workspace_entries ||
+            lg.count < required_logits ||
+            bo.elem_size != sizeof(int32_t) ||
+            bc.elem_size != sizeof(int32_t) ||
+            bo.count < tile_blocks || bc.count < tile_blocks ||
+            qm.count < q_rows * n_heads * head_dim ||
+            pt.count < prototype_elems ||
+            prototype_count >
+                static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+            n_tokens >
+                static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+            head_dim >
+                static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            return {
+                false,
+                "block_attn_stream_adaptive_block_stats_gemm invalid tensor shape"};
+        }
+        if (!cublas_handle_) {
+            return {
+                false,
+                "block_attn_stream_adaptive_block_stats_gemm has no cuBLAS handle"};
+        }
+
+        const float alpha = scale;
+        const float beta = 0.0f;
+        const auto *prototype =
+            reinterpret_cast<const __half *>(pt.ptr);
+        const auto *query = reinterpret_cast<const __half *>(qm.ptr);
+        const uint64_t query_layer_offset =
+            static_cast<uint64_t>(layer) * q_layer_stride * n_heads *
+            head_dim;
+        for (uint32_t kvh = 0; kvh < n_kv_heads; ++kvh) {
+            const __half *a = prototype +
+                static_cast<uint64_t>(kvh) * head_dim;
+            const __half *b = query + query_layer_offset +
+                static_cast<uint64_t>(kvh) * gqa_group * head_dim;
+            if (auto st = cublas_status(
+                    cublasGemmStridedBatchedEx(
+                        cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+                        static_cast<int>(prototype_count),
+                        static_cast<int>(n_tokens),
+                        static_cast<int>(head_dim),
+                        &alpha,
+                        a, CUDA_R_16F,
+                        static_cast<int>(n_kv_heads * head_dim),
+                        0,
+                        b, CUDA_R_16F,
+                        static_cast<int>(n_heads * head_dim),
+                        static_cast<long long>(head_dim),
+                        &beta,
+                        lg.ptr, CUDA_R_32F,
+                        static_cast<int>(prototype_count),
+                        static_cast<long long>(logits_per_head),
+                        static_cast<int>(gqa_group),
+                        CUBLAS_COMPUTE_32F_FAST_16F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "cublas adaptive block-stats GEMM"); !st.ok) {
+                return st;
+            }
+            if (!ported::launch_block_attn_stream_adaptive_gemm_reduce(
+                    bm.ptr, bs.ptr, lg.ptr, bo.ptr_i32(), bc.ptr_i32(),
+                    n_tokens, prototype_count, tile_blocks,
+                    workspace_block_base, workspace_block_stride,
+                    n_heads, kvh * gqa_group, gqa_group, exec_stream_)) {
+                return {
+                    false,
+                    "block_attn_stream_adaptive_gemm_reduce launch failed"};
+            }
+        }
+        return launch_status(
+            "cuda block_attn_stream_adaptive_block_stats_gemm_device");
+    }
+
     DeviceStatus block_attn_stream_adaptive_finalize_device(
             DeviceTensor &score,
             const DeviceTensor &block_max,
@@ -17256,6 +17449,31 @@ public:
             return {false, "block_kmean_content_batch launch failed"};
         }
         return launch_status("cuda block_kmean_content_batch_device");
+    }
+
+    DeviceStatus widen_raw_k_to_f32_device(const DeviceTensor &src,
+                                           DeviceTensor &dst,
+                                           uint64_t rows,
+                                           uint32_t row_elems) override {
+        if (rows == 0 || row_elems == 0) return {};
+        const auto &s = as_tensor(src);
+        auto &d = as_tensor(dst);
+        if (d.elem_size != sizeof(float) || d.is_fp8_kv()) {
+            return {false, "widen_raw_k_to_f32_device requires fp32 output"};
+        }
+        const uint64_t elems = rows * row_elems;
+        if (elems > s.count || elems > d.count) {
+            return {false, "widen_raw_k_to_f32_device range exceeds tensors"};
+        }
+        const ported::KbarDType src_dtype =
+            s.is_fp8_kv() ? ported::KbarDType::FP8
+                          : s.is_fp16() ? ported::KbarDType::F16
+                                        : ported::KbarDType::F32;
+        if (!ported::launch_widen_raw_k_to_f32(s.ptr, src_dtype, d.ptr, elems,
+                                               exec_stream_)) {
+            return {false, "widen_raw_k_to_f32 launch failed"};
+        }
+        return launch_status("cuda widen_raw_k_to_f32_device");
     }
 
     DeviceStatus block_kdirection_fixed4_batch_device(
@@ -22086,6 +22304,34 @@ bool launch_block_attn_stream_adaptive_block_stats_typed(
     return false;
 }
 
+bool launch_block_attn_stream_adaptive_gemm_reduce(
+        float *block_max, float *block_sum, const float *logits,
+        const int32_t *block_offsets, const int32_t *block_counts,
+        uint32_t n_tokens, uint32_t prototype_count,
+        uint32_t tile_blocks, uint32_t workspace_block_base,
+        uint32_t workspace_block_stride, uint32_t n_heads,
+        uint32_t query_head_base, uint32_t gqa_group,
+        cudaStream_t stream) {
+    if (n_tokens == 0 || prototype_count == 0 || tile_blocks == 0 ||
+        gqa_group == 0 || query_head_base + gqa_group > n_heads ||
+        workspace_block_base > workspace_block_stride ||
+        tile_blocks > workspace_block_stride - workspace_block_base) {
+        return false;
+    }
+    constexpr uint32_t threads = 256;
+    constexpr uint32_t max_grid = 1024;
+    const uint64_t pairs =
+        static_cast<uint64_t>(n_tokens) * tile_blocks;
+    const uint32_t grid = static_cast<uint32_t>(std::min<uint64_t>(
+        max_grid, (pairs + threads - 1) / threads));
+    block_attn_stream_adaptive_gemm_reduce_kernel<<<
+        grid, threads, 0, stream>>>(
+        block_max, block_sum, logits, block_offsets, block_counts,
+        n_tokens, prototype_count, tile_blocks, workspace_block_base,
+        workspace_block_stride, n_heads, query_head_base, gqa_group);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool launch_block_attn_stream_adaptive_finalize(
         float *score, const float *block_max, const float *block_sum,
         float *global_max, float *global_sum,
@@ -22534,6 +22780,42 @@ bool launch_block_kmean_content_batch_typed(
                 stream);
     }
     return false;
+}
+
+template <typename SrcT>
+__global__ void widen_raw_k_to_f32_kernel(const SrcT *__restrict__ src,
+                                          float *__restrict__ dst,
+                                          uint64_t elems) {
+    const uint64_t i =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= elems) return;
+    dst[i] = static_cast<float>(src[i]);
+}
+
+bool launch_widen_raw_k_to_f32(const void *src, KbarDType src_dtype,
+                               float *dst, uint64_t elems,
+                               cudaStream_t stream) {
+    if (elems == 0) return true;
+    constexpr uint32_t kThreads = 256;
+    const uint64_t blocks64 = (elems + kThreads - 1) / kThreads;
+    if (blocks64 > 0xffffffffull) return false;
+    const uint32_t blocks = static_cast<uint32_t>(blocks64);
+    switch (src_dtype) {
+        case KbarDType::F32:
+            widen_raw_k_to_f32_kernel<float><<<blocks, kThreads, 0, stream>>>(
+                static_cast<const float *>(src), dst, elems);
+            break;
+        case KbarDType::F16:
+            widen_raw_k_to_f32_kernel<__half><<<blocks, kThreads, 0, stream>>>(
+                static_cast<const __half *>(src), dst, elems);
+            break;
+        case KbarDType::FP8:
+            widen_raw_k_to_f32_kernel<__nv_fp8_e4m3>
+                <<<blocks, kThreads, 0, stream>>>(
+                    static_cast<const __nv_fp8_e4m3 *>(src), dst, elems);
+            break;
+    }
+    return cudaGetLastError() == cudaSuccess;
 }
 
 template <typename KbarT>

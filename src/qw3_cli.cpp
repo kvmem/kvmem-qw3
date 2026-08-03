@@ -1,7 +1,11 @@
 #include "qw3/gguf.hpp"
+#include "qw3/kvmem_archive.hpp"
 #include "qw3/qw3.hpp"
+#include "qw3/tokenizer.hpp"
+#include "kvmem_archive_cli.hpp"
 #include "kvmem_session.hpp"
 #include "server.hpp"
+#include "json.hpp"
 
 #include <cctype>
 #include <cmath>
@@ -23,12 +27,30 @@ void usage(std::ostream &os) {
         "Usage: qw3 --model MODEL -p PROMPT [options]\n"
         "       qw3 serve --model MODEL [--port 8080] [options]\n"
         "       qw3 kvmem-session --model MODEL [--session-ladder L] [options]\n"
+        "       qw3 archive build --model MODEL --kvmem-archive DIR --ctx N\n"
+        "                         [--archive-input FILE] [--archive-tokens N]\n"
+        "                         [--archive-token-input FILE]\n"
+        "                         [--archive-ladder-tokens N]\n"
+        "                         [--archive-pad-final-chunk] [options]\n"
+        "       qw3 archive query --model MODEL --kvmem-archive DIR\n"
+        "                         [--archive-tokens N] --archive-question Q\n"
+        "                         [--archive-questions-file FILE]\n"
+        "                         [--archive-questions-json FILE]\n"
+        "                         [--archive-question-format raw|qwen-chat|qwen-chat-no-thinking|qwen-user-continuation]\n"
+        "                         [--archive-results-file FILE]\n"
+        "                         [options]\n"
+        "       qw3 archive info  --kvmem-archive DIR\n"
+        "       qw3 tokenize --model MODEL --prompt-file FILE [--token-output FILE]\n"
         "\n"
         "Serve (OpenAI-compatible HTTP API; loads model once, serves forever).\n"
         "  Default is the conservative baseline: one request at a time, FP16 KV,\n"
         "  no global paged KV, no continuous batching, and no MTP.\n"
         "  --port N              Listen port. Default: 8080\n"
         "  --host ADDR           Bind address. Default: 127.0.0.1\n"
+        "  --kvmem-archive DIR  Start a dedicated frozen archive server; each\n"
+        "                        request prompt is the new query against the\n"
+        "                        attached prefix. Use --archive-tokens N to\n"
+        "                        expose a block-aligned prefix (default: all).\n"
         "  --continuous-batching Enable continuous request batching. Also enables\n"
         "                        the required global paged-KV serving pool and\n"
         "                        body-batch executor by default.\n"
@@ -354,6 +376,7 @@ int main(int argc, char **argv) {
     // `qw3 serve ...` runs the OpenAI-compatible HTTP server instead of a
     // one-shot generate. Detected as the first positional argument.
     bool serve = false;
+    bool tokenize_only = false;
     qw3::ServerConfig serve_cfg;
     bool kv_dtype_cli_set = false;
     std::string kv_dtype_cli;
@@ -369,13 +392,39 @@ int main(int argc, char **argv) {
     int session_repeat_queries = 0;
     std::string session_repeat_mode = "frozen";
 
+    // `qw3 archive build|query|info ...` drives the durable KVMem context
+    // archive: ingest a corpus once, then attach it repeatedly at any prefix
+    // length, under any retrieval policy, without recomputing the context.
+    std::string archive_op;
+    qw3::KvMemArchiveBuildConfig archive_build;
+    qw3::KvMemArchiveRunConfig archive_run;
+    std::string archive_questions_path;
+    std::string archive_questions_json_path;
+    std::string token_output_path;
+
     int arg_start = 1;
     if (argc > 1 && std::string(argv[1]) == "serve") {
         serve = true;
         arg_start = 2;
+    } else if (argc > 1 && std::string(argv[1]) == "tokenize") {
+        tokenize_only = true;
+        arg_start = 2;
     } else if (argc > 1 && std::string(argv[1]) == "kvmem-session") {
         kvmem_session = true;
         arg_start = 2;
+    } else if (argc > 1 && std::string(argv[1]) == "archive") {
+        if (argc < 3) {
+            std::cerr << "usage: qw3 archive build|query|info ...\n";
+            return 2;
+        }
+        archive_op = argv[2];
+        if (archive_op != "build" && archive_op != "query" &&
+            archive_op != "info") {
+            std::cerr << "unknown archive operation: " << archive_op
+                      << " (expected build, query, or info)\n";
+            return 2;
+        }
+        arg_start = 3;
     }
 
     try {
@@ -818,6 +867,53 @@ int main(int argc, char **argv) {
                 if (serve_cfg.thinking_budget_default < 0) {
                     throw std::runtime_error("--thinking-budget must be >= 0");
                 }
+            } else if (arg == "--kvmem-archive") {
+                engine.kvmem_archive_dir = need(arg);
+            } else if (arg == "--archive-input") {
+                archive_build.input_path = need(arg);
+            } else if (arg == "--archive-token-input") {
+                archive_build.token_input_path = need(arg);
+            } else if (arg == "--archive-tokens") {
+                // Build: how much of the corpus to ingest.
+                // Query: which prefix of the archive to attach.
+                const uint64_t v = std::stoull(need(arg));
+                archive_build.tokens = v;
+                archive_run.tokens = v;
+                engine.kvmem_archive_tokens = v;
+            } else if (arg == "--archive-ladder-tokens") {
+                archive_build.ladder_tokens = std::stoull(need(arg));
+            } else if (arg == "--archive-pad-final-chunk") {
+                archive_build.pad_final_chunk = true;
+            } else if (arg == "--archive-question") {
+                archive_run.questions.push_back(need(arg));
+            } else if (arg == "--archive-questions-file") {
+                archive_questions_path = need(arg);
+            } else if (arg == "--archive-questions-json") {
+                archive_questions_json_path = need(arg);
+            } else if (arg == "--archive-question-format") {
+                const std::string format = need(arg);
+                if (format == "raw") {
+                    archive_run.question_format =
+                        qw3::KvMemArchiveRunConfig::QuestionFormat::Raw;
+                } else if (format == "qwen-chat") {
+                    archive_run.question_format = qw3::KvMemArchiveRunConfig::
+                        QuestionFormat::QwenChatThinking;
+                } else if (format == "qwen-chat-no-thinking") {
+                    archive_run.question_format = qw3::KvMemArchiveRunConfig::
+                        QuestionFormat::QwenChatNoThinking;
+                } else if (format == "qwen-user-continuation") {
+                    archive_run.question_format = qw3::KvMemArchiveRunConfig::
+                        QuestionFormat::QwenUserContinuationNoThinking;
+                } else {
+                    throw std::runtime_error(
+                        "--archive-question-format must be "
+                        "raw|qwen-chat|qwen-chat-no-thinking|"
+                        "qwen-user-continuation");
+                }
+            } else if (arg == "--archive-results-file") {
+                archive_run.results_path = need(arg);
+            } else if (arg == "--token-output") {
+                token_output_path = need(arg);
             } else if (arg == "--session-ladder") {
                 session_ladder = parse_ladder(need(arg), arg);
             } else if (arg == "--session-decode-tokens") {
@@ -885,6 +981,54 @@ int main(int argc, char **argv) {
             return 0;
         }
 
+        if (tokenize_only) {
+            if (engine.model_path.empty()) {
+                throw std::runtime_error("qw3 tokenize requires --model");
+            }
+            if (prompt.empty()) {
+                throw std::runtime_error(
+                    "qw3 tokenize requires --prompt or --prompt-file");
+            }
+            const qw3::GgufFile gguf(engine.model_path);
+            const qw3::QwenTokenizer tokenizer(gguf);
+            const std::vector<int32_t> tokens = tokenizer.encode(prompt, false);
+            if (!token_output_path.empty()) {
+                std::ofstream out(token_output_path,
+                                  std::ios::out | std::ios::binary |
+                                      std::ios::trunc);
+                if (!out) {
+                    throw std::runtime_error("cannot create token output: " +
+                                             token_output_path);
+                }
+                static constexpr char magic[8] = {
+                    'Q', 'W', '3', 'T', 'O', 'K', '2', '\0'};
+                const uint64_t count = tokens.size();
+                const std::string model_sha256 =
+                    qw3::kvmem_archive_model_sha256(engine.model_path);
+                if (model_sha256.size() != 64) {
+                    throw std::runtime_error(
+                        "failed to identify tokenizer model for token output");
+                }
+                out.write(magic, sizeof(magic));
+                out.write(reinterpret_cast<const char *>(&count),
+                          sizeof(count));
+                out.write(model_sha256.data(),
+                          static_cast<std::streamsize>(model_sha256.size()));
+                if (!tokens.empty()) {
+                    out.write(reinterpret_cast<const char *>(tokens.data()),
+                              static_cast<std::streamsize>(
+                                  tokens.size() * sizeof(tokens[0])));
+                }
+                if (!out) {
+                    throw std::runtime_error("failed writing token output: " +
+                                             token_output_path);
+                }
+            }
+            std::cout << "tokens=" << tokens.size()
+                      << " bytes=" << prompt.size() << "\n";
+            return 0;
+        }
+
         if (native_plan) {
             const qw3::NativePlanInfo plan = qw3::inspect_native_plan(engine.model_path);
             std::cout << "native backend: " << (plan.supported ? "supported" : "incomplete") << "\n"
@@ -919,8 +1063,108 @@ int main(int argc, char **argv) {
             engine.backend = qw3::BackendKind::QwenNative;
             engine.native_heavy = true;
             if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
+            if (!engine.kvmem_archive_dir.empty()) {
+                if (kv_dtype_cli_set && kv_dtype_cli != "fp8") {
+                    throw std::runtime_error(
+                        "archive-backed serving requires --kv-dtype fp8");
+                }
+                if (serve_cfg.continuous_batching) {
+                    throw std::runtime_error(
+                        "archive-backed serving currently uses the serialized "
+                        "frozen-branch path and cannot use --continuous-batching");
+                }
+                engine.kvmem_enabled = true;
+                engine.kvmem_immutable_source_k = true;
+                engine.kvmem_raw_k_nvme = true;
+                engine.kvmem_query_conditioned = true;
+                engine.kvmem_update_mode = "step";
+                engine.kvmem_archive_mode = "attach";
+                if (!engine.native_mtp_chain_set ||
+                    engine.native_mtp_chain <= 0) {
+                    engine.native_mtp_chain = 4;
+                    engine.native_mtp_chain_set = true;
+                }
+                engine.native_mtp_speculate = true;
+                serve_cfg.kv_dtype = "fp8";
+            }
             serve_cfg.default_generation = gen;
             return qw3::run_server(engine, serve_cfg);
+        }
+
+        if (!archive_op.empty()) {
+            if (archive_op == "info") {
+                if (engine.kvmem_archive_dir.empty()) {
+                    throw std::runtime_error(
+                        "qw3 archive info requires --kvmem-archive");
+                }
+                return qw3::run_kvmem_archive_info(engine.kvmem_archive_dir);
+            }
+            if (kv_dtype_cli_set && kv_dtype_cli != "fp8") {
+                throw std::runtime_error(
+                    "the KVMem context archive format is fp8-only; "
+                    "--kv-dtype " + kv_dtype_cli + " is unsupported");
+            }
+            if (archive_op == "build") {
+                if (engine.ctx_size <= 0) {
+                    throw std::runtime_error(
+                        "qw3 archive build requires --ctx large enough for the "
+                        "full context");
+                }
+                return qw3::run_kvmem_archive_build(engine, archive_build);
+            }
+            if (!archive_questions_path.empty()) {
+                std::ifstream qin(archive_questions_path);
+                if (!qin) {
+                    throw std::runtime_error("cannot read " +
+                                             archive_questions_path);
+                }
+                std::string line;
+                while (std::getline(qin, line)) {
+                    if (!line.empty()) archive_run.questions.push_back(line);
+                }
+            }
+            if (!archive_questions_json_path.empty()) {
+                std::ifstream qin(archive_questions_json_path);
+                if (!qin) {
+                    throw std::runtime_error("cannot read " +
+                                             archive_questions_json_path);
+                }
+                nlohmann::json questions;
+                qin >> questions;
+                if (!questions.is_array()) {
+                    throw std::runtime_error(
+                        "--archive-questions-json must contain a JSON array");
+                }
+                for (const auto &question : questions) {
+                    if (!question.is_string()) {
+                        throw std::runtime_error(
+                            "--archive-questions-json entries must be strings");
+                    }
+                    archive_run.questions.push_back(
+                        question.get<std::string>());
+                }
+            }
+            if (archive_run.questions.empty()) {
+                throw std::runtime_error(
+                    "qw3 archive query requires --archive-question or "
+                    "--archive-questions-file/--archive-questions-json");
+            }
+            archive_run.max_tokens = gen.max_tokens;
+            archive_run.thinking_budget =
+                serve_cfg.thinking_budget_default;
+            if (serve_cfg.temperature_set) {
+                archive_run.temperature = gen.temperature;
+                archive_run.top_p = gen.top_p;
+                archive_run.top_k = gen.top_k;
+            }
+            if (engine.ctx_size <= 0) {
+                const qw3::KvMemArchiveManifest m =
+                    qw3::KvMemArchive::read_manifest(engine.kvmem_archive_dir);
+                engine.ctx_size = static_cast<int>(
+                    m.total_tokens + 4096 +
+                    static_cast<uint64_t>(std::max(1, gen.max_tokens)));
+            }
+            return qw3::run_kvmem_archive_query(engine, archive_run);
         }
 
         if (kvmem_session) {

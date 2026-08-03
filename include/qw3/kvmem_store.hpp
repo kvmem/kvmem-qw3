@@ -412,7 +412,8 @@ public:
     // resident move is an in-place delta rotation. `selected_ids` need not be sorted;
     // it is sorted ascending internally so window order is deterministic (sink
     // first ... recent last). Blocks are packed contiguously from window pos 0.
-    KvMemPlan set_selection(std::vector<uint32_t> selected_ids);
+    KvMemPlan set_selection(std::vector<uint32_t> selected_ids,
+                            bool force_raw_refresh = false);
 
     // Reset working-set membership (e.g. new session). Block table + baked_pos
     // are kept (the cache still holds K baked at whatever position it was left).

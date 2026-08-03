@@ -31,9 +31,10 @@ struct ServerConfig {
     bool mtp_batched_draft = false;
     bool mtp_batched_draft_set = false;
     // Lossless page-aligned prefix KV caching on the continuous-batching path.
-    // Off by default; --prefix-cache opts in. Page budget is unlimited (bounded
-    // by the KV pool) and tracing is off — these are the tuned values, so they
-    // are not exposed as separate switches.
+    // Off by default; --prefix-cache opts in. Page budget is unlimited by
+    // default (bounded by the KV pool), with an internal
+    // QW3_PREFIX_CACHE_MAX_PAGES override for bounded long-lived services.
+    // Tracing is off; neither tuning knob is exposed as a public CLI switch.
     bool prefix_cache = false;
     // kvmem single-request prefix cache on the plain (non-CB) serve route. Off
     // by default; --kvmem-prefix-cache opts in. Requires --kvmem. Keeps the

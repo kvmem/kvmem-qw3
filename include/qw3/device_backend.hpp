@@ -1454,6 +1454,22 @@ public:
         return {false, "derope_store_content_batch_device requires backend override"};
     }
 
+    // Widen a slab of raw-K rows from the KV cache dtype to fp32 so the
+    // prototype builders above can consume them. Attaching a context archive
+    // rebuilds the retrieval index from the persisted raw-K authority instead
+    // of from live prefill activations, and those builders require fp32 input.
+    // `src` holds `rows` rows of `row_elems` elements each, contiguous; `dst`
+    // receives the same shape as fp32. Raw K is already in the content frame,
+    // so callers pass rope_dim=0 to the builders to make the de-rotate an
+    // identity and reproduce byte-identical prototypes.
+    virtual DeviceStatus widen_raw_k_to_f32_device(const DeviceTensor &src,
+                                                   DeviceTensor &dst,
+                                                   uint64_t rows,
+                                                   uint32_t row_elems) {
+        (void)src; (void)dst; (void)rows; (void)row_elems;
+        return {false, "widen_raw_k_to_f32_device requires backend override"};
+    }
+
     // block_attn_score_exactmass_device (ExactMass, AgentKV port): per normal-
     // attention layer (one launch, ACCUMULATES into score), for every block w
     //   score[w] += head_w · Σ_{j<M} Σ_{qh<n_heads}
@@ -1671,6 +1687,41 @@ public:
         return {
             false,
             "block_attn_stream_adaptive_block_stats_device requires backend override"};
+    }
+
+    // Tensor-core implementation of the same exact block-statistics update.
+    // `logits` is bounded scratch reused for every KV head and streamed tile;
+    // backends that cannot run FP16 GEMM return unavailable and callers retain
+    // the scalar one-dot implementation above.
+    virtual DeviceStatus block_attn_stream_adaptive_block_stats_gemm_device(
+        DeviceTensor &block_max,
+        DeviceTensor &block_sum,
+        DeviceTensor &logits,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &prototype_tile,
+        const DeviceTensor &block_offsets,
+        const DeviceTensor &block_counts,
+        uint32_t layer,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t prototype_count,
+        uint32_t tile_blocks,
+        uint32_t workspace_block_base,
+        uint32_t workspace_block_stride,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale) {
+        (void)block_max; (void)block_sum; (void)logits; (void)q_multi;
+        (void)prototype_tile; (void)block_offsets; (void)block_counts;
+        (void)layer; (void)n_layers; (void)n_tokens;
+        (void)q_layer_stride; (void)prototype_count; (void)tile_blocks;
+        (void)workspace_block_base; (void)workspace_block_stride;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale;
+        return {
+            false,
+            "block_attn_stream_adaptive_block_stats_gemm_device requires backend override"};
     }
 
     virtual DeviceStatus block_attn_stream_adaptive_finalize_device(

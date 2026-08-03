@@ -24,7 +24,12 @@
     "agentlongbench_512k_cross_task16_k224k_b32_20260720_query_replay",
     "agentlongbench_512k_normal100_k224k_fp16_length_retry1_merged_20260725",
     "agentlongbench_1m_ds50_k224k_g32k_b32_meank_kvfp8_idxqfp16_canonical_refresh1_t06_think8k_cpu_all_on_gpuratio050_20260726_235009",
-    "agentlongbench_1m_full50_k224k_g32k_b1024_sb32max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727"
+    "agentlongbench_1m_full50_k224k_g32k_b1024_sb32max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727",
+    "memoryagentbench_kvmem_archive_20260802_full",
+    "memoryagentbench_kvmem_archive_20260802_over256k",
+    "memoryagentbench_compact_only_20260802_over256k",
+    "memoryagentbench_compact_rag_20260802_over256k",
+    "memoryagentbench_window32k_20260802_over256k"
   ],
   "runs": {
     "kvmem_500_eval_20260703_164509": {
@@ -114,6 +119,38 @@
     "agentlongbench_1m_full50_k224k_g32k_b512_sb16max_fp8_qrfix_immutable_refresh1_t06_think8k_20260727": {
       "label": "AgentLongBench 1M 50 条，B512/SB16-Max",
       "note": "512-token physical block，16 个 32-token subblock 取 max；未生成通过的 validation_report 前只能引用为进行中结果。"
+    },
+    "memoryagentbench_kvmem_archive_20260802_full": {
+      "label": "MemoryAgentBench 全量：KVMem archive",
+      "note": "146 contexts / 3,671 questions；每个 context 构建一次，所有问题从同一冻结状态独立分支。"
+    },
+    "memoryagentbench_kvmem_archive_20260802_over256k": {
+      "label": "MemoryAgentBench >256K：KVMem Adaptive Mean-K",
+      "note": "与三种plain baseline完全相同的30 contexts / 1,316 questions子集；动态1/2/4 prototypes，fallback=0。"
+    },
+    "memoryagentbench_compact_only_20260802_full": {
+      "label": "MemoryAgentBench 全量：Compact-only",
+      "note": "每个 context 使用同一份与问题无关的 compaction。"
+    },
+    "memoryagentbench_compact_rag_20260802_full": {
+      "label": "MemoryAgentBench 全量：Compact+RAG",
+      "note": "与 Compact-only 共享完全相同的 compaction；每题从原始完整历史中独立召回最多30,720个Qwen source tokens。"
+    },
+    "memoryagentbench_window32k_20260802_full": {
+      "label": "MemoryAgentBench 全量：Window32K",
+      "note": "每个 context 对所有问题复用同一份32,768-token完整prompt近期窗口。"
+    },
+    "memoryagentbench_compact_only_20260802_over256k": {
+      "label": "MemoryAgentBench >256K：Compact-only",
+      "note": "30 contexts / 1,316 questions；每个 context 使用同一份与问题无关的 compaction。"
+    },
+    "memoryagentbench_compact_rag_20260802_over256k": {
+      "label": "MemoryAgentBench >256K：Compact+RAG",
+      "note": "30 contexts / 1,316 questions；与 Compact-only 共享同一 compaction，每题独立召回最多30,720个Qwen source tokens。"
+    },
+    "memoryagentbench_window32k_20260802_over256k": {
+      "label": "MemoryAgentBench >256K：Window32K",
+      "note": "30 contexts / 1,316 questions；每个 context 的全部问题复用同一份32,768-token完整prompt近期窗口。"
     },
     "agentlongbench_1m_round_only_smoke_20260728_140900": {
       "label": "AgentLongBench 1M round-only 启动失败（无效）",

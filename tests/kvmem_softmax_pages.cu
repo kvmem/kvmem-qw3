@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <cmath>
@@ -90,6 +91,13 @@ bool launch_block_attn_stream_adaptive_block_stats_typed(
     uint32_t tile_blocks, uint32_t workspace_block_base,
     uint32_t workspace_block_stride, uint32_t n_heads,
     uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_gemm_reduce(
+    float *block_max, float *block_sum, const float *logits,
+    const int32_t *block_offsets, const int32_t *block_counts,
+    uint32_t n_tokens, uint32_t prototype_count, uint32_t tile_blocks,
+    uint32_t workspace_block_base, uint32_t workspace_block_stride,
+    uint32_t n_heads, uint32_t query_head_base, uint32_t gqa_group,
     cudaStream_t stream);
 bool launch_block_attn_stream_adaptive_finalize(
     float *score, const float *block_max, const float *block_sum,
@@ -836,6 +844,535 @@ static void run_adaptive_scorer_test() {
     CHECK(cudaFree(d_score));
     CHECK(cudaFree(d_prototypes));
     CHECK(cudaFree(d_q));
+}
+
+static void run_adaptive_tiled_type_matrix_test() {
+    constexpr uint32_t layers = 1;
+    constexpr uint32_t tokens = 2;
+    constexpr uint32_t q_stride = tokens;
+    constexpr uint32_t blocks = 17;
+    constexpr uint32_t kv_heads = 1;
+    constexpr uint32_t dim = 8;
+    constexpr uint32_t tile_blocks = 5;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dim));
+
+    std::vector<int32_t> layer_offsets{0, 0};
+    std::vector<int32_t> block_offsets(blocks, 0);
+    std::vector<int32_t> block_counts(blocks, 0);
+    std::vector<int32_t> prototype_blocks;
+    for (uint32_t b = 0; b < blocks; ++b) {
+        const uint32_t count = b % 3 == 0 ? 1u : b % 3 == 1 ? 2u : 4u;
+        block_offsets[b] = static_cast<int32_t>(prototype_blocks.size());
+        block_counts[b] = static_cast<int32_t>(count);
+        for (uint32_t p = 0; p < count; ++p) {
+            prototype_blocks.push_back(static_cast<int32_t>(b));
+        }
+    }
+    layer_offsets[1] = static_cast<int32_t>(prototype_blocks.size());
+    const uint32_t prototype_rows =
+        static_cast<uint32_t>(prototype_blocks.size());
+    const uint64_t prototype_elems =
+        static_cast<uint64_t>(prototype_rows) * kv_heads * dim;
+
+    std::mt19937 rng(77129);
+    std::normal_distribution<float> nd(0.0f, 0.35f);
+    std::vector<float> prototype_source(prototype_elems);
+    for (float &v : prototype_source) v = nd(rng);
+    float *d_prototype_source = nullptr;
+    CHECK(cudaMalloc(&d_prototype_source, prototype_elems * sizeof(float)));
+    CHECK(cudaMemcpy(d_prototype_source, prototype_source.data(),
+                     prototype_elems * sizeof(float), cudaMemcpyHostToDevice));
+
+    int32_t *d_tile_offsets = nullptr;
+    int32_t *d_tile_counts = nullptr;
+    CHECK(cudaMalloc(&d_tile_offsets, tile_blocks * sizeof(int32_t)));
+    CHECK(cudaMalloc(&d_tile_counts, tile_blocks * sizeof(int32_t)));
+
+    for (const uint32_t gqa : {1u, 2u, 3u, 4u, 6u}) {
+        const uint32_t heads = gqa * kv_heads;
+        const uint64_t q_count =
+            static_cast<uint64_t>(layers) * q_stride * heads * dim;
+        std::vector<float> q_source(q_count);
+        for (float &v : q_source) v = nd(rng);
+        float *d_q32 = nullptr;
+        __half *d_q16 = nullptr;
+        float *d_q_dequant = nullptr;
+        CHECK(cudaMalloc(&d_q32, q_count * sizeof(float)));
+        CHECK(cudaMalloc(&d_q16, q_count * sizeof(__half)));
+        CHECK(cudaMalloc(&d_q_dequant, q_count * sizeof(float)));
+        CHECK(cudaMemcpy(d_q32, q_source.data(), q_count * sizeof(float),
+                         cudaMemcpyHostToDevice));
+        const uint32_t threads = 256;
+        const uint32_t q_grid = static_cast<uint32_t>(
+            (q_count + threads - 1) / threads);
+        quantize_kbar<<<q_grid, threads>>>(d_q32, d_q16, q_count);
+        dequantize_kbar<<<q_grid, threads>>>(d_q16, d_q_dequant, q_count);
+        CHECK(cudaGetLastError());
+        std::vector<float> q16_host(q_count);
+        CHECK(cudaMemcpy(q16_host.data(), d_q_dequant,
+                         q_count * sizeof(float), cudaMemcpyDeviceToHost));
+
+        for (const bool query_fp16 : {false, true}) {
+            const void *query = query_fp16
+                ? static_cast<const void *>(d_q16)
+                : static_cast<const void *>(d_q32);
+            const std::vector<float> &q_host =
+                query_fp16 ? q16_host : q_source;
+
+            for (const auto dtype : {
+                     qw3::ported::KbarDType::F32,
+                     qw3::ported::KbarDType::F16,
+                     qw3::ported::KbarDType::FP8}) {
+                __half *d_p16 = nullptr;
+                __nv_fp8_e4m3 *d_p8 = nullptr;
+                float *d_p_dequant = nullptr;
+                const void *prototypes = d_prototype_source;
+                std::vector<float> prototype_host = prototype_source;
+                if (dtype != qw3::ported::KbarDType::F32) {
+                    CHECK(cudaMalloc(&d_p_dequant,
+                                     prototype_elems * sizeof(float)));
+                    const uint32_t p_grid = static_cast<uint32_t>(
+                        (prototype_elems + threads - 1) / threads);
+                    if (dtype == qw3::ported::KbarDType::F16) {
+                        CHECK(cudaMalloc(&d_p16,
+                                         prototype_elems * sizeof(__half)));
+                        quantize_kbar<<<p_grid, threads>>>(
+                            d_prototype_source, d_p16, prototype_elems);
+                        dequantize_kbar<<<p_grid, threads>>>(
+                            d_p16, d_p_dequant, prototype_elems);
+                        prototypes = d_p16;
+                    } else {
+                        CHECK(cudaMalloc(&d_p8,
+                                         prototype_elems *
+                                             sizeof(__nv_fp8_e4m3)));
+                        quantize_kbar<<<p_grid, threads>>>(
+                            d_prototype_source, d_p8, prototype_elems);
+                        dequantize_kbar<<<p_grid, threads>>>(
+                            d_p8, d_p_dequant, prototype_elems);
+                        prototypes = d_p8;
+                    }
+                    CHECK(cudaGetLastError());
+                    CHECK(cudaMemcpy(prototype_host.data(), d_p_dequant,
+                                     prototype_elems * sizeof(float),
+                                     cudaMemcpyDeviceToHost));
+                }
+
+                float *d_score = nullptr;
+                float *d_global_max = nullptr;
+                float *d_global_sum = nullptr;
+                float *d_block_max = nullptr;
+                float *d_block_sum = nullptr;
+                const uint32_t distributions = tokens * heads;
+                const uint64_t stats_entries =
+                    static_cast<uint64_t>(distributions) * blocks;
+                CHECK(cudaMalloc(&d_score, blocks * sizeof(float)));
+                CHECK(cudaMalloc(&d_global_max,
+                                 distributions * sizeof(float)));
+                CHECK(cudaMalloc(&d_global_sum,
+                                 distributions * sizeof(float)));
+                CHECK(cudaMalloc(&d_block_max,
+                                 stats_entries * sizeof(float)));
+                CHECK(cudaMalloc(&d_block_sum,
+                                 stats_entries * sizeof(float)));
+
+                auto install_tile_meta = [&](uint32_t first,
+                                             uint32_t count,
+                                             uint32_t prototype_begin) {
+                    std::vector<int32_t> offsets(count);
+                    std::vector<int32_t> counts(count);
+                    for (uint32_t b = 0; b < count; ++b) {
+                        offsets[b] = block_offsets[first + b] -
+                            static_cast<int32_t>(prototype_begin);
+                        counts[b] = block_counts[first + b];
+                    }
+                    CHECK(cudaMemcpy(d_tile_offsets, offsets.data(),
+                                     count * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice));
+                    CHECK(cudaMemcpy(d_tile_counts, counts.data(),
+                                     count * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice));
+                };
+                auto prototype_ptr = [&](uint32_t prototype_begin) {
+                    const uint64_t byte_offset =
+                        static_cast<uint64_t>(prototype_begin) *
+                        kv_heads * dim *
+                        (dtype == qw3::ported::KbarDType::F32
+                             ? sizeof(float)
+                             : dtype == qw3::ported::KbarDType::F16
+                                   ? sizeof(__half)
+                                   : sizeof(__nv_fp8_e4m3));
+                    return static_cast<const void *>(
+                        static_cast<const uint8_t *>(prototypes) + byte_offset);
+                };
+
+                CHECK(cudaMemset(d_score, 0, blocks * sizeof(float)));
+                bool initialize = true;
+                for (uint32_t first = 0; first < blocks;
+                     first += tile_blocks) {
+                    const uint32_t count =
+                        std::min(tile_blocks, blocks - first);
+                    const uint32_t prototype_begin =
+                        static_cast<uint32_t>(block_offsets[first]);
+                    const uint32_t last = first + count - 1;
+                    const uint32_t prototype_end =
+                        static_cast<uint32_t>(block_offsets[last] +
+                                              block_counts[last]);
+                    if (!qw3::ported::
+                            launch_block_attn_stream_adaptive_lse_typed(
+                                d_global_max, d_global_sum, query, query_fp16,
+                                prototype_ptr(prototype_begin), dtype,
+                                /*layer=*/0, layers, tokens, q_stride,
+                                prototype_end - prototype_begin, heads,
+                                kv_heads, dim, scale,
+                                initialize ? 1u : 0u, /*stream=*/0)) {
+                        std::fprintf(stderr,
+                                     "adaptive typed LSE rejected gqa=%u\n",
+                                     gqa);
+                        std::exit(1);
+                    }
+                    initialize = false;
+                }
+                for (uint32_t first = 0; first < blocks;
+                     first += tile_blocks) {
+                    const uint32_t count =
+                        std::min(tile_blocks, blocks - first);
+                    const uint32_t prototype_begin =
+                        static_cast<uint32_t>(block_offsets[first]);
+                    install_tile_meta(first, count, prototype_begin);
+                    if (!qw3::ported::
+                            launch_block_attn_stream_adaptive_score_typed(
+                                d_score, query, query_fp16,
+                                prototype_ptr(prototype_begin), dtype,
+                                d_tile_offsets, d_tile_counts,
+                                d_global_max, d_global_sum, /*layer=*/0,
+                                layers, tokens, q_stride, count, first,
+                                heads, kv_heads, dim, scale, /*stream=*/0)) {
+                        std::fprintf(stderr,
+                                     "adaptive typed score rejected gqa=%u\n",
+                                     gqa);
+                        std::exit(1);
+                    }
+                }
+                CHECK(cudaDeviceSynchronize());
+                std::vector<float> two_pass(blocks);
+                CHECK(cudaMemcpy(two_pass.data(), d_score,
+                                 blocks * sizeof(float),
+                                 cudaMemcpyDeviceToHost));
+
+                CHECK(cudaMemset(d_score, 0, blocks * sizeof(float)));
+                for (uint32_t first = 0; first < blocks;
+                     first += tile_blocks) {
+                    const uint32_t count =
+                        std::min(tile_blocks, blocks - first);
+                    const uint32_t prototype_begin =
+                        static_cast<uint32_t>(block_offsets[first]);
+                    const uint32_t last = first + count - 1;
+                    const uint32_t prototype_end =
+                        static_cast<uint32_t>(block_offsets[last] +
+                                              block_counts[last]);
+                    install_tile_meta(first, count, prototype_begin);
+                    if (!qw3::ported::
+                            launch_block_attn_stream_adaptive_block_stats_typed(
+                                d_block_max, d_block_sum, query, query_fp16,
+                                prototype_ptr(prototype_begin), dtype,
+                                d_tile_offsets, d_tile_counts,
+                                /*layer=*/0, layers, tokens, q_stride,
+                                prototype_end - prototype_begin, count,
+                                first, blocks, heads, kv_heads, dim, scale,
+                                /*stream=*/0)) {
+                        std::fprintf(stderr,
+                                     "adaptive typed stats rejected gqa=%u\n",
+                                     gqa);
+                        std::exit(1);
+                    }
+                }
+                if (!qw3::ported::launch_block_attn_stream_adaptive_finalize(
+                        d_score, d_block_max, d_block_sum,
+                        d_global_max, d_global_sum, /*layer=*/0, layers,
+                        tokens, blocks, blocks, /*global_block_base=*/0,
+                        heads, /*stream=*/0)) {
+                    std::fprintf(stderr,
+                                 "adaptive typed finalize rejected gqa=%u\n",
+                                 gqa);
+                    std::exit(1);
+                }
+                CHECK(cudaDeviceSynchronize());
+                std::vector<float> one_pass(blocks);
+                CHECK(cudaMemcpy(one_pass.data(), d_score,
+                                 blocks * sizeof(float),
+                                 cudaMemcpyDeviceToHost));
+                const std::vector<float> expected = host_adaptive_reference(
+                    q_host, prototype_host, layer_offsets, block_offsets,
+                    block_counts, prototype_blocks, layers, tokens, q_stride,
+                    blocks, heads, kv_heads, dim, scale,
+                    /*excl_lo=*/0, /*excl_hi=*/blocks);
+                char label[160];
+                const char *dtype_name =
+                    dtype == qw3::ported::KbarDType::F32 ? "f32"
+                    : dtype == qw3::ported::KbarDType::F16 ? "f16"
+                                                           : "fp8";
+                std::snprintf(label, sizeof(label),
+                              "adaptive-tiled-matrix-host-gqa%u-q%s-k%s",
+                              gqa, query_fp16 ? "f16" : "f32", dtype_name);
+                compare(label, one_pass, expected, 3e-6, 3e-3);
+                std::snprintf(label, sizeof(label),
+                              "adaptive-tiled-matrix-two-pass-gqa%u-q%s-k%s",
+                              gqa, query_fp16 ? "f16" : "f32", dtype_name);
+                compare(label, one_pass, two_pass, 3e-6, 3e-3);
+
+                CHECK(cudaFree(d_block_sum));
+                CHECK(cudaFree(d_block_max));
+                CHECK(cudaFree(d_global_sum));
+                CHECK(cudaFree(d_global_max));
+                CHECK(cudaFree(d_score));
+                if (d_p_dequant) CHECK(cudaFree(d_p_dequant));
+                if (d_p8) CHECK(cudaFree(d_p8));
+                if (d_p16) CHECK(cudaFree(d_p16));
+            }
+        }
+        CHECK(cudaFree(d_q_dequant));
+        CHECK(cudaFree(d_q16));
+        CHECK(cudaFree(d_q32));
+    }
+    CHECK(cudaFree(d_tile_counts));
+    CHECK(cudaFree(d_tile_offsets));
+    CHECK(cudaFree(d_prototype_source));
+}
+
+static void run_adaptive_gemm_parity_test() {
+    constexpr uint32_t layers = 2;
+    constexpr uint32_t tokens = 7;
+    constexpr uint32_t q_stride = tokens;
+    constexpr uint32_t blocks = 31;
+    constexpr uint32_t kv_heads = 2;
+    constexpr uint32_t gqa = 6;
+    constexpr uint32_t heads = kv_heads * gqa;
+    constexpr uint32_t dim = 32;
+    constexpr uint32_t tile_blocks = 7;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dim));
+
+    std::vector<int32_t> offsets(layers * blocks);
+    std::vector<int32_t> counts(layers * blocks);
+    uint32_t total_prototypes = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        for (uint32_t b = 0; b < blocks; ++b) {
+            const uint32_t count = (b + l) % 3 == 0
+                ? 1u : (b + l) % 3 == 1 ? 2u : 4u;
+            offsets[l * blocks + b] =
+                static_cast<int32_t>(total_prototypes);
+            counts[l * blocks + b] = static_cast<int32_t>(count);
+            total_prototypes += count;
+        }
+    }
+    const uint64_t prototype_elems =
+        static_cast<uint64_t>(total_prototypes) * kv_heads * dim;
+    const uint64_t query_elems =
+        static_cast<uint64_t>(layers) * q_stride * heads * dim;
+    std::mt19937 rng(93271);
+    std::normal_distribution<float> nd(0.0f, 0.25f);
+    std::vector<float> prototype_f32(prototype_elems);
+    std::vector<float> query_f32(query_elems);
+    for (float &v : prototype_f32) v = nd(rng);
+    for (float &v : query_f32) v = nd(rng);
+
+    float *d_prototype_f32 = nullptr;
+    float *d_query_f32 = nullptr;
+    __half *d_prototypes = nullptr;
+    __half *d_query = nullptr;
+    int32_t *d_offsets = nullptr;
+    int32_t *d_counts = nullptr;
+    float *d_scalar = nullptr;
+    float *d_gemm = nullptr;
+    float *d_block_max = nullptr;
+    float *d_block_sum = nullptr;
+    float *d_global_max = nullptr;
+    float *d_global_sum = nullptr;
+    float *d_logits = nullptr;
+    CHECK(cudaMalloc(&d_prototype_f32, prototype_elems * sizeof(float)));
+    CHECK(cudaMalloc(&d_query_f32, query_elems * sizeof(float)));
+    CHECK(cudaMalloc(&d_prototypes, prototype_elems * sizeof(__half)));
+    CHECK(cudaMalloc(&d_query, query_elems * sizeof(__half)));
+    CHECK(cudaMalloc(&d_offsets, tile_blocks * sizeof(int32_t)));
+    CHECK(cudaMalloc(&d_counts, tile_blocks * sizeof(int32_t)));
+    CHECK(cudaMalloc(&d_scalar, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&d_gemm, blocks * sizeof(float)));
+    const uint64_t stats_entries =
+        static_cast<uint64_t>(tokens) * heads * blocks;
+    CHECK(cudaMalloc(&d_block_max, stats_entries * sizeof(float)));
+    CHECK(cudaMalloc(&d_block_sum, stats_entries * sizeof(float)));
+    CHECK(cudaMalloc(&d_global_max,
+                     static_cast<uint64_t>(layers) * tokens * heads *
+                         sizeof(float)));
+    CHECK(cudaMalloc(&d_global_sum,
+                     static_cast<uint64_t>(layers) * tokens * heads *
+                         sizeof(float)));
+    uint32_t max_tile_prototypes = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        for (uint32_t first = 0; first < blocks; first += tile_blocks) {
+            const uint32_t count = std::min(tile_blocks, blocks - first);
+            uint32_t p = 0;
+            for (uint32_t b = 0; b < count; ++b) {
+                p += static_cast<uint32_t>(counts[l * blocks + first + b]);
+            }
+            max_tile_prototypes = std::max(max_tile_prototypes, p);
+        }
+    }
+    CHECK(cudaMalloc(
+        &d_logits,
+        static_cast<uint64_t>(gqa) * max_tile_prototypes * tokens *
+            sizeof(float)));
+    CHECK(cudaMemcpy(d_prototype_f32, prototype_f32.data(),
+                     prototype_elems * sizeof(float),
+                     cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_query_f32, query_f32.data(),
+                     query_elems * sizeof(float), cudaMemcpyHostToDevice));
+    constexpr uint32_t threads = 256;
+    quantize_kbar<<<
+        static_cast<uint32_t>((prototype_elems + threads - 1) / threads),
+        threads>>>(d_prototype_f32, d_prototypes, prototype_elems);
+    quantize_kbar<<<
+        static_cast<uint32_t>((query_elems + threads - 1) / threads),
+        threads>>>(d_query_f32, d_query, query_elems);
+    CHECK(cudaGetLastError());
+
+    auto install_meta = [&](uint32_t l, uint32_t first, uint32_t count,
+                            uint32_t prototype_begin) {
+        std::vector<int32_t> local_offsets(count);
+        std::vector<int32_t> local_counts(count);
+        for (uint32_t b = 0; b < count; ++b) {
+            local_offsets[b] = offsets[l * blocks + first + b] -
+                static_cast<int32_t>(prototype_begin);
+            local_counts[b] = counts[l * blocks + first + b];
+        }
+        CHECK(cudaMemcpy(d_offsets, local_offsets.data(),
+                         count * sizeof(int32_t), cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(d_counts, local_counts.data(),
+                         count * sizeof(int32_t), cudaMemcpyHostToDevice));
+    };
+    auto tile_shape = [&](uint32_t l, uint32_t first, uint32_t count,
+                          uint32_t &prototype_begin,
+                          uint32_t &prototype_count) {
+        prototype_begin =
+            static_cast<uint32_t>(offsets[l * blocks + first]);
+        const uint32_t last = l * blocks + first + count - 1;
+        const uint32_t prototype_end =
+            static_cast<uint32_t>(offsets[last] + counts[last]);
+        prototype_count = prototype_end - prototype_begin;
+    };
+
+    CHECK(cudaMemset(d_scalar, 0, blocks * sizeof(float)));
+    for (uint32_t l = 0; l < layers; ++l) {
+        for (uint32_t first = 0; first < blocks; first += tile_blocks) {
+            const uint32_t count = std::min(tile_blocks, blocks - first);
+            uint32_t prototype_begin = 0;
+            uint32_t prototype_count = 0;
+            tile_shape(l, first, count, prototype_begin, prototype_count);
+            install_meta(l, first, count, prototype_begin);
+            const __half *tile = d_prototypes +
+                static_cast<uint64_t>(prototype_begin) * kv_heads * dim;
+            if (!qw3::ported::
+                    launch_block_attn_stream_adaptive_block_stats_typed(
+                        d_block_max, d_block_sum, d_query,
+                        /*query_is_fp16=*/true, tile,
+                        qw3::ported::KbarDType::F16,
+                        d_offsets, d_counts, l, layers, tokens, q_stride,
+                        prototype_count, count, first, blocks, heads,
+                        kv_heads, dim, scale, /*stream=*/0)) {
+                std::fprintf(stderr, "adaptive scalar parity setup failed\n");
+                std::exit(1);
+            }
+        }
+        if (!qw3::ported::launch_block_attn_stream_adaptive_finalize(
+                d_scalar, d_block_max, d_block_sum,
+                d_global_max, d_global_sum, l, layers, tokens,
+                blocks, blocks, 0, heads, /*stream=*/0)) {
+            std::fprintf(stderr, "adaptive scalar parity finalize failed\n");
+            std::exit(1);
+        }
+    }
+
+    cublasHandle_t handle = nullptr;
+    if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "adaptive GEMM parity cublasCreate failed\n");
+        std::exit(1);
+    }
+    CHECK(cudaMemset(d_gemm, 0, blocks * sizeof(float)));
+    const float alpha = scale;
+    const float beta = 0.0f;
+    for (uint32_t l = 0; l < layers; ++l) {
+        for (uint32_t first = 0; first < blocks; first += tile_blocks) {
+            const uint32_t count = std::min(tile_blocks, blocks - first);
+            uint32_t prototype_begin = 0;
+            uint32_t prototype_count = 0;
+            tile_shape(l, first, count, prototype_begin, prototype_count);
+            install_meta(l, first, count, prototype_begin);
+            const __half *tile = d_prototypes +
+                static_cast<uint64_t>(prototype_begin) * kv_heads * dim;
+            const __half *q_layer = d_query +
+                static_cast<uint64_t>(l) * q_stride * heads * dim;
+            const uint64_t logits_per_head =
+                static_cast<uint64_t>(prototype_count) * tokens;
+            for (uint32_t kvh = 0; kvh < kv_heads; ++kvh) {
+                const cublasStatus_t status = cublasGemmStridedBatchedEx(
+                    handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    static_cast<int>(prototype_count),
+                    static_cast<int>(tokens), static_cast<int>(dim),
+                    &alpha, tile + kvh * dim, CUDA_R_16F,
+                    static_cast<int>(kv_heads * dim), 0,
+                    q_layer + kvh * gqa * dim, CUDA_R_16F,
+                    static_cast<int>(heads * dim),
+                    static_cast<long long>(dim),
+                    &beta, d_logits, CUDA_R_32F,
+                    static_cast<int>(prototype_count),
+                    static_cast<long long>(logits_per_head),
+                    static_cast<int>(gqa), CUBLAS_COMPUTE_32F_FAST_16F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (status != CUBLAS_STATUS_SUCCESS ||
+                    !qw3::ported::
+                        launch_block_attn_stream_adaptive_gemm_reduce(
+                            d_block_max, d_block_sum, d_logits,
+                            d_offsets, d_counts, tokens, prototype_count,
+                            count, first, blocks, heads, kvh * gqa, gqa,
+                            /*stream=*/0)) {
+                    std::fprintf(stderr,
+                                 "adaptive GEMM parity tile failed status=%d\n",
+                                 static_cast<int>(status));
+                    std::exit(1);
+                }
+            }
+        }
+        if (!qw3::ported::launch_block_attn_stream_adaptive_finalize(
+                d_gemm, d_block_max, d_block_sum,
+                d_global_max, d_global_sum, l, layers, tokens,
+                blocks, blocks, 0, heads, /*stream=*/0)) {
+            std::fprintf(stderr, "adaptive GEMM parity finalize failed\n");
+            std::exit(1);
+        }
+    }
+    CHECK(cudaDeviceSynchronize());
+    std::vector<float> scalar(blocks);
+    std::vector<float> gemm(blocks);
+    CHECK(cudaMemcpy(scalar.data(), d_scalar, blocks * sizeof(float),
+                     cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(gemm.data(), d_gemm, blocks * sizeof(float),
+                     cudaMemcpyDeviceToHost));
+    compare("adaptive-tensor-gemm-vs-scalar", gemm, scalar,
+            2e-5, 2e-3);
+
+    cublasDestroy(handle);
+    CHECK(cudaFree(d_logits));
+    CHECK(cudaFree(d_global_sum));
+    CHECK(cudaFree(d_global_max));
+    CHECK(cudaFree(d_block_sum));
+    CHECK(cudaFree(d_block_max));
+    CHECK(cudaFree(d_gemm));
+    CHECK(cudaFree(d_scalar));
+    CHECK(cudaFree(d_counts));
+    CHECK(cudaFree(d_offsets));
+    CHECK(cudaFree(d_query));
+    CHECK(cudaFree(d_prototypes));
+    CHECK(cudaFree(d_query_f32));
+    CHECK(cudaFree(d_prototype_f32));
 }
 
 static void run_adaptive_capture_test() {
@@ -1859,6 +2396,8 @@ int main(int argc, char **argv) {
     run_streamed_index_test(/*reduce_max=*/true);
     run_adaptive_capture_test();
     run_adaptive_scorer_test();
+    run_adaptive_tiled_type_matrix_test();
+    run_adaptive_gemm_parity_test();
     unsetenv("QW3_KVMEM_SOFTMAX_PAGES_FORCE_TILED");
     unsetenv("QW3_KVMEM_SOFTMAX_PAGES_SCALABLE");
     std::printf("[kvmem-softmax-pages] PASS\n");

@@ -109,6 +109,7 @@ add_library(qw3_core
     src/qwen_weights.cpp
     src/qwen_config.cpp
     src/kvmem_store.cpp
+    src/kvmem_archive.cpp
     src/tool_call_stream.cpp
     src/tokenizer.cpp
 )
@@ -123,6 +124,15 @@ target_include_directories(qw3_core PRIVATE
 target_compile_options(qw3_core PRIVATE
     -Wall -Wextra -Wpedantic
 )
+
+# Archive manifests identify the complete GGUF by SHA-256. OpenSSL's optimized
+# implementation makes the first uncached multi-GiB scan much faster; the
+# source retains a portable implementation for minimal deployments.
+find_package(OpenSSL QUIET COMPONENTS Crypto)
+if(OpenSSL_FOUND)
+    target_compile_definitions(qw3_core PRIVATE QW3_HAVE_OPENSSL=1)
+    target_link_libraries(qw3_core PUBLIC OpenSSL::Crypto)
+endif()
 
 if(QW3_ENABLE_CUDA)
     target_compile_definitions(qw3_core PRIVATE QW3_ENABLE_CUDA=1)
@@ -254,6 +264,10 @@ if(QW3_BUILD_TESTS)
     add_executable(qw3-nvme-kv-tier tests/nvme_kv_tier_test.cpp)
     target_link_libraries(qw3-nvme-kv-tier PRIVATE qw3_core)
     add_test(NAME qw3-nvme-kv-tier COMMAND qw3-nvme-kv-tier)
+
+    add_executable(qw3-kvmem-archive tests/kvmem_archive_test.cpp)
+    target_link_libraries(qw3-kvmem-archive PRIVATE qw3_core)
+    add_test(NAME qw3-kvmem-archive COMMAND qw3-kvmem-archive)
 
     if(QW3_ENABLE_CUDA)
         add_executable(qw3-mmq-parity tests/mmq_parity.cu)

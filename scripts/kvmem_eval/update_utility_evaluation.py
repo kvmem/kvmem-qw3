@@ -151,6 +151,8 @@ def fingerprint(ids: list[str]) -> str:
 
 def infer_dataset(*values: Any) -> str:
     text = " ".join(str(v).lower() for v in values if v)
+    if "memoryagentbench" in text:
+        return "MemoryAgentBench"
     if "agent" in text or "alfworld" in text or "agentlongbench" in text:
         return "AgentLongBench"
     if "longmemeval_m" in text or "longmemeval-m" in text or re.search(r"(^|[/_])m(?:10|102|_)", text):
@@ -506,6 +508,8 @@ def set_status(row: dict[str, Any]) -> None:
         status = "full"
     elif dataset == "AgentLongBench" and n in (100, 250):
         status = "full"
+    elif dataset == "MemoryAgentBench" and n == 3671:
+        status = "full"
     else:
         status = "subset"
     if not row.get("judged"):
@@ -828,6 +832,143 @@ def parse_longmem_baseline(path: Path, root: Path) -> dict[str, Any]:
     return row
 
 
+def memoryagentbench_ids(root: Path) -> list[str]:
+    ids: list[str] = []
+    for path in sorted((root / "rows").glob("*/results.jsonl")):
+        for record in load_jsonl(path):
+            ids.append(
+                f"{record['split']}|{int(record['dataset_row'])}|"
+                f"{int(record['question_index'])}"
+            )
+    return ids
+
+
+def parse_memoryagentbench_run(
+    root: Path, run_id: str, method: str, config_path: Path | None,
+    comparison_path: Path | None,
+) -> dict[str, Any]:
+    final_path = root / "final_summary.json"
+    final = load_json(final_path)
+    ids = memoryagentbench_ids(root)
+    row = new_row(run_id, "MemoryAgentBench")
+    row["date"] = iso_date(run_id, final_path.stat().st_mtime_ns)
+    row["kind"] = "generation" if method == "KVMem" else "baseline"
+    row["metric"] = "official mixed metrics; macro-category mean"
+    row["sample_count"] = len(ids)
+    row["evaluated_count"] = len(ids)
+    row["accuracy_denominator"] = len(ids)
+    row["sample_ids"] = ids
+    row["sample_id_sha256_12"] = fingerprint(ids)
+    row["sample_source"] = (
+        "/home/chaidi/kvmem_eval/KVMem_Motivation/data/raw/"
+        "MemoryAgentBench/data"
+    )
+    score = normal_accuracy(final.get("overall_macro_category_mean"))
+    row["accuracy"] = score
+    row["correct"] = None
+    final_questions = int(final.get("questions") or 0)
+    row["judged"] = (
+        score is not None
+        and final_questions == len(ids)
+        and len(ids) in (1316, 2355, 3671)
+    )
+    row["judge"] = final.get("judge_model_for_special_metrics")
+    row["params"]["retrieval_method"] = method
+    row["param_sources"]["retrieval_method"] = "experiment method"
+    row["artifacts"]["summary"] = str(final_path.resolve())
+    for name, path in (
+        ("official_local", root / "official_local_summary.json"),
+        ("special_judge", root / "special_judge_summary.json"),
+        ("special_results", root / "special_judgments.jsonl"),
+    ):
+        if path.exists():
+            row["artifacts"][name] = str(path.resolve())
+    if comparison_path is not None and comparison_path.exists():
+        row["artifacts"]["comparison"] = str(comparison_path.resolve())
+    if config_path is not None and config_path.exists():
+        config = load_json(config_path)
+        row["artifacts"]["run_config"] = str(config_path.resolve())
+        server = config.get("server_required") or {}
+        sampling = config.get("final_sampling") or {}
+        params = {
+            "model": config.get("model"),
+            "context_window": server.get("context_tokens"),
+            "kv_dtype": server.get("kv_dtype"),
+            "prefill_chunk": server.get("prefill_chunk_tokens"),
+            "mtp_chain": server.get("mtp_chain"),
+            "temperature": sampling.get("temperature"),
+            "top_p": sampling.get("top_p"),
+            "enable_thinking": sampling.get("thinking"),
+        }
+        merge_params(row, params, "run_config")
+    elif method == "KVMem":
+        # The archive runner predates the generic run_config convention. These
+        # values are the frozen parameters recorded in every row command and in
+        # docs/kvmem_memoryagentbench_archive_evaluation.md.
+        merge_params(row, {
+            "model": "Qwen3.6-27B-Q8_0",
+            "context_window": 374784,
+            "kvmem_budget": 204800,
+            "kvmem_gen_budget": 32768,
+            "kvmem_block_tokens": 512,
+            "retrieval_method": "key-direction-adaptive",
+            "kv_dtype": "fp8",
+            "prefill_chunk": 2048,
+            "opt_stage_out": "on",
+            "opt_stage_in": "on",
+            "opt_pack": "on",
+            "query_replay": True,
+            "immutable_kv": True,
+            "mtp_chain": 4,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "enable_thinking": False,
+        }, "frozen MemoryAgentBench archive config")
+    set_status(row)
+    return row
+
+
+def parse_memoryagentbench_over256k_view(
+    root: Path, comparison_path: Path,
+) -> dict[str, Any]:
+    """Register the long-context KVMem cohort derived from its full run."""
+    row = parse_memoryagentbench_run(
+        root,
+        "memoryagentbench_kvmem_archive_20260802_over256k",
+        "KVMem",
+        None,
+        comparison_path,
+    )
+    report = load_json(comparison_path)
+    values = (report.get("methods") or {}).get("KVMem") or {}
+    selected_ids: list[str] = []
+    for path in sorted((root / "rows").glob("*/results.jsonl")):
+        for record in load_jsonl(path):
+            if int(record.get("archive_tokens", -1)) > 262144:
+                selected_ids.append(
+                    f"{record['split']}|{int(record['dataset_row'])}|"
+                    f"{int(record['question_index'])}"
+                )
+    row["kind"] = "derived"
+    row["sample_count"] = len(selected_ids)
+    row["evaluated_count"] = len(selected_ids)
+    row["accuracy_denominator"] = len(selected_ids)
+    row["sample_ids"] = selected_ids
+    row["sample_id_sha256_12"] = fingerprint(selected_ids)
+    row["accuracy"] = normal_accuracy(values.get("overall_macro_category_mean"))
+    row["judged"] = (
+        row["accuracy"] is not None
+        and len(selected_ids) == 1316
+        and int(values.get("questions", -1)) == 1316
+    )
+    row["notes"] = [
+        "从同一146-context KVMem生成结果中按canonical archive_tokens>262144"
+        "筛出的30-context/1,316-question对比cohort；不是重新生成。"
+    ]
+    set_status(row)
+    return row
+
+
 def collect(
     results_root: Path,
     agent_baseline_root: Path | None,
@@ -891,6 +1032,59 @@ def collect(
         for path in sorted(longmem_baseline_root.rglob("*_dsv4pro_eval.jsonl")):
             rows.append(parse_longmem_baseline(path, longmem_baseline_root))
             longmem_baseline_count += 1
+    memoryagentbench_count = 0
+    kvmem_mab = results_root / "memoryagentbench_kvmem_archive_20260802_full"
+    baseline_mab = results_root / "memoryagentbench_plain_baselines_20260802"
+    comparison_full = baseline_mab / "comparison_full.json"
+    comparison_over = baseline_mab / "comparison_over256k.json"
+    comparison = comparison_full if comparison_full.exists() else comparison_over
+    if (kvmem_mab / "final_summary.json").exists():
+        rows.append(parse_memoryagentbench_run(
+            kvmem_mab,
+            "memoryagentbench_kvmem_archive_20260802_full",
+            "KVMem",
+            None,
+            comparison,
+        ))
+        memoryagentbench_count += 1
+        if comparison_over.exists():
+            rows.append(parse_memoryagentbench_over256k_view(
+                kvmem_mab, comparison_over,
+            ))
+            memoryagentbench_count += 1
+    for directory, run_stem, label in (
+        ("compact-only", "memoryagentbench_compact_only_20260802", "compact-only"),
+        ("compact-rag", "memoryagentbench_compact_rag_20260802", "compact+RAG"),
+        ("sliding-window", "memoryagentbench_window32k_20260802", "window-32K"),
+    ):
+        root = baseline_mab / "methods" / directory
+        if not (root / "final_summary.json").exists():
+            continue
+        question_count = len(memoryagentbench_ids(root))
+        if question_count == 3671:
+            phase = "full"
+            config_path = root / "run_config_under256k.json"
+            comparison_path = comparison_full
+        elif question_count == 1316:
+            phase = "over256k"
+            config_path = root / "run_config_over256k.json"
+            comparison_path = comparison_over
+        elif question_count == 2355:
+            phase = "under256k"
+            config_path = root / "run_config_under256k.json"
+            comparison_path = baseline_mab / "comparison_under256k.json"
+        else:
+            phase = f"partial{question_count}"
+            config_path = root / "run_config.json"
+            comparison_path = None
+        rows.append(parse_memoryagentbench_run(
+            root,
+            f"{run_stem}_{phase}",
+            label,
+            config_path,
+            comparison_path,
+        ))
+        memoryagentbench_count += 1
     # The canonical LongMemEval-M source contains very large histories.  Avoid
     # loading it merely to classify legacy tags: full S/M result artifacts
     # already give us the canonical question-ID sets at negligible cost.
@@ -923,6 +1117,7 @@ def collect(
         "standalone_accuracy_jsonl": orphan_count,
         "external_agent_baselines": agent_baseline_count,
         "external_longmemeval_baselines": longmem_baseline_count,
+        "memoryagentbench_runs": memoryagentbench_count,
         "total_registry_rows": len(rows),
     }
     return rows, counts
@@ -1002,7 +1197,10 @@ def result_text(row: dict[str, Any]) -> str:
         correct = row.get("correct")
         accuracy = row.get("accuracy")
         denominator = row.get("accuracy_denominator") or n
-        result = f"{correct}/{denominator} = {accuracy * 100:.2f}%"
+        if correct is None:
+            result = f"macro-category mean = {accuracy * 100:.2f}%"
+        else:
+            result = f"{correct}/{denominator} = {accuracy * 100:.2f}%"
         if denominator != n:
             result += f"（cohort={n}）"
         official = row.get("official_score")
@@ -1030,6 +1228,10 @@ def artifact_links(row: dict[str, Any]) -> str:
         "validation": "校验",
         "manifest": "manifest",
         "server_log": "日志",
+        "official_local": "官方本地评分",
+        "special_judge": "LLM judge汇总",
+        "special_results": "LLM judge逐题",
+        "comparison": "跨方法对比",
     }
     links = []
     for key, label in labels.items():
@@ -1090,7 +1292,10 @@ def render_markdown(
             headlines.append(matches[-1])
         else:
             missing_headlines.append(run_id)
-    datasets = ("LongMemEval-S", "LongMemEval-M", "AgentLongBench", "Other/unknown")
+    datasets = (
+        "LongMemEval-S", "LongMemEval-M", "AgentLongBench",
+        "MemoryAgentBench", "Other/unknown",
+    )
     known_dates = [row["date"] for row in rows if row["date"] != "unknown"]
     cutoff = max(known_dates) if known_dates else "unknown"
     lines = [
@@ -1139,7 +1344,8 @@ def render_markdown(
             f"{counts['special_nested_runs']} 个专项控制实验、"
             f"{counts['standalone_accuracy_jsonl']} 个没有 summary 的独立准确性 JSONL、"
             f"{counts['external_agent_baselines']} 个 AgentLongBench 原仓库基线、"
-            f"{counts['external_longmemeval_baselines']} 个 LongMemEval 原仓库基线。",
+            f"{counts['external_longmemeval_baselines']} 个 LongMemEval 原仓库基线、"
+            f"{counts['memoryagentbench_runs']} 个 MemoryAgentBench 登记结果。",
         )
     )
     for dataset in datasets:

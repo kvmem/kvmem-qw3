@@ -203,6 +203,24 @@ static void test_default_profile_reuses_moved_resident_k() {
     CHECK(s.blocks()[2].remap_count == 1);
 }
 
+static void test_explicit_force_raw_refresh_rebuilds_stable_selection() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.immutable_source_k = true;
+    KvMemStore s(cfg);
+    s.register_append(32 * 4);
+
+    (void)s.set_selection({0, 2});
+    const auto plan = s.set_selection({0, 2}, /*force_raw_refresh=*/true);
+    CHECK(plan.remaps.size() == 2);
+    CHECK(plan.stage_in.empty());
+    for (const KvMemRemap &rm : plan.remaps) {
+        CHECK(rm.working_k_resident);
+        CHECK(rm.raw_refresh);
+        CHECK(!rm.skip);
+    }
+}
+
 static void test_stage_in_uses_tier_residency() {
     KvMemStoreConfig cfg; cfg.block_tokens = 128;
     KvMemStore s(cfg);
@@ -876,6 +894,7 @@ int main() {
     test_immutable_source_selection_uses_bounded_delta_remaps();
     test_cold_immutable_same_position_rebuilds_k();
     test_default_profile_reuses_moved_resident_k();
+    test_explicit_force_raw_refresh_rebuilds_stable_selection();
     test_stage_in_uses_tier_residency();
     test_stage_in_ablation_forces_full_reload();
     test_topk_budget_sink_recent();

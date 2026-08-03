@@ -150,11 +150,10 @@ def main() -> int:
         prompts.append(preamble + f"Question {i}: Summarize the above in one line.\nAnswer:")
 
     # ---- Check 1: eviction under a tiny KV pool --------------------------
-    # The server hardcodes the prefix-cache page budget to unlimited, so we
-    # force reclamation through the REAL pool-exhaustion path: a tiny global KV
-    # pool (--kv-pool-pages). Flooding distinct long prompts fills the pool;
-    # allocate_physical_page must then evict LRU refcount==0 cache entries to
-    # make room. This is exactly the path the shared-page eviction bug lived in.
+    # Force reclamation through the real pool-exhaustion path using a tiny
+    # global KV pool (--kv-pool-pages).  This remains a distinct test from the
+    # proactive QW3_PREFIX_CACHE_MAX_PAGES budget: allocate_physical_page itself
+    # must be able to evict LRU refcount==0 cache entries and make room.
     evic_log = os.path.join(args.logdir, "evict.log")
     proc = start_server(args.binary, args.model, args.port,
                         {"QW3_PREFIX_CACHE_TRACE": "1"},
