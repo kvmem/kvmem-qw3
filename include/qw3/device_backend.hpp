@@ -1724,6 +1724,51 @@ public:
             "block_attn_stream_adaptive_block_stats_gemm_device requires backend override"};
     }
 
+    // Repack the naturally captured [row, head, dim] Adaptive tensors into
+    // head-major matrices.  This makes the GEMM K dimension and successive
+    // columns contiguous instead of gathering one small head slice from every
+    // wide interleaved row.
+    virtual DeviceStatus adaptive_pack_query_head_major_device(
+        DeviceTensor &dst, const DeviceTensor &src,
+        uint32_t layer, uint32_t n_tokens, uint32_t q_layer_stride,
+        uint32_t n_heads, uint32_t head_dim) {
+        (void)dst; (void)src; (void)layer; (void)n_tokens;
+        (void)q_layer_stride; (void)n_heads; (void)head_dim;
+        return {false,
+                "adaptive_pack_query_head_major_device requires backend override"};
+    }
+
+    virtual DeviceStatus adaptive_pack_prototypes_head_major_device(
+        DeviceTensor &dst, const DeviceTensor &src,
+        uint32_t prototype_begin, uint32_t prototype_count,
+        uint32_t n_kv_heads, uint32_t head_dim) {
+        (void)dst; (void)src; (void)prototype_begin;
+        (void)prototype_count; (void)n_kv_heads; (void)head_dim;
+        return {false,
+                "adaptive_pack_prototypes_head_major_device requires backend override"};
+    }
+
+    virtual DeviceStatus
+    block_attn_stream_adaptive_block_stats_gemm_head_major_device(
+        DeviceTensor &block_max, DeviceTensor &block_sum,
+        DeviceTensor &logits, const DeviceTensor &query_head_major,
+        const DeviceTensor &prototype_head_major,
+        const DeviceTensor &block_offsets,
+        const DeviceTensor &block_counts,
+        uint32_t n_tokens, uint32_t prototype_count,
+        uint32_t tile_blocks, uint32_t workspace_block_base,
+        uint32_t workspace_block_stride, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale) {
+        (void)block_max; (void)block_sum; (void)logits;
+        (void)query_head_major; (void)prototype_head_major;
+        (void)block_offsets; (void)block_counts; (void)n_tokens;
+        (void)prototype_count; (void)tile_blocks;
+        (void)workspace_block_base; (void)workspace_block_stride;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale;
+        return {false,
+                "adaptive head-major GEMM requires backend override"};
+    }
+
     virtual DeviceStatus block_attn_stream_adaptive_finalize_device(
         DeviceTensor &score,
         const DeviceTensor &block_max,

@@ -7152,6 +7152,52 @@ __global__ void block_attn_stream_adaptive_block_stats_gqa_kernel(
 // column-major order, so each query distribution sees one contiguous row of
 // prototype logits.  Grid-stride traversal caps the CTA count for very long
 // histories while preserving coalesced block-metadata and workspace writes.
+__global__ void adaptive_pack_query_head_major_kernel(
+        __half *dst, const __half *src, uint32_t layer,
+        uint32_t n_tokens, uint32_t q_layer_stride,
+        uint32_t n_heads, uint32_t head_dim) {
+    const uint64_t elems =
+        static_cast<uint64_t>(n_tokens) * n_heads * head_dim;
+    for (uint64_t i =
+             static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < elems;
+         i += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+        const uint32_t d = static_cast<uint32_t>(i % head_dim);
+        const uint64_t row = i / head_dim;
+        const uint32_t h = static_cast<uint32_t>(row % n_heads);
+        const uint32_t t = static_cast<uint32_t>(row / n_heads);
+        const uint64_t src_row =
+            (static_cast<uint64_t>(layer) * q_layer_stride + t) *
+                n_heads + h;
+        const uint64_t dst_row =
+            (static_cast<uint64_t>(h) * n_tokens + t);
+        dst[dst_row * head_dim + d] = src[src_row * head_dim + d];
+    }
+}
+
+__global__ void adaptive_pack_prototypes_head_major_kernel(
+        __half *dst, const __half *src, uint32_t prototype_begin,
+        uint32_t prototype_count, uint32_t n_kv_heads,
+        uint32_t head_dim) {
+    const uint64_t elems =
+        static_cast<uint64_t>(prototype_count) * n_kv_heads * head_dim;
+    for (uint64_t i =
+             static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < elems;
+         i += static_cast<uint64_t>(gridDim.x) * blockDim.x) {
+        const uint32_t d = static_cast<uint32_t>(i % head_dim);
+        const uint64_t row = i / head_dim;
+        const uint32_t h = static_cast<uint32_t>(row % n_kv_heads);
+        const uint32_t p = static_cast<uint32_t>(row / n_kv_heads);
+        const uint64_t src_row =
+            (static_cast<uint64_t>(prototype_begin) + p) *
+                n_kv_heads + h;
+        const uint64_t dst_row =
+            static_cast<uint64_t>(h) * prototype_count + p;
+        dst[dst_row * head_dim + d] = src[src_row * head_dim + d];
+    }
+}
+
 __global__ void block_attn_stream_adaptive_gemm_reduce_kernel(
         float *block_max, float *block_sum, const float *logits,
         const int32_t *block_offsets, const int32_t *block_counts,
@@ -16871,6 +16917,153 @@ public:
         }
         return launch_status(
             "cuda block_attn_stream_adaptive_block_stats_gemm_device");
+    }
+
+    DeviceStatus adaptive_pack_query_head_major_device(
+            DeviceTensor &dst, const DeviceTensor &src,
+            uint32_t layer, uint32_t n_tokens,
+            uint32_t q_layer_stride, uint32_t n_heads,
+            uint32_t head_dim) override {
+        auto &d = as_tensor(dst);
+        const auto &s = as_tensor(src);
+        const uint64_t elems =
+            static_cast<uint64_t>(n_tokens) * n_heads * head_dim;
+        const uint64_t required_src =
+            (static_cast<uint64_t>(layer) * q_layer_stride + n_tokens) *
+            n_heads * head_dim;
+        if (!d.is_fp16() || !s.is_fp16() || d.count < elems ||
+            s.count < required_src || n_tokens == 0 || n_heads == 0 ||
+            head_dim == 0) {
+            return {false, "adaptive query head-major pack invalid shape"};
+        }
+        constexpr uint32_t threads = 256;
+        const uint32_t grid = static_cast<uint32_t>(std::min<uint64_t>(
+            65535, (elems + threads - 1) / threads));
+        adaptive_pack_query_head_major_kernel<<<
+            grid, threads, 0, exec_stream_>>>(
+                reinterpret_cast<__half *>(d.ptr),
+                reinterpret_cast<const __half *>(s.ptr),
+                layer, n_tokens, q_layer_stride, n_heads, head_dim);
+        return launch_status("adaptive query head-major pack");
+    }
+
+    DeviceStatus adaptive_pack_prototypes_head_major_device(
+            DeviceTensor &dst, const DeviceTensor &src,
+            uint32_t prototype_begin, uint32_t prototype_count,
+            uint32_t n_kv_heads, uint32_t head_dim) override {
+        auto &d = as_tensor(dst);
+        const auto &s = as_tensor(src);
+        const uint64_t elems =
+            static_cast<uint64_t>(prototype_count) * n_kv_heads *
+            head_dim;
+        const uint64_t required_src =
+            (static_cast<uint64_t>(prototype_begin) + prototype_count) *
+            n_kv_heads * head_dim;
+        if (!d.is_fp16() || !s.is_fp16() || d.count < elems ||
+            s.count < required_src || prototype_count == 0 ||
+            n_kv_heads == 0 || head_dim == 0) {
+            return {false, "adaptive prototype head-major pack invalid shape"};
+        }
+        constexpr uint32_t threads = 256;
+        const uint32_t grid = static_cast<uint32_t>(std::min<uint64_t>(
+            65535, (elems + threads - 1) / threads));
+        adaptive_pack_prototypes_head_major_kernel<<<
+            grid, threads, 0, exec_stream_>>>(
+                reinterpret_cast<__half *>(d.ptr),
+                reinterpret_cast<const __half *>(s.ptr),
+                prototype_begin, prototype_count, n_kv_heads, head_dim);
+        return launch_status("adaptive prototype head-major pack");
+    }
+
+    DeviceStatus
+    block_attn_stream_adaptive_block_stats_gemm_head_major_device(
+            DeviceTensor &block_max, DeviceTensor &block_sum,
+            DeviceTensor &logits,
+            const DeviceTensor &query_head_major,
+            const DeviceTensor &prototype_head_major,
+            const DeviceTensor &block_offsets,
+            const DeviceTensor &block_counts,
+            uint32_t n_tokens, uint32_t prototype_count,
+            uint32_t tile_blocks, uint32_t workspace_block_base,
+            uint32_t workspace_block_stride, uint32_t n_heads,
+            uint32_t n_kv_heads, uint32_t head_dim,
+            float scale) override {
+        if (prototype_count == 0 || tile_blocks == 0 || n_tokens == 0 ||
+            n_heads == 0 || n_kv_heads == 0 ||
+            n_heads % n_kv_heads != 0 || head_dim == 0) {
+            return {false, "adaptive head-major GEMM invalid dimensions"};
+        }
+        auto &bm = as_tensor(block_max);
+        auto &bs = as_tensor(block_sum);
+        auto &lg = as_tensor(logits);
+        const auto &qm = as_tensor(query_head_major);
+        const auto &pt = as_tensor(prototype_head_major);
+        const auto &bo = as_tensor(block_offsets);
+        const auto &bc = as_tensor(block_counts);
+        const uint32_t gqa_group = n_heads / n_kv_heads;
+        const uint64_t workspace_entries =
+            static_cast<uint64_t>(n_tokens) * n_heads *
+            workspace_block_stride;
+        const uint64_t logits_per_head =
+            static_cast<uint64_t>(prototype_count) * n_tokens;
+        const uint64_t required_logits = logits_per_head * gqa_group;
+        if (!qm.is_fp16() || !pt.is_fp16() ||
+            bm.elem_size != sizeof(float) ||
+            bs.elem_size != sizeof(float) ||
+            lg.elem_size != sizeof(float) ||
+            bm.count < workspace_entries || bs.count < workspace_entries ||
+            lg.count < required_logits ||
+            qm.count < static_cast<uint64_t>(n_heads) * n_tokens * head_dim ||
+            pt.count < static_cast<uint64_t>(n_kv_heads) *
+                           prototype_count * head_dim ||
+            bo.elem_size != sizeof(int32_t) ||
+            bc.elem_size != sizeof(int32_t) ||
+            bo.count < tile_blocks || bc.count < tile_blocks ||
+            workspace_block_base > workspace_block_stride ||
+            tile_blocks > workspace_block_stride - workspace_block_base ||
+            !cublas_handle_) {
+            return {false, "adaptive head-major GEMM invalid tensor shape"};
+        }
+
+        const float alpha = scale;
+        const float beta = 0.0f;
+        const auto *prototype =
+            reinterpret_cast<const __half *>(pt.ptr);
+        const auto *query = reinterpret_cast<const __half *>(qm.ptr);
+        for (uint32_t kvh = 0; kvh < n_kv_heads; ++kvh) {
+            const __half *a = prototype +
+                static_cast<uint64_t>(kvh) * prototype_count * head_dim;
+            const __half *b = query +
+                static_cast<uint64_t>(kvh) * gqa_group * n_tokens *
+                    head_dim;
+            if (auto st = cublas_status(
+                    cublasGemmStridedBatchedEx(
+                        cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+                        static_cast<int>(prototype_count),
+                        static_cast<int>(n_tokens),
+                        static_cast<int>(head_dim), &alpha,
+                        a, CUDA_R_16F, static_cast<int>(head_dim), 0,
+                        b, CUDA_R_16F, static_cast<int>(head_dim),
+                        static_cast<long long>(n_tokens) * head_dim,
+                        &beta, lg.ptr, CUDA_R_32F,
+                        static_cast<int>(prototype_count),
+                        static_cast<long long>(logits_per_head),
+                        static_cast<int>(gqa_group),
+                        CUBLAS_COMPUTE_32F_FAST_16F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "cublas adaptive head-major GEMM"); !st.ok) {
+                return st;
+            }
+            if (!ported::launch_block_attn_stream_adaptive_gemm_reduce(
+                    bm.ptr, bs.ptr, lg.ptr, bo.ptr_i32(), bc.ptr_i32(),
+                    n_tokens, prototype_count, tile_blocks,
+                    workspace_block_base, workspace_block_stride,
+                    n_heads, kvh * gqa_group, gqa_group, exec_stream_)) {
+                return {false,
+                        "adaptive head-major GEMM reduce launch failed"};
+            }
+        }
+        return launch_status("cuda adaptive head-major GEMM");
     }
 
     DeviceStatus block_attn_stream_adaptive_finalize_device(

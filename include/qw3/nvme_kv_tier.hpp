@@ -68,6 +68,12 @@ struct NvmeKvTierConfig {
     // writes are range-written back and both reads and writes are advised
     // DONTNEED after the user buffer owns the data.
     bool drop_page_cache = false;
+    // Read sealed/direct-mapped archive payloads through a second O_DIRECT
+    // descriptor whenever the caller supplies naturally aligned pinned
+    // staging memory.  Index rebuilds and short/unaligned compatibility reads
+    // continue through the buffered descriptor.  Opening O_DIRECT is best
+    // effort so the same archive remains portable across filesystems.
+    bool direct_read = false;
 };
 
 struct NvmeSlotPlacement {
@@ -120,6 +126,31 @@ public:
             throw std::runtime_error(
                 "failed to open NVMe KV tier file: " + path_ + ": " +
                 std::strerror(errno));
+        }
+        if (cfg_.direct_read && cfg_.durable && cfg_.read_only) {
+#if defined(__linux__) && defined(O_DIRECT)
+            direct_fd_ = ::open(
+                path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+            if (direct_fd_ < 0) {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-io] direct_read_degraded=1 path=%s "
+                    "error=%d message=%s action=buffered-fallback\n",
+                    path_.c_str(), errno, std::strerror(errno));
+            } else {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-io] direct_read=1 path=%s alignment=%llu\n",
+                    path_.c_str(),
+                    static_cast<unsigned long long>(kDirectAlignment));
+            }
+#else
+            std::fprintf(
+                stderr,
+                "[kvmem-io] direct_read_degraded=1 path=%s "
+                "error=unsupported-platform action=buffered-fallback\n",
+                path_.c_str());
+#endif
         }
         if (cfg_.preallocate && !cfg_.read_only && cfg_.total_bytes > 0) {
             if (cfg_.total_bytes > static_cast<uint64_t>(
@@ -193,6 +224,7 @@ public:
     NvmeKvTier &operator=(const NvmeKvTier &) = delete;
 
     ~NvmeKvTier() {
+        if (direct_fd_ >= 0) ::close(direct_fd_);
         if (fd_ >= 0) ::close(fd_);
         if (overlay_fd_ >= 0) ::close(overlay_fd_);
     }
@@ -205,6 +237,7 @@ public:
     bool direct_mapped() const { return cfg_.direct_mapped; }
     bool read_only() const { return cfg_.read_only && overlay_fd_ < 0; }
     bool has_overlay() const { return overlay_fd_ >= 0; }
+    bool direct_reads() const { return direct_fd_ >= 0; }
 
     // Declare block ids [begin,end) resident at their identity slots. Only
     // meaningful for a direct-mapped arena, where an attached archive knows
@@ -360,9 +393,9 @@ public:
         validate_slot_range_io(
             slot, slot_byte_offset, data, bytes, "read");
         const uint64_t offset = slot_offset(slot) + slot_byte_offset;
-        const int fd = read_fd(slot);
+        const int fd = read_fd_for_range(slot, data, bytes, offset);
         pread_all(fd, data, bytes, offset);
-        if (cfg_.drop_page_cache) {
+        if (cfg_.drop_page_cache && fd != direct_fd_) {
             (void) drop_cached_range(fd, offset, bytes, /*write=*/false);
         }
     }
@@ -629,7 +662,12 @@ private:
             if (first.buffer_offset + first.bytes > buffer_bytes) {
                 throw std::runtime_error("NVMe batch span exceeds buffer");
             }
-            const int fd = write ? write_fd() : read_fd(first.slot);
+            const uint64_t first_file_offset = slot_offset(first.slot);
+            const int fd = write
+                ? write_fd()
+                : read_fd_for_range(
+                      first.slot, base + first.buffer_offset,
+                      first.bytes, first_file_offset);
             uint64_t merged_bytes = first.bytes;
             size_t j = i + 1;
             while (j < spans.size()) {
@@ -644,8 +682,12 @@ private:
                 // Adjacent slots can sit in different files once an overlay is
                 // in play, and merging across that boundary would read the
                 // wrong bytes for one of them.
+                const uint64_t next_file_offset = slot_offset(next.slot);
                 const bool same_file =
-                    write || read_fd(next.slot) == fd;
+                    write ||
+                    read_fd_for_range(
+                        next.slot, base + next.buffer_offset,
+                        next.bytes, next_file_offset) == fd;
                 if (!contiguous_file || !contiguous_buffer || !same_file) break;
                 validate_slot_io(next.slot, base + next.buffer_offset,
                                  next.bytes, write ? "write" : "read");
@@ -663,7 +705,7 @@ private:
                 pread_all(fd, base + first.buffer_offset, merged_bytes,
                           slot_offset(first.slot));
             }
-            if (cfg_.drop_page_cache) {
+            if (cfg_.drop_page_cache && fd != direct_fd_) {
                 const uint64_t file_offset = slot_offset(first.slot);
                 const bool dropped =
                     drop_cached_range(fd, file_offset, merged_bytes, write);
@@ -681,6 +723,26 @@ private:
             }
             i = j;
         }
+    }
+
+    bool direct_range_eligible(const void *data, uint64_t bytes,
+                               uint64_t offset) const {
+        if (direct_fd_ < 0 || !data || bytes == 0) return false;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+        return address % kDirectAlignment == 0 &&
+               bytes % kDirectAlignment == 0 &&
+               offset % kDirectAlignment == 0;
+    }
+
+    int read_fd_for_range(int32_t slot, const void *data, uint64_t bytes,
+                          uint64_t offset) const {
+        const int ordinary = read_fd(slot);
+        // Overlay records must always use their own buffered descriptor. The
+        // immutable base can use O_DIRECT only for aligned transfer slabs.
+        if (ordinary == fd_ && direct_range_eligible(data, bytes, offset)) {
+            return direct_fd_;
+        }
+        return ordinary;
     }
 
     bool drop_cached_range(int fd, uint64_t offset, uint64_t bytes,
@@ -764,9 +826,11 @@ private:
     }
 
     NvmeKvTierConfig cfg_;
+    static constexpr uint64_t kDirectAlignment = 4096;
     uint32_t slot_count_ = 0;
     std::string path_;
     int fd_ = -1;
+    int direct_fd_ = -1;
     int overlay_fd_ = -1;
     static constexpr uint8_t kOverlayBase = 0;
     static constexpr uint8_t kOverlayInitializing = 1;

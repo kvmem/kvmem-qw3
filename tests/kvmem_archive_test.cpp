@@ -420,6 +420,64 @@ static void test_direct_mapped_durable_tier() {
     remove_tree(dir);
 }
 
+static void test_direct_read_with_buffered_fallback() {
+    const std::string dir = temp_root() + "/direct-read";
+    remove_tree(dir);
+    if (::mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::printf("FAIL could not create %s\n", dir.c_str());
+        ++g_fail;
+        return;
+    }
+    constexpr uint64_t slot_bytes = 4096;
+    constexpr uint32_t slots = 2;
+    std::vector<uint8_t> expected(slot_bytes, 0);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected[i] = static_cast<uint8_t>((i * 17u + 3u) & 0xffu);
+    }
+    {
+        NvmeKvTierConfig cfg;
+        cfg.dir = dir;
+        cfg.file_name = "base.bin";
+        cfg.slot_bytes = slot_bytes;
+        cfg.total_bytes = slot_bytes * slots;
+        cfg.durable = true;
+        cfg.direct_mapped = true;
+        cfg.preallocate = true;
+        NvmeKvTier tier(cfg);
+        tier.write_block(1, expected.data(), expected.size());
+    }
+    {
+        NvmeKvTierConfig cfg;
+        cfg.dir = dir;
+        cfg.file_name = "base.bin";
+        cfg.slot_bytes = slot_bytes;
+        cfg.total_bytes = slot_bytes * slots;
+        cfg.durable = true;
+        cfg.direct_mapped = true;
+        cfg.read_only = true;
+        cfg.direct_read = true;
+        NvmeKvTier tier(cfg);
+        tier.mark_present_range(0, slots);
+
+        void *aligned_raw = nullptr;
+        CHECK(::posix_memalign(&aligned_raw, 4096, slot_bytes) == 0);
+        if (aligned_raw) {
+            std::memset(aligned_raw, 0, slot_bytes);
+            tier.read_block(1, aligned_raw, slot_bytes);
+            CHECK(std::memcmp(aligned_raw, expected.data(), slot_bytes) == 0);
+            std::free(aligned_raw);
+        }
+
+        // A normal vector is not guaranteed to satisfy O_DIRECT alignment.
+        // The same descriptor must transparently fall back to buffered pread.
+        std::vector<uint8_t> unaligned(slot_bytes + 1, 0);
+        tier.read_block(1, unaligned.data() + 1, slot_bytes);
+        CHECK(std::memcmp(
+                  unaligned.data() + 1, expected.data(), slot_bytes) == 0);
+    }
+    remove_tree(dir);
+}
+
 static void test_read_only_overlay_copy_on_write() {
     const std::string dir = temp_root() + "/overlay";
     remove_tree(dir);
@@ -522,6 +580,7 @@ int main() {
     test_ladder_lookup_for_truncation();
     test_resume_unsealed_build();
     test_direct_mapped_durable_tier();
+    test_direct_read_with_buffered_fallback();
     test_read_only_overlay_copy_on_write();
     if (g_fail == 0) std::printf("qw3-kvmem-archive: all checks passed\n");
     return g_fail == 0 ? 0 : 1;

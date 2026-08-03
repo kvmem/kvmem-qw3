@@ -1647,6 +1647,15 @@ private:
     // GPU placement finalizes a resident packed image; CPU placement streams
     // block-aligned tiles through the bounded slots below.
     std::vector<std::vector<uint8_t>> g_adaptive_layer_values_host_;
+    // Attached archives are immutable except for a small replay suffix. After
+    // rebuilding their Adaptive index, each layer can migrate from a growable
+    // pageable vector to a fixed-capacity pinned authority. Query-time H2D then
+    // reads canonical bytes directly instead of recopying the full index into
+    // a bounce slab. Layers fall back independently if pinned allocation fails.
+    std::vector<std::unique_ptr<HostBuffer>>
+        g_adaptive_layer_values_pinned_;
+    std::vector<uint64_t> g_adaptive_layer_values_pinned_size_;
+    std::vector<uint64_t> g_adaptive_layer_values_pinned_capacity_;
     std::vector<std::vector<int32_t>> g_adaptive_layer_parent_host_;
     std::vector<int32_t> g_adaptive_block_offsets_host_;
     std::vector<int32_t> g_adaptive_block_counts_host_;
@@ -1703,6 +1712,13 @@ private:
     uint64_t g_adaptive_stream_block_stats_capacity_ = 0;
     std::unique_ptr<DeviceTensor> g_adaptive_stream_logits_;
     uint64_t g_adaptive_stream_logits_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> g_adaptive_query_head_major_;
+    uint64_t g_adaptive_query_head_major_capacity_ = 0;
+    // Diagnostic/provisional selection captured after a prefix of Adaptive
+    // layers. Empty in ordinary runs. This lets the storage pipeline measure
+    // whether exact scoring converges early enough to prefetch selected KV
+    // without changing the final scorer or selection.
+    std::vector<uint32_t> g_adaptive_partial_selection_;
 
     // CPU-offloaded mean-K index (--kvmem-index-placement cpu). The canonical
     // full index keeps the same fixed-stride layer-major byte layout as
@@ -1769,6 +1785,10 @@ private:
         uint32_t layer, uint32_t first_prototype);
     void kvmem_drain_adaptive_gpu_uploads();
     void kvmem_finalize_adaptive_index();
+    void kvmem_migrate_adaptive_index_to_pinned();
+    uint64_t kvmem_adaptive_layer_value_bytes(uint32_t layer) const;
+    const uint8_t *kvmem_adaptive_layer_value_data(uint32_t layer) const;
+    uint8_t *kvmem_adaptive_layer_value_data(uint32_t layer);
     bool kvmem_score_adaptive_index(
         uint32_t n_blocks, uint32_t n_tokens,
         uint32_t q_layer_stride, float scale,
