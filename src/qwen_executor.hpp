@@ -1624,6 +1624,9 @@ private:
         g_adaptive_stream_slots_;
     uint64_t g_adaptive_stream_value_bytes_ = 0;
     uint32_t g_adaptive_stream_block_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> g_adaptive_stream_block_max_;
+    std::unique_ptr<DeviceTensor> g_adaptive_stream_block_sum_;
+    uint64_t g_adaptive_stream_block_stats_capacity_ = 0;
 
     // CPU-offloaded mean-K index (--kvmem-index-placement cpu). The canonical
     // full index keeps the same fixed-stride layer-major byte layout as

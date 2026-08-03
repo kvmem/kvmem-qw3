@@ -589,6 +589,24 @@ bool launch_block_attn_stream_adaptive_score_typed(
         uint32_t global_block_base, uint32_t n_heads,
         uint32_t n_kv_heads, uint32_t head_dim, float scale,
         cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_block_stats_typed(
+    float *block_max, float *block_sum,
+    const void *q_multi, bool query_is_fp16,
+    const void *prototype_tile, KbarDType prototype_dtype,
+    const int32_t *block_offsets, const int32_t *block_counts,
+    uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t q_layer_stride, uint32_t prototype_count,
+    uint32_t tile_blocks, uint32_t workspace_block_base,
+    uint32_t workspace_block_stride, uint32_t n_heads,
+    uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_finalize(
+    float *score, const float *block_max, const float *block_sum,
+    float *global_max, float *global_sum,
+    uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t workspace_block_stride, uint32_t block_count,
+    uint32_t global_block_base, uint32_t n_heads,
+    cudaStream_t stream);
 bool launch_block_attn_score_adaptive_layer_typed(
         float *score, const void *q_multi, bool query_is_fp16,
         const void *prototype_layer, KbarDType prototype_dtype,
@@ -7012,6 +7030,201 @@ __global__ void block_attn_stream_adaptive_score_gqa_kernel(
             (static_cast<float>(n_layers) *
              static_cast<float>(n_heads));
     }
+}
+
+// Exact one-dot CPU-offload path. A warp owns one logical block and computes
+// all prototype logits for one (query token, KV head) GQA group. The block's
+// log-sum-exp pair and MaxSim logit are retained in bounded layer-local
+// workspace. Once every block in the layer has been streamed, a separate
+// reduction obtains the exact softmax denominator and finalizes block scores.
+// This preserves the two-pass scorer's math while reading every prototype row
+// and evaluating every q·k dot only once.
+template <typename QueryT, typename KbarT, uint32_t GqaGroup>
+__global__ void block_attn_stream_adaptive_block_stats_gqa_kernel(
+        float *block_max, float *block_sum,
+        const QueryT *q_multi, const KbarT *prototype_tile,
+        const int32_t *block_offsets, const int32_t *block_counts,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t tile_blocks,
+        uint32_t workspace_block_base,
+        uint32_t workspace_block_stride,
+        uint32_t n_heads, uint32_t n_kv_heads,
+        uint32_t head_dim, float scale) {
+    static_assert(GqaGroup >= 1 && GqaGroup <= 6);
+    const uint32_t local_group = blockIdx.x;
+    const uint32_t local_groups = n_tokens * n_kv_heads;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    constexpr uint32_t kWarps = kSoftmaxPagesThreads / 32;
+    if (layer >= n_layers || local_group >= local_groups) return;
+
+    const uint32_t kvh = local_group % n_kv_heads;
+    const uint32_t t = local_group / n_kv_heads;
+    const uint32_t qh0 = kvh * GqaGroup;
+    const uint64_t qrow = static_cast<uint64_t>(n_heads) * head_dim;
+    const QueryT *qr0 =
+        q_multi +
+        (static_cast<uint64_t>(layer) * q_layer_stride + t) * qrow +
+        static_cast<uint64_t>(qh0) * head_dim;
+
+    for (uint32_t local_block = warp; local_block < tile_blocks;
+         local_block += kWarps) {
+        const uint32_t count =
+            static_cast<uint32_t>(max(block_counts[local_block], 0));
+        const uint32_t begin =
+            static_cast<uint32_t>(max(block_offsets[local_block], 0));
+        float stats_max[GqaGroup];
+        float stats_sum[GqaGroup];
+#pragma unroll
+        for (uint32_t g = 0; g < GqaGroup; ++g) {
+            stats_max[g] = -INFINITY;
+            stats_sum[g] = 0.0f;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            const KbarT *kr =
+                prototype_tile +
+                (static_cast<uint64_t>(begin + i) * n_kv_heads + kvh) *
+                    head_dim;
+            float dot[GqaGroup] = {};
+            for (uint32_t d = lane; d < head_dim; d += 32u) {
+                const float k = static_cast<float>(kr[d]);
+#pragma unroll
+                for (uint32_t g = 0; g < GqaGroup; ++g) {
+                    dot[g] +=
+                        static_cast<float>(
+                            qr0[static_cast<uint64_t>(g) * head_dim + d]) *
+                        k;
+                }
+            }
+#pragma unroll
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+#pragma unroll
+                for (uint32_t g = 0; g < GqaGroup; ++g) {
+                    dot[g] += __shfl_down_sync(
+                        0xffffffffu, dot[g], offset);
+                }
+            }
+            if (lane == 0) {
+#pragma unroll
+                for (uint32_t g = 0; g < GqaGroup; ++g) {
+                    const float value = dot[g] * scale;
+                    const float merged_max =
+                        fmaxf(stats_max[g], value);
+                    stats_sum[g] =
+                        (isfinite(stats_max[g])
+                             ? stats_sum[g] *
+                                   __expf(stats_max[g] - merged_max)
+                             : 0.0f) +
+                        __expf(value - merged_max);
+                    stats_max[g] = merged_max;
+                }
+            }
+        }
+        if (lane == 0) {
+            const uint32_t workspace_block =
+                workspace_block_base + local_block;
+#pragma unroll
+            for (uint32_t g = 0; g < GqaGroup; ++g) {
+                const uint32_t dist = t * n_heads + qh0 + g;
+                const uint64_t out =
+                    static_cast<uint64_t>(dist) *
+                        workspace_block_stride +
+                    workspace_block;
+                block_max[out] = stats_max[g];
+                block_sum[out] = stats_sum[g];
+            }
+        }
+    }
+}
+
+__global__ void block_attn_stream_adaptive_reduce_block_lse_kernel(
+        float *global_max, float *global_sum,
+        const float *block_max, const float *block_sum,
+        uint32_t layer, uint32_t local_distributions,
+        uint32_t workspace_block_stride, uint32_t block_count) {
+    const uint32_t dist = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (dist >= local_distributions) return;
+
+    float local_max = -INFINITY;
+    float local_sum = 0.0f;
+    const uint64_t row =
+        static_cast<uint64_t>(dist) * workspace_block_stride;
+    for (uint32_t b = tid; b < block_count; b += blockDim.x) {
+        const float value_max = block_max[row + b];
+        const float value_sum = block_sum[row + b];
+        const float merged_max = fmaxf(local_max, value_max);
+        float merged_sum = 0.0f;
+        if (isfinite(local_max)) {
+            merged_sum +=
+                local_sum * __expf(local_max - merged_max);
+        }
+        if (isfinite(value_max)) {
+            merged_sum +=
+                value_sum * __expf(value_max - merged_max);
+        }
+        local_max = merged_max;
+        local_sum = merged_sum;
+    }
+
+    __shared__ float reduce_max[kSoftmaxPagesThreads];
+    __shared__ float reduce_sum[kSoftmaxPagesThreads];
+    reduce_max[tid] = local_max;
+    reduce_sum[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1u) {
+        if (tid < s) {
+            const float a_max = reduce_max[tid];
+            const float b_max = reduce_max[tid + s];
+            const float merged_max = fmaxf(a_max, b_max);
+            float merged_sum = 0.0f;
+            if (isfinite(a_max)) {
+                merged_sum +=
+                    reduce_sum[tid] * __expf(a_max - merged_max);
+            }
+            if (isfinite(b_max)) {
+                merged_sum +=
+                    reduce_sum[tid + s] * __expf(b_max - merged_max);
+            }
+            reduce_max[tid] = merged_max;
+            reduce_sum[tid] = merged_sum;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const uint64_t out =
+            static_cast<uint64_t>(layer) * local_distributions + dist;
+        global_max[out] = reduce_max[0];
+        global_sum[out] = reduce_sum[0];
+    }
+}
+
+__global__ void block_attn_stream_adaptive_finalize_block_stats_kernel(
+        float *score, const float *block_max,
+        const float *global_max, const float *global_sum,
+        uint32_t layer, uint32_t n_layers,
+        uint32_t local_distributions,
+        uint32_t workspace_block_stride, uint32_t block_count,
+        uint32_t global_block_base, uint32_t n_heads) {
+    const uint32_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= block_count) return;
+    const uint64_t global_dist_base =
+        static_cast<uint64_t>(layer) * local_distributions;
+    float accum = 0.0f;
+    for (uint32_t dist = 0; dist < local_distributions; ++dist) {
+        const float denom = global_sum[global_dist_base + dist];
+        const float value =
+            block_max[
+                static_cast<uint64_t>(dist) * workspace_block_stride + b];
+        if (denom > 0.0f && isfinite(value)) {
+            accum += __expf(
+                         value - global_max[global_dist_base + dist]) /
+                     denom;
+        }
+    }
+    score[global_block_base + b] +=
+        accum /
+        (static_cast<float>(n_layers) * static_cast<float>(n_heads));
 }
 
 template <typename QueryT, typename KbarT>
@@ -16389,6 +16602,141 @@ public:
             "cuda block_attn_stream_adaptive_score_device");
     }
 
+    DeviceStatus block_attn_stream_adaptive_block_stats_device(
+            DeviceTensor &block_max,
+            DeviceTensor &block_sum,
+            const DeviceTensor &q_multi,
+            const DeviceTensor &prototype_tile,
+            const DeviceTensor &block_offsets,
+            const DeviceTensor &block_counts,
+            uint32_t layer,
+            uint32_t n_layers,
+            uint32_t n_tokens,
+            uint32_t q_layer_stride,
+            uint32_t prototype_count,
+            uint32_t tile_blocks,
+            uint32_t workspace_block_base,
+            uint32_t workspace_block_stride,
+            uint32_t n_heads,
+            uint32_t n_kv_heads,
+            uint32_t head_dim,
+            float scale) override {
+        if (prototype_count == 0 || tile_blocks == 0 || n_tokens == 0) {
+            return {};
+        }
+        if (n_layers == 0 || n_heads == 0 || n_kv_heads == 0 ||
+            head_dim == 0) {
+            return {
+                false,
+                "block_attn_stream_adaptive_block_stats invalid dimensions"};
+        }
+        auto &bm = as_tensor(block_max);
+        auto &bs = as_tensor(block_sum);
+        const auto &qm = as_tensor(q_multi);
+        const auto &pt = as_tensor(prototype_tile);
+        const auto &bo = as_tensor(block_offsets);
+        const auto &bc = as_tensor(block_counts);
+        const uint64_t local_distributions =
+            static_cast<uint64_t>(n_tokens) * n_heads;
+        const uint64_t workspace_entries =
+            local_distributions * workspace_block_stride;
+        const uint64_t q_rows =
+            static_cast<uint64_t>(n_layers - 1) * q_layer_stride +
+            n_tokens;
+        const uint64_t prototype_elems =
+            static_cast<uint64_t>(prototype_count) * n_kv_heads *
+            head_dim;
+        if (n_layers == 0 || layer >= n_layers ||
+            workspace_block_base > workspace_block_stride ||
+            tile_blocks > workspace_block_stride - workspace_block_base ||
+            bm.elem_size != sizeof(float) ||
+            bs.elem_size != sizeof(float) ||
+            bm.count < workspace_entries || bs.count < workspace_entries ||
+            bo.elem_size != sizeof(int32_t) ||
+            bc.elem_size != sizeof(int32_t) ||
+            bo.count < tile_blocks || bc.count < tile_blocks ||
+            qm.count < q_rows * n_heads * head_dim ||
+            pt.count < prototype_elems) {
+            return {
+                false,
+                "block_attn_stream_adaptive_block_stats invalid tensor shape"};
+        }
+        const ported::KbarDType dtype =
+            pt.is_fp8_kv() ? ported::KbarDType::FP8
+                           : pt.is_fp16()
+                                 ? ported::KbarDType::F16
+                                 : ported::KbarDType::F32;
+        if (!ported::launch_block_attn_stream_adaptive_block_stats_typed(
+                bm.ptr, bs.ptr, qm.ptr, qm.is_fp16(), pt.ptr, dtype,
+                bo.ptr_i32(), bc.ptr_i32(), layer, n_layers, n_tokens,
+                q_layer_stride, prototype_count, tile_blocks,
+                workspace_block_base, workspace_block_stride, n_heads,
+                n_kv_heads, head_dim, scale, exec_stream_)) {
+            return {
+                false,
+                "block_attn_stream_adaptive_block_stats launch failed"};
+        }
+        return launch_status(
+            "cuda block_attn_stream_adaptive_block_stats_device");
+    }
+
+    DeviceStatus block_attn_stream_adaptive_finalize_device(
+            DeviceTensor &score,
+            const DeviceTensor &block_max,
+            const DeviceTensor &block_sum,
+            DeviceTensor &global_max,
+            DeviceTensor &global_sum,
+            uint32_t layer,
+            uint32_t n_layers,
+            uint32_t n_tokens,
+            uint32_t workspace_block_stride,
+            uint32_t block_count,
+            uint32_t global_block_base,
+            uint32_t n_heads) override {
+        if (block_count == 0 || n_tokens == 0) return {};
+        if (n_layers == 0 || n_heads == 0) {
+            return {
+                false,
+                "block_attn_stream_adaptive_finalize invalid dimensions"};
+        }
+        auto &sc = as_tensor(score);
+        const auto &bm = as_tensor(block_max);
+        const auto &bs = as_tensor(block_sum);
+        auto &gm = as_tensor(global_max);
+        auto &gs = as_tensor(global_sum);
+        const uint64_t local_distributions =
+            static_cast<uint64_t>(n_tokens) * n_heads;
+        const uint64_t distributions =
+            static_cast<uint64_t>(n_layers) * local_distributions;
+        const uint64_t workspace_entries =
+            local_distributions * workspace_block_stride;
+        if (n_layers == 0 || layer >= n_layers ||
+            block_count > workspace_block_stride ||
+            sc.elem_size != sizeof(float) ||
+            sc.count < static_cast<uint64_t>(global_block_base) +
+                           block_count ||
+            bm.elem_size != sizeof(float) ||
+            bs.elem_size != sizeof(float) ||
+            bm.count < workspace_entries || bs.count < workspace_entries ||
+            gm.elem_size != sizeof(float) ||
+            gs.elem_size != sizeof(float) ||
+            gm.count < distributions || gs.count < distributions) {
+            return {
+                false,
+                "block_attn_stream_adaptive_finalize invalid tensor shape"};
+        }
+        if (!ported::launch_block_attn_stream_adaptive_finalize(
+                sc.ptr, bm.ptr, bs.ptr, gm.ptr, gs.ptr, layer, n_layers,
+                n_tokens, workspace_block_stride, block_count,
+                global_block_base, n_heads, exec_stream_)) {
+            return {
+                false,
+                "block_attn_stream_adaptive_finalize launch failed"};
+        }
+        return launch_status(
+            "cuda block_attn_stream_adaptive_finalize_device");
+    }
+
     DeviceStatus block_attn_score_adaptive_layer_device(
             DeviceTensor &score,
             const DeviceTensor &q_multi,
@@ -21645,6 +21993,133 @@ bool launch_block_attn_stream_adaptive_score_typed(
     }
 #undef QW3_ADAPTIVE_STREAM_SCORE
     return false;
+}
+
+template <typename QueryT, typename KbarT>
+bool launch_block_attn_stream_adaptive_block_stats_impl(
+        float *block_max, float *block_sum,
+        const void *q_multi, const void *prototype_tile,
+        const int32_t *block_offsets, const int32_t *block_counts,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t tile_blocks,
+        uint32_t workspace_block_base,
+        uint32_t workspace_block_stride,
+        uint32_t n_heads, uint32_t n_kv_heads,
+        uint32_t head_dim, float scale, cudaStream_t stream) {
+    if (layer >= n_layers || n_tokens == 0 || tile_blocks == 0 ||
+        workspace_block_base > workspace_block_stride ||
+        tile_blocks > workspace_block_stride - workspace_block_base ||
+        n_heads == 0 || n_kv_heads == 0 || head_dim == 0 ||
+        n_heads % n_kv_heads != 0) {
+        return false;
+    }
+    const uint32_t gqa_group = n_heads / n_kv_heads;
+    const uint64_t groups64 =
+        static_cast<uint64_t>(n_tokens) * n_kv_heads;
+    if (groups64 == 0 || groups64 > 0x7fffffffu) return false;
+#define QW3_ADAPTIVE_BLOCK_STATS_GQA(G)                                \
+    block_attn_stream_adaptive_block_stats_gqa_kernel<                 \
+        QueryT, KbarT, G><<<                                           \
+        static_cast<uint32_t>(groups64),                               \
+        kSoftmaxPagesThreads, 0, stream>>>(                            \
+        block_max, block_sum, static_cast<const QueryT *>(q_multi),    \
+        static_cast<const KbarT *>(prototype_tile),                    \
+        block_offsets, block_counts, layer, n_layers, n_tokens,        \
+        q_layer_stride, tile_blocks, workspace_block_base,             \
+        workspace_block_stride, n_heads, n_kv_heads, head_dim, scale)
+    if (gqa_group == 1u) {
+        QW3_ADAPTIVE_BLOCK_STATS_GQA(1u);
+    } else if (gqa_group == 2u) {
+        QW3_ADAPTIVE_BLOCK_STATS_GQA(2u);
+    } else if (gqa_group == 3u) {
+        QW3_ADAPTIVE_BLOCK_STATS_GQA(3u);
+    } else if (gqa_group == 4u) {
+        QW3_ADAPTIVE_BLOCK_STATS_GQA(4u);
+    } else if (gqa_group == 6u) {
+        QW3_ADAPTIVE_BLOCK_STATS_GQA(6u);
+    } else {
+        return false;
+    }
+#undef QW3_ADAPTIVE_BLOCK_STATS_GQA
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attn_stream_adaptive_block_stats_typed(
+        float *block_max, float *block_sum,
+        const void *q_multi, bool query_is_fp16,
+        const void *prototype_tile, KbarDType prototype_dtype,
+        const int32_t *block_offsets, const int32_t *block_counts,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t q_layer_stride, uint32_t prototype_count,
+        uint32_t tile_blocks, uint32_t workspace_block_base,
+        uint32_t workspace_block_stride, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        cudaStream_t stream) {
+    (void)prototype_count;
+#define QW3_ADAPTIVE_BLOCK_STATS(QT, KT)                               \
+    return launch_block_attn_stream_adaptive_block_stats_impl<QT, KT>(\
+        block_max, block_sum, q_multi, prototype_tile,                 \
+        block_offsets, block_counts, layer, n_layers, n_tokens,       \
+        q_layer_stride, tile_blocks, workspace_block_base,            \
+        workspace_block_stride, n_heads, n_kv_heads, head_dim,        \
+        scale, stream)
+    if (query_is_fp16) {
+        switch (prototype_dtype) {
+            case KbarDType::F32:
+                QW3_ADAPTIVE_BLOCK_STATS(__half, float);
+            case KbarDType::F16:
+                QW3_ADAPTIVE_BLOCK_STATS(__half, __half);
+            case KbarDType::FP8:
+                QW3_ADAPTIVE_BLOCK_STATS(__half, __nv_fp8_e4m3);
+        }
+    } else {
+        switch (prototype_dtype) {
+            case KbarDType::F32:
+                QW3_ADAPTIVE_BLOCK_STATS(float, float);
+            case KbarDType::F16:
+                QW3_ADAPTIVE_BLOCK_STATS(float, __half);
+            case KbarDType::FP8:
+                QW3_ADAPTIVE_BLOCK_STATS(float, __nv_fp8_e4m3);
+        }
+    }
+#undef QW3_ADAPTIVE_BLOCK_STATS
+    return false;
+}
+
+bool launch_block_attn_stream_adaptive_finalize(
+        float *score, const float *block_max, const float *block_sum,
+        float *global_max, float *global_sum,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t workspace_block_stride, uint32_t block_count,
+        uint32_t global_block_base, uint32_t n_heads,
+        cudaStream_t stream) {
+    if (layer >= n_layers || n_tokens == 0 || n_heads == 0 ||
+        block_count == 0 || block_count > workspace_block_stride) {
+        return false;
+    }
+    const uint64_t local_distributions64 =
+        static_cast<uint64_t>(n_tokens) * n_heads;
+    if (local_distributions64 == 0 ||
+        local_distributions64 > 0x7fffffffu) {
+        return false;
+    }
+    const uint32_t local_distributions =
+        static_cast<uint32_t>(local_distributions64);
+    block_attn_stream_adaptive_reduce_block_lse_kernel<<<
+        local_distributions, kSoftmaxPagesThreads, 0, stream>>>(
+        global_max, global_sum, block_max, block_sum, layer,
+        local_distributions, workspace_block_stride, block_count);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return false;
+    const uint32_t grid =
+        (block_count + kSoftmaxPagesThreads - 1) /
+        kSoftmaxPagesThreads;
+    block_attn_stream_adaptive_finalize_block_stats_kernel<<<
+        grid, kSoftmaxPagesThreads, 0, stream>>>(
+        score, block_max, global_max, global_sum, layer, n_layers,
+        local_distributions, workspace_block_stride, block_count,
+        global_block_base, n_heads);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 template <typename QueryT, typename KbarT>

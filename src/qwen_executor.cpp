@@ -1260,6 +1260,9 @@ void QwenExecutor::reset_state() {
     }
     g_adaptive_stream_value_bytes_ = 0;
     g_adaptive_stream_block_capacity_ = 0;
+    g_adaptive_stream_block_max_.reset();
+    g_adaptive_stream_block_sum_.reset();
+    g_adaptive_stream_block_stats_capacity_ = 0;
     kvmem_qc_total_blocks_ = 0;
     kvmem_qc_prompt_tokens_ = 0;
     kvmem_qc_captured_blocks_ = 0;
@@ -7865,6 +7868,9 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     }
     g_adaptive_stream_value_bytes_ = 0;
     g_adaptive_stream_block_capacity_ = 0;
+    g_adaptive_stream_block_max_.reset();
+    g_adaptive_stream_block_sum_.reset();
+    g_adaptive_stream_block_stats_capacity_ = 0;
     for (auto &slot : g_kbar_stream_slots_) {
         slot = MeanIndexStageSlot{};
     }
@@ -16890,7 +16896,7 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index(
             std::fprintf(
                 stderr,
                 "[bs-adaptive-stream-fallback] "
-                "from=layer-one-pass to=tiled-two-pass "
+                "from=layer-one-pass to=tiled-one-pass "
                 "reason=%s\n",
                 layer_failure.empty()
                     ? "unknown"
@@ -17124,6 +17130,84 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index(
     if (!accumulate) {
         require_status(backend_.zero_tensor(*g_score_dev_));
     }
+    const uint32_t included_blocks =
+        included_end - included_begin;
+    const uint32_t gqa_group =
+        cfg.n_kv_heads > 0
+            ? cfg.n_heads / cfg.n_kv_heads
+            : 0;
+    bool use_tiled_one_pass =
+        score_mode == KvMemAdaptiveScoreMode::Auto &&
+        cfg.n_kv_heads > 0 &&
+        cfg.n_heads % cfg.n_kv_heads == 0 &&
+        (gqa_group == 1u || gqa_group == 2u ||
+         gqa_group == 3u || gqa_group == 4u ||
+         gqa_group == 6u);
+    uint64_t block_stats_entries = 0;
+    uint64_t block_stats_bytes = 0;
+    std::string tiled_one_pass_fallback;
+    if (use_tiled_one_pass) {
+        const uint64_t local_distributions =
+            static_cast<uint64_t>(n_tokens) * cfg.n_heads;
+        if (local_distributions >
+            UINT64_MAX / included_blocks) {
+            use_tiled_one_pass = false;
+            tiled_one_pass_fallback =
+                "block_stats_shape_overflow";
+        } else {
+            block_stats_entries =
+                local_distributions * included_blocks;
+            if (block_stats_entries >
+                UINT64_MAX / (2ull * sizeof(float))) {
+                use_tiled_one_pass = false;
+                tiled_one_pass_fallback =
+                    "block_stats_bytes_overflow";
+            } else {
+                block_stats_bytes =
+                    block_stats_entries * 2ull * sizeof(float);
+                const uint64_t workspace_cap =
+                    static_cast<uint64_t>(env_uint32_or(
+                        "QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB", 512)) *
+                    1024ull * 1024ull;
+                if (block_stats_bytes > workspace_cap) {
+                    use_tiled_one_pass = false;
+                    tiled_one_pass_fallback =
+                        "block_stats_workspace_cap";
+                }
+            }
+        }
+    }
+    if (use_tiled_one_pass &&
+        (!g_adaptive_stream_block_max_ ||
+         !g_adaptive_stream_block_sum_ ||
+         g_adaptive_stream_block_stats_capacity_ <
+             block_stats_entries)) {
+        g_adaptive_stream_block_max_ =
+            backend_.tensor_f32(
+                block_stats_entries,
+                "g_adaptive_stream_block_max");
+        g_adaptive_stream_block_sum_ =
+            backend_.tensor_f32(
+                block_stats_entries,
+                "g_adaptive_stream_block_sum");
+        g_adaptive_stream_block_stats_capacity_ =
+            block_stats_entries;
+    }
+    if (score_mode == KvMemAdaptiveScoreMode::Auto &&
+        !use_tiled_one_pass &&
+        (std::getenv("QW3_KVMEM_TRACE") ||
+         kvmem_perf_trace_flag())) {
+        std::fprintf(
+            stderr,
+            "[bs-adaptive-stream-fallback] "
+            "from=tiled-one-pass to=tiled-two-pass reason=%s "
+            "workspace_mib=%.2f\n",
+            tiled_one_pass_fallback.empty()
+                ? "unsupported_gqa_group"
+                : tiled_one_pass_fallback.c_str(),
+            static_cast<double>(block_stats_bytes) /
+                (1024.0 * 1024.0));
+    }
     const size_t stream_workers = std::min<size_t>(
         kvmem_cpu_gather_threads(),
         std::max<uint64_t>(
@@ -17212,7 +17296,7 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index(
             const uint64_t meta_base =
                 static_cast<uint64_t>(tile.layer) *
                 g_adaptive_index_stride_blocks_;
-            if (pass == 2) {
+            if (pass != 1) {
                 for (uint32_t b = 0; b < tile.block_count; ++b) {
                     const uint64_t meta =
                         meta_base + tile.first_block + b;
@@ -17235,7 +17319,7 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index(
                 backend_.copy_bytes_from_host_async(
                     *slot.values, 0, host,
                     tile_value_bytes));
-            if (pass == 2) {
+            if (pass != 1) {
                 const uint64_t block_meta_bytes =
                     static_cast<uint64_t>(
                         tile.block_count) *
@@ -17268,7 +17352,21 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index(
                 backend_.execution_wait_for_kv_transfer(
                     slot.transfer_done));
             DeviceStatus st;
-            if (pass == 1) {
+            if (pass == 0) {
+                st =
+                    backend_.
+                        block_attn_stream_adaptive_block_stats_device(
+                            *g_adaptive_stream_block_max_,
+                            *g_adaptive_stream_block_sum_,
+                            *g_query_multi_, *slot.values,
+                            *slot.block_offsets, *slot.block_counts,
+                            tile.layer, layers, n_tokens,
+                            q_layer_stride, tile.prototype_count,
+                            tile.block_count,
+                            tile.first_block - included_begin,
+                            included_blocks, cfg.n_heads,
+                            cfg.n_kv_heads, cfg.head_dim, scale);
+            } else if (pass == 1) {
                 const bool first_in_layer =
                     i == 0 ||
                     tiles[i - 1].layer != tile.layer;
@@ -17302,7 +17400,9 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index(
             if (!st.ok) {
                 return scorer_backend_unavailable(
                     failure_reason,
-                    pass == 1
+                    pass == 0
+                        ? "cpu_adaptive_stream_block_stats_failed"
+                        : pass == 1
                         ? "cpu_adaptive_stream_lse_failed"
                         : "cpu_adaptive_stream_score_failed",
                     st);
@@ -17310,11 +17410,56 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index(
             require_status(
                 backend_.record_execution_fence(
                     slot.compute_done));
+            if (pass == 0 &&
+                (i + 1 == tiles.size() ||
+                 tiles[i + 1].layer != tile.layer)) {
+                st =
+                    backend_.block_attn_stream_adaptive_finalize_device(
+                        *g_score_dev_,
+                        *g_adaptive_stream_block_max_,
+                        *g_adaptive_stream_block_sum_,
+                        *g_kbar_stream_global_max_,
+                        *g_kbar_stream_global_sum_,
+                        tile.layer, layers, n_tokens,
+                        included_blocks, included_blocks,
+                        included_begin, cfg.n_heads);
+                if (!st.ok) {
+                    return scorer_backend_unavailable(
+                        failure_reason,
+                        "cpu_adaptive_stream_finalize_failed", st);
+                }
+            }
             if (i + 2 < tiles.size()) submit(i + 2);
         }
         require_status(backend_.synchronize());
         return true;
     };
+
+    if (use_tiled_one_pass) {
+        if (!run_pass(0)) return false;
+        if (std::getenv("QW3_KVMEM_TRACE") ||
+            kvmem_perf_trace_flag()) {
+            std::fprintf(
+                stderr,
+                "[bs-adaptive-stream] placement=cpu exact=1 "
+                "mode=tiled-one-pass passes=1 layers=%u blocks=%u "
+                "query_tokens=%u tiles=%zu staging_mib=%.2f "
+                "block_stats_mib=%.2f gather_workers=%zu "
+                "gqa_group=%u transferred_gib=%.3f "
+                "pack_ms=%.3f h2d_wait_ms=%.3f total_ms=%.3f\n",
+                layers, n_blocks, n_tokens, tiles.size(),
+                static_cast<double>(value_bytes) /
+                    (1024.0 * 1024.0),
+                static_cast<double>(block_stats_bytes) /
+                    (1024.0 * 1024.0),
+                stream_workers, gqa_group,
+                static_cast<double>(transferred_bytes) /
+                    (1024.0 * 1024.0 * 1024.0),
+                pack_ns / 1.0e6, h2d_wait_ns / 1.0e6,
+                (kvmem_steady_ns() - begin_ns) / 1.0e6);
+        }
+        return true;
+    }
 
     if (!run_pass(1) || !run_pass(2)) return false;
     if (std::getenv("QW3_KVMEM_TRACE") ||

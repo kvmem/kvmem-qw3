@@ -80,6 +80,24 @@ bool launch_block_attn_stream_adaptive_score_typed(
     uint32_t global_block_base, uint32_t n_heads,
     uint32_t n_kv_heads, uint32_t head_dim, float scale,
     cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_block_stats_typed(
+    float *block_max, float *block_sum,
+    const void *q_multi, bool query_is_fp16,
+    const void *prototype_tile, KbarDType prototype_dtype,
+    const int32_t *block_offsets, const int32_t *block_counts,
+    uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t q_layer_stride, uint32_t prototype_count,
+    uint32_t tile_blocks, uint32_t workspace_block_base,
+    uint32_t workspace_block_stride, uint32_t n_heads,
+    uint32_t n_kv_heads, uint32_t head_dim, float scale,
+    cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_finalize(
+    float *score, const float *block_max, const float *block_sum,
+    float *global_max, float *global_sum,
+    uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t workspace_block_stride, uint32_t block_count,
+    uint32_t global_block_base, uint32_t n_heads,
+    cudaStream_t stream);
 bool launch_block_attn_score_adaptive_layer_typed(
     float *score, const void *q_multi, bool query_is_fp16,
     const void *prototype_layer, KbarDType prototype_dtype,
@@ -667,8 +685,87 @@ static void run_adaptive_scorer_test() {
         "adaptive-streamed-vs-host", streamed, expected,
         3e-6, 3e-3);
 
-    CHECK(cudaMemset(d_score, 0, blocks * sizeof(float)));
     const uint32_t included_blocks = excl_hi - excl_lo;
+    const uint64_t block_stats_entries =
+        static_cast<uint64_t>(tokens) * heads * included_blocks;
+    float *d_block_max = nullptr;
+    float *d_block_sum = nullptr;
+    CHECK(cudaMalloc(
+        &d_block_max, block_stats_entries * sizeof(float)));
+    CHECK(cudaMalloc(
+        &d_block_sum, block_stats_entries * sizeof(float)));
+    CHECK(cudaMemset(d_score, 0, blocks * sizeof(float)));
+    for (uint32_t l = 0; l < layers; ++l) {
+        for (uint32_t first = excl_lo; first < excl_hi;
+             first += tile_blocks) {
+            const uint32_t count =
+                std::min(tile_blocks, excl_hi - first);
+            const uint32_t meta_begin = l * blocks + first;
+            const uint32_t prototype_begin =
+                static_cast<uint32_t>(block_offsets[meta_begin]);
+            const uint32_t last_meta = meta_begin + count - 1;
+            const uint32_t prototype_end =
+                static_cast<uint32_t>(block_offsets[last_meta]) +
+                static_cast<uint32_t>(block_counts[last_meta]);
+            const uint32_t prototype_count =
+                prototype_end - prototype_begin;
+            const float *tile =
+                d_prototypes +
+                static_cast<uint64_t>(prototype_begin) *
+                    kv_heads * dim;
+            std::vector<int32_t> local_offsets(count);
+            std::vector<int32_t> local_counts(count);
+            for (uint32_t b = 0; b < count; ++b) {
+                local_offsets[b] =
+                    block_offsets[meta_begin + b] -
+                    static_cast<int32_t>(prototype_begin);
+                local_counts[b] = block_counts[meta_begin + b];
+            }
+            CHECK(cudaMemcpy(
+                d_tile_offsets, local_offsets.data(),
+                count * sizeof(int32_t), cudaMemcpyHostToDevice));
+            CHECK(cudaMemcpy(
+                d_tile_counts, local_counts.data(),
+                count * sizeof(int32_t), cudaMemcpyHostToDevice));
+            if (!qw3::ported::
+                    launch_block_attn_stream_adaptive_block_stats_typed(
+                        d_block_max, d_block_sum, d_q,
+                        /*query_is_fp16=*/false, tile,
+                        qw3::ported::KbarDType::F32,
+                        d_tile_offsets, d_tile_counts, l, layers,
+                        tokens, q_stride, prototype_count, count,
+                        first - excl_lo, included_blocks, heads,
+                        kv_heads, dim, scale, /*stream=*/0)) {
+                std::fprintf(
+                    stderr,
+                    "adaptive tiled one-pass stats rejected test\n");
+                std::exit(1);
+            }
+        }
+        if (!qw3::ported::launch_block_attn_stream_adaptive_finalize(
+                d_score, d_block_max, d_block_sum,
+                d_global_max, d_global_sum, l, layers, tokens,
+                included_blocks, included_blocks, excl_lo, heads,
+                /*stream=*/0)) {
+            std::fprintf(
+                stderr,
+                "adaptive tiled one-pass finalize rejected test\n");
+            std::exit(1);
+        }
+    }
+    CHECK(cudaDeviceSynchronize());
+    std::vector<float> tiled_one_pass(blocks);
+    CHECK(cudaMemcpy(
+        tiled_one_pass.data(), d_score, blocks * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    compare(
+        "adaptive-tiled-one-pass-vs-packed",
+        tiled_one_pass, actual, 3e-6, 3e-3);
+    compare(
+        "adaptive-tiled-one-pass-vs-host",
+        tiled_one_pass, expected, 3e-6, 3e-3);
+
+    CHECK(cudaMemset(d_score, 0, blocks * sizeof(float)));
     for (uint32_t l = 0; l < layers; ++l) {
         const uint32_t meta_begin = l * blocks + excl_lo;
         const uint32_t prototype_begin =
@@ -726,6 +823,8 @@ static void run_adaptive_scorer_test() {
         "adaptive-layer-one-pass-vs-host",
         layer_one_pass, expected, 3e-6, 3e-3);
 
+    CHECK(cudaFree(d_block_sum));
+    CHECK(cudaFree(d_block_max));
     CHECK(cudaFree(d_tile_counts));
     CHECK(cudaFree(d_tile_offsets));
     CHECK(cudaFree(d_global_sum));

@@ -1639,6 +1639,62 @@ public:
             "block_attn_stream_adaptive_score_device requires backend override"};
     }
 
+    // Exact one-transfer/one-dot tiled Adaptive scorer. Each streamed tile
+    // writes per-(distribution, block) MaxSim logits and LSE pairs into a
+    // bounded layer-local workspace. `finalize` reduces those pairs into the
+    // exact all-prototype softmax denominator and accumulates the layer score.
+    virtual DeviceStatus block_attn_stream_adaptive_block_stats_device(
+        DeviceTensor &block_max,
+        DeviceTensor &block_sum,
+        const DeviceTensor &q_multi,
+        const DeviceTensor &prototype_tile,
+        const DeviceTensor &block_offsets,
+        const DeviceTensor &block_counts,
+        uint32_t layer,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t q_layer_stride,
+        uint32_t prototype_count,
+        uint32_t tile_blocks,
+        uint32_t workspace_block_base,
+        uint32_t workspace_block_stride,
+        uint32_t n_heads,
+        uint32_t n_kv_heads,
+        uint32_t head_dim,
+        float scale) {
+        (void)block_max; (void)block_sum; (void)q_multi;
+        (void)prototype_tile; (void)block_offsets; (void)block_counts;
+        (void)layer; (void)n_layers; (void)n_tokens;
+        (void)q_layer_stride; (void)prototype_count; (void)tile_blocks;
+        (void)workspace_block_base; (void)workspace_block_stride;
+        (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale;
+        return {
+            false,
+            "block_attn_stream_adaptive_block_stats_device requires backend override"};
+    }
+
+    virtual DeviceStatus block_attn_stream_adaptive_finalize_device(
+        DeviceTensor &score,
+        const DeviceTensor &block_max,
+        const DeviceTensor &block_sum,
+        DeviceTensor &global_max,
+        DeviceTensor &global_sum,
+        uint32_t layer,
+        uint32_t n_layers,
+        uint32_t n_tokens,
+        uint32_t workspace_block_stride,
+        uint32_t block_count,
+        uint32_t global_block_base,
+        uint32_t n_heads) {
+        (void)score; (void)block_max; (void)block_sum;
+        (void)global_max; (void)global_sum; (void)layer;
+        (void)n_layers; (void)n_tokens; (void)workspace_block_stride;
+        (void)block_count; (void)global_block_base; (void)n_heads;
+        return {
+            false,
+            "block_attn_stream_adaptive_finalize_device requires backend override"};
+    }
+
     // One-transfer/one-dot Adaptive scorer for a complete normal-attention
     // layer. `prototype_layer` and the block metadata use layer-local offsets;
     // the result is accumulated into global block scores with normalization by
