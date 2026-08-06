@@ -2169,7 +2169,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             if (!req["kvmem_prefill_window"].is_string()) {
                 set_error_response(
                     res, 400,
-                    "kvmem_prefill_window must be pressure|keep_selected");
+                    "kvmem_prefill_window must be "
+                    "pressure|keep_selected|semantic_chunk");
                 return;
             }
             const std::string mode =
@@ -2180,12 +2181,57 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             } else if (mode == "keep_selected") {
                 kvmem_prefill_window_mode =
                     KvMemPrefillWindowMode::KeepSelected;
+            } else if (mode == "semantic_chunk") {
+                kvmem_prefill_window_mode =
+                    KvMemPrefillWindowMode::SemanticChunk;
             } else {
                 set_error_response(
                     res, 400,
-                    "kvmem_prefill_window must be pressure|keep_selected");
+                    "kvmem_prefill_window must be "
+                    "pressure|keep_selected|semantic_chunk");
                 return;
             }
+        }
+        uint32_t kvmem_prefill_semantic_start_tokens = 0;
+        uint32_t kvmem_prefill_semantic_query_tokens = 0;
+        auto parse_nonnegative_u32 = [&](const char *name,
+                                         uint32_t &value) -> bool {
+            if (!req.contains(name)) return true;
+            if (!req[name].is_number_integer()) {
+                set_error_response(
+                    res, 400, std::string(name) +
+                                  " must be a non-negative integer");
+                return false;
+            }
+            const int64_t parsed = req[name].get<int64_t>();
+            if (parsed < 0 ||
+                static_cast<uint64_t>(parsed) >
+                    std::numeric_limits<uint32_t>::max()) {
+                set_error_response(
+                    res, 400, std::string(name) +
+                                  " must fit in uint32");
+                return false;
+            }
+            value = static_cast<uint32_t>(parsed);
+            return true;
+        };
+        if (!parse_nonnegative_u32(
+                "kvmem_prefill_semantic_start_tokens",
+                kvmem_prefill_semantic_start_tokens) ||
+            !parse_nonnegative_u32(
+                "kvmem_prefill_semantic_query_tokens",
+                kvmem_prefill_semantic_query_tokens)) {
+            return;
+        }
+        if (kvmem_prefill_window_mode !=
+                KvMemPrefillWindowMode::SemanticChunk &&
+            (kvmem_prefill_semantic_start_tokens != 0 ||
+             kvmem_prefill_semantic_query_tokens != 0)) {
+            set_error_response(
+                res, 400,
+                "kvmem_prefill_semantic_* requires "
+                "kvmem_prefill_window=semantic_chunk");
+            return;
         }
         bool kvmem_session_request = false;
         bool kvmem_session_reset = false;
@@ -2502,6 +2548,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
         g.kvmem_reselect_mode = kvmem_reselect_mode;
         g.kvmem_prefill_window_mode = kvmem_prefill_window_mode;
+        g.kvmem_prefill_semantic_start_tokens =
+            kvmem_prefill_semantic_start_tokens;
+        g.kvmem_prefill_semantic_query_tokens =
+            kvmem_prefill_semantic_query_tokens;
         g.kvmem_session_id = kvmem_session_id;
         if (kvmem_cache_request) {
             if (kvmem_cache_operation == "save") {

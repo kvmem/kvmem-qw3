@@ -278,6 +278,10 @@ public:
     void kvmem_finish_deferred_prefill_pressure();
     StateSnapshot snapshot_state();
     void capture_state(StateSnapshot &snapshot);
+    // Ephemeral rollback point used within one request. Unlike a reusable
+    // prefix/archive checkpoint it does not wait for unrelated raw-K tier
+    // persistence, because the caller never exposes or retains it externally.
+    void capture_transient_state(StateSnapshot &snapshot);
     void restore_state(const StateSnapshot &snapshot);
     // Restore only the hybrid model's recurrent/conv tensors. Position, hidden
     // state, normal-attention K/V, page tables, and KVMem selection stay live.
@@ -612,6 +616,15 @@ public:
     void kvmem_set_prefill_reselect_suppressed(bool suppressed) {
         kvmem_prefill_reselect_suppressed_ = suppressed;
     }
+    // A semantic-chunk first pass exists only to capture the retrieval query.
+    // Its pages are immediately rolled back, so durable raw-K/index/tier work
+    // would be pure overhead. The complete target and MTP forward still runs.
+    void kvmem_set_provisional_prefill(bool provisional) {
+        kvmem_provisional_prefill_ = provisional;
+    }
+    bool kvmem_provisional_prefill() const {
+        return kvmem_provisional_prefill_;
+    }
 
     // Re-select the working set from the built-in cumulative-attention top-k
     // and assemble it: re-RoPE each moved block in place (per attention layer)
@@ -906,6 +919,7 @@ private:
     // The selected suffix blocks were removed first, so replay consumes the
     // same GPU-pool capacity they occupied before the rewind.
     bool kvmem_query_replay_active_ = false;
+    bool kvmem_provisional_prefill_ = false;
     bool kvmem_keep_selected_prefill_ = false;
     // True once a selection has been assembled this session; gates the decode
     // window substitution. Cleared by reset_state().
@@ -1589,7 +1603,10 @@ private:
     uint64_t g_query_score_pinned_capacity_ = 0;               // bytes
     // Clean-query prefill (task #50). The PASS-A isolated-question query is stashed
     // here; it is NOT touched by reset_state so it survives the pass boundary.
-    std::unique_ptr<DeviceTensor> g_query_multi_clean_;        // [L, S, n_heads, head_dim] fp32
+    std::unique_ptr<DeviceTensor> g_query_multi_clean_;        // GPU stash; preserves FP16/FP32 dtype
+    std::unique_ptr<uint16_t[]> g_query_multi_clean_host_;     // host-backed FP16 stash
+    uint64_t g_query_multi_clean_host_capacity_ = 0;           // elements
+    uint64_t g_query_multi_clean_host_elems_ = 0;              // active elements
     uint32_t g_query_multi_clean_count_ = 0;                   // rows stashed (== S when ready)
     // Force pick_topk to always keep blocks with id >= this (question + live tail);
     // 0xffffffff => no pin. pick_topk result is unioned with [pin,block_count) in

@@ -331,10 +331,12 @@ prefill-to-decode boundary.
 
 For method writing, this is the key argument:
 
-> KVMem schedules memory at semantic step boundaries but also includes a
-> resource-triggered, query-independent sink-plus-tail offload path to maintain
-> the bounded-GPU invariant during very long prompt ingestion. Semantic
-> retrieval is reserved for the prefill-to-decode boundary.
+> By default, KVMem schedules semantic memory at request/query boundaries and
+> uses a resource-triggered, query-independent sink-plus-tail path during long
+> prefill. The opt-in `semantic_chunk` construction experiment instead captures
+> a query from every post-threshold physical chunk, selects historical context,
+> rolls back, and commits that chunk once under the selected window. Its
+> provisional pass has no durable KV/index/tier or MTP side effects.
 
 ## 4. KV-Native Mean-Key and Adaptive Prototype Retrieval
 

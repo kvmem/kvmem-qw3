@@ -777,6 +777,239 @@ uint32_t kvmem_selection_additions(const std::vector<uint32_t> &before,
     return additions;
 }
 
+struct KvMemSemanticChunkStats {
+    uint32_t chunks = 0;
+    uint64_t provisional_tokens = 0;
+    uint64_t replay_tokens = 0;
+    double provisional_s = 0.0;
+    double rollback_s = 0.0;
+    double reselect_s = 0.0;
+    double replay_s = 0.0;
+};
+
+// Run a history range through query-conditioned KVMem one physical prefill
+// chunk at a time. The first pass captures only Q; all durable KV/raw-K/index
+// state is produced by the replay after the semantic window is installed.
+// `prefill` must execute exactly [begin,end), including MTP-prefix priming when
+// MTP is enabled. Keeping that policy in the caller makes this orchestration
+// identical for plain and MTP generation.
+KvMemSemanticChunkStats kvmem_prefill_semantic_chunks(
+        QwenExecutor *executor,
+        uint32_t prompt_tokens,
+        uint32_t begin,
+        uint32_t end,
+        uint32_t configured_start,
+        uint32_t query_token_cap,
+        const std::function<void(uint32_t, uint32_t, bool)> &prefill) {
+    KvMemSemanticChunkStats stats;
+    if (!executor || !executor->kvmem_enabled() || begin >= end) return stats;
+    const KvMemStore *store = executor->block_store();
+    if (!store) {
+        throw std::runtime_error(
+            "semantic-chunk prefill requires a KVMem block store");
+    }
+    if (!kvmem_query_replay_retrieval_supported(
+            store->config().retrieval_method)) {
+        throw std::runtime_error(
+            "semantic-chunk prefill requires Mean-K/SubBlockMeanK retrieval");
+    }
+    const uint32_t bt = std::max<uint32_t>(1, store->config().block_tokens);
+    const uint32_t gen_budget = store->config().gen_budget;
+    uint32_t start = configured_start;
+    if (start == 0) {
+        start = store->config().prefill_budget != 0
+            ? store->config().prefill_budget
+            : store->select_budget_tokens();
+    }
+    start = ((start + bt - 1) / bt) * bt;
+    if (begin % bt != 0 || end % bt != 0) {
+        throw std::runtime_error(
+            "semantic-chunk history boundaries must be block aligned");
+    }
+
+    uint32_t cursor = begin;
+    if (cursor < std::min(start, end)) {
+        const uint32_t dense_end = std::min(start, end);
+        prefill(cursor, dense_end, /*compute_final_logits=*/false);
+        executor->kvmem_register_append(dense_end - cursor);
+        cursor = dense_end;
+    }
+    if (cursor >= end) return stats;
+
+    QwenExecutor::StateSnapshot boundary;
+    while (cursor < end) {
+        const uint32_t remaining = end - cursor;
+        uint32_t width = std::max<uint32_t>(
+            bt, executor->effective_prefill_chunk_size(remaining));
+        width = std::min(width, remaining);
+        if (width < remaining) width -= width % bt;
+        if (width == 0 || width % bt != 0) {
+            throw std::runtime_error(
+                "semantic-chunk prefill produced a non-aligned chunk");
+        }
+        if (gen_budget != 0 && width > gen_budget) {
+            throw std::runtime_error(
+                "semantic-chunk width exceeds the generation headroom");
+        }
+        const uint32_t chunk_begin = cursor;
+        const uint32_t chunk_end = cursor + width;
+        const uint32_t query_begin = query_token_cap == 0
+            ? chunk_begin
+            : std::max(chunk_begin, chunk_end - query_token_cap);
+
+        // At the first pressure boundary every historical block still fits in
+        // the selection budget, so query scoring cannot change the result.
+        // Install that identity window and commit the chunk once; the ordinary
+        // two-pass semantic path starts only after history has a real choice.
+        if (store->block_count() <= store->budget_blocks()) {
+            executor->kvmem_set_query_span(
+                0, 0, prompt_tokens,
+                /*index_tokens=*/chunk_end,
+                /*preserve_content_index=*/true,
+                /*capture_content_without_query=*/true);
+            executor->capture_transient_state(boundary);
+            const double select_start = wall_seconds();
+            executor->kvmem_reselect_prefill_pressure();
+            stats.reselect_s += wall_seconds() - select_start;
+            const std::vector<uint32_t> selected =
+                kvmem_selected_block_ids(executor);
+
+            const double replay_start = wall_seconds();
+            executor->kvmem_begin_query_replay(
+                boundary, selected,
+                /*reset_recurrent_state=*/false,
+                /*preserve_selected_context=*/true);
+            try {
+                prefill(chunk_begin, chunk_end,
+                        /*compute_final_logits=*/false);
+            } catch (...) {
+                executor->kvmem_end_query_replay();
+                throw;
+            }
+            executor->kvmem_end_query_replay();
+            executor->kvmem_prefill_writeback(chunk_end);
+            stats.replay_s += wall_seconds() - replay_start;
+            stats.replay_tokens += width;
+            ++stats.chunks;
+            cursor = chunk_end;
+
+            if (std::getenv("QW3_KVMEM_TRACE")) {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-semantic-chunk] event=%u range=[%u,%u) "
+                    "bootstrap=identity selected=%zu position=%u\n",
+                    stats.chunks, chunk_begin, chunk_end, selected.size(),
+                    executor->position());
+            }
+            continue;
+        }
+
+        // Reuse the fixed session index allocation and publish only historical
+        // blocks at selection time. The provisional pass is query-only, so it
+        // cannot append temporary Adaptive prototypes or tier writes.
+        executor->kvmem_set_query_span(
+            query_begin, chunk_end, prompt_tokens,
+            /*index_tokens=*/end,
+            /*preserve_content_index=*/true);
+        executor->capture_transient_state(boundary);
+
+        const double provisional_start = wall_seconds();
+        executor->kvmem_set_provisional_prefill(true);
+        executor->kvmem_set_prefill_reselect_suppressed(true);
+        try {
+            prefill(chunk_begin, chunk_end,
+                    /*compute_final_logits=*/false);
+        } catch (...) {
+            executor->kvmem_set_prefill_reselect_suppressed(false);
+            executor->kvmem_set_provisional_prefill(false);
+            throw;
+        }
+        executor->kvmem_set_prefill_reselect_suppressed(false);
+        executor->kvmem_set_provisional_prefill(false);
+        stats.provisional_s += wall_seconds() - provisional_start;
+        stats.provisional_tokens += width;
+        if (!executor->kvmem_stash_query()) {
+            throw std::runtime_error(
+                "semantic-chunk provisional pass did not capture its query");
+        }
+
+        const double rollback_start = wall_seconds();
+        executor->restore_state(boundary);
+        // Provisional mode did not register blocks, capture raw K/index rows, or
+        // start tier writes. restore_state() already drops its target/MTP pages
+        // and recurrent suffix, so the general kvmem_truncate_to() would only
+        // add an unnecessary global CPU/NVMe write drain here.
+        executor->kvmem_set_query_span(
+            query_begin, chunk_end, prompt_tokens,
+            /*index_tokens=*/chunk_begin,
+            /*preserve_content_index=*/true);
+        executor->kvmem_restore_stashed_query();
+        if (!executor->kvmem_publish_captured_prefix(chunk_begin)) {
+            throw std::runtime_error(
+                "semantic-chunk could not publish the historical index");
+        }
+        stats.rollback_s += wall_seconds() - rollback_start;
+
+        // The provisional chunk was removed before selection. Consequently all
+        // select-budget slots belong to historical context; the replayed chunk
+        // uses the ordinary generation/headroom pages instead of diluting the
+        // retrieved history.
+        executor->kvmem_set_pin_from_block(0xffffffffu);
+        const double select_start = wall_seconds();
+        executor->kvmem_reselect();
+        stats.reselect_s += wall_seconds() - select_start;
+        const std::vector<uint32_t> selected =
+            kvmem_selected_block_ids(executor);
+        for (uint32_t id : selected) {
+            if (id >= store->block_count() ||
+                store->blocks()[id].orig_pos_start >= chunk_begin) {
+                throw std::runtime_error(
+                    "semantic-chunk selected a non-historical block");
+            }
+        }
+
+        const double replay_start = wall_seconds();
+        executor->kvmem_begin_query_replay(
+            boundary, selected,
+            /*reset_recurrent_state=*/false,
+            /*preserve_selected_context=*/true);
+        // The final pass appends the chunk's durable Adaptive/Mean-K rows while
+        // no longer retaining its now-consumed query capture.
+        executor->kvmem_set_query_span(
+            0, 0, prompt_tokens,
+            /*index_tokens=*/chunk_end,
+            /*preserve_content_index=*/true,
+            /*capture_content_without_query=*/true);
+        try {
+            prefill(chunk_begin, chunk_end,
+                    /*compute_final_logits=*/false);
+        } catch (...) {
+            executor->kvmem_end_query_replay();
+            throw;
+        }
+        executor->kvmem_end_query_replay();
+        // Make the just-committed chunk durable immediately. Its asynchronous
+        // D2H can overlap the next provisional target-model pass, so the next
+        // selection normally only retires an already-started transfer instead
+        // of exposing a synchronous pressure-point stage-out.
+        executor->kvmem_prefill_writeback(chunk_end);
+        stats.replay_s += wall_seconds() - replay_start;
+        stats.replay_tokens += width;
+        ++stats.chunks;
+        cursor = chunk_end;
+
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(
+                stderr,
+                "[kvmem-semantic-chunk] event=%u range=[%u,%u) "
+                "query=[%u,%u) selected=%zu position=%u\n",
+                stats.chunks, chunk_begin, chunk_end, query_begin, chunk_end,
+                selected.size(), executor->position());
+        }
+    }
+    return stats;
+}
+
 // Cap on total physical KV pages pinned by the prefix cache. 0 = unlimited
 // (bounded only by the pool). Used to trigger LRU eviction.
 uint32_t prefix_cache_max_pages() {
@@ -9759,6 +9992,9 @@ private:
                                const GenerationOptions &options,
                                const CancellableTokenCallback &on_text,
                                DumpStream *dump) {
+        const bool semantic_chunk =
+            options.kvmem_prefill_window_mode ==
+            KvMemPrefillWindowMode::SemanticChunk;
         if (!options.kvmem_replay_query_spans.empty()) {
             throw std::runtime_error(
                 "KVMem transcript replay currently requires native MTP");
@@ -9795,7 +10031,9 @@ private:
         // token prefix of the new prompt, and prefill only the trailing suffix.
         // Otherwise fall back to the byte-identical reset+full-prefill path and
         // (if the flag is on) drop the now-stale warm checkpoints.
-        const KvmemReuse ru = kvmem_prefix_reuse(prompt_tokens, options);
+        const KvmemReuse ru = semantic_chunk
+            ? KvmemReuse{}
+            : kvmem_prefix_reuse(prompt_tokens, options);
         const uint32_t reuse_m = ru.c;
         const bool warm_reuse = reuse_m > 0;
         if (warm_reuse) {
@@ -9840,7 +10078,8 @@ private:
         }
 #endif
         const bool warm_capture =
-            !inline_refresh && kvmem_prefix_cache_enabled() &&
+            !semantic_chunk && !inline_refresh &&
+            kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
 
         // "Operating dense" predicate: below budget the store keeps every block
@@ -9865,6 +10104,18 @@ private:
                 executor_->block_store()->config().retrieval_method);
         const bool warm_source_index_ready =
             qc_active || warm_history_index_capture;
+
+        if (semantic_chunk) {
+            if (!executor_->kvmem_enabled() || !qc_active || dump != nullptr ||
+                inline_refresh || !options.kvmem_session_id.empty() ||
+                !executor_->block_store() ||
+                !kvmem_query_replay_retrieval_supported(
+                    executor_->block_store()->config().retrieval_method)) {
+                throw std::runtime_error(
+                    "semantic-chunk prefill requires a fresh, above-budget, "
+                    "query-conditioned Mean-K/SubBlockMeanK request");
+            }
+        }
 
         if (executor_->kvmem_enabled()) {
             executor_->kvmem_set_keep_selected_prefill(
@@ -9979,7 +10230,8 @@ private:
         const bool qc_pertoken_here = executor_->kvmem_qc_pertoken();
         const bool recompute_query =
             executor_->kvmem_enabled() && qc_active &&
-            kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
+            (semantic_chunk ||
+             kvmem_recompute_query_enabled(options_.kvmem_recompute_query)) &&
             dump == nullptr && executor_->block_store() &&
             kvmem_query_replay_retrieval_supported(
                 executor_->block_store()->config().retrieval_method);
@@ -10049,6 +10301,7 @@ private:
             executor_->kvmem_set_prefill_reselect_suppressed(false);
         };
         bool query_replay_applied = false;
+        KvMemSemanticChunkStats semantic_chunk_stats;
         if (dump) {
             for (size_t pi = prefill_begin; pi < prompt_tokens.size(); ++pi) {
                 step = executor_->forward_one_token(prompt_tokens[pi]);
@@ -10063,6 +10316,34 @@ private:
                 throw std::runtime_error(
                     "KVMem warm checkpoint is after the query replay boundary");
             }
+            if (semantic_chunk) {
+                if (prefill_begin != 0 || do_boundary_capture) {
+                    throw std::runtime_error(
+                        "semantic-chunk prefill requires a cold prompt without "
+                        "a warm prefix checkpoint");
+                }
+                semantic_chunk_stats = kvmem_prefill_semantic_chunks(
+                    executor_.get(),
+                    static_cast<uint32_t>(prompt_tokens.size()),
+                    /*begin=*/0, query_replay_begin,
+                    options.kvmem_prefill_semantic_start_tokens,
+                    options.kvmem_prefill_semantic_query_tokens,
+                    [&](uint32_t begin, uint32_t end, bool need_logits) {
+                        do_prefill_range(begin, end, need_logits);
+                    });
+                // History chunks temporarily replace the query span. Restore
+                // the real answer-producing user query before its first pass.
+                executor_->kvmem_set_query_span(
+                    options.kvmem_query_begin, options.kvmem_query_end,
+                    static_cast<uint32_t>(prompt_tokens.size()),
+                    /*index_tokens=*/query_replay_begin,
+                    /*preserve_content_index=*/true);
+                executor_->capture_state(query_replay_ckpt);
+                executor_->kvmem_start_query_prefetch(
+                    static_cast<uint32_t>(
+                        prompt_tokens.size() - query_replay_begin));
+                do_prefill_range(query_replay_begin, prompt_tokens.size());
+            } else {
             // P and B are independent boundaries. If P is no later than B,
             // stage the warm checkpoint on the first pass before capturing the
             // replay snapshot. If P is after B, its first-pass state will be
@@ -10088,6 +10369,7 @@ private:
                 static_cast<uint32_t>(
                     prompt_tokens.size() - query_replay_begin));
             do_prefill_range(query_replay_begin, prompt_tokens.size());
+            }
         } else if (query_replay) {
             const uint32_t qb = options.kvmem_query_begin;
             const uint32_t qe = options.kvmem_query_end;
@@ -10203,6 +10485,21 @@ private:
                              /*compute_final_logits=*/true);
         }
         const double t_prefill_end = wall_seconds();
+        if (semantic_chunk_stats.chunks != 0) {
+            std::ostringstream smsg;
+            smsg << std::fixed << std::setprecision(3)
+                 << "native kvmem semantic-chunk (plain): chunks="
+                 << semantic_chunk_stats.chunks
+                 << " provisional_tokens="
+                 << semantic_chunk_stats.provisional_tokens
+                 << " replay_tokens=" << semantic_chunk_stats.replay_tokens
+                 << " provisional_ms="
+                 << semantic_chunk_stats.provisional_s * 1e3
+                 << " rollback_ms=" << semantic_chunk_stats.rollback_s * 1e3
+                 << " reselect_ms=" << semantic_chunk_stats.reselect_s * 1e3
+                 << " replay_ms=" << semantic_chunk_stats.replay_s * 1e3;
+            log(smsg.str());
+        }
 #ifdef QW3_ENABLE_CUDA
         if (profile_cuda_prefill) {
             st = device_->synchronize();
@@ -10858,6 +11155,14 @@ private:
         // the CB per-request executors are excluded, so those paths are untouched.
         const bool transcript_replay_requested =
             !options.kvmem_replay_query_spans.empty();
+        const bool semantic_chunk =
+            options.kvmem_prefill_window_mode ==
+            KvMemPrefillWindowMode::SemanticChunk;
+        if (semantic_chunk && transcript_replay_requested) {
+            throw std::runtime_error(
+                "semantic-chunk prefill and transcript replay are mutually "
+                "exclusive");
+        }
         const bool inline_refresh =
             options.kvmem_inline_refresh !=
             KvMemInlineRefreshMode::Off;
@@ -10897,14 +11202,14 @@ private:
             override_executor == nullptr;
         const KvmemReuse kvmem_ru =
             (reset_session && override_executor == nullptr &&
-             !transcript_replay_requested && !api_session)
+             !transcript_replay_requested && !semantic_chunk && !api_session)
                 ? kvmem_prefix_reuse(prompt_tokens, options)
                 : KvmemReuse{};
         const uint32_t kvmem_reuse_m = kvmem_ru.c;
         const bool kvmem_warm_reuse = kvmem_reuse_m > 0;
         const bool kvmem_warm_capture =
             reset_session && override_executor == nullptr &&
-            !transcript_replay_requested && !api_session &&
+            !transcript_replay_requested && !semantic_chunk && !api_session &&
             !inline_refresh &&
             kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
@@ -11036,6 +11341,21 @@ private:
                 executor_->block_store()->config().retrieval_method);
         const bool kvmem_warm_source_index_ready =
             qc_active || kvmem_warm_history_index_capture;
+        if (semantic_chunk) {
+            if (!kvmem_on || !qc_active || !reset_session ||
+                override_executor != nullptr || api_session || dump != nullptr ||
+                inline_refresh || !executor_->block_store() ||
+                !kvmem_query_replay_retrieval_supported(
+                    executor_->block_store()->config().retrieval_method)) {
+                throw std::runtime_error(
+                    "semantic-chunk prefill requires a fresh, above-budget, "
+                    "query-conditioned Mean-K/SubBlockMeanK MTP request");
+            }
+            if (!mtp_local_positions) {
+                throw std::runtime_error(
+                    "semantic-chunk MTP prefill requires local MTP positions");
+            }
+        }
         const bool transcript_replay =
             transcript_replay_requested && kvmem_on && qc_active &&
             reset_session && !kvmem_warm_reuse && !kvmem_warm_capture &&
@@ -11140,7 +11460,8 @@ private:
             !kvmem_warm_reuse && !kvmem_warm_capture && dump == nullptr;
         const bool recompute_query =
             kvmem_on && qc_active &&
-            kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
+            (semantic_chunk ||
+             kvmem_recompute_query_enabled(options_.kvmem_recompute_query)) &&
             !transcript_replay && !query_replay && !clean_query &&
             dump == nullptr && executor_->block_store() &&
             kvmem_query_replay_retrieval_supported(
@@ -11404,6 +11725,16 @@ private:
         auto prime_mtp_prefix = [&](const std::vector<uint32_t> &tokens,
                                     uint32_t base_position) {
             if (!use_mtp_prefix) return;
+            // The provisional semantic pass only captures target-model Q and
+            // is rolled back immediately. Building draft-prefix K/V here would
+            // double MTP prefill work without affecting selection or output;
+            // the durable replay below primes MTP once under the chosen window.
+            if (executor_->kvmem_provisional_prefill()) {
+                if (mtp_local_positions) {
+                    executor_->kvmem_set_defer_prefill_pressure(false);
+                }
+                return;
+            }
             NativeExecutorReport mtp;
             try {
                 if (mtp_local_positions) {
@@ -11672,6 +12003,7 @@ private:
             executor_->kvmem_set_prefill_reselect_suppressed(false);
         };
         bool query_replay_applied = false;
+        KvMemSemanticChunkStats semantic_chunk_stats;
         if (dump) {
             if (use_mtp_prefix) {
                 log("native mtp_prefix: ok=false reason=\"dump logits path does not expose batch hidden rows\"");
@@ -13055,7 +13387,35 @@ private:
             // the hybrid recurrent state there, then finish the prompt exactly
             // as usual. The post-prefill selection below still uses this first
             // pass's pressure-window query.
-            if (kvmem_query_replay_begin >= prefill_absolute_base) {
+            if (semantic_chunk) {
+                if (prefill_absolute_base != 0 || kvmem_prefill_begin != 0 ||
+                    kvmem_do_boundary_capture) {
+                    throw std::runtime_error(
+                        "semantic-chunk MTP prefill requires a cold prompt "
+                        "without a warm prefix checkpoint");
+                }
+                semantic_chunk_stats = kvmem_prefill_semantic_chunks(
+                    executor_, logical_prompt_tokens,
+                    /*begin=*/0, kvmem_query_replay_begin,
+                    options.kvmem_prefill_semantic_start_tokens,
+                    options.kvmem_prefill_semantic_query_tokens,
+                    [&](uint32_t begin, uint32_t end, bool need_logits) {
+                        do_prefill_range(begin, end, need_logits);
+                    });
+                // Switch back from the per-chunk retrieval spans to the final
+                // user question while preserving the accumulated history index.
+                executor_->kvmem_set_query_span(
+                    options.kvmem_query_begin, options.kvmem_query_end,
+                    logical_prompt_tokens,
+                    /*index_tokens=*/kvmem_query_replay_begin,
+                    /*preserve_content_index=*/true);
+                executor_->capture_state(kvmem_query_replay_ckpt);
+                executor_->kvmem_start_query_prefetch(
+                    static_cast<uint32_t>(
+                        prefill_tokens.size() - kvmem_query_replay_begin));
+                do_prefill_range(kvmem_query_replay_begin,
+                                 prefill_tokens.size());
+            } else if (kvmem_query_replay_begin >= prefill_absolute_base) {
                 const size_t replay_local = static_cast<size_t>(
                     kvmem_query_replay_begin - prefill_absolute_base);
                 if (replay_local > prefill_tokens.size()) {
@@ -13106,6 +13466,21 @@ private:
             executor_->kvmem_set_defer_prefill_pressure(false);
         }
         const double t_prefill_end = wall_seconds();
+        if (semantic_chunk_stats.chunks != 0) {
+            std::ostringstream smsg;
+            smsg << std::fixed << std::setprecision(3)
+                 << "native kvmem semantic-chunk (mtp): chunks="
+                 << semantic_chunk_stats.chunks
+                 << " provisional_tokens="
+                 << semantic_chunk_stats.provisional_tokens
+                 << " replay_tokens=" << semantic_chunk_stats.replay_tokens
+                 << " provisional_ms="
+                 << semantic_chunk_stats.provisional_s * 1e3
+                 << " rollback_ms=" << semantic_chunk_stats.rollback_s * 1e3
+                 << " reselect_ms=" << semantic_chunk_stats.reselect_s * 1e3
+                 << " replay_ms=" << semantic_chunk_stats.replay_s * 1e3;
+            log(smsg.str());
+        }
 
         // Snapshot kvmem timing at the prefill->reselect boundary. The reselect
         // below is the post-prefill (decode-window) selection the session

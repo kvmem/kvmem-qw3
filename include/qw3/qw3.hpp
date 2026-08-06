@@ -23,6 +23,11 @@ enum class KvMemReselectMode {
 enum class KvMemPrefillWindowMode {
     Pressure,
     KeepSelected,
+    // After the configured history threshold, treat every physical prefill
+    // chunk as a semantic query: run it provisionally, roll back, select a
+    // bounded historical window, then replay the chunk into that window.
+    // Request-only and opt-in; the production default remains Pressure.
+    SemanticChunk,
 };
 
 enum class KvMemLocalCacheMode {
@@ -251,6 +256,12 @@ struct GenerationOptions {
     KvMemReselectMode kvmem_reselect_mode = KvMemReselectMode::Auto;
     KvMemPrefillWindowMode kvmem_prefill_window_mode =
         KvMemPrefillWindowMode::Pressure;
+    // SemanticChunk controls. Zero start inherits the active prefill budget;
+    // zero query tokens scores the complete physical prefill chunk. A non-zero
+    // query-token cap takes the suffix of the chunk while replaying the whole
+    // chunk, which is useful for scorer-cost ablations.
+    uint32_t kvmem_prefill_semantic_start_tokens = 0;
+    uint32_t kvmem_prefill_semantic_query_tokens = 0;
     // Optional request-local semantic selection budget in tokens. Zero inherits
     // the engine's --kvmem-budget, which is also the hard upper bound. This
     // does not change the pressure-prefill budget or resize the GPU KV pool.
