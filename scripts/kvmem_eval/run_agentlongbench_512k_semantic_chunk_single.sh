@@ -7,9 +7,13 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT=${PORT:-18089}
 GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.50}
 GEN_BUDGET=${GEN_BUDGET:-8192}
+RECENT_TOKENS=${RECENT_TOKENS:-4096}
+SEMANTIC_QUERY_TOKENS=${SEMANTIC_QUERY_TOKENS:-512}
+THINKING_BUDGET=${THINKING_BUDGET:-4096}
 START_INDEX=${START_INDEX:-0}
 LIMIT=${LIMIT:-1}
 TAG=${TAG:-agentlongbench_512k_k32_semantic_chunk_q512_adaptive_b32_fp8_mtp4_20260806}
+METHOD=${METHOD:-kvmem_adaptive_k32_b32_semantic_chunk_q512_fp8_mtp4}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
 MODEL=${MODEL:-$ROOT/models/Qwen3.6-27B-Q8_0.gguf}
@@ -79,7 +83,7 @@ env \
     --kvmem --kvmem-block-tokens 32 \
     --kvmem-budget 32768 --kvmem-prefill-budget 32768 \
     --kvmem-gen-budget "$GEN_BUDGET" \
-    --kvmem-sink-tokens 512 --kvmem-recent-tokens 4096 \
+    --kvmem-sink-tokens 512 --kvmem-recent-tokens "$RECENT_TOKENS" \
     --kvmem-method retrieval \
     --kvmem-retrieval-method key-direction-adaptive \
     --kvmem-index-placement gpu --kvmem-index-staging-mb 64 \
@@ -91,7 +95,7 @@ env \
     --kvmem-cpu-gb 48 --no-kvmem-raw-k-nvme \
     --kvmem-opt-stage-out on --kvmem-opt-stage-in on \
     --kvmem-opt-pack on \
-    --enable-thinking --thinking-budget 4096 \
+    --enable-thinking --thinking-budget "$THINKING_BUDGET" \
     --prefill-chunk 2048 --temp 0.6 \
     --native-mtp-speculate --mtp-chain 4 \
     --host 127.0.0.1 --port "$PORT" \
@@ -117,7 +121,7 @@ curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null
   --output-root "$RESULT_ROOT" \
   --api-base "http://127.0.0.1:$PORT/v1" \
   --model "$(basename "$MODEL")" \
-  --method kvmem_adaptive_k32_b32_semantic_chunk_q512_fp8_mtp4 \
+  --method "$METHOD" \
   --temperature 0.6 --top-p 0.95 --max-tokens "$GEN_BUDGET" \
   --context-window 655360 --context-safety-margin 16 \
   --timeout-sec 14400 --max-sample-sec 14400 --attempts 1 \
@@ -125,6 +129,6 @@ curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null
   --kvmem-retrieval-trace-metadata \
   --kvmem-prefill-window semantic_chunk \
   --kvmem-prefill-semantic-start-tokens 32768 \
-  --kvmem-prefill-semantic-query-tokens 512 \
+  --kvmem-prefill-semantic-query-tokens "$SEMANTIC_QUERY_TOKENS" \
   "${selection_args[@]}" \
   2>&1 | tee -a "$RUN_LOG"
