@@ -90,6 +90,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--kvmem-prefill-window",
+        choices=("pressure", "keep_selected", "semantic_chunk"),
+        help=(
+            "override the request-level KVMem prefill-window policy; omitted "
+            "requests retain the server default"
+        ),
+    )
+    parser.add_argument(
+        "--kvmem-prefill-semantic-start-tokens",
+        type=int,
+        default=0,
+        metavar="TOKENS",
+        help="semantic-chunk reselection begins after this many prompt tokens",
+    )
+    parser.add_argument(
+        "--kvmem-prefill-semantic-query-tokens",
+        type=int,
+        default=0,
+        metavar="TOKENS",
+        help="use at most the trailing N tokens of each chunk as its retrieval query",
+    )
+    parser.add_argument(
         "--kvmem-round-padding",
         type=int,
         default=0,
@@ -403,6 +425,15 @@ def chat_completion(
             payload["kvmem_round_padding"] = args.kvmem_round_padding
     if args.kvmem_inline_refresh is not None:
         payload["kvmem_inline_refresh"] = args.kvmem_inline_refresh
+    if args.kvmem_prefill_window is not None:
+        payload["kvmem_prefill_window"] = args.kvmem_prefill_window
+    if args.kvmem_prefill_window == "semantic_chunk":
+        payload["kvmem_prefill_semantic_start_tokens"] = (
+            args.kvmem_prefill_semantic_start_tokens
+        )
+        payload["kvmem_prefill_semantic_query_tokens"] = (
+            args.kvmem_prefill_semantic_query_tokens
+        )
     if args.seed is not None:
         payload["seed"] = args.seed
     request = urllib.request.Request(
@@ -638,6 +669,21 @@ def write_final(
 
 def main() -> None:
     args = parse_args()
+    if args.kvmem_prefill_semantic_start_tokens < 0:
+        raise RuntimeError("--kvmem-prefill-semantic-start-tokens must be >= 0")
+    if args.kvmem_prefill_semantic_query_tokens < 0:
+        raise RuntimeError("--kvmem-prefill-semantic-query-tokens must be >= 0")
+    if (
+        args.kvmem_prefill_window != "semantic_chunk"
+        and (
+            args.kvmem_prefill_semantic_start_tokens > 0
+            or args.kvmem_prefill_semantic_query_tokens > 0
+        )
+    ):
+        raise RuntimeError(
+            "semantic start/query token controls require "
+            "--kvmem-prefill-window semantic_chunk"
+        )
     if args.kvmem_round_padding < 0:
         raise RuntimeError("--kvmem-round-padding must be >= 0")
     if args.kvmem_round_padding > 0 and not args.kvmem_round_only:
@@ -709,6 +755,13 @@ def main() -> None:
         "kvmem_message_expansion": args.kvmem_message_expansion,
         "kvmem_round_padding": args.kvmem_round_padding,
         "kvmem_inline_refresh": args.kvmem_inline_refresh,
+        "kvmem_prefill_window": args.kvmem_prefill_window,
+        "kvmem_prefill_semantic_start_tokens": (
+            args.kvmem_prefill_semantic_start_tokens
+        ),
+        "kvmem_prefill_semantic_query_tokens": (
+            args.kvmem_prefill_semantic_query_tokens
+        ),
         "seed": args.seed,
         "allow_custom_subset": args.allow_custom_subset,
         "selected_samples": len(samples),
@@ -732,6 +785,9 @@ def main() -> None:
             "kvmem_message_expansion",
             "kvmem_round_padding",
             "kvmem_inline_refresh",
+            "kvmem_prefill_window",
+            "kvmem_prefill_semantic_start_tokens",
+            "kvmem_prefill_semantic_query_tokens",
             "seed",
             "allow_custom_subset",
             "selected_samples",
