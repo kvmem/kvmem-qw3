@@ -66,6 +66,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ssd-root", type=Path,
                    default=Path("/home/chaidi/kca/memoryagentbench_tmp"))
     p.add_argument("--tmpfs-limit-gib", type=float, default=50.0)
+    p.add_argument(
+        "--archive-storage", choices=("auto", "cpu-only"), default="auto",
+        help=(
+            "auto falls back from tmpfs to --ssd-root; cpu-only requires "
+            "every temporary archive to fit in RAM-backed tmpfs and never "
+            "uses the SSD path"
+        ),
+    )
     p.add_argument("--split", action="append", choices=SPLITS)
     p.add_argument("--source", action="append")
     p.add_argument("--row", type=int, action="append")
@@ -235,7 +243,8 @@ def main() -> int:
     args.model = args.model.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "rows").mkdir(exist_ok=True)
-    args.ssd_root.mkdir(parents=True, exist_ok=True)
+    if args.archive_storage == "auto":
+        args.ssd_root.mkdir(parents=True, exist_ok=True)
     selected_splits = args.split or list(SPLITS)
     run_id = safe_name(args.out_dir.name)
     work: list[tuple[str, Path, int, str]] = []
@@ -351,6 +360,13 @@ def main() -> int:
         tmpfs_cap = int(args.tmpfs_limit_gib * (1 << 30))
         tmpfs_free = available_bytes(args.tmpfs_root)
         use_tmpfs = estimate <= tmpfs_cap and estimate <= int(tmpfs_free * 0.92)
+        if args.archive_storage == "cpu-only" and not use_tmpfs:
+            raise RuntimeError(
+                "CPU-only archive does not fit RAM-backed tmpfs: "
+                f"estimate={estimate/(1<<30):.2f} GiB "
+                f"limit={args.tmpfs_limit_gib:.2f} GiB "
+                f"free={tmpfs_free/(1<<30):.2f} GiB"
+            )
         archive_parent = args.tmpfs_root if use_tmpfs else args.ssd_root
         archive_dir = archive_parent / f"qw3_mab_{run_id}_{row_name}"
         cpu_gb = args.cpu_gb_tmpfs if use_tmpfs else args.cpu_gb_ssd

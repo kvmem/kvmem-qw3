@@ -121,7 +121,12 @@ void usage(std::ostream &os) {
         "                        forward path is byte-identical to the default.\n"
         "  --kvmem-block-tokens N   Block granularity in tokens (multiple of KV page\n"
         "                        size). Default: 128.\n"
-        "  --kvmem-budget N  Max window tokens kept per selection. Default: 131072.\n"
+        "  --kvmem-budget N  Maximum semantic/decode window tokens per request.\n"
+        "                        Requests may narrow it with kvmem_semantic_budget.\n"
+        "                        Default: 131072.\n"
+        "  --kvmem-prefill-budget N  Pressure window used while ingesting long\n"
+        "                        history. Must be >= --kvmem-budget and defaults\n"
+        "                        to the same value when omitted.\n"
         "  --kvmem-interval N  Decode steps between reselections. Default: 64.\n"
         "  --kvmem-sink-tokens N    Always-kept prefix tokens (rounded to blocks).\n"
         "  --kvmem-recent-tokens N  Always-kept suffix tokens (rounded to blocks).\n"
@@ -496,6 +501,8 @@ int main(int argc, char **argv) {
                 engine.kvmem_block_tokens = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-budget") {
                 engine.kvmem_budget = parse_int(need(arg), arg);
+            } else if (arg == "--kvmem-prefill-budget") {
+                engine.kvmem_prefill_budget = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-gen-budget") {
                 engine.kvmem_gen_budget = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-interval") {

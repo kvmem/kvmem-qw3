@@ -1,0 +1,81 @@
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.10}
+
+\caption{
+Utility and efficiency results across controlled long-history benchmarks.
+Higher values are better for utility metrics, while lower values are better
+for pre-answer latency. Each method is evaluated using the frozen configuration
+that produced its reported utility result; active-context budgets are
+method- and benchmark-specific and are listed in the appendix. Full Context is
+reported only when the complete history fits the model and KV-cache capacity.
+Pre-answer latency is measured from the start of query-dependent context
+preparation to the first non-empty model token, including method-specific
+retrieval and final-query input processing, while excluding subsequent answer
+decoding and cold source-history ingestion. For Compact-only and Compact+RAG,
+values in parentheses exclude compact-summary generation.
+}
+\label{tab:utility-efficiency}
+
+\begin{tabular}{@{}llccccc@{}}
+\toprule
+\textbf{Benchmark}
+& \textbf{Metric}
+& \textbf{Full Context} (ref.)
+& \textbf{Sliding Window}
+& \textbf{Compact-only}
+& \textbf{Compact+RAG}
+& \textbf{\sys} \\
+\midrule
+
+\multirow{2}{*}{LongMemEval-S}
+& Answer Acc. (\%) $\uparrow$
+& 86.60 & 26.80 & 45.60 & \textbf{86.20} & \underline{85.60} \\
+& Pre-answer Latency (s) $\downarrow$
+& 0.81 & \underline{42.29} & 68.88 (3.50) & 116.13 (50.75) & \textbf{1.68} \\
+\midrule
+
+\multirow{2}{*}{LongMemEval-M}
+& Answer Acc. (\%) $\uparrow$
+& -- & -- & -- & -- & \textit{TBD} \\
+& Pre-answer Latency (s) $\downarrow$
+& -- & -- & -- & -- & \textit{TBD} \\
+\midrule
+
+\multirow{2}{*}{\shortstack[l]{MemoryAgentBench\\($>256$K)}}
+& Overall Score (\%) $\uparrow$
+& -- & 17.95 & 27.54 & \underline{34.80} & \textbf{40.99} \\
+& Pre-answer Latency (s) $\downarrow$
+& -- & \textbf{0.22} & 344.38 (1.22) & 357.81 (14.66) & \underline{4.28} \\
+\midrule
+
+\multirow{2}{*}{\shortstack[l]{AgentLongBench\\($\leq$256K)}}
+& Task Success (\%) $\uparrow$
+& 59.54 & 25.36 & 15.84 & \underline{47.49} & \textbf{60.87} \\
+& Pre-answer Latency (s) $\downarrow$
+& 0.08 & \underline{41.43} & 326.80 (1.32) & 380.94 (55.45) & \textbf{0.63} \\
+\midrule
+
+\multirow{2}{*}{\shortstack[l]{AgentLongBench\\(512K)}}
+& Task Success (\%) $\uparrow$
+& -- & 25.00 & 22.50 & \textbf{54.00} & \underline{53.00} \\
+& Pre-answer Latency (s) $\downarrow$
+& -- & \underline{39.12} & 1317.61 (68.86) & 1449.19 (200.44) & \textbf{1.07} \\
+\midrule
+
+\multirow{2}{*}{\shortstack[l]{AgentLongBench\\(1M)}}
+& Task Success (\%) $\uparrow$
+& -- & 20.00 & 32.00 & \underline{42.00} & \textbf{48.00} \\
+& Pre-answer Latency (s) $\downarrow$
+& -- & \underline{39.12} & -- (17.57) & -- (71.82) & \textbf{1.37} \\
+\midrule
+
+Average
+& Normalized Utility $\uparrow$
+& 1.00 & -- & -- & -- & \textit{TBD} \\
+
+\bottomrule
+\end{tabular}
+\end{table*}

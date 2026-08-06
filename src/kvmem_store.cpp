@@ -28,6 +28,30 @@ uint32_t ceil_percent(uint32_t value, uint32_t percent) {
 
 }  // namespace
 
+void KvMemStore::set_runtime_select_budget(uint32_t tokens) {
+    if (tokens == 0) {
+        runtime_select_budget_ = 0;
+        return;
+    }
+    if (tokens > cfg_.select_budget) {
+        throw std::invalid_argument(
+            "KVMem request semantic budget exceeds configured maximum");
+    }
+    if (tokens < cfg_.block_tokens || tokens % cfg_.block_tokens != 0) {
+        throw std::invalid_argument(
+            "KVMem request semantic budget must be a positive multiple of "
+            "block_tokens");
+    }
+    const uint32_t blocks = tokens / cfg_.block_tokens;
+    if (static_cast<uint64_t>(cfg_.sink_blocks) + cfg_.recent_blocks >
+        blocks) {
+        throw std::invalid_argument(
+            "KVMem request semantic budget is smaller than the configured "
+            "sink + recent allocation");
+    }
+    runtime_select_budget_ = tokens;
+}
+
 KvMemKeepAllocation resolve_kvmem_keep_allocation(
         uint32_t block_tokens,
         uint32_t select_budget,
@@ -271,7 +295,7 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
 
-    const uint32_t budget = budget_blocks();
+    const uint32_t budget = prefill_budget_blocks();
     if (budget == 0 || n <= budget) {
         selected.reserve(n);
         for (uint32_t i = 0; i < n; ++i) selected.push_back(i);

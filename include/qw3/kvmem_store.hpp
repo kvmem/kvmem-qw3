@@ -229,7 +229,10 @@ enum class KvMemAdaptiveScoreMode : uint8_t {
 
 struct KvMemStoreConfig {
     uint32_t block_tokens = 128;     // --kvmem-block-tokens
-    uint32_t select_budget = 131072; // --kvmem-budget (max window tokens)
+    uint32_t select_budget = 131072; // --kvmem-budget (semantic window tokens)
+    // Pressure-only prefill window. configure_kvmem normalizes zero to
+    // select_budget, so old callers retain byte-identical behavior.
+    uint32_t prefill_budget = 0;     // --kvmem-prefill-budget
     uint32_t gen_budget = 32768;     // --kvmem-gen-budget (GPU pool reserve for
                                      // one turn's newly generated tokens)
     uint32_t sink_blocks = 1;        // --kvmem-sink-blocks (always-kept prefix)
@@ -341,8 +344,26 @@ public:
     // is a no-op (returns empty).
     std::vector<KvMemDroppedBlock> truncate_to(uint32_t token_pos);
 
-    // Capacity of the selection budget measured in blocks.
-    uint32_t budget_blocks() const { return cfg_.select_budget / cfg_.block_tokens; }
+    // Capacity of the semantic selection budget. `select_budget` is the
+    // configured hard upper bound; a non-zero runtime value narrows one
+    // request/frozen branch without changing pressure-prefill capacity or any
+    // allocation made at configure time.
+    uint32_t select_budget_tokens() const {
+        return runtime_select_budget_ != 0
+            ? runtime_select_budget_ : cfg_.select_budget;
+    }
+    uint32_t runtime_select_budget_tokens() const {
+        return runtime_select_budget_;
+    }
+    void set_runtime_select_budget(uint32_t tokens);
+    uint32_t budget_blocks() const {
+        return select_budget_tokens() / cfg_.block_tokens;
+    }
+    uint32_t prefill_budget_blocks() const {
+        const uint32_t tokens = cfg_.prefill_budget != 0
+            ? cfg_.prefill_budget : cfg_.select_budget;
+        return tokens / cfg_.block_tokens;
+    }
 
     // Built-in v1 selection: top-k blocks by cumulative attention score, always
     // keeping the first `sink_blocks` and last `recent_blocks` blocks. Returns
@@ -421,6 +442,7 @@ public:
 
 private:
     KvMemStoreConfig cfg_;
+    uint32_t runtime_select_budget_ = 0;
     std::vector<KvMemBlock> blocks_;
     uint32_t total_tokens_ = 0;  // total appended context length
 };

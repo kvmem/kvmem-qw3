@@ -5491,7 +5491,7 @@ uint32_t QwenExecutor::effective_prefill_chunk_size(uint32_t total) const {
             std::max<uint32_t>(1, block_tokens / psz);
         const uint32_t pool_pages = kvmem_gpu_page_pool_->total_pages();
         const uint32_t budget_blocks =
-            std::max<uint32_t>(1, block_store_->budget_blocks());
+            std::max<uint32_t>(1, block_store_->prefill_budget_blocks());
         const uint32_t cushion_blocks =
             std::max<uint32_t>(1, block_store_->config().recent_blocks);
         const uint64_t resident_pages =
@@ -7505,6 +7505,20 @@ std::vector<int32_t> QwenExecutor::kv_physical_pages() const {
 
 // ---- Block-sparse KV attention ------------------------------------------
 
+uint32_t QwenExecutor::kvmem_set_runtime_select_budget(uint32_t tokens) {
+    if (!block_store_) {
+        if (tokens != 0) {
+            throw std::invalid_argument(
+                "KVMem request semantic budget requires KVMem");
+        }
+        return 0;
+    }
+    const uint32_t previous =
+        block_store_->runtime_select_budget_tokens();
+    block_store_->set_runtime_select_budget(tokens);
+    return previous;
+}
+
 void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_drain_mean_index_capture();
     kvmem_finish_proactive_d2h(/*wait_all=*/true);
@@ -7689,6 +7703,17 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         effective.gpu_high_watermark = effective.gpu_low_watermark;
     }
     if (effective.gpu_high_watermark > 1.0) effective.gpu_high_watermark = 1.0;
+    if (effective.prefill_budget == 0) {
+        effective.prefill_budget = effective.select_budget;
+    }
+    if (effective.prefill_budget < effective.select_budget) {
+        throw std::runtime_error(
+            "KVMem prefill budget must be >= semantic selection budget");
+    }
+    if (effective.prefill_budget % effective.block_tokens != 0) {
+        throw std::runtime_error(
+            "KVMem prefill budget must be divisible by block_tokens");
+    }
 
     const QwenConfig &model_cfg = model_.config();
     const uint32_t standard_layers =
@@ -7729,7 +7754,8 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         const uint64_t max_position = std::min<uint64_t>(
             kv_ctx_size_,
             std::max<uint64_t>(
-                effective.select_budget,
+                std::max(effective.select_budget,
+                         effective.prefill_budget),
                 effective.immutable_max_baked_position));
         if (max_position == 0 ||
             max_position > std::numeric_limits<uint32_t>::max()) {
@@ -7761,13 +7787,15 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     // it can change model output, so keep it disabled for every combination.
     kvmem_mtp_incremental_assembly_ = false;
     if (kvmem_mtp_local_positions_ && model_cfg.n_ctx_train > 0 &&
-        static_cast<uint64_t>(effective.select_budget) +
+        static_cast<uint64_t>(std::max(effective.select_budget,
+                                       effective.prefill_budget)) +
                 effective.gen_budget >
             model_cfg.n_ctx_train) {
         throw std::runtime_error(
             "KVMem local-position MTP requires --kvmem-budget + "
             "--kvmem-gen-budget to fit inside the model context limit (" +
-            std::to_string(effective.select_budget) + " + " +
+            std::to_string(std::max(effective.select_budget,
+                                    effective.prefill_budget)) + " + " +
             std::to_string(effective.gen_budget) + " > " +
             std::to_string(model_cfg.n_ctx_train) + ")");
     }
@@ -7976,7 +8004,9 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             (effective.cpu_tier_bytes > 0 || effective.nvme_tier_bytes > 0);
         if (tiers_available) {
             const uint32_t budget_blocks_min = std::max<uint32_t>(
-                1, effective.select_budget / effective.block_tokens);
+                1, std::max(effective.select_budget,
+                            effective.prefill_budget) /
+                       effective.block_tokens);
             const uint32_t recent_blocks_min = effective.recent_blocks;
             const long double lw = effective.gpu_low_watermark > 0.0
                 ? static_cast<long double>(effective.gpu_low_watermark)
@@ -7995,16 +8025,18 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
         }
         effective.estimated_gpu_block_capacity = cap_blocks;
         if (cap_blocks > 0) {
-            // The bounded GPU pool must hold BOTH the selection window
-            // (select_budget) AND one turn's newly generated tokens
+            // The bounded GPU pool must hold BOTH the widest pressure/semantic
+            // selection window and one turn's newly generated tokens
             // (gen_budget). In step update-mode no decode-time stage-out fires,
             // so a turn's register_append blocks stay GPU-resident; sizing the
             // pool to budget + gen_reserve makes mid-decode pool exhaustion
             // structurally impossible (paired with the server's max_tokens <=
             // gen_budget clamp). Hard-fail at configure time when VRAM can't fit
             // both, naming the knobs, instead of silently shrinking the window.
+            const uint32_t active_budget = std::max(
+                effective.select_budget, effective.prefill_budget);
             const uint32_t sel_budget_blocks = std::max<uint32_t>(
-                1, (effective.select_budget + effective.block_tokens - 1) /
+                1, (active_budget + effective.block_tokens - 1) /
                        effective.block_tokens);
             const uint32_t gen_reserve_blocks =
                 (effective.gen_budget + effective.block_tokens - 1) /
@@ -8016,7 +8048,8 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                     "kvmem: GPU pool cannot fit selection budget + generation "
                     "reserve. Need " + std::to_string(required_blocks) +
                     " blocks (" + std::to_string(sel_budget_blocks) +
-                    " for --kvmem-budget + " + std::to_string(gen_reserve_blocks) +
+                    " for max(--kvmem-budget, --kvmem-prefill-budget) + " +
+                    std::to_string(gen_reserve_blocks) +
                     " for --kvmem-gen-budget) but only " +
                     std::to_string(cap_blocks) + " fit under the current VRAM "
                     "ceiling. Raise --kvmem-gpu-memory-ratio, or lower "
@@ -12812,8 +12845,11 @@ uint32_t QwenExecutor::kvmem_reselect_prefill_pressure() {
             ? selected[sink] : n;
         std::fprintf(stderr,
                      "[bs-prefill-pressure] blocks=%u selected=%zu sink=%u "
-                     "tail_begin=%u\n",
-                     n, selected.size(), sink, tail_begin);
+                     "tail_begin=%u prefill_budget_blocks=%u "
+                     "semantic_budget_blocks=%u\n",
+                     n, selected.size(), sink, tail_begin,
+                     block_store_->prefill_budget_blocks(),
+                     block_store_->budget_blocks());
     }
     return kvmem_set_selection(selected);
 }
@@ -12824,7 +12860,11 @@ void QwenExecutor::kvmem_prepare_prefill_window(uint32_t upcoming_tokens) {
     if (kvmem_keep_selected_prefill_) return;
     const uint64_t projected_tokens =
         static_cast<uint64_t>(position_) + upcoming_tokens;
-    if (projected_tokens <= block_store_->config().select_budget) return;
+    const uint32_t pressure_budget =
+        block_store_->config().prefill_budget != 0
+            ? block_store_->config().prefill_budget
+            : block_store_->config().select_budget;
+    if (projected_tokens <= pressure_budget) return;
     (void)kvmem_reselect_prefill_pressure();
 }
 
@@ -13158,7 +13198,9 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                         "\"selected\":%u,\"query_begin\":%u,\"query_end\":%u,"
                         "\"context_begin\":%u,\"context_end\":%u,"
                         "\"prompt_tokens\":%zu,"
-                        "\"budget_blocks\":%u,\"recent\":%u,\"sink\":%u,"
+                        "\"budget_blocks\":%u,"
+                        "\"prefill_budget_blocks\":%u,"
+                        "\"recent\":%u,\"sink\":%u,"
                         "\"block_tokens\":%u,\"method\":\"%s\",\"mask\":%d,"
                         "\"scorer_requested\":\"%s\","
                         "\"scorer_used\":\"%s\","
@@ -13172,7 +13214,8 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                         kvmem_query_begin_, kvmem_query_end_,
                         kvmem_context_begin_, kvmem_context_end_,
                         kvmem_trace_prompt_tokens_.size(),
-                        block_store_->budget_blocks(), cfg.recent_blocks,
+                        block_store_->budget_blocks(),
+                        block_store_->prefill_budget_blocks(), cfg.recent_blocks,
                         cfg.sink_blocks, cfg.block_tokens,
                         kvmem_qc_deltanet_ ? "deltanet" :
                             (kvmem_qc_pertoken_ ? "per-token" :
@@ -19979,9 +20022,15 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
 
     DeviceTensor &h_inputs = *norm_batch_;
     DeviceTensor &mtp_h = *attn_out_batch_;
-    DeviceTensor &mtp_norm = *ffn_out_batch_;
+    DeviceTensor &mtp_token_emb = *ffn_out_batch_;
     DeviceTensor &mtp_concat = *proj_batch_;
-    DeviceTensor &mtp_enorm = *gate_proj_batch_;
+    if (!mtp_prefix_norm_batch_ || mtp_prefix_norm_capacity_ < batch) {
+        mtp_prefix_norm_batch_ = backend_.scratch_f32(
+            static_cast<uint64_t>(batch) * h_stride,
+            "mtp_prefix_norm_batch");
+        mtp_prefix_norm_capacity_ = batch;
+    }
+    DeviceTensor &mtp_norm = *mtp_prefix_norm_batch_;
     DeviceTensor &mtp_q = *q_batch_;
     DeviceTensor &mtp_k_batch = *k_batch_;
     DeviceTensor &mtp_v_batch = *v_batch_;
@@ -19997,22 +20046,27 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
 
     std::vector<uint64_t> rows(batch);
     for (uint32_t i = 0; i < batch; ++i) rows[i] = tokens[i];
-    require_status(backend_.q8_0_get_rows_batch(mtp_norm, *mtp->embed_tokens,
+    require_status(backend_.q8_0_get_rows_batch(mtp_token_emb, *mtp->embed_tokens,
                                                 rows.data(), batch));
     record(report, "mtp.token_embedding_lookup_batch");
-    require_status(backend_.rms_norm_batch(mtp_enorm, mtp_norm,
+    // Main prefill activations may be BF16.  Reusing attn_out/ffn_out is still
+    // safe, but rms_norm's output must stay F32: CUDA intentionally has no BF16
+    // output kernel.  Use one hidden-width F32 workspace for both normalized
+    // embedding and later attention norm, and normalize h_inputs in place after
+    // its packed rows have been consumed by the reduction.
+    require_status(backend_.rms_norm_batch(mtp_norm, mtp_token_emb,
                                            *mtp->enorm, batch, h_stride, eps));
     record(report, "mtp.enorm_batch");
-    require_status(backend_.rms_norm_batch(mtp_h, h_inputs,
+    require_status(backend_.rms_norm_batch(h_inputs, h_inputs,
                                            *mtp->hnorm, batch, h_stride, eps));
     record(report, "mtp.hnorm_batch");
 
     require_status(backend_.pack_mtp_concat(mtp_concat,
-                                            mtp_enorm,
-                                            mtp_h,
+                                            mtp_norm,
+                                            h_inputs,
                                             batch,
                                             h_stride,
-                                            mtp_h_stride,
+                                            h_stride,
                                             concat_stride,
                                             h_stride));
     record(report, "mtp.concat_batch");

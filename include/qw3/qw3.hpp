@@ -106,7 +106,12 @@ struct EngineOptions {
     // only when this is true.
     bool kvmem_enabled = false;
     int kvmem_block_tokens = 128;        // block granularity (multiple of KV page size)
-    int kvmem_budget = 131072;    // max window tokens kept per selection
+    int kvmem_budget = 131072;    // semantic/decode window tokens per selection
+    // Long-prefill pressure window. Zero inherits kvmem_budget, preserving the
+    // historical single-budget behavior. A larger value lets history KV be
+    // constructed under a wider sink+recent window before the final semantic
+    // query contracts the active context back to kvmem_budget.
+    int kvmem_prefill_budget = 0;
     int kvmem_gen_budget = 32768; // GPU pool reserve for generated tokens; also caps max_tokens
     int kvmem_interval = 64;      // decode steps between reselections
     // Always-kept prefix/suffix allocation. Negative means derive from the
@@ -246,6 +251,10 @@ struct GenerationOptions {
     KvMemReselectMode kvmem_reselect_mode = KvMemReselectMode::Auto;
     KvMemPrefillWindowMode kvmem_prefill_window_mode =
         KvMemPrefillWindowMode::Pressure;
+    // Optional request-local semantic selection budget in tokens. Zero inherits
+    // the engine's --kvmem-budget, which is also the hard upper bound. This
+    // does not change the pressure-prefill budget or resize the GPU KV pool.
+    uint32_t kvmem_semantic_budget = 0;
     std::string kvmem_session_id;
     // Named process-local checkpoint control. A save captures the completed
     // prefill-only request. A load restores that cache and treats this request's

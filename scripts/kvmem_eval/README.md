@@ -199,9 +199,13 @@ selection, aligned query replay, and retained session checkpoint.
 ## BEAM-10M
 
 `run_beam_10m.py` evaluates the official 10M-token BEAM conversations. Each
-history is sent once as a prefill-only request. Probing questions then restore
-the same immutable history checkpoint through `--kvmem-prefix-cache`; generated
-answers never enter the next question's context.
+history is sent once with `max_tokens=0` and saved through the process-local
+`kvmem_cache` API. Probing questions send only the short final user message and
+load version 1 in `frozen` mode. The server restores the immutable history both
+before and after every branch, so generated answers never enter the next
+question's context and the 10M history is not rendered, tokenized, or transmitted
+again for each probe. The generic single-lineage `--kvmem-prefix-cache` is not a
+frozen-branch API and is deliberately disabled by this launcher.
 
 Download conversation 1 through the Hugging Face mirror. The downloader
 explicitly unsets lowercase and uppercase HTTP(S)/ALL proxy variables before
@@ -232,10 +236,27 @@ scripts/kvmem_eval/run_beam_10m_kvmem.sh
 
 The runner writes an append-safe per-question JSONL, a request audit, a summary,
 and a BEAM-compatible JSON containing `llm_response`. The launcher enables
-prefix-cache tracing and fails unless every question restored a warm KVMem
-checkpoint. Use BEAM's official type-specific evaluator on the compatible JSON;
-`--no-judge` only disables the LongMemEval judge in the generic process
-orchestrator.
+KVMem tracing and fails unless it observes one local-cache save plus both the
+pre-branch and post-branch restore for every question. Use BEAM's official
+type-specific evaluator on the compatible JSON; `--no-judge` only disables the
+LongMemEval judge in the generic process orchestrator.
+
+The server's `--kvmem-budget` is the maximum semantic budget allocated at
+startup. A frozen query may narrow only that branch by sending, for example,
+`"kvmem_semantic_budget": 32768`; omitting the field uses the server maximum.
+The value must be block-aligned and no larger than `--kvmem-budget`.
+`--kvmem-prefill-budget` is unchanged, so one wide history construction can be
+reused for several smaller answer-time budgets without reallocating the KV
+pool. A smoke test for one saved history and three frozen branches is:
+
+```bash
+python scripts/kvmem_local_cache_smoke.py \
+  --semantic-budgets 32768,65536,131072
+```
+
+This is an in-process checkpoint: recurrent/hidden boundary state is copied on
+GPU and the existing tiered KV repository is referenced in place. It does not
+create a context archive or write a second full KV copy to SSD.
 
 ## Core performance ablation
 

@@ -74,7 +74,11 @@ std::string bytes_gib_label(uint64_t bytes) {
 }
 
 bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
-    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty();
+    // Request-local budgets mutate the single executor's selection policy for
+    // the duration of a request. Keep them on the serialized plain/frozen path
+    // until continuous batching has a per-row budget field.
+    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty() &&
+           g.kvmem_semantic_budget == 0;
 }
 
 json usage_json(size_t prompt_tokens, size_t completion_tokens) {
@@ -1726,6 +1730,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  kvmem=" << yesno(engine.kvmem_enabled) << "\n"
               << "  kvmem_block_tokens=" << engine.kvmem_block_tokens << "\n"
               << "  kvmem_budget=" << engine.kvmem_budget << "\n"
+              << "  kvmem_prefill_budget="
+              << (engine.kvmem_prefill_budget > 0
+                      ? engine.kvmem_prefill_budget
+                      : engine.kvmem_budget)
+              << "\n"
               << "  kvmem_update_mode=" << engine.kvmem_update_mode << "\n"
               << "  kvmem_performance_mode="
               << (kvmem_all_optimizations
@@ -1972,6 +1981,52 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.recover_thinking_eos = req.value("recover_thinking_eos", enable_thinking);
         g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
         if (g.thinking_budget < 0) g.thinking_budget = 0;
+
+        if (req.contains("kvmem_semantic_budget")) {
+            if (!engine.kvmem_enabled) {
+                throw std::invalid_argument(
+                    "kvmem_semantic_budget requires --kvmem");
+            }
+            const uint64_t configured_max = static_cast<uint64_t>(
+                std::max(0, engine.kvmem_budget));
+            uint64_t requested = 0;
+            if (!parse_bounded_json_u64(
+                    req["kvmem_semantic_budget"], 1, configured_max,
+                    requested)) {
+                throw std::invalid_argument(
+                    "kvmem_semantic_budget must be a positive integer no "
+                    "larger than --kvmem-budget (" +
+                    std::to_string(configured_max) + ")");
+            }
+            const uint64_t block_tokens = static_cast<uint64_t>(
+                std::max(1, engine.kvmem_block_tokens));
+            if (requested % block_tokens != 0) {
+                throw std::invalid_argument(
+                    "kvmem_semantic_budget must be divisible by "
+                    "--kvmem-block-tokens (" +
+                    std::to_string(block_tokens) + ")");
+            }
+            const KvMemKeepAllocation keep =
+                resolve_kvmem_keep_allocation(
+                    static_cast<uint32_t>(block_tokens),
+                    static_cast<uint32_t>(configured_max),
+                    engine.kvmem_sink_blocks,
+                    engine.kvmem_recent_blocks,
+                    engine.kvmem_sink_tokens,
+                    engine.kvmem_recent_tokens);
+            const uint64_t keep_blocks =
+                static_cast<uint64_t>(keep.sink_blocks) +
+                keep.recent_blocks;
+            if (requested / block_tokens < keep_blocks) {
+                throw std::invalid_argument(
+                    "kvmem_semantic_budget is smaller than the configured "
+                    "sink + recent allocation (" +
+                    std::to_string(keep_blocks * block_tokens) +
+                    " tokens)");
+            }
+            g.kvmem_semantic_budget =
+                static_cast<uint32_t>(requested);
+        }
 
         // ARCHIVED DeltaNet-state debug entry (2026-07-23).
         //
@@ -2436,7 +2491,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     " ctx=" + std::to_string(engine.ctx_size));
             return;
         }
-        GenerationOptions g = make_gen(req, prompt_token_count, enable_thinking);
+        GenerationOptions g;
+        try {
+            g = make_gen(req, prompt_token_count, enable_thinking);
+        } catch (const std::invalid_argument &e) {
+            set_error_response(res, 400, e.what());
+            return;
+        }
         g.raw_prompt = true; // prompt is already chat-framed
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
         g.kvmem_reselect_mode = kvmem_reselect_mode;
@@ -2938,7 +2999,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 size_t byte_cursor = 0;
                 size_t token_cursor = 0;
                 const uint64_t pressure_threshold =
-                    static_cast<uint64_t>(std::max(0, engine.kvmem_budget)) +
+                    static_cast<uint64_t>(std::max(
+                        0, engine.kvmem_prefill_budget > 0
+                               ? engine.kvmem_prefill_budget
+                               : engine.kvmem_budget)) +
                     static_cast<uint64_t>(std::max(0, engine.kvmem_gen_budget));
                 for (const RenderedMessageSpan &span : rendered_message_spans) {
                     const std::string gap = prompt.substr(
@@ -4265,13 +4329,298 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     " ctx=" + std::to_string(engine.ctx_size));
             return;
         }
-        GenerationOptions g = make_gen(req, prompt_token_count);
+        const bool enable_thinking =
+            req.value("enable_thinking", cfg.enable_thinking_default);
+        GenerationOptions g;
+        try {
+            g = make_gen(req, prompt_token_count, enable_thinking);
+        } catch (const std::invalid_argument &e) {
+            set_error_response(res, 400, e.what());
+            return;
+        }
         g.raw_prompt = true; // /v1/completions sends raw text, no chat template
+        // Raw completions receive an already-rendered prompt. The caller is
+        // responsible for including the assistant/<think> prefix; this flag
+        // only makes the ordinary thinking-token budget track that open span.
+        g.thinking_open = enable_thinking;
         g.prompt_token_ids_override = std::move(exact_prompt_tokens);
+
+        // Raw-token persistent sessions are useful when a benchmark must freeze
+        // a byte/token-identical history and time only a later query fragment.
+        // Chat sessions cannot provide that guarantee when the split falls
+        // inside one message because rendering the two requests would insert an
+        // extra role boundary.  Keep the controls explicit and token based:
+        // callers may pass an integer-array prompt plus a fragment-local query
+        // span.  The native persistent-session layer translates that span to
+        // logical sequence coordinates using the current append base.
+        bool kvmem_session_request = false;
+        bool kvmem_session_reset = false;
+        std::string kvmem_session_op;
+        if (req.contains("kvmem_session_id") ||
+            req.contains("kvmem_session_op")) {
+            if (!engine.kvmem_enabled) {
+                set_error_response(
+                    res, 400, "kvmem_session_* requires --kvmem");
+                return;
+            }
+            if (!req.contains("kvmem_session_id") ||
+                !req["kvmem_session_id"].is_string() ||
+                req["kvmem_session_id"].get<std::string>().empty() ||
+                !req.contains("kvmem_session_op") ||
+                !req["kvmem_session_op"].is_string()) {
+                set_error_response(
+                    res, 400,
+                    "raw completion sessions require a non-empty "
+                    "kvmem_session_id and kvmem_session_op=start|append|finish");
+                return;
+            }
+            g.kvmem_session_id =
+                req["kvmem_session_id"].get<std::string>();
+            kvmem_session_op =
+                req["kvmem_session_op"].get<std::string>();
+            if (kvmem_session_op != "start" &&
+                kvmem_session_op != "append" &&
+                kvmem_session_op != "finish") {
+                set_error_response(
+                    res, 400,
+                    "kvmem_session_op must be start|append|finish");
+                return;
+            }
+            if (kvmem_session_op != "finish" && g.max_tokens != 0) {
+                set_error_response(
+                    res, 400,
+                    "kvmem session start/append requires max_tokens=0");
+                return;
+            }
+            kvmem_session_request = true;
+            kvmem_session_reset = kvmem_session_op == "start";
+        }
+
+        bool kvmem_cache_request = false;
+        std::string kvmem_cache_id;
+        std::string kvmem_cache_operation;
+        KvMemLocalCacheMode kvmem_cache_mode =
+            KvMemLocalCacheMode::None;
+        uint64_t kvmem_cache_expected_version = 0;
+        bool kvmem_cache_expected_version_set = false;
+        uint64_t kvmem_cache_ttl_seconds = 0;
+        if (req.contains("kvmem_cache")) {
+            if (!engine.kvmem_enabled) {
+                set_error_response(res, 400,
+                                   "kvmem_cache requires --kvmem");
+                return;
+            }
+            if (kvmem_session_request) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_cache and kvmem_session_* are mutually exclusive");
+                return;
+            }
+            const json &cache = req["kvmem_cache"];
+            if (!cache.is_object()) {
+                set_error_response(res, 400,
+                                   "kvmem_cache must be an object");
+                return;
+            }
+            const bool save = cache.contains("save");
+            const bool load = cache.contains("load");
+            if (save == load) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_cache requires exactly one save or load object");
+                return;
+            }
+            const json &operation = cache[save ? "save" : "load"];
+            if (!operation.is_object() || !operation.contains("id") ||
+                !operation["id"].is_string()) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_cache save/load requires a string id");
+                return;
+            }
+            kvmem_cache_id = operation["id"].get<std::string>();
+            if (!valid_kvmem_cache_id(kvmem_cache_id)) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_cache id must be 1..128 characters using only "
+                    "letters, digits, '.', '_', '-', or ':'");
+                return;
+            }
+            if (save) {
+                kvmem_cache_operation = "save";
+                if (g.max_tokens != 0) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_cache save currently requires max_tokens=0");
+                    return;
+                }
+                const std::string scope = operation.value("scope", "local");
+                const std::string when =
+                    operation.value("when", "after_request");
+                if (scope != "local" || when != "after_request") {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_cache save supports only scope=local and "
+                        "when=after_request");
+                    return;
+                }
+                if (operation.contains("ttl_seconds") &&
+                    !parse_bounded_json_u64(
+                        operation["ttl_seconds"], 0, 31536000,
+                        kvmem_cache_ttl_seconds)) {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_cache ttl_seconds must be in [0,31536000]");
+                    return;
+                }
+                g.kvmem_cache_save_id = kvmem_cache_id;
+                g.kvmem_cache_ttl_seconds = kvmem_cache_ttl_seconds;
+            } else {
+                kvmem_cache_operation = "load";
+                const std::string mode = operation.value("mode", "frozen");
+                if (mode == "frozen") {
+                    kvmem_cache_mode = KvMemLocalCacheMode::Frozen;
+                } else if (mode == "append") {
+                    kvmem_cache_mode = KvMemLocalCacheMode::Append;
+                } else {
+                    set_error_response(
+                        res, 400,
+                        "kvmem_cache load mode must be frozen|append");
+                    return;
+                }
+                if (operation.contains("required") &&
+                    (!operation["required"].is_boolean() ||
+                     !operation["required"].get<bool>())) {
+                    set_error_response(
+                        res, 400,
+                        "process-local cache loads require required=true; "
+                        "missing caches never silently trigger full prefill");
+                    return;
+                }
+                if (operation.contains("expected_version")) {
+                    if (!parse_bounded_json_u64(
+                            operation["expected_version"], 1,
+                            std::numeric_limits<uint64_t>::max(),
+                            kvmem_cache_expected_version)) {
+                        set_error_response(
+                            res, 400,
+                            "kvmem_cache expected_version must be a positive "
+                            "integer");
+                        return;
+                    }
+                    kvmem_cache_expected_version_set = true;
+                }
+                if (kvmem_cache_mode == KvMemLocalCacheMode::Append) {
+                    if (g.max_tokens != 0) {
+                        set_error_response(
+                            res, 400,
+                            "kvmem_cache append currently requires "
+                            "max_tokens=0");
+                        return;
+                    }
+                    if (!kvmem_cache_expected_version_set) {
+                        set_error_response(
+                            res, 400,
+                            "kvmem_cache append requires expected_version");
+                        return;
+                    }
+                }
+                g.kvmem_cache_load_id = kvmem_cache_id;
+                g.kvmem_cache_load_mode = kvmem_cache_mode;
+                g.kvmem_cache_expected_version =
+                    kvmem_cache_expected_version;
+                g.kvmem_cache_expected_version_set =
+                    kvmem_cache_expected_version_set;
+            }
+            kvmem_cache_request = true;
+        }
+
+        if (req.contains("kvmem_reselect")) {
+            if (!req["kvmem_reselect"].is_string()) {
+                set_error_response(
+                    res, 400, "kvmem_reselect must be auto|force|off");
+                return;
+            }
+            const std::string mode =
+                req["kvmem_reselect"].get<std::string>();
+            if (mode == "auto") {
+                g.kvmem_reselect_mode = KvMemReselectMode::Auto;
+            } else if (mode == "force") {
+                g.kvmem_reselect_mode = KvMemReselectMode::Force;
+            } else if (mode == "off") {
+                g.kvmem_reselect_mode = KvMemReselectMode::Off;
+            } else {
+                set_error_response(
+                    res, 400, "kvmem_reselect must be auto|force|off");
+                return;
+            }
+        }
+        if (req.contains("kvmem_query_token_span")) {
+            const json &span = req["kvmem_query_token_span"];
+            uint64_t begin = 0;
+            uint64_t end = 0;
+            if (!span.is_object() || !span.contains("begin") ||
+                !span.contains("end") ||
+                !parse_bounded_json_u64(
+                    span["begin"], 0,
+                    std::numeric_limits<uint32_t>::max(), begin) ||
+                !parse_bounded_json_u64(
+                    span["end"], 1,
+                    std::numeric_limits<uint32_t>::max(), end) ||
+                end <= begin) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_query_token_span requires uint32 begin < end");
+                return;
+            }
+            if (!engine.kvmem_enabled ||
+                !engine.kvmem_query_conditioned) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_query_token_span requires --kvmem and "
+                    "--kvmem-query-conditioned");
+                return;
+            }
+            g.kvmem_query_begin = static_cast<uint32_t>(begin);
+            g.kvmem_query_end = static_cast<uint32_t>(end);
+        }
+        if (g.kvmem_reselect_mode == KvMemReselectMode::Force &&
+            g.kvmem_query_end <= g.kvmem_query_begin) {
+            set_error_response(
+                res, 400,
+                "kvmem_reselect=force requires kvmem_query_token_span");
+            return;
+        }
+        if (req.contains("kvmem_trace_tag")) {
+            if (!req["kvmem_trace_tag"].is_string()) {
+                set_error_response(res, 400,
+                                   "kvmem_trace_tag must be a string");
+                return;
+            }
+            const std::string tag =
+                req["kvmem_trace_tag"].get<std::string>();
+            if (tag.empty() || tag.size() > 128 ||
+                !std::all_of(tag.begin(), tag.end(), [](unsigned char c) {
+                    return std::isalnum(c) || c == '.' || c == '_' ||
+                           c == '-' || c == ':';
+                })) {
+                set_error_response(
+                    res, 400,
+                    "kvmem_trace_tag must be 1..128 characters from "
+                    "[A-Za-z0-9_.:-]");
+                return;
+            }
+            g.kvmem_trace_tag = tag;
+        }
         g.continuous_batching =
+            !kvmem_session_request && !kvmem_cache_request &&
             serve_continuous_batching_enabled() &&
             serve_continuous_batch_request_supported(g);
-        const std::string route = g.continuous_batching ? "continuous" : "plain";
+        const std::string route = kvmem_cache_request
+            ? ("cache-" + kvmem_cache_operation)
+            : (kvmem_session_request
+                   ? ("session-" + kvmem_session_op)
+                   : (g.continuous_batching ? "continuous" : "plain"));
         const std::string fallback_reason =
             g.continuous_batching ? "" :
             (serve_continuous_batching_enabled() ? "request_unsupported" : "disabled");
@@ -4282,18 +4631,31 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
         std::string text;
         size_t completion_tokens = 0;
+        const auto generation_start = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point first_token_at{};
+        bool first_token_seen = false;
+        auto consume_piece = [&](const std::string &piece) {
+            ++completion_tokens;
+            if (!first_token_seen && !piece.empty()) {
+                first_token_seen = true;
+                first_token_at = std::chrono::steady_clock::now();
+            }
+            text += piece;
+        };
         try {
-            if (g.continuous_batching) {
+            if (kvmem_session_request) {
+                std::lock_guard<std::mutex> lk(gen_mu);
+                eng.generate_session_stream(
+                    prompt, g, consume_piece, kvmem_session_reset);
+            } else if (g.continuous_batching) {
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
-                    ++completion_tokens;
-                    text += piece;
+                    consume_piece(piece);
                     return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
-                    ++completion_tokens;
-                    text += piece;
+                    consume_piece(piece);
                     return true;
                 });
             }
@@ -4323,7 +4685,26 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 {"index", 0}, {"text", text}, {"logprobs", nullptr},
                 {"finish_reason", generation_finish_reason(
                     stopped, completion_tokens, g.max_tokens)}}})},
-            {"usage", usage_json(prompt_token_count, completion_tokens)}};
+            {"usage", usage_json(prompt_token_count, completion_tokens)},
+            {"timing", json{
+                {"first_token_sec", first_token_seen
+                    ? json(std::chrono::duration<double>(
+                          first_token_at - generation_start).count())
+                    : json(nullptr)},
+                {"request_total_sec", std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - generation_start).count()}}}};
+        if (kvmem_cache_request) {
+            std::lock_guard<std::mutex> lk(gen_mu);
+            const KvMemLocalCacheInfo info =
+                eng.kvmem_local_cache_info(kvmem_cache_id);
+            if (!info.found) {
+                set_error_response(
+                    res, 500,
+                    "KVMem local cache operation completed without metadata");
+                return;
+            }
+            out["kvmem_cache"] = kvmem_cache_info_json(info);
+        }
         res.set_content(dump_json(out), "application/json");
     });
 

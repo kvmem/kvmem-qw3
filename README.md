@@ -1115,7 +1115,7 @@ KVMem CLI parameters:
 |---|---:|---|
 | `--kvmem` | off | Enable KVMem block-sparse KV attention. Without this flag the normal forward path is used. |
 | `--kvmem-block-tokens N` | `128` | KV block granularity in tokens. Must be a positive multiple of the KV page size. |
-| `--kvmem-budget N` | `131072` | Maximum selected working-set window per selection, in tokens. Approximate selected block count is `budget / block_tokens`. |
+| `--kvmem-budget N` | `131072` | Maximum selected working-set window per request, in tokens. API requests may narrow only their semantic selection with `kvmem_semantic_budget`; approximate selected block count is `budget / block_tokens`. |
 | `--kvmem-sink-tokens N` | auto | Always-kept prefix target in tokens, rounded up to physical blocks. The automatic target is `clamp(1% × budget, 1K, 2K)`. |
 | `--kvmem-recent-tokens N` | auto | Always-kept suffix target in tokens, rounded up to physical blocks. The automatic target is `clamp(8% × budget, 4K, 16K)`. |
 | `--kvmem-sink-blocks N` | unset | Compatibility override in physical blocks. Mutually exclusive with `--kvmem-sink-tokens`. |

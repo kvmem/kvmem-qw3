@@ -51,6 +51,7 @@ def chat(
     cache: dict[str, Any],
     *,
     reselect: str,
+    semantic_budget: int | None = None,
 ) -> tuple[int, dict[str, Any], float]:
     payload: dict[str, Any] = {
         "model": args.model,
@@ -62,6 +63,8 @@ def chat(
         "kvmem_reselect": reselect,
         "kvmem_cache": cache,
     }
+    if semantic_budget is not None:
+        payload["kvmem_semantic_budget"] = semantic_budget
     if reselect == "force":
         payload["kvmem_query_message_range"] = {
             "message_begin": 0,
@@ -100,10 +103,34 @@ def main() -> int:
     parser.add_argument("--history-repeats", type=int, default=400)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--ttl-seconds", type=int, default=3600)
+    parser.add_argument(
+        "--semantic-budgets",
+        default="",
+        help=(
+            "comma-separated request-local semantic budgets; when set, the "
+            "same frozen history is queried once per budget"
+        ),
+    )
     parser.add_argument("--keep-cache", action="store_true")
     args = parser.parse_args()
     if args.history_repeats < 1:
         parser.error("--history-repeats must be positive")
+    semantic_budgets: list[int | None]
+    if args.semantic_budgets:
+        try:
+            semantic_budgets = [
+                int(value.strip())
+                for value in args.semantic_budgets.split(",")
+                if value.strip()
+            ]
+        except ValueError as exc:
+            parser.error(f"invalid --semantic-budgets: {exc}")
+        if not semantic_budgets or any(
+            value is None or value <= 0 for value in semantic_budgets
+        ):
+            parser.error("--semantic-budgets must contain positive integers")
+    else:
+        semantic_budgets = [None, None]
 
     fact = "The archival access code is CERULEAN-7319."
     filler = (
@@ -136,7 +163,7 @@ def main() -> int:
     )
 
     frozen_answers: list[str] = []
-    for index in range(2):
+    for index, semantic_budget in enumerate(semantic_budgets):
         status, body, elapsed = chat(
             args,
             [{"role": "user", "content": "What is the archival access code?"}],
@@ -150,12 +177,19 @@ def main() -> int:
                 }
             },
             reselect="force",
+            semantic_budget=semantic_budget,
         )
         require_status(status, 200, body)
         info = cache_info(body)
         assert info["version"] == 1 and info["position"] == info_v1["position"]
         frozen_answers.append(answer(body))
-        print(f"frozen[{index + 1}]: {elapsed:.3f}s answer={frozen_answers[-1]!r}")
+        budget_label = "server-default" if semantic_budget is None else str(
+            semantic_budget
+        )
+        print(
+            f"frozen[{index + 1}] budget={budget_label}: "
+            f"{elapsed:.3f}s answer={frozen_answers[-1]!r}"
+        )
     for text in frozen_answers:
         assert "CERULEAN-7319" in text, f"frozen restore lost saved fact: {text!r}"
 

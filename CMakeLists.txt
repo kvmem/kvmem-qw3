@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 project(qw3 LANGUAGES CXX)
 
+find_package(Threads REQUIRED)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -124,6 +126,7 @@ target_include_directories(qw3_core PRIVATE
 target_compile_options(qw3_core PRIVATE
     -Wall -Wextra -Wpedantic
 )
+target_link_libraries(qw3_core PUBLIC Threads::Threads)
 
 # Archive manifests identify the complete GGUF by SHA-256. OpenSSL's optimized
 # implementation makes the first uncached multi-GiB scan much faster; the
@@ -227,8 +230,7 @@ endif()
 
 add_executable(qw3 src/qw3_cli.cpp src/qw3_server.cpp)
 target_include_directories(qw3 SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-find_package(Threads REQUIRED)
-target_link_libraries(qw3 PRIVATE qw3_core Threads::Threads)
+target_link_libraries(qw3 PRIVATE qw3_core)
 
 add_executable(qw3-inspect src/qw3_inspect.cpp)
 target_link_libraries(qw3-inspect PRIVATE qw3_core)

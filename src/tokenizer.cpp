@@ -5,16 +5,24 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <locale>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 namespace qw3 {
 namespace {
@@ -140,6 +148,31 @@ bool cp_is_mark(uint32_t cp) {
 bool cp_is_space(uint32_t cp) {
     if (cp < 0x80) return ascii_space(static_cast<uint8_t>(cp));
     return cp == 0xA0 || cp == 0x2028 || cp == 0x2029 || (cp >= 0x2000 && cp <= 0x200A);
+}
+
+// Respect process/thread CPU affinity (taskset, containers, and job schedulers)
+// instead of blindly using the host-wide CPU count. The tokenizer uses this as
+// an upper bound; small inputs and inputs with few independent chunks use fewer
+// workers automatically.
+size_t available_cpu_count() {
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        const int count = CPU_COUNT(&allowed);
+        if (count > 0) return static_cast<size_t>(count);
+    }
+#endif
+    const unsigned int count = std::thread::hardware_concurrency();
+    return std::max<size_t>(1, static_cast<size_t>(count));
+}
+
+// A single long encode consumes all CPUs available to the process. Serialize
+// such encodes so concurrent HTTP requests cannot each create a full-sized
+// worker set and oversubscribe the host. Short requests never take this lock.
+std::mutex &parallel_tokenizer_mutex() {
+    static std::mutex mutex;
+    return mutex;
 }
 
 } // namespace
@@ -528,37 +561,157 @@ std::vector<int32_t> QwenTokenizer::bpe_piece(const std::string &piece) const {
     return out;
 }
 
-std::vector<int32_t> QwenTokenizer::encode(const std::string &text, bool add_bos_override) const {
+std::vector<int32_t> QwenTokenizer::encode_regular_chunk(
+        const std::string &chunk) const {
     std::vector<int32_t> out;
-    if ((add_bos_override || add_bos_) && bos_id_ < vocab_size()) out.push_back(bos_id_);
+    for (const std::string &piece : detail::qwen_pre_tokenize(chunk)) {
+        const std::vector<int32_t> ids = bpe_piece(piece);
+        out.insert(out.end(), ids.begin(), ids.end());
+    }
+    return out;
+}
 
+std::vector<int32_t> QwenTokenizer::encode(const std::string &text, bool add_bos_override) const {
+    struct Segment {
+        size_t begin = 0;
+        size_t end = 0;
+        int32_t special_id = -1;
+    };
+    std::vector<Segment> segments;
+    // Chat prompts normally have two special-token boundaries per message.
+    // This reserve is deliberately conservative and has no semantic effect.
+    segments.reserve(std::max<size_t>(1, text.size() / 1024));
+    size_t regular_bytes = 0;
+    std::string special_initials;
+    special_initials.reserve(special_.size());
+    for (const auto &special : special_) {
+        if (special.first.empty() ||
+            special_initials.find(special.first.front()) != std::string::npos) {
+            continue;
+        }
+        special_initials.push_back(special.first.front());
+    }
     size_t i = 0;
     while (i < text.size()) {
-        // Try to match a special token first (longest match).
-        bool matched = false;
-        for (const auto &sp : special_) {
-            if (text.compare(i, sp.first.size(), sp.first) == 0) {
-                out.push_back(sp.second);
-                i += sp.first.size();
-                matched = true;
-                break;
+        // Every registered special token starts with one of the bytes in
+        // special_initials (currently '<'). Scan the input once for those
+        // candidate bytes, then verify the full strings in longest-first
+        // order. The old loop called find() once per special token after every
+        // chat message, which was effectively quadratic for 10M histories.
+        size_t candidate = special_initials.empty()
+            ? std::string::npos
+            : text.find_first_of(special_initials, i);
+        const std::pair<std::string, int32_t> *matched_special = nullptr;
+        while (candidate != std::string::npos) {
+            for (const auto &special : special_) {
+                if (special.first.front() == text[candidate] &&
+                    text.compare(candidate, special.first.size(),
+                                 special.first) == 0) {
+                    matched_special = &special;
+                    break;
+                }
             }
+            if (matched_special) break;
+            candidate = text.find_first_of(special_initials, candidate + 1);
         }
-        if (matched) continue;
 
-        // Find the next special token (or end of string), tokenize the
-        // intervening text normally.
-        size_t end = text.size();
-        for (const auto &sp : special_) {
-            const size_t pos = text.find(sp.first, i);
-            if (pos != std::string::npos && pos < end) end = pos;
+        const size_t regular_end = matched_special ? candidate : text.size();
+        if (regular_end > i) {
+            segments.push_back(Segment{i, regular_end, -1});
+            regular_bytes += regular_end - i;
         }
-        const std::string chunk = text.substr(i, end - i);
-        for (const std::string &piece : detail::qwen_pre_tokenize(chunk)) {
-            const std::vector<int32_t> ids = bpe_piece(piece);
-            out.insert(out.end(), ids.begin(), ids.end());
+        if (!matched_special) break;
+        segments.push_back(Segment{
+            candidate, candidate + matched_special->first.size(),
+            matched_special->second});
+        i = candidate + matched_special->first.size();
+    }
+
+    std::vector<std::vector<int32_t>> encoded(segments.size());
+    std::vector<size_t> regular_segments;
+    regular_segments.reserve(segments.size());
+    for (size_t segment_index = 0; segment_index < segments.size();
+         ++segment_index) {
+        const Segment &segment = segments[segment_index];
+        if (segment.special_id >= 0) {
+            encoded[segment_index].push_back(segment.special_id);
+        } else if (segment.end > segment.begin) {
+            regular_segments.push_back(segment_index);
         }
-        i = end;
+    }
+
+    // Thread creation and ordered result assembly are not worthwhile for short
+    // prompts. Above this threshold, assign at least 256 KiB of ordinary text
+    // per worker while never exceeding the CPUs available to this process.
+    constexpr size_t kParallelThresholdBytes = 512ull * 1024ull;
+    constexpr size_t kTargetBytesPerWorker = 256ull * 1024ull;
+    size_t worker_count = 1;
+    if (regular_bytes >= kParallelThresholdBytes &&
+        regular_segments.size() > 1) {
+        const size_t useful_workers =
+            (regular_bytes + kTargetBytesPerWorker - 1) /
+            kTargetBytesPerWorker;
+        worker_count = std::min(
+            {available_cpu_count(), useful_workers,
+             regular_segments.size()});
+    }
+
+    auto encode_segment = [&](size_t work_index) {
+        const size_t segment_index = regular_segments[work_index];
+        const Segment &segment = segments[segment_index];
+        encoded[segment_index] = encode_regular_chunk(
+            text.substr(segment.begin, segment.end - segment.begin));
+    };
+
+    if (worker_count <= 1) {
+        for (size_t work_index = 0; work_index < regular_segments.size();
+             ++work_index) {
+            encode_segment(work_index);
+        }
+    } else {
+        std::lock_guard<std::mutex> exclusive(parallel_tokenizer_mutex());
+        std::atomic<size_t> next_work{0};
+        std::atomic<bool> failed{false};
+        std::exception_ptr first_error;
+        std::mutex error_mutex;
+        auto worker = [&]() {
+            try {
+                while (!failed.load(std::memory_order_relaxed)) {
+                    const size_t work_index =
+                        next_work.fetch_add(1, std::memory_order_relaxed);
+                    if (work_index >= regular_segments.size()) break;
+                    encode_segment(work_index);
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> guard(error_mutex);
+                if (!first_error) first_error = std::current_exception();
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count - 1);
+        for (size_t worker_index = 1; worker_index < worker_count;
+             ++worker_index) {
+            workers.emplace_back(worker);
+        }
+        worker();
+        for (std::thread &thread : workers) thread.join();
+        if (first_error) std::rethrow_exception(first_error);
+    }
+
+    size_t token_count =
+        ((add_bos_override || add_bos_) && bos_id_ < vocab_size()) ? 1 : 0;
+    for (const auto &segment_tokens : encoded) {
+        token_count += segment_tokens.size();
+    }
+    std::vector<int32_t> out;
+    out.reserve(token_count);
+    if ((add_bos_override || add_bos_) && bos_id_ < vocab_size()) {
+        out.push_back(bos_id_);
+    }
+    for (auto &segment_tokens : encoded) {
+        out.insert(out.end(), segment_tokens.begin(), segment_tokens.end());
     }
     return out;
 }

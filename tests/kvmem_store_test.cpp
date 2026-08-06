@@ -535,6 +535,93 @@ static void test_prefill_pressure_edges() {
     CHECK(empty.pick_prefill_pressure_blocks().empty());
 }
 
+static void test_prefill_pressure_budget_is_independent_from_semantic_budget() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.select_budget = 32 * 4;
+    cfg.prefill_budget = 32 * 8;
+    cfg.sink_blocks = 1;
+    cfg.recent_blocks = 0;
+    KvMemStore s(cfg);
+    s.register_append(32 * 12);
+
+    // Pressure construction keeps a wide sink+tail context.
+    const std::vector<uint32_t> pressure{0, 5, 6, 7, 8, 9, 10, 11};
+    CHECK(s.prefill_budget_blocks() == 8);
+    CHECK(s.pick_prefill_pressure_blocks() == pressure);
+
+    // The final semantic selector still contracts to four blocks. The hotter
+    // middle blocks win independently of the wider prefill construction frame.
+    std::vector<double> scores(12, 0.0);
+    scores[2] = 4.0;
+    scores[3] = 3.0;
+    scores[4] = 2.0;
+    s.set_retrieval_scores(scores);
+    const std::vector<uint32_t> semantic{0, 2, 3, 4};
+    CHECK(s.budget_blocks() == 4);
+    CHECK(s.pick_topk_blocks() == semantic);
+}
+
+static void test_request_semantic_budget_override_is_scoped_and_bounded() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.select_budget = 32 * 8;   // CLI/server maximum.
+    cfg.prefill_budget = 32 * 12;
+    cfg.sink_blocks = 1;
+    cfg.recent_blocks = 1;
+    KvMemStore s(cfg);
+    s.register_append(32 * 16);
+
+    std::vector<double> scores(16, 0.0);
+    for (uint32_t id = 0; id < scores.size(); ++id) {
+        scores[id] = static_cast<double>(id);
+    }
+    s.set_retrieval_scores(scores);
+
+    CHECK(s.select_budget_tokens() == 32 * 8);
+    CHECK(s.runtime_select_budget_tokens() == 0);
+    CHECK(s.pick_topk_blocks().size() == 8);
+    CHECK(s.pick_prefill_pressure_blocks().size() == 12);
+
+    // A request may narrow semantic selection while pressure prefill remains
+    // at the configured 12-block construction window.
+    s.set_runtime_select_budget(32 * 4);
+    CHECK(s.select_budget_tokens() == 32 * 4);
+    CHECK(s.runtime_select_budget_tokens() == 32 * 4);
+    CHECK(s.pick_topk_blocks().size() == 4);
+    CHECK(s.pick_prefill_pressure_blocks().size() == 12);
+
+    // Zero restores the CLI maximum for the next request.
+    s.set_runtime_select_budget(0);
+    CHECK(s.select_budget_tokens() == 32 * 8);
+    CHECK(s.pick_topk_blocks().size() == 8);
+
+    bool over_max_threw = false;
+    try {
+        s.set_runtime_select_budget(32 * 9);
+    } catch (const std::invalid_argument &) {
+        over_max_threw = true;
+    }
+    CHECK(over_max_threw);
+
+    bool unaligned_threw = false;
+    try {
+        s.set_runtime_select_budget(32 * 4 + 1);
+    } catch (const std::invalid_argument &) {
+        unaligned_threw = true;
+    }
+    CHECK(unaligned_threw);
+
+    bool keep_allocation_threw = false;
+    try {
+        s.set_runtime_select_budget(32);  // sink + recent need two blocks.
+    } catch (const std::invalid_argument &) {
+        keep_allocation_threw = true;
+    }
+    CHECK(keep_allocation_threw);
+    CHECK(s.runtime_select_budget_tokens() == 0);
+}
+
 static void test_quota_policy_sink_recent_retrieval_profile() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 128;
@@ -903,6 +990,8 @@ int main() {
     test_topk_mandatory_blocks_stay_inside_budget();
     test_prefill_pressure_sink_full_recent_tail();
     test_prefill_pressure_edges();
+    test_prefill_pressure_budget_is_independent_from_semantic_budget();
+    test_request_semantic_budget_override_is_scoped_and_bounded();
     test_quota_policy_sink_recent_retrieval_profile();
     test_topk_all_fit();
     test_topk_empty();

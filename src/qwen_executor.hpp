@@ -441,6 +441,10 @@ public:
     // executor. No-op effect when kvmem or the CPU tier is off.
     void set_host_tier_pool(HostTierBufferPool *pool) { host_tier_pool_ = pool; }
     void configure_kvmem(const KvMemStoreConfig &cfg);
+    // Narrow the semantic selection budget for one request. Zero restores the
+    // configured --kvmem-budget. Returns the previous runtime override so the
+    // caller can restore it with an exception-safe scope guard.
+    uint32_t kvmem_set_runtime_select_budget(uint32_t tokens);
 
     // ---- Window-aware batched verify support (CB-MTP ragged path) ----------
     // When kvmem is active the assembled window advances in lockstep with
@@ -456,6 +460,15 @@ public:
     // the backend refuses above-budget session reuse (M-reuse) in this mode and
     // falls back to a full cold prefill (correct, just unoptimized).
     bool kvmem_qc_pertoken() const { return kvmem_qc_pertoken_; }
+    // Whether the fixed-stride semantic source index contains every token in
+    // [0,tokens). Used by prefix-checkpoint admission; a dense checkpoint alone
+    // is insufficient if the next request crosses the KVMem budget and needs
+    // query-conditioned retrieval without replaying the whole prefix.
+    bool kvmem_content_index_covers(uint32_t tokens) const {
+        return kvmem_mean_index_available() &&
+               !kvmem_qc_pertoken_ && !kvmem_qc_deltanet_ &&
+               kvmem_qc_captured_tokens_ >= tokens;
+    }
     uint32_t window_query_pos() const { return window_query_pos_; }
     uint32_t window_page_count() const { return window_page_count_; }
     const std::vector<int32_t> &window_pages_host() const {
@@ -863,6 +876,12 @@ private:
     std::unique_ptr<DeviceTensor> mtp_ffn_up_batch_;
     std::unique_ptr<DeviceTensor> mtp_ffn_mid_batch_;
     std::unique_ptr<DeviceTensor> mtp_ffn_out_batch_;
+    // One F32 hidden-width workspace for memory-efficient MTP prefix priming.
+    // Main prefill output tensors may be BF16 and therefore cannot receive an
+    // rms_norm result directly; allocating only this buffer preserves the
+    // large target-scratch reuse without resurrecting the old full MTP arena.
+    uint32_t mtp_prefix_norm_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> mtp_prefix_norm_batch_;
     std::unique_ptr<DeviceArgmaxBuffer> mtp_draft_argmaxes_;
     uint32_t mtp_draft_argmax_capacity_ = 0;
     uint32_t mtp_prefix_len_ = 0;

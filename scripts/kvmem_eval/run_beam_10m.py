@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Run BEAM-10M against qw3 with one cold ingest per conversation.
+"""Run BEAM-10M against qw3 with one frozen KVMem base per conversation.
 
-The server must be launched with ``--kvmem --kvmem-query-conditioned
---kvmem-prefix-cache`` and mean-k retrieval.  The history is first submitted as
-a prefill-only request.  Every probing question then repeats the canonical
-history plus one final user message.  qw3's warm KVMem prefix checkpoint restores
-the immutable history boundary, so each question is an independent branch and
-the previous generated answer is never part of the next question's context.
+The server must be launched with ``--kvmem --kvmem-query-conditioned`` and a
+query-replay-compatible Mean-K retrieval method.  The history is submitted once
+as a prefill-only local-cache save.  Every probing question then sends only its
+short final user message and loads the same version-1 checkpoint in ``frozen``
+mode.  qw3 restores the immutable history before the branch and again after it,
+so no answer or query from one probe can affect another probe.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ QUESTION_PREFIX = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate BEAM-10M with a warm KVMem history checkpoint"
+        description="Evaluate BEAM-10M from a frozen KVMem history checkpoint"
     )
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--use-all", action="store_true")
@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--read-timeout", type=float, default=7200.0)
     parser.add_argument("--connect-timeout", type=float, default=30.0)
+    parser.add_argument("--cache-ttl-seconds", type=int, default=86400)
     parser.add_argument("--no-thinking", action="store_true")
     parser.add_argument("--no-judge", action="store_true")
     parser.add_argument(
@@ -105,7 +106,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0 <= args.cache_ttl_seconds <= 31536000:
+        parser.error("--cache-ttl-seconds must be in [0,31536000]")
+    return args
 
 
 def parse_question_types(value: str | None) -> tuple[str, ...]:
@@ -213,6 +217,24 @@ def question_message(question: str) -> tuple[dict[str, str], tuple[int, int]]:
     start = len(QUESTION_PREFIX.encode("utf-8"))
     end = start + len(question.encode("utf-8"))
     return {"role": "user", "content": content}, (start, end)
+
+
+def cache_id(tag: str, conversation_id: str) -> str:
+    """Return a stable ID accepted by qw3's process-local cache API."""
+    def sanitize(value: str) -> str:
+        return "".join(
+            character
+            if character.isascii() and
+            (character.isalnum() or character in "._-:")
+            else "_"
+            for character in value
+        )
+
+    suffix = ":" + sanitize(conversation_id)
+    prefix = sanitize(f"beam:{tag}")
+    if len(suffix) >= 128:
+        return ("beam:" + suffix[-123:])[:128]
+    return prefix[: 128 - len(suffix)] + suffix
 
 
 def write_official_results(
@@ -339,6 +361,7 @@ def main() -> int:
             if not pending:
                 continue
             messages = list(conversation.messages)
+            frozen_cache_id = cache_id(args.tag, conversation.conversation_id)
             prefill_started = time.monotonic()
             prefill_result = client.chat(
                 messages,
@@ -346,6 +369,14 @@ def main() -> int:
                 enable_thinking=not args.no_thinking,
                 extra_body={
                     "kvmem_reselect": "off",
+                    "kvmem_cache": {
+                        "save": {
+                            "id": frozen_cache_id,
+                            "scope": "local",
+                            "when": "after_request",
+                            "ttl_seconds": args.cache_ttl_seconds,
+                        }
+                    },
                     "kvmem_trace_tag":
                         f"beam-{conversation.conversation_id}-history",
                 },
@@ -365,6 +396,9 @@ def main() -> int:
                         "finish_reason": prefill_result.finish_reason,
                         "latency_s": prefill_result.latency_s,
                         "client_error": prefill_result.error,
+                        "cache_id": frozen_cache_id,
+                        "cache_version": 1,
+                        "cache_mode": "save",
                     },
                     ensure_ascii=False,
                 )
@@ -402,12 +436,21 @@ def main() -> int:
                 final_message, (query_start, query_end) = question_message(
                     question.question
                 )
-                request_messages = messages + [final_message]
+                request_messages = [final_message]
                 result = client.chat(
                     request_messages,
                     extra_body={
+                        "kvmem_reselect": "force",
+                        "kvmem_cache": {
+                            "load": {
+                                "id": frozen_cache_id,
+                                "mode": "frozen",
+                                "required": True,
+                                "expected_version": 1,
+                            }
+                        },
                         "kvmem_query_span": {
-                            "message_index": len(request_messages) - 1,
+                            "message_index": 0,
                             "content_start": query_start,
                             "content_end": query_end,
                         },
@@ -470,6 +513,9 @@ def main() -> int:
                             "ttft_s": result.ttft_s,
                             "latency_s": result.latency_s,
                             "client_error": error,
+                            "cache_id": frozen_cache_id,
+                            "cache_version": 1,
+                            "cache_mode": "frozen",
                         },
                         ensure_ascii=False,
                     )
@@ -511,7 +557,7 @@ def main() -> int:
         ),
         "failures_this_run": failures,
         "cold_history_ingests_this_run": cold_ingests,
-        "expected_warm_prefix_hits_this_run": max(remaining - failures, 0),
+        "expected_frozen_cache_loads_this_run": remaining,
         "per_type_successful": {
             question_type: per_type[question_type]
             for question_type in QUESTION_TYPES

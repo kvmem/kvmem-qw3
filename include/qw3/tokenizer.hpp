@@ -54,6 +54,7 @@ private:
     void build_byte_maps();
     void finish_initialization();
     std::vector<int32_t> bpe_piece(const std::string &piece) const;
+    std::vector<int32_t> encode_regular_chunk(const std::string &chunk) const;
 
     // size_t pair hasher
     struct PairHash {
