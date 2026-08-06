@@ -6,10 +6,15 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT=${PORT:-18089}
 GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.50}
+KVMEM_BUDGET=${KVMEM_BUDGET:-32768}
 GEN_BUDGET=${GEN_BUDGET:-8192}
 RECENT_TOKENS=${RECENT_TOKENS:-4096}
 SEMANTIC_QUERY_TOKENS=${SEMANTIC_QUERY_TOKENS:-512}
+SEMANTIC_START_TOKENS=${SEMANTIC_START_TOKENS:-$KVMEM_BUDGET}
 THINKING_BUDGET=${THINKING_BUDGET:-4096}
+CPU_GB=${CPU_GB:-48}
+INDEX_STAGING_MB=${INDEX_STAGING_MB:-64}
+ADAPTIVE_BLOCK_STATS_MIB=${ADAPTIVE_BLOCK_STATS_MIB:-512}
 START_INDEX=${START_INDEX:-0}
 LIMIT=${LIMIT:-1}
 TAG=${TAG:-agentlongbench_512k_k32_semantic_chunk_q512_adaptive_b32_fp8_mtp4_20260806}
@@ -68,6 +73,9 @@ trap cleanup EXIT INT TERM
 
 env \
   -u QW3_KVMEM_REBUILT_STATE_DIR \
+  -u QW3_KVMEM_QUERY_SCORE_CHUNK \
+  -u QW3_KVMEM_QUERY_SCORE_TOKENS \
+  -u QW3_KVMEM_ADAPTIVE_GPU_PACKED \
   QW3_KVMEM_RECOMPUTE_QUERY=1 \
   QW3_KVMEM_IMMUTABLE_SOURCE_K=1 \
   QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS=8 \
@@ -77,22 +85,25 @@ env \
   QW3_FATTN_NSPLIT=1 \
   QW3_PREFILL_FA2_NSPLIT=1 \
   QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
+  QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB="$ADAPTIVE_BLOCK_STATS_MIB" \
   "$ROOT/build/qw3" serve \
     --model "$MODEL" \
     --ctx 655360 --kv-dtype fp8 \
     --kvmem --kvmem-block-tokens 32 \
-    --kvmem-budget 32768 --kvmem-prefill-budget 32768 \
+    --kvmem-budget "$KVMEM_BUDGET" \
+    --kvmem-prefill-budget "$KVMEM_BUDGET" \
     --kvmem-gen-budget "$GEN_BUDGET" \
     --kvmem-sink-tokens 512 --kvmem-recent-tokens "$RECENT_TOKENS" \
     --kvmem-method retrieval \
     --kvmem-retrieval-method key-direction-adaptive \
-    --kvmem-index-placement gpu --kvmem-index-staging-mb 64 \
+    --kvmem-index-placement gpu \
+    --kvmem-index-staging-mb "$INDEX_STAGING_MB" \
     --kvmem-adaptive-score-mode auto \
     --kvmem-adaptive-gain-1to2 0.10 \
     --kvmem-adaptive-gain-2to4 0.06 \
     --kvmem-update-mode step --kvmem-query-conditioned \
     --kvmem-immutable-k --kvmem-gpu-memory-ratio "$GPU_MEMORY_RATIO" \
-    --kvmem-cpu-gb 48 --no-kvmem-raw-k-nvme \
+    --kvmem-cpu-gb "$CPU_GB" --no-kvmem-raw-k-nvme \
     --kvmem-opt-stage-out on --kvmem-opt-stage-in on \
     --kvmem-opt-pack on \
     --enable-thinking --thinking-budget "$THINKING_BUDGET" \
@@ -128,7 +139,7 @@ curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null
   --enable-thinking --seed 20260722 \
   --kvmem-retrieval-trace-metadata \
   --kvmem-prefill-window semantic_chunk \
-  --kvmem-prefill-semantic-start-tokens 32768 \
+  --kvmem-prefill-semantic-start-tokens "$SEMANTIC_START_TOKENS" \
   --kvmem-prefill-semantic-query-tokens "$SEMANTIC_QUERY_TOKENS" \
   "${selection_args[@]}" \
   2>&1 | tee -a "$RUN_LOG"

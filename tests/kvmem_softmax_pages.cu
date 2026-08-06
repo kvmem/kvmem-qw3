@@ -98,6 +98,7 @@ bool launch_block_attn_stream_adaptive_gemm_reduce(
     uint32_t n_tokens, uint32_t prototype_count, uint32_t tile_blocks,
     uint32_t workspace_block_base, uint32_t workspace_block_stride,
     uint32_t n_heads, uint32_t query_head_base, uint32_t gqa_group,
+    uint32_t metadata_block_base, uint32_t prototype_base,
     cudaStream_t stream);
 bool launch_block_attn_stream_adaptive_finalize(
     float *score, const float *block_max, const float *block_sum,
@@ -113,6 +114,7 @@ bool launch_block_attn_score_adaptive_layer_typed(
     uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
     uint32_t q_layer_stride, uint32_t prototype_count,
     uint32_t block_count, uint32_t global_block_base,
+    uint32_t metadata_block_base, uint32_t prototype_base,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
     float scale, cudaStream_t stream);
 bool launch_block_kdirection_adaptive_batch_typed(
@@ -811,7 +813,10 @@ static void run_adaptive_scorer_test() {
                     layer_values, qw3::ported::KbarDType::F32,
                     d_tile_offsets, d_tile_counts, l, layers,
                     tokens, q_stride, layer_prototypes,
-                    included_blocks, excl_lo, heads, kv_heads,
+                    included_blocks, excl_lo,
+                    /*metadata_block_base=*/0,
+                    /*prototype_base=*/0,
+                    heads, kv_heads,
                     dim, scale, /*stream=*/0)) {
             std::fprintf(
                 stderr,
@@ -1192,8 +1197,8 @@ static void run_adaptive_gemm_parity_test() {
     CHECK(cudaMalloc(&d_query_f32, query_elems * sizeof(float)));
     CHECK(cudaMalloc(&d_prototypes, prototype_elems * sizeof(__half)));
     CHECK(cudaMalloc(&d_query, query_elems * sizeof(__half)));
-    CHECK(cudaMalloc(&d_offsets, tile_blocks * sizeof(int32_t)));
-    CHECK(cudaMalloc(&d_counts, tile_blocks * sizeof(int32_t)));
+    CHECK(cudaMalloc(&d_offsets, blocks * sizeof(int32_t)));
+    CHECK(cudaMalloc(&d_counts, blocks * sizeof(int32_t)));
     CHECK(cudaMalloc(&d_scalar, blocks * sizeof(float)));
     CHECK(cudaMalloc(&d_gemm, blocks * sizeof(float)));
     const uint64_t stats_entries =
@@ -1249,6 +1254,12 @@ static void run_adaptive_gemm_parity_test() {
         CHECK(cudaMemcpy(d_counts, local_counts.data(),
                          count * sizeof(int32_t), cudaMemcpyHostToDevice));
     };
+    auto install_absolute_meta = [&](uint32_t l) {
+        CHECK(cudaMemcpy(d_offsets, offsets.data() + l * blocks,
+                         blocks * sizeof(int32_t), cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(d_counts, counts.data() + l * blocks,
+                         blocks * sizeof(int32_t), cudaMemcpyHostToDevice));
+    };
     auto tile_shape = [&](uint32_t l, uint32_t first, uint32_t count,
                           uint32_t &prototype_begin,
                           uint32_t &prototype_count) {
@@ -1300,12 +1311,12 @@ static void run_adaptive_gemm_parity_test() {
     const float alpha = scale;
     const float beta = 0.0f;
     for (uint32_t l = 0; l < layers; ++l) {
+        install_absolute_meta(l);
         for (uint32_t first = 0; first < blocks; first += tile_blocks) {
             const uint32_t count = std::min(tile_blocks, blocks - first);
             uint32_t prototype_begin = 0;
             uint32_t prototype_count = 0;
             tile_shape(l, first, count, prototype_begin, prototype_count);
-            install_meta(l, first, count, prototype_begin);
             const __half *tile = d_prototypes +
                 static_cast<uint64_t>(prototype_begin) * kv_heads * dim;
             const __half *q_layer = d_query +
@@ -1333,6 +1344,8 @@ static void run_adaptive_gemm_parity_test() {
                             d_block_max, d_block_sum, d_logits,
                             d_offsets, d_counts, tokens, prototype_count,
                             count, first, blocks, heads, kvh * gqa, gqa,
+                            /*metadata_block_base=*/first,
+                            /*prototype_base=*/prototype_begin,
                             /*stream=*/0)) {
                     std::fprintf(stderr,
                                  "adaptive GEMM parity tile failed status=%d\n",

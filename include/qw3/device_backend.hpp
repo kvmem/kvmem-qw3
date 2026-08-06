@@ -1758,13 +1758,16 @@ public:
         uint32_t n_tokens, uint32_t prototype_count,
         uint32_t tile_blocks, uint32_t workspace_block_base,
         uint32_t workspace_block_stride, uint32_t n_heads,
-        uint32_t n_kv_heads, uint32_t head_dim, float scale) {
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t metadata_block_base,
+        uint32_t prototype_base) {
         (void)block_max; (void)block_sum; (void)logits;
         (void)query_head_major; (void)prototype_head_major;
         (void)block_offsets; (void)block_counts; (void)n_tokens;
         (void)prototype_count; (void)tile_blocks;
         (void)workspace_block_base; (void)workspace_block_stride;
         (void)n_heads; (void)n_kv_heads; (void)head_dim; (void)scale;
+        (void)metadata_block_base; (void)prototype_base;
         return {false,
                 "adaptive head-major GEMM requires backend override"};
     }
@@ -1809,6 +1812,7 @@ public:
         uint32_t prototype_count,
         uint32_t block_count,
         uint32_t global_block_base,
+        uint32_t metadata_block_base,
         uint32_t n_heads,
         uint32_t n_kv_heads,
         uint32_t head_dim,
@@ -1819,6 +1823,7 @@ public:
         (void)q_layer_stride; (void)prototype_row_offset;
         (void)prototype_count;
         (void)block_count; (void)global_block_base;
+        (void)metadata_block_base;
         (void)n_heads; (void)n_kv_heads; (void)head_dim;
         (void)scale;
         return {

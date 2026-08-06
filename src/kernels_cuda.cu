@@ -609,6 +609,7 @@ bool launch_block_attn_stream_adaptive_gemm_reduce(
     uint32_t n_tokens, uint32_t prototype_count, uint32_t tile_blocks,
     uint32_t workspace_block_base, uint32_t workspace_block_stride,
     uint32_t n_heads, uint32_t query_head_base, uint32_t gqa_group,
+    uint32_t metadata_block_base, uint32_t prototype_base,
     cudaStream_t stream);
 bool launch_block_attn_stream_adaptive_finalize(
     float *score, const float *block_max, const float *block_sum,
@@ -624,6 +625,7 @@ bool launch_block_attn_score_adaptive_layer_typed(
         uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
         uint32_t q_layer_stride, uint32_t prototype_count,
         uint32_t block_count, uint32_t global_block_base,
+        uint32_t metadata_block_base, uint32_t prototype_base,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
         float scale, cudaStream_t stream);
 bool launch_block_kmean_content_batch_merge(
@@ -6383,15 +6385,22 @@ __global__ void block_attn_adaptive_layer_accumulate_logits_kernel(
         uint32_t distribution_count,
         uint32_t block_count,
         uint32_t global_block_base,
+        uint32_t metadata_block_base,
+        uint32_t prototype_base,
         uint32_t prototype_count,
         float distribution_weight) {
     const uint32_t w =
         blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= block_count) return;
+    const uint32_t metadata_block = metadata_block_base + w;
+    const uint32_t absolute_begin = static_cast<uint32_t>(
+        max(block_offsets[metadata_block], 0));
     const uint32_t begin =
-        static_cast<uint32_t>(max(block_offsets[w], 0));
+        absolute_begin >= prototype_base
+            ? absolute_begin - prototype_base
+            : prototype_count;
     const uint32_t count =
-        static_cast<uint32_t>(max(block_counts[w], 0));
+        static_cast<uint32_t>(max(block_counts[metadata_block], 0));
     if (count == 0 || begin >= prototype_count ||
         count > prototype_count - begin) {
         return;
@@ -7204,7 +7213,8 @@ __global__ void block_attn_stream_adaptive_gemm_reduce_kernel(
         uint32_t n_tokens, uint32_t prototype_count,
         uint32_t tile_blocks, uint32_t workspace_block_base,
         uint32_t workspace_block_stride, uint32_t n_heads,
-        uint32_t query_head_base, uint32_t gqa_group) {
+        uint32_t query_head_base, uint32_t gqa_group,
+        uint32_t metadata_block_base, uint32_t prototype_base) {
     const uint64_t pairs =
         static_cast<uint64_t>(n_tokens) * tile_blocks;
     const uint64_t stride =
@@ -7214,10 +7224,15 @@ __global__ void block_attn_stream_adaptive_gemm_reduce_kernel(
          pair < pairs; pair += stride) {
         const uint32_t t = static_cast<uint32_t>(pair / tile_blocks);
         const uint32_t b = static_cast<uint32_t>(pair) - t * tile_blocks;
-        const uint32_t count =
-            static_cast<uint32_t>(max(block_counts[b], 0));
+        const uint32_t metadata_block = metadata_block_base + b;
+        const uint32_t count = static_cast<uint32_t>(
+            max(block_counts[metadata_block], 0));
+        const uint32_t absolute_begin = static_cast<uint32_t>(
+            max(block_offsets[metadata_block], 0));
         const uint32_t begin =
-            static_cast<uint32_t>(max(block_offsets[b], 0));
+            absolute_begin >= prototype_base
+                ? absolute_begin - prototype_base
+                : prototype_count;
         const uint32_t workspace_block = workspace_block_base + b;
         for (uint32_t g = 0; g < gqa_group; ++g) {
             float stats_max = -INFINITY;
@@ -16909,7 +16924,9 @@ public:
                     bm.ptr, bs.ptr, lg.ptr, bo.ptr_i32(), bc.ptr_i32(),
                     n_tokens, prototype_count, tile_blocks,
                     workspace_block_base, workspace_block_stride,
-                    n_heads, kvh * gqa_group, gqa_group, exec_stream_)) {
+                    n_heads, kvh * gqa_group, gqa_group,
+                    /*metadata_block_base=*/0,
+                    /*prototype_base=*/0, exec_stream_)) {
                 return {
                     false,
                     "block_attn_stream_adaptive_gemm_reduce launch failed"};
@@ -16987,7 +17004,8 @@ public:
             uint32_t tile_blocks, uint32_t workspace_block_base,
             uint32_t workspace_block_stride, uint32_t n_heads,
             uint32_t n_kv_heads, uint32_t head_dim,
-            float scale) override {
+            float scale, uint32_t metadata_block_base,
+            uint32_t prototype_base) override {
         if (prototype_count == 0 || tile_blocks == 0 || n_tokens == 0 ||
             n_heads == 0 || n_kv_heads == 0 ||
             n_heads % n_kv_heads != 0 || head_dim == 0) {
@@ -17018,7 +17036,10 @@ public:
                            prototype_count * head_dim ||
             bo.elem_size != sizeof(int32_t) ||
             bc.elem_size != sizeof(int32_t) ||
-            bo.count < tile_blocks || bc.count < tile_blocks ||
+            metadata_block_base > bo.count ||
+            tile_blocks > bo.count - metadata_block_base ||
+            metadata_block_base > bc.count ||
+            tile_blocks > bc.count - metadata_block_base ||
             workspace_block_base > workspace_block_stride ||
             tile_blocks > workspace_block_stride - workspace_block_base ||
             !cublas_handle_) {
@@ -17058,7 +17079,8 @@ public:
                     bm.ptr, bs.ptr, lg.ptr, bo.ptr_i32(), bc.ptr_i32(),
                     n_tokens, prototype_count, tile_blocks,
                     workspace_block_base, workspace_block_stride,
-                    n_heads, kvh * gqa_group, gqa_group, exec_stream_)) {
+                    n_heads, kvh * gqa_group, gqa_group,
+                    metadata_block_base, prototype_base, exec_stream_)) {
                 return {false,
                         "adaptive head-major GEMM reduce launch failed"};
             }
@@ -17137,6 +17159,7 @@ public:
             uint32_t prototype_count,
             uint32_t block_count,
             uint32_t global_block_base,
+            uint32_t metadata_block_base,
             uint32_t n_heads,
             uint32_t n_kv_heads,
             uint32_t head_dim,
@@ -17163,7 +17186,10 @@ public:
                     block_count ||
             bo.elem_size != sizeof(int32_t) ||
             bc.elem_size != sizeof(int32_t) ||
-            bo.count < block_count || bc.count < block_count ||
+            metadata_block_base > bo.count ||
+            block_count > bo.count - metadata_block_base ||
+            metadata_block_base > bc.count ||
+            block_count > bc.count - metadata_block_base ||
             qm.count < q_rows * n_heads * head_dim ||
             pt.count <
                 (static_cast<uint64_t>(prototype_row_offset) +
@@ -17188,7 +17214,8 @@ public:
                 sc.ptr, qm.ptr, qm.is_fp16(), prototype_ptr, dtype,
                 bo.ptr_i32(), bc.ptr_i32(), layer, n_layers,
                 n_tokens, q_layer_stride, prototype_count,
-                block_count, global_block_base, n_heads,
+                block_count, global_block_base, metadata_block_base,
+                prototype_row_offset, n_heads,
                 n_kv_heads, head_dim, scale, exec_stream_)) {
             return {
                 false,
@@ -22049,6 +22076,7 @@ bool launch_block_attn_score_adaptive_layer_impl(
         uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
         uint32_t q_layer_stride, uint32_t prototype_count,
         uint32_t block_count, uint32_t global_block_base,
+        uint32_t metadata_block_base, uint32_t prototype_base,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
         float scale, cudaStream_t stream) {
     if (layer >= n_layers || n_tokens == 0 ||
@@ -22185,7 +22213,8 @@ bool launch_block_attn_score_adaptive_layer_impl(
             score_grid, kSoftmaxPagesThreads, 0, stream>>>(
             score, logits, row_max, row_inv_sum,
             block_offsets, block_counts, count, block_count,
-            global_block_base, prototype_count,
+            global_block_base, metadata_block_base, prototype_base,
+            prototype_count,
             distribution_weight);
         err = cudaGetLastError();
         base += count;
@@ -22202,6 +22231,7 @@ bool launch_block_attn_score_adaptive_layer_typed(
         uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
         uint32_t q_layer_stride, uint32_t prototype_count,
         uint32_t block_count, uint32_t global_block_base,
+        uint32_t metadata_block_base, uint32_t prototype_base,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
         float scale, cudaStream_t stream) {
 #define QW3_ADAPTIVE_LAYER_SCORE(QT, KT)                               \
@@ -22209,8 +22239,9 @@ bool launch_block_attn_score_adaptive_layer_typed(
         score, static_cast<const QT *>(q_multi),                       \
         static_cast<const KT *>(prototype_layer), block_offsets,       \
         block_counts, layer, n_layers, n_tokens, q_layer_stride,       \
-        prototype_count, block_count, global_block_base, n_heads,      \
-        n_kv_heads, head_dim, scale, stream)
+        prototype_count, block_count, global_block_base,               \
+        metadata_block_base, prototype_base, n_heads, n_kv_heads,      \
+        head_dim, scale, stream)
     if (query_is_fp16) {
         switch (prototype_dtype) {
             case KbarDType::F32:
@@ -22504,6 +22535,7 @@ bool launch_block_attn_stream_adaptive_gemm_reduce(
         uint32_t tile_blocks, uint32_t workspace_block_base,
         uint32_t workspace_block_stride, uint32_t n_heads,
         uint32_t query_head_base, uint32_t gqa_group,
+        uint32_t metadata_block_base, uint32_t prototype_base,
         cudaStream_t stream) {
     if (n_tokens == 0 || prototype_count == 0 || tile_blocks == 0 ||
         gqa_group == 0 || query_head_base + gqa_group > n_heads ||
@@ -22521,7 +22553,8 @@ bool launch_block_attn_stream_adaptive_gemm_reduce(
         grid, threads, 0, stream>>>(
         block_max, block_sum, logits, block_offsets, block_counts,
         n_tokens, prototype_count, tile_blocks, workspace_block_base,
-        workspace_block_stride, n_heads, query_head_base, gqa_group);
+        workspace_block_stride, n_heads, query_head_base, gqa_group,
+        metadata_block_base, prototype_base);
     return cudaGetLastError() == cudaSuccess;
 }
 

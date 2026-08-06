@@ -17238,10 +17238,28 @@ void QwenExecutor::kvmem_finalize_adaptive_index() {
                         "g_adaptive_gpu_layer_offsets");
                 arena.block_counts =
                     backend_.tensor_i32(
-                        n_blocks,
-                        "g_adaptive_gpu_layer_counts");
+                    n_blocks,
+                    "g_adaptive_gpu_layer_counts");
                 arena.metadata_capacity = n_blocks;
             }
+            // Keep layer-local absolute prototype metadata resident beside
+            // the incremental prototype arena.  The Tensor-GEMM scorer may
+            // split a long query into many exact chunks; uploading rebased
+            // offsets for every prototype tile in every chunk needlessly
+            // serialized the CUDA stream.  These tensors already existed for
+            // the scalar layer scorer, so populating them here adds no GPU
+            // allocation and lets both paths reuse one canonical image.
+            const uint64_t meta_base =
+                static_cast<uint64_t>(l) *
+                g_adaptive_index_stride_blocks_;
+            require_status(backend_.copy_i32_from_host(
+                *arena.block_offsets, 0,
+                g_adaptive_block_offsets_host_.data() + meta_base,
+                n_blocks));
+            require_status(backend_.copy_i32_from_host(
+                *arena.block_counts, 0,
+                g_adaptive_block_counts_host_.data() + meta_base,
+                n_blocks));
         }
         g_adaptive_packed_.reset();
         g_adaptive_layer_offsets_dev_.reset();
@@ -17864,7 +17882,9 @@ bool QwenExecutor::kvmem_score_cpu_adaptive_index_layer_one_pass(
                 job.layer, layers, n_tokens, q_layer_stride,
                 /*prototype_row_offset=*/0,
                 job.prototype_count, job.block_count,
-                job.first_block, cfg.n_heads, cfg.n_kv_heads,
+                job.first_block,
+                /*metadata_block_base=*/0,
+                cfg.n_heads, cfg.n_kv_heads,
                 cfg.head_dim, scale);
         if (!st.ok) {
             return scorer_backend_unavailable(
@@ -18748,20 +18768,12 @@ bool QwenExecutor::kvmem_score_gpu_adaptive_index_layer_one_pass(
             AdaptiveIndexStageSlot &slot = g_adaptive_stream_slots_[0];
             const uint64_t value_elems = capacity_rows * row_elems;
             if (!slot.values || slot.values->count < value_elems ||
-                slot.values->dtype != DeviceTensorDType::F16 ||
-                !slot.block_offsets ||
-                slot.block_offsets->count < block_count ||
-                !slot.block_counts ||
-                slot.block_counts->count < block_count) {
+                slot.values->dtype != DeviceTensorDType::F16) {
                 slot.compute_done.reset();
                 slot.transfer_done.reset();
                 slot.host.reset();
                 slot.values = kvmem_alloc_mean_index_tensor(
                     value_elems, "g_adaptive_gpu_tile_values");
-                slot.block_offsets = backend_.tensor_i32(
-                    block_count, "g_adaptive_gpu_tile_offsets");
-                slot.block_counts = backend_.tensor_i32(
-                    block_count, "g_adaptive_gpu_tile_counts");
             }
             if (!g_adaptive_stream_block_max_ ||
                 !g_adaptive_stream_block_sum_ ||
@@ -18798,10 +18810,6 @@ bool QwenExecutor::kvmem_score_gpu_adaptive_index_layer_one_pass(
                     query_head_major_elems;
             }
 
-            std::vector<int32_t> tile_offsets;
-            std::vector<int32_t> tile_counts;
-            tile_offsets.reserve(block_count);
-            tile_counts.reserve(block_count);
             uint64_t copied_bytes = 0;
             uint32_t tiles = 0;
             const uint64_t begin_ns = kvmem_steady_ns();
@@ -18866,38 +18874,23 @@ bool QwenExecutor::kvmem_score_gpu_adaptive_index_layer_one_pass(
                     const uint32_t tile_prototypes =
                         static_cast<uint32_t>(
                             prototype_end - prototype_begin);
-                    tile_offsets.resize(tile_blocks);
-                    tile_counts.resize(tile_blocks);
-                    for (uint32_t b = 0; b < tile_blocks; ++b) {
-                        const uint64_t meta = meta_base + first + b;
-                        tile_offsets[b] =
-                            g_adaptive_block_offsets_host_[meta] -
-                            static_cast<int32_t>(prototype_begin);
-                        tile_counts[b] =
-                            g_adaptive_block_counts_host_[meta];
-                    }
                     require_status(
                         backend_.adaptive_pack_prototypes_head_major_device(
                             *slot.values, *arena.values,
                             prototype_begin, tile_prototypes,
                             cfg.n_kv_heads, cfg.head_dim));
-                    require_status(backend_.copy_i32_from_host(
-                        *slot.block_offsets, 0, tile_offsets.data(),
-                        tile_offsets.size()));
-                    require_status(backend_.copy_i32_from_host(
-                        *slot.block_counts, 0, tile_counts.data(),
-                        tile_counts.size()));
                     DeviceStatus st = backend_.
                         block_attn_stream_adaptive_block_stats_gemm_head_major_device(
                             *g_adaptive_stream_block_max_,
                             *g_adaptive_stream_block_sum_,
                             *g_adaptive_stream_logits_,
                             *g_adaptive_query_head_major_, *slot.values,
-                            *slot.block_offsets, *slot.block_counts,
+                            *arena.block_offsets, *arena.block_counts,
                             n_tokens, tile_prototypes, tile_blocks,
                             first - included_begin, block_count,
                             cfg.n_heads, cfg.n_kv_heads,
-                            cfg.head_dim, scale);
+                            cfg.head_dim, scale, first,
+                            prototype_begin);
                     if (!st.ok) {
                         return scorer_backend_unavailable(
                             failure_reason,
@@ -18942,8 +18935,6 @@ bool QwenExecutor::kvmem_score_gpu_adaptive_index_layer_one_pass(
         }
     }
 
-    std::vector<int32_t> offsets(block_count);
-    std::vector<int32_t> counts(block_count);
     const uint64_t begin_ns = kvmem_steady_ns();
     for (uint32_t l = 0; l < layers; ++l) {
         AdaptiveGpuLayerArena &arena =
@@ -18986,23 +18977,6 @@ bool QwenExecutor::kvmem_score_gpu_adaptive_index_layer_one_pass(
             static_cast<uint32_t>(
                 prototype_end - prototype_begin);
         if (prototype_count == 0) continue;
-        for (uint32_t b = 0; b < block_count; ++b) {
-            const uint64_t meta =
-                meta_base + included_begin + b;
-            offsets[b] =
-                g_adaptive_block_offsets_host_[meta] -
-                static_cast<int32_t>(prototype_begin);
-            counts[b] =
-                g_adaptive_block_counts_host_[meta];
-        }
-        require_status(
-            backend_.copy_i32_from_host(
-                *arena.block_offsets, 0,
-                offsets.data(), offsets.size()));
-        require_status(
-            backend_.copy_i32_from_host(
-                *arena.block_counts, 0,
-                counts.data(), counts.size()));
         const DeviceStatus st =
             backend_.block_attn_score_adaptive_layer_device(
                 *g_score_dev_, *g_query_multi_,
@@ -19011,6 +18985,7 @@ bool QwenExecutor::kvmem_score_gpu_adaptive_index_layer_one_pass(
                 q_layer_stride,
                 static_cast<uint32_t>(prototype_begin),
                 prototype_count, block_count, included_begin,
+                included_begin,
                 cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
                 scale);
         if (!st.ok) {
@@ -19131,11 +19106,16 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
     // For the exact CPU Adaptive one-dot path, however, every query chunk also
     // streams the complete prototype index.  At 10M context this is tens of
     // GiB, so unnecessarily splitting a query can dominate semantic TTFT.
-    // When the caller did not explicitly pin the chunk size, grow it to the
-    // largest value that fits the configured exact block-stat workspace.  The
-    // 512-MiB default therefore retains its conservative behavior; machines
-    // that intentionally raise QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB obtain fewer
-    // full-index scans without a second machine-specific tuning knob.
+    // When the caller did not explicitly pin the chunk size, adapt it to the
+    // largest value that fits the configured exact block-stat workspace.  CPU
+    // placement only grows the bounded staging chunk: shrinking it would turn
+    // one two-pass index transfer into several one-pass transfers.  The GPU
+    // index is already resident, so clamp in both directions there.  Without
+    // the downward clamp a 256-token chunk whose exact workspace is just over
+    // the cap silently falls all the way back to the scalar layer scorer even
+    // though (for example) three exact Tensor-GEMM chunks fit.  Splitting the
+    // query does not sample or truncate it; every query/prototype dot and the
+    // same per-token softmax contribution are still evaluated exactly once.
     const bool adaptive_exact_tiled =
         kvmem_mean_index_cpu() ||
         env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TENSOR_GEMM", true);
@@ -19159,7 +19139,10 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
             1024ull * 1024ull;
         if (bytes_per_token > 0) {
             const uint64_t fit = workspace_cap / bytes_per_token;
-            if (fit > chunk_tokens) {
+            if (kvmem_mean_index_cpu() && fit > chunk_tokens) {
+                chunk_tokens = static_cast<uint32_t>(
+                    std::min<uint64_t>(tokens, fit));
+            } else if (!kvmem_mean_index_cpu() && fit > 0) {
                 chunk_tokens = static_cast<uint32_t>(
                     std::min<uint64_t>(tokens, fit));
             }
