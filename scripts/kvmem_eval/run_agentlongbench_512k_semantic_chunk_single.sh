@@ -7,6 +7,8 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT=${PORT:-18089}
 GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.50}
 GEN_BUDGET=${GEN_BUDGET:-8192}
+START_INDEX=${START_INDEX:-0}
+LIMIT=${LIMIT:-1}
 TAG=${TAG:-agentlongbench_512k_k32_semantic_chunk_q512_adaptive_b32_fp8_mtp4_20260806}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
@@ -19,6 +21,32 @@ RUN_LOG=${RUN_LOG:-$LOG_ROOT/${TAG}_runner.log}
 mkdir -p "$RESULT_ROOT" "$LOG_ROOT"
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy=127.0.0.1,localhost
+
+if [[ ! "$START_INDEX" =~ ^[0-9]+$ ]] || [[ ! "$LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "START_INDEX must be >= 0 and LIMIT must be > 0" >&2
+  exit 2
+fi
+mapfile -t selected_ids < <(
+  "$ROOT/.venv/bin/python" - "$DATA" "$START_INDEX" "$LIMIT" <<'PY'
+import json
+import sys
+
+path, start, limit = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(path, encoding="utf-8") as handle:
+    rows = [json.loads(line) for line in handle if line.strip()]
+selected = rows[start:start + limit]
+if len(selected) != limit:
+    raise SystemExit(
+        f"requested [{start},{start + limit}) but dataset has {len(rows)} rows"
+    )
+for row in selected:
+    print(row["stable_sample_id"])
+PY
+)
+selection_args=()
+for sample_id in "${selected_ids[@]}"; do
+  selection_args+=(--question-id "$sample_id")
+done
 
 if curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
   echo "port $PORT already has a healthy server" >&2
@@ -98,5 +126,5 @@ curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null
   --kvmem-prefill-window semantic_chunk \
   --kvmem-prefill-semantic-start-tokens 32768 \
   --kvmem-prefill-semantic-query-tokens 512 \
-  --limit 1 \
+  "${selection_args[@]}" \
   2>&1 | tee -a "$RUN_LOG"
