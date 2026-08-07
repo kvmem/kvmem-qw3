@@ -719,13 +719,36 @@ def main() -> None:
     if len(set(sample_ids)) != len(sample_ids):
         raise RuntimeError("samples contain duplicate stable_sample_id values")
     if args.question_id:
-        wanted = set(args.question_id)
-        samples = [
-            sample
-            for sample in samples
-            if str(sample.get("stable_sample_id")) in wanted
-            or str((sample.get("raw") or {}).get("id")) in wanted
-        ]
+        # Repeated --question-id arguments are also an explicit execution
+        # order. Preserving only membership here used to silently fall back to
+        # dataset order, defeating priority-ordered diagnostic runs.
+        by_requested_id = {}
+        for sample in samples:
+            stable_id = str(sample.get("stable_sample_id") or "")
+            raw_id = str((sample.get("raw") or {}).get("id") or "")
+            if stable_id:
+                by_requested_id[stable_id] = sample
+            if raw_id:
+                by_requested_id[raw_id] = sample
+        ordered_samples = []
+        ordered_stable_ids = set()
+        missing_ids = []
+        for requested_id in args.question_id:
+            sample = by_requested_id.get(str(requested_id))
+            if sample is None:
+                missing_ids.append(str(requested_id))
+                continue
+            stable_id = str(sample.get("stable_sample_id") or "")
+            if stable_id in ordered_stable_ids:
+                continue
+            ordered_stable_ids.add(stable_id)
+            ordered_samples.append(sample)
+        if missing_ids:
+            raise RuntimeError(
+                "requested question IDs are absent from the dataset: "
+                + ", ".join(missing_ids[:8])
+            )
+        samples = ordered_samples
     elif args.limit is not None:
         samples = samples[: args.limit]
     if not samples:
