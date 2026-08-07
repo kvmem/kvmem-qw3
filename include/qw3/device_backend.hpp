@@ -1796,6 +1796,36 @@ public:
                 "adaptive GEMM LSE requires backend override"};
     }
 
+    // Exact bounded-workspace Adaptive scoring for one KV head and one query
+    // tile. The complete prototype range is dotted once; logits and block_max
+    // share a caller-owned workspace, and the backend immediately performs
+    // fused LSE/MaxSim reduction plus score finalization.
+    virtual DeviceStatus
+    block_attn_stream_adaptive_gemm_one_dot_head_device(
+        DeviceTensor &score, DeviceTensor &block_max,
+        DeviceTensor &global_max, DeviceTensor &global_sum,
+        DeviceTensor &logits, const DeviceTensor &query_head_major,
+        const DeviceTensor &prototype_natural,
+        const DeviceTensor &block_offsets,
+        const DeviceTensor &block_counts,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t prototype_count, uint32_t block_count,
+        uint32_t global_block_base, uint32_t metadata_block_base,
+        uint32_t prototype_base, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t kv_head,
+        uint32_t head_dim, float scale) {
+        (void)score; (void)block_max; (void)global_max;
+        (void)global_sum; (void)logits; (void)query_head_major;
+        (void)prototype_natural; (void)block_offsets;
+        (void)block_counts; (void)layer; (void)n_layers;
+        (void)n_tokens; (void)prototype_count; (void)block_count;
+        (void)global_block_base; (void)metadata_block_base;
+        (void)prototype_base; (void)n_heads; (void)n_kv_heads;
+        (void)kv_head; (void)head_dim; (void)scale;
+        return {false,
+                "adaptive one-dot GEMM requires backend override"};
+    }
+
     virtual DeviceStatus
     block_attn_stream_adaptive_gemm_score_head_major_device(
         DeviceTensor &score, DeviceTensor &logits,

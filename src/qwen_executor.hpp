@@ -1598,6 +1598,14 @@ private:
         uint32_t captured_tokens, uint32_t source_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         std::string *failure_reason);
+    // Exact one-dot variant. It partitions the existing bounded scorer slab
+    // between logits and per-block MaxSim, then processes query tiles against
+    // a complete prototype layer without recomputing q·prototype.
+    bool kvmem_score_gpu_adaptive_host_query_one_dot(
+        uint32_t n_blocks, uint32_t score_tokens,
+        uint32_t captured_tokens, uint32_t source_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        std::string *failure_reason);
     uint32_t kvmem_query_begin_ = 0;
     uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
     uint32_t g_query_multi_count_ = 0;                         // rows captured so far (per slot)

@@ -5860,11 +5860,32 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 "forward_n_tokens.qk", rope_base_pos, batch,
                 cfg.n_ctx_train, static_cast<int32_t>(il),
                 /*kernel_uses=*/2);
+            const int32_t provisional_slot =
+                (static_cast<size_t>(il) < std_layer_slot_.size())
+                    ? std_layer_slot_[il] : -1;
+            const bool provisional_terminal_query_layer =
+                kvmem_provisional_prefill_ && kvmem_qc_capture_active_ &&
+                kvmem_query_end_ > kvmem_query_begin_ &&
+                env_flag_enabled(
+                    "QW3_KVMEM_PROVISIONAL_EARLY_EXIT", true) &&
+                provisional_slot >= 0 &&
+                static_cast<uint32_t>(provisional_slot + 1) ==
+                    kvmem_qc_num_layers_;
             {
                 DeviceTensor *outs[3] = {q_batch_.get(), k_batch_.get(), v_batch_.get()};
                 const DeviceWeight *ws[3] = {layer.attn_q, layer.attn_k, layer.attn_v};
                 const uint32_t strides[3] = {q_stride_buf, k_stride_buf, v_stride_buf};
-                if (v_cache(il).dtype == DeviceTensorDType::FP8_E4M3) {
+                if (provisional_terminal_query_layer &&
+                    env_flag_enabled(
+                        "QW3_KVMEM_PROVISIONAL_Q_ONLY", true)) {
+                    // Only Q is observable at the terminal provisional layer;
+                    // avoid projecting K/V that would be discarded on the
+                    // immediate rollback.
+                    require_status(backend_.rms_norm_q8_0_matmul_fanout(
+                        *norm_batch_, outs, ws, strides, 1,
+                        *h_batch_, *layer.attn_norm, batch,
+                        h_stride, eps));
+                } else if (v_cache(il).dtype == DeviceTensorDType::FP8_E4M3) {
                     require_status(
                         backend_.rms_norm_q8_0_matmul_attention_fanout(
                             *norm_batch_, outs, ws, strides, 3,
@@ -5885,6 +5906,31 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                                                             standard_n_heads,
                                                             2 * standard_head_dim,
                                                             standard_head_dim, eps));
+
+            // A provisional semantic-chunk pass exists only to capture Q for
+            // retrieval. Once the final configured normal-attention layer has
+            // produced its normalized/rotated Q, no later activation, KV
+            // append, attention output, or FFN can affect the score. Exit the
+            // target forward at that exact boundary. This is computation
+            // pruning only: the provisional state is rolled back immediately,
+            // and the durable replay still executes the complete model/MTP.
+            if (provisional_terminal_query_layer) {
+                require_status(backend_.rope_partial_batch(
+                    *q_batch_, batch, q_stride_buf, standard_n_heads,
+                    2 * standard_head_dim, cfg.rope_dim, rope_base_pos,
+                    cfg.rope_theta));
+                kvmem_capture_query_multi(
+                    static_cast<uint32_t>(provisional_slot), chunk_off,
+                    batch, base_pos, rope_base_pos, q_stride_buf);
+                if (std::getenv("QW3_KVMEM_TRACE")) {
+                    std::fprintf(
+                        stderr,
+                        "[kvmem-provisional] early-exit layer=%u "
+                        "captured_layers=%u batch=%u\n",
+                        il, kvmem_qc_num_layers_, batch);
+                }
+                break;
+            }
             require_status(backend_.rmsnorm_per_head_batch(*k_batch_, *layer.attn_k_norm,
                                                             batch, k_stride_buf,
                                                             standard_n_kv_heads,
@@ -19134,6 +19180,301 @@ bool QwenExecutor::kvmem_score_adaptive_index(
     return true;
 }
 
+bool QwenExecutor::kvmem_score_gpu_adaptive_host_query_one_dot(
+        uint32_t n_blocks, uint32_t score_tokens,
+        uint32_t captured_tokens, uint32_t source_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        std::string *failure_reason) {
+    if (kvmem_adaptive_prototypes() && g_adaptive_index_dirty_) {
+        kvmem_finalize_adaptive_index();
+    }
+    if (!kvmem_adaptive_prototypes() || kvmem_mean_index_cpu() ||
+        !block_store_ || !kvmem_query_multi_host_data() || !g_score_dev_ ||
+        score_tokens != captured_tokens ||
+        env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_PACKED", false) ||
+        !env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_ONE_DOT", true) ||
+        !env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TENSOR_GEMM", true)) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_one_dot_unavailable");
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = kvmem_qc_num_layers_;
+    const uint32_t included_begin = std::min(excl_lo_end, n_blocks);
+    const uint32_t included_end = std::min(excl_hi_begin, n_blocks);
+    const uint32_t block_count = included_end - included_begin;
+    const uint32_t gqa_group =
+        cfg.n_kv_heads > 0 ? cfg.n_heads / cfg.n_kv_heads : 0;
+    if (layers == 0 || score_tokens == 0 || block_count == 0 ||
+        cfg.n_kv_heads == 0 || cfg.n_heads % cfg.n_kv_heads != 0 ||
+        gqa_group < 1u || gqa_group > 6u ||
+        g_adaptive_gpu_layer_arenas_.size() != layers ||
+        g_adaptive_index_elem_size_ != sizeof(uint16_t) ||
+        g_adaptive_block_offsets_host_.size() <
+            static_cast<uint64_t>(layers) *
+                g_adaptive_index_stride_blocks_ ||
+        g_adaptive_block_counts_host_.size() <
+            static_cast<uint64_t>(layers) *
+                g_adaptive_index_stride_blocks_) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_one_dot_shape_invalid");
+    }
+
+    uint64_t max_layer_prototypes = 0;
+    for (uint32_t l = 0; l < layers; ++l) {
+        const uint64_t meta_base =
+            static_cast<uint64_t>(l) * g_adaptive_index_stride_blocks_;
+        const auto &arena = g_adaptive_gpu_layer_arenas_[l];
+        if (!arena.values || !arena.block_offsets || !arena.block_counts ||
+            arena.values->dtype != DeviceTensorDType::F16) {
+            return scorer_unavailable(
+                failure_reason, "gpu_adaptive_one_dot_arena_unavailable");
+        }
+        const int32_t begin_i32 =
+            g_adaptive_block_offsets_host_[meta_base + included_begin];
+        const uint64_t last = meta_base + included_end - 1;
+        const int32_t last_offset_i32 =
+            g_adaptive_block_offsets_host_[last];
+        const int32_t last_count_i32 =
+            g_adaptive_block_counts_host_[last];
+        if (begin_i32 < 0 || last_offset_i32 < begin_i32 ||
+            last_count_i32 <= 0) {
+            return scorer_unavailable(
+                failure_reason, "gpu_adaptive_one_dot_metadata_invalid");
+        }
+        const uint64_t prototype_end =
+            static_cast<uint64_t>(last_offset_i32) +
+            static_cast<uint32_t>(last_count_i32);
+        const uint64_t prototype_count =
+            prototype_end - static_cast<uint32_t>(begin_i32);
+        if (prototype_count == 0 ||
+            prototype_end > arena.prototype_count) {
+            return scorer_unavailable(
+                failure_reason, "gpu_adaptive_one_dot_prototype_oob");
+        }
+        max_layer_prototypes =
+            std::max(max_layer_prototypes, prototype_count);
+    }
+
+    // Partition the existing scorer ceiling between block MaxSim and GEMM
+    // logits. A complete prototype layer must fit for every query tile; this
+    // is what lets the fused reducer consume each q·prototype exactly once.
+    const uint64_t workspace_bytes =
+        static_cast<uint64_t>(env_uint32_or(
+            "QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB", 512)) *
+        1024ull * 1024ull;
+    const uint64_t workspace_entries = workspace_bytes / sizeof(float);
+    const uint64_t entries_per_query_token =
+        static_cast<uint64_t>(gqa_group) *
+        (static_cast<uint64_t>(block_count) + max_layer_prototypes);
+    if (entries_per_query_token == 0 ||
+        workspace_entries < entries_per_query_token) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_one_dot_workspace_too_small");
+    }
+    const uint32_t max_query_tile = static_cast<uint32_t>(
+        std::min<uint64_t>(
+            score_tokens, workspace_entries / entries_per_query_token));
+    if (max_query_tile == 0) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_one_dot_query_tile_zero");
+    }
+    // Balance tiles rather than emitting one maximum tile followed by a tiny
+    // tail. The latter performs a full-layer GEMM with an inefficient N=1..N
+    // tail even though the same number of dots can be split evenly.
+    const uint32_t query_tile_count =
+        (score_tokens + max_query_tile - 1) / max_query_tile;
+    const uint32_t query_tile =
+        (score_tokens + query_tile_count - 1) / query_tile_count;
+    const uint64_t block_max_entries =
+        static_cast<uint64_t>(query_tile) * gqa_group * block_count;
+    const uint64_t logits_entries =
+        static_cast<uint64_t>(query_tile) * gqa_group *
+        max_layer_prototypes;
+    const uint64_t combined_entries =
+        block_max_entries + logits_entries;
+    if (combined_entries > workspace_entries ||
+        combined_entries > UINT64_MAX / sizeof(float)) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_one_dot_workspace_overflow");
+    }
+    if (!g_adaptive_stream_logits_ ||
+        g_adaptive_stream_logits_capacity_ < combined_entries) {
+        g_adaptive_stream_logits_ = backend_.scratch_f32(
+            combined_entries, "g_adaptive_one_dot_workspace");
+        g_adaptive_stream_logits_capacity_ = combined_entries;
+    }
+    auto block_max_view = backend_.tensor_view(
+        *g_adaptive_stream_logits_, /*byte_offset=*/0,
+        block_max_entries, sizeof(float), DeviceTensorDType::F32,
+        "g_adaptive_one_dot_block_max");
+    auto logits_view = backend_.tensor_view(
+        *g_adaptive_stream_logits_, block_max_entries * sizeof(float),
+        logits_entries, sizeof(float), DeviceTensorDType::F32,
+        "g_adaptive_one_dot_logits");
+    if (!block_max_view || !logits_view) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_one_dot_workspace_view_failed");
+    }
+
+    const uint64_t query_row_elems =
+        static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
+    const uint64_t query_tile_elems =
+        static_cast<uint64_t>(query_tile) * query_row_elems;
+    const uint64_t query_tile_bytes =
+        query_tile_elems * sizeof(uint16_t);
+    if (!g_query_multi_ ||
+        g_query_multi_->dtype != DeviceTensorDType::F16 ||
+        g_query_multi_->count < query_tile_elems) {
+        g_query_multi_ = backend_.tensor_f16(
+            query_tile_elems, "g_adaptive_one_dot_query_ingress");
+        g_query_multi_capacity_ = query_tile;
+    }
+    if (!g_adaptive_query_head_major_ ||
+        g_adaptive_query_head_major_capacity_ < query_tile_elems) {
+        g_adaptive_query_head_major_ = backend_.tensor_f16(
+            query_tile_elems, "g_adaptive_one_dot_query_head_major");
+        g_adaptive_query_head_major_capacity_ = query_tile_elems;
+    }
+    const bool direct_pinned_query =
+        static_cast<bool>(g_query_multi_pinned_host_);
+    if (!direct_pinned_query &&
+        (!g_query_score_pinned_ ||
+         g_query_score_pinned_capacity_ < query_tile_bytes)) {
+        g_query_score_pinned_ = backend_.host_buffer(
+            query_tile_bytes, "g_adaptive_one_dot_query_bounce");
+        g_query_score_pinned_capacity_ = query_tile_bytes;
+    }
+    const uint64_t distributions =
+        static_cast<uint64_t>(layers) * query_tile * cfg.n_heads;
+    if (!g_kbar_stream_global_max_ || !g_kbar_stream_global_sum_ ||
+        g_kbar_stream_distribution_capacity_ < distributions) {
+        g_kbar_stream_global_max_ = backend_.tensor_f32(
+            distributions, "g_adaptive_one_dot_global_max");
+        g_kbar_stream_global_sum_ = backend_.tensor_f32(
+            distributions, "g_adaptive_one_dot_global_sum");
+        g_kbar_stream_distribution_capacity_ = distributions;
+    }
+
+    require_status(backend_.zero_tensor(*g_score_dev_));
+    const uint16_t *query_host = kvmem_query_multi_host_data();
+    uint64_t query_h2d_bytes = 0;
+    uint64_t query_h2d_wait_ns = 0;
+    uint64_t query_gather_ns = 0;
+    uint32_t query_tiles = 0;
+    uint32_t gemm_calls = 0;
+    const uint64_t begin_ns = kvmem_steady_ns();
+    std::unique_ptr<DeviceTransferFence> prior_query_h2d;
+    std::unique_ptr<DeviceTransferFence> prior_query_consumed;
+
+    for (uint32_t l = 0; l < layers; ++l) {
+        const uint64_t meta_base =
+            static_cast<uint64_t>(l) * g_adaptive_index_stride_blocks_;
+        const auto &arena = g_adaptive_gpu_layer_arenas_[l];
+        const uint32_t prototype_begin = static_cast<uint32_t>(
+            g_adaptive_block_offsets_host_[meta_base + included_begin]);
+        const uint64_t last = meta_base + included_end - 1;
+        const uint32_t prototype_end =
+            static_cast<uint32_t>(
+                g_adaptive_block_offsets_host_[last]) +
+            static_cast<uint32_t>(
+                g_adaptive_block_counts_host_[last]);
+        const uint32_t prototype_count =
+            prototype_end - prototype_begin;
+        for (uint32_t query_begin = 0; query_begin < score_tokens;
+             query_begin += query_tile) {
+            const uint32_t tokens =
+                std::min(query_tile, score_tokens - query_begin);
+            const uint64_t bytes =
+                static_cast<uint64_t>(tokens) * query_row_elems *
+                sizeof(uint16_t);
+            if (prior_query_h2d) {
+                const uint64_t wait_begin = kvmem_steady_ns();
+                require_status(
+                    backend_.wait_kv_transfer_fence(prior_query_h2d));
+                query_h2d_wait_ns += kvmem_steady_ns() - wait_begin;
+            }
+            const uint64_t source =
+                (static_cast<uint64_t>(l) * source_stride + query_begin) *
+                query_row_elems;
+            const uint64_t gather_begin = kvmem_steady_ns();
+            const void *host_source = nullptr;
+            if (direct_pinned_query) {
+                host_source = query_host + source;
+            } else {
+                std::memcpy(
+                    g_query_score_pinned_->data, query_host + source,
+                    static_cast<size_t>(bytes));
+                host_source = g_query_score_pinned_->data;
+            }
+            query_gather_ns += kvmem_steady_ns() - gather_begin;
+            if (prior_query_consumed) {
+                require_status(backend_.kv_transfer_wait_for_execution(
+                    prior_query_consumed));
+            }
+            require_status(backend_.begin_kv_transfer_to_device());
+            require_status(backend_.copy_bytes_from_host_async(
+                *g_query_multi_, /*byte_offset=*/0, host_source, bytes));
+            std::unique_ptr<DeviceTransferFence> query_ready;
+            require_status(backend_.record_kv_transfer_fence(query_ready));
+            require_status(
+                backend_.execution_wait_for_kv_transfer(query_ready));
+            query_h2d_bytes += bytes;
+            require_status(backend_.adaptive_pack_query_head_major_device(
+                *g_adaptive_query_head_major_, *g_query_multi_,
+                /*layer=*/0, tokens, /*q_layer_stride=*/tokens,
+                cfg.n_heads, cfg.head_dim));
+            std::unique_ptr<DeviceTransferFence> query_consumed;
+            require_status(
+                backend_.record_execution_fence(query_consumed));
+            prior_query_h2d = std::move(query_ready);
+            prior_query_consumed = std::move(query_consumed);
+
+            for (uint32_t kvh = 0; kvh < cfg.n_kv_heads; ++kvh) {
+                DeviceStatus st =
+                    backend_.block_attn_stream_adaptive_gemm_one_dot_head_device(
+                        *g_score_dev_, *block_max_view,
+                        *g_kbar_stream_global_max_,
+                        *g_kbar_stream_global_sum_, *logits_view,
+                        *g_adaptive_query_head_major_, *arena.values,
+                        *arena.block_offsets, *arena.block_counts,
+                        l, layers, tokens, prototype_count, block_count,
+                        included_begin, included_begin, prototype_begin,
+                        cfg.n_heads, cfg.n_kv_heads, kvh,
+                        cfg.head_dim, scale);
+                if (!st.ok) {
+                    return scorer_backend_unavailable(
+                        failure_reason,
+                        "gpu_adaptive_one_dot_gemm_failed", st);
+                }
+                ++gemm_calls;
+            }
+            ++query_tiles;
+        }
+    }
+    require_status(backend_.synchronize());
+    if (std::getenv("QW3_KVMEM_TRACE") || kvmem_perf_trace_flag()) {
+        std::fprintf(
+            stderr,
+            "[bs-adaptive-score] placement=gpu layout=natural "
+            "mode=tiled-tensor-gemm-one-dot exact=1 passes=1 "
+            "layers=%u blocks=%u query_tokens=%u query_tile=%u "
+            "query_tiles=%u gemm_calls=%u gqa_group=%u "
+            "max_prototypes=%llu workspace_mib=%.2f "
+            "query_h2d_mib=%.2f query_gather_ms=%.3f "
+            "query_h2d_wait_ms=%.3f total_ms=%.3f\n",
+            layers, n_blocks, score_tokens, query_tile, query_tiles,
+            gemm_calls, gqa_group,
+            static_cast<unsigned long long>(max_layer_prototypes),
+            static_cast<double>(combined_entries * sizeof(float)) /
+                (1024.0 * 1024.0),
+            static_cast<double>(query_h2d_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(query_gather_ns) / 1.0e6,
+            static_cast<double>(query_h2d_wait_ns) / 1.0e6,
+            static_cast<double>(kvmem_steady_ns() - begin_ns) / 1.0e6);
+    }
+    return true;
+}
+
 bool QwenExecutor::kvmem_score_gpu_adaptive_host_query_two_pass(
         uint32_t n_blocks, uint32_t score_tokens,
         uint32_t captured_tokens, uint32_t source_stride, float scale,
@@ -19562,14 +19903,15 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
         std::getenv("QW3_KVMEM_QUERY_SCORE_CHUNK");
     // The old exact GPU path bounded O(Q*H*blocks) block statistics by
     // splitting Q, which rescanned the complete resident index for every
-    // chunk.  Once that workspace would overflow, prefer the exact two-pass
-    // layer-streaming implementation: it keeps O(Q*H) LSE state and scans the
-    // index exactly twice.  An explicit score-chunk override remains a useful
-    // compatibility/performance control and therefore retains the old path.
+    // chunk. Once that workspace would overflow, first try the exact one-dot
+    // path, which partitions the same workspace between logits and MaxSim.
+    // The exact two-pass layer streamer remains the zero-regression fallback.
+    // An explicit score-chunk override retains the old path for A/B tests.
     if (!score_chunk_env && kvmem_adaptive_prototypes() &&
         !kvmem_mean_index_cpu() && block_store_->config().adaptive_score_mode ==
             KvMemAdaptiveScoreMode::Auto &&
-        env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TWO_PASS", true) &&
+        (env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_ONE_DOT", true) ||
+         env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TWO_PASS", true)) &&
         env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TENSOR_GEMM", true) &&
         !env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_PACKED", false)) {
         const uint32_t included_begin = std::min(excl_lo_end, n_blocks);
@@ -19586,6 +19928,13 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
                 "QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB", 512)) *
             1024ull * 1024ull;
         if (required_block_stats > workspace_cap) {
+            std::string one_dot_failure;
+            if (kvmem_score_gpu_adaptive_host_query_one_dot(
+                    n_blocks, tokens, captured_tokens, source_stride,
+                    scale, excl_lo_end, excl_hi_begin,
+                    &one_dot_failure)) {
+                return true;
+            }
             std::string two_pass_failure;
             if (kvmem_score_gpu_adaptive_host_query_two_pass(
                     n_blocks, tokens, captured_tokens, source_stride,
@@ -19598,8 +19947,11 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
                 std::fprintf(
                     stderr,
                     "[bs-adaptive-stream-fallback] "
-                    "from=gpu-tiled-two-pass to=query-chunked-one-pass "
-                    "reason=%s\n",
+                    "from=gpu-one-dot/two-pass "
+                    "to=query-chunked-one-pass "
+                    "one_dot_reason=%s two_pass_reason=%s\n",
+                    one_dot_failure.empty()
+                        ? "unknown" : one_dot_failure.c_str(),
                     two_pass_failure.empty()
                         ? "unknown" : two_pass_failure.c_str());
             }

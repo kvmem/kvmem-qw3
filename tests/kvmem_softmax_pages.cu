@@ -115,6 +115,15 @@ bool launch_block_attn_stream_adaptive_gemm_score_reduce(
     uint32_t prototype_base, uint32_t n_heads,
     uint32_t query_head_base, uint32_t gqa_group,
     cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_gemm_one_dot_reduce(
+    float *score, float *block_max, float *global_max, float *global_sum,
+    const float *logits, const int32_t *block_offsets,
+    const int32_t *block_counts, uint32_t layer, uint32_t n_layers,
+    uint32_t n_tokens, uint32_t prototype_count, uint32_t block_count,
+    uint32_t global_block_base, uint32_t metadata_block_base,
+    uint32_t prototype_base, uint32_t n_heads,
+    uint32_t query_head_base, uint32_t gqa_group,
+    cudaStream_t stream);
 bool launch_block_attn_stream_adaptive_finalize(
     float *score, const float *block_max, const float *block_sum,
     float *global_max, float *global_sum,
@@ -1204,6 +1213,8 @@ static void run_adaptive_gemm_parity_test() {
     float *d_scalar = nullptr;
     float *d_gemm = nullptr;
     float *d_gemm_two_pass = nullptr;
+    float *d_gemm_one_dot = nullptr;
+    float *d_one_dot_block_max = nullptr;
     float *d_block_max = nullptr;
     float *d_block_sum = nullptr;
     float *d_global_max = nullptr;
@@ -1218,6 +1229,10 @@ static void run_adaptive_gemm_parity_test() {
     CHECK(cudaMalloc(&d_scalar, blocks * sizeof(float)));
     CHECK(cudaMalloc(&d_gemm, blocks * sizeof(float)));
     CHECK(cudaMalloc(&d_gemm_two_pass, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&d_gemm_one_dot, blocks * sizeof(float)));
+    CHECK(cudaMalloc(
+        &d_one_dot_block_max,
+        static_cast<uint64_t>(tokens) * gqa * blocks * sizeof(float)));
     const uint64_t stats_entries =
         static_cast<uint64_t>(tokens) * heads * blocks;
     CHECK(cudaMalloc(&d_block_max, stats_entries * sizeof(float)));
@@ -1229,7 +1244,9 @@ static void run_adaptive_gemm_parity_test() {
                      static_cast<uint64_t>(layers) * tokens * heads *
                          sizeof(float)));
     uint32_t max_tile_prototypes = 0;
+    uint32_t max_layer_prototypes = 0;
     for (uint32_t l = 0; l < layers; ++l) {
+        uint32_t layer_prototypes = 0;
         for (uint32_t first = 0; first < blocks; first += tile_blocks) {
             const uint32_t count = std::min(tile_blocks, blocks - first);
             uint32_t p = 0;
@@ -1237,11 +1254,14 @@ static void run_adaptive_gemm_parity_test() {
                 p += static_cast<uint32_t>(counts[l * blocks + first + b]);
             }
             max_tile_prototypes = std::max(max_tile_prototypes, p);
+            layer_prototypes += p;
         }
+        max_layer_prototypes =
+            std::max(max_layer_prototypes, layer_prototypes);
     }
     CHECK(cudaMalloc(
         &d_logits,
-        static_cast<uint64_t>(gqa) * max_tile_prototypes * tokens *
+        static_cast<uint64_t>(gqa) * max_layer_prototypes * tokens *
             sizeof(float)));
     CHECK(cudaMemcpy(d_prototype_f32, prototype_f32.data(),
                      prototype_elems * sizeof(float),
@@ -1452,20 +1472,78 @@ static void run_adaptive_gemm_parity_test() {
             }
         }
     }
+
+    // Exact fused one-dot path: a complete layer is materialized in logits
+    // once, while the reducer simultaneously derives global LSE and block
+    // MaxSim. Production query tiling only changes how many times this loop is
+    // invoked; it does not change the per-tile math exercised here.
+    CHECK(cudaMemset(d_gemm_one_dot, 0, blocks * sizeof(float)));
+    for (uint32_t l = 0; l < layers; ++l) {
+        install_absolute_meta(l);
+        const uint32_t prototype_begin =
+            static_cast<uint32_t>(offsets[l * blocks]);
+        const uint32_t last = l * blocks + blocks - 1;
+        const uint32_t prototype_end =
+            static_cast<uint32_t>(offsets[last] + counts[last]);
+        const uint32_t prototype_count =
+            prototype_end - prototype_begin;
+        const __half *prototype_layer = d_prototypes +
+            static_cast<uint64_t>(prototype_begin) * kv_heads * dim;
+        const __half *q_layer = d_query +
+            static_cast<uint64_t>(l) * q_stride * heads * dim;
+        const uint64_t logits_per_head =
+            static_cast<uint64_t>(prototype_count) * tokens;
+        for (uint32_t kvh = 0; kvh < kv_heads; ++kvh) {
+            const cublasStatus_t status = cublasGemmStridedBatchedEx(
+                handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                static_cast<int>(prototype_count),
+                static_cast<int>(tokens), static_cast<int>(dim),
+                &alpha, prototype_layer + kvh * dim, CUDA_R_16F,
+                static_cast<int>(kv_heads * dim), 0,
+                q_layer + kvh * gqa * dim, CUDA_R_16F,
+                static_cast<int>(heads * dim),
+                static_cast<long long>(dim), &beta,
+                d_logits, CUDA_R_32F,
+                static_cast<int>(prototype_count),
+                static_cast<long long>(logits_per_head),
+                static_cast<int>(gqa), CUBLAS_COMPUTE_32F_FAST_16F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (status != CUBLAS_STATUS_SUCCESS ||
+                !qw3::ported::
+                    launch_block_attn_stream_adaptive_gemm_one_dot_reduce(
+                        d_gemm_one_dot, d_one_dot_block_max,
+                        d_global_max, d_global_sum, d_logits,
+                        d_offsets, d_counts, l, layers, tokens,
+                        prototype_count, blocks, /*global_block_base=*/0,
+                        /*metadata_block_base=*/0, prototype_begin,
+                        heads, kvh * gqa, gqa, /*stream=*/0)) {
+                std::fprintf(
+                    stderr,
+                    "adaptive GEMM one-dot layer failed status=%d\n",
+                    static_cast<int>(status));
+                std::exit(1);
+            }
+        }
+    }
     CHECK(cudaDeviceSynchronize());
     std::vector<float> scalar(blocks);
     std::vector<float> gemm(blocks);
     std::vector<float> gemm_two_pass(blocks);
+    std::vector<float> gemm_one_dot(blocks);
     CHECK(cudaMemcpy(scalar.data(), d_scalar, blocks * sizeof(float),
                      cudaMemcpyDeviceToHost));
     CHECK(cudaMemcpy(gemm.data(), d_gemm, blocks * sizeof(float),
                      cudaMemcpyDeviceToHost));
     CHECK(cudaMemcpy(gemm_two_pass.data(), d_gemm_two_pass,
                      blocks * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(gemm_one_dot.data(), d_gemm_one_dot,
+                     blocks * sizeof(float), cudaMemcpyDeviceToHost));
     compare("adaptive-tensor-gemm-vs-scalar", gemm, scalar,
             2e-5, 2e-3);
     compare("adaptive-tensor-gemm-two-pass-vs-scalar",
             gemm_two_pass, scalar, 2e-5, 2e-3);
+    compare("adaptive-tensor-gemm-one-dot-vs-scalar",
+            gemm_one_dot, scalar, 2e-5, 2e-3);
 
     // Score parity is necessary but the production-visible contract is the
     // selected block set.  Check a deterministic Top-K as well, so a future
@@ -1504,6 +1582,23 @@ static void run_adaptive_gemm_parity_test() {
         std::fprintf(stderr, "adaptive GEMM two-pass Top-K mismatch\n");
         std::exit(1);
     }
+    const std::vector<uint32_t> one_dot_topk = topk(gemm_one_dot);
+    uint32_t one_dot_intersection = 0;
+    for (uint32_t id : scalar_topk) {
+        if (std::binary_search(
+                one_dot_topk.begin(), one_dot_topk.end(), id)) {
+            ++one_dot_intersection;
+        }
+    }
+    std::fprintf(
+        stderr,
+        "[kvmem-softmax-pages] adaptive-tensor-gemm-one-dot-topk "
+        "intersection=%u/%u\n",
+        one_dot_intersection, selection_k);
+    if (one_dot_intersection != selection_k) {
+        std::fprintf(stderr, "adaptive GEMM one-dot Top-K mismatch\n");
+        std::exit(1);
+    }
 
     cublasDestroy(handle);
     CHECK(cudaFree(d_logits));
@@ -1512,6 +1607,8 @@ static void run_adaptive_gemm_parity_test() {
     CHECK(cudaFree(d_block_sum));
     CHECK(cudaFree(d_block_max));
     CHECK(cudaFree(d_gemm_two_pass));
+    CHECK(cudaFree(d_one_dot_block_max));
+    CHECK(cudaFree(d_gemm_one_dot));
     CHECK(cudaFree(d_gemm));
     CHECK(cudaFree(d_scalar));
     CHECK(cudaFree(d_counts));

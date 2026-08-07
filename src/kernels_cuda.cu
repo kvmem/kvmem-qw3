@@ -626,6 +626,15 @@ bool launch_block_attn_stream_adaptive_gemm_score_reduce(
     uint32_t prototype_base, uint32_t n_heads,
     uint32_t query_head_base, uint32_t gqa_group,
     cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_gemm_one_dot_reduce(
+    float *score, float *block_max, float *global_max, float *global_sum,
+    const float *logits, const int32_t *block_offsets,
+    const int32_t *block_counts, uint32_t layer, uint32_t n_layers,
+    uint32_t n_tokens, uint32_t prototype_count, uint32_t block_count,
+    uint32_t global_block_base, uint32_t metadata_block_base,
+    uint32_t prototype_base, uint32_t n_heads,
+    uint32_t query_head_base, uint32_t gqa_group,
+    cudaStream_t stream);
 bool launch_block_attn_stream_adaptive_finalize(
     float *score, const float *block_max, const float *block_sum,
     float *global_max, float *global_sum,
@@ -7412,6 +7421,137 @@ __global__ void block_attn_stream_adaptive_gemm_score_reduce_kernel(
     }
     if (tid == 0) {
         score[global_block_base + local_block] +=
+            reduce[0] /
+            (static_cast<float>(n_layers) * static_cast<float>(n_heads));
+    }
+}
+
+// Exact one-dot Adaptive reducer. A CTA owns one query-token/GQA-head
+// distribution. Since the caller chooses a query tile whose complete layer
+// prototype range fits beside block_max in the bounded workspace, each logit
+// is consumed exactly once: the CTA writes every block MaxSim value and merges
+// all prototype logits into the distribution's global LSE at the same time.
+__global__ void block_attn_stream_adaptive_gemm_one_dot_stats_kernel(
+        float *block_max, float *global_max, float *global_sum,
+        const float *logits, const int32_t *block_offsets,
+        const int32_t *block_counts, uint32_t layer, uint32_t n_tokens,
+        uint32_t prototype_count, uint32_t block_count,
+        uint32_t metadata_block_base, uint32_t prototype_base,
+        uint32_t n_heads, uint32_t query_head_base,
+        uint32_t gqa_group) {
+    const uint32_t local_dist = blockIdx.x;
+    const uint32_t local_distributions = n_tokens * gqa_group;
+    const uint32_t tid = threadIdx.x;
+    if (local_dist >= local_distributions) return;
+    const uint32_t g = local_dist % gqa_group;
+    const uint32_t t = local_dist / gqa_group;
+    const uint64_t logits_base =
+        (static_cast<uint64_t>(g) * n_tokens + t) * prototype_count;
+
+    float local_max = -INFINITY;
+    float local_sum = 0.0f;
+    for (uint32_t b = tid; b < block_count; b += blockDim.x) {
+        const uint32_t metadata_block = metadata_block_base + b;
+        const int32_t count_i32 = block_counts[metadata_block];
+        const int32_t begin_i32 = block_offsets[metadata_block];
+        const uint32_t count =
+            count_i32 > 0 ? static_cast<uint32_t>(count_i32) : 0u;
+        const uint32_t absolute_begin =
+            begin_i32 >= 0 ? static_cast<uint32_t>(begin_i32)
+                           : prototype_count;
+        const uint32_t begin = absolute_begin >= prototype_base
+            ? absolute_begin - prototype_base
+            : prototype_count;
+        float bmax = -INFINITY;
+        if (count > 0 && begin <= prototype_count &&
+            count <= prototype_count - begin) {
+            for (uint32_t i = 0; i < count; ++i) {
+                const float value = logits[logits_base + begin + i];
+                bmax = fmaxf(bmax, value);
+                const float merged_max = fmaxf(local_max, value);
+                local_sum =
+                    (isfinite(local_max)
+                         ? local_sum * __expf(local_max - merged_max)
+                         : 0.0f) +
+                    __expf(value - merged_max);
+                local_max = merged_max;
+            }
+        }
+        // Block-major layout makes both this write and the later per-block
+        // finalize traversal contiguous across query distributions.
+        block_max[static_cast<uint64_t>(b) * local_distributions +
+                  local_dist] = bmax;
+    }
+
+    __shared__ float reduce_max[kSoftmaxPagesThreads];
+    __shared__ float reduce_sum[kSoftmaxPagesThreads];
+    reduce_max[tid] = local_max;
+    reduce_sum[tid] = local_sum;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1u) {
+        if (tid < s) {
+            const float a_max = reduce_max[tid];
+            const float b_max = reduce_max[tid + s];
+            const float merged_max = fmaxf(a_max, b_max);
+            float merged_sum = 0.0f;
+            if (isfinite(a_max)) {
+                merged_sum +=
+                    reduce_sum[tid] * __expf(a_max - merged_max);
+            }
+            if (isfinite(b_max)) {
+                merged_sum +=
+                    reduce_sum[tid + s] * __expf(b_max - merged_max);
+            }
+            reduce_max[tid] = merged_max;
+            reduce_sum[tid] = merged_sum;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const uint32_t global_dist =
+            layer * n_tokens * n_heads + t * n_heads +
+            query_head_base + g;
+        global_max[global_dist] = reduce_max[0];
+        global_sum[global_dist] = reduce_sum[0];
+    }
+}
+
+__global__ void block_attn_stream_adaptive_gemm_one_dot_finalize_kernel(
+        float *score, const float *block_max,
+        const float *global_max, const float *global_sum,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t block_count, uint32_t global_block_base,
+        uint32_t n_heads, uint32_t query_head_base,
+        uint32_t gqa_group) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (b >= block_count) return;
+    const uint32_t local_distributions = n_tokens * gqa_group;
+    const uint64_t block_base =
+        static_cast<uint64_t>(b) * local_distributions;
+    float local = 0.0f;
+    for (uint32_t item = tid; item < local_distributions;
+         item += blockDim.x) {
+        const uint32_t g = item % gqa_group;
+        const uint32_t t = item / gqa_group;
+        const uint32_t global_dist =
+            layer * n_tokens * n_heads + t * n_heads +
+            query_head_base + g;
+        const float denom = global_sum[global_dist];
+        const float value = block_max[block_base + item];
+        if (denom > 0.0f && isfinite(value)) {
+            local += __expf(value - global_max[global_dist]) / denom;
+        }
+    }
+    __shared__ float reduce[kSoftmaxPagesThreads];
+    reduce[tid] = local;
+    __syncthreads();
+    for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1u) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        score[global_block_base + b] +=
             reduce[0] /
             (static_cast<float>(n_layers) * static_cast<float>(n_heads));
     }
@@ -17339,6 +17479,117 @@ public:
     }
 
     DeviceStatus
+    block_attn_stream_adaptive_gemm_one_dot_head_device(
+            DeviceTensor &score, DeviceTensor &block_max,
+            DeviceTensor &global_max, DeviceTensor &global_sum,
+            DeviceTensor &logits,
+            const DeviceTensor &query_head_major,
+            const DeviceTensor &prototype_natural,
+            const DeviceTensor &block_offsets,
+            const DeviceTensor &block_counts,
+            uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+            uint32_t prototype_count, uint32_t block_count,
+            uint32_t global_block_base, uint32_t metadata_block_base,
+            uint32_t prototype_base, uint32_t n_heads,
+            uint32_t n_kv_heads, uint32_t kv_head,
+            uint32_t head_dim, float scale) override {
+        if (layer >= n_layers || n_tokens == 0 || prototype_count == 0 ||
+            block_count == 0 || n_heads == 0 || n_kv_heads == 0 ||
+            n_heads % n_kv_heads != 0 || kv_head >= n_kv_heads ||
+            head_dim == 0) {
+            return {false, "adaptive one-dot GEMM invalid dimensions"};
+        }
+        auto &sc = as_tensor(score);
+        auto &bm = as_tensor(block_max);
+        auto &gm = as_tensor(global_max);
+        auto &gs = as_tensor(global_sum);
+        auto &lg = as_tensor(logits);
+        const auto &qm = as_tensor(query_head_major);
+        const auto &pt = as_tensor(prototype_natural);
+        const auto &bo = as_tensor(block_offsets);
+        const auto &bc = as_tensor(block_counts);
+        const uint32_t gqa_group = n_heads / n_kv_heads;
+        const uint64_t local_distributions =
+            static_cast<uint64_t>(n_tokens) * gqa_group;
+        const uint64_t all_distributions =
+            static_cast<uint64_t>(n_layers) * n_tokens * n_heads;
+        const uint64_t required_logits =
+            local_distributions * prototype_count;
+        const uint64_t required_query =
+            static_cast<uint64_t>(n_heads) * n_tokens * head_dim;
+        const uint64_t required_prototypes =
+            (static_cast<uint64_t>(prototype_base) + prototype_count) *
+            n_kv_heads * head_dim;
+        if (!qm.is_fp16() || !pt.is_fp16() ||
+            sc.elem_size != sizeof(float) ||
+            bm.elem_size != sizeof(float) ||
+            gm.elem_size != sizeof(float) ||
+            gs.elem_size != sizeof(float) ||
+            lg.elem_size != sizeof(float) ||
+            sc.count < static_cast<uint64_t>(global_block_base) + block_count ||
+            bm.count < local_distributions * block_count ||
+            gm.count < all_distributions || gs.count < all_distributions ||
+            lg.count < required_logits || qm.count < required_query ||
+            pt.count < required_prototypes ||
+            bo.elem_size != sizeof(int32_t) ||
+            bc.elem_size != sizeof(int32_t) ||
+            metadata_block_base > bo.count ||
+            block_count > bo.count - metadata_block_base ||
+            metadata_block_base > bc.count ||
+            block_count > bc.count - metadata_block_base ||
+            prototype_count >
+                static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+            n_tokens >
+                static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+            head_dim >
+                static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+            !cublas_handle_) {
+            return {false, "adaptive one-dot GEMM invalid tensor shape"};
+        }
+
+        const float alpha = scale;
+        const float beta = 0.0f;
+        const auto *prototype =
+            reinterpret_cast<const __half *>(pt.ptr) +
+            (static_cast<uint64_t>(prototype_base) * n_kv_heads +
+             kv_head) * head_dim;
+        const auto *query =
+            reinterpret_cast<const __half *>(qm.ptr) +
+            static_cast<uint64_t>(kv_head) * gqa_group * n_tokens *
+                head_dim;
+        const uint64_t logits_per_head =
+            static_cast<uint64_t>(prototype_count) * n_tokens;
+        if (auto st = cublas_status(
+                cublasGemmStridedBatchedEx(
+                    cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+                    static_cast<int>(prototype_count),
+                    static_cast<int>(n_tokens),
+                    static_cast<int>(head_dim), &alpha,
+                    prototype, CUDA_R_16F,
+                    static_cast<int>(n_kv_heads * head_dim), 0,
+                    query, CUDA_R_16F, static_cast<int>(head_dim),
+                    static_cast<long long>(n_tokens) * head_dim,
+                    &beta, lg.ptr, CUDA_R_32F,
+                    static_cast<int>(prototype_count),
+                    static_cast<long long>(logits_per_head),
+                    static_cast<int>(gqa_group),
+                    CUBLAS_COMPUTE_32F_FAST_16F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "cublas adaptive one-dot GEMM"); !st.ok) {
+            return st;
+        }
+        if (!ported::launch_block_attn_stream_adaptive_gemm_one_dot_reduce(
+                sc.ptr, bm.ptr, gm.ptr, gs.ptr, lg.ptr,
+                bo.ptr_i32(), bc.ptr_i32(), layer, n_layers, n_tokens,
+                prototype_count, block_count, global_block_base,
+                metadata_block_base, prototype_base, n_heads,
+                kv_head * gqa_group, gqa_group, exec_stream_)) {
+            return {false, "adaptive one-dot GEMM reduce launch failed"};
+        }
+        return launch_status("cuda adaptive one-dot GEMM");
+    }
+
+    DeviceStatus
     block_attn_stream_adaptive_gemm_score_head_major_device(
             DeviceTensor &score, DeviceTensor &logits,
             const DeviceTensor &query_head_major,
@@ -22963,6 +23214,44 @@ bool launch_block_attn_stream_adaptive_gemm_score_reduce(
         global_max, global_sum, layer, n_layers, n_tokens,
         prototype_count, tile_blocks, global_block_base,
         metadata_block_base, prototype_base, n_heads,
+        query_head_base, gqa_group);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_block_attn_stream_adaptive_gemm_one_dot_reduce(
+        float *score, float *block_max, float *global_max,
+        float *global_sum, const float *logits,
+        const int32_t *block_offsets, const int32_t *block_counts,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t prototype_count, uint32_t block_count,
+        uint32_t global_block_base, uint32_t metadata_block_base,
+        uint32_t prototype_base, uint32_t n_heads,
+        uint32_t query_head_base, uint32_t gqa_group,
+        cudaStream_t stream) {
+    if (layer >= n_layers || n_tokens == 0 || prototype_count == 0 ||
+        block_count == 0 || n_heads == 0 || gqa_group == 0 ||
+        query_head_base + gqa_group > n_heads) {
+        return false;
+    }
+    const uint64_t distributions64 =
+        static_cast<uint64_t>(n_tokens) * gqa_group;
+    if (distributions64 == 0 || distributions64 > 0x7fffffffu) {
+        return false;
+    }
+    const uint32_t distributions =
+        static_cast<uint32_t>(distributions64);
+    block_attn_stream_adaptive_gemm_one_dot_stats_kernel<<<
+        distributions, kSoftmaxPagesThreads, 0, stream>>>(
+        block_max, global_max, global_sum, logits,
+        block_offsets, block_counts, layer, n_tokens,
+        prototype_count, block_count, metadata_block_base,
+        prototype_base, n_heads, query_head_base, gqa_group);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return false;
+    block_attn_stream_adaptive_gemm_one_dot_finalize_kernel<<<
+        block_count, kSoftmaxPagesThreads, 0, stream>>>(
+        score, block_max, global_max, global_sum, layer, n_layers,
+        n_tokens, block_count, global_block_base, n_heads,
         query_head_base, gqa_group);
     return cudaGetLastError() == cudaSuccess;
 }
