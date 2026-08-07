@@ -926,12 +926,16 @@ KvMemSemanticChunkStats kvmem_prefill_semantic_chunks(
         }
         executor->kvmem_set_prefill_reselect_suppressed(false);
         executor->kvmem_set_provisional_prefill(false);
-        stats.provisional_s += wall_seconds() - provisional_start;
-        stats.provisional_tokens += width;
-        if (!executor->kvmem_stash_query()) {
+        if (!executor->kvmem_stash_query(/*host_in_place=*/true)) {
             throw std::runtime_error(
                 "semantic-chunk provisional pass did not capture its query");
         }
+        // Stashing also drains the asynchronous query D2H capture. Include it
+        // in the provisional phase so semantic-chunk accounting covers the
+        // complete exposed critical path rather than leaving an unreported
+        // gap between provisional forward and rollback.
+        stats.provisional_s += wall_seconds() - provisional_start;
+        stats.provisional_tokens += width;
 
         const double rollback_start = wall_seconds();
         executor->restore_state(boundary);

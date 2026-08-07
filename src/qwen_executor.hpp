@@ -427,7 +427,10 @@ public:
     // names avoid tying replay to the isolated clean-query feature. reset keeps
     // the historical content index live while allowing the final replay to
     // replace the provisional Q used for selection.
-    bool kvmem_stash_query();
+    // `host_in_place` is valid only when the caller restores before another
+    // query capture. It avoids two redundant full-query host memcpy operations
+    // in semantic-chunk provisional rollback.
+    bool kvmem_stash_query(bool host_in_place = false);
     void kvmem_restore_stashed_query();
     void kvmem_reset_query_capture();
     bool kvmem_query_selection_ready() const;
@@ -1577,11 +1580,22 @@ private:
         uint64_t dst_elem_offset = 0;
         uint64_t elem_count = 0;
         bool pending = false;
+        bool direct_to_query_host = false;
     };
     void kvmem_drain_query_capture_slot(uint32_t slot);
     void kvmem_drain_query_capture();
     bool kvmem_score_host_query_chunks(
         uint32_t n_blocks, uint32_t kbar_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        std::string *failure_reason);
+    // Exact long-query Adaptive scorer for a GPU-resident index.  It stages
+    // one query layer at a time and scans each prototype layer twice: once for
+    // the global softmax LSE and once for per-block MaxSim mass.  This avoids
+    // rescanning/repacking the complete index for every bounded query chunk
+    // without materializing O(query_tokens * heads * blocks) statistics.
+    bool kvmem_score_gpu_adaptive_host_query_two_pass(
+        uint32_t n_blocks, uint32_t score_tokens,
+        uint32_t captured_tokens, uint32_t source_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         std::string *failure_reason);
     uint32_t kvmem_query_begin_ = 0;
@@ -1596,7 +1610,10 @@ private:
     std::unique_ptr<DeviceTensor> g_query_multi_;              // [L,S,H,D], FP16 mean-K or legacy FP32
     bool kvmem_query_host_capture_ = false;
     std::unique_ptr<uint16_t[]> g_query_multi_host_;           // pageable [L,S,H,D] fp16 bits
+    std::unique_ptr<HostBuffer> g_query_multi_pinned_host_;     // bounded pinned alternative
     uint64_t g_query_multi_host_capacity_ = 0;                 // elements, not rows
+    uint16_t *kvmem_query_multi_host_data();
+    const uint16_t *kvmem_query_multi_host_data() const;
     std::array<QueryCaptureSlot, 2> g_query_capture_slots_;
     uint32_t g_query_capture_next_slot_ = 0;
     std::unique_ptr<HostBuffer> g_query_score_pinned_;         // packed [L,C,H,D]
@@ -1607,6 +1624,7 @@ private:
     std::unique_ptr<uint16_t[]> g_query_multi_clean_host_;     // host-backed FP16 stash
     uint64_t g_query_multi_clean_host_capacity_ = 0;           // elements
     uint64_t g_query_multi_clean_host_elems_ = 0;              // active elements
+    bool g_query_multi_clean_host_in_place_ = false;
     uint32_t g_query_multi_clean_count_ = 0;                   // rows stashed (== S when ready)
     // Force pick_topk to always keep blocks with id >= this (question + live tail);
     // 0xffffffff => no pin. pick_topk result is unioned with [pin,block_count) in

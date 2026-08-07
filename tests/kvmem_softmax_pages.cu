@@ -100,6 +100,21 @@ bool launch_block_attn_stream_adaptive_gemm_reduce(
     uint32_t n_heads, uint32_t query_head_base, uint32_t gqa_group,
     uint32_t metadata_block_base, uint32_t prototype_base,
     cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_gemm_lse_reduce(
+    float *global_max, float *global_sum, const float *logits,
+    uint32_t layer, uint32_t n_tokens, uint32_t prototype_count,
+    uint32_t n_heads, uint32_t query_head_base, uint32_t gqa_group,
+    uint32_t initialize, cudaStream_t stream);
+bool launch_block_attn_stream_adaptive_gemm_score_reduce(
+    float *score, const float *logits,
+    const int32_t *block_offsets, const int32_t *block_counts,
+    const float *global_max, const float *global_sum,
+    uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+    uint32_t prototype_count, uint32_t tile_blocks,
+    uint32_t global_block_base, uint32_t metadata_block_base,
+    uint32_t prototype_base, uint32_t n_heads,
+    uint32_t query_head_base, uint32_t gqa_group,
+    cudaStream_t stream);
 bool launch_block_attn_stream_adaptive_finalize(
     float *score, const float *block_max, const float *block_sum,
     float *global_max, float *global_sum,
@@ -1188,6 +1203,7 @@ static void run_adaptive_gemm_parity_test() {
     int32_t *d_counts = nullptr;
     float *d_scalar = nullptr;
     float *d_gemm = nullptr;
+    float *d_gemm_two_pass = nullptr;
     float *d_block_max = nullptr;
     float *d_block_sum = nullptr;
     float *d_global_max = nullptr;
@@ -1201,6 +1217,7 @@ static void run_adaptive_gemm_parity_test() {
     CHECK(cudaMalloc(&d_counts, blocks * sizeof(int32_t)));
     CHECK(cudaMalloc(&d_scalar, blocks * sizeof(float)));
     CHECK(cudaMalloc(&d_gemm, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&d_gemm_two_pass, blocks * sizeof(float)));
     const uint64_t stats_entries =
         static_cast<uint64_t>(tokens) * heads * blocks;
     CHECK(cudaMalloc(&d_block_max, stats_entries * sizeof(float)));
@@ -1362,15 +1379,131 @@ static void run_adaptive_gemm_parity_test() {
             std::exit(1);
         }
     }
+
+    // Exercise the bounded exact two-pass reducers used by long GPU-resident
+    // queries.  The GEMM layout is identical to the one-pass test above; only
+    // the reduction workspace changes from O(Q*H*blocks) block statistics to
+    // O(Q*H) global LSE state.
+    CHECK(cudaMemset(d_gemm_two_pass, 0, blocks * sizeof(float)));
+    for (uint32_t l = 0; l < layers; ++l) {
+        install_absolute_meta(l);
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+            bool first_tile = true;
+            for (uint32_t first = 0; first < blocks;
+                 first += tile_blocks) {
+                const uint32_t count =
+                    std::min(tile_blocks, blocks - first);
+                uint32_t prototype_begin = 0;
+                uint32_t prototype_count = 0;
+                tile_shape(l, first, count,
+                           prototype_begin, prototype_count);
+                const __half *tile = d_prototypes +
+                    static_cast<uint64_t>(prototype_begin) *
+                        kv_heads * dim;
+                const __half *q_layer = d_query +
+                    static_cast<uint64_t>(l) * q_stride * heads * dim;
+                const uint64_t logits_per_head =
+                    static_cast<uint64_t>(prototype_count) * tokens;
+                for (uint32_t kvh = 0; kvh < kv_heads; ++kvh) {
+                    const cublasStatus_t status =
+                        cublasGemmStridedBatchedEx(
+                            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                            static_cast<int>(prototype_count),
+                            static_cast<int>(tokens),
+                            static_cast<int>(dim), &alpha,
+                            tile + kvh * dim, CUDA_R_16F,
+                            static_cast<int>(kv_heads * dim), 0,
+                            q_layer + kvh * gqa * dim, CUDA_R_16F,
+                            static_cast<int>(heads * dim),
+                            static_cast<long long>(dim),
+                            &beta, d_logits, CUDA_R_32F,
+                            static_cast<int>(prototype_count),
+                            static_cast<long long>(logits_per_head),
+                            static_cast<int>(gqa),
+                            CUBLAS_COMPUTE_32F_FAST_16F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    bool reduced = false;
+                    if (status == CUBLAS_STATUS_SUCCESS && pass == 0) {
+                        reduced = qw3::ported::
+                            launch_block_attn_stream_adaptive_gemm_lse_reduce(
+                                d_global_max, d_global_sum, d_logits,
+                                l, tokens, prototype_count, heads,
+                                kvh * gqa, gqa,
+                                first_tile ? 1u : 0u, /*stream=*/0);
+                    } else if (status == CUBLAS_STATUS_SUCCESS) {
+                        reduced = qw3::ported::
+                            launch_block_attn_stream_adaptive_gemm_score_reduce(
+                                d_gemm_two_pass, d_logits,
+                                d_offsets, d_counts,
+                                d_global_max, d_global_sum,
+                                l, layers, tokens, prototype_count,
+                                count, first, first, prototype_begin,
+                                heads, kvh * gqa, gqa, /*stream=*/0);
+                    }
+                    if (!reduced) {
+                        std::fprintf(
+                            stderr,
+                            "adaptive GEMM two-pass tile failed status=%d\n",
+                            static_cast<int>(status));
+                        std::exit(1);
+                    }
+                }
+                first_tile = false;
+            }
+        }
+    }
     CHECK(cudaDeviceSynchronize());
     std::vector<float> scalar(blocks);
     std::vector<float> gemm(blocks);
+    std::vector<float> gemm_two_pass(blocks);
     CHECK(cudaMemcpy(scalar.data(), d_scalar, blocks * sizeof(float),
                      cudaMemcpyDeviceToHost));
     CHECK(cudaMemcpy(gemm.data(), d_gemm, blocks * sizeof(float),
                      cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(gemm_two_pass.data(), d_gemm_two_pass,
+                     blocks * sizeof(float), cudaMemcpyDeviceToHost));
     compare("adaptive-tensor-gemm-vs-scalar", gemm, scalar,
             2e-5, 2e-3);
+    compare("adaptive-tensor-gemm-two-pass-vs-scalar",
+            gemm_two_pass, scalar, 2e-5, 2e-3);
+
+    // Score parity is necessary but the production-visible contract is the
+    // selected block set.  Check a deterministic Top-K as well, so a future
+    // reducer change cannot hide a ranking regression behind a small absolute
+    // score tolerance.
+    constexpr uint32_t selection_k = 8;
+    auto topk = [&](const std::vector<float> &values) {
+        std::vector<uint32_t> ids(values.size());
+        for (uint32_t i = 0; i < ids.size(); ++i) ids[i] = i;
+        std::partial_sort(
+            ids.begin(), ids.begin() + selection_k, ids.end(),
+            [&](uint32_t lhs, uint32_t rhs) {
+                if (values[lhs] != values[rhs]) {
+                    return values[lhs] > values[rhs];
+                }
+                return lhs < rhs;
+            });
+        ids.resize(selection_k);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    const std::vector<uint32_t> scalar_topk = topk(scalar);
+    const std::vector<uint32_t> two_pass_topk = topk(gemm_two_pass);
+    uint32_t intersection = 0;
+    for (uint32_t id : scalar_topk) {
+        if (std::binary_search(two_pass_topk.begin(), two_pass_topk.end(), id)) {
+            ++intersection;
+        }
+    }
+    std::fprintf(
+        stderr,
+        "[kvmem-softmax-pages] adaptive-tensor-gemm-two-pass-topk "
+        "intersection=%u/%u\n",
+        intersection, selection_k);
+    if (intersection != selection_k) {
+        std::fprintf(stderr, "adaptive GEMM two-pass Top-K mismatch\n");
+        std::exit(1);
+    }
 
     cublasDestroy(handle);
     CHECK(cudaFree(d_logits));
@@ -1378,6 +1511,7 @@ static void run_adaptive_gemm_parity_test() {
     CHECK(cudaFree(d_global_max));
     CHECK(cudaFree(d_block_sum));
     CHECK(cudaFree(d_block_max));
+    CHECK(cudaFree(d_gemm_two_pass));
     CHECK(cudaFree(d_gemm));
     CHECK(cudaFree(d_scalar));
     CHECK(cudaFree(d_counts));

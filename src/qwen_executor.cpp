@@ -14715,15 +14715,47 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     kvmem_query_host_capture_ = fp16_mean_query && S > score_tokens;
     if (kvmem_query_host_capture_) {
         const uint64_t elems = rows * query_row_elems;
-        // Pageable storage avoids consuming the process' finite pinned-memory
-        // budget for an arbitrarily long user query. Two small pinned bounce
-        // buffers below provide asynchronous D2H/H2D.
-        const bool shrink_host =
-            g_query_multi_host_ && elems > 0 &&
+        const uint64_t bytes = elems * sizeof(uint16_t);
+        const uint64_t pinned_cap =
+            static_cast<uint64_t>(env_uint32_or(
+                "QW3_KVMEM_QUERY_PINNED_MIB", 512)) *
+            1024ull * 1024ull;
+        bool use_pinned_host = bytes <= pinned_cap;
+        const bool shrink_host = elems > 0 &&
             g_query_multi_host_capacity_ / 4 > elems;
-        if (!g_query_multi_host_ ||
-            g_query_multi_host_capacity_ < elems || shrink_host) {
-            g_query_multi_host_.reset(new uint16_t[elems]);
+        if (use_pinned_host) {
+            if (!g_query_multi_pinned_host_ ||
+                g_query_multi_pinned_host_->bytes < bytes || shrink_host) {
+                try {
+                    g_query_multi_pinned_host_ = backend_.host_buffer(
+                        bytes, "g_query_capture_pinned");
+                    use_pinned_host =
+                        g_query_multi_pinned_host_ &&
+                        g_query_multi_pinned_host_->pinned;
+                } catch (const std::exception &e) {
+                    use_pinned_host = false;
+                    if (std::getenv("QW3_KVMEM_TRACE")) {
+                        std::fprintf(
+                            stderr,
+                            "[bs-qcap-host] pinned allocation unavailable; "
+                            "falling back to pageable capture: %s\n",
+                            e.what());
+                    }
+                }
+            }
+        }
+        use_pinned_host =
+            use_pinned_host && g_query_multi_pinned_host_ &&
+            g_query_multi_pinned_host_->pinned;
+        if (use_pinned_host) {
+            g_query_multi_host_.reset();
+            g_query_multi_host_capacity_ = elems;
+        } else {
+            if (!g_query_multi_host_ ||
+                g_query_multi_host_capacity_ < elems || shrink_host) {
+                g_query_multi_host_.reset(new uint16_t[elems]);
+            }
+            g_query_multi_pinned_host_.reset();
             g_query_multi_host_capacity_ = elems;
         }
         const uint64_t score_rows =
@@ -14742,10 +14774,12 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
             std::fprintf(
                 stderr,
                 "[bs-qcap-host] enabled=1 layers=%u tokens=%u "
-                "host_mib=%.2f score_chunk=%u gpu_stage_mib=%.2f\n",
+                "host_mib=%.2f host_kind=%s score_chunk=%u "
+                "gpu_stage_mib=%.2f\n",
                 L, S,
                 static_cast<double>(elems * sizeof(uint16_t)) /
                     (1024.0 * 1024.0),
+                use_pinned_host ? "pinned-direct" : "pageable-bounce",
                 score_tokens,
                 static_cast<double>(
                     score_rows * query_row_elems * sizeof(uint16_t)) /
@@ -15491,22 +15525,38 @@ void QwenExecutor::kvmem_drain_query_capture_slot(uint32_t slot_index) {
     QueryCaptureSlot &slot = g_query_capture_slots_[slot_index];
     if (!slot.pending) return;
     require_status(backend_.wait_kv_transfer_fence(slot.copy_done));
-    if (!g_query_multi_host_ ||
+    uint16_t *query_host = kvmem_query_multi_host_data();
+    if (!query_host ||
         slot.dst_elem_offset > g_query_multi_host_capacity_ ||
         slot.elem_count >
             g_query_multi_host_capacity_ - slot.dst_elem_offset ||
-        !slot.pinned ||
-        slot.elem_count * sizeof(uint16_t) > slot.pinned->bytes) {
+        (!slot.direct_to_query_host &&
+         (!slot.pinned ||
+          slot.elem_count * sizeof(uint16_t) > slot.pinned->bytes))) {
         throw std::runtime_error(
             "KVMem host query capture completed outside its destination");
     }
-    std::memcpy(
-        g_query_multi_host_.get() + slot.dst_elem_offset,
-        slot.pinned->data,
-        static_cast<size_t>(slot.elem_count) * sizeof(uint16_t));
+    if (!slot.direct_to_query_host) {
+        std::memcpy(
+            query_host + slot.dst_elem_offset, slot.pinned->data,
+            static_cast<size_t>(slot.elem_count) * sizeof(uint16_t));
+    }
     slot.pending = false;
+    slot.direct_to_query_host = false;
     slot.dst_elem_offset = 0;
     slot.elem_count = 0;
+}
+
+uint16_t *QwenExecutor::kvmem_query_multi_host_data() {
+    return g_query_multi_pinned_host_
+        ? static_cast<uint16_t *>(g_query_multi_pinned_host_->data)
+        : g_query_multi_host_.get();
+}
+
+const uint16_t *QwenExecutor::kvmem_query_multi_host_data() const {
+    return g_query_multi_pinned_host_
+        ? static_cast<const uint16_t *>(g_query_multi_pinned_host_->data)
+        : g_query_multi_host_.get();
 }
 
 void QwenExecutor::kvmem_drain_query_capture() {
@@ -15568,7 +15618,13 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
             stage.capacity_elems = elems;
         }
         const uint64_t bytes = elems * sizeof(uint16_t);
-        if (!stage.pinned || stage.pinned->bytes < bytes) {
+        const uint64_t dst_elem_offset =
+            (static_cast<uint64_t>(slot) * S +
+             g_query_multi_count_) * row_elems;
+        const bool direct_host =
+            static_cast<bool>(g_query_multi_pinned_host_);
+        if (!direct_host &&
+            (!stage.pinned || stage.pinned->bytes < bytes)) {
             stage.pinned =
                 backend_.host_buffer(bytes, "g_query_capture_bounce");
         }
@@ -15579,14 +15635,18 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
         if (!st.ok) return;
         require_status(backend_.begin_kv_transfer_from_device());
         require_status(backend_.copy_bytes_to_host_async(
-            *stage.device, stage.pinned->data, /*byte_offset=*/0, bytes));
+            *stage.device,
+            direct_host
+                ? static_cast<void *>(
+                      kvmem_query_multi_host_data() + dst_elem_offset)
+                : stage.pinned->data,
+            /*byte_offset=*/0, bytes));
         require_status(
             backend_.record_kv_transfer_fence(stage.copy_done));
-        stage.dst_elem_offset =
-            (static_cast<uint64_t>(slot) * S +
-             g_query_multi_count_) * row_elems;
+        stage.dst_elem_offset = dst_elem_offset;
         stage.elem_count = elems;
         stage.pending = true;
+        stage.direct_to_query_host = direct_host;
     } else {
         // Legacy full-GPU layout: write this chunk into layer `slot`'s slice.
         const uint64_t out_elem_off =
@@ -15619,7 +15679,7 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
 // Clean-query prefill (task #50). After a PASS-A prefill of the question tokens in
 // isolation, g_query_multi_ holds the recency-free de-RoPE'd query. Copy it into a
 // persistent buffer that the reset_state between the two passes will not clear.
-bool QwenExecutor::kvmem_stash_query() {
+bool QwenExecutor::kvmem_stash_query(bool host_in_place) {
     if (!g_query_multi_ || !g_query_multi_ready_ || g_query_multi_count_ == 0) {
         return false;
     }
@@ -15630,33 +15690,39 @@ bool QwenExecutor::kvmem_stash_query() {
             static_cast<uint64_t>(
                 std::max<uint32_t>(kvmem_qc_num_layers_, 1u)) *
             kvmem_query_span_ * cfg.n_heads * cfg.head_dim;
-        if (!g_query_multi_host_ ||
+        const uint16_t *query_host = kvmem_query_multi_host_data();
+        if (!query_host ||
             g_query_multi_host_capacity_ < elems) {
             throw std::runtime_error(
                 "KVMem host query capture is incomplete at stash");
         }
-        if (!g_query_multi_clean_host_ ||
-            g_query_multi_clean_host_capacity_ < elems) {
-            g_query_multi_clean_host_.reset(new uint16_t[elems]);
-            g_query_multi_clean_host_capacity_ = elems;
+        g_query_multi_clean_host_in_place_ = host_in_place;
+        if (!host_in_place) {
+            if (!g_query_multi_clean_host_ ||
+                g_query_multi_clean_host_capacity_ < elems) {
+                g_query_multi_clean_host_.reset(new uint16_t[elems]);
+                g_query_multi_clean_host_capacity_ = elems;
+            }
+            std::memcpy(g_query_multi_clean_host_.get(),
+                        query_host,
+                        static_cast<size_t>(elems * sizeof(uint16_t)));
         }
-        std::memcpy(g_query_multi_clean_host_.get(),
-                    g_query_multi_host_.get(),
-                    static_cast<size_t>(elems * sizeof(uint16_t)));
         g_query_multi_clean_host_elems_ = elems;
         g_query_multi_clean_.reset();
         g_query_multi_clean_count_ = g_query_multi_count_;
         if (std::getenv("QW3_KVMEM_TRACE")) {
             std::fprintf(
                 stderr,
-                "[bs-query-stash] stash location=host dtype=fp16 "
+                "[bs-query-stash] stash location=host dtype=fp16 mode=%s "
                 "rows=%u elems=%llu\n",
+                host_in_place ? "in-place" : "copy",
                 g_query_multi_clean_count_,
                 static_cast<unsigned long long>(elems));
         }
         return true;
     }
     const uint64_t n = g_query_multi_->count;
+    g_query_multi_clean_host_in_place_ = false;
     if (!g_query_multi_clean_ || g_query_multi_clean_->count < n ||
         g_query_multi_clean_->dtype != g_query_multi_->dtype) {
         g_query_multi_clean_ = g_query_multi_->elem_size == sizeof(uint16_t)
@@ -15690,22 +15756,30 @@ void QwenExecutor::kvmem_restore_stashed_query() {
             static_cast<uint64_t>(
                 std::max<uint32_t>(kvmem_qc_num_layers_, 1u)) *
             kvmem_query_span_ * cfg.n_heads * cfg.head_dim;
-        if (!g_query_multi_clean_host_ ||
-            g_query_multi_clean_host_elems_ < elems ||
-            !g_query_multi_host_ ||
+        uint16_t *query_host = kvmem_query_multi_host_data();
+        if (g_query_multi_clean_host_elems_ < elems ||
+            !query_host ||
             g_query_multi_host_capacity_ < elems) {
             throw std::runtime_error(
                 "KVMem host query stash does not match the restored span");
         }
-        std::memcpy(g_query_multi_host_.get(),
-                    g_query_multi_clean_host_.get(),
-                    static_cast<size_t>(elems * sizeof(uint16_t)));
+        if (!g_query_multi_clean_host_in_place_) {
+            if (!g_query_multi_clean_host_) {
+                throw std::runtime_error(
+                    "KVMem copied host query stash is unavailable");
+            }
+            std::memcpy(query_host,
+                        g_query_multi_clean_host_.get(),
+                        static_cast<size_t>(elems * sizeof(uint16_t)));
+        }
         g_query_multi_count_ = g_query_multi_clean_count_;
         g_query_multi_ready_ = true;
         if (std::getenv("QW3_KVMEM_TRACE")) {
             std::fprintf(stderr,
                          "[bs-query-stash] restore location=host "
-                         "dtype=fp16 rows=%u\n",
+                         "dtype=fp16 mode=%s rows=%u\n",
+                         g_query_multi_clean_host_in_place_
+                             ? "in-place" : "copy",
                          g_query_multi_count_);
         }
         return;
@@ -19060,11 +19134,410 @@ bool QwenExecutor::kvmem_score_adaptive_index(
     return true;
 }
 
+bool QwenExecutor::kvmem_score_gpu_adaptive_host_query_two_pass(
+        uint32_t n_blocks, uint32_t score_tokens,
+        uint32_t captured_tokens, uint32_t source_stride, float scale,
+        uint32_t excl_lo_end, uint32_t excl_hi_begin,
+        std::string *failure_reason) {
+    if (kvmem_adaptive_prototypes() && g_adaptive_index_dirty_) {
+        kvmem_finalize_adaptive_index();
+    }
+    if (!kvmem_adaptive_prototypes() || kvmem_mean_index_cpu() ||
+        !block_store_ || !kvmem_query_multi_host_data() || !g_score_dev_ ||
+        env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_PACKED", false) ||
+        !env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TWO_PASS", true) ||
+        !env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TENSOR_GEMM", true)) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_two_pass_unavailable");
+    }
+    const QwenConfig &cfg = model_.config();
+    const uint32_t layers = kvmem_qc_num_layers_;
+    const uint32_t included_begin = std::min(excl_lo_end, n_blocks);
+    const uint32_t included_end = std::min(excl_hi_begin, n_blocks);
+    const uint32_t block_count = included_end - included_begin;
+    const uint32_t gqa_group =
+        cfg.n_kv_heads > 0 ? cfg.n_heads / cfg.n_kv_heads : 0;
+    if (layers == 0 || score_tokens == 0 || captured_tokens == 0 ||
+        captured_tokens > source_stride || block_count == 0 ||
+        cfg.n_kv_heads == 0 || cfg.n_heads % cfg.n_kv_heads != 0 ||
+        gqa_group < 1u || gqa_group > 6u ||
+        g_adaptive_gpu_layer_arenas_.size() != layers ||
+        g_adaptive_index_elem_size_ != sizeof(uint16_t) ||
+        g_adaptive_block_offsets_host_.size() <
+            static_cast<uint64_t>(layers) *
+                g_adaptive_index_stride_blocks_ ||
+        g_adaptive_block_counts_host_.size() <
+            static_cast<uint64_t>(layers) *
+                g_adaptive_index_stride_blocks_) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_two_pass_shape_invalid");
+    }
+
+    const uint64_t row_elems =
+        static_cast<uint64_t>(cfg.n_kv_heads) * cfg.head_dim;
+    const uint64_t row_bytes = row_elems * sizeof(uint16_t);
+    const uint64_t query_row_elems =
+        static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
+    const uint64_t query_layer_elems =
+        static_cast<uint64_t>(score_tokens) * query_row_elems;
+    const uint64_t query_layer_bytes =
+        query_layer_elems * sizeof(uint16_t);
+    if (row_bytes == 0 || query_layer_elems == 0) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_two_pass_zero_shape");
+    }
+
+    uint64_t max_block_prototypes = 1;
+    for (uint32_t l = 0; l < layers; ++l) {
+        const uint64_t meta_base =
+            static_cast<uint64_t>(l) * g_adaptive_index_stride_blocks_;
+        const auto &arena = g_adaptive_gpu_layer_arenas_[l];
+        if (!arena.values || !arena.block_offsets || !arena.block_counts ||
+            arena.values->dtype != DeviceTensorDType::F16) {
+            return scorer_unavailable(
+                failure_reason, "gpu_adaptive_two_pass_arena_unavailable");
+        }
+        for (uint32_t b = included_begin; b < included_end; ++b) {
+            const int32_t count =
+                g_adaptive_block_counts_host_[meta_base + b];
+            if (count < 0) {
+                return scorer_unavailable(
+                    failure_reason,
+                    "gpu_adaptive_two_pass_negative_block_count");
+            }
+            max_block_prototypes = std::max<uint64_t>(
+                max_block_prototypes, static_cast<uint32_t>(count));
+        }
+    }
+
+    // Bound the logits slab by the same knob that bounded the previous exact
+    // block-stat workspace.  Smaller prototype tiles increase launch count but
+    // do not change dots or scores.  The persistent-index staging limit is an
+    // independent upper bound, so this path never consumes more scorer memory
+    // merely to avoid query chunking.
+    const uint64_t workspace_cap =
+        static_cast<uint64_t>(env_uint32_or(
+            "QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB", 512)) *
+        1024ull * 1024ull;
+    const uint64_t logits_bytes_per_prototype =
+        static_cast<uint64_t>(score_tokens) * gqa_group * sizeof(float);
+    if (workspace_cap < logits_bytes_per_prototype ||
+        logits_bytes_per_prototype == 0) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_two_pass_logits_cap_too_small");
+    }
+    const uint64_t staging_rows = std::max<uint64_t>(
+        1, block_store_->config().index_staging_bytes / row_bytes);
+    uint64_t capacity_rows = std::min<uint64_t>(
+        staging_rows, workspace_cap / logits_bytes_per_prototype);
+    capacity_rows = std::max(capacity_rows, max_block_prototypes);
+    if (capacity_rows > UINT32_MAX ||
+        capacity_rows > UINT64_MAX / row_elems) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_two_pass_capacity_overflow");
+    }
+    const uint64_t logits_entries =
+        static_cast<uint64_t>(score_tokens) * capacity_rows * gqa_group;
+    const uint64_t distributions64 =
+        static_cast<uint64_t>(layers) * score_tokens * cfg.n_heads;
+    if (logits_entries == 0 || distributions64 == 0 ||
+        distributions64 > UINT32_MAX) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_two_pass_distribution_overflow");
+    }
+    const char *layout_env =
+        std::getenv("QW3_KVMEM_ADAPTIVE_TWO_PASS_LAYOUT");
+    const bool natural_layout =
+        layout_env && std::strcmp(layout_env, "natural") == 0;
+    if (layout_env && !natural_layout &&
+        std::strcmp(layout_env, "head-major") != 0) {
+        return scorer_unavailable(
+            failure_reason, "gpu_adaptive_two_pass_layout_invalid");
+    }
+    const bool sampled_query = score_tokens < captured_tokens;
+    const bool direct_pinned_query =
+        !sampled_query && static_cast<bool>(g_query_multi_pinned_host_);
+
+    if (!g_query_multi_ ||
+        g_query_multi_->dtype != DeviceTensorDType::F16 ||
+        g_query_multi_->count < query_layer_elems) {
+        g_query_multi_ = backend_.tensor_f16(
+            query_layer_elems, "g_adaptive_two_pass_query_layer");
+        g_query_multi_capacity_ = score_tokens;
+    }
+    if (!natural_layout &&
+        (!g_adaptive_query_head_major_ ||
+         g_adaptive_query_head_major_capacity_ < query_layer_elems)) {
+        g_adaptive_query_head_major_ = backend_.tensor_f16(
+            query_layer_elems,
+            "g_adaptive_two_pass_query_head_major");
+        g_adaptive_query_head_major_capacity_ = query_layer_elems;
+    }
+    if (!direct_pinned_query &&
+        (!g_query_score_pinned_ ||
+         g_query_score_pinned_capacity_ < query_layer_bytes)) {
+        g_query_score_pinned_ = backend_.host_buffer(
+            query_layer_bytes, "g_adaptive_two_pass_query_bounce");
+        g_query_score_pinned_capacity_ = query_layer_bytes;
+    }
+    if (!g_kbar_stream_global_max_ ||
+        !g_kbar_stream_global_sum_ ||
+        g_kbar_stream_distribution_capacity_ < distributions64) {
+        g_kbar_stream_global_max_ = backend_.tensor_f32(
+            distributions64, "g_adaptive_two_pass_global_max");
+        g_kbar_stream_global_sum_ = backend_.tensor_f32(
+            distributions64, "g_adaptive_two_pass_global_sum");
+        g_kbar_stream_distribution_capacity_ = distributions64;
+    }
+    AdaptiveIndexStageSlot &slot = g_adaptive_stream_slots_[0];
+    const uint64_t value_elems = capacity_rows * row_elems;
+    if (!natural_layout &&
+        (!slot.values || slot.values->dtype != DeviceTensorDType::F16 ||
+         slot.values->count < value_elems)) {
+        slot.compute_done.reset();
+        slot.transfer_done.reset();
+        slot.host.reset();
+        slot.values = kvmem_alloc_mean_index_tensor(
+            value_elems, "g_adaptive_two_pass_prototype_tile");
+    }
+    if (!g_adaptive_stream_logits_ ||
+        g_adaptive_stream_logits_capacity_ < logits_entries) {
+        g_adaptive_stream_logits_ = backend_.scratch_f32(
+            logits_entries, "g_adaptive_two_pass_logits");
+        g_adaptive_stream_logits_capacity_ = logits_entries;
+    }
+
+    auto source_token = [&](uint32_t sampled) -> uint32_t {
+        if (!sampled_query) return sampled;
+        return static_cast<uint32_t>(
+            ((2ull * sampled + 1ull) * captured_tokens) /
+            (2ull * score_tokens));
+    };
+    require_status(backend_.zero_tensor(*g_score_dev_));
+    uint64_t query_gather_ns = 0;
+    uint64_t query_h2d_bytes = 0;
+    uint64_t query_h2d_wait_ns = 0;
+    uint64_t copied_bytes = 0;
+    uint32_t pass_tiles = 0;
+    const uint64_t begin_ns = kvmem_steady_ns();
+    std::unique_ptr<DeviceTransferFence> prior_query_h2d;
+    std::unique_ptr<DeviceTransferFence> prior_query_consumed;
+
+    for (uint32_t l = 0; l < layers; ++l) {
+        if (prior_query_h2d) {
+            // The pageable source is gathered into one pinned slab. Do not
+            // overwrite it until the preceding H2D has consumed the bytes.
+            const uint64_t wait_begin = kvmem_steady_ns();
+            require_status(
+                backend_.wait_kv_transfer_fence(prior_query_h2d));
+            query_h2d_wait_ns += kvmem_steady_ns() - wait_begin;
+        }
+        const uint64_t gather_begin = kvmem_steady_ns();
+        auto *packed = g_query_score_pinned_
+            ? static_cast<uint16_t *>(g_query_score_pinned_->data)
+            : nullptr;
+        const uint16_t *query_host = kvmem_query_multi_host_data();
+        const uint64_t layer_source =
+            static_cast<uint64_t>(l) * source_stride * query_row_elems;
+        if (!sampled_query && !direct_pinned_query) {
+            std::memcpy(
+                packed, query_host + layer_source,
+                static_cast<size_t>(query_layer_bytes));
+        } else if (sampled_query) {
+            for (uint32_t t = 0; t < score_tokens; ++t) {
+                const uint64_t src =
+                    layer_source +
+                    static_cast<uint64_t>(source_token(t)) *
+                        query_row_elems;
+                std::memcpy(
+                    packed + static_cast<uint64_t>(t) * query_row_elems,
+                    query_host + src,
+                    static_cast<size_t>(query_row_elems) * sizeof(uint16_t));
+            }
+        }
+        query_gather_ns += kvmem_steady_ns() - gather_begin;
+
+        // g_query_multi_ is only the token-major ingress slab. Once the exec
+        // stream has repacked it head-major, the next layer's H2D can overlap
+        // the current layer's two prototype scans without a second buffer.
+        if (prior_query_consumed) {
+            require_status(backend_.kv_transfer_wait_for_execution(
+                prior_query_consumed));
+        }
+        require_status(backend_.begin_kv_transfer_to_device());
+        require_status(backend_.copy_bytes_from_host_async(
+            *g_query_multi_, 0,
+            direct_pinned_query
+                ? static_cast<const void *>(query_host + layer_source)
+                : g_query_score_pinned_->data,
+            query_layer_bytes));
+        std::unique_ptr<DeviceTransferFence> query_ready;
+        require_status(backend_.record_kv_transfer_fence(query_ready));
+        require_status(
+            backend_.execution_wait_for_kv_transfer(query_ready));
+        query_h2d_bytes += query_layer_bytes;
+        if (!natural_layout) {
+            require_status(backend_.adaptive_pack_query_head_major_device(
+                *g_adaptive_query_head_major_, *g_query_multi_,
+                /*layer=*/0, score_tokens, /*q_layer_stride=*/score_tokens,
+                cfg.n_heads, cfg.head_dim));
+            std::unique_ptr<DeviceTransferFence> query_consumed;
+            require_status(
+                backend_.record_execution_fence(query_consumed));
+            prior_query_consumed = std::move(query_consumed);
+        }
+        prior_query_h2d = std::move(query_ready);
+
+        AdaptiveGpuLayerArena &arena =
+            g_adaptive_gpu_layer_arenas_[l];
+        const uint64_t meta_base =
+            static_cast<uint64_t>(l) * g_adaptive_index_stride_blocks_;
+        for (uint32_t pass = 0; pass < 2; ++pass) {
+            uint32_t first = included_begin;
+            bool first_tile = true;
+            while (first < included_end) {
+                const int32_t begin_i32 =
+                    g_adaptive_block_offsets_host_[meta_base + first];
+                if (begin_i32 < 0) {
+                    return scorer_unavailable(
+                        failure_reason,
+                        "gpu_adaptive_two_pass_negative_offset");
+                }
+                const uint32_t prototype_begin =
+                    static_cast<uint32_t>(begin_i32);
+                uint32_t last = first;
+                uint64_t prototype_end = prototype_begin;
+                while (last < included_end) {
+                    const int32_t offset_i32 =
+                        g_adaptive_block_offsets_host_[meta_base + last];
+                    const int32_t count_i32 =
+                        g_adaptive_block_counts_host_[meta_base + last];
+                    if (offset_i32 < 0 || count_i32 < 0) {
+                        return scorer_unavailable(
+                            failure_reason,
+                            "gpu_adaptive_two_pass_invalid_metadata");
+                    }
+                    const uint64_t proposed_end =
+                        static_cast<uint64_t>(
+                            static_cast<uint32_t>(offset_i32)) +
+                        static_cast<uint32_t>(count_i32);
+                    if (last > first &&
+                        proposed_end - prototype_begin > capacity_rows) {
+                        break;
+                    }
+                    prototype_end = proposed_end;
+                    ++last;
+                    if (prototype_end - prototype_begin >= capacity_rows) {
+                        break;
+                    }
+                }
+                if (last == first || prototype_end <= prototype_begin ||
+                    prototype_end - prototype_begin > capacity_rows ||
+                    prototype_end > arena.prototype_count) {
+                    return scorer_unavailable(
+                        failure_reason,
+                        "gpu_adaptive_two_pass_tile_oob");
+                }
+                const uint32_t tile_blocks = last - first;
+                const uint32_t tile_prototypes =
+                    static_cast<uint32_t>(
+                        prototype_end - prototype_begin);
+                if (!natural_layout) {
+                    require_status(
+                        backend_.adaptive_pack_prototypes_head_major_device(
+                            *slot.values, *arena.values,
+                            prototype_begin, tile_prototypes,
+                            cfg.n_kv_heads, cfg.head_dim));
+                }
+                DeviceTensor &query_tensor = natural_layout
+                    ? *g_query_multi_ : *g_adaptive_query_head_major_;
+                DeviceTensor &prototype_tensor = natural_layout
+                    ? *arena.values : *slot.values;
+                DeviceStatus st;
+                if (pass == 0) {
+                    st = backend_.
+                        block_attn_stream_adaptive_gemm_lse_head_major_device(
+                            *g_kbar_stream_global_max_,
+                            *g_kbar_stream_global_sum_,
+                            *g_adaptive_stream_logits_,
+                            query_tensor, prototype_tensor,
+                            l, layers, score_tokens, tile_prototypes,
+                            cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
+                            scale, first_tile ? 1u : 0u,
+                            natural_layout ? prototype_begin : 0u,
+                            natural_layout ? 0u : 1u);
+                } else {
+                    st = backend_.
+                        block_attn_stream_adaptive_gemm_score_head_major_device(
+                            *g_score_dev_, *g_adaptive_stream_logits_,
+                            query_tensor, prototype_tensor,
+                            *arena.block_offsets, *arena.block_counts,
+                            *g_kbar_stream_global_max_,
+                            *g_kbar_stream_global_sum_,
+                            l, layers, score_tokens, tile_prototypes,
+                            tile_blocks, first, first, prototype_begin,
+                            cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
+                            scale,
+                            natural_layout ? prototype_begin : 0u,
+                            natural_layout ? 0u : 1u);
+                }
+                if (!st.ok) {
+                    return scorer_backend_unavailable(
+                        failure_reason,
+                        pass == 0
+                            ? "gpu_adaptive_two_pass_lse_failed"
+                            : "gpu_adaptive_two_pass_score_failed",
+                        st);
+                }
+                if (!natural_layout) {
+                    copied_bytes +=
+                        static_cast<uint64_t>(tile_prototypes) * row_bytes;
+                }
+                ++pass_tiles;
+                first_tile = false;
+                first = last;
+            }
+        }
+        if (natural_layout) {
+            // Natural-layout GEMM reads the ingress tensor throughout both
+            // prototype scans, so the next layer may overwrite it only after
+            // the current layer's final score kernel.
+            std::unique_ptr<DeviceTransferFence> query_consumed;
+            require_status(
+                backend_.record_execution_fence(query_consumed));
+            prior_query_consumed = std::move(query_consumed);
+        }
+    }
+    require_status(backend_.synchronize());
+    if (std::getenv("QW3_KVMEM_TRACE") || kvmem_perf_trace_flag()) {
+        std::fprintf(
+            stderr,
+            "[bs-adaptive-score] placement=gpu "
+            "layout=%s mode=tiled-tensor-gemm-two-pass "
+            "exact=1 passes=2 layers=%u blocks=%u query_tokens=%u "
+            "gqa_group=%u pass_tiles=%u capacity_rows=%llu "
+            "d2d_gib=%.3f query_h2d_mib=%.2f query_gather_ms=%.3f "
+            "query_h2d_wait_ms=%.3f "
+            "total_ms=%.3f\n",
+            natural_layout ? "natural" : "head-major",
+            layers, n_blocks, score_tokens, gqa_group, pass_tiles,
+            static_cast<unsigned long long>(capacity_rows),
+            static_cast<double>(copied_bytes) /
+                (1024.0 * 1024.0 * 1024.0),
+            static_cast<double>(query_h2d_bytes) /
+                (1024.0 * 1024.0),
+            query_gather_ns / 1.0e6,
+            query_h2d_wait_ns / 1.0e6,
+            (kvmem_steady_ns() - begin_ns) / 1.0e6);
+    }
+    return true;
+}
+
 bool QwenExecutor::kvmem_score_host_query_chunks(
         uint32_t n_blocks, uint32_t kbar_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         std::string *failure_reason) {
-    if (!kvmem_query_host_capture_ || !g_query_multi_host_ ||
+    if (!kvmem_query_host_capture_ || !kvmem_query_multi_host_data() ||
         !g_query_multi_ || !kvmem_mean_index_available() ||
         !g_score_dev_) {
         return scorer_unavailable(
@@ -19085,6 +19558,54 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
         return scorer_unavailable(
             failure_reason, "host_query_stream_shape_invalid");
     }
+    const char *score_chunk_env =
+        std::getenv("QW3_KVMEM_QUERY_SCORE_CHUNK");
+    // The old exact GPU path bounded O(Q*H*blocks) block statistics by
+    // splitting Q, which rescanned the complete resident index for every
+    // chunk.  Once that workspace would overflow, prefer the exact two-pass
+    // layer-streaming implementation: it keeps O(Q*H) LSE state and scans the
+    // index exactly twice.  An explicit score-chunk override remains a useful
+    // compatibility/performance control and therefore retains the old path.
+    if (!score_chunk_env && kvmem_adaptive_prototypes() &&
+        !kvmem_mean_index_cpu() && block_store_->config().adaptive_score_mode ==
+            KvMemAdaptiveScoreMode::Auto &&
+        env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TWO_PASS", true) &&
+        env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_TENSOR_GEMM", true) &&
+        !env_flag_enabled("QW3_KVMEM_ADAPTIVE_GPU_PACKED", false)) {
+        const uint32_t included_begin = std::min(excl_lo_end, n_blocks);
+        const uint32_t included_end = std::min(excl_hi_begin, n_blocks);
+        const uint64_t included_blocks =
+            included_end > included_begin
+                ? static_cast<uint64_t>(included_end - included_begin)
+                : 0;
+        const uint64_t required_block_stats =
+            static_cast<uint64_t>(tokens) * cfg.n_heads * included_blocks *
+            2ull * sizeof(float);
+        const uint64_t workspace_cap =
+            static_cast<uint64_t>(env_uint32_or(
+                "QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB", 512)) *
+            1024ull * 1024ull;
+        if (required_block_stats > workspace_cap) {
+            std::string two_pass_failure;
+            if (kvmem_score_gpu_adaptive_host_query_two_pass(
+                    n_blocks, tokens, captured_tokens, source_stride,
+                    scale, excl_lo_end, excl_hi_begin,
+                    &two_pass_failure)) {
+                return true;
+            }
+            if (std::getenv("QW3_KVMEM_TRACE") ||
+                kvmem_perf_trace_flag()) {
+                std::fprintf(
+                    stderr,
+                    "[bs-adaptive-stream-fallback] "
+                    "from=gpu-tiled-two-pass to=query-chunked-one-pass "
+                    "reason=%s\n",
+                    two_pass_failure.empty()
+                        ? "unknown" : two_pass_failure.c_str());
+            }
+            if (failure_reason) failure_reason->clear();
+        }
+    }
     const bool sampled_query = tokens < captured_tokens;
     auto source_token = [&](uint32_t sampled) -> uint32_t {
         if (!sampled_query) return sampled;
@@ -19096,8 +19617,6 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
             ((2ull * sampled + 1ull) * captured_tokens) /
             (2ull * tokens));
     };
-    const char *score_chunk_env =
-        std::getenv("QW3_KVMEM_QUERY_SCORE_CHUNK");
     const uint32_t configured_chunk = std::max<uint32_t>(
         1, std::min<uint32_t>(
                tokens, env_uint32_or("QW3_KVMEM_QUERY_SCORE_CHUNK", 256)));
@@ -19195,7 +19714,7 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
                     (static_cast<uint64_t>(layer) * source_stride +
                      token_base) * row_elems;
                 std::memcpy(
-                    packed + dst, g_query_multi_host_.get() + src,
+                    packed + dst, kvmem_query_multi_host_data() + src,
                     static_cast<size_t>(chunk_layer_elems) *
                         sizeof(uint16_t));
             } else {
@@ -19208,7 +19727,7 @@ bool QwenExecutor::kvmem_score_host_query_chunks(
                     std::memcpy(
                         packed + dst +
                             static_cast<uint64_t>(t) * row_elems,
-                        g_query_multi_host_.get() + src,
+                        kvmem_query_multi_host_data() + src,
                         static_cast<size_t>(row_elems) *
                             sizeof(uint16_t));
                 }

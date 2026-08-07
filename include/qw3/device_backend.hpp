@@ -1772,6 +1772,59 @@ public:
                 "adaptive head-major GEMM requires backend override"};
     }
 
+    // Bounded-workspace exact two-pass Adaptive scoring.  Both operations
+    // consume the same Tensor-GEMM logits layout [GQA, token, prototype].
+    // Pass 1 merges a prototype tile into the per-query global LSE; pass 2
+    // converts block-local MaxSim logits into normalized block mass.
+    virtual DeviceStatus
+    block_attn_stream_adaptive_gemm_lse_head_major_device(
+        DeviceTensor &global_max, DeviceTensor &global_sum,
+        DeviceTensor &logits, const DeviceTensor &query_head_major,
+        const DeviceTensor &prototype_head_major,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t prototype_count, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t initialize, uint32_t prototype_storage_base = 0,
+        uint32_t head_major_layout = 1) {
+        (void)global_max; (void)global_sum; (void)logits;
+        (void)query_head_major; (void)prototype_head_major;
+        (void)layer; (void)n_layers; (void)n_tokens;
+        (void)prototype_count; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale; (void)initialize;
+        (void)prototype_storage_base; (void)head_major_layout;
+        return {false,
+                "adaptive GEMM LSE requires backend override"};
+    }
+
+    virtual DeviceStatus
+    block_attn_stream_adaptive_gemm_score_head_major_device(
+        DeviceTensor &score, DeviceTensor &logits,
+        const DeviceTensor &query_head_major,
+        const DeviceTensor &prototype_head_major,
+        const DeviceTensor &block_offsets,
+        const DeviceTensor &block_counts,
+        const DeviceTensor &global_max,
+        const DeviceTensor &global_sum,
+        uint32_t layer, uint32_t n_layers, uint32_t n_tokens,
+        uint32_t prototype_count, uint32_t tile_blocks,
+        uint32_t global_block_base, uint32_t metadata_block_base,
+        uint32_t prototype_base, uint32_t n_heads,
+        uint32_t n_kv_heads, uint32_t head_dim, float scale,
+        uint32_t prototype_storage_base = 0,
+        uint32_t head_major_layout = 1) {
+        (void)score; (void)logits; (void)query_head_major;
+        (void)prototype_head_major; (void)block_offsets;
+        (void)block_counts; (void)global_max; (void)global_sum;
+        (void)layer; (void)n_layers; (void)n_tokens;
+        (void)prototype_count; (void)tile_blocks;
+        (void)global_block_base; (void)metadata_block_base;
+        (void)prototype_base; (void)n_heads; (void)n_kv_heads;
+        (void)head_dim; (void)scale; (void)prototype_storage_base;
+        (void)head_major_layout;
+        return {false,
+                "adaptive GEMM score requires backend override"};
+    }
+
     virtual DeviceStatus block_attn_stream_adaptive_finalize_device(
         DeviceTensor &score,
         const DeviceTensor &block_max,
