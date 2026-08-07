@@ -621,13 +621,19 @@ public:
     }
     // A semantic-chunk first pass exists only to capture the retrieval query.
     // Its pages are immediately rolled back, so durable raw-K/index/tier work
-    // would be pure overhead. The complete target and MTP forward still runs.
+    // would be pure overhead. The target runs through the final required Q;
+    // MTP prefix work and the unobservable terminal suffix are skipped.
     void kvmem_set_provisional_prefill(bool provisional) {
         kvmem_provisional_prefill_ = provisional;
     }
     bool kvmem_provisional_prefill() const {
         return kvmem_provisional_prefill_;
     }
+    // When a semantic-chunk provisional pass uses the exact GPU Adaptive
+    // scorer, consume each normal-attention layer's Q directly while it is
+    // still resident. This avoids the otherwise redundant full-query
+    // GPU->CPU->GPU round trip without changing the scoring reduction.
+    bool kvmem_begin_provisional_adaptive_score();
 
     // Re-select the working set from the built-in cumulative-attention top-k
     // and assemble it: re-RoPE each moved block in place (per attention layer)
@@ -1606,6 +1612,9 @@ private:
         uint32_t captured_tokens, uint32_t source_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         std::string *failure_reason);
+    bool kvmem_score_provisional_adaptive_layer(
+        uint32_t layer, DeviceTensor &query_token_major,
+        uint32_t query_tokens, std::string *failure_reason);
     uint32_t kvmem_query_begin_ = 0;
     uint32_t kvmem_query_end_ = 0;                             // begin==end -> no span
     uint32_t g_query_multi_count_ = 0;                         // rows captured so far (per slot)
@@ -1634,6 +1643,32 @@ private:
     uint64_t g_query_multi_clean_host_elems_ = 0;              // active elements
     bool g_query_multi_clean_host_in_place_ = false;
     uint32_t g_query_multi_clean_count_ = 0;                   // rows stashed (== S when ready)
+    // Exact online Adaptive scoring for semantic-chunk provisional passes.
+    // The scorer reuses the ordinary bounded one-dot workspace and consumes Q
+    // before q_batch_ is reused by the next normal-attention layer. No
+    // full-query GPU allocation or host round trip is required.
+    bool g_provisional_adaptive_score_active_ = false;
+    bool g_provisional_adaptive_score_ready_ = false;
+    bool g_provisional_adaptive_score_stashed_ = false;
+    uint32_t g_provisional_adaptive_n_blocks_ = 0;
+    uint32_t g_provisional_adaptive_included_begin_ = 0;
+    uint32_t g_provisional_adaptive_included_end_ = 0;
+    uint32_t g_provisional_adaptive_query_tile_ = 0;
+    uint64_t g_provisional_adaptive_max_layer_prototypes_ = 0;
+    uint64_t g_provisional_adaptive_workspace_entries_ = 0;
+    uint64_t g_provisional_adaptive_begin_ns_ = 0;
+    uint32_t g_provisional_adaptive_query_tiles_ = 0;
+    uint32_t g_provisional_adaptive_gemm_calls_ = 0;
+    // The layers before the first normal-attention layer cannot observe the
+    // selected KV window. Their provisional hidden output and recurrent state
+    // are therefore exactly reusable by the durable replay. The hidden batch
+    // is stored in the otherwise-idle g_query_multi_ allocation, so this adds
+    // no device allocation.
+    bool g_provisional_prefix_replay_ready_ = false;
+    uint32_t g_provisional_prefix_replay_layer_ = 0;
+    uint32_t g_provisional_prefix_replay_batch_ = 0;
+    uint32_t g_provisional_prefix_replay_base_pos_ = 0;
+    uint64_t g_provisional_prefix_replay_elems_ = 0;
     // Force pick_topk to always keep blocks with id >= this (question + live tail);
     // 0xffffffff => no pin. pick_topk result is unioned with [pin,block_count) in
     // kvmem_selection_with_pin() before set_selection at every reselect site.

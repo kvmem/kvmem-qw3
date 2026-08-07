@@ -907,14 +907,14 @@ KvMemSemanticChunkStats kvmem_prefill_semantic_chunks(
         // Reuse the fixed session index allocation and publish only historical
         // blocks at selection time. The provisional pass is query-only, so it
         // cannot append temporary Adaptive prototypes or tier writes.
+        const double provisional_start = wall_seconds();
+        executor->kvmem_set_provisional_prefill(true);
         executor->kvmem_set_query_span(
             query_begin, chunk_end, prompt_tokens,
             /*index_tokens=*/end,
             /*preserve_content_index=*/true);
         executor->capture_transient_state(boundary);
-
-        const double provisional_start = wall_seconds();
-        executor->kvmem_set_provisional_prefill(true);
+        (void)executor->kvmem_begin_provisional_adaptive_score();
         executor->kvmem_set_prefill_reselect_suppressed(true);
         try {
             prefill(chunk_begin, chunk_end,
