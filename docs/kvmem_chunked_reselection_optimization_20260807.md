@@ -158,6 +158,60 @@ Across the complete sequence, engine time falls from 515.396 s to 411.291 s,
 a **20.20%** cumulative reduction without changing retrieval or increasing the
 configured GPU-memory ceiling.
 
+## 32K utility follow-up: minimal recent anchor
+
+The complete 100-sample K32 semantic-chunk run (`recent=0`) scored 34/100 and
+had ten `finish_reason=length` cases.  All ten truncated answers came from the
+tool-history tasks and entered a tool-call/transcript continuation loop.  A
+controlled four-sample cohort was chosen before tuning: two truncated/wrong
+cases and two normally stopped/correct cases.  All runs used the same 32K
+selection budget, 32K generation reserve, block size 32, 2K full-chunk query,
+Adaptive Mean-K, FP8 KV, MTP-4, temperature 0.6, and seed 20260722.
+
+| Recent anchor | Correct | Length | Per-sample result | Decision |
+|---:|---:|---:|---|---|
+| 0 (control) | 2/4 | 2/4 | 0, 1, 0, 1 | baseline |
+| 128 tokens / 4 blocks | **3/4** | **0/4** | 1, 1, 0, 1 | retained candidate |
+| 512 tokens / 16 blocks | **3/4** | **0/4** | 1, 1, 0, 1 | effective, but uses more budget |
+| 1,024 tokens / 32 blocks | 0/2 | 0/2 | 0, 0 | stopped early; regression |
+| 2,048 tokens / 64 blocks | 2/4 | 0/4 | 0, 1, 1, 0 | no net utility gain |
+
+The effect is not monotonic in the amount of recent context.  A four-block
+tail is enough to anchor the rendered dialogue/tool structure while consuming
+only 0.39% of the K32 budget.  Reserving 1K or 2K displaces more semantic Top-K
+blocks and causes different sample-level regressions.  On this cohort, 128 and
+512 tokens produced identical final answers, so 128 is the preferred candidate.
+
+Three additional formerly truncated Count Frequency (Tool) samples were
+tested.  They all changed from `length` to a short, well-formed `stop`, but
+remained incorrect.  Across the five formerly truncated samples tested in this
+follow-up, only one recovered the correct answer.  The defensible conclusion is
+therefore limited: a tiny recent anchor robustly improves generation stability
+and gave a preliminary +1/4 accuracy gain, but it does not fix the underlying
+retrieval/counting error in most truncated samples.  A full-100 run is required
+before replacing the published K32 utility result.
+
+An attempted chunk-local-only 2K pin (cleared before the final query) removed
+the two observed length stops but did not recover either answer.  That engine
+and API implementation was removed rather than retained.  The surviving
+candidate uses the existing `--kvmem-recent-tokens` mechanism; the reproducible
+launcher is:
+
+- `scripts/kvmem_eval/run_agentlongbench_512k_k32_semantic_chunk_recent128.sh`
+
+Primary artifacts:
+
+- recent=128 four-sample cohort:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_k32_chunked_recent128_ab4_20260808`
+- recent=512 four-sample cohort:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_k32_chunked_recent512_ab4_20260808`
+- recent=2K four-sample negative control:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_k32_chunked_recent2k_ab4_20260808`
+- chunk-local-only negative controls:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_k32_chunked_local2k_ab4_20260808`
+  and
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_k32_chunked_local2k_ab2_20260808`
+
 ## Remaining irreducible cost under current semantics
 
 The final run still spends about 201.6 s in the provisional phase (including
