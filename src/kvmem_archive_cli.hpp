@@ -13,6 +13,11 @@ namespace qw3 {
 // archive at the last complete raw-K chunk. Interrupted builds resume from the
 // highest ladder point whose payload is fully durable.
 struct KvMemArchiveBuildConfig {
+    enum class PrefillWindow {
+        Pressure,
+        SemanticChunk,
+    };
+
     // UTF-8 text to ingest. Empty uses token_input_path when supplied,
     // otherwise a deterministic synthetic corpus used by end-to-end tests.
     std::string input_path;
@@ -28,6 +33,14 @@ struct KvMemArchiveBuildConfig {
     // the next complete raw-K chunk.  This is useful for real benchmark rows;
     // the default remains truncation for archive-format compatibility tests.
     bool pad_final_chunk = false;
+    // Optional one-shot semantic-chunk construction. Pressure remains the
+    // archive compatibility default. SemanticChunk runs every physical
+    // prefill chunk after semantic_start_tokens provisionally, selects a
+    // bounded historical window with that complete chunk as the query, then
+    // replays the chunk before the archive is sealed.
+    PrefillWindow prefill_window = PrefillWindow::Pressure;
+    uint32_t semantic_start_tokens = 0;
+    uint32_t semantic_query_tokens = 0;
 };
 
 // Attach a sealed archive and ask questions against it without recomputing the

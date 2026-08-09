@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", action="append", choices=SPLITS)
     p.add_argument("--source", action="append")
     p.add_argument("--row", type=int, action="append")
+    p.add_argument(
+        "--selection-manifest", type=Path,
+        help="JSONL rows with exact {split,row} context identities",
+    )
     p.add_argument("--max-contexts", type=int)
     p.add_argument("--question-limit", type=int,
                    help="per-context diagnostic limit; omit for full evaluation")
@@ -89,6 +93,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cpu-gb-tmpfs", type=float, default=16.0)
     p.add_argument("--cpu-gb-ssd", type=float, default=64.0)
     p.add_argument("--prefill-chunk", type=int, default=2048)
+    p.add_argument(
+        "--prefill-window", choices=("pressure", "semantic_chunk"),
+        default="pressure",
+    )
+    p.add_argument("--prefill-semantic-start-tokens", type=int, default=0)
+    p.add_argument("--prefill-semantic-query-tokens", type=int, default=0)
+    p.add_argument("--immutable-refresh-tokens", type=int, default=1)
     p.add_argument("--ladder-tokens", type=int, default=262144)
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
@@ -239,13 +250,47 @@ def aggregate(out_dir: Path) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    if args.prefill_window != "semantic_chunk" and (
+        args.prefill_semantic_start_tokens != 0
+        or args.prefill_semantic_query_tokens != 0
+    ):
+        raise ValueError(
+            "--prefill-semantic-* requires --prefill-window semantic_chunk"
+        )
+    if args.prefill_semantic_start_tokens < 0:
+        raise ValueError("--prefill-semantic-start-tokens must be >= 0")
+    if args.prefill_semantic_query_tokens < 0:
+        raise ValueError("--prefill-semantic-query-tokens must be >= 0")
+    if args.immutable_refresh_tokens <= 0:
+        raise ValueError("--immutable-refresh-tokens must be > 0")
     args.binary = args.binary.resolve()
     args.model = args.model.resolve()
+    if args.selection_manifest is not None:
+        args.selection_manifest = args.selection_manifest.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "rows").mkdir(exist_ok=True)
     if args.archive_storage == "auto":
         args.ssd_root.mkdir(parents=True, exist_ok=True)
     selected_splits = args.split or list(SPLITS)
+    selected_pairs: set[tuple[str, int]] | None = None
+    if args.selection_manifest is not None:
+        selected_pairs = set()
+        with args.selection_manifest.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                split = str(item["split"])
+                row = int(item["row"])
+                if split not in SPLITS or row < 0:
+                    raise ValueError(
+                        f"invalid selection at line {line_number}: {item}"
+                    )
+                if (split, row) in selected_pairs:
+                    raise ValueError(
+                        f"duplicate selection at line {line_number}: {item}"
+                    )
+                selected_pairs.add((split, row))
     run_id = safe_name(args.out_dir.name)
     work: list[tuple[str, Path, int, str]] = []
     for split in selected_splits:
@@ -254,11 +299,21 @@ def main() -> int:
         for row_index, metadata_wrap in enumerate(table.to_pylist()):
             metadata = metadata_wrap.get("metadata") or {}
             source = metadata.get("source", "")
+            if selected_pairs is not None and (split, row_index) not in selected_pairs:
+                continue
             if args.source and source not in args.source:
                 continue
             if args.row and row_index not in args.row:
                 continue
             work.append((split, parquet, row_index, source))
+    if selected_pairs is not None:
+        found = {(split, row) for split, _, row, _ in work}
+        missing = selected_pairs - found
+        if missing:
+            raise ValueError(
+                "selection manifest contains contexts not found under the "
+                f"active split/source filters: {sorted(missing)}"
+            )
     if args.max_contexts is not None:
         work = work[: args.max_contexts]
 
@@ -287,7 +342,8 @@ def main() -> int:
     env.update({
         "QW3_Q8_BF16_MAIN": "0",
         "QW3_KVMEM_QUERY_REPLAY": "1",
-        "QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS": "1",
+        "QW3_KVMEM_IMMUTABLE_REFRESH_TOKENS":
+            str(args.immutable_refresh_tokens),
         "QW3_KVMEM_DROP_PAGE_CACHE": "0",
     })
 
@@ -384,12 +440,15 @@ def main() -> int:
         if manifest.exists():
             sealed = bool(json.loads(manifest.read_text(encoding="utf-8")).get("sealed"))
         if not sealed:
-            # Archive ingest uses the generic pressure-window path. Pressure
-            # selection is deliberately deterministic sink+recent and never
-            # consults a semantic scorer, so a mean-K build-time index is both
-            # cheaper and semantically identical to adaptive here. `archive
-            # query` below rebuilds the policy-specific adaptive index from
-            # immutable raw-K before any question-conditioned reselection.
+            # Pressure mode uses a cheap mean-K build-time index because its
+            # sink+recent policy never consults semantic scores. SemanticChunk
+            # instead needs the same Adaptive index used by the live K64
+            # experiment: every complete prefill chunk is scored provisionally
+            # and then replayed against its selected historical window.
+            build_retrieval = (
+                "key-direction-adaptive"
+                if args.prefill_window == "semantic_chunk" else "mean-k"
+            )
             build_cmd = [
                 str(args.binary), "archive", "build",
                 "--model", str(args.model),
@@ -408,14 +467,42 @@ def main() -> int:
                 "--kvmem-index-placement", args.index_placement,
                 "--kvmem-index-staging-mb", str(args.index_staging_mb),
                 "--kvmem-query-conditioned",
-                "--kvmem-retrieval-method", "mean-k",
+                "--kvmem-retrieval-method", build_retrieval,
                 "--kvmem-opt-stage-out", "on",
                 "--kvmem-opt-stage-in", "on",
                 "--kvmem-opt-pack", "on",
                 "--prefill-chunk", str(args.prefill_chunk),
             ]
+            if args.prefill_window == "semantic_chunk":
+                build_cmd += [
+                    "--archive-prefill-window", "semantic_chunk",
+                    "--archive-prefill-semantic-start-tokens",
+                    str(args.prefill_semantic_start_tokens),
+                    "--archive-prefill-semantic-query-tokens",
+                    str(args.prefill_semantic_query_tokens),
+                    "--kvmem-adaptive-gain-1to2", "0.10",
+                    "--kvmem-adaptive-gain-2to4", "0.06",
+                ]
             print(f"[{ordinal}/{len(work)}] BUILD {archive_dir}", flush=True)
             run_logged(build_cmd, row_dir / "build.log", env)
+            if args.prefill_window == "semantic_chunk" and aligned > row_budget:
+                build_log_text = (row_dir / "build.log").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                summaries = re.findall(
+                    r"native kvmem semantic-chunk \(mtp\): chunks=(\d+)",
+                    build_log_text,
+                )
+                if not summaries or int(summaries[-1]) <= 0:
+                    raise RuntimeError(
+                        "semantic-chunk archive build did not report any "
+                        f"chunk reselections: {row_dir / 'build.log'}"
+                    )
+                if re.search(r"\bfallback=(?:1|true)\b", build_log_text):
+                    raise RuntimeError(
+                        "fallback detected during semantic-chunk archive "
+                        f"build: {row_dir / 'build.log'}"
+                    )
 
         raw_results = row_dir / "archive_answers.jsonl"
         query_cmd = [

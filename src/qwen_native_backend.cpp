@@ -2244,20 +2244,70 @@ public:
         // prefix and must be discarded before appending the same suffix again.
         kvmem_archive_->truncate_tokens(start);
 
+        const bool semantic_chunk_requested =
+            cfg.prefill_window ==
+            KvMemArchiveBuildConfig::PrefillWindow::SemanticChunk;
+        if (semantic_chunk_requested && start != 0) {
+            throw std::runtime_error(
+                "semantic-chunk archive build cannot resume from an "
+                "intermediate ladder; rebuild into a fresh archive");
+        }
+        const KvMemStore *initial_store = executor_->block_store();
+        if (!initial_store) {
+            throw std::runtime_error(
+                "archive build lost its KVMem block store");
+        }
+        const bool semantic_chunk_build =
+            semantic_chunk_requested &&
+            target > initial_store->select_budget_tokens();
+
         GenerationOptions gen;
         gen.max_tokens = 0;  // ingest only; the archive never decodes
-        gen.kvmem_reselect_mode = KvMemReselectMode::Off;
+        gen.kvmem_reselect_mode = semantic_chunk_build
+            ? KvMemReselectMode::Force : KvMemReselectMode::Off;
         gen.kvmem_query_begin = 0;
         gen.kvmem_query_end = 0;
-        gen.kvmem_session_id = "kvmem-archive-build";
-        kvmem_api_session_active_ = true;
-        kvmem_api_session_id_ = gen.kvmem_session_id;
+        if (semantic_chunk_build) {
+            if (target > std::numeric_limits<uint32_t>::max()) {
+                throw std::runtime_error(
+                    "semantic-chunk archive build currently supports at most "
+                    "2^32-1 tokens");
+            }
+            if (target <= chunk_stride) {
+                throw std::runtime_error(
+                    "semantic-chunk archive needs a non-empty history before "
+                    "its final physical query chunk");
+            }
+            gen.kvmem_prefill_window_mode =
+                KvMemPrefillWindowMode::SemanticChunk;
+            gen.kvmem_prefill_semantic_start_tokens =
+                cfg.semantic_start_tokens;
+            gen.kvmem_prefill_semantic_query_tokens =
+                cfg.semantic_query_tokens;
+            gen.kvmem_query_begin = static_cast<uint32_t>(
+                target - chunk_stride);
+            gen.kvmem_query_end = static_cast<uint32_t>(target);
+            // SemanticChunk is deliberately a single cold request. A named API
+            // continuation would make the provisional/replay boundary depend
+            // on a warm checkpoint and is rejected by the inference path.
+            gen.kvmem_session_id.clear();
+            kvmem_api_session_active_ = false;
+            kvmem_api_session_id_.clear();
+        } else {
+            gen.kvmem_session_id = "kvmem-archive-build";
+            kvmem_api_session_active_ = true;
+            kvmem_api_session_id_ = gen.kvmem_session_id;
+        }
         kvmem_api_boundary_ckpt_ = QwenExecutor::StateSnapshot{};
         kvmem_api_boundary_pos_ = 0;
         kvmem_api_tail_tokens_.clear();
-        kvmem_api_tokens_.assign(
-            corpus.begin(),
-            corpus.begin() + static_cast<std::ptrdiff_t>(start));
+        if (semantic_chunk_build) {
+            kvmem_api_tokens_.clear();
+        } else {
+            kvmem_api_tokens_.assign(
+                corpus.begin(),
+                corpus.begin() + static_cast<std::ptrdiff_t>(start));
+        }
 
         if (start > 0) {
             // A ladder restores model state and cold tier authority, but the
@@ -2303,37 +2353,25 @@ public:
         const double t_start = wall_seconds();
         uint64_t pos = start;
         bool first_turn = (start == 0);
-        while (pos < target) {
-            const uint64_t next = std::min(target, pos + ladder);
-            std::vector<uint32_t> turn(
-                corpus.begin() + static_cast<std::ptrdiff_t>(pos),
-                corpus.begin() + static_cast<std::ptrdiff_t>(next));
-            MtpGenStats stats;
-            (void)generate_mtp(turn, gen, CancellableTokenCallback{},
-                               /*dump=*/nullptr,
-                               /*spec_mtp=*/true, /*trace_mtp=*/false,
-                               /*override_executor=*/nullptr,
-                               /*manage_device_scope=*/true,
-                               /*reset_session=*/first_turn, &stats);
-            first_turn = false;
-            pos = next;
-
+        auto persist_turn = [&](const std::vector<uint32_t> &turn,
+                                uint64_t expected_end,
+                                bool require_exact_end) {
             DeviceStatus scope = device_->begin();
             if (!scope.ok) throw std::runtime_error(scope.message);
             try {
                 const uint64_t sealable =
                     executor_->kvmem_archive_sealable_tokens();
+                if (require_exact_end && sealable != expected_end) {
+                    throw std::runtime_error(
+                        "archive build durable position mismatch: expected " +
+                        std::to_string(expected_end) + " got " +
+                        std::to_string(sealable));
+                }
                 executor_->kvmem_archive_persist_through(sealable);
                 // A durable ladder must define not only recurrent/hidden
                 // tensors but also the canonical active attention frame used
-                // by the next ingest turn. Without this normalization, an
-                // uninterrupted writer can retain its dense resident page
-                // layout while a resumed writer necessarily materializes the
-                // same bytes from raw-K/V into a compact window. The different
-                // attention reduction layout causes small numerical drift that
-                // crosses FP8 thresholds in later layers. Force both paths
-                // through the identical raw-authority reconstruction before
-                // publishing the ladder state.
+                // by the next ingest turn. Normalize both uninterrupted and
+                // resumed paths through the same raw-authority materialization.
                 const KvMemStore *store = executor_->block_store();
                 if (!store) {
                     throw std::runtime_error(
@@ -2360,6 +2398,38 @@ public:
             }
             DeviceStatus done = device_->end();
             if (!done.ok) throw std::runtime_error(done.message);
+        };
+
+        if (semantic_chunk_build) {
+            std::vector<uint32_t> turn(
+                corpus.begin(),
+                corpus.begin() + static_cast<std::ptrdiff_t>(target));
+            MtpGenStats stats;
+            (void)generate_mtp(turn, gen, CancellableTokenCallback{},
+                               /*dump=*/nullptr,
+                               /*spec_mtp=*/true, /*trace_mtp=*/false,
+                               /*override_executor=*/nullptr,
+                               /*manage_device_scope=*/true,
+                               /*reset_session=*/true, &stats);
+            pos = target;
+            persist_turn(turn, pos, /*require_exact_end=*/true);
+        } else {
+            while (pos < target) {
+                const uint64_t next = std::min(target, pos + ladder);
+                std::vector<uint32_t> turn(
+                    corpus.begin() + static_cast<std::ptrdiff_t>(pos),
+                    corpus.begin() + static_cast<std::ptrdiff_t>(next));
+                MtpGenStats stats;
+                (void)generate_mtp(turn, gen, CancellableTokenCallback{},
+                                   /*dump=*/nullptr,
+                                   /*spec_mtp=*/true, /*trace_mtp=*/false,
+                                   /*override_executor=*/nullptr,
+                                   /*manage_device_scope=*/true,
+                                   /*reset_session=*/first_turn, &stats);
+                first_turn = false;
+                pos = next;
+                persist_turn(turn, pos, /*require_exact_end=*/false);
+            }
         }
 
         const uint32_t bt = kvmem_archive_->manifest().layout.block_tokens;

@@ -32,6 +32,9 @@ void usage(std::ostream &os) {
         "                         [--archive-token-input FILE]\n"
         "                         [--archive-ladder-tokens N]\n"
         "                         [--archive-pad-final-chunk] [options]\n"
+        "                         [--archive-prefill-window pressure|semantic_chunk]\n"
+        "                         [--archive-prefill-semantic-start-tokens N]\n"
+        "                         [--archive-prefill-semantic-query-tokens N]\n"
         "       qw3 archive query --model MODEL --kvmem-archive DIR\n"
         "                         [--archive-tokens N] --archive-question Q\n"
         "                         [--archive-questions-file FILE]\n"
@@ -891,6 +894,37 @@ int main(int argc, char **argv) {
                 archive_build.ladder_tokens = std::stoull(need(arg));
             } else if (arg == "--archive-pad-final-chunk") {
                 archive_build.pad_final_chunk = true;
+            } else if (arg == "--archive-prefill-window") {
+                const std::string mode = need(arg);
+                if (mode == "pressure") {
+                    archive_build.prefill_window =
+                        qw3::KvMemArchiveBuildConfig::PrefillWindow::Pressure;
+                } else if (mode == "semantic_chunk") {
+                    archive_build.prefill_window = qw3::KvMemArchiveBuildConfig::
+                        PrefillWindow::SemanticChunk;
+                } else {
+                    throw std::runtime_error(
+                        "--archive-prefill-window must be "
+                        "pressure|semantic_chunk");
+                }
+            } else if (arg ==
+                       "--archive-prefill-semantic-start-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--archive-prefill-semantic-start-tokens must be >= 0");
+                }
+                archive_build.semantic_start_tokens =
+                    static_cast<uint32_t>(value);
+            } else if (arg ==
+                       "--archive-prefill-semantic-query-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0) {
+                    throw std::runtime_error(
+                        "--archive-prefill-semantic-query-tokens must be >= 0");
+                }
+                archive_build.semantic_query_tokens =
+                    static_cast<uint32_t>(value);
             } else if (arg == "--archive-question") {
                 archive_run.questions.push_back(need(arg));
             } else if (arg == "--archive-questions-file") {
@@ -1116,6 +1150,15 @@ int main(int argc, char **argv) {
                     throw std::runtime_error(
                         "qw3 archive build requires --ctx large enough for the "
                         "full context");
+                }
+                if (archive_build.prefill_window !=
+                        qw3::KvMemArchiveBuildConfig::PrefillWindow::
+                            SemanticChunk &&
+                    (archive_build.semantic_start_tokens != 0 ||
+                     archive_build.semantic_query_tokens != 0)) {
+                    throw std::runtime_error(
+                        "--archive-prefill-semantic-* requires "
+                        "--archive-prefill-window semantic_chunk");
                 }
                 return qw3::run_kvmem_archive_build(engine, archive_build);
             }
