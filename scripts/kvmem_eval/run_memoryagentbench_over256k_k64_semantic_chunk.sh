@@ -11,6 +11,7 @@ PY=${PY:-/home/chaidi/kvmem_eval/KVMem_Motivation/.venv/bin/python}
 SELECTION_MANIFEST=${SELECTION_MANIFEST:-$ROOT/scripts/kvmem_eval/memoryagentbench_over256k_contexts.jsonl}
 MAX_CONTEXTS=${MAX_CONTEXTS:-}
 QUESTION_LIMIT=${QUESTION_LIMIT:-}
+BLOCK_TOKENS=${BLOCK_TOKENS:-32}
 
 FILTER_ARGS=()
 if [[ -n $MAX_CONTEXTS ]]; then
@@ -37,7 +38,7 @@ fi
   "${FILTER_ARGS[@]}" \
   --archive-storage cpu-only \
   --tmpfs-limit-gib 60 \
-  --block-tokens 32 \
+  --block-tokens "$BLOCK_TOKENS" \
   --budget 65536 \
   --gen-budget 32768 \
   --sink-tokens 512 \

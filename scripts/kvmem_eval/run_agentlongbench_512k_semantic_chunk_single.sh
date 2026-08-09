@@ -11,6 +11,7 @@ CTX_TOKENS=${CTX_TOKENS:-655360}
 BENCHMARK_NAME=${BENCHMARK_NAME:-AgentLongBench-512K-normal100}
 KVMEM_BUDGET=${KVMEM_BUDGET:-32768}
 GEN_BUDGET=${GEN_BUDGET:-8192}
+BLOCK_TOKENS=${BLOCK_TOKENS:-32}
 # Keep the server-side generation reserve independent from the number of
 # answer tokens requested by scorer/performance smoke tests.
 REQUEST_MAX_TOKENS=${REQUEST_MAX_TOKENS:-$GEN_BUDGET}
@@ -120,7 +121,7 @@ env \
   "$ROOT/build/qw3" serve \
     --model "$MODEL" \
     --ctx "$CTX_TOKENS" --kv-dtype fp8 \
-    --kvmem --kvmem-block-tokens 32 \
+    --kvmem --kvmem-block-tokens "$BLOCK_TOKENS" \
     --kvmem-budget "$KVMEM_BUDGET" \
     --kvmem-prefill-budget "$KVMEM_BUDGET" \
     --kvmem-gen-budget "$GEN_BUDGET" \
