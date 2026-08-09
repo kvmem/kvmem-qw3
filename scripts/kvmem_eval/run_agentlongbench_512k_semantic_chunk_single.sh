@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# One-sample AgentLongBench-512K validation of chunk-level semantic replay.
-# Runs beside other servers, uses CPU-only KVMem spill, and never touches NVMe.
+# AgentLongBench validation runner for chunk-level semantic replay. Defaults to
+# the original 512K setup; wrappers may override the dataset and context size.
+# Uses CPU-only KVMem spill and never touches NVMe.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PORT=${PORT:-18089}
 GPU_MEMORY_RATIO=${GPU_MEMORY_RATIO:-0.50}
+CTX_TOKENS=${CTX_TOKENS:-655360}
+BENCHMARK_NAME=${BENCHMARK_NAME:-AgentLongBench-512K-normal100}
 KVMEM_BUDGET=${KVMEM_BUDGET:-32768}
 GEN_BUDGET=${GEN_BUDGET:-8192}
 # Keep the server-side generation reserve independent from the number of
@@ -37,8 +40,9 @@ export NO_PROXY=127.0.0.1,localhost
 export no_proxy=127.0.0.1,localhost
 
 if [[ ! "$START_INDEX" =~ ^[0-9]+$ ]] || [[ ! "$LIMIT" =~ ^[1-9][0-9]*$ ]] ||
-   [[ ! "$REQUEST_MAX_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "START_INDEX must be >= 0 and LIMIT must be > 0" >&2
+   [[ ! "$REQUEST_MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] ||
+   [[ ! "$CTX_TOKENS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "START_INDEX must be >= 0; LIMIT, REQUEST_MAX_TOKENS, and CTX_TOKENS must be > 0" >&2
   exit 2
 fi
 mapfile -t selected_ids < <(
@@ -115,7 +119,7 @@ env \
   QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB="$ADAPTIVE_BLOCK_STATS_MIB" \
   "$ROOT/build/qw3" serve \
     --model "$MODEL" \
-    --ctx 655360 --kv-dtype fp8 \
+    --ctx "$CTX_TOKENS" --kv-dtype fp8 \
     --kvmem --kvmem-block-tokens 32 \
     --kvmem-budget "$KVMEM_BUDGET" \
     --kvmem-prefill-budget "$KVMEM_BUDGET" \
@@ -155,13 +159,13 @@ curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null
 "$ROOT/.venv/bin/python" "$ROOT/scripts/kvmem_eval/run_agentlongbench_kvmem.py" \
   --benchmark-repo /home/chaidi/AgentLongBench_Motivation \
   --dataset "$DATA" --manifest "$MANIFEST" --allow-custom-subset \
-  --benchmark-name AgentLongBench-512K-normal100 \
+  --benchmark-name "$BENCHMARK_NAME" \
   --output-root "$RESULT_ROOT" \
   --api-base "http://127.0.0.1:$PORT/v1" \
   --model "$(basename "$MODEL")" \
   --method "$METHOD" \
   --temperature 0.6 --top-p 0.95 --max-tokens "$REQUEST_MAX_TOKENS" \
-  --context-window 655360 --context-safety-margin 16 \
+  --context-window "$CTX_TOKENS" --context-safety-margin 16 \
   --timeout-sec 14400 --max-sample-sec 14400 --attempts 1 \
   --enable-thinking --seed 20260722 \
   --kvmem-retrieval-trace-metadata \
