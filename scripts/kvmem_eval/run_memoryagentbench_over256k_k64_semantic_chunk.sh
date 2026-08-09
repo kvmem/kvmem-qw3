@@ -8,6 +8,17 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 STAMP=${STAMP:-$(date +%Y%m%d_%H%M%S)}
 OUT_DIR=${OUT_DIR:-/data/chaidi/kvmem_eval/results/memoryagentbench_over256k_k64_semantic_chunk_${STAMP}}
 PY=${PY:-/home/chaidi/kvmem_eval/KVMem_Motivation/.venv/bin/python}
+SELECTION_MANIFEST=${SELECTION_MANIFEST:-$ROOT/scripts/kvmem_eval/memoryagentbench_over256k_contexts.jsonl}
+MAX_CONTEXTS=${MAX_CONTEXTS:-}
+QUESTION_LIMIT=${QUESTION_LIMIT:-}
+
+FILTER_ARGS=()
+if [[ -n $MAX_CONTEXTS ]]; then
+  FILTER_ARGS+=(--max-contexts "$MAX_CONTEXTS")
+fi
+if [[ -n $QUESTION_LIMIT ]]; then
+  FILTER_ARGS+=(--question-limit "$QUESTION_LIMIT")
+fi
 
 export QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB=${QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB:-512}
 export QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=${QW3_FLASHINFER_PREFILL_WORKSPACE_MIB:-192}
@@ -22,8 +33,8 @@ fi
 
 "$PY" "$ROOT/scripts/kvmem_eval/run_memoryagentbench_archive.py" \
   --out-dir "$OUT_DIR" \
-  --selection-manifest \
-    "$ROOT/scripts/kvmem_eval/memoryagentbench_over256k_contexts.jsonl" \
+  --selection-manifest "$SELECTION_MANIFEST" \
+  "${FILTER_ARGS[@]}" \
   --archive-storage cpu-only \
   --tmpfs-limit-gib 60 \
   --block-tokens 32 \
