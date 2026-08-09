@@ -185,11 +185,30 @@ blocks and causes different sample-level regressions.  On this cohort, 128 and
 Three additional formerly truncated Count Frequency (Tool) samples were
 tested.  They all changed from `length` to a short, well-formed `stop`, but
 remained incorrect.  Across the five formerly truncated samples tested in this
-follow-up, only one recovered the correct answer.  The defensible conclusion is
-therefore limited: a tiny recent anchor robustly improves generation stability
-and gave a preliminary +1/4 accuracy gain, but it does not fix the underlying
-retrieval/counting error in most truncated samples.  A full-100 run is required
-before replacing the published K32 utility result.
+follow-up, only one recovered the correct answer.  The small-cohort conclusion
+was therefore deliberately limited: a tiny recent anchor robustly improved
+generation stability, but did not fix the underlying retrieval/counting error
+in most truncated samples.
+
+The subsequent full-100 validation completed in 11.81 hours and confirmed a
+net utility gain:
+
+| Question type | K32 chunked, recent=0 | K32 chunked, recent=128 |
+|---|---:|---:|
+| Count Correctness (Env) | 11/23 | **17/23** |
+| Count Frequency (Env) | 1/10 | **2/10** |
+| Count Frequency (Tool) | 9/22 | 9/22 |
+| Find Duplicates (Tool) | 11/22 | **13/22** |
+| Find Target Offsets (Tool) | **2/23** | 0/23 |
+| **Overall** | **34/100** | **41/100** |
+| `finish_reason=length` | 10/100 | **6/100** |
+
+On identical samples, 19 wrong answers became correct and 12 correct answers
+became wrong, for a net gain of seven.  Thus, retaining four recent blocks is
+an effective K32 default candidate: it improves full-set utility by seven
+percentage points and reduces, but does not eliminate, transcript-continuation
+loops.  The result is still retrieval-sensitive rather than uniformly better:
+Target Offsets regressed, and six outputs still hit the generation limit.
 
 An attempted chunk-local-only 2K pin (cleared before the final query) removed
 the two observed length stops but did not recover either answer.  That engine
@@ -201,6 +220,8 @@ launcher is:
 
 Primary artifacts:
 
+- recent=128 full-100 validation:
+  `/data/chaidi/kvmem_eval/results/agentlongbench_512k_k32_chunked_recent128_full100_20260808`
 - recent=128 four-sample cohort:
   `/data/chaidi/kvmem_eval/results/agentlongbench_512k_k32_chunked_recent128_ab4_20260808`
 - recent=512 four-sample cohort:
