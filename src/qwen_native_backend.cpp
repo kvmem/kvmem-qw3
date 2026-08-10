@@ -10212,7 +10212,8 @@ private:
         }
         const uint32_t query_replay_base = executor_->position();
         const bool query_replay =
-            kvmem_query_replay_enabled() && executor_->kvmem_enabled() &&
+            !semantic_chunk && kvmem_query_replay_enabled() &&
+            executor_->kvmem_enabled() &&
             qc_active && dump == nullptr &&
             options.kvmem_query_begin > 0 &&
             options.kvmem_query_begin >= query_replay_base &&
@@ -10221,7 +10222,7 @@ private:
                 executor_->block_store()->config().gen_budget &&
             executor_->block_store()->config().retrieval_method !=
                 KvMemRetrievalMethod::DeltaNet;
-        if (kvmem_query_replay_enabled() && !query_replay) {
+        if (!semantic_chunk && kvmem_query_replay_enabled() && !query_replay) {
             std::ostringstream rmsg;
             rmsg << "native kvmem query-replay skipped (plain): base="
                  << query_replay_base << " span=[" << options.kvmem_query_begin
@@ -11502,7 +11503,8 @@ private:
         }
         const uint32_t query_replay_base = executor_->position();
         const bool query_replay =
-            kvmem_query_replay_enabled() && kvmem_on && qc_active &&
+            !semantic_chunk && kvmem_query_replay_enabled() && kvmem_on &&
+            qc_active &&
             reset_session && override_executor == nullptr && dump == nullptr &&
             options.kvmem_query_begin > 0 &&
             options.kvmem_query_begin >= query_replay_base &&
@@ -11511,7 +11513,7 @@ private:
                 executor_->block_store()->config().gen_budget &&
             executor_->block_store()->config().retrieval_method !=
                 KvMemRetrievalMethod::DeltaNet;
-        if (kvmem_query_replay_enabled() && reset_session &&
+        if (!semantic_chunk && kvmem_query_replay_enabled() && reset_session &&
             override_executor == nullptr && !query_replay) {
             std::ostringstream rmsg;
             rmsg << "native kvmem query-replay skipped (mtp): base="
