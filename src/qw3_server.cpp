@@ -82,17 +82,6 @@ json usage_json(size_t prompt_tokens, size_t completion_tokens) {
                 {"total_tokens", prompt_tokens + completion_tokens}};
 }
 
-void replace_usage_with_retry(size_t retry_prompt_tokens,
-                              size_t retry_completion_tokens,
-                              size_t &usage_prompt_tokens,
-                              size_t &usage_completion_tokens) {
-    // Standard OpenAI usage describes the attempt that produced the returned
-    // response. A discarded internal repair attempt is server compute, not an
-    // additional conversation turn, and must not inflate client context usage.
-    usage_prompt_tokens = retry_prompt_tokens;
-    usage_completion_tokens = retry_completion_tokens;
-}
-
 bool parse_explicit_max_tokens(const json &req, bool &present, int &value,
                                std::string &error) {
     const char *key = nullptr;
@@ -1146,6 +1135,11 @@ ToolParseResult parse_tool_calls_xml(const std::string &text,
     return result;
 }
 
+std::string tool_call_parse_error_message(const std::string &reason) {
+    return "tool_call_parse_error: " +
+           (reason.empty() ? "tool call could not be parsed" : reason);
+}
+
 json tool_call_delta(const json &calls, size_t begin = 0) {
     json deltas = json::array();
     for (size_t i = begin; i < calls.size(); ++i) {
@@ -1669,22 +1663,6 @@ std::string render_messages(
         }
     }
     return prompt;
-}
-
-std::string render_tool_retry_prompt(
-        json messages, const json *tools, bool enable_thinking,
-        bool preserve_thinking, const std::string &forced_tool_name) {
-    messages.push_back(json{
-        {"role", "user"},
-        {"content",
-         "Your previous response attempted a tool call but its serialization "
-         "could not be parsed. Repeat the same intended tool action once using "
-         "the provided schema. Output one complete <tool_call> block with a "
-         "<function=...> tag and every required <parameter=...> block. Do not "
-         "write any prose before or after the tool call."}});
-    return render_messages(
-        messages, tools, enable_thinking, preserve_thinking,
-        forced_tool_name);
 }
 
 // Apply stop sequences: truncate `text` at the earliest occurrence of any stop
@@ -3137,8 +3115,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         // raw `tools` pointer into `req` would dangle. Capture a by-value copy
         // for schema-driven argument coercion inside the stream callback.
         const json tools_schema = tools ? *tools : json();
-        const json messages_schema = req["messages"];
-
         if (stream) {
             res.set_header("Cache-Control", "no-cache");
             res.set_header("X-Accel-Buffering", "no");
@@ -3148,15 +3124,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                  tool_request, forced_tool_request, tools_schema,
                  stream_include_usage, prompt_token_count, route,
                  fallback_reason, kvmem_session_request,
-                 kvmem_session_reset, messages_schema, preserve_thinking,
-                 forced_tool_name, t0](size_t, httplib::DataSink &sink) {
+                 kvmem_session_reset, t0](size_t, httplib::DataSink &sink) {
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
                     if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
                     std::string utf8_pending;
                     ReasoningStreamSplitter reasoning_splitter(enable_thinking);
                     size_t completion_tokens = 0;
-                    size_t usage_prompt_tokens = prompt_token_count;
                     bool stopped = false;
                     bool client_closed = false;
                     auto last_stream_write = std::chrono::steady_clock::now();
@@ -3214,7 +3188,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"created", created},
                                 {"model", model_id},
                                 {"choices", json::array()},
-                                {"usage", usage_json(usage_prompt_tokens,
+                                {"usage", usage_json(prompt_token_count,
                                                      completion_tokens)}};
                             const std::string us =
                                 "data: " + dump_json(usage) + "\n\n";
@@ -3226,19 +3200,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     };
                     try {
                         auto generate_request =
-                            [&](const std::string &attempt_prompt,
-                                const GenerationOptions &attempt_g,
-                                const CancellableTokenCallback &callback) {
+                            [&](const CancellableTokenCallback &callback) {
                             if (kvmem_session_request) {
                                 eng.generate_session_stream(
-                                    attempt_prompt, attempt_g,
+                                    prompt, g,
                                     [&](const std::string &piece) {
                                         (void)callback(piece);
                                     },
                                     kvmem_session_reset);
                             } else {
                                 eng.generate_stream_cancellable(
-                                    attempt_prompt, attempt_g, callback);
+                                    prompt, g, callback);
                             }
                         };
                         send_role();
@@ -3354,140 +3326,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                              next_progress_tokens);
                                 }
                             };
-                            auto retry_tool_call =
-                                [&](const std::string &first_error) {
-                                if (kvmem_session_request) {
-                                    throw std::runtime_error(
-                                        "tool_call_parse_error: retry is not "
-                                        "available for explicit KVMem sessions");
-                                }
-                                const std::string retry_prompt =
-                                    render_tool_retry_prompt(
-                                        messages_schema,
-                                        tools_schema.is_array()
-                                            ? &tools_schema : nullptr,
-                                        enable_thinking, preserve_thinking,
-                                        forced_tool_name);
-                                const size_t retry_prompt_tokens =
-                                    usage_tokenizer.encode(retry_prompt).size();
-                                if (retry_prompt_tokens >=
-                                    static_cast<size_t>(engine.ctx_size)) {
-                                    throw std::runtime_error(
-                                        "tool_call_parse_error: retry prompt "
-                                        "exceeds the KV context");
-                                }
-                                GenerationOptions retry_g = g;
-                                retry_g.max_tokens = std::min(
-                                    retry_g.max_tokens,
-                                    static_cast<int>(
-                                        engine.ctx_size -
-                                        retry_prompt_tokens));
-                                if (retry_g.max_tokens <= 0) {
-                                    throw std::runtime_error(
-                                        "tool_call_parse_error: no context "
-                                        "space remains for retry");
-                                }
-                                std::cerr << "[qw3-serve] #" << rid
-                                          << " tool_retry attempt=1 reason="
-                                          << dump_json(first_error)
-                                          << " prompt_tokens="
-                                          << retry_prompt_tokens << "\n";
-
-                                std::string retry_acc;
-                                bool retry_stopped = false;
-                                size_t retry_completion_tokens = 0;
-                                auto retry_last_write =
-                                    std::chrono::steady_clock::now();
-                                generate_request(
-                                    retry_prompt, retry_g,
-                                    [&](const std::string &piece) {
-                                        if (client_closed) return false;
-                                        ++retry_completion_tokens;
-                                        retry_acc += piece;
-                                        if (!stops.empty()) {
-                                            std::string probe = retry_acc;
-                                            if (apply_stops(probe, stops)) {
-                                                retry_acc = std::move(probe);
-                                                retry_stopped = true;
-                                                return false;
-                                            }
-                                        }
-                                        const auto now =
-                                            std::chrono::steady_clock::now();
-                                        if (now - retry_last_write >=
-                                            kToolHeartbeatInterval) {
-                                            send_delta(json::object());
-                                            retry_last_write = now;
-                                        }
-                                        return !client_closed;
-                                    });
-                                if (client_closed) return false;
-
-                                std::string retry_utf8;
-                                std::string retry_text =
-                                    take_complete_utf8(
-                                        retry_utf8, retry_acc);
-                                retry_text += flush_utf8_pending(
-                                    retry_utf8, false);
-                                const std::string retry_framed =
-                                    enable_thinking
-                                        ? ("<think>\n" + retry_text)
-                                        : retry_text;
-                                const ToolParseResult retry_result =
-                                    parse_tool_calls_xml(
-                                        retry_framed,
-                                        tools_schema.is_array()
-                                            ? &tools_schema : nullptr);
-                                if (!retry_result.intent_detected ||
-                                    !retry_result.valid ||
-                                    retry_result.calls.empty()) {
-                                    const std::string reason =
-                                        retry_result.error.empty()
-                                            ? "retry produced no tool call"
-                                            : retry_result.error;
-                                    throw std::runtime_error(
-                                        "tool_call_parse_error: retry failed: " +
-                                        reason);
-                                }
-                                const size_t discarded_completion_tokens =
-                                    completion_tokens;
-                                replace_usage_with_retry(
-                                    retry_prompt_tokens,
-                                    retry_completion_tokens,
-                                    usage_prompt_tokens,
-                                    completion_tokens);
-                                const ReasoningSplit retry_split =
-                                    split_reasoning(retry_framed);
-                                if (!retry_split.reasoning.empty()) {
-                                    send_delta(json{{"reasoning_content",
-                                                     retry_split.reasoning}});
-                                }
-                                send_delta(
-                                    tool_call_delta(retry_result.calls));
-                                std::cerr << "[qw3-serve] #" << rid
-                                          << " tool_retry_success calls="
-                                          << tool_calls_debug_summary(
-                                                 retry_result.calls)
-                                          << " finish="
-                                          << generation_finish_reason(
-                                                 retry_stopped,
-                                                 retry_completion_tokens,
-                                                 retry_g.max_tokens)
-                                          << " usage_prompt_tokens="
-                                          << usage_prompt_tokens
-                                          << " usage_completion_tokens="
-                                          << completion_tokens
-                                          << " discarded_prompt_tokens="
-                                          << prompt_token_count
-                                          << " discarded_completion_tokens="
-                                          << discarded_completion_tokens
-                                          << "\n";
-                                send_done("tool_calls");
-                                return true;
-                            };
-
-                            generate_request(
-                                prompt, g, [&](const std::string &piece) {
+                            generate_request([&](const std::string &piece) {
                                 if (stopped || client_closed) return false;
                                 ++completion_tokens;
                                 acc += piece;
@@ -3565,7 +3404,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             }
 
                             if (buffering_tool) {
-                                const bool first_hit_length =
+                                const bool hit_max_tokens =
                                     g.max_tokens > 0 &&
                                     completion_tokens >=
                                         static_cast<size_t>(g.max_tokens);
@@ -3573,22 +3412,20 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 if (!incremental.fatal()) {
                                     incremental.finish(
                                         tool_delta_committed &&
-                                            !first_hit_length,
+                                            !hit_max_tokens,
                                         closure_suffix);
                                 }
                                 if (incremental.fatal()) {
                                     if (!tool_delta_committed) {
-                                        if (first_hit_length) {
+                                        if (hit_max_tokens) {
                                             throw std::runtime_error(
                                                 "tool_call_parse_error: tool "
                                                 "call was truncated at "
                                                 "max_tokens");
                                         }
-                                        if (retry_tool_call(
-                                                incremental.error())) {
-                                            return true;
-                                        }
-                                        return true;
+                                        throw std::runtime_error(
+                                            tool_call_parse_error_message(
+                                                incremental.error()));
                                     }
                                     throw std::runtime_error(
                                         "tool_call_parse_error: committed "
@@ -3640,16 +3477,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                             ? "tool intent produced no call"
                                             : parsed.error;
                                     if (!tool_delta_committed) {
-                                        if (first_hit_length) {
+                                        if (hit_max_tokens) {
                                             throw std::runtime_error(
                                                 "tool_call_parse_error: tool "
                                                 "call was truncated at "
                                                 "max_tokens");
                                         }
-                                        if (retry_tool_call(parse_error)) {
-                                            return true;
-                                        }
-                                        return true;
+                                        throw std::runtime_error(
+                                            tool_call_parse_error_message(
+                                                parse_error));
                                     }
                                     throw std::runtime_error(
                                         "tool_call_parse_error: committed "
@@ -3670,17 +3506,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                             parsed.calls,
                                             validation_error)) {
                                         if (!tool_delta_committed) {
-                                            if (first_hit_length) {
+                                            if (hit_max_tokens) {
                                                 throw std::runtime_error(
                                                     "tool_call_parse_error: "
                                                     "tool call was truncated "
                                                     "at max_tokens");
                                             }
-                                            if (retry_tool_call(
-                                                    validation_error)) {
-                                                return true;
-                                            }
-                                            return true;
+                                            throw std::runtime_error(
+                                                tool_call_parse_error_message(
+                                                    validation_error));
                                         }
                                         throw std::runtime_error(
                                             "tool_call_parse_error: "
@@ -3719,12 +3553,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         "tool_call_parse_error: forced tool "
                                         "call was truncated at max_tokens");
                                 }
-                                if (retry_tool_call(
+                                throw std::runtime_error(
+                                    tool_call_parse_error_message(
                                         "forced tool choice produced no "
-                                        "<tool_call> block")) {
-                                    return true;
-                                }
-                                return true;
+                                        "<tool_call> block"));
                             } else {
                                 if (!content_pending.empty()) {
                                     emit_text(content_pending);
@@ -3744,8 +3576,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                       << "\n";
                             return true;
                         }
-                        generate_request(
-                            prompt, g, [&](const std::string &piece) {
+                        generate_request([&](const std::string &piece) {
                             if (stopped || client_closed) return false;
                             ++completion_tokens;
                             acc += piece;
@@ -3800,68 +3631,50 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
 
-        std::string raw_text;
+        std::string text;
         size_t completion_tokens = 0;
-        size_t final_completion_tokens = 0;
-        size_t usage_prompt_tokens = prompt_token_count;
-        int final_max_tokens = g.max_tokens;
         std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
         if (!g.continuous_batching) gen_lk.lock();
-        auto generate_buffered =
-            [&](const std::string &attempt_prompt,
-                const GenerationOptions &attempt_g,
-                std::string &output,
-                size_t &attempt_tokens,
-                bool session_request) {
-                if (session_request) {
-                    eng.generate_session_stream(
-                        attempt_prompt, attempt_g,
-                        [&](const std::string &piece) {
-                            ++attempt_tokens;
-                            output += piece;
-                        },
-                        kvmem_session_reset);
-                } else {
-                    eng.generate_stream_cancellable(
-                        attempt_prompt, attempt_g,
-                        [&](const std::string &piece) {
-                            ++attempt_tokens;
-                            output += piece;
-                            return true;
-                        });
-                }
-            };
         try {
-            generate_buffered(
-                prompt, g, raw_text, final_completion_tokens,
-                kvmem_session_request);
-            completion_tokens = final_completion_tokens;
+            if (kvmem_session_request) {
+                eng.generate_session_stream(
+                    prompt, g,
+                    [&](const std::string &piece) {
+                        ++completion_tokens;
+                        text += piece;
+                    },
+                    kvmem_session_reset);
+            } else {
+                eng.generate_stream_cancellable(
+                    prompt, g,
+                    [&](const std::string &piece) {
+                        ++completion_tokens;
+                        text += piece;
+                        return true;
+                    });
+            }
         } catch (const std::exception &e) {
             std::cerr << "[qw3-serve] #" << rid << " chat error="
                       << e.what() << "\n";
             set_error_response(res, status_for_exception(e), e.what());
             return;
         }
-        auto frame_output = [&](const std::string &raw, int max_tokens) {
-            std::string framed =
-                enable_thinking && max_tokens > 0
-                    ? ("<think>\n" + raw) : raw;
-            std::string pending;
-            framed = take_complete_utf8(pending, framed);
-            framed += flush_utf8_pending(pending, false);
-            return framed;
-        };
-        std::string text = frame_output(raw_text, g.max_tokens);
-        bool stopped = apply_stops(text, stops);
+        if (enable_thinking && g.max_tokens > 0) {
+            text = "<think>\n" + text;
+        }
+        std::string utf8_pending;
+        text = take_complete_utf8(utf8_pending, text);
+        text += flush_utf8_pending(utf8_pending, false);
+        const bool stopped = apply_stops(text, stops);
         ToolParseResult parsed = parse_tool_calls_xml(text, tools);
-        const bool retry_needed =
+        const bool tool_parse_failed =
             tool_request &&
             ((parsed.intent_detected && (!parsed.valid ||
                                          parsed.calls.empty())) ||
              (forced_tool_request && parsed.calls.empty()));
-        if (retry_needed) {
+        if (tool_parse_failed) {
             if (g.max_tokens > 0 &&
-                final_completion_tokens >=
+                completion_tokens >=
                     static_cast<size_t>(g.max_tokens)) {
                 set_error_response(
                     res, 500,
@@ -3869,85 +3682,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     "max_tokens");
                 return;
             }
-            if (kvmem_session_request) {
-                set_error_response(
-                    res, 500,
-                    "tool_call_parse_error: retry is not available for "
-                    "explicit KVMem sessions");
-                return;
-            }
-            try {
-                const std::string retry_prompt =
-                    render_tool_retry_prompt(
-                        messages_schema, tools, enable_thinking,
-                        preserve_thinking, forced_tool_name);
-                const size_t retry_prompt_tokens =
-                    usage_tokenizer.encode(retry_prompt).size();
-                if (retry_prompt_tokens >=
-                    static_cast<size_t>(engine.ctx_size)) {
-                    throw std::runtime_error(
-                        "retry prompt exceeds the KV context");
-                }
-                GenerationOptions retry_g = g;
-                retry_g.max_tokens = std::min(
-                    retry_g.max_tokens,
-                    static_cast<int>(
-                        engine.ctx_size - retry_prompt_tokens));
-                if (retry_g.max_tokens <= 0) {
-                    throw std::runtime_error(
-                        "no context space remains for retry");
-                }
-                std::cerr << "[qw3-serve] #" << rid
-                          << " tool_retry attempt=1 reason="
-                          << dump_json(
-                                 parsed.error.empty()
-                                     ? "forced tool choice produced no call"
-                                     : parsed.error)
-                          << " prompt_tokens=" << retry_prompt_tokens
-                          << "\n";
-                std::string retry_raw;
-                size_t retry_completion_tokens = 0;
-                generate_buffered(
-                    retry_prompt, retry_g, retry_raw,
-                    retry_completion_tokens, false);
-                const size_t discarded_completion_tokens =
-                    completion_tokens;
-                replace_usage_with_retry(
-                    retry_prompt_tokens, retry_completion_tokens,
-                    usage_prompt_tokens, completion_tokens);
-                text = frame_output(retry_raw, retry_g.max_tokens);
-                stopped = apply_stops(text, stops);
-                parsed = parse_tool_calls_xml(text, tools);
-                if (!parsed.intent_detected || !parsed.valid ||
-                    parsed.calls.empty()) {
-                    throw std::runtime_error(
-                        parsed.error.empty()
-                            ? "retry produced no tool call"
-                            : parsed.error);
-                }
-                final_completion_tokens = retry_completion_tokens;
-                final_max_tokens = retry_g.max_tokens;
-                std::cerr << "[qw3-serve] #" << rid
-                          << " tool_retry_success calls="
-                          << tool_calls_debug_summary(parsed.calls)
-                          << " usage_prompt_tokens="
-                          << usage_prompt_tokens
-                          << " usage_completion_tokens="
-                          << completion_tokens
-                          << " discarded_prompt_tokens="
-                          << prompt_token_count
-                          << " discarded_completion_tokens="
-                          << discarded_completion_tokens
-                          << "\n";
-            } catch (const std::exception &e) {
-                const std::string error =
-                    std::string("tool_call_parse_error: retry failed: ") +
-                    e.what();
-                std::cerr << "[qw3-serve] #" << rid << " " << error
-                          << "\n";
-                set_error_response(res, 500, error);
-                return;
-            }
+            const std::string error = tool_call_parse_error_message(
+                parsed.error.empty()
+                    ? "forced tool choice produced no call"
+                    : parsed.error);
+            std::cerr << "[qw3-serve] #" << rid << " " << error << "\n";
+            set_error_response(res, 500, error);
+            return;
         }
         const double ms =
             std::chrono::duration<double, std::milli>(
@@ -3969,7 +3710,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             message["reasoning_content"] = split.reasoning;
         }
         std::string finish = generation_finish_reason(
-            stopped, final_completion_tokens, final_max_tokens);
+            stopped, completion_tokens, g.max_tokens);
         if (!parsed.calls.empty()) {
             std::cerr << "[qw3-serve] #" << rid
                       << " tool_calls="
@@ -3985,7 +3726,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 {"index", 0},
                 {"message", message},
                 {"finish_reason", finish}}})},
-            {"usage", usage_json(usage_prompt_tokens, completion_tokens)}};
+            {"usage", usage_json(prompt_token_count, completion_tokens)}};
         res.set_content(dump_json(out), "application/json");
     });
 

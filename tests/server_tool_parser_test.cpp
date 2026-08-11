@@ -54,7 +54,7 @@ void test_valid_and_no_intent() {
     }
 }
 
-void test_missing_function_inference_and_retry_case() {
+void test_missing_function_inference_and_ambiguous_case() {
     const std::string missing_function =
         "<tool_call>"
         "<parameter=path>/tmp/a</parameter>"
@@ -75,7 +75,7 @@ void test_missing_function_inference_and_retry_case() {
         qw3::parse_tool_calls_xml(missing_function, &ambiguous_tools);
     if (!ambiguous.intent_detected || ambiguous.valid ||
         !ambiguous.calls.empty()) {
-        fail("ambiguous missing function name did not request retry");
+        fail("ambiguous missing function name was not rejected");
     }
 }
 
@@ -119,22 +119,18 @@ void test_schema_validation() {
     }
 }
 
-void test_incomplete_block_and_retry_prompt() {
+void test_incomplete_block_fails_closed() {
     const json tools = json::array({write_tool()});
     const auto incomplete = qw3::parse_tool_calls_xml(
         "<tool_call><parameter=path>/tmp/a</parameter>", &tools);
     if (!incomplete.intent_detected || incomplete.valid) {
-        fail("incomplete tool block did not request retry");
+        fail("incomplete tool block was not rejected");
     }
-
-    const json messages =
-        json::array({json{{"role", "user"}, {"content", "write a file"}}});
-    const std::string prompt = qw3::render_tool_retry_prompt(
-        messages, &tools, false, false, {});
-    if (prompt.find("previous response attempted a tool call") ==
-            std::string::npos ||
-        prompt.find("<function=...>") == std::string::npos) {
-        fail("retry prompt is missing the generic repair instruction");
+    const std::string error =
+        qw3::tool_call_parse_error_message(incomplete.error);
+    if (error !=
+        "tool_call_parse_error: incomplete <tool_call> block") {
+        fail("malformed tool call did not produce a stable parse error");
     }
 }
 
@@ -167,6 +163,21 @@ void test_incremental_commit_gate() {
         json::parse(call["function"].value("arguments", ""));
     if (arguments.value("content", "") != "hello") {
         fail("repaired incremental call lost its content");
+    }
+}
+
+void test_uncommitted_call_is_not_silently_repaired() {
+    const json tools = json::array({write_tool()});
+    qw3::IncrementalToolCallStream stream(&tools);
+    stream.feed(
+        "<tool_call><function=write>"
+        "<parameter=path>/tmp/a</parameter>"
+        "<parameter=content>partial");
+
+    std::string suffix;
+    stream.finish(false, suffix);
+    if (!stream.fatal() || !suffix.empty()) {
+        fail("uncommitted partial tool call was silently repaired");
     }
 }
 
@@ -222,29 +233,16 @@ void test_latest_external_input_query() {
         2, 3, true);
 }
 
-void test_retry_usage_replaces_discarded_attempt() {
-    size_t prompt_tokens = 133842;
-    size_t completion_tokens = 7300;
-    qw3::replace_usage_with_retry(
-        133910, 812, prompt_tokens, completion_tokens);
-    const json usage = qw3::usage_json(prompt_tokens, completion_tokens);
-    if (usage.value("prompt_tokens", 0) != 133910 ||
-        usage.value("completion_tokens", 0) != 812 ||
-        usage.value("total_tokens", 0) != 134722) {
-        fail("internal retry work inflated response usage");
-    }
-}
-
 } // namespace
 
 int main() {
     test_valid_and_no_intent();
-    test_missing_function_inference_and_retry_case();
+    test_missing_function_inference_and_ambiguous_case();
     test_schema_validation();
-    test_incomplete_block_and_retry_prompt();
+    test_incomplete_block_fails_closed();
     test_incremental_commit_gate();
+    test_uncommitted_call_is_not_silently_repaired();
     test_latest_external_input_query();
-    test_retry_usage_replaces_discarded_attempt();
     std::cout << "server_tool_parser_test: ok\n";
     return 0;
 }
