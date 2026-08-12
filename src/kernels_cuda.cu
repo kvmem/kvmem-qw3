@@ -14742,7 +14742,8 @@ public:
             uint32_t k_stride, uint32_t batch, uint32_t blk_tokens,
             uint32_t first_block_token_offset, uint32_t n_kv_heads,
             uint32_t head_dim, uint32_t rope_dim, int32_t rope_base,
-            float theta, uint32_t n_subblocks = 1) override {
+            float theta, uint32_t n_subblocks = 1,
+            uint32_t src_row_off = 0) override {
         if (n_blocks_chunk == 0 || n_kv_heads == 0 || head_dim == 0 ||
             batch == 0) {
             return {};
@@ -14757,12 +14758,14 @@ public:
             return {false,
                     "block_kmean_content_batch_merge_device offset out of range"};
         }
+        const float *k_ptr = kbt.ptr +
+            static_cast<uint64_t>(src_row_off) * k_stride;
         const ported::KbarDType kbar_dtype =
             kb.is_fp8_kv() ? ported::KbarDType::FP8
                            : kb.is_fp16() ? ported::KbarDType::F16
                                          : ported::KbarDType::F32;
         if (!ported::launch_block_kmean_content_batch_merge_typed(
-                kbt.ptr, kb.ptr, kbar_dtype, kbar_block_base,
+                k_ptr, kb.ptr, kbar_dtype, kbar_block_base,
                 n_blocks_chunk, k_stride,
                 batch, blk_tokens, first_block_token_offset, n_kv_heads,
                 head_dim, rope_dim, rope_base, theta, n_subblocks,

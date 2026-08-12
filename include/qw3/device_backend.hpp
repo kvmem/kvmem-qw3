@@ -1362,12 +1362,13 @@ public:
             uint32_t rope_dim,
             int32_t rope_base,
             float theta,
-            uint32_t n_subblocks = 1) {
+            uint32_t n_subblocks = 1,
+            uint32_t src_row_off = 0) {
         (void)k_batch; (void)kbar; (void)kbar_block_base;
         (void)n_blocks_chunk; (void)k_stride; (void)batch;
         (void)blk_tokens; (void)first_block_token_offset;
         (void)n_kv_heads; (void)head_dim; (void)rope_dim;
-        (void)rope_base; (void)theta; (void)n_subblocks;
+        (void)rope_base; (void)theta; (void)n_subblocks; (void)src_row_off;
         return {false,
                 "block_kmean_content_batch_merge_device requires backend override"};
     }

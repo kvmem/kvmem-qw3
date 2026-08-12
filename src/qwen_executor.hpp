@@ -417,6 +417,20 @@ public:
                               uint32_t index_tokens = 0,
                               bool preserve_content_index = false,
                               bool capture_content_without_query = false); // before prefill
+    uint32_t kvmem_mean_index_valid_tokens() const {
+        return kvmem_mean_index_valid_tokens_;
+    }
+    bool kvmem_mean_index_covers(uint32_t tokens) const {
+        return tokens <= kvmem_mean_index_valid_tokens_ &&
+            kvmem_qc_layer_stride_blocks_ != 0 &&
+            kvmem_has_mean_index_storage();
+    }
+    // Finish the position-invariant mean-K authority before a warm M checkpoint
+    // is committed. MTP verification is speculative, so its accepted suffix is
+    // rebuilt from immutable raw-K here instead of mutating the index mid-verify.
+    // Returns false when the index cannot safely cover position(); callers may
+    // retain an earlier P/Q checkpoint without failing the user request.
+    bool kvmem_finalize_mean_index_for_warm_checkpoint();
     uint32_t kvmem_query_expected_tokens() const {
         return kvmem_query_end_ > kvmem_query_begin_
             ? kvmem_query_end_ - kvmem_query_begin_ : 0;
@@ -1564,6 +1578,11 @@ private:
     uint32_t kvmem_qc_prompt_tokens_ = 0;                      // exact final logical prompt length
     uint32_t kvmem_qc_captured_blocks_ = 0;                    // blocks captured so far (slot 0)
     uint32_t kvmem_qc_captured_tokens_ = 0;                    // exact contiguous prefix represented by the index
+    // Persistent coverage watermark for the sidecar mean-K authority. Unlike
+    // g_kbar_multi_ready_ (published for the current scorer), this survives a
+    // warm truncate and proves whether a restored checkpoint can seed suffix
+    // capture without leaving an uncaptured prefix hole.
+    uint32_t kvmem_mean_index_valid_tokens_ = 0;
     // Fixed per-layer stride (in blocks) of g_kbar_multi_, pinned at ctx_blocks
     // (ceil(kv_ctx_size_/block_tokens)) for the whole session so preserved [0,D)
     // index slices stay valid as the block count grows across resumed turns
@@ -1571,12 +1590,10 @@ private:
     // scorer passes it as kbar_layer_stride while g_kbar_multi_blocks_ stays the
     // scored count. Legacy (non-resumable) turns leave it == the turn's block count.
     uint32_t kvmem_qc_layer_stride_blocks_ = 0;
-    // Set by kvmem_truncate_to when a truncate drops ZERO blocks (pure append /
-    // session resume): the resident token length that the preserved [0,D) index
-    // already covers. Consumed + cleared at the top of kvmem_set_query_span, where
-    // it seeds kvmem_qc_captured_blocks_ = resume/block_tokens and suppresses the
-    // full-buffer zero so only the new suffix's blocks are (re)captured. 0 on a cold
-    // turn (reset_state / a dropping truncate), which zeroes the whole index.
+    // Set by kvmem_truncate_to on a warm restore: the token length requested by
+    // the checkpoint. kvmem_set_query_span consumes it only when the persistent
+    // mean-K coverage watermark proves [0,D) is intact; otherwise suffix capture
+    // starts from zero rather than accepting a hole.
     uint32_t kvmem_qc_resume_base_tokens_ = 0;
     // Diagnostics-only metadata copied from GenerationOptions once per request.
     std::string kvmem_trace_tag_;
@@ -1586,12 +1603,10 @@ private:
     uint32_t kvmem_trace_event_count_ = 0;
     std::vector<uint32_t> kvmem_trace_prompt_tokens_;
 public:
-    // Enable/disable decode-time content capture around the (plain) decode loop.
-    // The server-side session-continuation path enables it before decoding an
-    // above-budget query-conditioned turn and disables (+ finalizes the trailing
-    // partial block) after, so the turn's generated blocks are indexed for the
-    // NEXT turn's reuse. No-op unless kvmem + a QC span + the fixed-stride index
-    // are live; safe to call unconditionally.
+    // Enable/disable decode-time content capture around the plain decode loop.
+    // Content-only capture below the selection budget is also eligible: query
+    // scoring stays off, but the generated suffix remains reusable if a later
+    // turn crosses the budget. Safe to call unconditionally.
     void kvmem_decode_capture_begin();
     void kvmem_decode_capture_finalize();
     // Per-std-layer decode hook: stage the just-RoPE'd K row (k_) for this token,
@@ -1602,22 +1617,23 @@ public:
 private:
     // ---- Decode-time content capture (server-side session continuation) -------
     // The incremental prefill capture (kvmem_capture_kbar_multi) only runs during
-    // prefill, so a turn's generated tokens are never indexed. Above budget they
-    // land in the preserved [0,D) region on the next resume turn but would stay
-    // zero-ranked (unselectable), breaking reuse==fresh equivalence. So above budget
-    // we index each generated block DURING decode as it completes. Decode K is
+    // prefill. Plain decode therefore extends the same authority as tokens commit.
+    // Decode K is
     // window-baked at a position that RESELECT re-bakes mid-block (interval < block
     // size), so contiguous-position batch de-RoPE is unsafe; instead each token's K
     // is de-RoPE'd at its OWN bake position the moment it is produced (reselect-
     // immune, since the content frame is position-invariant) and the resulting
     // content-frame rows are staged here [L, block_tokens, n_kv_heads*head_dim] fp32.
-    // On block completion the staged rows are meaned (rope_dim==0, no further rotate)
-    // into g_kbar_multi_[slot*stride + true_block_index]. Allocated lazily on the
-    // first above-budget decode; unused (and un-allocated) below budget / off / MTP.
-    void kvmem_capture_decode_block(uint32_t true_block_index, uint32_t rows);
+    // On block completion the staged rows are merged with any prefill prefix of
+    // the same block (rope_dim==0) and written into the mean-K authority.
+    void kvmem_capture_decode_block(uint32_t true_block_index,
+                                    uint32_t first_row,
+                                    uint32_t rows);
+    bool kvmem_refresh_mean_index_from_raw(uint32_t target_tokens);
     std::unique_ptr<DeviceTensor> g_kbar_decode_stage_;        // [L, block_tokens, n_kv_heads*head_dim] fp32 content-frame rows
-    bool kvmem_decode_capture_on_ = false;                     // enabled by kvmem_decode_capture_begin (plain above-budget QC turn)
-    bool decode_stage_active_ = false;                         // currently staging a block started at its first (offset-0) token
+    bool kvmem_decode_capture_on_ = false;
+    bool decode_stage_active_ = false;
+    uint32_t decode_stage_first_row_ = 0;
     uint32_t decode_stage_rows_ = 0;                           // content-frame rows staged in the current block
     uint32_t decode_stage_block_ = 0;                          // TRUE block index currently being staged
 

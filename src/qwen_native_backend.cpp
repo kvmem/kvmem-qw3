@@ -999,6 +999,13 @@ constexpr bool kvmem_prefix_checkpoint_reusable(uint32_t checkpoint,
     return checkpoint <= resume_ceiling && checkpoint < prompt_tokens;
 }
 
+constexpr bool kvmem_mean_index_checkpoint_covered(
+        bool required, uint32_t checkpoint, uint32_t checkpoint_coverage,
+        uint32_t live_coverage) {
+    return !required ||
+        (checkpoint_coverage >= checkpoint && live_coverage >= checkpoint);
+}
+
 enum class KvmemWarmCheckpoint : uint8_t {
     None = 0,
     Query,
@@ -1029,6 +1036,8 @@ struct KvmemWarmGeneration {
     KvmemWarmCheckpoint fallback_kind = KvmemWarmCheckpoint::None;
     uint32_t fallback_pos = 0;
     uint32_t end_pos = 0;
+    uint32_t fallback_mean_index_tokens = 0;
+    uint32_t end_mean_index_tokens = 0;
     bool fallback_resumable = false;
     bool end_resumable = false;
     bool valid = false;
@@ -1041,6 +1050,8 @@ struct KvmemWarmGeneration {
         fallback_kind = KvmemWarmCheckpoint::None;
         fallback_pos = 0;
         end_pos = 0;
+        fallback_mean_index_tokens = 0;
+        end_mean_index_tokens = 0;
         fallback_resumable = false;
         end_resumable = false;
         valid = false;
@@ -1093,6 +1104,14 @@ static_assert(kvmem_prefix_resume_ceiling(4096, true, 17, 32) == 0);
 static_assert(kvmem_prefix_checkpoint_reusable(2976, 4096, 2976));
 static_assert(!kvmem_prefix_checkpoint_reusable(3008, 4096, 2976));
 static_assert(!kvmem_prefix_checkpoint_reusable(4096, 4096, 4096));
+static_assert(!kvmem_mean_index_checkpoint_covered(
+    true, 48384, 0, 0));
+static_assert(kvmem_mean_index_checkpoint_covered(
+    true, 48384, 48384, 51769));
+static_assert(kvmem_mean_index_checkpoint_covered(
+    false, 48384, 0, 0));
+static_assert(!kvmem_mean_index_checkpoint_covered(
+    true, 52000, 51769, 51769));
 static_assert(
     kvmem_choose_warm_checkpoint(
         71702, 58784, 58784, KvmemWarmCheckpoint::Query, true,
@@ -7483,6 +7502,13 @@ private:
         kvmem_warm_staging_.reset_for_staging();
     }
 
+    bool kvmem_eager_mean_index_enabled() const {
+        return kvmem_prefix_cache_enabled() &&
+            options_.kvmem_enabled && options_.kvmem_query_conditioned &&
+            options_.kvmem_method == "retrieval" &&
+            options_.kvmem_retrieval_method == "mean-k";
+    }
+
     void kvmem_warm_invalidate_committed(const char *reason) {
         if (kvmem_warm_committed_.valid &&
             kvmem_prefix_cache_trace_enabled()) {
@@ -7586,6 +7612,8 @@ private:
         }
         kvmem_warm_staging_.fallback_kind = kind;
         kvmem_warm_staging_.fallback_pos = position;
+        kvmem_warm_staging_.fallback_mean_index_tokens =
+            executor->kvmem_mean_index_valid_tokens();
         kvmem_warm_staging_.fallback_resumable = true;
         if (kvmem_prefix_cache_trace_enabled()) {
             log("kvmem prefix-cache STAGE F=" +
@@ -7609,6 +7637,20 @@ private:
             return false;
         }
         stage.log.resize(pos);
+        if (kvmem_eager_mean_index_enabled()) {
+            try {
+                (void)executor->kvmem_finalize_mean_index_for_warm_checkpoint();
+            } catch (const std::exception &e) {
+                if (kvmem_prefix_cache_trace_enabled() ||
+                    std::getenv("QW3_KVMEM_TRACE")) {
+                    log(std::string("kvmem prefix-cache mean-K finalize "
+                                    "failed; M remains state-only: ") +
+                        e.what());
+                }
+            }
+        }
+        stage.end_mean_index_tokens =
+            executor->kvmem_mean_index_valid_tokens();
         executor->capture_state_to_host(stage.end);
         if (!stage.end.ready || stage.end.position != pos ||
             (stage.fallback_resumable &&
@@ -7636,7 +7678,11 @@ private:
                  << kvmem_warm_checkpoint_name(
                         kvmem_warm_committed_.fallback_kind)
                  << " F_pos=" << kvmem_warm_committed_.fallback_pos
+                 << " F_mean_tokens="
+                 << kvmem_warm_committed_.fallback_mean_index_tokens
                  << " M=" << kvmem_warm_committed_.end_pos
+                 << " M_mean_tokens="
+                 << kvmem_warm_committed_.end_mean_index_tokens
                  << " M_resumable="
                  << (kvmem_warm_committed_.end_resumable ? 1 : 0)
                  << " pinned_bytes=" << pinned_bytes;
@@ -7709,6 +7755,23 @@ private:
         // budget the index is unused, so the guard only bites above budget.
         const bool qc_pertoken_block =
             qc_active && executor_ && executor_->kvmem_qc_pertoken();
+        const bool require_mean_index = kvmem_eager_mean_index_enabled();
+        const auto mean_index_covers =
+            [&](uint32_t position, uint32_t checkpoint_coverage) {
+                return kvmem_mean_index_checkpoint_covered(
+                    require_mean_index, position, checkpoint_coverage,
+                    executor_->kvmem_mean_index_valid_tokens()) &&
+                    (!require_mean_index ||
+                     executor_->kvmem_mean_index_covers(position));
+            };
+        const bool fallback_resumable =
+            !qc_pertoken_block && warm.fallback_resumable &&
+            mean_index_covers(warm.fallback_pos,
+                              warm.fallback_mean_index_tokens);
+        const bool end_resumable =
+            !qc_pertoken_block && warm.end_resumable &&
+            mean_index_covers(warm.end_pos,
+                              warm.end_mean_index_tokens);
         const size_t lim = std::min(warm.log.size(), prompt.size());
         size_t D = 0;
         while (D < lim && warm.log[D] == prompt[D]) ++D;
@@ -7739,19 +7802,19 @@ private:
         result.checkpoint_after_query_boundary =
             checkpoint_crosses_query_boundary(
                 warm.end_pos,
-                !qc_pertoken_block && warm.end_resumable) ||
+                end_resumable) ||
             checkpoint_crosses_query_boundary(
                 warm.fallback_pos,
-                !qc_pertoken_block && warm.fallback_resumable);
+                fallback_resumable);
         // F is Q on a resumable query-replay turn and P otherwise. M remains the
         // preferred exact turn-end continuation.
         const KvmemWarmCheckpointChoice choice =
             kvmem_choose_warm_checkpoint(
                 static_cast<uint32_t>(prompt.size()), resume_ceiling,
                 warm.fallback_pos, warm.fallback_kind,
-                !qc_pertoken_block && warm.fallback_resumable,
+                fallback_resumable,
                 warm.end_pos,
-                !qc_pertoken_block && warm.end_resumable);
+                end_resumable);
         if (choice.position > 0) {
             result.c = choice.position;
             result.checkpoint = choice.checkpoint;
@@ -7771,15 +7834,22 @@ private:
                  << kvmem_warm_checkpoint_name(warm.fallback_kind)
                  << " F_pos=" << warm.fallback_pos
                  << " F_resumable=" << (warm.fallback_resumable ? 1 : 0)
+                 << " F_mean_tokens=" << warm.fallback_mean_index_tokens
                  << " M=" << warm.end_pos
                  << " M_resumable=" << (warm.end_resumable ? 1 : 0)
+                 << " M_mean_tokens=" << warm.end_mean_index_tokens
+                 << " live_mean_tokens="
+                 << executor_->kvmem_mean_index_valid_tokens()
                  << " generation=" << warm.generation
                  << " warm_log=" << warm.log.size()
                  << " prompt=" << prompt.size()
                  << " reason="
                  << (result.checkpoint_after_query_boundary
                          ? "checkpoint_after_query_boundary"
-                         : "no_reusable_checkpoint");
+                         : (require_mean_index &&
+                            !fallback_resumable && !end_resumable
+                                ? "mean_index_not_covered"
+                                : "no_reusable_checkpoint"));
             log(mmsg.str());
         }
         return result;
@@ -8369,7 +8439,11 @@ private:
             // Below budget (or no span): clear any residual span/g_query_multi
             // so kvmem_prepare_reselect keeps the single-token identity path.
             executor_->kvmem_set_query_span(
-                0, 0, static_cast<uint32_t>(prompt_tokens.size()));
+                0, 0, static_cast<uint32_t>(prompt_tokens.size()),
+                /*index_tokens=*/0,
+                /*preserve_content_index=*/false,
+                /*capture_content_without_query=*/
+                    kvmem_eager_mean_index_enabled());
         }
 
         const double t_prefill_start = wall_seconds();
@@ -9063,9 +9137,9 @@ private:
             ++decoded;
             if (on_text && !on_text(piece)) stream_cancelled = true;
         }
-        // Above-budget QC: index generated tokens as decode produces them so the
-        // next turn's preserved [0,D) slices cover the response too (Gap A). No-op
-        // unless kvmem + above budget + mean-k (guards inside begin()).
+        // Extend an active mean-K authority through generated tokens. This also
+        // runs below budget when eager warm indexing is enabled, so a later turn
+        // can cross the budget without rebuilding the historical prefix.
         executor_->kvmem_decode_capture_begin();
 #ifdef QW3_ENABLE_CUDA
         const bool profile_cuda_decode =
@@ -9674,7 +9748,11 @@ private:
             log(qmsg.str());
         } else if (kvmem_on) {
             executor_->kvmem_set_query_span(
-                0, 0, logical_prompt_tokens);
+                0, 0, logical_prompt_tokens,
+                /*index_tokens=*/0,
+                /*preserve_content_index=*/false,
+                /*capture_content_without_query=*/
+                    kvmem_eager_mean_index_enabled());
         }
         const int kvmem_interval = std::max(1, options_.kvmem_interval);
         uint32_t kvmem_last_reselect_pos = 0;
