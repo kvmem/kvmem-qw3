@@ -144,11 +144,11 @@ struct EngineOptions {
     // Host-side KVMem worker/memory locality. auto follows the active GPU's
     // sysfs PCI locality; off preserves OS scheduling; node:N is an override.
     std::string kvmem_numa_policy = "auto"; // auto|off|node:N
-    // Adaptive CPU index scoring: auto uses a one-transfer/one-dot per-layer
-    // path when a layer fits the bounded staging cap, otherwise the exact
-    // two-pass tiled compatibility path.
+    // Adaptive CPU index scoring. TiledOnePass retains exact per-block
+    // statistics in a bounded GPU workspace; TiledTwoPass is the minimum-
+    // memory compatibility path.
     std::string kvmem_adaptive_score_mode =
-        "auto"; // auto|layer-one-pass|tiled-two-pass
+        "auto"; // auto|layer-one-pass|tiled-one-pass|tiled-two-pass
     int kvmem_subblocks = 4;      // sub-block means per block (sub-block-mean-k only)
     std::string kvmem_subblock_reduce = "max"; // sub-block score reduction: max or sum
     double kvmem_adaptive_gain_1to2 = 0.10;
@@ -284,6 +284,28 @@ struct GenerationOptions {
     // means no span -> the recency/single-token path runs unchanged.
     uint32_t kvmem_query_begin = 0;
     uint32_t kvmem_query_end = 0;
+    // Optional half-open token span [begin,end) that must be checkpointed,
+    // pinned, and replayed after semantic selection.  This is deliberately
+    // independent of kvmem_query_*: benchmark task instructions and output
+    // framing may need to be replayed for answer fidelity while only the raw
+    // question contributes Q rows to retrieval scoring.  begin==end preserves
+    // the legacy behavior by using kvmem_query_* as the replay span.
+    uint32_t kvmem_replay_begin = 0;
+    uint32_t kvmem_replay_end = 0;
+    // Experimental query-token pruning. When both values are non-zero, the
+    // backend greedily decodes `probe_tokens` from the provisional prompt,
+    // measures their attention mass over the original query span, rolls the
+    // decode back, and scores retrieval with only the top `score_tokens` query
+    // rows. Zero keeps the existing full/uniform-sampled scorer unchanged.
+    uint32_t kvmem_query_attention_probe_tokens = 0;
+    uint32_t kvmem_query_attention_score_tokens = 0;
+    // Independent guided-retrieval experiment. The backend appends a private
+    // retrieval-planning turn, lets the model reason for at most
+    // `thinking_max_tokens`, then captures only the compact standalone query it
+    // emits after </think>. The private branch is rolled back before normal
+    // query replay/answer generation. Zero keeps this path disabled.
+    uint32_t kvmem_query_guided_thinking_max_tokens = 0;
+    uint32_t kvmem_query_guided_query_max_tokens = 0;
     // Experimental transcript replay: every span is a user query that arrived
     // after the KVMem working-set + generation reserve was already full. During
     // prefill the backend reselects at each span, replays that query against the

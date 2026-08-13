@@ -18137,7 +18137,8 @@ public:
                                               uint32_t n_pages,
                                               uint32_t page_size,
                                               uint32_t seq_len,
-                                              float scale) override {
+                                              float scale,
+                                              bool reset_output) override {
         if (n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || seq_len == 0) {
             return {};
         }
@@ -18168,11 +18169,13 @@ public:
             return {false, "block_attention_mass_paged_device requires fp16, "
                            "fp32, or fp8 KV"};
         }
-        if (auto st = cuda_status(cudaMemsetAsync(m.ptr, 0,
-                            static_cast<size_t>(buckets) * sizeof(float),
-                            exec_stream_),
-                            "block_attention_mass memset"); !st.ok) {
-            return st;
+        if (reset_output) {
+            if (auto st = cuda_status(cudaMemsetAsync(m.ptr, 0,
+                                static_cast<size_t>(buckets) * sizeof(float),
+                                exec_stream_),
+                                "block_attention_mass memset"); !st.ok) {
+                return st;
+            }
         }
         const void *ptr = is_fp16 ? static_cast<const void *>(kc.ptr_h())
                                   : is_fp8 ? static_cast<const void *>(kc.ptr_fp8())

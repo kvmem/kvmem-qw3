@@ -117,6 +117,70 @@ std::string archive_json_escape(const std::string &text) {
     return out.str();
 }
 
+struct ArchiveTokenSpan {
+    uint32_t begin = 0;
+    uint32_t end = 0;
+};
+
+ArchiveTokenSpan archive_removed_text_token_span(
+        const std::vector<int32_t> &full,
+        const std::vector<int32_t> &removed,
+        const char *label) {
+    size_t begin = 0;
+    const size_t common_limit = std::min(full.size(), removed.size());
+    while (begin < common_limit && full[begin] == removed[begin]) ++begin;
+    size_t suffix = 0;
+    while (suffix < full.size() - begin &&
+           suffix < removed.size() - begin &&
+           full[full.size() - 1 - suffix] ==
+               removed[removed.size() - 1 - suffix]) {
+        ++suffix;
+    }
+    const size_t end = full.size() - suffix;
+    if (end <= begin ||
+        end > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error(
+            std::string("archive ") + label +
+            " maps to an empty or oversized token span");
+    }
+    return {static_cast<uint32_t>(begin), static_cast<uint32_t>(end)};
+}
+
+std::string render_archive_question(
+        const std::string &content,
+        KvMemArchiveRunConfig::QuestionFormat format,
+        bool *thinking_open = nullptr) {
+    if (thinking_open) {
+        *thinking_open = format ==
+            KvMemArchiveRunConfig::QuestionFormat::QwenChatThinking;
+    }
+    if (format == KvMemArchiveRunConfig::QuestionFormat::Raw) {
+        return content;
+    }
+    const bool user_continuation = format ==
+        KvMemArchiveRunConfig::QuestionFormat::QwenUserContinuationNoThinking;
+    const std::string prefix = user_continuation
+        ? "\n"
+        : "<|im_start|>user\n";
+    const std::string suffix = format ==
+            KvMemArchiveRunConfig::QuestionFormat::QwenChatThinking
+        ? "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        : "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    // Normal Chat Completions mirrors the server's ASCII trim. A continuation
+    // is the remainder of an already-open canonical user message, so preserve
+    // its leading/trailing bytes exactly.
+    const std::string rendered_content = user_continuation
+        ? content
+        : trim_archive_question_ascii_ws(content);
+    return prefix + rendered_content + suffix;
+}
+
+uint32_t kvmem_effective_replay_begin(const GenerationOptions &options) {
+    return options.kvmem_replay_end > options.kvmem_replay_begin
+        ? options.kvmem_replay_begin
+        : options.kvmem_query_begin;
+}
+
 // Query replay only requires a fixed-stride, position-invariant Mean-K source
 // index. Sub-block Mean-K has the same property: it stores a fixed number of
 // equal sub-block means per physical block and differs only in boundary scoring.
@@ -2698,64 +2762,50 @@ public:
                 if (!done.ok) throw std::runtime_error(done.message);
             }
 
-            std::string rendered_question = cfg.questions[qi];
-            std::string empty_question;
+            // Match the HTTP server's request-boundary TTFT contract as
+            // closely as the direct archive CLI permits: query rendering and
+            // tokenization are part of final-query input processing and must
+            // be charged before retrieval/replay/prefill/first-token decode.
+            const double t_q = wall_seconds();
+            const KvMemArchiveRunConfig::Question &question =
+                cfg.questions[qi];
             bool thinking_open = false;
-            if (cfg.question_format !=
-                KvMemArchiveRunConfig::QuestionFormat::Raw) {
-                const bool user_continuation =
-                    cfg.question_format == KvMemArchiveRunConfig::
-                        QuestionFormat::QwenUserContinuationNoThinking;
-                const std::string prefix = user_continuation
-                    ? "\n"
-                    : "<|im_start|>user\n";
-                const std::string suffix =
-                    cfg.question_format == KvMemArchiveRunConfig::
-                                               QuestionFormat::QwenChatThinking
-                        ? "<|im_end|>\n<|im_start|>assistant\n<think>\n"
-                        : "<|im_end|>\n<|im_start|>assistant\n"
-                          "<think>\n\n</think>\n\n";
-                // Normal Chat Completions mirrors the server's ASCII trim.
-                // A continuation is different: its bytes are the remainder of
-                // an already-open canonical user message, so preserve leading
-                // and trailing whitespace exactly (benchmark templates use it).
-                const std::string content = user_continuation
-                    ? cfg.questions[qi]
-                    : trim_archive_question_ascii_ws(cfg.questions[qi]);
-                rendered_question = prefix + content + suffix;
-                empty_question = prefix + suffix;
-                thinking_open = cfg.question_format ==
-                    KvMemArchiveRunConfig::QuestionFormat::QwenChatThinking;
+            const std::string rendered_question = render_archive_question(
+                question.content, cfg.question_format, &thinking_open);
+            const std::string replay_removed_question =
+                render_archive_question({}, cfg.question_format);
+            std::string score_removed_content;
+            std::string score_span_text = question.content;
+            if (question.has_query_content_span) {
+                const size_t begin = static_cast<size_t>(
+                    question.query_content_start);
+                const size_t end = static_cast<size_t>(
+                    question.query_content_end);
+                score_span_text = question.content.substr(begin, end - begin);
+                score_removed_content = question.content;
+                score_removed_content.erase(begin, end - begin);
             }
+            const std::string score_removed_question = render_archive_question(
+                question.has_query_content_span ? score_removed_content
+                                                : std::string{},
+                cfg.question_format);
 
             const std::vector<int32_t> ids =
                 tokenizer_->encode(rendered_question);
             std::vector<uint32_t> q(ids.begin(), ids.end());
-            uint32_t query_begin = 0;
-            uint32_t query_end = static_cast<uint32_t>(q.size());
-            if (!empty_question.empty()) {
-                const std::vector<int32_t> empty_ids =
-                    tokenizer_->encode(empty_question);
-                size_t common_begin = 0;
-                const size_t common_limit =
-                    std::min(ids.size(), empty_ids.size());
-                while (common_begin < common_limit &&
-                       ids[common_begin] == empty_ids[common_begin]) {
-                    ++common_begin;
-                }
-                size_t common_suffix = 0;
-                while (common_suffix < ids.size() - common_begin &&
-                       common_suffix < empty_ids.size() - common_begin &&
-                       ids[ids.size() - 1 - common_suffix] ==
-                           empty_ids[empty_ids.size() - 1 - common_suffix]) {
-                    ++common_suffix;
-                }
-                query_begin = static_cast<uint32_t>(common_begin);
-                query_end = static_cast<uint32_t>(ids.size() - common_suffix);
-                if (query_end <= query_begin) {
-                    throw std::runtime_error(
-                        "archive chat question maps to an empty token span");
-                }
+            const ArchiveTokenSpan replay_span =
+                archive_removed_text_token_span(
+                    ids, tokenizer_->encode(replay_removed_question),
+                    "replay content");
+            const ArchiveTokenSpan score_span =
+                archive_removed_text_token_span(
+                    ids, tokenizer_->encode(score_removed_question),
+                    "score query");
+            if (score_span.begin < replay_span.begin ||
+                score_span.end > replay_span.end) {
+                throw std::runtime_error(
+                    "archive score query token span is outside the complete "
+                    "content replay span");
             }
             GenerationOptions qgen;
             qgen.max_tokens = std::max(1, cfg.max_tokens);
@@ -2766,18 +2816,63 @@ public:
             qgen.thinking_budget = cfg.thinking_budget;
             qgen.kvmem_session_id = kvmem_api_session_id_;
             qgen.kvmem_reselect_mode = KvMemReselectMode::Force;
-            qgen.kvmem_query_begin = base_pos + query_begin;
-            qgen.kvmem_query_end = base_pos + query_end;
+            qgen.kvmem_query_begin = base_pos + score_span.begin;
+            qgen.kvmem_query_end = base_pos + score_span.end;
+            qgen.kvmem_replay_begin = base_pos + replay_span.begin;
+            qgen.kvmem_replay_end = base_pos + replay_span.end;
+            if (cfg.query_attention_probe) {
+                qgen.kvmem_query_attention_probe_tokens =
+                    cfg.query_probe_tokens;
+                qgen.kvmem_query_attention_score_tokens =
+                    cfg.query_score_tokens;
+            } else if (cfg.query_guided_query) {
+                qgen.kvmem_query_guided_thinking_max_tokens =
+                    cfg.query_probe_tokens;
+                qgen.kvmem_query_guided_query_max_tokens =
+                    cfg.query_score_tokens;
+            }
             qgen.kvmem_trace_tag = "archive-q" + std::to_string(qi);
 
-            const double t_q = wall_seconds();
+            std::cerr << "[archive-query-span] question_index=" << qi
+                      << " score_span=[" << qgen.kvmem_query_begin << ","
+                      << qgen.kvmem_query_end << ")"
+                      << " score_tokens="
+                      << (score_span.end - score_span.begin)
+                      << " replay_span=[" << qgen.kvmem_replay_begin << ","
+                      << qgen.kvmem_replay_end << ")"
+                      << " replay_span_tokens="
+                      << (replay_span.end - replay_span.begin)
+                      << " replay_tail_tokens="
+                      << (q.size() - replay_span.begin)
+                      << " query_token_selector="
+                      << (cfg.query_attention_probe
+                              ? "attention-probe"
+                              : cfg.query_guided_query
+                                  ? "guided-query"
+                              : "none")
+                      << " score_span_text=\""
+                      << archive_json_escape(score_span_text) << "\"\n";
+
+            double first_token_s = -1.0;
+            const CancellableTokenCallback first_token_callback =
+                [&](const std::string &piece) {
+                    if (first_token_s < 0.0 && !piece.empty()) {
+                        first_token_s = wall_seconds() - t_q;
+                    }
+                    return true;
+                };
             MtpGenStats stats;
             const std::string answer = generate_mtp(
-                q, qgen, CancellableTokenCallback{}, /*dump=*/nullptr,
+                q, qgen, first_token_callback, /*dump=*/nullptr,
                 /*spec_mtp=*/true, /*trace_mtp=*/false,
                 /*override_executor=*/nullptr, /*manage_device_scope=*/true,
                 /*reset_session=*/false, &stats);
             const double question_wall_s = wall_seconds() - t_q;
+            if (first_token_s < 0.0 && !answer.empty()) {
+                throw std::runtime_error(
+                    "archive query produced output without a first-token "
+                    "callback timestamp");
+            }
             if (results) {
                 results << "{\"question_index\":" << qi
                         << ",\"archive_tokens\":" << want
@@ -2785,21 +2880,81 @@ public:
                         << ",\"decoded_tokens\":" << stats.decoded
                         << ",\"wall_s\":" << std::setprecision(9)
                         << question_wall_s
+                        << ",\"ttft_s\":";
+                if (first_token_s >= 0.0) {
+                    results << first_token_s;
+                } else {
+                    results << "null";
+                }
+                results
                         << ",\"prefill_s\":" << stats.prefill_s
                         << ",\"decode_s\":" << stats.decode_s
+                        << ",\"score_tokens\":"
+                        << (score_span.end - score_span.begin)
+                        << ",\"retrieval_score_tokens\":"
+                        << (stats.query_guided_query_tokens > 0
+                                ? stats.query_guided_query_tokens
+                                : stats.query_score_token_indices.empty()
+                                    ? score_span.end - score_span.begin
+                                : stats.query_score_token_indices.size())
+                        << ",\"query_token_selector\":\""
+                        << (cfg.query_attention_probe
+                                ? "attention-probe"
+                                : cfg.query_guided_query
+                                    ? "guided-query"
+                                : "none")
+                        << "\",\"query_probe_requested_tokens\":"
+                        << ((cfg.query_attention_probe ||
+                             cfg.query_guided_query)
+                                ? cfg.query_probe_tokens
+                                : 0)
+                        << ",\"query_probe_decoded_tokens\":"
+                        << stats.query_attention_probe_decoded
+                        << ",\"query_probe_attention_used\":"
+                        << (stats.query_attention_probe_used
+                                ? "true"
+                                : "false")
+                        << ",\"query_probe_s\":"
+                        << stats.query_attention_probe_s
+                        << ",\"guided_thinking_tokens\":"
+                        << stats.query_guided_thinking_tokens
+                        << ",\"guided_thinking_closed\":"
+                        << (stats.query_guided_thinking_closed
+                                ? "true" : "false")
+                        << ",\"guided_query_tokens\":"
+                        << stats.query_guided_query_tokens
+                        << ",\"guided_query_s\":"
+                        << stats.query_guided_query_s
+                        << ",\"guided_query_text\":\""
+                        << archive_json_escape(
+                               stats.query_guided_query_text)
+                        << "\""
+                        << ",\"query_score_token_indices\":[";
+                for (size_t i = 0;
+                     i < stats.query_score_token_indices.size(); ++i) {
+                    if (i) results << ',';
+                    results << stats.query_score_token_indices[i];
+                }
+                results
+                        << ']'
+                        << ",\"score_span_text\":\""
+                        << archive_json_escape(score_span_text)
+                        << "\",\"replay_span_tokens\":"
+                        << (replay_span.end - replay_span.begin)
                         << ",\"question\":\""
-                        << archive_json_escape(cfg.questions[qi])
+                        << archive_json_escape(question.content)
                         << "\",\"answer\":\""
                         << archive_json_escape(answer) << "\"}\n";
                 results.flush();
             }
             if (cfg.verbose) {
                 std::printf("\n[archive-q%zu] tokens=%llu prompt=%zu "
-                            "wall=%.3fs prefill=%.3fs decode=%.3fs "
+                            "ttft=%.3fs wall=%.3fs prefill=%.3fs decode=%.3fs "
                             "decoded=%d\n%s\n",
                             qi, static_cast<unsigned long long>(want),
-                            q.size(), question_wall_s, stats.prefill_s,
-                            stats.decode_s, stats.decoded, answer.c_str());
+                            q.size(), first_token_s, question_wall_s,
+                            stats.prefill_s, stats.decode_s, stats.decoded,
+                            answer.c_str());
                 std::fflush(stdout);
             }
         }
@@ -2907,6 +3062,13 @@ public:
             throw std::runtime_error(
                 "kvmem-session repeated queries require query_tokens > 0");
         }
+        if (cfg.prefill_probe_tokens < 0 || cfg.prefill_probe_repeats < 0 ||
+            (cfg.prefill_probe_repeats > 0 &&
+             cfg.prefill_probe_tokens <= 0)) {
+            throw std::runtime_error(
+                "kvmem-session prefill probes require positive token and "
+                "repeat counts");
+        }
         if (cfg.repeat_mode != "frozen" &&
             cfg.repeat_mode != "sequential") {
             throw std::runtime_error(
@@ -2926,10 +3088,38 @@ public:
             static_cast<uint64_t>(std::max(0, cfg.repeat_queries)) *
                 static_cast<uint64_t>(std::max(1, cfg.query_tokens)));
         std::vector<uint32_t> pool;
-        build_session_corpus(pool, max_target + query_reserve);
+        if (cfg.input_path.empty()) {
+            build_session_corpus(pool, max_target);
+        } else {
+            std::ifstream in(cfg.input_path, std::ios::binary);
+            if (!in) {
+                throw std::runtime_error(
+                    "kvmem-session cannot read input: " + cfg.input_path);
+            }
+            std::ostringstream text;
+            text << in.rdbuf();
+            const std::vector<int32_t> ids = tokenizer_->encode(text.str());
+            pool.assign(ids.begin(), ids.end());
+            if (pool.size() < max_target) {
+                throw std::runtime_error(
+                    "kvmem-session input token count " +
+                    std::to_string(pool.size()) + " is shorter than target " +
+                    std::to_string(max_target));
+            }
+        }
+        const uint64_t branch_reserve = std::max<uint64_t>(
+            query_reserve,
+            static_cast<uint64_t>(std::max(0, cfg.prefill_probe_tokens)));
+        std::vector<uint32_t> branch_pool;
+        build_session_corpus(branch_pool, branch_reserve);
         log("kvmem-session: corpus pool tokens=" + std::to_string(pool.size()) +
             " target_max=" + std::to_string(max_target) +
+            " source=" + (cfg.input_path.empty() ? "synthetic" : cfg.input_path) +
             " repeat_queries=" + std::to_string(cfg.repeat_queries) +
+            " prefill_probe_tokens=" +
+                std::to_string(cfg.prefill_probe_tokens) +
+            " prefill_probe_repeats=" +
+                std::to_string(cfg.prefill_probe_repeats) +
             " repeat_mode=" + cfg.repeat_mode);
 
         GenerationOptions gen;
@@ -2986,6 +3176,7 @@ public:
             double semantic_s = 0;
             double query_replay_s = 0;
             double decode_s = 0;
+            double first_token_ms = -1;
             double score_ms = 0;
             double stage_in_ms = 0;
             double stage_out_ms = 0;
@@ -2995,6 +3186,18 @@ public:
             int decoded = 0;
         };
         std::vector<QueryRow> query_rows;
+
+        struct PrefillProbeRow {
+            size_t turn = 0;
+            int probe = 0;
+            uint32_t base_pos = 0;
+            uint32_t final_pos = 0;
+            int tokens = 0;
+            double restore_ms = 0;
+            double prefill_s = 0;
+            double total_s = 0;
+        };
+        std::vector<PrefillProbeRow> prefill_probe_rows;
 
         // An executor snapshot alone is not a complete KVMem branch point:
         // API-session query replay also owns a block-aligned recurrent checkpoint
@@ -3183,7 +3386,7 @@ public:
             row.acceptance = stats.acceptance;
 
             const QwenExecutor::KvMemTierUsage tu = executor_->kvmem_tier_usage();
-            row.kv_bytes = tu.total_blocks * tu.block_bytes;
+            row.kv_bytes = tu.logical_kv_bytes;
             row.gpu_used = tu.gpu_used_bytes;
             row.cpu_used = tu.cpu_used_bytes;
             row.nvme_used = tu.nvme_used_bytes;
@@ -3219,7 +3422,78 @@ public:
                         "requested ladder target");
                 }
 
-                const uint64_t query_pool_begin = max_target;
+                const QwenExecutor::KvMemIndexUsage iu =
+                    executor_->kvmem_index_usage();
+                std::ostringstream resource;
+                resource << "[kvmem-session-resource] turn=" << ti
+                         << " workspace_tokens=" << target
+                         << " blocks=" << tu.total_blocks
+                         << " logical_kv_bytes=" << tu.logical_kv_bytes
+                         << " gpu_kv_used_bytes=" << tu.gpu_used_bytes
+                         << " gpu_kv_capacity_bytes=" << tu.gpu_capacity_bytes
+                         << " external_physical_bytes="
+                         << tu.external_physical_bytes
+                         << " persistent_authority_bytes="
+                         << tu.persistent_authority_bytes
+                         << " cpu_kv_bytes=" << tu.cpu_used_bytes
+                         << " nvme_kv_bytes=" << tu.nvme_used_bytes
+                         << " index_value_bytes=" << iu.value_bytes
+                         << " index_metadata_bytes=" << iu.metadata_bytes
+                         << " index_logical_bytes=" << iu.logical_bytes
+                         << " index_capacity_bytes=" << iu.capacity_bytes
+                         << " index_prototypes=" << iu.prototypes
+                         << " indexed_blocks=" << iu.indexed_blocks
+                         << " index_cpu=" << (iu.cpu_placement ? 1 : 0)
+                         << " index_adaptive=" << (iu.adaptive ? 1 : 0);
+                log(resource.str());
+
+                if (cfg.prefill_probe_repeats > 0) {
+                    std::vector<uint32_t> probe_chunk(
+                        branch_pool.begin(),
+                        branch_pool.begin() + cfg.prefill_probe_tokens);
+                    for (int pi = 0; pi < cfg.prefill_probe_repeats; ++pi) {
+                        const double restore_ms = restore_milestone(milestone);
+                        GenerationOptions pgen = gen;
+                        pgen.max_tokens = 0;
+                        pgen.kvmem_query_begin = 0;
+                        pgen.kvmem_query_end = 0;
+                        pgen.kvmem_reselect_mode = KvMemReselectMode::Off;
+                        MtpGenStats pstats;
+                        (void)generate_mtp(
+                            probe_chunk, pgen, CancellableTokenCallback{},
+                            /*dump=*/nullptr,
+                            /*spec_mtp=*/true, /*trace_mtp=*/false,
+                            /*override_executor=*/nullptr,
+                            /*manage_device_scope=*/true,
+                            /*reset_session=*/false, &pstats);
+                        PrefillProbeRow pr;
+                        pr.turn = ti;
+                        pr.probe = pi;
+                        pr.base_pos = milestone.position;
+                        pr.final_pos = executor_->position();
+                        pr.tokens = cfg.prefill_probe_tokens;
+                        pr.restore_ms = restore_ms;
+                        pr.prefill_s = pstats.prefill_s;
+                        pr.total_s = pstats.total_s;
+                        prefill_probe_rows.push_back(pr);
+                        std::ostringstream pmsg;
+                        pmsg << std::fixed << std::setprecision(3)
+                             << "[kvmem-session-prefill-probe] turn="
+                             << pr.turn << " probe=" << pr.probe
+                             << " base=" << pr.base_pos
+                             << " final=" << pr.final_pos
+                             << " tokens=" << pr.tokens
+                             << " restore_ms=" << pr.restore_ms
+                             << " prefill_ms=" << pr.prefill_s * 1.0e3
+                             << " total_ms=" << pr.total_s * 1.0e3
+                             << " prefill_tps="
+                             << (pr.tokens /
+                                 std::max(pr.prefill_s, 1.0e-9));
+                        log(pmsg.str());
+                    }
+                    (void)restore_milestone(milestone);
+                }
+
                 const uint64_t query_slots = std::max<uint64_t>(
                     1, query_reserve /
                            static_cast<uint64_t>(cfg.query_tokens));
@@ -3230,17 +3504,13 @@ public:
                     }
 
                     const uint32_t query_begin = executor_->position();
-                    const uint64_t slot =
-                        (static_cast<uint64_t>(ti) *
-                             static_cast<uint64_t>(cfg.repeat_queries) +
-                         static_cast<uint64_t>(qi)) %
-                        query_slots;
+                    // Reuse the exact same query set at every workspace point.
+                    const uint64_t slot = static_cast<uint64_t>(qi) % query_slots;
                     const uint64_t qoff =
-                        query_pool_begin +
                         slot * static_cast<uint64_t>(cfg.query_tokens);
                     std::vector<uint32_t> query_chunk(
-                        pool.begin() + static_cast<std::ptrdiff_t>(qoff),
-                        pool.begin() + static_cast<std::ptrdiff_t>(
+                        branch_pool.begin() + static_cast<std::ptrdiff_t>(qoff),
+                        branch_pool.begin() + static_cast<std::ptrdiff_t>(
                             qoff + static_cast<uint64_t>(cfg.query_tokens)));
 
                     GenerationOptions qgen = gen;
@@ -3250,11 +3520,21 @@ public:
                         query_begin + static_cast<uint32_t>(query_chunk.size());
                     qgen.kvmem_reselect_mode = KvMemReselectMode::Force;
 
+                    const double query_start_s = wall_seconds();
                     const QwenExecutor::KvMemTimingSnapshot qt0 =
                         QwenExecutor::kvmem_timing_snapshot();
+                    double first_token_ms = -1.0;
+                    const CancellableTokenCallback first_token_callback =
+                        [&](const std::string &piece) {
+                            if (first_token_ms < 0.0 && !piece.empty()) {
+                                first_token_ms =
+                                    (wall_seconds() - query_start_s) * 1.0e3;
+                            }
+                            return true;
+                        };
                     MtpGenStats qstats;
                     (void)generate_mtp(
-                        query_chunk, qgen, CancellableTokenCallback{},
+                        query_chunk, qgen, first_token_callback,
                         /*dump=*/nullptr,
                         /*spec_mtp=*/true, /*trace_mtp=*/false,
                         /*override_executor=*/nullptr,
@@ -3277,6 +3557,7 @@ public:
                     qr.semantic_s = qstats.semantic_reselect_s;
                     qr.query_replay_s = qstats.query_replay_s;
                     qr.decode_s = qstats.decode_s;
+                    qr.first_token_ms = first_token_ms;
                     qr.score_ms = dms(qt1.retrieval_ns, qt0.retrieval_ns);
                     qr.stage_in_ms = dms(qt1.stage_in_ns, qt0.stage_in_ns);
                     qr.stage_out_ms = dms(qt1.stage_out_ns, qt0.stage_out_ns);
@@ -3303,6 +3584,7 @@ public:
                          << " semantic_ms=" << qr.semantic_s * 1.0e3
                          << " replay_ms=" << qr.query_replay_s * 1.0e3
                          << " decode_ms=" << qr.decode_s * 1.0e3
+                         << " first_token_ms=" << qr.first_token_ms
                          << " score_ms=" << qr.score_ms
                          << " stage_in_ms=" << qr.stage_in_ms
                          << " stage_out_ms=" << qr.stage_out_ms
@@ -3363,7 +3645,7 @@ public:
             qtbl << "\n=== kvmem-session REPEATED QUERY SUMMARY ===\n";
             qtbl << "  turn  query       mode       base      qbegin"
                     "        qend  restore_ms  total_ms  semantic_ms"
-                    "  replay_ms  decode_ms  score_ms  stagein_ms"
+                    "  replay_ms  decode_ms  first_token_ms  score_ms  stagein_ms"
                     "  stageout_ms  assemble_ms  decoded\n";
             for (const QueryRow &q : query_rows) {
                 qtbl << "  " << std::setw(4) << q.turn
@@ -3378,6 +3660,7 @@ public:
                      << std::setw(13) << q.semantic_s * 1.0e3
                      << std::setw(11) << q.query_replay_s * 1.0e3
                      << std::setw(11) << q.decode_s * 1.0e3
+                     << std::setw(16) << q.first_token_ms
                      << std::setw(10) << q.score_ms
                      << std::setw(12) << q.stage_in_ms
                      << std::setw(13) << q.stage_out_ms
@@ -8341,6 +8624,9 @@ private:
             options_.kvmem_adaptive_score_mode == "layer-one-pass"
                 ? KvMemAdaptiveScoreMode::LayerOnePass
                 : options_.kvmem_adaptive_score_mode ==
+                          "tiled-one-pass"
+                      ? KvMemAdaptiveScoreMode::TiledOnePass
+                      : options_.kvmem_adaptive_score_mode ==
                           "tiled-two-pass"
                       ? KvMemAdaptiveScoreMode::TiledTwoPass
                       : KvMemAdaptiveScoreMode::Auto;
@@ -10234,6 +10520,29 @@ private:
             log(rmsg.str());
         }
 
+        const bool query_attention_probe_requested =
+            options.kvmem_query_attention_probe_tokens != 0 ||
+            options.kvmem_query_attention_score_tokens != 0;
+        const bool query_guided_query_requested =
+            options.kvmem_query_guided_thinking_max_tokens != 0 ||
+            options.kvmem_query_guided_query_max_tokens != 0;
+        if (query_attention_probe_requested &&
+            (options.kvmem_query_attention_probe_tokens == 0 ||
+             options.kvmem_query_attention_score_tokens == 0)) {
+            throw std::invalid_argument(
+                "KVMem query attention probe requires both a positive probe "
+                "length and a positive score-token budget");
+        }
+        if (query_guided_query_requested) {
+            throw std::invalid_argument(
+                "KVMem guided query currently requires the MTP archive "
+                "query path");
+        }
+        const bool query_attention_probe = query_attention_probe_requested;
+        executor_->kvmem_set_query_score_budget_hint(
+            query_attention_probe
+                ? options.kvmem_query_attention_score_tokens
+                : 0);
         // Query-conditioned KVMem (#82): mark the question token span BEFORE
         // prefill (mirrors generate_mtp). Only active above budget; below budget
         // the span is cleared so a warm HIT (restore_state, no reset_state)
@@ -10310,6 +10619,11 @@ private:
             dump == nullptr && executor_->block_store() &&
             kvmem_query_replay_retrieval_supported(
                 executor_->block_store()->config().retrieval_method);
+        if (query_attention_probe && !recompute_query) {
+            throw std::invalid_argument(
+                "KVMem query attention probe requires the query-recompute/"
+                "replay path with Mean-K or SubBlockMeanK retrieval");
+        }
         if (inline_refresh && !recompute_query) {
             throw std::runtime_error(
                 "KVMem inline refresh requires an above-budget, "
@@ -10644,6 +10958,123 @@ private:
                             std::to_string(
                                 executor_->kvmem_query_expected_tokens()) +
                             " query tokens");
+                    }
+                    uint32_t query_attention_probe_decoded = 0;
+                    bool query_attention_probe_used = false;
+                    double post_query_attention_probe_s = 0.0;
+                    std::vector<uint32_t> query_score_token_indices;
+                    const uint32_t query_tokens =
+                        options.kvmem_query_end - options.kvmem_query_begin;
+                    const uint32_t keep_query_tokens = std::min<uint32_t>(
+                        query_tokens,
+                        options.kvmem_query_attention_score_tokens);
+                    if (query_attention_probe &&
+                        keep_query_tokens < query_tokens) {
+                        const double t_probe_start = wall_seconds();
+                        std::vector<float> attention_mass;
+                        QwenExecutor::StateSnapshot probe_boundary;
+                        try {
+                            if (executor_->kvmem_begin_query_attention_probe(
+                                    options.kvmem_query_begin,
+                                    options.kvmem_query_end)) {
+                                executor_->capture_transient_state(
+                                    probe_boundary);
+                                int32_t probe_token = step.argmax_token;
+                                for (uint32_t i = 0;
+                                     i < options
+                                             .kvmem_query_attention_probe_tokens &&
+                                     probe_token >= 0;
+                                     ++i) {
+                                    NativeExecutorReport probe_step =
+                                        executor_->forward_one_token(
+                                            static_cast<uint32_t>(probe_token));
+                                    if (!probe_step.ok) break;
+                                    ++query_attention_probe_decoded;
+                                    probe_token = probe_step.argmax_token;
+                                }
+                                attention_mass = executor_
+                                    ->kvmem_end_query_attention_probe();
+                                executor_->restore_state(probe_boundary);
+                            }
+                        } catch (...) {
+                            executor_->kvmem_cancel_query_attention_probe();
+                            if (probe_boundary.ready) {
+                                executor_->restore_state(probe_boundary);
+                            }
+                            throw;
+                        }
+
+                        if (attention_mass.size() == query_tokens) {
+                            double positive_mass = 0.0;
+                            std::vector<uint32_t> ranked(query_tokens);
+                            for (uint32_t i = 0; i < query_tokens; ++i) {
+                                ranked[i] = i;
+                                if (std::isfinite(attention_mass[i]) &&
+                                    attention_mass[i] > 0.0f) {
+                                    positive_mass += attention_mass[i];
+                                } else {
+                                    attention_mass[i] =
+                                        -std::numeric_limits<float>::infinity();
+                                }
+                            }
+                            if (positive_mass > 0.0) {
+                                std::partial_sort(
+                                    ranked.begin(),
+                                    ranked.begin() + keep_query_tokens,
+                                    ranked.end(),
+                                    [&](uint32_t a, uint32_t b) {
+                                        if (attention_mass[a] !=
+                                            attention_mass[b]) {
+                                            return attention_mass[a] >
+                                                   attention_mass[b];
+                                        }
+                                        return a < b;
+                                    });
+                                ranked.resize(keep_query_tokens);
+                                std::sort(ranked.begin(), ranked.end());
+                                query_score_token_indices = std::move(ranked);
+                                query_attention_probe_used = true;
+                            }
+                        }
+
+                        // Unsupported attention dtype/kernel or an incomplete
+                        // probe falls back to deterministic full-span coverage.
+                        // The sparse score budget remains enforced, avoiding the
+                        // long-query scorer allocation that motivated the probe.
+                        if (query_score_token_indices.empty()) {
+                            query_score_token_indices.reserve(
+                                keep_query_tokens);
+                            for (uint32_t i = 0; i < keep_query_tokens; ++i) {
+                                query_score_token_indices.push_back(
+                                    static_cast<uint32_t>(
+                                        ((2ull * i + 1ull) * query_tokens) /
+                                        (2ull * keep_query_tokens)));
+                            }
+                        }
+                        executor_->kvmem_set_query_score_token_indices(
+                            query_score_token_indices);
+                        post_query_attention_probe_s +=
+                            wall_seconds() - t_probe_start;
+
+                        std::ostringstream pmsg;
+                        pmsg << "native kvmem query attention probe: requested="
+                             << options.kvmem_query_attention_probe_tokens
+                             << " decoded=" << query_attention_probe_decoded
+                             << " query_tokens=" << query_tokens
+                             << " score_tokens="
+                             << query_score_token_indices.size()
+                             << " selector="
+                             << (query_attention_probe_used
+                                     ? "attention-topk"
+                                     : "uniform-fallback")
+                             << " indices=[";
+                        for (size_t i = 0;
+                             i < query_score_token_indices.size(); ++i) {
+                            if (i) pmsg << ',';
+                            pmsg << query_score_token_indices[i];
+                        }
+                        pmsg << ']';
+                        log(pmsg.str());
                     }
                     const uint32_t bt = std::max<uint32_t>(
                         1, executor_->block_store()->config().block_tokens);
@@ -11190,10 +11621,19 @@ private:
         double reselect_s = 0.0; // post-prefill (decode-window) reselect wall clock
         double semantic_reselect_s = 0.0;
         double query_replay_s = 0.0;
+        double query_attention_probe_s = 0.0;
+        double query_guided_query_s = 0.0;
         double post_other_s = 0.0;
         int decoded = 0;
         uint64_t prompt_tokens = 0;
         double acceptance = 0.0;
+        uint32_t query_attention_probe_decoded = 0;
+        bool query_attention_probe_used = false;
+        std::vector<uint32_t> query_score_token_indices;
+        uint32_t query_guided_thinking_tokens = 0;
+        uint32_t query_guided_query_tokens = 0;
+        bool query_guided_thinking_closed = false;
+        std::string query_guided_query_text;
         // kvmem timing snapshot captured at the prefill->reselect boundary, so
         // the session harness can isolate the post-prefill (decode-window)
         // reselect breakdown from mid-prefill offload churn (which is folded
@@ -11542,6 +11982,52 @@ private:
             dump == nullptr && executor_->block_store() &&
             kvmem_query_replay_retrieval_supported(
                 executor_->block_store()->config().retrieval_method);
+        const bool query_attention_probe_requested =
+            options.kvmem_query_attention_probe_tokens != 0 ||
+            options.kvmem_query_attention_score_tokens != 0;
+        const bool query_guided_query_requested =
+            options.kvmem_query_guided_thinking_max_tokens != 0 ||
+            options.kvmem_query_guided_query_max_tokens != 0;
+        if (query_attention_probe_requested &&
+            (options.kvmem_query_attention_probe_tokens == 0 ||
+             options.kvmem_query_attention_score_tokens == 0)) {
+            throw std::invalid_argument(
+                "KVMem query attention probe requires both a positive probe "
+                "length and a positive score-token budget");
+        }
+        if (query_attention_probe_requested && !recompute_query) {
+            throw std::invalid_argument(
+                "KVMem query attention probe requires the query-recompute/"
+                "replay path with Mean-K or SubBlockMeanK retrieval");
+        }
+        if (query_guided_query_requested &&
+            (options.kvmem_query_guided_thinking_max_tokens == 0 ||
+             options.kvmem_query_guided_query_max_tokens == 0)) {
+            throw std::invalid_argument(
+                "KVMem guided query requires both a positive thinking "
+                "limit and a positive compact-query token budget");
+        }
+        if (query_attention_probe_requested &&
+            query_guided_query_requested) {
+            throw std::invalid_argument(
+                "KVMem attention-probe and guided-query selectors are "
+                "independent and cannot be enabled together");
+        }
+        if (query_guided_query_requested && !recompute_query) {
+            throw std::invalid_argument(
+                "KVMem guided query requires the query-recompute/replay "
+                "path with Mean-K or SubBlockMeanK retrieval");
+        }
+        const bool query_attention_probe =
+            query_attention_probe_requested && recompute_query;
+        const bool query_guided_query =
+            query_guided_query_requested && recompute_query;
+        executor_->kvmem_set_query_score_budget_hint(
+            query_attention_probe
+                ? options.kvmem_query_attention_score_tokens
+                : query_guided_query
+                    ? options.kvmem_query_guided_query_max_tokens
+                : 0);
         if (inline_refresh && !recompute_query) {
             throw std::runtime_error(
                 "KVMem inline refresh requires an above-budget, "
@@ -11868,6 +12354,15 @@ private:
 
         double post_semantic_reselect_s = 0.0;
         double post_query_replay_s = 0.0;
+        double post_query_attention_probe_s = 0.0;
+        double post_query_guided_query_s = 0.0;
+        uint32_t query_attention_probe_decoded = 0;
+        bool query_attention_probe_used = false;
+        std::vector<uint32_t> query_score_token_indices;
+        uint32_t query_guided_thinking_tokens = 0;
+        uint32_t query_guided_query_tokens = 0;
+        bool query_guided_thinking_closed = false;
+        std::string query_guided_query_text;
         const double t_prefill_start = wall_seconds();
         const uint32_t prefill_base =
             static_cast<uint32_t>(executor_->position());
@@ -11911,7 +12406,7 @@ private:
             const uint32_t bt = std::max<uint32_t>(
                 1, executor_->block_store()->config().block_tokens);
             kvmem_query_replay_begin =
-                (options.kvmem_query_begin / bt) * bt;
+                (kvmem_effective_replay_begin(options) / bt) * bt;
             if (kvmem_query_replay_begin == 0) {
                 throw std::runtime_error(
                     "KVMem query replay requires a non-zero aligned boundary");
@@ -13623,6 +14118,9 @@ private:
                     executor_->kvmem_reselect_prefill_pressure();
                 }
             } else {
+                // Optional reversible decode probe runs immediately before the
+                // final semantic selection; the complete replay suffix is still
+                // processed afterward under the selected context.
                 if (recompute_query) {
                     if (!executor_->kvmem_query_capture_complete()) {
                         throw std::runtime_error(
@@ -13633,6 +14131,301 @@ private:
                             std::to_string(
                                 executor_->kvmem_query_expected_tokens()) +
                             " query tokens");
+                    }
+                    if (query_guided_query) {
+                        const double t_probe_start = wall_seconds();
+                        QwenExecutor::StateSnapshot probe_boundary;
+                        try {
+                            if (!executor_->kvmem_begin_guided_query_probe(
+                                    options
+                                        .kvmem_query_guided_query_max_tokens)) {
+                                throw std::runtime_error(
+                                    "KVMem guided-query capture is unavailable "
+                                    "for the active backend/configuration");
+                            }
+                            executor_->capture_transient_state(probe_boundary);
+
+                            // This private turn is never registered or exposed.
+                            // It asks for one semantic retrieval query rather
+                            // than a bag of keywords; all of it is rolled back
+                            // after its Q rows have been copied aside.
+                            std::string guided_query_prompt;
+                            if (options.thinking_open) {
+                                guided_query_prompt = "</think>\n";
+                            }
+                            guided_query_prompt +=
+                                "<|im_end|>\n<|im_start|>user\n"
+                                "Before answering the preceding real user "
+                                "request, prepare a retrieval query for long-"
+                                "term memory. Think briefly about exactly what "
+                                "evidence must be found. Do not answer the real "
+                                "request. After finishing that private "
+                                "reasoning, output exactly one compact, "
+                                "standalone retrieval query on a single line. "
+                                "Write it as a grammatical natural-language "
+                                "question or declarative sentence that preserves "
+                                "the complete information need. Never output a "
+                                "keyword list, search-engine terms, quoted "
+                                "fragment, label, or answer. Preserve important "
+                                "entities, relationships, dates, and constraints; "
+                                "remove examples, filler, and answer-format "
+                                "instructions."
+                                "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+                            const std::vector<int32_t> private_prompt =
+                                tokenizer_->encode(guided_query_prompt);
+                            NativeExecutorReport guided_step;
+                            for (int32_t forced : private_prompt) {
+                                if (forced < 0) continue;
+                                executor_->kvmem_set_guided_query_capture(false);
+                                guided_step = executor_->forward_one_token(
+                                    static_cast<uint32_t>(forced));
+                                if (!guided_step.ok) {
+                                    throw std::runtime_error(
+                                        "KVMem guided-query private prompt "
+                                        "decode failed");
+                                }
+                            }
+                            int32_t proposed = guided_step.argmax_token;
+                            const int32_t close_think =
+                                tokenizer_->token_id("</think>");
+                            const int32_t im_end =
+                                tokenizer_->token_id("<|im_end|>");
+                            const int32_t eos = tokenizer_->eos_id();
+
+                            for (uint32_t i = 0;
+                                 i < options
+                                         .kvmem_query_guided_thinking_max_tokens &&
+                                 proposed >= 0;
+                                 ++i) {
+                                if (proposed == eos || proposed == im_end) break;
+                                executor_->kvmem_set_guided_query_capture(false);
+                                guided_step = executor_->forward_one_token(
+                                    static_cast<uint32_t>(proposed));
+                                if (!guided_step.ok) break;
+                                if (proposed == close_think) {
+                                    query_guided_thinking_closed = true;
+                                    proposed = guided_step.argmax_token;
+                                    break;
+                                }
+                                ++query_guided_thinking_tokens;
+                                proposed = guided_step.argmax_token;
+                            }
+
+                            // Natural close gives a content-dependent thinking
+                            // length. The cap is only a safety bound; on hitting
+                            // it, inject the close tag so no reasoning Q leaks
+                            // into the retrieval query tensor.
+                            if (!query_guided_thinking_closed) {
+                                if (close_think < 0) {
+                                    throw std::runtime_error(
+                                        "model tokenizer has no </think> token");
+                                }
+                                executor_->kvmem_set_guided_query_capture(false);
+                                guided_step = executor_->forward_one_token(
+                                    static_cast<uint32_t>(close_think));
+                                if (!guided_step.ok) {
+                                    throw std::runtime_error(
+                                        "KVMem guided-query forced think close "
+                                        "failed");
+                                }
+                                query_guided_thinking_closed = true;
+                                proposed = guided_step.argmax_token;
+                            }
+
+                            bool query_started = false;
+                            uint32_t uncaptured_prefix_tokens = 0;
+                            const uint32_t prefix_guard = 16;
+                            while (proposed >= 0 &&
+                                   query_guided_query_tokens <
+                                       options
+                                           .kvmem_query_guided_query_max_tokens) {
+                                if (proposed == eos || proposed == im_end ||
+                                    proposed == close_think) {
+                                    break;
+                                }
+                                const std::string piece =
+                                    tokenizer_->decode_one(proposed);
+                                const bool whitespace_only =
+                                    !piece.empty() && std::all_of(
+                                        piece.begin(), piece.end(),
+                                        [](unsigned char ch) {
+                                            return std::isspace(ch) != 0;
+                                        });
+                                if (query_started && whitespace_only &&
+                                    piece.find('\n') != std::string::npos) {
+                                    break;
+                                }
+                                const bool content_bearing =
+                                    !piece.empty() && !whitespace_only;
+                                // Ignore only leading separators. Once the
+                                // query starts, retain every token in that
+                                // single line, including internal whitespace,
+                                // so its Q sequence represents the compact
+                                // query rather than a keyword bag.
+                                const bool capture =
+                                    query_started || content_bearing;
+                                if (!capture && !query_started &&
+                                    ++uncaptured_prefix_tokens > prefix_guard) {
+                                    break;
+                                }
+                                executor_->kvmem_set_guided_query_capture(
+                                    capture);
+                                guided_step = executor_->forward_one_token(
+                                    static_cast<uint32_t>(proposed));
+                                if (!guided_step.ok) break;
+                                if (capture) {
+                                    query_started = true;
+                                    ++query_guided_query_tokens;
+                                    query_guided_query_text += piece;
+                                }
+                                const bool line_complete =
+                                    query_started &&
+                                    piece.find('\n') != std::string::npos;
+                                proposed = guided_step.argmax_token;
+                                if (line_complete) break;
+                            }
+                            executor_->kvmem_set_guided_query_capture(false);
+                            const uint32_t published =
+                                executor_->kvmem_end_guided_query_probe();
+                            executor_->restore_state(probe_boundary);
+                            if (published == 0 ||
+                                published != query_guided_query_tokens) {
+                                throw std::runtime_error(
+                                    "KVMem guided query produced no usable "
+                                    "compact-query Q rows");
+                            }
+                        } catch (...) {
+                            executor_->kvmem_cancel_guided_query_probe();
+                            if (probe_boundary.ready) {
+                                executor_->restore_state(probe_boundary);
+                            }
+                            throw;
+                        }
+                        post_query_guided_query_s +=
+                            wall_seconds() - t_probe_start;
+                        std::ostringstream gmsg;
+                        gmsg << "native kvmem guided query: thinking_tokens="
+                             << query_guided_thinking_tokens
+                             << " thinking_closed="
+                             << (query_guided_thinking_closed ? 1 : 0)
+                             << " query_tokens="
+                             << query_guided_query_tokens
+                             << " query=\""
+                             << escape_text(query_guided_query_text) << '"';
+                        log(gmsg.str());
+                    }
+                    const uint32_t query_tokens =
+                        options.kvmem_query_end - options.kvmem_query_begin;
+                    const uint32_t keep_query_tokens = std::min<uint32_t>(
+                        query_tokens,
+                        options.kvmem_query_attention_score_tokens);
+                    if (query_attention_probe &&
+                        keep_query_tokens < query_tokens) {
+                        const double t_probe_start = wall_seconds();
+                        std::vector<float> attention_mass;
+                        QwenExecutor::StateSnapshot probe_boundary;
+                        try {
+                            if (executor_->kvmem_begin_query_attention_probe(
+                                    options.kvmem_query_begin,
+                                    options.kvmem_query_end)) {
+                                executor_->capture_transient_state(
+                                    probe_boundary);
+                                int32_t probe_token = step.argmax_token;
+                                for (uint32_t i = 0;
+                                     i < options
+                                             .kvmem_query_attention_probe_tokens &&
+                                     probe_token >= 0;
+                                     ++i) {
+                                    NativeExecutorReport probe_step =
+                                        executor_->forward_one_token(
+                                            static_cast<uint32_t>(probe_token));
+                                    if (!probe_step.ok) break;
+                                    ++query_attention_probe_decoded;
+                                    probe_token = probe_step.argmax_token;
+                                }
+                                attention_mass = executor_
+                                    ->kvmem_end_query_attention_probe();
+                                executor_->restore_state(probe_boundary);
+                            }
+                        } catch (...) {
+                            executor_->kvmem_cancel_query_attention_probe();
+                            if (probe_boundary.ready) {
+                                executor_->restore_state(probe_boundary);
+                            }
+                            throw;
+                        }
+
+                        if (attention_mass.size() == query_tokens) {
+                            double positive_mass = 0.0;
+                            std::vector<uint32_t> ranked(query_tokens);
+                            for (uint32_t i = 0; i < query_tokens; ++i) {
+                                ranked[i] = i;
+                                if (std::isfinite(attention_mass[i]) &&
+                                    attention_mass[i] > 0.0f) {
+                                    positive_mass += attention_mass[i];
+                                } else {
+                                    attention_mass[i] =
+                                        -std::numeric_limits<float>::infinity();
+                                }
+                            }
+                            if (positive_mass > 0.0) {
+                                std::partial_sort(
+                                    ranked.begin(),
+                                    ranked.begin() + keep_query_tokens,
+                                    ranked.end(),
+                                    [&](uint32_t a, uint32_t b) {
+                                        if (attention_mass[a] !=
+                                            attention_mass[b]) {
+                                            return attention_mass[a] >
+                                                   attention_mass[b];
+                                        }
+                                        return a < b;
+                                    });
+                                ranked.resize(keep_query_tokens);
+                                std::sort(ranked.begin(), ranked.end());
+                                query_score_token_indices = std::move(ranked);
+                                query_attention_probe_used = true;
+                            }
+                        }
+
+                        // Unsupported attention dtype/kernel or an incomplete
+                        // probe falls back to deterministic full-span coverage.
+                        // The sparse score budget remains enforced, avoiding the
+                        // long-query scorer allocation that motivated the probe.
+                        if (query_score_token_indices.empty()) {
+                            query_score_token_indices.reserve(
+                                keep_query_tokens);
+                            for (uint32_t i = 0; i < keep_query_tokens; ++i) {
+                                query_score_token_indices.push_back(
+                                    static_cast<uint32_t>(
+                                        ((2ull * i + 1ull) * query_tokens) /
+                                        (2ull * keep_query_tokens)));
+                            }
+                        }
+                        executor_->kvmem_set_query_score_token_indices(
+                            query_score_token_indices);
+                        post_query_attention_probe_s +=
+                            wall_seconds() - t_probe_start;
+
+                        std::ostringstream pmsg;
+                        pmsg << "native kvmem query attention probe: requested="
+                             << options.kvmem_query_attention_probe_tokens
+                             << " decoded=" << query_attention_probe_decoded
+                             << " query_tokens=" << query_tokens
+                             << " score_tokens="
+                             << query_score_token_indices.size()
+                             << " selector="
+                             << (query_attention_probe_used
+                                     ? "attention-topk"
+                                     : "uniform-fallback")
+                             << " indices=[";
+                        for (size_t i = 0;
+                             i < query_score_token_indices.size(); ++i) {
+                            if (i) pmsg << ',';
+                            pmsg << query_score_token_indices[i];
+                        }
+                        pmsg << ']';
+                        log(pmsg.str());
                     }
                     const uint32_t bt = std::max<uint32_t>(
                         1, executor_->block_store()->config().block_tokens);
@@ -13730,7 +14523,8 @@ private:
                     executor_->kvmem_begin_query_replay(
                         kvmem_query_replay_ckpt, selected_context,
                         /*reset_recurrent_state=*/false,
-                        /*preserve_selected_context=*/true);
+                        /*preserve_selected_context=*/true,
+                        /*preserve_query_capture=*/query_guided_query);
 #if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =
@@ -13815,7 +14609,11 @@ private:
                                       replay_tokens.size());
                 }
                 executor_->kvmem_end_query_replay();
-                if (!executor_->kvmem_query_capture_complete()) {
+                const bool query_capture_complete = query_guided_query
+                    ? executor_->kvmem_query_captured_tokens() ==
+                          query_guided_query_tokens
+                    : executor_->kvmem_query_capture_complete();
+                if (!query_capture_complete) {
                     throw std::runtime_error(
                         "KVMem query replay final pass captured " +
                         std::to_string(
@@ -13955,7 +14753,8 @@ private:
                 std::max(t_native_done - t_native_start, 0.0);
             const double post_other_s = std::max(
                 postprefill_s - post_semantic_reselect_s -
-                    post_query_replay_s,
+                    post_query_replay_s - post_query_attention_probe_s -
+                    post_query_guided_query_s,
                 0.0);
             if (stats_out) {
                 stats_out->total_s = total_s;
@@ -13965,7 +14764,25 @@ private:
                 stats_out->semantic_reselect_s =
                     post_semantic_reselect_s;
                 stats_out->query_replay_s = post_query_replay_s;
+                stats_out->query_attention_probe_s =
+                    post_query_attention_probe_s;
+                stats_out->query_guided_query_s =
+                    post_query_guided_query_s;
                 stats_out->post_other_s = post_other_s;
+                stats_out->query_attention_probe_decoded =
+                    query_attention_probe_decoded;
+                stats_out->query_attention_probe_used =
+                    query_attention_probe_used;
+                stats_out->query_score_token_indices =
+                    query_score_token_indices;
+                stats_out->query_guided_thinking_tokens =
+                    query_guided_thinking_tokens;
+                stats_out->query_guided_query_tokens =
+                    query_guided_query_tokens;
+                stats_out->query_guided_thinking_closed =
+                    query_guided_thinking_closed;
+                stats_out->query_guided_query_text =
+                    query_guided_query_text;
             }
             std::ostringstream amsg;
             // Keep enough printed precision that consumers can independently
@@ -13991,6 +14808,10 @@ private:
                  << post_semantic_reselect_s * 1000.0
                  << " post_query_replay_ms="
                  << post_query_replay_s * 1000.0
+                 << " post_query_probe_ms="
+                 << post_query_attention_probe_s * 1000.0
+                 << " post_guided_query_ms="
+                 << post_query_guided_query_s * 1000.0
                  << " post_other_ms=" << post_other_s * 1000.0;
             log(amsg.str());
         };

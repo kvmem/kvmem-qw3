@@ -40,6 +40,9 @@ void usage(std::ostream &os) {
         "                         [--archive-questions-file FILE]\n"
         "                         [--archive-questions-json FILE]\n"
         "                         [--archive-question-format raw|qwen-chat|qwen-chat-no-thinking|qwen-user-continuation]\n"
+        "                         [--archive-query-token-selector none|attention-probe|guided-query]\n"
+        "                         [--archive-query-probe-tokens N]\n"
+        "                         [--archive-query-score-tokens N]\n"
         "                         [--archive-results-file FILE]\n"
         "                         [options]\n"
         "       qw3 archive info  --kvmem-archive DIR\n"
@@ -164,7 +167,7 @@ void usage(std::ostream &os) {
         "                        Auto follows the active GPU PCI locality;\n"
         "                        unsupported systems fall back to off.\n"
         "  --kvmem-adaptive-score-mode M  CPU Adaptive scorer:\n"
-        "                        auto|layer-one-pass|tiled-two-pass.\n"
+        "                        auto|layer-one-pass|tiled-one-pass|tiled-two-pass.\n"
         "                        Auto prefers one H2D transfer and one dot pass\n"
         "                        per layer, with exact tiled fallback.\n"
         "  --kvmem-semantic-expansion M  Complete-group materialization:\n"
@@ -256,6 +259,8 @@ void usage(std::ostream &os) {
         "                        256K,512K,1M,1.5M,2M. K/M/G suffixes + fractions\n"
         "                        allowed. Must be strictly increasing.\n"
         "                        Default: 256K,512K,1M,1.5M,2M.\n"
+        "  --session-input FILE  Tokenize FILE once and use its exact prefixes as\n"
+        "                        the ladder history. Default: synthetic corpus.\n"
         "  --session-decode-tokens N  MTP decode probe length per turn. Default: 256.\n"
         "  --session-query-tokens N  Tail tokens used as retrieval query at each\n"
         "                        ladder point. 0 disables query/replay. Default: 32.\n"
@@ -265,6 +270,10 @@ void usage(std::ostream &os) {
         "  --session-repeat-mode M  Repeated-query state: frozen restores the same\n"
         "                        checkpoint before every query; sequential keeps\n"
         "                        prior probe turns. Default: frozen.\n"
+        "  --session-prefill-probe-tokens N  Frozen-branch prefill chunk length at\n"
+        "                        every milestone. 0 disables. Default: 0.\n"
+        "  --session-prefill-probe-repeats N  Number of fixed prefill probes per\n"
+        "                        milestone. 0 disables. Default: 0.\n"
         "  --temp F              Decode-probe temperature. Default 0 (greedy);\n"
         "                        --temp>0 uses the Qwen3 sampled recipe.\n"
         "\n"
@@ -399,6 +408,9 @@ int main(int argc, char **argv) {
     int session_query_tokens = 32;
     int session_repeat_queries = 0;
     std::string session_repeat_mode = "frozen";
+    std::string session_input_path;
+    int session_prefill_probe_tokens = 0;
+    int session_prefill_probe_repeats = 0;
 
     // `qw3 archive build|query|info ...` drives the durable KVMem context
     // archive: ingest a corpus once, then attach it repeatedly at any prefix
@@ -639,10 +651,12 @@ int main(int argc, char **argv) {
                     engine.kvmem_adaptive_score_mode !=
                         "layer-one-pass" &&
                     engine.kvmem_adaptive_score_mode !=
+                        "tiled-one-pass" &&
+                    engine.kvmem_adaptive_score_mode !=
                         "tiled-two-pass") {
                     throw std::runtime_error(
                         "--kvmem-adaptive-score-mode must be "
-                        "auto|layer-one-pass|tiled-two-pass");
+                        "auto|layer-one-pass|tiled-one-pass|tiled-two-pass");
                 }
 #if 0  // Archived experimental CLI; implementation remains for future research.
             } else if (arg == "--kvmem-deltanet-layers") {
@@ -926,7 +940,7 @@ int main(int argc, char **argv) {
                 archive_build.semantic_query_tokens =
                     static_cast<uint32_t>(value);
             } else if (arg == "--archive-question") {
-                archive_run.questions.push_back(need(arg));
+                archive_run.questions.push_back({need(arg)});
             } else if (arg == "--archive-questions-file") {
                 archive_questions_path = need(arg);
             } else if (arg == "--archive-questions-json") {
@@ -951,12 +965,46 @@ int main(int argc, char **argv) {
                         "raw|qwen-chat|qwen-chat-no-thinking|"
                         "qwen-user-continuation");
                 }
+            } else if (arg == "--archive-query-token-selector") {
+                const std::string selector = need(arg);
+                if (selector == "none") {
+                    archive_run.query_attention_probe = false;
+                    archive_run.query_guided_query = false;
+                } else if (selector == "attention-probe") {
+                    archive_run.query_attention_probe = true;
+                    archive_run.query_guided_query = false;
+                } else if (selector == "guided-query") {
+                    archive_run.query_attention_probe = false;
+                    archive_run.query_guided_query = true;
+                } else {
+                    throw std::runtime_error(
+                        "--archive-query-token-selector must be "
+                        "none|attention-probe|guided-query");
+                }
+            } else if (arg == "--archive-query-probe-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value <= 0) {
+                    throw std::runtime_error(
+                        "--archive-query-probe-tokens must be > 0");
+                }
+                archive_run.query_probe_tokens =
+                    static_cast<uint32_t>(value);
+            } else if (arg == "--archive-query-score-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value <= 0) {
+                    throw std::runtime_error(
+                        "--archive-query-score-tokens must be > 0");
+                }
+                archive_run.query_score_tokens =
+                    static_cast<uint32_t>(value);
             } else if (arg == "--archive-results-file") {
                 archive_run.results_path = need(arg);
             } else if (arg == "--token-output") {
                 token_output_path = need(arg);
             } else if (arg == "--session-ladder") {
                 session_ladder = parse_ladder(need(arg), arg);
+            } else if (arg == "--session-input") {
+                session_input_path = need(arg);
             } else if (arg == "--session-decode-tokens") {
                 session_decode_tokens = parse_int(need(arg), arg);
                 if (session_decode_tokens <= 0) {
@@ -980,6 +1028,18 @@ int main(int argc, char **argv) {
                     session_repeat_mode != "sequential") {
                     throw std::runtime_error(
                         "--session-repeat-mode must be frozen|sequential");
+                }
+            } else if (arg == "--session-prefill-probe-tokens") {
+                session_prefill_probe_tokens = parse_int(need(arg), arg);
+                if (session_prefill_probe_tokens < 0) {
+                    throw std::runtime_error(
+                        "--session-prefill-probe-tokens must be >= 0");
+                }
+            } else if (arg == "--session-prefill-probe-repeats") {
+                session_prefill_probe_repeats = parse_int(need(arg), arg);
+                if (session_prefill_probe_repeats < 0) {
+                    throw std::runtime_error(
+                        "--session-prefill-probe-repeats must be >= 0");
                 }
             } else {
                 throw std::runtime_error("unknown argument: " + arg);
@@ -1170,7 +1230,7 @@ int main(int argc, char **argv) {
                 }
                 std::string line;
                 while (std::getline(qin, line)) {
-                    if (!line.empty()) archive_run.questions.push_back(line);
+                    if (!line.empty()) archive_run.questions.push_back({line});
                 }
             }
             if (!archive_questions_json_path.empty()) {
@@ -1186,12 +1246,52 @@ int main(int argc, char **argv) {
                         "--archive-questions-json must contain a JSON array");
                 }
                 for (const auto &question : questions) {
-                    if (!question.is_string()) {
-                        throw std::runtime_error(
-                            "--archive-questions-json entries must be strings");
+                    if (question.is_string()) {
+                        archive_run.questions.push_back(
+                            {question.get<std::string>()});
+                        continue;
                     }
-                    archive_run.questions.push_back(
-                        question.get<std::string>());
+                    if (!question.is_object() ||
+                        !question.contains("content") ||
+                        !question["content"].is_string() ||
+                        !question.contains("query_content_start") ||
+                        !question["query_content_start"].is_number_integer() ||
+                        !question.contains("query_content_end") ||
+                        !question["query_content_end"].is_number_integer()) {
+                        throw std::runtime_error(
+                            "--archive-questions-json entries must be strings "
+                            "or objects with string content and integer "
+                            "query_content_start/query_content_end");
+                    }
+                    const std::string content =
+                        question["content"].get<std::string>();
+                    const int64_t begin =
+                        question["query_content_start"].get<int64_t>();
+                    const int64_t end =
+                        question["query_content_end"].get<int64_t>();
+                    if (begin < 0 || end <= begin ||
+                        static_cast<uint64_t>(end) > content.size()) {
+                        throw std::runtime_error(
+                            "--archive-questions-json query content byte "
+                            "offsets are empty or outside content");
+                    }
+                    const auto is_utf8_boundary = [&](size_t offset) {
+                        return offset == content.size() ||
+                            (static_cast<unsigned char>(content[offset]) &
+                             0xc0u) != 0x80u;
+                    };
+                    if (!is_utf8_boundary(static_cast<size_t>(begin)) ||
+                        !is_utf8_boundary(static_cast<size_t>(end))) {
+                        throw std::runtime_error(
+                            "--archive-questions-json query content offsets "
+                            "must be UTF-8 byte boundaries");
+                    }
+                    qw3::KvMemArchiveRunConfig::Question parsed;
+                    parsed.content = content;
+                    parsed.query_content_start = static_cast<uint64_t>(begin);
+                    parsed.query_content_end = static_cast<uint64_t>(end);
+                    parsed.has_query_content_span = true;
+                    archive_run.questions.push_back(std::move(parsed));
                 }
             }
             if (archive_run.questions.empty()) {
@@ -1234,6 +1334,7 @@ int main(int argc, char **argv) {
                 static_cast<uint64_t>(session_repeat_queries) *
                     static_cast<uint64_t>(session_query_tokens +
                                           session_decode_tokens) +
+                static_cast<uint64_t>(session_prefill_probe_tokens) +
                 4096;
             if (engine.ctx_size <= 0 ||
                 static_cast<uint64_t>(engine.ctx_size) < need_ctx) {
@@ -1241,10 +1342,13 @@ int main(int argc, char **argv) {
             }
             qw3::KvMemSessionConfig sess;
             sess.ladder_tokens = session_ladder;
+            sess.input_path = session_input_path;
             sess.decode_tokens = session_decode_tokens;
             sess.query_tokens = session_query_tokens;
             sess.repeat_queries = session_repeat_queries;
             sess.repeat_mode = session_repeat_mode;
+            sess.prefill_probe_tokens = session_prefill_probe_tokens;
+            sess.prefill_probe_repeats = session_prefill_probe_repeats;
             if (session_repeat_queries > 0 && session_query_tokens <= 0) {
                 throw std::runtime_error(
                     "--session-repeat-queries requires "

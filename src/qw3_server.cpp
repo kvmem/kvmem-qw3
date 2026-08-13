@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -36,6 +37,103 @@ namespace qw3 {
 namespace {
 
 using json = nlohmann::json;
+
+using ServerClock = std::chrono::steady_clock;
+using ServerTimePoint = ServerClock::time_point;
+
+double server_elapsed_seconds(ServerTimePoint begin, ServerTimePoint end) {
+    return std::chrono::duration<double>(end - begin).count();
+}
+
+bool visible_stream_delta(const json &delta) {
+    for (const char *key : {"content", "reasoning_content"}) {
+        if (delta.contains(key) && delta[key].is_string() &&
+            !delta[key].get_ref<const std::string &>().empty()) {
+            return true;
+        }
+    }
+    return delta.contains("tool_calls") && delta["tool_calls"].is_array() &&
+           !delta["tool_calls"].empty();
+}
+
+// Server-side TTFT uses the request-arrival boundary, so JSON parsing,
+// rendering/tokenization, queueing, prefix restoration, KVMem reselection,
+// query replay, and the first decode step are all represented.  Keep both the
+// first non-empty model piece and the first visible streamed payload: tool and
+// reasoning framing may delay the latter even after the model has produced a
+// token.
+struct ServerTtftTracker {
+    explicit ServerTtftTracker(ServerTimePoint request_start_in)
+        : request_start(request_start_in) {}
+
+    void start_engine(ServerTimePoint when) {
+        engine_start = when;
+        engine_started = true;
+    }
+
+    void observe_model_piece(const std::string &piece) {
+        if (!first_model_seen && !piece.empty()) {
+            first_model_seen = true;
+            first_model_at = ServerClock::now();
+        }
+    }
+
+    void observe_visible_output() {
+        if (!first_output_seen) {
+            first_output_seen = true;
+            first_output_at = ServerClock::now();
+        }
+    }
+
+    json timing_json(ServerTimePoint request_end) const {
+        return json{
+            {"server_ttft_sec", first_model_seen
+                 ? json(server_elapsed_seconds(request_start, first_model_at))
+                 : json(nullptr)},
+            {"engine_ttft_sec", first_model_seen && engine_started
+                 ? json(server_elapsed_seconds(engine_start, first_model_at))
+                 : json(nullptr)},
+            {"response_ttft_sec", first_output_seen
+                 ? json(server_elapsed_seconds(request_start, first_output_at))
+                 : json(nullptr)},
+            {"request_total_sec",
+             server_elapsed_seconds(request_start, request_end)}};
+    }
+
+    void log(uint64_t rid, const std::string &route, bool streaming,
+             ServerTimePoint request_end) const {
+        const double server_ttft_ms = first_model_seen
+            ? server_elapsed_seconds(request_start, first_model_at) * 1000.0
+            : -1.0;
+        const double engine_ttft_ms = first_model_seen && engine_started
+            ? server_elapsed_seconds(engine_start, first_model_at) * 1000.0
+            : -1.0;
+        const double response_ttft_ms = first_output_seen
+            ? server_elapsed_seconds(request_start, first_output_at) * 1000.0
+            : -1.0;
+        std::cerr << std::fixed << std::setprecision(6)
+                  << "[qw3-server-ttft]"
+                  << " rid=" << rid
+                  << " route=" << route
+                  << " stream=" << (streaming ? 1 : 0)
+                  << " model_token_seen=" << (first_model_seen ? 1 : 0)
+                  << " server_ttft_ms=" << server_ttft_ms
+                  << " engine_ttft_ms=" << engine_ttft_ms
+                  << " visible_output_seen=" << (first_output_seen ? 1 : 0)
+                  << " response_ttft_ms=" << response_ttft_ms
+                  << " request_total_ms="
+                  << server_elapsed_seconds(request_start, request_end) * 1000.0
+                  << "\n";
+    }
+
+    ServerTimePoint request_start{};
+    ServerTimePoint engine_start{};
+    ServerTimePoint first_model_at{};
+    ServerTimePoint first_output_at{};
+    bool engine_started = false;
+    bool first_model_seen = false;
+    bool first_output_seen = false;
+};
 
 bool serve_continuous_batching_enabled() {
     return env_flag_enabled("QW3_CONTINUOUS_BATCHING");
@@ -3759,7 +3857,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [&, prompt, g, stops, id, created, rid, t0, enable_thinking,
+                [&, prompt, g, stops, id, created, rid, t0,
+                 server_request_start, enable_thinking,
                  tool_request, forced_tool_request, tools_schema,
                  stream_include_usage, prompt_token_count, route,
                  fallback_reason, kvmem_session_request,
@@ -3776,6 +3875,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     bool client_closed = false;
                     auto engine_start = std::chrono::steady_clock::now();
                     auto engine_end = engine_start;
+                    ServerTtftTracker ttft(server_request_start);
                     auto last_stream_write = std::chrono::steady_clock::now();
                     auto send_raw = [&](const std::string &s) {
                         if (client_closed) return false;
@@ -3801,7 +3901,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 {"delta", delta},
                                 {"finish_reason", nullptr}}})}};
                         const std::string s = "data: " + dump_json(chunk) + "\n\n";
-                        return send_raw(s);
+                        const bool sent = send_raw(s);
+                        if (sent && visible_stream_delta(delta)) {
+                            ttft.observe_visible_output();
+                        }
+                        return sent;
                     };
                     auto send_role = [&]() {
                         json chunk = {
@@ -3830,6 +3934,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                     kvmem_cache_info_json(info);
                             }
                         }
+                        done["timing"] =
+                            ttft.timing_json(std::chrono::steady_clock::now());
                         const std::string ds = "data: " + dump_json(done) + "\n\n";
                         send_raw(ds);
                         if (stream_include_usage) {
@@ -3853,16 +3959,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         auto generate_request =
                             [&](const CancellableTokenCallback &callback) {
                             engine_start = std::chrono::steady_clock::now();
+                            ttft.start_engine(engine_start);
+                            auto tracked_callback =
+                                [&](const std::string &piece) {
+                                    ttft.observe_model_piece(piece);
+                                    return callback(piece);
+                                };
                             if (kvmem_session_request) {
                                 eng.generate_session_stream(
                                     prompt, g,
                                     [&](const std::string &piece) {
-                                        (void)callback(piece);
+                                        (void)tracked_callback(piece);
                                     },
                                     kvmem_session_reset);
                             } else {
                                 eng.generate_stream_cancellable(
-                                    prompt, g, callback);
+                                    prompt, g, tracked_callback);
                             }
                             engine_end = std::chrono::steady_clock::now();
                         };
@@ -4028,9 +4140,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             });
 
                             if (client_closed) {
+                                const auto request_end =
+                                    std::chrono::steady_clock::now();
+                                ttft.log(rid, route, true, request_end);
                                 log_server_accounting(
                                     engine_start, engine_end,
-                                    std::chrono::steady_clock::now(), true);
+                                    request_end, true);
                                 std::cerr << "[qw3-serve] #" << rid
                                           << " chat(stream tools) chars="
                                           << acc.size()
@@ -4152,9 +4267,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                       << " incremental_tool="
                                       << (incremental.streaming() ? "true" : "false")
                                       << "\n";
+                            const auto request_end =
+                                std::chrono::steady_clock::now();
+                            ttft.log(rid, route, true, request_end);
                             log_server_accounting(
                                 engine_start, engine_end,
-                                std::chrono::steady_clock::now(), true);
+                                request_end, true);
                             return true;
                         }
                         generate_request([&](const std::string &piece) {
@@ -4189,9 +4307,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                   << " route=" << route
                                   << (client_closed ? " client_closed=true" : "")
                                   << "\n";
+                        const auto request_end =
+                            std::chrono::steady_clock::now();
+                        ttft.log(rid, route, true, request_end);
                         log_server_accounting(
                             engine_start, engine_end,
-                            std::chrono::steady_clock::now(), true);
+                            request_end, true);
                         return true;
                     } catch (const std::exception &e) {
                         json chunk = {
@@ -4209,6 +4330,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         sink.done();
                         std::cerr << "[qw3-serve] #" << rid
                                   << " chat(stream) error=" << e.what() << "\n";
+                        ttft.log(rid, route, true,
+                                 std::chrono::steady_clock::now());
                         return false;
                     }
                 });
@@ -4219,28 +4342,34 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         size_t completion_tokens = 0;
         auto engine_start = std::chrono::steady_clock::now();
         auto engine_end = engine_start;
+        ServerTtftTracker ttft(server_request_start);
+        auto consume_piece = [&](const std::string &piece) {
+            ttft.observe_model_piece(piece);
+            ++completion_tokens;
+            text += piece;
+        };
         try {
             if (kvmem_session_request) {
                 std::lock_guard<std::mutex> lk(gen_mu);
                 engine_start = std::chrono::steady_clock::now();
+                ttft.start_engine(engine_start);
                 eng.generate_session_stream(
                     prompt, g, [&](const std::string &piece) {
-                        ++completion_tokens;
-                        text += piece;
+                        consume_piece(piece);
                     }, kvmem_session_reset);
             } else if (g.continuous_batching) {
                 engine_start = std::chrono::steady_clock::now();
+                ttft.start_engine(engine_start);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
-                    ++completion_tokens;
-                    text += piece;
+                    consume_piece(piece);
                     return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
                 engine_start = std::chrono::steady_clock::now();
+                ttft.start_engine(engine_start);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
-                    ++completion_tokens;
-                    text += piece;
+                    consume_piece(piece);
                     return true;
                 });
             }
@@ -4291,7 +4420,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 {"index", 0},
                 {"message", message},
                 {"finish_reason", finish}}})},
-            {"usage", usage_json(prompt_token_count, completion_tokens)}};
+            {"usage", usage_json(prompt_token_count, completion_tokens)},
+            {"timing", ttft.timing_json(std::chrono::steady_clock::now())}};
         if (kvmem_cache_request) {
             const KvMemLocalCacheInfo info =
                 eng.kvmem_local_cache_info(kvmem_cache_id);
@@ -4304,12 +4434,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             out["kvmem_cache"] = kvmem_cache_info_json(info);
         }
         res.set_content(dump_json(out), "application/json");
+        const auto request_end = std::chrono::steady_clock::now();
+        ttft.log(rid, route, false, request_end);
         log_server_accounting(
-            engine_start, engine_end, std::chrono::steady_clock::now(), false);
+            engine_start, engine_end, request_end, false);
     });
 
     svr.Post("/v1/completions", [&](const httplib::Request &hreq,
                                     httplib::Response &res) {
+        const auto server_request_start = std::chrono::steady_clock::now();
         json req;
         try {
             req = json::parse(hreq.body);
@@ -4681,11 +4814,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
         std::string text;
         size_t completion_tokens = 0;
-        const auto generation_start = std::chrono::steady_clock::now();
+        auto generation_start = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point first_token_at{};
         bool first_token_seen = false;
+        ServerTtftTracker ttft(server_request_start);
         auto consume_piece = [&](const std::string &piece) {
             ++completion_tokens;
+            ttft.observe_model_piece(piece);
             if (!first_token_seen && !piece.empty()) {
                 first_token_seen = true;
                 first_token_at = std::chrono::steady_clock::now();
@@ -4695,15 +4830,21 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         try {
             if (kvmem_session_request) {
                 std::lock_guard<std::mutex> lk(gen_mu);
+                generation_start = std::chrono::steady_clock::now();
+                ttft.start_engine(generation_start);
                 eng.generate_session_stream(
                     prompt, g, consume_piece, kvmem_session_reset);
             } else if (g.continuous_batching) {
+                generation_start = std::chrono::steady_clock::now();
+                ttft.start_engine(generation_start);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     consume_piece(piece);
                     return true;
                 });
             } else {
                 std::lock_guard<std::mutex> lk(gen_mu);
+                generation_start = std::chrono::steady_clock::now();
+                ttft.start_engine(generation_start);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
                     consume_piece(piece);
                     return true;
@@ -4728,6 +4869,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             std::cerr << " fallback_reason=" << fallback_reason;
         }
         std::cerr << "\n";
+        const auto response_build_at = std::chrono::steady_clock::now();
+        json timing = ttft.timing_json(response_build_at);
+        // Preserve the original engine-relative field for existing clients.
+        timing["first_token_sec"] = first_token_seen
+            ? json(std::chrono::duration<double>(
+                  first_token_at - generation_start).count())
+            : json(nullptr);
         json out = {
             {"id", id}, {"object", "text_completion"}, {"created", created},
             {"model", model_id},
@@ -4736,13 +4884,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 {"finish_reason", generation_finish_reason(
                     stopped, completion_tokens, g.max_tokens)}}})},
             {"usage", usage_json(prompt_token_count, completion_tokens)},
-            {"timing", json{
-                {"first_token_sec", first_token_seen
-                    ? json(std::chrono::duration<double>(
-                          first_token_at - generation_start).count())
-                    : json(nullptr)},
-                {"request_total_sec", std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - generation_start).count()}}}};
+            {"timing", std::move(timing)}};
         if (kvmem_cache_request) {
             std::lock_guard<std::mutex> lk(gen_mu);
             const KvMemLocalCacheInfo info =
@@ -4756,6 +4898,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             out["kvmem_cache"] = kvmem_cache_info_json(info);
         }
         res.set_content(dump_json(out), "application/json");
+        ttft.log(rid, route, false, std::chrono::steady_clock::now());
     });
 
     svr.set_logger([](const httplib::Request &req, const httplib::Response &res) {

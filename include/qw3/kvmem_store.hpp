@@ -225,6 +225,7 @@ enum class KvMemAdaptiveScoreMode : uint8_t {
     Auto = 0,
     LayerOnePass = 1,
     TiledTwoPass = 2,
+    TiledOnePass = 3,
 };
 
 struct KvMemStoreConfig {
@@ -310,6 +311,11 @@ struct KvMemStoreConfig {
     double gpu_high_watermark = 0.95;
     double gpu_low_watermark = 0.85;
     uint32_t estimated_gpu_block_capacity = 0;
+    // Complete GPU-resident K+V bytes for one logical block.  This differs
+    // from estimated_block_bytes in immutable-source mode, where the lower
+    // tiers store position-free K separately and each spill record contains
+    // only V.  Resource reporting must use this value for the GPU page pool.
+    uint64_t gpu_resident_block_bytes = 0;
     uint64_t estimated_block_bytes = 0;
     uint64_t cpu_tier_bytes = 0;
     uint64_t nvme_tier_bytes = 0;

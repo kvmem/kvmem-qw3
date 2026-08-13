@@ -298,7 +298,8 @@ public:
     void kvmem_begin_query_replay(const StateSnapshot &boundary,
                                   const std::vector<uint32_t> &context_block_ids,
                                   bool reset_recurrent_state = false,
-                                  bool preserve_selected_context = false);
+                                  bool preserve_selected_context = false,
+                                  bool preserve_query_capture = false);
     void kvmem_end_query_replay();
     // Use otherwise-idle generation-reserve pages to bring a bounded set of
     // CPU-resident, historically hot blocks back to GPU while the first-pass
@@ -398,6 +399,30 @@ public:
         return expected > 0 && g_query_multi_ready_ &&
             g_query_multi_count_ >= expected;
     }
+    // Bound the query scorer's GPU staging allocation before prefill. This is a
+    // request-local hint: zero preserves the environment/default threshold.
+    void kvmem_set_query_score_budget_hint(uint32_t tokens) {
+        kvmem_query_score_budget_hint_ = tokens;
+    }
+    // Select exact query rows (zero-based within kvmem_query_*). An empty list
+    // preserves the existing full-query / uniform-midpoint scorer behavior.
+    void kvmem_set_query_score_token_indices(
+        const std::vector<uint32_t> &indices);
+    // Accumulate true decode attention mass over individual query positions at
+    // one representative standard-attention layer. The caller owns rollback.
+    bool kvmem_begin_query_attention_probe(uint32_t begin, uint32_t end);
+    std::vector<float> kvmem_end_query_attention_probe();
+    void kvmem_cancel_query_attention_probe();
+    // Reversible guided retrieval. While active, ordinary decode-side KVMem
+    // bookkeeping is suppressed. Capture may be toggled per generated token so
+    // reasoning/control/separator tokens are fed normally but only the compact
+    // retrieval query's Q rows are retained. `end` publishes [L,K,H,D].
+    bool kvmem_begin_guided_query_probe(uint32_t query_capacity);
+    void kvmem_set_guided_query_capture(bool capture) {
+        kvmem_guided_query_capture_this_token_ = capture;
+    }
+    uint32_t kvmem_end_guided_query_probe();
+    void kvmem_cancel_guided_query_probe();
     // Publish the incrementally captured mean-K index for the CURRENT logical
     // prefix, even though the full teacher-forced transcript has not yet been
     // consumed. Used only by experimental transcript replay before an
@@ -491,7 +516,9 @@ public:
         bool     enabled = false;
         bool     active = false;
         uint64_t total_blocks = 0;
-        uint64_t block_bytes = 0;
+        uint64_t block_bytes = 0;          // lower-tier spill record bytes
+        uint64_t gpu_block_bytes = 0;      // complete resident K+V bytes
+        uint64_t logical_kv_bytes = 0;     // complete K+V for all blocks
         bool     gpu_pool = false;          // bounded pool present (i.e. spilling)
         uint64_t gpu_used_bytes = 0;
         uint64_t gpu_capacity_bytes = 0;
@@ -505,8 +532,27 @@ public:
         uint64_t nvme_capacity_bytes = 0;
         uint64_t nvme_raw_k_bytes = 0;
         uint64_t nvme_spill_bytes = 0;
+        // Physical bytes currently occupied outside the GPU (including clean
+        // cache copies).  persistent_authority_bytes de-duplicates those
+        // copies and counts the unique raw-K + V authority required to retain
+        // the addressable workspace.
+        uint64_t external_physical_bytes = 0;
+        uint64_t persistent_authority_bytes = 0;
     };
     KvMemTierUsage kvmem_tier_usage() const;
+
+    struct KvMemIndexUsage {
+        bool enabled = false;
+        bool cpu_placement = false;
+        bool adaptive = false;
+        uint64_t value_bytes = 0;
+        uint64_t metadata_bytes = 0;
+        uint64_t logical_bytes = 0;
+        uint64_t capacity_bytes = 0;
+        uint64_t prototypes = 0;
+        uint32_t indexed_blocks = 0;
+    };
+    KvMemIndexUsage kvmem_index_usage() const;
     // Extend the assembled window so `n` verify tokens can append at the window
     // tail. True KV for [true_base_pos, true_base_pos+n) must already be
     // allocated (caller runs prepare_kv_pages first). No-op unless kvmem is
@@ -1635,6 +1681,8 @@ private:
     uint32_t g_query_capture_next_slot_ = 0;
     std::unique_ptr<HostBuffer> g_query_score_pinned_;         // packed [L,C,H,D]
     uint64_t g_query_score_pinned_capacity_ = 0;               // bytes
+    uint32_t kvmem_query_score_budget_hint_ = 0;
+    std::vector<uint32_t> kvmem_query_score_token_indices_;
     // Clean-query prefill (task #50). The PASS-A isolated-question query is stashed
     // here; it is NOT touched by reset_state so it survives the pass boundary.
     std::unique_ptr<DeviceTensor> g_query_multi_clean_;        // GPU stash; preserves FP16/FP32 dtype
@@ -1819,11 +1867,22 @@ private:
 
     // CPU-offloaded mean-K index (--kvmem-index-placement cpu). The canonical
     // full index keeps the same fixed-stride layer-major byte layout as
-    // g_kbar_multi_, but lives in pageable host memory. Two fixed-size pinned
-    // host/device slots serve both incremental prefill D2H capture and exact
-    // two-pass retrieval H2D streaming.
+    // g_kbar_multi_. CUDA normally stores each layer in its own pinned host
+    // allocation, matching the Adaptive index authority: scoring can enqueue
+    // every layer slice directly into a bounded device tile without first
+    // repacking the complete index through a bounce buffer. The legacy
+    // pageable allocation remains as a graceful fallback when pinning fails.
+    // Two fixed-size pinned host/device slots still serve incremental prefill
+    // D2H capture and the fallback packed scorer.
     struct MeanIndexStageSlot {
         std::unique_ptr<DeviceTensor> device;
+        // Plain Mean-K is the degenerate Adaptive layout with exactly one
+        // prototype per block.  These fixed metadata tensors let its streamed
+        // scorer reuse the existing Adaptive Tensor-GEMM reductions.
+        std::unique_ptr<DeviceTensor> block_offsets;
+        std::unique_ptr<DeviceTensor> block_counts;
+        std::vector<std::unique_ptr<DeviceTensor>> gemm_layer_views;
+        uint32_t gemm_view_blocks = 0;
         std::unique_ptr<HostBuffer> host;
         std::unique_ptr<DeviceTransferFence> transfer_done;
         std::unique_ptr<DeviceTransferFence> compute_done;
@@ -1834,6 +1893,9 @@ private:
         uint64_t capture_bytes = 0;
     };
     std::unique_ptr<uint8_t[]> g_kbar_multi_host_;
+    std::vector<std::unique_ptr<HostBuffer>>
+        g_kbar_multi_host_layers_;
+    uint64_t g_kbar_multi_host_layer_bytes_ = 0;
     uint64_t g_kbar_multi_host_capacity_bytes_ = 0;
     uint64_t g_kbar_multi_host_bytes_ = 0;
     uint32_t g_kbar_multi_host_elem_size_ = 0;
@@ -1850,6 +1912,12 @@ private:
     bool kvmem_mean_index_cpu() const;
     bool kvmem_mean_index_available() const;
     bool kvmem_adaptive_prototypes() const;
+    bool kvmem_mean_index_host_layers_ready() const;
+    bool kvmem_mean_index_host_layers_pinned() const;
+    uint8_t *kvmem_mean_index_host_layer_data(uint32_t layer);
+    const uint8_t *kvmem_mean_index_host_layer_data(
+        uint32_t layer) const;
+    void kvmem_clear_cpu_mean_index_storage();
     void kvmem_prepare_cpu_mean_index(uint64_t elements, uint32_t layers,
                                       uint32_t stride_blocks,
                                       bool preserve_content_index);
@@ -1891,7 +1959,10 @@ private:
         uint32_t q_layer_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
         uint32_t accumulate, std::string *failure_reason);
-    bool kvmem_score_cpu_adaptive_index(
+    // Unified CPU prototype-index scorer. Adaptive supplies a variable number
+    // of prototypes per block; plain Mean-K supplies the degenerate implicit
+    // view offset[b]=b,count[b]=1 over its canonical per-layer host index.
+    bool kvmem_score_cpu_prototype_index(
         uint32_t n_blocks, uint32_t n_tokens,
         uint32_t q_layer_stride, float scale,
         uint32_t excl_lo_end, uint32_t excl_hi_begin,
@@ -2030,6 +2101,40 @@ private:
     uint64_t kvmem_attn_trace_sample_ = 0;
     uint32_t kvmem_attn_trace_mass_capacity_ = 0;
     std::unique_ptr<DeviceTensor> kvmem_attn_trace_mass_;
+
+    // Request-local attention probe. Query positions are represented as
+    // one-token buckets in compact-window coordinates; every probe decode step
+    // atomic-adds into one device vector and only the final result crosses PCIe.
+    void kvmem_accumulate_query_attention_probe(
+        uint32_t layer_index, const DeviceTensor &k_cache,
+        const DeviceTensor &q, uint32_t q_stride,
+        const DeviceTensor &page_indices, uint32_t n_pages,
+        uint32_t seq_len, float scale);
+    bool kvmem_query_attention_probe_active_ = false;
+    uint32_t kvmem_query_attention_probe_count_ = 0;
+    uint32_t kvmem_query_attention_probe_steps_ = 0;
+    uint32_t kvmem_query_attention_probe_capacity_ = 0;
+    std::vector<int32_t> kvmem_query_attention_probe_base_host_;
+    std::vector<int32_t> kvmem_query_attention_probe_tokens_host_;
+    std::unique_ptr<DeviceTensor> kvmem_query_attention_probe_base_dev_;
+    std::unique_ptr<DeviceTensor> kvmem_query_attention_probe_tokens_dev_;
+    std::unique_ptr<DeviceTensor> kvmem_query_attention_probe_mass_;
+
+    bool kvmem_query_probe_guard_active() const {
+        return kvmem_query_attention_probe_active_ ||
+               kvmem_guided_query_probe_active_;
+    }
+    void kvmem_capture_guided_query(uint32_t layer_index,
+                                    const DeviceTensor &q,
+                                    uint32_t q_stride,
+                                    uint32_t rope_pos);
+    bool kvmem_guided_query_probe_active_ = false;
+    bool kvmem_guided_query_capture_this_token_ = false;
+    bool kvmem_guided_query_capture_failed_ = false;
+    uint32_t kvmem_guided_query_capacity_ = 0;
+    uint32_t kvmem_guided_query_count_ = 0;
+    uint64_t kvmem_guided_query_tensor_capacity_ = 0;
+    std::unique_ptr<DeviceTensor> kvmem_guided_query_dev_;
 
     // ---- Global attention-distribution diagnostics ------------------------
     // Enabled when QW3_ATTN_TRACE points at a JSONL output path. Unlike the

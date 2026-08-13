@@ -1269,11 +1269,12 @@ public:
                                                       uint32_t n_pages,
                                                       uint32_t page_size,
                                                       uint32_t seq_len,
-                                                      float scale) {
+                                                      float scale,
+                                                      bool reset_output = true) {
         (void)mass; (void)q; (void)q_stride; (void)k_cache; (void)n_window_blocks;
         (void)n_heads; (void)n_kv_heads; (void)per_pos_size; (void)head_dim;
         (void)win_base; (void)blk_tokens; (void)page_indices; (void)n_pages;
-        (void)page_size; (void)seq_len; (void)scale;
+        (void)page_size; (void)seq_len; (void)scale; (void)reset_output;
         return {false, "block_attention_mass_paged_device requires backend override"};
     }
 

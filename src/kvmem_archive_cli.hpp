@@ -47,6 +47,17 @@ struct KvMemArchiveBuildConfig {
 // context. Every question runs from the same attached prefix, which is the
 // point: it isolates the cost and the answer quality of the question itself.
 struct KvMemArchiveRunConfig {
+    struct Question {
+        std::string content;
+        // Optional UTF-8 byte offsets into content.  When present, only this
+        // substring is the retrieval score query; the complete content remains
+        // the answer-producing replay span.  Absence preserves the legacy
+        // behavior where the complete content is both score and replay span.
+        uint64_t query_content_start = 0;
+        uint64_t query_content_end = 0;
+        bool has_query_content_span = false;
+    };
+
     enum class QuestionFormat {
         // Backward-compatible diagnostic mode: append the supplied bytes as-is
         // and use every appended token as the retrieval query.
@@ -69,13 +80,20 @@ struct KvMemArchiveRunConfig {
     // allowed; the nearest ladder point at or below it is restored and the
     // residual is re-prefilled from the archived token stream.
     uint64_t tokens = 0;
-    std::vector<std::string> questions;
+    std::vector<Question> questions;
     int max_tokens = 128;
     float temperature = 0.0f;
     float top_p = 1.0f;
     int top_k = 0;
     int thinking_budget = 0;
     QuestionFormat question_format = QuestionFormat::Raw;
+    // Default off. The mutually-exclusive CLI selectors either retain top
+    // original-query rows from a reversible attention probe, or retain only a
+    // compact query generated after reversible private reasoning.
+    bool query_attention_probe = false;
+    bool query_guided_query = false;
+    uint32_t query_probe_tokens = 100;
+    uint32_t query_score_tokens = 64;
     // Optional machine-readable result stream. One JSON object is flushed
     // after every completed question so long benchmark rows remain auditable
     // even if a later question fails.

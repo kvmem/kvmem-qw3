@@ -96,9 +96,24 @@ _QUERY_ROW_RE = re.compile(
     r"capture_ms=([\d.eE+-]+) restore_ms=([\d.eE+-]+) "
     r"total_ms=([\d.eE+-]+) semantic_ms=([\d.eE+-]+) "
     r"replay_ms=([\d.eE+-]+) decode_ms=([\d.eE+-]+) "
+    r"(?:first_token_ms=([\d.eE+-]+) )?"
     r"score_ms=([\d.eE+-]+) stage_in_ms=([\d.eE+-]+) "
     r"stage_out_ms=([\d.eE+-]+) assemble_ms=([\d.eE+-]+) "
     r"stage_in_blocks=(\d+) stage_out_blocks=(\d+) decoded=(\d+)")
+_RESOURCE_RE = re.compile(
+    r"\[kvmem-session-resource\] turn=(\d+) workspace_tokens=(\d+) "
+    r"blocks=(\d+) logical_kv_bytes=(\d+) gpu_kv_used_bytes=(\d+) "
+    r"gpu_kv_capacity_bytes=(\d+) external_physical_bytes=(\d+) "
+    r"persistent_authority_bytes=(\d+) cpu_kv_bytes=(\d+) "
+    r"nvme_kv_bytes=(\d+) index_value_bytes=(\d+) "
+    r"index_metadata_bytes=(\d+) index_logical_bytes=(\d+) "
+    r"index_capacity_bytes=(\d+) index_prototypes=(\d+) "
+    r"indexed_blocks=(\d+) index_cpu=(\d+) index_adaptive=(\d+)")
+_PREFILL_PROBE_RE = re.compile(
+    r"\[kvmem-session-prefill-probe\] turn=(\d+) probe=(\d+) "
+    r"base=(\d+) final=(\d+) tokens=(\d+) restore_ms=([\d.eE+-]+) "
+    r"prefill_ms=([\d.eE+-]+) total_ms=([\d.eE+-]+) "
+    r"prefill_tps=([\d.eE+-]+)")
 
 
 def _gib(nbytes: float) -> float:
@@ -282,13 +297,50 @@ def parse_repeated_queries(log: str) -> List[dict]:
             "semantic_ms": float(g[10]),
             "query_replay_ms": float(g[11]),
             "decode_ms": float(g[12]),
-            "score_ms": float(g[13]),
-            "stage_in_ms": float(g[14]),
-            "stage_out_ms": float(g[15]),
-            "assemble_ms": float(g[16]),
-            "stage_in_blocks": int(g[17]),
-            "stage_out_blocks": int(g[18]),
-            "decoded": int(g[19]),
+            "first_token_ms": None if g[13] is None else float(g[13]),
+            "score_ms": float(g[14]),
+            "stage_in_ms": float(g[15]),
+            "stage_out_ms": float(g[16]),
+            "assemble_ms": float(g[17]),
+            "stage_in_blocks": int(g[18]),
+            "stage_out_blocks": int(g[19]),
+            "decoded": int(g[20]),
+        })
+    return out
+
+
+def parse_resources(log: str) -> List[dict]:
+    """Parse exact milestone resource snapshots."""
+    keys = (
+        "turn", "workspace_tokens", "blocks", "logical_kv_bytes",
+        "gpu_kv_used_bytes", "gpu_kv_capacity_bytes",
+        "external_physical_bytes", "persistent_authority_bytes",
+        "cpu_kv_bytes", "nvme_kv_bytes", "index_value_bytes",
+        "index_metadata_bytes", "index_logical_bytes",
+        "index_capacity_bytes", "index_prototypes", "indexed_blocks",
+        "index_cpu", "index_adaptive",
+    )
+    return [
+        {key: int(value) for key, value in zip(keys, match.groups())}
+        for match in _RESOURCE_RE.finditer(log)
+    ]
+
+
+def parse_prefill_probes(log: str) -> List[dict]:
+    """Parse fixed frozen-branch prefill probes."""
+    out: List[dict] = []
+    for match in _PREFILL_PROBE_RE.finditer(log):
+        g = match.groups()
+        out.append({
+            "turn": int(g[0]),
+            "probe": int(g[1]),
+            "base_pos": int(g[2]),
+            "final_pos": int(g[3]),
+            "tokens": int(g[4]),
+            "restore_ms": float(g[5]),
+            "prefill_ms": float(g[6]),
+            "total_ms": float(g[7]),
+            "prefill_tps": float(g[8]),
         })
     return out
 
@@ -309,6 +361,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--qw3", default="./build/qw3")
     ap.add_argument("--model", required=True)
+    ap.add_argument("--input", default="",
+                    help="real history text file; default uses synthetic corpus")
     ap.add_argument("--ladder", default="256K,512K,1M,1.5M,2M",
                     help="comma-separated cumulative ctx targets (K/M suffixes)")
     ap.add_argument("--decode-tokens", type=int, default=256,
@@ -323,6 +377,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     default="frozen",
                     help="restore the same milestone before every query or "
                          "preserve earlier probe turns")
+    ap.add_argument("--prefill-probe-tokens", type=int, default=0,
+                    help="fixed frozen-branch prefill chunk per milestone")
+    ap.add_argument("--prefill-probe-repeats", type=int, default=0)
     ap.add_argument("--temp", type=float, default=0.0,
                     help="decode-probe temperature (0=greedy, default). temp>0 "
                          "routes the Qwen3 sampled recipe (top_p=0.95 top_k=20)")
@@ -331,6 +388,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="retrieval window in tokens (--kvmem-budget)")
     ap.add_argument("--gen-budget", type=int, default=32768)
     ap.add_argument("--block-tokens", type=int, default=16)
+    ap.add_argument("--sink-tokens", type=int, default=-1,
+                    help="explicit always-kept prefix tokens; -1 uses engine default")
+    ap.add_argument("--recent-tokens", type=int, default=-1,
+                    help="explicit always-kept suffix tokens; -1 uses engine default")
     ap.add_argument("--method", default="retrieval")
     ap.add_argument("--retrieval-method", default="mean-k",
                     choices=("mean-k", "sub-block-mean-k",
@@ -339,6 +400,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--subblocks", type=int, default=1)
     ap.add_argument("--adaptive-gain-1to2", type=float, default=0.10)
     ap.add_argument("--adaptive-gain-2to4", type=float, default=0.06)
+    ap.add_argument(
+        "--adaptive-score-mode", default="auto",
+        choices=("auto", "layer-one-pass", "tiled-one-pass", "tiled-two-pass"),
+    )
     ap.add_argument("--index-placement", choices=("gpu", "cpu"),
                     default="gpu")
     ap.add_argument("--index-staging-mb", type=int, default=64)
@@ -375,6 +440,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("--repeat-queries must be >= 0")
     if args.repeat_queries > 0 and args.query_tokens <= 0:
         raise SystemExit("--repeat-queries requires --query-tokens > 0")
+    if args.prefill_probe_repeats > 0 and args.prefill_probe_tokens <= 0:
+        raise SystemExit("--prefill-probe-repeats requires positive tokens")
 
     qw3 = Path(args.qw3)
     model = Path(args.model)
@@ -423,11 +490,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--kvmem-subblocks", str(args.subblocks),
         "--kvmem-adaptive-gain-1to2", str(args.adaptive_gain_1to2),
         "--kvmem-adaptive-gain-2to4", str(args.adaptive_gain_2to4),
+        "--kvmem-adaptive-score-mode", args.adaptive_score_mode,
         "--kvmem-index-placement", args.index_placement,
         "--kvmem-index-staging-mb", str(args.index_staging_mb),
         "--kvmem-numa-policy", args.numa_policy,
         "--kvmem-gpu-memory-ratio", str(args.gpu_ratio),
     ]
+    if args.sink_tokens >= 0:
+        cmd += ["--kvmem-sink-tokens", str(args.sink_tokens)]
+    if args.recent_tokens >= 0:
+        cmd += ["--kvmem-recent-tokens", str(args.recent_tokens)]
+    if args.input:
+        cmd += ["--session-input", args.input]
     # Keep the default command line byte-compatible with older binaries and
     # already-running ablation queues. The new flags are emitted only when the
     # milestone fan-out is explicitly requested.
@@ -435,6 +509,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         cmd += [
             "--session-repeat-queries", str(args.repeat_queries),
             "--session-repeat-mode", args.repeat_mode,
+        ]
+    if args.prefill_probe_repeats > 0:
+        cmd += [
+            "--session-prefill-probe-tokens",
+            str(args.prefill_probe_tokens),
+            "--session-prefill-probe-repeats",
+            str(args.prefill_probe_repeats),
         ]
     cmd += ["--no-kvmem-immutable-k" if args.no_immutable_k
             else "--kvmem-immutable-k"]
@@ -513,6 +594,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     turns = parse_turns(log)
     repeated_queries = parse_repeated_queries(log)
+    resources = parse_resources(log)
+    prefill_probes = parse_prefill_probes(log)
     summary = parse_summary(log)
     for t in turns:
         s = summary.get(int(t["turn"]))
@@ -558,13 +641,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if repeated_queries:
         print(f"\n{'turn':>4s} {'q':>3s} {'mode':>10s} {'base':>10s} "
               f"{'restore':>9s} {'total':>9s} {'semantic':>9s} "
-              f"{'replay':>9s} {'score':>8s} {'stagein':>8s} "
+              f"{'replay':>9s} {'ttft':>9s} {'score':>8s} {'stagein':>8s} "
               f"{'stageout':>9s} {'assemble':>9s}", flush=True)
         for q in repeated_queries:
             print(f"{q['turn']:4d} {q['query']:3d} {q['mode']:>10s} "
                   f"{q['base_pos']:10d} {q['restore_ms']:9.3f} "
                   f"{q['total_ms']:9.3f} {q['semantic_ms']:9.3f} "
-                  f"{q['query_replay_ms']:9.3f} {q['score_ms']:8.3f} "
+                  f"{q['query_replay_ms']:9.3f} "
+                  f"{q['first_token_ms'] if q['first_token_ms'] is not None else float('nan'):9.3f} "
+                  f"{q['score_ms']:8.3f} "
                   f"{q['stage_in_ms']:8.3f} {q['stage_out_ms']:9.3f} "
                   f"{q['assemble_ms']:9.3f}", flush=True)
 
@@ -581,6 +666,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "peak_host_rss_mib": sampler.peak_rss,
         "log_path": logf.name,
         "turns": turns,
+        "resources": resources,
+        "prefill_probes": prefill_probes,
         "repeated_queries": repeated_queries,
     }
     Path(args.out_json).write_text(json.dumps(out, indent=2), encoding="utf-8")

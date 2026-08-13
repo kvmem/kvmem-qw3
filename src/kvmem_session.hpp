@@ -19,6 +19,9 @@ struct KvMemSessionConfig {
     // 1572864, 2097152}. Each turn prefills the delta needed to bring the
     // running position up to the next target before the decode probe.
     std::vector<uint64_t> ladder_tokens;
+    // Optional real history corpus. When set, the file is tokenized once and
+    // exact prefix slices drive the ladder instead of the synthetic corpus.
+    std::string input_path;
     // Tokens to decode (MTP) at each ladder point to sample steady-state TBT.
     int decode_tokens = 256;
     // Final tokens of each synthetic append that act as an absolute-position
@@ -34,6 +37,11 @@ struct KvMemSessionConfig {
     // restored after the probes so the next ladder delta remains exact.
     int repeat_queries = 0;
     std::string repeat_mode = "frozen"; // frozen|sequential
+    // Fixed frozen-branch prefill probes at every milestone. Each probe
+    // restores the milestone, appends the same token chunk with final semantic
+    // re-selection disabled, records prefill_s, then restores again.
+    int prefill_probe_tokens = 0;
+    int prefill_probe_repeats = 0;
     // Decode-probe sampling. Default is greedy (temp=0) for a stable
     // steady-state throughput probe; --temp/--top-p/--top-k route the Qwen3
     // sampled path (MTP is distribution-lossless under temp>0).
