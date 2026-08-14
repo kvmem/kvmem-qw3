@@ -123,12 +123,35 @@ def timed_completion(url: str, payload: dict[str, Any], timeout: int) -> dict[st
     body = post_json(url, payload, timeout)
     total = time.perf_counter() - started
     timing = body.get("timing") or {}
-    first_token_sec = timing.get("first_token_sec")
-    if not isinstance(first_token_sec, (int, float)):
-        raise RuntimeError(f"completion lacks first-token timing: {body}")
+    # ``server_ttft_sec`` starts at HTTP request arrival and therefore covers
+    # parsing/tokenization, queueing, prefix restore, KVMem reselection, query
+    # replay, query prefill, and the first decode step.  The legacy
+    # ``first_token_sec`` starts only when the engine is entered and is kept as
+    # a diagnostic, not as the paper's pre-answer-latency boundary.
+    server_ttft_sec = timing.get("server_ttft_sec")
+    engine_ttft_sec = timing.get("engine_ttft_sec")
+    response_ttft_sec = timing.get("response_ttft_sec")
+    legacy_first_token_sec = timing.get("first_token_sec")
+    if not isinstance(server_ttft_sec, (int, float)):
+        raise RuntimeError(f"completion lacks server-side TTFT: {body}")
     choice = (body.get("choices") or [{}])[0]
     return {
-        "client_ttft_ms": float(first_token_sec) * 1000.0,
+        "server_ttft_ms": float(server_ttft_sec) * 1000.0,
+        "engine_ttft_ms": (
+            float(engine_ttft_sec) * 1000.0
+            if isinstance(engine_ttft_sec, (int, float)) else None
+        ),
+        "response_ttft_ms": (
+            float(response_ttft_sec) * 1000.0
+            if isinstance(response_ttft_sec, (int, float)) else None
+        ),
+        "legacy_engine_first_token_ms": (
+            float(legacy_first_token_sec) * 1000.0
+            if isinstance(legacy_first_token_sec, (int, float)) else None
+        ),
+        # Retain the old field name for readers of existing artifacts, but
+        # make it explicitly equal to the request-arrival metric.
+        "client_ttft_ms": float(server_ttft_sec) * 1000.0,
         "client_first_reasoning_ms": None,
         "client_first_content_ms": None,
         "client_total_ms": total * 1000.0,
@@ -198,7 +221,17 @@ def main() -> None:
     parser.add_argument("--block-tokens", type=int, required=True)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument("--thinking-budget", type=int, default=8192)
+    parser.add_argument(
+        "--prefill-window",
+        choices=("pressure", "semantic_chunk"),
+        default="pressure",
+        help="history-KV construction policy from the matching utility run",
+    )
+    parser.add_argument("--prefill-semantic-start-tokens", type=int, default=0)
+    parser.add_argument("--prefill-semantic-query-tokens", type=int, default=0)
     parser.add_argument(
         "--final-reselect",
         choices=("force", "off"),
@@ -235,7 +268,9 @@ def main() -> None:
         "model": args.model,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": args.top_k,
         "enable_thinking": args.enable_thinking,
+        "thinking_budget": args.thinking_budget,
         "seed": args.seed,
     }
     for sample in samples:
@@ -269,36 +304,18 @@ def main() -> None:
         qe = len(full_token_ids) - suffix
         if qe <= qb:
             raise RuntimeError("final query did not map to a non-empty token span")
-        # Use raw strings for the two session fragments.  The native server's
-        # exact-token override currently follows a different batched BF16
-        # scratch path, while ordinary raw strings share the validated Chat
-        # prefill path.  Split at a tokenizer-independent newline before the
-        # final "Question:" section and prove that separately tokenizing the
-        # two fragments concatenates to the one-shot token sequence exactly.
-        rendered_query_char = len("<|im_start|>user\n") + char_begin
-        candidate = rendered_query_char - len("Question:\n")
-        split_char = -1
-        split_prefix_ids: list[int] = []
-        split_finish_ids: list[int] = []
-        for _ in range(32):
-            if candidate <= 0:
-                break
-            prefix_ids = tokenize(args.api_base, rendered[:candidate], args.timeout)
-            finish_ids = tokenize(args.api_base, rendered[candidate:], args.timeout)
-            if prefix_ids + finish_ids == full_token_ids:
-                split_char = candidate
-                split_prefix_ids = prefix_ids
-                split_finish_ids = finish_ids
-                break
-            candidate = rendered.rfind("\n", 0, candidate)
-        if split_char < 0:
-            raise RuntimeError(
-                "could not find an exact independently tokenizable split before query"
-            )
-        split_prefix = rendered[:split_char]
-        split_finish = rendered[split_char:]
-        if len(split_prefix_ids) > qb:
-            raise RuntimeError("frozen prefix unexpectedly contains query tokens")
+        # Persistent raw-completion sessions accept integer token arrays.  Split
+        # the canonical one-shot stream at the immediately preceding physical
+        # block boundary.  This is both tokenizer-exact and the smallest replay
+        # suffix accepted by Adaptive prototype capture: at most B-1 historical
+        # tokens are charged to the measured final request.
+        split_token = (qb // args.block_tokens) * args.block_tokens
+        if split_token <= 0:
+            raise RuntimeError("query has no preceding physical block boundary")
+        split_prefix_ids = full_token_ids[:split_token]
+        split_finish_ids = full_token_ids[split_token:]
+        if split_prefix_ids + split_finish_ids != full_token_ids:
+            raise RuntimeError("integer-token session split changed the prompt")
         history_tokens = len(split_prefix_ids)
         query_tokens = qe - qb
         full_tokens = len(full_token_ids)
@@ -308,11 +325,18 @@ def main() -> None:
 
         prep_payload = {
             **common,
-            "prompt": split_prefix,
+            "prompt": split_prefix_ids,
             "max_tokens": 0,
             "kvmem_session_id": session_id,
             "kvmem_session_op": "start",
             "kvmem_reselect": "off",
+            "kvmem_prefill_window": args.prefill_window,
+            "kvmem_prefill_semantic_start_tokens": (
+                args.prefill_semantic_start_tokens
+            ),
+            "kvmem_prefill_semantic_query_tokens": (
+                args.prefill_semantic_query_tokens
+            ),
             "kvmem_trace_tag": prep_tag,
         }
         prep_started = time.perf_counter()
@@ -326,7 +350,7 @@ def main() -> None:
             log_start = handle.seek(0, 2)
         final_payload = {
             **common,
-            "prompt": split_finish,
+            "prompt": split_finish_ids,
             "max_tokens": 1,
             "kvmem_session_id": session_id,
             "kvmem_session_op": "finish",
@@ -367,23 +391,39 @@ def main() -> None:
             "method": (
                 "kvmem" if args.final_reselect == "force" else "full_context"
             ),
+            "latency_protocol": "final_query_boundary_v2",
+            "history_maintenance_excluded": True,
             "history_tokens": history_tokens,
             "query_tokens": query_tokens,
             "active_prompt_tokens": full_tokens,
             "active_context_budget": args.active_context_budget,
             "generation_reserve": args.generation_reserve,
             "kvmem_block_tokens": args.block_tokens,
+            "prefill_window": args.prefill_window,
+            "prefill_semantic_start_tokens": (
+                args.prefill_semantic_start_tokens
+            ),
+            "prefill_semantic_query_tokens": (
+                args.prefill_semantic_query_tokens
+            ),
+            "top_k": args.top_k,
+            "thinking_budget": args.thinking_budget,
             "preparation_ingest_ms_excluded": prep_ms,
             **client,
             **native,
-            "pre_answer_latency_ms": client["client_ttft_ms"],
+            "pre_answer_latency_ms": client["server_ttft_ms"],
+            "pre_answer_latency_boundary": (
+                "final-query arrival through first non-empty model token; "
+                "includes semantic reselect, materialization, query replay/prefill"
+            ),
             "cache_state": "clean_frozen_raw_token_session",
             "session_query_log": query_log,
             "final_reselect": args.final_reselect,
             "query_span_tokens": [qb, qe],
             "query_span_content_bytes": [byte_begin, byte_end],
             "finish_fragment_tokens": len(split_finish_ids),
-            "split_token": len(split_prefix_ids),
+            "alignment_replay_prefix_tokens": qb - len(split_prefix_ids),
+            "split_token": split_token,
             "trace_tag": final_tag,
             "attempt": 1,
             "status": "completed",

@@ -176,7 +176,12 @@ bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
     // the duration of a request. Keep them on the serialized plain/frozen path
     // until continuous batching has a per-row budget field.
     return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty() &&
-           g.kvmem_semantic_budget == 0;
+           g.kvmem_semantic_budget == 0 &&
+           g.kvmem_query_attention_probe_tokens == 0 &&
+           g.kvmem_query_attention_score_tokens == 0 &&
+           g.kvmem_query_guided_thinking_max_tokens == 0 &&
+           g.kvmem_query_guided_query_max_tokens == 0 &&
+           !g.kvmem_query_guided_direct;
 }
 
 json usage_json(size_t prompt_tokens, size_t completion_tokens) {
@@ -1656,9 +1661,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         cfg.prefix_cache = false;
     }
     if (cfg.prefix_cache && mtp_enabled) {
-        std::cerr << "[qw3-serve] note: --prefix-cache active, but MTP requests "
-                     "cold-prefill in v1 (cache applies to the plain "
-                     "continuous-batching path)\n";
+        std::cerr << "[qw3-serve] --prefix-cache with MTP: caching paired "
+                     "main/draft KV pages and MTP prefix state\n";
     }
     if (cfg.kvmem_prefix_cache && !engine.kvmem_enabled) {
         std::cerr << "[qw3-serve] --kvmem-prefix-cache requires --kvmem; "
@@ -1809,7 +1813,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  prefix_cache="
               << yesno(cfg.prefix_cache && cfg.continuous_batching) << "\n"
               << "  prefix_cache_max_pages="
-              << std::getenv("QW3_PREFIX_CACHE_MAX_PAGES") << "\n"
+              << (std::getenv("QW3_PREFIX_CACHE_MAX_PAGES")
+                      ? std::getenv("QW3_PREFIX_CACHE_MAX_PAGES")
+                      : "0(unlimited)")
+              << "\n"
+              << "  prefix_cache_max_entries="
+              << (std::getenv("QW3_PREFIX_CACHE_MAX_ENTRIES")
+                      ? std::getenv("QW3_PREFIX_CACHE_MAX_ENTRIES")
+                      : "64(default)")
+              << "\n"
               << "  tool_argument_streaming=canonical-string\n"
               << "  matmul=mmq\n"
               << "  disable_hgemm=1\n"
@@ -2079,6 +2091,59 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.recover_thinking_eos = req.value("recover_thinking_eos", enable_thinking);
         g.thinking_budget = req.value("thinking_budget", cfg.thinking_budget_default);
         if (g.thinking_budget < 0) g.thinking_budget = 0;
+
+        const bool has_guided_thinking =
+            req.contains("kvmem_query_guided_thinking_max_tokens");
+        const bool has_guided_query =
+            req.contains("kvmem_query_guided_query_max_tokens");
+        bool guided_direct = false;
+        if (req.contains("kvmem_query_guided_direct")) {
+            if (!req["kvmem_query_guided_direct"].is_boolean()) {
+                throw std::invalid_argument(
+                    "kvmem_query_guided_direct must be a boolean");
+            }
+            guided_direct =
+                req["kvmem_query_guided_direct"].get<bool>();
+        }
+        if (has_guided_thinking != has_guided_query) {
+            throw std::invalid_argument(
+                "guided query requires both "
+                "kvmem_query_guided_thinking_max_tokens and "
+                "kvmem_query_guided_query_max_tokens");
+        }
+        if (has_guided_thinking) {
+            if (!engine.kvmem_enabled || !engine.kvmem_query_conditioned) {
+                throw std::invalid_argument(
+                    "guided query requires --kvmem and "
+                    "--kvmem-query-conditioned");
+            }
+            uint64_t thinking_max = 0;
+            uint64_t query_max = 0;
+            if (!parse_bounded_json_u64(
+                    req["kvmem_query_guided_thinking_max_tokens"],
+                    guided_direct ? 0 : 1,
+                    std::numeric_limits<uint32_t>::max(), thinking_max) ||
+                !parse_bounded_json_u64(
+                    req["kvmem_query_guided_query_max_tokens"], 1,
+                    std::numeric_limits<uint32_t>::max(), query_max)) {
+                throw std::invalid_argument(
+                    "guided-query thinking/query limits must be positive "
+                    "uint32 integers");
+            }
+            g.kvmem_query_guided_thinking_max_tokens =
+                static_cast<uint32_t>(thinking_max);
+            g.kvmem_query_guided_query_max_tokens =
+                static_cast<uint32_t>(query_max);
+            g.kvmem_query_guided_direct = guided_direct;
+            if (guided_direct && thinking_max != 0) {
+                throw std::invalid_argument(
+                    "direct guided query requires a zero private-thinking "
+                    "limit");
+            }
+        } else if (guided_direct) {
+            throw std::invalid_argument(
+                "kvmem_query_guided_direct requires guided-query token limits");
+        }
 
         if (req.contains("kvmem_semantic_budget")) {
             if (!engine.kvmem_enabled) {

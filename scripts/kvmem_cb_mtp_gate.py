@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -52,11 +53,14 @@ def run_prefix_probe(qw3: Path, model: Path, ctx: int, max_tokens: int,
         cmd += ["--kvmem", "--kvmem-block-tokens", "16",
                 "--kvmem-budget", "131072", "--kvmem-method", "recency"]
     if mtp:
-        cmd += ["--native-mtp-speculate", "--mtp-chain", "2"]
+        cmd += ["--native-mtp-speculate", "--mtp-chain", "4"]
     env = os.environ.copy()
     env["QW3_CONTINUOUS_BATCHING_TRACE"] = "1"
     env["QW3_PREFIX_CACHE"] = "1"
     env["QW3_PREFIX_CACHE_TRACE"] = "1"
+    env["QW3_FATTN_NSPLIT"] = "1"
+    env["QW3_PREFILL_FA2_NSPLIT"] = "1"
+    env["QW3_CONTINUOUS_MTP_PHASE_SYNC"] = "1"
     proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, env=env)
     prompt = long_prompt("PFX-SHARED-PREAMBLE", 200)
@@ -72,6 +76,7 @@ def run_prefix_probe(qw3: Path, model: Path, ctx: int, max_tokens: int,
     finally:
         log = e2e.terminate_server(proc)
     texts = [e2e.parse_completion_text(b) for b in bodies]
+    hit_tail = log.rsplit("prefix_cache hit", 1)[-1] if "prefix_cache hit" in log else ""
     return {
         "log": log,
         "texts": texts,
@@ -80,6 +85,13 @@ def run_prefix_probe(qw3: Path, model: Path, ctx: int, max_tokens: int,
         "reused": "reused_tokens=" in log,
         "ok_status": all(t != "" for t in texts),
         "identical": len(texts) == 2 and texts[0] == texts[1],
+        "commit_has_mtp_pages": bool(re.search(
+            r"prefix_cache commit[^\n]*mtp_pages=[1-9][0-9]*", log)),
+        "hit_has_mtp_pages": bool(re.search(
+            r"prefix_cache hit[^\n]*mtp_pages=[1-9][0-9]*", log)),
+        "mtp_active_after_hit": bool(re.search(
+            r"native mtp_spec_summary:[^\n]*enabled=true[^\n]*drafted=[1-9][0-9]*",
+            hit_tail)),
         "cmd": cmd,
     }
 
@@ -194,19 +206,28 @@ def main(argv: List[str] | None = None) -> int:
     if underflow:
         failures.append("sparse kvmem CB+MTP tripped the window-underflow throw")
 
-    # Scenario #4: prefix-cache double-prefill probe on the CB+MTP path. Sends a
-    # shared-prefix prompt twice sequentially; reports commit/hit evidence. In a
-    # pure-MTP serve the commit may not fire (commit lives on the non-MTP prefill
-    # path), so this is informational: if a hit occurs the second output must
-    # still equal the first (Task-6 prefill_offset fix => no double-prefill).
+    # Scenario #4: lossless MTP prefix-cache gate. The first request must commit
+    # both main and MTP pages; the second must hit them, skip the shared prefill,
+    # and still execute a non-empty speculative chain with identical output.
     pfx = run_prefix_probe(qw3, model, max(args.ctx, 2048),
                            max(args.max_tokens, 32), args.timeout, mtp=True)
     print(f"prefix-probe(MTP): commit={pfx['commit']} hit={pfx['hit']} "
           f"reused={pfx['reused']} ok_status={pfx['ok_status']} "
-          f"identical={pfx['identical']}")
+          f"identical={pfx['identical']} "
+          f"commit_mtp={pfx['commit_has_mtp_pages']} "
+          f"hit_mtp={pfx['hit_has_mtp_pages']} "
+          f"mtp_after_hit={pfx['mtp_active_after_hit']}")
     if not pfx["ok_status"]:
         failures.append("prefix-cache CB+MTP probe: a request returned no text")
-    if pfx["hit"] and not pfx["identical"]:
+    if not pfx["commit"]:
+        failures.append("prefix-cache CB+MTP probe produced no cache commit")
+    if not pfx["hit"] or not pfx["reused"]:
+        failures.append("prefix-cache CB+MTP probe produced no reused-token hit")
+    if not pfx["commit_has_mtp_pages"] or not pfx["hit_has_mtp_pages"]:
+        failures.append("prefix-cache CB+MTP probe did not preserve MTP KV pages")
+    if not pfx["mtp_active_after_hit"]:
+        failures.append("prefix-cache hit request did not execute MTP drafts")
+    if not pfx["identical"]:
         failures.append(
             "prefix-cache CB+MTP hit produced different output on the 2nd "
             "request (possible double-prefill / offset bug)")
@@ -219,6 +240,7 @@ def main(argv: List[str] | None = None) -> int:
     print(f"kvmem completions: {kvmem.completions!r}")
 
     out = {"ok": not failures, "failures": failures,
+           "prefix_probe": pfx,
            "results": [e2e.asdict(r) for r in results]}
     Path(args.out_json).write_text(json.dumps(out, indent=2, ensure_ascii=False),
                                    encoding="utf-8")

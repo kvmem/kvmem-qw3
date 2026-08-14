@@ -11,11 +11,15 @@ for pre-answer latency. Each method is evaluated using the frozen configuration
 that produced its reported utility result; active-context budgets are
 method- and benchmark-specific and are listed in the appendix. Full Context is
 reported only when the complete history fits the model and KV-cache capacity.
-Pre-answer latency is measured from the start of query-dependent context
-preparation to the first non-empty model token, including method-specific
-retrieval and final-query input processing, while excluding subsequent answer
-decoding and cold source-history ingestion. For Compact-only and Compact+RAG,
-values in parentheses exclude compact-summary generation.
+Latency values are remeasured on the current RTX PRO 6000 with the same native
+\sys{} binary and model, using one P50-length representative per benchmark
+slice. Pre-answer latency is measured from final-query arrival, with the source
+history already maintained and the active context full, to the first non-empty
+model token. It includes query-triggered retrieval, one final boundary
+compaction when applicable, final-context re-prefill and final-query processing,
+while excluding subsequent answer decoding and earlier history maintenance.
+For Compact-only and Compact+RAG, values in parentheses exclude the final
+boundary compaction.
 }
 \label{tab:utility-efficiency}
 
@@ -34,7 +38,7 @@ values in parentheses exclude compact-summary generation.
 & Answer Acc. (\%) $\uparrow$
 & 86.60 & 26.80 & 45.60 & \textbf{86.20} & \underline{85.60} \\
 & Pre-answer Latency (s) $\downarrow$
-& 0.81 & \underline{42.29} & 68.88 (3.50) & 116.13 (50.75) & \textbf{1.68} \\
+& 0.30 & \textbf{0.19} & 18.92 (2.91) & 26.63 (10.63) & \underline{0.48} \\
 \midrule
 
 \multirow{2}{*}{LongMemEval-M}
@@ -46,30 +50,30 @@ values in parentheses exclude compact-summary generation.
 
 \multirow{2}{*}{\shortstack[l]{MemoryAgentBench\\($>256$K)}}
 & Overall Score (\%) $\uparrow$
-& -- & 17.95 & 27.54 & \underline{34.80} & \textbf{40.99} \\
+& -- & 23.94 & 27.54 & \textbf{43.66} & \underline{38.58} \\
 & Pre-answer Latency (s) $\downarrow$
-& -- & \textbf{0.22} & 344.38 (1.22) & 357.81 (14.66) & \underline{4.28} \\
+& -- & \textbf{0.26} & 85.87 (0.57) & 106.02 (20.72) & \underline{1.81} \\
 \midrule
 
 \multirow{2}{*}{\shortstack[l]{AgentLongBench\\($\leq$256K)}}
 & Task Success (\%) $\uparrow$
 & 59.54 & 25.36 & 15.84 & \underline{47.49} & \textbf{60.87} \\
 & Pre-answer Latency (s) $\downarrow$
-& 0.08 & \underline{41.43} & 326.80 (1.32) & 380.94 (55.45) & \textbf{0.63} \\
+& 0.17 & \textbf{0.11} & 97.04 (0.45) & 111.39 (14.80) & \underline{0.38} \\
 \midrule
 
 \multirow{2}{*}{\shortstack[l]{AgentLongBench\\(512K)}}
 & Task Success (\%) $\uparrow$
-& -- & 25.00 & 22.50 & \textbf{54.00} & \underline{53.00} \\
+& -- & 25.00 & 22.50 & \underline{49.50} & \textbf{53.00} \\
 & Pre-answer Latency (s) $\downarrow$
-& -- & \underline{39.12} & 1317.61 (68.86) & 1449.19 (200.44) & \textbf{1.07} \\
+& -- & \textbf{0.20} & 246.49 (6.36) & 263.70 (23.58) & \underline{0.62} \\
 \midrule
 
 \multirow{2}{*}{\shortstack[l]{AgentLongBench\\(1M)}}
 & Task Success (\%) $\uparrow$
-& -- & 20.00 & 32.00 & \underline{42.00} & \textbf{48.00} \\
+& -- & 20.00 & 32.00 & \textbf{58.00} & \underline{50.00} \\
 & Pre-answer Latency (s) $\downarrow$
-& -- & \underline{39.12} & -- (17.57) & -- (71.82) & \textbf{1.37} \\
+& -- & \textbf{0.26} & 380.19 (3.05) & 416.38 (39.24) & \underline{0.73} \\
 \midrule
 
 Average
@@ -78,4 +82,16 @@ Average
 
 \bottomrule
 \end{tabular}
+
+\vspace{2pt}
+\parbox{\textwidth}{\footnotesize
+Latency active-context caps are 32K for LongMemEval-S and AgentLongBench
+$\leq$256K, 64K for MemoryAgentBench $>$256K and AgentLongBench-512K, and
+100K for AgentLongBench-1M. The corresponding \sys{} configurations are
+K32/B32, K32/B32, K64/B64, K64/B32, and K100/B128. Sliding Window uses the
+same per-benchmark cap. Compact-only and Compact+RAG enforce the same final
+prompt cap with no raw tail or metadata headers; their unavoidable summary
+occupies part of that cap, and RAG fills the remaining capacity. Utility is
+computed on each full benchmark cohort, whereas latency uses one frozen
+P50-length representative per slice.}
 \end{table*}

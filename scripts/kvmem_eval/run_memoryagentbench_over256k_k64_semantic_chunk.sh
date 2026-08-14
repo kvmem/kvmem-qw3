@@ -12,6 +12,7 @@ SELECTION_MANIFEST=${SELECTION_MANIFEST:-$ROOT/scripts/kvmem_eval/memoryagentben
 MAX_CONTEXTS=${MAX_CONTEXTS:-}
 QUESTION_LIMIT=${QUESTION_LIMIT:-}
 BLOCK_TOKENS=${BLOCK_TOKENS:-32}
+QUERY_SCORE_SPAN=${QUERY_SCORE_SPAN:-formatted}
 
 FILTER_ARGS=()
 if [[ -n $MAX_CONTEXTS ]]; then
@@ -36,6 +37,7 @@ fi
   --out-dir "$OUT_DIR" \
   --selection-manifest "$SELECTION_MANIFEST" \
   "${FILTER_ARGS[@]}" \
+  --query-score-span "$QUERY_SCORE_SPAN" \
   --archive-storage cpu-only \
   --tmpfs-limit-gib 60 \
   --block-tokens "$BLOCK_TOKENS" \

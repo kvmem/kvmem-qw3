@@ -100,12 +100,42 @@ def indexed(metadata: dict[str, Any], key: str, i: int) -> Any:
     return value
 
 
+def render_query_with_byte_span(
+    template: str, raw_question: Any
+) -> tuple[str, int, int]:
+    """Render once while retaining the raw question's exact UTF-8 byte span."""
+    if template.count("{question}") != 1:
+        raise ValueError("query template must contain exactly one {question}")
+    prefix_template, suffix_template = template.split("{question}")
+    prefix = prefix_template.format(label="{label}")
+    suffix = suffix_template.format(label="{label}")
+    question = str(raw_question)
+    formatted = prefix + question + suffix
+    # Guard exact compatibility with the upstream formatting operation. This
+    # makes accidental template changes fail before any expensive archive build.
+    expected = template.format(question=raw_question, label="{label}")
+    if formatted != expected:
+        raise RuntimeError("position-aware query rendering changed prompt bytes")
+    begin = len(prefix.encode("utf-8"))
+    end = begin + len(question.encode("utf-8"))
+    return formatted, begin, end
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--parquet", type=Path, required=True)
     p.add_argument("--row", type=int, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--chunk-size", type=int, default=4096)
+    p.add_argument(
+        "--query-score-span",
+        choices=("formatted", "raw"),
+        default="formatted",
+        help=(
+            "formatted writes the legacy string-array questions file; raw "
+            "writes explicit UTF-8 byte offsets for raw-question scoring"
+        ),
+    )
     p.add_argument(
         "--timestamp",
         default="2026-08-02 00:00:00",
@@ -153,10 +183,11 @@ def main() -> int:
             f"questions/answers mismatch: {len(questions)} vs {len(answers)}"
         )
     query_template = QUERY[kind]
-    formatted_questions = [
-        query_template.format(question=question, label="{label}")
+    rendered_questions = [
+        render_query_with_byte_span(query_template, question)
         for question in questions
     ]
+    formatted_questions = [item[0] for item in rendered_questions]
     qa_ids = metadata.get("qa_pair_ids") or [None] * len(questions)
     if not isinstance(qa_ids, list):
         qa_ids = [qa_ids]
@@ -166,14 +197,27 @@ def main() -> int:
     questions_path = args.out_dir / "questions.json"
     qa_path = args.out_dir / "qa.json"
     prefix_path.write_text(archive_prefix, encoding="utf-8")
+    archive_questions: list[Any]
+    if args.query_score_span == "raw":
+        archive_questions = [
+            {
+                "content": content,
+                "query_content_start": begin,
+                "query_content_end": end,
+            }
+            for content, begin, end in rendered_questions
+        ]
+    else:
+        archive_questions = formatted_questions
     questions_path.write_text(
-        json.dumps(formatted_questions, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(archive_questions, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     qa = []
-    for i, (raw_q, formatted_q, answer) in enumerate(
-        zip(questions, formatted_questions, answers)
+    for i, (raw_q, rendered_q, answer) in enumerate(
+        zip(questions, rendered_questions, answers)
     ):
+        formatted_q, _, _ = rendered_q
         qa.append(
             {
                 "question_index": i,
@@ -204,6 +248,12 @@ def main() -> int:
         "official_chunks": len(chunks),
         "timestamp": args.timestamp,
         "questions": len(formatted_questions),
+        "query_score_span": args.query_score_span,
+        "questions_schema": (
+            "content+utf8-query-offsets-v1"
+            if args.query_score_span == "raw"
+            else "legacy-string-array"
+        ),
         "archive_prefix": str(prefix_path.resolve()),
         "questions_file": str(questions_path.resolve()),
         "qa_file": str(qa_path.resolve()),

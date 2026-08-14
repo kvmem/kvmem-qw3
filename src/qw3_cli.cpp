@@ -82,7 +82,7 @@ void usage(std::ostream &os) {
         "  --prefix-cache        Enable lossless prefix KV caching: reuse the KV\n"
         "                        of a shared prompt prefix across requests (re-ask\n"
         "                        / multi-turn append). Continuous-batching path;\n"
-        "                        MTP requests cold-prefill. Default: off.\n"
+        "                        caches main and MTP draft state. Default: off.\n"
         "  --no-continuous-batching, --no-paged-kv, --no-body-batch,\n"
         "  --no-mtp-batched-draft, --no-mtp-paged-prefix\n"
         "                        Compatibility/debug disable switches.\n"

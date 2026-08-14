@@ -109,6 +109,7 @@ def main() -> int:
     ap.add_argument("--model", default="models/Qwen3.6-27B-Q8_0.gguf")
     ap.add_argument("--port", type=int, default=8137)
     ap.add_argument("--max-tokens", type=int, default=48)
+    ap.add_argument("--mtp-chain", type=int, default=0)
     ap.add_argument("--boot-timeout", type=float, default=240.0)
     ap.add_argument("--req-timeout", type=float, default=180.0)
     ap.add_argument("--logdir", default="/tmp/prefix_cache_canary")
@@ -135,11 +136,19 @@ def main() -> int:
     q_a_ext = q_a + " A CUDA stream is"
 
     failures: List[str] = []
+    mtp_args = (["--native-mtp-speculate", "--mtp-chain",
+                 str(args.mtp_chain)] if args.mtp_chain > 0 else [])
+    deterministic_env = {
+        "QW3_FATTN_NSPLIT": "1",
+        "QW3_PREFILL_FA2_NSPLIT": "1",
+        "QW3_CONTINUOUS_MTP_PHASE_SYNC": "1",
+    }
 
     # ---- COLD baseline (cache OFF) ---------------------------------------
     cold_log = os.path.join(args.logdir, "cold.log")
     proc = start_server(args.binary, args.model, args.port,
-                        {"QW3_PREFIX_CACHE": "0"}, [], cold_log)
+                        {**deterministic_env, "QW3_PREFIX_CACHE": "0"},
+                        mtp_args, cold_log)
     cold_a = cold_b = ""
     cold_ext = ""
     try:
@@ -170,9 +179,10 @@ def main() -> int:
     # hit/commit lines without a user-facing switch.
     warm_log = os.path.join(args.logdir, "warm.log")
     proc = start_server(args.binary, args.model, args.port,
-                        {"QW3_PREFIX_CACHE_TRACE": "1",
+                        {**deterministic_env,
+                         "QW3_PREFIX_CACHE_TRACE": "1",
                          "QW3_CONTINUOUS_BATCHING_TRACE": "1"},
-                        ["--prefix-cache"], warm_log)
+                        ["--prefix-cache", *mtp_args], warm_log)
     warm_a1 = warm_a2 = warm_b = ""
     warm_ext = ""
     try:
@@ -209,6 +219,10 @@ def main() -> int:
     warm_trace = read_text(warm_log)
     hits = len(re.findall(r"prefix_cache hit ", warm_trace))
     commits = len(re.findall(r"prefix_cache commit ", warm_trace))
+    mtp_commits = len(re.findall(
+        r"prefix_cache commit[^\n]*mtp_pages=[1-9][0-9]*", warm_trace))
+    mtp_hits = len(re.findall(
+        r"prefix_cache hit[^\n]*mtp_pages=[1-9][0-9]*", warm_trace))
 
     # ---- Invariant checks ------------------------------------------------
     # The authoritative lossless signal is WITHIN a single process: a cache hit
@@ -233,13 +247,18 @@ def main() -> int:
         failures.append(f"expected >=2 prefix_cache hits (A#2 re-ask + EXT), saw {hits}")
     if commits < 1:
         failures.append(f"expected >=1 prefix_cache commit in trace, saw {commits}")
+    if args.mtp_chain > 0 and (mtp_commits < 1 or mtp_hits < 2):
+        failures.append(
+            "MTP prefix state was not preserved for both re-ask and extension "
+            f"hits (commits={mtp_commits}, hits={mtp_hits})")
 
     print("=== prefix cache canary ===")
     print(f"cold_a len={len(cold_a)} warm_a1 len={len(warm_a1)} "
           f"warm_a2 len={len(warm_a2)}")
     print(f"cold_b len={len(cold_b)} warm_b len={len(warm_b)}")
     print(f"cold_ext len={len(cold_ext)} warm_ext len={len(warm_ext)}")
-    print(f"trace: hits={hits} commits={commits}")
+    print(f"trace: hits={hits} commits={commits} "
+          f"mtp_hits={mtp_hits} mtp_commits={mtp_commits}")
     print(f"identical A#2==coldA: {warm_a2 == cold_a and bool(cold_a)}")
     print(f"identical B==coldB:   {warm_b == cold_b and bool(cold_b)}")
     print(f"identical EXT==coldEXT: {warm_ext == cold_ext and bool(cold_ext)}")

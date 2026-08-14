@@ -1,10 +1,31 @@
 # Paper Pre-answer Latency Completion Plan
 
-Date: 2026-08-03
+Date: 2026-08-12
 
-Status: completed on 2026-08-04 for every recoverable table cell. Results and
-limitations are recorded in `docs/paper_pre_answer_latency_results_20260804.md`;
-the filled LaTeX source is `docs/paper_utility_efficiency_table.tex`.
+Status: completed. The validated current-machine results are in
+`docs/paper_pre_answer_latency_results_20260812.md`; machine-readable artifacts
+are under `/data/chaidi/kvmem_eval/results/`
+`paper_pre_answer_latency_qw3_current_20260812`. The 2026-08-04 values are
+historical estimates and must not be copied into the final table.
+
+All formal latency cells in this rerun use the native `qw3` server from this
+repository. vLLM runs and historical provider-side timings are diagnostic only
+and are excluded from the paper table. The plain-baseline and KVMem passes
+record their binary SHA256 and GGUF path; final validation requires both
+identities to match.
+
+The canonical resumable launch is:
+
+```bash
+tmux new-session -d -s paper_latency_qw3_all_20260812 \
+  'cd /home/chaidi/qw3 && bash scripts/kvmem_eval/supervise_paper_latency_qw3_all.sh'
+```
+
+Formal artifacts are isolated under:
+
+```text
+/data/chaidi/kvmem_eval/results/paper_pre_answer_latency_qw3_current_20260812/
+```
 
 ## Goal and publication contract
 
@@ -14,19 +35,22 @@ method configuration that produced the utility value in the corresponding
 table cell. Active-context budgets are therefore method- and benchmark-specific;
 they are not uniformly 32K.
 
-The main latency boundary is:
+The final-query boundary assumes the method has already maintained the source
+history and that its current active context is full. The main latency is:
 
 ```text
 pre-answer latency
-= wall time from the start of query-dependent context preparation
+= wall time from final-query arrival
   until the client receives the first non-empty reasoning/content token
 ```
 
 It includes, when applicable:
 
-- sliding-window selection and prompt preparation;
-- compact-summary construction for the non-parenthesized Compact values;
-- RAG block/query encoding, ranking, selected-text loading and prompt assembly;
+- exactly one final full-window compact-summary operation for the
+  non-parenthesized Compact values;
+- RAG query encoding, scoring/ranking, selected-text loading and prompt
+  assembly;
+- re-prefill of the newly compacted summary/context;
 - final-query tokenization/prefill;
 - KVMem scoring, stage-out exposed on the critical path, stage-in,
   materialization/re-RoPE, semantic commit and query replay;
@@ -37,12 +61,45 @@ It excludes:
 - final-answer decoding after the first non-empty token;
 - grading and result persistence;
 - cold ingestion of the complete source history for Full Context and KVMem;
+- Sliding suffix selection, resident-window prefill and other history
+  maintenance completed before the final query;
+- earlier iterative Compact rounds completed while maintaining history;
+- RAG corpus chunking and block-embedding/index construction completed while
+  maintaining history;
 - model/server startup and one-time kernel warm-up.
 
-For Compact-only and Compact+RAG, the main value charges the complete
-non-amortized summary-generation cost. The parenthesized value excludes summary
-generation and reports the steady-state query cost. This asymmetry must remain
-explicit in the caption and table note.
+For Compact-only and Compact+RAG, the main value charges one complete
+query-boundary compaction. It does not charge every earlier maintenance round
+again. The parenthesized value excludes that final boundary compaction but
+retains query-dependent RAG, final prompt materialization/re-prefill and TTFT.
+
+The exact per-method sums are:
+
+```text
+Full Context
+  = final-query continuation TTFT from resident full-history KV
+
+Sliding Window
+  = final-query continuation TTFT from resident selected-window KV
+
+Compact-only
+  = final boundary compaction
+  + final compact-context prompt materialization/re-prefill
+  + final-query TTFT
+
+Compact+RAG
+  = final boundary compaction
+  + query embedding + scoring/top-k
+  + selected-text/prompt materialization
+  + final compact+retrieved-context re-prefill
+  + final-query TTFT
+
+KVMem
+  = semantic scoring/reselection
+  + exposed stage-out/stage-in/materialization/re-RoPE
+  + query replay/prefill
+  + first-token generation
+```
 
 KVMem's internal operation-only value remains useful as a breakdown, but it is
 not the main table value:
@@ -55,6 +112,51 @@ The main KVMem cell must use the client-observed pre-answer latency from a
 frozen history state. It must not publish `kvmem_operation_ms` as though it were
 the complete TTFT.
 
+## Server-side TTFT instrumentation
+
+The qw3 HTTP server now records a monotonic timestamp at the beginning of every
+`/v1/chat/completions` or `/v1/completions` handler and explicitly reports:
+
+| Field | Boundary | Intended use |
+|---|---|---|
+| `server_ttft_sec` | HTTP handler entry to the first non-empty model piece | Primary cross-dataset server TTFT |
+| `engine_ttft_sec` | Actual engine invocation to the first non-empty model piece | Separates JSON/render/tokenize/queue overhead from inference |
+| `response_ttft_sec` | HTTP handler entry to the first successfully written non-empty streamed reasoning/content/tool delta | Client-visible streaming boundary |
+| `request_total_sec` | HTTP handler entry to response completion/build | Diagnostic total; includes answer decoding |
+
+For non-streaming Chat Completions, `server_ttft_sec` and `engine_ttft_sec` are
+still measured at the internal first-token callback, while
+`response_ttft_sec` is `null` because the client does not receive a partial
+response. For prefill-only requests (`max_tokens=0`) all TTFT fields are `null`
+because no output token exists. `/v1/completions` retains its legacy
+engine-relative `first_token_sec` field for compatibility.
+
+Non-streaming responses expose these values in the top-level `timing` object.
+Streaming Chat Completions attach the same object to the final chunk (the chunk
+whose choice has a non-null `finish_reason`), independently of
+`stream_options.include_usage`. Every completed request also emits one
+machine-parseable server-log line:
+
+```text
+[qw3-server-ttft] rid=42 route=plain stream=1 model_token_seen=1 server_ttft_ms=412.300000 engine_ttft_ms=398.100000 visible_output_seen=1 response_ttft_ms=412.650000 request_total_ms=1832.700000
+```
+
+Use `server_ttft_sec` as the paper measurement when the benchmark uses a
+frozen/session request for the final question. The metric includes every piece
+of work submitted in that request. Consequently, if a runner sends the complete
+history and the final question together, `server_ttft_sec` correctly includes
+the complete cold-history prefill and is **not** the table's amortized
+pre-answer latency. To exclude cold history ingestion, first ingest/freeze the
+history in an unmeasured request, then time a separate final-query request that
+restores or branches from that state.
+
+The plain dense-prefix measurements run with MTP disabled because native qw3
+prefix-cache v1 intentionally cold-prefills MTP requests. KVMem latency keeps
+the frozen MTP setting used by its utility configuration. Since the metric
+ends at the first token, this serving constraint and the exact server flags are
+reported with the latency artifacts rather than hidden behind an estimated
+conversion factor.
+
 ## Revised paper caption
 
 Use wording equivalent to the following when the table source is updated:
@@ -66,11 +168,13 @@ for pre-answer latency. Each method is evaluated using the frozen configuration
 that produced its reported utility result; active-context budgets are
 method- and benchmark-specific and are listed in the appendix. Full Context is
 reported only when the complete history fits the model and KV-cache capacity.
-Pre-answer latency is measured from the start of query-dependent context
-preparation to the first non-empty model token, including method-specific
-retrieval and final-query input processing, while excluding subsequent answer
-decoding and cold source-history ingestion. For Compact-only and Compact+RAG,
-values in parentheses exclude compact-summary generation.
+Pre-answer latency is measured from final-query arrival, with the source
+history already maintained and the current active context full, to the first
+non-empty model token. It includes query-triggered retrieval, exactly one
+boundary compaction when applicable, final-context re-prefill and final-query
+processing, while excluding subsequent answer decoding and all earlier history
+maintenance. For Compact-only and Compact+RAG, values in parentheses exclude
+the final boundary compaction.
 ```
 
 The old sentence claiming that every non-Full method uses a 32K active context
@@ -89,9 +193,9 @@ The currently identified KVMem configurations are:
 |---|---|
 | LongMemEval-S | K=32K; G=32K; block=32; key-direction-adaptive; FP16 KV/index/query; chunk=2K; thinking=4K |
 | AgentLongBench <=256K | K=32K; G=32K; block=32; mean-k; FP16 KV; chunk=2K; thinking=4K |
-| MemoryAgentBench >256K | K=200K; G=32K; block=512; key-direction-adaptive 1/2/4 prototypes; FP8 KV with FP16 index/query; chunk=2K; CPU index; query replay; immutable KV; all three transfer optimizations |
-| AgentLongBench 512K | K=224K; G=32K; block=32; mean-k; FP16 KV; chunk=2K; thinking; query replay; immutable KV |
-| AgentLongBench 1M | K=224K; G=32K; block=512 with 32-token scoring slices; key-direction-fixed4 MaxSim; FP8 KV with FP16 index/query; chunk=2K; thinking=8K; query replay; immutable KV |
+| MemoryAgentBench >256K | K=64K; G=32K; block=64; key-direction-adaptive 1/2/4 prototypes; FP8 KV with FP16 index/query; 2K semantic-chunk reselection; sink=512; recent=0; GPU index; query replay; immutable KV (refresh=8); CPU-only archive backing; all three transfer optimizations |
+| AgentLongBench 512K | K=64K; G=32K; block=32; key-direction-adaptive; FP8 KV with FP16 index/query; 2K semantic-chunk reselection; sink=512; recent=0; thinking=8K; query replay; immutable KV; CPU-only backing |
+| AgentLongBench 1M | K=100K; G=32K; block=128 with 32-token scoring slices; key-direction-adaptive; FP8 KV with FP16 index/query; 2K semantic-chunk reselection; sink=512; recent=0; thinking=8K; query replay; immutable KV; CPU-only backing |
 
 The baseline configurations must likewise be read from the exact utility
 artifacts rather than replaced with a new common 32K setting. Record the actual
@@ -123,9 +227,9 @@ The remaining work is:
 | Benchmark slice | Full Context | Sliding Window | Compact-only | Compact+RAG | KVMem | Action |
 |---|---|---|---|---|---|---|
 | MemoryAgentBench (>256K) | Keep `--` | Missing | Missing | Missing | Missing | Reuse raw artifacts plus targeted timing-only reruns |
-| AgentLongBench (<=256K) | Missing | Missing | Missing | Missing | Missing | Three-sample controlled measurement |
-| AgentLongBench (512K) | Keep `--` | Missing | Missing | Missing | Missing | Three-sample controlled measurement |
-| AgentLongBench (1M) | Keep `--` | Missing | Missing | Missing | Missing | Three-sample controlled measurement |
+| AgentLongBench (<=256K) | Missing | Missing | Missing | Missing | Missing | One P50-length representative |
+| AgentLongBench (512K) | Keep `--` | Missing | Missing | Missing | Missing | One P50-length representative |
+| AgentLongBench (1M) | Keep `--` | Missing | Missing | Missing | Missing | One P50-length representative |
 
 Full Context must not be measured for a slice above the model's complete-history
 capacity. In particular, MemoryAgentBench >256K, AgentLongBench-512K and
@@ -250,41 +354,69 @@ The main cell is the client-observed pre-answer latency, not
 
 ## AgentLongBench representative measurement
 
-Use three samples per length slice. This is a representative latency estimate,
-not a full-population latency evaluation.
+Use one sample per length slice: the sample closest to the canonical rendered
+history-length median (P50). This is a representative point latency
+measurement, not a population latency estimate. The main table must label the
+latency cells as `n=1, P50-length representative`; it must not describe them as
+means over the full benchmark.
+
+The original frozen P25/P50/P75 candidates and their canonical history/query
+token counts are persisted in
+`scripts/kvmem_eval/paper_latency_agentlongbench_samples_20260812.jsonl`.
+Every formal method is validated against the P50 identity from that manifest.
+P25/P75 pilot measurements may be retained on disk but are excluded from final
+aggregation.
 
 For each slice:
 
 1. Render each sample with the canonical worker used by its frozen utility run.
 2. Tokenize the history without the final question using qw3 `/tokenize`.
 3. Sort the frozen utility population by rendered history-token length.
-4. Select the samples closest to P25, P50 and P75, with stable sample ID as the
-   deterministic tie-breaker.
-5. Persist the three IDs and their history/query token counts before launching
-   a method.
-6. Run every applicable method on exactly the same three IDs.
+4. Select the sample closest to P50, with stable sample ID as the deterministic
+   tie-breaker.
+5. Persist its ID and history/query token counts before launching a method.
+6. Run every applicable method on exactly the same P50 ID.
 7. Warm kernels only with an unrelated synthetic request, then restore the
    clean pre-query state and perform one recorded run.
 8. If a run fails, retry the same sample from the clean state; do not replace
    it with another sample.
-9. Report the arithmetic mean across the three samples and retain all raw
-   per-sample values.
+9. Report the one measured P50 value. Retain any earlier P25/P75 pilot values,
+   but do not average them into the main table.
 
 | Slice | Frozen population | Samples | Methods |
 |---|---:|---:|---|
-| AgentLongBench <=256K | 250 | 3 | Full Context, Sliding Window, Compact-only, Compact+RAG, KVMem |
-| AgentLongBench 512K | 100 | 3 | Sliding Window, Compact-only, Compact+RAG, KVMem |
-| AgentLongBench 1M | 50 | 3 | Sliding Window, Compact-only, Compact+RAG, KVMem |
+| AgentLongBench <=256K | 250 | 1 (P50) | Full Context, Sliding Window, Compact-only, Compact+RAG, KVMem |
+| AgentLongBench 512K | 100 | 1 (P50) | Sliding Window, Compact-only, Compact+RAG, KVMem |
+| AgentLongBench 1M | 50 | 1 (P50) | Sliding Window, Compact-only, Compact+RAG, KVMem |
 
-This is 39 method-sample measurements:
+This is 13 method-sample measurements:
 
 ```text
-3 * 5 + 3 * 4 + 3 * 4 = 39
+1 * 5 + 1 * 4 + 1 * 4 = 13
 ```
 
-Compact-only and Compact+RAG may reuse an identical generated summary when the
-frozen compact configuration and input are identical. Both main values must
-still include the recorded full, non-amortized summary-generation time.
+Compact-only and Compact+RAG may reuse the identical final boundary summary
+artifact when their frozen compact configuration and input are identical. Both
+main values include that one measured boundary-compaction cost; neither repeats
+earlier maintenance rounds.
+
+For AgentLongBench-1M, utility reuses the frozen question-blind DeepSeek V4 Pro
+summary, but the historical July API timing is not used in the current latency
+table. The P50 compaction call is replayed on the current host using qw3 and the
+frozen prompt policy. Validation requires the original history identity and
+server prompt-token count. The main Compact value charges this current model
+time; the parenthesized value contains only current local RAG preparation
+and/or final-query TTFT. Raw artifacts are under the formal run root.
+
+```text
+/data/chaidi/kvmem_eval/results/paper_pre_answer_latency_current_20260812/
+  alb1m_deepseek_compaction_current
+```
+
+The replay is launched by
+`scripts/kvmem_eval/run_alb1m_deepseek_compaction_latency_sample.sh`.  It reads
+the API key only from the process environment, copies it to a mode-0600 tmpfs
+file for the upstream runner, and removes the file on exit.
 
 ## Unified runner and timing requirements
 
@@ -380,11 +512,11 @@ controlled context-length scaling curve.
 - [ ] Audit the five existing LongMemEval-S latency values against the revised boundary.
 - [ ] Implement trace-tagged per-sample KVMem timing and client TTFT persistence.
 - [ ] Pass the one-sample, five-method smoke gate.
-- [ ] Freeze P25/P50/P75 AgentLongBench IDs and rendered token lengths.
+- [x] Freeze P50 AgentLongBench IDs and rendered token lengths.
 - [ ] Complete targeted MemoryAgentBench timing for the same 30 contexts/1,316 questions.
-- [ ] Measure five methods on the three AgentLongBench <=256K samples.
-- [ ] Measure four methods on the three AgentLongBench-512K samples.
-- [ ] Measure four methods on the three AgentLongBench-1M samples.
+- [ ] Measure five methods on the AgentLongBench <=256K P50 sample.
+- [ ] Measure four methods on the AgentLongBench-512K P50 sample.
+- [ ] Measure four methods on the AgentLongBench-1M P50 sample.
 - [ ] Verify that no Full Context run is launched above complete-history capacity.
 - [ ] Verify every main KVMem cell uses client TTFT, with semantic/replay retained only as breakdown.
 - [ ] Verify Compact main values include full non-amortized compaction and parentheses exclude it.

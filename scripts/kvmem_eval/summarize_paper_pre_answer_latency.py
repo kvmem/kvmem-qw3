@@ -30,6 +30,17 @@ MAB_BASELINE_ROOT = Path(
     "memoryagentbench_plain_baselines_20260802"
 )
 
+# The historical AgentLongBench plain baselines ran on A40 instances.  A
+# matched 32,768-token Qwen3.6-27B-Q8_0 llama.cpp cold-window gate on the
+# current RTX PRO 6000 measured 16.504 s, versus 39.117871 s for the frozen
+# A40 512K cohort.  Preserve raw measurements and expose a clearly labelled
+# hardware-normalized estimate rather than silently replacing provenance.
+ALB_A40_TO_PRO6000_SPEEDUP = 39.11787108161176 / 16.504
+LLAMA_TO_QW3_PRO6000_SPEEDUP = 16.504 / 8.171
+LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP = (
+    ALB_A40_TO_PRO6000_SPEEDUP * LLAMA_TO_QW3_PRO6000_SPEEDUP
+)
+
 ALB_IDS = {
     "le256": [
         "eaf6372f9c37a999d2b88fa4c4a9373d212bb9e817b0c52fdd7d9b2356275a89",
@@ -160,6 +171,30 @@ def alb_summary() -> dict[str, Any]:
             rows = select(method_paths[method], ids)
             values = [first_token_s(row) for row in rows]
             item[method] = {"per_sample_s": values, "steady_mean_s": mean(values)}
+        sliding_raw_s = item["sliding"]["steady_mean_s"]
+        item["sliding"]["pro6000_normalized_mean_s"] = (
+            sliding_raw_s / ALB_A40_TO_PRO6000_SPEEDUP
+        )
+        item["sliding"]["pro6000_qw3_normalized_mean_s"] = (
+            sliding_raw_s / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP
+        )
+        item["sliding"]["hardware_normalization"] = {
+            "source_gpu": "NVIDIA A40",
+            "target_gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            "speedup": ALB_A40_TO_PRO6000_SPEEDUP,
+            "reference": "32,768-token Qwen3.6-27B-Q8_0 llama.cpp cold-window",
+            "source_reference_s": 39.11787108161176,
+            "target_reference_s": 16.504,
+            "status": "estimate-not-rerun",
+        }
+        item["sliding"]["backend_normalization"] = {
+            "source_backend": "llama.cpp",
+            "target_backend": "qw3 native",
+            "speedup": LLAMA_TO_QW3_PRO6000_SPEEDUP,
+            "source_reference_s": 16.504,
+            "target_reference_s": 8.171,
+            "status": "estimate-not-rerun",
+        }
 
         if slice_name == "le256":
             compact_rows = select(method_paths["compact"], ids)
@@ -216,6 +251,37 @@ def alb_summary() -> dict[str, Any]:
             if compaction else None
         )
 
+        # The plain AgentLongBench baselines above were collected on the same
+        # historical A40 deployment.  Provide a simple whole-operation
+        # normalization as requested for paper-table comparison.  This is an
+        # estimate: it also scales the small CPU/tokenizer fraction, so raw
+        # values remain the source of record.
+        for method in ("compact", "compact_rag"):
+            method_item = item[method]
+            method_item["pro6000_normalized_steady_mean_s"] = (
+                method_item["steady_mean_s"] / ALB_A40_TO_PRO6000_SPEEDUP
+            )
+            method_item["pro6000_qw3_normalized_steady_mean_s"] = (
+                method_item["steady_mean_s"]
+                / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP
+            )
+            raw_main = method_item.get("main_mean_s")
+            method_item["pro6000_normalized_main_mean_s"] = (
+                raw_main / ALB_A40_TO_PRO6000_SPEEDUP
+                if raw_main is not None else None
+            )
+            method_item["pro6000_qw3_normalized_main_mean_s"] = (
+                raw_main / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP
+                if raw_main is not None else None
+            )
+            method_item["hardware_normalization"] = {
+                "source_gpu": "NVIDIA A40",
+                "target_gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                "speedup": ALB_A40_TO_PRO6000_SPEEDUP,
+                "status": "estimate-not-rerun",
+                "scope": "whole recorded operation",
+            }
+
         kvmem_rows = load_jsonl(method_paths["kvmem"])
         if kvmem_rows:
             row_by_id = {row["sample_id"]: row for row in kvmem_rows}
@@ -261,6 +327,19 @@ def mab_summary() -> dict[str, Any]:
             if not rows:
                 raise RuntimeError(f"missing baseline results: {row_dir}")
             compaction_s = 0.0
+            cold_window_prefill_s = 0.0
+            if method == "sliding-window":
+                # The utility runner primed one fixed 32K recent window per
+                # context, so row ttft_s only measures the warm-prefix query.
+                # Reconstruct the cold-window boundary by charging that saved
+                # cold prefill to every independently evaluated question, then
+                # add the observed question-suffix TTFT.  Do not add
+                # selection_sec: the fixed recent window is context-dependent,
+                # not query-dependent, and the utility runner selects it once.
+                row_summary = json.loads((row_dir / "row_summary.json").read_text())
+                cold_window_prefill_s = float(
+                    row_summary["prefix_cache"]["warmup_ttft_s"]
+                )
             if method != "sliding-window":
                 state_path = MAB_BASELINE_ROOT / "shared" / "compact" / f"{name}.json"
                 state = json.loads(state_path.read_text())
@@ -269,13 +348,21 @@ def mab_summary() -> dict[str, Any]:
                     for r in state["rounds"]
                 )
             for row in rows:
-                query_s = float(row["ttft_s"])
+                query_s = float(row["ttft_s"]) + cold_window_prefill_s
                 values.append(query_s)
                 main_values.append(query_s + compaction_s)
         methods[method] = {
             "questions": len(values),
             "steady_mean_s": mean(values),
             "main_mean_s": mean(main_values),
+            **(
+                {
+                    "boundary": "cold 32K window prefill + question-suffix TTFT",
+                    "cache_state": "cold-window",
+                }
+                if method == "sliding-window"
+                else {}
+            ),
         }
     return {
         "contexts": len(selected_names),
@@ -306,6 +393,18 @@ def main() -> None:
             "compact_rag_main_s": 116.13,
             "compact_rag_steady_s": 50.75,
             "kvmem_s": 1.68,
+            "pro6000_qw3_normalized_estimate": {
+                "status": "legacy-estimate-not-rerun",
+                "source_assumption": "A40 llama.cpp plain baselines",
+                "speedup": LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP,
+                "full_context_s": 0.81 / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP,
+                "sliding_s": 42.29 / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP,
+                "compact_main_s": 68.88 / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP,
+                "compact_steady_s": 3.50 / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP,
+                "compact_rag_main_s": 116.13 / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP,
+                "compact_rag_steady_s": 50.75 / LEGACY_A40_LLAMA_TO_PRO6000_QW3_SPEEDUP,
+                "kvmem_s": 1.68,
+            },
         },
         "memoryagentbench_gt256k": mab_summary(),
         "agentlongbench": alb_summary(),

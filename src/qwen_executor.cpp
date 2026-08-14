@@ -1321,6 +1321,10 @@ void QwenExecutor::reset_state() {
     g_provisional_prefix_replay_batch_ = 0;
     g_provisional_prefix_replay_base_pos_ = 0;
     g_provisional_prefix_replay_elems_ = 0;
+    std::fill(kvmem_raw_k_gpu_block_to_slot_.begin(),
+              kvmem_raw_k_gpu_block_to_slot_.end(), -1);
+    std::fill(kvmem_raw_k_gpu_slot_to_block_.begin(),
+              kvmem_raw_k_gpu_slot_to_block_.end(), -1);
     kvmem_qc_capture_active_ = false;
     // Per-layer multi-layer index + incremental-capture progress are per-request:
     // drop them so a fresh request rebuilds its own full-coverage index (#91).
@@ -4036,7 +4040,211 @@ void QwenExecutor::kvmem_materialize_raw_k(
     const uint32_t cap = std::max<uint32_t>(
         1, kvmem_raw_transfer_block_cap_);
 
-    for (uint32_t begin = 0; begin < refreshes.size(); begin += cap) {
+    // A semantic-chunk working set changes only slightly between adjacent
+    // events, but immutable-K drift protection intentionally reconstructs
+    // every moved block from its position-free authority. Optionally retain a
+    // bounded copy of that authority on GPU: cache hits still execute the same
+    // raw-K scatter + RoPE kernels and differ only in where the identical raw
+    // bytes are read from. Zero/unset preserves the existing CPU/H2D path.
+    const uint32_t raw_gpu_cache_mib =
+        env_uint32_or("QW3_KVMEM_RAW_K_GPU_CACHE_MIB", 0);
+    const uint64_t cache_block_elems =
+        static_cast<uint64_t>(kvmem_raw_layers_.size()) * block_elems;
+    const uint64_t cache_block_bytes =
+        static_cast<uint64_t>(kvmem_raw_layers_.size()) * block_bytes;
+    bool raw_gpu_cache_enabled =
+        raw_gpu_cache_mib != 0 && kvmem_raw_k_block_major_ &&
+        cache_block_elems != 0 && cache_block_bytes != 0 && block_store_;
+    if (raw_gpu_cache_enabled) {
+        const uint64_t cache_bytes =
+            static_cast<uint64_t>(raw_gpu_cache_mib) * 1024ull * 1024ull;
+        const uint32_t slots_by_bytes = static_cast<uint32_t>(
+            std::min<uint64_t>(UINT32_MAX, cache_bytes / cache_block_bytes));
+        const uint32_t desired_slots = std::min<uint32_t>(
+            block_store_->budget_blocks(), slots_by_bytes);
+        raw_gpu_cache_enabled = desired_slots != 0;
+        if (raw_gpu_cache_enabled &&
+            (!kvmem_raw_k_gpu_cache_ ||
+             kvmem_raw_k_gpu_cache_block_elems_ != cache_block_elems ||
+             kvmem_raw_k_gpu_cache_slots_ != desired_slots)) {
+            kvmem_raw_k_gpu_cache_ = kvmem_alloc_raw_k_tensor(
+                static_cast<uint64_t>(desired_slots) * cache_block_elems,
+                "kvmem_raw_k_gpu_cache");
+            kvmem_raw_k_gpu_cache_block_elems_ = cache_block_elems;
+            kvmem_raw_k_gpu_cache_slots_ = desired_slots;
+            kvmem_raw_k_gpu_slot_to_block_.assign(desired_slots, -1);
+            kvmem_raw_k_gpu_block_to_slot_.assign(
+                block_store_->block_count(), -1);
+            if (std::getenv("QW3_KVMEM_TRACE") ||
+                kvmem_perf_trace_flag()) {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-raw-k-cache] event=allocate budget_mib=%u "
+                    "slots=%u block_bytes=%llu allocated_mib=%.2f\n",
+                    raw_gpu_cache_mib, desired_slots,
+                    static_cast<unsigned long long>(cache_block_bytes),
+                    static_cast<double>(desired_slots) *
+                        cache_block_bytes / (1024.0 * 1024.0));
+            }
+        } else if (raw_gpu_cache_enabled &&
+                   kvmem_raw_k_gpu_block_to_slot_.size() <
+                       block_store_->block_count()) {
+            kvmem_raw_k_gpu_block_to_slot_.resize(
+                block_store_->block_count(), -1);
+        }
+    }
+
+    std::vector<const KvMemRemap *> gpu_hits;
+    std::vector<int32_t> gpu_hit_slots;
+    std::vector<const KvMemRemap *> cpu_refreshes;
+    if (raw_gpu_cache_enabled) {
+        gpu_hits.reserve(refreshes.size());
+        gpu_hit_slots.reserve(refreshes.size());
+        cpu_refreshes.reserve(refreshes.size());
+        for (const KvMemRemap *rm : refreshes) {
+            int32_t slot = -1;
+            if (rm && rm->n_tokens == bt &&
+                rm->block_id < kvmem_raw_k_gpu_block_to_slot_.size()) {
+                slot = kvmem_raw_k_gpu_block_to_slot_[rm->block_id];
+                if (slot < 0 ||
+                    static_cast<uint32_t>(slot) >=
+                        kvmem_raw_k_gpu_slot_to_block_.size() ||
+                    kvmem_raw_k_gpu_slot_to_block_[slot] !=
+                        static_cast<int32_t>(rm->block_id)) {
+                    slot = -1;
+                }
+            }
+            if (slot >= 0) {
+                gpu_hits.push_back(rm);
+                gpu_hit_slots.push_back(slot);
+            } else {
+                cpu_refreshes.push_back(rm);
+            }
+        }
+    } else {
+        cpu_refreshes.assign(refreshes.begin(), refreshes.end());
+    }
+
+    // Compact non-contiguous cache slots into one bounded device slab, then
+    // feed the ordinary block-major materializer. The D2D copies are ordered
+    // on the execution stream and replace substantially larger host gathers
+    // and PCIe H2D transfers; the RoPE arithmetic is unchanged.
+    for (uint32_t begin = 0; begin < gpu_hits.size(); begin += cap) {
+        const uint32_t n = std::min<uint32_t>(
+            cap, static_cast<uint32_t>(gpu_hits.size()) - begin);
+        const uint32_t required_slots = std::max<uint32_t>(1, n);
+        if (!kvmem_raw_k_gpu_gather_ ||
+            kvmem_raw_k_gpu_gather_slots_ < required_slots ||
+            kvmem_raw_k_gpu_gather_->count <
+                static_cast<uint64_t>(cap) * cache_block_elems ||
+            kvmem_raw_k_gpu_gather_->elem_size !=
+                kvmem_raw_k_gpu_cache_->elem_size) {
+            kvmem_raw_k_gpu_gather_ = kvmem_alloc_raw_k_tensor(
+                static_cast<uint64_t>(cap) * cache_block_elems,
+                "kvmem_raw_k_gpu_gather");
+            kvmem_raw_k_gpu_gather_slots_ = cap;
+        }
+        for (uint32_t j = 0; j < n; ++j) {
+            require_status(backend_.copy_d2d_into(
+                *kvmem_raw_k_gpu_gather_,
+                static_cast<uint64_t>(j) * cache_block_elems,
+                *kvmem_raw_k_gpu_cache_,
+                static_cast<uint64_t>(gpu_hit_slots[begin + j]) *
+                    cache_block_elems,
+                cache_block_elems));
+        }
+        bs_remap_to_host_.clear();
+        bs_remap_ntok_host_.clear();
+        uint32_t max_tokens = 0;
+        for (uint32_t j = 0; j < n; ++j) {
+            const KvMemRemap &rm = *gpu_hits[begin + j];
+            bs_remap_to_host_.push_back(rm.to_base);
+            bs_remap_ntok_host_.push_back(
+                static_cast<int32_t>(rm.n_tokens));
+            max_tokens = std::max(max_tokens, rm.n_tokens);
+        }
+        if (n > bs_remap_capacity_) {
+            bs_remap_capacity_ = n;
+            bs_remap_to_dev_ =
+                backend_.tensor_i32(bs_remap_capacity_, "bs_remap_to");
+            bs_remap_from_dev_ =
+                backend_.tensor_i32(bs_remap_capacity_, "bs_remap_from");
+            bs_remap_ntok_dev_ =
+                backend_.tensor_i32(bs_remap_capacity_, "bs_remap_ntok");
+        }
+        require_status(backend_.copy_i32_from_host(
+            *bs_remap_to_dev_, 0, bs_remap_to_host_.data(), n));
+        require_status(backend_.copy_i32_from_host(
+            *bs_remap_ntok_dev_, 0, bs_remap_ntok_host_.data(), n));
+        for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
+            require_status(
+                backend_.raw_k_scatter_rope_paged_batched_device(
+                    k_cache(kvmem_raw_layers_[slot]),
+                    *kvmem_raw_k_gpu_gather_,
+                    static_cast<uint64_t>(slot) * block_elems,
+                    n, bt, cfg.n_kv_heads,
+                    static_cast<uint32_t>(per_pos), cfg.head_dim,
+                    cfg.rope_dim, *bs_remap_to_dev_,
+                    *bs_remap_ntok_dev_, *window_pages_device_,
+                    kv_pages_.page_size, cfg.rope_theta,
+                    kvmem_rope_sincos_.get(),
+                    kvmem_rope_table_positions_, cache_block_elems));
+        }
+        kvmem_assembly_raw_gpu_hit_blocks_ += n;
+        kvmem_assembly_raw_gpu_hit_bytes_ +=
+            static_cast<uint64_t>(n) * cache_block_bytes;
+    }
+
+    std::vector<int32_t> cpu_refresh_cache_slots(
+        cpu_refreshes.size(), -1);
+    if (raw_gpu_cache_enabled && !cpu_refreshes.empty()) {
+        const auto &blocks = block_store_->blocks();
+        std::vector<int32_t> available_slots;
+        available_slots.reserve(kvmem_raw_k_gpu_cache_slots_);
+        for (uint32_t slot = 0;
+             slot < kvmem_raw_k_gpu_cache_slots_; ++slot) {
+            const int32_t old =
+                kvmem_raw_k_gpu_slot_to_block_[slot];
+            if (old < 0 ||
+                static_cast<uint32_t>(old) >= blocks.size() ||
+                !blocks[old].in_working_set) {
+                available_slots.push_back(static_cast<int32_t>(slot));
+            }
+        }
+        uint32_t next_available = 0;
+        for (uint32_t i = 0; i < cpu_refreshes.size(); ++i) {
+            const KvMemRemap &rm = *cpu_refreshes[i];
+            if (rm.n_tokens != bt) continue;
+            if (next_available >= available_slots.size()) continue;
+            const int32_t chosen = available_slots[next_available++];
+            const int32_t old =
+                kvmem_raw_k_gpu_slot_to_block_[chosen];
+            if (old >= 0 &&
+                static_cast<uint32_t>(old) <
+                    kvmem_raw_k_gpu_block_to_slot_.size()) {
+                kvmem_raw_k_gpu_block_to_slot_[old] = -1;
+            }
+            kvmem_raw_k_gpu_slot_to_block_[chosen] = -1;
+            cpu_refresh_cache_slots[i] = chosen;
+        }
+    }
+    kvmem_assembly_raw_gpu_miss_blocks_ +=
+        static_cast<uint32_t>(cpu_refreshes.size());
+    if (raw_gpu_cache_enabled &&
+        (std::getenv("QW3_KVMEM_TRACE") ||
+         kvmem_perf_trace_flag())) {
+        std::fprintf(
+            stderr,
+            "[kvmem-raw-k-cache] event=materialize hits=%zu misses=%zu "
+            "hit_bytes=%llu slots=%u\n",
+            gpu_hits.size(), cpu_refreshes.size(),
+            static_cast<unsigned long long>(
+                static_cast<uint64_t>(gpu_hits.size()) *
+                cache_block_bytes),
+            kvmem_raw_k_gpu_cache_slots_);
+    }
+
+    for (uint32_t begin = 0; begin < cpu_refreshes.size(); begin += cap) {
         RawMaterializeSlot *pipeline_slot = nullptr;
         if (kvmem_raw_pipeline_enabled_) {
             pipeline_slot =
@@ -4050,7 +4258,7 @@ void QwenExecutor::kvmem_materialize_raw_k(
                 pipeline_slot->compute_done));
         }
         const uint32_t n = std::min<uint32_t>(
-            cap, static_cast<uint32_t>(refreshes.size()) - begin);
+            cap, static_cast<uint32_t>(cpu_refreshes.size()) - begin);
         const uint64_t total_elems =
             static_cast<uint64_t>(kvmem_raw_layers_.size()) * n * block_elems;
         const uint64_t total_bytes =
@@ -4103,7 +4311,7 @@ void QwenExecutor::kvmem_materialize_raw_k(
         // Validity is block-global, not layer-specific. The legacy loop
         // repeated this check for every standard-attention layer.
         for (uint32_t j = 0; j < n; ++j) {
-            const KvMemRemap &rm = *refreshes[begin + j];
+            const KvMemRemap &rm = *cpu_refreshes[begin + j];
             const KvMemBlock &block =
                 block_store_->blocks()[rm.block_id];
             for (uint32_t t = 0; t < rm.n_tokens; ++t) {
@@ -4118,7 +4326,7 @@ void QwenExecutor::kvmem_materialize_raw_k(
         }
         auto gather_layer = [&](uint32_t slot) {
             for (uint32_t j = 0; j < n; ++j) {
-                const KvMemRemap &rm = *refreshes[begin + j];
+                const KvMemRemap &rm = *cpu_refreshes[begin + j];
                 const KvMemBlock &block =
                     block_store_->blocks()[rm.block_id];
                 uint8_t *dst = packed +
@@ -4139,7 +4347,7 @@ void QwenExecutor::kvmem_materialize_raw_k(
         // layout. A full selected block is one contiguous ~1 MiB memcpy
         // instead of L independent 64 KiB copies spread across a chunk.
         auto gather_block = [&](uint32_t j) {
-            const KvMemRemap &rm = *refreshes[begin + j];
+            const KvMemRemap &rm = *cpu_refreshes[begin + j];
             const KvMemBlock &block =
                 block_store_->blocks()[rm.block_id];
             uint8_t *dst = packed +
@@ -4207,7 +4415,7 @@ void QwenExecutor::kvmem_materialize_raw_k(
         kvmem_assembly_raw_gather_ns_ +=
             kvmem_steady_ns() - gather0;
         for (uint32_t j = 0; j < n; ++j) {
-            const KvMemRemap &rm = *refreshes[begin + j];
+            const KvMemRemap &rm = *cpu_refreshes[begin + j];
             bs_remap_to_host_.push_back(rm.to_base);
             bs_remap_ntok_host_.push_back(
                 static_cast<int32_t>(rm.n_tokens));
@@ -4243,6 +4451,28 @@ void QwenExecutor::kvmem_materialize_raw_k(
             kvmem_steady_ns() - h2d0;
         kvmem_assembly_raw_bytes_ += total_bytes;
         ++kvmem_assembly_raw_batches_;
+        if (raw_gpu_cache_enabled) {
+            for (uint32_t j = 0; j < n; ++j) {
+                const int32_t cache_slot =
+                    cpu_refresh_cache_slots[begin + j];
+                if (cache_slot < 0) continue;
+                require_status(backend_.copy_d2d_into(
+                    *kvmem_raw_k_gpu_cache_,
+                    static_cast<uint64_t>(cache_slot) *
+                        cache_block_elems,
+                    *transfer_dev,
+                    static_cast<uint64_t>(j) * cache_block_elems,
+                    cache_block_elems));
+                const uint32_t block_id =
+                    cpu_refreshes[begin + j]->block_id;
+                kvmem_raw_k_gpu_slot_to_block_[cache_slot] =
+                    static_cast<int32_t>(block_id);
+                if (block_id <
+                    kvmem_raw_k_gpu_block_to_slot_.size()) {
+                    kvmem_raw_k_gpu_block_to_slot_[block_id] = cache_slot;
+                }
+            }
+        }
         if (std::getenv("QW3_KVMEM_TRACE") ||
             kvmem_tier_trace_enabled()) {
             std::fprintf(
@@ -4250,7 +4480,7 @@ void QwenExecutor::kvmem_materialize_raw_k(
                 "[kvmem-raw-k] refresh_blocks=%u packed_bytes=%llu "
                 "first_block=%u\n",
                 n, static_cast<unsigned long long>(total_bytes),
-                refreshes[begin]->block_id);
+                cpu_refreshes[begin]->block_id);
         }
         for (uint32_t slot = 0; slot < kvmem_raw_layers_.size(); ++slot) {
             const uint64_t raw_element_offset =
@@ -7896,9 +8126,11 @@ void QwenExecutor::kvmem_reset_recurrent_state() {
     }
 }
 
-void QwenExecutor::seed_from_shared_prefix(const std::vector<int32_t> &shared_pages,
-                                           const StateSnapshot &recur,
-                                           uint32_t aligned_len) {
+void QwenExecutor::seed_from_shared_prefix(
+        const std::vector<int32_t> &shared_pages,
+        const std::vector<int32_t> &shared_mtp_pages,
+        const StateSnapshot &recur,
+        uint32_t aligned_len) {
     ensure_scratch();
     const uint32_t page_size = kv_pages_.page_size;
     if (page_size == 0) {
@@ -7909,29 +8141,76 @@ void QwenExecutor::seed_from_shared_prefix(const std::vector<int32_t> &shared_pa
             "seed_from_shared_prefix: aligned_len must be a whole number of "
             "KV pages");
     }
+    if (!shared_mtp_pages.empty()) {
+        ensure_mtp_scratch();
+        if (mtp_kv_pages_.page_size != page_size ||
+            static_cast<uint64_t>(shared_mtp_pages.size()) * page_size !=
+                aligned_len ||
+            recur.mtp_kv_logical_pages !=
+                static_cast<uint32_t>(shared_mtp_pages.size()) ||
+            recur.mtp_prefix_len < aligned_len || !recur.mtp_prefix_h) {
+            throw std::runtime_error(
+                "seed_from_shared_prefix: incomplete MTP prefix state");
+        }
+    }
     // The page table must be empty (caller resets the executor first).
     kv_pages_.adopt_shared_pages(backend_, shared_pages);
+    if (!shared_mtp_pages.empty()) {
+        mtp_kv_pages_.adopt_shared_pages(backend_, shared_mtp_pages);
+    }
     // Restore recurrent + conv state captured at exactly aligned_len. This
-    // also sets position_ and truncates kv logical pages to recur.kv_logical_pages.
-    // Because we adopted exactly the shared pages, that truncation is a no-op.
+    // also sets position_ and truncates both logical page tables to the counts
+    // in the snapshot. Because we adopted exactly the shared pages, those
+    // truncations are no-ops.
     restore_state(recur);
     position_ = aligned_len;
+    // restore_state normally only rewinds mtp_prefix_len_. A fresh executor
+    // starts at zero, so a cross-request seed must explicitly publish the
+    // restored draft prefix after installing its pages and hidden state.
+    if (!shared_mtp_pages.empty()) mtp_prefix_len_ = aligned_len;
 }
 
-std::vector<int32_t> QwenExecutor::mark_kv_prefix_shared(uint32_t logical_start_page) {
-    // Mark the prefix [0..logical_start_page) as borrowed so this executor's
-    // dtor/reset won't free those pages — the prefix cache now pins them. The
-    // suffix [logical_start_page..end) stays owned and frees normally when the
-    // live request finishes. Returns the prefix's physical pages for the cache
-    // to record + pin.
-    const uint32_t n = std::min<uint32_t>(
-        logical_start_page, static_cast<uint32_t>(kv_pages_.pages.size()));
+bool QwenExecutor::mark_prefix_shared(
+        uint32_t logical_pages, bool include_mtp,
+        std::vector<int32_t> &main_pages,
+        std::vector<int32_t> &mtp_pages) {
+    main_pages.clear();
+    mtp_pages.clear();
+    if (logical_pages == 0 || kv_pages_.pages.size() < logical_pages) {
+        return false;
+    }
+    if (include_mtp &&
+        (mtp_kv_pages_.page_size != kv_pages_.page_size ||
+         mtp_kv_pages_.pages.size() < logical_pages ||
+         mtp_prefix_len_ < logical_pages * kv_pages_.page_size ||
+         !mtp_prefix_h_)) {
+        return false;
+    }
+
+    main_pages.assign(kv_pages_.pages.begin(),
+                      kv_pages_.pages.begin() + logical_pages);
+    if (include_mtp) {
+        mtp_pages.assign(mtp_kv_pages_.pages.begin(),
+                         mtp_kv_pages_.pages.begin() + logical_pages);
+    }
+
+    // Mark the promoted prefix borrowed so reset/dtor never returns cache-owned
+    // pages to either global pool. The caller pins the returned physical ids.
     if (kv_pages_.owned.size() < kv_pages_.pages.size()) {
         kv_pages_.owned.resize(kv_pages_.pages.size(), true);
     }
-    for (uint32_t i = 0; i < n; ++i) kv_pages_.owned[i] = false;
-    return std::vector<int32_t>(kv_pages_.pages.begin(),
-                                kv_pages_.pages.begin() + n);
+    for (uint32_t i = 0; i < logical_pages; ++i) {
+        kv_pages_.owned[i] = false;
+    }
+    if (include_mtp) {
+        if (mtp_kv_pages_.owned.size() < mtp_kv_pages_.pages.size()) {
+            mtp_kv_pages_.owned.resize(mtp_kv_pages_.pages.size(), true);
+        }
+        for (uint32_t i = 0; i < logical_pages; ++i) {
+            mtp_kv_pages_.owned[i] = false;
+        }
+    }
+    return true;
 }
 
 std::vector<int32_t> QwenExecutor::kv_physical_pages() const {
@@ -9721,6 +10000,12 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
                   static_cast<uint8_t>(0));
     }
     kvmem_truncate_raw_k(token_pos);
+    // A truncated block id may later be reused for different token content.
+    // Keep the allocation reusable but invalidate every logical cache entry.
+    std::fill(kvmem_raw_k_gpu_block_to_slot_.begin(),
+              kvmem_raw_k_gpu_block_to_slot_.end(), -1);
+    std::fill(kvmem_raw_k_gpu_slot_to_block_.begin(),
+              kvmem_raw_k_gpu_slot_to_block_.end(), -1);
     kvmem_raw_decode_block_start_ = -1;
     kvmem_raw_decode_first_row_ = 0;
     kvmem_raw_decode_rows_ = 0;
@@ -12830,6 +13115,9 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     kvmem_assembly_raw_h2d_wait_ns_ = 0;
     kvmem_assembly_raw_bytes_ = 0;
     kvmem_assembly_raw_batches_ = 0;
+    kvmem_assembly_raw_gpu_hit_bytes_ = 0;
+    kvmem_assembly_raw_gpu_hit_blocks_ = 0;
+    kvmem_assembly_raw_gpu_miss_blocks_ = 0;
     kvmem_assembly_final_drain_ns_ = 0;
     const QwenConfig &cfg = model_.config();
     kvmem_ensure_rope_sincos_table();
@@ -13219,6 +13507,8 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 "raw_gather_ms=%.3f raw_h2d_submit_ms=%.3f "
                 "raw_h2d_wait_ms=%.3f final_drain_ms=%.3f "
                 "raw_bytes=%llu raw_batches=%u "
+                "raw_gpu_hit_bytes=%llu raw_gpu_hit_blocks=%u "
+                "raw_gpu_miss_blocks=%u "
                 "raw_refresh_blocks=%zu inplace_blocks=%u "
                 "mtp_blocks=%u mtp_inplace_blocks=%u\n",
                 kvmem_raw_pipeline_enabled_
@@ -13234,7 +13524,12 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                 kvmem_assembly_final_drain_ns_ / 1.0e6,
                 static_cast<unsigned long long>(
                     kvmem_assembly_raw_bytes_),
-                kvmem_assembly_raw_batches_, raw_refreshes.size(), n_moved,
+                kvmem_assembly_raw_batches_,
+                static_cast<unsigned long long>(
+                    kvmem_assembly_raw_gpu_hit_bytes_),
+                kvmem_assembly_raw_gpu_hit_blocks_,
+                kvmem_assembly_raw_gpu_miss_blocks_,
+                raw_refreshes.size(), n_moved,
                 mtp_rebuild_blocks, mtp_inplace_blocks);
         }
     }

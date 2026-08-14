@@ -166,6 +166,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8139)
     ap.add_argument("--max-tokens", type=int, default=16)
     ap.add_argument("--ctx", type=int, default=131072)
+    ap.add_argument("--mtp-chain", type=int, default=0)
     ap.add_argument("--boot-timeout", type=float, default=300.0)
     ap.add_argument("--req-timeout", type=float, default=600.0)
     ap.add_argument("--lengths", default="16000,32000,64000")
@@ -189,13 +190,21 @@ def main() -> int:
         prompts[L] = (turn1, turn2)
 
     failures: List[str] = []
+    mtp_args = (["--native-mtp-speculate", "--mtp-chain",
+                 str(args.mtp_chain)] if args.mtp_chain > 0 else [])
+    deterministic_env = {
+        "QW3_FATTN_NSPLIT": "1",
+        "QW3_PREFILL_FA2_NSPLIT": "1",
+        "QW3_CONTINUOUS_MTP_PHASE_SYNC": "1",
+    }
 
     # ---- WARM run (cache ON) --------------------------------------------
     warm_log = os.path.join(args.logdir, "warm.log")
     proc = start_server(args.binary, args.model, args.port, args.ctx,
-                        {"QW3_PREFIX_CACHE_TRACE": "1",
+                        {**deterministic_env,
+                         "QW3_PREFIX_CACHE_TRACE": "1",
                          "QW3_CONTINUOUS_BATCHING_TRACE": "1"},
-                        ["--prefix-cache"], warm_log)
+                        ["--prefix-cache", *mtp_args], warm_log)
     # request log order -> (L, turn) so we can map prefill traces back.
     warm_order: List[Tuple[int, int]] = []
     warm_e2e: Dict[Tuple[int, int], float] = {}
@@ -226,8 +235,9 @@ def main() -> int:
     # ---- COLD run (cache OFF) -------------------------------------------
     cold_log = os.path.join(args.logdir, "cold.log")
     proc = start_server(args.binary, args.model, args.port, args.ctx,
-                        {"QW3_CONTINUOUS_BATCHING_TRACE": "1"},
-                        [], cold_log)
+                        {**deterministic_env,
+                         "QW3_CONTINUOUS_BATCHING_TRACE": "1"},
+                        mtp_args, cold_log)
     cold_order: List[Tuple[int, int]] = []
     cold_e2e: Dict[Tuple[int, int], float] = {}
     try:
@@ -254,6 +264,11 @@ def main() -> int:
     warm_pf = parse_prefills(warm_trace)   # in order: [t1_L0, t2_L0, t1_L1, ...]
     cold_pf = parse_prefills(cold_trace)   # in order: [t2_L0, t2_L1, t2_L2]
     warm_hits = parse_hits(warm_trace)
+    mtp_hits = len(re.findall(
+        r"prefix_cache hit[^\n]*mtp_pages=[1-9][0-9]*", warm_trace))
+    if args.mtp_chain > 0 and mtp_hits < len(lengths):
+        failures.append(
+            f"expected {len(lengths)} MTP-page hits, saw {mtp_hits}")
 
     # Map warm prefill traces to (L, turn) by log order.
     warm_pf_by_key: Dict[Tuple[int, int], Tuple[int, int, float]] = {}
@@ -264,7 +279,8 @@ def main() -> int:
         cold_pf_by_key[key] = rec
 
     print("=== prefix cache latency benchmark (multi-turn append) ===")
-    print(f"max_tokens={args.max_tokens} ctx={args.ctx}")
+    print(f"max_tokens={args.max_tokens} ctx={args.ctx} "
+          f"mtp_chain={args.mtp_chain}")
     header = (f"{'target_L':>9} {'prompt_tok':>10} {'reused':>8} {'reuse%':>7} "
               f"{'cold_pf':>9} {'warm_pf':>9} {'pf_saved':>9} {'pf_x':>6} "
               f"{'cold_e2e':>9} {'warm_e2e':>9} {'e2e_saved':>10} {'e2e%':>6}")

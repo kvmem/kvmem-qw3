@@ -603,7 +603,7 @@ Serving feature switches:
 | `--no-mtp-batched-draft` | n/a | Disables batched MTP draft for debugging. |
 | `--mtp-paged-prefix` | auto | Forces paged MTP prefix KV. Auto-on for MTP + paged KV. |
 | `--no-mtp-paged-prefix` | n/a | Disables paged MTP prefix for debugging. |
-| `--prefix-cache` | off | Lossless prefix KV caching: reuse a shared prompt prefix's KV across requests. Requires `--continuous-batching`; MTP requests cold-prefill in v1. |
+| `--prefix-cache` | off | Lossless prefix KV caching: reuse a shared prompt prefix's main and, when enabled, MTP draft state across requests. Requires `--continuous-batching`. |
 
 Explicit examples:
 
@@ -669,7 +669,13 @@ Scope and limits (v1):
   seconds to ~0.06s; the longer the shared context, the larger the win).
 - The "shared system preamble + a *different* question" case does not reuse yet
   (each distinct question commits its own entry). That is the next milestone.
-- **MTP** requests (`--mtp-chain N`) bypass the cache in v1 and cold-prefill.
+- **MTP** requests (`--mtp-chain N`) cache and restore paired main/MTP KV
+  pages plus the recurrent/conv and MTP-prefix hidden state, so speculative
+  decoding remains active after a prefix hit.
+- Prefix entries have an independent LRU state-snapshot cap of 64 by default
+  (`QW3_PREFIX_CACHE_MAX_ENTRIES`; set 0 for unlimited). This is separate from
+  `QW3_PREFIX_CACHE_MAX_PAGES` because linear prompt chains can share nearly
+  all KV pages while still owning distinct recurrent/conv/MTP device states.
 - Enabling the cache currently forces the per-row prefill path (batch-prefill is
   disabled so commits land exactly on page boundaries).
 

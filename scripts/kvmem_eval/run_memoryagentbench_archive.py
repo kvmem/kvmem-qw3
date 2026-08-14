@@ -84,6 +84,63 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-contexts", type=int)
     p.add_argument("--question-limit", type=int,
                    help="per-context diagnostic limit; omit for full evaluation")
+    p.add_argument(
+        "--query-score-span",
+        choices=("formatted", "raw"),
+        default="formatted",
+        help=(
+            "formatted reproduces the legacy full-template retrieval query; "
+            "raw scores only the source question while replaying the same "
+            "complete formatted prompt"
+        ),
+    )
+    p.add_argument(
+        "--query-token-selector",
+        choices=("none", "attention-probe", "guided-query"),
+        default="none",
+        help=(
+            "attention-probe greedily decodes a reversible probe and scores "
+            "retrieval with the highest-attention original query tokens; "
+            "guided-query captures only the model's compact standalone query "
+            "Q after a bounded private reasoning phase; default none preserves the "
+            "existing scorer"
+        ),
+    )
+    p.add_argument(
+        "--query-probe-tokens",
+        type=int,
+        default=100,
+        help=(
+            "attention-probe decode length, or guided-query's maximum private "
+            "thinking length"
+        ),
+    )
+    p.add_argument(
+        "--query-score-tokens",
+        type=int,
+        default=64,
+        help=(
+            "number of original Q rows retained by attention-probe, or the "
+            "maximum generated compact-query length"
+        ),
+    )
+    p.add_argument(
+        "--dump-retrieval-scores",
+        action="store_true",
+        help=(
+            "write one full per-block score/selection snapshot per question "
+            "for recall and A/B intersection analysis"
+        ),
+    )
+    p.add_argument(
+        "--answer-max-tokens-override",
+        type=int,
+        default=0,
+        help=(
+            "override source-specific answer limits; 0 preserves utility "
+            "semantics, while 1 gives an explicit first-token latency run"
+        ),
+    )
     p.add_argument("--block-tokens", type=int, default=512)
     p.add_argument("--budget", type=int, default=204800)
     p.add_argument("--gen-budget", type=int, default=32768)
@@ -263,6 +320,12 @@ def main() -> int:
         raise ValueError("--prefill-semantic-query-tokens must be >= 0")
     if args.immutable_refresh_tokens <= 0:
         raise ValueError("--immutable-refresh-tokens must be > 0")
+    if args.answer_max_tokens_override < 0:
+        raise ValueError("--answer-max-tokens-override must be non-negative")
+    if args.query_probe_tokens <= 0:
+        raise ValueError("--query-probe-tokens must be > 0")
+    if args.query_score_tokens <= 0:
+        raise ValueError("--query-score-tokens must be > 0")
     args.binary = args.binary.resolve()
     args.model = args.model.resolve()
     if args.selection_manifest is not None:
@@ -273,8 +336,10 @@ def main() -> int:
         args.ssd_root.mkdir(parents=True, exist_ok=True)
     selected_splits = args.split or list(SPLITS)
     selected_pairs: set[tuple[str, int]] | None = None
+    selected_order: dict[tuple[str, int], int] | None = None
     if args.selection_manifest is not None:
         selected_pairs = set()
+        selected_order = {}
         with args.selection_manifest.open(encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, 1):
                 if not line.strip():
@@ -291,6 +356,7 @@ def main() -> int:
                         f"duplicate selection at line {line_number}: {item}"
                     )
                 selected_pairs.add((split, row))
+                selected_order[(split, row)] = len(selected_order)
     run_id = safe_name(args.out_dir.name)
     work: list[tuple[str, Path, int, str]] = []
     for split in selected_splits:
@@ -314,6 +380,11 @@ def main() -> int:
                 "selection manifest contains contexts not found under the "
                 f"active split/source filters: {sorted(missing)}"
             )
+        # A selection manifest is also the experiment schedule.  Preserving
+        # its order lets diagnostic runs front-load known regressions while
+        # retaining exactly the same complete context/question population.
+        assert selected_order is not None
+        work.sort(key=lambda item: selected_order[(item[0], item[2])])
     if args.max_contexts is not None:
         work = work[: args.max_contexts]
 
@@ -358,12 +429,21 @@ def main() -> int:
         row_dir.mkdir(parents=True, exist_ok=True)
         print(f"[{ordinal}/{len(work)}] PREPARE {source} row={row_index}",
               flush=True)
-        if not (row_dir / "prepare_manifest.json").exists():
+        prepare_manifest_path = row_dir / "prepare_manifest.json"
+        prepare_needed = not prepare_manifest_path.exists()
+        if not prepare_needed:
+            prior_prepare = json.loads(
+                prepare_manifest_path.read_text(encoding="utf-8")
+            )
+            prior_span = prior_prepare.get("query_score_span", "formatted")
+            prepare_needed = prior_span != args.query_score_span
+        if prepare_needed:
             run_logged(
                 [
                     sys.executable, str(prepare_script),
                     "--parquet", str(parquet), "--row", str(row_index),
                     "--out-dir", str(row_dir),
+                    "--query-score-span", args.query_score_span,
                 ],
                 row_dir / "prepare.log",
             )
@@ -396,7 +476,11 @@ def main() -> int:
                 raise RuntimeError(f"invalid prior token log: {token_log}")
             token_count = int(match.group(1))
         aligned = math.ceil(token_count / args.prefill_chunk) * args.prefill_chunk
-        max_tokens = MAX_TOKENS[source_family(source)]
+        max_tokens = (
+            args.answer_max_tokens_override
+            if args.answer_max_tokens_override > 0
+            else MAX_TOKENS[source_family(source)]
+        )
         # Immutable archive mode always uses the bounded tiered page pool. A
         # global 200K budget is larger than many benchmark contexts; passing it
         # verbatim makes (budget + generation reserve) exceed --ctx, disables
@@ -536,6 +620,12 @@ def main() -> int:
             "--top-k", str(args.top_k),
             "-n", str(max_tokens),
         ]
+        if args.query_token_selector != "none":
+            query_cmd.extend([
+                "--archive-query-token-selector", args.query_token_selector,
+                "--archive-query-probe-tokens", str(args.query_probe_tokens),
+                "--archive-query-score-tokens", str(args.query_score_tokens),
+            ])
         print(
             f"[{ordinal}/{len(work)}] QUERY n={len(qa)} "
             f"max_tokens={max_tokens}", flush=True
@@ -549,6 +639,15 @@ def main() -> int:
         # correctness coverage.
         query_env["QW3_KVMEM_PERF_TRACE"] = "1"
         query_env.pop("QW3_KVMEM_TRACE", None)
+        retrieval_dump = row_dir / "retrieval_scores.jsonl"
+        if args.dump_retrieval_scores:
+            # The executor appends snapshots so server-style multi-request runs
+            # are durable. This direct row query is an atomic rerun and needs a
+            # fresh file to keep exactly one snapshot per question.
+            retrieval_dump.write_text("", encoding="utf-8")
+            query_env["QW3_KVMEM_DUMP_SCORES"] = str(retrieval_dump)
+        else:
+            query_env.pop("QW3_KVMEM_DUMP_SCORES", None)
         run_logged(query_cmd, row_dir / "query.log", query_env)
         query_log_text = (row_dir / "query.log").read_text(
             encoding="utf-8", errors="replace"
@@ -577,6 +676,13 @@ def main() -> int:
             if output["question_index"] != gold["question_index"]:
                 raise RuntimeError("question index mismatch")
             metrics = simple_metrics(output["answer"], gold["answer"], family)
+            if args.query_score_span == "raw" and (
+                output.get("score_span_text") != str(gold["raw_question"])
+            ):
+                raise RuntimeError(
+                    "raw score span text mismatch for question "
+                    f"{output['question_index']}"
+                )
             enriched.append({
                 **output,
                 "split": split,
@@ -588,6 +694,7 @@ def main() -> int:
                 "raw_question": gold["raw_question"],
                 "gold_answer": gold["answer"],
                 "keypoints": gold.get("keypoints"),
+                "query_score_span_mode": args.query_score_span,
                 "metrics": metrics,
             })
         enriched_path = row_dir / "results.jsonl"
@@ -622,6 +729,11 @@ def main() -> int:
             "max_generation_tokens": max_tokens,
             "scorer_events": len(scorer_fallbacks),
             "scorer_fallbacks": sum(scorer_fallbacks),
+            "query_score_span_mode": args.query_score_span,
+            "retrieval_dump": (
+                str(retrieval_dump.resolve())
+                if args.dump_retrieval_scores else None
+            ),
             "results": str(enriched_path.resolve()),
             "official_special_metrics_pending": family in (
                 "infbench", "longmemeval", "recsys"

@@ -245,3 +245,53 @@ also verified that Q transfer was not the dominant end-to-end cost. Further
 large gains require faster model-forward kernels or a semantic change such as a
 less frequent reselection cadence; another local I/O copy optimization cannot
 remove the remaining dual-forward floor.
+
+## V4: exact GPU raw-K working-set cache (2026-08-14)
+
+The immutable-K policy periodically reconstructs moved blocks from canonical,
+position-free raw K so repeated compact-position changes cannot accumulate
+quantization or RoPE drift. Semantic-chunk selections overlap substantially,
+but the previous implementation gathered and uploaded the same canonical bytes
+from CPU again whenever a retained block required this exact refresh.
+
+`QW3_KVMEM_RAW_K_GPU_CACHE_MIB` now optionally keeps a bounded block-major copy
+of canonical raw K for the active working set. A hit still runs the existing
+raw-K scatter and RoPE kernels; only the source of the byte-identical raw input
+changes from a CPU/H2D slab to a GPU/D2D slab. Zero/unset disables the cache.
+The allocation is capped by the configured selection budget, partial blocks are
+not cached, and reset/truncate invalidates all logical entries.
+
+Strict A/B used stable sample
+`2e754542b66666a0d6d86ee81f8ac34c1d6e2c66f128a95efc8ee6d1c73460d8`,
+K64/G32/B32, 2,048-token full-chunk queries, 221 reselections, MTP-4, and
+one requested output token. Both sides used the same newly built binary.
+
+| Metric | Cache off | 2-GiB budget | Change |
+|---|---:|---:|---:|
+| Engine / pre-answer time | 411.226 s | 402.531 s | **-2.11%** |
+| Exposed reselection | 30.785 s | 22.437 s | **-27.12%** |
+| Assembly | 24.435 s | 16.034 s | **-34.38%** |
+| Re-RoPE/materialization portion | 24.111 s | 15.709 s | **-34.84%** |
+| Main raw-K CPU/H2D traffic | 217.598 GiB | 92.876 GiB | **-57.32%** |
+| Provisional phase | 201.537 s | 201.425 s | unchanged |
+| Durable replay | 158.854 s | 158.733 s | unchanged |
+
+For this K64/B32 setup the working-set cap limits the persistent cache to
+1,024 MiB despite the 2-GiB environment budget; the bounded 128-block D2D
+gather slab adds 64 MiB. The larger budget leaves room for configurations with
+larger raw-K bytes per physical block.
+
+Validation:
+
+- all 221 logged top-score records are byte-identical;
+- all 221 semantic selection/reuse transitions are byte-identical;
+- all 221 scorer records and chunk boundaries are byte-identical;
+- the first generated token is identical;
+- no fallback or OOM occurred;
+- the KVMem store, assembly, immutable-K, RoPE-remap, softmax, and mean-K merge
+  test set passes.
+
+Artifacts:
+
+- cache on: `/data/chaidi/kvmem_eval/logs/agentlongbench_512k_k64_semchunk_rawkgpu2g_perf_20260814_server.log`
+- cache off: `/data/chaidi/kvmem_eval/logs/agentlongbench_512k_k64_semchunk_rawkgpu_off_perf_20260814_server.log`

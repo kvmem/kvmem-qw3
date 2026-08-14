@@ -306,6 +306,9 @@ struct GenerationOptions {
     // query replay/answer generation. Zero keeps this path disabled.
     uint32_t kvmem_query_guided_thinking_max_tokens = 0;
     uint32_t kvmem_query_guided_query_max_tokens = 0;
+    // Skip private reasoning and directly rewrite the real request as one
+    // retrieval question. This remains independent from normal answer thinking.
+    bool kvmem_query_guided_direct = false;
     // Experimental transcript replay: every span is a user query that arrived
     // after the KVMem working-set + generation reserve was already full. During
     // prefill the backend reselects at each span, replays that query against the

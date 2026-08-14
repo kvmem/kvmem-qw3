@@ -25,6 +25,7 @@ import argparse
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -255,22 +256,32 @@ def enumerate_work(args: argparse.Namespace) -> list[WorkRow]:
 
 class TokenCounter:
     def __init__(self, tokenizer_dir: Path) -> None:
-        from tokenizers import Tokenizer
+        import transformers
+        from transformers import AutoTokenizer
 
         tokenizer_json = tokenizer_dir / "tokenizer.json"
         if not tokenizer_json.is_file():
             raise BaselineError(f"tokenizer.json is missing: {tokenizer_json}")
         self.path = tokenizer_dir.resolve()
-        self.tokenizer = Tokenizer.from_file(str(tokenizer_json))
+        # Loading tokenizer.json directly is not equivalent to the tokenizer
+        # used by recent vLLM releases.  Transformers 5 applies Qwen's updated
+        # Unicode pre-tokenization rules at AutoTokenizer construction time;
+        # the difference is observable for Hindi/Bengali/Urdu text and can
+        # move a nominal 64K prompt across the hard cap.  Run generation with
+        # the same Python environment as vLLM and use its AutoTokenizer here.
+        self.transformers_version = transformers.__version__
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            str(self.path), local_files_only=True, use_fast=True
+        )
         self.calls = 0
         self.seconds = 0.0
 
     def ids(self, text: str) -> list[int]:
         started = time.perf_counter()
-        result = self.tokenizer.encode(text, add_special_tokens=False).ids
+        result = self.tokenizer.encode(text, add_special_tokens=False)
         self.calls += 1
         self.seconds += time.perf_counter() - started
-        return result
+        return list(result)
 
     def count(self, text: str) -> int:
         return len(self.ids(text))
@@ -278,6 +289,8 @@ class TokenCounter:
     def snapshot(self) -> dict[str, Any]:
         return {
             "tokenizer": str(self.path),
+            "implementation": type(self.tokenizer).__name__,
+            "transformers_version": self.transformers_version,
             "calls": self.calls,
             "seconds": self.seconds,
         }
@@ -292,6 +305,9 @@ def qwen_open_user(system: str, content: str) -> str:
 
 QWEN_NO_THINK_SUFFIX = (
     "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+)
+RAG_VARIABLE_PREFIX = (
+    "[Question-specific blocks retrieved from the full original memorized context]"
 )
 
 
@@ -448,6 +464,17 @@ def compact_common_content(summary: str, tail: str) -> str:
     )
 
 
+def compact_summary_only_content(summary: str) -> str:
+    if not summary.strip():
+        raise BaselineError("strict no-tail compact state has an empty summary")
+    return (
+        "The full memorized context was compressed without seeing any "
+        "question or retrieval result.\n\n"
+        "[Question-independent full-history summary]\n"
+        f"{summary.strip()}"
+    )
+
+
 def find_compact_segment_end(
     *,
     history: str,
@@ -512,6 +539,7 @@ def checked_chat(
     top_k: int,
     attempts: int,
     require_content: bool = True,
+    accept_terminal_length: bool = False,
 ) -> tuple[Any, int]:
     last = None
     for attempt in range(1, attempts + 1):
@@ -524,7 +552,11 @@ def checked_chat(
             extra_body={"top_k": top_k},
         )
         last = result
-        if result.error is None and (result.answer or not require_content):
+        if result.error is None and (
+            result.answer
+            or not require_content
+            or (accept_terminal_length and result.finish_reason == "length")
+        ):
             return result, attempt
         if attempt < attempts:
             time.sleep(min(2 ** (attempt - 1), 8))
@@ -550,6 +582,8 @@ def compact_fingerprint(args: argparse.Namespace, context: str) -> str:
         "top_p": 0.9,
         "top_k": args.top_k,
         "thinking": False,
+        "full_history": args.compact_full_history,
+        "no_raw_tail": args.compact_no_tail,
     }
     return sha256_text(canonical_json(value))
 
@@ -572,19 +606,45 @@ def prepare_compact_state(
         if state.get("status") == "completed":
             return state
     else:
-        state = {
-            "schema_version": 1,
-            "status": "running",
-            "config_sha256": fingerprint,
-            "context_sha256": sha256_text(context),
-            "context_chars": len(context),
-            "cursor": 0,
-            "summary": "",
-            "rounds": [],
-            "question_seen": False,
-            "retrieval_seen": False,
-            "created_at": now_iso(),
-        }
+        source_path = None
+        if args.source_shared_workspace is not None:
+            source_path = (
+                args.source_shared_workspace / "shared" / "compact" / f"{row.name}.json"
+            )
+        if source_path is not None and source_path.is_file():
+            source = read_json(source_path)
+            if source.get("context_sha256") != sha256_text(context):
+                raise BaselineError(
+                    f"source compact context mismatch: {source_path}"
+                )
+            if source.get("question_seen") is not False or source.get("retrieval_seen") is not False:
+                raise BaselineError(
+                    f"source compact checkpoint leaked query information: {source_path}"
+                )
+            state = {
+                **source,
+                "status": "running",
+                "config_sha256": fingerprint,
+                "imported_from": str(source_path.resolve()),
+                "imported_config_sha256": source.get("config_sha256"),
+                "imported_round_count": len(source.get("rounds") or []),
+                "updated_at": now_iso(),
+            }
+        else:
+            state = {
+                "schema_version": 1,
+                "status": "running",
+                "config_sha256": fingerprint,
+                "context_sha256": sha256_text(context),
+                "context_chars": len(context),
+                "cursor": 0,
+                "summary": "",
+                "rounds": [],
+                "imported_round_count": 0,
+                "question_seen": False,
+                "retrieval_seen": False,
+                "created_at": now_iso(),
+            }
 
     compact_module = load_module(COMPACT_REFERENCE, "_mab_compact_reference")
     cursor = int(state.get("cursor") or 0)
@@ -592,9 +652,18 @@ def prepare_compact_state(
     rounds = list(state.get("rounds") or [])
     while True:
         tail = context[cursor:]
-        common = compact_common_content(summary, tail)
+        common = (
+            compact_summary_only_content(summary)
+            if args.compact_full_history and cursor >= len(context)
+            else compact_common_content(summary, tail)
+        )
         open_tokens = counter.count(qwen_open_user(system, common))
-        if open_tokens <= args.compact_common_open_tokens:
+        completed = (
+            cursor >= len(context)
+            if args.compact_full_history
+            else open_tokens <= args.compact_common_open_tokens
+        )
+        if completed:
             state.update({
                 "status": "completed",
                 "cursor": cursor,
@@ -636,11 +705,8 @@ def prepare_compact_state(
             top_p=0.9,
             top_k=args.top_k,
             attempts=args.attempts,
+            accept_terminal_length=True,
         )
-        if result.finish_reason == "length":
-            raise BaselineError(
-                f"compact round exhausted summary budget for {row.name}"
-            )
         if (
             result.prompt_tokens is not None
             and result.prompt_tokens > args.compaction_input_tokens
@@ -664,9 +730,11 @@ def prepare_compact_state(
             "summary_sha256": sha256_text(new_summary),
             "summary_tokens_local": counter.count(new_summary),
             "finish_reason": result.finish_reason,
+            "summary_truncated_at_limit": result.finish_reason == "length",
             "accepted_attempt": accepted_attempt,
             "selection_sec": selection_sec,
             "ttft_s": result.ttft_s,
+            "server_ttft_s": result.server_ttft_s,
             "latency_s": result.latency_s,
             "completion_tokens": result.completion_tokens,
             "completed_at": now_iso(),
@@ -685,7 +753,11 @@ def prepare_compact_state(
         write_json_atomic(path, state)
 
 
-def format_rag_blocks(blocks: list[dict[str, Any]]) -> str:
+def format_rag_blocks(
+    blocks: list[dict[str, Any]], *, include_metadata: bool = True
+) -> str:
+    if not include_metadata:
+        return "\n\n---\n\n".join(str(block["text"]) for block in blocks)
     return "\n\n".join(
         (
             f"[Retrieved block rank={block['rank']} "
@@ -695,12 +767,69 @@ def format_rag_blocks(blocks: list[dict[str, Any]]) -> str:
     )
 
 
-def rag_question_suffix(blocks: list[dict[str, Any]], formatted_question: str) -> str:
+def rag_question_suffix(
+    blocks: list[dict[str, Any]],
+    formatted_question: str,
+    *,
+    include_metadata: bool = True,
+) -> str:
     return (
-        "[Question-specific blocks retrieved from the full original memorized context]\n"
-        f"{format_rag_blocks(blocks)}\n\n"
+        f"{RAG_VARIABLE_PREFIX}\n"
+        f"{format_rag_blocks(blocks, include_metadata=include_metadata)}\n\n"
         f"{formatted_question}"
     )
+
+
+def select_rag_blocks_for_prompt_budget(
+    *,
+    retrieval: dict[str, Any],
+    system: str,
+    aligned_common: str,
+    formatted_question: str,
+    counter: TokenCounter,
+    prompt_limit: int,
+    include_metadata: bool,
+) -> tuple[list[dict[str, Any]], str, int]:
+    """Select the largest top-ranked set that fits the complete prompt cap."""
+    candidates = list(retrieval.get("retrieved_blocks") or [])
+
+    def choose(count: int) -> list[dict[str, Any]]:
+        return sorted(
+            (
+                block for block in candidates
+                if int(block.get("rank") or 0) <= count
+            ),
+            key=lambda block: int(block["chunk_index"]),
+        )
+
+    def materialize(count: int) -> tuple[list[dict[str, Any]], str, int]:
+        blocks = choose(count)
+        variable = rag_question_suffix(
+            blocks,
+            formatted_question,
+            include_metadata=include_metadata,
+        )
+        tokens = counter.count(
+            qwen_chat_no_thinking(system, aligned_common + "\n" + variable)
+        )
+        return blocks, variable, tokens
+
+    best_blocks, best_variable, best_tokens = materialize(0)
+    if best_tokens > prompt_limit:
+        raise BaselineError(
+            "compact summary and question alone exceed strict prompt cap: "
+            f"{best_tokens}>{prompt_limit}"
+        )
+    lo, hi = 1, len(candidates)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        blocks, variable, tokens = materialize(mid)
+        if tokens <= prompt_limit:
+            best_blocks, best_variable, best_tokens = blocks, variable, tokens
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best_blocks, best_variable, best_tokens
 
 
 def rag_config(args: argparse.Namespace, module: ModuleType) -> dict[str, Any]:
@@ -985,6 +1114,7 @@ def prime_shared_prefix(
     counter: TokenCounter,
     system: str,
     common: str,
+    variable_prefix: str,
 ) -> tuple[str, dict[str, Any]]:
     aligned, alignment = align_common_prefix(
         system=system,
@@ -993,7 +1123,8 @@ def prime_shared_prefix(
         page_tokens=args.prefix_page_tokens,
     )
     # Every scored request appends exactly ``"\n" + variable`` to the shared
-    # content below.  Prime with that same question-independent separator.
+    # content below. Prime through a non-whitespace prefix shared by every
+    # variable in the row.
     #
     # Priming only ``aligned`` is subtly incorrect for byte-level/BPE
     # tokenizers: the final newline token can merge differently with
@@ -1001,9 +1132,17 @@ def prime_shared_prefix(
     # scored request.  A cache entry may then extend one or two tokens past the
     # real common token prefix.  It happened to fall back to the preceding KV
     # page for some rows, but caused a complete prefix-cache miss for others.
-    # Including the separator on both sides makes the warmup text an exact
-    # prefix of every scored user content up to the tokenizer boundary.
-    warmup_content = aligned + "\n"
+    # Qwen's Jinja template applies ``trim`` to message content. A warmup that
+    # ends at the separator newline therefore loses the alignment padding on
+    # vLLM, even though scored requests retain it as internal whitespace.
+    # Ending at a real shared prefix makes the rendered warmup an actual prefix
+    # of every scored prompt without changing any scored prompt.
+    if not variable_prefix or variable_prefix[-1].isspace():
+        raise BaselineError(
+            "prefix-cache warmup requires a non-empty, non-whitespace-ending "
+            "shared variable prefix"
+        )
+    warmup_content = aligned + "\n" + variable_prefix
     warmup_open_tokens = counter.count(qwen_open_user(system, warmup_content))
     warmup_prompt_tokens = counter.count(
         qwen_chat_no_thinking(system, warmup_content)
@@ -1018,6 +1157,8 @@ def prime_shared_prefix(
         raise BaselineError("prefix-cache warmup has no reusable KV page")
     alignment.update({
         "warmup_shared_separator": "\\n",
+        "warmup_shared_variable_prefix_chars": len(variable_prefix),
+        "warmup_shared_variable_prefix_sha256": sha256_text(variable_prefix),
         "prefix_cache_guard_pages": args.prefix_cache_guard_pages,
         "warmup_open_tokens": warmup_open_tokens,
         "warmup_prompt_tokens_local": warmup_prompt_tokens,
@@ -1029,7 +1170,7 @@ def prime_shared_prefix(
             {"role": "system", "content": system},
             {"role": "user", "content": warmup_content},
         ],
-        max_tokens=1,
+        max_tokens=0,
         temperature=0.0,
         top_p=1.0,
         top_k=0,
@@ -1041,19 +1182,47 @@ def prime_shared_prefix(
         "warmup_prompt_tokens_server": result.prompt_tokens,
         "warmup_completion_tokens": result.completion_tokens,
         "warmup_ttft_s": result.ttft_s,
+        "warmup_server_ttft_s": result.server_ttft_s,
+        "warmup_engine_ttft_s": result.engine_ttft_s,
         "warmup_latency_s": result.latency_s,
         "warmup_finish_reason": result.finish_reason,
         "warmup_scored": False,
     })
-    if (
-        result.prompt_tokens is not None
-        and abs(result.prompt_tokens - alignment["warmup_prompt_tokens_local"]) > 2
-    ):
+    if result.finish_reason != "prefill_only" or result.completion_tokens not in (None, 0):
         raise BaselineError(
-            "local/server prompt tokenizer mismatch during prefix warmup: "
-            f"local={alignment['warmup_prompt_tokens_local']} "
-            f"server={result.prompt_tokens}"
+            "dense prefix warmup was not prefill-only: "
+            f"finish={result.finish_reason!r} completion={result.completion_tokens!r}"
         )
+    if result.prompt_tokens is not None:
+        # QW3 tokenizes with the tokenizer embedded in the served GGUF.  Its
+        # segmentation can differ slightly from the matching HF fast
+        # tokenizer used to construct a strict prompt budget (seven tokens on
+        # the current MemoryAgentBench representative).  The server-reported
+        # count is authoritative for the KV-page commit.  Do not reject an
+        # otherwise valid prefill-only warmup merely because the two tokenizer
+        # implementations are not bit-identical; retain the delta explicitly
+        # so the result remains auditable.
+        local_tokens = int(alignment["warmup_prompt_tokens_local"])
+        server_tokens = int(result.prompt_tokens)
+        alignment["warmup_prompt_token_delta_server_minus_local"] = (
+            server_tokens - local_tokens
+        )
+        expected_commit = (server_tokens // args.prefix_page_tokens) * (
+            args.prefix_page_tokens
+        )
+        if expected_commit >= server_tokens:
+            expected_commit -= args.prefix_page_tokens
+        expected_commit -= (
+            args.prefix_cache_guard_pages * args.prefix_page_tokens
+        )
+        if expected_commit <= 0:
+            raise BaselineError(
+                "server tokenizer leaves no reusable KV page during prefix warmup"
+            )
+        alignment["expected_commit_tokens_local_estimate"] = alignment[
+            "expected_commit_tokens"
+        ]
+        alignment["expected_commit_tokens"] = expected_commit
     return aligned, alignment
 
 
@@ -1091,6 +1260,14 @@ def aggregate_method(method_root: Path) -> dict[str, Any]:
 
 
 def method_config(args: argparse.Namespace, method: str) -> dict[str, Any]:
+    import importlib.metadata
+    import transformers
+
+    try:
+        vllm_version = importlib.metadata.version("vllm")
+    except importlib.metadata.PackageNotFoundError:
+        vllm_version = None
+
     return {
         "schema_version": 1,
         "created_at": now_iso(),
@@ -1103,6 +1280,17 @@ def method_config(args: argparse.Namespace, method: str) -> dict[str, Any]:
             "QW3 lossless dense prefix cache primed at an exact KV-page boundary"
         ),
         "model": args.model_name,
+        "serving_runtime": {
+            "vllm_version": vllm_version,
+            "transformers_version": transformers.__version__,
+            "python": sys.executable,
+        },
+        "prompt_tokenizer": {
+            "path": str(args.tokenizer_dir.resolve()),
+            "implementation": "transformers.AutoTokenizer(use_fast=True)",
+            "transformers_version": transformers.__version__,
+            "must_match_vllm_runtime": True,
+        },
         "server_required": {
             "context_tokens": args.context_window,
             "kv_dtype": "fp8",
@@ -1120,6 +1308,7 @@ def method_config(args: argparse.Namespace, method: str) -> dict[str, Any]:
             "top_k": args.top_k,
             "thinking": False,
             "max_tokens": MAX_TOKENS,
+            "max_tokens_override": args.answer_max_tokens_override,
         },
         "compact": {
             "reference": str(COMPACT_REFERENCE),
@@ -1130,6 +1319,12 @@ def method_config(args: argparse.Namespace, method: str) -> dict[str, Any]:
             "question_seen": False,
             "retrieval_seen": False,
             "shared_between_compact_methods": True,
+            "full_history": args.compact_full_history,
+            "raw_tail_tokens": 0 if args.compact_no_tail else "remaining_uncompressed_tail",
+            "source_shared_workspace": (
+                str(args.source_shared_workspace.resolve())
+                if args.source_shared_workspace is not None else None
+            ),
         },
         "rag": {
             "reference": str(RAG_REFERENCE),
@@ -1139,6 +1334,12 @@ def method_config(args: argparse.Namespace, method: str) -> dict[str, Any]:
             "overlap": args.rag_overlap,
             "corpus": "full original memorized context",
             "index_frequency": "once per parquet row",
+            "prepared_question_subset": (
+                args.question_limit
+                if args.prepare_rag_respect_question_limit else "all"
+            ),
+            "dynamic_prompt_budget": args.rag_dynamic_budget,
+            "prompt_metadata": not args.rag_no_metadata,
         },
         "sliding": {
             "complete_prompt_tokens": args.sliding_prompt_tokens,
@@ -1151,21 +1352,26 @@ def method_config(args: argparse.Namespace, method: str) -> dict[str, Any]:
             ),
             "reused_from_256k_reference": {
                 "context_window": 262144,
-                "complete_prompt_tokens": 32768,
+                "complete_prompt_tokens": args.sliding_prompt_tokens,
                 "selection": "largest recent raw-history suffix",
                 "prompt_budget_scope": "complete final prompt",
             },
             "comparison_control_overrides": {
                 "model_and_kv": "match the current MemoryAgentBench KVMem run",
                 "sampling_and_output_limits": "match each official source task",
-                "mtp": "disabled so frozen dense-prefix branches are actually reused",
+                "mtp": (
+                    f"server MTP chain={args.server_mtp_chain}; utility answers "
+                    "branch independently from the same lossless dense prefix"
+                ),
             },
         },
         "prompt_limits": {
             "context_window": args.context_window,
             "generation_reserve": args.generation_reserve,
             "compact_rag_final_input": (
-                args.context_window - args.generation_reserve
+                args.strict_final_prompt_tokens
+                if args.strict_final_prompt_tokens is not None
+                else args.context_window - args.generation_reserve
             ),
         },
         "references": {
@@ -1210,7 +1416,20 @@ def run_method_row(
     results_path = row_dir / "results.jsonl"
     summary_path = row_dir / "row_summary.json"
     existing_records = read_jsonl(results_path)
-    if summary_path.exists():
+    if any(
+        record.get("latency_protocol") != "final_query_boundary_v2"
+        for record in existing_records
+    ):
+        # A v1 row may contain a cold-window or all-history accounting result.
+        # Keep the old file on disk as a sidecar and rebuild this method under
+        # the publication boundary instead of silently resuming it.
+        legacy_path = results_path.with_suffix(".boundary_v1.jsonl")
+        if not legacy_path.exists():
+            results_path.replace(legacy_path)
+        existing_records = []
+        summary_path.unlink(missing_ok=True)
+    requested_repairs = set(args.repair_question_index or [])
+    if summary_path.exists() and not requested_repairs:
         shared_hashes = {
             str(record.get("shared_context_sha256"))
             for record in existing_records
@@ -1235,14 +1454,58 @@ def run_method_row(
         )
         summary = str(compact_state.get("summary") or "")
         cursor = int(compact_state.get("cursor") or 0)
-        common = compact_common_content(summary, prepared["context"][cursor:])
+        if args.compact_no_tail:
+            if cursor != len(prepared["context"]):
+                raise BaselineError(
+                    f"strict no-tail compact state does not cover full history: "
+                    f"{row.name} cursor={cursor}/{len(prepared['context'])}"
+                )
+            common = compact_summary_only_content(summary)
+        else:
+            common = compact_common_content(summary, prepared["context"][cursor:])
         selection = {
             "compact_rounds": int(compact_state.get("round_count") or 0),
+            "compact_imported_rounds": int(
+                compact_state.get("imported_round_count") or 0
+            ),
             "compact_cursor": cursor,
             "compact_summary_sha256": sha256_text(summary),
             "compact_common_open_tokens": compact_state["common_open_tokens"],
             "compact_config_sha256": compact_state["config_sha256"],
+            "raw_tail_chars": 0 if args.compact_no_tail else len(prepared["context"]) - cursor,
         }
+        compact_rounds = list(compact_state.get("rounds") or [])
+        imported_round_count = selection["compact_imported_rounds"]
+        # The pre-query state already contains every completed maintenance
+        # compaction except the final full-window boundary event.  Even when a
+        # latency workspace was built from scratch, do not charge all earlier
+        # iterative rounds again at final-query arrival.
+        maintenance_round_count = max(imported_round_count, len(compact_rounds) - 1)
+        maintenance_rounds = compact_rounds[:maintenance_round_count]
+        boundary_rounds = compact_rounds[maintenance_round_count:]
+        selection.update({
+            "latency_protocol": "final_query_boundary_v2",
+            "history_maintenance_excluded": True,
+            "compact_maintenance_rounds": len(maintenance_rounds),
+            "compact_maintenance_total_sec": sum(
+                float(item.get("selection_sec") or 0.0)
+                + float(item.get("latency_s") or 0.0)
+                for item in maintenance_rounds
+            ),
+            "compact_boundary_rounds": len(boundary_rounds),
+            "compact_boundary_selection_sec": sum(
+                float(item.get("selection_sec") or 0.0)
+                for item in boundary_rounds
+            ),
+            "compact_boundary_generation_sec": sum(
+                float(item.get("latency_s") or 0.0)
+                for item in boundary_rounds
+            ),
+        })
+        selection["compact_boundary_total_sec"] = (
+            selection["compact_boundary_selection_sec"]
+            + selection["compact_boundary_generation_sec"]
+        )
     else:
         common, selection = select_fixed_sliding_suffix(
             system=prepared["system"],
@@ -1261,22 +1524,64 @@ def run_method_row(
         index for index, record in completed.items()
         if record.get("shared_context_sha256") != expected_shared_hash
     }
+    invalid_repairs = sorted(
+        index for index in requested_repairs
+        if index < 0 or index >= len(prepared["qa"])
+    )
+    if invalid_repairs:
+        raise BaselineError(
+            f"repair question indices outside row range for {row.name}: "
+            f"{invalid_repairs}; questions={len(prepared['qa'])}"
+        )
+    replacements.update(requested_repairs)
     if replacements:
         print(
             f"[{row.ordinal}] {method} repairing shared-context mismatch "
             f"{row.name} questions={sorted(replacements)}",
             flush=True,
         )
+    if method == "compact-rag":
+        shared_variable_prefix = RAG_VARIABLE_PREFIX
+    else:
+        shared_variable_prefix = os.path.commonprefix(
+            prepared["all_formatted_questions"]
+        ).rstrip()
+        if not shared_variable_prefix:
+            raise BaselineError(
+                f"{method} questions have no stable shared textual prefix: "
+                f"{row.name}"
+            )
+    reprefill_started = time.perf_counter()
     aligned_common, prefix_cache = prime_shared_prefix(
-        args, client, counter, prepared["system"], common
+        args,
+        client,
+        counter,
+        prepared["system"],
+        common,
+        shared_variable_prefix,
     )
+    # This request builds the answer-producing dense KV for the newly compacted
+    # summary/common context.  It is query-boundary work for Compact methods,
+    # while Sliding's resident window was prepared before the query.
+    if method in ("compact-only", "compact-rag"):
+        reprefill = time.perf_counter() - reprefill_started
+        if reprefill <= 0:
+            raise BaselineError(f"missing final-context re-prefill time: {row.name}")
+        selection["final_context_reprefill_total_sec"] = float(reprefill)
+        selection["final_context_reprefill_included_in_pre_answer"] = True
+    else:
+        selection["resident_window_warmup_excluded"] = True
     rag_by_question = {}
     if rag_state is not None:
         rag_by_question = {
             int(item["question_index"]): item
             for item in rag_state["retrievals"]
         }
-    final_input_limit = args.context_window - args.generation_reserve
+    final_input_limit = (
+        args.strict_final_prompt_tokens
+        if args.strict_final_prompt_tokens is not None
+        else args.context_window - args.generation_reserve
+    )
     for question_index, (gold, formatted_question) in enumerate(
         zip(prepared["qa"], prepared["formatted_questions"])
     ):
@@ -1288,16 +1593,42 @@ def run_method_row(
                 raise BaselineError(
                     f"missing retrieval q={question_index} for {row.name}"
                 )
-            variable = rag_question_suffix(
-                retrieval["retrieved_blocks"], formatted_question
-            )
+            materialization_started = time.perf_counter()
+            if args.rag_dynamic_budget:
+                selected_blocks, variable, prompt_tokens_local = (
+                    select_rag_blocks_for_prompt_budget(
+                        retrieval=retrieval,
+                        system=prepared["system"],
+                        aligned_common=aligned_common,
+                        formatted_question=formatted_question,
+                        counter=counter,
+                        prompt_limit=final_input_limit,
+                        include_metadata=not args.rag_no_metadata,
+                    )
+                )
+            else:
+                selected_blocks = list(retrieval["retrieved_blocks"])
+                variable = rag_question_suffix(
+                    selected_blocks,
+                    formatted_question,
+                    include_metadata=not args.rag_no_metadata,
+                )
+                prompt_tokens_local = counter.count(
+                    qwen_chat_no_thinking(
+                        prepared["system"], aligned_common + "\n" + variable
+                    )
+                )
+            rag_materialization_sec = time.perf_counter() - materialization_started
         else:
             retrieval = None
+            selected_blocks = []
             variable = formatted_question
+            rag_materialization_sec = 0.0
         user_content = aligned_common + "\n" + variable
-        prompt_tokens_local = counter.count(
-            qwen_chat_no_thinking(prepared["system"], user_content)
-        )
+        if method != "compact-rag":
+            prompt_tokens_local = counter.count(
+                qwen_chat_no_thinking(prepared["system"], user_content)
+            )
         limit = (
             args.sliding_prompt_tokens
             if method == "sliding-window" else final_input_limit
@@ -1307,7 +1638,11 @@ def run_method_row(
                 f"{method} prompt overflow {row.name} q={question_index}: "
                 f"{prompt_tokens_local}>{limit}"
             )
-        max_tokens = MAX_TOKENS[source_family(row.source)]
+        max_tokens = (
+            args.answer_max_tokens_override
+            if args.answer_max_tokens_override > 0
+            else MAX_TOKENS[source_family(row.source)]
+        )
         result, attempt = checked_chat(
             client,
             [
@@ -1319,6 +1654,12 @@ def run_method_row(
             top_p=args.top_p,
             top_k=args.top_k,
             attempts=args.attempts,
+            # A final answer that spends its whole generation allowance in
+            # reasoning is an accuracy failure, not a transport failure.  Keep
+            # the terminal row so one pathological question cannot abort the
+            # complete benchmark.  Compaction calls deliberately retain the
+            # stricter non-empty-content requirement above.
+            accept_terminal_length=True,
         )
         if result.prompt_tokens is not None and result.prompt_tokens > limit:
             raise BaselineError(
@@ -1327,6 +1668,7 @@ def run_method_row(
         metrics = simple_metrics(result.answer, gold["answer"])
         record = {
             "schema_version": 1,
+            "latency_protocol": "final_query_boundary_v2",
             "method": method,
             "split": row.split,
             "source": row.source,
@@ -1348,6 +1690,10 @@ def run_method_row(
             "completion_tokens": result.completion_tokens,
             "max_generation_tokens": max_tokens,
             "ttft_s": result.ttft_s,
+            "server_ttft_s": result.server_ttft_s,
+            "engine_ttft_s": result.engine_ttft_s,
+            "response_ttft_s": result.response_ttft_s,
+            "server_request_total_s": result.server_request_total_s,
             "wall_s": result.latency_s,
             "first_part": result.first_part,
             "metrics": metrics,
@@ -1360,13 +1706,45 @@ def run_method_row(
             "retrieval": (
                 {
                     "effective_top_k": retrieval["effective_top_k"],
-                    "retrieved_tokens_estimate": retrieval[
-                        "retrieved_tokens_estimate"
-                    ],
+                    "candidate_count": len(retrieval["retrieved_blocks"]),
+                    "selected_count": len(selected_blocks),
+                    "retrieved_tokens_estimate": sum(
+                        int(block["chunk_tokens"]) for block in selected_blocks
+                    ),
                     "retrieved_block_ids": [
                         block["block_id"]
-                        for block in retrieval["retrieved_blocks"]
+                        for block in selected_blocks
                     ],
+                    "metadata_headers": not args.rag_no_metadata,
+                    "dynamic_prompt_budget": args.rag_dynamic_budget,
+                    # Offline prepare-rag freezes corpus/query embeddings and
+                    # ranking before the generation server starts.  Preserve
+                    # that measured work alongside the per-question prompt
+                    # materialization so pre-answer latency can be reproduced
+                    # without inferring missing time from wall-clock logs.
+                    "index_and_ranking_sec": float(
+                        (rag_state.get("timing") or {}).get("total_sec") or 0.0
+                    ),
+                    "block_embedding_sec": float(
+                        (rag_state.get("timing") or {}).get("block_embedding_sec") or 0.0
+                    ),
+                    "query_embedding_sec": float(
+                        (rag_state.get("timing") or {}).get("query_embedding_sec") or 0.0
+                    ),
+                    "ranking_sec": float(
+                        (rag_state.get("timing") or {}).get("ranking_sec") or 0.0
+                    ),
+                    "history_index_build_sec": (
+                        float((rag_state.get("timing") or {}).get("total_sec") or 0.0)
+                        - float((rag_state.get("timing") or {}).get("query_embedding_sec") or 0.0)
+                        - float((rag_state.get("timing") or {}).get("ranking_sec") or 0.0)
+                    ),
+                    "query_path_sec": (
+                        float((rag_state.get("timing") or {}).get("query_embedding_sec") or 0.0)
+                        + float((rag_state.get("timing") or {}).get("ranking_sec") or 0.0)
+                        + rag_materialization_sec
+                    ),
+                    "prompt_materialization_sec": rag_materialization_sec,
                 }
                 if retrieval is not None else None
             ),
@@ -1389,6 +1767,29 @@ def run_method_row(
         )
 
     records = [completed[index] for index in range(len(prepared["qa"]))]
+    if method == "compact-rag":
+        retrieval_rows = [
+            record["retrieval"] for record in records
+            if isinstance(record.get("retrieval"), dict)
+        ]
+        selection.update({
+            "rag_index_and_ranking_sec": float(
+                (rag_state.get("timing") or {}).get("total_sec") or 0.0
+            ),
+            "rag_block_embedding_sec": float(
+                (rag_state.get("timing") or {}).get("block_embedding_sec") or 0.0
+            ),
+            "rag_query_embedding_sec": float(
+                (rag_state.get("timing") or {}).get("query_embedding_sec") or 0.0
+            ),
+            "rag_ranking_sec": float(
+                (rag_state.get("timing") or {}).get("ranking_sec") or 0.0
+            ),
+            "mean_rag_prompt_materialization_sec": statistics.fmean(
+                float(item.get("prompt_materialization_sec") or 0.0)
+                for item in retrieval_rows
+            ),
+        })
     row_summary = {
         "schema_version": 1,
         "method": method,
@@ -1516,9 +1917,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generation-reserve", type=int, default=32768)
     parser.add_argument("--compaction-input-tokens", type=int, default=232000)
     parser.add_argument("--summary-max-tokens", type=int, default=25000)
+    parser.add_argument(
+        "--answer-max-tokens-override",
+        type=int,
+        default=0,
+        help=(
+            "override source-specific answer limits; 0 preserves utility "
+            "semantics, while 1 is intended only for TTFT sampling"
+        ),
+    )
     parser.add_argument("--carry-max-tokens", type=int, default=70000)
     parser.add_argument("--compact-common-open-tokens", type=int, default=192000)
     parser.add_argument("--max-compact-rounds", type=int, default=16)
+    parser.add_argument(
+        "--compact-full-history",
+        action="store_true",
+        help="continue question-independent compaction until all history is summarized",
+    )
+    parser.add_argument(
+        "--compact-no-tail",
+        action="store_true",
+        help="exclude raw recent history from the final compact prompt",
+    )
+    parser.add_argument(
+        "--source-shared-workspace",
+        type=Path,
+        help="import validated question-independent compact checkpoints from this workspace",
+    )
+    parser.add_argument(
+        "--strict-final-prompt-tokens",
+        type=int,
+        help="complete final prompt cap for compact methods, including chat template",
+    )
     parser.add_argument("--sliding-prompt-tokens", type=int, default=32768)
     parser.add_argument("--prefix-page-tokens", type=int, default=16)
     parser.add_argument(
@@ -1533,6 +1963,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rag-top-k", type=int, default=30)
     parser.add_argument("--rag-block-size", type=int, default=1024)
     parser.add_argument("--rag-overlap", type=int, default=128)
+    parser.add_argument(
+        "--rag-dynamic-budget",
+        action="store_true",
+        help="use as many top-ranked RAG candidates as fit the strict final prompt cap",
+    )
+    parser.add_argument(
+        "--rag-no-metadata",
+        action="store_true",
+        help="materialize retrieved source text without rank/block-id headers",
+    )
     parser.add_argument("--embedding-device", default="cuda")
     parser.add_argument("--embedding-batch-size", type=int, default=32)
     parser.add_argument("--timestamp", default="2026-08-02 00:00:00")
@@ -1541,6 +1981,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--row", type=int, action="append")
     parser.add_argument("--max-contexts", type=int)
     parser.add_argument("--question-limit", type=int)
+    parser.add_argument(
+        "--repair-question-index",
+        type=int,
+        action="append",
+        help=(
+            "zero-based question index to regenerate in an otherwise "
+            "completed row; repeat for multiple indices"
+        ),
+    )
+    parser.add_argument(
+        "--prepare-rag-respect-question-limit",
+        action="store_true",
+        help=(
+            "prepare only the diagnostic question subset selected by "
+            "--question-limit; intended for independent-query latency runs"
+        ),
+    )
     parser.add_argument(
         "--reference-results",
         type=Path,
@@ -1563,6 +2020,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise BaselineError("run requires --method")
     if args.question_limit is not None and args.question_limit <= 0:
         raise BaselineError("--question-limit must be positive")
+    if args.repair_question_index and args.command != "run":
+        raise BaselineError("--repair-question-index is valid only with run")
+    if args.repair_question_index and args.max_contexts not in (None, 1):
+        raise BaselineError(
+            "--repair-question-index requires a single selected row"
+        )
+    if args.prepare_rag_respect_question_limit and args.question_limit is None:
+        raise BaselineError(
+            "--prepare-rag-respect-question-limit requires --question-limit"
+        )
+    if args.answer_max_tokens_override < 0:
+        raise BaselineError("--answer-max-tokens-override must be non-negative")
     if args.server_mtp_chain < 0:
         raise BaselineError("--server-mtp-chain must be non-negative")
     if args.prefix_page_tokens <= 0:
@@ -1573,8 +2042,34 @@ def validate_args(args: argparse.Namespace) -> None:
         raise BaselineError("RAG overlap must satisfy 0 <= overlap < block size")
     if args.context_window - args.generation_reserve <= 0:
         raise BaselineError("generation reserve consumes the context window")
-    if args.compact_common_open_tokens >= args.context_window - args.generation_reserve:
+    compact_limit = (
+        args.strict_final_prompt_tokens
+        if args.strict_final_prompt_tokens is not None
+        else args.context_window - args.generation_reserve
+    )
+    if args.strict_final_prompt_tokens is not None and not (
+        0 < args.strict_final_prompt_tokens <= args.context_window
+    ):
+        raise BaselineError(
+            "--strict-final-prompt-tokens must be in (0, --context-window]"
+        )
+    if not args.compact_full_history and args.compact_common_open_tokens >= compact_limit:
         raise BaselineError("compact common prefix leaves no final-query/RAG headroom")
+    if args.compact_no_tail and not args.compact_full_history:
+        raise BaselineError("--compact-no-tail requires --compact-full-history")
+    if args.rag_dynamic_budget and args.strict_final_prompt_tokens is None:
+        raise BaselineError(
+            "--rag-dynamic-budget requires --strict-final-prompt-tokens"
+        )
+    if args.rag_no_metadata and not args.rag_dynamic_budget:
+        raise BaselineError("--rag-no-metadata requires --rag-dynamic-budget")
+    if (
+        args.source_shared_workspace is not None
+        and not args.source_shared_workspace.is_dir()
+    ):
+        raise BaselineError(
+            f"source shared workspace not found: {args.source_shared_workspace}"
+        )
     if (
         args.min_context_tokens_exclusive is not None
         and args.max_context_tokens_inclusive is not None
@@ -1627,7 +2122,11 @@ def main() -> int:
             batch_size=args.embedding_batch_size,
         )
         for row in work:
-            prepared = load_prepared(args, row, apply_question_limit=False)
+            prepared = load_prepared(
+                args,
+                row,
+                apply_question_limit=args.prepare_rag_respect_question_limit,
+            )
             state = prepare_rag_row(args, row, prepared, retriever, module)
             print(
                 f"[{row.ordinal}/{len(work)}] RAG {row.source} "
@@ -1648,10 +2147,18 @@ def main() -> int:
     write_json_atomic(method_root / "run_config.json", config)
     write_json_atomic(method_root / method_config_filename(args), config)
     for row in work:
-        prepared = load_prepared(args, row)
-        summary = run_method_row(
-            args, row, args.method, prepared, client, counter
-        )
+        lock_path = method_root / "locks" / f"{row.name}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            # Multiple filtered runners may fill disjoint rows against one
+            # max_num_seqs>1 server. If their selections eventually overlap,
+            # block here and re-read the completed row instead of racing its
+            # JSONL/checkpoint files.
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            prepared = load_prepared(args, row)
+            summary = run_method_row(
+                args, row, args.method, prepared, client, counter
+            )
         aggregate = aggregate_method(method_root)
         print(
             f"[{row.ordinal}/{len(work)}] DONE {args.method} {row.source} "

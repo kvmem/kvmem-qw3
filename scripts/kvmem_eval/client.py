@@ -38,6 +38,10 @@ class ChatResult:
     completion_tokens: int | None
     first_part: str                  # "reasoning" | "content" | "" (which arrived first)
     error: str | None = None
+    server_ttft_s: float | None = None
+    engine_ttft_s: float | None = None
+    response_ttft_s: float | None = None
+    server_request_total_s: float | None = None
 
     @property
     def truncated(self) -> bool:
@@ -90,19 +94,45 @@ class Qw3Client:
         Network/HTTP errors are captured into ChatResult.error rather than raised,
         so a single bad sample doesn't abort a 102-sample run.
         """
+        enable_thinking = overrides.get(
+            "enable_thinking", self.enable_thinking
+        )
         payload = {
             "model": overrides.get("model", self.model),
             "messages": messages,
             "temperature": overrides.get("temperature", self.temperature),
             "top_p": overrides.get("top_p", self.top_p),
             "max_tokens": overrides.get("max_tokens", self.max_tokens),
-            "enable_thinking": overrides.get("enable_thinking", self.enable_thinking),
+            # qw3-native accepts the legacy top-level field.  vLLM passes
+            # Qwen's switch through the chat template instead.  Send both so
+            # the same evaluation client has identical semantics on either
+            # OpenAI-compatible backend.
+            "enable_thinking": enable_thinking,
+            "chat_template_kwargs": {
+                "enable_thinking": enable_thinking,
+            },
             "stream": True,
+            # vLLM only attaches prompt/completion usage to a streaming
+            # response when explicitly requested.  qw3-native tolerates this
+            # standard OpenAI field and keeps its existing timing behavior.
+            "stream_options": {"include_usage": True},
         }
         extra_body = overrides.get("extra_body")
         if extra_body is not None:
             if not isinstance(extra_body, dict):
                 raise TypeError("extra_body must be a dict when provided")
+            extra_body = dict(extra_body)
+            extra_template_kwargs = extra_body.pop(
+                "chat_template_kwargs", None
+            )
+            if extra_template_kwargs is not None:
+                if not isinstance(extra_template_kwargs, dict):
+                    raise TypeError(
+                        "chat_template_kwargs must be a dict when provided"
+                    )
+                payload["chat_template_kwargs"].update(
+                    extra_template_kwargs
+                )
             payload.update(extra_body)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -119,6 +149,7 @@ class Qw3Client:
         stream_error: str | None = None
         prompt_tokens: int | None = None
         completion_tokens: int | None = None
+        server_timing: dict[str, Any] = {}
 
         try:
             resp = self._session.post(
@@ -169,13 +200,19 @@ class Qw3Client:
                     prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
                     completion_tokens = usage.get("completion_tokens", completion_tokens)
 
+                timing = chunk.get("timing")
+                if isinstance(timing, dict):
+                    server_timing.update(timing)
+
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
                 choice = choices[0]
                 delta = choice.get("delta") or {}
 
-                rc = delta.get("reasoning_content")
+                # qw3-native and different vLLM releases use two names for
+                # the streamed reasoning channel.
+                rc = delta.get("reasoning_content") or delta.get("reasoning")
                 if rc:
                     if ttft is None:
                         ttft = time.monotonic() - t0
@@ -212,6 +249,10 @@ class Qw3Client:
             first_part=first_part,
             error=(stream_error or "server stream finished with error")
             if finish_reason == "error" else stream_error,
+            server_ttft_s=server_timing.get("server_ttft_sec"),
+            engine_ttft_s=server_timing.get("engine_ttft_sec"),
+            response_ttft_s=server_timing.get("response_ttft_sec"),
+            server_request_total_s=server_timing.get("request_total_sec"),
         )
 
 

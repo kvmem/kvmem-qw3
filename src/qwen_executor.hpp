@@ -327,21 +327,23 @@ public:
 
     // ---- Prefix-cache reuse (serve / continuous-batching) -----------------
     // Seed this (freshly-reset) executor from a cached, page-aligned prefix.
-    // Installs `shared_pages` as logical KV pages [0..n) marked non-owned (the
-    // pool pins them; this executor never frees them), restores recurrent +
-    // conv state from `recur`, and sets position_ = aligned_len. Subsequent
-    // prefill must start at aligned_len (use prefill_offset). aligned_len must
-    // equal shared_pages.size() * kv page_size.
-    void seed_from_shared_prefix(const std::vector<int32_t> &shared_pages,
-                                 const StateSnapshot &recur,
-                                 uint32_t aligned_len);
-    // Hand the physical KV pages for logical range [logical_start_page..end)
-    // to the caller WITHOUT freeing them, and mark the retained pages
-    // [0..logical_start_page) as non-owned so this executor's dtor won't free
-    // them either (they are now pinned by the prefix cache). Returns the
-    // detached physical pages. Used at commit time when the executor keeps
-    // reading the shared prefix it just promoted.
-    std::vector<int32_t> mark_kv_prefix_shared(uint32_t logical_start_page);
+    // Installs `shared_pages` and optional matching `shared_mtp_pages` as
+    // logical KV pages [0..n), marked non-owned (the pools pin them; this
+    // executor never frees them). Restores recurrent/conv and MTP-prefix hidden
+    // state from `recur`, then sets position_ = aligned_len. Subsequent prefill
+    // must start at aligned_len (use prefill_offset).
+    void seed_from_shared_prefix(
+        const std::vector<int32_t> &shared_pages,
+        const std::vector<int32_t> &shared_mtp_pages,
+        const StateSnapshot &recur,
+        uint32_t aligned_len);
+    // Atomically promote the first `logical_pages` main-KV pages, and when
+    // requested the matching MTP draft-KV pages, into cache-owned borrowed
+    // pages. Validation happens before ownership changes so a partial promote
+    // cannot leak pages. The caller pins both returned page lists.
+    bool mark_prefix_shared(uint32_t logical_pages, bool include_mtp,
+                            std::vector<int32_t> &main_pages,
+                            std::vector<int32_t> &mtp_pages);
     // Snapshot of the current physical KV pages (logical order). Used to
     // record a freshly-computed prefix into the cache.
     std::vector<int32_t> kv_physical_pages() const;
@@ -1158,6 +1160,22 @@ private:
     uint64_t kvmem_assembly_raw_h2d_wait_ns_ = 0;
     uint64_t kvmem_assembly_raw_bytes_ = 0;
     uint32_t kvmem_assembly_raw_batches_ = 0;
+    // Optional GPU cache for immutable, position-free raw K. Semantic-chunk
+    // reselection keeps most blocks but frequently moves them to a different
+    // compact position. Keeping their canonical raw bytes on device avoids
+    // repeating the CPU gather + PCIe upload while preserving the exact
+    // raw-K -> RoPE -> KV materialization path. The byte budget is controlled
+    // by QW3_KVMEM_RAW_K_GPU_CACHE_MIB (zero/unset disables it).
+    std::unique_ptr<DeviceTensor> kvmem_raw_k_gpu_cache_;
+    std::unique_ptr<DeviceTensor> kvmem_raw_k_gpu_gather_;
+    uint64_t kvmem_raw_k_gpu_cache_block_elems_ = 0;
+    uint32_t kvmem_raw_k_gpu_cache_slots_ = 0;
+    uint32_t kvmem_raw_k_gpu_gather_slots_ = 0;
+    std::vector<int32_t> kvmem_raw_k_gpu_block_to_slot_;
+    std::vector<int32_t> kvmem_raw_k_gpu_slot_to_block_;
+    uint64_t kvmem_assembly_raw_gpu_hit_bytes_ = 0;
+    uint32_t kvmem_assembly_raw_gpu_hit_blocks_ = 0;
+    uint32_t kvmem_assembly_raw_gpu_miss_blocks_ = 0;
     uint64_t kvmem_assembly_final_drain_ns_ = 0;
     // Assembly optimization: a persistent FP32 [position, RoPE pair, sin/cos]
     // table preserves the legacy de-rotate/re-rotate arithmetic while sharing

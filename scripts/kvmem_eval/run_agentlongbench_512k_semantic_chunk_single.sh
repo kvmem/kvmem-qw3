@@ -18,11 +18,18 @@ REQUEST_MAX_TOKENS=${REQUEST_MAX_TOKENS:-$GEN_BUDGET}
 RECENT_TOKENS=${RECENT_TOKENS:-4096}
 SEMANTIC_QUERY_TOKENS=${SEMANTIC_QUERY_TOKENS:-512}
 SEMANTIC_START_TOKENS=${SEMANTIC_START_TOKENS:-$KVMEM_BUDGET}
+PREFILL_WINDOW=${PREFILL_WINDOW:-semantic_chunk}
 THINKING_BUDGET=${THINKING_BUDGET:-4096}
 CPU_GB=${CPU_GB:-48}
 INDEX_STAGING_MB=${INDEX_STAGING_MB:-64}
 ADAPTIVE_BLOCK_STATS_MIB=${ADAPTIVE_BLOCK_STATS_MIB:-512}
+# Optional exact raw-K working-set cache. Zero preserves the ordinary
+# CPU-authority/H2D materialization path.
+RAW_K_GPU_CACHE_MIB=${RAW_K_GPU_CACHE_MIB:-0}
 QUERY_SCORE_CHUNK=${QUERY_SCORE_CHUNK:-}
+QUERY_TOKEN_SELECTOR=${QUERY_TOKEN_SELECTOR:-none}
+GUIDED_THINKING_MAX_TOKENS=${GUIDED_THINKING_MAX_TOKENS:-0}
+GUIDED_QUERY_MAX_TOKENS=${GUIDED_QUERY_MAX_TOKENS:-0}
 START_INDEX=${START_INDEX:-0}
 LIMIT=${LIMIT:-1}
 SAMPLE_ORDER=${SAMPLE_ORDER:-dataset}
@@ -31,6 +38,7 @@ METHOD=${METHOD:-kvmem_adaptive_k32_b32_semantic_chunk_q512_fp8_mtp4}
 DATA=${DATA:-/data/chaidi/kvmem_eval/data/agentlongbench_512k_normal100/samples.jsonl}
 MANIFEST=${MANIFEST:-/home/chaidi/AgentLongBench-Long/results/agentlongbench_512k_normal100/compact_only_normal100/manifest/selected_samples.jsonl}
 MODEL=${MODEL:-$ROOT/models/Qwen3.6-27B-Q8_0.gguf}
+QW3_BIN=${QW3_BIN:-$ROOT/build/qw3}
 RESULT_ROOT=${RESULT_ROOT:-/data/chaidi/kvmem_eval/results/$TAG}
 LOG_ROOT=${LOG_ROOT:-/data/chaidi/kvmem_eval/logs}
 SERVER_LOG=${SERVER_LOG:-$LOG_ROOT/${TAG}_server.log}
@@ -118,7 +126,8 @@ env \
   QW3_PREFILL_FA2_NSPLIT=1 \
   QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
   QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB="$ADAPTIVE_BLOCK_STATS_MIB" \
-  "$ROOT/build/qw3" serve \
+  QW3_KVMEM_RAW_K_GPU_CACHE_MIB="$RAW_K_GPU_CACHE_MIB" \
+  "$QW3_BIN" serve \
     --model "$MODEL" \
     --ctx "$CTX_TOKENS" --kv-dtype fp8 \
     --kvmem --kvmem-block-tokens "$BLOCK_TOKENS" \
@@ -157,6 +166,31 @@ for _ in $(seq 1 300); do
 done
 curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null
 
+guided_query_args=()
+if [[ "$QUERY_TOKEN_SELECTOR" == guided-query ||
+      "$QUERY_TOKEN_SELECTOR" == guided-query-direct ]]; then
+  guided_query_args=(
+    --kvmem-query-token-selector "$QUERY_TOKEN_SELECTOR"
+    --kvmem-guided-thinking-max-tokens "$GUIDED_THINKING_MAX_TOKENS"
+    --kvmem-guided-query-max-tokens "$GUIDED_QUERY_MAX_TOKENS"
+  )
+elif [[ "$QUERY_TOKEN_SELECTOR" != none ]]; then
+  echo "QUERY_TOKEN_SELECTOR must be none|guided-query|guided-query-direct" >&2
+  exit 2
+fi
+
+prefill_window_args=(--kvmem-prefill-window "$PREFILL_WINDOW")
+if [[ "$PREFILL_WINDOW" == semantic_chunk ]]; then
+  prefill_window_args+=(
+    --kvmem-prefill-semantic-start-tokens "$SEMANTIC_START_TOKENS"
+    --kvmem-prefill-semantic-query-tokens "$SEMANTIC_QUERY_TOKENS"
+  )
+elif [[ "$PREFILL_WINDOW" != pressure &&
+        "$PREFILL_WINDOW" != keep_selected ]]; then
+  echo "PREFILL_WINDOW must be pressure|keep_selected|semantic_chunk" >&2
+  exit 2
+fi
+
 "$ROOT/.venv/bin/python" "$ROOT/scripts/kvmem_eval/run_agentlongbench_kvmem.py" \
   --benchmark-repo /home/chaidi/AgentLongBench_Motivation \
   --dataset "$DATA" --manifest "$MANIFEST" --allow-custom-subset \
@@ -170,8 +204,7 @@ curl -fsS --noproxy '*' "http://127.0.0.1:$PORT/health" >/dev/null
   --timeout-sec 14400 --max-sample-sec 14400 --attempts 1 \
   --enable-thinking --seed 20260722 \
   --kvmem-retrieval-trace-metadata \
-  --kvmem-prefill-window semantic_chunk \
-  --kvmem-prefill-semantic-start-tokens "$SEMANTIC_START_TOKENS" \
-  --kvmem-prefill-semantic-query-tokens "$SEMANTIC_QUERY_TOKENS" \
+  "${prefill_window_args[@]}" \
+  "${guided_query_args[@]}" \
   "${selection_args[@]}" \
   2>&1 | tee -a "$RUN_LOG"

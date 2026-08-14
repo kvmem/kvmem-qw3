@@ -112,6 +112,30 @@ def parse_args() -> argparse.Namespace:
         help="use at most the trailing N tokens of each chunk as its retrieval query",
     )
     parser.add_argument(
+        "--kvmem-query-token-selector",
+        choices=("none", "guided-query", "guided-query-direct"),
+        default="none",
+        help=(
+            "guided-query privately reasons before generating a compact query; "
+            "guided-query-direct rewrites it without private reasoning; none "
+            "preserves the existing full-query scorer"
+        ),
+    )
+    parser.add_argument(
+        "--kvmem-guided-thinking-max-tokens",
+        type=int,
+        default=0,
+        metavar="TOKENS",
+        help="maximum private thinking tokens for guided-query",
+    )
+    parser.add_argument(
+        "--kvmem-guided-query-max-tokens",
+        type=int,
+        default=0,
+        metavar="TOKENS",
+        help="maximum compact-query tokens captured for guided retrieval",
+    )
+    parser.add_argument(
         "--kvmem-round-padding",
         type=int,
         default=0,
@@ -434,6 +458,18 @@ def chat_completion(
         payload["kvmem_prefill_semantic_query_tokens"] = (
             args.kvmem_prefill_semantic_query_tokens
         )
+    if args.kvmem_query_token_selector in {
+        "guided-query",
+        "guided-query-direct",
+    }:
+        payload["kvmem_query_guided_thinking_max_tokens"] = (
+            args.kvmem_guided_thinking_max_tokens
+        )
+        payload["kvmem_query_guided_query_max_tokens"] = (
+            args.kvmem_guided_query_max_tokens
+        )
+        if args.kvmem_query_token_selector == "guided-query-direct":
+            payload["kvmem_query_guided_direct"] = True
     if args.seed is not None:
         payload["seed"] = args.seed
     request = urllib.request.Request(
@@ -673,6 +709,29 @@ def main() -> None:
         raise RuntimeError("--kvmem-prefill-semantic-start-tokens must be >= 0")
     if args.kvmem_prefill_semantic_query_tokens < 0:
         raise RuntimeError("--kvmem-prefill-semantic-query-tokens must be >= 0")
+    guided_limits = (
+        args.kvmem_guided_thinking_max_tokens,
+        args.kvmem_guided_query_max_tokens,
+    )
+    if args.kvmem_query_token_selector == "guided-query":
+        if any(value <= 0 for value in guided_limits):
+            raise RuntimeError(
+                "guided-query requires positive guided thinking/query limits"
+            )
+    elif args.kvmem_query_token_selector == "guided-query-direct":
+        if args.kvmem_guided_thinking_max_tokens != 0:
+            raise RuntimeError(
+                "guided-query-direct requires a zero private-thinking limit"
+            )
+        if args.kvmem_guided_query_max_tokens <= 0:
+            raise RuntimeError(
+                "guided-query-direct requires a positive query-token limit"
+            )
+    elif any(value != 0 for value in guided_limits):
+        raise RuntimeError(
+            "guided thinking/query limits require "
+            "a guided query selector"
+        )
     if (
         args.kvmem_prefill_window != "semantic_chunk"
         and (
@@ -785,6 +844,11 @@ def main() -> None:
         "kvmem_prefill_semantic_query_tokens": (
             args.kvmem_prefill_semantic_query_tokens
         ),
+        "kvmem_query_token_selector": args.kvmem_query_token_selector,
+        "kvmem_guided_thinking_max_tokens": (
+            args.kvmem_guided_thinking_max_tokens
+        ),
+        "kvmem_guided_query_max_tokens": args.kvmem_guided_query_max_tokens,
         "seed": args.seed,
         "allow_custom_subset": args.allow_custom_subset,
         "selected_samples": len(samples),
@@ -811,6 +875,9 @@ def main() -> None:
             "kvmem_prefill_window",
             "kvmem_prefill_semantic_start_tokens",
             "kvmem_prefill_semantic_query_tokens",
+            "kvmem_query_token_selector",
+            "kvmem_guided_thinking_max_tokens",
+            "kvmem_guided_query_max_tokens",
             "seed",
             "allow_custom_subset",
             "selected_samples",
@@ -897,6 +964,13 @@ def main() -> None:
                 "top_p": args.top_p,
                 "enable_thinking": args.enable_thinking,
                 "kvmem_inline_refresh": args.kvmem_inline_refresh,
+                "kvmem_query_token_selector": args.kvmem_query_token_selector,
+                "kvmem_guided_thinking_max_tokens": (
+                    args.kvmem_guided_thinking_max_tokens
+                ),
+                "kvmem_guided_query_max_tokens": (
+                    args.kvmem_guided_query_max_tokens
+                ),
             }
             if retrieval_group_spans is not None:
                 group_lengths = [

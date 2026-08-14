@@ -1084,6 +1084,18 @@ uint32_t prefix_cache_max_pages() {
     return env_uint32_or("QW3_PREFIX_CACHE_MAX_PAGES", 0);
 }
 
+// Recurrent/conv and optional MTP-prefix state are independent device
+// snapshots per cache entry even when a linear prompt chain shares nearly all
+// physical KV pages. A page-only budget therefore cannot bound device memory:
+// hundreds of progressively longer entries can pin the same pages while their
+// state snapshots accumulate. Keep a separate LRU entry cap. The environment
+// override accepts 0 for unlimited legacy behavior; the safe default leaves
+// ample room for concurrent prompt branches without allowing an unbounded
+// state-snapshot chain.
+uint32_t prefix_cache_max_entries() {
+    return env_uint32_or("QW3_PREFIX_CACHE_MAX_ENTRIES", 64);
+}
+
 // Leave this many complete KV pages behind the natural prompt boundary when
 // publishing a shared prefix.  The default remains zero for existing users.
 // A one-page guard is useful for independently rendered chat requests: BPE
@@ -1353,6 +1365,19 @@ constexpr bool kvmem_prefix_checkpoint_reusable(uint32_t checkpoint,
     return checkpoint <= resume_ceiling && checkpoint < prompt_tokens;
 }
 
+// A durable query snapshot makes a checkpoint *after* the historical query
+// reusable as well.  The checkpoint must be at/after the complete query (never
+// in its middle), remain inside the exact token LCP, and leave at least one new
+// token to prefill.  Callers still require a tier-backed source index before
+// enabling this path; this helper only expresses the positional invariant.
+constexpr bool kvmem_post_query_checkpoint_reusable(
+        uint32_t checkpoint, uint32_t prompt_tokens,
+        uint32_t common_prefix, uint32_t query_end,
+        bool query_snapshot_ready) {
+    return query_snapshot_ready && checkpoint >= query_end &&
+        checkpoint <= common_prefix && checkpoint < prompt_tokens;
+}
+
 // A sparse prompt checkpoint is useful to a later query-conditioned request
 // only when both halves of the historical state survive: the tiered K/V blocks
 // and the position-invariant source index.  `qc_active` is intentionally not an
@@ -1372,6 +1397,14 @@ static_assert(kvmem_prefix_resume_ceiling(4096, true, 17, 32) == 0);
 static_assert(kvmem_prefix_checkpoint_reusable(2976, 4096, 2976));
 static_assert(!kvmem_prefix_checkpoint_reusable(3008, 4096, 2976));
 static_assert(!kvmem_prefix_checkpoint_reusable(4096, 4096, 4096));
+static_assert(kvmem_post_query_checkpoint_reusable(
+    3968, 4096, 4000, 3000, true));
+static_assert(!kvmem_post_query_checkpoint_reusable(
+    2976, 4096, 4000, 3000, true));
+static_assert(!kvmem_post_query_checkpoint_reusable(
+    3968, 4096, 3900, 3000, true));
+static_assert(!kvmem_post_query_checkpoint_reusable(
+    3968, 4096, 4000, 3000, false));
 static_assert(kvmem_sparse_prompt_checkpoint_resumable(
     true, false, false, false));
 static_assert(kvmem_sparse_prompt_checkpoint_resumable(
@@ -7570,19 +7603,10 @@ private:
                     a.kvmem_timing_baseline = QwenExecutor::kvmem_timing_snapshot();
                 }
                 const double prefill0 = wall_seconds();
-                // Prefix-cache: start prefill at a.prefill_offset (set to the
-                // reused prefix length by seed_from_shared_prefix in
-                // initialize_continuous_active). Starting at 0 would re-append
-                // the seeded tokens at position_=hit_len, corrupting the KV
-                // layout (double-prefill). The seeded MAIN KV pages are
-                // physically resident; only the MTP draft prefix (a SEPARATE KV
-                // cache) was not seeded, and its hidden states are not
-                // recoverable from the prefix cache. So for a seeded request we
-                // skip MTP-prefix priming: the draft chain then bails
-                // (position_ > mtp_prefix_len_==0) to a full forward_one_token
-                // per token — correct output, just no speculation over the
-                // reused prefix. Non-seeded requests prime as before.
-                const bool seeded_prefix = a.prefill_offset > 0;
+                // Prefix-cache: start at the restored main+MTP page-aligned
+                // boundary. Both page tables, recurrent/conv state, and
+                // mtp_prefix_h are seeded by initialize_continuous_active, so
+                // only the uncached suffix is prefetched and MTP-primed.
                 const size_t prefill_start = std::min<size_t>(
                     a.prefill_offset, req->prompt_tokens.size());
                 for (size_t offset = prefill_start;
@@ -7591,8 +7615,17 @@ private:
                         req->prompt_tokens.size() - offset);
                     const uint32_t width = std::max<uint32_t>(
                         1, a.executor->effective_prefill_chunk_size(remaining));
-                    const size_t end =
+                    size_t end =
                         offset + std::min<size_t>(remaining, width);
+                    // The MTP lane owns its prefill loop, so it must honor the
+                    // same exact commit boundary as the plain lane. Landing on
+                    // this boundary after both target and draft priming makes
+                    // the cached state lossless for future MTP requests.
+                    if (a.prefix_commit_pending &&
+                        offset < a.prefix_commit_len &&
+                        end > a.prefix_commit_len) {
+                        end = a.prefix_commit_len;
+                    }
                     std::vector<uint32_t> chunk(
                         req->prompt_tokens.begin() +
                             static_cast<std::ptrdiff_t>(offset),
@@ -7620,43 +7653,38 @@ private:
                         throw std::runtime_error("MTP prefill failed");
                     }
                     prefill_ops += step.ops_executed;
-                    if (!seeded_prefix) {
-                        NativeExecutorReport prefix;
-                        try {
-                            prefix = mtp_local
-                                ? a.executor
-                                      ->prime_mtp_prefix_from_last_batch_at(
-                                          chunk,
-                                          a.executor
-                                              ->last_forward_logical_base(),
-                                          a.executor
-                                              ->last_forward_rope_base())
-                                : a.executor
-                                      ->prime_mtp_prefix_from_last_batch(
-                                          chunk,
-                                          static_cast<uint32_t>(offset));
-                        } catch (...) {
-                            if (mtp_local) {
-                                a.executor
-                                    ->kvmem_set_defer_prefill_pressure(false);
-                            }
-                            throw;
-                        }
-                        if (!prefix.ok) {
-                            throw std::runtime_error(
-                                "MTP prefix priming failed in batched lane");
-                        }
-                        a.executor->kvmem_prefill_writeback(
-                            a.executor->last_forward_logical_base() +
-                            static_cast<uint32_t>(chunk.size()));
+                    NativeExecutorReport prefix;
+                    try {
+                        prefix = mtp_local
+                            ? a.executor->prime_mtp_prefix_from_last_batch_at(
+                                  chunk,
+                                  a.executor->last_forward_logical_base(),
+                                  a.executor->last_forward_rope_base())
+                            : a.executor->prime_mtp_prefix_from_last_batch(
+                                  chunk, static_cast<uint32_t>(offset));
+                    } catch (...) {
                         if (mtp_local) {
-                            a.executor
-                                ->kvmem_finish_deferred_prefill_pressure();
+                            a.executor->kvmem_set_defer_prefill_pressure(false);
                         }
-                    } else if (mtp_local) {
-                        a.executor->kvmem_set_defer_prefill_pressure(false);
+                        throw;
+                    }
+                    if (!prefix.ok) {
+                        throw std::runtime_error(
+                            "MTP prefix priming failed in batched lane");
+                    }
+                    a.executor->kvmem_prefill_writeback(
+                        a.executor->last_forward_logical_base() +
+                        static_cast<uint32_t>(chunk.size()));
+                    if (mtp_local) {
+                        a.executor->kvmem_finish_deferred_prefill_pressure();
                     }
                     offset = end;
+                    a.prefill_offset = static_cast<uint32_t>(offset);
+                    if (a.prefix_commit_pending &&
+                        a.prefill_offset == a.prefix_commit_len) {
+                        prefix_cache_commit(a, a.prefix_commit_len);
+                        a.prefix_commit_pending = false;
+                    }
                 }
                 if (a.executor->kvmem_mtp_local_positions()) {
                     a.executor->kvmem_set_defer_prefill_pressure(false);
@@ -7690,6 +7718,7 @@ private:
                 }
                 const double prefill_s = std::max(wall_seconds() - prefill0, 1e-9);
                 a.prefill_ops = prefill_ops;
+                a.prefill_s = prefill_s;
                 // First post-prefill token: sample from the last prefill row when
                 // temp>0 (pick_continuous_next_token round-trips logits_ via
                 // copy_last_logits + applies penalties); greedy returns the
@@ -8838,14 +8867,16 @@ private:
             const uint32_t prompt_len =
                 static_cast<uint32_t>(req->prompt_tokens.size());
             std::vector<int32_t> hit_pages;
+            std::vector<int32_t> hit_mtp_pages;
             QwenExecutor::StateSnapshot hit_recur;
             uint32_t hit_len = 0;
             const uint64_t hit_id = prefix_cache_lookup(
-                req->prompt_tokens, page_size, hit_pages, hit_recur, hit_len);
+                req->prompt_tokens, page_size, req->spec_mtp,
+                hit_pages, hit_mtp_pages, hit_recur, hit_len);
             if (hit_id != 0 && hit_len > 0 && hit_len < prompt_len) {
                 try {
-                    a.executor->seed_from_shared_prefix(hit_pages, hit_recur,
-                                                        hit_len);
+                    a.executor->seed_from_shared_prefix(
+                        hit_pages, hit_mtp_pages, hit_recur, hit_len);
                     a.prefill_offset = hit_len;
                     a.held_prefix_entries.push_back(hit_id);
                     a.kv_state.update(a.executor->kv_state_snapshot());
@@ -8854,7 +8885,8 @@ private:
                         m << "prefix_cache hit id=" << hit_id
                           << " req=" << req->id
                           << " reused_tokens=" << hit_len
-                          << " pages=" << hit_pages.size();
+                          << " pages=" << hit_pages.size()
+                          << " mtp_pages=" << hit_mtp_pages.size();
                         log(m.str());
                     }
                 } catch (const std::exception &e) {
@@ -9726,17 +9758,22 @@ private:
 
     void prefix_cache_install_evict_cb() {
         if (prefix_cache_evict_cb_installed_ || !cb_kv_pool_) return;
-        cb_kv_pool_->set_evict_callback([this]() -> uint32_t {
+        const auto evict_one = [this]() -> uint32_t {
             return prefix_cache_evict_lru(1);
-        });
+        };
+        cb_kv_pool_->set_evict_callback(evict_one);
+        // MTP has a separate global page pool. Cached draft pages must be able
+        // to trigger the same paired-entry eviction when that pool fills.
+        if (cb_mtp_kv_pool_) cb_mtp_kv_pool_->set_evict_callback(evict_one);
         prefix_cache_evict_cb_installed_ = true;
     }
 
     // A chosen resume point: c = token position to resume at, prompt_ckpt selects
     // ckpt_prompt_ (P) vs ckpt_end_ (M). c==0 means "no reuse -> full reset".
-    // Query-conditioned turns additionally constrain c to the aligned query
-    // replay boundary so suffix prefill can recapture the complete query and
-    // save an exact replay snapshot.
+    // Query-conditioned turns ordinarily constrain c to the aligned query
+    // replay boundary. A later checkpoint is allowed only when the prior turn
+    // also retained a complete, coordinate-matched query snapshot; that mode
+    // replays solely the strict-extension suffix from c.
     struct KvmemReuse {
         uint32_t c = 0;
         bool prompt_ckpt = false;
@@ -9744,6 +9781,7 @@ private:
         uint32_t resume_ceiling = 0;
         uint32_t replay_boundary = 0;
         bool query_limited = false;
+        bool query_snapshot_reuse = false;
         bool checkpoint_after_query_boundary = false;
     };
 
@@ -9751,11 +9789,12 @@ private:
     // prefix of the warm log and the new prompt) and returns the largest
     // checkpoint C in {M,P} with C <= D and C < prompt.size() (strict, so >=1
     // suffix token always re-prefills and re-seeds decode). On an above-budget
-    // query-conditioned turn the ceiling is tightened to B=align_down(query_begin,
-    // block_tokens), establishing C <= B before any state is restored. Preference
-    // M over P: reusing at M skips re-decoding as well as re-prefilling. QC is only
-    // active above budget; below budget selection is identity and reuse proceeds
-    // as in the dense config.
+    // query-conditioned turn the ordinary ceiling is
+    // B=align_down(query_begin, block_tokens). A durable query snapshot permits
+    // C>=query_end instead: selection uses the retained Q and replay starts at C,
+    // never in the middle of Q. Preference M over P: reusing at M skips
+    // re-decoding as well as re-prefilling. QC is only active above budget;
+    // below budget selection is identity and reuse proceeds as in dense mode.
     KvmemReuse kvmem_prefix_reuse(const std::vector<uint32_t> &prompt,
                                   const GenerationOptions &options) {
 #if 0  // Archived DeltaNet recurrent-state artifact requests.
@@ -9786,6 +9825,25 @@ private:
         // fixed-stride at large --ctx, so above budget we refuse reuse in that mode
         // and fall back to a full cold prefill (correct, just unoptimized). Below
         // budget the index is unused, so the guard only bites above budget.
+        const size_t lim = std::min(kvmem_warm_log_.size(), prompt.size());
+        size_t D = 0;
+        while (D < lim && kvmem_warm_log_[D] == prompt[D]) ++D;
+        const uint32_t common_prefix = static_cast<uint32_t>(
+            std::min<size_t>(D, std::numeric_limits<uint32_t>::max()));
+        // A stashed query is valid only for the exact same token coordinates,
+        // and only while the complete query remains inside the new prompt's
+        // exact LCP.  This is the extra authority needed to resume after Q:
+        // the historical source index supplies K, while the stash supplies the
+        // otherwise-unrecoverable Q rows.
+        const bool qc_query_snapshot_ready =
+            qc_active && kvmem_warm_query_stashed_ &&
+            kvmem_warm_query_begin_ == options.kvmem_query_begin &&
+            kvmem_warm_query_end_ == options.kvmem_query_end &&
+            options.kvmem_query_end <= common_prefix &&
+            kvmem_recompute_query_enabled(options_.kvmem_recompute_query) &&
+            options.kvmem_query_guided_thinking_max_tokens == 0 &&
+            options.kvmem_query_guided_query_max_tokens == 0 &&
+            !options.kvmem_query_guided_direct;
         const bool qc_pertoken_block =
             qc_active && executor_ && executor_->kvmem_qc_pertoken();
         const bool qc_end_checkpoint_block =
@@ -9796,32 +9854,43 @@ private:
             qc_pertoken_block ||
             (qc_active && (!kvmem_warm_prompt_resumable_ ||
                            !kvmem_warm_source_index_ready_));
-        const size_t lim = std::min(kvmem_warm_log_.size(), prompt.size());
-        size_t D = 0;
-        while (D < lim && kvmem_warm_log_[D] == prompt[D]) ++D;
         const uint32_t bt = executor_->block_store()
             ? std::max<uint32_t>(
                   1, executor_->block_store()->config().block_tokens)
             : 1;
-        const uint32_t common_prefix = static_cast<uint32_t>(
-            std::min<size_t>(D, std::numeric_limits<uint32_t>::max()));
         const uint32_t replay_boundary = qc_active
             ? (options.kvmem_query_begin / bt) * bt
             : 0;
-        const uint32_t resume_ceiling = kvmem_prefix_resume_ceiling(
+        const uint32_t query_boundary_ceiling = kvmem_prefix_resume_ceiling(
             common_prefix, qc_active, options.kvmem_query_begin, bt);
+        const uint32_t resume_ceiling = qc_query_snapshot_ready
+            ? common_prefix : query_boundary_ceiling;
         KvmemReuse result;
         result.common_prefix = common_prefix;
         result.resume_ceiling = resume_ceiling;
         result.replay_boundary = replay_boundary;
         result.query_limited = qc_active;
+        const auto checkpoint_reusable =
+            [&](uint32_t position) {
+                return kvmem_prefix_checkpoint_reusable(
+                           position, static_cast<uint32_t>(prompt.size()),
+                           query_boundary_ceiling) ||
+                    kvmem_post_query_checkpoint_reusable(
+                           position, static_cast<uint32_t>(prompt.size()),
+                           common_prefix, options.kvmem_query_end,
+                           qc_query_snapshot_ready);
+            };
         const auto checkpoint_crosses_query_boundary =
             [&](uint32_t position, bool resumable) {
                 return qc_active && resumable &&
                     kvmem_prefix_checkpoint_reusable(
                         position, static_cast<uint32_t>(prompt.size()),
                         common_prefix) &&
-                    position > resume_ceiling;
+                    position > query_boundary_ceiling &&
+                    !kvmem_post_query_checkpoint_reusable(
+                        position, static_cast<uint32_t>(prompt.size()),
+                        common_prefix, options.kvmem_query_end,
+                        qc_query_snapshot_ready);
             };
         result.checkpoint_after_query_boundary =
             checkpoint_crosses_query_boundary(
@@ -9835,11 +9904,11 @@ private:
         // question instead of the whole history (server-side session continuation).
         // Below budget behavior is byte-identical (M offered exactly as before).
         if (!qc_end_checkpoint_block &&
-            kvmem_prefix_checkpoint_reusable(
-                kvmem_warm_end_pos_, static_cast<uint32_t>(prompt.size()),
-                resume_ceiling)) {
+            checkpoint_reusable(kvmem_warm_end_pos_)) {
             result.c = kvmem_warm_end_pos_;
             result.prompt_ckpt = false;
+            result.query_snapshot_reuse =
+                qc_active && result.c > query_boundary_ceiling;
             return result;
         }
         // P (prompt-end resume) is offered at a BLOCK BOUNDARY below the prompt
@@ -9854,11 +9923,11 @@ private:
         // index being position-invariant (captured at capture time); the per-token
         // index can't be fixed-stride, so qc_pertoken_block still refuses.
         if (!qc_prompt_checkpoint_block &&
-            kvmem_prefix_checkpoint_reusable(
-                kvmem_warm_prompt_pos_,
-                static_cast<uint32_t>(prompt.size()), resume_ceiling)) {
+            checkpoint_reusable(kvmem_warm_prompt_pos_)) {
             result.c = kvmem_warm_prompt_pos_;
             result.prompt_ckpt = true;
+            result.query_snapshot_reuse =
+                qc_active && result.c > query_boundary_ceiling;
             return result;
         }
         // Miss despite a valid warm log: log why so the miss pattern is
@@ -9871,6 +9940,8 @@ private:
             mmsg << "kvmem prefix-cache MISS (why): D=" << D
                  << " ceiling=" << resume_ceiling
                  << " query_limited=" << (qc_active ? 1 : 0)
+                 << " query_snapshot="
+                 << (qc_query_snapshot_ready ? 1 : 0)
                  << " replay_boundary=" << replay_boundary
                  << " P=" << kvmem_warm_prompt_pos_
                  << " M=" << kvmem_warm_end_pos_
@@ -9928,11 +9999,46 @@ private:
                 bs->config().retrieval_method));
     }
 
-    uint64_t prefix_cache_lookup(const std::vector<uint32_t> &prompt,
-                                 uint32_t page_size,
-                                 std::vector<int32_t> &out_pages,
-                                 QwenExecutor::StateSnapshot &out_recur,
-                                 uint32_t &out_aligned_len) {
+    // Persist the complete de-RoPE'd query alongside the warm P/M checkpoints.
+    // StateSnapshot intentionally owns only model-compute state; the query is a
+    // scorer input with a backend-specific host/GPU layout, so QwenExecutor's
+    // existing clean-query stash is the durable authority.  Metadata is stored
+    // here and checked against the next request's exact LCP before restoration.
+    bool kvmem_capture_warm_query_snapshot(
+            QwenExecutor &executor, const GenerationOptions &options,
+            bool eligible) {
+        kvmem_warm_query_stashed_ = false;
+        kvmem_warm_query_begin_ = 0;
+        kvmem_warm_query_end_ = 0;
+        if (!eligible ||
+            options.kvmem_query_end <= options.kvmem_query_begin ||
+            !executor.kvmem_query_capture_complete()) {
+            return false;
+        }
+        try {
+            if (!executor.kvmem_stash_query()) return false;
+        } catch (const std::exception &e) {
+            if (kvmem_prefix_cache_trace_enabled() ||
+                std::getenv("QW3_KVMEM_TRACE")) {
+                log(std::string("kvmem prefix-cache query snapshot skipped: ") +
+                    e.what());
+            }
+            return false;
+        }
+        kvmem_warm_query_stashed_ = true;
+        kvmem_warm_query_begin_ = options.kvmem_query_begin;
+        kvmem_warm_query_end_ = options.kvmem_query_end;
+        return true;
+    }
+
+    uint64_t prefix_cache_lookup(
+            const std::vector<uint32_t> &prompt,
+            uint32_t page_size,
+            bool require_mtp,
+            std::vector<int32_t> &out_pages,
+            std::vector<int32_t> &out_mtp_pages,
+            QwenExecutor::StateSnapshot &out_recur,
+            uint32_t &out_aligned_len) {
         if (!prefix_cache_enabled() || prompt.size() < 2 * page_size) return 0;
         std::lock_guard<std::mutex> lk(prefix_cache_mu_);
         const uint32_t prompt_len = static_cast<uint32_t>(prompt.size());
@@ -9951,10 +10057,19 @@ private:
                                 prompt.begin())) {
                     continue;  // hash collision
                 }
+                const uint32_t prefix_pages = probe / page_size;
+                if (require_mtp &&
+                    (e.mtp_kv_pages.size() != prefix_pages ||
+                     e.recur.mtp_kv_logical_pages != prefix_pages ||
+                     e.recur.mtp_prefix_len < probe ||
+                     !e.recur.mtp_prefix_h)) {
+                    continue;
+                }
                 // Hit. Pin already held by the entry; bump refcount + LRU.
                 ++e.refcount;
                 e.last_used_seq = ++prefix_cache_seq_;
                 out_pages = e.kv_pages;
+                out_mtp_pages = e.mtp_kv_pages;
                 out_recur = clone_state_snapshot(e.recur);
                 out_aligned_len = e.aligned_len;
                 return e.id;
@@ -9971,11 +10086,20 @@ private:
         dst.ready = src.ready;
         dst.position = src.position;
         dst.kv_logical_pages = src.kv_logical_pages;
+        dst.mtp_kv_logical_pages = src.mtp_kv_logical_pages;
         dst.mtp_prefix_len = src.mtp_prefix_len;
         if (src.h) {
             dst.h = device_->scratch_like(
                 *src.h, src.h->count, "prefix_clone_h");
             prefix_require_ok(device_->copy_d2d(*dst.h, *src.h, 0, src.h->count));
+        }
+        if (src.mtp_prefix_h) {
+            dst.mtp_prefix_h = device_->scratch_like(
+                *src.mtp_prefix_h, src.mtp_prefix_h->count,
+                "prefix_clone_mtp_h");
+            prefix_require_ok(device_->copy_d2d(
+                *dst.mtp_prefix_h, *src.mtp_prefix_h, 0,
+                src.mtp_prefix_h->count));
         }
         dst.recurrent_states.resize(src.recurrent_states.size());
         dst.conv_states.resize(src.conv_states.size());
@@ -10001,26 +10125,17 @@ private:
     }
 
     // Complete clone used by the in-process KVMem milestone harness. The
-    // continuous-batching prefix cache above intentionally clones only the
-    // recurrent seed associated with separately pinned main-KV pages; changing
-    // its shape would alter an unrelated production path. A milestone branch,
-    // in contrast, must preserve MTP, registration, and sparse-window metadata.
+    // continuous-batching prefix cache above clones the dense model state,
+    // including MTP prefix hidden state, while its main/MTP KV pages are pinned
+    // separately. A milestone branch additionally preserves registration and
+    // sparse-window metadata.
     QwenExecutor::StateSnapshot clone_milestone_state_snapshot(
             const QwenExecutor::StateSnapshot &src) {
         QwenExecutor::StateSnapshot dst = clone_state_snapshot(src);
-        dst.mtp_kv_logical_pages = src.mtp_kv_logical_pages;
         dst.kvmem_registered_pos = src.kvmem_registered_pos;
         dst.kvmem_active = src.kvmem_active;
         dst.window_query_pos = src.window_query_pos;
         dst.window_page_count = src.window_page_count;
-        if (src.mtp_prefix_h) {
-            dst.mtp_prefix_h = device_->scratch_like(
-                *src.mtp_prefix_h, src.mtp_prefix_h->count,
-                "milestone_clone_mtp_h");
-            prefix_require_ok(device_->copy_d2d(
-                *dst.mtp_prefix_h, *src.mtp_prefix_h, 0,
-                src.mtp_prefix_h->count));
-        }
         return dst;
     }
 
@@ -10033,6 +10148,7 @@ private:
         const uint32_t page_size = a.executor->kv_page_size_public();
         if (page_size == 0 || (aligned_len % page_size) != 0) return;
         const uint32_t prefix_pages = aligned_len / page_size;
+        const bool include_mtp = a.req && a.req->spec_mtp;
 
         // Don't duplicate an entry that already covers this exact prefix.
         const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
@@ -10045,7 +10161,12 @@ private:
                     if (e.aligned_len == aligned_len &&
                         e.tokens.size() == aligned_len &&
                         std::equal(e.tokens.begin(), e.tokens.end(),
-                                   prompt.begin())) {
+                                   prompt.begin()) &&
+                        (!include_mtp ||
+                         (e.mtp_kv_pages.size() == prefix_pages &&
+                          e.recur.mtp_kv_logical_pages == prefix_pages &&
+                          e.recur.mtp_prefix_len >= aligned_len &&
+                          e.recur.mtp_prefix_h))) {
                         ++e.refcount;  // creator holds it too
                         e.last_used_seq = ++prefix_cache_seq_;
                         a.held_prefix_entries.push_back(e.id);
@@ -10064,9 +10185,15 @@ private:
         a.executor->capture_state(entry.recur);
         // Mark prefix pages borrowed in the executor + collect their physical
         // ids; the executor keeps reading them but will not free them.
-        entry.kv_pages = a.executor->mark_kv_prefix_shared(prefix_pages);
-        if (entry.kv_pages.size() != prefix_pages) return;  // nothing to share
+        if (!a.executor->mark_prefix_shared(
+                prefix_pages, include_mtp,
+                entry.kv_pages, entry.mtp_kv_pages)) {
+            return;
+        }
         if (cb_kv_pool_) cb_kv_pool_->pin_pages(entry.kv_pages);
+        if (cb_mtp_kv_pool_ && !entry.mtp_kv_pages.empty()) {
+            cb_mtp_kv_pool_->pin_pages(entry.mtp_kv_pages);
+        }
 
         uint64_t eid = 0;
         {
@@ -10075,9 +10202,11 @@ private:
             entry.refcount = 1;  // creator holds it until finish
             entry.last_used_seq = ++prefix_cache_seq_;
             prefix_cache_pinned_pages_ += prefix_pages;
+            ++prefix_cache_entry_count_;
             a.held_prefix_entries.push_back(entry.id);
             eid = entry.id;
             const uint32_t alen = entry.aligned_len;
+            const size_t mtp_page_count = entry.mtp_kv_pages.size();
             prefix_cache_[h].push_back(std::move(entry));
             if (prefix_cache_trace_enabled()) {
                 std::ostringstream m;
@@ -10085,25 +10214,38 @@ private:
                   << " req=" << a.req->id
                   << " aligned_len=" << alen
                   << " pages=" << prefix_pages
-                  << " pinned_pages=" << prefix_cache_pinned_pages_;
+                  << " mtp_pages=" << mtp_page_count
+                  << " pinned_pages=" << prefix_cache_pinned_pages_
+                  << " entries=" << prefix_cache_entry_count_;
                 log(m.str());
             }
         }
         (void) eid;
-        // Enforce the page budget: evict LRU refcount==0 entries until we are
-        // within QW3_PREFIX_CACHE_MAX_PAGES (0 = unlimited). The just-committed
-        // entry has refcount 1 so it is never the victim here.
-        const uint32_t budget = prefix_cache_max_pages();
-        if (budget > 0) {
-            for (int guard = 0; guard < 4096; ++guard) {
-                uint32_t pinned;
-                {
-                    std::lock_guard<std::mutex> lk(prefix_cache_mu_);
-                    pinned = prefix_cache_pinned_pages_;
-                }
-                if (pinned <= budget) break;
-                if (prefix_cache_evict_lru(1) == 0) break;  // nothing evictable
+        // The just-committed entry has refcount 1, so it cannot evict itself.
+        prefix_cache_enforce_budgets();
+    }
+
+    // Enforce both physical-page and state-snapshot budgets. This is called
+    // after commit and again after releasing request references: concurrent
+    // requests may temporarily make every over-budget entry non-evictable,
+    // but the release pass reclaims them as soon as they become idle.
+    void prefix_cache_enforce_budgets() {
+        const uint32_t page_budget = prefix_cache_max_pages();
+        const uint32_t entry_budget = prefix_cache_max_entries();
+        if (page_budget == 0 && entry_budget == 0) return;
+        for (int guard = 0; guard < 4096; ++guard) {
+            uint32_t pinned = 0;
+            uint32_t entries = 0;
+            {
+                std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+                pinned = prefix_cache_pinned_pages_;
+                entries = prefix_cache_entry_count_;
             }
+            const bool pages_ok = page_budget == 0 || pinned <= page_budget;
+            const bool entries_ok =
+                entry_budget == 0 || entries <= entry_budget;
+            if (pages_ok && entries_ok) break;
+            if (prefix_cache_evict_lru(1) == 0) break;
         }
     }
 
@@ -10111,15 +10253,21 @@ private:
     // stay until the entry is evicted at refcount 0.
     void prefix_cache_release(ContinuousBatchActive &a) {
         if (a.held_prefix_entries.empty()) return;
-        std::lock_guard<std::mutex> lk(prefix_cache_mu_);
-        for (uint64_t eid : a.held_prefix_entries) {
-            for (auto &kv : prefix_cache_) {
-                for (PrefixCacheEntry &e : kv.second) {
-                    if (e.id == eid && e.refcount > 0) { --e.refcount; break; }
+        {
+            std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+            for (uint64_t eid : a.held_prefix_entries) {
+                for (auto &kv : prefix_cache_) {
+                    for (PrefixCacheEntry &e : kv.second) {
+                        if (e.id == eid && e.refcount > 0) {
+                            --e.refcount;
+                            break;
+                        }
+                    }
                 }
             }
+            a.held_prefix_entries.clear();
         }
-        a.held_prefix_entries.clear();
+        prefix_cache_enforce_budgets();
     }
 
     // Evict up to `want` LRU entries with refcount==0, unpin + free their pages
@@ -10158,8 +10306,16 @@ private:
                 cb_kv_pool_->unpin_pages(victim.kv_pages);
                 cb_kv_pool_->release_physical_pages(victim.kv_pages);
             }
+            if (cb_mtp_kv_pool_ && !victim.mtp_kv_pages.empty()) {
+                cb_mtp_kv_pool_->unpin_pages(victim.mtp_kv_pages);
+                cb_mtp_kv_pool_->release_physical_pages(
+                    victim.mtp_kv_pages);
+            }
             const uint32_t pages = static_cast<uint32_t>(victim.kv_pages.size());
             ++evicted_entries;
+            if (prefix_cache_entry_count_ > 0) {
+                --prefix_cache_entry_count_;
+            }
             if (prefix_cache_pinned_pages_ >= pages) {
                 prefix_cache_pinned_pages_ -= pages;
             }
@@ -10168,7 +10324,9 @@ private:
                 m << "prefix_cache evict id=" << victim.id
                   << " aligned_len=" << victim.aligned_len
                   << " pages=" << pages
-                  << " pinned_pages=" << prefix_cache_pinned_pages_;
+                  << " mtp_pages=" << victim.mtp_kv_pages.size()
+                  << " pinned_pages=" << prefix_cache_pinned_pages_
+                  << " entries=" << prefix_cache_entry_count_;
                 log(m.str());
             }
             bucket.erase(bucket.begin() + static_cast<std::ptrdiff_t>(best_idx));
@@ -10185,10 +10343,15 @@ private:
                     cb_kv_pool_->unpin_pages(e.kv_pages);
                     cb_kv_pool_->release_physical_pages(e.kv_pages);
                 }
+                if (cb_mtp_kv_pool_ && !e.mtp_kv_pages.empty()) {
+                    cb_mtp_kv_pool_->unpin_pages(e.mtp_kv_pages);
+                    cb_mtp_kv_pool_->release_physical_pages(e.mtp_kv_pages);
+                }
             }
         }
         prefix_cache_.clear();
         prefix_cache_pinned_pages_ = 0;
+        prefix_cache_entry_count_ = 0;
     }
 
     void finish_continuous_active(ContinuousBatchActive &a) {
@@ -10410,6 +10573,8 @@ private:
                      << " ceiling=" << ru.resume_ceiling
                      << " replay_boundary=" << ru.replay_boundary
                      << " query_limited=" << (ru.query_limited ? 1 : 0)
+                     << " query_snapshot="
+                     << (ru.query_snapshot_reuse ? 1 : 0)
                      << " prompt=" << prompt_tokens.size()
                      << " suffix=" << (prompt_tokens.size() - reuse_m);
                 log(tmsg.str());
@@ -10525,7 +10690,8 @@ private:
             options.kvmem_query_attention_score_tokens != 0;
         const bool query_guided_query_requested =
             options.kvmem_query_guided_thinking_max_tokens != 0 ||
-            options.kvmem_query_guided_query_max_tokens != 0;
+            options.kvmem_query_guided_query_max_tokens != 0 ||
+            options.kvmem_query_guided_direct;
         if (query_attention_probe_requested &&
             (options.kvmem_query_attention_probe_tokens == 0 ||
              options.kvmem_query_attention_score_tokens == 0)) {
@@ -10555,6 +10721,9 @@ private:
                                             static_cast<uint32_t>(prompt_tokens.size()),
                                             /*index_tokens=*/0,
                                             /*preserve_content_index=*/warm_reuse);
+            if (ru.query_snapshot_reuse) {
+                executor_->kvmem_restore_stashed_query();
+            }
             std::ostringstream qmsg;
             qmsg << "native kvmem query-conditioned: span=["
                  << options.kvmem_query_begin << "," << options.kvmem_query_end
@@ -10642,7 +10811,9 @@ private:
         if (recompute_query) {
             const uint32_t bt = std::max<uint32_t>(
                 1, executor_->block_store()->config().block_tokens);
-            query_replay_begin = (options.kvmem_query_begin / bt) * bt;
+            query_replay_begin = ru.query_snapshot_reuse
+                ? reuse_m
+                : (options.kvmem_query_begin / bt) * bt;
             if (query_replay_begin == 0) {
                 throw std::runtime_error(
                     "KVMem query replay requires a non-zero aligned boundary");
@@ -11189,7 +11360,9 @@ private:
                     executor_->kvmem_begin_query_replay(
                         query_replay_ckpt, selected_context,
                         /*reset_recurrent_state=*/false,
-                        /*preserve_selected_context=*/true);
+                        /*preserve_selected_context=*/true,
+                        /*preserve_query_capture=*/
+                            ru.query_snapshot_reuse);
 #if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =
@@ -11325,6 +11498,10 @@ private:
                         warm_source_index_ready &&
                         executor_->kvmem_content_index_covers(
                             static_cast<uint32_t>(pos));
+                    const bool query_snapshot_ready =
+                        kvmem_capture_warm_query_snapshot(
+                            *executor_, options,
+                            qc_active && prompt_source_index_ready);
                     kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
                     kvmem_warm_prompt_pos_ = warm_prompt_pos;
                     kvmem_warm_prompt_resumable_ = warm_prompt_resumable;
@@ -11349,7 +11526,9 @@ private:
                              << " M_resumable="
                              << (kvmem_warm_end_resumable_ ? 1 : 0)
                              << " M_source_index="
-                             << (end_source_index_ready ? 1 : 0);
+                             << (end_source_index_ready ? 1 : 0)
+                             << " query_snapshot="
+                             << (query_snapshot_ready ? 1 : 0);
                         log(cmsg.str());
                     }
                 } else {
@@ -11539,6 +11718,10 @@ private:
                     warm_source_index_ready &&
                     executor_->kvmem_content_index_covers(
                         static_cast<uint32_t>(pos));
+                const bool query_snapshot_ready =
+                    kvmem_capture_warm_query_snapshot(
+                        *executor_, options,
+                        qc_active && prompt_source_index_ready);
                 // Commit the staged prompt-end (P) checkpoint alongside the
                 // turn-end (M) one; flip all warm fields together so a mid-decode
                 // throw leaves the prior turn's warm state intact.
@@ -11565,6 +11748,8 @@ private:
                          << (kvmem_warm_end_resumable_ ? 1 : 0)
                          << " M_source_index="
                          << (end_source_index_ready ? 1 : 0)
+                         << " query_snapshot="
+                         << (query_snapshot_ready ? 1 : 0)
                          << " decoded=" << decoded;
                     log(cmsg.str());
                 }
@@ -11751,6 +11936,8 @@ private:
                      << " replay_boundary=" << kvmem_ru.replay_boundary
                      << " query_limited="
                      << (kvmem_ru.query_limited ? 1 : 0)
+                     << " query_snapshot="
+                     << (kvmem_ru.query_snapshot_reuse ? 1 : 0)
                      << " prompt=" << prompt_tokens.size()
                      << " suffix=" << (prompt_tokens.size() - kvmem_reuse_m);
                 log(tmsg.str());
@@ -11987,7 +12174,8 @@ private:
             options.kvmem_query_attention_score_tokens != 0;
         const bool query_guided_query_requested =
             options.kvmem_query_guided_thinking_max_tokens != 0 ||
-            options.kvmem_query_guided_query_max_tokens != 0;
+            options.kvmem_query_guided_query_max_tokens != 0 ||
+            options.kvmem_query_guided_direct;
         if (query_attention_probe_requested &&
             (options.kvmem_query_attention_probe_tokens == 0 ||
              options.kvmem_query_attention_score_tokens == 0)) {
@@ -12001,11 +12189,23 @@ private:
                 "replay path with Mean-K or SubBlockMeanK retrieval");
         }
         if (query_guided_query_requested &&
-            (options.kvmem_query_guided_thinking_max_tokens == 0 ||
-             options.kvmem_query_guided_query_max_tokens == 0)) {
+            options.kvmem_query_guided_query_max_tokens == 0) {
             throw std::invalid_argument(
-                "KVMem guided query requires both a positive thinking "
-                "limit and a positive compact-query token budget");
+                "KVMem guided query requires a positive compact-query "
+                "token budget");
+        }
+        if (query_guided_query_requested &&
+            !options.kvmem_query_guided_direct &&
+            options.kvmem_query_guided_thinking_max_tokens == 0) {
+            throw std::invalid_argument(
+                "KVMem reasoning-guided query requires a positive private-"
+                "thinking limit");
+        }
+        if (options.kvmem_query_guided_direct &&
+            options.kvmem_query_guided_thinking_max_tokens != 0) {
+            throw std::invalid_argument(
+                "KVMem direct guided query requires a zero private-thinking "
+                "limit");
         }
         if (query_attention_probe_requested &&
             query_guided_query_requested) {
@@ -12022,6 +12222,8 @@ private:
             query_attention_probe_requested && recompute_query;
         const bool query_guided_query =
             query_guided_query_requested && recompute_query;
+        const bool query_guided_direct =
+            query_guided_query && options.kvmem_query_guided_direct;
         executor_->kvmem_set_query_score_budget_hint(
             query_attention_probe
                 ? options.kvmem_query_attention_score_tokens
@@ -12156,6 +12358,9 @@ private:
                 initial_qb, initial_qe, logical_prompt_tokens,
                 /*index_tokens=*/0,
                 /*preserve_content_index=*/kvmem_warm_reuse);
+            if (kvmem_ru.query_snapshot_reuse) {
+                executor_->kvmem_restore_stashed_query();
+            }
             std::ostringstream qmsg;
             qmsg << "native kvmem query-conditioned: span=["
                  << initial_qb << "," << initial_qe
@@ -12362,7 +12567,9 @@ private:
         uint32_t query_guided_thinking_tokens = 0;
         uint32_t query_guided_query_tokens = 0;
         bool query_guided_thinking_closed = false;
+        bool query_guided_fallback_original = false;
         std::string query_guided_query_text;
+        std::string query_guided_fallback_reason;
         const double t_prefill_start = wall_seconds();
         const uint32_t prefill_base =
             static_cast<uint32_t>(executor_->position());
@@ -12405,8 +12612,9 @@ private:
         if (recompute_query) {
             const uint32_t bt = std::max<uint32_t>(
                 1, executor_->block_store()->config().block_tokens);
-            kvmem_query_replay_begin =
-                (kvmem_effective_replay_begin(options) / bt) * bt;
+            kvmem_query_replay_begin = kvmem_ru.query_snapshot_reuse
+                ? kvmem_reuse_m
+                : (kvmem_effective_replay_begin(options) / bt) * bt;
             if (kvmem_query_replay_begin == 0) {
                 throw std::runtime_error(
                     "KVMem query replay requires a non-zero aligned boundary");
@@ -14150,27 +14358,75 @@ private:
                             // than a bag of keywords; all of it is rolled back
                             // after its Q rows have been copied aside.
                             std::string guided_query_prompt;
+                            std::string direct_source_query;
                             if (options.thinking_open) {
                                 guided_query_prompt = "</think>\n";
                             }
-                            guided_query_prompt +=
-                                "<|im_end|>\n<|im_start|>user\n"
-                                "Before answering the preceding real user "
-                                "request, prepare a retrieval query for long-"
-                                "term memory. Think briefly about exactly what "
-                                "evidence must be found. Do not answer the real "
-                                "request. After finishing that private "
-                                "reasoning, output exactly one compact, "
-                                "standalone retrieval query on a single line. "
-                                "Write it as a grammatical natural-language "
-                                "question or declarative sentence that preserves "
-                                "the complete information need. Never output a "
-                                "keyword list, search-engine terms, quoted "
-                                "fragment, label, or answer. Preserve important "
-                                "entities, relationships, dates, and constraints; "
-                                "remove examples, filler, and answer-format "
-                                "instructions."
-                                "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+                            if (query_guided_direct) {
+                                std::vector<int32_t> source_query_tokens;
+                                source_query_tokens.reserve(
+                                    options.kvmem_query_end -
+                                    options.kvmem_query_begin);
+                                for (uint32_t pos = options.kvmem_query_begin;
+                                     pos < options.kvmem_query_end &&
+                                     pos < prompt_tokens.size();
+                                     ++pos) {
+                                    source_query_tokens.push_back(
+                                        static_cast<int32_t>(
+                                            prompt_tokens[pos]));
+                                }
+                                direct_source_query =
+                                    tokenizer_->decode(source_query_tokens);
+                                // Keep untrusted query text from introducing a
+                                // structural ChatML boundary into the private turn.
+                                size_t special = 0;
+                                while ((special = direct_source_query.find(
+                                            "<|", special)) !=
+                                       std::string::npos) {
+                                    direct_source_query.replace(
+                                        special, 2, "< |");
+                                    special += 3;
+                                }
+                                guided_query_prompt +=
+                                    "<|im_end|>\n<|im_start|>user\n"
+                                    "RETRIEVAL QUERY REWRITE TASK\n\n"
+                                    "Convert only the SOURCE REQUEST below into "
+                                    "one memory-search request.\n\n"
+                                    "SOURCE REQUEST BEGIN\n" +
+                                    direct_source_query +
+                                    "\nSOURCE REQUEST END\n\n"
+                                    "Your output must state what evidence should be "
+                                    "found in conversation history. Copy all "
+                                    "important names, dates, round numbers, "
+                                    "relationships, and constraints from the source. "
+                                    "Do not solve, calculate, guess, or state the "
+                                    "answer. Do not call a tool. Do not use quotation "
+                                    "marks, tags, XML, JSON, labels, explanations, "
+                                    "or keyword lists. Output exactly one grammatical "
+                                    "question or command on one line, ending with "
+                                    "normal sentence punctuation. Nothing else."
+                                    "<|im_end|>\n<|im_start|>assistant\n"
+                                    "<think>\n\n</think>\n\nRetrieval query: ";
+                            } else {
+                                guided_query_prompt +=
+                                    "<|im_end|>\n<|im_start|>user\n"
+                                    "Before answering the preceding real user "
+                                    "request, prepare a retrieval query for long-"
+                                    "term memory. Think briefly about exactly what "
+                                    "evidence must be found. Do not answer the real "
+                                    "request. After finishing that private "
+                                    "reasoning, output exactly one compact, "
+                                    "standalone retrieval query on a single line. "
+                                    "Write it as a grammatical natural-language "
+                                    "question or declarative sentence that preserves "
+                                    "the complete information need. Never output a "
+                                    "keyword list, search-engine terms, quoted "
+                                    "fragment, label, or answer. Preserve important "
+                                    "entities, relationships, dates, and constraints; "
+                                    "remove examples, filler, and answer-format "
+                                    "instructions."
+                                    "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+                            }
                             const std::vector<int32_t> private_prompt =
                                 tokenizer_->encode(guided_query_prompt);
                             NativeExecutorReport guided_step;
@@ -14192,44 +14448,48 @@ private:
                                 tokenizer_->token_id("<|im_end|>");
                             const int32_t eos = tokenizer_->eos_id();
 
-                            for (uint32_t i = 0;
-                                 i < options
-                                         .kvmem_query_guided_thinking_max_tokens &&
-                                 proposed >= 0;
-                                 ++i) {
-                                if (proposed == eos || proposed == im_end) break;
-                                executor_->kvmem_set_guided_query_capture(false);
-                                guided_step = executor_->forward_one_token(
-                                    static_cast<uint32_t>(proposed));
-                                if (!guided_step.ok) break;
-                                if (proposed == close_think) {
+                            if (query_guided_direct) {
+                                query_guided_thinking_closed = true;
+                            } else {
+                                for (uint32_t i = 0;
+                                     i < options
+                                             .kvmem_query_guided_thinking_max_tokens &&
+                                     proposed >= 0;
+                                     ++i) {
+                                    if (proposed == eos || proposed == im_end) break;
+                                    executor_->kvmem_set_guided_query_capture(false);
+                                    guided_step = executor_->forward_one_token(
+                                        static_cast<uint32_t>(proposed));
+                                    if (!guided_step.ok) break;
+                                    if (proposed == close_think) {
+                                        query_guided_thinking_closed = true;
+                                        proposed = guided_step.argmax_token;
+                                        break;
+                                    }
+                                    ++query_guided_thinking_tokens;
+                                    proposed = guided_step.argmax_token;
+                                }
+
+                                // Natural close gives a content-dependent thinking
+                                // length. The cap is only a safety bound; on hitting
+                                // it, inject the close tag so no reasoning Q leaks
+                                // into the retrieval query tensor.
+                                if (!query_guided_thinking_closed) {
+                                    if (close_think < 0) {
+                                        throw std::runtime_error(
+                                            "model tokenizer has no </think> token");
+                                    }
+                                    executor_->kvmem_set_guided_query_capture(false);
+                                    guided_step = executor_->forward_one_token(
+                                        static_cast<uint32_t>(close_think));
+                                    if (!guided_step.ok) {
+                                        throw std::runtime_error(
+                                            "KVMem guided-query forced think close "
+                                            "failed");
+                                    }
                                     query_guided_thinking_closed = true;
                                     proposed = guided_step.argmax_token;
-                                    break;
                                 }
-                                ++query_guided_thinking_tokens;
-                                proposed = guided_step.argmax_token;
-                            }
-
-                            // Natural close gives a content-dependent thinking
-                            // length. The cap is only a safety bound; on hitting
-                            // it, inject the close tag so no reasoning Q leaks
-                            // into the retrieval query tensor.
-                            if (!query_guided_thinking_closed) {
-                                if (close_think < 0) {
-                                    throw std::runtime_error(
-                                        "model tokenizer has no </think> token");
-                                }
-                                executor_->kvmem_set_guided_query_capture(false);
-                                guided_step = executor_->forward_one_token(
-                                    static_cast<uint32_t>(close_think));
-                                if (!guided_step.ok) {
-                                    throw std::runtime_error(
-                                        "KVMem guided-query forced think close "
-                                        "failed");
-                                }
-                                query_guided_thinking_closed = true;
-                                proposed = guided_step.argmax_token;
                             }
 
                             bool query_started = false;
@@ -14255,8 +14515,29 @@ private:
                                     piece.find('\n') != std::string::npos) {
                                     break;
                                 }
+                                std::string trimmed_piece = piece;
+                                while (!trimmed_piece.empty() && std::isspace(
+                                           static_cast<unsigned char>(
+                                               trimmed_piece.back()))) {
+                                    trimmed_piece.pop_back();
+                                }
+                                size_t trimmed_first = 0;
+                                while (trimmed_first < trimmed_piece.size() &&
+                                       std::isspace(static_cast<unsigned char>(
+                                           trimmed_piece[trimmed_first]))) {
+                                    ++trimmed_first;
+                                }
+                                trimmed_piece.erase(0, trimmed_first);
+                                const bool direct_leading_wrapper =
+                                    query_guided_direct && !query_started &&
+                                    (trimmed_piece == "\"" ||
+                                     trimmed_piece == "'" ||
+                                     trimmed_piece == "`" ||
+                                     trimmed_piece == "“" ||
+                                     trimmed_piece == "‘");
                                 const bool content_bearing =
-                                    !piece.empty() && !whitespace_only;
+                                    !piece.empty() && !whitespace_only &&
+                                    !direct_leading_wrapper;
                                 // Ignore only leading separators. Once the
                                 // query starts, retain every token in that
                                 // single line, including internal whitespace,
@@ -14281,18 +14562,96 @@ private:
                                 const bool line_complete =
                                     query_started &&
                                     piece.find('\n') != std::string::npos;
+                                // A direct rewrite is contractually one question.
+                                // Stop as soon as that question ends, before the
+                                // model can emit a closing quote or explanation.
+                                const bool question_complete =
+                                    query_guided_direct && capture &&
+                                    (piece.find('?') != std::string::npos ||
+                                     piece.find("？") != std::string::npos);
                                 proposed = guided_step.argmax_token;
-                                if (line_complete) break;
+                                if (line_complete || question_complete) break;
                             }
                             executor_->kvmem_set_guided_query_capture(false);
-                            const uint32_t published =
-                                executor_->kvmem_end_guided_query_probe();
-                            executor_->restore_state(probe_boundary);
-                            if (published == 0 ||
-                                published != query_guided_query_tokens) {
-                                throw std::runtime_error(
-                                    "KVMem guided query produced no usable "
-                                    "compact-query Q rows");
+                            if (query_guided_direct) {
+                                std::string normalized = query_guided_query_text;
+                                while (!normalized.empty() && std::isspace(
+                                           static_cast<unsigned char>(
+                                               normalized.back()))) {
+                                    normalized.pop_back();
+                                }
+                                size_t first = 0;
+                                while (first < normalized.size() && std::isspace(
+                                           static_cast<unsigned char>(
+                                               normalized[first]))) {
+                                    ++first;
+                                }
+                                normalized.erase(0, first);
+                                std::string lower = normalized;
+                                std::transform(
+                                    lower.begin(), lower.end(), lower.begin(),
+                                    [](unsigned char ch) {
+                                        return static_cast<char>(std::tolower(ch));
+                                    });
+                                const bool question =
+                                    normalized.find('?') != std::string::npos ||
+                                    normalized.find("？") != std::string::npos;
+                                const bool terminal_ascii =
+                                    !normalized.empty() &&
+                                    (normalized.back() == '.' ||
+                                     normalized.back() == '!');
+                                const bool terminal_cjk =
+                                    normalized.size() >= 3 &&
+                                    (normalized.compare(
+                                         normalized.size() - 3, 3, "。") == 0 ||
+                                     normalized.compare(
+                                         normalized.size() - 3, 3, "！") == 0);
+                                const bool single_line_request =
+                                    !normalized.empty() &&
+                                    normalized.find('\n') == std::string::npos &&
+                                    normalized.find('\r') == std::string::npos &&
+                                    (question || terminal_ascii || terminal_cjk);
+                                const bool structured_answer =
+                                    lower.find("<answer") != std::string::npos ||
+                                    lower.find("tool_call") != std::string::npos ||
+                                    lower.find("<tool") != std::string::npos ||
+                                    lower.find("```") != std::string::npos ||
+                                    (!normalized.empty() &&
+                                     (normalized.front() == '{' ||
+                                      normalized.front() == '['));
+                                if (!single_line_request || structured_answer) {
+                                    // The original query Q was already captured
+                                    // before this reversible probe. Cancelling here
+                                    // leaves it intact, so malformed rewrites can
+                                    // safely fall back without a second query replay.
+                                    query_guided_fallback_original = true;
+                                    query_guided_fallback_reason = structured_answer
+                                        ? "structured-output"
+                                        : normalized.empty()
+                                            ? "empty-output"
+                                            : "incomplete-or-multiline-output";
+                                    executor_->kvmem_cancel_guided_query_probe();
+                                    executor_->restore_state(probe_boundary);
+                                    query_guided_query_tokens =
+                                        executor_->kvmem_query_captured_tokens();
+                                    query_guided_query_text = direct_source_query;
+                                    if (query_guided_query_tokens == 0) {
+                                        throw std::runtime_error(
+                                            "KVMem guided-query fallback found no "
+                                            "original query Q rows");
+                                    }
+                                }
+                            }
+                            if (!query_guided_fallback_original) {
+                                const uint32_t published =
+                                    executor_->kvmem_end_guided_query_probe();
+                                executor_->restore_state(probe_boundary);
+                                if (published == 0 ||
+                                    published != query_guided_query_tokens) {
+                                    throw std::runtime_error(
+                                        "KVMem guided query produced no usable "
+                                        "compact-query Q rows");
+                                }
                             }
                         } catch (...) {
                             executor_->kvmem_cancel_guided_query_probe();
@@ -14304,14 +14663,23 @@ private:
                         post_query_guided_query_s +=
                             wall_seconds() - t_probe_start;
                         std::ostringstream gmsg;
-                        gmsg << "native kvmem guided query: thinking_tokens="
+                        gmsg << "native kvmem guided query: mode="
+                             << (query_guided_fallback_original
+                                     ? "fallback-original"
+                                     : query_guided_direct ? "direct"
+                                                           : "reasoning")
+                             << " thinking_tokens="
                              << query_guided_thinking_tokens
                              << " thinking_closed="
                              << (query_guided_thinking_closed ? 1 : 0)
                              << " query_tokens="
                              << query_guided_query_tokens
-                             << " query=\""
-                             << escape_text(query_guided_query_text) << '"';
+                             << " query="
+                             << escape_text(query_guided_query_text);
+                        if (query_guided_fallback_original) {
+                            gmsg << " reason="
+                                 << query_guided_fallback_reason;
+                        }
                         log(gmsg.str());
                     }
                     const uint32_t query_tokens =
@@ -14524,7 +14892,9 @@ private:
                         kvmem_query_replay_ckpt, selected_context,
                         /*reset_recurrent_state=*/false,
                         /*preserve_selected_context=*/true,
-                        /*preserve_query_capture=*/query_guided_query);
+                        /*preserve_query_capture=*/
+                            query_guided_query ||
+                            kvmem_ru.query_snapshot_reuse);
 #if 0  // Archived DeltaNet recurrent-state capture/import.
                 if (rebuilt_state_import || rebuilt_state_capture) {
                     const std::vector<uint32_t> selected_source_tokens =
@@ -14833,6 +15203,11 @@ private:
                         kvmem_warm_source_index_ready &&
                         executor_->kvmem_content_index_covers(
                             static_cast<uint32_t>(pos));
+                    const bool query_snapshot_ready =
+                        kvmem_capture_warm_query_snapshot(
+                            *executor_, options,
+                            qc_active && prompt_source_index_ready &&
+                                !query_guided_query);
                     kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
                     kvmem_warm_prompt_pos_ = kvmem_warm_prompt_pos;
                     kvmem_warm_prompt_resumable_ =
@@ -14858,7 +15233,9 @@ private:
                              << " M_resumable="
                              << (kvmem_warm_end_resumable_ ? 1 : 0)
                              << " M_source_index="
-                             << (end_source_index_ready ? 1 : 0);
+                             << (end_source_index_ready ? 1 : 0)
+                             << " query_snapshot="
+                             << (query_snapshot_ready ? 1 : 0);
                         log(cmsg.str());
                     }
                 } else {
@@ -15739,6 +16116,11 @@ private:
                     kvmem_warm_source_index_ready &&
                     executor_->kvmem_content_index_covers(
                         static_cast<uint32_t>(pos));
+                const bool query_snapshot_ready =
+                    kvmem_capture_warm_query_snapshot(
+                        *executor_, options,
+                        qc_active && prompt_source_index_ready &&
+                            !query_guided_query);
                 // Commit the staged prompt-end (P) checkpoint alongside the
                 // turn-end (M) one; flip all warm fields together so a mid-decode
                 // throw leaves the prior turn's warm state intact.
@@ -15765,6 +16147,8 @@ private:
                          << (kvmem_warm_end_resumable_ ? 1 : 0)
                          << " M_source_index="
                          << (end_source_index_ready ? 1 : 0)
+                         << " query_snapshot="
+                         << (query_snapshot_ready ? 1 : 0)
                          << " decoded=" << decoded;
                     log(cmsg.str());
                 }
@@ -16254,16 +16638,17 @@ private:
     std::unique_ptr<GlobalKvPagePool> cb_kv_pool_;
     std::unique_ptr<GlobalKvPagePool> cb_mtp_kv_pool_;
 
-    // ---- Prefix cache (Phase 1: lossless page-aligned prefix reuse) -------
-    // One entry per committed, page-aligned prompt prefix. Pages are pinned in
-    // cb_kv_pool_ while the entry lives; recur holds the recurrent+conv state
-    // captured at exactly aligned_len so reuse is lossless on the hybrid model.
+    // ---- Prefix cache: lossless page-aligned prefix reuse -----------------
+    // One entry per committed prompt prefix. Main pages and optional matching
+    // MTP draft pages are pinned in their separate global pools; recur holds
+    // recurrent/conv plus MTP-prefix hidden state at exactly aligned_len.
     struct PrefixCacheEntry {
         uint64_t id = 0;
         std::vector<uint32_t> tokens;     // exact prefix tokens (collision-safe)
         uint32_t aligned_len = 0;         // == tokens.size(), multiple of page_size
         std::vector<int32_t> kv_pages;    // pinned physical pages, logical 0..n
-        QwenExecutor::StateSnapshot recur;// recurrent+conv state at aligned_len
+        std::vector<int32_t> mtp_kv_pages;// matching pinned MTP draft pages
+        QwenExecutor::StateSnapshot recur;// recurrent/conv/MTP state at boundary
         uint32_t refcount = 0;            // live requests reading these pages
         uint64_t last_used_seq = 0;       // LRU
     };
@@ -16272,6 +16657,7 @@ private:
     uint64_t prefix_cache_seq_ = 0;
     uint64_t prefix_cache_next_id_ = 1;
     uint32_t prefix_cache_pinned_pages_ = 0;
+    uint32_t prefix_cache_entry_count_ = 0;
     bool prefix_cache_evict_cb_installed_ = false;
 
     // ---- kvmem single-request prefix cache (QW3_KVMEM_PREFIX_CACHE) --------
@@ -16302,6 +16688,9 @@ private:
     bool kvmem_warm_source_index_ready_ = false; // historical scorer rows durable
     bool kvmem_warm_end_resumable_ = false; // ckpt_end_ tier/window state durable
     bool kvmem_warm_end_source_index_ready_ = false; // scorer covers [0,M)
+    bool kvmem_warm_query_stashed_ = false; // complete Q rows for post-query P/M
+    uint32_t kvmem_warm_query_begin_ = 0;
+    uint32_t kvmem_warm_query_end_ = 0;
     bool kvmem_warm_valid_ = false;
 
     // Generic API-level persistent session. The first implementation is
