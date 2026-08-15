@@ -9867,6 +9867,220 @@ private:
         bool checkpoint_after_query_boundary = false;
     };
 
+    struct KvmemWarmSuspension {
+        uint64_t generation = 0;
+        bool retain_prompt = false;
+        bool retain_end = false;
+    };
+
+    void kvmem_warm_begin_stage() {
+        kvmem_warm_stage_ckpt_prompt_.ready = false;
+        kvmem_warm_stage_ckpt_end_.ready = false;
+    }
+
+    void kvmem_warm_abort_stage(const char *reason) {
+        kvmem_warm_stage_ckpt_prompt_.ready = false;
+        kvmem_warm_stage_ckpt_end_.ready = false;
+        if (kvmem_prefix_cache_trace_enabled()) {
+            log("kvmem prefix-cache ABORT keep_generation=" +
+                std::to_string(kvmem_warm_valid_
+                                   ? kvmem_warm_generation_
+                                   : 0) +
+                " reason=" + (reason ? reason : "unknown"));
+        }
+    }
+
+    void kvmem_warm_invalidate_committed(const char *reason) {
+        if (kvmem_warm_valid_ && kvmem_prefix_cache_trace_enabled()) {
+            log("kvmem prefix-cache INVALIDATE generation=" +
+                std::to_string(kvmem_warm_generation_) +
+                " reason=" + (reason ? reason : "unknown"));
+        }
+        kvmem_warm_valid_ = false;
+        kvmem_warm_log_.clear();
+        kvmem_warm_query_stashed_ = false;
+        kvmem_warm_query_begin_ = 0;
+        kvmem_warm_query_end_ = 0;
+    }
+
+    // A request mutates the live executor and block store after restoring a
+    // committed checkpoint. Hide that generation until prefill completes, and
+    // remember which part remains physically recoverable if decode is cancelled.
+    KvmemWarmSuspension kvmem_warm_suspend_committed(bool restored_prompt) {
+        KvmemWarmSuspension suspension;
+        if (!kvmem_warm_valid_) return suspension;
+        suspension.generation = kvmem_warm_generation_;
+        suspension.retain_prompt =
+            kvmem_warm_prompt_resumable_ &&
+            kvmem_warm_ckpt_prompt_.ready;
+        suspension.retain_end =
+            !restored_prompt && kvmem_warm_end_resumable_ &&
+            kvmem_warm_ckpt_end_.ready;
+        kvmem_warm_valid_ = false;
+        if (!suspension.retain_prompt && !suspension.retain_end) {
+            suspension.generation = 0;
+        }
+        if (kvmem_prefix_cache_trace_enabled()) {
+            std::ostringstream smsg;
+            smsg << "kvmem prefix-cache SUSPEND generation="
+                 << kvmem_warm_generation_
+                 << " restored=" << (restored_prompt ? "P" : "M")
+                 << " retain_P=" << (suspension.retain_prompt ? 1 : 0)
+                 << " retain_M=" << (suspension.retain_end ? 1 : 0);
+            log(smsg.str());
+        }
+        return suspension;
+    }
+
+    // Resume only after the request's prefill/replay transaction completed.
+    // The executor owns one query stash, so the in-flight request may have
+    // replaced it. Keep P/M as a conservative fallback but drop the old
+    // post-query shortcut until a successful commit captures a fresh stash.
+    void kvmem_warm_resume_committed(
+            const KvmemWarmSuspension &suspension) {
+        if (suspension.generation == 0 ||
+            suspension.generation != kvmem_warm_generation_) {
+            return;
+        }
+        kvmem_warm_prompt_resumable_ =
+            kvmem_warm_prompt_resumable_ && suspension.retain_prompt;
+        kvmem_warm_source_index_ready_ =
+            kvmem_warm_source_index_ready_ && suspension.retain_prompt;
+        kvmem_warm_end_resumable_ =
+            kvmem_warm_end_resumable_ && suspension.retain_end;
+        kvmem_warm_end_source_index_ready_ =
+            kvmem_warm_end_source_index_ready_ && suspension.retain_end;
+        kvmem_warm_query_stashed_ = false;
+        kvmem_warm_query_begin_ = 0;
+        kvmem_warm_query_end_ = 0;
+        kvmem_warm_valid_ =
+            (kvmem_warm_prompt_resumable_ &&
+             kvmem_warm_ckpt_prompt_.ready) ||
+            (kvmem_warm_end_resumable_ && kvmem_warm_ckpt_end_.ready);
+        if (kvmem_prefix_cache_trace_enabled()) {
+            std::ostringstream rmsg;
+            rmsg << "kvmem prefix-cache RESUME generation="
+                 << kvmem_warm_generation_
+                 << " P_resumable="
+                 << (kvmem_warm_prompt_resumable_ ? 1 : 0)
+                 << " M_resumable="
+                 << (kvmem_warm_end_resumable_ ? 1 : 0)
+                 << " query_snapshot=0";
+            log(rmsg.str());
+        }
+    }
+
+    void kvmem_warm_capture_prompt_stage(
+            QwenExecutor *executor, uint32_t position, bool resumable) {
+        if (!resumable) return;
+        if (!executor) {
+            throw std::runtime_error(
+                "KVMem warm prompt capture requires an executor");
+        }
+        executor->capture_state_to_host(kvmem_warm_stage_ckpt_prompt_);
+        if (!kvmem_warm_stage_ckpt_prompt_.ready ||
+            kvmem_warm_stage_ckpt_prompt_.position != position) {
+            throw std::runtime_error(
+                "KVMem warm prompt checkpoint position mismatch");
+        }
+    }
+
+    bool kvmem_warm_commit_stage(
+            QwenExecutor *executor,
+            const std::vector<uint32_t> &prompt,
+            const std::vector<uint32_t> &generated,
+            uint32_t prompt_pos,
+            bool prompt_resumable,
+            bool source_index_ready,
+            const GenerationOptions &options,
+            bool query_snapshot_eligible,
+            const char *route,
+            int decoded) {
+        if (!executor) return false;
+
+        std::vector<uint32_t> next_log = prompt;
+        next_log.insert(next_log.end(), generated.begin(), generated.end());
+        const size_t pos = executor->position();
+        if (pos > next_log.size()) {
+            kvmem_warm_abort_stage("executor_position_beyond_log");
+            return false;
+        }
+        next_log.resize(pos);
+
+        executor->capture_state_to_host(kvmem_warm_stage_ckpt_end_);
+        if (!kvmem_warm_stage_ckpt_end_.ready ||
+            kvmem_warm_stage_ckpt_end_.position != pos ||
+            (prompt_resumable &&
+             (!kvmem_warm_stage_ckpt_prompt_.ready ||
+              kvmem_warm_stage_ckpt_prompt_.position != prompt_pos))) {
+            kvmem_warm_abort_stage("snapshot_validation_failed");
+            return false;
+        }
+
+        const bool prompt_source_index_ready =
+            prompt_resumable && source_index_ready &&
+            executor->kvmem_content_index_resume_compatible(prompt_pos);
+        const bool end_source_index_ready =
+            source_index_ready &&
+            executor->kvmem_content_index_resume_compatible(
+                static_cast<uint32_t>(pos));
+        const bool end_resumable =
+            kvmem_prompt_checkpoint_resumable(end_source_index_ready);
+        const bool query_snapshot_ready =
+            kvmem_capture_warm_query_snapshot(
+                *executor, options,
+                query_snapshot_eligible && prompt_source_index_ready);
+
+        std::swap(kvmem_warm_ckpt_prompt_,
+                  kvmem_warm_stage_ckpt_prompt_);
+        std::swap(kvmem_warm_ckpt_end_, kvmem_warm_stage_ckpt_end_);
+        kvmem_warm_stage_ckpt_prompt_.ready = false;
+        kvmem_warm_stage_ckpt_end_.ready = false;
+
+        kvmem_warm_log_ = std::move(next_log);
+        kvmem_warm_prompt_pos_ = prompt_pos;
+        kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
+        kvmem_warm_prompt_resumable_ = prompt_resumable;
+        kvmem_warm_source_index_ready_ = prompt_source_index_ready;
+        kvmem_warm_end_resumable_ = end_resumable;
+        kvmem_warm_end_source_index_ready_ = end_source_index_ready;
+        kvmem_warm_generation_ = kvmem_warm_next_generation_++;
+        kvmem_warm_valid_ = true;
+
+        if (kvmem_prefix_cache_trace_enabled()) {
+            const uint64_t pinned_bytes =
+                kvmem_warm_ckpt_prompt_.host_bytes() +
+                kvmem_warm_ckpt_end_.host_bytes() +
+                kvmem_warm_stage_ckpt_prompt_.host_bytes() +
+                kvmem_warm_stage_ckpt_end_.host_bytes();
+            std::string route_label = route ? route : "unknown";
+            if (route_label == "plain_prefill_only") {
+                route_label = "plain prefill-only";
+            } else if (route_label == "mtp_prefill_only") {
+                route_label = "mtp prefill-only";
+            }
+            std::ostringstream cmsg;
+            cmsg << "kvmem prefix-cache CAPTURE (" << route_label << "):"
+                 << " warm_log=" << kvmem_warm_log_.size()
+                 << " pos=" << pos
+                 << " P=" << prompt_pos
+                 << " P_resumable=" << (prompt_resumable ? 1 : 0)
+                 << " P_source_index="
+                 << (prompt_source_index_ready ? 1 : 0)
+                 << " M=" << pos
+                 << " M_resumable=" << (end_resumable ? 1 : 0)
+                 << " M_source_index="
+                 << (end_source_index_ready ? 1 : 0)
+                 << " query_snapshot="
+                 << (query_snapshot_ready ? 1 : 0)
+                 << " decoded=" << decoded
+                 << " generation=" << kvmem_warm_generation_
+                 << " pinned_bytes=" << pinned_bytes;
+            log(cmsg.str());
+        }
+        return true;
+    }
+
     // Longest-common-prefix reuse pick. Computes D (the longest common token
     // prefix of the warm log and the new prompt) and returns the largest
     // checkpoint C in {M,P} with C <= D and C < prompt.size() (strict, so >=1
@@ -10653,9 +10867,14 @@ private:
             : kvmem_prefix_reuse(prompt_tokens, options);
         const uint32_t reuse_m = ru.c;
         const bool warm_reuse = reuse_m > 0;
+        KvmemWarmSuspension suspended_warm;
         if (warm_reuse) {
-            executor_->restore_state(ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
-                                                    : kvmem_warm_ckpt_end_);
+            const QwenExecutor::HostStateSnapshot &checkpoint =
+                ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
+                               : kvmem_warm_ckpt_end_;
+            suspended_warm =
+                kvmem_warm_suspend_committed(ru.prompt_ckpt);
+            executor_->restore_state_from_host(checkpoint);
             // restore_state rewound position/KV/recurrent/window to C but not the
             // block store (still at the prior turn's end M). Rewind it to C.
             executor_->kvmem_truncate_to(reuse_m);
@@ -10675,7 +10894,9 @@ private:
             }
         } else {
             executor_->reset_state();
-            if (kvmem_prefix_cache_enabled()) kvmem_warm_valid_ = false;
+            if (kvmem_prefix_cache_enabled()) {
+                kvmem_warm_invalidate_committed("cold_reset_plain");
+            }
         }
 #if 0  // Archived DeltaNet recurrent-state seed.
         if (rebuilt_state_seed) {
@@ -10700,6 +10921,7 @@ private:
             !semantic_chunk && !inline_refresh &&
             kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
+        if (warm_capture) kvmem_warm_begin_stage();
 
         // "Operating dense" predicate: below budget the store keeps every block
         // GPU-resident in identity order, so selection/QC are no-ops and the
@@ -11039,12 +11261,13 @@ private:
                 executor_->kvmem_register_append(
                     ckpt_split - static_cast<uint32_t>(prefill_begin));
                 executor_->kvmem_reselect_prefill_pressure();
-                kvmem_warm_valid_ = false;
-                executor_->capture_state(kvmem_warm_ckpt_prompt_);
                 warm_prompt_pos = ckpt_split;
                 warm_prompt_resumable =
                     kvmem_prompt_checkpoint_resumable(
                         warm_source_index_ready);
+                kvmem_warm_capture_prompt_stage(
+                    executor_.get(), warm_prompt_pos,
+                    warm_prompt_resumable);
                 warm_checkpoint_staged = true;
                 do_prefill_range(ckpt_split, query_replay_begin);
             } else {
@@ -11149,8 +11372,6 @@ private:
             executor_->kvmem_register_append(
                 ckpt_split - static_cast<uint32_t>(prefill_begin));
             executor_->kvmem_reselect_prefill_pressure();
-            kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
-            executor_->capture_state(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = ckpt_split;
             warm_checkpoint_staged = true;
             // Below budget: the strict all-GPU-identity precondition (every block
@@ -11163,6 +11384,9 @@ private:
             warm_prompt_resumable =
                 kvmem_prompt_checkpoint_resumable(
                     warm_source_index_ready);
+            kvmem_warm_capture_prompt_stage(
+                executor_.get(), warm_prompt_pos,
+                warm_prompt_resumable);
             // Second segment [split, P): finish the prompt.
             do_prefill_range(ckpt_split, prompt_tokens.size(),
                              /*compute_final_logits=*/true);
@@ -11534,12 +11758,13 @@ private:
                     // the first pressure-window pass that has just been discarded.
                     executor_->kvmem_register_append(
                         ckpt_split - query_replay_begin);
-                    kvmem_warm_valid_ = false;
-                    executor_->capture_state(kvmem_warm_ckpt_prompt_);
                     warm_prompt_pos = ckpt_split;
                     warm_prompt_resumable =
                         kvmem_prompt_checkpoint_resumable(
                             warm_source_index_ready);
+                    kvmem_warm_capture_prompt_stage(
+                        executor_.get(), warm_prompt_pos,
+                        warm_prompt_resumable);
                     warm_checkpoint_staged = true;
                     do_prefill_range(ckpt_split, prompt_tokens.size());
                 } else {
@@ -11575,18 +11800,21 @@ private:
         }
         }
 
+        kvmem_warm_resume_committed(suspended_warm);
+
         // kvmem prefix cache: fallback prompt-end (P) checkpoint. When the
         // block-boundary split above already staged ckpt_P at B, skip this;
         // otherwise (tiny prompt, sparse/tiered, or ckpt_M reuse past the last
         // boundary) capture at P here, AFTER register+reselect so the snapshot's
         // block store / window / registered_pos all describe exactly P tokens.
         if (warm_capture && !warm_checkpoint_staged) {
-            kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
-            executor_->capture_state(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             warm_prompt_resumable =
                 kvmem_prompt_checkpoint_resumable(
                     warm_source_index_ready);
+            kvmem_warm_capture_prompt_stage(
+                executor_.get(), warm_prompt_pos,
+                warm_prompt_resumable);
         }
 
 #if 0  // Archived DeltaNet recurrent-state export.
@@ -11616,55 +11844,10 @@ private:
         // next token, enter decode capture, or append generated KV.
         if (options.max_tokens == 0) {
             if (warm_capture) {
-                kvmem_warm_log_ = prompt_tokens;
-                const size_t pos = executor_->position();
-                if (pos <= kvmem_warm_log_.size()) {
-                    kvmem_warm_log_.resize(pos);
-                    executor_->capture_state(kvmem_warm_ckpt_end_);
-                    const bool prompt_source_index_ready =
-                        warm_source_index_ready &&
-                        executor_->kvmem_content_index_resume_compatible(
-                            warm_prompt_pos);
-                    const bool end_source_index_ready =
-                        warm_source_index_ready &&
-                        executor_->kvmem_content_index_resume_compatible(
-                            static_cast<uint32_t>(pos));
-                    const bool query_snapshot_ready =
-                        kvmem_capture_warm_query_snapshot(
-                            *executor_, options,
-                            qc_prepare && prompt_source_index_ready);
-                    kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
-                    kvmem_warm_prompt_pos_ = warm_prompt_pos;
-                    kvmem_warm_prompt_resumable_ = warm_prompt_resumable;
-                    kvmem_warm_source_index_ready_ =
-                        prompt_source_index_ready;
-                    kvmem_warm_end_resumable_ =
-                        kvmem_prompt_checkpoint_resumable(
-                            end_source_index_ready);
-                    kvmem_warm_end_source_index_ready_ =
-                        end_source_index_ready;
-                    kvmem_warm_valid_ = true;
-                    if (kvmem_prefix_cache_trace_enabled()) {
-                        std::ostringstream cmsg;
-                        cmsg << "kvmem prefix-cache CAPTURE "
-                             << "(plain prefill-only): warm_log="
-                             << kvmem_warm_log_.size() << " pos=" << pos
-                             << " P=" << warm_prompt_pos
-                             << " P_resumable="
-                             << (warm_prompt_resumable ? 1 : 0)
-                             << " P_source_index="
-                             << (prompt_source_index_ready ? 1 : 0)
-                             << " M_resumable="
-                             << (kvmem_warm_end_resumable_ ? 1 : 0)
-                             << " M_source_index="
-                             << (end_source_index_ready ? 1 : 0)
-                             << " query_snapshot="
-                             << (query_snapshot_ready ? 1 : 0);
-                        log(cmsg.str());
-                    }
-                } else {
-                    kvmem_warm_valid_ = false;
-                }
+                (void)kvmem_warm_commit_stage(
+                    executor_.get(), prompt_tokens, {}, warm_prompt_pos,
+                    warm_prompt_resumable, warm_source_index_ready,
+                    options, qc_prepare, "plain_prefill_only", 0);
             }
             st = device_->end();
             if (!st.ok) throw std::runtime_error(st.message);
@@ -11832,63 +12015,16 @@ private:
         // position -> it matches KV pages + kvmem register count exactly. A
         // position() beyond the log can't happen on the plain path, but guard it
         // (invalidate) rather than capture an inconsistent checkpoint. Captured
-        // inside the device scope since capture_state issues device copies.
+        // inside the device scope because the pinned-host snapshot starts with
+        // asynchronous device-to-host copies.
         if (warm_capture && !stream_cancelled) {
-            kvmem_warm_log_ = prompt_tokens;
-            kvmem_warm_log_.insert(kvmem_warm_log_.end(),
-                                   gen_tokens.begin(), gen_tokens.end());
-            const size_t pos = executor_->position();
-            if (pos <= kvmem_warm_log_.size()) {
-                kvmem_warm_log_.resize(pos);
-                executor_->capture_state(kvmem_warm_ckpt_end_);
-                const bool prompt_source_index_ready =
-                    warm_source_index_ready &&
-                    executor_->kvmem_content_index_resume_compatible(
-                        warm_prompt_pos);
-                const bool end_source_index_ready =
-                    warm_source_index_ready &&
-                    executor_->kvmem_content_index_resume_compatible(
-                        static_cast<uint32_t>(pos));
-                const bool query_snapshot_ready =
-                    kvmem_capture_warm_query_snapshot(
-                        *executor_, options,
-                        qc_prepare && prompt_source_index_ready);
-                // Commit the staged prompt-end (P) checkpoint alongside the
-                // turn-end (M) one; flip all warm fields together so a mid-decode
-                // throw leaves the prior turn's warm state intact.
-                kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
-                kvmem_warm_prompt_pos_ = warm_prompt_pos;
-                kvmem_warm_prompt_resumable_ = warm_prompt_resumable;
-                kvmem_warm_source_index_ready_ =
-                    prompt_source_index_ready;
-                kvmem_warm_end_resumable_ =
-                    kvmem_prompt_checkpoint_resumable(
-                        end_source_index_ready);
-                kvmem_warm_end_source_index_ready_ =
-                    end_source_index_ready;
-                kvmem_warm_valid_ = true;
-                if (kvmem_prefix_cache_trace_enabled()) {
-                    std::ostringstream cmsg;
-                    cmsg << "kvmem prefix-cache CAPTURE (plain): warm_log="
-                         << kvmem_warm_log_.size() << " pos=" << pos
-                         << " P=" << warm_prompt_pos
-                         << " P_resumable=" << (warm_prompt_resumable ? 1 : 0)
-                         << " P_source_index="
-                         << (prompt_source_index_ready ? 1 : 0)
-                         << " M_resumable="
-                         << (kvmem_warm_end_resumable_ ? 1 : 0)
-                         << " M_source_index="
-                         << (end_source_index_ready ? 1 : 0)
-                         << " query_snapshot="
-                         << (query_snapshot_ready ? 1 : 0)
-                         << " decoded=" << decoded;
-                    log(cmsg.str());
-                }
-            } else {
-                kvmem_warm_valid_ = false;
-            }
-        } else if (stream_cancelled) {
-            kvmem_warm_valid_ = false;
+            (void)kvmem_warm_commit_stage(
+                executor_.get(), prompt_tokens, gen_tokens,
+                warm_prompt_pos, warm_prompt_resumable,
+                warm_source_index_ready, options, qc_prepare,
+                "plain", decoded);
+        } else if (stream_cancelled && warm_capture) {
+            kvmem_warm_abort_stage("stream_cancelled_plain");
         }
 
         st = device_->end();
@@ -12038,6 +12174,7 @@ private:
                 : KvmemReuse{};
         const uint32_t kvmem_reuse_m = kvmem_ru.c;
         const bool kvmem_warm_reuse = kvmem_reuse_m > 0;
+        KvmemWarmSuspension suspended_warm;
         const bool kvmem_warm_capture =
             reset_session && override_executor == nullptr &&
             !transcript_replay_requested && !semantic_chunk && !api_session &&
@@ -12055,8 +12192,12 @@ private:
             // exactly reuse_m tokens (restore_state rewinds position + KV pages +
             // recurrent state + window, but NOT the block store). Suffix-only
             // prefill below then re-prefills [reuse_m, prompt.end()).
-            executor_->restore_state(kvmem_ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
-                                                          : kvmem_warm_ckpt_end_);
+            const QwenExecutor::HostStateSnapshot &checkpoint =
+                kvmem_ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
+                                     : kvmem_warm_ckpt_end_;
+            suspended_warm =
+                kvmem_warm_suspend_committed(kvmem_ru.prompt_ckpt);
+            executor_->restore_state_from_host(checkpoint);
             executor_->kvmem_truncate_to(kvmem_reuse_m);
             if (kvmem_prefix_cache_trace_enabled()) {
                 std::ostringstream tmsg;
@@ -12075,8 +12216,12 @@ private:
             }
         } else if (reset_session) {
             executor_->reset_state();
-            if (kvmem_warm_capture) kvmem_warm_valid_ = false;
+            if (override_executor == nullptr &&
+                kvmem_prefix_cache_enabled()) {
+                kvmem_warm_invalidate_committed("cold_reset_mtp");
+            }
         }
+        if (kvmem_warm_capture) kvmem_warm_begin_stage();
 #if 0  // Archived DeltaNet recurrent-state seed.
         if (rebuilt_state_seed) {
             if (kvmem_warm_reuse) {
@@ -13046,8 +13191,6 @@ private:
             // snapshot, which is why the prefill is split.
             executor_->kvmem_register_append(static_cast<uint32_t>(split_local));
             executor_->kvmem_reselect_prefill_pressure();
-            kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
-            executor_->capture_state(kvmem_warm_ckpt_prompt_);
             kvmem_warm_prompt_pos = kvmem_ckpt_split;
             kvmem_warm_checkpoint_staged = true;
             // Below budget: strict all-GPU-identity. Above budget: identity never
@@ -13056,6 +13199,9 @@ private:
             kvmem_warm_prompt_resumable =
                 kvmem_prompt_checkpoint_resumable(
                     kvmem_warm_source_index_ready);
+            kvmem_warm_capture_prompt_stage(
+                executor_, kvmem_warm_prompt_pos,
+                kvmem_warm_prompt_resumable);
             // Second segment [split, P): finish the prompt.
             do_prefill_range(split_local, prefill_tokens.size(),
                              /*compute_final_logits=*/true);
@@ -14372,12 +14518,13 @@ private:
                     executor_->kvmem_register_append(
                         kvmem_ckpt_split - prefill_absolute_base);
                     executor_->kvmem_reselect_prefill_pressure();
-                    kvmem_warm_valid_ = false;
-                    executor_->capture_state(kvmem_warm_ckpt_prompt_);
                     kvmem_warm_prompt_pos = kvmem_ckpt_split;
                     kvmem_warm_prompt_resumable =
                         kvmem_prompt_checkpoint_resumable(
                             kvmem_warm_source_index_ready);
+                    kvmem_warm_capture_prompt_stage(
+                        executor_, kvmem_warm_prompt_pos,
+                        kvmem_warm_prompt_resumable);
                     kvmem_warm_checkpoint_staged = true;
                     do_prefill_range(checkpoint_local, replay_local);
                 } else {
@@ -15128,12 +15275,13 @@ private:
                                       checkpoint_local);
                     executor_->kvmem_register_append(
                         kvmem_ckpt_split - kvmem_query_replay_begin);
-                    kvmem_warm_valid_ = false;
-                    executor_->capture_state(kvmem_warm_ckpt_prompt_);
                     kvmem_warm_prompt_pos = kvmem_ckpt_split;
                     kvmem_warm_prompt_resumable =
                         kvmem_prompt_checkpoint_resumable(
                             kvmem_warm_source_index_ready);
+                    kvmem_warm_capture_prompt_stage(
+                        executor_, kvmem_warm_prompt_pos,
+                        kvmem_warm_prompt_resumable);
                     kvmem_warm_checkpoint_staged = true;
                     do_prefill_vector(replay_tokens,
                                       kvmem_query_replay_begin,
@@ -15227,18 +15375,21 @@ private:
                     std::to_string(logical_prompt_tokens));
             }
         }
+        kvmem_warm_resume_committed(suspended_warm);
+
         // kvmem prefix cache: fallback prompt-end (P) checkpoint. When the
         // block-boundary split above already staged ckpt_P at B, skip this;
         // otherwise (tiny prompt, sparse/tiered, or ckpt_M reuse past the last
         // boundary) capture at P here, AFTER register+reselect so the snapshot
         // describes exactly P tokens (block store + window + registered_pos).
         if (kvmem_warm_capture && !kvmem_warm_checkpoint_staged) {
-            kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
-            executor_->capture_state(kvmem_warm_ckpt_prompt_);
             kvmem_warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             kvmem_warm_prompt_resumable =
                 kvmem_prompt_checkpoint_resumable(
                     kvmem_warm_source_index_ready);
+            kvmem_warm_capture_prompt_stage(
+                executor_, kvmem_warm_prompt_pos,
+                kvmem_warm_prompt_resumable);
         }
 #if 0  // Archived DeltaNet recurrent-state export.
         if (rebuilt_state_export) {
@@ -15356,57 +15507,12 @@ private:
         // do not initialize the sampler, draft/verify machinery, or decode KV.
         if (options.max_tokens == 0) {
             if (kvmem_warm_capture) {
-                kvmem_warm_log_ = prompt_tokens;
-                const size_t pos = executor_->position();
-                if (pos <= kvmem_warm_log_.size()) {
-                    kvmem_warm_log_.resize(pos);
-                    executor_->capture_state(kvmem_warm_ckpt_end_);
-                    const bool prompt_source_index_ready =
-                        kvmem_warm_source_index_ready &&
-                        executor_->kvmem_content_index_resume_compatible(
-                            kvmem_warm_prompt_pos);
-                    const bool end_source_index_ready =
-                        kvmem_warm_source_index_ready &&
-                        executor_->kvmem_content_index_resume_compatible(
-                            static_cast<uint32_t>(pos));
-                    const bool query_snapshot_ready =
-                        kvmem_capture_warm_query_snapshot(
-                            *executor_, options,
-                            qc_prepare && prompt_source_index_ready &&
-                                !query_guided_query);
-                    kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
-                    kvmem_warm_prompt_pos_ = kvmem_warm_prompt_pos;
-                    kvmem_warm_prompt_resumable_ =
-                        kvmem_warm_prompt_resumable;
-                    kvmem_warm_source_index_ready_ =
-                        prompt_source_index_ready;
-                    kvmem_warm_end_resumable_ =
-                        kvmem_prompt_checkpoint_resumable(
-                            end_source_index_ready);
-                    kvmem_warm_end_source_index_ready_ =
-                        end_source_index_ready;
-                    kvmem_warm_valid_ = true;
-                    if (kvmem_prefix_cache_trace_enabled()) {
-                        std::ostringstream cmsg;
-                        cmsg << "kvmem prefix-cache CAPTURE "
-                             << "(mtp prefill-only): warm_log="
-                             << kvmem_warm_log_.size() << " pos=" << pos
-                             << " P=" << kvmem_warm_prompt_pos
-                             << " P_resumable="
-                             << (kvmem_warm_prompt_resumable ? 1 : 0)
-                             << " P_source_index="
-                             << (prompt_source_index_ready ? 1 : 0)
-                             << " M_resumable="
-                             << (kvmem_warm_end_resumable_ ? 1 : 0)
-                             << " M_source_index="
-                             << (end_source_index_ready ? 1 : 0)
-                             << " query_snapshot="
-                             << (query_snapshot_ready ? 1 : 0);
-                        log(cmsg.str());
-                    }
-                } else {
-                    kvmem_warm_valid_ = false;
-                }
+                (void)kvmem_warm_commit_stage(
+                    executor_, prompt_tokens, {}, kvmem_warm_prompt_pos,
+                    kvmem_warm_prompt_resumable,
+                    kvmem_warm_source_index_ready, options,
+                    qc_prepare && !query_guided_query,
+                    "mtp_prefill_only", 0);
             }
             if (manage_device_scope) {
                 st = device_->end();
@@ -16265,64 +16371,16 @@ private:
         // resident). position() beyond the log (e.g. an accepted token committed
         // to KV but not emitted because max_tokens was hit) invalidates the warm
         // state instead of capturing an inconsistent checkpoint. Captured inside
-        // the device scope since capture_state issues device copies.
+        // the device scope because the pinned-host snapshot starts with
+        // asynchronous device-to-host copies.
         if (kvmem_warm_capture && !stream_cancelled) {
-            kvmem_warm_log_ = prompt_tokens;
-            kvmem_warm_log_.insert(kvmem_warm_log_.end(),
-                                   gen_tokens.begin(), gen_tokens.end());
-            const size_t pos = executor_->position();
-            if (pos <= kvmem_warm_log_.size()) {
-                kvmem_warm_log_.resize(pos);
-                executor_->capture_state(kvmem_warm_ckpt_end_);
-                const bool prompt_source_index_ready =
-                    kvmem_warm_source_index_ready &&
-                    executor_->kvmem_content_index_resume_compatible(
-                        kvmem_warm_prompt_pos);
-                const bool end_source_index_ready =
-                    kvmem_warm_source_index_ready &&
-                    executor_->kvmem_content_index_resume_compatible(
-                        static_cast<uint32_t>(pos));
-                const bool query_snapshot_ready =
-                    kvmem_capture_warm_query_snapshot(
-                        *executor_, options,
-                        qc_prepare && prompt_source_index_ready &&
-                            !query_guided_query);
-                // Commit the staged prompt-end (P) checkpoint alongside the
-                // turn-end (M) one; flip all warm fields together so a mid-decode
-                // throw leaves the prior turn's warm state intact.
-                kvmem_warm_end_pos_ = static_cast<uint32_t>(pos);
-                kvmem_warm_prompt_pos_ = kvmem_warm_prompt_pos;
-                kvmem_warm_prompt_resumable_ = kvmem_warm_prompt_resumable;
-                kvmem_warm_source_index_ready_ =
-                    prompt_source_index_ready;
-                kvmem_warm_end_resumable_ =
-                    kvmem_prompt_checkpoint_resumable(
-                        end_source_index_ready);
-                kvmem_warm_end_source_index_ready_ =
-                    end_source_index_ready;
-                kvmem_warm_valid_ = true;
-                if (kvmem_prefix_cache_trace_enabled()) {
-                    std::ostringstream cmsg;
-                    cmsg << "kvmem prefix-cache CAPTURE (mtp): warm_log="
-                         << kvmem_warm_log_.size() << " pos=" << pos
-                         << " P=" << kvmem_warm_prompt_pos
-                         << " P_resumable=" << (kvmem_warm_prompt_resumable ? 1 : 0)
-                         << " P_source_index="
-                         << (prompt_source_index_ready ? 1 : 0)
-                         << " M_resumable="
-                         << (kvmem_warm_end_resumable_ ? 1 : 0)
-                         << " M_source_index="
-                         << (end_source_index_ready ? 1 : 0)
-                         << " query_snapshot="
-                         << (query_snapshot_ready ? 1 : 0)
-                         << " decoded=" << decoded;
-                    log(cmsg.str());
-                }
-            } else {
-                kvmem_warm_valid_ = false;
-            }
-        } else if (stream_cancelled) {
-            kvmem_warm_valid_ = false;
+            (void)kvmem_warm_commit_stage(
+                executor_, prompt_tokens, gen_tokens,
+                kvmem_warm_prompt_pos, kvmem_warm_prompt_resumable,
+                kvmem_warm_source_index_ready, options,
+                qc_prepare && !query_guided_query, "mtp", decoded);
+        } else if (stream_cancelled && kvmem_warm_capture) {
+            kvmem_warm_abort_stage("stream_cancelled_mtp");
         }
 
         if (manage_device_scope) {
@@ -16829,12 +16887,12 @@ private:
     // ---- kvmem single-request prefix cache (QW3_KVMEM_PREFIX_CACHE) --------
     // Keeps the plain-route shared executor_ warm across requests. kvmem_warm_log_
     // is the full token sequence of the last request (prompt + committed decode
-    // tokens). Two resume checkpoints of that request are kept (a small ladder):
-    //   kvmem_warm_ckpt_end_    -- capture_state at turn end (position M, after
-    //                              decode). Reuse here needs the whole warm log
-    //                              to be a token prefix of the new prompt.
-    //   kvmem_warm_ckpt_prompt_ -- capture_state at prompt end (position P, after
-    //                              the post-prefill reselect, before decode). Lets
+    // tokens). Two pinned-host resume checkpoints form a small ladder:
+    //   kvmem_warm_ckpt_end_    -- turn end (position M, after decode). Reuse
+    //                              here needs the whole warm log to prefix the
+    //                              new prompt.
+    //   kvmem_warm_ckpt_prompt_ -- prompt end (position P, after the post-prefill
+    //                              reselect, before decode). Lets
     //                              a new prompt that diverges INSIDE the prior
     //                              response region [P,M) still resume at P and
     //                              re-prefill only [P,end) instead of the whole
@@ -16844,10 +16902,15 @@ private:
     //                              position-invariant source index.
     // On a new request we pick the largest checkpoint C in {M,P} with C <= D (the
     // longest common token prefix) and C < prompt.size(), restore it, rewind the
-    // block store to C (kvmem_truncate_to), and prefill [C,end).
+    // block store to C (kvmem_truncate_to), and prefill [C,end). The stage pair
+    // makes capture transactional: successful requests swap both host snapshots
+    // at commit, while cancellation discards staging and retains the physically
+    // valid part of the prior generation.
     std::vector<uint32_t> kvmem_warm_log_;
-    QwenExecutor::StateSnapshot kvmem_warm_ckpt_end_;
-    QwenExecutor::StateSnapshot kvmem_warm_ckpt_prompt_;
+    QwenExecutor::HostStateSnapshot kvmem_warm_ckpt_end_;
+    QwenExecutor::HostStateSnapshot kvmem_warm_ckpt_prompt_;
+    QwenExecutor::HostStateSnapshot kvmem_warm_stage_ckpt_end_;
+    QwenExecutor::HostStateSnapshot kvmem_warm_stage_ckpt_prompt_;
     uint32_t kvmem_warm_prompt_pos_ = 0;   // P (position of ckpt_prompt_)
     uint32_t kvmem_warm_end_pos_ = 0;      // M (position of ckpt_end_)
     bool kvmem_warm_prompt_resumable_ = false;  // ckpt_prompt_ safe to resume
@@ -16858,6 +16921,8 @@ private:
     uint32_t kvmem_warm_query_begin_ = 0;
     uint32_t kvmem_warm_query_end_ = 0;
     bool kvmem_warm_valid_ = false;
+    uint64_t kvmem_warm_generation_ = 0;
+    uint64_t kvmem_warm_next_generation_ = 1;
 
     // Generic API-level persistent session. The first implementation is
     // intentionally single-active-session because executor_ itself is a single
