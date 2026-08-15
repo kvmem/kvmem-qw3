@@ -1547,6 +1547,7 @@ private:
     void kvmem_flush_raw_k_capture(uint32_t true_base, uint32_t first_row,
                                    uint32_t rows);
     void kvmem_flush_raw_k_decode();
+    void kvmem_resolve_raw_k_decode_before_truncate(uint32_t token_pos);
     void kvmem_materialize_raw_k(
         const std::vector<const KvMemRemap *> &refreshes);
     void kvmem_ensure_rope_sincos_table();
