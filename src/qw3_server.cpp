@@ -471,6 +471,50 @@ size_t last_query_index_for_template(const json &messages) {
     return last_query;
 }
 
+struct RetrievalQueryMessageRange {
+    size_t begin = 0;
+    size_t end = 0;
+    bool tool_result = false;
+
+    bool valid() const { return end > begin; }
+};
+
+bool is_tool_result_message(const json &message) {
+    if (!message.is_object()) return false;
+    const std::string role = message.value("role", "");
+    if (role == "tool") return true;
+    if (role != "user") return false;
+    const std::string content = trim_ascii_ws(
+        message.contains("content") ? render_content(message["content"]) : "");
+    return is_tool_response_content(content);
+}
+
+// Retrieval follows the latest external input event. A normal user turn is one
+// message; parallel tool results are one contiguous event. Assistant tool-call
+// arguments remain in the model prompt but are deliberately excluded from the
+// retrieval query, since a large Write payload is an action rather than new
+// evidence returned to the model.
+RetrievalQueryMessageRange latest_retrieval_query_message_range(
+        const json &messages) {
+    if (!messages.is_array()) return {};
+    for (size_t end = messages.size(); end > 0; --end) {
+        const size_t index = end - 1;
+        const json &message = messages[index];
+        if (!message.is_object()) continue;
+        if (is_tool_result_message(message)) {
+            size_t begin = index;
+            while (begin > 0 && is_tool_result_message(messages[begin - 1])) {
+                --begin;
+            }
+            return RetrievalQueryMessageRange{begin, index + 1, true};
+        }
+        if (message.value("role", "") == "user") {
+            return RetrievalQueryMessageRange{index, index + 1, false};
+        }
+    }
+    return {};
+}
+
 enum class StreamPart {
     Reasoning,
     Content,
@@ -3382,15 +3426,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
 
-        // Query-conditioned KVMem: mark the final user message's token span so
-        // the executor selects the decode window by multi-token mean relevance
-        // to the question instead of recency. Computed by render-twice-and-diff
-        // (robust to chat template + BPE): re-render with the final user
-        // message's content emptied; the common-prefix-len + length-delta then
-        // brackets exactly the question content tokens (role markers / assistant
-        // suffix fall in the shared prefix/suffix). Only when the server was
-        // launched with --kvmem-query-conditioned; otherwise the span stays empty
-        // and selection is byte-identical to the single-token / recency path.
+        // Query-conditioned KVMem marks the latest external input event: either
+        // the final normal user message or the final contiguous tool-result
+        // group. Render-twice-and-diff maps the full event through the chat
+        // template without imposing a content-length cap.
         if (engine.kvmem_query_conditioned &&
             kvmem_reselect_mode != KvMemReselectMode::Off) {
             const json &msgs = req["messages"];
@@ -3819,14 +3858,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 }
             }
 
-            // Existing default behavior is deliberately unchanged when the
-            // explicit field is absent: use the complete final user message.
+            // Default event query: tool clients commonly append one or more
+            // role=tool messages after the original user request. Those results
+            // are the new evidence for the next agent step and replace the stale
+            // original question as the retrieval query. Assistant tool-call
+            // arguments remain in the prompt but are not part of the query.
             if (!explicit_span && !req.contains("kvmem_query_span")) {
-                const size_t lqi = last_query_index_for_template(msgs);
-                if (lqi < msgs.size() && msgs[lqi].is_object() &&
-                    msgs[lqi].value("role", "") == "user") {
+                const RetrievalQueryMessageRange range =
+                    latest_retrieval_query_message_range(msgs);
+                if (range.valid()) {
                     json msgs_empty = msgs;
-                    msgs_empty[lqi]["content"] = "";
+                    for (size_t i = range.begin; i < range.end; ++i) {
+                        msgs_empty[i]["content"] = "";
+                    }
                     const std::string empty_prompt = render_messages(
                         msgs_empty, tools, enable_thinking,
                         preserve_thinking, forced_tool_name,
@@ -3836,27 +3880,49 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         usage_tokenizer.encode(prompt);
                     const std::vector<int32_t> tok_empty =
                         usage_tokenizer.encode(empty_prompt);
-                    if (tok_full.size() > tok_empty.size()) {
+                    if (tok_full != tok_empty) {
                         size_t qb = 0;
-                        const size_t maxn = tok_empty.size();
-                        while (qb < maxn && tok_full[qb] == tok_empty[qb]) ++qb;
-                        const size_t qe =
-                            qb + (tok_full.size() - tok_empty.size());
-                        g.kvmem_query_begin = static_cast<uint32_t>(qb);
-                        g.kvmem_query_end = static_cast<uint32_t>(qe);
-                        std::cerr << "[qw3-serve] kvmem query span [" << qb
-                                  << "," << qe << ") of " << tok_full.size()
-                                  << " prompt tokens\n";
-                        if (std::getenv("QW3_KVMEM_TRACE")) {
-                            const std::vector<int32_t> slice(
-                                tok_full.begin() + static_cast<long>(qb),
-                                tok_full.begin() + static_cast<long>(qe));
-                            std::string txt = usage_tokenizer.decode(slice);
-                            if (txt.size() > 200)
-                                txt = txt.substr(0, 200) + "...";
+                        const size_t prefix_max =
+                            std::min(tok_full.size(), tok_empty.size());
+                        while (qb < prefix_max &&
+                               tok_full[qb] == tok_empty[qb]) {
+                            ++qb;
+                        }
+                        size_t suffix = 0;
+                        while (suffix < tok_full.size() - qb &&
+                               suffix < tok_empty.size() - qb &&
+                               tok_full[tok_full.size() - 1 - suffix] ==
+                                   tok_empty[tok_empty.size() - 1 - suffix]) {
+                            ++suffix;
+                        }
+                        const size_t qe = tok_full.size() - suffix;
+                        if (qe <= qb) {
                             std::cerr
-                                << "[qw3-serve] kvmem query span text: \""
-                                << txt << "\"\n";
+                                << "[qw3-serve] kvmem query event mapped to "
+                                   "an empty token span; query conditioning "
+                                   "skipped\n";
+                        } else {
+                            g.kvmem_query_begin = static_cast<uint32_t>(qb);
+                            g.kvmem_query_end = static_cast<uint32_t>(qe);
+                            std::cerr
+                                << "[qw3-serve] kvmem "
+                                << (range.tool_result ? "tool-result" : "user")
+                                << " query messages=[" << range.begin << ","
+                                << range.end << ") span=[" << qb << "," << qe
+                                << ") tokens=" << (qe - qb)
+                                << " prompt_tokens=" << tok_full.size() << "\n";
+                            if (std::getenv("QW3_KVMEM_TRACE")) {
+                                const std::vector<int32_t> slice(
+                                    tok_full.begin() + static_cast<long>(qb),
+                                    tok_full.begin() + static_cast<long>(qe));
+                                std::string txt = usage_tokenizer.decode(slice);
+                                if (txt.size() > 200) {
+                                    txt = txt.substr(0, 200) + "...";
+                                }
+                                std::cerr
+                                    << "[qw3-serve] kvmem query span text: \""
+                                    << txt << "\"\n";
+                            }
                         }
                     }
                 }

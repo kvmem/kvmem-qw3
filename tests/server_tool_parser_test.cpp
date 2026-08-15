@@ -181,6 +181,58 @@ void test_uncommitted_call_is_not_silently_repaired() {
     }
 }
 
+void expect_query_range(const json &messages, size_t begin, size_t end,
+                        bool tool_result) {
+    const qw3::RetrievalQueryMessageRange range =
+        qw3::latest_retrieval_query_message_range(messages);
+    if (!range.valid() || range.begin != begin || range.end != end ||
+        range.tool_result != tool_result) {
+        fail("latest retrieval query message range was incorrect");
+    }
+}
+
+void test_latest_external_input_query() {
+    expect_query_range(
+        json::array({
+            json{{"role", "user"}, {"content", "initial request"}},
+            json{{"role", "assistant"}, {"content", "answer"}},
+            json{{"role", "user"}, {"content", "follow-up"}},
+        }),
+        2, 3, false);
+
+    const std::string large_result(1024 * 1024, 'x');
+    const json tool_messages = json::array({
+        json{{"role", "user"}, {"content", "inspect the project"}},
+        json{{"role", "assistant"},
+             {"tool_calls",
+              json::array({
+                  json{{"function",
+                        json{{"name", "read"},
+                             {"arguments", R"({"path":"/tmp/a"})"}}}},
+                  json{{"function",
+                        json{{"name", "read"},
+                             {"arguments", R"({"path":"/tmp/b"})"}}}},
+              })}},
+        json{{"role", "tool"}, {"content", large_result}},
+        json{{"role", "tool"}, {"content", "second result"}},
+    });
+    expect_query_range(tool_messages, 2, 4, true);
+    if (tool_messages[2]["content"].get<std::string>().size() !=
+        large_result.size()) {
+        fail("large tool result was truncated");
+    }
+
+    expect_query_range(
+        json::array({
+            json{{"role", "user"}, {"content", "initial request"}},
+            json{{"role", "assistant"}, {"content", "tool call"}},
+            json{{"role", "user"},
+                 {"content",
+                  "<tool_response>\ncomplete output\n</tool_response>"}},
+        }),
+        2, 3, true);
+}
+
 } // namespace
 
 int main() {
@@ -190,6 +242,7 @@ int main() {
     test_incomplete_block_fails_closed();
     test_incremental_commit_gate();
     test_uncommitted_call_is_not_silently_repaired();
+    test_latest_external_input_query();
     std::cout << "server_tool_parser_test: ok\n";
     return 0;
 }

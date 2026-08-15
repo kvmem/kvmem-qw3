@@ -221,6 +221,47 @@ constexpr KvmemQueryLifecycle kvmem_query_lifecycle(
     return out;
 }
 
+struct KvmemReplayCapacity {
+    bool fits = false;
+    uint32_t boundary = 0;
+    uint32_t suffix_blocks = 0;
+    uint32_t required_blocks = 0;
+    uint32_t budget_blocks = 0;
+};
+
+KvmemReplayCapacity kvmem_replay_capacity(
+        const QwenExecutor *executor, uint32_t replay_boundary,
+        uint32_t logical_prompt_end) {
+    KvmemReplayCapacity out;
+    out.boundary = replay_boundary;
+    if (!executor || !executor->block_store() || replay_boundary == 0 ||
+        replay_boundary >= logical_prompt_end) {
+        return out;
+    }
+    const KvMemStore *store = executor->block_store();
+    const uint32_t bt =
+        std::max<uint32_t>(1, store->config().block_tokens);
+    out.budget_blocks = store->budget_blocks();
+    if (out.budget_blocks == 0) return out;
+
+    const uint64_t total_blocks =
+        (static_cast<uint64_t>(logical_prompt_end) + bt - 1) / bt;
+    const uint64_t boundary_block = replay_boundary / bt;
+    if (boundary_block >= total_blocks) return out;
+    const uint64_t sink_blocks =
+        std::min<uint64_t>(store->config().sink_blocks, total_blocks);
+    const uint64_t suffix_blocks = total_blocks - boundary_block;
+    const uint64_t required_blocks = boundary_block < sink_blocks
+        ? total_blocks
+        : sink_blocks + suffix_blocks;
+    out.suffix_blocks = static_cast<uint32_t>(
+        std::min<uint64_t>(suffix_blocks, UINT32_MAX));
+    out.required_blocks = static_cast<uint32_t>(
+        std::min<uint64_t>(required_blocks, UINT32_MAX));
+    out.fits = required_blocks <= out.budget_blocks;
+    return out;
+}
+
 static_assert(kvmem_query_lifecycle(
     true, 229282, 229376, true, true, true).prepare);
 static_assert(!kvmem_query_lifecycle(
@@ -10842,13 +10883,45 @@ private:
         // The per-token index can't be fixed-stride, so above-budget per-token
         // still declines (captured as a non-resumable P below).
         const bool qc_pertoken_here = executor_->kvmem_qc_pertoken();
-        const bool recompute_query =
+        const bool recompute_query_requested =
             executor_->kvmem_enabled() && qc_select_active &&
             (semantic_chunk ||
              kvmem_recompute_query_enabled(options_.kvmem_recompute_query)) &&
             dump == nullptr && executor_->block_store() &&
             kvmem_query_replay_retrieval_supported(
                 executor_->block_store()->config().retrieval_method);
+        uint32_t replay_boundary_candidate = 0;
+        if (recompute_query_requested) {
+            const uint32_t bt = std::max<uint32_t>(
+                1, executor_->block_store()->config().block_tokens);
+            replay_boundary_candidate = ru.query_snapshot_reuse
+                ? reuse_m
+                : (options.kvmem_query_begin / bt) * bt;
+        }
+        const KvmemReplayCapacity replay_capacity =
+            recompute_query_requested
+                ? kvmem_replay_capacity(
+                      executor_.get(), replay_boundary_candidate,
+                      static_cast<uint32_t>(prompt_tokens.size()))
+                : KvmemReplayCapacity{};
+        const bool recompute_query =
+            recompute_query_requested && replay_capacity.fits;
+        if (recompute_query_requested && !recompute_query) {
+            log("native kvmem query replay fallback (plain): boundary=" +
+                std::to_string(replay_capacity.boundary) +
+                " suffix_blocks=" +
+                std::to_string(replay_capacity.suffix_blocks) +
+                " required_blocks=" +
+                std::to_string(replay_capacity.required_blocks) +
+                " budget_blocks=" +
+                std::to_string(replay_capacity.budget_blocks) +
+                " mode=single-pass-query-selection");
+        }
+        if (semantic_chunk && recompute_query_requested && !recompute_query) {
+            throw std::invalid_argument(
+                "KVMem semantic-chunk replay suffix exceeds the selection "
+                "budget");
+        }
         if (query_attention_probe && !recompute_query) {
             throw std::invalid_argument(
                 "KVMem query attention probe requires the query-recompute/"
@@ -10870,15 +10943,7 @@ private:
         QwenExecutor::StateSnapshot query_replay_ckpt;
         uint32_t query_replay_begin = 0;
         if (recompute_query) {
-            const uint32_t bt = std::max<uint32_t>(
-                1, executor_->block_store()->config().block_tokens);
-            query_replay_begin = ru.query_snapshot_reuse
-                ? reuse_m
-                : (options.kvmem_query_begin / bt) * bt;
-            if (query_replay_begin == 0) {
-                throw std::runtime_error(
-                    "KVMem query replay requires a non-zero aligned boundary");
-            }
+            query_replay_begin = replay_capacity.boundary;
         }
         uint32_t warm_prompt_pos = 0;
         bool warm_prompt_resumable = false;
@@ -12234,7 +12299,7 @@ private:
             kvmem_on && qc_select_active && kvmem_clean_query_enabled() &&
             !transcript_replay && !query_replay &&
             !kvmem_warm_reuse && !kvmem_warm_capture && dump == nullptr;
-        const bool recompute_query =
+        const bool recompute_query_requested =
             kvmem_on && qc_select_active &&
             (semantic_chunk ||
              kvmem_recompute_query_enabled(options_.kvmem_recompute_query)) &&
@@ -12242,6 +12307,38 @@ private:
             dump == nullptr && executor_->block_store() &&
             kvmem_query_replay_retrieval_supported(
                 executor_->block_store()->config().retrieval_method);
+        uint32_t replay_boundary_candidate = 0;
+        if (recompute_query_requested) {
+            const uint32_t bt = std::max<uint32_t>(
+                1, executor_->block_store()->config().block_tokens);
+            replay_boundary_candidate = kvmem_ru.query_snapshot_reuse
+                ? kvmem_reuse_m
+                : (kvmem_effective_replay_begin(options) / bt) * bt;
+        }
+        const KvmemReplayCapacity replay_capacity =
+            recompute_query_requested
+                ? kvmem_replay_capacity(
+                      executor_, replay_boundary_candidate,
+                      logical_prompt_tokens)
+                : KvmemReplayCapacity{};
+        const bool recompute_query =
+            recompute_query_requested && replay_capacity.fits;
+        if (recompute_query_requested && !recompute_query) {
+            log("native kvmem query replay fallback (mtp): boundary=" +
+                std::to_string(replay_capacity.boundary) +
+                " suffix_blocks=" +
+                std::to_string(replay_capacity.suffix_blocks) +
+                " required_blocks=" +
+                std::to_string(replay_capacity.required_blocks) +
+                " budget_blocks=" +
+                std::to_string(replay_capacity.budget_blocks) +
+                " mode=single-pass-query-selection");
+        }
+        if (semantic_chunk && recompute_query_requested && !recompute_query) {
+            throw std::invalid_argument(
+                "KVMem semantic-chunk replay suffix exceeds the selection "
+                "budget");
+        }
         const bool query_attention_probe_requested =
             options.kvmem_query_attention_probe_tokens != 0 ||
             options.kvmem_query_attention_score_tokens != 0;
@@ -12683,15 +12780,7 @@ private:
         QwenExecutor::StateSnapshot kvmem_query_replay_ckpt;
         uint32_t kvmem_query_replay_begin = 0;
         if (recompute_query) {
-            const uint32_t bt = std::max<uint32_t>(
-                1, executor_->block_store()->config().block_tokens);
-            kvmem_query_replay_begin = kvmem_ru.query_snapshot_reuse
-                ? kvmem_reuse_m
-                : (kvmem_effective_replay_begin(options) / bt) * bt;
-            if (kvmem_query_replay_begin == 0) {
-                throw std::runtime_error(
-                    "KVMem query replay requires a non-zero aligned boundary");
-            }
+            kvmem_query_replay_begin = replay_capacity.boundary;
             if (api_session &&
                 kvmem_query_replay_begin < api_append_base) {
                 if (!kvmem_api_boundary_ckpt_.ready ||
