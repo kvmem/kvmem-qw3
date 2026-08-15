@@ -503,6 +503,20 @@ public:
                !kvmem_qc_pertoken_ && !kvmem_qc_deltanet_ &&
                kvmem_qc_captured_tokens_ >= tokens;
     }
+    // A checkpoint may resume incremental index capture only when the suffix
+    // layout accepted by that index starts at `tokens`. Fixed Mean-K can merge
+    // a partial boundary block; Adaptive prototypes currently require a sealed
+    // block boundary and must fall back from an unaligned M checkpoint to the
+    // aligned P checkpoint instead.
+    bool kvmem_content_index_resume_compatible(uint32_t tokens) const {
+        if (!kvmem_content_index_covers(tokens)) return false;
+        if (!kvmem_adaptive_prototypes()) return true;
+        const uint32_t bt = block_store_
+            ? std::max<uint32_t>(
+                  1, block_store_->config().block_tokens)
+            : 1;
+        return tokens % bt == 0;
+    }
     uint32_t window_query_pos() const { return window_query_pos_; }
     uint32_t window_page_count() const { return window_page_count_; }
     const std::vector<int32_t> &window_pages_host() const {
