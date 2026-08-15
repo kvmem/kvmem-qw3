@@ -251,6 +251,15 @@ if(QW3_BUILD_TESTS)
     target_link_libraries(qw3-tool-call-stream PRIVATE qw3_core)
     add_test(NAME qw3-tool-call-stream COMMAND qw3-tool-call-stream)
 
+    add_executable(qw3-server-tool-parser
+        tests/server_tool_parser_test.cpp)
+    target_include_directories(qw3-server-tool-parser PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(qw3-server-tool-parser SYSTEM PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+    target_link_libraries(qw3-server-tool-parser PRIVATE qw3_core)
+    add_test(NAME qw3-server-tool-parser COMMAND qw3-server-tool-parser)
+
     add_executable(qw3-chat-template-policy
         tests/chat_template_policy_test.cpp)
     target_include_directories(qw3-chat-template-policy PRIVATE

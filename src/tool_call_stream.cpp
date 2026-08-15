@@ -93,6 +93,41 @@ bool CanonicalToolCallStreamParser::finish(
     return true;
 }
 
+bool CanonicalToolCallStreamParser::finish_with_closure_repair(
+        std::vector<ToolCallStreamEvent> &events,
+        std::string &synthesized_suffix) {
+    synthesized_suffix.clear();
+    if (!feed({}, events)) return false;
+    if (complete()) return true;
+
+    static const std::string parameter_close = "</parameter>";
+    static const std::string function_close = "</function>";
+    static const std::string tool_close = "</tool_call>";
+
+    if (state_ == State::ParameterValue &&
+        is_prefix_of(pending_, parameter_close)) {
+        synthesized_suffix =
+            parameter_close.substr(pending_.size()) +
+            function_close + tool_close;
+    } else if (state_ == State::ParameterOrFunctionEnd &&
+               is_prefix_of(pending_, function_close)) {
+        synthesized_suffix =
+            function_close.substr(pending_.size()) + tool_close;
+    } else if (state_ == State::ToolEnd &&
+               is_prefix_of(pending_, tool_close)) {
+        synthesized_suffix = tool_close.substr(pending_.size());
+    } else {
+        fail("incomplete canonical tool call is not closure-repairable");
+        return false;
+    }
+
+    if (!feed(synthesized_suffix, events) || !complete()) {
+        if (!failed()) fail("canonical tool closure repair did not complete");
+        return false;
+    }
+    return true;
+}
+
 void CanonicalToolCallStreamParser::consume_whitespace() {
     size_t count = 0;
     while (count < pending_.size() &&

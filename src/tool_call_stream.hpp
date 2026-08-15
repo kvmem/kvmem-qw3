@@ -37,6 +37,9 @@ public:
     bool feed(const std::string &text,
               std::vector<ToolCallStreamEvent> &events);
     bool finish(std::vector<ToolCallStreamEvent> &events);
+    bool finish_with_closure_repair(
+        std::vector<ToolCallStreamEvent> &events,
+        std::string &synthesized_suffix);
 
     bool started() const { return started_; }
     bool complete() const { return state_ == State::Complete; }

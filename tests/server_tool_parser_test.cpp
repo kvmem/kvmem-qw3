@@ -1,0 +1,195 @@
+#include "../src/qw3_server.cpp"
+
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
+namespace {
+
+using json = nlohmann::json;
+
+[[noreturn]] void fail(const std::string &message) {
+    std::cerr << "server_tool_parser_test: " << message << "\n";
+    std::exit(1);
+}
+
+json string_tool(const std::string &name,
+                 const json &properties,
+                 const json &required) {
+    return json{
+        {"type", "function"},
+        {"function",
+         json{{"name", name},
+              {"parameters",
+               json{{"type", "object"},
+                    {"properties", properties},
+                    {"required", required},
+                    {"additionalProperties", false}}}}}};
+}
+
+json write_tool(const std::string &name = "write") {
+    return string_tool(
+        name,
+        json{{"path", json{{"type", "string"}}},
+             {"content", json{{"type", "string"}}}},
+        json::array({"path", "content"}));
+}
+
+void test_valid_and_no_intent() {
+    const json tools = json::array({write_tool()});
+    const auto none = qw3::parse_tool_calls_xml("ordinary answer", &tools);
+    if (!none.valid || none.intent_detected || !none.calls.empty()) {
+        fail("ordinary text was classified as malformed tool intent");
+    }
+
+    const auto parsed = qw3::parse_tool_calls_xml(
+        "<tool_call><function=write>"
+        "<parameter=path>/tmp/a</parameter>"
+        "<parameter=content>hello</parameter>"
+        "</function></tool_call>",
+        &tools);
+    if (!parsed.valid || !parsed.intent_detected ||
+        parsed.calls.size() != 1) {
+        fail("valid canonical tool call was rejected");
+    }
+}
+
+void test_missing_function_inference_and_ambiguous_case() {
+    const std::string missing_function =
+        "<tool_call>"
+        "<parameter=path>/tmp/a</parameter>"
+        "<parameter=content>hello</parameter>"
+        "</tool_call>";
+
+    const json unique_tools = json::array({write_tool()});
+    const auto inferred =
+        qw3::parse_tool_calls_xml(missing_function, &unique_tools);
+    if (!inferred.valid || inferred.calls.size() != 1 ||
+        inferred.calls.front()["function"].value("name", "") != "write") {
+        fail("unambiguous missing function name was not recovered");
+    }
+
+    const json ambiguous_tools =
+        json::array({write_tool("write"), write_tool("replace")});
+    const auto ambiguous =
+        qw3::parse_tool_calls_xml(missing_function, &ambiguous_tools);
+    if (!ambiguous.intent_detected || ambiguous.valid ||
+        !ambiguous.calls.empty()) {
+        fail("ambiguous missing function name was not rejected");
+    }
+}
+
+void test_schema_validation() {
+    const json tools = json::array({write_tool()});
+    const auto missing = qw3::parse_tool_calls_xml(
+        "<tool_call><function=write>"
+        "<parameter=path>/tmp/a</parameter>"
+        "</function></tool_call>",
+        &tools);
+    if (missing.valid ||
+        missing.error.find("missing required property") ==
+            std::string::npos) {
+        fail("missing required argument was accepted");
+    }
+
+    const json count_tools = json::array({string_tool(
+        "count",
+        json{{"value", json{{"type", "integer"}}}},
+        json::array({"value"}))});
+    const auto wrong_type = qw3::parse_tool_calls_xml(
+        "<tool_call><function=count>"
+        "<parameter=value>not-an-integer</parameter>"
+        "</function></tool_call>",
+        &count_tools);
+    if (wrong_type.valid ||
+        wrong_type.error.find("wrong JSON type") == std::string::npos) {
+        fail("wrong schema type was accepted");
+    }
+
+    const auto unknown = qw3::parse_tool_calls_xml(
+        "<tool_call><function=write>"
+        "<parameter=path>/tmp/a</parameter>"
+        "<parameter=content>hello</parameter>"
+        "<parameter=extra>bad</parameter>"
+        "</function></tool_call>",
+        &tools);
+    if (unknown.valid ||
+        unknown.error.find("unknown property") == std::string::npos) {
+        fail("additionalProperties=false was ignored");
+    }
+}
+
+void test_incomplete_block_fails_closed() {
+    const json tools = json::array({write_tool()});
+    const auto incomplete = qw3::parse_tool_calls_xml(
+        "<tool_call><parameter=path>/tmp/a</parameter>", &tools);
+    if (!incomplete.intent_detected || incomplete.valid) {
+        fail("incomplete tool block was not rejected");
+    }
+    const std::string error =
+        qw3::tool_call_parse_error_message(incomplete.error);
+    if (error !=
+        "tool_call_parse_error: incomplete <tool_call> block") {
+        fail("malformed tool call did not produce a stable parse error");
+    }
+}
+
+void test_incremental_commit_gate() {
+    const json tools = json::array({write_tool()});
+    qw3::IncrementalToolCallStream stream(&tools);
+    stream.feed(
+        "<tool_call><function=write>"
+        "<parameter=path>/tmp/a</parameter>");
+    if (stream.ready_to_commit()) {
+        fail("stream committed before every required parameter appeared");
+    }
+    stream.feed("<parameter=content>hello");
+    if (!stream.ready_to_commit()) {
+        fail("stream did not become committable after required parameters");
+    }
+
+    std::string suffix;
+    stream.finish(true, suffix);
+    if (stream.fatal() || suffix.empty()) {
+        fail("committed stream closure repair failed");
+    }
+    const json call = stream.finalized_call();
+    std::string validation_error;
+    if (!qw3::validate_tool_call(call, &tools, validation_error)) {
+        fail("repaired incremental call failed schema validation: " +
+             validation_error);
+    }
+    const json arguments =
+        json::parse(call["function"].value("arguments", ""));
+    if (arguments.value("content", "") != "hello") {
+        fail("repaired incremental call lost its content");
+    }
+}
+
+void test_uncommitted_call_is_not_silently_repaired() {
+    const json tools = json::array({write_tool()});
+    qw3::IncrementalToolCallStream stream(&tools);
+    stream.feed(
+        "<tool_call><function=write>"
+        "<parameter=path>/tmp/a</parameter>"
+        "<parameter=content>partial");
+
+    std::string suffix;
+    stream.finish(false, suffix);
+    if (!stream.fatal() || !suffix.empty()) {
+        fail("uncommitted partial tool call was silently repaired");
+    }
+}
+
+} // namespace
+
+int main() {
+    test_valid_and_no_intent();
+    test_missing_function_inference_and_ambiguous_case();
+    test_schema_validation();
+    test_incomplete_block_fails_closed();
+    test_incremental_commit_gate();
+    test_uncommitted_call_is_not_silently_repaired();
+    std::cout << "server_tool_parser_test: ok\n";
+    return 0;
+}
