@@ -113,6 +113,7 @@ add_library(qw3_core
     src/kvmem_store.cpp
     src/kvmem_archive.cpp
     src/tool_call_stream.cpp
+    src/tool_structure_constraint.cpp
     src/tokenizer.cpp
 )
 
@@ -250,6 +251,14 @@ if(QW3_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(qw3-tool-call-stream PRIVATE qw3_core)
     add_test(NAME qw3-tool-call-stream COMMAND qw3-tool-call-stream)
+
+    add_executable(qw3-tool-structure-constraint
+        tests/tool_structure_constraint_test.cpp)
+    target_include_directories(qw3-tool-structure-constraint PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(qw3-tool-structure-constraint PRIVATE qw3_core)
+    add_test(NAME qw3-tool-structure-constraint
+        COMMAND qw3-tool-structure-constraint)
 
     add_executable(qw3-server-tool-parser
         tests/server_tool_parser_test.cpp)

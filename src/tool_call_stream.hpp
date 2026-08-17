@@ -40,6 +40,9 @@ public:
     bool finish_with_closure_repair(
         std::vector<ToolCallStreamEvent> &events,
         std::string &synthesized_suffix);
+    bool finish_with_structural_closure_repair(
+        std::vector<ToolCallStreamEvent> &events,
+        std::string &synthesized_suffix);
 
     bool started() const { return started_; }
     bool complete() const { return state_ == State::Complete; }
@@ -64,6 +67,10 @@ private:
     };
 
     bool parse(std::vector<ToolCallStreamEvent> &events);
+    bool finish_with_closure_repair_impl(
+        std::vector<ToolCallStreamEvent> &events,
+        std::string &synthesized_suffix,
+        bool allow_parameter_value_close);
     bool consume_exact(const std::string &tag, const char *label);
     void consume_whitespace();
     void fail(std::string message);

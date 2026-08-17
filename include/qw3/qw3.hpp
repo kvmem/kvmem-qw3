@@ -219,6 +219,26 @@ struct EngineOptions {
     uint64_t kvmem_archive_ladder_tokens = 0;
 };
 
+// Request-local tool-call grammar compiled by the serving layer from the
+// OpenAI tools[].function.parameters schemas. The native decoder deliberately
+// keeps this representation small: values remain model-generated text, while
+// function names, parameter names, required fields, and canonical Qwen tags
+// are constrained during token selection.
+struct ToolStructureParameter {
+    std::string name;
+    bool required = false;
+};
+
+struct ToolStructureFunction {
+    std::string name;
+    std::vector<ToolStructureParameter> parameters;
+    bool allow_additional_parameters = true;
+};
+
+struct ToolStructureConstraintSpec {
+    std::vector<ToolStructureFunction> functions;
+};
+
 struct GenerationOptions {
     int max_tokens = 256;
     float temperature = 0.6f;
@@ -251,6 +271,10 @@ struct GenerationOptions {
     // Whether the prompt already opened a <think> block (enable_thinking). The
     // budget counter only runs while a think block is open.
     bool thinking_open = false;
+    // Optional canonical Qwen tool-call grammar. It is populated from the
+    // current request's tools schema, never from client identity or a global
+    // server-side schema registry.
+    std::shared_ptr<const ToolStructureConstraintSpec> tool_structure;
     // Generic multi-request KVMem controls. These describe inference behavior;
     // dataset/session parsing remains entirely in the caller.
     KvMemReselectMode kvmem_reselect_mode = KvMemReselectMode::Auto;

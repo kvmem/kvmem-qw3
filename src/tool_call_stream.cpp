@@ -96,6 +96,21 @@ bool CanonicalToolCallStreamParser::finish(
 bool CanonicalToolCallStreamParser::finish_with_closure_repair(
         std::vector<ToolCallStreamEvent> &events,
         std::string &synthesized_suffix) {
+    return finish_with_closure_repair_impl(
+        events, synthesized_suffix, true);
+}
+
+bool CanonicalToolCallStreamParser::finish_with_structural_closure_repair(
+        std::vector<ToolCallStreamEvent> &events,
+        std::string &synthesized_suffix) {
+    return finish_with_closure_repair_impl(
+        events, synthesized_suffix, false);
+}
+
+bool CanonicalToolCallStreamParser::finish_with_closure_repair_impl(
+        std::vector<ToolCallStreamEvent> &events,
+        std::string &synthesized_suffix,
+        bool allow_parameter_value_close) {
     synthesized_suffix.clear();
     if (!feed({}, events)) return false;
     if (complete()) return true;
@@ -104,7 +119,8 @@ bool CanonicalToolCallStreamParser::finish_with_closure_repair(
     static const std::string function_close = "</function>";
     static const std::string tool_close = "</tool_call>";
 
-    if (state_ == State::ParameterValue &&
+    if (allow_parameter_value_close &&
+        state_ == State::ParameterValue &&
         is_prefix_of(pending_, parameter_close)) {
         synthesized_suffix =
             parameter_close.substr(pending_.size()) +

@@ -5,6 +5,7 @@
 #include "qwen_executor.hpp"
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
+#include "tool_structure_constraint.hpp"
 #include "qw3/device_backend.hpp"
 #include "qw3/tokenizer.hpp"
 
@@ -437,6 +438,111 @@ int32_t sample_token(const std::vector<float> &logits, float temp, float top_p,
     return sample_from(sampling_distribution(logits, temp, top_p, top_k, min_p), rng);
 }
 
+bool mask_tool_structure_logits(
+        std::vector<float> &logits,
+        const detail::ToolStructureConstraint &constraint,
+        const std::vector<std::string> &token_pieces) {
+    const size_t n = std::min(logits.size(), token_pieces.size());
+    bool any_finite = false;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        const bool allowed =
+            i < n && constraint.allows_piece(token_pieces[i]);
+        if (!allowed) {
+            logits[i] = -std::numeric_limits<float>::infinity();
+        } else if (std::isfinite(logits[i])) {
+            any_finite = true;
+        }
+    }
+    return any_finite;
+}
+
+int32_t sample_tool_structure_token(
+        std::vector<float> &logits, float temp, float top_p, int top_k,
+        float min_p, std::mt19937_64 &rng,
+        const detail::ToolStructureConstraint &constraint,
+        const std::vector<std::string> &token_pieces) {
+    if (constraint.requires_full_mask()) {
+        if (!mask_tool_structure_logits(logits, constraint, token_pieces)) {
+            throw std::runtime_error(
+                "tool structure constraint has no finite legal token in state " +
+                constraint.state_name());
+        }
+        return sample_token(logits, temp, top_p, top_k, min_p, rng);
+    }
+
+    const int32_t candidate =
+        sample_token(logits, temp, top_p, top_k, min_p, rng);
+    if (candidate >= 0 &&
+        static_cast<size_t>(candidate) < token_pieces.size() &&
+        constraint.allows_piece(token_pieces[static_cast<size_t>(candidate)])) {
+        return candidate;
+    }
+    // Outside a tool call and inside a free-form parameter value, nearly every
+    // token is legal. Only pay the full-vocabulary scan when a sampled token
+    // crosses a structural boundary in an invalid way.
+    if (!mask_tool_structure_logits(logits, constraint, token_pieces)) {
+        throw std::runtime_error(
+            "tool structure constraint rejected every token in state " +
+            constraint.state_name());
+    }
+    return sample_token(logits, temp, top_p, top_k, min_p, rng);
+}
+
+std::vector<float> constrained_target_distribution(
+        std::vector<float> row, float temp, float top_p, int top_k,
+        float min_p, const detail::ToolStructureConstraint *constraint,
+        const std::vector<std::string> *token_pieces) {
+    auto distribution = [&](const std::vector<float> &values) {
+        if (temp > 0.0f) {
+            return sampling_distribution(values, temp, top_p, top_k, min_p);
+        }
+        std::vector<float> p(values.size(), 0.0f);
+        if (!values.empty()) {
+            int best = 0;
+            float best_value = values[0];
+            for (int i = 1; i < static_cast<int>(values.size()); ++i) {
+                if (values[i] > best_value) {
+                    best_value = values[i];
+                    best = i;
+                }
+            }
+            p[best] = 1.0f;
+        }
+        return p;
+    };
+
+    if (!constraint || !token_pieces) return distribution(row);
+    if (constraint->requires_full_mask()) {
+        if (!mask_tool_structure_logits(row, *constraint, *token_pieces)) {
+            throw std::runtime_error(
+                "MTP tool structure constraint has no legal target token");
+        }
+        return distribution(row);
+    }
+
+    std::vector<float> p = distribution(row);
+    double legal_sum = 0.0;
+    for (size_t i = 0; i < p.size(); ++i) {
+        if (p[i] <= 0.0f) continue;
+        if (i >= token_pieces->size() ||
+            !constraint->allows_piece((*token_pieces)[i])) {
+            p[i] = 0.0f;
+        } else {
+            legal_sum += p[i];
+        }
+    }
+    if (legal_sum > 0.0) {
+        const float inv = static_cast<float>(1.0 / legal_sum);
+        for (float &probability : p) probability *= inv;
+        return p;
+    }
+    if (!mask_tool_structure_logits(row, *constraint, *token_pieces)) {
+        throw std::runtime_error(
+            "MTP tool structure constraint rejected every target token");
+    }
+    return distribution(row);
+}
+
 struct SpecAcceptResult {
     uint32_t accepted = 0;     // number of leading drafts accepted
     int32_t extra_token = -1;  // residual (on reject) or bonus (on full accept)
@@ -458,7 +564,9 @@ SpecAcceptResult speculative_accept_pointmass(
         float temp, float top_p, int top_k, float min_p,
         float presence_penalty, float repetition_penalty,
         const std::unordered_map<uint32_t, uint32_t> &seen,
-        std::mt19937_64 &rng) {
+        std::mt19937_64 &rng,
+        const std::vector<detail::ToolStructureConstraint> *row_constraints = nullptr,
+        const std::vector<std::string> *token_pieces = nullptr) {
     SpecAcceptResult r;
     std::unordered_map<uint32_t, uint32_t> ctx = seen;
     std::uniform_real_distribution<double> unit(0.0, 1.0);
@@ -467,23 +575,19 @@ SpecAcceptResult speculative_accept_pointmass(
     // sampling distribution; temp<=0 collapses to a point mass at the argmax so
     // the accept test reproduces greedy decoding (now over the penalized logits),
     // letting penalties apply correctly even when sampling is off.
-    auto target_dist = [&](const std::vector<float> &row) -> std::vector<float> {
-        if (temp > 0.0f)
-            return sampling_distribution(row, temp, top_p, top_k, min_p);
-        std::vector<float> p(row.size(), 0.0f);
-        if (!row.empty()) {
-            int best = 0;
-            float bv = row[0];
-            for (int i = 1; i < static_cast<int>(row.size()); ++i)
-                if (row[i] > bv) { bv = row[i]; best = i; }
-            p[best] = 1.0f;
-        }
-        return p;
+    auto target_dist = [&](const std::vector<float> &row,
+                           size_t row_index) -> std::vector<float> {
+        const detail::ToolStructureConstraint *constraint =
+            row_constraints && row_index < row_constraints->size()
+                ? &(*row_constraints)[row_index]
+                : nullptr;
+        return constrained_target_distribution(
+            row, temp, top_p, top_k, min_p, constraint, token_pieces);
     };
     for (size_t i = 0; i < n && i < target_rows.size(); ++i) {
         std::vector<float> row = target_rows[i];  // copy; penalized in place
         apply_token_penalties(row, ctx, presence_penalty, repetition_penalty);
-        std::vector<float> p = target_dist(row);
+        std::vector<float> p = target_dist(row, i);
         const uint32_t d = drafts[i];
         const float accept_prob = (d < p.size()) ? p[d] : 0.0f;
         if (unit(rng) < static_cast<double>(accept_prob)) {
@@ -501,7 +605,7 @@ SpecAcceptResult speculative_accept_pointmass(
     if (n < target_rows.size()) {
         std::vector<float> row = target_rows[n];
         apply_token_penalties(row, ctx, presence_penalty, repetition_penalty);
-        std::vector<float> p = target_dist(row);
+        std::vector<float> p = target_dist(row, n);
         r.extra_token = sample_from(p, rng);
     }
     return r;
@@ -4060,6 +4164,24 @@ public:
     }
 
 private:
+    const std::vector<std::string> &tool_structure_token_pieces() {
+        if (!tokenizer_) {
+            throw std::runtime_error(
+                "tool structure decoding requires an initialized tokenizer");
+        }
+        const size_t vocab = static_cast<size_t>(tokenizer_->vocab_size());
+        if (tool_structure_token_pieces_.size() == vocab) {
+            return tool_structure_token_pieces_;
+        }
+        tool_structure_token_pieces_.clear();
+        tool_structure_token_pieces_.reserve(vocab);
+        for (size_t i = 0; i < vocab; ++i) {
+            tool_structure_token_pieces_.push_back(
+                tokenizer_->decode_one(static_cast<int32_t>(i)));
+        }
+        return tool_structure_token_pieces_;
+    }
+
     struct LocalKvMemCacheEntry {
         std::string id;
         std::string status = "ready";
@@ -6472,6 +6594,7 @@ private:
     static bool continuous_batch_request_supported(const GenerationOptions &options,
                                                    const DumpStream *dump) {
         return dump == nullptr && options.max_tokens >= 0 &&
+               !options.tool_structure &&
                options.kvmem_semantic_budget == 0 &&
                options.kvmem_replay_query_spans.empty() &&
                options.kvmem_oracle_token_spans.empty() &&
@@ -11870,20 +11993,51 @@ private:
         const bool do_sample = options.temperature > 0.0f;
         std::mt19937_64 rng(options.seed);
         std::vector<float> logit_buf;
+        std::unique_ptr<detail::ToolStructureConstraint> tool_constraint;
+        const std::vector<std::string> *tool_token_pieces = nullptr;
+        if (options.tool_structure &&
+            !options.tool_structure->functions.empty()) {
+            tool_constraint =
+                std::make_unique<detail::ToolStructureConstraint>(
+                    options.tool_structure);
+            tool_token_pieces = &tool_structure_token_pieces();
+        }
         std::unordered_map<uint32_t, uint32_t> seen_tokens;
         seen_tokens.reserve(prompt_tokens.size() + static_cast<size_t>(options.max_tokens));
         for (uint32_t token : prompt_tokens) ++seen_tokens[token];
         auto pick_next = [&](int32_t fallback_argmax) -> int32_t {
-            const bool need_logits =
+            bool need_logits =
                 do_sample ||
                 options.presence_penalty != 0.0f ||
                 (options.repetition_penalty > 0.0f &&
-                 options.repetition_penalty != 1.0f);
+                 options.repetition_penalty != 1.0f) ||
+                (tool_constraint && tool_constraint->requires_full_mask());
+            if (!need_logits && tool_constraint && tool_token_pieces) {
+                const bool fallback_valid = fallback_argmax >= 0 &&
+                    static_cast<size_t>(fallback_argmax) <
+                        tool_token_pieces->size() &&
+                    tool_constraint->allows_piece(
+                        (*tool_token_pieces)[fallback_argmax]);
+                need_logits = !fallback_valid;
+            }
             if (!need_logits) return fallback_argmax;
-            if (!executor_->copy_last_logits(logit_buf)) return fallback_argmax;
+            if (!executor_->copy_last_logits(logit_buf)) {
+                if (tool_constraint && need_logits) {
+                    throw std::runtime_error(
+                        "tool structure decoding could not read target logits");
+                }
+                return fallback_argmax;
+            }
             apply_token_penalties(logit_buf, seen_tokens,
                                   options.presence_penalty,
                                   options.repetition_penalty);
+            if (tool_constraint && tool_token_pieces) {
+                const int32_t constrained = sample_tool_structure_token(
+                    logit_buf, options.temperature, options.top_p,
+                    options.top_k, options.min_p, rng,
+                    *tool_constraint, *tool_token_pieces);
+                return constrained >= 0 ? constrained : fallback_argmax;
+            }
             if (!do_sample) {
                 int best = 0;
                 float bv = logit_buf.empty() ? -std::numeric_limits<float>::infinity()
@@ -11922,6 +12076,11 @@ private:
         };
         if (options.max_tokens > 0 && !should_stop_eos()) {
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
+            if (tool_constraint && !tool_constraint->commit_piece(piece)) {
+                throw std::runtime_error(
+                    "tool structure commit failed in plain decode: " +
+                    tool_constraint->error());
+            }
             generated += piece;
             ++seen_tokens[next_token];
             if (warm_capture) gen_tokens.push_back(next_token);
@@ -11983,6 +12142,11 @@ private:
             next_token = budget_apply(budget, static_cast<uint32_t>(new_token));
             if (should_stop_eos()) break;
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(next_token));
+            if (tool_constraint && !tool_constraint->commit_piece(piece)) {
+                throw std::runtime_error(
+                    "tool structure commit failed in plain decode: " +
+                    tool_constraint->error());
+            }
             generated += piece;
             ++seen_tokens[next_token];
             if (warm_capture) gen_tokens.push_back(next_token);
@@ -15555,6 +15719,15 @@ private:
         const int32_t eos = tokenizer_->eos_id();
         ThinkingBudgetState budget;
         budget_init(budget, options);
+        std::unique_ptr<detail::ToolStructureConstraint> tool_constraint;
+        const std::vector<std::string> *tool_token_pieces = nullptr;
+        if (options.tool_structure &&
+            !options.tool_structure->functions.empty()) {
+            tool_constraint =
+                std::make_unique<detail::ToolStructureConstraint>(
+                    options.tool_structure);
+            tool_token_pieces = &tool_structure_token_pieces();
+        }
 
         // Sampling setup for distribution-lossless MTP. temp<=0 with no penalties
         // keeps the exact greedy argmax path (byte-identical to pre-change). When
@@ -15581,12 +15754,36 @@ private:
         // fallback. Used for the prefill seed, the drafts-empty fallback, and the
         // plain-decode tail so a sampling request samples on every non-spec path.
         auto pick_from_last_logits = [&](int32_t fallback_argmax) -> uint32_t {
-            if (!mtp_need_logits_pick) return static_cast<uint32_t>(fallback_argmax);
-            if (!executor_->copy_last_logits(mtp_logit_buf))
+            bool need_logits = mtp_need_logits_pick ||
+                (tool_constraint && tool_constraint->requires_full_mask());
+            if (!need_logits && tool_constraint && tool_token_pieces) {
+                const bool fallback_valid = fallback_argmax >= 0 &&
+                    static_cast<size_t>(fallback_argmax) <
+                        tool_token_pieces->size() &&
+                    tool_constraint->allows_piece(
+                        (*tool_token_pieces)[fallback_argmax]);
+                need_logits = !fallback_valid;
+            }
+            if (!need_logits) return static_cast<uint32_t>(fallback_argmax);
+            if (!executor_->copy_last_logits(mtp_logit_buf)) {
+                if (tool_constraint && need_logits) {
+                    throw std::runtime_error(
+                        "MTP tool structure decoding could not read target logits");
+                }
                 return static_cast<uint32_t>(fallback_argmax);
+            }
             apply_token_penalties(mtp_logit_buf, mtp_seen,
                                   options.presence_penalty,
                                   options.repetition_penalty);
+            if (tool_constraint && tool_token_pieces) {
+                const int32_t constrained = sample_tool_structure_token(
+                    mtp_logit_buf, options.temperature, options.top_p,
+                    options.top_k, options.min_p, mtp_rng,
+                    *tool_constraint, *tool_token_pieces);
+                return constrained >= 0
+                    ? static_cast<uint32_t>(constrained)
+                    : static_cast<uint32_t>(fallback_argmax);
+            }
             int32_t tok;
             if (mtp_do_sample) {
                 tok = sample_token(mtp_logit_buf, options.temperature,
@@ -15886,6 +16083,11 @@ private:
             recover_thinking_eos(budget, token);
             if (decoded >= options.max_tokens || should_stop_mtp_eos(token)) return false;
             const std::string piece = tokenizer_->decode_one(static_cast<int32_t>(token));
+            if (tool_constraint && !tool_constraint->commit_piece(piece)) {
+                throw std::runtime_error(
+                    "tool structure commit failed in MTP decode: " +
+                    tool_constraint->error());
+            }
             generated += piece;
             budget_observe(budget, token);
             // Track committed tokens for the next accept test's penalties (no-op
@@ -15965,6 +16167,20 @@ private:
                     static_cast<uint32_t>(options.max_tokens - decoded);
                 const uint32_t draft_limit =
                     mtp_policy.draft_limit(remaining_tokens, mtp_chain_len);
+                std::unique_ptr<detail::ToolStructureConstraint>
+                    draft_constraint;
+                std::vector<detail::ToolStructureConstraint>
+                    tool_constraint_rows;
+                bool tool_constraint_needs_logits = false;
+                if (tool_constraint) {
+                    draft_constraint =
+                        std::make_unique<detail::ToolStructureConstraint>(
+                            *tool_constraint);
+                    tool_constraint_rows.push_back(*draft_constraint);
+                    tool_constraint_needs_logits =
+                        draft_constraint->enforcing() ||
+                        draft_constraint->requires_full_mask();
+                }
                 const double t_draft_start = mtp_phase_time();
                 std::vector<NativeExecutorReport> chain = use_device_mtp_draft_chain
                     ? executor_->forward_mtp_draft_chain_with_prefix_device(current, draft_limit)
@@ -16000,7 +16216,27 @@ private:
                         budget.can_recover_eos(static_cast<uint32_t>(mtp.argmax_token))) {
                         break;
                     }
-                    drafts.push_back(static_cast<uint32_t>(mtp.argmax_token));
+                    const uint32_t draft_token =
+                        static_cast<uint32_t>(mtp.argmax_token);
+                    if (draft_constraint && tool_token_pieces) {
+                        if (draft_token >= tool_token_pieces->size() ||
+                            !draft_constraint->allows_piece(
+                                (*tool_token_pieces)[draft_token])) {
+                            break;
+                        }
+                        if (!draft_constraint->commit_piece(
+                                (*tool_token_pieces)[draft_token])) {
+                            break;
+                        }
+                    }
+                    drafts.push_back(draft_token);
+                    if (draft_constraint) {
+                        tool_constraint_rows.push_back(*draft_constraint);
+                        tool_constraint_needs_logits =
+                            tool_constraint_needs_logits ||
+                            draft_constraint->enforcing() ||
+                            draft_constraint->requires_full_mask();
+                    }
                     ++mtp_drafts;
                     ++mtp_spec_drafted;
                     mtp_ops += mtp.ops_executed;
@@ -16051,12 +16287,16 @@ private:
                 // request samples (temp>0). Same indexing as row_argmaxes: row i
                 // gates draft i; the final row is the all-accept bonus source.
                 std::vector<std::vector<float>> row_logits;
+                const bool mtp_verify_needs_logits =
+                    mtp_need_logits_pick || tool_constraint_needs_logits;
                 const double t_verify_start = mtp_phase_time();
                 if (use_sequential_verifier) {
                     step = NativeExecutorReport{};
                     step.ok = true;
                     row_argmaxes.reserve(verify_tokens.size());
-                    if (mtp_need_logits_pick) row_logits.reserve(verify_tokens.size());
+                    if (mtp_verify_needs_logits) {
+                        row_logits.reserve(verify_tokens.size());
+                    }
                     for (uint32_t token : verify_tokens) {
                         NativeExecutorReport verify_step = executor_->forward_one_token(token);
                         if (trace_mtp_verify) {
@@ -16075,7 +16315,7 @@ private:
                         });
                         // Copy this row's logits before the next forward_one_token
                         // overwrites the executor's logits_ scratch.
-                        if (mtp_need_logits_pick) {
+                        if (mtp_verify_needs_logits) {
                             row_logits.emplace_back();
                             executor_->copy_last_logits(row_logits.back());
                         }
@@ -16086,7 +16326,7 @@ private:
                         state_checkpoint_count > 0 ? &mtp_spec_state_checkpoints : nullptr,
                         state_checkpoint_count,
                         /*copy_last_logits=*/!mtp_skip_verify_logits_copy_enabled(),
-                        mtp_need_logits_pick ? &row_logits : nullptr);
+                        mtp_verify_needs_logits ? &row_logits : nullptr);
                     ++mtp_spec_batched_verify_batches;
                     mtp_spec_batched_verify_tokens += verify_tokens.size();
                     if (trace_mtp_verify) {
@@ -16103,7 +16343,7 @@ private:
 
                 uint32_t accepted = 0;
                 int32_t target_token = eos;
-                if (mtp_need_logits_pick) {
+                if (mtp_verify_needs_logits) {
                     // Distribution-lossless point-mass speculative-sampling accept
                     // test. extra_token is the residual draw on reject or the bonus
                     // draw on full accept; both replace the greedy argmax target.
@@ -16113,7 +16353,11 @@ private:
                         row_logits, drafts,
                         options.temperature, options.top_p, options.top_k,
                         options.min_p, options.presence_penalty,
-                        options.repetition_penalty, mtp_seen, mtp_rng);
+                        options.repetition_penalty, mtp_seen, mtp_rng,
+                        tool_constraint_rows.empty()
+                            ? nullptr : &tool_constraint_rows,
+                        tool_constraint_rows.empty()
+                            ? nullptr : tool_token_pieces);
                     accepted = sr.accepted;
                     target_token = sr.extra_token >= 0 ? sr.extra_token : eos;
                     for (uint32_t i = 0; i < accepted; ++i) {
@@ -16226,7 +16470,7 @@ private:
                     // test already drew the bonus into target_token whenever logits
                     // were picked (sampling or penalties), so only recompute it on the
                     // pure-greedy (no-penalty) path.
-                    if (!mtp_need_logits_pick) {
+                    if (!mtp_verify_needs_logits) {
                         target_token = row_argmaxes[drafts.size()].token >= 0
                             ? row_argmaxes[drafts.size()].token
                             : eos;
@@ -16857,6 +17101,7 @@ private:
     bool archive_query_base_ready_ = false;
     std::unique_ptr<QwenExecutor> executor_;
     std::unique_ptr<QwenTokenizer> tokenizer_;
+    std::vector<std::string> tool_structure_token_pieces_;
     std::unique_ptr<BatchedPrefillExecutor> cb_prefill_executor_;
     std::unique_ptr<BatchedDecodeExecutor> cb_decode_executor_;
     std::unique_ptr<GlobalKvPagePool> cb_kv_pool_;

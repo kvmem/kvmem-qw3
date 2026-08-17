@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -175,7 +176,8 @@ bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
     // Request-local budgets mutate the single executor's selection policy for
     // the duration of a request. Keep them on the serialized plain/frozen path
     // until continuous batching has a per-row budget field.
-    return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty() &&
+    return g.max_tokens >= 0 && !g.tool_structure &&
+           g.kvmem_replay_query_spans.empty() &&
            g.kvmem_semantic_budget == 0 &&
            g.kvmem_query_attention_probe_tokens == 0 &&
            g.kvmem_query_attention_score_tokens == 0 &&
@@ -320,11 +322,57 @@ std::string dump_json(const json &value) {
     return value.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
+const char *openai_error_type(int status) {
+    switch (status) {
+        case 400: return "BadRequestError";
+        case 404: return "NotFoundError";
+        case 409: return "ConflictError";
+        case 410: return "GoneError";
+        case 413: return "PayloadTooLargeError";
+        case 429: return "RateLimitError";
+        default:
+            return status >= 500 ? "InternalServerError" : "APIError";
+    }
+}
+
+json openai_error_response_json(int status, const std::string &message) {
+    return json{{"error",
+                 json{{"message", message},
+                      {"type", openai_error_type(status)},
+                      {"param", nullptr},
+                      {"code", status}}}};
+}
+
+void dump_tool_parse_failure(uint64_t rid, const std::string &error,
+                             const std::string &generated_text) {
+    const char *path = std::getenv("QW3_TOOL_PARSE_DUMP");
+    if (!path || !*path) return;
+
+    const size_t tool0 = generated_text.find("<tool_call>");
+    const std::string tool_text =
+        tool0 == std::string::npos ? generated_text
+                                   : generated_text.substr(tool0);
+    static std::mutex dump_mutex;
+    std::lock_guard<std::mutex> lock(dump_mutex);
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        std::cerr << "[qw3-serve] #" << rid
+                  << " tool_parse_dump_open_failed path=" << path << "\n";
+        return;
+    }
+    out << dump_json(json{{"rid", rid},
+                          {"error", error},
+                          {"generated_chars", generated_text.size()},
+                          {"tool_text", tool_text}})
+        << '\n';
+}
+
 void set_error_response(httplib::Response &res,
                         int status,
                         const std::string &message) {
     res.status = status;
-    res.set_content(dump_json(json{{"error", message}}), "application/json");
+    res.set_content(dump_json(openai_error_response_json(status, message)),
+                    "application/json");
 }
 
 int status_for_exception(const std::exception &e) {
@@ -1251,25 +1299,41 @@ struct ToolParseResult {
     std::vector<json> calls;
     bool intent_detected = false;
     bool valid = true;
+    bool closure_repaired = false;
     std::string error;
 };
 
 ToolParseResult parse_tool_calls_xml(const std::string &text,
-                                     const json *tools = nullptr) {
+                                     const json *tools = nullptr,
+                                     bool allow_structural_repair = false) {
     ToolParseResult result;
+    std::string parse_text = text;
     size_t pos = 0;
     while (true) {
-        const size_t tc0 = text.find("<tool_call>", pos);
+        const size_t tc0 = parse_text.find("<tool_call>", pos);
         if (tc0 == std::string::npos) break;
         result.intent_detected = true;
-        const size_t tc1 = text.find("</tool_call>", tc0);
+        size_t tc1 = parse_text.find("</tool_call>", tc0);
         if (tc1 == std::string::npos) {
-            result.valid = false;
-            result.error = "incomplete <tool_call> block";
-            break;
+            std::string suffix;
+            detail::CanonicalToolCallStreamParser parser;
+            std::vector<detail::ToolCallStreamEvent> events;
+            const std::string trailing = parse_text.substr(tc0);
+            if (!allow_structural_repair ||
+                !parser.feed(trailing, events) ||
+                !parser.finish_with_structural_closure_repair(
+                    events, suffix) ||
+                suffix.empty()) {
+                result.valid = false;
+                result.error = "incomplete <tool_call> block";
+                break;
+            }
+            parse_text += suffix;
+            result.closure_repaired = true;
+            tc1 = parse_text.find("</tool_call>", tc0);
         }
         const size_t inner0 = tc0 + std::string("<tool_call>").size();
-        const std::string inner = text.substr(inner0, tc1 - inner0);
+        const std::string inner = parse_text.substr(inner0, tc1 - inner0);
         std::vector<json> block_calls;
         if (!parse_tool_call_block(inner, tools, block_calls) ||
             block_calls.empty()) {
@@ -1394,6 +1458,18 @@ public:
             ? parser_.finish_with_closure_repair(events, synthesized_suffix)
             : parser_.finish(events);
         if (!ok) {
+            parser_failed();
+            return;
+        }
+        process(events);
+    }
+
+    void finish_structural(std::string &synthesized_suffix) {
+        synthesized_suffix.clear();
+        if (abandoned_ || fatal_) return;
+        std::vector<detail::ToolCallStreamEvent> events;
+        if (!parser_.finish_with_structural_closure_repair(
+                events, synthesized_suffix)) {
             parser_failed();
             return;
         }
@@ -1640,6 +1716,78 @@ std::string tools_debug_summary(const json &tools) {
         summary.push_back(item);
     }
     return dump_json(summary);
+}
+
+std::shared_ptr<const ToolStructureConstraintSpec>
+compile_tool_structure_constraint(const json *tools,
+                                  const std::string &forced_tool_name = {}) {
+    if (!tools || !tools->is_array() || tools->empty()) return {};
+
+    auto spec = std::make_shared<ToolStructureConstraintSpec>();
+    std::unordered_set<std::string> function_names;
+    for (const json &tool : *tools) {
+        if (!tool.is_object()) continue;
+        const json *function =
+            tool.contains("function") && tool["function"].is_object()
+                ? &tool["function"]
+                : &tool;
+        const std::string name = function->value("name", std::string());
+        if (name.empty() ||
+            (!forced_tool_name.empty() && name != forced_tool_name) ||
+            !function_names.insert(name).second) {
+            continue;
+        }
+
+        ToolStructureFunction compiled;
+        compiled.name = name;
+        const json *parameters =
+            function->contains("parameters") &&
+                    (*function)["parameters"].is_object()
+                ? &(*function)["parameters"]
+                : nullptr;
+        compiled.allow_additional_parameters =
+            !parameters || !parameters->contains("additionalProperties") ||
+            !(*parameters)["additionalProperties"].is_boolean() ||
+            (*parameters)["additionalProperties"].get<bool>();
+
+        std::unordered_set<std::string> required;
+        if (parameters && parameters->contains("required") &&
+            (*parameters)["required"].is_array()) {
+            for (const json &field : (*parameters)["required"]) {
+                if (field.is_string() && !field.get<std::string>().empty()) {
+                    required.insert(field.get<std::string>());
+                }
+            }
+        }
+
+        std::unordered_set<std::string> parameter_names;
+        if (parameters && parameters->contains("properties") &&
+            (*parameters)["properties"].is_object()) {
+            for (auto it = (*parameters)["properties"].begin();
+                 it != (*parameters)["properties"].end(); ++it) {
+                if (it.key().empty() ||
+                    !parameter_names.insert(it.key()).second) {
+                    continue;
+                }
+                compiled.parameters.push_back(
+                    ToolStructureParameter{it.key(),
+                                           required.count(it.key()) != 0});
+            }
+        }
+        // JSON Schema permits required names that are not listed in properties
+        // when additional properties are enabled. Preserve that explicit
+        // requirement so the decoder cannot close the call without it.
+        for (const std::string &field : required) {
+            if (parameter_names.insert(field).second) {
+                compiled.parameters.push_back(
+                    ToolStructureParameter{field, true});
+            }
+        }
+        spec->functions.push_back(std::move(compiled));
+    }
+    return spec->functions.empty()
+        ? std::shared_ptr<const ToolStructureConstraintSpec>{}
+        : std::shared_ptr<const ToolStructureConstraintSpec>(std::move(spec));
 }
 
 // Streaming tool-call detection. The model may emit natural-language reasoning
@@ -2309,16 +2457,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         try {
             req = json::parse(hreq.body);
         } catch (const std::exception &e) {
-            res.status = 400;
-            res.set_content(
-                dump_json(json{{"error", std::string("invalid JSON: ") + e.what()}}),
-                "application/json");
+            set_error_response(
+                res, 400, std::string("invalid JSON: ") + e.what());
             return;
         }
         if (!req.contains("content") || !req["content"].is_string()) {
-            res.status = 400;
-            res.set_content(dump_json(json{{"error", "missing string content"}}),
-                            "application/json");
+            set_error_response(res, 400, "missing string content");
             return;
         }
         const std::string content = req["content"].get<std::string>();
@@ -2596,16 +2740,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         try {
             req = json::parse(hreq.body);
         } catch (const std::exception &e) {
-            res.status = 400;
-            res.set_content(dump_json(json{{"error", std::string("invalid JSON: ") + e.what()}}),
-                            "application/json");
+            set_error_response(
+                res, 400, std::string("invalid JSON: ") + e.what());
             return;
         }
         const auto server_json_end = std::chrono::steady_clock::now();
         if (!req.contains("messages") || !req["messages"].is_array()) {
-            res.status = 400;
-            res.set_content(dump_json(json{{"error", "missing messages[]"}}),
-                            "application/json");
+            set_error_response(res, 400, "missing messages[]");
             return;
         }
         bool explicit_max_tokens = false;
@@ -3033,6 +3174,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         g.raw_prompt = true; // prompt is already chat-framed
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
+        if (tool_request &&
+            env_flag_enabled("QW3_TOOL_STRUCTURE_DECODING", true)) {
+            g.tool_structure =
+                compile_tool_structure_constraint(tools, forced_tool_name);
+            if (g.tool_structure) {
+                std::cerr << "[qw3-serve] structured_tool_decoding=enabled"
+                          << " functions="
+                          << g.tool_structure->functions.size() << "\n";
+            }
+        }
         g.kvmem_reselect_mode = kvmem_reselect_mode;
         g.kvmem_prefill_window_mode = kvmem_prefill_window_mode;
         g.kvmem_prefill_semantic_start_tokens =
@@ -4597,10 +4748,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                         static_cast<size_t>(g.max_tokens);
                                 std::string closure_suffix;
                                 if (!incremental.fatal()) {
-                                    incremental.finish(
-                                        tool_delta_committed &&
-                                            !hit_max_tokens,
-                                        closure_suffix);
+                                    if (!hit_max_tokens &&
+                                        !tool_delta_committed) {
+                                        incremental.finish_structural(
+                                            closure_suffix);
+                                    } else {
+                                        incremental.finish(
+                                            tool_delta_committed &&
+                                                !hit_max_tokens,
+                                            closure_suffix);
+                                    }
                                 }
                                 if (incremental.fatal()) {
                                     if (!tool_delta_committed) {
@@ -4649,18 +4806,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                             : validation_error;
                                     } else {
                                         parsed.calls.push_back(repaired_call);
+                                        parsed.closure_repaired = true;
                                     }
                                 } else {
                                     parsed = parse_tool_calls_xml(
                                         framed,
                                         tools_schema.is_array() ? &tools_schema
-                                                                : nullptr);
+                                                                : nullptr,
+                                        !hit_max_tokens);
                                 }
                                 if (!parsed.valid || parsed.calls.empty()) {
                                     const std::string parse_error =
                                         parsed.error.empty()
                                             ? "tool intent produced no call"
                                             : parsed.error;
+                                    dump_tool_parse_failure(
+                                        rid, parse_error, framed);
                                     if (!tool_delta_committed) {
                                         if (hit_max_tokens) {
                                             throw std::runtime_error(
@@ -4725,7 +4886,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                           << (incremental.streaming()
                                                   ? "true" : "false")
                                           << " closure_repaired="
-                                          << (!closure_suffix.empty()
+                                          << (parsed.closure_repaired
                                                   ? "true" : "false")
                                           << "\n";
                                 send_done("tool_calls");
@@ -4806,15 +4967,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             request_end, true);
                         return true;
                     } catch (const std::exception &e) {
-                        json chunk = {
-                            {"id", id}, {"object", "chat.completion.chunk"},
-                            {"created", created}, {"model", model_id},
-                            {"choices", json::array({json{
-                                {"index", 0},
-                                {"delta", json::object()},
-                                {"finish_reason", "error"}}})},
-                            {"error", e.what()}};
-                        const std::string s = "data: " + dump_json(chunk) + "\n\n";
+                        const int status = status_for_exception(e);
+                        const std::string s =
+                            "data: " +
+                            dump_json(openai_error_response_json(
+                                status, e.what())) +
+                            "\n\n";
                         send_raw(s);
                         const std::string fin = "data: [DONE]\n\n";
                         send_raw(fin);
@@ -4876,15 +5034,24 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         text = take_complete_utf8(utf8_pending, text);
         text += flush_utf8_pending(utf8_pending, false);
         const bool stopped = apply_stops(text, stops);
-        ToolParseResult parsed = parse_tool_calls_xml(text, tools);
+        const bool hit_max_tokens =
+            g.max_tokens > 0 &&
+            completion_tokens >= static_cast<size_t>(g.max_tokens);
+        ToolParseResult parsed = parse_tool_calls_xml(
+            text, tools, !hit_max_tokens);
         const bool tool_parse_failed =
             tool_request &&
             ((parsed.intent_detected &&
               (!parsed.valid || parsed.calls.empty())) ||
              (forced_tool_request && parsed.calls.empty()));
         if (tool_parse_failed) {
-            if (g.max_tokens > 0 &&
-                completion_tokens >= static_cast<size_t>(g.max_tokens)) {
+            dump_tool_parse_failure(
+                rid,
+                parsed.error.empty()
+                    ? "tool intent produced no call"
+                    : parsed.error,
+                text);
+            if (hit_max_tokens) {
                 set_error_response(
                     res, 500,
                     "tool_call_parse_error: tool call was truncated at "
@@ -4924,6 +5091,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             std::cerr << "[qw3-serve] #" << rid
                       << " tool_calls="
                       << tool_calls_debug_summary(parsed.calls)
+                      << " closure_repaired="
+                      << (parsed.closure_repaired ? "true" : "false")
                       << "\n";
             message["tool_calls"] = parsed.calls;
             finish = "tool_calls";
@@ -4962,9 +5131,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         try {
             req = json::parse(hreq.body);
         } catch (const std::exception &e) {
-            res.status = 400;
-            res.set_content(dump_json(json{{"error", std::string("invalid JSON: ") + e.what()}}),
-                            "application/json");
+            set_error_response(
+                res, 400, std::string("invalid JSON: ") + e.what());
             return;
         }
         std::string prompt;
@@ -4996,9 +5164,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 exact_prompt_tokens.push_back(static_cast<uint32_t>(token));
             }
         } else {
-            res.status = 400;
-            res.set_content(dump_json(json{{"error", "missing prompt"}}),
-                            "application/json");
+            set_error_response(res, 400, "missing prompt");
             return;
         }
         bool explicit_max_tokens = false;

@@ -146,6 +146,45 @@ void test_closure_repair_rejects_missing_structure() {
     }
 }
 
+void test_structural_closure_repair() {
+    for (const std::string &text : {
+             "<tool_call><function=Write>"
+             "<parameter=content>hello</parameter>",
+             "<tool_call><function=Write>"
+             "<parameter=content>hello</parameter></function>",
+             "<tool_call><function=Write>"
+             "<parameter=content>hello</parameter></function></tool_"}) {
+        CanonicalToolCallStreamParser parser;
+        std::vector<ToolCallStreamEvent> events;
+        if (!parser.feed(text, events)) {
+            fail("structural prefix failed before EOF: " + parser.error());
+        }
+        std::string suffix;
+        if (!parser.finish_with_structural_closure_repair(events, suffix)) {
+            fail("structural closure repair failed: " + parser.error());
+        }
+        if (suffix.empty()) {
+            fail("structural closure repair did not report a suffix");
+        }
+        const ParsedCall call = collect(events);
+        if (call.name != "Write" || call.args.at("content") != "hello") {
+            fail("structural closure repair changed the parsed call");
+        }
+    }
+
+    CanonicalToolCallStreamParser parser;
+    std::vector<ToolCallStreamEvent> events;
+    if (!parser.feed(
+            "<tool_call><function=Write><parameter=content>partial",
+            events)) {
+        fail("open parameter prefix failed before EOF");
+    }
+    std::string suffix;
+    if (parser.finish_with_structural_closure_repair(events, suffix)) {
+        fail("structural repair closed an open parameter value");
+    }
+}
+
 void test_json_fragment_escaping() {
     const std::string first = "quote=\" slash=\\ newline=\n tab=\t ";
     const std::string second = "control=\x01 UTF-8=\xE4\xB8\xAD\xE6\x96\x87";
@@ -165,6 +204,7 @@ int main() {
     test_malformed_fails_closed();
     test_closure_repair();
     test_closure_repair_rejects_missing_structure();
+    test_structural_closure_repair();
     test_json_fragment_escaping();
     std::cout << "tool_call_stream_test: ok\n";
     return 0;
