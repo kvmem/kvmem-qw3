@@ -291,6 +291,11 @@ void KvMemStore::record_block_rerope(uint32_t block_id, int64_t baked_pos) {
 }
 
 std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
+    return pick_prefill_pressure_blocks({});
+}
+
+std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(
+        const std::vector<uint32_t> &mandatory_blocks) const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
@@ -303,13 +308,28 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks() const {
     }
 
     const uint32_t sink = std::min({cfg_.sink_blocks, budget, n});
-    const uint32_t tail = budget - sink;
-    selected.reserve(budget);
-    for (uint32_t i = 0; i < sink; ++i) selected.push_back(i);
-    // n > budget guarantees `tail_begin >= sink`, so the prefix and suffix do
-    // not overlap and the result contains exactly `budget` ascending IDs.
-    const uint32_t tail_begin = n - tail;
-    for (uint32_t i = tail_begin; i < n; ++i) selected.push_back(i);
+    std::vector<uint8_t> kept(n, 0);
+    uint32_t kept_count = 0;
+    auto keep = [&](uint32_t id) {
+        if (id < n && !kept[id]) {
+            kept[id] = 1;
+            ++kept_count;
+        }
+    };
+    for (uint32_t id = 0; id < sink; ++id) keep(id);
+    for (uint32_t id : mandatory_blocks) keep(id);
+    if (kept_count > budget) {
+        throw std::runtime_error(
+            "KVMem mandatory prefill selection plus sink blocks exceeds "
+            "the configured prefill budget");
+    }
+    for (uint32_t id = n; id > 0 && kept_count < budget; --id) {
+        keep(id - 1);
+    }
+    selected.reserve(kept_count);
+    for (uint32_t id = 0; id < n; ++id) {
+        if (kept[id]) selected.push_back(id);
+    }
     return selected;
 }
 

@@ -400,6 +400,11 @@ public:
     // retrieval/profile/attention scores and also ignores `recent_blocks`:
     // "recent" here means the full newest tail left after reserving the sink.
     std::vector<uint32_t> pick_prefill_pressure_blocks() const;
+    // Same pressure selector with request-scoped mandatory blocks. Mandatory
+    // blocks consume ordinary newest-tail slots and never expand the fixed
+    // prefill budget.
+    std::vector<uint32_t> pick_prefill_pressure_blocks(
+        const std::vector<uint32_t> &mandatory_blocks) const;
 
     // Accumulate per-block attention quality (decode side-channel, #40). `scores`
     // is indexed by block_id; entries beyond block_count() are ignored.

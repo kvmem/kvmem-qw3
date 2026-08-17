@@ -1,6 +1,8 @@
 #include "server.hpp"
 
+#include "anthropic_adapter.hpp"
 #include "env_flags.hpp"
+#include "harness_semantics.hpp"
 #include "tool_call_stream.hpp"
 #include "qw3/qw3.hpp"
 #include "qw3/gguf.hpp"
@@ -176,6 +178,7 @@ bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
     // the duration of a request. Keep them on the serialized plain/frozen path
     // until continuous batching has a per-row budget field.
     return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty() &&
+           g.kvmem_pinned_token_spans.empty() &&
            g.kvmem_semantic_budget == 0 &&
            g.kvmem_query_attention_probe_tokens == 0 &&
            g.kvmem_query_attention_score_tokens == 0 &&
@@ -420,7 +423,9 @@ bool is_tool_response_content(const std::string &content) {
            trimmed.compare(trimmed.size() - close.size(), close.size(), close) == 0;
 }
 
-size_t last_query_index_for_template(const json &messages) {
+size_t last_query_index_for_template(
+        const json &messages,
+        detail::HarnessKind harness_kind = detail::HarnessKind::None) {
     if (!messages.is_array() || messages.empty()) return 0;
     bool multi_step_tool = true;
     size_t last_query = messages.size() - 1;
@@ -431,7 +436,9 @@ size_t last_query_index_for_template(const json &messages) {
         if (multi_step_tool && m.value("role", "") == "user") {
             const std::string content =
                 trim_ascii_ws(m.contains("content") ? render_content(m["content"]) : "");
-            if (!is_tool_response_content(content)) {
+            if (!is_tool_response_content(content) &&
+                !detail::harness_message_is_meta_only(
+                    harness_kind, content)) {
                 multi_step_tool = false;
                 last_query = i;
             }
@@ -1363,38 +1370,30 @@ size_t tool_call_safe_emit_len(const std::string &text, bool &marker_found) {
 // Qwen XML tool calls, and tool results become user-side <tool_response> blocks.
 // The final assistant header (+ thinking prefill or empty-think block) is
 // appended for generation.
-struct RenderedMessageSpan {
-    size_t message_index = 0;
-    std::string role;
-    size_t segment_begin = 0;
-    size_t segment_end = 0;
-    size_t content_begin = 0;
-    size_t content_end = 0;
-};
+using RenderedMessageSpan = detail::HarnessRenderedMessageSpan;
 
 std::string render_messages(
         const json &messages, const json *tools, bool enable_thinking,
         const std::string &forced_tool_name = {},
         std::vector<RenderedMessageSpan> *message_spans = nullptr,
-        bool add_generation_prompt = true) {
+        bool add_generation_prompt = true,
+        bool require_tool_call = false,
+        detail::HarnessKind harness_kind = detail::HarnessKind::None,
+        size_t *control_prefix_end = nullptr) {
     size_t num_sys = 0;
     std::string merged_system;
-    if (messages.is_array() && !messages.empty() && messages[0].is_object()) {
-        const std::string first_role = messages[0].value("role", "");
-        if (first_role == "system" || first_role == "developer") {
-            merged_system = trim_ascii_ws(
-                messages[0].contains("content") ? render_content(messages[0]["content"]) : "");
-            num_sys = 1;
-            if (messages.size() > 1 && messages[1].is_object()) {
-                const std::string second_role = messages[1].value("role", "");
-                if (second_role == "system" || second_role == "developer") {
-                    const std::string second = trim_ascii_ws(
-                        messages[1].contains("content") ? render_content(messages[1]["content"]) : "");
-                    merged_system += "\n" + second;
-                    num_sys = 2;
-                }
-            }
+    while (messages.is_array() && num_sys < messages.size() &&
+           messages[num_sys].is_object()) {
+        const std::string role = messages[num_sys].value("role", "");
+        if (role != "system" && role != "developer") break;
+        const std::string part = trim_ascii_ws(
+            messages[num_sys].contains("content")
+                ? render_content(messages[num_sys]["content"]) : "");
+        if (!part.empty()) {
+            if (!merged_system.empty()) merged_system += "\n";
+            merged_system += part;
         }
+        ++num_sys;
     }
 
     std::string prompt;
@@ -1418,6 +1417,8 @@ std::string render_messages(
         prompt += "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n";
         if (!forced_tool_name.empty()) {
             prompt += "- You MUST call the function named `" + forced_tool_name + "`\n";
+        } else if (require_tool_call) {
+            prompt += "- You MUST call one of the available functions\n";
         }
         prompt += "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n";
         prompt += "</IMPORTANT>";
@@ -1427,7 +1428,9 @@ std::string render_messages(
         prompt += "<|im_start|>system\n" + merged_system + "<|im_end|>\n";
     }
 
-    const size_t last_query_index = last_query_index_for_template(messages);
+    if (control_prefix_end) *control_prefix_end = prompt.size();
+    const size_t last_query_index =
+        last_query_index_for_template(messages, harness_kind);
     for (size_t i = 0; messages.is_array() && i < messages.size(); ++i) {
         const auto &m = messages[i];
         if (!m.is_object() || i < num_sys) continue;
@@ -1944,12 +1947,28 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     });
 
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response &res) {
+        const int context_window = std::max(1, engine.ctx_size);
+        int max_output_tokens = context_window;
+        if (cfg.default_max_tokens_set &&
+            cfg.default_generation.max_tokens > 0) {
+            max_output_tokens = std::min(
+                max_output_tokens, cfg.default_generation.max_tokens);
+        }
+        if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0) {
+            max_output_tokens = std::min(
+                max_output_tokens, engine.kvmem_gen_budget);
+        }
+
         json out = {
             {"object", "list"},
             {"data", json::array({json{{"id", model_id},
                                        {"object", "model"},
                                        {"created", unix_now()},
-                                       {"owned_by", "qw3"}}})}};
+                                       {"owned_by", "qw3"},
+                                       {"context_window", context_window},
+                                       {"context_length", context_window},
+                                       {"max_output_tokens", max_output_tokens},
+                                       {"max_tokens", max_output_tokens}}})}};
         res.set_content(dump_json(out), "application/json");
     });
 
@@ -2274,8 +2293,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         return g;
     };
 
-    svr.Post("/v1/chat/completions", [&](const httplib::Request &hreq,
-                                         httplib::Response &res) {
+    auto handle_chat_completions = [&](const httplib::Request &hreq,
+                                       httplib::Response &res,
+                                       detail::HarnessProtocol protocol) {
         const auto server_request_start = std::chrono::steady_clock::now();
         json req;
         try {
@@ -2622,6 +2642,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const bool tool_choice_none =
             req.contains("tool_choice") && req["tool_choice"].is_string() &&
             req["tool_choice"].get<std::string>() == "none";
+        const bool tool_choice_required =
+            req.contains("tool_choice") && req["tool_choice"].is_string() &&
+            req["tool_choice"].get<std::string>() == "required";
         std::string forced_tool_name;
         if (req.contains("tool_choice") && req["tool_choice"].is_object()) {
             const json &tc = req["tool_choice"];
@@ -2639,6 +2662,31 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
             std::cerr << "\n";
         }
+        bool has_leading_control_message = false;
+        if (!req["messages"].empty() && req["messages"][0].is_object()) {
+            const std::string role = req["messages"][0].value("role", "");
+            has_leading_control_message =
+                role == "system" || role == "developer";
+        }
+        const bool dsh_compact =
+            hreq.has_header("x-deepseek-harness-compact") &&
+            trim_ascii_ws(hreq.get_header_value(
+                "x-deepseek-harness-compact")) == "1";
+        const detail::HarnessRequestContext harness =
+            detail::classify_harness(detail::HarnessRequestSignals{
+                protocol,
+                hreq.has_header("User-Agent")
+                    ? hreq.get_header_value("User-Agent") : std::string(),
+                hreq.has_header("x-deepseek-harness-user-id") ||
+                    hreq.has_header("x-deepseek-harness-session-id") ||
+                    hreq.has_header("x-deepseek-harness-compact"),
+                hreq.has_header("x-opencode-session") ||
+                    hreq.has_header("x-opencode-project") ||
+                    hreq.has_header("x-opencode-request") ||
+                    hreq.has_header("x-opencode-client"),
+                raw_tools && raw_tools->is_array() && !raw_tools->empty(),
+                has_leading_control_message,
+                dsh_compact});
         bool transcript_replay = false;
         if (req.contains("kvmem_transcript_replay")) {
             if (!req["kvmem_transcript_replay"].is_boolean()) {
@@ -2670,6 +2718,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
         std::vector<RenderedMessageSpan> rendered_message_spans;
+        const bool harness_semantic_pins =
+            harness.kind != detail::HarnessKind::None &&
+            engine.kvmem_enabled;
         const bool explicit_retrieval_groups =
             req.contains("kvmem_retrieval_group_spans");
         const bool auto_message_groups =
@@ -2677,12 +2728,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             !explicit_retrieval_groups;
         const bool map_retrieval_groups =
             explicit_retrieval_groups || auto_message_groups;
+        size_t control_prefix_end = 0;
         const auto server_render_start = std::chrono::steady_clock::now();
         const std::string prompt = render_messages(
             req["messages"], tools, enable_thinking, forced_tool_name,
-            (transcript_replay || map_retrieval_groups)
+            (transcript_replay || map_retrieval_groups ||
+             harness_semantic_pins)
                 ? &rendered_message_spans : nullptr,
-            /*add_generation_prompt=*/!prefill_only);
+            /*add_generation_prompt=*/!prefill_only,
+            /*require_tool_call=*/tool_choice_required,
+            harness.kind,
+            harness_semantic_pins ? &control_prefix_end : nullptr);
         const auto server_render_end = std::chrono::steady_clock::now();
         std::vector<int32_t> prompt_token_ids =
             usage_tokenizer.encode(prompt);
@@ -2728,6 +2784,156 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 g.kvmem_cache_expected_version_set =
                     kvmem_cache_expected_version_set;
             }
+        }
+
+        // Harness-aware production pins. The common renderer records exact
+        // provenance boundaries; the semantic layer distinguishes request
+        // control, the real current task, the live tool trajectory, and
+        // durable workspace policy frames before mapping them to tokens.
+        if (harness_semantic_pins) {
+            const detail::HarnessSemanticPlan semantic_plan =
+                detail::derive_harness_semantic_plan(
+                    harness.kind, prompt, control_prefix_end,
+                    rendered_message_spans);
+            auto generation_reason = [](detail::HarnessSpanReason reason) {
+                switch (reason) {
+                case detail::HarnessSpanReason::SystemControl:
+                    return GenerationOptions::KvMemPinnedReason::SystemControl;
+                case detail::HarnessSpanReason::CurrentQuery:
+                    return GenerationOptions::KvMemPinnedReason::CurrentQuery;
+                case detail::HarnessSpanReason::LiveToolTrajectory:
+                    return GenerationOptions::KvMemPinnedReason::
+                        LiveToolTrajectory;
+                case detail::HarnessSpanReason::ProjectPolicy:
+                    return GenerationOptions::KvMemPinnedReason::ProjectPolicy;
+                }
+                return GenerationOptions::KvMemPinnedReason::CurrentQuery;
+            };
+            size_t reason_span_counts[4] = {0, 0, 0, 0};
+            for (const detail::HarnessByteSpan &pin : semantic_plan.spans) {
+                const size_t index = static_cast<size_t>(pin.reason);
+                if (index < 4) ++reason_span_counts[index];
+            }
+
+            std::vector<size_t> token_bytes;
+            token_bytes.reserve(prompt_token_ids.size() + 1);
+            token_bytes.push_back(0);
+            size_t decoded_bytes = 0;
+            bool decode_matches = true;
+            for (int32_t token : prompt_token_ids) {
+                const std::string piece = usage_tokenizer.decode_one(token);
+                if (decoded_bytes + piece.size() > prompt.size() ||
+                    prompt.compare(decoded_bytes, piece.size(), piece) != 0) {
+                    decode_matches = false;
+                    break;
+                }
+                decoded_bytes += piece.size();
+                token_bytes.push_back(decoded_bytes);
+            }
+            if (!decode_matches || decoded_bytes != prompt.size()) {
+                set_error_response(
+                    res, 500,
+                    "could not map harness semantic spans through tokenizer "
+                    "pieces exactly");
+                return;
+            }
+
+            for (const detail::HarnessByteSpan &pin : semantic_plan.spans) {
+                const auto begin_it = std::upper_bound(
+                    token_bytes.begin(), token_bytes.end(), pin.begin);
+                const size_t token_begin = begin_it == token_bytes.begin()
+                    ? 0
+                    : static_cast<size_t>(
+                          begin_it - token_bytes.begin() - 1);
+                const auto end_it = std::lower_bound(
+                    token_bytes.begin(), token_bytes.end(), pin.end);
+                const size_t token_end = static_cast<size_t>(
+                    end_it - token_bytes.begin());
+                if (token_begin >= token_end ||
+                    token_end > prompt_token_ids.size()) {
+                    set_error_response(
+                        res, 500,
+                        "harness semantic region maps to an empty token span");
+                    return;
+                }
+                g.kvmem_pinned_token_spans.push_back(
+                    GenerationOptions::KvMemPinnedTokenSpan{
+                        static_cast<uint32_t>(token_begin),
+                        static_cast<uint32_t>(token_end),
+                        generation_reason(pin.reason)});
+            }
+
+            const uint32_t block_tokens = static_cast<uint32_t>(
+                std::max(1, engine.kvmem_block_tokens));
+            const uint32_t prompt_blocks = static_cast<uint32_t>(
+                (prompt_token_count + block_tokens - 1) / block_tokens);
+            std::vector<uint8_t> mandatory_blocks(prompt_blocks, 0);
+            uint32_t mandatory_count = 0;
+            const uint32_t budget_tokens = g.kvmem_semantic_budget > 0
+                ? g.kvmem_semantic_budget
+                : static_cast<uint32_t>(
+                      std::max(0, engine.kvmem_budget));
+            const KvMemKeepAllocation harness_keep =
+                resolve_kvmem_keep_allocation(
+                    block_tokens, budget_tokens,
+                    engine.kvmem_sink_blocks,
+                    engine.kvmem_recent_blocks,
+                    engine.kvmem_sink_tokens,
+                    engine.kvmem_recent_tokens);
+            auto mark_block = [&](uint32_t block) {
+                if (block < prompt_blocks && !mandatory_blocks[block]) {
+                    mandatory_blocks[block] = 1;
+                    ++mandatory_count;
+                }
+            };
+            const uint32_t sink_blocks = std::min<uint32_t>(
+                harness_keep.sink_blocks,
+                prompt_blocks);
+            for (uint32_t block = 0; block < sink_blocks; ++block) {
+                mark_block(block);
+            }
+            for (const auto &pin : g.kvmem_pinned_token_spans) {
+                const uint32_t first = pin.begin / block_tokens;
+                const uint32_t last = (pin.end - 1) / block_tokens;
+                for (uint32_t block = first;
+                     block <= last && block < prompt_blocks; ++block) {
+                    mark_block(block);
+                }
+            }
+            const uint32_t budget_blocks =
+                budget_tokens / block_tokens;
+            if (mandatory_count > budget_blocks) {
+                set_error_response(
+                    res, 413,
+                    std::string("Harness mandatory semantic context (") +
+                        detail::harness_kind_name(harness.kind) +
+                        ") requires " +
+                        std::to_string(mandatory_count * block_tokens) +
+                        " KVMem tokens but the active selection budget is " +
+                        std::to_string(budget_tokens) +
+                        "; spans(system/query/live/policy)=" +
+                        std::to_string(reason_span_counts[0]) + "/" +
+                        std::to_string(reason_span_counts[1]) + "/" +
+                        std::to_string(reason_span_counts[2]) + "/" +
+                        std::to_string(reason_span_counts[3]) +
+                        "; increase --kvmem-budget or reduce harness context");
+                return;
+            }
+            std::cerr << "[qw3-serve] KVMem harness pins harness="
+                      << detail::harness_kind_name(harness.kind)
+                      << " compact=" << (harness.compact ? 1 : 0)
+                      << " spans="
+                      << g.kvmem_pinned_token_spans.size()
+                      << " spans_system=" << reason_span_counts[0]
+                      << " spans_query=" << reason_span_counts[1]
+                      << " spans_live=" << reason_span_counts[2]
+                      << " spans_policy=" << reason_span_counts[3]
+                      << " policy_frames="
+                      << semantic_plan.project_policy_frame_count
+                      << " mandatory_blocks=" << mandatory_count
+                      << " mandatory_tokens="
+                      << mandatory_count * block_tokens
+                      << " budget_tokens=" << budget_tokens << "\n";
         }
 
         // Optional semantic retrieval groups. Flattened benchmarks supply byte
@@ -2861,7 +3067,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 }
             } else {
                 const size_t final_query =
-                    last_query_index_for_template(req["messages"]);
+                    last_query_index_for_template(
+                        req["messages"], harness.kind);
                 requested.reserve(rendered_message_spans.size());
                 for (const RenderedMessageSpan &span :
                      rendered_message_spans) {
@@ -3164,7 +3371,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 const std::string empty_prompt = render_messages(
                     msgs_empty, tools, enable_thinking, forced_tool_name,
                     /*message_spans=*/nullptr,
-                    /*add_generation_prompt=*/!prefill_only);
+                    /*add_generation_prompt=*/!prefill_only,
+                    /*require_tool_call=*/tool_choice_required,
+                    harness.kind);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
                 size_t qb = 0;
@@ -3396,7 +3605,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 const std::string empty_prompt = render_messages(
                     msgs_empty, tools, enable_thinking, forced_tool_name,
                     /*message_spans=*/nullptr,
-                    /*add_generation_prompt=*/!prefill_only);
+                    /*add_generation_prompt=*/!prefill_only,
+                    /*require_tool_call=*/tool_choice_required,
+                    harness.kind);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
@@ -3481,7 +3692,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 const std::string empty_prompt = render_messages(
                     msgs_empty, tools, enable_thinking, forced_tool_name,
                     /*message_spans=*/nullptr,
-                    /*add_generation_prompt=*/!prefill_only);
+                    /*add_generation_prompt=*/!prefill_only,
+                    /*require_tool_call=*/tool_choice_required,
+                    harness.kind);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
@@ -3539,7 +3752,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             // Existing default behavior is deliberately unchanged when the
             // explicit field is absent: use the complete final user message.
             if (!explicit_span && !req.contains("kvmem_query_span")) {
-                const size_t lqi = last_query_index_for_template(msgs);
+                const size_t lqi = last_query_index_for_template(
+                    msgs, harness.kind);
                 if (lqi < msgs.size() && msgs[lqi].is_object() &&
                     msgs[lqi].value("role", "") == "user") {
                     json msgs_empty = msgs;
@@ -3547,7 +3761,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     const std::string empty_prompt = render_messages(
                         msgs_empty, tools, enable_thinking, forced_tool_name,
                         /*message_spans=*/nullptr,
-                        /*add_generation_prompt=*/!prefill_only);
+                        /*add_generation_prompt=*/!prefill_only,
+                        /*require_tool_call=*/tool_choice_required,
+                        harness.kind);
                     const std::vector<int32_t> tok_full =
                         usage_tokenizer.encode(prompt);
                     const std::vector<int32_t> tok_empty =
@@ -4503,6 +4719,230 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         ttft.log(rid, route, false, request_end);
         log_server_accounting(
             engine_start, engine_end, request_end, false);
+    };
+    svr.Post("/v1/chat/completions",
+             [&](const httplib::Request &hreq,
+                 httplib::Response &res) {
+        handle_chat_completions(
+            hreq, res, detail::HarnessProtocol::OpenAIChat);
+    });
+
+    auto set_anthropic_error = [&](httplib::Response &res, int status,
+                                   const std::string &message,
+                                   const std::string &type =
+                                       "invalid_request_error") {
+        res.status = status;
+        res.set_content(
+            dump_json(detail::anthropic_error_body(message, type)),
+            "application/json");
+    };
+
+    auto anthropic_prompt_token_count = [&](const json &openai_req,
+                                             size_t &count,
+                                             std::string &error) {
+        if (!openai_req.contains("messages") ||
+            !openai_req["messages"].is_array()) {
+            error = "converted request is missing messages[]";
+            return false;
+        }
+        const bool enable_thinking = openai_req.value(
+            "enable_thinking", cfg.enable_thinking_default);
+        const json *raw_tools = openai_req.contains("tools")
+            ? &openai_req["tools"] : nullptr;
+        const bool tool_choice_none =
+            openai_req.contains("tool_choice") &&
+            openai_req["tool_choice"].is_string() &&
+            openai_req["tool_choice"].get<std::string>() == "none";
+        const bool tool_choice_required =
+            openai_req.contains("tool_choice") &&
+            openai_req["tool_choice"].is_string() &&
+            openai_req["tool_choice"].get<std::string>() == "required";
+        const json *tools = tool_choice_none ? nullptr : raw_tools;
+        std::string forced_tool_name;
+        if (openai_req.contains("tool_choice") &&
+            openai_req["tool_choice"].is_object()) {
+            const json &choice = openai_req["tool_choice"];
+            if (choice.contains("function") &&
+                choice["function"].is_object()) {
+                forced_tool_name =
+                    choice["function"].value("name", "");
+            }
+        }
+        const std::string prompt = render_messages(
+            openai_req["messages"], tools, enable_thinking,
+            forced_tool_name, /*message_spans=*/nullptr,
+            /*add_generation_prompt=*/true,
+            /*require_tool_call=*/tool_choice_required,
+            detail::HarnessKind::ClaudeCode);
+        count = usage_tokenizer.encode(prompt).size();
+        return true;
+    };
+
+    svr.Post("/v1/messages/count_tokens",
+             [&](const httplib::Request &hreq,
+                 httplib::Response &res) {
+        json anthropic_req;
+        try {
+            anthropic_req = json::parse(hreq.body);
+        } catch (const std::exception &e) {
+            set_anthropic_error(
+                res, 400, std::string("invalid JSON: ") + e.what());
+            return;
+        }
+        json openai_req;
+        std::string error;
+        if (!detail::anthropic_request_to_openai(
+                anthropic_req, openai_req, error,
+                /*require_max_tokens=*/false)) {
+            set_anthropic_error(res, 400, error);
+            return;
+        }
+        size_t count = 0;
+        if (!anthropic_prompt_token_count(openai_req, count, error)) {
+            set_anthropic_error(res, 400, error);
+            return;
+        }
+        res.set_content(dump_json(json{{"input_tokens", count}}),
+                        "application/json");
+    });
+
+    svr.Post("/v1/messages",
+             [&](const httplib::Request &hreq,
+                 httplib::Response &res) {
+        json anthropic_req;
+        try {
+            anthropic_req = json::parse(hreq.body);
+        } catch (const std::exception &e) {
+            set_anthropic_error(
+                res, 400, std::string("invalid JSON: ") + e.what());
+            return;
+        }
+        json openai_req;
+        std::string error;
+        if (!detail::anthropic_request_to_openai(
+                anthropic_req, openai_req, error)) {
+            set_anthropic_error(res, 400, error);
+            return;
+        }
+        const bool stream = openai_req.value("stream", false);
+        const std::string requested_model =
+            anthropic_req.value("model", model_id);
+        size_t input_tokens = 0;
+        if (!anthropic_prompt_token_count(
+                openai_req, input_tokens, error)) {
+            set_anthropic_error(res, 400, error);
+            return;
+        }
+
+        httplib::Request internal_request;
+        internal_request.body = dump_json(openai_req);
+        httplib::Response internal_response;
+        handle_chat_completions(
+            internal_request, internal_response,
+            detail::HarnessProtocol::AnthropicMessages);
+        if (internal_response.status >= 400) {
+            std::string message = internal_response.body;
+            try {
+                const json body = json::parse(internal_response.body);
+                if (body.contains("error") && body["error"].is_string()) {
+                    message = body["error"].get<std::string>();
+                }
+            } catch (...) {
+            }
+            const std::string type = internal_response.status == 429
+                ? "rate_limit_error"
+                : (internal_response.status >= 500
+                       ? "api_error" : "invalid_request_error");
+            set_anthropic_error(
+                res, internal_response.status, message, type);
+            return;
+        }
+
+        if (!stream) {
+            try {
+                const json openai_response =
+                    json::parse(internal_response.body);
+                const json out = detail::anthropic_response_from_openai(
+                    openai_response, requested_model);
+                res.set_content(dump_json(out), "application/json");
+            } catch (const std::exception &e) {
+                set_anthropic_error(
+                    res, 500,
+                    std::string("could not translate model response: ") +
+                        e.what(),
+                    "api_error");
+            }
+            return;
+        }
+
+        if (!internal_response.content_provider_) {
+            set_anthropic_error(
+                res, 500,
+                "streaming chat handler did not create a content provider",
+                "api_error");
+            return;
+        }
+        auto inner_response = std::make_shared<httplib::Response>(
+            std::move(internal_response));
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("X-Accel-Buffering", "no");
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [inner_response, requested_model, input_tokens](
+                    size_t, httplib::DataSink &outer_sink) {
+                detail::AnthropicSseAdapter adapter(
+                    requested_model, input_tokens);
+                bool writable = true;
+                std::string adapter_error;
+                auto emit = [&](const std::string &wire) {
+                    if (!writable) return false;
+                    if (outer_sink.is_writable &&
+                        !outer_sink.is_writable()) {
+                        writable = false;
+                        return false;
+                    }
+                    writable = outer_sink.write(
+                        wire.data(), wire.size());
+                    return writable;
+                };
+
+                httplib::DataSink inner_sink;
+                inner_sink.is_writable = [&]() {
+                    return writable &&
+                        (!outer_sink.is_writable ||
+                         outer_sink.is_writable());
+                };
+                inner_sink.write = [&](const char *data, size_t size) {
+                    if (!adapter.feed(
+                            data, size, emit, adapter_error)) {
+                        writable = false;
+                        return false;
+                    }
+                    return writable;
+                };
+                inner_sink.done = []() {};
+                inner_sink.done_with_trailer =
+                    [](const httplib::Headers &) {};
+
+                bool ok = inner_response->content_provider_(
+                    0, 0, inner_sink);
+                if (writable &&
+                    !adapter.finish(emit, adapter_error)) {
+                    ok = false;
+                }
+                if (writable && !adapter_error.empty()) {
+                    const std::string wire =
+                        "event: error\ndata: " +
+                        dump_json(detail::anthropic_error_body(
+                            adapter_error, "api_error")) +
+                        "\n\n";
+                    (void)outer_sink.write(wire.data(), wire.size());
+                    ok = false;
+                }
+                inner_response->content_provider_success_ = ok;
+                outer_sink.done();
+                return ok;
+            });
     });
 
     svr.Post("/v1/completions", [&](const httplib::Request &hreq,

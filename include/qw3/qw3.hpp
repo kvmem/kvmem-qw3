@@ -328,6 +328,24 @@ struct GenerationOptions {
         uint32_t end = 0;
     };
     std::vector<KvMemRetrievalGroupSpan> kvmem_retrieval_group_spans;
+    // Production semantic pins derived by protocol adapters. Unlike the
+    // diagnostics-only oracle spans below, these remain active for pressure
+    // prefill and every later reselection in the request. They still consume
+    // the fixed selection budget; the serving layer rejects over-budget pin
+    // sets instead of silently dropping a semantic region.
+    enum class KvMemPinnedReason : uint8_t {
+        SystemControl = 0,
+        CurrentQuery = 1,
+        LiveToolTrajectory = 2,
+        ProjectPolicy = 3,
+        ExplicitClientPin = 4,
+    };
+    struct KvMemPinnedTokenSpan {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+        KvMemPinnedReason reason = KvMemPinnedReason::CurrentQuery;
+    };
+    std::vector<KvMemPinnedTokenSpan> kvmem_pinned_token_spans;
     // Optional transcript-construction boundaries. Each value is the first
     // token of an independent historical session, before block alignment. The
     // session-local canonical-KV experiment uses these boundaries to prevent a

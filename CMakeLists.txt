@@ -112,6 +112,8 @@ add_library(qw3_core
     src/qwen_config.cpp
     src/kvmem_store.cpp
     src/kvmem_archive.cpp
+    src/anthropic_adapter.cpp
+    src/harness_semantics.cpp
     src/tool_call_stream.cpp
     src/tokenizer.cpp
 )
@@ -250,6 +252,20 @@ if(QW3_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(qw3-tool-call-stream PRIVATE qw3_core)
     add_test(NAME qw3-tool-call-stream COMMAND qw3-tool-call-stream)
+
+    add_executable(qw3-anthropic-adapter tests/anthropic_adapter_test.cpp)
+    target_include_directories(qw3-anthropic-adapter PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(qw3-anthropic-adapter SYSTEM PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+    target_link_libraries(qw3-anthropic-adapter PRIVATE qw3_core)
+    add_test(NAME qw3-anthropic-adapter COMMAND qw3-anthropic-adapter)
+
+    add_executable(qw3-harness-semantics tests/harness_semantics_test.cpp)
+    target_include_directories(qw3-harness-semantics PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(qw3-harness-semantics PRIVATE qw3_core)
+    add_test(NAME qw3-harness-semantics COMMAND qw3-harness-semantics)
 
     add_executable(qw3-tokenizer-pretokenizer
         tests/tokenizer_pretokenizer_test.cpp)

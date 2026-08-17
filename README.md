@@ -485,6 +485,13 @@ of the normal serving startup command.
 
 ## Paged KV and continuous batching
 
+Claude Code, OpenCode, and DeepSeek Harness can use `qw3 serve` through the
+Anthropic Messages or OpenAI-compatible Chat Completions APIs. See
+[docs/harness_compatibility.md](docs/harness_compatibility.md) for automatic
+detection and harness-aware KVMem mandatory-span behavior, and
+[docs/claude_code.md](docs/claude_code.md) for Claude Code setup. Existing
+OpenAI-compatible request and response formats remain unchanged.
+
 The `continuous_batching` branch now has a service-oriented paged-KV and
 continuous-batching path for OpenAI-compatible workloads. Service behavior is
 controlled by explicit `qw3 serve` switches. Some lower-level backend toggles

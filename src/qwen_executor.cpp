@@ -13562,20 +13562,23 @@ uint32_t QwenExecutor::kvmem_reselect_prefill_pressure() {
     // content index immediately before the first mid-prefill eviction. Keep
     // that correctness side effect, but do not score or consult it here.
     kvmem_prepare_content_index_before_first_selection();
+    const std::vector<uint32_t> mandatory =
+        kvmem_materialize_mandatory_blocks();
     const std::vector<uint32_t> selected =
-        block_store_->pick_prefill_pressure_blocks();
+        block_store_->pick_prefill_pressure_blocks(mandatory);
     if (std::getenv("QW3_KVMEM_TRACE")) {
         const uint32_t n = block_store_->block_count();
         const uint32_t sink = std::min<uint32_t>(
             block_store_->config().sink_blocks,
             static_cast<uint32_t>(selected.size()));
-        const uint32_t tail_begin = selected.size() > sink
+        const uint32_t first_non_sink = selected.size() > sink
             ? selected[sink] : n;
         std::fprintf(stderr,
                      "[bs-prefill-pressure] blocks=%u selected=%zu sink=%u "
-                     "tail_begin=%u prefill_budget_blocks=%u "
+                     "first_non_sink=%u mandatory=%zu prefill_budget_blocks=%u "
                      "semantic_budget_blocks=%u\n",
-                     n, selected.size(), sink, tail_begin,
+                     n, selected.size(), sink, first_non_sink,
+                     mandatory.size(),
                      block_store_->prefill_budget_blocks(),
                      block_store_->budget_blocks());
     }
@@ -16943,6 +16946,27 @@ void QwenExecutor::kvmem_set_oracle_token_spans(
     }
 }
 
+void QwenExecutor::kvmem_set_mandatory_token_spans(
+        const std::vector<std::pair<uint32_t, uint32_t>> &spans) {
+    kvmem_mandatory_token_spans_.clear();
+    kvmem_mandatory_token_spans_.reserve(spans.size());
+    uint32_t previous_begin = 0;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const auto &[begin, end] = spans[i];
+        if (end <= begin || (i > 0 && begin < previous_begin)) {
+            throw std::runtime_error(
+                "KVMem mandatory token spans must be sorted and non-empty");
+        }
+        kvmem_mandatory_token_spans_.emplace_back(begin, end);
+        previous_begin = begin;
+    }
+    if (!spans.empty() && std::getenv("QW3_KVMEM_TRACE")) {
+        std::fprintf(stderr,
+                     "[bs-mandatory] configured token_spans=%zu\n",
+                     spans.size());
+    }
+}
+
 void QwenExecutor::kvmem_set_retrieval_group_spans(
         const std::vector<std::pair<uint32_t, uint32_t>> &spans) {
     kvmem_retrieval_group_spans_.clear();
@@ -17044,18 +17068,7 @@ bool QwenExecutor::kvmem_prepare_round_score_groups(uint32_t n_blocks) {
     return true;
 }
 
-std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
-    const bool round_ready =
-        block_store_->config().semantic_expansion !=
-            KvMemSemanticExpansion::None &&
-        !kvmem_retrieval_group_spans_.empty() &&
-        kvmem_round_group_scores_.size() ==
-            kvmem_retrieval_group_spans_.size();
-    if (!round_ready &&
-        kvmem_qc_pin_from_block_ == 0xffffffffu &&
-        kvmem_oracle_token_spans_.empty()) {
-        return block_store_->pick_topk_blocks();
-    }
+std::vector<uint32_t> QwenExecutor::kvmem_materialize_mandatory_blocks() const {
     const uint32_t nb = block_store_->block_count();
     std::vector<uint32_t> mandatory;
     if (kvmem_qc_pin_from_block_ < nb) {
@@ -17085,7 +17098,50 @@ std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
                          nb, mandatory.size());
         }
     }
+    if (!kvmem_mandatory_token_spans_.empty()) {
+        const uint32_t bt =
+            std::max<uint32_t>(1, block_store_->config().block_tokens);
+        for (const auto &[begin, end] : kvmem_mandatory_token_spans_) {
+            const uint32_t first = begin / bt;
+            const uint32_t last = (end - 1) / bt;
+            if (first >= nb) continue;
+            const uint32_t capped_last = std::min(last, nb - 1);
+            for (uint32_t id = first; id <= capped_last; ++id) {
+                mandatory.push_back(id);
+            }
+        }
+        std::sort(mandatory.begin(), mandatory.end());
+        mandatory.erase(std::unique(mandatory.begin(), mandatory.end()),
+                        mandatory.end());
+        if (std::getenv("QW3_KVMEM_TRACE")) {
+            std::fprintf(stderr,
+                         "[bs-mandatory] materialized_blocks=%u mandatory=%zu\n",
+                         nb, mandatory.size());
+        }
+    }
+    std::sort(mandatory.begin(), mandatory.end());
+    mandatory.erase(std::unique(mandatory.begin(), mandatory.end()),
+                    mandatory.end());
+    return mandatory;
+}
+
+std::vector<uint32_t> QwenExecutor::kvmem_selection_with_pin() {
+    const bool round_ready =
+        block_store_->config().semantic_expansion !=
+            KvMemSemanticExpansion::None &&
+        !kvmem_retrieval_group_spans_.empty() &&
+        kvmem_round_group_scores_.size() ==
+            kvmem_retrieval_group_spans_.size();
+    if (!round_ready &&
+        kvmem_qc_pin_from_block_ == 0xffffffffu &&
+        kvmem_oracle_token_spans_.empty() &&
+        kvmem_mandatory_token_spans_.empty()) {
+        return block_store_->pick_topk_blocks();
+    }
+    std::vector<uint32_t> mandatory =
+        kvmem_materialize_mandatory_blocks();
     if (kvmem_oracle_only_) {
+        const uint32_t nb = block_store_->block_count();
         const uint32_t sink =
             std::min(block_store_->config().sink_blocks, nb);
         for (uint32_t id = 0; id < sink; ++id) {

@@ -468,6 +468,11 @@ public:
     void kvmem_set_oracle_token_spans(
         const std::vector<std::pair<uint32_t, uint32_t>> &spans,
         bool oracle_only = false);
+    // Production request-scoped mandatory spans. These persist across internal
+    // clean-query/reset passes and are overwritten (including with empty) at
+    // the beginning of every native request.
+    void kvmem_set_mandatory_token_spans(
+        const std::vector<std::pair<uint32_t, uint32_t>> &spans);
     void kvmem_set_retrieval_group_spans(
         const std::vector<std::pair<uint32_t, uint32_t>> &spans);
     // Borrow the pinned CPU-tier buffer from a shared pool instead of allocating
@@ -1755,7 +1760,10 @@ private:
     uint32_t kvmem_qc_pin_from_block_ = 0xffffffffu;
     std::vector<std::pair<uint32_t, uint32_t>>
         kvmem_oracle_token_spans_;
+    std::vector<std::pair<uint32_t, uint32_t>>
+        kvmem_mandatory_token_spans_;
     bool kvmem_oracle_only_ = false;
+    std::vector<uint32_t> kvmem_materialize_mandatory_blocks() const;
     std::vector<uint32_t> kvmem_selection_with_pin();
 
     // ---- Per-normal-attention-layer multi-layer selection (#85-#90) --------

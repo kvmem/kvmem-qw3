@@ -48,7 +48,7 @@ void usage(std::ostream &os) {
         "       qw3 archive info  --kvmem-archive DIR\n"
         "       qw3 tokenize --model MODEL --prompt-file FILE [--token-output FILE]\n"
         "\n"
-        "Serve (OpenAI-compatible HTTP API; loads model once, serves forever).\n"
+        "Serve (OpenAI- and Anthropic-compatible HTTP APIs; loads model once).\n"
         "  Default is the conservative baseline: one request at a time, FP16 KV,\n"
         "  no global paged KV, no continuous batching, and no MTP.\n"
         "  --port N              Listen port. Default: 8080\n"
@@ -390,8 +390,8 @@ int main(int argc, char **argv) {
     bool dump_tensors = false;
     bool think = false;
 
-    // `qw3 serve ...` runs the OpenAI-compatible HTTP server instead of a
-    // one-shot generate. Detected as the first positional argument.
+    // `qw3 serve ...` runs the OpenAI/Anthropic-compatible HTTP server instead
+    // of a one-shot generate. Detected as the first positional argument.
     bool serve = false;
     bool tokenize_only = false;
     qw3::ServerConfig serve_cfg;

@@ -10721,6 +10721,13 @@ private:
             }
             executor_->kvmem_set_retrieval_group_spans(
                 retrieval_groups);
+            std::vector<std::pair<uint32_t, uint32_t>> mandatory_spans;
+            mandatory_spans.reserve(
+                options.kvmem_pinned_token_spans.size());
+            for (const auto &span : options.kvmem_pinned_token_spans) {
+                mandatory_spans.emplace_back(span.begin, span.end);
+            }
+            executor_->kvmem_set_mandatory_token_spans(mandatory_spans);
         }
         const uint32_t query_replay_base = executor_->position();
         const bool query_replay =
@@ -12200,6 +12207,13 @@ private:
             }
             executor_->kvmem_set_retrieval_group_spans(
                 retrieval_groups);
+            std::vector<std::pair<uint32_t, uint32_t>> mandatory_spans;
+            mandatory_spans.reserve(
+                options.kvmem_pinned_token_spans.size());
+            for (const auto &span : options.kvmem_pinned_token_spans) {
+                mandatory_spans.emplace_back(span.begin, span.end);
+            }
+            executor_->kvmem_set_mandatory_token_spans(mandatory_spans);
         }
         const uint32_t query_replay_base = executor_->position();
         const bool query_replay =
