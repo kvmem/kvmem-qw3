@@ -207,6 +207,8 @@ void usage(std::ostream &os) {
         "  --kvmem-query-conditioned  Score blocks by the multi-token mean against the\n"
         "                        final user message (the question) instead of recency.\n"
         "                        Requires the serve layer to mark the query span.\n"
+        "  --kvmem-query-max-tokens N  Maximum exact query rows / mean-Q prototypes.\n"
+        "                        Longer queries are split into N ranges. Default: 512.\n"
         "  --no-kvmem-recompute-query  Do not replay the query after semantic\n"
         "                        reselection. Default: replay is enabled.\n"
         "  --kvmem-immutable-k  Keep unrotated K in a CPU mirror and one active GPU\n"
@@ -755,6 +757,12 @@ int main(int argc, char **argv) {
                 }
             } else if (arg == "--kvmem-query-conditioned") {
                 engine.kvmem_query_conditioned = true;
+            } else if (arg == "--kvmem-query-max-tokens") {
+                engine.kvmem_query_max_tokens = parse_int(need(arg), arg);
+                if (engine.kvmem_query_max_tokens <= 0) {
+                    throw std::runtime_error(
+                        "--kvmem-query-max-tokens must be > 0");
+                }
             } else if (arg == "--no-kvmem-recompute-query") {
                 engine.kvmem_recompute_query = false;
             } else if (arg == "--kvmem-immutable-k") {

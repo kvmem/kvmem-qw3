@@ -3,6 +3,7 @@
 #include "qw3/qw3.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -10,6 +11,11 @@
 
 namespace qw3 {
 namespace detail {
+
+struct ToolStructureLegalTokens {
+    std::vector<uint32_t> ids;
+    double build_ms = 0.0;
+};
 
 // Byte-level state machine for the canonical Qwen tool-call form. It is
 // tokenizer-independent: callers test a decoded token piece on a copy, then
@@ -28,6 +34,10 @@ public:
 
     const std::string &error() const { return error_; }
     std::string state_name() const;
+    std::string diagnostic_summary() const;
+    const ToolStructureLegalTokens &legal_tokens(
+        const std::vector<std::string> &token_pieces,
+        bool *cache_hit = nullptr) const;
 
 private:
     enum class State {
@@ -51,7 +61,10 @@ private:
     bool function_name_has_prefix(const std::string &prefix) const;
     bool select_function(const std::string &name);
     bool parameter_name_has_prefix(const std::string &prefix) const;
+    bool parameter_name_can_close() const;
     bool select_parameter(const std::string &name);
+    bool has_legal_completion() const;
+    void invalidate_legal_tokens();
     void begin_tool_call();
     void fail(std::string message);
 
@@ -64,8 +77,13 @@ private:
     std::string structural_buffer_;
     std::string value_close_suffix_;
     std::vector<bool> seen_parameters_;
-    std::unordered_set<std::string> seen_additional_parameters_;
+    std::shared_ptr<const std::unordered_set<std::string>>
+        seen_additional_parameters_ =
+            std::make_shared<const std::unordered_set<std::string>>();
     std::string error_;
+    mutable const std::vector<std::string> *legal_token_source_ = nullptr;
+    mutable std::shared_ptr<const ToolStructureLegalTokens>
+        legal_token_cache_;
 };
 
 } // namespace detail

@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 namespace qw3 {
@@ -15,6 +17,7 @@ constexpr const char *kParameterOpen = "<parameter=";
 constexpr const char *kParameterClose = "</parameter>";
 constexpr const char *kFunctionClose = "</function>";
 constexpr const char *kToolClose = "</tool_call>";
+constexpr size_t kMaxParameterNameBytes = 128;
 
 bool is_space(unsigned char c) {
     return std::isspace(c) != 0;
@@ -60,16 +63,27 @@ bool ToolStructureConstraint::allows_piece(const std::string &piece) const {
     if (!enabled()) return true;
     if (piece.empty()) return !enforcing();
     ToolStructureConstraint probe(*this);
-    return probe.feed(piece);
+    return probe.commit_piece(piece);
 }
 
 bool ToolStructureConstraint::commit_piece(const std::string &piece) {
     if (!enabled()) return true;
+    invalidate_legal_tokens();
     if (piece.empty() && enforcing()) {
         fail("empty token inside canonical tool call");
         return false;
     }
-    return feed(piece);
+    if (!feed(piece)) return false;
+    if (!has_legal_completion()) {
+        fail("canonical tool structure has no legal completion");
+        return false;
+    }
+    return true;
+}
+
+void ToolStructureConstraint::invalidate_legal_tokens() {
+    legal_token_source_ = nullptr;
+    legal_token_cache_.reset();
 }
 
 void ToolStructureConstraint::fail(std::string message) {
@@ -85,7 +99,8 @@ void ToolStructureConstraint::begin_tool_call() {
     structural_buffer_.clear();
     value_close_suffix_.clear();
     seen_parameters_.clear();
-    seen_additional_parameters_.clear();
+    seen_additional_parameters_ =
+        std::make_shared<const std::unordered_set<std::string>>();
 }
 
 bool ToolStructureConstraint::update_marker_suffix(
@@ -137,7 +152,8 @@ bool ToolStructureConstraint::select_function(const std::string &name) {
         function_index_ = i;
         seen_parameters_.assign(
             spec_->functions[i].parameters.size(), false);
-        seen_additional_parameters_.clear();
+        seen_additional_parameters_ =
+            std::make_shared<const std::unordered_set<std::string>>();
         state_ = State::ParameterOrFunctionEnd;
         structural_buffer_.clear();
         name_buffer_.clear();
@@ -164,7 +180,7 @@ bool ToolStructureConstraint::parameter_name_has_prefix(
     if (!spec_ || function_index_ >= spec_->functions.size()) return false;
     const ToolStructureFunction &function = spec_->functions[function_index_];
     if (function.allow_additional_parameters) {
-        return prefix.size() <= 128 &&
+        return prefix.size() <= kMaxParameterNameBytes &&
                std::none_of(prefix.begin(), prefix.end(), [](unsigned char c) {
                    return is_space(c) || c == '<' || c == '>';
                });
@@ -174,6 +190,30 @@ bool ToolStructureConstraint::parameter_name_has_prefix(
         if (is_prefix_of(prefix, function.parameters[i].name)) return true;
     }
     return false;
+}
+
+bool ToolStructureConstraint::parameter_name_can_close() const {
+    if (!spec_ || function_index_ >= spec_->functions.size() ||
+        name_buffer_.empty()) {
+        return false;
+    }
+    const ToolStructureFunction &function = spec_->functions[function_index_];
+    for (size_t i = 0; i < function.parameters.size(); ++i) {
+        if (function.parameters[i].name != name_buffer_) continue;
+        return i >= seen_parameters_.size() || !seen_parameters_[i];
+    }
+    return function.allow_additional_parameters &&
+        (!seen_additional_parameters_ ||
+         seen_additional_parameters_->count(name_buffer_) == 0);
+}
+
+bool ToolStructureConstraint::has_legal_completion() const {
+    if (!enabled()) return true;
+    if (state_ == State::Failed) return false;
+    if (state_ != State::ParameterName) return true;
+    if (!parameter_name_has_prefix(name_buffer_)) return false;
+    if (name_buffer_.size() < kMaxParameterNameBytes) return true;
+    return parameter_name_can_close();
 }
 
 bool ToolStructureConstraint::select_parameter(const std::string &name) {
@@ -195,13 +235,19 @@ bool ToolStructureConstraint::select_parameter(const std::string &name) {
         return true;
     }
     if (!function.allow_additional_parameters ||
-        seen_additional_parameters_.count(name) != 0) {
+        (seen_additional_parameters_ &&
+         seen_additional_parameters_->count(name) != 0)) {
         fail(function.allow_additional_parameters
                  ? "duplicate additional canonical tool parameter"
                  : "tool parameter is not present in the request schema");
         return false;
     }
-    seen_additional_parameters_.insert(name);
+    auto updated = std::make_shared<std::unordered_set<std::string>>(
+        seen_additional_parameters_
+            ? *seen_additional_parameters_
+            : std::unordered_set<std::string>{});
+    updated->insert(name);
+    seen_additional_parameters_ = std::move(updated);
     state_ = State::ParameterValue;
     value_close_suffix_.clear();
     name_buffer_.clear();
@@ -310,6 +356,49 @@ std::string ToolStructureConstraint::state_name() const {
         case State::Failed: return "failed";
     }
     return "unknown";
+}
+
+std::string ToolStructureConstraint::diagnostic_summary() const {
+    size_t seen_declared = 0;
+    for (bool seen : seen_parameters_) seen_declared += seen ? 1 : 0;
+    size_t declared = 0;
+    if (spec_ && function_index_ < spec_->functions.size()) {
+        declared = spec_->functions[function_index_].parameters.size();
+    }
+    std::ostringstream out;
+    out << "state=" << state_name()
+        << " name_bytes=" << name_buffer_.size()
+        << " fixed_pos=" << fixed_pos_
+        << " seen_declared=" << seen_declared
+        << " declared=" << declared
+        << " seen_additional="
+        << (seen_additional_parameters_
+                ? seen_additional_parameters_->size()
+                : 0);
+    return out.str();
+}
+
+const ToolStructureLegalTokens &ToolStructureConstraint::legal_tokens(
+        const std::vector<std::string> &token_pieces,
+        bool *cache_hit) const {
+    if (legal_token_cache_ && legal_token_source_ == &token_pieces) {
+        if (cache_hit) *cache_hit = true;
+        return *legal_token_cache_;
+    }
+    if (cache_hit) *cache_hit = false;
+    auto built = std::make_shared<ToolStructureLegalTokens>();
+    built->ids.reserve(token_pieces.size() / 8);
+    const auto begin = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < token_pieces.size(); ++i) {
+        if (allows_piece(token_pieces[i])) {
+            built->ids.push_back(static_cast<uint32_t>(i));
+        }
+    }
+    built->build_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+    legal_token_source_ = &token_pieces;
+    legal_token_cache_ = std::move(built);
+    return *legal_token_cache_;
 }
 
 } // namespace detail

@@ -710,6 +710,12 @@ bool launch_derope_query_multi_f16(void *q_multi, const float *q,
                                    uint32_t n_heads, uint32_t head_dim,
                                    uint32_t rope_dim, int32_t start_pos,
                                    float theta, cudaStream_t stream);
+bool launch_derope_query_segment_mean_f16(
+    void *q_mean, const float *q, uint32_t q_token_stride,
+    uint32_t q_head_stride, uint32_t cnt, uint32_t query_offset,
+    uint32_t query_tokens, uint32_t prototypes, uint32_t n_heads,
+    uint32_t head_dim, uint32_t rope_dim, int32_t start_pos, float theta,
+    cudaStream_t stream);
 }
 
 #if QW3_ENABLE_FLASHINFER
@@ -8847,6 +8853,74 @@ __global__ void derope_query_multi_kernel(void *q_multi,
     } else {
         static_cast<float *>(q_multi)[out] = deroped;
     }
+}
+
+// Streaming query compression. The complete query is divided into
+// `prototypes` contiguous ranges using floor(i*S/N) boundaries. A prefill
+// chunk updates every range it overlaps. CUDA stream ordering makes the FP16
+// running-mean update race-free across chunks, while each chunk's reduction is
+// accumulated in FP32 before the final store.
+__global__ void derope_query_segment_mean_f16_kernel(
+        __half *q_mean, const float *q, uint32_t q_token_stride,
+        uint32_t q_head_stride, uint32_t cnt, uint32_t query_offset,
+        uint32_t query_tokens, uint32_t prototypes, uint32_t n_heads,
+        uint32_t head_dim, uint32_t rope_dim, int32_t start_pos,
+        float theta, uint32_t first_segment) {
+    const uint32_t packed = blockIdx.x;
+    const uint32_t qh = packed % n_heads;
+    const uint32_t segment = first_segment + packed / n_heads;
+    const uint32_t d = threadIdx.x;
+    if (d >= head_dim || segment >= prototypes) return;
+
+    const uint32_t segment_begin = static_cast<uint32_t>(
+        (static_cast<uint64_t>(segment) * query_tokens) / prototypes);
+    const uint32_t segment_end = static_cast<uint32_t>(
+        (static_cast<uint64_t>(segment + 1) * query_tokens) / prototypes);
+    const uint32_t chunk_end = query_offset + cnt;
+    const uint32_t lo = max(query_offset, segment_begin);
+    const uint32_t hi = min(chunk_end, segment_end);
+    if (hi <= lo) return;
+
+    const uint32_t half = rope_dim / 2;
+    const bool rotated = d < rope_dim;
+    const uint32_t rope_index = d < half ? d : d - half;
+    const float inv_freq = rotated
+        ? __powf(theta, -2.0f * static_cast<float>(rope_index) /
+                            static_cast<float>(rope_dim))
+        : 0.0f;
+    float partial_sum = 0.0f;
+    for (uint32_t source_row = lo; source_row < hi; ++source_row) {
+        const uint32_t r = source_row - query_offset;
+        const float *row = q + static_cast<uint64_t>(r) * q_token_stride +
+                           static_cast<uint64_t>(qh) * q_head_stride;
+        const int32_t query_pos = start_pos + static_cast<int32_t>(r);
+        float deroped;
+        if (d < half) {
+            const float ang = static_cast<float>(query_pos) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            deroped = row[d] * c + row[d + half] * s;
+        } else if (d < rope_dim) {
+            const float ang = static_cast<float>(query_pos) * inv_freq;
+            float s, c;
+            __sincosf(ang, &s, &c);
+            deroped = -row[d - half] * s + row[d] * c;
+        } else {
+            deroped = row[d];
+        }
+        partial_sum += deroped;
+    }
+
+    const uint32_t previous = lo - segment_begin;
+    const uint32_t added = hi - lo;
+    const uint32_t total = previous + added;
+    const uint64_t out =
+        (static_cast<uint64_t>(segment) * n_heads + qh) * head_dim + d;
+    const float prior = previous > 0 ? __half2float(q_mean[out]) : 0.0f;
+    const float mean =
+        (prior * static_cast<float>(previous) + partial_sum) /
+        static_cast<float>(total);
+    q_mean[out] = __float2half_rn(mean);
 }
 
 __global__ void kv_append_kernel(float *cache,
@@ -18613,6 +18687,37 @@ public:
         return launch_status("cuda derope_query_multi_device");
     }
 
+    DeviceStatus derope_query_segment_mean_f16_device(
+            DeviceTensor &q_mean, const DeviceTensor &q,
+            uint64_t q_elem_offset, uint64_t out_elem_offset,
+            uint32_t q_token_stride, uint32_t q_head_stride,
+            uint32_t cnt, uint32_t query_offset,
+            uint32_t query_tokens, uint32_t prototypes,
+            uint32_t n_heads, uint32_t head_dim, uint32_t rope_dim,
+            int32_t start_pos, float theta) override {
+        if (cnt == 0 || n_heads == 0 || head_dim == 0) return {};
+        auto &qm = as_tensor(q_mean);
+        const auto &qt = as_tensor(q);
+        if (!qm.is_fp16()) {
+            return {false,
+                    "derope_query_segment_mean requires FP16 output"};
+        }
+        if (query_tokens == 0 || prototypes == 0 ||
+            prototypes > query_tokens || query_offset >= query_tokens ||
+            cnt > query_tokens - query_offset) {
+            return {false,
+                    "derope_query_segment_mean has invalid query range"};
+        }
+        if (!ported::launch_derope_query_segment_mean_f16(
+                qm.ptr_h() + out_elem_offset, qt.ptr + q_elem_offset,
+                q_token_stride, q_head_stride, cnt, query_offset,
+                query_tokens, prototypes, n_heads, head_dim, rope_dim,
+                start_pos, theta, exec_stream_)) {
+            return {false, "derope_query_segment_mean launch failed"};
+        }
+        return launch_status("cuda derope_query_segment_mean_f16_device");
+    }
+
     DeviceStatus kv_append_batch_paged_ragged_device(
                                               DeviceTensor &cache,
                                               const DeviceTensor &src,
@@ -24002,6 +24107,40 @@ bool launch_derope_query_multi_f16(void *q_multi, const float *q,
     derope_query_multi_kernel<<<grid, head_dim, 0, stream>>>(
         q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim, rope_dim,
         start_pos, theta, /*output_fp16=*/true);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_derope_query_segment_mean_f16(
+        void *q_mean, const float *q, uint32_t q_token_stride,
+        uint32_t q_head_stride, uint32_t cnt, uint32_t query_offset,
+        uint32_t query_tokens, uint32_t prototypes, uint32_t n_heads,
+        uint32_t head_dim, uint32_t rope_dim, int32_t start_pos,
+        float theta, cudaStream_t stream) {
+    if (cnt == 0 || n_heads == 0 || head_dim == 0) return true;
+    if (!q_mean || !q || query_tokens == 0 || prototypes == 0 ||
+        prototypes > query_tokens || query_offset >= query_tokens ||
+        cnt > query_tokens - query_offset) {
+        return false;
+    }
+    // floor(i*S/N) segment boundaries map source row r to the first segment
+    // whose upper boundary is greater than r.
+    const uint32_t first_segment = static_cast<uint32_t>(
+        ((static_cast<uint64_t>(query_offset + 1) * prototypes) - 1) /
+        query_tokens);
+    const uint32_t last_segment = static_cast<uint32_t>(
+        ((static_cast<uint64_t>(query_offset + cnt) * prototypes) - 1) /
+        query_tokens);
+    const uint64_t touched =
+        static_cast<uint64_t>(last_segment - first_segment + 1);
+    const uint64_t blocks = touched * n_heads;
+    if (blocks == 0 || blocks > 0x7fffffffull || head_dim > 1024) {
+        return false;
+    }
+    derope_query_segment_mean_f16_kernel<<<
+        static_cast<uint32_t>(blocks), head_dim, 0, stream>>>(
+        static_cast<__half *>(q_mean), q, q_token_stride, q_head_stride,
+        cnt, query_offset, query_tokens, prototypes, n_heads, head_dim,
+        rope_dim, start_pos, theta, first_segment);
     return cudaGetLastError() == cudaSuccess;
 }
 

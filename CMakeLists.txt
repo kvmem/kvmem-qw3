@@ -349,6 +349,14 @@ if(QW3_BUILD_TESTS)
         set_property(TARGET qw3-kvmem-kmean-merge PROPERTY CUDA_STANDARD 17)
         set_property(TARGET qw3-kvmem-kmean-merge PROPERTY CUDA_STANDARD_REQUIRED ON)
         add_test(NAME qw3-kvmem-kmean-merge COMMAND qw3-kvmem-kmean-merge)
+
+        add_executable(qw3-kvmem-query-segment-mean
+                       tests/kvmem_query_segment_mean.cu)
+        target_link_libraries(qw3-kvmem-query-segment-mean PRIVATE qw3_core)
+        set_property(TARGET qw3-kvmem-query-segment-mean PROPERTY CUDA_STANDARD 17)
+        set_property(TARGET qw3-kvmem-query-segment-mean PROPERTY CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME qw3-kvmem-query-segment-mean
+                 COMMAND qw3-kvmem-query-segment-mean)
         if(QW3_BUILD_NVFP4)
             add_executable(qw3-mixed-linear-parity tests/mixed_linear_parity.cu)
             target_link_libraries(qw3-mixed-linear-parity PRIVATE qw3_core)

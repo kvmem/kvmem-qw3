@@ -267,6 +267,10 @@ struct KvMemStoreConfig {
     bool optimize_stage_out = true;
     bool optimize_stage_in = true;
     bool optimize_pack = true;
+    // Query-conditioned mean-K keeps exact per-token Q rows up to this count.
+    // Longer query spans are compressed into this many contiguous mean-Q
+    // prototypes. This bounds query capture independently of prompt length.
+    uint32_t query_max_tokens = 512;
 
     // Drift-bounded K construction. The executor stores unrotated historical K
     // in a CPU mirror and keeps only one active K copy on GPU. Resident window

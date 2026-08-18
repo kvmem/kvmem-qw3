@@ -4,6 +4,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -130,6 +131,39 @@ void test_probe_does_not_mutate_and_mask_states() {
     }
 }
 
+void test_parameter_name_transition_cannot_enter_dead_state() {
+    ToolStructureConstraint constraint(edit_spec(true));
+    const std::string name(128, 'a');
+    require_commit(
+        constraint,
+        "<tool_call><function=edit><parameter=" + name +
+            ">value</parameter><parameter=" + name.substr(0, 127));
+
+    if (constraint.allows_piece("a")) {
+        fail("duplicate maximum-length parameter entered a dead state");
+    }
+    if (!constraint.allows_piece("b>")) {
+        fail("unique maximum-length parameter completion was blocked");
+    }
+
+    const std::vector<std::string> pieces = {"a", "b>", ">", "_"};
+    const auto &first = constraint.legal_tokens(pieces);
+    const auto &second = constraint.legal_tokens(pieces);
+    if (&first != &second) fail("legal token set was not cached");
+    if (first.ids.size() != 3 || first.ids[0] != 1 ||
+        first.ids[1] != 2 || first.ids[2] != 3) {
+        fail("legal token set contains a transition into the dead state");
+    }
+
+    ToolStructureConstraint rejected(constraint);
+    if (rejected.commit_piece("a")) {
+        fail("dead-state transition committed successfully");
+    }
+    if (rejected.error().find("no legal completion") == std::string::npos) {
+        fail("dead-state transition did not report its root cause");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -138,6 +172,7 @@ int main() {
     test_duplicate_and_cross_token_boundaries();
     test_value_marker_lookalike_and_additional_properties();
     test_probe_does_not_mutate_and_mask_states();
+    test_parameter_name_transition_cannot_enter_dead_state();
     std::cout << "tool structure constraint tests passed\n";
     return 0;
 }

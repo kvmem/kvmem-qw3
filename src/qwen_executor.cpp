@@ -1298,6 +1298,11 @@ void QwenExecutor::reset_state() {
     kvmem_drain_query_capture();
     kvmem_query_begin_ = 0;
     kvmem_query_end_ = 0;
+    kvmem_query_span_ = 0;
+    kvmem_query_source_span_ = 0;
+    kvmem_query_source_captured_ = 0;
+    kvmem_query_segment_mean_ = false;
+    kvmem_query_capture_failed_ = false;
     kvmem_query_score_budget_hint_ = 0;
     kvmem_query_score_token_indices_.clear();
     kvmem_cancel_query_attention_probe();
@@ -7977,6 +7982,8 @@ void QwenExecutor::kvmem_begin_query_replay(
     if (!preserve_query_capture) {
         g_query_multi_count_ = 0;
         g_query_multi_ready_ = false;
+        kvmem_query_source_captured_ = 0;
+        kvmem_query_capture_failed_ = false;
     }
     g_query_ready_ = false;
     kvmem_dn_qcount_ = 0;
@@ -10335,6 +10342,11 @@ void QwenExecutor::kvmem_truncate_to(uint32_t token_pos) {
     kvmem_drain_query_capture();
     kvmem_query_begin_ = 0;
     kvmem_query_end_ = 0;
+    kvmem_query_span_ = 0;
+    kvmem_query_source_span_ = 0;
+    kvmem_query_source_captured_ = 0;
+    kvmem_query_segment_mean_ = false;
+    kvmem_query_capture_failed_ = false;
     g_query_multi_ready_ = false;
     g_query_multi_count_ = 0;
 }
@@ -15444,6 +15456,10 @@ uint32_t QwenExecutor::kvmem_end_guided_query_probe() {
     }
     g_query_multi_capacity_ = rows;
     kvmem_query_span_ = count;
+    kvmem_query_source_span_ = count;
+    kvmem_query_source_captured_ = count;
+    kvmem_query_segment_mean_ = false;
+    kvmem_query_capture_failed_ = false;
     g_query_multi_count_ = count;
     g_query_multi_ready_ = true;
     kvmem_query_host_capture_ = false;
@@ -15915,6 +15931,11 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     kvmem_drain_query_capture();
     kvmem_query_score_token_indices_.clear();
     kvmem_query_host_capture_ = false;
+    kvmem_query_span_ = 0;
+    kvmem_query_source_span_ = 0;
+    kvmem_query_source_captured_ = 0;
+    kvmem_query_segment_mean_ = false;
+    kvmem_query_capture_failed_ = false;
     g_provisional_adaptive_score_active_ = false;
     g_provisional_adaptive_score_ready_ = false;
     // Consume + clear the resume base up front (set by the preceding
@@ -15954,19 +15975,15 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // Resolve the normal-attention layer set (pins bs_score_layer_ as a side
     // effect) and read the env A/B knobs so capture/scoring agree on L this run.
     kvmem_resolve_std_layers();
-    // g_query_multi_ holds the per-layer de-RoPE'd question rows, laid out
-    // [L, S, n_heads, head_dim] (S = span length, per-layer row stride). Allocate
-    // by the exact L*S so a tiny question only costs tens of MB.
-    const uint32_t S = std::max<uint32_t>(
+    // g_query_multi_ holds per-layer de-RoPE'd question rows. Ordinary queries
+    // keep the exact [L,S,H,D] layout. Longer mean-K queries use one mean-Q per
+    // contiguous source range, giving [L,P,H,D] with P bounded by the configured
+    // query maximum while every source token still contributes.
+    const uint32_t source_tokens = std::max<uint32_t>(
         1, kvmem_query_end_ - kvmem_query_begin_);
-    kvmem_query_span_ = S;
+    kvmem_query_source_span_ = source_tokens;
+    kvmem_query_source_captured_ = 0;
     const uint32_t L = std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
-    const uint64_t rows = static_cast<uint64_t>(L) * S;
-    const uint64_t query_row_elems =
-        static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
-    if (rows > UINT64_MAX / query_row_elems) {
-        throw std::runtime_error("KVMem query capture size overflow");
-    }
     // Default to FP16 query capture for CUDA mean-K. Queries that fit in the
     // bounded scoring stage stay entirely on GPU; only longer queries use the
     // host-backed streaming path. ExactMass and the archived DeltaNet scorer
@@ -15975,8 +15992,6 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     const uint32_t score_limit = kvmem_query_score_budget_hint_ > 0
         ? kvmem_query_score_budget_hint_
         : env_uint32_or("QW3_KVMEM_QUERY_SCORE_CHUNK", 256);
-    const uint32_t score_tokens =
-        std::min<uint32_t>(S, std::max<uint32_t>(score_limit, 1));
     // Content-only durable replay needs no query tensor. Keep the online
     // provisional prefix snapshot in g_query_multi_ until forward_n_tokens
     // consumes it instead of shrinking that allocation to the empty span.
@@ -15990,8 +16005,69 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
         kvmem_query_end_ > kvmem_query_begin_ &&
         !kvmem_qc_pertoken_ && !kvmem_qc_deltanet_ &&
         !env_flag_enabled("QW3_KVMEM_CLEAN_QUERY");
-    kvmem_query_host_capture_ = fp16_mean_query && S > score_tokens;
-    if (kvmem_query_host_capture_) {
+    const uint32_t query_max_tokens = block_store_
+        ? std::max<uint32_t>(1, block_store_->config().query_max_tokens)
+        : 512u;
+    // Attention-probe selection addresses individual source rows, so retain
+    // its existing exact layout. The normal production mean-K path uses the
+    // bounded segment representation.
+    kvmem_query_segment_mean_ = fp16_mean_query &&
+        kvmem_query_score_budget_hint_ == 0 &&
+        source_tokens > query_max_tokens;
+    kvmem_query_span_ = kvmem_query_segment_mean_
+        ? query_max_tokens : source_tokens;
+    const uint32_t score_tokens = std::min<uint32_t>(
+        kvmem_query_span_, std::max<uint32_t>(score_limit, 1));
+    const uint64_t rows =
+        static_cast<uint64_t>(L) * kvmem_query_span_;
+    const uint64_t query_row_elems =
+        static_cast<uint64_t>(cfg.n_heads) * cfg.head_dim;
+    if (rows > UINT64_MAX / query_row_elems) {
+        throw std::runtime_error("KVMem query capture size overflow");
+    }
+    kvmem_query_host_capture_ = fp16_mean_query &&
+        !kvmem_query_segment_mean_ && kvmem_query_span_ > score_tokens;
+    if (kvmem_query_segment_mean_) {
+        // Segment means are updated on the execution stream as each prefill
+        // chunk arrives, so they remain device-resident and never require a
+        // full-query host allocation.
+        g_query_multi_host_.reset();
+        g_query_multi_pinned_host_.reset();
+        g_query_multi_host_capacity_ = 0;
+        try {
+            if (!g_query_multi_ ||
+                g_query_multi_->elem_size != sizeof(uint16_t) ||
+                g_query_multi_capacity_ < rows ||
+                g_query_multi_capacity_ > rows * 2) {
+                g_query_multi_ = backend_.tensor_f16(
+                    rows * query_row_elems, "g_query_segment_mean_fp16");
+                g_query_multi_capacity_ = rows;
+            }
+        } catch (const std::exception &e) {
+            kvmem_query_capture_failed_ = true;
+            std::fprintf(
+                stderr,
+                "[bs-qcap] mode=segment-mean source_tokens=%u "
+                "prototypes=%u allocation_failed=%s; "
+                "falling back to non-query retrieval\n",
+                source_tokens, kvmem_query_span_, e.what());
+        }
+        if (!kvmem_query_capture_failed_) {
+            const uint32_t min_segment =
+                source_tokens / kvmem_query_span_;
+            const uint32_t max_segment =
+                (source_tokens + kvmem_query_span_ - 1) /
+                kvmem_query_span_;
+            std::fprintf(
+                stderr,
+                "[bs-qcap] mode=segment-mean source_tokens=%u "
+                "prototypes=%u segment_tokens=%u..%u buffer_mib=%.2f\n",
+                source_tokens, kvmem_query_span_, min_segment, max_segment,
+                static_cast<double>(rows * query_row_elems *
+                                    sizeof(uint16_t)) /
+                    (1024.0 * 1024.0));
+        }
+    } else if (kvmem_query_host_capture_) {
         const uint64_t elems = rows * query_row_elems;
         const uint64_t bytes = elems * sizeof(uint16_t);
         const uint64_t pinned_cap =
@@ -16054,7 +16130,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
                 "[bs-qcap-host] enabled=1 layers=%u tokens=%u "
                 "host_mib=%.2f host_kind=%s score_chunk=%u "
                 "gpu_stage_mib=%.2f\n",
-                L, S,
+                L, kvmem_query_span_,
                 static_cast<double>(elems * sizeof(uint16_t)) /
                     (1024.0 * 1024.0),
                 use_pinned_host ? "pinned-direct" : "pageable-bounce",
@@ -16080,7 +16156,7 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
                 stderr,
                 "[bs-qcap-gpu] fp16=1 layers=%u tokens=%u "
                 "gpu_mib=%.2f threshold=%u\n",
-                L, S,
+                L, kvmem_query_span_,
                 static_cast<double>(
                     rows * query_row_elems * sizeof(uint16_t)) /
                     (1024.0 * 1024.0),
@@ -16370,7 +16446,8 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
                     backend_.tensor_f32(small_per_layer * L_dn, "g_deltanet_r");
             }
             // g_deltanet_q_ [L_dn, S, num_k_heads, dk] fp32.
-            const uint64_t q_rows = static_cast<uint64_t>(L_dn) * S;
+            const uint64_t q_rows =
+                static_cast<uint64_t>(L_dn) * source_tokens;
             const uint64_t q_elems = q_rows * cfg.num_k_heads() * dk;
             if (!g_deltanet_q_ || g_deltanet_q_->count < q_elems) {
                 g_deltanet_q_ = backend_.tensor_f32(q_elems, "g_deltanet_q");
@@ -16856,7 +16933,8 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
                                              uint32_t rope_base_pos,
                                              uint32_t q_token_stride) {
     if (kvmem_query_end_ <= kvmem_query_begin_) return;
-    if (!g_query_multi_ || !q_batch_ || g_query_multi_ready_) return;
+    if (!g_query_multi_ || !q_batch_ || g_query_multi_ready_ ||
+        kvmem_query_capture_failed_) return;
     // base_pos and [query_begin,query_end) are both absolute positions in the
     // complete prompt. This remains true after prefix reuse: restore_state sets
     // position() to checkpoint C and suffix prefill begins at base_pos=C.
@@ -16884,6 +16962,58 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
         cfg.n_ctx_train, actual_layer);
     const uint64_t row_elems =
         static_cast<uint64_t>(n_heads) * head_dim;
+    if (kvmem_query_segment_mean_) {
+        const uint32_t source_offset =
+            base_pos + r0 - kvmem_query_begin_;
+        if (slot == 0 &&
+            source_offset != kvmem_query_source_captured_) {
+            kvmem_query_capture_failed_ = true;
+            std::fprintf(
+                stderr,
+                "[bs-qcap] mode=segment-mean capture_gap expected=%u "
+                "actual=%u count=%u; falling back to non-query retrieval\n",
+                kvmem_query_source_captured_, source_offset, cnt);
+            return;
+        }
+        const uint64_t out_elem_offset =
+            static_cast<uint64_t>(slot) * S * row_elems;
+        const DeviceStatus st =
+            backend_.derope_query_segment_mean_f16_device(
+                *g_query_multi_, *q_batch_, q_elem_off, out_elem_offset,
+                q_token_stride, q_head_stride, cnt, source_offset,
+                kvmem_query_source_span_, S, n_heads, head_dim,
+                cfg.rope_dim, start_pos, cfg.rope_theta);
+        if (!st.ok) {
+            kvmem_query_capture_failed_ = true;
+            std::fprintf(
+                stderr,
+                "[bs-qcap] mode=segment-mean kernel_failed=%s; "
+                "falling back to non-query retrieval\n",
+                st.message ? st.message : "unknown");
+            return;
+        }
+        const uint32_t L =
+            std::max<uint32_t>(kvmem_qc_num_layers_, 1u);
+        if (slot + 1 == L) {
+            kvmem_query_source_captured_ += cnt;
+            if (kvmem_query_source_captured_ >=
+                kvmem_query_source_span_) {
+                g_query_multi_count_ = S;
+                g_query_multi_ready_ = true;
+            }
+            if (std::getenv("QW3_KVMEM_TRACE")) {
+                std::fprintf(
+                    stderr,
+                    "[bs-qcap] mode=segment-mean slot=%u rope_base=%u "
+                    "r0=%u source_count=%u/%u prototypes=%u ready=%d\n",
+                    slot, rope_base_pos, r0,
+                    kvmem_query_source_captured_,
+                    kvmem_query_source_span_, S,
+                    g_query_multi_ready_ ? 1 : 0);
+            }
+        }
+        return;
+    }
     if (kvmem_query_host_capture_) {
         if (g_provisional_adaptive_score_active_) {
             // The de-RoPE output is already the exact FP16 content-frame query
@@ -17107,6 +17237,7 @@ void QwenExecutor::kvmem_restore_stashed_query() {
     if (g_provisional_adaptive_score_stashed_) {
         g_query_multi_count_ = g_query_multi_clean_count_;
         g_query_multi_ready_ = true;
+        kvmem_query_source_captured_ = kvmem_query_source_span_;
         g_provisional_adaptive_score_ready_ = true;
         if (std::getenv("QW3_KVMEM_TRACE")) {
             std::fprintf(
@@ -17141,6 +17272,7 @@ void QwenExecutor::kvmem_restore_stashed_query() {
         }
         g_query_multi_count_ = g_query_multi_clean_count_;
         g_query_multi_ready_ = true;
+        kvmem_query_source_captured_ = kvmem_query_source_span_;
         if (std::getenv("QW3_KVMEM_TRACE")) {
             std::fprintf(stderr,
                          "[bs-query-stash] restore location=host "
@@ -17161,6 +17293,7 @@ void QwenExecutor::kvmem_restore_stashed_query() {
     require_status(backend_.copy_d2d(*g_query_multi_, *g_query_multi_clean_, 0, n));
     g_query_multi_count_ = g_query_multi_clean_count_;
     g_query_multi_ready_ = true;
+    kvmem_query_source_captured_ = kvmem_query_source_span_;
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
                      "[bs-query-stash] restore location=gpu rows=%u\n",
@@ -17179,6 +17312,8 @@ void QwenExecutor::kvmem_restore_clean_query() {
 void QwenExecutor::kvmem_reset_query_capture() {
     g_query_multi_count_ = 0;
     g_query_multi_ready_ = false;
+    kvmem_query_source_captured_ = 0;
+    kvmem_query_capture_failed_ = false;
     g_provisional_adaptive_score_active_ = false;
     g_provisional_adaptive_score_ready_ = false;
     g_provisional_adaptive_score_stashed_ = false;
@@ -22379,17 +22514,23 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(
         std::fprintf(
             stderr,
             "[bs-mean-score-perf] placement=%s blocks=%u layers=%u "
-            "query_tokens=%u groups=%u elapsed_ms=%.3f\n",
+            "query_tokens=%u query_source_tokens=%u query_mode=%s "
+            "groups=%u elapsed_ms=%.3f\n",
             kvmem_mean_index_cpu() ? "cpu" : "gpu", nb, L, M,
+            kvmem_query_source_span_,
+            kvmem_query_segment_mean_ ? "segment-mean" : "exact",
             round_mode ? output_count : 0,
             (kvmem_steady_ns() - score_begin_ns) / 1.0e6);
     }
     if (std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
                      "[bs-mean-softmax] query-conditioned softmax-pages: "
-                     "L=%u M=%u tokens scored %u blocks groups=%u "
+                     "L=%u M=%u source_tokens=%u mode=%s scored %u blocks "
+                     "groups=%u "
                      "group_reduce=%s alpha=%.3f\n",
-                     L, M, nb, round_mode ? output_count : 0,
+                     L, M, kvmem_query_source_span_,
+                     kvmem_query_segment_mean_ ? "segment-mean" : "exact",
+                     nb, round_mode ? output_count : 0,
                      round_mode &&
                              block_store_->config().group_score_reduce ==
                                  KvMemGroupScoreReduce::

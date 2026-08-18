@@ -431,10 +431,16 @@ public:
     uint32_t kvmem_query_captured_tokens() const {
         return g_query_multi_count_;
     }
+    uint32_t kvmem_query_captured_source_tokens() const {
+        return kvmem_query_segment_mean_
+            ? kvmem_query_source_captured_ : g_query_multi_count_;
+    }
     bool kvmem_query_capture_complete() const {
         const uint32_t expected = kvmem_query_expected_tokens();
-        return expected > 0 && g_query_multi_ready_ &&
-            g_query_multi_count_ >= expected;
+        return expected > 0 && !kvmem_query_capture_failed_ &&
+            g_query_multi_ready_ &&
+            kvmem_query_captured_source_tokens() >= expected &&
+            g_query_multi_count_ >= kvmem_query_span_;
     }
     // Bound the query scorer's GPU staging allocation before prefill. This is a
     // request-local hint: zero preserves the environment/default threshold.
@@ -1842,7 +1848,15 @@ private:
     bool g_kraw_multi_ready_ = false;                          // g_kraw_multi_ holds raw keys
     int32_t kvmem_qc_layer_cap_ = -1;                          // env: cap L (-1 = all std layers)
     uint32_t kvmem_qc_num_layers_ = 0;                         // L (resolved std-layer count)
-    uint32_t kvmem_query_span_ = 0;                            // S (span length, == capacity)
+    // Query-conditioned mean-K stores either every query row or one mean-Q
+    // prototype per contiguous source range. kvmem_query_span_ remains the
+    // physical per-layer stride consumed by scorers; source_span_ is the
+    // original logical query length.
+    uint32_t kvmem_query_span_ = 0;                            // stored rows / layer
+    uint32_t kvmem_query_source_span_ = 0;                     // original query tokens
+    uint32_t kvmem_query_source_captured_ = 0;                 // sequential source progress
+    bool kvmem_query_segment_mean_ = false;
+    bool kvmem_query_capture_failed_ = false;
     std::vector<std::pair<uint32_t, uint32_t>>
         kvmem_retrieval_group_spans_;
     std::vector<int32_t> kvmem_round_group_begin_host_;

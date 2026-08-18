@@ -2175,6 +2175,27 @@ public:
         return {false, "derope_query_multi_device requires backend override"};
     }
 
+    // Compress a contiguous slice of a longer query into fixed contiguous
+    // segment prototypes. Each output row is the running mean of the
+    // de-RoPE'd Q rows belonging to that segment. Calls for successive prefill
+    // chunks are ordered and update the same FP16 output in place.
+    virtual DeviceStatus derope_query_segment_mean_f16_device(
+            DeviceTensor &q_mean, const DeviceTensor &q,
+            uint64_t q_elem_offset, uint64_t out_elem_offset,
+            uint32_t q_token_stride, uint32_t q_head_stride,
+            uint32_t cnt, uint32_t query_offset,
+            uint32_t query_tokens, uint32_t prototypes,
+            uint32_t n_heads, uint32_t head_dim, uint32_t rope_dim,
+            int32_t start_pos, float theta) {
+        (void)q_mean; (void)q; (void)q_elem_offset;
+        (void)out_elem_offset; (void)q_token_stride;
+        (void)q_head_stride; (void)cnt; (void)query_offset;
+        (void)query_tokens; (void)prototypes; (void)n_heads;
+        (void)head_dim; (void)rope_dim; (void)start_pos; (void)theta;
+        return {false,
+                "derope_query_segment_mean_f16_device requires backend override"};
+    }
+
     // Cross-request paged KV append. src layout is [batch, src_stride], each
     // row b writes to logical_positions[b] through the page-table slice
     // page_indices[page_indptr[b]..page_indptr[b+1]).

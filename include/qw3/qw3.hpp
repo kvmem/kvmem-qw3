@@ -181,6 +181,10 @@ struct EngineOptions {
     // (mean over question tokens) instead of recency. Default OFF -> behavior is
     // byte-identical to the recency/single-token retrieval path.
     bool kvmem_query_conditioned = false;
+    // Maximum number of query representations retained by query-conditioned
+    // mean-K retrieval. Longer queries are partitioned into this many
+    // contiguous ranges and represented by one de-RoPE'd mean-Q per range.
+    int kvmem_query_max_tokens = 512;
     // Re-prefill the query suffix against the just-selected semantic window.
     // Enabled by default for query-conditioned mean-k; the first-pass query is
     // still used for retrieval scoring, while decode consumes the replayed KV.

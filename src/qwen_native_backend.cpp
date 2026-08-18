@@ -438,22 +438,81 @@ int32_t sample_token(const std::vector<float> &logits, float temp, float top_p,
     return sample_from(sampling_distribution(logits, temp, top_p, top_k, min_p), rng);
 }
 
-bool mask_tool_structure_logits(
-        std::vector<float> &logits,
+struct ToolStructureCandidates {
+    std::vector<float> logits;
+    std::vector<uint32_t> token_ids;
+    size_t grammar_legal = 0;
+    double grammar_build_ms = 0.0;
+};
+
+ToolStructureCandidates finite_tool_structure_candidates(
+        const std::vector<float> &logits,
         const detail::ToolStructureConstraint &constraint,
         const std::vector<std::string> &token_pieces) {
-    const size_t n = std::min(logits.size(), token_pieces.size());
-    bool any_finite = false;
-    for (size_t i = 0; i < logits.size(); ++i) {
-        const bool allowed =
-            i < n && constraint.allows_piece(token_pieces[i]);
-        if (!allowed) {
-            logits[i] = -std::numeric_limits<float>::infinity();
-        } else if (std::isfinite(logits[i])) {
-            any_finite = true;
-        }
+    bool cache_hit = false;
+    const detail::ToolStructureLegalTokens &legal =
+        constraint.legal_tokens(token_pieces, &cache_hit);
+    if (!cache_hit && env_flag_enabled("QW3_TOOL_STRUCTURE_TRACE")) {
+        std::ostringstream trace;
+        trace << "[qw3-tool-structure] legal_candidates "
+              << constraint.diagnostic_summary()
+              << " grammar_legal=" << legal.ids.size()
+              << " build_ms=" << std::fixed << std::setprecision(3)
+              << legal.build_ms;
+        std::cerr << trace.str() << "\n";
     }
-    return any_finite;
+    ToolStructureCandidates candidates;
+    candidates.grammar_legal = legal.ids.size();
+    candidates.grammar_build_ms = legal.build_ms;
+    candidates.logits.reserve(legal.ids.size());
+    candidates.token_ids.reserve(legal.ids.size());
+    for (uint32_t token : legal.ids) {
+        if (token >= logits.size() || !std::isfinite(logits[token])) continue;
+        candidates.logits.push_back(logits[token]);
+        candidates.token_ids.push_back(token);
+    }
+    return candidates;
+}
+
+std::string tool_structure_candidate_error(
+        const char *prefix, const std::vector<float> &logits,
+        const detail::ToolStructureConstraint &constraint,
+        const ToolStructureCandidates &candidates) {
+    size_t finite_vocab = 0;
+    for (float logit : logits) finite_vocab += std::isfinite(logit) ? 1 : 0;
+    std::ostringstream message;
+    message << prefix << " in state " << constraint.state_name()
+            << " (" << constraint.diagnostic_summary()
+            << " grammar_legal=" << candidates.grammar_legal
+            << " finite_legal=" << candidates.token_ids.size()
+            << " finite_vocab=" << finite_vocab
+            << " vocab=" << logits.size()
+            << " candidate_build_ms=" << std::fixed
+            << std::setprecision(3) << candidates.grammar_build_ms << ")";
+    return message.str();
+}
+
+int32_t sample_finite_tool_structure_candidate(
+        const std::vector<float> &logits, float temp, float top_p, int top_k,
+        float min_p, std::mt19937_64 &rng,
+        const detail::ToolStructureConstraint &constraint,
+        const std::vector<std::string> &token_pieces,
+        const char *error_prefix) {
+    ToolStructureCandidates candidates = finite_tool_structure_candidates(
+        logits, constraint, token_pieces);
+    if (candidates.token_ids.empty()) {
+        throw std::runtime_error(tool_structure_candidate_error(
+            error_prefix, logits, constraint, candidates));
+    }
+    const int32_t compact = sample_token(
+        candidates.logits, temp, top_p, top_k, min_p, rng);
+    if (compact < 0 ||
+        static_cast<size_t>(compact) >= candidates.token_ids.size()) {
+        throw std::runtime_error(tool_structure_candidate_error(
+            "tool structure constraint could not sample a legal token",
+            logits, constraint, candidates));
+    }
+    return static_cast<int32_t>(candidates.token_ids[compact]);
 }
 
 int32_t sample_tool_structure_token(
@@ -462,12 +521,10 @@ int32_t sample_tool_structure_token(
         const detail::ToolStructureConstraint &constraint,
         const std::vector<std::string> &token_pieces) {
     if (constraint.requires_full_mask()) {
-        if (!mask_tool_structure_logits(logits, constraint, token_pieces)) {
-            throw std::runtime_error(
-                "tool structure constraint has no finite legal token in state " +
-                constraint.state_name());
-        }
-        return sample_token(logits, temp, top_p, top_k, min_p, rng);
+        return sample_finite_tool_structure_candidate(
+            logits, temp, top_p, top_k, min_p, rng, constraint,
+            token_pieces,
+            "tool structure constraint has no finite legal token");
     }
 
     const int32_t candidate =
@@ -480,12 +537,9 @@ int32_t sample_tool_structure_token(
     // Outside a tool call and inside a free-form parameter value, nearly every
     // token is legal. Only pay the full-vocabulary scan when a sampled token
     // crosses a structural boundary in an invalid way.
-    if (!mask_tool_structure_logits(logits, constraint, token_pieces)) {
-        throw std::runtime_error(
-            "tool structure constraint rejected every token in state " +
-            constraint.state_name());
-    }
-    return sample_token(logits, temp, top_p, top_k, min_p, rng);
+    return sample_finite_tool_structure_candidate(
+        logits, temp, top_p, top_k, min_p, rng, constraint, token_pieces,
+        "tool structure constraint rejected every finite token");
 }
 
 std::vector<float> constrained_target_distribution(
@@ -512,12 +566,23 @@ std::vector<float> constrained_target_distribution(
     };
 
     if (!constraint || !token_pieces) return distribution(row);
-    if (constraint->requires_full_mask()) {
-        if (!mask_tool_structure_logits(row, *constraint, *token_pieces)) {
-            throw std::runtime_error(
-                "MTP tool structure constraint has no legal target token");
+    auto constrained_distribution = [&]() {
+        ToolStructureCandidates candidates =
+            finite_tool_structure_candidates(row, *constraint, *token_pieces);
+        if (candidates.token_ids.empty()) {
+            throw std::runtime_error(tool_structure_candidate_error(
+                "MTP tool structure constraint has no finite legal target token",
+                row, *constraint, candidates));
         }
-        return distribution(row);
+        std::vector<float> compact = distribution(candidates.logits);
+        std::vector<float> expanded(row.size(), 0.0f);
+        for (size_t i = 0; i < compact.size(); ++i) {
+            expanded[candidates.token_ids[i]] = compact[i];
+        }
+        return expanded;
+    };
+    if (constraint->requires_full_mask()) {
+        return constrained_distribution();
     }
 
     std::vector<float> p = distribution(row);
@@ -536,11 +601,7 @@ std::vector<float> constrained_target_distribution(
         for (float &probability : p) probability *= inv;
         return p;
     }
-    if (!mask_tool_structure_logits(row, *constraint, *token_pieces)) {
-        throw std::runtime_error(
-            "MTP tool structure constraint rejected every target token");
-    }
-    return distribution(row);
+    return constrained_distribution();
 }
 
 struct SpecAcceptResult {
@@ -8986,6 +9047,8 @@ private:
         bs_cfg.optimize_stage_out = options_.kvmem_opt_stage_out;
         bs_cfg.optimize_stage_in = options_.kvmem_opt_stage_in;
         bs_cfg.optimize_pack = options_.kvmem_opt_pack;
+        bs_cfg.query_max_tokens = static_cast<uint32_t>(
+            std::max(1, options_.kvmem_query_max_tokens));
         exec.set_kvmem_enabled(true);
         exec.configure_kvmem(bs_cfg);
     }
@@ -11597,7 +11660,7 @@ private:
                         throw std::runtime_error(
                             "KVMem query replay first pass captured " +
                             std::to_string(
-                                executor_->kvmem_query_captured_tokens()) +
+                                executor_->kvmem_query_captured_source_tokens()) +
                             "/" +
                             std::to_string(
                                 executor_->kvmem_query_expected_tokens()) +
@@ -11899,7 +11962,7 @@ private:
                     throw std::runtime_error(
                         "KVMem query replay final pass captured " +
                         std::to_string(
-                            executor_->kvmem_query_captured_tokens()) +
+                            executor_->kvmem_query_captured_source_tokens()) +
                         "/" +
                         std::to_string(
                             executor_->kvmem_query_expected_tokens()) +
@@ -14807,7 +14870,7 @@ private:
                         throw std::runtime_error(
                             "KVMem query replay first pass captured " +
                             std::to_string(
-                                executor_->kvmem_query_captured_tokens()) +
+                                executor_->kvmem_query_captured_source_tokens()) +
                             "/" +
                             std::to_string(
                                 executor_->kvmem_query_expected_tokens()) +
@@ -15465,7 +15528,7 @@ private:
                     throw std::runtime_error(
                         "KVMem query replay final pass captured " +
                         std::to_string(
-                            executor_->kvmem_query_captured_tokens()) +
+                            executor_->kvmem_query_captured_source_tokens()) +
                         "/" +
                         std::to_string(
                             executor_->kvmem_query_expected_tokens()) +

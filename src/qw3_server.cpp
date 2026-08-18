@@ -2321,6 +2321,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << yesno(engine.kvmem_opt_pack) << "\n"
               << "  kvmem_query_conditioned="
               << yesno(engine.kvmem_query_conditioned) << "\n"
+              << "  kvmem_query_max_tokens="
+              << engine.kvmem_query_max_tokens << "\n"
               << "  kvmem_recompute_query="
               << yesno(engine.kvmem_recompute_query) << "\n"
               << "  kvmem_immutable_k="
@@ -4978,7 +4980,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         send_raw(fin);
                         sink.done();
                         std::cerr << "[qw3-serve] #" << rid
-                                  << " chat(stream) error=" << e.what() << "\n";
+                                  << " chat(stream) error=" << e.what()
+                                  << " completion_tokens=" << completion_tokens
+                                  << " chars=" << acc.size() << "\n";
                         ttft.log(rid, route, true,
                                  std::chrono::steady_clock::now());
                         return false;
