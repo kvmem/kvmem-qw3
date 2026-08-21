@@ -448,7 +448,6 @@ struct GenerationOptions {
         ProjectPolicy = 3,
         ExplicitClientPin = 4,
         RootTask = 5,
-        VisualEvidence = 6,
     };
     struct KvMemPinnedTokenSpan {
         uint32_t begin = 0;

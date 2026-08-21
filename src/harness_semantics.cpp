@@ -11,8 +11,6 @@ namespace {
 
 constexpr std::string_view kReminderOpen = "<system-reminder>";
 constexpr std::string_view kReminderClose = "</system-reminder>";
-constexpr std::string_view kVisualOpen = "<visual-evidence>";
-constexpr std::string_view kVisualClose = "</visual-evidence>";
 
 std::string ascii_lower(std::string_view value) {
     std::string out(value);
@@ -275,33 +273,6 @@ HarnessSemanticPlan derive_harness_semantic_plan(
         }
     }
 
-    // Captions emitted by the multimodal bridge are model-derived evidence,
-    // not control/query text. Keep each bounded visual frame independently so
-    // an older screenshot returned by a tool remains available after its tool
-    // transaction moves back into retrievable history.
-    for (const HarnessRenderedMessageSpan &span : messages) {
-        if (!valid_content_bounds(prompt, span) ||
-            (span.role != "user" && span.role != "tool")) {
-            continue;
-        }
-        const std::string_view content = prompt.substr(
-            span.content_begin, span.content_end - span.content_begin);
-        size_t cursor = 0;
-        while (cursor < content.size()) {
-            const size_t begin = content.find(kVisualOpen, cursor);
-            if (begin == std::string_view::npos) break;
-            const size_t close = content.find(
-                kVisualClose, begin + kVisualOpen.size());
-            if (close == std::string_view::npos) break;
-            const size_t end = close + kVisualClose.size();
-            plan.spans.push_back(HarnessByteSpan{
-                span.content_begin + begin,
-                span.content_begin + end,
-                HarnessSpanReason::VisualEvidence});
-            ++plan.visual_evidence_frame_count;
-            cursor = end;
-        }
-    }
     size_t first_relevant_policy = 0;
     std::optional<size_t> latest_baseline;
     for (size_t i = 0; i < policies.size(); ++i) {

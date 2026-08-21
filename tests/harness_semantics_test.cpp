@@ -257,35 +257,6 @@ void test_latest_policy_copy_is_exact_mandatory() {
             "stale policy copy remained mandatory");
 }
 
-void test_visual_evidence_is_bounded_mandatory() {
-    std::string prompt = "CONTROL\n";
-    const size_t control_end = prompt.size();
-    std::vector<HarnessRenderedMessageSpan> spans;
-    spans.push_back(append_message(prompt, 0, "user", "fix the UI"));
-    spans.push_back(append_message(prompt, 1, "assistant", "take screenshot"));
-    spans.push_back(append_message(
-        prompt, 2, "tool",
-        "prefix\n<visual-evidence>red error banner: build failed"
-        "</visual-evidence>\nsuffix"));
-    spans.push_back(append_message(prompt, 3, "assistant", "continue"));
-    spans.push_back(append_message(prompt, 4, "tool", "new output"));
-
-    const HarnessSemanticPlan plan = derive_harness_semantic_plan(
-        HarnessKind::ClaudeCode, prompt, control_end, spans);
-    require(count_reason(plan, HarnessSpanReason::VisualEvidence) == 1 &&
-                plan.visual_evidence_frame_count == 1,
-            "historical visual evidence was not independently retained");
-    const HarnessByteSpan *visual = find_reason(
-        plan, HarnessSpanReason::VisualEvidence);
-    require(visual != nullptr &&
-                prompt.substr(visual->begin, visual->end - visual->begin) ==
-                    "<visual-evidence>red error banner: build failed"
-                    "</visual-evidence>",
-            "visual mandatory span was not bounded to its marker");
-    require(plan.live_suffix_message_begin_index == 3,
-            "historical visual evidence expanded the live suffix");
-}
-
 void test_missing_control_prefix_does_not_invent_system_pin() {
     std::string prompt = "<user>run the tool</user>";
     std::vector<HarnessRenderedMessageSpan> spans;
@@ -318,7 +289,6 @@ int main() {
     test_new_user_query_is_its_own_live_suffix();
     test_tool_and_meta_turns_do_not_displace_root_or_current_task();
     test_latest_policy_copy_is_exact_mandatory();
-    test_visual_evidence_is_bounded_mandatory();
     test_missing_control_prefix_does_not_invent_system_pin();
     std::cout << "harness_semantics_test: PASS\n";
     return 0;

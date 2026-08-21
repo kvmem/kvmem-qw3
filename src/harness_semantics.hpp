@@ -60,7 +60,6 @@ enum class HarnessSpanReason {
     LiveToolTrajectory,
     ProjectPolicy,
     RootTask,
-    VisualEvidence,
 };
 
 struct HarnessByteSpan {
@@ -81,7 +80,6 @@ struct HarnessSemanticPlan {
     size_t history_end = 0;
     std::vector<HarnessByteSpan> spans;
     size_t project_policy_frame_count = 0;
-    size_t visual_evidence_frame_count = 0;
 };
 
 // True only when the whole message is composed of harness-owned reminder

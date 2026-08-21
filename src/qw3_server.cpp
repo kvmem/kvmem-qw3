@@ -3168,15 +3168,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     return GenerationOptions::KvMemPinnedReason::ProjectPolicy;
                 case detail::HarnessSpanReason::RootTask:
                     return GenerationOptions::KvMemPinnedReason::RootTask;
-                case detail::HarnessSpanReason::VisualEvidence:
-                    return GenerationOptions::KvMemPinnedReason::VisualEvidence;
                 }
                 return GenerationOptions::KvMemPinnedReason::CurrentQuery;
             };
-            size_t reason_span_counts[6] = {0, 0, 0, 0, 0, 0};
+            size_t reason_span_counts[5] = {0, 0, 0, 0, 0};
             for (const detail::HarnessByteSpan &pin : semantic_plan.spans) {
                 const size_t index = static_cast<size_t>(pin.reason);
-                if (index < 6) ++reason_span_counts[index];
+                if (index < 5) ++reason_span_counts[index];
             }
 
             std::vector<size_t> token_bytes;
@@ -3266,7 +3264,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             std::vector<uint8_t> query_blocks(prompt_blocks, 0);
             std::vector<uint8_t> policy_blocks(prompt_blocks, 0);
             std::vector<uint8_t> live_blocks(prompt_blocks, 0);
-            std::vector<uint8_t> visual_blocks(prompt_blocks, 0);
             const uint32_t budget_tokens = g.kvmem_semantic_budget > 0
                 ? g.kvmem_semantic_budget
                 : static_cast<uint32_t>(
@@ -3292,8 +3289,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 case GenerationOptions::KvMemPinnedReason::RootTask:
                 case GenerationOptions::KvMemPinnedReason::ProjectPolicy:
                     return static_cast<uint8_t>(1);
-                case GenerationOptions::KvMemPinnedReason::VisualEvidence:
-                    return static_cast<uint8_t>(2);
                 case GenerationOptions::KvMemPinnedReason::LiveToolTrajectory:
                 case GenerationOptions::KvMemPinnedReason::ExplicitClientPin:
                     return static_cast<uint8_t>(0);
@@ -3321,9 +3316,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         break;
                     case GenerationOptions::KvMemPinnedReason::ProjectPolicy:
                         reason_blocks = &policy_blocks;
-                        break;
-                    case GenerationOptions::KvMemPinnedReason::VisualEvidence:
-                        reason_blocks = &visual_blocks;
                         break;
                     case GenerationOptions::KvMemPinnedReason::
                             LiveToolTrajectory:
@@ -3405,7 +3397,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             const uint32_t query_block_count = count_marked(query_blocks);
             const uint32_t policy_block_count = count_marked(policy_blocks);
             const uint32_t live_block_count = count_marked(live_blocks);
-            const uint32_t visual_block_count = count_marked(visual_blocks);
             const uint32_t mandatory_count = static_cast<uint32_t>(
                 mandatory_fit.hard_blocks.size());
             const uint32_t recent_budget_blocks =
@@ -3430,11 +3421,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << " spans_root=" << reason_span_counts[4]
                       << " spans_query=" << reason_span_counts[1]
                       << " spans_policy=" << reason_span_counts[3]
-                      << " spans_visual=" << reason_span_counts[5]
                       << " policy_frames="
                       << semantic_plan.project_policy_frame_count
-                      << " visual_frames="
-                      << semantic_plan.visual_evidence_frame_count
                       << " root_task_message="
                       << (semantic_plan.root_task_message_index.has_value()
                               ? std::to_string(
@@ -3468,7 +3456,6 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << " blocks_root=" << root_block_count
                       << " blocks_query=" << query_block_count
                       << " blocks_policy=" << policy_block_count
-                      << " blocks_visual=" << visual_block_count
                       << " blocks_live=" << live_block_count
                       << " mandatory_blocks_raw="
                       << mandatory_fit.raw_mandatory_blocks
