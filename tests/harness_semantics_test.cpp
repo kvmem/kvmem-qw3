@@ -110,120 +110,202 @@ void test_meta_message_detection() {
             "mixed real user content was incorrectly classified as meta-only");
 }
 
-void test_dsh_baseline_after_real_query() {
+const HarnessByteSpan *find_reason(const HarnessSemanticPlan &plan,
+                                   HarnessSpanReason reason) {
+    for (const HarnessByteSpan &span : plan.spans) {
+        if (span.reason == reason) return &span;
+    }
+    return nullptr;
+}
+
+void test_bounded_query_and_live_tool_suffix() {
     std::string prompt = "CONTROL\n";
     const size_t control_end = prompt.size();
     std::vector<HarnessRenderedMessageSpan> spans;
     spans.push_back(append_message(prompt, 0, "user", "fix the parser"));
-    spans.push_back(append_message(
-        prompt, 1, "user",
-        "<system-reminder>\n"
-        "The following workspace instructions may be relevant to your work.\n\n"
-        "Instructions from: AGENTS.md\n\nAlways run tests.\n"
-        "</system-reminder>"));
+    spans.push_back(append_message(prompt, 1, "assistant", "calling read"));
+    spans.push_back(append_message(prompt, 2, "tool", "old tool output"));
+    spans.push_back(append_message(prompt, 3, "assistant", "calling test"));
+    spans.push_back(append_message(prompt, 4, "tool", "latest test output"));
 
-    const HarnessSemanticPlan plan = derive_harness_semantic_plan(
-        HarnessKind::DeepSeekHarness, prompt, control_end, spans);
-    require(plan.current_query_message_index.has_value() &&
-                *plan.current_query_message_index == 0,
-            "DSH workspace baseline displaced the real current query");
-    require(count_reason(plan, HarnessSpanReason::SystemControl) == 1,
-            "control prefix was not pinned");
-    require(count_reason(plan, HarnessSpanReason::CurrentQuery) == 1,
-            "real DSH query was not pinned");
-    require(count_reason(plan, HarnessSpanReason::LiveToolTrajectory) == 1,
-            "post-query DSH baseline was not in the live trajectory");
-    require(count_reason(plan, HarnessSpanReason::ProjectPolicy) == 1 &&
-                plan.project_policy_frame_count == 1,
-            "DSH workspace baseline was not retained as project policy");
+    for (HarnessKind kind : {HarnessKind::ClaudeCode,
+                             HarnessKind::OpenCode,
+                             HarnessKind::DeepSeekHarness,
+                             HarnessKind::GenericToolClient}) {
+        const HarnessSemanticPlan plan = derive_harness_semantic_plan(
+            kind, prompt, control_end, spans);
+        require(count_reason(plan, HarnessSpanReason::SystemControl) == 1 &&
+                    count_reason(plan, HarnessSpanReason::CurrentQuery) == 1,
+                "control/query exact spans were not retained");
+        require(count_reason(plan, HarnessSpanReason::RootTask) == 0 &&
+                    plan.root_task_message_index == 0,
+                "one-turn root task was duplicated");
+        require(count_reason(plan, HarnessSpanReason::LiveToolTrajectory) == 0,
+                "live suffix leaked into exact mandatory spans");
+        require(plan.current_query_message_index == 0,
+                "real task was not identified as score query");
+        require(plan.live_suffix_message_begin_index == 3,
+                "latest tool transaction did not start at its assistant call");
+        require(plan.live_suffix_span.has_value() &&
+                    plan.live_suffix_span->begin == spans[3].segment_begin &&
+                    plan.live_suffix_span->end == prompt.size() &&
+                    plan.history_end == spans[3].segment_begin,
+                "bounded live suffix/history boundary is incorrect");
+        require(spans[1].segment_begin < plan.history_end &&
+                    spans[2].segment_end <= plan.history_end,
+                "completed tool transaction was not returned to history");
+    }
 }
 
-void test_opencode_nested_policy_latest_wins() {
+void test_claude_user_role_tool_response_and_parallel_results() {
+    std::string prompt = "CONTROL\n";
+    const size_t control_end = prompt.size();
+    std::vector<HarnessRenderedMessageSpan> spans;
+    spans.push_back(append_message(prompt, 0, "user", "implement feature"));
+    spans.push_back(append_message(prompt, 1, "assistant", "parallel calls"));
+    spans.push_back(append_message(
+        prompt, 2, "user", "<tool_response>first</tool_response>"));
+    spans.push_back(append_message(
+        prompt, 3, "user", "<tool_response>second</tool_response>"));
+    const HarnessSemanticPlan plan = derive_harness_semantic_plan(
+        HarnessKind::ClaudeCode, prompt, control_end, spans);
+    require(plan.current_query_message_index == 0,
+            "Claude user-role tool result displaced the task query");
+    require(plan.live_suffix_message_begin_index == 1 &&
+                plan.live_suffix_span->begin == spans[1].segment_begin,
+            "parallel Claude tool results did not retain their assistant call");
+}
+
+void test_new_user_query_is_its_own_live_suffix() {
+    std::string prompt = "CONTROL\n";
+    const size_t control_end = prompt.size();
+    std::vector<HarnessRenderedMessageSpan> spans;
+    spans.push_back(append_message(prompt, 0, "user", "first task"));
+    spans.push_back(append_message(prompt, 1, "assistant", "done"));
+    spans.push_back(append_message(prompt, 2, "user", "new task"));
+    const HarnessSemanticPlan plan = derive_harness_semantic_plan(
+        HarnessKind::OpenCode, prompt, control_end, spans);
+    require(plan.current_query_message_index == 2 &&
+                plan.live_suffix_message_begin_index == 2,
+            "latest real user query was not selected");
+    require(plan.root_task_message_index == 0 &&
+                count_reason(plan, HarnessSpanReason::RootTask) == 1,
+            "stable root task was not retained with a later instruction");
+    const HarnessByteSpan *root = find_reason(
+        plan, HarnessSpanReason::RootTask);
+    require(root != nullptr && root->begin == spans[0].segment_begin &&
+                root->end == spans[0].segment_end,
+            "root task span was not byte-exact");
+    require(plan.live_suffix_span->begin == spans[2].segment_begin,
+            "new query live suffix started before the query");
+}
+
+void test_tool_and_meta_turns_do_not_displace_root_or_current_task() {
+    std::string prompt = "CONTROL\n";
+    const size_t control_end = prompt.size();
+    std::vector<HarnessRenderedMessageSpan> spans;
+    spans.push_back(append_message(prompt, 0, "user", "exact root criteria"));
+    spans.push_back(append_message(prompt, 1, "assistant", "call"));
+    spans.push_back(append_message(
+        prompt, 2, "user", "<tool_response>result</tool_response>"));
+    spans.push_back(append_message(
+        prompt, 3, "user",
+        "<system-reminder>Answer without a thinking block.</system-reminder>"));
+    spans.push_back(append_message(prompt, 4, "user", "finish the task"));
+    spans.push_back(append_message(prompt, 5, "assistant", "call again"));
+    spans.push_back(append_message(prompt, 6, "tool", "latest result"));
+
+    for (HarnessKind kind : {HarnessKind::ClaudeCode,
+                             HarnessKind::OpenCode,
+                             HarnessKind::DeepSeekHarness}) {
+        const HarnessSemanticPlan plan = derive_harness_semantic_plan(
+            kind, prompt, control_end, spans);
+        require(plan.root_task_message_index == 0 &&
+                    plan.current_query_message_index == 4,
+                "tool/meta turn displaced root or current task");
+        require(count_reason(plan, HarnessSpanReason::RootTask) == 1 &&
+                    count_reason(plan, HarnessSpanReason::CurrentQuery) == 1,
+                "root/current lifetimes were not independently retained");
+        require(plan.live_suffix_message_begin_index == 5,
+                "latest tool suffix boundary changed after root pinning");
+    }
+}
+
+void test_latest_policy_copy_is_exact_mandatory() {
     std::string prompt = "CONTROL\n";
     const size_t control_end = prompt.size();
     std::vector<HarnessRenderedMessageSpan> spans;
     spans.push_back(append_message(prompt, 0, "user", "inspect package"));
-    spans.push_back(append_message(prompt, 1, "assistant", "calling read"));
+    spans.push_back(append_message(
+        prompt, 1, "tool",
+        "<system-reminder>\nInstructions from: pkg/AGENTS.md\nold\n"
+        "</system-reminder>"));
     spans.push_back(append_message(
         prompt, 2, "tool",
-        "file v1\n<system-reminder>\n"
-        "Instructions from: packages/app/AGENTS.md\nold policy\n"
+        "<system-reminder>\nUpdated instructions from: pkg/AGENTS.md\nnew\n"
         "</system-reminder>"));
-    spans.push_back(append_message(prompt, 3, "user", "read it again"));
-    spans.push_back(append_message(prompt, 4, "assistant", "calling read"));
-    spans.push_back(append_message(
-        prompt, 5, "tool",
-        "file v2\n<system-reminder>\n"
-        "Instructions from: packages/app/AGENTS.md\nnew policy\n"
-        "</system-reminder>"));
-    spans.push_back(append_message(prompt, 6, "user", "now edit it"));
-
     const HarnessSemanticPlan plan = derive_harness_semantic_plan(
         HarnessKind::OpenCode, prompt, control_end, spans);
-    require(plan.current_query_message_index.has_value() &&
-                *plan.current_query_message_index == 6,
-            "latest OpenCode task was not selected");
-    require(count_reason(plan, HarnessSpanReason::LiveToolTrajectory) == 0,
-            "completed historical tool chain was retained as live");
-    require(count_reason(plan, HarnessSpanReason::ProjectPolicy) == 1,
-            "latest nested OpenCode policy did not supersede the old copy");
-    const HarnessByteSpan *policy = nullptr;
-    for (const HarnessByteSpan &span : plan.spans) {
-        if (span.reason == HarnessSpanReason::ProjectPolicy) policy = &span;
-    }
+    require(count_reason(plan, HarnessSpanReason::ProjectPolicy) == 1 &&
+                plan.project_policy_frame_count == 1,
+            "latest keyed policy did not supersede its stale copy");
+    const HarnessByteSpan *policy = find_reason(
+        plan, HarnessSpanReason::ProjectPolicy);
     require(policy != nullptr &&
                 prompt.substr(policy->begin, policy->end - policy->begin)
-                    .find("new policy") != std::string::npos,
-            "the stale OpenCode policy won latest-path selection");
+                    .find("new") != std::string::npos,
+            "stale policy copy remained mandatory");
 }
 
-void test_claude_mixed_query_and_reminder() {
-    std::string prompt;
+void test_visual_evidence_is_bounded_mandatory() {
+    std::string prompt = "CONTROL\n";
+    const size_t control_end = prompt.size();
+    std::vector<HarnessRenderedMessageSpan> spans;
+    spans.push_back(append_message(prompt, 0, "user", "fix the UI"));
+    spans.push_back(append_message(prompt, 1, "assistant", "take screenshot"));
+    spans.push_back(append_message(
+        prompt, 2, "tool",
+        "prefix\n<visual-evidence>red error banner: build failed"
+        "</visual-evidence>\nsuffix"));
+    spans.push_back(append_message(prompt, 3, "assistant", "continue"));
+    spans.push_back(append_message(prompt, 4, "tool", "new output"));
+
+    const HarnessSemanticPlan plan = derive_harness_semantic_plan(
+        HarnessKind::ClaudeCode, prompt, control_end, spans);
+    require(count_reason(plan, HarnessSpanReason::VisualEvidence) == 1 &&
+                plan.visual_evidence_frame_count == 1,
+            "historical visual evidence was not independently retained");
+    const HarnessByteSpan *visual = find_reason(
+        plan, HarnessSpanReason::VisualEvidence);
+    require(visual != nullptr &&
+                prompt.substr(visual->begin, visual->end - visual->begin) ==
+                    "<visual-evidence>red error banner: build failed"
+                    "</visual-evidence>",
+            "visual mandatory span was not bounded to its marker");
+    require(plan.live_suffix_message_begin_index == 3,
+            "historical visual evidence expanded the live suffix");
+}
+
+void test_missing_control_prefix_does_not_invent_system_pin() {
+    std::string prompt = "<user>run the tool</user>";
     std::vector<HarnessRenderedMessageSpan> spans;
     spans.push_back(append_message(
-        prompt, 0, "user",
-        "implement the change\n"
-        "<system-reminder>\nInstructions from: CLAUDE.md\n"
-        "Use the project style.\n</system-reminder>"));
-    const HarnessSemanticPlan plan = derive_harness_semantic_plan(
-        HarnessKind::ClaudeCode, prompt, 0, spans);
-    require(plan.current_query_message_index.has_value() &&
-                *plan.current_query_message_index == 0,
-            "Claude query with an appended reminder was discarded");
-    require(count_reason(plan, HarnessSpanReason::CurrentQuery) == 1 &&
-                count_reason(plan, HarnessSpanReason::ProjectPolicy) == 1,
-            "Claude mixed query did not receive both lifetimes");
-}
+        prompt, 1, "tool",
+        "<system-reminder>Instructions from: AGENTS.md\npolicy"
+        "</system-reminder>"));
 
-void test_control_prefix_without_messages() {
-    const std::string prompt = "TOOLS AND SYSTEM";
-    const HarnessSemanticPlan plan = derive_harness_semantic_plan(
-        HarnessKind::OpenCode, prompt, prompt.size(), {});
-    require(count_reason(plan, HarnessSpanReason::SystemControl) == 1,
-            "message-free control prefix was not pinned");
-    require(!plan.current_query_message_index.has_value(),
-            "message-free prompt invented a current query");
-}
-
-void test_user_role_tool_response_is_not_a_query() {
-    std::string prompt;
-    std::vector<HarnessRenderedMessageSpan> spans;
-    spans.push_back(append_message(prompt, 0, "user", "run the tool"));
-    spans.push_back(append_message(prompt, 1, "assistant", "tool call"));
-    // The production renderer records assistant segment bounds but not a
-    // request-content subrange because generated thinking/tool XML is mixed in.
-    spans.back().content_begin = 0;
-    spans.back().content_end = 0;
-    spans.push_back(append_message(
-        prompt, 2, "user",
-        "<tool_response>tool output</tool_response>"));
-    const HarnessSemanticPlan plan = derive_harness_semantic_plan(
-        HarnessKind::GenericToolClient, prompt, 0, spans);
-    require(plan.current_query_message_index.has_value() &&
-                *plan.current_query_message_index == 0,
-            "user-role tool response displaced the real query");
-    require(count_reason(plan, HarnessSpanReason::LiveToolTrajectory) == 2,
-            "user-role tool response chain was not kept live");
+    const HarnessSemanticPlan missing = derive_harness_semantic_plan(
+        HarnessKind::OpenCode, prompt, 0, spans);
+    require(count_reason(missing, HarnessSpanReason::SystemControl) == 0 &&
+                count_reason(missing, HarnessSpanReason::ProjectPolicy) == 1,
+            "missing control boundary invented system pin or lost exact policy");
+    const HarnessSemanticPlan invalid = derive_harness_semantic_plan(
+        HarnessKind::OpenCode, prompt, prompt.size() + 1, spans);
+    require(count_reason(invalid, HarnessSpanReason::SystemControl) == 0,
+            "out-of-range control boundary was accepted");
+    require(derive_harness_semantic_plan(
+                HarnessKind::None, prompt, prompt.size(), spans).spans.empty(),
+            "unidentified client unexpectedly gained a mandatory span");
 }
 
 } // namespace
@@ -231,11 +313,13 @@ void test_user_role_tool_response_is_not_a_query() {
 int main() {
     test_harness_classification();
     test_meta_message_detection();
-    test_dsh_baseline_after_real_query();
-    test_opencode_nested_policy_latest_wins();
-    test_claude_mixed_query_and_reminder();
-    test_control_prefix_without_messages();
-    test_user_role_tool_response_is_not_a_query();
+    test_bounded_query_and_live_tool_suffix();
+    test_claude_user_role_tool_response_and_parallel_results();
+    test_new_user_query_is_its_own_live_suffix();
+    test_tool_and_meta_turns_do_not_displace_root_or_current_task();
+    test_latest_policy_copy_is_exact_mandatory();
+    test_visual_evidence_is_bounded_mandatory();
+    test_missing_control_prefix_does_not_invent_system_pin();
     std::cout << "harness_semantics_test: PASS\n";
     return 0;
 }

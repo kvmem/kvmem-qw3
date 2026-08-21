@@ -231,6 +231,14 @@ void usage(std::ostream &os) {
         "  --kvmem-query-replay  Replay the final user query after query-conditioned\n"
         "                        block selection. Requires --kvmem and\n"
         "                        --kvmem-query-conditioned. Default: off.\n"
+        "  --kvmem-guided-reselect M  Harness self-query trigger: off|boundary|\n"
+        "                        middecode|both. Default: off.\n"
+        "  --kvmem-guided-thinking-tokens N  Private planning cap. Default: 0\n"
+        "                        (generate the contextual retrieval query directly).\n"
+        "  --kvmem-guided-query-tokens N  Retrieval query cap, 1..512. Default: 256.\n"
+        "  --kvmem-middecode-trigger-tokens N  Refresh threshold within each\n"
+        "                        generation epoch. Default: 28672.\n"
+        "  --kvmem-middecode-max-refreshes N  Per-request cap, 0..8. Default: 2.\n"
         "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
@@ -750,6 +758,46 @@ int main(int argc, char **argv) {
                 }
             } else if (arg == "--kvmem-query-conditioned") {
                 engine.kvmem_query_conditioned = true;
+            } else if (arg == "--kvmem-guided-reselect") {
+                engine.kvmem_guided_reselect = need(arg);
+                if (engine.kvmem_guided_reselect != "off" &&
+                    engine.kvmem_guided_reselect != "boundary" &&
+                    engine.kvmem_guided_reselect != "middecode" &&
+                    engine.kvmem_guided_reselect != "both") {
+                    throw std::runtime_error(
+                        "--kvmem-guided-reselect must be "
+                        "off|boundary|middecode|both");
+                }
+            } else if (arg == "--kvmem-guided-thinking-tokens") {
+                engine.kvmem_guided_thinking_tokens =
+                    parse_int(need(arg), arg);
+                if (engine.kvmem_guided_thinking_tokens < 0 ||
+                    engine.kvmem_guided_thinking_tokens > 4096) {
+                    throw std::runtime_error(
+                        "--kvmem-guided-thinking-tokens must be in [0,4096]");
+                }
+            } else if (arg == "--kvmem-guided-query-tokens") {
+                engine.kvmem_guided_query_tokens = parse_int(need(arg), arg);
+                if (engine.kvmem_guided_query_tokens < 1 ||
+                    engine.kvmem_guided_query_tokens > 512) {
+                    throw std::runtime_error(
+                        "--kvmem-guided-query-tokens must be in [1,512]");
+                }
+            } else if (arg == "--kvmem-middecode-trigger-tokens") {
+                engine.kvmem_middecode_trigger_tokens =
+                    parse_int(need(arg), arg);
+                if (engine.kvmem_middecode_trigger_tokens < 1) {
+                    throw std::runtime_error(
+                        "--kvmem-middecode-trigger-tokens must be positive");
+                }
+            } else if (arg == "--kvmem-middecode-max-refreshes") {
+                engine.kvmem_middecode_max_refreshes =
+                    parse_int(need(arg), arg);
+                if (engine.kvmem_middecode_max_refreshes < 0 ||
+                    engine.kvmem_middecode_max_refreshes > 8) {
+                    throw std::runtime_error(
+                        "--kvmem-middecode-max-refreshes must be in [0,8]");
+                }
             } else if (arg == "--no-kvmem-recompute-query") {
                 engine.kvmem_recompute_query = false;
             } else if (arg == "--kvmem-immutable-k") {

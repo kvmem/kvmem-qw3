@@ -3,6 +3,8 @@
 #include "anthropic_adapter.hpp"
 #include "env_flags.hpp"
 #include "harness_semantics.hpp"
+#include "kvmem_request_plan.hpp"
+#include "kvmem_refresh_policy.hpp"
 #include "tool_call_stream.hpp"
 #include "qw3/qw3.hpp"
 #include "qw3/gguf.hpp"
@@ -28,10 +30,13 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace qw3 {
@@ -184,7 +189,11 @@ bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
            g.kvmem_query_attention_score_tokens == 0 &&
            g.kvmem_query_guided_thinking_max_tokens == 0 &&
            g.kvmem_query_guided_query_max_tokens == 0 &&
-           !g.kvmem_query_guided_direct;
+           !g.kvmem_query_guided_direct &&
+           g.kvmem_middecode_trigger_tokens == 0 &&
+           g.kvmem_middecode_steady_trigger_tokens == 0 &&
+           g.kvmem_middecode_max_refreshes == 0 &&
+           g.kvmem_middecode_query_max_tokens == 0;
 }
 
 json usage_json(size_t prompt_tokens, size_t completion_tokens) {
@@ -1379,6 +1388,7 @@ std::string render_messages(
         bool add_generation_prompt = true,
         bool require_tool_call = false,
         detail::HarnessKind harness_kind = detail::HarnessKind::None,
+        bool stable_harness_reasoning = false,
         size_t *control_prefix_end = nullptr) {
     size_t num_sys = 0;
     std::string merged_system;
@@ -1468,7 +1478,15 @@ std::string render_messages(
                 }
             }
             prompt += "<|im_start|>assistant\n";
-            if (add_generation_prompt && i > last_query_index) {
+            // Qwen's compact history convention drops earlier reasoning when
+            // a newer real user message arrives.  That rewrites the token
+            // prefix at the first assistant turn of a long tool trajectory
+            // and defeats persistent KVMem prefix reuse.  In the explicitly
+            // enabled harness+KVMem prefix mode, retain the already-rendered
+            // assistant framing so a new semantic query only appends a suffix.
+            // The default remains byte-identical for ordinary serving.
+            if (add_generation_prompt &&
+                (stable_harness_reasoning || i > last_query_index)) {
                 prompt += "<think>\n" + reasoning_content + "\n</think>\n\n";
             }
             prompt += assistant_content;
@@ -1648,6 +1666,28 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     }
     const bool mtp_enabled = !engine.native_mtp_trace && engine.native_mtp_chain > 0;
     engine.native_mtp_speculate = mtp_enabled;
+    const bool guided_boundary =
+        engine.kvmem_guided_reselect == "boundary" ||
+        engine.kvmem_guided_reselect == "both";
+    const bool guided_middecode =
+        engine.kvmem_guided_reselect == "middecode" ||
+        engine.kvmem_guided_reselect == "both";
+    if ((guided_boundary || guided_middecode) &&
+        (!engine.kvmem_enabled || !engine.kvmem_query_conditioned)) {
+        throw std::runtime_error(
+            "--kvmem-guided-reselect requires --kvmem and "
+            "--kvmem-query-conditioned");
+    }
+    if ((guided_boundary || guided_middecode) && !mtp_enabled) {
+        throw std::runtime_error(
+            "--kvmem-guided-reselect currently requires --mtp-chain > 0");
+    }
+    if (guided_middecode &&
+        engine.kvmem_middecode_trigger_tokens >= engine.kvmem_gen_budget) {
+        throw std::runtime_error(
+            "--kvmem-middecode-trigger-tokens must be smaller than "
+            "--kvmem-gen-budget");
+    }
     if (mtp_enabled && cfg.continuous_batching && !cfg.mtp_batched_draft_set) {
         cfg.mtp_batched_draft = true;
     }
@@ -1861,6 +1901,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << yesno(engine.kvmem_opt_pack) << "\n"
               << "  kvmem_query_conditioned="
               << yesno(engine.kvmem_query_conditioned) << "\n"
+              << "  kvmem_guided_reselect="
+              << engine.kvmem_guided_reselect << "\n"
+              << "  kvmem_guided_thinking_tokens="
+              << engine.kvmem_guided_thinking_tokens << "\n"
+              << "  kvmem_guided_query_tokens="
+              << engine.kvmem_guided_query_tokens << "\n"
+              << "  kvmem_middecode_trigger_tokens="
+              << engine.kvmem_middecode_trigger_tokens << "\n"
+              << "  kvmem_middecode_max_refreshes="
+              << engine.kvmem_middecode_max_refreshes << "\n"
               << "  kvmem_recompute_query="
               << yesno(engine.kvmem_recompute_query) << "\n"
               << "  kvmem_immutable_k="
@@ -1955,8 +2005,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 max_output_tokens, cfg.default_generation.max_tokens);
         }
         if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0) {
+            const uint64_t kvmem_cap = guided_middecode
+                ? static_cast<uint64_t>(engine.kvmem_gen_budget) +
+                    static_cast<uint64_t>(
+                        engine.kvmem_middecode_max_refreshes) *
+                    static_cast<uint64_t>(
+                        engine.kvmem_middecode_trigger_tokens)
+                : static_cast<uint64_t>(engine.kvmem_gen_budget);
             max_output_tokens = std::min(
-                max_output_tokens, engine.kvmem_gen_budget);
+                max_output_tokens,
+                static_cast<int>(std::min<uint64_t>(
+                    kvmem_cap,
+                    static_cast<uint64_t>(
+                        std::numeric_limits<int>::max()))));
         }
 
         json out = {
@@ -2038,7 +2099,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     // the Qwen3-recommended preset for the request's thinking mode (see below);
     // any field the client sends overrides it.
     auto make_gen = [&](const json &req, size_t prompt_token_count,
-                        bool enable_thinking = true) -> GenerationOptions {
+                        bool enable_thinking = true,
+                        bool allow_kvmem_multi_epoch = false)
+            -> GenerationOptions {
         GenerationOptions g = cfg.default_generation;
         // Qwen3-recommended sampling preset per mode, applied only where the
         // user did not pin the value on the CLI or in the request. Thinking:
@@ -2087,16 +2150,28 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << " (remaining context)\n";
             g.max_tokens = remaining_ctx;
         }
-        // kvmem: a single turn's generation must not exceed the GPU pool's
-        // generation reserve (--kvmem-gen-budget). The bounded pool is sized for
-        // select_budget + gen_budget, so capping max_tokens at gen_budget keeps
-        // step-mode decode (which never stages out) from exhausting the pool.
+        // Ordinarily one turn cannot exceed the physical generation reserve.
+        // Mid-decode guided reselection explicitly starts a new bounded epoch;
+        // cap the request by the configured number of epochs instead of by one
+        // reserve, while the backend still enforces each epoch independently.
+        const uint64_t kvmem_request_output_cap = allow_kvmem_multi_epoch
+            ? static_cast<uint64_t>(std::max(0, engine.kvmem_gen_budget)) +
+                static_cast<uint64_t>(
+                    std::max(0, engine.kvmem_middecode_max_refreshes)) *
+                static_cast<uint64_t>(
+                    std::max(0, engine.kvmem_middecode_trigger_tokens))
+            : static_cast<uint64_t>(
+                  std::max(0, engine.kvmem_gen_budget));
         if (engine.kvmem_enabled && engine.kvmem_gen_budget > 0 &&
-            g.max_tokens > engine.kvmem_gen_budget) {
+            static_cast<uint64_t>(g.max_tokens) > kvmem_request_output_cap) {
             std::cerr << "[qw3-serve] capping request max_tokens from "
-                      << g.max_tokens << " to " << engine.kvmem_gen_budget
-                      << " (kvmem gen budget)\n";
-            g.max_tokens = engine.kvmem_gen_budget;
+                      << g.max_tokens << " to " << kvmem_request_output_cap
+                      << (allow_kvmem_multi_epoch
+                              ? " (kvmem multi-epoch output cap)\n"
+                              : " (kvmem gen budget)\n");
+            g.max_tokens = static_cast<int>(std::min<uint64_t>(
+                kvmem_request_output_cap,
+                static_cast<uint64_t>(std::numeric_limits<int>::max())));
         }
         g.temperature = req.value("temperature", g.temperature);
         g.top_p = req.value("top_p", g.top_p);
@@ -2140,14 +2215,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             uint64_t query_max = 0;
             if (!parse_bounded_json_u64(
                     req["kvmem_query_guided_thinking_max_tokens"],
-                    guided_direct ? 0 : 1,
-                    std::numeric_limits<uint32_t>::max(), thinking_max) ||
+                    guided_direct ? 0 : 1, 4096, thinking_max) ||
                 !parse_bounded_json_u64(
                     req["kvmem_query_guided_query_max_tokens"], 1,
-                    std::numeric_limits<uint32_t>::max(), query_max)) {
+                    512, query_max)) {
                 throw std::invalid_argument(
-                    "guided-query thinking/query limits must be positive "
-                    "uint32 integers");
+                    "guided-query thinking/query limits must be integers in "
+                    "[1,4096] (or 0 for direct mode) and [1,512] "
+                    "respectively");
             }
             g.kvmem_query_guided_thinking_max_tokens =
                 static_cast<uint32_t>(thinking_max);
@@ -2728,6 +2803,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             !explicit_retrieval_groups;
         const bool map_retrieval_groups =
             explicit_retrieval_groups || auto_message_groups;
+        const bool stable_harness_reasoning =
+            harness_semantic_pins && cfg.kvmem_prefix_cache;
         size_t control_prefix_end = 0;
         const auto server_render_start = std::chrono::steady_clock::now();
         const std::string prompt = render_messages(
@@ -2738,12 +2815,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             /*add_generation_prompt=*/!prefill_only,
             /*require_tool_call=*/tool_choice_required,
             harness.kind,
+            stable_harness_reasoning,
             harness_semantic_pins ? &control_prefix_end : nullptr);
         const auto server_render_end = std::chrono::steady_clock::now();
         std::vector<int32_t> prompt_token_ids =
             usage_tokenizer.encode(prompt);
         const auto server_tokenize_end = std::chrono::steady_clock::now();
         size_t prompt_token_count = prompt_token_ids.size();
+        std::optional<detail::HarnessSemanticPlan> harness_semantic_plan;
+        if (harness_semantic_pins) {
+            harness_semantic_plan = detail::derive_harness_semantic_plan(
+                harness.kind, prompt, control_prefix_end,
+                rendered_message_spans);
+        }
         if (archive_prefix_tokens + prompt_token_count >=
             static_cast<uint64_t>(std::max(1, engine.ctx_size))) {
             set_error_response(
@@ -2756,9 +2840,175 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     " ctx=" + std::to_string(engine.ctx_size));
             return;
         }
+        const bool above_selection_budget =
+            archive_prefix_tokens + prompt_token_count >
+                static_cast<uint64_t>(std::max(0, engine.kvmem_budget));
+        bool private_guided_refresh = false;
+        bool private_refresh_requires_pressure = false;
+        bool headroom_grace = false;
+        bool initial_headroom_grace = false;
+        uint32_t grace_middecode_trigger_tokens = 0;
+        uint32_t grace_epoch_limit_tokens = 0;
+        uint64_t cross_turn_delta_tokens = 0;
+        bool same_task_guided_suppressed = false;
+        std::optional<size_t> guided_trajectory_key;
+        detail::KvmemHarnessRefreshReason harness_refresh_reason =
+            detail::KvmemHarnessRefreshReason::None;
+        if ((guided_boundary || guided_middecode) &&
+            harness.kind != detail::HarnessKind::None &&
+            !req["messages"].empty() && harness_semantic_plan.has_value()) {
+            const detail::HarnessSemanticPlan &semantic_plan =
+                *harness_semantic_plan;
+            const size_t fallback_query_index =
+                last_query_index_for_template(req["messages"], harness.kind);
+            const size_t root_index =
+                semantic_plan.root_task_message_index.value_or(
+                    fallback_query_index);
+            const size_t current_index =
+                semantic_plan.current_query_message_index.value_or(
+                    fallback_query_index);
+            auto message_identity = [&](size_t index) {
+                std::string identity = std::to_string(index) + ":";
+                if (index < req["messages"].size()) {
+                    const json &message = req["messages"][index];
+                    identity += message.value("role", "") + ":" +
+                        dump_json(message.contains("content")
+                            ? message["content"] : json());
+                }
+                return identity;
+            };
+            const size_t trajectory_key = std::hash<std::string>{}(
+                std::to_string(static_cast<int>(harness.kind)) + ":" +
+                message_identity(root_index));
+            const size_t current_query_key =
+                std::hash<std::string>{}(message_identity(current_index));
+            guided_trajectory_key = trajectory_key;
+            const uint64_t logical_prompt_tokens =
+                archive_prefix_tokens + prompt_token_count;
+            std::lock_guard<std::mutex> lock(guided_trajectory_mu);
+            if (guided_trajectories.size() >= 128 &&
+                guided_trajectories.find(trajectory_key) ==
+                    guided_trajectories.end()) {
+                guided_trajectories.clear();
+            }
+            auto state_it = guided_trajectories.find(trajectory_key);
+            bool known_task = state_it != guided_trajectories.end();
+            if (!known_task) {
+                state_it = guided_trajectories.emplace(
+                    trajectory_key, GuidedTrajectoryState{}).first;
+            }
+            GuidedTrajectoryState &state = state_it->second;
+            const detail::KvmemCrossTurnRefreshDecision decision =
+                detail::kvmem_cross_turn_refresh_decision(
+                    logical_prompt_tokens,
+                    state.last_seen_prompt_tokens,
+                    state.last_refresh_prompt_tokens,
+                    guided_middecode
+                        ? static_cast<uint64_t>(
+                              std::max(0,
+                                  engine.kvmem_middecode_trigger_tokens))
+                        : 0);
+            if (decision.reset) {
+                state.last_refresh_prompt_tokens = 0;
+                state.selection_started = false;
+            }
+            const bool same_user_query =
+                known_task && !decision.reset && state.has_current_query &&
+                state.current_query_key == current_query_key;
+            const detail::KvmemHarnessRefreshDecision refresh =
+                detail::kvmem_harness_refresh_decision(
+                    detail::KvmemHarnessRefreshInput{
+                        known_task && !decision.reset,
+                        same_user_query,
+                        state.selection_started,
+                        kvmem_reselect_mode != KvMemReselectMode::Off,
+                        kvmem_reselect_mode == KvMemReselectMode::Force,
+                        decision.reset,
+                        logical_prompt_tokens,
+                        static_cast<uint64_t>(
+                            std::max(0, engine.kvmem_budget)),
+                        guided_middecode
+                            ? static_cast<uint64_t>(std::max(
+                                  0,
+                                  engine.kvmem_middecode_trigger_tokens))
+                            : 0,
+                        decision});
+            harness_refresh_reason = refresh.reason;
+            if (refresh.reselect) {
+                private_guided_refresh = refresh.private_query;
+                cross_turn_delta_tokens = decision.delta_tokens;
+                private_refresh_requires_pressure =
+                    detail::kvmem_private_refresh_requires_pressure(
+                        private_guided_refresh,
+                        state.selection_started,
+                        decision.delta_tokens,
+                        logical_prompt_tokens,
+                        static_cast<uint64_t>(
+                            std::max(0, engine.kvmem_budget)),
+                        static_cast<uint64_t>(
+                            std::max(0, engine.kvmem_gen_budget)));
+                if (kvmem_reselect_mode != KvMemReselectMode::Force) {
+                    kvmem_reselect_mode = KvMemReselectMode::Auto;
+                }
+            } else if (above_selection_budget) {
+                headroom_grace = refresh.headroom_grace;
+                initial_headroom_grace = refresh.initial_headroom_grace;
+                if (headroom_grace) {
+                    grace_middecode_trigger_tokens = static_cast<uint32_t>(
+                        std::min<uint64_t>(
+                            refresh.middecode_tokens_until_refresh,
+                            std::numeric_limits<uint32_t>::max()));
+                    const uint64_t epoch_tokens_used = state.selection_started
+                        ? decision.delta_tokens
+                        : logical_prompt_tokens - static_cast<uint64_t>(
+                              std::max(0, engine.kvmem_budget));
+                    const uint64_t generation_budget = static_cast<uint64_t>(
+                        std::max(0, engine.kvmem_gen_budget));
+                    grace_epoch_limit_tokens = static_cast<uint32_t>(
+                        std::min<uint64_t>(
+                            generation_budget > epoch_tokens_used
+                                ? generation_budget - epoch_tokens_used
+                                : 1,
+                            std::numeric_limits<uint32_t>::max()));
+                }
+                same_task_guided_suppressed = known_task;
+                cross_turn_delta_tokens = decision.delta_tokens;
+                kvmem_reselect_mode = KvMemReselectMode::Off;
+            }
+            state.last_seen_prompt_tokens = logical_prompt_tokens;
+            state.current_query_key = current_query_key;
+            state.has_current_query = true;
+        }
+        if (same_task_guided_suppressed) {
+            std::cerr
+                << "[qw3-serve] KVMem harness continuation gate harness="
+                << detail::harness_kind_name(harness.kind)
+                << " reselect=off trajectory_delta_tokens="
+                << cross_turn_delta_tokens
+                << " threshold="
+                << engine.kvmem_middecode_trigger_tokens
+                << " initial_headroom_grace="
+                << (initial_headroom_grace ? 1 : 0)
+                << " headroom_grace=" << (headroom_grace ? 1 : 0)
+                << " middecode_until_refresh="
+                << grace_middecode_trigger_tokens << "\n";
+        }
+        const bool automatic_harness_retrieval =
+            harness.kind != detail::HarnessKind::None &&
+            above_selection_budget &&
+            kvmem_reselect_mode != KvMemReselectMode::Off;
+        const bool automatic_harness_refresh_active =
+            automatic_harness_retrieval || headroom_grace;
+        const bool keep_refresh_epoch =
+            detail::kvmem_refresh_prefill_keeps_epoch(
+                headroom_grace,
+                automatic_harness_retrieval && private_guided_refresh &&
+                    !private_refresh_requires_pressure);
         GenerationOptions g;
         try {
-            g = make_gen(req, prompt_token_count, enable_thinking);
+            g = make_gen(req, prompt_token_count, enable_thinking,
+                         automatic_harness_refresh_active &&
+                             guided_middecode);
         } catch (const std::invalid_argument &e) {
             set_error_response(res, 400, e.what());
             return;
@@ -2766,12 +3016,106 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.raw_prompt = true; // prompt is already chat-framed
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
         g.kvmem_reselect_mode = kvmem_reselect_mode;
+        g.kvmem_prepare_query_only =
+            above_selection_budget && same_task_guided_suppressed;
         g.kvmem_prefill_window_mode = kvmem_prefill_window_mode;
+        if (keep_refresh_epoch) {
+            if (req.contains("kvmem_prefill_window") &&
+                kvmem_prefill_window_mode !=
+                    KvMemPrefillWindowMode::KeepSelected) {
+                set_error_response(
+                    res, 400,
+                    "an active KVMem A+B/private-query epoch requires "
+                    "kvmem_prefill_window=keep_selected (or omit the field)");
+                return;
+            }
+            g.kvmem_prefill_window_mode =
+                KvMemPrefillWindowMode::KeepSelected;
+        }
         g.kvmem_prefill_semantic_start_tokens =
             kvmem_prefill_semantic_start_tokens;
         g.kvmem_prefill_semantic_query_tokens =
             kvmem_prefill_semantic_query_tokens;
         g.kvmem_session_id = kvmem_session_id;
+        const bool request_has_guided_query =
+            req.contains("kvmem_query_guided_thinking_max_tokens") ||
+            req.contains("kvmem_query_guided_query_max_tokens") ||
+            req.contains("kvmem_query_guided_direct");
+        if (automatic_harness_retrieval && private_guided_refresh &&
+            !request_has_guided_query) {
+            g.kvmem_query_guided_thinking_max_tokens =
+                static_cast<uint32_t>(
+                    engine.kvmem_guided_thinking_tokens);
+            g.kvmem_query_guided_query_max_tokens =
+                static_cast<uint32_t>(engine.kvmem_guided_query_tokens);
+            g.kvmem_query_guided_direct = false;
+        }
+        if (automatic_harness_refresh_active && guided_middecode) {
+            g.kvmem_middecode_trigger_tokens = headroom_grace
+                ? std::max<uint32_t>(1, grace_middecode_trigger_tokens)
+                : static_cast<uint32_t>(
+                      engine.kvmem_middecode_trigger_tokens);
+            g.kvmem_middecode_steady_trigger_tokens =
+                static_cast<uint32_t>(
+                    engine.kvmem_middecode_trigger_tokens);
+            g.kvmem_middecode_max_refreshes = static_cast<uint32_t>(
+                engine.kvmem_middecode_max_refreshes);
+            g.kvmem_middecode_query_max_tokens = static_cast<uint32_t>(
+                engine.kvmem_guided_query_tokens);
+            g.kvmem_middecode_epoch_limit_tokens = headroom_grace
+                ? std::max<uint32_t>(1, grace_epoch_limit_tokens)
+                : static_cast<uint32_t>(
+                      std::max(1, engine.kvmem_gen_budget));
+        }
+        if (automatic_harness_refresh_active &&
+            !g.kvmem_refresh_observer &&
+            guided_trajectory_key.has_value()) {
+            const size_t trajectory_key = *guided_trajectory_key;
+            const uint64_t request_prompt_tokens =
+                archive_prefix_tokens + prompt_token_count;
+            g.kvmem_refresh_observer =
+                [&, trajectory_key, request_prompt_tokens](
+                        uint32_t decoded_tokens) {
+                    std::lock_guard<std::mutex> lock(
+                        guided_trajectory_mu);
+                    const auto it = guided_trajectories.find(
+                        trajectory_key);
+                    if (it == guided_trajectories.end()) return;
+                    GuidedTrajectoryState &state = it->second;
+                    state.selection_started = true;
+                    state.last_refresh_prompt_tokens =
+                        detail::kvmem_saturating_add_u64(
+                            request_prompt_tokens, decoded_tokens);
+                    state.last_seen_prompt_tokens = std::max(
+                        state.last_seen_prompt_tokens,
+                        state.last_refresh_prompt_tokens);
+                };
+        }
+        if (automatic_harness_refresh_active &&
+            (guided_boundary || guided_middecode)) {
+            std::cerr
+                << "[qw3-serve] KVMem automatic retrieval harness="
+                << detail::harness_kind_name(harness.kind)
+                << " mode=" << engine.kvmem_guided_reselect
+                << " trigger="
+                << detail::kvmem_harness_refresh_reason_name(
+                       harness_refresh_reason)
+                << " trajectory_delta_tokens="
+                << cross_turn_delta_tokens
+                << " prompt_tokens=" << prompt_token_count
+                << " boundary_query_tokens="
+                << g.kvmem_query_guided_query_max_tokens
+                << " middecode_trigger="
+                << g.kvmem_middecode_trigger_tokens
+                << " middecode_steady_trigger="
+                << g.kvmem_middecode_steady_trigger_tokens
+                << " max_refreshes="
+                << g.kvmem_middecode_max_refreshes
+                << " middecode_query_tokens="
+                << g.kvmem_middecode_query_max_tokens
+                << " epoch_limit="
+                << g.kvmem_middecode_epoch_limit_tokens << "\n";
+        }
         if (kvmem_cache_request) {
             if (kvmem_cache_operation == "save") {
                 g.kvmem_cache_save_id = kvmem_cache_id;
@@ -2786,15 +3130,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
         }
 
-        // Harness-aware production pins. The common renderer records exact
-        // provenance boundaries; the semantic layer distinguishes request
-        // control, the real current task, the live tool trajectory, and
-        // durable workspace policy frames before mapping them to tokens.
+        uint32_t request_raw_mandatory_blocks = 0;
+        uint32_t request_mandatory_blocks = 0;
+        uint32_t request_raw_live_suffix_blocks = 0;
+        uint32_t request_live_suffix_blocks = 0;
+        uint32_t request_soft_retrievable_blocks = 0;
+        uint32_t request_sink_blocks = 0;
+        uint32_t request_retrieval_reserve_blocks = 0;
+        bool request_capacity_fitted = false;
+
+        // Harness-aware semantic lifetimes. Stable controls, the exact task,
+        // and deduplicated policy frames are bounded mandatory spans. The
+        // unfinished tool transaction is a separate replay suffix; completed
+        // tool rounds remain ordinary semantic candidates.
         if (harness_semantic_pins) {
-            const detail::HarnessSemanticPlan semantic_plan =
-                detail::derive_harness_semantic_plan(
-                    harness.kind, prompt, control_prefix_end,
-                    rendered_message_spans);
+            const detail::HarnessSemanticPlan &semantic_plan =
+                *harness_semantic_plan;
             auto generation_reason = [](detail::HarnessSpanReason reason) {
                 switch (reason) {
                 case detail::HarnessSpanReason::SystemControl:
@@ -2806,13 +3157,17 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         LiveToolTrajectory;
                 case detail::HarnessSpanReason::ProjectPolicy:
                     return GenerationOptions::KvMemPinnedReason::ProjectPolicy;
+                case detail::HarnessSpanReason::RootTask:
+                    return GenerationOptions::KvMemPinnedReason::RootTask;
+                case detail::HarnessSpanReason::VisualEvidence:
+                    return GenerationOptions::KvMemPinnedReason::VisualEvidence;
                 }
                 return GenerationOptions::KvMemPinnedReason::CurrentQuery;
             };
-            size_t reason_span_counts[4] = {0, 0, 0, 0};
+            size_t reason_span_counts[6] = {0, 0, 0, 0, 0, 0};
             for (const detail::HarnessByteSpan &pin : semantic_plan.spans) {
                 const size_t index = static_cast<size_t>(pin.reason);
-                if (index < 4) ++reason_span_counts[index];
+                if (index < 6) ++reason_span_counts[index];
             }
 
             std::vector<size_t> token_bytes;
@@ -2838,19 +3193,33 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 return;
             }
 
-            for (const detail::HarnessByteSpan &pin : semantic_plan.spans) {
+            auto map_byte_span = [&](const detail::HarnessByteSpan &span)
+                    -> std::optional<std::pair<uint32_t, uint32_t>> {
+                if (span.begin >= span.end || span.end > prompt.size()) {
+                    return std::nullopt;
+                }
                 const auto begin_it = std::upper_bound(
-                    token_bytes.begin(), token_bytes.end(), pin.begin);
+                    token_bytes.begin(), token_bytes.end(), span.begin);
                 const size_t token_begin = begin_it == token_bytes.begin()
                     ? 0
                     : static_cast<size_t>(
                           begin_it - token_bytes.begin() - 1);
                 const auto end_it = std::lower_bound(
-                    token_bytes.begin(), token_bytes.end(), pin.end);
+                    token_bytes.begin(), token_bytes.end(), span.end);
                 const size_t token_end = static_cast<size_t>(
                     end_it - token_bytes.begin());
                 if (token_begin >= token_end ||
                     token_end > prompt_token_ids.size()) {
+                    return std::nullopt;
+                }
+                return std::make_pair(
+                    static_cast<uint32_t>(token_begin),
+                    static_cast<uint32_t>(token_end));
+            };
+
+            for (const detail::HarnessByteSpan &pin : semantic_plan.spans) {
+                const auto mapped = map_byte_span(pin);
+                if (!mapped.has_value()) {
                     set_error_response(
                         res, 500,
                         "harness semantic region maps to an empty token span");
@@ -2858,17 +3227,37 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 }
                 g.kvmem_pinned_token_spans.push_back(
                     GenerationOptions::KvMemPinnedTokenSpan{
-                        static_cast<uint32_t>(token_begin),
-                        static_cast<uint32_t>(token_end),
+                        mapped->first,
+                        mapped->second,
                         generation_reason(pin.reason)});
+            }
+
+            std::optional<std::pair<uint32_t, uint32_t>> live_suffix_tokens;
+            if (semantic_plan.live_suffix_span.has_value()) {
+                live_suffix_tokens = map_byte_span(
+                    *semantic_plan.live_suffix_span);
+                if (!live_suffix_tokens.has_value()) {
+                    set_error_response(
+                        res, 500,
+                        "harness live suffix maps to an empty token span");
+                    return;
+                }
+                // kvmem_replay_* is deliberately independent of the score
+                // query. Only query-conditioned selection consumes it.
+                g.kvmem_replay_begin = live_suffix_tokens->first;
+                g.kvmem_replay_end = live_suffix_tokens->second;
             }
 
             const uint32_t block_tokens = static_cast<uint32_t>(
                 std::max(1, engine.kvmem_block_tokens));
             const uint32_t prompt_blocks = static_cast<uint32_t>(
                 (prompt_token_count + block_tokens - 1) / block_tokens);
-            std::vector<uint8_t> mandatory_blocks(prompt_blocks, 0);
-            uint32_t mandatory_count = 0;
+            std::vector<uint8_t> system_blocks(prompt_blocks, 0);
+            std::vector<uint8_t> root_blocks(prompt_blocks, 0);
+            std::vector<uint8_t> query_blocks(prompt_blocks, 0);
+            std::vector<uint8_t> policy_blocks(prompt_blocks, 0);
+            std::vector<uint8_t> live_blocks(prompt_blocks, 0);
+            std::vector<uint8_t> visual_blocks(prompt_blocks, 0);
             const uint32_t budget_tokens = g.kvmem_semantic_budget > 0
                 ? g.kvmem_semantic_budget
                 : static_cast<uint32_t>(
@@ -2880,60 +3269,326 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     engine.kvmem_recent_blocks,
                     engine.kvmem_sink_tokens,
                     engine.kvmem_recent_tokens);
-            auto mark_block = [&](uint32_t block) {
-                if (block < prompt_blocks && !mandatory_blocks[block]) {
-                    mandatory_blocks[block] = 1;
-                    ++mandatory_count;
-                }
-            };
             const uint32_t sink_blocks = std::min<uint32_t>(
                 harness_keep.sink_blocks,
                 prompt_blocks);
-            for (uint32_t block = 0; block < sink_blocks; ++block) {
-                mark_block(block);
-            }
+            request_sink_blocks = sink_blocks;
+            std::vector<detail::KvmemMandatoryBlockSpan> hard_spans;
+            hard_spans.reserve(g.kvmem_pinned_token_spans.size());
+            auto pin_priority = [](GenerationOptions::KvMemPinnedReason reason) {
+                switch (reason) {
+                case GenerationOptions::KvMemPinnedReason::SystemControl:
+                case GenerationOptions::KvMemPinnedReason::CurrentQuery:
+                    return static_cast<uint8_t>(0);
+                case GenerationOptions::KvMemPinnedReason::RootTask:
+                case GenerationOptions::KvMemPinnedReason::ProjectPolicy:
+                    return static_cast<uint8_t>(1);
+                case GenerationOptions::KvMemPinnedReason::VisualEvidence:
+                    return static_cast<uint8_t>(2);
+                case GenerationOptions::KvMemPinnedReason::LiveToolTrajectory:
+                case GenerationOptions::KvMemPinnedReason::ExplicitClientPin:
+                    return static_cast<uint8_t>(0);
+                }
+                return static_cast<uint8_t>(3);
+            };
             for (const auto &pin : g.kvmem_pinned_token_spans) {
                 const uint32_t first = pin.begin / block_tokens;
                 const uint32_t last = (pin.end - 1) / block_tokens;
+                hard_spans.push_back(detail::KvmemMandatoryBlockSpan{
+                    first, std::min<uint32_t>(last + 1, prompt_blocks),
+                    pin_priority(pin.reason)});
                 for (uint32_t block = first;
                      block <= last && block < prompt_blocks; ++block) {
-                    mark_block(block);
+                    std::vector<uint8_t> *reason_blocks = nullptr;
+                    switch (pin.reason) {
+                    case GenerationOptions::KvMemPinnedReason::SystemControl:
+                        reason_blocks = &system_blocks;
+                        break;
+                    case GenerationOptions::KvMemPinnedReason::CurrentQuery:
+                        reason_blocks = &query_blocks;
+                        break;
+                    case GenerationOptions::KvMemPinnedReason::RootTask:
+                        reason_blocks = &root_blocks;
+                        break;
+                    case GenerationOptions::KvMemPinnedReason::ProjectPolicy:
+                        reason_blocks = &policy_blocks;
+                        break;
+                    case GenerationOptions::KvMemPinnedReason::VisualEvidence:
+                        reason_blocks = &visual_blocks;
+                        break;
+                    case GenerationOptions::KvMemPinnedReason::
+                            LiveToolTrajectory:
+                        reason_blocks = &live_blocks;
+                        break;
+                    case GenerationOptions::KvMemPinnedReason::
+                            ExplicitClientPin:
+                        break;
+                    }
+                    if (reason_blocks) (*reason_blocks)[block] = 1;
+                }
+            }
+            uint32_t live_suffix_blocks = 0;
+            uint32_t live_first_block = prompt_blocks;
+            uint32_t live_end_block = prompt_blocks;
+            if (live_suffix_tokens.has_value()) {
+                const uint32_t first =
+                    live_suffix_tokens->first / block_tokens;
+                const uint32_t last =
+                    (live_suffix_tokens->second - 1) / block_tokens;
+                live_first_block = first;
+                live_end_block = std::min<uint32_t>(last + 1, prompt_blocks);
+                live_suffix_blocks = last - first + 1;
+                for (uint32_t block = first;
+                     block <= last && block < prompt_blocks; ++block) {
+                    live_blocks[block] = 1;
                 }
             }
             const uint32_t budget_blocks =
                 budget_tokens / block_tokens;
-            if (mandatory_count > budget_blocks) {
-                set_error_response(
-                    res, 413,
-                    std::string("Harness mandatory semantic context (") +
-                        detail::harness_kind_name(harness.kind) +
-                        ") requires " +
-                        std::to_string(mandatory_count * block_tokens) +
-                        " KVMem tokens but the active selection budget is " +
-                        std::to_string(budget_tokens) +
-                        "; spans(system/query/live/policy)=" +
-                        std::to_string(reason_span_counts[0]) + "/" +
-                        std::to_string(reason_span_counts[1]) + "/" +
-                        std::to_string(reason_span_counts[2]) + "/" +
-                        std::to_string(reason_span_counts[3]) +
-                        "; increase --kvmem-budget or reduce harness context");
-                return;
+            const detail::KvmemMandatoryFitResult mandatory_fit =
+                detail::kvmem_fit_mandatory_blocks(
+                    detail::KvmemMandatoryFitInput{
+                        prompt_blocks,
+                        budget_blocks,
+                        sink_blocks,
+                        harness_keep.recent_blocks,
+                        hard_spans,
+                        live_first_block,
+                        live_end_block});
+            // Executor pins are the fitted hard anchors only. Every omitted
+            // source block was still tokenized/prefilled and remains in the
+            // KVMem content index as an ordinary retrieval candidate.
+            g.kvmem_pinned_token_spans.clear();
+            for (size_t i = 0; i < mandatory_fit.hard_blocks.size();) {
+                const uint32_t first = mandatory_fit.hard_blocks[i];
+                uint32_t end = first + 1;
+                ++i;
+                while (i < mandatory_fit.hard_blocks.size() &&
+                       mandatory_fit.hard_blocks[i] == end) {
+                    ++end;
+                    ++i;
+                }
+                g.kvmem_pinned_token_spans.push_back(
+                    GenerationOptions::KvMemPinnedTokenSpan{
+                        first * block_tokens,
+                        static_cast<uint32_t>(std::min<uint64_t>(
+                            static_cast<uint64_t>(end) * block_tokens,
+                            prompt_token_count)),
+                        GenerationOptions::KvMemPinnedReason::
+                            ExplicitClientPin});
             }
+            if (live_suffix_tokens.has_value()) {
+                // Replay only the contiguous fitted tail. The full raw live
+                // transaction remains stored/retrievable but can no longer
+                // force A+N blocks back into the A-token active window.
+                g.kvmem_replay_begin = std::min<uint32_t>(
+                    mandatory_fit.replay_begin_block * block_tokens,
+                    static_cast<uint32_t>(prompt_token_count));
+                g.kvmem_replay_end =
+                    static_cast<uint32_t>(prompt_token_count);
+            }
+            const auto count_marked = [](const std::vector<uint8_t> &marks) {
+                return static_cast<uint32_t>(std::count(
+                    marks.begin(), marks.end(), static_cast<uint8_t>(1)));
+            };
+            const uint32_t system_block_count = count_marked(system_blocks);
+            const uint32_t root_block_count = count_marked(root_blocks);
+            const uint32_t query_block_count = count_marked(query_blocks);
+            const uint32_t policy_block_count = count_marked(policy_blocks);
+            const uint32_t live_block_count = count_marked(live_blocks);
+            const uint32_t visual_block_count = count_marked(visual_blocks);
+            const uint32_t mandatory_count = static_cast<uint32_t>(
+                mandatory_fit.hard_blocks.size());
+            const uint32_t recent_budget_blocks =
+                budget_blocks > mandatory_count
+                    ? budget_blocks - mandatory_count : 0;
+            request_raw_mandatory_blocks =
+                mandatory_fit.raw_mandatory_blocks;
+            request_mandatory_blocks = mandatory_count;
+            request_raw_live_suffix_blocks = live_suffix_blocks;
+            request_live_suffix_blocks = mandatory_fit.fitted_live_blocks;
+            request_soft_retrievable_blocks =
+                mandatory_fit.soft_retrievable_blocks;
+            request_retrieval_reserve_blocks =
+                mandatory_fit.retrieval_reserve_blocks;
+            request_capacity_fitted = mandatory_fit.capacity_fitted;
             std::cerr << "[qw3-serve] KVMem harness pins harness="
                       << detail::harness_kind_name(harness.kind)
                       << " compact=" << (harness.compact ? 1 : 0)
                       << " spans="
                       << g.kvmem_pinned_token_spans.size()
                       << " spans_system=" << reason_span_counts[0]
+                      << " spans_root=" << reason_span_counts[4]
                       << " spans_query=" << reason_span_counts[1]
-                      << " spans_live=" << reason_span_counts[2]
                       << " spans_policy=" << reason_span_counts[3]
+                      << " spans_visual=" << reason_span_counts[5]
                       << " policy_frames="
                       << semantic_plan.project_policy_frame_count
-                      << " mandatory_blocks=" << mandatory_count
+                      << " visual_frames="
+                      << semantic_plan.visual_evidence_frame_count
+                      << " root_task_message="
+                      << (semantic_plan.root_task_message_index.has_value()
+                              ? std::to_string(
+                                    *semantic_plan.root_task_message_index)
+                              : "none")
+                      << " score_query_message="
+                      << (semantic_plan.current_query_message_index.has_value()
+                              ? std::to_string(
+                                    *semantic_plan.current_query_message_index)
+                              : "none")
+                      << " live_suffix_message="
+                      << (semantic_plan.live_suffix_message_begin_index
+                                  .has_value()
+                              ? std::to_string(
+                                    *semantic_plan
+                                         .live_suffix_message_begin_index)
+                              : "none")
+                      << " live_suffix=["
+                      << (live_suffix_tokens.has_value()
+                              ? std::to_string(live_suffix_tokens->first)
+                              : "0")
+                      << ","
+                      << (live_suffix_tokens.has_value()
+                              ? std::to_string(live_suffix_tokens->second)
+                              : "0")
+                      << ") live_suffix_blocks_raw=" << live_suffix_blocks
+                      << " live_suffix_blocks_fitted="
+                      << mandatory_fit.fitted_live_blocks
+                      << " live_replay_begin=" << g.kvmem_replay_begin
+                      << " blocks_system=" << system_block_count
+                      << " blocks_root=" << root_block_count
+                      << " blocks_query=" << query_block_count
+                      << " blocks_policy=" << policy_block_count
+                      << " blocks_visual=" << visual_block_count
+                      << " blocks_live=" << live_block_count
+                      << " mandatory_blocks_raw="
+                      << mandatory_fit.raw_mandatory_blocks
+                      << " mandatory_blocks_fitted=" << mandatory_count
+                      << " soft_retrievable_blocks="
+                      << mandatory_fit.soft_retrievable_blocks
+                      << " retrieval_reserve_blocks="
+                      << mandatory_fit.retrieval_reserve_blocks
+                      << " capacity_fitted="
+                      << (mandatory_fit.capacity_fitted ? 1 : 0)
                       << " mandatory_tokens="
                       << mandatory_count * block_tokens
+                      << " recent_budget_blocks=" << recent_budget_blocks
+                      << " recent_budget_tokens="
+                      << recent_budget_blocks * block_tokens
                       << " budget_tokens=" << budget_tokens << "\n";
+        }
+
+        if (request_capacity_fitted && private_guided_refresh) {
+            // An oversized current transaction cannot be appended to the old
+            // A+B physical epoch even when a private semantic refresh is due.
+            // Ingest/index it under pressure first; the generated query then
+            // selects from the complete durable source.
+            g.kvmem_prefill_window_mode =
+                KvMemPrefillWindowMode::Pressure;
+            private_refresh_requires_pressure = true;
+        }
+
+        // The server owns semantic/capacity admission; the backend will
+        // finalize P/M checkpoint reuse on this same plan before touching GPU
+        // or executor state.
+        const uint64_t logical_prompt_tokens =
+            archive_prefix_tokens + prompt_token_count;
+        const bool planned_reselect = above_selection_budget &&
+            g.kvmem_reselect_mode != KvMemReselectMode::Off;
+        const bool planned_keep_selected = above_selection_budget &&
+            !planned_reselect &&
+            (g.kvmem_prefill_window_mode ==
+                 KvMemPrefillWindowMode::KeepSelected ||
+             g.kvmem_prepare_query_only);
+        detail::KvmemRequestPlanInput plan_input;
+        plan_input.enabled = engine.kvmem_enabled;
+        plan_input.reselect = planned_reselect;
+        plan_input.private_query =
+            planned_reselect && private_guided_refresh;
+        plan_input.keep_selected = planned_keep_selected;
+        plan_input.logical_prompt_tokens = logical_prompt_tokens;
+        plan_input.request_prompt_tokens = prompt_token_count;
+        plan_input.context_limit_tokens = static_cast<uint64_t>(
+            std::max(1, engine.ctx_size));
+        plan_input.selection_budget_tokens = static_cast<uint64_t>(
+            std::max(0, engine.kvmem_budget));
+        plan_input.generation_budget_tokens = static_cast<uint64_t>(
+            std::max(0, engine.kvmem_gen_budget));
+        plan_input.refresh_trigger_tokens = static_cast<uint64_t>(
+            std::max(0, engine.kvmem_middecode_trigger_tokens));
+        plan_input.requested_output_tokens = static_cast<uint32_t>(
+            std::max(0, g.max_tokens));
+        plan_input.block_tokens = static_cast<uint32_t>(
+            std::max(0, engine.kvmem_block_tokens));
+        plan_input.raw_mandatory_blocks = request_raw_mandatory_blocks;
+        plan_input.mandatory_blocks = request_mandatory_blocks;
+        plan_input.raw_live_suffix_blocks =
+            request_raw_live_suffix_blocks;
+        plan_input.live_suffix_blocks = request_live_suffix_blocks;
+        plan_input.soft_retrievable_blocks =
+            request_soft_retrievable_blocks;
+        plan_input.sink_blocks = request_sink_blocks;
+        plan_input.retrieval_reserve_blocks =
+            request_retrieval_reserve_blocks;
+        plan_input.capacity_fitted = request_capacity_fitted;
+        plan_input.pressure_ingest =
+            private_refresh_requires_pressure;
+        g.kvmem_request_plan =
+            detail::kvmem_draft_request_plan(plan_input);
+        if (g.kvmem_request_plan.action ==
+            KvMemRequestPlanAction::RejectBeforeExecution) {
+            const int status = g.kvmem_request_plan.reject_reason ==
+                    KvMemRequestPlanRejectReason::ContextLimit
+                ? 413
+                : (g.kvmem_request_plan.reject_reason ==
+                       KvMemRequestPlanRejectReason::InvalidBudget
+                       ? 400 : 500);
+            set_error_response(
+                res, status,
+                std::string("KVMem request admission rejected before ") +
+                    "execution: reason=" +
+                    detail::kvmem_request_plan_reject_name(
+                        g.kvmem_request_plan.reject_reason) +
+                    " prompt_tokens=" +
+                    std::to_string(logical_prompt_tokens) +
+                    " mandatory_blocks_raw=" +
+                    std::to_string(request_raw_mandatory_blocks) +
+                    " mandatory_blocks_fitted=" +
+                    std::to_string(request_mandatory_blocks) +
+                    " live_suffix_blocks_raw=" +
+                    std::to_string(request_raw_live_suffix_blocks) +
+                    " live_suffix_blocks_fitted=" +
+                    std::to_string(request_live_suffix_blocks) +
+                    " selection_budget_tokens=" +
+                    std::to_string(engine.kvmem_budget) +
+                    " block_tokens=" +
+                    std::to_string(engine.kvmem_block_tokens));
+            return;
+        }
+        if (engine.kvmem_enabled) {
+            std::cerr << "[qw3-serve] KVMem request plan stage=draft action="
+                      << detail::kvmem_request_plan_action_name(
+                             g.kvmem_request_plan.action)
+                      << " prompt_tokens=" << logical_prompt_tokens
+                      << " selection_budget=" << engine.kvmem_budget
+                      << " generation_budget=" << engine.kvmem_gen_budget
+                      << " mandatory_blocks_raw="
+                      << request_raw_mandatory_blocks
+                      << " mandatory_blocks_fitted="
+                      << request_mandatory_blocks
+                      << " live_suffix_blocks_raw="
+                      << request_raw_live_suffix_blocks
+                      << " live_suffix_blocks_fitted="
+                      << request_live_suffix_blocks
+                      << " soft_retrievable_blocks="
+                      << request_soft_retrievable_blocks
+                      << " retrieval_reserve_blocks="
+                      << request_retrieval_reserve_blocks
+                      << " capacity_fitted="
+                      << (request_capacity_fitted ? 1 : 0)
+                      << " pressure_ingest="
+                      << (g.kvmem_request_plan.pressure_ingest ? 1 : 0)
+                      << "\n";
         }
 
         // Optional semantic retrieval groups. Flattened benchmarks supply byte
@@ -3319,7 +3974,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         // launched with --kvmem-query-conditioned; otherwise the span stays empty
         // and selection is byte-identical to the single-token / recency path.
         if (engine.kvmem_query_conditioned &&
-            kvmem_reselect_mode != KvMemReselectMode::Off) {
+            (kvmem_reselect_mode != KvMemReselectMode::Off ||
+             g.kvmem_prepare_query_only)) {
             const json &msgs = req["messages"];
             bool explicit_span = false;
 
@@ -3373,7 +4029,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     /*message_spans=*/nullptr,
                     /*add_generation_prompt=*/!prefill_only,
                     /*require_tool_call=*/tool_choice_required,
-                    harness.kind);
+                    harness.kind,
+                    stable_harness_reasoning);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
                 size_t qb = 0;
@@ -3607,7 +4264,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     /*message_spans=*/nullptr,
                     /*add_generation_prompt=*/!prefill_only,
                     /*require_tool_call=*/tool_choice_required,
-                    harness.kind);
+                    harness.kind,
+                    stable_harness_reasoning);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
@@ -3694,7 +4352,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     /*message_spans=*/nullptr,
                     /*add_generation_prompt=*/!prefill_only,
                     /*require_tool_call=*/tool_choice_required,
-                    harness.kind);
+                    harness.kind,
+                    stable_harness_reasoning);
                 const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
                 const std::vector<int32_t> tok_empty =
                     usage_tokenizer.encode(empty_prompt);
@@ -3763,7 +4422,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         /*message_spans=*/nullptr,
                         /*add_generation_prompt=*/!prefill_only,
                         /*require_tool_call=*/tool_choice_required,
-                        harness.kind);
+                        harness.kind,
+                        stable_harness_reasoning);
                     const std::vector<int32_t> tok_full =
                         usage_tokenizer.encode(prompt);
                     const std::vector<int32_t> tok_empty =
@@ -4074,7 +4734,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                        engine_end,
                                    std::chrono::steady_clock::time_point
                                        response_end,
-                                   bool streaming) {
+                                   bool streaming,
+                                   bool stream_completed,
+                                   const std::string &terminal_error) {
                 auto ms = [](auto begin, auto end) {
                     return std::chrono::duration<double, std::milli>(
                                end - begin)
@@ -4125,6 +4787,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                           << " pre_sum_ms=" << preprocess_sum_ms
                           << " pre_error_ms="
                           << (preprocess_ms - preprocess_sum_ms)
+                          << " stream_completed="
+                          << (streaming ? (stream_completed ? 1 : 0) : 1)
+                          << " terminal_status="
+                          << (terminal_error.empty()
+                                  ? (stream_completed ? "success"
+                                                      : "client_closed")
+                                  : "error")
+                          << " terminal_error="
+                          << dump_json(terminal_error)
                           << "\n";
             };
 
@@ -4426,7 +5097,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                 ttft.log(rid, route, true, request_end);
                                 log_server_accounting(
                                     engine_start, engine_end,
-                                    request_end, true);
+                                    request_end, true,
+                                    /*stream_completed=*/false,
+                                    /*terminal_error=*/"");
                                 std::cerr << "[qw3-serve] #" << rid
                                           << " chat(stream tools) chars="
                                           << acc.size()
@@ -4553,7 +5226,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             ttft.log(rid, route, true, request_end);
                             log_server_accounting(
                                 engine_start, engine_end,
-                                request_end, true);
+                                request_end, true,
+                                /*stream_completed=*/true,
+                                /*terminal_error=*/"");
                             return true;
                         }
                         generate_request([&](const std::string &piece) {
@@ -4593,7 +5268,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         ttft.log(rid, route, true, request_end);
                         log_server_accounting(
                             engine_start, engine_end,
-                            request_end, true);
+                            request_end, true,
+                            /*stream_completed=*/true,
+                            /*terminal_error=*/"");
                         return true;
                     } catch (const std::exception &e) {
                         json chunk = {
@@ -4606,13 +5283,21 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             {"error", e.what()}};
                         const std::string s = "data: " + dump_json(chunk) + "\n\n";
                         send_raw(s);
-                        const std::string fin = "data: [DONE]\n\n";
-                        send_raw(fin);
+                        // Do not append [DONE]: for protocol adapters an error
+                        // is terminal and must not be followed by a synthetic
+                        // successful message_stop.
                         sink.done();
                         std::cerr << "[qw3-serve] #" << rid
                                   << " chat(stream) error=" << e.what() << "\n";
-                        ttft.log(rid, route, true,
-                                 std::chrono::steady_clock::now());
+                        const auto request_end =
+                            std::chrono::steady_clock::now();
+                        if (engine_end == engine_start) {
+                            engine_end = request_end;
+                        }
+                        ttft.log(rid, route, true, request_end);
+                        log_server_accounting(
+                            engine_start, engine_end, request_end, true,
+                            /*stream_completed=*/false, e.what());
                         return false;
                     }
                 });
@@ -4718,7 +5403,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const auto request_end = std::chrono::steady_clock::now();
         ttft.log(rid, route, false, request_end);
         log_server_accounting(
-            engine_start, engine_end, request_end, false);
+            engine_start, engine_end, request_end, false,
+            /*stream_completed=*/true,
+            /*terminal_error=*/"");
     };
     svr.Post("/v1/chat/completions",
              [&](const httplib::Request &hreq,
@@ -4773,7 +5460,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             forced_tool_name, /*message_spans=*/nullptr,
             /*add_generation_prompt=*/true,
             /*require_tool_call=*/tool_choice_required,
-            detail::HarnessKind::ClaudeCode);
+            detail::HarnessKind::ClaudeCode,
+            engine.kvmem_enabled && cfg.kvmem_prefix_cache);
         count = usage_tokenizer.encode(prompt).size();
         return true;
     };

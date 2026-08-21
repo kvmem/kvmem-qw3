@@ -30,6 +30,72 @@ enum class KvMemPrefillWindowMode {
     SemanticChunk,
 };
 
+// One request-wide KVMem admission/execution decision.  The serving layer
+// drafts the semantic/capacity part after tokenization; the native backend
+// finalizes checkpoint reuse before it mutates executor or GPU state.  Keeping
+// the decision in GenerationOptions prevents the server, prefix cache, and
+// executor from independently choosing incompatible policies.
+enum class KvMemRequestPlanAction : uint8_t {
+    Disabled = 0,
+    DenseAppend,
+    PressurePrefill,
+    KeepSelectedAppend,
+    ResumeMThenAppend,
+    ResumePThenReplayTail,
+    ReselectWithUserQuery,
+    GeneratePrivateQueryThenReselect,
+    RejectBeforeExecution,
+};
+
+enum class KvMemRequestPlanRejectReason : uint8_t {
+    None = 0,
+    ContextLimit,
+    InvalidBudget,
+    CapacityFitFailure,
+};
+
+struct KvMemRequestPlan {
+    bool enabled = false;
+    bool finalized = false;
+    bool above_selection_budget = false;
+    KvMemRequestPlanAction action = KvMemRequestPlanAction::Disabled;
+    // The semantic action drafted by the server is retained when checkpoint
+    // finalization turns KeepSelectedAppend into a concrete M/P resume.
+    KvMemRequestPlanAction semantic_action =
+        KvMemRequestPlanAction::Disabled;
+    KvMemRequestPlanRejectReason reject_reason =
+        KvMemRequestPlanRejectReason::None;
+    uint64_t logical_prompt_tokens = 0;
+    // Prompt tokens carried by this request, excluding an attached immutable
+    // archive prefix. Prefix-cache checkpoints are expressed in this space.
+    uint64_t request_prompt_tokens = 0;
+    uint64_t context_limit_tokens = 0;
+    uint64_t selection_budget_tokens = 0;
+    uint64_t generation_budget_tokens = 0;
+    uint64_t refresh_trigger_tokens = 0;
+    uint32_t requested_output_tokens = 0;
+    uint32_t block_tokens = 0;
+    // Raw span sizes describe the protocol/harness request. Fitted sizes are
+    // the bounded hard anchors actually materialized in the active window;
+    // the difference remains fully stored and semantically retrievable.
+    uint32_t raw_mandatory_blocks = 0;
+    uint32_t mandatory_blocks = 0;
+    uint32_t raw_live_suffix_blocks = 0;
+    uint32_t live_suffix_blocks = 0;
+    uint32_t soft_retrievable_blocks = 0;
+    uint32_t sink_blocks = 0;
+    uint32_t retrieval_reserve_blocks = 0;
+    bool capacity_fitted = false;
+    // True when the incoming suffix cannot fit in the current A+B physical
+    // epoch. The full source is pressure-ingested before private-query
+    // selection instead of attempting an unsafe keep-selected append.
+    bool pressure_ingest = false;
+    bool checkpoint_available = false;
+    uint32_t resume_position = 0;
+    uint32_t common_prefix = 0;
+    uint64_t incremental_suffix_tokens = 0;
+};
+
 enum class KvMemLocalCacheMode {
     None,
     Frozen,
@@ -181,6 +247,20 @@ struct EngineOptions {
     // (mean over question tokens) instead of recency. Default OFF -> behavior is
     // byte-identical to the recency/single-token retrieval path.
     bool kvmem_query_conditioned = false;
+    // Harness self-query policy. A trajectory first seen below A keeps its
+    // initial dense epoch after crossing A and refreshes at A+T; a genuinely
+    // new user query above A refreshes immediately. Later stable tool turns and
+    // long responses refresh after T accumulated tokens at a safe boundary.
+    // "boundary", "middecode", and "both" control which request/decode
+    // opportunities may execute that policy.
+    std::string kvmem_guided_reselect = "off"; // off|boundary|middecode|both
+    // Zero asks the model for the compact retrieval query directly.  A
+    // positive value enables an additional private reasoning phase, which is
+    // useful for ablations but adds decode latency before every refresh.
+    int kvmem_guided_thinking_tokens = 0;
+    int kvmem_guided_query_tokens = 256; // hard-capped to 512 by CLI/server
+    int kvmem_middecode_trigger_tokens = 28672;
+    int kvmem_middecode_max_refreshes = 2;
     // Re-prefill the query suffix against the just-selected semantic window.
     // Enabled by default for query-conditioned mean-k; the first-pass query is
     // still used for retrieval scoring, while decode consumes the replayed KV.
@@ -251,9 +331,16 @@ struct GenerationOptions {
     // Whether the prompt already opened a <think> block (enable_thinking). The
     // budget counter only runs while a think block is open.
     bool thinking_open = false;
+    // Unified serving/prefix/executor admission decision. Ordinary library
+    // callers leave this disabled and preserve the legacy behavior.
+    KvMemRequestPlan kvmem_request_plan;
     // Generic multi-request KVMem controls. These describe inference behavior;
     // dataset/session parsing remains entirely in the caller.
     KvMemReselectMode kvmem_reselect_mode = KvMemReselectMode::Auto;
+    // Maintain the query Q/source index and a resumable checkpoint without
+    // selecting a new semantic window on this request. Harness continuations
+    // use this while an A+B/T epoch remains active.
+    bool kvmem_prepare_query_only = false;
     KvMemPrefillWindowMode kvmem_prefill_window_mode =
         KvMemPrefillWindowMode::Pressure;
     // SemanticChunk controls. Zero start inherits the active prefill budget;
@@ -309,6 +396,29 @@ struct GenerationOptions {
     // Skip private reasoning and directly rewrite the real request as one
     // retrieval question. This remains independent from normal answer thinking.
     bool kvmem_query_guided_direct = false;
+    // Private guided-query refresh during visible decode. Zero disables the
+    // corresponding trigger. The request-wide output counter is independent of
+    // the per-epoch KVMem generation reserve.
+    uint32_t kvmem_middecode_trigger_tokens = 0;
+    // Internal serving override for epochs after the first refresh in this
+    // request. The first epoch may be shorter because an HTTP request starts
+    // partway through the A+B headroom; subsequent epochs must return to the
+    // engine-wide trigger instead of repeatedly using that remaining distance.
+    // Zero preserves the legacy/direct-caller behavior by reusing the first
+    // trigger for every epoch.
+    uint32_t kvmem_middecode_steady_trigger_tokens = 0;
+    uint32_t kvmem_middecode_max_refreshes = 0;
+    uint32_t kvmem_middecode_query_max_tokens = 0;
+    // Physical headroom for the current generation epoch. Zero inherits the
+    // engine-wide generation budget. The first dense A+B epoch may set a
+    // smaller request-local value when its prompt already consumed part of B.
+    uint32_t kvmem_middecode_epoch_limit_tokens = 0;
+    // Serving-only lifecycle notification. The argument is the number of
+    // visible tokens committed by this request at the completed refresh.
+    // Invoked only after a semantic refresh and its replay have completed.
+    // The argument is the number of visible tokens generated after this
+    // request's prompt (zero for a request-boundary refresh).
+    std::function<void(uint32_t)> kvmem_refresh_observer;
     // Experimental transcript replay: every span is a user query that arrived
     // after the KVMem working-set + generation reserve was already full. During
     // prefill the backend reselects at each span, replays that query against the
@@ -339,6 +449,8 @@ struct GenerationOptions {
         LiveToolTrajectory = 2,
         ProjectPolicy = 3,
         ExplicitClientPin = 4,
+        RootTask = 5,
+        VisualEvidence = 6,
     };
     struct KvMemPinnedTokenSpan {
         uint32_t begin = 0;

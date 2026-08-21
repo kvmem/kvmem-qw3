@@ -11,6 +11,8 @@ namespace {
 
 constexpr std::string_view kReminderOpen = "<system-reminder>";
 constexpr std::string_view kReminderClose = "</system-reminder>";
+constexpr std::string_view kVisualOpen = "<visual-evidence>";
+constexpr std::string_view kVisualClose = "</visual-evidence>";
 
 std::string ascii_lower(std::string_view value) {
     std::string out(value);
@@ -153,6 +155,26 @@ bool valid_content_bounds(std::string_view prompt,
         span.content_end <= span.segment_end;
 }
 
+bool is_tool_result_message(std::string_view prompt,
+                            const HarnessRenderedMessageSpan &span) {
+    if (!valid_segment_bounds(prompt, span)) return false;
+    if (span.role == "tool") return true;
+    if (span.role != "user" || !valid_content_bounds(prompt, span)) {
+        return false;
+    }
+    return looks_like_tool_response(prompt.substr(
+        span.content_begin, span.content_end - span.content_begin));
+}
+
+bool is_meta_only_message(HarnessKind kind, std::string_view prompt,
+                          const HarnessRenderedMessageSpan &span) {
+    if (span.role != "user" || !valid_content_bounds(prompt, span)) {
+        return false;
+    }
+    return harness_message_is_meta_only(kind, prompt.substr(
+        span.content_begin, span.content_end - span.content_begin));
+}
+
 struct PolicyFrameRef {
     size_t message_order = 0;
     size_t prompt_begin = 0;
@@ -222,11 +244,17 @@ HarnessSemanticPlan derive_harness_semantic_plan(
     HarnessSemanticPlan plan;
     if (kind == HarnessKind::None) return plan;
 
+    // The deterministic renderer prefix is stable across the complete agent
+    // run and contains tool schemas/protocol plus system/developer controls.
     if (control_prefix_end > 0 && control_prefix_end <= prompt.size()) {
         plan.spans.push_back(HarnessByteSpan{
             0, control_prefix_end, HarnessSpanReason::SystemControl});
     }
 
+    // Keep only the newest applicable copy of each workspace policy. A complete
+    // baseline supersedes every earlier baseline; later keyed updates supersede
+    // only the matching path. This makes policy cost stable rather than growing
+    // once per tool result.
     std::vector<PolicyFrameRef> policies;
     for (size_t order = 0; order < messages.size(); ++order) {
         const HarnessRenderedMessageSpan &span = messages[order];
@@ -247,14 +275,39 @@ HarnessSemanticPlan derive_harness_semantic_plan(
         }
     }
 
+    // Captions emitted by the multimodal bridge are model-derived evidence,
+    // not control/query text. Keep each bounded visual frame independently so
+    // an older screenshot returned by a tool remains available after its tool
+    // transaction moves back into retrievable history.
+    for (const HarnessRenderedMessageSpan &span : messages) {
+        if (!valid_content_bounds(prompt, span) ||
+            (span.role != "user" && span.role != "tool")) {
+            continue;
+        }
+        const std::string_view content = prompt.substr(
+            span.content_begin, span.content_end - span.content_begin);
+        size_t cursor = 0;
+        while (cursor < content.size()) {
+            const size_t begin = content.find(kVisualOpen, cursor);
+            if (begin == std::string_view::npos) break;
+            const size_t close = content.find(
+                kVisualClose, begin + kVisualOpen.size());
+            if (close == std::string_view::npos) break;
+            const size_t end = close + kVisualClose.size();
+            plan.spans.push_back(HarnessByteSpan{
+                span.content_begin + begin,
+                span.content_begin + end,
+                HarnessSpanReason::VisualEvidence});
+            ++plan.visual_evidence_frame_count;
+            cursor = end;
+        }
+    }
     size_t first_relevant_policy = 0;
     std::optional<size_t> latest_baseline;
     for (size_t i = 0; i < policies.size(); ++i) {
         if (policies[i].complete_baseline) latest_baseline = i;
     }
-    if (latest_baseline.has_value()) {
-        first_relevant_policy = *latest_baseline;
-    }
+    if (latest_baseline.has_value()) first_relevant_policy = *latest_baseline;
     std::unordered_map<std::string, size_t> latest_by_key;
     for (size_t i = first_relevant_policy; i < policies.size(); ++i) {
         for (const std::string &key : policies[i].keys) {
@@ -276,32 +329,91 @@ HarnessSemanticPlan derive_harness_semantic_plan(
         ++plan.project_policy_frame_count;
     }
 
-    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
-        if (it->role != "user" || !valid_content_bounds(prompt, *it)) {
+    // Identify the first durable task as well as the newest real user request.
+    // Long-running harnesses commonly append a terse "continue/finalize the
+    // original task" turn.  Keeping only that newest instruction loses the
+    // exact acceptance criteria needed to finish the task.  Both lifetimes are
+    // bounded to their individual messages; a one-turn request is pinned only
+    // once as CurrentQuery.
+    std::optional<size_t> root_query_order;
+    for (size_t order = 0; order < messages.size(); ++order) {
+        const HarnessRenderedMessageSpan &span = messages[order];
+        if (span.role != "user" || !valid_content_bounds(prompt, span)) {
             continue;
         }
         const std::string_view content = prompt.substr(
-            it->content_begin, it->content_end - it->content_begin);
+            span.content_begin, span.content_end - span.content_begin);
         if (looks_like_tool_response(content) ||
             harness_message_is_meta_only(kind, content)) {
             continue;
         }
-        plan.current_query_message_index = it->message_index;
+        root_query_order = order;
+        plan.root_task_message_index = span.message_index;
+        break;
+    }
+
+    std::optional<size_t> query_order;
+    for (size_t rev = 0; rev < messages.size(); ++rev) {
+        const size_t order = messages.size() - 1 - rev;
+        const HarnessRenderedMessageSpan &span = messages[order];
+        if (span.role != "user" || !valid_content_bounds(prompt, span)) {
+            continue;
+        }
+        const std::string_view content = prompt.substr(
+            span.content_begin, span.content_end - span.content_begin);
+        if (looks_like_tool_response(content) ||
+            harness_message_is_meta_only(kind, content)) {
+            continue;
+        }
+        query_order = order;
+        plan.current_query_message_index = span.message_index;
         plan.spans.push_back(HarnessByteSpan{
-            it->segment_begin, it->segment_end,
+            span.segment_begin, span.segment_end,
             HarnessSpanReason::CurrentQuery});
         break;
     }
 
-    if (plan.current_query_message_index.has_value()) {
-        for (const HarnessRenderedMessageSpan &span : messages) {
-            if (!valid_segment_bounds(prompt, span) ||
-                span.message_index <= *plan.current_query_message_index) {
-                continue;
+    if (root_query_order.has_value() && query_order.has_value() &&
+        *root_query_order != *query_order) {
+        const HarnessRenderedMessageSpan &root = messages[*root_query_order];
+        plan.spans.push_back(HarnessByteSpan{
+            root.segment_begin, root.segment_end,
+            HarnessSpanReason::RootTask});
+    }
+
+    if (query_order.has_value()) {
+        size_t suffix_order = *query_order;
+        // A tool continuation keeps only the newest unfinished tool transaction:
+        // all parallel result messages plus the assistant call that produced
+        // them. Completed earlier transactions remain semantic candidates.
+        size_t tail = messages.size();
+        while (tail > *query_order + 1 &&
+               is_meta_only_message(kind, prompt, messages[tail - 1])) {
+            --tail;
+        }
+        if (tail > *query_order + 1 &&
+            is_tool_result_message(prompt, messages[tail - 1])) {
+            size_t first_result = tail - 1;
+            while (first_result > *query_order + 1 &&
+                   (is_tool_result_message(prompt, messages[first_result - 1]) ||
+                    is_meta_only_message(kind, prompt,
+                                         messages[first_result - 1]))) {
+                --first_result;
             }
-            plan.spans.push_back(HarnessByteSpan{
-                span.segment_begin, span.segment_end,
-                HarnessSpanReason::LiveToolTrajectory});
+            suffix_order = first_result;
+            if (suffix_order > *query_order + 1 &&
+                messages[suffix_order - 1].role == "assistant" &&
+                valid_segment_bounds(prompt, messages[suffix_order - 1])) {
+                --suffix_order;
+            }
+        }
+        const HarnessRenderedMessageSpan &suffix = messages[suffix_order];
+        if (valid_segment_bounds(prompt, suffix)) {
+            plan.live_suffix_message_begin_index = suffix.message_index;
+            plan.history_end = suffix.segment_begin;
+            plan.live_suffix_span = HarnessByteSpan{
+                suffix.segment_begin, prompt.size(),
+                HarnessSpanReason::LiveToolTrajectory};
         }
     }
 

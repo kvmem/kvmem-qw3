@@ -59,6 +59,8 @@ enum class HarnessSpanReason {
     CurrentQuery,
     LiveToolTrajectory,
     ProjectPolicy,
+    RootTask,
+    VisualEvidence,
 };
 
 struct HarnessByteSpan {
@@ -68,9 +70,18 @@ struct HarnessByteSpan {
 };
 
 struct HarnessSemanticPlan {
+    // The first durable user task in the agent run.  This remains stable when
+    // a later user turn merely says to continue/finalize the original task.
+    std::optional<size_t> root_task_message_index;
     std::optional<size_t> current_query_message_index;
+    std::optional<size_t> live_suffix_message_begin_index;
+    std::optional<HarnessByteSpan> live_suffix_span;
+    // Historical retrieval candidates end immediately before the live suffix.
+    // Zero means that no conversational boundary could be derived.
+    size_t history_end = 0;
     std::vector<HarnessByteSpan> spans;
     size_t project_policy_frame_count = 0;
+    size_t visual_evidence_frame_count = 0;
 };
 
 // True only when the whole message is composed of harness-owned reminder
@@ -80,9 +91,12 @@ struct HarnessSemanticPlan {
 bool harness_message_is_meta_only(HarnessKind kind,
                                   std::string_view content);
 
-// Build byte-accurate mandatory regions from an already-rendered prompt.
-// control_prefix_end is the first conversational byte, so it includes the
-// template control tokens, tool schemas/protocol, and system/developer text.
+// Build byte-accurate semantic lifetimes from an already-rendered prompt.
+// Stable control, the root task, the exact current instruction, and the latest
+// durable policy frames become bounded mandatory spans. When root and current
+// are the same message only CurrentQuery is emitted. The unfinished tool round is returned
+// separately as live_suffix_span: it is replayed after semantic selection but
+// is never confused with the score-query span or the completed tool history.
 HarnessSemanticPlan derive_harness_semantic_plan(
     HarnessKind kind,
     std::string_view prompt,

@@ -503,6 +503,45 @@ static void test_mandatory_hard_union_overflow_throws() {
     CHECK(semantic_threw);
 }
 
+static void test_long_agent_query_is_not_an_unbounded_suffix_pin() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 128;
+    cfg.select_budget = 128 * 512;  // production 64K selection budget
+    cfg.sink_blocks = 0;            // SystemControl below already covers sink
+    cfg.recent_blocks = 0;
+    KvMemStore s(cfg);
+    s.register_append(128 * 547);   // observed 69,982-token Claude trace
+
+    // Historical behavior: SystemControl occupies [0,172], while treating the
+    // score query at block 172 as pin_from_block materializes [172,546]. The
+    // deduplicated union is all 547 blocks and must reproduce the overflow.
+    std::vector<uint32_t> legacy;
+    for (uint32_t id = 0; id < 547; ++id) legacy.push_back(id);
+    bool legacy_threw = false;
+    try {
+        (void)s.pick_topk_blocks(legacy);
+    } catch (const std::runtime_error &) {
+        legacy_threw = true;
+    }
+    CHECK(legacy_threw);
+
+    // Fixed behavior: retain exact control [0,172], exact task [172,179], and
+    // only the newest eight-block live tool suffix [539,546]. Completed tool
+    // history remains a scored candidate and the result stays within 512.
+    std::vector<uint32_t> bounded;
+    for (uint32_t id = 0; id <= 179; ++id) bounded.push_back(id);
+    for (uint32_t id = 539; id <= 546; ++id) bounded.push_back(id);
+    std::vector<double> scores(547, 0.0);
+    scores[300] = 1000.0;  // completed historical tool evidence
+    s.set_retrieval_scores(scores);
+    const auto selected = s.pick_topk_blocks(bounded);
+    CHECK(selected.size() == 512);
+    CHECK(std::find(selected.begin(), selected.end(), 300) != selected.end());
+    for (uint32_t id = 539; id <= 546; ++id) {
+        CHECK(std::find(selected.begin(), selected.end(), id) != selected.end());
+    }
+}
+
 static void test_prefill_pressure_mandatory_blocks_stay_inside_budget() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 32;
@@ -1063,6 +1102,7 @@ int main() {
     test_topk_mandatory_blocks_stay_inside_budget();
     test_mandatory_overlap_deduplicates_and_recent_is_best_effort();
     test_mandatory_hard_union_overflow_throws();
+    test_long_agent_query_is_not_an_unbounded_suffix_pin();
     test_prefill_pressure_mandatory_blocks_stay_inside_budget();
     test_prefill_pressure_sink_full_recent_tail();
     test_prefill_pressure_edges();

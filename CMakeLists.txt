@@ -247,6 +247,28 @@ if(QW3_BUILD_TESTS)
     target_link_libraries(qw3-kvmem-store PRIVATE qw3_core)
     add_test(NAME qw3-kvmem-store COMMAND qw3-kvmem-store)
 
+    add_executable(qw3-kvmem-prefix-reuse-policy
+        tests/kvmem_prefix_reuse_policy_test.cpp)
+    target_include_directories(qw3-kvmem-prefix-reuse-policy PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME qw3-kvmem-prefix-reuse-policy
+        COMMAND qw3-kvmem-prefix-reuse-policy)
+
+    add_executable(qw3-kvmem-refresh-policy
+        tests/kvmem_refresh_policy_test.cpp)
+    target_include_directories(qw3-kvmem-refresh-policy PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME qw3-kvmem-refresh-policy
+        COMMAND qw3-kvmem-refresh-policy)
+
+    add_executable(qw3-kvmem-request-plan
+        tests/kvmem_request_plan_test.cpp)
+    target_include_directories(qw3-kvmem-request-plan PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME qw3-kvmem-request-plan
+        COMMAND qw3-kvmem-request-plan)
+
     add_executable(qw3-tool-call-stream tests/tool_call_stream_test.cpp)
     target_include_directories(qw3-tool-call-stream PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)

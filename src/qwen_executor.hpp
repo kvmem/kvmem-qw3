@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <deque>
 #include <future>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -55,7 +56,15 @@ public:
         uint32_t kv_logical_pages = 0;
         uint32_t mtp_kv_logical_pages = 0;
         uint32_t mtp_prefix_len = 0;
+        uint32_t mtp_payload_valid_through =
+            std::numeric_limits<uint32_t>::max();
         uint32_t kvmem_registered_pos = 0;
+        // Monotonic identity of the assembled KVMem working set.  A prefix
+        // checkpoint captured before a later semantic selection must never be
+        // restored into that newer sparse layout: its recurrent/KV/page-table
+        // state describes a different window even when the token prefix still
+        // matches.
+        uint64_t kvmem_selection_generation = 0;
         // kvmem window state: when kvmem is active the assembled window advances
         // in lockstep with position_ as decode/verify tokens append at the
         // window tail. A snapshot/restore (MTP rollback) must round-trip the
@@ -262,6 +271,19 @@ public:
     bool kvmem_mtp_local_positions() const {
         return kvmem_mtp_local_positions_;
     }
+    struct MtpCheckpointStatus {
+        bool complete = false;
+        uint32_t prefix_len = 0;
+        uint32_t payload_valid_through = 0;
+        uint32_t first_missing_block =
+            std::numeric_limits<uint32_t>::max();
+        std::string reason;
+    };
+    // A resumable main-model checkpoint is not necessarily a resumable MTP
+    // checkpoint.  Validate both prefix continuity and durable MTP V coverage
+    // before advertising P/M to the next request.
+    MtpCheckpointStatus kvmem_mtp_checkpoint_status(
+        uint32_t checkpoint_pos) const;
     // RoPE coordinate used by the most recently committed target token. The
     // logical position may be far beyond the native context, while this value
     // stays inside the current selected window.
@@ -388,13 +410,17 @@ public:
                               uint32_t prompt_tokens,
                               uint32_t index_tokens = 0,
                               bool preserve_content_index = false,
-                              bool capture_content_without_query = false); // before prefill
+                              bool capture_content_without_query = false,
+                              uint32_t min_query_storage_rows = 0); // before prefill
     uint32_t kvmem_query_expected_tokens() const {
         return kvmem_query_end_ > kvmem_query_begin_
             ? kvmem_query_end_ - kvmem_query_begin_ : 0;
     }
     uint32_t kvmem_query_captured_tokens() const {
         return g_query_multi_count_;
+    }
+    uint32_t kvmem_stashed_query_tokens() const {
+        return g_query_multi_clean_count_;
     }
     bool kvmem_query_capture_complete() const {
         const uint32_t expected = kvmem_query_expected_tokens();
@@ -462,6 +488,10 @@ public:
     void kvmem_reset_query_capture();
     bool kvmem_query_selection_ready() const;
     void kvmem_set_pin_from_block(uint32_t b) { kvmem_qc_pin_from_block_ = b; }
+    // Replace the current suffix pin with the largest desired recent tail that
+    // fits after sink + request-scoped mandatory spans are de-duplicated.
+    // Returns the actual number of pinned tail tokens (block rounded).
+    uint32_t kvmem_set_bounded_recent_pin(uint32_t desired_tokens);
     // Diagnostics-only oracle selection. Spans use logical prompt-token
     // coordinates; every currently materialized block that overlaps a span is
     // mandatory, but still consumes the configured selection budget.
@@ -493,6 +523,9 @@ public:
     // so it must call kvmem_advance_window(chunk) after a successful batched
     // verify. These accessors expose the window frame the metadata builder reads.
     bool kvmem_active() const { return kvmem_active_; }
+    uint64_t kvmem_selection_generation() const {
+        return kvmem_selection_generation_;
+    }
     // True when query-conditioned selection uses the raw per-token index
     // (g_kraw_multi_, --kvmem-retrieval-method per-token). That index is strided by
     // the per-turn total token count and cannot be fixed-stride at large --ctx, so
@@ -605,11 +638,11 @@ public:
     // semantic reselect both operate over the correct block count. No-op when
     // block-sparse is disabled or token_pos is already the live end.
     void kvmem_truncate_to(uint32_t token_pos);
-    // Spill cold blocks to the tier mid-prefill if the bounded GPU page pool is
-    // about to run short. `next_chunk_tokens` is the size of the upcoming prefill
-    // append, so the offload fires while there is still room for it (a full chunk
-    // can grab >100 pages at once, so a "only when nearly empty" trigger would
-    // let the pool exhaust mid-chunk and throw). No-op when not bounded/tiered.
+    // Spill cold blocks to the tier before an upcoming prefill append if the
+    // bounded GPU page pool cannot fit that exact chunk. A full chunk can grab
+    // >100 pages at once, while a final partial tail may need only one page; the
+    // caller must therefore pass the actual upcoming chunk, not the prior size.
+    // No-op when not bounded/tiered.
     void kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens);
     // SSD stage-out write-through producer. Call only after every KV source for
     // [0, completed_pos) is durable (for local-position MTP this means after
@@ -660,6 +693,13 @@ public:
     // Rebuild the retrieval index for blocks [0, blocks) from the raw-K
     // authority. Used after an attach, where no prefill activations exist.
     void kvmem_build_index_from_raw_k(uint32_t blocks);
+    // Extend the fixed-stride Mean-K source index through `tokens` from the
+    // immutable content-frame raw-K authority.  This is primarily the MTP
+    // end-of-turn path: speculative forward_n_tokens does not visit the plain
+    // per-token decode capture hook, but the accepted K rows are still durable
+    // in raw K.  Rebuilding only the missing tail makes the turn-end checkpoint
+    // resumable without rescanning the full transcript.
+    bool kvmem_finalize_content_index_from_raw_k(uint32_t tokens);
 
     // Assemble the deterministic long-prefill working set: configured sink
     // prefix plus the newest blocks filling the rest of the selection budget.
@@ -974,6 +1014,11 @@ private:
     std::unique_ptr<DeviceArgmaxBuffer> mtp_draft_argmaxes_;
     uint32_t mtp_draft_argmax_capacity_ = 0;
     uint32_t mtp_prefix_len_ = 0;
+    // Defensive availability marker.  A missing historical MTP page never
+    // aborts the authoritative target request; it invalidates checkpoints at
+    // and after this position so the next request safely rebuilds instead.
+    uint32_t kvmem_mtp_payload_valid_through_ =
+        std::numeric_limits<uint32_t>::max();
     uint32_t logits_batch_capacity_ = 0;
     std::unique_ptr<DeviceTensor> logits_batch_;
 
@@ -1000,6 +1045,7 @@ private:
     // True once a selection has been assembled this session; gates the decode
     // window substitution. Cleared by reset_state().
     bool kvmem_active_ = false;
+    uint64_t kvmem_selection_generation_ = 0;
     bool kvmem_immutable_source_k_ = false;
     bool kvmem_mtp_local_positions_ = false;
     // Experimental incremental MTP assembly: retained blocks follow the same bounded
@@ -1455,7 +1501,10 @@ private:
         std::vector<int32_t> &dst_page_indices);
     void kvmem_stage_out_packed(
         const std::vector<uint32_t> &block_ids);
-    void kvmem_stage_out(const std::vector<uint32_t> &block_ids);
+    void kvmem_stage_out(const std::vector<uint32_t> &block_ids,
+                         bool force_unpacked = false);
+    void kvmem_mark_mtp_payload_incomplete(
+        const KvMemBlock &block, const char *source);
     bool kvmem_block_pages_resident(const KvMemBlock &block) const;
     bool kvmem_block_mtp_pages_resident(const KvMemBlock &block) const;
     uint64_t kvmem_kv_page_bytes() const;
@@ -1728,6 +1777,7 @@ private:
     uint64_t g_query_multi_clean_host_elems_ = 0;              // active elements
     bool g_query_multi_clean_host_in_place_ = false;
     uint32_t g_query_multi_clean_count_ = 0;                   // rows stashed (== S when ready)
+    uint32_t g_query_multi_clean_span_ = 0;                    // per-layer row stride in stash
     // Exact online Adaptive scoring for semantic-chunk provisional passes.
     // The scorer reuses the ordinary bounded one-dot workspace and consumes Q
     // before q_batch_ is reused by the next normal-attention layer. No
@@ -1806,7 +1856,10 @@ private:
     bool g_kraw_multi_ready_ = false;                          // g_kraw_multi_ holds raw keys
     int32_t kvmem_qc_layer_cap_ = -1;                          // env: cap L (-1 = all std layers)
     uint32_t kvmem_qc_num_layers_ = 0;                         // L (resolved std-layer count)
-    uint32_t kvmem_query_span_ = 0;                            // S (span length, == capacity)
+    // Physical per-layer row stride/capacity. The semantic public query length
+    // remains kvmem_query_end_-kvmem_query_begin_; a detached guided query may
+    // be shorter or longer than that public span.
+    uint32_t kvmem_query_span_ = 0;
     std::vector<std::pair<uint32_t, uint32_t>>
         kvmem_retrieval_group_spans_;
     std::vector<int32_t> kvmem_round_group_begin_host_;

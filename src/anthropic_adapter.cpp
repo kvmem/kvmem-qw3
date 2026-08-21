@@ -40,7 +40,23 @@ std::string text_content(const json &content, std::string &error) {
 bool append_system_messages(const json &system, json &messages,
                             std::string &error) {
     if (system.is_null()) return true;
-    const std::string text = text_content(system, error);
+    const json *model_system = &system;
+    json filtered;
+    if (system.is_array()) {
+        filtered = json::array();
+        for (const json &block : system) {
+            const bool billing_marker = block.is_object() &&
+                block.value("type", "") == "text" &&
+                block.contains("text") && block["text"].is_string() &&
+                block["text"].get_ref<const std::string &>().rfind(
+                    "x-anthropic-billing-header:", 0) == 0 &&
+                block["text"].get_ref<const std::string &>().find('\n') ==
+                    std::string::npos;
+            if (!billing_marker) filtered.push_back(block);
+        }
+        model_system = &filtered;
+    }
+    const std::string text = text_content(*model_system, error);
     if (!error.empty()) {
         error = "system: " + error;
         return false;
