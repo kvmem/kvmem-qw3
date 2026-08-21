@@ -209,9 +209,9 @@ cmake --build build -j
 ### NVFP4 / FP8 safetensors
 
 The native backend also accepts a Hugging Face model directory containing a
-`compressed-tensors` Qwen3.5/Qwen3.6 checkpoint. Mixed checkpoints may combine
-NVFP4 W4A4 group-16 MLP weights, FP8 W8A8 projections, and BF16 fallback
-weights. NVFP4 uses FlashInfer's SM120 CUTLASS kernel and is enabled
+`compressed-tensors` Qwen3.5/Qwen3.6/Qwen3.8 checkpoint. Mixed checkpoints may
+combine NVFP4 W4A4 group-16 MLP weights, FP8 W8A8 projections, and BF16
+fallback weights. NVFP4 uses FlashInfer's SM120 CUTLASS kernel and is enabled
 automatically only for a `120a` CUDA build; Q8 and non-Blackwell FlashInfer
 builds do not compile this adapter.
 
@@ -254,6 +254,73 @@ with all other options above unchanged. Its estimated peak is approximately
 23.13 GiB, leaving about 0.87 GiB on a nominal 24 GiB device. Keep the GPU free
 of other workloads and treat 112K as a limit-oriented setting rather than the
 default recommendation; 96K retains safer runtime headroom.
+
+#### Recommended 24 GiB Qwen3.8 KVMem profile
+
+The following single-request profile extends the logical context to 256K while
+keeping a 40K active context window and a 20K generation reserve. It was sized
+for a nominal 24 GiB GPU using the **Unsloth Qwen3.8-27B-NVFP4** text model with
+an **FP8-quantized MTP head**:
+
+> **Model preparation is required.** The tested checkpoint is not the stock
+> NVFP4 directory unchanged. Start from the NVFP4 model and quantize its MTP
+> draft-head weights to FP8 offline, preserving the corresponding
+> `compressed-tensors` metadata. Qw3 does not quantize a BF16 MTP head at load
+> time. In particular, `--kv-dtype fp8` only selects an FP8 KV cache; it does
+> not quantize the MTP weights.
+
+```sh
+QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
+./build-flashinfer/qw3 serve \
+  --model /path/to/Qwen3.8-27B-NVFP4-MTP-FP8 \
+  --host 127.0.0.1 \
+  --port 18080 \
+  --ctx 262144 \
+  --kv-dtype fp8 \
+  --prefill-chunk 512 \
+  --cpu-embedding \
+  --kvmem \
+  --kvmem-block-tokens 128 \
+  --kvmem-budget 40960 \
+  --kvmem-gen-budget 20480 \
+  --kvmem-sink-tokens 12288 \
+  --kvmem-method retrieval \
+  --kvmem-retrieval-method mean-k \
+  --kvmem-index-placement gpu \
+  --kvmem-update-mode step \
+  --kvmem-query-conditioned \
+  --kvmem-query-max-tokens 512 \
+  --kvmem-select-policy topk \
+  --kvmem-gpu-memory-ratio 0.99 \
+  --kvmem-cpu-gb 10 \
+  --no-kvmem-raw-k-nvme \
+  --kvmem-prefix-cache \
+  --enable-thinking \
+  --preserve-thinking \
+  --thinking-budget 16384 \
+  --temp 1.0 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --native-mtp-speculate \
+  --mtp-chain 3 \
+  --no-continuous-batching \
+  -n 20480
+```
+
+This profile deliberately omits `--kvmem-nvme-gb` and
+`--kvmem-nvme-dir`. At a 256K logical context, approximately 8.5 GiB is enough
+for complete immutable raw-K and spilled-V CPU backing, while
+`--kvmem-cpu-gb 10` leaves working margin. This KVMem budget does not include
+the host model mapping, pinned transfer buffers, tokenizer state, or the OS;
+keep at least 16-20 GiB of total host memory free before starting the server.
+
+Based on the measured 48K-active/24K-generation profile, reducing the resident
+window to 40K+20K is expected to save about 408 MiB and peak at approximately
+23.37 GiB of model-attributable GPU memory. That leaves only about 0.63 GiB on
+a nominal 24 GiB card, so avoid other CUDA workloads and remeasure on the target
+driver and hardware. The 128-token block size keeps the complete 256K FP16
+mean-K index at about 64 MiB on GPU, at the cost of coarser retrieval granularity
+than smaller blocks.
 
 For the FlashInfer wheel layout used by the `vllm` environment:
 
