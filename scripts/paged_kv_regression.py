@@ -199,7 +199,6 @@ def run_qw3(
         "qwen-native",
         "--model",
         str(model),
-        "--native-heavy",
         "--raw",
         "--kv-dtype",
         kv_dtype,

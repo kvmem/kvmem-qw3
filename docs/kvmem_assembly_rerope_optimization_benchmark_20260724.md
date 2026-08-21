@@ -30,9 +30,9 @@ The optimized implementation contains two layers:
 The table kernels intentionally preserve the legacy de-rotate/re-rotate
 arithmetic order.  CUDA parity tests report zero bit mismatches.
 
-`opt_3` enables the full pipeline by default.  The environment variable
-`QW3_KVMEM_ASSEMBLY_MODE=legacy|table|pipeline` provides explicit A/B and
-rollback modes.
+The full pipeline is now controlled by `--kvmem-opt-pack on|off`. The former
+`QW3_KVMEM_ASSEMBLY_MODE=legacy|table|pipeline` experimental override has been
+removed.
 
 ## Results
 

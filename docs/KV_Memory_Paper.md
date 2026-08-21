@@ -409,7 +409,6 @@ selected offloaded block must stage back in before attention can read it.
 --kvmem-retrieval-blocks N  Retrieval quota under quota policy (0 = derive). Default 0.
 --kvmem-profile-blocks N    Profile quota under quota policy (0 = derive). Default 0.
 --kvmem-gpu-memory-ratio F  Fraction of total GPU memory used to estimate KVMem KV cap. Default 0.50.
---kvmem-gpu-high-watermark F  Future spill threshold for GPU-resident blocks. Default 0.95.
 --kvmem-gpu-low-watermark F   Future eviction target after spill. Default 0.85.
 --kvmem-cpu-bytes N         CPU tier byte budget. 0 disables runtime page release. Default 0.
 --kvmem-nvme-dir DIR        NVMe backing-file directory.

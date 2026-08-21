@@ -176,7 +176,6 @@ def run_qw3(
     cmd = [
         args.qw3,
         "--backend", "qwen-native",
-        "--native-heavy",
         "--native-kernels", "cuda",
         "--native-linear-backend", "auto",
         "--model", args.model,

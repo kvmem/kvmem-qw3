@@ -391,7 +391,6 @@ def main() -> int:
             args.qw3,
             "--backend", "qwen-native",
             "--model", args.model,
-            "--native-heavy",
             "--raw",
             "--kv-dtype", args.kv_dtype,
             "--temp", "0",

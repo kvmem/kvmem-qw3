@@ -404,10 +404,10 @@ This path is enabled by default only when all of the following are true:
 - immutable source K is enabled;
 - MTP is absent or uses local-position K.
 
-Set `QW3_KVMEM_PREFILL_WRITEBACK=0` for a matched compatibility baseline.
-Set `QW3_KVMEM_PREFILL_CPU_ADMIT=0` only when measuring an SSD-only profile;
-the production default retains CPU admission so proactive write-through does
-not turn later CPU hits into SSD reads.
+Set `--kvmem-opt-stage-out off` for a matched compatibility baseline. The old
+`QW3_KVMEM_PREFILL_WRITEBACK` and `QW3_KVMEM_PREFILL_CPU_ADMIT` experimental
+overrides have been removed; CPU admission is part of the unified stage-out
+policy so proactive write-through does not turn later CPU hits into SSD reads.
 Legacy mutable-K or baked-position MTP configurations continue through the
 selection-time stage-out path because a non-destructive write-through copy
 cannot canonicalize their working K in place.

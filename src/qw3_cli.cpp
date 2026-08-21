@@ -104,7 +104,6 @@ void usage(std::ostream &os) {
         "  -t, --threads N       llama.cpp CPU helper threads\n"
         "  -ngl N                GPU layers passed to llama.cpp. Default: -1\n"
         "  -b, --batch N         Batch size passed to llama.cpp. Default: 2048\n"
-        "  --native-heavy        Compatibility flag; native generation is enabled by default\n"
         "  --native-kernels NAME cuda. Default: cuda\n"
         "  --native-linear-backend NAME auto, cublas, or custom. Default: auto\n"
         "  --cpu-embedding       Keep a BF16 input embedding table on CPU and\n"
@@ -115,7 +114,6 @@ void usage(std::ostream &os) {
         "  --native-mtp-prefix   Populate diagnostic MTP prefix KV before drafts\n"
         "  --native-mtp-speculate Experimental MTP speculative decode\n"
         "  --mtp-policy NAME     MTP depth policy: fixed default, or adaptive.\n"
-        "  --native-token-id N   Token id used by qwen-native single-token forward. Default: 0\n"
         "  --prefill-chunk N     Prefill chunk size in tokens (qwen-native).\n"
         "                        0 = no chunking (whole-prompt batch, max throughput,\n"
         "                        peak scratch grows with prompt length).\n"
@@ -179,17 +177,6 @@ void usage(std::ostream &os) {
         "                        0=raw mass, 1=mean density. Default: 0.5.\n"
         "  --kvmem-round-retrieval  Compatibility alias for\n"
         "                        --kvmem-semantic-expansion round.\n"
-#if 0  // Experimental DeltaNet retrieval is archived; see docs/kvmem_deltanet_retrieval_experimental.md.
-        "  --kvmem-deltanet-layers N  DeltaNet-retrieval layer count (0 = derive from\n"
-        "                        --kvmem-deltanet-mem-budget-gb). deltanet method only.\n"
-        "  --kvmem-deltanet-layer-policy P  Layer subset: even|late. Default: even.\n"
-        "  --kvmem-deltanet-mem-budget-gb F  Cap for the per-block DeltaNet state-edit\n"
-        "                        buffer. Default: 32.\n"
-        "  --kvmem-deltanet-decay on|off  Apply the exp(G_M-G_j) post-block decay to\n"
-        "                        each block's state edit. Default: on.\n"
-        "  --kvmem-deltanet-topk-q N  TopKMean over query tokens. Default: 4.\n"
-        "  --kvmem-deltanet-topk-h N  TopKMean over DeltaNet heads. Default: 4.\n"
-#endif
         "  --kvmem-update-mode M  Reselect cadence: interval|step. Default: interval.\n"
         "  --kvmem-opt-stage-out on|off  Proactive lower-tier writeback and\n"
         "                        clean backing. Default: on.\n"
@@ -212,7 +199,6 @@ void usage(std::ostream &os) {
         "  --kvmem-profile-blocks N    Quota policy profile blocks (0 = derive).\n"
         "  --kvmem-gpu-memory-ratio F  GPU memory fraction for KVMem KV cap.\n"
         "                        Default: 0.50.\n"
-        "  --kvmem-gpu-high-watermark F Spill threshold for future tiering. Default: 0.95.\n"
         "  --kvmem-gpu-low-watermark F  Evict target for future tiering. Default: 0.85.\n"
         "  --kvmem-cpu-gb F      CPU tier budget in GiB for offloaded KV blocks.\n"
         "                        0 disables runtime page release. Default: 0.\n"
@@ -482,8 +468,6 @@ int main(int argc, char **argv) {
                 engine.gpu_layers = parse_int(need(arg), arg);
             } else if (arg == "-b" || arg == "--batch") {
                 engine.batch_size = parse_int(need(arg), arg);
-            } else if (arg == "--native-heavy") {
-                engine.native_heavy = true;
             } else if (arg == "--native-kernels") {
                 engine.native_kernels = need(arg);
             } else if (arg == "--native-linear-backend") {
@@ -512,8 +496,6 @@ int main(int argc, char **argv) {
                 engine.native_mtp_prefix = true;
             } else if (arg == "--native-mtp-speculate") {
                 engine.native_mtp_speculate = true;
-            } else if (arg == "--native-token-id") {
-                engine.native_token_id = parse_int(need(arg), arg);
             } else if (arg == "--prefill-chunk") {
                 engine.prefill_chunk = parse_int(need(arg), arg);
             } else if (arg == "--no-prefill-chunk") {
@@ -666,30 +648,6 @@ int main(int argc, char **argv) {
                         "--kvmem-adaptive-score-mode must be "
                         "auto|layer-one-pass|tiled-one-pass|tiled-two-pass");
                 }
-#if 0  // Archived experimental CLI; implementation remains for future research.
-            } else if (arg == "--kvmem-deltanet-layers") {
-                engine.kvmem_deltanet_layers = parse_int(need(arg), arg);
-            } else if (arg == "--kvmem-deltanet-layer-policy") {
-                engine.kvmem_deltanet_layer_policy = need(arg);
-                if (engine.kvmem_deltanet_layer_policy != "even" &&
-                    engine.kvmem_deltanet_layer_policy != "late") {
-                    throw std::runtime_error(
-                        "--kvmem-deltanet-layer-policy must be even|late");
-                }
-            } else if (arg == "--kvmem-deltanet-mem-budget-gb") {
-                engine.kvmem_deltanet_mem_budget_gb = parse_float(need(arg), arg);
-            } else if (arg == "--kvmem-deltanet-decay") {
-                const std::string v = need(arg);
-                if (v != "on" && v != "off") {
-                    throw std::runtime_error(
-                        "--kvmem-deltanet-decay must be on|off");
-                }
-                engine.kvmem_deltanet_decay = (v == "on");
-            } else if (arg == "--kvmem-deltanet-topk-q") {
-                engine.kvmem_deltanet_topk_q = parse_int(need(arg), arg);
-            } else if (arg == "--kvmem-deltanet-topk-h") {
-                engine.kvmem_deltanet_topk_h = parse_int(need(arg), arg);
-#endif
             } else if (arg == "--kvmem-subblocks") {
                 engine.kvmem_subblocks = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-subblock-reduce") {
@@ -810,8 +768,6 @@ int main(int argc, char **argv) {
                 engine.kvmem_profile_blocks = parse_int(need(arg), arg);
             } else if (arg == "--kvmem-gpu-memory-ratio") {
                 engine.kvmem_gpu_memory_ratio = parse_float(need(arg), arg);
-            } else if (arg == "--kvmem-gpu-high-watermark") {
-                engine.kvmem_gpu_high_watermark = parse_float(need(arg), arg);
             } else if (arg == "--kvmem-gpu-low-watermark") {
                 engine.kvmem_gpu_low_watermark = parse_float(need(arg), arg);
             } else if (arg == "--kvmem-cpu-gb") {

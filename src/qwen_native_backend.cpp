@@ -8656,7 +8656,6 @@ private:
         bs_cfg.profile_blocks =
             static_cast<uint32_t>(std::max(0, options_.kvmem_profile_blocks));
         bs_cfg.gpu_memory_ratio = options_.kvmem_gpu_memory_ratio;
-        bs_cfg.gpu_high_watermark = options_.kvmem_gpu_high_watermark;
         bs_cfg.gpu_low_watermark = options_.kvmem_gpu_low_watermark;
         bs_cfg.cpu_tier_bytes = options_.kvmem_cpu_bytes;
         bs_cfg.nvme_tier_bytes = options_.kvmem_nvme_bytes;

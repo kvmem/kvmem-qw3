@@ -8336,26 +8336,6 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             ? "-" : kvmem_numa_pci_bus_id_.c_str(),
         kvmem_format_cpu_list(kvmem_numa_cpus_).c_str(),
         kvmem_numa_cpus_.empty() ? 0 : 1);
-    static constexpr const char *kRemovedOptimizationEnvs[] = {
-        "QW3_KVMEM_PREFILL_WRITEBACK",
-        "QW3_KVMEM_ASSEMBLY_MODE",
-        "QW3_KVMEM_RAW_K_BLOCK_MAJOR",
-        "QW3_KVMEM_OVERLAP_STAGEIN_ASSEMBLY",
-        "QW3_KVMEM_PERSISTENT_CPU_POOL",
-        "QW3_KVMEM_INCLUSIVE_CPU",
-        "QW3_KVMEM_QUERY_PREFETCH",
-        "QW3_KVMEM_MTP_INCREMENTAL_ASSEMBLY",
-        "QW3_KVMEM_RAW_K_TRANSFER_BLOCKS",
-        "QW3_KVMEM_PREFILL_CPU_ADMIT",
-    };
-    for (const char *name : kRemovedOptimizationEnvs) {
-        if (std::getenv(name)) {
-            throw std::runtime_error(
-                std::string(name) +
-                " was removed; use --kvmem-opt-stage-out, "
-                "--kvmem-opt-stage-in, and --kvmem-opt-pack");
-        }
-    }
     // Immutable source K is the default. The legacy environment override is
     // still tri-state: an explicit false value disables it just like the CLI
     // opt-out, while an unset variable preserves EngineOptions.
@@ -8457,10 +8437,6 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     if (effective.gpu_memory_ratio > 1.0) effective.gpu_memory_ratio = 1.0;
     if (effective.gpu_low_watermark < 0.0) effective.gpu_low_watermark = 0.0;
     if (effective.gpu_low_watermark > 1.0) effective.gpu_low_watermark = 1.0;
-    if (effective.gpu_high_watermark < effective.gpu_low_watermark) {
-        effective.gpu_high_watermark = effective.gpu_low_watermark;
-    }
-    if (effective.gpu_high_watermark > 1.0) effective.gpu_high_watermark = 1.0;
     if (effective.prefill_budget == 0) {
         effective.prefill_budget = effective.select_budget;
     }

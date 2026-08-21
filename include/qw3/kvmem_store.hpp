@@ -295,7 +295,7 @@ struct KvMemStoreConfig {
     uint32_t deltanet_layers = 0;             // --kvmem-deltanet-layers (0 => derive from budget)
     KvMemDeltaNetLayerPolicy deltanet_layer_policy = KvMemDeltaNetLayerPolicy::Even;
     uint64_t deltanet_mem_budget_bytes = 0;   // --kvmem-deltanet-mem-budget-gb (0 => 32 GiB default)
-    bool     deltanet_decay = true;           // --kvmem-deltanet-decay (apply exp(G_M - G_j))
+    bool     deltanet_decay = true;           // Internal DeltaNet experiment: apply exp(G_M - G_j).
     uint32_t deltanet_topk_q = 4;             // --kvmem-deltanet-topk-q (TopKMean over query tokens)
     uint32_t deltanet_topk_h = 4;             // --kvmem-deltanet-topk-h (TopKMean over heads)
 
@@ -308,7 +308,6 @@ struct KvMemStoreConfig {
     // active working-set budget; CPU/NVMe tiering will use the same estimated
     // block capacity as the global GPU repository high-watermark.
     double gpu_memory_ratio = 0.50;
-    double gpu_high_watermark = 0.95;
     double gpu_low_watermark = 0.85;
     uint32_t estimated_gpu_block_capacity = 0;
     // Complete GPU-resident K+V bytes for one logical block.  This differs

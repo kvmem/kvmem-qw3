@@ -143,7 +143,6 @@ struct EngineOptions {
     int batch_size = 2048;
     bool verbose = false;
     bool native_heavy = true;
-    int native_token_id = 0;
     std::string native_kernels = "cuda";
     std::string native_linear_backend = "auto";
     // Keep a BF16 input embedding table in its mapped host checkpoint and
@@ -272,7 +271,6 @@ struct EngineOptions {
     int kvmem_retrieval_blocks = 0; // 0 = derive from remaining budget
     int kvmem_profile_blocks = 0;   // 0 = derive from remaining budget
     double kvmem_gpu_memory_ratio = 0.50;
-    double kvmem_gpu_high_watermark = 0.95;
     double kvmem_gpu_low_watermark = 0.85;
     uint64_t kvmem_cpu_bytes = 0;
     uint64_t kvmem_nvme_bytes = 0;

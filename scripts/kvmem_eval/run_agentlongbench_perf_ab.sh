@@ -82,16 +82,6 @@ run_cell() {
   echo "[$(date --iso-8601=seconds)] START cell=$cell tag=$tag stage_out=$stage_out stage_in=$stage_in pack=$pack" |
     tee -a "$SUMMARY_LOG"
   env \
-    -u QW3_KVMEM_PREFILL_WRITEBACK \
-    -u QW3_KVMEM_ASSEMBLY_MODE \
-    -u QW3_KVMEM_RAW_K_BLOCK_MAJOR \
-    -u QW3_KVMEM_RAW_K_TRANSFER_BLOCKS \
-    -u QW3_KVMEM_OVERLAP_STAGEIN_ASSEMBLY \
-    -u QW3_KVMEM_PERSISTENT_CPU_POOL \
-    -u QW3_KVMEM_INCLUSIVE_CPU \
-    -u QW3_KVMEM_QUERY_PREFETCH \
-    -u QW3_KVMEM_MTP_INCREMENTAL_ASSEMBLY \
-    -u QW3_KVMEM_PREFILL_CPU_ADMIT \
     QW3_KVMEM_PERF_TRACE=1 \
     PORT="$PORT" \
     TAG="$tag" \
