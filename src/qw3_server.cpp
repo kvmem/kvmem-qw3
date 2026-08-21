@@ -1988,6 +1988,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     // Single shared KV cache + scratch in the executor => serialize generation.
     std::mutex gen_mu;
+    struct GuidedTrajectoryState {
+        uint64_t last_seen_prompt_tokens = 0;
+        uint64_t last_refresh_prompt_tokens = 0;
+        size_t current_query_key = 0;
+        bool has_current_query = false;
+        bool selection_started = false;
+    };
+    std::mutex guided_trajectory_mu;
+    std::unordered_map<size_t, GuidedTrajectoryState> guided_trajectories;
     std::atomic<uint64_t> req_counter{0};
 
     httplib::Server svr;
