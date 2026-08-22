@@ -102,6 +102,40 @@ void test_request_conversion() {
     }
 }
 
+void test_billing_marker_does_not_invalidate_prompt_prefix() {
+    auto request = [](const std::string &cch, bool cache_control) {
+        json user = json{{"type", "text"}, {"text", "do the task"}};
+        if (cache_control) {
+            user["cache_control"] = json{{"type", "ephemeral"}};
+        }
+        return json{
+            {"model", "qwen"},
+            {"max_tokens", 64},
+            {"system", json::array({
+                 json{{"type", "text"},
+                      {"text", "x-anthropic-billing-header: cc_version=2.1.148; cch=" + cch + ";"}},
+                 json{{"type", "text"}, {"text", "stable policy"}}})},
+            {"messages", json::array({json{
+                 {"role", "user"},
+                 {"content", json::array({user})}}})}
+        };
+    };
+
+    json first;
+    json second;
+    std::string error;
+    require(anthropic_request_to_openai(
+                request("first", true), first, error), error);
+    require(anthropic_request_to_openai(
+                request("second", false), second, error), error);
+    require(first["messages"] == second["messages"],
+            "Claude transport-only marker changed the model prompt prefix");
+    require(first["messages"].size() == 2 &&
+                first["messages"][0]["role"] == "system" &&
+                first["messages"][0]["content"] == "stable policy",
+            "billing marker was not removed without disturbing real policy");
+}
+
 void test_rejects_unsupported_image() {
     const json request = {
         {"model", "qwen"},
@@ -330,6 +364,7 @@ void test_streaming_error_is_terminal() {
 
 int main() {
     test_request_conversion();
+    test_billing_marker_does_not_invalidate_prompt_prefix();
     test_rejects_unsupported_image();
     test_tool_result_followed_by_reminder_preserves_order();
     test_malformed_field_type_returns_error();
