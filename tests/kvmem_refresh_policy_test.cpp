@@ -27,6 +27,21 @@ int main() {
             "post-refresh epoch reused the initial remaining distance");
     require(kvmem_middecode_trigger_for_epoch(1770, 0, 1) == 1770,
             "zero steady trigger changed legacy direct-caller behavior");
+    require(kvmem_mtp_compact_output_horizon(
+                188416, 65473, 65536, 61377, 2) == 65536,
+            "multi-epoch request used its request-wide output cap as one "
+            "MTP compact epoch");
+    require(kvmem_mtp_compact_output_horizon(
+                32768, 65473, 65536, 61377, 2) == 32768,
+            "short multi-epoch request expanded its MTP compact horizon");
+    require(kvmem_mtp_compact_output_horizon(
+                188416, 65473, 65536, 0, 2) == 188416,
+            "request without a refresh trigger lost the conservative MTP "
+            "position guard");
+    require(kvmem_mtp_compact_output_horizon(
+                188416, 65473, 65536, 61377, 0) == 188416,
+            "request without refresh capacity lost the conservative MTP "
+            "position guard");
     require(kvmem_middecode_refresh_due(
                 1798, 0,
                 kvmem_middecode_trigger_for_epoch(1770, 61440, 0), 0, 2),

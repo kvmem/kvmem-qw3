@@ -28,6 +28,25 @@ inline constexpr uint32_t kvmem_middecode_trigger_for_epoch(
         : first_trigger_tokens;
 }
 
+// Local-position MTP only needs enough RoPE headroom for one generation
+// epoch. A guided mid-decode refresh compacts/rebases the selected prefix
+// before the next epoch, so using the request-wide output cap here falsely
+// rejects otherwise-safe multi-epoch requests. Without a complete refresh
+// policy, retain the conservative request-wide horizon.
+inline constexpr uint64_t kvmem_mtp_compact_output_horizon(
+        uint64_t request_max_tokens, uint32_t first_epoch_limit_tokens,
+        uint32_t steady_epoch_limit_tokens,
+        uint32_t middecode_trigger_tokens, uint32_t max_refreshes) {
+    if (request_max_tokens == 0 || middecode_trigger_tokens == 0 ||
+        max_refreshes == 0 || first_epoch_limit_tokens == 0 ||
+        steady_epoch_limit_tokens == 0) {
+        return request_max_tokens;
+    }
+    const uint64_t largest_epoch = std::max<uint64_t>(
+        first_epoch_limit_tokens, steady_epoch_limit_tokens);
+    return std::min(request_max_tokens, largest_epoch);
+}
+
 // A generated retrieval query is publishable only after the model reaches a
 // real one-line boundary (EOS, ChatML end, newline, or terminal punctuation).
 // Merely consuming the configured token cap is not a boundary: publishing that

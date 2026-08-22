@@ -12325,9 +12325,24 @@ private:
             (!env_flag_enabled("QW3_KVMEM_FULLCTX_QUERY") ||
              mtp_rope_limit == 0 ||
              logical_prompt_tokens <= mtp_rope_limit);
+        const uint64_t mtp_request_output_tokens =
+            static_cast<uint64_t>(std::max(0, options.max_tokens));
+        const uint32_t mtp_steady_epoch_limit = static_cast<uint32_t>(
+            std::max(1, options_.kvmem_gen_budget));
+        const uint32_t mtp_first_epoch_limit =
+            options.kvmem_middecode_epoch_limit_tokens != 0
+                ? options.kvmem_middecode_epoch_limit_tokens
+                : mtp_steady_epoch_limit;
+        const uint64_t mtp_compact_output_horizon =
+            detail::kvmem_mtp_compact_output_horizon(
+                mtp_request_output_tokens,
+                mtp_first_epoch_limit,
+                mtp_steady_epoch_limit,
+                options.kvmem_middecode_trigger_tokens,
+                options.kvmem_middecode_max_refreshes);
         const uint64_t mtp_compact_end =
             static_cast<uint64_t>(kvmem_sel_budget) +
-            static_cast<uint64_t>(std::max(0, options.max_tokens));
+            mtp_compact_output_horizon;
         const bool mtp_prefix_positions_safe =
             !kvmem_on || mtp_rope_limit == 0 ||
             (mtp_compact_prefill_safe
@@ -12807,8 +12822,20 @@ private:
         if (mtp_local_positions && !mtp_prefix_positions_safe) {
             throw std::runtime_error(
                 "KVMem local-position MTP cannot construct an in-range compact "
-                "prefix for this request; disable QW3_KVMEM_FULLCTX_QUERY or "
-                "reduce the KVMem/generation budgets");
+                "prefix for this request: selection_budget=" +
+                std::to_string(kvmem_sel_budget) +
+                " request_max_tokens=" +
+                std::to_string(mtp_request_output_tokens) +
+                " compact_output_horizon=" +
+                std::to_string(mtp_compact_output_horizon) +
+                " projected_compact_end=" +
+                std::to_string(mtp_compact_end) +
+                " rope_limit=" + std::to_string(mtp_rope_limit) +
+                " fullctx_query=" +
+                std::to_string(
+                    env_flag_enabled("QW3_KVMEM_FULLCTX_QUERY") ? 1 : 0) +
+                "; disable QW3_KVMEM_FULLCTX_QUERY when enabled, or reduce "
+                "the KVMem/per-epoch generation budgets");
         }
         if (!mtp_prefix_positions_safe &&
             (spec_mtp || trace_mtp || mtp_prefix_enabled(options_))) {
@@ -12818,6 +12845,10 @@ private:
                 std::to_string(mtp_logical_end) + " projected_compact_end=" +
                 std::to_string(mtp_compact_end) + " local_positions=" +
                 std::to_string(mtp_local_positions ? 1 : 0) +
+                " request_max_tokens=" +
+                std::to_string(mtp_request_output_tokens) +
+                " compact_output_horizon=" +
+                std::to_string(mtp_compact_output_horizon) +
                 " compact_prefill_safe=" +
                 std::to_string(mtp_compact_prefill_safe ? 1 : 0) +
                 " action=disable_mtp_prefix_and_speculation");
@@ -12829,6 +12860,10 @@ private:
                 std::to_string(mtp_rope_limit) + " projected_logical_end=" +
                 std::to_string(mtp_logical_end) + " projected_compact_end=" +
                 std::to_string(mtp_compact_end) +
+                " request_max_tokens=" +
+                std::to_string(mtp_request_output_tokens) +
+                " compact_output_horizon=" +
+                std::to_string(mtp_compact_output_horizon) +
                 " local_positions=1 action=use_compact_window_positions");
         }
         if (spec_mtp && mtp_chain_len != requested_mtp_chain_len) {
