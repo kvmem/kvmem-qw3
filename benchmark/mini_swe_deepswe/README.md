@@ -29,6 +29,13 @@ container exposes a host-local TCP relay on port 80. The agent reaches it as
 `172.17.0.1.nip.io`, so Pier keeps both domain allowlisting and network
 isolation enabled. The relay contains no HTTP or model logic.
 
+Pier's upstream MiniSweAgent adapter is inherited by a local transport-only
+subclass. It changes only installation of the pinned `uv 0.7.13`: curl is
+forced to HTTP/1.1 with bounded retries, avoiding reproducible HTTP/2 truncation
+from GitHub on this host. The MiniSweAgent version remains 2.4.6, and its prompt,
+tools, loop, trajectory conversion, network policy, and verifier are unchanged.
+The adapter source hash is stored in the run manifest.
+
 ## Locked components
 
 See `versions.lock.json`. The runner validates the Pier and mini-swe-agent

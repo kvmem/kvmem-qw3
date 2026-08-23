@@ -35,6 +35,10 @@ MODEL = REPO / "models" / "Qwen3.8-27B-Q8_0.gguf"
 DEEPSWE_TASKS = REPO / "benchmark" / "deep-swe" / "tasks"
 DEEPSWE_MANIFEST = DEEPSWE_TASKS / "manifest.json"
 RELAY_SCRIPT = HERE / "tcp_relay.py"
+AGENT_ADAPTER = HERE / "reliable_mini_swe_agent.py"
+AGENT_IMPORT_PATH = (
+    "benchmark.mini_swe_deepswe.reliable_mini_swe_agent:ReliableMiniSweAgent"
+)
 # This is the official base image of the first locked DeepSWE task.  Pier must
 # use it for that task anyway, so the relay adds no independent image source.
 RELAY_IMAGE = (
@@ -44,7 +48,7 @@ RELAY_IMAGE = (
 SOURCE_TASK_LIST = (
     REPO / "benchmark" / "claude_deepswe_ab" / "tasks_requestplan_10_no_happy.json"
 )
-MAX_INFRASTRUCTURE_ATTEMPTS = 3
+MAX_INFRASTRUCTURE_ATTEMPTS = 5
 
 
 def utc_now() -> str:
@@ -94,6 +98,7 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
         DEEPSWE_MANIFEST,
         SOURCE_TASK_LIST,
         RELAY_SCRIPT,
+        AGENT_ADAPTER,
     ]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -359,8 +364,8 @@ def pier_command(task_id: str, task_dir: Path, task_artifact: Path, api_base: st
         "--yes",
         "--path",
         str(task_dir),
-        "--agent",
-        "mini-swe-agent",
+        "--agent-import-path",
+        AGENT_IMPORT_PATH,
         "--model",
         "openai/Qwen3.8-27B",
         "--agent-kwarg",
@@ -491,6 +496,15 @@ def main() -> int:
         manifest = read_json(manifest_path)
         if manifest.get("task_ids") != [item["task_id"] for item in selected]:
             raise RuntimeError("Existing run manifest has a different task selection")
+        manifest["agent_install_adapter"] = {
+            "import_path": AGENT_IMPORT_PATH,
+            "path": str(AGENT_ADAPTER),
+            "sha256": sha256(AGENT_ADAPTER),
+            "scope": "transport-only uv installer hardening",
+        }
+        manifest["last_resumed_at"] = utc_now()
+        manifest["last_resume_git"] = git_snapshot()
+        write_json(manifest_path, manifest)
     else:
         manifest = {
             "schema_version": 1,
@@ -506,9 +520,17 @@ def main() -> int:
                 "qw3_binary_sha256": sha256(QW3),
                 "model": str(MODEL),
                 "model_size_bytes": MODEL.stat().st_size,
+                "agent_install_adapter": str(AGENT_ADAPTER),
+                "agent_install_adapter_sha256": sha256(AGENT_ADAPTER),
             },
             "qwen_command": qwen_command(args.host, args.port),
             "api_base": api_base,
+            "agent_install_adapter": {
+                "import_path": AGENT_IMPORT_PATH,
+                "path": str(AGENT_ADAPTER),
+                "sha256": sha256(AGENT_ADAPTER),
+                "scope": "transport-only uv installer hardening",
+            },
             "pier_safe_port_relay": {
                 "image": RELAY_IMAGE,
                 "listen": f"{args.host}:{args.api_port}",
