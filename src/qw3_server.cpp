@@ -2756,11 +2756,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             hreq.has_header("x-deepseek-harness-compact") &&
             trim_ascii_ws(hreq.get_header_value(
                 "x-deepseek-harness-compact")) == "1";
+        const bool mini_swe_agent =
+            hreq.has_header("x-qw3-harness") &&
+            trim_ascii_ws(hreq.get_header_value("x-qw3-harness")) ==
+                "mini-swe-agent";
         const detail::HarnessRequestContext harness =
             detail::classify_harness(detail::HarnessRequestSignals{
                 protocol,
                 hreq.has_header("User-Agent")
                     ? hreq.get_header_value("User-Agent") : std::string(),
+                mini_swe_agent,
                 hreq.has_header("x-deepseek-harness-user-id") ||
                     hreq.has_header("x-deepseek-harness-session-id") ||
                     hreq.has_header("x-deepseek-harness-compact"),

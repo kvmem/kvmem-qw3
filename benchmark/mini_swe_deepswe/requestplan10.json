@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "description": "The exact ten DeepSWE tasks from the historical one-attempt KVMem batch that scored 8/10, now evaluated with the official Pier + mini-swe-agent harness.",
+  "source": "benchmark/claude_deepswe_ab/tasks_requestplan_10_no_happy.json",
+  "source_sha256": "b77314f6776038842c22d9e232abca01dc9c14b20021c1d5ee9b32a0d8d53e7b",
+  "historical_batch": "benchmark/claude_deepswe_ab/recordings/kvmem128_gen64_requestplan10_seed73_20260820_e",
+  "historical_score": {
+    "passes": 8,
+    "total": 10
+  },
+  "tasks": [
+    {"task_id": "expr-try-catch-errors", "historical_reward": 0},
+    {"task_id": "termenv-preserve-ansi-resets", "historical_reward": 0},
+    {"task_id": "psd-tools-blend-range-api", "historical_reward": 1},
+    {"task_id": "scriggo-method-declarations", "historical_reward": 1},
+    {"task_id": "wasmi-trap-coredumps", "historical_reward": 1},
+    {"task_id": "opa-template-string-reconstruction", "historical_reward": 1},
+    {"task_id": "tomlkit-toml-table-converters", "historical_reward": 1},
+    {"task_id": "true-myth-iterable-collection-combinators", "historical_reward": 1},
+    {"task_id": "valibot-recursive-schema-composition", "historical_reward": 1},
+    {"task_id": "boa-hierarchical-evaluation-cancellation", "historical_reward": 1}
+  ]
+}

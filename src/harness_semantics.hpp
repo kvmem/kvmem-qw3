@@ -14,6 +14,7 @@ enum class HarnessKind {
     ClaudeCode,
     OpenCode,
     DeepSeekHarness,
+    MiniSweAgent,
     GenericToolClient,
 };
 
@@ -25,6 +26,7 @@ enum class HarnessProtocol {
 struct HarnessRequestSignals {
     HarnessProtocol protocol = HarnessProtocol::OpenAIChat;
     std::string user_agent;
+    bool has_mini_swe_agent_header = false;
     bool has_deepseek_harness_header = false;
     bool has_opencode_header = false;
     bool has_tools = false;

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "pier": {
+    "repository": "https://github.com/datacurve-ai/pier.git",
+    "commit": "949ec4f6004fa74f4a5b0d05c4f3c1a98e8a4a9e",
+    "version": "0.3.1"
+  },
+  "mini_swe_agent": {
+    "version": "2.4.6",
+    "wheel_sha256": "a35463c553ac825c7773b03cfa69cd44958e3af20155dcc5711fdf9e4c67cd54"
+  },
+  "python": "3.12.13",
+  "deep_swe_task_manifest_sha256": "f987b656fe75e20eeb7a050ec1b3c5d692cc8f102dfe7caca45906616b5ae879",
+  "requestplan10_source_sha256": "b77314f6776038842c22d9e232abca01dc9c14b20021c1d5ee9b32a0d8d53e7b"
+}

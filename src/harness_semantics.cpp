@@ -123,7 +123,8 @@ std::vector<ReminderFrame> reminder_frames(std::string_view content) {
 
 bool frame_is_control(HarnessKind kind, const ReminderFrame &frame) {
     if (kind == HarnessKind::None) return false;
-    if (kind == HarnessKind::GenericToolClient) {
+    if (kind == HarnessKind::GenericToolClient ||
+        kind == HarnessKind::MiniSweAgent) {
         return frame.persistent_policy;
     }
     return true;
@@ -191,6 +192,14 @@ HarnessRequestContext classify_harness(
         out.kind = HarnessKind::ClaudeCode;
         return out;
     }
+    if (signals.has_mini_swe_agent_header ||
+        contains_ascii_case_insensitive(
+            signals.user_agent, "mini-swe-agent") ||
+        contains_ascii_case_insensitive(
+            signals.user_agent, "mini_swe_agent")) {
+        out.kind = HarnessKind::MiniSweAgent;
+        return out;
+    }
     if (signals.has_deepseek_harness_header ||
         contains_ascii_case_insensitive(
             signals.user_agent, "deepseek-harness/")) {
@@ -213,6 +222,7 @@ const char *harness_kind_name(HarnessKind kind) {
     case HarnessKind::ClaudeCode: return "claude-code";
     case HarnessKind::OpenCode: return "opencode";
     case HarnessKind::DeepSeekHarness: return "deepseek-harness";
+    case HarnessKind::MiniSweAgent: return "mini-swe-agent";
     case HarnessKind::GenericToolClient: return "generic-tool-client";
     case HarnessKind::None: return "none";
     }
