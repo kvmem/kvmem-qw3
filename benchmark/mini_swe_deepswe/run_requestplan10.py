@@ -13,7 +13,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -35,6 +34,13 @@ QW3 = REPO / "build" / "qw3"
 MODEL = REPO / "models" / "Qwen3.8-27B-Q8_0.gguf"
 DEEPSWE_TASKS = REPO / "benchmark" / "deep-swe" / "tasks"
 DEEPSWE_MANIFEST = DEEPSWE_TASKS / "manifest.json"
+RELAY_SCRIPT = HERE / "tcp_relay.py"
+# This is the official base image of the first locked DeepSWE task.  Pier must
+# use it for that task anyway, so the relay adds no independent image source.
+RELAY_IMAGE = (
+    "public.ecr.aws/d3j8x8q7/swe-bench-202605:"
+    "kh71gkadwafw4ry4r6g37era0182qpms-v1.1"
+)
 SOURCE_TASK_LIST = (
     REPO / "benchmark" / "claude_deepswe_ab" / "tasks_requestplan_10_no_happy.json"
 )
@@ -79,7 +85,15 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
     lock = read_json(VERSION_LOCK)
     task_spec = read_json(tasks_path)
 
-    required = [PIER, PYTHON, QW3, MODEL, DEEPSWE_MANIFEST, SOURCE_TASK_LIST]
+    required = [
+        PIER,
+        PYTHON,
+        QW3,
+        MODEL,
+        DEEPSWE_MANIFEST,
+        SOURCE_TASK_LIST,
+        RELAY_SCRIPT,
+    ]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise RuntimeError("Missing required artifact(s): " + ", ".join(missing))
@@ -263,6 +277,51 @@ def stop_process(process: subprocess.Popen[Any], timeout: float = 30.0) -> None:
         process.wait(timeout=10.0)
 
 
+def start_relay(
+    name: str,
+    *,
+    listen_host: str,
+    listen_port: int,
+    target_host: str,
+    target_port: int,
+) -> None:
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "-d",
+        "--name",
+        name,
+        "--network",
+        "host",
+        "--entrypoint",
+        "python3",
+        "-v",
+        f"{RELAY_SCRIPT}:/opt/qw3/tcp_relay.py:ro",
+        RELAY_IMAGE,
+        "/opt/qw3/tcp_relay.py",
+        "--listen-host",
+        listen_host,
+        "--listen-port",
+        str(listen_port),
+        "--target-host",
+        target_host,
+        "--target-port",
+        str(target_port),
+    ]
+    run_text(command)
+
+
+def stop_relay(name: str) -> None:
+    subprocess.run(
+        ["docker", "stop", "--time", "5", name],
+        cwd=REPO,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def pier_command(task_id: str, task_dir: Path, task_artifact: Path, api_base: str) -> list[str]:
     jobs_dir = task_artifact / "pier_jobs"
     return [
@@ -344,6 +403,8 @@ def main() -> int:
     parser.add_argument("--tasks-file", type=Path, default=DEFAULT_TASKS)
     parser.add_argument("--host", default="172.17.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--api-host", default="172.17.0.1.nip.io")
+    parser.add_argument("--api-port", type=int, default=80)
     parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -356,7 +417,7 @@ def main() -> int:
 
     run_dir = args.output_root.resolve() / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    api_base = f"http://{args.host}:{args.port}/v1"
+    api_base = f"http://{args.api_host}:{args.api_port}/v1"
     manifest_path = run_dir / "manifest.json"
     if manifest_path.exists():
         manifest = read_json(manifest_path)
@@ -380,6 +441,11 @@ def main() -> int:
             },
             "qwen_command": qwen_command(args.host, args.port),
             "api_base": api_base,
+            "pier_safe_port_relay": {
+                "image": RELAY_IMAGE,
+                "listen": f"{args.host}:{args.api_port}",
+                "target": f"{args.host}:{args.port}",
+            },
         }
         write_json(manifest_path, manifest)
 
@@ -403,6 +469,8 @@ def main() -> int:
         qwen_log_path = task_artifact / "qw3_server.log"
         pier_log_path = task_artifact / "pier_console.log"
         qwen_log = qwen_log_path.open("ab", buffering=0)
+        relay_name = f"qw3-pier-relay-{os.getpid()}"
+        relay_started = False
         server = subprocess.Popen(
             qwen_command(args.host, args.port),
             cwd=REPO,
@@ -415,6 +483,15 @@ def main() -> int:
         pier_exit: int | None = None
         try:
             wait_for_health(server, f"http://{args.host}:{args.port}/health")
+            start_relay(
+                relay_name,
+                listen_host=args.host,
+                listen_port=args.api_port,
+                target_host=args.host,
+                target_port=args.port,
+            )
+            relay_started = True
+            wait_for_health(server, f"http://{args.host}:{args.api_port}/health")
             command = pier_command(task_id, DEEPSWE_TASKS / task_id, task_artifact, api_base)
             write_json(
                 task_artifact / "attempt.json",
@@ -434,6 +511,8 @@ def main() -> int:
                     stderr=subprocess.STDOUT,
                 ).returncode
         finally:
+            if relay_started:
+                stop_relay(relay_name)
             stop_process(server)
             qwen_log.close()
 

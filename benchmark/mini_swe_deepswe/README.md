@@ -19,6 +19,12 @@ which is the native QW3 API. The request includes
 `x-qw3-harness: mini-swe-agent`, allowing QW3 to use explicit harness semantics
 instead of guessing from prompt text.
 
+Pier's policy proxy intentionally permits only destination ports 80 and 443.
+QW3 remains an unprivileged host process on port 8000; a task-base-image
+container exposes a host-local TCP relay on port 80. The agent reaches it as
+`172.17.0.1.nip.io`, so Pier keeps both domain allowlisting and network
+isolation enabled. The relay contains no HTTP or model logic.
+
 ## Locked components
 
 See `versions.lock.json`. The runner validates the Pier and mini-swe-agent
