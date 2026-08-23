@@ -13,6 +13,10 @@ batch through DeepSWE's official execution path:
 - A task is resumably skipped only after a numeric official verifier reward was
   captured with no Pier trial exception. A reward of zero is a valid result and
   is not automatically retried.
+- A transient official container-build/network failure that occurs before
+  MiniSweAgent starts is retried up to three infrastructure attempts. Each
+  attempt has a separate artifact directory. Failures after the agent starts,
+  and every numeric verifier result including zero, are never auto-retried.
 
 The provider is explicitly `litellm` so mini-swe-agent uses Chat Completions,
 which is the native QW3 API. The request includes

@@ -44,6 +44,7 @@ RELAY_IMAGE = (
 SOURCE_TASK_LIST = (
     REPO / "benchmark" / "claude_deepswe_ab" / "tasks_requestplan_10_no_happy.json"
 )
+MAX_INFRASTRUCTURE_ATTEMPTS = 3
 
 
 def utc_now() -> str:
@@ -395,6 +396,55 @@ def trial_result(task_artifact: Path) -> tuple[Path, dict[str, Any]] | None:
     return candidates[0]
 
 
+def attempt_artifact(task_artifact: Path, attempt: int) -> Path:
+    """Return a stable artifact root for an infrastructure attempt.
+
+    Attempt one retains the original layout.  Retry artifacts live under a
+    separate directory so an interrupted or failed official Pier run is never
+    overwritten and remains auditable.
+    """
+    if attempt == 1:
+        return task_artifact
+    return task_artifact / "infrastructure_retries" / f"attempt_{attempt:02d}"
+
+
+def attempted_count(task_artifact: Path) -> int:
+    count = int((task_artifact / "pier_jobs").exists())
+    retry_root = task_artifact / "infrastructure_retries"
+    if retry_root.is_dir():
+        count += sum(
+            1
+            for path in retry_root.glob("attempt_*")
+            if (path / "pier_jobs").exists()
+        )
+    return count
+
+
+def retryable_pre_agent_infrastructure_failure(attempt_root: Path) -> bool:
+    """Retry only an official environment failure before the agent ran.
+
+    A model/serving failure after MiniSweAgent has started needs diagnosis and
+    must not be hidden by an automatic rerun.  A numeric verifier result is
+    handled before this function and is never retried, including reward zero.
+    """
+    if any(attempt_root.glob("pier_jobs/*/*/agent/mini-swe-agent.trajectory.json")):
+        return False
+    exceptions = list(attempt_root.glob("pier_jobs/*/*/exception.txt"))
+    if not exceptions:
+        return False
+    text = "\n".join(path.read_text(encoding="utf-8", errors="replace") for path in exceptions)
+    markers = (
+        "Docker compose command failed",
+        "failed to download",
+        "HTTP/2 stream",
+        "Temporary failure resolving",
+        "Could not resolve host",
+        "connection reset",
+        "network error",
+    )
+    return any(marker.lower() in text.lower() for marker in markers)
+
+
 def completed_summary(task_artifact: Path) -> dict[str, Any] | None:
     path = task_artifact / "summary.json"
     if not path.is_file():
@@ -483,87 +533,116 @@ def main() -> int:
             print(f"[{ordinal}/{len(selected)}] SKIP completed {task_id}: reward={existing['reward']}", flush=True)
             continue
 
-        print(f"[{ordinal}/{len(selected)}] START {task_id}", flush=True)
-        qwen_log_path = task_artifact / "qw3_server.log"
-        pier_log_path = task_artifact / "pier_console.log"
-        qwen_log = qwen_log_path.open("ab", buffering=0)
-        relay_name = f"qw3-pier-relay-{os.getpid()}"
-        relay_started = False
-        server = subprocess.Popen(
-            qwen_command(args.host, args.port),
-            cwd=REPO,
-            env=qwen_environment(),
-            stdout=qwen_log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        started_at = utc_now()
-        pier_exit: int | None = None
-        try:
-            wait_for_health(server, f"http://{args.host}:{args.port}/health")
-            start_relay(
-                relay_name,
-                listen_host=args.host,
-                listen_port=args.api_port,
-                target_host=args.host,
-                target_port=args.port,
+        first_attempt = attempted_count(task_artifact) + 1
+        if first_attempt > MAX_INFRASTRUCTURE_ATTEMPTS:
+            raise RuntimeError(
+                f"{task_id}: exhausted {MAX_INFRASTRUCTURE_ATTEMPTS} infrastructure attempts; "
+                f"inspect {task_artifact}"
             )
-            relay_started = True
-            wait_for_health(server, f"http://{args.host}:{args.api_port}/health")
-            command = pier_command(task_id, DEEPSWE_TASKS / task_id, task_artifact, api_base)
-            write_json(
-                task_artifact / "attempt.json",
-                {
-                    "task_id": task_id,
-                    "started_at": started_at,
-                    "historical_reward": item["historical_reward"],
-                    "pier_command": command,
-                    "qwen_pid": server.pid,
-                },
-            )
-            with pier_log_path.open("ab", buffering=0) as pier_log:
-                pier_exit = subprocess.run(
-                    command,
-                    cwd=REPO,
-                    stdout=pier_log,
-                    stderr=subprocess.STDOUT,
-                ).returncode
-        finally:
-            if relay_started:
-                stop_relay(relay_name)
-            stop_process(server)
-            qwen_log.close()
 
-        parsed = trial_result(task_artifact)
-        if parsed is None:
-            write_json(
-                task_artifact / "summary.json",
-                {
-                    "status": "infrastructure_error",
-                    "task_id": task_id,
-                    "started_at": started_at,
-                    "finished_at": utc_now(),
-                    "pier_exit_code": pier_exit,
-                    "reason": "Pier did not produce exactly one trial result with a numeric verifier reward",
-                },
+        successful: tuple[Path, dict[str, Any], str, int | None, int] | None = None
+        for infrastructure_attempt in range(first_attempt, MAX_INFRASTRUCTURE_ATTEMPTS + 1):
+            current_artifact = attempt_artifact(task_artifact, infrastructure_attempt)
+            current_artifact.mkdir(parents=True, exist_ok=True)
+            print(
+                f"[{ordinal}/{len(selected)}] START {task_id} "
+                f"infrastructure_attempt={infrastructure_attempt}/{MAX_INFRASTRUCTURE_ATTEMPTS}",
+                flush=True,
             )
-            raise RuntimeError(f"{task_id}: no valid official verifier result; inspect {task_artifact}")
+            qwen_log_path = current_artifact / "qw3_server.log"
+            pier_log_path = current_artifact / "pier_console.log"
+            qwen_log = qwen_log_path.open("ab", buffering=0)
+            relay_name = f"qw3-pier-relay-{os.getpid()}"
+            relay_started = False
+            server = subprocess.Popen(
+                qwen_command(args.host, args.port),
+                cwd=REPO,
+                env=qwen_environment(),
+                stdout=qwen_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            started_at = utc_now()
+            pier_exit: int | None = None
+            try:
+                wait_for_health(server, f"http://{args.host}:{args.port}/health")
+                start_relay(
+                    relay_name,
+                    listen_host=args.host,
+                    listen_port=args.api_port,
+                    target_host=args.host,
+                    target_port=args.port,
+                )
+                relay_started = True
+                wait_for_health(server, f"http://{args.host}:{args.api_port}/health")
+                command = pier_command(
+                    task_id, DEEPSWE_TASKS / task_id, current_artifact, api_base
+                )
+                write_json(
+                    current_artifact / "attempt.json",
+                    {
+                        "task_id": task_id,
+                        "infrastructure_attempt": infrastructure_attempt,
+                        "started_at": started_at,
+                        "historical_reward": item["historical_reward"],
+                        "pier_command": command,
+                        "qwen_pid": server.pid,
+                    },
+                )
+                with pier_log_path.open("ab", buffering=0) as pier_log:
+                    pier_exit = subprocess.run(
+                        command,
+                        cwd=REPO,
+                        stdout=pier_log,
+                        stderr=subprocess.STDOUT,
+                    ).returncode
+            finally:
+                if relay_started:
+                    stop_relay(relay_name)
+                stop_process(server)
+                qwen_log.close()
 
-        result_path, result = parsed
-        if result.get("exception_info") is not None:
-            write_json(
-                task_artifact / "summary.json",
-                {
-                    "status": "infrastructure_error",
-                    "task_id": task_id,
-                    "started_at": started_at,
-                    "finished_at": utc_now(),
-                    "pier_exit_code": pier_exit,
-                    "trial_result": str(result_path),
-                    "exception_info": result["exception_info"],
-                },
+            parsed = trial_result(current_artifact)
+            if parsed is not None and parsed[1].get("exception_info") is None:
+                successful = (*parsed, started_at, pier_exit, infrastructure_attempt)
+                break
+
+            attempt_summary: dict[str, Any] = {
+                "status": "infrastructure_error",
+                "task_id": task_id,
+                "infrastructure_attempt": infrastructure_attempt,
+                "started_at": started_at,
+                "finished_at": utc_now(),
+                "pier_exit_code": pier_exit,
+            }
+            if parsed is None:
+                attempt_summary["reason"] = (
+                    "Pier did not produce exactly one trial result with a numeric verifier reward"
+                )
+            else:
+                attempt_summary["trial_result"] = str(parsed[0])
+                attempt_summary["exception_info"] = parsed[1].get("exception_info")
+            retryable = retryable_pre_agent_infrastructure_failure(current_artifact)
+            attempt_summary["retryable_pre_agent_failure"] = retryable
+            write_json(current_artifact / "infrastructure_attempt.json", attempt_summary)
+
+            if retryable and infrastructure_attempt < MAX_INFRASTRUCTURE_ATTEMPTS:
+                print(
+                    f"[{ordinal}/{len(selected)}] RETRY {task_id}: "
+                    "transient official container build failure before agent startup",
+                    flush=True,
+                )
+                continue
+
+            write_json(task_artifact / "summary.json", attempt_summary)
+            raise RuntimeError(
+                f"{task_id}: no valid official verifier result; inspect {current_artifact}"
             )
-            raise RuntimeError(f"{task_id}: Pier trial ended with an exception; inspect {result_path}")
+
+        if successful is None:
+            raise RuntimeError(f"{task_id}: no successful infrastructure attempt")
+
+        result_path, result, started_at, pier_exit, infrastructure_attempt = successful
 
         reward = result["verifier_result"]["rewards"]["reward"]
         summary = {
@@ -572,6 +651,7 @@ def main() -> int:
             "started_at": started_at,
             "finished_at": utc_now(),
             "pier_exit_code": pier_exit,
+            "infrastructure_attempt": infrastructure_attempt,
             "reward": reward,
             "historical_reward": item["historical_reward"],
             "trial_result": str(result_path),
