@@ -230,11 +230,15 @@ def qwen_environment() -> dict[str, str]:
 def wait_for_health(process: subprocess.Popen[Any], url: str, timeout: float = 300.0) -> None:
     deadline = time.monotonic() + timeout
     last_error = "not attempted"
+    # The host often exports an HTTP(S) proxy for outbound traffic.  The QW3
+    # health endpoint is a host-local Docker bridge address and must never be
+    # sent through that proxy.  Pier's agent-side proxy remains untouched.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"QW3 exited during startup with code {process.returncode}")
         try:
-            with urllib.request.urlopen(url, timeout=2.0) as response:
+            with opener.open(url, timeout=2.0) as response:
                 if response.status == 200:
                     return
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
