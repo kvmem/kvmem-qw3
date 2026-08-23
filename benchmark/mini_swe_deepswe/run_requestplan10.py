@@ -106,6 +106,17 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
                 "import importlib.metadata as m; print(m.version('datacurve-pier'))",
             ]
         ),
+        "pier_commit": run_text(
+            [
+                str(PYTHON),
+                "-c",
+                (
+                    "import importlib.metadata as m,json; "
+                    "d=json.loads(m.distribution('datacurve-pier').read_text('direct_url.json')); "
+                    "print(d['vcs_info']['commit_id'])"
+                ),
+            ]
+        ),
         "mini_swe_agent_version": run_text(
             [
                 str(PYTHON),
@@ -121,6 +132,7 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
     }
     expected = {
         "pier_version": lock["pier"]["version"],
+        "pier_commit": lock["pier"]["commit"],
         "mini_swe_agent_version": lock["mini_swe_agent"]["version"],
         "python_version": lock["python"],
         "deep_swe_task_manifest_sha256": lock["deep_swe_task_manifest_sha256"],
@@ -136,6 +148,12 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
 
     if task_spec.get("source_sha256") != actual["requestplan10_source_sha256"]:
         raise RuntimeError("Task selection file no longer matches its authoritative source")
+    authoritative_task_ids = [item["task_id"] for item in read_json(SOURCE_TASK_LIST)["tasks"]]
+    selected_task_ids = [item["task_id"] for item in task_spec["tasks"]]
+    if selected_task_ids != authoritative_task_ids:
+        raise RuntimeError(
+            "Task IDs/order differ from the authoritative historical requestplan10 list"
+        )
     for item in task_spec["tasks"]:
         task_dir = DEEPSWE_TASKS / item["task_id"]
         if not (task_dir / "task.toml").is_file():
