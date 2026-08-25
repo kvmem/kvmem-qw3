@@ -173,7 +173,7 @@ curl -N http://127.0.0.1:18080/v1/chat/completions \
 ## Recommended 24 GiB Qwen3.8 KVMem Profile
 
 This profile is intended for a nominal 24 GiB GPU. It provides a 256K logical
-context, a 40K selected active window, and a 20K generation reserve.
+context, a 48K selected active window, and a 24K generation reserve.
 
 > **The tested model is the Unsloth Qwen3.8-27B-NVFP4 text checkpoint with an
 > MTP head that was separately quantized to FP8.** The stock NVFP4 directory
@@ -181,9 +181,9 @@ context, a 40K selected active window, and a 20K generation reserve.
 > that conversion at startup.
 
 ```sh
-QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
+QW3_KVMEM_SCRATCH_RESERVE_MIB=768 \
 ./build-flashinfer/qw3 serve \
-  --model /path/to/Qwen3.8-27B-NVFP4-MTP-FP8 \
+  --model /path/to/Qwen3.8-27B-NVFP4-MTPFP8 \
   --host 127.0.0.1 \
   --port 18080 \
   --ctx 262144 \
@@ -191,32 +191,25 @@ QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
   --prefill-chunk 512 \
   --cpu-embedding \
   --kvmem \
-  --kvmem-block-tokens 128 \
-  --kvmem-budget 40960 \
-  --kvmem-gen-budget 20480 \
-  --kvmem-sink-tokens 12288 \
-  --kvmem-method retrieval \
-  --kvmem-retrieval-method mean-k \
-  --kvmem-index-placement gpu \
-  --kvmem-update-mode step \
-  --kvmem-query-conditioned \
-  --kvmem-query-max-tokens 512 \
-  --kvmem-select-policy topk \
-  --kvmem-gpu-memory-ratio 0.99 \
+  --kvmem-budget 49152 \
+  --kvmem-gen-budget 24576 \
   --kvmem-cpu-gb 10 \
-  --no-kvmem-raw-k-nvme \
+  --kvmem-gpu-memory-ratio 0.99 \
+  --kvmem-opt-stage-out off \
+  --kvmem-update-mode step \
   --kvmem-prefix-cache \
+  --kvmem-query-conditioned \
+  --mtp-chain 3 \
+  --native-mtp-speculate \
+  --no-continuous-batching \
   --enable-thinking \
   --preserve-thinking \
-  --thinking-budget 16384 \
-  --temp 1.0 \
-  --top-p 0.95 \
-  --top-k 20 \
-  --mtp-chain 3 \
-  --no-continuous-batching \
-  -n 20480
+  --thinking-budget 10240
 ```
 
+`QW3_KVMEM_SCRATCH_RESERVE_MIB=768` is a GPU-pool sizing knob (default 3072).
+It is not an allocated scratch buffer; it leaves room under
+`--kvmem-gpu-memory-ratio 0.99` so the 48K+24K resident window still fits.
 No SSD tier is configured. At this context size, approximately 8.5 GiB is
 enough for complete immutable raw-K and spilled-V CPU backing; the 10 GiB tier
 leaves working margin.
@@ -224,19 +217,17 @@ leaves working margin.
 | Capacity item | Value |
 |---|---:|
 | Logical context | 262,144 tokens |
-| Active selection budget | 40,960 tokens |
-| Generation reserve and server output cap | 20,480 tokens |
-| Always-kept prefix | 12,288 tokens |
+| Active selection budget | 49,152 tokens |
+| Generation reserve and server output cap | 24,576 tokens |
+| Always-kept prefix | auto (~1,024 tokens) |
 | KVMem CPU tier | 10 GiB |
 | NVMe tier | Disabled |
 | 256K FP16 mean-K index at block size 128 | About 64 MiB on GPU |
-| Estimated model-attributable GPU peak | About 23.37 GiB |
+| Observed process GPU peak | About 23.7 GiB on a 24.5 GiB device |
 
-The peak estimate is derived from the measured 48K-active/24K-generation
-profile, with approximately 408 MiB removed for the smaller resident window.
-It leaves roughly 0.63 GiB on a nominal 24 GiB device. Driver behavior, CUDA
-allocator high-watermarks, display use, and model layout can change the peak;
-keep the GPU free of other CUDA workloads and measure on the target machine.
+Driver behavior, CUDA allocator high-watermarks, display use, and model layout
+can change the peak; keep the GPU free of other CUDA workloads and measure on
+the target machine.
 
 `--kvmem-cpu-gb` only accounts for the KVMem tier. Keep at least 16-20 GiB of
 total host memory free for the tier, host model mapping, pinned buffers,
