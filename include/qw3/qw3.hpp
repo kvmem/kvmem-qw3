@@ -236,7 +236,10 @@ struct ToolStructureParameter {
 struct ToolStructureFunction {
     std::string name;
     std::vector<ToolStructureParameter> parameters;
-    bool allow_additional_parameters = true;
+    // Closed tool sets (OpenCode, etc.) omit additionalProperties. Treat that
+    // as false so parameter names stay in the declared list; explicit true or
+    // an additionalProperties schema still opts in.
+    bool allow_additional_parameters = false;
 };
 
 struct ToolStructureConstraintSpec {

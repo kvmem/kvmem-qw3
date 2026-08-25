@@ -1400,15 +1400,25 @@ bool tool_has_only_string_properties(const json *tools,
     return true;
 }
 
+bool schema_allows_additional_parameters(const json *parameters) {
+    if (!parameters || !parameters->contains("additionalProperties")) {
+        return false;
+    }
+    const json &additional = (*parameters)["additionalProperties"];
+    if (additional.is_boolean()) return additional.get<bool>();
+    // A property schema is an explicit opt-in to extra keys.
+    return true;
+}
+
 bool tool_allows_incremental_additional_property(
         const json *tools, const std::string &name) {
     const json *definition = find_tool_definition(tools, name);
     if (!definition || !definition->contains("parameters") ||
         !(*definition)["parameters"].is_object()) {
-        return true;
+        return false;
     }
     const json &parameters = (*definition)["parameters"];
-    if (!parameters.contains("additionalProperties")) return true;
+    if (!schema_allows_additional_parameters(&parameters)) return false;
     const json &additional = parameters["additionalProperties"];
     if (additional.is_boolean()) return additional.get<bool>();
     return schema_is_plain_string(additional);
@@ -1746,9 +1756,7 @@ compile_tool_structure_constraint(const json *tools,
                 ? &(*function)["parameters"]
                 : nullptr;
         compiled.allow_additional_parameters =
-            !parameters || !parameters->contains("additionalProperties") ||
-            !(*parameters)["additionalProperties"].is_boolean() ||
-            (*parameters)["additionalProperties"].get<bool>();
+            schema_allows_additional_parameters(parameters);
 
         std::unordered_set<std::string> required;
         if (parameters && parameters->contains("required") &&

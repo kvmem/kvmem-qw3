@@ -1,4 +1,5 @@
 #include "../src/qw3_server.cpp"
+#include "tool_structure_constraint.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -333,6 +334,49 @@ void test_tool_structure_schema_compilation() {
     if (!forced || forced->functions.size() != 1 ||
         forced->functions.front().name != "edit") {
         fail("forced tool did not narrow the structure constraint");
+    }
+
+    const json omitted = json::array({json{
+        {"type", "function"},
+        {"function",
+         json{{"name", "bash"},
+              {"parameters",
+               json{{"type", "object"},
+                    {"properties",
+                     json{{"command", json{{"type", "string"}}},
+                          {"timeout", json{{"type", "number"}}},
+                          {"workdir", json{{"type", "string"}}},
+                          {"description", json{{"type", "string"}}}}},
+                    {"required", json::array({"command"})}}}}}}});
+    const auto omitted_spec = qw3::compile_tool_structure_constraint(&omitted);
+    if (!omitted_spec || omitted_spec->functions.size() != 1 ||
+        omitted_spec->functions.front().name != "bash" ||
+        omitted_spec->functions.front().allow_additional_parameters ||
+        omitted_spec->functions.front().parameters.size() != 4) {
+        fail("omitted additionalProperties did not default to false");
+    }
+    qw3::detail::ToolStructureConstraint omitted_constraint(omitted_spec);
+    if (!omitted_constraint.commit_piece("<tool_call><function=bash>")) {
+        fail("declared bash opener was rejected");
+    }
+    if (omitted_constraint.allows_piece("<parameter=extra>")) {
+        fail("omitted additionalProperties allowed an extra parameter name");
+    }
+    if (!omitted_constraint.allows_piece("<parameter=command>")) {
+        fail("declared bash parameter was blocked");
+    }
+
+    json explicit_true = omitted;
+    explicit_true[0]["function"]["parameters"]["additionalProperties"] = true;
+    const auto true_spec =
+        qw3::compile_tool_structure_constraint(&explicit_true);
+    if (!true_spec || !true_spec->functions.front().allow_additional_parameters) {
+        fail("explicit additionalProperties=true was not honored");
+    }
+    qw3::detail::ToolStructureConstraint extra(true_spec);
+    if (!extra.commit_piece("<tool_call><function=bash>") ||
+        !extra.allows_piece("<parameter=extra>")) {
+        fail("explicit additionalProperties=true blocked extra parameter names");
     }
 }
 
