@@ -6610,11 +6610,18 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(standard_head_dim));
             if (use_paged_prefill) {
-                // MTP verify/replay is a tiny causal batch. The paged batch
-                // decode adapter uses split-K per row and is substantially
-                // faster than the paged prefill planner over a long cache.
-                // Real prompt prefill remains on the prefill path.
-                if (batch == 1 || (mtp_single_chunk && batch <= 8)) {
+                // MTP verify/replay is a tiny causal batch. BatchDecode is the
+                // conservative default, but it scans the shared prefix once
+                // per verifier row. On A40 with FP8 KV, causal BatchPrefill
+                // reuses that prefix and is substantially faster; the Ampere
+                // node profile opts into it after parity/performance canaries.
+                // Real prompt prefill remains on the prefill path either way.
+                const bool mtp_verify_paged_prefill =
+                    mtp_single_chunk && batch > 1 && batch <= 8 &&
+                    env_flag_enabled("QW3_EXPERIMENTAL_MTP_VERIFY_PAGED_PREFILL");
+                if (batch == 1 ||
+                    (mtp_single_chunk && batch <= 8 &&
+                     !mtp_verify_paged_prefill)) {
                     require_status(backend_.attention_decode_batch_paged_gated_device(
                         *mid_batch_, *q_batch_, 2 * standard_head_dim,
                         attention_k_cache(il), v_cache(il),

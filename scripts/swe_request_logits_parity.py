@@ -389,7 +389,6 @@ def main() -> int:
 
         common = [
             args.qw3,
-            "--backend", "qwen-native",
             "--model", args.model,
             "--raw",
             "--kv-dtype", args.kv_dtype,

@@ -30,7 +30,9 @@ DEFAULT_TASKS = HERE / "requestplan10.json"
 VERSION_LOCK = HERE / "versions.lock.json"
 PIER = REPO / ".venv-deepswe-pier" / "bin" / "pier"
 PYTHON = REPO / ".venv-deepswe-pier" / "bin" / "python"
-QW3 = REPO / "build" / "qw3"
+QW3 = Path(
+    os.environ.get("QW3_DEEPSWE_BINARY", str(REPO / "build" / "qw3"))
+).resolve()
 MODEL = REPO / "models" / "Qwen3.8-27B-Q8_0.gguf"
 DEEPSWE_TASKS = REPO / "benchmark" / "deep-swe" / "tasks"
 DEEPSWE_MANIFEST = DEEPSWE_TASKS / "manifest.json"
@@ -38,6 +40,10 @@ RELAY_SCRIPT = HERE / "tcp_relay.py"
 AGENT_ADAPTER = HERE / "reliable_mini_swe_agent.py"
 AGENT_IMPORT_PATH = (
     "benchmark.mini_swe_deepswe.reliable_mini_swe_agent:ReliableMiniSweAgent"
+)
+COMPACT_AGENT_RUNTIME = HERE / "compacting_mini_swe_agent_runtime.py"
+COMPACT_AGENT_IMPORT_PATH = (
+    "benchmark.mini_swe_deepswe.reliable_mini_swe_agent:CompactingMiniSweAgent"
 )
 # This is the official base image of the first locked DeepSWE task.  Pier must
 # use it for that task anyway, so the relay adds no independent image source.
@@ -48,7 +54,53 @@ RELAY_IMAGE = (
 SOURCE_TASK_LIST = (
     REPO / "benchmark" / "claude_deepswe_ab" / "tasks_requestplan_10_no_happy.json"
 )
-MAX_INFRASTRUCTURE_ATTEMPTS = 5
+MAX_INFRASTRUCTURE_ATTEMPTS = 10
+LOCAL_INFRASTRUCTURE_TIMEOUT_MULTIPLIER = 4.0
+QW3_STARTUP_TIMEOUT_SEC = 1800.0
+SCORED_AGENT_TERMINAL_EXCEPTIONS = {"AgentTimeoutError"}
+# Pier 0.3.1 has no explicit "disable agent timeout" switch.  A very large,
+# finite multiplier is operationally unbounded while remaining faithfully
+# serializable in Pier's JSON artifacts (unlike IEEE infinity, which Pydantic
+# serializes as null).  5400 seconds * 1,000,000 is over 171 years.
+UNBOUNDED_AGENT_TIMEOUT_MULTIPLIER = 1_000_000.0
+
+
+def local_reliability_policy(mode: str = "kvmem") -> dict[str, Any]:
+    policy: dict[str, Any] = {
+        "qwen_logical_context_tokens": 3_145_728,
+        "qwen_cpu_tier_gib": 110,
+        "qwen_startup_timeout_sec": QW3_STARTUP_TIMEOUT_SEC,
+        "infrastructure_timeout_multiplier": (
+            LOCAL_INFRASTRUCTURE_TIMEOUT_MULTIPLIER
+        ),
+        "max_infrastructure_attempts": MAX_INFRASTRUCTURE_ATTEMPTS,
+        "mini_swe_agent": {
+            "step_limit": 0,
+            "cost_limit": 0,
+            "wall_time_limit_seconds": 0,
+            "max_consecutive_format_errors": 10,
+            "shell_command_timeout_sec": 1800,
+            "model_request_timeout_sec": 21600,
+        },
+    }
+    if mode == "dense-compaction":
+        policy["qwen_logical_context_tokens"] = 262_144
+        policy["mini_swe_agent"]["compaction"] = {
+            "enabled": True,
+            "trigger_tokens": 220_000,
+            "summary_max_tokens": 16_384,
+            "keep_original_system_and_task": True,
+            "keep_raw_tail": False,
+        }
+    return policy
+
+
+def agent_import_path(mode: str) -> str:
+    return (
+        COMPACT_AGENT_IMPORT_PATH
+        if mode == "dense-compaction"
+        else AGENT_IMPORT_PATH
+    )
 
 
 def utc_now() -> str:
@@ -99,6 +151,7 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
         SOURCE_TASK_LIST,
         RELAY_SCRIPT,
         AGENT_ADAPTER,
+        COMPACT_AGENT_RUNTIME,
     ]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -167,8 +220,17 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
     return lock, task_spec
 
 
-def qwen_command(host: str, port: int) -> list[str]:
-    return [
+def qwen_command(
+    host: str,
+    port: int,
+    mode: str = "kvmem",
+    seed: int = 73,
+    guided_query_tokens: int = 512,
+    kvmem_budget: int = 131072,
+    kvmem_prefill_budget: int = 131072,
+    kvmem_gen_budget: int = 65536,
+) -> list[str]:
+    common = [
         str(QW3),
         "serve",
         "--model",
@@ -193,7 +255,7 @@ def qwen_command(host: str, port: int) -> list[str]:
         "--repetition-penalty",
         "1.0",
         "--seed",
-        "73",
+        str(seed),
         "--native-mtp-speculate",
         "--mtp-chain",
         "4",
@@ -201,18 +263,41 @@ def qwen_command(host: str, port: int) -> list[str]:
         host,
         "--port",
         str(port),
+    ]
+    if mode == "dense-compaction":
+        return common + [
+            "--ctx",
+            "262144",
+            "--continuous-batching",
+            "--max-active",
+            "1",
+            "--max-pending",
+            "8",
+            # One MiniSWE trajectory is executed at a time, but LiteLLM may
+            # briefly submit a retry before the prior HTTP worker has returned.
+            # The continuous scheduler already limits physical execution to
+            # max-active=1 and the paged KV pool to ctx.  Do not also charge
+            # queued requests a full-ctx logical reservation, which would turn
+            # that harmless overlap into a spurious HTTP 429.
+            "--max-total-tokens",
+            "0",
+            "--prefix-cache",
+            "--mtp-batched-draft",
+            "--mtp-paged-prefix",
+        ]
+    return common + [
         "--ctx",
-        "1048576",
+        "3145728",
         "--kvmem",
         "--kvmem-prefix-cache",
         "--kvmem-block-tokens",
         "32",
         "--kvmem-budget",
-        "131072",
+        str(kvmem_budget),
         "--kvmem-prefill-budget",
-        "131072",
+        str(kvmem_prefill_budget),
         "--kvmem-gen-budget",
-        "65536",
+        str(kvmem_gen_budget),
         "--kvmem-method",
         "retrieval",
         "--kvmem-retrieval-method",
@@ -229,7 +314,7 @@ def qwen_command(host: str, port: int) -> list[str]:
         "--kvmem-guided-thinking-tokens",
         "0",
         "--kvmem-guided-query-tokens",
-        "512",
+        str(guided_query_tokens),
         "--kvmem-middecode-trigger-tokens",
         "61440",
         "--kvmem-middecode-max-refreshes",
@@ -238,7 +323,7 @@ def qwen_command(host: str, port: int) -> list[str]:
         "--kvmem-gpu-memory-ratio",
         "1.0",
         "--kvmem-cpu-gb",
-        "40",
+        "110",
         "--kvmem-opt-stage-out",
         "on",
         "--kvmem-opt-stage-in",
@@ -260,12 +345,19 @@ def qwen_environment() -> dict[str, str]:
             "QW3_KVMEM_PREFIX_CACHE_TRACE": "1",
             "QW3_KVMEM_PERF_TRACE": "1",
             "QW3_KVMEM_TIER_TRACE": "1",
+            # Accuracy control: use the pre-optimization MTP verifier paths.
+            # Keep these explicit so a parent shell cannot silently turn an
+            # agent rollout back into the experimental implementation.
         }
     )
     return env
 
 
-def wait_for_health(process: subprocess.Popen[Any], url: str, timeout: float = 300.0) -> None:
+def wait_for_health(
+    process: subprocess.Popen[Any],
+    url: str,
+    timeout: float = QW3_STARTUP_TIMEOUT_SEC,
+) -> None:
     deadline = time.monotonic() + timeout
     last_error = "not attempted"
     # The host often exports an HTTP(S) proxy for outbound traffic.  The QW3
@@ -299,6 +391,70 @@ def stop_process(process: subprocess.Popen[Any], timeout: float = 30.0) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=10.0)
+
+
+def stop_process_group(
+    process: subprocess.Popen[Any] | None, timeout: float = 30.0
+) -> None:
+    """Stop a Pier process and every host-side child it launched.
+
+    Pier invokes ``docker compose exec`` below its own process.  Killing only
+    the runner leaves that exec process and the in-container MiniSWE agent
+    alive, so a resumed attempt can silently share the same QW3 endpoint with
+    the stale trajectory.  Every Pier child is started in a fresh session;
+    terminate that whole process group before stopping the model service.
+    """
+
+    if process is None or process.poll() is not None:
+        return
+    for sig, wait_seconds in (
+        (signal.SIGINT, timeout),
+        (signal.SIGTERM, 10.0),
+        (signal.SIGKILL, 10.0),
+    ):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=wait_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def cleanup_attempt_containers(attempt_root: Path) -> None:
+    """Remove only containers owned by trials in one interrupted attempt."""
+
+    projects = {
+        trial.name.lower()
+        for trial in attempt_root.glob("pier_jobs/*/*")
+        if trial.is_dir()
+    }
+    for project in sorted(projects):
+        listed = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                f"label=com.docker.compose.project={project}",
+            ],
+            cwd=REPO,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        container_ids = listed.stdout.split()
+        if container_ids:
+            subprocess.run(
+                ["docker", "rm", "-f", *container_ids],
+                cwd=REPO,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
 
 def start_relay(
@@ -346,9 +502,18 @@ def stop_relay(name: str) -> None:
     )
 
 
-def pier_command(task_id: str, task_dir: Path, task_artifact: Path, api_base: str) -> list[str]:
+def pier_command(
+    task_id: str,
+    task_dir: Path,
+    task_artifact: Path,
+    api_base: str,
+    *,
+    mode: str = "kvmem",
+    unbounded_agent_timeout: bool = False,
+    task_cpus: int | None = None,
+) -> list[str]:
     jobs_dir = task_artifact / "pier_jobs"
-    return [
+    command = [
         str(PIER),
         "run",
         "--jobs-dir",
@@ -361,28 +526,50 @@ def pier_command(task_id: str, task_dir: Path, task_artifact: Path, api_base: st
         "1",
         "--max-retries",
         "0",
+        "--timeout-multiplier",
+        str(LOCAL_INFRASTRUCTURE_TIMEOUT_MULTIPLIER),
         "--yes",
-        "--path",
-        str(task_dir),
-        "--agent-import-path",
-        AGENT_IMPORT_PATH,
-        "--model",
-        "openai/Qwen3.8-27B",
-        "--agent-kwarg",
-        "version=2.4.6",
-        "--agent-kwarg",
-        "model_class=litellm",
-        "--agent-kwarg",
-        "cost_limit=0",
-        "--agent-kwarg",
-        'model_kwargs={"drop_params":true,"extra_headers":{"x-qw3-harness":"mini-swe-agent"}}',
-        "--agent-env",
-        "OPENAI_API_KEY=local-qw3",
-        "--agent-env",
-        f"OPENAI_BASE_URL={api_base}",
-        "--agent-env",
-        "MSWEA_COST_TRACKING=ignore_errors",
     ]
+    if task_cpus is not None:
+        command.extend(["--override-cpus", str(task_cpus)])
+    # Keep the solver timeout independent from the local-infrastructure
+    # multiplier.  Local runs default to operationally unbounded; the explicit
+    # official mode restores the task's original 90-minute value.
+    command.extend(
+        [
+            "--agent-timeout-multiplier",
+            str(
+                UNBOUNDED_AGENT_TIMEOUT_MULTIPLIER
+                if unbounded_agent_timeout
+                else 1.0
+            ),
+        ]
+    )
+    command.extend(
+        [
+            "--path",
+            str(task_dir),
+            "--agent-import-path",
+            agent_import_path(mode),
+            "--model",
+            "openai/Qwen3.8-27B",
+            "--agent-kwarg",
+            "version=2.4.6",
+            "--agent-kwarg",
+            "model_class=litellm",
+            "--agent-kwarg",
+            "cost_limit=0",
+            "--agent-kwarg",
+            'model_kwargs={"drop_params":true,"extra_headers":{"x-qw3-harness":"mini-swe-agent"}}',
+            "--agent-env",
+            "OPENAI_API_KEY=local-qw3",
+            "--agent-env",
+            f"OPENAI_BASE_URL={api_base}",
+            "--agent-env",
+            "MSWEA_COST_TRACKING=ignore_errors",
+        ]
+    )
+    return command
 
 
 def trial_result(task_artifact: Path) -> tuple[Path, dict[str, Any]] | None:
@@ -399,6 +586,23 @@ def trial_result(task_artifact: Path) -> tuple[Path, dict[str, Any]] | None:
     if len(candidates) != 1:
         return None
     return candidates[0]
+
+
+def is_terminal_scored_outcome(result: dict[str, Any]) -> bool:
+    """Return whether an official numeric score is a terminal model outcome.
+
+    Pier verifies the workspace after an agent timeout and can therefore emit a
+    complete numeric reward together with ``AgentTimeoutError``.  That timeout
+    is a valid one-attempt model failure, not an infrastructure failure: the
+    runner must record it and continue to the next task.  Other post-agent
+    exceptions remain diagnostic stops until they are classified explicitly.
+    """
+    exception = result.get("exception_info")
+    if exception is None:
+        return True
+    if not isinstance(exception, dict):
+        return False
+    return exception.get("exception_type") in SCORED_AGENT_TERMINAL_EXCEPTIONS
 
 
 def attempt_artifact(task_artifact: Path, attempt: int) -> Path:
@@ -446,6 +650,8 @@ def retryable_pre_agent_infrastructure_failure(attempt_root: Path) -> bool:
         "Could not resolve host",
         "connection reset",
         "network error",
+        "timed out",
+        "timeout",
     )
     return any(marker.lower() in text.lower() for marker in markers)
 
@@ -459,6 +665,54 @@ def completed_summary(task_artifact: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return data if data.get("status") == "completed" and "reward" in data else None
+
+
+def recover_terminal_scored_summary(
+    task_artifact: Path, task_id: str, historical_reward: Any
+) -> dict[str, Any] | None:
+    """Promote an already verified timeout result to a resumable completion.
+
+    This is needed when resuming an older runner invocation that incorrectly
+    wrote ``infrastructure_error`` after Pier had already produced a numeric
+    verifier result for an agent timeout.
+    """
+    roots = [task_artifact]
+    retry_root = task_artifact / "infrastructure_retries"
+    if retry_root.is_dir():
+        roots.extend(sorted(retry_root.glob("attempt_*")))
+
+    for current_artifact in reversed(roots):
+        parsed = trial_result(current_artifact)
+        if parsed is None or not is_terminal_scored_outcome(parsed[1]):
+            continue
+        result_path, result = parsed
+        rewards = result["verifier_result"]["rewards"]
+        attempt_meta_path = current_artifact / "attempt.json"
+        attempt_meta = (
+            read_json(attempt_meta_path) if attempt_meta_path.is_file() else {}
+        )
+        infrastructure_attempt = int(attempt_meta.get("infrastructure_attempt", 1))
+        summary: dict[str, Any] = {
+            "status": "completed",
+            "task_id": task_id,
+            "started_at": attempt_meta.get("started_at", result.get("started_at")),
+            "finished_at": result.get("finished_at", utc_now()),
+            "pier_exit_code": 0,
+            "infrastructure_attempt": infrastructure_attempt,
+            "reward": rewards["reward"],
+            "historical_reward": historical_reward,
+            "trial_result": str(result_path),
+            "recovered_from_scored_result": True,
+        }
+        exception = result.get("exception_info")
+        if isinstance(exception, dict):
+            summary["agent_terminal_exception"] = {
+                "exception_type": exception.get("exception_type"),
+                "exception_message": exception.get("exception_message"),
+            }
+        write_json(task_artifact / "summary.json", summary)
+        return summary
+    return None
 
 
 def git_snapshot() -> dict[str, Any]:
@@ -478,15 +732,102 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--api-host", default="172.17.0.1.nip.io")
     parser.add_argument("--api-port", type=int, default=80)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=73,
+        help="QW3 sampling seed recorded for this rollout (default: 73)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("kvmem", "dense-compaction"),
+        default="kvmem",
+        help=(
+            "KVMem long-context run, or ordinary dense QW3 with automatic "
+            "MiniSWE compaction at a 256K context limit"
+        ),
+    )
+    parser.add_argument(
+        "--guided-query-tokens",
+        type=int,
+        default=512,
+        help=(
+            "maximum generated KVMem guided-retrieval query length "
+            "(default: 512; only used in kvmem mode)"
+        ),
+    )
+    parser.add_argument(
+        "--kvmem-budget",
+        type=int,
+        default=131072,
+        help="KVMem semantic-selection budget in tokens (default: 131072)",
+    )
+    parser.add_argument(
+        "--kvmem-prefill-budget",
+        type=int,
+        default=None,
+        help=(
+            "KVMem pressure-prefill budget in tokens; defaults to "
+            "--kvmem-budget"
+        ),
+    )
+    parser.add_argument(
+        "--kvmem-gen-budget",
+        type=int,
+        default=65536,
+        help="KVMem generation reserve in tokens (default: 65536)",
+    )
+    parser.add_argument(
+        "--task-cpus",
+        type=int,
+        default=None,
+        help="override Pier's task-container CPU limit",
+    )
     parser.add_argument("--only", action="append", default=[])
+    parser.add_argument(
+        "--rerun",
+        action="append",
+        default=[],
+        help="rerun a selected task even when a completed summary exists",
+    )
+    parser.set_defaults(unbounded_agent_timeout=True)
+    parser.add_argument(
+        "--unbounded-agent-timeout",
+        dest="unbounded_agent_timeout",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--official-agent-timeout",
+        dest="unbounded_agent_timeout",
+        action="store_false",
+        help="restore the locked task's official 90-minute agent deadline",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    if args.kvmem_prefill_budget is None:
+        args.kvmem_prefill_budget = args.kvmem_budget
+    if args.kvmem_budget <= 0:
+        raise RuntimeError("--kvmem-budget must be positive")
+    if args.kvmem_prefill_budget <= 0:
+        raise RuntimeError("--kvmem-prefill-budget must be positive")
+    if args.kvmem_gen_budget <= 0:
+        raise RuntimeError("--kvmem-gen-budget must be positive")
 
     lock, task_spec = validate_environment(args.tasks_file.resolve())
     selected = [item for item in task_spec["tasks"] if not args.only or item["task_id"] in args.only]
     unknown = sorted(set(args.only) - {item["task_id"] for item in task_spec["tasks"]})
     if unknown:
         raise RuntimeError(f"Unknown --only task(s): {', '.join(unknown)}")
+    unknown_reruns = sorted(
+        set(args.rerun) - {item["task_id"] for item in selected}
+    )
+    if unknown_reruns:
+        raise RuntimeError(
+            "Unknown or unselected --rerun task(s): " + ", ".join(unknown_reruns)
+        )
+    rerun_ids = set(args.rerun)
 
     run_dir = args.output_root.resolve() / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -496,21 +837,66 @@ def main() -> int:
         manifest = read_json(manifest_path)
         if manifest.get("task_ids") != [item["task_id"] for item in selected]:
             raise RuntimeError("Existing run manifest has a different task selection")
+        existing_mode = manifest.get("execution_mode", "kvmem")
+        if existing_mode != args.mode:
+            raise RuntimeError(
+                f"Existing run uses mode={existing_mode}, requested mode={args.mode}"
+            )
         manifest["agent_install_adapter"] = {
-            "import_path": AGENT_IMPORT_PATH,
+            "import_path": agent_import_path(args.mode),
             "path": str(AGENT_ADAPTER),
             "sha256": sha256(AGENT_ADAPTER),
-            "scope": "transport-only uv installer hardening",
+            "runtime_path": (
+                str(COMPACT_AGENT_RUNTIME)
+                if args.mode == "dense-compaction"
+                else None
+            ),
+            "runtime_sha256": (
+                sha256(COMPACT_AGENT_RUNTIME)
+                if args.mode == "dense-compaction"
+                else None
+            ),
+            "scope": (
+                "installer transport, slow-local-run reliability, and "
+                "automatic dense-context compaction"
+                if args.mode == "dense-compaction"
+                else "installer transport and slow-local-run reliability hardening"
+            ),
         }
         manifest["last_resumed_at"] = utc_now()
         manifest["last_resume_git"] = git_snapshot()
+        manifest["last_resume_agent_timeout_policy"] = (
+            "unbounded" if args.unbounded_agent_timeout else "task-default"
+        )
+        manifest["last_resume_rerun_tasks"] = sorted(rerun_ids)
+        manifest["last_resume_seed"] = args.seed
+        rollout_seeds = manifest.setdefault("rollout_seeds", [])
+        if args.seed not in rollout_seeds:
+            rollout_seeds.append(args.seed)
+        manifest["qwen_command"] = qwen_command(
+            args.host,
+            args.port,
+            args.mode,
+            args.seed,
+            args.guided_query_tokens,
+            args.kvmem_budget,
+            args.kvmem_prefill_budget,
+            args.kvmem_gen_budget,
+        )
+        manifest["local_reliability_policy"] = local_reliability_policy(args.mode)
         write_json(manifest_path, manifest)
     else:
         manifest = {
             "schema_version": 1,
             "created_at": utc_now(),
             "run_name": args.run_name,
-            "method": "official Pier + mini-swe-agent; one attempt and fresh QW3 per task",
+            "execution_mode": args.mode,
+            "method": (
+                "official Pier + mini-swe-agent with automatic compaction; "
+                "one attempt and fresh dense QW3 per task"
+                if args.mode == "dense-compaction"
+                else "official Pier + mini-swe-agent; one attempt and fresh QW3 per task"
+            ),
             "task_ids": [item["task_id"] for item in selected],
             "historical_score": task_spec["historical_score"],
             "locks": lock,
@@ -523,13 +909,47 @@ def main() -> int:
                 "agent_install_adapter": str(AGENT_ADAPTER),
                 "agent_install_adapter_sha256": sha256(AGENT_ADAPTER),
             },
-            "qwen_command": qwen_command(args.host, args.port),
+            "qwen_command": qwen_command(
+                args.host,
+                args.port,
+                args.mode,
+                args.seed,
+                args.guided_query_tokens,
+                args.kvmem_budget,
+                args.kvmem_prefill_budget,
+                args.kvmem_gen_budget,
+            ),
+            "rollout_seeds": [args.seed],
             "api_base": api_base,
+            "agent_timeout_policy": (
+                "unbounded" if args.unbounded_agent_timeout else "task-default"
+            ),
+            "agent_timeout_multiplier": (
+                UNBOUNDED_AGENT_TIMEOUT_MULTIPLIER
+                if args.unbounded_agent_timeout
+                else 1.0
+            ),
+            "local_reliability_policy": local_reliability_policy(args.mode),
             "agent_install_adapter": {
-                "import_path": AGENT_IMPORT_PATH,
+                "import_path": agent_import_path(args.mode),
                 "path": str(AGENT_ADAPTER),
                 "sha256": sha256(AGENT_ADAPTER),
-                "scope": "transport-only uv installer hardening",
+                "runtime_path": (
+                    str(COMPACT_AGENT_RUNTIME)
+                    if args.mode == "dense-compaction"
+                    else None
+                ),
+                "runtime_sha256": (
+                    sha256(COMPACT_AGENT_RUNTIME)
+                    if args.mode == "dense-compaction"
+                    else None
+                ),
+                "scope": (
+                    "installer transport, slow-local-run reliability, and "
+                    "automatic dense-context compaction"
+                    if args.mode == "dense-compaction"
+                    else "installer transport and slow-local-run reliability hardening"
+                ),
             },
             "pier_safe_port_relay": {
                 "image": RELAY_IMAGE,
@@ -543,24 +963,67 @@ def main() -> int:
         print(json.dumps(manifest, indent=2))
         for item in selected:
             print("TASK", item["task_id"])
-            print("PIER", json.dumps(pier_command(item["task_id"], DEEPSWE_TASKS / item["task_id"], run_dir / item["task_id"], api_base)))
+            print(
+                "PIER",
+                json.dumps(
+                    pier_command(
+                        item["task_id"],
+                        DEEPSWE_TASKS / item["task_id"],
+                        run_dir / item["task_id"],
+                        api_base,
+                        mode=args.mode,
+                        unbounded_agent_timeout=args.unbounded_agent_timeout,
+                        task_cpus=args.task_cpus,
+                    )
+                ),
+            )
         return 0
 
     for ordinal, item in enumerate(selected, start=1):
         task_id = item["task_id"]
         task_artifact = run_dir / task_id
         task_artifact.mkdir(parents=True, exist_ok=True)
+        force_rerun = task_id in rerun_ids
         existing = completed_summary(task_artifact)
-        if existing is not None:
+        if existing is None and not force_rerun:
+            existing = recover_terminal_scored_summary(
+                task_artifact, task_id, item["historical_reward"]
+            )
+        if existing is not None and not force_rerun:
             print(f"[{ordinal}/{len(selected)}] SKIP completed {task_id}: reward={existing['reward']}", flush=True)
             continue
 
+        if force_rerun and existing is not None:
+            next_attempt = attempted_count(task_artifact) + 1
+            write_json(
+                task_artifact
+                / f"summary_before_rerun_attempt_{next_attempt:02d}.json",
+                existing,
+            )
+            write_json(
+                task_artifact / "summary.json",
+                {
+                    "status": "rerunning",
+                    "task_id": task_id,
+                    "previous_reward": existing.get("reward"),
+                    "rerun_requested_at": utc_now(),
+                    "agent_timeout_policy": (
+                        "unbounded"
+                        if args.unbounded_agent_timeout
+                        else "task-default"
+                    ),
+                },
+            )
+
         first_attempt = attempted_count(task_artifact) + 1
         if first_attempt > MAX_INFRASTRUCTURE_ATTEMPTS:
-            raise RuntimeError(
-                f"{task_id}: exhausted {MAX_INFRASTRUCTURE_ATTEMPTS} infrastructure attempts; "
-                f"inspect {task_artifact}"
+            print(
+                f"[{ordinal}/{len(selected)}] SKIP failed {task_id}: exhausted "
+                f"{MAX_INFRASTRUCTURE_ATTEMPTS} infrastructure attempts; "
+                f"inspect {task_artifact}",
+                flush=True,
             )
+            continue
 
         successful: tuple[Path, dict[str, Any], str, int | None, int] | None = None
         for infrastructure_attempt in range(first_attempt, MAX_INFRASTRUCTURE_ATTEMPTS + 1):
@@ -576,8 +1039,18 @@ def main() -> int:
             qwen_log = qwen_log_path.open("ab", buffering=0)
             relay_name = f"qw3-pier-relay-{os.getpid()}"
             relay_started = False
+            pier_process: subprocess.Popen[Any] | None = None
             server = subprocess.Popen(
-                qwen_command(args.host, args.port),
+                qwen_command(
+                    args.host,
+                    args.port,
+                    args.mode,
+                    args.seed,
+                    args.guided_query_tokens,
+                    args.kvmem_budget,
+                    args.kvmem_prefill_budget,
+                    args.kvmem_gen_budget,
+                ),
                 cwd=REPO,
                 env=qwen_environment(),
                 stdout=qwen_log,
@@ -586,6 +1059,7 @@ def main() -> int:
             )
             started_at = utc_now()
             pier_exit: int | None = None
+            runner_exception: dict[str, str] | None = None
             try:
                 wait_for_health(server, f"http://{args.host}:{args.port}/health")
                 start_relay(
@@ -598,34 +1072,74 @@ def main() -> int:
                 relay_started = True
                 wait_for_health(server, f"http://{args.host}:{args.api_port}/health")
                 command = pier_command(
-                    task_id, DEEPSWE_TASKS / task_id, current_artifact, api_base
+                    task_id,
+                    DEEPSWE_TASKS / task_id,
+                    current_artifact,
+                    api_base,
+                    mode=args.mode,
+                    unbounded_agent_timeout=args.unbounded_agent_timeout,
+                    task_cpus=args.task_cpus,
                 )
                 write_json(
                     current_artifact / "attempt.json",
                     {
                         "task_id": task_id,
                         "infrastructure_attempt": infrastructure_attempt,
+                        "rollout_seed": args.seed,
                         "started_at": started_at,
                         "historical_reward": item["historical_reward"],
+                        "agent_timeout_policy": (
+                            "unbounded"
+                            if args.unbounded_agent_timeout
+                            else "task-default"
+                        ),
+                        "agent_timeout_multiplier": (
+                            UNBOUNDED_AGENT_TIMEOUT_MULTIPLIER
+                            if args.unbounded_agent_timeout
+                            else 1.0
+                        ),
                         "pier_command": command,
+                        "qwen_command": qwen_command(
+                            args.host,
+                            args.port,
+                            args.mode,
+                            args.seed,
+                            args.guided_query_tokens,
+                            args.kvmem_budget,
+                            args.kvmem_prefill_budget,
+                            args.kvmem_gen_budget,
+                        ),
+                        "qwen_binary_sha256": sha256(QW3),
                         "qwen_pid": server.pid,
                     },
                 )
                 with pier_log_path.open("ab", buffering=0) as pier_log:
-                    pier_exit = subprocess.run(
+                    pier_process = subprocess.Popen(
                         command,
                         cwd=REPO,
                         stdout=pier_log,
                         stderr=subprocess.STDOUT,
-                    ).returncode
+                        start_new_session=True,
+                    )
+                    pier_exit = pier_process.wait()
+            except Exception as exc:
+                # A QW3 startup/relay/Pier-launch failure used to escape this
+                # loop and terminate the remaining benchmark queue.  Persist it
+                # as an infrastructure attempt so a fresh service can retry.
+                runner_exception = {
+                    "exception_type": type(exc).__name__,
+                    "exception_message": str(exc),
+                }
             finally:
+                stop_process_group(pier_process)
+                cleanup_attempt_containers(current_artifact)
                 if relay_started:
                     stop_relay(relay_name)
                 stop_process(server)
                 qwen_log.close()
 
             parsed = trial_result(current_artifact)
-            if parsed is not None and parsed[1].get("exception_info") is None:
+            if parsed is not None and is_terminal_scored_outcome(parsed[1]):
                 successful = (*parsed, started_at, pier_exit, infrastructure_attempt)
                 break
 
@@ -633,10 +1147,13 @@ def main() -> int:
                 "status": "infrastructure_error",
                 "task_id": task_id,
                 "infrastructure_attempt": infrastructure_attempt,
+                "rollout_seed": args.seed,
                 "started_at": started_at,
                 "finished_at": utc_now(),
                 "pier_exit_code": pier_exit,
             }
+            if runner_exception is not None:
+                attempt_summary["runner_exception"] = runner_exception
             if parsed is None:
                 attempt_summary["reason"] = (
                     "Pier did not produce exactly one trial result with a numeric verifier reward"
@@ -644,7 +1161,14 @@ def main() -> int:
             else:
                 attempt_summary["trial_result"] = str(parsed[0])
                 attempt_summary["exception_info"] = parsed[1].get("exception_info")
-            retryable = retryable_pre_agent_infrastructure_failure(current_artifact)
+            agent_started = any(
+                current_artifact.glob(
+                    "pier_jobs/*/*/agent/mini-swe-agent.trajectory.json"
+                )
+            )
+            retryable = (
+                runner_exception is not None and not agent_started
+            ) or retryable_pre_agent_infrastructure_failure(current_artifact)
             attempt_summary["retryable_pre_agent_failure"] = retryable
             write_json(current_artifact / "infrastructure_attempt.json", attempt_summary)
 
@@ -657,12 +1181,15 @@ def main() -> int:
                 continue
 
             write_json(task_artifact / "summary.json", attempt_summary)
-            raise RuntimeError(
-                f"{task_id}: no valid official verifier result; inspect {current_artifact}"
+            print(
+                f"[{ordinal}/{len(selected)}] FAILED {task_id}: no valid official "
+                f"verifier result; continuing queue; inspect {current_artifact}",
+                flush=True,
             )
+            break
 
         if successful is None:
-            raise RuntimeError(f"{task_id}: no successful infrastructure attempt")
+            continue
 
         result_path, result, started_at, pier_exit, infrastructure_attempt = successful
 
@@ -674,10 +1201,17 @@ def main() -> int:
             "finished_at": utc_now(),
             "pier_exit_code": pier_exit,
             "infrastructure_attempt": infrastructure_attempt,
+            "rollout_seed": args.seed,
             "reward": reward,
             "historical_reward": item["historical_reward"],
             "trial_result": str(result_path),
         }
+        exception = result.get("exception_info")
+        if isinstance(exception, dict):
+            summary["agent_terminal_exception"] = {
+                "exception_type": exception.get("exception_type"),
+                "exception_message": exception.get("exception_message"),
+            }
         write_json(task_artifact / "summary.json", summary)
         print(f"[{ordinal}/{len(selected)}] DONE {task_id}: reward={reward}", flush=True)
 

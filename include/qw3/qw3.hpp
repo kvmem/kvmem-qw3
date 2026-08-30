@@ -8,12 +8,6 @@
 
 namespace qw3 {
 
-enum class BackendKind {
-    Mock,
-    LlamaCli,
-    QwenNative,
-};
-
 enum class KvMemReselectMode {
     Auto,
     Force,
@@ -135,13 +129,7 @@ enum class KvMemInlineRefreshMode {
 
 struct EngineOptions {
     std::string model_path;
-    BackendKind backend = BackendKind::QwenNative;
-    std::string llama_cli_path = "llama-completion";
     int ctx_size = 262144;
-    int threads = 0;
-    int gpu_layers = -1;
-    int batch_size = 2048;
-    bool verbose = false;
     bool native_heavy = true;
     std::string native_kernels = "cuda";
     std::string native_linear_backend = "auto";
@@ -257,7 +245,7 @@ struct EngineOptions {
     // positive value enables an additional private reasoning phase, which is
     // useful for ablations but adds decode latency before every refresh.
     int kvmem_guided_thinking_tokens = 0;
-    int kvmem_guided_query_tokens = 256; // hard-capped to 512 by CLI/server
+    int kvmem_guided_query_tokens = 256; // hard-capped to 4096 by CLI/server
     int kvmem_middecode_trigger_tokens = 28672;
     int kvmem_middecode_max_refreshes = 2;
     // Re-prefill the query suffix against the just-selected semantic window.
@@ -575,8 +563,6 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-std::string backend_kind_name(BackendKind kind);
-BackendKind parse_backend_kind(const std::string &name);
 std::string render_qwen3_chat_prompt(const std::string &system,
                                      const std::string &user,
                                      bool enable_thinking);

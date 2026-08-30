@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "description": "Ten-task KVMem RequestPlan validation batch; Happy DOM is excluded because its completed reward=1 run is retained instead of being repeated",
+  "tasks": [
+    {
+      "task_id": "expr-try-catch-errors",
+      "verifier_image": "qw3-deepswe-expr-try-catch-errors-verifier:v1.1"
+    },
+    {
+      "task_id": "termenv-preserve-ansi-resets",
+      "verifier_image": "qw3-deepswe-termenv-preserve-ansi-resets-verifier:v1.1"
+    },
+    {
+      "task_id": "psd-tools-blend-range-api",
+      "verifier_image": "qw3-deepswe-psd-tools-blend-range-api-verifier:v1.1"
+    },
+    {
+      "task_id": "scriggo-method-declarations",
+      "verifier_image": "qw3-deepswe-scriggo-method-declarations-verifier:v1.1"
+    },
+    {
+      "task_id": "wasmi-trap-coredumps",
+      "verifier_image": "qw3-deepswe-wasmi-trap-coredumps-verifier:v1.1"
+    },
+    {
+      "task_id": "opa-template-string-reconstruction",
+      "verifier_image": "qw3-deepswe-opa-template-string-reconstruction-verifier:v1.1"
+    },
+    {
+      "task_id": "tomlkit-toml-table-converters",
+      "verifier_image": "qw3-deepswe-tomlkit-toml-table-converters-verifier:v1.1"
+    },
+    {
+      "task_id": "true-myth-iterable-collection-combinators",
+      "verifier_image": "qw3-deepswe-true-myth-iterable-collection-combinators-verifier:v1.1"
+    },
+    {
+      "task_id": "valibot-recursive-schema-composition",
+      "verifier_image": "qw3-deepswe-valibot-recursive-schema-composition-verifier:v1.1"
+    },
+    {
+      "task_id": "boa-hierarchical-evaluation-cancellation",
+      "verifier_image": "qw3-deepswe-boa-hierarchical-evaluation-cancellation-verifier:v1.1"
+    }
+  ]
+}

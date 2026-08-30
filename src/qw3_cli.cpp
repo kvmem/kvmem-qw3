@@ -95,15 +95,8 @@ void usage(std::ostream &os) {
         "                        Default: use remaining context per request.\n"
         "\n"
         "Runtime:\n"
-        "  --backend NAME        qwen-native, mock, or llama-cli. Default: qwen-native\n"
-        "  --llama-cli PATH      llama.cpp llama-completion binary. Default: llama-completion\n"
-        "  --llama-completion PATH\n"
-        "                        Alias for --llama-cli\n"
         "  -m, --model PATH      GGUF file or HF safetensors model directory\n"
         "  -c, --ctx N           Context size. Default: 262144\n"
-        "  -t, --threads N       llama.cpp CPU helper threads\n"
-        "  -ngl N                GPU layers passed to llama.cpp. Default: -1\n"
-        "  -b, --batch N         Batch size passed to llama.cpp. Default: 2048\n"
         "  --native-kernels NAME cuda. Default: cuda\n"
         "  --native-linear-backend NAME auto, cublas, or custom. Default: auto\n"
         "  --cpu-embedding       Keep a BF16 input embedding table on CPU and\n"
@@ -221,11 +214,10 @@ void usage(std::ostream &os) {
         "                        middecode|both. Default: off.\n"
         "  --kvmem-guided-thinking-tokens N  Private planning cap. Default: 0\n"
         "                        (generate the contextual retrieval query directly).\n"
-        "  --kvmem-guided-query-tokens N  Retrieval query cap, 1..512. Default: 256.\n"
+        "  --kvmem-guided-query-tokens N  Retrieval query cap, 1..4096. Default: 256.\n"
         "  --kvmem-middecode-trigger-tokens N  Refresh threshold within each\n"
         "                        generation epoch. Default: 28672.\n"
         "  --kvmem-middecode-max-refreshes N  Per-request cap, 0..8. Default: 2.\n"
-        "  --verbose             Keep llama.cpp stderr\n"
         "\n"
         "Prompt:\n"
         "  -p, --prompt TEXT     User prompt\n"
@@ -242,7 +234,7 @@ void usage(std::ostream &os) {
         "  --min-p F             Min-p. Default: 0.0\n"
         "  --presence-penalty F  Presence penalty. Default: 0.0\n"
         "  --repetition-penalty F Repetition penalty. Default: 1.0\n"
-        "  --seed N              Seed passed to llama.cpp\n"
+        "  --seed N              Random-number-generator seed\n"
         "\n"
         "kvmem-session (growth-profiling harness; one persistent process that\n"
         "  prefills a long context then keeps growing it across turns, measuring\n"
@@ -452,22 +444,10 @@ int main(int argc, char **argv) {
             if (arg == "-h" || arg == "--help") {
                 usage(std::cout);
                 return 0;
-            } else if (arg == "--backend") {
-                engine.backend = qw3::parse_backend_kind(need(arg));
-            } else if (arg == "--llama-cli") {
-                engine.llama_cli_path = need(arg);
-            } else if (arg == "--llama-completion") {
-                engine.llama_cli_path = need(arg);
             } else if (arg == "-m" || arg == "--model") {
                 engine.model_path = need(arg);
             } else if (arg == "-c" || arg == "--ctx") {
                 engine.ctx_size = parse_int(need(arg), arg);
-            } else if (arg == "-t" || arg == "--threads") {
-                engine.threads = parse_int(need(arg), arg);
-            } else if (arg == "-ngl") {
-                engine.gpu_layers = parse_int(need(arg), arg);
-            } else if (arg == "-b" || arg == "--batch") {
-                engine.batch_size = parse_int(need(arg), arg);
             } else if (arg == "--native-kernels") {
                 engine.native_kernels = need(arg);
             } else if (arg == "--native-linear-backend") {
@@ -737,9 +717,9 @@ int main(int argc, char **argv) {
             } else if (arg == "--kvmem-guided-query-tokens") {
                 engine.kvmem_guided_query_tokens = parse_int(need(arg), arg);
                 if (engine.kvmem_guided_query_tokens < 1 ||
-                    engine.kvmem_guided_query_tokens > 512) {
+                    engine.kvmem_guided_query_tokens > 4096) {
                     throw std::runtime_error(
-                        "--kvmem-guided-query-tokens must be in [1,512]");
+                        "--kvmem-guided-query-tokens must be in [1,4096]");
                 }
             } else if (arg == "--kvmem-middecode-trigger-tokens") {
                 engine.kvmem_middecode_trigger_tokens =
@@ -784,8 +764,6 @@ int main(int argc, char **argv) {
                 engine.kvmem_raw_k_nvme = true;
             } else if (arg == "--no-kvmem-raw-k-nvme") {
                 engine.kvmem_raw_k_nvme = false;
-            } else if (arg == "--verbose") {
-                engine.verbose = true;
             } else if (arg == "-p" || arg == "--prompt") {
                 prompt = need(arg);
             } else if (arg == "--prompt-file") {
@@ -1165,7 +1143,6 @@ int main(int argc, char **argv) {
         }
 
         if (serve) {
-            engine.backend = qw3::BackendKind::QwenNative;
             engine.native_heavy = true;
             if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
             if (!engine.kvmem_archive_dir.empty()) {
@@ -1322,7 +1299,6 @@ int main(int argc, char **argv) {
         }
 
         if (kvmem_session) {
-            engine.backend = qw3::BackendKind::QwenNative;
             engine.native_heavy = true;
             if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
             if (kv_dtype_cli_set) {

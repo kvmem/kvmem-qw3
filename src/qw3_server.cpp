@@ -821,6 +821,75 @@ void add_tool_argument(json &args, const json *props,
     }
 }
 
+// Parse the canonical Qwen XML form with the same state machine used for
+// irreversible streaming deltas.  The permissive recovery parser below is
+// intentionally not involved: source text inside a Write/Edit argument may
+// legitimately contain tags whose names collide with schema properties (for
+// example SCXML's <content>0</content> inside Write.content).
+bool parse_canonical_tool_call_block(const std::string &block,
+                                     const json *tools,
+                                     std::string &name,
+                                     json &args) {
+    detail::CanonicalToolCallStreamParser parser;
+    std::vector<detail::ToolCallStreamEvent> events;
+    const std::string framed = "<tool_call>" + block + "</tool_call>";
+    if (!parser.feed(framed, events) || !parser.finish(events) ||
+        !parser.complete()) {
+        return false;
+    }
+
+    std::string parameter_name;
+    std::string parameter_value;
+    std::unordered_set<std::string> seen;
+    bool parameter_open = false;
+    bool tool_complete = false;
+    args = json::object();
+    for (const detail::ToolCallStreamEvent &event : events) {
+        switch (event.kind) {
+            case detail::ToolCallStreamEventKind::ToolStart:
+                if (!name.empty()) return false;
+                name = event.value;
+                break;
+            case detail::ToolCallStreamEventKind::ParameterStart: {
+                if (parameter_open || name.empty()) return false;
+                const json *props = find_tool_properties(tools, name);
+                parameter_name = schema_property_name(props, event.value);
+                if (parameter_name.empty() ||
+                    !seen.insert(parameter_name).second) {
+                    return false;
+                }
+                parameter_value.clear();
+                parameter_open = true;
+                break;
+            }
+            case detail::ToolCallStreamEventKind::ParameterData:
+                if (!parameter_open) return false;
+                parameter_value += event.value;
+                break;
+            case detail::ToolCallStreamEventKind::ParameterEnd: {
+                if (!parameter_open) return false;
+                const json *props = find_tool_properties(tools, name);
+                if (props && props->contains(parameter_name) &&
+                    (*props)[parameter_name].is_object()) {
+                    args[parameter_name] = coerce_value_by_schema(
+                        parameter_value, (*props)[parameter_name]);
+                } else {
+                    args[parameter_name] = parameter_value;
+                }
+                parameter_name.clear();
+                parameter_value.clear();
+                parameter_open = false;
+                break;
+            }
+            case detail::ToolCallStreamEventKind::ToolEnd:
+                if (parameter_open) return false;
+                tool_complete = true;
+                break;
+        }
+    }
+    return tool_complete && !name.empty() && tool_name_allowed(tools, name);
+}
+
 void parse_parameter_tags(const std::string &block, const json *props, json &args) {
     size_t pos = 0;
     while ((pos = block.find("<parameter=", pos)) != std::string::npos) {
@@ -1007,13 +1076,24 @@ bool parse_tool_call_block(const std::string &inner, const json *tools,
     if (parse_json_tool_call_text(inner, calls)) return true;
 
     const std::string normalized = strip_tool_control_tokens(inner);
+    std::string canonical_name;
+    json canonical_args = json::object();
+    if (parse_canonical_tool_call_block(
+            normalized, tools, canonical_name, canonical_args)) {
+        calls.push_back(make_tool_call_json(canonical_name, canonical_args));
+        return true;
+    }
+
     std::string name = tool_name_from_marker(normalized, tools);
     const json *props = find_tool_properties(tools, name);
     json args = json::object();
     parse_parameter_tags(normalized, props, args);
-    parse_arg_key_value_tags(normalized, props, args);
-    parse_loose_parameter_tags(normalized, props, args);
-    parse_schema_named_tags(normalized, props, args);
+    // Recovery grammars are mutually exclusive fallbacks.  Never merge them
+    // into a successfully parsed parameter-tag call: doing so lets source text
+    // such as <content>...</content> overwrite the enclosing Write.content.
+    if (args.empty()) parse_arg_key_value_tags(normalized, props, args);
+    if (args.empty()) parse_loose_parameter_tags(normalized, props, args);
+    if (args.empty()) parse_schema_named_tags(normalized, props, args);
 
     // A few generations place a JSON object directly after function_edit>.
     // Parse it only when it starts at an object boundary; arbitrary code text
@@ -1179,6 +1259,45 @@ public:
                 json::parse(fn.value("arguments", std::string("{}")));
             if (streamed != parsed) {
                 reason = "streamed and fully parsed arguments differ";
+                if (streamed.is_object() && parsed.is_object()) {
+                    std::unordered_set<std::string> keys;
+                    for (auto it = streamed.begin(); it != streamed.end(); ++it) {
+                        keys.insert(it.key());
+                    }
+                    for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+                        keys.insert(it.key());
+                    }
+                    for (const std::string &key : keys) {
+                        const bool has_streamed = streamed.contains(key);
+                        const bool has_parsed = parsed.contains(key);
+                        if (has_streamed && has_parsed &&
+                            streamed[key] == parsed[key]) {
+                            continue;
+                        }
+                        reason += " key=" + dump_json(json(key));
+                        reason += " streamed=";
+                        if (!has_streamed) {
+                            reason += "missing";
+                        } else if (streamed[key].is_string()) {
+                            reason += "string(chars=" + std::to_string(
+                                streamed[key].get_ref<const std::string &>().size()) +
+                                ")";
+                        } else {
+                            reason += streamed[key].type_name();
+                        }
+                        reason += " parsed=";
+                        if (!has_parsed) {
+                            reason += "missing";
+                        } else if (parsed[key].is_string()) {
+                            reason += "string(chars=" + std::to_string(
+                                parsed[key].get_ref<const std::string &>().size()) +
+                                ")";
+                        } else {
+                            reason += parsed[key].type_name();
+                        }
+                        break;
+                    }
+                }
                 return false;
             }
         } catch (const std::exception &e) {
@@ -1590,8 +1709,6 @@ std::vector<std::string> parse_stops(const json &req) {
 } // namespace
 
 int run_server(EngineOptions engine, ServerConfig cfg) {
-    // Force the working native path for serving regardless of caller defaults.
-    engine.backend = BackendKind::QwenNative;
     engine.native_heavy = true;
     if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
     if (cfg.max_active <= 0) throw std::runtime_error("--max-active must be > 0");
@@ -1815,11 +1932,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
               << "  host=" << cfg.host << "\n"
               << "  port=" << cfg.port << "\n"
               << "  model=" << engine.model_path << "\n"
-              << "  backend=" << backend_kind_name(engine.backend) << "\n"
               << "  native_kernels=" << engine.native_kernels << "\n"
               << "  cpu_embedding=" << yesno(engine.cpu_embedding) << "\n"
               << "  ctx=" << engine.ctx_size << "\n"
-              << "  batch=" << engine.batch_size << "\n"
               << "  prefill_chunk=" << engine.prefill_chunk << "\n"
               << "  kv_dtype=" << cfg.kv_dtype << "\n"
               << "  paged_kv=" << yesno(cfg.paged_kv) << "\n"
@@ -2227,10 +2342,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     guided_direct ? 0 : 1, 4096, thinking_max) ||
                 !parse_bounded_json_u64(
                     req["kvmem_query_guided_query_max_tokens"], 1,
-                    512, query_max)) {
+                    4096, query_max)) {
                 throw std::invalid_argument(
                     "guided-query thinking/query limits must be integers in "
-                    "[1,4096] (or 0 for direct mode) and [1,512] "
+                    "[1,4096] (or 0 for direct mode) and [1,4096] "
                     "respectively");
             }
             g.kvmem_query_guided_thinking_max_tokens =

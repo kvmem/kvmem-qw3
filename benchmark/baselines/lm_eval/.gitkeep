@@ -1,0 +1,2 @@
+# Optional frozen lm_eval baselines for accuracy diffing.
+# Copy a prior results_*.json tree here after a validated run.

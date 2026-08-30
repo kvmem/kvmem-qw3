@@ -45,6 +45,23 @@
 #include <vector>
 
 namespace qw3 {
+
+LinearBackend parse_linear_backend(const std::string &name) {
+    if (name == "auto") return LinearBackend::Auto;
+    if (name == "custom") return LinearBackend::Custom;
+    if (name == "cublas") return LinearBackend::Cublas;
+    throw std::invalid_argument("unknown linear backend: " + name);
+}
+
+const char *linear_backend_name(LinearBackend backend) {
+    switch (backend) {
+    case LinearBackend::Auto: return "auto";
+    case LinearBackend::Custom: return "custom";
+    case LinearBackend::Cublas: return "cublas";
+    }
+    return "unknown";
+}
+
 namespace {
 
 double wall_seconds() {
@@ -1911,10 +1928,6 @@ public:
         stop_continuous_batch_worker();
     }
 
-    std::string name() const override {
-        return "qwen-native";
-    }
-
     // ---- Context archive (docs/kvmem_context_archive_design.md) ----
 
     // Fields that fix the archive's byte layout or its numerics. Deliberately
@@ -2115,7 +2128,7 @@ public:
         // generate(). Subsequent generate() calls reuse the same DeviceBackend
         // and the same on-GPU weight buffers.
         if (options_.native_kernels != "cuda") {
-            // mock/cpu kernels are no longer wired here; we still let load()
+            // CPU kernels are no longer wired here; we still let load()
             // complete so callers that just want to inspect the plan can do so.
             log("native load: model=" + fmt_seconds(t_gguf - t0) +
                 " (skipped device init: native-kernels=" + options_.native_kernels + ")");
@@ -15004,11 +15017,6 @@ private:
                                         [](unsigned char ch) {
                                             return std::isspace(ch) != 0;
                                         });
-                                if (query_started && whitespace_only &&
-                                    piece.find('\n') != std::string::npos) {
-                                    query_terminated = true;
-                                    break;
-                                }
                                 std::string trimmed_piece = piece;
                                 while (!trimmed_piece.empty() && std::isspace(
                                            static_cast<unsigned char>(
@@ -15053,20 +15061,7 @@ private:
                                     ++query_guided_query_tokens;
                                     query_guided_query_text += piece;
                                 }
-                                const bool line_complete =
-                                    query_started &&
-                                    piece.find('\n') != std::string::npos;
-                                // A direct rewrite is contractually one question.
-                                // Stop as soon as that question ends, before the
-                                // model can emit a closing quote or explanation.
-                                const bool sentence_complete = capture &&
-                                    detail::kvmem_guided_query_piece_terminates(
-                                        piece);
                                 proposed = guided_step.argmax_token;
-                                if (line_complete || sentence_complete) {
-                                    query_terminated = true;
-                                    break;
-                                }
                             }
                             post_query_guided_decode_s +=
                                 wall_seconds() - query_decode_start;
@@ -15091,25 +15086,8 @@ private:
                                     [](unsigned char ch) {
                                         return static_cast<char>(std::tolower(ch));
                                     });
-                                const bool question =
-                                    normalized.find('?') != std::string::npos ||
-                                    normalized.find("？") != std::string::npos;
-                                const bool terminal_ascii =
-                                    !normalized.empty() &&
-                                    (normalized.back() == '.' ||
-                                     normalized.back() == '!');
-                                const bool terminal_cjk =
-                                    normalized.size() >= 3 &&
-                                    (normalized.compare(
-                                         normalized.size() - 3, 3, "。") == 0 ||
-                                     normalized.compare(
-                                         normalized.size() - 3, 3, "！") == 0);
-                                const bool single_line_request =
-                                    !normalized.empty() &&
-                                    normalized.find('\n') == std::string::npos &&
-                                    normalized.find('\r') == std::string::npos &&
-                                    (!query_guided_direct || question ||
-                                     terminal_ascii || terminal_cjk);
+                                const bool valid_request_text =
+                                    !normalized.empty();
                                 const bool structured_answer =
                                     lower.find("<answer") != std::string::npos ||
                                     lower.find("tool_call") != std::string::npos ||
@@ -15124,7 +15102,7 @@ private:
                                         options
                                             .kvmem_query_guided_query_max_tokens,
                                         query_terminated);
-                                if (!complete || !single_line_request ||
+                                if (!complete || !valid_request_text ||
                                     structured_answer) {
                                     // The original query Q was already captured
                                     // before this reversible probe. Cancelling here
@@ -15137,7 +15115,7 @@ private:
                                             ? "empty-output"
                                             : !complete
                                                 ? "unterminated-output"
-                                            : "incomplete-or-multiline-output";
+                                            : "invalid-request-text";
                                     executor_->kvmem_cancel_guided_query_probe();
                                     {
                                         const double state_start = wall_seconds();
@@ -16322,11 +16300,6 @@ private:
                             [](unsigned char ch) {
                                 return std::isspace(ch) != 0;
                             });
-                    if (started && whitespace_only &&
-                        piece.find('\n') != std::string::npos) {
-                        query_terminated = true;
-                        break;
-                    }
                     const bool capture = started ||
                         (!piece.empty() && !whitespace_only);
                     executor_->kvmem_set_guided_query_capture(capture);
@@ -16339,12 +16312,6 @@ private:
                         query_text += piece;
                     }
                     proposed = private_step.argmax_token;
-                    if (started &&
-                        (piece.find('\n') != std::string::npos ||
-                         detail::kvmem_guided_query_piece_terminates(piece))) {
-                        query_terminated = true;
-                        break;
-                    }
                 }
                 kvmem_middecode_generated_query_s +=
                     wall_seconds() - generated_query_start;
@@ -16366,8 +16333,6 @@ private:
                         options.kvmem_middecode_query_max_tokens,
                         query_terminated) ||
                     query_text.empty() ||
-                    query_text.find('\n') != std::string::npos ||
-                    query_text.find('\r') != std::string::npos ||
                     query_text.find("<tool") != std::string::npos ||
                     query_text.find("```" ) != std::string::npos ||
                     query_text.front() == '{' || query_text.front() == '[';
@@ -17757,7 +17722,6 @@ std::unique_ptr<Backend> make_qwen_native_backend() {
 
 int run_kvmem_session(EngineOptions engine, const KvMemSessionConfig &cfg) {
     // Force the single-request native MTP + kvmem path this harness profiles.
-    engine.backend = BackendKind::QwenNative;
     engine.native_heavy = true;
     if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
     if (engine.prefill_chunk < 0) engine.prefill_chunk = 2048;
@@ -17795,7 +17759,6 @@ namespace {
 // Both archive commands need the same immutable-K + fp8 + SSD-authority shape;
 // they differ only in whether the arenas are writable.
 void apply_archive_engine_defaults(EngineOptions &engine, const char *mode) {
-    engine.backend = BackendKind::QwenNative;
     engine.native_heavy = true;
     if (engine.native_kernels.empty()) engine.native_kernels = "cuda";
     if (engine.prefill_chunk < 0) engine.prefill_chunk = 2048;

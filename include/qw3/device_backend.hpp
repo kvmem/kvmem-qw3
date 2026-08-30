@@ -77,7 +77,7 @@ struct HostBuffer {
 };
 
 // Opaque completion marker for the dedicated KV transfer stream. CUDA records
-// a cudaEvent behind all copies queued so far; synchronous/mock backends use
+// a cudaEvent behind all copies queued so far; synchronous implementations use
 // the default implementation below, which drains the transfer immediately and
 // returns a null marker. Keeping the marker backend-owned lets the executor
 // pipeline two pinned slabs without leaking CUDA types into the public header.
@@ -94,14 +94,15 @@ public:
     virtual DeviceStatus end() = 0;
     virtual DeviceStatus synchronize() = 0;
 
-    // Free / total bytes of device memory. Return 0 when the backend cannot
-    // report this (CPU / mock). Free bytes are used to size prefill chunks;
+    // Free / total bytes of device memory. Return 0 when an implementation
+    // cannot report this. Free bytes are used to size prefill chunks;
     // total bytes are used for KVMem ratio-based KV residency budgeting.
     virtual uint64_t free_device_bytes() const { return 0; }
     virtual uint64_t total_device_bytes() const { return 0; }
     // PCI bus/device/function for topology-aware host-side I/O placement.
-    // CUDA returns the canonical domain:bus:device.function string; CPU/mock
-    // backends leave it empty so callers can fall back without special cases.
+    // CUDA returns the canonical domain:bus:device.function string; non-CUDA
+    // implementations leave it empty so callers can fall back without special
+    // cases.
     virtual std::string pci_bus_id() const { return {}; }
 
     // CUDA-graph capture hooks. Default impls are no-ops so non-CUDA backends
@@ -2510,7 +2511,8 @@ public:
 
     // Copy `count` floats from the device tensor starting at offset to host
     // memory. Used by --dump-logits and other diagnostics. Default no-op
-    // implementation keeps the mock backend simple; CUDA overrides it.
+    // implementation keeps synchronous implementations simple; CUDA overrides
+    // it.
     virtual DeviceStatus copy_to_host(const DeviceTensor &x, float *host, uint64_t offset, uint64_t count) {
         (void)x; (void)host; (void)offset; (void)count;
         return {false, "copy_to_host not implemented for this backend"};
@@ -2528,8 +2530,8 @@ public:
     }
 
     // Async raw byte copies for tiered KV storage. The default implementation
-    // preserves synchronous semantics so non-CUDA/mock backends do not need to
-    // understand streams. CUDA overrides these with a dedicated copy stream;
+    // preserves synchronous semantics so non-CUDA implementations do not need
+    // to understand streams. CUDA overrides these with a dedicated copy stream;
     // callers must keep host buffers alive until wait_kv_transfer() returns.
     virtual DeviceStatus begin_kv_transfer_from_device() { return {}; }
     virtual DeviceStatus begin_kv_transfer_to_device() { return {}; }

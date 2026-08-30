@@ -1,0 +1,310 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560"
+     viewBox="0 0 1200 560" role="img"
+     aria-labelledby="kvmem-flow-title kvmem-flow-desc">
+  <title id="kvmem-flow-title">Animated KVMem memory flow</title>
+  <desc id="kvmem-flow-desc">
+    A four-step animation that plays once. Long agent history is prefetched, cold KV
+    blocks move from the bounded GPU working set to host RAM and NVMe, a new
+    query scores a compact Mean-K index, and selected blocks return to the GPU
+    working set before answer generation.
+  </desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#06111e"/>
+      <stop offset="1" stop-color="#0b1c2e"/>
+    </linearGradient>
+    <linearGradient id="gpu" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#103b42"/>
+      <stop offset="1" stop-color="#123147"/>
+    </linearGradient>
+    <linearGradient id="answer" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#39d0ba" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#66a3ff" stop-opacity="0.20"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="soft" x="-20%" y="-30%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#000814"
+                    flood-opacity="0.42"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4f718c"/>
+    </marker>
+  </defs>
+
+  <style>
+    text { font-family: Inter, ui-sans-serif, system-ui, -apple-system,
+           BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .title { fill: #f4f9fc; font-size: 25px; font-weight: 700; }
+    .subtitle { fill: #9fb6c7; font-size: 13px; }
+    .label { fill: #e8f2f8; font-size: 14px; font-weight: 650; }
+    .small { fill: #9fb6c7; font-size: 11px; }
+    .tiny { fill: #8099aa; font-size: 10px; }
+    .panel { fill: #0c1d2d; stroke: #29465d; stroke-width: 1.2; }
+    .block { fill: #17334a; stroke: #3d617b; stroke-width: 1; }
+    .block-hot { fill: #15504e; stroke: #39d0ba; stroke-width: 1.3; }
+    .block-selected { fill: #4a3d68; stroke: #a797ff; stroke-width: 1.3; }
+    .wire { fill: none; stroke: #4f718c; stroke-width: 2;
+            marker-end: url(#arrow); }
+    .wire-dash { fill: none; stroke: #36566d; stroke-width: 1.5;
+                 stroke-dasharray: 5 7; }
+    .phase { opacity: 0.65; }
+    .p1 { animation: phase1 4.6s ease-in-out 1 both; }
+    .p2 { animation: phase2 4.6s ease-in-out 1 both; }
+    .p3 { animation: phase3 4.6s ease-in-out 1 both; }
+    .p4 { animation: phase4 4.6s ease-in-out 1 both; }
+    .scan { transform-origin: center; animation: scan 4.6s ease-in-out 1 both; }
+    .query { animation: query 4.6s ease-in-out 1 both; }
+    .response { animation: response 4.6s ease-in-out 1 both; }
+    .selected-pulse { animation: selected 4.6s ease-in-out 1 both; }
+    .answer-token { opacity: 1; animation: token 4.6s ease-out 1 both; }
+    .t2 { animation-delay: 0.08s; }
+    .t3 { animation-delay: 0.16s; }
+    .t4 { animation-delay: 0.24s; }
+    .t5 { animation-delay: 0.32s; }
+    @keyframes phase1 {
+      0%, 3%, 19% { opacity: 1; } 26%, 92% { opacity: 0.25; } 100% { opacity: 0.65; }
+    }
+    @keyframes phase2 {
+      0%, 20% { opacity: 0.25; } 27%, 42% { opacity: 1; } 49%, 92% { opacity: 0.25; } 100% { opacity: 0.65; }
+    }
+    @keyframes phase3 {
+      0%, 43% { opacity: 0.25; } 50%, 65% { opacity: 1; } 72%, 92% { opacity: 0.25; } 100% { opacity: 0.65; }
+    }
+    @keyframes phase4 {
+      0%, 66% { opacity: 0.25; } 74%, 100% { opacity: 1; }
+    }
+    @keyframes scan {
+      0%, 45% { opacity: 0.35; transform: scaleY(0.62); }
+      53%, 65% { opacity: 1; transform: scaleY(1); filter: url(#glow); }
+      73%, 100% { opacity: 0.65; transform: scaleY(0.8); }
+    }
+    @keyframes query {
+      0%, 46% { opacity: 0.45; }
+      53%, 68% { opacity: 1; filter: url(#glow); }
+      76%, 100% { opacity: 1; }
+    }
+    @keyframes response {
+      0%, 70% { opacity: 0.25; }
+      78%, 100% { opacity: 1; }
+    }
+    @keyframes selected {
+      0%, 66% { filter: none; }
+      74%, 92% { filter: url(#glow); }
+      100% { filter: none; }
+    }
+    @keyframes token {
+      0%, 74% { opacity: 0; transform: translateY(5px); }
+      83%, 100% { opacity: 1; transform: translateY(0); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .p1, .p2, .p3, .p4, .scan, .query, .response,
+      .selected-pulse, .answer-token { animation: none !important; opacity: 1; }
+      .motion-dot { display: none; }
+    }
+  </style>
+
+  <rect x="1" y="1" width="1198" height="558" rx="24" fill="url(#bg)"
+        stroke="#203c53" stroke-width="2"/>
+
+  <text x="42" y="46" class="title">KVMem keeps a large history behind a bounded GPU window</text>
+  <text x="42" y="70" class="subtitle">Prefill history · tier cold KV blocks · score a compact index · recall only what the query needs</text>
+
+  <g transform="translate(42 91)">
+    <g class="phase p1">
+      <circle cx="8" cy="8" r="8" fill="#39d0ba"/>
+      <text x="8" y="12" text-anchor="middle" fill="#061b1b" font-size="10" font-weight="800">1</text>
+      <text x="23" y="12" class="small">Ingest history</text>
+    </g>
+    <g transform="translate(153 0)" class="phase p2">
+      <circle cx="8" cy="8" r="8" fill="#66a3ff"/>
+      <text x="8" y="12" text-anchor="middle" fill="#071528" font-size="10" font-weight="800">2</text>
+      <text x="23" y="12" class="small">Tier cold blocks</text>
+    </g>
+    <g transform="translate(332 0)" class="phase p3">
+      <circle cx="8" cy="8" r="8" fill="#ffcc66"/>
+      <text x="8" y="12" text-anchor="middle" fill="#281d04" font-size="10" font-weight="800">3</text>
+      <text x="23" y="12" class="small">Query &amp; score</text>
+    </g>
+    <g transform="translate(493 0)" class="phase p4">
+      <circle cx="8" cy="8" r="8" fill="#a797ff"/>
+      <text x="8" y="12" text-anchor="middle" fill="#180d2c" font-size="10" font-weight="800">4</text>
+      <text x="23" y="12" class="small">Recall a bounded window</text>
+    </g>
+  </g>
+
+  <!-- Accumulated history -->
+  <g filter="url(#soft)">
+    <rect x="42" y="132" width="245" height="352" rx="17" class="panel"/>
+    <text x="64" y="161" class="label">Accumulated agent history</text>
+    <text x="64" y="180" class="small">Conversation + tool state + files</text>
+
+    <g transform="translate(64 205)">
+      <rect width="200" height="48" rx="10" fill="#102a3e" stroke="#31546d"/>
+      <circle cx="20" cy="24" r="9" fill="#39d0ba" fill-opacity="0.8"/>
+      <text x="39" y="21" class="small">Earlier turns</text>
+      <text x="39" y="36" class="tiny">messages and decisions</text>
+    </g>
+    <g transform="translate(64 263)">
+      <rect width="200" height="48" rx="10" fill="#102a3e" stroke="#31546d"/>
+      <circle cx="20" cy="24" r="9" fill="#66a3ff" fill-opacity="0.82"/>
+      <text x="39" y="21" class="small">Tool output</text>
+      <text x="39" y="36" class="tiny">logs, search, shell results</text>
+    </g>
+    <g transform="translate(64 321)">
+      <rect width="200" height="48" rx="10" fill="#102a3e" stroke="#31546d"/>
+      <circle cx="20" cy="24" r="9" fill="#ffcc66" fill-opacity="0.85"/>
+      <text x="39" y="21" class="small">Workspace context</text>
+      <text x="39" y="36" class="tiny">documents and code</text>
+    </g>
+    <g transform="translate(64 379)">
+      <rect width="200" height="48" rx="10" fill="#102a3e" stroke="#31546d"/>
+      <circle cx="20" cy="24" r="9" fill="#a797ff" fill-opacity="0.85"/>
+      <text x="39" y="21" class="small">Long-term memory</text>
+      <text x="39" y="36" class="tiny">contextualized KV blocks</text>
+    </g>
+    <text x="64" y="458" class="small">History grows; GPU window stays bounded.</text>
+  </g>
+
+  <!-- Storage tiers -->
+  <g filter="url(#soft)">
+    <rect x="340" y="132" width="505" height="116" rx="17" fill="url(#gpu)"
+          stroke="#2e817c" stroke-width="1.4"/>
+    <text x="363" y="159" class="label">GPU working set</text>
+    <text x="700" y="159" class="small">bounded active KV window</text>
+    <g transform="translate(363 181)">
+      <rect width="48" height="42" rx="7" class="block-hot"/>
+      <rect x="56" width="48" height="42" rx="7" class="block"/>
+      <rect x="112" width="48" height="42" rx="7" class="block-selected selected-pulse"/>
+      <rect x="168" width="48" height="42" rx="7" class="block"/>
+      <rect x="224" width="48" height="42" rx="7" class="block-hot"/>
+      <rect x="280" width="48" height="42" rx="7" class="block"/>
+      <rect x="336" width="48" height="42" rx="7" class="block-selected selected-pulse"/>
+      <rect x="392" width="48" height="42" rx="7" class="block-hot"/>
+    </g>
+
+    <rect x="340" y="274" width="505" height="91" rx="17" class="panel"/>
+    <text x="363" y="302" class="label">Host RAM tier</text>
+    <text x="716" y="302" class="small">warm recoverable blocks</text>
+    <g transform="translate(363 319)">
+      <rect width="31" height="25" rx="5" class="block"/>
+      <rect x="38" width="31" height="25" rx="5" class="block"/>
+      <rect x="76" width="31" height="25" rx="5" class="block-selected selected-pulse"/>
+      <rect x="114" width="31" height="25" rx="5" class="block"/>
+      <rect x="152" width="31" height="25" rx="5" class="block"/>
+      <rect x="190" width="31" height="25" rx="5" class="block"/>
+      <rect x="228" width="31" height="25" rx="5" class="block"/>
+      <rect x="266" width="31" height="25" rx="5" class="block"/>
+      <rect x="304" width="31" height="25" rx="5" class="block"/>
+      <rect x="342" width="31" height="25" rx="5" class="block"/>
+      <rect x="380" width="31" height="25" rx="5" class="block"/>
+      <rect x="418" width="31" height="25" rx="5" class="block"/>
+    </g>
+
+    <rect x="340" y="391" width="505" height="91" rx="17" class="panel"/>
+    <text x="363" y="419" class="label">NVMe tier</text>
+    <text x="719" y="419" class="small">large cold backing store</text>
+    <g transform="translate(363 436)">
+      <rect width="31" height="25" rx="5" class="block"/>
+      <rect x="38" width="31" height="25" rx="5" class="block"/>
+      <rect x="76" width="31" height="25" rx="5" class="block"/>
+      <rect x="114" width="31" height="25" rx="5" class="block"/>
+      <rect x="152" width="31" height="25" rx="5" class="block-selected selected-pulse"/>
+      <rect x="190" width="31" height="25" rx="5" class="block"/>
+      <rect x="228" width="31" height="25" rx="5" class="block"/>
+      <rect x="266" width="31" height="25" rx="5" class="block"/>
+      <rect x="304" width="31" height="25" rx="5" class="block"/>
+      <rect x="342" width="31" height="25" rx="5" class="block"/>
+      <rect x="380" width="31" height="25" rx="5" class="block"/>
+      <rect x="418" width="31" height="25" rx="5" class="block"/>
+    </g>
+  </g>
+
+  <!-- Static paths and moving tier packets -->
+  <path d="M 287 238 C 315 238 320 205 340 205" class="wire"/>
+  <path d="M 590 248 L 590 274" class="wire-dash"/>
+  <path d="M 620 365 L 620 391" class="wire-dash"/>
+  <path d="M 532 274 C 532 253 505 252 505 228" class="wire-dash"/>
+  <path d="M 682 391 C 682 355 742 352 742 228" class="wire-dash"/>
+
+  <circle class="motion-dot" r="6" fill="#66a3ff" filter="url(#glow)" opacity="0">
+    <animateMotion dur="0.72s" begin="1.18s" fill="freeze"
+                   path="M590 236 L590 308"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
+             dur="0.72s" begin="1.18s" fill="freeze"/>
+  </circle>
+  <circle class="motion-dot" r="6" fill="#66a3ff" filter="url(#glow)" opacity="0">
+    <animateMotion dur="0.72s" begin="1.62s" fill="freeze"
+                   path="M620 352 L620 428"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
+             dur="0.72s" begin="1.62s" fill="freeze"/>
+  </circle>
+  <circle class="motion-dot" r="7" fill="#a797ff" filter="url(#glow)" opacity="0">
+    <animateMotion dur="0.72s" begin="3.25s" fill="freeze"
+                   path="M532 319 C532 253 505 252 505 205"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
+             dur="0.72s" begin="3.25s" fill="freeze"/>
+  </circle>
+  <circle class="motion-dot" r="7" fill="#a797ff" filter="url(#glow)" opacity="0">
+    <animateMotion dur="0.76s" begin="3.58s" fill="freeze"
+                   path="M682 448 C682 355 742 352 742 205"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
+             dur="0.76s" begin="3.58s" fill="freeze"/>
+  </circle>
+
+  <!-- Query, index and response -->
+  <g filter="url(#soft)">
+    <rect x="891" y="132" width="267" height="350" rx="17" class="panel"/>
+    <g class="query">
+      <rect x="914" y="158" width="221" height="62" rx="13" fill="#122b40"
+            stroke="#ffcc66" stroke-opacity="0.75"/>
+      <text x="932" y="181" class="small">New user query</text>
+      <text x="932" y="202" class="label">“Where is the old fact?”</text>
+    </g>
+
+    <path d="M 1024 224 L 1024 253" class="wire-dash"/>
+    <rect x="914" y="256" width="221" height="74" rx="13" fill="#10273a"
+          stroke="#3a617a"/>
+    <text x="932" y="279" class="small">Compact retrieval index</text>
+    <text x="932" y="301" class="label">Mean-K scorer</text>
+    <g transform="translate(1064 274)">
+      <rect x="0" y="16" width="6" height="25" rx="3" fill="#ffcc66" class="scan"/>
+      <rect x="10" y="7" width="6" height="34" rx="3" fill="#ffcc66" class="scan"/>
+      <rect x="20" y="21" width="6" height="20" rx="3" fill="#ffcc66" class="scan"/>
+      <rect x="30" y="1" width="6" height="40" rx="3" fill="#ffcc66" class="scan"/>
+      <rect x="40" y="12" width="6" height="29" rx="3" fill="#ffcc66" class="scan"/>
+      <rect x="50" y="24" width="6" height="17" rx="3" fill="#ffcc66" class="scan"/>
+    </g>
+
+    <path d="M 914 294 C 874 294 871 210 845 210" class="wire-dash"/>
+    <path d="M 845 333 C 873 333 874 316 914 316" class="wire-dash"/>
+
+    <g class="response">
+      <rect x="914" y="360" width="221" height="91" rx="13" fill="url(#answer)"
+            stroke="#39d0ba" stroke-opacity="0.72"/>
+      <text x="932" y="384" class="small">Answer generation</text>
+      <g transform="translate(932 402)">
+        <rect width="31" height="12" rx="6" fill="#39d0ba" class="answer-token t1"/>
+        <rect x="38" width="46" height="12" rx="6" fill="#66a3ff" class="answer-token t2"/>
+        <rect x="91" width="24" height="12" rx="6" fill="#39d0ba" class="answer-token t3"/>
+        <rect x="122" width="40" height="12" rx="6" fill="#66a3ff" class="answer-token t4"/>
+        <rect x="169" width="26" height="12" rx="6" fill="#39d0ba" class="answer-token t5"/>
+      </g>
+      <text x="932" y="437" class="tiny">Only selected KV blocks return to GPU.</text>
+    </g>
+  </g>
+
+  <circle class="motion-dot" r="6" fill="#ffcc66" filter="url(#glow)" opacity="0">
+    <animateMotion dur="0.58s" begin="2.48s" fill="freeze"
+                   path="M1024 217 L1024 267"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
+             dur="0.58s" begin="2.48s" fill="freeze"/>
+  </circle>
+
+  <text x="42" y="526" class="tiny">Illustrative control flow — performance and capacity claims require a pinned release artifact.</text>
+  <text x="1158" y="526" text-anchor="end" class="tiny">under-5-second animation · final frame remains readable</text>
+</svg>

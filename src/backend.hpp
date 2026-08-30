@@ -11,7 +11,6 @@ namespace qw3 {
 class Backend {
 public:
     virtual ~Backend() = default;
-    virtual std::string name() const = 0;
     virtual void load(const EngineOptions &options) = 0;
     virtual std::string generate(const std::string &prompt,
                                  const GenerationOptions &options,
@@ -44,6 +43,6 @@ public:
     }
 };
 
-std::unique_ptr<Backend> make_backend(BackendKind kind);
+std::unique_ptr<Backend> make_qwen_native_backend();
 
 } // namespace qw3

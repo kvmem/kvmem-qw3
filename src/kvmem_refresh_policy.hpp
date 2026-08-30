@@ -47,25 +47,11 @@ inline constexpr uint64_t kvmem_mtp_compact_output_horizon(
     return std::min(request_max_tokens, largest_epoch);
 }
 
-// A generated retrieval query is publishable only after the model reaches a
-// real one-line boundary (EOS, ChatML end, newline, or terminal punctuation).
-// Merely consuming the configured token cap is not a boundary: publishing that
-// prefix made long-running agents reselect on truncated file/symbol names.
-inline bool kvmem_guided_query_piece_terminates(std::string_view piece) {
-    while (!piece.empty() &&
-           (piece.back() == ' ' || piece.back() == '\t' ||
-            piece.back() == '\r' || piece.back() == '\n')) {
-        piece.remove_suffix(1);
-    }
-    if (piece.empty()) return false;
-    const char last = piece.back();
-    if (last == '.' || last == '!' || last == '?') return true;
-    return piece.size() >= 3 &&
-        (piece.substr(piece.size() - 3) == "。" ||
-         piece.substr(piece.size() - 3) == "！" ||
-         piece.substr(piece.size() - 3) == "？");
-}
-
+// A generated retrieval query is publishable only after the model emits a real
+// sequence boundary (EOS, ChatML end, or the private-thinking close token).
+// Punctuation and newlines are content: they commonly occur inside file names,
+// symbols, code expressions, lists, and error traces. Merely consuming the
+// configured token cap is not a boundary either.
 inline bool kvmem_guided_query_complete(
         uint32_t query_tokens, uint32_t max_tokens,
         bool natural_termination) {

@@ -175,7 +175,6 @@ def run_qw3(
     pf.write_text(prompt)
     cmd = [
         args.qw3,
-        "--backend", "qwen-native",
         "--native-kernels", "cuda",
         "--native-linear-backend", "auto",
         "--model", args.model,
@@ -401,7 +400,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--qw3", default=os.environ.get("QW3", "./build/qw3"))
     p.add_argument(
         "--llama",
-        default=os.environ.get("LLAMA_COMPLETION", os.environ.get("LLAMA_CLI", "")),
+        default=os.environ.get("LLAMA_COMPLETION", ""),
     )
     p.add_argument("--model", default=os.environ.get("MODEL", ""))
     p.add_argument("-n", "--n-decode", type=int, default=512)

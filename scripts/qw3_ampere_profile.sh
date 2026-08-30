@@ -23,7 +23,15 @@ compute_cap=${compute_cap//[[:space:]]/}
 
 case "$compute_cap" in
     8.0) default_binary=/root/data/qw3/build/sm80/qw3 ;;
-    8.6) default_binary=/root/data/qw3/build/sm86/qw3 ;;
+    8.6)
+        default_binary=/root/data/qw3/build/sm86_fp8_batch/qw3
+        # On A40 with FP8 KV, causal BatchPrefill shares the long prefix
+        # across the MTP verifier rows.  The old BatchDecode path scans that
+        # prefix once per row and is roughly 3x slower at 78K--130K context.
+        # Keep this node-profile default overridable for parity experiments.
+        : "${QW3_EXPERIMENTAL_MTP_VERIFY_PAGED_PREFILL:=1}"
+        export QW3_EXPERIMENTAL_MTP_VERIFY_PAGED_PREFILL
+        ;;
     *)
         printf 'qw3_ampere_profile: unsupported compute capability %s (%s)\n' \
             "$compute_cap" "$gpu_name" >&2
@@ -87,6 +95,8 @@ done
 printf '[qw3-ampere-profile] gpu=%s cc=%s memory_mib=%s kv_dtype=%s mtp_chain=%s cpu_gb=%s real_binary=%s\n' \
     "$gpu_name" "$compute_cap" "$memory_mib" "$kv_dtype" "$mtp_chain" \
     "$cpu_gb" "$real_binary" >&2
+printf '[qw3-ampere-profile] mtp_verify_paged_prefill=%s\n' \
+    "${QW3_EXPERIMENTAL_MTP_VERIFY_PAGED_PREFILL:-0}" >&2
 
 # The still-running Pro6000 campaign freezes the shared harness at MTP=4, so
 # its readiness parser cannot be edited in place.  Emit its legacy marker with

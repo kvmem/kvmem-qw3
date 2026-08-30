@@ -4,7 +4,7 @@
 The script is intentionally dependency-free. It drives the local `qw3` CLI,
 checks that generated text is invariant across page sizes, optionally compares
 against a baseline binary, and records prefill/decode throughput parsed from
-the native backend summary line.
+the native runtime summary line.
 """
 
 from __future__ import annotations
@@ -195,8 +195,6 @@ def run_qw3(
 
     cmd = [
         str(binary),
-        "--backend",
-        "qwen-native",
         "--model",
         str(model),
         "--raw",

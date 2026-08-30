@@ -13,7 +13,7 @@ struct Engine::Impl {
 
 Engine::Engine(EngineOptions options) : impl_(std::make_unique<Impl>()) {
     impl_->options = std::move(options);
-    impl_->backend = make_backend(impl_->options.backend);
+    impl_->backend = make_qwen_native_backend();
     impl_->backend->load(impl_->options);
 }
 

@@ -40,8 +40,8 @@ env \
   QW3_FLASHINFER_PREFILL_WORKSPACE_MIB=192 \
   "$ROOT/build/qw3" serve \
   --host 127.0.0.1 --port "$PORT" --model "$MODEL" \
-  --backend qwen-native --native-kernels cuda \
-  --ctx 262144 --batch 2048 --prefill-chunk 2048 --kv-dtype fp16 \
+  --native-kernels cuda \
+  --ctx 262144 --prefill-chunk 2048 --kv-dtype fp16 \
   --native-mtp-speculate --mtp-chain 4 \
   --enable-thinking --thinking-budget 4096 -n 32768 \
   --kvmem --kvmem-block-tokens 32 --kvmem-budget 229376 \

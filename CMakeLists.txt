@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(QW3_BUILD_TESTS "Build qw3 smoke tests" ON)
+option(QW3_BUILD_TESTS "Build QW3 host and CUDA tests" ON)
 option(QW3_ENABLE_CUDA "Build CUDA native kernels" OFF)
 option(QW3_ENABLE_FLASHINFER "Build optional FlashInfer prefill adapter" OFF)
 set(QW3_GDN_SM120_AOT_DIR "" CACHE PATH
@@ -98,13 +98,10 @@ else()
 endif()
 
 add_library(qw3_core
-    src/backend.cpp
     src/engine.cpp
     src/gguf.cpp
     src/model_source.cpp
     ${QW3_CUDA_SRCS}
-    src/llama_cli_backend.cpp
-    src/mock_backend.cpp
     src/qwen_native.cpp
     src/qwen_native_backend.cpp
     src/qwen_executor.cpp
@@ -238,10 +235,10 @@ add_executable(qw3-inspect src/qw3_inspect.cpp)
 target_link_libraries(qw3-inspect PRIVATE qw3_core)
 
 if(QW3_BUILD_TESTS)
-    add_executable(qw3-smoke tests/smoke.cpp)
-    target_link_libraries(qw3-smoke PRIVATE qw3_core)
+    add_executable(qw3-prompt-render tests/prompt_render_test.cpp)
+    target_link_libraries(qw3-prompt-render PRIVATE qw3_core)
     enable_testing()
-    add_test(NAME qw3-smoke COMMAND qw3-smoke)
+    add_test(NAME qw3-prompt-render COMMAND qw3-prompt-render)
 
     add_executable(qw3-kvmem-store tests/kvmem_store_test.cpp)
     target_link_libraries(qw3-kvmem-store PRIVATE qw3_core)

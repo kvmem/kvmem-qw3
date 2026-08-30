@@ -137,7 +137,6 @@ def run_cli(name: str,
             extra_env: Optional[Dict[str, str]] = None) -> CaseResult:
     cmd = [
         str(qw3),
-        "--backend", "qwen-native",
         "--model", str(model),
         "--raw",
         "--kv-dtype", "fp16",

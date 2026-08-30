@@ -98,6 +98,38 @@ void test_near_close_marker_and_crlf_trim() {
     }
 }
 
+void test_schema_named_tags_remain_argument_data() {
+    const std::string content =
+        "<scxml>\n"
+        "  <donedata><content>0</content></donedata>\n"
+        "  <file_path>/not/a/tool/argument</file_path>\n"
+        "</scxml>";
+    const std::string text =
+        "<tool_call>\n<function=Write>\n"
+        "<parameter=content>\n" + content +
+        "\n</parameter>\n"
+        "<parameter=file_path>\n/tmp/scxml_test.py\n</parameter>\n"
+        "</function>\n</tool_call>";
+
+    CanonicalToolCallStreamParser parser;
+    std::vector<ToolCallStreamEvent> events;
+    for (size_t i = 0; i < text.size(); i += 7) {
+        if (!parser.feed(text.substr(i, 7), events)) {
+            fail("schema-tag content parse failed: " + parser.error());
+        }
+    }
+    if (!parser.finish(events)) {
+        fail("schema-tag content finish failed: " + parser.error());
+    }
+    const ParsedCall call = collect(events);
+    if (call.args.at("content") != content) {
+        fail("schema-named source tag overwrote Write.content");
+    }
+    if (call.args.at("file_path") != "/tmp/scxml_test.py") {
+        fail("schema-named source tag overwrote Write.file_path");
+    }
+}
+
 void test_malformed_fails_closed() {
     CanonicalToolCallStreamParser parser;
     std::vector<ToolCallStreamEvent> events;
@@ -125,6 +157,7 @@ void test_json_fragment_escaping() {
 int main() {
     test_one_byte_chunks();
     test_near_close_marker_and_crlf_trim();
+    test_schema_named_tags_remain_argument_data();
     test_malformed_fails_closed();
     test_json_fragment_escaping();
     std::cout << "tool_call_stream_test: ok\n";

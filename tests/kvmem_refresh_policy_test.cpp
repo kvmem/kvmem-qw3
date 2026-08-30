@@ -77,12 +77,6 @@ int main() {
             "initial oversized callback tried to retain an impossible epoch");
     require(!kvmem_refresh_prefill_keeps_epoch(false, false),
             "ordinary semantic request incorrectly retained a stale epoch");
-    require(kvmem_guided_query_piece_terminates("Find Foo::bar?"),
-            "ASCII question was not a query boundary");
-    require(kvmem_guided_query_piece_terminates("查找失败的测试。\n"),
-            "CJK sentence was not a query boundary");
-    require(!kvmem_guided_query_piece_terminates("src/foo.rs"),
-            "file-name suffix was treated as a query boundary");
     require(kvmem_guided_query_complete(63, 64, true),
             "naturally terminated query was rejected");
     require(!kvmem_guided_query_complete(64, 64, false),
