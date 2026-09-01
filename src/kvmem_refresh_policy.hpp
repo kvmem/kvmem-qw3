@@ -378,6 +378,17 @@ inline bool kvmem_middecode_emergency_refresh_due(
         epoch_limit - epoch_tokens <= guard_tokens;
 }
 
+// A normal refresh fires while the A+B epoch still has enough space for the
+// private prompt and its generated retrieval query.  An emergency refresh is
+// different: it exists precisely because an open tool/code fragment consumed
+// that headroom.  Appending a private branch there can exhaust the bounded GPU
+// page pool before selection has a chance to free pages.  Reuse the already
+// captured original task query for this rare safety path instead.
+inline constexpr bool kvmem_middecode_generate_private_query(
+        bool emergency_refresh) {
+    return !emergency_refresh;
+}
+
 inline uint32_t kvmem_middecode_refresh_recent_tokens(
         uint32_t select_budget, uint32_t epoch_tokens,
         bool emergency_refresh) {

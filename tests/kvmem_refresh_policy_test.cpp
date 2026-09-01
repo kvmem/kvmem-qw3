@@ -201,6 +201,10 @@ int main() {
             "emergency refresh did not fire at the reserve guard");
     require(kvmem_middecode_emergency_refresh_due(32768, 32768),
             "emergency refresh did not fire at the reserve limit");
+    require(kvmem_middecode_generate_private_query(false),
+            "safe refresh unexpectedly disabled its private query");
+    require(!kvmem_middecode_generate_private_query(true),
+            "emergency refresh may overrun the page pool with a private query");
     require(kvmem_middecode_refresh_recent_tokens(
                 65536, 32256, true) == 32256,
             "emergency refresh did not retain the complete open epoch");

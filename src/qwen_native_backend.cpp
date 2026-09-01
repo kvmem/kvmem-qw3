@@ -16226,7 +16226,15 @@ private:
             uint32_t query_tokens = 0;
             uint32_t private_prompt_tokens = 0;
             bool fallback_original = false;
-            try {
+            if (!detail::kvmem_middecode_generate_private_query(
+                    emergency_refresh)) {
+                // Only the reserve guard remains.  The original task query is
+                // still captured, whereas even the private prompt (before its
+                // up-to-4K answer) can consume the last physical KV pages.
+                // Select immediately and preserve the complete open epoch via
+                // the bounded recent pin below.
+                fallback_original = true;
+            } else try {
                 if (!executor_->kvmem_begin_guided_query_probe(
                         options.kvmem_middecode_query_max_tokens)) {
                     throw std::runtime_error(
