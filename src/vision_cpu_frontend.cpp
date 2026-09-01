@@ -6,10 +6,12 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -71,15 +73,33 @@ std::string read_line(int fd) {
 } // namespace
 
 struct CpuVisionFrontend::Impl {
+    struct CacheEntry {
+        std::vector<CpuVisionImage> images;
+        CpuVisionEncoding encoding;
+        uint64_t bytes = 0;
+    };
+
     pid_t pid = -1;
     int request_fd = -1;
     int response_fd = -1;
     std::mutex mutex;
+    uint64_t cache_limit_bytes = 512ULL << 20;
+    uint64_t cache_bytes = 0;
+    std::vector<CacheEntry> cache;
 
     Impl(const std::string &model_directory,
          const std::string &python_executable,
          const std::string &worker_script,
          uint32_t threads) {
+        if (const char *value = std::getenv("QW3_VISION_CPU_CACHE_MIB")) {
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long long mib = std::strtoull(value, &end, 10);
+            if (errno == 0 && end != value && *end == '\0' &&
+                mib <= std::numeric_limits<uint64_t>::max() / (1ULL << 20)) {
+                cache_limit_bytes = static_cast<uint64_t>(mib) << 20;
+            }
+        }
         int to_child[2] = {-1, -1};
         int from_child[2] = {-1, -1};
         if (::pipe(to_child) != 0 || ::pipe(from_child) != 0) {
@@ -97,6 +117,10 @@ struct CpuVisionFrontend::Impl {
                 std::string("cannot fork vision worker: ") + std::strerror(errno));
         }
         if (pid == 0) {
+            // Interactive Ctrl-C is intended for the serving parent. Let the
+            // worker observe pipe EOF/the explicit shutdown frame instead of
+            // emitting an unrelated Python KeyboardInterrupt traceback.
+            (void)::signal(SIGINT, SIG_IGN);
             ::dup2(to_child[0], STDIN_FILENO);
             ::dup2(from_child[1], STDOUT_FILENO);
             close_fd(to_child[0]); close_fd(to_child[1]);
@@ -175,6 +199,24 @@ CpuVisionEncoding CpuVisionFrontend::encode(
         const std::vector<CpuVisionImage> &images) {
     if (images.empty()) return {};
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto same_images = [&](const std::vector<CpuVisionImage> &cached) {
+        if (cached.size() != images.size()) return false;
+        for (size_t i = 0; i < images.size(); ++i) {
+            if (cached[i].media_type != images[i].media_type ||
+                cached[i].base64_data != images[i].base64_data) return false;
+        }
+        return true;
+    };
+    for (size_t i = 0; i < impl_->cache.size(); ++i) {
+        if (!same_images(impl_->cache[i].images)) continue;
+        Impl::CacheEntry hit = std::move(impl_->cache[i]);
+        impl_->cache.erase(impl_->cache.begin() +
+                           static_cast<std::ptrdiff_t>(i));
+        impl_->cache.push_back(std::move(hit));
+        CpuVisionEncoding result = impl_->cache.back().encoding;
+        result.cache_hit = true;
+        return result;
+    }
     json request{{"op", "encode"}, {"images", json::array()}};
     for (const CpuVisionImage &image : images) {
         request["images"].push_back(
@@ -225,6 +267,22 @@ CpuVisionEncoding CpuVisionFrontend::encode(
     }
     if (counted_rows != rows) {
         throw std::runtime_error("CPU vision grid rows do not match embeddings");
+    }
+    const uint64_t result_bytes =
+        static_cast<uint64_t>(result.embeddings.size()) * sizeof(float);
+    if (impl_->cache_limit_bytes > 0 &&
+        result_bytes <= impl_->cache_limit_bytes) {
+        while (!impl_->cache.empty() &&
+               impl_->cache_bytes > impl_->cache_limit_bytes - result_bytes) {
+            impl_->cache_bytes -= impl_->cache.front().bytes;
+            impl_->cache.erase(impl_->cache.begin());
+        }
+        Impl::CacheEntry entry;
+        entry.images = images;
+        entry.encoding = result;
+        entry.bytes = result_bytes;
+        impl_->cache.push_back(std::move(entry));
+        impl_->cache_bytes += result_bytes;
     }
     return result;
 }

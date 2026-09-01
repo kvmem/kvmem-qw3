@@ -3897,21 +3897,113 @@ public:
         }
         GenerationOptions effective_options = options;
         if (!effective_options.input_embedding_overrides.empty() &&
-            !reset_session) {
-            throw std::runtime_error(
-                "multimodal V1 does not support append/session continuation");
+            effective_options.input_embedding_fingerprint == 0) {
+            effective_options.input_embedding_fingerprint =
+                input_embedding_fingerprint(
+                    effective_options.input_embedding_overrides);
         }
-        executor_->set_input_embedding_overrides(
-            effective_options.input_embedding_overrides, prompt_tokens,
-            effective_options.input_mrope_positions);
-        if (!effective_options.input_embedding_overrides.empty()) {
-            // V1 checkpoints do not serialize visual embeddings. They must
-            // never alias a same-shaped image prompt or leave overwritten KV
-            // pages advertised as a reusable text checkpoint.
-            kvmem_warm_valid_ = false;
+        if (!reset_session && kvmem_api_session_active_) {
+            // A session append is logically one dense source sequence even
+            // though only the new suffix is executed. Retain earlier visual
+            // rows and offset any newly supplied image coordinates into the
+            // established M-RoPE coordinate space.
+            std::vector<uint32_t> combined_tokens = kvmem_api_tokens_;
+            std::vector<GenerationOptions::InputEmbeddingOverride>
+                combined_overrides = kvmem_active_input_embedding_overrides_;
+            std::vector<std::array<uint32_t, 3>> combined_positions =
+                kvmem_active_input_mrope_positions_;
+            if (!combined_overrides.empty() &&
+                combined_positions.size() != combined_tokens.size()) {
+                throw std::runtime_error(
+                    "multimodal session cache has inconsistent M-RoPE state");
+            }
+            uint32_t coordinate_base = static_cast<uint32_t>(combined_tokens.size());
+            if (!combined_positions.empty()) {
+                const auto &last = combined_positions.back();
+                coordinate_base = std::max({last[0], last[1], last[2]}) + 1u;
+            }
+            if (!effective_options.input_embedding_overrides.empty()) {
+                if (effective_options.input_mrope_positions.size() !=
+                    prompt_tokens.size()) {
+                    throw std::runtime_error(
+                        "multimodal session append requires complete suffix M-RoPE positions");
+                }
+                const uint32_t row_base = static_cast<uint32_t>(
+                    combined_overrides.size());
+                for (uint32_t &token : prompt_tokens) {
+                    if ((token & 0x80000000u) != 0) {
+                        token = 0x80000000u |
+                            ((token & 0x7fffffffu) + row_base);
+                    }
+                }
+                for (auto item : effective_options.input_embedding_overrides) {
+                    item.token_id = 0x80000000u |
+                        ((item.token_id & 0x7fffffffu) + row_base);
+                    for (uint32_t &axis : item.position) axis += coordinate_base;
+                    combined_overrides.push_back(std::move(item));
+                }
+                for (auto position : effective_options.input_mrope_positions) {
+                    for (uint32_t &axis : position) axis += coordinate_base;
+                    combined_positions.push_back(position);
+                }
+                effective_options.input_embedding_fingerprint =
+                    combine_input_embedding_fingerprints(
+                        kvmem_active_input_embedding_fingerprint_,
+                        effective_options.input_embedding_fingerprint);
+            } else if (!combined_overrides.empty()) {
+                combined_positions.reserve(combined_positions.size() +
+                                           prompt_tokens.size());
+                for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+                    const uint32_t position = coordinate_base +
+                        static_cast<uint32_t>(i);
+                    combined_positions.push_back(
+                        {position, position, position});
+                }
+                effective_options.input_embedding_fingerprint =
+                    kvmem_active_input_embedding_fingerprint_;
+            }
+            combined_tokens.insert(combined_tokens.end(), prompt_tokens.begin(),
+                                   prompt_tokens.end());
+            effective_options.input_embedding_overrides =
+                std::move(combined_overrides);
+            effective_options.input_mrope_positions =
+                std::move(combined_positions);
+            executor_->set_input_embedding_overrides(
+                effective_options.input_embedding_overrides, combined_tokens,
+                effective_options.input_mrope_positions);
+        } else {
+            executor_->set_input_embedding_overrides(
+                effective_options.input_embedding_overrides, prompt_tokens,
+                effective_options.input_mrope_positions);
+        }
+        if (reset_session || kvmem_api_session_active_) {
+            kvmem_active_input_embedding_fingerprint_ =
+                effective_options.input_embedding_fingerprint;
+            kvmem_active_input_embedding_overrides_ =
+                effective_options.input_embedding_overrides;
+            kvmem_active_input_mrope_positions_ =
+                effective_options.input_mrope_positions;
         }
         const uint32_t append_base = reset_session
             ? 0u : static_cast<uint32_t>(executor_->position());
+        if (!reset_session && kvmem_api_session_active_) {
+            std::vector<GenerationOptions::KvMemPinnedTokenSpan>
+                combined_spans = kvmem_active_pinned_token_spans_;
+            combined_spans.reserve(
+                combined_spans.size() +
+                effective_options.kvmem_pinned_token_spans.size());
+            for (auto span : effective_options.kvmem_pinned_token_spans) {
+                span.begin += append_base;
+                span.end += append_base;
+                combined_spans.push_back(span);
+            }
+            effective_options.kvmem_pinned_token_spans =
+                std::move(combined_spans);
+        }
+        if (reset_session || kvmem_api_session_active_) {
+            kvmem_active_pinned_token_spans_ =
+                effective_options.kvmem_pinned_token_spans;
+        }
         if (!reset_session &&
             effective_options.kvmem_query_end >
                 effective_options.kvmem_query_begin) {
@@ -4061,6 +4153,12 @@ private:
         uint32_t api_boundary_pos = 0;
         std::vector<uint32_t> api_tail_tokens;
         std::vector<uint32_t> session_tokens;
+        uint64_t input_embedding_fingerprint = 0;
+        std::vector<GenerationOptions::InputEmbeddingOverride>
+            input_embedding_overrides;
+        std::vector<std::array<uint32_t, 3>> input_mrope_positions;
+        std::vector<GenerationOptions::KvMemPinnedTokenSpan>
+            pinned_token_spans;
         std::vector<uint32_t> selected_blocks;
         uint32_t total_blocks = 0;
         QwenExecutor::KvMemTierUsage tier_usage;
@@ -4083,7 +4181,8 @@ private:
 
     static std::string local_cache_fingerprint(
             const std::vector<uint32_t> &tokens,
-            const EngineOptions &options, uint32_t position) {
+            const EngineOptions &options, uint32_t position,
+            uint64_t input_embedding_fingerprint = 0) {
         // FNV-1a is an integrity/debug fingerprint, not an authentication
         // primitive. Exact cache lookup is always the explicit ID + version.
         uint64_t h = 1469598103934665603ULL;
@@ -4115,11 +4214,47 @@ private:
         mix_string(options.kvmem_retrieval_method);
         mix_string(options.kvmem_index_placement);
         mix_u64(position);
+        mix_u64(input_embedding_fingerprint);
         for (uint32_t token : tokens) mix_u64(token);
         std::ostringstream out;
         out << "fnv1a64:" << std::hex << std::setfill('0')
             << std::setw(16) << h;
         return out.str();
+    }
+
+    static uint64_t input_embedding_fingerprint(
+            const std::vector<GenerationOptions::InputEmbeddingOverride>
+                &overrides) {
+        uint64_t h = 1469598103934665603ULL;
+        auto mix_u64 = [&](uint64_t value) {
+            for (int i = 0; i < 8; ++i) {
+                h ^= static_cast<uint8_t>(value & 0xffu);
+                h *= 1099511628211ULL;
+                value >>= 8;
+            }
+        };
+        for (const auto &item : overrides) {
+            mix_u64(item.token_id);
+            mix_u64(item.source_token_id);
+            for (uint32_t axis : item.position) mix_u64(axis);
+            for (float value : item.embedding) {
+                uint32_t bits = 0;
+                std::memcpy(&bits, &value, sizeof(bits));
+                mix_u64(bits);
+            }
+        }
+        return h != 0 ? h : 1;
+    }
+
+    static uint64_t combine_input_embedding_fingerprints(uint64_t prefix,
+                                                          uint64_t suffix) {
+        uint64_t h = prefix != 0 ? prefix : 1469598103934665603ULL;
+        for (int i = 0; i < 8; ++i) {
+            h ^= static_cast<uint8_t>(suffix & 0xffu);
+            h *= 1099511628211ULL;
+            suffix >>= 8;
+        }
+        return h != 0 ? h : 1;
     }
 
     static KvMemLocalCacheInfo local_kvmem_cache_info(
@@ -4150,6 +4285,10 @@ private:
         entry.api_boundary_state = QwenExecutor::StateSnapshot{};
         entry.api_tail_tokens.clear();
         entry.session_tokens.clear();
+        entry.input_embedding_fingerprint = 0;
+        entry.input_embedding_overrides.clear();
+        entry.input_mrope_positions.clear();
+        entry.pinned_token_spans.clear();
         entry.selected_blocks.clear();
     }
 
@@ -4228,12 +4367,18 @@ private:
         next.api_boundary_pos = kvmem_api_boundary_pos_;
         next.api_tail_tokens = kvmem_api_tail_tokens_;
         next.session_tokens = kvmem_api_tokens_;
+        next.input_embedding_fingerprint =
+            kvmem_active_input_embedding_fingerprint_;
+        next.input_embedding_overrides = kvmem_active_input_embedding_overrides_;
+        next.input_mrope_positions = kvmem_active_input_mrope_positions_;
+        next.pinned_token_spans = kvmem_active_pinned_token_spans_;
         next.selected_blocks = kvmem_checkpoint_block_ids(executor_.get());
         next.total_blocks = executor_->block_store()
             ? executor_->block_store()->block_count() : 0;
         next.tier_usage = executor_->kvmem_tier_usage();
         next.fingerprint = local_cache_fingerprint(
-            next.session_tokens, options_, next.position);
+            next.session_tokens, options_, next.position,
+            next.input_embedding_fingerprint);
 
         DeviceStatus scope = device_->begin();
         if (!scope.ok) throw std::runtime_error(scope.message);
@@ -4262,6 +4407,9 @@ private:
         if (!scope.ok) throw std::runtime_error(scope.message);
         bool scope_open = true;
         try {
+            executor_->set_input_embedding_overrides(
+                entry.input_embedding_overrides, entry.session_tokens,
+                entry.input_mrope_positions);
             executor_->restore_state(entry.executor_state);
             executor_->kvmem_truncate_to(entry.position);
             if (!entry.selected_blocks.empty()) {
@@ -4270,6 +4418,12 @@ private:
             kvmem_api_boundary_pos_ = entry.api_boundary_pos;
             kvmem_api_tail_tokens_ = entry.api_tail_tokens;
             kvmem_api_tokens_ = entry.session_tokens;
+            kvmem_active_input_embedding_fingerprint_ =
+                entry.input_embedding_fingerprint;
+            kvmem_active_input_embedding_overrides_ =
+                entry.input_embedding_overrides;
+            kvmem_active_input_mrope_positions_ = entry.input_mrope_positions;
+            kvmem_active_pinned_token_spans_ = entry.pinned_token_spans;
             kvmem_api_boundary_ckpt_ = entry.api_boundary_state.ready
                 ? clone_milestone_state_snapshot(entry.api_boundary_state)
                 : QwenExecutor::StateSnapshot{};
@@ -9888,6 +10042,8 @@ private:
         if (!kvmem_prefix_cache_enabled()) return {};
         if (!executor_ || !executor_->kvmem_enabled()) return {};
         if (!kvmem_warm_valid_ || kvmem_warm_log_.empty()) return {};
+        if (options.input_embedding_fingerprint !=
+            kvmem_warm_input_embedding_fingerprint_) return {};
         const uint32_t sel_budget = executor_->block_store()
             ? executor_->block_store()->select_budget_tokens() : 0;
         const bool qc_source_index_supported =
@@ -10819,7 +10975,6 @@ private:
 #endif
         const bool warm_capture =
             !semantic_chunk && !inline_refresh &&
-            options.input_embedding_overrides.empty() &&
             kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
 
@@ -10899,10 +11054,17 @@ private:
         const bool split_score_query_and_live_suffix =
             options.kvmem_replay_end > options.kvmem_replay_begin &&
             requested_replay_begin != options.kvmem_query_begin;
+        const bool block_atomic_query_index =
+            executor_->block_store() &&
+            (executor_->block_store()->config().prototype_mode ==
+                 KvMemPrototypeMode::KeyDirectionAdaptive ||
+             executor_->block_store()->config().prototype_mode ==
+                 KvMemPrototypeMode::KeyDirectionFixed4);
         const bool query_replay =
             !semantic_chunk && kvmem_query_replay_enabled() &&
             executor_->kvmem_enabled() &&
             qc_select_active && dump == nullptr &&
+            !block_atomic_query_index &&
             !split_score_query_and_live_suffix &&
             options.kvmem_query_begin > 0 &&
             options.kvmem_query_begin >= query_replay_base &&
@@ -11769,6 +11931,8 @@ private:
         if (options.max_tokens == 0) {
             if (warm_capture) {
                 kvmem_warm_log_ = prompt_tokens;
+                kvmem_warm_input_embedding_fingerprint_ =
+                    options.input_embedding_fingerprint;
                 const size_t pos = executor_->position();
                 if (pos <= kvmem_warm_log_.size()) {
                     kvmem_warm_log_.resize(pos);
@@ -11992,6 +12156,8 @@ private:
         // inside the device scope since capture_state issues device copies.
         if (warm_capture && !stream_cancelled) {
             kvmem_warm_log_ = prompt_tokens;
+            kvmem_warm_input_embedding_fingerprint_ =
+                options.input_embedding_fingerprint;
             kvmem_warm_log_.insert(kvmem_warm_log_.end(),
                                    gen_tokens.begin(), gen_tokens.end());
             const size_t pos = executor_->position();
@@ -12249,7 +12415,6 @@ private:
             reset_session && override_executor == nullptr &&
             !transcript_replay_requested && !semantic_chunk && !api_session &&
             !inline_refresh &&
-            options.input_embedding_overrides.empty() &&
             kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
         DeviceStatus st;
@@ -12503,10 +12668,17 @@ private:
         const bool split_score_query_and_live_suffix =
             options.kvmem_replay_end > options.kvmem_replay_begin &&
             requested_replay_begin != options.kvmem_query_begin;
+        const bool block_atomic_query_index =
+            executor_->block_store() &&
+            (executor_->block_store()->config().prototype_mode ==
+                 KvMemPrototypeMode::KeyDirectionAdaptive ||
+             executor_->block_store()->config().prototype_mode ==
+                 KvMemPrototypeMode::KeyDirectionFixed4);
         const bool query_replay =
             !semantic_chunk && kvmem_query_replay_enabled() && kvmem_on &&
             qc_select_active &&
             reset_session && override_executor == nullptr && dump == nullptr &&
+            !block_atomic_query_index &&
             !split_score_query_and_live_suffix &&
             options.kvmem_query_begin > 0 &&
             options.kvmem_query_begin >= query_replay_base &&
@@ -12655,6 +12827,26 @@ private:
             api_final_boundary =
                 (logical_prompt_tokens / api_bt) * api_bt;
         }
+        // Packed Adaptive/Fixed4 prototypes cannot merge a continuation that
+        // begins inside their last block. Restore the already-captured API
+        // boundary and teacher-force only the saved (< block_tokens) tail plus
+        // this request's suffix. This is required both for a storage-only
+        // append and for the provisional pass of a semantic frozen query: the
+        // latter must extend the source index from an aligned boundary before
+        // it can capture/score the query. The computation is identical to a
+        // continuous append, bounded to one old block, and avoids either a cold
+        // history rebuild or an incomplete packed index.
+        const bool api_partial_block_replay =
+            api_session && !reset_session && block_atomic_query_index &&
+            kvmem_api_boundary_pos_ < api_append_base;
+        if (api_partial_block_replay) {
+            if (!kvmem_api_boundary_ckpt_.ready) {
+                throw std::runtime_error(
+                    "KVMem packed-index append has no aligned API checkpoint");
+            }
+            executor_->restore_state(kvmem_api_boundary_ckpt_);
+            executor_->kvmem_truncate_to(kvmem_api_boundary_pos_);
+        }
         if (clean_query) {
             // PASS A: capture the query from the question tokens ALONE. The question
             // prefills at positions 0..S attending only over itself + sink, so the
@@ -12709,7 +12901,10 @@ private:
                 executor_->kvmem_set_query_span(
                     options.kvmem_query_begin, options.kvmem_query_end,
                     logical_prompt_tokens,
-                    /*index_tokens=*/0,
+                    /*index_tokens=*/recompute_query
+                        ? (kvmem_effective_replay_begin(options) / api_bt) *
+                              api_bt
+                        : 0,
                     /*preserve_content_index=*/!reset_session);
                 std::ostringstream qmsg;
                 qmsg << "native kvmem session query-conditioned: span=["
@@ -12739,7 +12934,9 @@ private:
                 : options.kvmem_query_end;
             executor_->kvmem_set_query_span(
                 initial_qb, initial_qe, logical_prompt_tokens,
-                /*index_tokens=*/0,
+                /*index_tokens=*/recompute_query
+                    ? (kvmem_effective_replay_begin(options) / api_bt) * api_bt
+                    : 0,
                 /*preserve_content_index=*/kvmem_warm_reuse,
                 /*capture_content_without_query=*/false,
                 /*min_query_storage_rows=*/
@@ -13031,8 +13228,13 @@ private:
                                 prompt_tokens.end());
         }
         const std::vector<uint32_t> &prefill_tokens =
-            kvmem_warm_reuse ? kvmem_suffix : prompt_tokens;
-        const size_t kvmem_prefill_begin = kvmem_warm_reuse ? kvmem_reuse_m : 0;
+            api_partial_block_replay
+                ? api_sequence_tokens
+                : kvmem_warm_reuse ? kvmem_suffix : prompt_tokens;
+        const size_t kvmem_prefill_begin =
+            api_partial_block_replay
+                ? api_sequence_base
+                : kvmem_warm_reuse ? kvmem_reuse_m : 0;
         // Common prefill entry for checkpoint reuse and persistent
         // reset_session=false growth: discard the prior semantic working set
         // before any new above-budget token is evaluated.
@@ -13225,9 +13427,11 @@ private:
                     tokens, lbegin, lend, compute_final_logits);
             }
         };
-        const uint32_t prefill_absolute_base = api_session
-            ? api_append_base
-            : static_cast<uint32_t>(kvmem_prefill_begin);
+        const uint32_t prefill_absolute_base = api_partial_block_replay
+            ? api_sequence_base
+            : api_session
+                ? api_append_base
+                : static_cast<uint32_t>(kvmem_prefill_begin);
         auto do_prefill_range = [&](size_t lbegin, size_t lend,
                                     bool compute_final_logits = true) {
             do_prefill_vector(prefill_tokens, prefill_absolute_base,
@@ -14784,12 +14988,21 @@ private:
             // Register the tokens not yet in the store so it lands at prompt.size().
             // Already registered before this point: reuse_m (warm restore) plus the
             // first segment when a block-boundary ckpt_P split ran.
-            const uint32_t already =
-                kvmem_warm_checkpoint_staged
+            const uint32_t already = api_session
+                ? (api_partial_block_replay
+                       ? api_sequence_base
+                       : api_append_base)
+                : kvmem_warm_checkpoint_staged
                     ? kvmem_ckpt_split
                     : static_cast<uint32_t>(kvmem_prefill_begin);
-            const uint32_t reg_n =
-                static_cast<uint32_t>(prompt_tokens.size()) - already;
+            const uint32_t registration_end = api_session
+                ? logical_prompt_tokens
+                : static_cast<uint32_t>(prompt_tokens.size());
+            if (already > registration_end) {
+                throw std::runtime_error(
+                    "KVMem prefill registration boundary exceeds the prompt");
+            }
+            const uint32_t reg_n = registration_end - already;
             executor_->kvmem_register_append(reg_n);
             if (options.kvmem_reselect_mode == KvMemReselectMode::Off) {
                 // A persistent prefill-only ingest must not collapse from the
@@ -15775,6 +15988,8 @@ private:
         if (options.max_tokens == 0) {
             if (kvmem_warm_capture) {
                 kvmem_warm_log_ = prompt_tokens;
+                kvmem_warm_input_embedding_fingerprint_ =
+                    options.input_embedding_fingerprint;
                 const size_t pos = executor_->position();
                 if (pos <= kvmem_warm_log_.size()) {
                     kvmem_warm_log_.resize(pos);
@@ -17003,6 +17218,8 @@ private:
         // the device scope since capture_state issues device copies.
         if (kvmem_warm_capture && !stream_cancelled) {
             kvmem_warm_log_ = prompt_tokens;
+            kvmem_warm_input_embedding_fingerprint_ =
+                options.input_embedding_fingerprint;
             kvmem_warm_log_.insert(kvmem_warm_log_.end(),
                                    gen_tokens.begin(), gen_tokens.end());
             const size_t pos = executor_->position();
@@ -17649,6 +17866,7 @@ private:
     // longest common token prefix) and C < prompt.size(), restore it, rewind the
     // block store to C (kvmem_truncate_to), and prefill [C,end).
     std::vector<uint32_t> kvmem_warm_log_;
+    uint64_t kvmem_warm_input_embedding_fingerprint_ = 0;
     QwenExecutor::StateSnapshot kvmem_warm_ckpt_end_;
     QwenExecutor::StateSnapshot kvmem_warm_ckpt_prompt_;
     uint32_t kvmem_warm_prompt_pos_ = 0;   // P (position of ckpt_prompt_)
@@ -17678,6 +17896,13 @@ private:
     // Canonical teacher-forced token history for named local-cache integrity
     // metadata. This is host-only (4 bytes/token) and does not duplicate KV.
     std::vector<uint32_t> kvmem_api_tokens_;
+    uint64_t kvmem_active_input_embedding_fingerprint_ = 0;
+    std::vector<GenerationOptions::InputEmbeddingOverride>
+        kvmem_active_input_embedding_overrides_;
+    std::vector<std::array<uint32_t, 3>>
+        kvmem_active_input_mrope_positions_;
+    std::vector<GenerationOptions::KvMemPinnedTokenSpan>
+        kvmem_active_pinned_token_spans_;
 
     // Phase-1 request-level local checkpoint registry. Only one executor
     // lineage can be ready at a time; a cold unrelated request evicts ready

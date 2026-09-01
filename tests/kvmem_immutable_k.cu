@@ -61,6 +61,21 @@ bool launch_raw_k_scatter_rope_paged_batched_table(
         const int32_t *page_indices, uint32_t page_size,
         const float *rope_sincos, uint32_t rope_table_positions,
         uint64_t raw_block_stride_elements, cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_mrope(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, const int32_t *mrope_positions,
+        uint32_t mrope_position_stride, cudaStream_t stream);
+bool launch_derope_query_multi_mrope(
+        float *q_multi, const float *q, uint32_t q_token_stride,
+        uint32_t q_head_stride, uint32_t cnt, uint32_t n_heads,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *positions,
+        uint32_t position_offset, uint32_t position_stride, float theta,
+        cudaStream_t stream);
 }
 
 #define CUDA_CHECK(call) do {                                             \
@@ -143,6 +158,70 @@ __global__ void bake_half_to_half(const __half *raw, __half *out,
         v = i < half ? x0 * c - x1 * s : x0 * s + x1 * c;
     }
     out[off + i] = __float2half(v);
+}
+
+__device__ __forceinline__ uint32_t reference_mrope_axis(uint32_t pair) {
+    if ((pair % 3U) == 1U && pair < 33U) return 1;
+    if ((pair % 3U) == 2U && pair < 30U) return 2;
+    return 0;
+}
+
+__global__ void bake_half_to_half_mrope(
+        const __half *raw, __half *out, uint32_t rows, uint32_t heads,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *positions,
+        uint32_t position_offset, uint32_t position_stride, float theta) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t i = threadIdx.x;
+    const uint32_t half = rope_dim / 2;
+    if (row >= rows || head >= heads || i >= head_dim) return;
+    const uint64_t off =
+        (static_cast<uint64_t>(row) * heads + head) * head_dim;
+    float v = __half2float(raw[off + i]);
+    if (i < rope_dim) {
+        const uint32_t pair = i < half ? i : i - half;
+        const uint32_t axis = reference_mrope_axis(pair);
+        const int32_t position = positions[
+            static_cast<uint64_t>(axis) * position_stride +
+            position_offset + row];
+        const float x0 = __half2float(raw[off + pair]);
+        const float x1 = __half2float(raw[off + pair + half]);
+        const float inv =
+            __powf(theta, -2.0f * float(pair) / float(rope_dim));
+        float s, c;
+        __sincosf(float(position) * inv, &s, &c);
+        v = i < half ? x0 * c - x1 * s : x0 * s + x1 * c;
+    }
+    out[off + i] = __float2half(v);
+}
+
+__global__ void bake_float_to_float_mrope(
+        const float *raw, float *out, uint32_t rows, uint32_t heads,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *positions,
+        uint32_t position_offset, uint32_t position_stride, float theta) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t i = threadIdx.x;
+    const uint32_t half = rope_dim / 2;
+    if (row >= rows || head >= heads || i >= head_dim) return;
+    const uint64_t off =
+        (static_cast<uint64_t>(row) * heads + head) * head_dim;
+    float v = raw[off + i];
+    if (i < rope_dim) {
+        const uint32_t pair = i < half ? i : i - half;
+        const uint32_t axis = reference_mrope_axis(pair);
+        const int32_t position = positions[
+            static_cast<uint64_t>(axis) * position_stride +
+            position_offset + row];
+        const float x0 = raw[off + pair];
+        const float x1 = raw[off + pair + half];
+        const float inv =
+            __powf(theta, -2.0f * float(pair) / float(rope_dim));
+        float s, c;
+        __sincosf(float(position) * inv, &s, &c);
+        v = i < half ? x0 * c - x1 * s : x0 * s + x1 * c;
+    }
+    out[off + i] = v;
 }
 
 static void remap(__half *cache, int32_t from, int32_t to,
@@ -307,6 +386,84 @@ int main() {
             max_abs);
         return 1;
     }
+
+    // Exact Qwen3.5/3.8 three-axis M-RoPE materialization. Destination cache
+    // slots are physical; the phase comes from the compact axis-major table.
+    std::vector<int32_t> mrope_positions(3 * rope_table_positions);
+    for (uint32_t row = 0; row < rope_table_positions; ++row) {
+        mrope_positions[row] = 1000 + static_cast<int32_t>(row);
+        mrope_positions[rope_table_positions + row] =
+            2000 + static_cast<int32_t>(row * 2);
+        mrope_positions[2 * rope_table_positions + row] =
+            3000 + static_cast<int32_t>(row * 3);
+    }
+    int32_t *d_mrope_positions = nullptr;
+    CUDA_CHECK(cudaMalloc(
+        &d_mrope_positions, mrope_positions.size() * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemcpy(
+        d_mrope_positions, mrope_positions.data(),
+        mrope_positions.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_scatter_cache, 0, bytes * 2));
+    if (!qw3::ported::launch_raw_k_scatter_rope_paged_batched_mrope(
+            d_scatter_cache, d_raw_half, true, 0, 1, rows, heads,
+            heads * head_dim, head_dim, rope_dim, d_to, d_ntok, d_pages4,
+            16, theta, /*raw_block_stride_elements=*/0, d_mrope_positions,
+            rope_table_positions, 0)) {
+        std::fprintf(stderr, "M-RoPE raw K scatter rejected test input\n");
+        return 1;
+    }
+    bake_half_to_half_mrope<<<dim3(rows, heads), head_dim>>>(
+        d_raw_half, d_scatter_ref, rows, heads, head_dim, rope_dim,
+        d_mrope_positions, scatter_to, rope_table_positions, theta);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(scatter_got.data(), d_scatter_cache + count,
+                          bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(scatter_ref.data(), d_scatter_ref, bytes,
+                          cudaMemcpyDeviceToHost));
+    if (std::memcmp(scatter_got.data(), scatter_ref.data(), bytes) != 0) {
+        std::fprintf(stderr,
+                     "FAIL M-RoPE raw scatter differs from direct bake\n");
+        return 1;
+    }
+
+    // Query-conditioned retrieval must invert those same three-axis phases.
+    float *d_query_rotated = nullptr, *d_query_deroped = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_query_rotated, count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_query_deroped, count * sizeof(float)));
+    bake_float_to_float_mrope<<<dim3(rows, heads), head_dim>>>(
+        d_raw, d_query_rotated, rows, heads, head_dim, rope_dim,
+        d_mrope_positions, scatter_to, rope_table_positions, theta);
+    if (!qw3::ported::launch_derope_query_multi_mrope(
+            d_query_deroped, d_query_rotated, heads * head_dim, head_dim,
+            rows, heads, head_dim, rope_dim, d_mrope_positions, scatter_to,
+            rope_table_positions, theta, 0)) {
+        std::fprintf(stderr, "M-RoPE query de-RoPE rejected test input\n");
+        return 1;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> query_deroped(count);
+    CUDA_CHECK(cudaMemcpy(query_deroped.data(), d_query_deroped,
+                          count * sizeof(float), cudaMemcpyDeviceToHost));
+    float query_max_abs = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+        query_max_abs = std::max(query_max_abs,
+            std::fabs(query_deroped[i] - raw[i]));
+    }
+    if (query_max_abs > 2.0e-5f) {
+        std::fprintf(stderr,
+                     "FAIL M-RoPE query round-trip max_abs=%.8f\n",
+                     query_max_abs);
+        return 1;
+    }
+    cudaFree(d_query_deroped);
+    cudaFree(d_query_rotated);
+    cudaFree(d_mrope_positions);
+    bake_half_to_half<<<dim3(rows, heads), head_dim>>>(
+        d_raw_half, d_scatter_ref, rows, heads, head_dim, rope_dim,
+        scatter_to, theta);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(scatter_ref.data(), d_scatter_ref, bytes,
+                          cudaMemcpyDeviceToHost));
 
     // Block-major assembly packs [block, layer, token, element]. Select layer
     // 1 from two blocks using a 2*block stride; block 1 must still match the

@@ -21,6 +21,7 @@ struct CpuVisionEncoding {
     };
 
     uint32_t embedding_dim = 0;
+    bool cache_hit = false;
     std::vector<Grid> grids;
     // Image-major contiguous float32 rows, sum(grid.rows) * embedding_dim.
     std::vector<float> embeddings;

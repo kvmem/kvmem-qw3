@@ -361,6 +361,23 @@ bool launch_raw_k_scatter_rope_paged_batched_fp8(
         const int32_t *to_base, const int32_t *n_tokens,
         const int32_t *page_indices, uint32_t page_size, float theta,
         uint64_t raw_block_stride_elements, cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_mrope(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, const int32_t *mrope_positions,
+        uint32_t mrope_position_stride, cudaStream_t stream);
+bool launch_raw_k_scatter_rope_paged_batched_mrope_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, const int32_t *mrope_positions,
+        uint32_t mrope_position_stride, cudaStream_t stream);
 bool launch_raw_k_scatter_rope_paged_batched_table(
         void *cache, const void *raw_k, bool is_fp16,
         uint64_t raw_element_offset, uint32_t n_blocks,
@@ -710,6 +727,18 @@ bool launch_derope_query_multi_f16(void *q_multi, const float *q,
                                    uint32_t n_heads, uint32_t head_dim,
                                    uint32_t rope_dim, int32_t start_pos,
                                    float theta, cudaStream_t stream);
+bool launch_derope_query_multi_mrope(
+        float *q_multi, const float *q, uint32_t q_token_stride,
+        uint32_t q_head_stride, uint32_t cnt, uint32_t n_heads,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *positions,
+        uint32_t position_offset, uint32_t position_stride, float theta,
+        cudaStream_t stream);
+bool launch_derope_query_multi_mrope_f16(
+        void *q_multi, const float *q, uint32_t q_token_stride,
+        uint32_t q_head_stride, uint32_t cnt, uint32_t n_heads,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *positions,
+        uint32_t position_offset, uint32_t position_stride, float theta,
+        cudaStream_t stream);
 }
 
 #if QW3_ENABLE_FLASHINFER
@@ -4800,6 +4829,14 @@ __global__ void rope_partial_positions_kernel(float *x,
     base[i + half] = x0 * s + x1 * c;
 }
 
+__device__ __forceinline__ uint32_t qwen_mrope_axis(uint32_t pair) {
+    // Qwen3.5/3.8 repeats mrope_section=[11,11,10] twice and interleaves
+    // temporal/height/width across one half of the rotary channels.
+    if ((pair % 3U) == 1U && pair < 33U) return 1;
+    if ((pair % 3U) == 2U && pair < 30U) return 2;
+    return 0;
+}
+
 __global__ void rope_partial_mrope_kernel(float *x,
                                           uint32_t n_units,
                                           uint32_t per_unit_stride,
@@ -4818,9 +4855,7 @@ __global__ void rope_partial_mrope_kernel(float *x,
     // transformers Qwen3.5 repeats [11,11,10] twice and then interleaves the
     // three axes. Expressed on one half of the rotary channels this is:
     // H for indices 1,4,...,31; W for 2,5,...,29; T otherwise.
-    uint32_t axis = 0;
-    if ((i % 3U) == 1U && i < 33U) axis = 1;
-    if ((i % 3U) == 2U && i < 30U) axis = 2;
+    const uint32_t axis = qwen_mrope_axis(i);
     const int32_t pos = positions[static_cast<uint64_t>(axis) * batch + b];
     float *base = x + static_cast<uint64_t>(b) * batch_stride +
                   unit * per_unit_stride;
@@ -5015,6 +5050,62 @@ __global__ void raw_k_scatter_rope_paged_batched_kernel(
                    static_cast<float>(rope_dim));
     float s, c;
     __sincosf(static_cast<float>(logical_pos) * inv_freq, &s, &c);
+    const float out = d < half ? (x0 * c - x1 * s)
+                               : (x0 * s + x1 * c);
+    dst[d] = static_cast<T>(out);
+}
+
+// Multimodal variant of immutable raw-K reconstruction. Physical placement is
+// still addressed by the scalar compact window slot, while the rotary phase is
+// selected independently from the exact temporal/height/width coordinate for
+// that slot. Text rows carry the same value on all axes and are therefore
+// exactly equivalent to the scalar kernel above.
+template <typename T>
+__global__ void raw_k_scatter_rope_paged_batched_mrope_kernel(
+        T *cache, const T *raw_k, uint64_t raw_element_offset,
+        uint64_t raw_block_stride_elements,
+        uint32_t max_n_tokens, uint32_t per_pos_size, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        const int32_t *mrope_positions, uint32_t mrope_position_stride) {
+    const uint32_t bz = blockIdx.z;
+    const uint32_t tok = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (tok >= static_cast<uint32_t>(n_tokens[bz]) || d >= head_dim) return;
+
+    const uint64_t block_stride = raw_block_stride_elements != 0
+        ? raw_block_stride_elements
+        : static_cast<uint64_t>(max_n_tokens) * per_pos_size;
+    const uint64_t src_row =
+        static_cast<uint64_t>(bz) * block_stride +
+        static_cast<uint64_t>(tok) * per_pos_size +
+        static_cast<uint64_t>(unit) * head_dim;
+    const T *src = raw_k + raw_element_offset + src_row;
+    const uint32_t logical_pos =
+        static_cast<uint32_t>(to_base[bz]) + tok;
+    const uint32_t physical_pos =
+        kv_physical_pos_from_pages(logical_pos, page_indices, page_size);
+    T *dst = cache + static_cast<uint64_t>(physical_pos) * per_pos_size +
+             static_cast<uint64_t>(unit) * head_dim;
+
+    if (d >= rope_dim) {
+        dst[d] = src[d];
+        return;
+    }
+    const uint32_t half = rope_dim / 2;
+    const uint32_t pair = d < half ? d : d - half;
+    const uint32_t axis = qwen_mrope_axis(pair);
+    const int32_t logical_rope_pos =
+        mrope_positions[static_cast<uint64_t>(axis) *
+                            mrope_position_stride + logical_pos];
+    const float x0 = static_cast<float>(src[pair]);
+    const float x1 = static_cast<float>(src[pair + half]);
+    const float inv_freq = __powf(
+        theta, -2.0f * static_cast<float>(pair) /
+                   static_cast<float>(rope_dim));
+    float s, c;
+    __sincosf(static_cast<float>(logical_rope_pos) * inv_freq, &s, &c);
     const float out = d < half ? (x0 * c - x1 * s)
                                : (x0 * s + x1 * c);
     dst[d] = static_cast<T>(out);
@@ -8871,6 +8962,49 @@ __global__ void derope_query_multi_kernel(void *q_multi,
         float s, c;
         __sincosf(ang, &s, &c);
         deroped = -row[d - half] * s + row[d] * c;
+    } else {
+        deroped = row[d];
+    }
+    const uint64_t out =
+        (static_cast<uint64_t>(r) * n_heads + qh) * head_dim + d;
+    if (output_fp16) {
+        static_cast<__half *>(q_multi)[out] = __float2half_rn(deroped);
+    } else {
+        static_cast<float *>(q_multi)[out] = deroped;
+    }
+}
+
+__global__ void derope_query_multi_mrope_kernel(
+        void *q_multi, const float *q, uint32_t q_token_stride,
+        uint32_t q_head_stride, uint32_t n_heads, uint32_t head_dim,
+        uint32_t rope_dim, const int32_t *positions,
+        uint32_t position_offset, uint32_t position_stride, float theta,
+        bool output_fp16) {
+    const uint32_t r = blockIdx.y;
+    const uint32_t qh = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    if (d >= head_dim) return;
+    const float *row = q + static_cast<uint64_t>(r) * q_token_stride +
+                       static_cast<uint64_t>(qh) * q_head_stride;
+    const uint32_t half = rope_dim / 2;
+    float deroped;
+    if (d < rope_dim) {
+        const uint32_t pair = d < half ? d : d - half;
+        const uint32_t axis = qwen_mrope_axis(pair);
+        const int32_t query_pos = positions[
+            static_cast<uint64_t>(axis) * position_stride +
+            position_offset + r];
+        const float inv_freq = __powf(
+            theta, -2.0f * static_cast<float>(pair) /
+                       static_cast<float>(rope_dim));
+        const float ang = static_cast<float>(query_pos) * inv_freq;
+        float s, c;
+        __sincosf(ang, &s, &c);
+        if (d < half) {
+            deroped = row[d] * c + row[d + half] * s;
+        } else {
+            deroped = -row[d - half] * s + row[d] * c;
+        }
     } else {
         deroped = row[d];
     }
@@ -16662,7 +16796,9 @@ public:
             const DeviceTensor &page_indices, uint32_t page_size,
             float theta, const DeviceTensor *rope_sincos,
             uint32_t rope_table_positions,
-            uint64_t raw_block_stride_elements) override {
+            uint64_t raw_block_stride_elements,
+            const DeviceTensor *mrope_positions,
+            uint32_t mrope_position_stride) override {
         if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return {};
         if (page_size == 0) {
             return {false,
@@ -16720,7 +16856,33 @@ public:
             }
             table_ptr = table.ptr;
         }
-        const bool launched = table_ptr
+        const int32_t *mrope_ptr = nullptr;
+        if (mrope_positions) {
+            const auto &positions = as_tensor(*mrope_positions);
+            if (mrope_position_stride == 0 ||
+                positions.elem_size != sizeof(int32_t) ||
+                positions.count < 3ULL * mrope_position_stride) {
+                return {false, "KVMem raw scatter M-RoPE position mismatch"};
+            }
+            mrope_ptr = positions.ptr_i32();
+        }
+        const bool launched = mrope_ptr
+            ? (is_fp8
+                ? ported::launch_raw_k_scatter_rope_paged_batched_mrope_fp8(
+                      dst_ptr, src_ptr, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, block_stride, mrope_ptr,
+                      mrope_position_stride, exec_stream_)
+                : ported::launch_raw_k_scatter_rope_paged_batched_mrope(
+                      dst_ptr, src_ptr, is_fp16, raw_element_offset, n_blocks,
+                      max_n_tokens, n_kv_heads, per_pos_size, head_dim,
+                      rope_dim, as_tensor(to_base).ptr_i32(),
+                      as_tensor(n_tokens).ptr_i32(), pages.ptr_i32(),
+                      page_size, theta, block_stride, mrope_ptr,
+                      mrope_position_stride, exec_stream_))
+            : table_ptr
             ? (is_fp8
                 ? ported::launch_raw_k_scatter_rope_paged_batched_table_fp8(
                       dst_ptr, src_ptr, raw_element_offset, n_blocks,
@@ -18672,6 +18834,38 @@ public:
             return {false, "derope_query_multi launch failed"};
         }
         return launch_status("cuda derope_query_multi_device");
+    }
+
+    DeviceStatus derope_query_multi_mrope_device(
+            DeviceTensor &q_multi, const DeviceTensor &q,
+            uint64_t q_elem_offset, uint64_t out_elem_offset,
+            uint32_t q_token_stride, uint32_t q_head_stride,
+            uint32_t cnt, uint32_t n_heads, uint32_t head_dim,
+            uint32_t rope_dim, const DeviceTensor &positions,
+            uint32_t position_offset, uint32_t position_stride,
+            float theta) override {
+        if (cnt == 0 || n_heads == 0 || head_dim == 0) return {};
+        auto &qm = as_tensor(q_multi);
+        const auto &qt = as_tensor(q);
+        const auto &pos = as_tensor(positions);
+        if (position_stride == 0 || position_offset + cnt > position_stride ||
+            pos.elem_size != sizeof(int32_t) ||
+            pos.count < 3ULL * position_stride) {
+            return {false, "derope query M-RoPE position mismatch"};
+        }
+        const bool ok = qm.is_fp16()
+            ? ported::launch_derope_query_multi_mrope_f16(
+                  qm.ptr_h() + out_elem_offset, qt.ptr + q_elem_offset,
+                  q_token_stride, q_head_stride, cnt, n_heads, head_dim,
+                  rope_dim, pos.ptr_i32(), position_offset,
+                  position_stride, theta, exec_stream_)
+            : ported::launch_derope_query_multi_mrope(
+                  qm.ptr + out_elem_offset, qt.ptr + q_elem_offset,
+                  q_token_stride, q_head_stride, cnt, n_heads, head_dim,
+                  rope_dim, pos.ptr_i32(), position_offset,
+                  position_stride, theta, exec_stream_);
+        if (!ok) return {false, "derope query M-RoPE launch failed"};
+        return launch_status("cuda derope_query_multi_mrope_device");
     }
 
     DeviceStatus kv_append_batch_paged_ragged_device(
@@ -21856,6 +22050,66 @@ bool launch_raw_k_scatter_rope_paged_batched_fp8(
 }
 
 template <typename T>
+bool launch_raw_k_scatter_rope_paged_batched_mrope_typed(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, const int32_t *mrope_positions,
+        uint32_t mrope_position_stride, cudaStream_t stream) {
+    if (n_blocks == 0 || max_n_tokens == 0 || n_kv_heads == 0) return true;
+    dim3 grid(max_n_tokens, n_kv_heads, n_blocks);
+    raw_k_scatter_rope_paged_batched_mrope_kernel<T>
+        <<<grid, head_dim, 0, stream>>>(
+            static_cast<T *>(cache), static_cast<const T *>(raw_k),
+            raw_element_offset, raw_block_stride_elements, max_n_tokens,
+            per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+            page_indices, page_size, theta, mrope_positions,
+            mrope_position_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_raw_k_scatter_rope_paged_batched_mrope(
+        void *cache, const void *raw_k, bool is_fp16,
+        uint64_t raw_element_offset, uint32_t n_blocks,
+        uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, const int32_t *mrope_positions,
+        uint32_t mrope_position_stride, cudaStream_t stream) {
+    if (is_fp16) {
+        return launch_raw_k_scatter_rope_paged_batched_mrope_typed<__half>(
+            cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+            n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+            page_indices, page_size, theta, raw_block_stride_elements,
+            mrope_positions, mrope_position_stride, stream);
+    }
+    return launch_raw_k_scatter_rope_paged_batched_mrope_typed<float>(
+        cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+        n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+        page_indices, page_size, theta, raw_block_stride_elements,
+        mrope_positions, mrope_position_stride, stream);
+}
+
+bool launch_raw_k_scatter_rope_paged_batched_mrope_fp8(
+        void *cache, const void *raw_k, uint64_t raw_element_offset,
+        uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
+        uint32_t per_pos_size, uint32_t head_dim, uint32_t rope_dim,
+        const int32_t *to_base, const int32_t *n_tokens,
+        const int32_t *page_indices, uint32_t page_size, float theta,
+        uint64_t raw_block_stride_elements, const int32_t *mrope_positions,
+        uint32_t mrope_position_stride, cudaStream_t stream) {
+    return launch_raw_k_scatter_rope_paged_batched_mrope_typed<
+        __nv_fp8_e4m3>(
+            cache, raw_k, raw_element_offset, n_blocks, max_n_tokens,
+            n_kv_heads, per_pos_size, head_dim, rope_dim, to_base, n_tokens,
+            page_indices, page_size, theta, raw_block_stride_elements,
+            mrope_positions, mrope_position_stride, stream);
+}
+
+template <typename T>
 bool launch_raw_k_scatter_rope_paged_batched_table_typed(
         void *cache, const void *raw_k, uint64_t raw_element_offset,
         uint32_t n_blocks, uint32_t max_n_tokens, uint32_t n_kv_heads,
@@ -24063,6 +24317,36 @@ bool launch_derope_query_multi_f16(void *q_multi, const float *q,
     derope_query_multi_kernel<<<grid, head_dim, 0, stream>>>(
         q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim, rope_dim,
         start_pos, theta, /*output_fp16=*/true);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_derope_query_multi_mrope(
+        float *q_multi, const float *q, uint32_t q_token_stride,
+        uint32_t q_head_stride, uint32_t cnt, uint32_t n_heads,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *positions,
+        uint32_t position_offset, uint32_t position_stride, float theta,
+        cudaStream_t stream) {
+    if (cnt == 0 || n_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_heads, cnt);
+    derope_query_multi_mrope_kernel<<<grid, head_dim, 0, stream>>>(
+        q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim,
+        rope_dim, positions, position_offset, position_stride, theta,
+        /*output_fp16=*/false);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool launch_derope_query_multi_mrope_f16(
+        void *q_multi, const float *q, uint32_t q_token_stride,
+        uint32_t q_head_stride, uint32_t cnt, uint32_t n_heads,
+        uint32_t head_dim, uint32_t rope_dim, const int32_t *positions,
+        uint32_t position_offset, uint32_t position_stride, float theta,
+        cudaStream_t stream) {
+    if (cnt == 0 || n_heads == 0 || head_dim == 0) return true;
+    dim3 grid(n_heads, cnt);
+    derope_query_multi_mrope_kernel<<<grid, head_dim, 0, stream>>>(
+        q_multi, q, q_token_stride, q_head_stride, n_heads, head_dim,
+        rope_dim, positions, position_offset, position_stride, theta,
+        /*output_fp16=*/true);
     return cudaGetLastError() == cudaSuccess;
 }
 

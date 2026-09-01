@@ -322,6 +322,11 @@ struct GenerationOptions {
         std::vector<float> embedding;
     };
     std::vector<InputEmbeddingOverride> input_embedding_overrides;
+    // Stable identity of the request's ordered visual inputs. Text-only
+    // requests use zero. Prefix/session caches must match this in addition to
+    // token IDs because two different images intentionally use the same
+    // synthetic token-ID layout.
+    uint64_t input_embedding_fingerprint = 0;
     // Exact dense-prompt M-RoPE coordinates, one entry per prompt token. This
     // is populated only for multimodal requests. KVMem keeps visual spans
     // atomic and can replay their synthetic embedding IDs; compact re-RoPE

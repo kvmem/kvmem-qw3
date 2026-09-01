@@ -533,6 +533,7 @@ std::string render_content(const json &content) {
 struct PreparedVisionRequest {
     detail::CpuVisionEncoding encoded;
     std::vector<std::pair<uint32_t, uint32_t>> token_spans;
+    uint64_t fingerprint = 0;
 
     bool active() const { return !encoded.grids.empty(); }
 };
@@ -616,6 +617,25 @@ bool prepare_vision_messages(json &messages,
         return false;
     }
 
+    // Hash the ordered source payloads rather than the projected embeddings:
+    // this is deterministic across worker/kernel implementations and avoids a
+    // second pass over the much larger projected tensor. It is cache identity,
+    // not an authentication primitive.
+    uint64_t fingerprint = 1469598103934665603ULL;
+    auto mix = [&](std::string_view value) {
+        for (unsigned char byte : value) {
+            fingerprint ^= static_cast<uint64_t>(byte);
+            fingerprint *= 1099511628211ULL;
+        }
+        fingerprint ^= 0xffu;
+        fingerprint *= 1099511628211ULL;
+    };
+    for (const auto &image : images) {
+        mix(image.media_type);
+        mix(image.base64_data);
+    }
+    prepared.fingerprint = fingerprint != 0 ? fingerprint : 1;
+
     size_t image_index = 0;
     for (json &message : messages) {
         if (!message.is_object() || !message.contains("content") ||
@@ -673,6 +693,7 @@ bool finalize_vision_tokens(
     size_t embedding_row = 0;
     size_t search = 0;
     generation.input_embedding_overrides.clear();
+    generation.input_embedding_fingerprint = prepared.fingerprint;
     generation.input_mrope_positions.assign(tokens.size(), {0, 0, 0});
     prepared.token_spans.clear();
 
@@ -2368,9 +2389,23 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             worker = (std::filesystem::path(QW3_SOURCE_DIR) /
                       "scripts/qw3_vision_cpu_worker.py").string();
         }
-        const uint32_t threads = engine.vision_cpu_threads > 0
+        uint32_t threads = engine.vision_cpu_threads > 0
             ? static_cast<uint32_t>(engine.vision_cpu_threads)
             : std::max<uint32_t>(1, std::thread::hardware_concurrency());
+        if (engine.vision_cpu_threads <= 0) {
+            if (const char *value = std::getenv("QW3_VISION_CPU_THREADS")) {
+                try {
+                    const unsigned long parsed = std::stoul(value);
+                    if (parsed > 0 &&
+                        parsed <= std::numeric_limits<uint32_t>::max()) {
+                        threads = static_cast<uint32_t>(parsed);
+                    }
+                } catch (...) {
+                    throw std::runtime_error(
+                        "QW3_VISION_CPU_THREADS must be a positive integer");
+                }
+            }
+        }
         std::cerr << "[qw3-serve] loading CPU vision frontend model="
                   << engine.vision_cpu_model_path << " threads=" << threads
                   << "\n";
@@ -4857,19 +4892,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
 
         if (prepared_vision.active()) {
-            if (kvmem_session_request || kvmem_cache_request ||
-                transcript_replay) {
-                set_error_response(
-                    res, 400,
-                    "multimodal V1 supports standalone requests only; "
-                    "KVMem session/cache/transcript replay is not yet "
-                    "supported");
-                return;
-            }
             if (req.contains("kvmem_round_padding")) {
                 set_error_response(
                     res, 400,
-                    "multimodal V1 cannot be combined with kvmem_round_padding");
+                    "multimodal input cannot be combined with "
+                    "kvmem_round_padding because padding would invalidate "
+                    "the explicit M-RoPE/embedding token map");
                 return;
             }
             std::string finalize_error;
@@ -4943,6 +4971,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << prepared_vision.encoded.grids.size()
                       << " visual_tokens="
                       << g.input_embedding_overrides.size()
+                      << " vision_cache_hit="
+                      << (prepared_vision.encoded.cache_hit ? 1 : 0)
                       << " mandatory_spans="
                       << prepared_vision.token_spans.size() << "\n";
         }

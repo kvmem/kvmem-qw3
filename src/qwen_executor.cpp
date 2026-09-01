@@ -987,7 +987,10 @@ void QwenExecutor::set_input_embedding_overrides(
     input_embedding_override_index_.clear();
     input_multimodal_prompt_tokens_.clear();
     input_mrope_positions_.clear();
+    input_compact_mrope_positions_.clear();
+    input_compact_mrope_valid_.clear();
     input_mrope_decode_delta_ = 0;
+    prepared_input_mrope_valid_ = false;
     if (overrides.empty()) return;
     if (prompt_tokens.empty() || mrope_positions.size() != prompt_tokens.size()) {
         throw std::runtime_error(
@@ -1003,6 +1006,8 @@ void QwenExecutor::set_input_embedding_overrides(
     }
     input_multimodal_prompt_tokens_ = prompt_tokens;
     input_mrope_positions_ = mrope_positions;
+    input_compact_mrope_positions_.resize(prompt_tokens.size());
+    input_compact_mrope_valid_.assign(prompt_tokens.size(), 0);
     const auto &last = input_mrope_positions_.back();
     const uint32_t next = std::max({last[0], last[1], last[2]}) + 1u;
     input_mrope_decode_delta_ = static_cast<int64_t>(next) -
@@ -1065,10 +1070,31 @@ void QwenExecutor::overwrite_input_embeddings_batch(DeviceTensor &dst,
 bool QwenExecutor::prepare_input_mrope_batch(const uint32_t *tokens,
                                             uint32_t batch,
                                             uint32_t logical_base) {
-    if (input_mrope_positions_.empty() ||
-        static_cast<uint64_t>(logical_base) + batch >
-            input_multimodal_prompt_tokens_.size()) {
-        return false;
+    if (input_mrope_positions_.empty() || batch == 0) return false;
+    if (static_cast<uint64_t>(logical_base) + batch >
+        input_multimodal_prompt_tokens_.size()) {
+        if (!kvmem_active_) return false;
+        if (!input_mrope_positions_device_ ||
+            input_mrope_positions_capacity_ < batch) {
+            input_mrope_positions_device_ = backend_.tensor_i32(
+                3ULL * batch, "input_mrope_positions");
+            input_mrope_positions_capacity_ = batch;
+        }
+        input_mrope_positions_host_.resize(3ULL * batch);
+        for (uint32_t axis = 0; axis < 3; ++axis) {
+            for (uint32_t i = 0; i < batch; ++i) {
+                input_mrope_positions_host_[
+                    static_cast<size_t>(axis) * batch + i] =
+                    static_cast<int32_t>(window_mrope_next_ + i);
+            }
+        }
+        require_status(backend_.copy_i32_from_host(
+            *input_mrope_positions_device_, 0,
+            input_mrope_positions_host_.data(), 3ULL * batch));
+        window_mrope_next_ += batch;
+        prepared_input_mrope_next_ = window_mrope_next_;
+        prepared_input_mrope_valid_ = true;
+        return true;
     }
     for (uint32_t i = 0; i < batch; ++i) {
         if (tokens[i] != input_multimodal_prompt_tokens_[logical_base + i]) {
@@ -1082,17 +1108,81 @@ bool QwenExecutor::prepare_input_mrope_batch(const uint32_t *tokens,
         input_mrope_positions_capacity_ = batch;
     }
     input_mrope_positions_host_.resize(3ULL * batch);
+    bool compact_positions_ready = kvmem_active_;
+    if (compact_positions_ready) {
+        for (uint32_t i = 0; i < batch; ++i) {
+            if (!input_compact_mrope_valid_[logical_base + i]) {
+                compact_positions_ready = false;
+                break;
+            }
+        }
+    }
+    if (kvmem_active_ && !compact_positions_ready) {
+        const auto &first = input_mrope_positions_[logical_base];
+        if (!window_mrope_append_active_ ||
+            logical_base != window_mrope_append_source_next_) {
+            for (uint32_t axis = 0; axis < 3; ++axis) {
+                window_mrope_append_delta_[axis] =
+                    static_cast<int64_t>(window_mrope_next_) -
+                    static_cast<int64_t>(first[axis]);
+            }
+            window_mrope_append_active_ = true;
+        }
+        uint32_t next = window_mrope_next_;
+        for (uint32_t i = 0; i < batch; ++i) {
+            std::array<uint32_t, 3> compact{};
+            for (uint32_t axis = 0; axis < 3; ++axis) {
+                const int64_t value =
+                    static_cast<int64_t>(
+                        input_mrope_positions_[logical_base + i][axis]) +
+                    window_mrope_append_delta_[axis];
+                if (value < 0 || value > std::numeric_limits<int32_t>::max()) {
+                    throw std::runtime_error(
+                        "compact multimodal RoPE position is out of range");
+                }
+                compact[axis] = static_cast<uint32_t>(value);
+                next = std::max(next, compact[axis] + 1u);
+            }
+            input_compact_mrope_positions_[logical_base + i] = compact;
+            input_compact_mrope_valid_[logical_base + i] = 1;
+        }
+        window_mrope_append_source_next_ = logical_base + batch;
+        window_mrope_next_ = next;
+    }
     for (uint32_t axis = 0; axis < 3; ++axis) {
         for (uint32_t i = 0; i < batch; ++i) {
+            const auto &position = kvmem_active_
+                ? input_compact_mrope_positions_[logical_base + i]
+                : input_mrope_positions_[logical_base + i];
             input_mrope_positions_host_[static_cast<size_t>(axis) * batch + i] =
-                static_cast<int32_t>(
-                    input_mrope_positions_[logical_base + i][axis]);
+                static_cast<int32_t>(position[axis]);
         }
     }
     require_status(backend_.copy_i32_from_host(
         *input_mrope_positions_device_, 0,
         input_mrope_positions_host_.data(), 3ULL * batch));
+    prepared_input_mrope_next_ = kvmem_active_
+        ? window_mrope_next_
+        : std::max({
+              input_mrope_positions_[logical_base + batch - 1][0],
+              input_mrope_positions_[logical_base + batch - 1][1],
+              input_mrope_positions_[logical_base + batch - 1][2]}) + 1u;
+    prepared_input_mrope_valid_ = true;
     return true;
+}
+
+std::array<uint32_t, 3> QwenExecutor::source_multimodal_rope_position(
+        uint32_t pos) const {
+    if (pos < input_mrope_positions_.size()) {
+        return input_mrope_positions_[pos];
+    }
+    const int64_t adjusted =
+        static_cast<int64_t>(pos) + input_mrope_decode_delta_;
+    if (adjusted < 0 || adjusted > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error("multimodal source RoPE position overflow");
+    }
+    const uint32_t value = static_cast<uint32_t>(adjusted);
+    return {value, value, value};
 }
 
 uint32_t QwenExecutor::adjusted_multimodal_rope_position(uint32_t pos) const {
@@ -1317,6 +1407,14 @@ void QwenExecutor::reset_state() {
     last_forward_rows_ = 0;
     window_pages_host_.clear();
     window_page_count_ = 0;
+    window_mrope_positions_host_.clear();
+    window_mrope_next_ = 0;
+    window_mrope_append_active_ = false;
+    window_mrope_append_source_next_ = 0;
+    window_mrope_append_delta_ = {0, 0, 0};
+    prepared_input_mrope_valid_ = false;
+    std::fill(input_compact_mrope_valid_.begin(),
+              input_compact_mrope_valid_.end(), 0);
     mtp_window_pages_host_.clear();
     mtp_window_page_count_ = 0;
     window_query_pos_ = 0;
@@ -4322,7 +4420,10 @@ void QwenExecutor::kvmem_materialize_raw_k(
                     *bs_remap_ntok_dev_, *window_pages_device_,
                     kv_pages_.page_size, cfg.rope_theta,
                     kvmem_rope_sincos_.get(),
-                    kvmem_rope_table_positions_, cache_block_elems));
+                    kvmem_rope_table_positions_, cache_block_elems,
+                    window_mrope_positions_host_.empty()
+                        ? nullptr : window_mrope_positions_device_.get(),
+                    window_query_pos_));
         }
         kvmem_assembly_raw_gpu_hit_blocks_ += n;
         kvmem_assembly_raw_gpu_hit_bytes_ +=
@@ -4638,7 +4739,10 @@ void QwenExecutor::kvmem_materialize_raw_k(
                     kv_pages_.page_size, cfg.rope_theta,
                     kvmem_rope_sincos_.get(),
                     kvmem_rope_table_positions_,
-                    raw_block_stride));
+                    raw_block_stride,
+                    window_mrope_positions_host_.empty()
+                        ? nullptr : window_mrope_positions_device_.get(),
+                    window_query_pos_));
         }
         if (pipeline_slot) {
             require_status(backend_.record_execution_fence(
@@ -5006,7 +5110,11 @@ void QwenExecutor::kvmem_materialize_raw_mtp_k(
                 *mtp_window_pages_device_,
                 mtp_kv_pages_.page_size, cfg.rope_theta,
                 kvmem_rope_sincos_.get(),
-                kvmem_rope_table_positions_));
+                kvmem_rope_table_positions_,
+                /*raw_block_stride_elements=*/0,
+                window_mrope_positions_host_.empty()
+                    ? nullptr : window_mrope_positions_device_.get(),
+                window_query_pos_));
         if (pipeline_slot) {
             require_status(backend_.record_execution_fence(
                 pipeline_slot->compute_done));
@@ -5706,8 +5814,11 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             // RoPE position: under the no-re-RoPE experiment the window keeps true
             // positions, so the new token's Q/K rotate at the TRUE position_ while
             // the append-slot and (length-based) attention mask stay on attn_pos.
-            const uint32_t rope_pos = adjusted_multimodal_rope_position(
-                (bs && kvmem_no_rerope_) ? position_ : attn_pos);
+            const uint32_t rope_pos =
+                bs && !kvmem_no_rerope_ && !input_mrope_positions_.empty()
+                    ? window_mrope_next_
+                    : adjusted_multimodal_rope_position(
+                          (bs && kvmem_no_rerope_) ? position_ : attn_pos);
             if (kvmem_mtp_local_positions_ && cfg.n_ctx_train > 0 &&
                 rope_pos >= cfg.n_ctx_train) {
                 throw std::runtime_error(
@@ -5909,7 +6020,10 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
         // eager begin/end pairing here is always correct.
         require_status(backend_.end());
         position_++;
-        if (kvmem_active_) window_query_pos_++;
+        if (kvmem_active_) {
+            window_query_pos_++;
+            if (!input_mrope_positions_.empty()) ++window_mrope_next_;
+        }
         report.ok = true;
         return report;
     }
@@ -5936,7 +6050,10 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
     require_status(backend_.end());
 
     position_++;
-    if (kvmem_active_) window_query_pos_++;
+    if (kvmem_active_) {
+        window_query_pos_++;
+        if (!input_mrope_positions_.empty()) ++window_mrope_next_;
+    }
     if (kvmem_active_ && !kvmem_query_probe_guard_active() &&
         kvmem_attn_trace_enabled()) {
         ++kvmem_attn_trace_seen_tokens_;
@@ -6264,6 +6381,7 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         state_checkpoints->kvmem_active = bs_at_entry;
         state_checkpoints->window_base_query_pos = window_query_pos_;
         state_checkpoints->window_base_page_count = window_page_count_;
+        state_checkpoints->window_base_mrope_next = window_mrope_next_;
         if (state_checkpoints->recurrent_states.size() != recurrent_states_.size()) {
             state_checkpoints->recurrent_states.resize(recurrent_states_.size());
         }
@@ -6670,7 +6788,10 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 }
                 kvmem_capture_query_multi(
                     static_cast<uint32_t>(provisional_slot), chunk_off,
-                    batch, base_pos, rope_base_pos, q_stride_buf);
+                    batch, base_pos, rope_base_pos, q_stride_buf,
+                    use_input_mrope ? input_mrope_positions_device_.get()
+                                    : nullptr,
+                    use_input_mrope ? batch : 0);
                 if (std::getenv("QW3_KVMEM_TRACE")) {
                     std::fprintf(
                         stderr,
@@ -6731,7 +6852,11 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                     if (kvmem_query_end_ > kvmem_query_begin_) {
                         kvmem_capture_query_multi(
                             static_cast<uint32_t>(slot), chunk_off, batch,
-                            base_pos, rope_base_pos, q_stride_buf);
+                            base_pos, rope_base_pos, q_stride_buf,
+                            use_input_mrope
+                                ? input_mrope_positions_device_.get()
+                                : nullptr,
+                            use_input_mrope ? batch : 0);
                     }
                     // Build the full-coverage per-layer content index incrementally
                     // (#91): index EVERY block of this chunk from the freshly-RoPE'd
@@ -7078,9 +7203,11 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
     const bool window_mode = kvmem_active_;
     const uint32_t rope_limit = model_.config().n_ctx_train;
     if (window_mode && rope_limit > 0) {
-        if (window_query_pos_ >= rope_limit) return reports;
+        const uint32_t rope_base = input_mrope_positions_.empty()
+            ? window_query_pos_ : window_mrope_next_;
+        if (rope_base >= rope_limit) return reports;
         max_tokens = std::min<uint32_t>(
-            max_tokens, rope_limit - window_query_pos_);
+            max_tokens, rope_limit - rope_base);
     }
     const uint32_t pre_window_pages = mtp_window_page_count_;
     uint32_t current = token_id;
@@ -7093,7 +7220,9 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
             mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
             kvmem_extend_mtp_window_for_decode_n(i + 1, position_);
             const uint32_t win_pos = window_query_pos_ + i;
-            report = forward_mtp_draft_from(current, h_input, win_pos, win_pos,
+            const uint32_t rope_pos = input_mrope_positions_.empty()
+                ? win_pos : window_mrope_next_ + i;
+            report = forward_mtp_draft_from(current, h_input, rope_pos, win_pos,
                                             win_pos + 1, /*compute_logits=*/true,
                                             /*argmax_out=*/nullptr,
                                             /*argmax_out_index=*/0,
@@ -7144,9 +7273,11 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
     const bool window_mode = kvmem_active_;
     const uint32_t rope_limit = model_.config().n_ctx_train;
     if (window_mode && rope_limit > 0) {
-        if (window_query_pos_ >= rope_limit) return {};
+        const uint32_t rope_base = input_mrope_positions_.empty()
+            ? window_query_pos_ : window_mrope_next_;
+        if (rope_base >= rope_limit) return {};
         max_tokens = std::min<uint32_t>(
-            max_tokens, rope_limit - window_query_pos_);
+            max_tokens, rope_limit - rope_base);
     }
     const uint32_t pre_window_pages = mtp_window_page_count_;
     std::vector<NativeExecutorReport> reports;
@@ -7156,19 +7287,22 @@ std::vector<NativeExecutorReport> QwenExecutor::forward_mtp_draft_chain_with_pre
         if (cache_pos >= kv_ctx_size_) break;
         const DeviceTensor &h_input = (i == 0) ? *h_ : *mtp_h_;
         const DeviceArgmaxBuffer *token_source = i == 0 ? nullptr : mtp_draft_argmaxes_.get();
-        uint32_t draft_pos = cache_pos;
+        uint32_t draft_rope_pos = cache_pos;
+        uint32_t draft_cache_pos = cache_pos;
         bool window_frame = false;
         if (window_mode) {
             mtp_kv_pages_.ensure_pages(backend_, kv_ctx_size_, cache_pos, 1);
             kvmem_extend_mtp_window_for_decode_n(i + 1, position_);
-            draft_pos = window_query_pos_ + i;
+            draft_cache_pos = window_query_pos_ + i;
+            draft_rope_pos = input_mrope_positions_.empty()
+                ? window_query_pos_ + i : window_mrope_next_ + i;
             window_frame = true;
         }
         NativeExecutorReport report = forward_mtp_draft_from(token_id,
                                                              h_input,
-                                                             draft_pos,
-                                                             draft_pos,
-                                                             draft_pos + 1,
+                                                             draft_rope_pos,
+                                                             draft_cache_pos,
+                                                             draft_cache_pos + 1,
                                                              /*compute_logits=*/true,
                                                              mtp_draft_argmaxes_.get(),
                                                              i,
@@ -7496,6 +7630,11 @@ void QwenExecutor::capture_transient_state(StateSnapshot &snapshot) {
     snapshot.kvmem_active = kvmem_active_;
     snapshot.window_query_pos = window_query_pos_;
     snapshot.window_page_count = window_page_count_;
+    snapshot.window_mrope_next = window_mrope_next_;
+    snapshot.window_mrope_append_active = window_mrope_append_active_;
+    snapshot.window_mrope_append_source_next =
+        window_mrope_append_source_next_;
+    snapshot.window_mrope_append_delta = window_mrope_append_delta_;
     if (h_) {
         if (!snapshot.h || snapshot.h->count != h_->count ||
             snapshot.h->dtype != h_->dtype) {
@@ -7600,6 +7739,11 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
     if (snapshot.kvmem_active) {
         window_query_pos_ = snapshot.window_query_pos;
         window_page_count_ = snapshot.window_page_count;
+        window_mrope_next_ = snapshot.window_mrope_next;
+        window_mrope_append_active_ = snapshot.window_mrope_append_active;
+        window_mrope_append_source_next_ =
+            snapshot.window_mrope_append_source_next;
+        window_mrope_append_delta_ = snapshot.window_mrope_append_delta;
         if (window_pages_host_.size() > window_page_count_) {
             window_pages_host_.resize(window_page_count_);
         }
@@ -7621,6 +7765,10 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
         // restores; this is the final state-fidelity guard for all other
         // snapshot users (including speculative rollback).
         window_query_pos_ = 0;
+        window_mrope_next_ = 0;
+        window_mrope_append_active_ = false;
+        window_mrope_append_source_next_ = 0;
+        window_mrope_append_delta_ = {0, 0, 0};
         window_page_count_ = 0;
         window_pages_host_.clear();
         mtp_window_page_count_ = 0;
@@ -7804,6 +7952,23 @@ void QwenExecutor::kvmem_begin_query_replay(
         // replay-suffix page is a window tail. Shortening the valid host/count
         // prefix is sufficient; the device page table already contains the
         // identical context prefix and kernels never read beyond the count.
+        const uint32_t old_window_tokens = window_query_pos_;
+        if (!window_mrope_positions_host_.empty()) {
+            uint32_t next_mrope = 0;
+            for (uint32_t axis = 0; axis < 3; ++axis) {
+                for (uint32_t pos = 0; pos < preserved_context_tokens; ++pos) {
+                    next_mrope = std::max(
+                        next_mrope,
+                        static_cast<uint32_t>(
+                            window_mrope_positions_host_[
+                                static_cast<size_t>(axis) * old_window_tokens +
+                                pos]) + 1u);
+                }
+            }
+            window_mrope_next_ = next_mrope;
+            window_mrope_append_active_ = false;
+            window_mrope_append_source_next_ = 0;
+        }
         window_query_pos_ = preserved_context_tokens;
         window_page_count_ = preserved_context_pages;
         window_pages_host_.resize(window_page_count_);
@@ -7912,6 +8077,13 @@ void QwenExecutor::kvmem_begin_query_replay(
     g_indexed_blocks_ = 0;
     g_kbar_multi_ready_ = false;
     g_kbar_multi_blocks_ = 0;
+    // Final-query replay rebuilds Q against the selected context, but the Q
+    // suffix is not new historical content. Cap the incremental content-index
+    // authority at the aligned replay boundary. Without this cap Adaptive and
+    // Fixed4 try to append the mid-block query segment to their block-atomic
+    // packed index and fail whenever query_begin is not block aligned.
+    kvmem_qc_prompt_tokens_ = boundary.position;
+    kvmem_qc_total_blocks_ = boundary.position / bt;
     kvmem_qc_captured_tokens_ = boundary.position;
     kvmem_qc_captured_blocks_ = boundary.position / bt;
 
@@ -9064,6 +9236,11 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_active_ = false;
     window_pages_host_.clear();
     window_page_count_ = 0;
+    window_mrope_positions_host_.clear();
+    window_mrope_next_ = 0;
+    window_mrope_append_active_ = false;
+    window_mrope_append_source_next_ = 0;
+    window_mrope_append_delta_ = {0, 0, 0};
     mtp_window_pages_host_.clear();
     mtp_window_page_count_ = 0;
     window_query_pos_ = 0;
@@ -13575,6 +13752,106 @@ void QwenExecutor::kvmem_stage_out(
     }
 }
 
+void QwenExecutor::build_kvmem_window_mrope_positions(
+        const KvMemPlan &plan) {
+    window_mrope_append_active_ = false;
+    window_mrope_append_source_next_ = 0;
+    window_mrope_append_delta_ = {0, 0, 0};
+    prepared_input_mrope_valid_ = false;
+    if (input_mrope_positions_.empty()) {
+        window_mrope_positions_host_.clear();
+        window_mrope_next_ = plan.total_window_tokens;
+        return;
+    }
+    const uint32_t total = plan.total_window_tokens;
+    window_mrope_positions_host_.assign(3ULL * total, 0);
+    std::fill(input_compact_mrope_valid_.begin(),
+              input_compact_mrope_valid_.end(), 0);
+    const auto &blocks = block_store_->blocks();
+    uint32_t cursor = 0;
+    size_t begin = 0;
+    while (begin < plan.remaps.size()) {
+        size_t end = begin + 1;
+        uint32_t source_end =
+            blocks[plan.remaps[begin].block_id].orig_pos_start +
+            plan.remaps[begin].n_tokens;
+        uint32_t destination_end =
+            static_cast<uint32_t>(plan.remaps[begin].to_base) +
+            plan.remaps[begin].n_tokens;
+        while (end < plan.remaps.size()) {
+            const KvMemRemap &next = plan.remaps[end];
+            const KvMemBlock &next_block = blocks[next.block_id];
+            if (next_block.orig_pos_start != source_end ||
+                static_cast<uint32_t>(next.to_base) != destination_end) {
+                break;
+            }
+            source_end += next.n_tokens;
+            destination_end += next.n_tokens;
+            ++end;
+        }
+
+        const KvMemBlock &first_block =
+            blocks[plan.remaps[begin].block_id];
+        const auto first_source = source_multimodal_rope_position(
+            first_block.orig_pos_start);
+        std::array<int64_t, 3> delta{};
+        for (uint32_t axis = 0; axis < 3; ++axis) {
+            delta[axis] = static_cast<int64_t>(cursor) -
+                          static_cast<int64_t>(first_source[axis]);
+        }
+        uint32_t group_next = cursor;
+        for (size_t ri = begin; ri < end; ++ri) {
+            const KvMemRemap &rm = plan.remaps[ri];
+            const KvMemBlock &block = blocks[rm.block_id];
+            if (rm.to_base < 0 ||
+                static_cast<uint64_t>(rm.to_base) + rm.n_tokens > total) {
+                throw std::runtime_error(
+                    "multimodal KVMem remap exceeds compact window");
+            }
+            for (uint32_t tok = 0; tok < rm.n_tokens; ++tok) {
+                const uint32_t source_pos = block.orig_pos_start + tok;
+                const uint32_t destination_pos =
+                    static_cast<uint32_t>(rm.to_base) + tok;
+                const auto source =
+                    source_multimodal_rope_position(source_pos);
+                std::array<uint32_t, 3> compact{};
+                for (uint32_t axis = 0; axis < 3; ++axis) {
+                    const int64_t value =
+                        static_cast<int64_t>(source[axis]) + delta[axis];
+                    if (value < 0 ||
+                        value > std::numeric_limits<int32_t>::max()) {
+                        throw std::runtime_error(
+                            "selected multimodal RoPE position is out of range");
+                    }
+                    compact[axis] = static_cast<uint32_t>(value);
+                    window_mrope_positions_host_[
+                        static_cast<size_t>(axis) * total + destination_pos] =
+                        static_cast<int32_t>(value);
+                    group_next = std::max(group_next, compact[axis] + 1u);
+                }
+                if (source_pos < input_compact_mrope_positions_.size()) {
+                    input_compact_mrope_positions_[source_pos] = compact;
+                    input_compact_mrope_valid_[source_pos] = 1;
+                }
+            }
+        }
+        cursor = group_next;
+        begin = end;
+    }
+    window_mrope_next_ = cursor;
+    if (!window_mrope_positions_device_ ||
+        window_mrope_positions_capacity_ < total) {
+        window_mrope_positions_device_ = backend_.tensor_i32(
+            3ULL * total, "kvmem_window_mrope_positions");
+        window_mrope_positions_capacity_ = total;
+    }
+    if (total > 0) {
+        require_status(backend_.copy_i32_from_host(
+            *window_mrope_positions_device_, 0,
+            window_mrope_positions_host_.data(), 3ULL * total));
+    }
+}
+
 void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     const bool tm = kvmem_measure_timing_flag();
     const uint64_t t_asm0 = tm ? kvmem_steady_ns() : 0;
@@ -13592,8 +13869,14 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     const uint32_t page_size = kv_pages_.page_size;
     const uint32_t per_pos =
         static_cast<uint32_t>(cfg.n_kv_heads) * cfg.head_dim;
+    build_kvmem_window_mrope_positions(plan);
+    const bool multimodal_window = !input_mrope_positions_.empty();
+    if (multimodal_window && !kvmem_immutable_source_k_) {
+        throw std::runtime_error(
+            "multimodal KVMem requires immutable raw-K reconstruction");
+    }
     if (kvmem_mtp_local_positions_ && cfg.n_ctx_train > 0 &&
-        static_cast<uint64_t>(plan.total_window_tokens) +
+        static_cast<uint64_t>(window_mrope_next_) +
                 block_store_->config().gen_budget >
             cfg.n_ctx_train) {
         throw std::runtime_error(
@@ -13623,6 +13906,11 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     // So gate the mirror on the MTP cache covering all registered blocks; when it
     // lags, skip the build (the stale mirror is never read before the rebuild).
     const bool build_mtp_window = kvmem_mtp_prefix_covers_registered();
+    if (multimodal_window && build_mtp_window &&
+        !kvmem_mtp_local_positions_) {
+        throw std::runtime_error(
+            "multimodal KVMem MTP requires local-position raw-K mode");
+    }
     if (build_mtp_window) mtp_window_pages_host_.clear();
     const auto &blocks = block_store_->blocks();
     // Per-window-block metadata for the cumulative-attention selection signal:
@@ -13704,6 +13992,12 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
     const uint32_t standard_remap_layers =
         count_standard_attention_layers(cfg, weights_.n_layers());
     for (const KvMemRemap &rm : plan.remaps) {
+        if (multimodal_window) {
+            // A scalar delta re-RoPE cannot represent visual H/W coordinates.
+            // Rebuild every selected row from the immutable position-free K.
+            raw_refreshes.push_back(&rm);
+            continue;
+        }
         if (rm.skip && rm.raw_refresh) {
             throw std::runtime_error(
                 "KVMem invalid remap: raw-K refresh was hidden by skip");
@@ -13815,7 +14109,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
             const int64_t mtp_from = mtp_baked_pos_[rm.block_id];
             const bool cold_rebuild =
                 !rm.working_k_resident || rm.raw_refresh;
-            if (!cold_rebuild &&
+            if (!multimodal_window && !cold_rebuild &&
                 mtp_from == static_cast<int64_t>(rm.to_base)) {
                 continue;
             }
@@ -13825,6 +14119,7 @@ void QwenExecutor::kvmem_assemble(const KvMemPlan &plan) {
                  static_cast<uint64_t>(mtp_from) + rm.n_tokens >
                      cfg.n_ctx_train);
             const bool exact_rebuild =
+                multimodal_window ||
                 !kvmem_mtp_incremental_assembly_ ||
                 kvmem_no_rerope_ ||
                 cold_rebuild ||
@@ -16311,13 +16606,28 @@ void QwenExecutor::kvmem_set_query_span(uint32_t begin, uint32_t end,
     // Query replay ranks historical blocks only. Its query span remains in the
     // full prompt coordinate frame, while the content index deliberately ends
     // at the query boundary so it is complete before the final replay begins.
-    const uint32_t indexed_tokens = index_tokens > 0 ? index_tokens : prompt_tokens;
+    uint32_t indexed_tokens = index_tokens > 0 ? index_tokens : prompt_tokens;
     if (indexed_tokens == 0) return;
     const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
+    // An explicit index boundary separates sealed historical content from a
+    // query/replay suffix. Adaptive and Fixed4 are block-atomic packed
+    // representations: they cannot merge a later suffix that starts inside an
+    // already packed block. Canonicalize every caller's explicit boundary here
+    // so transcript, guided-query, API-session, and final-query paths cannot
+    // accidentally publish a partial historical block. The model still
+    // prefills the complete prompt; only scorer-index ownership is shortened.
+    const bool block_atomic_prototypes =
+        kvmem_adaptive_prototypes() ||
+        block_store_->config().prototype_mode ==
+            KvMemPrototypeMode::KeyDirectionFixed4;
+    if (index_tokens > 0 && block_atomic_prototypes) {
+        indexed_tokens = (indexed_tokens / bt) * bt;
+        if (indexed_tokens == 0) return;
+    }
     const uint32_t total_blocks = (indexed_tokens + bt - 1) / bt;
     if (total_blocks == 0) return;
     kvmem_qc_total_blocks_ = total_blocks;
-    kvmem_qc_prompt_tokens_ = prompt_tokens;
+    kvmem_qc_prompt_tokens_ = indexed_tokens;
     // Sub-block mean-k (SubBlockMeanK): capture this many equal, non-overlapping
     // sub-block means per block so the scorer can run softmax at sub-block
     // granularity. 1 for plain mean-k / per-token -> byte-identical layout.
@@ -17059,7 +17369,9 @@ void QwenExecutor::kvmem_drain_query_capture() {
 void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
                                              uint32_t batch, uint32_t base_pos,
                                              uint32_t rope_base_pos,
-                                             uint32_t q_token_stride) {
+                                             uint32_t q_token_stride,
+                                             const DeviceTensor *mrope_positions,
+                                             uint32_t mrope_position_stride) {
     if (kvmem_query_end_ <= kvmem_query_begin_) return;
     if (!g_query_multi_ || !q_batch_ || g_query_multi_ready_) return;
     // base_pos and [query_begin,query_end) are both absolute positions in the
@@ -17089,6 +17401,19 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
         cfg.n_ctx_train, actual_layer);
     const uint64_t row_elems =
         static_cast<uint64_t>(n_heads) * head_dim;
+    auto derope_rows = [&](DeviceTensor &dst, uint64_t out_elem_offset) {
+        if (mrope_positions) {
+            return backend_.derope_query_multi_mrope_device(
+                dst, *q_batch_, q_elem_off, out_elem_offset,
+                q_token_stride, q_head_stride, cnt, n_heads, head_dim,
+                cfg.rope_dim, *mrope_positions, r0,
+                mrope_position_stride, cfg.rope_theta);
+        }
+        return backend_.derope_query_multi_device(
+            dst, *q_batch_, q_elem_off, out_elem_offset,
+            q_token_stride, q_head_stride, cnt, n_heads, head_dim,
+            cfg.rope_dim, start_pos, cfg.rope_theta);
+    };
     if (kvmem_query_host_capture_) {
         if (g_provisional_adaptive_score_active_) {
             // The de-RoPE output is already the exact FP16 content-frame query
@@ -17104,11 +17429,7 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
                     elems, "g_query_provisional_online_stage");
                 stage.capacity_elems = elems;
             }
-            auto st = backend_.derope_query_multi_device(
-                *stage.device, *q_batch_, q_elem_off,
-                /*out_elem_offset=*/0, q_token_stride, q_head_stride,
-                cnt, n_heads, head_dim, cfg.rope_dim, start_pos,
-                cfg.rope_theta);
+            auto st = derope_rows(*stage.device, /*out_elem_offset=*/0);
             if (!st.ok) {
                 throw std::runtime_error(
                     std::string(
@@ -17148,10 +17469,7 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
             stage.pinned =
                 backend_.host_buffer(bytes, "g_query_capture_bounce");
         }
-        auto st = backend_.derope_query_multi_device(
-            *stage.device, *q_batch_, q_elem_off, /*out_elem_offset=*/0,
-            q_token_stride, q_head_stride, cnt, n_heads, head_dim,
-            cfg.rope_dim, start_pos, cfg.rope_theta);
+        auto st = derope_rows(*stage.device, /*out_elem_offset=*/0);
         if (!st.ok) return;
         require_status(backend_.begin_kv_transfer_from_device());
         require_status(backend_.copy_bytes_to_host_async(
@@ -17173,10 +17491,7 @@ void QwenExecutor::kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
         const uint64_t out_elem_off =
             (static_cast<uint64_t>(slot) * S +
              g_query_multi_count_) * row_elems;
-        auto st = backend_.derope_query_multi_device(
-            *g_query_multi_, *q_batch_, q_elem_off, out_elem_off,
-            q_token_stride, q_head_stride, cnt, n_heads, head_dim,
-            cfg.rope_dim, start_pos, cfg.rope_theta);
+        auto st = derope_rows(*g_query_multi_, out_elem_off);
         if (!st.ok) return;
     }
     // The shared per-slot token count tracks progress identically across all L
@@ -17863,7 +18178,16 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     } else if (key_direction_adaptive) {
         throw std::runtime_error(
             "key-direction-adaptive capture requires a block-aligned "
-            "prefill suffix");
+            "prefill suffix: base_pos=" + std::to_string(base_pos) +
+            " batch=" + std::to_string(batch) +
+            " captured_tokens=" +
+            std::to_string(kvmem_qc_captured_tokens_) +
+            " indexed_tokens=" +
+            std::to_string(kvmem_qc_prompt_tokens_) +
+            " total_blocks=" +
+            std::to_string(kvmem_qc_total_blocks_) +
+            " query_replay=" +
+            std::to_string(kvmem_query_replay_active_ ? 1 : 0));
     } else if (key_direction_fixed4 && off == 0) {
         st = backend_.block_kdirection_fixed4_batch_device(
             *k_src, *capture_index, kbar_block_base, n_blocks_chunk,
@@ -22992,6 +23316,7 @@ void QwenExecutor::restore_state_checkpoint(const StateCheckpointSet &checkpoint
     if (checkpoints.kvmem_active) {
         const uint32_t page_size = kv_pages_.page_size;
         window_query_pos_ = checkpoints.window_base_query_pos + index + 1;
+        window_mrope_next_ = checkpoints.window_base_mrope_next + index + 1;
         window_page_count_ = (window_query_pos_ + page_size - 1) / page_size;
         if (window_pages_host_.size() > window_page_count_) {
             window_pages_host_.resize(window_page_count_);

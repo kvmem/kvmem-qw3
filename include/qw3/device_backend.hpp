@@ -1210,13 +1210,16 @@ public:
             const DeviceTensor &page_indices, uint32_t page_size, float theta,
             const DeviceTensor *rope_sincos = nullptr,
             uint32_t rope_table_positions = 0,
-            uint64_t raw_block_stride_elements = 0) {
+            uint64_t raw_block_stride_elements = 0,
+            const DeviceTensor *mrope_positions = nullptr,
+            uint32_t mrope_position_stride = 0) {
         (void)k_cache; (void)raw_k; (void)raw_element_offset; (void)n_blocks;
         (void)max_n_tokens; (void)n_kv_heads; (void)per_pos_size;
         (void)head_dim; (void)rope_dim; (void)to_base; (void)n_tokens;
         (void)page_indices; (void)page_size; (void)theta;
         (void)rope_sincos; (void)rope_table_positions;
         (void)raw_block_stride_elements;
+        (void)mrope_positions; (void)mrope_position_stride;
         return {false,
                 "raw_k_scatter_rope_paged_batched_device requires backend override"};
     }
@@ -2192,6 +2195,27 @@ public:
         (void)q_token_stride; (void)q_head_stride; (void)cnt; (void)n_heads;
         (void)head_dim; (void)rope_dim; (void)start_pos; (void)theta;
         return {false, "derope_query_multi_device requires backend override"};
+    }
+
+    // Exact inverse of rope_partial_batch_mrope for captured query rows.
+    // `positions` contains three axis-major int32 arrays, each with
+    // `position_stride` entries. Row r uses position_offset+r. This keeps
+    // query-conditioned scoring position-invariant when the query itself
+    // contains visual tokens or is replayed in a compact KVMem window.
+    virtual DeviceStatus derope_query_multi_mrope_device(
+            DeviceTensor &q_multi, const DeviceTensor &q,
+            uint64_t q_elem_offset, uint64_t out_elem_offset,
+            uint32_t q_token_stride, uint32_t q_head_stride,
+            uint32_t cnt, uint32_t n_heads, uint32_t head_dim,
+            uint32_t rope_dim, const DeviceTensor &positions,
+            uint32_t position_offset, uint32_t position_stride,
+            float theta) {
+        (void)q_multi; (void)q; (void)q_elem_offset; (void)out_elem_offset;
+        (void)q_token_stride; (void)q_head_stride; (void)cnt; (void)n_heads;
+        (void)head_dim; (void)rope_dim; (void)positions;
+        (void)position_offset; (void)position_stride; (void)theta;
+        return {false,
+                "derope_query_multi_mrope_device requires backend override"};
     }
 
     // Cross-request paged KV append. src layout is [batch, src_stride], each

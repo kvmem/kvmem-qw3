@@ -77,6 +77,10 @@ public:
         bool kvmem_active = false;
         uint32_t window_query_pos = 0;
         uint32_t window_page_count = 0;
+        uint32_t window_mrope_next = 0;
+        bool window_mrope_append_active = false;
+        uint32_t window_mrope_append_source_next = 0;
+        std::array<int64_t, 3> window_mrope_append_delta = {0, 0, 0};
         std::unique_ptr<DeviceTensor> h;
         // prime_mtp_prefix_from_last_batch consumes the previous target hidden
         // row from mtp_prefix_h_. Restoring only mtp_prefix_len would leave this
@@ -102,6 +106,7 @@ public:
         bool kvmem_active = false;
         uint32_t window_base_query_pos = 0;
         uint32_t window_base_page_count = 0;
+        uint32_t window_base_mrope_next = 0;
         std::unique_ptr<DeviceTensor> h;
         std::shared_ptr<DeviceTensor> h_shared;
         std::vector<std::unique_ptr<DeviceTensor>> recurrent_states;
@@ -915,6 +920,9 @@ private:
                                    uint32_t batch,
                                    uint32_t logical_base);
     uint32_t adjusted_multimodal_rope_position(uint32_t pos) const;
+    std::array<uint32_t, 3> source_multimodal_rope_position(
+        uint32_t pos) const;
+    void build_kvmem_window_mrope_positions(const KvMemPlan &plan);
 
     bool scratch_ready_ = false;
     std::vector<GenerationOptions::InputEmbeddingOverride>
@@ -922,10 +930,14 @@ private:
     std::unordered_map<uint32_t, size_t> input_embedding_override_index_;
     std::vector<uint32_t> input_multimodal_prompt_tokens_;
     std::vector<std::array<uint32_t, 3>> input_mrope_positions_;
+    std::vector<std::array<uint32_t, 3>> input_compact_mrope_positions_;
+    std::vector<uint8_t> input_compact_mrope_valid_;
     std::vector<int32_t> input_mrope_positions_host_;
     std::unique_ptr<DeviceTensor> input_mrope_positions_device_;
     uint32_t input_mrope_positions_capacity_ = 0;
     int64_t input_mrope_decode_delta_ = 0;
+    uint32_t prepared_input_mrope_next_ = 0;
+    bool prepared_input_mrope_valid_ = false;
     std::unique_ptr<DeviceTensor> h_;
     std::unique_ptr<DeviceTensor> norm_;
     std::unique_ptr<DeviceTensor> attn_out_;
@@ -1087,6 +1099,17 @@ private:
     std::vector<int32_t> window_pages_host_;
     std::unique_ptr<DeviceTensor> window_pages_device_;
     uint32_t window_page_count_ = 0;
+    // Exact compact-window M-RoPE coordinates, axis-major [3, window tokens].
+    // Present only for multimodal requests. K/V physical addressing remains
+    // scalar; these coordinates control the rotary phase used to reconstruct
+    // immutable raw K after semantic selection.
+    std::vector<int32_t> window_mrope_positions_host_;
+    std::unique_ptr<DeviceTensor> window_mrope_positions_device_;
+    uint32_t window_mrope_positions_capacity_ = 0;
+    uint32_t window_mrope_next_ = 0;
+    bool window_mrope_append_active_ = false;
+    uint32_t window_mrope_append_source_next_ = 0;
+    std::array<int64_t, 3> window_mrope_append_delta_ = {0, 0, 0};
     // MTP-draft mirror of the main window page table. The MTP draft head has its
     // own KV cache (mtp_kv_pages_), so the window is a separate page-pointer
     // reordering over the SAME selected blocks (lockstep with the main window;
@@ -1728,10 +1751,11 @@ private:
     // question tokens (rewards broadly-relevant blocks) instead of the single
     // last-token query. Default OFF (span empty) -> the single-token retrieval /
     // recency path is byte-identical.
-    void kvmem_capture_query_multi(uint32_t slot, uint32_t chunk_off,
-                                   uint32_t batch, uint32_t base_pos,
-                                   uint32_t rope_base_pos,
-                                   uint32_t q_token_stride);
+    void kvmem_capture_query_multi(
+        uint32_t slot, uint32_t chunk_off, uint32_t batch,
+        uint32_t base_pos, uint32_t rope_base_pos,
+        uint32_t q_token_stride, const DeviceTensor *mrope_positions,
+        uint32_t mrope_position_stride);
     // Long retrieval queries are captured through two bounded GPU/pinned
     // bounce slots into pageable host memory, then streamed back in token
     // chunks for scoring. This keeps GPU use O(chunk) instead of O(L*S).
