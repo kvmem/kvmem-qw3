@@ -54,6 +54,7 @@ RELAY_IMAGE = (
 SOURCE_TASK_LIST = (
     REPO / "benchmark" / "claude_deepswe_ab" / "tasks_requestplan_10_no_happy.json"
 )
+STRATIFIED_SELECTOR = HERE / "select_stratified20.py"
 MAX_INFRASTRUCTURE_ATTEMPTS = 10
 LOCAL_INFRASTRUCTURE_TIMEOUT_MULTIPLIER = 4.0
 QW3_STARTUP_TIMEOUT_SEC = 1800.0
@@ -63,6 +64,21 @@ SCORED_AGENT_TERMINAL_EXCEPTIONS = {"AgentTimeoutError"}
 # serializable in Pier's JSON artifacts (unlike IEEE infinity, which Pydantic
 # serializes as null).  5400 seconds * 1,000,000 is over 171 years.
 UNBOUNDED_AGENT_TIMEOUT_MULTIPLIER = 1_000_000.0
+
+
+class RunnerInterrupted(BaseException):
+    """Stop the queue without bypassing the active attempt's cleanup."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
+
+
+def install_graceful_stop_handler() -> None:
+    def stop(signum: int, _frame: object) -> None:
+        raise RunnerInterrupted(signum)
+
+    signal.signal(signal.SIGTERM, stop)
 
 
 def local_reliability_policy(mode: str = "kvmem") -> dict[str, Any]:
@@ -126,6 +142,27 @@ def write_json(path: Path, value: Any) -> None:
     temp.replace(path)
 
 
+def remote_qw3_identity() -> dict[str, Any] | None:
+    """Return reproducibility metadata when QW3 is reached through SSH."""
+
+    host = os.environ.get("QW3_REMOTE_SSH_HOST", "").strip()
+    binary = os.environ.get("QW3_REMOTE_BINARY", "").strip()
+    if not host and not binary:
+        return None
+    return {
+        "transport": "ssh-local-forward",
+        "host": host,
+        "ssh_port": int(os.environ.get("QW3_REMOTE_SSH_PORT", "22")),
+        "binary": binary,
+        "binary_sha256": os.environ.get(
+            "QW3_DEEPSWE_REMOTE_BINARY_SHA256"
+        ),
+        "workdir": os.environ.get("QW3_REMOTE_WORKDIR", "/home/chaidi/qw3"),
+        "listen_host": os.environ.get("QW3_REMOTE_LISTEN_HOST", "127.0.0.1"),
+        "listen_port": int(os.environ.get("QW3_REMOTE_LISTEN_PORT", "8000")),
+    }
+
+
 def run_text(command: list[str], *, check: bool = True) -> str:
     result = subprocess.run(
         command,
@@ -149,6 +186,7 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
         MODEL,
         DEEPSWE_MANIFEST,
         SOURCE_TASK_LIST,
+        STRATIFIED_SELECTOR,
         RELAY_SCRIPT,
         AGENT_ADAPTER,
         COMPACT_AGENT_RUNTIME,
@@ -205,14 +243,29 @@ def validate_environment(tasks_path: Path) -> tuple[dict[str, Any], dict[str, An
     if mismatches:
         raise RuntimeError("Version/data lock mismatch:\n" + json.dumps(mismatches, indent=2))
 
-    if task_spec.get("source_sha256") != actual["requestplan10_source_sha256"]:
-        raise RuntimeError("Task selection file no longer matches its authoritative source")
-    authoritative_task_ids = [item["task_id"] for item in read_json(SOURCE_TASK_LIST)["tasks"]]
     selected_task_ids = [item["task_id"] for item in task_spec["tasks"]]
-    if selected_task_ids != authoritative_task_ids:
-        raise RuntimeError(
-            "Task IDs/order differ from the authoritative historical requestplan10 list"
+    selection = task_spec.get("selection") or {}
+    if selection.get("kind") == "stratified_difficulty_sample":
+        run_text(
+            [
+                str(PYTHON),
+                str(STRATIFIED_SELECTOR),
+                "--check",
+                str(tasks_path),
+            ]
         )
+    else:
+        if task_spec.get("source_sha256") != actual["requestplan10_source_sha256"]:
+            raise RuntimeError(
+                "Task selection file no longer matches its authoritative source"
+            )
+        authoritative_task_ids = [
+            item["task_id"] for item in read_json(SOURCE_TASK_LIST)["tasks"]
+        ]
+        if selected_task_ids != authoritative_task_ids:
+            raise RuntimeError(
+                "Task IDs/order differ from the authoritative historical requestplan10 list"
+            )
     for item in task_spec["tasks"]:
         task_dir = DEEPSWE_TASKS / item["task_id"]
         if not (task_dir / "task.toml").is_file():
@@ -230,6 +283,11 @@ def qwen_command(
     kvmem_prefill_budget: int = 131072,
     kvmem_gen_budget: int = 65536,
 ) -> list[str]:
+    # Leave enough room in the generation reserve to materialize the private
+    # retrieval query used by a mid-decode refresh.  The historical 64K/4K
+    # configuration evaluates to 61,440, while smaller generation reserves
+    # must not inherit that fixed threshold.
+    middecode_trigger_tokens = max(1, kvmem_gen_budget - guided_query_tokens)
     common = [
         str(QW3),
         "serve",
@@ -316,7 +374,7 @@ def qwen_command(
         "--kvmem-guided-query-tokens",
         str(guided_query_tokens),
         "--kvmem-middecode-trigger-tokens",
-        "61440",
+        str(middecode_trigger_tokens),
         "--kvmem-middecode-max-refreshes",
         "2",
         "--kvmem-immutable-k",
@@ -724,6 +782,7 @@ def git_snapshot() -> dict[str, Any]:
 
 
 def main() -> int:
+    install_graceful_stop_handler()
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--output-root", type=Path, default=HERE / "recordings")
@@ -842,6 +901,12 @@ def main() -> int:
             raise RuntimeError(
                 f"Existing run uses mode={existing_mode}, requested mode={args.mode}"
             )
+        frozen_selection_sha = manifest.get("task_selection_file_sha256")
+        current_selection_sha = sha256(args.tasks_file.resolve())
+        if frozen_selection_sha and frozen_selection_sha != current_selection_sha:
+            raise RuntimeError(
+                "Existing run uses a different frozen task-selection manifest"
+            )
         manifest["agent_install_adapter"] = {
             "import_path": agent_import_path(args.mode),
             "path": str(AGENT_ADAPTER),
@@ -883,6 +948,7 @@ def main() -> int:
             args.kvmem_prefill_budget,
             args.kvmem_gen_budget,
         )
+        manifest["remote_qw3"] = remote_qw3_identity()
         manifest["local_reliability_policy"] = local_reliability_policy(args.mode)
         write_json(manifest_path, manifest)
     else:
@@ -898,6 +964,9 @@ def main() -> int:
                 else "official Pier + mini-swe-agent; one attempt and fresh QW3 per task"
             ),
             "task_ids": [item["task_id"] for item in selected],
+            "task_selection_file": str(args.tasks_file.resolve()),
+            "task_selection_file_sha256": sha256(args.tasks_file.resolve()),
+            "task_selection": task_spec.get("selection"),
             "historical_score": task_spec["historical_score"],
             "locks": lock,
             "git": git_snapshot(),
@@ -919,6 +988,7 @@ def main() -> int:
                 args.kvmem_prefill_budget,
                 args.kvmem_gen_budget,
             ),
+            "remote_qw3": remote_qw3_identity(),
             "rollout_seeds": [args.seed],
             "api_base": api_base,
             "agent_timeout_policy": (
@@ -1110,6 +1180,7 @@ def main() -> int:
                             args.kvmem_gen_budget,
                         ),
                         "qwen_binary_sha256": sha256(QW3),
+                        "remote_qw3": remote_qw3_identity(),
                         "qwen_pid": server.pid,
                     },
                 )
@@ -1232,5 +1303,7 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except RunnerInterrupted as exc:
+        raise SystemExit(128 + exc.signum)
     except KeyboardInterrupt:
         raise SystemExit(130)

@@ -409,7 +409,11 @@ def state(
         "binary_sha": (manifest.get("artifacts") or {}).get(
             "qw3_binary_sha256"
         ),
-        "seed": attempt_seed(latest_attempt(run / current_task)[1], 73) if current_task else 73,
+        "seed": (
+            attempt_seed(latest_attempt(run / current_task)[1], active_seed)
+            if current_task
+            else active_seed
+        ),
         "rollout_columns": [
             {"label": label, "seed": seed} for label, seed, _path in rollout_runs
         ],
@@ -447,7 +451,14 @@ def main() -> int:
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     run = args.run.resolve()
-    rollout_runs: list[tuple[str, int, Path]] = [("R1", 73, run)]
+    manifest = read_json(run / "manifest.json", {}) or {}
+    manifest_seeds = manifest.get("rollout_seeds")
+    base_seed = (
+        int(manifest_seeds[0])
+        if isinstance(manifest_seeds, list) and manifest_seeds
+        else 73
+    )
+    rollout_runs: list[tuple[str, int, Path]] = [("R1", base_seed, run)]
     for value in args.rollout_run:
         try:
             label, seed_text, path_text = value.split(":", 2)
@@ -457,7 +468,6 @@ def main() -> int:
                 f"invalid --rollout-run {value!r}; expected LABEL:SEED:PATH"
             ) from error
     plan = read_json(args.plan.resolve(), {}) or {}
-    manifest = read_json(run / "manifest.json", {}) or {}
     selected_ids = manifest.get("task_ids")
     if isinstance(selected_ids, list) and selected_ids:
         selected = {str(task_id) for task_id in selected_ids}

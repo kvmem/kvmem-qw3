@@ -1,0 +1,260 @@
+{
+  "description": "Frozen 20-task DeepSWE sample with all five empirical difficulty levels represented; selection is independent of local KVMem outcomes.",
+  "historical_score": {
+    "kind": "public_trial_pass_rate",
+    "note": "Per-task rates are selection metadata, not local rewards."
+  },
+  "schema_version": 1,
+  "selection": {
+    "algorithm": "pass-rate-strata-contiguous-bins-python-random-v1",
+    "algorithm_detail": "Levels ascend 1..5; tasks sort by (historical pass rate, task ID); each level is partitioned into contiguous integer bins; one index per bin is drawn by one shared random.Random(seed) stream.",
+    "anchors_pct": {
+      "1": 95.0,
+      "2": 80.0,
+      "3": 60.0,
+      "4": 30.0,
+      "5": 5.0
+    },
+    "kind": "stratified_difficulty_sample",
+    "population_counts": {
+      "1": 4,
+      "2": 25,
+      "3": 42,
+      "4": 36,
+      "5": 6
+    },
+    "quotas": {
+      "1": 2,
+      "2": 4,
+      "3": 6,
+      "4": 6,
+      "5": 2
+    },
+    "seed": 20260831,
+    "task_ids_sha256": "f161925c58b121d3c905c3859b25762e599c031f392c2ee059f45f868d232a3f"
+  },
+  "source": "benchmark/opencode_swebench/deepswe_v1_1_trials.json",
+  "source_sha256": "13d6f7563330110231b008ae4eb38e03de24af08acead840de296d1127144971",
+  "tasks": [
+    {
+      "difficulty_level": 1,
+      "historical_pass_rate_pct": 88.5246,
+      "historical_reward": null,
+      "population_index": 0,
+      "public_trials": 244,
+      "selection_bin": 0,
+      "selection_bin_start": 0,
+      "selection_bin_stop": 2,
+      "task_id": "drizzle-orm-window-function-builders"
+    },
+    {
+      "difficulty_level": 1,
+      "historical_pass_rate_pct": 90.1639,
+      "historical_reward": null,
+      "population_index": 2,
+      "public_trials": 244,
+      "selection_bin": 1,
+      "selection_bin_start": 2,
+      "selection_bin_stop": 4,
+      "task_id": "narwhals-rolling-window-suite"
+    },
+    {
+      "difficulty_level": 2,
+      "historical_pass_rate_pct": 72.541,
+      "historical_reward": null,
+      "population_index": 4,
+      "public_trials": 244,
+      "selection_bin": 0,
+      "selection_bin_start": 0,
+      "selection_bin_stop": 6,
+      "task_id": "koota-entity-snapshot-rollback"
+    },
+    {
+      "difficulty_level": 2,
+      "historical_pass_rate_pct": 74.3802,
+      "historical_reward": null,
+      "population_index": 8,
+      "public_trials": 242,
+      "selection_bin": 1,
+      "selection_bin_start": 6,
+      "selection_bin_stop": 12,
+      "task_id": "aiomonitor-task-snapshots-diff"
+    },
+    {
+      "difficulty_level": 2,
+      "historical_pass_rate_pct": 79.4239,
+      "historical_reward": null,
+      "population_index": 15,
+      "public_trials": 243,
+      "selection_bin": 2,
+      "selection_bin_start": 12,
+      "selection_bin_stop": 18,
+      "task_id": "helm-unified-manifest-stream"
+    },
+    {
+      "difficulty_level": 2,
+      "historical_pass_rate_pct": 84.0164,
+      "historical_reward": null,
+      "population_index": 23,
+      "public_trials": 244,
+      "selection_bin": 3,
+      "selection_bin_start": 18,
+      "selection_bin_stop": 25,
+      "task_id": "returns-validated-error-accumulation"
+    },
+    {
+      "difficulty_level": 3,
+      "historical_pass_rate_pct": 47.9508,
+      "historical_reward": null,
+      "population_index": 0,
+      "public_trials": 244,
+      "selection_bin": 0,
+      "selection_bin_start": 0,
+      "selection_bin_stop": 7,
+      "task_id": "bandit-incremental-cache-control"
+    },
+    {
+      "difficulty_level": 3,
+      "historical_pass_rate_pct": 54.5082,
+      "historical_reward": null,
+      "population_index": 10,
+      "public_trials": 244,
+      "selection_bin": 1,
+      "selection_bin_start": 7,
+      "selection_bin_stop": 14,
+      "task_id": "prometheus-typed-label-sorting"
+    },
+    {
+      "difficulty_level": 3,
+      "historical_pass_rate_pct": 58.6066,
+      "historical_reward": null,
+      "population_index": 18,
+      "public_trials": 244,
+      "selection_bin": 2,
+      "selection_bin_start": 14,
+      "selection_bin_stop": 21,
+      "task_id": "opa-rego-rule-profiling"
+    },
+    {
+      "difficulty_level": 3,
+      "historical_pass_rate_pct": 63.5246,
+      "historical_reward": null,
+      "population_index": 27,
+      "public_trials": 244,
+      "selection_bin": 3,
+      "selection_bin_start": 21,
+      "selection_bin_stop": 28,
+      "task_id": "mobly-grouped-test-barriers"
+    },
+    {
+      "difficulty_level": 3,
+      "historical_pass_rate_pct": 66.9421,
+      "historical_reward": null,
+      "population_index": 34,
+      "public_trials": 242,
+      "selection_bin": 4,
+      "selection_bin_start": 28,
+      "selection_bin_stop": 35,
+      "task_id": "numba-stencil-boundary-modes"
+    },
+    {
+      "difficulty_level": 3,
+      "historical_pass_rate_pct": 69.8745,
+      "historical_reward": null,
+      "population_index": 41,
+      "public_trials": 239,
+      "selection_bin": 5,
+      "selection_bin_start": 35,
+      "selection_bin_stop": 42,
+      "task_id": "dynamodb-toolbox-lazy-recursive-schemas"
+    },
+    {
+      "difficulty_level": 4,
+      "historical_pass_rate_pct": 23.1405,
+      "historical_reward": null,
+      "population_index": 5,
+      "public_trials": 242,
+      "selection_bin": 0,
+      "selection_bin_start": 0,
+      "selection_bin_stop": 6,
+      "task_id": "testem-bail-on-test-failure"
+    },
+    {
+      "difficulty_level": 4,
+      "historical_pass_rate_pct": 27.1605,
+      "historical_reward": null,
+      "population_index": 10,
+      "public_trials": 243,
+      "selection_bin": 1,
+      "selection_bin_start": 6,
+      "selection_bin_stop": 12,
+      "task_id": "quill-shared-toolbar-focus"
+    },
+    {
+      "difficulty_level": 4,
+      "historical_pass_rate_pct": 30.8333,
+      "historical_reward": null,
+      "population_index": 17,
+      "public_trials": 240,
+      "selection_bin": 2,
+      "selection_bin_start": 12,
+      "selection_bin_stop": 18,
+      "task_id": "awilix-async-container-initialization"
+    },
+    {
+      "difficulty_level": 4,
+      "historical_pass_rate_pct": 34.5679,
+      "historical_reward": null,
+      "population_index": 21,
+      "public_trials": 243,
+      "selection_bin": 3,
+      "selection_bin_start": 18,
+      "selection_bin_stop": 24,
+      "task_id": "vulture-persistent-analysis-cache"
+    },
+    {
+      "difficulty_level": 4,
+      "historical_pass_rate_pct": 37.1901,
+      "historical_reward": null,
+      "population_index": 29,
+      "public_trials": 242,
+      "selection_bin": 4,
+      "selection_bin_start": 24,
+      "selection_bin_stop": 30,
+      "task_id": "clack-async-autocomplete-options"
+    },
+    {
+      "difficulty_level": 4,
+      "historical_pass_rate_pct": 37.2951,
+      "historical_reward": null,
+      "population_index": 30,
+      "public_trials": 244,
+      "selection_bin": 5,
+      "selection_bin_start": 30,
+      "selection_bin_stop": 36,
+      "task_id": "optique-conditional-option-dependencies"
+    },
+    {
+      "difficulty_level": 5,
+      "historical_pass_rate_pct": 4.1322,
+      "historical_reward": null,
+      "population_index": 1,
+      "public_trials": 242,
+      "selection_bin": 0,
+      "selection_bin_start": 0,
+      "selection_bin_stop": 3,
+      "task_id": "gql-incremental-graphql-delivery"
+    },
+    {
+      "difficulty_level": 5,
+      "historical_pass_rate_pct": 15.9836,
+      "historical_reward": null,
+      "population_index": 5,
+      "public_trials": 244,
+      "selection_bin": 1,
+      "selection_bin_start": 3,
+      "selection_bin_stop": 6,
+      "task_id": "effect-sse-httpapi-streaming"
+    }
+  ]
+}

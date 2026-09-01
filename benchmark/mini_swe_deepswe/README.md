@@ -66,6 +66,64 @@ For a one-task infrastructure smoke test:
 
 Re-running the same command resumes from official verifier-complete tasks.
 
+## Frozen stratified 20-task sample
+
+`stratified20_seed20260831.json` is the authoritative 20-task sample used for
+the difficulty-stratified screen.  The **selection seed** is `20260831`; it is
+independent of the QW3 rollout seeds.  Its quotas are Level 1/2/3/4/5 =
+2/4/6/6/2.  Within each level, the audited public trial pass rates are sorted,
+partitioned into contiguous bins, and one task per bin is drawn by a single
+fixed PRNG stream.  The source-data hash and exact ordered-task-ID hash are
+stored in the manifest.
+
+Verify that the public source and selected IDs still reproduce exactly:
+
+```bash
+./benchmark/mini_swe_deepswe/select_stratified20.py \
+  --check benchmark/mini_swe_deepswe/stratified20_seed20260831.json
+```
+
+Run one official Pier + mini-swe-agent rollout without changing the frozen
+selection (the example uses the current KVMem 128K/64K setup):
+
+```bash
+./benchmark/mini_swe_deepswe/run_requestplan10.py \
+  --run-name stratified20_mini_swe_kvmem_s1000 \
+  --tasks-file benchmark/mini_swe_deepswe/stratified20_seed20260831.json \
+  --mode kvmem \
+  --seed 1000 \
+  --kvmem-budget 131072 \
+  --kvmem-prefill-budget 131072 \
+  --kvmem-gen-budget 65536 \
+  --guided-query-tokens 4096
+```
+
+For pass@4, repeat the complete 20-task round with rollout seeds 2000, 3000,
+and 4000 and distinct run names.  Do not use selection seed `20260831` as a
+model rollout seed.  Every run manifest records both the frozen-selection file
+hash and the model seed, so results can be compared task by task with the
+public DeepSWE trials.
+
+### Local Pier containers with a remote QW3 GPU service
+
+When a GPU worker is itself a container and cannot run nested Docker, keep
+Pier, the task containers, artifact collection, and verification on the local
+host. Set `QW3_DEEPSWE_BINARY` to `remote_qw3_ssh_wrapper.py`; the runner then
+owns an SSH local-forward as its per-task model process and starts only QW3 on
+the remote worker. The wrapper uses SSH key authentication and never stores a
+password. Remote identity and binary SHA metadata are recorded in the run
+manifest.
+
+The checked-in A40 K64/G32 launch configuration is:
+
+```bash
+./benchmark/mini_swe_deepswe/run_stratified20_a40_remote_k64g32.sh
+```
+
+It exposes the remote endpoint at `172.17.0.1:8010` and uses the local Pier
+relay on port 443, allowing an existing local run on ports 8000/80 to continue
+independently.
+
 For independent repeated rollouts, keep all other options fixed and vary the
 recorded QW3 sampling seed.  For example, after the original seed-73 rollout:
 
