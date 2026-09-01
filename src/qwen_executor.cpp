@@ -979,6 +979,135 @@ QwenExecutor::~QwenExecutor() {
     }
 }
 
+void QwenExecutor::set_input_embedding_overrides(
+        const std::vector<GenerationOptions::InputEmbeddingOverride> &overrides,
+        const std::vector<uint32_t> &prompt_tokens,
+        const std::vector<std::array<uint32_t, 3>> &mrope_positions) {
+    input_embedding_overrides_ = overrides;
+    input_embedding_override_index_.clear();
+    input_multimodal_prompt_tokens_.clear();
+    input_mrope_positions_.clear();
+    input_mrope_decode_delta_ = 0;
+    if (overrides.empty()) return;
+    if (prompt_tokens.empty() || mrope_positions.size() != prompt_tokens.size()) {
+        throw std::runtime_error(
+            "multimodal embedding overrides require one M-RoPE position per prompt token");
+    }
+    const uint32_t n_embd = model_.config().n_embd;
+    for (size_t i = 0; i < input_embedding_overrides_.size(); ++i) {
+        const auto &item = input_embedding_overrides_[i];
+        if (item.token_id < 0x80000000u || item.embedding.size() != n_embd ||
+            !input_embedding_override_index_.emplace(item.token_id, i).second) {
+            throw std::runtime_error("invalid or duplicate multimodal embedding override");
+        }
+    }
+    input_multimodal_prompt_tokens_ = prompt_tokens;
+    input_mrope_positions_ = mrope_positions;
+    const auto &last = input_mrope_positions_.back();
+    const uint32_t next = std::max({last[0], last[1], last[2]}) + 1u;
+    input_mrope_decode_delta_ = static_cast<int64_t>(next) -
+                                static_cast<int64_t>(prompt_tokens.size());
+}
+
+uint32_t QwenExecutor::resolve_input_token(uint32_t token_id) const {
+    if (input_embedding_override_index_.empty()) return token_id;
+    const auto it = input_embedding_override_index_.find(token_id);
+    return it == input_embedding_override_index_.end()
+        ? token_id
+        : input_embedding_overrides_[it->second].source_token_id;
+}
+
+namespace {
+uint16_t multimodal_float_to_bf16(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits += 0x7fffu + lsb;
+    return static_cast<uint16_t>(bits >> 16);
+}
+} // namespace
+
+void QwenExecutor::overwrite_input_embedding(DeviceTensor &dst,
+                                             uint32_t token_id,
+                                             uint64_t row_offset) {
+    const auto it = input_embedding_override_index_.find(token_id);
+    if (it == input_embedding_override_index_.end()) return;
+    const auto &embedding = input_embedding_overrides_[it->second].embedding;
+    const uint64_t byte_offset = row_offset * dst.elem_size;
+    if (dst.dtype == DeviceTensorDType::F32) {
+        require_status(backend_.copy_bytes_from_host(
+            dst, byte_offset, embedding.data(),
+            embedding.size() * sizeof(float)));
+        return;
+    }
+    if (dst.dtype == DeviceTensorDType::BF16) {
+        std::vector<uint16_t> bf16(embedding.size());
+        std::transform(embedding.begin(), embedding.end(), bf16.begin(),
+                       multimodal_float_to_bf16);
+        require_status(backend_.copy_bytes_from_host(
+            dst, byte_offset, bf16.data(), bf16.size() * sizeof(uint16_t)));
+        return;
+    }
+    throw std::runtime_error(
+        "multimodal embedding target must be FP32 or BF16");
+}
+
+void QwenExecutor::overwrite_input_embeddings_batch(DeviceTensor &dst,
+                                                    const uint32_t *tokens,
+                                                    uint32_t batch,
+                                                    uint32_t row_stride) {
+    for (uint32_t i = 0; i < batch; ++i) {
+        overwrite_input_embedding(dst, tokens[i],
+                                  static_cast<uint64_t>(i) * row_stride);
+    }
+}
+
+bool QwenExecutor::prepare_input_mrope_batch(const uint32_t *tokens,
+                                            uint32_t batch,
+                                            uint32_t logical_base) {
+    if (input_mrope_positions_.empty() ||
+        static_cast<uint64_t>(logical_base) + batch >
+            input_multimodal_prompt_tokens_.size()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < batch; ++i) {
+        if (tokens[i] != input_multimodal_prompt_tokens_[logical_base + i]) {
+            return false;
+        }
+    }
+    if (!input_mrope_positions_device_ ||
+        input_mrope_positions_capacity_ < batch) {
+        input_mrope_positions_device_ = backend_.tensor_i32(
+            3ULL * batch, "input_mrope_positions");
+        input_mrope_positions_capacity_ = batch;
+    }
+    input_mrope_positions_host_.resize(3ULL * batch);
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+        for (uint32_t i = 0; i < batch; ++i) {
+            input_mrope_positions_host_[static_cast<size_t>(axis) * batch + i] =
+                static_cast<int32_t>(
+                    input_mrope_positions_[logical_base + i][axis]);
+        }
+    }
+    require_status(backend_.copy_i32_from_host(
+        *input_mrope_positions_device_, 0,
+        input_mrope_positions_host_.data(), 3ULL * batch));
+    return true;
+}
+
+uint32_t QwenExecutor::adjusted_multimodal_rope_position(uint32_t pos) const {
+    if (input_mrope_positions_.empty() ||
+        pos < input_multimodal_prompt_tokens_.size() || kvmem_active_) {
+        return pos;
+    }
+    const int64_t adjusted = static_cast<int64_t>(pos) +
+                             input_mrope_decode_delta_;
+    if (adjusted < 0 || adjusted > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("multimodal decode RoPE position overflow");
+    }
+    return static_cast<uint32_t>(adjusted);
+}
+
 QwenExecutor::DecodeStateView QwenExecutor::decode_state_view() const {
     DecodeStateView view;
     view.position = position_;
@@ -5438,7 +5567,9 @@ NativeExecutorReport QwenExecutor::dry_run_token(uint32_t token_id, bool execute
 
     require_status(backend_.begin());
     begin_record_timing(full_executor_trace_enabled());
-    require_status(backend_.q8_0_get_row(*h_, weights_.token_embd(), token_id));
+    require_status(backend_.q8_0_get_row(
+        *h_, weights_.token_embd(), resolve_input_token(token_id)));
+    overwrite_input_embedding(*h_, token_id);
     record(report, "token_embedding_lookup");
     require_status(backend_.rms_norm(*norm_, *h_, weights_.output_norm(), model_.config().rms_eps));
     record(report, "output_norm");
@@ -5511,7 +5642,9 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
         !executor_trace_timing_enabled() &&
         backend_.begin_capture();
 
-    require_status(backend_.q8_0_get_row(*h_, weights_.token_embd(), token_id));
+    require_status(backend_.q8_0_get_row(
+        *h_, weights_.token_embd(), resolve_input_token(token_id)));
+    overwrite_input_embedding(*h_, token_id);
     record(report, "token_embedding_lookup");
 
     for (uint32_t il = 0; il < weights_.n_layers(); ++il) {
@@ -5573,8 +5706,8 @@ NativeExecutorReport QwenExecutor::forward_one_token(uint32_t token_id,
             // RoPE position: under the no-re-RoPE experiment the window keeps true
             // positions, so the new token's Q/K rotate at the TRUE position_ while
             // the append-slot and (length-based) attention mask stay on attn_pos.
-            const uint32_t rope_pos =
-                (bs && kvmem_no_rerope_) ? position_ : attn_pos;
+            const uint32_t rope_pos = adjusted_multimodal_rope_position(
+                (bs && kvmem_no_rerope_) ? position_ : attn_pos);
             if (kvmem_mtp_local_positions_ && cfg.n_ctx_train > 0 &&
                 rope_pos >= cfg.n_ctx_train) {
                 throw std::runtime_error(
@@ -6201,8 +6334,14 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
         // Embedding lookup runs eagerly: q8_0_get_rows_batch issues a
         // pageable host->device memcpy which is unsafe inside stream capture.
         std::vector<uint64_t> rows_h(batch);
-        for (uint32_t i = 0; i < batch; ++i) rows_h[i] = tokens[chunk_off + i];
+        for (uint32_t i = 0; i < batch; ++i) {
+            rows_h[i] = resolve_input_token(tokens[chunk_off + i]);
+        }
         require_status(backend_.q8_0_get_rows_batch(*h_batch_, weights_.token_embd(), rows_h.data(), batch));
+        overwrite_input_embeddings_batch(
+            *h_batch_, tokens.data() + chunk_off, batch, h_stride);
+        const bool use_input_mrope = prepare_input_mrope_batch(
+            tokens.data() + chunk_off, batch, base_pos);
         if (record_ops) record(report, "token_embedding_lookup_batch");
 
         uint32_t layer_begin = 0;
@@ -6518,10 +6657,17 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
             // pruning only: the provisional state is rolled back immediately,
             // and the durable replay still executes the complete model/MTP.
             if (provisional_terminal_query_layer) {
-                require_status(backend_.rope_partial_batch(
-                    *q_batch_, batch, q_stride_buf, standard_n_heads,
-                    2 * standard_head_dim, cfg.rope_dim, rope_base_pos,
-                    cfg.rope_theta));
+                if (use_input_mrope) {
+                    require_status(backend_.rope_partial_batch_mrope(
+                        *q_batch_, batch, q_stride_buf, standard_n_heads,
+                        2 * standard_head_dim, cfg.rope_dim,
+                        *input_mrope_positions_device_, cfg.rope_theta));
+                } else {
+                    require_status(backend_.rope_partial_batch(
+                        *q_batch_, batch, q_stride_buf, standard_n_heads,
+                        2 * standard_head_dim, cfg.rope_dim, rope_base_pos,
+                        cfg.rope_theta));
+                }
                 kvmem_capture_query_multi(
                     static_cast<uint32_t>(provisional_slot), chunk_off,
                     batch, base_pos, rope_base_pos, q_stride_buf);
@@ -6543,17 +6689,25 @@ NativeExecutorReport QwenExecutor::forward_n_tokens(const std::vector<uint32_t> 
                 kvmem_capture_raw_k_batch(il, *k_batch_, batch);
             }
 
-            require_status(backend_.rope_partial_batch(*q_batch_,
-                                                        batch, q_stride_buf,
-                                                        standard_n_heads,
-                                                        2 * standard_head_dim,
-                                                        cfg.rope_dim, rope_base_pos, cfg.rope_theta));
-            require_status(backend_.rope_partial_batch(*k_batch_,
-                                                        batch, k_stride_buf,
-                                                        standard_n_kv_heads,
-                                                        standard_head_dim,
-                                                        cfg.rope_dim, rope_base_pos,
-                                                        cfg.rope_theta));
+            if (use_input_mrope) {
+                require_status(backend_.rope_partial_batch_mrope(
+                    *q_batch_, batch, q_stride_buf, standard_n_heads,
+                    2 * standard_head_dim, cfg.rope_dim,
+                    *input_mrope_positions_device_, cfg.rope_theta));
+                require_status(backend_.rope_partial_batch_mrope(
+                    *k_batch_, batch, k_stride_buf, standard_n_kv_heads,
+                    standard_head_dim, cfg.rope_dim,
+                    *input_mrope_positions_device_, cfg.rope_theta));
+            } else {
+                require_status(backend_.rope_partial_batch(
+                    *q_batch_, batch, q_stride_buf, standard_n_heads,
+                    2 * standard_head_dim, cfg.rope_dim, rope_base_pos,
+                    cfg.rope_theta));
+                require_status(backend_.rope_partial_batch(
+                    *k_batch_, batch, k_stride_buf, standard_n_kv_heads,
+                    standard_head_dim, cfg.rope_dim, rope_base_pos,
+                    cfg.rope_theta));
+            }
 
             // Query-conditioned KVMem (#80/#87): capture the in-span question Q
             // rows during prefill and de-RoPE into the content frame for boundary
@@ -7085,7 +7239,9 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
     }
 
     const QwenConfig &cfg = model_.config();
-    if (cfg.n_ctx_train > 0 && rope_pos >= cfg.n_ctx_train) {
+    const uint32_t effective_rope_pos =
+        adjusted_multimodal_rope_position(rope_pos);
+    if (cfg.n_ctx_train > 0 && effective_rope_pos >= cfg.n_ctx_train) {
         report.missing_kernels.push_back(
             "native MTP RoPE position exceeds the model context limit");
         return report;
@@ -7098,6 +7254,8 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
 
     require_status(backend_.begin());
     begin_record_timing(executor_trace_timing_enabled());
+    const bool use_input_mrope = !token_source &&
+        prepare_input_mrope_batch(&token_id, 1, cache_pos);
 
     if (token_source) {
         require_status(backend_.q8_0_get_row_from_argmax(*mtp_embd_,
@@ -7105,7 +7263,9 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
                                                          *token_source,
                                                          token_source_index));
     } else {
-        require_status(backend_.q8_0_get_row(*mtp_embd_, *mtp->embed_tokens, token_id));
+        require_status(backend_.q8_0_get_row(
+            *mtp_embd_, *mtp->embed_tokens, resolve_input_token(token_id)));
+        overwrite_input_embedding(*mtp_embd_, token_id);
     }
     record(report, "mtp.token_embedding_lookup");
     require_status(backend_.rms_norm(*mtp_enorm_, *mtp_embd_, *mtp->enorm, eps));
@@ -7143,14 +7303,25 @@ NativeExecutorReport QwenExecutor::forward_mtp_draft_from(uint32_t token_id,
         kvmem_capture_raw_mtp_k(*k_, cache_pos, 1);
     }
     trace_rope_position_if_out_of_range(
-        "forward_mtp_draft_from.qk", rope_pos, 1, cfg.n_ctx_train,
+        "forward_mtp_draft_from.qk", effective_rope_pos, 1, cfg.n_ctx_train,
         static_cast<int32_t>(weights_.n_layers()), /*kernel_uses=*/2);
-    require_status(backend_.rope_partial(*q_, standard_n_heads,
-                                         2 * standard_head_dim,
-                                         cfg.rope_dim, rope_pos, cfg.rope_theta));
-    require_status(backend_.rope_partial(*k_, standard_n_kv_heads,
-                                         standard_head_dim,
-                                         cfg.rope_dim, rope_pos, cfg.rope_theta));
+    if (use_input_mrope) {
+        require_status(backend_.rope_partial_batch_mrope(
+            *q_, 1, 2 * standard_n_heads * standard_head_dim,
+            standard_n_heads, 2 * standard_head_dim, cfg.rope_dim,
+            *input_mrope_positions_device_, cfg.rope_theta));
+        require_status(backend_.rope_partial_batch_mrope(
+            *k_, 1, standard_n_kv_heads * standard_head_dim,
+            standard_n_kv_heads, standard_head_dim, cfg.rope_dim,
+            *input_mrope_positions_device_, cfg.rope_theta));
+    } else {
+        require_status(backend_.rope_partial(
+            *q_, standard_n_heads, 2 * standard_head_dim,
+            cfg.rope_dim, effective_rope_pos, cfg.rope_theta));
+        require_status(backend_.rope_partial(
+            *k_, standard_n_kv_heads, standard_head_dim,
+            cfg.rope_dim, effective_rope_pos, cfg.rope_theta));
+    }
 
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
     // kvmem windowed draft (window_frame=true, only when kvmem_active_): attend
@@ -23099,6 +23270,8 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
 
     require_status(backend_.begin());
     begin_record_timing(full_executor_trace_enabled());
+    const bool use_input_mrope = prepare_input_mrope_batch(
+        tokens.data(), batch, logical_base_position);
 
     const DeviceTensor &first_h =
         (logical_base_position == 0) ? *mtp_zero_h_ : *mtp_prefix_h_;
@@ -23107,9 +23280,13 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
     record(report, "mtp.prefix_hinput_batch");
 
     std::vector<uint64_t> rows(batch);
-    for (uint32_t i = 0; i < batch; ++i) rows[i] = tokens[i];
+    for (uint32_t i = 0; i < batch; ++i) {
+        rows[i] = resolve_input_token(tokens[i]);
+    }
     require_status(backend_.q8_0_get_rows_batch(mtp_token_emb, *mtp->embed_tokens,
                                                 rows.data(), batch));
+    overwrite_input_embeddings_batch(
+        mtp_token_emb, tokens.data(), batch, h_stride);
     record(report, "mtp.token_embedding_lookup_batch");
     // Main prefill activations may be BF16.  Reusing attn_out/ffn_out is still
     // safe, but rms_norm's output must stay F32: CUDA intentionally has no BF16
@@ -23164,18 +23341,25 @@ NativeExecutorReport QwenExecutor::prime_mtp_prefix_from_last_batch_at(
         "prime_mtp_prefix_from_last_batch.qk", rope_base_position, batch,
         cfg.n_ctx_train, static_cast<int32_t>(weights_.n_layers()),
         /*kernel_uses=*/2);
-    require_status(backend_.rope_partial_batch(mtp_q,
-                                               batch, q_stride_buf,
-                                               standard_n_heads,
-                                               2 * standard_head_dim,
-                                               cfg.rope_dim, rope_base_position,
-                                               cfg.rope_theta));
-    require_status(backend_.rope_partial_batch(mtp_k_batch,
-                                               batch, k_stride_buf,
-                                               standard_n_kv_heads,
-                                               standard_head_dim,
-                                               cfg.rope_dim, rope_base_position,
-                                               cfg.rope_theta));
+    if (use_input_mrope) {
+        require_status(backend_.rope_partial_batch_mrope(
+            mtp_q, batch, q_stride_buf, standard_n_heads,
+            2 * standard_head_dim, cfg.rope_dim,
+            *input_mrope_positions_device_, cfg.rope_theta));
+        require_status(backend_.rope_partial_batch_mrope(
+            mtp_k_batch, batch, k_stride_buf, standard_n_kv_heads,
+            standard_head_dim, cfg.rope_dim,
+            *input_mrope_positions_device_, cfg.rope_theta));
+    } else {
+        require_status(backend_.rope_partial_batch(
+            mtp_q, batch, q_stride_buf, standard_n_heads,
+            2 * standard_head_dim, cfg.rope_dim, rope_base_position,
+            cfg.rope_theta));
+        require_status(backend_.rope_partial_batch(
+            mtp_k_batch, batch, k_stride_buf, standard_n_kv_heads,
+            standard_head_dim, cfg.rope_dim, rope_base_position,
+            cfg.rope_theta));
+    }
     const uint32_t per_pos = standard_n_kv_heads * standard_head_dim;
     mtp_kv_pages_.ensure_pages(
         backend_, kv_ctx_size_, logical_base_position, batch);

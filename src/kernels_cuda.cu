@@ -4800,6 +4800,40 @@ __global__ void rope_partial_positions_kernel(float *x,
     base[i + half] = x0 * s + x1 * c;
 }
 
+__global__ void rope_partial_mrope_kernel(float *x,
+                                          uint32_t n_units,
+                                          uint32_t per_unit_stride,
+                                          uint32_t rope_dim,
+                                          const int32_t *positions,
+                                          uint32_t batch_stride,
+                                          float theta,
+                                          uint32_t batch) {
+    const uint32_t b = blockIdx.x;
+    const uint32_t unit = blockIdx.y;
+    const uint32_t i = threadIdx.x;
+    if (b >= batch || unit >= n_units) return;
+    const uint32_t half = rope_dim / 2;
+    if (i >= half) return;
+
+    // transformers Qwen3.5 repeats [11,11,10] twice and then interleaves the
+    // three axes. Expressed on one half of the rotary channels this is:
+    // H for indices 1,4,...,31; W for 2,5,...,29; T otherwise.
+    uint32_t axis = 0;
+    if ((i % 3U) == 1U && i < 33U) axis = 1;
+    if ((i % 3U) == 2U && i < 30U) axis = 2;
+    const int32_t pos = positions[static_cast<uint64_t>(axis) * batch + b];
+    float *base = x + static_cast<uint64_t>(b) * batch_stride +
+                  unit * per_unit_stride;
+    const float inv_freq = __powf(
+        theta, -2.0f * static_cast<float>(i) / static_cast<float>(rope_dim));
+    float c, s;
+    __sincosf(static_cast<float>(pos) * inv_freq, &s, &c);
+    const float x0 = base[i];
+    const float x1 = base[i + half];
+    base[i] = x0 * c - x1 * s;
+    base[i + half] = x0 * s + x1 * c;
+}
+
 // Re-RoPE delta rotation for block-sparse KV reuse. A cached K row was baked
 // with RoPE at its original absolute position (k_stored = R(p_orig·f)·k_raw).
 // To reuse it at a remapped position p_new we apply a single delta rotation
@@ -16228,6 +16262,33 @@ public:
             t.ptr, n_units, per_unit_stride, rope_dim, pos.ptr_i32(),
             batch_stride, theta);
         return launch_status("cuda rope_partial_batch_positions");
+    }
+
+    DeviceStatus rope_partial_batch_mrope(DeviceTensor &x,
+                                          uint32_t batch,
+                                          uint32_t batch_stride,
+                                          uint32_t n_units,
+                                          uint32_t per_unit_stride,
+                                          uint32_t rope_dim,
+                                          const DeviceTensor &positions,
+                                          float theta) override {
+        if (batch == 0) return {};
+        if (rope_dim != 64) {
+            return {false,
+                    "Qwen3.5 multimodal RoPE currently requires rope_dim=64"};
+        }
+        auto &t = as_tensor(x);
+        const auto &pos = as_tensor(positions);
+        if (pos.elem_size != sizeof(int32_t) || pos.count < 3ULL * batch) {
+            return {false, "rope_partial_batch_mrope positions tensor invalid"};
+        }
+        const uint32_t half = rope_dim / 2;
+        if (half == 0) return {};
+        dim3 grid(batch, n_units);
+        rope_partial_mrope_kernel<<<grid, half, 0, exec_stream_>>>(
+            t.ptr, n_units, per_unit_stride, rope_dim, pos.ptr_i32(),
+            batch_stride, theta, batch);
+        return launch_status("cuda rope_partial_batch_mrope");
     }
 
     DeviceStatus kv_append(DeviceTensor &cache,

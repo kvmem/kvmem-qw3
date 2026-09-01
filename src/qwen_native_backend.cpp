@@ -3896,6 +3896,20 @@ public:
             prompt_tokens.assign(ids.begin(), ids.end());
         }
         GenerationOptions effective_options = options;
+        if (!effective_options.input_embedding_overrides.empty() &&
+            !reset_session) {
+            throw std::runtime_error(
+                "multimodal V1 does not support append/session continuation");
+        }
+        executor_->set_input_embedding_overrides(
+            effective_options.input_embedding_overrides, prompt_tokens,
+            effective_options.input_mrope_positions);
+        if (!effective_options.input_embedding_overrides.empty()) {
+            // V1 checkpoints do not serialize visual embeddings. They must
+            // never alias a same-shaped image prompt or leave overwritten KV
+            // pages advertised as a reusable text checkpoint.
+            kvmem_warm_valid_ = false;
+        }
         const uint32_t append_base = reset_session
             ? 0u : static_cast<uint32_t>(executor_->position());
         if (!reset_session &&
@@ -6450,6 +6464,7 @@ private:
     static bool continuous_batch_request_supported(const GenerationOptions &options,
                                                    const DumpStream *dump) {
         return dump == nullptr && options.max_tokens >= 0 &&
+               options.input_embedding_overrides.empty() &&
                options.kvmem_semantic_budget == 0 &&
                options.kvmem_replay_query_spans.empty() &&
                options.kvmem_oracle_token_spans.empty() &&
@@ -10804,6 +10819,7 @@ private:
 #endif
         const bool warm_capture =
             !semantic_chunk && !inline_refresh &&
+            options.input_embedding_overrides.empty() &&
             kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
 
@@ -12233,6 +12249,7 @@ private:
             reset_session && override_executor == nullptr &&
             !transcript_replay_requested && !semantic_chunk && !api_session &&
             !inline_refresh &&
+            options.input_embedding_overrides.empty() &&
             kvmem_prefix_cache_enabled() &&
             executor_->kvmem_enabled();
         DeviceStatus st;

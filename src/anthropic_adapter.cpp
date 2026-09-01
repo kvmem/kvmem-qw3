@@ -79,12 +79,23 @@ bool append_user_message(const json &content, json &messages,
         return false;
     }
 
-    std::string pending_text;
-    auto flush_text = [&]() {
-        if (pending_text.empty()) return;
+    json pending_content = json::array();
+    auto flush_content = [&]() {
+        if (pending_content.empty()) return;
+        bool text_only = true;
+        std::string text;
+        for (const json &part : pending_content) {
+            if (!part.is_object() || part.value("type", "") != "text" ||
+                !part.contains("text") || !part["text"].is_string()) {
+                text_only = false;
+                break;
+            }
+            text += part["text"].get<std::string>();
+        }
         messages.push_back(
-            json{{"role", "user"}, {"content", pending_text}});
-        pending_text.clear();
+            json{{"role", "user"},
+                 {"content", text_only ? json(text) : pending_content}});
+        pending_content = json::array();
     };
     for (const json &block : content) {
         if (!block.is_object()) {
@@ -97,11 +108,34 @@ bool append_user_message(const json &content, json &messages,
                 error = "text blocks require a string text field";
                 return false;
             }
-            pending_text += block["text"].get<std::string>();
+            pending_content.push_back(
+                json{{"type", "text"}, {"text", block["text"]}});
+            continue;
+        }
+        if (type == "image") {
+            if (!block.contains("source") || !block["source"].is_object()) {
+                error = "image blocks require an object source";
+                return false;
+            }
+            const json &source = block["source"];
+            if (source.value("type", "") != "base64" ||
+                !source.contains("media_type") ||
+                !source["media_type"].is_string() ||
+                !source.contains("data") || !source["data"].is_string() ||
+                source["data"].get_ref<const std::string &>().empty()) {
+                error = "image source requires type=base64, media_type, and data";
+                return false;
+            }
+            const std::string url =
+                "data:" + source["media_type"].get<std::string>() +
+                ";base64," + source["data"].get<std::string>();
+            pending_content.push_back(json{
+                {"type", "image_url"},
+                {"image_url", json{{"url", url}}}});
             continue;
         }
         if (type == "tool_result") {
-            flush_text();
+            flush_content();
             if (!block.contains("tool_use_id") ||
                 !block["tool_use_id"].is_string()) {
                 error = "tool_result blocks require a string tool_use_id";
@@ -127,7 +161,7 @@ bool append_user_message(const json &content, json &messages,
         error = "unsupported user content block type: " + type;
         return false;
     }
-    flush_text();
+    flush_content();
     if (content.empty()) {
         messages.push_back(json{{"role", "user"}, {"content", ""}});
     }

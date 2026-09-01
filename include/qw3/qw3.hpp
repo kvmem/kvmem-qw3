@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <memory>
 #include <string>
@@ -137,6 +138,14 @@ struct EngineOptions {
     // stage only selected rows to CUDA. Opt-in because it trades a small
     // host-gather / PCIe cost for substantially lower device memory use.
     bool cpu_embedding = false;
+    // Optional CPU-only Qwen3.5 vision frontend. Empty keeps the historical
+    // text-only path byte-identical and does not start a Python/PyTorch worker.
+    // The worker loads only model.visual.* weights; projected image embeddings
+    // are copied into the normal CUDA language-model input stream.
+    std::string vision_cpu_model_path;
+    std::string vision_cpu_python;
+    std::string vision_cpu_worker;
+    int vision_cpu_threads = 0; // 0 = online CPU count
     // Diagnostics: when non-empty, write a JSONL line per generated step
     // with the prompt tokens, decoded token, and top-k logits.
     std::string dump_logits_path;
@@ -300,6 +309,24 @@ struct GenerationOptions {
     // decode/re-tokenize change at concatenated sparse-block boundaries in
     // controlled representation experiments.
     std::vector<uint32_t> prompt_token_ids_override;
+    // Request-local projected visual embeddings. token_id is a synthetic ID
+    // outside the vocabulary placed into prompt_token_ids_override. The
+    // executor resolves it to source_token_id for ordinary embedding lookup,
+    // then overwrites that row with embedding. Positions are the exact Qwen3.5
+    // temporal/height/width M-RoPE coordinates for the original dense prompt.
+    // Empty preserves every existing text-only code path.
+    struct InputEmbeddingOverride {
+        uint32_t token_id = 0;
+        uint32_t source_token_id = 0;
+        std::array<uint32_t, 3> position = {0, 0, 0};
+        std::vector<float> embedding;
+    };
+    std::vector<InputEmbeddingOverride> input_embedding_overrides;
+    // Exact dense-prompt M-RoPE coordinates, one entry per prompt token. This
+    // is populated only for multimodal requests. KVMem keeps visual spans
+    // atomic and can replay their synthetic embedding IDs; compact re-RoPE
+    // remains governed by the existing KVMem window coordinates.
+    std::vector<std::array<uint32_t, 3>> input_mrope_positions;
     bool ignore_eos = false;
     // Serving compatibility: if generation is still inside an open <think>
     // block, replace a sampled EOS with the tokenizer's </think> token and

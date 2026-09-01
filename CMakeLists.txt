@@ -110,6 +110,7 @@ add_library(qw3_core
     src/kvmem_store.cpp
     src/kvmem_archive.cpp
     src/anthropic_adapter.cpp
+    src/vision_cpu_frontend.cpp
     src/harness_semantics.cpp
     src/tool_call_stream.cpp
     src/tokenizer.cpp
@@ -124,6 +125,9 @@ target_include_directories(qw3_core PRIVATE
 
 target_compile_options(qw3_core PRIVATE
     -Wall -Wextra -Wpedantic
+)
+target_compile_definitions(qw3_core PRIVATE
+    QW3_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 target_link_libraries(qw3_core PUBLIC Threads::Threads)
 
@@ -229,6 +233,9 @@ endif()
 
 add_executable(qw3 src/qw3_cli.cpp src/qw3_server.cpp)
 target_include_directories(qw3 SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_compile_definitions(qw3 PRIVATE
+    QW3_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
 target_link_libraries(qw3 PRIVATE qw3_core)
 
 add_executable(qw3-inspect src/qw3_inspect.cpp)

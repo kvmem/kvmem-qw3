@@ -6,6 +6,7 @@
 #include "kvmem_request_plan.hpp"
 #include "kvmem_refresh_policy.hpp"
 #include "tool_call_stream.hpp"
+#include "vision_cpu_frontend.hpp"
 #include "qw3/qw3.hpp"
 #include "qw3/gguf.hpp"
 #include "qw3/kvmem_archive.hpp"
@@ -38,6 +39,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <thread>
 
 namespace qw3 {
 
@@ -183,6 +185,7 @@ bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
     // the duration of a request. Keep them on the serialized plain/frozen path
     // until continuous batching has a per-row budget field.
     return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty() &&
+           g.input_embedding_overrides.empty() &&
            g.kvmem_pinned_token_spans.empty() &&
            g.kvmem_semantic_budget == 0 &&
            g.kvmem_query_attention_probe_tokens == 0 &&
@@ -525,6 +528,246 @@ std::string render_content(const json &content) {
         return out;
     }
     return content.dump();
+}
+
+struct PreparedVisionRequest {
+    detail::CpuVisionEncoding encoded;
+    std::vector<std::pair<uint32_t, uint32_t>> token_spans;
+
+    bool active() const { return !encoded.grids.empty(); }
+};
+
+bool parse_data_image_url(const std::string &url,
+                          detail::CpuVisionImage &image,
+                          std::string &error) {
+    if (url.rfind("data:", 0) != 0) {
+        error = "CPU vision V1 accepts base64 data: image URLs only";
+        return false;
+    }
+    const size_t comma = url.find(',');
+    const size_t base64 = url.find(";base64");
+    if (comma == std::string::npos || base64 == std::string::npos ||
+        base64 > comma) {
+        error = "image URL must be a base64 data URI";
+        return false;
+    }
+    image.media_type = url.substr(5, base64 - 5);
+    image.base64_data = url.substr(comma + 1);
+    if (image.media_type.rfind("image/", 0) != 0 ||
+        image.base64_data.empty()) {
+        error = "invalid base64 image data URI";
+        return false;
+    }
+    return true;
+}
+
+bool openai_image_block(const json &block,
+                        detail::CpuVisionImage &image,
+                        std::string &error) {
+    if (!block.is_object() || block.value("type", "") != "image_url") {
+        return false;
+    }
+    if (!block.contains("image_url")) {
+        error = "image_url block requires image_url";
+        return false;
+    }
+    std::string url;
+    if (block["image_url"].is_string()) {
+        url = block["image_url"].get<std::string>();
+    } else if (block["image_url"].is_object() &&
+               block["image_url"].contains("url") &&
+               block["image_url"]["url"].is_string()) {
+        url = block["image_url"]["url"].get<std::string>();
+    } else {
+        error = "image_url must be a string or an object with string url";
+        return false;
+    }
+    return parse_data_image_url(url, image, error);
+}
+
+bool prepare_vision_messages(json &messages,
+                             detail::CpuVisionFrontend *frontend,
+                             PreparedVisionRequest &prepared,
+                             std::string &error) {
+    std::vector<detail::CpuVisionImage> images;
+    for (const json &message : messages) {
+        if (!message.is_object() || !message.contains("content") ||
+            !message["content"].is_array()) {
+            continue;
+        }
+        for (const json &block : message["content"]) {
+            if (!block.is_object() || block.value("type", "") != "image_url") {
+                continue;
+            }
+            detail::CpuVisionImage image;
+            if (!openai_image_block(block, image, error)) return false;
+            images.push_back(std::move(image));
+        }
+    }
+    if (images.empty()) return true;
+    if (!frontend) {
+        error = "image input requires --vision-cpu-model DIR";
+        return false;
+    }
+    try {
+        prepared.encoded = frontend->encode(images);
+    } catch (const std::exception &e) {
+        error = e.what();
+        return false;
+    }
+
+    size_t image_index = 0;
+    for (json &message : messages) {
+        if (!message.is_object() || !message.contains("content") ||
+            !message["content"].is_array()) {
+            continue;
+        }
+        for (json &block : message["content"]) {
+            if (!block.is_object() || block.value("type", "") != "image_url") {
+                continue;
+            }
+            if (image_index >= prepared.encoded.grids.size()) {
+                error = "vision worker image count does not match the request";
+                return false;
+            }
+            const uint32_t rows = prepared.encoded.grids[image_index].rows;
+            std::string placeholder = "<|vision_start|>";
+            placeholder.reserve(placeholder.size() +
+                                static_cast<size_t>(rows) * 13 + 16);
+            for (uint32_t row = 0; row < rows; ++row) {
+                placeholder += "<|image_pad|>";
+            }
+            placeholder += "<|vision_end|>";
+            block = json{{"type", "text"}, {"text", std::move(placeholder)}};
+            ++image_index;
+        }
+    }
+    if (image_index != prepared.encoded.grids.size()) {
+        error = "vision request mutation lost an image";
+        return false;
+    }
+    return true;
+}
+
+bool finalize_vision_tokens(
+        std::vector<int32_t> &tokens,
+        const QwenTokenizer &tokenizer,
+        PreparedVisionRequest &prepared,
+        GenerationOptions &generation,
+        std::string &error) {
+    if (!prepared.active()) return true;
+    const int32_t image_pad = tokenizer.token_id("<|image_pad|>");
+    const int32_t vision_start = tokenizer.token_id("<|vision_start|>");
+    const int32_t vision_end = tokenizer.token_id("<|vision_end|>");
+    if (image_pad < 0 || vision_start < 0 || vision_end < 0) {
+        error = "model tokenizer is missing Qwen vision special tokens";
+        return false;
+    }
+    if (prepared.encoded.embedding_dim == 0 ||
+        prepared.encoded.embedding_dim > std::numeric_limits<uint32_t>::max()) {
+        error = "vision worker returned an invalid embedding width";
+        return false;
+    }
+
+    std::vector<uint8_t> modality(tokens.size(), 0);
+    size_t embedding_row = 0;
+    size_t search = 0;
+    generation.input_embedding_overrides.clear();
+    generation.input_mrope_positions.assign(tokens.size(), {0, 0, 0});
+    prepared.token_spans.clear();
+
+    for (const auto &grid : prepared.encoded.grids) {
+        while (search + 1 < tokens.size() &&
+               !(tokens[search] == vision_start &&
+                 tokens[search + 1] == image_pad)) {
+            ++search;
+        }
+        if (search + 1 >= tokens.size()) {
+            error = "rendered prompt has fewer vision spans than encoded images";
+            return false;
+        }
+        const size_t span_begin = search;
+        const size_t begin = ++search;
+        while (search < tokens.size() && tokens[search] == image_pad) {
+            ++search;
+        }
+        const size_t end = search;
+        if (end - begin != grid.rows) {
+            error = "rendered image token run does not match the processed image grid";
+            return false;
+        }
+        if (end >= tokens.size() || tokens[end] != vision_end) {
+            error = "rendered image token run is missing vision_end";
+            return false;
+        }
+        prepared.token_spans.emplace_back(
+            static_cast<uint32_t>(span_begin),
+            static_cast<uint32_t>(end + 1));
+        for (size_t pos = begin; pos < end; ++pos) {
+            modality[pos] = 1;
+            if (embedding_row >= 0x7fffffffu) {
+                error = "too many visual embedding rows";
+                return false;
+            }
+            const uint32_t virtual_id =
+                0x80000000u | static_cast<uint32_t>(embedding_row + 1);
+            GenerationOptions::InputEmbeddingOverride override;
+            override.token_id = virtual_id;
+            override.source_token_id = static_cast<uint32_t>(image_pad);
+            const size_t offset = embedding_row * prepared.encoded.embedding_dim;
+            override.embedding.assign(
+                prepared.encoded.embeddings.begin() +
+                    static_cast<std::ptrdiff_t>(offset),
+                prepared.encoded.embeddings.begin() +
+                    static_cast<std::ptrdiff_t>(offset +
+                                                prepared.encoded.embedding_dim));
+            generation.input_embedding_overrides.push_back(std::move(override));
+            tokens[pos] = static_cast<int32_t>(virtual_id);
+            ++embedding_row;
+        }
+    }
+    if (embedding_row * prepared.encoded.embedding_dim !=
+        prepared.encoded.embeddings.size()) {
+        error = "unused visual embeddings remain after prompt mapping";
+        return false;
+    }
+
+    uint32_t current = 0;
+    size_t image_index = 0;
+    for (size_t pos = 0; pos < tokens.size();) {
+        if (modality[pos] == 0) {
+            generation.input_mrope_positions[pos] = {current, current, current};
+            ++current;
+            ++pos;
+            continue;
+        }
+        if (image_index >= prepared.encoded.grids.size()) {
+            error = "image modality run count exceeds image grids";
+            return false;
+        }
+        const auto &grid = prepared.encoded.grids[image_index++];
+        if (grid.height % 2 != 0 || grid.width % 2 != 0) {
+            error = "Qwen vision grid is not divisible by spatial merge size 2";
+            return false;
+        }
+        const uint32_t llm_h = grid.height / 2;
+        const uint32_t llm_w = grid.width / 2;
+        const uint32_t plane = llm_h * llm_w;
+        for (uint32_t row = 0; row < grid.rows; ++row, ++pos) {
+            const uint32_t t = plane > 0 ? row / plane : 0;
+            const uint32_t rem = plane > 0 ? row % plane : 0;
+            const uint32_t h = llm_w > 0 ? rem / llm_w : 0;
+            const uint32_t w = llm_w > 0 ? rem % llm_w : 0;
+            const std::array<uint32_t, 3> mrope = {
+                current + t, current + h, current + w};
+            generation.input_mrope_positions[pos] = mrope;
+            generation.input_embedding_overrides[
+                static_cast<size_t>(tokens[pos] & 0x7fffffffu) - 1].position =
+                    mrope;
+        }
+        current += std::max({grid.temporal, llm_h, llm_w});
+    }
+    return true;
 }
 
 std::string trim_ascii_ws(std::string s) {
@@ -2101,6 +2344,41 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     const std::string model_id = basename_of(engine.model_path);
     std::cerr << "[qw3-serve] model loaded; id=" << model_id << "\n";
 
+    std::unique_ptr<detail::CpuVisionFrontend> vision_frontend;
+    if (!engine.vision_cpu_model_path.empty()) {
+        std::string python = engine.vision_cpu_python;
+        if (python.empty()) {
+            if (const char *env = std::getenv("QW3_VISION_CPU_PYTHON")) {
+                python = env;
+            }
+        }
+        if (python.empty()) {
+            const std::filesystem::path local_python =
+                std::filesystem::path(QW3_SOURCE_DIR) / ".venv/bin/python";
+            python = std::filesystem::exists(local_python)
+                ? local_python.string() : "python3";
+        }
+        std::string worker = engine.vision_cpu_worker;
+        if (worker.empty()) {
+            if (const char *env = std::getenv("QW3_VISION_CPU_WORKER")) {
+                worker = env;
+            }
+        }
+        if (worker.empty()) {
+            worker = (std::filesystem::path(QW3_SOURCE_DIR) /
+                      "scripts/qw3_vision_cpu_worker.py").string();
+        }
+        const uint32_t threads = engine.vision_cpu_threads > 0
+            ? static_cast<uint32_t>(engine.vision_cpu_threads)
+            : std::max<uint32_t>(1, std::thread::hardware_concurrency());
+        std::cerr << "[qw3-serve] loading CPU vision frontend model="
+                  << engine.vision_cpu_model_path << " threads=" << threads
+                  << "\n";
+        vision_frontend = std::make_unique<detail::CpuVisionFrontend>(
+            engine.vision_cpu_model_path, python, worker, threads);
+        std::cerr << "[qw3-serve] CPU vision frontend ready\n";
+    }
+
     // Single shared KV cache + scratch in the executor => serialize generation.
     std::mutex gen_mu;
     struct GuidedTrajectoryState {
@@ -2510,6 +2788,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             res.status = 400;
             res.set_content(dump_json(json{{"error", "missing messages[]"}}),
                             "application/json");
+            return;
+        }
+        PreparedVisionRequest prepared_vision;
+        std::string vision_error;
+        if (!prepare_vision_messages(req["messages"], vision_frontend.get(),
+                                     prepared_vision, vision_error)) {
+            set_error_response(res, 400, vision_error);
             return;
         }
         bool explicit_max_tokens = false;
@@ -4571,6 +4856,97 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
         }
 
+        if (prepared_vision.active()) {
+            if (kvmem_session_request || kvmem_cache_request ||
+                transcript_replay) {
+                set_error_response(
+                    res, 400,
+                    "multimodal V1 supports standalone requests only; "
+                    "KVMem session/cache/transcript replay is not yet "
+                    "supported");
+                return;
+            }
+            if (req.contains("kvmem_round_padding")) {
+                set_error_response(
+                    res, 400,
+                    "multimodal V1 cannot be combined with kvmem_round_padding");
+                return;
+            }
+            std::string finalize_error;
+            if (!finalize_vision_tokens(prompt_token_ids, usage_tokenizer,
+                                        prepared_vision, g,
+                                        finalize_error)) {
+                set_error_response(res, 400, finalize_error);
+                return;
+            }
+            g.prompt_token_ids_override.assign(
+                prompt_token_ids.begin(), prompt_token_ids.end());
+            for (const auto &span : prepared_vision.token_spans) {
+                g.kvmem_pinned_token_spans.push_back(
+                    GenerationOptions::KvMemPinnedTokenSpan{
+                        span.first, span.second,
+                        GenerationOptions::KvMemPinnedReason::
+                            ExplicitClientPin});
+            }
+            if (engine.kvmem_enabled) {
+                const uint32_t block_tokens = static_cast<uint32_t>(
+                    std::max(1, engine.kvmem_block_tokens));
+                const uint32_t budget_tokens = g.kvmem_semantic_budget > 0
+                    ? g.kvmem_semantic_budget
+                    : static_cast<uint32_t>(std::max(0, engine.kvmem_budget));
+                std::vector<uint8_t> pinned(
+                    (prompt_token_ids.size() + block_tokens - 1) /
+                        block_tokens,
+                    0);
+                for (const auto &span : g.kvmem_pinned_token_spans) {
+                    if (span.begin >= span.end) continue;
+                    const uint32_t first = span.begin / block_tokens;
+                    const uint32_t last = (span.end - 1) / block_tokens;
+                    for (uint32_t block = first;
+                         block <= last && block < pinned.size(); ++block) {
+                        pinned[block] = 1;
+                    }
+                }
+                const uint64_t pinned_tokens =
+                    static_cast<uint64_t>(std::count(
+                        pinned.begin(), pinned.end(), uint8_t{1})) *
+                    block_tokens;
+                if (pinned_tokens > budget_tokens) {
+                    set_error_response(
+                        res, 413,
+                        "multimodal mandatory spans exceed the KVMem active "
+                        "budget: pinned_tokens=" +
+                            std::to_string(pinned_tokens) +
+                            " budget_tokens=" +
+                            std::to_string(budget_tokens));
+                    return;
+                }
+                const uint32_t pinned_blocks = static_cast<uint32_t>(
+                    std::count(pinned.begin(), pinned.end(), uint8_t{1}));
+                // The generic request plan was drafted before visual token
+                // IDs were installed so byte/token span mapping stayed exact.
+                // Refresh its capacity accounting now that the atomic visual
+                // spans are known, without changing any text-only plan.
+                plan_input.raw_mandatory_blocks = std::max(
+                    plan_input.raw_mandatory_blocks, pinned_blocks);
+                plan_input.mandatory_blocks = pinned_blocks;
+                const uint32_t budget_blocks = budget_tokens / block_tokens;
+                plan_input.retrieval_reserve_blocks =
+                    budget_blocks > pinned_blocks
+                        ? std::min(plan_input.retrieval_reserve_blocks,
+                                   budget_blocks - pinned_blocks)
+                        : 0;
+                g.kvmem_request_plan =
+                    detail::kvmem_draft_request_plan(plan_input);
+            }
+            std::cerr << "[qw3-serve] multimodal prompt images="
+                      << prepared_vision.encoded.grids.size()
+                      << " visual_tokens="
+                      << g.input_embedding_overrides.size()
+                      << " mandatory_spans="
+                      << prepared_vision.token_spans.size() << "\n";
+        }
+
         // Controlled round-alignment experiment. The request's byte spans are
         // first mapped through the canonical, unmodified prompt above so query
         // and group coordinates remain auditable. We then insert an ordinary
@@ -5571,8 +5947,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     choice["function"].value("name", "");
             }
         }
+        json messages = openai_req["messages"];
+        PreparedVisionRequest prepared;
+        if (!prepare_vision_messages(messages, vision_frontend.get(),
+                                     prepared, error)) {
+            return false;
+        }
         const std::string prompt = render_messages(
-            openai_req["messages"], tools, enable_thinking,
+            messages, tools, enable_thinking,
             forced_tool_name, /*message_spans=*/nullptr,
             /*add_generation_prompt=*/true,
             /*require_tool_call=*/tool_choice_required,

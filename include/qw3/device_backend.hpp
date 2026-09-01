@@ -1044,6 +1044,24 @@ public:
         return {false, "rope_partial_batch_positions requires backend override"};
     }
 
+    // Qwen3.5/3.8 multimodal RoPE. `positions` is a packed int32 tensor with
+    // three consecutive arrays of length `batch`: temporal, height, width.
+    // The frequency halves use Qwen's interleaved mrope_section=[11,11,10]
+    // routing. Text rows provide the same value on all three axes and are
+    // therefore exactly equivalent to ordinary RoPE.
+    virtual DeviceStatus rope_partial_batch_mrope(DeviceTensor &x,
+                                                  uint32_t batch,
+                                                  uint32_t batch_stride,
+                                                  uint32_t n_units,
+                                                  uint32_t per_unit_stride,
+                                                  uint32_t rope_dim,
+                                                  const DeviceTensor &positions,
+                                                  float theta) {
+        (void)x; (void)batch; (void)batch_stride; (void)n_units;
+        (void)per_unit_stride; (void)rope_dim; (void)positions; (void)theta;
+        return {false, "rope_partial_batch_mrope requires backend override"};
+    }
+
     // Append `per_pos_size` floats from src into cache at slot `pos`.
     virtual DeviceStatus kv_append(DeviceTensor &cache,
                                    const DeviceTensor &src,

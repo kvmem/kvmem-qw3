@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace qw3 {
@@ -188,6 +189,10 @@ public:
     void set_mtp_prefix_len(uint32_t prefix_len);
     void prepare_decode_token_pages(uint32_t count = 1);
     void advance_position(uint32_t count = 1) { position_ += count; }
+    void set_input_embedding_overrides(
+        const std::vector<GenerationOptions::InputEmbeddingOverride> &overrides,
+        const std::vector<uint32_t> &prompt_tokens,
+        const std::vector<std::array<uint32_t, 3>> &mrope_positions);
 
     NativeExecutorReport dry_run_token(uint32_t token_id, bool execute_heavy);
     NativeExecutorReport forward_one_token(uint32_t token_id,
@@ -899,8 +904,28 @@ private:
     void ensure_ffn_mid_batch_scratch(uint32_t active_batch);
     void ensure_ffn_gate_up_batch_scratch(uint32_t active_batch);
     void ensure_recurrent_materialization_batch_scratch(uint32_t active_batch);
+    uint32_t resolve_input_token(uint32_t token_id) const;
+    void overwrite_input_embedding(DeviceTensor &dst, uint32_t token_id,
+                                   uint64_t row_offset = 0);
+    void overwrite_input_embeddings_batch(DeviceTensor &dst,
+                                          const uint32_t *tokens,
+                                          uint32_t batch,
+                                          uint32_t row_stride);
+    bool prepare_input_mrope_batch(const uint32_t *tokens,
+                                   uint32_t batch,
+                                   uint32_t logical_base);
+    uint32_t adjusted_multimodal_rope_position(uint32_t pos) const;
 
     bool scratch_ready_ = false;
+    std::vector<GenerationOptions::InputEmbeddingOverride>
+        input_embedding_overrides_;
+    std::unordered_map<uint32_t, size_t> input_embedding_override_index_;
+    std::vector<uint32_t> input_multimodal_prompt_tokens_;
+    std::vector<std::array<uint32_t, 3>> input_mrope_positions_;
+    std::vector<int32_t> input_mrope_positions_host_;
+    std::unique_ptr<DeviceTensor> input_mrope_positions_device_;
+    uint32_t input_mrope_positions_capacity_ = 0;
+    int64_t input_mrope_decode_delta_ = 0;
     std::unique_ptr<DeviceTensor> h_;
     std::unique_ptr<DeviceTensor> norm_;
     std::unique_ptr<DeviceTensor> attn_out_;

@@ -136,22 +136,29 @@ void test_billing_marker_does_not_invalidate_prompt_prefix() {
             "billing marker was not removed without disturbing real policy");
 }
 
-void test_rejects_unsupported_image() {
+void test_converts_base64_image() {
     const json request = {
         {"model", "qwen"},
         {"max_tokens", 64},
         {"messages", json::array({json{
              {"role", "user"},
-             {"content", json::array({json{{"type", "image"},
-                                             {"source", json::object()}}})}}})}
+             {"content", json::array({
+                  json{{"type", "text"}, {"text", "inspect"}},
+                  json{{"type", "image"},
+                       {"source", json{{"type", "base64"},
+                                        {"media_type", "image/png"},
+                                        {"data", "aGVsbG8="}}}}})}}})}
     };
     json converted;
     std::string error;
-    require(!anthropic_request_to_openai(request, converted, error),
-            "image input was silently accepted");
-    require(error.find("unsupported user content block type") !=
-                std::string::npos,
-            "image rejection was not explicit");
+    require(anthropic_request_to_openai(request, converted, error), error);
+    const json &content = converted["messages"][0]["content"];
+    require(content.is_array() && content.size() == 2,
+            "image/text block order was not preserved");
+    require(content[1]["type"] == "image_url" &&
+                content[1]["image_url"]["url"] ==
+                    "data:image/png;base64,aGVsbG8=",
+            "Anthropic base64 image did not map to OpenAI image_url");
 }
 
 void test_tool_result_followed_by_reminder_preserves_order() {
@@ -365,7 +372,7 @@ void test_streaming_error_is_terminal() {
 int main() {
     test_request_conversion();
     test_billing_marker_does_not_invalidate_prompt_prefix();
-    test_rejects_unsupported_image();
+    test_converts_base64_image();
     test_tool_result_followed_by_reminder_preserves_order();
     test_malformed_field_type_returns_error();
     test_nonstream_response_conversion();
