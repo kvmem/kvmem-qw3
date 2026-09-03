@@ -1119,9 +1119,11 @@ private:
     uint32_t mtp_window_page_count_ = 0;
     std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
-    // Dedicated immutable raw-K arena. Slots are permanent per raw chunk for
-    // the lifetime of a session; unlike the V tier they are never LRU-reused
-    // while their token range remains valid.
+    // Dedicated immutable raw-K arena. Online sessions address one record per
+    // semantic block so GC/truncation can reclaim it independently; durable
+    // archives retain their legacy direct-mapped record per capture chunk.
+    // Unlike the V cache, raw-K records are authoritative until explicitly
+    // truncated or permanently removed by a higher-level policy.
     std::unique_ptr<NvmeKvTier> kvmem_raw_k_nvme_tier_;
 
     // Context archive. When set, the raw-K and V arenas above live inside the
@@ -1203,6 +1205,17 @@ private:
     uint64_t kvmem_raw_k_chunk_bytes_ = 0;
     uint64_t kvmem_raw_mtp_k_chunk_bytes_ = 0;
     bool kvmem_raw_k_nvme_enabled_ = false;
+    // Online raw-K persistence is independently addressable at the semantic
+    // block granularity even though capture, D2H and writeback remain grouped
+    // in raw_k_chunk_tokens_ batches.  Archives deliberately retain their
+    // legacy direct-mapped, one-slot-per-capture-chunk layout so existing
+    // durable artifacts remain byte-for-byte compatible.
+    bool kvmem_raw_k_nvme_block_slots_ = false;
+    uint64_t kvmem_raw_k_nvme_main_block_bytes_ = 0;
+    uint64_t kvmem_raw_k_nvme_mtp_block_bytes_ = 0;
+    uint64_t kvmem_raw_k_nvme_slot_bytes_ = 0;
+    std::vector<uint8_t> kvmem_raw_k_nvme_block_backed_;
+    std::vector<uint8_t> kvmem_raw_mtp_k_nvme_block_backed_;
     std::vector<uint8_t> kvmem_raw_k_nvme_backed_;
     std::vector<uint8_t> kvmem_raw_mtp_k_nvme_backed_;
     std::vector<uint8_t> kvmem_raw_k_dirty_;
@@ -1566,8 +1579,14 @@ private:
     bool kvmem_cpu_budget_has(uint64_t bytes) const;
     bool kvmem_reserve_cpu_slot(int32_t slot);
     void kvmem_release_cpu_slot(int32_t slot);
-    void kvmem_evict_cpu_for_raw(uint64_t bytes);
-    bool kvmem_evict_one_raw_k_chunk();
+    void kvmem_evict_cpu_for_raw(
+        uint64_t bytes, bool protect_mtp = false,
+        uint32_t protect_first = UINT32_MAX,
+        uint32_t protect_last = 0);
+    bool kvmem_evict_one_raw_k_chunk(
+        bool protect_mtp = false,
+        uint32_t protect_first = UINT32_MAX,
+        uint32_t protect_last = 0);
     void kvmem_ensure_raw_k_chunks(uint32_t base, uint32_t rows,
                                    bool mtp);
     void kvmem_write_raw_k(uint32_t layer_slot, uint32_t base,

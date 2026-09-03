@@ -813,12 +813,29 @@ QwenExecutor::KvMemTierUsage QwenExecutor::kvmem_tier_usage() const {
                 static_cast<uint64_t>(kvmem_nvme_tier_->slot_count()) *
                 u.block_bytes;
         }
-        for (uint8_t backed : kvmem_raw_k_nvme_backed_) {
-            if (backed) u.nvme_raw_k_bytes += kvmem_raw_k_chunk_bytes_;
-        }
-        for (uint8_t backed : kvmem_raw_mtp_k_nvme_backed_) {
-            if (backed) {
-                u.nvme_raw_k_bytes += kvmem_raw_mtp_k_chunk_bytes_;
+        if (kvmem_raw_k_nvme_block_slots_) {
+            for (uint8_t backed : kvmem_raw_k_nvme_block_backed_) {
+                if (backed) {
+                    u.nvme_raw_k_bytes +=
+                        kvmem_raw_k_nvme_main_block_bytes_;
+                }
+            }
+            for (uint8_t backed : kvmem_raw_mtp_k_nvme_block_backed_) {
+                if (backed) {
+                    u.nvme_raw_k_bytes +=
+                        kvmem_raw_k_nvme_mtp_block_bytes_;
+                }
+            }
+        } else {
+            for (uint8_t backed : kvmem_raw_k_nvme_backed_) {
+                if (backed) {
+                    u.nvme_raw_k_bytes += kvmem_raw_k_chunk_bytes_;
+                }
+            }
+            for (uint8_t backed : kvmem_raw_mtp_k_nvme_backed_) {
+                if (backed) {
+                    u.nvme_raw_k_bytes += kvmem_raw_mtp_k_chunk_bytes_;
+                }
             }
         }
         if (kvmem_raw_k_nvme_tier_) {
@@ -1444,6 +1461,10 @@ void QwenExecutor::reset_state() {
     }
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
     if (kvmem_raw_k_nvme_tier_) kvmem_raw_k_nvme_tier_->clear();
+    std::fill(kvmem_raw_k_nvme_block_backed_.begin(),
+              kvmem_raw_k_nvme_block_backed_.end(), uint8_t{0});
+    std::fill(kvmem_raw_mtp_k_nvme_block_backed_.begin(),
+              kvmem_raw_mtp_k_nvme_block_backed_.end(), uint8_t{0});
     std::fill(kvmem_raw_k_nvme_backed_.begin(),
               kvmem_raw_k_nvme_backed_.end(), uint8_t{0});
     std::fill(kvmem_raw_mtp_k_nvme_backed_.begin(),
@@ -2797,7 +2818,9 @@ void QwenExecutor::kvmem_release_cpu_slot(int32_t slot) {
     }
 }
 
-void QwenExecutor::kvmem_evict_cpu_for_raw(uint64_t bytes) {
+void QwenExecutor::kvmem_evict_cpu_for_raw(
+        uint64_t bytes, bool protect_mtp,
+        uint32_t protect_first, uint32_t protect_last) {
     if (!kvmem_sparse_cpu_tier_ || kvmem_cpu_budget_has(bytes)) return;
     if (!kvmem_cpu_tier_ || !block_store_) {
         throw std::runtime_error(
@@ -2860,7 +2883,10 @@ void QwenExecutor::kvmem_evict_cpu_for_raw(uint64_t bytes) {
         const int32_t victim_i =
             kvmem_cpu_tier_ ? kvmem_cpu_tier_->lru_victim() : -1;
         if (!kvmem_nvme_tier_ || victim_i < 0) {
-            if (kvmem_evict_one_raw_k_chunk()) continue;
+            if (kvmem_evict_one_raw_k_chunk(
+                    protect_mtp, protect_first, protect_last)) {
+                continue;
+            }
             throw std::runtime_error(
                 "KVMem immutable raw-K growth exhausted --kvmem-cpu-gb; "
                 "no CPU V block or raw-K cache chunk can be evicted. Raise "
@@ -2966,6 +2992,83 @@ void QwenExecutor::kvmem_persist_raw_k_chunk(
         throw std::runtime_error(
             "KVMem cannot persist a non-resident raw-K chunk");
     }
+    if (kvmem_raw_k_nvme_block_slots_) {
+        if (!block_store_) {
+            throw std::runtime_error(
+                "KVMem raw-K block-slot persistence lost its block store");
+        }
+        const uint32_t bt = std::max<uint32_t>(
+            1, block_store_->config().block_tokens);
+        const uint32_t blocks_per_chunk =
+            kvmem_raw_k_chunk_tokens_ / bt;
+        const uint64_t total_blocks =
+            (static_cast<uint64_t>(kv_ctx_size_) + bt - 1) / bt;
+        const uint64_t first_block =
+            static_cast<uint64_t>(chunk) * blocks_per_chunk;
+        const uint32_t blocks = first_block >= total_blocks
+            ? 0
+            : static_cast<uint32_t>(std::min<uint64_t>(
+                  blocks_per_chunk, total_blocks - first_block));
+        const uint64_t block_bytes = mtp
+            ? kvmem_raw_k_nvme_mtp_block_bytes_
+            : kvmem_raw_k_nvme_main_block_bytes_;
+        const uint64_t slot_offset = mtp
+            ? kvmem_raw_k_nvme_main_block_bytes_ : 0;
+        const auto &valid_tokens = mtp
+            ? kvmem_raw_mtp_k_valid_tokens_
+            : kvmem_raw_k_valid_tokens_;
+        auto &block_backed = mtp
+            ? kvmem_raw_mtp_k_nvme_block_backed_
+            : kvmem_raw_k_nvme_block_backed_;
+        uint32_t written_blocks = 0;
+        for (uint32_t b = 0; b < blocks; ++b) {
+            const uint32_t block_id =
+                static_cast<uint32_t>(first_block + b);
+            const size_t token_begin = std::min<size_t>(
+                valid_tokens.size(),
+                static_cast<size_t>(block_id) * bt);
+            const size_t token_end = std::min<size_t>(
+                valid_tokens.size(), token_begin + bt);
+            const bool has_valid = std::any_of(
+                valid_tokens.begin() +
+                    static_cast<std::ptrdiff_t>(token_begin),
+                valid_tokens.begin() +
+                    static_cast<std::ptrdiff_t>(token_end),
+                [](uint8_t v) { return v != 0; });
+            if (!has_valid) continue;
+            const NvmeSlotPlacement placement =
+                kvmem_raw_k_nvme_tier_->place_block(block_id);
+            if (placement.slot < 0) {
+                throw std::runtime_error(
+                    "KVMem raw-K NVMe block-slot arena is full");
+            }
+            kvmem_raw_k_nvme_tier_->write_slot_range(
+                placement.slot, slot_offset,
+                chunks[chunk].get() +
+                    static_cast<uint64_t>(b) * block_bytes,
+                block_bytes);
+            if (block_id < block_backed.size()) {
+                block_backed[block_id] = 1;
+            }
+            ++written_blocks;
+        }
+        backed[chunk] = 1;
+        dirty[chunk] = 0;
+        kvmem_raw_k_nvme_write_bytes_ +=
+            static_cast<uint64_t>(written_blocks) * block_bytes;
+        if (kvmem_tier_trace_enabled()) {
+            std::fprintf(
+                stderr,
+                "[kvmem-raw-k-nvme] op=write-block-group chunk=%u "
+                "segment=%s blocks=%u bytes=%llu cumulative_write_bytes=%llu\n",
+                chunk, mtp ? "mtp" : "main", written_blocks,
+                static_cast<unsigned long long>(
+                    static_cast<uint64_t>(written_blocks) * block_bytes),
+                static_cast<unsigned long long>(
+                    kvmem_raw_k_nvme_write_bytes_));
+        }
+        return;
+    }
     const NvmeSlotPlacement placement =
         kvmem_raw_k_nvme_tier_->place_block(chunk);
     if (placement.slot < 0) {
@@ -3021,26 +3124,89 @@ void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
             // generation. The completed future proves both the transfer fence
             // and positional write are done, so this is the last safe point to
             // populate the CPU cache before the slot can be recycled.
-            if (chunk < kvmem_raw_k_chunks_.size() &&
-                kvmem_raw_k_chunks_[chunk]) {
-                std::memcpy(
-                    kvmem_raw_k_chunks_[chunk].get(), record,
-                    static_cast<size_t>(kvmem_raw_k_chunk_bytes_));
-            }
-            if (kvmem_raw_mtp_k_chunk_bytes_ > 0 &&
-                chunk < kvmem_raw_mtp_k_chunks_.size() &&
-                kvmem_raw_mtp_k_chunks_[chunk]) {
-                std::memcpy(
-                    kvmem_raw_mtp_k_chunks_[chunk].get(),
-                    record + kvmem_raw_k_chunk_bytes_,
-                    static_cast<size_t>(
-                        kvmem_raw_mtp_k_chunk_bytes_));
+            if (kvmem_raw_k_nvme_block_slots_) {
+                const uint32_t bt = block_store_
+                    ? std::max<uint32_t>(
+                          1, block_store_->config().block_tokens)
+                    : kvmem_raw_k_chunk_tokens_;
+                const uint32_t blocks_per_chunk =
+                    kvmem_raw_k_chunk_tokens_ / bt;
+                for (uint32_t b = 0; b < blocks_per_chunk; ++b) {
+                    const uint8_t *block_record =
+                        record + static_cast<uint64_t>(b) *
+                                     kvmem_raw_k_nvme_slot_bytes_;
+                    if (chunk < kvmem_raw_k_chunks_.size() &&
+                        kvmem_raw_k_chunks_[chunk]) {
+                        std::memcpy(
+                            kvmem_raw_k_chunks_[chunk].get() +
+                                static_cast<uint64_t>(b) *
+                                    kvmem_raw_k_nvme_main_block_bytes_,
+                            block_record,
+                            static_cast<size_t>(
+                                kvmem_raw_k_nvme_main_block_bytes_));
+                    }
+                    if (kvmem_raw_k_nvme_mtp_block_bytes_ > 0 &&
+                        chunk < kvmem_raw_mtp_k_chunks_.size() &&
+                        kvmem_raw_mtp_k_chunks_[chunk]) {
+                        std::memcpy(
+                            kvmem_raw_mtp_k_chunks_[chunk].get() +
+                                static_cast<uint64_t>(b) *
+                                    kvmem_raw_k_nvme_mtp_block_bytes_,
+                            block_record +
+                                kvmem_raw_k_nvme_main_block_bytes_,
+                            static_cast<size_t>(
+                                kvmem_raw_k_nvme_mtp_block_bytes_));
+                    }
+                }
+            } else {
+                if (chunk < kvmem_raw_k_chunks_.size() &&
+                    kvmem_raw_k_chunks_[chunk]) {
+                    std::memcpy(
+                        kvmem_raw_k_chunks_[chunk].get(), record,
+                        static_cast<size_t>(kvmem_raw_k_chunk_bytes_));
+                }
+                if (kvmem_raw_mtp_k_chunk_bytes_ > 0 &&
+                    chunk < kvmem_raw_mtp_k_chunks_.size() &&
+                    kvmem_raw_mtp_k_chunks_[chunk]) {
+                    std::memcpy(
+                        kvmem_raw_mtp_k_chunks_[chunk].get(),
+                        record + kvmem_raw_k_chunk_bytes_,
+                        static_cast<size_t>(
+                            kvmem_raw_mtp_k_chunk_bytes_));
+                }
             }
             if (chunk < kvmem_raw_k_nvme_backed_.size()) {
                 kvmem_raw_k_nvme_backed_[chunk] = 1;
             }
             if (chunk < kvmem_raw_mtp_k_nvme_backed_.size()) {
                 kvmem_raw_mtp_k_nvme_backed_[chunk] = 1;
+            }
+            if (kvmem_raw_k_nvme_block_slots_ && block_store_) {
+                const uint32_t bt = std::max<uint32_t>(
+                    1, block_store_->config().block_tokens);
+                const uint32_t blocks_per_chunk =
+                    kvmem_raw_k_chunk_tokens_ / bt;
+                const uint64_t total_blocks =
+                    (static_cast<uint64_t>(kv_ctx_size_) + bt - 1) / bt;
+                const uint64_t first_block =
+                    static_cast<uint64_t>(chunk) * blocks_per_chunk;
+                const uint32_t blocks = first_block >= total_blocks
+                    ? 0
+                    : static_cast<uint32_t>(std::min<uint64_t>(
+                          blocks_per_chunk, total_blocks - first_block));
+                for (uint32_t b = 0; b < blocks; ++b) {
+                    const size_t block_id =
+                        static_cast<size_t>(first_block + b);
+                    if (block_id <
+                        kvmem_raw_k_nvme_block_backed_.size()) {
+                        kvmem_raw_k_nvme_block_backed_[block_id] = 1;
+                    }
+                    if (kvmem_raw_mtp_k_chunk_bytes_ > 0 &&
+                        block_id <
+                            kvmem_raw_mtp_k_nvme_block_backed_.size()) {
+                        kvmem_raw_mtp_k_nvme_block_backed_[block_id] = 1;
+                    }
+                }
             }
             if (chunk < kvmem_raw_k_dirty_.size()) {
                 kvmem_raw_k_dirty_[chunk] = 0;
@@ -3091,9 +3257,19 @@ void QwenExecutor::kvmem_submit_raw_k_writeback_slot(
     RawWritebackSlot &slot =
         kvmem_raw_writeback_slots_[slot_index];
     if (slot.in_flight || slot.used_bytes == 0) return;
+    // Main and MTP capture are produced at different points in the forward
+    // path. A staging slab may therefore contain a reserved group whose final
+    // physical spans have not been published yet. Never submit (or reap) a
+    // partially assembled group.
+    for (uint32_t chunk : slot.chunks) {
+        if (chunk >= kvmem_raw_k_write_pending_.size() ||
+            !kvmem_raw_k_write_pending_[chunk]) {
+            return;
+        }
+    }
     if (!slot.host || !kvmem_raw_k_nvme_tier_ ||
         slot.chunks.empty() ||
-        slot.spans.size() != slot.chunks.size()) {
+        slot.spans.empty()) {
         throw std::runtime_error(
             "KVMem raw-K writeback slot is incomplete");
     }
@@ -3223,42 +3399,120 @@ bool QwenExecutor::kvmem_copy_raw_k_chunk_to_writeback(
     uint8_t *record =
         static_cast<uint8_t *>(slot.host->data) +
         record_offset;
-    if (!kvmem_raw_writeback_main_ready_[chunk]) {
-        if (!kvmem_raw_k_chunks_[chunk]) {
+    if (kvmem_raw_k_nvme_block_slots_) {
+        if (!kvmem_raw_writeback_main_ready_[chunk] &&
+            !kvmem_raw_k_chunks_[chunk]) {
             throw std::runtime_error(
                 "KVMem completed raw-K chunk is not CPU resident");
         }
-        std::memcpy(
-            record, kvmem_raw_k_chunks_[chunk].get(),
-            static_cast<size_t>(kvmem_raw_k_chunk_bytes_));
-        kvmem_raw_writeback_main_ready_[chunk] = 1;
-    }
-    if (kvmem_raw_mtp_k_chunk_bytes_ > 0 &&
-        !kvmem_raw_writeback_mtp_ready_[chunk]) {
-        if (chunk >= kvmem_raw_mtp_k_chunks_.size() ||
-            !kvmem_raw_mtp_k_chunks_[chunk]) {
+        if (kvmem_raw_mtp_k_chunk_bytes_ > 0 &&
+            !kvmem_raw_writeback_mtp_ready_[chunk] &&
+            (chunk >= kvmem_raw_mtp_k_chunks_.size() ||
+             !kvmem_raw_mtp_k_chunks_[chunk])) {
             throw std::runtime_error(
                 "KVMem completed raw MTP-K chunk is not CPU resident");
         }
-        std::memcpy(
-            record + kvmem_raw_k_chunk_bytes_,
-            kvmem_raw_mtp_k_chunks_[chunk].get(),
-            static_cast<size_t>(
-                kvmem_raw_mtp_k_chunk_bytes_));
-        kvmem_raw_writeback_mtp_ready_[chunk] = 1;
+        const uint32_t bt = std::max<uint32_t>(
+            1, block_store_->config().block_tokens);
+        const uint32_t blocks_per_chunk =
+            kvmem_raw_k_chunk_tokens_ / bt;
+        for (uint32_t b = 0; b < blocks_per_chunk; ++b) {
+            uint8_t *block_record =
+                record + static_cast<uint64_t>(b) *
+                             kvmem_raw_k_nvme_slot_bytes_;
+            if (!kvmem_raw_writeback_main_ready_[chunk]) {
+                std::memcpy(
+                    block_record,
+                    kvmem_raw_k_chunks_[chunk].get() +
+                        static_cast<uint64_t>(b) *
+                            kvmem_raw_k_nvme_main_block_bytes_,
+                    static_cast<size_t>(
+                        kvmem_raw_k_nvme_main_block_bytes_));
+            }
+            if (kvmem_raw_k_nvme_mtp_block_bytes_ > 0 &&
+                !kvmem_raw_writeback_mtp_ready_[chunk]) {
+                std::memcpy(
+                    block_record +
+                        kvmem_raw_k_nvme_main_block_bytes_,
+                    kvmem_raw_mtp_k_chunks_[chunk].get() +
+                        static_cast<uint64_t>(b) *
+                            kvmem_raw_k_nvme_mtp_block_bytes_,
+                    static_cast<size_t>(
+                        kvmem_raw_k_nvme_mtp_block_bytes_));
+            }
+        }
+        kvmem_raw_writeback_main_ready_[chunk] = 1;
+        if (kvmem_raw_mtp_k_chunk_bytes_ > 0) {
+            kvmem_raw_writeback_mtp_ready_[chunk] = 1;
+        }
+    } else {
+        if (!kvmem_raw_writeback_main_ready_[chunk]) {
+            if (!kvmem_raw_k_chunks_[chunk]) {
+                throw std::runtime_error(
+                    "KVMem completed raw-K chunk is not CPU resident");
+            }
+            std::memcpy(
+                record, kvmem_raw_k_chunks_[chunk].get(),
+                static_cast<size_t>(kvmem_raw_k_chunk_bytes_));
+            kvmem_raw_writeback_main_ready_[chunk] = 1;
+        }
+        if (kvmem_raw_mtp_k_chunk_bytes_ > 0 &&
+            !kvmem_raw_writeback_mtp_ready_[chunk]) {
+            if (chunk >= kvmem_raw_mtp_k_chunks_.size() ||
+                !kvmem_raw_mtp_k_chunks_[chunk]) {
+                throw std::runtime_error(
+                    "KVMem completed raw MTP-K chunk is not CPU resident");
+            }
+            std::memcpy(
+                record + kvmem_raw_k_chunk_bytes_,
+                kvmem_raw_mtp_k_chunks_[chunk].get(),
+                static_cast<size_t>(
+                    kvmem_raw_mtp_k_chunk_bytes_));
+            kvmem_raw_writeback_mtp_ready_[chunk] = 1;
+        }
     }
     if (kvmem_raw_mtp_k_chunk_bytes_ == 0) {
         kvmem_raw_writeback_mtp_ready_[chunk] = 1;
     }
-    const NvmeSlotPlacement placement =
-        kvmem_raw_k_nvme_tier_->place_block(chunk);
-    if (placement.slot < 0) {
-        throw std::runtime_error(
-            "KVMem raw-K NVMe authority arena is full");
+    if (kvmem_raw_k_nvme_block_slots_) {
+        const uint32_t bt = std::max<uint32_t>(
+            1, block_store_->config().block_tokens);
+        const uint32_t blocks_per_chunk =
+            kvmem_raw_k_chunk_tokens_ / bt;
+        const uint64_t total_blocks =
+            (static_cast<uint64_t>(kv_ctx_size_) + bt - 1) / bt;
+        const uint64_t first_block =
+            static_cast<uint64_t>(chunk) * blocks_per_chunk;
+        const uint32_t blocks = first_block >= total_blocks
+            ? 0
+            : static_cast<uint32_t>(std::min<uint64_t>(
+                  blocks_per_chunk, total_blocks - first_block));
+        for (uint32_t b = 0; b < blocks; ++b) {
+            const uint32_t block_id =
+                static_cast<uint32_t>(first_block + b);
+            const NvmeSlotPlacement placement =
+                kvmem_raw_k_nvme_tier_->place_block(block_id);
+            if (placement.slot < 0) {
+                throw std::runtime_error(
+                    "KVMem raw-K NVMe block-slot arena is full");
+            }
+            slot.spans.push_back(NvmeIoSpan{
+                placement.slot,
+                record_offset + static_cast<uint64_t>(b) *
+                                    kvmem_raw_k_nvme_slot_bytes_,
+                kvmem_raw_k_nvme_slot_bytes_});
+        }
+    } else {
+        const NvmeSlotPlacement placement =
+            kvmem_raw_k_nvme_tier_->place_block(chunk);
+        if (placement.slot < 0) {
+            throw std::runtime_error(
+                "KVMem raw-K NVMe authority arena is full");
+        }
+        slot.spans.push_back(NvmeIoSpan{
+            placement.slot, record_offset,
+            kvmem_raw_writeback_record_bytes_});
     }
-    slot.spans.push_back(NvmeIoSpan{
-        placement.slot, record_offset,
-        kvmem_raw_writeback_record_bytes_});
     kvmem_raw_k_write_pending_[chunk] = 1;
     if (slot.used_bytes == slot.capacity_bytes) {
         kvmem_submit_raw_k_writeback_slot(slot_index);
@@ -3466,7 +3720,9 @@ void QwenExecutor::kvmem_persist_completed_raw_k_chunks(
     }
 }
 
-bool QwenExecutor::kvmem_evict_one_raw_k_chunk() {
+bool QwenExecutor::kvmem_evict_one_raw_k_chunk(
+        bool protect_mtp, uint32_t protect_first,
+        uint32_t protect_last) {
     if (!kvmem_raw_k_nvme_enabled_ || !kvmem_raw_k_nvme_tier_) {
         return false;
     }
@@ -3489,6 +3745,18 @@ bool QwenExecutor::kvmem_evict_one_raw_k_chunk() {
         for (uint32_t pass = 0; pass < 3 && victim == UINT32_MAX; ++pass) {
             for (uint32_t chunk = 0; chunk < chunks.size(); ++chunk) {
                 if (!chunks[chunk]) continue;
+                // One host capture can straddle two 2048-token cache chunks
+                // when its logical base is not chunk aligned. All chunks in
+                // that capture must stay resident until every layer has been
+                // copied. Otherwise allocating the later chunk can evict an
+                // earlier one and leave kvmem_write_raw_k() with a dangling
+                // destination. The protection is segment-specific so MTP can
+                // still reclaim a completed main segment (and vice versa).
+                if (mtp == protect_mtp &&
+                    protect_first != UINT32_MAX &&
+                    chunk >= protect_first && chunk <= protect_last) {
+                    continue;
+                }
                 // A direct D2H may already own this allocation while its
                 // combined main/MTP record is still being assembled in pinned
                 // staging. It is neither readable nor independently
@@ -3585,7 +3853,8 @@ void QwenExecutor::kvmem_ensure_raw_k_chunks(
             // large coalesced writes even after the CPU cache reaches steady
             // state.
             while (!kvmem_cpu_budget_has(chunk_bytes) &&
-                   kvmem_evict_one_raw_k_chunk()) {
+                   kvmem_evict_one_raw_k_chunk(
+                       mtp, first, last)) {
             }
         }
         if (!kvmem_cpu_budget_has(chunk_bytes) &&
@@ -3598,7 +3867,8 @@ void QwenExecutor::kvmem_ensure_raw_k_chunks(
             // currently-building record half complete.
             kvmem_flush_raw_k_writes(/*wait_all=*/true);
         }
-        kvmem_evict_cpu_for_raw(chunk_bytes);
+        kvmem_evict_cpu_for_raw(
+            chunk_bytes, mtp, first, last);
         if (!kvmem_cpu_budget_has(chunk_bytes)) {
             throw std::runtime_error(
                 "immutable raw-K chunk exceeds the configured CPU budget");
@@ -3608,19 +3878,85 @@ void QwenExecutor::kvmem_ensure_raw_k_chunks(
         auto &backed =
             mtp ? kvmem_raw_mtp_k_nvme_backed_
                 : kvmem_raw_k_nvme_backed_;
-        if (kvmem_raw_k_nvme_enabled_ &&
-            chunk < backed.size() && backed[chunk]) {
-            const int32_t slot =
-                kvmem_raw_k_nvme_tier_->block_slot(chunk);
-            if (slot < 0) {
-                throw std::runtime_error(
-                    "KVMem raw-K backing metadata lost its NVMe slot");
+        bool has_nvme_backing =
+            chunk < backed.size() && backed[chunk];
+        if (kvmem_raw_k_nvme_block_slots_) {
+            const uint32_t bt = std::max<uint32_t>(
+                1, block_store_->config().block_tokens);
+            const uint32_t blocks_per_chunk =
+                kvmem_raw_k_chunk_tokens_ / bt;
+            const size_t first_block =
+                static_cast<size_t>(chunk) * blocks_per_chunk;
+            const auto &block_backed = mtp
+                ? kvmem_raw_mtp_k_nvme_block_backed_
+                : kvmem_raw_k_nvme_block_backed_;
+            const size_t block_end = std::min<size_t>(
+                block_backed.size(), first_block + blocks_per_chunk);
+            has_nvme_backing = std::any_of(
+                block_backed.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        std::min(first_block, block_backed.size())),
+                block_backed.begin() +
+                    static_cast<std::ptrdiff_t>(block_end),
+                [](uint8_t v) { return v != 0; });
+        }
+        if (kvmem_raw_k_nvme_enabled_ && has_nvme_backing) {
+            if (kvmem_raw_k_nvme_block_slots_) {
+                const uint32_t bt = std::max<uint32_t>(
+                    1, block_store_->config().block_tokens);
+                const uint32_t blocks_per_chunk =
+                    kvmem_raw_k_chunk_tokens_ / bt;
+                const uint64_t total_blocks =
+                    (static_cast<uint64_t>(kv_ctx_size_) + bt - 1) / bt;
+                const uint64_t first_block =
+                    static_cast<uint64_t>(chunk) * blocks_per_chunk;
+                const uint32_t blocks = first_block >= total_blocks
+                    ? 0
+                    : static_cast<uint32_t>(std::min<uint64_t>(
+                          blocks_per_chunk, total_blocks - first_block));
+                const uint64_t block_bytes = mtp
+                    ? kvmem_raw_k_nvme_mtp_block_bytes_
+                    : kvmem_raw_k_nvme_main_block_bytes_;
+                const uint64_t slot_offset = mtp
+                    ? kvmem_raw_k_nvme_main_block_bytes_ : 0;
+                const auto &block_backed = mtp
+                    ? kvmem_raw_mtp_k_nvme_block_backed_
+                    : kvmem_raw_k_nvme_block_backed_;
+                for (uint32_t b = 0; b < blocks; ++b) {
+                    const uint32_t block_id =
+                        static_cast<uint32_t>(first_block + b);
+                    if (block_id >= block_backed.size() ||
+                        !block_backed[block_id]) {
+                        continue;
+                    }
+                    const int32_t slot =
+                        kvmem_raw_k_nvme_tier_->block_slot(block_id);
+                    if (slot < 0) {
+                        throw std::runtime_error(
+                            "KVMem raw-K block backing metadata lost its "
+                            "NVMe slot");
+                    }
+                    kvmem_raw_k_nvme_tier_->read_slot_range(
+                        slot, slot_offset,
+                        storage.get() +
+                            static_cast<uint64_t>(b) * block_bytes,
+                        block_bytes);
+                }
+                kvmem_raw_k_nvme_read_bytes_ +=
+                    static_cast<uint64_t>(blocks) * block_bytes;
+            } else {
+                const int32_t slot =
+                    kvmem_raw_k_nvme_tier_->block_slot(chunk);
+                if (slot < 0) {
+                    throw std::runtime_error(
+                        "KVMem raw-K backing metadata lost its NVMe slot");
+                }
+                const uint64_t segment_offset =
+                    mtp ? kvmem_raw_k_chunk_bytes_ : 0;
+                kvmem_raw_k_nvme_tier_->read_slot_range(
+                    slot, segment_offset, storage.get(), chunk_bytes);
+                kvmem_raw_k_nvme_read_bytes_ += chunk_bytes;
             }
-            const uint64_t segment_offset =
-                mtp ? kvmem_raw_k_chunk_bytes_ : 0;
-            kvmem_raw_k_nvme_tier_->read_slot_range(
-                slot, segment_offset, storage.get(), chunk_bytes);
-            kvmem_raw_k_nvme_read_bytes_ += chunk_bytes;
         }
         chunks[chunk] = std::move(storage);
         if (mtp) {
@@ -3679,6 +4015,10 @@ void QwenExecutor::kvmem_write_raw_k(
                 : static_cast<uint64_t>(layer_slot) *
                       kvmem_raw_k_chunk_tokens_;
             row_offset = layer_base + within;
+        }
+        if (chunk >= chunks.size() || !chunks[chunk]) {
+            throw std::runtime_error(
+                "immutable raw-K capture lost a protected destination chunk");
         }
         uint8_t *dst = chunks[chunk].get() +
             row_offset * kvmem_raw_k_row_bytes_;
@@ -3740,21 +4080,41 @@ void QwenExecutor::kvmem_read_raw_k(
             const auto &backed =
                 mtp ? kvmem_raw_mtp_k_nvme_backed_
                     : kvmem_raw_k_nvme_backed_;
+            const uint32_t nvme_key =
+                kvmem_raw_k_nvme_block_slots_ ? pos / bt : chunk;
+            const auto &block_backed = mtp
+                ? kvmem_raw_mtp_k_nvme_block_backed_
+                : kvmem_raw_k_nvme_block_backed_;
+            const bool nvme_backed = kvmem_raw_k_nvme_block_slots_
+                ? nvme_key < block_backed.size() &&
+                      block_backed[nvme_key]
+                : chunk < backed.size() && backed[chunk];
             if (!kvmem_raw_k_nvme_enabled_ ||
-                chunk >= backed.size() || !backed[chunk]) {
+                !nvme_backed) {
                 throw std::runtime_error(
                     "immutable raw-K read references a chunk with no "
                     "CPU or NVMe authority");
             }
             const int32_t nvme_slot =
-                kvmem_raw_k_nvme_tier_->block_slot(chunk);
+                kvmem_raw_k_nvme_tier_->block_slot(nvme_key);
             if (nvme_slot < 0) {
                 throw std::runtime_error(
                     "immutable raw-K NVMe slot is missing");
             }
-            const uint64_t segment_offset =
-                (mtp ? kvmem_raw_k_chunk_bytes_ : 0) +
-                row_offset * kvmem_raw_k_row_bytes_;
+            uint64_t segment_offset = 0;
+            if (kvmem_raw_k_nvme_block_slots_) {
+                const uint32_t token_in_block = pos % bt;
+                segment_offset = mtp
+                    ? kvmem_raw_k_nvme_main_block_bytes_ +
+                          static_cast<uint64_t>(token_in_block) *
+                              kvmem_raw_k_row_bytes_
+                    : (static_cast<uint64_t>(layer_slot) * bt +
+                       token_in_block) * kvmem_raw_k_row_bytes_;
+            } else {
+                segment_offset =
+                    (mtp ? kvmem_raw_k_chunk_bytes_ : 0) +
+                    row_offset * kvmem_raw_k_row_bytes_;
+            }
             kvmem_raw_k_nvme_tier_->read_slot_range(
                 nvme_slot, segment_offset, dst, bytes);
         }
@@ -3798,25 +4158,36 @@ void QwenExecutor::kvmem_read_raw_k_block(
         const auto &backed =
             mtp ? kvmem_raw_mtp_k_nvme_backed_
                 : kvmem_raw_k_nvme_backed_;
+        const uint32_t nvme_key = kvmem_raw_k_nvme_block_slots_
+            ? base / bt : chunk;
+        const auto &block_backed = mtp
+            ? kvmem_raw_mtp_k_nvme_block_backed_
+            : kvmem_raw_k_nvme_block_backed_;
+        const bool nvme_backed = kvmem_raw_k_nvme_block_slots_
+            ? nvme_key < block_backed.size() &&
+                  block_backed[nvme_key]
+            : chunk < backed.size() && backed[chunk];
         if (kvmem_raw_k_nvme_enabled_ &&
-            chunk < backed.size() && backed[chunk]) {
+            nvme_backed) {
             const int32_t slot =
-                kvmem_raw_k_nvme_tier_->block_slot(chunk);
+                kvmem_raw_k_nvme_tier_->block_slot(nvme_key);
             if (slot < 0) {
                 throw std::runtime_error(
                     "KVMem raw-K block lost its NVMe slot");
             }
             const uint64_t segment_offset =
-                (mtp ? kvmem_raw_k_chunk_bytes_ : 0) +
-                byte_offset;
+                kvmem_raw_k_nvme_block_slots_
+                    ? (mtp ? kvmem_raw_k_nvme_main_block_bytes_ : 0)
+                    : (mtp ? kvmem_raw_k_chunk_bytes_ : 0) +
+                          byte_offset;
             kvmem_raw_k_nvme_tier_->read_slot_range(
                 slot, segment_offset, dst, block_bytes);
             if (kvmem_tier_trace_enabled()) {
                 std::fprintf(
                     stderr,
                     "[kvmem-raw-k-nvme] op=read-block chunk=%u "
-                    "segment=%s slot=%d token_base=%u bytes=%llu\n",
-                    chunk, mtp ? "mtp" : "main", slot, base,
+                    "record=%u segment=%s slot=%d token_base=%u bytes=%llu\n",
+                    chunk, nvme_key, mtp ? "mtp" : "main", slot, base,
                     static_cast<unsigned long long>(block_bytes));
             }
             return;
@@ -3965,8 +4336,26 @@ void QwenExecutor::kvmem_truncate_raw_k(uint32_t token_pos) {
         (token_pos + kvmem_raw_k_chunk_tokens_ - 1) /
         kvmem_raw_k_chunk_tokens_;
     const size_t chunk_count = kvmem_raw_k_chunks_.size();
+    if (kvmem_raw_k_nvme_block_slots_ && block_store_ &&
+        kvmem_raw_k_nvme_tier_) {
+        const uint32_t bt = std::max<uint32_t>(
+            1, block_store_->config().block_tokens);
+        const size_t first_block =
+            (static_cast<uint64_t>(token_pos) + bt - 1) / bt;
+        const size_t block_count =
+            kvmem_raw_k_nvme_block_backed_.size();
+        for (size_t block = first_block; block < block_count; ++block) {
+            kvmem_raw_k_nvme_tier_->release_block(
+                static_cast<uint32_t>(block));
+            kvmem_raw_k_nvme_block_backed_[block] = 0;
+            if (block < kvmem_raw_mtp_k_nvme_block_backed_.size()) {
+                kvmem_raw_mtp_k_nvme_block_backed_[block] = 0;
+            }
+        }
+    }
     for (size_t i = first; i < chunk_count; ++i) {
-        if (kvmem_raw_k_nvme_tier_) {
+        if (kvmem_raw_k_nvme_tier_ &&
+            !kvmem_raw_k_nvme_block_slots_) {
             kvmem_raw_k_nvme_tier_->release_block(
                 static_cast<uint32_t>(i));
         }
@@ -4127,12 +4516,19 @@ bool QwenExecutor::kvmem_try_direct_raw_k_d2h(
         for (uint32_t layer_slot = 0;
              layer_slot < kvmem_raw_layers_.size();
              ++layer_slot) {
-            uint8_t *dst =
-                record +
-                (static_cast<uint64_t>(block) *
-                     kvmem_raw_layers_.size() +
-                 layer_slot) *
-                    layer_block_bytes;
+            uint8_t *dst = record;
+            if (kvmem_raw_k_nvme_block_slots_) {
+                dst += static_cast<uint64_t>(block) *
+                           kvmem_raw_k_nvme_slot_bytes_ +
+                       static_cast<uint64_t>(layer_slot) *
+                           layer_block_bytes;
+            } else {
+                dst +=
+                    (static_cast<uint64_t>(block) *
+                         kvmem_raw_layers_.size() +
+                     layer_slot) *
+                        layer_block_bytes;
+            }
             const uint64_t src_offset =
                 (static_cast<uint64_t>(first_row) +
                  static_cast<uint64_t>(block) * bt) *
@@ -4814,11 +5210,27 @@ bool QwenExecutor::kvmem_try_direct_raw_mtp_k_d2h(
     RawWritebackSlot &slot =
         kvmem_raw_writeback_slots_[slot_index];
     uint8_t *dst =
-        static_cast<uint8_t *>(slot.host->data) +
-        record_offset + kvmem_raw_k_chunk_bytes_;
+        static_cast<uint8_t *>(slot.host->data) + record_offset;
     require_status(backend_.begin_kv_transfer_from_device());
-    require_status(backend_.copy_bytes_to_host_async(
-        raw_k, dst, 0, kvmem_raw_mtp_k_chunk_bytes_));
+    if (kvmem_raw_k_nvme_block_slots_) {
+        const uint32_t bt = std::max<uint32_t>(
+            1, block_store_->config().block_tokens);
+        const uint32_t blocks = kvmem_raw_k_chunk_tokens_ / bt;
+        for (uint32_t block = 0; block < blocks; ++block) {
+            require_status(backend_.copy_bytes_to_host_async(
+                raw_k,
+                dst + static_cast<uint64_t>(block) *
+                          kvmem_raw_k_nvme_slot_bytes_ +
+                      kvmem_raw_k_nvme_main_block_bytes_,
+                static_cast<uint64_t>(block) *
+                    kvmem_raw_k_nvme_mtp_block_bytes_,
+                kvmem_raw_k_nvme_mtp_block_bytes_));
+        }
+    } else {
+        require_status(backend_.copy_bytes_to_host_async(
+            raw_k, dst + kvmem_raw_k_chunk_bytes_, 0,
+            kvmem_raw_mtp_k_chunk_bytes_));
+    }
     require_status(backend_.record_kv_transfer_fence(
         kvmem_raw_mtp_capture_d2h_done_[
             kvmem_raw_mtp_capture_active_slot_]));
@@ -9273,6 +9685,12 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     kvmem_raw_k_chunk_bytes_ = 0;
     kvmem_raw_mtp_k_chunk_bytes_ = 0;
     kvmem_raw_k_nvme_enabled_ = false;
+    kvmem_raw_k_nvme_block_slots_ = false;
+    kvmem_raw_k_nvme_main_block_bytes_ = 0;
+    kvmem_raw_k_nvme_mtp_block_bytes_ = 0;
+    kvmem_raw_k_nvme_slot_bytes_ = 0;
+    kvmem_raw_k_nvme_block_backed_.clear();
+    kvmem_raw_mtp_k_nvme_block_backed_.clear();
     kvmem_raw_k_nvme_backed_.clear();
     kvmem_raw_mtp_k_nvme_backed_.clear();
     kvmem_raw_k_dirty_.clear();
@@ -9416,6 +9834,19 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 ? static_cast<uint64_t>(kvmem_raw_k_chunk_tokens_) *
                       kvmem_raw_k_row_bytes_
                 : 0;
+        const uint32_t raw_blocks_per_chunk =
+            kvmem_raw_k_chunk_tokens_ / effective.block_tokens;
+        kvmem_raw_k_nvme_main_block_bytes_ =
+            static_cast<uint64_t>(kvmem_raw_layers_.size()) *
+            effective.block_tokens * kvmem_raw_k_row_bytes_;
+        kvmem_raw_k_nvme_mtp_block_bytes_ =
+            kvmem_mtp_local_positions_
+                ? static_cast<uint64_t>(effective.block_tokens) *
+                      kvmem_raw_k_row_bytes_
+                : 0;
+        kvmem_raw_k_nvme_slot_bytes_ =
+            kvmem_raw_k_nvme_main_block_bytes_ +
+            kvmem_raw_k_nvme_mtp_block_bytes_;
         kvmem_raw_k_valid_tokens_.assign(kv_ctx_size_, 0);
         kvmem_raw_k_nvme_backed_.assign(
             static_cast<size_t>(raw_chunk_count), 0);
@@ -9433,13 +9864,33 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 static_cast<size_t>(raw_chunk_count), 0);
         }
         if (effective.raw_k_nvme) {
+            // Online sessions use one independently reclaimable raw-K record
+            // per semantic block. Capture and writeback are still aggregated
+            // by the 2048-token raw chunk. Context archives retain the legacy
+            // one-slot-per-chunk direct mapping for format compatibility.
+            kvmem_raw_k_nvme_block_slots_ = kvmem_archive_ == nullptr;
+            const uint64_t raw_nvme_slots =
+                kvmem_raw_k_nvme_block_slots_
+                    ? (static_cast<uint64_t>(kv_ctx_size_) +
+                       effective.block_tokens - 1) /
+                          effective.block_tokens
+                    : raw_chunk_count;
+            if (kvmem_raw_k_nvme_block_slots_) {
+                kvmem_raw_k_nvme_block_backed_.assign(
+                    static_cast<size_t>(raw_nvme_slots), 0);
+                if (kvmem_mtp_local_positions_) {
+                    kvmem_raw_mtp_k_nvme_block_backed_.assign(
+                        static_cast<size_t>(raw_nvme_slots), 0);
+                }
+            }
             NvmeKvTierConfig raw_cfg;
             raw_cfg.dir = effective.nvme_tier_dir;
             raw_cfg.file_name = "qw3_kvmem_raw_k_nvme.bin";
-            raw_cfg.total_bytes = raw_authority_bytes;
-            raw_cfg.slot_bytes =
-                kvmem_raw_k_chunk_bytes_ +
-                kvmem_raw_mtp_k_chunk_bytes_;
+            raw_cfg.slot_bytes = kvmem_raw_k_nvme_block_slots_
+                ? kvmem_raw_k_nvme_slot_bytes_
+                : kvmem_raw_k_chunk_bytes_ +
+                      kvmem_raw_mtp_k_chunk_bytes_;
+            raw_cfg.total_bytes = raw_nvme_slots * raw_cfg.slot_bytes;
             raw_cfg.drop_page_cache = env_flag_enabled(
                 "QW3_KVMEM_DROP_PAGE_CACHE", true);
             if (kvmem_archive_ != nullptr) {
@@ -9459,15 +9910,21 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
                 std::make_unique<NvmeKvTier>(std::move(raw_cfg));
             if (!kvmem_raw_k_nvme_tier_->enabled() ||
                 kvmem_raw_k_nvme_tier_->slot_count() <
-                    raw_chunk_count) {
+                    raw_nvme_slots) {
                 throw std::runtime_error(
                     "KVMem failed to create the complete raw-K NVMe "
                     "authority arena");
             }
             kvmem_raw_k_nvme_enabled_ = true;
+            // A staging record remains a complete capture chunk. In block-slot
+            // mode it contains `raw_blocks_per_chunk` adjacent physical
+            // records and is submitted as that many coalescible spans.
             kvmem_raw_writeback_record_bytes_ =
-                kvmem_raw_k_chunk_bytes_ +
-                kvmem_raw_mtp_k_chunk_bytes_;
+                kvmem_raw_k_nvme_block_slots_
+                    ? static_cast<uint64_t>(raw_blocks_per_chunk) *
+                          kvmem_raw_k_nvme_slot_bytes_
+                    : kvmem_raw_k_chunk_bytes_ +
+                          kvmem_raw_mtp_k_chunk_bytes_;
             kvmem_raw_writeback_chunks_per_slot_ =
                 effective.optimize_pack
                     ? static_cast<uint32_t>(std::max<uint64_t>(
@@ -9500,16 +9957,21 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
             std::fprintf(
                 stderr,
                 "[kvmem-raw-k-nvme] enabled=1 chunks=%llu "
-                "record_bytes=%llu main_chunk_bytes=%llu "
+                "layout=%s physical_slots=%u slot_bytes=%llu "
+                "writeback_group_bytes=%llu main_chunk_bytes=%llu "
                 "mtp_chunk_bytes=%llu authority_bytes=%llu "
                 "v_spill_bytes=%llu cpu_cache_bytes=%llu "
                 "writeback_slots=2 chunks_per_batch=%u "
                 "pinned_slot_bytes=%llu direct_d2h=%d "
                 "gpu_capture_slots=2\n",
                 static_cast<unsigned long long>(raw_chunk_count),
+                kvmem_raw_k_nvme_block_slots_
+                    ? "semantic-block-slots" : "legacy-chunk-slots",
+                kvmem_raw_k_nvme_tier_->slot_count(),
                 static_cast<unsigned long long>(
-                    kvmem_raw_k_chunk_bytes_ +
-                    kvmem_raw_mtp_k_chunk_bytes_),
+                    kvmem_raw_k_nvme_tier_->slot_bytes()),
+                static_cast<unsigned long long>(
+                    kvmem_raw_writeback_record_bytes_),
                 static_cast<unsigned long long>(
                     kvmem_raw_k_chunk_bytes_),
                 static_cast<unsigned long long>(

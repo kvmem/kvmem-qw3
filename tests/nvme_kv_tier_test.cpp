@@ -165,6 +165,78 @@ static void test_coalesced_batch_io() {
     CHECK(output == input);
 }
 
+static void test_block_addressable_raw_k_group() {
+    // Model the online raw-K layout: one semantic block per physical slot,
+    // with Main and MTP K adjacent inside the record. A complete 2048-token
+    // capture group (64 B32 records) must still collapse to one positional
+    // write, while every B32 record remains independently reclaimable.
+    constexpr uint32_t kBlocksPerCapture = 64;
+    constexpr uint64_t kMainBytes = 80;
+    constexpr uint64_t kMtpBytes = 24;
+    constexpr uint64_t kSlotBytes = kMainBytes + kMtpBytes;
+
+    NvmeKvTierConfig cfg;
+    cfg.dir = temp_dir();
+    cfg.file_name = "qw3_raw_k_block_group_test.bin";
+    cfg.total_bytes = kSlotBytes * (kBlocksPerCapture + 1);
+    cfg.slot_bytes = kSlotBytes;
+    NvmeKvTier t(cfg);
+
+    std::vector<uint8_t> input(
+        static_cast<size_t>(kSlotBytes * kBlocksPerCapture));
+    std::vector<NvmeIoSpan> spans;
+    for (uint32_t block = 0; block < kBlocksPerCapture; ++block) {
+        const auto p = t.place_block(1000 + block);
+        CHECK(p.slot == static_cast<int32_t>(block));
+        const uint64_t offset = static_cast<uint64_t>(block) * kSlotBytes;
+        std::fill_n(
+            input.begin() + static_cast<std::ptrdiff_t>(offset),
+            static_cast<size_t>(kMainBytes),
+            static_cast<uint8_t>(block));
+        std::fill_n(
+            input.begin() +
+                static_cast<std::ptrdiff_t>(offset + kMainBytes),
+            static_cast<size_t>(kMtpBytes),
+            static_cast<uint8_t>(0x80u + block));
+        spans.push_back(NvmeIoSpan{p.slot, offset, kSlotBytes});
+    }
+
+    NvmeBatchIoStats writes;
+    t.write_spans(spans, input.data(), input.size(), &writes);
+    CHECK(writes.bytes == input.size());
+    CHECK(writes.syscalls == 1);
+
+    constexpr uint32_t kVictim = 17;
+    const int32_t victim_slot = t.block_slot(1000 + kVictim);
+    CHECK(victim_slot == static_cast<int32_t>(kVictim));
+    t.release_block(1000 + kVictim);
+    CHECK(t.block_slot(1000 + kVictim) == -1);
+
+    const auto replacement = t.place_block(9000);
+    CHECK(replacement.slot == victim_slot);
+    std::vector<uint8_t> replacement_record(kSlotBytes, 0xe7);
+    t.write_block(9000, replacement_record.data(), replacement_record.size());
+
+    std::vector<uint8_t> output(kSlotBytes, 0);
+    t.read_block(9000, output.data(), output.size());
+    CHECK(output == replacement_record);
+
+    // Reusing one record must not disturb either adjacent semantic block.
+    for (uint32_t neighbor : {kVictim - 1, kVictim + 1}) {
+        t.read_block(1000 + neighbor, output.data(), output.size());
+        CHECK(std::equal(
+            output.begin(),
+            output.begin() + static_cast<std::ptrdiff_t>(kMainBytes),
+            input.begin() + static_cast<std::ptrdiff_t>(
+                static_cast<uint64_t>(neighbor) * kSlotBytes)));
+        CHECK(std::equal(
+            output.begin() + static_cast<std::ptrdiff_t>(kMainBytes),
+            output.end(),
+            input.begin() + static_cast<std::ptrdiff_t>(
+                static_cast<uint64_t>(neighbor) * kSlotBytes + kMainBytes)));
+    }
+}
+
 static void test_concurrent_positional_batches() {
     NvmeKvTierConfig cfg;
     cfg.dir = temp_dir();
@@ -215,6 +287,7 @@ int main() {
     test_slot_ranges_and_file_names();
     test_evicting_place();
     test_coalesced_batch_io();
+    test_block_addressable_raw_k_group();
     test_concurrent_positional_batches();
 
     if (g_fail != 0) {
