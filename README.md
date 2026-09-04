@@ -1,12 +1,12 @@
 # QW3 + KVMem
 
-CUDA-native inference and experimental tiered KV memory for long-running Qwen
+CUDA-native inference and tiered KV memory for long-running Qwen
 agents.
 
 QW3 is a purpose-built inference runtime for Qwen `qwen35` hybrid models. It
 owns model loading, tokenization, CUDA execution, and device memory instead of
 delegating generation to another inference engine. Development currently
-focuses on Qwen3.6 and Qwen3.8 27B text generation plus an experimental native
+focuses on Qwen3.6 and Qwen3.8 27B text generation plus a native
 Qwen3.8 image-input path.
 
 Its main research feature, **KVMem**, turns previously computed attention KV
@@ -14,18 +14,6 @@ state into reusable agent memory. KVMem keeps a bounded working set on the GPU,
 stages colder blocks through host RAM and optional NVMe, and selects relevant
 blocks for each new query. The goal is to reduce repeated full-history prefill
 and text compaction in long-lived agent sessions.
-
-> [!IMPORTANT]
-> **QW3 is currently a research preview.** The host build and host unit tests
-> have been reproduced from a fresh build of the current release-preparation
-> worktree, but the final release commit has not yet been retested and a
-> release-pinned GPU/model gate has not been published. Native Q8 inference is
-> currently **Expected**; KVMem, NVFP4, MTP, continuous batching, and frozen
-> archives are **Experimental**.
->
-> Model weights are not included. A public model revision, checksum, and
-> conversion/download procedure still need to be pinned before the first
-> release can describe any GPU configuration as release-tested.
 
 ## Why QW3?
 
@@ -43,52 +31,48 @@ and text compaction in long-lived agent sessions.
   continuous batching, FP8 KV, and NVFP4 weights are available for research and
   tuning.
 
-The external `llama-completion` executable is not linked into QW3 and is not a
-runtime backend; it is used only by an optional development benchmark. A small
-set of llama.cpp-derived CUDA source files remains compiled into QW3 under the
-MIT license and is identified in
-[the third-party notices](THIRD_PARTY_NOTICES.md).
-
 ## How KVMem works
 
-Normal full-context inference keeps every attention KV entry in the active
-device context. KVMem separates accumulated memory from the working set used
-for the next answer:
+KVMem treats an agent’s accumulated KV cache as virtual memory. When the workspace exceeds GPU capacity or the model’s context window, it stores completed KV blocks in host memory or NVMe instead of discarding or summarizing them. At each agent step, KVMem uses the current query to select relevant historical blocks and materializes them, in chronological order, into a bounded GPU-resident execution view. By reusing previously computed KV states and loading only the blocks needed for the current step, KVMem supports large persistent workspaces while keeping GPU memory usage bounded.
 
 ![Animated high-level KVMem overview: long history remains recoverable across
 memory tiers, a new question ranks an internal Mean-K block-summary index, a
 selected KV block replaces another block in a fixed-size GPU attention window,
 and QW3 generates with the refreshed context.](docs/assets/kvmem-flow.svg)
 
-This is a high-level retrieval overview, not an exact execution trace. For
-readability it omits mandatory kept regions, the short internal query-state
-rebuild, and position remapping. The model still generates locally in QW3;
-KVMem is not an external vector database or RAG service.
+The following three parameters control KVMem’s capacity:
 
-The three important capacity controls are:
+- `--ctx` sets the maximum logical size of the accumulated request or agent
+  workspace, including history stored outside GPU memory.
+- `--kvmem-budget` limits the number of historical tokens selected and
+  materialized into the active working set at each agent step.
+- `--kvmem-gen-budget` reserves space in the active context for newly generated
+  response tokens, preventing retrieved history from occupying the entire
+  context window.
 
-- `--ctx`: maximum accumulated request/session capacity.
-- `--kvmem-budget`: history tokens selected into the active semantic working
-  set.
-- `--kvmem-gen-budget`: space reserved for the new response.
-
-When the working-set budget is smaller than the accumulated history, retrieval
-is intentionally lossy. Answer quality therefore depends on the retrieval
-method, block size, query, and budget. KVMem is most useful for long-running
-agents; it is unnecessary for ordinary short prompts that already fit in GPU
-memory.
+The active working set, current-step context, and generation reserve must
+together fit within the model’s context window and the available GPU KV
+capacity. When the accumulated history exceeds `--kvmem-budget`, KVMem uses
+query-conditioned retrieval to select the most relevant historical blocks for
+the current step. The retrieval method, block size, query construction, and
+working-set budget provide flexible controls for balancing context coverage and
+execution efficiency. KVMem is designed for long-running agents, with its
+benefits becoming increasingly pronounced as the accumulated workspace grows
+beyond practical GPU KV capacity.
 
 ## Requirements
 
 - Linux; current development and validation use x86-64.
-- An NVIDIA GPU and compatible CUDA toolkit.
+- An Ampere-or-newer NVIDIA GPU and a matching CUDA toolkit. The 27B Q8_0
+  quick start is intended for a dedicated 48 GiB-class GPU; smaller-memory
+  configurations have not been validated as an onboarding path.
 - CMake 3.16 or newer for the host build, CMake 3.18 or newer for the CUDA
-  quick start, and a C++17 compiler. The recorded host baseline uses CMake
-  3.22.1 and GCC 11.4. The final SM120 toolchain floor still needs a clean
-  release gate.
+  quick start, and a C++17 compiler. SM120 builds require CUDA 12.8 or newer.
 - A compatible language checkpoint for the Qwen `qwen35` architecture. Image
   input additionally requires the matching Hugging Face model directory with
   `model.visual.*` weights and the Python preprocessing dependencies.
+- Python 3 and the Hugging Face CLI are needed only for the download commands;
+  install the latter with `python3 -m pip install --upgrade huggingface_hub`.
 - Additional host RAM and fast local NVMe for large KVMem configurations.
 
 QW3 generation is CUDA-only. A host-only build supports model inspection and
@@ -98,9 +82,9 @@ and other non-NVIDIA device backends are not implemented.
 ## Quick start: Q8_0 GGUF
 
 This is the smallest QW3 runtime path: in-tree CUDA kernels, FP16 KV, no MTP,
-and one request at a time. FlashInfer and Python packages are not required.
-The commands assume that CUDA and a compatible Q8_0 GGUF are already
-available; model acquisition or conversion time is not included.
+and one request at a time. FlashInfer and Python packages are not required for
+the runtime. If a compatible Q8_0 GGUF is already available, set `QW3_MODEL`
+to it and skip the optional download block below.
 
 The native GGUF loader currently supports GGUF v3 files whose model tensors are
 Q8_0 with F32 metadata/scalar tensors. Generic Q4/IQ GGUF files are not
@@ -113,6 +97,7 @@ git clone https://github.com/Di-Chai/qw3.git
 cd qw3
 
 export QW3_MODEL=/absolute/path/to/Qwen3.6-or-Qwen3.8-27B-Q8_0.gguf
+# Example for RTX PRO 6000 Blackwell; replace this for the target GPU.
 export QW3_CUDA_ARCH=120a-real
 ```
 
@@ -139,11 +124,9 @@ The public file is not byte-identical to the private GGUF used by some older
 internal experiments. It is therefore a reproducible candidate, not evidence
 that those historical numbers reproduce unchanged.
 
-`120a-real` is the current Blackwell development target. Select the architecture
-that matches the deployment GPU; intended Q8 build targets include `80`
-(Ampere), `86` (RTX 30/A6000), `89` (Ada), and `90` (Hopper). Those targets
-remain Expected until each has passed a public release gate. SM120 builds
-require CUDA 12.8 or newer.
+Set `QW3_CUDA_ARCH` to the deployment GPU instead of copying `120a-real`
+unchanged: use `80` for A100, `86` for A40/A6000/RTX 30, `89` for Ada, `90`
+for Hopper, and `120a-real` for SM120 Blackwell.
 
 ### 2. Build the CUDA runtime
 
@@ -214,26 +197,92 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-This is an Expected native CUDA path, not yet a release-tested hardware
-profile. See [the release baseline](docs/release_baseline.md) for the current
-evidence level.
+The commands above have been checked with the pinned Qwen3.6 Q8_0 file. See
+[the release baseline](docs/release_baseline.md) for the current per-hardware
+validation status.
 
 ## Optional Qwen3.8 image input
 
 QW3 can accept base64 `data:` image URLs on the OpenAI-compatible chat endpoint
 when a matching Qwen3.8 Hugging Face model directory supplies the visual
-weights:
+weights. First prepare the Python worker used for image decoding and
+preprocessing:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install \
+  torch pillow safetensors 'transformers>=5.10,<6'
+
+export QW3_VISION_MODEL=/absolute/path/to/Qwen3.8-27B-BF16
+export QW3_VISION_CPU_PYTHON="${PWD}/.venv/bin/python"
+```
+
+The CPU visual frontend works with the basic Q8 build from the previous
+section. Only the visual tower runs on CPU; the language model remains on GPU:
 
 ```bash
 ./build/qw3 serve \
   --model "${QW3_MODEL}" \
-  --vision-model /absolute/path/to/Qwen3.8-27B-BF16 \
+  --vision-model "${QW3_VISION_MODEL}" \
+  --vision-device cpu \
+  --host 127.0.0.1 --port 8080 \
+  --ctx 32768 \
+  --kv-dtype fp16 \
+  --mtp-chain 0 \
+  --no-continuous-batching
+```
+
+Native CUDA vision additionally requires a FlashInfer-enabled build; the basic
+`build` binary above does not contain that path:
+
+```bash
+export FLASHINFER_DATA=/absolute/path/to/compatible/flashinfer/data
+
+cmake -S . -B build-vision \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DQW3_BUILD_TESTS=OFF \
+  -DQW3_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="${QW3_CUDA_ARCH}" \
+  -DQW3_ENABLE_FLASHINFER=ON \
+  -DQW3_FLASHINFER_INCLUDE_DIR="${FLASHINFER_DATA}/include" \
+  -DQW3_FLASHINFER_CUTLASS_INCLUDE_DIR="${FLASHINFER_DATA}/cutlass/include"
+
+cmake --build build-vision -j
+
+./build-vision/qw3 serve \
+  --model "${QW3_MODEL}" \
+  --vision-model "${QW3_VISION_MODEL}" \
   --vision-device cuda \
   --host 127.0.0.1 --port 8080 \
   --ctx 32768 \
   --kv-dtype fp16 \
   --mtp-chain 0 \
   --no-continuous-batching
+```
+
+Both servers accept the same OpenAI content-block request:
+
+```bash
+export IMAGE_FILE=/absolute/path/to/image.png
+export IMAGE_BASE64="$(base64 -w0 "${IMAGE_FILE}")"
+
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"model\": \"qw3\",
+    \"messages\": [{
+      \"role\": \"user\",
+      \"content\": [
+        {\"type\": \"text\", \"text\": \"Describe this image.\"},
+        {\"type\": \"image_url\", \"image_url\": {
+          \"url\": \"data:image/png;base64,${IMAGE_BASE64}\"
+        }}
+      ]
+    }],
+    \"temperature\": 0,
+    \"max_tokens\": 256
+  }"
 ```
 
 `--vision-device cuda` keeps the BF16 visual tower and projected embeddings on
@@ -290,14 +339,20 @@ logical capacity:
   --kvmem-cpu-gb 16 \
   --kvmem-nvme-dir "${QW3_KVMEM_DIR}" \
   --kvmem-nvme-gb 64 \
-  --kvmem-prefix-cache \
   --kvmem-query-replay
 ```
 
 OpenAI clients should send the accumulated `messages` history on each turn.
-For the serialized route above, `--kvmem-prefix-cache` reuses an exact shared
-prompt-and-response prefix and prefills only the appended suffix. The final user
-message drives query-conditioned retrieval.
+The command above deliberately leaves warm prefix caching off so that the
+first smoke test validates the stateless full-transcript path without relying
+on checkpoint reuse. The final user message drives query-conditioned retrieval.
+
+`--kvmem-prefix-cache` is an optional serialized, single-trajectory
+optimization that reuses an exact prompt-and-response prefix and prefills only
+the appended suffix. Before adding it to a deployment, run
+`scripts/kvmem_prefix_cache_above_budget_canary.py` against the exact build and
+configuration; it has stricter prompt-continuation and checkpoint invariants
+than the base KVMem path.
 
 The public retrieval scorer values are:
 
@@ -329,8 +384,10 @@ Face `compressed-tensors` directory and uses FlashInfer/CUTLASS-backed NVFP4
 kernels; it is not a generic Q4 GGUF path.
 
 ```bash
+export QW3_MODEL_ROOT="${QW3_MODEL_ROOT:-${PWD}/../qw3-models}"
 export QW3_NVFP4_REVISION=ccdaab7e68af2409599b8949a8f2685703c9bae5
 export QW3_NVFP4_MODEL="${QW3_MODEL_ROOT}/qwen36-nvfp4"
+mkdir -p "${QW3_NVFP4_MODEL}"
 
 hf download unsloth/Qwen3.6-27B-NVFP4 \
   --revision "${QW3_NVFP4_REVISION}" \
@@ -353,7 +410,19 @@ cmake -S . -B build-nvfp4 \
   -DQW3_FLASHINFER_CUTLASS_INCLUDE_DIR="${FLASHINFER_DATA}/cutlass/include"
 
 cmake --build build-nvfp4 -j
+
+# Loader and tensor-binding smoke test.
 ./build-nvfp4/qw3 --model "${QW3_NVFP4_MODEL}" --native-plan
+
+# Short generation smoke test; FP8 is the KV-cache dtype, not the weight dtype.
+./build-nvfp4/qw3 \
+  --model "${QW3_NVFP4_MODEL}" \
+  --ctx 8192 \
+  --kv-dtype fp8 \
+  --prefill-chunk 1024 \
+  --temp 0 --top-p 1 --top-k 1 \
+  -p "Explain virtual memory in one paragraph." \
+  -n 256
 ```
 
 Do not run `qw3-inspect` on this Hugging Face directory; that tool accepts GGUF
