@@ -5001,6 +5001,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << g.input_embedding_overrides.size()
                       << " vision_cache_hit="
                       << (prepared_vision.encoded.cache_hit ? 1 : 0)
+                      << " vision_cache_hits="
+                      << prepared_vision.encoded.cache_hits
+                      << " vision_cache_misses="
+                      << prepared_vision.encoded.cache_misses
                       << " mandatory_spans="
                       << prepared_vision.token_spans.size() << "\n";
         }

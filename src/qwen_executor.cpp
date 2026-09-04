@@ -1069,9 +1069,9 @@ void QwenExecutor::overwrite_input_embedding(DeviceTensor &dst,
         }
         const uint32_t dst_row = static_cast<uint32_t>(
             row_offset / model_.config().n_embd);
-        const uint32_t src_row = item.embedding_row;
+        const auto source = device->resolve(item.embedding_row);
         require_status(backend_.scatter_bf16_rows(
-            dst, device->tensor(), &dst_row, &src_row, 1,
+            dst, *source.tensor, &dst_row, &source.row, 1,
             model_.config().n_embd, model_.config().n_embd,
             device->dim()));
         return;
@@ -1104,8 +1104,12 @@ void QwenExecutor::overwrite_input_embeddings_batch(DeviceTensor &dst,
     // Group them into one scatter launch; host-backed CPU embeddings retain
     // the established conversion/copy path below.
     const detail::DeviceInputEmbeddingStorage *device = nullptr;
-    std::vector<uint32_t> dst_rows;
-    std::vector<uint32_t> src_rows;
+    struct DeviceScatter {
+        const DeviceTensor *tensor = nullptr;
+        std::vector<uint32_t> dst_rows;
+        std::vector<uint32_t> src_rows;
+    };
+    std::vector<DeviceScatter> scatters;
     for (uint32_t i = 0; i < batch; ++i) {
         const auto it = input_embedding_override_index_.find(tokens[i]);
         if (it == input_embedding_override_index_.end()) continue;
@@ -1119,13 +1123,24 @@ void QwenExecutor::overwrite_input_embeddings_batch(DeviceTensor &dst,
                 "a multimodal batch must reference one device embedding table");
         }
         device = candidate;
-        dst_rows.push_back(i);
-        src_rows.push_back(item.embedding_row);
+        const auto source = device->resolve(item.embedding_row);
+        auto group = std::find_if(
+            scatters.begin(), scatters.end(), [&](const DeviceScatter &scatter) {
+                return scatter.tensor == source.tensor;
+            });
+        if (group == scatters.end()) {
+            scatters.push_back({source.tensor, {}, {}});
+            group = std::prev(scatters.end());
+        }
+        group->dst_rows.push_back(i);
+        group->src_rows.push_back(source.row);
     }
-    if (device && !dst_rows.empty()) {
+    for (const DeviceScatter &scatter : scatters) {
         require_status(backend_.scatter_bf16_rows(
-            dst, device->tensor(), dst_rows.data(), src_rows.data(),
-            static_cast<uint32_t>(dst_rows.size()), model_.config().n_embd,
+            dst, *scatter.tensor, scatter.dst_rows.data(),
+            scatter.src_rows.data(),
+            static_cast<uint32_t>(scatter.dst_rows.size()),
+            model_.config().n_embd,
             row_stride, device->dim()));
     }
     for (uint32_t i = 0; i < batch; ++i) {

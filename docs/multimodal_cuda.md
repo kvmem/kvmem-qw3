@@ -21,9 +21,12 @@ and are scattered into the language-model input tensor in one device launch;
 there is no projected-embedding D2H/H2D round trip.
 
 The visual weights consume about 879 MiB for Qwen3.8-27B. Final embeddings are
-cached by the ordered image payload so full-transcript clients do not encode
-unchanged images on every request. The default GPU cache limit is 512 MiB and
-can be changed with `QW3_VISION_GPU_CACHE_MIB` (use `0` to disable it).
+cached per image, so full-transcript clients only encode newly added or changed
+images. Cached image tensors are assembled as a zero-copy segmented embedding
+table in request order. The default GPU cache limit is 512 MiB and can be
+changed with `QW3_VISION_GPU_CACHE_MIB` (use `0` to disable it). Serving logs
+report both `vision_cache_hits` and `vision_cache_misses` per request. The CPU
+vision frontend uses the same per-image policy under `QW3_VISION_CPU_CACHE_MIB`.
 
 Visual token spans remain mandatory under KVMem, retain their three-axis
 M-RoPE coordinates, and are preserved by local-cache and persistent-session

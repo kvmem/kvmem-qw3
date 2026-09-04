@@ -6,7 +6,8 @@ agents.
 QW3 is a purpose-built inference runtime for Qwen `qwen35` hybrid models. It
 owns model loading, tokenization, CUDA execution, and device memory instead of
 delegating generation to another inference engine. Development currently
-focuses on the text path of Qwen3.6 and Qwen3.8 27B models.
+focuses on Qwen3.6 and Qwen3.8 27B text generation plus an experimental native
+Qwen3.8 image-input path.
 
 Its main research feature, **KVMem**, turns previously computed attention KV
 state into reusable agent memory. KVMem keeps a bounded working set on the GPU,
@@ -36,6 +37,8 @@ and text compaction in long-lived agent sessions.
   Qwen's DeltaNet-plus-attention `qwen35` architecture.
 - **Local API serving:** expose OpenAI-compatible completions and an
   Anthropic-compatible Messages subset from the same native runtime.
+- **Optional native vision:** run the Qwen3.8 visual tower on CPU or CUDA and
+  reuse unchanged per-image embeddings across full-transcript requests.
 - **Optional performance paths:** MTP speculative decoding, paged KV,
   continuous batching, FP8 KV, and NVFP4 weights are available for research and
   tuning.
@@ -86,7 +89,9 @@ memory.
   quick start, and a C++17 compiler. The recorded host baseline uses CMake
   3.22.1 and GCC 11.4. The final SM120 toolchain floor still needs a clean
   release gate.
-- A compatible text checkpoint for the Qwen `qwen35` architecture.
+- A compatible language checkpoint for the Qwen `qwen35` architecture. Image
+  input additionally requires the matching Hugging Face model directory with
+  `model.visual.*` weights and the Python preprocessing dependencies.
 - Additional host RAM and fast local NVMe for large KVMem configurations.
 
 QW3 generation is CUDA-only. A host-only build supports model inspection and
@@ -193,6 +198,39 @@ This is an Expected native CUDA path, not yet a release-tested hardware
 profile. See [the release baseline](docs/release_baseline.md) for the current
 evidence level.
 
+## Optional Qwen3.8 image input
+
+QW3 can accept base64 `data:` image URLs on the OpenAI-compatible chat endpoint
+when a matching Qwen3.8 Hugging Face model directory supplies the visual
+weights:
+
+```bash
+./build/qw3 serve \
+  --model "${QW3_MODEL}" \
+  --vision-model /absolute/path/to/Qwen3.8-27B-BF16 \
+  --vision-device cuda \
+  --host 127.0.0.1 --port 8080 \
+  --ctx 32768 \
+  --kv-dtype fp16 \
+  --mtp-chain 0 \
+  --no-continuous-batching
+```
+
+`--vision-device cuda` keeps the BF16 visual tower and projected embeddings on
+the GPU; `--vision-device cpu` runs the visual model in the worker process and
+copies its projected embeddings into the language model. Both paths cache
+results per image, so an accumulated request such as `[A,B,C] -> [A,B,C,D]`
+only reruns the visual tower for `D`. The default CPU and GPU cache limits are
+512 MiB and can be changed with `QW3_VISION_CPU_CACHE_MIB` and
+`QW3_VISION_GPU_CACHE_MIB`.
+
+KVMem keeps each visual token span atomic and preserves its M-RoPE coordinates.
+Current full-transcript serving does not yet reuse the language-model KV prefix
+when the ordered image set changes; per-image caching currently removes visual
+tower recomputation, not repeated LM prefill. Video input and multimodal
+continuous batching are not implemented. See the
+[native CUDA vision notes](docs/multimodal_cuda.md) for validation details.
+
 ## Try KVMem
 
 > [!WARNING]
@@ -289,14 +327,16 @@ semantics.
 | Other Qwen `qwen35`/legacy `qwen3` shapes | Experimental | Metadata may parse, but shape coverage is not release-validated |
 | HF `compressed-tensors` NVFP4 on SM120 | Experimental | Requires FlashInfer/CUTLASS and an exact compatible checkpoint |
 | KVMem GPU/CPU/NVMe retrieval | Experimental | Off by default; retrieval quality and resource needs depend on the workload |
+| Qwen3.8 image input | Experimental | Base64 data images; CPU or native BF16 CUDA visual tower; per-image cache and KVMem visual spans implemented |
 | MTP, paged KV, and continuous batching | Experimental | Implemented research paths with combination-specific constraints |
 | Frozen KVMem archives | Experimental | FP8-only serialized workflow; no continuous batching |
 | Q4/IQ GGUF, CPU generation, or non-NVIDIA generation | Unsupported | No native runtime path |
 
-The Hugging Face loader accepts `qwen3_5_text` model directories using the
-`compressed-tensors` format. A generic official FP8 or BF16 directory is not a
-drop-in replacement. QW3 currently provides language-model inference only; it
-does not accept image or video inputs from multimodal Qwen checkpoints.
+The language-model Hugging Face loader accepts `qwen3_5_text` directories using
+the `compressed-tensors` format. A generic official FP8 or BF16 directory is
+not a drop-in replacement for that language path. The optional visual frontend
+separately reads matching `model.visual.*` weights from a Hugging Face model
+directory; it currently accepts images but not video.
 
 ## Optional runtime paths
 
@@ -307,6 +347,8 @@ The following are intentionally outside the first quick start:
 - **NVFP4:** 4-bit `compressed-tensors` weights on SM120a, not generic Q4 GGUF.
 - **MTP speculative decode:** enable with `--mtp-chain N`; currently
   Experimental.
+- **Image input:** enable with `--vision-model DIR --vision-device cpu|cuda`;
+  currently serialized and Experimental.
 - **Continuous batching:** enable with `--continuous-batching`; it also enables
   the required paged-KV serving pool and body-batch executor by default.
 - **Frozen archives:** `qw3 archive build|query|info` provides an immutable
@@ -323,6 +365,7 @@ stable compatibility contract during the research-preview phase.
 - [Claude Code integration](docs/claude_code.md)
 - [Incremental KVMem sessions](docs/kvmem_incremental_session_api.md)
 - [Semantic-group retrieval](docs/kvmem_semantic_group_retrieval.md)
+- [Native CUDA vision frontend](docs/multimodal_cuda.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 Historical optimization notes and benchmark records are development evidence,

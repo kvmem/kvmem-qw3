@@ -6,10 +6,11 @@
 
 <!-- Replace the two TBD values with the final paper and video links. -->
 
-KVMem QW3 is a single-GPU inference and memory runtime for the text path of
-Qwen `qwen35` hybrid models. Its core capability, **KVMem**, retains previously
-computed attention KV blocks across GPU memory, host RAM, and optional NVMe,
-then retrieves a bounded working set for each new query.
+KVMem QW3 is a single-GPU inference and memory runtime for Qwen `qwen35` hybrid
+models, with experimental Qwen3.8 image input. Its core capability, **KVMem**,
+keeps previously computed attention state recoverable across GPU memory, host
+RAM, and optional NVMe, then materializes a bounded selected-history window for
+each new query.
 
 The goal is to let an agent keep a large accumulated history without repeatedly
 compacting that history into text or attending densely to every past token on
@@ -25,8 +26,9 @@ every answer.
 > [!TIP]
 > **Planned launch demo:** generate a 107K-token incident ledger on camera,
 > place an unseen rollback code in the middle, and recover it with a 32K-token
-> GPU working set. The video will ship with the exact corpus, manifest, trace,
-> and response so the result cannot be explained by model memorization.
+> selected-history budget plus a separate generation reserve. The video will
+> ship with the exact corpus, manifest, trace, and response so the result cannot
+> be explained by model memorization.
 
 ## Why KVMem?
 
@@ -36,20 +38,24 @@ discards detail; rebuilding a long prompt repeats expensive prefill work.
 
 KVMem instead treats contextualized KV state as a tiered memory system:
 
-![Animated KVMem flow: history is prefetched into KV blocks, cold blocks move from the bounded GPU window to host RAM or NVMe, and query-selected blocks return for answer generation.](docs/assets/kvmem-flow.svg)
+![Animated high-level KVMem overview: long history remains recoverable across memory tiers, a new question ranks an internal Mean-K block-summary index, the selected KV block replaces another block in a fixed-size GPU attention window, and QW3 generates with the refreshed context.](docs/assets/kvmem-flow.svg)
 
-The animation plays once and leaves a complete final frame. It is an
-illustrative control-flow explanation, not performance evidence.
+This is a high-level retrieval intuition, not an exact execution trace. For
+readability it omits mandatory kept regions, the short internal query-state
+rebuild, and position remapping; those remain part of the canonical runtime.
+The animation loops with a short pause on the complete diagram; reduced-motion
+clients see the same static diagram.
 
 The model still generates locally in the QW3 CUDA runtime. KVMem is not an
 external vector database or a RAG service. Three controls define its memory
 shape:
 
 - `--ctx`: maximum accumulated request or session capacity.
-- `--kvmem-budget`: history selected into the active working set.
-- `--kvmem-gen-budget`: space reserved for the new response.
+- `--kvmem-budget`: total selected-history budget shared by protected and
+  query-selected blocks.
+- `--kvmem-gen-budget`: a separate page reserve for the new response.
 
-When history exceeds the working-set budget, selection is lossy by design.
+When history exceeds the selected-history budget, selection is lossy by design.
 Retrieval method, block size, query quality, and budget can affect answer
 quality.
 
@@ -59,6 +65,7 @@ quality.
 |---|---|---|---|---|
 | Qwen3.6-27B Q8_0 + FP16 KV + KVMem `mean-k` | Core onboarding profile | Ready; real-model internal runs | Release candidate; public GGUF reproduction pending | Shown 128K template starts with a 48 GiB-class dedicated GPU; SM120 is the current reference |
 | Qwen3.6-27B NVFP4 + FP8 KV + KVMem `mean-k` | Core memory-efficient profile | Ready; loader, kernels, generation, and real-model KVMem exercised internally | Release candidate; dependency lock and clean public rerun pending | NVIDIA SM120a only; physical 24 GiB support is not yet claimed |
+| Qwen3.8 image input with CPU/CUDA visual frontend | Advanced Preview | Real-image CPU/GPU parity, native CUDA serving, per-image cache, and KVMem visual-span gates exercised internally | Experimental; public model/image gate pending | Base64 images only; no video or multimodal continuous batching |
 | MTP, continuous batching, alternative scorers, frozen archives | Advanced Preview | Implemented and internally exercised | Outside the canonical first-user gate | Combination-specific constraints apply |
 | Host build and unit tests | Contributor baseline | Clean build and tests reproduced | Does not validate model generation | Linux x86-64; no GPU required |
 
@@ -83,6 +90,8 @@ dependency bundle, not a self-contained install promise.
 - The Hugging Face `hf` CLI for the model download commands.
 - Enough local disk for the model plus optional NVMe tier storage.
 - Additional host RAM for the requested KVMem CPU tier.
+- A matching Hugging Face model directory and Python preprocessing environment
+  when image input is enabled.
 
 Host-only builds support inspection and unit tests, but QW3 does not provide
 CPU model generation.
@@ -157,6 +166,23 @@ export QW3_KV_DTYPE=fp16
 
 If CMake cannot find `nvcc`, add the CUDA `bin` directory to `PATH` or set
 `CUDACXX` before configuring.
+
+### Optional Qwen3.8 image input
+
+Add a matching Hugging Face model directory and choose where to run the visual
+tower:
+
+```text
+--vision-model /absolute/path/to/Qwen3.8-27B-BF16
+--vision-device cuda
+```
+
+`--vision-device cpu` remains available when GPU memory is tighter. Both paths
+cache projected embeddings per image, and KVMem preserves visual spans and
+their M-RoPE coordinates. Full-transcript requests that add a new image still
+repeat language-model prefill for the shared visual prefix; automatic
+multimodal LM-KV prefix reuse is not yet implemented. See
+[`docs/multimodal_cuda.md`](docs/multimodal_cuda.md).
 
 ### 3. Verify plain generation
 
@@ -268,9 +294,9 @@ print(f"history_tokens={count} answer={answer!r}")
 print("quality_canary=" + ("PASS" if SECRET in answer else "MISS"))
 PY
 
-grep -E 'native kvmem query-replay \(plain\).*index_ready=1' \
+grep -E 'native kvmem query replay \(plain\): boundary=[0-9]+.*suffix_tokens=[1-9][0-9]*' \
   /tmp/qw3-kvmem-server.log
-grep -E '\[kvmem-scorer\].*requested=mean-k used=mean-k fallback=0' \
+grep -E '\[kvmem-scorer\].*requested=mean-k used=mean-k fallback=0.*query_ready=1.*indexed_blocks=[1-9][0-9]*' \
   /tmp/qw3-kvmem-server.log
 grep -E '\[kvmem-tier\] stage_out' /tmp/qw3-kvmem-server.log
 ```
@@ -366,7 +392,8 @@ separate public profile.
 | Qwen3.8 profile and additional physical GPU release matrices | Future profiles |
 | CPU generation, AMD/ROCm, Metal | Unsupported |
 | Generic Q4/Q6/Q8_K/IQ GGUF weights | Unsupported; native GGUF weights are Q8_0 plus F32 tensors |
-| Multimodal image/video input | Out of scope; QW3 currently serves the text path |
+| Qwen3.8 image input | Advanced Preview; CPU/CUDA visual frontend, per-image cache, and KVMem visual spans implemented |
+| Video input or multimodal continuous batching | Unsupported |
 | Frozen archive + continuous batching or non-FP8 archive KV | Unsupported |
 
 The only public retrieval scorer values are `mean-k`, `per-token`,
@@ -395,6 +422,7 @@ KVMem activity assertions, and a published result manifest.
 - [Claude Code integration](docs/claude_code.md)
 - [Incremental KVMem sessions](docs/kvmem_incremental_session_api.md)
 - [Semantic-group retrieval](docs/kvmem_semantic_group_retrieval.md)
+- [Native CUDA vision frontend](docs/multimodal_cuda.md)
 - [Current release audit](docs/release_baseline.md)—this document must adopt
   the V1 status taxonomy before V1 replaces the root README.
 

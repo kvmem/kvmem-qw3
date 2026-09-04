@@ -35,6 +35,10 @@ struct VisionEncoding {
 
     uint32_t embedding_dim = 0;
     bool cache_hit = false;
+    // Per-image cache accounting. `cache_hit` remains the backwards-compatible
+    // whole-request signal and is true only when cache_misses == 0.
+    uint32_t cache_hits = 0;
+    uint32_t cache_misses = 0;
     std::vector<Grid> grids;
     // CPU frontend result. The native CUDA frontend instead populates storage
     // so the projected rows never make a GPU -> CPU -> GPU round trip.

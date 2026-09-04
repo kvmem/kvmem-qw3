@@ -11,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -70,13 +71,41 @@ std::string read_line(int fd) {
     }
 }
 
+uint64_t image_fingerprint(const CpuVisionImage &image) {
+    uint64_t hash = 1469598103934665603ULL;
+    const auto mix = [&](std::string_view value) {
+        for (unsigned char byte : value) {
+            hash ^= static_cast<uint64_t>(byte);
+            hash *= 1099511628211ULL;
+        }
+        hash ^= 0xffu;
+        hash *= 1099511628211ULL;
+    };
+    mix(image.media_type);
+    mix(image.base64_data);
+    return hash != 0 ? hash : 1;
+}
+
+bool same_image(const CpuVisionImage &a, const CpuVisionImage &b) {
+    return a.media_type == b.media_type && a.base64_data == b.base64_data;
+}
+
 } // namespace
 
 struct CpuVisionFrontend::Impl {
     struct CacheEntry {
-        std::vector<CpuVisionImage> images;
-        CpuVisionEncoding encoding;
+        CpuVisionImage image;
+        uint64_t fingerprint = 0;
+        CpuVisionEncoding::Grid grid;
+        uint32_t dim = 0;
+        std::shared_ptr<std::vector<float>> embeddings;
         uint64_t bytes = 0;
+    };
+
+    struct ImageResult {
+        CpuVisionEncoding::Grid grid;
+        uint32_t dim = 0;
+        std::shared_ptr<std::vector<float>> embeddings;
     };
 
     pid_t pid = -1;
@@ -216,90 +245,180 @@ CpuVisionEncoding CpuVisionFrontend::encode(
         throw std::runtime_error("encode called on preprocess-only vision worker");
     }
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto same_images = [&](const std::vector<CpuVisionImage> &cached) {
-        if (cached.size() != images.size()) return false;
-        for (size_t i = 0; i < images.size(); ++i) {
-            if (cached[i].media_type != images[i].media_type ||
-                cached[i].base64_data != images[i].base64_data) return false;
-        }
-        return true;
-    };
-    for (size_t i = 0; i < impl_->cache.size(); ++i) {
-        if (!same_images(impl_->cache[i].images)) continue;
-        Impl::CacheEntry hit = std::move(impl_->cache[i]);
-        impl_->cache.erase(impl_->cache.begin() +
-                           static_cast<std::ptrdiff_t>(i));
-        impl_->cache.push_back(std::move(hit));
-        CpuVisionEncoding result = impl_->cache.back().encoding;
-        result.cache_hit = true;
-        return result;
-    }
-    json request{{"op", "encode"}, {"images", json::array()}};
-    for (const CpuVisionImage &image : images) {
-        request["images"].push_back(
-            json{{"media_type", image.media_type}, {"data", image.base64_data}});
-    }
-    const std::string wire = request.dump() + "\n";
-    write_all(impl_->request_fd, wire.data(), wire.size());
-    const json response = json::parse(read_line(impl_->response_fd));
-    if (!response.value("ok", false)) {
-        throw std::runtime_error(
-            "CPU vision encoding failed: " + response.value("error", "unknown error"));
-    }
-    if (response.value("dtype", "") != "f32") {
-        throw std::runtime_error("CPU vision worker returned an unsupported dtype");
-    }
-    const uint64_t rows = response.at("rows").get<uint64_t>();
-    const uint64_t dim = response.at("dim").get<uint64_t>();
-    const uint64_t bytes = response.at("bytes").get<uint64_t>();
-    if (rows == 0 || dim == 0 || dim > std::numeric_limits<uint32_t>::max() ||
-        rows > std::numeric_limits<uint64_t>::max() / dim ||
-        rows * dim > std::numeric_limits<size_t>::max() / sizeof(float) ||
-        bytes != rows * dim * sizeof(float)) {
-        throw std::runtime_error("CPU vision worker returned an invalid embedding shape");
-    }
-    CpuVisionEncoding result;
-    result.embedding_dim = static_cast<uint32_t>(dim);
-    result.embeddings.resize(static_cast<size_t>(rows * dim));
-    read_all(impl_->response_fd, result.embeddings.data(), static_cast<size_t>(bytes));
+    std::vector<Impl::ImageResult> ordered(images.size());
+    std::vector<uint64_t> fingerprints(images.size());
+    std::vector<size_t> unique_miss_requests;
+    std::vector<uint32_t> request_to_miss(
+        images.size(), std::numeric_limits<uint32_t>::max());
+    uint32_t cache_hits = 0;
 
-    const json &grids = response.at("grids");
-    const json &counts = response.at("counts");
-    if (!grids.is_array() || !counts.is_array() ||
-        grids.size() != images.size() || counts.size() != images.size()) {
-        throw std::runtime_error("CPU vision worker returned inconsistent image grids");
-    }
-    uint64_t counted_rows = 0;
-    for (size_t i = 0; i < grids.size(); ++i) {
-        if (!grids[i].is_array() || grids[i].size() != 3) {
-            throw std::runtime_error("CPU vision worker returned an invalid grid");
+    for (size_t request_index = 0; request_index < images.size();
+         ++request_index) {
+        fingerprints[request_index] = image_fingerprint(images[request_index]);
+        bool found = false;
+        for (size_t cache_index = 0; cache_index < impl_->cache.size();
+             ++cache_index) {
+            if (impl_->cache[cache_index].fingerprint !=
+                    fingerprints[request_index] ||
+                !same_image(impl_->cache[cache_index].image,
+                            images[request_index])) {
+                continue;
+            }
+            Impl::CacheEntry hit = std::move(impl_->cache[cache_index]);
+            impl_->cache.erase(impl_->cache.begin() +
+                               static_cast<std::ptrdiff_t>(cache_index));
+            impl_->cache.push_back(std::move(hit));
+            const auto &entry = impl_->cache.back();
+            ordered[request_index] = {
+                entry.grid, entry.dim, entry.embeddings};
+            ++cache_hits;
+            found = true;
+            break;
         }
-        CpuVisionEncoding::Grid grid;
-        grid.temporal = grids[i][0].get<uint32_t>();
-        grid.height = grids[i][1].get<uint32_t>();
-        grid.width = grids[i][2].get<uint32_t>();
-        grid.rows = counts[i].get<uint32_t>();
-        counted_rows += grid.rows;
-        result.grids.push_back(grid);
-    }
-    if (counted_rows != rows) {
-        throw std::runtime_error("CPU vision grid rows do not match embeddings");
-    }
-    const uint64_t result_bytes =
-        static_cast<uint64_t>(result.embeddings.size()) * sizeof(float);
-    if (impl_->cache_limit_bytes > 0 &&
-        result_bytes <= impl_->cache_limit_bytes) {
-        while (!impl_->cache.empty() &&
-               impl_->cache_bytes > impl_->cache_limit_bytes - result_bytes) {
-            impl_->cache_bytes -= impl_->cache.front().bytes;
-            impl_->cache.erase(impl_->cache.begin());
+        if (found) continue;
+        for (uint32_t miss = 0; miss < unique_miss_requests.size(); ++miss) {
+            const size_t prior = unique_miss_requests[miss];
+            if (fingerprints[prior] == fingerprints[request_index] &&
+                same_image(images[prior], images[request_index])) {
+                request_to_miss[request_index] = miss;
+                ++cache_hits;
+                found = true;
+                break;
+            }
         }
-        Impl::CacheEntry entry;
-        entry.images = images;
-        entry.encoding = result;
-        entry.bytes = result_bytes;
-        impl_->cache.push_back(std::move(entry));
-        impl_->cache_bytes += result_bytes;
+        if (!found) {
+            request_to_miss[request_index] =
+                static_cast<uint32_t>(unique_miss_requests.size());
+            unique_miss_requests.push_back(request_index);
+        }
+    }
+
+    if (!unique_miss_requests.empty()) {
+        json request{{"op", "encode"}, {"images", json::array()}};
+        for (size_t request_index : unique_miss_requests) {
+            const auto &image = images[request_index];
+            request["images"].push_back(
+                json{{"media_type", image.media_type},
+                     {"data", image.base64_data}});
+        }
+        const std::string wire = request.dump() + "\n";
+        write_all(impl_->request_fd, wire.data(), wire.size());
+        const json response = json::parse(read_line(impl_->response_fd));
+        if (!response.value("ok", false)) {
+            throw std::runtime_error(
+                "CPU vision encoding failed: " +
+                response.value("error", "unknown error"));
+        }
+        if (response.value("dtype", "") != "f32") {
+            throw std::runtime_error(
+                "CPU vision worker returned an unsupported dtype");
+        }
+        const uint64_t rows = response.at("rows").get<uint64_t>();
+        const uint64_t dim = response.at("dim").get<uint64_t>();
+        const uint64_t bytes = response.at("bytes").get<uint64_t>();
+        if (rows == 0 || dim == 0 ||
+            dim > std::numeric_limits<uint32_t>::max() ||
+            rows > std::numeric_limits<uint64_t>::max() / dim ||
+            rows * dim > std::numeric_limits<size_t>::max() / sizeof(float) ||
+            bytes != rows * dim * sizeof(float)) {
+            throw std::runtime_error(
+                "CPU vision worker returned an invalid embedding shape");
+        }
+        std::vector<float> flat(static_cast<size_t>(rows * dim));
+        read_all(impl_->response_fd, flat.data(), static_cast<size_t>(bytes));
+
+        const json &grids = response.at("grids");
+        const json &counts = response.at("counts");
+        if (!grids.is_array() || !counts.is_array() ||
+            grids.size() != unique_miss_requests.size() ||
+            counts.size() != unique_miss_requests.size()) {
+            throw std::runtime_error(
+                "CPU vision worker returned inconsistent image grids");
+        }
+        std::vector<Impl::ImageResult> miss_results(
+            unique_miss_requests.size());
+        uint64_t source_row = 0;
+        for (size_t miss = 0; miss < unique_miss_requests.size(); ++miss) {
+            if (!grids[miss].is_array() || grids[miss].size() != 3) {
+                throw std::runtime_error(
+                    "CPU vision worker returned an invalid grid");
+            }
+            CpuVisionEncoding::Grid grid;
+            grid.temporal = grids[miss][0].get<uint32_t>();
+            grid.height = grids[miss][1].get<uint32_t>();
+            grid.width = grids[miss][2].get<uint32_t>();
+            grid.rows = counts[miss].get<uint32_t>();
+            if (grid.rows == 0 || grid.rows > rows ||
+                source_row > rows - grid.rows) {
+                throw std::runtime_error(
+                    "CPU vision grid rows exceed embeddings");
+            }
+            auto image_embeddings = std::make_shared<std::vector<float>>(
+                flat.begin() + static_cast<std::ptrdiff_t>(source_row * dim),
+                flat.begin() + static_cast<std::ptrdiff_t>(
+                    (source_row + grid.rows) * dim));
+            Impl::ImageResult part{
+                grid, static_cast<uint32_t>(dim), image_embeddings};
+            const uint64_t result_bytes = static_cast<uint64_t>(
+                image_embeddings->size()) * sizeof(float);
+            const size_t request_index = unique_miss_requests[miss];
+            if (impl_->cache_limit_bytes > 0 &&
+                result_bytes <= impl_->cache_limit_bytes) {
+                while (!impl_->cache.empty() &&
+                       impl_->cache_bytes >
+                           impl_->cache_limit_bytes - result_bytes) {
+                    impl_->cache_bytes -= impl_->cache.front().bytes;
+                    impl_->cache.erase(impl_->cache.begin());
+                }
+                Impl::CacheEntry entry;
+                entry.image = images[request_index];
+                entry.fingerprint = fingerprints[request_index];
+                entry.grid = grid;
+                entry.dim = static_cast<uint32_t>(dim);
+                entry.embeddings = image_embeddings;
+                entry.bytes = result_bytes;
+                impl_->cache.push_back(std::move(entry));
+                impl_->cache_bytes += result_bytes;
+            }
+            miss_results[miss] = std::move(part);
+            source_row += grid.rows;
+        }
+        if (source_row != rows) {
+            throw std::runtime_error(
+                "CPU vision grid rows do not match embeddings");
+        }
+        for (size_t request_index = 0; request_index < images.size();
+             ++request_index) {
+            const uint32_t miss = request_to_miss[request_index];
+            if (miss != std::numeric_limits<uint32_t>::max()) {
+                ordered[request_index] = miss_results[miss];
+            }
+        }
+    }
+
+    CpuVisionEncoding result;
+    result.cache_hits = cache_hits;
+    result.cache_misses = static_cast<uint32_t>(unique_miss_requests.size());
+    result.cache_hit = result.cache_misses == 0;
+    uint64_t total_values = 0;
+    for (const auto &part : ordered) {
+        if (!part.embeddings || part.grid.rows == 0 || part.dim == 0 ||
+            part.embeddings->size() !=
+                static_cast<uint64_t>(part.grid.rows) * part.dim ||
+            (result.embedding_dim != 0 && result.embedding_dim != part.dim) ||
+            total_values > std::numeric_limits<size_t>::max() -
+                               part.embeddings->size()) {
+            throw std::runtime_error("invalid cached CPU vision image result");
+        }
+        result.embedding_dim = part.dim;
+        result.grids.push_back(part.grid);
+        total_values += part.embeddings->size();
+    }
+    result.embeddings.reserve(static_cast<size_t>(total_values));
+    for (const auto &part : ordered) {
+        result.embeddings.insert(result.embeddings.end(),
+                                 part.embeddings->begin(),
+                                 part.embeddings->end());
     }
     return result;
 }

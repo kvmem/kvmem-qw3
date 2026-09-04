@@ -1,12 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560"
-     viewBox="0 0 1200 560" role="img"
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630"
+     viewBox="0 0 1200 630" role="img"
      aria-labelledby="kvmem-flow-title kvmem-flow-desc">
-  <title id="kvmem-flow-title">Animated KVMem memory flow</title>
+  <title id="kvmem-flow-title">Long history, bounded GPU working set</title>
   <desc id="kvmem-flow-desc">
-    A four-step animation that plays once. Long agent history is prefetched, cold KV
-    blocks move from the bounded GPU working set to host RAM and NVMe, a new
-    query scores a compact Mean-K index, and selected blocks return to the GPU
-    working set before answer generation.
+    A four-step conceptual overview of KVMem. Historical model state remains
+    recoverable across GPU and CPU tiers, with NVMe as an optional extension.
+    A new question ranks an internal per-block Mean-K summary index. The
+    top-ranked historical KV block is staged into a fixed-size GPU attention
+    window while another block is staged out. The model then generates with the
+    refreshed context. Mandatory kept regions, the short internal query-state
+    rebuild, and position remapping are intentionally omitted for readability.
+    The animation loops continuously, with a short pause on its complete frame.
   </desc>
 
   <defs>
@@ -14,297 +18,323 @@
       <stop offset="0" stop-color="#06111e"/>
       <stop offset="1" stop-color="#0b1c2e"/>
     </linearGradient>
-    <linearGradient id="gpu" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#103b42"/>
-      <stop offset="1" stop-color="#123147"/>
-    </linearGradient>
     <linearGradient id="answer" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#39d0ba" stop-opacity="0.22"/>
-      <stop offset="1" stop-color="#66a3ff" stop-opacity="0.20"/>
+      <stop offset="0" stop-color="#143d3d"/>
+      <stop offset="1" stop-color="#152f4e"/>
     </linearGradient>
-    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
-      <feGaussianBlur stdDeviation="5" result="blur"/>
-      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    <filter id="soft" x="-15%" y="-25%" width="130%" height="160%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#000814"
+                    flood-opacity="0.38"/>
     </filter>
-    <filter id="soft" x="-20%" y="-30%" width="140%" height="160%">
-      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#000814"
-                    flood-opacity="0.42"/>
+    <filter id="glow" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
             markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4f718c"/>
+      <path d="M0 0 L10 5 L0 10 z" fill="#65839a"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#a797ff"/>
     </marker>
   </defs>
 
   <style>
     text { font-family: Inter, ui-sans-serif, system-ui, -apple-system,
            BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    .title { fill: #f4f9fc; font-size: 25px; font-weight: 700; }
-    .subtitle { fill: #9fb6c7; font-size: 13px; }
-    .label { fill: #e8f2f8; font-size: 14px; font-weight: 650; }
-    .small { fill: #9fb6c7; font-size: 11px; }
-    .tiny { fill: #8099aa; font-size: 10px; }
+    .title { fill: #f5f9fc; font-size: 30px; font-weight: 760; }
+    .subtitle { fill: #a5bac9; font-size: 16px; }
+    .heading { fill: #edf5fa; font-size: 18px; font-weight: 720; }
+    .body { fill: #d8e6ee; font-size: 16px; }
+    .small { fill: #a5bac9; font-size: 15px; }
+    .micro { fill: #8ea6b7; font-size: 14px; }
+    .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
     .panel { fill: #0c1d2d; stroke: #29465d; stroke-width: 1.2; }
-    .block { fill: #17334a; stroke: #3d617b; stroke-width: 1; }
-    .block-hot { fill: #15504e; stroke: #39d0ba; stroke-width: 1.3; }
-    .block-selected { fill: #4a3d68; stroke: #a797ff; stroke-width: 1.3; }
-    .wire { fill: none; stroke: #4f718c; stroke-width: 2;
+    .block { fill: #142e42; stroke: #3c6078; stroke-width: 1.2; }
+    .block-fact { fill: #49395f; stroke: #b9a8ff; stroke-width: 1.8; }
+    .block-query { fill: #143d3d; stroke: #50dfc7; stroke-width: 1.7; }
+    .tier-gpu { fill: #173d48; }
+    .tier-cpu { fill: #1b3450; }
+    .wire { fill: none; stroke: #65839a; stroke-width: 2.2;
             marker-end: url(#arrow); }
-    .wire-dash { fill: none; stroke: #36566d; stroke-width: 1.5;
-                 stroke-dasharray: 5 7; }
-    .phase { opacity: 0.65; }
-    .p1 { animation: phase1 4.6s ease-in-out 1 both; }
-    .p2 { animation: phase2 4.6s ease-in-out 1 both; }
-    .p3 { animation: phase3 4.6s ease-in-out 1 both; }
-    .p4 { animation: phase4 4.6s ease-in-out 1 both; }
-    .scan { transform-origin: center; animation: scan 4.6s ease-in-out 1 both; }
-    .query { animation: query 4.6s ease-in-out 1 both; }
-    .response { animation: response 4.6s ease-in-out 1 both; }
-    .selected-pulse { animation: selected 4.6s ease-in-out 1 both; }
-    .answer-token { opacity: 1; animation: token 4.6s ease-out 1 both; }
-    .t2 { animation-delay: 0.08s; }
-    .t3 { animation-delay: 0.16s; }
-    .t4 { animation-delay: 0.24s; }
-    .t5 { animation-delay: 0.32s; }
-    @keyframes phase1 {
-      0%, 3%, 19% { opacity: 1; } 26%, 92% { opacity: 0.25; } 100% { opacity: 0.65; }
+    .wire-accent { fill: none; stroke: #a797ff; stroke-width: 2.3;
+                   marker-end: url(#arrow-accent); }
+    .badge { fill: #66a3ff; }
+    .focus-ring { fill: none; stroke: #66a3ff; stroke-width: 2.3;
+                  opacity: 0; pointer-events: none; }
+    .focus1 { animation: focus1 9s ease-in-out infinite; }
+    .focus2 { animation: focus2 9s ease-in-out infinite; }
+    .focus3 { animation: focus3 9s ease-in-out infinite; }
+    .focus4 { animation: focus4 9s ease-in-out infinite; }
+    .query-pulse { animation: queryPulse 9s ease-in-out infinite; }
+    .fact-pulse { animation: factPulse 9s ease-in-out infinite; }
+    .window-pulse { animation: windowPulse 9s ease-in-out infinite; }
+    .answer-pulse { animation: answerPulse 9s ease-in-out infinite; }
+    .stage-source { animation: stageSource 9s ease-in-out infinite; }
+    .move-out { transform-box: fill-box; transform-origin: center;
+                animation: stageOut 9s ease-in-out infinite; }
+    .move-in { transform-box: fill-box; transform-origin: center;
+               animation: stageIn 9s ease-in-out infinite; }
+
+    @keyframes focus1 {
+      0% { opacity: 0; } 3%, 19% { opacity: 0.9; }
+      23%, 100% { opacity: 0; }
     }
-    @keyframes phase2 {
-      0%, 20% { opacity: 0.25; } 27%, 42% { opacity: 1; } 49%, 92% { opacity: 0.25; } 100% { opacity: 0.65; }
+    @keyframes focus2 {
+      0%, 19% { opacity: 0; } 24%, 44% { opacity: 0.9; }
+      49%, 100% { opacity: 0; }
     }
-    @keyframes phase3 {
-      0%, 43% { opacity: 0.25; } 50%, 65% { opacity: 1; } 72%, 92% { opacity: 0.25; } 100% { opacity: 0.65; }
+    @keyframes focus3 {
+      0%, 43% { opacity: 0; } 49%, 70% { opacity: 0.9; }
+      75%, 100% { opacity: 0; }
     }
-    @keyframes phase4 {
-      0%, 66% { opacity: 0.25; } 74%, 100% { opacity: 1; }
+    @keyframes focus4 {
+      0%, 68% { opacity: 0; } 74%, 86% { opacity: 0.9; }
+      90%, 100% { opacity: 0; }
     }
-    @keyframes scan {
-      0%, 45% { opacity: 0.35; transform: scaleY(0.62); }
-      53%, 65% { opacity: 1; transform: scaleY(1); filter: url(#glow); }
-      73%, 100% { opacity: 0.65; transform: scaleY(0.8); }
+    @keyframes queryPulse {
+      0%, 20%, 47%, 100% { filter: none; }
+      27%, 43% { filter: url(#glow); }
     }
-    @keyframes query {
-      0%, 46% { opacity: 0.45; }
-      53%, 68% { opacity: 1; filter: url(#glow); }
-      76%, 100% { opacity: 1; }
+    @keyframes factPulse {
+      0%, 30%, 73%, 100% { filter: none; }
+      38%, 68% { filter: url(#glow); }
     }
-    @keyframes response {
-      0%, 70% { opacity: 0.25; }
-      78%, 100% { opacity: 1; }
+    @keyframes windowPulse {
+      0%, 47%, 75%, 100% { filter: none; }
+      55%, 70% { filter: url(#glow); }
     }
-    @keyframes selected {
-      0%, 66% { filter: none; }
-      74%, 92% { filter: url(#glow); }
-      100% { filter: none; }
+    @keyframes answerPulse {
+      0%, 72%, 100% { opacity: 0.65; }
+      80%, 92% { opacity: 1; }
     }
-    @keyframes token {
-      0%, 74% { opacity: 0; transform: translateY(5px); }
-      83%, 100% { opacity: 1; transform: translateY(0); }
+    @keyframes stageSource {
+      0%, 56% { opacity: 1; }
+      57%, 100% { opacity: 0; }
+    }
+    @keyframes stageOut {
+      0%, 48% { opacity: 0; transform: translate(0, 0); }
+      51% { opacity: 1; transform: translate(0, 0); }
+      57% { opacity: 1; transform: translate(0, 61px); }
+      60%, 100% { opacity: 0; transform: translate(0, 61px); }
+    }
+    @keyframes stageIn {
+      0%, 57% { opacity: 0; transform: translate(0, 0); }
+      60% { opacity: 1; transform: translate(0, 0); }
+      68% { opacity: 1; transform: translate(125px, -61px); }
+      71%, 100% { opacity: 0; transform: translate(125px, -61px); }
     }
     @media (prefers-reduced-motion: reduce) {
-      .p1, .p2, .p3, .p4, .scan, .query, .response,
-      .selected-pulse, .answer-token { animation: none !important; opacity: 1; }
-      .motion-dot { display: none; }
+      .focus1, .focus2, .focus3, .focus4, .query-pulse, .fact-pulse,
+      .window-pulse, .answer-pulse, .stage-source, .move-out, .move-in {
+        animation: none !important;
+      }
+      .focus-ring, .move-out, .move-in { display: none; }
+      .answer-pulse { opacity: 1; }
     }
   </style>
 
-  <rect x="1" y="1" width="1198" height="558" rx="24" fill="url(#bg)"
+  <rect x="1" y="1" width="1198" height="628" rx="24" fill="url(#bg)"
         stroke="#203c53" stroke-width="2"/>
+  <text x="40" y="45" class="title">Long history. Small GPU working set.</text>
+  <text x="40" y="72" class="subtitle">KVMem ranks history for each question and stages selected KV into a bounded GPU attention window.</text>
 
-  <text x="42" y="46" class="title">KVMem keeps a large history behind a bounded GPU window</text>
-  <text x="42" y="70" class="subtitle">Prefill history · tier cold KV blocks · score a compact index · recall only what the query needs</text>
-
-  <g transform="translate(42 91)">
-    <g class="phase p1">
-      <circle cx="8" cy="8" r="8" fill="#39d0ba"/>
-      <text x="8" y="12" text-anchor="middle" fill="#061b1b" font-size="10" font-weight="800">1</text>
-      <text x="23" y="12" class="small">Ingest history</text>
-    </g>
-    <g transform="translate(153 0)" class="phase p2">
-      <circle cx="8" cy="8" r="8" fill="#66a3ff"/>
-      <text x="8" y="12" text-anchor="middle" fill="#071528" font-size="10" font-weight="800">2</text>
-      <text x="23" y="12" class="small">Tier cold blocks</text>
-    </g>
-    <g transform="translate(332 0)" class="phase p3">
-      <circle cx="8" cy="8" r="8" fill="#ffcc66"/>
-      <text x="8" y="12" text-anchor="middle" fill="#281d04" font-size="10" font-weight="800">3</text>
-      <text x="23" y="12" class="small">Query &amp; score</text>
-    </g>
-    <g transform="translate(493 0)" class="phase p4">
-      <circle cx="8" cy="8" r="8" fill="#a797ff"/>
-      <text x="8" y="12" text-anchor="middle" fill="#180d2c" font-size="10" font-weight="800">4</text>
-      <text x="23" y="12" class="small">Recall a bounded window</text>
-    </g>
-  </g>
-
-  <!-- Accumulated history -->
+  <!-- 1. History is retained across tiers. -->
   <g filter="url(#soft)">
-    <rect x="42" y="132" width="245" height="352" rx="17" class="panel"/>
-    <text x="64" y="161" class="label">Accumulated agent history</text>
-    <text x="64" y="180" class="small">Conversation + tool state + files</text>
+    <rect x="40" y="94" width="1120" height="146" rx="17" class="panel"/>
+    <circle cx="64" cy="119" r="13" class="badge"/>
+    <text x="64" y="124" text-anchor="middle" fill="#071528" font-size="13" font-weight="800">1</text>
+    <text x="86" y="125" class="heading">History remains recoverable across memory tiers</text>
+    <text x="1135" y="124" text-anchor="end" class="small">GPU active · CPU recoverable · NVMe optional</text>
 
-    <g transform="translate(64 205)">
-      <rect width="200" height="48" rx="10" fill="#102a3e" stroke="#31546d"/>
-      <circle cx="20" cy="24" r="9" fill="#39d0ba" fill-opacity="0.8"/>
-      <text x="39" y="21" class="small">Earlier turns</text>
-      <text x="39" y="36" class="tiny">messages and decisions</text>
-    </g>
-    <g transform="translate(64 263)">
-      <rect width="200" height="48" rx="10" fill="#102a3e" stroke="#31546d"/>
-      <circle cx="20" cy="24" r="9" fill="#66a3ff" fill-opacity="0.82"/>
-      <text x="39" y="21" class="small">Tool output</text>
-      <text x="39" y="36" class="tiny">logs, search, shell results</text>
-    </g>
-    <g transform="translate(64 321)">
-      <rect width="200" height="48" rx="10" fill="#102a3e" stroke="#31546d"/>
-      <circle cx="20" cy="24" r="9" fill="#ffcc66" fill-opacity="0.85"/>
-      <text x="39" y="21" class="small">Workspace context</text>
-      <text x="39" y="36" class="tiny">documents and code</text>
-    </g>
-    <g transform="translate(64 379)">
-      <rect width="200" height="48" rx="10" fill="#102a3e" stroke="#31546d"/>
-      <circle cx="20" cy="24" r="9" fill="#a797ff" fill-opacity="0.85"/>
-      <text x="39" y="21" class="small">Long-term memory</text>
-      <text x="39" y="36" class="tiny">contextualized KV blocks</text>
-    </g>
-    <text x="64" y="458" class="small">History grows; GPU window stays bounded.</text>
-  </g>
-
-  <!-- Storage tiers -->
-  <g filter="url(#soft)">
-    <rect x="340" y="132" width="505" height="116" rx="17" fill="url(#gpu)"
-          stroke="#2e817c" stroke-width="1.4"/>
-    <text x="363" y="159" class="label">GPU working set</text>
-    <text x="700" y="159" class="small">bounded active KV window</text>
-    <g transform="translate(363 181)">
-      <rect width="48" height="42" rx="7" class="block-hot"/>
-      <rect x="56" width="48" height="42" rx="7" class="block"/>
-      <rect x="112" width="48" height="42" rx="7" class="block-selected selected-pulse"/>
-      <rect x="168" width="48" height="42" rx="7" class="block"/>
-      <rect x="224" width="48" height="42" rx="7" class="block-hot"/>
-      <rect x="280" width="48" height="42" rx="7" class="block"/>
-      <rect x="336" width="48" height="42" rx="7" class="block-selected selected-pulse"/>
-      <rect x="392" width="48" height="42" rx="7" class="block-hot"/>
-    </g>
-
-    <rect x="340" y="274" width="505" height="91" rx="17" class="panel"/>
-    <text x="363" y="302" class="label">Host RAM tier</text>
-    <text x="716" y="302" class="small">warm recoverable blocks</text>
-    <g transform="translate(363 319)">
-      <rect width="31" height="25" rx="5" class="block"/>
-      <rect x="38" width="31" height="25" rx="5" class="block"/>
-      <rect x="76" width="31" height="25" rx="5" class="block-selected selected-pulse"/>
-      <rect x="114" width="31" height="25" rx="5" class="block"/>
-      <rect x="152" width="31" height="25" rx="5" class="block"/>
-      <rect x="190" width="31" height="25" rx="5" class="block"/>
-      <rect x="228" width="31" height="25" rx="5" class="block"/>
-      <rect x="266" width="31" height="25" rx="5" class="block"/>
-      <rect x="304" width="31" height="25" rx="5" class="block"/>
-      <rect x="342" width="31" height="25" rx="5" class="block"/>
-      <rect x="380" width="31" height="25" rx="5" class="block"/>
-      <rect x="418" width="31" height="25" rx="5" class="block"/>
-    </g>
-
-    <rect x="340" y="391" width="505" height="91" rx="17" class="panel"/>
-    <text x="363" y="419" class="label">NVMe tier</text>
-    <text x="719" y="419" class="small">large cold backing store</text>
-    <g transform="translate(363 436)">
-      <rect width="31" height="25" rx="5" class="block"/>
-      <rect x="38" width="31" height="25" rx="5" class="block"/>
-      <rect x="76" width="31" height="25" rx="5" class="block"/>
-      <rect x="114" width="31" height="25" rx="5" class="block"/>
-      <rect x="152" width="31" height="25" rx="5" class="block-selected selected-pulse"/>
-      <rect x="190" width="31" height="25" rx="5" class="block"/>
-      <rect x="228" width="31" height="25" rx="5" class="block"/>
-      <rect x="266" width="31" height="25" rx="5" class="block"/>
-      <rect x="304" width="31" height="25" rx="5" class="block"/>
-      <rect x="342" width="31" height="25" rx="5" class="block"/>
-      <rect x="380" width="31" height="25" rx="5" class="block"/>
-      <rect x="418" width="31" height="25" rx="5" class="block"/>
-    </g>
-  </g>
-
-  <!-- Static paths and moving tier packets -->
-  <path d="M 287 238 C 315 238 320 205 340 205" class="wire"/>
-  <path d="M 590 248 L 590 274" class="wire-dash"/>
-  <path d="M 620 365 L 620 391" class="wire-dash"/>
-  <path d="M 532 274 C 532 253 505 252 505 228" class="wire-dash"/>
-  <path d="M 682 391 C 682 355 742 352 742 228" class="wire-dash"/>
-
-  <circle class="motion-dot" r="6" fill="#66a3ff" filter="url(#glow)" opacity="0">
-    <animateMotion dur="0.72s" begin="1.18s" fill="freeze"
-                   path="M590 236 L590 308"/>
-    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
-             dur="0.72s" begin="1.18s" fill="freeze"/>
-  </circle>
-  <circle class="motion-dot" r="6" fill="#66a3ff" filter="url(#glow)" opacity="0">
-    <animateMotion dur="0.72s" begin="1.62s" fill="freeze"
-                   path="M620 352 L620 428"/>
-    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
-             dur="0.72s" begin="1.62s" fill="freeze"/>
-  </circle>
-  <circle class="motion-dot" r="7" fill="#a797ff" filter="url(#glow)" opacity="0">
-    <animateMotion dur="0.72s" begin="3.25s" fill="freeze"
-                   path="M532 319 C532 253 505 252 505 205"/>
-    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
-             dur="0.72s" begin="3.25s" fill="freeze"/>
-  </circle>
-  <circle class="motion-dot" r="7" fill="#a797ff" filter="url(#glow)" opacity="0">
-    <animateMotion dur="0.76s" begin="3.58s" fill="freeze"
-                   path="M682 448 C682 355 742 352 742 205"/>
-    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
-             dur="0.76s" begin="3.58s" fill="freeze"/>
-  </circle>
-
-  <!-- Query, index and response -->
-  <g filter="url(#soft)">
-    <rect x="891" y="132" width="267" height="350" rx="17" class="panel"/>
-    <g class="query">
-      <rect x="914" y="158" width="221" height="62" rx="13" fill="#122b40"
-            stroke="#ffcc66" stroke-opacity="0.75"/>
-      <text x="932" y="181" class="small">New user query</text>
-      <text x="932" y="202" class="label">“Where is the old fact?”</text>
-    </g>
-
-    <path d="M 1024 224 L 1024 253" class="wire-dash"/>
-    <rect x="914" y="256" width="221" height="74" rx="13" fill="#10273a"
-          stroke="#3a617a"/>
-    <text x="932" y="279" class="small">Compact retrieval index</text>
-    <text x="932" y="301" class="label">Mean-K scorer</text>
-    <g transform="translate(1064 274)">
-      <rect x="0" y="16" width="6" height="25" rx="3" fill="#ffcc66" class="scan"/>
-      <rect x="10" y="7" width="6" height="34" rx="3" fill="#ffcc66" class="scan"/>
-      <rect x="20" y="21" width="6" height="20" rx="3" fill="#ffcc66" class="scan"/>
-      <rect x="30" y="1" width="6" height="40" rx="3" fill="#ffcc66" class="scan"/>
-      <rect x="40" y="12" width="6" height="29" rx="3" fill="#ffcc66" class="scan"/>
-      <rect x="50" y="24" width="6" height="17" rx="3" fill="#ffcc66" class="scan"/>
-    </g>
-
-    <path d="M 914 294 C 874 294 871 210 845 210" class="wire-dash"/>
-    <path d="M 845 333 C 873 333 874 316 914 316" class="wire-dash"/>
-
-    <g class="response">
-      <rect x="914" y="360" width="221" height="91" rx="13" fill="url(#answer)"
-            stroke="#39d0ba" stroke-opacity="0.72"/>
-      <text x="932" y="384" class="small">Answer generation</text>
-      <g transform="translate(932 402)">
-        <rect width="31" height="12" rx="6" fill="#39d0ba" class="answer-token t1"/>
-        <rect x="38" width="46" height="12" rx="6" fill="#66a3ff" class="answer-token t2"/>
-        <rect x="91" width="24" height="12" rx="6" fill="#39d0ba" class="answer-token t3"/>
-        <rect x="122" width="40" height="12" rx="6" fill="#66a3ff" class="answer-token t4"/>
-        <rect x="169" width="26" height="12" rx="6" fill="#39d0ba" class="answer-token t5"/>
+    <g transform="translate(65 143)">
+      <g>
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H0</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-cpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">CPU</text>
       </g>
-      <text x="932" y="437" class="tiny">Only selected KV blocks return to GPU.</text>
+      <g transform="translate(78 0)">
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H1</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-cpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">CPU</text>
+      </g>
+      <g transform="translate(156 0)">
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H2</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-cpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">CPU</text>
+      </g>
+      <g transform="translate(234 0)">
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H3</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-cpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">CPU</text>
+      </g>
+      <g transform="translate(312 0)" class="fact-pulse">
+        <rect width="70" height="64" rx="8" class="block-fact"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H4</text>
+        <text x="35" y="40" text-anchor="middle" fill="#ded5ff" font-size="14" font-weight="750">FACT</text>
+        <rect y="47" width="70" height="17" class="tier-cpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">CPU</text>
+      </g>
+      <g transform="translate(390 0)">
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H5</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-cpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">CPU</text>
+      </g>
+      <g transform="translate(468 0)">
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H6</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-gpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">GPU</text>
+      </g>
+      <g transform="translate(546 0)">
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H7</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-gpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">GPU</text>
+      </g>
+      <g transform="translate(624 0)">
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H8</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-gpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">GPU</text>
+      </g>
+      <g transform="translate(702 0)">
+        <rect width="70" height="64" rx="8" class="block"/>
+        <text x="35" y="21" text-anchor="middle" class="small mono">H9</text>
+        <text x="35" y="40" text-anchor="middle" class="micro">history</text>
+        <rect y="47" width="70" height="17" class="tier-gpu"/>
+        <text x="35" y="60" text-anchor="middle" class="micro">GPU</text>
+      </g>
     </g>
+    <text x="865" y="166" class="body">Many history blocks</text>
+    <text x="865" y="190" class="body">Fixed active GPU slots</text>
+    <text x="865" y="218" class="micro">Leaving GPU does not delete history.</text>
+    <rect x="43" y="97" width="1114" height="140" rx="15" class="focus-ring focus1"/>
   </g>
 
-  <circle class="motion-dot" r="6" fill="#ffcc66" filter="url(#glow)" opacity="0">
-    <animateMotion dur="0.58s" begin="2.48s" fill="freeze"
-                   path="M1024 217 L1024 267"/>
-    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.12;.82;1"
-             dur="0.58s" begin="2.48s" fill="freeze"/>
-  </circle>
+  <!-- 2. The question ranks an internal block-summary index. -->
+  <g filter="url(#soft)">
+    <rect x="40" y="260" width="540" height="174" rx="17" class="panel"/>
+    <circle cx="64" cy="285" r="13" class="badge"/>
+    <text x="64" y="290" text-anchor="middle" fill="#071528" font-size="13" font-weight="800">2</text>
+    <text x="86" y="291" class="heading">The question ranks history blocks</text>
 
-  <text x="42" y="526" class="tiny">Illustrative control flow — performance and capacity claims require a pinned release artifact.</text>
-  <text x="1158" y="526" text-anchor="end" class="tiny">under-5-second animation · final frame remains readable</text>
+    <g class="query-pulse">
+      <rect x="65" y="314" width="168" height="58" rx="11" class="block-query"/>
+      <text x="149" y="337" text-anchor="middle" class="small">new question</text>
+      <text x="149" y="359" text-anchor="middle" fill="#8cebdc" font-size="16" font-weight="720">“Rollback code?”</text>
+    </g>
+    <path d="M235 343 L265 343" class="wire"/>
+
+    <rect x="274" y="306" width="276" height="104" rx="12" fill="#102438" stroke="#3a5b71"/>
+    <text x="292" y="328" class="small">internal Mean-K index</text>
+    <g transform="translate(294 340)">
+      <line x1="0" y1="39" x2="236" y2="39" stroke="#36546a"/>
+      <g><rect y="29" width="20" height="10" rx="3" fill="#3c6078"/><text x="10" y="56" text-anchor="middle" class="micro mono">H0</text></g>
+      <g transform="translate(30 0)"><rect y="25" width="20" height="14" rx="3" fill="#3c6078"/><text x="10" y="56" text-anchor="middle" class="micro mono">H1</text></g>
+      <g transform="translate(60 0)"><rect y="31" width="20" height="8" rx="3" fill="#3c6078"/><text x="10" y="56" text-anchor="middle" class="micro mono">H2</text></g>
+      <g transform="translate(90 0)"><rect y="22" width="20" height="17" rx="3" fill="#3c6078"/><text x="10" y="56" text-anchor="middle" class="micro mono">H3</text></g>
+      <g transform="translate(120 0)" class="fact-pulse"><rect y="0" width="20" height="39" rx="3" fill="#a797ff"/><text x="10" y="56" text-anchor="middle" fill="#ded5ff" font-size="13" class="mono">H4</text></g>
+      <g transform="translate(150 0)"><rect y="27" width="20" height="12" rx="3" fill="#3c6078"/><text x="10" y="56" text-anchor="middle" class="micro mono">H5</text></g>
+      <g transform="translate(180 0)"><rect y="30" width="20" height="9" rx="3" fill="#3c6078"/><text x="10" y="56" text-anchor="middle" class="micro mono">H6</text></g>
+      <g transform="translate(210 0)"><rect y="24" width="20" height="15" rx="3" fill="#3c6078"/><text x="10" y="56" text-anchor="middle" class="micro mono">H7</text></g>
+    </g>
+    <text x="65" y="421" class="micro">Ranks per-block KV summaries · no external vector database</text>
+    <rect x="43" y="263" width="534" height="168" rx="15" class="focus-ring focus2"/>
+  </g>
+
+  <!-- 3. Stage selected KV into the fixed-size GPU window. -->
+  <g filter="url(#soft)">
+    <rect x="600" y="260" width="560" height="174" rx="17" class="panel"/>
+    <circle cx="624" cy="285" r="13" class="badge"/>
+    <text x="624" y="290" text-anchor="middle" fill="#071528" font-size="13" font-weight="800">3</text>
+    <text x="646" y="291" class="heading">Swap selected KV into the fixed GPU window</text>
+
+    <text x="625" y="317" class="small">before · 4 slots</text>
+    <g transform="translate(625 327)">
+      <rect width="45" height="42" rx="7" class="block"/><text x="22" y="26" text-anchor="middle" class="micro mono">H6</text>
+      <rect x="52" width="45" height="42" rx="7" class="block"/><text x="74" y="26" text-anchor="middle" class="micro mono">H7</text>
+      <rect x="104" width="45" height="42" rx="7" class="block"/><text x="126" y="26" text-anchor="middle" class="micro mono">H8</text>
+      <rect x="156" width="45" height="42" rx="7" class="block"/><text x="178" y="26" text-anchor="middle" class="micro mono">H9</text>
+    </g>
+    <g transform="translate(625 327)"><g class="move-out">
+      <rect width="45" height="42" rx="7" class="block"/>
+      <text x="22" y="26" text-anchor="middle" class="micro mono">H6</text>
+    </g></g>
+
+    <path d="M837 348 L903 348" class="wire"/>
+    <text x="849" y="335" class="micro">swap</text>
+
+    <text x="915" y="317" class="small">after · 4 slots</text>
+    <g transform="translate(915 327)" class="window-pulse">
+      <rect width="45" height="42" rx="7" class="block-fact"/><text x="22" y="26" text-anchor="middle" fill="#ded5ff" font-size="13" class="mono">H4</text>
+      <rect x="52" width="45" height="42" rx="7" class="block"/><text x="74" y="26" text-anchor="middle" class="micro mono">H7</text>
+      <rect x="104" width="45" height="42" rx="7" class="block"/><text x="126" y="26" text-anchor="middle" class="micro mono">H8</text>
+      <rect x="156" width="45" height="42" rx="7" class="block"/><text x="178" y="26" text-anchor="middle" class="micro mono">H9</text>
+    </g>
+
+    <path d="M647 371 L647 386" class="wire"/>
+    <g transform="translate(625 388)">
+      <rect width="76" height="28" rx="7" class="block"/>
+      <text x="38" y="19" text-anchor="middle" class="micro mono">H6 · CPU</text>
+    </g>
+    <g transform="translate(790 388)">
+      <g class="stage-source">
+        <rect width="98" height="28" rx="7" class="block-fact"/>
+        <text x="49" y="19" text-anchor="middle" fill="#ded5ff" font-size="12" class="mono">H4 FACT · CPU</text>
+      </g>
+      <g class="move-in">
+        <rect width="45" height="28" rx="7" class="block-fact"/>
+        <text x="22" y="19" text-anchor="middle" fill="#ded5ff" font-size="12" class="mono">H4</text>
+      </g>
+    </g>
+    <path d="M889 401 C906 395 918 383 937 371" class="wire-accent"/>
+    <text x="915" y="420" class="micro">Fixed size · history order preserved</text>
+    <rect x="603" y="263" width="554" height="168" rx="15" class="focus-ring focus3"/>
+  </g>
+
+  <!-- 4. Generate with the refreshed context. -->
+  <g filter="url(#soft)">
+    <rect x="40" y="454" width="1120" height="106" rx="17" class="panel"/>
+    <circle cx="64" cy="479" r="13" class="badge"/>
+    <text x="64" y="484" text-anchor="middle" fill="#071528" font-size="13" font-weight="800">4</text>
+    <text x="86" y="485" class="heading">Generate with the refreshed context</text>
+
+    <rect x="324" y="496" width="150" height="43" rx="9" class="block-query query-pulse"/>
+    <text x="399" y="523" text-anchor="middle" fill="#8cebdc" font-size="15" font-weight="700">same question</text>
+    <text x="487" y="524" class="body">+</text>
+    <g transform="translate(514 497)" class="window-pulse">
+      <rect width="43" height="41" rx="7" class="block-fact"/><text x="21" y="25" text-anchor="middle" fill="#ded5ff" font-size="12" class="mono">H4</text>
+      <rect x="49" width="43" height="41" rx="7" class="block"/><text x="70" y="25" text-anchor="middle" class="micro mono">H7</text>
+      <rect x="98" width="43" height="41" rx="7" class="block"/><text x="119" y="25" text-anchor="middle" class="micro mono">H8</text>
+      <rect x="147" width="43" height="41" rx="7" class="block"/><text x="168" y="25" text-anchor="middle" class="micro mono">H9</text>
+    </g>
+    <path d="M711 517 L753 517" class="wire"/>
+    <rect x="761" y="496" width="136" height="43" rx="9" fill="#173d48" stroke="#39d0ba"/>
+    <text x="829" y="523" text-anchor="middle" fill="#b8f3e8" font-size="15" font-weight="700">Qwen CUDA</text>
+    <path d="M899 517 L933 517" class="wire"/>
+    <g class="answer-pulse">
+      <rect x="941" y="491" width="191" height="53" rx="10" fill="url(#answer)" stroke="#39d0ba"/>
+      <text x="957" y="510" class="micro">answer</text>
+      <text x="957" y="533" fill="#8cebdc" font-size="15" font-weight="750" class="mono">KVMEM-7F3A…</text>
+    </g>
+    <rect x="43" y="457" width="1114" height="100" rx="15" class="focus-ring focus4"/>
+  </g>
+
+  <rect x="40" y="580" width="1120" height="34" rx="11" fill="#0f2638" stroke="#2c5268"/>
+  <text x="60" y="602" fill="#dceaf2" font-size="15" font-weight="650">Full history stays recoverable. GPU attention uses one bounded, question-selected working set.</text>
 </svg>

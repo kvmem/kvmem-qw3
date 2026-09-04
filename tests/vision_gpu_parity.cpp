@@ -46,21 +46,48 @@ float bf16_to_float(uint16_t value) {
     return result;
 }
 
+qw3::VisionImage load_image(const std::filesystem::path &path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open image: " + path.string());
+    const std::vector<uint8_t> bytes(
+        std::istreambuf_iterator<char>(input), {});
+    qw3::VisionImage image;
+    image.media_type = path.extension() == ".png" ? "image/png" : "image/jpeg";
+    image.base64_data = base64_encode(bytes);
+    return image;
+}
+
+std::vector<uint16_t> copy_device_encoding(
+        qw3::DeviceBackend &backend,
+        const qw3::detail::DeviceInputEmbeddingStorage &storage) {
+    const uint64_t count = static_cast<uint64_t>(storage.rows()) * storage.dim();
+    std::vector<uint16_t> result(static_cast<size_t>(count));
+    for (const auto &segment : storage.segments()) {
+        auto status = backend.copy_bytes_to_host(
+            *segment.tensor,
+            result.data() + static_cast<uint64_t>(segment.logical_row) *
+                                storage.dim(),
+            static_cast<uint64_t>(segment.source_row) * storage.dim() *
+                sizeof(uint16_t),
+            static_cast<uint64_t>(segment.rows) * storage.dim() *
+                sizeof(uint16_t));
+        if (!status.ok) throw std::runtime_error(status.message);
+    }
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char **argv) try {
-    if (argc != 5) {
-        std::cerr << "usage: qw3-vision-gpu-parity MODEL_DIR PYTHON WORKER IMAGE\n";
+    if (argc != 5 && argc != 6) {
+        std::cerr << "usage: qw3-vision-gpu-parity MODEL_DIR PYTHON WORKER "
+                     "IMAGE [IMAGE2]\n";
         return 2;
     }
-    const std::filesystem::path image_path = argv[4];
-    std::ifstream image_in(image_path, std::ios::binary);
-    if (!image_in) throw std::runtime_error("cannot open image");
-    const std::vector<uint8_t> image_bytes(
-        std::istreambuf_iterator<char>(image_in), {});
-    qw3::VisionImage image;
-    image.media_type = image_path.extension() == ".png" ? "image/png" : "image/jpeg";
-    image.base64_data = base64_encode(image_bytes);
+    const qw3::VisionImage image = load_image(argv[4]);
+    const bool test_per_image_cache = argc == 6;
+    const qw3::VisionImage image2 = test_per_image_cache
+        ? load_image(argv[5]) : qw3::VisionImage{};
 
     auto backend = qw3::make_cuda_device_backend(qw3::LinearBackend::Cublas);
     if (!backend) throw std::runtime_error("CUDA backend unavailable");
@@ -104,6 +131,36 @@ int main(int argc, char **argv) try {
         gpu_min_ms = std::min(gpu_min_ms, gpu_ms);
         cpu_min_ms = std::min(cpu_min_ms, cpu_ms);
     }
+    double partial_hit_ms = 0.0;
+    double reordered_hit_ms = 0.0;
+    if (test_per_image_cache) {
+        const auto partial_begin = std::chrono::steady_clock::now();
+        gpu_result = gpu.encode({image, image2});
+        const auto partial_end = std::chrono::steady_clock::now();
+        partial_hit_ms = std::chrono::duration<double, std::milli>(
+            partial_end - partial_begin).count();
+        if (gpu_result.cache_hit || gpu_result.cache_hits != 1 ||
+            gpu_result.cache_misses != 1) {
+            throw std::runtime_error(
+                "per-image cache did not report one hit and one miss");
+        }
+        const auto reordered_begin = std::chrono::steady_clock::now();
+        gpu_result = gpu.encode({image2, image});
+        const auto reordered_end = std::chrono::steady_clock::now();
+        reordered_hit_ms = std::chrono::duration<double, std::milli>(
+            reordered_end - reordered_begin).count();
+        if (!gpu_result.cache_hit || gpu_result.cache_hits != 2 ||
+            gpu_result.cache_misses != 0) {
+            throw std::runtime_error(
+                "per-image cache did not fully hit reordered images");
+        }
+        cpu_result = cpu.encode({image2, image});
+        if (cpu_result.cache_hit || cpu_result.cache_hits != 1 ||
+            cpu_result.cache_misses != 1) {
+            throw std::runtime_error(
+                "CPU per-image cache did not report one hit and one miss");
+        }
+    }
     if (!gpu_result.storage || gpu_result.embedding_dim != cpu_result.embedding_dim ||
         gpu_result.grids.size() != cpu_result.grids.size()) {
         throw std::runtime_error("CPU/GPU vision result metadata mismatch");
@@ -115,10 +172,7 @@ int main(int argc, char **argv) try {
     if (count != cpu_result.embeddings.size()) {
         throw std::runtime_error("CPU/GPU vision result shape mismatch");
     }
-    std::vector<uint16_t> gpu_bf16(static_cast<size_t>(count));
-    status = backend->copy_bytes_to_host(storage->tensor(), gpu_bf16.data(), 0,
-                                         count * sizeof(uint16_t));
-    if (!status.ok) throw std::runtime_error(status.message);
+    std::vector<uint16_t> gpu_bf16 = copy_device_encoding(*backend, *storage);
 
     double abs_sum = 0.0;
     double sq_error = 0.0;
@@ -146,6 +200,8 @@ int main(int argc, char **argv) try {
               << " gpu_min_ms=" << gpu_min_ms
               << " cpu_mean_ms=" << (cpu_total_ms / repeats)
               << " cpu_min_ms=" << cpu_min_ms
+              << " partial_hit_ms=" << partial_hit_ms
+              << " reordered_hit_ms=" << reordered_hit_ms
               << " mean_abs=" << (abs_sum / count)
               << " rmse=" << std::sqrt(sq_error / count)
               << " max_abs=" << max_abs
