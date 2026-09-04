@@ -102,9 +102,11 @@ void usage(std::ostream &os) {
         "  --cpu-embedding       Keep a BF16 input embedding table on CPU and\n"
         "                        transfer only selected rows. Requires a separate\n"
         "                        LM head. Default: off.\n"
-        "  --vision-cpu-model DIR  Enable the optional CPU-only Qwen3.5 vision\n"
-        "                        frontend using DIR's HF vision weights. Projected\n"
-        "                        embeddings are injected into the GPU text model.\n"
+        "  --vision-model DIR    Enable the Qwen3.5 visual frontend using DIR's\n"
+        "                        HF vision weights.\n"
+        "  --vision-device NAME  Visual tower device: cpu or cuda. Default: cpu.\n"
+        "  --vision-cpu-model DIR  Legacy alias for --vision-model DIR\n"
+        "                        --vision-device cpu.\n"
         "  --native-mtp-trace    Run one optional MTP draft-head diagnostic\n"
         "  --native-mtp-chain N  Diagnostic MTP draft chain length. Default: 1\n"
         "  --native-mtp-prefix   Populate diagnostic MTP prefix KV before drafts\n"
@@ -459,6 +461,18 @@ int main(int argc, char **argv) {
                 engine.cpu_embedding = true;
             } else if (arg == "--vision-cpu-model") {
                 engine.vision_cpu_model_path = need(arg);
+                engine.vision_model_path = engine.vision_cpu_model_path;
+                engine.vision_device = "cpu";
+            } else if (arg == "--vision-model") {
+                engine.vision_model_path = need(arg);
+            } else if (arg == "--vision-device") {
+                engine.vision_device = need(arg);
+                if (engine.vision_device != "cpu" &&
+                    engine.vision_device != "cuda") {
+                    throw std::runtime_error(
+                        "invalid --vision-device (want cpu|cuda): " +
+                        engine.vision_device);
+                }
             } else if (arg == "--native-mtp-trace") {
                 engine.native_mtp_trace = true;
             } else if (arg == "--native-mtp-chain") {

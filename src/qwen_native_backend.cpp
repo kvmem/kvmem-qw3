@@ -8,6 +8,7 @@
 #include "qwen_executor.hpp"
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
+#include "vision_gpu_frontend.hpp"
 #include "qw3/device_backend.hpp"
 #include "qw3/tokenizer.hpp"
 
@@ -1928,6 +1929,14 @@ public:
         stop_continuous_batch_worker();
     }
 
+    VisionEncoding encode_vision(
+            const std::vector<VisionImage> &images) override {
+        if (!vision_gpu_frontend_) {
+            throw std::runtime_error("native CUDA vision frontend is not configured");
+        }
+        return vision_gpu_frontend_->encode(images);
+    }
+
     // ---- Context archive (docs/kvmem_context_archive_design.md) ----
 
     // Fields that fix the archive's byte layout or its numerics. Deliberately
@@ -2156,6 +2165,37 @@ public:
         st = device_->synchronize();
         if (!st.ok) throw std::runtime_error(std::string("weight upload sync failed: ") + st.message);
         const double t_weights = wall_seconds();
+
+        if (!options_.vision_model_path.empty() &&
+            options_.vision_device == "cuda") {
+            std::string python = options_.vision_cpu_python;
+            if (python.empty()) {
+                if (const char *value = std::getenv("QW3_VISION_CPU_PYTHON")) {
+                    python = value;
+                }
+            }
+            if (python.empty()) {
+                python = std::string(QW3_SOURCE_DIR) + "/.venv/bin/python";
+            }
+            std::string worker = options_.vision_cpu_worker;
+            if (worker.empty()) {
+                if (const char *value = std::getenv("QW3_VISION_CPU_WORKER")) {
+                    worker = value;
+                }
+            }
+            if (worker.empty()) {
+                worker = std::string(QW3_SOURCE_DIR) +
+                         "/scripts/qw3_vision_cpu_worker.py";
+            }
+            uint32_t threads = options_.vision_cpu_threads > 0
+                ? static_cast<uint32_t>(options_.vision_cpu_threads)
+                : std::max<uint32_t>(1, std::thread::hardware_concurrency());
+            vision_gpu_frontend_ = std::make_unique<detail::GpuVisionFrontend>(
+                *device_, options_.vision_model_path, python, worker, threads);
+            log("native CUDA vision: weights=" +
+                std::to_string(vision_gpu_frontend_->weight_bytes() >> 20) +
+                " MiB device=cuda");
+        }
 
         const uint32_t ctx_size = options_.ctx_size > 0 ? static_cast<uint32_t>(options_.ctx_size) : 4096u;
         executor_ = std::make_unique<QwenExecutor>(*model_, *weights_, *device_, ctx_size);
@@ -17804,6 +17844,7 @@ private:
     // and after the executors that borrow from it.
     std::unique_ptr<HostTierBufferPool> cb_host_tier_pool_;
     std::unique_ptr<QwenWeights> weights_;
+    std::unique_ptr<detail::GpuVisionFrontend> vision_gpu_frontend_;
     // Declared before executor_ so it is destroyed after it: the executor holds
     // a borrowed pointer to the archive for as long as it can write.
     std::unique_ptr<KvMemArchive> kvmem_archive_;

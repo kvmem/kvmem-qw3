@@ -88,7 +88,8 @@ if(QW3_ENABLE_CUDA)
         endif()
         list(APPEND QW3_CUDA_SRCS
             src/flashinfer_prefill_adapter.cu
-            src/flashinfer_decode_adapter.cu)
+            src/flashinfer_decode_adapter.cu
+            src/flashinfer_vision_adapter.cu)
     endif()
 else()
     if(QW3_ENABLE_FLASHINFER)
@@ -111,6 +112,7 @@ add_library(qw3_core
     src/kvmem_archive.cpp
     src/anthropic_adapter.cpp
     src/vision_cpu_frontend.cpp
+    src/vision_gpu_frontend.cpp
     src/harness_semantics.cpp
     src/tool_call_stream.cpp
     src/tokenizer.cpp
@@ -314,6 +316,11 @@ if(QW3_BUILD_TESTS)
     add_test(NAME qw3-kvmem-archive COMMAND qw3-kvmem-archive)
 
     if(QW3_ENABLE_CUDA)
+        add_executable(qw3-vision-gpu-parity tests/vision_gpu_parity.cpp)
+        target_include_directories(qw3-vision-gpu-parity PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(qw3-vision-gpu-parity PRIVATE qw3_core)
+
         add_executable(qw3-mmq-parity tests/mmq_parity.cu)
         target_link_libraries(qw3-mmq-parity PRIVATE qw3_core)
         set_property(TARGET qw3-mmq-parity PROPERTY CUDA_STANDARD 17)

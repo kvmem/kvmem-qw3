@@ -86,11 +86,14 @@ struct CpuVisionFrontend::Impl {
     uint64_t cache_limit_bytes = 512ULL << 20;
     uint64_t cache_bytes = 0;
     std::vector<CacheEntry> cache;
+    bool preprocess_only = false;
 
     Impl(const std::string &model_directory,
          const std::string &python_executable,
          const std::string &worker_script,
-         uint32_t threads) {
+         uint32_t threads,
+         bool preprocess_only_arg,
+         const std::string &runtime_device) : preprocess_only(preprocess_only_arg) {
         if (const char *value = std::getenv("QW3_VISION_CPU_CACHE_MIB")) {
             char *end = nullptr;
             errno = 0;
@@ -126,9 +129,17 @@ struct CpuVisionFrontend::Impl {
             close_fd(to_child[0]); close_fd(to_child[1]);
             close_fd(from_child[0]); close_fd(from_child[1]);
             const std::string thread_arg = std::to_string(threads);
-            ::execl(python_executable.c_str(), python_executable.c_str(),
-                    worker_script.c_str(), "--model", model_directory.c_str(),
-                    "--threads", thread_arg.c_str(), static_cast<char *>(nullptr));
+            if (preprocess_only) {
+                ::execl(python_executable.c_str(), python_executable.c_str(),
+                        worker_script.c_str(), "--model", model_directory.c_str(),
+                        "--threads", thread_arg.c_str(), "--preprocess-only",
+                        static_cast<char *>(nullptr));
+            } else {
+                ::execl(python_executable.c_str(), python_executable.c_str(),
+                        worker_script.c_str(), "--model", model_directory.c_str(),
+                        "--threads", thread_arg.c_str(), "--device",
+                        runtime_device.c_str(), static_cast<char *>(nullptr));
+            }
             std::fprintf(stderr, "failed to exec vision worker: %s\n",
                          std::strerror(errno));
             _exit(127);
@@ -189,15 +200,21 @@ struct CpuVisionFrontend::Impl {
 CpuVisionFrontend::CpuVisionFrontend(std::string model_directory,
                                      std::string python_executable,
                                      std::string worker_script,
-                                     uint32_t threads)
+                                     uint32_t threads,
+                                     bool preprocess_only,
+                                     std::string runtime_device)
     : impl_(std::make_unique<Impl>(model_directory, python_executable,
-                                   worker_script, std::max<uint32_t>(1, threads))) {}
+                                   worker_script, std::max<uint32_t>(1, threads),
+                                   preprocess_only, runtime_device)) {}
 
 CpuVisionFrontend::~CpuVisionFrontend() = default;
 
 CpuVisionEncoding CpuVisionFrontend::encode(
         const std::vector<CpuVisionImage> &images) {
     if (images.empty()) return {};
+    if (impl_->preprocess_only) {
+        throw std::runtime_error("encode called on preprocess-only vision worker");
+    }
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto same_images = [&](const std::vector<CpuVisionImage> &cached) {
         if (cached.size() != images.size()) return false;
@@ -283,6 +300,75 @@ CpuVisionEncoding CpuVisionFrontend::encode(
         entry.bytes = result_bytes;
         impl_->cache.push_back(std::move(entry));
         impl_->cache_bytes += result_bytes;
+    }
+    return result;
+}
+
+CpuVisionPatches CpuVisionFrontend::preprocess(
+        const std::vector<CpuVisionImage> &images) {
+    if (images.empty()) return {};
+    if (!impl_->preprocess_only) {
+        throw std::runtime_error("preprocess called on encoding vision worker");
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    json request{{"op", "preprocess"}, {"images", json::array()}};
+    for (const CpuVisionImage &image : images) {
+        request["images"].push_back(
+            json{{"media_type", image.media_type}, {"data", image.base64_data}});
+    }
+    const std::string wire = request.dump() + "\n";
+    write_all(impl_->request_fd, wire.data(), wire.size());
+    const json response = json::parse(read_line(impl_->response_fd));
+    if (!response.value("ok", false)) {
+        throw std::runtime_error(
+            "vision preprocessing failed: " + response.value("error", "unknown error"));
+    }
+    if (response.value("dtype", "") != "bf16") {
+        throw std::runtime_error("vision preprocessor returned an unsupported dtype");
+    }
+    const uint64_t rows = response.at("rows").get<uint64_t>();
+    const uint64_t dim = response.at("dim").get<uint64_t>();
+    const uint64_t bytes = response.at("bytes").get<uint64_t>();
+    if (rows == 0 || dim == 0 || dim > std::numeric_limits<uint32_t>::max() ||
+        rows > std::numeric_limits<uint64_t>::max() / dim ||
+        rows * dim > std::numeric_limits<size_t>::max() / sizeof(uint16_t) ||
+        bytes != rows * dim * sizeof(uint16_t)) {
+        throw std::runtime_error("vision preprocessor returned an invalid patch shape");
+    }
+    CpuVisionPatches result;
+    result.patch_dim = static_cast<uint32_t>(dim);
+    result.patches.resize(static_cast<size_t>(rows * dim));
+    read_all(impl_->response_fd, result.patches.data(), static_cast<size_t>(bytes));
+
+    const json &grids = response.at("grids");
+    const json &counts = response.at("counts");
+    const json &patch_counts = response.at("patch_counts");
+    if (!grids.is_array() || !counts.is_array() || !patch_counts.is_array() ||
+        grids.size() != images.size() || counts.size() != images.size() ||
+        patch_counts.size() != images.size()) {
+        throw std::runtime_error("vision preprocessor returned inconsistent image grids");
+    }
+    uint64_t counted_patches = 0;
+    for (size_t i = 0; i < grids.size(); ++i) {
+        if (!grids[i].is_array() || grids[i].size() != 3) {
+            throw std::runtime_error("vision preprocessor returned an invalid grid");
+        }
+        CpuVisionPatches::Grid grid;
+        grid.temporal = grids[i][0].get<uint32_t>();
+        grid.height = grids[i][1].get<uint32_t>();
+        grid.width = grids[i][2].get<uint32_t>();
+        grid.rows = counts[i].get<uint32_t>();
+        const uint64_t expected_patches = static_cast<uint64_t>(grid.temporal) *
+                                          grid.height * grid.width;
+        if (patch_counts[i].get<uint64_t>() != expected_patches ||
+            grid.rows != expected_patches / 4) {
+            throw std::runtime_error("vision preprocessor grid/count mismatch");
+        }
+        counted_patches += expected_patches;
+        result.grids.push_back(grid);
+    }
+    if (counted_patches != rows) {
+        throw std::runtime_error("vision grids do not match preprocessed patches");
     }
     return result;
 }

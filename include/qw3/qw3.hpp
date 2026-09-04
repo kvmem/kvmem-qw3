@@ -9,6 +9,39 @@
 
 namespace qw3 {
 
+// Type-erased storage for request-local input embeddings.  CPU frontends keep
+// using InputEmbeddingOverride::embedding; native device frontends implement
+// this interface so projected visual rows can remain resident on the device
+// until the language-model embedding scatter has consumed them.
+class InputEmbeddingStorage {
+public:
+    virtual ~InputEmbeddingStorage() = default;
+    virtual uint32_t rows() const = 0;
+    virtual uint32_t dim() const = 0;
+};
+
+struct VisionImage {
+    std::string media_type;
+    std::string base64_data;
+};
+
+struct VisionEncoding {
+    struct Grid {
+        uint32_t temporal = 0;
+        uint32_t height = 0;
+        uint32_t width = 0;
+        uint32_t rows = 0;
+    };
+
+    uint32_t embedding_dim = 0;
+    bool cache_hit = false;
+    std::vector<Grid> grids;
+    // CPU frontend result. The native CUDA frontend instead populates storage
+    // so the projected rows never make a GPU -> CPU -> GPU round trip.
+    std::vector<float> embeddings;
+    std::shared_ptr<const InputEmbeddingStorage> storage;
+};
+
 enum class KvMemReselectMode {
     Auto,
     Force,
@@ -143,6 +176,10 @@ struct EngineOptions {
     // The worker loads only model.visual.* weights; projected image embeddings
     // are copied into the normal CUDA language-model input stream.
     std::string vision_cpu_model_path;
+    // Preferred unified visual frontend configuration. `vision_device` is
+    // "cpu" or "cuda"; the legacy vision_cpu_model_path remains accepted.
+    std::string vision_model_path;
+    std::string vision_device = "cpu";
     std::string vision_cpu_python;
     std::string vision_cpu_worker;
     int vision_cpu_threads = 0; // 0 = online CPU count
@@ -320,6 +357,10 @@ struct GenerationOptions {
         uint32_t source_token_id = 0;
         std::array<uint32_t, 3> position = {0, 0, 0};
         std::vector<float> embedding;
+        // When set, embedding_row selects a row from device-backed storage.
+        // Exactly one of `embedding` and `storage` is expected to be present.
+        std::shared_ptr<const InputEmbeddingStorage> storage;
+        uint32_t embedding_row = 0;
     };
     std::vector<InputEmbeddingOverride> input_embedding_overrides;
     // Stable identity of the request's ordered visual inputs. Text-only
@@ -572,6 +613,7 @@ public:
     const EngineOptions &options() const;
     ModelInfo inspect_model() const;
     NativePlanInfo native_plan() const;
+    VisionEncoding encode_vision(const std::vector<VisionImage> &images);
     std::string generate(const std::string &prompt, const GenerationOptions &options);
     void generate_stream(const std::string &prompt,
                          const GenerationOptions &options,

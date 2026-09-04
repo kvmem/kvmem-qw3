@@ -538,6 +538,9 @@ struct PreparedVisionRequest {
     bool active() const { return !encoded.grids.empty(); }
 };
 
+using VisionEncoder = std::function<
+    VisionEncoding(const std::vector<VisionImage> &)>;
+
 bool parse_data_image_url(const std::string &url,
                           detail::CpuVisionImage &image,
                           std::string &error) {
@@ -587,7 +590,7 @@ bool openai_image_block(const json &block,
 }
 
 bool prepare_vision_messages(json &messages,
-                             detail::CpuVisionFrontend *frontend,
+                             const VisionEncoder &encoder,
                              PreparedVisionRequest &prepared,
                              std::string &error) {
     std::vector<detail::CpuVisionImage> images;
@@ -606,12 +609,12 @@ bool prepare_vision_messages(json &messages,
         }
     }
     if (images.empty()) return true;
-    if (!frontend) {
-        error = "image input requires --vision-cpu-model DIR";
+    if (!encoder) {
+        error = "image input requires --vision-model DIR";
         return false;
     }
     try {
-        prepared.encoded = frontend->encode(images);
+        prepared.encoded = encoder(images);
     } catch (const std::exception &e) {
         error = e.what();
         return false;
@@ -735,22 +738,36 @@ bool finalize_vision_tokens(
             GenerationOptions::InputEmbeddingOverride override;
             override.token_id = virtual_id;
             override.source_token_id = static_cast<uint32_t>(image_pad);
-            const size_t offset = embedding_row * prepared.encoded.embedding_dim;
-            override.embedding.assign(
-                prepared.encoded.embeddings.begin() +
-                    static_cast<std::ptrdiff_t>(offset),
-                prepared.encoded.embeddings.begin() +
-                    static_cast<std::ptrdiff_t>(offset +
-                                                prepared.encoded.embedding_dim));
+            if (prepared.encoded.storage) {
+                override.storage = prepared.encoded.storage;
+                override.embedding_row = static_cast<uint32_t>(embedding_row);
+            } else {
+                const size_t offset =
+                    embedding_row * prepared.encoded.embedding_dim;
+                override.embedding.assign(
+                    prepared.encoded.embeddings.begin() +
+                        static_cast<std::ptrdiff_t>(offset),
+                    prepared.encoded.embeddings.begin() +
+                        static_cast<std::ptrdiff_t>(offset +
+                                                    prepared.encoded.embedding_dim));
+            }
             generation.input_embedding_overrides.push_back(std::move(override));
             tokens[pos] = static_cast<int32_t>(virtual_id);
             ++embedding_row;
         }
     }
-    if (embedding_row * prepared.encoded.embedding_dim !=
-        prepared.encoded.embeddings.size()) {
-        error = "unused visual embeddings remain after prompt mapping";
-        return false;
+    if (prepared.encoded.storage) {
+        if (prepared.encoded.storage->rows() != embedding_row ||
+            prepared.encoded.storage->dim() != prepared.encoded.embedding_dim) {
+            error = "device visual embeddings do not match prompt mapping";
+            return false;
+        }
+    } else {
+        if (embedding_row * prepared.encoded.embedding_dim !=
+            prepared.encoded.embeddings.size()) {
+            error = "unused visual embeddings remain after prompt mapping";
+            return false;
+        }
     }
 
     uint32_t current = 0;
@@ -2366,7 +2383,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     std::cerr << "[qw3-serve] model loaded; id=" << model_id << "\n";
 
     std::unique_ptr<detail::CpuVisionFrontend> vision_frontend;
-    if (!engine.vision_cpu_model_path.empty()) {
+    VisionEncoder vision_encoder;
+    const std::string vision_model = !engine.vision_model_path.empty()
+        ? engine.vision_model_path : engine.vision_cpu_model_path;
+    if (!vision_model.empty() && engine.vision_device == "cpu") {
         std::string python = engine.vision_cpu_python;
         if (python.empty()) {
             if (const char *env = std::getenv("QW3_VISION_CPU_PYTHON")) {
@@ -2407,11 +2427,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
         }
         std::cerr << "[qw3-serve] loading CPU vision frontend model="
-                  << engine.vision_cpu_model_path << " threads=" << threads
+                  << vision_model << " threads=" << threads
                   << "\n";
         vision_frontend = std::make_unique<detail::CpuVisionFrontend>(
-            engine.vision_cpu_model_path, python, worker, threads);
+            vision_model, python, worker, threads);
+        vision_encoder = [&](const std::vector<VisionImage> &images) {
+            return vision_frontend->encode(images);
+        };
         std::cerr << "[qw3-serve] CPU vision frontend ready\n";
+    } else if (!vision_model.empty() && engine.vision_device == "cuda") {
+        vision_encoder = [&](const std::vector<VisionImage> &images) {
+            return eng.encode_vision(images);
+        };
+        std::cerr << "[qw3-serve] native CUDA vision frontend ready\n";
     }
 
     // Single shared KV cache + scratch in the executor => serialize generation.
@@ -2827,7 +2855,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         PreparedVisionRequest prepared_vision;
         std::string vision_error;
-        if (!prepare_vision_messages(req["messages"], vision_frontend.get(),
+        if (!prepare_vision_messages(req["messages"], vision_encoder,
                                      prepared_vision, vision_error)) {
             set_error_response(res, 400, vision_error);
             return;
@@ -5979,7 +6007,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         }
         json messages = openai_req["messages"];
         PreparedVisionRequest prepared;
-        if (!prepare_vision_messages(messages, vision_frontend.get(),
+        if (!prepare_vision_messages(messages, vision_encoder,
                                      prepared, error)) {
             return false;
         }

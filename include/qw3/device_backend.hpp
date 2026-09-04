@@ -2629,6 +2629,113 @@ public:
         return copy_bytes_from_host(x, byte_offset, host, byte_count);
     }
 
+    // Copy arbitrary BF16 rows from one device tensor into arbitrary rows of
+    // an FP32/BF16 destination.  The index arrays are host-resident and contain
+    // `row_count` entries.  Native vision uses this to inject all projected
+    // image embeddings with one asynchronous launch instead of one blocking
+    // H2D copy per visual token.
+    virtual DeviceStatus scatter_bf16_rows(
+            DeviceTensor &dst,
+            const DeviceTensor &src,
+            const uint32_t *dst_rows,
+            const uint32_t *src_rows,
+            uint32_t row_count,
+            uint32_t width,
+            uint32_t dst_stride,
+            uint32_t src_stride) {
+        (void)dst; (void)src; (void)dst_rows; (void)src_rows;
+        (void)row_count; (void)width; (void)dst_stride; (void)src_stride;
+        return {false, "device BF16 row scatter is not supported"};
+    }
+
+    // Bilinearly gather four rows from a learned BF16 position table. Corner
+    // indices and weights are inexpensive CPU preprocessing metadata; the
+    // learned parameter and interpolation arithmetic remain on the GPU.
+    virtual DeviceStatus vision_bf16_position_interpolate(
+            DeviceTensor &out,
+            const DeviceWeight &table,
+            const uint32_t *indices4,
+            const float *weights4,
+            uint32_t rows,
+            uint32_t width) {
+        (void)out; (void)table; (void)indices4; (void)weights4;
+        (void)rows; (void)width;
+        return {false, "native CUDA vision position interpolation is not supported"};
+    }
+
+    // Native Qwen3.5 visual tower primitives.  They deliberately operate on
+    // BF16 activations/weights and keep all intermediates on the same backend
+    // as the language model.  Defaults make the optional CUDA frontend fail
+    // explicitly without changing non-CUDA builds.
+    virtual DeviceStatus vision_bf16_linear(
+            DeviceTensor &out,
+            const DeviceWeight &weight,
+            const DeviceTensor &x,
+            const DeviceWeight *bias,
+            const DeviceTensor *residual,
+            uint32_t batch,
+            uint32_t in_stride,
+            uint32_t out_stride,
+            bool gelu_tanh,
+            bool gelu_erf = false) {
+        (void)out; (void)weight; (void)x; (void)bias; (void)residual;
+        (void)batch; (void)in_stride; (void)out_stride; (void)gelu_tanh;
+        (void)gelu_erf;
+        return {false, "native CUDA vision linear is not supported"};
+    }
+    virtual DeviceStatus vision_bf16_layer_norm(
+            DeviceTensor &out,
+            const DeviceTensor &x,
+            const DeviceWeight &weight,
+            const DeviceWeight &bias,
+            uint32_t rows,
+            uint32_t width,
+            float eps) {
+        (void)out; (void)x; (void)weight; (void)bias;
+        (void)rows; (void)width; (void)eps;
+        return {false, "native CUDA vision layer norm is not supported"};
+    }
+    virtual DeviceStatus vision_bf16_qkv_rope_pad(
+            DeviceTensor &q,
+            DeviceTensor &k,
+            DeviceTensor &v,
+            const DeviceTensor &qkv,
+            const DeviceTensor &cos,
+            const DeviceTensor &sin,
+            uint32_t tokens,
+            uint32_t heads,
+            uint32_t head_dim,
+            uint32_t padded_head_dim) {
+        (void)q; (void)k; (void)v; (void)qkv; (void)cos; (void)sin;
+        (void)tokens; (void)heads; (void)head_dim; (void)padded_head_dim;
+        return {false, "native CUDA vision QKV/RoPE is not supported"};
+    }
+    virtual DeviceStatus vision_bf16_attention(
+            DeviceTensor &out,
+            const DeviceTensor &q,
+            const DeviceTensor &k,
+            const DeviceTensor &v,
+            const uint32_t *cu_seqlens,
+            uint32_t segments,
+            uint32_t heads,
+            uint32_t head_dim,
+            float scale) {
+        (void)out; (void)q; (void)k; (void)v; (void)cu_seqlens;
+        (void)segments; (void)heads; (void)head_dim; (void)scale;
+        return {false, "native CUDA vision attention is not supported"};
+    }
+    virtual DeviceStatus vision_bf16_compact_heads(
+            DeviceTensor &out,
+            const DeviceTensor &padded,
+            uint32_t tokens,
+            uint32_t heads,
+            uint32_t head_dim,
+            uint32_t padded_head_dim) {
+        (void)out; (void)padded; (void)tokens; (void)heads;
+        (void)head_dim; (void)padded_head_dim;
+        return {false, "native CUDA vision head compaction is not supported"};
+    }
+
     // CPU-tier stage-in fast path. `host` contains a packed slab of KV pages.
     // One H2D moves the slab into a reusable backend staging allocation, then
     // one scatter kernel per target tensor writes its pages to arbitrary

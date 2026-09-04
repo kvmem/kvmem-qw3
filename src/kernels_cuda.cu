@@ -19,6 +19,9 @@
 #include <vector>
 
 #include "cuda_helpers.cuh"
+#ifdef QW3_ENABLE_FLASHINFER
+#include "flashinfer_vision_adapter.hpp"
+#endif
 #ifdef QW3_ENABLE_NVFP4
 #include "fp8_scaled_mm_adapter.hpp"
 #include "nvfp4_linear_adapter.hpp"
@@ -9713,6 +9716,202 @@ struct Fp8LtPlan {
     }
 };
 
+__global__ void scatter_bf16_rows_kernel(
+        void *dst_raw,
+        bool dst_bf16,
+        const __nv_bfloat16 *src,
+        const uint32_t *dst_rows,
+        const uint32_t *src_rows,
+        uint32_t row_count,
+        uint32_t width,
+        uint32_t dst_stride,
+        uint32_t src_stride) {
+    const uint64_t linear = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
+                            threadIdx.x;
+    const uint64_t total = static_cast<uint64_t>(row_count) * width;
+    if (linear >= total) return;
+    const uint32_t row = static_cast<uint32_t>(linear / width);
+    const uint32_t col = static_cast<uint32_t>(linear -
+                                               static_cast<uint64_t>(row) * width);
+    const __nv_bfloat16 value =
+        src[static_cast<uint64_t>(src_rows[row]) * src_stride + col];
+    const uint64_t dst_index =
+        static_cast<uint64_t>(dst_rows[row]) * dst_stride + col;
+    if (dst_bf16) {
+        static_cast<__nv_bfloat16 *>(dst_raw)[dst_index] = value;
+    } else {
+        static_cast<float *>(dst_raw)[dst_index] = __bfloat162float(value);
+    }
+}
+
+__device__ __forceinline__ float vision_gelu_tanh(float x) {
+    constexpr float kAlpha = 0.7978845608028654f;
+    constexpr float kBeta = 0.044715f;
+    return 0.5f * x * (1.0f + tanhf(kAlpha * (x + kBeta * x * x * x)));
+}
+
+__global__ void vision_bf16_epilogue_kernel(
+        __nv_bfloat16 *out,
+        const __nv_bfloat16 *bias,
+        const __nv_bfloat16 *residual,
+        uint64_t count,
+        uint32_t width,
+        bool gelu_tanh,
+        bool gelu_erf) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (i >= count) return;
+    float value = __bfloat162float(out[i]);
+    if (bias) value += __bfloat162float(bias[i % width]);
+    if (gelu_tanh) value = vision_gelu_tanh(value);
+    if (gelu_erf) {
+        value = 0.5f * value *
+                (1.0f + erff(value * 0.7071067811865475f));
+    }
+    if (residual) value += __bfloat162float(residual[i]);
+    out[i] = __float2bfloat16_rn(value);
+}
+
+__global__ void vision_bf16_position_interpolate_kernel(
+        __nv_bfloat16 *out,
+        const __nv_bfloat16 *table,
+        const uint32_t *indices4,
+        const float *weights4,
+        uint64_t count,
+        uint32_t width) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (i >= count) return;
+    const uint32_t row = static_cast<uint32_t>(i / width);
+    const uint32_t col = static_cast<uint32_t>(i % width);
+    float value = 0.0f;
+#pragma unroll
+    for (uint32_t corner = 0; corner < 4; ++corner) {
+        const uint64_t meta = static_cast<uint64_t>(row) * 4 + corner;
+        value += weights4[meta] * __bfloat162float(
+            table[static_cast<uint64_t>(indices4[meta]) * width + col]);
+    }
+    out[i] = __float2bfloat16_rn(value);
+}
+
+__global__ void vision_bf16_layer_norm_kernel(
+        __nv_bfloat16 *out,
+        const __nv_bfloat16 *x,
+        const __nv_bfloat16 *weight,
+        const __nv_bfloat16 *bias,
+        uint32_t width,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    const uint64_t base = static_cast<uint64_t>(row) * width;
+    float sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < width; col += blockDim.x) {
+        const float value = __bfloat162float(x[base + col]);
+        sum += value;
+    }
+    __shared__ float shared_sum[256];
+    shared_sum[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float mean = shared_sum[0] / static_cast<float>(width);
+    // Deliberately make variance a second pass. E[x^2]-E[x]^2 loses
+    // significant low bits for vision activations and the resulting error is
+    // amplified by 27 residual blocks.
+    float variance_sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < width; col += blockDim.x) {
+        const float delta = __bfloat162float(x[base + col]) - mean;
+        variance_sum += delta * delta;
+    }
+    shared_sum[threadIdx.x] = variance_sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float variance = shared_sum[0] / static_cast<float>(width);
+    const float inv_std = rsqrtf(variance + eps);
+    for (uint32_t col = threadIdx.x; col < width; col += blockDim.x) {
+        const float value = (__bfloat162float(x[base + col]) - mean) * inv_std;
+        out[base + col] = __float2bfloat16_rn(
+            value * __bfloat162float(weight[col]) +
+            __bfloat162float(bias[col]));
+    }
+}
+
+__global__ void vision_bf16_qkv_rope_pad_kernel(
+        __nv_bfloat16 *q,
+        __nv_bfloat16 *k,
+        __nv_bfloat16 *v,
+        const __nv_bfloat16 *qkv,
+        const __nv_bfloat16 *cos,
+        const __nv_bfloat16 *sin,
+        uint32_t tokens,
+        uint32_t heads,
+        uint32_t head_dim,
+        uint32_t padded_head_dim) {
+    const uint64_t total =
+        static_cast<uint64_t>(tokens) * heads * padded_head_dim;
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (i >= total) return;
+    const uint32_t d = static_cast<uint32_t>(i % padded_head_dim);
+    const uint64_t th = i / padded_head_dim;
+    const uint32_t head = static_cast<uint32_t>(th % heads);
+    const uint32_t token = static_cast<uint32_t>(th / heads);
+    if (d >= head_dim) {
+        q[i] = __float2bfloat16_rn(0.0f);
+        k[i] = __float2bfloat16_rn(0.0f);
+        v[i] = __float2bfloat16_rn(0.0f);
+        return;
+    }
+    const uint32_t hidden = heads * head_dim;
+    const uint64_t row = static_cast<uint64_t>(token) * 3 * hidden;
+    const uint64_t lane = static_cast<uint64_t>(head) * head_dim + d;
+    const uint32_t half = head_dim / 2;
+    const uint32_t peer_d = d < half ? d + half : d - half;
+    const uint64_t peer = static_cast<uint64_t>(head) * head_dim + peer_d;
+    const float c = __bfloat162float(cos[
+        static_cast<uint64_t>(token) * head_dim + d]);
+    const float s = __bfloat162float(sin[
+        static_cast<uint64_t>(token) * head_dim + d]);
+    const float q0 = __bfloat162float(qkv[row + lane]);
+    const float k0 = __bfloat162float(qkv[row + hidden + lane]);
+    float qr = __bfloat162float(qkv[row + peer]);
+    float kr = __bfloat162float(qkv[row + hidden + peer]);
+    if (d < half) {
+        qr = -qr;
+        kr = -kr;
+    }
+    q[i] = __float2bfloat16_rn(q0 * c + qr * s);
+    k[i] = __float2bfloat16_rn(k0 * c + kr * s);
+    v[i] = qkv[row + 2 * hidden + lane];
+}
+
+__global__ void vision_bf16_compact_heads_kernel(
+        __nv_bfloat16 *out,
+        const __nv_bfloat16 *padded,
+        uint64_t count,
+        uint32_t heads,
+        uint32_t head_dim,
+        uint32_t padded_head_dim) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
+                       threadIdx.x;
+    if (i >= count) return;
+    const uint32_t width = heads * head_dim;
+    const uint32_t d = static_cast<uint32_t>(i % width);
+    const uint64_t token = i / width;
+    const uint32_t head = d / head_dim;
+    const uint32_t lane = d - head * head_dim;
+    out[i] = padded[token * heads * padded_head_dim +
+                    head * padded_head_dim + lane];
+}
+
 class CudaDeviceBackend final : public DeviceBackend {
     static constexpr uint32_t kFlashInferBatchPrefillHostSlots = 8;
     static constexpr uint32_t kHostEmbeddingSlots = 2;
@@ -9762,6 +9961,10 @@ public:
         if (cublaslt_handle_) cublasLtDestroy(cublaslt_handle_);
         if (cublaslt_workspace_) cudaFree(cublaslt_workspace_);
         if (rows_buf_) cudaFree(rows_buf_);
+        if (embedding_scatter_dst_rows_) cudaFree(embedding_scatter_dst_rows_);
+        if (embedding_scatter_src_rows_) cudaFree(embedding_scatter_src_rows_);
+        if (vision_position_indices_) cudaFree(vision_position_indices_);
+        if (vision_position_weights_) cudaFree(vision_position_weights_);
         if (x_fp16_workspace_) cudaFree(x_fp16_workspace_);
         if (x_bf16_workspace_) cudaFree(x_bf16_workspace_);
         if (x_fp8_workspace_) cudaFree(x_fp8_workspace_);
@@ -21213,6 +21416,303 @@ public:
                            "copy_bytes_from_host async");
     }
 
+    DeviceStatus scatter_bf16_rows(
+            DeviceTensor &dst,
+            const DeviceTensor &src,
+            const uint32_t *dst_rows,
+            const uint32_t *src_rows,
+            uint32_t row_count,
+            uint32_t width,
+            uint32_t dst_stride,
+            uint32_t src_stride) override {
+        if (row_count == 0 || width == 0) return {};
+        if (!dst_rows || !src_rows) {
+            return {false, "BF16 row scatter received null indices"};
+        }
+        auto &d = as_tensor(dst);
+        const auto &s = as_tensor(src);
+        if (!s.is_bf16() || (!d.is_bf16() && d.dtype != DeviceTensorDType::F32)) {
+            return {false, "BF16 row scatter dtype mismatch"};
+        }
+        if (static_cast<uint64_t>(src_stride) * row_count >
+                std::numeric_limits<uint64_t>::max() ||
+            static_cast<uint64_t>(dst_stride) * row_count >
+                std::numeric_limits<uint64_t>::max()) {
+            return {false, "BF16 row scatter shape overflow"};
+        }
+        uint32_t max_src = 0, max_dst = 0;
+        for (uint32_t i = 0; i < row_count; ++i) {
+            max_src = std::max(max_src, src_rows[i]);
+            max_dst = std::max(max_dst, dst_rows[i]);
+        }
+        if (width > src_stride || width > dst_stride ||
+            static_cast<uint64_t>(max_src) * src_stride + width > s.count ||
+            static_cast<uint64_t>(max_dst) * dst_stride + width > d.count) {
+            return {false, "BF16 row scatter out of bounds"};
+        }
+        if (embedding_scatter_row_capacity_ < row_count) {
+            if (embedding_scatter_dst_rows_) cudaFree(embedding_scatter_dst_rows_);
+            if (embedding_scatter_src_rows_) cudaFree(embedding_scatter_src_rows_);
+            embedding_scatter_dst_rows_ = nullptr;
+            embedding_scatter_src_rows_ = nullptr;
+            embedding_scatter_row_capacity_ = 0;
+            if (auto st = cuda_status(cudaMalloc(
+                    &embedding_scatter_dst_rows_,
+                    static_cast<size_t>(row_count) * sizeof(uint32_t)),
+                    "embedding scatter dst rows alloc"); !st.ok) return st;
+            if (auto st = cuda_status(cudaMalloc(
+                    &embedding_scatter_src_rows_,
+                    static_cast<size_t>(row_count) * sizeof(uint32_t)),
+                    "embedding scatter src rows alloc"); !st.ok) return st;
+            embedding_scatter_row_capacity_ = row_count;
+        }
+        if (auto st = cuda_status(cudaMemcpyAsync(
+                embedding_scatter_dst_rows_, dst_rows,
+                static_cast<size_t>(row_count) * sizeof(uint32_t),
+                cudaMemcpyHostToDevice, exec_stream_),
+                "embedding scatter dst rows upload"); !st.ok) return st;
+        if (auto st = cuda_status(cudaMemcpyAsync(
+                embedding_scatter_src_rows_, src_rows,
+                static_cast<size_t>(row_count) * sizeof(uint32_t),
+                cudaMemcpyHostToDevice, exec_stream_),
+                "embedding scatter src rows upload"); !st.ok) return st;
+        const uint64_t total = static_cast<uint64_t>(row_count) * width;
+        scatter_bf16_rows_kernel<<<
+            static_cast<unsigned>((total + 255) / 256), 256, 0, exec_stream_>>>(
+                d.ptr, d.is_bf16(), s.ptr_bf16(),
+                embedding_scatter_dst_rows_, embedding_scatter_src_rows_,
+                row_count, width, dst_stride, src_stride);
+        return launch_status("cuda BF16 embedding row scatter");
+    }
+
+    DeviceStatus vision_bf16_linear(
+            DeviceTensor &out,
+            const DeviceWeight &weight,
+            const DeviceTensor &x,
+            const DeviceWeight *bias,
+            const DeviceTensor *residual,
+            uint32_t batch,
+            uint32_t in_stride,
+            uint32_t out_stride,
+            bool gelu_tanh,
+            bool gelu_erf) override {
+        auto &o = as_tensor(out);
+        const auto &input = as_tensor(x);
+        const auto &w = as_weight(weight);
+        if (!o.is_bf16() || !input.is_bf16() ||
+            w.type != WeightType::BF16 ||
+            in_stride < w.cols || out_stride < w.rows ||
+            static_cast<uint64_t>(batch) * out_stride > o.count ||
+            static_cast<uint64_t>(batch) * in_stride > input.count) {
+            return {false, "native vision BF16 linear shape/dtype mismatch"};
+        }
+        const CudaWeight *b = nullptr;
+        if (bias) {
+            b = &as_weight(*bias);
+            if (b->type != WeightType::BF16 || b->rows * b->cols < w.rows) {
+                return {false, "native vision BF16 bias mismatch"};
+            }
+        }
+        const CudaTensor *r = nullptr;
+        if (residual) {
+            r = &as_tensor(*residual);
+            if (!r->is_bf16() || r->count <
+                    static_cast<uint64_t>(batch) * out_stride) {
+                return {false, "native vision BF16 residual mismatch"};
+            }
+        }
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        if (auto st = cublas_status(cublasGemmEx(
+                cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
+                static_cast<int>(w.rows), static_cast<int>(batch),
+                static_cast<int>(w.cols), &alpha,
+                w.ptr, CUDA_R_16BF, static_cast<int>(w.cols),
+                input.ptr_bf16(), CUDA_R_16BF, static_cast<int>(in_stride),
+                &beta, o.ptr_bf16(), CUDA_R_16BF,
+                static_cast<int>(out_stride),
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "cublasGemmEx native vision BF16 linear"); !st.ok) {
+            return st;
+        }
+        const uint64_t count = static_cast<uint64_t>(batch) * out_stride;
+        if (b || r || gelu_tanh || gelu_erf) {
+            vision_bf16_epilogue_kernel<<<
+                static_cast<unsigned>((count + 255) / 256), 256, 0,
+                exec_stream_>>>(
+                    o.ptr_bf16(),
+                    b ? static_cast<const __nv_bfloat16 *>(b->ptr) : nullptr,
+                    r ? r->ptr_bf16() : nullptr,
+                    count, out_stride, gelu_tanh, gelu_erf);
+        }
+        return launch_status("cuda native vision BF16 linear");
+    }
+
+    DeviceStatus vision_bf16_position_interpolate(
+            DeviceTensor &out,
+            const DeviceWeight &table,
+            const uint32_t *indices4,
+            const float *weights4,
+            uint32_t rows,
+            uint32_t width) override {
+        auto &o = as_tensor(out);
+        const auto &w = as_weight(table);
+        const uint64_t count = static_cast<uint64_t>(rows) * width;
+        const uint64_t meta_count = static_cast<uint64_t>(rows) * 4;
+        if (!o.is_bf16() || w.type != WeightType::BF16 ||
+            o.count < count || w.cols != width || !indices4 || !weights4) {
+            return {false, "native vision position interpolation mismatch"};
+        }
+        if (vision_position_capacity_ < meta_count) {
+            if (vision_position_indices_) cudaFree(vision_position_indices_);
+            if (vision_position_weights_) cudaFree(vision_position_weights_);
+            vision_position_indices_ = nullptr;
+            vision_position_weights_ = nullptr;
+            vision_position_capacity_ = 0;
+            if (auto st = cuda_status(cudaMalloc(
+                    &vision_position_indices_, meta_count * sizeof(uint32_t)),
+                    "vision position index alloc"); !st.ok) return st;
+            if (auto st = cuda_status(cudaMalloc(
+                    &vision_position_weights_, meta_count * sizeof(float)),
+                    "vision position weight alloc"); !st.ok) return st;
+            vision_position_capacity_ = meta_count;
+        }
+        if (auto st = cuda_status(cudaMemcpyAsync(
+                vision_position_indices_, indices4,
+                meta_count * sizeof(uint32_t), cudaMemcpyHostToDevice,
+                exec_stream_), "vision position index upload"); !st.ok) return st;
+        if (auto st = cuda_status(cudaMemcpyAsync(
+                vision_position_weights_, weights4,
+                meta_count * sizeof(float), cudaMemcpyHostToDevice,
+                exec_stream_), "vision position weight upload"); !st.ok) return st;
+        vision_bf16_position_interpolate_kernel<<<
+            static_cast<unsigned>((count + 255) / 256), 256, 0,
+            exec_stream_>>>(
+                o.ptr_bf16(), static_cast<const __nv_bfloat16 *>(w.ptr),
+                vision_position_indices_, vision_position_weights_, count,
+                width);
+        return launch_status("cuda native vision position interpolation");
+    }
+
+    DeviceStatus vision_bf16_layer_norm(
+            DeviceTensor &out,
+            const DeviceTensor &x,
+            const DeviceWeight &weight,
+            const DeviceWeight &bias,
+            uint32_t rows,
+            uint32_t width,
+            float eps) override {
+        auto &o = as_tensor(out);
+        const auto &input = as_tensor(x);
+        const auto &w = as_weight(weight);
+        const auto &b = as_weight(bias);
+        const uint64_t count = static_cast<uint64_t>(rows) * width;
+        if (!o.is_bf16() || !input.is_bf16() ||
+            w.type != WeightType::BF16 || b.type != WeightType::BF16 ||
+            o.count < count || input.count < count ||
+            w.rows * w.cols < width || b.rows * b.cols < width) {
+            return {false, "native vision BF16 layer norm mismatch"};
+        }
+        vision_bf16_layer_norm_kernel<<<rows, 256, 0, exec_stream_>>>(
+            o.ptr_bf16(), input.ptr_bf16(),
+            static_cast<const __nv_bfloat16 *>(w.ptr),
+            static_cast<const __nv_bfloat16 *>(b.ptr), width, eps);
+        return launch_status("cuda native vision BF16 layer norm");
+    }
+
+    DeviceStatus vision_bf16_qkv_rope_pad(
+            DeviceTensor &q,
+            DeviceTensor &k,
+            DeviceTensor &v,
+            const DeviceTensor &qkv,
+            const DeviceTensor &cos,
+            const DeviceTensor &sin,
+            uint32_t tokens,
+            uint32_t heads,
+            uint32_t head_dim,
+            uint32_t padded_head_dim) override {
+        auto &qq = as_tensor(q);
+        auto &kk = as_tensor(k);
+        auto &vv = as_tensor(v);
+        const auto &packed = as_tensor(qkv);
+        const auto &cc = as_tensor(cos);
+        const auto &ss = as_tensor(sin);
+        const uint64_t padded_count =
+            static_cast<uint64_t>(tokens) * heads * padded_head_dim;
+        const uint64_t qkv_count =
+            static_cast<uint64_t>(tokens) * heads * head_dim * 3;
+        const uint64_t rope_count = static_cast<uint64_t>(tokens) * head_dim;
+        if (!qq.is_bf16() || !kk.is_bf16() || !vv.is_bf16() ||
+            !packed.is_bf16() || !cc.is_bf16() || !ss.is_bf16() ||
+            qq.count < padded_count || kk.count < padded_count ||
+            vv.count < padded_count || packed.count < qkv_count ||
+            cc.count < rope_count || ss.count < rope_count ||
+            head_dim == 0 || (head_dim & 1u) != 0 ||
+            padded_head_dim < head_dim) {
+            return {false, "native vision QKV/RoPE shape mismatch"};
+        }
+        vision_bf16_qkv_rope_pad_kernel<<<
+            static_cast<unsigned>((padded_count + 255) / 256), 256, 0,
+            exec_stream_>>>(
+                qq.ptr_bf16(), kk.ptr_bf16(), vv.ptr_bf16(),
+                packed.ptr_bf16(), cc.ptr_bf16(), ss.ptr_bf16(),
+                tokens, heads, head_dim, padded_head_dim);
+        return launch_status("cuda native vision QKV/RoPE pad");
+    }
+
+    DeviceStatus vision_bf16_attention(
+            DeviceTensor &out,
+            const DeviceTensor &q,
+            const DeviceTensor &k,
+            const DeviceTensor &v,
+            const uint32_t *cu_seqlens,
+            uint32_t segments,
+            uint32_t heads,
+            uint32_t head_dim,
+            float scale) override {
+#ifdef QW3_ENABLE_FLASHINFER
+        auto &o = as_tensor(out);
+        const auto &qq = as_tensor(q);
+        const auto &kk = as_tensor(k);
+        const auto &vv = as_tensor(v);
+        if (!o.is_bf16() || !qq.is_bf16() || !kk.is_bf16() ||
+            !vv.is_bf16()) {
+            return {false, "native vision attention requires BF16 tensors"};
+        }
+        if (!flashinfer_vision_adapter::launch_bf16(
+                o.ptr_bf16(), qq.ptr_bf16(), kk.ptr_bf16(), vv.ptr_bf16(),
+                cu_seqlens, segments, heads, head_dim, scale, exec_stream_)) {
+            return {false, "FlashInfer native vision attention launch failed"};
+        }
+        return launch_status("cuda FlashInfer native vision attention");
+#else
+        (void)out; (void)q; (void)k; (void)v; (void)cu_seqlens;
+        (void)segments; (void)heads; (void)head_dim; (void)scale;
+        return {false, "native CUDA vision requires FlashInfer"};
+#endif
+    }
+
+    DeviceStatus vision_bf16_compact_heads(
+            DeviceTensor &out,
+            const DeviceTensor &padded,
+            uint32_t tokens,
+            uint32_t heads,
+            uint32_t head_dim,
+            uint32_t padded_head_dim) override {
+        auto &o = as_tensor(out);
+        const auto &p = as_tensor(padded);
+        const uint64_t count = static_cast<uint64_t>(tokens) * heads * head_dim;
+        if (!o.is_bf16() || !p.is_bf16() || o.count < count ||
+            p.count < static_cast<uint64_t>(tokens) * heads * padded_head_dim) {
+            return {false, "native vision head compaction mismatch"};
+        }
+        vision_bf16_compact_heads_kernel<<<
+            static_cast<unsigned>((count + 255) / 256), 256, 0,
+            exec_stream_>>>(o.ptr_bf16(), p.ptr_bf16(), count, heads,
+                            head_dim, padded_head_dim);
+        return launch_status("cuda native vision head compaction");
+    }
+
     DeviceStatus copy_packed_pages_from_host_async(
             const void *host, uint64_t host_bytes,
             const std::vector<DeviceTensor *> &targets,
@@ -21648,6 +22148,12 @@ private:
     std::vector<std::unique_ptr<Fp8LtPlan>> fp8_lt_plans_;
     uint64_t *rows_buf_ = nullptr;
     uint32_t  rows_buf_capacity_ = 0;
+    uint32_t *embedding_scatter_dst_rows_ = nullptr;
+    uint32_t *embedding_scatter_src_rows_ = nullptr;
+    uint32_t embedding_scatter_row_capacity_ = 0;
+    uint32_t *vision_position_indices_ = nullptr;
+    float *vision_position_weights_ = nullptr;
+    uint64_t vision_position_capacity_ = 0;
     HostEmbeddingSlot host_embedding_slots_[kHostEmbeddingSlots];
     uint32_t host_embedding_next_slot_ = 0;
     ArgmaxPair *host_embedding_argmax_ = nullptr;

@@ -1,4 +1,5 @@
 #include "qwen_executor.hpp"
+#include "vision_embedding_storage.hpp"
 #include "kvmem_prefix_reuse_policy.hpp"
 #include "kvmem_refresh_policy.hpp"
 #include "env_flags.hpp"
@@ -1016,7 +1017,12 @@ void QwenExecutor::set_input_embedding_overrides(
     const uint32_t n_embd = model_.config().n_embd;
     for (size_t i = 0; i < input_embedding_overrides_.size(); ++i) {
         const auto &item = input_embedding_overrides_[i];
-        if (item.token_id < 0x80000000u || item.embedding.size() != n_embd ||
+        const bool host_embedding = item.embedding.size() == n_embd;
+        const bool device_embedding = item.storage &&
+            item.storage->dim() == n_embd &&
+            item.embedding_row < item.storage->rows();
+        if (item.token_id < 0x80000000u ||
+            host_embedding == device_embedding ||
             !input_embedding_override_index_.emplace(item.token_id, i).second) {
             throw std::runtime_error("invalid or duplicate multimodal embedding override");
         }
@@ -1054,7 +1060,23 @@ void QwenExecutor::overwrite_input_embedding(DeviceTensor &dst,
                                              uint64_t row_offset) {
     const auto it = input_embedding_override_index_.find(token_id);
     if (it == input_embedding_override_index_.end()) return;
-    const auto &embedding = input_embedding_overrides_[it->second].embedding;
+    const auto &item = input_embedding_overrides_[it->second];
+    if (item.storage) {
+        const auto *device = dynamic_cast<const detail::DeviceInputEmbeddingStorage *>(
+            item.storage.get());
+        if (!device) {
+            throw std::runtime_error("unsupported device embedding storage");
+        }
+        const uint32_t dst_row = static_cast<uint32_t>(
+            row_offset / model_.config().n_embd);
+        const uint32_t src_row = item.embedding_row;
+        require_status(backend_.scatter_bf16_rows(
+            dst, device->tensor(), &dst_row, &src_row, 1,
+            model_.config().n_embd, model_.config().n_embd,
+            device->dim()));
+        return;
+    }
+    const auto &embedding = item.embedding;
     const uint64_t byte_offset = row_offset * dst.elem_size;
     if (dst.dtype == DeviceTensorDType::F32) {
         require_status(backend_.copy_bytes_from_host(
@@ -1078,7 +1100,40 @@ void QwenExecutor::overwrite_input_embeddings_batch(DeviceTensor &dst,
                                                     const uint32_t *tokens,
                                                     uint32_t batch,
                                                     uint32_t row_stride) {
+    // Device-backed overrides from a vision request share one storage object.
+    // Group them into one scatter launch; host-backed CPU embeddings retain
+    // the established conversion/copy path below.
+    const detail::DeviceInputEmbeddingStorage *device = nullptr;
+    std::vector<uint32_t> dst_rows;
+    std::vector<uint32_t> src_rows;
     for (uint32_t i = 0; i < batch; ++i) {
+        const auto it = input_embedding_override_index_.find(tokens[i]);
+        if (it == input_embedding_override_index_.end()) continue;
+        const auto &item = input_embedding_overrides_[it->second];
+        if (!item.storage) continue;
+        const auto *candidate =
+            dynamic_cast<const detail::DeviceInputEmbeddingStorage *>(
+                item.storage.get());
+        if (!candidate || (device && candidate != device)) {
+            throw std::runtime_error(
+                "a multimodal batch must reference one device embedding table");
+        }
+        device = candidate;
+        dst_rows.push_back(i);
+        src_rows.push_back(item.embedding_row);
+    }
+    if (device && !dst_rows.empty()) {
+        require_status(backend_.scatter_bf16_rows(
+            dst, device->tensor(), dst_rows.data(), src_rows.data(),
+            static_cast<uint32_t>(dst_rows.size()), model_.config().n_embd,
+            row_stride, device->dim()));
+    }
+    for (uint32_t i = 0; i < batch; ++i) {
+        const auto it = input_embedding_override_index_.find(tokens[i]);
+        if (it != input_embedding_override_index_.end() &&
+            input_embedding_overrides_[it->second].storage) {
+            continue;
+        }
         overwrite_input_embedding(dst, tokens[i],
                                   static_cast<uint64_t>(i) * row_stride);
     }
@@ -18565,6 +18620,19 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     const uint32_t n_kv_heads = cfg.n_kv_heads;
     const uint32_t head_dim = cfg.head_dim;
     const uint32_t bt = std::max<uint32_t>(block_store_->config().block_tokens, 1u);
+    // The scorer index intentionally stops at kvmem_qc_prompt_tokens_ when a
+    // trailing query/replay suffix is excluded from the historical candidate
+    // set. forward_n_tokens() still visits that suffix, so ignore batches that
+    // start beyond the index boundary and trim a batch that straddles it.  The
+    // old code performed the contiguity assertion first: a second query-suffix
+    // batch then compared its full-prompt base against the frozen historical
+    // cursor and failed even though no rows from that batch belong in the
+    // index. This is especially easy to hit when multimodal query tokens make
+    // the suffix span more than one prefill micro-batch.
+    if (base_pos >= kvmem_qc_prompt_tokens_) return;
+    const uint32_t capture_batch = std::min<uint32_t>(
+        batch, kvmem_qc_prompt_tokens_ - base_pos);
+    if (capture_batch == 0) return;
     // Per-layer slice base uses the FIXED session stride (ctx_blocks) when set, so
     // preserved [0,D) slices stay put as the block count grows across resumed turns
     // (server-side session continuation). Falls back to the turn's block count when
@@ -18588,7 +18656,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     const uint32_t first_block = base_pos / bt;
     if (first_block >= kvmem_qc_total_blocks_) return;
     const uint32_t n_blocks_chunk = std::min(
-        (off + batch + bt - 1) / bt,
+        (off + capture_batch + bt - 1) / bt,
         kvmem_qc_total_blocks_ - first_block);
     if (n_blocks_chunk == 0) return;
     const uint64_t per_pos = static_cast<uint64_t>(n_kv_heads) * head_dim;
@@ -18634,7 +18702,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
         KvMemPrototypeMode::KeyDirectionAdaptive;
     if (key_direction_adaptive && off == 0) {
         kvmem_capture_adaptive_layer(
-            slot, first_block, n_blocks_chunk, batch,
+            slot, first_block, n_blocks_chunk, capture_batch,
             k_token_stride, rope_base_pos);
         st = {};
     } else if (key_direction_adaptive) {
@@ -18653,7 +18721,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     } else if (key_direction_fixed4 && off == 0) {
         st = backend_.block_kdirection_fixed4_batch_device(
             *k_src, *capture_index, kbar_block_base, n_blocks_chunk,
-            k_token_stride, batch, bt, n_kv_heads, head_dim, derope_dim,
+            k_token_stride, capture_batch, bt, n_kv_heads, head_dim, derope_dim,
             static_cast<int32_t>(rope_base_pos), cfg.rope_theta,
             /*src_row_off=*/0);
     } else if (key_direction_fixed4) {
@@ -18666,13 +18734,13 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
         // suffix needs after rollback.
         st = backend_.block_kmean_content_batch_device(
             *k_src, *capture_index, kbar_block_base, n_blocks_chunk,
-            k_token_stride, batch, bt, n_kv_heads, head_dim, derope_dim,
+            k_token_stride, capture_batch, bt, n_kv_heads, head_dim, derope_dim,
             static_cast<int32_t>(rope_base_pos), cfg.rope_theta,
             /*src_row_off=*/0, /*n_subblocks=*/kvmem_qc_n_subblocks_);
     } else {
         st = backend_.block_kmean_content_batch_merge_device(
             *k_src, *capture_index, kbar_block_base, n_blocks_chunk,
-            k_token_stride, batch, bt, off, n_kv_heads, head_dim,
+            k_token_stride, capture_batch, bt, off, n_kv_heads, head_dim,
             derope_dim, static_cast<int32_t>(rope_base_pos), cfg.rope_theta,
             /*n_subblocks=*/kvmem_qc_n_subblocks_);
     }
@@ -18684,7 +18752,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
     if (kvmem_qc_pertoken_ && g_kraw_multi_ &&
         kvmem_qc_total_tokens_ > 0 && base_pos < kvmem_qc_total_tokens_) {
         const uint32_t store_rows =
-            std::min(batch, kvmem_qc_total_tokens_ - base_pos);
+            std::min(capture_batch, kvmem_qc_total_tokens_ - base_pos);
         const uint64_t out_base_elem =
             (static_cast<uint64_t>(slot) * kvmem_qc_total_tokens_ + base_pos) *
             n_kv_heads * head_dim;
@@ -18704,7 +18772,7 @@ void QwenExecutor::kvmem_capture_kbar_multi(uint32_t slot, uint32_t batch,
         kvmem_finish_mean_index_capture(
             cpu_stage_slot, first_block, n_blocks_chunk);
     }
-    kvmem_qc_captured_tokens_ = base_pos + batch;
+    kvmem_qc_captured_tokens_ = base_pos + capture_batch;
     kvmem_qc_captured_blocks_ =
         (kvmem_qc_captured_tokens_ + bt - 1) / bt;
     if (kvmem_qc_captured_tokens_ < kvmem_qc_prompt_tokens_) return;

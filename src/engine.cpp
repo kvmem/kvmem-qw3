@@ -35,6 +35,10 @@ NativePlanInfo Engine::native_plan() const {
     return inspect_native_plan(impl_->options.model_path);
 }
 
+VisionEncoding Engine::encode_vision(const std::vector<VisionImage> &images) {
+    return impl_->backend->encode_vision(images);
+}
+
 std::string Engine::generate(const std::string &prompt, const GenerationOptions &options) {
     return impl_->backend->generate(prompt, options, nullptr);
 }

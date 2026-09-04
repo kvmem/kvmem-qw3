@@ -5,26 +5,19 @@
 #include <string>
 #include <vector>
 
+#include "qw3/qw3.hpp"
+
 namespace qw3::detail {
 
-struct CpuVisionImage {
-    std::string media_type;
-    std::string base64_data;
-};
+using CpuVisionImage = VisionImage;
+using CpuVisionEncoding = VisionEncoding;
 
-struct CpuVisionEncoding {
-    struct Grid {
-        uint32_t temporal = 0;
-        uint32_t height = 0;
-        uint32_t width = 0;
-        uint32_t rows = 0;
-    };
-
-    uint32_t embedding_dim = 0;
-    bool cache_hit = false;
+struct CpuVisionPatches {
+    using Grid = CpuVisionEncoding::Grid;
+    uint32_t patch_dim = 0;
     std::vector<Grid> grids;
-    // Image-major contiguous float32 rows, sum(grid.rows) * embedding_dim.
-    std::vector<float> embeddings;
+    // Image-major flattened patches in native BF16 bit representation.
+    std::vector<uint16_t> patches;
 };
 
 class CpuVisionFrontend {
@@ -32,13 +25,16 @@ public:
     CpuVisionFrontend(std::string model_directory,
                       std::string python_executable,
                       std::string worker_script,
-                      uint32_t threads);
+                      uint32_t threads,
+                      bool preprocess_only = false,
+                      std::string runtime_device = "cpu");
     ~CpuVisionFrontend();
 
     CpuVisionFrontend(const CpuVisionFrontend &) = delete;
     CpuVisionFrontend &operator=(const CpuVisionFrontend &) = delete;
 
     CpuVisionEncoding encode(const std::vector<CpuVisionImage> &images);
+    CpuVisionPatches preprocess(const std::vector<CpuVisionImage> &images);
 
 private:
     struct Impl;
