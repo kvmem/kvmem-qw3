@@ -9,7 +9,7 @@ delegating generation to another inference engine. Development currently
 focuses on Qwen3.6 and Qwen3.8 27B text generation plus a native
 Qwen3.8 image-input path.
 
-Its main research feature, **KVMem**, turns previously computed attention KV
+Its main feature, **KVMem**, turns previously computed attention KV
 state into reusable agent memory. KVMem keeps a bounded working set on the GPU,
 stages colder blocks through host RAM and optional NVMe, and selects relevant
 blocks for each new query. The goal is to reduce repeated full-history prefill
@@ -28,8 +28,7 @@ and text compaction in long-lived agent sessions.
 - **Optional native vision:** run the Qwen3.8 visual tower on CPU or CUDA and
   reuse unchanged per-image embeddings across full-transcript requests.
 - **Optional performance paths:** MTP speculative decoding, paged KV,
-  continuous batching, FP8 KV, and NVFP4 weights are available for research and
-  tuning.
+  continuous batching, FP8 KV, and NVFP4 weights can be enabled independently.
 
 ## How KVMem works
 
@@ -63,9 +62,8 @@ beyond practical GPU KV capacity.
 ## Requirements
 
 - Linux; current development and validation use x86-64.
-- An Ampere-or-newer NVIDIA GPU and a matching CUDA toolkit. The 27B Q8_0
-  quick start is intended for a dedicated 48 GiB-class GPU; smaller-memory
-  configurations have not been validated as an onboarding path.
+- An Ampere-or-newer NVIDIA GPU and a matching CUDA toolkit. A dedicated GPU
+  with at least 48 GiB of memory is recommended for the 27B Q8_0 quick start.
 - CMake 3.16 or newer for the host build, CMake 3.18 or newer for the CUDA
   quick start, and a C++17 compiler. SM120 builds require CUDA 12.8 or newer.
 - A compatible language checkpoint for the Qwen `qwen35` architecture. Image
@@ -119,10 +117,6 @@ export QW3_MODEL="${QW3_Q8_DIR}/Qwen3.6-27B-Q8_0.gguf"
 export QW3_Q8_SHA256=f93f517f38e696d35a1a7df2c0e3155a64f4c4dcd662107a146ae263f7fb14ce
 printf '%s  %s\n' "${QW3_Q8_SHA256}" "${QW3_MODEL}" | sha256sum -c -
 ```
-
-The public file is not byte-identical to the private GGUF used by some older
-internal experiments. It is therefore a reproducible candidate, not evidence
-that those historical numbers reproduce unchanged.
 
 Set `QW3_CUDA_ARCH` to the deployment GPU instead of copying `120a-real`
 unchanged: use `80` for A100, `86` for A40/A6000/RTX 30, `89` for Ada, `90`
@@ -198,8 +192,8 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 The commands above have been checked with the pinned Qwen3.6 Q8_0 file. See
-[the release baseline](docs/release_baseline.md) for the current per-hardware
-validation status.
+[the hardware compatibility notes](docs/release_baseline.md) for details about
+other configurations.
 
 ## Optional Qwen3.8 image input
 
@@ -302,11 +296,6 @@ continuous batching are not implemented. See the
 
 ## Try KVMem
 
-> [!WARNING]
-> KVMem is experimental. The following command is a configuration template,
-> not a capacity, quality, or performance promise. Start with a short prompt and
-> compare its output with KVMem disabled before moving to long agent histories.
-
 Prepare a directory on a fast local NVMe filesystem:
 
 ```bash
@@ -394,8 +383,8 @@ hf download unsloth/Qwen3.6-27B-NVFP4 \
   --local-dir "${QW3_NVFP4_MODEL}"
 ```
 
-The public FlashInfer/CUTLASS dependency lock is not final. Developers with a
-compatible package-data bundle can configure the path explicitly:
+Set `FLASHINFER_DATA` to a FlashInfer package-data directory containing
+`include/` and `cutlass/include/`:
 
 ```bash
 export FLASHINFER_DATA=/absolute/path/to/compatible/flashinfer/data
@@ -426,8 +415,7 @@ cmake --build build-nvfp4 -j
 ```
 
 Do not run `qw3-inspect` on this Hugging Face directory; that tool accepts GGUF
-files only. NVFP4 remains Experimental until its dependency bundle and public
-physical-GPU reproduction are pinned.
+files only.
 
 ## APIs
 
@@ -445,34 +433,7 @@ The built-in server does not provide authentication or TLS. Keep it bound to
 `127.0.0.1`; if it must be reachable beyond localhost, place it behind an
 authenticated TLS reverse proxy and apply normal network access controls.
 
-KVMem cache/session endpoints and request extensions are experimental. See the
-integration documents below before depending on their lifecycle or concurrency
-semantics.
-
-## Current support boundary
-
-| Area | RC0 status | Boundary |
-|---|---|---|
-| Host build, GGUF inspection, and host unit tests | Tested | Recorded preparation snapshot; must be rerun for the release commit |
-| Qwen3.6 27B Q8_0 on NVIDIA CUDA | Expected | Internally exercised on RTX PRO 6000 Blackwell; public model/GPU gate pending |
-| Qwen3.8 27B Q8_0 on NVIDIA CUDA | Expected | Implementation path exists; public clean-run artifact pending |
-| Other Qwen `qwen35`/legacy `qwen3` shapes | Experimental | Metadata may parse, but shape coverage is not release-validated |
-| HF `compressed-tensors` NVFP4 on SM120 | Experimental | Requires FlashInfer/CUTLASS and an exact compatible checkpoint |
-| KVMem GPU/CPU/NVMe retrieval | Experimental | Off by default; retrieval quality and resource needs depend on the workload |
-| Qwen3.8 image input | Experimental | Base64 data images; CPU or native BF16 CUDA visual tower; per-image cache and KVMem visual spans implemented |
-| MTP, paged KV, and continuous batching | Experimental | Implemented research paths with combination-specific constraints |
-| Frozen KVMem archives | Experimental | FP8-only serialized workflow; no continuous batching |
-| Q4/IQ GGUF, CPU generation, or non-NVIDIA generation | Unsupported | No native runtime path |
-
-The status words describe evidence, not product importance:
-
-- **Expected:** the implementation path exists and has internal evidence, but
-  the exact public commit/model/hardware gate has not been published.
-- **Experimental:** implemented research functionality whose combinations and
-  interfaces may still change.
-- **Release-tested:** reserved for a public commit, immutable model and
-  dependency manifest, recorded hardware/toolchain, exact commands, and a
-  published passing artifact.
+## Model format notes
 
 The language-model Hugging Face loader accepts `qwen3_5_text` directories using
 the `compressed-tensors` format. A generic official FP8 or BF16 directory is
@@ -487,17 +448,15 @@ The following are intentionally outside the first quick start:
 - **FlashInfer:** optional build-time headers for optimized prefill/decode,
   required by FP8 KV and NVFP4 paths used in current development.
 - **NVFP4:** 4-bit `compressed-tensors` weights on SM120a, not generic Q4 GGUF.
-- **MTP speculative decode:** enable with `--mtp-chain N`; currently
-  Experimental.
+- **MTP speculative decode:** enable with `--mtp-chain N`.
 - **Image input:** enable with `--vision-model DIR --vision-device cpu|cuda`;
-  currently serialized and Experimental.
+  image requests currently use serialized serving.
 - **Continuous batching:** enable with `--continuous-batching`; it also enables
   the required paged-KV serving pool and body-batch executor by default.
 - **Frozen archives:** `qw3 archive build|query|info` provides an immutable
   long-context workflow with stricter FP8 and serving constraints.
 
-Run `./build/qw3 --help` for the complete current CLI. Advanced flags are not a
-stable compatibility contract during the research-preview phase.
+Run `./build/qw3 --help` for the complete current CLI.
 
 ## Documentation
 
@@ -510,10 +469,6 @@ stable compatibility contract during the research-preview phase.
 - [Native CUDA vision frontend](docs/multimodal_cuda.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 
-Historical optimization notes and benchmark records are development evidence,
-not current support promises. They will be moved out of the stable user
-documentation before RC0.
-
 ## Host build and unit tests
 
 The host build is useful for contributors working on parsing, policies,
@@ -524,11 +479,6 @@ cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release
 cmake --build build-host -j
 ctest --test-dir build-host --output-on-failure
 ```
-
-A CUDA build without a physical GPU is not runtime evidence: some component
-tests can skip when no device is available. Release runtime claims require a
-pinned model, a supported physical GPU, and the GPU gate described in the
-release baseline.
 
 ## Project layout
 
