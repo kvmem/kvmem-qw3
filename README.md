@@ -55,18 +55,15 @@ Normal full-context inference keeps every attention KV entry in the active
 device context. KVMem separates accumulated memory from the working set used
 for the next answer:
 
-```text
-conversation history
-        │
-        ▼
-  prefill into KV blocks ───► GPU working set
-        │                         ▲
-        ├────────────────────► host RAM
-        │                         ▲
-        └────────────────────► local NVMe
-                                  │
-new query ──► block scorer ──► selected blocks ──► compact attention ──► answer
-```
+![Animated high-level KVMem overview: long history remains recoverable across
+memory tiers, a new question ranks an internal Mean-K block-summary index, a
+selected KV block replaces another block in a fixed-size GPU attention window,
+and QW3 generates with the refreshed context.](docs/assets/kvmem-flow.svg)
+
+This is a high-level retrieval overview, not an exact execution trace. For
+readability it omits mandatory kept regions, the short internal query-state
+rebuild, and position remapping. The model still generates locally in QW3;
+KVMem is not an external vector database or RAG service.
 
 The three important capacity controls are:
 
@@ -118,6 +115,29 @@ cd qw3
 export QW3_MODEL=/absolute/path/to/Qwen3.6-or-Qwen3.8-27B-Q8_0.gguf
 export QW3_CUDA_ARCH=120a-real
 ```
+
+For a reproducible public Qwen3.6 Q8 candidate, download the pinned revision
+and verify its checksum:
+
+```bash
+export QW3_MODEL_ROOT="${PWD}/../qw3-models"
+export QW3_Q8_REVISION=82d411acf4a06cfb8d9b073a5211bf410bfc29bf
+export QW3_Q8_DIR="${QW3_MODEL_ROOT}/qwen36-q8"
+mkdir -p "${QW3_Q8_DIR}"
+
+hf download unsloth/Qwen3.6-27B-GGUF \
+  Qwen3.6-27B-Q8_0.gguf \
+  --revision "${QW3_Q8_REVISION}" \
+  --local-dir "${QW3_Q8_DIR}"
+
+export QW3_MODEL="${QW3_Q8_DIR}/Qwen3.6-27B-Q8_0.gguf"
+export QW3_Q8_SHA256=f93f517f38e696d35a1a7df2c0e3155a64f4c4dcd662107a146ae263f7fb14ce
+printf '%s  %s\n' "${QW3_Q8_SHA256}" "${QW3_MODEL}" | sha256sum -c -
+```
+
+The public file is not byte-identical to the private GGUF used by some older
+internal experiments. It is therefore a reproducible candidate, not evidence
+that those historical numbers reproduce unchanged.
 
 `120a-real` is the current Blackwell development target. Select the architecture
 that matches the deployment GPU; intended Q8 build targets include `80`
@@ -297,6 +317,49 @@ template assumes a dedicated GPU. Lower it only if the resulting ceiling can
 still contain the resident model, scratch reserve, selected KV window, and
 generation reserve.
 
+Enable `QW3_KVMEM_TRACE=1` and `QW3_KVMEM_TIER_TRACE=1` when validating a new
+installation. An above-budget request should show query replay, a non-fallback
+retrieval scorer, and tier movement. A successful short chat request proves
+HTTP and generation health, but does not prove that sparse KVMem retrieval ran.
+
+## Optional NVFP4 profile
+
+NVFP4 is the memory-efficient weight path for NVIDIA SM120a. It loads a Hugging
+Face `compressed-tensors` directory and uses FlashInfer/CUTLASS-backed NVFP4
+kernels; it is not a generic Q4 GGUF path.
+
+```bash
+export QW3_NVFP4_REVISION=ccdaab7e68af2409599b8949a8f2685703c9bae5
+export QW3_NVFP4_MODEL="${QW3_MODEL_ROOT}/qwen36-nvfp4"
+
+hf download unsloth/Qwen3.6-27B-NVFP4 \
+  --revision "${QW3_NVFP4_REVISION}" \
+  --local-dir "${QW3_NVFP4_MODEL}"
+```
+
+The public FlashInfer/CUTLASS dependency lock is not final. Developers with a
+compatible package-data bundle can configure the path explicitly:
+
+```bash
+export FLASHINFER_DATA=/absolute/path/to/compatible/flashinfer/data
+
+cmake -S . -B build-nvfp4 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DQW3_BUILD_TESTS=OFF \
+  -DQW3_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=120a-real \
+  -DQW3_ENABLE_FLASHINFER=ON \
+  -DQW3_FLASHINFER_INCLUDE_DIR="${FLASHINFER_DATA}/include" \
+  -DQW3_FLASHINFER_CUTLASS_INCLUDE_DIR="${FLASHINFER_DATA}/cutlass/include"
+
+cmake --build build-nvfp4 -j
+./build-nvfp4/qw3 --model "${QW3_NVFP4_MODEL}" --native-plan
+```
+
+Do not run `qw3-inspect` on this Hugging Face directory; that tool accepts GGUF
+files only. NVFP4 remains Experimental until its dependency bundle and public
+physical-GPU reproduction are pinned.
+
 ## APIs
 
 The serialized server exposes:
@@ -331,6 +394,16 @@ semantics.
 | MTP, paged KV, and continuous batching | Experimental | Implemented research paths with combination-specific constraints |
 | Frozen KVMem archives | Experimental | FP8-only serialized workflow; no continuous batching |
 | Q4/IQ GGUF, CPU generation, or non-NVIDIA generation | Unsupported | No native runtime path |
+
+The status words describe evidence, not product importance:
+
+- **Expected:** the implementation path exists and has internal evidence, but
+  the exact public commit/model/hardware gate has not been published.
+- **Experimental:** implemented research functionality whose combinations and
+  interfaces may still change.
+- **Release-tested:** reserved for a public commit, immutable model and
+  dependency manifest, recorded hardware/toolchain, exact commands, and a
+  published passing artifact.
 
 The language-model Hugging Face loader accepts `qwen3_5_text` directories using
 the `compressed-tensors` format. A generic official FP8 or BF16 directory is
