@@ -317,6 +317,11 @@ struct EngineOptions {
     // default for compatibility; enable for contexts whose raw-K authority
     // exceeds the CPU tier budget.
     bool kvmem_raw_k_nvme = false;
+    // Opt-in CPU background retirement; logical live-block target. The first
+    // implementation keeps the existing --ctx admission/storage reservation.
+    uint32_t kvmem_gc_max_blocks = 0;
+    bool kvmem_gc_shadow = false;
+    int kvmem_gc_cpu = -1;
     // Durable context archive (docs/kvmem_context_archive_design.md). When
     // `kvmem_archive_dir` is set, the raw-K and V arenas live inside that
     // directory instead of an ephemeral NVMe cache. "build" writes a new

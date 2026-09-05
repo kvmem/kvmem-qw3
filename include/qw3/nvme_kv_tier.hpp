@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <memory>
 #include <limits>
+#include <list>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -81,6 +82,12 @@ struct NvmeSlotPlacement {
     int32_t evicted_block = -1;
 };
 
+struct NvmeAllocation {
+    uint32_t block_id = 0;
+    int32_t slot = -1;
+    uint64_t generation = 0;
+};
+
 struct NvmeIoSpan {
     int32_t slot = -1;
     uint64_t buffer_offset = 0;
@@ -106,6 +113,7 @@ public:
                 cfg_.total_bytes / cfg_.slot_bytes);
         }
         if (slot_count_ == 0 || cfg_.dir.empty()) return;
+        slot_generations_.resize(slot_count_, 0);
 
         ensure_dir(cfg_.dir);
         if (cfg_.file_name.empty() ||
@@ -296,6 +304,7 @@ public:
         block_to_slot_.erase(vit);
         erase_lru_locked(victim);
         block_to_slot_[block_id] = slot;
+        slot_generations_[slot] = ++allocation_sequence_;
         touch_locked(block_id);
         out.slot = slot;
         out.evicted_block = static_cast<int32_t>(victim);
@@ -311,6 +320,38 @@ public:
         erase_lru_locked(block_id);
     }
 
+    NvmeAllocation allocation(uint32_t block_id) const {
+        std::lock_guard<std::mutex> lock(meta_mu_);
+        auto it = block_to_slot_.find(block_id);
+        if (it == block_to_slot_.end()) return {block_id, -1, 0};
+        return {block_id, it->second, slot_generations_[it->second]};
+    }
+
+    bool try_allocation(uint32_t block_id, NvmeAllocation &out) const {
+        std::unique_lock<std::mutex> lock(meta_mu_, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        auto it = block_to_slot_.find(block_id);
+        out = it == block_to_slot_.end() ? NvmeAllocation{block_id, -1, 0}
+              : NvmeAllocation{block_id, it->second, slot_generations_[it->second]};
+        return true;
+    }
+
+    // CPU GC never waits for this allocator. Identity includes the allocation
+    // generation, so a delayed callback cannot free a reused slot/block ID.
+    // Caller must separately wait for directory readers and actual I/O leases.
+    bool try_release_allocation(const NvmeAllocation &a) {
+        std::unique_lock<std::mutex> lock(meta_mu_, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        if (cfg_.direct_mapped || a.slot < 0) return true;
+        auto it = block_to_slot_.find(a.block_id);
+        if (it == block_to_slot_.end() || it->second != a.slot ||
+            slot_generations_[a.slot] != a.generation) return true;
+        free_slots_.push_back(a.slot);
+        block_to_slot_.erase(it);
+        erase_lru_locked(a.block_id);
+        return true;
+    }
+
     void clear() {
         std::lock_guard<std::mutex> lock(meta_mu_);
         free_slots_.clear();
@@ -322,6 +363,7 @@ public:
         }
         block_to_slot_.clear();
         lru_.clear();
+        lru_positions_.clear();
     }
 
     void touch(uint32_t block_id) {
@@ -488,6 +530,7 @@ private:
         const int32_t slot = free_slots_.back();
         free_slots_.pop_back();
         block_to_slot_[block_id] = slot;
+        slot_generations_[slot] = ++allocation_sequence_;
         touch_locked(block_id);
         out.slot = slot;
         return out;
@@ -811,18 +854,21 @@ private:
         // A direct-mapped arena never evicts, so maintaining recency would only
         // pay the linear erase below once per access.
         if (cfg_.direct_mapped) return;
-        erase_lru_locked(block_id);
-        lru_.push_back(block_id);
+        auto it = lru_positions_.find(block_id);
+        if (it != lru_positions_.end()) {
+            lru_.splice(lru_.end(), lru_, it->second);
+        } else {
+            lru_.push_back(block_id);
+            lru_positions_[block_id] = std::prev(lru_.end());
+        }
     }
 
     void erase_lru_locked(uint32_t block_id) {
         if (cfg_.direct_mapped) return;
-        for (auto it = lru_.begin(); it != lru_.end(); ++it) {
-            if (*it == block_id) {
-                lru_.erase(it);
-                return;
-            }
-        }
+        auto it = lru_positions_.find(block_id);
+        if (it == lru_positions_.end()) return;
+        lru_.erase(it->second);
+        lru_positions_.erase(it);
     }
 
     NvmeKvTierConfig cfg_;
@@ -841,7 +887,10 @@ private:
     mutable std::atomic<bool> cache_drop_warned_{false};
     std::vector<int32_t> free_slots_;
     std::unordered_map<uint32_t, int32_t> block_to_slot_;
-    std::vector<uint32_t> lru_;
+    std::list<uint32_t> lru_;
+    std::unordered_map<uint32_t, std::list<uint32_t>::iterator> lru_positions_;
+    std::vector<uint64_t> slot_generations_;
+    uint64_t allocation_sequence_ = 0;
 };
 
 } // namespace qw3

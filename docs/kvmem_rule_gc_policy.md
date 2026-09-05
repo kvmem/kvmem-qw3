@@ -1,6 +1,6 @@
 # KVMem 规则回收策略 v1
 
-状态：设计，未实现。2026-09-05。按用户最新要求，第一版不训练判别模型，不要求换模型后重新采集训练集。采用硬保护、规则分级、组内热度排序和候选观察期。这里只定义选择策略；物理回收仍依赖[后台 GC 设计](/home/chaidi/qw3/docs/kvmem_background_gc_design.md)中的视图、lease、generation、空闲储备和 GPU index 一致性。
+状态：规则设计；保守运行时子集已实现，范围与实测见 [GC v1](kvmem_gc_v1.md)。2026-09-05。按用户最新要求，第一版不训练判别模型，不要求换模型后重新采集训练集。采用硬保护、规则分级、组内热度排序和候选观察期。这里只定义选择策略；物理回收仍依赖[后台 GC 设计](/home/chaidi/qw3/docs/kvmem_background_gc_design.md)中的视图、lease、generation、空闲储备和 GPU index 一致性。
 
 ## 输出含义与原则
 

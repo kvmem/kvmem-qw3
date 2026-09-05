@@ -2014,6 +2014,13 @@ public:
             throw std::invalid_argument("qwen-native backend requires --model");
         }
         options_ = options;
+        if ((options_.kvmem_gc_max_blocks || options_.kvmem_gc_shadow || options_.kvmem_gc_cpu >= 0) &&
+            (!options_.kvmem_enabled || !options_.kvmem_gc_max_blocks)) {
+            throw std::invalid_argument("KVMem GC options require --kvmem and --kvmem-gc-max-blocks");
+        }
+        if (options_.kvmem_gc_max_blocks && !options_.kvmem_archive_dir.empty()) {
+            throw std::invalid_argument("KVMem GC v1 supports online history, not context archives");
+        }
 
         const double t0 = wall_seconds();
         model_ = std::make_unique<QwenNativeModel>(open_model_source(options.model_path));
@@ -3694,6 +3701,13 @@ public:
     std::string generate(const std::string &prompt,
                          const GenerationOptions &options,
                          const CancellableTokenCallback &on_text) override {
+        if (options_.kvmem_gc_max_blocks &&
+            (options.continuous_batching || !options.kvmem_cache_save_id.empty() ||
+             !options.kvmem_cache_load_id.empty() ||
+             options.kvmem_inline_refresh != KvMemInlineRefreshMode::Off ||
+             !options.kvmem_oracle_token_spans.empty())) {
+            throw std::invalid_argument("KVMem GC v1 requires ordinary serialized requests with implicit prefix reuse");
+        }
         ScopedKvMemSemanticBudget budget_scope(
             executor_.get(), options.kvmem_semantic_budget);
         if (executor_ && executor_->kvmem_enabled() &&
@@ -8841,6 +8855,13 @@ private:
         bs_cfg.nvme_tier_bytes = options_.kvmem_nvme_bytes;
         bs_cfg.nvme_tier_dir = options_.kvmem_nvme_dir;
         bs_cfg.raw_k_nvme = options_.kvmem_raw_k_nvme;
+        bs_cfg.gc.max_live_blocks = options_.kvmem_gc_max_blocks;
+        bs_cfg.gc.shadow = options_.kvmem_gc_shadow;
+        bs_cfg.gc.trace = env_flag_enabled("QW3_KVMEM_GC_TRACE");
+        bs_cfg.gc.worker_cpu = options_.kvmem_gc_cpu;
+        if (bs_cfg.gc.max_live_blocks && !options_.kvmem_query_conditioned) {
+            throw std::runtime_error("KVMem GC requires --kvmem-query-conditioned");
+        }
         bs_cfg.immutable_source_k = options_.kvmem_immutable_source_k;
         bs_cfg.mtp_enabled =
             mtp_prefix_enabled(options_) || mtp_speculate_enabled(options_);
@@ -10169,13 +10190,25 @@ private:
         result.query_limited = qc_resume_guard;
         const auto checkpoint_reusable =
             [&](uint32_t position) {
-                return kvmem_prefix_checkpoint_reusable(
+                const bool reusable = kvmem_prefix_checkpoint_reusable(
                            position, static_cast<uint32_t>(prompt.size()),
                            query_boundary_ceiling) ||
                     kvmem_post_query_checkpoint_reusable(
                            position, static_cast<uint32_t>(prompt.size()),
                            common_prefix, options.kvmem_query_end,
                            qc_query_snapshot_ready);
+                if (!reusable) return false;
+                if (const auto *store = executor_->block_store(); store && store->gc()) {
+                    for (const auto &span : options.kvmem_pinned_token_spans) {
+                        const uint32_t id = store->gc_missing_required_prefix_block(span.begin, span.end, position);
+                        if (id != UINT32_MAX) {
+                            log("[kvmem-gc] action=checkpoint-miss reason=required-history-deleted block=" +
+                                std::to_string(id) + " checkpoint=" + std::to_string(position));
+                            return false; // try a shorter checkpoint before cold prefill
+                        }
+                    }
+                }
+                return true;
             };
         const auto checkpoint_crosses_query_boundary =
             [&](uint32_t position, bool resumable) {
@@ -10936,6 +10969,11 @@ private:
                                const GenerationOptions &request_options,
                                const CancellableTokenCallback &on_text,
                                DumpStream *dump) {
+        executor_->kvmem_gc_begin_step();
+        struct GcRequestScope {
+            QwenExecutor *executor;
+            ~GcRequestScope() { executor->kvmem_gc_end_step(); }
+        } gc_request_scope{executor_.get()};
         GenerationOptions options = request_options;
         if (options.kvmem_request_plan.enabled &&
             options.kvmem_request_plan.pressure_ingest) {

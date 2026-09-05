@@ -1,6 +1,6 @@
 # KVMem 后台回收设计分析
 
-状态：设计建议 v4，尚未实现。分析日期：2026-09-05。依据当前工作区代码（包含已有未提交修改）、对话《论文差异与定位》，以及进一步明确的两个目标：尽量删除未来复用概率最低的 blocks；管理全部在 CPU 上完成，避免增加 GPU 服务延迟。按用户最新要求，第一版改为无需训练的规则评分器；具体规则见[规则策略 v1](/home/chaidi/qw3/docs/kvmem_rule_gc_policy.md)。文件版本/读取范围与 Mean-K 联合信号仍依据现有 82 条完整实验轨迹；见[轨迹分析](/home/chaidi/qw3/docs/kvmem_file_history_gc_trace_analysis_20260905.md)。
+状态：完整设计建议 v4；已实现的保守运行时子集、与本方案的差异和验证见 [GC v1](kvmem_gc_v1.md)。本页尚未标为完成的内容不是当前代码能力。分析日期：2026-09-05。依据当前工作区代码（包含已有未提交修改）、对话《论文差异与定位》，以及进一步明确的两个目标：尽量删除未来复用概率最低的 blocks；管理全部在 CPU 上完成，避免增加 GPU 服务延迟。按用户最新要求，第一版改为无需训练的规则评分器；具体规则见[规则策略 v1](/home/chaidi/qw3/docs/kvmem_rule_gc_policy.md)。文件版本/读取范围与 Mean-K 联合信号仍依据现有 82 条完整实验轨迹；见[轨迹分析](/home/chaidi/qw3/docs/kvmem_file_history_gc_trace_analysis_20260905.md)。
 
 ## 结论
 

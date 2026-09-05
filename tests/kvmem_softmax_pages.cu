@@ -2606,7 +2606,75 @@ static void run_adaptive_benchmark() {
     CHECK(cudaFree(d_q));
 }
 
+// GC retains prototype layout but writes zero counts for holes. Exercise the
+// exact denominator used by the host-index one-pass scheduler, including an
+// entirely dead tile and a completely masked index. Dead logits are huge so a
+// post-softmax mask cannot accidentally pass this reference comparison.
+static void run_gc_hole_mask_test() {
+    constexpr uint32_t blocks = 8, dim = 32, tile = 2;
+    const std::vector<float> logits{0, 100, 1, 100, 100, 100, 2, 100};
+    std::vector<float> query(dim, 0), keys(blocks * dim, 0);
+    query[0] = 1;
+    for (uint32_t b = 0; b < blocks; ++b) keys[b * dim] = logits[b];
+    const int32_t offsets[blocks]{0,1,0,1,0,1,0,1};
+    float *q = nullptr, *k = nullptr, *x = nullptr, *score = nullptr;
+    float *bmax = nullptr, *bsum = nullptr, *gmax = nullptr, *gsum = nullptr;
+    int32_t *off = nullptr, *counts = nullptr;
+    CHECK(cudaMalloc(&q, dim * sizeof(float)));
+    CHECK(cudaMalloc(&k, blocks * dim * sizeof(float)));
+    CHECK(cudaMalloc(&x, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&score, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&bmax, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&bsum, blocks * sizeof(float)));
+    CHECK(cudaMalloc(&gmax, sizeof(float)));
+    CHECK(cudaMalloc(&gsum, sizeof(float)));
+    CHECK(cudaMalloc(&off, blocks * sizeof(int32_t)));
+    CHECK(cudaMalloc(&counts, blocks * sizeof(int32_t)));
+    CHECK(cudaMemcpy(q, query.data(), dim * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(k, keys.data(), keys.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(x, logits.data(), blocks * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(off, offsets, sizeof(offsets), cudaMemcpyHostToDevice));
+    for (bool all_dead : {false, true}) {
+        std::vector<int32_t> live{1,0,1,0,0,0,1,0};
+        if (all_dead) std::fill(live.begin(), live.end(), 0);
+        CHECK(cudaMemcpy(counts, live.data(), blocks * sizeof(int32_t), cudaMemcpyHostToDevice));
+        double denom = 0;
+        for (uint32_t b = 0; b < blocks; ++b) if (live[b]) denom += std::exp(double(logits[b]));
+        for (bool gemm : {false, true}) {
+            CHECK(cudaMemset(score, 0, blocks * sizeof(float)));
+            for (uint32_t first = 0; first < blocks; first += tile) {
+                const bool ok = gemm
+                    ? qw3::ported::launch_block_attn_stream_adaptive_gemm_reduce(
+                        bmax, bsum, x + first, off + first, counts + first,
+                        1, tile, tile, first, blocks, 1, 0, 1, 0, 0, 0)
+                    : qw3::ported::launch_block_attn_stream_adaptive_block_stats_typed(
+                        bmax, bsum, q, false, k + first * dim, qw3::ported::KbarDType::F32,
+                        off + first, counts + first, 0, 1, 1, 1, tile, tile, first, blocks, 1, 1, dim, 1.0f, 0);
+                if (!ok) { std::fprintf(stderr, "GC masked stats launch failed\n"); std::exit(1); }
+            }
+            if (!qw3::ported::launch_block_attn_stream_adaptive_finalize(
+                    score, bmax, bsum, gmax, gsum, 0, 1, 1, blocks, blocks, 0, 1, 0)) {
+                std::fprintf(stderr, "GC masked finalize failed\n"); std::exit(1);
+            }
+            std::vector<float> actual(blocks);
+            CHECK(cudaMemcpy(actual.data(), score, blocks * sizeof(float), cudaMemcpyDeviceToHost));
+            for (uint32_t b = 0; b < blocks; ++b) {
+                const double expected = live[b] ? std::exp(double(logits[b])) / denom : 0;
+                if (!std::isfinite(actual[b]) || std::abs(actual[b] - expected) > 1e-5) {
+                    std::fprintf(stderr, "GC masked softmax mismatch block=%u actual=%g expected=%g\n", b, actual[b], expected);
+                    std::exit(1);
+                }
+            }
+        }
+    }
+    CHECK(cudaFree(q)); CHECK(cudaFree(k)); CHECK(cudaFree(x)); CHECK(cudaFree(score));
+    CHECK(cudaFree(bmax)); CHECK(cudaFree(bsum)); CHECK(cudaFree(gmax)); CHECK(cudaFree(gsum));
+    CHECK(cudaFree(off)); CHECK(cudaFree(counts));
+    std::printf("[kvmem-gc-mask] PASS\n");
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--gc-mask-only") == 0) { run_gc_hole_mask_test(); return 0; }
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
         std::fprintf(stderr, "[kvmem-softmax-pages] no CUDA device; skipping\n");
@@ -2642,6 +2710,7 @@ int main(int argc, char **argv) {
     run_adaptive_scorer_test();
     run_adaptive_tiled_type_matrix_test();
     run_adaptive_gemm_parity_test();
+    run_gc_hole_mask_test();
     unsetenv("QW3_KVMEM_SOFTMAX_PAGES_FORCE_TILED");
     unsetenv("QW3_KVMEM_SOFTMAX_PAGES_SCALABLE");
     std::printf("[kvmem-softmax-pages] PASS\n");

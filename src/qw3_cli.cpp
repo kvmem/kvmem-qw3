@@ -206,6 +206,9 @@ void usage(std::ostream &os) {
         "  --kvmem-nvme-bytes N  NVMe tier budget in bytes (legacy alias).\n"
         "  --kvmem-raw-k-nvme    Reserve NVMe capacity for immutable raw-K and use\n"
         "                        CPU raw-K chunks as a bounded cache. Default: off.\n"
+        "  --kvmem-gc-max-blocks N  Enable CPU GC with a live-history block target.\n"
+        "  --kvmem-gc-shadow    Evaluate candidates without deleting payloads.\n"
+        "  --kvmem-gc-cpu N     Bind the low-priority GC worker to CPU N.\n"
         "  --no-kvmem-raw-k-nvme Keep the complete raw-K authority in CPU memory.\n"
         "  --kvmem-prefix-cache  Serve plain (non-CB) route only: keep the shared\n"
         "                        executor warm across requests and prefill only the\n"
@@ -781,6 +784,16 @@ int main(int argc, char **argv) {
                 engine.kvmem_nvme_bytes = parse_u64(need(arg), arg);
             } else if (arg == "--kvmem-raw-k-nvme") {
                 engine.kvmem_raw_k_nvme = true;
+            } else if (arg == "--kvmem-gc-max-blocks") {
+                const auto value = parse_u64(need(arg), arg);
+                if (value <= 0 || value > UINT32_MAX) throw std::runtime_error("--kvmem-gc-max-blocks must be in 1..UINT32_MAX");
+                engine.kvmem_gc_max_blocks = static_cast<uint32_t>(value);
+            } else if (arg == "--kvmem-gc-shadow") {
+                engine.kvmem_gc_shadow = true;
+            } else if (arg == "--kvmem-gc-cpu") {
+                const uint64_t cpu = parse_u64(need(arg), arg);
+                if (cpu > INT32_MAX) throw std::runtime_error("--kvmem-gc-cpu is out of range");
+                engine.kvmem_gc_cpu = static_cast<int>(cpu);
             } else if (arg == "--no-kvmem-raw-k-nvme") {
                 engine.kvmem_raw_k_nvme = false;
             } else if (arg == "-p" || arg == "--prompt") {

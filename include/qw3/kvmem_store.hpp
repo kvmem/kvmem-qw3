@@ -1,4 +1,5 @@
 #pragma once
+#include "qw3/kvmem_gc.hpp"
 
 // Block-sparse KV attention — block repository + working-set selection.
 //
@@ -106,6 +107,9 @@ struct KvMemDroppedBlock {
 
 // Result of diffing a new selection against the current working set.
 struct KvMemPlan {
+    // Keep the previous window alive until the ordinary transfer/assembly plan
+    // has finished. Checkpoints separately share the current window's lease.
+    std::shared_ptr<KvMemGc::Lease> gc_previous_window;
     // Blocks newly entering the logical working set. The executor may avoid a
     // physical transfer when their GPU pages are still resident.
     std::vector<uint32_t> stage_in;
@@ -229,6 +233,7 @@ enum class KvMemAdaptiveScoreMode : uint8_t {
 };
 
 struct KvMemStoreConfig {
+    KvMemGcConfig gc;
     uint32_t block_tokens = 128;     // --kvmem-block-tokens
     uint32_t select_budget = 131072; // --kvmem-budget (semantic window tokens)
     // Pressure-only prefill window. configure_kvmem normalizes zero to
@@ -332,6 +337,15 @@ public:
     const KvMemStoreConfig &config() const { return cfg_; }
     uint32_t block_count() const { return static_cast<uint32_t>(blocks_.size()); }
     const std::vector<KvMemBlock> &blocks() const { return blocks_; }
+    void attach_gc(std::shared_ptr<KvMemGc> gc) { gc_ = std::move(gc); if (gc_) gc_->set_recent_blocks(cfg_.recent_blocks); gc_view_ = gc_ ? gc_->read_view() : nullptr; }
+    const std::shared_ptr<KvMemGc> &gc() const { return gc_; }
+    const std::shared_ptr<const KvMemGc::View> &gc_view() const { return gc_view_; }
+    void gc_begin_step();
+    void gc_end_step() { if (gc_) gc_view_.reset(); }
+    bool is_live(uint32_t id) const { return id < block_count() && (!gc_ || (gc_view_ && gc_->is_live(id, gc_view_))); }
+    uint32_t gc_missing_required_prefix_block(uint32_t begin, uint32_t end, uint32_t prefix_end) const;
+    std::shared_ptr<KvMemGc::Lease> gc_checkpoint_lease();
+    void gc_restore_lease(std::shared_ptr<KvMemGc::Lease> lease) { gc_working_lease_ = std::move(lease); if (gc_) gc_->set_active(gc_working_lease_); }
 
     // Register newly-appended context tokens as blocks. Called as the context
     // grows. Partial trailing blocks are extended in place until full, then a
@@ -451,6 +465,11 @@ public:
     void clear_working_set();
 
 private:
+    void gc_sync_block(uint32_t id);
+    void gc_validate_mandatory(const std::vector<uint32_t> &) const;
+    std::shared_ptr<KvMemGc> gc_;
+    std::shared_ptr<const KvMemGc::View> gc_view_;
+    std::shared_ptr<KvMemGc::Lease> gc_working_lease_;
     KvMemStoreConfig cfg_;
     uint32_t runtime_select_budget_ = 0;
     std::vector<KvMemBlock> blocks_;

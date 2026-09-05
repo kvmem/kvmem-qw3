@@ -970,6 +970,7 @@ QwenExecutor::QwenExecutor(const QwenNativeModel &model,
 }
 
 QwenExecutor::~QwenExecutor() {
+    if (kvmem_gc_) kvmem_gc_->stop();
     try {
         kvmem_drain_mean_index_capture();
         kvmem_finish_proactive_d2h(/*wait_all=*/true);
@@ -1529,6 +1530,10 @@ void QwenExecutor::reset_state() {
                   kvmem_cpu_sparse_slot_live_.end(), uint8_t{0});
         if (!retain_cold_host) kvmem_cpu_sparse_bytes_ = 0;
     }
+    if (kvmem_gc_) {
+        kvmem_gc_->forget_tail(0); kvmem_gc_->set_active({});
+        kvmem_gc_->set_indexed_blocks(0); kvmem_gc_mandatory_lease_.reset();
+    }
     if (kvmem_nvme_tier_) kvmem_nvme_tier_->clear();
     if (kvmem_raw_k_nvme_tier_) kvmem_raw_k_nvme_tier_->clear();
     std::fill(kvmem_raw_k_nvme_block_backed_.begin(),
@@ -1727,6 +1732,7 @@ void QwenExecutor::reset_state() {
     kvmem_trace_event_count_ = 0;
     if (block_store_) {
         *block_store_ = KvMemStore(block_store_->config());
+        if (kvmem_gc_) block_store_->attach_gc(kvmem_gc_);
     }
     kvmem_attn_trace_seen_tokens_ = 0;
     kvmem_attn_trace_sample_ = 0;
@@ -3036,6 +3042,20 @@ bool QwenExecutor::kvmem_raw_k_chunk_complete(
         [](uint8_t v) { return v != 0; });
 }
 
+void QwenExecutor::kvmem_gc_raw_chunk_state(uint32_t chunk, bool durable) {
+    if (!kvmem_gc_ || !block_store_ || !kvmem_raw_k_chunk_tokens_) return;
+    const uint32_t bt = block_store_->config().block_tokens;
+    const uint32_t begin = chunk * (kvmem_raw_k_chunk_tokens_ / bt);
+    const uint32_t end = std::min(block_store_->block_count(), begin + kvmem_raw_k_chunk_tokens_ / bt);
+    const bool complete = durable && chunk < kvmem_raw_k_dirty_.size() && !kvmem_raw_k_dirty_[chunk] &&
+        chunk < kvmem_raw_k_write_pending_.size() && !kvmem_raw_k_write_pending_[chunk];
+    for (uint32_t id = begin; id < end; ++id) {
+        const bool backed = complete && id < kvmem_raw_k_nvme_block_backed_.size() &&
+                            kvmem_raw_k_nvme_block_backed_[id];
+        kvmem_gc_->update_flags(id, KvMemGc::RawBacked, backed ? KvMemGc::RawBacked : 0u);
+    }
+}
+
 void QwenExecutor::kvmem_persist_raw_k_chunk(
         uint32_t chunk, bool mtp) {
     if (!kvmem_raw_k_nvme_enabled_ || !kvmem_raw_k_nvme_tier_) {
@@ -3094,6 +3114,7 @@ void QwenExecutor::kvmem_persist_raw_k_chunk(
         for (uint32_t b = 0; b < blocks; ++b) {
             const uint32_t block_id =
                 static_cast<uint32_t>(first_block + b);
+            if (kvmem_gc_ && block_id < block_store_->block_count() && !block_store_->is_live(block_id)) continue;
             const size_t token_begin = std::min<size_t>(
                 valid_tokens.size(),
                 static_cast<size_t>(block_id) * bt);
@@ -3124,6 +3145,7 @@ void QwenExecutor::kvmem_persist_raw_k_chunk(
         }
         backed[chunk] = 1;
         dirty[chunk] = 0;
+        if (!mtp) kvmem_gc_raw_chunk_state(chunk, true);
         kvmem_raw_k_nvme_write_bytes_ +=
             static_cast<uint64_t>(written_blocks) * block_bytes;
         if (kvmem_tier_trace_enabled()) {
@@ -3287,6 +3309,7 @@ void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
             if (chunk < kvmem_raw_k_write_pending_.size()) {
                 kvmem_raw_k_write_pending_[chunk] = 0;
             }
+            kvmem_gc_raw_chunk_state(chunk, true);
             if (chunk < kvmem_raw_writeback_chunk_slot_.size() &&
                 kvmem_raw_writeback_chunk_slot_[chunk] ==
                     static_cast<int8_t>(slot_index)) {
@@ -3313,6 +3336,7 @@ void QwenExecutor::kvmem_reap_raw_k_writes(bool wait_all) {
         slot.chunks.clear();
         slot.spans.clear();
         slot.in_flight = false;
+        slot.gc_view.reset();
         slot.d2h_done.reset();
         slot.submit_ns = 0;
     }
@@ -3354,6 +3378,7 @@ void QwenExecutor::kvmem_submit_raw_k_writeback_slot(
         std::move(slot.d2h_done);
     slot.submit_ns = kvmem_steady_ns();
     slot.in_flight = true;
+    if (kvmem_gc_) slot.gc_view = block_store_->gc_view();
     slot.future = std::async(
         std::launch::async,
         [tier, backend, data, buffer_bytes, spans,
@@ -3560,6 +3585,7 @@ bool QwenExecutor::kvmem_copy_raw_k_chunk_to_writeback(
         for (uint32_t b = 0; b < blocks; ++b) {
             const uint32_t block_id =
                 static_cast<uint32_t>(first_block + b);
+            if (kvmem_gc_ && block_id < block_store_->block_count() && !block_store_->is_live(block_id)) continue;
             const NvmeSlotPlacement placement =
                 kvmem_raw_k_nvme_tier_->place_block(block_id);
             if (placement.slot < 0) {
@@ -3584,6 +3610,7 @@ bool QwenExecutor::kvmem_copy_raw_k_chunk_to_writeback(
             kvmem_raw_writeback_record_bytes_});
     }
     kvmem_raw_k_write_pending_[chunk] = 1;
+    kvmem_gc_raw_chunk_state(chunk, false);
     if (slot.used_bytes == slot.capacity_bytes) {
         kvmem_submit_raw_k_writeback_slot(slot_index);
         kvmem_raw_writeback_fill_slot_ =
@@ -3995,6 +4022,7 @@ void QwenExecutor::kvmem_ensure_raw_k_chunks(
                 for (uint32_t b = 0; b < blocks; ++b) {
                     const uint32_t block_id =
                         static_cast<uint32_t>(first_block + b);
+                    if (kvmem_gc_ && block_id < block_store_->block_count() && !block_store_->is_live(block_id)) continue;
                     if (block_id >= block_backed.size() ||
                         !block_backed[block_id]) {
                         continue;
@@ -4095,7 +4123,11 @@ void QwenExecutor::kvmem_write_raw_k(
         const uint64_t bytes =
             static_cast<uint64_t>(take) * kvmem_raw_k_row_bytes_;
         std::memcpy(dst, src, static_cast<size_t>(bytes));
-        if (chunk < dirty.size()) dirty[chunk] = 1;
+        if (chunk < dirty.size()) {
+            const bool was_dirty = dirty[chunk] != 0;
+            dirty[chunk] = 1;
+            if (!mtp && !was_dirty) kvmem_gc_raw_chunk_state(chunk, false);
+        }
         src += bytes;
         pos += take;
         left -= take;
@@ -8096,6 +8128,7 @@ void QwenExecutor::capture_state(StateSnapshot &snapshot) {
     // D2H on every MTP batch.
     kvmem_sync_raw_k_persistence();
     capture_transient_state(snapshot);
+    if (kvmem_gc_ && block_store_) snapshot.gc_lease = block_store_->gc_checkpoint_lease();
 }
 
 void QwenExecutor::capture_transient_state(StateSnapshot &snapshot) {
@@ -8173,6 +8206,7 @@ void QwenExecutor::restore_state(const StateSnapshot &snapshot) {
         throw std::runtime_error("cannot restore an empty QwenExecutor snapshot");
     }
     ensure_scratch();
+    if (kvmem_gc_ && block_store_) block_store_->gc_restore_lease(snapshot.gc_lease);
     if (snapshot.h && h_) {
         require_status(backend_.copy_d2d(*h_, *snapshot.h, 0, h_->count));
     }
@@ -9110,6 +9144,26 @@ uint32_t QwenExecutor::kvmem_set_runtime_select_budget(uint32_t tokens) {
 }
 
 void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
+    if (cfg.gc.max_live_blocks &&
+        (!cfg.raw_k_nvme || !cfg.immutable_source_k || cfg.mtp_enabled ||
+         cfg.index_placement != KvMemIndexPlacement::CPU ||
+         cfg.retrieval_method != KvMemRetrievalMethod::MeanK || cfg.n_subblocks != 1 ||
+         cfg.select_method != KvMemMethod::Retrieval ||
+         cfg.select_policy != KvMemSelectPolicy::TopK ||
+         cfg.semantic_expansion != KvMemSemanticExpansion::None ||
+         cfg.prototype_mode != KvMemPrototypeMode::Contiguous ||
+         (cfg.adaptive_score_mode != KvMemAdaptiveScoreMode::Auto &&
+          cfg.adaptive_score_mode != KvMemAdaptiveScoreMode::TiledOnePass) ||
+         env_flag_enabled("QW3_KVMEM_MEAN_LEGACY_OUTER", false) ||
+         !cfg.optimize_stage_out || kvmem_archive_)) {
+        throw std::invalid_argument(
+            "KVMem GC v1 requires online immutable raw-K NVMe, CPU index placement, "
+            "plain Mean-K/top-k, inclusive stage-out, and MTP/group/archive disabled");
+    }
+    if (kvmem_gc_) kvmem_gc_->stop();
+    kvmem_gc_.reset();
+    kvmem_gc_mandatory_lease_.reset();
+    kvmem_gc_score_event_.reset(); kvmem_gc_score_sequence_ = 0;
     kvmem_drain_mean_index_capture();
     kvmem_finish_proactive_d2h(/*wait_all=*/true);
     kvmem_reap_pending_writes(/*wait_all=*/true);
@@ -10569,6 +10623,36 @@ void QwenExecutor::configure_kvmem(const KvMemStoreConfig &cfg) {
     g_indexed_blocks_ = 0;
     g_orig_base_host_.clear();
     g_blk_tokens_host_.clear();
+    if (effective.gc.max_live_blocks) {
+        const uint32_t capacity = static_cast<uint32_t>(
+            (static_cast<uint64_t>(kv_ctx_size_) + effective.block_tokens - 1) / effective.block_tokens);
+        const uint64_t protected_budget =
+            (static_cast<uint64_t>(std::max(effective.select_budget, effective.prefill_budget)) +
+             effective.gen_budget + effective.block_tokens - 1) / effective.block_tokens;
+        if (!kvmem_raw_k_nvme_tier_ || !kvmem_nvme_tier_ ||
+            effective.gc.max_live_blocks <= protected_budget || effective.gc.max_live_blocks >= capacity) {
+            throw std::invalid_argument(
+                "KVMem GC target must exceed working+generation budgets and be below --ctx blocks; both NVMe tiers are required");
+        }
+        NvmeKvTier *raw = kvmem_raw_k_nvme_tier_.get();
+        NvmeKvTier *values = kvmem_nvme_tier_.get();
+        kvmem_gc_ = std::make_shared<KvMemGc>(effective.gc, capacity,
+            [raw, values](uint32_t id) -> std::function<bool()> {
+                NvmeAllocation k, v;
+                if (!raw->try_allocation(id, k) || !values->try_allocation(id, v)) return {};
+                if (k.slot < 0 || v.slot < 0) return {};
+                return [raw, values, k, v, k_done = false, v_done = false]() mutable {
+                    if (!k_done) k_done = raw->try_release_allocation(k);
+                    if (!v_done) v_done = values->try_release_allocation(v);
+                    return k_done && v_done;
+                };
+            });
+        block_store_->attach_gc(kvmem_gc_);
+        kvmem_gc_->set_indexed_blocks(0);
+        std::fprintf(stderr, "[kvmem-gc] enabled=1 mode=%s max_live_blocks=%u cpu=%d physical=nvme ctx_blocks=%u\n",
+                     effective.gc.shadow ? "shadow" : "delete", effective.gc.max_live_blocks,
+                     effective.gc.worker_cpu, capacity);
+    }
 }
 
 void QwenExecutor::kvmem_register_append(uint32_t n_new_tokens) {
@@ -10604,8 +10688,19 @@ void QwenExecutor::kvmem_register_append(uint32_t n_new_tokens) {
 void QwenExecutor::kvmem_register_until(uint32_t target_pos) {
     if (!kvmem_enabled_ || !block_store_) return;
     if (target_pos <= kvmem_registered_pos_) return;
+    const uint32_t first = kvmem_registered_pos_;
     block_store_->register_append(target_pos - kvmem_registered_pos_);
     kvmem_registered_pos_ = target_pos;
+    if (kvmem_gc_ && kvmem_raw_k_chunk_tokens_) {
+        const uint32_t bt = block_store_->config().block_tokens;
+        for (uint32_t id = first / bt; id < target_pos / bt; ++id) {
+            const uint32_t chunk = id * bt / kvmem_raw_k_chunk_tokens_;
+            const bool backed = id < kvmem_raw_k_nvme_block_backed_.size() &&
+                kvmem_raw_k_nvme_block_backed_[id] && chunk < kvmem_raw_k_dirty_.size() &&
+                !kvmem_raw_k_dirty_[chunk] && !kvmem_raw_k_write_pending_[chunk];
+            kvmem_gc_->update_flags(id, KvMemGc::RawBacked, backed ? KvMemGc::RawBacked : 0u);
+        }
+    }
 }
 
 void QwenExecutor::kvmem_build_index_from_raw_k(uint32_t blocks) {
@@ -11978,6 +12073,7 @@ void QwenExecutor::kvmem_start_prefetch(const KvMemPlan &plan) {
     const uint64_t t_in0 = tm ? kvmem_steady_ns() : 0;
     kvmem_prefetch_ = KvMemPrefetchState{};
     kvmem_prefetch_.active = true;
+    if (kvmem_gc_) kvmem_prefetch_.gc_view = block_store_->gc_view();
     if (perf_trace) {
         kvmem_prefetch_.perf.start_enter_ns = t_in0;
     }
@@ -12747,6 +12843,7 @@ void QwenExecutor::kvmem_submit_write_batch(
 
     NvmeKvTier *tier = kvmem_nvme_tier_.get();
     KvMemPendingWriteBatch pending;
+    if (kvmem_gc_) pending.gc_view = block_store_->gc_view();
     pending.buffer = std::move(buffer);
     pending.buffer_bytes = pending.buffer->size();
     pending.spans = std::move(spans);
@@ -12797,6 +12894,7 @@ void QwenExecutor::kvmem_submit_pinned_write_batch(
 
     NvmeKvTier *tier = kvmem_nvme_tier_.get();
     KvMemPendingWriteBatch pending;
+    if (kvmem_gc_) pending.gc_view = block_store_->gc_view();
     pending.pinned_buffer = std::move(buffer);
     pending.buffer_bytes = bytes;
     pending.proactive = true;
@@ -12876,6 +12974,7 @@ void QwenExecutor::kvmem_submit_pinned_cpu_copy_batch(
         kvmem_steady_ns() - wait0;
 
     KvMemPendingWriteBatch pending;
+    if (kvmem_gc_) pending.gc_view = block_store_->gc_view();
     pending.pinned_buffer = std::move(buffer);
     pending.buffer_bytes = bytes;
     pending.proactive = true;
@@ -14913,6 +15012,7 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     if (kvmem_pending_reselect_) {
         throw std::runtime_error("KVMem reselect already prepared");
     }
+    kvmem_gc_score_event_.reset();
     const bool had_query_prefetch = kvmem_query_prefetch_active_;
     const uint64_t query_prefetch_start_ns =
         kvmem_query_prefetch_start_ns_;
@@ -15053,6 +15153,12 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
                     scorer_used = scorer_requested;
                 } else {
                     add_scorer_failure(scorer_requested, reason);
+                    if (kvmem_gc_) {
+                        // Keep the existing window profile if the normal scorer
+                        // is unavailable. Never run an unmasked fallback over holes.
+                        scorer_used = "window-profile";
+                        break;
+                    }
                     reason.clear();
                     scored = kvmem_retrieval_score(&reason);
                     if (scored) {
@@ -15075,6 +15181,13 @@ uint32_t QwenExecutor::kvmem_prepare_reselect() {
     }
     kvmem_pending_plan_ =
         block_store_->set_selection(kvmem_selection_with_pin());
+    if (kvmem_gc_score_event_) {
+        auto &event = *kvmem_gc_score_event_;
+        event.selected.assign(event.scores.size(), 0);
+        for (const auto &remap : kvmem_pending_plan_.remaps)
+            if (remap.block_id < event.selected.size()) event.selected[remap.block_id] = 1;
+        kvmem_gc_->submit_scores(std::move(kvmem_gc_score_event_));
+    }
     if (perf_trace || std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(
             stderr,
@@ -18381,6 +18494,19 @@ void QwenExecutor::kvmem_set_mandatory_token_spans(
         kvmem_mandatory_token_spans_.emplace_back(begin, end);
         previous_begin = begin;
     }
+    if (kvmem_gc_ && block_store_) {
+        std::vector<uint32_t> ids;
+        const uint32_t bt = block_store_->config().block_tokens;
+        for (const auto &[begin, end] : spans) {
+            const uint32_t last = std::min(block_store_->block_count(), (end - 1) / bt + 1);
+            for (uint32_t id = begin / bt; id < last; ++id) {
+                if (!block_store_->is_live(id)) throw std::runtime_error("GC mandatory history requires cold prefill");
+                ids.push_back(id);
+            }
+        }
+        std::sort(ids.begin(), ids.end()); ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        kvmem_gc_mandatory_lease_ = kvmem_gc_->pin(ids);
+    }
     if (!spans.empty() && std::getenv("QW3_KVMEM_TRACE")) {
         std::fprintf(stderr,
                      "[bs-mandatory] configured token_spans=%zu\n",
@@ -21130,6 +21256,11 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
             }
         }
     }
+    if (kvmem_gc_ && !use_tiled_one_pass) {
+        // The older two-pass denominator ignores block_counts. Do not let
+        // deleted prototypes contribute mass through that fallback.
+        return scorer_unavailable(failure_reason, "gc_requires_tiled_one_pass_workspace");
+    }
     if (use_tiled_one_pass &&
         (!g_adaptive_stream_block_max_ ||
          !g_adaptive_stream_block_sum_ ||
@@ -21345,8 +21476,8 @@ bool QwenExecutor::kvmem_score_cpu_prototype_index(
                         static_cast<int32_t>(
                             tile.prototype_begin);
                     counts[b] =
-                        prototype_count(
-                            tile.layer, tile.first_block + b);
+                        kvmem_gc_ && !block_store_->is_live(tile.first_block + b)
+                            ? 0 : prototype_count(tile.layer, tile.first_block + b);
                 }
             }
             pack_ns += kvmem_steady_ns() - pack_begin;
@@ -23641,6 +23772,21 @@ bool QwenExecutor::kvmem_retrieval_score_mean_softmax(
                                      LengthNormalizedMass
                          ? "length-normalized-mass" : "max",
                      block_store_->config().group_length_norm_alpha);
+    }
+    if (kvmem_gc_) {
+        auto event = std::make_shared<KvMemGc::ScoreEvent>();
+        event->sequence = ++kvmem_gc_score_sequence_;
+        event->step = kvmem_gc_->step();
+        event->scorer_epoch = 1; // controller lifetime is one model/index configuration
+        event->generations.resize(best.size());
+        event->eligible.resize(best.size(), 0);
+        for (uint32_t id = 0; id < best.size(); ++id) {
+            event->generations[id] = kvmem_gc_->generation(id);
+            event->eligible[id] = id < nb && id >= excl_lo_end && id < excl_hi_begin &&
+                                  block_store_->is_live(id);
+        }
+        event->scores = std::move(best); // reuse the existing score D2H result
+        kvmem_gc_score_event_ = std::move(event);
     }
     return true;
 }

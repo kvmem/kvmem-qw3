@@ -109,6 +109,7 @@ add_library(qw3_core
     src/qwen_weights.cpp
     src/qwen_config.cpp
     src/kvmem_store.cpp
+    src/kvmem_gc.cpp
     src/kvmem_archive.cpp
     src/anthropic_adapter.cpp
     src/vision_cpu_frontend.cpp
@@ -247,6 +248,10 @@ if(QW3_BUILD_TESTS)
     add_executable(qw3-prompt-render tests/prompt_render_test.cpp)
     target_link_libraries(qw3-prompt-render PRIVATE qw3_core)
     enable_testing()
+    add_executable(qw3-kvmem-gc tests/kvmem_gc_test.cpp src/kvmem_gc.cpp src/kvmem_store.cpp)
+    target_include_directories(qw3-kvmem-gc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(qw3-kvmem-gc PRIVATE Threads::Threads)
+    add_test(NAME qw3-kvmem-gc COMMAND qw3-kvmem-gc)
     add_executable(qw3-prefix-cache-lifetime tests/prefix_cache_lifetime_test.cpp)
     target_include_directories(qw3-prefix-cache-lifetime PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -52,6 +52,7 @@ public:
 class QwenExecutor {
 public:
     struct StateSnapshot {
+        std::shared_ptr<KvMemGc::Lease> gc_lease;
         bool ready = false;
         uint32_t position = 0;
         uint32_t kv_logical_pages = 0;
@@ -520,6 +521,12 @@ public:
     // executor. No-op effect when kvmem or the CPU tier is off.
     void set_host_tier_pool(HostTierBufferPool *pool) { host_tier_pool_ = pool; }
     void configure_kvmem(const KvMemStoreConfig &cfg);
+    void kvmem_gc_begin_step() {
+        if (kvmem_gc_) kvmem_gc_->set_indexed_blocks(g_kbar_multi_ready_ ? g_kbar_multi_blocks_ : 0);
+        if (block_store_) block_store_->gc_begin_step();
+    }
+    void kvmem_gc_end_step() { if (block_store_) block_store_->gc_end_step(); }
+    KvMemGc::Stats kvmem_gc_stats() const { return kvmem_gc_ ? kvmem_gc_->stats() : KvMemGc::Stats{}; }
     // Narrow the semantic selection budget for one request. Zero restores the
     // configured --kvmem-budget. Returns the previous runtime override so the
     // caller can restore it with an exception-safe scope guard.
@@ -1118,6 +1125,11 @@ private:
     std::unique_ptr<DeviceTensor> mtp_window_pages_device_;
     uint32_t mtp_window_page_count_ = 0;
     std::unique_ptr<PinnedKvTier> kvmem_cpu_tier_;
+    std::shared_ptr<KvMemGc> kvmem_gc_;
+    std::shared_ptr<KvMemGc::Lease> kvmem_gc_mandatory_lease_;
+    std::shared_ptr<KvMemGc::ScoreEvent> kvmem_gc_score_event_;
+    uint64_t kvmem_gc_score_sequence_ = 0;
+    void kvmem_gc_raw_chunk_state(uint32_t chunk, bool backed);
     std::unique_ptr<NvmeKvTier> kvmem_nvme_tier_;
     // Dedicated immutable raw-K arena. Online sessions address one record per
     // semantic block so GC/truncation can reclaim it independently; durable
@@ -1249,6 +1261,7 @@ private:
     // NvmeKvTier::write_spans coalesces them into one large pwrite + one range
     // writeback.
     struct RawWritebackSlot {
+        std::shared_ptr<const KvMemGc::View> gc_view;
         std::unique_ptr<HostBuffer> host;
         std::unique_ptr<DeviceTransferFence> d2h_done;
         uint64_t capacity_bytes = 0;
@@ -1412,6 +1425,7 @@ private:
         uint32_t nvme_blocks = 0;
     };
     struct KvMemPrefetchState {
+        std::shared_ptr<const KvMemGc::View> gc_view;
         bool active = false;
         bool queued_h2d = false;
         // Frozen when prefetch starts.  In local-position MTP mode historical
@@ -1452,6 +1466,7 @@ private:
         uint32_t async_batches = 0;
     };
     struct KvMemPendingWriteBatch {
+        std::shared_ptr<const KvMemGc::View> gc_view;
         struct CpuCopy {
             uint32_t block_id = 0;
             int32_t slot = -1;
