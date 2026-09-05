@@ -52,14 +52,21 @@ de-RoPE, query replay, decode, and MTP verification all use Qwen's exact
 interleaved T/H/W M-RoPE layout. KVMem keeps both source and compact-window
 three-axis positions so a semantic remap never falls back to scalar RoPE.
 
-Process-local warm-prefix and named `kvmem_cache` checkpoints include a stable
-visual-input fingerprint, projected embeddings, complete M-RoPE positions, and
-mandatory spans. Frozen loads therefore send only the new text query. Append
-loads reuse the last aligned checkpoint and replay at most one old partial
-block before adding a suffix, which keeps packed Adaptive/Fixed4 indexes exact.
-Persistent KVMem session appends retain prior images and can add new images;
-their virtual token IDs and M-RoPE coordinates are rebased into the combined
-source sequence.
+Process-local warm-prefix checkpoints retain lightweight per-row visual
+identities in addition to the request-level fingerprint. Prefix admission
+compares the source identity and M-RoPE coordinate of every visual row before
+the candidate checkpoint. This permits an accumulated `[A,B,C] -> [A,B,C,D]`
+request to reuse the language-model KV for `A,B,C`, without retaining the old
+projected tensor solely for cache validation; changing or reordering a prior
+image shortens the reusable prefix at its first visual token.
+
+Named `kvmem_cache` checkpoints include the projected embeddings, complete
+M-RoPE positions, mandatory spans, and request fingerprint. Frozen loads
+therefore send only the new text query. Append loads reuse the last aligned
+checkpoint and replay at most one old partial block before adding a suffix,
+which keeps packed Adaptive/Fixed4 indexes exact. Persistent KVMem session
+appends retain prior images and can add new images; their virtual token IDs and
+M-RoPE coordinates are rebased into the combined source sequence.
 
 ## Validation
 
@@ -82,6 +89,12 @@ the image:
   --image /absolute/path/to/image.png \
   --history-repeats 200
 ```
+
+`scripts/multimodal_prefix_cache_canary.py` separately exercises accumulated
+full-transcript warm reuse: turn one sends image A, and turn two resends A while
+appending image B. With `QW3_KVMEM_PREFIX_CACHE_TRACE=1`, the second request
+must report a prefix-cache HIT. Its optional `--replacement-image` case changes
+historical A while preserving the token layout and must report a safe MISS.
 
 `qw3-kvmem-immutable-k` additionally checks exact scalar/three-axis immutable-K
 rebuild and query de-RoPE parity on CUDA.

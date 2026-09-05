@@ -336,6 +336,8 @@ struct EngineOptions {
 };
 
 struct GenerationOptions {
+    // Thread-safe transport/request cancellation, checked between GPU chunks.
+    std::function<bool()> should_cancel;
     int max_tokens = 256;
     float temperature = 0.6f;
     float top_p = 0.95f;
@@ -360,6 +362,12 @@ struct GenerationOptions {
         uint32_t token_id = 0;
         uint32_t source_token_id = 0;
         std::array<uint32_t, 3> position = {0, 0, 0};
+        // Stable identity of this projected input row. The server derives it
+        // from the source image identity and the row within that image, so a
+        // prefix cache can validate only the visual rows preceding a candidate
+        // checkpoint. Zero keeps the legacy whole-request fingerprint fallback
+        // for callers that do not provide row identities.
+        uint64_t cache_identity = 0;
         std::vector<float> embedding;
         // When set, embedding_row selects a row from device-backed storage.
         // Exactly one of `embedding` and `storage` is expected to be present.
@@ -368,9 +376,9 @@ struct GenerationOptions {
     };
     std::vector<InputEmbeddingOverride> input_embedding_overrides;
     // Stable identity of the request's ordered visual inputs. Text-only
-    // requests use zero. Prefix/session caches must match this in addition to
-    // token IDs because two different images intentionally use the same
-    // synthetic token-ID layout.
+    // requests use zero. This remains the conservative cache authority for
+    // callers that omit per-row cache_identity; row-aware serving can instead
+    // validate only the visual inputs preceding a candidate checkpoint.
     uint64_t input_embedding_fingerprint = 0;
     // Exact dense-prompt M-RoPE coordinates, one entry per prompt token. This
     // is populated only for multimodal requests. KVMem keeps visual spans

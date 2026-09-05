@@ -192,7 +192,7 @@ def start_server(args: argparse.Namespace, port: int, log_path: Path) -> tuple[s
         "--kvmem-sink-tokens", "128",
         "--kvmem-recent-tokens", "0",
         "--kvmem-method", "retrieval",
-        "--kvmem-retrieval-method", "key-direction-adaptive",
+        "--kvmem-retrieval-method", args.retrieval_method,
         "--kvmem-index-placement", "gpu",
         "--kvmem-update-mode", "step",
         "--kvmem-query-conditioned",
@@ -259,6 +259,10 @@ def main() -> int:
     parser.add_argument("--ctx", type=int, default=16384)
     parser.add_argument("--budget", type=int, default=4096)
     parser.add_argument("--block-tokens", type=int, default=32)
+    parser.add_argument(
+        "--retrieval-method", default="key-direction-adaptive",
+        choices=("mean-k", "key-direction-adaptive"),
+        help="semantic index implementation exercised by the canary")
     parser.add_argument("--gen-budget", type=int, default=1024)
     parser.add_argument("--cpu-gb", type=int, default=2)
     parser.add_argument(
@@ -421,7 +425,11 @@ def main() -> int:
         "no_cold_rebuild": "reason=no_reusable_checkpoint" not in warm_log,
         "reuse_reported": reuse > 0 and prefilled > 0,
         "suffix_only": prompt_tokens > 0 and prefilled < prompt_tokens // 4,
-        "semantic_scorer": "used=key-direction-adaptive-packed-gpu fallback=0" in warm_log,
+        "semantic_scorer": (
+            "used=key-direction-adaptive-packed-gpu fallback=0" in warm_log
+            if args.retrieval_method == "key-direction-adaptive"
+            else "[kvmem-scorer]" in warm_log and "fallback=0" in warm_log
+        ),
         "mtp_active": args.plain or
                       "native mtp_spec_summary: enabled=true" in warm_log,
         "no_server_error": "POST /v1/chat/completions -> 5" not in warm_log,

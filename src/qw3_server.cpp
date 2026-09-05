@@ -1,10 +1,12 @@
 #include "server.hpp"
+#include "request_cancellation.hpp"
 
 #include "anthropic_adapter.hpp"
 #include "env_flags.hpp"
 #include "harness_semantics.hpp"
 #include "kvmem_request_plan.hpp"
 #include "kvmem_refresh_policy.hpp"
+#include "multimodal_prefix_cache.hpp"
 #include "tool_call_stream.hpp"
 #include "vision_cpu_frontend.hpp"
 #include "qw3/qw3.hpp"
@@ -180,13 +182,13 @@ std::string bytes_gib_label(uint64_t bytes) {
     return std::string(buf);
 }
 
-bool serve_continuous_batch_request_supported(const GenerationOptions &g) {
+bool serve_continuous_batch_request_supported(const GenerationOptions &g,
+                                               bool kvmem_enabled) {
     // Request-local budgets mutate the single executor's selection policy for
     // the duration of a request. Keep them on the serialized plain/frozen path
     // until continuous batching has a per-row budget field.
     return g.max_tokens >= 0 && g.kvmem_replay_query_spans.empty() &&
-           g.input_embedding_overrides.empty() &&
-           g.kvmem_pinned_token_spans.empty() &&
+           (!kvmem_enabled || g.kvmem_pinned_token_spans.empty()) &&
            g.kvmem_semantic_budget == 0 &&
            g.kvmem_query_attention_probe_tokens == 0 &&
            g.kvmem_query_attention_score_tokens == 0 &&
@@ -308,6 +310,7 @@ void set_error_response(httplib::Response &res,
                         int status,
                         const std::string &message) {
     res.status = status;
+    if (status == 429) res.set_header("Retry-After", "1");
     res.set_content(dump_json(json{{"error", message}}), "application/json");
 }
 
@@ -533,6 +536,7 @@ std::string render_content(const json &content) {
 struct PreparedVisionRequest {
     detail::CpuVisionEncoding encoded;
     std::vector<std::pair<uint32_t, uint32_t>> token_spans;
+    std::vector<uint64_t> image_fingerprints;
     uint64_t fingerprint = 0;
 
     bool active() const { return !encoded.grids.empty(); }
@@ -624,8 +628,7 @@ bool prepare_vision_messages(json &messages,
     // this is deterministic across worker/kernel implementations and avoids a
     // second pass over the much larger projected tensor. It is cache identity,
     // not an authentication primitive.
-    uint64_t fingerprint = 1469598103934665603ULL;
-    auto mix = [&](std::string_view value) {
+    auto mix = [](uint64_t &fingerprint, std::string_view value) {
         for (unsigned char byte : value) {
             fingerprint ^= static_cast<uint64_t>(byte);
             fingerprint *= 1099511628211ULL;
@@ -633,9 +636,17 @@ bool prepare_vision_messages(json &messages,
         fingerprint ^= 0xffu;
         fingerprint *= 1099511628211ULL;
     };
+    uint64_t fingerprint = 1469598103934665603ULL;
+    prepared.image_fingerprints.clear();
+    prepared.image_fingerprints.reserve(images.size());
     for (const auto &image : images) {
-        mix(image.media_type);
-        mix(image.base64_data);
+        mix(fingerprint, image.media_type);
+        mix(fingerprint, image.base64_data);
+        uint64_t image_fingerprint = 1469598103934665603ULL;
+        mix(image_fingerprint, image.media_type);
+        mix(image_fingerprint, image.base64_data);
+        prepared.image_fingerprints.push_back(
+            image_fingerprint != 0 ? image_fingerprint : 1);
     }
     prepared.fingerprint = fingerprint != 0 ? fingerprint : 1;
 
@@ -700,7 +711,13 @@ bool finalize_vision_tokens(
     generation.input_mrope_positions.assign(tokens.size(), {0, 0, 0});
     prepared.token_spans.clear();
 
-    for (const auto &grid : prepared.encoded.grids) {
+    if (prepared.image_fingerprints.size() != prepared.encoded.grids.size()) {
+        error = "vision source identity count does not match encoded images";
+        return false;
+    }
+    for (size_t grid_index = 0;
+         grid_index < prepared.encoded.grids.size(); ++grid_index) {
+        const auto &grid = prepared.encoded.grids[grid_index];
         while (search + 1 < tokens.size() &&
                !(tokens[search] == vision_start &&
                  tokens[search + 1] == image_pad)) {
@@ -738,6 +755,10 @@ bool finalize_vision_tokens(
             GenerationOptions::InputEmbeddingOverride override;
             override.token_id = virtual_id;
             override.source_token_id = static_cast<uint32_t>(image_pad);
+            override.cache_identity =
+                detail::multimodal_row_cache_identity(
+                    prepared.image_fingerprints[grid_index],
+                    static_cast<uint32_t>(pos - begin));
             if (prepared.encoded.storage) {
                 override.storage = prepared.encoded.storage;
                 override.embedding_row = static_cast<uint32_t>(embedding_row);
@@ -2455,7 +2476,21 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     std::unordered_map<size_t, GuidedTrajectoryState> guided_trajectories;
     std::atomic<uint64_t> req_counter{0};
 
+    detail::RequestCancellationRegistry cancellation_registry;
     httplib::Server svr;
+    svr.Post(R"(/v1/requests/([A-Za-z0-9_.-]+)/cancel)",
+             [&](const httplib::Request &req, httplib::Response &res) {
+        const auto state = cancellation_registry.cancel(req.matches[1].str());
+        if (!state) {
+            res.status = 404;
+            res.set_content(R"({"error":"unknown request id"})", "application/json");
+            return;
+        }
+        const bool completed = state->completed.load();
+        res.status = completed ? 200 : 202;
+        res.set_content(dump_json(json{{"cancelled", true},
+                                      {"completed", completed}}), "application/json");
+    });
 
     svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
@@ -2836,6 +2871,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     auto handle_chat_completions = [&](const httplib::Request &hreq,
                                        httplib::Response &res,
                                        detail::HarnessProtocol protocol) {
+        std::shared_ptr<detail::RequestCancellationRegistry::Lease> cancellation;
+        try {
+            cancellation = cancellation_registry.begin(
+                hreq.get_header_value("x-qw3-request-id"));
+        } catch (const std::exception &e) {
+            set_error_response(res, 400, e.what());
+            return;
+        }
+
         const auto server_request_start = std::chrono::steady_clock::now();
         json req;
         try {
@@ -3223,12 +3267,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             hreq.has_header("x-qw3-harness") &&
             trim_ascii_ws(hreq.get_header_value("x-qw3-harness")) ==
                 "mini-swe-agent";
+        const bool generic_tool_harness =
+            hreq.has_header("x-qw3-harness") &&
+            (trim_ascii_ws(hreq.get_header_value("x-qw3-harness")) ==
+                 "osworld" ||
+             trim_ascii_ws(hreq.get_header_value("x-qw3-harness")) ==
+                 "generic-tool-client");
         const detail::HarnessRequestContext harness =
             detail::classify_harness(detail::HarnessRequestSignals{
                 protocol,
                 hreq.has_header("User-Agent")
                     ? hreq.get_header_value("User-Agent") : std::string(),
                 mini_swe_agent,
+                generic_tool_harness,
                 hreq.has_header("x-deepseek-harness-user-id") ||
                     hreq.has_header("x-deepseek-harness-session-id") ||
                     hreq.has_header("x-deepseek-harness-compact"),
@@ -3490,6 +3541,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             set_error_response(res, 400, e.what());
             return;
         }
+        g.should_cancel = [cancellation, closed = hreq.is_connection_closed] {
+            return cancellation->state->cancelled.load() || (closed && closed());
+        };
         g.raw_prompt = true; // prompt is already chat-framed
         g.thinking_open = enable_thinking; // budget only runs while <think> is open
         g.kvmem_reselect_mode = kvmem_reselect_mode;
@@ -5255,11 +5309,47 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 << g.kvmem_query_end << ")\n";
         }
 
+        // Harness anchors and multimodal image spans are discovered at
+        // different preprocessing stages.  Canonicalize the combined list
+        // once, after every prompt transformation, so the executor receives
+        // monotonic, non-overlapping mandatory ranges regardless of source.
+        if (engine.kvmem_enabled && !g.kvmem_pinned_token_spans.empty()) {
+            std::sort(
+                g.kvmem_pinned_token_spans.begin(),
+                g.kvmem_pinned_token_spans.end(),
+                [](const auto &a, const auto &b) {
+                    if (a.begin != b.begin) return a.begin < b.begin;
+                    return a.end < b.end;
+                });
+            std::vector<GenerationOptions::KvMemPinnedTokenSpan> canonical;
+            canonical.reserve(g.kvmem_pinned_token_spans.size());
+            for (const auto &span : g.kvmem_pinned_token_spans) {
+                if (span.begin >= span.end ||
+                    span.end > prompt_token_count) {
+                    set_error_response(
+                        res, 500,
+                        "KVMem mandatory span is outside the final prompt");
+                    return;
+                }
+                if (!canonical.empty() &&
+                    span.begin <= canonical.back().end) {
+                    canonical.back().end =
+                        std::max(canonical.back().end, span.end);
+                    canonical.back().reason =
+                        GenerationOptions::KvMemPinnedReason::
+                            ExplicitClientPin;
+                    continue;
+                }
+                canonical.push_back(span);
+            }
+            g.kvmem_pinned_token_spans = std::move(canonical);
+        }
+
         g.continuous_batching =
             !kvmem_session_request &&
             !kvmem_cache_request &&
             serve_continuous_batching_enabled() &&
-            serve_continuous_batch_request_supported(g);
+            serve_continuous_batch_request_supported(g, engine.kvmem_enabled);
         const std::string route = kvmem_cache_request
             ? ("cache-" + kvmem_cache_operation)
             : (kvmem_session_request
@@ -5881,6 +5971,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 engine_start = std::chrono::steady_clock::now();
                 ttft.start_engine(engine_start);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
+                    if (g.should_cancel && g.should_cancel()) return false;
                     consume_piece(piece);
                     return true;
                 });
@@ -5889,6 +5980,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 engine_start = std::chrono::steady_clock::now();
                 ttft.start_engine(engine_start);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
+                    if (g.should_cancel && g.should_cancel()) return false;
                     consume_piece(piece);
                     return true;
                 });
@@ -5919,8 +6011,37 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         std::cerr << " " << ms << "ms\n";
         const std::vector<json> tool_calls = parse_tool_calls_xml(text, tools);
         const ReasoningSplit split = split_reasoning(text);
+        // OpenAI-compatible responses may carry both a natural-language plan
+        // and native tool_calls.  Keep the text before the first XML tool
+        // frame instead of discarding it: GUI agents use that short plan as
+        // durable action history on the next turn.  The XML frame itself is
+        // represented structurally in message.tool_calls and must not be
+        // duplicated in message.content.
+        std::string response_content = split.content;
+        if (!tool_calls.empty()) {
+            const size_t tool_begin = response_content.find("<tool_call>");
+            if (tool_begin != std::string::npos) {
+                response_content =
+                    trim_ascii_ws(response_content.substr(0, tool_begin));
+            }
+        }
         json message = json{{"role", "assistant"},
-                            {"content", tool_calls.empty() ? split.content : ""}};
+                            {"content", response_content}};
+        // QW3 clients that replay an exact agent transcript can use this
+        // vendor extension to preserve the original XML spelling and avoid a
+        // prefix-cache miss caused by reconstructing tool arguments from JSON.
+        // A native tool call terminates the assistant turn.  Some samples can
+        // still emit chat-template sentinels after the closing XML frame; do
+        // not carry that suffix into the next request's history.
+        std::string replay_completion = text;
+        if (!tool_calls.empty()) {
+            static constexpr std::string_view kToolCallEnd = "</tool_call>";
+            const size_t tool_end = replay_completion.rfind(kToolCallEnd);
+            if (tool_end != std::string::npos) {
+                replay_completion.resize(tool_end + kToolCallEnd.size());
+            }
+        }
+        message["qw3_raw_completion"] = replay_completion;
         if (!split.reasoning.empty()) {
             message["reasoning_content"] = split.reasoning;
         }
@@ -6195,6 +6316,15 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     svr.Post("/v1/completions", [&](const httplib::Request &hreq,
                                     httplib::Response &res) {
+        std::shared_ptr<detail::RequestCancellationRegistry::Lease> cancellation;
+        try {
+            cancellation = cancellation_registry.begin(
+                hreq.get_header_value("x-qw3-request-id"));
+        } catch (const std::exception &e) {
+            set_error_response(res, 400, e.what());
+            return;
+        }
+
         const auto server_request_start = std::chrono::steady_clock::now();
         json req;
         try {
@@ -6274,6 +6404,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             set_error_response(res, 400, e.what());
             return;
         }
+        g.should_cancel = [cancellation, closed = hreq.is_connection_closed] {
+            return cancellation->state->cancelled.load() || (closed && closed());
+        };
         g.raw_prompt = true; // /v1/completions sends raw text, no chat template
         // Raw completions receive an already-rendered prompt. The caller is
         // responsible for including the assistant/<think> prefix; this flag
@@ -6551,7 +6684,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         g.continuous_batching =
             !kvmem_session_request && !kvmem_cache_request &&
             serve_continuous_batching_enabled() &&
-            serve_continuous_batch_request_supported(g);
+            serve_continuous_batch_request_supported(g, engine.kvmem_enabled);
         const std::string route = kvmem_cache_request
             ? ("cache-" + kvmem_cache_operation)
             : (kvmem_session_request
@@ -6591,6 +6724,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 generation_start = std::chrono::steady_clock::now();
                 ttft.start_engine(generation_start);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
+                    if (g.should_cancel && g.should_cancel()) return false;
                     consume_piece(piece);
                     return true;
                 });
@@ -6599,6 +6733,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 generation_start = std::chrono::steady_clock::now();
                 ttft.start_engine(generation_start);
                 eng.generate_stream_cancellable(prompt, g, [&](const std::string &piece) {
+                    if (g.should_cancel && g.should_cancel()) return false;
                     consume_piece(piece);
                     return true;
                 });

@@ -247,6 +247,15 @@ if(QW3_BUILD_TESTS)
     add_executable(qw3-prompt-render tests/prompt_render_test.cpp)
     target_link_libraries(qw3-prompt-render PRIVATE qw3_core)
     enable_testing()
+    add_executable(qw3-prefix-cache-lifetime tests/prefix_cache_lifetime_test.cpp)
+    target_include_directories(qw3-prefix-cache-lifetime PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(qw3-prefix-cache-lifetime PRIVATE Threads::Threads)
+    add_test(NAME qw3-prefix-cache-lifetime COMMAND qw3-prefix-cache-lifetime)
+    add_executable(qw3-request-disconnect tests/request_disconnect_test.cpp)
+    target_link_libraries(qw3-request-disconnect PRIVATE Threads::Threads)
+    add_test(NAME qw3-request-disconnect COMMAND qw3-request-disconnect)
+
     add_test(NAME qw3-prompt-render COMMAND qw3-prompt-render)
 
     add_executable(qw3-kvmem-store tests/kvmem_store_test.cpp)

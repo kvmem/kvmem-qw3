@@ -1,0 +1,3 @@
+{"question_id":"8752c811","question_type":"single-session-assistant","population_quantile":0.25,"full_prompt_tokens":108842,"source_index":468}
+{"question_id":"1d4e3b97","question_type":"single-session-preference","population_quantile":0.50,"full_prompt_tokens":109793,"source_index":158}
+{"question_id":"gpt4_7a0daae1","question_type":"temporal-reasoning","population_quantile":0.75,"full_prompt_tokens":110632,"source_index":253}

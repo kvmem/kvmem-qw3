@@ -288,10 +288,12 @@ only reruns the visual tower for `D`. The default CPU and GPU cache limits are
 `QW3_VISION_GPU_CACHE_MIB`.
 
 KVMem keeps each visual token span atomic and preserves its M-RoPE coordinates.
-Current full-transcript serving does not yet reuse the language-model KV prefix
-when the ordered image set changes; per-image caching currently removes visual
-tower recomputation, not repeated LM prefill. Video input and multimodal
-continuous batching are not implemented. See the
+With `--kvmem-prefix-cache`, full-transcript serving validates visual identity
+at each projected row before a candidate checkpoint. An accumulated request
+such as `[A,B,C] -> [A,B,C,D]` can therefore reuse the language-model KV prefix
+for `A,B,C`, while a changed or reordered historical image forces a safe miss
+at its first visual token. Video input and multimodal continuous batching are
+not implemented. See the
 [native CUDA vision notes](docs/multimodal_cuda.md) for validation details.
 
 ## Try KVMem

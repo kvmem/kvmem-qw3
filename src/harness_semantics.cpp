@@ -200,6 +200,10 @@ HarnessRequestContext classify_harness(
         out.kind = HarnessKind::MiniSweAgent;
         return out;
     }
+    if (signals.has_generic_tool_harness_header) {
+        out.kind = HarnessKind::GenericToolClient;
+        return out;
+    }
     if (signals.has_deepseek_harness_header ||
         contains_ascii_case_insensitive(
             signals.user_agent, "deepseek-harness/")) {

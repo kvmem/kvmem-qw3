@@ -542,7 +542,8 @@ struct Request {
   std::string local_addr;
   int local_port = -1;
 
-  // for server
+  // for server. Valid only for the lifetime of this request/response.
+  std::function<bool()> is_connection_closed;
   std::string version;
   std::string target;
   Params params;
@@ -6664,6 +6665,9 @@ Server::process_request(Stream &strm, bool close_connection,
     connection_closed = true;
   }
 
+  req.is_connection_closed = [sock = strm.socket()] {
+    return !detail::is_socket_alive(sock);
+  };
   strm.get_remote_ip_and_port(req.remote_addr, req.remote_port);
   req.set_header("REMOTE_ADDR", req.remote_addr);
   req.set_header("REMOTE_PORT", std::to_string(req.remote_port));

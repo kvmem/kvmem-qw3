@@ -79,6 +79,11 @@ void test_harness_classification() {
             "explicit mini-swe-agent header was not recognized");
 
     signals = {};
+    signals.has_generic_tool_harness_header = true;
+    require(classify_harness(signals).kind == HarnessKind::GenericToolClient,
+            "explicit generic tool harness header was not recognized");
+
+    signals = {};
     signals.user_agent = "mini-swe-agent/2.4.6 litellm";
     require(classify_harness(signals).kind == HarnessKind::MiniSweAgent,
             "mini-swe-agent User-Agent was not recognized");

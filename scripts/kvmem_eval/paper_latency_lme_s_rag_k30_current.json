@@ -1,0 +1,34 @@
+{
+  "input_path": "/data/chaidi/kvmem_eval/data/longmemeval_s.json",
+  "output_path": "/data/chaidi/kvmem_eval/results/paper_pre_answer_latency_current_20260812/lme_s_rag_k30_unused.jsonl",
+  "llm": {
+    "mode": "vllm",
+    "api_base": "http://127.0.0.1:18124/v1",
+    "model_name": "Qwen3.6-27B-FP8",
+    "api_key_env": "VLLM_API_KEY",
+    "temperature": 0.0,
+    "max_tokens": 1,
+    "request_timeout_sec": 3600,
+    "stream_timing": true,
+    "extra_body": {
+      "chat_template_kwargs": {"enable_thinking": true}
+    }
+  },
+  "tokenizer": {
+    "name": "/home/chaidi/kvmem_eval/KVMem_Motivation/models/tokenizers/Qwen3.6-27B-FP8"
+  },
+  "compact": {
+    "summary_mode": "llm",
+    "compact_prompt_path": "/home/chaidi/kvmem_eval/KVMem_Motivation/docs/codex_compact_sources/prompt.md",
+    "context_window_tokens": 100000,
+    "summary_max_chars": 4000,
+    "summary_temperature": 0.0
+  },
+  "retrieval": {
+    "top_k": 30,
+    "method": "rag",
+    "chunk_size": 1024,
+    "chunk_overlap": 128,
+    "embedding_model": "/data/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+  }
+}

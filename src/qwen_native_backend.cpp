@@ -1,10 +1,12 @@
 #include "backend.hpp"
+#include "global_kv_page_pool.hpp"
 #include "env_flags.hpp"
 #include "kvmem_archive_cli.hpp"
 #include "kvmem_prefix_reuse_policy.hpp"
 #include "kvmem_request_plan.hpp"
 #include "kvmem_refresh_policy.hpp"
 #include "kvmem_session.hpp"
+#include "multimodal_prefix_cache.hpp"
 #include "qwen_executor.hpp"
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
@@ -625,9 +627,9 @@ uint32_t continuous_batching_admission_wait_us() {
     return env_uint32_or("QW3_CONTINUOUS_BATCHING_ADMISSION_WAIT_US", 1000);
 }
 
-uint64_t continuous_batching_max_total_tokens(uint32_t ctx_size, uint32_t max_active) {
+uint64_t continuous_batching_max_total_tokens(uint64_t physical_slots, uint32_t max_active) {
     (void)max_active;
-    const uint64_t default_budget = static_cast<uint64_t>(ctx_size);
+    const uint64_t default_budget = physical_slots;
     const uint64_t configured =
         env_uint64_or("QW3_CONTINUOUS_BATCHING_MAX_TOTAL_TOKENS", default_budget);
     return configured == 0 ? std::numeric_limits<uint64_t>::max() : configured;
@@ -1180,117 +1182,6 @@ bool prefix_cache_trace_enabled() {
     return env_flag_enabled("QW3_PREFIX_CACHE_TRACE");
 }
 
-class GlobalKvPagePool final : public KvPhysicalPageAllocator {
-public:
-    GlobalKvPagePool(uint32_t total_pages, uint32_t page_size)
-        : total_pages_(total_pages), page_size_(page_size) {
-        free_pages_.reserve(total_pages_);
-        for (uint32_t i = 0; i < total_pages_; ++i) {
-            free_pages_.push_back(static_cast<int32_t>(total_pages_ - 1U - i));
-        }
-        page_pin_refcount_.assign(total_pages_, 0);
-    }
-
-    // Installed by the backend's prefix cache. On free-stack exhaustion the
-    // pool invokes this to reclaim pinned (refcount==0 entry) cache pages back
-    // onto the free stack. Must return the number of pages freed (0 = nothing
-    // evictable). The callback runs WITHOUT the pool mutex held (it itself
-    // calls unpin_pages/release_physical_pages, which take the lock).
-    void set_evict_callback(std::function<uint32_t()> cb) {
-        evict_cb_ = std::move(cb);
-    }
-
-    int32_t allocate_physical_page() override {
-        for (;;) {
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                if (!free_pages_.empty()) {
-                    const int32_t page = free_pages_.back();
-                    free_pages_.pop_back();
-                    ++used_pages_;
-                    return page;
-                }
-            }
-            // Free stack empty: ask the prefix cache to evict the LRU entry
-            // whose refcount is 0, then retry. A single eviction may reclaim
-            // ZERO physical pages when the victim shares all its pages with a
-            // longer cached entry (extension/multi-turn). The evict callback
-            // returns the number of ENTRIES it evicted (progress), not pages,
-            // so we keep evicting until a page actually frees up or there is
-            // nothing left to evict. Each iteration drops one entry's pin, so
-            // the entry that uniquely owns the shared region eventually frees.
-            if (!evict_cb_ || evict_cb_() == 0) break;
-        }
-        std::lock_guard<std::mutex> lk(mu_);
-        throw std::runtime_error(
-            "global KV page pool exhausted: free=0 total=" +
-            std::to_string(total_pages_) +
-            " page_size=" + std::to_string(page_size_));
-    }
-
-    void release_physical_pages(const std::vector<int32_t> &pages) override {
-        if (pages.empty()) return;
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int32_t page : pages) {
-            if (page < 0 || static_cast<uint32_t>(page) >= total_pages_) {
-                continue;
-            }
-            // Defense in depth: a page still pinned by a prefix-cache entry
-            // must never re-enter the free stack (the owning executor's
-            // `owned` flag should already prevent this).
-            if (page_pin_refcount_[page] > 0) continue;
-            free_pages_.push_back(page);
-            if (used_pages_ > 0) --used_pages_;
-        }
-    }
-
-    // Pin pages held by a prefix-cache entry so they can never be handed out
-    // by allocate_physical_page or returned to the free stack while live.
-    void pin_pages(const std::vector<int32_t> &pages) {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int32_t page : pages) {
-            if (page < 0 || static_cast<uint32_t>(page) >= total_pages_) {
-                continue;
-            }
-            ++page_pin_refcount_[page];
-        }
-    }
-
-    // Drop the cache's pin on pages (called just before releasing them at
-    // eviction). Does NOT return them to the free stack; pair with
-    // release_physical_pages.
-    void unpin_pages(const std::vector<int32_t> &pages) {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (int32_t page : pages) {
-            if (page < 0 || static_cast<uint32_t>(page) >= total_pages_) {
-                continue;
-            }
-            if (page_pin_refcount_[page] > 0) --page_pin_refcount_[page];
-        }
-    }
-
-    uint32_t free_pages() const override {
-        std::lock_guard<std::mutex> lk(mu_);
-        return static_cast<uint32_t>(free_pages_.size());
-    }
-
-    uint32_t used_pages() const override {
-        std::lock_guard<std::mutex> lk(mu_);
-        return used_pages_;
-    }
-
-    uint32_t total_pages() const override { return total_pages_; }
-    uint32_t page_size() const { return page_size_; }
-
-private:
-    uint32_t total_pages_ = 0;
-    uint32_t page_size_ = 0;
-    mutable std::mutex mu_;
-    std::vector<int32_t> free_pages_;
-    std::vector<uint16_t> page_pin_refcount_;
-    std::function<uint32_t()> evict_cb_;
-    uint32_t used_pages_ = 0;
-};
 
 bool mtp_trace_enabled() {
     return env_flag_enabled("QW3_MTP_TRACE");
@@ -4277,6 +4168,7 @@ private:
             mix_u64(item.token_id);
             mix_u64(item.source_token_id);
             for (uint32_t axis : item.position) mix_u64(axis);
+            mix_u64(item.cache_identity);
             for (float value : item.embedding) {
                 uint32_t bits = 0;
                 std::memcpy(&bits, &value, sizeof(bits));
@@ -4284,6 +4176,20 @@ private:
             }
         }
         return h != 0 ? h : 1;
+    }
+
+    static std::vector<detail::MultimodalTokenIdentity>
+    input_embedding_cache_identities(
+            const std::vector<GenerationOptions::InputEmbeddingOverride>
+                &overrides) {
+        std::vector<detail::MultimodalTokenIdentity> identities;
+        identities.reserve(overrides.size());
+        for (const auto &item : overrides) {
+            identities.push_back(detail::MultimodalTokenIdentity{
+                item.token_id, item.source_token_id, item.position,
+                item.cache_identity});
+        }
+        return identities;
     }
 
     static uint64_t combine_input_embedding_fingerprints(uint64_t prefix,
@@ -4639,8 +4545,26 @@ private:
         }
     };
 
+    struct PrefixEntryLease {
+        std::vector<uint64_t> ids;
+        std::function<void(std::vector<uint64_t> &)> release;
+        ~PrefixEntryLease() { if (release) release(ids); }
+    };
+
+    static bool request_cancelled(const GenerationOptions &options) {
+        return options.should_cancel && options.should_cancel();
+    }
+
+    static void check_request_cancelled(const GenerationOptions &options) {
+        if (request_cancelled(options)) {
+            throw std::runtime_error("request cancelled");
+        }
+    }
+
     struct ContinuousBatchActive {
         std::shared_ptr<ContinuousBatchRequest> req;
+        // Declared before executor: pages stop being used before refs drop.
+        std::unique_ptr<PrefixEntryLease> prefix_lease;
         std::unique_ptr<QwenExecutor> executor;
         ContinuousRequestKvState kv_state;
         std::unordered_map<uint32_t, uint32_t> seen_tokens;
@@ -4655,12 +4579,12 @@ private:
         uint64_t decode_ops = 0;
         double prefill_s = 0.0;
         double decode_start = 0.0;
-        // Prefix-cache bookkeeping (serve path). held_prefix_entries are entry
-        // ids whose refcount this request holds (adopted on hit + committed on
-        // miss); all are decremented at finish. prefix_commit_pending requests
+        // Prefix-cache bookkeeping. The lease holds adopted/committed entry
+        // references through executor teardown, including exceptions.
+        // prefix_commit_pending requests
         // a one-shot recurrent+KV snapshot when prefill_offset reaches
         // prefix_commit_len (a page-aligned boundary < prompt_len).
-        std::vector<uint64_t> held_prefix_entries;
+        uint32_t prefix_reused_tokens = 0;
         bool prefix_commit_pending = false;
         uint32_t prefix_commit_len = 0;
         // kvmem reselect cadence (per-request, mirrors generate_plain's
@@ -6658,7 +6582,6 @@ private:
     static bool continuous_batch_request_supported(const GenerationOptions &options,
                                                    const DumpStream *dump) {
         return dump == nullptr && options.max_tokens >= 0 &&
-               options.input_embedding_overrides.empty() &&
                options.kvmem_semantic_budget == 0 &&
                options.kvmem_replay_query_spans.empty() &&
                options.kvmem_oracle_token_spans.empty() &&
@@ -6746,7 +6669,10 @@ private:
         const uint32_t max_active = continuous_batching_max_active();
         const uint32_t max_pending = continuous_batching_max_pending();
         const uint64_t max_total_tokens =
-            continuous_batching_max_total_tokens(ctx_size, max_active);
+            continuous_batching_max_total_tokens(
+                cb_kv_pool_ ? static_cast<uint64_t>(cb_kv_pool_->total_pages()) *
+                                  cb_kv_pool_->page_size() : ctx_size,
+                max_active);
         {
             std::lock_guard<std::mutex> lk(cb_mu_);
             if (cb_pending_.size() >= max_pending) {
@@ -6775,7 +6701,22 @@ private:
         cb_cv_.notify_one();
 
         std::unique_lock<std::mutex> lk(req->mu);
-        req->cv.wait(lk, [&]() { return req->done; });
+        while (!req->cv.wait_for(lk, std::chrono::milliseconds(100),
+                                 [&]() { return req->done; })) {
+            if (!request_cancelled(req->options)) continue;
+            lk.unlock();
+            bool removed = false;
+            {
+                std::lock_guard<std::mutex> queue_lock(cb_mu_);
+                auto it = std::find(cb_pending_.begin(), cb_pending_.end(), req);
+                if (it != cb_pending_.end()) {
+                    cb_pending_.erase(it);
+                    removed = true;
+                }
+            }
+            if (removed) complete_continuous_request(req, {}, "request cancelled");
+            lk.lock();
+        }
         if (!req->error.empty()) throw std::runtime_error(req->error);
         return req->generated;
     }
@@ -6788,9 +6729,18 @@ private:
             std::lock_guard<std::mutex> lk(req->mu);
             req->generated = std::move(generated);
             req->error = std::move(error);
+            req->options.should_cancel = {};
             req->done = true;
         }
         req->cv.notify_one();
+    }
+
+    void complete_continuous_active(ContinuousBatchActive &active,
+                                    std::string generated,
+                                    std::string error = {}) {
+        active.executor.reset();
+        active.prefix_lease.reset();
+        complete_continuous_request(active.req, std::move(generated), std::move(error));
     }
 
     void release_continuous_request_budget(
@@ -7051,10 +7001,10 @@ private:
                 pending.pop_front();
             }
             for (auto &a : active) {
-                if (a.req) complete_continuous_request(a.req, {}, e.what());
+                if (a.req) complete_continuous_active(a, {}, e.what());
             }
             for (auto &a : prefilling) {
-                if (a.req) complete_continuous_request(a.req, {}, e.what());
+                if (a.req) complete_continuous_active(a, {}, e.what());
             }
             log(std::string("native continuous_batching: worker_failed reason=\"") +
                 e.what() + "\"");
@@ -7087,6 +7037,7 @@ private:
                 prompt, req->options, req->on_text, nullptr,
                 req->spec_mtp, req->trace_mtp, executor.get(),
                 /*manage_device_scope=*/false);
+            executor.reset();
             complete_continuous_request(req, std::move(generated));
         } catch (const std::exception &e) {
             complete_continuous_request(req, {}, e.what());
@@ -7839,7 +7790,8 @@ private:
             // (penalties unused), so greedy MTP stays byte-identical.
             ++a.seen_tokens[token];
             ++a.decoded;
-            if (a.req->on_text && !a.req->on_text(piece)) {
+            if (request_cancelled(a.req->options) ||
+                (a.req->on_text && !a.req->on_text(piece))) {
                 a.stream_cancelled = true;
                 return false;
             }
@@ -7852,6 +7804,7 @@ private:
                     run_continuous_mtp_request(req, ctx_size);
                     return;
                 }
+                try {
                 ContinuousBatchActive a;
                 initialize_continuous_active(a, req, ctx_size);
                 if (continuous_batching_trace_enabled()) {
@@ -7880,6 +7833,7 @@ private:
                     a.prefill_offset, req->prompt_tokens.size());
                 for (size_t offset = prefill_start;
                      offset < req->prompt_tokens.size();) {
+                    check_request_cancelled(req->options);
                     const uint32_t remaining = static_cast<uint32_t>(
                         req->prompt_tokens.size() - offset);
                     const uint32_t width = std::max<uint32_t>(
@@ -8040,6 +7994,9 @@ private:
                         log(policy_msg.str());
                     }
                 }
+                } catch (const std::exception &e) {
+                    complete_continuous_request(req, {}, e.what());
+                }
             };
 
         try {
@@ -8111,6 +8068,7 @@ private:
                 draft_rows.reserve(mtp_active.size());
                 for (size_t row = 0; row < mtp_active.size(); ++row) {
                     ContinuousBatchActive &a = mtp_active[row];
+                    if (a.req && request_cancelled(a.req->options)) a.stream_cancelled = true;
                     if (!a.req || a.stream_cancelled ||
                         a.decoded >= a.req->options.max_tokens ||
                         should_stop(a, a.next_token)) {
@@ -8821,7 +8779,7 @@ private:
             }
         } catch (const std::exception &e) {
             for (auto &a : mtp_active) {
-                if (a.req) complete_continuous_request(a.req, {}, e.what());
+                if (a.req) complete_continuous_active(a, {}, e.what());
             }
             for (const auto &req : reqs) {
                 if (req && !req->done) {
@@ -9107,7 +9065,13 @@ private:
             ContinuousBatchActive &a,
             const std::shared_ptr<ContinuousBatchRequest> &req,
             uint32_t ctx_size) {
+        check_request_cancelled(req->options);
         a.req = req;
+        a.prefix_lease = std::make_unique<PrefixEntryLease>();
+        a.prefix_lease->ids.reserve(2); // hit + one commit; no allocation after pinning
+        a.prefix_lease->release = [this](std::vector<uint64_t> &ids) {
+            prefix_cache_release(ids);
+        };
         a.executor = std::make_unique<QwenExecutor>(
             *model_, *weights_, *device_, ctx_size,
             cb_kv_pool_.get(), &cb_kv_cache_view_,
@@ -9117,6 +9081,15 @@ private:
         // not pay a per-request cudaHostAlloc of the whole --kvmem-cpu-gb tier.
         a.executor->set_host_tier_pool(cb_host_tier_pool_.get());
         a.executor->reset_state();
+        // Multimodal requests use synthetic input token ids plus exact M-RoPE
+        // positions.  Configure these before either cold prefill or warm-prefix
+        // seeding so the uncached suffix follows the same embedding/position
+        // path as a plain request.  The request owns any device-backed visual
+        // storage for the lifetime of this executor.
+        a.executor->set_input_embedding_overrides(
+            req->options.input_embedding_overrides,
+            req->prompt_tokens,
+            req->options.input_mrope_positions);
         // Per-request kvmem: each CB executor gets its own block store + window
         // when --kvmem is set. The reselect cadence is driven below at the
         // prefill->active transition (first register + reselect) and per decode
@@ -9138,15 +9111,21 @@ private:
             std::vector<int32_t> hit_mtp_pages;
             QwenExecutor::StateSnapshot hit_recur;
             uint32_t hit_len = 0;
+            const std::vector<detail::MultimodalTokenIdentity>
+                input_identities = input_embedding_cache_identities(
+                    req->options.input_embedding_overrides);
             const uint64_t hit_id = prefix_cache_lookup(
                 req->prompt_tokens, page_size, req->spec_mtp,
+                input_identities,
+                req->options.input_embedding_fingerprint,
                 hit_pages, hit_mtp_pages, hit_recur, hit_len);
             if (hit_id != 0 && hit_len > 0 && hit_len < prompt_len) {
                 try {
                     a.executor->seed_from_shared_prefix(
                         hit_pages, hit_mtp_pages, hit_recur, hit_len);
                     a.prefill_offset = hit_len;
-                    a.held_prefix_entries.push_back(hit_id);
+                    a.prefix_reused_tokens = hit_len;
+                    a.prefix_lease->ids.push_back(hit_id);
                     a.kv_state.update(a.executor->kv_state_snapshot());
                     if (prefix_cache_trace_enabled()) {
                         std::ostringstream m;
@@ -9162,9 +9141,8 @@ private:
                     // drop the refcount we took in lookup.
                     a.executor->reset_state();
                     a.prefill_offset = 0;
-                    ContinuousBatchActive tmp;
-                    tmp.held_prefix_entries.push_back(hit_id);
-                    prefix_cache_release(tmp);
+                    std::vector<uint64_t> failed_refs{hit_id};
+                    prefix_cache_release(failed_refs);
                     if (prefix_cache_trace_enabled()) {
                         log(std::string("prefix_cache hit-seed failed, cold "
                                         "fallback: ") + e.what());
@@ -9210,6 +9188,7 @@ private:
         if (prefilling.empty()) return;
         ContinuousBatchActive &a = prefilling.front();
         try {
+            check_request_cancelled(a.req->options);
             const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
             if (a.prefill_offset >= prompt.size() && !prompt.empty()) {
                 throw std::runtime_error("continuous prefill has no prompt tokens");
@@ -9284,7 +9263,7 @@ private:
                                                a.req->prompt_tokens,
                                                step);
                 }
-                complete_continuous_request(a.req, {});
+                complete_continuous_active(a, {});
                 prefilling.erase(prefilling.begin());
                 return;
             }
@@ -9299,7 +9278,7 @@ private:
             }
             prefilling.erase(prefilling.begin());
         } catch (const std::exception &e) {
-            complete_continuous_request(a.req, {}, e.what());
+            complete_continuous_active(a, {}, e.what());
             prefilling.erase(prefilling.begin());
         }
     }
@@ -9618,12 +9597,12 @@ private:
             if (out.prefill_index >= prefilling.size()) continue;
             ContinuousBatchActive &a = prefilling[out.prefill_index];
             if (!out.error.empty()) {
-                complete_continuous_request(a.req, {}, out.error);
+                complete_continuous_active(a, {}, out.error);
                 state[out.prefill_index] = kRemove;
                 continue;
             }
             if (!out.ok()) {
-                complete_continuous_request(a.req, {}, "prefill failed");
+                complete_continuous_active(a, {}, "prefill failed");
                 state[out.prefill_index] = kRemove;
                 continue;
             }
@@ -9662,7 +9641,7 @@ private:
                                                a.req->prompt_tokens,
                                                out.report);
                 }
-                complete_continuous_request(a.req, {});
+                complete_continuous_active(a, {});
                 state[out.prefill_index] = kRemove;
                 continue;
             }
@@ -9947,7 +9926,7 @@ private:
                     continue;
                 }
             } catch (const std::exception &e) {
-                complete_continuous_request(a.req, {}, e.what());
+                complete_continuous_active(a, {}, e.what());
                 a.req.reset();
             }
         }
@@ -9996,7 +9975,8 @@ private:
         a.req->generated += piece;
         ++a.seen_tokens[token];
         ++a.decoded;
-        if (a.req->on_text && !a.req->on_text(piece)) {
+        if (request_cancelled(a.req->options) ||
+                (a.req->on_text && !a.req->on_text(piece))) {
             a.stream_cancelled = true;
             return false;
         }
@@ -10082,8 +10062,6 @@ private:
         if (!kvmem_prefix_cache_enabled()) return {};
         if (!executor_ || !executor_->kvmem_enabled()) return {};
         if (!kvmem_warm_valid_ || kvmem_warm_log_.empty()) return {};
-        if (options.input_embedding_fingerprint !=
-            kvmem_warm_input_embedding_fingerprint_) return {};
         const uint32_t sel_budget = executor_->block_store()
             ? executor_->block_store()->select_budget_tokens() : 0;
         const bool qc_source_index_supported =
@@ -10110,8 +10088,17 @@ private:
         const size_t lim = std::min(kvmem_warm_log_.size(), prompt.size());
         size_t D = 0;
         while (D < lim && kvmem_warm_log_[D] == prompt[D]) ++D;
-        const uint32_t common_prefix = static_cast<uint32_t>(
+        const uint32_t token_common_prefix = static_cast<uint32_t>(
             std::min<size_t>(D, std::numeric_limits<uint32_t>::max()));
+        const std::vector<detail::MultimodalTokenIdentity>
+            current_embedding_identities = input_embedding_cache_identities(
+                options.input_embedding_overrides);
+        const uint32_t common_prefix = detail::multimodal_prefix_lcp(
+            prompt, token_common_prefix,
+            kvmem_warm_input_embedding_identities_,
+            current_embedding_identities,
+            kvmem_warm_input_embedding_fingerprint_,
+            options.input_embedding_fingerprint);
         // A stashed query is valid only for the exact same token coordinates,
         // and only while the complete query remains inside the new prompt's
         // exact LCP.  This is the extra authority needed to resume after Q:
@@ -10254,7 +10241,9 @@ private:
         if (kvmem_prefix_cache_trace_enabled() ||
             std::getenv("QW3_KVMEM_TRACE")) {
             std::ostringstream mmsg;
-            mmsg << "kvmem prefix-cache MISS (why): D=" << D
+            mmsg << "kvmem prefix-cache MISS (why): D=" << common_prefix
+                 << " token_D=" << D
+                 << " visual_D=" << common_prefix
                  << " ceiling=" << resume_ceiling
                  << " query_limited=" << (qc_resume_guard ? 1 : 0)
                  << " query_snapshot="
@@ -10414,6 +10403,9 @@ private:
             const std::vector<uint32_t> &prompt,
             uint32_t page_size,
             bool require_mtp,
+            const std::vector<detail::MultimodalTokenIdentity>
+                &input_identities,
+            uint64_t input_embedding_fingerprint,
             std::vector<int32_t> &out_pages,
             std::vector<int32_t> &out_mtp_pages,
             QwenExecutor::StateSnapshot &out_recur,
@@ -10425,8 +10417,21 @@ private:
         // longest aligned length strictly below prompt_len is the first probe.
         uint32_t probe = (prompt_len / page_size) * page_size;
         if (probe >= prompt_len) probe -= page_size;
+        std::vector<uint64_t> page_hashes(probe / page_size + 1);
+        uint64_t rolling_hash = 1469598103934665603ULL;
+        for (uint32_t i = 0; i < probe; ++i) {
+            uint32_t token = prompt[i];
+            for (int byte = 0; byte < 4; ++byte) {
+                rolling_hash ^= token & 0xffu;
+                rolling_hash *= 1099511628211ULL;
+                token >>= 8;
+            }
+            if ((i + 1) % page_size == 0) {
+                page_hashes[(i + 1) / page_size] = rolling_hash;
+            }
+        }
         for (; probe >= page_size; probe -= page_size) {
-            const uint64_t h = prefix_cache_hash(prompt.data(), probe);
+            const uint64_t h = page_hashes[probe / page_size];
             auto it = prefix_cache_.find(h);
             if (it == prefix_cache_.end()) continue;
             for (PrefixCacheEntry &e : it->second) {
@@ -10435,6 +10440,16 @@ private:
                 if (!std::equal(e.tokens.begin(), e.tokens.end(),
                                 prompt.begin())) {
                     continue;  // hash collision
+                }
+                // Synthetic image token ids describe only row/layout.  Pixel
+                // content and M-RoPE position must also match before reusing
+                // the language-model KV produced for a visual prefix.
+                if (detail::multimodal_prefix_lcp(
+                        prompt, probe,
+                        e.input_embedding_identities, input_identities,
+                        e.input_embedding_fingerprint,
+                        input_embedding_fingerprint) != probe) {
+                    continue;
                 }
                 const uint32_t prefix_pages = probe / page_size;
                 if (require_mtp &&
@@ -10445,14 +10460,31 @@ private:
                     continue;
                 }
                 // Hit. Pin already held by the entry; bump refcount + LRU.
-                ++e.refcount;
-                e.last_used_seq = ++prefix_cache_seq_;
                 out_pages = e.kv_pages;
                 out_mtp_pages = e.mtp_kv_pages;
                 out_recur = clone_state_snapshot(e.recur);
+                ++e.refcount;
+                e.last_used_seq = ++prefix_cache_seq_;
                 out_aligned_len = e.aligned_len;
                 return e.id;
             }
+        }
+        if (prefix_cache_trace_enabled()) {
+            uint32_t best_lcp = 0;
+            for (const auto &bucket : prefix_cache_) {
+                for (const auto &entry : bucket.second) {
+                    const uint32_t limit = std::min<uint32_t>(prompt_len, entry.tokens.size());
+                    uint32_t lcp = 0;
+                    while (lcp < limit && prompt[lcp] == entry.tokens[lcp]) ++lcp;
+                    lcp = detail::multimodal_prefix_lcp(
+                        prompt, lcp, entry.input_embedding_identities, input_identities,
+                        entry.input_embedding_fingerprint, input_embedding_fingerprint);
+                    best_lcp = std::max(best_lcp, lcp);
+                }
+            }
+            log("prefix_cache miss prompt_tokens=" + std::to_string(prompt_len) +
+                " entries=" + std::to_string(prefix_cache_entry_count_) +
+                " longest_cached_lcp=" + std::to_string(best_lcp));
         }
         return 0;
     }
@@ -10528,6 +10560,12 @@ private:
         if (page_size == 0 || (aligned_len % page_size) != 0) return;
         const uint32_t prefix_pages = aligned_len / page_size;
         const bool include_mtp = a.req && a.req->spec_mtp;
+        const std::vector<detail::MultimodalTokenIdentity> input_identities =
+            a.req ? input_embedding_cache_identities(
+                        a.req->options.input_embedding_overrides)
+                  : std::vector<detail::MultimodalTokenIdentity>{};
+        const uint64_t input_fingerprint =
+            a.req ? a.req->options.input_embedding_fingerprint : 0;
 
         // Don't duplicate an entry that already covers this exact prefix.
         const std::vector<uint32_t> &prompt = a.req->prompt_tokens;
@@ -10541,6 +10579,11 @@ private:
                         e.tokens.size() == aligned_len &&
                         std::equal(e.tokens.begin(), e.tokens.end(),
                                    prompt.begin()) &&
+                        detail::multimodal_prefix_lcp(
+                            prompt, aligned_len,
+                            e.input_embedding_identities, input_identities,
+                            e.input_embedding_fingerprint,
+                            input_fingerprint) == aligned_len &&
                         (!include_mtp ||
                          (e.mtp_kv_pages.size() == prefix_pages &&
                           e.recur.mtp_kv_logical_pages == prefix_pages &&
@@ -10548,7 +10591,7 @@ private:
                           e.recur.mtp_prefix_h))) {
                         ++e.refcount;  // creator holds it too
                         e.last_used_seq = ++prefix_cache_seq_;
-                        a.held_prefix_entries.push_back(e.id);
+                        a.prefix_lease->ids.push_back(e.id);
                         return;
                     }
                 }
@@ -10559,6 +10602,8 @@ private:
         entry.aligned_len = aligned_len;
         entry.tokens.assign(prompt.begin(),
                             prompt.begin() + static_cast<std::ptrdiff_t>(aligned_len));
+        entry.input_embedding_fingerprint = input_fingerprint;
+        entry.input_embedding_identities = input_identities;
         // Capture recurrent+conv state at exactly aligned_len. The executor's
         // position_ is aligned_len here (caller invokes at the boundary).
         a.executor->capture_state(entry.recur);
@@ -10580,9 +10625,8 @@ private:
             entry.id = prefix_cache_next_id_++;
             entry.refcount = 1;  // creator holds it until finish
             entry.last_used_seq = ++prefix_cache_seq_;
-            prefix_cache_pinned_pages_ += prefix_pages;
             ++prefix_cache_entry_count_;
-            a.held_prefix_entries.push_back(entry.id);
+            a.prefix_lease->ids.push_back(entry.id);
             eid = entry.id;
             const uint32_t alen = entry.aligned_len;
             const size_t mtp_page_count = entry.mtp_kv_pages.size();
@@ -10594,7 +10638,7 @@ private:
                   << " aligned_len=" << alen
                   << " pages=" << prefix_pages
                   << " mtp_pages=" << mtp_page_count
-                  << " pinned_pages=" << prefix_cache_pinned_pages_
+                  << " pinned_pages=" << (cb_kv_pool_ ? cb_kv_pool_->pinned_pages() : 0)
                   << " entries=" << prefix_cache_entry_count_;
                 log(m.str());
             }
@@ -10617,7 +10661,7 @@ private:
             uint32_t entries = 0;
             {
                 std::lock_guard<std::mutex> lk(prefix_cache_mu_);
-                pinned = prefix_cache_pinned_pages_;
+                pinned = (cb_kv_pool_ ? cb_kv_pool_->pinned_pages() : 0);
                 entries = prefix_cache_entry_count_;
             }
             const bool pages_ok = page_budget == 0 || pinned <= page_budget;
@@ -10630,11 +10674,11 @@ private:
 
     // Drop refcounts this request holds. Pinned pages are NOT freed here; they
     // stay until the entry is evicted at refcount 0.
-    void prefix_cache_release(ContinuousBatchActive &a) {
-        if (a.held_prefix_entries.empty()) return;
+    void prefix_cache_release(std::vector<uint64_t> &ids) {
+        if (ids.empty()) return;
         {
             std::lock_guard<std::mutex> lk(prefix_cache_mu_);
-            for (uint64_t eid : a.held_prefix_entries) {
+            for (uint64_t eid : ids) {
                 for (auto &kv : prefix_cache_) {
                     for (PrefixCacheEntry &e : kv.second) {
                         if (e.id == eid && e.refcount > 0) {
@@ -10644,7 +10688,7 @@ private:
                     }
                 }
             }
-            a.held_prefix_entries.clear();
+            ids.clear();
         }
         prefix_cache_enforce_budgets();
     }
@@ -10695,16 +10739,13 @@ private:
             if (prefix_cache_entry_count_ > 0) {
                 --prefix_cache_entry_count_;
             }
-            if (prefix_cache_pinned_pages_ >= pages) {
-                prefix_cache_pinned_pages_ -= pages;
-            }
             if (prefix_cache_trace_enabled()) {
                 std::ostringstream m;
                 m << "prefix_cache evict id=" << victim.id
                   << " aligned_len=" << victim.aligned_len
                   << " pages=" << pages
                   << " mtp_pages=" << victim.mtp_kv_pages.size()
-                  << " pinned_pages=" << prefix_cache_pinned_pages_
+                  << " pinned_pages=" << (cb_kv_pool_ ? cb_kv_pool_->pinned_pages() : 0)
                   << " entries=" << prefix_cache_entry_count_;
                 log(m.str());
             }
@@ -10729,16 +10770,13 @@ private:
             }
         }
         prefix_cache_.clear();
-        prefix_cache_pinned_pages_ = 0;
         prefix_cache_entry_count_ = 0;
     }
 
     void finish_continuous_active(ContinuousBatchActive &a) {
-        // Release any prefix-cache entries this request held (adopted or
-        // committed) before tearing down the executor: dropping the refcount
-        // makes the entry evictable, and the executor dtor frees only its
-        // private (owned) suffix pages — never the pinned shared prefix.
-        prefix_cache_release(a);
+        // Refresh completion telemetry; the MTP lane used to leave kv_state
+        // at its initial (zero on a miss) snapshot throughout the request.
+        if (a.executor) a.kv_state.update(a.executor->kv_state_snapshot());
         const double decode_s = std::max(wall_seconds() - a.decode_start, 1e-9);
         std::ostringstream msg;
         msg << "native continuous_batch:"
@@ -10755,7 +10793,9 @@ private:
             msg << " (" << std::fixed << std::setprecision(2)
                 << (a.decoded / decode_s) << " tok/s)";
         }
-        msg << " prefill_ops=" << a.prefill_ops
+        msg << " reused_tokens=" << a.prefix_reused_tokens
+            << " prefill_tokens=" << (a.prefill_offset - a.prefix_reused_tokens)
+            << " prefill_ops=" << a.prefill_ops
             << " decode_ops=" << a.decode_ops
             << " kv_seq_len=" << a.kv_state.seq_len
             << " kv_page_size=" << a.kv_state.page_size
@@ -10774,7 +10814,9 @@ private:
             QwenExecutor::kvmem_timing_emit_delta(tag.c_str(),
                                                   a.kvmem_timing_baseline);
         }
-        complete_continuous_request(a.req, std::move(a.req->generated));
+        // Release physical pages and shared references before acknowledging
+        // completion; a retry must not race the previous executor's teardown.
+        complete_continuous_active(a, std::move(a.req->generated));
     }
 
     // ---- Thinking-token budget helpers ------------------------------------
@@ -11973,6 +12015,9 @@ private:
                 kvmem_warm_log_ = prompt_tokens;
                 kvmem_warm_input_embedding_fingerprint_ =
                     options.input_embedding_fingerprint;
+                kvmem_warm_input_embedding_identities_ =
+                    input_embedding_cache_identities(
+                        options.input_embedding_overrides);
                 const size_t pos = executor_->position();
                 if (pos <= kvmem_warm_log_.size()) {
                     kvmem_warm_log_.resize(pos);
@@ -12198,6 +12243,9 @@ private:
             kvmem_warm_log_ = prompt_tokens;
             kvmem_warm_input_embedding_fingerprint_ =
                 options.input_embedding_fingerprint;
+            kvmem_warm_input_embedding_identities_ =
+                input_embedding_cache_identities(
+                    options.input_embedding_overrides);
             kvmem_warm_log_.insert(kvmem_warm_log_.end(),
                                    gen_tokens.begin(), gen_tokens.end());
             const size_t pos = executor_->position();
@@ -16030,6 +16078,9 @@ private:
                 kvmem_warm_log_ = prompt_tokens;
                 kvmem_warm_input_embedding_fingerprint_ =
                     options.input_embedding_fingerprint;
+                kvmem_warm_input_embedding_identities_ =
+                    input_embedding_cache_identities(
+                        options.input_embedding_overrides);
                 const size_t pos = executor_->position();
                 if (pos <= kvmem_warm_log_.size()) {
                     kvmem_warm_log_.resize(pos);
@@ -17260,6 +17311,9 @@ private:
             kvmem_warm_log_ = prompt_tokens;
             kvmem_warm_input_embedding_fingerprint_ =
                 options.input_embedding_fingerprint;
+            kvmem_warm_input_embedding_identities_ =
+                input_embedding_cache_identities(
+                    options.input_embedding_overrides);
             kvmem_warm_log_.insert(kvmem_warm_log_.end(),
                                    gen_tokens.begin(), gen_tokens.end());
             const size_t pos = executor_->position();
@@ -17872,6 +17926,9 @@ private:
     struct PrefixCacheEntry {
         uint64_t id = 0;
         std::vector<uint32_t> tokens;     // exact prefix tokens (collision-safe)
+        uint64_t input_embedding_fingerprint = 0;
+        std::vector<detail::MultimodalTokenIdentity>
+            input_embedding_identities;  // identity only; never pins vision storage
         uint32_t aligned_len = 0;         // == tokens.size(), multiple of page_size
         std::vector<int32_t> kv_pages;    // pinned physical pages, logical 0..n
         std::vector<int32_t> mtp_kv_pages;// matching pinned MTP draft pages
@@ -17883,7 +17940,6 @@ private:
     std::mutex prefix_cache_mu_;
     uint64_t prefix_cache_seq_ = 0;
     uint64_t prefix_cache_next_id_ = 1;
-    uint32_t prefix_cache_pinned_pages_ = 0;
     uint32_t prefix_cache_entry_count_ = 0;
     bool prefix_cache_evict_cb_installed_ = false;
 
@@ -17908,6 +17964,8 @@ private:
     // block store to C (kvmem_truncate_to), and prefill [C,end).
     std::vector<uint32_t> kvmem_warm_log_;
     uint64_t kvmem_warm_input_embedding_fingerprint_ = 0;
+    std::vector<detail::MultimodalTokenIdentity>
+        kvmem_warm_input_embedding_identities_;
     QwenExecutor::StateSnapshot kvmem_warm_ckpt_end_;
     QwenExecutor::StateSnapshot kvmem_warm_ckpt_prompt_;
     uint32_t kvmem_warm_prompt_pos_ = 0;   // P (position of ckpt_prompt_)

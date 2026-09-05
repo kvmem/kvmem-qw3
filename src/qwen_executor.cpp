@@ -10764,6 +10764,15 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
         return false;
     };
     if (tokens == 0) return true;
+    // A turn-end warm checkpoint is durable even when query-conditioned index
+    // capture is disabled. Publish the partial decode block before any of the
+    // index-specific early returns below; otherwise M may advertise decoded KV
+    // positions whose immutable raw-K validity bits are still only staged in
+    // kvmem_raw_capture_dev_. The next prefix-cache resume can then select that
+    // boundary block and fail on its first generated token as "uncaptured".
+    // This runs once at the agent-step boundary, not for speculative snapshots.
+    kvmem_flush_raw_k_decode();
+    kvmem_sync_raw_k_persistence();
     if (tokens <= kvmem_qc_captured_tokens_) {
         return kvmem_content_index_covers(tokens);
     }
@@ -10789,13 +10798,6 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     // raw K that a guided reselection is allowed to have evicted.  The ordinary
     // incremental capture path has exact partial-mean merge semantics, so start
     // at the exact captured-token cursor instead.
-    // Decode publishes full block boundaries eagerly, but a request can end at
-    // any token.  Flush the partial tail before consulting the immutable raw-K
-    // validity bitmap; merely waiting for already-submitted persistence writes
-    // leaves that staging tail invisible and incorrectly makes a current-
-    // generation turn-end checkpoint non-resumable.
-    kvmem_flush_raw_k_decode();
-    kvmem_sync_raw_k_persistence();
     const uint32_t start = kvmem_qc_captured_tokens_;
     if (start >= tokens || tokens > kvmem_raw_k_valid_tokens_.size()) {
         return unavailable("raw-range");
@@ -10838,6 +10840,7 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     }
 
     const uint32_t saved_total_blocks = kvmem_qc_total_blocks_;
+    const uint32_t saved_prompt_tokens = kvmem_qc_prompt_tokens_;
     const uint32_t saved_captured_tokens = kvmem_qc_captured_tokens_;
     const uint32_t saved_captured_blocks = kvmem_qc_captured_blocks_;
     const bool saved_multi_ready = g_kbar_multi_ready_;
@@ -10845,7 +10848,15 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     const uint32_t saved_multi_blocks = g_kbar_multi_blocks_;
     const uint32_t saved_indexed_blocks = g_indexed_blocks_;
     try {
+        // The online query capture intentionally indexes only the sealed
+        // history before the current query.  At turn end, however, that query
+        // and the accepted completion become history for the next request.
+        // Temporarily extend the capture boundary to the checkpoint target;
+        // otherwise kvmem_capture_kbar_multi() trims at the stale query
+        // boundary and this function invariably reports that the raw-K tail
+        // did not reach `tokens`.
         kvmem_qc_total_blocks_ = target_blocks;
+        kvmem_qc_prompt_tokens_ = tokens;
         kvmem_qc_captured_tokens_ = start;
         kvmem_qc_captured_blocks_ = (start + bt - 1) / bt;
         g_kbar_multi_ready_ = false;
@@ -10889,6 +10900,7 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     } catch (...) {
         kvmem_index_rebuild_source_ = nullptr;
         kvmem_qc_total_blocks_ = saved_total_blocks;
+        kvmem_qc_prompt_tokens_ = saved_prompt_tokens;
         kvmem_qc_captured_tokens_ = saved_captured_tokens;
         kvmem_qc_captured_blocks_ = saved_captured_blocks;
         g_kbar_multi_ready_ = saved_multi_ready;

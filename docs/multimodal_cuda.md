@@ -33,6 +33,12 @@ M-RoPE coordinates, and are preserved by local-cache and persistent-session
 checkpoints. A request is rejected when its mandatory visual span alone exceeds
 the configured KVMem active budget.
 
+Serialized `--kvmem-prefix-cache` reuse is visual-identity aware. It stores only
+lightweight source-row identities with the warm checkpoint and validates every
+visual row inside the proposed reusable prefix. Appending a new image after the
+checkpoint does not invalidate older language-model KV, while changing a prior
+image forces a miss before its first projected token.
+
 For numerical validation against the Transformers visual tower:
 
 ```bash

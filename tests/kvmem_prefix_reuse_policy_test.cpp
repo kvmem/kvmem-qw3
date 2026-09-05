@@ -1,4 +1,5 @@
 #include "kvmem_prefix_reuse_policy.hpp"
+#include "multimodal_prefix_cache.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -7,6 +8,7 @@
 namespace {
 
 using qw3::detail::KvmemPrefixReuseSafety;
+using qw3::detail::MultimodalTokenIdentity;
 using qw3::detail::kvmem_branch_safe_prompt_checkpoint_split;
 using qw3::detail::kvmem_checkpoint_selection_compatible;
 using qw3::detail::kvmem_prefix_reuse_safety;
@@ -19,6 +21,8 @@ using qw3::detail::kvmem_warm_query_snapshot_reusable;
 using qw3::detail::kvmem_warm_query_snapshot_coordinates_match;
 using qw3::detail::kvmem_warm_query_snapshot_capture_ready;
 using qw3::detail::kvmem_warm_query_snapshot_source_end;
+using qw3::detail::multimodal_prefix_lcp;
+using qw3::detail::multimodal_row_cache_identity;
 
 [[noreturn]] void fail(const std::string &message) {
     std::cerr << "kvmem_prefix_reuse_policy_test: " << message << "\n";
@@ -251,6 +255,52 @@ void test_middecode_selection_invalidates_old_prompt_checkpoint() {
             "semantic query replay accepted an unaligned M boundary");
 }
 
+MultimodalTokenIdentity visual_identity(uint32_t row, uint64_t image,
+                                        uint32_t position) {
+    return MultimodalTokenIdentity{
+        0x80000000u | (row + 1), 151655,
+        {position, position, position},
+        multimodal_row_cache_identity(image, row)};
+}
+
+void test_multimodal_prefix_identity() {
+    const std::vector<uint32_t> tokens = {
+        10, 0x80000001u, 0x80000002u, 11,
+        0x80000003u, 0x80000004u, 12};
+    const std::vector<MultimodalTokenIdentity> warm = {
+        visual_identity(0, 101, 1), visual_identity(1, 101, 2),
+        visual_identity(2, 202, 4), visual_identity(3, 202, 5)};
+
+    // Appending a new image changes the whole-request fingerprint but not the
+    // identities of visual rows already present in the reusable prefix.
+    std::vector<MultimodalTokenIdentity> appended = warm;
+    appended.push_back(visual_identity(4, 303, 7));
+    require(multimodal_prefix_lcp(tokens, 7, warm, appended, 1001, 1002) == 7,
+            "appended image invalidated an unchanged visual prefix");
+
+    // A changed source image with the same synthetic token layout must shorten
+    // the LCP at the first affected visual row.
+    std::vector<MultimodalTokenIdentity> changed = warm;
+    changed[2] = visual_identity(2, 999, 4);
+    require(multimodal_prefix_lcp(tokens, 7, warm, changed, 1001, 1003) == 4,
+            "changed image payload reused stale language-model KV");
+
+    // M-RoPE coordinates are part of the cache identity even when pixels match.
+    std::vector<MultimodalTokenIdentity> moved = warm;
+    moved[1].position[2] += 1;
+    require(multimodal_prefix_lcp(tokens, 7, warm, moved, 1001, 1001) == 2,
+            "changed visual position reused stale language-model KV");
+
+    // Legacy callers without row identities keep the prior whole-fingerprint
+    // behavior, while text before the first image remains reusable.
+    std::vector<MultimodalTokenIdentity> legacy = warm;
+    for (auto &item : legacy) item.cache_identity = 0;
+    require(multimodal_prefix_lcp(tokens, 7, legacy, legacy, 7, 8) == 1,
+            "legacy multimodal caller bypassed whole-request fingerprint");
+    require(multimodal_prefix_lcp(tokens, 1, legacy, legacy, 7, 8) == 1,
+            "image change invalidated an earlier text-only prefix");
+}
+
 }  // namespace
 
 int main() {
@@ -261,6 +311,7 @@ int main() {
     test_cold_and_dense_controls();
     test_query_prepare_and_per_token_guards();
     test_middecode_selection_invalidates_old_prompt_checkpoint();
+    test_multimodal_prefix_identity();
     std::cout << "kvmem_prefix_reuse_policy_test: PASS\n";
     return 0;
 }
