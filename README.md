@@ -15,6 +15,8 @@ stages colder blocks through host RAM and optional NVMe, and selects relevant
 blocks for each new query. The goal is to reduce repeated full-history prefill
 and text compaction in long-lived agent sessions.
 
+Paper link: <https://arxiv.org/abs/2609.04852>
+
 ## Why QW3?
 
 - **Native CUDA runtime:** QW3 owns the loader, tokenizer, executor, CUDA
