@@ -59,6 +59,12 @@ task membership and completed results are unchanged. Existing agent scripts, dep
 preflight and verifier images are reused. Infrastructure errors pause the
 queue and task failures remain in the data.
 
+Formal MTP=4 refers to main generation. The frozen DeepSWE launcher does not
+enable the independent `QW3_KVMEM_GUIDED_MTP` flag; full guided query generation
+and replay remain enabled. Separate short qualification runs explicitly
+exercise guided MTP on both smaller models. `guided_mtp_configuration_audit.json`
+records the observed main/guided MTP counters; do not pool these two protocols.
+
 Run `python3 scripts/run_qwen35_deepswe_pilot.py --prepare-only` to audit the
 manifest, and `--run` to start/resume. `pilot_plan.json`, per-arm manifests and
 `pilot_status.json` record the frozen artifacts and progress. OSWorld was
