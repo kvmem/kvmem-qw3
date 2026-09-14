@@ -69,7 +69,15 @@ def report(root):
         assessment = batch.paired_assessment(q, k, selection_budget=131072,
             expected_ordinary_context=262144, expected_kvmem_context=3145728,
             expected_effective_window=242144)
-        pairs.append(dict(model=key[0], task_id=key[1], pair_complete=bool(q and k), **assessment))
+        compactions = (q.get('claude') or {}).get('compactions', 0)
+        reselections = (k.get('server') or {}).get('kvmem_semantic_reselections', 0)
+        pairs.append(dict(model=key[0], task_id=key[1], pair_complete=bool(q and k),
+            ordinary_compactions=compactions, kvmem_semantic_reselections=reselections,
+            maintenance_events_observed=bool(compactions or reselections),
+            # Matching reward signatures does not match the generated work.
+            # Preserve the legacy assessment, but never interpret its
+            # "claimable" label as a causal engine/maintenance speedup.
+            maintenance_speedup_isolated=False, **assessment))
     # Retain quality-divergent pairs in the main comparison. Quality-equivalence
     # is a separate diagnostic; selecting on equal scores would bias accuracy.
     valid = {(p['model'], p['task_id']) for p in pairs if p['pair_complete']
@@ -107,6 +115,8 @@ def report(root):
             'Only completed, naturally terminated, protocol-valid pairs enter paired averages.',
             'Quality-divergent pairs remain included; they are separately flagged.',
             'Agent/request wall-time ratios compare complete trajectories, not matched engine inputs.',
+            'The legacy long_context_pressure_observed field can be true below the actual refresh threshold; maintenance_events_observed requires a logged compaction or semantic refresh.',
+            'Equal reward signatures, including equal failures, do not isolate maintenance-induced speedup.',
             'Pure decode throughput excludes prefill, retrieval, compaction and tools.',
             'All completed arm results, including invalid ones, remain in arms.csv for audit.'])
     (out / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
