@@ -137,8 +137,9 @@ retained the full open fragment and used the original query; selection took
 generated a 123-token query in 1,202.259 ms, selected 4,096 of 8,051 blocks
 in 142.447 ms including KV organization, and replayed 991 tokens from aligned
 checkpoint P=256640 in 201.204 ms. Its server visible-content TTFT was
-2,012.625 ms. Both requests completed and execution continued; task accuracy
-still requires the final verifier result. `first_real_refreshes_9B.json`
+2,012.625 ms. Both requests completed and execution continued; the final
+verifier later reported 0/130 feature tests and 566/566 existing tests passed.
+`first_real_refreshes_9B.json`
 preserves the source lines and timing boundaries.
 
 The pilot report separates generated-query refreshes, original-query
@@ -185,3 +186,13 @@ if the queued position ablation does not explain the discrepancy.
 `vision_error_locality.json` records source hashes and row statistics;
 `vision_block10_input_variance_probe.json` records the independent FP64
 normalization probe. Neither diagnostic changes or waives the visual gate.
+
+`vision_same_block_input_audit.py` prepares a further reference-only diagnostic:
+each of the 24 reference blocks receives the exact saved native BF16 input to
+that block, independently of the previous reference block's output. Comparing
+native/reference local errors against math/flash reference spread can separate
+local operator discrepancies from accumulated propagation. Input shapes and
+source hashes passed CPU validation, including equality of the saved native
+final output with the frozen parity output. GPU execution remains pending;
+these deliberately disconnected block outputs must not be presented as a
+full encoder result or used for agent inference or performance measurements.
