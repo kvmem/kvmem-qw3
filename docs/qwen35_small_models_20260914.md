@@ -207,3 +207,17 @@ real agent throughput does not follow parameter count alone. These are still
 different generated trajectories, not an isolated model-size or MTP-speedup
 experiment. `mtp_acceptance_matched_tasks.json` preserves the 12 source rows
 and server-log hashes; phase timers do not identify exclusive CPU/GPU costs.
+
+A CPU-only FP64 sensitivity probe now reproduces most of the observed block-10
+amplification from the two saved block-9 inputs. Every chosen query attends to
+all 8,160 rows; both inputs use identical FP64 equations and checkpoint values.
+For row 3220 the input difference has L2 norm 1.002, remains 0.982 after the
+attention residual, and becomes 26.913 after the MLP residual. The observed
+native-versus-reference BF16 block output difference is 27.374, with direction
+cosine 0.9999986 relative to the FP64 propagated difference. Across all six
+selected rows, direction cosine is at least 0.999825 and the relative residual
+between observed and propagated differences is 0.44%--4.29%. This localizes the
+large block-10 amplification mainly to the MLP transformation of already
+different inputs. It does not locate the first source of rounding differences,
+prove full-encoder correctness, or waive the failed visual gate. Raw stage
+arrays and checkpoint tensor hashes are in `vision_block10_fp64_sensitivity/`.
