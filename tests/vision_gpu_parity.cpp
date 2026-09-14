@@ -372,6 +372,19 @@ int main(int argc, char **argv) try {
         norm_gpu += static_cast<double>(actual) * actual;
     }
     const double cosine = dot / std::sqrt(norm_cpu * norm_gpu);
+    // Preserve complete embeddings for independent reference-backend audits.
+    // This diagnostic does not change the calculation or the pass threshold.
+    if (const char *directory = std::getenv("QW3_VISION_PARITY_DUMP_DIR")) {
+        std::filesystem::create_directories(directory);
+        const auto path = std::filesystem::path(directory);
+        std::ofstream native(path / "native.bf16", std::ios::binary);
+        native.write(reinterpret_cast<const char *>(gpu_bf16.data()),
+                     static_cast<std::streamsize>(count * sizeof(uint16_t)));
+        std::ofstream reference(path / "reference.f32", std::ios::binary);
+        reference.write(reinterpret_cast<const char *>(cpu_result.embeddings.data()),
+                        static_cast<std::streamsize>(count * sizeof(float)));
+        if (!native || !reference) throw std::runtime_error("vision parity dump failed");
+    }
     std::cout << "rows=" << storage->rows()
               << " dim=" << storage->dim()
               << " weights_mib=" << (gpu.weight_bytes() / 1048576.0)
