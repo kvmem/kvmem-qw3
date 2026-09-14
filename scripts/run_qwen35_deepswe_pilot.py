@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,20 @@ batch.service_readiness_markers = readiness
 def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     batch.atomic_json(path, value)
+
+
+def wait_gpu_idle(timeout=60.0):
+    """Allow driver accounting to settle after server exit, keeping GPU exclusivity."""
+    deadline = time.monotonic() + timeout
+    while True:
+        active = subprocess.check_output(
+            ['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'],
+            text=True).strip()
+        if not active:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f'GPU is still occupied after {timeout:g}s: {active}')
+        time.sleep(0.5)
 
 
 def prepare():
@@ -80,15 +95,15 @@ def prepare():
                     prefix_cache=True)
                 manifest['sampling_reference']['profile'] = 'copied_from_existing_27b_deepswe'
                 manifest['execution'].update(agent_container_memory='16g',
-                    order='task-major; alternate model and policy order by task index', concurrency=1)
+                    order='9B first, then 4B; alternate policy order by task index', concurrency=1)
                 manifest['weight_provenance'] = dict(base=str(model).replace('-with-MTP.gguf', '.gguf.provenance.json'),
                     augmentation=str(model) + '.augmentation.json', base_q8_tensors_unchanged=True)
                 manifest['precision'] = dict(weights='Q8_0', kv='FP8', mtp_chain=4)
                 save(manifest_path, manifest)
             batch.rebuild_and_lock(root, manifest, external_server_artifacts=identities[size])
     jobs = []
-    for index, task in enumerate(tasks):
-        for size in (('4B', '9B') if index % 2 == 0 else ('9B', '4B')):
+    for size in ('9B', '4B'):
+        for index, task in enumerate(tasks):
             policies = ('qw3', 'kvmem') if (index + (size == '9B')) % 2 == 0 else ('kvmem', 'qw3')
             for policy in policies:
                 jobs.append(dict(task_id=task['task_id'], model=size, policy=policy,
@@ -142,9 +157,9 @@ def run(plan):
                 if ordinary.abnormal_reasons(metrics):
                     raise RuntimeError(f'completed arm needs audit before reuse: {job}')
                 continue
-            active = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip()
-            if active:
-                raise RuntimeError(f'GPU is already occupied: {active}')
+            state.update(status='waiting_for_gpu', job=job, completed=len(summarize(plan)), updated_at=batch.utc_now())
+            save(HERE / 'pilot_status.json', state)
+            wait_gpu_idle()
             batch.MODEL = Path(manifest['model'])
             batch.QW3 = BINARY
             batch.publish_supervisor_owner(root)
