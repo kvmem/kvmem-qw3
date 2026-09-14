@@ -171,3 +171,17 @@ fallback inside decode. The completed subset, source metric hashes, MTP
 counters and validated per-request timings are in `9B_completed/` (3,124
 request rows). The remaining 4B pilot and visual qualification continue
 separately; completing the 9B subset does not complete the overall goal.
+
+A CPU-only analysis of saved BF16 visual tensors localized the 4B divergence:
+the 20 largest-error rows account for 80.3% of squared error after block 10
+and 91.4% after block 11 (8,160 rows total). The six largest-error block-10
+rows have bitwise-identical initial patch/position embeddings between the
+two encoders. Their block-9 output variances are 0.105--0.184, in roughly
+the top 2% of rows and far above the LayerNorm epsilon of 1e-6. Thus near-zero
+input variance does not explain this particular amplification. This does
+not exclude an indirect effect of earlier position-rounding differences
+through attention. It motivates separating attention and MLP contributions
+if the queued position ablation does not explain the discrepancy.
+`vision_error_locality.json` records source hashes and row statistics;
+`vision_block10_input_variance_probe.json` records the independent FP64
+normalization probe. Neither diagnostic changes or waives the visual gate.
