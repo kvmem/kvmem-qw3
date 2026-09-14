@@ -248,3 +248,17 @@ and summary generation; neither its avoidability nor a pure summary-decode
 interpretation follows from the log alone. The agent continued normally.
 `first_4b_native_compaction_breakdown.json` records the client/server match and
 hashes of fixed log prefixes, so later log appends do not invalidate sources.
+
+Run `python3 scripts/report_qwen35_maintenance_events.py` after refreshing the
+main pilot report to export `report/maintenance_events.{json,csv}`. It joins
+completed serial KVMem requests to their source log lines and preserves
+before-decode query generation, selection, replay and ordinary prefill as
+separate fields. Mid-decode timers are taken once from the cumulative final
+request summary and remain included in engine decode time. Selection event
+wall time overlaps the accounting fields and must not be added to them.
+Source hashes and timing definitions accompany the export. The initial eight
+maintenance requests matched the existing request-latency export exactly;
+the two 4B Wasmi events also matched their independently recorded breakdowns.
+Its fallback event correctly excludes the separate MTP bridge log from the
+query count. These measurements do not establish task success or a causal
+maintenance speedup.
