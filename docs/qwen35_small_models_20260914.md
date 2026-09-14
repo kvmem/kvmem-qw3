@@ -50,8 +50,12 @@ CPU backing cap 110 GiB, guided query limit 4096, thinking cap 28672,
 temperature 1.0/top-p 0.95/top-k 20. Mean-K index placement remains GPU,
 as in that DeepSWE reference. Ordinary context and native auto-compaction
 window are 262144. NVMe and GC are not enabled. The fixed first eight tasks,
-seed 1000, two models and two policies give 32 trials; policy/model order is
-counterbalanced by task index. Existing agent scripts, dependency/network
+seed 1000, two models and two policies give 32 trials. After the first 4B pair,
+the user requested 9B first: all sixteen 9B arms now precede the remaining 4B
+arms, retaining the original within-model counterbalanced policy order.
+`pilot_plan.json` records this schedule revision and the original plan/source
+are archived under `controller_revision_9b_first/`. Model binaries, parameters,
+task membership and completed results are unchanged. Existing agent scripts, dependency/network
 preflight and verifier images are reused. Infrastructure errors pause the
 queue and task failures remain in the data.
 
@@ -60,3 +64,23 @@ manifest, and `--run` to start/resume. `pilot_plan.json`, per-arm manifests and
 `pilot_status.json` record the frozen artifacts and progress. OSWorld was
 paused after 060 completed; all 50 completed arm-result hashes are recorded
 in `pause.json` and must remain unchanged when resuming.
+
+The first completed 4B pair (`superjson-error-stack-serialization`) had reward
+0 in both arms: 0/80 feature tests and 116/116 existing tests passed. Both
+agents and verifiers exited normally; retain these quality failures. Weighted
+decode throughput was 128.74 token/s for ordinary qw3 and 125.53 token/s for
+KVMem, over different trajectories (82,586 vs 101,100 decoded tokens). KVMem
+performed one real guided refresh: 919.6 ms query generation, 141.5 ms
+selection/KV organization, 301.5 ms replay and 2.027 s visible-content TTFT.
+No aggregate ability or speedup claim is supported by this one pair.
+
+An additional visual diagnostic (`vision_backend_audit/comparison.json`)
+compared native BF16 output and PyTorch math/Flash BF16 output against a
+PyTorch FP32 math reference, without changing the original pass threshold.
+For 4B, relative RMS error against FP32 was 8.57% native, 9.23% PyTorch math
+BF16 and 8.76% PyTorch Flash BF16; for 9B, 9.35%, 9.27% and 9.28% respectively.
+Even the two PyTorch BF16 attention implementations differed at cosine
+0.998646 (4B) and 0.998455 (9B). This is evidence of numerical sensitivity,
+not proof of full vision compatibility: the original native-vs-reference
+gate is still failing and needs separate resolution before small-model
+multimodal experiments.
