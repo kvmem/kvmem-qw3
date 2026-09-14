@@ -156,3 +156,18 @@ policies passed 2/8 full tasks. These are historical results: engine and
 harness revisions differ, and the export does not establish hardware
 equivalence. Keep them separate from the current-build 4B/9B measurements;
 their timing differences cannot isolate model size or current engine speed.
+
+The fixed 9B text pilot subsequently completed all 16 arms (eight paired
+tasks, seed 1000), with normal agent/verifier termination and clean model
+service protocols. Full-task success was 0/8 for each policy. Mean agent
+time was 655.20 s for ordinary qw3 and 759.56 s for KVMem; weighted engine
+decode throughput was 128.14 and 126.62 token/s. Mean prefill time was 36.09
+and 22.73 s, while mean decoded tokens were 68.40K and 82.07K. Thus lower
+prefill time did not yield lower overall agent time in this pilot; different
+generated work and task failures prevent a maintenance-induced speedup or
+ability-preservation claim. Ordinary execution had two native compactions;
+KVMem had four generated-query refreshes with replay and one original-query
+fallback inside decode. The completed subset, source metric hashes, MTP
+counters and validated per-request timings are in `9B_completed/` (3,124
+request rows). The remaining 4B pilot and visual qualification continue
+separately; completing the 9B subset does not complete the overall goal.
