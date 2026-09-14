@@ -32,8 +32,11 @@ def save(path, value):
 
 
 def sha(path):
+    digest = hashlib.sha256()
     with path.open('rb') as f:
-        return hashlib.file_digest(f, 'sha256').hexdigest()
+        for chunk in iter(lambda: f.read(8 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def wait_gpu():
