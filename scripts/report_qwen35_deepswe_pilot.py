@@ -20,6 +20,40 @@ def mean(rows, key):
     return statistics.mean(values) if values else None
 
 
+def maintenance_counters(log):
+    """Separate generated guidance from fallback events in the legacy counter.
+
+    Mid-decode event timers are cumulative within a request. Aggregate the
+    final native-generate summary once per request, not each refresh message.
+    """
+    result = dict(generated_query_refreshes=0, direct_query_refreshes=0,
+        original_query_fallback_refreshes=0, emergency_open_fragment_refreshes=0,
+        query_replay_requests=0, middecode_refreshes=0,
+        middecode_query_sec=0.0, middecode_reselect_sec=0.0)
+    for line in log.read_text(errors='replace').splitlines():
+        if line.startswith(('[qw3] native kvmem guided query: mode=',
+                '[qw3] native kvmem middecode guided reselect: refresh=')):
+            # Query text can itself contain key=value; only parse log metadata.
+            fields = dict(re.findall(r'([a-z0-9_]+)=([^ ]+)', line.split(' query=', 1)[0]))
+            mode = fields.get('query_mode', fields.get('mode'))
+            if mode in ('reasoning', 'generated') and int(fields['query_tokens']) > 0:
+                result['generated_query_refreshes'] += 1
+            elif mode == 'direct':
+                result['direct_query_refreshes'] += 1
+            elif mode == 'fallback-original':
+                result['original_query_fallback_refreshes'] += 1
+            if fields.get('boundary') == 'emergency-open-fragment':
+                result['emergency_open_fragment_refreshes'] += 1
+        if line.startswith('[qw3] native kvmem query replay: boundary='):
+            result['query_replay_requests'] += 1
+        if line.startswith('[qw3] native generate:'):
+            fields = dict(re.findall(r'([a-z0-9_]+)=([^ ]+)', line))
+            result['middecode_refreshes'] += int(fields.get('kvmem_middecode_refreshes', 0))
+            result['middecode_query_sec'] += float(fields.get('kvmem_middecode_query_ms', 0)) / 1000
+            result['middecode_reselect_sec'] += float(fields.get('kvmem_middecode_reselect_ms', 0)) / 1000
+    return result
+
+
 def arm_row(job, root):
     arm = root / 'pilot' / job['model'] / job['policy'] / 'runs' / job['task_id'] / job['condition']
     metrics_path = arm / 'metrics.json'
@@ -48,6 +82,7 @@ def arm_row(job, root):
         unexpected_no_reusable_checkpoints=server.get('kvmem_unexpected_no_reusable_checkpoints', 0),
         metrics_path=str(metrics_path), binary_sha256=manifest['locked_artifacts']['qw3_binary_sha256'],
         model_sha256=manifest['locked_artifacts']['model_sha256'])
+    row.update(maintenance_counters(arm / 'server/qw3_server.log'))
     return row, d
 
 
@@ -169,7 +204,8 @@ def report(root):
             'Agent/request wall-time ratios compare complete trajectories, not matched engine inputs.',
             'The legacy long_context_pressure_observed field can be true below the actual refresh threshold; maintenance_events_observed requires a logged compaction or semantic refresh.',
             'Equal reward signatures, including equal failures, do not isolate maintenance-induced speedup.',
-            'Pure decode throughput excludes prefill, retrieval, compaction and tools.',
+            'Engine decode throughput excludes prefill, before-decode maintenance and tools, but includes any mid-decode refresh/query and MTP rebase work.',
+            'The legacy guided_query_count counts log events, including original-query fallbacks; generated_query_refreshes requires an accepted generated query. Mid-decode timers come from final per-request summaries to avoid summing cumulative event timers.',
             'MTP acceptance is total accepted / total drafted; recorded host phase timers are not an exclusive GPU-time breakdown.',
             'request_latency.csv contains server-side measurements; visible TTFT is not client observation-to-action latency. Negative/unobserved timings are null, not zero.',
             'All completed arm results, including invalid ones, remain in arms.csv for audit.'])

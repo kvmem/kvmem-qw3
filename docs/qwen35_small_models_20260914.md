@@ -128,3 +128,22 @@ and quality differ, and compaction accounts for only 4.28% of ordinary agent
 time. Both processes and verifiers completed normally. The model/engine
 artifacts and all completed result hashes were preserved through the
 reference-audit pause, then the remaining 9B-first schedule resumed.
+
+The fifth 9B KVMem trajectory (`drizzle-orm-window-function-builders`)
+exercised both refresh routes. Request 42 reached the reserve guard while
+generating a long, unfinished `Write` call. The existing emergency path
+retained the full open fragment and used the original query; selection took
+871.661 ms inside decode, with no newly generated query. Request 72 later
+generated a 123-token query in 1,202.259 ms, selected 4,096 of 8,051 blocks
+in 142.447 ms including KV organization, and replayed 991 tokens from aligned
+checkpoint P=256640 in 201.204 ms. Its server visible-content TTFT was
+2,012.625 ms. Both requests completed and execution continued; task accuracy
+still requires the final verifier result. `first_real_refreshes_9B.json`
+preserves the source lines and timing boundaries.
+
+The pilot report separates generated-query refreshes, original-query
+fallbacks, direct queries and replay requests. The legacy `guided_query_count`
+also counts fallback log records and must not be read as a count of newly
+generated queries. Engine decode time includes mid-decode maintenance;
+its logged query/reselection totals are exported separately and aggregated
+once per request, because individual mid-decode event timers are cumulative.
