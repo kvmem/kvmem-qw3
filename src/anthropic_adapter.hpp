@@ -5,11 +5,17 @@
 #include <cstddef>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace qw3 {
 namespace detail {
 
 using AnthropicJson = nlohmann::json;
+
+struct AnthropicMessageMapping {
+    size_t system_count = 0;
+    std::vector<size_t> message_counts;
+};
 
 // Convert an Anthropic Messages request into the OpenAI-shaped request used by
 // qw3's common chat path. Harness identity stays in the internal route context
@@ -17,7 +23,8 @@ using AnthropicJson = nlohmann::json;
 bool anthropic_request_to_openai(const AnthropicJson &request,
                                  AnthropicJson &openai_request,
                                  std::string &error,
-                                 bool require_max_tokens = true);
+                                 bool require_max_tokens = true,
+                                 AnthropicMessageMapping *mapping = nullptr);
 
 // Convert a completed OpenAI ChatCompletions response into an Anthropic
 // Messages response. Throws std::invalid_argument for malformed input.

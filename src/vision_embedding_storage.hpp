@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -13,11 +14,39 @@ namespace qw3::detail {
 
 class DeviceInputEmbeddingStorage final : public InputEmbeddingStorage {
 public:
+    // Historical KV hits need only image identity and row metadata. Upload a
+    // CPU-cached feature tensor only if prefill/replay actually reads its rows.
+    // The owning engine keeps its backend alive throughout storage use.
+    class CpuTensor {
+    public:
+        CpuTensor(DeviceBackend &backend,
+                  std::shared_ptr<const std::vector<uint16_t>> values)
+            : backend_(backend), values_(std::move(values)) {}
+        uint64_t count() const { return values_ ? values_->size() : 0; }
+        const DeviceTensor *get() const {
+            std::call_once(once_, [&]() {
+                auto tensor = backend_.tensor_bf16(count(), "vision_restored_image");
+                const auto status = backend_.copy_bytes_from_host(*tensor, 0,
+                    values_->data(), count() * sizeof(uint16_t));
+                if (!status.ok) throw std::runtime_error(
+                    std::string("restore CPU vision features: ") + status.message);
+                tensor_ = std::move(tensor);
+            });
+            return tensor_.get();
+        }
+    private:
+        DeviceBackend &backend_;
+        std::shared_ptr<const std::vector<uint16_t>> values_;
+        mutable std::once_flag once_;
+        mutable std::unique_ptr<DeviceTensor> tensor_;
+    };
     struct Segment {
         std::shared_ptr<DeviceTensor> tensor;
         uint32_t logical_row = 0;
         uint32_t source_row = 0;
         uint32_t rows = 0;
+        std::shared_ptr<CpuTensor> cpu;
+        const DeviceTensor *get() const { return tensor ? tensor.get() : cpu->get(); }
     };
 
     struct ResolvedRow {
@@ -48,7 +77,7 @@ public:
             throw std::runtime_error(
                 "device embedding storage is not one contiguous tensor");
         }
-        return *segments_[0].tensor;
+        return *segments_[0].get();
     }
     const std::vector<Segment> &segments() const { return segments_; }
 
@@ -69,7 +98,7 @@ public:
         if (offset >= segment.rows) {
             throw std::runtime_error("device embedding storage has a row gap");
         }
-        return {segment.tensor.get(), segment.source_row + offset};
+        return {segment.get(), segment.source_row + offset};
     }
 
 private:
@@ -79,10 +108,12 @@ private:
         }
         uint32_t next_row = 0;
         for (const Segment &segment : segments_) {
-            if (!segment.tensor || segment.rows == 0 ||
+            const uint64_t count = segment.tensor ? segment.tensor->count :
+                (segment.cpu ? segment.cpu->count() : 0);
+            if (count == 0 || segment.rows == 0 ||
                 segment.logical_row != next_row ||
-                segment.source_row > segment.tensor->count / dim_ ||
-                segment.rows > segment.tensor->count / dim_ - segment.source_row) {
+                segment.source_row > count / dim_ ||
+                segment.rows > count / dim_ - segment.source_row) {
                 throw std::runtime_error("invalid device embedding segment");
             }
             next_row += segment.rows;

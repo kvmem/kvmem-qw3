@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/ibireme/yyjson",
+  "version": "0.12.0",
+  "commit": "8b4a38dc994a110abaec8a400615567bd996105f",
+  "files_sha256": {
+    "yyjson.c": "ac2e9bbb2e2d9149d90878d40506a1d624fa0b33c979a11b61075c54782c6d6a",
+    "yyjson.h": "175867c5493a5df648cec566717fa1c29aa2f6096f5f0cf1efad0b65e1f6d7b3",
+    "LICENSE": "45e384d3d52c73cba3a64d6e6c25d47cd738cd8a55c30629e3201046eda62947"
+  },
+  "local_modifications": [
+    {
+      "file": "yyjson.c",
+      "sha256": "c0d80227ee353d9ff7d2ba1f6970fa261f30ef890d9888198aada1c4c60364e9",
+      "purpose": "QW3_YYJSON_ASCII_SIMD: bounded SSE2 scanning of ordinary ASCII string bytes; original quote/escape/control/UTF-8 decoding retained. Enabled by QW3_JSON_ASCII_SIMD in the qw3 build, scalar fallback elsewhere.",
+      "validation": "CPU passed: 8731 exact value/type/error cases in candidate, baseline and ASan/UBSan builds; full equality on 500 original requests; CMake ON/OFF checks and scalar fallback object equality. Native inference validation pending; see benchmark/osworld_v2/claudecode_json_simd_20260909"
+    }
+  ]
+}

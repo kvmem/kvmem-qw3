@@ -48,7 +48,6 @@ def _load_runtime(
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
     config = AutoConfig.from_pretrained(model_dir, local_files_only=True)
-    vision = Qwen3_5VisionModel(config.vision_config)
 
     index_path = model_dir / "model.safetensors.index.json"
     if not index_path.is_file():
@@ -66,13 +65,26 @@ def _load_runtime(
         with safe_open(model_dir / shard, framework="pt", device="cpu") as handle:
             for name in names:
                 state[name.removeprefix("model.visual.")] = handle.get_tensor(name)
-    missing, unexpected = vision.load_state_dict(state, strict=False)
+    # Standard loading casts checkpoint parameters but preserves FP32
+    # non-persistent buffers such as visual rotary inv_freq. A whole-model
+    # .to(dtype=bfloat16) would silently reduce those buffers as well.
+    vision, loading = Qwen3_5VisionModel.from_pretrained(
+        None, config=config.vision_config, state_dict=state,
+        dtype=torch.bfloat16, output_loading_info=True,
+    )
+    missing = loading["missing_keys"]
+    unexpected = loading["unexpected_keys"]
     if missing or unexpected:
         raise RuntimeError(
             f"vision checkpoint mismatch: missing={missing[:8]} unexpected={unexpected[:8]}"
         )
     del state
-    vision.eval().to(device=device, dtype=torch.bfloat16)
+    vision.eval().to(device=device)
+    if device == "cuda":
+        # Keep BF16 tensor inputs with FP32 accumulation, as the native visual
+        # tower does. PyTorch otherwise permits BF16 intermediate reductions;
+        # that backend choice can amplify rounding differences across 27 layers.
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     return torch, Image, vision, processor
 
 

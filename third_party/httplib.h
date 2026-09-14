@@ -6139,6 +6139,22 @@ inline bool Server::read_content(Stream &strm, Request &req, Response &res) {
           // Regular
           [&](const char *buf, size_t n) {
             if (req.body.size() + n > req.body.max_size()) { return false; }
+#ifdef CPPHTTPLIB_REQUEST_BODY_RESERVE_MAX
+            // Local opt-in: avoid repeated growth/copies of large plain bodies.
+            // This callback runs after the existing length admission check and
+            // after receiving data. Keep the reservation bounded, and retain
+            // the original behavior for chunked or encoded bodies.
+            if (req.body.empty() && req.has_header("Content-Length") &&
+                !req.has_header("Transfer-Encoding") &&
+                !req.has_header("Content-Encoding")) {
+              const auto len = detail::get_header_value_u64(
+                  req.headers, "Content-Length", 0, 0);
+              if (len <= CPPHTTPLIB_REQUEST_BODY_RESERVE_MAX &&
+                  len <= req.body.max_size()) {
+                req.body.reserve(static_cast<size_t>(len));
+              }
+            }
+#endif
             req.body.append(buf, n);
             return true;
           },

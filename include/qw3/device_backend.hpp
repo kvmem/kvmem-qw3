@@ -2677,10 +2677,13 @@ public:
             uint32_t in_stride,
             uint32_t out_stride,
             bool gelu_tanh,
-            bool gelu_erf = false) {
+            bool gelu_erf = false,
+            bool patch_conv3d = false) {
         (void)out; (void)weight; (void)x; (void)bias; (void)residual;
         (void)batch; (void)in_stride; (void)out_stride; (void)gelu_tanh;
-        (void)gelu_erf;
+        // patch_conv3d matches cuDNN's FP32 accumulation and separate BF16
+        // bias addition; nn.Linear accumulates bias before output rounding.
+        (void)gelu_erf; (void)patch_conv3d;
         return {false, "native CUDA vision linear is not supported"};
     }
     virtual DeviceStatus vision_bf16_layer_norm(
@@ -2695,6 +2698,8 @@ public:
         (void)rows; (void)width; (void)eps;
         return {false, "native CUDA vision layer norm is not supported"};
     }
+    // QKV and padded outputs are BF16; cos/sin must remain FP32 so visual
+    // position encoding matches standard Transformers BF16 model loading.
     virtual DeviceStatus vision_bf16_qkv_rope_pad(
             DeviceTensor &q,
             DeviceTensor &k,

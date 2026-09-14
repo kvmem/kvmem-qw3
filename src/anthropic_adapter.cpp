@@ -90,11 +90,12 @@ bool append_user_message(const json &content, json &messages,
                 text_only = false;
                 break;
             }
-            text += part["text"].get<std::string>();
+            text += part["text"].get_ref<const std::string &>();
         }
-        messages.push_back(
-            json{{"role", "user"},
-                 {"content", text_only ? json(text) : pending_content}});
+        json message{{"role", "user"}};
+        if (text_only) message["content"] = std::move(text);
+        else message["content"] = std::move(pending_content);
+        messages.push_back(std::move(message));
         pending_content = json::array();
     };
     for (const json &block : content) {
@@ -126,12 +127,14 @@ bool append_user_message(const json &content, json &messages,
                 error = "image source requires type=base64, media_type, and data";
                 return false;
             }
-            const std::string url =
-                "data:" + source["media_type"].get<std::string>() +
-                ";base64," + source["data"].get<std::string>();
-            pending_content.push_back(json{
-                {"type", "image_url"},
-                {"image_url", json{{"url", url}}}});
+            std::string url =
+                "data:" + source["media_type"].get<std::string>() + ";base64,";
+            const auto &data = source["data"].get_ref<const std::string &>();
+            url.reserve(url.size() + data.size());
+            url.append(data);
+            json image{{"type", "image_url"}};
+            image["image_url"]["url"] = std::move(url);
+            pending_content.push_back(std::move(image));
             continue;
         }
         if (type == "tool_result") {
@@ -142,20 +145,38 @@ bool append_user_message(const json &content, json &messages,
                 return false;
             }
             std::string tool_error;
-            std::string result = block.contains("content")
-                ? text_content(block["content"], tool_error)
-                : std::string();
+            json result = "";
+            if (block.contains("content") && block["content"].is_array()) {
+                // Screenshots returned by MCP/Read are nested in tool_result.
+                // Preserve the tool association and the order of text/images.
+                for (const auto &part : block["content"]) {
+                    if (!part.is_object() || (part.value("type", "") != "text" &&
+                                              part.value("type", "") != "image")) {
+                        error = "tool_result supports text and image blocks only";
+                        return false;
+                    }
+                }
+                json converted = json::array();
+                if (!append_user_message(block["content"], converted, tool_error)) {
+                    error = "tool_result: " + tool_error;
+                    return false;
+                }
+                result = std::move(converted.front()["content"]);
+            } else if (block.contains("content")) {
+                result = text_content(block["content"], tool_error);
+            }
             if (!tool_error.empty()) {
                 error = "tool_result: " + tool_error;
                 return false;
             }
             if (block.value("is_error", false)) {
-                result = "[tool_error]\n" + result;
+                if (result.is_string()) result = "[tool_error]\n" + result.get<std::string>();
+                else result.insert(result.begin(), json{{"type", "text"}, {"text", "[tool_error]\n"}});
             }
-            messages.push_back(json{
-                {"role", "tool"},
-                {"tool_call_id", block["tool_use_id"]},
-                {"content", result}});
+            json message{{"role", "tool"},
+                         {"tool_call_id", block["tool_use_id"]}};
+            message["content"] = std::move(result);
+            messages.push_back(std::move(message));
             continue;
         }
         error = "unsupported user content block type: " + type;
@@ -227,12 +248,14 @@ bool append_assistant_message(const json &content, json &messages,
     return true;
 }
 
-bool convert_messages(const json &input, json &output, std::string &error) {
+bool convert_messages(const json &input, json &output, std::string &error,
+                      AnthropicMessageMapping *mapping) {
     if (!input.is_array()) {
         error = "messages must be an array";
         return false;
     }
     for (const json &message : input) {
+        const size_t before = output.size();
         if (!message.is_object() || !message.contains("role") ||
             !message["role"].is_string() || !message.contains("content")) {
             error = "each message requires string role and content";
@@ -252,6 +275,7 @@ bool convert_messages(const json &input, json &output, std::string &error) {
             error = "message role must be user or assistant";
             return false;
         }
+        if (mapping) mapping->message_counts.push_back(output.size() - before);
     }
     return true;
 }
@@ -354,8 +378,10 @@ std::string message_id_from_openai(const std::string &id) {
 
 static bool anthropic_request_to_openai_impl(
         const json &request, json &openai_request,
-        std::string &error, bool require_max_tokens) {
+        std::string &error, bool require_max_tokens,
+        AnthropicMessageMapping *mapping) {
     error.clear();
+    if (mapping) *mapping = {};
     if (!request.is_object()) {
         error = "request body must be a JSON object";
         return false;
@@ -381,7 +407,8 @@ static bool anthropic_request_to_openai_impl(
         !append_system_messages(request["system"], messages, error)) {
         return false;
     }
-    if (!convert_messages(request["messages"], messages, error)) return false;
+    if (mapping) mapping->system_count = messages.size();
+    if (!convert_messages(request["messages"], messages, error, mapping)) return false;
     openai_request["messages"] = std::move(messages);
 
     if (request.contains("max_tokens")) {
@@ -464,10 +491,11 @@ static bool anthropic_request_to_openai_impl(
 
 bool anthropic_request_to_openai(const json &request, json &openai_request,
                                  std::string &error,
-                                 bool require_max_tokens) {
+                                 bool require_max_tokens,
+                                 AnthropicMessageMapping *mapping) {
     try {
         return anthropic_request_to_openai_impl(
-            request, openai_request, error, require_max_tokens);
+            request, openai_request, error, require_max_tokens, mapping);
     } catch (const std::exception &e) {
         openai_request = json::object();
         error = std::string("invalid Anthropic request field: ") + e.what();

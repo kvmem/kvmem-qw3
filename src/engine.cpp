@@ -38,6 +38,9 @@ NativePlanInfo Engine::native_plan() const {
 VisionEncoding Engine::encode_vision(const std::vector<VisionImage> &images) {
     return impl_->backend->encode_vision(images);
 }
+VisionEncoding Engine::encode_vision_sources(const std::vector<VisionImageSourcePtr> &images) {
+    return impl_->backend->encode_vision_sources(images);
+}
 
 std::string Engine::generate(const std::string &prompt, const GenerationOptions &options) {
     return impl_->backend->generate(prompt, options, nullptr);

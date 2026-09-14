@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(qw3 LANGUAGES CXX)
+project(qw3 LANGUAGES C CXX)
 
 find_package(Threads REQUIRED)
 
@@ -234,12 +234,20 @@ if(QW3_ENABLE_CUDA)
     endif()
 endif()
 
+add_library(qw3_request_json STATIC
+    src/native_request_json.cpp
+    third_party/yyjson/yyjson.c)
+option(QW3_JSON_ASCII_SIMD "Scan long JSON ASCII strings with SSE2 when available" ON)
+target_compile_definitions(qw3_request_json PRIVATE
+    $<$<BOOL:${QW3_JSON_ASCII_SIMD}>:QW3_YYJSON_ASCII_SIMD=1>)
+target_include_directories(qw3_request_json SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
 add_executable(qw3 src/qw3_cli.cpp src/qw3_server.cpp)
 target_include_directories(qw3 SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_compile_definitions(qw3 PRIVATE
     QW3_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
-target_link_libraries(qw3 PRIVATE qw3_core)
+target_link_libraries(qw3 PRIVATE qw3_core qw3_request_json)
 
 add_executable(qw3-inspect src/qw3_inspect.cpp)
 target_link_libraries(qw3-inspect PRIVATE qw3_core)
@@ -248,6 +256,15 @@ if(QW3_BUILD_TESTS)
     add_executable(qw3-prompt-render tests/prompt_render_test.cpp)
     target_link_libraries(qw3-prompt-render PRIVATE qw3_core)
     enable_testing()
+    add_executable(qw3-native-request-json tests/native_request_json_test.cpp)
+    target_include_directories(qw3-native-request-json PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(qw3-native-request-json PRIVATE qw3_request_json)
+    add_test(NAME qw3-native-request-json COMMAND qw3-native-request-json)
+    add_executable(qw3-native-message-prefix tests/native_message_prefix_test.cpp src/anthropic_adapter.cpp)
+    target_include_directories(qw3-native-message-prefix PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(qw3-native-message-prefix PRIVATE qw3_request_json Threads::Threads)
+    add_test(NAME qw3-native-message-prefix COMMAND qw3-native-message-prefix)
     add_executable(qw3-kvmem-gc tests/kvmem_gc_test.cpp src/kvmem_gc.cpp src/kvmem_store.cpp)
     target_include_directories(qw3-kvmem-gc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(qw3-kvmem-gc PRIVATE Threads::Threads)
@@ -273,6 +290,39 @@ if(QW3_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME qw3-kvmem-prefix-reuse-policy
         COMMAND qw3-kvmem-prefix-reuse-policy)
+
+    add_executable(qw3-multimodal-pin-policy
+        tests/multimodal_pin_policy_test.cpp)
+    target_include_directories(qw3-multimodal-pin-policy PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME qw3-multimodal-pin-policy COMMAND qw3-multimodal-pin-policy)
+
+    add_executable(qw3-message-prefix-cache tests/message_prefix_cache_test.cpp)
+    target_include_directories(qw3-message-prefix-cache PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(qw3-message-prefix-cache SYSTEM PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+    target_link_libraries(qw3-message-prefix-cache PRIVATE Threads::Threads)
+    add_test(NAME qw3-message-prefix-cache COMMAND qw3-message-prefix-cache)
+
+    # Real-tokenizer parity and timing; invoke with a local GGUF model path.
+    add_executable(qw3-chat-token-cache tests/chat_token_cache_test.cpp)
+    target_include_directories(qw3-chat-token-cache PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(qw3-chat-token-cache PRIVATE qw3_core)
+
+    # Run with the local GGUF tokenizer, like qw3-chat-token-cache above.
+    add_executable(qw3-vision-request-preparation tests/vision_request_preparation_test.cpp)
+    target_include_directories(qw3-vision-request-preparation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(qw3-vision-request-preparation SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+    target_link_libraries(qw3-vision-request-preparation PRIVATE qw3_core)
+
+    add_executable(qw3-input-embedding-override-index
+        tests/input_embedding_override_index_test.cpp)
+    target_include_directories(qw3-input-embedding-override-index PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME qw3-input-embedding-override-index
+        COMMAND qw3-input-embedding-override-index)
 
     add_executable(qw3-kvmem-refresh-policy
         tests/kvmem_refresh_policy_test.cpp)
@@ -330,10 +380,21 @@ if(QW3_BUILD_TESTS)
     add_test(NAME qw3-kvmem-archive COMMAND qw3-kvmem-archive)
 
     if(QW3_ENABLE_CUDA)
+        add_executable(qw3-vision-cpu-cache tests/vision_cpu_cache_test.cpp)
+        target_include_directories(qw3-vision-cpu-cache PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(qw3-vision-cpu-cache PRIVATE qw3_core)
+
         add_executable(qw3-vision-gpu-parity tests/vision_gpu_parity.cpp)
         target_include_directories(qw3-vision-gpu-parity PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(qw3-vision-gpu-parity PRIVATE qw3_core)
+
+        add_executable(qw3-prefix-state-storage tests/prefix_state_storage_test.cpp)
+        target_include_directories(qw3-prefix-state-storage PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(qw3-prefix-state-storage PRIVATE qw3_core)
+        add_test(NAME qw3-prefix-state-storage COMMAND qw3-prefix-state-storage)
 
         add_executable(qw3-mmq-parity tests/mmq_parity.cu)
         target_link_libraries(qw3-mmq-parity PRIVATE qw3_core)

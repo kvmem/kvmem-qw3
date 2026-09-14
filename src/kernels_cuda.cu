@@ -9750,19 +9750,32 @@ __device__ __forceinline__ float vision_gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanhf(kAlpha * (x + kBeta * x * x * x)));
 }
 
+__global__ void vision_bf16_bias_fill_kernel(
+        __nv_bfloat16 *out, const __nv_bfloat16 *bias,
+        uint64_t count, uint32_t stride, uint32_t width) {
+    const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) {
+        const uint32_t column = i % stride;
+        out[i] = column < width ? bias[column] : __float2bfloat16_rn(0.0f);
+    }
+}
+
 __global__ void vision_bf16_epilogue_kernel(
         __nv_bfloat16 *out,
         const __nv_bfloat16 *bias,
         const __nv_bfloat16 *residual,
         uint64_t count,
+        uint32_t stride,
         uint32_t width,
         bool gelu_tanh,
         bool gelu_erf) {
     const uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
     if (i >= count) return;
+    const uint32_t column = i % stride;
+    if (column >= width) return;
     float value = __bfloat162float(out[i]);
-    if (bias) value += __bfloat162float(bias[i % width]);
+    if (bias) value += __bfloat162float(bias[column]);
     if (gelu_tanh) value = vision_gelu_tanh(value);
     if (gelu_erf) {
         value = 0.5f * value *
@@ -9849,8 +9862,8 @@ __global__ void vision_bf16_qkv_rope_pad_kernel(
         __nv_bfloat16 *k,
         __nv_bfloat16 *v,
         const __nv_bfloat16 *qkv,
-        const __nv_bfloat16 *cos,
-        const __nv_bfloat16 *sin,
+        const float *cos,
+        const float *sin,
         uint32_t tokens,
         uint32_t heads,
         uint32_t head_dim,
@@ -9876,10 +9889,8 @@ __global__ void vision_bf16_qkv_rope_pad_kernel(
     const uint32_t half = head_dim / 2;
     const uint32_t peer_d = d < half ? d + half : d - half;
     const uint64_t peer = static_cast<uint64_t>(head) * head_dim + peer_d;
-    const float c = __bfloat162float(cos[
-        static_cast<uint64_t>(token) * head_dim + d]);
-    const float s = __bfloat162float(sin[
-        static_cast<uint64_t>(token) * head_dim + d]);
+    const float c = cos[static_cast<uint64_t>(token) * head_dim + d];
+    const float s = sin[static_cast<uint64_t>(token) * head_dim + d];
     const float q0 = __bfloat162float(qkv[row + lane]);
     const float k0 = __bfloat162float(qkv[row + hidden + lane]);
     float qr = __bfloat162float(qkv[row + peer]);
@@ -9888,8 +9899,10 @@ __global__ void vision_bf16_qkv_rope_pad_kernel(
         qr = -qr;
         kr = -kr;
     }
-    q[i] = __float2bfloat16_rn(q0 * c + qr * s);
-    k[i] = __float2bfloat16_rn(k0 * c + kr * s);
+    // Match the reference's separate FP32 multiply/add operations before
+    // converting the rotated vectors back to the activation dtype.
+    q[i] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(q0, c), __fmul_rn(qr, s)));
+    k[i] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(k0, c), __fmul_rn(kr, s)));
     v[i] = qkv[row + 2 * hidden + lane];
 }
 
@@ -21495,7 +21508,8 @@ public:
             uint32_t in_stride,
             uint32_t out_stride,
             bool gelu_tanh,
-            bool gelu_erf) override {
+            bool gelu_erf,
+            bool patch_conv3d) override {
         auto &o = as_tensor(out);
         const auto &input = as_tensor(x);
         const auto &w = as_weight(weight);
@@ -21521,9 +21535,31 @@ public:
                 return {false, "native vision BF16 residual mismatch"};
             }
         }
+        // Accumulate the bias inside GEMM before its BF16 output rounding,
+        // as nn.Linear/addmm does. Adding bias after a rounded BF16 product
+        // changes QKV and MLP activations throughout the visual tower.
+        const uint64_t count = static_cast<uint64_t>(batch) * out_stride;
+        if (b && !patch_conv3d) {
+            vision_bf16_bias_fill_kernel<<<
+                static_cast<unsigned>((count + 255) / 256), 256, 0, exec_stream_>>>(
+                    o.ptr_bf16(), static_cast<const __nv_bfloat16 *>(b->ptr),
+                    count, out_stride, w.rows);
+        }
         const float alpha = 1.0f;
-        const float beta = 0.0f;
-        if (auto st = cublas_status(cublasGemmEx(
+        const float beta = b && !patch_conv3d ? 1.0f : 0.0f;
+        // Keep every visual GEMM reduction in FP32. CUBLAS_COMPUTE_32F alone
+        // still permits intermediate BF16 reductions. The patch embedding
+        // additionally matches Conv3d's separate BF16 bias addition.
+        cublasMath_t previous_math = CUBLAS_DEFAULT_MATH;
+        {
+            if (auto st = cublas_status(cublasGetMathMode(cublas_handle_, &previous_math),
+                    "get vision GEMM math mode"); !st.ok) return st;
+            if (auto st = cublas_status(cublasSetMathMode(cublas_handle_,
+                    static_cast<cublasMath_t>(previous_math |
+                        CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)),
+                    "set vision FP32 reduction"); !st.ok) return st;
+        }
+        const auto gemm_status = cublas_status(cublasGemmEx(
                 cublas_handle_, CUBLAS_OP_T, CUBLAS_OP_N,
                 static_cast<int>(w.rows), static_cast<int>(batch),
                 static_cast<int>(w.cols), &alpha,
@@ -21532,18 +21568,20 @@ public:
                 &beta, o.ptr_bf16(), CUDA_R_16BF,
                 static_cast<int>(out_stride),
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                "cublasGemmEx native vision BF16 linear"); !st.ok) {
-            return st;
+                "cublasGemmEx native vision BF16 linear");
+        {
+            if (auto st = cublas_status(cublasSetMathMode(cublas_handle_, previous_math),
+                    "restore vision GEMM math mode"); !st.ok) return st;
         }
-        const uint64_t count = static_cast<uint64_t>(batch) * out_stride;
-        if (b || r || gelu_tanh || gelu_erf) {
+        if (!gemm_status.ok) return gemm_status;
+        if ((b && patch_conv3d) || r || gelu_tanh || gelu_erf) {
             vision_bf16_epilogue_kernel<<<
                 static_cast<unsigned>((count + 255) / 256), 256, 0,
                 exec_stream_>>>(
                     o.ptr_bf16(),
-                    b ? static_cast<const __nv_bfloat16 *>(b->ptr) : nullptr,
+                    b && patch_conv3d ? static_cast<const __nv_bfloat16 *>(b->ptr) : nullptr,
                     r ? r->ptr_bf16() : nullptr,
-                    count, out_stride, gelu_tanh, gelu_erf);
+                    count, out_stride, w.rows, gelu_tanh, gelu_erf);
         }
         return launch_status("cuda native vision BF16 linear");
     }
@@ -21643,7 +21681,8 @@ public:
             static_cast<uint64_t>(tokens) * heads * head_dim * 3;
         const uint64_t rope_count = static_cast<uint64_t>(tokens) * head_dim;
         if (!qq.is_bf16() || !kk.is_bf16() || !vv.is_bf16() ||
-            !packed.is_bf16() || !cc.is_bf16() || !ss.is_bf16() ||
+            !packed.is_bf16() || cc.dtype != DeviceTensorDType::F32 ||
+            ss.dtype != DeviceTensorDType::F32 ||
             qq.count < padded_count || kk.count < padded_count ||
             vv.count < padded_count || packed.count < qkv_count ||
             cc.count < rope_count || ss.count < rope_count ||
@@ -21655,7 +21694,7 @@ public:
             static_cast<unsigned>((padded_count + 255) / 256), 256, 0,
             exec_stream_>>>(
                 qq.ptr_bf16(), kk.ptr_bf16(), vv.ptr_bf16(),
-                packed.ptr_bf16(), cc.ptr_bf16(), ss.ptr_bf16(),
+                packed.ptr_bf16(), cc.ptr, ss.ptr,
                 tokens, heads, head_dim, padded_head_dim);
         return launch_status("cuda native vision QKV/RoPE pad");
     }

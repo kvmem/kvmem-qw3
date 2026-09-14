@@ -46,6 +46,13 @@ public:
         (void)images;
         throw std::runtime_error("native CUDA vision is not configured");
     }
+    virtual VisionEncoding encode_vision_sources(
+            const std::vector<VisionImageSourcePtr> &images) {
+        std::vector<VisionImage> values;
+        values.reserve(images.size());
+        for (const auto &image : images) values.push_back(image->image());
+        return encode_vision(values);
+    }
 };
 
 std::unique_ptr<Backend> make_qwen_native_backend();

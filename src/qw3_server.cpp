@@ -2,11 +2,17 @@
 #include "request_cancellation.hpp"
 
 #include "anthropic_adapter.hpp"
+#include "native_request_json.hpp"
+#include "native_message_preparation.hpp"
 #include "env_flags.hpp"
 #include "harness_semantics.hpp"
 #include "kvmem_request_plan.hpp"
 #include "kvmem_refresh_policy.hpp"
 #include "multimodal_prefix_cache.hpp"
+#include "multimodal_pin_policy.hpp"
+#include "message_prefix_cache.hpp"
+#include "vision_request_preparation.hpp"
+#include "chat_token_cache.hpp"
 #include "tool_call_stream.hpp"
 #include "vision_cpu_frontend.hpp"
 #include "qw3/qw3.hpp"
@@ -17,6 +23,14 @@
 
 // Vendored single-header deps (included as SYSTEM headers via CMake so their
 // warnings don't trip -Wall -Wextra -Wpedantic).
+#ifndef CPPHTTPLIB_RECV_BUFSIZ
+#define CPPHTTPLIB_RECV_BUFSIZ size_t(65536u)
+#endif
+#ifndef CPPHTTPLIB_REQUEST_BODY_RESERVE_MAX
+// Reserve plain bodies only within this bound; larger/encoded/chunked requests
+// retain the normal growing buffer. The limit does not reject or truncate them.
+#define CPPHTTPLIB_REQUEST_BODY_RESERVE_MAX size_t(536870912u)
+#endif
 #include "httplib.h"
 #include "json.hpp"
 
@@ -533,301 +547,10 @@ std::string render_content(const json &content) {
     return content.dump();
 }
 
-struct PreparedVisionRequest {
-    detail::CpuVisionEncoding encoded;
-    std::vector<std::pair<uint32_t, uint32_t>> token_spans;
-    std::vector<uint64_t> image_fingerprints;
-    uint64_t fingerprint = 0;
-
-    bool active() const { return !encoded.grids.empty(); }
-};
-
-using VisionEncoder = std::function<
-    VisionEncoding(const std::vector<VisionImage> &)>;
-
-bool parse_data_image_url(const std::string &url,
-                          detail::CpuVisionImage &image,
-                          std::string &error) {
-    if (url.rfind("data:", 0) != 0) {
-        error = "CPU vision V1 accepts base64 data: image URLs only";
-        return false;
-    }
-    const size_t comma = url.find(',');
-    const size_t base64 = url.find(";base64");
-    if (comma == std::string::npos || base64 == std::string::npos ||
-        base64 > comma) {
-        error = "image URL must be a base64 data URI";
-        return false;
-    }
-    image.media_type = url.substr(5, base64 - 5);
-    image.base64_data = url.substr(comma + 1);
-    if (image.media_type.rfind("image/", 0) != 0 ||
-        image.base64_data.empty()) {
-        error = "invalid base64 image data URI";
-        return false;
-    }
-    return true;
-}
-
-bool openai_image_block(const json &block,
-                        detail::CpuVisionImage &image,
-                        std::string &error) {
-    if (!block.is_object() || block.value("type", "") != "image_url") {
-        return false;
-    }
-    if (!block.contains("image_url")) {
-        error = "image_url block requires image_url";
-        return false;
-    }
-    std::string url;
-    if (block["image_url"].is_string()) {
-        url = block["image_url"].get<std::string>();
-    } else if (block["image_url"].is_object() &&
-               block["image_url"].contains("url") &&
-               block["image_url"]["url"].is_string()) {
-        url = block["image_url"]["url"].get<std::string>();
-    } else {
-        error = "image_url must be a string or an object with string url";
-        return false;
-    }
-    return parse_data_image_url(url, image, error);
-}
-
-bool prepare_vision_messages(json &messages,
-                             const VisionEncoder &encoder,
-                             PreparedVisionRequest &prepared,
-                             std::string &error) {
-    std::vector<detail::CpuVisionImage> images;
-    for (const json &message : messages) {
-        if (!message.is_object() || !message.contains("content") ||
-            !message["content"].is_array()) {
-            continue;
-        }
-        for (const json &block : message["content"]) {
-            if (!block.is_object() || block.value("type", "") != "image_url") {
-                continue;
-            }
-            detail::CpuVisionImage image;
-            if (!openai_image_block(block, image, error)) return false;
-            images.push_back(std::move(image));
-        }
-    }
-    if (images.empty()) return true;
-    if (!encoder) {
-        error = "image input requires --vision-model DIR";
-        return false;
-    }
-    try {
-        prepared.encoded = encoder(images);
-    } catch (const std::exception &e) {
-        error = e.what();
-        return false;
-    }
-
-    // Hash the ordered source payloads rather than the projected embeddings:
-    // this is deterministic across worker/kernel implementations and avoids a
-    // second pass over the much larger projected tensor. It is cache identity,
-    // not an authentication primitive.
-    auto mix = [](uint64_t &fingerprint, std::string_view value) {
-        for (unsigned char byte : value) {
-            fingerprint ^= static_cast<uint64_t>(byte);
-            fingerprint *= 1099511628211ULL;
-        }
-        fingerprint ^= 0xffu;
-        fingerprint *= 1099511628211ULL;
-    };
-    uint64_t fingerprint = 1469598103934665603ULL;
-    prepared.image_fingerprints.clear();
-    prepared.image_fingerprints.reserve(images.size());
-    for (const auto &image : images) {
-        mix(fingerprint, image.media_type);
-        mix(fingerprint, image.base64_data);
-        uint64_t image_fingerprint = 1469598103934665603ULL;
-        mix(image_fingerprint, image.media_type);
-        mix(image_fingerprint, image.base64_data);
-        prepared.image_fingerprints.push_back(
-            image_fingerprint != 0 ? image_fingerprint : 1);
-    }
-    prepared.fingerprint = fingerprint != 0 ? fingerprint : 1;
-
-    size_t image_index = 0;
-    for (json &message : messages) {
-        if (!message.is_object() || !message.contains("content") ||
-            !message["content"].is_array()) {
-            continue;
-        }
-        for (json &block : message["content"]) {
-            if (!block.is_object() || block.value("type", "") != "image_url") {
-                continue;
-            }
-            if (image_index >= prepared.encoded.grids.size()) {
-                error = "vision worker image count does not match the request";
-                return false;
-            }
-            const uint32_t rows = prepared.encoded.grids[image_index].rows;
-            std::string placeholder = "<|vision_start|>";
-            placeholder.reserve(placeholder.size() +
-                                static_cast<size_t>(rows) * 13 + 16);
-            for (uint32_t row = 0; row < rows; ++row) {
-                placeholder += "<|image_pad|>";
-            }
-            placeholder += "<|vision_end|>";
-            block = json{{"type", "text"}, {"text", std::move(placeholder)}};
-            ++image_index;
-        }
-    }
-    if (image_index != prepared.encoded.grids.size()) {
-        error = "vision request mutation lost an image";
-        return false;
-    }
-    return true;
-}
-
-bool finalize_vision_tokens(
-        std::vector<int32_t> &tokens,
-        const QwenTokenizer &tokenizer,
-        PreparedVisionRequest &prepared,
-        GenerationOptions &generation,
-        std::string &error) {
-    if (!prepared.active()) return true;
-    const int32_t image_pad = tokenizer.token_id("<|image_pad|>");
-    const int32_t vision_start = tokenizer.token_id("<|vision_start|>");
-    const int32_t vision_end = tokenizer.token_id("<|vision_end|>");
-    if (image_pad < 0 || vision_start < 0 || vision_end < 0) {
-        error = "model tokenizer is missing Qwen vision special tokens";
-        return false;
-    }
-    if (prepared.encoded.embedding_dim == 0 ||
-        prepared.encoded.embedding_dim > std::numeric_limits<uint32_t>::max()) {
-        error = "vision worker returned an invalid embedding width";
-        return false;
-    }
-
-    std::vector<uint8_t> modality(tokens.size(), 0);
-    size_t embedding_row = 0;
-    size_t search = 0;
-    generation.input_embedding_overrides.clear();
-    generation.input_embedding_fingerprint = prepared.fingerprint;
-    generation.input_mrope_positions.assign(tokens.size(), {0, 0, 0});
-    prepared.token_spans.clear();
-
-    if (prepared.image_fingerprints.size() != prepared.encoded.grids.size()) {
-        error = "vision source identity count does not match encoded images";
-        return false;
-    }
-    for (size_t grid_index = 0;
-         grid_index < prepared.encoded.grids.size(); ++grid_index) {
-        const auto &grid = prepared.encoded.grids[grid_index];
-        while (search + 1 < tokens.size() &&
-               !(tokens[search] == vision_start &&
-                 tokens[search + 1] == image_pad)) {
-            ++search;
-        }
-        if (search + 1 >= tokens.size()) {
-            error = "rendered prompt has fewer vision spans than encoded images";
-            return false;
-        }
-        const size_t span_begin = search;
-        const size_t begin = ++search;
-        while (search < tokens.size() && tokens[search] == image_pad) {
-            ++search;
-        }
-        const size_t end = search;
-        if (end - begin != grid.rows) {
-            error = "rendered image token run does not match the processed image grid";
-            return false;
-        }
-        if (end >= tokens.size() || tokens[end] != vision_end) {
-            error = "rendered image token run is missing vision_end";
-            return false;
-        }
-        prepared.token_spans.emplace_back(
-            static_cast<uint32_t>(span_begin),
-            static_cast<uint32_t>(end + 1));
-        for (size_t pos = begin; pos < end; ++pos) {
-            modality[pos] = 1;
-            if (embedding_row >= 0x7fffffffu) {
-                error = "too many visual embedding rows";
-                return false;
-            }
-            const uint32_t virtual_id =
-                0x80000000u | static_cast<uint32_t>(embedding_row + 1);
-            GenerationOptions::InputEmbeddingOverride override;
-            override.token_id = virtual_id;
-            override.source_token_id = static_cast<uint32_t>(image_pad);
-            override.cache_identity =
-                detail::multimodal_row_cache_identity(
-                    prepared.image_fingerprints[grid_index],
-                    static_cast<uint32_t>(pos - begin));
-            if (prepared.encoded.storage) {
-                override.storage = prepared.encoded.storage;
-                override.embedding_row = static_cast<uint32_t>(embedding_row);
-            } else {
-                const size_t offset =
-                    embedding_row * prepared.encoded.embedding_dim;
-                override.embedding.assign(
-                    prepared.encoded.embeddings.begin() +
-                        static_cast<std::ptrdiff_t>(offset),
-                    prepared.encoded.embeddings.begin() +
-                        static_cast<std::ptrdiff_t>(offset +
-                                                    prepared.encoded.embedding_dim));
-            }
-            generation.input_embedding_overrides.push_back(std::move(override));
-            tokens[pos] = static_cast<int32_t>(virtual_id);
-            ++embedding_row;
-        }
-    }
-    if (prepared.encoded.storage) {
-        if (prepared.encoded.storage->rows() != embedding_row ||
-            prepared.encoded.storage->dim() != prepared.encoded.embedding_dim) {
-            error = "device visual embeddings do not match prompt mapping";
-            return false;
-        }
-    } else {
-        if (embedding_row * prepared.encoded.embedding_dim !=
-            prepared.encoded.embeddings.size()) {
-            error = "unused visual embeddings remain after prompt mapping";
-            return false;
-        }
-    }
-
-    uint32_t current = 0;
-    size_t image_index = 0;
-    for (size_t pos = 0; pos < tokens.size();) {
-        if (modality[pos] == 0) {
-            generation.input_mrope_positions[pos] = {current, current, current};
-            ++current;
-            ++pos;
-            continue;
-        }
-        if (image_index >= prepared.encoded.grids.size()) {
-            error = "image modality run count exceeds image grids";
-            return false;
-        }
-        const auto &grid = prepared.encoded.grids[image_index++];
-        if (grid.height % 2 != 0 || grid.width % 2 != 0) {
-            error = "Qwen vision grid is not divisible by spatial merge size 2";
-            return false;
-        }
-        const uint32_t llm_h = grid.height / 2;
-        const uint32_t llm_w = grid.width / 2;
-        const uint32_t plane = llm_h * llm_w;
-        for (uint32_t row = 0; row < grid.rows; ++row, ++pos) {
-            const uint32_t t = plane > 0 ? row / plane : 0;
-            const uint32_t rem = plane > 0 ? row % plane : 0;
-            const uint32_t h = llm_w > 0 ? rem / llm_w : 0;
-            const uint32_t w = llm_w > 0 ? rem % llm_w : 0;
-            const std::array<uint32_t, 3> mrope = {
-                current + t, current + h, current + w};
-            generation.input_mrope_positions[pos] = mrope;
-            generation.input_embedding_overrides[
-                static_cast<size_t>(tokens[pos] & 0x7fffffffu) - 1].position =
-                    mrope;
-        }
-        current += std::max({grid.temporal, llm_h, llm_w});
-    }
-    return true;
-}
+using detail::PreparedVisionRequest;
+using detail::VisionEncoder;
+using detail::prepare_vision_messages;
+using detail::finalize_vision_tokens;
 
 std::string trim_ascii_ws(std::string s) {
     size_t b = 0;
@@ -1905,6 +1628,9 @@ std::string render_messages(
             // and defeats persistent KVMem prefix reuse.  In the explicitly
             // enabled harness+KVMem prefix mode, retain the already-rendered
             // assistant framing so a new semantic query only appends a suffix.
+            // Ordinary harness clients can opt into the same stable framing;
+            // otherwise a summary instruction alone can invalidate their KV
+            // prefix, even when the retained thinking delimiters are empty.
             // The default remains byte-identical for ordinary serving.
             if (add_generation_prompt &&
                 (stable_harness_reasoning || i > last_query_index)) {
@@ -2400,11 +2126,23 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         usage_tokenizer_owner = std::make_unique<QwenTokenizer>(*usage_gguf);
     }
     QwenTokenizer &usage_tokenizer = *usage_tokenizer_owner;
+    detail::ChatTokenCache chat_token_cache(usage_tokenizer);
+    const bool use_chat_token_cache = env_flag_enabled("QW3_SERVER_TOKEN_CACHE");
+    if (use_chat_token_cache) chat_token_cache.prepare_decoded_pieces();
+    auto encode_usage = [&](const std::string &text) {
+        return use_chat_token_cache ? chat_token_cache.encode(text)
+                                    : usage_tokenizer.encode(text);
+    };
+    auto decode_usage = [&](int32_t token) {
+        return use_chat_token_cache ? chat_token_cache.decode_one(token)
+                                    : usage_tokenizer.decode_one(token);
+    };
     const std::string model_id = basename_of(engine.model_path);
     std::cerr << "[qw3-serve] model loaded; id=" << model_id << "\n";
 
     std::unique_ptr<detail::CpuVisionFrontend> vision_frontend;
     VisionEncoder vision_encoder;
+    detail::PreparedVisionEncoder prepared_vision_encoder;
     const std::string vision_model = !engine.vision_model_path.empty()
         ? engine.vision_model_path : engine.vision_cpu_model_path;
     if (!vision_model.empty() && engine.vision_device == "cpu") {
@@ -2455,10 +2193,19 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         vision_encoder = [&](const std::vector<VisionImage> &images) {
             return vision_frontend->encode(images);
         };
+        prepared_vision_encoder = [&](const std::vector<VisionImageSourcePtr> &images) {
+            std::vector<VisionImage> values;
+            values.reserve(images.size());
+            for (const auto &image : images) values.push_back(image->image());
+            return vision_frontend->encode(values);
+        };
         std::cerr << "[qw3-serve] CPU vision frontend ready\n";
     } else if (!vision_model.empty() && engine.vision_device == "cuda") {
         vision_encoder = [&](const std::vector<VisionImage> &images) {
             return eng.encode_vision(images);
+        };
+        prepared_vision_encoder = [&](const std::vector<VisionImageSourcePtr> &images) {
+            return eng.encode_vision_sources(images);
         };
         std::cerr << "[qw3-serve] native CUDA vision frontend ready\n";
     }
@@ -2475,6 +2222,22 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     std::mutex guided_trajectory_mu;
     std::unordered_map<size_t, GuidedTrajectoryState> guided_trajectories;
     std::atomic<uint64_t> req_counter{0};
+    detail::MessagePrefixCache message_prefix_cache;
+    const bool use_message_prefix_cache = env_flag_enabled("QW3_MESSAGE_PREFIX_CACHE");
+    const size_t prepared_cache_mib = env_uint32_or(
+        "QW3_PREPARED_PREFIX_CACHE_MIB", 512);
+    constexpr size_t bytes_per_mib = 1024u * 1024u;
+    if (prepared_cache_mib > std::numeric_limits<size_t>::max() / bytes_per_mib) {
+        throw std::runtime_error("QW3_PREPARED_PREFIX_CACHE_MIB exceeds addressable size");
+    }
+    detail::PreparedMessageCache prepared_message_cache(
+        static_cast<size_t>(prepared_cache_mib) * bytes_per_mib);
+    const bool use_prepared_prefix_cache = use_message_prefix_cache &&
+        env_flag_enabled("QW3_PREPARED_PREFIX_CACHE", true);
+    if (use_prepared_prefix_cache) {
+        std::cerr << "[qw3-serve] prepared prefix cache: cpu_mib="
+                  << prepared_cache_mib << " entries=2\n";
+    }
 
     detail::RequestCancellationRegistry cancellation_registry;
     httplib::Server svr;
@@ -2587,7 +2350,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             return;
         }
         const std::string content = req["content"].get<std::string>();
-        const std::vector<int32_t> tokens = usage_tokenizer.encode(content);
+        const std::vector<int32_t> tokens = encode_usage(content);
         json out{{"count", tokens.size()}};
         if (req.value("return_tokens", false)) out["tokens"] = tokens;
         res.set_content(dump_json(out), "application/json");
@@ -2870,7 +2633,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
 
     auto handle_chat_completions = [&](const httplib::Request &hreq,
                                        httplib::Response &res,
-                                       detail::HarnessProtocol protocol) {
+                                       detail::HarnessProtocol protocol,
+                                       json *parsed_request = nullptr,
+                                       const detail::NativePreparedRequest *native_input = nullptr) {
         std::shared_ptr<detail::RequestCancellationRegistry::Lease> cancellation;
         try {
             cancellation = cancellation_registry.begin(
@@ -2883,7 +2648,11 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const auto server_request_start = std::chrono::steady_clock::now();
         json req;
         try {
-            req = json::parse(hreq.body);
+            // Native adapters already validated and converted this JSON. Move
+            // its ownership instead of serializing all historical images and
+            // immediately parsing the same payload again.
+            req = parsed_request ? std::move(*parsed_request)
+                                 : json::parse(hreq.body);
         } catch (const std::exception &e) {
             res.status = 400;
             res.set_content(dump_json(json{{"error", std::string("invalid JSON: ") + e.what()}}),
@@ -2897,10 +2666,85 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             "application/json");
             return;
         }
+        bool retain_raw_messages = false;
+        json raw_messages;
+        std::shared_ptr<const detail::PreparedMessageCache::Entry> previous_prepared;
+        std::shared_ptr<detail::PreparedMessageCache::Entry> prepared_candidate;
+        size_t prepared_prefix_count = 0;
+        const bool native_prepared_cache = use_prepared_prefix_cache &&
+            protocol == detail::HarnessProtocol::AnthropicMessages &&
+            env_flag_enabled("QW3_ANTHROPIC_PREPARED_CACHE");
+        if (native_input && native_input->previous) {
+            previous_prepared = native_input->previous;
+            prepared_prefix_count = native_input->prefix_count;
+        }
+        if (req.contains("qw3_cache_messages") && !req["qw3_cache_messages"].is_boolean()) {
+            set_error_response(res, 400, "qw3_cache_messages must be boolean");
+            return;
+        }
+        retain_raw_messages = native_prepared_cache || (use_message_prefix_cache &&
+            req.value("qw3_cache_messages", false) && !req.value("stream", false));
+        if (req.contains("qw3_messages_prefix")) {
+            const json &prefix = req["qw3_messages_prefix"];
+            if (!retain_raw_messages || !prefix.is_object() ||
+                !prefix.contains("id") || !prefix["id"].is_string() ||
+                !prefix.contains("count") || !prefix["count"].is_number_integer() ||
+                prefix["count"].get<int64_t>() < 0) {
+                set_error_response(res, 400, "invalid or unsupported qw3_messages_prefix");
+                return;
+            }
+            json restored;
+            bool missing = false, valid = false;
+            if (use_prepared_prefix_cache) {
+                prepared_prefix_count = static_cast<size_t>(prefix["count"].get<int64_t>());
+                const auto status = prepared_message_cache.restore(
+                    prefix["id"].get<std::string>(), prepared_prefix_count, previous_prepared);
+                missing = status == detail::PreparedMessageCache::Restore::Missing;
+                valid = status == detail::PreparedMessageCache::Restore::Ok;
+            } else {
+                const auto status = message_prefix_cache.restore(
+                    prefix["id"].get<std::string>(),
+                    static_cast<size_t>(prefix["count"].get<int64_t>()), req["messages"], restored);
+                missing = status == detail::MessagePrefixCache::Restore::Missing;
+                valid = status == detail::MessagePrefixCache::Restore::Ok;
+                if (valid) req["messages"] = std::move(restored);
+            }
+            if (missing) {
+                res.status = 409;
+                res.set_content(dump_json(json{{"error", {
+                    {"code", "qw3_messages_cache_miss"},
+                    {"message", "Message prefix expired; resend full messages"}}}}),
+                    "application/json");
+                return;
+            }
+            if (!valid) {
+                set_error_response(res, 400, "message prefix count exceeds cached history");
+                return;
+            }
+        }
+        if (native_prepared_cache && !previous_prepared && !req.contains("qw3_messages_prefix")) {
+            previous_prepared = prepared_message_cache.match_prefix(
+                req["messages"], prepared_prefix_count);
+            auto &messages = req["messages"].get_ref<json::array_t &>();
+            messages.erase(messages.begin(), messages.begin() + prepared_prefix_count);
+        }
+        // Keep source identity separate from the rendered representation. The
+        // legacy path retains a raw snapshot; prepared records hold both forms.
+        if (retain_raw_messages && !use_prepared_prefix_cache) raw_messages = req["messages"];
         PreparedVisionRequest prepared_vision;
         std::string vision_error;
-        if (!prepare_vision_messages(req["messages"], vision_encoder,
-                                     prepared_vision, vision_error)) {
+        bool vision_ready;
+        if (retain_raw_messages && use_prepared_prefix_cache) {
+            prepared_candidate = std::make_shared<detail::PreparedMessageCache::Entry>();
+            vision_ready = detail::prepare_vision_messages_incremental(
+                req["messages"], prepared_vision_encoder, previous_prepared,
+                prepared_prefix_count, *prepared_candidate, prepared_vision, vision_error);
+            if (vision_ready && native_input) prepared_candidate->native = native_input->snapshot;
+        } else {
+            vision_ready = prepare_vision_messages(req["messages"], vision_encoder,
+                                                   prepared_vision, vision_error);
+        }
+        if (!vision_ready) {
             set_error_response(res, 400, vision_error);
             return;
         }
@@ -3332,10 +3176,12 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const bool map_retrieval_groups =
             explicit_retrieval_groups || auto_message_groups;
         const bool stable_harness_reasoning =
-            harness_semantic_pins && cfg.kvmem_prefix_cache;
+            (harness_semantic_pins && cfg.kvmem_prefix_cache) ||
+            (harness.kind != detail::HarnessKind::None &&
+             env_flag_enabled("QW3_HARNESS_STABLE_REASONING"));
         size_t control_prefix_end = 0;
         const auto server_render_start = std::chrono::steady_clock::now();
-        const std::string prompt = render_messages(
+        std::string prompt = render_messages(
             req["messages"], tools, enable_thinking, forced_tool_name,
             (transcript_replay || map_retrieval_groups ||
              harness_semantic_pins)
@@ -3347,7 +3193,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             harness_semantic_pins ? &control_prefix_end : nullptr);
         const auto server_render_end = std::chrono::steady_clock::now();
         std::vector<int32_t> prompt_token_ids =
-            usage_tokenizer.encode(prompt);
+            encode_usage(prompt);
         const auto server_tokenize_end = std::chrono::steady_clock::now();
         size_t prompt_token_count = prompt_token_ids.size();
         std::optional<detail::HarnessSemanticPlan> harness_semantic_plan;
@@ -3382,7 +3228,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         std::optional<size_t> guided_trajectory_key;
         detail::KvmemHarnessRefreshReason harness_refresh_reason =
             detail::KvmemHarnessRefreshReason::None;
-        if ((guided_boundary || guided_middecode) &&
+        if (engine.kvmem_enabled && engine.kvmem_query_conditioned &&
             harness.kind != detail::HarnessKind::None &&
             !req["messages"].empty() && harness_semantic_plan.has_value()) {
             const detail::HarnessSemanticPlan &semantic_plan =
@@ -3460,7 +3306,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                                   0,
                                   engine.kvmem_middecode_trigger_tokens))
                             : 0,
-                        decision});
+                        decision}, guided_boundary || guided_middecode);
             harness_refresh_reason = refresh.reason;
             if (refresh.reselect) {
                 private_guided_refresh = refresh.private_query;
@@ -3528,6 +3374,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const bool automatic_harness_refresh_active =
             automatic_harness_retrieval || headroom_grace;
         const bool keep_refresh_epoch =
+            ((!guided_boundary && !guided_middecode) &&
+             same_task_guided_suppressed) ||
             detail::kvmem_refresh_prefill_keeps_epoch(
                 headroom_grace,
                 automatic_harness_retrieval && private_guided_refresh &&
@@ -3705,7 +3553,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             size_t decoded_bytes = 0;
             bool decode_matches = true;
             for (int32_t token : prompt_token_ids) {
-                const std::string piece = usage_tokenizer.decode_one(token);
+                const std::string piece = decode_usage(token);
                 if (decoded_bytes + piece.size() > prompt.size() ||
                     prompt.compare(decoded_bytes, piece.size(), piece) != 0) {
                     decode_matches = false;
@@ -4271,7 +4119,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             bool decode_matches = true;
             for (int32_t token : prompt_token_ids) {
                 const std::string piece =
-                    usage_tokenizer.decode_one(token);
+                    decode_usage(token);
                 if (decoded_bytes + piece.size() > prompt.size() ||
                     prompt.compare(decoded_bytes, piece.size(), piece) != 0) {
                     decode_matches = false;
@@ -4550,7 +4398,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     harness.kind,
                     stable_harness_reasoning);
                 const std::vector<int32_t> tok_empty =
-                    usage_tokenizer.encode(empty_prompt);
+                    encode_usage(empty_prompt);
                 size_t qb = 0;
                 const size_t prefix_max =
                     std::min(prompt_token_ids.size(), tok_empty.size());
@@ -4605,14 +4453,14 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     const std::string gap = prompt.substr(
                         byte_cursor, span.segment_begin - byte_cursor);
                     const std::vector<int32_t> gap_tokens =
-                        usage_tokenizer.encode(gap);
+                        encode_usage(gap);
                     rebuilt.insert(rebuilt.end(), gap_tokens.begin(), gap_tokens.end());
                     token_cursor += gap_tokens.size();
 
                     const std::string segment = prompt.substr(
                         span.segment_begin, span.segment_end - span.segment_begin);
                     const std::vector<int32_t> segment_tokens =
-                        usage_tokenizer.encode(segment);
+                        encode_usage(segment);
                     const size_t segment_token_begin = token_cursor;
                     if (span.message_index < msgs.size() &&
                         msgs[span.message_index].is_object() &&
@@ -4641,7 +4489,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                             local_content_begin,
                             local_content_end - local_content_begin);
                         const std::vector<int32_t> empty_tokens =
-                            usage_tokenizer.encode(empty_segment);
+                            encode_usage(empty_segment);
                         size_t local_qb = 0;
                         const size_t prefix_max =
                             std::min(segment_tokens.size(), empty_tokens.size());
@@ -4673,7 +4521,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     byte_cursor = span.segment_end;
                 }
                 const std::vector<int32_t> tail_tokens =
-                    usage_tokenizer.encode(prompt.substr(byte_cursor));
+                    encode_usage(prompt.substr(byte_cursor));
                 rebuilt.insert(rebuilt.end(), tail_tokens.begin(), tail_tokens.end());
                 if (rebuilt != prompt_token_ids) {
                     set_error_response(
@@ -4784,9 +4632,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     /*require_tool_call=*/tool_choice_required,
                     harness.kind,
                     stable_harness_reasoning);
-                const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
+                const std::vector<int32_t> tok_full = encode_usage(prompt);
                 const std::vector<int32_t> tok_empty =
-                    usage_tokenizer.encode(empty_prompt);
+                    encode_usage(empty_prompt);
                 size_t cb = 0;
                 const size_t prefix_max = std::min(tok_full.size(), tok_empty.size());
                 while (cb < prefix_max && tok_full[cb] == tok_empty[cb]) ++cb;
@@ -4872,9 +4720,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     /*require_tool_call=*/tool_choice_required,
                     harness.kind,
                     stable_harness_reasoning);
-                const std::vector<int32_t> tok_full = usage_tokenizer.encode(prompt);
+                const std::vector<int32_t> tok_full = encode_usage(prompt);
                 const std::vector<int32_t> tok_empty =
-                    usage_tokenizer.encode(empty_prompt);
+                    encode_usage(empty_prompt);
                 size_t qb = 0;
                 const size_t prefix_max = std::min(tok_full.size(), tok_empty.size());
                 while (qb < prefix_max && tok_full[qb] == tok_empty[qb]) ++qb;
@@ -4943,9 +4791,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                         harness.kind,
                         stable_harness_reasoning);
                     const std::vector<int32_t> tok_full =
-                        usage_tokenizer.encode(prompt);
+                        encode_usage(prompt);
                     const std::vector<int32_t> tok_empty =
-                        usage_tokenizer.encode(empty_prompt);
+                        encode_usage(empty_prompt);
                     if (tok_full.size() > tok_empty.size()) {
                         size_t qb = 0;
                         const size_t maxn = tok_empty.size();
@@ -4985,13 +4833,33 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             std::string finalize_error;
             if (!finalize_vision_tokens(prompt_token_ids, usage_tokenizer,
                                         prepared_vision, g,
-                                        finalize_error)) {
+                                        finalize_error,
+                                        previous_prepared ? previous_prepared->mapping : nullptr,
+                                        prepared_candidate ? &prepared_candidate->mapping : nullptr)) {
                 set_error_response(res, 400, finalize_error);
                 return;
             }
             g.prompt_token_ids_override.assign(
                 prompt_token_ids.begin(), prompt_token_ids.end());
-            for (const auto &span : prepared_vision.token_spans) {
+            if (prepared_candidate) {
+                std::cerr << "[qw3-prepared-prefix] messages_reused=" << prepared_vision.prefix_messages_reused
+                          << " images_reused=" << prepared_vision.prefix_images_reused
+                          << " images_new=" << (prepared_vision.sources.size() - prepared_vision.prefix_images_reused)
+                          << " mapping_tokens_reused=" << prepared_vision.mapping_tokens_reused
+                          << " mapping_tokens_total=" << prompt_token_ids.size() << '\n';
+            }
+            const bool retrievable_visual_history = engine.kvmem_enabled &&
+                env_flag_enabled("QW3_KVMEM_RETRIEVABLE_VISUAL_HISTORY");
+            std::vector<detail::VisualTokenSpan> protected_visual_spans;
+            for (const auto &span : g.kvmem_pinned_token_spans) {
+                protected_visual_spans.emplace_back(span.begin, span.end);
+            }
+            protected_visual_spans.emplace_back(
+                g.kvmem_query_begin, g.kvmem_query_end);
+            const auto mandatory_images = detail::mandatory_visual_spans(
+                prepared_vision.token_spans, protected_visual_spans,
+                retrievable_visual_history);
+            for (const auto &span : mandatory_images) {
                 g.kvmem_pinned_token_spans.push_back(
                     GenerationOptions::KvMemPinnedTokenSpan{
                         span.first, span.second,
@@ -5035,8 +4903,8 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     std::count(pinned.begin(), pinned.end(), uint8_t{1}));
                 // The generic request plan was drafted before visual token
                 // IDs were installed so byte/token span mapping stayed exact.
-                // Refresh its capacity accounting now that the atomic visual
-                // spans are known, without changing any text-only plan.
+                // Refresh capacity using protected images; unpinned historical
+                // image blocks remain in the source history for retrieval.
                 plan_input.raw_mandatory_blocks = std::max(
                     plan_input.raw_mandatory_blocks, pinned_blocks);
                 plan_input.mandatory_blocks = pinned_blocks;
@@ -5060,7 +4928,13 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                       << " vision_cache_misses="
                       << prepared_vision.encoded.cache_misses
                       << " mandatory_spans="
-                      << prepared_vision.token_spans.size() << "\n";
+                      << mandatory_images.size()
+                      << " retrievable_visual_spans="
+                      << (prepared_vision.token_spans.size() -
+                          mandatory_images.size())
+                      << " visual_history_policy="
+                      << (retrievable_visual_history ? "retrievable" : "pin-all")
+                      << "\n";
         }
 
         // Controlled round-alignment experiment. The request's byte spans are
@@ -5121,9 +4995,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             }
 
             const std::vector<int32_t> newline_tokens =
-                usage_tokenizer.encode("\n");
+                encode_usage("\n");
             if (newline_tokens.size() != 1 ||
-                usage_tokenizer.decode_one(newline_tokens.front()) != "\n") {
+                decode_usage(newline_tokens.front()) != "\n") {
                 set_error_response(
                     res, 500,
                     "tokenizer has no exact one-token newline for "
@@ -5367,6 +5241,10 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const std::string id = gen_id("chatcmpl-");
         const int64_t created = unix_now();
         const uint64_t rid = ++req_counter;
+        // The native Messages wrapper uses this exact count after preparation;
+        // it must not encode every screenshot once just to count, then again
+        // in the actual request path.
+        res.set_header("X-QW3-Input-Tokens", std::to_string(prompt_token_count));
         const auto server_preprocess_end = std::chrono::steady_clock::now();
         const auto t0 = server_preprocess_end;
         auto log_server_accounting =
@@ -5449,18 +5327,33 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         const json tools_schema = tools ? *tools : json();
 
         if (stream) {
+            // The HTTP library can copy its content-provider functor. Keep the
+            // full visual row/position arrays in one immutable request owner,
+            // rather than copying them with each functor. This branch returns
+            // after installing the provider, so the local prompt/options can
+            // transfer ownership without affecting the non-streaming path.
+            struct StreamRequestState {
+                std::string prompt;
+                GenerationOptions options;
+            };
+            const auto stream_request =
+                std::make_shared<const StreamRequestState>(
+                    StreamRequestState{std::move(prompt), std::move(g)});
             res.set_header("Cache-Control", "no-cache");
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [&, prompt, g, stops, id, created, rid, t0,
+                [&, stream_request, stops, id, created, rid, t0,
                  server_request_start, enable_thinking,
                  tool_request, forced_tool_request, tools_schema,
                  stream_include_usage, prompt_token_count, route,
                  fallback_reason, kvmem_session_request,
                  kvmem_session_reset,
                  kvmem_cache_request, kvmem_cache_id,
-                 log_server_accounting](size_t, httplib::DataSink &sink) {
+                 log_server_accounting, native_prepared_cache,
+                 prepared_candidate](size_t, httplib::DataSink &sink) {
+                    const auto &prompt = stream_request->prompt;
+                    const auto &g = stream_request->options;
                     std::unique_lock<std::mutex> gen_lk(gen_mu, std::defer_lock);
                     if (!g.continuous_batching) gen_lk.lock();
                     std::string acc;
@@ -5516,6 +5409,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                     };
                     auto send_done = [&](const std::string &finish_reason) {
                         if (client_closed) return;
+                        if (native_prepared_cache && prepared_candidate) {
+                            prepared_message_cache.store(gen_id("msgcache-"), prepared_candidate);
+                        }
                         json done = {
                             {"id", id}, {"object", "chat.completion.chunk"},
                             {"created", created}, {"model", model_id},
@@ -6063,6 +5959,16 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 {"finish_reason", finish}}})},
             {"usage", usage_json(prompt_token_count, completion_tokens)},
             {"timing", ttft.timing_json(std::chrono::steady_clock::now())}};
+        if (retain_raw_messages) {
+            const std::string cache_id = gen_id("msgcache-");
+            const size_t message_count = prepared_candidate ? prepared_candidate->messages.size() : raw_messages.size();
+            const bool retained = prepared_candidate
+                ? prepared_message_cache.store(cache_id, std::move(prepared_candidate))
+                : message_prefix_cache.store(cache_id, std::move(raw_messages));
+            if (retained) {
+                out["qw3_messages_cache"] = json{{"id", cache_id}, {"count", message_count}};
+            }
+        }
         if (kvmem_cache_request) {
             const KvMemLocalCacheInfo info =
                 eng.kvmem_local_cache_info(kvmem_cache_id);
@@ -6142,8 +6048,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             /*add_generation_prompt=*/true,
             /*require_tool_call=*/tool_choice_required,
             detail::HarnessKind::ClaudeCode,
-            engine.kvmem_enabled && cfg.kvmem_prefix_cache);
-        count = usage_tokenizer.encode(prompt).size();
+            (engine.kvmem_enabled && cfg.kvmem_prefix_cache) ||
+                env_flag_enabled("QW3_HARNESS_STABLE_REASONING"));
+        count = encode_usage(prompt).size();
         return true;
     };
 
@@ -6152,7 +6059,9 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                  httplib::Response &res) {
         json anthropic_req;
         try {
-            anthropic_req = json::parse(hreq.body);
+            anthropic_req = detail::parse_native_request_json(
+                hreq.body, hreq.body.size() >= 65536 &&
+                    env_flag_enabled("QW3_NATIVE_FAST_JSON", true));
         } catch (const std::exception &e) {
             set_anthropic_error(
                 res, 400, std::string("invalid JSON: ") + e.what());
@@ -6178,37 +6087,42 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
     svr.Post("/v1/messages",
              [&](const httplib::Request &hreq,
                  httplib::Response &res) {
-        json anthropic_req;
+        const auto native_request_start = std::chrono::steady_clock::now();
+        const bool direct_request = env_flag_enabled("QW3_ANTHROPIC_DIRECT_REQUEST", true);
+        const bool wire_prefix = direct_request && use_prepared_prefix_cache &&
+            env_flag_enabled("QW3_ANTHROPIC_PREPARED_CACHE") &&
+            env_flag_enabled("QW3_ANTHROPIC_WIRE_PREFIX", true);
+        detail::NativePreparedRequest native_input;
+        std::string error;
         try {
-            anthropic_req = json::parse(hreq.body);
+            if (!detail::prepare_native_messages_request(
+                    hreq.body, native_input, error,
+                    wire_prefix ? prepared_message_cache.latest_native() : nullptr,
+                    wire_prefix, hreq.body.size() >= 65536 &&
+                        env_flag_enabled("QW3_NATIVE_FAST_JSON", true))) {
+                set_anthropic_error(res, 400, error);
+                return;
+            }
         } catch (const std::exception &e) {
             set_anthropic_error(
                 res, 400, std::string("invalid JSON: ") + e.what());
             return;
         }
-        json openai_req;
-        std::string error;
-        if (!detail::anthropic_request_to_openai(
-                anthropic_req, openai_req, error)) {
-            set_anthropic_error(res, 400, error);
-            return;
-        }
+        const auto native_convert_end = std::chrono::steady_clock::now();
+        json &openai_req = native_input.openai;
         const bool stream = openai_req.value("stream", false);
         const std::string requested_model =
-            anthropic_req.value("model", model_id);
-        size_t input_tokens = 0;
-        if (!anthropic_prompt_token_count(
-                openai_req, input_tokens, error)) {
-            set_anthropic_error(res, 400, error);
-            return;
-        }
-
+            native_input.request.value("model", model_id);
         httplib::Request internal_request;
-        internal_request.body = dump_json(openai_req);
+        if (!direct_request) internal_request.body = dump_json(openai_req);
+        const auto native_bridge_end = std::chrono::steady_clock::now();
         httplib::Response internal_response;
         handle_chat_completions(
             internal_request, internal_response,
-            detail::HarnessProtocol::AnthropicMessages);
+            detail::HarnessProtocol::AnthropicMessages,
+            direct_request ? &openai_req : nullptr,
+            wire_prefix ? &native_input : nullptr);
+        const auto native_handler_end = std::chrono::steady_clock::now();
         if (internal_response.status >= 400) {
             std::string message = internal_response.body;
             try {
@@ -6225,6 +6139,32 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
             set_anthropic_error(
                 res, internal_response.status, message, type);
             return;
+        }
+
+        const size_t input_tokens = std::stoull(
+            internal_response.get_header_value("X-QW3-Input-Tokens"));
+        if (env_flag_enabled("QW3_ANTHROPIC_PREPROCESS_TRACE")) {
+            const auto ms = [](auto end, auto begin) {
+                return std::chrono::duration<double, std::milli>(end - begin).count();
+            };
+            std::cerr << "[qw3-anthropic-preprocess] stream=" << stream
+                      << " direct=" << direct_request
+                      << " input_tokens=" << input_tokens
+                      << " request_start_ns="
+                      << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             native_request_start.time_since_epoch()).count()
+                      << " handler_end_ns="
+                      << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             native_handler_end.time_since_epoch()).count()
+                      << " parse_ms=" << native_input.parse_ms
+                      << " convert_ms=" << native_input.convert_ms
+                      << " wire_prefix_messages=" << native_input.wire_prefix_messages
+                      << " wire_prefix_bytes=" << native_input.wire_prefix_bytes
+                      << " wire_prefix_system_fallback=" << native_input.system_fallback
+                      << " bridge_ms=" << ms(native_bridge_end, native_convert_end)
+                      << " handler_ms=" << ms(native_handler_end, native_bridge_end)
+                      << " total_ms=" << ms(native_handler_end, native_request_start)
+                      << '\n';
         }
 
         if (!stream) {
@@ -6381,7 +6321,7 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
         (void)explicit_max_tokens;
         (void)requested_max_tokens;
         const size_t prompt_token_count = exact_prompt_tokens.empty()
-            ? usage_tokenizer.encode(prompt).size()
+            ? encode_usage(prompt).size()
             : exact_prompt_tokens.size();
         if (archive_prefix_tokens + prompt_token_count >=
             static_cast<uint64_t>(std::max(1, engine.ctx_size))) {

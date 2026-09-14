@@ -52,6 +52,12 @@ KVMEM_GEN_BUDGET="${QW3_OSWORLD_KVMEM_GEN_BUDGET:-${MAX_OUTPUT_TOKENS}}"
 # the bounded tiered pool instead of a dense full-context allocation.
 KVMEM_BUDGET="${QW3_OSWORLD_KVMEM_BUDGET:-$((CONTEXT_TOKENS - KVMEM_GEN_BUDGET - KVMEM_BLOCK_TOKENS))}"
 KVMEM_CPU_GB="${QW3_OSWORLD_KVMEM_CPU_GB:-2}"
+KVMEM_METHOD="${QW3_OSWORLD_KVMEM_METHOD:-recency}"
+KVMEM_QUERY_CONDITIONED="${QW3_OSWORLD_KVMEM_QUERY_CONDITIONED:-0}"
+KVMEM_INDEX_PLACEMENT="${QW3_OSWORLD_KVMEM_INDEX_PLACEMENT:-gpu}"
+export QW3_MESSAGE_PREFIX_CACHE="${QW3_MESSAGE_PREFIX_CACHE:-${QW3_OSWORLD_MESSAGE_PREFIX_CACHE:-0}}"
+export QW3_PREPARED_PREFIX_CACHE="${QW3_PREPARED_PREFIX_CACHE:-1}"
+QW3_BINARY="${QW3_OSWORLD_BINARY:-${QW3_ROOT}/build/qw3}"
 if [[ -n "${QW3_OSWORLD_EVAL_PROFILE:-}" ]]; then
   EVALUATION_PROFILE="${QW3_OSWORLD_EVAL_PROFILE}"
 elif [[ "${MAX_STEPS}" -eq 500 ]]; then
@@ -126,10 +132,14 @@ git -C "${QW3_ROOT}" status --short --branch >"${RUN_DIR}/source_status.txt"
 git -C "${QW3_ROOT}" diff --binary HEAD -- >"${RUN_DIR}/source_dirty.patch"
 git -C "${OSWORLD_ROOT}" diff --binary HEAD -- >"${RUN_DIR}/osworld_source_dirty.patch"
 tar -czf "${RUN_DIR}/osworld_source_untracked_snapshot.tar.gz" \
-  -C "${OSWORLD_ROOT}" mm_agents/qw3_summary_history.py
+  -C "${OSWORLD_ROOT}" mm_agents/qw3_summary_history.py mm_agents/qw3_message_transport.py
 tar -czf "${RUN_DIR}/source_untracked_snapshot.tar.gz" \
   -C "${QW3_ROOT}" \
   src/multimodal_prefix_cache.hpp \
+  src/message_prefix_cache.hpp \
+  src/prepared_message_cache.hpp \
+  src/vision_request_preparation.hpp \
+  src/chat_token_cache.hpp \
   src/global_kv_page_pool.hpp \
   src/request_cancellation.hpp \
   scripts/multimodal_prefix_cache_canary.py \
@@ -158,10 +168,32 @@ case "${KVMEM_PREFIX_CACHE}" in
       --kvmem-budget "${KVMEM_BUDGET}"
       --kvmem-prefill-budget "${KVMEM_BUDGET}"
       --kvmem-gen-budget "${KVMEM_GEN_BUDGET}"
-      --kvmem-method recency
+      --kvmem-method "${KVMEM_METHOD}"
+      --kvmem-retrieval-method "${QW3_OSWORLD_KVMEM_RETRIEVAL_METHOD:-mean-k}"
+      --kvmem-index-placement "${KVMEM_INDEX_PLACEMENT}"
+      --kvmem-opt-stage-out "${QW3_OSWORLD_KVMEM_OPT_STAGE_OUT:-on}"
+      --kvmem-update-mode "${QW3_OSWORLD_KVMEM_UPDATE_MODE:-interval}"
+      --kvmem-guided-reselect "${QW3_OSWORLD_KVMEM_GUIDED_RESELECT:-off}"
+      --kvmem-guided-thinking-tokens "${QW3_OSWORLD_KVMEM_GUIDED_THINKING_TOKENS:-0}"
+      --kvmem-guided-query-tokens "${QW3_OSWORLD_KVMEM_GUIDED_QUERY_TOKENS:-256}"
+      --kvmem-middecode-trigger-tokens "${QW3_OSWORLD_KVMEM_REFRESH_TOKENS:-28672}"
+      --kvmem-middecode-max-refreshes "${QW3_OSWORLD_KVMEM_MIDDECODE_MAX_REFRESHES:-2}"
+      --kvmem-nvme-gb 0
+      --no-kvmem-raw-k-nvme
       --kvmem-gpu-memory-ratio 0.90
       --kvmem-cpu-gb "${KVMEM_CPU_GB}"
     )
+    case "${KVMEM_QUERY_CONDITIONED}" in
+      0) ;;
+      1) kvmem_args+=(--kvmem-query-conditioned) ;;
+      *) die "QW3_OSWORLD_KVMEM_QUERY_CONDITIONED must be 0 or 1." ;;
+    esac
+    if [[ -n "${QW3_OSWORLD_KVMEM_SINK_TOKENS:-}" ]]; then
+      kvmem_args+=(--kvmem-sink-tokens "${QW3_OSWORLD_KVMEM_SINK_TOKENS}")
+    fi
+    if [[ -n "${QW3_OSWORLD_KVMEM_RECENT_TOKENS:-}" ]]; then
+      kvmem_args+=(--kvmem-recent-tokens "${QW3_OSWORLD_KVMEM_RECENT_TOKENS}")
+    fi
     ;;
   *)
     die "QW3_OSWORLD_KVMEM_PREFIX_CACHE must be 0 or 1."
@@ -197,14 +229,14 @@ case "${SERVER_ENABLE_THINKING}" in
   0) ;;
   *) die "QW3_OSWORLD_SERVER_ENABLE_THINKING must be 0 or 1." ;;
 esac
-./build/qw3 serve \
+"${QW3_BINARY}" serve \
   --model "${MODEL}" \
   --vision-model "${VISION_MODEL}" \
   --vision-device cuda \
   --host 127.0.0.1 \
   --port "${PORT}" \
   --ctx "${CONTEXT_TOKENS}" \
-  --kv-dtype fp16 \
+  --kv-dtype "${QW3_OSWORLD_KV_DTYPE:-fp16}" \
   --prefill-chunk 2048 \
   --mtp-chain "${MTP_CHAIN}" \
   "${serve_route_args[@]}" \
@@ -217,6 +249,7 @@ esac
   "${kvmem_args[@]}" \
   >"${SERVER_LOG}" 2>&1 &
 server_pid=$!
+printf '%s\n' "${server_pid}" >"${RUN_DIR}/server.pid"
 
 ready=0
 for _ in $(seq 1 180); do

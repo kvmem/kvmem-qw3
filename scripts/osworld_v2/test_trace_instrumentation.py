@@ -64,6 +64,20 @@ class FakeAgent(Qwen35VLAgent):
 
 
 class TraceInstrumentationTest(unittest.TestCase):
+    def test_full_history_keeps_early_evidence_past_sliding_limits(self):
+        agent = FakeAgent(history_mode="full", history_n=2, image_max=2, fold_size=1)
+        agent.reset()
+        for step in range(1, 8):
+            agent.predict("Keep the first screenshot's evidence.", {"screenshot": screenshot_bytes()})
+            trace = agent.last_step_trace["compaction"]
+            self.assertEqual(trace["included_steps"], list(range(1, step + 1)))
+            self.assertEqual(trace["active_image_count"], step)
+            self.assertEqual(trace["history_truncated_steps"], 0)
+            self.assertFalse(trace["triggered"])
+            self.assertEqual(trace["collapsed_steps"], [])
+            self.assertEqual(agent.last_api_metadata["usage"]["prompt_tokens"], 1000 + step * 100)
+        self.assertIsNone(agent.summary_history)
+
     def test_native_tool_response_preserves_reasoning_and_action_text(self):
         message = SimpleNamespace(
             content="Action: Click the center of the OK button.",

@@ -1,0 +1,11 @@
+upstream/
+__pycache__/
+*.pyc
+native_build/
+native_source/
+.venv/
+compat_generated/
+compat_build/
+wheels/
+results/
+!results/README.md

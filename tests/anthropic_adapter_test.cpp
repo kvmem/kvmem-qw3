@@ -39,6 +39,36 @@ std::vector<json> parse_named_sse(const std::string &wire) {
     return events;
 }
 
+void test_empty_and_text_tool_results() {
+    const std::vector<std::pair<json, std::string>> cases = {
+        {json::array(), ""},
+        {"", ""},
+        {json::array({json{{"type", "text"}, {"text", ""}}}), ""},
+        {json::array({json{{"type", "text"}, {"text", "第一行\n"}},
+                      json{{"type", "text"}, {"text", "second 😀"}}}),
+         "第一行\nsecond 😀"},
+    };
+    for (const auto &item : cases) {
+        for (bool is_error : {false, true}) {
+            json request = {
+                {"model", "qwen"}, {"max_tokens", 16},
+                {"messages", json::array({json{
+                    {"role", "user"}, {"content", json::array({json{
+                        {"type", "tool_result"}, {"tool_use_id", "empty_tool"},
+                        {"content", item.first}, {"is_error", is_error}}})}}})}};
+            json converted;
+            std::string error;
+            require(anthropic_request_to_openai(request, converted, error), error);
+            const auto &message = converted["messages"].back();
+            require(message["role"] == "tool" && message["tool_call_id"] == "empty_tool",
+                    "empty/text result lost tool association");
+            require(message["content"] == (is_error ? "[tool_error]\n" : "") + item.second,
+                    "empty/text result changed content or order: input=" + item.first.dump() +
+                    " actual=" + message["content"].dump());
+        }
+    }
+}
+
 void test_request_conversion() {
     const json request = {
         {"model", "Qwen3.8-27B"},
@@ -191,6 +221,30 @@ void test_tool_result_followed_by_reminder_preserves_order() {
                     .find("Instructions from: CLAUDE.md") !=
                     std::string::npos,
             "post-tool Claude reminder was lost or reordered");
+}
+
+void test_tool_result_images() {
+    json request = {{"model", "qwen"}, {"max_tokens", 64},
+        {"messages", json::array({json{{"role", "user"}, {"content", json::array({
+            json{{"type", "tool_result"}, {"tool_use_id", "toolu_screen"}, {"is_error", true},
+                 {"content", json::array({json{{"type", "text"}, {"text", "screen"}},
+                     json{{"type", "image"}, {"source", {{"type", "base64"},
+                           {"media_type", "image/png"}, {"data", "aGVsbG8="}}}},
+                     json{{"type", "text"}, {"text", "after"}}})}},
+            json{{"type", "text"}, {"text", "reminder"}}})}}})}};
+    json converted; std::string error;
+    require(anthropic_request_to_openai(request, converted, error), error);
+    const auto &messages = converted["messages"];
+    require(messages.size() == 2 && messages[0]["role"] == "tool" &&
+        messages[0]["tool_call_id"] == "toolu_screen", "image lost tool association");
+    const auto &content = messages[0]["content"];
+    require(content.size() == 4 && content[0]["text"] == "[tool_error]\n" &&
+        content[1]["text"] == "screen" && content[2]["type"] == "image_url" &&
+        content[3]["text"] == "after" && messages[1]["content"] == "reminder",
+        "tool image order changed");
+    request["messages"][0]["content"][0]["content"][1]["type"] = "document";
+    require(!anthropic_request_to_openai(request, converted, error),
+        "unsupported tool content silently accepted");
 }
 
 void test_malformed_field_type_returns_error() {
@@ -370,9 +424,11 @@ void test_streaming_error_is_terminal() {
 } // namespace
 
 int main() {
+    test_empty_and_text_tool_results();
     test_request_conversion();
     test_billing_marker_does_not_invalidate_prompt_prefix();
     test_converts_base64_image();
+    test_tool_result_images();
     test_tool_result_followed_by_reminder_preserves_order();
     test_malformed_field_type_returns_error();
     test_nonstream_response_conversion();

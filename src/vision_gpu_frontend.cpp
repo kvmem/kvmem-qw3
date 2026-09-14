@@ -6,11 +6,12 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
-#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -29,26 +30,6 @@ void require_ok(DeviceStatus status, const char *operation) {
     }
 }
 
-uint16_t float_to_bf16(float value) {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    // Round to nearest, ties to even. Preserve NaNs rather than accidentally
-    // rounding them to infinity.
-    if ((bits & 0x7f800000u) != 0x7f800000u) {
-        bits += 0x7fffu + ((bits >> 16) & 1u);
-    } else if ((bits & 0x007fffffu) != 0) {
-        bits |= 0x00010000u;
-    }
-    return static_cast<uint16_t>(bits >> 16);
-}
-
-float round_to_bf16(float value) {
-    const uint32_t bits = static_cast<uint32_t>(float_to_bf16(value)) << 16;
-    float rounded = 0.0f;
-    std::memcpy(&rounded, &bits, sizeof(rounded));
-    return rounded;
-}
-
 uint64_t shape_count(const std::vector<uint64_t> &shape) {
     uint64_t count = 1;
     for (uint64_t dim : shape) {
@@ -60,23 +41,9 @@ uint64_t shape_count(const std::vector<uint64_t> &shape) {
     return count;
 }
 
-uint64_t image_fingerprint(const CpuVisionImage &image) {
-    uint64_t hash = 1469598103934665603ULL;
-    const auto mix = [&](std::string_view value) {
-        for (unsigned char byte : value) {
-            hash ^= static_cast<uint64_t>(byte);
-            hash *= 1099511628211ULL;
-        }
-        hash ^= 0xffu;
-        hash *= 1099511628211ULL;
-    };
-    mix(image.media_type);
-    mix(image.base64_data);
-    return hash != 0 ? hash : 1;
-}
-
-bool same_image(const CpuVisionImage &a, const CpuVisionImage &b) {
-    return a.media_type == b.media_type && a.base64_data == b.base64_data;
+bool same_image(const VisionImageSourcePtr &a, const VisionImageSourcePtr &b) {
+    return a == b || (a->image().media_type == b->image().media_type &&
+                      a->image().base64_data == b->image().base64_data);
 }
 
 struct HostTensor {
@@ -212,11 +179,12 @@ struct GpuVisionFrontend::Impl {
     };
 
     struct CacheEntry {
-        CpuVisionImage image;
+        VisionImageSourcePtr image;
         uint64_t fingerprint = 0;
         CpuVisionEncoding::Grid grid;
         std::shared_ptr<DeviceTensor> tensor;
         uint64_t bytes = 0;
+        std::shared_ptr<std::vector<uint16_t>> host_bf16;
     };
 
     struct ForwardResult {
@@ -229,6 +197,7 @@ struct GpuVisionFrontend::Impl {
         CpuVisionEncoding::Grid grid;
         std::shared_ptr<DeviceTensor> tensor;
         uint32_t source_row = 0;
+        std::shared_ptr<DeviceInputEmbeddingStorage::CpuTensor> cpu;
     };
 
     DeviceBackend &backend;
@@ -246,8 +215,14 @@ struct GpuVisionFrontend::Impl {
     uint64_t uploaded_bytes = 0;
     std::mutex encode_mutex;
     uint64_t cache_limit_bytes = 512ULL << 20;
+    uint32_t max_batch_images = 4;
     uint64_t cache_bytes = 0;
     std::vector<CacheEntry> cache;
+    // Keep exact projected features after GPU eviction. This is an optional,
+    // bounded second tier, not another image encoder or a history summary.
+    uint64_t host_cache_limit_bytes = 0;
+    uint64_t host_cache_bytes = 0;
+    std::vector<CacheEntry> host_cache;
 
     Impl(DeviceBackend &backend_arg,
          const std::string &model_directory,
@@ -260,6 +235,16 @@ struct GpuVisionFrontend::Impl {
         if (!backend.supports_bf16_activations()) {
             throw std::runtime_error("native CUDA vision requires BF16 activations");
         }
+        if (const char *value = std::getenv("QW3_VISION_MAX_BATCH_IMAGES")) {
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long long count = std::strtoull(value, &end, 10);
+            if (errno == 0 && end != value && *end == '\0' && value[0] != '-' &&
+                count <= std::numeric_limits<uint32_t>::max()) {
+                // Zero preserves the unbounded batch for diagnostics.
+                max_batch_images = static_cast<uint32_t>(count);
+            }
+        }
         if (const char *value = std::getenv("QW3_VISION_GPU_CACHE_MIB")) {
             char *end = nullptr;
             errno = 0;
@@ -267,6 +252,15 @@ struct GpuVisionFrontend::Impl {
             if (errno == 0 && end != value && *end == '\0' &&
                 mib <= std::numeric_limits<uint64_t>::max() / (1ULL << 20)) {
                 cache_limit_bytes = static_cast<uint64_t>(mib) << 20;
+            }
+        }
+        if (const char *value = std::getenv("QW3_VISION_CPU_CACHE_MIB")) {
+            char *end = nullptr;
+            errno = 0;
+            const unsigned long long mib = std::strtoull(value, &end, 10);
+            if (errno == 0 && end != value && *end == '\0' && value[0] != '-' &&
+                mib <= std::numeric_limits<uint64_t>::max() / (1ULL << 20)) {
+                host_cache_limit_bytes = static_cast<uint64_t>(mib) << 20;
             }
         }
         SafeTensorReader reader(model_directory);
@@ -393,13 +387,18 @@ struct GpuVisionFrontend::Impl {
     void build_rope_and_segments(
             const std::vector<CpuVisionEncoding::Grid> &grids,
             uint64_t patch_count,
-            std::vector<uint16_t> &cos_values,
-            std::vector<uint16_t> &sin_values,
+            std::vector<float> &cos_values,
+            std::vector<float> &sin_values,
             std::vector<uint32_t> &cu_seqlens) const {
         cos_values.resize(static_cast<size_t>(patch_count) * kHeadDim);
         sin_values.resize(static_cast<size_t>(patch_count) * kHeadDim);
         cu_seqlens.clear();
         cu_seqlens.push_back(0);
+        std::array<float, kHeadDim / 4> inv_frequencies;
+        for (uint32_t i = 0; i < inv_frequencies.size(); ++i) {
+            inv_frequencies[i] = 1.0f / std::pow(
+                10000.0f, static_cast<float>(2 * i) / (kHeadDim / 2));
+        }
         uint64_t token = 0;
         for (const auto &grid : grids) {
             const uint32_t bh_count = grid.height / kMerge;
@@ -415,22 +414,16 @@ struct GpuVisionFrontend::Impl {
                                     const uint32_t base = d % (kHeadDim / 2);
                                     const uint32_t freq_index = base % 18;
                                     const uint32_t position = base < 18 ? h : w;
-                                    // Transformers moves the rotary module to
-                                    // BF16 before applying it: both inv_freq and
-                                    // position*inv_freq are rounded to BF16
-                                    // before cos/sin. Matching those two
-                                    // rounding points matters for tall/large
-                                    // images whose position IDs exceed 100.
-                                    const float inv_freq = round_to_bf16(std::pow(
-                                        10000.0f,
-                                        -static_cast<float>(2 * freq_index) /
-                                            36.0f));
-                                    const float angle = round_to_bf16(
-                                        static_cast<float>(position) * inv_freq);
+                                    // HF from_pretrained keeps this non-persistent
+                                    // rotary buffer in FP32, even with BF16 weights.
+                                    // Preserve FP32 through angles, cos/sin and
+                                    // Q/K rotation; only the rotated Q/K are BF16.
+                                    const float angle = static_cast<float>(position) *
+                                                        inv_frequencies[freq_index];
                                     cos_values[token * kHeadDim + d] =
-                                        float_to_bf16(std::cos(angle));
+                                        std::cos(angle);
                                     sin_values[token * kHeadDim + d] =
-                                        float_to_bf16(std::sin(angle));
+                                        std::sin(angle);
                                 }
                                 ++token;
                             }
@@ -467,16 +460,16 @@ struct GpuVisionFrontend::Impl {
         std::vector<float> position_weights;
         build_position_metadata(input.grids, patches, position_indices,
                                 position_weights);
-        std::vector<uint16_t> cos_values;
-        std::vector<uint16_t> sin_values;
+        std::vector<float> cos_values;
+        std::vector<float> sin_values;
         std::vector<uint32_t> cu_seqlens;
         build_rope_and_segments(input.grids, patches, cos_values, sin_values,
                                 cu_seqlens);
 
         auto patches_d = backend.tensor_bf16(patches * kPatchDim, "vision_patches");
         auto position_d = backend.tensor_bf16(patches * kHidden, "vision_position");
-        auto cos_d = backend.tensor_bf16(patches * kHeadDim, "vision_cos");
-        auto sin_d = backend.tensor_bf16(patches * kHeadDim, "vision_sin");
+        auto cos_d = backend.tensor_f32(patches * kHeadDim, "vision_cos");
+        auto sin_d = backend.tensor_f32(patches * kHeadDim, "vision_sin");
         require_ok(backend.copy_bytes_from_host(
             *patches_d, 0, input.patches.data(), input.patches.size() * 2),
             "upload vision patches");
@@ -485,10 +478,10 @@ struct GpuVisionFrontend::Impl {
             position_weights.data(), tokens, kHidden),
             "vision position interpolation");
         require_ok(backend.copy_bytes_from_host(
-            *cos_d, 0, cos_values.data(), cos_values.size() * 2),
+            *cos_d, 0, cos_values.data(), cos_values.size() * sizeof(float)),
             "upload vision cosine");
         require_ok(backend.copy_bytes_from_host(
-            *sin_d, 0, sin_values.data(), sin_values.size() * 2),
+            *sin_d, 0, sin_values.data(), sin_values.size() * sizeof(float)),
             "upload vision sine");
 
         auto hidden = backend.tensor_bf16(patches * kHidden, "vision_hidden");
@@ -510,7 +503,7 @@ struct GpuVisionFrontend::Impl {
 
         require_ok(backend.vision_bf16_linear(
             *hidden, *patch_weight, *patches_d, patch_bias.get(), nullptr,
-            tokens, kPatchDim, kHidden, false), "vision patch projection");
+            tokens, kPatchDim, kHidden, false, false, true), "vision patch projection");
         require_ok(backend.add_n(*hidden, *hidden, *position_d,
                                  patches * kHidden),
                    "vision add position embeddings");
@@ -576,7 +569,33 @@ struct GpuVisionFrontend::Impl {
         return {std::move(input.grids), std::move(final_device), output_rows};
     }
 
-    CpuVisionEncoding encode(const std::vector<CpuVisionImage> &images) {
+    static uint64_t host_entry_bytes(const CacheEntry &entry) {
+        return entry.bytes + entry.image->image().base64_data.size() +
+               entry.image->image().media_type.size() + sizeof(CacheEntry);
+    }
+
+    void retain_on_host(const CacheEntry &entry) {
+        const uint64_t bytes = host_entry_bytes(entry);
+        if (bytes > host_cache_limit_bytes || host_cache_limit_bytes == 0) return;
+        while (!host_cache.empty() &&
+               host_cache_bytes > host_cache_limit_bytes - bytes) {
+            host_cache_bytes -= host_entry_bytes(host_cache.front());
+            host_cache.erase(host_cache.begin());
+        }
+        CacheEntry saved;
+        saved.image = entry.image;
+        saved.fingerprint = entry.fingerprint;
+        saved.grid = entry.grid;
+        saved.bytes = entry.bytes;
+        saved.host_bf16 = std::make_shared<std::vector<uint16_t>>(
+            entry.bytes / sizeof(uint16_t));
+        require_ok(backend.copy_bytes_to_host(*entry.tensor,
+            saved.host_bf16->data(), 0, entry.bytes), "stage vision features to CPU");
+        host_cache.push_back(std::move(saved));
+        host_cache_bytes += bytes;
+    }
+
+    CpuVisionEncoding encode(const std::vector<VisionImageSourcePtr> &images) {
         if (images.empty()) return {};
         std::lock_guard<std::mutex> lock(encode_mutex);
 
@@ -586,10 +605,17 @@ struct GpuVisionFrontend::Impl {
         std::vector<uint32_t> request_to_miss(
             images.size(), std::numeric_limits<uint32_t>::max());
         uint32_t cache_hits = 0;
+        uint32_t cpu_hits = 0;
+        double cpu_lookup_ms = 0.0;
+        double stageout_ms = 0.0;
+        // Duplicate CPU hits share one transient GPU allocation within this
+        // call. Do not promote every historical hit into the GPU LRU: scanning
+        // a history larger than that LRU would evict all of its recent entries.
+        std::unordered_map<uint64_t, std::vector<size_t>> restored;
 
         for (size_t request_index = 0; request_index < images.size();
              ++request_index) {
-            fingerprints[request_index] = image_fingerprint(images[request_index]);
+            fingerprints[request_index] = images[request_index]->fingerprint();
             bool found = false;
             for (size_t cache_index = 0; cache_index < cache.size();
                  ++cache_index) {
@@ -598,6 +624,7 @@ struct GpuVisionFrontend::Impl {
                     continue;
                 }
                 CacheEntry hit = std::move(cache[cache_index]);
+                hit.image = images[request_index];
                 cache.erase(cache.begin() +
                             static_cast<std::ptrdiff_t>(cache_index));
                 cache.push_back(std::move(hit));
@@ -605,6 +632,39 @@ struct GpuVisionFrontend::Impl {
                 ordered[request_index] = {
                     entry.grid, entry.tensor, 0};
                 ++cache_hits;
+                found = true;
+                break;
+            }
+            if (found) continue;
+
+            auto &prior_restores = restored[fingerprints[request_index]];
+            for (size_t prior : prior_restores) {
+                if (same_image(images[prior], images[request_index])) {
+                    ordered[request_index] = ordered[prior];
+                    ++cache_hits;
+                    ++cpu_hits;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) continue;
+            for (size_t i = 0; i < host_cache.size(); ++i) {
+                if (host_cache[i].fingerprint != fingerprints[request_index] ||
+                    !same_image(host_cache[i].image, images[request_index])) continue;
+                const auto started = std::chrono::steady_clock::now();
+                CacheEntry hit = std::move(host_cache[i]);
+                hit.image = images[request_index];
+                host_cache.erase(host_cache.begin() + static_cast<std::ptrdiff_t>(i));
+                host_cache.push_back(std::move(hit));
+                const auto &entry = host_cache.back();
+                ordered[request_index] = {entry.grid, {}, 0,
+                    std::make_shared<DeviceInputEmbeddingStorage::CpuTensor>(
+                        backend, entry.host_bf16)};
+                prior_restores.push_back(request_index);
+                cpu_lookup_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                ++cache_hits;
+                ++cpu_hits;
                 found = true;
                 break;
             }
@@ -628,72 +688,86 @@ struct GpuVisionFrontend::Impl {
         }
 
         if (!unique_miss_requests.empty()) {
-            std::vector<CpuVisionImage> missing_images;
-            missing_images.reserve(unique_miss_requests.size());
-            for (size_t request_index : unique_miss_requests) {
-                missing_images.push_back(images[request_index]);
-            }
-            ForwardResult forward = encode_uncached(missing_images);
-            if (forward.grids.size() != missing_images.size()) {
-                throw std::runtime_error(
-                    "native vision returned inconsistent per-image grids");
-            }
-
-            uint64_t counted_rows = 0;
-            for (const auto &grid : forward.grids) counted_rows += grid.rows;
-            if (counted_rows != forward.rows) {
-                throw std::runtime_error(
-                    "native vision grids do not cover projected embeddings");
-            }
-
             std::vector<ImageResult> miss_results(unique_miss_requests.size());
-            uint32_t source_row = 0;
-            bool issued_split_copy = false;
-            for (size_t miss = 0; miss < unique_miss_requests.size(); ++miss) {
-                const size_t request_index = unique_miss_requests[miss];
-                const auto &grid = forward.grids[miss];
-                const uint64_t result_bytes = static_cast<uint64_t>(grid.rows) *
-                                              kOutput * sizeof(uint16_t);
-                const bool cacheable = cache_limit_bytes > 0 &&
-                                       result_bytes <= cache_limit_bytes;
-                ImageResult part{grid, forward.tensor, source_row};
-                if (cacheable) {
-                    // A multi-image miss is evaluated as one efficient visual
-                    // batch, then split with cheap D2D copies so evicting one
-                    // image really releases its allocation. The common case
-                    // of one new screenshot reuses the forward output directly.
-                    if (unique_miss_requests.size() > 1) {
-                        auto split = backend.tensor_bf16(
-                            static_cast<uint64_t>(grid.rows) * kOutput,
-                            "vision_cached_image");
-                        require_ok(backend.copy_d2d(
-                            *split, *forward.tensor,
-                            static_cast<uint64_t>(source_row) * kOutput,
-                            static_cast<uint64_t>(grid.rows) * kOutput),
-                            "split cached vision image");
-                        part.tensor = std::shared_ptr<DeviceTensor>(std::move(split));
-                        part.source_row = 0;
-                        issued_split_copy = true;
-                    }
-                    while (!cache.empty() &&
-                           cache_bytes > cache_limit_bytes - result_bytes) {
-                        cache_bytes -= cache.front().bytes;
-                        cache.erase(cache.begin());
-                    }
-                    CacheEntry entry;
-                    entry.image = images[request_index];
-                    entry.fingerprint = fingerprints[request_index];
-                    entry.grid = grid;
-                    entry.tensor = part.tensor;
-                    entry.bytes = result_bytes;
-                    cache.push_back(std::move(entry));
-                    cache_bytes += result_bytes;
+            const size_t batch_limit = max_batch_images ? max_batch_images :
+                                      unique_miss_requests.size();
+            // Vision attention is segmented per image. Bound activation
+            // residency while evaluating every missing image in source order;
+            // the common one-screenshot request retains the same forward call.
+            for (size_t begin = 0; begin < unique_miss_requests.size();
+                 begin += batch_limit) {
+                const size_t count = std::min(batch_limit, unique_miss_requests.size() - begin);
+                std::vector<CpuVisionImage> missing_images;
+                missing_images.reserve(count);
+                for (size_t i = 0; i < count; ++i) {
+                    missing_images.push_back(images[unique_miss_requests[begin + i]]->image());
                 }
-                miss_results[miss] = std::move(part);
-                source_row += grid.rows;
-            }
-            if (issued_split_copy) {
-                require_ok(backend.synchronize(), "cache vision image splits");
+                ForwardResult forward = encode_uncached(missing_images);
+                if (forward.grids.size() != missing_images.size()) {
+                    throw std::runtime_error(
+                        "native vision returned inconsistent per-image grids");
+                }
+
+                uint64_t counted_rows = 0;
+                for (const auto &grid : forward.grids) counted_rows += grid.rows;
+                if (counted_rows != forward.rows) {
+                    throw std::runtime_error(
+                        "native vision grids do not cover projected embeddings");
+                }
+
+                uint32_t source_row = 0;
+                bool issued_split_copy = false;
+                for (size_t local = 0; local < count; ++local) {
+                    const size_t miss = begin + local;
+                    const size_t request_index = unique_miss_requests[miss];
+                    const auto &grid = forward.grids[local];
+                    const uint64_t result_bytes = static_cast<uint64_t>(grid.rows) *
+                                                  kOutput * sizeof(uint16_t);
+                    const bool cacheable = cache_limit_bytes > 0 &&
+                                           result_bytes <= cache_limit_bytes;
+                    ImageResult part{grid, forward.tensor, source_row};
+                    if (cacheable) {
+                        // A multi-image miss is evaluated as one efficient visual
+                        // batch, then split with cheap D2D copies so evicting one
+                        // image really releases its allocation. The common case
+                        // of one new screenshot reuses the forward output directly.
+                        if (count > 1) {
+                            auto split = backend.tensor_bf16(
+                                static_cast<uint64_t>(grid.rows) * kOutput,
+                                "vision_cached_image");
+                            require_ok(backend.copy_d2d(
+                                *split, *forward.tensor,
+                                static_cast<uint64_t>(source_row) * kOutput,
+                                static_cast<uint64_t>(grid.rows) * kOutput),
+                                "split cached vision image");
+                            part.tensor = std::shared_ptr<DeviceTensor>(std::move(split));
+                            part.source_row = 0;
+                            issued_split_copy = true;
+                        }
+                        while (!cache.empty() &&
+                               cache_bytes > cache_limit_bytes - result_bytes) {
+                            const auto started = std::chrono::steady_clock::now();
+                            retain_on_host(cache.front());
+                            stageout_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - started).count();
+                            cache_bytes -= cache.front().bytes;
+                            cache.erase(cache.begin());
+                        }
+                        CacheEntry entry;
+                        entry.image = images[request_index];
+                        entry.fingerprint = fingerprints[request_index];
+                        entry.grid = grid;
+                        entry.tensor = part.tensor;
+                        entry.bytes = result_bytes;
+                        cache.push_back(std::move(entry));
+                        cache_bytes += result_bytes;
+                    }
+                    miss_results[miss] = std::move(part);
+                    source_row += grid.rows;
+                }
+                if (issued_split_copy) {
+                    require_ok(backend.synchronize(), "cache vision image splits");
+                }
             }
 
             for (size_t request_index = 0; request_index < images.size();
@@ -710,11 +784,24 @@ struct GpuVisionFrontend::Impl {
         result.cache_hits = cache_hits;
         result.cache_misses = static_cast<uint32_t>(unique_miss_requests.size());
         result.cache_hit = result.cache_misses == 0;
+        if (host_cache_limit_bytes > 0) {
+            std::cerr << "[qw3-vision-cache] images=" << images.size()
+                      << " gpu_hits=" << (cache_hits - cpu_hits)
+                      << " cpu_hits=" << cpu_hits
+                      << " encoded_images=" << result.cache_misses
+                      << " max_batch_images=" << max_batch_images
+                      << " gpu_bytes=" << cache_bytes
+                      << " cpu_bytes=" << host_cache_bytes
+                      << " cpu_limit_bytes=" << host_cache_limit_bytes
+                      << " cpu_lookup_ms=" << cpu_lookup_ms
+                      << " cpu_restore=on-demand"
+                      << " stageout_ms=" << stageout_ms << '\n';
+        }
         std::vector<DeviceInputEmbeddingStorage::Segment> segments;
         segments.reserve(ordered.size());
         uint64_t logical_row = 0;
         for (const ImageResult &image : ordered) {
-            if (!image.tensor || image.grid.rows == 0 ||
+            if ((!image.tensor && !image.cpu) || image.grid.rows == 0 ||
                 logical_row > std::numeric_limits<uint32_t>::max() -
                                   image.grid.rows) {
                 throw std::runtime_error("invalid cached vision image result");
@@ -723,7 +810,7 @@ struct GpuVisionFrontend::Impl {
             segments.push_back({image.tensor,
                                 static_cast<uint32_t>(logical_row),
                                 image.source_row,
-                                image.grid.rows});
+                                image.grid.rows, image.cpu});
             logical_row += image.grid.rows;
         }
         result.storage = std::make_shared<DeviceInputEmbeddingStorage>(
@@ -745,6 +832,19 @@ GpuVisionFrontend::~GpuVisionFrontend() = default;
 
 CpuVisionEncoding GpuVisionFrontend::encode(
         const std::vector<CpuVisionImage> &images) {
+    std::vector<VisionImageSourcePtr> sources;
+    sources.reserve(images.size());
+    for (const auto &image : images) {
+        sources.push_back(std::make_shared<const VisionImageSource>(image));
+    }
+    return encode_sources(sources);
+}
+
+CpuVisionEncoding GpuVisionFrontend::encode_sources(
+        const std::vector<VisionImageSourcePtr> &images) {
+    for (const auto &image : images) {
+        if (!image) throw std::runtime_error("null prepared vision image source");
+    }
     return impl_->encode(images);
 }
 

@@ -187,7 +187,8 @@ inline constexpr bool kvmem_refresh_prefill_keeps_epoch(
 }
 
 inline KvmemHarnessRefreshDecision kvmem_harness_refresh_decision(
-        const KvmemHarnessRefreshInput &in) {
+        const KvmemHarnessRefreshInput &in,
+        bool guided_refresh_enabled = true) {
     KvmemHarnessRefreshDecision out;
     if (in.force_reselect) {
         out.reselect = true;
@@ -213,6 +214,11 @@ inline KvmemHarnessRefreshDecision kvmem_harness_refresh_decision(
         out.reason = KvmemHarnessRefreshReason::NewUserQuery;
         return out;
     }
+    // With private query generation disabled, growth in a stable tool task
+    // is capacity pressure, not a new retrieval query. The executor retains
+    // mandatory blocks and the recent tail through its ordinary pressure
+    // path; never re-score the stale user query merely because A or B filled.
+    if (!guided_refresh_enabled) return out;
     if (!in.selection_started) {
         const uint64_t target = kvmem_initial_headroom_refresh_target(
             in.selection_budget, in.trigger_tokens);

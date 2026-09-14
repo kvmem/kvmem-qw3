@@ -8,6 +8,7 @@
 #include "kvmem_session.hpp"
 #include "multimodal_prefix_cache.hpp"
 #include "qwen_executor.hpp"
+#include "prefix_state_storage.hpp"
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
 #include "vision_gpu_frontend.hpp"
@@ -1828,6 +1829,14 @@ public:
         return vision_gpu_frontend_->encode(images);
     }
 
+    VisionEncoding encode_vision_sources(
+            const std::vector<VisionImageSourcePtr> &images) override {
+        if (!vision_gpu_frontend_) {
+            throw std::runtime_error("native CUDA vision frontend is not configured");
+        }
+        return vision_gpu_frontend_->encode_sources(images);
+    }
+
     // ---- Context archive (docs/kvmem_context_archive_design.md) ----
 
     // Fields that fix the archive's byte layout or its numerics. Deliberately
@@ -2123,6 +2132,7 @@ public:
                 std::make_unique<GlobalKvPagePool>(mtp_pool_pages,
                                                    kv_page_size);
             allocate_continuous_mtp_kv_cache(mtp_pool_pages, kv_page_size);
+            initialize_prefix_host_storage();
         }
 
         st = device_->end();
@@ -3840,10 +3850,34 @@ public:
             const std::vector<int32_t> ids = tokenizer_->encode(prompt);
             prompt_tokens.assign(ids.begin(), ids.end());
         }
-        GenerationOptions effective_options = options;
+        const bool trace_visual_cpu = env_flag_enabled("QW3_VISUAL_CPU_TRACE");
+        const auto visual_now = [trace_visual_cpu]() {
+            return trace_visual_cpu ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+        };
+        const auto visual_start = visual_now();
+        const uint32_t request_ctx = options_.ctx_size > 0
+            ? static_cast<uint32_t>(options_.ctx_size) : 4096u;
+        // Ordinary stateless requests already carry the exact visual map and
+        // fitting generation limit. Borrow their immutable options for this
+        // synchronous call; session appends, fingerprint completion and token
+        // capping retain a private copy before any mutation.
+        const bool borrow_options = reset_session && !kvmem_api_session_active_ &&
+            (options.input_embedding_overrides.empty() || options.input_embedding_fingerprint != 0) &&
+            prompt_tokens.size() <= request_ctx &&
+            options.max_tokens <= static_cast<int>(request_ctx -
+                static_cast<uint32_t>(prompt_tokens.size()) + 1u);
+        GenerationOptions adjusted_options;
+        if (!borrow_options) adjusted_options = options;
+        const GenerationOptions &effective_options = borrow_options ? options : adjusted_options;
+        const auto mutable_options = [&]() -> GenerationOptions & {
+            if (borrow_options) throw std::logic_error("borrowed generation options require an unexpected mutation");
+            return adjusted_options;
+        };
+        const auto visual_options_copied = visual_now();
         if (!effective_options.input_embedding_overrides.empty() &&
             effective_options.input_embedding_fingerprint == 0) {
-            effective_options.input_embedding_fingerprint =
+            mutable_options().input_embedding_fingerprint =
                 input_embedding_fingerprint(
                     effective_options.input_embedding_overrides);
         }
@@ -3891,7 +3925,7 @@ public:
                     for (uint32_t &axis : position) axis += coordinate_base;
                     combined_positions.push_back(position);
                 }
-                effective_options.input_embedding_fingerprint =
+                mutable_options().input_embedding_fingerprint =
                     combine_input_embedding_fingerprints(
                         kvmem_active_input_embedding_fingerprint_,
                         effective_options.input_embedding_fingerprint);
@@ -3904,14 +3938,14 @@ public:
                     combined_positions.push_back(
                         {position, position, position});
                 }
-                effective_options.input_embedding_fingerprint =
+                mutable_options().input_embedding_fingerprint =
                     kvmem_active_input_embedding_fingerprint_;
             }
             combined_tokens.insert(combined_tokens.end(), prompt_tokens.begin(),
                                    prompt_tokens.end());
-            effective_options.input_embedding_overrides =
+            mutable_options().input_embedding_overrides =
                 std::move(combined_overrides);
-            effective_options.input_mrope_positions =
+            mutable_options().input_mrope_positions =
                 std::move(combined_positions);
             executor_->set_input_embedding_overrides(
                 effective_options.input_embedding_overrides, combined_tokens,
@@ -3921,13 +3955,35 @@ public:
                 effective_options.input_embedding_overrides, prompt_tokens,
                 effective_options.input_mrope_positions);
         }
+        const auto visual_executor_set = visual_now();
         if (reset_session || kvmem_api_session_active_) {
             kvmem_active_input_embedding_fingerprint_ =
                 effective_options.input_embedding_fingerprint;
-            kvmem_active_input_embedding_overrides_ =
-                effective_options.input_embedding_overrides;
-            kvmem_active_input_mrope_positions_ =
-                effective_options.input_mrope_positions;
+            // These retained maps are read only by explicit session append
+            // and named-cache save/restore. The executor owns the current
+            // request's map independently, including stateless KV reuse.
+            if (kvmem_api_session_active_) {
+                kvmem_active_input_embedding_overrides_ =
+                    effective_options.input_embedding_overrides;
+                kvmem_active_input_mrope_positions_ =
+                    effective_options.input_mrope_positions;
+            } else {
+                kvmem_active_input_embedding_overrides_.clear();
+                kvmem_active_input_mrope_positions_.clear();
+            }
+        }
+        if (trace_visual_cpu && !effective_options.input_embedding_overrides.empty()) {
+            const auto finished = visual_now();
+            const auto ms = [](auto begin, auto end) {
+                return std::chrono::duration<double, std::milli>(end - begin).count();
+            };
+            log("native visual_cpu: rows=" +
+                std::to_string(effective_options.input_embedding_overrides.size()) +
+                " options_borrowed=" + std::to_string(borrow_options) +
+                " options_copy_ms=" + std::to_string(ms(visual_start, visual_options_copied)) +
+                " executor_setup_ms=" + std::to_string(ms(visual_options_copied, visual_executor_set)) +
+                " active_copy_ms=" + std::to_string(ms(visual_executor_set, finished)) +
+                " total_ms=" + std::to_string(ms(visual_start, finished)));
         }
         const uint32_t append_base = reset_session
             ? 0u : static_cast<uint32_t>(executor_->position());
@@ -3942,7 +3998,7 @@ public:
                 span.end += append_base;
                 combined_spans.push_back(span);
             }
-            effective_options.kvmem_pinned_token_spans =
+            mutable_options().kvmem_pinned_token_spans =
                 std::move(combined_spans);
         }
         if (reset_session || kvmem_api_session_active_) {
@@ -3952,14 +4008,14 @@ public:
         if (!reset_session &&
             effective_options.kvmem_query_end >
                 effective_options.kvmem_query_begin) {
-            effective_options.kvmem_query_begin += append_base;
-            effective_options.kvmem_query_end += append_base;
+            mutable_options().kvmem_query_begin += append_base;
+            mutable_options().kvmem_query_end += append_base;
         }
         if (!reset_session &&
             effective_options.kvmem_context_end >
                 effective_options.kvmem_context_begin) {
-            effective_options.kvmem_context_begin += append_base;
-            effective_options.kvmem_context_end += append_base;
+            mutable_options().kvmem_context_begin += append_base;
+            mutable_options().kvmem_context_end += append_base;
         }
         const uint32_t ctx_size = options_.ctx_size > 0
             ? static_cast<uint32_t>(options_.ctx_size)
@@ -3978,7 +4034,7 @@ public:
                 std::to_string(effective_options.max_tokens) + " to " +
                 std::to_string(max_emit_tokens) +
                 " to fit KV ctx=" + std::to_string(ctx_size));
-            effective_options.max_tokens = static_cast<int>(max_emit_tokens);
+            mutable_options().max_tokens = static_cast<int>(max_emit_tokens);
         }
 
         if (options_.dump_tokens) {
@@ -4579,6 +4635,9 @@ private:
         std::shared_ptr<ContinuousBatchRequest> req;
         // Declared before executor: pages stop being used before refs drop.
         std::unique_ptr<PrefixEntryLease> prefix_lease;
+        // Stable immutable owner, retained through executor teardown and all
+        // queued restore copies. Container moves/eviction cannot invalidate it.
+        std::shared_ptr<QwenExecutor::StateSnapshot> prefix_snapshot;
         std::unique_ptr<QwenExecutor> executor;
         ContinuousRequestKvState kv_state;
         std::unordered_map<uint32_t, uint32_t> seen_tokens;
@@ -6753,6 +6812,7 @@ private:
                                     std::string generated,
                                     std::string error = {}) {
         active.executor.reset();
+        active.prefix_snapshot.reset();
         active.prefix_lease.reset();
         complete_continuous_request(active.req, std::move(generated), std::move(error));
     }
@@ -9130,7 +9190,7 @@ private:
                 static_cast<uint32_t>(req->prompt_tokens.size());
             std::vector<int32_t> hit_pages;
             std::vector<int32_t> hit_mtp_pages;
-            QwenExecutor::StateSnapshot hit_recur;
+            std::shared_ptr<QwenExecutor::StateSnapshot> hit_recur;
             uint32_t hit_len = 0;
             const std::vector<detail::MultimodalTokenIdentity>
                 input_identities = input_embedding_cache_identities(
@@ -9142,8 +9202,13 @@ private:
                 hit_pages, hit_mtp_pages, hit_recur, hit_len);
             if (hit_id != 0 && hit_len > 0 && hit_len < prompt_len) {
                 try {
+                    // A borrowed cache snapshot must outlive queued copies.
+                    // With host storage disabled, keep the legacy temporary
+                    // clone scoped to initialization instead of retaining an
+                    // extra GPU snapshot throughout prefill and decode.
+                    if (prefix_host_pool_) a.prefix_snapshot = hit_recur;
                     a.executor->seed_from_shared_prefix(
-                        hit_pages, hit_mtp_pages, hit_recur, hit_len);
+                        hit_pages, hit_mtp_pages, *hit_recur, hit_len);
                     a.prefill_offset = hit_len;
                     a.prefix_reused_tokens = hit_len;
                     a.prefix_lease->ids.push_back(hit_id);
@@ -10052,6 +10117,7 @@ private:
         bool query_limited = false;
         bool query_snapshot_reuse = false;
         bool checkpoint_after_query_boundary = false;
+        bool replay_ring = false;
     };
 
     // Longest-common-prefix reuse pick. Computes D (the longest common token
@@ -10243,6 +10309,44 @@ private:
             result.prompt_ckpt = false;
             result.query_snapshot_reuse =
                 qc_resume_guard && result.c > query_boundary_ceiling;
+            return result;
+        }
+        // A small decode-checkpoint ring bounds replay when the rendered
+        // response differs just before M (for example a truncated tool call).
+        // Apply the SAME LCP/query/alignment/selection/source-index guards as
+        // P. Promote the winning snapshot into P so all downstream replay
+        // paths use the established P state and metadata together.
+        ReplayCheckpoint *best_replay = nullptr;
+        for (auto &entry : kvmem_replay_checkpoints_) {
+            const auto &snapshot = entry.state;
+            if (!entry.resumable || !entry.source_index_ready || !snapshot.ready ||
+                !detail::kvmem_checkpoint_selection_compatible(
+                    snapshot.kvmem_selection_generation,
+                    executor_->kvmem_selection_generation()) ||
+                (executor_->kvmem_qc_pertoken() && prompt.size() > sel_budget) ||
+                !checkpoint_reusable(snapshot.position) ||
+                snapshot.position % bt != 0 ||
+                (best_replay && snapshot.position <= best_replay->state.position)) continue;
+            best_replay = &entry;
+        }
+        if (best_replay &&
+            (prompt_checkpoint_block ||
+             !checkpoint_reusable(kvmem_warm_prompt_pos_) ||
+             best_replay->state.position > kvmem_warm_prompt_pos_)) {
+            const uint32_t replay_pos = best_replay->state.position;
+            std::swap(kvmem_warm_ckpt_prompt_, best_replay->state);
+            std::swap(kvmem_warm_prompt_resumable_, best_replay->resumable);
+            std::swap(kvmem_warm_source_index_ready_, best_replay->source_index_ready);
+            kvmem_warm_prompt_pos_ = replay_pos;
+            result.c = replay_pos;
+            result.prompt_ckpt = true;
+            result.replay_ring = true;
+            result.query_snapshot_reuse = qc_resume_guard && result.c > query_boundary_ceiling;
+            if (kvmem_prefix_cache_trace_enabled()) {
+                log("kvmem prefix-cache REPLAY-R: R=" + std::to_string(replay_pos) +
+                    " D=" + std::to_string(common_prefix) + " M=" +
+                    std::to_string(kvmem_warm_end_pos_));
+            }
             return result;
         }
         // P (prompt-end resume) is offered at a BLOCK BOUNDARY below the prompt
@@ -10441,7 +10545,7 @@ private:
             uint64_t input_embedding_fingerprint,
             std::vector<int32_t> &out_pages,
             std::vector<int32_t> &out_mtp_pages,
-            QwenExecutor::StateSnapshot &out_recur,
+            std::shared_ptr<QwenExecutor::StateSnapshot> &out_recur,
             uint32_t &out_aligned_len) {
         if (!prefix_cache_enabled() || prompt.size() < 2 * page_size) return 0;
         std::lock_guard<std::mutex> lk(prefix_cache_mu_);
@@ -10487,18 +10591,31 @@ private:
                 const uint32_t prefix_pages = probe / page_size;
                 if (require_mtp &&
                     (e.mtp_kv_pages.size() != prefix_pages ||
-                     e.recur.mtp_kv_logical_pages != prefix_pages ||
-                     e.recur.mtp_prefix_len < probe ||
-                     !e.recur.mtp_prefix_h)) {
+                     e.state->state().mtp_kv_logical_pages != prefix_pages ||
+                     e.state->state().mtp_prefix_len < probe ||
+                     !e.state->state().mtp_prefix_h)) {
                     continue;
                 }
                 // Hit. Pin already held by the entry; bump refcount + LRU.
                 out_pages = e.kv_pages;
                 out_mtp_pages = e.mtp_kv_pages;
-                out_recur = clone_state_snapshot(e.recur);
+                const bool cold = !e.state->gpu;
+                if (prefix_host_pool_) {
+                    out_recur = e.state->restore(
+                        cold ? std::move(prefix_recycled_snapshot_) : nullptr);
+                } else {
+                    // Keep the legacy snapshot semantics outside the opt-in
+                    // dense cache, including existing CB+KVMem configurations.
+                    out_recur = std::make_shared<QwenExecutor::StateSnapshot>(
+                        clone_state_snapshot(e.state->state()));
+                }
                 ++e.refcount;
                 e.last_used_seq = ++prefix_cache_seq_;
                 out_aligned_len = e.aligned_len;
+                if (cold && prefix_cache_trace_enabled()) {
+                    log("prefix_cache restore_cpu id=" + std::to_string(e.id) +
+                        " aligned_len=" + std::to_string(e.aligned_len));
+                }
                 return e.id;
             }
         }
@@ -10619,9 +10736,9 @@ private:
                             input_fingerprint) == aligned_len &&
                         (!include_mtp ||
                          (e.mtp_kv_pages.size() == prefix_pages &&
-                          e.recur.mtp_kv_logical_pages == prefix_pages &&
-                          e.recur.mtp_prefix_len >= aligned_len &&
-                          e.recur.mtp_prefix_h))) {
+                          e.state->state().mtp_kv_logical_pages == prefix_pages &&
+                          e.state->state().mtp_prefix_len >= aligned_len &&
+                          e.state->state().mtp_prefix_h))) {
                         ++e.refcount;  // creator holds it too
                         e.last_used_seq = ++prefix_cache_seq_;
                         a.prefix_lease->ids.push_back(e.id);
@@ -10639,7 +10756,11 @@ private:
         entry.input_embedding_identities = input_identities;
         // Capture recurrent+conv state at exactly aligned_len. The executor's
         // position_ is aligned_len here (caller invokes at the boundary).
-        a.executor->capture_state(entry.recur);
+        entry.state = std::make_unique<detail::PrefixStateStorage>(*device_);
+        entry.state->gpu = std::move(prefix_recycled_snapshot_);
+        if (!entry.state->gpu)
+            entry.state->gpu = std::make_shared<QwenExecutor::StateSnapshot>();
+        a.executor->capture_state(*entry.state->gpu);
         // Mark prefix pages borrowed in the executor + collect their physical
         // ids; the executor keeps reading them but will not free them.
         if (!a.executor->mark_prefix_shared(
@@ -10703,6 +10824,7 @@ private:
             if (pages_ok && entries_ok) break;
             if (prefix_cache_evict_lru(1) == 0) break;
         }
+        prefix_cache_stage_cold();
     }
 
     // Drop refcounts this request holds. Pinned pages are NOT freed here; they
@@ -10723,7 +10845,84 @@ private:
             }
             ids.clear();
         }
+        prefix_cache_reap_host_copies();
         prefix_cache_enforce_budgets();
+    }
+
+    void initialize_prefix_host_storage() {
+        prefix_gpu_entries_ = env_uint32_or("QW3_PREFIX_CACHE_GPU_ENTRIES", 0);
+        if (!prefix_gpu_entries_ || !prefix_cache_enabled()) return;
+        const uint32_t entries = prefix_cache_max_entries();
+        if (options_.kvmem_enabled || !entries)
+            throw std::invalid_argument("CPU prefix snapshots require dense CB and a finite prefix entry budget");
+        if (prefix_gpu_entries_ >= entries) return;
+        // Reserve pinned backing at model startup, not on the request path.
+        // Upper-bound both hidden rows as FP32; packing itself preserves dtype.
+        const auto &cfg = model_->config();
+        uint64_t bytes = static_cast<uint64_t>(cfg.n_embd) * 2 * sizeof(float);
+        if (cfg.num_v_heads() > 0 && cfg.ssm_conv_kernel > 0) {
+            for (uint32_t i = 0; i < weights_->n_layers(); ++i) {
+                const auto &layer = weights_->layer(i);
+                if (!layer.recurrent) continue;
+                bytes += (static_cast<uint64_t>(cfg.num_v_heads()) *
+                    cfg.head_v_dim_ssm() * cfg.head_k_dim() +
+                    layer.recurrent_qkv_dim * (cfg.ssm_conv_kernel - 1)) * sizeof(float);
+            }
+        }
+        prefix_host_buffer_bytes_ = (bytes + 4095) & ~uint64_t(4095);
+        prefix_host_pool_ = std::make_shared<HostTierBufferPool>(*device_);
+        std::vector<std::unique_ptr<HostBuffer>> buffers;
+        for (uint32_t i = 0; i < entries; ++i)
+            buffers.push_back(prefix_host_pool_->acquire(prefix_host_buffer_bytes_, "prefix_snapshot_host"));
+        for (auto &buffer : buffers) prefix_host_pool_->release(std::move(buffer));
+        log("prefix_cache host_storage gpu_entries=" + std::to_string(prefix_gpu_entries_) +
+            " logical_entries=" + std::to_string(entries) +
+            " reserved_host_bytes=" + std::to_string(prefix_host_buffer_bytes_ * entries));
+    }
+
+    // Commit starts copies of older immutable snapshots before decode. The
+    // request-release pass reaps them after decode, without extra worker threads
+    // calling the shared DeviceBackend or changing its stream state.
+    void prefix_cache_stage_cold() {
+        if (!prefix_host_pool_) return;
+        std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+        std::vector<PrefixCacheEntry *> resident;
+        for (auto &bucket : prefix_cache_)
+            for (auto &entry : bucket.second)
+                if (entry.state->gpu && !entry.state->copying()) resident.push_back(&entry);
+        std::sort(resident.begin(), resident.end(), [](const auto *a, const auto *b) {
+            return a->last_used_seq < b->last_used_seq;
+        });
+        size_t remaining = resident.size();
+        for (auto *entry : resident) {
+            if (remaining <= prefix_gpu_entries_) break;
+            if (entry->refcount || entry->state->gpu.use_count() != 1) continue;
+            std::shared_ptr<HostBuffer> host;
+            if (!entry->state->has_host_copy()) {
+                auto pool = prefix_host_pool_;
+                host = std::shared_ptr<HostBuffer>(pool->acquire(
+                    prefix_host_buffer_bytes_, "prefix_snapshot_host").release(),
+                    [pool](HostBuffer *buffer) { pool->release(std::unique_ptr<HostBuffer>(buffer)); });
+            }
+            entry->state->stage_out(std::move(host));
+            --remaining;
+        }
+    }
+
+    void prefix_cache_reap_host_copies() {
+        if (!prefix_host_pool_) return;
+        std::lock_guard<std::mutex> lk(prefix_cache_mu_);
+        for (auto &bucket : prefix_cache_) {
+            for (auto &entry : bucket.second) {
+                if (entry.refcount || !entry.state->copying()) continue;
+                auto recycled = entry.state->finish_offload();
+                if (!recycled) continue;
+                if (!prefix_recycled_snapshot_) prefix_recycled_snapshot_ = std::move(recycled);
+                if (prefix_cache_trace_enabled())
+                    log("prefix_cache offload_cpu id=" + std::to_string(entry.id) +
+                        " aligned_len=" + std::to_string(entry.aligned_len));
+            }
+        }
     }
 
     // Evict up to `want` LRU entries with refcount==0, unpin + free their pages
@@ -10803,6 +11002,7 @@ private:
             }
         }
         prefix_cache_.clear();
+        prefix_recycled_snapshot_.reset();
         prefix_cache_entry_count_ = 0;
     }
 
@@ -10969,6 +11169,10 @@ private:
                                const GenerationOptions &request_options,
                                const CancellableTokenCallback &on_text,
                                DumpStream *dump) {
+        if (env_flag_enabled("QW3_KVMEM_SKIP_POSTSELECTION_QUERY_REPLAY")) {
+            throw std::invalid_argument(
+                "the no-postselection-query-replay ablation requires native MTP");
+        }
         executor_->kvmem_gc_begin_step();
         struct GcRequestScope {
             QwenExecutor *executor;
@@ -11050,6 +11254,7 @@ private:
 
         const uint32_t reuse_m = ru.c;
         const bool warm_reuse = reuse_m > 0;
+        prune_replay_checkpoints(reuse_m);
         if (warm_reuse) {
             executor_->restore_state(ru.prompt_ckpt ? kvmem_warm_ckpt_prompt_
                                                     : kvmem_warm_ckpt_end_);
@@ -11358,8 +11563,8 @@ private:
             const uint32_t prompt_end = static_cast<uint32_t>(prompt_tokens.size());
             const uint32_t split = kvmem_prompt_checkpoint_split(
                 prompt_end, static_cast<uint32_t>(prefill_begin), bt,
-                qc_select_active ? options.kvmem_query_begin : 0,
-                qc_select_active ? options.kvmem_query_end : 0);
+                qc.capture_active() ? options.kvmem_query_begin : 0,
+                qc.capture_active() ? options.kvmem_query_end : 0);
             if (split > 0) {
                 ckpt_split = split;
                 if (split == prefill_begin && warm_reuse &&
@@ -11457,6 +11662,7 @@ private:
                     executor_->kvmem_reselect_prefill_pressure();
                 }
                 kvmem_warm_valid_ = false;
+                retain_replaced_prompt_checkpoint(reuse_m);
                 executor_->capture_state(kvmem_warm_ckpt_prompt_);
                 warm_prompt_pos = ckpt_split;
                 warm_prompt_resumable =
@@ -11577,6 +11783,7 @@ private:
                 executor_->kvmem_reselect_prefill_pressure();
             }
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
+            retain_replaced_prompt_checkpoint(reuse_m);
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = ckpt_split;
             warm_checkpoint_staged = true;
@@ -11966,6 +12173,7 @@ private:
                     executor_->kvmem_register_append(
                         ckpt_split - query_replay_begin);
                     kvmem_warm_valid_ = false;
+                    retain_replaced_prompt_checkpoint(reuse_m);
                     executor_->capture_state(kvmem_warm_ckpt_prompt_);
                     warm_prompt_pos = ckpt_split;
                     warm_prompt_resumable =
@@ -12016,6 +12224,7 @@ private:
         // block store / window / registered_pos all describe exactly P tokens.
         if (warm_capture && !warm_checkpoint_staged) {
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
+            retain_replaced_prompt_checkpoint(reuse_m);
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             warm_prompt_resumable =
@@ -12208,6 +12417,7 @@ private:
              i + 1 < options.max_tokens && !stream_cancelled;
              ++i) {
             if (should_stop_eos()) break;
+            if (bs_on) executor_->kvmem_prepare_decode_window(1);
             const uint32_t feed = next_token;
             step = executor_->forward_one_token(feed);
             if (!step.ok) throw std::runtime_error("decode failed");
@@ -12548,6 +12758,7 @@ private:
             st = device_->begin();
             if (!st.ok) throw std::runtime_error(st.message);
         }
+        if (kvmem_warm_capture) prune_replay_checkpoints(kvmem_reuse_m);
         if (kvmem_warm_reuse) {
             // Resume at the chosen checkpoint (M=turn-end or P=prompt-end), then
             // rewind the block store / tier slots / stale selection index to
@@ -12907,6 +13118,20 @@ private:
             query_guided_query_requested && recompute_query;
         const bool query_guided_direct =
             query_guided_query && options.kvmem_query_guided_direct;
+        const bool skip_postselection_query_replay = env_flag_enabled(
+            "QW3_KVMEM_SKIP_POSTSELECTION_QUERY_REPLAY");
+        if (skip_postselection_query_replay &&
+            (!kvmem_on || override_executor || !reset_session ||
+             api_session || transcript_replay || query_replay ||
+             semantic_chunk || inline_refresh || clean_query || dump ||
+             query_attention_probe_requested ||
+             !kvmem_recompute_query_enabled(options_.kvmem_recompute_query) ||
+             (qc_select_active && (!query_guided_query || options.max_tokens == 0)))) {
+            throw std::invalid_argument(
+                "QW3_KVMEM_SKIP_POSTSELECTION_QUERY_REPLAY is an experimental "
+                "stateless MTP guided-query ablation; it requires the normal "
+                "query-conditioning path and a positive generation budget");
+        }
         executor_->kvmem_set_query_score_budget_hint(
             query_attention_probe
                 ? options.kvmem_query_attention_score_tokens
@@ -13325,6 +13550,31 @@ private:
             mtp_prefix_ops += mtp.ops_executed;
         };
 
+        const bool guided_mtp_requested = env_flag_enabled("QW3_KVMEM_GUIDED_MTP");
+        auto prime_guided_mtp = [&](const std::vector<uint32_t> &tokens,
+                                    bool supported = true) {
+            if (!guided_mtp_requested) return false;
+            const uint32_t base = executor_->last_forward_logical_base();
+            const auto prefix = executor_->mtp_prefix_state_view();
+            if (!supported || !use_mtp_prefix || mtp_chain_len == 0 ||
+                !executor_->kvmem_active() ||
+                !prefix.ready || prefix.prefix_len < base ||
+                executor_->last_forward_rows() != tokens.size()) {
+                log("native kvmem guided MTP: enabled=0 reason=unsupported-private-prefix");
+                return false;
+            }
+            // The enclosing probe snapshot owns this private prefix. Do not use
+            // prime_mtp_prefix(), which also starts durable history writeback.
+            auto primed = executor_->prime_mtp_prefix_from_last_batch_at(
+                tokens, base, executor_->last_forward_rope_base());
+            if (!primed.ok) {
+                throw std::runtime_error("KVMem guided MTP private prompt priming failed");
+            }
+            log("native kvmem guided MTP: enabled=1 chain=" +
+                std::to_string(mtp_chain_len));
+            return true;
+        };
+
         double post_semantic_reselect_s = 0.0;
         double post_query_replay_s = 0.0;
         double post_query_attention_probe_s = 0.0;
@@ -13420,8 +13670,8 @@ private:
             const uint32_t prompt_end = static_cast<uint32_t>(prompt_tokens.size());
             const uint32_t split = kvmem_prompt_checkpoint_split(
                 prompt_end, static_cast<uint32_t>(kvmem_prefill_begin), bt,
-                qc_select_active ? options.kvmem_query_begin : 0,
-                qc_select_active ? options.kvmem_query_end : 0);
+                qc.capture_active() ? options.kvmem_query_begin : 0,
+                qc.capture_active() ? options.kvmem_query_end : 0);
             if (split > 0) {
                 kvmem_ckpt_split = split;
                 if (split == kvmem_prefill_begin && kvmem_warm_reuse &&
@@ -13687,6 +13937,7 @@ private:
                 executor_->kvmem_reselect_prefill_pressure();
             }
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
+            retain_replaced_prompt_checkpoint(kvmem_reuse_m);
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             kvmem_warm_prompt_pos = kvmem_ckpt_split;
             kvmem_warm_checkpoint_staged = true;
@@ -15018,6 +15269,7 @@ private:
                         executor_->kvmem_reselect_prefill_pressure();
                     }
                     kvmem_warm_valid_ = false;
+                    retain_replaced_prompt_checkpoint(kvmem_reuse_m);
                     executor_->capture_state(kvmem_warm_ckpt_prompt_);
                     kvmem_warm_prompt_pos = kvmem_ckpt_split;
                     kvmem_warm_prompt_resumable =
@@ -15080,6 +15332,14 @@ private:
             kvmem_boundary_valid = true;
         }
 
+        // A private guided query overwrites logits as well as model state. The
+        // complete replay normally replaces them; the ablation retains the
+        // first-pass distribution explicitly (including sampled first tokens).
+        std::unique_ptr<DeviceTensor> first_pass_logits;
+        if (skip_postselection_query_replay && recompute_query &&
+            options.kvmem_reselect_mode != KvMemReselectMode::Off) {
+            first_pass_logits = executor_->snapshot_last_logits();
+        }
         // kvmem: register the prefilled prompt as context blocks and assemble
         // the first working set (mirrors generate_plain). Under the default
         // all-fit budget this is an identity selection so the window equals the
@@ -15290,6 +15550,9 @@ private:
                             const double private_prompt_start = wall_seconds();
                             NativeExecutorReport guided_step =
                                 executor_->forward_n_tokens(private_prompt);
+                            const bool guided_mtp = guided_step.ok && prime_guided_mtp(
+                                private_prompt,
+                                options.kvmem_query_guided_thinking_max_tokens == 0);
                             post_query_guided_prompt_s +=
                                 wall_seconds() - private_prompt_start;
                             if (!guided_step.ok) {
@@ -15353,6 +15616,8 @@ private:
 
                             bool query_started = false;
                             bool query_terminated = false;
+                            QwenExecutor::StateCheckpointSet guided_checkpoints;
+                            std::vector<uint32_t> guided_tokens;
                             uint32_t uncaptured_prefix_tokens = 0;
                             const uint32_t prefix_guard = 16;
                             const double query_decode_start = wall_seconds();
@@ -15409,13 +15674,27 @@ private:
                                 }
                                 executor_->kvmem_set_guided_query_capture(
                                     capture);
-                                guided_step = executor_->forward_one_token(
-                                    static_cast<uint32_t>(proposed));
+                                guided_step = guided_mtp
+                                    ? executor_->forward_guided_query_mtp(
+                                          static_cast<uint32_t>(proposed),
+                                          capture ? mtp_chain_len : 0,
+                                          options.kvmem_query_guided_query_max_tokens -
+                                              query_guided_query_tokens,
+                                          {eos, im_end, close_think},
+                                          guided_checkpoints, guided_tokens)
+                                    : executor_->forward_one_token(
+                                          static_cast<uint32_t>(proposed));
                                 if (!guided_step.ok) break;
                                 if (capture) {
                                     query_started = true;
-                                    ++query_guided_query_tokens;
-                                    query_guided_query_text += piece;
+                                    if (guided_mtp) {
+                                        query_guided_query_tokens += guided_tokens.size();
+                                        for (uint32_t token : guided_tokens)
+                                            query_guided_query_text += tokenizer_->decode_one(token);
+                                    } else {
+                                        ++query_guided_query_tokens;
+                                        query_guided_query_text += piece;
+                                    }
                                 }
                                 proposed = guided_step.argmax_token;
                             }
@@ -15689,6 +15968,30 @@ private:
                     wall_seconds() - t_semantic_start;
             }
             if (recompute_query &&
+                options.kvmem_reselect_mode != KvMemReselectMode::Off &&
+                skip_postselection_query_replay) {
+                const uint32_t first_pass_end = executor_->position();
+                if (first_pass_end != logical_prompt_tokens || !first_pass_logits) {
+                    throw std::runtime_error("no-replay private query did not restore the prompt state");
+                }
+                executor_->restore_last_logits(*first_pass_logits);
+                first_pass_logits.reset();
+                executor_->kvmem_rebase_checkpoint_to_selected_prefix(
+                    kvmem_query_replay_ckpt);
+                if (kvmem_warm_capture) {
+                    // Keep a current-generation aligned origin even when this
+                    // request emits one token and never crosses a new boundary.
+                    kvmem_postselection_pos = kvmem_query_replay_ckpt.position;
+                    kvmem_postselection_ckpt = std::move(kvmem_query_replay_ckpt);
+                }
+                log("native kvmem query replay skipped: ablation=keep-first-pass"
+                    " boundary=" + std::to_string(kvmem_query_replay_begin) +
+                    " suffix_tokens=" + std::to_string(
+                        logical_prompt_tokens - kvmem_query_replay_begin) +
+                    " position=" + std::to_string(first_pass_end) +
+                    " logits_restored=1 generation=" + std::to_string(
+                        executor_->kvmem_selection_generation()));
+            } else if (recompute_query &&
                 options.kvmem_reselect_mode != KvMemReselectMode::Off) {
                 const double t_query_replay_start = wall_seconds();
                 // Freeze the exact semantic context selected above. Every block
@@ -15857,6 +16160,7 @@ private:
                     executor_->kvmem_register_append(
                         kvmem_ckpt_split - kvmem_query_replay_begin);
                     kvmem_warm_valid_ = false;
+                    retain_replaced_prompt_checkpoint(kvmem_reuse_m);
                     executor_->capture_state(kvmem_warm_ckpt_prompt_);
                     kvmem_warm_prompt_pos = kvmem_ckpt_split;
                     kvmem_warm_prompt_resumable =
@@ -15976,6 +16280,7 @@ private:
         // describes exactly P tokens (block store + window + registered_pos).
         if (kvmem_warm_capture && !kvmem_warm_checkpoint_staged) {
             kvmem_warm_valid_ = false;  // invalid until end-capture re-validates
+            retain_replaced_prompt_checkpoint(kvmem_reuse_m);
             executor_->capture_state(kvmem_warm_ckpt_prompt_);
             kvmem_warm_prompt_pos = static_cast<uint32_t>(executor_->position());
             kvmem_warm_prompt_resumable =
@@ -16642,6 +16947,7 @@ private:
                 const double private_prompt_start = wall_seconds();
                 NativeExecutorReport private_step =
                     executor_->forward_n_tokens(private_prompt_ids);
+                const bool guided_mtp = private_step.ok && prime_guided_mtp(private_prompt_ids);
                 kvmem_middecode_private_prompt_s +=
                     wall_seconds() - private_prompt_start;
                 if (!private_step.ok) {
@@ -16653,6 +16959,8 @@ private:
                 const int32_t close_think = tokenizer_->token_id("</think>");
                 bool started = false;
                 bool query_terminated = false;
+                QwenExecutor::StateCheckpointSet guided_checkpoints;
+                std::vector<uint32_t> guided_tokens;
                 const double generated_query_start = wall_seconds();
                 while (proposed >= 0 &&
                        query_tokens <
@@ -16672,13 +16980,25 @@ private:
                     const bool capture = started ||
                         (!piece.empty() && !whitespace_only);
                     executor_->kvmem_set_guided_query_capture(capture);
-                    private_step = executor_->forward_one_token(
-                        static_cast<uint32_t>(proposed));
+                    private_step = guided_mtp
+                        ? executor_->forward_guided_query_mtp(
+                              static_cast<uint32_t>(proposed),
+                              capture ? mtp_chain_len : 0,
+                              options.kvmem_middecode_query_max_tokens - query_tokens,
+                              {eos, im_end, close_think},
+                              guided_checkpoints, guided_tokens)
+                        : executor_->forward_one_token(static_cast<uint32_t>(proposed));
                     if (!private_step.ok) break;
                     if (capture) {
                         started = true;
-                        ++query_tokens;
-                        query_text += piece;
+                        if (guided_mtp) {
+                            query_tokens += guided_tokens.size();
+                            for (uint32_t token : guided_tokens)
+                                query_text += tokenizer_->decode_one(token);
+                        } else {
+                            ++query_tokens;
+                            query_text += piece;
+                        }
                     }
                     proposed = private_step.argmax_token;
                 }
@@ -16816,6 +17136,35 @@ private:
             return true;
         };
 
+        const uint32_t decode_checkpoint_interval =
+            env_uint32_or("QW3_KVMEM_DECODE_CHECKPOINT_TOKENS", 0);
+        uint32_t last_decode_checkpoint = static_cast<uint32_t>(prompt_tokens.size());
+        uint32_t decode_checkpoint_count = 0;
+        double decode_checkpoint_seconds = 0.0;
+        auto maybe_capture_decode_checkpoint = [&]() {
+            if (!kvmem_warm_capture || decode_checkpoint_interval == 0 ||
+                !executor_->block_store()) return;
+            const uint32_t pos = executor_->position();
+            const uint32_t bt = std::max<uint32_t>(1,
+                executor_->block_store()->config().block_tokens);
+            if (pos <= last_decode_checkpoint ||
+                pos - last_decode_checkpoint < std::max(bt, decode_checkpoint_interval) ||
+                pos % bt != 0 || pos > prompt_tokens.size() + gen_tokens.size() ||
+                !executor_->kvmem_mtp_checkpoint_status(pos).complete) return;
+            const double started = wall_seconds();
+            auto &entry = kvmem_replay_checkpoints_[kvmem_replay_checkpoint_next_];
+            // Pending snapshots become reusable only after turn-end source
+            // finalization. A failed/cancelled generation cannot publish one.
+            entry.resumable = false;
+            entry.source_index_ready = false;
+            executor_->capture_state(entry.state);
+            last_decode_checkpoint = pos;
+            kvmem_replay_checkpoint_next_ =
+                (kvmem_replay_checkpoint_next_ + 1) % kvmem_replay_checkpoints_.size();
+            ++decode_checkpoint_count;
+            decode_checkpoint_seconds += wall_seconds() - started;
+        };
+
         if (options.max_tokens > 0 && !should_stop_mtp_eos(next_token)) {
             if (emit_generated_token(next_token) && trace_mtp && !run_spec_mtp) {
                 trace_mtp_chain(next_token, decoded - 1);
@@ -16833,7 +17182,9 @@ private:
         // and could make tier spill fail on a missing MTP V page.
         auto run_plain_decode_step = [&](bool allow_guided_refresh,
                                          bool maintain_mtp_prefix) -> bool {
+            if (kvmem_on) executor_->kvmem_prepare_decode_window(1);
             maybe_capture_postselection_checkpoint();
+            maybe_capture_decode_checkpoint();
             if (allow_guided_refresh) {
                 (void)maybe_middecode_guided_refresh();
             }
@@ -16901,15 +17252,22 @@ private:
                    !stream_cancelled &&
                    decoded < options.max_tokens &&
                    !should_stop_mtp_eos(next_token)) {
+                // Reserve only the next draft + target cycle, not the whole
+                // response cap. Never change selection inside verification or
+                // rollback: both target and draft prefixes are committed here.
+                const bool capacity_recovered = kvmem_on &&
+                    executor_->kvmem_prepare_decode_window(mtp_chain_len + 1);
                 maybe_capture_postselection_checkpoint();
-                if (maybe_middecode_guided_refresh()) {
+                maybe_capture_decode_checkpoint();
+                if (capacity_recovered || maybe_middecode_guided_refresh()) {
                     // The target window changed.  Bridge exactly one token on
                     // the authoritative target path, rebuild its MTP prefix in
                     // the new compact frame, then resume speculation.  The old
                     // behavior permanently disabled MTP for the request and
                     // left every later MTP V page unprimed.
-                    log("native kvmem middecode guided reselect: "
-                        "mtp_rebase=bridge");
+                    log(capacity_recovered
+                        ? "native kvmem decode capacity recovery: mtp_rebase=bridge"
+                        : "native kvmem middecode guided reselect: mtp_rebase=bridge");
                     if (!run_plain_decode_step(
                             /*allow_guided_refresh=*/false,
                             /*maintain_mtp_prefix=*/true)) {
@@ -17336,6 +17694,7 @@ private:
         // to publish the current selection generation before warm-state
         // finalization.
         maybe_capture_postselection_checkpoint();
+        maybe_capture_decode_checkpoint();
         const double t_decode_end = wall_seconds();
 
         // kvmem prefix cache: record this request's end as the warm resume point.
@@ -17376,10 +17735,33 @@ private:
                     !postselection_checkpoint_current ||
                     executor_->kvmem_finalize_content_index_from_raw_k(
                         kvmem_postselection_pos);
+                // Finalize through the newest aligned R before attempting M's
+                // partial last block. An incomplete M must not poison R.
+                uint32_t replay_index_end = 0;
+                for (const auto &entry : kvmem_replay_checkpoints_) {
+                    if (entry.state.ready && entry.state.position <= pos &&
+                        entry.state.kvmem_selection_generation ==
+                            executor_->kvmem_selection_generation()) {
+                        replay_index_end = std::max(replay_index_end, entry.state.position);
+                    }
+                }
+                const bool replay_index_finalized = replay_index_end > 0 &&
+                    executor_->kvmem_finalize_content_index_from_raw_k(replay_index_end);
+                for (auto &entry : kvmem_replay_checkpoints_) {
+                    entry.source_index_ready = replay_index_finalized &&
+                        entry.state.ready && entry.state.position <= replay_index_end &&
+                        entry.state.kvmem_selection_generation ==
+                            executor_->kvmem_selection_generation() &&
+                        executor_->kvmem_content_index_resume_compatible(entry.state.position);
+                    entry.resumable = entry.source_index_ready &&
+                        entry.state.mtp_prefix_len >= entry.state.position &&
+                        executor_->kvmem_mtp_checkpoint_status(entry.state.position).complete;
+                }
                 const bool end_index_finalized =
                     executor_->kvmem_finalize_content_index_from_raw_k(
                         static_cast<uint32_t>(pos));
                 if (postselection_checkpoint_current) {
+                    retain_replaced_prompt_checkpoint(kvmem_reuse_m);
                     kvmem_warm_ckpt_prompt_ =
                         std::move(kvmem_postselection_ckpt);
                     kvmem_warm_prompt_pos =
@@ -17451,6 +17833,8 @@ private:
                          << " query_snapshot="
                          << (query_snapshot_ready ? 1 : 0)
                          << " decoded=" << decoded;
+                    cmsg << " decode_checkpoints=" << decode_checkpoint_count
+                         << " decode_checkpoint_ms=" << decode_checkpoint_seconds * 1000.0;
                     log(cmsg.str());
                 }
             } else {
@@ -17970,7 +18354,7 @@ private:
         uint32_t aligned_len = 0;         // == tokens.size(), multiple of page_size
         std::vector<int32_t> kv_pages;    // pinned physical pages, logical 0..n
         std::vector<int32_t> mtp_kv_pages;// matching pinned MTP draft pages
-        QwenExecutor::StateSnapshot recur;// recurrent/conv/MTP state at boundary
+        std::unique_ptr<detail::PrefixStateStorage> state;
         uint32_t refcount = 0;            // live requests reading these pages
         uint64_t last_used_seq = 0;       // LRU
     };
@@ -17980,6 +18364,12 @@ private:
     uint64_t prefix_cache_next_id_ = 1;
     uint32_t prefix_cache_entry_count_ = 0;
     bool prefix_cache_evict_cb_installed_ = false;
+    uint32_t prefix_gpu_entries_ = 0;
+    uint64_t prefix_host_buffer_bytes_ = 0;
+    std::shared_ptr<HostTierBufferPool> prefix_host_pool_;
+    // One recycled allocation, in addition to the hot entries. Cold hits may
+    // promote a snapshot; active leases are exempt from the soft hot budget.
+    std::shared_ptr<QwenExecutor::StateSnapshot> prefix_recycled_snapshot_;
 
     // ---- kvmem single-request prefix cache (QW3_KVMEM_PREFIX_CACHE) --------
     // Keeps the plain-route shared executor_ warm across requests. kvmem_warm_log_
@@ -18006,6 +18396,54 @@ private:
         kvmem_warm_input_embedding_identities_;
     QwenExecutor::StateSnapshot kvmem_warm_ckpt_end_;
     QwenExecutor::StateSnapshot kvmem_warm_ckpt_prompt_;
+    struct ReplayCheckpoint {
+        QwenExecutor::StateSnapshot state;
+        bool resumable = false;
+        bool source_index_ready = false;
+    };
+    std::array<ReplayCheckpoint, 3> kvmem_replay_checkpoints_;
+    size_t kvmem_replay_checkpoint_next_ = 0;
+    // Retain the previous aligned P before a later capture overwrites it.
+    // Short decodes never fill the decode-checkpoint ring, but a rewritten
+    // tool-result tail can still move D a few tokens before the newest P.
+    // Swap the buffers: the normal capture reuses an evicted ring allocation;
+    // preserving the old state performs no additional GPU snapshot/copy.
+    void retain_replaced_prompt_checkpoint(uint32_t resume_pos) {
+        if (resume_pos == 0 || !executor_ || !executor_->block_store()) return;
+        const auto &state = kvmem_warm_ckpt_prompt_;
+        const uint32_t bt = std::max<uint32_t>(1,
+            executor_->block_store()->config().block_tokens);
+        if (!state.ready || !kvmem_warm_prompt_resumable_ ||
+            !kvmem_warm_source_index_ready_ || state.position == 0 ||
+            state.position != kvmem_warm_prompt_pos_ ||
+            state.position > resume_pos || state.position % bt != 0 ||
+            !detail::kvmem_checkpoint_selection_compatible(
+                state.kvmem_selection_generation,
+                executor_->kvmem_selection_generation())) return;
+        auto &entry = kvmem_replay_checkpoints_[kvmem_replay_checkpoint_next_];
+        const uint32_t retained = state.position;
+        std::swap(entry.state, kvmem_warm_ckpt_prompt_);
+        entry.resumable = true;
+        entry.source_index_ready = true;
+        kvmem_replay_checkpoint_next_ =
+            (kvmem_replay_checkpoint_next_ + 1) % kvmem_replay_checkpoints_.size();
+        if (kvmem_prefix_cache_trace_enabled()) {
+            log("kvmem prefix-cache RETAIN-P: R=" + std::to_string(retained) +
+                " resume=" + std::to_string(resume_pos));
+        }
+    }
+    void prune_replay_checkpoints(uint32_t resume_pos) {
+        for (auto &entry : kvmem_replay_checkpoints_) {
+            // KV after the chosen origin will be overwritten. It no longer
+            // belongs to the next warm log, even if its token count matches.
+            if (resume_pos == 0 || entry.state.position > resume_pos) {
+                entry.resumable = false;
+                entry.source_index_ready = false;
+                entry.state.ready = false;
+                entry.state.gc_lease.reset();
+            }
+        }
+    }
     uint32_t kvmem_warm_prompt_pos_ = 0;   // P (position of ckpt_prompt_)
     uint32_t kvmem_warm_end_pos_ = 0;      // M (position of ckpt_end_)
     bool kvmem_warm_prompt_resumable_ = false;  // ckpt_prompt_ safe to resume

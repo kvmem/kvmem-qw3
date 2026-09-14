@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace qw3 {
@@ -24,6 +25,34 @@ struct VisionImage {
     std::string media_type;
     std::string base64_data;
 };
+
+// Server-owned immutable image identity. Reusing this object avoids rescanning
+// a validated historical payload; callers cannot override its fingerprint.
+class VisionImageSource {
+public:
+    static constexpr uint64_t fingerprint_seed = 1469598103934665603ULL;
+    explicit VisionImageSource(VisionImage image) : image_(std::move(image)) {
+        fingerprint_ = append_fingerprint(fingerprint_seed);
+        if (!fingerprint_) fingerprint_ = 1;
+    }
+    const VisionImage &image() const { return image_; }
+    uint64_t fingerprint() const { return fingerprint_; }
+    uint64_t append_fingerprint(uint64_t state) const {
+        for (const auto *part : {&image_.media_type, &image_.base64_data}) {
+            for (unsigned char byte : *part) {
+                state ^= byte;
+                state *= 1099511628211ULL;
+            }
+            state ^= 0xffu;
+            state *= 1099511628211ULL;
+        }
+        return state;
+    }
+private:
+    VisionImage image_;
+    uint64_t fingerprint_ = 0;
+};
+using VisionImageSourcePtr = std::shared_ptr<const VisionImageSource>;
 
 struct VisionEncoding {
     struct Grid {
@@ -386,9 +415,10 @@ struct GenerationOptions {
     // validate only the visual inputs preceding a candidate checkpoint.
     uint64_t input_embedding_fingerprint = 0;
     // Exact dense-prompt M-RoPE coordinates, one entry per prompt token. This
-    // is populated only for multimodal requests. KVMem keeps visual spans
-    // atomic and can replay their synthetic embedding IDs; compact re-RoPE
-    // remains governed by the existing KVMem window coordinates.
+    // is populated only for multimodal requests. KVMem can replay synthetic
+    // embedding IDs; protected visual spans stay whole while opted-in sparse
+    // history can select older visual blocks. Compact re-RoPE remains governed
+    // by the existing KVMem window coordinates.
     std::vector<std::array<uint32_t, 3>> input_mrope_positions;
     bool ignore_eos = false;
     // Serving compatibility: if generation is still inside an open <think>
@@ -631,6 +661,7 @@ public:
     ModelInfo inspect_model() const;
     NativePlanInfo native_plan() const;
     VisionEncoding encode_vision(const std::vector<VisionImage> &images);
+    VisionEncoding encode_vision_sources(const std::vector<VisionImageSourcePtr> &images);
     std::string generate(const std::string &prompt, const GenerationOptions &options);
     void generate_stream(const std::string &prompt,
                          const GenerationOptions &options,

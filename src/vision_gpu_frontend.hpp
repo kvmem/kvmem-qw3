@@ -26,6 +26,7 @@ public:
     GpuVisionFrontend &operator=(const GpuVisionFrontend &) = delete;
 
     CpuVisionEncoding encode(const std::vector<CpuVisionImage> &images);
+    CpuVisionEncoding encode_sources(const std::vector<VisionImageSourcePtr> &images);
     uint64_t weight_bytes() const;
 
 private:

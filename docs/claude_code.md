@@ -151,10 +151,85 @@ failed arm.
 
 ## Current limitations
 
-Image, document, redacted-thinking, and Anthropic server-tool blocks are not yet
-supported. They return an explicit `invalid_request_error`; unsupported
-content is never silently removed.
+Base64 image blocks are supported in user messages and inside tool results;
+text/image order and the tool-call association are preserved. Documents,
+redacted-thinking and Anthropic server-tool blocks are not yet supported and
+return an explicit `invalid_request_error`.
 OpenAI-compatible endpoints keep their existing request and response formats.
+
+`QW3_MESSAGE_PREFIX_CACHE=1 QW3_PREPARED_PREFIX_CACHE=1
+QW3_ANTHROPIC_PREPARED_CACHE=1` enables server-side prepared-history reuse for
+native Claude Code requests, including streaming. Claude Code still sends its
+original complete history. The server compares exact raw message prefixes with
+at most two bounded snapshots, reuses prepared metadata, and publishes a new
+snapshot only after successful generation. Rewrites and compaction invalidate
+the affected suffix through the same token/image checks as explicit prefix
+handles. This does not alter Claude Code's own history management. The Messages
+wrapper obtains token usage from the actual prepared request, avoiding a second
+vision preparation solely to count the same request.
+
+With this prepared cache and the direct native request path enabled,
+`QW3_ANTHROPIC_WIRE_PREFIX=1` (the default) moves prefix reuse ahead of full JSON
+parsing and Anthropic conversion. The server compares complete source-message
+bytes against the latest native snapshot, then parses and converts only the
+unmatched suffix. Shared immutable source records retain the mapping from each
+Anthropic message to its internal messages, including tool results that expand
+into multiple messages. Current system fields and request options are still
+validated; a changed rendered system prefix falls back to the full request.
+Unsupported layouts and malformed JSON retain the original parsing behavior.
+Compacted histories replace the client's old history; cached messages are never
+automatically appended to them. Token/image LCP, checkpoint and replay checks
+remain unchanged. No client changes, session ID or custom wire fields are needed.
+Set the flag to `0` for a comparison using the same prepared cache after full
+parsing/conversion. The preprocessing trace reports `wire_prefix_messages`,
+`wire_prefix_bytes`, and `wire_prefix_system_fallback`. Cached source bytes count
+against the same bounded metadata budget. This removes repeated CPU object
+processing; the native client still serializes and sends the complete history,
+and the server still receives and compares those bytes.
+
+`QW3_PREPARED_PREFIX_CACHE_MIB` controls this CPU metadata cache's total accounting
+limit (default 512 MiB, at most two snapshots). A positive value of 2048 is useful
+for complete multimodal histories approaching the 2M-token KVMem limit. This is
+separate from the CPU KV and vision feature-cache budgets. The accounting remains
+conservative for shared records; an oversized snapshot is still rejected, and
+in-flight requests can retain evicted records. Increasing this budget does not
+change image encoding, tokenization results, selection, or query replay.
+
+`QW3_HARNESS_STABLE_REASONING=1` lets recognized harness clients retain earlier
+assistant thinking delimiters when a new user instruction arrives. This is
+already the behavior of KVMem prefix mode. Enabling it for an ordinary QW3
+baseline prevents a native compaction instruction from rewriting the earlier
+token prefix solely by removing those delimiters (including empty delimiters
+when thinking is disabled). KV reuse still requires exact token/image-prefix
+matches; the flag never restores a mismatching checkpoint. It does not change
+Claude Code's compaction trigger or summary request. It defaults to off for
+ordinary serving and does not affect unrecognized clients.
+The native `count_tokens` endpoint applies the same framing flag as generation.
+
+Native Messages requests pass their converted JSON object directly to the
+generation handler by default. This avoids serializing and parsing the complete
+image history a second time, while retaining the original client request and
+all model calculations. `QW3_ANTHROPIC_DIRECT_REQUEST=0` restores the JSON round
+trip for comparisons. `QW3_ANTHROPIC_PREPROCESS_TRACE=1` records the native
+wrapper's parse, conversion, bridge and handler timings. The handler interval
+includes generation for non-streaming requests; for streaming requests it ends
+when the response provider is installed, before that provider runs.
+The trace also records monotonic request-start and handler-end timestamps so
+local client traces can isolate time spent before the native handler begins.
+
+Native request bodies of at least 64 KiB also use the vendored yyjson reader for
+string-heavy JSON parsing. The resulting message object has the same owned
+strings and number types as before; number literals still use the original
+nlohmann parser. Invalid, unsupported or deeply nested documents fall back to
+the original parser, retaining its validation and error behavior. UTF-8
+validation remains enabled. `QW3_NATIVE_FAST_JSON=0` disables this optimization
+for both Messages and `count_tokens`. This changes CPU parsing only.
+
+Streaming responses keep one immutable owner of the rendered prompt and
+generation options. Copies of the HTTP content-provider callback share that
+owner, avoiding repeated copies of complete visual row and position arrays.
+The arrays and generation calculations remain unchanged; their lifetime extends
+until the response provider is released.
 
 See [harness_compatibility.md](harness_compatibility.md) for reminder lifetime,
 budget priority, OpenCode, and DeepSeek Harness details.

@@ -63,8 +63,12 @@ def progress(run, task_ids):
     scores = {task: score(task_root / task / "result.txt") for task in task_ids}
     completed = {task: value for task, value in scores.items() if value is not None}
     pending = [task for task in task_ids if scores[task] is None]
+    prediction_failures = [task for task in pending
+                           if any(row.get("status") == "predict_error"
+                                  for row in rows(task_root / task / "step_timing.jsonl"))]
     value = {"completed_tasks": len(completed), "task_scores": completed,
              "tasks_without_result": pending,
+             "prediction_failure_tasks": prediction_failures,
              "mean_score_completed": statistics.mean(completed.values()) if completed else None,
              "current_task": None}
     traces = [task_root / task / "agent_step_trace.jsonl" for task in pending]
@@ -85,6 +89,9 @@ def progress(run, task_ids):
             "summary_failures": sum(e.get("status") == "error" for e in events),
             "recent20_mean_ttft_sec": statistics.mean(ttfts) if ttfts else None,
             "recent20_mean_step_sec": statistics.mean(step_times) if step_times else None,
+            "last_prompt_tokens": records[-1].get("api", {}).get("usage", {}).get("prompt_tokens") if records else None,
+            "image_folding_events": sum(bool(r.get("compaction", {}).get("triggered")) for r in records),
+            "history_truncation_steps": sum(r.get("compaction", {}).get("history_truncated_steps", 0) > 0 for r in records),
         }
     return value
 
@@ -168,6 +175,21 @@ def run_plan(plan, state_path):
         save()
         while child.poll() is None:
             state.update(progress(run, plan["task_ids"]))
+            if plan.get("stop_on_prediction_failure") and state["prediction_failure_tasks"]:
+                state["status"] = "stopped_prediction_failure"
+                save()
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    child.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+                state.update(exit_code=child.returncode, finished_at_utc=now())
+                save()
+                return
             save()
             time.sleep(poll_seconds)
         state.update(progress(run, plan["task_ids"]))

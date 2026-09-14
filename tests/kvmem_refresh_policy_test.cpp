@@ -145,6 +145,18 @@ int main() {
                 at_initial.reason ==
                     KvmemHarnessRefreshReason::InitialHeadroom,
             "initial refresh did not fire at A+T");
+    for (uint64_t length : {65537ULL, 98304ULL, 400000ULL}) {
+        auto stable_without_guidance = initial_due;
+        stable_without_guidance.prompt_tokens = length;
+        stable_without_guidance.cross_turn.due = true;
+        for (bool selected : {false, true}) {
+            stable_without_guidance.selection_started = selected;
+            const auto no_query = kvmem_harness_refresh_decision(
+                stable_without_guidance, false);
+            require(!no_query.reselect && !no_query.private_query,
+                    "guided-off stable task reselected at a capacity boundary");
+        }
+    }
     KvmemHarnessRefreshInput new_user = first_crossing;
     new_user.same_user_query = false;
     const auto new_user_decision =
@@ -154,6 +166,24 @@ int main() {
                 new_user_decision.reason ==
                     KvmemHarnessRefreshReason::NewUserQuery,
             "new user query above A did not refresh immediately");
+    const auto new_user_without_guidance =
+        kvmem_harness_refresh_decision(new_user, false);
+    require(new_user_without_guidance.reselect &&
+                !new_user_without_guidance.private_query &&
+                new_user_without_guidance.reason ==
+                    KvmemHarnessRefreshReason::NewUserQuery,
+            "guided-off disabled genuine new-user retrieval");
+    auto forced_without_guidance = initial_due;
+    forced_without_guidance.force_reselect = true;
+    require(kvmem_harness_refresh_decision(forced_without_guidance, false).reselect,
+            "guided-off ignored explicit force");
+    auto cold_without_guidance = initial_due;
+    cold_without_guidance.known_conversation = false;
+    require(kvmem_harness_refresh_decision(cold_without_guidance, false).reselect,
+            "guided-off disabled initial above-budget retrieval");
+    cold_without_guidance.incoming_reselect = false;
+    require(!kvmem_harness_refresh_decision(cold_without_guidance, false).reselect,
+            "guided-off ignored explicit cold ingest-only mode");
     KvmemHarnessRefreshInput stable_selected = first_crossing;
     stable_selected.selection_started = true;
     stable_selected.cross_turn = kvmem_cross_turn_refresh_decision(

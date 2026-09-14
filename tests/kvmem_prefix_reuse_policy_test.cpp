@@ -95,6 +95,12 @@ void test_branch_safe_prompt_checkpoint() {
 }
 
 void test_query_safe_prompt_checkpoint() {
+    // OSWorld's first request is below budget: preparation still needs the
+    // complete Q or a checkpoint before Q. A 16-token response then tail
+    // rewrite leaves D=6803 < M=6807, so P must be 6528, not 6752 inside Q.
+    static_assert(kvmem_query_safe_prompt_checkpoint_split(
+                      6792, 0, 32, 6550, 6783) == 6528);
+
     // Real OpenCode tool continuation from the 64K guided DeepSWE pilot.  The
     // ordinary branch-tail split selected 240224, which is inside the current
     // user query [240171,240279).  That overwrote the reusable P=240160 and

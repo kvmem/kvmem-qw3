@@ -2,6 +2,7 @@
 
 #include "qwen_native.hpp"
 #include "qwen_weights.hpp"
+#include "input_embedding_override_index.hpp"
 #include "qw3/device_backend.hpp"
 #include "qw3/kvmem_archive.hpp"
 #include "qw3/kvmem_store.hpp"
@@ -316,6 +317,9 @@ public:
     // persistence, because the caller never exposes or retains it externally.
     void capture_transient_state(StateSnapshot &snapshot);
     void restore_state(const StateSnapshot &snapshot);
+    // Experimental no-replay continuation: project an existing aligned model
+    // state onto the current selected prefix without rewinding the live state.
+    void kvmem_rebase_checkpoint_to_selected_prefix(StateSnapshot &snapshot);
     // Restore only the hybrid model's recurrent/conv tensors. Position, hidden
     // state, normal-attention K/V, page tables, and KVMem selection stay live.
     // Used by the gated inline-refresh ablation to isolate standard-KV refresh
@@ -397,6 +401,10 @@ public:
     // Copy the most recent logits tensor back to host. Returns false if
     // forward_one_token has not been called yet.
     bool copy_last_logits(std::vector<float> &out) const;
+    // Private query probes overwrite logits even when restore_state rolls back
+    // their hidden/recurrent state. A no-replay caller must restore both.
+    std::unique_ptr<DeviceTensor> snapshot_last_logits();
+    void restore_last_logits(const DeviceTensor &snapshot);
 
     // ---- Block-sparse KV attention (single-session, opt-in) ---------------
     // Master switch. When false (default) the forward path is byte-identical
@@ -462,6 +470,12 @@ public:
     }
     uint32_t kvmem_end_guided_query_probe();
     void kvmem_cancel_guided_query_probe();
+    // One private greedy MTP step, using the ordinary draft/verify/rollback
+    // primitives. `tokens` contains only target-confirmed query inputs.
+    NativeExecutorReport forward_guided_query_mtp(
+        uint32_t current, uint32_t chain, uint32_t remaining,
+        const std::array<int32_t, 3> &stops, StateCheckpointSet &checkpoints,
+        std::vector<uint32_t> &tokens);
     // Publish the incrementally captured mean-K index for the CURRENT logical
     // prefix, even though the full teacher-forced transcript has not yet been
     // consumed. Used only by experimental transcript replay before an
@@ -660,7 +674,11 @@ public:
     // >100 pages at once, while a final partial tail may need only one page; the
     // caller must therefore pass the actual upcoming chunk, not the prior size.
     // No-op when not bounded/tiered.
-    void kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens);
+    void kvmem_maybe_prefill_offload(uint32_t next_chunk_tokens,
+                                   bool decode = false);
+    // Call only at a committed boundary, before any speculative draft/verify.
+    // Returns true when pressure changed the window and MTP needs a bridge.
+    bool kvmem_prepare_decode_window(uint32_t next_tokens);
     // SSD stage-out write-through producer. Call only after every KV source for
     // [0, completed_pos) is durable (for local-position MTP this means after
     // prime_mtp_prefix_from_last_batch). Full newly-completed blocks are packed
@@ -934,7 +952,7 @@ private:
     bool scratch_ready_ = false;
     std::vector<GenerationOptions::InputEmbeddingOverride>
         input_embedding_overrides_;
-    std::unordered_map<uint32_t, size_t> input_embedding_override_index_;
+    detail::InputEmbeddingOverrideIndex input_embedding_override_index_;
     std::vector<uint32_t> input_multimodal_prompt_tokens_;
     std::vector<std::array<uint32_t, 3>> input_mrope_positions_;
     std::vector<std::array<uint32_t, 3>> input_compact_mrope_positions_;
@@ -2303,7 +2321,9 @@ private:
     void kvmem_capture_guided_query(uint32_t layer_index,
                                     const DeviceTensor &q,
                                     uint32_t q_stride,
-                                    uint32_t rope_pos);
+                                    uint32_t rope_pos,
+                                    uint32_t count = 1,
+                                    uint32_t token_stride = 0);
     bool kvmem_guided_query_probe_active_ = false;
     bool kvmem_guided_query_capture_this_token_ = false;
     bool kvmem_guided_query_capture_failed_ = false;

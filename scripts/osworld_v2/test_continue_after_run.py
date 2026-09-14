@@ -25,6 +25,51 @@ def wait_for(predicate):
 
 
 class ContinuationTest(unittest.TestCase):
+    def test_prediction_error_stops_batch_without_creating_zero_scores(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "scripts/osworld_v2").mkdir(parents=True)
+            worker = root / "fake_worker.py"
+            worker.write_text("""import json, os, pathlib, time
+root = pathlib.Path(os.environ['QW3_OSWORLD_RESULT_ROOT'])
+run = root / (os.environ['QW3_OSWORLD_RUN_LABEL'] + '-' + os.environ['QW3_OSWORLD_RUN_ID'])
+task = run / 'osworld/pyautogui/screenshot/gpt-qw3/tasks/052'
+task.mkdir(parents=True)
+(task / 'step_timing.jsonl').write_text(json.dumps({'status': 'predict_error', 'error': 'HTTP 413'}) + '\\n')
+time.sleep(30)
+""")
+            (root / "scripts/osworld_v2/run_qw3_full.sh").write_text(
+                f"#!/bin/bash\nexec {sys.executable} {worker}\n")
+            metadata = root / "previous.json"
+            write_json(metadata, {"status": "paused_for_repair"})
+            selection = root / "tasks.json"
+            write_json(selection, {"tasks": ["052", "004"]})
+            state = root / "state.json"
+            plan = root / "plan.json"
+            write_json(plan, {
+                "root": str(root), "state_path": str(state), "poll_seconds": 0.05,
+                "predecessor_run": str(root / "previous"), "predecessor_metadata": str(metadata),
+                "wait_for_processes": [], "task_ids": ["052", "004"],
+                "stop_on_prediction_failure": True,
+                "settings": {"OSWORLD_TEST_META": str(selection), "QW3_OSWORLD_PORT": "0",
+                             "QW3_OSWORLD_RUN_LABEL": "test", "QW3_OSWORLD_RESULT_ROOT": str(root / "results")}})
+            supervisor = subprocess.Popen([sys.executable, str(SCRIPT), "--plan", str(plan)],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                _, stderr = supervisor.communicate(timeout=8)
+                self.assertEqual(supervisor.returncode, 0, stderr.decode())
+                final = json.loads(state.read_text())
+                self.assertEqual(final["status"], "stopped_prediction_failure")
+                self.assertEqual(final["prediction_failure_tasks"], ["052"])
+                self.assertEqual(final["task_scores"], {})
+                self.assertEqual(final["completed_tasks"], 0)
+                self.assertFalse((Path(final["run_dir"]) / 'osworld/pyautogui/screenshot/gpt-qw3/tasks/004').exists())
+            finally:
+                if supervisor.poll() is None:
+                    supervisor.terminate()
+                supervisor.wait(timeout=3)
+                supervisor.stderr.close()
+
     def test_waits_for_both_processes_and_keeps_missing_score_unset(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

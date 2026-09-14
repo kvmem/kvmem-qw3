@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import hashlib
 import os
 import platform
 import subprocess
@@ -108,7 +109,10 @@ def main() -> None:
             "task_count": len(selected_tasks),
             "model": file_metadata(args.model),
             "vision_model_index": file_metadata(vision_index),
-            "qw3_binary": file_metadata(args.qw3_root / "build" / "qw3"),
+            "qw3_binary": {
+                **file_metadata(Path(os.environ.get("QW3_OSWORLD_BINARY", str(args.qw3_root / "build" / "qw3")))),
+                "sha256": hashlib.sha256(Path(os.environ.get("QW3_OSWORLD_BINARY", str(args.qw3_root / "build" / "qw3"))).read_bytes()).hexdigest(),
+            },
         },
         "run": {
             "provider": "docker",
@@ -122,6 +126,7 @@ def main() -> None:
             "vnc_enabled": os.environ.get("QW3_OSWORLD_ENABLE_VNC", "0") == "1",
             "guest_resource_trace_enabled": os.environ.get("QW3_OSWORLD_TRACE_GUEST", "1") == "1",
             "sampling": {
+                "seed": int(os.environ.get("QW3_OSWORLD_SEED", "0")),
                 "temperature": float(os.environ.get("QW3_OSWORLD_TEMPERATURE", "1.0")),
                 "top_p": float(os.environ.get("QW3_OSWORLD_TOP_P", "0.95")),
                 "top_k": int(os.environ.get("QW3_OSWORLD_TOP_K", "20")),
@@ -157,6 +162,10 @@ def main() -> None:
             "fold_size": int(os.environ.get("QW3_OSWORLD_FOLD_SIZE", "10")),
         },
         "runtime": {
+            "message_prefix_transport": os.environ.get("QW3_OSWORLD_MESSAGE_PREFIX_CACHE", "0") == "1",
+            "message_prefix_cache": os.environ.get("QW3_MESSAGE_PREFIX_CACHE", "0") == "1",
+            "prepared_prefix_cache": os.environ.get("QW3_MESSAGE_PREFIX_CACHE", "0") == "1" and os.environ.get("QW3_PREPARED_PREFIX_CACHE", "1").lower() not in {"0", "off", "false", "none", "n", "no"},
+            "server_token_cache": os.environ.get("QW3_SERVER_TOKEN_CACHE", "0").lower() in {"1", "true", "yes", "on"},
             "server_enable_thinking_default": os.environ.get(
                 "QW3_OSWORLD_SERVER_ENABLE_THINKING",
                 os.environ.get("QW3_OSWORLD_ENABLE_THINKING", "1"),
@@ -178,6 +187,19 @@ def main() -> None:
                 args.kvmem_gen_budget if args.kvmem_prefix_cache else None
             ),
             "kvmem_cpu_gb": args.kvmem_cpu_gb if args.kvmem_prefix_cache else None,
+            "kvmem_method": os.environ.get("QW3_OSWORLD_KVMEM_METHOD", "recency") if args.kvmem_prefix_cache else None,
+            "kvmem_retrieval_method": os.environ.get("QW3_OSWORLD_KVMEM_RETRIEVAL_METHOD", "mean-k") if args.kvmem_prefix_cache else None,
+            "kvmem_query_conditioned": args.kvmem_prefix_cache == 1 and os.environ.get("QW3_OSWORLD_KVMEM_QUERY_CONDITIONED", "0") == "1",
+            "kvmem_index_placement": os.environ.get("QW3_OSWORLD_KVMEM_INDEX_PLACEMENT", "gpu") if args.kvmem_prefix_cache else None,
+            "kvmem_retrievable_visual_history": args.kvmem_prefix_cache == 1 and os.environ.get("QW3_KVMEM_RETRIEVABLE_VISUAL_HISTORY", "0").lower() in {"1", "true", "yes", "on"},
+            "kvmem_update_mode": os.environ.get("QW3_OSWORLD_KVMEM_UPDATE_MODE", "interval") if args.kvmem_prefix_cache else None,
+            "kvmem_guided_reselect": os.environ.get("QW3_OSWORLD_KVMEM_GUIDED_RESELECT", "off") if args.kvmem_prefix_cache else None,
+            "kvmem_guided_thinking_tokens": int(os.environ.get("QW3_OSWORLD_KVMEM_GUIDED_THINKING_TOKENS", "0")),
+            "kvmem_guided_query_tokens": int(os.environ.get("QW3_OSWORLD_KVMEM_GUIDED_QUERY_TOKENS", "256")),
+            "kvmem_refresh_tokens": int(os.environ.get("QW3_OSWORLD_KVMEM_REFRESH_TOKENS", "28672")),
+            "kvmem_nvme_gb": 0,
+            "kvmem_opt_stage_out": os.environ.get("QW3_OSWORLD_KVMEM_OPT_STAGE_OUT", "on") == "on",
+            "kvmem_raw_k_nvme": False,
             "kvmem_immutable_k": (
                 bool(args.kvmem_immutable_k) if args.kvmem_prefix_cache else None
             ),
@@ -189,9 +211,16 @@ def main() -> None:
             "max_active": args.max_active,
             "mtp_chain": int(os.environ.get("QW3_OSWORLD_MTP_CHAIN", "0")),
             "context_tokens": args.context_tokens,
+            "kv_dtype": os.environ.get("QW3_OSWORLD_KV_DTYPE", "fp16"),
             "vision_device": "cuda",
             "vision_embedding_cache_mib": int(
                 os.environ.get("QW3_VISION_GPU_CACHE_MIB", "512")
+            ),
+            "vision_embedding_cpu_cache_mib": int(
+                os.environ.get("QW3_VISION_CPU_CACHE_MIB", "0")
+            ),
+            "kvmem_decode_checkpoint_tokens": int(
+                os.environ.get("QW3_KVMEM_DECODE_CHECKPOINT_TOKENS", "0")
             ),
         },
         "endpoints": {
