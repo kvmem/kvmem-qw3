@@ -146,7 +146,12 @@ def main():
                         time.sleep(.5)
                     for name in cases:
                         directory=OUT/size/name
-                        records=[json.loads(x) for x in (directory/'qw3_logits.jsonl').read_text().splitlines()]
+                        # Individual BPE tokens can contain only part of a UTF-8
+                        # character. Preserve those bytes in display strings;
+                        # comparison uses integer IDs and numeric logits only.
+                        # Split on raw LF, not Unicode line-separator tokens.
+                        records=[json.loads(x.decode('utf-8', errors='surrogateescape'))
+                                 for x in (directory/'qw3_logits.jsonl').read_bytes().split(b'\n') if x]
                         tokens=next(x['tokens'] for x in records if x['event']=='prompt')
                         native=next(x for x in records if x['event']=='step'
                                     and x['phase']=='prefill' and x['step']==len(tokens)-1)
@@ -167,7 +172,7 @@ def main():
                         proc.kill();proc.wait()
         state.update(status='complete_pending_interpretation',finished_at=time.time())
     except BaseException as error:
-        state.update(status='needs_attention',error=repr(error));raise
+        state.update(status='needs_attention',error=f'{type(error).__name__}: {str(error)[:1024]}');raise
     finally:
         save(OUT/'status.json',state)
 

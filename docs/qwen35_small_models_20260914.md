@@ -84,3 +84,35 @@ Even the two PyTorch BF16 attention implementations differed at cosine
 not proof of full vision compatibility: the original native-vs-reference
 gate is still failing and needs separate resolution before small-model
 multimodal experiments.
+
+After the first 9B pair, an independent same-weight text diagnostic compared
+qw3 and llama.cpp on five fixed prompts per model (5, 23, 25, 1,145 and 2,325
+tokens), including a 27B control. All 15 first-token argmaxes agreed. Top-32
+set overlap was 31–32/32 for 4B, 28–32/32 for 9B and 31–32/32 for 27B;
+logits were not identical. Common-token centered logit RMS differences ranged
+from 0.046–0.176, 0.020–0.230 and 0.038–0.425 respectively. This supports
+continuing the text pilot without evidence of a large new shape/loading
+error in these cases; it does not prove long-trajectory accuracy or MTP
+equivalence. The diagnostic uses FP16 KV and no speculation; the frozen pilot
+continues with FP8 KV/MTP=4. Raw dumps, commands, identities and the review are
+under `reference_logits_audit/`. Partial UTF-8 display-token bytes are retained
+in the dumps and decoded with surrogate escaping only by the reader;
+comparison uses integer token IDs and numeric logits.
+
+The new `qw3-vision-attention-oracle` independently checks 64/72-dimensional
+vision attention against FP64 CPU softmax, including two separate images,
+an empty segment and 128-lane padding. Both cases passed (maximum absolute
+error 0.002032/0.002015; RMS 0.000498/0.000495). The fixture also distinguishes
+incorrect padded-dimension scaling and cross-image attention. This narrows
+the unresolved full-encoder visual difference; it does not waive that gate.
+
+The first 9B pair is also retained as a quality failure. Ordinary qw3 had
+8/80 new tests and 26/116 existing tests pass, versus 0/80 and 21/116 for
+KVMem. Ordinary execution took 1,334.45 seconds, generated 160,697 tokens and
+had one native compaction (client-reported 57.129 seconds); KVMem took 612.99
+seconds, generated 69,583 tokens and did not reach semantic reselection.
+This is not evidence of a 2.18x maintenance-induced speedup: generated work
+and quality differ, and compaction accounts for only 4.28% of ordinary agent
+time. Both processes and verifiers completed normally. The model/engine
+artifacts and all completed result hashes were preserved through the
+reference-audit pause, then the remaining 9B-first schedule resumed.
