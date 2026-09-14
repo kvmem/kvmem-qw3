@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import re
 import statistics
 import sys
 
@@ -48,6 +49,34 @@ def arm_row(job, root):
         metrics_path=str(metrics_path), binary_sha256=manifest['locked_artifacts']['qw3_binary_sha256'],
         model_sha256=manifest['locked_artifacts']['model_sha256'])
     return row, d
+
+
+def mtp_row(arm):
+    """Aggregate counters, not averages of rounded per-request accept rates.
+
+    Phase values are the existing engine's host timers; they are not a CUDA
+    profile and should not be assumed to partition decode wall time exactly.
+    """
+    log = Path(arm['metrics_path']).parent / 'server/qw3_server.log'
+    summaries = []
+    for line in log.read_text(errors='replace').splitlines():
+        if '[qw3] native mtp_spec_summary:' not in line:
+            continue
+        fields = dict(re.findall(r'([a-z0-9_]+)=([^ ]+)', line))
+        if fields.get('enabled') == 'true':
+            summaries.append(fields)
+    total = lambda key: sum(float(s.get(key, '0').rstrip('s')) for s in summaries)
+    drafted, accepted = int(total('drafted')), int(total('accepted'))
+    return dict(model=arm['model'], policy=arm['policy'], task_id=arm['task_id'],
+        summaries=len(summaries), model_requests=arm['request_count'],
+        drafted=drafted, accepted=accepted,
+        acceptance=accepted / drafted if drafted else None,
+        batches=int(total('batches')), rollbacks=int(total('rollbacks')),
+        draft_sec=total('draft_s'), verify_sec=total('verify_s'),
+        restore_sec=total('restore_s'), snapshot_sec=total('snapshot_s'),
+        replay_sec=total('replay_s'), prefix_sec=total('prefix_s'),
+        decode_sec=arm['decode_sec'], decoded_tokens=arm['decoded_tokens'],
+        weighted_decode_tokens_per_s=arm['decode_tps_completed'], log_path=str(log))
 
 
 def report(root):
@@ -102,7 +131,9 @@ def report(root):
                 semantic_reselections=sum(r['semantic_reselections'] for r in rows)))
     out = root / 'report'
     out.mkdir(exist_ok=True)
-    for name, rows in (('arms', arms), ('pairs', pairs), ('paired_summary', summary)):
+    mtp = [mtp_row(arm) for arm in arms]
+    for name, rows in (('arms', arms), ('pairs', pairs), ('paired_summary', summary),
+                       ('mtp_counters', mtp)):
         (out / f'{name}.json').write_text(json.dumps(rows, indent=2) + '\n')
         if rows:
             with (out / f'{name}.csv').open('w', newline='') as f:
@@ -118,6 +149,7 @@ def report(root):
             'The legacy long_context_pressure_observed field can be true below the actual refresh threshold; maintenance_events_observed requires a logged compaction or semantic refresh.',
             'Equal reward signatures, including equal failures, do not isolate maintenance-induced speedup.',
             'Pure decode throughput excludes prefill, retrieval, compaction and tools.',
+            'MTP acceptance is total accepted / total drafted; recorded host phase timers are not an exclusive GPU-time breakdown.',
             'All completed arm results, including invalid ones, remain in arms.csv for audit.'])
     (out / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps({k: result[k] for k in ('completed_arms', 'total_arms', 'completed_pairs', 'valid_pairs')}))
