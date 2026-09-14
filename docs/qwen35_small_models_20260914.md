@@ -85,6 +85,18 @@ not proof of full vision compatibility: the original native-vs-reference
 gate is still failing and needs separate resolution before small-model
 multimodal experiments.
 
+Audit correction: that FP32 reference retained FP32 image preprocessing,
+whereas the native and both BF16 references rounded input patches to BF16.
+Consequently the reported FP32 errors include input-quantization differences
+and cannot isolate encoder arithmetic. The BF16-to-BF16 comparison is not
+affected by this confound. `scripts/qwen35_vision_reference_audit.py` prepares
+a separate audit using identical BF16 input patches promoted to FP32 only
+for reference arithmetic. It freezes the original screenshot and two held-out
+screenshots, hashes reference tensors and code, and retains the original gate
+outcomes. Results require interpretation; collecting them does not itself
+qualify visual compatibility. This diagnostic is queued after the text pilot
+to preserve exclusive GPU timing.
+
 After the first 9B pair, an independent same-weight text diagnostic compared
 qw3 and llama.cpp on five fixed prompts per model (5, 23, 25, 1,145 and 2,325
 tokens), including a 27B control. All 15 first-token argmaxes agreed. Top-32
