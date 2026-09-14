@@ -221,3 +221,19 @@ large block-10 amplification mainly to the MLP transformation of already
 different inputs. It does not locate the first source of rounding differences,
 prove full-encoder correctness, or waive the failed visual gate. Raw stage
 arrays and checkpoint tensor hashes are in `vision_block10_fp64_sensitivity/`.
+
+Submission diagnostics must accompany interpretation of task accuracy. Each
+fixed prompt explicitly requires the agent to commit its changes. The frozen
+harness evaluates `git diff BASE HEAD` (`model.patch`) and separately records
+`git diff BASE` (`working_tree.patch`), commit history and short git status.
+The completed 9B subset contains three empty submitted patches in each policy;
+two of the three ordinary cases and all three KVMem cases also leave working
+changes (tracked or untracked). An empty submitted patch does not establish
+the quality of unsubmitted code. For example, 4B Awilix/KVMem leaves a 44,349-byte
+working-tree patch but no commit; its unchanged submitted tree fails compilation
+of the new feature tests because the required public APIs are absent.
+The report now exposes these distinctions without altering rewards, excluding
+trials, committing on the agent's behalf or re-evaluating alternative patches.
+`9B_completed/submission_audit.{json,csv}` preserves the full 16-arm audit;
+`submission_diagnostic_validation.json` confirms all 23 previously reported
+arm metrics remained unchanged when these diagnostic fields were added.

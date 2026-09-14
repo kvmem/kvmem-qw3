@@ -20,6 +20,37 @@ def mean(rows, key):
     return statistics.mean(values) if values else None
 
 
+def submission_counters(arm):
+    """Describe the committed patch without substituting unsubmitted work.
+
+    working_tree.patch is base-to-worktree, so it can contain the committed
+    patch too. Compare their contents before labeling tracked work uncommitted.
+    """
+    submitted = arm / 'model.patch'
+    working = arm / 'working_tree.patch'
+    commits = arm / 'commits.txt'
+    status = arm / 'git_status.txt'
+    prompt = arm / 'prompt.md'
+    submitted_bytes = submitted.read_bytes() if submitted.exists() else None
+    working_bytes = working.read_bytes() if working.exists() else None
+    status_lines = status.read_text(errors='replace').splitlines() if status.exists() else None
+    untracked = sum(line.startswith('?? ') for line in status_lines) if status_lines is not None else None
+    dirty = bool(status_lines) if status_lines is not None else None
+    tracked_diff = (working_bytes != submitted_bytes
+                    if working_bytes is not None and submitted_bytes is not None else None)
+    return dict(
+        submitted_patch_bytes=len(submitted_bytes) if submitted_bytes is not None else None,
+        working_tree_patch_bytes=len(working_bytes) if working_bytes is not None else None,
+        recorded_commits=len(commits.read_text(errors='replace').splitlines()) if commits.exists() else None,
+        untracked_paths=untracked, worktree_dirty=dirty,
+        uncommitted_tracked_diff=tracked_diff,
+        empty_submitted_patch=submitted_bytes == b'' if submitted_bytes is not None else None,
+        empty_submission_with_working_changes=(submitted_bytes == b'' and bool(tracked_diff or untracked)
+                                               if submitted_bytes is not None and working_bytes is not None and status_lines is not None else None),
+        commit_instruction_present=('commit everything when you are done' in prompt.read_text(errors='replace').lower()
+                                    if prompt.exists() else None))
+
+
 def maintenance_counters(log):
     """Separate generated guidance from fallback events in the legacy counter.
 
@@ -83,6 +114,7 @@ def arm_row(job, root):
         metrics_path=str(metrics_path), binary_sha256=manifest['locked_artifacts']['qw3_binary_sha256'],
         model_sha256=manifest['locked_artifacts']['model_sha256'])
     row.update(maintenance_counters(arm / 'server/qw3_server.log'))
+    row.update(submission_counters(arm))
     return row, d
 
 
@@ -183,7 +215,9 @@ def report(root):
                 mean_decoded_tokens=mean(rows, 'decoded_tokens'),
                 weighted_decode_tokens_per_s=tokens / decode if decode else None,
                 compactions=sum(r['compactions'] for r in rows),
-                semantic_reselections=sum(r['semantic_reselections'] for r in rows)))
+                semantic_reselections=sum(r['semantic_reselections'] for r in rows),
+                empty_submitted_patch_arms=sum(r['empty_submitted_patch'] is True for r in rows),
+                empty_submission_with_working_changes_arms=sum(r['empty_submission_with_working_changes'] is True for r in rows)))
     out = root / 'report'
     out.mkdir(exist_ok=True)
     mtp = [mtp_row(arm) for arm in arms]
@@ -201,6 +235,8 @@ def report(root):
         summary=summary, notes=[
             'Only completed, naturally terminated, protocol-valid pairs enter paired averages.',
             'Quality-divergent pairs remain included; they are separately flagged.',
+            'The fixed task instruction requires commits and the verifier evaluates model.patch (base-to-HEAD). Uncommitted work is retained separately; submission diagnostics do not change scores or exclude trials.',
+            'working_tree.patch contains the full base-to-worktree diff; its nonzero size alone does not imply missing commits. Empty submissions with working changes are reported separately and do not measure the quality of the unsubmitted implementation.',
             'Agent/request wall-time ratios compare complete trajectories, not matched engine inputs.',
             'The legacy long_context_pressure_observed field can be true below the actual refresh threshold; maintenance_events_observed requires a logged compaction or semantic refresh.',
             'Equal reward signatures, including equal failures, do not isolate maintenance-induced speedup.',
