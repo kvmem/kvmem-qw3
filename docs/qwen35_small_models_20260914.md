@@ -147,3 +147,12 @@ also counts fallback log records and must not be read as a count of newly
 generated queries. Engine decode time includes mid-decode maintenance;
 its logged query/reselection totals are exported separately and aggregated
 once per request, because individual mid-decode event timers are cumulative.
+
+Historical 27B data for all eight preselected task IDs and seed 1000 are
+aligned under `reference_27b_matched/` (16 arms). The exporter checks the
+recorded task entries, sampling settings, policy, MTP=4 and Claude executable
+against this pilot, and verifies FP8 KV from the old server logs. Both old
+policies passed 2/8 full tasks. These are historical results: engine and
+harness revisions differ, and the export does not establish hardware
+equivalence. Keep them separate from the current-build 4B/9B measurements;
+their timing differences cannot isolate model size or current engine speed.
