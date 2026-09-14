@@ -237,3 +237,14 @@ trials, committing on the agent's behalf or re-evaluating alternative patches.
 `9B_completed/submission_audit.{json,csv}` preserves the full 16-arm audit;
 `submission_diagnostic_validation.json` confirms all 23 previously reported
 arm metrics remained unchanged when these diagnostic fields were added.
+
+The first observed 4B native compaction occurred in Awilix/ordinary request
+202: client duration 53.420 s, pre/post history 229,120/8,136 tokens. The
+server processed 221,979 uncached prompt tokens in 24.918 s and generated
+2,594 tokens in 28.309 s; server visible-content TTFT was 25.054 s and total
+request time 53.338 s. The cache miss logged a longest common prefix of 20,298
+tokens and no reusable saved entry. Thus this raw pause includes cold prefill
+and summary generation; neither its avoidability nor a pure summary-decode
+interpretation follows from the log alone. The agent continued normally.
+`first_4b_native_compaction_breakdown.json` records the client/server match and
+hashes of fixed log prefixes, so later log appends do not invalidate sources.
