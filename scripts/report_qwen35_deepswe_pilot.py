@@ -79,6 +79,26 @@ def mtp_row(arm):
         weighted_decode_tokens_per_s=arm['decode_tps_completed'], log_path=str(log))
 
 
+def latency_rows(arm):
+    log = Path(arm['metrics_path']).parent / 'server/qw3_server.log'
+    result = []
+    for number, line in enumerate(log.read_text(errors='replace').splitlines(), 1):
+        if not line.startswith('[qw3-server-ttft] '):
+            continue
+        fields = dict(re.findall(r'([a-z0-9_]+)=([^ ]+)', line))
+        def timing(key):
+            value = float(fields[key])
+            return value if value >= 0 else None
+        result.append(dict(model=arm['model'], policy=arm['policy'], task_id=arm['task_id'],
+            request_id=int(fields['rid']), route=fields['route'],
+            stream=fields['stream'] == '1', model_token_seen=fields['model_token_seen'] == '1',
+            visible_output_seen=fields['visible_output_seen'] == '1',
+            engine_ttft_ms=timing('engine_ttft_ms'), server_ttft_ms=timing('server_ttft_ms'),
+            server_visible_ttft_ms=timing('response_ttft_ms'),
+            request_total_ms=timing('request_total_ms'), source_line=number, log_path=str(log)))
+    return result
+
+
 def report(root):
     plan = json.loads((root / 'pilot_plan.json').read_text())
     arms, raw = [], {}
@@ -132,8 +152,9 @@ def report(root):
     out = root / 'report'
     out.mkdir(exist_ok=True)
     mtp = [mtp_row(arm) for arm in arms]
+    requests = [row for arm in arms for row in latency_rows(arm)]
     for name, rows in (('arms', arms), ('pairs', pairs), ('paired_summary', summary),
-                       ('mtp_counters', mtp)):
+                       ('mtp_counters', mtp), ('request_latency', requests)):
         (out / f'{name}.json').write_text(json.dumps(rows, indent=2) + '\n')
         if rows:
             with (out / f'{name}.csv').open('w', newline='') as f:
@@ -150,6 +171,7 @@ def report(root):
             'Equal reward signatures, including equal failures, do not isolate maintenance-induced speedup.',
             'Pure decode throughput excludes prefill, retrieval, compaction and tools.',
             'MTP acceptance is total accepted / total drafted; recorded host phase timers are not an exclusive GPU-time breakdown.',
+            'request_latency.csv contains server-side measurements; visible TTFT is not client observation-to-action latency. Negative/unobserved timings are null, not zero.',
             'All completed arm results, including invalid ones, remain in arms.csv for audit.'])
     (out / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps({k: result[k] for k in ('completed_arms', 'total_arms', 'completed_pairs', 'valid_pairs')}))
