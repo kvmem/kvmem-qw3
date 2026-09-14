@@ -151,17 +151,17 @@ WeightWithShape upload_weight(DeviceBackend &backend,
 } // namespace
 
 struct GpuVisionFrontend::Impl {
-    static constexpr uint32_t kHidden = 1152;
-    static constexpr uint32_t kIntermediate = 4304;
-    static constexpr uint32_t kHeads = 16;
-    static constexpr uint32_t kHeadDim = 72;
+    uint32_t kHidden = 0;
+    uint32_t kIntermediate = 0;
+    uint32_t kHeads = 0;
+    uint32_t kHeadDim = 0;
     static constexpr uint32_t kPaddedHeadDim = 128;
     static constexpr uint32_t kPatchDim = 1536;
     static constexpr uint32_t kMerge = 2;
-    static constexpr uint32_t kMergedHidden = 4608;
-    static constexpr uint32_t kOutput = 5120;
-    static constexpr uint32_t kLayers = 27;
-    static constexpr uint32_t kPositionSide = 48;
+    uint32_t kMergedHidden = 0;
+    uint32_t kOutput = 0;
+    uint32_t kLayers = 0;
+    uint32_t kPositionSide = 0;
 
     struct Layer {
         std::unique_ptr<DeviceWeight> norm1_weight;
@@ -205,7 +205,7 @@ struct GpuVisionFrontend::Impl {
     std::unique_ptr<DeviceWeight> patch_weight;
     std::unique_ptr<DeviceWeight> patch_bias;
     std::unique_ptr<DeviceWeight> position_table;
-    std::array<Layer, kLayers> layers;
+    std::vector<Layer> layers;
     std::unique_ptr<DeviceWeight> merger_norm_weight;
     std::unique_ptr<DeviceWeight> merger_norm_bias;
     std::unique_ptr<DeviceWeight> merger_fc1_weight;
@@ -232,6 +232,36 @@ struct GpuVisionFrontend::Impl {
         : backend(backend_arg),
           preprocessor(model_directory, python_executable, worker_script,
                        preprocess_threads, true) {
+        std::ifstream config_in(std::filesystem::path(model_directory) / "config.json");
+        if (!config_in) throw std::runtime_error("missing vision model config");
+        json config;
+        config_in >> config;
+        const auto &vision = config.at("vision_config");
+        kHidden = vision.at("hidden_size").get<uint32_t>();
+        kIntermediate = vision.at("intermediate_size").get<uint32_t>();
+        kHeads = vision.at("num_heads").get<uint32_t>();
+        kOutput = vision.at("out_hidden_size").get<uint32_t>();
+        kLayers = vision.at("depth").get<uint32_t>();
+        const uint32_t positions = vision.at("num_position_embeddings").get<uint32_t>();
+        kPositionSide = static_cast<uint32_t>(std::sqrt(positions));
+        if (!kHidden || !kIntermediate || !kHeads || !kOutput || !kLayers ||
+            kHidden % kHeads != 0 || positions == 0 ||
+            static_cast<uint64_t>(kPositionSide) * kPositionSide != positions ||
+            vision.at("spatial_merge_size").get<uint32_t>() != kMerge ||
+            vision.at("in_channels").get<uint32_t>() != 3 ||
+            vision.at("patch_size").get<uint32_t>() != 16 ||
+            vision.at("temporal_patch_size").get<uint32_t>() != 2 ||
+            vision.value("hidden_act", std::string()) != "gelu_pytorch_tanh" ||
+            !vision.value("deepstack_visual_indexes", json::array()).empty() ||
+            config.at("text_config").at("hidden_size").get<uint32_t>() != kOutput) {
+            throw std::runtime_error("unsupported Qwen vision model configuration");
+        }
+        kHeadDim = kHidden / kHeads;
+        if (kHeadDim % 4 != 0 || kHeadDim > kPaddedHeadDim) {
+            throw std::runtime_error("unsupported Qwen vision attention head dimension");
+        }
+        kMergedHidden = kHidden * kMerge * kMerge;
+        layers.resize(kLayers);
         if (!backend.supports_bf16_activations()) {
             throw std::runtime_error("native CUDA vision requires BF16 activations");
         }
@@ -276,7 +306,7 @@ struct GpuVisionFrontend::Impl {
                             kPatchDim, "vision_patch_w");
         patch_bias = take(prefix + "patch_embed.proj.bias", 1, kHidden,
                           "vision_patch_b");
-        position_table = take(prefix + "pos_embed.weight", 2304, kHidden,
+        position_table = take(prefix + "pos_embed.weight", positions, kHidden,
                               "vision_position_table");
 
         for (uint32_t i = 0; i < kLayers; ++i) {
@@ -394,8 +424,8 @@ struct GpuVisionFrontend::Impl {
         sin_values.resize(static_cast<size_t>(patch_count) * kHeadDim);
         cu_seqlens.clear();
         cu_seqlens.push_back(0);
-        std::array<float, kHeadDim / 4> inv_frequencies;
-        for (uint32_t i = 0; i < inv_frequencies.size(); ++i) {
+        std::array<float, kPaddedHeadDim / 4> inv_frequencies;
+        for (uint32_t i = 0; i < kHeadDim / 4; ++i) {
             inv_frequencies[i] = 1.0f / std::pow(
                 10000.0f, static_cast<float>(2 * i) / (kHeadDim / 2));
         }
@@ -412,8 +442,8 @@ struct GpuVisionFrontend::Impl {
                                 const uint32_t w = bw * kMerge + iw;
                                 for (uint32_t d = 0; d < kHeadDim; ++d) {
                                     const uint32_t base = d % (kHeadDim / 2);
-                                    const uint32_t freq_index = base % 18;
-                                    const uint32_t position = base < 18 ? h : w;
+                                    const uint32_t freq_index = base % (kHeadDim / 4);
+                                    const uint32_t position = base < kHeadDim / 4 ? h : w;
                                     // HF from_pretrained keeps this non-persistent
                                     // rotary buffer in FP32, even with BF16 weights.
                                     // Preserve FP32 through angles, cos/sin and

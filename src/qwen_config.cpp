@@ -137,11 +137,12 @@ QwenConfig::QwenConfig(const std::string &hf_model_directory) {
     head_v_dim = head_dim;
     rms_eps = text.value("rms_norm_eps", 1e-6f);
 
-    const float partial_rotary = text.value("partial_rotary_factor", 1.0f);
+    const json &rope = text.contains("rope_parameters")
+        ? text.at("rope_parameters") : text;
+    const float partial_rotary = rope.value(
+        "partial_rotary_factor", text.value("partial_rotary_factor", 1.0f));
     rope_dim = static_cast<uint32_t>(std::lround(head_dim * partial_rotary));
-    if (text.contains("rope_parameters")) {
-        rope_theta = text.at("rope_parameters").value("rope_theta", 1e7f);
-    }
+    rope_theta = rope.value("rope_theta", 1e7f);
 
     ssm_conv_kernel = text.at("linear_conv_kernel_dim").get<uint32_t>();
     ssm_group_count = text.at("linear_num_key_heads").get<uint32_t>();

@@ -448,6 +448,10 @@ uint32_t plan_batch_decode_head_dim(uint32_t n_heads,
     const uint32_t group_size = n_heads / n_kv_heads;
     const auto cc = flashinfer::GetCudaComputeCapability();
     if (cc.first < 8) return 0;
+    if (group_size == 4) {
+        return plan_batch_decode_chunk_size<HeadDim, 4, 2, Params, Variant>(
+            n_kv_heads, batch, max_seq_len);
+    }
     if (group_size == 6) {
         return plan_batch_decode_chunk_size<HeadDim, 6, 2, Params, Variant>(
             n_kv_heads, batch, max_seq_len);
@@ -469,6 +473,10 @@ cudaError_t launch_batch_decode_head_dim_dispatch(Params params,
     const uint32_t group_size = n_heads / n_kv_heads;
     const auto cc = flashinfer::GetCudaComputeCapability();
     if (cc.first < 8) return cudaErrorInvalidDeviceFunction;
+    if (group_size == 4) {
+        return launch_batch_decode_group_size<HeadDim, 4, 2, Params, Variant>(
+            params, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);
+    }
     if (group_size == 6) {
         return launch_batch_decode_group_size<HeadDim, 6, 2, Params, Variant>(
             params, tmp_v, tmp_s, o_indptr_host, partition_kv, rowwise_merge, stream);

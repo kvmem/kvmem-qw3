@@ -257,7 +257,7 @@ bool ends_with(const std::string &value, const std::string &suffix) {
            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-std::string hf_name_for_internal(const std::string &name) {
+std::string hf_name_for_internal(const std::string &name, uint32_t n_layers) {
     if (name == "token_embd.weight") return "model.language_model.embed_tokens.weight";
     if (name == "output_norm.weight") return "model.language_model.norm.weight";
     if (name == "output.weight") return "lm_head.weight";
@@ -273,7 +273,7 @@ std::string hf_name_for_internal(const std::string &name) {
         return {};
     }
     const std::string suffix = name.substr(dot + 1);
-    if (layer == 64) {
+    if (layer == n_layers) {
         const std::string prefix = "mtp.layers.0.";
         if (suffix == "attn_norm.weight") return prefix + "input_layernorm.weight";
         if (suffix == "ffn_norm.weight" || suffix == "post_attention_norm.weight")
@@ -342,6 +342,7 @@ public:
             throw std::runtime_error("HF model is not compressed-tensors: " + method);
         }
         const json &text = config.at("text_config");
+        n_layers_ = text.at("num_hidden_layers").get<uint32_t>();
         linear_k_heads_ = text.at("linear_num_key_heads").get<uint32_t>();
         linear_v_heads_ = text.at("linear_num_value_heads").get<uint32_t>();
         linear_k_head_dim_ = text.at("linear_key_head_dim").get<uint32_t>();
@@ -355,7 +356,7 @@ public:
     const ModelTensorInfo *find_tensor(const std::string &internal_name) const override {
         const auto cached = logical_.find(internal_name);
         if (cached != logical_.end()) return cached->second.get();
-        const std::string hf_name = hf_name_for_internal(internal_name);
+        const std::string hf_name = hf_name_for_internal(internal_name, n_layers_);
         if (hf_name.empty()) return nullptr;
 
         const RawSafetensor *raw = raw_tensor(hf_name);
@@ -509,6 +510,7 @@ private:
     std::unordered_map<std::string, std::string> weight_map_;
     mutable std::unordered_map<std::string, std::unique_ptr<SafetensorsShard>> shards_;
     mutable std::unordered_map<std::string, std::unique_ptr<ModelTensorInfo>> logical_;
+    uint32_t n_layers_ = 0;
     uint32_t linear_k_heads_ = 0;
     uint32_t linear_v_heads_ = 0;
     uint32_t linear_k_head_dim_ = 0;
