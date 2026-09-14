@@ -196,3 +196,14 @@ source hashes passed CPU validation, including equality of the saved native
 final output with the frozen parity output. GPU execution remains pending;
 these deliberately disconnected block outputs must not be presented as a
 full encoder result or used for agent inference or performance measurements.
+
+An interim MTP comparison restricts both models and policies to the first three
+completed task IDs (12 arms). Weighted draft acceptance is 51.01%/52.60% for
+4B ordinary/KVMem and 77.14%/76.09% for 9B. That corresponds to 2.04/2.10
+accepted drafts per batch for 4B versus 3.08/3.03 for 9B. Observed engine decode
+throughput is 127.89/124.89 and 129.56/128.26 token/s, respectively. Lower 4B
+draft acceptance is a relevant observed difference when interpreting why
+real agent throughput does not follow parameter count alone. These are still
+different generated trajectories, not an isolated model-size or MTP-speedup
+experiment. `mtp_acceptance_matched_tasks.json` preserves the 12 source rows
+and server-log hashes; phase timers do not identify exclusive CPU/GPU costs.
