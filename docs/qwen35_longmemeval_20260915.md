@@ -93,3 +93,19 @@ The report includes only completed, scored pairs and marks whether all thirty
 pairs are present. Measured service totals sum ingestion/index/summarization and
 final-query phases; model/server loading and uninstrumented client work are
 excluded. Raw-completions TTFT may be a thinking token, not a visible final answer.
+
+## NFC parity-check repair and resume
+
+After 22 completed pairs, sample `352ab8bd` stopped before inference because a
+history excerpt contained a decomposed combining macron (`where\u0304`). The HF
+tokenizer declares NFC normalization; its encoding composes this to `wherē`,
+while the native GGUF tokenizer consumes the original bytes. Only the diagnostic
+`/tokenize` request now applies the HF tokenizer's declared normalizer. Actual
+model input IDs, query offsets, summaries, retrieval and generation are unchanged.
+
+The normalized diagnostic matches HF input IDs for all 30 full prompts; only
+this one prompt changes under normalization. All 44 completed result hashes,
+the old source/identity, the failed pre-inference directory, and the explicit
+identity migration are retained in `resume_nfc_audit/`. Three protocol tests
+pass, including the combining-mark regression. No frozen engine/model was
+modified. Resume continues the remaining eight pairs without replacing answers.

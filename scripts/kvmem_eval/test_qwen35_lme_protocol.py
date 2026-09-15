@@ -18,6 +18,16 @@ class CharacterTokenizer:
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_native_probe_matches_declared_hf_normalization_without_changing_ids(self):
+        tok = run.AutoTokenizer.from_pretrained(run.TOKENIZER, local_files_only=True)
+        text = 'The formula says where\u0304u is bounded.\nQuestion: what is bounded?'
+        before = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+        normalized = run.native_tokenizer_probe_text(tok, text)
+        self.assertIn('wher\u0113u', normalized)
+        self.assertEqual(before['input_ids'], run.ids(tok, normalized))
+        self.assertEqual(before, tok(text, add_special_tokens=False, return_offsets_mapping=True))
+        self.assertEqual(tok.decode(before['input_ids']), normalized)
+
     def test_labels_and_question_do_not_change_history(self):
         sample = {'haystack_dates': ['2022-01-01'], 'haystack_sessions': [[
             {'role': 'user', 'content': 'I moved to Paris.', 'has_answer': True}]],

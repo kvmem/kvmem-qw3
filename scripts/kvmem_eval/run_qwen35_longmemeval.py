@@ -197,6 +197,14 @@ def ids(tok, text):
     return tok.encode(text, add_special_tokens=False)
 
 
+def native_tokenizer_probe_text(tok, text):
+    # HF applies its declared normalizer before BPE; GGUF's native tokenizer
+    # consumes bytes directly. Normalize only the parity-check text. Model
+    # input IDs and query offsets still come from the unchanged HF encoding.
+    normalizer = tok.backend_tokenizer.normalizer
+    return normalizer.normalize_str(text) if normalizer is not None else text
+
+
 def generate(base, prompt, directory, name, *, thinking=True, max_tokens=8192, extra=None):
     payload = {'model': 'qw3', 'prompt': prompt, 'max_tokens': max_tokens, 'stream': False,
                'temperature': .6 if thinking else 0., 'top_p': .95, 'top_k': 20, 'seed': 1000,
@@ -233,7 +241,7 @@ def run_kvmem(sample, tok, directory):
     assert 0 < split <= qb < qe <= len(full_ids) < 262144 - 8192
     assert full_ids[:split] == ids(tok, history_only)[:split]
     with server(directory, 'kvmem') as base:
-        native, _ = post(base, '/tokenize', {'content': full, 'return_tokens': True})
+        native, _ = post(base, '/tokenize', {'content': native_tokenizer_probe_text(tok, full), 'return_tokens': True})
         assert native['tokens'] == full_ids, 'Local tokenizer differs from native Q8 tokenizer'
         session_id = 'lme-' + sample['question_id']
         prep, wall = post(base, '/v1/completions', {
