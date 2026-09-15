@@ -18,6 +18,18 @@ class CharacterTokenizer:
 
 
 class ProtocolTest(unittest.TestCase):
+    def test_raw_token_transport_rejects_a_different_id_mapping(self):
+        tok = run.AutoTokenizer.from_pretrained(run.TOKENIZER, local_files_only=True)
+        audit = run.validate_raw_token_vocabulary(tok)
+        self.assertTrue(audit['all_hf_token_ids_match'])
+        self.assertTrue(audit['all_merge_rules_match'])
+        vocab = tok.get_vocab()
+        first, second = list(vocab)[:2]
+        vocab[first], vocab[second] = vocab[second], vocab[first]
+        with patch.object(tok, 'get_vocab', return_value=vocab):
+            with self.assertRaisesRegex(AssertionError, 'token ID mapping differs'):
+                run.validate_raw_token_vocabulary(tok)
+
     def test_native_probe_matches_declared_hf_normalization_without_changing_ids(self):
         tok = run.AutoTokenizer.from_pretrained(run.TOKENIZER, local_files_only=True)
         text = 'The formula says where\u0304u is bounded.\nQuestion: what is bounded?'

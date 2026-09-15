@@ -58,7 +58,8 @@ def main():
                 code = child.wait()
             assert code == 0, f'{phase} exited {code}; inspect campaign_{phase}.log'
         report = json.loads((OUT / 'report' / 'summary.json').read_text())
-        assert report['complete'] and report['scored_pairs'] == 30
+        planned = len(json.loads((OUT / 'inference_samples.json').read_text()))
+        assert report['complete'] and report['scored_pairs'] == planned
         state.update(status='complete', finished_at=time.time())
     except BaseException as error:
         state.update(status='needs_attention', error=repr(error), finished_at=time.time())

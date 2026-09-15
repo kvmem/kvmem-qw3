@@ -79,8 +79,9 @@ def main():
     discordant = wins + losses
     p = (min(1., 2 * sum(math.comb(discordant, i) for i in range(min(wins, losses) + 1)) / 2**discordant)
          if discordant else 1.)
+    plan = json.loads((OUT / 'plan.json').read_text())
     caveats = [
-        'Fixed balanced 30-question diagnostic pilot; not the natural 500-question distribution.',
+        plan.get('sample_description', f'Fixed balanced {len(samples)}-question diagnostic pilot; not the natural 500-question distribution.'),
         'Local 27B judge with official prompts, not an official leaderboard score. Calibration is a sanity check, not full judge validation.',
         'Final-query time includes generation/thinking but excludes prebuilt history memory and archive.',
         'Recorded service total sums measured ingestion/index/summary/query phases; excludes server/model loading and uninstrumented client work.',

@@ -22,7 +22,8 @@ import urllib.request
 from transformers import AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / 'benchmark/longmemeval_qwen35_9b_20260915'
+OUT = Path(os.environ.get('QWEN35_LME_OUTPUT_ROOT',
+                         str(ROOT / 'benchmark/longmemeval_qwen35_9b_20260915'))).resolve()
 BINARY = ROOT / 'benchmark/qwen35_small_20260914/frozen/qw3'
 MODEL = ROOT / 'models/Qwen3.5-9B-Q8_0-with-MTP.gguf'
 TOKENIZER = ROOT / 'models/Qwen3.5-9B-BF16'
@@ -205,6 +206,31 @@ def native_tokenizer_probe_text(tok, text):
     return normalizer.normalize_str(text) if normalizer is not None else text
 
 
+def validate_raw_token_vocabulary(tok):
+    # Requests carry HF token IDs, not text to be re-tokenized by the engine.
+    # Verify every ID against the actual GGUF before accepting that transport.
+    import gguf
+    reader = gguf.GGUFReader(MODEL)
+    native_tokens = reader.get_field('tokenizer.ggml.tokens').contents()
+    vocab = tok.get_vocab()
+    assert set(vocab.values()) == set(range(len(vocab))), 'Unexpected noncontiguous HF vocabulary'
+    assert len(vocab) <= len(native_tokens), 'HF vocabulary exceeds GGUF rows'
+    assert all(native_tokens[i] == token for token, i in vocab.items()), 'HF/GGUF token ID mapping differs'
+    # GGUF pads the embedding vocabulary to the model's allocated row count.
+    # Those rows are not emitted by the HF input encoder.
+    assert all(token == f'[PAD{i}]' for i, token in enumerate(native_tokens)
+               if i >= len(vocab)), 'Unexpected GGUF vocabulary extension'
+    hf = json.loads((TOKENIZER / 'tokenizer.json').read_text())
+    merges = [' '.join(pair) if isinstance(pair, list) else pair for pair in hf['model']['merges']]
+    assert merges == reader.get_field('tokenizer.ggml.merges').contents(), 'HF/GGUF merge rules differ'
+    return {'all_hf_token_ids_match': True, 'hf_vocabulary_size': len(vocab),
+            'gguf_vocabulary_rows': len(native_tokens), 'gguf_padding_rows': len(native_tokens) - len(vocab),
+            'all_merge_rules_match': True, 'merge_count': len(merges),
+            'tokenizer_json_sha256': sha(TOKENIZER / 'tokenizer.json'),
+            'normalizer': hf.get('normalizer'),
+            'transport': 'HF-generated integer token IDs sent directly to the model'}
+
+
 def generate(base, prompt, directory, name, *, thinking=True, max_tokens=8192, extra=None):
     payload = {'model': 'qw3', 'prompt': prompt, 'max_tokens': max_tokens, 'stream': False,
                'temperature': .6 if thinking else 0., 'top_p': .95, 'top_k': 20, 'seed': 1000,
@@ -241,8 +267,19 @@ def run_kvmem(sample, tok, directory):
     assert 0 < split <= qb < qe <= len(full_ids) < 262144 - 8192
     assert full_ids[:split] == ids(tok, history_only)[:split]
     with server(directory, 'kvmem') as base:
-        native, _ = post(base, '/tokenize', {'content': native_tokenizer_probe_text(tok, full), 'return_tokens': True})
-        assert native['tokens'] == full_ids, 'Local tokenizer differs from native Q8 tokenizer'
+        normalized = native_tokenizer_probe_text(tok, full)
+        native, _ = post(base, '/tokenize', {'content': normalized, 'return_tokens': True})
+        token_audit = {'native_reencoding_equal': native['tokens'] == full_ids,
+                       'hf_tokens': len(full_ids), 'native_tokens': len(native['tokens'])}
+        if native['tokens'] != full_ids:
+            # Native Unicode character classes differ on e.g. fractions. This
+            # encoder is not on the raw-ID inference path. Require exact vocab
+            # identity and an official-tokenizer round trip, rather than change
+            # model input IDs to the native segmentation or alter the history.
+            token_audit.update(validate_raw_token_vocabulary(tok))
+            assert tok.decode(full_ids, clean_up_tokenization_spaces=False) == normalized
+            assert tok.decode(native['tokens'], clean_up_tokenization_spaces=False) == normalized
+        save(directory / 'tokenizer_audit.json', token_audit)
         session_id = 'lme-' + sample['question_id']
         prep, wall = post(base, '/v1/completions', {
             'model': 'qw3', 'prompt': full_ids[:split], 'max_tokens': 0,
@@ -334,6 +371,7 @@ def main():
     if args.limit:
         samples = samples[:args.limit]
     tok = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
+    save(OUT / 'raw_token_vocabulary_audit.json', validate_raw_token_vocabulary(tok))
     sources = [Path(__file__), RAG_WORKER, BINARY, MODEL, TOKENIZER / 'tokenizer.json',
                TOKENIZER / 'tokenizer_config.json', OUT / 'plan.json', OUT / 'inference_samples.json', OUT / 'references.json']
     identity = {str(p): sha(p) for p in sources}
