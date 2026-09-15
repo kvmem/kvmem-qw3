@@ -20,29 +20,34 @@ def process_identity(pid):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--prepare-pid', required=True, type=int)
+    waiting = parser.add_mutually_exclusive_group(required=True)
+    waiting.add_argument('--prepare-pid', type=int)
+    waiting.add_argument('--warmup-pid', type=int,
+                         help='Wait for a limited inference run, then complete the full plan')
     args = parser.parse_args()
+    wait_pid = args.prepare_pid if args.prepare_pid is not None else args.warmup_pid
+    ready_status = 'prepared' if args.prepare_pid is not None else 'inference_complete'
     status_path = OUT / 'campaign_status.json'
     if status_path.exists():
         previous = json.loads(status_path.read_text())
         assert process_identity(previous['pid']) != previous.get('process_identity'), 'Campaign already running'
     state = {'pid': os.getpid(), 'process_identity': process_identity(os.getpid()),
-             'started_at': time.time(), 'status': 'waiting_for_cpu_preparation'}
+             'started_at': time.time(), 'status': 'waiting_for_preparation_or_warmup'}
     save(status_path, state)
     try:
         preparation = json.loads((OUT / 'status.json').read_text())
-        assert preparation['pid'] == args.prepare_pid
-        identity = process_identity(args.prepare_pid)
+        assert preparation['pid'] == wait_pid
+        identity = process_identity(wait_pid)
         deadline = time.monotonic() + 3600
-        while identity is not None and process_identity(args.prepare_pid) == identity:
+        while identity is not None and process_identity(wait_pid) == identity:
             preparation = json.loads((OUT / 'status.json').read_text())
-            if preparation['status'] in ('prepared', 'needs_attention'):
+            if preparation['status'] in (ready_status, 'needs_attention'):
                 break
             assert time.monotonic() < deadline, 'Preparation exceeded one hour'
             time.sleep(5)
         # Prepared status is written only after the embedding worker has closed.
         preparation = json.loads((OUT / 'status.json').read_text())
-        assert preparation['status'] == 'prepared', preparation
+        assert preparation['status'] == ready_status, preparation
         for phase, script in (
             ('inference', 'run_qwen35_longmemeval.py'),
             ('grading', 'score_qwen35_longmemeval.py'),
