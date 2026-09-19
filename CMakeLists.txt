@@ -51,6 +51,10 @@ if(QW3_ENABLE_CUDA)
         endif()
         get_filename_component(QW3_FLASHINFER_DATA_DIR
             "${QW3_FLASHINFER_INCLUDE_DIR}" DIRECTORY)
+        include(cmake/FlashInferPrefillSync.cmake)
+        set(QW3_FLASHINFER_OVERLAY_DIR "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-overlay")
+        qw3_prepare_flashinfer_prefill("${QW3_FLASHINFER_INCLUDE_DIR}"
+            "${QW3_FLASHINFER_OVERLAY_DIR}")
         set(QW3_FLASHINFER_CCCL_INCLUDE_DIRS)
         foreach(QW3_FLASHINFER_CCCL_DIR
                 "${QW3_FLASHINFER_DATA_DIR}/cccl/cub"
@@ -168,6 +172,7 @@ if(QW3_ENABLE_CUDA)
     if(QW3_ENABLE_FLASHINFER)
         target_compile_definitions(qw3_core PRIVATE QW3_ENABLE_FLASHINFER=1)
         target_include_directories(qw3_core SYSTEM PRIVATE
+            ${QW3_FLASHINFER_OVERLAY_DIR}
             ${QW3_FLASHINFER_INCLUDE_DIR}
             ${QW3_FLASHINFER_CCCL_INCLUDE_DIRS})
     endif()
@@ -273,6 +278,9 @@ if(QW3_BUILD_TESTS)
     add_executable(qw3-prompt-render tests/prompt_render_test.cpp)
     target_link_libraries(qw3-prompt-render PRIVATE qw3_core)
     enable_testing()
+    add_test(NAME qw3-flashinfer-sync-overlay COMMAND ${CMAKE_COMMAND}
+        -DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/flashinfer-sync-overlay-test
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/flashinfer_sync_overlay.cmake)
     add_executable(qw3-small-model-config tests/qwen_small_model_config_test.cpp)
     target_include_directories(qw3-small-model-config SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
     target_link_libraries(qw3-small-model-config PRIVATE qw3_core)
@@ -406,7 +414,7 @@ if(QW3_BUILD_TESTS)
         add_test(NAME qw3-native-attention-oracle COMMAND qw3-native-attention-oracle)
         add_test(NAME qw3-native-attention-oracle-fp32 COMMAND qw3-native-attention-oracle --fp32)
         set_tests_properties(qw3-native-attention-oracle qw3-native-attention-oracle-fp32 PROPERTIES
-            ENVIRONMENT "QW3_PREFILL_ATTN=mma-gqa-v2;QW3_PREFILL_ATTN_MIN_BATCH=1"
+            ENVIRONMENT "QW3_PREFILL_ATTN=mma-gqa-v2;QW3_PREFILL_ATTN_MIN_BATCH=1;QW3_DECODE_ATTN=native"
             LABELS "cuda;native_attention" TIMEOUT 180)
         if(QW3_ENABLE_FLASHINFER)
             add_executable(qw3-flashinfer-decode-gqa tests/flashinfer_decode_gqa.cu)
@@ -414,8 +422,17 @@ if(QW3_BUILD_TESTS)
             set_property(TARGET qw3-flashinfer-decode-gqa PROPERTY CUDA_STANDARD 17)
             add_test(NAME qw3-flashinfer-decode-gqa COMMAND qw3-flashinfer-decode-gqa)
             add_test(NAME qw3-flashinfer-prefill-gqa COMMAND qw3-flashinfer-decode-gqa --prefill)
-            set_tests_properties(qw3-flashinfer-decode-gqa qw3-flashinfer-prefill-gqa PROPERTIES
-                ENVIRONMENT "QW3_PREFILL_ATTN=flashinfer;QW3_DECODE_ATTN=flashinfer"
+            add_test(NAME qw3-flashinfer-prefill-queued COMMAND qw3-flashinfer-decode-gqa --queued)
+            add_executable(qw3-flashinfer-plan-cache tests/flashinfer_plan_cache.cu)
+            target_include_directories(qw3-flashinfer-plan-cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            target_link_libraries(qw3-flashinfer-plan-cache PRIVATE qw3_core)
+            set_property(TARGET qw3-flashinfer-plan-cache PROPERTY CUDA_STANDARD 17)
+            add_test(NAME qw3-flashinfer-plan-cache COMMAND qw3-flashinfer-plan-cache)
+            add_executable(qw3-flashinfer-model-repeat tests/flashinfer_model_repeat.cpp)
+            target_link_libraries(qw3-flashinfer-model-repeat PRIVATE qw3_core)
+            set_tests_properties(qw3-flashinfer-decode-gqa qw3-flashinfer-prefill-gqa
+                qw3-flashinfer-prefill-queued qw3-flashinfer-plan-cache PROPERTIES
+                ENVIRONMENT "QW3_PREFILL_ATTN=flashinfer;QW3_DECODE_ATTN=flashinfer;QW3_FLASHINFER_PLAN_CACHE=1"
                 LABELS "cuda;flashinfer_attention" TIMEOUT 180)
             add_executable(qw3-vision-attention-oracle tests/vision_attention_oracle.cpp)
             target_link_libraries(qw3-vision-attention-oracle PRIVATE qw3_core)

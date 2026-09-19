@@ -16,7 +16,7 @@ run_case() {
     local test_status=0
     timeout 180 env -i PATH="$PATH" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
       CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-      QW3_PREFILL_ATTN="$test_kernel" QW3_PREFILL_ATTN_MIN_BATCH=1 "$@" \
+      QW3_PREFILL_ATTN="$test_kernel" QW3_PREFILL_ATTN_MIN_BATCH=1 QW3_DECODE_ATTN=native "$@" \
       "$test_sanitizer" --tool "$test_tool" --error-exitcode 99 --print-limit 12 \
       "$test_binary" "${test_binary_args[@]}" > "$test_log" 2>&1 || test_status=$?
     printf '%s %s exit=%s\n' "$test_name" "$test_tool" "$test_status" | tee "$test_log.status"

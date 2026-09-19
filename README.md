@@ -72,6 +72,8 @@ beyond practical GPU KV capacity.
 - Python 3 and the Hugging Face CLI are needed only for the download commands;
   install the latter with `python3 -m pip install --upgrade huggingface_hub`.
 - Additional host RAM and fast local NVMe for large KVMem configurations.
+- FlashInfer headers for KVMem, FP8 KV, continuous batching, native CUDA
+  vision, or NVFP4; see the [FlashInfer build](#optional-flashinfer-build).
 
 QW3 generation is CUDA-only. A host-only build supports model inspection and
 unit tests, but it does not provide a CPU generation runtime. AMD/ROCm, Metal,
@@ -128,13 +130,19 @@ for Hopper, and `120a-real` for SM120 Blackwell.
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DQW3_ENABLE_CUDA=ON \
+  -DQW3_ENABLE_FLASHINFER=OFF \
   -DCMAKE_CUDA_ARCHITECTURES="${QW3_CUDA_ARCH}"
 
 cmake --build build -j
 ```
 
 If CMake cannot find `nvcc`, add the CUDA `bin` directory to `PATH` or set
-`CUDACXX` before configuring.
+`CUDACXX` before configuring, for example
+`export CUDACXX=/usr/local/cuda/bin/nvcc` (adjust for your toolkit location).
+
+The explicit `OFF` keeps this a native-only build even when reusing a CMake
+cache. Use the separate `build-flashinfer` directory below for FlashInfer;
+omitting the option does not reset a previously cached value.
 
 ### 3. Inspect the GGUF
 
@@ -195,6 +203,69 @@ The commands above have been checked with the pinned Qwen3.6 Q8_0 file. See
 [the hardware compatibility notes](docs/release_baseline.md) for details about
 other configurations.
 
+## Optional FlashInfer build
+
+FlashInfer is optional for ordinary Q8_0 + FP16 KV generation. It is required
+for FP8 KV and the current device-paged attention paths used by KVMem and
+continuous batching, as well as native CUDA vision and SM120a NVFP4 weights.
+The native-only `build/qw3` above does not include these paths.
+
+Keep `QW3_MODEL` and `QW3_CUDA_ARCH` from the quick start: use `89` for RTX 4090
+or `120a-real` for SM120 Blackwell. Set `FLASHINFER_DATA` to an installed
+FlashInfer package's `data` directory containing `include/`, `cutlass/include/`,
+and `cutlass/tools/util/include/`. The SM89/SM120 regression campaign used
+FlashInfer **0.6.11.post2** with CUDA **13.0.88**; this is the tested combination,
+not a claim that every FlashInfer or CUDA version is interchangeable.
+
+```bash
+export FLASHINFER_DATA=/absolute/path/to/flashinfer/data
+
+cmake -S . -B build-flashinfer \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DQW3_BUILD_TESTS=OFF \
+  -DQW3_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="${QW3_CUDA_ARCH}" \
+  -DQW3_ENABLE_FLASHINFER=ON \
+  -DQW3_FLASHINFER_INCLUDE_DIR="${FLASHINFER_DATA}/include" \
+  -DQW3_FLASHINFER_CUTLASS_INCLUDE_DIR="${FLASHINFER_DATA}/cutlass/include"
+
+cmake --build build-flashinfer -j4
+```
+
+CMake applies the scalar-output synchronization fix in a build-private header
+overlay; do not edit installed FlashInfer headers. Rebuild after updating QW3
+to include both this fix and the plan-cache/host-metadata fixes. An unrecognized
+dependency layout stops configuration and requires compatibility review.
+
+FlashInfer attention and its plan cache are enabled by default in this build.
+If an earlier workaround forced native attention or disabled the plan cache,
+remove those overrides from the launching shell or service configuration:
+
+```bash
+unset QW3_PREFILL_ATTN QW3_DECODE_ATTN QW3_FLASHINFER_PLAN_CACHE
+
+./build-flashinfer/qw3 serve \
+  --model "${QW3_MODEL}" \
+  --host 127.0.0.1 --port 8080 \
+  --ctx 32768 \
+  --kv-dtype fp16 \
+  --prefill-chunk 2048 \
+  --mtp-chain 0 \
+  --no-continuous-batching
+```
+
+The service CLI/API is unchanged. `2048` makes the server's existing default
+prefill chunk explicit; `1024` is also valid. Use `--kv-dtype fp8` for FP8 KV
+with the same Q8_0 weights. Stop an existing server on port 8080 before starting
+another example, or choose a different port.
+
+The latest regression covered serialized Qwen3.8-27B-Q8_0 generation with
+FP16/FP8 KV on an RTX 4090 **48 GB configuration** (SM89) and RTX PRO 6000
+Blackwell (SM120a). It does not establish that the model fits a stock 24 GB
+4090, or validate KVMem, concurrent serving, MTP, vision, or NVFP4 weights.
+See the [SM89/SM120 FlashInfer results](docs/flashinfer_sm89_sm120_fix.md) for
+correctness checks, throughput by chunk size, and test coverage limits.
+
 ## Optional Qwen3.8 image input
 
 QW3 can accept base64 `data:` image URLs on the OpenAI-compatible chat endpoint
@@ -212,8 +283,8 @@ export QW3_VISION_MODEL=/absolute/path/to/Qwen3.8-27B-BF16
 export QW3_VISION_CPU_PYTHON="${PWD}/.venv/bin/python"
 ```
 
-The CPU visual frontend works with the basic Q8 build from the previous
-section. Only the visual tower runs on CPU; the language model remains on GPU:
+The CPU visual frontend works with the basic Q8 build from the quick start.
+Only the visual tower runs on CPU; the language model remains on GPU:
 
 ```bash
 ./build/qw3 serve \
@@ -227,24 +298,11 @@ section. Only the visual tower runs on CPU; the language model remains on GPU:
   --no-continuous-batching
 ```
 
-Native CUDA vision additionally requires a FlashInfer-enabled build; the basic
-`build` binary above does not contain that path:
+Native CUDA vision requires the [FlashInfer build](#optional-flashinfer-build)
+above; the basic `build` binary does not contain that path:
 
 ```bash
-export FLASHINFER_DATA=/absolute/path/to/compatible/flashinfer/data
-
-cmake -S . -B build-vision \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DQW3_BUILD_TESTS=OFF \
-  -DQW3_ENABLE_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES="${QW3_CUDA_ARCH}" \
-  -DQW3_ENABLE_FLASHINFER=ON \
-  -DQW3_FLASHINFER_INCLUDE_DIR="${FLASHINFER_DATA}/include" \
-  -DQW3_FLASHINFER_CUTLASS_INCLUDE_DIR="${FLASHINFER_DATA}/cutlass/include"
-
-cmake --build build-vision -j
-
-./build-vision/qw3 serve \
+./build-flashinfer/qw3 serve \
   --model "${QW3_MODEL}" \
   --vision-model "${QW3_VISION_MODEL}" \
   --vision-device cuda \
@@ -298,6 +356,12 @@ not implemented. See the
 
 ## Try KVMem
 
+First complete the [FlashInfer build](#optional-flashinfer-build), including
+removing any old native-attention overrides. KVMem requires FlashInfer's
+FP16/FP8 device-paged attention even with serialized serving and
+`--kvmem-index-placement cpu`; the index placement does not move attention to
+the CPU. Do not use the native-only quick-start binary for this example.
+
 Prepare a directory on a fast local NVMe filesystem:
 
 ```bash
@@ -309,7 +373,7 @@ Start a serialized KVMem service with a 32K selected working set inside a 128K
 logical capacity:
 
 ```bash
-./build/qw3 serve \
+./build-flashinfer/qw3 serve \
   --model "${QW3_MODEL}" \
   --host 127.0.0.1 \
   --port 8080 \
@@ -448,13 +512,15 @@ directory; it currently accepts images but not video.
 The following are intentionally outside the first quick start:
 
 - **FlashInfer:** optional build-time headers for optimized prefill/decode,
-  required by FP8 KV and NVFP4 paths used in current development.
+  required by FP8 KV, KVMem/device-paged attention, continuous batching, native
+  CUDA vision, and NVFP4. Use the [FlashInfer build](#optional-flashinfer-build).
 - **NVFP4:** 4-bit `compressed-tensors` weights on SM120a, not generic Q4 GGUF.
 - **MTP speculative decode:** enable with `--mtp-chain N`.
 - **Image input:** enable with `--vision-model DIR --vision-device cpu|cuda`;
   image requests currently use serialized serving.
-- **Continuous batching:** enable with `--continuous-batching`; it also enables
-  the required paged-KV serving pool and body-batch executor by default.
+- **Continuous batching:** use a FlashInfer-enabled binary and enable with
+  `--continuous-batching`; it also enables the required paged-KV serving pool
+  and body-batch executor by default.
 - **Frozen archives:** `qw3 archive build|query|info` provides an immutable
   long-context workflow with stricter FP8 and serving constraints.
 
@@ -463,6 +529,7 @@ Run `./build/qw3 --help` for the complete current CLI.
 ## Documentation
 
 - [Release status and support matrix](docs/release_baseline.md)
+- [FlashInfer SM89/SM120 fixes, regression results, and throughput](docs/flashinfer_sm89_sm120_fix.md)
 - [Architecture](docs/architecture.md)
 - [Harness compatibility](docs/harness_compatibility.md)
 - [Claude Code integration](docs/claude_code.md)

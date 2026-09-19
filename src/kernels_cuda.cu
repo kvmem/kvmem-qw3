@@ -20500,17 +20500,13 @@ public:
                     n_pages, page_size, n_heads, n_kv_heads, head_dim,
                     base_seq_len, batch, q_batch_stride, out_batch_stride,
                     scale, exec_stream_, &plan_cache_hit);
+            // Even cache hits enqueue H2D reads of the pinned request metadata.
+            // Fence every acquired slot, including a partially failed launch,
+            // before a subsequent layer/chunk may overwrite its contents.
+            if (auto st = record_flashinfer_batch_prefill_host_workspace(); !st.ok) {
+                return st;
+            }
             if (launched) {
-                // A cache hit does not read or write the acquired host plan
-                // buffer. Leave it immediately reusable instead of fencing it
-                // behind this layer's entire attention launch.
-                if (!plan_cache_hit) {
-                    if (auto st =
-                            record_flashinfer_batch_prefill_host_workspace();
-                        !st.ok) {
-                        return st;
-                    }
-                }
                 return launch_status("cuda attention_prefill_batch flashinfer paged gated");
             }
             return {false, "flashinfer paged prefill launcher refused"};
@@ -20647,11 +20643,10 @@ public:
                     q_indptr_host, page_indptr_host, batch, total_q,
                     page_size, n_heads, n_kv_heads, head_dim,
                     q_batch_stride, out_batch_stride, scale, exec_stream_);
+            if (auto st = record_flashinfer_batch_prefill_host_workspace(); !st.ok) {
+                return st;
+            }
             if (launched) {
-                if (auto st = record_flashinfer_batch_prefill_host_workspace();
-                    !st.ok) {
-                    return st;
-                }
                 return launch_status("cuda attention_prefill_batch flashinfer ragged paged gated");
             }
             return {false, "flashinfer ragged paged prefill launcher refused"};

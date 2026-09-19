@@ -157,8 +157,10 @@ both `QW3_PREFILL_ATTN=mma-gqa-v2` and `QW3_DECODE_ATTN=native` before the comma
 to select native attention. This is not a substitute for FlashInfer on external
 paged/KVMem paths. Continuous batching, prefix-cache and KVMem serving are not
 covered by this native validation. The FlashInfer report documents outstanding
-prefill synchronization and plan-reuse issues; neither its isolated dependency
-patch nor the plan-cache workaround is integrated by this change.
+prefill synchronization and plan-reuse issues at the time of this native fix.
+They are addressed by the subsequent
+[FlashInfer integration and SM120 regression campaign](flashinfer_sm89_sm120_fix.md),
+which documents when the native-only workaround is no longer needed.
 
 ## Coverage limits and artifacts
 

@@ -1,5 +1,10 @@
 # SM89 FlashInfer compatibility and single-request throughput
 
+This document records the initial diagnostic campaign. The subsequent
+[integrated fix and SM89/SM120 validation](flashinfer_sm89_sm120_fix.md) resolves
+the issues described here for its tested configurations and supersedes the
+temporary native-only recommendation below.
+
 This is a follow-up to `issue2_sm89_fix.md`, using the repaired working tree on
 the same remote RTX 4090. Results below apply to this measured configuration,
 not all FlashInfer operations or all supported GPU architectures.

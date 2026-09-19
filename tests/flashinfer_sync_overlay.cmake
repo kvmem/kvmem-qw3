@@ -1,0 +1,42 @@
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/FlashInferPrefillSync.cmake")
+if(NOT TEST_ROOT)
+    message(FATAL_ERROR "TEST_ROOT must name a disposable build directory")
+endif()
+set(input "${TEST_ROOT}/include")
+set(output "${TEST_ROOT}/overlay")
+file(MAKE_DIRECTORY "${input}/flashinfer/attention")
+file(WRITE "${input}/flashinfer/cp_async.cuh" "// sibling header\n")
+if(REJECT_UNKNOWN)
+    file(WRITE "${input}/flashinfer/attention/prefill.cuh" "// unknown layout\n")
+    qw3_prepare_flashinfer_prefill("${input}" "${output}")
+    message(FATAL_ERROR "Unrecognized header was accepted")
+endif()
+set(source [=[#include "../cp_async.cuh"
+void write_o_reg_gmem() {
+      uint32_t o_smem_offset_w = o_smem->template get_permuted_offset<UPCAST_STRIDE_O>(
+          warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
+}
+]=])
+file(WRITE "${input}/flashinfer/attention/prefill.cuh" "${source}")
+file(SHA256 "${input}/flashinfer/attention/prefill.cuh" original_hash)
+qw3_prepare_flashinfer_prefill("${input}" "${output}")
+file(READ "${output}/flashinfer/attention/prefill.cuh" patched)
+string(FIND "${patched}" "#ifndef FLASHINFER_STMATRIX_M8N8X4_ENABLED" guard)
+string(FIND "${patched}" "__syncwarp();" barrier)
+if(guard LESS 0 OR barrier LESS guard OR NOT EXISTS "${output}/flashinfer/cp_async.cuh")
+    message(FATAL_ERROR "Missing architecture guard, barrier or relative include")
+endif()
+file(SHA256 "${output}/flashinfer/attention/prefill.cuh" first_hash)
+qw3_prepare_flashinfer_prefill("${input}" "${output}")
+file(SHA256 "${output}/flashinfer/attention/prefill.cuh" second_hash)
+file(SHA256 "${input}/flashinfer/attention/prefill.cuh" unchanged_hash)
+if(NOT first_hash STREQUAL second_hash OR NOT original_hash STREQUAL unchanged_hash)
+    message(FATAL_ERROR "Overlay is not repeatable or modified the input dependency")
+endif()
+execute_process(COMMAND "${CMAKE_COMMAND}" "-DTEST_ROOT=${TEST_ROOT}/unknown"
+    -DREJECT_UNKNOWN=ON -P "${CMAKE_CURRENT_LIST_FILE}"
+    RESULT_VARIABLE rejected OUTPUT_VARIABLE rejection ERROR_VARIABLE rejection_error)
+if(rejected EQUAL 0 OR NOT rejection_error MATCHES "Unrecognized FlashInfer")
+    message(FATAL_ERROR "Unknown-header guard failed: ${rejection_error}")
+endif()
+message(STATUS "FlashInfer overlay guard and repeatability checks passed")

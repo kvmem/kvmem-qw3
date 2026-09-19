@@ -95,11 +95,81 @@ void compare(qw3::DeviceBackend &backend, unsigned heads, unsigned kv_heads, boo
     if (max_error > 0.001f) throw std::runtime_error("paged causal attention differs from CPU oracle");
 }
 
+// Do not synchronize between layers. A cached plan still uploads request
+// metadata, and the pinned host ring must not wrap while those reads are live.
+template<class KV>
+void queued_prefill(qw3::DeviceBackend &backend, bool fp8,
+                    unsigned base = 8193, unsigned calls = 96) {
+    constexpr unsigned dim = 256, heads = 24, kv_heads = 4, batch = 33;
+    constexpr unsigned page = 32;
+    const unsigned pages = (base + batch + 15 + page - 1) / page;
+    constexpr unsigned stride = kv_heads * dim, q_stride = heads * 2 * dim;
+    constexpr unsigned out_stride = heads * dim;
+    std::vector<KV> k(pages * page * stride), v(k.size());
+    std::vector<double> prefix(pages * page + 1);
+    for (unsigned t = 0; t < pages * page; ++t) {
+        const KV value = KV(float(t % 64) / 8);
+        prefix[t + 1] = prefix[t] + float(value);
+        for (unsigned c = 0; c < stride; ++c) v[t * stride + c] = value;
+    }
+    std::vector<int32_t> mapping(pages);
+    for (unsigned p = 0; p < pages; ++p) mapping[p] = p;
+    std::vector<float> query(batch * q_stride, 0);
+    auto kd = fp8 ? backend.tensor_fp8_kv(k.size(), "queued K") : backend.tensor_f16(k.size(), "queued K");
+    auto vd = fp8 ? backend.tensor_fp8_kv(v.size(), "queued V") : backend.tensor_f16(v.size(), "queued V");
+    auto qd = backend.tensor_f32(query.size(), "queued Q");
+    auto pd = backend.tensor_i32(pages, "queued pages");
+    std::vector<std::unique_ptr<qw3::DeviceTensor>> outputs;
+    for (unsigned i = 0; i < calls; ++i)
+        outputs.push_back(backend.tensor_f32(batch * out_stride, "queued O"));
+    check(backend.copy_bytes_from_host(*kd, 0, k.data(), k.size() * sizeof(KV)));
+    check(backend.copy_bytes_from_host(*vd, 0, v.data(), v.size() * sizeof(KV)));
+    check(backend.copy_bytes_from_host(*qd, 0, query.data(), query.size() * sizeof(float)));
+    check(backend.copy_i32_from_host(*pd, 0, mapping.data(), pages));
+    auto launch = [&](unsigned i) {
+        check(backend.attention_prefill_batch_paged_gated_device(
+            *outputs[i], *qd, 2 * dim, *kd, *vd, *pd, pages, page, heads,
+            kv_heads, dim, base + i % 16, batch, q_stride, out_stride,
+            1.0f / std::sqrt(float(dim))));
+    };
+    launch(0); // Grow scratch before the asynchronous burst.
+    check(backend.synchronize());
+    for (unsigned i = 0; i < calls; ++i) launch(i);
+    check(backend.synchronize());
+    std::vector<float> result(batch * out_stride);
+    float max_error = 0;
+    for (unsigned i = 0; i < calls; ++i) {
+        check(backend.copy_to_host(*outputs[i], result.data(), 0, result.size()));
+        for (unsigned b = 0; b < batch; ++b) {
+            const unsigned length = base + i % 16 + b + 1;
+            const float expected = float(prefix[length] / length / 2);
+            for (unsigned d = 0; d < out_stride; ++d) {
+                const float actual = result[b * out_stride + d];
+                if (!std::isfinite(actual)) throw std::runtime_error("non-finite queued prefill");
+                max_error = std::max(max_error, std::abs(actual - expected));
+            }
+        }
+    }
+    std::printf("queued dtype=%s base=%u calls=%u max_abs_error=%g\n", fp8 ? "FP8" : "FP16", base, calls, max_error);
+    if (max_error > 0.001f) throw std::runtime_error("queued prefill metadata lifetime regression");
+}
+
 int main(int argc, char **argv) try {
     const bool prefill = argc == 2 && std::strcmp(argv[1], "--prefill") == 0;
-    if (argc != 1 && !prefill) throw std::runtime_error("usage: flashinfer_decode_gqa [--prefill]");
+    const bool queued = argc == 2 && std::strcmp(argv[1], "--queued") == 0;
+    const bool queued_small = argc == 2 && std::strcmp(argv[1], "--queued-small") == 0;
+    if (argc != 1 && !prefill && !queued && !queued_small)
+        throw std::runtime_error("usage: flashinfer_decode_gqa [--prefill|--queued|--queued-small]");
     auto backend = qw3::make_cuda_device_backend(qw3::LinearBackend::Cublas);
     check(backend->begin());
+    if (queued || queued_small) {
+        // Race instrumentation retains extensive shared-memory access history.
+        // Keep its bounded variant above two complete pinned-ring wraps; the
+        // ordinary CTest and memcheck retain the full 8K/96-launch stress case.
+        queued_prefill<half>(*backend, false, queued_small ? 257 : 8193, queued_small ? 24 : 96);
+        queued_prefill<__nv_fp8_e4m3>(*backend, true, queued_small ? 257 : 8193, queued_small ? 24 : 96);
+        return 0;
+    }
     if (prefill) {
         for (unsigned dim : {128u, 256u}) {
             for (auto shape : {std::pair<unsigned, unsigned>{31, 0}, {33, 997}, {129, 63}}) {

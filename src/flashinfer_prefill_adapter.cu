@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace qw3 {
 namespace flashinfer_adapter {
@@ -158,13 +159,14 @@ bool paged_prefill_plan_cache_enabled() {
 }
 
 // Every normal-attention layer in one prefill chunk has the same scheduling
-// shape and shares the same persistent FlashInfer workspaces. PrefillPlan is
-// independent of the actual K/V page IDs, but the old path rebuilt and
-// re-uploaded that identical plan once per layer. Cache only an immediately
-// reusable workspace/shape tuple; a changed chunk length, KV-page count,
-// workspace, stream, or dtype instantiation is a miss and replans normally.
+// shape. Cache the CPU scheduling result, NOT an assumption that a borrowed
+// device workspace still contains that plan: ragged prefill, a different KV
+// dtype, or a recycled backend allocation may have overwritten it. Restore
+// cached metadata through the caller's fenced pinned slot on every hit.
 struct PagedPrefillPlanCache {
     bool valid = false;
+    int device = -1;
+    std::vector<char> metadata;
     int32_t *int_workspace = nullptr;
     size_t int_workspace_bytes = 0;
     float *requested_float_workspace = nullptr;
@@ -189,8 +191,9 @@ struct PagedPrefillPlanCache {
             float *fw, size_t fw_bytes, cudaStream_t s,
             uint32_t b, uint32_t pages, uint32_t nh,
             uint32_t nkh, uint32_t hd, uint32_t ps,
-            bool allow_split) const {
+            bool allow_split, int current_device) const {
         return valid &&
+               device == current_device &&
                int_workspace == iw &&
                int_workspace_bytes == iw_bytes &&
                requested_float_workspace == fw &&
@@ -309,13 +312,15 @@ bool run_batch_prefill_paged_typed(
     size_t active_float_workspace_bytes = float_workspace_bytes;
     static thread_local PagedPrefillPlanCache plan_cache;
     const bool use_plan_cache = paged_prefill_plan_cache_enabled();
+    int current_device = -1;
+    if (cudaGetDevice(&current_device) != cudaSuccess) return false;
     const bool plan_cache_hit =
         use_plan_cache &&
         plan_cache.matches(
             int_workspace, int_workspace_bytes,
             float_workspace, float_workspace_bytes, stream,
             batch, need_pages, n_heads, n_kv_heads, head_dim,
-            page_size, allow_split_kv);
+            page_size, allow_split_kv, current_device);
     if (plan_cache_hit_out) *plan_cache_hit_out = plan_cache_hit;
     auto plan = [&](bool disable_split_kv) {
         return flashinfer::PrefillPlan<int32_t>(
@@ -349,6 +354,11 @@ bool run_batch_prefill_paged_typed(
         active_float_workspace = plan_cache.active_float_workspace;
         active_float_workspace_bytes =
             plan_cache.active_float_workspace_bytes;
+        std::memcpy(plan_host_workspace, plan_cache.metadata.data(),
+                    plan_cache.metadata.size());
+        if (cudaMemcpyAsync(plan_int_workspace, plan_host_workspace,
+                            plan_cache.metadata.size(), cudaMemcpyHostToDevice,
+                            stream) != cudaSuccess) return false;
     } else {
         if (plan_cache.valid &&
             std::getenv("QW3_FLASHINFER_PLAN_CACHE_TRACE")) {
@@ -366,6 +376,8 @@ bool run_batch_prefill_paged_typed(
         }
         plan_cache.consecutive_hits = 0;
         ++plan_cache.total_misses;
+        // A failed plan may partially overwrite the borrowed workspaces.
+        plan_cache.valid = false;
         cudaError_t plan_st = cudaErrorInvalidValue;
         try {
             plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
@@ -384,7 +396,17 @@ bool run_batch_prefill_paged_typed(
         }
         if (plan_st != cudaSuccess) return false;
         if (use_plan_cache) {
-            plan_cache.valid = true;
+            // These are the final allocations in non-graph PrefillPlan (also
+            // mirrored by prefill_plan_workspace_size below). Copy only the
+            // live metadata extent, not the potentially multi-MiB capacity.
+            const size_t metadata_bytes = plan_info.split_kv
+                ? size_t(plan_info.block_valid_mask_offset) +
+                    size_t(plan_info.padded_batch_size) * sizeof(bool)
+                : size_t(plan_info.kv_chunk_size_ptr_offset) + sizeof(int32_t);
+            if (metadata_bytes > plan_int_workspace_bytes) return false;
+            const auto *metadata = static_cast<const char *>(plan_host_workspace);
+            plan_cache.metadata.assign(metadata, metadata + metadata_bytes);
+            plan_cache.device = current_device;
             plan_cache.int_workspace = int_workspace;
             plan_cache.int_workspace_bytes = int_workspace_bytes;
             plan_cache.requested_float_workspace = float_workspace;
@@ -402,6 +424,7 @@ bool run_batch_prefill_paged_typed(
             plan_cache.page_size = page_size;
             plan_cache.allow_split_kv = allow_split_kv;
             plan_cache.plan_info = plan_info;
+            plan_cache.valid = true;
         }
     }
 
