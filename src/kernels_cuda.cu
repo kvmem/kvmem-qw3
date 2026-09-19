@@ -13279,6 +13279,7 @@ private:
                            &trans_b, sizeof(trans_b)),
                        "cuBLASLt FP8 transB")) break;
             if (outer_scale) {
+#if QW3_CUBLASLT_HAS_OUTER_SCALE
                 const int32_t scale_mode =
                     CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
                 if (!check(cublasLtMatmulDescSetAttribute(
@@ -13291,6 +13292,10 @@ private:
                                CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
                                &scale_mode, sizeof(scale_mode)),
                            "cuBLASLt FP8 B outer scale mode")) break;
+#else
+                result = {false, "FP8 outer scaling requires newer cuBLASLt headers"};
+                break;
+#endif
             }
 
             // The buffers are row-major [N,K] and [batch,K]. Viewing them as

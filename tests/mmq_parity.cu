@@ -1,4 +1,4 @@
-// MMQ v4 parity test.
+// MMQ parity test (QW3_MMQ_VERSION selects the kernel).
 //
 // Validates that the v4 kernel (qw3::ported::launch_mmq_q8_0 with
 // QW3_MMQ_VERSION=4) produces the same matmul result that an FP32 host
@@ -30,6 +30,10 @@
 #include <vector>
 
 namespace qw3 { namespace ported {
+size_t q8_1_scratch_bytes(uint32_t batch, uint32_t cols);
+bool launch_quantize_q8_1(const float *x, void *y_q8_1,
+                          uint32_t batch, uint32_t cols, uint32_t stride_x_row,
+                          cudaStream_t stream);
 size_t q8_1_mmq_scratch_bytes(uint32_t batch, uint32_t cols);
 bool launch_quantize_mmq_q8_1(const float *x, void *y_q8_1_mmq,
                               uint32_t batch, uint32_t cols, uint32_t stride_x_row,
@@ -133,6 +137,33 @@ struct ShapeResult {
     int total;
 };
 
+// The launcher's older v2/v3/v6 kernels consume row-major 36-byte Q8_1,
+// not the 144-byte super-block layout used by v4/v5/v7/v8.
+static bool uses_mmq_y_layout(int M, int N, int K) {
+    const char *env = std::getenv("QW3_MMQ_VERSION");
+    const char version = env ? env[0] : 'a';
+    if (version == '2' || version == '3' || version == '6') return false;
+    if (version == '4') return K % 256 == 0 && M >= 128 && N >= 128;
+    if (version == '5') return K % 256 == 0 && M >= 128 && N >= 64;
+    if (version == '7') return K % 128 == 0 && M >= 64 && N >= 64;
+    return K % 128 == 0 && M >= 128;
+}
+
+static void dequant_q8_1_host(const std::vector<uint8_t> &Yq, int N, int K,
+                              std::vector<float> &out) {
+    out.resize(static_cast<size_t>(N) * K);
+    for (int j = 0; j < N; ++j) {
+        for (int kb = 0; kb < K / QK; ++kb) {
+            const uint8_t *blk = Yq.data() + (size_t(j) * (K / QK) + kb) * 36;
+            __half hd;
+            std::memcpy(&hd, blk, 2);
+            const float d = __half2float(hd);
+            const int8_t *qs = reinterpret_cast<const int8_t *>(blk + 4);
+            for (int t = 0; t < QK; ++t) out[j * K + kb * QK + t] = qs[t] * d;
+        }
+    }
+}
+
 static ShapeResult run_shape(int M, int N, int K, std::mt19937 &rng) {
     std::uniform_real_distribution<float> dx(-1.0f, 1.0f);
     std::uniform_real_distribution<float> dw(-0.5f, 0.5f);
@@ -179,16 +210,17 @@ static ShapeResult run_shape(int M, int N, int K, std::mt19937 &rng) {
     CHECK(cudaMalloc(&d_out, static_cast<size_t>(N) * M * sizeof(float)));
     CHECK(cudaMemset(d_out, 0, static_cast<size_t>(N) * M * sizeof(float)));
 
-    const size_t scratch_bytes =
-        qw3::ported::q8_1_mmq_scratch_bytes(static_cast<uint32_t>(N),
-                                            static_cast<uint32_t>(K));
+    const bool mmq_y = uses_mmq_y_layout(M, N, K);
+    const size_t scratch_bytes = mmq_y
+        ? qw3::ported::q8_1_mmq_scratch_bytes(N, K)
+        : qw3::ported::q8_1_scratch_bytes(N, K);
     CHECK(cudaMalloc(&d_act, scratch_bytes));
 
-    if (!qw3::ported::launch_quantize_mmq_q8_1(
-                d_x, d_act,
-                static_cast<uint32_t>(N), static_cast<uint32_t>(K),
-                static_cast<uint32_t>(K), /*stream=*/0)) {
-        std::fprintf(stderr, "launch_quantize_mmq_q8_1 failed (M=%d N=%d K=%d)\n",
+    const bool quantized = mmq_y
+        ? qw3::ported::launch_quantize_mmq_q8_1(d_x, d_act, N, K, K, 0)
+        : qw3::ported::launch_quantize_q8_1(d_x, d_act, N, K, K, 0);
+    if (!quantized) {
+        std::fprintf(stderr, "activation quantization failed (M=%d N=%d K=%d)\n",
                      M, N, K);
         std::exit(1);
     }
@@ -225,7 +257,8 @@ static ShapeResult run_shape(int M, int N, int K, std::mt19937 &rng) {
     std::vector<float> W_de;
     std::vector<float> X_de;
     dequant_q8_0_host(Wq, M, K, W_de);
-    dequant_q8_1_mmq_host(Yq, N, K, X_de);
+    if (mmq_y) dequant_q8_1_mmq_host(Yq, N, K, X_de);
+    else dequant_q8_1_host(Yq, N, K, X_de);
 
     std::vector<float> ref(static_cast<size_t>(N) * M, 0.0f);
     for (int n = 0; n < N; ++n) {
@@ -246,6 +279,10 @@ static ShapeResult run_shape(int M, int N, int K, std::mt19937 &rng) {
     const float abs_tol = 5e-3f;
     const float rel_tol = 1e-3f;
     for (size_t i = 0; i < got.size(); ++i) {
+        if (!std::isfinite(got[i])) {
+            ++r.n_outside_tol;
+            continue;
+        }
         float d = std::fabs(got[i] - ref[i]);
         r.max_abs_diff = std::max(r.max_abs_diff, d);
         float denom = std::max(std::fabs(ref[i]), 1e-6f);
@@ -255,7 +292,12 @@ static ShapeResult run_shape(int M, int N, int K, std::mt19937 &rng) {
     return r;
 }
 
-int main(int /*argc*/, char ** /*argv*/) {
+int main(int argc, char **argv) {
+    const bool small = argc == 2 && std::strcmp(argv[1], "--small") == 0;
+    if (argc != 1 && !small) {
+        std::fprintf(stderr, "usage: mmq_parity [--small]\n");
+        return 2;
+    }
     // Force MMQ dispatch in launch_mmq_q8_0 (consumes 144-B block_q8_1_mmq_t).
     // Honor the user's QW3_MMQ_VERSION if set, else default to v7.
     if (!std::getenv("QW3_MMQ_VERSION")) {
@@ -264,8 +306,8 @@ int main(int /*argc*/, char ** /*argv*/) {
 
     int dev_count = 0;
     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) {
-        std::fprintf(stderr, "no CUDA devices, skipping\n");
-        return 0;
+        std::fprintf(stderr, "no CUDA devices%s\n", small ? "" : ", skipping");
+        return small ? 1 : 0;
     }
 
     std::mt19937 rng(0x5eedu);
@@ -294,6 +336,12 @@ int main(int /*argc*/, char ** /*argv*/) {
         {640,   223, 2304},
     };
 
+    // Keep sanitizer runs bounded while retaining several complete K loops.
+    if (small) {
+        shapes.resize(7);
+        shapes.push_back({129, 131, 768}); // checked row and batch tails
+        shapes.push_back({192, 129, 512});
+    }
     int n_failed = 0;
     for (auto s : shapes) {
         ShapeResult r = run_shape(s.M, s.N, s.K, rng);

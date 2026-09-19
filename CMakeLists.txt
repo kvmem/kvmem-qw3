@@ -24,6 +24,19 @@ set(QW3_NVFP4_TEST_MODEL "" CACHE PATH "Optional local NVFP4 model for checkpoin
 if(QW3_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    # Row/column FP8 scale modes are absent from older cuBLASLt headers (12.4).
+    # Probe the API, rather than making the ordinary Q8/FP16 build depend on it.
+    include(CheckCXXSourceCompiles)
+    include(CMakePushCheckState)
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+    check_cxx_source_compiles("#include <cublasLt.h>
+        int main() {
+            return int(CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F)
+                 + int(CUBLASLT_MATMUL_DESC_A_SCALE_MODE)
+                 + int(CUBLASLT_MATMUL_DESC_B_SCALE_MODE);
+        }" QW3_CUBLASLT_HAS_OUTER_SCALE)
+    cmake_pop_check_state()
     # Default to Ampere+ — INT8 MMA m16n8k32.s8.s8.s32 (mmq_q8.cu) needs
     # sm_80. Override with -DCMAKE_CUDA_ARCHITECTURES=...
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -145,6 +158,10 @@ endif()
 
 if(QW3_ENABLE_CUDA)
     target_compile_definitions(qw3_core PRIVATE QW3_ENABLE_CUDA=1)
+    if(QW3_CUBLASLT_HAS_OUTER_SCALE)
+        set_property(SOURCE src/kernels_cuda.cu APPEND PROPERTY
+            COMPILE_DEFINITIONS QW3_CUBLASLT_HAS_OUTER_SCALE=1)
+    endif()
     target_link_libraries(qw3_core PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt)
     set_property(TARGET qw3_core PROPERTY CUDA_STANDARD 17)
     set_property(TARGET qw3_core PROPERTY CUDA_STANDARD_REQUIRED ON)
@@ -384,11 +401,22 @@ if(QW3_BUILD_TESTS)
     add_test(NAME qw3-kvmem-archive COMMAND qw3-kvmem-archive)
 
     if(QW3_ENABLE_CUDA)
+        add_executable(qw3-native-attention-oracle tests/native_attention_oracle.cpp)
+        target_link_libraries(qw3-native-attention-oracle PRIVATE qw3_core)
+        add_test(NAME qw3-native-attention-oracle COMMAND qw3-native-attention-oracle)
+        add_test(NAME qw3-native-attention-oracle-fp32 COMMAND qw3-native-attention-oracle --fp32)
+        set_tests_properties(qw3-native-attention-oracle qw3-native-attention-oracle-fp32 PROPERTIES
+            ENVIRONMENT "QW3_PREFILL_ATTN=mma-gqa-v2;QW3_PREFILL_ATTN_MIN_BATCH=1"
+            LABELS "cuda;native_attention" TIMEOUT 180)
         if(QW3_ENABLE_FLASHINFER)
             add_executable(qw3-flashinfer-decode-gqa tests/flashinfer_decode_gqa.cu)
             target_link_libraries(qw3-flashinfer-decode-gqa PRIVATE qw3_core)
             set_property(TARGET qw3-flashinfer-decode-gqa PROPERTY CUDA_STANDARD 17)
             add_test(NAME qw3-flashinfer-decode-gqa COMMAND qw3-flashinfer-decode-gqa)
+            add_test(NAME qw3-flashinfer-prefill-gqa COMMAND qw3-flashinfer-decode-gqa --prefill)
+            set_tests_properties(qw3-flashinfer-decode-gqa qw3-flashinfer-prefill-gqa PROPERTIES
+                ENVIRONMENT "QW3_PREFILL_ATTN=flashinfer;QW3_DECODE_ATTN=flashinfer"
+                LABELS "cuda;flashinfer_attention" TIMEOUT 180)
             add_executable(qw3-vision-attention-oracle tests/vision_attention_oracle.cpp)
             target_link_libraries(qw3-vision-attention-oracle PRIVATE qw3_core)
             add_test(NAME qw3-vision-attention-oracle COMMAND qw3-vision-attention-oracle)

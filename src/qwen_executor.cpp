@@ -403,7 +403,19 @@ bool full_executor_trace_enabled() {
 }
 
 bool paged_kv_prefill_for_local_cache_enabled() {
-    return env_flag_enabled("QW3_PAGED_KV_PREFILL", true);
+    // Device-page-table attention requires FlashInfer. Native builds keep
+    // their local cache contiguous; explicit paged caches are handled separately.
+#if QW3_ENABLE_FLASHINFER
+    const char *dtype = std::getenv("QW3_KV_DTYPE");
+    const bool supported_dtype = !dtype || std::strcmp(dtype, "fp16") == 0 ||
+        std::strcmp(dtype, "fp8") == 0;
+    const char *decode = std::getenv("QW3_DECODE_ATTN");
+    const bool native_decode = decode && std::strcmp(decode, "native") == 0;
+    return supported_dtype && !native_decode &&
+        env_flag_enabled("QW3_PAGED_KV_PREFILL", true);
+#else
+    return false;
+#endif
 }
 
 size_t kvmem_env_size(const char *name, size_t fallback,

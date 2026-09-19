@@ -36,6 +36,14 @@
 
 #include "cuda_helpers.cuh"
 
+// This translation unit is compiled separately from fattn_vec_decode.cu.
+// Without its own architecture guard the PTX helpers become silent no-ops.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#define QW3_MMA_AVAILABLE 1
+#else
+#define QW3_MMA_AVAILABLE 0
+#endif
+
 namespace qw3 {
 namespace ported {
 
@@ -91,7 +99,7 @@ __device__ __forceinline__ void ldmatrix_x4_a(
     const __half *p = base + (lane & 15) * stride_h + ((lane >> 4) * 8);
     unsigned smem = __cvta_generic_to_shared(p);
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
         : "r"(smem));
 #else
@@ -119,7 +127,7 @@ __device__ __forceinline__ void ldmatrix_x2_b_trans(
     const __half *p = base + (lane & 15) * stride_h;
     unsigned smem = __cvta_generic_to_shared(p);
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0,%1}, [%2];"
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
         : "=r"(b0), "=r"(b1)
         : "r"(smem));
 #else
@@ -535,6 +543,8 @@ fattn_prefill_mma_gqa_kernel_v3_t(
         }
 
         if (USE_CP_ASYNC_K) {
+            // The next async write reuses K read by every warp in this tile.
+            __syncthreads();
             const uint32_t t0_next = t0 + BC;
             if (t0_next < kv_hi) { issue_K(t0_next); mma_detail::cp_async_commit(); }
         }
@@ -603,6 +613,8 @@ fattn_prefill_mma_gqa_kernel_v3_t(
             const float prev_l  = s_l[m_row];
             const float alpha   = (prev_m == -INFINITY) ? 0.0f : __expf(prev_m - new_m);
             const float new_l   = prev_l * alpha + row_sum;
+            // All lanes must consume the old shared state before lane 0 updates it.
+            __syncwarp();
             if (lane == 0) {
                 s_m[m_row]     = new_m;
                 s_l[m_row]     = new_l;
@@ -671,6 +683,9 @@ fattn_prefill_mma_gqa_kernel_v3_t(
             }
         }
 
+        // Finish all P/V reads before any warp reuses these shared buffers.
+        // Also required when V uses synchronous loads at the next loop iteration.
+        __syncthreads();
         if (USE_CP_ASYNC_V) {
             const uint32_t t0_next = t0 + BC;
             if (t0_next < kv_hi) { issue_V(t0_next); mma_detail::cp_async_commit(); }
@@ -1100,6 +1115,8 @@ fattn_prefill_mma_gqa_kernel_v4_t(
         }
 
         if (USE_CP_ASYNC_K) {
+            // The next async write reuses K read by every warp in this tile.
+            __syncthreads();
             const uint32_t t0_next = t0 + BC;
             if (t0_next < kv_hi) { issue_K(t0_next); mma_detail::cp_async_commit(); }
         }
@@ -1162,6 +1179,8 @@ fattn_prefill_mma_gqa_kernel_v4_t(
             const float prev_l  = s_l[m_row];
             const float alpha   = (prev_m == -INFINITY) ? 0.0f : __expf(prev_m - new_m);
             const float new_l   = prev_l * alpha + row_sum;
+            // All lanes must consume the old shared state before lane 0 updates it.
+            __syncwarp();
             if (lane == 0) {
                 s_m[m_row]     = new_m;
                 s_l[m_row]     = new_l;
@@ -1242,6 +1261,9 @@ fattn_prefill_mma_gqa_kernel_v4_t(
             }
         }
 
+        // Finish all P/V reads before any warp reuses these shared buffers.
+        // Also required when V uses synchronous loads at the next loop iteration.
+        __syncthreads();
         if (USE_CP_ASYNC_V) {
             const uint32_t t0_next = t0 + BC;
             if (t0_next < kv_hi) { issue_V(t0_next); mma_detail::cp_async_commit(); }
@@ -1693,6 +1715,8 @@ fattn_prefill_mma_gqa_kernel_v5_t(
         }
 
         if (USE_CP_ASYNC_K) {
+            // The next async write reuses K read by every warp in this tile.
+            __syncthreads();
             const uint32_t t0_next = t0 + BC;
             if (t0_next < kv_hi) { issue_K(t0_next); mma_detail::cp_async_commit(); }
         }
@@ -1757,6 +1781,8 @@ fattn_prefill_mma_gqa_kernel_v5_t(
             const float prev_l  = s_l[m_row];
             const float alpha   = (prev_m == -INFINITY) ? 0.0f : __expf(prev_m - new_m);
             const float new_l   = prev_l * alpha + row_sum;
+            // All lanes must consume the old shared state before lane 0 updates it.
+            __syncwarp();
             if (lane == 0) {
                 s_m[m_row]     = new_m;
                 s_l[m_row]     = new_l;
@@ -1841,6 +1867,9 @@ fattn_prefill_mma_gqa_kernel_v5_t(
             }
         }
 
+        // Finish all P/V reads before any warp reuses these shared buffers.
+        // Also required when V uses synchronous loads at the next loop iteration.
+        __syncthreads();
         if (USE_CP_ASYNC_V) {
             const uint32_t t0_next = t0 + BC;
             if (t0_next < kv_hi) { issue_V(t0_next); mma_detail::cp_async_commit(); }

@@ -123,7 +123,7 @@ __device__ __forceinline__ void ldmatrix_x4(
     const int *xs = ptr_int + (lane & 15) * stride_int + (lane >> 4) * 4;
     unsigned smem = __cvta_generic_to_shared(xs);
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
         : "r"(smem));
 }
@@ -143,7 +143,7 @@ __device__ __forceinline__ void ldmatrix_x2(
     const int *xs = ptr_int + (lane & 7) * stride_int + ((lane >> 3) & 1) * 4;
     unsigned smem = __cvta_generic_to_shared(xs);
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x2.b16 {%0,%1}, [%2];"
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
         : "=r"(b0), "=r"(b1)
         : "r"(smem));
 }
@@ -600,7 +600,7 @@ __device__ __forceinline__ void v4_ldmatrix_x4(
         const int *xs_base) {
     unsigned smem = __cvta_generic_to_shared(xs_base);
     asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
         : "r"(smem));
 }
