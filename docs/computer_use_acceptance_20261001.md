@@ -92,3 +92,19 @@ and 1,019/1,042, 1,022/1,068 and 1,023/1,093 selected/total blocks. Historical
 message groups match the expected 77/79/81/83, including older same-turn tools.
 This diagnoses continuation and mapping; no desktop actions were dispatched,
 and it does not establish final old-image answer quality or live task success.
+
+
+The first repaired live attempt (`windows-long-on-03`) was interrupted by
+SIGTERM after 66 completed actions, before its 900-second deadline. The signal
+sender is unknown; no kernel OOM/GPU fault was found in the inspected interval.
+Queue, app and engine termination were verified, then the dedicated desktop
+was explicitly paused. There is no final task result and no off-policy run;
+this is incomplete infrastructure evidence, not a passed task or a deadline
+failure. [Interruption record](computer_use_archive_interruption_20261001.json).
+
+A fresh pair (`windows-long-{on,off}-04`) now runs under the transient user unit
+`qw3-computer-long-repair-02.service`, with a 45-minute overall bound and an
+exit cleanup that pauses the owned VM. Both task deadlines remain 900 seconds,
+with the same snapshot and `c436ec6` app/engine sources. Neither new outcome
+is qualified yet. Read the unit's actual state before acting on queue JSON;
+an active unit's `Result=success` is not task-completion evidence.

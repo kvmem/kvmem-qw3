@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790809448.853832,
+  "reviewed_at": 1790810508.5605159,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
@@ -119,7 +119,25 @@
     "total_pages": 36,
     "audit": "docs/computer_use_windows_long_pair_02_20261001.json",
     "on_error": "Live archive task deadline exceeded",
-    "off_error": "Live archive task deadline exceeded"
+    "off_error": "Live archive task deadline exceeded",
+    "repair_attempt_03": {
+      "status": "infrastructure_interruption",
+      "qualified": false,
+      "evidence": "docs/computer_use_archive_interruption_20261001.json",
+      "task_deadline_reached": false
+    },
+    "repair_attempt_04": {
+      "status": "running",
+      "qualified": false,
+      "supervision": "qw3-computer-long-repair-02.service",
+      "run_dirs": [
+        "windows-long-on-04",
+        "windows-long-off-04"
+      ],
+      "task_deadline_seconds_each": 900,
+      "service_limit_seconds": 2700,
+      "source_commit": "c436ec65800b6fb4edfa790c9c72a718fd6e6029"
+    }
   },
   "native_client_source_identity_scope": "Bundle 04 matches the frozen baseline; working app/engine repairs are newer and require fresh qualification."
 }

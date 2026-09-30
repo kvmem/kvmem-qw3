@@ -1,0 +1,29 @@
+{
+  "kind": "externally_interrupted_live_trial",
+  "recorded_at": 1790810361.7939281,
+  "exec_session": 32931,
+  "exit_code": 143,
+  "signal": "SIGTERM",
+  "sender": "unknown",
+  "owned_queue_app_engine_processes_absent": true,
+  "app_and_model_ports_closed": true,
+  "gpu_compute_processes": 0,
+  "completed_task": false,
+  "task_deadline_seconds": 900,
+  "task_result_written": false,
+  "action_counts": {
+    "completed": 66
+  },
+  "last_action_created": 1790810245.576329,
+  "task_started_at": 1790809820.7421548,
+  "desktop_paused_after_manual_cleanup": true,
+  "frozen_hashes_unchanged": true,
+  "off_policy_started": false,
+  "qualification": "incomplete; do not count as passed or task deadline failure",
+  "retained_last_screenshot": "apps/computer_use/.runtime/windows-long-on-03/app/desktop/screenshots/b77aea66c9a497d42a2b6fe73b0a5c48c193ab8624bbc20309a62429b94f5bcc.png",
+  "kernel_oom_or_gpu_fault_found": false,
+  "host_signal_source_established": false,
+  "last_visible_page": 31,
+  "total_pages": 36,
+  "screenshot_sha256": "b77aea66c9a497d42a2b6fe73b0a5c48c193ab8624bbc20309a62429b94f5bcc"
+}
