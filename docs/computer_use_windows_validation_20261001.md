@@ -452,7 +452,18 @@ request tag matches a ready, non-fallback retrieval record selecting 1,021
 of 2,009 blocks. DFlash fallback count was zero. Full identity, resource scopes
 and evidence hashes: `computer_use_windows_long_on_04_20261001.json`.
 
-The matching off-policy trial is still running under the bounded transient
-service. This closes one live KVMem-on task, not the paired comparison, the
-changed-old-image control, final native-client requalification, input-death
-recovery candidate, Mac or physical desktop acceptance. Goal remains active.
+The matching off-policy trial finished with a normal timeout at 901.80s
+under the same 900s deadline, last visible page 18/36 and 40 completed actions.
+The comparison is complete: on passed, off failed; all configuration/evidence
+consistency checks passed. Sampled GPU peaks were 45.785/67.668 GiB (on/off),
+engine RSS 40.373/32.027 GiB. See `computer_use_windows_long_pair_04_20261001.json`
+and `computer_use_windows_long_requests_20261001.csv`. Live trajectories differ,
+and on includes prefix reuse; this is not a retrieval-only speed comparison.
+
+A subsequent same-turn positive/changed-image negative probe found a quality
+failure at 162,062 tokens: on misread the positive image reference/name, off
+was correct. Both negatives returned null, but on emitted no semantic
+retrieval dump. Logs show same-query reselection suppression with guided refresh
+disabled. See `computer_use_same_turn_visual_01_20261001.json`. This remains
+open alongside final native-client qualification, input-death recovery, Mac
+and physical desktop acceptance. Goal remains active.

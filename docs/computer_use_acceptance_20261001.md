@@ -26,7 +26,8 @@ partial count is a time-stamped observation, not its final result.
 | Growing history and Codex retention | `long-history-probe-01`; `codex-long-01/history-check.json` and raw inference/events | Growing fixture history and actual Codex preservation of eight images/4,800 notes demonstrated. This does not substitute for the live desktop archive task. |
 | Resource and speculation accounting | [Long matrix](computer_use_long_matrix_20261001.csv), [memory diagnostic](computer_use_memory_diagnostic_20261001.csv), scoped raw reports | DFlash accepted/drafted/fallback counters, TTFT, task/action and process/device measurements retained. Allocation traces passed on both policies but explicitly exclude some allocation classes; not a complete census. |
 | Three repetitions of each native Windows core task, both policies | `windows-native-suite-02/summary.json`; frozen `qw3-type-20261001` | Completed 18/18 with a passing independent evidence audit. Same source/model/binary/snapshot identities across both policies; per-trial CSV retained. This qualifies the frozen clipboard-preserving executor, not the undeployed recovery candidate. |
-| Actual long desktop task across retrieval threshold, both policies | [Paired baseline audit](computer_use_windows_long_pair_02_20261001.json); `windows-long-{on,off}-02` | Both timed out at the same 900-second deadline: on 900.61s, page 21/36; off 901.72s, page 18/36. No archive file was verified. Frozen app, engine and snapshot identities match. Index/history repairs and new live qualification remain open. |
+| Actual long desktop task across retrieval threshold, both policies | [Completed repaired pair](computer_use_windows_long_pair_04_20261001.json); `windows-long-{on,off}-04` | On completed 36/36 pages in 644.65s; off timed out at 901.80s, last visible page 18/36. Both used the same 900s deadline and frozen configuration. The comparison is complete; both tasks did not pass. Earlier paired failures remain retained. |
+| Same-turn old-image positive/negative controls | [Failure report](computer_use_same_turn_visual_01_20261001.json) | At 162,062 tokens, on returned a wrong reference/name; off was correct. Both changed-image negatives returned null, but on produced no semantic retrieval dump. Guided-refresh configuration requires investigation. |
 | macOS executor/client and physical targets | [Mac access preparation](computer_use_mac_test_access_20261001.md) | Still open. Readiness helper prepared; only syntax/help/non-Mac refusal verified. No Mac or physical Windows desktop acceptance has run. |
 
 ## Comparison interpretation
@@ -64,9 +65,10 @@ the candidate; the original paired queue is now terminal.
 ## Open gates
 
 The repeated native matrix passed for its frozen executor. The goal cannot
-close until the paired live archive task passes, the new clipboard ownership
-failure case is qualified or
-repaired, and the macOS/accessible physical-desktop requirements are satisfied.
+close until the same-turn visual retrieval failure is resolved, the clipboard
+ownership failure case is qualified or repaired, and the macOS/accessible
+physical-desktop requirements are satisfied. The live on/off archive comparison
+is complete, including the off-policy timeout.
 Earlier failures remain failures even when their repaired pilot passes.
 Missing hardware is recorded as missing evidence, never a successful test.
 Reproduction commands live in the [application README](../apps/computer_use/README.md).
@@ -102,12 +104,11 @@ was explicitly paused. There is no final task result and no off-policy run;
 this is incomplete infrastructure evidence, not a passed task or a deadline
 failure. [Interruption record](computer_use_archive_interruption_20261001.json).
 
-A fresh pair (`windows-long-{on,off}-04`) now runs under the transient user unit
-`qw3-computer-long-repair-02.service`, with a 45-minute overall bound and an
-exit cleanup that pauses the owned VM. Both task deadlines remain 900 seconds,
-with the same snapshot and `c436ec6` app/engine sources. The on-policy trial has now passed its independent evidence audit; the off
-trial is running. The paired outcome remains unqualified until both terminate. Read the unit's actual state before acting on queue JSON;
-an active unit's `Result=success` is not task-completion evidence.
+The repaired pair (`windows-long-{on,off}-04`) finished under transient user
+unit `qw3-computer-long-repair-02.service`. Both task deadlines were 900 seconds,
+with the same snapshot and `c436ec6` app/engine sources. Its exit cleanup passed,
+and the VM ended paused. Independent comparison checks passed; the on task
+passed and the off task timed out. The unit is terminal.
 
 
 ## Repaired live archive, KVMem on
@@ -130,6 +131,33 @@ high-water was 40.373 GiB. These resource scopes must not be added together.
 [Independent audit and identity](computer_use_windows_long_on_04_20261001.json).
 The client/model ran on Linux and actual desktop actions ran in Windows on
 the same host. This is one successful task, not a reliability estimate or
-native Windows GPU qualification. The matching off-policy trial remains live;
-no final pair result is claimed. The same-turn changed-image negative probe
-is prepared separately and has not run against the model yet.
+native Windows GPU qualification. The completed pair is summarized below.
+
+
+## Completed paired comparison and remaining visual failure
+
+| Measurement | KVMem on | KVMem off |
+| --- | ---: | ---: |
+| Task outcome, 900s limit | Passed, 644.65s | Timed out, 901.80s including stop overhead |
+| Last verified progress | 36/36, exact saved JSON | Last visible page 18/36, no verified output |
+| Completed actions | 81 | 40 |
+| Completed inference requests | 82 | 40, plus one cancelled request |
+| Bridge inference elapsed median / p95 | 8.16s / 14.10s | 20.53s / 43.01s |
+| Max completed prompt tokens | 262,656 | 128,283 |
+| Sampled whole-device GPU peak | 45.785 GiB | 67.668 GiB |
+| Engine RSS high-water | 40.373 GiB | 32.027 GiB |
+
+[Pair audit and metrics](computer_use_windows_long_pair_04_20261001.json) and
+[all request timings, including cancellation](computer_use_windows_long_requests_20261001.csv).
+Trajectories differ and on includes prefix reuse. These are one paired task's
+observations, not an isolated retrieval speedup or minimum-memory estimate.
+
+The subsequent same-turn visual probe exposed a separate quality failure:
+with identical 162,062-token inputs, on returned `QW3-WIN-2026-001` and
+`Alice Johnson` instead of the screenshot's `QW3-WINDOWS-2026-ALPHA` and `Alice`;
+off returned the correct values. Both changed-image negative outputs were
+null. On suppressed semantic reselection for the existing user query and used
+pressure-prefill; no retrieval dump was produced. The diagnostic also reports
+its missing-file validation error. This failure remains open, and does not
+become a pass because the earlier live archive succeeded.
+[Full retained failure](computer_use_same_turn_visual_01_20261001.json).

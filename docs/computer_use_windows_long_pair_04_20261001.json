@@ -1,0 +1,180 @@
+{
+  "kind": "completed_live_kvmem_on_off_comparison",
+  "comparison_complete": true,
+  "both_tasks_passed": false,
+  "audit": {
+    "kind": "terminal_live_archive_pair_audit",
+    "passed": false,
+    "evidence_consistent": true,
+    "comparison_checks": {
+      "on_off_labels": true,
+      "same_source_hashes": true,
+      "same_binary": true,
+      "same_launcher": true,
+      "same_snapshot": true,
+      "same_deadline": true,
+      "same_model": true,
+      "same_vision-model": true,
+      "same_dflash-model": true,
+      "same_ctx": true,
+      "same_kv-dtype": true,
+      "same_speculative-method": true,
+      "same_prefill-chunk": true
+    },
+    "trials": [
+      {
+        "directory": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-04",
+        "kvmem": "on",
+        "passed": true,
+        "evidence_consistent": true,
+        "reported_passed": true,
+        "elapsed_seconds": 644.6502600498497,
+        "error": null,
+        "evidence_hashes": {
+          "summary.json": "6a4f1dd2a0dabd0633370f5b17fa6855f4c66c4009dcec52c592da1c2949cd4c",
+          "task/result.json": "8d38060e47b44a635d2e4e35a3267d6d84601348b1f5ebe027f669dd882c43d1",
+          "app/task.json": "0d04c702f74982236bfa809e49dcdacae464b8d00ee30f5d9afce9dd256e5767",
+          "engine/manifest.json": "92acc7c92770d465a05d49e5a14fa8c1262f5ab69eeb80fc7f15d9b62f3d6b6a"
+        },
+        "action_counts": {
+          "completed": 81
+        },
+        "dflash": {
+          "drafted": 19164,
+          "accepted": 11071,
+          "fallback_requests": 0
+        },
+        "sampled_gpu_peak_bytes": 49161437184,
+        "engine_rss_high_water_bytes": 43349831680,
+        "history": {
+          "request_directory": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-04/app/inference/b37ae9dc8a0d42fcaf37680c95c0ae06",
+          "prompt_tokens": 256966,
+          "backend_trace_tag": "b37ae9dc8a0d42fcaf37680c95c0ae06",
+          "image_count": 80,
+          "unique_image_url_hashes": 80,
+          "all_prior_images_preserved": true,
+          "unique_prior_images": 79,
+          "reference_absent_from_prior_text": true
+        },
+        "retrieval": {
+          "type": "meta",
+          "schema_version": "qw3_kvmem_retrieval_dump.v2",
+          "seq": 39,
+          "trace_tag": "b37ae9dc8a0d42fcaf37680c95c0ae06",
+          "block_count": 2009,
+          "selected": 1021,
+          "query_begin": 2421,
+          "query_end": 4094,
+          "context_begin": 0,
+          "context_end": 0,
+          "prompt_tokens": 256966,
+          "budget_blocks": 1024,
+          "prefill_budget_blocks": 1024,
+          "recent": 82,
+          "sink": 11,
+          "block_tokens": 128,
+          "method": "mean-k",
+          "mask": -1,
+          "scorer_requested": "sub-block-mean-k-max",
+          "scorer_used": "sub-block-mean-k-max",
+          "scorer_fallback_reason": "none",
+          "query_expected": 1673,
+          "query_captured": 1673,
+          "qc_total_blocks": 2008,
+          "qc_captured_blocks": 2008,
+          "trace_event": 0,
+          "trace_events": 0,
+          "index_ready": 1,
+          "query_ready": 1,
+          "immutable_source_k": 1
+        },
+        "file_sha256": "da215048cb633ff2b47051629299f45ffc52084165b3368cf65e03c0673b10be"
+      },
+      {
+        "directory": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-off-04",
+        "kvmem": "off",
+        "passed": false,
+        "evidence_consistent": true,
+        "reported_passed": false,
+        "elapsed_seconds": 901.7965232250281,
+        "error": "TimeoutError('Live archive task deadline exceeded')",
+        "evidence_hashes": {
+          "summary.json": "5319013fe7066d2b60486bba3d953e2ee5fe232b615a7154110ce60b10da67b2",
+          "task/result.json": "0c528588d8705a8e39d4d8e468688f2f0909bd1f0d4aebe4b7d563b4d9bd6842",
+          "app/task.json": "5c997db5eebf8cc13fb87481f0b878004570f89b07523c78a6e0463110b63adb",
+          "engine/manifest.json": "0f614acc4b9bce89f92e0ca8ca619d9309fb6cfb23c1f8cafa0ba1277524e03d"
+        },
+        "action_counts": {
+          "completed": 40
+        },
+        "dflash": {
+          "drafted": 9434,
+          "accepted": 5393,
+          "fallback_requests": 0
+        },
+        "sampled_gpu_peak_bytes": 72657928192,
+        "engine_rss_high_water_bytes": 34388353024
+      }
+    ],
+    "scope": "Live trajectories may differ. KVMem on includes prefix reuse; off does not. Retained evidence audit, not a new desktop action or statistical reliability claim."
+  },
+  "timings": {
+    "kind": "terminal_live_pair_request_timing_summary",
+    "aggregates": [
+      {
+        "kvmem": "on",
+        "task_passed": true,
+        "task_seconds": 644.6502600498497,
+        "task_error": null,
+        "inference_requests": 82,
+        "request_statuses": {
+          "completed": 82
+        },
+        "completed_inference_seconds_median": 8.162787870503962,
+        "completed_inference_seconds_p95": 14.1003281949088,
+        "max_completed_prompt_tokens": 262656,
+        "sampled_gpu_peak_bytes": 49161437184,
+        "engine_rss_high_water_bytes": 43349831680
+      },
+      {
+        "kvmem": "off",
+        "task_passed": false,
+        "task_seconds": 901.7965232250281,
+        "task_error": "TimeoutError('Live archive task deadline exceeded')",
+        "inference_requests": 41,
+        "request_statuses": {
+          "cancelled": 1,
+          "completed": 40
+        },
+        "completed_inference_seconds_median": 20.525325275026262,
+        "completed_inference_seconds_p95": 43.005528084049,
+        "max_completed_prompt_tokens": 128283,
+        "sampled_gpu_peak_bytes": 72657928192,
+        "engine_rss_high_water_bytes": 34388353024
+      }
+    ],
+    "scope": "Different live trajectories; KVMem on includes prefix reuse. Request elapsed time is measured at the Responses bridge. First backend event is retained as raw telemetry, not asserted to be visible TTFT. GPU is sampled whole-device usage; RSS is engine process high-water. Cancelled/failed requests remain in the CSV."
+  },
+  "off_final_ui": {
+    "kind": "retained_final_ui_review",
+    "image": "apps/computer_use/.runtime/windows-long-off-04/app/desktop/screenshots/c4164f17d16c8a1427e3c757c30f8a538d5b4cdce0c35f68c977ea7cce7628b1.png",
+    "sha256": "c4164f17d16c8a1427e3c757c30f8a538d5b4cdce0c35f68c977ea7cce7628b1",
+    "reviewed_at": 1790812366.8465564,
+    "last_visible_page": 18,
+    "total_pages": 36,
+    "checkbox_checked": true,
+    "saved_output_verified": false,
+    "note": "The final retained screenshot shows page 18 ready for review; no completed archive file was verified."
+  },
+  "supervision_cleanup": {
+    "kind": "owned_vm_service_exit_pause",
+    "at": 1790812182.0333452,
+    "passed": true
+  },
+  "source_commit_with_app_engine_repair": "c436ec65800b6fb4edfa790c9c72a718fd6e6029",
+  "recorded_engine_commits": [
+    "c436ec65800b6fb4edfa790c9c72a718fd6e6029",
+    "2c21dc18be8a99a0477d6dd2190f4dfa0c3195d5"
+  ],
+  "binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea"
+}

@@ -1,0 +1,374 @@
+{
+  "kind": "same_turn_visual_failure_report",
+  "passed": false,
+  "runtime_tested": true,
+  "tools_dispatched": false,
+  "source_result_sha256": "3553df36a9c49acde918017538b9f803672e181cca6e41704b3a7e68dea8fbdb",
+  "result": {
+    "kind": "same_turn_visual_retrieval_diagnostic",
+    "passed": false,
+    "corpus": {
+      "kind": "synthetic_tool_history_with_retained_codex_controls_and_query_image",
+      "runtime_tested": false,
+      "tools_dispatched": false,
+      "source_corpus": "/home/chaidi/qw3/apps/computer_use/.runtime/same-turn-visual-corpus-01",
+      "cases": [
+        {
+          "name": "short_present",
+          "path": "short_present.json",
+          "sha256": "884b87f7887e22ffdda425b5cf34ce5a4efd4580cff9f50746375555f1b83586",
+          "messages": 8,
+          "expected_groups": 3,
+          "expected": {
+            "reference": "QW3-WINDOWS-2026-ALPHA",
+            "name": "Alice",
+            "priority": "High"
+          }
+        },
+        {
+          "name": "long_present",
+          "path": "long_present.json",
+          "sha256": "5857c703e40eb7d327bfafb51d72c34ffd82e5eb7c5066902f0755c17d791afc",
+          "messages": 140,
+          "expected_groups": 135,
+          "expected": {
+            "reference": "QW3-WINDOWS-2026-ALPHA",
+            "name": "Alice",
+            "priority": "High"
+          }
+        },
+        {
+          "name": "long_absent",
+          "path": "long_absent.json",
+          "sha256": "43aee0c697153dada33691ed00057bf877d05bd672e09d6633e8c3ac9e42042e",
+          "messages": 140,
+          "expected_groups": 135,
+          "expected": {
+            "reference": null,
+            "name": null,
+            "priority": null
+          }
+        }
+      ],
+      "positive_negative_differences_excluding_trace_tag": [
+        "/messages/29/content/1/image_url/url"
+      ],
+      "root_user_message_index": 3,
+      "later_user_messages": 0,
+      "retained_controls_source": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-02/app/inference/41a9302bdcb64313b304a1db7e0824b9/request.json",
+      "retained_controls_source_sha256": "791d419246ff472b93e9b5da6b27e9e3f4ad4b4beeaa130df17598a5635640dd",
+      "environment_metadata_index": 2,
+      "root_query_has_image": true
+    },
+    "profiles": [
+      {
+        "kvmem": "on",
+        "passed": false,
+        "cases": [
+          {
+            "name": "short_present",
+            "passed": true,
+            "started_at": 1790812311.17042,
+            "status": "completed",
+            "http_status": 200,
+            "first_output_seconds": 1.939069600775838,
+            "finish_reason": "stop",
+            "usage": {
+              "completion_tokens": 26,
+              "prompt_tokens": 4114,
+              "total_tokens": 4140
+            },
+            "text": "{\"reference\":\"QW3-WINDOWS-2026-ALPHA\",\"name\":\"Alice\",\"priority\":\"High\"}",
+            "tool_calls": [],
+            "elapsed_seconds": 2.3410329669713974,
+            "process": {
+              "cpu_seconds": 26.49,
+              "rss_bytes": 32969023488,
+              "peak_rss_bytes": 34387337216
+            },
+            "cpu_seconds": 2.2099999999999973,
+            "answer": {
+              "reference": "QW3-WINDOWS-2026-ALPHA",
+              "name": "Alice",
+              "priority": "High"
+            },
+            "groups": [
+              3
+            ]
+          },
+          {
+            "name": "long_present",
+            "passed": false,
+            "started_at": 1790812313.5640907,
+            "status": "completed",
+            "http_status": 200,
+            "first_output_seconds": 62.6427858537063,
+            "finish_reason": "stop",
+            "usage": {
+              "completion_tokens": 41,
+              "prompt_tokens": 162062,
+              "total_tokens": 162103
+            },
+            "text": "{\n  \"reference\": \"QW3-WIN-2026-001\",\n  \"name\": \"Alice Johnson\",\n  \"priority\": \"High\"\n}",
+            "tool_calls": [],
+            "elapsed_seconds": 63.14269677270204,
+            "process": {
+              "cpu_seconds": 92.17,
+              "rss_bytes": 38431760384,
+              "peak_rss_bytes": 38431760384
+            },
+            "cpu_seconds": 65.68,
+            "answer": {
+              "reference": "QW3-WIN-2026-001",
+              "name": "Alice Johnson",
+              "priority": "High"
+            },
+            "check_error": "AssertionError('Historical image answer differs')"
+          },
+          {
+            "name": "long_absent",
+            "passed": false,
+            "started_at": 1790812376.7543952,
+            "status": "completed",
+            "http_status": 200,
+            "first_output_seconds": 62.17538405675441,
+            "finish_reason": "stop",
+            "usage": {
+              "completion_tokens": 23,
+              "prompt_tokens": 162062,
+              "total_tokens": 162085
+            },
+            "text": "{\n  \"reference\": null,\n  \"name\": null,\n  \"priority\": null\n}",
+            "tool_calls": [],
+            "elapsed_seconds": 62.42037377785891,
+            "process": {
+              "cpu_seconds": 156.64,
+              "rss_bytes": 38435688448,
+              "peak_rss_bytes": 38435688448
+            },
+            "cpu_seconds": 64.46999999999998,
+            "answer": {
+              "reference": null,
+              "name": null,
+              "priority": null
+            },
+            "groups": [
+              135
+            ]
+          }
+        ],
+        "engine": {
+          "command": [
+            "/home/chaidi/qw3/build-dflash-integration/qw3",
+            "serve",
+            "--model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-Q8_0.gguf",
+            "--vision-model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-BF16",
+            "--vision-device",
+            "cuda",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "18080",
+            "--ctx",
+            "1048576",
+            "--kv-dtype",
+            "fp8",
+            "--speculative-method",
+            "dflash2",
+            "--prefill-chunk",
+            "2048",
+            "--kvmem",
+            "--kvmem-block-tokens",
+            "128",
+            "--kvmem-budget",
+            "131072",
+            "--kvmem-gen-budget",
+            "65536",
+            "--kvmem-cpu-gb",
+            "48",
+            "--kvmem-prefill-budget",
+            "131072",
+            "--kvmem-query-conditioned",
+            "--kvmem-query-replay",
+            "--kvmem-retrieval-method",
+            "sub-block-mean-k",
+            "--kvmem-semantic-expansion",
+            "message",
+            "--kvmem-prefix-cache",
+            "--dflash-model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-DFlash2-BF16"
+          ],
+          "qw3_env": {
+            "QW3_DFLASH_PRIVATE_MAX_DRAFT_TOKENS": "7",
+            "QW3_KVMEM_RETRIEVABLE_VISUAL_HISTORY": "1",
+            "QW3_KVMEM_TRACE": "1",
+            "QW3_KVMEM_PREFIX_CACHE_TRACE": "1",
+            "QW3_KVMEM_DUMP_SCORES": "/home/chaidi/qw3/apps/computer_use/.runtime/same-turn-visual-probe-01/on/engine/retrieval.jsonl"
+          },
+          "gpu": "GPU-a57d360d-3852-802c-1a47-8f38577ce127, NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, 14 MiB",
+          "binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+          "source_commit": "981301b303a3a1f987967e20853e93839cd78d47",
+          "kvmem": "on",
+          "prefix_reuse": true,
+          "visual_history": "retrievable",
+          "launcher_sha256": "1cf8270ae5a45f7faf31cad2e2360cc07e09ef9e01011678e3f56dca91d0323c",
+          "pid": 1048172
+        },
+        "error": "FileNotFoundError(2, 'No such file or directory')"
+      },
+      {
+        "kvmem": "off",
+        "passed": true,
+        "cases": [
+          {
+            "name": "short_present",
+            "passed": true,
+            "started_at": 1790812468.5357442,
+            "status": "completed",
+            "http_status": 200,
+            "first_output_seconds": 1.6070855450816453,
+            "finish_reason": "stop",
+            "usage": {
+              "completion_tokens": 26,
+              "prompt_tokens": 4114,
+              "total_tokens": 4140
+            },
+            "text": "{\"reference\":\"QW3-WINDOWS-2026-ALPHA\",\"name\":\"Alice\",\"priority\":\"High\"}",
+            "tool_calls": [],
+            "elapsed_seconds": 1.825598459225148,
+            "process": {
+              "cpu_seconds": 24.57,
+              "rss_bytes": 30983008256,
+              "peak_rss_bytes": 34384867328
+            },
+            "cpu_seconds": 1.5599999999999987,
+            "answer": {
+              "reference": "QW3-WINDOWS-2026-ALPHA",
+              "name": "Alice",
+              "priority": "High"
+            }
+          },
+          {
+            "name": "long_present",
+            "passed": true,
+            "started_at": 1790812470.4028566,
+            "status": "completed",
+            "http_status": 200,
+            "first_output_seconds": 60.533534314949065,
+            "finish_reason": "stop",
+            "usage": {
+              "completion_tokens": 40,
+              "prompt_tokens": 162062,
+              "total_tokens": 162102
+            },
+            "text": "{\n  \"reference\": \"QW3-WINDOWS-2026-ALPHA\",\n  \"name\": \"Alice\",\n  \"priority\": \"High\"\n}",
+            "tool_calls": [],
+            "elapsed_seconds": 60.874510248657316,
+            "process": {
+              "cpu_seconds": 85.54,
+              "rss_bytes": 31003983872,
+              "peak_rss_bytes": 34384867328
+            },
+            "cpu_seconds": 60.970000000000006,
+            "answer": {
+              "reference": "QW3-WINDOWS-2026-ALPHA",
+              "name": "Alice",
+              "priority": "High"
+            }
+          },
+          {
+            "name": "long_absent",
+            "passed": true,
+            "started_at": 1790812531.3261607,
+            "status": "completed",
+            "http_status": 200,
+            "first_output_seconds": 60.57333356421441,
+            "finish_reason": "stop",
+            "usage": {
+              "completion_tokens": 23,
+              "prompt_tokens": 162062,
+              "total_tokens": 162085
+            },
+            "text": "{\n  \"reference\": null,\n  \"name\": null,\n  \"priority\": null\n}",
+            "tool_calls": [],
+            "elapsed_seconds": 60.74723919201642,
+            "process": {
+              "cpu_seconds": 146.38,
+              "rss_bytes": 31016923136,
+              "peak_rss_bytes": 34384867328
+            },
+            "cpu_seconds": 60.83999999999999,
+            "answer": {
+              "reference": null,
+              "name": null,
+              "priority": null
+            }
+          }
+        ],
+        "engine": {
+          "command": [
+            "/home/chaidi/qw3/build-dflash-integration/qw3",
+            "serve",
+            "--model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-Q8_0.gguf",
+            "--vision-model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-BF16",
+            "--vision-device",
+            "cuda",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "18080",
+            "--ctx",
+            "1048576",
+            "--kv-dtype",
+            "fp8",
+            "--speculative-method",
+            "dflash2",
+            "--prefill-chunk",
+            "2048",
+            "--dflash-model",
+            "/home/chaidi/qw3/models/Qwen3.8-27B-DFlash2-BF16"
+          ],
+          "qw3_env": {
+            "QW3_DFLASH_PRIVATE_MAX_DRAFT_TOKENS": "7",
+            "QW3_KVMEM_TRACE": "1",
+            "QW3_KVMEM_PREFIX_CACHE_TRACE": "1",
+            "QW3_KVMEM_DUMP_SCORES": "/home/chaidi/qw3/apps/computer_use/.runtime/same-turn-visual-probe-01/off/engine/retrieval.jsonl"
+          },
+          "gpu": "GPU-a57d360d-3852-802c-1a47-8f38577ce127, NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, 14 MiB",
+          "binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+          "source_commit": "981301b303a3a1f987967e20853e93839cd78d47",
+          "kvmem": "off",
+          "prefix_reuse": false,
+          "visual_history": "retrievable",
+          "launcher_sha256": "1cf8270ae5a45f7faf31cad2e2360cc07e09ef9e01011678e3f56dca91d0323c",
+          "pid": 1048902
+        },
+        "matched_long_tokens": true
+      }
+    ],
+    "live_desktop": false
+  },
+  "interpretation": {
+    "on_positive_answer_wrong": true,
+    "both_negative_answers_correct": true,
+    "on_negative_retrieval_qualified": false,
+    "on_retrieval_dump_missing": true,
+    "diagnostic_error": "The runner also raised FileNotFoundError when checking a retrieval dump that was never produced. This does not invalidate the recorded wrong positive answer.",
+    "finding": "Same-root-query growth with guided reselection disabled used pressure-prefill and suppressed semantic reselection. No final query-conditioned retrieval record was produced. A guided-refresh configuration still needs qualification."
+  },
+  "service_terminal": {
+    "unit": "qw3-computer-same-turn-visual-01.service",
+    "ActiveState": "failed",
+    "MainPID": 0,
+    "ExecMainStatus": 1
+  },
+  "cleanup": {
+    "gpu_compute_processes": [],
+    "model_and_app_listeners": [],
+    "verified_at": 1790812764.8772194
+  }
+}
