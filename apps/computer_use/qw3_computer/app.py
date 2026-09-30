@@ -18,12 +18,13 @@ from .desktop import Desktop, DesktopError, DesktopRejected, mcp_observation
 
 
 class Controller:
-    def __init__(self, runtime, desktop, backend, port, backend_token=None):
+    def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False):
         self.runtime = Path(runtime).resolve()
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.desktop = desktop
         self.backend = backend
         self.backend_token = backend_token
+        self.trace_backend = trace_backend
         self.port = port
         self.token = secrets.token_hex(32)
         token_file = self.runtime / "mcp-token.txt"
@@ -56,7 +57,8 @@ class Controller:
     async def start(self):
         await self.desktop.start()
         self.bridge = web.AppRunner(bridge_app(self.backend, trace_dir=self.runtime / "inference",
-                                              backend_token=self.backend_token), handler_cancellation=True)
+                                              backend_token=self.backend_token, trace_backend=self.trace_backend),
+                                    handler_cancellation=True)
         await self.bridge.setup()
         site = web.TCPSite(self.bridge, "127.0.0.1", 0)
         await site.start()
@@ -324,7 +326,8 @@ async def run(args):
     token = args.backend_token.read_text(encoding="utf-8-sig").strip() if args.backend_token else None
     if args.backend_token and not token:
         raise ValueError("Backend token file is empty")
-    controller = Controller(args.runtime, desktop, args.backend, args.port, backend_token=token)
+    controller = Controller(args.runtime, desktop, args.backend, args.port, backend_token=token,
+                            trace_backend=args.trace_backend)
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
         await runner.setup()
@@ -349,6 +352,7 @@ def main():
     parser.add_argument("--desktop", default="http://127.0.0.1:18082")
     parser.add_argument("--desktop-token", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--trace-backend", action="store_true", help="Tag QW3 requests for retrieval diagnostics")
     try:
         asyncio.run(run(parser.parse_args()))
     except KeyboardInterrupt:

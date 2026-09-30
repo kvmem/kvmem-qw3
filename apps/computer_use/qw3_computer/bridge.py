@@ -142,7 +142,9 @@ class ResponseStream:
 
 
 def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096, trace_dir=None,
-               backend_token=None):
+               backend_token=None, trace_backend=False):
+    if trace_backend and trace_dir is None:
+        raise ValueError("Backend trace tags require a local trace directory")
     app = web.Application(client_max_size=64 * 1024 * 1024)
     lock = asyncio.Lock()
 
@@ -167,13 +169,18 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
         async with lock:
             trace = None
             if trace_dir is not None:
-                trace = Path(trace_dir) / uuid.uuid4().hex
+                request_id = uuid.uuid4().hex
+                trace = Path(trace_dir) / request_id
+                if trace_backend:
+                    converted.body["kvmem_trace_tag"] = request_id
                 trace.mkdir(parents=True)
                 # Keep exact local inputs for paired on/off replay. This opt-in
                 # trace belongs to the application runtime, never source control.
                 (trace / "request.json").write_text(json.dumps(converted.body, ensure_ascii=False))
             started = time.monotonic()
             metrics = {"started_at": time.time(), "status": "in_progress"}
+            if trace_backend:
+                metrics["backend_trace_tag"] = converted.body["kvmem_trace_tag"]
             output = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                                  "Cache-Control": "no-cache"})
             stream = ResponseStream(output, public_model, converted.names)
@@ -234,12 +241,17 @@ def main():
     parser.add_argument("--backend", default="http://127.0.0.1:18080/v1")
     parser.add_argument("--backend-model", default="qw3")
     parser.add_argument("--backend-token", type=Path, help="Optional token file for the private VM model relay")
+    parser.add_argument("--trace-dir", type=Path, help="Retain exact local inference requests and metrics")
+    parser.add_argument("--trace-backend", action="store_true", help="Send request tags for QW3 retrieval diagnostics")
     args = parser.parse_args()
+    if args.trace_backend and args.trace_dir is None:
+        parser.error("--trace-backend requires --trace-dir")
     token = args.backend_token.read_text(encoding="utf-8-sig").strip() if args.backend_token else None
     if args.backend_token and not token:
         parser.error("backend token file is empty")
     logging.basicConfig(level=logging.INFO)
-    web.run_app(create_app(args.backend, args.backend_model, backend_token=token), host="127.0.0.1",
+    web.run_app(create_app(args.backend, args.backend_model, backend_token=token,
+                           trace_dir=args.trace_dir, trace_backend=args.trace_backend), host="127.0.0.1",
                 port=args.port, handler_cancellation=True)
 
 

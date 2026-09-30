@@ -89,6 +89,100 @@ struct KvPageTableTestAccess {
         unsetenv("QW3_KVMEM_ADAPTIVE_BLOCK_STATS_MIB");
         std::cout << (fp16 ? "FP16/GEMM" : "FP32/scalar") << " Q tiling: all 521 rows, masked holes, unequal final tile and layer stride passed\n";
     }
+    static void legacy_tail(const QwenNativeModel &model, const QwenWeights &weights,
+                            DeviceBackend &backend, bool fp8, uint32_t ns, bool cpu_index) {
+        constexpr uint32_t P = 4, B = 32, C = 64, D = 4, L = 2, Seed = 13;
+        QwenExecutor e(model, weights, backend, P * B);
+        KvMemStoreConfig cfg; cfg.block_tokens = B; cfg.n_subblocks = ns;
+        cfg.index_placement = cpu_index ? KvMemIndexPlacement::CPU : KvMemIndexPlacement::GPU;
+        cfg.index_staging_bytes = 2 * ns * D * L * (fp8 ? 2 : 4);
+        e.block_store_ = std::make_unique<KvMemStore>(cfg);
+        check(!e.block_store_->has_repository(), "tail probe must use legacy contiguous history");
+        e.kvmem_enabled_ = true;
+        e.kvmem_raw_k_block_major_ = true;
+        e.kvmem_raw_k_row_bytes_ = D * (fp8 ? 1 : 4);
+        e.kvmem_raw_layers_ = {0,1}; e.kvmem_raw_k_chunk_tokens_ = C;
+        e.kvmem_raw_k_chunk_bytes_ = C * L * e.kvmem_raw_k_row_bytes_;
+        e.kvmem_raw_k_valid_tokens_.assign(P * B, 1);
+        e.kvmem_raw_k_chunks_.resize(2); e.kvmem_raw_k_dirty_.resize(2);
+        for (auto &chunk : e.kvmem_raw_k_chunks_)
+            chunk = std::make_unique<uint8_t[]>(e.kvmem_raw_k_chunk_bytes_);
+        e.kvmem_qc_num_layers_ = L; e.kvmem_qc_n_subblocks_ = ns;
+        e.kvmem_qc_layer_stride_blocks_ = P; e.kvmem_qc_total_blocks_ = 1;
+        e.kvmem_qc_prompt_tokens_ = Seed; e.kvmem_qc_capture_active_ = true;
+        if (cpu_index) e.kvmem_prepare_cpu_mean_index(P * ns * L * D, L, P, false);
+        else e.g_kbar_multi_ = e.kvmem_alloc_mean_index_tensor(P * ns * L * D, "legacy_tail_index");
+        const auto value = [](uint32_t row, uint32_t layer, uint32_t col) {
+            return float(1u << ((row + 2 * layer + col) % 4));
+        };
+        auto seed = backend.tensor_f32(Seed * D, "tail_prefill_seed");
+        for (uint32_t layer = 0; layer < L; ++layer) {
+            std::vector<uint8_t> bytes(P * B * e.kvmem_raw_k_row_bytes_);
+            std::vector<float> prefix(Seed * D);
+            for (uint32_t row = 0; row < P * B; ++row) for (uint32_t col = 0; col < D; ++col) {
+                const auto exponent = (row + 2 * layer + col) % 4;
+                if (fp8) bytes[row * D + col] = uint8_t(0x38 + exponent * 8);
+                else { const float v = value(row, layer, col); std::memcpy(bytes.data() + (row * D + col) * 4, &v, 4); }
+                if (row < Seed) prefix[row * D + col] = value(row, layer, col);
+            }
+            e.kvmem_write_raw_k(layer, 0, bytes.data(), P * B, false);
+            ok(backend.copy_bytes_from_host(*seed, 0, prefix.data(), prefix.size() * sizeof(float)));
+            // Exercise the real prefill capture path first; the later calls
+            // must merge generated raw K into these partial sub-block means.
+            e.kvmem_index_rebuild_source_ = seed.get();
+            e.kvmem_capture_kbar_multi(layer, Seed, 0, 0, D);
+        }
+        e.kvmem_index_rebuild_source_ = nullptr;
+        check(e.kvmem_content_index_covers(Seed), "prefill seed index was not published");
+        auto packed = e.kvmem_alloc_mean_index_tensor(ns * D, "tail_probe_read");
+        auto widened = backend.tensor_f32(ns * D, "tail_probe_read_f32");
+        const auto compare = [&](uint32_t end) {
+            for (uint32_t layer = 0; layer < L; ++layer) for (uint32_t block = 0; block * B < end; ++block) {
+                const uint64_t offset = uint64_t(block) * ns * D * packed->elem_size;
+                if (cpu_index) {
+                    ok(backend.copy_bytes_from_host(*packed, 0,
+                        e.kvmem_mean_index_host_layer_data(layer) + offset, ns * D * packed->elem_size));
+                } else {
+                    ok(backend.copy_d2d(*packed, *e.g_kbar_multi_,
+                        (uint64_t(layer) * P + block) * ns * D, ns * D));
+                }
+                ok(backend.widen_raw_k_to_f32_device(*packed, *widened, ns, D));
+                std::vector<float> actual(ns * D);
+                ok(backend.copy_to_host(*widened, actual.data(), 0, actual.size()));
+                for (uint32_t sub = 0; sub < ns; ++sub) for (uint32_t col = 0; col < D; ++col) {
+                    const uint32_t lo = block * B + sub * (B / ns);
+                    const uint32_t hi = std::min(end, lo + B / ns);
+                    double expected = 0;
+                    for (uint32_t row = lo; row < hi; ++row) expected += value(row, layer, col);
+                    if (hi > lo) expected /= hi - lo;
+                    if (!std::isfinite(actual[sub * D + col]) ||
+                        std::abs(actual[sub * D + col] - expected) >= (fp8 ? 0.005 : 1e-5)) {
+                        throw std::runtime_error("raw-K decode tail mean mismatch: end=" +
+                            std::to_string(end) + " layer=" + std::to_string(layer) +
+                            " block=" + std::to_string(block) + " sub=" + std::to_string(sub) +
+                            " col=" + std::to_string(col) + " actual=" + std::to_string(actual[sub * D + col]) +
+                            " expected=" + std::to_string(expected));
+                    }
+                }
+            }
+        };
+        compare(Seed);
+        e.kvmem_raw_k_valid_tokens_[20] = 0;
+        check(!e.kvmem_finalize_content_index_from_raw_k(29), "missing raw row was accepted");
+        check(e.kvmem_qc_captured_tokens_ == Seed, "failed extension changed the published cursor");
+        compare(Seed);
+        e.kvmem_raw_k_valid_tokens_[20] = 1;
+        for (uint32_t end : {29u, 37u, 64u, 70u}) {
+            check(e.kvmem_finalize_content_index_from_raw_k(end), "legacy raw-K decode tail finalization failed");
+            check(e.kvmem_content_index_covers(end) && e.kvmem_content_index_resume_compatible(end),
+                  "complete decode tail is not available for warm checkpoint admission");
+            compare(end);
+        }
+        std::cout << "legacy tail raw=" << (fp8 ? "FP8" : "FP32") << " ns=" << ns
+                  << " index=" << (cpu_index ? "CPU" : "GPU")
+                  << ": missing-row refusal and four unaligned extensions matched full-prefix means\n";
+    }
+
     static void run(const QwenNativeModel &model, const QwenWeights &weights, DeviceBackend &backend, bool fp8, uint32_t ns) {
         constexpr uint32_t P = 4, B = 32, C = 64, D = 4, L = 2;
         QwenExecutor e(model, weights, backend, P * B);
@@ -244,6 +338,8 @@ int main() {
                 setenv("QW3_KV_DTYPE", fp8 ? "fp8" : "fp32", 1);
                 for (uint32_t ns : {1u, 4u}) KvPageTableTestAccess::run(model, weights, *backend, fp8, ns);
                 KvPageTableTestAccess::query_tiles(model, weights, *backend, fp8);
+                for (uint32_t ns : {1u, 4u}) for (bool cpu_index : {false, true})
+                    KvPageTableTestAccess::legacy_tail(model, weights, *backend, fp8, ns, cpu_index);
             }
         }
         ok(backend->end()); std::filesystem::remove_all(dir);

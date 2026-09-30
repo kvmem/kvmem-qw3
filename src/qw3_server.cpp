@@ -4187,12 +4187,23 @@ int run_server(EngineOptions engine, ServerConfig cfg) {
                 const size_t final_query =
                     last_query_index_for_template(
                         req["messages"], harness.kind);
+                // A single user task can accumulate many tool observations.
+                // The scoring query stays pinned at the user intent, while
+                // historical evidence extends up to the current live suffix.
+                // Do not drop those same-turn tool/image messages merely
+                // because they follow the last user message.
+                const size_t history_end_message =
+                    harness_semantic_plan &&
+                        harness_semantic_plan->live_suffix_message_begin_index
+                    ? *harness_semantic_plan->live_suffix_message_begin_index
+                    : final_query;
                 requested.reserve(rendered_message_spans.size());
                 for (const RenderedMessageSpan &span :
                      rendered_message_spans) {
                     // The final user query is pinned/replayed independently and
                     // must not become a historical retrieval candidate.
-                    if (span.message_index >= final_query ||
+                    if (span.message_index >= history_end_message ||
+                        span.message_index == final_query ||
                         span.segment_end <= span.segment_begin) {
                         continue;
                     }

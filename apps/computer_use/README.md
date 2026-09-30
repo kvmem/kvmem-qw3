@@ -214,13 +214,14 @@ inspect `summary.json` rather than treating process exit as task success.
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_suite.py \
-  --snapshot qw3-scroll-20261001 --kvmem on off --repetitions 3 \
+  --snapshot qw3-type-20261001 --kvmem on off --repetitions 3 \
   --run-dir apps/computer_use/.runtime/windows-suite-new
 ```
 
-The Windows guest currently runs the executor; the UI, Codex and GPU model run
-on Linux. A packaged native Windows/Mac application and physical-desktop tests
-are separate qualification steps. The dedicated VM test account is elevated;
+In `windows_suite.py`, the Windows guest runs the executor while the UI, Codex
+and GPU model run on Linux. `windows_native_suite.py` runs the client and Codex
+inside Windows; bundle 04 passed its 18 repeated core tasks. Updated bundles,
+macOS and physical desktops require their own qualification. The dedicated VM test account is elevated;
 this prototype is not qualified as a general-purpose desktop permission sandbox.
 
 The second full on/off snapshot suite retained 17 successes and one off-mode

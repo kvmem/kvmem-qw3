@@ -1,0 +1,200 @@
+{
+  "kind": "retained_live_history_continuation_diagnostic",
+  "passed": true,
+  "source": "apps/computer_use/.runtime/same-turn-continuation-01",
+  "tool_actions_dispatched": false,
+  "binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+  "scope": "Four retained requests, one below and three consecutively above budget. No final old-image answer or live desktop success is claimed.",
+  "stages": [
+    {
+      "trace_tag": "same-turn-continuation-01-00",
+      "source_request": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-02/app/inference/b4f37c83fe544b1eb008a4ec6e94dc98/request.json",
+      "source_sha256": "eb504ff03df167b57cc81fede98a184562efa09ce0b01c15f695c60e59ba4622",
+      "status": "completed",
+      "elapsed_seconds": 52.73719634488225,
+      "expected_groups": 77,
+      "actual_groups": [
+        77
+      ],
+      "usage": {
+        "completion_tokens": 169,
+        "prompt_tokens": 130005,
+        "total_tokens": 130174
+      },
+      "reused_tokens": 0,
+      "prefilled_tokens": null
+    },
+    {
+      "trace_tag": "same-turn-continuation-01-01",
+      "source_request": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-02/app/inference/41a9302bdcb64313b304a1db7e0824b9/request.json",
+      "source_sha256": "791d419246ff472b93e9b5da6b27e9e3f4ad4b4beeaa130df17598a5635640dd",
+      "status": "completed",
+      "elapsed_seconds": 8.177287263330072,
+      "expected_groups": 79,
+      "actual_groups": [
+        79
+      ],
+      "usage": {
+        "completion_tokens": 176,
+        "prompt_tokens": 133278,
+        "total_tokens": 133454
+      },
+      "reused_tokens": 130174,
+      "prefilled_tokens": 3104,
+      "retrieval": {
+        "type": "meta",
+        "schema_version": "qw3_kvmem_retrieval_dump.v2",
+        "seq": 0,
+        "trace_tag": "same-turn-continuation-01-01",
+        "block_count": 1042,
+        "selected": 1019,
+        "query_begin": 2421,
+        "query_end": 4091,
+        "context_begin": 0,
+        "context_end": 0,
+        "prompt_tokens": 133278,
+        "budget_blocks": 1024,
+        "prefill_budget_blocks": 1024,
+        "recent": 82,
+        "sink": 11,
+        "block_tokens": 128,
+        "method": "mean-k",
+        "mask": -1,
+        "scorer_requested": "sub-block-mean-k-max",
+        "scorer_used": "sub-block-mean-k-max",
+        "scorer_fallback_reason": "none",
+        "query_expected": 1670,
+        "query_captured": 1670,
+        "qc_total_blocks": 1042,
+        "qc_captured_blocks": 1042,
+        "trace_event": 0,
+        "trace_events": 0,
+        "index_ready": 1,
+        "query_ready": 1,
+        "immutable_source_k": 1
+      }
+    },
+    {
+      "trace_tag": "same-turn-continuation-01-02",
+      "source_request": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-02/app/inference/a9fc51ad1dda443fbf87fed90683971b/request.json",
+      "source_sha256": "0e877b40779820dde63b90861e7cca0786e4058c3abe7a7de8af5cfc2ddf39e8",
+      "status": "completed",
+      "elapsed_seconds": 8.26361192110926,
+      "expected_groups": 81,
+      "actual_groups": [
+        81
+      ],
+      "usage": {
+        "completion_tokens": 170,
+        "prompt_tokens": 136554,
+        "total_tokens": 136724
+      },
+      "reused_tokens": 133454,
+      "prefilled_tokens": 3100,
+      "retrieval": {
+        "type": "meta",
+        "schema_version": "qw3_kvmem_retrieval_dump.v2",
+        "seq": 1,
+        "trace_tag": "same-turn-continuation-01-02",
+        "block_count": 1068,
+        "selected": 1022,
+        "query_begin": 2421,
+        "query_end": 4091,
+        "context_begin": 0,
+        "context_end": 0,
+        "prompt_tokens": 136554,
+        "budget_blocks": 1024,
+        "prefill_budget_blocks": 1024,
+        "recent": 82,
+        "sink": 11,
+        "block_tokens": 128,
+        "method": "mean-k",
+        "mask": -1,
+        "scorer_requested": "sub-block-mean-k-max",
+        "scorer_used": "sub-block-mean-k-max",
+        "scorer_fallback_reason": "none",
+        "query_expected": 1670,
+        "query_captured": 1670,
+        "qc_total_blocks": 1067,
+        "qc_captured_blocks": 1067,
+        "trace_event": 0,
+        "trace_events": 0,
+        "index_ready": 1,
+        "query_ready": 1,
+        "immutable_source_k": 1
+      }
+    },
+    {
+      "trace_tag": "same-turn-continuation-01-03",
+      "source_request": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-02/app/inference/105a83a9880e4b51985e255d490a9950/request.json",
+      "source_sha256": "182687cab543b2b55708d2d3cc6c81e48c03458d8076794c54b013719a1e509f",
+      "status": "completed",
+      "elapsed_seconds": 8.503232837188989,
+      "expected_groups": 83,
+      "actual_groups": [
+        83
+      ],
+      "usage": {
+        "completion_tokens": 175,
+        "prompt_tokens": 139827,
+        "total_tokens": 140002
+      },
+      "reused_tokens": 136724,
+      "prefilled_tokens": 3103,
+      "retrieval": {
+        "type": "meta",
+        "schema_version": "qw3_kvmem_retrieval_dump.v2",
+        "seq": 2,
+        "trace_tag": "same-turn-continuation-01-03",
+        "block_count": 1093,
+        "selected": 1023,
+        "query_begin": 2421,
+        "query_end": 4091,
+        "context_begin": 0,
+        "context_end": 0,
+        "prompt_tokens": 139827,
+        "budget_blocks": 1024,
+        "prefill_budget_blocks": 1024,
+        "recent": 82,
+        "sink": 11,
+        "block_tokens": 128,
+        "method": "mean-k",
+        "mask": -1,
+        "scorer_requested": "sub-block-mean-k-max",
+        "scorer_used": "sub-block-mean-k-max",
+        "scorer_fallback_reason": "none",
+        "query_expected": 1670,
+        "query_captured": 1670,
+        "qc_total_blocks": 1093,
+        "qc_captured_blocks": 1093,
+        "trace_event": 0,
+        "trace_events": 0,
+        "index_ready": 1,
+        "query_ready": 1,
+        "immutable_source_k": 1
+      }
+    }
+  ],
+  "checked_at": 1790809571.1129727,
+  "source_sha256": {
+    "src/qwen_executor.cpp": "29e4759210a051e361af7567456f383e90e653345349aef48c91d86eab0d5e87",
+    "src/kernels_cuda.cu": "b9421bd43db38754b29136a29a86ab22557b0e97065219d7ce461e6d27987e94",
+    "src/qw3_server.cpp": "d1c8ac80ea5236a0ecb18656704c422968cf3db8937366d21808fbbcd814437b",
+    "tests/kvmem_repository_index_test.cpp": "c2e8e55e35fc26289f48627a6f6f822a08672c7ea2b9ad3d6621a567759dcf53",
+    "tests/kvmem_kmean_merge.cu": "f238ffb14bb948d37de0e5f6c34ebeab4bbb58085f085047d1d712bd605ceb35",
+    "apps/computer_use/qw3_computer/bridge.py": "76d2dfa66070bdd59b952eb1c10375db6f4631e63120312bf135e8237b5aa75a",
+    "apps/computer_use/qw3_computer/app.py": "c57d9de6f6dfcff9974011f27e06317642387351bbc54c1b8370e33fe78b9ad1",
+    "apps/computer_use/tests/test_bridge.py": "50c7c15d85ef8b444039dca1643dccdb27e0727beada47bb484b80a3b24e7062",
+    "apps/computer_use/tests/test_long_evidence.py": "ac9a320a301c65936b364fbe8d5188791f2c72cf23cc3514d593d3ad219f94bd",
+    "apps/computer_use/windows_long_task.py": "84aa4a8c0484ca0811cb2ad25c8ce187db94018e912d12e69a59877c623c564d",
+    "apps/computer_use/windows_long_suite.py": "695f362236cf291fba239323b747e4eaf0e4f675382e4ca49ebf9a4b8fa8ee22",
+    "apps/computer_use/pack_windows_client.py": "1afb925888ec59584ff5ab7046597275deec32e49fa9c05e546473f059cd2f18"
+  },
+  "regressions": {
+    "cuda_tests": 2,
+    "cpu_ctests": 44,
+    "application_tests_with_actual_codex": 34,
+    "all_passed": true,
+    "details": "apps/computer_use/.runtime/sparse-reuse-candidate/repair-validation.json"
+  }
+}

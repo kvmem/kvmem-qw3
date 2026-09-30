@@ -12598,8 +12598,8 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
     }
     if (!kvmem_enabled_ || !block_store_ || !kvmem_qc_capture_active_ ||
         !kvmem_mean_index_available() || kvmem_qc_pertoken_ ||
-        kvmem_qc_deltanet_ || kvmem_qc_n_subblocks_ != 1 ||
-        kvmem_adaptive_prototypes() ||
+        kvmem_qc_deltanet_ || kvmem_qc_n_subblocks_ == 0 ||
+        block_store_->config().prototype_mode != KvMemPrototypeMode::Contiguous ||
         kvmem_qc_layer_stride_blocks_ == 0) {
         return unavailable("unsupported-state");
     }
@@ -12610,6 +12610,9 @@ bool QwenExecutor::kvmem_finalize_content_index_from_raw_k(
         return unavailable("stride-capacity");
     }
 
+    // Contiguous sub-block means use the same exact partial-mean merge as
+    // prefill. Direction-based prototypes have different merge semantics and
+    // remain excluded above. Keep raw-row coverage and layer checks intact.
     // Accepted MTP rows reach the same immutable raw-K authority as ordinary
     // decode, but not the per-token plain-decode index hook.  Publish pending
     // D2H before reading that authority, then merge only the uncaptured suffix.

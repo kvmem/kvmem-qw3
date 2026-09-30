@@ -104,7 +104,7 @@ async def run(args):
             await ready("http://127.0.0.1:18080/health", engine)
             with (output / "app-launch.log").open("wb") as log:
                 app = await asyncio.create_subprocess_exec(sys.executable, "-m", "qw3_computer.app",
-                    "--runtime", output / "app", "--desktop-token", token_file,
+                    "--runtime", output / "app", "--desktop-token", token_file, "--trace-backend",
                     cwd=root, env=env, stdout=log, stderr=log)
             await ready("http://127.0.0.1:18083/api/state", app, app_ready=True)
             summary["passed"] = await run_task(SimpleNamespace(

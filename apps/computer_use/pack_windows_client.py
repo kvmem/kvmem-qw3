@@ -60,6 +60,7 @@ def main():
     (app / "vm").mkdir()
     shutil.copyfile(root / "vm/model_relay.py", app / "vm/model_relay.py")
     shutil.copyfile(root / "windows_task.py", app / "windows_task.py")
+    shutil.copyfile(root / "windows_long_task.py", app / "windows_long_task.py")
     (output / "start.ps1").write_text('''param(
     [string]$Backend = 'http://127.0.0.1:18080/v1',
     [string]$BackendToken = '',

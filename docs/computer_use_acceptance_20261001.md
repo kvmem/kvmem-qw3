@@ -15,7 +15,7 @@ partial count is a time-stamped observation, not its final result.
 | --- | --- | --- |
 | Preserve the pre-existing implementation | Git checkpoint `d968ebc`; later application commits through `53cd0bf` | Existing DFlash/KVMem/tokenizer work committed. Model files and private/bulk artifacts excluded. |
 | CPU build and baseline checks | `cpu-baseline-recheck-01/{result.json,ctest.xml,check-0.log,check-1.log}` | Release CPU build from M0 rechecked: 44 CTests and 2 benchmark-helper tests passed. C++/original helper sources unchanged from checkpoint. Prior logs retained before replacing CTest's last-run log. |
-| Codex Responses subset, image/tool transport and lifecycle contracts | Native client bundle 04 manifest; `windows-native-suite-02/on-notepad-0/native-client-tests*` | 31 native Windows tests passed with actual pinned Codex. All 19 bundled source files match the checkout; this is subset compatibility, not the full Responses API. |
+| Codex Responses subset, image/tool transport and lifecycle contracts | Native client bundle 04 manifest; `windows-native-suite-02/on-notepad-0/native-client-tests*` | 31 native Windows tests passed with actual pinned Codex. Its 19 bundled source files match the frozen baseline; modified clients need fresh qualification. This is subset compatibility, not the full Responses API. |
 | Actual local model/image/MCP loop | `codex-gpu-smoke-02`, `dflash-smoke-04`; native pilot/task artifacts | Actual QW3 vision and DFlash exercised, rather than fixture-only model responses. [Provider report](computer_use_codex_m1_20261001.md). |
 | Screenshots, bounded actions, stale observations and no-progress handling | Native contracts; `windows-scroll-contract-03`; `windows-recovery-03/result.json` | Real Windows scroll/failure/recovery evidence plus contract coverage. The old executor recovery evidence does not qualify the newly introduced clipboard critical section. |
 | Literal text and correct saved files | `windows-typing-paste-04/result.json`, `windows-clipboard-01/check-final.json` | Final executor: four Notepad inputs plus one Edge Unicode/4096-character form passed; five clipboard fixture formats restored. Existing failed approaches retained. |
@@ -26,7 +26,7 @@ partial count is a time-stamped observation, not its final result.
 | Growing history and Codex retention | `long-history-probe-01`; `codex-long-01/history-check.json` and raw inference/events | Growing fixture history and actual Codex preservation of eight images/4,800 notes demonstrated. This does not substitute for the live desktop archive task. |
 | Resource and speculation accounting | [Long matrix](computer_use_long_matrix_20261001.csv), [memory diagnostic](computer_use_memory_diagnostic_20261001.csv), scoped raw reports | DFlash accepted/drafted/fallback counters, TTFT, task/action and process/device measurements retained. Allocation traces passed on both policies but explicitly exclude some allocation classes; not a complete census. |
 | Three repetitions of each native Windows core task, both policies | `windows-native-suite-02/summary.json`; frozen `qw3-type-20261001` | Completed 18/18 with a passing independent evidence audit. Same source/model/binary/snapshot identities across both policies; per-trial CSV retained. This qualifies the frozen clipboard-preserving executor, not the undeployed recovery candidate. |
-| Actual long desktop task across retrieval threshold, both policies | `type-native-long-queue-01.json`; `windows_long_suite.py` / `windows_long_task.py` | Native gate passed; KVMem-on live archive is now running. No archive acceptance result yet. Both policies retain the same 900-second deadline; a first-policy failure must still be followed by the paired policy. |
+| Actual long desktop task across retrieval threshold, both policies | [Paired baseline audit](computer_use_windows_long_pair_02_20261001.json); `windows-long-{on,off}-02` | Both timed out at the same 900-second deadline: on 900.61s, page 21/36; off 901.72s, page 18/36. No archive file was verified. Frozen app, engine and snapshot identities match. Index/history repairs and new live qualification remain open. |
 | macOS executor/client and physical targets | [Mac access preparation](computer_use_mac_test_access_20261001.md) | Still open. Readiness helper prepared; only syntax/help/non-Mac refusal verified. No Mac or physical Windows desktop acceptance has run. |
 
 ## Comparison interpretation
@@ -40,10 +40,10 @@ repetition per positive/negative case; it does not establish a reliability rate.
 
 An isolated input candidate now replaces the focused native edit selection
 without temporary clipboard ownership. It remains outside the deployed source:
-no Windows runtime checks have been performed on it. The running matrix still
+no Windows runtime checks have been performed on it. The completed matrix
 qualifies the frozen executor hash below, and the clipboard interruption gate
 remains open. A native selection/undo/read-only/NUL probe is prepared alongside
-the candidate for execution after the queue becomes terminal.
+the candidate; the original paired queue is now terminal.
 
 ## Frozen Windows qualification identity
 
@@ -70,3 +70,25 @@ repaired, and the macOS/accessible physical-desktop requirements are satisfied.
 Earlier failures remain failures even when their repaired pilot passes.
 Missing hardware is recorded as missing evidence, never a successful test.
 Reproduction commands live in the [application README](../apps/computer_use/README.md).
+
+
+## Long-history repair validation
+
+The original four-subblock generated-tail failure was reproduced against the
+original library. The revised tail finalizer retains raw-row and shape checks,
+and the CUDA capture kernels clear unused tail subblocks in recycled storage.
+The rebuilt CPU suite passes all 44 CTests. Both CUDA index/merge tests pass,
+covering CPU/GPU indices, FP32/FP8 raw keys,
+partial extension, missing-row refusal and typed mean output. The application
+now passes 34 Linux contracts with actual Codex enabled. Native bundle 04
+remains evidence for its frozen source, not this modified client.
+
+The [retained-request continuation audit](computer_use_continuation_repair_20261001.json)
+replays one 130,005-token request followed by 133,278, 136,554 and 139,827 tokens.
+All four completed. The three above-budget requests reused 130,174, 133,454 and
+136,724 tokens, respectively, and completed in 8.18, 8.26 and 8.50 seconds.
+Their own tagged retrieval records report ready query/index state, no fallback
+and 1,019/1,042, 1,022/1,068 and 1,023/1,093 selected/total blocks. Historical
+message groups match the expected 77/79/81/83, including older same-turn tools.
+This diagnoses continuation and mapping; no desktop actions were dispatched,
+and it does not establish final old-image answer quality or live task success.

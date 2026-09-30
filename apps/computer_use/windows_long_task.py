@@ -79,10 +79,29 @@ def inspect_history(runtime):
                     if part.get("type") == "image_url":
                         historical_images.add(hashlib.sha256(part["image_url"]["url"].encode()).hexdigest())
     assert len(historical_images) > 1 and historical_images.issubset(set(images)), "Earlier observation images were discarded"
+    metrics = json.loads((directory / "metrics.json").read_text())
+    assert body.get("kvmem_trace_tag") and body["kvmem_trace_tag"] == metrics.get("backend_trace_tag"), \
+        "Request and metrics do not have the same backend trace tag"
     return {"request_directory": str(directory), "prompt_tokens": usage["prompt_tokens"],
+            "backend_trace_tag": body.get("kvmem_trace_tag"),
             "image_count": len(images), "unique_image_url_hashes": len(set(images)),
             "all_prior_images_preserved": True, "unique_prior_images": len(historical_images),
             "reference_absent_from_prior_text": True}
+
+
+def inspect_retrieval(path, history):
+    """Require the final answer's own retrieval record, never a same-length neighbor."""
+    tag = history["backend_trace_tag"]
+    assert tag, "Missing request-scoped backend trace tag"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    candidates = [row for row in rows if row.get("type") == "meta"
+                  and row.get("trace_tag") == tag and row.get("mask") == -1
+                  and row["prompt_tokens"] == history["prompt_tokens"]]
+    assert candidates, "Missing retrieval evidence for the reference-generating request"
+    meta = candidates[-1]
+    assert meta["selected"] < meta["block_count"]
+    assert meta["scorer_fallback_reason"] == "none" and meta["query_ready"] and meta["index_ready"]
+    return meta
 
 
 async def run(args):
@@ -139,14 +158,7 @@ async def run(args):
                     result["completed_actions"] = len(actions)
                     result["history"] = inspect_history(args.app_runtime)
                     if engine["kvmem"] == "on":
-                        rows = [json.loads(line) for line in (args.engine_dir / "retrieval.jsonl").read_text().splitlines()]
-                        candidates = [r for r in rows if r.get("type") == "meta"
-                                      and r["prompt_tokens"] == result["history"]["prompt_tokens"]]
-                        assert candidates, "Missing retrieval evidence for the reference-generating request"
-                        meta = candidates[-1]
-                        assert meta["selected"] < meta["block_count"]
-                        assert meta["scorer_fallback_reason"] == "none" and meta["query_ready"] and meta["index_ready"]
-                        result["retrieval"] = meta
+                        result["retrieval"] = inspect_retrieval(args.engine_dir / "retrieval.jsonl", result["history"])
                     result["passed"] = True
                     break
                 await asyncio.sleep(1)

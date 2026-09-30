@@ -8111,7 +8111,14 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     const uint32_t sub_tokens = (blk_tokens + n_subblocks - 1) / n_subblocks;
     const uint32_t blk_lo = j * blk_tokens;
     const uint32_t r_lo = blk_lo + sb * sub_tokens;
-    if (r_lo >= batch) return;
+    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
+    const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
+    if (r_lo >= batch) {
+        // Capture overwrites the whole destination block, including unused
+        // subblocks in a partial tail. Staging may contain an older block.
+        kbar[out] = static_cast<KbarT>(0.0f);
+        return;
+    }
     uint32_t r_hi = r_lo + sub_tokens;
     const uint32_t blk_hi = blk_lo + blk_tokens;
     if (r_hi > blk_hi) r_hi = blk_hi;   // last sub-block stops at the block end
@@ -8145,9 +8152,7 @@ __global__ void block_kmean_content_batch_kernel(const float *k_batch,
     }
     const uint32_t n = r_hi - r_lo;
     const float inv = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
-    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
-    kbar[(blk * gridDim.y + h) * head_dim + d] =
-        static_cast<KbarT>(acc * inv);
+    kbar[out] = static_cast<KbarT>(acc * inv);
 }
 
 // Fixed-4 Key-direction prototype capture. Unlike equal-width sub-blocks, the
@@ -8685,7 +8690,14 @@ __global__ void block_kmean_content_batch_merge_kernel(
     const uint32_t incoming_hi = incoming_lo + batch;
     const uint32_t overlap_lo = max(sb_lo, incoming_lo);
     const uint32_t overlap_hi = min(sb_hi, incoming_hi);
-    if (overlap_lo >= overlap_hi) return;
+    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
+    const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
+    if (overlap_lo >= overlap_hi) {
+        // Keep already captured prefix subblocks; clear only rows beyond the
+        // new tail, which may otherwise retain an unrelated staged mean.
+        if (sb_lo >= incoming_hi) kbar[out] = static_cast<KbarT>(0.0f);
+        return;
+    }
 
     // Only the first destination block can contain an existing prefix. This
     // generic intersection naturally yields zero for later blocks/sub-blocks.
@@ -8723,8 +8735,6 @@ __global__ void block_kmean_content_batch_merge_kernel(
         acc += deroped;
     }
     const uint32_t added = r_hi - r_lo;
-    const uint64_t blk = (kbar_block_base + j) * n_subblocks + sb;
-    const uint64_t out = (blk * gridDim.y + h) * head_dim + d;
     const float prior_sum = prior > 0
         ? static_cast<float>(kbar[out]) * static_cast<float>(prior) : 0.0f;
     kbar[out] = static_cast<KbarT>(

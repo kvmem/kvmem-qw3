@@ -346,3 +346,21 @@ KVMem-on archive task; no long-desktop completion is claimed yet. The temporary
 clipboard ownership crash case remains open. Its isolated replacement and
 recovery probes are prepared, with only syntax/help/live-queue refusal checked;
 no candidate Windows actions have run. The goal remains active.
+
+
+Paired live archive baseline (2026-10-01): both original 900-second trials are
+terminal failures. KVMem on stopped after 900.61s with 44 completed and four
+stale-observation rejections; the last retained screen is page 21/36. Off
+stopped after 901.72s with 40 completed actions and no rejections; its last
+screen is page 18/36. Neither produced a verified archive file. Both desktops
+ended paused, with no unresolved action receipts. The paired audit is
+`computer_use_windows_long_pair_02_20261001.json`; its source, binary and
+snapshot identities match. Different live trajectories preclude interpreting
+these timeout durations as a controlled retrieval-only speed comparison.
+
+The on-policy logs exposed unsupported sub-block generated-tail finalization
+and automatic message groups that omitted same-turn historical tool images.
+The original CUDA index probe reproduced the former; repair qualification is
+in progress. New request tags connect each final answer to its own retrieval
+record. Baseline failures and the original engine binary remain retained; no
+new live archive acceptance is claimed.

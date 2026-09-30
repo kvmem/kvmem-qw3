@@ -27,11 +27,13 @@ async def chunk(response, delta=None, finish=None):
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.backend_bodies = []
         self.mode = "text"
         self.entered = asyncio.Event()
         self.cancelled = asyncio.Event()
 
         async def backend(request):
+            self.backend_bodies.append(await request.json())
             self.backend_authorization = request.headers.get("Authorization")
             self.entered.set()
             if self.mode == "http_error":
@@ -81,6 +83,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(last["type"], "response.completed")
         self.assertEqual(last["response"]["output"][0]["content"][0]["text"], "你好")
         self.assertEqual(last["response"]["usage"]["total_tokens"], 12)
+        self.assertNotIn("kvmem_trace_tag", self.backend_bodies[-1])
 
     async def test_complete_tool_is_released_once(self):
         self.mode = "tool"
@@ -89,6 +92,36 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["call_id"], "call_one")
         self.assertEqual(done[0]["arguments"], "{}")
+
+    async def test_backend_trace_tags_match_retained_requests_and_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, url = await serve(create_app(self.backend_url + "/v1", trace_dir=Path(directory),
+                                                 trace_backend=True))
+            try:
+                tags = []
+                for _ in range(2):
+                    async with self.client.post(url + "/v1/responses", json=request()) as response:
+                        self.assertEqual(response.status, 200)
+                        output = await response.text()
+                    body = self.backend_bodies[-1]
+                    tag = body["kvmem_trace_tag"]
+                    self.assertRegex(tag, r"^[0-9a-f]{32}$")
+                    self.assertNotIn(tag, json.dumps(body["messages"]))
+                    self.assertNotIn(tag, output)
+                    saved = Path(directory) / tag
+                    self.assertEqual(json.loads((saved / "request.json").read_text()), body)
+                    metrics = json.loads((saved / "metrics.json").read_text())
+                    self.assertEqual(metrics["backend_trace_tag"], tag)
+                    self.assertEqual(metrics["status"], "completed")
+                    tags.append(tag)
+                self.assertEqual(len(set(tags)), 2)
+                self.assertEqual({p.name for p in Path(directory).iterdir()}, set(tags))
+            finally:
+                await runner.cleanup()
+
+    async def test_backend_trace_tags_require_retained_local_evidence(self):
+        with self.assertRaisesRegex(ValueError, "local trace directory"):
+            create_app(self.backend_url + "/v1", trace_backend=True)
 
     async def test_private_backend_token_is_not_in_model_history_or_output(self):
         token = "private-vm-test-token"

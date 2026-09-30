@@ -1,0 +1,93 @@
+{
+  "kind": "paired_live_archive_failure_evidence",
+  "reviewed_at": 1790809280.9062717,
+  "passed": false,
+  "frozen_app_sources_identical": true,
+  "frozen_binary_identical": true,
+  "same_snapshot": true,
+  "client_platform": "linux",
+  "desktop_platform": "windows",
+  "note": "Both original 900s trials timed out. Last pages inspected from retained screenshots. App files were empty; no completed archive file was verified. Different live trajectories are not identical-input performance measurements.",
+  "trials": [
+    {
+      "kvmem": "on",
+      "passed": false,
+      "task_deadline_seconds": 900,
+      "elapsed_seconds": 900.6111584091559,
+      "error": "TimeoutError('Live archive task deadline exceeded')",
+      "completed_actions": 44,
+      "rejected_actions": 4,
+      "unresolved_actions": 0,
+      "last_visible_page": 21,
+      "total_pages": 36,
+      "last_screenshot": "apps/computer_use/.runtime/windows-long-on-02/app/desktop/screenshots/1ce05b283da7a824bb4dcd2931a9abccc2e2df184d9e32107dd1a733e3677fc3.png",
+      "last_screenshot_sha256": "1ce05b283da7a824bb4dcd2931a9abccc2e2df184d9e32107dd1a733e3677fc3",
+      "app_status": "stopped",
+      "turn_status": "interrupted",
+      "app_recorded_files": [],
+      "final_desktop_paused": true,
+      "max_prompt_tokens": 168916,
+      "sampled_gpu_peak_bytes": 48244981760,
+      "engine_rss_high_water_bytes": 39628406784,
+      "dflash_drafted": 11732,
+      "dflash_accepted": 6792,
+      "dflash_fallback_requests": 0,
+      "binary_sha256": "e14b429817f42cedee5659c786087f0265f6335a58073d884a2108782ca9a2ad",
+      "prefix_reuse": true,
+      "snapshot": {
+        "name": "qw3-type-20261001",
+        "created_at": 1790803003.882885,
+        "image_id": "sha256:0cff9eb0e7aee9953e55bc682852ca4fdca233145a58ae1ec94f0b0c01a2ed30",
+        "source_hashes": {
+          "executor.ps1": "b5e4eafa2204609a32914ef90bd2aaec85a902884ec7199ea2e3fbb8bddd37fb",
+          "fixture.html": "31b765afe8c6d5e12ec04de7fe00433014f7e19ba434dc39fb74b67728da5063",
+          "bootstrap.ps1": "d0faaffec901aa66c1b1a435b113881c7d7ee14bd35a8a1d3203e97ac6d0a0ec"
+        },
+        "disk_virtual_bytes": 68719476736,
+        "state": "powered_off_disk_snapshot",
+        "container": "qw3-computer-windows"
+      },
+      "source_commit": "49f25082c3c5a29ea431bb9745086790bce8aa89"
+    },
+    {
+      "kvmem": "off",
+      "passed": false,
+      "task_deadline_seconds": 900.0,
+      "elapsed_seconds": 901.7151810419746,
+      "error": "TimeoutError('Live archive task deadline exceeded')",
+      "completed_actions": 40,
+      "rejected_actions": 0,
+      "unresolved_actions": 0,
+      "last_visible_page": 18,
+      "total_pages": 36,
+      "last_screenshot": "apps/computer_use/.runtime/windows-long-off-02/app/desktop/screenshots/a865b60044c88d1db59165fcc30d3c22aae78f6b936c679d8c954c2da3b467ec.png",
+      "last_screenshot_sha256": "a865b60044c88d1db59165fcc30d3c22aae78f6b936c679d8c954c2da3b467ec",
+      "app_status": "stopped",
+      "turn_status": "interrupted",
+      "app_recorded_files": [],
+      "final_desktop_paused": true,
+      "max_prompt_tokens": 128303,
+      "sampled_gpu_peak_bytes": 72657928192,
+      "engine_rss_high_water_bytes": 34383958016,
+      "dflash_drafted": 9235,
+      "dflash_accepted": 5430,
+      "dflash_fallback_requests": 0,
+      "binary_sha256": "e14b429817f42cedee5659c786087f0265f6335a58073d884a2108782ca9a2ad",
+      "prefix_reuse": false,
+      "snapshot": {
+        "name": "qw3-type-20261001",
+        "created_at": 1790803003.882885,
+        "image_id": "sha256:0cff9eb0e7aee9953e55bc682852ca4fdca233145a58ae1ec94f0b0c01a2ed30",
+        "source_hashes": {
+          "executor.ps1": "b5e4eafa2204609a32914ef90bd2aaec85a902884ec7199ea2e3fbb8bddd37fb",
+          "fixture.html": "31b765afe8c6d5e12ec04de7fe00433014f7e19ba434dc39fb74b67728da5063",
+          "bootstrap.ps1": "d0faaffec901aa66c1b1a435b113881c7d7ee14bd35a8a1d3203e97ac6d0a0ec"
+        },
+        "disk_virtual_bytes": 68719476736,
+        "state": "powered_off_disk_snapshot",
+        "container": "qw3-computer-windows"
+      },
+      "source_commit": "c30d7a48ae0b4ec1d5995fe040aef7cdb9cd2163"
+    }
+  ]
+}
