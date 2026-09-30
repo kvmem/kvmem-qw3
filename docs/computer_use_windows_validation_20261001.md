@@ -245,3 +245,20 @@ matrix result remains false because a pilot contains one of the required 18
 trials. This does not yet qualify repeated reliability or native crash recovery.
 Evidence: `windows-native-pilot-01/{evidence-audit.json,trials.csv}` and
 `on-browser-0/guest/{native-ui.png,client-resources.jsonl,app/,task/}`.
+
+## Native Windows crash/resume
+
+`windows-native-restart-01` passed in **63.12 seconds**, including the injected
+crash and pause. The setup driver killed only its own app tree after the first
+completed Edge-open action. The app PID changed from 2076 to 9408; the task ID
+and Codex thread ID were preserved. The restarted app remained paused, with no
+additional action during a two-second hold. Explicit resume completed the
+cross-app copy and saved the exact expected 22-byte file. The host independently
+confirmed its content/hash and the use of Ctrl+C/Ctrl+V without typing the code.
+
+The guest driver exited zero and both injected-crash and final-cleanup taskkill
+commands succeeded. The terminated Python processes themselves returned exit
+code 1, as expected for forced termination; this is distinct from the test
+driver's successful exit. Evidence is in `windows-native-restart-01/`, including
+the exported `guest/restart/result.json`, app ledger and both taskkill logs.
+This closes the native process-crash case; repeated core tasks remain open.

@@ -84,6 +84,12 @@ shared DFlash experiment lock when present. It requires local model assets:
 - `models/Qwen3.8-27B-DFlash2-BF16`
 - `models/Qwen3.8-27B-BF16` for the matching visual tower
 
+`--trace-memory` enables the existing binary's CUDA tensor-allocation and
+workspace-capacity diagnostics in `engine.log`. Run it separately from latency
+benchmarks. Tensor records cover owned allocations of at least 1 MiB; workspace
+counters cover named backend capacities. Views, smaller/direct allocations and
+all CUDA-library internals are not a complete census. No new binary is required.
+
 The profile uses FP8 KV, K128K/G64K, 1M logical context, a 48GiB CPU
 tier, 128-token blocks with four 32-token scoring slices, message-level
 retrieval and multimodal prefix reuse. It uses the available 96GB-class GPU;
@@ -281,8 +287,10 @@ and setup-helper hashes, process cleanup, client samples and UI output.
 
 The restart variant kills only the application process tree it started, checks
 that restart stays paused with the same task identity, then explicitly resumes
-and verifies the saved file. Its new Windows-specific driver also awaits native
-qualification; Linux crash/resume evidence does not qualify this variant.
+and verifies the saved file. `windows-native-restart-01` passed in 63.12 seconds:
+the same Codex thread resumed after a two-second no-action pause and produced
+the exact expected cross-app file using Ctrl+C/Ctrl+V. That time includes the
+injected crash and pause, but excludes VM/model setup.
 
 ## KVMem and decoder comparison
 
