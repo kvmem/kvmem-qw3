@@ -334,3 +334,15 @@ engine/model assets, guest state or snapshot is changed. Recorded Git commits
 can therefore differ between trial manifests; their application-source and
 binary hashes remain the qualification identities. The native suite remains
 in progress, with no final acceptance declaration.
+
+
+Native Windows milestone (2026-10-01): `windows-native-suite-02` completed all
+18 repeated core tasks, with 18/18 independent evidence checks and the full
+matrix gate passed. The raw native CSV and Windows validation report record
+all repetitions, resource scopes, the single recovered pre-dispatch rejection,
+and zero DFlash fallback/unresolved actions. Documentation commit `49f2508`
+did not alter frozen application sources. The queue has moved to the live
+KVMem-on archive task; no long-desktop completion is claimed yet. The temporary
+clipboard ownership crash case remains open. Its isolated replacement and
+recovery probes are prepared, with only syntax/help/live-queue refusal checked;
+no candidate Windows actions have run. The goal remains active.

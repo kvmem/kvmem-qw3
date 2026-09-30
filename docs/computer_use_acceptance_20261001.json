@@ -1,15 +1,22 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790805723.3358884,
+  "reviewed_at": 1790807061.9059727,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
   "native_client_source_files_match": true,
   "current_native_matrix": {
-    "status": "running",
-    "completed_trials": 12,
-    "passed_trials": 12,
-    "required_trials": 18
+    "status": "completed",
+    "completed_trials": 18,
+    "passed_trials": 18,
+    "required_trials": 18,
+    "independent_audit_passed": true,
+    "qualified_executor_sha256": "b5e4eafa2204609a32914ef90bd2aaec85a902884ec7199ea2e3fbb8bddd37fb",
+    "recorded_commits": [
+      "49f25082c3c5a29ea431bb9745086790bce8aa89",
+      "53cd0bfbc6bc97917e270b7a6a6ac451efb0233a"
+    ],
+    "recorded_commits_have_identical_app_sources": true
   },
   "verified_retained_evidence": {
     "cpu-baseline-recheck-01/result.json": {
@@ -53,10 +60,21 @@
     },
     "windows-native-client-04/manifest.json": {
       "sha256": "7ae6e37d61cb8ee6d462a46e796e9879f22bd7eb1452473249f70cd45cd1bb38"
+    },
+    "windows-native-suite-02/summary.json": {
+      "sha256": "32b821f534741bf7c0c81fea84bdf668c8e33f6c6f89e1e91b7bb2663c2e3355"
+    },
+    "windows-native-suite-02/evidence-audit.json": {
+      "sha256": "66a89b33fdf40d15d7f8a369537271cf59c7db4f14be8b7308bd110e0a945662"
+    },
+    "windows-native-suite-02/trials.csv": {
+      "sha256": "27fc51d5da4197fd1dedc5336d798e7f9ae7081c9625acc5e664398d00c1a4e8"
+    },
+    "windows-native-suite-02/partial-ui-review.json": {
+      "sha256": "ed0fa7f43279a7212ecf59f355ac289c7e6929deea89dcab83a2622c804590c1"
     }
   },
   "remaining": [
-    "Complete and audit all18 native Windows on/off trials.",
     "Run paired real desktop long-history tasks across retrieval threshold; fixture/replay success is not a substitute.",
     "Qualify or repair clipboard restoration if executor is forcibly terminated during temporary ownership.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
@@ -71,7 +89,13 @@
     "runtime_tested": false,
     "deployed": false,
     "location": "apps/computer_use/.runtime/input-recovery-candidate",
-    "change": "Focused native edit replacement without taking clipboard ownership; pending actual Windows tests."
+    "change": "Focused native edit replacement without taking clipboard ownership; pending actual Windows tests.",
+    "candidate_sha256": "6678710b6425f3d1a1828e0ba90213590526c9adad2b2751fb9d5f317747b45f"
   },
-  "source_identity_note": "Recorded app source is 53cd0bf; this documentation/Mac-helper checkpoint leaves frozen app, binary, model and guest hashes unchanged. Trial Git commits may differ without source changes."
+  "source_identity_note": "Recorded app source is 53cd0bf; this documentation/Mac-helper checkpoint leaves frozen app, binary, model and guest hashes unchanged. Trial Git commits may differ without source changes.",
+  "live_archive": {
+    "status": "on_running",
+    "paired_deadline_seconds": 900,
+    "qualified": false
+  }
 }

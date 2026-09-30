@@ -25,8 +25,8 @@ partial count is a time-stamped observation, not its final result.
 | Above-budget historical visual evidence | `comparison-long-02/visual-checks.json`; `comparison-long-controls-01/visual-checks.json` | 12/12 positive/changed-image-negative cases across all six profiles passed at 158,911 tokens. One repetition per case, not a statistical reliability claim. |
 | Growing history and Codex retention | `long-history-probe-01`; `codex-long-01/history-check.json` and raw inference/events | Growing fixture history and actual Codex preservation of eight images/4,800 notes demonstrated. This does not substitute for the live desktop archive task. |
 | Resource and speculation accounting | [Long matrix](computer_use_long_matrix_20261001.csv), [memory diagnostic](computer_use_memory_diagnostic_20261001.csv), scoped raw reports | DFlash accepted/drafted/fallback counters, TTFT, task/action and process/device measurements retained. Allocation traces passed on both policies but explicitly exclude some allocation classes; not a complete census. |
-| Three repetitions of each native Windows core task, both policies | `windows-native-suite-02/summary.json`; frozen `qw3-type-20261001` | Running. The pilot of the prior off-Notepad failure passed in 111.84 s with 11 actions and the exact 46-byte file; it is not the required 18-case matrix. |
-| Actual long desktop task across retrieval threshold, both policies | `type-native-long-queue-01.json`; `windows_long_suite.py` / `windows_long_task.py` | Prepared and queued after the full native audit. No live archive acceptance result yet. Each policy retains the same 900-second deadline and failure gate. |
+| Three repetitions of each native Windows core task, both policies | `windows-native-suite-02/summary.json`; frozen `qw3-type-20261001` | Completed 18/18 with a passing independent evidence audit. Same source/model/binary/snapshot identities across both policies; per-trial CSV retained. This qualifies the frozen clipboard-preserving executor, not the undeployed recovery candidate. |
+| Actual long desktop task across retrieval threshold, both policies | `type-native-long-queue-01.json`; `windows_long_suite.py` / `windows_long_task.py` | Native gate passed; KVMem-on live archive is now running. No archive acceptance result yet. Both policies retain the same 900-second deadline; a first-policy failure must still be followed by the paired policy. |
 | macOS executor/client and physical targets | [Mac access preparation](computer_use_mac_test_access_20261001.md) | Still open. Readiness helper prepared; only syntax/help/non-Mac refusal verified. No Mac or physical Windows desktop acceptance has run. |
 
 ## Comparison interpretation
@@ -63,8 +63,9 @@ the candidate for execution after the queue becomes terminal.
 
 ## Open gates
 
-The goal cannot close until the entire repeated native matrix and paired live
-archive task pass, the new clipboard ownership failure case is qualified or
+The repeated native matrix passed for its frozen executor. The goal cannot
+close until the paired live archive task passes, the new clipboard ownership
+failure case is qualified or
 repaired, and the macOS/accessible physical-desktop requirements are satisfied.
 Earlier failures remain failures even when their repaired pilot passes.
 Missing hardware is recorded as missing evidence, never a successful test.

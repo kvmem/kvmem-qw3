@@ -359,3 +359,66 @@ at version 04 because its app/Codex/MCP files are unchanged.
 New clean snapshot `qw3-type-20261001` was created with the final executor hash
 above and unchanged fixture/bootstrap hashes. Native and live-archive helpers
 now default to this snapshot; older snapshots remain retained.
+
+
+## Completed native Windows matrix after literal-input repair
+
+`windows-native-suite-02` completed **18/18 tasks**, and its independent
+`evidence-audit.json` passed every trial plus the complete-matrix gate. Each
+KVMem policy ran three fresh-snapshot repetitions of Notepad, the browser form
+and cross-application copying. App, pinned Codex and Computer MCP ran natively
+inside Windows; inference ran on the local physical Linux GPU host. This is
+single-host local VM deployment evidence, not native Windows GPU serving.
+
+The tested executor is the clipboard-preserving `b5e4eafa...` version from
+`53cd0bf`, frozen in `qw3-type-20261001`; client bundle 04 is unchanged. All 19
+bundled sources match the checkout. The 31 native contract tests passed before
+each trial. The engine and launcher each have one hash across the matrix.
+Trial manifests record commits `53cd0bf` and `49f2508`: a Git diff confirmed
+that the intervening documentation/Mac-readiness commit changed no application
+sources. A separately prepared input-recovery candidate was not deployed.
+
+| Task | KVMem on, three times (s) | On median (s) | KVMem off, three times (s) | Off median (s) |
+| --- | --- | --- | --- | --- |
+| Notepad | 31.30, 33.43, 31.40 | 31.40 | 59.55, 41.51, 51.29 | 51.29 |
+| Browser form | 66.82, 49.26, 42.21 | 49.26 | 77.91, 77.74, 78.36 | 77.91 |
+| Cross-app copy | 58.14, 63.53, 51.30 | 58.14 | 103.19, 103.60, 123.04 | 103.60 |
+
+Task times exclude VM/model/client setup. The raw
+[per-trial CSV](computer_use_windows_native_suite_02_20261001.csv) retains action
+counts and latency percentiles, server visible-output timing, client CPU/RAM,
+engine/device resources and actual DFlash counters.
+
+| Resource or execution counter | KVMem on | KVMem off |
+| --- | --- | --- |
+| Sampled whole-device GPU peak (GiB) | 44.046875 | 67.404296875 |
+| Engine-process RSS high-water (GiB) | 32.5122 | 32.0282 |
+| Peak sum of native client working sets (MiB) | 220.046875 | 211.730469 |
+| Peak sum of native client private bytes (MiB) | 131.277344 | 122.015625 |
+| DFlash accepted / drafted tokens | 16,465 / 29,153 | 14,535 / 26,285 |
+| DFlash fallback requests | 0 | 0 |
+| Completed desktop actions | 94 | 87 |
+| Rejected actions / unresolved actions at finish | 1 / 0 | 0 / 0 |
+| Largest prompt (tokens) | 46,684 | 43,613 |
+
+The one rejection was a requested three-click action in `on-cross_app-0`;
+only one or two clicks are supported. It was rejected before dispatch, the
+application supplied a fresh observation, and the task recovered and produced
+the correct file. Every delivered file's name, content, byte size and SHA-256
+were independently checked. Copy tasks contained actual Ctrl+C/Ctrl+V receipts,
+not a typed substitution of the expected reference.
+
+These are deployed configurations: on includes prefix reuse, while off does
+not. Their action trajectories differ, and these prompts remain below K128K.
+The latency difference is therefore not an isolated sparse-retrieval speedup.
+The common logical context capacity is 1M; the measured dense allocation must
+not be relabeled as a context-size-matched minimum. GPU peaks are sampled,
+not hard allocation bounds. Client working sets can double-count shared pages;
+they exclude the host model and the controlled desktop apps.
+
+Earlier failed suites and input probes remain archived. This closes the
+repeated native core-task gate for the frozen executor, but does not qualify
+forced termination while it temporarily owns the clipboard. Paired live
+archive tasks, the candidate input-recovery change, Mac and physical desktops
+remain separate acceptance items. The success gate has started the KVMem-on
+live archive run; no final archive result is claimed here.
