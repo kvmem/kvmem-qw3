@@ -235,15 +235,16 @@ folder includes `start.ps1` and `test.ps1`; it contains no model weights or
 executor token. `vm/test_native_client.ps1` is a setup-only helper to run the
 contract tests in the dedicated guest from a staged, hashed ZIP. The current
 Windows bundle 04 passes all 31 tests with exit code 0, including actual native
-Codex and MCP success/error image results against a fixture backend. Real-model desktop tasks through the
-Windows-native client remain to be qualified.
+Codex and MCP success/error image results against a fixture backend. A native
+Windows real-model browser pilot also passed in 40.66 seconds with 10 actions
+and independently verified JSON. Full repeated acceptance remains open.
 
-`vm/model_relay.py` is preparation for testing the native Windows client with
+`vm/model_relay.py` connects the native Windows client with
 the host GPU. It binds only the owned container's Docker bridge gateway and
 requires both that container's source address and a separate token. Its route,
 authorization and disconnect behavior pass local tests. The client accepts
 `--backend-token` (or `-BackendToken` in its PowerShell launcher) as a file path;
-the token stays outside model history. Real VM connectivity remains to be qualified. The runtime bridge
+the token stays outside model history. Real VM connectivity passed in that pilot. The runtime bridge
 and model stay on loopback in the existing Linux-host trials.
 
 `windows_native_suite.py` and the setup-only `vm/run_native_case.ps1` prepare
@@ -251,13 +252,16 @@ real-model qualification with the app, native Codex and MCP inside Windows.
 Each trial restores the clean snapshot, installs and tests the hashed offline
 client, starts the private model relay, then checks the saved task file from
 both the native client and the host. It exports the guest runtime and renders
-the actual local UI in Windows Edge. These new orchestration helpers have not
-yet completed real-VM qualification. Wait for other VM/model suites to end
+the actual local UI in Windows Edge. Their first browser pilot passed, including
+process-tree cleanup and evidence export. Wait for other VM/model suites to end
 before running them; restoring a snapshot resets the dedicated guest.
 The native task helper also samples its app process tree's CPU time, working
 set and private-byte counters. Shared pages can appear in multiple working
 sets, so their sum is not unique physical RAM use. These guest counters are
-separate from the host GPU/engine resource log and await native validation.
+separate from the host GPU/engine resource log. The pilot retained 38 valid
+samples covering Python and Codex. Its peak sum of working sets was 201.16 MiB
+and peak sum of private bytes was 110.48 MiB; these exclude the GPU engine and
+the controlled desktop applications.
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
@@ -265,7 +269,15 @@ PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_s
 
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
   --restart --cases cross_app --run-dir apps/computer_use/.runtime/windows-native-restart-new
+
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
+  --kvmem on off --repetitions 3 --run-dir apps/computer_use/.runtime/windows-native-suite-new
 ```
+
+`summarize_windows.py` and `audit_windows_suite.py` also read native suite
+exports. The audit still requires all 18 repeated tasks; a passing single pilot
+is reported as an incomplete matrix. Native checks additionally verify bundle
+and setup-helper hashes, process cleanup, client samples and UI output.
 
 The restart variant kills only the application process tree it started, checks
 that restart stays paused with the same task identity, then explicitly resumes

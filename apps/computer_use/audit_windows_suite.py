@@ -16,6 +16,12 @@ def audit(run, repetitions):
     summary = json.loads((run / "summary.json").read_text())
     if summary["status"] == "running":
         raise RuntimeError("The suite is live; wait for its process to exit")
+    native = summary.get("kind") == "windows_native_real_model_snapshot_trials"
+    if native and summary.get("restart"):
+        raise ValueError("Crash/resume runs are separate from the repeated core-task matrix")
+    if native:
+        for source, digest in summary["helper_sha256"].items():
+            assert hashlib.sha256((run / Path(source).name).read_bytes()).hexdigest() == digest
     expected = set(itertools.product(("on", "off"), TASKS, range(repetitions)))
     keys = [(t["kvmem"], t["case"], t["repetition"]) for t in summary["trials"]]
     checks = []
@@ -29,12 +35,28 @@ def audit(run, repetitions):
             case = CASES[trial["case"]]
             assert summary["task_definitions"][trial["case"]] == case, "Task definition changed"
             directory = Path(trial["directory"])
-            task = json.loads((directory / "task/result.json").read_text())
-            app = json.loads((directory / "app/task.json").read_text())
+            client = directory / "guest" if native else directory
+            task = json.loads((client / "task/result.json").read_text())
+            app = json.loads((client / "app/task.json").read_text())
             assert task["passed"] and app["status"] == "completed" and app["turn_status"] == "completed"
             assert task["task_id"] == app["id"]
-            assert trial["initial_health"]["paused"] and trial["final_health"]["paused"]
-            assert trial["initial_health"]["desktop_id"] == trial["final_health"]["desktop_id"]
+            assert trial["initial_health"]["paused"] and task["state"]["desktop_paused"]
+            if native:
+                result = trial["native_result"]
+                qualification = trial["native_contracts"]
+                assert result["passed"] and result["driver_exit_code"] == 0 and result["shutdown_exit_code"] == 0
+                assert result["run_id"] == trial["run_id"] and result["task"] == task
+                assert qualification["passed"] and qualification["process_exit_code"] == 0
+                assert result["bundle_sha256"] == qualification["bundle_sha256"] == summary["bundle_sha256"]
+                assert (client / "native-ui.png").stat().st_size > 0
+                assert task["state"]["observation"]["desktop_id"] == trial["initial_health"]["desktop_id"]
+                samples = [json.loads(line) for line in (client / "client-resources.jsonl").read_text(encoding="utf-8-sig").splitlines()]
+                assert samples and all("error" not in sample for sample in samples)
+                names = {p["name"].lower() for sample in samples for p in sample["processes"]}
+                assert "python" in names and "codex" in names, "Missing native client process samples"
+            else:
+                assert trial["final_health"]["paused"]
+                assert trial["initial_health"]["desktop_id"] == trial["final_health"]["desktop_id"]
             actual = trial["verified_file"]
             assert actual == task["verified_file"] and app["files"] == [actual]
             assert actual["name"] == case["filename"]
@@ -44,7 +66,7 @@ def audit(run, repetitions):
                 assert json.loads(actual["content"]) == case["json"]
             else:
                 assert actual["content"] == case["content"]
-            with sqlite3.connect((directory / "app/desktop/desktop.sqlite").as_uri() + "?mode=ro", uri=True) as db:
+            with sqlite3.connect((client / "app/desktop/desktop.sqlite").as_uri() + "?mode=ro", uri=True) as db:
                 rows = list(db.execute("SELECT task,request,status FROM actions"))
             assert rows and all(row[0] == app["id"] for row in rows)
             assert not any(row[2] in ("dispatching", "uncertain") for row in rows)
@@ -71,11 +93,12 @@ def audit(run, repetitions):
             item.update(passed=True, completed_actions=len(actions), file_sha256=actual["sha256"],
                         dflash_drafted=sum(int(s[0]) for s in speculation),
                         dflash_accepted=sum(int(s[1]) for s in speculation), dflash_fallback_requests=0)
-        except (AssertionError, KeyError, ValueError, OSError) as exc:
+        except (AssertionError, KeyError, ValueError, OSError, sqlite3.Error) as exc:
             item["error"] = repr(exc)
         checks.append(item)
     matrix_complete = set(keys) == expected and len(keys) == len(expected)
     result = {"kind": "retained_windows_suite_evidence_audit", "checks": checks,
+              "client_platform": "windows" if native else "linux",
               "matrix_complete": matrix_complete, "expected_trials": len(expected),
               "binary_hashes": sorted(binary_hashes), "launcher_hashes": sorted(launcher_hashes),
               "recorded_commits": sorted(source_commits),

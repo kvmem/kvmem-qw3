@@ -22,11 +22,15 @@ def summarize(run):
     summary = json.loads((run / "summary.json").read_text())
     if summary["status"] == "running":
         raise ValueError("The suite is still running; wait for its terminal summary")
+    native = summary.get("kind") == "windows_native_real_model_snapshot_trials"
     rows = []
     for trial in summary["trials"]:
         directory = Path(trial["directory"])
         row = {key: trial.get(key) for key in ("kvmem", "case", "repetition", "passed", "elapsed_seconds", "error")}
-        task_result = directory / "task/result.json"
+        client = directory / "guest" if native else directory
+        app = client / ("restart/app" if summary.get("restart") else "app")
+        row["client_platform"] = "windows" if native else "linux"
+        task_result = client / ("restart/result.json" if summary.get("restart") else "task/result.json")
         if row["elapsed_seconds"] is None and task_result.exists():
             row["elapsed_seconds"] = json.loads(task_result.read_text()).get("elapsed_seconds")
         resources = directory / "resources.jsonl"
@@ -34,7 +38,20 @@ def summarize(run):
             samples = [json.loads(line) for line in resources.read_text().splitlines()]
             row["sampled_gpu_peak_bytes"] = max((s.get("gpu_memory_bytes", 0) for s in samples), default=0)
             row["process_rss_high_water_bytes"] = max((s.get("peak_rss_bytes", 0) for s in samples), default=0)
-        database = directory / "app/desktop/desktop.sqlite"
+        client_resources = client / "client-resources.jsonl"
+        if client_resources.exists():
+            samples = [json.loads(line) for line in client_resources.read_text(encoding="utf-8-sig").splitlines()]
+            row["client_resource_sample_errors"] = sum("error" in s for s in samples)
+            row["client_samples"] = len(samples)
+            # Shared pages may be counted in more than one process working set.
+            row["client_sum_working_sets_peak_bytes"] = max((sum(p["working_set_bytes"] for p in s.get("processes", [])) for s in samples), default=0)
+            row["client_sum_private_bytes_peak"] = max((sum(p["private_bytes"] for p in s.get("processes", [])) for s in samples), default=0)
+            cpu_by_pid = {}
+            for sample in samples:
+                for process in sample.get("processes", []):
+                    cpu_by_pid[process["pid"]] = max(cpu_by_pid.get(process["pid"], 0), process["cpu_seconds"])
+            row["client_sampled_cpu_seconds"] = sum(cpu_by_pid.values())
+        database = app / "desktop/desktop.sqlite"
         if database.exists():
             with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
                 observations = dict(db.execute("SELECT id,created FROM observations"))

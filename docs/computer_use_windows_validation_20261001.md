@@ -221,3 +221,27 @@ the independently read output was the exact expected 22-byte file. The original
 300-second timeout remains a retained failure. This one repaired trial does
 not replace the required repeated suite. Its success gate has now started the
 native Windows browser pilot.
+
+## First native Windows real-model pilot
+
+`windows-native-pilot-01` passed the browser task in **40.66 seconds**, with
+10 completed actions, no rejected or unresolved action, and an independently
+verified 89-byte JSON file. The app, Codex 0.159.2 and MCP ran inside Windows;
+only model inference ran on the local Linux GPU through the private authenticated
+relay. The 31 native contracts passed again after snapshot restore. App-tree
+shutdown and driver exit codes were both zero, and the guest runtime was exported.
+
+The actual Windows Edge UI screenshot was inspected: Chinese controls rendered,
+the final desktop showed the saved form, and the output panel listed the file.
+The helper retained 38 valid client process samples including Python and Codex.
+Peak summed working sets were 201.16 MiB, peak summed private bytes 110.48 MiB,
+and summed sampled CPU time 5.06 seconds. Shared working-set pages can be counted
+more than once; these are client-process counters, excluding the controlled
+Edge/Notepad processes and the separate GPU server. Sampled host GPU peak was
+43.98 GiB. DFlash accepted 1,603/2,790 drafted tokens with no fallback.
+
+The independent native evidence audit passed the trial check. Its overall
+matrix result remains false because a pilot contains one of the required 18
+trials. This does not yet qualify repeated reliability or native crash recovery.
+Evidence: `windows-native-pilot-01/{evidence-audit.json,trials.csv}` and
+`on-browser-0/guest/{native-ui.png,client-resources.jsonl,app/,task/}`.
