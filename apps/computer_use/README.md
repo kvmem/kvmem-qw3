@@ -180,6 +180,42 @@ on Linux. A packaged native Windows/Mac application and physical-desktop tests
 are separate qualification steps. The dedicated VM test account is elevated;
 this prototype is not qualified as a general-purpose desktop permission sandbox.
 
+### Recovery and native-client qualification helpers
+
+After the repeated suite has stopped, `windows_recovery.py` exercises the real
+executor's repeated-action pause, then drops one reply after Windows durably
+completes an action. It checks reconciliation and duplicate receipts without a
+second dispatch. `--restart-executor` additionally restarts only the dedicated
+guest executor before reconciliation. `windows_restart.py` requires a clean
+snapshot and a running engine; it crashes its own application process group,
+checks that restart stays paused, explicitly resumes, and verifies the task file.
+These new drivers still require their first VM qualification run.
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_recovery.py \
+  --restart-executor --run-dir apps/computer_use/.runtime/recovery-new
+
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_restart.py \
+  --run-dir apps/computer_use/.runtime/restart-new
+
+python3 apps/computer_use/summarize_windows.py apps/computer_use/.runtime/windows-suite-new
+```
+
+`pack_windows_client.py` assembles an offline x64 client folder from CPython
+3.13.13, the official Codex 0.159.2 package and Windows wheels. It verifies Codex
+against the official release digest and records every asset/source hash. The
+folder includes `start.ps1` and `test.ps1`; it contains no model weights or
+executor token. `vm/test_native_client.ps1` is a setup-only helper to run the
+contract tests in the dedicated guest from a staged, hashed ZIP. The first
+bundle has been assembled on Linux; Windows execution is not yet qualified.
+
+`vm/model_relay.py` is preparation for testing the native Windows client with
+the host GPU. It binds only the owned container's Docker bridge gateway and
+requires both that container's source address and a separate token. Its route,
+authorization and disconnect behavior pass local tests. Client backend-token
+wiring and real VM connectivity remain to be qualified. The runtime bridge
+and model stay on loopback in the existing Linux-host trials.
+
 ## KVMem and decoder comparison
 
 Freeze `inference/*/request.json` inputs into a corpus with a `manifest.json`
