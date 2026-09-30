@@ -12,6 +12,32 @@ if (!$HiddenWorker) {
 $share = '\\host.lan\Data'
 $app = $null
 $result = @{kind='windows_native_client_real_model'; passed=$false; started=(Get-Date -Format o)}
+function Sample-ClientProcesses {
+    # Working sets can share DLL pages. Preserve per-process counters instead
+    # of presenting their sum as unique physical RAM consumption.
+    try {
+        $all = @(Get-CimInstance Win32_Process -OperationTimeoutSec 2)
+        $owned = New-Object 'System.Collections.Generic.HashSet[int]'
+        [void]$owned.Add($app.Id)
+        do {
+            $changed = $false
+            foreach ($entry in $all) {
+                if ($owned.Contains([int]$entry.ParentProcessId) -and $owned.Add([int]$entry.ProcessId)) { $changed=$true }
+            }
+        } while ($changed)
+        $samples = @()
+        foreach ($processId in $owned) {
+            $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+            if ($process) {
+                $samples += @{pid=$process.Id; name=$process.ProcessName; cpu_seconds=$process.TotalProcessorTime.TotalSeconds;
+                    working_set_bytes=$process.WorkingSet64; peak_working_set_bytes=$process.PeakWorkingSet64;
+                    private_bytes=$process.PrivateMemorySize64}
+            }
+        }
+        $row = @{time_utc=[DateTime]::UtcNow.ToString('o'); app_pid=$app.Id; processes=$samples}
+    } catch { $row = @{time_utc=[DateTime]::UtcNow.ToString('o'); error=$_.Exception.Message} }
+    $row | ConvertTo-Json -Compress -Depth 5 | Add-Content "$runtime\client-resources.jsonl" -Encoding UTF8
+}
 try {
     $configuration = Get-Content "$share\native-case.json" -Raw | ConvertFrom-Json
     $result.run_id = $configuration.run_id
@@ -70,10 +96,16 @@ try {
     $driverHandle = $driver.Handle
     @{stage='task_running'; run_id=$configuration.run_id; application_pid=$app.Id; driver_pid=$driver.Id} |
         ConvertTo-Json | Set-Content "$share\native-case-progress.json" -Encoding UTF8
-    if (!$driver.WaitForExit(330000)) {
-        Stop-Process -Id $driver.Id -Force
-        throw 'Native task driver exceeded its deadline'
+    $taskDeadline = [DateTime]::UtcNow.AddSeconds(330)
+    Sample-ClientProcesses
+    while (!$driver.WaitForExit(1000)) {
+        Sample-ClientProcesses
+        if ([DateTime]::UtcNow -ge $taskDeadline) {
+            Stop-Process -Id $driver.Id -Force
+            throw 'Native task driver exceeded its deadline'
+        }
     }
+    Sample-ClientProcesses
     $driver.Refresh()
     $result.driver_exit_code = $driver.ExitCode
     if ($driver.ExitCode -ne 0) { throw "Native task driver failed: $($driver.ExitCode)" }

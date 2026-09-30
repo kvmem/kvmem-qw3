@@ -242,6 +242,10 @@ both the native client and the host. It exports the guest runtime and renders
 the actual local UI in Windows Edge. These new orchestration helpers have not
 yet completed real-VM qualification. Wait for other VM/model suites to end
 before running them; restoring a snapshot resets the dedicated guest.
+The native task helper also samples its app process tree's CPU time, working
+set and private-byte counters. Shared pages can appear in multiple working
+sets, so their sum is not unique physical RAM use. These guest counters are
+separate from the host GPU/engine resource log and await native validation.
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
