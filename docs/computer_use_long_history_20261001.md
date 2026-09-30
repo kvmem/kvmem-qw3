@@ -72,6 +72,38 @@ process remaining briefly visible in NVML after releasing its file lock.
 The launcher now waits for both lock release and a clear GPU process list;
 it does not stop another process to obtain the GPU.
 
+The checked-in `check_long_replay.py` now reproduces the answer and final-trace
+checks against this retained corpus: **4/4 passed**. The initial cold selection
+uses a provisional window while the query/index are being built; the later
+query-conditioned selection has the complete query/index and no scorer
+fallback. The no-fallback result applies to that final selection, not every
+provisional operation during cold ingestion.
+
+### Memory accounting scope
+
+The DFlash-on log reports the following components. Capacities, usage counters
+and whole-device samples have different scopes and must not be added together.
+
+| Component | Reported amount | Meaning |
+|---|---:|---|
+| Target weights | 27,260.6 MiB | Native uploaded tensors; rounded log value |
+| DFlash weights | 3,671 MiB | Uploaded draft tensors; integer MiB log value |
+| Vision tower | 878 MiB | CUDA vision weights |
+| GPU KV pool | 6,710,886,400 bytes | Pool capacity; includes its used blocks |
+| GPU KV blocks after positive request | 4,311,744,512 bytes | Used part of the pool, not another allocation |
+| Mean-key retrieval index | 1,073,741,824 bytes | FP16 index allocation |
+| Assembly RoPE table | 67,108,864 bytes | Position table |
+| CPU KV tier after positive request | 5,301,600,256 bytes | Used counter within the 48 GiB configured tier |
+| CPU raw K / spill | 2,617,245,696 / 2,602,565,632 bytes | Components of CPU tier usage |
+
+The log also reports a 202.12 MiB pinned query capture, 48 MiB GPU query staging
+and two raw transfer buffers. It does not give a complete disjoint allocation
+breakdown for image embeddings, verifier workspaces, every transfer buffer or
+temporary CUDA allocations. The 43.41 GiB sampled whole-device peak includes
+more than the named weights and KV/index allocations. Process RSS and configured
+CPU tier capacity are also distinct; these counters are not a full allocator
+audit or a physical 48GB-card qualification.
+
 ## Real Codex multi-turn history
 
 `codex-long-01` ran the pinned Codex app-server against QW3 and an observation

@@ -24,6 +24,8 @@ from windows_task import CASES
 
 async def run(args):
     root = Path(__file__).resolve().parents[2]
+    if args.restart and "browser" in args.cases:
+        raise ValueError("Crash/resume qualification supports --cases notepad cross_app")
     output = args.run_dir.resolve(); output.mkdir(parents=True, exist_ok=False)
     info = json.loads(await command("docker", "inspect", "qw3-computer-windows"))[0]
     assert info["Config"].get("Labels", {}).get("com.qw3.computer-use.owner") == "codex-goal-20260930"
@@ -34,14 +36,18 @@ async def run(args):
     bundle = json.loads((args.bundle_dir / "manifest.json").read_text())
     assert json.loads((args.bundle_dir / "archive.json").read_text())["sha256"] == bundle_hash
     assert bundle["source_files"]["windows_task.py"] == hashlib.sha256((root / "apps/computer_use/windows_task.py").read_bytes()).hexdigest()
-    helpers = [Path(__file__), root / "apps/computer_use/vm/run_native_case.ps1",
+    case_helper = root / "apps/computer_use/vm" / ("run_native_restart.ps1" if args.restart else "run_native_case.ps1")
+    helpers = [Path(__file__), case_helper,
                root / "apps/computer_use/vm/test_native_client.ps1",
                root / "apps/computer_use/vm/model_relay.py"]
+    if args.restart:
+        helpers.append(root / "apps/computer_use/vm/native_restart.py")
+        shutil.copyfile(root / "apps/computer_use/vm/native_restart.py", shared / "native_restart.py")
     helper_hashes = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in helpers}
     for helper in helpers:
         shutil.copyfile(helper, output / helper.name)
     summary = {"kind": "windows_native_real_model_snapshot_trials", "status": "running", "trials": [],
-               "bundle_sha256": bundle_hash, "bundle": bundle, "method": args.method,
+               "bundle_sha256": bundle_hash, "bundle": bundle, "method": args.method, "restart": args.restart,
                "helper_sha256": helper_hashes,
                "source_commit": (await command("git", "rev-parse", "HEAD")).strip(),
                "task_definitions": {c: CASES[c] for c in args.cases},
@@ -136,9 +142,8 @@ async def run(args):
                                 shutil.move(shared / name, prior / name)
                         (shared / "native-case.json").write_text(json.dumps({"case": case, "run_id": run_id,
                             "backend": f"http://{relay_manifest['bind']}:18084/v1"}))
-                        await command(sys.executable, root / "apps/computer_use/vm/provision.py",
-                                      root / "apps/computer_use/vm/run_native_case.ps1")
-                        result = await result_file(shared / "native-case-result.json", lambda r: True, 420)
+                        await command(sys.executable, root / "apps/computer_use/vm/provision.py", case_helper)
+                        result = await result_file(shared / "native-case-result.json", lambda r: True, 600 if args.restart else 420)
                         assert result.get("run_id") == run_id, "Native result belongs to another trial or setup failed before reading its run ID"
                         trial["native_result"] = result
                         export = shared / "native-results" / run_id
@@ -152,7 +157,8 @@ async def run(args):
                                       if f["name"] == CASES[case]["filename"])
                         assert actual == expected, "Native client and guest output evidence differ"
                         if case == "cross_app":
-                            database = directory / "guest/app/desktop/desktop.sqlite"
+                            app_relative = "restart/app" if args.restart else "app"
+                            database = directory / "guest" / app_relative / "desktop/desktop.sqlite"
                             with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
                                 actions = [json.loads(row[0])["action"] for row in db.execute(
                                     "SELECT request FROM actions WHERE status='completed' ORDER BY created")]
@@ -189,4 +195,5 @@ if __name__ == "__main__":
     parser.add_argument("--kvmem", nargs="+", choices=["on", "off"], default=["on"])
     parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--restart", action="store_true", help="Inject a native app crash and require explicit resume")
     asyncio.run(run(parser.parse_args()))

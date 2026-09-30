@@ -236,7 +236,15 @@ before running them; restoring a snapshot resets the dedicated guest.
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
   --cases browser --run-dir apps/computer_use/.runtime/windows-native-pilot-new
+
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
+  --restart --cases cross_app --run-dir apps/computer_use/.runtime/windows-native-restart-new
 ```
+
+The restart variant kills only the application process tree it started, checks
+that restart stays paused with the same task identity, then explicitly resumes
+and verifies the saved file. Its new Windows-specific driver also awaits native
+qualification; Linux crash/resume evidence does not qualify this variant.
 
 ## KVMem and decoder comparison
 
@@ -283,6 +291,15 @@ The second uses real Codex and an observation fixture; it never sends desktop
 input. Use a fresh engine for each isolated measurement, and distinguish warm
 prefix reuse from cold on/off comparisons. The long cold corpus can be replayed
 with `compare_replay.py --visual-history retrievable --trace-retrieval`.
+
+After a long replay finishes, validate both the visual answers and the complete
+final retrieval trace. This checker has passed against the retained DFlash
+on/off positive and negative corpus:
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/check_long_replay.py \
+  apps/computer_use/.runtime/comparison-long-new
+```
 
 Sources: [Codex app-server](https://learn.chatgpt.com/docs/app-server),
 [Codex config](https://learn.chatgpt.com/docs/config-file/config-reference),
