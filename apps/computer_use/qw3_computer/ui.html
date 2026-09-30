@@ -33,12 +33,12 @@ button{border:1px solid #c6cfdc;background:white;border-radius:7px;padding:10px 
 </div></main>
 <script>
 const el=id=>document.getElementById(id);let lastImage='',state={};
-const labels={idle:'就绪',starting:'准备中',running:'正在执行',paused:'已暂停',stopped:'已停止',completed:'已结束 · 请核对结果',failed:'执行失败'};
+const labels={idle:'就绪',starting:'准备中',running:'正在执行',verifying:'正在核对输出',paused:'已暂停',stopped:'已停止',completed:'已结束 · 请核对结果',failed:'执行失败'};
 function error(message){el('notice').textContent=message;el('notice').style.display=message?'block':'none'}
 async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok)throw Error(data.error||'操作失败');return data}
 function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s.status):'尚未就绪';
- const running=['starting','running'].includes(s.status),paused=s.status==='paused';
- el('start').disabled=!s.ready||running||paused;el('pause').disabled=!running;el('resume').disabled=!paused||!s.ready;el('stop').disabled=!running&&!paused;el('refresh').disabled=!s.desktop_paused;
+ const running=['starting','running'].includes(s.status),busy=running||s.status==='verifying',paused=s.status==='paused';
+ el('start').disabled=!s.ready||busy||paused;el('pause').disabled=!running;el('resume').disabled=!paused||!s.ready;el('stop').disabled=!busy&&!paused;el('refresh').disabled=!s.desktop_paused;
  el('ackrow').style.display=s.uncertain_actions?.length?'block':'none';error(s.notice||s.turn_error?.message||'');
  el('action').textContent=s.current_action?JSON.stringify(s.current_action,null,2):(running?'正在观察和思考…':labels[s.status]||'等待任务');
  const o=s.observation;if(o){el('window').textContent=o.foreground.title||'Windows 桌面';el('target').textContent=`${o.width} × ${o.height} · ${o.foreground.process||'桌面'}`;if(o.sha256!==lastImage){lastImage=o.sha256;el('screen').src='/api/screenshot?v='+encodeURIComponent(lastImage)}}

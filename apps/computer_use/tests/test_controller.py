@@ -63,6 +63,20 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["status"], "completed")
         self.assertTrue(self.desktop.paused)
 
+    async def test_completion_waits_for_file_evidence(self):
+        gate = asyncio.Event()
+        async def files(*args):
+            await gate.wait()
+            return {"files": [{"name": "delivered.txt", "content": "ok"}]}
+        self.desktop.request = files
+        self.controller.consume_task = asyncio.create_task(self.controller.consume())
+        await self.controller.start_task("test task")
+        self.assertEqual(self.controller.state["status"], "verifying")
+        gate.set()
+        await asyncio.sleep(0)
+        self.assertEqual(self.controller.state["status"], "completed")
+        self.assertEqual(self.controller.state["files"][0]["name"], "delivered.txt")
+
     async def test_resume_rpc_failure_keeps_desktop_paused(self):
         self.controller.state.update(status="paused", id="task", thread_id="test-thread", turn_id="old-turn")
         self.controller.client.rpc.side_effect = RuntimeError("thread cannot be loaded")

@@ -3,8 +3,11 @@
 Work in progress: the local UI, Codex provider bridge, Computer MCP and Windows
 VM executor work end to end. Three real-model Windows smoke tasks have produced
 independently verified files, including one pause/resume run. Repeated trials
-from a clean snapshot, long-history retrieval and physical-machine acceptance
-remain open. See `../../docs/computer_use_codex_m2_20261001.md` for evidence.
+from a clean snapshot and physical-machine acceptance remain open. A real
+Codex observation fixture preserved eight images through 168K tokens and
+answered a historical-image question with above-budget KVMem selection.
+See `../../docs/computer_use_codex_m2_20261001.md` for desktop evidence and
+`../../docs/computer_use_long_history_20261001.md` for the separate diagnostics.
 See `../../docs/computer_use_codex_goal_20260930.md` for the full goal.
 
 ## Runtime
@@ -34,9 +37,8 @@ are never delivered for execution.
 
 The model catalog advertises image input and a 1M logical context. Automatic
 compaction starts at 950K tokens, above the 128K KVMem retrieval threshold.
-Image-budget compaction is disabled. Long-history retrieval and Codex's actual
-behavior near the context limit still need measurement; short-history prefix
-reuse does not qualify them.
+Image-budget compaction is disabled. Preservation and retrieval passed a 168K
+diagnostic; Codex's behavior near the 1M context limit remains unqualified.
 
 ## Development and tests
 
@@ -160,6 +162,19 @@ smoke tasks were not repeated from a common snapshot; they are not a benchmark
 success rate. `vm/provision.py` is a setup-only QEMU console helper, never a
 model-accessible tool. `vm/vnc_admin.py` captures diagnostic screenshots only.
 
+`windows_suite.py` automates the same-snapshot repetitions. Stop the app and
+engine first; the suite restores only the task-owned VM and starts a fresh app
+and engine for every trial. It checks saved files directly through the guest
+and checks Ctrl+C/Ctrl+V action receipts for the copy task. Every failure and
+source identity is retained. A completed suite can still contain failed trials;
+inspect `summary.json` rather than treating process exit as task success.
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_suite.py \
+  --snapshot qw3-clean-20261001 --kvmem on off --repetitions 3 \
+  --run-dir apps/computer_use/.runtime/windows-suite-new
+```
+
 The Windows guest currently runs the executor; the UI, Codex and GPU model run
 on Linux. A packaged native Windows/Mac application and physical-desktop tests
 are separate qualification steps. The dedicated VM test account is elevated;
@@ -185,6 +200,31 @@ fresh for each profile and remains warm across its ordered requests; distinguish
 the first pass from subsequent passes. It never dispatches generated actions.
 Startup/capacity failures are retained without silently truncating one side.
 Short histories below K128K qualify overhead and function, not retrieval benefits.
+
+For above-budget diagnostics, start a fresh engine with
+`--visual-history retrievable --trace-retrieval`. This allows old visual spans
+to participate in retrieval. The default `pin-all` policy protects all images
+and cannot fit an unlimited screenshot history into the fixed K budget.
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/long_history_probe.py \
+  --engine-dir apps/computer_use/.runtime/engine-new-run \
+  --run-dir apps/computer_use/.runtime/history-new-run
+
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/smoke_codex_long.py \
+  --engine-dir apps/computer_use/.runtime/engine-new-run \
+  --historical apps/computer_use/.runtime/history-new-run/historical.png \
+  --current apps/computer_use/.runtime/history-new-run/current.png \
+  --run-dir apps/computer_use/.runtime/codex-history-new-run
+```
+
+The first diagnostic uses recorded screenshots from the frozen short corpus
+and synthetic archive notes. It checks short recognition, budget crossing,
+retrieval and visual-cache invalidation after replacing the historical image.
+The second uses real Codex and an observation fixture; it never sends desktop
+input. Use a fresh engine for each isolated measurement, and distinguish warm
+prefix reuse from cold on/off comparisons. The long cold corpus can be replayed
+with `compare_replay.py --visual-history retrievable --trace-retrieval`.
 
 Sources: [Codex app-server](https://learn.chatgpt.com/docs/app-server),
 [Codex config](https://learn.chatgpt.com/docs/config-file/config-reference),

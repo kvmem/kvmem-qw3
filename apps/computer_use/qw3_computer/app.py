@@ -30,7 +30,7 @@ class Controller:
         token_file.chmod(0o600)
         self.state_path = self.runtime / "task.json"
         self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {"status": "idle"}
-        if self.state["status"] in ("starting", "running", "paused"):
+        if self.state["status"] in ("starting", "running", "verifying", "paused"):
             self.state["status"] = "paused"
             self.state["notice"] = "应用已重新启动。请核对当前桌面后继续。"
         self.state.setdefault("messages", [])
@@ -77,7 +77,7 @@ class Controller:
                 params = event.get("params", {})
                 if method == "app/disconnected":
                     self.ready = False
-                    if self.state["status"] in ("starting", "running", "paused"):
+                    if self.state["status"] in ("starting", "running", "verifying", "paused"):
                         self.state.update(status="paused", notice="Codex 连接已断开。重启应用后可核对桌面并继续。")
                     with contextlib.suppress(DesktopError):
                         await self.desktop.control("pause")
@@ -97,7 +97,7 @@ class Controller:
                 elif method == "turn/completed" and params["turn"]["id"] == self.state.get("turn_id"):
                     status = params["turn"]["status"]
                     if self.state["status"] not in ("paused", "stopped"):
-                        self.state["status"] = "completed" if status == "completed" else "failed"
+                        self.state["status"] = "verifying"
                     self.state["turn_status"] = status
                     self.state["turn_error"] = params["turn"].get("error")
                     self.state["current_action"] = None
@@ -107,6 +107,9 @@ class Controller:
                         self.state["files"] = (await self.desktop.request("GET", "/files"))["files"]
                     except DesktopError as exc:
                         self.state["notice"] = str(exc)
+                        self.state["evidence_error"] = str(exc)
+                    if self.state["status"] == "verifying":
+                        self.state["status"] = "completed" if status == "completed" else "failed"
                     self.state["finished_at"] = time.time()
                 self.save()
 
@@ -114,7 +117,7 @@ class Controller:
         async with self.control_lock:
             if not self.ready:
                 raise DesktopError("应用尚未就绪。")
-            if self.state["status"] in ("starting", "running", "paused"):
+            if self.state["status"] in ("starting", "running", "verifying", "paused"):
                 raise DesktopError("请先停止或继续当前任务。")
             if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 12000:
                 raise DesktopError("请输入 1–12000 字的任务描述。")
@@ -220,7 +223,7 @@ class Controller:
 
     async def close(self):
         self.ready = False
-        if self.state["status"] in ("starting", "running"):
+        if self.state["status"] in ("starting", "running", "verifying"):
             self.state.update(status="paused", notice="应用已关闭。重启后请核对桌面并继续。")
             self.save()
         if self.consume_task:

@@ -223,6 +223,15 @@ the common comparison configuration now reserves 48GiB CPU tier capacity.
 This does not reinstate the retired 48GB GPU limit. Long-history retrieval,
 native Windows/Mac client packaging and physical-desktop acceptance remain open.
 
+Further progress 2026-10-01: above-budget historical-image diagnostics passed
+at 158,911 tokens, including a changed-image negative control that invalidated
+prefix reuse. A matched DFlash KVMem on/off replay passed all four positive and
+negative checks. Real Codex preserved eight image observations and all archive
+notes through 168,845 tokens and correctly answered the old-image question with
+actual sparse selection. See `computer_use_long_history_20261001.md`; synthetic
+archive diagnostics do not substitute for live desktop task acceptance. The
+application now publishes task completion only after collecting output evidence.
+
 - Codex app-server: https://learn.chatgpt.com/docs/app-server
 - Codex provider configuration:
   https://learn.chatgpt.com/docs/config-file/config-reference

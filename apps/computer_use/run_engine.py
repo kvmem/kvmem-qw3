@@ -17,6 +17,8 @@ def main():
                         help="CPU tier capacity; 1M context with native MTP needs more than 32 GiB")
     parser.add_argument("--prefix-reuse", choices=["auto", "off"], default="auto",
                         help="off gives cold fixed-input replay on both KVMem sides")
+    parser.add_argument("--visual-history", choices=["pin-all", "retrievable"], default="pin-all")
+    parser.add_argument("--trace-retrieval", action="store_true")
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--lock-timeout", type=float, default=0,
                         help="Wait briefly for a previous owned engine's GPU lock to be released")
@@ -43,10 +45,17 @@ def main():
                 time.sleep(0.2)
         os.set_inheritable(handle.fileno(), True)
         handles.append(handle)
-    users = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid",
-                                     "--format=csv,noheader"], text=True).strip()
-    if users:
-        raise SystemExit("GPU has existing compute processes; refusing to start")
+    deadline = time.monotonic() + args.lock_timeout
+    while True:
+        users = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid",
+                                         "--format=csv,noheader"], text=True).strip()
+        if not users:
+            break
+        if time.monotonic() >= deadline:
+            raise SystemExit("GPU has existing compute processes; refusing to start: " + users)
+        # A terminated process can briefly remain visible to the driver after
+        # its file locks disappear. Never start over its outstanding context.
+        time.sleep(0.2)
     gpu = subprocess.check_output(["nvidia-smi", "--query-gpu=uuid,name,memory.total,memory.used",
                                    "--format=csv,noheader"], text=True).strip()
     binary = root / "build-dflash-integration/qw3"
@@ -72,10 +81,18 @@ def main():
     env = {k: v for k, v in os.environ.items() if not k.startswith("QW3_")}
     if args.method == "dflash2":
         env["QW3_DFLASH_PRIVATE_MAX_DRAFT_TOKENS"] = "7"
+    if args.kvmem == "on" and args.visual_history == "retrievable":
+        env["QW3_KVMEM_RETRIEVABLE_VISUAL_HISTORY"] = "1"
+    if args.trace_retrieval:
+        env["QW3_KVMEM_TRACE"] = "1"
+        env["QW3_KVMEM_PREFIX_CACHE_TRACE"] = "1"
+        env["QW3_KVMEM_DUMP_SCORES"] = str(run / "retrieval.jsonl")
     manifest = {"command": command, "qw3_env": {k: v for k, v in env.items() if k.startswith("QW3_")},
                 "gpu": gpu, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
                 "kvmem": args.kvmem, "prefix_reuse": args.kvmem == "on" and args.prefix_reuse == "auto",
+                "visual_history": args.visual_history,
+                "launcher_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "pid": os.getpid()}
     (run / "manifest.json").write_text(json.dumps(manifest, indent=2))
     log = (run / "engine.log").open("ab", buffering=0)

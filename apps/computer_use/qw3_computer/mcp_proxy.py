@@ -70,4 +70,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    # MCP JSONL is UTF-8 even when Windows' redirected-stdio code page differs.
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
     asyncio.run(main())

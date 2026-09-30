@@ -119,8 +119,11 @@ async def run(args):
                 command = [sys.executable, str(root / "apps/computer_use/run_engine.py"), "--method", method,
                            "--kvmem", kvmem, "--prefix-reuse", "off", "--port", str(args.port),
                            "--kvmem-cpu-gib", str(args.kvmem_cpu_gib),
-                           "--lock-timeout", "10",
+                           "--lock-timeout", "30",
+                           "--visual-history", args.visual_history,
                            "--run-dir", str(directory / "engine")]
+                if args.trace_retrieval:
+                    command.append("--trace-retrieval")
                 print("starting", label, flush=True)
                 with (directory / "launcher.log").open("wb") as log:
                     proc = await asyncio.create_subprocess_exec(*command, cwd=root, stdout=log, stderr=log)
@@ -175,5 +178,7 @@ if __name__ == "__main__":
     parser.add_argument("--kvmem", nargs="+", choices=["on", "off"], default=["on", "off"])
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--kvmem-cpu-gib", type=int, default=48)
+    parser.add_argument("--visual-history", choices=["pin-all", "retrievable"], default="pin-all")
+    parser.add_argument("--trace-retrieval", action="store_true")
     parser.add_argument("--port", type=int, default=18080)
     asyncio.run(run(parser.parse_args()))

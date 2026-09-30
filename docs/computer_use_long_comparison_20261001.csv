@@ -1,0 +1,5 @@
+profile,case,repetition,status,prompt_tokens,completion_tokens,first_output_seconds,elapsed_seconds,prefill_seconds,decode_seconds,decode_tokens_per_second,cpu_seconds,rss_bytes
+dflash2-kvmem-on,present_image,0,completed,158911,40,64.63880758872256,65.01426316797733,63.921,0.369,108.52,68.02000000000001,38346567680
+dflash2-kvmem-on,absent_image,0,completed,158911,15,63.7946718679741,63.94692320097238,63.66,0.147,101.94,67.45999999999998,38350491648
+dflash2-kvmem-off,present_image,0,completed,158911,40,59.43817847687751,59.829157926142216,58.904,0.384,104.04,59.7,31001595904
+dflash2-kvmem-off,absent_image,0,completed,158911,23,58.986749093048275,59.16076693171635,58.902,0.167,137.35,59.25,31014105088
