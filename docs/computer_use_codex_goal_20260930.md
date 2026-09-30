@@ -31,6 +31,14 @@ variables for VM image downloads. Do not change the host's global proxy settings
 or unrelated containers. The initial aria2 Windows ISO download had no proxy
 environment variables; the VM launcher also explicitly clears them for later runs.
 
+Comparison scope update, 2026-10-01: the user also requires KVMem enabled versus
+disabled comparison. Use a KVMem on/off × none/native-MTP/DFlash matrix with
+the same frozen task, image and history inputs. Compare success, latency,
+throughput and CPU/GPU resources. Include cold fixed-input replay to separate
+retrieval effects from prefix-reuse effects, alongside the actual application
+flows. Report long-history capacity failures as such; do not truncate only one
+side or compare different inputs as equivalent runs.
+
 ## Existing baseline and evidence
 
 - Preserve the existing source changes in a local Git checkpoint before new
@@ -141,6 +149,7 @@ Sampled whole-device usage and allocator measurements have different scopes;
 report both where available and do not present sampling as a hard guarantee.
 Report screenshot-to-action latency, TTFT, action latency P50/P95, vision time,
 decode time, retrieval/replay time, CPU RAM, GPU peak and task outcomes.
+The KVMem on/off decoder matrix above is now required acceptance evidence.
 
 ### M4: repeatable VM and physical-desktop validation
 
@@ -198,9 +207,21 @@ do not claim GPU, VM or physical-machine tests that have not run.
 ## References
 
 Progress after M0: the provider prototype and a real Codex → QW3/DFlash →
-two-round image MCP smoke are working. Windows VM installation is underway.
+two-round image MCP smoke are working. Windows VM installation is complete.
 See `computer_use_codex_m1_20261001.md` for exact successes, retained failures,
 resource observations and remaining acceptance. The goal is still active.
+
+Progress 2026-10-01: the local UI, durable Computer MCP boundary and Windows
+executor now work with real Codex and QW3/DFlash. Three Windows tasks produced
+independently verified files; cross-application copy/paste also passed a real
+pause/resume cycle. These are single smoke trials, not the three-repetition
+snapshot acceptance. See `computer_use_codex_m2_20261001.md`. The short-history
+KVMem on/off × decoder matrix completed 54/54 frozen-input requests; see
+`computer_use_kvmem_comparison_20261001.md` for actual timings and limits.
+Native MTP at 1M context exceeded the initial 32GiB CPU backing configuration;
+the common comparison configuration now reserves 48GiB CPU tier capacity.
+This does not reinstate the retired 48GB GPU limit. Long-history retrieval,
+native Windows/Mac client packaging and physical-desktop acceptance remain open.
 
 - Codex app-server: https://learn.chatgpt.com/docs/app-server
 - Codex provider configuration:

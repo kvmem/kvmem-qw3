@@ -26,6 +26,14 @@ def main():
         raise SystemExit(f"{NAME} already exists; inspect it instead of replacing it")
     for directory in ("storage", "shared"):
         (runtime / directory).mkdir(exist_ok=True)
+    source = Path(__file__).resolve().parent
+    for name in ("executor.ps1", "fixture.html", "bootstrap.ps1"):
+        shutil.copyfile(source / name, runtime / "shared" / name)
+    token = runtime / "shared" / "executor-token.txt"
+    if not token.exists():
+        with token.open("x") as output:
+            token.chmod(0o600)
+            output.write(secrets.token_hex(32))
     credentials = runtime / "windows.env"
     if not credentials.exists():
         with credentials.open("x") as output:

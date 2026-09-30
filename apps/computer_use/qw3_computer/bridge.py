@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+from pathlib import Path
 import time
 import uuid
 
@@ -140,7 +141,7 @@ class ResponseStream:
         await self.emit("response.failed", response=self.response)
 
 
-def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096):
+def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096, trace_dir=None):
     app = web.Application(client_max_size=64 * 1024 * 1024)
     lock = asyncio.Lock()
 
@@ -162,6 +163,15 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
         if lock.locked():
             return web.json_response({"error": {"message": "another local inference request is active"}}, status=409)
         async with lock:
+            trace = None
+            if trace_dir is not None:
+                trace = Path(trace_dir) / uuid.uuid4().hex
+                trace.mkdir(parents=True)
+                # Keep exact local inputs for paired on/off replay. This opt-in
+                # trace belongs to the application runtime, never source control.
+                (trace / "request.json").write_text(json.dumps(converted.body, ensure_ascii=False))
+            started = time.monotonic()
+            metrics = {"started_at": time.time(), "status": "in_progress"}
             output = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                                  "Cache-Control": "no-cache"})
             stream = ResponseStream(output, public_model, converted.names)
@@ -169,26 +179,35 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                 async with app[BACKEND].post(backend_url.rstrip("/") + "/chat/completions",
                                                 json=converted.body) as upstream:
                     if upstream.status != 200:
+                        metrics.update(status="http_error", http_status=upstream.status)
                         return web.json_response({"error": {"message": f"QW3 returned HTTP {upstream.status}"}}, status=502)
                     await output.prepare(request)
                     await stream.start()
                     done = False
                     async for data in read_sse(upstream.content):
+                        metrics.setdefault("first_event_seconds", time.monotonic() - started)
                         if data == "[DONE]":
                             done = True
                             break
-                        await stream.chunk(json.loads(data))
+                        chunk = json.loads(data)
+                        if trace is not None:
+                            with (trace / "backend.jsonl").open("a") as log:
+                                log.write(data + "\n")
+                        await stream.chunk(chunk)
                     require(done, "backend stream ended without [DONE]")
                     await stream.finish()
+                    metrics.update(status=stream.response["status"], usage=stream.usage)
                     await output.write_eof()
                     return output
             except asyncio.CancelledError:
+                metrics["status"] = "cancelled"
                 # aiohttp handler_cancellation closes the upstream request even
                 # when the client disconnects during a long, silent prefill.
                 LOG.info("local request cancelled; upstream connection closed")
                 raise
             except (ProtocolError, ValueError, TypeError, KeyError, IndexError,
                     aiohttp.ClientError, TimeoutError) as exc:
+                metrics.update(status="failed", error=str(exc))
                 LOG.warning("local backend failed: %s", exc)
                 if not output.prepared:
                     return web.json_response({"error": {"message": str(exc)}}, status=502)
@@ -198,6 +217,10 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                 except (ConnectionError, RuntimeError):
                     pass
                 return output
+            finally:
+                if trace is not None:
+                    metrics["elapsed_seconds"] = time.monotonic() - started
+                    (trace / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     app.router.add_post("/v1/responses", responses)
     return app

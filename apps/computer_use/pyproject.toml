@@ -11,6 +11,10 @@ dependencies = ["aiohttp==3.14.0", "Pillow>=10,<13"]
 
 [project.scripts]
 qw3-responses = "qw3_computer.bridge:main"
+qw3-computer = "qw3_computer.app:main"
 
 [tool.setuptools.packages.find]
 include = ["qw3_computer*"]
+
+[tool.setuptools.package-data]
+qw3_computer = ["ui.html"]

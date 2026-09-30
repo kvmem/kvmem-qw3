@@ -1,8 +1,10 @@
 # Local Codex computer use
 
-Work in progress: the provider bridge and real-model image/tool smoke are
-working. Windows VM installation is provisioned. The desktop executor, task UI,
-repeatable Windows task suite and physical-machine acceptance remain open.
+Work in progress: the local UI, Codex provider bridge, Computer MCP and Windows
+VM executor work end to end. Three real-model Windows smoke tasks have produced
+independently verified files, including one pause/resume run. Repeated trials
+from a clean snapshot, long-history retrieval and physical-machine acceptance
+remain open. See `../../docs/computer_use_codex_m2_20261001.md` for evidence.
 See `../../docs/computer_use_codex_goal_20260930.md` for the full goal.
 
 ## Runtime
@@ -80,11 +82,15 @@ shared DFlash experiment lock when present. It requires local model assets:
 - `models/Qwen3.8-27B-DFlash2-BF16`
 - `models/Qwen3.8-27B-BF16` for the matching visual tower
 
-The initial profile uses FP8 KV, K128K/G64K, 1M logical context, a 32GiB CPU
+The profile uses FP8 KV, K128K/G64K, 1M logical context, a 48GiB CPU
 tier, 128-token blocks with four 32-token scoring slices, message-level
 retrieval and multimodal prefix reuse. It uses the available 96GB-class GPU;
 48GB is not an acceptance limit. `--method none` and `--method mtp` select
-separate controls; neither control has been measured for this app yet.
+separate controls. `--kvmem on|off` selects the memory policy, and
+`--prefix-reuse off` disables prefix reuse for paired fixed-input replay.
+The first DFlash smoke used a 32GiB CPU tier. A later MTP startup check showed
+that its additional KV backing exceeds that budget at 1M context, so the common
+comparison profile uses 48GiB. This is CPU memory capacity, not a GPU limit.
 
 The smoke checks a real model identifying a red input image, requesting two
 MCP fixture observations and identifying the returned blue screenshots. It
@@ -107,13 +113,78 @@ docker logs --tail 30 qw3-computer-windows
 ```
 
 Only loopback ports are published: browser viewer `http://127.0.0.1:18006`,
-VNC `15900`, and the planned desktop executor `18082`. The VM has no GPU
+VNC `15900`, and the desktop executor `18082`. The VM has no GPU
 passthrough. The GPU model remains on the Linux host.
 
-The bootstrap runs in the VM's test account desktop. It waits for the reviewed
-`executor.ps1` and token file in the dedicated shared directory; the executor
-is not implemented yet. Windows/Mac endpoint testing and inference running
-entirely on an ordinary Windows/Mac machine are separate qualification steps.
+The launcher stages `executor.ps1`, the offline fixture and a random token into
+the VM's dedicated share. The bootstrap runs them in its logged-in test account
+desktop and configures this account's Edge download folder. It never runs on
+the host. The executor exposes screenshots, bounded click/type/key/scroll and
+three allowed applications (Notepad, Edge, Explorer). Every action refers to
+the current desktop and observation, expires after 60 seconds, and checks the
+foreground window. Completed action IDs return their durable receipt. An
+uncertain delivery pauses operation and must be reconciled before continuing.
+
+Start the engine above, then launch the application:
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python -m qw3_computer.app \
+  --runtime apps/computer_use/.runtime/my-desktop-run \
+  --desktop-token apps/computer_use/.runtime/windows/shared/executor-token.txt
+```
+
+Open `http://127.0.0.1:18083`. The UI shows progress, latest screenshot, pause,
+resume/stop controls and saved-file contents. The viewer on `18006` supports
+manual takeover while the application is paused. Refreshing the UI image does
+not invalidate the model's active observation. SQLite action records, images,
+Codex history and exact inference requests stay in the app-owned runtime.
+On restart, unfinished tasks are paused until explicitly resumed.
+
+```bash
+# Start each trial with no pre-existing expected output file.
+.venv/bin/python apps/computer_use/windows_task.py --case cross_app \
+  --pause-after-seconds 6 --run-dir apps/computer_use/.runtime/cross-app-new
+
+# Stop the application first; keep the VM running for fixture preparation.
+python3 apps/computer_use/vm/provision.py apps/computer_use/vm/prepare_baseline.ps1
+# Snapshot operations require the VM powered off.
+docker stop -t 120 qw3-computer-windows
+python3 apps/computer_use/vm/snapshot.py create --name clean-baseline
+docker start qw3-computer-windows
+# Before a repeat: stop, restore the same named snapshot, then start again.
+```
+
+`windows_task.py` freezes three task definitions and checks actual saved text
+or JSON. A completed model turn alone never qualifies the file check. Initial
+smoke tasks were not repeated from a common snapshot; they are not a benchmark
+success rate. `vm/provision.py` is a setup-only QEMU console helper, never a
+model-accessible tool. `vm/vnc_admin.py` captures diagnostic screenshots only.
+
+The Windows guest currently runs the executor; the UI, Codex and GPU model run
+on Linux. A packaged native Windows/Mac application and physical-desktop tests
+are separate qualification steps. The dedicated VM test account is elevated;
+this prototype is not qualified as a general-purpose desktop permission sandbox.
+
+## KVMem and decoder comparison
+
+Freeze `inference/*/request.json` inputs into a corpus with a `manifest.json`
+containing each case's `name`, relative `path`, and `sha256`. Use identical
+payloads, image bytes, generation limits and order for both memory policies.
+Stop the application and its engine before running the comparison:
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/compare_replay.py \
+  --corpus apps/computer_use/.runtime/replay-corpus-01 \
+  --run-dir apps/computer_use/.runtime/comparison-new
+```
+
+This runs KVMem on/off × none/MTP/DFlash, three repetitions by default, with
+prefix reuse disabled. It records exact launch manifests, streamed outputs,
+latencies, CPU time, process RSS and sampled GPU resources. Vision cache starts
+fresh for each profile and remains warm across its ordered requests; distinguish
+the first pass from subsequent passes. It never dispatches generated actions.
+Startup/capacity failures are retained without silently truncating one side.
+Short histories below K128K qualify overhead and function, not retrieval benefits.
 
 Sources: [Codex app-server](https://learn.chatgpt.com/docs/app-server),
 [Codex config](https://learn.chatgpt.com/docs/config-file/config-reference),

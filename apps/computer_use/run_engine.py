@@ -6,12 +6,20 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--method", choices=["none", "mtp", "dflash2"], default="dflash2")
+    parser.add_argument("--kvmem", choices=["on", "off"], default="on")
+    parser.add_argument("--kvmem-cpu-gib", type=int, default=48,
+                        help="CPU tier capacity; 1M context with native MTP needs more than 32 GiB")
+    parser.add_argument("--prefix-reuse", choices=["auto", "off"], default="auto",
+                        help="off gives cold fixed-input replay on both KVMem sides")
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--lock-timeout", type=float, default=0,
+                        help="Wait briefly for a previous owned engine's GPU lock to be released")
     parser.add_argument("--run-dir", type=Path, required=True)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
@@ -24,7 +32,15 @@ def main():
     handles = []
     for path in locks:
         handle = path.open("rb" if path == shared else "a")
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + args.lock_timeout
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SystemExit(f"GPU experiment lock is busy: {path}")
+                time.sleep(0.2)
         os.set_inheritable(handle.fileno(), True)
         handles.append(handle)
     users = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid",
@@ -38,13 +54,17 @@ def main():
                "--vision-model", str(root / "models/Qwen3.8-27B-BF16"), "--vision-device", "cuda",
                "--host", "127.0.0.1", "--port", str(args.port), "--ctx", "1048576",
                "--kv-dtype", "fp8", "--speculative-method", args.method,
-               "--prefill-chunk", "2048", "--kvmem", "--kvmem-block-tokens", "128",
+               "--prefill-chunk", "2048"]
+    if args.kvmem == "on":
+        command += ["--kvmem", "--kvmem-block-tokens", "128",
                "--kvmem-budget", "131072", "--kvmem-gen-budget", "65536",
-               "--kvmem-cpu-gb", "32",
-               "--kvmem-prefill-budget", "131072", "--kvmem-prefix-cache",
+               "--kvmem-cpu-gb", str(args.kvmem_cpu_gib),
+               "--kvmem-prefill-budget", "131072",
                "--kvmem-query-conditioned", "--kvmem-query-replay",
                "--kvmem-retrieval-method", "sub-block-mean-k",
                "--kvmem-semantic-expansion", "message"]
+        if args.prefix_reuse == "auto":
+            command += ["--kvmem-prefix-cache"]
     if args.method == "dflash2":
         command += ["--dflash-model", str(root / "models/Qwen3.8-27B-DFlash2-BF16")]
     elif args.method == "mtp":
@@ -55,6 +75,7 @@ def main():
     manifest = {"command": command, "qw3_env": {k: v for k, v in env.items() if k.startswith("QW3_")},
                 "gpu": gpu, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+                "kvmem": args.kvmem, "prefix_reuse": args.kvmem == "on" and args.prefix_reuse == "auto",
                 "pid": os.getpid()}
     (run / "manifest.json").write_text(json.dumps(manifest, indent=2))
     log = (run / "engine.log").open("ab", buffering=0)

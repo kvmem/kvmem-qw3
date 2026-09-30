@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QW3 桌面助手</title>
+<style>
+:root{font:15px system-ui,-apple-system,"Segoe UI",sans-serif;color:#26364a;background:#f5f6f8}*{box-sizing:border-box}
+body{margin:0}header{padding:20px 30px;background:white;border-bottom:1px solid #e2e6ec;display:flex;align-items:center;justify-content:space-between}
+h1{font-size:20px;margin:0;letter-spacing:.02em}header small{color:#718096;margin-left:16px}.badge{padding:7px 13px;background:#edf2f7;border-radius:20px;font-size:13px}
+main{display:grid;grid-template-columns:minmax(300px,360px) minmax(0,1fr);gap:24px;max-width:1700px;margin:auto;padding:24px}
+.card{background:white;border:1px solid #e2e6ec;border-radius:12px;padding:22px;margin-bottom:20px}h2{font-size:16px;margin:0 0 16px}
+textarea{width:100%;resize:vertical;min-height:155px;padding:12px;border:1px solid #bdc7d5;border-radius:7px;font:inherit;line-height:1.65}
+button{border:1px solid #c6cfdc;background:white;border-radius:7px;padding:10px 15px;font:600 14px system-ui;cursor:pointer}button:disabled{opacity:.4;cursor:default}
+.primary{color:white;background:#214eb4;border-color:#214eb4}.row{display:flex;gap:9px;margin-top:14px;flex-wrap:wrap}
+.note{color:#6b788a;line-height:1.6;font-size:13px}.warning{color:#9b4b12;background:#fff6e9;padding:12px;border-radius:7px;white-space:pre-wrap;display:none}
+.screen{padding:0;overflow:hidden;background:#182434;min-height:260px;display:flex;align-items:center;justify-content:center}.screen img{display:block;width:100%;height:auto}
+.screenbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.messages{white-space:pre-wrap;line-height:1.7;max-height:440px;overflow:auto}.message+.message{border-top:1px solid #e8ebef;padding-top:12px;margin-top:12px}
+.action{font:13px ui-monospace,monospace;white-space:pre-wrap;color:#536781}.file{display:block;padding:10px;background:#f4f7fb;margin:8px 0;border-radius:6px;word-break:break-all}details{font-size:13px;margin-top:12px;white-space:pre-wrap}
+#ackrow{display:none;font-size:13px;line-height:1.6;margin-top:10px}@media(max-width:900px){main{grid-template-columns:1fr}.screen{min-height:160px}}
+</style>
+<header><div><h1>QW3 桌面助手 <small>本地运行</small></h1></div><span class="badge" id="status">连接中</span></header>
+<main><aside>
+<section class="card"><h2>让电脑帮你完成任务</h2><textarea id="prompt" placeholder="例如：打开记事本，写下会议要点并保存到指定文件。"></textarea>
+<div class="row"><button class="primary" id="start">开始任务</button><button id="stop">停止</button></div>
+<p class="note">助手只操作选中的测试桌面。你可以随时暂停接管，核对当前画面后继续。</p><div class="warning" id="notice"></div></section>
+<section class="card"><h2>操作与进度</h2><div class="action" id="action">等待任务</div>
+<div class="row"><button id="pause">暂停接管</button><button id="resume">继续任务</button></div>
+<label id="ackrow"><input id="ack" type="checkbox"> 我已核对画面，确认可以从当前状态继续。</label>
+<p class="note" id="target"></p></section>
+<section class="card"><h2>输出文件</h2><div id="files" class="note">完成后将在这里显示文件证据。</div></section>
+</aside><div>
+<div class="screenbar"><strong id="window">测试桌面</strong><button id="refresh">刷新画面</button></div>
+<section class="card screen"><img id="screen" alt="选中桌面的最新截图"></section>
+<section class="card"><h2>任务记录</h2><div id="messages" class="messages note">任务开始后，会显示助手的进度和结果。</div></section>
+</div></main>
+<script>
+const el=id=>document.getElementById(id);let lastImage='',state={};
+const labels={idle:'就绪',starting:'准备中',running:'正在执行',paused:'已暂停',stopped:'已停止',completed:'已结束 · 请核对结果',failed:'执行失败'};
+function error(message){el('notice').textContent=message;el('notice').style.display=message?'block':'none'}
+async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok)throw Error(data.error||'操作失败');return data}
+function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s.status):'尚未就绪';
+ const running=['starting','running'].includes(s.status),paused=s.status==='paused';
+ el('start').disabled=!s.ready||running||paused;el('pause').disabled=!running;el('resume').disabled=!paused||!s.ready;el('stop').disabled=!running&&!paused;el('refresh').disabled=!s.desktop_paused;
+ el('ackrow').style.display=s.uncertain_actions?.length?'block':'none';error(s.notice||s.turn_error?.message||'');
+ el('action').textContent=s.current_action?JSON.stringify(s.current_action,null,2):(running?'正在观察和思考…':labels[s.status]||'等待任务');
+ const o=s.observation;if(o){el('window').textContent=o.foreground.title||'Windows 桌面';el('target').textContent=`${o.width} × ${o.height} · ${o.foreground.process||'桌面'}`;if(o.sha256!==lastImage){lastImage=o.sha256;el('screen').src='/api/screenshot?v='+encodeURIComponent(lastImage)}}
+ const messages=[...(s.messages||[]),...(s.draft?[s.draft]:[])];el('messages').replaceChildren(...messages.map(text=>{const p=document.createElement('div');p.className='message';p.textContent=text;return p}));
+ el('files').replaceChildren(...(s.files||[]).map(f=>{const d=document.createElement('details');d.className='file';const summary=document.createElement('summary');summary.textContent=f.name+' · '+f.size+' 字节';d.append(summary,document.createTextNode(f.content));return d}));
+}
+el('start').onclick=()=>post('/api/task',{prompt:el('prompt').value,acknowledge_uncertain:el('ack').checked}).then(s=>{el('ack').checked=false;render(s)}).catch(e=>error(e.message));
+for(const command of ['pause','stop','resume'])el(command).onclick=()=>post('/api/control',{command,acknowledge_uncertain:el('ack').checked}).then(s=>{el('ack').checked=false;render(s)}).catch(e=>error(e.message));
+el('refresh').onclick=()=>post('/api/observe',{}).then(render).catch(e=>error(e.message));
+async function poll(){try{const response=await fetch('/api/state');render(await response.json())}catch(e){error('连接已断开，请检查本地应用。')}setTimeout(poll,600)}poll();
+</script></html>
