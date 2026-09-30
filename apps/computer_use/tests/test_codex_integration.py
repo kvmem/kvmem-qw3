@@ -20,7 +20,7 @@ from test_bridge import chunk, serve
 
 @unittest.skipUnless(os.environ.get("QW3_TEST_CODEX") == "1", "set QW3_TEST_CODEX=1 for real Codex")
 class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_images_two_mcp_rounds_and_interrupt(self):
+    async def test_images_success_error_mcp_rounds_and_interrupt(self):
         calls = []
         waiting, cancelled = asyncio.Event(), asyncio.Event()
         async def backend(request):
@@ -52,7 +52,7 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
         bridge_runner, bridge_url = await serve(create_app(url + "/v1"))
         with tempfile.TemporaryDirectory(prefix="qw3-codex-integration-") as runtime:
             write_config(runtime, bridge_url + "/v1", sys.executable,
-                         [str(Path(__file__).with_name("fixture_mcp.py").resolve())])
+                         [str(Path(__file__).with_name("fixture_mcp.py").resolve()), "--error-second"])
             client = CodexClient(runtime)
             async def completed(turn):
                 while True:
@@ -78,6 +78,7 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([m["tool_call_id"] for m in outputs], ["call_1", "call_2"])
                 for output in outputs:
                     self.assertTrue(any(p.get("type") == "image_url" for p in output["content"]), output)
+                self.assertIn("Action rejected without dispatch", json.dumps(outputs[1]))
                 self.assertEqual(calls[1]["messages"], calls[2]["messages"][:len(calls[1]["messages"])])
                 turn = await client.turn(thread, "Wait for cancellation.")
                 await asyncio.wait_for(waiting.wait(), 10)

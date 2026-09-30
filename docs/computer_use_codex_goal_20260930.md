@@ -253,6 +253,16 @@ VM: restart remained paused until explicit resume, then the original task
 completed with the exact saved copy code. The corrected 18-trial live on/off
 suite has started from the new snapshot; full repeated acceptance is still open.
 
+The second suite subsequently finished with 17/18 passed: on 9/9, off 8/9.
+The last cross-app task timed out after inefficient wheel navigation and a
+Save As foreground transition. All attempts and per-trial resource/action
+metrics are retained. The current repair makes wheel direction and target
+coordinates explicit, returns a fresh observation after a confirmed rejected
+action, and waits for scroll animation. The real executor probe and 31 local
+contracts pass; a new model-driven suite is still required. The queued native
+pilot correctly did not start after the failed prerequisite. See the updated
+Windows validation report; this does not close repeated acceptance.
+
 - Codex app-server: https://learn.chatgpt.com/docs/app-server
 - Codex provider configuration:
   https://learn.chatgpt.com/docs/config-file/config-reference

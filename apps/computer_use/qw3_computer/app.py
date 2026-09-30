@@ -14,7 +14,7 @@ from aiohttp import web
 
 from .bridge import create_app as bridge_app
 from .codex import CodexClient, write_config
-from .desktop import Desktop, DesktopError, mcp_observation
+from .desktop import Desktop, DesktopError, DesktopRejected, mcp_observation
 
 
 class Controller:
@@ -217,6 +217,16 @@ class Controller:
                 self.state["notice"] = "连续操作没有改变桌面，任务已暂停。"
                 await self.client.interrupt(self.state["thread_id"], self.state["turn_id"])
             return mcp_observation(result["observation"], result)
+        except DesktopRejected as exc:
+            # The guest explicitly confirms that no input was dispatched.
+            # Return a current screen so recovery need not spend a model turn
+            # requesting observe. The rejected action ID stays reserved.
+            try:
+                observation = await self.desktop.observe()
+            except DesktopError:
+                raise exc
+            return mcp_observation(observation, {"action_id": arguments.get("action_id"),
+                "status": "rejected", "dispatched": False, "error": str(exc)}) | {"isError": True}
         except BaseException:
             if self.desktop.paused:
                 self.state["status"] = "paused"

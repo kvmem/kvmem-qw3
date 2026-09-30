@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import aiohttp
 
 from qw3_computer.app import Controller, web_app
-from qw3_computer.desktop import DesktopError
+from qw3_computer.desktop import DesktopError, DesktopRejected
 from test_bridge import serve
 
 
@@ -103,6 +103,33 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.controller.ready)
         self.assertTrue(self.desktop.paused)
         self.assertEqual(self.controller.state["status"], "paused")
+
+    async def test_known_rejection_returns_fresh_image_without_retry(self):
+        self.controller.state["status"] = "running"
+        self.desktop.paused = False
+        self.desktop.act = AsyncMock(side_effect=DesktopRejected("Foreground changed"))
+        self.desktop.observe.return_value = self.desktop.latest | {"observation_id": "fresh", "image": "new-image"}
+        result = await self.controller.tool("act", {"action_id": "rejected-001", "action": {"kind": "key", "key": "ENTER"}})
+        self.assertTrue(result["isError"])
+        metadata = json.loads(result["content"][0]["text"])
+        self.assertEqual(metadata["status"], "rejected")
+        self.assertFalse(metadata["dispatched"])
+        self.assertEqual(metadata["observation"]["observation_id"], "fresh")
+        self.assertEqual(result["content"][1]["data"], "new-image")
+        self.desktop.act.assert_awaited_once()
+        self.desktop.observe.assert_awaited_once()
+        self.assertFalse(self.desktop.paused)
+        self.assertEqual(self.controller.state["status"], "running")
+
+    async def test_rejected_action_with_failed_refresh_stays_rejected(self):
+        self.controller.state["status"] = "running"
+        self.desktop.paused = False
+        self.desktop.act = AsyncMock(side_effect=DesktopRejected("Foreground changed"))
+        self.desktop.observe.side_effect = DesktopError("Observer unavailable")
+        with self.assertRaisesRegex(DesktopRejected, "Foreground changed"):
+            await self.controller.tool("act", {"action_id": "rejected-002", "action": {"kind": "key", "key": "ENTER"}})
+        self.desktop.act.assert_awaited_once()
+        self.assertFalse(self.desktop.paused)
 
     async def test_clean_shutdown_retains_resumable_task(self):
         self.controller.state.update(status="running", id="task", thread_id="test-thread", turn_id="test-turn")

@@ -132,6 +132,74 @@ The first real-model browser pilot on `qw3-uia-20261001` also passed: 10 actions
 the supplied `(198,604)` and `(261,673)` control centers. Evidence is in
 `windows-uia-pilot-01/`. A single pilot does not complete the repeated suite.
 
-The corrected 18-trial `windows-suite-02` is now running from the new snapshot.
-Real-model native-client desktop execution, complete live on/off repetitions,
-native-client process-crash recovery, Mac and physical-desktop tests remain open.
+## Second snapshot suite: all attempts retained, 17/18 passed
+
+`windows-suite-02` completed all 18 planned attempts using the UIA snapshot.
+KVMem on passed 9/9; off passed 8/9. The final off cross-app task exceeded the
+unchanged 300-second deadline before saving its file. It is a failed trial.
+The queued native-client pilot was cancelled by its success gate and never ran.
+
+| Task | On task times (s) | Off task times (s) |
+|---|---|---|
+| Browser form | 58.60, 39.94, 55.63 | 104.79, 91.74, 92.75 |
+| Notepad | 50.79, 40.54, 47.54 | 114.32, 177.17, 195.22 |
+| Cross-app copy | 65.72, 56.52, 56.06 | 171.54, 153.95, **300.62 timeout** |
+
+The sampled GPU peaks were 44.03 GiB on and 67.44 GiB off; engine process RSS
+high-water was 33.00 and 32.03 GiB respectively. These host counters exclude
+the separate client processes. All recorded DFlash summaries reported no
+fallback: 17,868/33,565 draft tokens accepted on and 20,260/39,589 off. The latter
+includes the failed task's completed inference requests. Largest prompts were
+50,876 and 69,419 tokens, below K128K, so this suite does not test sparse
+retrieval above budget.
+
+This compares the deployed profiles: on enables prefix reuse, while off does
+not. Screenshots, actions and trajectory lengths differ between live trials.
+The raw per-trial data in `computer_use_windows_suite_02_20261001.csv` includes
+action counts, rejected actions, screenshot-to-action latency, receipt latency,
+server visible-output timing and failures. It is not an isolated retrieval
+speedup measurement. The frozen-input reports separately disable prefix reuse.
+
+The independent evidence audit passed 17 trial checks and rejected the failed
+one, despite the matrix being complete. It verified file contents, sizes and
+hashes, task/receipt state, clipboard operations and actual DFlash use. A
+separate source audit verified 231 hashes across seven recorded Git commits;
+those commits added reports or unused helpers while the tested sources stayed
+fixed. Engine and launcher identities were also identical. Evidence is under
+`windows-suite-02/{evidence-audit.json,frozen-source-audit.json,trials.csv}`.
+
+### Failure-driven changes awaiting model requalification
+
+The failed trajectory spent about 139 seconds before copying the reference.
+It used several positive wheel scrolls while trying to reach lower content and
+also sent an out-of-range 10-step scroll. The old tool described positive as up,
+but exposed only a signed step count and implicitly used the existing pointer
+position. A later Save As transition caused a correctly rejected stale-window
+click and another observe/model round. Eventually it typed the filename but
+timed out before completing the save.
+
+Scrolling now has an explicit `up`/`down` direction, positive 1–8 steps and
+required screenshot coordinates inside the intended pane. The executor moves
+the pointer before sending the wheel input. A real probe exposed Edge's smooth
+animation continuing through the original 250ms capture delay; scroll now gets
+an additional 600ms settling interval. Observation also retries, at most twice,
+if the foreground window/title changes while collecting its screenshot and
+accessibility metadata. Continued transitions omit control hints rather than
+pairing them with a different window's screenshot.
+
+A confirmed pre-dispatch rejection now returns an error **and a fresh screenshot**
+to the model. The rejected action remains reserved and is never replayed. Lost
+or uncertain delivery still pauses and requires reconciliation. All 31 local
+contract tests pass, including pinned Codex preserving images in an MCP error
+result and interruption. The latest Windows bundle still needs native execution.
+
+`windows-scroll-contract-03` passed against actual Windows: the Name control
+moved from y=335 to y=154 after down, and back to y=335 after up. Wrong direction,
+zero/excess steps and out-of-screen coordinates were rejected. Probe 01 retains
+a test-driver focus mistake; probe 02 retains the intermediate-animation-frame
+failure that motivated the additional settling interval. These are executor
+probes, not successful model-driven repetitions.
+
+Real-model requalification, native-client desktop execution, native-client
+process-crash recovery, Mac and physical-desktop tests remain open. The task
+definitions, 300-second deadline and 100-tool limit remain unchanged.

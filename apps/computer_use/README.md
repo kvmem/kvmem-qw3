@@ -180,6 +180,16 @@ on Linux. A packaged native Windows/Mac application and physical-desktop tests
 are separate qualification steps. The dedicated VM test account is elevated;
 this prototype is not qualified as a general-purpose desktop permission sandbox.
 
+The second full on/off snapshot suite retained 17 successes and one off-mode
+cross-app timeout. The current revision addresses its scroll/navigation failure:
+`scroll` requires `direction` (`up`/`down`), positive `steps` (1–8), and `x`/`y`
+inside the intended content pane. Old signed-only scroll arguments are rejected.
+The executor waits briefly for wheel animation and rechecks foreground changes
+during observation. Confirmed rejected actions return a fresh screenshot without
+replaying input. The 300-second task deadline and 100-tool limit are unchanged.
+These changes passed a real Windows scroll probe and all 31 local contracts;
+model-driven requalification and a new matching snapshot/bundle remain pending.
+
 ### Recovery and native-client qualification helpers
 
 After the repeated suite has stopped, `windows_recovery.py` exercises the real

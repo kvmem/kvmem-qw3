@@ -167,16 +167,16 @@ function Foreground {
     if ($processId) { $name = (Get-Process -Id $processId -ErrorAction SilentlyContinue).ProcessName }
     return @{ handle=$handle.ToInt64(); process=$name; title=$title.ToString() }
 }
-function Observe {
+function Observe([int]$Attempt = 0) {
     $bounds = [Windows.Forms.Screen]::PrimaryScreen.Bounds
     $bitmap = [Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
     $graphics = [Drawing.Graphics]::FromImage($bitmap)
     $stream = [IO.MemoryStream]::new()
     try {
+        $front = Foreground
         $graphics.CopyFromScreen($bounds.Location, [Drawing.Point]::Empty, $bounds.Size)
         $bitmap.Save($stream, [Drawing.Imaging.ImageFormat]::Png)
         $bytes = $stream.ToArray()
-        $front = Foreground
         $progressHash = Hash-Bytes $bytes
         $windowRect = [DesktopNative+WindowRect]::new()
         if ([DesktopNative]::GetWindowRect([IntPtr]$front.handle, [ref]$windowRect)) {
@@ -195,6 +195,14 @@ function Observe {
             }
         }
         $accessibility = [DesktopAccessibility]::Read([IntPtr]$front.handle, $bounds.Width, $bounds.Height)
+        $afterRead = Foreground
+        if ($afterRead.handle -ne $front.handle -or $afterRead.title -ne $front.title) {
+            if ($Attempt -lt 2) { return (Observe -Attempt ($Attempt + 1)) }
+            # Keep the screenshot's original window identity; dispatch will
+            # reject a changed foreground. Never pair it with another window's
+            # control coordinates during a continuing transition.
+            $accessibility = @{status='foreground_changed'; controls=@(); truncated=$false}
+        }
         $script:latest = @{ desktop_id=$desktopId; observation_id=[guid]::NewGuid().ToString();
             captured_at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); width=$bounds.Width; height=$bounds.Height;
             sha256=(Hash-Bytes $bytes); image=[Convert]::ToBase64String($bytes); mime_type='image/png';
@@ -219,7 +227,13 @@ function Validate-Action($Action, $Observation) {
         }
         'type' { Properties $Action @('kind','text'); Require ($Action.text -is [string] -and $Action.text.Length -ge 1 -and $Action.text.Length -le 4096) 'Text must contain 1..4096 characters' }
         'key' { Properties $Action @('kind','key'); Require ($keyMap.ContainsKey([string]$Action.key)) 'Unsupported key chord' }
-        'scroll' { Properties $Action @('kind','steps'); Require (($Action.steps -is [int] -or $Action.steps -is [long]) -and $Action.steps -ne 0 -and [Math]::Abs($Action.steps) -le 8) 'Scroll steps must be -8..8, excluding zero' }
+        'scroll' {
+            Properties $Action @('kind','direction','steps','x','y')
+            Require ($Action.direction -in @('up','down')) 'Scroll direction must be up or down'
+            Require (($Action.steps -is [int] -or $Action.steps -is [long]) -and $Action.steps -ge 1 -and $Action.steps -le 8) 'Scroll steps must be 1..8'
+            Require (($Action.x -is [int] -or $Action.x -is [long]) -and ($Action.y -is [int] -or $Action.y -is [long])) 'Scroll coordinates must be integers'
+            Require ($Action.x -ge 0 -and $Action.x -lt $Observation.width -and $Action.y -ge 0 -and $Action.y -lt $Observation.height) 'Scroll coordinates outside screenshot'
+        }
         'open_app' { Properties $Action @('kind','app'); Require ($Action.app -in @('notepad','edge','explorer')) 'Application is outside the allowed scope' }
         default { throw 'Unsupported action kind' }
     }
@@ -263,7 +277,15 @@ function Act($Request) {
             }
             'type' { [DesktopNative]::TypeText($a.text) }
             'key' { [Windows.Forms.SendKeys]::SendWait($keyMap[$a.key]) }
-            'scroll' { [DesktopNative]::mouse_event(0x800,0,0,([int]$a.steps * 120),[UIntPtr]::Zero) }
+            'scroll' {
+                [DesktopNative]::SetCursorPos($a.x,$a.y) | Out-Null
+                $delta = [int]$a.steps * 120
+                if ($a.direction -eq 'down') { $delta = -$delta }
+                [DesktopNative]::mouse_event(0x800,0,0,$delta,[UIntPtr]::Zero)
+                # Edge's smooth wheel animation can still be moving when the
+                # normal 250ms post-input screenshot is captured.
+                Start-Sleep -Milliseconds 600
+            }
             'open_app' {
                 switch ($a.app) {
                     'notepad' { Start-Process notepad.exe }

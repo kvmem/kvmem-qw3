@@ -94,10 +94,14 @@ class DesktopTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_known_rejection_does_not_require_uncertain_ack(self):
         self.mode = "reject"
+        request = self.action()
         with self.assertRaises(DesktopRejected):
-            await self.desktop.act(self.action())
+            await self.desktop.act(request)
         self.assertEqual(self.desktop.unresolved(), [])
         self.assertFalse(self.desktop.paused)
+        self.assertEqual(self.effects, 0)
+        with self.assertRaisesRegex(DesktopError, "Previous action is rejected"):
+            await self.desktop.act(request)
         self.assertEqual(self.effects, 0)
 
     async def test_lost_response_reconciles_after_app_restart_without_replay(self):

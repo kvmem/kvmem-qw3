@@ -26,6 +26,9 @@ for line in sys.stdin:
         count += 1
         result = {"content": [{"type": "text", "text": f"fixture observation {count}"},
                               {"type": "image", "data": image, "mimeType": "image/png"}]}
+        if "--error-second" in sys.argv and count == 2:
+            result["isError"] = True
+            result["content"][0]["text"] = "Action rejected without dispatch; fresh fixture observation 2"
     elif method == "ping":
         result = {}
     else:
