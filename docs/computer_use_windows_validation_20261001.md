@@ -191,7 +191,7 @@ A confirmed pre-dispatch rejection now returns an error **and a fresh screenshot
 to the model. The rejected action remains reserved and is never replayed. Lost
 or uncertain delivery still pauses and requires reconciliation. All 31 local
 contract tests pass, including pinned Codex preserving images in an MCP error
-result and interruption. The latest Windows bundle still needs native execution.
+result and interruption. Native contract qualification is recorded below.
 
 `windows-scroll-contract-03` passed against actual Windows: the Name control
 moved from y=335 to y=154 after down, and back to y=335 after up. Wrong direction,
@@ -213,3 +213,11 @@ still pending; these fixture-backed contracts do not qualify that path.
 Real-model requalification, native-client desktop execution, native-client
 process-crash recovery, Mac and physical-desktop tests remain open. The task
 definitions, 300-second deadline and 100-tool limit remain unchanged.
+
+The repaired Linux-host off-mode cross-app pilot (`windows-scroll-pilot-01`)
+subsequently passed in **135.96 seconds**, with 13 completed actions and no
+rejected action. It used two explicit downward scrolls and real Ctrl+C/Ctrl+V;
+the independently read output was the exact expected 22-byte file. The original
+300-second timeout remains a retained failure. This one repaired trial does
+not replace the required repeated suite. Its success gate has now started the
+native Windows browser pilot.

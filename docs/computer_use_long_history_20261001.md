@@ -104,6 +104,45 @@ more than the named weights and KV/index allocations. Process RSS and configured
 CPU tier capacity are also distinct; these counters are not a full allocator
 audit or a physical 48GB-card qualification.
 
+### Target-only and native MTP controls
+
+`comparison-long-controls-01` adds target-only (`none`) and native MTP,
+each with KVMem on/off, against exactly the same two frozen requests. Its
+eight answer and final-retrieval checks passed. Together with the retained
+DFlash pair, the matrix contains **12/12 passed checks across six profiles**.
+Each case has one repetition. Prefix reuse is disabled throughout; the first
+case starts with a cold vision cache, and the second shares its Notepad image.
+
+| Decoder | KVMem | Positive request (s) | Negative request (s) | Profile GPU peak (GiB) |
+|---|---|---:|---:|---:|
+| Target only | On | 64.39 | 62.49 | 38.26 |
+| Target only | Off | 60.12 | 59.31 | 61.89 |
+| Native MTP | On | 64.62 | 62.63 | 39.63 |
+| Native MTP | Off | 59.64 | 59.13 | 64.38 |
+| DFlash 2 | On | 65.01 | 63.95 | 43.41 |
+| DFlash 2 | Off | 59.83 | 59.16 | 67.14 |
+
+For these single cold positive requests, KVMem reduced sampled GPU peak by
+about 35–38%, while total request time increased by about 7–9%. The replies
+contain only 40 output tokens: long prefill dominates, so faster speculative
+decoding does not establish an end-to-end advantage here. Native MTP uses a
+chain length of four; DFlash uses a maximum of seven draft tokens. They run
+separately. These are observations from this setup, not statistical estimates
+or recommendations for a smaller context allocation.
+
+All six manifests have identical binary and launcher hashes and identical
+frozen case hashes. Git commits differ because application helpers and reports
+were updated between batches; no engine binary or launcher change occurred.
+The final on-mode selections have complete query/index capture and the
+requested scorer without fallback. Target-only selected 1,024/1,242 blocks;
+MTP and DFlash selected 1,020/1,233 for the positive case and 1,021/1,233 for
+the negative case. All negative outputs have null values for the three fields.
+
+The merged `computer_use_long_matrix_20261001.csv` contains all 12 requests,
+their originating run directories, timing, CPU/RSS and profile-level GPU
+samples. The existing four-row DFlash CSV remains unchanged. Raw output and
+retrieval checks are retained in each run's `visual-checks.json`.
+
 ## Real Codex multi-turn history
 
 `codex-long-01` ran the pinned Codex app-server against QW3 and an observation
@@ -135,6 +174,7 @@ a separate acceptance item.
 ## Scope
 
 The short on/off × target-only/native-MTP/DFlash matrix is reported separately
-in `computer_use_kvmem_comparison_20261001.md`. The above-budget comparison here
-uses DFlash only. No million-token, 48GB physical-card, native Windows client,
-Mac or physical-desktop qualification follows from these diagnostics.
+in `computer_use_kvmem_comparison_20261001.md`. Both short and above-budget
+histories now cover all six profiles. No million-token, 48GB physical-card,
+native Windows client, Mac or physical-desktop qualification follows from
+these diagnostics.
