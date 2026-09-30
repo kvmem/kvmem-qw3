@@ -62,6 +62,9 @@ struct ServerConfig {
     // Default thinking budget (max tokens inside <think>) when a chat request
     // omits `thinking_budget`. 0 disables the cap.
     int thinking_budget_default = 0;
+    bool thinking_summary_default = false;
+    uint32_t thinking_summary_tokens_default = 0;
+    uint32_t thinking_summary_min_tokens_default = 1024;
 };
 
 // Loads the model (via Engine(engine)) and serves until the process is killed.

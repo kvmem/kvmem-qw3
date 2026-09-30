@@ -85,6 +85,15 @@ duplicates helpers and kernels from the MIT-licensed
 `src/fattn_vec_decode.cu`, so it remains in this group even though its routes
 are diagnostic rather than default execution paths.
 
+## utf8proc
+
+- Upstream: <https://github.com/JuliaStrings/utf8proc>
+- Source identity: `third_party/utf8proc/UPSTREAM.json`
+- License: MIT; Unicode data also carries the notice in
+  `third_party/utf8proc/LICENSE.md`.
+
+The tokenizer uses the bundled utf8proc sources for Unicode normalization.
+
 ## Externally supplied dependencies
 
 CUDA, OpenSSL, FlashInfer, CUTLASS, and CuTe DSL artifacts are not copied

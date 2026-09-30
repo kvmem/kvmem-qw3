@@ -82,4 +82,9 @@ public:
 std::unique_ptr<ModelSource> make_gguf_model_source(std::unique_ptr<GgufFile> gguf);
 std::unique_ptr<ModelSource> open_model_source(const std::string &path);
 
+// Untransformed HF tensors, by their original names. Supports a standalone
+// model.safetensors or a sharded index; does not apply Qwen3.5 norm/reorder or
+// compressed-tensors transformations. The caller validates the architecture.
+std::unique_ptr<ModelSource> open_raw_safetensors_source(const std::string &directory);
+
 } // namespace qw3

@@ -70,6 +70,7 @@ separately installed `llama-completion` executable directly.
 |---|---|---|
 | Plain QW3 CLI or serialized HTTP serving | Expected | Native CUDA path; it must pass a pinned clean GPU/model gate before becoming Tested. |
 | Plain plus MTP | Experimental | Native MTP speculative decode is exposed as an experimental path. |
+| DFlash 2 | Experimental | Alternative draft selected with `--speculative-method dflash2 --dflash-model DIR`; supports the integrated KVMem controller. See [selection and validation limits](dflash2_integration.md). |
 | Continuous batching without MTP | Experimental | Requires paged KV; broader sampling and concurrency release coverage is missing. |
 | Continuous batching plus MTP | Experimental | Uses batched draft execution and paged MTP prefix state. |
 | KVMem, serialized, without MTP | Experimental | Research path; `--kvmem` is off by default. |

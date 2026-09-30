@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <condition_variable>
+#include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -37,6 +40,47 @@ static void test_disabled() {
     NvmeKvTier t(cfg);
     CHECK(!t.enabled());
     CHECK(t.slot_count() == 0);
+}
+
+static void test_concurrent_arena_owners() {
+    NvmeKvTierConfig cfg;
+    cfg.dir = temp_dir();
+    cfg.file_name = "concurrent_owner.bin";
+    cfg.slot_bytes = 64; cfg.total_bytes = 256;
+    ::mkdir(cfg.dir.c_str(), 0755);
+    const std::string existing = cfg.dir + "/" + cfg.file_name;
+    { std::ofstream file(existing); file << "preserve-existing-file"; }
+    std::mutex mutex;
+    std::condition_variable cv;
+    unsigned ready = 0;
+    bool start = false;
+    std::vector<std::future<std::unique_ptr<NvmeKvTier>>> pending;
+    for (unsigned owner = 0; owner < 16; ++owner) {
+        pending.push_back(std::async(std::launch::async, [&, owner] {
+            { std::unique_lock<std::mutex> lock(mutex); ++ready; cv.notify_all();
+              cv.wait(lock, [&] { return start; }); }
+            auto tier = std::make_unique<NvmeKvTier>(cfg);
+            std::vector<uint8_t> payload(64, uint8_t(owner + 1));
+            tier->write_block(0, payload.data(), payload.size());
+            return tier;
+        }));
+    }
+    { std::unique_lock<std::mutex> lock(mutex); cv.wait(lock, [&] { return ready == 16; });
+      start = true; cv.notify_all(); }
+    std::vector<std::unique_ptr<NvmeKvTier>> owners;
+    for (auto &future : pending) owners.push_back(future.get());
+    std::set<std::string> names;
+    for (unsigned i = 0; i < owners.size(); ++i) {
+        std::vector<uint8_t> payload(64);
+        owners[i]->read_block(0, payload.data(), payload.size());
+        CHECK(payload == std::vector<uint8_t>(64, uint8_t(i + 1)));
+        CHECK(names.insert(owners[i]->path()).second);
+        CHECK(::access(owners[i]->path().c_str(), F_OK) != 0);
+    }
+    std::ifstream preserved(existing);
+    std::string contents; std::getline(preserved, contents);
+    CHECK(contents == "preserve-existing-file");
+    ::unlink(existing.c_str());
 }
 
 static void test_write_read_release() {
@@ -282,6 +326,7 @@ static void test_concurrent_positional_batches() {
 }
 
 int main() {
+    test_concurrent_arena_owners();
     test_disabled();
     test_write_read_release();
     test_slot_ranges_and_file_names();

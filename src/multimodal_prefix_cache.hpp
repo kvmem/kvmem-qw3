@@ -53,8 +53,8 @@ inline const MultimodalTokenIdentity *multimodal_token_identity(
 //
 // Legacy callers may omit per-row cache identities. In that case the old
 // whole-request fingerprint remains the conservative authority.
-inline uint32_t multimodal_prefix_lcp(
-        const std::vector<uint32_t> &tokens, uint32_t token_lcp,
+inline uint64_t multimodal_prefix_lcp(
+        const std::vector<uint32_t> &tokens, uint64_t token_lcp,
         const std::vector<MultimodalTokenIdentity> &warm_identities,
         const std::vector<MultimodalTokenIdentity> &current_identities,
         uint64_t warm_fingerprint, uint64_t current_fingerprint) {
@@ -70,17 +70,17 @@ inline uint32_t multimodal_prefix_lcp(
         if (!warm || !current ||
             warm->source_token_id != current->source_token_id ||
             warm->position != current->position) {
-            return static_cast<uint32_t>(pos);
+            return static_cast<uint64_t>(pos);
         }
         if (warm->cache_identity == 0 || current->cache_identity == 0) {
             if (warm_fingerprint != current_fingerprint) {
-                return static_cast<uint32_t>(pos);
+                return static_cast<uint64_t>(pos);
             }
         } else if (warm->cache_identity != current->cache_identity) {
-            return static_cast<uint32_t>(pos);
+            return static_cast<uint64_t>(pos);
         }
     }
-    return static_cast<uint32_t>(limit);
+    return static_cast<uint64_t>(limit);
 }
 
 }  // namespace qw3::detail

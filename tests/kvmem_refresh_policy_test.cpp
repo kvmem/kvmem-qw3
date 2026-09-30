@@ -15,6 +15,33 @@ void require(bool condition, const char *message) {
 
 int main() {
     using namespace qw3::detail;
+    for (uint32_t decoded = 0; decoded <= 20; ++decoded) {
+        for (uint32_t requested = 0; requested <= 7; ++requested) {
+            const auto limit = kvmem_middecode_draft_limit(requested, decoded, 0, 13, 0, 1);
+            require(limit <= requested, "refresh gate increased the draft count");
+            if (decoded < 13) require(decoded + limit + 1 <= 13,
+                "speculation skipped a refresh boundary");
+            else require(limit == 0, "unsafe text after refresh threshold was not bridged serially");
+            require(kvmem_middecode_draft_limit(requested, decoded, 0, 13, 1, 1) == requested,
+                "completed refresh kept throttling speculation");
+        }
+    }
+    require(kvmem_middecode_draft_limit(7, 110, 100, 13, 1, 2) == 2 &&
+            kvmem_middecode_draft_limit(7, 110, 100, 0, 1, 2) == 7,
+            "refresh epoch offset or disabled policy changed");
+    const std::vector<int32_t> compact{100, 101, 100, 101, 100, 101};
+    require(kvmem_rope_batch_within_limit(262144, 2, 262144, &compact),
+            "physical KV count rejected valid compact M-RoPE coordinates");
+    const std::vector<int32_t> beyond{100, 101, 100, 262144, 100, 101};
+    const std::vector<int32_t> negative{100, 101, 100, -1, 100, 101};
+    require(!kvmem_rope_batch_within_limit(0, 2, 262144, &beyond) &&
+            !kvmem_rope_batch_within_limit(0, 2, 262144, &negative) &&
+            !kvmem_rope_batch_within_limit(0, 3, 262144, &compact),
+            "invalid multimodal coordinates bypassed the position guard");
+    require(kvmem_rope_batch_within_limit(262142, 2, 262144) &&
+            !kvmem_rope_batch_within_limit(262143, 2, 262144) &&
+            !kvmem_rope_batch_within_limit(UINT64_MAX, 2, 262144),
+            "text RoPE bound or overflow guard changed");
     require(!kvmem_middecode_refresh_due(24575, 0, 24576, 0, 2),
             "refresh fired before threshold");
     require(kvmem_middecode_refresh_due(24576, 0, 24576, 0, 2),

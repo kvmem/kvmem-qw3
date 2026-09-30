@@ -1,0 +1,27 @@
+{
+  "repository": "https://github.com/JuliaStrings/utf8proc",
+  "version": "2.10.0",
+  "revision": "a1b99daa2a3393884220264c927a48ba1251a9c6",
+  "files": {
+    "utf8proc.c": {
+      "sha256": "1f36d14e69e4a5f0658635496f5a9b1f76c418dc36841d2c39d61ab61a258c5d",
+      "bytes": 32643,
+      "url": "https://raw.githubusercontent.com/JuliaStrings/utf8proc/a1b99daa2a3393884220264c927a48ba1251a9c6/utf8proc.c"
+    },
+    "utf8proc.h": {
+      "sha256": "d947b38124a9f218631b537dd7a367f6a2a6a992c72caa46b3f3e7c81e6138ee",
+      "bytes": 33458,
+      "url": "https://raw.githubusercontent.com/JuliaStrings/utf8proc/a1b99daa2a3393884220264c927a48ba1251a9c6/utf8proc.h"
+    },
+    "utf8proc_data.c": {
+      "sha256": "6aa28d305d65af54260a3521278715c49c4e2445c9c017e8ebf38da3735422e5",
+      "bytes": 2347972,
+      "url": "https://raw.githubusercontent.com/JuliaStrings/utf8proc/a1b99daa2a3393884220264c927a48ba1251a9c6/utf8proc_data.c"
+    },
+    "LICENSE.md": {
+      "sha256": "3b510150d34f248a221bb88e1d811238d6c6c18b51231822c42974c39bb07256",
+      "bytes": 5125,
+      "url": "https://raw.githubusercontent.com/JuliaStrings/utf8proc/a1b99daa2a3393884220264c927a48ba1251a9c6/LICENSE.md"
+    }
+  }
+}

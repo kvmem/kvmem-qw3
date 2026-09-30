@@ -34,14 +34,34 @@ def verdict(text):
     return value == 'yes'
 
 
+def completed_pairs(samples, root):
+    """Take a paired snapshot, including reused outputs outside the run prefix."""
+    selected = []
+    for sample in samples:
+        paths = [root / 'trials' / sample['question_id'] / policy / 'result.json'
+                 for policy in ('kvmem', 'compact_rag')]
+        if all(path.exists() and json.loads(path.read_text()).get('status') == 'completed'
+               for path in paths):
+            selected.append(sample)
+    return selected
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--limit', type=int)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--limit', type=int)
+    selection.add_argument('--completed-only', action='store_true',
+                           help='Grade a fixed snapshot of all completed pairs, including reused later IDs')
     args = parser.parse_args()
     refs = {r['question_id']: r for r in json.loads((OUT / 'references.json').read_text())}
     samples = json.loads((OUT / 'inference_samples.json').read_text())
+    planned_pairs = len(samples)
     if args.limit:
         samples = samples[:args.limit]
+    elif args.completed_only:
+        samples = completed_pairs(samples, OUT)
+    if not samples:
+        raise RuntimeError('No completed paired outputs to grade')
     jobs = []
     for sample in samples:
         for policy in ('kvmem', 'compact_rag'):
@@ -61,7 +81,15 @@ def main():
     else:
         save(root / 'identity.json', identity)
     run = root / f'run_{int(time.time())}'
-    status = {'status': 'running', 'started_at': time.time(), 'pairs': len(samples)}
+    save(run / 'selection.json', {
+        'created_at': time.time(), 'completed_only': args.completed_only,
+        'planned_pairs': planned_pairs, 'selected_pairs': len(samples),
+        'question_ids': [sample['question_id'] for sample in samples],
+        'predictions': [{'question_id': qid, 'policy': policy, 'sha256': sha(path)}
+                        for qid, policy, path, _ in jobs],
+    })
+    status = {'status': 'running', 'started_at': time.time(), 'pairs': len(samples),
+              'planned_pairs': planned_pairs, 'selection': str(run / 'selection.json')}
     save(root / 'status.json', status)
     rows = []
     try:
@@ -111,6 +139,7 @@ def main():
                     assert row['prediction_sha256'] == sha(path)
                 else:
                     correct, scored = assess(refs[qid], result['answer'], run / 'answers', f'{qid}_{policy}')
+                    assert json.loads(path.read_text()) == result, f'Prediction changed during grading: {path}'
                     row = {'question_id': qid, 'question_type': refs[qid]['question_type'],
                            'policy': policy, 'correct': correct, 'raw_judge_response': scored['answer'],
                            'prediction_sha256': sha(path), 'hypothesis': result['answer']}
@@ -131,7 +160,9 @@ def main():
         save(OUT / 'scored_results.json', rows)
         save(OUT / 'summary.json', {'judge': 'local Qwen3.8-27B Q8, official per-type prompt, temperature zero',
              'is_official_leaderboard_score': False, 'questions': len(samples), 'methods': summary,
-             'notes': ['Fixed balanced pilot, not the natural full-test distribution.',
+             'planned_questions': planned_pairs, 'complete': len(samples) == planned_pairs,
+             'selection': str(run / 'selection.json'),
+             'notes': ['Completed paired subset of the fixed plan; interim type proportions may be unbalanced.',
                        'Final-query time excludes previously built history memory/index; phase costs remain in raw results.']})
         status.update(status='complete', finished_at=time.time())
         print(json.dumps(summary), flush=True)

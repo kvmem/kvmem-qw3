@@ -16,24 +16,24 @@ int main() {
         auto backend = make_cuda_device_backend(LinearBackend::Auto);
         check(static_cast<bool>(backend), "CUDA backend unavailable");
         ok(backend->begin());
-        {
+        for (const uint64_t origin : {0ull, 1ull << 40}) {
             Storage stored(*backend);
             stored.gpu = std::make_shared<Storage::Snapshot>();
             auto &s = *stored.gpu;
             s.ready = true;
-            s.position = 96;
+            s.position = origin + 96;
             s.kv_logical_pages = 6;
             s.mtp_kv_logical_pages = 6;
-            s.mtp_prefix_len = 96;
-            s.mtp_payload_valid_through = 100;
-            s.kvmem_registered_pos = 95;
+            s.mtp_prefix_len = origin + 96;
+            s.mtp_payload_valid_through = origin + 100;
+            s.kvmem_registered_pos = origin + 95;
             s.kvmem_selection_generation = 123;
             s.kvmem_active = true;
             s.window_query_pos = 32;
             s.window_page_count = 2;
             s.window_mrope_next = 44;
             s.window_mrope_append_active = true;
-            s.window_mrope_append_source_next = 77;
+            s.window_mrope_append_source_next = origin + 77;
             s.window_mrope_append_delta = {-6, 7, 8};
             s.h = backend->tensor_bf16(15, "test hidden");
             s.mtp_prefix_h = backend->tensor_f32(17, "test MTP hidden");
@@ -43,6 +43,14 @@ int main() {
             s.recurrent_states[2] = backend->tensor_f32(256, "test recurrent 2");
             s.conv_states[0] = backend->tensor_f32(13, "test convolution");
             s.conv_states[2] = backend->tensor_f32(13, "test convolution 2");
+            auto draft = std::make_shared<DFlashExecutor::StateSnapshot>();
+            draft->backend = backend.get();
+            draft->next_position = origin + 96;
+            draft->rows = 3;
+            draft->rope_next = 71;
+            draft->raw_keys.push_back(backend->tensor_f32(27, "draft raw keys"));
+            draft->values.push_back(backend->tensor_f32(27, "draft values"));
+            s.dflash = draft;
             std::vector<std::vector<uint8_t>> originals;
             Storage::tensors(s, [&](auto &tensor) {
                 if (!tensor) return;
@@ -69,16 +77,22 @@ int main() {
                 ok(backend->copy_bytes_from_host(*tensor, 0, zeros.data(), zeros.size()));
             });
             auto restored = stored.restore(std::move(recycled));
-            check(restored->ready && restored->position == 96 &&
+            check(restored->ready && restored->position == origin + 96 &&
                   restored->kv_logical_pages == 6 && restored->mtp_kv_logical_pages == 6 &&
-                  restored->mtp_prefix_len == 96 && restored->mtp_payload_valid_through == 100 &&
-                  restored->kvmem_registered_pos == 95 && restored->kvmem_selection_generation == 123 &&
+                  restored->mtp_prefix_len == origin + 96 && restored->mtp_payload_valid_through == origin + 100 &&
+                  restored->kvmem_registered_pos == origin + 95 && restored->kvmem_selection_generation == 123 &&
                   restored->kvmem_active && restored->window_query_pos == 32 &&
                   restored->window_page_count == 2 && restored->window_mrope_next == 44 &&
-                  restored->window_mrope_append_active && restored->window_mrope_append_source_next == 77 &&
+                  restored->window_mrope_append_active && restored->window_mrope_append_source_next == origin + 77 &&
                   restored->window_mrope_append_delta == std::array<int64_t, 3>{-6, 7, 8},
                   "snapshot metadata changed");
             check(!restored->recurrent_states[1] && !restored->conv_states[1], "empty layers changed");
+            check(restored->dflash && restored->dflash != draft &&
+                  restored->dflash->backend == backend.get() &&
+                  restored->dflash->next_position == origin + 96 &&
+                  restored->dflash->rows == 3 && restored->dflash->rope_next == 71 &&
+                  restored->dflash->raw_keys.at(0) != draft->raw_keys.at(0),
+                  "draft metadata lost or shared snapshot overwritten");
             size_t index = 0;
             Storage::tensors(*restored, [&](auto &tensor) {
                 if (!tensor) return;

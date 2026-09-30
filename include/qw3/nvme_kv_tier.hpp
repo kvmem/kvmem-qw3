@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
@@ -122,14 +123,14 @@ public:
                 "NVMe KV tier file_name must be a non-empty basename");
         }
         path_ = cfg_.dir + "/" + cfg_.file_name;
-        int flags = O_CLOEXEC;
-        if (cfg_.read_only) {
-            flags |= O_RDONLY;
+        if (!cfg_.durable) {
+            if (cfg_.read_only)
+                throw std::runtime_error("read-only NVMe arenas must be durable");
+            fd_ = open_ephemeral(path_);
         } else {
-            flags |= O_CREAT | O_RDWR;
-            if (!cfg_.durable) flags |= O_TRUNC;
+            const int flags = O_CLOEXEC | (cfg_.read_only ? O_RDONLY : (O_CREAT | O_RDWR));
+            fd_ = ::open(path_.c_str(), flags, 0644);
         }
-        fd_ = ::open(path_.c_str(), flags, 0644);
         if (fd_ < 0) {
             throw std::runtime_error(
                 "failed to open NVMe KV tier file: " + path_ + ": " +
@@ -201,23 +202,6 @@ public:
                          path_.c_str(),
                          static_cast<unsigned long long>(cfg_.total_bytes));
 #endif
-        }
-        if (!cfg_.durable) {
-            // The backing store is an ephemeral cache, never a recoverable
-            // checkpoint. Unlink it immediately while retaining the open file
-            // descriptor: all positional I/O continues to work, but the
-            // filesystem reclaims the blocks automatically when the process
-            // closes the fd, including abnormal exits and SIGKILL. This also
-            // prevents stale qw3_kvmem_nvme.bin files from accumulating across
-            // evaluations.
-            if (::unlink(path_.c_str()) != 0) {
-                const int unlink_error = errno;
-                ::close(fd_);
-                fd_ = -1;
-                throw std::runtime_error(
-                    "failed to make NVMe KV tier file ephemeral: " + path_ +
-                    ": " + std::strerror(unlink_error));
-            }
         }
         if (cfg_.read_only && !cfg_.overlay_dir.empty()) open_overlay();
         if (cfg_.direct_mapped) return;
@@ -536,6 +520,36 @@ private:
         return out;
     }
 
+    static int open_ephemeral(std::string &path) {
+        // O_TRUNC followed by unlink leaves a constructor race: two sessions
+        // can open the same inode before either unlinks it. Reserve a unique
+        // name atomically, then unlink before preallocation or any other work.
+        path += ".XXXXXX";
+        std::vector<char> name(path.begin(), path.end());
+        name.push_back('\0');
+#if defined(__linux__)
+        const int fd = ::mkostemp(name.data(), O_CLOEXEC);
+#else
+        const int fd = ::mkstemp(name.data());
+#endif
+        if (fd < 0)
+            throw std::runtime_error("failed to create ephemeral NVMe arena: " + path + ": " + std::strerror(errno));
+        path.assign(name.data());
+#if !defined(__linux__)
+        if (::fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+            const int error = errno;
+            ::close(fd); ::unlink(path.c_str());
+            throw std::runtime_error("failed to set NVMe arena close-on-exec: " + std::string(std::strerror(error)));
+        }
+#endif
+        if (::unlink(path.c_str()) != 0) {
+            const int error = errno;
+            ::close(fd);
+            throw std::runtime_error("failed to unlink ephemeral NVMe arena: " + path + ": " + std::strerror(error));
+        }
+        return fd;
+    }
+
     void open_overlay() {
         ensure_dir(cfg_.overlay_dir);
         if (cfg_.overlay_file_name.empty() ||
@@ -543,26 +557,9 @@ private:
             throw std::runtime_error(
                 "NVMe KV tier overlay_file_name must be a non-empty basename");
         }
-        const std::string overlay_path =
+        std::string overlay_path =
             cfg_.overlay_dir + "/" + cfg_.overlay_file_name;
-        overlay_fd_ = ::open(overlay_path.c_str(),
-                             O_CLOEXEC | O_CREAT | O_RDWR | O_TRUNC, 0644);
-        if (overlay_fd_ < 0) {
-            throw std::runtime_error(
-                "failed to open NVMe KV tier overlay file: " + overlay_path +
-                ": " + std::strerror(errno));
-        }
-        // Same rationale as the ephemeral arena: the overlay is scratch that
-        // must not outlive the process, and the file stays sparse so it costs
-        // only the slots the session actually diverges on.
-        if (::unlink(overlay_path.c_str()) != 0) {
-            const int unlink_error = errno;
-            ::close(overlay_fd_);
-            overlay_fd_ = -1;
-            throw std::runtime_error(
-                "failed to make NVMe KV tier overlay ephemeral: " +
-                overlay_path + ": " + std::strerror(unlink_error));
-        }
+        overlay_fd_ = open_ephemeral(overlay_path);
         overlay_valid_ = std::unique_ptr<std::atomic<uint8_t>[]>(
             new std::atomic<uint8_t>[slot_count_]);
         for (uint32_t i = 0; i < slot_count_; ++i) {

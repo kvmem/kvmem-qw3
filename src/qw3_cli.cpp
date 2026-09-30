@@ -5,6 +5,7 @@
 #include "kvmem_archive_cli.hpp"
 #include "kvmem_session.hpp"
 #include "server.hpp"
+#include "speculative_options.hpp"
 #include "json.hpp"
 
 #include <cctype>
@@ -72,7 +73,10 @@ void usage(std::ostream &os) {
         "  --kv-pool-pages N     Global KV pool pages. Default: ceil(ctx/page_size)\n"
         "  --mtp-kv-pool-pages N Global MTP-prefix KV pages. Default: kv-pool-pages\n"
         "  --kv-dtype NAME       KV-cache dtype: fp16 default, or fp8/fp32/q8.\n"
-        "  --mtp-chain N         MTP speculative chain length. Default: 0 (off).\n"
+        "  --speculative-method MODE  none|mtp|dflash2; omitted preserves legacy flags.\n"
+        "                        mtp uses the target's native MTP head (default chain 4).\n"
+        "                        dflash2 requires --dflash-model PATH.\n"
+        "  --mtp-chain N         Native MTP speculative chain length. Default: 0 (off).\n"
         "                        N>0 enables MTP speculation.\n"
         "  --mtp-policy NAME     MTP depth policy: fixed default, or adaptive.\n"
         "  --mtp-adaptive-min-chain N  Adaptive MTP minimum chain. Default: auto.\n"
@@ -89,6 +93,11 @@ void usage(std::ostream &os) {
         "  --enable-thinking     Default chat requests to thinking mode (long CoT).\n"
         "  --thinking-budget N   Default max tokens inside <think> before the\n"
         "                        engine force-closes it. 0 disables (default).\n"
+        "  --thinking-summary    Summarize long thinking with natural termination.\n"
+        "  --thinking-summary-tokens N  Optional explicit summary cap (1..1024);\n"
+        "                        also enables compaction. 0 means no explicit cap.\n"
+        "  --thinking-summary-min-tokens N  Minimum reasoning length to summarize\n"
+        "                        (default: 1024). Requires serialized KVMem+MTP.\n"
         "  --native-mtp-chain N  Alias for --mtp-chain.\n"
         "  --native-mtp-trace    Diagnostic mode; disables default MTP speculate.\n"
         "  -n N                  Optional service max generated tokens cap.\n"
@@ -111,6 +120,7 @@ void usage(std::ostream &os) {
         "  --native-mtp-chain N  Diagnostic MTP draft chain length. Default: 1\n"
         "  --native-mtp-prefix   Populate diagnostic MTP prefix KV before drafts\n"
         "  --native-mtp-speculate Experimental MTP speculative decode\n"
+        "  --dflash-model PATH  DFlash 2 draft checkpoint for native speculative decode\n"
         "  --mtp-policy NAME     MTP depth policy: fixed default, or adaptive.\n"
         "  --prefill-chunk N     Prefill chunk size in tokens (qwen-native).\n"
         "                        0 = no chunking (whole-prompt batch, max throughput,\n"
@@ -207,6 +217,10 @@ void usage(std::ostream &os) {
         "  --kvmem-raw-k-nvme    Reserve NVMe capacity for immutable raw-K and use\n"
         "                        CPU raw-K chunks as a bounded cache. Default: off.\n"
         "  --kvmem-gc-max-blocks N  Enable CPU GC with a live-history block target.\n"
+        "  --kvmem-repository-blocks N  Experimental reusable CPU repository.\n"
+        "                        Requires --ctx = N * block size; history may grow\n"
+        "                        beyond it. Serialized CPU mean-K path only.\n"
+        "  --kvmem-repository-gc MODE  off|shadow|delete (default: delete).\n"
         "  --kvmem-gc-shadow    Evaluate candidates without deleting payloads.\n"
         "  --kvmem-gc-cpu N     Bind the low-priority GC worker to CPU N.\n"
         "  --no-kvmem-raw-k-nvme Keep the complete raw-K authority in CPU memory.\n"
@@ -239,6 +253,7 @@ void usage(std::ostream &os) {
         "  --temp F              Temperature. Default: 0.6\n"
         "  --top-p F             Top-p. Default: 0.95\n"
         "  --top-k N             Top-k. Default: 20 (Qwen3 recommended; 0 disables)\n"
+        "  --sampling-filter-order NAME  joint (default) or top-k-first\n"
         "  --min-p F             Min-p. Default: 0.0\n"
         "  --presence-penalty F  Presence penalty. Default: 0.0\n"
         "  --repetition-penalty F Repetition penalty. Default: 1.0\n"
@@ -476,6 +491,10 @@ int main(int argc, char **argv) {
                         "invalid --vision-device (want cpu|cuda): " +
                         engine.vision_device);
                 }
+            } else if (arg == "--speculative-method") {
+                engine.speculative_method = need(arg);
+            } else if (arg == "--dflash-model") {
+                engine.dflash_model_path = need(arg);
             } else if (arg == "--native-mtp-trace") {
                 engine.native_mtp_trace = true;
             } else if (arg == "--native-mtp-chain") {
@@ -784,6 +803,17 @@ int main(int argc, char **argv) {
                 engine.kvmem_nvme_bytes = parse_u64(need(arg), arg);
             } else if (arg == "--kvmem-raw-k-nvme") {
                 engine.kvmem_raw_k_nvme = true;
+            } else if (arg == "--kvmem-repository-blocks") {
+                const auto value = parse_u64(need(arg), arg);
+                if (!value || value > UINT32_MAX)
+                    throw std::runtime_error("--kvmem-repository-blocks must be in 1..UINT32_MAX");
+                engine.kvmem_repository_blocks = static_cast<uint32_t>(value);
+            } else if (arg == "--kvmem-repository-gc") {
+                engine.kvmem_repository_gc_mode = need(arg);
+                if (engine.kvmem_repository_gc_mode != "off" &&
+                    engine.kvmem_repository_gc_mode != "shadow" &&
+                    engine.kvmem_repository_gc_mode != "delete")
+                    throw std::runtime_error("--kvmem-repository-gc must be off|shadow|delete");
             } else if (arg == "--kvmem-gc-max-blocks") {
                 const auto value = parse_u64(need(arg), arg);
                 if (value <= 0 || value > UINT32_MAX) throw std::runtime_error("--kvmem-gc-max-blocks must be in 1..UINT32_MAX");
@@ -817,6 +847,8 @@ int main(int argc, char **argv) {
                 serve_cfg.top_p_set = true;
             } else if (arg == "--top-k") {
                 gen.top_k = parse_int(need(arg), arg);
+            } else if (arg == "--sampling-filter-order") {
+                gen.sampling_filter_order = qw3::parse_sampling_filter_order(need(arg));
             } else if (arg == "--min-p") {
                 gen.min_p = parse_float(need(arg), arg);
             } else if (arg == "--presence-penalty") {
@@ -905,6 +937,18 @@ int main(int argc, char **argv) {
                 if (serve_cfg.thinking_budget_default < 0) {
                     throw std::runtime_error("--thinking-budget must be >= 0");
                 }
+            } else if (arg == "--thinking-summary") {
+                serve_cfg.thinking_summary_default = true;
+            } else if (arg == "--thinking-summary-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0 || value > 1024)
+                    throw std::runtime_error("--thinking-summary-tokens must be in [0,1024]");
+                serve_cfg.thinking_summary_tokens_default = static_cast<uint32_t>(value);
+            } else if (arg == "--thinking-summary-min-tokens") {
+                const int value = parse_int(need(arg), arg);
+                if (value < 0)
+                    throw std::runtime_error("--thinking-summary-min-tokens must be >= 0");
+                serve_cfg.thinking_summary_min_tokens_default = static_cast<uint32_t>(value);
             } else if (arg == "--kvmem-archive") {
                 engine.kvmem_archive_dir = need(arg);
             } else if (arg == "--archive-input") {
@@ -1060,6 +1104,8 @@ int main(int argc, char **argv) {
             }
         }
 
+        qw3::detail::normalize_speculative_options(engine);
+
         if (inspect || dump_tensors) {
             const qw3::GgufFile gguf(engine.model_path);
             const qw3::ModelInfo info = gguf.model_info();
@@ -1193,12 +1239,13 @@ int main(int argc, char **argv) {
                 engine.kvmem_query_conditioned = true;
                 engine.kvmem_update_mode = "step";
                 engine.kvmem_archive_mode = "attach";
-                if (!engine.native_mtp_chain_set ||
-                    engine.native_mtp_chain <= 0) {
-                    engine.native_mtp_chain = 4;
-                    engine.native_mtp_chain_set = true;
+                if (engine.speculative_method != "none" && engine.dflash_model_path.empty()) {
+                    if (!engine.native_mtp_chain_set || engine.native_mtp_chain <= 0) {
+                        engine.native_mtp_chain = 4;
+                        engine.native_mtp_chain_set = true;
+                    }
+                    engine.native_mtp_speculate = true;
                 }
-                engine.native_mtp_speculate = true;
                 serve_cfg.kv_dtype = "fp8";
             }
             serve_cfg.default_generation = gen;
@@ -1313,6 +1360,7 @@ int main(int argc, char **argv) {
                     "--archive-questions-file/--archive-questions-json");
             }
             archive_run.max_tokens = gen.max_tokens;
+            archive_run.sampling_filter_order = gen.sampling_filter_order;
             archive_run.thinking_budget =
                 serve_cfg.thinking_budget_default;
             if (serve_cfg.temperature_set) {
@@ -1372,6 +1420,7 @@ int main(int argc, char **argv) {
             }
             // Default greedy; --temp opts the decode probe into the Qwen3
             // sampled recipe (top_p/top_k carry their gen defaults 0.95/20).
+            sess.sampling_filter_order = gen.sampling_filter_order;
             if (serve_cfg.temperature_set) {
                 sess.temperature = gen.temperature;
                 sess.top_p = gen.top_p;

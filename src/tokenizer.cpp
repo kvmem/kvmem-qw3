@@ -1,21 +1,23 @@
 #include "qw3/tokenizer.hpp"
 
 #include "tokenizer_internal.hpp"
+#include "qwen_unicode_tables.hpp"
 #include "json.hpp"
+#include "utf8proc/utf8proc.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
-#include <cwctype>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
-#include <locale>
 #include <mutex>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -104,50 +106,28 @@ std::vector<uint32_t> gpt2_bytes_to_unicode_table() {
 bool ascii_digit(uint8_t c) { return c >= '0' && c <= '9'; }
 bool ascii_alpha(uint8_t c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 bool ascii_space(uint8_t c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; }
-bool cp_is_cjk(uint32_t cp) {
-    // CJK Unified, CJK Ext A, Hiragana, Katakana, Hangul, fullwidth forms.
-    return (cp >= 0x3040 && cp <= 0x30FF) ||
-           (cp >= 0x3400 && cp <= 0x4DBF) ||
-           (cp >= 0x4E00 && cp <= 0x9FFF) ||
-           (cp >= 0xAC00 && cp <= 0xD7AF) ||
-           (cp >= 0xF900 && cp <= 0xFAFF) ||
-           (cp >= 0xFF00 && cp <= 0xFFEF);
-}
-
 bool cp_is_letter(uint32_t cp) {
     if (cp < 0x80) return ascii_alpha(static_cast<uint8_t>(cp));
-    if (cp_is_cjk(cp)) return true;
-    // C wide-character functions otherwise start in the "C" locale even when
-    // LANG/LC_ALL is UTF-8.  Constructing the environment locale explicitly
-    // makes accented Latin and other scripts follow Unicode-like alpha
-    // classification without mutating the process-global locale.
-    static const std::locale utf8_locale("");
-    return cp <= static_cast<uint32_t>(WCHAR_MAX) &&
-           std::use_facet<std::ctype<wchar_t>>(utf8_locale).is(
-               std::ctype_base::alpha, static_cast<wchar_t>(cp));
+    // Unicode blocks include punctuation/numbers as well as letters. Exact
+    // categories are required: treating the fullwidth comma as a letter splits
+    // e.g. Chinese "，《" punctuation differently before BPE. Locale alpha/digit
+    // classifications also do not implement the tokenizer's \p{L}/\p{N} sets.
+    return detail::unicode::contains(cp, detail::unicode::letters);
 }
 
 bool cp_is_number(uint32_t cp) {
     if (cp < 0x80) return ascii_digit(static_cast<uint8_t>(cp));
-    static const std::locale utf8_locale("");
-    return cp <= static_cast<uint32_t>(WCHAR_MAX) &&
-           std::use_facet<std::ctype<wchar_t>>(utf8_locale).is(
-               std::ctype_base::digit, static_cast<wchar_t>(cp));
+    return detail::unicode::contains(cp, detail::unicode::numbers);
 }
 
 bool cp_is_mark(uint32_t cp) {
-    // The common Unicode combining-mark blocks.  Qwen3.5's regex joins marks
-    // to letter runs (\p{L}\p{M}) rather than treating them as punctuation.
-    return (cp >= 0x0300 && cp <= 0x036F) ||
-           (cp >= 0x1AB0 && cp <= 0x1AFF) ||
-           (cp >= 0x1DC0 && cp <= 0x1DFF) ||
-           (cp >= 0x20D0 && cp <= 0x20FF) ||
-           (cp >= 0xFE20 && cp <= 0xFE2F);
+    if (cp < 0x80) return false;
+    return detail::unicode::contains(cp, detail::unicode::marks);
 }
 
 bool cp_is_space(uint32_t cp) {
     if (cp < 0x80) return ascii_space(static_cast<uint8_t>(cp));
-    return cp == 0xA0 || cp == 0x2028 || cp == 0x2029 || (cp >= 0x2000 && cp <= 0x200A);
+    return detail::unicode::contains(cp, detail::unicode::spaces);
 }
 
 // Respect process/thread CPU affinity (taskset, containers, and job schedulers)
@@ -373,6 +353,18 @@ std::string QwenTokenizer::bytes_to_chars(const std::string &bytes) const {
     return out;
 }
 
+std::string detail::qwen_normalize_utf8(const std::string &text) {
+    if (std::all_of(text.begin(), text.end(), [](unsigned char c) { return c < 0x80; }))
+        return text;
+    utf8proc_uint8_t *normalized = nullptr;
+    const auto size = utf8proc_map(reinterpret_cast<const utf8proc_uint8_t *>(text.data()),
+        static_cast<utf8proc_ssize_t>(text.size()), &normalized,
+        static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE));
+    std::unique_ptr<utf8proc_uint8_t, decltype(&std::free)> storage(normalized, &std::free);
+    if (size < 0) throw std::runtime_error(std::string("tokenizer NFC normalization failed: ") + utf8proc_errmsg(size));
+    return std::string(reinterpret_cast<const char *>(normalized), static_cast<size_t>(size));
+}
+
 std::vector<std::string> detail::qwen_pre_tokenize(const std::string &text) {
     // Exact Unicode-aware pre-tokenizer control flow, matching llama.cpp's
     // optimized implementation of the Qwen tokenizer Split regex:
@@ -428,13 +420,15 @@ std::vector<std::string> detail::qwen_pre_tokenize(const std::string &text) {
         const uint32_t c0 = cp(pos);
 
         // English contractions, case-insensitive.
-        if (c0 == '\'' && pos + 1 < len && cp(pos + 1) < 0x80) {
-            const char a = static_cast<char>(
-                std::tolower(static_cast<unsigned char>(cp(pos + 1))));
-            const char b = pos + 2 < len && cp(pos + 2) < 0x80
-                ? static_cast<char>(
-                      std::tolower(static_cast<unsigned char>(cp(pos + 2))))
-                : '\0';
+        if (c0 == '\'' && pos + 1 < len) {
+            // Among the contraction letters, Unicode case-insensitive regex
+            // matching additionally folds U+017F (long s) to ASCII s.
+            const auto fold = [](uint32_t c) -> char {
+                if (c == 0x017F) return 's';
+                return c < 0x80 ? static_cast<char>(std::tolower(static_cast<unsigned char>(c))) : '\0';
+            };
+            const char a = fold(cp(pos + 1));
+            const char b = pos + 2 < len ? fold(cp(pos + 2)) : '\0';
             if (a == 's' || a == 't' || a == 'm' || a == 'd') {
                 pos += 2;
                 add_piece(start, pos);
@@ -563,8 +557,10 @@ std::vector<int32_t> QwenTokenizer::bpe_piece(const std::string &piece) const {
 
 std::vector<int32_t> QwenTokenizer::encode_regular_chunk(
         const std::string &chunk) const {
+    const bool unicode = std::any_of(chunk.begin(), chunk.end(), [](unsigned char c) { return c >= 0x80; });
+    const std::string normalized = unicode ? detail::qwen_normalize_utf8(chunk) : std::string{};
     std::vector<int32_t> out;
-    for (const std::string &piece : detail::qwen_pre_tokenize(chunk)) {
+    for (const std::string &piece : detail::qwen_pre_tokenize(unicode ? normalized : chunk)) {
         const std::vector<int32_t> ids = bpe_piece(piece);
         out.insert(out.end(), ids.begin(), ids.end());
     }

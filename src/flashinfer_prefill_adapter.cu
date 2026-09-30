@@ -148,6 +148,92 @@ bool run_prefill_typed(
     return st == cudaSuccess;
 }
 
+bool stable_fp8_prefill_enabled() {
+    const char *raw = std::getenv("QW3_EXPERIMENTAL_FP8_STABLE_PREFILL");
+    if (!raw || !*raw) return false;
+    return std::strcmp(raw, "0") != 0 && std::strcmp(raw, "false") != 0 &&
+           std::strcmp(raw, "off") != 0 && std::strcmp(raw, "no") != 0;
+}
+
+bool stable_ragged_verify_shape(const int32_t *q_indptr, uint32_t batch,
+                               uint32_t page_size, uint32_t heads,
+                               uint32_t kv_heads, uint32_t head_dim) {
+    const char *raw = std::getenv("QW3_EXPERIMENTAL_FP8_STABLE_RAGGED_PREFILL");
+    if (!raw || std::strcmp(raw, "1") != 0 || !q_indptr || batch == 0 ||
+        heads != 24 || kv_heads != 4 || head_dim != 256 ||
+        (page_size != 16 && page_size != 32)) return false;
+    for (uint32_t i = 0; i < batch; ++i)
+        if (q_indptr[i + 1] <= q_indptr[i] || q_indptr[i + 1] - q_indptr[i] > 8)
+            return false;
+    return true;
+}
+
+// Match the fixed eight-row FP8 verifier: one 64-row packed-Q tile per
+// request and 1024-token KV partitions. The ordinary planner chooses both
+// from the other requests in the batch, including switching to CTA_Q=16
+// when a request reaches a one/two-token verification tail.
+// Keep real Q lengths in the output/merge descriptors; padding the planner's
+// Q indptr alone would create holes in another request's output.
+cudaError_t plan_stable_ragged_verify(
+        flashinfer::PrefillPlanInfo &info, void *int_workspace,
+        void *host_workspace, size_t int_bytes,
+        float *float_workspace, size_t float_bytes,
+        const int32_t *q_indptr, const int32_t *page_indptr,
+        uint32_t batch, uint32_t total_q, uint32_t page_size,
+        cudaStream_t stream) {
+    constexpr uint32_t heads = 24, dim = 256, tile_q = 64;
+    const uint32_t chunk_pages = 1024 / page_size;
+    std::vector<int32_t> requests, q_tiles, kv_tiles, output{0}, merge{0};
+    bool split = false;
+    for (uint32_t i = 0; i < batch; ++i) {
+        const int64_t pages = int64_t(page_indptr[i + 1]) - page_indptr[i];
+        const int64_t rows = int64_t(q_indptr[i + 1]) - q_indptr[i];
+        if (pages <= 0 || rows <= 0 || rows > 8) return cudaErrorInvalidValue;
+        const int64_t chunks = (pages + chunk_pages - 1) / chunk_pages;
+        if (int64_t(output.back()) + rows * chunks > INT32_MAX ||
+            requests.size() + chunks > INT32_MAX) return cudaErrorInvalidValue;
+        split |= chunks > 1;
+        for (int32_t k = 0; k < chunks; ++k) {
+            requests.push_back(i); q_tiles.push_back(0); kv_tiles.push_back(k);
+        }
+        for (int64_t q = 0; q < rows; ++q) merge.push_back(merge.back() + chunks);
+        output.push_back(merge.back());
+    }
+    if (merge.size() != uint64_t(total_q) + 1 || (split && !float_workspace))
+        return cudaErrorInvalidValue;
+    info = {};
+    info.cta_tile_q = tile_q; info.total_num_rows = total_q;
+    info.padded_batch_size = requests.size(); info.split_kv = split;
+    flashinfer::AlignedAllocator integers(int_workspace, int_bytes);
+    auto copy_vector = [&](const std::vector<int32_t> &values, const char *name) {
+        const auto offset = integers.aligned_alloc_offset(values.size() * sizeof(int32_t), 16, name);
+        std::memcpy(static_cast<char *>(host_workspace) + offset, values.data(), values.size() * sizeof(int32_t));
+        return offset;
+    };
+    info.request_indices_offset = copy_vector(requests, "stable_ragged_requests");
+    info.qo_tile_indices_offset = copy_vector(q_tiles, "stable_ragged_q_tiles");
+    info.kv_tile_indices_offset = copy_vector(kv_tiles, "stable_ragged_kv_tiles");
+    info.o_indptr_offset = copy_vector(output, "stable_ragged_output");
+    info.kv_chunk_size_ptr_offset = integers.aligned_alloc_offset(sizeof(int32_t), 1, "stable_ragged_chunk");
+    *reinterpret_cast<int32_t *>(static_cast<char *>(host_workspace) + info.kv_chunk_size_ptr_offset) = 1024;
+    if (split) {
+        flashinfer::AlignedAllocator floats(float_workspace, float_bytes);
+        // Kernels write only real qo_len rows at o_indptr[request] +
+        // qo_idx * chunks + chunk. Reserving a whole CTA_Q tile per KV
+        // partition wastes up to 64x and exceeds the default scratch limit
+        // at long C4, even though the actual merge payload fits comfortably.
+        const size_t partial_rows = size_t(heads) * merge.back();
+        info.v_offset = floats.aligned_alloc_offset(partial_rows * dim * sizeof(float), 16, "stable_ragged_v");
+        info.s_offset = floats.aligned_alloc_offset(partial_rows * sizeof(float), 16, "stable_ragged_s");
+        info.merge_indptr_offset = copy_vector(merge, "stable_ragged_merge");
+        info.block_valid_mask_offset = integers.aligned_alloc_offset(requests.size() * sizeof(bool), 16, "stable_ragged_valid");
+        std::fill_n(reinterpret_cast<bool *>(static_cast<char *>(host_workspace) + info.block_valid_mask_offset), requests.size(), true);
+    }
+    // Construct all host descriptors before the single asynchronous copy.
+    return cudaMemcpyAsync(int_workspace, host_workspace, integers.num_allocated_bytes(),
+                           cudaMemcpyHostToDevice, stream);
+}
+
 constexpr uint32_t kPagedPrefillPrefixI32 = 16;
 
 bool paged_prefill_plan_cache_enabled() {
@@ -181,6 +267,7 @@ struct PagedPrefillPlanCache {
     uint32_t head_dim = 0;
     uint32_t page_size = 0;
     bool allow_split_kv = false;
+    bool fixed_verify_schedule = false;
     uint64_t consecutive_hits = 0;
     uint64_t total_hits = 0;
     uint64_t total_misses = 0;
@@ -293,7 +380,14 @@ bool run_batch_prefill_paged_typed(
     using Variant = flashinfer::DefaultAttention<false, false, false, false>;
 
     flashinfer::PrefillPlanInfo plan_info;
-    int32_t qo_indptr_h[2] = {0, static_cast<int32_t>(batch)};
+    // Diagnostic-only stable schedule for the Qwen FP8 verifier shape. Plan
+    // enough Q rows for an eight-row call even for a serial call. Device Q
+    // indptr and max_total_num_rows remain the actual row count, so no padded
+    // input or output is accessed. Extra merge descriptors are unused.
+    const bool fixed_verify_schedule = stable_fp8_prefill_enabled() && sizeof(TKV) == 1 && head_dim == 256 &&
+        n_heads == 24 && n_kv_heads == 4 && (page_size == 16 || page_size == 32) && batch <= 8;
+    const uint32_t planning_rows = fixed_verify_schedule ? 8u : batch;
+    int32_t qo_indptr_h[2] = {0, static_cast<int32_t>(planning_rows)};
     int32_t kv_indptr_h[2] = {0, static_cast<int32_t>(need_pages)};
     void *plan_int_workspace =
         reinterpret_cast<void *>(reinterpret_cast<char *>(int_workspace) + prefix_bytes);
@@ -308,6 +402,7 @@ bool run_batch_prefill_paged_typed(
     // tmp_v/tmp_s and merges them via VariableLengthMergeStates internally.
     const bool allow_split_kv =
         (float_workspace != nullptr && float_workspace_bytes > 0);
+    if (fixed_verify_schedule && need_pages > (1024 / page_size) && !allow_split_kv) return false;
     float *active_float_workspace = float_workspace;
     size_t active_float_workspace_bytes = float_workspace_bytes;
     static thread_local PagedPrefillPlanCache plan_cache;
@@ -316,6 +411,7 @@ bool run_batch_prefill_paged_typed(
     if (cudaGetDevice(&current_device) != cudaSuccess) return false;
     const bool plan_cache_hit =
         use_plan_cache &&
+        plan_cache.fixed_verify_schedule == fixed_verify_schedule &&
         plan_cache.matches(
             int_workspace, int_workspace_bytes,
             float_workspace, float_workspace_bytes, stream,
@@ -332,7 +428,7 @@ bool run_batch_prefill_paged_typed(
             plan_info,
             qo_indptr_h,
             kv_indptr_h,
-            batch,
+            planning_rows,
             1,
             n_heads,
             n_kv_heads,
@@ -342,7 +438,7 @@ bool run_batch_prefill_paged_typed(
             false,
             sizeof(half),
             -1,
-            0,
+            fixed_verify_schedule ? (1024 / page_size) : 0, // 1024 KV tokens, independent of Q width
             disable_split_kv,
             0,
             stream);
@@ -382,6 +478,8 @@ bool run_batch_prefill_paged_typed(
         try {
             plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
         } catch (const std::exception &) {
+            // Do not hide an undersized fixed schedule with a different algorithm.
+            if (fixed_verify_schedule) return false;
             // FlashInfer's aligned workspace allocator throws when a requested
             // split plan does not fit. Correctness does not require splitting:
             // retry with the non-split planner instead of failing the request.
@@ -423,6 +521,7 @@ bool run_batch_prefill_paged_typed(
             plan_cache.head_dim = head_dim;
             plan_cache.page_size = page_size;
             plan_cache.allow_split_kv = allow_split_kv;
+            plan_cache.fixed_verify_schedule = fixed_verify_schedule;
             plan_cache.plan_info = plan_info;
             plan_cache.valid = true;
         }
@@ -588,7 +687,13 @@ bool run_batch_prefill_paged_ragged_typed(
         (float_workspace != nullptr && float_workspace_bytes > 0);
     float *active_float_workspace = float_workspace;
     size_t active_float_workspace_bytes = float_workspace_bytes;
+    const bool fixed_verify_schedule = sizeof(TKV) == 1 &&
+        stable_ragged_verify_shape(q_indptr_host, batch, page_size, n_heads, n_kv_heads, head_dim);
     auto plan = [&](bool disable_split_kv) {
+        if (fixed_verify_schedule)
+            return plan_stable_ragged_verify(plan_info, int_workspace, host_int_workspace,
+                int_workspace_bytes, float_workspace, float_workspace_bytes,
+                q_indptr_host, page_indptr_host, batch, total_q, page_size, stream);
         return flashinfer::PrefillPlan<int32_t>(
             disable_split_kv ? nullptr : active_float_workspace,
             disable_split_kv ? 0 : active_float_workspace_bytes,
@@ -617,6 +722,9 @@ bool run_batch_prefill_paged_ragged_typed(
     try {
         plan_st = plan(/*disable_split_kv=*/!allow_split_kv);
     } catch (const std::exception &) {
+        // A fixed schedule must not silently change arithmetic on allocation
+        // failure. Its workspace is sized together with the ordinary plan.
+        if (fixed_verify_schedule) return false;
         active_float_workspace = nullptr;
         active_float_workspace_bytes = 0;
         plan_info = {};
@@ -750,7 +858,7 @@ cudaError_t prefill_plan_workspace_size(
         uint32_t n_heads,
         uint32_t n_kv_heads,
         uint32_t head_dim,
-        uint32_t page_size) {
+        uint32_t page_size, int32_t fixed_split_size = 0) {
     if (!qo_indptr_h || !kv_indptr_h || batch_size == 0 ||
         n_kv_heads == 0 || n_heads % n_kv_heads != 0) {
         return cudaErrorInvalidValue;
@@ -782,7 +890,7 @@ cudaError_t prefill_plan_workspace_size(
             max_batch_size_if_split,
             /*enable_cuda_graph=*/false,
             /*window_left=*/-1,
-            /*fixed_split_size=*/0,
+            /*fixed_split_size=*/fixed_split_size,
             /*disable_split_kv=*/false);
 
         const bool split_kv = std::get<0>(split_plan);
@@ -866,7 +974,7 @@ bool batch_prefill_paged_workspace_bytes(
     int32_t qo_indptr_h[2] = {0, static_cast<int32_t>(batch)};
     int32_t kv_indptr_h[2] = {0, static_cast<int32_t>(need_pages)};
     size_t plan_int_bytes = 0;
-    const cudaError_t status =
+    cudaError_t status =
         prefill_plan_workspace_size(
             float_workspace_bytes,
             plan_int_bytes,
@@ -878,6 +986,22 @@ bool batch_prefill_paged_workspace_bytes(
             n_kv_heads,
             head_dim,
             /*page_size=*/page_size);
+    // This dtype-independent capacity query must accommodate both the
+    // original plan and the FP8 fixed plan. Keep the original capacity for
+    // FP16 callers. Ragged workspace sizing handles its optional fixed plan
+    // separately, using the same 1024-token partition width.
+    if (stable_fp8_prefill_enabled() && status == cudaSuccess && head_dim == 256 && n_heads == 24 &&
+        n_kv_heads == 4 && (page_size == 16 || page_size == 32) && batch <= 8) {
+        int32_t fixed_qo[2] = {0, 8};
+        size_t fixed_float_bytes = 0, fixed_int_bytes = 0;
+        status = prefill_plan_workspace_size(
+            fixed_float_bytes, fixed_int_bytes, fixed_qo, kv_indptr_h,
+            8, 1, n_heads, n_kv_heads, head_dim, page_size, 1024 / page_size);
+        if (status == cudaSuccess) {
+            float_workspace_bytes = std::max(float_workspace_bytes, fixed_float_bytes);
+            plan_int_bytes = std::max(plan_int_bytes, fixed_int_bytes);
+        }
+    }
     if (status != cudaSuccess ||
         plan_int_bytes >
             std::numeric_limits<size_t>::max() -
@@ -912,7 +1036,7 @@ bool batch_prefill_paged_ragged_workspace_bytes(
         page_indptr_host[0] != 0 || page_indptr_host[batch] <= 0) {
         return false;
     }
-    const cudaError_t status =
+    cudaError_t status =
         prefill_plan_workspace_size(
             float_workspace_bytes,
             int_workspace_bytes,
@@ -924,6 +1048,33 @@ bool batch_prefill_paged_ragged_workspace_bytes(
             n_kv_heads,
             head_dim,
             page_size);
+    if (status == cudaSuccess && stable_ragged_verify_shape(
+            q_indptr_host, batch, page_size, n_heads, n_kv_heads, head_dim)) {
+        // Eight planning rows force CTA_Q=64. This overallocates only merge
+        // metadata; execution uses real per-request row counts throughout.
+        if (batch > uint32_t(INT32_MAX / 8)) return false;
+        std::vector<int32_t> padded_q(batch + 1);
+        for (uint32_t i = 0; i <= batch; ++i) padded_q[i] = i * 8;
+        size_t fixed_float_bytes = 0, fixed_int_bytes = 0;
+        status = prefill_plan_workspace_size(fixed_float_bytes, fixed_int_bytes,
+            padded_q.data(), const_cast<int32_t *>(page_indptr_host), batch * 8,
+            batch, n_heads, n_kv_heads, head_dim, page_size, 1024 / page_size);
+        if (status == cudaSuccess) {
+            size_t partial_rows = 0;
+            bool split = false;
+            for (uint32_t i = 0; i < batch; ++i) {
+                const size_t chunks = (size_t(page_indptr_host[i + 1] - page_indptr_host[i]) +
+                                       1024 / page_size - 1) / (1024 / page_size);
+                partial_rows += size_t(q_indptr_host[i + 1] - q_indptr_host[i]) * chunks;
+                split |= chunks > 1;
+            }
+            // Same compact layout as plan_stable_ragged_verify. Keep the
+            // ordinary plan's requirement too for FP16/unsupported callers.
+            fixed_float_bytes = split ? partial_rows * n_heads * (head_dim + 1) * sizeof(float) : 0;
+            float_workspace_bytes = std::max(float_workspace_bytes, fixed_float_bytes);
+            int_workspace_bytes = std::max(int_workspace_bytes, fixed_int_bytes);
+        }
+    }
     if (status != cudaSuccess) {
         int_workspace_bytes = 0;
         float_workspace_bytes = 0;

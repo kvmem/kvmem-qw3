@@ -1,5 +1,7 @@
 #pragma once
 #include "qw3/kvmem_gc.hpp"
+#include "qw3/kvmem_repository.hpp"
+#include "qw3/kvmem_repository_gc.hpp"
 
 // Block-sparse KV attention — block repository + working-set selection.
 //
@@ -24,6 +26,8 @@
 // same selected block IDs); the per-layer dimension is reserved for later.
 
 #include <cstdint>
+#include <array>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -70,6 +74,13 @@ struct KvMemBlock {
     double   profile_score = 0.0;    // window-local cumulative attention heat
     double   retrieval_score = 0.0;  // global retrieval score
 
+    // Bounded repository mode only: block_id/orig_pos_start address a physical
+    // metadata/page slot; historical order is separate and must not be inferred
+    // from those reusable addresses. Legacy mode has generation == 0.
+    uint64_t repository_generation = 0;
+    uint64_t logical_id = 0;
+    uint64_t history_pos_start = 0;
+
     uint32_t orig_pos_end() const { return orig_pos_start + n_tokens; }
 };
 
@@ -105,11 +116,50 @@ struct KvMemDroppedBlock {
     int32_t  nvme_slot = -1;
 };
 
+// One contiguous slice of a history interval in a reusable physical slot.
+// storage_begin addresses repository page/raw-K/index backing, not RoPE.
+struct KvMemStorageSpan {
+    uint64_t history_begin = 0;
+    uint32_t storage_begin = 0;
+    uint32_t token_count = 0;
+    KvMemBlockHandle handle;
+};
+
+// A read owns the backing until all copies/scoring have actually completed.
+struct KvMemStorageRead {
+    std::vector<KvMemStorageSpan> spans;
+    std::vector<KvMemRepository::Lease> leases;
+};
+
+// A canonical index row is usable only for this exact generation and token
+// prefix. An address alone cannot distinguish newly reused or rewritten KV.
+struct KvMemIndexStamp {
+    KvMemBlockHandle handle;
+    uint32_t tokens = 0;
+};
+struct KvMemRepositoryScoreFrame {
+    std::vector<KvMemRepository::Lease> leases;
+    std::vector<uint8_t> enabled; // physical-slot mask, consumed before softmax
+};
+
+struct KvMemStoragePageSpan {
+    uint32_t storage_page = 0;
+    uint32_t window_page = 0;
+    uint32_t page_count = 0;
+};
+// Translate one ordinary contiguous forward into page aliases without splitting
+// it into per-block GPU batches. The first/last pages may be partial; internal
+// physical discontinuities must land on page boundaries. The caller retains
+// the source Read/Append leases through GPU/IO completion.
+std::vector<KvMemStoragePageSpan> kvmem_storage_page_spans(
+    const std::vector<KvMemStorageSpan> &, uint32_t page_size, uint32_t window_begin);
+
 // Result of diffing a new selection against the current working set.
 struct KvMemPlan {
     // Keep the previous window alive until the ordinary transfer/assembly plan
     // has finished. Checkpoints separately share the current window's lease.
     std::shared_ptr<KvMemGc::Lease> gc_previous_window;
+    std::shared_ptr<std::vector<KvMemRepository::Lease>> repository_previous_window;
     // Blocks newly entering the logical working set. The executor may avoid a
     // physical transfer when their GPU pages are still resident.
     std::vector<uint32_t> stage_in;
@@ -277,8 +327,9 @@ struct KvMemStoreConfig {
     // in a CPU mirror and keeps only one active K copy on GPU. Resident window
     // moves use an in-place delta rotation; cold blocks and blocks crossing a
     // refresh threshold are rebuilt from raw K in one H2D + scatter/RoPE
-    // pass. Native serving uses a conservative count limit of 8 for both FP16
-    // and FP8; controlled experiments may override it.
+    // pass. Native FP16 serving uses a count limit of 8. FP8 serving sets the
+    // absolute-delta limit to 1, rebuilding every moved block to avoid repeated
+    // quantization drift; stable resident slots still skip reconstruction.
     bool immutable_source_k = false;
     // Engine-level MTP prefix/speculation is enabled for this executor. Kept
     // explicit so non-MTP KVMem runs do not allocate/tier an unused MTP cache
@@ -328,21 +379,31 @@ struct KvMemStoreConfig {
     // authority. CPU raw-K chunks then become a bounded cache and cold selected
     // blocks stream directly from SSD into the existing packed staging slabs.
     bool raw_k_nvme = false;
+    // Internal bounded-serving integration. Zero preserves the legacy store.
+    // Physical ctx must equal this capacity * block_tokens; cumulative history
+    // uses independent repository positions. Not exposed by the CLI yet.
+    uint32_t repository_blocks = 0;
+    uint32_t repository_ready_low = 0, repository_ready_high = 0;
+    KvMemRepositoryGc::Mode repository_gc_mode = KvMemRepositoryGc::Mode::Delete;
 };
 
 class KvMemStore {
 public:
     explicit KvMemStore(KvMemStoreConfig cfg) : cfg_(cfg) {}
+    KvMemStore(KvMemStoreConfig, std::shared_ptr<KvMemRepository>);
 
     const KvMemStoreConfig &config() const { return cfg_; }
     uint32_t block_count() const { return static_cast<uint32_t>(blocks_.size()); }
     const std::vector<KvMemBlock> &blocks() const { return blocks_; }
-    void attach_gc(std::shared_ptr<KvMemGc> gc) { gc_ = std::move(gc); if (gc_) gc_->set_recent_blocks(cfg_.recent_blocks); gc_view_ = gc_ ? gc_->read_view() : nullptr; }
+    void attach_gc(std::shared_ptr<KvMemGc> gc);
     const std::shared_ptr<KvMemGc> &gc() const { return gc_; }
     const std::shared_ptr<const KvMemGc::View> &gc_view() const { return gc_view_; }
     void gc_begin_step();
-    void gc_end_step() { if (gc_) gc_view_.reset(); }
-    bool is_live(uint32_t id) const { return id < block_count() && (!gc_ || (gc_view_ && gc_->is_live(id, gc_view_))); }
+    void gc_end_step() {
+        if (gc_) gc_view_.reset();
+        if (repository_gc_) repository_gc_->notify_progress();
+    }
+    bool is_live(uint32_t id) const;
     uint32_t gc_missing_required_prefix_block(uint32_t begin, uint32_t end, uint32_t prefix_end) const;
     std::shared_ptr<KvMemGc::Lease> gc_checkpoint_lease();
     void gc_restore_lease(std::shared_ptr<KvMemGc::Lease> lease) { gc_working_lease_ = std::move(lease); if (gc_) gc_->set_active(gc_working_lease_); }
@@ -352,6 +413,128 @@ public:
     // new block starts. Returns the number of blocks that became newly full
     // (the trailing partial block is always present once any token exists).
     void register_append(uint32_t n_new_tokens);
+
+    // Opt-in bounded-store API. A producer commits a repository reservation
+    // after preparing its payload, then installs the corresponding physical
+    // slot metadata here. baked_pos is the ACTUAL local RoPE position used to
+    // produce this K, never the unbounded historical token position.
+    bool has_repository() const { return bool(repository_); }
+    const std::shared_ptr<KvMemRepository> &repository() const { return repository_; }
+    void attach_repository_gc(std::shared_ptr<KvMemRepositoryGc>);
+    // Executor publishes these only after all configured main/MTP raw-K/V and
+    // index components have actually become authoritative for this generation.
+    void set_repository_gc_flags(KvMemBlockHandle, uint32_t mask, uint32_t values);
+    void register_repository_block(KvMemRepository::Lease, uint32_t baked_pos);
+    KvMemBlockHandle repository_handle(uint32_t slot) const;
+    uint64_t history_end() const { return total_tokens_; }
+    // There is at most one foreground append transaction. Prepare reserves
+    // whole slots without publishing unwritten bytes; it returns nullptr if
+    // the CPU worker has not supplied sufficient ready capacity. The caller
+    // executes the SAME batched GPU forward over these disjoint addresses,
+    // waits for payload completion, then commits the accepted prefix (MTP).
+    // No structural Store mutation or destruction is allowed while a
+    // transaction exists. Versioned IO/index completion flags may be published.
+    class RepositoryAppend {
+    public:
+        ~RepositoryAppend();
+        RepositoryAppend(const RepositoryAppend &) = delete;
+        RepositoryAppend &operator=(const RepositoryAppend &) = delete;
+        const std::vector<KvMemStorageSpan> &spans() const { return spans_; }
+        std::vector<KvMemRepository::Lease> io_leases() const;
+        uint64_t begin() const { return begin_; }
+        uint64_t end() const { return begin_ + count_; }
+        // Extend a speculative/streamed batch without publishing any bytes.
+        // False leaves the original reservation unchanged (ready exhaustion).
+        bool extend(uint32_t count);
+        KvMemStorageRead storage_write(uint64_t begin, uint32_t count) const;
+        // Foreground GPU cleanup before commit/cancel exposes rejected slots
+        // to the CPU reclaimer. Keep the partially accepted physical page.
+        std::vector<std::pair<uint32_t, uint32_t>> discarded_page_ranges(
+            uint32_t accepted_tokens, uint32_t page_size) const;
+        void commit(uint32_t accepted_tokens);
+    private:
+        friend class KvMemStore;
+        explicit RepositoryAppend(KvMemStore &owner) : owner_(&owner) {}
+        KvMemStore *owner_;
+        uint64_t begin_ = 0;
+        uint32_t count_ = 0, baked_begin_ = 0;
+        std::vector<KvMemStorageSpan> spans_;
+        std::vector<KvMemRepository::Reservation> reservations_;
+        KvMemRepository::Lease tail_;
+    };
+    std::unique_ptr<RepositoryAppend> prepare_repository_append(
+        uint32_t count, uint32_t local_rope_begin);
+    // Lookup is O(log(capacity) + touched blocks), independent of cumulative
+    // history length. Deleted or not-yet-committed intervals fail explicitly.
+    KvMemStorageRead repository_storage_read(uint64_t begin, uint32_t count) const;
+    // Physical cache/writeback scan. O(count + prepared batch log(batch));
+    // skips retired holes and includes Writing only through its reservation.
+    // Spans cover the valid/prepared prefix of each slot and carry real leases.
+    KvMemStorageRead repository_slot_read(uint32_t first_slot, uint32_t count,
+                                         const RepositoryAppend *prepared = nullptr) const;
+    size_t repository_directory_entries() const { return repository_history_.size(); }
+    // Maps original transcript intervals to current physical slots. Strict
+    // coverage rejects deleted gaps; it never substitutes an unrelated block
+    // that later reused the same physical address.
+    std::vector<uint32_t> history_span_blocks(uint64_t begin, uint64_t end,
+                                              bool require_complete = true) const;
+    std::vector<KvMemRepository::Lease> repository_checkpoint_leases() const;
+    // Checkpoints keep only their working set resident in the repository. The
+    // registry itself is fixed-size; expired entries are reused, not appended.
+    // A rewind invalidates later checkpoints even if a new branch subsequently
+    // reaches the same length. Earlier checkpoints retain their prefix leases.
+    class RepositoryCheckpoint {
+    public:
+        bool valid() const { return valid_; }
+        uint64_t position() const { return position_; }
+    private:
+        friend class KvMemStore;
+        std::shared_ptr<KvMemRepository> repository_;
+        uint64_t position_ = 0;
+        bool valid_ = true;
+        std::vector<KvMemRepository::Lease> leases_;
+    };
+    static constexpr size_t repository_checkpoint_capacity = 32;
+    std::shared_ptr<RepositoryCheckpoint> repository_checkpoint(uint64_t position,
+                                                               bool pin_working_set = true);
+    void protect_repository_checkpoint(const std::shared_ptr<RepositoryCheckpoint> &);
+    bool repository_checkpoint_valid(const std::shared_ptr<RepositoryCheckpoint> &) const;
+
+    // Foreground transaction: first quiesce index, raw/V and main/MTP readers;
+    // then release GPU pages described by discarded_spans BEFORE commit.
+    // The CPU reclaimer may reclaim only after commit and destruction of this
+    // transaction. A partial tail keeps its unchanged prefix; suffix snapshots
+    // are invalidated before any later append may overwrite the discarded data.
+    class RepositoryRewind {
+    public:
+        ~RepositoryRewind();
+        RepositoryRewind(const RepositoryRewind &) = delete;
+        RepositoryRewind &operator=(const RepositoryRewind &) = delete;
+        const std::vector<KvMemStorageSpan> &discarded_spans() const { return discarded_; }
+        uint64_t position() const { return position_; }
+        void commit();
+    private:
+        friend class KvMemStore;
+        explicit RepositoryRewind(KvMemStore &s) : owner_(&s) {}
+        KvMemStore *owner_;
+        uint64_t position_ = 0;
+        KvMemStorageRead captured_;
+        std::vector<KvMemStorageSpan> discarded_;
+    };
+    std::unique_ptr<RepositoryRewind> prepare_repository_rewind(uint64_t position);
+    KvMemRepositoryScoreFrame repository_score_frame(
+        const std::vector<KvMemIndexStamp> &index, uint64_t history_end,
+        bool mask_kept) const;
+    // Scorers/IO retain these leases across asynchronous work. The immutable
+    // handles must accompany returned scores and selected blocks, so a stale
+    // slot number cannot silently address the next generation.
+    std::vector<KvMemRepository::Lease> repository_read_leases() const;
+    void set_repository_retrieval_scores(const std::vector<KvMemBlockHandle> &,
+                                        const std::vector<double> &);
+    void accumulate_repository_attn(const std::vector<KvMemBlockHandle> &,
+                                    const std::vector<double> &);
+    KvMemPlan set_repository_selection(const std::vector<KvMemBlockHandle> &,
+                                       bool force_raw_refresh = false);
 
     // Drop trailing blocks so the store holds exactly `token_pos` tokens (the
     // inverse of register_append). Used by the kvmem prefix cache to rewind the
@@ -406,6 +589,10 @@ public:
         const std::vector<std::pair<uint32_t, uint32_t>> &groups,
         const std::vector<double> &group_scores,
         const std::vector<uint32_t> &mandatory_blocks = {}) const;
+    std::vector<uint32_t> pick_repository_semantic_groups(
+        const std::vector<std::pair<uint64_t, uint64_t>> &groups,
+        const std::vector<double> &group_scores,
+        const std::vector<uint32_t> &mandatory_blocks = {}) const;
 
     // Deterministic working set used only while a long prefill is under memory
     // pressure. Keep the configured sink prefix, then fill every remaining
@@ -417,6 +604,15 @@ public:
     // blocks consume ordinary newest-tail slots and never expand the fixed
     // prefill budget.
     std::vector<uint32_t> pick_prefill_pressure_blocks(
+        const std::vector<uint32_t> &mandatory_blocks) const;
+    struct RepositoryPressureSelection {
+        std::vector<uint32_t> blocks;
+        std::vector<KvMemRepository::Lease> leases;
+    };
+    // Snapshot candidates and retain only the chosen block generations until
+    // set_repository_selection installs their working-set leases. CPU GC may
+    // otherwise retire a candidate between the pure selector and installation.
+    RepositoryPressureSelection pin_repository_pressure_selection(
         const std::vector<uint32_t> &mandatory_blocks) const;
 
     // Accumulate per-block attention quality (decode side-channel, #40). `scores`
@@ -438,16 +634,16 @@ public:
 
     void set_block_tier(uint32_t block_id, KvTier tier,
                         int32_t cpu_slot = -1,
-                        int32_t nvme_slot = -1);
+                        int32_t nvme_slot = -1, uint64_t generation = 0);
     // Inclusive-copy metadata used by stage-out. These do not change which tier is
     // active, so evicting a CPU cache copy cannot accidentally mark a still-live
     // GPU block cold.
-    void set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot);
+    void set_block_cpu_copy(uint32_t block_id, int32_t cpu_slot, uint64_t generation = 0);
     void set_block_ssd_backing(uint32_t block_id, int32_t nvme_slot,
-                               bool clean);
-    void set_block_io_in_flight(uint32_t block_id, bool in_flight);
-    void set_block_baked_pos(uint32_t block_id, int64_t baked_pos);
-    void record_block_rerope(uint32_t block_id, int64_t baked_pos);
+                               bool clean, uint64_t generation = 0);
+    void set_block_io_in_flight(uint32_t block_id, bool in_flight, uint64_t generation = 0);
+    void set_block_baked_pos(uint32_t block_id, int64_t baked_pos, uint64_t generation = 0);
+    void record_block_rerope(uint32_t block_id, int64_t baked_pos, uint64_t generation = 0);
 
     // Diff `selected_ids` against current GPU residency / working-set state and produce the
     // stage-in/out lists + the window remap plan. Each remap starts from the
@@ -465,15 +661,41 @@ public:
     void clear_working_set();
 
 private:
+    void repository_sync_gc(uint32_t slot, bool used = false);
+    void install_repository_block(KvMemRepository::Lease, uint32_t baked_pos,
+                                  uint32_t valid_tokens);
+    void require_no_repository_append() const;
+    KvMemRepository::Lease validate_repository_mutation(uint32_t, uint64_t) const;
+    std::vector<uint32_t> chronological_ids() const;
+    bool earlier(uint32_t a, uint32_t b) const;
+    bool sink_block(uint32_t id) const;
+    KvMemPlan set_selection_impl(std::vector<uint32_t>, bool);
+    std::shared_ptr<KvMemRepository> repository_;
+    std::shared_ptr<KvMemRepositoryGc> repository_gc_;
+    std::vector<uint32_t> repository_gc_flags_;
+    std::vector<KvMemBlockHandle> repository_score_handles_;
+    uint64_t repository_score_sequence_ = 0;
+    bool repository_scores_pending_ = false;
+    std::vector<KvMemRepository::Lease> repository_resident_leases_;
+    using RepositoryHistory = std::map<uint64_t, KvMemBlockHandle>;
+    // Foreground-owned directory. Recycle one preallocated map node per slot;
+    // the CPU reclaimer only changes repository atomics, never this map.
+    RepositoryHistory repository_history_;
+    std::vector<RepositoryHistory::node_type> repository_history_nodes_;
+    bool repository_append_pending_ = false;
+    std::array<std::weak_ptr<RepositoryCheckpoint>, repository_checkpoint_capacity> repository_checkpoints_;
     void gc_sync_block(uint32_t id);
     void gc_validate_mandatory(const std::vector<uint32_t> &) const;
+    std::vector<uint32_t> pick_prefill_pressure_from(
+        const std::vector<uint32_t> &order,
+        const std::vector<uint32_t> &mandatory_blocks) const;
     std::shared_ptr<KvMemGc> gc_;
     std::shared_ptr<const KvMemGc::View> gc_view_;
     std::shared_ptr<KvMemGc::Lease> gc_working_lease_;
     KvMemStoreConfig cfg_;
     uint32_t runtime_select_budget_ = 0;
     std::vector<KvMemBlock> blocks_;
-    uint32_t total_tokens_ = 0;  // total appended context length
+    uint64_t total_tokens_ = 0;  // cumulative history, not allocated KV capacity
 };
 
 } // namespace qw3

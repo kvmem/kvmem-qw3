@@ -27,6 +27,7 @@ public:
 
     static void copy_metadata(Snapshot &dst, const Snapshot &src) {
         dst.gc_lease = src.gc_lease;
+        dst.repository_checkpoint = src.repository_checkpoint;
         dst.ready = src.ready;
         dst.position = src.position;
         dst.kv_logical_pages = src.kv_logical_pages;
@@ -42,6 +43,7 @@ public:
         dst.window_mrope_append_active = src.window_mrope_append_active;
         dst.window_mrope_append_source_next = src.window_mrope_append_source_next;
         dst.window_mrope_append_delta = src.window_mrope_append_delta;
+        dst.dflash = src.dflash; // Immutable; cold storage replaces this with descriptors below.
     }
 
     template<class F> static void tensors(Snapshot &state, F fn) {
@@ -49,6 +51,10 @@ public:
         fn(state.mtp_prefix_h);
         for (auto &tensor : state.recurrent_states) fn(tensor);
         for (auto &tensor : state.conv_states) fn(tensor);
+        if (state.dflash) {
+            for (const auto &tensor : state.dflash->raw_keys) fn(tensor);
+            for (const auto &tensor : state.dflash->values) fn(tensor);
+        }
     }
 
     static uint64_t bytes(Snapshot &state) {
@@ -83,6 +89,12 @@ public:
             layout->recurrent_states[i] = metadata(gpu->recurrent_states[i]);
         for (size_t i = 0; i < gpu->conv_states.size(); ++i)
             layout->conv_states[i] = metadata(gpu->conv_states[i]);
+        if (gpu->dflash) {
+            auto draft = std::make_shared<DFlashExecutor::StateSnapshot>(*gpu->dflash);
+            for (auto &tensor : draft->raw_keys) tensor = metadata(tensor);
+            for (auto &tensor : draft->values) tensor = metadata(tensor);
+            layout->dflash = std::move(draft);
+        }
         try {
             require(backend_.begin_kv_transfer_from_device());
             uint64_t offset = 0;
@@ -135,6 +147,19 @@ public:
             prepare(next->recurrent_states[i], layout_->recurrent_states[i]);
         for (size_t i = 0; i < next->conv_states.size(); ++i)
             prepare(next->conv_states[i], layout_->conv_states[i]);
+        if (layout_->dflash) {
+            auto draft = std::make_shared<DFlashExecutor::StateSnapshot>(*layout_->dflash);
+            // Do not overwrite shared immutable GPU draft snapshots held by
+            // other cache readers when recycling the target allocation.
+            auto allocate = [&](auto &tensor) {
+                auto descriptor = tensor;
+                tensor.reset();
+                prepare(tensor, descriptor);
+            };
+            for (auto &tensor : draft->raw_keys) allocate(tensor);
+            for (auto &tensor : draft->values) allocate(tensor);
+            next->dflash = std::move(draft);
+        }
         try {
             // Newly allocated BF16 tensors may still have initialization on
             // the execution stream. Order H2D after it, then wait once for the
