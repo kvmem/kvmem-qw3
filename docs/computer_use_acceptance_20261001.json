@@ -1,0 +1,77 @@
+{
+  "kind": "acceptance_evidence_inventory_not_completion_certificate",
+  "reviewed_at": 1790805723.3358884,
+  "goal_complete": false,
+  "recorded_source_commit": "53cd0bf",
+  "gpu_limit_48gb_retired": true,
+  "native_client_source_files_match": true,
+  "current_native_matrix": {
+    "status": "running",
+    "completed_trials": 12,
+    "passed_trials": 12,
+    "required_trials": 18
+  },
+  "verified_retained_evidence": {
+    "cpu-baseline-recheck-01/result.json": {
+      "sha256": "2043aca7fd053072dd397db8aad6d4e58fa8f3e2f12de6f3eae7febed41ee067"
+    },
+    "comparison-short-02/output_checks.json": {
+      "sha256": "4d73356d893b660a84b6f906f5cb407a811b5b5c7dc461130947295560f0f665"
+    },
+    "comparison-long-02/visual-checks.json": {
+      "sha256": "a0314ec1cc8780ef6a7390b2193ba4f2ba7bf2e7e9d8c573de894a8f9754e80d"
+    },
+    "comparison-long-controls-01/visual-checks.json": {
+      "sha256": "4f166a6fc85861d4b13ef697702b99ed56e7e1d6d363e65ef2bf99e9418cd34c"
+    },
+    "windows-recovery-03/result.json": {
+      "sha256": "f81694e9f41148d4611d123652c4befa91f43bdc2a2cf536001db2f4e6fac851"
+    },
+    "windows-restart-01/result.json": {
+      "sha256": "4ed6a52a88d6e32f6a05df82bf74b5cc1661f4e0e03878d4ae0c5a312490bfde"
+    },
+    "windows-native-restart-01/summary.json": {
+      "sha256": "f0199e677f2089d08b3704653d76d4ca6fd2162d2a5ddb2b5586c9d325b0fef7"
+    },
+    "browser-ui-check-01/result.json": {
+      "sha256": "492a35fe2004995b6bc26b48b70855d022e8abd8b5cf9762d9797121b8bd270e"
+    },
+    "windows-typing-paste-04/result.json": {
+      "sha256": "afdff5f8f75f222989bba8f74fb3440661db27202882d78234d119f61db52e49"
+    },
+    "windows-clipboard-01/check-final.json": {
+      "sha256": "30b91fe3c456a2863ab22d00a798682fc24356ee84f4cb83a03745e5791dc1e1"
+    },
+    "memory-long-dflash-01/dflash2-kvmem-on/memory-evidence.json": {
+      "sha256": "c3b558814f2f25500528804f81da185c569b60e47f191d464503f286d4023f89"
+    },
+    "memory-long-dflash-01/dflash2-kvmem-off/memory-evidence.json": {
+      "sha256": "b4ef02084c412d17126d5e78bb2c9b7debd407c25a71c6578d837772cbdf6b54"
+    },
+    "windows-native-type-pilot-01/evidence-audit.json": {
+      "sha256": "423a0ff80c7863ec9c741cb5695069b583c07613b552c846d500cf472f4ec045"
+    },
+    "windows-native-client-04/manifest.json": {
+      "sha256": "7ae6e37d61cb8ee6d462a46e796e9879f22bd7eb1452473249f70cd45cd1bb38"
+    }
+  },
+  "remaining": [
+    "Complete and audit all18 native Windows on/off trials.",
+    "Run paired real desktop long-history tasks across retrieval threshold; fixture/replay success is not a substitute.",
+    "Qualify or repair clipboard restoration if executor is forcibly terminated during temporary ownership.",
+    "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
+    "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
+  ],
+  "macos_readiness_helper": {
+    "source": "scripts/computer_use_macos_preflight.py",
+    "validation": "apps/computer_use/.runtime/macos-preflight-check-01/validation.json",
+    "macos_qualified": false
+  },
+  "isolated_input_candidate": {
+    "runtime_tested": false,
+    "deployed": false,
+    "location": "apps/computer_use/.runtime/input-recovery-candidate",
+    "change": "Focused native edit replacement without taking clipboard ownership; pending actual Windows tests."
+  },
+  "source_identity_note": "Recorded app source is 53cd0bf; this documentation/Mac-helper checkpoint leaves frozen app, binary, model and guest hashes unchanged. Trial Git commits may differ without source changes."
+}

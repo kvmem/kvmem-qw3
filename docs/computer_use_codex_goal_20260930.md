@@ -292,3 +292,45 @@ further allocator accounting, Mac and physical targets remain open.
 - Local integration: `docs/dflash2_integration.md`
 - Existing VM harness: `scripts/osworld_v2/README.md`
 - DFlash memory evidence: `docs/dflash2_single_request_results_20260927.md`
+
+
+Latest update: CUDA allocation diagnostics and literal-input repair (2026-10-01).
+The explicit memory-tracing launcher is now committed (`e924840`), and its paired
+DFlash long-input run passed all four visual checks plus both trace-consistency
+checks. Event-sampled device peaks were 43.42 GiB on and 67.14 GiB off. The scopes
+and untraced allocation categories remain explicit in the long-history report;
+this is not a complete allocator census or a 48GB physical-device qualification.
+
+The native 18-trial run stopped after nine passes and an off-mode Notepad
+failure caused by real Unicode input corruption. Direct saved-file probes
+reproduced it without a model. The repaired executor (`53cd0bf`) passed its
+final five file/browser checks and preservation of five clipboard formats.
+It is frozen in `qw3-type-20261001`, with native client bundle 04 unchanged.
+The previously failing native off-mode Notepad task now passes in 111.84 seconds,
+with 11 completed actions, an exact 46-byte file, 1,803/3,341 DFlash drafted
+tokens accepted and no fallback. Its single-trial evidence check passed; the
+full matrix gate intentionally remains false for a one-case pilot.
+
+The success gate has started `windows-native-suite-02`: 18 native Windows
+on/off trials, followed only after successful matrix audit by the paired live
+archive runs. Application sources and snapshots remain frozen for this queue.
+The UI screenshot and complete pilot evidence are retained under
+`windows-native-type-pilot-01`. Required repeated acceptance, live long desktop
+history, forced executor termination during temporary clipboard ownership,
+macOS and physical-desktop acceptance remain open. The goal remains active.
+
+Evidence index and target preparation (2026-10-01):
+`computer_use_acceptance_20261001.md` and its JSON companion map completed
+requirements to retained artifacts and keep the outstanding gates explicit.
+A consolidated CPU recheck passed all 44 CTests and both benchmark-helper tests;
+prior CTest logs were retained. The read-only macOS preflight helper and
+`computer_use_mac_test_access_20261001.md` describe target access without asking
+for passwords or private keys. Only syntax/help/non-Mac refusal have been
+verified; no Apple API or Mac desktop test is claimed.
+
+Documentation and this independent Mac helper may be committed while the
+Windows queue is running: none of the frozen `apps/computer_use` sources,
+engine/model assets, guest state or snapshot is changed. Recorded Git commits
+can therefore differ between trial manifests; their application-source and
+binary hashes remain the qualification identities. The native suite remains
+in progress, with no final acceptance declaration.
