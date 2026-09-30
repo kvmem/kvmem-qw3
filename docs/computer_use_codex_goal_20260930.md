@@ -268,6 +268,23 @@ tests on actual Windows with exit code 0. A new clean, powered-off snapshot
 `qw3-scroll-20261001` includes that client and the revised executor. Native
 GPU-backed task execution and the repeated model suite remain pending.
 
+Latest qualification update: the 158,911-token frozen history now covers all
+six decoder/KVMem profiles, with **12/12** positive/negative checks passed
+(one repetition per case). All profiles use the same binary, launcher and
+frozen input hashes. KVMem lowered sampled GPU peak but increased cold request
+time in this diagnostic; see `computer_use_long_matrix_20261001.csv`.
+
+The repaired off-mode cross-app pilot passed in 135.96 seconds. Native Windows
+client execution with the real GPU then passed the browser pilot in 40.66
+seconds, including exact file verification and a visually inspected native UI.
+Native app crash/resume also passed in 63.12 seconds, preserving task/thread
+identity and staying paused until explicit resume. These close the corresponding
+single-run native cases. The new native 18-trial on/off matrix is running from
+`qw3-scroll-20261001`; it has not yet passed. A serial queue will audit that
+matrix before starting the real 36-page archive task with KVMem on and off.
+The goal remains active; repeated reliability, live above-budget execution,
+further allocator accounting, Mac and physical targets remain open.
+
 - Codex app-server: https://learn.chatgpt.com/docs/app-server
 - Codex provider configuration:
   https://learn.chatgpt.com/docs/config-file/config-reference
