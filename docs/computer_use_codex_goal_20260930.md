@@ -6,9 +6,15 @@ Created: 2026-09-30, Asia/Shanghai. Status: active.
 
 Build a computer use application around Codex app-server, QW3/KVMem and
 DFlash speculative decoding. First validate desktop operation in repeatable
-virtual machines, with inference on an accessible NVIDIA GPU host. Use a 48G
-GPU memory budget. Follow with physical-desktop acceptance; deployment on
+virtual machines, with inference on the current NVIDIA GPU host. Use its
+available 96GB-class GPU capacity and report measured memory use; 48GB is not
+a hard constraint. Follow with physical-desktop acceptance; deployment on
 ordinary Windows/Mac machines remains the subsequent product target.
+
+Latest scope update, 2026-09-30: the user explicitly relaxed the original 48G
+limit. This supersedes the memory constraint in the initially created goal.
+Prioritize correct operation and measured performance. Treat lower-memory
+profiles as separate later evaluations, not a gate for the first application.
 
 The user selected Codex as the runtime harness. Do not substitute a new custom
 agent loop or migrate to llama.cpp as the primary implementation for this goal.
@@ -38,7 +44,7 @@ decoding as separate controls, never simultaneously with DFlash.
   reported compute processes, and `/dev/kvm`. GPU/KVM access is therefore
   available through the host execution path. Docker has existing experiment
   containers; their presence is not authorization to stop or replace them.
-  The 48G application budget remains in force despite the larger physical GPU.
+  The user subsequently allowed using the larger available GPU capacity.
   A macOS test machine has not yet been identified.
 
 ## Architecture
@@ -103,13 +109,14 @@ takeover/resume and duplicate-call handling. A desktop operation without a
 natural idempotency guarantee requires observation-based reconciliation after
 uncertain delivery, not an unconditional retry.
 
-### M3: multimodal KVMem + DFlash within the memory budget
+### M3: multimodal KVMem + DFlash correctness and resource measurement
 
-Start with one active desktop task and serialized multimodal serving. A 64K
-retrieval budget and 16K generation reserve are initial candidates, not measured
-capacity claims. Record exact byte capacity reported by the selected device;
-distinguish 48 GB from 48 GiB. Use 48,000,000,000 bytes as the conservative
-development ceiling until the actual device and budget are recorded.
+Start with one active desktop task and serialized multimodal serving. The
+existing K128K/G64K text-replay configuration is a starting candidate for the
+96GB-class host, not a measured multimodal capacity claim. Record the exact
+device capacity and application usage in bytes, with consistent GB/GiB units.
+There is no 48GB pass/fail threshold. Smaller working sets and generation
+reserves can be evaluated separately after the functional baseline is stable.
 
 Account for target/draft weights, vision tower, image embeddings, active KV,
 indexes, verifier buffers and transient allocations. Measure first-image
@@ -119,7 +126,8 @@ DFlash separately under the same task/input policy. Capture actual speculation
 acceptance and fallback counters; a configured flag alone is insufficient.
 
 Acceptance requires correct tool/image round trips, valid outputs and state
-restoration, no OOM, and measured memory within budget with practical headroom.
+restoration, no OOM, and measured memory fitting the available GPU with
+practical headroom for the tested workload.
 Sampled whole-device usage and allocator measurements have different scopes;
 report both where available and do not present sampling as a hard guarantee.
 Report screenshot-to-action latency, TTFT, action latency P50/P95, vision time,
