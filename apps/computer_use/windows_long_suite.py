@@ -132,7 +132,7 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--snapshot", default="qw3-scroll-20261001")
+    parser.add_argument("--snapshot", default="qw3-type-20261001")
     parser.add_argument("--kvmem", choices=["on", "off"], default="on")
     parser.add_argument("--task-timeout", type=float, default=900)
     raise SystemExit(0 if asyncio.run(run(parser.parse_args())) else 1)

@@ -6,7 +6,8 @@ Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes,WindowsBase
 $automationRefs = @('System.dll','System.Core.dll',
     [Windows.Automation.AutomationElement].Assembly.Location,
     [Windows.Automation.AutomationPattern].Assembly.Location,
-    [Windows.Rect].Assembly.Location)
+    [Windows.Rect].Assembly.Location,
+    [Windows.Forms.Clipboard].Assembly.Location, [Drawing.Bitmap].Assembly.Location)
 Add-Type -ReferencedAssemblies $automationRefs @'
 using System;
 using System.Runtime.InteropServices;
@@ -32,26 +33,136 @@ public static class DesktopNative {
     }
     [StructLayout(LayoutKind.Sequential)] public struct Input { public uint type; public InputUnion value; }
     [DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint count, Input[] inputs, int size);
+    [StructLayout(LayoutKind.Sequential)] public struct GuiThreadInfo {
+        public uint size, flags;
+        public IntPtr active, focus, capture, menuOwner, moveSize, caret;
+        public WindowRect caretRect;
+    }
+    [DllImport("user32.dll", SetLastError=true)] private static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder name, int count);
+    [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] private static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll")] private static extern bool CloseClipboard();
+    [DllImport("user32.dll")] private static extern IntPtr GetClipboardData(uint format);
+    [DllImport("kernel32.dll")] private static extern UIntPtr GlobalSize(IntPtr memory);
+    [DllImport("kernel32.dll")] private static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")] private static extern bool GlobalUnlock(IntPtr memory);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
+    private static IntPtr Focus(IntPtr window) {
+        uint process;
+        var info = new GuiThreadInfo(); info.size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo));
+        if (GetForegroundWindow() != window ||
+            !GetGUIThreadInfo(GetWindowThreadProcessId(window, out process), ref info) || info.focus == IntPtr.Zero)
+            throw new InvalidOperationException("Focused input control changed or unavailable");
+        return info.focus;
+    }
+    private static System.IO.MemoryStream RawClipboardFormat(string format) {
+        // Copy unknown formats as opaque bytes, never deserialize an object
+        // supplied by another application through IDataObject.GetData().
+        if (!OpenClipboard(IntPtr.Zero)) throw new InvalidOperationException("Clipboard is busy");
+        try {
+            IntPtr memory = GetClipboardData((uint)System.Windows.Forms.DataFormats.GetFormat(format).Id);
+            ulong size = GlobalSize(memory).ToUInt64();
+            if (memory == IntPtr.Zero || size == 0 || size > 16 * 1024 * 1024)
+                throw new InvalidOperationException("Clipboard format cannot be preserved within 16 MiB: " + format);
+            IntPtr bytes = GlobalLock(memory);
+            if (bytes == IntPtr.Zero) throw new InvalidOperationException("Clipboard format is not a byte buffer: " + format);
+            try {
+                byte[] copy = new byte[(int)size]; Marshal.Copy(bytes, copy, 0, copy.Length);
+                return new System.IO.MemoryStream(copy);
+            } finally { GlobalUnlock(memory); }
+        } finally { CloseClipboard(); }
+    }
+    private static void PasteText(IntPtr window, IntPtr focus, string text) {
+        // Win11 RichEdit corrupts Unicode keyboard bursts. WM_PASTE asks the
+        // focused edit control to consume one literal string synchronously.
+        // Materialize all existing clipboard formats before taking ownership;
+        // never overwrite a subsequent clipboard change from another client.
+        uint previous = GetClipboardSequenceNumber();
+        var original = System.Windows.Forms.Clipboard.GetDataObject();
+        var saved = new System.Windows.Forms.DataObject();
+        var owned = new List<IDisposable>();
+        bool changed = false;
+        uint temporary = 0;
+        try {
+            if (original != null) foreach (string format in original.GetFormats(false)) {
+                bool standard = format == "Text" || format == "UnicodeText" || format == "OEMText" ||
+                    format == "Rich Text Format" || format == "HTML Format" || format == "FileDrop" || format == "Bitmap";
+                object value = standard ? original.GetData(format, false) : RawClipboardFormat(format);
+                var stream = value as System.IO.MemoryStream;
+                var bitmap = value as System.Drawing.Bitmap;
+                if (stream != null) {
+                    if (standard) value = new System.IO.MemoryStream(stream.ToArray());
+                    owned.Add((IDisposable)value);
+                }
+                else if (bitmap != null) { value = bitmap.Clone(); owned.Add((IDisposable)value); }
+                else if (value == null || !(value is string || value is byte[] || value is string[]))
+                    throw new InvalidOperationException("Clipboard format cannot be preserved: " + format);
+                saved.SetData(format, false, value);
+            }
+            if (GetClipboardSequenceNumber() != previous || Focus(window) != focus)
+                throw new InvalidOperationException("Clipboard or focus changed before text input");
+            var data = new System.Windows.Forms.DataObject();
+            data.SetData(System.Windows.Forms.DataFormats.UnicodeText, true, text.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\n", "\r\n"));
+            // DWORD zero opts this temporary payload out of Windows clipboard
+            // history and cloud upload. Original formats are restored below.
+            using (var history = new System.IO.MemoryStream(new byte[4]))
+            using (var cloud = new System.IO.MemoryStream(new byte[4])) {
+                data.SetData("CanIncludeInClipboardHistory", false, history);
+                data.SetData("CanUploadToCloudClipboard", false, cloud);
+                System.Windows.Forms.Clipboard.SetDataObject(data, true, 3, 30);
+                temporary = GetClipboardSequenceNumber(); changed = true;
+                if (Focus(window) != focus) throw new InvalidOperationException("Focus changed before paste");
+                UIntPtr result;
+                if (SendMessageTimeout(focus, 0x0302, UIntPtr.Zero, IntPtr.Zero, 3, 2000, out result) == IntPtr.Zero)
+                    throw new InvalidOperationException("Paste delivery timed out");
+            }
+        } finally {
+            try {
+                if (changed) {
+                    if (GetClipboardSequenceNumber() != temporary)
+                        throw new InvalidOperationException("Clipboard changed during text input; preserved the newer clipboard");
+                    if (original == null || saved.GetFormats(false).Length == 0) System.Windows.Forms.Clipboard.Clear();
+                    else System.Windows.Forms.Clipboard.SetDataObject(saved, true, 3, 30);
+                }
+            } finally { foreach (var value in owned) value.Dispose(); }
+        }
+    }
     public static void TypeText(string text) {
+        IntPtr window = GetForegroundWindow(), focus = Focus(window);
+        var name = new StringBuilder(256); GetClassName(focus, name, name.Capacity);
+        string kind = name.ToString();
+        if (kind.Equals("Edit", StringComparison.OrdinalIgnoreCase) || kind.StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase)) {
+            PasteText(window, focus, text);
+            return;
+        }
+        // Browser and other non-edit windows retain normal Unicode input.
         var events = new List<Input>();
         for (int i = 0; i < text.Length; i++) {
             char c = text[i];
             if (c == '\r' && i + 1 < text.Length && text[i+1] == '\n') continue;
-            Input down = new Input(), up = new Input();
-            down.type = up.type = 1;
-            if (c == '\r' || c == '\n') {
-                down.value.keyboard.vk = up.value.keyboard.vk = 0x0D;
-                up.value.keyboard.flags = 2;
-            } else {
-                down.value.keyboard.scan = up.value.keyboard.scan = c;
-                down.value.keyboard.flags = 4;
-                up.value.keyboard.flags = 6;
-            }
+            Input down = new Input(), up = new Input(); down.type = up.type = 1;
+            if (c == '\r' || c == '\n') { down.value.keyboard.vk = up.value.keyboard.vk = 0x0D; up.value.keyboard.flags = 2; }
+            else { down.value.keyboard.scan = up.value.keyboard.scan = c; down.value.keyboard.flags = 4; up.value.keyboard.flags = 6; }
             events.Add(down); events.Add(up);
         }
+        if (Focus(window) != focus) throw new InvalidOperationException("Focus changed before text input");
         Input[] inputs = events.ToArray();
-        if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != inputs.Length)
-            throw new InvalidOperationException("SendInput did not deliver all input events");
+        var watch = Stopwatch.StartNew();
+        for (int offset = 0; offset < inputs.Length;) {
+            if (Focus(window) != focus || watch.ElapsedMilliseconds > 14000)
+                throw new InvalidOperationException("Focus changed or typing deadline exceeded; remaining text was not sent");
+            int count = Math.Min(64, inputs.Length - offset);
+            if (offset + count < inputs.Length && Char.IsHighSurrogate((char)inputs[offset+count-2].value.keyboard.scan)) count += 2;
+            var batch = new Input[count]; Array.Copy(inputs, offset, batch, 0, count);
+            if (SendInput((uint)count, batch, Marshal.SizeOf(typeof(Input))) != count)
+                throw new InvalidOperationException("SendInput did not deliver all input events");
+            offset += count;
+            // Bound each queued burst. A 4096-unit browser field otherwise
+            // leaves the UI processing input after the following click.
+            System.Threading.Thread.Sleep(20);
+        }
     }
 }
 public sealed class ControlHint {

@@ -430,3 +430,26 @@ Sources: [Codex app-server](https://learn.chatgpt.com/docs/app-server),
 [Codex config](https://learn.chatgpt.com/docs/config-file/config-reference),
 [Dockur Windows](https://github.com/dockur/windows),
 [Microsoft evaluation media](https://www.microsoft.com/en-us/evalcenter/download-windows-11-enterprise).
+
+
+## Windows literal input qualification
+
+`windows_typing.py` verifies actual Notepad saved files for English,
+multilingual/emoji/newline text and two 4096-UTF-16-unit boundaries. Add `--browser`
+for an independent Edge form download containing Unicode and a 4096-character
+field. It uses ordinary desktop actions and Save As, then checks file content,
+size and hashes. Run it only while other VM suites are stopped:
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_typing.py \
+  --run-dir apps/computer_use/.runtime/typing-new --repetitions 3 --browser
+```
+
+Edit/RichEdit input uses a synchronous paste message with temporary clipboard
+ownership and restoration; other windows use paced Unicode keyboard batches.
+Raw clipboard formats are bounded to 16 MiB each and are never deserialized.
+Unsupported snapshot formats reject before taking ownership. The final direct
+input candidate passed four Notepad cases, the Edge download and preservation
+of five clipboard fixture formats. Forced executor termination during temporary
+clipboard ownership remains unqualified. See the Windows validation report for
+retained failures and the exact source/evidence hashes.

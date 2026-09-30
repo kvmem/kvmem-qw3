@@ -10,6 +10,9 @@ $archive = Join-Path $share ('before-baseline-' + (Get-Date -Format 'yyyyMMdd-HH
 New-Item -ItemType Directory $archive | Out-Null
 Get-Process notepad,msedge -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 2
+# Drop only the dedicated VM's test clipboard between qualification cases.
+Add-Type -AssemblyName System.Windows.Forms
+[Windows.Forms.Clipboard]::Clear()
 foreach ($directory in @('outputs','actions')) {
     if (Test-Path "$root\$directory") {
         Copy-Item "$root\$directory" "$archive\$directory" -Recurse

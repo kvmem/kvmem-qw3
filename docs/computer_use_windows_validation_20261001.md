@@ -280,3 +280,82 @@ Evidence includes result/source manifests, app/Codex traces and three screenshot
 under `apps/computer_use/.runtime/browser-ui-check-01/`. This CPU-only check ran
 while the native suite was active; that suite's elapsed times are live workflow
 measurements rather than an isolated system-wide latency benchmark.
+
+
+## Retained native repetition failure and literal-input reproduction
+
+`windows-native-suite-01` stopped at its tenth attempted trial: all nine
+KVMem-on tasks passed, then `off-notepad-0` timed out at 300.27 seconds before
+saving a file. This is **9/10 attempted, not a completed 18-trial comparison**.
+The evidence audit failed the incomplete matrix and the failed trial. The
+success-gated live archive queue consequently exited without running a task.
+
+The failed desktop screenshots show actual repeated punctuation and displaced
+newlines after a Unicode keyboard burst. The model repeatedly tried to repair
+the document; dense re-prefill added delay, but the input corruption was also
+reproduced without any model. `windows_typing.py` types through the executor,
+uses the visible Save As controls and independently reads each saved file's
+UTF-8 content, size and SHA-256. Its initial diagnostic version used only
+keyboard events; the final candidate uses the guarded input path described below. The original executor failed all three English trials in
+`windows-typing-before-01`; the first file contained `QW3 computer use` followed
+by a blank line and repeated periods.
+
+Per-character Unicode pacing did not repair this: the 2 ms attempt
+(`windows-typing-after-01`) and 10 ms attempt (`windows-typing-10ms-01`) both
+failed their first English file check. The guest executor hash was independently
+confirmed for the 2 ms attempt. A current-layout virtual-key attempt
+(`windows-typing-native-01`) passed one of four English/Unicode trials; it also
+lost uppercase letters and corrupted Unicode. These failed implementations and
+raw file/screenshot evidence remain retained. Notepad version was 11.2607.14.0.
+No spelling/autocorrect setting was disabled to make a test pass.
+
+Focused-window character messages preserved short text after adding explicit
+Enter messages, but synchronous delivery exceeded the action deadline for
+4096 units (`windows-typing-wmchar-02`). Asynchronous delivery returned before
+Notepad finished processing the input (`windows-typing-postchar-01`). These
+remain failures, not qualified input implementations.
+
+## Literal-input repair
+
+The final executor uses synchronous `WM_PASTE` for the focused Windows Edit or
+RichEdit control. It snapshots existing clipboard formats before temporary
+ownership, prevents the temporary payload from entering Windows clipboard
+history/cloud sync, and restores the snapshot on normal completion. Unknown
+formats are copied as opaque HGLOBAL bytes rather than deserialized objects;
+non-byte formats or individual raw formats above 16 MiB fail before taking
+ownership. A newer clipboard change is preserved instead of overwritten.
+Browser windows retain Unicode input, now in bounded batches separated by
+20 ms, with a focus check and a 14-second dispatch deadline. Partial failures
+continue to pause the durable executor and must not be blindly retried.
+
+The initial paste candidate passed **12/12** actual Notepad files across three
+repetitions (`windows-typing-paste-01`): English, multilingual/emoji/newlines,
+4096 ASCII units and 4096 UTF-16 units containing Chinese/emoji. The final
+source, SHA-256 `b5e4eafa2204609a32914ef90bd2aaec85a902884ec7199ea2e3fbb8bddd37fb`,
+passed **5/5** in `windows-typing-paste-04`: all four Notepad cases plus a real
+Edge form download containing Unicode text and an exact 4096-character field.
+Notepad type actions took 0.51–0.59 seconds. Saved/downloaded files, not just
+screenshots, supply the independent content/hash checks.
+
+The earlier unpaced browser attempt returned before its subsequent clicks
+finished (`windows-typing-paste-02`, four Notepad checks passed; browser gate
+failed). A separate probe startup failed because Edge covered the newly opened
+Notepad (`windows-typing-paste-03`, no typing dispatched); the probe now uses
+ordinary Alt+Tab in that state. Both attempts remain retained.
+
+`windows-clipboard-01/check-final.json` confirms the final guest source and
+preservation of all five seeded formats after input: Unicode text, RTF, a
+bitmap, a file list and custom bytes. The seed/check helper runs only as VM
+setup; the model receives no clipboard-reading tool. Cross-app copy tasks still
+require the model's actual Ctrl+C/Ctrl+V sequence. Normal clipboard restoration
+is qualified; forced executor termination during temporary clipboard ownership
+is not yet qualified. These direct input checks do not replace the repeated
+native model tasks, which remain open.
+
+The setup helper archives prior outputs/actions and clears only the dedicated
+VM's test clipboard before creating a fresh baseline. The client bundle stays
+at version 04 because its app/Codex/MCP files are unchanged.
+
+New clean snapshot `qw3-type-20261001` was created with the final executor hash
+above and unchanged fixture/bootstrap hashes. Native and live-archive helpers
+now default to this snapshot; older snapshots remain retained.
