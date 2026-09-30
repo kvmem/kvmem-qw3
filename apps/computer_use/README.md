@@ -204,7 +204,17 @@ PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_restart.
   --run-dir apps/computer_use/.runtime/restart-new
 
 python3 apps/computer_use/summarize_windows.py apps/computer_use/.runtime/windows-suite-new
+
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/audit_windows_suite.py \
+  apps/computer_use/.runtime/windows-suite-new
 ```
+
+The evidence audit requires all 18 terminal trials and checks exact saved
+contents and hashes, task identities, final pause, clipboard actions, unresolved
+receipts, model configuration and active DFlash counters. It correctly rejects
+the retained incomplete first suite while validating its seven successful trials.
+Different recorded Git commits can reflect documentation or new unused helpers;
+the engine binary and launcher hashes must still be identical across the suite.
 
 `pack_windows_client.py` assembles an offline x64 client folder from CPython
 3.13.13, the official Codex 0.159.2 package and Windows wheels. It verifies Codex
