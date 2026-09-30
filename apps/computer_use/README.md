@@ -84,11 +84,11 @@ shared DFlash experiment lock when present. It requires local model assets:
 - `models/Qwen3.8-27B-DFlash2-BF16`
 - `models/Qwen3.8-27B-BF16` for the matching visual tower
 
-`--trace-memory` enables the existing binary's CUDA tensor-allocation and
-workspace-capacity diagnostics in `engine.log`. Run it separately from latency
-benchmarks. Tensor records cover owned allocations of at least 1 MiB; workspace
+The existing binary has CUDA tensor-allocation and workspace-capacity tracing
+hooks. An explicit launcher option and a separate diagnostic run are still
+pending. Tensor records cover owned allocations of at least 1 MiB; workspace
 counters cover named backend capacities. Views, smaller/direct allocations and
-all CUDA-library internals are not a complete census. No new binary is required.
+all CUDA-library internals are not a complete census.
 
 The profile uses FP8 KV, K128K/G64K, 1M logical context, a 48GiB CPU
 tier, 128-token blocks with four 32-token scoring slices, message-level
