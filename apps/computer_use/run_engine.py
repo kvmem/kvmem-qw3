@@ -19,6 +19,8 @@ def main():
                         help="off gives cold fixed-input replay on both KVMem sides")
     parser.add_argument("--visual-history", choices=["pin-all", "retrievable"], default="pin-all")
     parser.add_argument("--trace-retrieval", action="store_true")
+    parser.add_argument("--trace-memory", action="store_true",
+                        help="Separate diagnostic: trace CUDA tensor allocations and workspace capacities")
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--lock-timeout", type=float, default=0,
                         help="Wait briefly for a previous owned engine's GPU lock to be released")
@@ -87,6 +89,9 @@ def main():
         env["QW3_KVMEM_TRACE"] = "1"
         env["QW3_KVMEM_PREFIX_CACHE_TRACE"] = "1"
         env["QW3_KVMEM_DUMP_SCORES"] = str(run / "retrieval.jsonl")
+    if args.trace_memory:
+        env["QW3_CUDA_TENSOR_ALLOC_TRACE"] = "1"
+        env["QW3_CUDA_WORKSPACE_TRACE"] = "1"
     manifest = {"command": command, "qw3_env": {k: v for k, v in env.items() if k.startswith("QW3_")},
                 "gpu": gpu, "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),

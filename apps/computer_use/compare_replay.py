@@ -105,6 +105,7 @@ async def run(args):
         path = args.corpus / case["path"]
         assert hashlib.sha256(path.read_bytes()).hexdigest() == case["sha256"], "Frozen input changed"
     summary = {"kind": "fixed_input_replay_no_tool_dispatch", "prefix_reuse": False,
+               "allocation_diagnostic": args.trace_memory,
                "corpus": str(args.corpus.resolve()), "cases": cases, "profiles": [],
                "vision_cache": "fresh per profile, retained across ordered requests/repetitions"}
     endpoint = f"http://127.0.0.1:{args.port}"
@@ -124,6 +125,8 @@ async def run(args):
                            "--run-dir", str(directory / "engine")]
                 if args.trace_retrieval:
                     command.append("--trace-retrieval")
+                if args.trace_memory:
+                    command.append("--trace-memory")
                 print("starting", label, flush=True)
                 with (directory / "launcher.log").open("wb") as log:
                     proc = await asyncio.create_subprocess_exec(*command, cwd=root, stdout=log, stderr=log)
@@ -180,5 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--kvmem-cpu-gib", type=int, default=48)
     parser.add_argument("--visual-history", choices=["pin-all", "retrievable"], default="pin-all")
     parser.add_argument("--trace-retrieval", action="store_true")
+    parser.add_argument("--trace-memory", action="store_true",
+                        help="Separate allocation diagnostic; do not use its timings as a benchmark")
     parser.add_argument("--port", type=int, default=18080)
     asyncio.run(run(parser.parse_args()))

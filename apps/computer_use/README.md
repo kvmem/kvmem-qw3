@@ -85,8 +85,9 @@ shared DFlash experiment lock when present. It requires local model assets:
 - `models/Qwen3.8-27B-BF16` for the matching visual tower
 
 The existing binary has CUDA tensor-allocation and workspace-capacity tracing
-hooks. An explicit launcher option and a separate diagnostic run are still
-pending. Tensor records cover owned allocations of at least 1 MiB; workspace
+hooks. `run_engine.py --trace-memory` enables them; `compare_replay.py` accepts
+the same flag for a separate paired diagnostic. Do not use instrumented timings
+as a latency benchmark. Tensor records cover owned allocations of at least 1 MiB; workspace
 counters cover named backend capacities. Views, smaller/direct allocations and
 all CUDA-library internals are not a complete census.
 
@@ -103,7 +104,10 @@ python apps/computer_use/summarize_memory.py /path/to/run/engine \
 Its allocation-event arithmetic was checked with synthetic records, including
 unmatched frees and malformed input. The retained long DFlash log reproduces
 the known resource peak and reports that allocation tracing was absent. An
-instrumented real GPU run is still required; the parser does not supply one.
+instrumented DFlash long-context on/off run has now passed all four visual
+answer checks and both trace-consistency checks; see
+`docs/computer_use_memory_diagnostic_20261001.csv`. The counters remain a partial
+allocation view, not a full allocator census.
 
 The profile uses FP8 KV, K128K/G64K, 1M logical context, a 48GiB CPU
 tier, 128-token blocks with four 32-token scoring slices, message-level

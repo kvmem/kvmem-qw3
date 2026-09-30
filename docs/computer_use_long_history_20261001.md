@@ -187,3 +187,34 @@ in `computer_use_kvmem_comparison_20261001.md`. Both short and above-budget
 histories now cover all six profiles. No million-token, 48GB physical-card,
 native Windows client, Mac or physical-desktop qualification follows from
 these diagnostics.
+
+
+## Separate CUDA allocation diagnostic
+
+`memory-long-dflash-01` replays the identical frozen 158,911-token positive and
+negative cases with DFlash, KVMem on/off and prefix reuse disabled. Both sides
+use the same unchanged engine binary and new launcher hash, with existing tensor
+and workspace trace hooks enabled. All four visual answer checks passed;
+`summarize_memory.py --require-traces` passed on both completed engine logs
+(701 on-mode events; 331 off-mode events, no inconsistent records).
+
+| Counter | KVMem on | KVMem off |
+| --- | ---: | ---: |
+| Whole-device usage maximum at traced allocation/free events | 43.42 GiB | 67.14 GiB |
+| One-second whole-device sampled peak | 42.76 GiB | 66.71 GiB |
+| Traced owned tensors' simultaneous peak | 10.27 GiB | 34.24 GiB |
+| Named workspace maximum capacity | 382.11 MiB | 255.67 MiB |
+| Model process RSS high-water counter | 35.72 GiB | 32.03 GiB |
+
+The event snapshots caught peaks missed by one-second sampling. Traced tensors
+cover owned allocations of at least 1 MiB, not all weights, direct allocations,
+views, CUDA-library internals or transient usage. Workspace capacities overlap
+with other scopes and must not be added to device usage. Exit via SIGTERM means
+remaining live trace counters are not a leak assessment. This is a separate
+instrumented diagnostic, with one repetition per input, not another timing
+benchmark or a physical 48GB qualification. Windows input probes ran concurrently
+on CPU; no other GPU compute process shared the model GPU.
+
+The compact exported counters and binary/log/launcher hashes are retained in
+`docs/computer_use_memory_diagnostic_20261001.csv`; full logs, samples and scoped
+reports are under `apps/computer_use/.runtime/memory-long-dflash-01/`.
