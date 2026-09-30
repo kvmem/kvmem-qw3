@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qw3-computer"
+version = "0.1.0"
+description = "Local Codex provider and desktop application for QW3"
+requires-python = ">=3.11"
+dependencies = ["aiohttp==3.14.0", "Pillow>=10,<13"]
+
+[project.scripts]
+qw3-responses = "qw3_computer.bridge:main"
+
+[tool.setuptools.packages.find]
+include = ["qw3_computer*"]

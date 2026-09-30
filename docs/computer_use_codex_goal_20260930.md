@@ -22,6 +22,15 @@ Use Qwen3.8-27B Q8_0 target weights, FP8 target KV and the matching DFlash draft
 DFlash and native MTP are alternative draft models; run native MTP and target-only
 decoding as separate controls, never simultaneously with DFlash.
 
+Latest platform priority, 2026-09-30: validate Windows in a VM first, as
+requested by the user. Mac connectivity can be prepared later and does not
+block the Codex/provider/Windows work.
+
+Download preference: clear lowercase/uppercase HTTP, HTTPS and ALL proxy
+variables for VM image downloads. Do not change the host's global proxy settings
+or unrelated containers. The initial aria2 Windows ISO download had no proxy
+environment variables; the VM launcher also explicitly clears them for later runs.
+
 ## Existing baseline and evidence
 
 - Preserve the existing source changes in a local Git checkpoint before new
@@ -187,6 +196,11 @@ do not claim GPU, VM or physical-machine tests that have not run.
   implementation is the next milestone.
 
 ## References
+
+Progress after M0: the provider prototype and a real Codex → QW3/DFlash →
+two-round image MCP smoke are working. Windows VM installation is underway.
+See `computer_use_codex_m1_20261001.md` for exact successes, retained failures,
+resource observations and remaining acceptance. The goal is still active.
 
 - Codex app-server: https://learn.chatgpt.com/docs/app-server
 - Codex provider configuration:
