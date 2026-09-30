@@ -262,3 +262,21 @@ code 1, as expected for forced termination; this is distinct from the test
 driver's successful exit. Evidence is in `windows-native-restart-01/`, including
 the exported `guest/restart/result.json`, app ledger and both taskkill logs.
 This closes the native process-crash case; repeated core tasks remain open.
+
+## Browser button integration
+
+`browser-ui-check-01` passed in 6.85 seconds using Linux Chromium, Playwright
+1.58.0 and actual pinned Codex. All user transitions were driven by the real
+page's buttons: start, pause, refresh, resume, then start a second task and stop.
+The model and desktop endpoints were scripted local fixtures on independent
+ports, so this does not add another Windows/model task success.
+
+The first task preserved its task/thread identities across resume. Both pause
+and stop cancelled the held upstream request, and neither dispatched another
+action during its two-second hold. The UI showed the delivered file, expanded
+its content, and rendered HTML-like model/file text literally without executing
+it. There were no page errors. The completed screenshot was visually inspected.
+Evidence includes result/source manifests, app/Codex traces and three screenshots
+under `apps/computer_use/.runtime/browser-ui-check-01/`. This CPU-only check ran
+while the native suite was active; that suite's elapsed times are live workflow
+measurements rather than an isolated system-wide latency benchmark.

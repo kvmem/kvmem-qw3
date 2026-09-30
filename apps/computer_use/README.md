@@ -105,6 +105,24 @@ MCP fixture observations and identifying the returned blue screenshots. It
 retains the Codex events and its success/failure result. This does not measure
 Windows task completion or sustained performance.
 
+`smoke_ui.py` exercises the actual browser buttons with real pinned Codex,
+the app, bridge and MCP, using scripted local model/desktop endpoints on
+independent ports. With Playwright 1.58.0 and an existing Chromium executable:
+
+```bash
+PYTHONPATH=apps/computer_use python apps/computer_use/smoke_ui.py \
+  --browser /absolute/path/to/chrome \
+  --run-dir apps/computer_use/.runtime/browser-ui-new
+```
+
+`browser-ui-check-01` passed start, pause, refresh, same-task/thread resume,
+file expansion, and a second task's stop. Both held inference requests were
+cancelled; no extra action occurred during two-second paused/stopped checks.
+File and model text containing HTML rendered literally, with no browser errors.
+It retained screenshots of paused/completed/stopped UI and the Codex trace.
+This is a Linux browser wiring check with fixture services, separate from
+Windows real-model desktop acceptance. Playwright is a test-only dependency.
+
 ## Windows VM
 
 `vm/start_windows.py` creates only the task-owned `qw3-computer-windows`
