@@ -358,9 +358,23 @@ PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_long_tas
   --run-dir apps/computer_use/.runtime/archive-task-new
 ```
 
+`windows_long_suite.py` automates that clean-snapshot setup, fixture hash check,
+fresh engine/app startup, resource sampling and owned-process cleanup. It runs
+the client on Linux and the desktop on Windows, and refuses occupied service
+ports. The orchestrator is prepared but has not yet completed a live trial:
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_long_suite.py \
+  --kvmem on --run-dir apps/computer_use/.runtime/archive-suite-new
+```
+
+Use `--kvmem off` in a separate new directory for the paired live policy. Keep
+the same task deadline (900 seconds by default); retain a timeout or a task
+that finishes below the retrieval threshold as failed qualification.
+
 After a long replay finishes, validate both the visual answers and the complete
-final retrieval trace. This checker has passed against the retained DFlash
-on/off positive and negative corpus:
+final retrieval trace. This checker has passed all 12 positive/negative cases
+in the retained target-only, native MTP and DFlash on/off runs:
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/check_long_replay.py \
