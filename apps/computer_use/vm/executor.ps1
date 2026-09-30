@@ -2,16 +2,26 @@ param([int]$Port = 5000)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type @'
+Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes,WindowsBase
+$automationRefs = @('System.dll','System.Core.dll',
+    [Windows.Automation.AutomationElement].Assembly.Location,
+    [Windows.Automation.AutomationPattern].Assembly.Location,
+    [Windows.Rect].Assembly.Location)
+Add-Type -ReferencedAssemblies $automationRefs @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using System.Windows.Automation;
 public static class DesktopNative {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [StructLayout(LayoutKind.Sequential)] public struct WindowRect { public int left, top, right, bottom; }
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out WindowRect rect);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
     [StructLayout(LayoutKind.Sequential)] public struct Keyboard { public ushort vk, scan; public uint flags, time; public UIntPtr extra; }
@@ -42,6 +52,74 @@ public static class DesktopNative {
         Input[] inputs = events.ToArray();
         if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != inputs.Length)
             throw new InvalidOperationException("SendInput did not deliver all input events");
+    }
+}
+public sealed class ControlHint {
+    public string name;
+    public string kind;
+    public int x, y, width, height, center_x, center_y;
+    public bool focused;
+}
+public sealed class ControlHints {
+    public string status;
+    public long elapsed_ms;
+    public bool truncated;
+    public ControlHint[] controls = new ControlHint[0];
+}
+public static class DesktopAccessibility {
+    private static Task<ControlHints> pending;
+    public static ControlHints Read(IntPtr handle, int width, int height) {
+        // UIA providers can hang. Keep at most one MTA worker and never return
+        // an old worker's controls as evidence for a newer observation.
+        if (pending != null && !pending.IsCompleted)
+            return new ControlHints { status = "provider_busy" };
+        pending = Task.Run(() => Collect(handle, width, height));
+        if (!pending.Wait(750)) return new ControlHints { status = "timeout" };
+        return pending.Result;
+    }
+    private static ControlHints Collect(IntPtr handle, int width, int height) {
+        var watch = Stopwatch.StartNew();
+        try {
+            var root = AutomationElement.FromHandle(handle);
+            var types = new [] { ControlType.Button, ControlType.CheckBox, ControlType.ComboBox,
+                ControlType.Edit, ControlType.MenuItem, ControlType.RadioButton, ControlType.TabItem,
+                ControlType.Hyperlink, ControlType.ListItem, ControlType.TreeItem };
+            var conditions = new List<Condition>();
+            foreach (var type in types)
+                conditions.Add(new PropertyCondition(AutomationElement.ControlTypeProperty, type));
+            var filter = new AndCondition(new OrCondition(conditions.ToArray()),
+                new PropertyCondition(AutomationElement.IsOffscreenProperty, false),
+                new PropertyCondition(AutomationElement.IsEnabledProperty, true));
+            var cache = new CacheRequest();
+            cache.TreeScope = TreeScope.Element;
+            cache.AutomationElementMode = AutomationElementMode.None;
+            foreach (var property in new [] { AutomationElement.NameProperty,
+                AutomationElement.ControlTypeProperty, AutomationElement.BoundingRectangleProperty,
+                AutomationElement.IsPasswordProperty, AutomationElement.HasKeyboardFocusProperty })
+                cache.Add(property);
+            AutomationElementCollection elements;
+            using (cache.Activate()) { elements = root.FindAll(TreeScope.Descendants, filter); }
+            var hints = new List<ControlHint>();
+            foreach (AutomationElement element in elements) {
+                var info = element.Cached;
+                if (info.IsPassword) continue;
+                var rect = info.BoundingRectangle;
+                if (rect.IsEmpty || rect.Width <= 0 || rect.Height <= 0) continue;
+                int cx = (int)Math.Floor(rect.X + rect.Width / 2), cy = (int)Math.Floor(rect.Y + rect.Height / 2);
+                if (cx < 0 || cy < 0 || cx >= width || cy >= height) continue;
+                string name = info.Name ?? "";
+                if (name.Length > 200) name = name.Substring(0, 200);
+                hints.Add(new ControlHint { name = name, kind = info.ControlType.ProgrammaticName.Replace("ControlType.", ""),
+                    x = (int)Math.Floor(rect.X), y = (int)Math.Floor(rect.Y), width = (int)Math.Ceiling(rect.Width),
+                    height = (int)Math.Ceiling(rect.Height), center_x = cx, center_y = cy,
+                    focused = info.HasKeyboardFocus });
+                if (hints.Count == 80) break;
+            }
+            return new ControlHints { status = "ok", elapsed_ms = watch.ElapsedMilliseconds,
+                truncated = hints.Count == 80, controls = hints.ToArray() };
+        } catch (Exception error) {
+            return new ControlHints { status = "unavailable:" + error.GetType().Name, elapsed_ms = watch.ElapsedMilliseconds };
+        }
     }
 }
 '@
@@ -98,10 +176,29 @@ function Observe {
         $graphics.CopyFromScreen($bounds.Location, [Drawing.Point]::Empty, $bounds.Size)
         $bitmap.Save($stream, [Drawing.Imaging.ImageFormat]::Png)
         $bytes = $stream.ToArray()
+        $front = Foreground
+        $progressHash = Hash-Bytes $bytes
+        $windowRect = [DesktopNative+WindowRect]::new()
+        if ([DesktopNative]::GetWindowRect([IntPtr]$front.handle, [ref]$windowRect)) {
+            $left = [Math]::Max(0, $windowRect.left - $bounds.X)
+            $top = [Math]::Max(0, $windowRect.top - $bounds.Y)
+            $right = [Math]::Min($bounds.Width, $windowRect.right - $bounds.X)
+            $bottom = [Math]::Min($bounds.Height, $windowRect.bottom - $bounds.Y)
+            if ($right -gt $left -and $bottom -gt $top) {
+                $region = [Drawing.Rectangle]::new($left, $top, ($right-$left), ($bottom-$top))
+                $crop = $bitmap.Clone($region, $bitmap.PixelFormat)
+                $progressStream = [IO.MemoryStream]::new()
+                try {
+                    $crop.Save($progressStream, [Drawing.Imaging.ImageFormat]::Png)
+                    $progressHash = Hash-Bytes $progressStream.ToArray()
+                } finally { $crop.Dispose(); $progressStream.Dispose() }
+            }
+        }
+        $accessibility = [DesktopAccessibility]::Read([IntPtr]$front.handle, $bounds.Width, $bounds.Height)
         $script:latest = @{ desktop_id=$desktopId; observation_id=[guid]::NewGuid().ToString();
             captured_at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); width=$bounds.Width; height=$bounds.Height;
             sha256=(Hash-Bytes $bytes); image=[Convert]::ToBase64String($bytes); mime_type='image/png';
-            foreground=(Foreground); paused=$script:paused }
+            foreground=$front; accessibility=$accessibility; progress_sha256=$progressHash; paused=$script:paused }
         return $script:latest
     } finally { $stream.Dispose(); $graphics.Dispose(); $bitmap.Dispose() }
 }
@@ -173,7 +270,7 @@ function Act($Request) {
                     'explorer' { Start-Process explorer.exe $outputs }
                     'edge' {
                         $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
-                        Start-Process $edge @('--no-first-run','--no-default-browser-check','--disable-background-networking','--disable-component-update','--disable-sync',"--user-data-dir=$root\BrowserProfile",'file:///C:/Qw3Computer/fixture.html')
+                        Start-Process $edge @('--no-first-run','--no-default-browser-check','--disable-background-networking','--disable-component-update','--disable-sync','--force-renderer-accessibility',"--user-data-dir=$root\BrowserProfile",'file:///C:/Qw3Computer/fixture.html')
                     }
                 }
                 Start-Sleep -Milliseconds 800
@@ -182,7 +279,11 @@ function Act($Request) {
         Start-Sleep -Milliseconds 250
         $after = Observe
         $actionSignature = Hash-Bytes ([Text.Encoding]::UTF8.GetBytes(($a | ConvertTo-Json -Depth 6 -Compress)))
-        if ($before.sha256 -eq $after.sha256 -and $script:lastSignature -eq $actionSignature) { $script:noProgress++ }
+        # Taskbar notifications and background windows do not count as progress
+        # in the active application. Preserve the full image/hash for evidence.
+        if ($before.foreground.handle -eq $after.foreground.handle -and
+            $before.progress_sha256 -eq $after.progress_sha256 -and
+            $script:lastSignature -eq $actionSignature) { $script:noProgress++ }
         else { $script:noProgress = 0 }
         $script:lastSignature = $actionSignature
         if ($script:noProgress -ge 2) { $script:paused = $true; $after.paused = $true }

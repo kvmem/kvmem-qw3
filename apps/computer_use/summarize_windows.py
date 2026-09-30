@@ -26,6 +26,9 @@ def summarize(run):
     for trial in summary["trials"]:
         directory = Path(trial["directory"])
         row = {key: trial.get(key) for key in ("kvmem", "case", "repetition", "passed", "elapsed_seconds", "error")}
+        task_result = directory / "task/result.json"
+        if row["elapsed_seconds"] is None and task_result.exists():
+            row["elapsed_seconds"] = json.loads(task_result.read_text()).get("elapsed_seconds")
         resources = directory / "resources.jsonl"
         if resources.exists():
             samples = [json.loads(line) for line in resources.read_text().splitlines()]

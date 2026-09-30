@@ -18,11 +18,12 @@ from .desktop import Desktop, DesktopError, mcp_observation
 
 
 class Controller:
-    def __init__(self, runtime, desktop, backend, port):
+    def __init__(self, runtime, desktop, backend, port, backend_token=None):
         self.runtime = Path(runtime).resolve()
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.desktop = desktop
         self.backend = backend
+        self.backend_token = backend_token
         self.port = port
         self.token = secrets.token_hex(32)
         token_file = self.runtime / "mcp-token.txt"
@@ -54,7 +55,8 @@ class Controller:
 
     async def start(self):
         await self.desktop.start()
-        self.bridge = web.AppRunner(bridge_app(self.backend, trace_dir=self.runtime / "inference"), handler_cancellation=True)
+        self.bridge = web.AppRunner(bridge_app(self.backend, trace_dir=self.runtime / "inference",
+                                              backend_token=self.backend_token), handler_cancellation=True)
         await self.bridge.setup()
         site = web.TCPSite(self.bridge, "127.0.0.1", 0)
         await site.start()
@@ -101,6 +103,7 @@ class Controller:
                     self.state["turn_status"] = status
                     self.state["turn_error"] = params["turn"].get("error")
                     self.state["current_action"] = None
+                    self.state.pop("evidence_error", None)
                     try:
                         await self.desktop.control("pause")
                         await self.desktop.observe()
@@ -108,6 +111,8 @@ class Controller:
                     except DesktopError as exc:
                         self.state["notice"] = str(exc)
                         self.state["evidence_error"] = str(exc)
+                        if self.state["status"] == "verifying":
+                            self.state["status"] = "paused"
                     if self.state["status"] == "verifying":
                         self.state["status"] = "completed" if status == "completed" else "failed"
                     self.state["finished_at"] = time.time()
@@ -306,7 +311,10 @@ def web_app(controller):
 
 async def run(args):
     desktop = Desktop(args.desktop, args.desktop_token.read_text().strip(), args.runtime / "desktop")
-    controller = Controller(args.runtime, desktop, args.backend, args.port)
+    token = args.backend_token.read_text(encoding="utf-8-sig").strip() if args.backend_token else None
+    if args.backend_token and not token:
+        raise ValueError("Backend token file is empty")
+    controller = Controller(args.runtime, desktop, args.backend, args.port, backend_token=token)
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
         await runner.setup()
@@ -327,6 +335,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=18083)
     parser.add_argument("--backend", default="http://127.0.0.1:18080/v1")
+    parser.add_argument("--backend-token", type=Path, help="Optional private VM relay token file")
     parser.add_argument("--desktop", default="http://127.0.0.1:18082")
     parser.add_argument("--desktop-token", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)

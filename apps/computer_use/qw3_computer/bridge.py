@@ -141,13 +141,15 @@ class ResponseStream:
         await self.emit("response.failed", response=self.response)
 
 
-def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096, trace_dir=None):
+def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096, trace_dir=None,
+               backend_token=None):
     app = web.Application(client_max_size=64 * 1024 * 1024)
     lock = asyncio.Lock()
 
     async def sessions(app):
+        headers = {"Authorization": "Bearer " + backend_token} if backend_token else {}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600, sock_read=180),
-                                         trust_env=False) as session:
+                                         trust_env=False, headers=headers) as session:
             app[BACKEND] = session
             yield
 
@@ -231,9 +233,13 @@ def main():
     parser.add_argument("--port", type=int, default=18081)
     parser.add_argument("--backend", default="http://127.0.0.1:18080/v1")
     parser.add_argument("--backend-model", default="qw3")
+    parser.add_argument("--backend-token", type=Path, help="Optional token file for the private VM model relay")
     args = parser.parse_args()
+    token = args.backend_token.read_text(encoding="utf-8-sig").strip() if args.backend_token else None
+    if args.backend_token and not token:
+        parser.error("backend token file is empty")
     logging.basicConfig(level=logging.INFO)
-    web.run_app(create_app(args.backend, args.backend_model), host="127.0.0.1",
+    web.run_app(create_app(args.backend, args.backend_model, backend_token=token), host="127.0.0.1",
                 port=args.port, handler_cancellation=True)
 
 

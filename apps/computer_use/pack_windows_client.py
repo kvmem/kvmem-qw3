@@ -62,6 +62,7 @@ def main():
     shutil.copyfile(root / "windows_task.py", app / "windows_task.py")
     (output / "start.ps1").write_text('''param(
     [string]$Backend = 'http://127.0.0.1:18080/v1',
+    [string]$BackendToken = '',
     [string]$Desktop = 'http://127.0.0.1:5000',
     [string]$DesktopToken = 'C:\\Qw3Computer\\executor-token.txt',
     [string]$Runtime = ''
@@ -70,7 +71,9 @@ $ErrorActionPreference = 'Stop'
 $env:PATH = "$PSScriptRoot\\codex\\bin;$env:PATH"
 $env:PYTHONUTF8 = '1'
 if (!$Runtime) { $Runtime = Join-Path $PSScriptRoot 'runtime' }
-& "$PSScriptRoot\\python\\python.exe" -X utf8 -m qw3_computer.app --backend $Backend --desktop $Desktop --desktop-token $DesktopToken --runtime $Runtime
+$clientArgs = @('-X','utf8','-m','qw3_computer.app','--backend',$Backend,'--desktop',$Desktop,'--desktop-token',$DesktopToken,'--runtime',$Runtime)
+if ($BackendToken) { $clientArgs += @('--backend-token',$BackendToken) }
+& "$PSScriptRoot\\python\\python.exe" @clientArgs
 exit $LASTEXITCODE
 ''', encoding="utf-8")
     (output / "test.ps1").write_text('''$ErrorActionPreference = 'Stop'

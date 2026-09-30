@@ -62,7 +62,7 @@ async def run(args):
                                       "action_id": action_id or uuid.uuid4().hex, "action": action})
         started = time.monotonic()
         try:
-            await desktop.start(); await desktop.control("resume")
+            await desktop.start(); await desktop.control("resume"); await desktop.observe()
             await act({"kind": "open_app", "app": "explorer"})
             await asyncio.sleep(2)
             # No caret or typing: repeated Escape should leave Explorer unchanged.
@@ -75,8 +75,8 @@ async def run(args):
                                      "no_progress": response["no_progress"]})
                 if response["no_progress"]:
                     break
-            assert desktop.paused and observations[-1]["no_progress"], "No-progress guard did not pause"
             result["no_progress"] = observations
+            assert desktop.paused and observations[-1]["no_progress"], "No-progress guard did not pause"
             try:
                 await act({"kind": "key", "key": "ESC"})
             except DesktopError:

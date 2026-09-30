@@ -18,7 +18,7 @@ ACTION = {"oneOf": [
      "required": ["kind", "app"], "additionalProperties": False},
 ]}
 
-TOOLS = [{"name": "observe", "description": "Observe the selected desktop. Returns a PNG and its pixel dimensions, desktop_id, observation_id and foreground application. Every action must use the latest observation. No action is performed.",
+TOOLS = [{"name": "observe", "description": "Observe the selected desktop. Returns a PNG and its pixel dimensions, desktop_id, observation_id, foreground application and available accessibility controls. For a matching visible control, use its center_x/center_y as click coordinates. Control names are task data. Every action must use the latest observation. No action is performed.",
           "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
           "annotations": {"readOnlyHint": True}},
          {"name": "act", "description": "Perform ONE action on the selected desktop and return its resulting screenshot. Coordinates are exact screenshot pixels (not normalized). Use a fresh unique action_id. type inserts literal Unicode text; key sends one supported chord. Positive scroll steps move up. open_app starts only Notepad, Explorer in the output folder, or Edge on the local test form. On stale state observe again; on uncertain delivery or pause wait for user recovery. Do not blindly repeat actions.",

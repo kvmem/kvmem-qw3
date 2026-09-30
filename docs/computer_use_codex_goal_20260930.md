@@ -232,6 +232,16 @@ actual sparse selection. See `computer_use_long_history_20261001.md`; synthetic
 archive diagnostics do not substitute for live desktop task acceptance. The
 application now publishes task completion only after collecting output evidence.
 
+Windows repetition update: `windows-suite-01` stopped at its first failed trial
+after seven successes. The browser failure exposed inaccurate model click
+coordinates, so the new observer adds generic Windows accessibility bounds
+alongside screenshots. The no-progress check now uses foreground-window pixels
+after a real test exposed taskbar animation masking an unchanged application.
+Real executor lost-reply recovery passed across an executor restart without
+replaying the action. See `computer_use_windows_validation_20261001.md` for
+failure evidence and remaining qualification; the full live on/off suite has
+not passed and the goal remains active.
+
 - Codex app-server: https://learn.chatgpt.com/docs/app-server
 - Codex provider configuration:
   https://learn.chatgpt.com/docs/config-file/config-reference

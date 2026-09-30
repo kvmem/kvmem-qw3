@@ -189,7 +189,11 @@ second dispatch. `--restart-executor` additionally restarts only the dedicated
 guest executor before reconciliation. `windows_restart.py` requires a clean
 snapshot and a running engine; it crashes its own application process group,
 checks that restart stays paused, explicitly resumes, and verifies the task file.
-These new drivers still require their first VM qualification run.
+The real executor test passed, including an executor restart and exactly one
+action dispatch across lost-reply recovery. The application crash/resume driver
+still requires its first qualification run. See
+`../../docs/computer_use_windows_validation_20261001.md` for retained failures
+and the corrected foreground-window progress check.
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_recovery.py \
@@ -212,8 +216,9 @@ bundle has been assembled on Linux; Windows execution is not yet qualified.
 `vm/model_relay.py` is preparation for testing the native Windows client with
 the host GPU. It binds only the owned container's Docker bridge gateway and
 requires both that container's source address and a separate token. Its route,
-authorization and disconnect behavior pass local tests. Client backend-token
-wiring and real VM connectivity remain to be qualified. The runtime bridge
+authorization and disconnect behavior pass local tests. The client accepts
+`--backend-token` (or `-BackendToken` in its PowerShell launcher) as a file path;
+the token stays outside model history. Real VM connectivity remains to be qualified. The runtime bridge
 and model stay on loopback in the existing Linux-host trials.
 
 ## KVMem and decoder comparison

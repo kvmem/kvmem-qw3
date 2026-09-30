@@ -125,6 +125,9 @@ async def run(args):
                             trial["clipboard_path_verified"] = True
                     except Exception as exc:
                         trial.update(passed=False, error=repr(exc))
+                        task_result = directory / "task/result.json"
+                        if task_result.exists():
+                            trial["elapsed_seconds"] = json.loads(task_result.read_text()).get("elapsed_seconds")
                         print("FAILED", label, repr(exc), flush=True)
                     finally:
                         await stop(app)

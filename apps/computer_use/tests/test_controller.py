@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import aiohttp
 
 from qw3_computer.app import Controller, web_app
+from qw3_computer.desktop import DesktopError
 from test_bridge import serve
 
 
@@ -85,6 +86,14 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.state["status"], "paused")
         self.assertTrue(self.desktop.paused)
         self.assertEqual(json.loads(self.controller.state_path.read_text())["status"], "paused")
+
+    async def test_missing_result_evidence_does_not_publish_completion(self):
+        self.desktop.request.side_effect = DesktopError("Desktop unavailable")
+        self.controller.consume_task = asyncio.create_task(self.controller.consume())
+        await self.controller.start_task("test task")
+        self.assertEqual(self.controller.state["turn_status"], "completed")
+        self.assertEqual(self.controller.state["status"], "paused")
+        self.assertEqual(self.controller.state["evidence_error"], "Desktop unavailable")
 
     async def test_disconnect_pauses_desktop(self):
         self.controller.state.update(status="running", thread_id="test-thread")

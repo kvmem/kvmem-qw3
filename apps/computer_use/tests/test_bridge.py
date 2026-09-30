@@ -1,5 +1,7 @@
 import asyncio
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
 import aiohttp
@@ -30,6 +32,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.cancelled = asyncio.Event()
 
         async def backend(request):
+            self.backend_authorization = request.headers.get("Authorization")
             self.entered.set()
             if self.mode == "http_error":
                 return web.Response(status=503)
@@ -57,6 +60,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         app = web.Application()
         app.router.add_post("/v1/chat/completions", backend)
         self.backend, url = await serve(app)
+        self.backend_url = url
         self.bridge, self.url = await serve(create_app(url + "/v1"))
         self.client = aiohttp.ClientSession()
 
@@ -85,6 +89,20 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["call_id"], "call_one")
         self.assertEqual(done[0]["arguments"], "{}")
+
+    async def test_private_backend_token_is_not_in_model_history_or_output(self):
+        token = "private-vm-test-token"
+        with tempfile.TemporaryDirectory() as directory:
+            runner, url = await serve(create_app(self.backend_url + "/v1", backend_token=token, trace_dir=Path(directory)))
+            try:
+                async with self.client.post(url + "/v1/responses", json=request()) as response:
+                    body = await response.text()
+                    self.assertNotIn(token, body)
+                self.assertEqual(self.backend_authorization, "Bearer " + token)
+                for path in Path(directory).rglob("*.json"):
+                    self.assertNotIn(token, path.read_text())
+            finally:
+                await runner.cleanup()
 
     async def test_truncated_or_invalid_stream_never_completes(self):
         for mode in ("truncated", "bad_tool"):
