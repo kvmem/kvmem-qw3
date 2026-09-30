@@ -242,6 +242,17 @@ replaying the action. See `computer_use_windows_validation_20261001.md` for
 failure evidence and remaining qualification; the full live on/off suite has
 not passed and the goal remains active.
 
+The corrected browser pilot subsequently passed with 10 actions and verified
+JSON. The offline Windows x64 client also passed all 29 contract/lifecycle tests
+with native CPython 3.13.13 and Codex 0.159.2, exit code 0, including image MCP
+round trips and interruption against a scripted backend. Native-client desktop
+execution with the actual GPU model is still a separate pending check.
+
+Real application crash/resume also passed on the Linux host against the Windows
+VM: restart remained paused until explicit resume, then the original task
+completed with the exact saved copy code. The corrected 18-trial live on/off
+suite has started from the new snapshot; full repeated acceptance is still open.
+
 - Codex app-server: https://learn.chatgpt.com/docs/app-server
 - Codex provider configuration:
   https://learn.chatgpt.com/docs/config-file/config-reference

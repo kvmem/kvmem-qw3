@@ -190,8 +190,9 @@ guest executor before reconciliation. `windows_restart.py` requires a clean
 snapshot and a running engine; it crashes its own application process group,
 checks that restart stays paused, explicitly resumes, and verifies the task file.
 The real executor test passed, including an executor restart and exactly one
-action dispatch across lost-reply recovery. The application crash/resume driver
-still requires its first qualification run. See
+action dispatch across lost-reply recovery. A real Codex/QW3 task also passed
+application crash/resume with the app on Linux and executor on Windows, retaining
+pause until explicit resume and independently verifying the copied file. See
 `../../docs/computer_use_windows_validation_20261001.md` for retained failures
 and the corrected foreground-window progress check.
 
@@ -210,8 +211,10 @@ python3 apps/computer_use/summarize_windows.py apps/computer_use/.runtime/window
 against the official release digest and records every asset/source hash. The
 folder includes `start.ps1` and `test.ps1`; it contains no model weights or
 executor token. `vm/test_native_client.ps1` is a setup-only helper to run the
-contract tests in the dedicated guest from a staged, hashed ZIP. The first
-bundle has been assembled on Linux; Windows execution is not yet qualified.
+contract tests in the dedicated guest from a staged, hashed ZIP. The current
+Windows bundle passes all 29 tests with exit code 0, including actual native
+Codex and MCP against a fixture backend. Real-model desktop tasks through the
+Windows-native client remain to be qualified.
 
 `vm/model_relay.py` is preparation for testing the native Windows client with
 the host GPU. It binds only the owned container's Docker bridge gateway and

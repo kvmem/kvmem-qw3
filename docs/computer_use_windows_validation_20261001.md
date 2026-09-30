@@ -87,9 +87,20 @@ before declaring the deterministic tasks accepted.
   Windows; recovery did not replay it.
 
 This is injected transport loss around a real Windows action, not model-driven
-fault recovery. Application-process crash/resume with real Codex is a separate
-pending test. `windows-recovery-01` retains a driver error (missing fresh observe
+fault recovery. `windows-recovery-01` retains a driver error (missing fresh observe
 after resume); `windows-recovery-02` retains the taskbar-animation failure.
+
+Separately, `windows-restart-01` passed a real Codex/QW3 cross-application task
+after forcibly terminating the host application's own process group following
+its first completed action. Restart preserved the task identity and paused
+the desktop. No action was dispatched during the two-second paused check.
+An explicit resume restored the Codex thread, reconciled the current screen and
+finished the copy task. The saved file contained exactly the expected 22-byte
+reference code. Total test time was 71.63 seconds, including restart and the
+paused interval. This exercised the Linux-host application controlling Windows;
+the same process-crash test has not yet run with the app hosted inside Windows.
+Evidence: `apps/computer_use/.runtime/windows-restart-01/` and
+`windows-restart-engine-01/`.
 
 ## Client and lifecycle checks
 
@@ -101,7 +112,26 @@ the Codex turn reports completion. All **29** local contract/lifecycle tests
 pass, including actual pinned Codex with a scripted backend.
 
 Windows x64 client assets and an offline bundle are prepared, with the Codex
-package checked against the official release digest. These artifacts are not
-yet Windows-native runtime qualification. The native client, complete live
-on/off repetitions, application crash/resume, Mac and physical-desktop tests
-remain open.
+package checked against the official release digest. The native Windows bundle
+now passes **29/29 tests with exit code 0**, using Windows CPython 3.13.13 and
+Codex 0.159.2. This includes real Windows Codex/app-server and stdio MCP with
+images, multiple tool rounds and interruption against a scripted backend.
+It does not yet prove real-model desktop execution through the Windows client.
+
+Evidence is in `apps/computer_use/.runtime/windows-native-contracts-02/`, including
+stderr, the exit-code result, bundle/source hashes and test-helper identity.
+The bundle is `windows-native-client-03`, ZIP SHA-256
+`d47bf411157d8355b5f3028f93c1aa31ea6425d84edd2906865c9eede8ff2143`.
+The earlier wrapper attempt exited without a result; the next run passed every
+test but did not preserve the process exit code. Both were retained, and the
+wrapper now captures native streams separately and holds the process handle
+until it reads the exit code.
+
+The first real-model browser pilot on `qw3-uia-20261001` also passed: 10 actions,
+40.01 seconds, with the correct saved JSON. Its checkbox and Save clicks used
+the supplied `(198,604)` and `(261,673)` control centers. Evidence is in
+`windows-uia-pilot-01/`. A single pilot does not complete the repeated suite.
+
+The corrected 18-trial `windows-suite-02` is now running from the new snapshot.
+Real-model native-client desktop execution, complete live on/off repetitions,
+native-client process-crash recovery, Mac and physical-desktop tests remain open.
