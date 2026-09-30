@@ -224,6 +224,20 @@ authorization and disconnect behavior pass local tests. The client accepts
 the token stays outside model history. Real VM connectivity remains to be qualified. The runtime bridge
 and model stay on loopback in the existing Linux-host trials.
 
+`windows_native_suite.py` and the setup-only `vm/run_native_case.ps1` prepare
+real-model qualification with the app, native Codex and MCP inside Windows.
+Each trial restores the clean snapshot, installs and tests the hashed offline
+client, starts the private model relay, then checks the saved task file from
+both the native client and the host. It exports the guest runtime and renders
+the actual local UI in Windows Edge. These new orchestration helpers have not
+yet completed real-VM qualification. Wait for other VM/model suites to end
+before running them; restoring a snapshot resets the dedicated guest.
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
+  --cases browser --run-dir apps/computer_use/.runtime/windows-native-pilot-new
+```
+
 ## KVMem and decoder comparison
 
 Freeze `inference/*/request.json` inputs into a corpus with a `manifest.json`
