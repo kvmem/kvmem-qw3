@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790810508.5605159,
+  "reviewed_at": 1790811336.7716968,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
@@ -87,6 +87,18 @@
     },
     "windows-long-pair-02-audit.json": {
       "sha256": "92d6176d78114aadf8429edd52de7364ddd0619949c7f2e23eea8a0f07300286"
+    },
+    "windows-long-on-04/summary.json": {
+      "sha256": "6a4f1dd2a0dabd0633370f5b17fa6855f4c66c4009dcec52c592da1c2949cd4c"
+    },
+    "windows-long-on-04/task/result.json": {
+      "sha256": "8d38060e47b44a635d2e4e35a3267d6d84601348b1f5ebe027f669dd882c43d1"
+    },
+    "windows-long-on-04/evidence-audit.json": {
+      "sha256": "bc2bbdcfbd12448744569e32505551cde2b64a9058f1af438250363214476c03"
+    },
+    "windows-long-on-04/visual-review.json": {
+      "sha256": "5d3d8c1e9b53061fdb9237371c3af10736ff92dd3f13e123ab65c82ca7c8d10f"
     }
   },
   "remaining": [
@@ -127,7 +139,7 @@
       "task_deadline_reached": false
     },
     "repair_attempt_04": {
-      "status": "running",
+      "status": "on_passed_off_running",
       "qualified": false,
       "supervision": "qw3-computer-long-repair-02.service",
       "run_dirs": [
@@ -136,7 +148,10 @@
       ],
       "task_deadline_seconds_each": 900,
       "service_limit_seconds": 2700,
-      "source_commit": "c436ec65800b6fb4edfa790c9c72a718fd6e6029"
+      "source_commit": "c436ec65800b6fb4edfa790c9c72a718fd6e6029",
+      "on_qualified": true,
+      "on_elapsed_seconds": 644.6502600498497,
+      "on_evidence": "docs/computer_use_windows_long_on_04_20261001.json"
     }
   },
   "native_client_source_identity_scope": "Bundle 04 matches the frozen baseline; working app/engine repairs are newer and require fresh qualification."

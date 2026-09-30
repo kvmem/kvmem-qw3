@@ -364,3 +364,19 @@ The original CUDA index probe reproduced the former; repair qualification is
 in progress. New request tags connect each final answer to its own retrieval
 record. Baseline failures and the original engine binary remain retained; no
 new live archive acceptance is claimed.
+
+
+Repaired KVMem-on live archive (2026-10-01): `windows-long-on-04` passed in
+644.65s with all 36 pages and 81 completed actions. Independent retained-evidence
+and final-UI reviews passed. The correct 363-byte JSON has SHA-256
+`da215048cb633ff2b47051629299f45ffc52084165b3368cf65e03c0673b10be`.
+The reference-producing request had 256,966 prompt tokens, preserved all
+79 prior images and contained no prior textual copy of the reference. Its
+request tag matches a ready, non-fallback retrieval record selecting 1,021
+of 2,009 blocks. DFlash fallback count was zero. Full identity, resource scopes
+and evidence hashes: `computer_use_windows_long_on_04_20261001.json`.
+
+The matching off-policy trial is still running under the bounded transient
+service. This closes one live KVMem-on task, not the paired comparison, the
+changed-old-image control, final native-client requalification, input-death
+recovery candidate, Mac or physical desktop acceptance. Goal remains active.

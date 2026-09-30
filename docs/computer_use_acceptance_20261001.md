@@ -105,6 +105,31 @@ failure. [Interruption record](computer_use_archive_interruption_20261001.json).
 A fresh pair (`windows-long-{on,off}-04`) now runs under the transient user unit
 `qw3-computer-long-repair-02.service`, with a 45-minute overall bound and an
 exit cleanup that pauses the owned VM. Both task deadlines remain 900 seconds,
-with the same snapshot and `c436ec6` app/engine sources. Neither new outcome
-is qualified yet. Read the unit's actual state before acting on queue JSON;
+with the same snapshot and `c436ec6` app/engine sources. The on-policy trial has now passed its independent evidence audit; the off
+trial is running. The paired outcome remains unqualified until both terminate. Read the unit's actual state before acting on queue JSON;
 an active unit's `Result=success` is not task-completion evidence.
+
+
+## Repaired live archive, KVMem on
+
+`windows-long-on-04` completed the actual 36-page Windows workflow in 644.65s
+under the unchanged 900-second deadline. All 81 actions completed, with no
+rejections or unresolved receipts. The independently checked 363-byte
+`archive-review.json` contains the correct reference and pages 1 through 36;
+SHA-256 is `da215048cb633ff2b47051629299f45ffc52084165b3368cf65e03c0673b10be`.
+The retained final UI also shows the correct reference and successful save.
+
+The request that first typed the reference contained 256,966 prompt tokens and
+80 images, preserving all 79 distinct prior images. The reference was absent
+from prior text. Its exact request tag matches an as-run retrieval record with
+1,021 of 2,009 blocks selected, query/index ready and no scorer fallback.
+Across the task DFlash accepted 11,071 of 19,164 drafted tokens, with zero
+fallback requests. Sampled whole-device GPU peak was 45.785 GiB; engine RSS
+high-water was 40.373 GiB. These resource scopes must not be added together.
+
+[Independent audit and identity](computer_use_windows_long_on_04_20261001.json).
+The client/model ran on Linux and actual desktop actions ran in Windows on
+the same host. This is one successful task, not a reliability estimate or
+native Windows GPU qualification. The matching off-policy trial remains live;
+no final pair result is claimed. The same-turn changed-image negative probe
+is prepared separately and has not run against the model yet.

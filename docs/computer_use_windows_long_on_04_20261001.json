@@ -1,0 +1,102 @@
+{
+  "kind": "independent_retained_live_archive_trial_audit",
+  "auditor_sha256": "e6e0aa9afa0377be72ec547826aed448cb781035434b72ac9b5d8bf499d8f227",
+  "checked_at": 1790811249.5396864,
+  "directory": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-04",
+  "kvmem": "on",
+  "passed": true,
+  "evidence_consistent": true,
+  "reported_passed": true,
+  "elapsed_seconds": 644.6502600498497,
+  "error": null,
+  "evidence_hashes": {
+    "summary.json": "6a4f1dd2a0dabd0633370f5b17fa6855f4c66c4009dcec52c592da1c2949cd4c",
+    "task/result.json": "8d38060e47b44a635d2e4e35a3267d6d84601348b1f5ebe027f669dd882c43d1",
+    "app/task.json": "0d04c702f74982236bfa809e49dcdacae464b8d00ee30f5d9afce9dd256e5767",
+    "engine/manifest.json": "92acc7c92770d465a05d49e5a14fa8c1262f5ab69eeb80fc7f15d9b62f3d6b6a"
+  },
+  "action_counts": {
+    "completed": 81
+  },
+  "dflash": {
+    "drafted": 19164,
+    "accepted": 11071,
+    "fallback_requests": 0
+  },
+  "sampled_gpu_peak_bytes": 49161437184,
+  "engine_rss_high_water_bytes": 43349831680,
+  "history": {
+    "request_directory": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-04/app/inference/b37ae9dc8a0d42fcaf37680c95c0ae06",
+    "prompt_tokens": 256966,
+    "backend_trace_tag": "b37ae9dc8a0d42fcaf37680c95c0ae06",
+    "image_count": 80,
+    "unique_image_url_hashes": 80,
+    "all_prior_images_preserved": true,
+    "unique_prior_images": 79,
+    "reference_absent_from_prior_text": true
+  },
+  "retrieval": {
+    "type": "meta",
+    "schema_version": "qw3_kvmem_retrieval_dump.v2",
+    "seq": 39,
+    "trace_tag": "b37ae9dc8a0d42fcaf37680c95c0ae06",
+    "block_count": 2009,
+    "selected": 1021,
+    "query_begin": 2421,
+    "query_end": 4094,
+    "context_begin": 0,
+    "context_end": 0,
+    "prompt_tokens": 256966,
+    "budget_blocks": 1024,
+    "prefill_budget_blocks": 1024,
+    "recent": 82,
+    "sink": 11,
+    "block_tokens": 128,
+    "method": "mean-k",
+    "mask": -1,
+    "scorer_requested": "sub-block-mean-k-max",
+    "scorer_used": "sub-block-mean-k-max",
+    "scorer_fallback_reason": "none",
+    "query_expected": 1673,
+    "query_captured": 1673,
+    "qc_total_blocks": 2008,
+    "qc_captured_blocks": 2008,
+    "trace_event": 0,
+    "trace_events": 0,
+    "index_ready": 1,
+    "query_ready": 1,
+    "immutable_source_k": 1
+  },
+  "file_sha256": "da215048cb633ff2b47051629299f45ffc52084165b3368cf65e03c0673b10be",
+  "binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+  "launcher_sha256": "1cf8270ae5a45f7faf31cad2e2360cc07e09ef9e01011678e3f56dca91d0323c",
+  "recorded_suite_commit": "c436ec65800b6fb4edfa790c9c72a718fd6e6029",
+  "recorded_engine_commit": "c436ec65800b6fb4edfa790c9c72a718fd6e6029",
+  "snapshot": {
+    "name": "qw3-type-20261001",
+    "created_at": 1790803003.882885,
+    "image_id": "sha256:0cff9eb0e7aee9953e55bc682852ca4fdca233145a58ae1ec94f0b0c01a2ed30",
+    "source_hashes": {
+      "executor.ps1": "b5e4eafa2204609a32914ef90bd2aaec85a902884ec7199ea2e3fbb8bddd37fb",
+      "fixture.html": "31b765afe8c6d5e12ec04de7fe00433014f7e19ba434dc39fb74b67728da5063",
+      "bootstrap.ps1": "d0faaffec901aa66c1b1a435b113881c7d7ee14bd35a8a1d3203e97ac6d0a0ec"
+    },
+    "disk_virtual_bytes": 68719476736,
+    "state": "powered_off_disk_snapshot",
+    "container": "qw3-computer-windows"
+  },
+  "client_platform": "linux",
+  "desktop_platform": "windows",
+  "final_ui_review": {
+    "kind": "retained_final_ui_review",
+    "image": "apps/computer_use/.runtime/windows-long-on-04/app/desktop/screenshots/298145f8f018911e230f48fa72170a3046b443a1f39cbcae93e07b9134ceb0f8.png",
+    "sha256": "298145f8f018911e230f48fa72170a3046b443a1f39cbcae93e07b9134ceb0f8",
+    "reviewed_at": 1790811271.758463,
+    "verified_file_sha256": "da215048cb633ff2b47051629299f45ffc52084165b3368cf65e03c0673b10be",
+    "note": "Final UI inspected separately; task pass is also supported by direct saved-file contents/hash and action/history/retrieval audit.",
+    "visible_review_complete_pages": 36,
+    "visible_reference": "ARCHIVE-T7M4-92QX",
+    "visible_saved_filename": "archive-review.json"
+  },
+  "scope": "One successful live Windows archive task with Linux client/model host. No statistical reliability or native Windows GPU claim; paired off-policy trial still running."
+}
