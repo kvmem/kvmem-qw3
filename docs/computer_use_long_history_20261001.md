@@ -104,6 +104,15 @@ more than the named weights and KV/index allocations. Process RSS and configured
 CPU tier capacity are also distinct; these counters are not a full allocator
 audit or a physical 48GB-card qualification.
 
+The retained startup log also reports three pinned host I/O slab pools:
+512 MiB for prefill writeback, 256 MiB for packed stage-out and 256 MiB for
+read staging. These are capacity reports contributing to host memory pressure;
+they must not be added to process RSS as if they were separate physical usage.
+`summarize_memory.py` now reproduces component records and the sampled peak
+from this retained run in `dflash2-kvmem-on/memory-evidence.json`. It explicitly
+reports that tensor/workspace allocation traces are absent. The existing binary
+supports those trace hooks, but a separate instrumented GPU run remains pending.
+
 ### Target-only and native MTP controls
 
 `comparison-long-controls-01` adds target-only (`none`) and native MTP,

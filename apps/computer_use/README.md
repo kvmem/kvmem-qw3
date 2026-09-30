@@ -90,6 +90,21 @@ pending. Tensor records cover owned allocations of at least 1 MiB; workspace
 counters cover named backend capacities. Views, smaller/direct allocations and
 all CUDA-library internals are not a complete census.
 
+`summarize_memory.py` collects retained component/capacity logs and separate
+resource samples. It explicitly marks an ordinary run's missing allocation
+traces; `--require-traces` rejects a missing or inconsistent diagnostic. For
+example, after an engine has exited:
+
+```bash
+python apps/computer_use/summarize_memory.py /path/to/run/engine \
+  --samples /path/to/run/resources.jsonl --output /path/to/run/memory-evidence.json
+```
+
+Its allocation-event arithmetic was checked with synthetic records, including
+unmatched frees and malformed input. The retained long DFlash log reproduces
+the known resource peak and reports that allocation tracing was absent. An
+instrumented real GPU run is still required; the parser does not supply one.
+
 The profile uses FP8 KV, K128K/G64K, 1M logical context, a 48GiB CPU
 tier, 128-token blocks with four 32-token scoring slices, message-level
 retrieval and multimodal prefix reuse. It uses the available 96GB-class GPU;
