@@ -171,7 +171,7 @@ inspect `summary.json` rather than treating process exit as task success.
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_suite.py \
-  --snapshot qw3-clean-20261001 --kvmem on off --repetitions 3 \
+  --snapshot qw3-scroll-20261001 --kvmem on off --repetitions 3 \
   --run-dir apps/computer_use/.runtime/windows-suite-new
 ```
 
@@ -187,8 +187,10 @@ inside the intended content pane. Old signed-only scroll arguments are rejected.
 The executor waits briefly for wheel animation and rechecks foreground changes
 during observation. Confirmed rejected actions return a fresh screenshot without
 replaying input. The 300-second task deadline and 100-tool limit are unchanged.
-These changes passed a real Windows scroll probe and all 31 local contracts;
-model-driven requalification and a new matching snapshot/bundle remain pending.
+These changes passed a real Windows scroll probe and all 31 contracts on both
+Linux and Windows. The matching `qw3-scroll-20261001` snapshot and
+`windows-native-client-04` bundle are prepared; model-driven requalification
+remains pending. Earlier snapshots retain their original source hash guards.
 
 ### Recovery and native-client qualification helpers
 
@@ -232,8 +234,8 @@ against the official release digest and records every asset/source hash. The
 folder includes `start.ps1` and `test.ps1`; it contains no model weights or
 executor token. `vm/test_native_client.ps1` is a setup-only helper to run the
 contract tests in the dedicated guest from a staged, hashed ZIP. The current
-Windows bundle passes all 29 tests with exit code 0, including actual native
-Codex and MCP against a fixture backend. Real-model desktop tasks through the
+Windows bundle 04 passes all 31 tests with exit code 0, including actual native
+Codex and MCP success/error image results against a fixture backend. Real-model desktop tasks through the
 Windows-native client remain to be qualified.
 
 `vm/model_relay.py` is preparation for testing the native Windows client with

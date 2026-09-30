@@ -263,6 +263,11 @@ contracts pass; a new model-driven suite is still required. The queued native
 pilot correctly did not start after the failed prerequisite. See the updated
 Windows validation report; this does not close repeated acceptance.
 
+The scroll-compatible offline client (bundle 04) subsequently passed all 31
+tests on actual Windows with exit code 0. A new clean, powered-off snapshot
+`qw3-scroll-20261001` includes that client and the revised executor. Native
+GPU-backed task execution and the repeated model suite remain pending.
+
 - Codex app-server: https://learn.chatgpt.com/docs/app-server
 - Codex provider configuration:
   https://learn.chatgpt.com/docs/config-file/config-reference

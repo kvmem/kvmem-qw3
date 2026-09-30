@@ -200,6 +200,16 @@ a test-driver focus mistake; probe 02 retains the intermediate-animation-frame
 failure that motivated the additional settling interval. These are executor
 probes, not successful model-driven repetitions.
 
+The new scroll-compatible client subsequently passed **31/31 native Windows
+tests, exit code 0**, including the error-image round trip. Evidence is in
+`windows-native-contracts-03/`. Bundle `windows-native-client-04` has ZIP SHA-256
+`4cf9d3cf8e5d8cad9c2d5ec4e4e20c7cb24664dc500a2d1fef4d279b8d798945`.
+The previous bundle remains archived by its hash. The new powered-off snapshot
+`qw3-scroll-20261001` contains this client and executor SHA-256
+`2dd1a5ab9a4bad3537515d6a53386c6793107bd9de8cb07058d79e2aca62238a`.
+Fixture and bootstrap hashes are unchanged. Native real-model execution is
+still pending; these fixture-backed contracts do not qualify that path.
+
 Real-model requalification, native-client desktop execution, native-client
 process-crash recovery, Mac and physical-desktop tests remain open. The task
 definitions, 300-second deadline and 100-tool limit remain unchanged.
