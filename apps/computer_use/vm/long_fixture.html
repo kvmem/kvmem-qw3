@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Local desktop test · Archive review</title>
+<style>
+body{font:17px system-ui;background:#edf2f7;color:#14283e;margin:0;padding:18px}
+main{max-width:950px;margin:auto;background:white;padding:24px 30px;border-radius:14px}
+h1{font-size:27px;margin:0 0 8px}p{line-height:1.4;margin:9px 0;color:#526273}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 24px;margin:18px 0}
+label{display:block;font-weight:600}input[type=text]{box-sizing:border-box;width:100%;padding:9px;font:inherit;border:1px solid #abb9c7;border-radius:6px;margin-top:5px}
+input[readonly]{background:#f3f6fa;color:#43566e}
+button{font:600 18px system-ui;border:0;border-radius:7px;background:#175cd3;color:white;padding:12px 22px;margin-top:18px;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}code{font:20px ui-monospace;background:#eef3f8;padding:3px 7px}
+#status{color:#087347}#reference-note{min-height:35px}
+</style>
+<main>
+<h1>Archive review</h1>
+<p id="heading"></p>
+<p id="reference-note"></p>
+<form id="review">
+<div class="grid" id="records"></div>
+<label><input id="confirmed" type="checkbox" required> I have reviewed this page</label>
+<button id="next" type="submit">Confirm and continue</button>
+</form>
+<form id="finish" hidden>
+<p>All archive pages were reviewed. Enter the archive reference shown on the opening page.</p>
+<label for="reference">Opening archive reference</label><input id="reference" type="text" autocomplete="off" required>
+<button type="submit">Save archive review</button>
+</form>
+<p id="status" role="status"></p>
+</main>
+<script>
+// Dedicated offline workload. It supplies no computer-control or model API.
+const pages=36, reviewed=[];
+let page=1;
+const heading=document.querySelector('#heading'),note=document.querySelector('#reference-note');
+const form=document.querySelector('#review'),records=document.querySelector('#records');
+function showPage(){
+ heading.textContent=`Page ${page} of ${pages} · ready for review`;
+ note.replaceChildren();
+ if(page===1){
+  note.append('Opening archive reference: ');
+  const code=document.createElement('code');code.textContent='ARCHIVE-T7M4-92QX';note.append(code);
+ }else{note.textContent='The opening reference is no longer shown. Continue reviewing the archive.';}
+ records.replaceChildren();
+ const values=[['Document identifier',`ARCH-${String(page).padStart(3,'0')}`],
+  ['Department','Local operations'],['Archive owner',`Review desk ${1+(page%4)}`],
+  ['Retention schedule','Internal working copy'],['Document status','Ready for review'],
+  ['Record sequence',`${page} of ${pages}`]];
+ values.forEach(([name,value],index)=>{
+  const label=document.createElement('label');label.textContent=name;
+  const input=document.createElement('input');input.type='text';input.readOnly=true;
+  input.id=`record-${index}`;input.value=value;label.htmlFor=input.id;label.append(input);records.append(label);
+ });
+ document.querySelector('#confirmed').checked=false;
+}
+form.addEventListener('submit',event=>{
+ event.preventDefault();reviewed.push(page);
+ if(page<pages){page++;showPage();return;}
+ form.hidden=true;document.querySelector('#finish').hidden=false;
+ heading.textContent=`Review complete · ${reviewed.length} pages`;
+ note.textContent='Enter the opening reference from the earlier observation.';
+ document.querySelector('#reference').focus();
+});
+document.querySelector('#finish').addEventListener('submit',event=>{
+ event.preventDefault();
+ const result={reference:document.querySelector('#reference').value,reviewed_pages:[...reviewed],page_count:pages};
+ const url=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));
+ const link=document.createElement('a');link.href=url;link.download='archive-review.json';link.click();
+ setTimeout(()=>URL.revokeObjectURL(url),3000);
+ document.querySelector('#status').textContent='Saved archive-review.json';
+ document.querySelector('#finish button').disabled=true;
+});
+showPage();
+</script>
+</html>

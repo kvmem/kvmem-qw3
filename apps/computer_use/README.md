@@ -292,6 +292,34 @@ input. Use a fresh engine for each isolated measurement, and distinguish warm
 prefix reuse from cold on/off comparisons. The long cold corpus can be replayed
 with `compare_replay.py --visual-history retrievable --trace-retrieval`.
 
+`windows_long_task.py` prepares a separate real-desktop long-history check:
+36 local archive pages, a checkbox and confirmation on each, followed by typing
+the opening page's reference into the final form and saving the JSON. It must
+cross K128K at the reference-generating request, retain the historical images,
+and have no reference text in earlier model history. It checks the final file,
+clipboard/page-reset shortcuts and the actual final retrieval trace. The
+application's 100-tool limit is unchanged. This workload has not yet passed a
+real-model trial and is not included in the three frozen short tasks.
+The page itself passed a Linux headless-browser check: all 36 confirmations,
+required checkbox behavior, reference hiding after page 1, exact JSON download
+and zero JavaScript errors. The first/final layouts were also visually checked
+at 1280×675. Evidence is in `.runtime/windows-long-fixture-check-01/`; this
+checks the test fixture, not Windows or the model's ability to complete it.
+
+After other VM/model tests end, restore the clean snapshot, copy
+`vm/long_fixture.html` into the VM's shared directory, archive any old
+`long-task-ready.json`, then run `vm/prepare_long_task.ps1` using `vm/provision.py`.
+Wait for the new ready file and verify its fixture hash. Start a fresh engine
+with `--visual-history retrievable --trace-retrieval` and a fresh app runtime,
+then run:
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_long_task.py \
+  --app-runtime apps/computer_use/.runtime/archive-app-new \
+  --engine-dir apps/computer_use/.runtime/archive-engine-new \
+  --run-dir apps/computer_use/.runtime/archive-task-new
+```
+
 After a long replay finishes, validate both the visual answers and the complete
 final retrieval trace. This checker has passed against the retained DFlash
 on/off positive and negative corpus:
