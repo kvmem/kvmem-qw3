@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790824948.9529662,
+  "reviewed_at": 1790825772.4282827,
   "goal_complete": false,
   "recorded_source_commit": "7d18e50",
   "gpu_limit_48gb_retired": true,
@@ -189,7 +189,6 @@
   },
   "remaining": [
     "Apply and qualify the prepared periodic-selection boundary candidate. The unchanged engine reproduced the retained request50 cold fallback:61.259s prefill/65.225s client first output. Fixed short54/54 and long12/12 controls and the guided live pair are complete; latency repair and live requalification remain open.",
-    "Repair native-client process-identity resource sampling and qualify a fresh matched Windows measurement. Independent native functionality and host GPU/RSS evidence remain valid.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
   ],
@@ -325,12 +324,23 @@
     "recorded_commits_have_identical_app_sources": true
   },
   "native_client_resources": {
-    "qualified": false,
+    "qualified": true,
     "issue": "docs/computer_use_native_resource_attribution_20261001.json",
     "observer_repair_integrated": true,
     "native_identity_probe_passed": true,
     "probe_report": "docs/computer_use_native_resource_probe_20261001.json",
-    "fresh_matched_measurement_status": "prepared_not_started"
+    "fresh_matched_measurement_status": "completed",
+    "unit": "qw3-computer-native-resources-01.service",
+    "expected_main_pid": 1159951,
+    "runtime_result": "apps/computer_use/.runtime/native-resource-qualification-01/result.json",
+    "observed_on_task_passed": true,
+    "observed_on_samples_valid": 32,
+    "observed_at": 1790825563.0040545,
+    "fresh_matched_trials_passed": 2,
+    "report": "docs/computer_use_native_resources_20261001.json",
+    "scope": "One corrected-observer Notepad trial per policy; legacy18-trial client metrics remain invalid.",
+    "unit_terminal": true,
+    "cleanup_passed": true
   },
   "guided_live_archive": {
     "on_passed": true,

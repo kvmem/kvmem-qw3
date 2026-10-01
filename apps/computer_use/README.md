@@ -6,8 +6,9 @@ trials from a clean snapshot. The repaired Linux client completed a 36-page
 Windows task with KVMem on; off timed out at the same 900-second deadline.
 The current application bundle 06 passed 18/18 native tasks and both on/off
 restart checks. Fixed-input controls passed 54 short and 12 long checks across
-target-only, native MTP and DFlash. Checkpoint latency repair, corrected client
-resource measurements, physical-machine and macOS acceptance remain open. See the current
+target-only, native MTP and DFlash. Corrected client resource measurements passed
+a separate on/off Notepad pair. Checkpoint latency repair, physical-machine and
+macOS acceptance remain open. See the current
 [acceptance index](../../docs/computer_use_acceptance_20261001.md) for exact
 source identities, preserved failures and the scope of each result.
 See `../../docs/computer_use_codex_m2_20261001.md` for desktop evidence and
@@ -333,8 +334,10 @@ could attach old system processes after PID reuse, so legacy client counters
 are withheld. The repaired observer checks each PID and process creation time,
 retains parent identities, and refuses partial/ambiguous samples. Its ten real
 Windows probe checks and eight offline validator tests passed. A fresh matched
-model-task resource pair is still required; this does not alter the existing
-18 functional outcomes or their host GPU measurements.
+Notepad pair then passed with all 89 samples qualified: peak summed working
+sets were 210.72/214.74 MiB on/off, private bytes 122.63/126.17 MiB. This is one
+resource trial per policy, excluding the model and controlled desktop apps. It
+does not replace the existing 18 functional outcomes or repair legacy counters.
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \

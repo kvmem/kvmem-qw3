@@ -1,0 +1,156 @@
+{
+  "kind": "qualified_native_windows_client_resource_pair",
+  "passed": true,
+  "reviewed_at": 1790825772.4278774,
+  "source_commit": "6191ad6605635e87031226d2fb981302190848e4",
+  "source_scope": "Corrected test observer/summarizer with unchanged bundle06 application/test files and engine005. Separate one-case pair, not a replacement for the18-trial native matrix.",
+  "trials": [
+    {
+      "kvmem": "on",
+      "passed": true,
+      "elapsed_seconds": 34.01016039999999,
+      "application_pid": 1220,
+      "expected_application_pid_matches_samples": true,
+      "resources": {
+        "client_samples": 32,
+        "client_resource_sample_errors": 0,
+        "client_resource_comparison_valid": true,
+        "client_resource_errors": [],
+        "client_sum_working_sets_peak_bytes": 220958720,
+        "client_sum_private_bytes_peak": 128589824,
+        "client_sampled_cpu_seconds": 4.65625
+      },
+      "process_count_min": 3,
+      "process_count_max": 5,
+      "sampled_names": [
+        "codex",
+        "conhost",
+        "python"
+      ],
+      "native_contracts_passed": true,
+      "output_sha256": "efef6d7c1b7868c02d2567b834d67135e37c2bdaaf21d1f1de232aa33129c581",
+      "engine_binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+      "engine_manifest_sha256": "c189c1b784cfe086d6da6ae7e43a8064f77a8e26ac6f3ab4b70cd821428159e6",
+      "artifacts": {
+        "apps/computer_use/.runtime/windows-native-resource-pair-01/on-notepad-0/guest/client-resources.jsonl": "0fec0feb2c1b2d113c1e19c0684e702061f85c140eccf653eee34fe5043f4407",
+        "apps/computer_use/.runtime/windows-native-resource-pair-01/on-notepad-0/result.json": "e09184c1f768e5642e730062a475c47b500f0c7dcdfafe583adfa47ca367a159",
+        "apps/computer_use/.runtime/windows-native-resource-pair-01/on-notepad-0/guest/task/result.json": "760fe0689c4b12ebc9db7da92fa515a899044fa3518b7f0631786c052039ee95",
+        "apps/computer_use/.runtime/windows-native-resource-pair-01/on-notepad-0/guest/shutdown.stdout.log": "a207721936746359acb33c45c528e5d375bb5b7522d138b1712c5b7cd399f25c"
+      }
+    },
+    {
+      "kvmem": "off",
+      "passed": true,
+      "elapsed_seconds": 60.933993099999995,
+      "application_pid": 572,
+      "expected_application_pid_matches_samples": true,
+      "resources": {
+        "client_samples": 57,
+        "client_resource_sample_errors": 0,
+        "client_resource_comparison_valid": true,
+        "client_resource_errors": [],
+        "client_sum_working_sets_peak_bytes": 225173504,
+        "client_sum_private_bytes_peak": 132300800,
+        "client_sampled_cpu_seconds": 5.015625
+      },
+      "process_count_min": 3,
+      "process_count_max": 5,
+      "sampled_names": [
+        "codex",
+        "conhost",
+        "python"
+      ],
+      "native_contracts_passed": true,
+      "output_sha256": "efef6d7c1b7868c02d2567b834d67135e37c2bdaaf21d1f1de232aa33129c581",
+      "engine_binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+      "engine_manifest_sha256": "6e3d6428c5db2c2076c746b816d4dc27699575227c4a1d1f50b0a55cb2899b64",
+      "artifacts": {
+        "apps/computer_use/.runtime/windows-native-resource-pair-01/off-notepad-0/guest/client-resources.jsonl": "e95a2d55b48722e83cb57b307e870db43f14825eb0ec617be89f28c96a51a280",
+        "apps/computer_use/.runtime/windows-native-resource-pair-01/off-notepad-0/result.json": "63eb1a5cfe65106269a132c67cb16ad196ee8eb646d8e5ac098d896b1d0111d0",
+        "apps/computer_use/.runtime/windows-native-resource-pair-01/off-notepad-0/guest/task/result.json": "a4cb4700ac2ca12ec670dc836fcc76ed965cf935af35c7e271ab8e42c7a9d6db",
+        "apps/computer_use/.runtime/windows-native-resource-pair-01/off-notepad-0/guest/shutdown.stdout.log": "b07fe16a29732d95f742dba19521232680115ba26703ea81a8ac48141c09cabe"
+      }
+    }
+  ],
+  "bundle_sha256": "23851fd5c83e8b4e70a2595fcf46d3f1c7f1f600e1ff140a3ade8b2ad69c08f4",
+  "helper_sha256": {
+    "apps/computer_use/windows_native_suite.py": "c275c5d2d934f3781ee73a610837d4807417667835885c784da55baa083a7003",
+    "apps/computer_use/vm/run_native_case.ps1": "74a941735beb41d6c1f32230e7b3919b6becf473e97b83ef1fa6ed8af5980206",
+    "apps/computer_use/vm/test_native_client.ps1": "d8f36f45e877d00ea6ec0622a1a0db5254edebc1f745b43c8b3164d8983451b3",
+    "apps/computer_use/vm/model_relay.py": "3d946d4503c89f6c51effcfa4ef4e9905c435661a05067cb2fe5638de18928ed"
+  },
+  "snapshot": {
+    "name": "qw3-exact-20261001",
+    "created_at": 1790816386.7901478,
+    "image_id": "sha256:0cff9eb0e7aee9953e55bc682852ca4fdca233145a58ae1ec94f0b0c01a2ed30",
+    "source_hashes": {
+      "executor.ps1": "6678710b6425f3d1a1828e0ba90213590526c9adad2b2751fb9d5f317747b45f",
+      "fixture.html": "31b765afe8c6d5e12ec04de7fe00433014f7e19ba434dc39fb74b67728da5063",
+      "bootstrap.ps1": "d0faaffec901aa66c1b1a435b113881c7d7ee14bd35a8a1d3203e97ac6d0a0ec"
+    },
+    "disk_virtual_bytes": 68719476736,
+    "state": "powered_off_disk_snapshot",
+    "container": "qw3-computer-windows"
+  },
+  "independent_evidence_audit": {
+    "kind": "retained_windows_suite_evidence_audit",
+    "checks": [
+      {
+        "kvmem": "on",
+        "case": "notepad",
+        "repetition": 0,
+        "passed": true,
+        "client_resource_comparison_valid": true,
+        "client_resource_sample_errors": 0,
+        "client_resource_errors": [],
+        "native_process_samples_present": true,
+        "completed_actions": 7,
+        "file_sha256": "efef6d7c1b7868c02d2567b834d67135e37c2bdaaf21d1f1de232aa33129c581",
+        "dflash_drafted": 2403,
+        "dflash_accepted": 1251,
+        "dflash_fallback_requests": 0
+      },
+      {
+        "kvmem": "off",
+        "case": "notepad",
+        "repetition": 0,
+        "passed": true,
+        "client_resource_comparison_valid": true,
+        "client_resource_sample_errors": 0,
+        "client_resource_errors": [],
+        "native_process_samples_present": true,
+        "completed_actions": 7,
+        "file_sha256": "efef6d7c1b7868c02d2567b834d67135e37c2bdaaf21d1f1de232aa33129c581",
+        "dflash_drafted": 2422,
+        "dflash_accepted": 1248,
+        "dflash_fallback_requests": 0
+      }
+    ],
+    "client_platform": "windows",
+    "matrix_complete": true,
+    "expected_trials": 2,
+    "binary_hashes": [
+      "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea"
+    ],
+    "launcher_hashes": [
+      "da826a96c415bb45e3f18e5abc480ccabb29b9199d3f61251ec6d307297c0e67"
+    ],
+    "recorded_commits": [
+      "6191ad6605635e87031226d2fb981302190848e4"
+    ],
+    "passed": true,
+    "task_set": [
+      "notepad"
+    ],
+    "client_resource_comparison_valid": true
+  },
+  "cleanup": {
+    "kind": "owned_vm_service_cleanup",
+    "passed": true,
+    "at": 1790825688.4235356,
+    "paused": true
+  },
+  "unit_terminal": true,
+  "supervisor_result_sha256": "315b1df695c31af54872fdff03499ecfd67ccedda8ebef64e42d62e62323958b",
+  "scope": "Windows-native app/Codex/MCP tree only; excludes controlled desktop apps, Python task driver, observer, Linux model/relay and VM overhead. Working-set/private-byte peaks are sums, not unique physical RAM. CPU totals cover sampled process lifetimes. One run per policy does not establish an average memory/performance advantage. All legacy counter records remain unqualified; no historical raw artifact was repaired."
+}

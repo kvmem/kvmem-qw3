@@ -1,7 +1,7 @@
 {
   "kind": "unchanged_engine_prefix_miss_reproduction",
   "passed": true,
-  "reviewed_at": 1790824948.9512305,
+  "reviewed_at": 1790825394.7146428,
   "request_count": 50,
   "source_manifest_sha256": "3ad9470a9b02a616d24fdce425d7fa98cfc924f7318db59b99a0374d23022c92",
   "engine_binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
@@ -22,11 +22,13 @@
   "completed_phase_requests": 50,
   "phase_tags_match_retained_manifest": true,
   "tools_dispatched": false,
-  "scope": "Reproduces the unsafe-to-reuse checkpoint state and cold fallback under unchanged engine controls. Actual generated speculation/checkpoint placement can vary: this replay retained P158848 (generation56), whereas the live trace captured P159104 (generation57); both are stale against final generation58. This is a reproduction, not a repaired performance result or desktop quality test.",
+  "scope": "Reproduces the same checkpoint sequence and safe cold fallback under unchanged engine controls. Both original and replay capture aligned P159104 at generation57, then invalidate it with selection at159128/generation58; turn-end retains stale P158848/generation56 and unaligned M159158/generation58. All50 retained inputs completed. This is a reproduction, not a repaired performance result or desktop quality test.",
   "artifacts": {
     "apps/computer_use/.runtime/prefix-replay-baseline-01/result.json": "df4184b32d547b334224fa5f2bfc0850cc3add574e0dfc4a8928dd15e912664c",
     "apps/computer_use/.runtime/prefix-replay-baseline-01/engine/engine.log": "83576772b1f3c62a250930926bcaceb587a775ba4bf2bcf5e275a60c45829bdf",
     "apps/computer_use/.runtime/prefix-replay-baseline-01-phases/result.json": "9461dd89eb025f9d4d2578d32bfee149cb65e37cf0270597dc103a04dba0430a",
     "apps/computer_use/.runtime/prefix-replay-baseline-01-phases/requests.csv": "7ab2547d27ddf3e093e43d23ef55947bb345efaca4bfb5dc76d79f062378bf3c"
-  }
+  },
+  "post_selection_capture_matches_original": "[qw3] kvmem prefix-cache POST-SELECTION P (mtp): pos=159104 generation=57",
+  "turn_end_capture_matches_original": true
 }

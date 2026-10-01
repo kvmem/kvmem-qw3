@@ -1,7 +1,7 @@
 {
   "kind": "native_client_resource_attribution_defect",
-  "status": "observer_repaired_native_probe_passed_model_resource_pair_pending",
-  "reviewed_at": 1790825176.5729835,
+  "status": "repaired_and_new_pair_qualified_legacy_counters_withheld",
+  "reviewed_at": 1790825772.428587,
   "affected_trial": "off-notepad-2",
   "application_pid": 676,
   "samples": 72,
@@ -69,7 +69,7 @@
   "conclusion": "Native-client RAM/CPU comparison from this matrix is unqualified. Raw values remain retained but are excluded from the published comparison; do not repair them by filtering process names.",
   "scope": "All18 task outcomes and durations are retained. Independent host GPU/engine RSS and phase timings are unaffected by the attribution error. Built-in taskkill cleanup retained only5 owned process successes.",
   "repair_required": "Match PID and process creation identity at each parent/child edge and counter read, retain parent/birth identities, then verify on actual Windows and repeat a matched client resource measurement.",
-  "current_live_queue": "Prior frozen qualification and followup queues are terminal; corrected observer can be tested in a new matched pair.",
+  "current_live_queue": "All resource qualification tasks are terminal with owned VM paused.",
   "candidate": "Integrated tested observer into apps/computer_use/vm/run_native_case.ps1; prepared original candidate remains retained.",
   "reference_sources": [
     "https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-process",
@@ -81,5 +81,7 @@
     "passed": true,
     "report": "docs/computer_use_native_resource_probe_20261001.json",
     "integrated_observer_matches_tested_helper": true
-  }
+  },
+  "fresh_pair_report": "docs/computer_use_native_resources_20261001.json",
+  "fresh_pair_passed": true
 }

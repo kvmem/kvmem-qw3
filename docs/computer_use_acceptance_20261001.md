@@ -3,9 +3,9 @@
 Status: **active; not a completion certificate**. Windows VM functionality and
 both fixed-input decoder matrices are qualified at the identities below. The
 long live comparison is complete: KVMem on passed; off timed out. Checkpoint
-latency, fresh native-client resource measurements, macOS and physical hardware
-acceptance remain open. Standalone vision timing and the Windows process-identity
-probe have passed.
+latency, macOS and physical hardware acceptance remain open. Standalone vision
+timing, the Windows process-identity probe and a fresh native resource pair
+have passed.
 
 The user retired the initial 48GB GPU limit. Tests use the current host's RTX
 PRO 6000 Blackwell Server Edition, reporting 97,887 MiB. Inference is local on
@@ -76,6 +76,14 @@ GiB on/off. The legacy native-client RAM/CPU samples are **unqualified** because
 PID reuse contaminated one process tree; they are withheld from the comparison.
 Independent task outcomes, host GPU and engine RSS remain valid.
 
+The [corrected observer's fresh Notepad pair](computer_use_native_resources_20261001.json)
+passed on/off with all 32/57 samples qualified. Peak sums of client working
+sets were 210.72/214.74 MiB; private bytes were 122.63/126.17 MiB. The samples
+contained 3–5 owned Python/Codex/console processes and matched the actual app
+PID and creation identities. These counters exclude the Linux model, controlled
+desktop applications and VM overhead. One pair is not a memory advantage
+estimate, and it does not rehabilitate the old client counters.
+
 The long live pair used the same snapshot and 900s deadline:
 
 | Measurement | On | Off |
@@ -120,11 +128,12 @@ engine, output and retrieval identities.
    prefill and 65.225s client first output. The scheduling candidate passed CPU
    policy checks but is not applied or GPU-qualified. Keep the replay
    alignment guard and 60s observation lifetime.
-2. **Native-client resource attribution:** [defect and prepared probe](computer_use_native_resource_attribution_20261001.json).
+2. **Native-client resource attribution repaired:** [defect and repair](computer_use_native_resource_attribution_20261001.json).
    The [native probe](computer_use_native_resource_probe_20261001.json) passed
    all ten Windows checks; eight offline validator tests passed. The exact tested
-   observer is integrated. Run a fresh matched resource pair before publishing
-   client memory or CPU measurements.
+   observer is integrated. The fresh on/off pair passed both task and resource
+   audits, with 89/89 samples qualified and the desktop paused at cleanup.
+   The old 18-trial client resource comparison remains invalid.
 3. **Vision timing completed:** [three standalone trials](computer_use_vision_profile_20261001.json)
    passed CPU/GPU embedding parity. Median first-image GPU processing was
    106.861ms, append-one-new-image 73.681ms, cached reorder 1.242ms. Timings
