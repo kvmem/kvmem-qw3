@@ -1,6 +1,6 @@
 {
   "kind": "guided_prefix_latency_diagnostic_and_candidate",
-  "reviewed_at": 1790826003.4538808,
+  "reviewed_at": 1790826822.1334586,
   "live_task_result": "docs/computer_use_windows_long_on_06_20261001.json",
   "cause_evidence": {
     "request_before_first_miss": 49,
@@ -89,21 +89,26 @@
       "model_prefix_replay_passed": null,
       "live_desktop_qualified": false
     },
-    "model_continuation_tested": false,
-    "gpu_test_scope": "Three targeted strategy/CUDA regressions passed; model prefix and visual replay are running.",
+    "model_continuation_tested": true,
+    "gpu_test_scope": "44 CPU and3 policy/CUDA checks,50 retained prefix requests and8 guided visual seed/long checks passed. Live desktop and current-engine fixed controls remain under requalification.",
     "qualification": {
       "unit": "qw3-computer-guided-boundary-01.service",
       "expected_main_pid": 1167433,
       "result": "apps/computer_use/.runtime/guided-boundary-qualification-01/result.json",
-      "observed_status": "running",
+      "observed_status": "passed",
       "source_commit": "1fb9dbb",
-      "observed_at": 1790826191.4930174
-    }
+      "observed_at": 1790826822.1334677,
+      "unit_terminal": true,
+      "prefix_report": "docs/computer_use_prefix_boundary_comparison_20261001.json",
+      "visual_report": "docs/computer_use_guided_visual_02_20261001.json"
+    },
+    "model_prefix_replay_passed": true,
+    "visual_regression_passed": true
   },
   "candidate_patch_sha256": "361d1bdaf243a27077145ba5964288542340dde2cf98383f0296351e0c93b713",
   "remaining_validation": [
-    "Build the isolated candidate and verify identical controls, input counts, request success, checkpoint behavior and output quality.",
-    "Validate real long desktop behavior and on/off controls before replacing the qualified runtime."
+    "Qualify actual36-page Windows archive tasks on both policies under the unchanged900s deadline, checking final output and stale observations.",
+    "Complete source-matched fixed54-short/12-long controls with candidate engine9f1d15."
   ],
   "scope": "The candidate is prepared outside production sources. CPU scheduling tests and a clean patch check do not prove GPU state correctness, retrieval quality, latency improvement or desktop acceptance."
 }

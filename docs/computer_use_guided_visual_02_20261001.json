@@ -1,0 +1,188 @@
+{
+  "kind": "retained_guided_visual_evidence_audit",
+  "passed": true,
+  "results": [
+    {
+      "policy": "on",
+      "branch": "present",
+      "name": "short_present",
+      "prompt_tokens": 4114,
+      "seconds": 2.272529706824571,
+      "answer": {
+        "reference": "QW3-WINDOWS-2026-ALPHA",
+        "name": "Alice",
+        "priority": "High"
+      },
+      "request_sha256": "884b87f7887e22ffdda425b5cf34ce5a4efd4580cff9f50746375555f1b83586"
+    },
+    {
+      "policy": "on",
+      "branch": "present",
+      "name": "long_present",
+      "prompt_tokens": 162062,
+      "seconds": 64.97094431193545,
+      "answer": {
+        "reference": "QW3-WINDOWS-2026-ALPHA",
+        "name": "Alice",
+        "priority": "High"
+      },
+      "request_sha256": "5857c703e40eb7d327bfafb51d72c34ffd82e5eb7c5066902f0755c17d791afc",
+      "retrieval": {
+        "type": "meta",
+        "schema_version": "qw3_kvmem_retrieval_dump.v2",
+        "seq": 0,
+        "trace_tag": "same-turn-visual-02-long_present",
+        "block_count": 1267,
+        "selected": 1018,
+        "query_begin": 904,
+        "query_end": 2013,
+        "context_begin": 0,
+        "context_end": 0,
+        "prompt_tokens": 162062,
+        "budget_blocks": 1024,
+        "prefill_budget_blocks": 1024,
+        "recent": 82,
+        "sink": 11,
+        "block_tokens": 128,
+        "method": "mean-k",
+        "mask": -1,
+        "scorer_requested": "sub-block-mean-k-max",
+        "scorer_used": "sub-block-mean-k-max",
+        "scorer_fallback_reason": "none",
+        "query_expected": 1109,
+        "query_captured": 37,
+        "qc_total_blocks": 1257,
+        "qc_captured_blocks": 1257,
+        "trace_event": 0,
+        "trace_events": 0,
+        "index_ready": 1,
+        "query_ready": 1,
+        "immutable_source_k": 1
+      }
+    },
+    {
+      "policy": "off",
+      "branch": "present",
+      "name": "short_present",
+      "prompt_tokens": 4114,
+      "seconds": 1.7984198909252882,
+      "answer": {
+        "reference": "QW3-WINDOWS-2026-ALPHA",
+        "name": "Alice",
+        "priority": "High"
+      },
+      "request_sha256": "884b87f7887e22ffdda425b5cf34ce5a4efd4580cff9f50746375555f1b83586"
+    },
+    {
+      "policy": "off",
+      "branch": "present",
+      "name": "long_present",
+      "prompt_tokens": 162062,
+      "seconds": 60.866637281142175,
+      "answer": {
+        "reference": "QW3-WINDOWS-2026-ALPHA",
+        "name": "Alice",
+        "priority": "High"
+      },
+      "request_sha256": "5857c703e40eb7d327bfafb51d72c34ffd82e5eb7c5066902f0755c17d791afc"
+    },
+    {
+      "policy": "on",
+      "branch": "absent",
+      "name": "short_present",
+      "prompt_tokens": 4114,
+      "seconds": 2.2690403410233557,
+      "answer": {
+        "reference": "QW3-WINDOWS-2026-ALPHA",
+        "name": "Alice",
+        "priority": "High"
+      },
+      "request_sha256": "884b87f7887e22ffdda425b5cf34ce5a4efd4580cff9f50746375555f1b83586"
+    },
+    {
+      "policy": "on",
+      "branch": "absent",
+      "name": "long_absent",
+      "prompt_tokens": 162062,
+      "seconds": 64.64190318761393,
+      "answer": {
+        "reference": null,
+        "name": null,
+        "priority": null
+      },
+      "request_sha256": "43aee0c697153dada33691ed00057bf877d05bd672e09d6633e8c3ac9e42042e",
+      "retrieval": {
+        "type": "meta",
+        "schema_version": "qw3_kvmem_retrieval_dump.v2",
+        "seq": 0,
+        "trace_tag": "same-turn-visual-02-long_absent",
+        "block_count": 1267,
+        "selected": 1018,
+        "query_begin": 904,
+        "query_end": 2013,
+        "context_begin": 0,
+        "context_end": 0,
+        "prompt_tokens": 162062,
+        "budget_blocks": 1024,
+        "prefill_budget_blocks": 1024,
+        "recent": 82,
+        "sink": 11,
+        "block_tokens": 128,
+        "method": "mean-k",
+        "mask": -1,
+        "scorer_requested": "sub-block-mean-k-max",
+        "scorer_used": "sub-block-mean-k-max",
+        "scorer_fallback_reason": "none",
+        "query_expected": 1109,
+        "query_captured": 33,
+        "qc_total_blocks": 1257,
+        "qc_captured_blocks": 1257,
+        "trace_event": 0,
+        "trace_events": 0,
+        "index_ready": 1,
+        "query_ready": 1,
+        "immutable_source_k": 1
+      }
+    },
+    {
+      "policy": "off",
+      "branch": "absent",
+      "name": "short_present",
+      "prompt_tokens": 4114,
+      "seconds": 1.7347924271598458,
+      "answer": {
+        "reference": "QW3-WINDOWS-2026-ALPHA",
+        "name": "Alice",
+        "priority": "High"
+      },
+      "request_sha256": "884b87f7887e22ffdda425b5cf34ce5a4efd4580cff9f50746375555f1b83586"
+    },
+    {
+      "policy": "off",
+      "branch": "absent",
+      "name": "long_absent",
+      "prompt_tokens": 162062,
+      "seconds": 60.75486529618502,
+      "answer": {
+        "reference": null,
+        "name": null,
+        "priority": null
+      },
+      "request_sha256": "43aee0c697153dada33691ed00057bf877d05bd672e09d6633e8c3ac9e42042e"
+    }
+  ],
+  "service": {
+    "MainPID": "0",
+    "Result": "success",
+    "ExecMainStatus": "0",
+    "ActiveState": "inactive"
+  },
+  "result_sha256": "91a0756ea81b984c1ef51e30f42e956ef145c8e4e2d03af2208dd3b77cd97bf8",
+  "scope": "Four long policy/branch checks, each with a short seed. Single repetition. No desktop tools dispatched; not live-task qualification.",
+  "reviewed_at": 1790826822.1330838,
+  "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+  "supervisor_result_sha256": "a9ab03a8882a00b3f3b2d2d4e5e6b052929d539957d9c50351ea6bd21226428c",
+  "independent_auditor_sha256": "052f375e8ff16a21c4898d661ec82e371df30ddc493f09655918b14e1c36be36",
+  "candidate_source_commit": "1fb9dbb",
+  "desktop_qualified": false
+}

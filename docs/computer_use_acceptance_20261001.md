@@ -33,9 +33,10 @@ Runtime paths below are relative to `apps/computer_use/.runtime/`.
   refresh. These profiles answer different questions and must remain separate.
 
 The workspace now contains candidate engine `9f1d1515...` from `1fb9dbb`. It
-passes 44 CPU and three targeted policy/CUDA checks; its 50-request prefix and
-same-turn visual regressions are running under `qw3-computer-guided-boundary-01.service`.
-It is not yet live-desktop qualified. The measurements below belong to engine
+passes 44 CPU and three targeted policy/CUDA checks. Its 50-request prefix and
+eight seed/long visual checks also passed; that supervisor is terminal.
+`qw3-computer-guided-live-01.service` now runs fresh real archive on/off tasks
+and fixed-input controls. The candidate is not yet live-desktop qualified. The measurements below belong to engine
 `005654a6...`, retained in `guided-boundary-candidate/qw3-baseline-005`.
 
 Independent analysis and documentation commits occurred during the frozen
@@ -132,9 +133,12 @@ engine, output and retrieval identities.
    The [unchanged-engine replay](computer_use_prefix_baseline_20261001.json)
    completed all 50 requests and reproduced the final cold fallback: 61.259s
    prefill and 65.225s client first output. The scheduling candidate is applied and
-   built, with 44 CPU and three targeted policy/CUDA checks passed. Its model
-   continuation and visual regressions are running; live qualification remains
-   required. Keep the replay
+   built, with 44 CPU and three targeted policy/CUDA checks passed. The
+   [matched50-request comparison](computer_use_prefix_boundary_comparison_20261001.json)
+   passes: the final request reuses159,104 tokens, reduces prefill61.259s to1.570s
+   and total elapsed67.393s to6.897s. The
+   [eight visual checks](computer_use_guided_visual_02_20261001.json) also pass.
+   Actual desktop and same-engine controls are running. Keep the replay
    alignment guard and 60s observation lifetime.
 2. **Native-client resource attribution repaired:** [defect and repair](computer_use_native_resource_attribution_20261001.json).
    The [native probe](computer_use_native_resource_probe_20261001.json) passed
