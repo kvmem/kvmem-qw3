@@ -14795,8 +14795,13 @@ private:
             if (options_.kvmem_update_mode != "step" &&
                 executor_->block_store()->block_count() >
                     executor_->block_store()->budget_blocks() &&
-                committed_pos >= kvmem_last_reselect_pos +
-                                     static_cast<uint32_t>(kvmem_interval)) {
+                (kvmem_warm_capture
+                    ? detail::kvmem_periodic_reselect_boundary_due(
+                          committed_pos, kvmem_last_reselect_pos,
+                          static_cast<uint32_t>(kvmem_interval),
+                          executor_->block_store()->config().block_tokens)
+                    : committed_pos >= kvmem_last_reselect_pos +
+                          static_cast<uint32_t>(kvmem_interval))) {
                 if (defer_finish) {
                     executor_->kvmem_prepare_reselect();
                 } else {
@@ -18934,10 +18939,18 @@ private:
                     requested_drafts = std::min(requested_drafts, static_cast<uint32_t>(
                         std::max(0, budget.budget - budget.think_tokens - 1)));
                 }
+                const bool periodic_reselect_alignment = kvmem_warm_capture &&
+                    kvmem_on && options_.kvmem_update_mode != "step" &&
+                    executor_->block_store()->block_count() >
+                        executor_->block_store()->budget_blocks() &&
+                    detail::kvmem_periodic_reselect_align_drafts(
+                        checkpoint_pos, kvmem_last_reselect_pos,
+                        static_cast<uint32_t>(kvmem_interval), checkpoint_bt, requested_drafts);
                 const uint32_t draft_limit = detail::kvmem_checkpoint_draft_limit(
                     checkpoint_pos, checkpoint_bt,
                     requested_drafts,
-                    postselection_checkpoint_due() || periodic_checkpoint_due);
+                    postselection_checkpoint_due() || periodic_checkpoint_due ||
+                    periodic_reselect_alignment);
                 const double t_draft_start = mtp_phase_time();
                 DFlashProposal dflash_proposal;
                 std::vector<NativeExecutorReport> chain;

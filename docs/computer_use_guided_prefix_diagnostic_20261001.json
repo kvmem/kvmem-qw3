@@ -1,6 +1,6 @@
 {
   "kind": "guided_prefix_latency_diagnostic_and_candidate",
-  "reviewed_at": 1790824948.9523554,
+  "reviewed_at": 1790826003.4538808,
   "live_task_result": "docs/computer_use_windows_long_on_06_20261001.json",
   "cause_evidence": {
     "request_before_first_miss": 49,
@@ -37,8 +37,8 @@
   "candidate": {
     "kind": "warm_periodic_selection_boundary_candidate",
     "prepared_at": 1790822731.1266453,
-    "applied_to_worktree": false,
-    "gpu_tested": false,
+    "applied_to_worktree": true,
+    "gpu_tested": "CUDA regression probes passed; model continuation not yet tested",
     "baseline_engine_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
     "base_sources": {
       "src/kvmem_prefix_reuse_policy.hpp": "e1628141ce37c22bc37747fa43149e8a8ad9906565325abe08a09b6f94d04f30",
@@ -59,7 +59,36 @@
       "build_command": "g++ -std=c++17 -O2 -I apps/computer_use/.runtime/guided-boundary-candidate -I src apps/computer_use/.runtime/guided-boundary-candidate/kvmem_prefix_reuse_policy_test.cpp -o apps/computer_use/.runtime/guided-boundary-candidate/policy-test",
       "initial_candidate_failure_retained": "policy-failure-01/result.json"
     },
-    "patch_applies_cleanly": true
+    "patch_applies_cleanly": true,
+    "build_validation": {
+      "kind": "periodic_boundary_candidate_build_validation",
+      "reviewed_at": 1790826003.3031807,
+      "built": true,
+      "cpu_build_passed": true,
+      "gpu_build_passed": true,
+      "tests": {
+        "cpu": {
+          "passed": true,
+          "tests": 44,
+          "xml_sha256": "f214c64a180f756148a9e811ec7708c29f805f0a98cd7b080bcdda186bfe8a99"
+        },
+        "gpu": {
+          "passed": true,
+          "tests": 3,
+          "xml_sha256": "4f4333966d0eafa19c07e956fb7cc07d6a74120495a39e7c2543ae768006661e"
+        }
+      },
+      "baseline_binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+      "candidate_binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+      "source_sha256": {
+        "src/kvmem_prefix_reuse_policy.hpp": "d5aa5a6e26a67a57e6b588941aa9437328950413045a7e8109e57d130007928a",
+        "src/qwen_native_backend.cpp": "ff5e23b466c6c95c6c2d34e6481a94d9d11d241ecbe832eaf424a3fb9b08f77e",
+        "tests/kvmem_prefix_reuse_policy_test.cpp": "38b0021ce80cb7a6df8a89e8ee4e4c9faba3c60fbd214cbc9bcffcb362a12f39"
+      },
+      "original_patch_sha256": "361d1bdaf243a27077145ba5964288542340dde2cf98383f0296351e0c93b713",
+      "model_prefix_replay_passed": null,
+      "live_desktop_qualified": false
+    }
   },
   "candidate_patch_sha256": "361d1bdaf243a27077145ba5964288542340dde2cf98383f0296351e0c93b713",
   "remaining_validation": [

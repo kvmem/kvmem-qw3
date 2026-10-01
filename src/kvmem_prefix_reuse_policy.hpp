@@ -15,6 +15,33 @@ constexpr uint32_t kvmem_checkpoint_draft_limit(
     return drafts < gap ? drafts : gap - 1;
 }
 
+// Warm sessions need an aligned checkpoint in the current selection. A
+// periodic reselect between that checkpoint and EOS invalidates P while M can
+// remain unaligned. Schedule periodic updates at the first block boundary at
+// or after their interval; explicit pressure recovery remains independent.
+constexpr bool kvmem_periodic_reselect_boundary_due(
+        uint64_t position, uint64_t last_reselect, uint32_t interval,
+        uint32_t block_tokens) {
+    const uint32_t bt = block_tokens ? block_tokens : 1;
+    const uint32_t gap = interval ? interval : 1;
+    return position >= last_reselect && position - last_reselect >= gap &&
+        position % bt == 0;
+}
+
+// A speculative acceptance can otherwise jump over the scheduled boundary.
+// Clamp when the next boundary is due or this cycle could cross the
+// interval threshold (including configurations smaller than a draft cycle).
+constexpr bool kvmem_periodic_reselect_align_drafts(
+        uint64_t position, uint64_t last_reselect, uint32_t interval,
+        uint32_t block_tokens, uint32_t requested_drafts) {
+    if (position < last_reselect || block_tokens == 0) return false;
+    const uint64_t elapsed = position - last_reselect;
+    const uint32_t gap = interval ? interval : 1;
+    const uint32_t boundary_distance = block_tokens - position % block_tokens;
+    return elapsed >= gap || gap - elapsed <= boundary_distance ||
+        gap - elapsed <= uint64_t(requested_drafts) + 1;
+}
+
 // The rendered message header can begin in the block BEFORE its scoring Q.
 // A fresh Q needs a checkpoint no later than both boundaries; otherwise an
 // unaligned M can skip the only reachable state for the complete live replay.

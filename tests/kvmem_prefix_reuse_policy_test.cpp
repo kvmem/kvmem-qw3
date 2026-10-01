@@ -327,7 +327,50 @@ void test_multimodal_prefix_identity() {
 
 }  // namespace
 
+void test_warm_periodic_selection_preserves_replay_origin() {
+    using qw3::detail::kvmem_periodic_reselect_boundary_due;
+    using qw3::detail::kvmem_periodic_reselect_align_drafts;
+    // Retained live trace: prompt158994, periodic selections159062/159128,
+    // P159104 at generation57 invalidated by generation58, then EOS159158.
+    // The candidate instead selects at159104 and retains that aligned P.
+    require(kvmem_periodic_reselect_boundary_due(159104, 158994, 64, 128),
+            "retained trace did not reach its first due aligned selection");
+    require(!kvmem_periodic_reselect_boundary_due(159128, 159104, 64, 128),
+            "late partial-block selection invalidated the replay origin");
+    require(!kvmem_periodic_reselect_boundary_due(159158, 159104, 64, 128),
+            "EOS triggered an unaligned selection");
+    for (uint32_t bt : {1u, 32u, 128u}) {
+        for (uint32_t interval : {1u, 64u, 255u, 256u}) {
+            for (uint32_t offset = 0; offset < bt; ++offset) {
+                for (uint32_t acceptance = 1; acceptance <= 8; ++acceptance) {
+                    uint64_t pos = (1ull << 40) + offset;
+                    uint64_t last = pos;
+                    const uint64_t end = pos + 1024;
+                    while (pos < end) {
+                        const uint32_t drafts = qw3::detail::kvmem_checkpoint_draft_limit(
+                            pos, bt, 7, kvmem_periodic_reselect_align_drafts(pos, last, interval, bt, 7));
+                        const uint32_t count = acceptance < drafts + 1 ? acceptance : drafts + 1;
+                        pos += count;
+                        if (kvmem_periodic_reselect_boundary_due(pos, last, interval, bt)) {
+                            require(pos % bt == 0, "periodic selection is not aligned");
+                            require(pos - last >= interval, "periodic selection happened early");
+                            require(pos - last < uint64_t(interval) + bt,
+                                    "speculation skipped a due selection boundary");
+                            last = pos;
+                        }
+                    }
+                    require(pos - last < uint64_t(interval) + bt,
+                            "periodic selection was postponed indefinitely");
+                }
+            }
+        }
+    }
+    require(!kvmem_periodic_reselect_align_drafts(10, 11, 64, 128, 7),
+            "invalid reversed progress enabled a boundary clamp");
+}
+
 int main() {
+    test_warm_periodic_selection_preserves_replay_origin();
     // Every possible MTP acceptance length reaches an aligned state before
     // crossing it, including the final current-token-only transition.
     for (uint64_t start = 1071316; start < 1071348; ++start) {
