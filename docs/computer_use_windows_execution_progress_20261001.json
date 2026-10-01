@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T04:23:33.529740+08:00",
+  "updated_at": "2026-10-02T04:54:08.218253+08:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -73,7 +73,7 @@
   "recording_limits": [
     "static desktop may be sampled around 2 Hz by QEMU; actual intervals retained",
     "resource counters exclude VM overhead",
-    "not yet qualified across full-length tasks"
+    "900-second actual-model preflight recorded continuously; multi-hour scenarios and recorder slowdown control remain unqualified"
   ],
   "web_source": {
     "repo": "https://github.com/Task-Web/OSWorld-web",
@@ -229,7 +229,9 @@
     "apps/computer_use/vm/archive_share.py": "65d94794684313a05cfcf71d8bb3685263f2a9b135191f1fe2a45899b843cd77",
     "apps/computer_use/vm/clean_windows_baseline.py": "459ab727264939fb61fedc7aa26bd145ebf784237605cb9038b8711be26d2cd9",
     "apps/computer_use/vm/prepare_osworld_baseline.ps1": "5143bc6bba6bb7f2ae37993094f6a507644d5072b458fc5bc878264d9781889c",
-    "apps/computer_use/vm/verify_osworld_baseline.ps1": "bb44f8e063fa4ee2752b552339b279852f074b9c21ad288ce1a99b4efa7d5a0a"
+    "apps/computer_use/vm/verify_osworld_baseline.ps1": "bb44f8e063fa4ee2752b552339b279852f074b9c21ad288ce1a99b4efa7d5a0a",
+    "apps/computer_use/osworld_windows/preflight013.py": "4ea514fd05881077837eb72d7eb92f83153f6cd00a861d9ac1d03ac15a3229f2",
+    "apps/computer_use/osworld_windows/summarize_preflight.py": "6e7f61e2f95d276fa1a8d5d61dd802e81a0bd9b847a2f44a534c54bdb6f9e49d"
   },
   "pending": [
     "Complete remaining task preparation: 006 one inaccessible original and local mirror/initializer/grader; 022 remaining download UI/reset; 035 visibility and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 process audit integration",
@@ -698,7 +700,98 @@
       "snapshot_frozen": false,
       "reset_roundtrip_validated": false,
       "identity_reuse_rejected": true,
-      "preview_url": "http://127.0.0.1:18086/index.html"
+      "preview_url": "http://127.0.0.1:18086/index.html",
+      "model_test_completed_scope": "Counted formal trials; unscored real-model preflight is recorded separately below.",
+      "real_model_preflight": {
+        "completed": true,
+        "formal_run": false,
+        "pipeline_passed": true,
+        "task_passed": false,
+        "outcome": "time_limit",
+        "kvmem": "on",
+        "visual_history": "pin-all",
+        "speculative_method": "dflash2",
+        "task_seconds": 900.3153544999999,
+        "time_limit_seconds": 900,
+        "source_budget_note": "The provisional formal budget is 1800 seconds; this run is not counted toward formal results.",
+        "score": 0,
+        "fields_correct": 0,
+        "fields_total": 8,
+        "submitted": false,
+        "partial_gui_input_present": true,
+        "requests": 100,
+        "successful_request_streams": 99,
+        "cancelled_at_timeout": 1,
+        "largest_prompt_tokens": 347022,
+        "actions": {
+          "count": 96,
+          "statuses": {
+            "completed": 95,
+            "rejected": 1
+          },
+          "kinds": {
+            "click": 41,
+            "scroll": 45,
+            "key": 4,
+            "type": 6
+          }
+        },
+        "server_ttft_ms": {
+          "count": 100,
+          "p50": 2160.4292475,
+          "p95": 8020.495939849999,
+          "maximum": 14831.676992,
+          "mean": 3389.29686415
+        },
+        "request_duration_ms": {
+          "count": 100,
+          "p50": 6897.0917,
+          "p95": 13700.247314749999,
+          "maximum": 91793.746201,
+          "mean": 7825.585368239999
+        },
+        "dflash_actual": {
+          "summary_count": 100,
+          "enabled_count": 100,
+          "fallback_count": 0,
+          "drafted": 31730,
+          "accepted": 16356,
+          "weighted_acceptance": 0.5154743145288371,
+          "scope": "all native DFlash summaries, including any internal retrieval work"
+        },
+        "resources": {
+          "samples": 956,
+          "peak_gpu_mib": 47384.0,
+          "peak_host_rss_gib": 43.826934814453125,
+          "scope": "engine process and device samples including model startup; excludes Windows VM and native client memory"
+        },
+        "recording": {
+          "complete": true,
+          "seconds": 931.296430304,
+          "actual_captures": 2729,
+          "encoded_frames": 9313,
+          "actual_capture_gap_seconds": {
+            "count": 2728,
+            "p50": 0.2094970195,
+            "p95": 0.9354328225500004,
+            "maximum": 1.625462158,
+            "mean": 0.34132329314332843
+          },
+          "sampling_note": "Encoded 10 fps repeats last available image; real VNC sampling intervals are reported separately.",
+          "recorder_cpu_seconds": 74.46854400000001,
+          "encoder_cpu_seconds": 158.856366
+        },
+        "result": "apps/computer_use/.runtime/osworld-013-preflight-on-01/result.json",
+        "analysis": "apps/computer_use/.runtime/osworld-013-preflight-on-01/analysis.json",
+        "failure_analysis": "apps/computer_use/.runtime/osworld-013-preflight-on-01/failure-analysis.json",
+        "video": "apps/computer_use/.runtime/osworld-013-preflight-on-01/video/screen.mp4",
+        "preview_url": "http://127.0.0.1:18088/index.html",
+        "agent_workflow_changed": false,
+        "comparison_available": false,
+        "gpu_and_relay_released": true,
+        "guest_executor_paused": true,
+        "next_attempt_requires_restore": true
+      }
     },
     "004": {
       "model_test_completed": false,
@@ -1095,7 +1188,8 @@
     "host_review_handoff_cases_passed": 10,
     "host_review_handoff_evidence": "apps/computer_use/.runtime/osworld-035-review-handoff-01/result.json",
     "production_campaign_scheduler_complete": false,
-    "full_recording_and_snapshot_integration_complete": false
+    "full_recording_and_snapshot_integration_complete": false,
+    "real_model_recording_snapshot_preflight_013_passed": true
   },
   "application_entries": {
     "native_contracts": {
@@ -1272,5 +1366,19 @@
       ],
       "evidence": "apps/computer_use/.runtime/pre-cleanup-backup-01/result.json"
     }
+  },
+  "preflight_workflow_observations": {
+    "evidence": "apps/computer_use/.runtime/osworld-013-preflight-on-01/failure-analysis.json",
+    "first_infeasible_allocation_request": 21,
+    "first_infeasible_allocation_guest_seconds": 96.70645141601562,
+    "model_detected_bad_budget_request": 63,
+    "model_detected_bad_budget_guest_seconds": 468.63895773887634,
+    "expired_observation_rejected_after_long_reasoning": true,
+    "hypotheses_only": [
+      "Before editing, extract mandatory constraints, compute a complete candidate and check budget/balance/uniqueness/ratios; begin GUI entry only after those checks. Do not inject expected answers.",
+      "Use page landmarks and supported Home/End navigation to reduce repeated scanning; re-observe after long planning before dispatching an action."
+    ],
+    "v1_selected": false,
+    "no_kvmem_comparison_yet": true
   }
 }
