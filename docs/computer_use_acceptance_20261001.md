@@ -1,12 +1,12 @@
 # Computer-use acceptance evidence index
 
-Status: **active; not a completion certificate**. Windows VM functionality and
-both fixed-input decoder matrices are qualified for baseline engine `005654a6...`.
-Its long live comparison is complete: KVMem on passed; off timed out. Checkpoint
-repair has passed its first real long desktop task; the matching off-policy run
-timed out at the same deadline. New-engine short controls passed 54/54; long controls are still running. Mac and physical hardware
-acceptance remain open. Standalone vision timing, the Windows process-identity
-probe and a fresh native resource pair have passed.
+Status: **active; Windows VM evidence reviewed, Mac and physical targets open**.
+Baseline engine `005654a6...` has qualified native Windows core, restart and
+resource checks. The repaired engine `9f1d1515...` passed its live KVMem-on
+archive task and both fixed-input decoder matrices (54 short and 12 long
+checks). Its paired off-policy archive timed out under the same deadline.
+The supervised queue and cleanup are complete. These results do not qualify
+native Windows GPU inference or Mac/physical desktop deployment.
 
 The user retired the initial 48GB GPU limit. Tests use the current host's RTX
 PRO 6000 Blackwell Server Edition, reporting 97,887 MiB. Inference is local on
@@ -33,20 +33,23 @@ Runtime paths below are relative to `apps/computer_use/.runtime/`.
   history and prefix reuse. Fixed-input controls disable prefix reuse and guided
   refresh. These profiles answer different questions and must remain separate.
 
-The workspace now contains candidate engine `9f1d1515...` from `1fb9dbb`. It
-passes 44 CPU and three targeted policy/CUDA checks. Its 50-request prefix and
-eight seed/long visual checks also passed; that supervisor is terminal.
-`qw3-computer-guided-live-01.service` now runs fresh real archive on/off tasks
-and fixed-input controls. The new live pair is complete: on passed and off
-timed out. Its results are recorded separately below. The earlier measurements belong to engine
-`005654a6...`, retained in `guided-boundary-candidate/qw3-baseline-005`.
+The workspace engine `9f1d1515...`, from repair commit `1fb9dbb`, passed 44 CPU
+and three targeted policy/CUDA checks, the matched 50-request prefix replay,
+eight seed/long visual checks, and the live/fixed comparisons below. Earlier
+native Windows measurements belong to engine `005654a6...`, retained in
+`guided-boundary-candidate/qw3-baseline-005`.
+
+`qw3-computer-guided-live-01.service` is terminal with MainPID 0. It ended
+failed because the dense archive exceeded the deadline; all comparison stages
+were attempted, both fixed matrices passed, and cleanup left the desktop
+paused. This is a completed comparison with a retained task failure.
 
 Independent analysis and documentation commits occurred during the frozen
 experiments. Per-trial Git HEAD can differ; application, binary, input, bundle
 and snapshot hashes identify what was tested. No current GPU diagnostic may
 have its frozen sources or engine replaced while it is active.
 
-## Completed current checks
+## Retained baseline checks
 
 | Requirement | Evidence | Result and scope |
 | --- | --- | --- |
@@ -127,7 +130,7 @@ The independent offline audit can be reproduced with
 `scripts/computer_use_long_control_audit.py`; the report records all input,
 engine, output and retrieval identities.
 
-## Boundary repair: completed live on/off comparison
+## Boundary repair: current live and fixed controls
 
 The [new on-policy archive](computer_use_windows_long_on_07_20261001.json)
 passed in **416.09s**, with all 36 pages, 80 completed actions, no rejections or
@@ -158,14 +161,36 @@ and one deadline-cancelled request without terminal timing; its phase audit
 passes consistency, with incomplete coverage. The [six-profile short controls](computer_use_short_controls_04_20261001.json)
 passed all 54 limited output checks, with actual speculation and no fallback.
 Their sampled GPU peaks were 37.209/62.299 GiB (none), 38.693/65.365 GiB (MTP)
-and 42.451/67.541 GiB (DFlash), on/off respectively. Long fixed controls remain
-running.
+and 42.451/67.541 GiB (DFlash), on/off respectively.
+The [long fixed controls](computer_use_long_controls_04_20261001.json) also
+passed 12/12 positive/changed-image-negative checks, with identical 158,911-token
+inputs, prefix reuse and guided refresh disabled, actual requested speculation
+and no fallback. All six on-policy requests had ready query/index state and
+actual sparse selection. All 12 requests passed additive server phase accounting;
+detailed native phases are available for the eight MTP/DFlash requests. The
+four target-only requests lack detailed native-accounting logs, so those fields
+remain blank. The four on-policy speculative requests also match native tags;
+other phase attribution uses serial order and exact token counts.
 [All 122 paired requests](computer_use_windows_long_requests_07_20261001.csv);
 [all 81 on-policy phases](computer_use_windows_long_on_07_phases_20261001.csv).
 
-## Remaining work and retained failures
 
-1. **Checkpoint latency:** four on-policy archive requests lost an admissible
+| Decoder | On seconds, positive / negative | Off seconds, positive / negative | GPU GiB, on / off |
+| --- | ---: | ---: | ---: |
+| None | 64.741 / 62.624 | 60.122 / 59.269 | 38.271 / 61.893 |
+| Native MTP | 64.533 / 62.766 | 59.730 / 59.140 | 39.627 / 64.385 |
+| DFlash2 | 64.611 / 62.803 | 59.801 / 59.115 | 43.410 / 66.943 |
+
+This is one request per image case/profile, with short answers and an image
+cache retained between the two cases. Cold on-policy requests use less sampled
+GPU memory but take longer here. These observations are separate from live
+history-reuse benefits and do not establish long-output speculation throughput.
+[12 request measurements](computer_use_long_controls_04_requests_20261001.csv);
+[12 native/server phase records](computer_use_long_controls_04_phases_20261001.csv).
+
+## Qualification boundaries and remaining targets
+
+1. **Checkpoint latency repaired:** four on-policy archive requests lost an admissible
    checkpoint after a late periodic selection, causing 61–108s cold prefills and
    stale observations. [Cause and isolated candidate](computer_use_guided_prefix_diagnostic_20261001.json).
    The [unchanged-engine replay](computer_use_prefix_baseline_20261001.json)
@@ -178,8 +203,9 @@ running.
    [eight visual checks](computer_use_guided_visual_02_20261001.json) also pass.
    The new on-policy real desktop task also passed, with zero checkpoint misses
    or rejected actions. Matched off-policy comparison is complete with a normal
-   deadline failure; short controls passed 54/54 and long controls are running. Keep the replay
-   alignment guard and 60s observation lifetime.
+   deadline failure. Both same-engine fixed matrices passed (54 short, 12 long).
+   Terminal source/binary hashes matched the frozen manifests and cleanup left
+   the desktop paused. Keep the replay alignment guard and 60s observation lifetime.
 2. **Native-client resource attribution repaired:** [defect and repair](computer_use_native_resource_attribution_20261001.json).
    The [native probe](computer_use_native_resource_probe_20261001.json) passed
    all ten Windows checks; eight offline validator tests passed. The exact tested

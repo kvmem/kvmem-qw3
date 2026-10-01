@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790828922.2006044,
+  "reviewed_at": 1790829883.2539604,
   "goal_complete": false,
   "recorded_source_commit": "7d18e50",
   "gpu_limit_48gb_retired": true,
@@ -188,7 +188,6 @@
     }
   },
   "remaining": [
-    "Finish engine9f six-profile long fixed controls. Short controls passed 54/54. Live archive07 pair complete: on passed, off hit the same 900s deadline at page 18; preserve engine005 native/core resource identities.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
   ],
@@ -403,13 +402,11 @@
   "boundary_candidate_qualification": {
     "source_commit": "1fb9dbb",
     "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
-    "status": "live_archive_pair_compared_fixed_controls_running",
+    "status": "qualified_live_comparison_and_fixed_controls",
     "unit": "qw3-computer-guided-boundary-01.service",
     "expected_main_pid": 1167433,
     "cpu_checks_passed": 44,
     "targeted_gpu_policy_checks_passed": 3,
-    "last_qualified_engine_remains": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
-    "desktop_qualified": false,
     "prefix_checks_passed": 50,
     "visual_checks_passed": 8,
     "model_supervisor_terminal": true,
@@ -417,13 +414,16 @@
     "visual_report": "docs/computer_use_guided_visual_02_20261001.json",
     "live_archive_on_passed": true,
     "live_archive_on_report": "docs/computer_use_windows_long_on_07_20261001.json",
-    "desktop_qualification_scope": "One real Windows VM archive workflow, Linux client/model; native core trials retain engine005 identity."
+    "desktop_qualification_scope": "One real Windows VM archive workflow, Linux client/model; native core trials retain engine005 identity.",
+    "live_desktop_comparison_qualified": true,
+    "all_live_tasks_passed": false,
+    "native_core_engine_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea"
   },
   "boundary_live_requalification": {
-    "status": "running",
+    "status": "comparison_completed_with_dense_deadline_failure",
     "unit": "qw3-computer-guided-live-01.service",
     "expected_main_pid": 1169600,
-    "observed_at": 1790828399.6046832,
+    "observed_at": 1790829883.2539656,
     "result": "apps/computer_use/.runtime/guided-live-qualification-01/result.json",
     "run_dirs": [
       "windows-long-on-07",
@@ -450,7 +450,27 @@
       ],
       [
         "short-six-profiles",
-        "running"
+        "completed"
+      ],
+      [
+        "short-metrics",
+        "completed"
+      ],
+      [
+        "long-six-profiles",
+        "completed"
+      ],
+      [
+        "long-visual-checks",
+        "completed"
+      ],
+      [
+        "long-metrics",
+        "completed"
+      ],
+      [
+        "long-identity-audit",
+        "completed"
       ]
     ],
     "on_passed": true,
@@ -462,14 +482,43 @@
     "off_elapsed_seconds": 901.086665048264,
     "comparison_completed": true,
     "comparison_evidence_consistent": true,
-    "pair_report": "docs/computer_use_windows_long_pair_07_20261001.json"
+    "pair_report": "docs/computer_use_windows_long_pair_07_20261001.json",
+    "terminal": true,
+    "terminal_review": {
+      "kind": "terminal_boundary_qualification_review",
+      "reviewed_at": 1790829883.253708,
+      "unit": {
+        "MainPID": "0",
+        "Result": "exit-code",
+        "ActiveState": "failed"
+      },
+      "supervisor_pid": 1169600,
+      "supervisor_result_sha256": "8847e9c314cdf4ab03eef61b4749af80c825fc8cd1284d1e333c441658aff007",
+      "all_stages_attempted": true,
+      "comparison_completed": true,
+      "all_live_tasks_passed": false,
+      "expected_failure": "Dense archive hit the same 900s deadline; on passed.",
+      "short_checks_passed": 54,
+      "long_checks_passed": 12,
+      "frozen_sources_unchanged_at_terminal": true,
+      "engine_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+      "cleanup": {
+        "kind": "owned_vm_service_cleanup",
+        "passed": true,
+        "at": 1790829741.3080258,
+        "paused": true
+      },
+      "scope": "Changed above-budget warm path and matched fixed controls qualified. Native Windows core/resource evidence retains engine005 identity; Mac and physical desktops remain open."
+    }
   },
   "boundary_fixed_controls": {
     "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
     "short_passed": 54,
     "short_required": 54,
     "short_document": "docs/computer_use_short_controls_04_20261001.json",
-    "long_status": "running",
-    "long_required": 12
+    "long_status": "passed",
+    "long_required": 12,
+    "long_passed": 12,
+    "long_document": "docs/computer_use_long_controls_04_20261001.json"
   }
 }

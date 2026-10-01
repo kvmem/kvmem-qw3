@@ -1,6 +1,6 @@
 {
   "kind": "guided_prefix_latency_diagnostic_and_candidate",
-  "reviewed_at": 1790827460.2793686,
+  "reviewed_at": 1790829972.023569,
   "live_task_result": "docs/computer_use_windows_long_on_06_20261001.json",
   "cause_evidence": {
     "request_before_first_miss": 49,
@@ -90,7 +90,7 @@
       "live_desktop_qualified": false
     },
     "model_continuation_tested": true,
-    "gpu_test_scope": "44 CPU and3 policy/CUDA checks,50 retained prefix requests and8 guided visual seed/long checks passed. Live desktop and current-engine fixed controls remain under requalification.",
+    "gpu_test_scope": "44 CPU and 3 targeted policy/CUDA checks, 50 retained prefix requests, 8 guided visual checks, live archive07 on/off comparison, 54 short fixed requests and 12 long fixed requests completed. On live task passed with zero misses/rejections; dense live task timed out at the unchanged deadline. Native core/resource trials retain engine005 identity.",
     "qualification": {
       "unit": "qw3-computer-guided-boundary-01.service",
       "expected_main_pid": 1167433,
@@ -105,12 +105,15 @@
     "model_prefix_replay_passed": true,
     "visual_regression_passed": true,
     "live_archive_on_qualified": true,
-    "live_archive_on_report": "docs/computer_use_windows_long_on_07_20261001.json"
+    "live_archive_on_report": "docs/computer_use_windows_long_on_07_20261001.json",
+    "live_pair_report": "docs/computer_use_windows_long_pair_07_20261001.json",
+    "fixed_control_reports": [
+      "docs/computer_use_short_controls_04_20261001.json",
+      "docs/computer_use_long_controls_04_20261001.json"
+    ],
+    "build_validation_snapshot_scope": "Retained build-time snapshot; model/live flags there predate the completed qualification recorded alongside it."
   },
   "candidate_patch_sha256": "361d1bdaf243a27077145ba5964288542340dde2cf98383f0296351e0c93b713",
-  "remaining_validation": [
-    "Finish matched off-policy live archive07 and paired evidence/timing audit under unchanged900s deadline.",
-    "Complete source-matched fixed54-short/12-long controls with engine9f1d15."
-  ],
-  "scope": "The candidate is prepared outside production sources. CPU scheduling tests and a clean patch check do not prove GPU state correctness, retrieval quality, latency improvement or desktop acceptance."
+  "remaining_validation": [],
+  "scope": "Repair applied in commit1fb9dbb and validated on engine9f1d15. Same 50 input bodies demonstrate restored prefix reuse; one real on-policy archive passed without checkpoint misses. Matched dense timeout and original failures remain retained. Fixed controls completed without regression. This closes this repair qualification, not Mac/physical deployment or a general reliability claim."
 }

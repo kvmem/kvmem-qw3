@@ -7,8 +7,13 @@ Windows task with KVMem on; off timed out at the same 900-second deadline.
 The current application bundle 06 passed 18/18 native tasks and both on/off
 restart checks. Fixed-input controls passed 54 short and 12 long checks across
 target-only, native MTP and DFlash. Corrected client resource measurements passed
-a separate on/off Notepad pair. Checkpoint latency repair, physical-machine and
-macOS acceptance remain open. See the current
+a separate on/off Notepad pair. The checkpoint boundary repair also passed a
+matched 50-request replay, eight visual checks and a new live archive comparison:
+on finished in 416.09s without checkpoint misses or rejected actions; off timed
+out at page 18. New-engine fixed controls passed 54/54 short and 12/12 long
+checks. These results retain separate engine identities; native Windows core
+trials used the preceding engine. Physical-machine and macOS acceptance remain
+open. See the current
 [acceptance index](../../docs/computer_use_acceptance_20261001.md) for exact
 source identities, preserved failures and the scope of each result.
 See `../../docs/computer_use_codex_m2_20261001.md` for desktop evidence and
@@ -133,7 +138,8 @@ off, same-query history growth can use capacity selection without semantic
 retrieval. A 162K-token diagnostic exposed an incorrect old-image answer in
 that configuration. With refresh on, all four long on/off positive/changed-image
 negative checks passed, each seeded by the same short request. That diagnostic
-does not dispatch desktop actions or qualify the revised live task profile.
+does not dispatch desktop actions. The separate live archive pair and its source
+identities are linked in the acceptance index.
 
 ```bash
 python3 apps/computer_use/run_engine.py --method dflash2 --kvmem on \
@@ -247,8 +253,9 @@ PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_suite.py
 
 In `windows_suite.py`, the Windows guest runs the executor while the UI, Codex
 and GPU model run on Linux. `windows_native_suite.py` runs the client and Codex
-inside Windows; bundle 04 passed its 18 repeated core tasks. Updated bundles,
-macOS and physical desktops require their own qualification. The dedicated VM test account is elevated;
+inside Windows; bundle 06 passed its 18 repeated core tasks on engine
+`005654a6...`. Revised bundles/engines, macOS and physical desktops retain their
+own qualification scope. The dedicated VM test account is elevated;
 this prototype is not qualified as a general-purpose desktop permission sandbox.
 
 The second full on/off snapshot suite retained 17 successes and one off-mode
@@ -258,10 +265,10 @@ inside the intended content pane. Old signed-only scroll arguments are rejected.
 The executor waits briefly for wheel animation and rechecks foreground changes
 during observation. Confirmed rejected actions return a fresh screenshot without
 replaying input. The 300-second task deadline and 100-tool limit are unchanged.
-These changes passed a real Windows scroll probe and all 31 contracts on both
-Linux and Windows. The matching `qw3-scroll-20261001` snapshot and
-`windows-native-client-04` bundle are prepared; model-driven requalification
-remains pending. Earlier snapshots retain their original source hash guards.
+These changes first passed a real Windows scroll probe and 31 contracts on both
+Linux and Windows. Subsequent input repairs and bundle 06 passed 34 contracts
+and the 18-task native matrix on `qw3-exact-20261001`, as recorded in the
+acceptance index. Earlier snapshots retain their original source hash guards.
 
 ### Recovery and native-client qualification helpers
 
@@ -382,10 +389,12 @@ trial; invalid or legacy records never produce published client RAM totals.
 
 The restart variant kills only the application process tree it started, checks
 that restart stays paused with the same task identity, then explicitly resumes
-and verifies the saved file. `windows-native-restart-01` passed in 63.12 seconds:
-the same Codex thread resumed after a two-second no-action pause and produced
-the exact expected cross-app file using Ctrl+C/Ctrl+V. That time includes the
-injected crash and pause, but excludes VM/model setup.
+and verifies the saved file. `windows-native-restart-02` passed on/off in
+63.03/124.67 seconds on engine `005654a6...`: the same Codex thread resumed
+after a two-second no-action pause and produced the exact expected cross-app
+file using Ctrl+C/Ctrl+V. Those times include the injected crash and pause,
+but exclude VM/model setup. The retained supervisor audit-key error and its
+independent evidence review are documented in the acceptance index.
 
 ## KVMem and decoder comparison
 
@@ -439,8 +448,11 @@ the opening page's reference into the final form and saving the JSON. It must
 cross K128K at the reference-generating request, retain the historical images,
 and have no reference text in earlier model history. It checks the final file,
 clipboard/page-reset shortcuts and the actual final retrieval trace. The
-application's 100-tool limit is unchanged. This workload has not yet passed a
-real-model trial and is not included in the three frozen short tasks.
+application's 100-tool limit is unchanged. The current KVMem-on engine passed
+all 36 pages with the exact saved file and without copying the reference into
+prior text. The paired dense run timed out under the same deadline; it also
+violated the intermediate-transcription rule. This workload is separate from
+the three frozen short tasks.
 The page itself passed a Linux headless-browser check: all 36 confirmations,
 required checkbox behavior, reference hiding after page 1, exact JSON download
 and zero JavaScript errors. The first/final layouts were also visually checked
