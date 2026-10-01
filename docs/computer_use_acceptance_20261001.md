@@ -189,3 +189,28 @@ now exposes `--guided-refresh both`; default `off` preserves reproducibility of
 older measurements. The previous wrong answer remains a failure of that older
 configuration. A fresh live/native qualification of revised sources is pending.
 [Guided diagnostic evidence](computer_use_guided_visual_20261001.json).
+
+
+## Current source-matched baseline and first qualification failure
+
+Bundle 05 contains 21 current application/test source files. Its offline archive
+SHA-256 is `0fe2bb683827902c206ed3574b0918efa54651b735870572eb1579ed4c477610`.
+All 34 native Windows contracts passed with Codex 0.159.2 and Python 3.13.13,
+without skips. The new powered-off snapshot `qw3-edit-20261001` contains executor
+`6678710b...`, the matching fixture/bootstrap and installed client. It rebooted
+paused with an empty output directory. Bundle 04 and prior snapshots remain
+retained. [Preparation and source identities](computer_use_windows_baseline_05_20261001.json).
+
+The supervised unit `qw3-computer-final-qualification-01.service` stopped after
+its first native Notepad task failed in 40.11s. The saved file was 44 bytes;
+the expected 46 bytes include a final CRLF. All nine requested actions completed,
+but the model never requested that last newline and incorrectly claimed success.
+The task definition and byte-exact check remain unchanged. Cleanup paused the
+desktop; no remaining native tasks, restart checks, long pair or replay stages
+started. [Failure evidence](computer_use_native_newline_failure_20261001.json).
+
+General exact-text guidance now requires preserving whitespace and requested
+final newlines, prefers a complete literal block within the tool limit, and
+checks the final caret/line position before saving. This change still requires
+a new native client bundle and real-model qualification. Bundle 05's failure
+and its 34 passing protocol contracts remain separate evidence.

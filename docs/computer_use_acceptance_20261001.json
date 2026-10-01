@@ -1,10 +1,10 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790814637.5677574,
+  "reviewed_at": 1790816196.100065,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
-  "native_client_source_files_match": false,
+  "native_client_source_files_match": true,
   "current_native_matrix": {
     "status": "completed",
     "completed_trials": 18,
@@ -162,6 +162,27 @@
     },
     "input-semantics-promoted-01/identity.json": {
       "sha256": "58af904ef3be8e8b603d6ddc5e92dd8358a32b05111efafb0b9a7c3430b40ce5"
+    },
+    "windows-final-preparation-01/result.json": {
+      "sha256": "45fdf4150b13aa52004112171d54f337845aa39aa621aac2b70136a41a6d37f7"
+    },
+    "windows-final-preparation-01/native-client-tests.json": {
+      "sha256": "969ee15eb07a52cfff7ee4010789621a58a0f2293d9faefe47e4caafcc095341"
+    },
+    "windows-final-preparation-01/native-client-tests.stderr.log": {
+      "sha256": "896e5549592d5907649bb21704967f17ffc12ec8d5fe34eae58880ce06d960e7"
+    },
+    "windows-final-preparation-01-cleanup.json": {
+      "sha256": "c8e50da53cb24ae5ff1d064566721b6c25e5da6fdcb8a325ea2703ec32ff5480"
+    },
+    "windows-native-client-05/manifest.json": {
+      "sha256": "97fb38e3502769b166487ae70e549a300950d0131a5e80ef58a34cd0a318cdd8"
+    },
+    "windows-native-client-05/archive.json": {
+      "sha256": "65c473257143a032d634e03a526079c28b7da004a68b2ba6eed840f410176a99"
+    },
+    "windows/snapshots/qw3-edit-20261001/manifest.json": {
+      "sha256": "a68674e700e9b4e3f5fda4e09b37d6aa34bda49e5a8bfbf07160c8ad3e7e3d7d"
     }
   },
   "remaining": [
@@ -239,7 +260,7 @@
       "cleanup_passed": true
     }
   },
-  "native_client_source_identity_scope": "Bundle 04 matches the frozen baseline; working app/engine repairs are newer and require fresh qualification.",
+  "native_client_source_identity_scope": "Bundle05 has21 matching current bundled source files and passed34 native contracts. Its live18-task requalification is running; frozen bundle04 18/18 evidence remains scoped to old sources.",
   "same_turn_visual": {
     "passed": false,
     "on_positive_answer_wrong": true,
@@ -254,5 +275,17 @@
     "short_seed_checks": 4,
     "report": "docs/computer_use_guided_visual_20261001.json",
     "current_live_profile_qualified": false
+  },
+  "matched_native_client_bundle": "apps/computer_use/.runtime/windows-native-client-05",
+  "native_requalification": {
+    "status": "failed_first_task",
+    "unit": "qw3-computer-final-qualification-01.service",
+    "result": "apps/computer_use/.runtime/final-windows-qualification-01/result.json",
+    "failure_document": "docs/computer_use_native_newline_failure_20261001.json",
+    "attempted_trials": 1,
+    "passed_trials": 0,
+    "required_trials": 18,
+    "later_stages_started": false,
+    "cleanup_paused": true
   }
 }
