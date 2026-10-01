@@ -214,3 +214,48 @@ final newlines, prefers a complete literal block within the tool limit, and
 checks the final caret/line position before saving. This change still requires
 a new native client bundle and real-model qualification. Bundle 05's failure
 and its 34 passing protocol contracts remain separate evidence.
+
+Bundle 06 (`23851fd5...`) passed all 34 native contracts. The clean snapshot
+`qw3-exact-20261001` rebooted paused with no outputs, using unchanged executor
+`6678710b...`. [Preparation identities](computer_use_windows_baseline_06_20261001.json).
+The supervised `qw3-computer-final-qualification-02.service` now runs a fresh
+18-task native matrix (`windows-native-suite-04`), with explicit bundle/snapshot
+arguments. Source commit `7d18e50` and engine `005654a6...` are frozen. It will
+continue to restart, live-long and fixed-input stages only after the core
+matrix passes. Its 3-hour service cap does not change individual task deadlines.
+No live qualification is claimed from preparation or a running service.
+
+The first on-policy repetition passed all three tasks: Notepad38.13s,
+browser42.77s and cross-app58.98s. The Notepad output has the exact46 bytes,
+including the requested final CRLF; the UI shows the caret atLn3 Col1.
+Cross-app evidence contains actual CTRL+C/CTRL+V and the exact22-byte reference.
+All31 actions across the three tasks completed, without rejected or unresolved
+delivery. These are partial progress observations, not an18-trial pass or a
+KVMem on/off performance conclusion.
+[First-round progress evidence](computer_use_windows_native_04_progress_20261001.json).
+
+## Request phase accounting
+
+The offline analyzer `scripts/computer_use_phase_report.py` validates additive
+server/native timers, serialized request IDs and bridge token counts. Nine
+focused tests passed, including crossed IDs, bad tags/tokens, invalid durations,
+parent/child timing consistency and cancellation evidence. Retained logs passed
+for the new native pilot's10 requests, archive pair04's123 requests, and two old
+cold replay requests with nested query-selection/replay timing. All82 archive-on
+requests have matching trace tags. Dense mode omits native tags, so its40 completed
+requests correlate by serial order plus token counts; the41st cancelled request
+retains missing native/terminal timing. That weaker attribution is explicit.
+The task timeout remains a timeout. These offline checks do not alter the live
+queue or create new task passes. [Analysis identities and scopes](computer_use_phase_accounting_20261001.json)
+and [per-request phases](computer_use_windows_long_phases_20261001.csv).
+
+Server validation time includes image preparation and is not a pure vision
+encoding timer. A standalone frontend measurement using the existing GPU vision
+parity executable remains pending until the frozen GPU queue finishes. Native
+phases are nested within server engine time, and query-replay events are nested
+again; do not add them as independent cost. Component medians need not sum.
+
+The offline analyzer, its tests and evidence documents may be committed while
+the queue runs. They do not change the frozen application files, guest bundle,
+snapshot, model assets or engine binary. Trial Git HEAD values may therefore
+differ; content hashes remain the tested identities.

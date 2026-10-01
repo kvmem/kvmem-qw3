@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790816196.100065,
+  "reviewed_at": 1790817872.9536886,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
@@ -187,7 +187,7 @@
   },
   "remaining": [
     "Qualify explicit guided-refresh live profile and final native sources. Four same-turn visual long checks passed with guided both; original guided-off failure retained. Paired baseline live comparison complete (on passed, off timed out).",
-    "Requalify revised native-edit executor and current client in a new matching clean snapshot. Focused control, typing, clipboard, and actual dispatch-death probes passed; original failures preserved.",
+    "Complete the18-task native matrix and on/off native restart checks for bundle06 on its matching clean snapshot; retain suite03 newline failure. Native-edit execution and dispatch-death probes already passed.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
   ],
@@ -216,7 +216,7 @@
     "source": "apps/computer_use/vm/executor.ps1",
     "promoted_native_semantics_passed": true
   },
-  "source_identity_note": "Native 18/18 and paired long-run baseline use app source 53cd0bf and engine e14b4298. Subsequent candidate engine/app repairs require fresh qualification; old results do not certify modified sources.",
+  "source_identity_note": "Frozen native suite02 (18/18) uses old bundle04, executor b5e4 and engine e14b. Archive pair04 uses repaired engine005654 with old executor b5e4 and guided refresh off; on passed and off timed out. Neither certifies the revised bundle06/executor6678/guided-both combination.",
   "live_archive": {
     "status": "both_policies_failed_deadline",
     "paired_deadline_seconds": 900,
@@ -260,7 +260,7 @@
       "cleanup_passed": true
     }
   },
-  "native_client_source_identity_scope": "Bundle05 has21 matching current bundled source files and passed34 native contracts. Its live18-task requalification is running; frozen bundle04 18/18 evidence remains scoped to old sources.",
+  "native_client_source_identity_scope": "Bundle06 contains21 matching bundled source files and passed34 native contracts. Its first on-policy repetition passed all three real Windows tasks; the frozen18-trial queue remains active. Bundle05 first-task newline failure remains retained; bundle04 old18/18 results have their original scope.",
   "same_turn_visual": {
     "passed": false,
     "on_positive_answer_wrong": true,
@@ -276,16 +276,30 @@
     "report": "docs/computer_use_guided_visual_20261001.json",
     "current_live_profile_qualified": false
   },
-  "matched_native_client_bundle": "apps/computer_use/.runtime/windows-native-client-05",
+  "matched_native_client_bundle": "apps/computer_use/.runtime/windows-native-client-06",
   "native_requalification": {
-    "status": "failed_first_task",
-    "unit": "qw3-computer-final-qualification-01.service",
-    "result": "apps/computer_use/.runtime/final-windows-qualification-01/result.json",
-    "failure_document": "docs/computer_use_native_newline_failure_20261001.json",
-    "attempted_trials": 1,
-    "passed_trials": 0,
+    "status": "running",
+    "unit": "qw3-computer-final-qualification-02.service",
+    "result": "apps/computer_use/.runtime/final-windows-qualification-02/result.json",
+    "matrix": "apps/computer_use/.runtime/windows-native-suite-04",
     "required_trials": 18,
-    "later_stages_started": false,
-    "cleanup_paused": true
+    "snapshot": "qw3-exact-20261001",
+    "bundle_sha256": "23851fd5c83e8b4e70a2595fcf46d3f1c7f1f600e1ff140a3ade8b2ad69c08f4",
+    "prior_failure_document": "docs/computer_use_native_newline_failure_20261001.json",
+    "observed_at": 1790817872.9536796,
+    "completed_trials": 7,
+    "passed_trials": 7,
+    "first_round_progress_document": "docs/computer_use_windows_native_04_progress_20261001.json",
+    "source_identity_note": "Application files, model assets and engine remain frozen at the recorded hashes. Independent offline analysis/tests and documentation commits may change Git HEAD during the queue."
+  },
+  "phase_accounting": {
+    "document": "docs/computer_use_phase_accounting_20261001.json",
+    "csv": "docs/computer_use_windows_long_phases_20261001.csv",
+    "consistency_audit_passed": true,
+    "native_pilot_requests": 10,
+    "archive_requests": 123,
+    "archive_complete_native_timings": 122,
+    "archive_cancelled_without_native_terminal": 1,
+    "pure_vision_encoding_time_measured": false
   }
 }
