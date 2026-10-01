@@ -578,3 +578,51 @@ exposed to Computer MCP. Provisioning and the fault test use unique shared
 script/request/result paths so rapid calls cannot accept an earlier SMB-cached
 result. Production uncertain actions still require the user to inspect the
 screen and explicitly reconcile them before continuing.
+
+## Windows OSWorld campaign preparation
+
+The ten-scenario plan and live preparation status are recorded in
+`docs/computer_use_windows_execution_optimization_20261001.md` and
+`docs/computer_use_windows_execution_progress_20261001.json`. Formal on/off
+runs require qualified task initializers, graders, and a new frozen snapshot;
+the earlier Notepad/browser suite is separate evidence.
+
+The desktop schema now includes fixed launch targets for LibreOffice
+Writer/Calc/Impress, Thunderbird, GIMP, and the pinned WPS Spreadsheets binary.
+It exposes 73 fixed keyboard actions and bounded 100–2000 ms drag actions with
+an optional Shift, Ctrl, or Alt modifier. A drag releases held input on error;
+a durable marker also releases it after executor process death. The original
+action stays uncertain and cannot be replayed. `windows_office_controls.py`
+and `windows_drag_interruption.py` qualify these contracts in the real VM.
+
+`vm/osworld-web.compose.yml` runs task-owned FormCraft, TeamChat, CloudCRM,
+Calendar, and MailHub services from the pinned OSWorld-web source. Browser
+access uses synthetic `.qw3.test` hostnames, a loopback/VM-private gateway, and
+normal application APIs. Full-state/management endpoints are restricted to
+the host's separate loopback ports. Set `QW3_WINDOWS_BRIDGE_IP` to the verified
+VM bridge gateway; clear uppercase and lowercase HTTP/HTTPS/ALL_PROXY variables
+when building or downloading. The shared frontend recipe disables npm audit
+and funding network requests while retaining package-lock verification.
+
+`osworld_windows/` contains host-only setup and grading code. It is deliberately
+excluded from the native client bundle. Task 013 preparation hashes the pinned
+PDF, initializes a fresh private form identity, and stages only public task
+materials in Windows. Its grader preserves the upstream best-whole-solution
+field score and separately requires actual submission and an unchanged form
+for strict success. `qualify013` checks positive/negative outcomes against the
+upstream comparator; `qualify013_gui` records a known-answer GUI submission.
+These checks are not model results. Never give the agent evaluator fixtures,
+expected answers, or host state-management interfaces.
+
+`task_driver.py` records one native application task until completion, failure,
+pause, budget exhaustion, or deadline. It does not grade the answer or resume
+uncertain input. Ordinary terminal outcomes can advance a campaign only after
+the desktop is stopped; infrastructure errors stop the queue. Full campaign
+scheduling, scene restoration, and independent grading remain separate host
+responsibilities.
+
+`probe_compaction.py` exercises the real pinned Codex/bridge control plane with
+scripted token usage. At the 950K threshold, the observed compaction request
+includes the prior image and the following request contains the text summary
+without that image. Both policies must use this same history behavior and
+record compaction events. This probe is not a 950K-token GPU inference test.

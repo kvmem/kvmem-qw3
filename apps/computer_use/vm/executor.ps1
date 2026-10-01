@@ -20,6 +20,8 @@ public static class DesktopNative {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, UIntPtr extra);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [StructLayout(LayoutKind.Sequential)] public struct WindowRect { public int left, top, right, bottom; }
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out WindowRect rect);
@@ -211,20 +213,58 @@ $script:latest = $null
 $script:paused = $true
 $script:noProgress = 0
 $script:lastSignature = ''
-$allowedApps = @('explorer','msedge','notepad','ApplicationFrameHost','StartMenuExperienceHost','SearchHost','ShellExperienceHost')
+$allowedApps = @('explorer','msedge','notepad','ApplicationFrameHost','StartMenuExperienceHost','SearchHost','ShellExperienceHost',
+    'soffice','soffice.bin','thunderbird','gimp-3','et','wps')
+$officeApps = @{
+    'writer'=@{path='C:\Program Files\LibreOffice\program\soffice.exe'; arguments=@('--writer')}
+    'calc'=@{path='C:\Program Files\LibreOffice\program\soffice.exe'; arguments=@('--calc')}
+    'impress'=@{path='C:\Program Files\LibreOffice\program\soffice.exe'; arguments=@('--impress')}
+    'thunderbird'=@{path='C:\Program Files\Mozilla Thunderbird\thunderbird.exe'; arguments=@()}
+    'gimp'=@{path='C:\Program Files\GIMP 3\bin\gimp-3.exe'; arguments=@()}
+    'wps_spreadsheets'=@{path="$env:LOCALAPPDATA\Kingsoft\WPS Office\12.1.0.28485\office6\et.exe"; arguments=@()}
+}
 $keyMap = @{
     'ENTER'='{ENTER}'; 'TAB'='{TAB}'; 'SHIFT+TAB'='+{TAB}'; 'ESC'='{ESC}';
     'BACKSPACE'='{BACKSPACE}'; 'DELETE'='{DELETE}'; 'UP'='{UP}'; 'DOWN'='{DOWN}';
     'LEFT'='{LEFT}'; 'RIGHT'='{RIGHT}'; 'HOME'='{HOME}'; 'END'='{END}';
     'CTRL+A'='^a'; 'CTRL+C'='^c'; 'CTRL+V'='^v'; 'CTRL+X'='^x';
     'CTRL+S'='^s'; 'CTRL+SHIFT+S'='^+s'; 'CTRL+N'='^n'; 'CTRL+O'='^o';
-    'CTRL+L'='^l'; 'CTRL+W'='^w'; 'CTRL+Z'='^z'; 'ALT+TAB'='%{TAB}'; 'ALT+F4'='%{F4}'
+    'CTRL+L'='^l'; 'CTRL+W'='^w'; 'CTRL+Z'='^z'; 'ALT+TAB'='%{TAB}'; 'ALT+F4'='%{F4}';
+    'SPACE'=' '; 'PAGEUP'='{PGUP}'; 'PAGEDOWN'='{PGDN}';
+    'SHIFT+UP'='+{UP}'; 'SHIFT+DOWN'='+{DOWN}'; 'SHIFT+LEFT'='+{LEFT}'; 'SHIFT+RIGHT'='+{RIGHT}';
+    'SHIFT+HOME'='+{HOME}'; 'SHIFT+END'='+{END}';
+    'CTRL+HOME'='^{HOME}'; 'CTRL+END'='^{END}'; 'CTRL+SHIFT+HOME'='^+{HOME}'; 'CTRL+SHIFT+END'='^+{END}';
+    'CTRL+UP'='^{UP}'; 'CTRL+DOWN'='^{DOWN}'; 'CTRL+LEFT'='^{LEFT}'; 'CTRL+RIGHT'='^{RIGHT}';
+    'CTRL+PAGEUP'='^{PGUP}'; 'CTRL+PAGEDOWN'='^{PGDN}'; 'CTRL+TAB'='^{TAB}'; 'CTRL+SHIFT+TAB'='^+{TAB}';
+    'CTRL+SHIFT+N'='^+n'; 'CTRL+SHIFT+O'='^+o'; 'CTRL+Y'='^y'; 'CTRL+SHIFT+Z'='^+z';
+    'CTRL+F'='^f'; 'CTRL+H'='^h'; 'CTRL+B'='^b'; 'CTRL+I'='^i'; 'CTRL+U'='^u'; 'CTRL+P'='^p';
+    'CTRL+1'='^1'; 'CTRL+0'='^0'; 'F2'='{F2}'; 'F4'='{F4}'; 'F5'='{F5}'; 'F6'='{F6}'; 'F11'='{F11}'; 'F12'='{F12}';
+    'M'='m'; 'R'='r'; 'S'='s'; 'T'='t'; 'V'='v'; 'Z'='z'; 'SHIFT+R'='+r'; 'SHIFT+T'='+t'; 'SHIFT+M'='+m'
 }
 
 function Save-Json($Path, $Value) {
     $temp = "$Path.tmp"
     [IO.File]::WriteAllText($temp, ($Value | ConvertTo-Json -Depth 16 -Compress), [Text.UTF8Encoding]::new($false))
     Move-Item -Force $temp $Path
+}
+$heldInputFile = Join-Path $root 'held-drag-input.json'
+function Release-DragInput([int]$Modifier) {
+    [DesktopNative]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
+    if ($Modifier) { [DesktopNative]::keybd_event($Modifier,0,2,[UIntPtr]::Zero) }
+}
+# A process kill bypasses finally. The durable marker is written before any
+# button/key down; restart releases only this executor's recorded drag input.
+# Its action stays uncertain in the ledger and is never dispatched again.
+if (Test-Path -LiteralPath $heldInputFile) {
+    $held = Get-Content -LiteralPath $heldInputFile -Raw | ConvertFrom-Json
+    if ($held.action_id -notmatch '^[a-zA-Z0-9_-]{8,80}$' -or
+        $held.modifier -notin @(0,16,17,18)) { throw 'Invalid held input recovery record' }
+    Release-DragInput $held.modifier
+    Save-Json (Join-Path $root ('input-recovery-' + [guid]::NewGuid().ToString() + '.json')) @{
+        action_id=$held.action_id; modifier=$held.modifier; released_at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        reason='executor_restart'; original_delivery='uncertain'
+    }
+    Remove-Item -LiteralPath $heldInputFile
 }
 function Hash-Bytes([byte[]]$Bytes) {
     $hash = [Security.Cryptography.SHA256]::Create()
@@ -300,6 +340,18 @@ function Validate-Action($Action, $Observation) {
             Require ($Action.clicks -in @(1,2)) 'Only one or two clicks are supported'
         }
         'type' { Properties $Action @('kind','text'); Require ($Action.text -is [string] -and $Action.text.Length -ge 1 -and $Action.text.Length -le 4096) 'Text must contain 1..4096 characters' }
+        'drag' {
+            Properties $Action @('kind','from_x','from_y','to_x','to_y','duration_ms','modifier')
+            foreach ($name in @('from_x','from_y','to_x','to_y','duration_ms')) {
+                Require ($Action.$name -is [int] -or $Action.$name -is [long]) 'Drag coordinates and duration must be integers'
+            }
+            Require ($Action.from_x -ge 0 -and $Action.from_x -lt $Observation.width -and
+                $Action.to_x -ge 0 -and $Action.to_x -lt $Observation.width -and
+                $Action.from_y -ge 0 -and $Action.from_y -lt $Observation.height -and
+                $Action.to_y -ge 0 -and $Action.to_y -lt $Observation.height) 'Drag coordinates outside screenshot'
+            Require ($Action.duration_ms -ge 100 -and $Action.duration_ms -le 2000) 'Drag duration must be 100..2000 ms'
+            Require ($Action.modifier -in @('none','SHIFT','CTRL','ALT')) 'Unsupported drag modifier'
+        }
         'key' { Properties $Action @('kind','key'); Require ($keyMap.ContainsKey([string]$Action.key)) 'Unsupported key chord' }
         'scroll' {
             Properties $Action @('kind','direction','steps','x','y')
@@ -308,7 +360,13 @@ function Validate-Action($Action, $Observation) {
             Require (($Action.x -is [int] -or $Action.x -is [long]) -and ($Action.y -is [int] -or $Action.y -is [long])) 'Scroll coordinates must be integers'
             Require ($Action.x -ge 0 -and $Action.x -lt $Observation.width -and $Action.y -ge 0 -and $Action.y -lt $Observation.height) 'Scroll coordinates outside screenshot'
         }
-        'open_app' { Properties $Action @('kind','app'); Require ($Action.app -in @('notepad','edge','explorer')) 'Application is outside the allowed scope' }
+        'open_app' {
+            Properties $Action @('kind','app')
+            Require ($Action.app -in @('notepad','edge','explorer') -or $officeApps.ContainsKey([string]$Action.app)) 'Application is outside the allowed scope'
+            if ($officeApps.ContainsKey([string]$Action.app)) {
+                Require (Test-Path -LiteralPath $officeApps[$Action.app].path -PathType Leaf) 'Requested office application is not installed'
+            }
+        }
         default { throw 'Unsupported action kind' }
     }
 }
@@ -333,6 +391,11 @@ function Act($Request) {
     Require ($front.handle -eq $before.foreground.handle) 'Foreground window changed; observe again'
     if ($Request.action.kind -ne 'open_app') { Require ($front.process -in $allowedApps) 'Foreground application is outside the allowed scope' }
     if ($Request.action.kind -eq 'type') { [DesktopNative]::ValidateText($Request.action.text) }
+    if ($Request.action.kind -eq 'drag') {
+        foreach ($key in @(1,16,17,18)) {
+            Require (([DesktopNative]::GetAsyncKeyState($key) -band 0x8000) -eq 0) 'Release held mouse/modifier input before dragging'
+        }
+    }
     $record = @{ signature=$signature; status='dispatching'; request=$Request; dispatched_at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
     Save-Json $path $record
     # From this durable point onward, errors imply uncertain delivery. Never
@@ -351,6 +414,30 @@ function Act($Request) {
                 }
             }
             'type' { [DesktopNative]::TypeText($a.text) }
+            'drag' {
+                $modifier = @{none=0; SHIFT=16; CTRL=17; ALT=18}[$a.modifier]
+                Save-Json $heldInputFile @{action_id=$Request.action_id; modifier=$modifier}
+                [DesktopNative]::SetCursorPos($a.from_x,$a.from_y) | Out-Null
+                try {
+                    if ($modifier) { [DesktopNative]::keybd_event($modifier,0,0,[UIntPtr]::Zero) }
+                    [DesktopNative]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
+                    $steps = [Math]::Max(5, [Math]::Ceiling($a.duration_ms / 20.0))
+                    for ($step=1; $step -le $steps; $step++) {
+                        # Losing foreground during a drag makes delivery uncertain;
+                        # always release held input, then let the ledger pause it.
+                        if ([DesktopNative]::GetForegroundWindow().ToInt64() -ne $front.handle) {
+                            throw 'Foreground changed during drag'
+                        }
+                        Start-Sleep -Milliseconds ([int][Math]::Ceiling($a.duration_ms / $steps))
+                        $x = [int][Math]::Round($a.from_x + ($a.to_x - $a.from_x) * $step / $steps)
+                        $y = [int][Math]::Round($a.from_y + ($a.to_y - $a.from_y) * $step / $steps)
+                        [DesktopNative]::SetCursorPos($x,$y) | Out-Null
+                    }
+                } finally {
+                    Release-DragInput $modifier
+                    Remove-Item -LiteralPath $heldInputFile
+                }
+            }
             'key' { [Windows.Forms.SendKeys]::SendWait($keyMap[$a.key]) }
             'scroll' {
                 [DesktopNative]::SetCursorPos($a.x,$a.y) | Out-Null
@@ -362,6 +449,11 @@ function Act($Request) {
                 Start-Sleep -Milliseconds 600
             }
             'open_app' {
+                if ($officeApps.ContainsKey([string]$a.app)) {
+                    $launch = $officeApps[$a.app]
+                    if ($launch.arguments.Count) { Start-Process -FilePath $launch.path -ArgumentList $launch.arguments }
+                    else { Start-Process -FilePath $launch.path }
+                }
                 switch ($a.app) {
                     'notepad' { Start-Process notepad.exe }
                     'explorer' { Start-Process explorer.exe $outputs }

@@ -1,24 +1,25 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-01T14:20:41.874379+00:00",
+  "updated_at": "2026-10-01T15:26:07.776854+00:00",
   "goal_status": "active",
-  "phase": "P0",
+  "phase": "P0 platform qualification and P1 task 013 preparation",
   "formal_runs_completed": 0,
   "v0_frozen": false,
   "client": {
-    "host_tests_passed": 40,
-    "windows_tests_passed": 40,
+    "host_tests_passed": 47,
+    "windows_tests_passed": 47,
     "qualification": {
       "kind": "windows_native_client_contract_tests",
-      "finished": "2026-10-01T14:05:21.2057929-07:00",
-      "directory": "C:\\Qw3Computer\\clients\\bb04686b5f33",
-      "started": "2026-10-01T14:04:52.0908505-07:00",
+      "finished": "2026-10-01T15:20:08.9732783-07:00",
+      "directory": "C:\\Qw3Computer\\clients\\b5ad6f60c2ac",
+      "started": "2026-10-01T15:19:37.7804230-07:00",
       "python": "Python 3.13.13",
-      "bundle_sha256": "bb04686b5f33589662ae6799fb642219b1caf08aa28963870b794e5dab4656e2",
+      "bundle_sha256": "b5ad6f60c2acf0b8086192f83398b120caffc73430c69ea6a2c837fc200011c8",
       "passed": true,
       "codex": "codex-cli 0.159.2",
       "process_exit_code": 0
-    }
+    },
+    "host_tests_evidence": "apps/computer_use/.runtime/osworld-platform-host-tests-10.log"
   },
   "office_install": {
     "passed": true,
@@ -73,25 +74,45 @@
     "repo": "https://github.com/Task-Web/OSWorld-web",
     "tag": "v2026.08.08",
     "commit": "90ec2218f7747b15fe5117cdbe59b8978446ab9c",
-    "deployed": false
+    "deployed": true,
+    "sites": [
+      "formcraft",
+      "teamchat",
+      "cloudcrm",
+      "calendar",
+      "mailhub"
+    ],
+    "guest_http_verified": true,
+    "browser_rendered_sites": [
+      "formcraft"
+    ],
+    "image_manifest": "apps/computer_use/.runtime/osworld-web-images-02.json",
+    "gateway_boundary_evidence": "apps/computer_use/.runtime/osworld-sites-host-connectivity-02.json"
   },
   "source_sha256": {
     "apps/computer_use/qw3_computer/app.py": "db8e902c87bf6243ac43af50bcc0116faeb2c142908a5e6893874985ddcf5a9f",
     "apps/computer_use/tests/test_controller.py": "cef2776828d36a4c7c23ab33ee5e9dfbeb6692feb524128783b504d47abe911a",
-    "apps/computer_use/pack_windows_client.py": "54c92672389025fbea194fed3274b638483ea7f4bb2bd6a256b81b3f81bc6a93",
+    "apps/computer_use/pack_windows_client.py": "181c943425740a7285127374bde84a2d80ac60e893db5e06bb026cb5105630d4",
     "apps/computer_use/vm/record_console.py": "27d092a9d7215a7dc6727e1fe5428b8b7cca058509457f60827eb139f3d7d821",
     "apps/computer_use/vm/qualify_recording.py": "2213c764dfb70a1dee8fe89d97a77c1d09292c487ce4ab4c9587087f0d079e17",
     "apps/computer_use/vm/vnc_admin.py": "8ecafde699aef14c519c28dd9a6cc6bebfef5cc1d43d6c2e9ddff72077354921",
-    "apps/computer_use/vm/install_osworld_graphics_wps.ps1": "6d289dfdf757de91c7006ee4c7ac3803c97f2f4ca955ea67428c3a990a7aa00e"
+    "apps/computer_use/vm/install_osworld_graphics_wps.ps1": "6d289dfdf757de91c7006ee4c7ac3803c97f2f4ca955ea67428c3a990a7aa00e",
+    "apps/computer_use/qw3_computer/tool_schema.py": "e14eb6891a0262453d789f5c41c06e54bc0500cdf2bed2fb1c1a475b8cb289fe",
+    "apps/computer_use/vm/executor.ps1": "43a615ba64e23f49bebd94c63662db278b42f8c301980fe85a8d57b6b3c9f3e1",
+    "apps/computer_use/task_driver.py": "1ad798fbf7bf253197ae96fe5aec4d0e82488350c4a1e338426a9e276f9ffddf",
+    "apps/computer_use/tests/test_task_driver.py": "ae5f8abadbfd5198325b855c318e7016e4fdabc7f1cfb54d890c653c5afbe8a3",
+    "apps/computer_use/probe_compaction.py": "a38ba82434b553a4cc22a0b4c94d97f69797a1ee99d0fda8c1e3e816dee05abd",
+    "apps/computer_use/vm/test_drag_interruption.ps1": "48d7fdc451ea52f413a44f8d3408fe256e7d09cef8e2c3226c1af6a0783f581d",
+    "apps/computer_use/windows_drag_interruption.py": "79665defa3cc81cb0ab55a993a72588b215764b605295b6e6db6673f423f7dc4",
+    "apps/computer_use/windows_office_controls.py": "bb0430b80ece026a1298478ae7e9b8a8c14b8e013c572ba67128adac61458b39"
   },
   "pending": [
-    "WPS installer terminal result and all four office apps first-run verification",
-    "allowlisted office app launches, bounded drag and keyboard actions",
-    "long context policy qualification",
-    "continue-on-task-failure scheduler",
-    "private site deployment",
-    "ten initializers and independent graders",
-    "new qualified frozen snapshot",
+    "office task-specific profile/first-run readiness (Writer, Calc, Impress, Thunderbird)",
+    "wire terminal driver into continue-on-task-failure native campaign scheduler",
+    "qualify the remaining nine initializers and independent graders; complete 013 reset/snapshot validation",
+    "validate non-FormCraft site rendering and per-attempt state reset",
+    "full-duration recording overhead and clock alignment",
+    "new qualified frozen snapshot and V0 configuration",
     "20 baseline runs and evidence-based optimization"
   ],
   "last_qualified_platform_commit": "e2f9f78",
@@ -217,9 +238,342 @@
     "terminal_result_available": true
   },
   "evidence_paths": {
-    "native_client": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-07.json",
+    "native_client": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-09.json",
     "recording": "apps/computer_use/.runtime/windows-osworld-recording-probe-02",
     "installers": "apps/computer_use/.runtime/windows/shared/osworld-installers-01",
     "inventory": "apps/computer_use/.runtime/windows/shared/osworld-app-inventory-02.json"
-  }
+  },
+  "office_artifact_qualification": {
+    "gimp": {
+      "width": 320,
+      "height": 240,
+      "rgb": true,
+      "sha256": "737a101d2f50c6589c3a88e3d85cd1074818bed992faa6d08b7cdff2930afa8e"
+    },
+    "wps": {
+      "formula": "=1+2",
+      "cached_value": 3,
+      "text": "local-wps-ok",
+      "sha256": "094105b50ece7ca47e8ac9e932c5d7cdd9f66ba5e1cdca8a91e792db06076820"
+    },
+    "passed": true
+  },
+  "office_input_contract": {
+    "kind": "windows_office_input_contracts",
+    "passed": true,
+    "run": "02",
+    "rejected": [
+      "Drag coordinates outside screenshot",
+      "Drag coordinates outside screenshot",
+      "Drag duration must be 100..2000 ms",
+      "Drag duration must be 100..2000 ms",
+      "Drag coordinates and duration must be integers",
+      "Unsupported drag modifier",
+      "Unexpected action property: extra",
+      "Application is outside the allowed scope",
+      "Unsupported key chord"
+    ],
+    "verified_drags": 4,
+    "verified_rejections": 9,
+    "keyboard_result": "alpha beta gamma alpha beta gamma",
+    "executor_sha256": "43a615ba64e23f49bebd94c63662db278b42f8c301980fe85a8d57b6b3c9f3e1"
+  },
+  "drag_kill_contract": {
+    "kind": "windows_drag_interruption_contract",
+    "mode": "kill",
+    "passed": true,
+    "delivery_error": "Desktop unavailable: ServerDisconnectedError",
+    "guest": {
+      "mode": "kill",
+      "action_id": "drag-fault-d096537649dc4b6d886183c09c855865",
+      "kind": "real_drag_interruption",
+      "recovery": [
+        {
+          "action_id": "drag-fault-d096537649dc4b6d886183c09c855865",
+          "reason": "executor_restart",
+          "modifier": 18,
+          "released_at": 1790891888706,
+          "original_delivery": "uncertain"
+        }
+      ],
+      "passed": true,
+      "after": [
+        {
+          "key": 1,
+          "down": false
+        },
+        {
+          "key": 16,
+          "down": false
+        },
+        {
+          "key": 17,
+          "down": false
+        },
+        {
+          "key": 18,
+          "down": false
+        }
+      ],
+      "before": [
+        {
+          "key": 1,
+          "down": true
+        },
+        {
+          "key": 16,
+          "down": false
+        },
+        {
+          "key": 17,
+          "down": false
+        },
+        {
+          "key": 18,
+          "down": true
+        }
+      ],
+      "old_executor_pid": 13036,
+      "record": {
+        "status": "dispatching",
+        "signature": "e73edb09ac1f030f8d3b2827bd89e68133361ba88e3385137e3fbfb700638ef8",
+        "dispatched_at": 1790891882037,
+        "request": {
+          "desktop_id": "5dac0a09-2af8-4d62-b21a-2bcc9d247ca3",
+          "observation_id": "64fec039-0b5f-4611-94ab-62682ae6273f",
+          "action_id": "drag-fault-d096537649dc4b6d886183c09c855865",
+          "action": {
+            "kind": "drag",
+            "from_x": 260,
+            "from_y": 267,
+            "to_x": 560,
+            "to_y": 267,
+            "modifier": "ALT",
+            "duration_ms": 2000
+          }
+        }
+      }
+    },
+    "duplicate_rejection": "Previous delivery is uncertain; observe and reconcile before using a new action_id",
+    "health": {
+      "desktop_id": "5dac0a09-2af8-4d62-b21a-2bcc9d247ca3",
+      "version": "0.1.0",
+      "platform": "windows",
+      "paused": true,
+      "process_id": 10428
+    },
+    "receipt_status": "dispatching",
+    "action_id": "drag-fault-d096537649dc4b6d886183c09c855865"
+  },
+  "drag_focus_contract": {
+    "qualified": true,
+    "result": {
+      "kind": "windows_drag_interruption_contract",
+      "mode": "focus",
+      "passed": true,
+      "worker_sha256": "48d7fdc451ea52f413a44f8d3408fe256e7d09cef8e2c3226c1af6a0783f581d",
+      "delivery_error": "Action delivery is uncertain; desktop paused. Foreground changed during drag",
+      "guest": {
+        "focus_injected": true,
+        "record": {
+          "status": "uncertain",
+          "signature": "1e39cce118dbdab6e3b12be5a5982d66253ab7548e234ba2da9e5d93f8df44e1",
+          "dispatched_at": 1790893522656,
+          "request": {
+            "desktop_id": "5dac0a09-2af8-4d62-b21a-2bcc9d247ca3",
+            "observation_id": "3a4d67c5-1d3b-4847-8514-683a63622318",
+            "action_id": "drag-fault-d03f84dd471648e5865769f29341761f",
+            "action": {
+              "kind": "drag",
+              "from_x": 260,
+              "from_y": 267,
+              "to_x": 560,
+              "to_y": 267,
+              "modifier": "ALT",
+              "duration_ms": 2000
+            }
+          },
+          "error": "Foreground changed during drag"
+        },
+        "action_id": "drag-fault-d03f84dd471648e5865769f29341761f",
+        "foreground_before": 853672,
+        "fault_kind": "foreground_input_queue_attachment",
+        "after": [
+          {
+            "key": 1,
+            "down": false
+          },
+          {
+            "key": 16,
+            "down": false
+          },
+          {
+            "key": 17,
+            "down": false
+          },
+          {
+            "key": 18,
+            "down": false
+          }
+        ],
+        "before": [
+          {
+            "key": 1,
+            "down": true
+          },
+          {
+            "key": 16,
+            "down": false
+          },
+          {
+            "key": 17,
+            "down": false
+          },
+          {
+            "key": 18,
+            "down": true
+          }
+        ],
+        "mode": "focus",
+        "old_executor_pid": 10428,
+        "kind": "real_drag_interruption",
+        "held_marker_removed": true,
+        "input_queues_attached": true,
+        "passed": true,
+        "foreground_after": 329550
+      },
+      "duplicate_rejection": "Previous delivery is uncertain; observe and reconcile before using a new action_id",
+      "health": {
+        "desktop_id": "5dac0a09-2af8-4d62-b21a-2bcc9d247ca3",
+        "version": "0.1.0",
+        "platform": "windows",
+        "paused": true,
+        "process_id": 10428
+      },
+      "receipt_status": "uncertain",
+      "action_id": "drag-fault-d03f84dd471648e5865769f29341761f"
+    },
+    "method": "foreground input queue attachment; requires the executor foreground-change receipt and removed held-input marker",
+    "qualification_limit": "Normal and process-kill probes separately establish held-input release; this probe establishes the foreground-error cleanup path.",
+    "preserved_unqualified_attempts": [
+      "apps/computer_use/.runtime/windows-drag-focus-01",
+      "apps/computer_use/.runtime/windows-drag-focus-02",
+      "apps/computer_use/.runtime/windows-drag-focus-03",
+      "apps/computer_use/.runtime/windows-drag-focus-04",
+      "apps/computer_use/.runtime/windows-drag-focus-05",
+      "apps/computer_use/.runtime/windows-drag-focus-06",
+      "apps/computer_use/.runtime/windows-drag-focus-07"
+    ]
+  },
+  "compaction_control": {
+    "kind": "scripted_context_boundary_control_plane",
+    "real_long_context_inference": false,
+    "simulated_input_usage": 950100,
+    "passed": true,
+    "turn": {
+      "id": "01a0f97f-8fda-71c1-b600-3af0ea895624",
+      "items": [
+        {
+          "type": "agentMessage",
+          "id": "msg_6fa6fb8a54604c2a9f3e71bb9889e10a",
+          "text": "The fixture observation was received. The diagnostic is complete; no desktop action was performed.",
+          "phase": null,
+          "memoryCitation": null,
+          "delivery": null,
+          "questions": null
+        }
+      ],
+      "itemsView": "summary",
+      "status": "completed",
+      "error": null,
+      "startedAt": 1790892281,
+      "completedAt": 1790892282,
+      "durationMs": 569
+    },
+    "request_count": 3,
+    "compaction_events": [
+      {
+        "method": "item/started",
+        "params": {
+          "item": {
+            "type": "contextCompaction",
+            "id": "01a0f97f-90fb-73e1-a7df-4c414b62c93c"
+          },
+          "threadId": "01a0f97f-8fc3-7383-8ad1-0970ed2a4061",
+          "turnId": "01a0f97f-8fda-71c1-b600-3af0ea895624",
+          "startedAtMs": 1790892282107
+        },
+        "emittedAtMs": 1790892282107
+      },
+      {
+        "method": "item/completed",
+        "params": {
+          "item": {
+            "type": "contextCompaction",
+            "id": "01a0f97f-90fb-73e1-a7df-4c414b62c93c"
+          },
+          "threadId": "01a0f97f-8fc3-7383-8ad1-0970ed2a4061",
+          "turnId": "01a0f97f-8fda-71c1-b600-3af0ea895624",
+          "completedAtMs": 1790892282255
+        },
+        "emittedAtMs": 1790892282275
+      }
+    ],
+    "completed_compactions": 1,
+    "request_images": [
+      0,
+      1,
+      0
+    ],
+    "request_tool_counts": [
+      5,
+      0,
+      5
+    ],
+    "qualification_limit": "Scripted usage through real Windows Codex and bridge; not long-context GPU performance or answer-quality evidence."
+  },
+  "task_preparation": {
+    "013": {
+      "grader_cases_passed": 50,
+      "upstream_comparator_equivalence": true,
+      "gui_qualification": {
+        "kind": "task013_known_answer_gui_qualification",
+        "model_used": false,
+        "formal_run": false,
+        "passed": true,
+        "grade": {
+          "task": "013",
+          "source_sha256": "75ea95a35b3cba2e98ad1e95dbaf883bcb1408f09201927a376804a62a94a1d6",
+          "original_compatible_score": 1.0,
+          "strict_success": true,
+          "fields_correct": 8,
+          "fields_total": 8,
+          "best_solution_index": 0,
+          "field_checks": {
+            "first_prize": true,
+            "first_prize_amount": true,
+            "second_prize": true,
+            "second_prize_amount": true,
+            "third_prize": true,
+            "third_prize_amount": true,
+            "participation_prize": true,
+            "participation_prize_amount": true
+          },
+          "submitted": true,
+          "form_unchanged": true,
+          "adaptation": "Windows Edge; upstream field score plus explicit submission and unchanged-form checks"
+        },
+        "recorder_exit_code": 0,
+        "recording_complete": true,
+        "elapsed_seconds": 47.58916119998321
+      },
+      "recording": "apps/computer_use/.runtime/osworld-013-gui-01/video/screen.mp4",
+      "model_test_completed": false,
+      "snapshot_frozen": false,
+      "reset_roundtrip_validated": false,
+      "identity_reuse_rejected": true,
+      "preview_url": "http://127.0.0.1:18086/index.html"
+    }
+  },
+  "latest_preparation_source": "This commit; source identities are recorded above. V0 remains unfrozen."
 }

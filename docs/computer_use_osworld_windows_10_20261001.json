@@ -267,7 +267,8 @@
       "continuous_recording_validated": false,
       "adaptation_notes": [
         "Explicit Windows paths and app/setup adaptation",
-        "Keep original and custom Windows scores separate"
+        "Keep original and custom Windows scores separate",
+        "Retain the MailHub tab and state_3.json supplied by the original setup; do not omit email context."
       ]
     },
     {
