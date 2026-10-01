@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T03:01:13.623077+08:00",
+  "updated_at": "2026-10-02T03:30:44.697242+08:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -174,7 +174,7 @@
     "apps/computer_use/osworld_windows/prepare013.py": "64c45f03a081dedb8b9b363076af6c4fa7ad88b599b481b8c7bf0411a5d1a1ef",
     "apps/computer_use/osworld_windows/task080.py": "e84ff04cd28b2ffb44947308eb9267923f57df4417373f460d8afd67e8aca882",
     "apps/computer_use/osworld_windows/prepare_native.py": "21ba3e34a9a77f3fbd78cd7aeb46b108c0dff1e85e41c7ed12ee0e96c93093c3",
-    "apps/computer_use/osworld_windows/task004.py": "34b58bd9579343c739717bfc681d48e3aed0deaa1866de7cf1a85952f9b71551",
+    "apps/computer_use/osworld_windows/task004.py": "509ea0060226a0e00722a6330cb09dad74f0e083afb67740323616a49f4ea1cf",
     "apps/computer_use/osworld_windows/task010.py": "61671213c2d3f70101299641a45f77522995847d80dedf698c750da9f82596f2",
     "apps/computer_use/osworld_windows/__init__.py": "9f6c33f6e61342c1f07a5724bc342bb9221ef4d0e60fb02cbb6d68140df4c9a8",
     "apps/computer_use/osworld_windows/upstream.py": "30c0b9fea3362e0327e1b15536cae64740133bc147a5a00ca6977975f9d2cbab",
@@ -220,11 +220,14 @@
     "apps/computer_use/osworld_windows/reviews035.py": "08e6533729b451398e0a9c8ceeb2cba80b7f59ae096f4c483ec311f5ac0c5545",
     "apps/computer_use/osworld_windows/qualify035_reviews.py": "0ea27ee3a2694c4aab9f08e88ba5107d01ab20cef65b437340778986a72cd28e",
     "apps/computer_use/osworld_windows/qualify_native_driver.py": "e153c59c0d47913ddda544f1afc6a1c55513eeb6b5f9bb4d71a8dff6fb46118c",
-    "apps/computer_use/osworld_windows/qualify_crm_conversion.py": "4b514dc3e3c874c9ddb51b1ff0e3d243b11cb163b087dd2cdb85bdb8142da553"
+    "apps/computer_use/osworld_windows/qualify_crm_conversion.py": "4b514dc3e3c874c9ddb51b1ff0e3d243b11cb163b087dd2cdb85bdb8142da553",
+    "apps/computer_use/osworld_windows/preservation004.py": "1d479a716b80ecc200aeb6dd623844837209540c19d21833237146942b46ec79",
+    "apps/computer_use/osworld_windows/preservation004_controls.json": "9adef43ff05c4c5c80313137337f01d61da925a8be97112c67642dbfb0ee5dfc",
+    "apps/computer_use/osworld_windows/qualify004.py": "65c4c2f969590562fb5d6d61d90290239458cf93bc2a4dee2e1ef5a47499d81c",
+    "apps/computer_use/osworld_windows/materials006.py": "f441529217550bb63334ff21eb7850f52eee02a801981c2fce0c28e5166f6e0c"
   },
   "pending": [
-    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 visibility and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 actual process audit integration",
-    "Resolve 004 locked-slide preservation across repeated native saves and font substitution",
+    "Complete remaining task preparation: 006 one inaccessible original and local mirror/initializer/grader; 022 remaining download UI/reset; 035 visibility and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 process audit integration",
     "Integrate qualified generic native launcher, collectors, event handoff, task reset, recorder and graders into the continue-on-task-failure campaign scheduler",
     "Integrate qualified application-entry configurations into all scenario initializers and clean reset",
     "Before freezing: archive/remove all known-answer qualification files and old task products from guest and SMB-visible share; validate minimal per-attempt public staging",
@@ -233,7 +236,7 @@
     "Clean baseline snapshot, restore round trips, frozen V0 configuration",
     "20 V0 on/off baseline runs; diagnose; at most two general candidates; V1 comparison and conditional repetition"
   ],
-  "last_qualified_platform_commit": "e2f9f78",
+  "last_qualified_platform_commit": "cbf885f",
   "guest_app_inventory": {
     "known_executables": [
       {
@@ -338,7 +341,7 @@
         "file": "gimp-3.2.6-setup.exe",
         "process_id": 7108,
         "signature_status": "Valid",
-        "publisher": "CN=Jernej Simončič, O=Jernej Simončič, L=Ljubljana, C=SI",
+        "publisher": "CN=Jernej Simon\u010di\u010d, O=Jernej Simon\u010di\u010d, L=Ljubljana, C=SI",
         "sha256": "9337cccbc01d4098ee7a3dab215b3afbe6ece99c5287c92441d6f12cf541ebca"
       },
       {
@@ -699,32 +702,96 @@
       "input_opened_in_impress": true,
       "source_input_sha256": "c34c7fa8536023cccb8febcb67961584d6d6cbe324b2fdaa14211ec082592d15",
       "evidence": "apps/computer_use/.runtime/osworld-004-qual-01",
-      "grader_status": "strict_preservation_gate_pending",
+      "grader_status": "qualified_with_exact_unedited_native_serialization_controls",
       "upstream_positive_score_before_save": 1.0,
       "original_hyperlink_fixture_score_after_save": 0.9667,
       "qualified_blue_hyperlink_fixture_score_after_save": 1.0,
       "one_save_locked_render_matches_unedited_one_save_control": true,
       "two_save_render_drift_detected": true,
       "installed_gill_sans_font_files_found": false,
-      "serializer_evidence": "apps/computer_use/.runtime/windows/shared/office-roundtrip-03/comparison.json"
+      "serializer_evidence": "apps/computer_use/.runtime/windows/shared/office-roundtrip-03/comparison.json",
+      "grader_cases_passed": 18,
+      "grader_evidence": "apps/computer_use/.runtime/osworld-004-grader-02/result.json",
+      "preservation_control_save_counts": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "preservation_control_bank_sha256": "9adef43ff05c4c5c80313137337f01d61da925a8be97112c67642dbfb0ee5dfc",
+      "native_gui_save_validated": true,
+      "native_gui_saved_sha256": "597fdd0f7fb7f3a0e7d2f4a6da2ea530a75bfdd91a617373a92e7c946c9f7c0e",
+      "native_gui_original_score": 1.0,
+      "native_gui_strict_success": true,
+      "native_gui_evidence": "apps/computer_use/.runtime/osworld-004-native-serialization-01/independent-result.json",
+      "font_policy": "Gill Sans requests are stored; identical Windows fallback rendering in both arms; no added licensed font",
+      "unrecognized_serialization_policy": "Requires evidence review; not automatically called model corruption",
+      "remaining": [
+        "Integrate initializer and grader with campaign and clean reset",
+        "Archive all reference/qualification files outside guest and SMB before snapshot",
+        "Review any submission whose locked appearance does not match an unedited control; preserve original score"
+      ]
     },
     "006": {
       "model_test_completed": false,
-      "status": "external_materials_incomplete",
+      "status": "19_original_materials_frozen_one_sharepoint_link_requires_authentication",
       "source_applicants": 20,
       "external_links": 18,
       "initial_direct_fetch_timeouts": 12,
-      "recovered_public_pdfs": [
-        "Yao_Tu.pdf",
-        "Li_Wei.pdf",
-        "Xu_Minmin.pdf"
-      ],
       "recovered_pdfs_include_negative_candidate": true,
       "original_mailbox_resume_attachments": 2,
       "audit_evidence": "apps/computer_use/.runtime/osworld-006-material-audit-01",
-      "no_proxy_used_for_downloads": true,
+      "no_proxy_used_for_downloads": false,
       "offline_materials_question_pending": true,
-      "remaining": "Recover every task-required original resume or document infeasibility before formal task construction"
+      "remaining": "Await choice on the one inaccessible original; build Windows mirror/mailbox/initializer and independent grader without fabricating a replacement or changing the original answer set",
+      "available_original_applicants": 19,
+      "pdf_resume_count": 17,
+      "notion_resume_count": 2,
+      "notion_original_blocks_retained": 114,
+      "encrypted_pdfs_preserved": 2,
+      "pdf_passwords_available_in_original_application": true,
+      "frozen_materials_evidence": "apps/computer_use/.runtime/osworld-006-frozen-originals-04/manifest.json",
+      "frozen_manifest_sha256": "9432db91afba998f535ebf9544c027dc1db25650148e66a005a23c4d8c479337",
+      "material_checks_passed": 8,
+      "material_checks_evidence": "apps/computer_use/.runtime/osworld-006-material-qualification-01/result.json",
+      "recovery_evidence": [
+        "apps/computer_use/.runtime/osworld-006-material-audit-01",
+        "apps/computer_use/.runtime/osworld-006-material-audit-02",
+        "apps/computer_use/.runtime/osworld-006-material-audit-03",
+        "apps/computer_use/.runtime/osworld-006-material-audit-04",
+        "apps/computer_use/.runtime/osworld-006-material-audit-05"
+      ],
+      "download_network_policy": "Images/software remain proxy-free; public resume documents recovered through the pre-existing proxy after direct timeouts",
+      "partial_response_bug": "Initial aiohttp read(n) retained first chunks; complete bounded stream download in audit-05, PDFs verified before freezing; failed outputs retained",
+      "unavailable_applicant": "Yiren Lin",
+      "unavailable_reason": "Original SharePoint sharing URL redirects to sign-in; unauthenticated original-link content API returns HTTP 401",
+      "replacement_approval_received": false,
+      "recovered_public_pdf_applicants": [
+        "Fu Tuna",
+        "Yao Tu",
+        "Jinwei Luo",
+        "Sophia Miller",
+        "Alex Johnson",
+        "Arvind Patel",
+        "Ethan Clark",
+        "Xu Minmin",
+        "Evan Carter",
+        "Zhang Hao",
+        "Wei Jie Li",
+        "Li Wei",
+        "Marly Delina",
+        "Avery Xia",
+        "Haoran Liu"
+      ]
     },
     "010": {
       "model_test_completed": false,

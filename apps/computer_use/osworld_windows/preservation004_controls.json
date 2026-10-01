@@ -1,0 +1,360 @@
+{
+  "algorithm": "locked-slide-appearance-graph-v1",
+  "source_sha256": "c34c7fa8536023cccb8febcb67961584d6d6cbe324b2fdaa14211ec082592d15",
+  "renderer_version": "26.8.0.3",
+  "control_generation_evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/result.json",
+  "font_environment": "Windows task VM: Gill Sans not installed; native fallback rendering is shared by both arms; requested font names remain checked",
+  "controls": [
+    {
+      "save_count": 0,
+      "file_sha256": "c34c7fa8536023cccb8febcb67961584d6d6cbe324b2fdaa14211ec082592d15",
+      "evidence": "/home/chaidi/qw3/third_party/OSWorld-V2/cache/osworld_v2_assets/task_004/stanford-nlp-seminar-talk-v2_2.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "035b3f18dee593c31b6170440719e31e70c4333993acc41dfd1f90fbf7b41018",
+          "6fdf25f0ddf95156cff7e5c3dd68213ac68571efcdfb6d3cbfef5fe3ae109349",
+          "bd6796abd07a1a382009ca2fcd3ae7623359f0372b0d74fb2660f36360224ef3",
+          "de15d84e076c835e7bb8caa30ea7407c4219571457c2cdcc872690474a418ab0",
+          "b7d78bba79abcf1bc617e9cfa678234b623ca2ecd3704bea282ee9169f22d8d4",
+          "54d20424d9caad531fd4e65ada12f8ad1248961a4108290be8aab0b48dd399d3",
+          "90c63e031eeaae83ab5de148211c154e1534dd55d19f945e87aa9aacc6ebfd3c",
+          "ed8c6e8e2360672db42f203115b1d495a14d9d33f13f063c96b2ad189337ec72",
+          "5d92590770485665fd5aa8278429b05928f10e4343e3fd096b11731c975784d7",
+          "f10efe1c77a18af4faa97b94530cfe34bff7e4b01b7de2f98c0b49aa32d38006",
+          "b7b467e5784276bf1c4fcb1594e7143992d643761956ca466ff73f49fe73559c",
+          "91d7e73e0814acaea55e278ba879d369fba363e74b1049f02bfdf3f12f336689",
+          "b4d916de2f08e2a7db4e6cba1172306767eb5a6c971e38e0b8e3c5e56afd4796",
+          "3ea763a0591062a8b00e39a014cc56d6fd9e49924e497b4132ce688cc9afded9",
+          "80fb3fd25c5370e12f3422c6d554141b07105ab7d7071fbbb6fe5b8774b68109",
+          "fd2a1de99cda1e65d768cb48506234960d9612f4413b174fb34bbacb563ba4d1",
+          "b4c38a7cec532eb721e953418af67fd6dbc06722d2e36d82cb294e47542aba2a"
+        ]
+      }
+    },
+    {
+      "save_count": 1,
+      "file_sha256": "f0afe98e1ac493d333272a990ab6ce2910cc919b39b949692ceabf6c082c5edb",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-01/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "099fb72d9550cce6b28f24e627c80ed15b9bd376010097c421fa199874dd876c",
+          "ca7f3cad11c4e2a65fa4f9a24a5372c253367dda9e78924925151a474be94a4a",
+          "0b719afd70806a2d8e359bb777f8421df1fbbea8b844993a939eb0665f165232",
+          "9007ad24065fa0c468167b76f2046210a22e4cd512074e16cfca93a07aa29e4f",
+          "723f31ac0d63879f5acf13d5fb7d4ecf3285dd337e7b8b8e019c37d3129c5b2d",
+          "81959c97519a78f867f3c91542ed79de96804218ea83b58c0bcdeb3a8c27bcf2",
+          "b7a1870d4a4eb43b003e7817e101e3abb1f9ca60db3e1a1951f946e601b8b420",
+          "ed5203eb7a0119b519b464b5d9dbf6495ab0f1baa2fb5c85475a476efc6956da",
+          "477bb1cd4c0b8c545b4ef51cf1c6567988a7f07246ed96e3931d25bed1d30b96",
+          "11cf0eb068c94c567d5c4a1071e3e34db738bcf573a35efc4028bb4402f23ca6",
+          "81e1434976298f6d2ea4468d9e50cef79f6af544e9ff6b80ab0f9a9fab7c82de",
+          "cfdd83eea2793c205fcd7b40703885229ede7e961186f43da3af6da5d97d2ce6",
+          "b1a72f31b315674384e2a6b6428de5985c748a40cc814e4a44a662661523f15a",
+          "6af7fad92c425447e27882279ca57133286b76f69bae903f5121994923ffd9fe",
+          "c9e44ddcbd9a673b3fd10055f520458abceb8f6e27f2c85dce5ccfb56e136301",
+          "baf598756f0df41efac0f1f180464ea6de30299797a7e40eb07351f6253065a2",
+          "905331b72b403d28170b3f4b94c88a295dddd37c774f71b99743b9b7bc982de6"
+        ]
+      }
+    },
+    {
+      "save_count": 2,
+      "file_sha256": "deaa45aa8ff486b1cf9c1fb50b18697a459aea586003cc96a768b7d220d32397",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-02/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "26c67adcca268fa2f2c3e9114256e1da36cceadf43e49bf0496569fbeccf9b95",
+          "6440c103d132db6831aa7e6248024a23d0f929cf2f8f2c7e9d9326e8d1c9af3f",
+          "767e0acf619ec5805c26be0bb2440d1cb2d625deffa27e5eeaea93bf52ecca0c",
+          "47305d6d84d9fd3ad8f583a292b5312de7f863639b9555a4e6793dab8f8fdee6",
+          "56a3ba1602acea2b27ea4eb302f8f702bdaae89398da48485820bf5d1dc7a106",
+          "78f5b4a9d64954b3161815ac56c1e1f77fff347998b131775d32e31cf4e39a1b",
+          "f39d5a7b68c9779e30333ee19350def6636fcb6fd5a92d409b8f33f97a9e7097",
+          "ebe268b1adafa9aa1ba0035110125bd083224d2fe0e1782b4dc5a37a8788403b",
+          "b1a13fd45d86617ebdac3198d58f67a373b38ab19fcfab14b048bb00b2cce8e8",
+          "344a98e318f5413c4866b165b1a840c8cc53a597a0b9a643c53bedfc76169f93",
+          "a55bfc675f92ef728cfcab9eebc6f041277cb9a5a1d7c5d0c1575b4c5f94dd60",
+          "6c106773a5681435629847577b1f29224971bb18e23d40fd686731e18f6c9e1c",
+          "4847e7b97127f57561132afe3ec3a41d1ec6753e4e44c6fc9498594fe459d8c9",
+          "5d9358c53b83413367afa314188f5002c46033c14a0e9156d04d6227d1bbb59d",
+          "dd1358288fb60354352105782c050ed2a25eafeab3004f0981087b9f70f53d1d",
+          "864ae54e387e70491e1fb12cfda7270b9f7f4c548407a6540db3a302b0797fcd",
+          "5df71f062f29be76e8ebb04d0e483683c77e2fd49c2750df5dd8c7f993d1b883"
+        ]
+      }
+    },
+    {
+      "save_count": 3,
+      "file_sha256": "7f23dd658513672dc96c378905b65fe6c19ff3614711952198e9801fa92a5601",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-03/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "96dbd4edca45146ea0e25f11779a98b4a25d8f4203fbebe6729e5ff96447a482",
+          "5473b6ada71ab433df8b8b15ccf966035a831747ed80a435bb25090a8eb2a0d7",
+          "aa4525dd4a10b2488ce887336c9907adc4746f28810924d1edf035a2cb4d8d8a",
+          "e17b864c32c6135432e11868c44308cd1fbe025cee67c7428820069274869200",
+          "5db31f9095dbf681289caa652b06bf2c8149808de89a0e9c873e87ae89d34d2d",
+          "53c3c967de3020f7a490aca2b41b0983a92ef84a801eb252c021b9aa8cf7b799",
+          "29cd57c2a1cc2ad06e197be6bfe744d0e8e15550f69baba8c05b4e998a5282ae",
+          "a4d41a4a2fa0735e150f4adb9c637bd3d68839a8b74c3a6e21c39f1d3c3e0079",
+          "73070ae7631ca339328c90b43bf112109c6542f93e2136cb5ab21ac2e2fe0844",
+          "5acbd3f7b02a60d72933675172259a9f53f10757e334a8488d169dc7ace0bffd",
+          "68f149f5ab7e7dec88ff41e49570cfab0d8f9ae727b8d182b72a0d38e755d2d7",
+          "2f0001784dbbb2465edd25c23cb0d69adf773078186f837a1dfadef75bb7a9ad",
+          "cfc105824bbde003312c7a0a085b465e08c8fb2489250d6b1a283c840ecbff40",
+          "4333e0874c182c0ef27d39d6f46cde7500788440ec40b66b5532441a39cbc77f",
+          "5ea9aedd5efa030591d7733d88e0c1081411a5c2877250be25b234b147200dfe",
+          "e4e6d63f0f4f25d25b6afbfe35e112d38cccc4d141fdac599a6174936255c2d5",
+          "595da0d341209dad220a62f38d62d69232a90c03a2fd85e003ff26d1cada0c2e"
+        ]
+      }
+    },
+    {
+      "save_count": 4,
+      "file_sha256": "58fd8a5be224681bde13a487d3118263f0f06b26a546e17e0ede130150ad8e5f",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-04/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "2ce10b00d6efece424cfb347a6e71c40b10409fe9548e5dfb8a44623a7965731",
+          "b695e3bc2d416ca79e78363b730dc9ec5d99b29984365c191cf50721a7e1a681",
+          "ae37f501a32c435e0e3f347e321f896dd848c6b776f75873f9b8357728cf901c",
+          "9bc6d8a8317c407f0c253f033717ed2c86dc93b8054605a7ca851ff805a7fdc7",
+          "d138c7a99de008f416cc19304a5bda86b1b5d0cb57c64fe50e27f6f79784de15",
+          "beda3a19d82ed1f8096277d88149a6acb24636ba5a1f26249adabe0fb425283f",
+          "4c7697c23efc3c04612656e8b1a3a3ae6a267d8f2ddb95e3dcfa3e607b884ba7",
+          "999c2a5f297760b7f39ff88d9ffcb3b23d1cc1a7c376431a9f669828f4504d32",
+          "e2b603f8c35bc191235d46e6932d25c32606d8d69130fa9e3da7fc595ce51885",
+          "000cc92e21164b3aee99961bae8867de4cec4a20a13c113d6999073af491d2d5",
+          "e7822474b878b638a9c63e659c457b2cf47ee6f56a20eed9547f84fd35d7a0ae",
+          "beebe3dfe484ab7171367e11c31d43c1298e1990f8dfb66b565b637db388d185",
+          "da7eafe7bcd91a2c67488754822454b16f0da3bdbc805789c95a3ba50c281a45",
+          "61c54480d59a639d1d1c6e526679b7f0468184a63ea84fb2651c76c540e7b3a5",
+          "82f834dbf109a4e9fe05433cd38df97277f316356a62b1a11962c5c65ffefe61",
+          "b643ea2164230aea76f81ee1531dc456da57223681bd6fd774db810d35b487c3",
+          "b5bacd0e919a6e7f45c3777f8dbcb7ffc12791e112f870657bbe9f26945ae377"
+        ]
+      }
+    },
+    {
+      "save_count": 5,
+      "file_sha256": "e6223ea299134b649e0b2ecb17a94dc95197f89b9321da706a98ed0d62bcea6c",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-05/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "b524972b003348e2df0d3d4fe6af062ac7e24a6c8d18a1a2d069b94950c12e6c",
+          "636405334187a0c3a1e8a1ab63b215100f1ea2c9eae08599924c838851f423c3",
+          "0c2b8282d2982fe6395c5bb1d6158a62fb9f8c4ffd2474c0a78dcbcb5fba8312",
+          "bdb25726b2aefbaecf1e9d6686fb05d53f2a1c58b694aec100a87c1fc2bda928",
+          "57053c83b903b91b912122e7369cf030d7ad099eb188629316e3a36839841171",
+          "0e0a0cec39bfd67ae8b88ff9c773cfdd21c8b319bd80eae2186d40d0cbe49a43",
+          "bd8b113a6a8f55bf7a56c295d4d9988256166df2c825564f53ef8daa9c404dbc",
+          "f18416ca6f83a9f652136a731f9798b3eab76464ab14b97463f140b51f46016f",
+          "866d04c55dfc88befce80229124ad461260bc668acf3f980d78103839240909d",
+          "1ee7a141c4cc5c8bc3262644cd52a1e8bef2da220ba07e19dbf5d607ab6af561",
+          "9d445e72d95b9fbd3d198aefcd858e68de33adde1f99018b49cca8822277edb3",
+          "b56ae9af0b514b9db451521ab43e7beada2bb742421a00501cd61cd0e3bc6a05",
+          "044315f17b11b63684010fb4fd49103c53761e1f0cbc1237e83ef637a86d16c4",
+          "1ee36b41e69a1757773cb44660c2e8a9df5819e1f0a5b03ce1ca1adac288029d",
+          "5bbcb33f3ebb6789b156b2ed83117f96ba0f13cc3122de00d4bef304095588d9",
+          "bc2bb0906d7da032ca285c8202566a4a02d00d1709519c187f70923b8d2b9075",
+          "6e3fb056c951a78f90b3a3b425d553163550654ab24060a73f893e50dbb7e75f"
+        ]
+      }
+    },
+    {
+      "save_count": 6,
+      "file_sha256": "f05765ddc32829c6a4e5df08aabb47d88b4a024015d98f678c2c666bce4b435e",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-06/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "c97f15af7414ffbadd98e2ae7791428d7681e2e4b6f5420f0cea9832ee4325ab",
+          "cdd059dd344671de087f228c731c2ac75352367ef5a59e5a7ebb3dfbb9ee9607",
+          "4954822a1e839622563c6295e7a9858a9faa24089140287f9d5d1d5f3ad2d58e",
+          "96424b75511ebbc9e963814423800124aa26cba4e2b43198b2ca1ecd1d9f58c7",
+          "ebf62dfb86dfff90492157c9ab3727956b6ce37a708e32502fd6fcb66a0f7cfe",
+          "837c7af5ef379d8e49bf1c54757f25b07c09805eb87ae0cd743a0fbae841bea4",
+          "85e0a6a2a41475cf6ffcb6860b8e3e9d0e112038822d3b668c4c5ba46757b27c",
+          "018835a6c4b25902559b3df7f3b6c7d7b9697ad2859940d943a6eff80efcbc01",
+          "02097162cfe8a6990eba2f98c9364096bac33af6871f6d5cefa89503e4376b60",
+          "49ffb19ab293186faea3e1fa7de1ec8069534be0225f2641eeade4a4dfa75953",
+          "3a45ab9a2bd3298fed6539e2168107e16c99235534e9db1276fca74033ad76c4",
+          "6e6cbc2a789f413f6366103ddb471729c10b73be69baa53a1660ab893c549a99",
+          "5e700aa5aaa31a0c301bf44312944a574e1e12a7222bf773859b6038dddec101",
+          "cc63f11744fb61f54701d8f80de2381d5341edef1a938fac94d26c2bf8389b49",
+          "f980b7cd6f9bac36b2cdef58f5516acd55d46f63655f95276c29310524cf41e1",
+          "a984f8b6afeda39dbe5232191b3262848e8dead60fa6861219c9573debbe6b5a",
+          "71c7131c08f56fe96db3d62996aa9b5336b7ffd7fb3d6568afc318ec9dfddb9a"
+        ]
+      }
+    },
+    {
+      "save_count": 7,
+      "file_sha256": "a8d5732ffd48f53cbf93f7a580cdcdda671a182e1dd807fb2ab7671844b8d18f",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-07/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "477eadaaf6e254fb0e73e6144e5ae788b895e9cec132c701528447fea9ab8bd1",
+          "5ddb6bb43debeaf045d3e712381048dd794c314c3319052f86640333ec81edcc",
+          "8d92e8eb0b9ad09f7f93e23787e7756137e8f687153682767f8f08e37b8c06d2",
+          "55a98c079938e69564ad66442beaad01e0535a5a73a3880ec2fcd9b42af8b85c",
+          "c3ac7d285933fb68e7ccfbb60dd88adcb9598b36aedcc49ebbbbcd27e1d8a31e",
+          "f9c8de2d083ed3fbc8e8f0c490c0c241efbd0c503a0ed91d143d6d07cd6a1362",
+          "057d72405d71f90a1265d4da3f750a26120b4d6b0ac17d15fddc457d4424cca6",
+          "f485c00210c22f544b4fbde748087860a31633a72d4c2aa9651753c2b66c29c6",
+          "8a05411db9a73d8a99e85cf2f80565fab55241148cde1b142f3e45bd56775a80",
+          "67a8513d71528cc828c383ab7a4ab09d95bef51025465a11982dc70c89dc1791",
+          "99e388a69d5b22384c109b2f94dc6075367c4aff07c02cfd7180994cd5baa79b",
+          "01bf2e9ab8911a77152c5b49de52bff6a1171d938ec3f237ffa5abd63d87163a",
+          "7ced35ff51fd6cd98d05da31011da32b3d2982661fe4f2f92ce5dff0e772aaad",
+          "01dc5ac72f233717691466c2633cd87ebacca8ea2d38b57150aaae9e548f4561",
+          "11516df3b128da7b5ae1f576d51a300fcc308aee3a5c9909ab66564365cf7a61",
+          "7fec253dba9b32e3004e53f6b3baa506a0ba04ca48bdaad1b1dda7601f84a5c1",
+          "8c0b59919f9fc1ce25b7fdd112289d4bae5053b9a6b8acdbcbd19d5008fa6cf3"
+        ]
+      }
+    },
+    {
+      "save_count": 8,
+      "file_sha256": "345895e856b52f5d8055def748d112f98e80a2ae547477c9ec35e7f9e94814cd",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-08/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "a83c25d330b7e50cc89d34a4cfe9dcd6a346ef9da6a52170b23918792cffa408",
+          "f628f58b6953b5ab4c450a5acfac7b1712db677758ad54b694c32c8e49732ebb",
+          "c13dd48a3e314a61464fe54fd77ef988af02b25046c7a26ab288f7f2db55f83a",
+          "d44cf88aea614a05a6335d8749143807232de43b8b3922190d7f90ef6c128381",
+          "5acd9a0202fd31132add60d4e608723e832393c0893769023547a5bf0dc1e69e",
+          "1913d1032c39fb1401fe7ba250b0b6a5937734b74cf8639fb8257fb1236d8e64",
+          "b40d50aef82b53c09361f76edf8405f97347a8a4a497350a188e7a0b970cc773",
+          "f3f4c77083846ffba63ee8b23d0ff47d3264aab124c4d502a8b93a32c70c4f86",
+          "0999f507ae9d16cb28095d95fc7a8c416eac8398c0016a6ff1fe411b8e62f2cc",
+          "910d1dafd77d948e9ddbb285b8ff0891825d151977d67a55d86f192513ff424a",
+          "3094d5c0c0972d0753344b385935cb66fa242cf8a9b227e51bdd8e842c1e82d9",
+          "4f0bbdab76dfb5fbcf0461a9a2d997ebc91ffe3b5057a510fd0f2aecb6a4332c",
+          "e280f35195a438406a2965433c763cdf85d72dfe75589ed65be25e0ef8c1b219",
+          "4f64c489a7216d95fc88bf4457cbe28c218f492fd0c5cd8bcaf6dee97e224e8b",
+          "73f31891041656a05f1ec5f19a9df106b71fca3d285587df6aa238c232f3dc75",
+          "044a625c1fa9eae817f75053fd1979f4e7a41e6750962e020e13ee4a26c13a3b",
+          "305b09b257b1babbabfa971c846dea60332fba1ab116811959c9c7a05ba313a1"
+        ]
+      }
+    },
+    {
+      "save_count": 9,
+      "file_sha256": "b4de1b75422a881d1abd7ca9e8e643eb105bdfcfeae7cfd8404ffceee2698f87",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-09/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "d7cd61a47cf43c4bfbc43b0faa73dae622c68f8d694df1db7f5d32c4ebc53dfc",
+          "63284765b99626641412c8d357d79922b9bdee57768e613c6a36ae6c3c681746",
+          "e8d150686b31396de6dca41f4dd9ff43ec2ce078ad201451beff095824c0e583",
+          "ff23f40f02984a6f7baf198b445aa093dcf04f5471195192db5b73744017cf8d",
+          "2af62c753360dea6fa872f8979bf246a8026fc1acc415aaaaab70f7670242b04",
+          "1b702668045d330cc4267c443e582b857cf69affce80eb3a9b0588434e95ad02",
+          "16cf4bbbff47adb9af49cb7b92825b51c1abcf4c4a542c73f8d665355bc7be32",
+          "5d774d1003c764d4f3cefcf3f2efcd428e46d8b5b4af30bb7e3594dd7151c960",
+          "7bbd049fe5ab50a4103ab0693e73531ab3351487c0b59862dfc26711e3181f31",
+          "d86b5a497e52cd6ac914dede5ad827f083902f779cc07537f3dabaa98c1e4e59",
+          "d250fb2896f673bce198a3755a6ddd6e4b565453b48a852bda4dacba2c3aa709",
+          "81f0c72d4dd5f2d859236b4a32584fe3a302c6fbc33f6c126f5da3c9521e2e1a",
+          "38e2b39f85e94a69dada8587708046cd1826509b4c1bbaf068e7fb6ba1db7edc",
+          "07bfdef496aa1a0ee46ce9e58ac696264508e917f19252a1167eb845c380e20f",
+          "f460e5187969089a314d71e4f1f826588968a7b0d4a28e70d01c1318fea2be3a",
+          "bf7fb72be943a0e3d4de140f202fd5816ed1b311fdef6a01c1854a3e8d9daf30",
+          "f9025e87d85d88082c7057969f0ff1a00bfd150ccff6c05495934384f05b2d32"
+        ]
+      }
+    },
+    {
+      "save_count": 10,
+      "file_sha256": "a657bba9b6742efcf53c28488ae468a97f3da45cbde806de92051b98f56bb438",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-10/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "7aba3eb5a554da1d71a997513dd80e3f7455ed9403861303b2f1fce32ff42ee4",
+          "1a6343d0bd58c7e38e008347b359dca8e6bcad7fea792985a6f7cab18019cd67",
+          "907d16dd14fe4763382c3565015f152068833be79549b3a3b1ca68e654962d4a",
+          "29e9a9d9589d6b9fb52ce292bd1719aaba53f70d4f5bbfac8402ee51a70ca2d8",
+          "183879b2bb9c8a55fa30c9504018583bba0348f0870d82e76b1d16448d35916d",
+          "5e004a00f766abb54c70c1463b3a91df98ff82c50ae638ff13e009629aa4ca24",
+          "74699014818b914b95a871a66b99e1febd1abcb6a942d9bb6a790ebe55e62322",
+          "d0864fb6ba83057b26c4706c59d90e730de8b4f73852e83ad0407d6556995943",
+          "e713eee178cb665b960ac37906093fc2b806e3acad40822be8ecdac257e16da6",
+          "8fb153992d7b9fd3e433d4a6055ae7de2ceb6112b049022e23374f68c209ea75",
+          "e2ae09014477fcd8e46358260195d876f6626cdaead3f204badd3cd9adf5795c",
+          "1d7b54cfa9168beeb4c8ae90d625e8d47c25c5845f3452173e081b612bb22219",
+          "3ad02cd84e7a4035744fd7f945f03ccc85a2d6e8b9fc2f52c5daae66cf5d48f9",
+          "5e60415e2b294013d0a43156a104ca3c2e64f7df488798600da598ddd2e695a5",
+          "05846c25559e5200d6c661a6308f40aba3bb030313b5e5280f8bbcb61c45dff0",
+          "f32f71d16d31cb7dd432554bf319ba8072d288bc0fc87bc656d640300a3bc0fe",
+          "c1504ccfb0db393c3e6bd35fc5ab6dd7f078322dc04d8108055dded471397b49"
+        ]
+      }
+    },
+    {
+      "save_count": 11,
+      "file_sha256": "87e50598188fb05cb02c9934b82b88c9b91609a20949c23961dd39b8906d9666",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-11/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "5d61dfbfafdf11dd504c335f3bbc943ab509240128242362877b5eb19f58c382",
+          "3cb31c9f3705d402053985438f565d026acdc93548933c9d70cd8b7f7195901c",
+          "1aa19a07001a974562ef51c0b348d21d3163c4b5ed8b44d846fedacb2188a562",
+          "ff0d9a7e56ed5d22b02ef310c63bcac2c29e248545216b9492a80fc4a556bf7e",
+          "b67459b81d246f91696701c2419e448c2d101742b2ef0daa73a02cbd54440901",
+          "4b8bedfdda10e75aaa644260a35eed27a9568f1c9ea1574574ecd240a9915a75",
+          "437cf8b93c889e956c6fc71f2f4e47cb7d9721d2a5c2091fd090ada6aa0ff390",
+          "f85ac42c4dedc1fc3eb0a76e6a3aa69fb7a6fac853a24edb5e5215830b61fd2d",
+          "7aeac5c2cfeea6c0c46d728641d43d3e405aa07a1b14ec0c996da66ada4fef11",
+          "841b0ca1f8355c3ddfc05be93623271e9cf36e969b203b6642619e062c46c280",
+          "7a8690dedfce94bf2aac765d28bfa4ea8d046ac34f296517a2382767bb7e79ce",
+          "ad5a6ba9612da215075e6fee63b156c9f56486a9e6326561f20a13e546327e01",
+          "9f2291ef892f130168fc1b8ee698aed7f3a596da00cc15ae241551b22c5cd54e",
+          "b6ee129646eb32e2fb26aebed29d125b84c5fe422e9f5d9b7fd0ed677c8f8dc0",
+          "1ec8f6ea2cfb8e5bf97a52b2c493141ab2894c0e4f16ff24aece88223562d86a",
+          "4d80d2f00c1b8bf21ff8bf32670781d0554816ff8115244a27f9f4e182246c20",
+          "3cefb6a77b82bc8766a4c9f4c95a091aa5e849610a57fbcb1b2fd1607d749fd3"
+        ]
+      }
+    },
+    {
+      "save_count": 12,
+      "file_sha256": "b23eacddca905a8d41caf279905d5a45732a44b4257a608ae143675ae99c49dc",
+      "evidence": "apps/computer_use/.runtime/windows/shared/office-locked-controls-01/save-12/control.pptx",
+      "signature": {
+        "global": "0492794f4aee3e42348a3f9d17f9f277fed2881ee4e78c0e0ab4255ceac880c6",
+        "slides": [
+          "e5a918352f8fc6f17b1eb22db79828f487ed6bfcf721911325e712c908ffa9d3",
+          "78d027198d0f0c8a27d15787e47a06775c8edc3cf89ff6b50c944f131bbb409d",
+          "5eb24e62fb6b4d4e6d8c97a456eb7692175df0a678a3d437c93bcf0288cfbda7",
+          "d0dd2fed6a64f071193b89564ca60779a200ca67524bc44ca782cb05ca50de72",
+          "141c5e38544857c43012d4181e9b4a7fb2bf4a9a7e0e346d83205cfe74c8beb4",
+          "1c647afac75b04ab3e6c244bca4d8583ef97a2efbc7c84ffff9b74ca7d91e01c",
+          "730ad45b3365bd939d4870a1e4836a4d84e77500fd49e522b2d066e7936030f7",
+          "17eb1e969c0bbb957f94c39ec691e64c1b105110f23a225cdcc90a6e931eba0c",
+          "74bcd63d2a9885af05c40bdfa9cfe5c939bbe3b6aa86048f4211f1748c432d18",
+          "392d12f2499b894feeee211b154d3a26748ff2841199a0e0e02260aa2cc0138c",
+          "e6706a012342b10cb51dabbd5c26637fcd2c2905dd311cd4df11697ac5747e5a",
+          "6b5d20dca4b259919aa1465e3d21dcd78429fa20a2548ed91427057cdc62078a",
+          "210858c32d296bcdeabcb8da94bc13ad7a07e54d3c0f9510d13c85ec1332555a",
+          "e41ec872fefdb0a4cbca4ea804c23f28b66347edfa7bd7dd330d583a5fc30713",
+          "8b43a32af635d1927579314525e778aefa674f9281a3dd240d119193b8ac4b1e",
+          "b4f313572d1100a66990e92ca051578a38f2c33efd39299995a53ecf1ed00eee",
+          "b82a6d21835fdfa6b2d94731f9bb95d1b3fefbeaeec056c0dc0968603e5b8648"
+        ]
+      }
+    }
+  ]
+}
