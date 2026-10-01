@@ -40,15 +40,14 @@ public static class DesktopNative {
     }
     [DllImport("user32.dll", SetLastError=true)] private static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder name, int count);
-    [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
-    [DllImport("user32.dll")] private static extern bool OpenClipboard(IntPtr owner);
-    [DllImport("user32.dll")] private static extern bool CloseClipboard();
-    [DllImport("user32.dll")] private static extern IntPtr GetClipboardData(uint format);
-    [DllImport("kernel32.dll")] private static extern UIntPtr GlobalSize(IntPtr memory);
-    [DllImport("kernel32.dll")] private static extern IntPtr GlobalLock(IntPtr memory);
-    [DllImport("kernel32.dll")] private static extern bool GlobalUnlock(IntPtr memory);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool IsWindowUnicode(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr window, uint flags);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongW", ExactSpelling=true)] private static extern int GetWindowStyle(IntPtr window, int index);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    private static extern IntPtr SendTextMessageTimeout(IntPtr window, uint message, UIntPtr wparam,
+        [MarshalAs(UnmanagedType.LPWStr)] string text, uint flags, uint timeout, out UIntPtr result);
     private static IntPtr Focus(IntPtr window) {
         uint process;
         var info = new GuiThreadInfo(); info.size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo));
@@ -57,84 +56,48 @@ public static class DesktopNative {
             throw new InvalidOperationException("Focused input control changed or unavailable");
         return info.focus;
     }
-    private static System.IO.MemoryStream RawClipboardFormat(string format) {
-        // Copy unknown formats as opaque bytes, never deserialize an object
-        // supplied by another application through IDataObject.GetData().
-        if (!OpenClipboard(IntPtr.Zero)) throw new InvalidOperationException("Clipboard is busy");
-        try {
-            IntPtr memory = GetClipboardData((uint)System.Windows.Forms.DataFormats.GetFormat(format).Id);
-            ulong size = GlobalSize(memory).ToUInt64();
-            if (memory == IntPtr.Zero || size == 0 || size > 16 * 1024 * 1024)
-                throw new InvalidOperationException("Clipboard format cannot be preserved within 16 MiB: " + format);
-            IntPtr bytes = GlobalLock(memory);
-            if (bytes == IntPtr.Zero) throw new InvalidOperationException("Clipboard format is not a byte buffer: " + format);
-            try {
-                byte[] copy = new byte[(int)size]; Marshal.Copy(bytes, copy, 0, copy.Length);
-                return new System.IO.MemoryStream(copy);
-            } finally { GlobalUnlock(memory); }
-        } finally { CloseClipboard(); }
-    }
-    private static void PasteText(IntPtr window, IntPtr focus, string text) {
-        // Win11 RichEdit corrupts Unicode keyboard bursts. WM_PASTE asks the
-        // focused edit control to consume one literal string synchronously.
-        // Materialize all existing clipboard formats before taking ownership;
-        // never overwrite a subsequent clipboard change from another client.
-        uint previous = GetClipboardSequenceNumber();
-        var original = System.Windows.Forms.Clipboard.GetDataObject();
-        var saved = new System.Windows.Forms.DataObject();
-        var owned = new List<IDisposable>();
-        bool changed = false;
-        uint temporary = 0;
-        try {
-            if (original != null) foreach (string format in original.GetFormats(false)) {
-                bool standard = format == "Text" || format == "UnicodeText" || format == "OEMText" ||
-                    format == "Rich Text Format" || format == "HTML Format" || format == "FileDrop" || format == "Bitmap";
-                object value = standard ? original.GetData(format, false) : RawClipboardFormat(format);
-                var stream = value as System.IO.MemoryStream;
-                var bitmap = value as System.Drawing.Bitmap;
-                if (stream != null) {
-                    if (standard) value = new System.IO.MemoryStream(stream.ToArray());
-                    owned.Add((IDisposable)value);
-                }
-                else if (bitmap != null) { value = bitmap.Clone(); owned.Add((IDisposable)value); }
-                else if (value == null || !(value is string || value is byte[] || value is string[]))
-                    throw new InvalidOperationException("Clipboard format cannot be preserved: " + format);
-                saved.SetData(format, false, value);
-            }
-            if (GetClipboardSequenceNumber() != previous || Focus(window) != focus)
-                throw new InvalidOperationException("Clipboard or focus changed before text input");
-            var data = new System.Windows.Forms.DataObject();
-            data.SetData(System.Windows.Forms.DataFormats.UnicodeText, true, text.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\n", "\r\n"));
-            // DWORD zero opts this temporary payload out of Windows clipboard
-            // history and cloud upload. Original formats are restored below.
-            using (var history = new System.IO.MemoryStream(new byte[4]))
-            using (var cloud = new System.IO.MemoryStream(new byte[4])) {
-                data.SetData("CanIncludeInClipboardHistory", false, history);
-                data.SetData("CanUploadToCloudClipboard", false, cloud);
-                System.Windows.Forms.Clipboard.SetDataObject(data, true, 3, 30);
-                temporary = GetClipboardSequenceNumber(); changed = true;
-                if (Focus(window) != focus) throw new InvalidOperationException("Focus changed before paste");
-                UIntPtr result;
-                if (SendMessageTimeout(focus, 0x0302, UIntPtr.Zero, IntPtr.Zero, 3, 2000, out result) == IntPtr.Zero)
-                    throw new InvalidOperationException("Paste delivery timed out");
-            }
-        } finally {
-            try {
-                if (changed) {
-                    if (GetClipboardSequenceNumber() != temporary)
-                        throw new InvalidOperationException("Clipboard changed during text input; preserved the newer clipboard");
-                    if (original == null || saved.GetFormats(false).Length == 0) System.Windows.Forms.Clipboard.Clear();
-                    else System.Windows.Forms.Clipboard.SetDataObject(saved, true, 3, 30);
-                }
-            } finally { foreach (var value in owned) value.Dispose(); }
-        }
-    }
-    public static void TypeText(string text) {
-        IntPtr window = GetForegroundWindow(), focus = Focus(window);
+    private static bool IsEdit(IntPtr focus) {
         var name = new StringBuilder(256); GetClassName(focus, name, name.Capacity);
         string kind = name.ToString();
-        if (kind.Equals("Edit", StringComparison.OrdinalIgnoreCase) || kind.StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase)) {
-            PasteText(window, focus, text);
+        return kind.Equals("Edit", StringComparison.OrdinalIgnoreCase) ||
+            kind.StartsWith("RichEdit", StringComparison.OrdinalIgnoreCase);
+    }
+    private static bool InputEnabled(IntPtr focus) {
+        if (!IsWindowVisible(focus)) return false;
+        // GA_PARENT excludes owners: an enabled Save As dialog can have a
+        // disabled owner, while a disabled parent prevents child input.
+        IntPtr current = focus;
+        for (int depth = 0; current != IntPtr.Zero && depth < 64; depth++) {
+            if (!IsWindowEnabled(current)) return false;
+            if ((GetWindowStyle(current, -16) & 0x40000000) == 0) return true;
+            current = GetAncestor(current, 1);
+        }
+        return false;
+    }
+    private static IntPtr CheckedTextFocus(IntPtr window, string text) {
+        // EM_REPLACESEL receives a null-terminated UTF-16 string. Reject NUL
+        // before dispatch rather than silently inserting only a prefix.
+        if (text.IndexOf('\0') >= 0) throw new InvalidOperationException("Text must not contain NUL");
+        IntPtr focus = Focus(window);
+        if (IsEdit(focus) && (!InputEnabled(focus) || !IsWindowUnicode(focus) ||
+            (GetWindowStyle(focus, -16) & 0x0800) != 0))
+            throw new InvalidOperationException("Focused edit control is disabled, read-only, or not Unicode");
+        return focus;
+    }
+    public static void ValidateText(string text) { CheckedTextFocus(GetForegroundWindow(), text); }
+    public static void TypeText(string text) {
+        IntPtr window = GetForegroundWindow(), focus = CheckedTextFocus(window, text);
+        if (IsEdit(focus)) {
+            // Insert at the current selection/caret with one undoable native
+            // edit operation. Do not take clipboard ownership: process death
+            // must not discard a user's clipboard. Normal UI Save still writes
+            // the document; this method never reads or writes document files.
+            string literal = text.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\n", "\r\n");
+            if (CheckedTextFocus(window, text) != focus)
+                throw new InvalidOperationException("Focus changed before text input");
+            UIntPtr result;
+            if (SendTextMessageTimeout(focus, 0x00C2, new UIntPtr(1), literal, 3, 2000, out result) == IntPtr.Zero)
+                throw new InvalidOperationException("Text delivery timed out");
             return;
         }
         // Browser and other non-edit windows retain normal Unicode input.
@@ -369,6 +332,7 @@ function Act($Request) {
     $front = Foreground
     Require ($front.handle -eq $before.foreground.handle) 'Foreground window changed; observe again'
     if ($Request.action.kind -ne 'open_app') { Require ($front.process -in $allowedApps) 'Foreground application is outside the allowed scope' }
+    if ($Request.action.kind -eq 'type') { [DesktopNative]::ValidateText($Request.action.text) }
     $record = @{ signature=$signature; status='dispatching'; request=$Request; dispatched_at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
     Save-Json $path $record
     # From this durable point onward, errors imply uncertain delivery. Never

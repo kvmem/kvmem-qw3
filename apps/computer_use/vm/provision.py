@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import uuid
 
 NAME = "qw3-computer-windows"
 HMP = r'''
@@ -29,8 +30,13 @@ def main():
     if info["Config"]["Labels"].get("com.qw3.computer-use.owner") != "codex-goal-20260930":
         raise SystemExit("VM owner does not match this task")
     shared = next(Path(m["Source"]) for m in info["Mounts"] if m["Destination"] == "/shared")
-    shutil.copyfile(args.script, shared / "admin-script.ps1")
-    subprocess.run(["docker", "exec", "-i", NAME, "python3", "-"], input=HMP, text=True, check=True)
+    # A Windows SMB client can retain the preceding contents of a path that the
+    # Linux host overwrites. A unique path also preserves the exact setup script
+    # and prevents a later invocation from replacing a script still executing.
+    staged_name = "admin-" + uuid.uuid4().hex + ".ps1"
+    shutil.copyfile(args.script, shared / staged_name)
+    command = HMP.replace("admin-script.ps1", staged_name)
+    subprocess.run(["docker", "exec", "-i", NAME, "python3", "-"], input=command, text=True, check=True)
 
 
 if __name__ == "__main__":

@@ -98,6 +98,7 @@ async def run(args):
             with (output / "engine-launch.log").open("wb") as log:
                 engine = await asyncio.create_subprocess_exec(sys.executable, root / "apps/computer_use/run_engine.py",
                     "--method", "dflash2", "--kvmem", args.kvmem, "--lock-timeout", "30",
+                    "--guided-refresh", args.guided_refresh,
                     "--visual-history", "retrievable", "--trace-retrieval", "--run-dir", output / "engine",
                     cwd=root, env=env, stdout=log, stderr=log)
             sampler = asyncio.create_task(monitor(engine.pid, output / "resources.jsonl", stopped))
@@ -134,5 +135,6 @@ if __name__ == "__main__":
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--snapshot", default="qw3-type-20261001")
     parser.add_argument("--kvmem", choices=["on", "off"], default="on")
+    parser.add_argument("--guided-refresh", choices=["off", "both"], default="off")
     parser.add_argument("--task-timeout", type=float, default=900)
     raise SystemExit(0 if asyncio.run(run(parser.parse_args())) else 1)

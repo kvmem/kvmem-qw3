@@ -1,11 +1,13 @@
 # Local Codex computer use
 
 Work in progress: the local UI, Codex provider bridge, Computer MCP and Windows
-VM executor work end to end. Three real-model Windows smoke tasks have produced
-independently verified files, including one pause/resume run. Repeated trials
-from a clean snapshot and physical-machine acceptance remain open. A real
-Codex observation fixture preserved eight images through 168K tokens and
-answered a historical-image question with above-budget KVMem selection.
+VM executor work end to end. A frozen native Windows client passed 18 core-task
+trials from a clean snapshot. The repaired Linux client completed a 36-page
+Windows task with KVMem on; off timed out at the same 900-second deadline.
+Later source changes need fresh native qualification. Physical-machine and
+macOS acceptance remain open. See the current
+[acceptance index](../../docs/computer_use_acceptance_20261001.md) for exact
+source identities, preserved failures and the scope of each result.
 See `../../docs/computer_use_codex_m2_20261001.md` for desktop evidence and
 `../../docs/computer_use_long_history_20261001.md` for the separate diagnostics.
 See `../../docs/computer_use_codex_goal_20260930.md` for the full goal.
@@ -118,6 +120,26 @@ separate controls. `--kvmem on|off` selects the memory policy, and
 The first DFlash smoke used a 32GiB CPU tier. A later MTP startup check showed
 that its additional KV backing exceeds that budget at 1M context, so the common
 comparison profile uses 48GiB. This is CPU memory capacity, not a GPU limit.
+
+For long tool histories within one user task, `--guided-refresh both` enables
+private query generation and retrieval refresh at request/generation boundaries.
+It requires DFlash or MTP on the KVMem side; the dense side ignores this option.
+The default remains `off` for reproducing earlier measurements. With refresh
+off, same-query history growth can use capacity selection without semantic
+retrieval. A 162K-token diagnostic exposed an incorrect old-image answer in
+that configuration. With refresh on, all four long on/off positive/changed-image
+negative checks passed, each seeded by the same short request. That diagnostic
+does not dispatch desktop actions or qualify the revised live task profile.
+
+```bash
+python3 apps/computer_use/run_engine.py --method dflash2 --kvmem on \
+  --guided-refresh both --visual-history retrievable --trace-retrieval \
+  --run-dir apps/computer_use/.runtime/engine-guided-new-run
+```
+
+`windows_long_suite.py --guided-refresh both` selects the same refresh policy
+for a new live qualification run. Use new output directories and retain prior
+failures. The underlying engine binary is unchanged by this launcher option.
 
 The smoke checks a real model identifying a red input image, requesting two
 MCP fixture observations and identifying the returned blue screenshots. It
@@ -446,11 +468,29 @@ PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_typing.p
   --run-dir apps/computer_use/.runtime/typing-new --repetitions 3 --browser
 ```
 
-Edit/RichEdit input uses a synchronous paste message with temporary clipboard
-ownership and restoration; other windows use paced Unicode keyboard batches.
-Raw clipboard formats are bounded to 16 MiB each and are never deserialized.
-Unsupported snapshot formats reject before taking ownership. The final direct
-input candidate passed four Notepad cases, the Edge download and preservation
-of five clipboard fixture formats. Forced executor termination during temporary
-clipboard ownership remains unqualified. See the Windows validation report for
-retained failures and the exact source/evidence hashes.
+Edit/RichEdit input now uses an undoable `EM_REPLACESEL` operation on the focused
+Unicode control, without taking clipboard ownership. It validates focus,
+read-only/disabled state and NUL before dispatch; other windows retain paced
+Unicode keyboard batches. Nine native-control checks passed for selection,
+undo, Unicode, refusal cases and unchanged clipboard sequence. Actual Notepad,
+Edge and forced-termination qualification is tracked in the acceptance index.
+The previous clipboard-preserving implementation and its successful input and
+18-task results remain baseline evidence; they do not qualify a revised
+executor. See the Windows validation report for retained failures and hashes.
+
+`windows_input_recovery.py` runs a dedicated VM fault test: it seeds five
+clipboard formats, kills only the identified executor while a selected action
+is durably dispatching, checks restart/duplicate refusal, explicitly reconciles
+that known fixture action, and saves through the UI. It requires the current
+executor to be deployed and all model/VM task suites to be stopped:
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_input_recovery.py \
+  --run-dir apps/computer_use/.runtime/input-death-new
+```
+
+The setup scripts in `vm/` are administrative test fixtures and are never
+exposed to Computer MCP. Provisioning and the fault test use unique shared
+script/request/result paths so rapid calls cannot accept an earlier SMB-cached
+result. Production uncertain actions still require the user to inspect the
+screen and explicitly reconcile them before continuing.

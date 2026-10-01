@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--prefix-reuse", choices=["auto", "off"], default="auto",
                         help="off gives cold fixed-input replay on both KVMem sides")
     parser.add_argument("--visual-history", choices=["pin-all", "retrievable"], default="pin-all")
+    parser.add_argument("--guided-refresh", choices=["off", "both"], default="off",
+                        help="both refreshes same-task history at KVMem boundaries; requires DFlash or MTP")
     parser.add_argument("--trace-retrieval", action="store_true")
     parser.add_argument("--trace-memory", action="store_true",
                         help="Separate diagnostic: trace CUDA tensor allocations and workspace capacities")
@@ -26,6 +28,8 @@ def main():
                         help="Wait briefly for a previous owned engine's GPU lock to be released")
     parser.add_argument("--run-dir", type=Path, required=True)
     args = parser.parse_args()
+    if args.kvmem == "on" and args.guided_refresh != "off" and args.method == "none":
+        parser.error("--guided-refresh both requires --method dflash2 or mtp when KVMem is on")
     root = Path(__file__).resolve().parents[2]
     run = args.run_dir.resolve()
     run.mkdir(parents=True, exist_ok=False)
@@ -74,6 +78,8 @@ def main():
                "--kvmem-query-conditioned", "--kvmem-query-replay",
                "--kvmem-retrieval-method", "sub-block-mean-k",
                "--kvmem-semantic-expansion", "message"]
+        if args.guided_refresh != "off":
+            command += ["--kvmem-guided-reselect", args.guided_refresh]
         if args.prefix_reuse == "auto":
             command += ["--kvmem-prefix-cache"]
     if args.method == "dflash2":
@@ -97,6 +103,7 @@ def main():
                 "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
                 "kvmem": args.kvmem, "prefix_reuse": args.kvmem == "on" and args.prefix_reuse == "auto",
                 "visual_history": args.visual_history,
+                "guided_refresh": args.guided_refresh if args.kvmem == "on" else "off",
                 "launcher_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "pid": os.getpid()}
     (run / "manifest.json").write_text(json.dumps(manifest, indent=2))

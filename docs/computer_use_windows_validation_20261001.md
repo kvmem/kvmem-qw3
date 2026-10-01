@@ -467,3 +467,20 @@ retrieval dump. Logs show same-query reselection suppression with guided refresh
 disabled. See `computer_use_same_turn_visual_01_20261001.json`. This remains
 open alongside final native-client qualification, input-death recovery, Mac
 and physical desktop acceptance. Goal remains active.
+
+
+Guided refresh and native input revision (2026-10-01): all four 162,062-token
+same-turn visual on/off positive/changed-image-negative checks passed with the
+isolated guided-both configuration; each had a separate short seed. On selected
+1,018/1,267 blocks with ready query/index and no fallback. The launcher now
+exposes `--guided-refresh both`; original guided-off failure and the earlier
+live pair remain retained. See `computer_use_guided_visual_20261001.json`.
+
+The adopted executor uses undoable native edit replacement without clipboard
+ownership. Its nine control checks, five exact real-input files and five
+clipboard formats passed. A real input dispatch was killed; restart stayed
+paused, duplicates were refused, and explicit fixture reconciliation produced
+exactly one `BASE-ONCE` file. See `computer_use_native_edit_recovery_20261001.json`.
+A new source-matched native bundle/snapshot and live qualification are still
+required. Earlier native 18/18 results do not certify revised sources. The
+Mac/physical target requirement remains open.

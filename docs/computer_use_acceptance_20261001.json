@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790812764.8774958,
+  "reviewed_at": 1790814637.5677574,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
@@ -120,11 +120,53 @@
     },
     "same-turn-visual-probe-01/result.json": {
       "sha256": "3553df36a9c49acde918017538b9f803672e181cca6e41704b3a7e68dea8fbdb"
+    },
+    "visual-guided-01/result.json": {
+      "sha256": "84aa1dfe25a8925a585804ea7c37d61c1e170029ed0eb846bb7f94f8d0c5aa69"
+    },
+    "visual-guided-01/evidence-audit.json": {
+      "sha256": "63783886247fd178792112dc26f3cf43cd052553f811f274e0f512bcded18921"
+    },
+    "input-semantics-01/result.json": {
+      "sha256": "00272fd436d760f9c7fab474591a15ec32726e060e269c44af6eca25c462b9f0"
+    },
+    "windows-typing-edit-01/result.json": {
+      "sha256": "843f86244e126eaeaabb1a92d3da5b644927c27e1ad400a6bde00bddff06d3f3"
+    },
+    "windows-typing-edit-02/result.json": {
+      "sha256": "a66c43df73eb0eb6edf95dcbf9b85fcc63b90ea54623626137ad61c758eda0e2"
+    },
+    "windows-typing-edit-02/evidence-audit.json": {
+      "sha256": "86b6e607d9584baba7eeaf39f6a0c7085f725ee98b3756192f787d61785494b9"
+    },
+    "input-recovery-validation-02/clipboard-check.json": {
+      "sha256": "b95baecd3d2d0e3cf8ae34499b99aa9e753a34025524fc608c520971f67ee26c"
+    },
+    "windows-input-death-03/result.json": {
+      "sha256": "07bc5c49159713cbe33a6fe93499b0245d8731cf0aba9aa9213e81722fc67167"
+    },
+    "input-recovery-death-03-service-cleanup.json": {
+      "sha256": "3849a8e5ea7ad1d967b98288e1a41255b00bc0ac2c6702e172e30b40ec6499bb"
+    },
+    "windows-input-death-04/result.json": {
+      "sha256": "c9316e26a727f5b91918535a91c6423d8643fb158b369d6b6a91c37fa2309d17"
+    },
+    "windows-input-death-04/evidence-audit.json": {
+      "sha256": "b885b6d61f1de8e095aed53775ee2f87d60498e4960e115798e66ccc738acd38"
+    },
+    "input-recovery-death-04-service-cleanup.json": {
+      "sha256": "0788cedb3cff26f59e4082ad93fd73d87af548874a0810f3157249e8829fb2eb"
+    },
+    "input-semantics-promoted-01/result.json": {
+      "sha256": "2936a89e59510de78f9270ca9fec33c01c9a0f9bdcb25e2067d6ecddbe52e9cd"
+    },
+    "input-semantics-promoted-01/identity.json": {
+      "sha256": "58af904ef3be8e8b603d6ddc5e92dd8358a32b05111efafb0b9a7c3430b40ce5"
     }
   },
   "remaining": [
-    "Paired live comparison completed: on passed, off timed out at matched 900s deadline. Resolve newly exposed same-turn old-image retrieval failure; preserve both baseline and current failures.",
-    "Qualify or repair clipboard restoration if executor is forcibly terminated during temporary ownership.",
+    "Qualify explicit guided-refresh live profile and final native sources. Four same-turn visual long checks passed with guided both; original guided-off failure retained. Paired baseline live comparison complete (on passed, off timed out).",
+    "Requalify revised native-edit executor and current client in a new matching clean snapshot. Focused control, typing, clipboard, and actual dispatch-death probes passed; original failures preserved.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
   ],
@@ -134,11 +176,24 @@
     "macos_qualified": false
   },
   "isolated_input_candidate": {
-    "runtime_tested": false,
-    "deployed": false,
+    "runtime_tested": true,
+    "deployed": true,
     "location": "apps/computer_use/.runtime/input-recovery-candidate",
-    "change": "Focused native edit replacement without taking clipboard ownership; pending actual Windows tests.",
-    "candidate_sha256": "6678710b6425f3d1a1828e0ba90213590526c9adad2b2751fb9d5f317747b45f"
+    "change": "Adopted focused native edit replacement without clipboard ownership; native semantic/input/death probes passed. Full real-model requalification pending.",
+    "candidate_sha256": "6678710b6425f3d1a1828e0ba90213590526c9adad2b2751fb9d5f317747b45f",
+    "semantics_passed_checks": 9,
+    "semantics_report": "apps/computer_use/.runtime/input-semantics-01/result.json",
+    "first_typing_attempt": "Setup focus failure retained in windows-typing-edit-01; no input was typed.",
+    "current_queue": "qw3-computer-input-death-04.service",
+    "current_queue_status": "passed",
+    "typing_checks_passed": 5,
+    "clipboard_formats_passed": 5,
+    "process_death_passed": true,
+    "process_death_report": "docs/computer_use_native_edit_recovery_20261001.json",
+    "promoted_driver_passed": true,
+    "promoted_driver_seconds": 115.7211521747522,
+    "source": "apps/computer_use/vm/executor.ps1",
+    "promoted_native_semantics_passed": true
   },
   "source_identity_note": "Native 18/18 and paired long-run baseline use app source 53cd0bf and engine e14b4298. Subsequent candidate engine/app repairs require fresh qualification; old results do not certify modified sources.",
   "live_archive": {
@@ -192,5 +247,12 @@
     "cases_each": 3,
     "prompt_tokens_long": 162062,
     "report": "docs/computer_use_same_turn_visual_01_20261001.json"
+  },
+  "guided_visual_diagnostic": {
+    "passed": true,
+    "long_checks": 4,
+    "short_seed_checks": 4,
+    "report": "docs/computer_use_guided_visual_20261001.json",
+    "current_live_profile_qualified": false
   }
 }

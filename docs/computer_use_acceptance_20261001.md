@@ -17,17 +17,17 @@ partial count is a time-stamped observation, not its final result.
 | CPU build and baseline checks | `cpu-baseline-recheck-01/{result.json,ctest.xml,check-0.log,check-1.log}` | Release CPU build from M0 rechecked: 44 CTests and 2 benchmark-helper tests passed. C++/original helper sources unchanged from checkpoint. Prior logs retained before replacing CTest's last-run log. |
 | Codex Responses subset, image/tool transport and lifecycle contracts | Native client bundle 04 manifest; `windows-native-suite-02/on-notepad-0/native-client-tests*` | 31 native Windows tests passed with actual pinned Codex. Its 19 bundled source files match the frozen baseline; modified clients need fresh qualification. This is subset compatibility, not the full Responses API. |
 | Actual local model/image/MCP loop | `codex-gpu-smoke-02`, `dflash-smoke-04`; native pilot/task artifacts | Actual QW3 vision and DFlash exercised, rather than fixture-only model responses. [Provider report](computer_use_codex_m1_20261001.md). |
-| Screenshots, bounded actions, stale observations and no-progress handling | Native contracts; `windows-scroll-contract-03`; `windows-recovery-03/result.json` | Real Windows scroll/failure/recovery evidence plus contract coverage. The old executor recovery evidence does not qualify the newly introduced clipboard critical section. |
-| Literal text and correct saved files | `windows-typing-paste-04/result.json`, `windows-clipboard-01/check-final.json` | Final executor: four Notepad inputs plus one Edge Unicode/4096-character form passed; five clipboard fixture formats restored. Existing failed approaches retained. |
+| Screenshots, bounded actions, stale observations and no-progress handling | Native contracts; `windows-scroll-contract-03`; `windows-recovery-03/result.json` | Real Windows scroll/failure/recovery evidence plus contract coverage. The revised executor has separate dispatch-death and clipboard evidence below. |
+| Literal text and correct saved files | `windows-typing-paste-04/result.json`, `windows-clipboard-01/check-final.json` | Frozen baseline executor: four Notepad inputs plus one Edge Unicode/4096-character form passed; five clipboard fixture formats restored. Existing failed approaches retained. |
 | User controls and UI | `browser-ui-check-01`; `windows-native-type-pilot-01/visual-review.json` | Actual browser start/pause/refresh/resume/stop with scripted endpoints passed; native real-task UI also visually inspected. No JavaScript errors in the button test. |
-| Pause and process restart | `windows-restart-01/result.json`; `windows-native-restart-01/summary.json` | Linux and Windows clients restored the same task and stayed paused until explicit resume; real files verified. Forced executor termination while it owns the temporary clipboard remains open. |
+| Pause and process restart | `windows-restart-01/result.json`; `windows-native-restart-01/summary.json` | Linux and Windows clients restored the same task and stayed paused until explicit resume; real files verified. The revised executor avoids temporary clipboard ownership; its new dispatch-death evidence is recorded below. |
 | KVMem on/off × none/MTP/DFlash fixed short inputs | `comparison-short-02/{summary.json,output_checks.json}` | 54 completed requests passed the limited next-tool/filename checks. Same frozen inputs, prefix reuse disabled. No desktop actions dispatched by this replay. |
 | Above-budget historical visual evidence | `comparison-long-02/visual-checks.json`; `comparison-long-controls-01/visual-checks.json` | 12/12 positive/changed-image-negative cases across all six profiles passed at 158,911 tokens. One repetition per case, not a statistical reliability claim. |
 | Growing history and Codex retention | `long-history-probe-01`; `codex-long-01/history-check.json` and raw inference/events | Growing fixture history and actual Codex preservation of eight images/4,800 notes demonstrated. This does not substitute for the live desktop archive task. |
 | Resource and speculation accounting | [Long matrix](computer_use_long_matrix_20261001.csv), [memory diagnostic](computer_use_memory_diagnostic_20261001.csv), scoped raw reports | DFlash accepted/drafted/fallback counters, TTFT, task/action and process/device measurements retained. Allocation traces passed on both policies but explicitly exclude some allocation classes; not a complete census. |
-| Three repetitions of each native Windows core task, both policies | `windows-native-suite-02/summary.json`; frozen `qw3-type-20261001` | Completed 18/18 with a passing independent evidence audit. Same source/model/binary/snapshot identities across both policies; per-trial CSV retained. This qualifies the frozen clipboard-preserving executor, not the undeployed recovery candidate. |
+| Three repetitions of each native Windows core task, both policies | `windows-native-suite-02/summary.json`; frozen `qw3-type-20261001` | Completed 18/18 with a passing independent evidence audit. Same source/model/binary/snapshot identities across both policies; per-trial CSV retained. This qualifies the frozen clipboard-preserving executor, not the subsequently revised native-edit executor. |
 | Actual long desktop task across retrieval threshold, both policies | [Completed repaired pair](computer_use_windows_long_pair_04_20261001.json); `windows-long-{on,off}-04` | On completed 36/36 pages in 644.65s; off timed out at 901.80s, last visible page 18/36. Both used the same 900s deadline and frozen configuration. The comparison is complete; both tasks did not pass. Earlier paired failures remain retained. |
-| Same-turn old-image positive/negative controls | [Failure report](computer_use_same_turn_visual_01_20261001.json) | At 162,062 tokens, on returned a wrong reference/name; off was correct. Both changed-image negatives returned null, but on produced no semantic retrieval dump. Guided-refresh configuration requires investigation. |
+| Same-turn old-image positive/negative controls | [Failure report](computer_use_same_turn_visual_01_20261001.json) | At 162,062 tokens, on returned a wrong reference/name; off was correct. Both changed-image negatives returned null, but on produced no semantic retrieval dump. Guided-refresh diagnostic subsequently passed; live qualification of that setting remains pending. |
 | macOS executor/client and physical targets | [Mac access preparation](computer_use_mac_test_access_20261001.md) | Still open. Readiness helper prepared; only syntax/help/non-Mac refusal verified. No Mac or physical Windows desktop acceptance has run. |
 
 ## Comparison interpretation
@@ -39,12 +39,18 @@ explicitly disable prefix reuse on both sides. Do not attribute all live-task
 latency differences to sparse retrieval alone. The long replay has one
 repetition per positive/negative case; it does not establish a reliability rate.
 
-An isolated input candidate now replaces the focused native edit selection
-without temporary clipboard ownership. It remains outside the deployed source:
-no Windows runtime checks have been performed on it. The completed matrix
-qualifies the frozen executor hash below, and the clipboard interruption gate
-remains open. A native selection/undo/read-only/NUL probe is prepared alongside
-the candidate; the original paired queue is now terminal.
+The revised input implementation replaces the focused native edit selection
+without taking clipboard ownership. Nine actual Windows control checks and
+five real Notepad/Edge input cases passed; saved bytes and hashes were checked
+independently. All five seeded clipboard formats survived. A real forced kill
+left the selected action durably `dispatching`; the executor restarted paused,
+rejected duplicate delivery and required explicit reconciliation. The final
+file contained exactly `BASE-ONCE`, with one local reconciled action record.
+The fixture's confirmation is controlled test setup, not automatic production
+recovery. Initial setup/focus failures remain retained. The repository-promoted
+fault driver also passed in 115.72s, with the saved file rechecked directly in
+the VM and exactly one reconciled local record; the prior 18-task matrix still
+qualifies only its frozen executor. [Input and recovery evidence](computer_use_native_edit_recovery_20261001.json).
 
 ## Frozen Windows qualification identity
 
@@ -65,9 +71,9 @@ the candidate; the original paired queue is now terminal.
 ## Open gates
 
 The repeated native matrix passed for its frozen executor. The goal cannot
-close until the same-turn visual retrieval failure is resolved, the clipboard
-ownership failure case is qualified or repaired, and the macOS/accessible
-physical-desktop requirements are satisfied. The live on/off archive comparison
+close until the guided-refresh configuration and revised native sources pass
+fresh live qualification, and the macOS/accessible physical-desktop
+requirements are satisfied. The live on/off archive comparison
 is complete, including the off-policy timeout.
 Earlier failures remain failures even when their repaired pilot passes.
 Missing hardware is recorded as missing evidence, never a successful test.
@@ -161,3 +167,25 @@ pressure-prefill; no retrieval dump was produced. The diagnostic also reports
 its missing-file validation error. This failure remains open, and does not
 become a pass because the earlier live archive succeeded.
 [Full retained failure](computer_use_same_turn_visual_01_20261001.json).
+
+
+## Guided same-turn diagnostic
+
+The isolated `--kvmem-guided-reselect both` profile passed all four long
+on/off positive/changed-image-negative checks, plus their four short seeds.
+Each branch starts a fresh engine, sends the same 4,114-token seed, then an
+identical 162,062-token long body on both policies. The positive/negative bodies
+differ only in the old PNG and diagnostic tag. Both on-policy long cases selected
+1,018 of 1,267 blocks with ready query/index state and no scorer fallback.
+The replacement private query had 37/33 captured tokens; the original query-span
+length in metadata is 1,109, so these quantities are intentionally different.
+DFlash remained active without fallback. Raw stream outputs, input hashes,
+model/launcher identities and retrieval tags passed an independent audit.
+
+Positive elapsed time was 64.68s on / 60.82s off; negative was 64.66s / 60.71s.
+These single replay measurements establish neither a reliability rate nor a
+live-task speedup. No desktop tools were dispatched. The application launcher
+now exposes `--guided-refresh both`; default `off` preserves reproducibility of
+older measurements. The previous wrong answer remains a failure of that older
+configuration. A fresh live/native qualification of revised sources is pending.
+[Guided diagnostic evidence](computer_use_guided_visual_20261001.json).

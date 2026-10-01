@@ -1,7 +1,7 @@
 """Verify literal desktop text input by saving actual Notepad files in the test VM.
 
 No model, UIA writing, or programmatic document edits are used.
-The executor may temporarily paste into edit controls; the probe still saves
+The executor inserts literal text into the focused edit control; the probe saves
 through the ordinary UI and independently verifies the resulting files.
 The focus point is for the reviewed default VM window geometry; Save As uses
 visible accessibility control centers. Run only while other VM tasks are idle.
