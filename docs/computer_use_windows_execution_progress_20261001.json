@@ -1,28 +1,28 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T02:25:31.385816+08:00",
+  "updated_at": "2026-10-02T03:01:13.623077+08:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
   "v0_frozen": false,
   "client": {
-    "host_tests_passed": 61,
-    "windows_tests_passed": 61,
-    "bundle": "windows-native-client-11",
+    "host_tests_passed": 72,
+    "windows_tests_passed": 72,
+    "bundle": "windows-native-client-13",
     "qualification": {
       "kind": "windows_native_client_contract_tests",
-      "finished": "2026-10-02T00:48:53.6701517+00:00",
-      "directory": "C:\\Qw3Computer\\clients\\71c9d1050355",
-      "started": "2026-10-02T00:48:17.3649873+00:00",
+      "finished": "2026-10-02T01:49:05.7210469+00:00",
+      "directory": "C:\\Qw3Computer\\clients\\482d558bc3e4",
+      "started": "2026-10-02T01:48:28.5509090+00:00",
       "python": "Python 3.13.13",
-      "bundle_sha256": "71c9d1050355b608a6004cc124f5a79af77efa85f511c083bf7a223e323abaac",
+      "bundle_sha256": "482d558bc3e4690731f28ca300d2295d5c87649eb74960ef1a42632ee9a564c3",
       "passed": true,
       "codex": "codex-cli 0.159.2",
       "process_exit_code": 0
     },
-    "host_tests_evidence": "apps/computer_use/.runtime/followup-host-contract-tests-01.log",
-    "windows_tests_evidence": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-11.stderr.log",
-    "package_manifest": "apps/computer_use/.runtime/windows-native-client-11/archive.json",
+    "host_tests_evidence": "apps/computer_use/.runtime/native-driver-host-tests-02.log",
+    "windows_tests_evidence": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-13.stderr.log",
+    "package_manifest": "apps/computer_use/.runtime/windows-native-client-13/archive.json",
     "default_shared_candidate_promoted": false,
     "qualification_uses_scripted_backend_not_qw3_inference": true
   },
@@ -125,6 +125,31 @@
       },
       "upstream_checkout_modified": false,
       "classification": "common_platform_preparation_not_agent_strategy_gain"
+    },
+    "cloudcrm_overlay": {
+      "dockerfile": "apps/computer_use/vm/osworld-crm.Dockerfile",
+      "fix": "Qualified is a lead status, not proof of conversion; set and check isConverted after actual conversion",
+      "deployed": {
+        "kind": "owned_crm_conversion_overlay_deployment",
+        "passed": true,
+        "image": "sha256:cd4d46c18034475aa964ba15979fcf8d5d4210ad1a0800fc939c7518ee566896",
+        "container": "6d5ace929c8963b980b03ca2bb092c2ba982b6bd35edc0154b90d7ef43f0f4a9",
+        "restored": [
+          {
+            "user": "osworld-state-qualification-566bea49ecba44b8",
+            "data_and_note_preserved": true
+          },
+          {
+            "user": "osworld-038-qual-02",
+            "data_and_note_preserved": true
+          }
+        ],
+        "formal_run": false
+      },
+      "candidate_api_cases_passed": 15,
+      "candidate_api_evidence": "apps/computer_use/.runtime/osworld-crm-conversion-01/result.json",
+      "upstream_checkout_modified": false,
+      "classification": "common_platform_preparation_not_agent_strategy_gain"
     }
   },
   "source_sha256": {
@@ -135,10 +160,10 @@
     "apps/computer_use/vm/qualify_recording.py": "2213c764dfb70a1dee8fe89d97a77c1d09292c487ce4ab4c9587087f0d079e17",
     "apps/computer_use/vm/vnc_admin.py": "8ecafde699aef14c519c28dd9a6cc6bebfef5cc1d43d6c2e9ddff72077354921",
     "apps/computer_use/vm/install_osworld_graphics_wps.ps1": "6d289dfdf757de91c7006ee4c7ac3803c97f2f4ca955ea67428c3a990a7aa00e",
-    "apps/computer_use/qw3_computer/tool_schema.py": "e14eb6891a0262453d789f5c41c06e54bc0500cdf2bed2fb1c1a475b8cb289fe",
-    "apps/computer_use/vm/executor.ps1": "43a615ba64e23f49bebd94c63662db278b42f8c301980fe85a8d57b6b3c9f3e1",
-    "apps/computer_use/task_driver.py": "1ad798fbf7bf253197ae96fe5aec4d0e82488350c4a1e338426a9e276f9ffddf",
-    "apps/computer_use/tests/test_task_driver.py": "ae5f8abadbfd5198325b855c318e7016e4fdabc7f1cfb54d890c653c5afbe8a3",
+    "apps/computer_use/qw3_computer/tool_schema.py": "32c59bdd6b3cd9f7631661d2ebc657b89efb830215608a7c817ce0a32d924f80",
+    "apps/computer_use/vm/executor.ps1": "ce6d820b5bfbd7c21978cb130971d9d0b94f1280d9df2d78fd87e2d84c6ae104",
+    "apps/computer_use/task_driver.py": "4392a36594b58510ee1c9e107cba8377b7ea606bdf2850565a625c165b62a5e6",
+    "apps/computer_use/tests/test_task_driver.py": "4e69591f27474bd307757ae41d22d3d423eab28ecb9ccbe95aae1b42d4ebbed5",
     "apps/computer_use/probe_compaction.py": "a38ba82434b553a4cc22a0b4c94d97f69797a1ee99d0fda8c1e3e816dee05abd",
     "apps/computer_use/vm/test_drag_interruption.ps1": "48d7fdc451ea52f413a44f8d3408fe256e7d09cef8e2c3226c1af6a0783f581d",
     "apps/computer_use/windows_drag_interruption.py": "79665defa3cc81cb0ab55a993a72588b215764b605295b6e6db6673f423f7dc4",
@@ -177,7 +202,7 @@
     "apps/computer_use/osworld_windows/qualify043.py": "3fcb792eac502f208870e4008c7e986bd54f9b5f413f720e37e269849ad66739",
     "apps/computer_use/osworld_windows/prepare043.py": "0ecb8178149b3ae1c6d15af35f92efb63c36342c7bc8a6843cb29e32d4bdbc43",
     "apps/computer_use/vm/osworld-calendar.Dockerfile": "4851738919820ad0d59aa2e9a35cd881296c1cae4827717cd4fb02475696042e",
-    "apps/computer_use/vm/osworld-web.compose.yml": "c8d98aff20a79c2188f24648a871914ba4e24e8626453ed01703bb7e7a52725b",
+    "apps/computer_use/vm/osworld-web.compose.yml": "8188e6c7af9c88c154885a6d1aae273c8ca324345d4c26fe2f901b46b726c88a",
     "apps/computer_use/tests/test_codex_integration.py": "1ffe9ed791efea8ae0d5f8a508bdf0810ae37868238c24a9a1c68385af99d5a6",
     "apps/computer_use/osworld_windows/prepare035.py": "a5e69cadfbab7dce43328d8529ae802b44853dfb08d9f2c124537082274a993c",
     "apps/computer_use/osworld_windows/events035.py": "2f30a5cb1165096f0ce74955230efcc0d1bacb3d314947ef3927e9ed4fc44284",
@@ -185,13 +210,23 @@
     "apps/computer_use/osworld_windows/task051.py": "02939fd881cfa95f19458c4cb86b1bfe65cb40d2224ea62676b8036888bbcf5d",
     "apps/computer_use/osworld_windows/qualify051.py": "e07c88eaa463dc02715722359675467e08355f80eaa0cc7fcdba93984954d37a",
     "apps/computer_use/osworld_windows/qualify080.py": "c1706ed39d8fa190fce9b75107bb99ae8694a406fa992c46fa6922c7927614d7",
-    "apps/computer_use/vm/osworld-image-grader.Dockerfile": "c485fb1aa768a908423af063ce45fefa61572cfd70ccbb966f8d2bcba67822ff"
+    "apps/computer_use/vm/osworld-image-grader.Dockerfile": "c485fb1aa768a908423af063ce45fefa61572cfd70ccbb966f8d2bcba67822ff",
+    "apps/computer_use/vm/client_resources.ps1": "08ea5918132f4238830548c6d41b075cdb27c0fdcd95d03d6c272ea0199c6c3e",
+    "apps/computer_use/vm/run_native_task.ps1": "e3fe2b800665549ee4932c18cfb2d367069cee560ad43839552d176ac854dc9e",
+    "apps/computer_use/vm/test_application_entries.ps1": "543a1325100f953cb23ced0de3d09a49befe7bc3a6737a7ee00c57947348ee1a",
+    "apps/computer_use/vm/osworld-crm.Dockerfile": "a66ef1c18a78795dd311c68cee49edeb32823a3240b13383baeced107a85424d",
+    "apps/computer_use/osworld_windows/entries.py": "7f23ceab3435447ef5d728cee209d5d60e8a9ac501eafdcd7ced6e2319cd908e",
+    "apps/computer_use/osworld_windows/launch.py": "6d37109c35a6fdbddd97988bda57bae3c22dfbc292abe9962ab78160a6d4727f",
+    "apps/computer_use/osworld_windows/reviews035.py": "08e6533729b451398e0a9c8ceeb2cba80b7f59ae096f4c483ec311f5ac0c5545",
+    "apps/computer_use/osworld_windows/qualify035_reviews.py": "0ea27ee3a2694c4aab9f08e88ba5107d01ab20cef65b437340778986a72cd28e",
+    "apps/computer_use/osworld_windows/qualify_native_driver.py": "e153c59c0d47913ddda544f1afc6a1c55513eeb6b5f9bb4d71a8dff6fb46118c",
+    "apps/computer_use/osworld_windows/qualify_crm_conversion.py": "4b514dc3e3c874c9ddb51b1ff0e3d243b11cb163b087dd2cdb85bdb8142da553"
   },
   "pending": [
-    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 native dynamic driver and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 actual process audit integration",
+    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 visibility and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 actual process audit integration",
     "Resolve 004 locked-slide preservation across repeated native saves and font substitution",
-    "Wire terminal driver, qualified native binary artifact collection, reset, recorder and graders into the continue-on-task-failure campaign scheduler",
-    "Qualify benchmark browser reopen and Explorer entry paths; current Edge open_app still targets legacy BrowserProfile/fixture.html",
+    "Integrate qualified generic native launcher, collectors, event handoff, task reset, recorder and graders into the continue-on-task-failure campaign scheduler",
+    "Integrate qualified application-entry configurations into all scenario initializers and clean reset",
     "Before freezing: archive/remove all known-answer qualification files and old task products from guest and SMB-visible share; validate minimal per-attempt public staging",
     "Mirror private-site decorative remote assets and validate remaining UI paths",
     "Full-duration recording overhead and monotonic event alignment",
@@ -321,7 +356,7 @@
     "terminal_result_available": true
   },
   "evidence_paths": {
-    "native_client": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-09.json",
+    "native_client": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-13.json",
     "recording": "apps/computer_use/.runtime/windows-osworld-recording-probe-02",
     "installers": "apps/computer_use/.runtime/windows/shared/osworld-installers-01",
     "inventory": "apps/computer_use/.runtime/windows/shared/osworld-app-inventory-02.json"
@@ -725,8 +760,12 @@
       "grader_cases_passed": 11,
       "grader_evidence": "apps/computer_use/.runtime/osworld-038-grader-01/result.json",
       "gui_evidence": "apps/computer_use/.runtime/osworld-038-qual-02",
-      "gui_status_write_validated": false,
-      "pending": "Native GUI status change/conversion and pristine reset qualification; mirror decorative remote avatars locally"
+      "gui_status_write_validated": true,
+      "pending": "Fresh snapshot/restore qualification and local decorative assets; integrate initializer and grader into campaign",
+      "gui_conversion_validated": true,
+      "gui_status_evidence": "apps/computer_use/.runtime/osworld-entry-qualification-01/crm-status-result.json",
+      "gui_conversion_evidence": "apps/computer_use/.runtime/osworld-entry-qualification-01/crm-conversion-result.json",
+      "upstream_conversion_defect_fixed": true
     },
     "080": {
       "model_test_completed": false,
@@ -841,7 +880,7 @@
         1620
       ],
       "remaining": [
-        "Wire actual completed-review checkpoints and follow-up into the native campaign driver",
+        "Integrate qualified native four-review driver into frozen campaign attempts",
         "Instrument event delivery, UI visibility and first model observation on one host monotonic timeline",
         "Fresh snapshot and restore roundtrip; remove all qualification answers/workbooks from guest and SMB before freeze"
       ],
@@ -864,7 +903,11 @@
       ],
       "preserved_failures": [
         "apps/computer_use/.runtime/osworld-035-qual-01/tab-input-limitation.json"
-      ]
+      ],
+      "native_same_thread_driver_qualified": true,
+      "native_driver_evidence": "apps/computer_use/.runtime/native-driver-qual-02/result.json",
+      "driver_qualification_uses_scripted_backend": true,
+      "host_handoff_cases_passed": 10
     },
     "043": {
       "model_test_completed": false,
@@ -929,7 +972,7 @@
     "receipt": "apps/computer_use/.runtime/windows/shared/binary-collection-qual-01/receipt.json",
     "independent_validation": "apps/computer_use/.runtime/windows/shared/binary-collection-qual-01-independent.json",
     "limitations": [
-      "Administrative component, not yet wired into the campaign scheduler",
+      "Integrated with generic native task launcher; final snapshot/recorder/campaign scheduler remains pending",
       "XCF artifact scoring separately qualified; process-constraint review still required for real trajectories",
       "Presentation is a previously saved qualification output, not pristine input"
     ],
@@ -945,5 +988,120 @@
     "evidence": "apps/computer_use/.runtime/followup-codex-integration-01.log",
     "formal_run": false,
     "scope": "Common task lifecycle feature, not an agent strategy optimization"
-  }
+  },
+  "native_task_driver": {
+    "qualification": {
+      "passed": true,
+      "native_bundle": "482d558bc3e4690731f28ca300d2295d5c87649eb74960ef1a42632ee9a564c3",
+      "formal_run": false,
+      "model_used": false,
+      "scripted_backend": true,
+      "elapsed_seconds": 21.45608540000103,
+      "resource_samples": 19,
+      "complete_resource_samples": 19,
+      "checks": {
+        "four_reviews_same_thread": true,
+        "four_distinct_turns": true,
+        "lifetime_budget_retained": true,
+        "three_public_updates_in_history": true,
+        "previous_review_text_retained": true,
+        "desktop_observed_once_per_review": true,
+        "all_original_events_once": true,
+        "terminal_queue_continues": true,
+        "native_export_preserves_fixture": true,
+        "missing_artifact_not_infrastructure": true,
+        "credential_not_exported": true
+      },
+      "known_limitations": [
+        "SMB file handoff waits about five seconds per update on this VM; separate from inference latency",
+        "No continuous recording in this component qualification",
+        "Screen observations do not prove newly delivered TeamChat messages were read; visibility/first-use audit still required"
+      ]
+    },
+    "evidence": "apps/computer_use/.runtime/native-driver-qual-02/result.json",
+    "terminal_driver_cases_passed": 18,
+    "host_review_handoff_cases_passed": 10,
+    "host_review_handoff_evidence": "apps/computer_use/.runtime/osworld-035-review-handoff-01/result.json",
+    "production_campaign_scheduler_complete": false,
+    "full_recording_and_snapshot_integration_complete": false
+  },
+  "application_entries": {
+    "native_contracts": {
+      "passed": true,
+      "cases": [
+        {
+          "name": "legacy_without_configuration",
+          "passed": true
+        },
+        {
+          "name": "three_sites_and_exact_hash",
+          "passed": true
+        },
+        {
+          "name": "single_loopback_site",
+          "passed": true
+        },
+        {
+          "name": "PurchaseTasks_profile",
+          "passed": true
+        },
+        {
+          "name": "CalendarTasks_profile",
+          "passed": true
+        },
+        {
+          "name": "external_url",
+          "passed": true
+        },
+        {
+          "name": "browser_argument_injection",
+          "passed": true
+        },
+        {
+          "name": "network_share_profile",
+          "passed": true
+        },
+        {
+          "name": "other_attempt_profile",
+          "passed": true
+        },
+        {
+          "name": "profile_path_traversal",
+          "passed": true
+        },
+        {
+          "name": "other_explorer_root",
+          "passed": true
+        },
+        {
+          "name": "unknown_task",
+          "passed": true
+        },
+        {
+          "name": "non_array_urls",
+          "passed": true
+        },
+        {
+          "name": "empty_urls",
+          "passed": true
+        },
+        {
+          "name": "unknown_property",
+          "passed": true
+        }
+      ],
+      "executor_sha256": "ce6d820b5bfbd7c21978cb130971d9d0b94f1280d9df2d78fd87e2d84c6ae104",
+      "kind": "native_application_entry_contracts"
+    },
+    "native_browser_reopen_and_explorer_passed": true,
+    "evidence": "apps/computer_use/.runtime/osworld-entry-qualification-01/result.json",
+    "configuration_is_host_owned_not_mcp_argument": true,
+    "initializers_need_campaign_integration": true
+  },
+  "preparation_observations_not_v1_candidates": [
+    "Wrapped multi-line link bounding-box centers can fall between clickable text lines",
+    "Browser control hints can briefly be empty after native popup closure",
+    "Wheel input can modify a focused numeric field; verify values before submission",
+    "SMB update handoff takes about five seconds per batch; keep separate from model latency"
+  ]
 }

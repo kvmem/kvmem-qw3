@@ -328,6 +328,31 @@ function Require($Condition, [string]$Message) { if (!$Condition) { throw $Messa
 function Properties($Value, [string[]]$Allowed) {
     foreach ($property in $Value.PSObject.Properties.Name) { Require ($property -in $Allowed) "Unexpected action property: $property" }
 }
+function Application-Entries {
+    # Written by the task initializer, never supplied as an MCP argument.
+    $path = Join-Path $root 'application-entries.json'
+    if (!(Test-Path -LiteralPath $path)) {
+        return @{browser_profile="$root\BrowserProfile"; browser_urls=@('file:///C:/Qw3Computer/fixture.html'); explorer_path=$outputs; legacy=$true}
+    }
+    $raw = [IO.File]::ReadAllBytes($path)
+    $entry = [Text.Encoding]::UTF8.GetString($raw).TrimStart([char]0xfeff) | ConvertFrom-Json
+    Properties $entry @('version','run','task','browser_profile','browser_urls','explorer_path')
+    Require ($entry.version -eq 1 -and $entry.run -cmatch '^[a-zA-Z0-9_-]{8,60}$') 'Invalid task application entry identity'
+    Require ($entry.task -in @('013','004','006','010','038','022','035','043','080','051')) 'Unknown application entry task'
+    $profile = "$root\OsworldBrowserProfile"
+    if ($entry.task -eq '022') { $profile = "$root\LoanTasks\$($entry.run)\BrowserProfile" }
+    if ($entry.task -eq '035') { $profile = "$root\PurchaseTasks\$($entry.run)\BrowserProfile" }
+    if ($entry.task -eq '043') { $profile = "$root\CalendarTasks\$($entry.run)\BrowserProfile" }
+    Require ($entry.browser_profile -ceq $profile) 'Unexpected task browser profile'
+    Require ($entry.browser_urls -is [array] -and $entry.browser_urls.Count -ge 1 -and $entry.browser_urls.Count -le 8) 'Task needs one to eight browser entry URLs'
+    foreach ($url in $entry.browser_urls) {
+        Require ($url -is [string] -and $url -cmatch '^(about:blank|http://(formcraft|teamchat|cloudcrm|calendar|mailhub)\.qw3\.test:18090/[a-zA-Z0-9_/?=&.%-]*|http://(localhost|127\.0\.0\.1):808[1-6]/[a-zA-Z0-9_/?=&.%-]*)$') 'Unexpected task browser entry URL'
+    }
+    $folders = @("$env:USERPROFILE\Desktop", "$env:USERPROFILE\Documents", "$env:USERPROFILE\Downloads", "$env:USERPROFILE\Documents\LoanDocs", $outputs)
+    Require ($entry.explorer_path -cin $folders -and (Test-Path -LiteralPath $entry.explorer_path -PathType Container)) 'Unexpected task Explorer entry folder'
+    return @{browser_profile=$entry.browser_profile; browser_urls=@($entry.browser_urls); explorer_path=$entry.explorer_path;
+        run=$entry.run; task=$entry.task; sha256=(Hash-Bytes $raw); legacy=$false}
+}
 function Validate-Action($Action, $Observation) {
     Require ($null -ne $Action) 'Missing action'
     $kind = [string]$Action.kind
@@ -387,6 +412,8 @@ function Act($Request) {
     Require (([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $script:latest.captured_at) -lt 60000) 'Observation expired; observe again'
     $before = $script:latest
     Validate-Action $Request.action $before
+    $applicationEntries = $null
+    if ($Request.action.kind -eq 'open_app' -and $Request.action.app -in @('edge','explorer')) { $applicationEntries = Application-Entries }
     $front = Foreground
     Require ($front.handle -eq $before.foreground.handle) 'Foreground window changed; observe again'
     if ($Request.action.kind -ne 'open_app') { Require ($front.process -in $allowedApps) 'Foreground application is outside the allowed scope' }
@@ -397,6 +424,7 @@ function Act($Request) {
         }
     }
     $record = @{ signature=$signature; status='dispatching'; request=$Request; dispatched_at=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+    if ($applicationEntries) { $record.application_entries = $applicationEntries }
     Save-Json $path $record
     # From this durable point onward, errors imply uncertain delivery. Never
     # dispatch the same action_id again, including after executor restart.
@@ -456,10 +484,11 @@ function Act($Request) {
                 }
                 switch ($a.app) {
                     'notepad' { Start-Process notepad.exe }
-                    'explorer' { Start-Process explorer.exe $outputs }
+                    'explorer' { Start-Process explorer.exe -ArgumentList ('"'+$applicationEntries.explorer_path+'"') }
                     'edge' {
                         $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
-                        Start-Process $edge @('--no-first-run','--no-default-browser-check','--disable-background-networking','--disable-component-update','--disable-sync','--force-renderer-accessibility',"--user-data-dir=$root\BrowserProfile",'file:///C:/Qw3Computer/fixture.html')
+                        $arguments = @('--no-first-run','--no-default-browser-check','--disable-background-networking','--disable-component-update','--disable-sync','--force-renderer-accessibility',('--user-data-dir="'+$applicationEntries.browser_profile+'"')) + $applicationEntries.browser_urls
+                        Start-Process $edge -ArgumentList $arguments
                     }
                 }
                 Start-Sleep -Milliseconds 800

@@ -39,6 +39,7 @@ services:
     <<: *backend
     build:
       context: ../../../third_party/OSWorld-web/cloudcrm_web/backend
+      dockerfile: ../../../../apps/computer_use/vm/osworld-crm.Dockerfile
       args: *direct-downloads
     ports: ["127.0.0.1:18112:8000"]
     volumes: ["../../../third_party/OSWorld-web/cloudcrm_web/STATE.md:/app/STATE.md:ro"]
