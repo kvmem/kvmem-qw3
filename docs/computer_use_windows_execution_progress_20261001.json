@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T00:23:54.686195+08:00",
+  "updated_at": "2026-10-02T00:58:22.992534+08:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -127,10 +127,18 @@
     "apps/computer_use/osworld_windows/qualify010.py": "085c44ef3b9b690bd73be4c5ccbd6afb8af8d4fb033088d9daf66668b69c9f7a",
     "apps/computer_use/osworld_windows/prepare038.py": "148e456f9b2ae650209bfe5479a67766d95799eccc785e3d7058a8476f9f4de4",
     "apps/computer_use/osworld_windows/source.py": "2a4654ad3bc70d36cd530ccfa6a15f8cc630081383d7f0449b416dedc67ba8e3",
-    "apps/computer_use/osworld_windows/task038.py": "ca25101c3283776d700ce22b381fc384ce20562317886ddd38b6767a3e1cd31c"
+    "apps/computer_use/osworld_windows/task038.py": "ca25101c3283776d700ce22b381fc384ce20562317886ddd38b6767a3e1cd31c",
+    "apps/computer_use/osworld_windows/task035.py": "edbfbb2ec800e58958cc3ebcf25d17bf11431409b2b015e9751530182778e249",
+    "apps/computer_use/osworld_windows/task022.py": "aa549464508c61cd2ae2a89003a15e4e0060fe73d495fff3c02617ddfe2f50ca",
+    "apps/computer_use/osworld_windows/prepare022.py": "4796d877d1670f3d8224af4358f000a63ebff9f02e0edd58866785d7b716446d",
+    "apps/computer_use/osworld_windows/qualify035.py": "895a137472dc0732d21f007dd3b683297a5099f84344665ebc9e7a0f29d8b27e",
+    "apps/computer_use/osworld_windows/qualify022_web_guest.py": "b9aed512e1fd3590ba7f2dae230a7b1d78499e47be231bf286b9867dd114d591",
+    "apps/computer_use/osworld_windows/materials022.py": "bcbeb01d97bf376368eb3bf97a2151756779547577fdde619bec682d3c552677",
+    "apps/computer_use/osworld_windows/collect022_guest.py": "c33a4c7089638f473a72131c25f1d5d0a6ecbb718a14d4486a1e339a56c6db48",
+    "apps/computer_use/osworld_windows/qualify022.py": "284ead5715b0f9e3dc48c45701f17dba427306fb943aca34d4272db0b0b4c06d"
   },
   "pending": [
-    "Complete remaining task initializers and independent positive/negative graders, especially 006 materials, 022 sites, 035 dynamic events, 043 calendar, 051 process constraints",
+    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 dynamic events; 043 calendar; 051 process constraints",
     "Resolve 004 locked-slide preservation across repeated native saves and font substitution; finish 080 positive/full rubric qualification",
     "Wire terminal driver, native binary artifact collection, reset, recorder and graders into the continue-on-task-failure campaign scheduler",
     "Qualify benchmark browser reopen and Explorer entry paths; current Edge open_app still targets legacy BrowserProfile/fixture.html",
@@ -699,6 +707,73 @@
         "layers": 1,
         "background_layer_name": "background.png"
       }
+    },
+    "022": {
+      "model_test_completed": false,
+      "snapshot_frozen": false,
+      "reset_roundtrip_validated": false,
+      "fixture": "apps/computer_use/.runtime/osworld-022-materials-02",
+      "fixture_manifest_sha256": "44287f57e9b04d9890b27d65e7d7dd19f1cd7dbfd5fa104d18064a3d9922827d",
+      "local_pdfs": 87,
+      "website_pdfs": 43,
+      "public_files": 158,
+      "required_documents": 23,
+      "pdf_parse_checks_passed": 130,
+      "host_generator_dependency": "fpdf2==2.8.7",
+      "public_account_urls_adapted_to_guest_loopback": true,
+      "grader_cases_passed": 24,
+      "grader_evidence": "apps/computer_use/.runtime/osworld-022-grader-02/result.json",
+      "six_guest_loopback_sites_running": true,
+      "debug_port_guest_loopback_only": true,
+      "known_answer_upload_submission_passed": true,
+      "known_answer_original_score": 1.0,
+      "qualification_upload_method": "CDP real file-input selection of 23 known-answer files",
+      "qualification_submit_method": "native Computer MCP click on observed Submit Application button",
+      "native_single_file_picker_upload_passed": true,
+      "native_file_picker_evidence": "apps/computer_use/.runtime/osworld-022-qual-02/upload-result.json",
+      "bank_login_native_download_and_hash_passed": true,
+      "native_download_evidence": "apps/computer_use/.runtime/osworld-022-qual-03/download-verified.json",
+      "browser_download_directory": "C:\\Qw3Computer\\outputs",
+      "download_location_explicit_in_task_prompt": true,
+      "known_answer_submission_evidence": "apps/computer_use/.runtime/osworld-022-qual-03/independent-result.json",
+      "continuous_recording": {
+        "evidence": "apps/computer_use/.runtime/osworld-022-qual-03/video/recording.json",
+        "complete": true,
+        "seconds": 150.338136487,
+        "captures": 390,
+        "video_frames": 1504,
+        "model_used": false
+      },
+      "preview_url": "http://127.0.0.1:18087/index.html",
+      "preserved_failures": [
+        "apps/computer_use/.runtime/osworld-022-qual-01",
+        "apps/computer_use/.runtime/osworld-022-qual-03/download-result.json"
+      ],
+      "remaining": [
+        "Validate remaining four account UI download paths",
+        "Fresh per-attempt snapshot and restore roundtrip",
+        "Remove all qualification file mappings/answers and previous downloads from guest and SMB-visible share before formal freeze",
+        "Bind initializer, collector and scorer to native campaign driver"
+      ]
+    },
+    "035": {
+      "model_test_completed": false,
+      "snapshot_frozen": false,
+      "grader_cases_passed": 16,
+      "grader_evidence": "apps/computer_use/.runtime/osworld-035-grader-01/result.json",
+      "original_remote_judge_used": false,
+      "original_score_claimed": false,
+      "adaptation": "Local deterministic saved-workbook matching, all seven fields, protected header/baseline and no extra rows; events_complete gate",
+      "scheduled_messages": 23,
+      "late_material_arrivals_seconds": [
+        1500,
+        1620
+      ],
+      "remaining": [
+        "Freeze reproducible dynamic event delivery and visibility evidence",
+        "Initialize Windows workbook and private TeamChat state",
+        "Validate Windows saved positive and pristine reset"
+      ]
     }
   },
   "latest_preparation_source": "This commit; source identities are recorded above. V0 remains unfrozen.",

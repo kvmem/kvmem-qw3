@@ -197,27 +197,32 @@
       "scenario_id": "win-osworld-022",
       "source_task_id": "022",
       "title_zh": "申请材料核对上传",
-      "status": "not_started",
+      "status": "qualification_in_progress",
       "analysis_role": "diagnostic_development",
       "batch": "B",
       "provisional_timeout_seconds": 5400,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
-      "grader_validated": false,
-      "recording_validated": false
+      "grader_validated": true,
+      "recording_validated": false,
+      "known_answer_windows_submission_validated": true,
+      "native_bank_download_validated": true,
+      "all_account_downloads_validated": false
     },
     {
       "scenario_id": "win-osworld-035",
       "source_task_id": "035",
       "title_zh": "动态采购审批",
-      "status": "not_started",
+      "status": "qualification_in_progress",
       "analysis_role": "diagnostic_development",
       "batch": "B",
       "provisional_timeout_seconds": 5400,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "local_grader_cases_validated": true,
+      "dynamic_delivery_validated": false
     },
     {
       "scenario_id": "win-osworld-043",
