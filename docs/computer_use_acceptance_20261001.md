@@ -26,6 +26,9 @@ defines outcome, latency, resource and recording comparisons. A synchronized
 offline replay of retained archive observations is available in
 `comparison-replay-long-07-04/index.html`; it is screenshot reconstruction,
 not continuous video or a result from the proposed ten scenarios.
+The [execution and agent-optimization plan](computer_use_windows_execution_optimization_20261001.md)
+adds platform readiness gates, failure analysis, separate V0/V1 workflow versions,
+and a four-condition retest matrix. Its status ledger contains planned cells only.
 
 ## Current qualified identities
 
