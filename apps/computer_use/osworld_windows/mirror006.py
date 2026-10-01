@@ -17,7 +17,9 @@ from .mailboxes import prepare_profile
 from .source import ROOT, asset, sha256
 
 ORIGINALS = ROOT / 'apps/computer_use/.runtime/osworld-006-frozen-originals-04'
-ORIGIN = 'http://localhost:8087'
+# Each scenario runs alone after a clean restore. Reuse an already qualified
+# local browser-entry port; do not widen the executor's URL boundary.
+ORIGIN = 'http://localhost:8086'
 
 
 def rewrite_links(source, target, mapping):
@@ -126,6 +128,7 @@ def build(originals, output, *, allow_incomplete=False):
     mailbox = prepare_profile('006', public / 'MailProfile', r'C:\Qw3Computer\TaskMailProfiles\RUN_ID')
     hashes = {str(p.relative_to(public)): sha256(p) for p in sorted(public.rglob('*')) if p.is_file()}
     report = {'kind': 'task006_offline_original_mirror', 'formal_run': False, 'complete': complete,
+              'origin': ORIGIN,
               'formal_ready': False, 'diagnostic_only': not complete,
               'unavailable_applicants': [row['name'] for row in rows if not row['available']],
               'original_manifest_sha256': sha256(originals / 'manifest.json'),

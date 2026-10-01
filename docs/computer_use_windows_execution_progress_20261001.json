@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-01T21:58:35.084447+00:00",
+  "updated_at": "2026-10-01T22:39:05.973373+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -231,16 +231,24 @@
     "apps/computer_use/vm/prepare_osworld_baseline.ps1": "5143bc6bba6bb7f2ae37993094f6a507644d5072b458fc5bc878264d9781889c",
     "apps/computer_use/vm/verify_osworld_baseline.ps1": "bb44f8e063fa4ee2752b552339b279852f074b9c21ad288ce1a99b4efa7d5a0a",
     "apps/computer_use/osworld_windows/preflight013.py": "4ea514fd05881077837eb72d7eb92f83153f6cd00a861d9ac1d03ac15a3229f2",
-    "apps/computer_use/osworld_windows/summarize_preflight.py": "6e7f61e2f95d276fa1a8d5d61dd802e81a0bd9b847a2f44a534c54bdb6f9e49d"
+    "apps/computer_use/osworld_windows/summarize_preflight.py": "6e7f61e2f95d276fa1a8d5d61dd802e81a0bd9b847a2f44a534c54bdb6f9e49d",
+    "apps/computer_use/collect_directory.py": "8b6123c268f0dc900deac5b45538cdb52d81cc797d57783db8c4f842e03f532f",
+    "apps/computer_use/osworld_windows/analyze_relay.py": "a852bf0698e458cdf24f56ed695217b7e8d548de6c4c8800f57d343fd00aa961",
+    "apps/computer_use/osworld_windows/task006.py": "e3f27170d0a4da446e6933ec282e865987fa21431fd5e4fb1a18c1bc98fbe8c3",
+    "apps/computer_use/tests/test_collect_directory.py": "d39aec9ec303ff94dfcd79f5de8d2bbfecb6cf77ceba1826b12a50fdbfecfa84",
+    "apps/computer_use/tests/test_relay_evidence.py": "ad67a394192be7b1228242f5858292ba9e29675618141d3ee69fdb3838417dce",
+    "apps/computer_use/tests/test_task006.py": "25db045bab6f400a931c034b338de00b5f432a4cf356e5485ab9dd4fc613523b",
+    "apps/computer_use/osworld_windows/mirror006.py": "9256de6ae7eb1a24424456093e4cdef966eb6f6fe58e5da405c94e3c2796f4aa",
+    "apps/computer_use/osworld_windows/prepare006.py": "58b261e1f037b68d905e60fe99b04ee6462e13697b2f26af0367366a77adeadb"
   },
   "pending": [
-    "Complete 006 missing original availability; offline mirror has 29 host checks and initializer 8 host checks; native qualification and folder collector/content grader remain",
-    "Common queue qualified on native 004-on and 010-off short preflights; complete remaining scenario reset/collection paths and formal freeze",
-    "Complete 022 remaining four account UI downloads, 035 update visibility/first-observation timing, 043 frozen source-conflict disclosures and 051 complete trajectory/video process audit",
-    "Mirror private-site decorative remote assets and validate remaining UI paths",
-    "Verify full-budget recording completeness and event alignment; 15-minute 013 recording and recorder CPU costs already measured",
-    "Freeze V0 model/engine/history/budgets only after all platform and scenario qualifications; use qualified clean snapshot and archive SMB before every attempt",
-    "20 V0 on/off baseline runs; diagnose; at most two general candidates; V1 comparison and conditional repetition"
+    "Qualify default JPG/PNG/JPEG handling with neutral images after the 051 OpenWith blocker; preserve current snapshot and failed run",
+    "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
+    "Complete 022 remaining four account UI downloads; preserve partial 035 real-QW3 handoff and full scripted four-review qualification separately",
+    "Mirror private-site fonts and dynamic decorative assets; 65 avatar images are frozen and decoded, candidate not deployed",
+    "Complete 043 source-conflict disclosures and 051 full process audit when an artifact could pass; retain failures as failures",
+    "Freeze common model/engine/history/budgets and qualified clean snapshot before formal comparisons",
+    "20 V0 on/off baseline runs; diagnose; at most two generic candidates; V1 comparison and conditional repetition"
   ],
   "last_qualified_platform_commit": "cbf885f",
   "guest_app_inventory": {
@@ -907,17 +915,17 @@
         "Haoran Liu"
       ],
       "offline_mirror": {
-        "status": "host_qualified_diagnostic_only",
+        "status": "native_diagnostic_only_with_focus_limitation",
         "complete": false,
         "formal_ready": false,
         "originals_preserved": true,
         "rewritten_cv_links": 18,
         "public_files": 37,
         "checks_passed": 29,
-        "evidence": "apps/computer_use/.runtime/osworld-006-mirror-qualification-03/result.json",
-        "fixture": "apps/computer_use/.runtime/osworld-006-offline-mirror-02",
+        "evidence": "apps/computer_use/.runtime/osworld-006-mirror-qualification-04/result.json",
+        "fixture": "apps/computer_use/.runtime/osworld-006-offline-mirror-03",
         "failed_attempt_evidence": "apps/computer_use/.runtime/osworld-006-mirror-qualification-01/failure.json",
-        "native_initialization_validated": false,
+        "native_initialization_validated": true,
         "missing_original": "Yiren Lin",
         "notes": [
           "PDF bytes/encryption and original mail attachments preserved",
@@ -929,7 +937,27 @@
         "native_initializer_host_checks": 8,
         "native_initializer_host_evidence": "apps/computer_use/.runtime/osworld-006-initializer-qualification-01/result.json",
         "builder_source": "apps/computer_use/osworld_windows/mirror006.py",
-        "native_initializer_source": "apps/computer_use/osworld_windows/prepare006.py"
+        "native_initializer_source": "apps/computer_use/osworld_windows/prepare006.py",
+        "previous_fixture": "apps/computer_use/.runtime/osworld-006-offline-mirror-02",
+        "origin": "http://localhost:8086",
+        "previous_native_failure": "apps/computer_use/.runtime/osworld-006-native-diagnostic-01/result.json",
+        "entry_port_fix": "Reuse the existing permitted loopback port 8086 after per-task clean restore; executor URL boundary unchanged",
+        "native_evidence": "apps/computer_use/.runtime/osworld-006-native-diagnostic-02/result.json",
+        "native_assessment": "apps/computer_use/.runtime/osworld-006-native-diagnostic-02/assessment.json",
+        "requested_application_focus_verified": false
+      },
+      "artifact_grading_preparation": {
+        "collector": "apps/computer_use/collect_directory.py",
+        "grader": "apps/computer_use/osworld_windows/task006.py",
+        "collector_host_tests": 7,
+        "grader_host_tests": 7,
+        "native_qualified": true,
+        "expected_rules_loaded_from_pinned_upstream": true,
+        "filename_only_success_rejected": true,
+        "transformed_valid_pdf_requires_separate_review": true,
+        "formal_ready": false,
+        "native_qualification_scope": "Neutral folder export only: missing folder, Unicode PDF filename, independent byte hashes, nonrecursive subdirectory listing; no benchmark answer or model success",
+        "native_evidence": "apps/computer_use/.runtime/osworld-006-native-diagnostic-02/result.json"
       }
     },
     "010": {
@@ -986,7 +1014,26 @@
       "gui_conversion_validated": true,
       "gui_status_evidence": "apps/computer_use/.runtime/osworld-entry-qualification-01/crm-status-result.json",
       "gui_conversion_evidence": "apps/computer_use/.runtime/osworld-entry-qualification-01/crm-conversion-result.json",
-      "upstream_conversion_defect_fixed": true
+      "upstream_conversion_defect_fixed": true,
+      "real_model_preflight": {
+        "run": "osworld-native038-on-01",
+        "task": "038",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.2924389,
+        "strict_success": false,
+        "inference_requests": 31,
+        "actions": 27,
+        "video_seconds": 203.651860869,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native038-on-01/result.json",
+        "initial_correct_statuses": 11,
+        "final_correct_statuses": 12,
+        "changed_leads": 1,
+        "conversions_completed": 0,
+        "state_change_evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native038-on-01/state-change-analysis.json"
+      }
     },
     "080": {
       "model_test_completed": false,
@@ -1010,7 +1057,25 @@
         "Campaign integration and task reset"
       ],
       "shared_clean_base": "qw3-osworld-clean-20261002",
-      "qualification_answers_isolated_in_base": true
+      "qualification_answers_isolated_in_base": true,
+      "real_model_preflight": {
+        "run": "osworld-native080-on-01",
+        "task": "080",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.34885330000003,
+        "strict_success": false,
+        "inference_requests": 49,
+        "actions": 36,
+        "video_seconds": 206.947127652,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native080-on-01/result.json",
+        "artifact_unchanged": true,
+        "scope_rejections": 21,
+        "failure_analysis": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native080-on-01/failure-analysis.json",
+        "pdf_default_opened_successfully_in_actual_model_task": true
+      }
     },
     "051": {
       "model_test_completed": false,
@@ -1039,7 +1104,27 @@
         "Campaign integration and task reset"
       ],
       "shared_clean_base": "qw3-osworld-clean-20261002",
-      "qualification_answers_isolated_in_base": true
+      "qualification_answers_isolated_in_base": true,
+      "real_model_preflight": {
+        "run": "osworld-native051-on-01",
+        "task": "051",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.2376418,
+        "strict_success": false,
+        "inference_requests": 57,
+        "actions": 55,
+        "video_seconds": 206.766117817,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native051-on-01/result.json",
+        "platform_readiness_passed": false,
+        "artifact_missing": true,
+        "scope_rejections": 52,
+        "opened_dialog_extension": ".jpg",
+        "intended_reference": "reference.png",
+        "failure_analysis": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native051-on-01/failure-analysis.json"
+      }
     },
     "022": {
       "model_test_completed": false,
@@ -1116,9 +1201,8 @@
         1620
       ],
       "remaining": [
-        "Integrate qualified native four-review driver into frozen campaign attempts",
-        "Instrument event delivery, UI visibility and first model observation on one host monotonic timeline",
-        "Fresh snapshot and restore roundtrip; per-attempt share archival remains mandatory"
+        "Complete one actual-QW3 four-review dynamic attempt or retain valid model failure with the scripted four-review platform qualification clearly separated",
+        "Freeze common task/history configuration and record all three delivery/exposure evidence paths; partial screenshot exposure does not prove all message bodies were seen"
       ],
       "semantic_event_cases_passed": 22,
       "semantic_event_evidence": "apps/computer_use/.runtime/osworld-035-events-01/result.json",
@@ -1153,6 +1237,30 @@
         "evidence": "apps/computer_use/.runtime/osworld-web-qualification-01/osworld-web035-on-01/result.json",
         "adapter_fix": "instruction now included in manifest and checked before model launch",
         "model_task_result": null
+      },
+      "real_model_preflight": {
+        "run": "osworld-web035-on-02",
+        "task": "035",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "interrupted",
+        "formal_run": false,
+        "task_seconds": 343.46086110000005,
+        "strict_success": false,
+        "inference_requests": 62,
+        "actions": 56,
+        "video_seconds": 369.455837805,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/osworld-web035-on-02/result.json",
+        "outcome": "paused_by_no_progress",
+        "review_batches_delivered": [
+          1,
+          2
+        ],
+        "final_batch_delivered": false,
+        "failure_analysis": "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/osworld-web035-on-02/failure-analysis.json",
+        "first_batch_pixel_exposure_seconds": 9.859681528,
+        "second_batch_notification_pixel_exposure_seconds": 15.536539071,
+        "full_message_visibility_or_understanding_not_claimed": true
       }
     },
     "043": {
@@ -1189,7 +1297,21 @@
         "apps/computer_use/.runtime/osworld-043-qual-02/day-before-fix-result.json"
       ],
       "shared_clean_base": "qw3-osworld-clean-20261002",
-      "qualification_answers_isolated_in_base": true
+      "qualification_answers_isolated_in_base": true,
+      "real_model_preflight": {
+        "run": "osworld-native043-on-01",
+        "task": "043",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.310602,
+        "strict_success": false,
+        "inference_requests": 37,
+        "actions": 32,
+        "video_seconds": 205.688152342,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native043-on-01/result.json"
+      }
     }
   },
   "latest_preparation_source": "This commit; source identities are recorded above. V0 remains unfrozen.",
@@ -1461,10 +1583,29 @@
       "Use page landmarks and supported Home/End navigation to reduce repeated scanning; re-observe after long planning before dispatching an action."
     ],
     "v1_selected": false,
-    "no_kvmem_comparison_yet": true
+    "no_kvmem_comparison_yet": true,
+    "additional_035_evidence": {
+      "path": "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/osworld-web035-on-02/failure-analysis.json",
+      "same_wrong_click_count": 3,
+      "intended": "Emily DM",
+      "actual": "Mike DM",
+      "candidate": "Choose a matching observed control identity and use its current coordinates; after no progress, re-observe and relocate before another click",
+      "existing_tool_description_already_advises_control_centers": true,
+      "prompt_rewording_alone_not_assumed_effective": true,
+      "v1_implemented": false
+    },
+    "application_focus_evidence": {
+      "path": "apps/computer_use/.runtime/osworld-006-native-diagnostic-02/assessment.json",
+      "administrative_dispatches": 3,
+      "requested_foreground_confirmed": 0,
+      "foreground_remained": "soffice.bin",
+      "also_observed_in_model_task": "080",
+      "candidate": "Verify foreground after launching an application and resolve the target window before acting",
+      "v1_implemented": false
+    }
   },
   "native_scenario_campaign": {
-    "status": "two_task_native_queue_qualified_nine_adapters_not_all_native_qualified",
+    "status": "nine_tasks_have_real_model_preflights_but_common_platform_gaps_remain",
     "formal_run": false,
     "v0_frozen": false,
     "adapter_tasks": [
@@ -1525,6 +1666,80 @@
         "video_seconds": 83.363001297,
         "video_sha256": "ce734fdebac26c6d6199c4e1e51b3bf85fae732924b69dfae2c25a7873bb8cf8",
         "evidence": "apps/computer_use/.runtime/osworld-queue-qualification-01/osworld-queue010-off-01/result.json"
+      },
+      {
+        "run": "osworld-web035-on-02",
+        "task": "035",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "interrupted",
+        "formal_run": false,
+        "task_seconds": 343.46086110000005,
+        "strict_success": false,
+        "inference_requests": 62,
+        "actions": 56,
+        "video_seconds": 369.455837805,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/osworld-web035-on-02/result.json"
+      },
+      {
+        "run": "osworld-native038-on-01",
+        "task": "038",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.2924389,
+        "strict_success": false,
+        "inference_requests": 31,
+        "actions": 27,
+        "video_seconds": 203.651860869,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native038-on-01/result.json"
+      },
+      {
+        "run": "osworld-native043-on-01",
+        "task": "043",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.310602,
+        "strict_success": false,
+        "inference_requests": 37,
+        "actions": 32,
+        "video_seconds": 205.688152342,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native043-on-01/result.json"
+      },
+      {
+        "run": "osworld-native080-on-01",
+        "task": "080",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.34885330000003,
+        "strict_success": false,
+        "inference_requests": 49,
+        "actions": 36,
+        "video_seconds": 206.947127652,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native080-on-01/result.json",
+        "artifact_unchanged": true,
+        "scope_rejections": 21,
+        "failure_analysis": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native080-on-01/failure-analysis.json",
+        "pdf_default_opened_successfully_in_actual_model_task": true
+      },
+      {
+        "run": "osworld-native051-on-01",
+        "task": "051",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.2376418,
+        "strict_success": false,
+        "inference_requests": 57,
+        "actions": 55,
+        "video_seconds": 206.766117817,
+        "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native051-on-01/result.json"
       }
     ],
     "automatic_continuation_after_timeout_verified": true,
@@ -1576,14 +1791,55 @@
       ],
       "note": "022 model preflight timed out with valid collection; 035 failed before native launch because its manifest lacked instruction; failure preserved and adapter corrected"
     },
-    "default_snapshot": "qw3-osworld-pdf-20261002"
+    "default_snapshot": "qw3-osworld-pdf-20261002",
+    "dynamic_preflight_queue": {
+      "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/result.json",
+      "status": "halted",
+      "completed_attempts": 1,
+      "unstarted_tasks": [
+        "038",
+        "043",
+        "080",
+        "051"
+      ],
+      "fresh_queue_for_unstarted": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/result.json"
+    },
+    "remaining_scenarios_queue": {
+      "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/result.json",
+      "status": "complete",
+      "tasks": [
+        "038",
+        "043",
+        "080",
+        "051"
+      ],
+      "all_pipeline_passed": true,
+      "all_task_success": false,
+      "formal_run": false
+    },
+    "model_preflight_task_ids": [
+      "013",
+      "004",
+      "010",
+      "038",
+      "022",
+      "035",
+      "043",
+      "080",
+      "051"
+    ]
   },
   "model_relay_timing": {
     "implemented": true,
     "contract_checks": 3,
-    "native_qualified": false,
+    "native_qualified": true,
     "scope": "Host monotonic request/first-response-byte/terminal times plus canonical request hash and latest input PNG hash; no prompt, screenshot payload or token logged",
-    "not_v1_strategy_change": true
+    "not_v1_strategy_change": true,
+    "native_evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/osworld-web035-on-02/relay-input-analysis.json",
+    "unique_bound_inputs": 62,
+    "receipt_integrity_passed": true,
+    "evidence_analysis_tests": 5,
+    "full_message_text_exposure_unknown": true
   },
   "pdf_default_clean_base": {
     "snapshot": "qw3-osworld-pdf-20261002",
@@ -1605,5 +1861,17 @@
     "cleanup_evidence": "apps/computer_use/.runtime/pdf-handler-qualification-01/cleanup-manifest.json",
     "cleanup_archive_sha256": "6538ae1c06fd5d71c728553967aaee49f939e0c8644bfe1ca24c069bf82a3290",
     "scope": "Common platform correction before formal V0; no agent strategy change"
+  },
+  "offline_decorative_assets": {
+    "inventory": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/inventory.json",
+    "candidate": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/candidate/manifest.json",
+    "avatar_urls": 65,
+    "cached_originals": 49,
+    "new_direct_downloads": 16,
+    "all_proxy_variables_unset": true,
+    "deployed": false,
+    "fonts_and_dynamic_fallbacks_pending": true,
+    "decode_checks_passed": 65,
+    "decode_evidence": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/candidate/decode-qualification.json"
   }
 }
