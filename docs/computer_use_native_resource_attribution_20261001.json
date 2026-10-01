@@ -70,5 +70,11 @@
   "scope": "All18 task outcomes and durations are retained. Independent host GPU/engine RSS and phase timings are unaffected by the attribution error. Built-in taskkill cleanup retained only5 owned process successes.",
   "repair_required": "Match PID and process creation identity at each parent/child edge and counter read, retain parent/birth identities, then verify on actual Windows and repeat a matched client resource measurement.",
   "current_live_queue": "final-windows-qualification-04 does not run the defective client sampler; frozen application files remain unchanged until it completes.",
-  "candidate": "apps/computer_use/.runtime/client-resource-candidate (prepared, not yet executed on Windows)"
+  "candidate": "apps/computer_use/.runtime/client-resource-candidate (prepared, not yet executed on Windows)",
+  "reference_sources": [
+    "https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-process",
+    "https://learn.microsoft.com/en-us/windows/win32/wmisdk/cim-datetime"
+  ],
+  "prepared_native_probe": "scripts/computer_use_resource_probe.py",
+  "probe_scope": "Checks the10 prepared ownership/time-identity contracts on real Windows after GPU comparison and diagnostic queues finish. No native Windows API result or application memory measurement is claimed yet."
 }

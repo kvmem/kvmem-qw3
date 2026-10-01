@@ -1,8 +1,8 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790823146.3584273,
+  "reviewed_at": 1790823928.1011739,
   "goal_complete": false,
-  "recorded_source_commit": "53cd0bf",
+  "recorded_source_commit": "7d18e50",
   "gpu_limit_48gb_retired": true,
   "native_client_source_files_match": true,
   "current_native_matrix": {
@@ -332,5 +332,34 @@
     "latency_issue_open": true,
     "comparison_completed": true,
     "all_tasks_passed": false
+  },
+  "current_fixed_controls": {
+    "short_passed": 54,
+    "short_required": 54,
+    "short_document": "docs/computer_use_short_controls_03_20261001.json",
+    "long_status": "running",
+    "long_required": 12
+  },
+  "recorded_source_scope": "Qualified application content at7d18e50 and engine005654; documentation/analysis commit identities vary and are recorded per experiment. Earlier retained artifacts keep their original source scopes.",
+  "native_resource_probe_readiness": {
+    "kind": "native_resource_probe_readiness",
+    "reviewed_at": 1790823764.4968805,
+    "script_sha256": "cd2aa69b0c20881da0887340131c492dabceda56abb6d785ed7c90c9a03c7b0d",
+    "help_and_syntax_passed": true,
+    "active_predecessor_refused": true,
+    "vm_access_performed": false,
+    "windows_probe_executed": false,
+    "candidate_directory": "apps/computer_use/.runtime/client-resource-candidate",
+    "scope": "The setup driver is prepared. Its active-predecessor guard was verified before Docker, VM HTTP, provisioning or source staging. Real Windows API behavior and application memory measurements remain unqualified."
+  },
+  "queued_diagnostics": {
+    "unit": "qw3-computer-qualification-followup-01.service",
+    "result": "apps/computer_use/.runtime/qualification-followup-01/result.json",
+    "observed_status": "waiting_for_final_qualification_04",
+    "experiments": [
+      "baseline-prefix-replay",
+      "vision-profile"
+    ],
+    "production_sources_remain_frozen": true
   }
 }
