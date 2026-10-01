@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T01:56:24.827056+08:00",
+  "updated_at": "2026-10-02T02:25:31.385816+08:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -147,7 +147,7 @@
     "apps/computer_use/osworld_windows/qualify013.py": "de3799057598ba0bfbc3a877769e2147d8a71f33a48d230f164526a1ecac2522",
     "apps/computer_use/osworld_windows/qualify013_gui.py": "bd9860ad2d701101c01d35c5d2032e8e3d60dd0a5ebef728e35b1e37c786c612",
     "apps/computer_use/osworld_windows/prepare013.py": "64c45f03a081dedb8b9b363076af6c4fa7ad88b599b481b8c7bf0411a5d1a1ef",
-    "apps/computer_use/osworld_windows/task080.py": "883e2875bf1c6a74839c3e44f3cb054229a7ee0466cb80376e08cb0d4dc8f178",
+    "apps/computer_use/osworld_windows/task080.py": "e84ff04cd28b2ffb44947308eb9267923f57df4417373f460d8afd67e8aca882",
     "apps/computer_use/osworld_windows/prepare_native.py": "21ba3e34a9a77f3fbd78cd7aeb46b108c0dff1e85e41c7ed12ee0e96c93093c3",
     "apps/computer_use/osworld_windows/task004.py": "34b58bd9579343c739717bfc681d48e3aed0deaa1866de7cf1a85952f9b71551",
     "apps/computer_use/osworld_windows/task010.py": "61671213c2d3f70101299641a45f77522995847d80dedf698c750da9f82596f2",
@@ -181,11 +181,15 @@
     "apps/computer_use/tests/test_codex_integration.py": "1ffe9ed791efea8ae0d5f8a508bdf0810ae37868238c24a9a1c68385af99d5a6",
     "apps/computer_use/osworld_windows/prepare035.py": "a5e69cadfbab7dce43328d8529ae802b44853dfb08d9f2c124537082274a993c",
     "apps/computer_use/osworld_windows/events035.py": "2f30a5cb1165096f0ce74955230efcc0d1bacb3d314947ef3927e9ed4fc44284",
-    "apps/computer_use/osworld_windows/qualify035_events.py": "395b5a7a660df77df101172e5222e904b818e9534afe47292a867e0389a86ac2"
+    "apps/computer_use/osworld_windows/qualify035_events.py": "395b5a7a660df77df101172e5222e904b818e9534afe47292a867e0389a86ac2",
+    "apps/computer_use/osworld_windows/task051.py": "02939fd881cfa95f19458c4cb86b1bfe65cb40d2224ea62676b8036888bbcf5d",
+    "apps/computer_use/osworld_windows/qualify051.py": "e07c88eaa463dc02715722359675467e08355f80eaa0cc7fcdba93984954d37a",
+    "apps/computer_use/osworld_windows/qualify080.py": "c1706ed39d8fa190fce9b75107bb99ae8694a406fa992c46fa6922c7927614d7",
+    "apps/computer_use/vm/osworld-image-grader.Dockerfile": "c485fb1aa768a908423af063ce45fefa61572cfd70ccbb966f8d2bcba67822ff"
   },
   "pending": [
-    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 native dynamic driver and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 process constraints",
-    "Resolve 004 locked-slide preservation across repeated native saves and font substitution; finish 080 positive/full rubric qualification",
+    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 native dynamic driver and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 actual process audit integration",
+    "Resolve 004 locked-slide preservation across repeated native saves and font substitution",
     "Wire terminal driver, qualified native binary artifact collection, reset, recorder and graders into the continue-on-task-failure campaign scheduler",
     "Qualify benchmark browser reopen and Explorer entry paths; current Edge open_app still targets legacy BrowserProfile/fixture.html",
     "Before freezing: archive/remove all known-answer qualification files and old task products from guest and SMB-visible share; validate minimal per-attempt public staging",
@@ -729,16 +733,23 @@
       "held_out_trajectory_used_for_tuning": false,
       "input_opened_in_wps": true,
       "initializer_evidence": "apps/computer_use/.runtime/osworld-080-qual-01",
-      "grader_status": "positive_full_rubric_qualification_pending",
+      "grader_status": "twelve_cases_and_native_wps_saved_positive_qualified",
       "upstream_windows_formula_max_credit": 0.4,
       "upstream_perfect_fixture_score": 0.7390894607843137,
       "saved_cache_aware_perfect_fixture_score": 0.9190894607843137,
-      "remaining_fixture_mismatches": [
-        "overlay role annual quota missing",
-        "visible formatting checks incomplete"
-      ],
+      "remaining_fixture_mismatches": [],
       "evidence": "apps/computer_use/.runtime/osworld-080-grader-01/saved-cache-checks.json",
-      "adaptation": "Keep upstream score; additionally apply original numeric checks to saved WPS caches, without grader recalculation or save"
+      "adaptation": "Preserve upstream Windows score; separately check saved formula caches and standards-compliant relative/root-relative package targets without grader recalculation or save",
+      "grader_cases_passed": 12,
+      "grader_evidence": "apps/computer_use/.runtime/osworld-080-grader-06/result.json",
+      "native_serialization_evidence": "apps/computer_use/.runtime/osworld-080-native-serialization-01/independent-result.json",
+      "native_positive_original_score": 0.82,
+      "native_positive_windows_saved_score": 1,
+      "native_positive_strict_success": true,
+      "remaining": [
+        "Archive known answers outside guest and SMB before clean snapshot",
+        "Campaign integration and task reset"
+      ]
     },
     "051": {
       "model_test_completed": false,
@@ -746,13 +757,27 @@
       "initializer_prepared": true,
       "input_opened_in_gimp": true,
       "initializer_evidence": "apps/computer_use/.runtime/osworld-051-qual-01",
-      "grader_status": "not_implemented",
+      "grader_status": "artifact_and_process_audit_binding_qualified",
       "canvas": {
         "width": 2560,
         "height": 1440,
         "layers": 1,
         "background_layer_name": "background.png"
-      }
+      },
+      "grader_cases_passed": 17,
+      "grader_evidence": "apps/computer_use/.runtime/osworld-051-grader-02/result.json",
+      "decoder_image": "sha256:f49901b8ad84c5e151367d30f13cf9eb90921ef9e2bf4cb8ea20bc4d262346e6",
+      "native_serialization_evidence": "apps/computer_use/.runtime/osworld-051-native-serialization-01/independent-result.json",
+      "native_artifact_original_score": 1,
+      "native_artifact_checks_passed": true,
+      "native_process_audit_status": "not_audited",
+      "full_process_qualification_passed": false,
+      "synthetic_audit_fixture_is_not_video_or_real_trajectory": true,
+      "remaining": [
+        "Bind host-only complete trajectory/video review to every formal saved XCF; no crop/rotation history inferred from final artifact",
+        "Archive qualification reference/answer files outside guest and SMB before clean snapshot",
+        "Campaign integration and task reset"
+      ]
     },
     "022": {
       "model_test_completed": false,
@@ -905,7 +930,7 @@
     "independent_validation": "apps/computer_use/.runtime/windows/shared/binary-collection-qual-01-independent.json",
     "limitations": [
       "Administrative component, not yet wired into the campaign scheduler",
-      "XCF signature qualified here, render grading remains task 051 work",
+      "XCF artifact scoring separately qualified; process-constraint review still required for real trajectories",
       "Presentation is a previously saved qualification output, not pristine input"
     ],
     "model_used": false
