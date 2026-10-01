@@ -1,29 +1,30 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T01:37:53.653689+08:00",
+  "updated_at": "2026-10-02T01:56:24.827056+08:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
   "v0_frozen": false,
   "client": {
-    "host_tests_passed": 54,
-    "windows_tests_passed": 54,
-    "bundle": "windows-native-client-10",
+    "host_tests_passed": 61,
+    "windows_tests_passed": 61,
+    "bundle": "windows-native-client-11",
     "qualification": {
       "kind": "windows_native_client_contract_tests",
-      "finished": "2026-10-02T00:27:31.5057092+00:00",
-      "directory": "C:\\Qw3Computer\\clients\\5561973f3678",
-      "started": "2026-10-02T00:26:59.3064635+00:00",
+      "finished": "2026-10-02T00:48:53.6701517+00:00",
+      "directory": "C:\\Qw3Computer\\clients\\71c9d1050355",
+      "started": "2026-10-02T00:48:17.3649873+00:00",
       "python": "Python 3.13.13",
-      "bundle_sha256": "5561973f36786310e2ce3a9af5fa9c565b5e8b9bd519c5a75607ddf4e1f27d5f",
+      "bundle_sha256": "71c9d1050355b608a6004cc124f5a79af77efa85f511c083bf7a223e323abaac",
       "passed": true,
       "codex": "codex-cli 0.159.2",
       "process_exit_code": 0
     },
-    "host_tests_evidence": "apps/computer_use/.runtime/collector-host-contract-tests-02.log",
-    "windows_tests_evidence": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-10.stderr.log",
-    "package_manifest": "apps/computer_use/.runtime/windows-native-client-10/archive.json",
-    "default_shared_candidate_promoted": false
+    "host_tests_evidence": "apps/computer_use/.runtime/followup-host-contract-tests-01.log",
+    "windows_tests_evidence": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-11.stderr.log",
+    "package_manifest": "apps/computer_use/.runtime/windows-native-client-11/archive.json",
+    "default_shared_candidate_promoted": false,
+    "qualification_uses_scripted_backend_not_qw3_inference": true
   },
   "office_install": {
     "passed": true,
@@ -127,8 +128,8 @@
     }
   },
   "source_sha256": {
-    "apps/computer_use/qw3_computer/app.py": "db8e902c87bf6243ac43af50bcc0116faeb2c142908a5e6893874985ddcf5a9f",
-    "apps/computer_use/tests/test_controller.py": "cef2776828d36a4c7c23ab33ee5e9dfbeb6692feb524128783b504d47abe911a",
+    "apps/computer_use/qw3_computer/app.py": "a07fcb233b763537746981ec9b320b7c4b7240b36ae9db30f2317ea686136155",
+    "apps/computer_use/tests/test_controller.py": "98508d52bbac38f3d826afe90f82772f13aaa78c64d1f587d62effc303662966",
     "apps/computer_use/pack_windows_client.py": "637c7657a56c38a7f077bc5eb077b78d402e67dee9305e3243b2435574c0aecb",
     "apps/computer_use/vm/record_console.py": "27d092a9d7215a7dc6727e1fe5428b8b7cca058509457f60827eb139f3d7d821",
     "apps/computer_use/vm/qualify_recording.py": "2213c764dfb70a1dee8fe89d97a77c1d09292c487ce4ab4c9587087f0d079e17",
@@ -176,10 +177,14 @@
     "apps/computer_use/osworld_windows/qualify043.py": "3fcb792eac502f208870e4008c7e986bd54f9b5f413f720e37e269849ad66739",
     "apps/computer_use/osworld_windows/prepare043.py": "0ecb8178149b3ae1c6d15af35f92efb63c36342c7bc8a6843cb29e32d4bdbc43",
     "apps/computer_use/vm/osworld-calendar.Dockerfile": "4851738919820ad0d59aa2e9a35cd881296c1cae4827717cd4fb02475696042e",
-    "apps/computer_use/vm/osworld-web.compose.yml": "c8d98aff20a79c2188f24648a871914ba4e24e8626453ed01703bb7e7a52725b"
+    "apps/computer_use/vm/osworld-web.compose.yml": "c8d98aff20a79c2188f24648a871914ba4e24e8626453ed01703bb7e7a52725b",
+    "apps/computer_use/tests/test_codex_integration.py": "1ffe9ed791efea8ae0d5f8a508bdf0810ae37868238c24a9a1c68385af99d5a6",
+    "apps/computer_use/osworld_windows/prepare035.py": "a5e69cadfbab7dce43328d8529ae802b44853dfb08d9f2c124537082274a993c",
+    "apps/computer_use/osworld_windows/events035.py": "2f30a5cb1165096f0ce74955230efcc0d1bacb3d314947ef3927e9ed4fc44284",
+    "apps/computer_use/osworld_windows/qualify035_events.py": "395b5a7a660df77df101172e5222e904b818e9534afe47292a867e0389a86ac2"
   },
   "pending": [
-    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 dynamic events; 043 disclosed constraint-conflict handling/reset; 051 process constraints",
+    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 native dynamic driver and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 process constraints",
     "Resolve 004 locked-slide preservation across repeated native saves and font substitution; finish 080 positive/full rubric qualification",
     "Wire terminal driver, qualified native binary artifact collection, reset, recorder and graders into the continue-on-task-failure campaign scheduler",
     "Qualify benchmark browser reopen and Explorer entry paths; current Edge open_app still targets legacy BrowserProfile/fixture.html",
@@ -811,9 +816,29 @@
         1620
       ],
       "remaining": [
-        "Freeze reproducible dynamic event delivery and visibility evidence",
-        "Initialize Windows workbook and private TeamChat state",
-        "Validate Windows saved positive and pristine reset"
+        "Wire actual completed-review checkpoints and follow-up into the native campaign driver",
+        "Instrument event delivery, UI visibility and first model observation on one host monotonic timeline",
+        "Fresh snapshot and restore roundtrip; remove all qualification answers/workbooks from guest and SMB before freeze"
+      ],
+      "semantic_event_cases_passed": 22,
+      "semantic_event_evidence": "apps/computer_use/.runtime/osworld-035-events-01/result.json",
+      "native_initialization_passed": true,
+      "native_three_batch_delivery_passed": true,
+      "native_late_sales_dm_visible": true,
+      "native_saved_known_answer_passed": true,
+      "native_saved_known_answer_score": 1,
+      "native_evidence": "apps/computer_use/.runtime/osworld-035-qual-01/native-preparation-result.json",
+      "native_grade": "apps/computer_use/.runtime/osworld-035-qual-01/native-saved-grade.json",
+      "schedule_candidate": "apps/computer_use/.runtime/osworld-035-qual-01/message-schedule.json",
+      "adaptations": [
+        "Original message content retained in three review-completion batches of 21/1/1",
+        "Original 30-minute wall-clock arrivals are not reproduced",
+        "Fixed December 2025 business month and deterministic message timestamps",
+        "Materialize missing dm_emily conversation for the original late Sales sender",
+        "Local deterministic scoring replaces original remote LLM judge"
+      ],
+      "preserved_failures": [
+        "apps/computer_use/.runtime/osworld-035-qual-01/tab-input-limitation.json"
       ]
     },
     "043": {
@@ -884,5 +909,16 @@
       "Presentation is a previously saved qualification output, not pristine input"
     ],
     "model_used": false
+  },
+  "review_followup_contract": {
+    "available": true,
+    "same_task_and_codex_thread_preserved": true,
+    "lifetime_tool_budget_preserved": true,
+    "idempotent_event_id": true,
+    "pause_failure_uncertainty_budget_bypass_rejected": true,
+    "linux_and_windows_real_codex_four_turn_test_passed": true,
+    "evidence": "apps/computer_use/.runtime/followup-codex-integration-01.log",
+    "formal_run": false,
+    "scope": "Common task lifecycle feature, not an agent strategy optimization"
   }
 }

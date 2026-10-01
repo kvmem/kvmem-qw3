@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 from pathlib import Path
+import re
 import secrets
 import signal
 import sys
@@ -175,6 +176,66 @@ class Controller:
                 raise
             return self.snapshot()
 
+    async def followup(self, task_id, completed_turn_id, event_id, prompt):
+        """Continue an explicitly identified completed review on the same history.
+
+        Used by the local owner/harness for newly arrived task information.
+        It cannot recover a pause, uncertainty, failed turn or exhausted budget.
+        Persist the event before sending it so a lost reply cannot duplicate it.
+        """
+        async with self.control_lock:
+            if not isinstance(event_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{8,80}", event_id):
+                raise DesktopError("Invalid follow-up event identity")
+            if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 12000:
+                raise DesktopError("Follow-up needs a 1–12000 character prompt")
+            if task_id != self.state.get("id"):
+                raise DesktopError("Follow-up task identity does not match")
+            request = {"event_id": event_id, "completed_turn_id": completed_turn_id, "prompt": prompt}
+            previous = next((e for e in self.state.get("followups", []) if e["event_id"] == event_id), None)
+            if previous:
+                if any(previous.get(k) != v for k, v in request.items()):
+                    raise DesktopError("Follow-up identity was reused with different content")
+                if previous.get("delivery") != "accepted":
+                    raise DesktopError("Follow-up delivery is uncertain; inspect before recovery")
+                return self.snapshot()
+            if (not self.ready or self.state.get("status") != "completed"
+                    or completed_turn_id != self.state.get("turn_id")
+                    or self.state.get("turn_status") != "completed"
+                    or self.state.get("evidence_error") or not self.desktop.paused
+                    or self.desktop.unresolved()):
+                raise DesktopError("Follow-up requires the identified completed, verified and paused turn")
+            if self.budget_remaining() == 0:
+                raise DesktopError("任务调用额度已用尽；后续消息不会重置额度。")
+            receipt = request | {"delivery": "pending", "requested_at": time.time(),
+                                 "tool_calls_used_before": self.state["tool_calls_used"]}
+            self.state.setdefault("followups", []).append(receipt)
+            self.state.update(status="starting", notice="", draft="")
+            self.state.pop("finished_at", None)
+            self.state.pop("turn_id", None)
+            self.save()
+            try:
+                await self.desktop.control("resume")
+                observation = await self.desktop.observe()
+                self.desktop.task_id = task_id
+                await self.client.rpc("thread/resume", {"threadId": self.state["thread_id"]})
+                description = json.dumps({k: v for k, v in observation.items() if k != "image"}, ensure_ascii=False)
+                text = prompt + "\nContinue the same task using its existing history. Current desktop observation:\n" + description
+                turn_id = await self.client.turn(self.state["thread_id"], text,
+                                                ["data:image/png;base64," + observation["image"]])
+                self.state["turn_id"] = turn_id
+                receipt.update(delivery="accepted", turn_id=turn_id)
+                if self.state["status"] == "starting":
+                    self.state["status"] = "running"
+                self.save()
+            except BaseException:
+                receipt["delivery"] = "uncertain"
+                self.state.update(status="paused", notice="后续消息投递未确认，请核对后恢复。")
+                self.save()
+                with contextlib.suppress(DesktopError):
+                    await self.desktop.control("pause")
+                raise
+            return self.snapshot()
+
     async def control(self, command, acknowledge_uncertain=False):
         async with self.control_lock:
             if command not in ("pause", "stop", "resume"):
@@ -324,6 +385,11 @@ def web_app(controller):
         body = await request.json()
         return web.json_response(await controller.control(body["command"], body.get("acknowledge_uncertain", False)))
 
+    async def followup(request):
+        body = await request.json()
+        return web.json_response(await controller.followup(body.get("task_id"), body.get("completed_turn_id"),
+                                                          body.get("event_id"), body.get("prompt")))
+
     async def observe(request):
         if not controller.desktop.paused:
             raise DesktopError("运行期间请使用暂停接管；刷新观察会使正在推理的坐标失效。")
@@ -345,6 +411,7 @@ def web_app(controller):
     app.router.add_get("/api/screenshot", screenshot)
     app.router.add_post("/api/task", start)
     app.router.add_post("/api/control", control)
+    app.router.add_post("/api/followup", followup)
     app.router.add_post("/api/observe", observe)
     app.router.add_post("/internal/tool", tool)
     return app

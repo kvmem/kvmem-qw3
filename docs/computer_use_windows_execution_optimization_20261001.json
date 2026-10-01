@@ -219,10 +219,13 @@
       "provisional_timeout_seconds": 5400,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
-      "grader_validated": false,
+      "grader_validated": true,
       "recording_validated": false,
       "local_grader_cases_validated": true,
-      "dynamic_delivery_validated": false
+      "dynamic_delivery_validated": false,
+      "dynamic_delivery_components_validated": true,
+      "native_message_visibility_validated": true,
+      "known_answer_windows_save_validated": true
     },
     {
       "scenario_id": "win-osworld-043",

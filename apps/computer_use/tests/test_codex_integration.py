@@ -9,17 +9,83 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import AsyncMock
 
 from aiohttp import web
 from PIL import Image
 
 from qw3_computer.bridge import create_app
+from qw3_computer.app import Controller, web_app
 from qw3_computer.codex import CodexClient, write_config
 from test_bridge import chunk, serve
+from test_controller import FixtureDesktop
 
 
 @unittest.skipUnless(os.environ.get("QW3_TEST_CODEX") == "1", "set QW3_TEST_CODEX=1 for real Codex")
 class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_reviews_continue_same_codex_history_and_budget(self):
+        calls = []
+        async def backend(request):
+            body = await request.json()
+            calls.append(body)
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            if len(calls) % 2:
+                name = next(t["function"]["name"] for t in body["tools"]
+                            if t["function"]["name"].endswith("observe"))
+                await chunk(response, {"tool_calls": [{"index": 0, "id": f"observe_{len(calls)}",
+                    "type": "function", "function": {"name": name, "arguments": "{}"}}]})
+                await chunk(response, finish="tool_calls")
+            else:
+                await chunk(response, {"content": f"Review marker {len(calls) // 2} completed."})
+                await chunk(response, finish="stop")
+            await response.write(b"data: [DONE]\n\n")
+            return response
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", backend)
+        backend_runner, url = await serve(app)
+        with tempfile.TemporaryDirectory(prefix="qw3-followup-integration-") as runtime:
+            desktop = FixtureDesktop()
+            desktop.start = AsyncMock()
+            pixels = io.BytesIO()
+            Image.new("RGB", (128, 96), "blue").save(pixels, format="PNG")
+            desktop.observe.return_value = desktop.latest | {"image": base64.b64encode(pixels.getvalue()).decode()}
+            controller = Controller(runtime, desktop, url + "/v1", 0, tool_call_limit=4, output_policy="task")
+            app_runner, app_url = await serve(web_app(controller))
+            controller.port = int(app_url.rsplit(":", 1)[1])
+            try:
+                await controller.start()
+                async def finish():
+                    async with asyncio.timeout(40):
+                        while controller.state["status"] in ("starting", "running", "verifying"):
+                            await asyncio.sleep(.02)
+                    self.assertEqual(controller.state["status"], "completed", controller.state)
+                    self.assertTrue(desktop.paused)
+                await controller.start_task("Initial purchase review marker.")
+                await finish()
+                task_id, thread_id = controller.state["id"], controller.state["thread_id"]
+                for batch in (1, 2, 3):
+                    self.assertEqual(controller.state["tool_calls_used"], batch)
+                    turn_id = controller.state["turn_id"]
+                    await controller.followup(task_id, turn_id, f"batch-{batch:03}", f"New public message batch {batch}.")
+                    await finish()
+                    self.assertEqual(controller.state["id"], task_id)
+                    self.assertEqual(controller.state["thread_id"], thread_id)
+                    # Retrying a confirmed owner request must not run again.
+                    await controller.followup(task_id, turn_id, f"batch-{batch:03}", f"New public message batch {batch}.")
+                self.assertEqual(len(calls), 8)
+                self.assertEqual(controller.state["tool_calls_used"], 4)
+                self.assertEqual(controller.budget_remaining(), 0)
+                self.assertEqual(len(controller.state["messages"]), 4)
+                final_history = json.dumps(calls[-1]["messages"])
+                for text in ["Initial purchase review marker.", "Review marker 1 completed.",
+                             "New public message batch 1.", "New public message batch 2.", "New public message batch 3."]:
+                    self.assertIn(text, final_history)
+            finally:
+                await controller.close()
+                await app_runner.cleanup()
+                await backend_runner.cleanup()
+
     async def test_images_success_error_mcp_rounds_and_interrupt(self):
         calls = []
         waiting, cancelled = asyncio.Event(), asyncio.Event()

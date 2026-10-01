@@ -223,6 +223,79 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 Controller(self.temp.name, self.desktop, "unused", 1, tool_call_limit=limit)
 
+    def completed_review(self):
+        self.controller.state.update(id="owned-task", status="completed", thread_id="same-history",
+                                     turn_id="previous-turn", turn_status="completed", tool_calls_used=17,
+                                     tool_call_limit=50, output_policy="task", messages=["Initial review finished."])
+        self.controller.save()
+
+    async def test_followup_preserves_history_identity_and_lifetime_budget(self):
+        self.completed_review()
+        self.controller.client.turn = AsyncMock(return_value="next-turn")
+        result = await self.controller.followup("owned-task", "previous-turn", "event-001", "Review the newly arrived messages.")
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["id"], "owned-task")
+        self.assertEqual(result["thread_id"], "same-history")
+        self.assertEqual(result["tool_calls_used"], 17)
+        self.assertEqual(result["tool_call_limit"], 50)
+        self.assertEqual(result["messages"], ["Initial review finished."])
+        self.controller.client.new_thread.assert_not_awaited()
+        self.controller.client.rpc.assert_awaited_once_with("thread/resume", {"threadId": "same-history"})
+        self.assertEqual(result["followups"][0]["delivery"], "accepted")
+        self.assertEqual(json.loads(self.controller.state_path.read_text())["tool_calls_used"], 17)
+
+    async def test_followup_is_idempotent_and_refuses_changed_replay(self):
+        self.completed_review()
+        self.controller.client.turn = AsyncMock(return_value="next-turn")
+        args = ("owned-task", "previous-turn", "event-001", "New messages arrived.")
+        await self.controller.followup(*args)
+        await self.controller.followup(*args)
+        self.controller.client.turn.assert_awaited_once()
+        with self.assertRaisesRegex(DesktopError, "different content"):
+            await self.controller.followup(*args[:3], "Changed instructions")
+
+    async def test_followup_cannot_bypass_pause_failure_budget_or_stale_turn(self):
+        for changes in ({"status": "paused"}, {"status": "failed"}, {"status": "running"},
+                        {"turn_id": "different-turn"}, {"tool_calls_used": 50},
+                        {"evidence_error": "File evidence unavailable"}, {"turn_status": "failed"}):
+            self.completed_review()
+            self.controller.state.pop("evidence_error", None)
+            self.controller.state.update(changes)
+            self.desktop.control = AsyncMock(wraps=self.desktop.control)
+            with self.assertRaises(DesktopError):
+                await self.controller.followup("owned-task", "previous-turn", "event-001", "New messages arrived.")
+            self.desktop.control.assert_not_awaited()
+
+    async def test_followup_uncertain_dispatch_is_persisted_without_retry(self):
+        self.completed_review()
+        self.controller.client.turn = AsyncMock(side_effect=RuntimeError("lost reply"))
+        args = ("owned-task", "previous-turn", "event-001", "New messages arrived.")
+        with self.assertRaisesRegex(RuntimeError, "lost reply"):
+            await self.controller.followup(*args)
+        self.assertTrue(self.desktop.paused)
+        saved = json.loads(self.controller.state_path.read_text())
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(saved["followups"][0]["delivery"], "uncertain")
+        with self.assertRaisesRegex(DesktopError, "uncertain"):
+            await self.controller.followup(*args)
+        self.controller.client.turn.assert_awaited_once()
+
+    async def test_fast_followup_completion_remains_completed(self):
+        self.completed_review()
+        self.controller.consume_task = asyncio.create_task(self.controller.consume())
+        result = await self.controller.followup("owned-task", "previous-turn", "event-001", "New messages arrived.")
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(self.desktop.paused)
+        self.assertEqual(result["tool_calls_used"], 17)
+
+    async def test_followup_cannot_acknowledge_uncertain_desktop_actions(self):
+        self.completed_review()
+        self.desktop.unresolved = lambda: [{"action_id": "unconfirmed"}]
+        self.desktop.control = AsyncMock(wraps=self.desktop.control)
+        with self.assertRaisesRegex(DesktopError, "verified"):
+            await self.controller.followup("owned-task", "previous-turn", "event-001", "New messages arrived.")
+        self.desktop.control.assert_not_awaited()
+
     async def test_foreign_websites_cannot_start_local_tasks(self):
         self.controller.start_task = AsyncMock(return_value={"status": "running"})
         runner, url = await serve(web_app(self.controller))
