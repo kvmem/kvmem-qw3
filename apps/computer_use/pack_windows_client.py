@@ -63,6 +63,7 @@ def main():
     shutil.copyfile(root / "windows_long_task.py", app / "windows_long_task.py")
     shutil.copyfile(root / "probe_compaction.py", app / "probe_compaction.py")
     shutil.copyfile(root / "task_driver.py", app / "task_driver.py")
+    shutil.copyfile(root / "collect_artifacts.py", app / "collect_artifacts.py")
     (output / "start.ps1").write_text('''param(
     [string]$Backend = 'http://127.0.0.1:18080/v1',
     [string]$BackendToken = '',

@@ -1,25 +1,29 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T00:58:22.992534+08:00",
+  "updated_at": "2026-10-02T01:37:53.653689+08:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
   "v0_frozen": false,
   "client": {
-    "host_tests_passed": 47,
-    "windows_tests_passed": 47,
+    "host_tests_passed": 54,
+    "windows_tests_passed": 54,
+    "bundle": "windows-native-client-10",
     "qualification": {
       "kind": "windows_native_client_contract_tests",
-      "finished": "2026-10-01T15:20:08.9732783-07:00",
-      "directory": "C:\\Qw3Computer\\clients\\b5ad6f60c2ac",
-      "started": "2026-10-01T15:19:37.7804230-07:00",
+      "finished": "2026-10-02T00:27:31.5057092+00:00",
+      "directory": "C:\\Qw3Computer\\clients\\5561973f3678",
+      "started": "2026-10-02T00:26:59.3064635+00:00",
       "python": "Python 3.13.13",
-      "bundle_sha256": "b5ad6f60c2acf0b8086192f83398b120caffc73430c69ea6a2c837fc200011c8",
+      "bundle_sha256": "5561973f36786310e2ce3a9af5fa9c565b5e8b9bd519c5a75607ddf4e1f27d5f",
       "passed": true,
       "codex": "codex-cli 0.159.2",
       "process_exit_code": 0
     },
-    "host_tests_evidence": "apps/computer_use/.runtime/osworld-platform-host-tests-10.log"
+    "host_tests_evidence": "apps/computer_use/.runtime/collector-host-contract-tests-02.log",
+    "windows_tests_evidence": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-10.stderr.log",
+    "package_manifest": "apps/computer_use/.runtime/windows-native-client-10/archive.json",
+    "default_shared_candidate_promoted": false
   },
   "office_install": {
     "passed": true,
@@ -84,18 +88,48 @@
     ],
     "guest_http_verified": true,
     "browser_rendered_sites": [
-      "formcraft",
+      "calendar",
       "cloudcrm",
-      "teamchat",
-      "mailhub"
+      "formcraft",
+      "mailhub",
+      "teamchat"
     ],
     "image_manifest": "apps/computer_use/.runtime/osworld-web-images-02.json",
-    "gateway_boundary_evidence": "apps/computer_use/.runtime/osworld-sites-host-connectivity-02.json"
+    "gateway_boundary_evidence": "apps/computer_use/.runtime/osworld-sites-host-connectivity-02.json",
+    "calendar_overlay": {
+      "dockerfile": "apps/computer_use/vm/osworld-calendar.Dockerfile",
+      "fixes": [
+        "Include src/lib in Tailwind content discovery so event colors render",
+        "Accept the already exposed and rendered Day view in action validation"
+      ],
+      "deployed": {
+        "kind": "owned_calendar_day_view_rebuild",
+        "states_restored": [
+          {
+            "user": "osworld-state-qualification-2a601bd0f17f4d3d",
+            "data_preserved": true
+          },
+          {
+            "user": "osworld-043-qual-01",
+            "data_preserved": true
+          },
+          {
+            "user": "osworld-043-qual-02",
+            "data_preserved": true
+          }
+        ],
+        "image": "sha256:95f5193b06477b278d02be0c0ea2173a0cb1c5452a5e5ec3ece582f43acec33e",
+        "container": "17ab09f208ad648ae792a81d24974df7cee90a9f6cd44b88a13ad392b470407b",
+        "formal_run": false
+      },
+      "upstream_checkout_modified": false,
+      "classification": "common_platform_preparation_not_agent_strategy_gain"
+    }
   },
   "source_sha256": {
     "apps/computer_use/qw3_computer/app.py": "db8e902c87bf6243ac43af50bcc0116faeb2c142908a5e6893874985ddcf5a9f",
     "apps/computer_use/tests/test_controller.py": "cef2776828d36a4c7c23ab33ee5e9dfbeb6692feb524128783b504d47abe911a",
-    "apps/computer_use/pack_windows_client.py": "181c943425740a7285127374bde84a2d80ac60e893db5e06bb026cb5105630d4",
+    "apps/computer_use/pack_windows_client.py": "637c7657a56c38a7f077bc5eb077b78d402e67dee9305e3243b2435574c0aecb",
     "apps/computer_use/vm/record_console.py": "27d092a9d7215a7dc6727e1fe5428b8b7cca058509457f60827eb139f3d7d821",
     "apps/computer_use/vm/qualify_recording.py": "2213c764dfb70a1dee8fe89d97a77c1d09292c487ce4ab4c9587087f0d079e17",
     "apps/computer_use/vm/vnc_admin.py": "8ecafde699aef14c519c28dd9a6cc6bebfef5cc1d43d6c2e9ddff72077354921",
@@ -135,15 +169,22 @@
     "apps/computer_use/osworld_windows/qualify022_web_guest.py": "b9aed512e1fd3590ba7f2dae230a7b1d78499e47be231bf286b9867dd114d591",
     "apps/computer_use/osworld_windows/materials022.py": "bcbeb01d97bf376368eb3bf97a2151756779547577fdde619bec682d3c552677",
     "apps/computer_use/osworld_windows/collect022_guest.py": "c33a4c7089638f473a72131c25f1d5d0a6ecbb718a14d4486a1e339a56c6db48",
-    "apps/computer_use/osworld_windows/qualify022.py": "284ead5715b0f9e3dc48c45701f17dba427306fb943aca34d4272db0b0b4c06d"
+    "apps/computer_use/osworld_windows/qualify022.py": "284ead5715b0f9e3dc48c45701f17dba427306fb943aca34d4272db0b0b4c06d",
+    "apps/computer_use/collect_artifacts.py": "7dcf0b3b51ef8d971a238df1d54a94da3fef0688e730fe2e9c0b4c80a8651872",
+    "apps/computer_use/tests/test_collect_artifacts.py": "334d6107602b22ee4b2836c82629c1c8e90732645dc5346fd3eef269ef85083e",
+    "apps/computer_use/osworld_windows/task043.py": "a1946bb3fed6a4d7514ee1fd7382287f38b58769187fa2742e2b2328ffe92229",
+    "apps/computer_use/osworld_windows/qualify043.py": "3fcb792eac502f208870e4008c7e986bd54f9b5f413f720e37e269849ad66739",
+    "apps/computer_use/osworld_windows/prepare043.py": "0ecb8178149b3ae1c6d15af35f92efb63c36342c7bc8a6843cb29e32d4bdbc43",
+    "apps/computer_use/vm/osworld-calendar.Dockerfile": "4851738919820ad0d59aa2e9a35cd881296c1cae4827717cd4fb02475696042e",
+    "apps/computer_use/vm/osworld-web.compose.yml": "c8d98aff20a79c2188f24648a871914ba4e24e8626453ed01703bb7e7a52725b"
   },
   "pending": [
-    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 dynamic events; 043 calendar; 051 process constraints",
+    "Complete remaining task preparation: 006 original materials; 022 remaining download UI/reset; 035 dynamic events; 043 disclosed constraint-conflict handling/reset; 051 process constraints",
     "Resolve 004 locked-slide preservation across repeated native saves and font substitution; finish 080 positive/full rubric qualification",
-    "Wire terminal driver, native binary artifact collection, reset, recorder and graders into the continue-on-task-failure campaign scheduler",
+    "Wire terminal driver, qualified native binary artifact collection, reset, recorder and graders into the continue-on-task-failure campaign scheduler",
     "Qualify benchmark browser reopen and Explorer entry paths; current Edge open_app still targets legacy BrowserProfile/fixture.html",
     "Before freezing: archive/remove all known-answer qualification files and old task products from guest and SMB-visible share; validate minimal per-attempt public staging",
-    "Mirror private-site decorative remote assets and validate Calendar/remaining UI paths",
+    "Mirror private-site decorative remote assets and validate remaining UI paths",
     "Full-duration recording overhead and monotonic event alignment",
     "Clean baseline snapshot, restore round trips, frozen V0 configuration",
     "20 V0 on/off baseline runs; diagnose; at most two general candidates; V1 comparison and conditional repetition"
@@ -774,6 +815,41 @@
         "Initialize Windows workbook and private TeamChat state",
         "Validate Windows saved positive and pristine reset"
       ]
+    },
+    "043": {
+      "model_test_completed": false,
+      "snapshot_frozen": false,
+      "original_calendar_initialized": true,
+      "original_handbook_opened": true,
+      "teamchat_native_rendered": true,
+      "guest_timezone": "UTC",
+      "initial_event_count": 38,
+      "native_single_meeting_edit_passed": true,
+      "native_edit_evidence": "apps/computer_use/.runtime/osworld-043-qual-02/native-edit-result.json",
+      "native_day_view_and_reload_passed": true,
+      "day_view_evidence": "apps/computer_use/.runtime/osworld-043-qual-02/day-after-fix-result.json",
+      "native_saved_reference_integrity_passed": true,
+      "native_collected_grade": "apps/computer_use/.runtime/osworld-043-qual-02/native-collected-grade.json",
+      "grader_cases_passed": 16,
+      "grader_evidence": "apps/computer_use/.runtime/osworld-043-grader-02/result.json",
+      "constraint_audit": "apps/computer_use/.runtime/osworld-043-grader-01/constraint-audit.json",
+      "full_business_positive_exists": false,
+      "scoring_policy": "Keep source-compatible score, structural checks and diagnostic business-constraint audit separate; do not silently relax original requirements",
+      "constraint_limits": [
+        "No common 09:00-18:00 work interval across LA/London/Singapore; this is an explicit diagnostic interpretation of normal working hours",
+        "Handbook and scoring source disagree on attendees for M06 and M19",
+        "Original score ignores finite recurrence/guest integrity and permits five-minute changes to protected events"
+      ],
+      "remaining": [
+        "Freeze disclosed handling of source constraint conflicts without claiming full business success",
+        "Fresh task snapshot and restore roundtrip",
+        "Remove qualification materials from guest and SMB share before formal freeze",
+        "Wire initializer, collector and grading into native campaign"
+      ],
+      "preserved_failures": [
+        "apps/computer_use/.runtime/osworld-043-qual-01",
+        "apps/computer_use/.runtime/osworld-043-qual-02/day-before-fix-result.json"
+      ]
     }
   },
   "latest_preparation_source": "This commit; source identities are recorded above. V0 remains unfrozen.",
@@ -787,5 +863,26 @@
       "prior_state_preserved"
     ],
     "evidence": "apps/computer_use/.runtime/osworld-sites-identity-02/result.json"
+  },
+  "binary_artifact_collection": {
+    "native_qualification_passed": true,
+    "formats": [
+      "docx_in_doc_container",
+      "xlsx",
+      "pptx",
+      "xcf",
+      "pdf"
+    ],
+    "files_copied": 5,
+    "missing_deliverable_distinguished": true,
+    "maximum_file_bytes": 536870912,
+    "receipt": "apps/computer_use/.runtime/windows/shared/binary-collection-qual-01/receipt.json",
+    "independent_validation": "apps/computer_use/.runtime/windows/shared/binary-collection-qual-01-independent.json",
+    "limitations": [
+      "Administrative component, not yet wired into the campaign scheduler",
+      "XCF signature qualified here, render grading remains task 051 work",
+      "Presentation is a previously saved qualification output, not pristine input"
+    ],
+    "model_used": false
   }
 }

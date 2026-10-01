@@ -228,14 +228,19 @@
       "scenario_id": "win-osworld-043",
       "source_task_id": "043",
       "title_zh": "跨时区日历修复",
-      "status": "not_started",
+      "status": "qualification_in_progress",
       "analysis_role": "reserved_until_v1_frozen",
       "batch": "B",
       "provisional_timeout_seconds": 5400,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "native_calendar_edit_validated": true,
+      "native_day_view_validated": true,
+      "local_grader_cases_validated": true,
+      "business_constraint_conflicts_disclosed": true,
+      "full_business_positive_exists": false
     },
     {
       "scenario_id": "win-osworld-080",

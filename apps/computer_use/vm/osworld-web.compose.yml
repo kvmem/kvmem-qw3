@@ -49,6 +49,7 @@ services:
   calendar:
     build:
       context: ../../../third_party/OSWorld-web/calendar_web
+      dockerfile: ../../../apps/computer_use/vm/osworld-calendar.Dockerfile
       args: *direct-downloads
     environment: {NODE_ENV: production, COOKIE_NAME: user_id, COOKIE_MAX_AGE: "2592000"}
     ports: ["127.0.0.1:18113:3000"]
