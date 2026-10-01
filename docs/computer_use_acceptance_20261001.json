@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790817872.9536886,
+  "reviewed_at": 1790821194.33631,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
@@ -10,13 +10,15 @@
     "completed_trials": 18,
     "passed_trials": 18,
     "required_trials": 18,
-    "independent_audit_passed": true,
-    "qualified_executor_sha256": "b5e4eafa2204609a32914ef90bd2aaec85a902884ec7199ea2e3fbb8bddd37fb",
+    "functional_independent_audit_passed": true,
+    "report": "docs/computer_use_windows_native_04_20261001.json",
+    "qualified_executor_sha256": "6678710b6425f3d1a1828e0ba90213590526c9adad2b2751fb9d5f317747b45f",
     "recorded_commits": [
-      "49f25082c3c5a29ea431bb9745086790bce8aa89",
-      "53cd0bfbc6bc97917e270b7a6a6ac451efb0233a"
+      "4c2aad54c4cb8083c2bbd0b1a9ff45a7e3587506",
+      "7d18e50edcba5d83f5fee26520fe6278b8555259"
     ],
-    "recorded_commits_have_identical_app_sources": true
+    "recorded_commits_have_identical_app_sources": true,
+    "client_resource_comparison_valid": false
   },
   "verified_retained_evidence": {
     "cpu-baseline-recheck-01/result.json": {
@@ -186,8 +188,8 @@
     }
   },
   "remaining": [
-    "Qualify explicit guided-refresh live profile and final native sources. Four same-turn visual long checks passed with guided both; original guided-off failure retained. Paired baseline live comparison complete (on passed, off timed out).",
-    "Complete the18-task native matrix and on/off native restart checks for bundle06 on its matching clean snapshot; retain suite03 newline failure. Native-edit execution and dispatch-death probes already passed.",
+    "Complete guided live archive06 on/off and current-engine six-profile fixed-input controls; preserve original guided-off failure and all prior live timeouts.",
+    "Repair native-client process-identity resource sampling and qualify a fresh matched Windows measurement. Independent native functionality and host GPU/RSS evidence remain valid.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
   ],
@@ -216,7 +218,7 @@
     "source": "apps/computer_use/vm/executor.ps1",
     "promoted_native_semantics_passed": true
   },
-  "source_identity_note": "Frozen native suite02 (18/18) uses old bundle04, executor b5e4 and engine e14b. Archive pair04 uses repaired engine005654 with old executor b5e4 and guided refresh off; on passed and off timed out. Neither certifies the revised bundle06/executor6678/guided-both combination.",
+  "source_identity_note": "Current matrix04 and restart02 qualify bundle06/executor6678/engine005654/guided-both core native client behavior. Earlier archive pair04 is on the old executor with guided refresh off; guided live archive06 and current-engine fixed controls are not yet qualified.",
   "live_archive": {
     "status": "both_policies_failed_deadline",
     "paired_deadline_seconds": 900,
@@ -260,7 +262,7 @@
       "cleanup_passed": true
     }
   },
-  "native_client_source_identity_scope": "Bundle06 contains21 matching bundled source files and passed34 native contracts. Its first on-policy repetition passed all three real Windows tasks; the frozen18-trial queue remains active. Bundle05 first-task newline failure remains retained; bundle04 old18/18 results have their original scope.",
+  "native_client_source_identity_scope": "Bundle06 contains21 matching bundled source files and passed34 native contracts per trial, all18 core Windows tasks and both native crash/resume tests. Original bundle05 newline failure is retained.",
   "same_turn_visual": {
     "passed": false,
     "on_positive_answer_wrong": true,
@@ -278,19 +280,22 @@
   },
   "matched_native_client_bundle": "apps/computer_use/.runtime/windows-native-client-06",
   "native_requalification": {
-    "status": "running",
-    "unit": "qw3-computer-final-qualification-02.service",
-    "result": "apps/computer_use/.runtime/final-windows-qualification-02/result.json",
+    "status": "native_complete_long_and_replay_running",
+    "unit": "qw3-computer-final-qualification-04.service",
+    "result": "apps/computer_use/.runtime/final-windows-qualification-04/result.json",
     "matrix": "apps/computer_use/.runtime/windows-native-suite-04",
     "required_trials": 18,
     "snapshot": "qw3-exact-20261001",
     "bundle_sha256": "23851fd5c83e8b4e70a2595fcf46d3f1c7f1f600e1ff140a3ade8b2ad69c08f4",
     "prior_failure_document": "docs/computer_use_native_newline_failure_20261001.json",
-    "observed_at": 1790817872.9536796,
-    "completed_trials": 7,
-    "passed_trials": 7,
+    "observed_at": 1790821194.3363106,
+    "completed_trials": 18,
+    "passed_trials": 18,
     "first_round_progress_document": "docs/computer_use_windows_native_04_progress_20261001.json",
-    "source_identity_note": "Application files, model assets and engine remain frozen at the recorded hashes. Independent offline analysis/tests and documentation commits may change Git HEAD during the queue."
+    "source_identity_note": "Application files, model assets and engine remain frozen at the recorded hashes. Independent offline analysis/tests and documentation commits may change Git HEAD during the queue.",
+    "restart_passed": 2,
+    "restart_report": "docs/computer_use_windows_native_restart_02_20261001.json",
+    "startup_failure_report": "docs/computer_use_windows_long_startup_05_20261001.json"
   },
   "phase_accounting": {
     "document": "docs/computer_use_phase_accounting_20261001.json",
@@ -301,5 +306,22 @@
     "archive_complete_native_timings": 122,
     "archive_cancelled_without_native_terminal": 1,
     "pure_vision_encoding_time_measured": false
+  },
+  "previous_native_matrix": {
+    "status": "completed",
+    "completed_trials": 18,
+    "passed_trials": 18,
+    "required_trials": 18,
+    "independent_audit_passed": true,
+    "qualified_executor_sha256": "b5e4eafa2204609a32914ef90bd2aaec85a902884ec7199ea2e3fbb8bddd37fb",
+    "recorded_commits": [
+      "49f25082c3c5a29ea431bb9745086790bce8aa89",
+      "53cd0bfbc6bc97917e270b7a6a6ac451efb0233a"
+    ],
+    "recorded_commits_have_identical_app_sources": true
+  },
+  "native_client_resources": {
+    "qualified": false,
+    "issue": "docs/computer_use_native_resource_attribution_20261001.json"
   }
 }

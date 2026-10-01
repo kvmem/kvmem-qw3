@@ -1,0 +1,61 @@
+{
+  "kind": "native_restart_retained_evidence_audit",
+  "passed": true,
+  "checks": [
+    {
+      "kvmem": "on",
+      "passed": true,
+      "seconds": 63.0328138,
+      "file_sha256": "5cbb7d876d8ab20b6a2a0302328313659eac645e363dcb8c1df7b1d05facde71",
+      "completed_actions": 12
+    },
+    {
+      "kvmem": "off",
+      "passed": true,
+      "seconds": 124.67255719999999,
+      "file_sha256": "5cbb7d876d8ab20b6a2a0302328313659eac645e363dcb8c1df7b1d05facde71",
+      "completed_actions": 12
+    }
+  ],
+  "source_summary_sha256": "34b9c5106f56c5ea0342feabeab2ebb5ee4656d34432a04c4613fcdd48bcd37e",
+  "termination_scope": "The driver checks taskkill exit zero; crash/cleanup_exit_code 1 records deliberately terminated application processes. Successful retained taskkill logs and exact root PIDs are independently checked.",
+  "auditor_sha256": "7947e72b93a68aee12cd748ba91f16a7fed55e4b293b91786da8aec837b01086",
+  "run": "apps/computer_use/.runtime/windows-native-restart-02",
+  "bundle_sha256": "23851fd5c83e8b4e70a2595fcf46d3f1c7f1f600e1ff140a3ade8b2ad69c08f4",
+  "snapshot": "qw3-exact-20261001",
+  "regression": {
+    "auditor_sha256": "7947e72b93a68aee12cd748ba91f16a7fed55e4b293b91786da8aec837b01086",
+    "valid_retained_pair_passed": true,
+    "negative_checks": [
+      {
+        "mutation": "cleanup_exit_code",
+        "rejected": true
+      },
+      {
+        "mutation": "cleanup_error",
+        "rejected": true
+      },
+      {
+        "mutation": "paused_without_actions_seconds",
+        "rejected": true
+      }
+    ],
+    "original_evidence_unchanged": true
+  },
+  "queue_failure": {
+    "run": "apps/computer_use/.runtime/final-windows-qualification-02",
+    "error": "KeyError('shutdown_exit_code')",
+    "scope": "Audit helper expected a regular-case driver field absent in the crash/resume schema. Both tasks had completed; original failed service result and logs are retained.",
+    "cleanup": {
+      "kind": "owned_vm_service_cleanup",
+      "passed": true,
+      "at": 1790820578.9435737,
+      "paused": true
+    }
+  },
+  "continuation": {
+    "unit": "qw3-computer-final-qualification-03.service",
+    "path": "apps/computer_use/.runtime/final-windows-qualification-03/result.json",
+    "scope": "Audit corrected and existing evidence checked; completed native tasks were not rerun. Only previously unstarted stages continue."
+  }
+}
