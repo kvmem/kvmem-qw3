@@ -1,0 +1,975 @@
+{
+  "schema_version": 1,
+  "status": "plan_only_not_benchmark_results",
+  "date": "2026-10-01",
+  "scope": "10 OSWorld-derived Windows scenarios; Codex + QW3 + DFlash2",
+  "source": {
+    "code_root": "third_party/OSWorld-V2",
+    "code_commit": "d578d2d4e0dc82b43e270fdaa7fa89d9708cd154",
+    "task_repository": "xlangai/osworld_v2_tasks",
+    "task_source_revision": "0ec2aa30344a28103a33c89c6588c3437bfcdca1",
+    "task_manifest": "third_party/OSWorld-V2/cache/osworld_v2_task_manifest/manifests/task_hashes.json",
+    "task_manifest_sha256": "42f8f6f8939b8712997d5891456a575f8a2a5f53465e9e3e6747af5d6efd0915",
+    "asset_repository": "xlangai/osworld_v2_assets_gated",
+    "asset_revision": "v2026.08.08",
+    "asset_commit": "acad110ef3136405f95434b54862bf9066176c2a",
+    "asset_manifest": "third_party/OSWorld-V2/cache/osworld_v2_asset_manifest.json",
+    "asset_manifest_sha256": "137373379dd5b44335131730e4e04d034aa384c6020b7bf7c3cc096332c9d5df",
+    "official_project_url": "https://github.com/xlang-ai/OSWorld-V2",
+    "official_tasks_url": "https://huggingface.co/datasets/xlangai/osworld_v2_tasks"
+  },
+  "scenario_count": 10,
+  "verified_task_file_count": 10,
+  "verified_asset_file_count": 44,
+  "first_round_runs": 20,
+  "total_runs_at_three_repetitions": 60,
+  "initial_budget_max_execution_hours_20_runs": 22,
+  "initial_budget_max_execution_hours_60_runs": 66,
+  "budgets_frozen": false,
+  "official_leaderboard_comparable": false,
+  "speculative_method": "dflash2",
+  "requires_before_scoring": [
+    "Freeze Windows-adapted prompts, material placement and task evaluators",
+    "Validate new applications/executor allowlist and create new VM/client baseline",
+    "Deploy/reset matching private website states",
+    "Validate continuous read-only recording and measure overhead",
+    "Validate positive/negative evaluator examples",
+    "Freeze budgets, configurations, identities and AB/BA schedule"
+  ],
+  "scenarios": [
+    {
+      "id": "win-osworld-013",
+      "source_task_id": "013",
+      "title_zh": "奖品分配填表",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_013.py",
+      "source_sha256": "75ea95a35b3cba2e98ad1e95dbaf883bcb1408f09201927a376804a62a94a1d6",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_013/all_gts.json": {
+          "sha256": "a5f72f50191d168ecf2ff148ce3fcd0013d6b31aabbdcbd97e18ff90a5c0531d",
+          "bytes": 20823
+        },
+        "task_013/gt.json": {
+          "sha256": "8224dee2a6068cc3cab82caf9c23c5e79669183f1fe920ff4b1b2362ade30998",
+          "bytes": 4402
+        },
+        "task_013/prize-items.pdf": {
+          "sha256": "bcd5e163d96668d032d2e23689f3bd3fdad528ebcbb9c6eebb33e624accfdd91",
+          "bytes": 247139
+        },
+        "task_013/prize-items_fig.pdf": {
+          "sha256": "3b6168b27206ee665180f6ee73279f998612f10a6a7c4f99158d6927fc8a7e99",
+          "bytes": 3340391
+        },
+        "task_013/state.json": {
+          "sha256": "702f8e92d8ab061279659d81b23c54d78b1f76b270bec32058591101ca964f99",
+          "bytes": 3876
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "edge"
+      ],
+      "private_sites": [
+        "formcraft"
+      ],
+      "provisional_timeout_seconds": 1800,
+      "provisional_tool_call_limit": 300,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    },
+    {
+      "id": "win-osworld-004",
+      "source_task_id": "004",
+      "title_zh": "演示文稿风格修复",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_004.py",
+      "source_sha256": "2ccaf3ca09f683d2ba4ddbadb83b0dde25b64db0087c99361f6f98ebc2560173",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_004/stanford-nlp-seminar-talk-v2.pptx": {
+          "sha256": "4c71515b8ba58790b1323c37a54763fa1b50f65b984da3b22d3686af8eb50bc7",
+          "bytes": 18266823
+        },
+        "task_004/stanford-nlp-seminar-talk-v2_2.pptx": {
+          "sha256": "c34c7fa8536023cccb8febcb67961584d6d6cbe324b2fdaa14211ec082592d15",
+          "bytes": 18284346
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "libreoffice_impress"
+      ],
+      "private_sites": [],
+      "provisional_timeout_seconds": 1800,
+      "provisional_tool_call_limit": 300,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    },
+    {
+      "id": "win-osworld-006",
+      "source_task_id": "006",
+      "title_zh": "申请材料筛选归档",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_006.py",
+      "source_sha256": "07322e1eecc80eb304ba8b6704f8d60afe8631013037d290a4c566409856ede2",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_006/internal_application.xlsx": {
+          "sha256": "d5d5cb2181bc2e4f0356c1e1c2217d6d3340ff97dd669661ba9370d4aebb0621",
+          "bytes": 88031
+        },
+        "task_006/thunderbird-profile.tar.gz": {
+          "sha256": "02bc206727cc56e70264665af71a9efe1ece3bd7898b5edfff45e2c631717bd9",
+          "bytes": 451995
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "thunderbird",
+        "libreoffice_calc",
+        "explorer"
+      ],
+      "private_sites": [],
+      "provisional_timeout_seconds": 3600,
+      "provisional_tool_call_limit": 500,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    },
+    {
+      "id": "win-osworld-010",
+      "source_task_id": "010",
+      "title_zh": "交流资助报销清单",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_010.py",
+      "source_sha256": "9b3114d0a832fe77525a6308f5faab84da6cd1e8065f39d778436f0ea53bcf06",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_010/15057628-1a60-54c0-868c-e84b7ba977b2_Guidelines.docx": {
+          "sha256": "3c002745cfda606972201df0005a27a9877d22f54d6cdfd29accf226ceca2b11",
+          "bytes": 1158695
+        },
+        "task_010/Approval_Letter_Alex_Li.pdf": {
+          "sha256": "5a3817e9673d3290a34bc96feed3d02295e1b2c641a53e0c8a9689928fb25a61",
+          "bytes": 2501
+        },
+        "task_010/Approval_Letter_Alex_Li_Spring2024.pdf": {
+          "sha256": "b307f2b0fbeaa67b5f5a2ddcc7b8671cf861c20c2bf7a58498086fb4a6c8eba3",
+          "bytes": 1851
+        },
+        "task_010/Approval_Letter_Emily_Chen.pdf": {
+          "sha256": "8f93f5684c44256139a936c8c062bea6d74c98e2555cb8a7dab86c176c42dc47",
+          "bytes": 1854
+        },
+        "task_010/Attachment_4_Reimbursement_Checklist_Example_plain.pdf": {
+          "sha256": "7eb191a08e341cd9c04ec5ccb54756b63575f6fa8f1b50e5f4b2f5ea90959a52",
+          "bytes": 225603
+        },
+        "task_010/Funding_Application_Receipt.pdf": {
+          "sha256": "5c236e2075bc3fe850b83e64cc266cacbc247f2e1eb0b685261aa8cfc8bdfafa",
+          "bytes": 1780
+        },
+        "task_010/HKU_Fellowship_Funding_Standards_2025.pdf": {
+          "sha256": "3e897142b4a039be8aa7861aa92582ab4f31ee730206e3eb1b73d9337a8ae3e3",
+          "bytes": 1776
+        },
+        "task_010/Pre_Approval_Notice_Alex_Li.pdf": {
+          "sha256": "592bb4c9f1e8257f6b6245ee1ca3d5b3c55ee75589a8ebbedca45e58b128f4cc",
+          "bytes": 1968
+        },
+        "task_010/Reimbursement_Checklist_Completed.docx": {
+          "sha256": "7635f0b99b8e0d979d0697b86c366cd56a3b4f7ee1bf7314d1a44a77f7febf74",
+          "bytes": 20971
+        },
+        "task_010/UIUC_Exchange_Welcome_Letter.pdf": {
+          "sha256": "c6eddea9de8ca2e70d08b66b1d58d13e0d1a6f54cf97ecf6c62cbfee5bbfe2e1",
+          "bytes": 1935
+        },
+        "task_010/email_010.tar.gz": {
+          "sha256": "fc8dc865be4e4e89ca36d3ece2538872a60e4115d4447b041059ce6fb15c2151",
+          "bytes": 17858394
+        },
+        "task_010/letter.pdf": {
+          "sha256": "600d320d22c87b90fc0eed77c7ae7c76fac27cd1c81ad2c2031889ac0677a007",
+          "bytes": 109015
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "thunderbird",
+        "libreoffice_writer",
+        "libreoffice_calc",
+        "edge",
+        "explorer"
+      ],
+      "private_sites": [],
+      "provisional_timeout_seconds": 3600,
+      "provisional_tool_call_limit": 500,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    },
+    {
+      "id": "win-osworld-038",
+      "source_task_id": "038",
+      "title_zh": "CRM 批量线索更新",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_038.py",
+      "source_sha256": "5d84857ab21f9a095a2b5616d62d299cb12a83654ba8671fd435913e5903a449",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_038/state_1.json": {
+          "sha256": "6e5ca3aead739e47e73a5dec0b0aecbef72c91c91e4ff33fdb55e7cffeebc34f",
+          "bytes": 82389
+        },
+        "task_038/state_2.json": {
+          "sha256": "2f52b98236a4d73e892c177b1f32fb8e90ea6175b114a99b950cba30fb56acb0",
+          "bytes": 38951
+        },
+        "task_038/state_3.json": {
+          "sha256": "4bc0a7291b9354f781766e9b5cc9e2d4e1f71469878b5f874eab5f99305bcf1e",
+          "bytes": 43253
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "edge"
+      ],
+      "private_sites": [
+        "cloudcrm",
+        "teamchat",
+        "mailhub"
+      ],
+      "provisional_timeout_seconds": 3600,
+      "provisional_tool_call_limit": 500,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    },
+    {
+      "id": "win-osworld-022",
+      "source_task_id": "022",
+      "title_zh": "申请材料核对上传",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_022.py",
+      "source_sha256": "4ee7db1c15776f64e5cf520f89d5a4d15e64c0a236ec4e9b80f4c85ed3fac4b2",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_022/loanhub_initial_state.json": {
+          "sha256": "4e3353c6ebcb73432f95ff701f2318f1b333a4d4d9953f38ef2e146719858d8c",
+          "bytes": 731
+        },
+        "task_022/task_022.zip": {
+          "sha256": "288273a2bfd4c206399e5a8a086ddc66dc8dab17e7115556c2daefd3c93d29b6",
+          "bytes": 108856
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "edge",
+        "explorer"
+      ],
+      "private_sites": [
+        "loanhub",
+        "simulated_account_sites"
+      ],
+      "provisional_timeout_seconds": 5400,
+      "provisional_tool_call_limit": 500,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    },
+    {
+      "id": "win-osworld-035",
+      "source_task_id": "035",
+      "title_zh": "动态采购审批",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_035.py",
+      "source_sha256": "a46d1ab1a4b6c5f9cce841352c93dc14b32371b2deae61c48018b905794e2577",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_035/dynamic_state.json": {
+          "sha256": "adb9da0263f7c945d5ac5ba34d08a754352883cda33f63b83793e4527444795f",
+          "bytes": 22712
+        },
+        "task_035/dynamic_state_035.json": {
+          "sha256": "a9e34713d56b51a443131109d9b5e465f63681aeeb3a7e7539fc4e9e4c25b43c",
+          "bytes": 22714
+        },
+        "task_035/minileaf_bundle.zip": {
+          "sha256": "b27767607188891c154fd3e7af4270888e1fe04fa86f8e0748707347eb6f3259",
+          "bytes": 22916224
+        },
+        "task_035/purchase_order_form.xlsx": {
+          "sha256": "8c132e93f8008ee39b447c0b56d837031a6da66f628626f8e5042f65d6d50ed4",
+          "bytes": 5443
+        },
+        "task_035/purchase_order_form_gt.xlsx": {
+          "sha256": "5a97629693ce1411d887a84302cae6519f0656befa1392251264680f8c86d426",
+          "bytes": 4327
+        },
+        "task_035/state.json": {
+          "sha256": "10782b63d9126ba13b550cfbd2a11ea33933460b3cd56c2d3fdad7009582cfbd",
+          "bytes": 15184
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "edge",
+        "libreoffice_calc"
+      ],
+      "private_sites": [
+        "teamchat"
+      ],
+      "provisional_timeout_seconds": 5400,
+      "provisional_tool_call_limit": 500,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate",
+        "Replace remote LLM grading with deterministic local row matcher; change dynamic delivery to frozen semantic milestones"
+      ]
+    },
+    {
+      "id": "win-osworld-043",
+      "source_task_id": "043",
+      "title_zh": "跨时区日历修复",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_043.py",
+      "source_sha256": "dc92942d7d9717f00b198f25907bdd47deef2fca645094e5b25cc0f1b21f91e0",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_043/calendar_state.json": {
+          "sha256": "4bd7836236c9b2f5e834b5033b24ae1eeab4cfee3e5da5ac423041404d78d990",
+          "bytes": 23685
+        },
+        "task_043/meetings.doc": {
+          "sha256": "ffc73596d7ad9cceadbf3cc0a84b3bdf6b332bb4b6dbdd36a8a61ac5f4dcbb9f",
+          "bytes": 10816
+        },
+        "task_043/teamchat_state.json": {
+          "sha256": "f1689ef28fa682f6753a863b78db70eb7942967969c0efcc35a90bd41064da7b",
+          "bytes": 47023
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "edge",
+        "libreoffice_writer"
+      ],
+      "private_sites": [
+        "calendar",
+        "teamchat"
+      ],
+      "provisional_timeout_seconds": 5400,
+      "provisional_tool_call_limit": 500,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    },
+    {
+      "id": "win-osworld-080",
+      "source_task_id": "080",
+      "title_zh": "经营规划工作簿修复",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_080.py",
+      "source_sha256": "13866402a9b1113e0ea7eebcd3894becd790c3f66c9fbe806c64209cfe34c098",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_080/FY26_GTM_Planning_Model_Broken.xlsx": {
+          "sha256": "0e77c479c5cb1a1031f3cef008f6f4b1657b3cbfe6f2c0c9f75713fc1375a357",
+          "bytes": 25436
+        },
+        "task_080/FY26_GTM_Planning_Model_Perfect_v2.xlsx": {
+          "sha256": "d35000ca189c96bdf571b08255bfc14de7eb70974f7e4ea0e56a68bbfb807932",
+          "bytes": 25334
+        },
+        "task_080/GTM_Operating_Model_Change_Memo.pdf": {
+          "sha256": "fdd339b09af3790cc06a84960f8dc30ba8d81f0832c7c1c3b59d8528cd59515c",
+          "bytes": 451844
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "wps_spreadsheets",
+        "edge"
+      ],
+      "private_sites": [],
+      "provisional_timeout_seconds": 5400,
+      "provisional_tool_call_limit": 500,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    },
+    {
+      "id": "win-osworld-051",
+      "source_task_id": "051",
+      "title_zh": "参考图复现与图层编辑",
+      "source_file": "third_party/OSWorld-V2/evaluation_examples/task_class/task_051.py",
+      "source_sha256": "13d006169e3491d06376e75adc7e08fa283ed6c392c413b8043a4b36491bb15f",
+      "source_matches_pinned_manifest": true,
+      "assets": {
+        "task_051/background.xcf": {
+          "sha256": "f840d4e52b8ed15a56f3017672a93721141e63ba2ba5d6b9f180101985e0061e",
+          "bytes": 5866246
+        },
+        "task_051/character_blue_gt.png": {
+          "sha256": "0d2e5791a7978f25a448f21f3bcba68d0aaa0b47a7cb314f2a013e388085b8d4",
+          "bytes": 157589
+        },
+        "task_051/character_red_gt.png": {
+          "sha256": "acd930c4215516221f40ddd3b882d76d1504de58205cad180070c91f801b6703",
+          "bytes": 134052
+        },
+        "task_051/gt_1.png": {
+          "sha256": "fdbb43ee8fd8fec84b4e74d6a8b016935b8bedb45d722849afc9df2f93a524ad",
+          "bytes": 362406
+        },
+        "task_051/materials.zip": {
+          "sha256": "b308225644ea06f4a874997d95d1407829b3d4da45e8ab4c15314d06da36b1e5",
+          "bytes": 10792762
+        },
+        "task_051/task_051_gt.xcf": {
+          "sha256": "17d6048cc8acc3e7241d5431ec087a32063cc5ea75f4a495116a9c7af9a36e60",
+          "bytes": 25638293
+        }
+      },
+      "assets_verified": true,
+      "windows_apps": [
+        "gimp",
+        "explorer"
+      ],
+      "private_sites": [],
+      "provisional_timeout_seconds": 3600,
+      "provisional_tool_call_limit": 500,
+      "status": "planned_not_run",
+      "windows_setup_validated": false,
+      "windows_evaluator_validated": false,
+      "continuous_recording_validated": false,
+      "adaptation_notes": [
+        "Explicit Windows paths and app/setup adaptation",
+        "Keep original and custom Windows scores separate"
+      ]
+    }
+  ],
+  "proposed_schedule": [
+    {
+      "run_index": 1,
+      "scenario_id": "win-osworld-013",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 2,
+      "scenario_id": "win-osworld-013",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 3,
+      "scenario_id": "win-osworld-004",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 4,
+      "scenario_id": "win-osworld-004",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 5,
+      "scenario_id": "win-osworld-006",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 6,
+      "scenario_id": "win-osworld-006",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 7,
+      "scenario_id": "win-osworld-010",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 8,
+      "scenario_id": "win-osworld-010",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 9,
+      "scenario_id": "win-osworld-038",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 10,
+      "scenario_id": "win-osworld-038",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 11,
+      "scenario_id": "win-osworld-022",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 12,
+      "scenario_id": "win-osworld-022",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 13,
+      "scenario_id": "win-osworld-035",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 14,
+      "scenario_id": "win-osworld-035",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 15,
+      "scenario_id": "win-osworld-043",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 16,
+      "scenario_id": "win-osworld-043",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 17,
+      "scenario_id": "win-osworld-080",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 18,
+      "scenario_id": "win-osworld-080",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 19,
+      "scenario_id": "win-osworld-051",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 20,
+      "scenario_id": "win-osworld-051",
+      "repetition": 1,
+      "pair_seed": 20261002,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 21,
+      "scenario_id": "win-osworld-013",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 22,
+      "scenario_id": "win-osworld-013",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 23,
+      "scenario_id": "win-osworld-004",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 24,
+      "scenario_id": "win-osworld-004",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 25,
+      "scenario_id": "win-osworld-006",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 26,
+      "scenario_id": "win-osworld-006",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 27,
+      "scenario_id": "win-osworld-010",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 28,
+      "scenario_id": "win-osworld-010",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 29,
+      "scenario_id": "win-osworld-038",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 30,
+      "scenario_id": "win-osworld-038",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 31,
+      "scenario_id": "win-osworld-022",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 32,
+      "scenario_id": "win-osworld-022",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 33,
+      "scenario_id": "win-osworld-035",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 34,
+      "scenario_id": "win-osworld-035",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 35,
+      "scenario_id": "win-osworld-043",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 36,
+      "scenario_id": "win-osworld-043",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 37,
+      "scenario_id": "win-osworld-080",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 38,
+      "scenario_id": "win-osworld-080",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 39,
+      "scenario_id": "win-osworld-051",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 40,
+      "scenario_id": "win-osworld-051",
+      "repetition": 2,
+      "pair_seed": 20261003,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 41,
+      "scenario_id": "win-osworld-013",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 42,
+      "scenario_id": "win-osworld-013",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 43,
+      "scenario_id": "win-osworld-004",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 44,
+      "scenario_id": "win-osworld-004",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 45,
+      "scenario_id": "win-osworld-006",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 46,
+      "scenario_id": "win-osworld-006",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 47,
+      "scenario_id": "win-osworld-010",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 48,
+      "scenario_id": "win-osworld-010",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 49,
+      "scenario_id": "win-osworld-038",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 50,
+      "scenario_id": "win-osworld-038",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 51,
+      "scenario_id": "win-osworld-022",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 52,
+      "scenario_id": "win-osworld-022",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 53,
+      "scenario_id": "win-osworld-035",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 54,
+      "scenario_id": "win-osworld-035",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 55,
+      "scenario_id": "win-osworld-043",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 56,
+      "scenario_id": "win-osworld-043",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 57,
+      "scenario_id": "win-osworld-080",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 58,
+      "scenario_id": "win-osworld-080",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    },
+    {
+      "run_index": 59,
+      "scenario_id": "win-osworld-051",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "on",
+      "status": "planned"
+    },
+    {
+      "run_index": 60,
+      "scenario_id": "win-osworld-051",
+      "repetition": 3,
+      "pair_seed": 20261004,
+      "kvmem": "off",
+      "status": "planned"
+    }
+  ]
+}

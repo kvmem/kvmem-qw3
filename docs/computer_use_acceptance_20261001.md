@@ -19,6 +19,14 @@ The [JSON inventory](computer_use_acceptance_20261001.json) and linked reports
 retain identities and distinguish passed functionality from open measurements.
 Runtime paths below are relative to `apps/computer_use/.runtime/`.
 
+The next Windows expansion is a [10-scenario OSWorld-derived evaluation plan](computer_use_osworld_windows_10_20261001.md),
+with a [pinned source/asset and proposed run manifest](computer_use_osworld_windows_10_20261001.json).
+It is **planned, not new task-pass evidence**. The [measurement protocol](computer_use_windows_complex_eval_20261001.md)
+defines outcome, latency, resource and recording comparisons. A synchronized
+offline replay of retained archive observations is available in
+`comparison-replay-long-07-04/index.html`; it is screenshot reconstruction,
+not continuous video or a result from the proposed ten scenarios.
+
 ## Current qualified identities
 
 - Application content: `7d18e50`; engine SHA-256
