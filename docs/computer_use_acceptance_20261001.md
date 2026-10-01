@@ -4,7 +4,7 @@ Status: **active; not a completion certificate**. Windows VM functionality and
 both fixed-input decoder matrices are qualified for baseline engine `005654a6...`.
 Its long live comparison is complete: KVMem on passed; off timed out. Checkpoint
 repair has passed its first real long desktop task; the matching off-policy run
-timed out at the same deadline. New-engine fixed controls are still running. Mac and physical hardware
+timed out at the same deadline. New-engine short controls passed 54/54; long controls are still running. Mac and physical hardware
 acceptance remain open. Standalone vision timing, the Windows process-identity
 probe and a fresh native resource pair have passed.
 
@@ -155,8 +155,11 @@ instruction. No successful historical-image recall is claimed for that run.
 The paired identities and retained evidence are consistent. On/off sampled
 whole-device GPU peaks were 46.125/67.674 GiB. Off has 40 complete model requests
 and one deadline-cancelled request without terminal timing; its phase audit
-passes consistency, with incomplete coverage. The six-profile fixed controls
-remain running.
+passes consistency, with incomplete coverage. The [six-profile short controls](computer_use_short_controls_04_20261001.json)
+passed all 54 limited output checks, with actual speculation and no fallback.
+Their sampled GPU peaks were 37.209/62.299 GiB (none), 38.693/65.365 GiB (MTP)
+and 42.451/67.541 GiB (DFlash), on/off respectively. Long fixed controls remain
+running.
 [All 122 paired requests](computer_use_windows_long_requests_07_20261001.csv);
 [all 81 on-policy phases](computer_use_windows_long_on_07_phases_20261001.csv).
 
@@ -175,7 +178,7 @@ remain running.
    [eight visual checks](computer_use_guided_visual_02_20261001.json) also pass.
    The new on-policy real desktop task also passed, with zero checkpoint misses
    or rejected actions. Matched off-policy comparison is complete with a normal
-   deadline failure; fixed controls are running. Keep the replay
+   deadline failure; short controls passed 54/54 and long controls are running. Keep the replay
    alignment guard and 60s observation lifetime.
 2. **Native-client resource attribution repaired:** [defect and repair](computer_use_native_resource_attribution_20261001.json).
    The [native probe](computer_use_native_resource_probe_20261001.json) passed

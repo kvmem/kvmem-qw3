@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790828399.604682,
+  "reviewed_at": 1790828922.2006044,
   "goal_complete": false,
   "recorded_source_commit": "7d18e50",
   "gpu_limit_48gb_retired": true,
@@ -188,7 +188,7 @@
     }
   },
   "remaining": [
-    "Finish engine9f six-profile fixed controls. Matched live archive07 comparison is complete: on passed 36 pages in 416.092s with zero rejections/checkpoint misses; off hit the same 900s deadline at page 18 and produced no file. Preserve engine005 native/core resource identities.",
+    "Finish engine9f six-profile long fixed controls. Short controls passed 54/54. Live archive07 pair complete: on passed, off hit the same 900s deadline at page 18; preserve engine005 native/core resource identities.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
   ],
@@ -463,5 +463,13 @@
     "comparison_completed": true,
     "comparison_evidence_consistent": true,
     "pair_report": "docs/computer_use_windows_long_pair_07_20261001.json"
+  },
+  "boundary_fixed_controls": {
+    "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+    "short_passed": 54,
+    "short_required": 54,
+    "short_document": "docs/computer_use_short_controls_04_20261001.json",
+    "long_status": "running",
+    "long_required": 12
   }
 }

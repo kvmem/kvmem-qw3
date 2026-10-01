@@ -1,0 +1,761 @@
+{
+  "kind": "qualified_short_fixed_input_controls_current_engine",
+  "reviewed_at": 1790828881.3113787,
+  "passed": true,
+  "requests": 54,
+  "profiles": [
+    {
+      "profile": "none-kvmem-on",
+      "runs": 9,
+      "output_checks_passed": 9,
+      "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+      "source_commit": "2a1193c5ceb0ea478f99d5d0a8cb90f57e946bab",
+      "engine_manifest_sha256": "2246fbccf517dcf3590cb1a4ec426b8b6c4b69917c04e6b319b0ccc6bac75938",
+      "engine_log_sha256": "458834b91fd9d1bb3e94d5ac8c809e3504a1b09aea4c6cd1f5f0bab5153a933a",
+      "drafted": 0,
+      "accepted": 0,
+      "fallback_requests": 0,
+      "sampled_gpu_peak_bytes": 39952842752,
+      "engine_rss_high_water_bytes": 33729228800
+    },
+    {
+      "profile": "none-kvmem-off",
+      "runs": 9,
+      "output_checks_passed": 9,
+      "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+      "source_commit": "2a1193c5ceb0ea478f99d5d0a8cb90f57e946bab",
+      "engine_manifest_sha256": "624b0bf02a0cb42054d66a964756349bbe15229f2e1fc51034ae824b5220f9f6",
+      "engine_log_sha256": "f1e8c48e48ce6b842256af67790d6b6c763aff801022695ff0ada756183064c8",
+      "drafted": 0,
+      "accepted": 0,
+      "fallback_requests": 0,
+      "sampled_gpu_peak_bytes": 66892857344,
+      "engine_rss_high_water_bytes": 30973571072
+    },
+    {
+      "profile": "mtp-kvmem-on",
+      "runs": 9,
+      "output_checks_passed": 9,
+      "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+      "source_commit": "1890db02178d4ed2e3c6b3a41caa2d26bec46ba8",
+      "engine_manifest_sha256": "bd6d883f2704950fd1a3c6c3c99d139fe3bedecc605a23c736d816d38b944dd6",
+      "engine_log_sha256": "e4a88470dd193eac867cc66d5f51560c9b8d3b32e2a94208049e5bd496f8f1fe",
+      "drafted": 1830,
+      "accepted": 1263,
+      "fallback_requests": 0,
+      "sampled_gpu_peak_bytes": 41546678272,
+      "engine_rss_high_water_bytes": 34288349184
+    },
+    {
+      "profile": "mtp-kvmem-off",
+      "runs": 9,
+      "output_checks_passed": 9,
+      "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+      "source_commit": "1890db02178d4ed2e3c6b3a41caa2d26bec46ba8",
+      "engine_manifest_sha256": "dbb895743748ff8b8fb5144ad5691aabb6c80b47c468294526a25d703bba4a2c",
+      "engine_log_sha256": "1442a2ca7793f31febc7c13caef79a9a47c79135fbdf2965599e560050a8da8e",
+      "drafted": 1908,
+      "accepted": 1296,
+      "fallback_requests": 0,
+      "sampled_gpu_peak_bytes": 70185385984,
+      "engine_rss_high_water_bytes": 31467716608
+    },
+    {
+      "profile": "dflash2-kvmem-on",
+      "runs": 9,
+      "output_checks_passed": 9,
+      "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+      "source_commit": "1890db02178d4ed2e3c6b3a41caa2d26bec46ba8",
+      "engine_manifest_sha256": "179dd3a73ec1e166300ab663858d8276678b58302c468d638a4b0cb06633c7d5",
+      "engine_log_sha256": "0a42516ae560fcfcf7f8ab9f00efa919c635464155d23b351e372fb7ba3aa757",
+      "drafted": 2451,
+      "accepted": 1383,
+      "fallback_requests": 0,
+      "sampled_gpu_peak_bytes": 45581598720,
+      "engine_rss_high_water_bytes": 34387001344
+    },
+    {
+      "profile": "dflash2-kvmem-off",
+      "runs": 9,
+      "output_checks_passed": 9,
+      "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+      "source_commit": "1890db02178d4ed2e3c6b3a41caa2d26bec46ba8",
+      "engine_manifest_sha256": "e17c2da9469d21d26653431067510ee664d0d1b31cedbc5b68be90c554d27255",
+      "engine_log_sha256": "401d4612e268007c40429271d552f91908c44bc2808345c1835d36f398ecd105",
+      "drafted": 2526,
+      "accepted": 1422,
+      "fallback_requests": 0,
+      "sampled_gpu_peak_bytes": 72521613312,
+      "engine_rss_high_water_bytes": 34387202048
+    }
+  ],
+  "cases": [
+    {
+      "name": "initial_desktop",
+      "path": "initial_desktop.json",
+      "sha256": "dd20db4ee50ab9d925dff14d8544a603db62566147158cf650c6d832132e6576",
+      "source": "apps/computer_use/.runtime/windows-app-01/inference/e951d55829b14b8fac504161e806081e",
+      "original_usage": {
+        "input_tokens": 3532,
+        "output_tokens": 159,
+        "total_tokens": 3691
+      }
+    },
+    {
+      "name": "notepad_history",
+      "path": "notepad_history.json",
+      "sha256": "5aa68f136a47a083735682d0d8b1ce50dd7ac8d06f3c793e2a42efb491a99fbb",
+      "source": "apps/computer_use/.runtime/windows-app-01/inference/870beceec7c74c2f8b964f350b63e9a5",
+      "original_usage": {
+        "input_tokens": 21126,
+        "output_tokens": 228,
+        "total_tokens": 21354
+      }
+    },
+    {
+      "name": "browser_history",
+      "path": "browser_history.json",
+      "sha256": "abdd208638a383706ce7c6b3c80ebf3ff6974195a6147225335c5daff03e8e80",
+      "source": "apps/computer_use/.runtime/windows-app-01/inference/eb84b82042e94e20a582c3ba12102b9c",
+      "original_usage": {
+        "input_tokens": 33079,
+        "output_tokens": 139,
+        "total_tokens": 33218
+      }
+    }
+  ],
+  "matched_model_controls": {
+    "--model": "/home/chaidi/qw3/models/Qwen3.8-27B-Q8_0.gguf",
+    "--vision-model": "/home/chaidi/qw3/models/Qwen3.8-27B-BF16",
+    "--vision-device": "cuda",
+    "--ctx": "1048576",
+    "--kv-dtype": "fp8",
+    "--prefill-chunk": "2048"
+  },
+  "prefix_reuse": false,
+  "guided_refresh": "off",
+  "vision_cache": "fresh per profile, retained across ordered requests/repetitions",
+  "case_metrics": [
+    {
+      "profile": "none-kvmem-on",
+      "case": "initial_desktop",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 1.4390562479384243,
+      "warm_first_output_seconds_median": 0.8841131790541112,
+      "warm_decode_tokens_per_second_median": 44.615,
+      "warm_elapsed_seconds_median": 4.44809460430406,
+      "sampled_profile_gpu_peak_bytes": 39952842752,
+      "profile_rss_high_water_bytes": 33729228800
+    },
+    {
+      "profile": "none-kvmem-on",
+      "case": "notepad_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 6.97426532022655,
+      "warm_first_output_seconds_median": 5.51998593704775,
+      "warm_decode_tokens_per_second_median": 44.269999999999996,
+      "warm_elapsed_seconds_median": 10.828071933006868,
+      "sampled_profile_gpu_peak_bytes": 39952842752,
+      "profile_rss_high_water_bytes": 33729228800
+    },
+    {
+      "profile": "none-kvmem-on",
+      "case": "browser_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 10.271067508962005,
+      "warm_first_output_seconds_median": 8.83081849804148,
+      "warm_decode_tokens_per_second_median": 43.379999999999995,
+      "warm_elapsed_seconds_median": 13.025903990492225,
+      "sampled_profile_gpu_peak_bytes": 39952842752,
+      "profile_rss_high_water_bytes": 33729228800
+    },
+    {
+      "profile": "none-kvmem-off",
+      "case": "initial_desktop",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 1.24593211337924,
+      "warm_first_output_seconds_median": 0.8459967963863164,
+      "warm_decode_tokens_per_second_median": 46.21,
+      "warm_elapsed_seconds_median": 4.2874829871580005,
+      "sampled_profile_gpu_peak_bytes": 66892857344,
+      "profile_rss_high_water_bytes": 30973571072
+    },
+    {
+      "profile": "none-kvmem-off",
+      "case": "notepad_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 6.410179102793336,
+      "warm_first_output_seconds_median": 5.275749769527465,
+      "warm_decode_tokens_per_second_median": 45.504999999999995,
+      "warm_elapsed_seconds_median": 10.813965481705964,
+      "sampled_profile_gpu_peak_bytes": 66892857344,
+      "profile_rss_high_water_bytes": 30973571072
+    },
+    {
+      "profile": "none-kvmem-off",
+      "case": "browser_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 9.850729075726122,
+      "warm_first_output_seconds_median": 8.481768787140027,
+      "warm_decode_tokens_per_second_median": 44.88,
+      "warm_elapsed_seconds_median": 12.537604140583426,
+      "sampled_profile_gpu_peak_bytes": 66892857344,
+      "profile_rss_high_water_bytes": 30973571072
+    },
+    {
+      "profile": "mtp-kvmem-on",
+      "case": "initial_desktop",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 1.390367376152426,
+      "warm_first_output_seconds_median": 0.8752606669440866,
+      "warm_decode_tokens_per_second_median": 151.035,
+      "warm_elapsed_seconds_median": 1.933363389922306,
+      "sampled_profile_gpu_peak_bytes": 41546678272,
+      "profile_rss_high_water_bytes": 34288349184
+    },
+    {
+      "profile": "mtp-kvmem-on",
+      "case": "notepad_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 7.031595706008375,
+      "warm_first_output_seconds_median": 5.502181486459449,
+      "warm_decode_tokens_per_second_median": 110.245,
+      "warm_elapsed_seconds_median": 7.6377144295256585,
+      "sampled_profile_gpu_peak_bytes": 41546678272,
+      "profile_rss_high_water_bytes": 34288349184
+    },
+    {
+      "profile": "mtp-kvmem-on",
+      "case": "browser_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 10.252128927968442,
+      "warm_first_output_seconds_median": 8.870631597703323,
+      "warm_decode_tokens_per_second_median": 100.745,
+      "warm_elapsed_seconds_median": 10.681477656122297,
+      "sampled_profile_gpu_peak_bytes": 41546678272,
+      "profile_rss_high_water_bytes": 34288349184
+    },
+    {
+      "profile": "mtp-kvmem-off",
+      "case": "initial_desktop",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 1.2364626107737422,
+      "warm_first_output_seconds_median": 0.8509133968036622,
+      "warm_decode_tokens_per_second_median": 159.83999999999997,
+      "warm_elapsed_seconds_median": 1.8502769712358713,
+      "sampled_profile_gpu_peak_bytes": 70185385984,
+      "profile_rss_high_water_bytes": 31467716608
+    },
+    {
+      "profile": "mtp-kvmem-off",
+      "case": "notepad_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 6.313629143871367,
+      "warm_first_output_seconds_median": 5.302886939840391,
+      "warm_decode_tokens_per_second_median": 110.225,
+      "warm_elapsed_seconds_median": 7.593027268303558,
+      "sampled_profile_gpu_peak_bytes": 70185385984,
+      "profile_rss_high_water_bytes": 31467716608
+    },
+    {
+      "profile": "mtp-kvmem-off",
+      "case": "browser_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 9.871197035070509,
+      "warm_first_output_seconds_median": 8.544450092827901,
+      "warm_decode_tokens_per_second_median": 103.87,
+      "warm_elapsed_seconds_median": 10.30179354781285,
+      "sampled_profile_gpu_peak_bytes": 70185385984,
+      "profile_rss_high_water_bytes": 31467716608
+    },
+    {
+      "profile": "dflash2-kvmem-on",
+      "case": "initial_desktop",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 1.52306958893314,
+      "warm_first_output_seconds_median": 0.8899515690281987,
+      "warm_decode_tokens_per_second_median": 175.09,
+      "warm_elapsed_seconds_median": 1.8051072882954031,
+      "sampled_profile_gpu_peak_bytes": 45581598720,
+      "profile_rss_high_water_bytes": 34387001344
+    },
+    {
+      "profile": "dflash2-kvmem-on",
+      "case": "notepad_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 6.771551403217018,
+      "warm_first_output_seconds_median": 5.50138799729757,
+      "warm_decode_tokens_per_second_median": 125.50999999999999,
+      "warm_elapsed_seconds_median": 7.378397430060431,
+      "sampled_profile_gpu_peak_bytes": 45581598720,
+      "profile_rss_high_water_bytes": 34387001344
+    },
+    {
+      "profile": "dflash2-kvmem-on",
+      "case": "browser_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 10.147875907830894,
+      "warm_first_output_seconds_median": 8.791946900542825,
+      "warm_decode_tokens_per_second_median": 98.67,
+      "warm_elapsed_seconds_median": 10.642005837522447,
+      "sampled_profile_gpu_peak_bytes": 45581598720,
+      "profile_rss_high_water_bytes": 34387001344
+    },
+    {
+      "profile": "dflash2-kvmem-off",
+      "case": "initial_desktop",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 1.32122988300398,
+      "warm_first_output_seconds_median": 0.8485191999934614,
+      "warm_decode_tokens_per_second_median": 180.425,
+      "warm_elapsed_seconds_median": 1.7368185620289296,
+      "sampled_profile_gpu_peak_bytes": 72521613312,
+      "profile_rss_high_water_bytes": 34387202048
+    },
+    {
+      "profile": "dflash2-kvmem-off",
+      "case": "notepad_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 6.473204110749066,
+      "warm_first_output_seconds_median": 5.294733734801412,
+      "warm_decode_tokens_per_second_median": 129.84,
+      "warm_elapsed_seconds_median": 7.24107807315886,
+      "sampled_profile_gpu_peak_bytes": 72521613312,
+      "profile_rss_high_water_bytes": 34387202048
+    },
+    {
+      "profile": "dflash2-kvmem-off",
+      "case": "browser_history",
+      "status": "completed",
+      "completed": 3,
+      "trials": 3,
+      "cold_first_output_seconds": 9.993937442079186,
+      "warm_first_output_seconds_median": 8.532583428546786,
+      "warm_decode_tokens_per_second_median": 99.475,
+      "warm_elapsed_seconds_median": 10.367593065602705,
+      "sampled_profile_gpu_peak_bytes": 72521613312,
+      "profile_rss_high_water_bytes": 34387202048
+    }
+  ],
+  "checks": [
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "none",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "mtp",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "initial_desktop",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "notepad_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "on",
+      "case": "browser_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 0,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 1,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "initial_desktop",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "notepad_history",
+      "repetition": 2,
+      "valid": true
+    },
+    {
+      "method": "dflash2",
+      "kvmem": "off",
+      "case": "browser_history",
+      "repetition": 2,
+      "valid": true
+    }
+  ],
+  "scope": "Archived immutable short inputs of3532/21126/33079 tokens. These are limited next-tool/filename checks, with no desktop action or generated-file validation. Three ordered repetitions per case/profile; vision cache is retained inside each fresh profile. This separates KVMem controls from the prefix-reuse benefit present in live tasks. Output token counts can differ, so elapsed/throughput values are reported separately.",
+  "artifacts": {
+    "apps/computer_use/.runtime/comparison-short-04/summary.json": "fee746dd432e499c448a487689c58651754905b7f986a0e50389e5345e9ec310",
+    "apps/computer_use/.runtime/comparison-short-04/output_checks.json": "cc0ed247ca0df36f4262645ebf6da414a95dd29ed3170727745fefdbc9116020",
+    "apps/computer_use/.runtime/comparison-short-04/aggregate.json": "eb700b2b1749f8d4bad95e71e7f0b5076236768b44442d4c76ee78e477ad0f87",
+    "apps/computer_use/.runtime/comparison-short-04/requests.csv": "ca07619ea362fa79b8a591f0dbd37ff2f0c041dbfa58c868d6fd82daf39b5d17"
+  }
+}
