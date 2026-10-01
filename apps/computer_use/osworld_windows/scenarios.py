@@ -53,6 +53,11 @@ def prepare(task, run, output, bundle):
     manifest = json.loads((output / 'manifest.json').read_text())
     if manifest.get('task') != task or manifest.get('run') != run:
         raise ValueError('Initializer returned another attempt identity')
+    if not isinstance(manifest.get('instruction'), str) or not manifest['instruction'].strip():
+        raise ValueError('Initializer did not provide the reviewed task instruction')
+    prompt = output / 'prompt.txt'
+    if prompt.exists() and prompt.read_text() != manifest['instruction']:
+        raise ValueError('Initializer prompt differs from its task manifest')
     return manifest
 
 

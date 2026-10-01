@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 from types import SimpleNamespace
 
-from .native_run import run as run_attempt
+from .native_run import DEFAULT_SNAPSHOT, run as run_attempt
 from .scenarios import validate_task
 from .source import ROOT, sha256
 
@@ -85,6 +85,8 @@ async def execute(plan, args, *, runner=run_attempt):
             report['status'] = 'complete'
     except asyncio.CancelledError:
         report.update(status='interrupted', error='Queue cancelled; do not resume the same attempt')
+        if report['trials'] and report['trials'][-1]['status'] == 'running':
+            report['trials'][-1].update(status='interrupted', queue_may_continue=False)
         raise
     except Exception as exc:
         report.update(status='halted', error=f'{type(exc).__name__}: {exc}')
@@ -102,7 +104,7 @@ if __name__ == '__main__':
     parser.add_argument('--plan', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bundle', type=Path, default=ROOT / 'apps/computer_use/.runtime/windows-native-client-13')
-    parser.add_argument('--snapshot', default='qw3-osworld-clean-20261002')
+    parser.add_argument('--snapshot', default=DEFAULT_SNAPSHOT)
     parser.add_argument('--ffmpeg', type=Path, required=True)
     parser.add_argument('--grader-python', type=Path, default=ROOT / 'third_party/OSWorld-V2/.venv/bin/python')
     args = parser.parse_args()

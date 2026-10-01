@@ -1,4 +1,9 @@
 import asyncio
+import base64
+import hashlib
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
 from aiohttp import web
@@ -9,6 +14,8 @@ from vm.model_relay import create_app
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.receipts = Path(self.temporary.name) / 'requests.jsonl'
         self.requests = []
         self.cancelled = asyncio.Event()
         upstream = web.Application()
@@ -18,10 +25,14 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"ready": True})
 
         async def stream(request):
-            self.requests.append(await request.json())
+            body = await request.json()
+            self.requests.append(body)
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
             await response.prepare(request)
             await response.write(b'data: {"ok":true}\n\n')
+            if body.get('finish'):
+                await response.write_eof()
+                return response
             try:
                 await asyncio.Event().wait()
             finally:
@@ -32,12 +43,13 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.upstream = TestServer(upstream, handler_cancellation=True)
         await self.upstream.start_server()
         self.client = TestClient(TestServer(create_app(str(self.upstream.make_url("/")).rstrip("/"),
-                                                      "127.0.0.1", "test-token"), handler_cancellation=True))
+                                                      "127.0.0.1", "test-token", receipt_path=self.receipts), handler_cancellation=True))
         await self.client.start_server()
 
     async def asyncTearDown(self):
         await self.client.close()
         await self.upstream.close()
+        self.temporary.cleanup()
 
     async def test_token_peer_and_route_boundaries(self):
         response = await self.client.get("/health")
@@ -45,6 +57,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/health", headers={"Authorization": "Bearer wrong"})
         self.assertEqual(response.status, 401)
         self.assertEqual(self.requests, [])
+        self.assertEqual(self.receipts.read_text(), '')
         response = await self.client.get("/health", headers={"Authorization": "Bearer test-token"})
         self.assertEqual(await response.json(), {"ready": True})
         response = await self.client.get("/admin", headers={"Authorization": "Bearer test-token"})
@@ -67,3 +80,37 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         response.close()
         await asyncio.wait_for(self.cancelled.wait(), 2)
         self.assertEqual(self.requests, [{"stream": True}])
+        async with asyncio.timeout(2):
+            while True:
+                rows = [json.loads(line) for line in self.receipts.read_text().splitlines()]
+                if rows and rows[-1]['event'] == 'request_terminal':
+                    break
+                await asyncio.sleep(.01)
+        self.assertEqual(rows[-1]['status'], 'cancelled')
+
+    async def test_receipts_bind_request_and_last_image_without_logging_content(self):
+        first, last = b'first image', b'last image'
+        def image(value):
+            return {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(value).decode()}}
+        body = {'stream': True, 'finish': True, 'messages': [{'role': 'user', 'content': [
+            {'type': 'text', 'text': 'Private test text not to be retained'}, image(first), image(last)]}]}
+        raw = json.dumps(body).encode()
+        response = await self.client.post('/v1/chat/completions', data=raw,
+                                          headers={'Authorization': 'Bearer test-token', 'Content-Type': 'application/json'})
+        self.assertEqual(await response.read(), b'data: {"ok":true}\n\n')
+        self.assertEqual(self.requests, [body])
+        text = self.receipts.read_text()
+        self.assertNotIn('Private test text', text)
+        self.assertNotIn('test-token', text)
+        self.assertNotIn(base64.b64encode(last).decode(), text)
+        rows = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual([row['event'] for row in rows], ['request_forwarding', 'request_terminal'])
+        final = rows[-1]
+        self.assertEqual(final['status'], 'complete')
+        self.assertEqual(final['wire_sha256'], hashlib.sha256(raw).hexdigest())
+        canonical = json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
+        self.assertEqual(final['canonical_request_sha256'], hashlib.sha256(canonical).hexdigest())
+        self.assertEqual(final['latest_image_sha256'], hashlib.sha256(last).hexdigest())
+        self.assertLessEqual(final['host_received_monotonic_ns'], final['host_forwarding_monotonic_ns'])
+        self.assertLessEqual(final['host_forwarding_monotonic_ns'], final['first_response_byte_monotonic_ns'])
+        self.assertLessEqual(final['first_response_byte_monotonic_ns'], final['host_finished_monotonic_ns'])

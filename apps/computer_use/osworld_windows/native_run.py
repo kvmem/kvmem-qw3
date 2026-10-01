@@ -24,7 +24,20 @@ from .scenarios import IMPLEMENTED, SITES, collection, prepare as prepare_task, 
 from .sites import Site
 from .source import ROOT, sha256
 
+DEFAULT_SNAPSHOT = 'qw3-osworld-pdf-20261002'
+SNAPSHOT_QUALIFICATIONS = {
+    'qw3-osworld-clean-20261002': 'baseline-clean-qualification-01/roundtrip-result.json',
+    DEFAULT_SNAPSHOT: 'pdf-handler-qualification-01/roundtrip-result.json',
+}
 
+def snapshot_qualification(app, name):
+    if name not in SNAPSHOT_QUALIFICATIONS:
+        raise ValueError('Snapshot has no registered restore qualification')
+    path = app / '.runtime' / SNAPSHOT_QUALIFICATIONS[name]
+    result = json.loads(path.read_text())
+    if result.get('passed') is not True or result.get('snapshot', name) != name:
+        raise ValueError('Selected snapshot has not passed its restore qualification')
+    return dict(path=str(path), sha256=sha256(path), snapshot=name)
 
 def terminal_status(report):
     native = report.get('native_result', {})
@@ -141,9 +154,7 @@ async def run(args):
                     except (aiohttp.ClientError, TimeoutError):
                         await asyncio.sleep(1)
         try:
-            baseline = json.loads((app / '.runtime/baseline-clean-qualification-01/roundtrip-result.json').read_text())
-            if not baseline['passed']:
-                raise ValueError('Clean base has not passed restore qualification')
+            report['snapshot_qualification'] = snapshot_qualification(app, args.snapshot)
             health = await get('http://127.0.0.1:18082/health', True)
             if not health['paused']:
                 raise ValueError('VM is active; refusing to restore it')
@@ -163,13 +174,18 @@ async def run(args):
             owns_desktop = True
             event('restoring_clean_base')
             await command('docker', 'stop', '-t', '120', 'qw3-computer-windows')
+            event('vm_stopped')
             archived = await command(sys.executable, app / 'vm/archive_share.py', 'shared-archive-' + run_id)
             (output / 'prior-share-archive.json').write_text(archived)
+            event('prior_share_archived')
             await command(sys.executable, app / 'vm/snapshot.py', 'restore', '--name', args.snapshot)
+            event('disk_snapshot_restored')
             await command('docker', 'start', 'qw3-computer-windows')
+            event('vm_started_waiting_for_executor')
             report['initial_health'] = await ready('http://127.0.0.1:18082/health', True)
             if not report['initial_health']['paused'] or (await get('http://127.0.0.1:18082/files', True))['files']:
                 raise ValueError('Restored desktop is not empty and paused')
+            event('clean_desktop_ready')
             manifest = await asyncio.to_thread(prepare_task, args.task, run_id, output / 'task', args.bundle)
             site_initialized = bool(SITES.get(args.task))
             staged = share / (run_id + '-inputs')
@@ -183,6 +199,7 @@ async def run(args):
             report['application_entries'] = await wait_json(share / (run_id + '-entry-result.json'), 120)
             if not report['initialization']['passed'] or not report['application_entries']['passed']:
                 raise ValueError('Native scenario initialization failed')
+            event('scenario_initialized')
             event('starting_qw3')
             engine = await launch('engine', [sys.executable, app / 'run_engine.py', '--method', 'dflash2',
                 '--kvmem', args.kvmem, '--guided-refresh', 'both', '--visual-history', args.visual_history,
@@ -305,7 +322,7 @@ if __name__ == '__main__':
     parser.add_argument('--grader-python', type=Path, default=ROOT / 'third_party/OSWorld-V2/.venv/bin/python')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bundle', type=Path, default=ROOT / 'apps/computer_use/.runtime/windows-native-client-13')
-    parser.add_argument('--snapshot', default='qw3-osworld-clean-20261002')
+    parser.add_argument('--snapshot', default=DEFAULT_SNAPSHOT)
     parser.add_argument('--ffmpeg', type=Path, required=True)
     parser.add_argument('--kvmem', choices=('on', 'off'), default='on')
     parser.add_argument('--timeout', type=int, default=900)

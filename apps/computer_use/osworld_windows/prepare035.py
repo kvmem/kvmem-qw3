@@ -60,6 +60,7 @@ $result | ConvertTo-Json -Depth 5 | Set-Content '\\host.lan\Data\RUN_ID-setup-re
     prompt += "\nEdit and save C:\\Users\\Qw3Test\\Desktop\\purchase_order_form.xlsx in place.\n"
     (output / "prompt.txt").write_text(prompt)
     (output / "manifest.json").write_text(json.dumps({"task": "035", "run": run,
+        "instruction": prompt,
         "formal_run": False, "model_used": False, "browser_url": url, "input_sha256": sha256(source),
         "status": "prepared_not_gui_validated", "wall_clock_delivery_reproduced": False,
         "adaptation": "Three declared review-completion message milestones; original message contents unchanged; static December 2025 business month"}, indent=2))

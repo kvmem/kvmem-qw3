@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-01T21:15:36.326608+00:00",
+  "updated_at": "2026-10-01T21:58:35.084447+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -234,7 +234,7 @@
     "apps/computer_use/osworld_windows/summarize_preflight.py": "6e7f61e2f95d276fa1a8d5d61dd802e81a0bd9b847a2f44a534c54bdb6f9e49d"
   },
   "pending": [
-    "Complete 006 original CV availability and local mirror/mailbox/initializer/grader without substituting unauthorised material",
+    "Complete 006 missing original availability; offline mirror has 29 host checks and initializer 8 host checks; native qualification and folder collector/content grader remain",
     "Common queue qualified on native 004-on and 010-off short preflights; complete remaining scenario reset/collection paths and formal freeze",
     "Complete 022 remaining four account UI downloads, 035 update visibility/first-observation timing, 043 frozen source-conflict disclosures and 051 complete trajectory/video process audit",
     "Mirror private-site decorative remote assets and validate remaining UI paths",
@@ -866,7 +866,7 @@
       "audit_evidence": "apps/computer_use/.runtime/osworld-006-material-audit-01",
       "no_proxy_used_for_downloads": false,
       "offline_materials_question_pending": true,
-      "remaining": "Await choice on the one inaccessible original; build Windows mirror/mailbox/initializer and independent grader without fabricating a replacement or changing the original answer set",
+      "remaining": "Obtain missing original CV or explicit adaptation choice; Windows-qualify prepared offline mirror/mailbox initializer; complete folder collector and independent content grader without changing original eligibility answer set",
       "available_original_applicants": 19,
       "pdf_resume_count": 17,
       "notion_resume_count": 2,
@@ -905,7 +905,32 @@
         "Marly Delina",
         "Avery Xia",
         "Haoran Liu"
-      ]
+      ],
+      "offline_mirror": {
+        "status": "host_qualified_diagnostic_only",
+        "complete": false,
+        "formal_ready": false,
+        "originals_preserved": true,
+        "rewritten_cv_links": 18,
+        "public_files": 37,
+        "checks_passed": 29,
+        "evidence": "apps/computer_use/.runtime/osworld-006-mirror-qualification-03/result.json",
+        "fixture": "apps/computer_use/.runtime/osworld-006-offline-mirror-02",
+        "failed_attempt_evidence": "apps/computer_use/.runtime/osworld-006-mirror-qualification-01/failure.json",
+        "native_initialization_validated": false,
+        "missing_original": "Yiren Lin",
+        "notes": [
+          "PDF bytes/encryption and original mail attachments preserved",
+          "Two Notion pages retain original verified block content",
+          "Only 18 CV URL cells and hyperlink destinations change; all other workbook cells/formulas/styles and ZIP members preserved",
+          "Missing original replaced by no CV; its diagnostic route explicitly reports unavailable material",
+          "Normal build/setup refuse incomplete materials; formal scenario remains blocked"
+        ],
+        "native_initializer_host_checks": 8,
+        "native_initializer_host_evidence": "apps/computer_use/.runtime/osworld-006-initializer-qualification-01/result.json",
+        "builder_source": "apps/computer_use/osworld_windows/mirror006.py",
+        "native_initializer_source": "apps/computer_use/osworld_windows/prepare006.py"
+      }
     },
     "010": {
       "model_test_completed": false,
@@ -1063,7 +1088,19 @@
         "Bind initializer, collector and scorer to native campaign driver"
       ],
       "shared_clean_base": "qw3-osworld-clean-20261002",
-      "qualification_answers_isolated_in_base": true
+      "qualification_answers_isolated_in_base": true,
+      "real_model_preflight": {
+        "formal_run": false,
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "timeout_seconds": 600,
+        "original_compatible_score": 0,
+        "submitted": false,
+        "accepted_uploads": 0,
+        "evidence": "apps/computer_use/.runtime/osworld-web-qualification-01/osworld-web022-on-01/result.json",
+        "failure_analysis": "apps/computer_use/.runtime/osworld-web-qualification-01/osworld-web022-on-01/failure-analysis.json",
+        "platform_gap": "OpenWith PDF default-application confirmation causes nine scope rejections; qualify a new Edge-default clean base before formal freeze"
+      }
     },
     "035": {
       "model_test_completed": false,
@@ -1108,7 +1145,15 @@
       "driver_qualification_uses_scripted_backend": true,
       "host_handoff_cases_passed": 10,
       "shared_clean_base": "qw3-osworld-clean-20261002",
-      "qualification_answers_isolated_in_base": true
+      "qualification_answers_isolated_in_base": true,
+      "campaign_launch_failure": {
+        "run": "osworld-web035-on-01",
+        "native_task_launched": false,
+        "error": "KeyError: 'instruction'",
+        "evidence": "apps/computer_use/.runtime/osworld-web-qualification-01/osworld-web035-on-01/result.json",
+        "adapter_fix": "instruction now included in manifest and checked before model launch",
+        "model_task_result": null
+      }
     },
     "043": {
       "model_test_completed": false,
@@ -1440,7 +1485,7 @@
       "apps/computer_use/osworld_windows/grade_run.py",
       "apps/computer_use/osworld_windows/campaign.py"
     ],
-    "contract_tests": 8,
+    "contract_tests": 11,
     "host_negative_dispatch_checks": 9,
     "host_dispatch_evidence": "apps/computer_use/.runtime/osworld-queue-grading-qualification-01/result.json",
     "native_evidence": "apps/computer_use/.runtime/osworld-queue-qualification-01/result.json",
@@ -1491,7 +1536,74 @@
       "Qualify remaining per-task reset, collection, dynamic events and complete process audit paths",
       "Finish 006 original materials and adapter",
       "Freeze common history policy and all ten-task V0 configuration before formal results",
-      "Add granular restore timing and interruption recovery proof before long unattended queue"
-    ]
+      "Native interruption recovery qualification remains; cancellation terminal records and granular restore timing are implemented"
+    ],
+    "web_preflight_queue": {
+      "status": "halted",
+      "formal_run": false,
+      "tasks": [
+        "022",
+        "035"
+      ],
+      "timeout_each_seconds": 600,
+      "evidence": "apps/computer_use/.runtime/osworld-web-qualification-01/result.json",
+      "not_a_paired_kvmem_comparison": true,
+      "trials": [
+        {
+          "run": "osworld-web022-on-01",
+          "task": "022",
+          "kvmem": "on",
+          "timeout_seconds": 600,
+          "tool_call_limit": 300,
+          "status": "timed_out",
+          "result_path": "/home/chaidi/qw3/apps/computer_use/.runtime/osworld-web-qualification-01/osworld-web022-on-01/result.json",
+          "pipeline_passed": true,
+          "queue_may_continue": true,
+          "strict_success": false
+        },
+        {
+          "run": "osworld-web035-on-01",
+          "task": "035",
+          "kvmem": "on",
+          "timeout_seconds": 600,
+          "tool_call_limit": 300,
+          "status": "infra_invalid",
+          "result_path": "/home/chaidi/qw3/apps/computer_use/.runtime/osworld-web-qualification-01/osworld-web035-on-01/result.json",
+          "pipeline_passed": false,
+          "queue_may_continue": false,
+          "strict_success": null
+        }
+      ],
+      "note": "022 model preflight timed out with valid collection; 035 failed before native launch because its manifest lacked instruction; failure preserved and adapter corrected"
+    },
+    "default_snapshot": "qw3-osworld-pdf-20261002"
+  },
+  "model_relay_timing": {
+    "implemented": true,
+    "contract_checks": 3,
+    "native_qualified": false,
+    "scope": "Host monotonic request/first-response-byte/terminal times plus canonical request hash and latest input PNG hash; no prompt, screenshot payload or token logged",
+    "not_v1_strategy_change": true
+  },
+  "pdf_default_clean_base": {
+    "snapshot": "qw3-osworld-pdf-20261002",
+    "qualified": true,
+    "formal_run": false,
+    "evidence": "apps/computer_use/.runtime/pdf-handler-qualification-01/roundtrip-result.json",
+    "original_snapshot_retained": "qw3-osworld-clean-20261002",
+    "pdf_handler": "MSEdgePDF",
+    "checks": {
+      "neutral_marker_absent_after_restore": true,
+      "pdf_handler_survives_restore": true,
+      "ordinary_file_open_uses_edge": true,
+      "executor_action_accepted": true,
+      "final_snapshot_restored_clean": true
+    },
+    "qualification_used_neutral_pdf_only": true,
+    "executor_allowlist_unchanged": true,
+    "guest_and_share_clean_after_final_restore": true,
+    "cleanup_evidence": "apps/computer_use/.runtime/pdf-handler-qualification-01/cleanup-manifest.json",
+    "cleanup_archive_sha256": "6538ae1c06fd5d71c728553967aaee49f939e0c8644bfe1ca24c069bf82a3290",
+    "scope": "Common platform correction before formal V0; no agent strategy change"
   }
 }
