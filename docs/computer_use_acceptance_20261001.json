@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790821194.33631,
+  "reviewed_at": 1790822124.2416217,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
@@ -188,7 +188,7 @@
     }
   },
   "remaining": [
-    "Complete guided live archive06 on/off and current-engine six-profile fixed-input controls; preserve original guided-off failure and all prior live timeouts.",
+    "Finish guided archive06 dense trial and current-engine six-profile fixed controls. Guided on passed36 pages at261864 query tokens, but four61-108s cold prefills caused observation expiry; reproduce and assess this latency issue. Preserve all earlier guided-off failures and timeouts.",
     "Repair native-client process-identity resource sampling and qualify a fresh matched Windows measurement. Independent native functionality and host GPU/RSS evidence remain valid.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
@@ -323,5 +323,12 @@
   "native_client_resources": {
     "qualified": false,
     "issue": "docs/computer_use_native_resource_attribution_20261001.json"
+  },
+  "guided_live_archive": {
+    "on_passed": true,
+    "on_document": "docs/computer_use_windows_long_on_06_20261001.json",
+    "off_status": "running",
+    "paired_result": null,
+    "latency_issue_open": true
   }
 }
