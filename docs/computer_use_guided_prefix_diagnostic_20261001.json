@@ -1,6 +1,6 @@
 {
   "kind": "guided_prefix_latency_diagnostic_and_candidate",
-  "reviewed_at": 1790822793.5412045,
+  "reviewed_at": 1790824948.9523554,
   "live_task_result": "docs/computer_use_windows_long_on_06_20261001.json",
   "cause_evidence": {
     "request_before_first_miss": 49,
@@ -18,7 +18,7 @@
     "manifest": "apps/computer_use/.runtime/guided-prefix-reproduction-06/manifest.json",
     "manifest_sha256": "3ad9470a9b02a616d24fdce425d7fa98cfc924f7318db59b99a0374d23022c92",
     "request_count": 50,
-    "gpu_executed": false,
+    "gpu_executed": true,
     "readiness": {
       "kind": "prefix_replay_readiness",
       "reviewed_at": 1790822396.1532745,
@@ -29,7 +29,10 @@
       "requests_in_frozen_manifest": 50,
       "source_manifest_sha256": "3ad9470a9b02a616d24fdce425d7fa98cfc924f7318db59b99a0374d23022c92",
       "next": "After final-qualification-04 terminates, replay unchanged requests under the same engine controls. A successful request sequence and reproduction of the final checkpoint miss are reported separately."
-    }
+    },
+    "passed": true,
+    "reproduced_original_checkpoint_miss": true,
+    "report": "docs/computer_use_prefix_baseline_20261001.json"
   },
   "candidate": {
     "kind": "warm_periodic_selection_boundary_candidate",
@@ -60,7 +63,6 @@
   },
   "candidate_patch_sha256": "361d1bdaf243a27077145ba5964288542340dde2cf98383f0296351e0c93b713",
   "remaining_validation": [
-    "Reproduce the miss with the unchanged baseline binary on retained inputs.",
     "Build the isolated candidate and verify identical controls, input counts, request success, checkpoint behavior and output quality.",
     "Validate real long desktop behavior and on/off controls before replacing the qualified runtime."
   ],

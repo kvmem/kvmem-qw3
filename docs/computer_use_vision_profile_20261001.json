@@ -1,0 +1,188 @@
+{
+  "kind": "standalone_vision_frontend_profile",
+  "passed": true,
+  "started_at": 1790824814.0945983,
+  "trials": [
+    {
+      "repetition": 0,
+      "passed": true,
+      "started_at": 1790824820.1949277,
+      "pid": 1158879,
+      "exit_code": 0,
+      "finished_at": 1790824836.6885686,
+      "metrics": {
+        "rows": 2000,
+        "dim": 5120,
+        "weights_mib": 878.772919,
+        "repeats": 1,
+        "gpu_mean_ms": 106.861173,
+        "gpu_min_ms": 106.861173,
+        "cpu_mean_ms": 3800.58014,
+        "cpu_min_ms": 3800.58014,
+        "partial_hit_ms": 76.282589,
+        "reordered_hit_ms": 1.247036,
+        "mean_abs": 0.0072015747,
+        "rmse": 0.0260710662,
+        "max_abs": 30,
+        "cosine": 0.999429631
+      },
+      "log_sha256": "00408988683a7bb071997b1bebb95e3005f3bf6be06c809f92543a9881597036"
+    },
+    {
+      "repetition": 1,
+      "passed": true,
+      "started_at": 1790824836.765658,
+      "pid": 1159002,
+      "exit_code": 0,
+      "finished_at": 1790824853.9607463,
+      "metrics": {
+        "rows": 2000,
+        "dim": 5120,
+        "weights_mib": 878.772919,
+        "repeats": 1,
+        "gpu_mean_ms": 105.0205,
+        "gpu_min_ms": 105.0205,
+        "cpu_mean_ms": 3716.74792,
+        "cpu_min_ms": 3716.74792,
+        "partial_hit_ms": 73.680625,
+        "reordered_hit_ms": 1.237261,
+        "mean_abs": 0.0072015747,
+        "rmse": 0.0260710662,
+        "max_abs": 30,
+        "cosine": 0.999429631
+      },
+      "log_sha256": "5f69794285742d4af53ca837e3d9f5055c3859ebcbebeea1156dfa6b5ac385b6"
+    },
+    {
+      "repetition": 2,
+      "passed": true,
+      "started_at": 1790824854.0392566,
+      "pid": 1159140,
+      "exit_code": 0,
+      "finished_at": 1790824870.9358463,
+      "metrics": {
+        "rows": 2000,
+        "dim": 5120,
+        "weights_mib": 878.772919,
+        "repeats": 1,
+        "gpu_mean_ms": 114.990054,
+        "gpu_min_ms": 114.990054,
+        "cpu_mean_ms": 4063.30266,
+        "cpu_min_ms": 4063.30266,
+        "partial_hit_ms": 72.449764,
+        "reordered_hit_ms": 1.241707,
+        "mean_abs": 0.0072015747,
+        "rmse": 0.0260710662,
+        "max_abs": 30,
+        "cosine": 0.999429631
+      },
+      "log_sha256": "93a47de681c1463fcdf8087ecdd37521f3a547e3a5b1e952a21c20e51e82b0f7"
+    }
+  ],
+  "prerequisite_unit": "qw3-computer-final-qualification-04.service",
+  "unit_state": {
+    "MainPID": "0",
+    "Result": "exit-code",
+    "ActiveState": "failed",
+    "SubState": "failed"
+  },
+  "scope": "First-image timing includes Python image preprocessing and CUDA vision forward, after frontend/model construction. Append timing has one hit and one new image; reorder timing has two cached hits. No target/draft weights or live desktop actions are present. Timings do not replace live server latency or total application memory.",
+  "gpu": "GPU-a57d360d-3852-802c-1a47-8f38577ce127, NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB",
+  "identities": [
+    {
+      "path": "/home/chaidi/qw3/build-dflash-integration/qw3-vision-gpu-parity",
+      "sha256": "f68f74d31c22db48d6c57abbe0d9080bc72beaadcf4faa9588d33f5eeb026f6d",
+      "bytes": 56827056
+    },
+    {
+      "path": "/home/chaidi/qw3/build-dflash-integration/libqw3_core.a",
+      "sha256": "d592cb14d0d47daf363318faecb509fc1dff408eec0ad444303eccdd057650bb",
+      "bytes": 69042760
+    },
+    {
+      "path": "/home/chaidi/qw3/models/Qwen3.8-27B-BF16/model.safetensors.index.json",
+      "sha256": "77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df",
+      "bytes": 112216
+    },
+    {
+      "path": "/home/chaidi/qw3/models/Qwen3.8-27B-BF16/config.json",
+      "sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+      "bytes": 4312
+    },
+    {
+      "path": "/home/chaidi/qw3/models/Qwen3.8-27B-BF16/model-00001-of-00018.safetensors",
+      "sha256": "ba0ce20aae489ad196733da5064bcdf159a1fe84f53336648196e1ebb7751b1c",
+      "bytes": 3966730552
+    },
+    {
+      "path": "/home/chaidi/qw3/scripts/computer_use_vision_profile.py",
+      "sha256": "e60a694efe3114458fd3bc61c44bcf2e647f757f2c2c7e78935fbc87ece04dc2",
+      "bytes": 9485
+    },
+    {
+      "path": "/home/chaidi/qw3/scripts/computer_use_phase_report.py",
+      "sha256": "8b721ebc70c3f04e428eaff5d9fc7c23d4f119ee6aeb6720c43205580f541469",
+      "bytes": 9917
+    },
+    {
+      "path": "/home/chaidi/qw3/tests/vision_gpu_parity.cpp",
+      "sha256": "d16a84ac7dc0309958e28153e38dbb1edfcf8e58344fd6bc0783b4728eeb6557",
+      "bytes": 20196
+    },
+    {
+      "path": "/home/chaidi/qw3/src/vision_gpu_frontend.cpp",
+      "sha256": "745610e0bcac51466a7a6679eec95807ed578b982818eff4d7189d4af1eda815",
+      "bytes": 43035
+    },
+    {
+      "path": "/home/chaidi/qw3/src/vision_cpu_frontend.cpp",
+      "sha256": "2f9f579520bc0ce6828aef01aeb4188233fe8c0eb35c6074ef57747e0f954da6",
+      "bytes": 20249
+    },
+    {
+      "path": "/home/chaidi/qw3/scripts/qw3_vision_cpu_worker.py",
+      "sha256": "c8b9eca5953253bd7723a47c42f7ec6bdc24a6b751fc7f49162fd007601b1e9e",
+      "bytes": 9047
+    }
+  ],
+  "images": [
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-native-suite-04/on-notepad-0/guest/app/desktop/screenshots/51bb5ce482df7a7c5d87a3a99ebfc06b5e3fe2292aa0d0b02e78dfb9d6c18269.png",
+      "sha256": "51bb5ce482df7a7c5d87a3a99ebfc06b5e3fe2292aa0d0b02e78dfb9d6c18269",
+      "bytes": 334344
+    },
+    {
+      "path": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-native-suite-04/on-notepad-0/guest/app/desktop/screenshots/f1bc91c50c831530cf3d828099ae5ec0ff2718b46d6ab239efaa7a599a6e1adf.png",
+      "sha256": "f1bc91c50c831530cf3d828099ae5ec0ff2718b46d6ab239efaa7a599a6e1adf",
+      "bytes": 367302
+    }
+  ],
+  "qw3_env": {
+    "QW3_VISION_GPU_CACHE_MIB": "512",
+    "QW3_VISION_PARITY_REPEATS": "1"
+  },
+  "cache_capacities_bytes": {
+    "gpu_features": 536870912,
+    "gpu_host_spill": 0,
+    "cpu_reference_features": 536870912
+  },
+  "command": [
+    "/home/chaidi/qw3/build-dflash-integration/qw3-vision-gpu-parity",
+    "/home/chaidi/qw3/models/Qwen3.8-27B-BF16",
+    "/home/chaidi/qw3/.venv/bin/python",
+    "/home/chaidi/qw3/scripts/qw3_vision_cpu_worker.py",
+    "/home/chaidi/qw3/apps/computer_use/.runtime/windows-native-suite-04/on-notepad-0/guest/app/desktop/screenshots/51bb5ce482df7a7c5d87a3a99ebfc06b5e3fe2292aa0d0b02e78dfb9d6c18269.png",
+    "/home/chaidi/qw3/apps/computer_use/.runtime/windows-native-suite-04/on-notepad-0/guest/app/desktop/screenshots/f1bc91c50c831530cf3d828099ae5ec0ff2718b46d6ab239efaa7a599a6e1adf.png"
+  ],
+  "finished_at": 1790824870.9365473,
+  "reviewed_at": 1790824948.9527125,
+  "metric_medians": {
+    "gpu_mean_ms": 106.861173,
+    "cpu_mean_ms": 3800.58014,
+    "partial_hit_ms": 73.680625,
+    "reordered_hit_ms": 1.241707
+  },
+  "unit_terminal": true,
+  "main_pid": 0,
+  "result_sha256": "f5f5c12efa33c563ceed90a7b62c28a50a2b3be7b600fecf7d71c5ebf09468ac"
+}

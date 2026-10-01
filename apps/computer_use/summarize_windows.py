@@ -7,6 +7,8 @@ import re
 import sqlite3
 import statistics
 
+from client_resources import summarize_client_resources
+
 
 def percentile(values, percent):
     if not values:
@@ -41,16 +43,7 @@ def summarize(run):
         client_resources = client / "client-resources.jsonl"
         if client_resources.exists():
             samples = [json.loads(line) for line in client_resources.read_text(encoding="utf-8-sig").splitlines()]
-            row["client_resource_sample_errors"] = sum("error" in s for s in samples)
-            row["client_samples"] = len(samples)
-            # Shared pages may be counted in more than one process working set.
-            row["client_sum_working_sets_peak_bytes"] = max((sum(p["working_set_bytes"] for p in s.get("processes", [])) for s in samples), default=0)
-            row["client_sum_private_bytes_peak"] = max((sum(p["private_bytes"] for p in s.get("processes", [])) for s in samples), default=0)
-            cpu_by_pid = {}
-            for sample in samples:
-                for process in sample.get("processes", []):
-                    cpu_by_pid[process["pid"]] = max(cpu_by_pid.get(process["pid"], 0), process["cpu_seconds"])
-            row["client_sampled_cpu_seconds"] = sum(cpu_by_pid.values())
+            row.update(summarize_client_resources(samples))
         database = app / "desktop/desktop.sqlite"
         if database.exists():
             with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:

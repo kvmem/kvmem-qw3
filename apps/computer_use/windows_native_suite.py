@@ -193,8 +193,8 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--bundle-dir", type=Path, default=Path("apps/computer_use/.runtime/windows-native-client-05"))
-    parser.add_argument("--snapshot", default="qw3-edit-20261001")
+    parser.add_argument("--bundle-dir", type=Path, default=Path("apps/computer_use/.runtime/windows-native-client-06"))
+    parser.add_argument("--snapshot", default="qw3-exact-20261001")
     parser.add_argument("--method", choices=["none", "mtp", "dflash2"], default="dflash2")
     parser.add_argument("--guided-refresh", choices=["off", "both"], default="off")
     parser.add_argument("--visual-history", choices=["pin-all", "retrievable"], default="pin-all")

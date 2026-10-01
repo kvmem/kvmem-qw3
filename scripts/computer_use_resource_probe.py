@@ -9,7 +9,6 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
@@ -35,11 +34,26 @@ def run(args):
     prerequisites = {args.after_unit: terminal_unit(args.after_unit),
                      'qw3-computer-final-qualification-04.service':
                          terminal_unit('qw3-computer-final-qualification-04.service')}
-    candidate = args.candidate_dir.resolve()
-    prepared = json.loads((candidate / 'preparation.json').read_text())
-    for name in ('helpers.ps1', 'test_client_resources.ps1', 'client_resources.py'):
-        if digest(candidate / name) != prepared['source_files'][name]:
-            raise ValueError('Candidate source changed: ' + name)
+    if args.candidate_dir:
+        candidate = args.candidate_dir.resolve()
+        prepared = json.loads((candidate / 'preparation.json').read_text())
+        for name in ('helpers.ps1', 'test_client_resources.ps1', 'client_resources.py'):
+            if digest(candidate / name) != prepared['source_files'][name]:
+                raise ValueError('Candidate source changed: ' + name)
+        helper_source = (candidate / 'helpers.ps1').read_text()
+        probe_source = (candidate / 'test_client_resources.ps1').read_text()
+        validator_path = candidate / 'client_resources.py'
+    else:
+        # Extract the exact embedded observer so the standalone probe and
+        # native task sampler cannot silently test different implementations.
+        driver = (ROOT / 'apps/computer_use/vm/run_native_case.ps1').read_text()
+        begin = '# Read-only process accounting.'
+        end = '\nfunction Sample-ClientProcesses'
+        if driver.count(begin) != 1 or driver.count(end) != 1:
+            raise ValueError('Native resource helper boundaries are ambiguous')
+        helper_source = driver[driver.index(begin):driver.index(end)]
+        probe_source = (ROOT / 'apps/computer_use/vm/test_client_resources.ps1').read_text()
+        validator_path = ROOT / 'apps/computer_use/client_resources.py'
     info = json.loads(subprocess.check_output(['docker', 'inspect', 'qw3-computer-windows'],
                                               text=True, timeout=10))[0]
     if info['Config']['Labels'].get('com.qw3.computer-use.owner') != 'codex-goal-20260930':
@@ -62,16 +76,16 @@ def run(args):
     output.mkdir(parents=True, exist_ok=False)
     state = dict(kind='actual_windows_client_resource_identity_probe', passed=False,
                  started_at=time.time(), prerequisites=prerequisites, initial_health=before,
-                 candidate_sources={name: digest(candidate / name)
-                                    for name in ('helpers.ps1', 'test_client_resources.ps1', 'client_resources.py')},
+                 candidate_sources={'helpers.ps1': hashlib.sha256(helper_source.encode()).hexdigest(),
+                                    'test_client_resources.ps1': hashlib.sha256(probe_source.encode()).hexdigest(),
+                                    'client_resources.py': digest(validator_path)},
                  native_application_memory_measured=False)
     identifier = 'client-resource-' + uuid.uuid4().hex
     helper_name = identifier + '-helpers.ps1'
     report_name = identifier + '.json'
     try:
-        shutil.copyfile(candidate / 'helpers.ps1', shared / helper_name)
-        source = (candidate / 'test_client_resources.ps1').read_text()
-        source = source.replace('client-resource-helpers.ps1', helper_name).replace('client-resource-probe.json', report_name)
+        (shared / helper_name).write_text(helper_source)
+        source = probe_source.replace('client-resource-helpers.ps1', helper_name).replace('client-resource-probe.json', report_name)
         script = output / 'native-probe.ps1'
         script.write_text(source)
         state['staged_probe_sha256'] = digest(script)
@@ -95,7 +109,7 @@ def run(args):
         checks = report['checks']
         if len(checks) != len(CHECKS) or {c['name'] for c in checks} != CHECKS or not all(c['passed'] for c in checks):
             raise RuntimeError('Native probe contract coverage is incomplete')
-        spec = importlib.util.spec_from_file_location('candidate_client_resources', candidate / 'client_resources.py')
+        spec = importlib.util.spec_from_file_location('candidate_client_resources', validator_path)
         validator = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(validator)
         validator.validate_sample(report['real_sample'])
@@ -104,7 +118,7 @@ def run(args):
         if state['final_health']['desktop_id'] != before['desktop_id']:
             raise RuntimeError('The desktop changed during the setup-only probe')
         state['passed'] = True
-    except (KeyError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         state['error'] = repr(exc)
     finally:
         state['finished_at'] = time.time()
@@ -117,6 +131,6 @@ def run(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--after-unit', required=True)
-    parser.add_argument('--candidate-dir', type=Path, default=BASE / 'client-resource-candidate')
+    parser.add_argument('--candidate-dir', type=Path, help='Optional isolated candidate; defaults to the checked-in observer')
     parser.add_argument('--run-dir', type=Path, required=True)
     raise SystemExit(0 if run(parser.parse_args()) else 1)

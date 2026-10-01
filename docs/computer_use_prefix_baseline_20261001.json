@@ -1,0 +1,32 @@
+{
+  "kind": "unchanged_engine_prefix_miss_reproduction",
+  "passed": true,
+  "reviewed_at": 1790824948.9512305,
+  "request_count": 50,
+  "source_manifest_sha256": "3ad9470a9b02a616d24fdce425d7fa98cfc924f7318db59b99a0374d23022c92",
+  "engine_binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+  "same_controls": true,
+  "same_environment": true,
+  "reproduced_original_checkpoint_miss": true,
+  "final_prompt_tokens": 162253,
+  "final_elapsed_seconds": 67.39317894121632,
+  "final_client_first_output_seconds": 65.22524019004777,
+  "final_native_prefill_ms": 61258.622136,
+  "final_server_response_ttft_ms": 65169.380401,
+  "miss": [
+    "prefix-cache MISS (why): D=159158 token_D=159158 visual_D=159158 ceiling=159158 query_limited=1 query_snapshot=1 query_snapshot_exact=1 query_snapshot_structural=1 source_index_required=1 source_index_layout_incompatible=0 replay_boundary=2432 P=158848 M=159158 P_resumable=0 P_source_index=1 M_resumable=1 M_source_index=1 P_selection_current=0 M_selection_current=1 warm_log=159158 prompt=162253 reason=no_reusable_checkpoint"
+  ],
+  "previous_request_capture": [
+    "prefix-cache CAPTURE (mtp): warm_log=159158 pos=159158 P=158848 P_resumable=1 P_selection_current=0 P_rebased_after_selection=0 P_selection_generation=56 M_selection_generation=58 P_source_index=1 M_resumable=1 M_source_index=1 query_snapshot=1 decoded=164 decode_checkpoints=0 decode_checkpoint_ms=0"
+  ],
+  "completed_phase_requests": 50,
+  "phase_tags_match_retained_manifest": true,
+  "tools_dispatched": false,
+  "scope": "Reproduces the unsafe-to-reuse checkpoint state and cold fallback under unchanged engine controls. Actual generated speculation/checkpoint placement can vary: this replay retained P158848 (generation56), whereas the live trace captured P159104 (generation57); both are stale against final generation58. This is a reproduction, not a repaired performance result or desktop quality test.",
+  "artifacts": {
+    "apps/computer_use/.runtime/prefix-replay-baseline-01/result.json": "df4184b32d547b334224fa5f2bfc0850cc3add574e0dfc4a8928dd15e912664c",
+    "apps/computer_use/.runtime/prefix-replay-baseline-01/engine/engine.log": "83576772b1f3c62a250930926bcaceb587a775ba4bf2bcf5e275a60c45829bdf",
+    "apps/computer_use/.runtime/prefix-replay-baseline-01-phases/result.json": "9461dd89eb025f9d4d2578d32bfee149cb65e37cf0270597dc103a04dba0430a",
+    "apps/computer_use/.runtime/prefix-replay-baseline-01-phases/requests.csv": "7ab2547d27ddf3e093e43d23ef55947bb345efaca4bfb5dc76d79f062378bf3c"
+  }
+}

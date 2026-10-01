@@ -4,8 +4,10 @@ Work in progress: the local UI, Codex provider bridge, Computer MCP and Windows
 VM executor work end to end. A frozen native Windows client passed 18 core-task
 trials from a clean snapshot. The repaired Linux client completed a 36-page
 Windows task with KVMem on; off timed out at the same 900-second deadline.
-Later source changes need fresh native qualification. Physical-machine and
-macOS acceptance remain open. See the current
+The current application bundle 06 passed 18/18 native tasks and both on/off
+restart checks. Fixed-input controls passed 54 short and 12 long checks across
+target-only, native MTP and DFlash. Checkpoint latency repair, corrected client
+resource measurements, physical-machine and macOS acceptance remain open. See the current
 [acceptance index](../../docs/computer_use_acceptance_20261001.md) for exact
 source identities, preserved failures and the scope of each result.
 See `../../docs/computer_use_codex_m2_20261001.md` for desktop evidence and
@@ -71,7 +73,8 @@ run directory for each attempt:
 
 ```bash
 python3 apps/computer_use/run_engine.py \
-  --method dflash2 --run-dir apps/computer_use/.runtime/engine-new-run
+  --method dflash2 --kvmem on --guided-refresh both --visual-history retrievable \
+  --run-dir apps/computer_use/.runtime/engine-new-run
 
 # In another terminal, once engine.log says it is listening:
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/smoke_codex_gpu.py \
@@ -301,10 +304,10 @@ against the official release digest and records every asset/source hash. The
 folder includes `start.ps1` and `test.ps1`; it contains no model weights or
 executor token. `vm/test_native_client.ps1` is a setup-only helper to run the
 contract tests in the dedicated guest from a staged, hashed ZIP. The current
-Windows bundle 04 passes all 31 tests with exit code 0, including actual native
-Codex and MCP success/error image results against a fixture backend. A native
-Windows real-model browser pilot also passed in 40.66 seconds with 10 actions
-and independently verified JSON. Full repeated acceptance remains open.
+Windows bundle 06 passes all 34 tests with exit code 0, including actual native
+Codex and MCP success/error image results against a fixture backend. The native
+real-model core matrix also passed all 18 repeated tasks. Source identities and
+every repetition are recorded in the acceptance index.
 
 `vm/model_relay.py` connects the native Windows client with
 the host GPU. It binds only the owned container's Docker bridge gateway and
@@ -325,33 +328,54 @@ before running them; restoring a snapshot resets the dedicated guest.
 The native task helper also samples its app process tree's CPU time, working
 set and private-byte counters. Shared pages can appear in multiple working
 sets, so their sum is not unique physical RAM use. These guest counters are
-separate from the host GPU/engine resource log. The pilot retained 38 valid
-samples covering Python and Codex. Its peak sum of working sets was 201.16 MiB
-and peak sum of private bytes was 110.48 MiB; these exclude the GPU engine and
-the controlled desktop applications.
+separate from the host GPU/engine resource log. The original PID-only sampler
+could attach old system processes after PID reuse, so legacy client counters
+are withheld. The repaired observer checks each PID and process creation time,
+retains parent identities, and refuses partial/ambiguous samples. Its ten real
+Windows probe checks and eight offline validator tests passed. A fresh matched
+model-task resource pair is still required; this does not alter the existing
+18 functional outcomes or their host GPU measurements.
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
-  --cases browser --run-dir apps/computer_use/.runtime/windows-native-pilot-new
+  --cases browser --guided-refresh both --visual-history retrievable \
+  --run-dir apps/computer_use/.runtime/windows-native-pilot-new
 
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
-  --restart --cases cross_app --run-dir apps/computer_use/.runtime/windows-native-restart-new
+  --restart --cases cross_app --guided-refresh both --visual-history retrievable \
+  --run-dir apps/computer_use/.runtime/windows-native-restart-new
 
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
   --kvmem on off --repetitions 3 --guided-refresh both --visual-history retrievable \
   --run-dir apps/computer_use/.runtime/windows-native-suite-new
 ```
 
-Current native/long suite defaults target bundle 05 and `qw3-edit-20261001`.
+Current native/long suite defaults target bundle 06 and `qw3-exact-20261001`.
 Create and verify that matching baseline before running; the older bundle 04
 and `qw3-type-20261001` snapshot belong to the clipboard-preserving executor.
 The suite records the requested refresh and visual-history settings, and its
 audit checks those settings against each actual engine manifest.
 
 `summarize_windows.py` and `audit_windows_suite.py` also read native suite
-exports. The audit still requires all 18 repeated tasks; a passing single pilot
-is reported as an incomplete matrix. Native checks additionally verify bundle
+exports. The default audit requires all 18 repeated tasks; a passing single pilot
+is reported as an incomplete matrix. An explicit `--cases notepad --repetitions 1`
+audits a separate two-policy resource pair without claiming the full matrix.
+Native checks additionally verify bundle
 and setup-helper hashes, process cleanup, client samples and UI output.
+Client-resource qualification is reported separately from functional success.
+
+After all existing GPU/VM queues end, the setup-only ownership probe can be
+repeated against the observer embedded in the checked-in native task helper:
+
+```bash
+.venv/bin/python scripts/computer_use_resource_probe.py \
+  --after-unit NAME-OF-COMPLETED-TEST.service \
+  --run-dir apps/computer_use/.runtime/native-resource-probe-new
+```
+
+The probe checks the owned, paused Windows VM and creation identities. It does
+not measure the application's memory. Its output must pass before a resource
+trial; invalid or legacy records never produce published client RAM totals.
 
 The restart variant kills only the application process tree it started, checks
 that restart stays paused with the same task identity, then explicitly resumes
@@ -437,11 +461,12 @@ PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_long_tas
 `windows_long_suite.py` automates that clean-snapshot setup, fixture hash check,
 fresh engine/app startup, resource sampling and owned-process cleanup. It runs
 the client on Linux and the desktop on Windows, and refuses occupied service
-ports. The orchestrator is prepared but has not yet completed a live trial:
+ports. The latest paired trial completed all 36 pages with KVMem on; off reached
+page 18 before the same 900s deadline. Run new trials with a fresh directory:
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_long_suite.py \
-  --kvmem on --run-dir apps/computer_use/.runtime/archive-suite-new
+  --kvmem on --guided-refresh both --run-dir apps/computer_use/.runtime/archive-suite-new
 ```
 
 Use `--kvmem off` in a separate new directory for the paired live policy. Keep

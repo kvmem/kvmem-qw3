@@ -3,8 +3,9 @@
 Status: **active; not a completion certificate**. Windows VM functionality and
 both fixed-input decoder matrices are qualified at the identities below. The
 long live comparison is complete: KVMem on passed; off timed out. Checkpoint
-latency, native-client resource attribution, vision timing, macOS and physical
-hardware acceptance remain open.
+latency, fresh native-client resource measurements, macOS and physical hardware
+acceptance remain open. Standalone vision timing and the Windows process-identity
+probe have passed.
 
 The user retired the initial 48GB GPU limit. Tests use the current host's RTX
 PRO 6000 Blackwell Server Edition, reporting 97,887 MiB. Inference is local on
@@ -54,9 +55,9 @@ have its frozen sources or engine replaced while it is active.
 The terminal `qw3-computer-final-qualification-04.service` attempted every
 stage and completed cleanup with the desktop paused. It correctly ended failed
 because the dense archive timed out; the 54 short and 12 long controls passed.
-`qw3-computer-qualification-followup-01.service` is separately running the
-unchanged-engine prefix reproduction, followed by standalone vision profiling.
-Read its live unit and result before starting GPU work or replacing sources.
+`qw3-computer-qualification-followup-01.service` is also terminal with success:
+50 unchanged-engine requests reproduced the checkpoint miss, then three standalone
+vision trials passed. Read live unit states before starting another test queue.
 
 ## KVMem on/off observations
 
@@ -114,17 +115,22 @@ engine, output and retrieval identities.
 1. **Checkpoint latency:** four on-policy archive requests lost an admissible
    checkpoint after a late periodic selection, causing 61–108s cold prefills and
    stale observations. [Cause and isolated candidate](computer_use_guided_prefix_diagnostic_20261001.json).
-   The unchanged-engine 50-request replay is running. The scheduling candidate
-   passed CPU policy checks but is not applied or GPU-qualified. Keep the replay
+   The [unchanged-engine replay](computer_use_prefix_baseline_20261001.json)
+   completed all 50 requests and reproduced the final cold fallback: 61.259s
+   prefill and 65.225s client first output. The scheduling candidate passed CPU
+   policy checks but is not applied or GPU-qualified. Keep the replay
    alignment guard and 60s observation lifetime.
 2. **Native-client resource attribution:** [defect and prepared probe](computer_use_native_resource_attribution_20261001.json).
-   Validate PID plus creation identity on actual Windows, then run a fresh matched
-   resource pair. Eight offline tests and probe readiness are not native API or
-   application resource acceptance.
-3. **Vision timing:** [standalone probe readiness](computer_use_vision_profile_readiness_20261001.json).
-   Cold encoding, one new image, cached reorder and CPU/GPU embedding parity
-   are queued. Server validation time includes other work and is not a pure
-   image encoding timer. Nested phase timings must not be double counted.
+   The [native probe](computer_use_native_resource_probe_20261001.json) passed
+   all ten Windows checks; eight offline validator tests passed. The exact tested
+   observer is integrated. Run a fresh matched resource pair before publishing
+   client memory or CPU measurements.
+3. **Vision timing completed:** [three standalone trials](computer_use_vision_profile_20261001.json)
+   passed CPU/GPU embedding parity. Median first-image GPU processing was
+   106.861ms, append-one-new-image 73.681ms, cached reorder 1.242ms. Timings
+   include preprocessing after frontend/model construction, with no target or
+   draft model loaded. They are not full task latency or cold startup time.
+   Nested server/native phases must not be double counted.
 4. **Mac and physical targets:** [access/preflight instructions](computer_use_mac_test_access_20261001.md).
    No accessible Mac or physical Windows desktop has been tested. Mac executor,
    client, ordinary-device inference, scaling, IME, focus, permissions and

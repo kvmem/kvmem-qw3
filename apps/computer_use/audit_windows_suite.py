@@ -8,11 +8,14 @@ import re
 import sqlite3
 
 from windows_task import CASES
+from client_resources import summarize_client_resources
 
 TASKS = ("notepad", "browser", "cross_app")
 
 
-def audit(run, repetitions):
+def audit(run, repetitions, cases=TASKS):
+    if not cases or len(set(cases)) != len(cases) or not set(cases).issubset(TASKS):
+        raise ValueError("Invalid requested task set")
     summary = json.loads((run / "summary.json").read_text())
     if summary["status"] == "running":
         raise RuntimeError("The suite is live; wait for its process to exit")
@@ -22,7 +25,7 @@ def audit(run, repetitions):
     if native:
         for source, digest in summary["helper_sha256"].items():
             assert hashlib.sha256((run / Path(source).name).read_bytes()).hexdigest() == digest
-    expected = set(itertools.product(("on", "off"), TASKS, range(repetitions)))
+    expected = set(itertools.product(("on", "off"), cases, range(repetitions)))
     keys = [(t["kvmem"], t["case"], t["repetition"]) for t in summary["trials"]]
     checks = []
     binary_hashes, launcher_hashes = set(), set()
@@ -50,10 +53,19 @@ def audit(run, repetitions):
                 assert result["bundle_sha256"] == qualification["bundle_sha256"] == summary["bundle_sha256"]
                 assert (client / "native-ui.png").stat().st_size > 0
                 assert task["state"]["observation"]["desktop_id"] == trial["initial_health"]["desktop_id"]
-                samples = [json.loads(line) for line in (client / "client-resources.jsonl").read_text(encoding="utf-8-sig").splitlines()]
-                assert samples and all("error" not in sample for sample in samples)
-                names = {p["name"].lower() for sample in samples for p in sample["processes"]}
-                assert "python" in names and "codex" in names, "Missing native client process samples"
+                # A broken observer invalidates resource measurements, not an
+                # independently verified task result. Preserve its error here.
+                item["client_resource_comparison_valid"] = False
+                try:
+                    samples = [json.loads(line) for line in (client / "client-resources.jsonl").read_text(encoding="utf-8-sig").splitlines()]
+                    resource_check = summarize_client_resources(samples)
+                    item["client_resource_sample_errors"] = resource_check["client_resource_sample_errors"]
+                    item["client_resource_errors"] = resource_check["client_resource_errors"]
+                    names = {p["name"].lower() for sample in samples for p in sample.get("processes", [])}
+                    item["native_process_samples_present"] = {"python", "codex"}.issubset(names)
+                    item["client_resource_comparison_valid"] = resource_check["client_resource_comparison_valid"] and item["native_process_samples_present"]
+                except (KeyError, TypeError, ValueError, OSError) as exc:
+                    item["client_resource_error"] = repr(exc)
             else:
                 assert trial["final_health"]["paused"]
                 assert trial["initial_health"]["desktop_id"] == trial["final_health"]["desktop_id"]
@@ -113,6 +125,8 @@ def audit(run, repetitions):
               "recorded_commits": sorted(source_commits),
               "passed": summary["status"] == "completed" and matrix_complete and all(c["passed"] for c in checks)
                         and len(binary_hashes) == len(launcher_hashes) == 1}
+    result["task_set"] = list(cases)
+    result["client_resource_comparison_valid"] = native and result["passed"] and all(c.get("client_resource_comparison_valid", False) for c in checks)
     (run / "evidence-audit.json").write_text(json.dumps(result, indent=2))
     print(json.dumps({key: result[key] for key in ("passed", "matrix_complete", "expected_trials")}))
     return result["passed"]
@@ -122,5 +136,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--cases", nargs="+", choices=TASKS, default=list(TASKS))
     args = parser.parse_args()
-    raise SystemExit(0 if audit(args.run_dir.resolve(), args.repetitions) else 1)
+    raise SystemExit(0 if audit(args.run_dir.resolve(), args.repetitions, tuple(args.cases)) else 1)

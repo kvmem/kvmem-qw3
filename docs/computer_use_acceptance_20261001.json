@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790824712.9063826,
+  "reviewed_at": 1790824948.9529662,
   "goal_complete": false,
   "recorded_source_commit": "7d18e50",
   "gpu_limit_48gb_retired": true,
@@ -188,8 +188,7 @@
     }
   },
   "remaining": [
-    "Address periodic-selection checkpoint latency after baseline retained-input reproduction. Current-engine fixed controls are complete: short54/54 and long12/12. Guided live archive06 comparison is complete: on passed36 pages; off reached page18 and timed out at900s. Four cold-prefill/observation-expiry retries remain an open usability issue.",
-    "Complete isolated vision frontend/cache timing and CPU/GPU embedding parity diagnostics queued after prefix reproduction.",
+    "Apply and qualify the prepared periodic-selection boundary candidate. The unchanged engine reproduced the retained request50 cold fallback:61.259s prefill/65.225s client first output. Fixed short54/54 and long12/12 controls and the guided live pair are complete; latency repair and live requalification remain open.",
     "Repair native-client process-identity resource sampling and qualify a fresh matched Windows measurement. Independent native functionality and host GPU/RSS evidence remain valid.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
@@ -327,7 +326,11 @@
   },
   "native_client_resources": {
     "qualified": false,
-    "issue": "docs/computer_use_native_resource_attribution_20261001.json"
+    "issue": "docs/computer_use_native_resource_attribution_20261001.json",
+    "observer_repair_integrated": true,
+    "native_identity_probe_passed": true,
+    "probe_report": "docs/computer_use_native_resource_probe_20261001.json",
+    "fresh_matched_measurement_status": "prepared_not_started"
   },
   "guided_live_archive": {
     "on_passed": true,
@@ -336,7 +339,8 @@
     "paired_result": "docs/computer_use_windows_long_pair_06_20261001.json",
     "latency_issue_open": true,
     "comparison_completed": true,
-    "all_tasks_passed": false
+    "all_tasks_passed": false,
+    "prefix_baseline_reproduced": true
   },
   "current_fixed_controls": {
     "short_passed": 54,
@@ -364,12 +368,26 @@
   "queued_diagnostics": {
     "unit": "qw3-computer-qualification-followup-01.service",
     "result": "apps/computer_use/.runtime/qualification-followup-01/result.json",
-    "observed_status": "baseline_prefix_replay_running",
+    "observed_status": "completed",
     "experiments": [
       "baseline-prefix-replay",
       "vision-profile"
     ],
-    "production_sources_remain_frozen": true,
-    "observed_at": 1790824712.9065428
+    "production_sources_remain_frozen": false,
+    "observed_at": 1790824948.9529667,
+    "baseline_prefix_reproduced": true,
+    "vision_profile_passed": true,
+    "unit_terminal": true
+  },
+  "vision_profile": {
+    "passed": true,
+    "trials": 3,
+    "report": "docs/computer_use_vision_profile_20261001.json",
+    "metric_medians_ms": {
+      "gpu_mean_ms": 106.861173,
+      "cpu_mean_ms": 3800.58014,
+      "partial_hit_ms": 73.680625,
+      "reordered_hit_ms": 1.241707
+    }
   }
 }
