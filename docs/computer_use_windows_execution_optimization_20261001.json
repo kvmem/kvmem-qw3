@@ -58,7 +58,7 @@
     {
       "id": "P1",
       "name_zh": "十项场景适配",
-      "status": "not_started",
+      "status": "in_progress",
       "depends_on": [
         "P0"
       ],
@@ -127,66 +127,71 @@
       "scenario_id": "win-osworld-013",
       "source_task_id": "013",
       "title_zh": "奖品分配填表",
-      "status": "not_started",
+      "status": "preparation_in_progress",
       "analysis_role": "diagnostic_development",
       "batch": "A",
       "provisional_timeout_seconds": 1800,
       "provisional_tool_call_limit": 300,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "preparation_evidence_record": "docs/computer_use_windows_execution_progress_20261001.json#/task_preparation/013"
     },
     {
       "scenario_id": "win-osworld-004",
       "source_task_id": "004",
       "title_zh": "演示文稿风格修复",
-      "status": "not_started",
+      "status": "preparation_in_progress",
       "analysis_role": "diagnostic_development",
       "batch": "A",
       "provisional_timeout_seconds": 1800,
       "provisional_tool_call_limit": 300,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "preparation_evidence_record": "docs/computer_use_windows_execution_progress_20261001.json#/task_preparation/004"
     },
     {
       "scenario_id": "win-osworld-006",
       "source_task_id": "006",
       "title_zh": "申请材料筛选归档",
-      "status": "not_started",
+      "status": "external_materials_incomplete",
       "analysis_role": "diagnostic_development",
       "batch": "A",
       "provisional_timeout_seconds": 3600,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "preparation_evidence_record": "docs/computer_use_windows_execution_progress_20261001.json#/task_preparation/006"
     },
     {
       "scenario_id": "win-osworld-010",
       "source_task_id": "010",
       "title_zh": "交流资助报销清单",
-      "status": "not_started",
+      "status": "preparation_in_progress",
       "analysis_role": "diagnostic_development",
       "batch": "A",
       "provisional_timeout_seconds": 3600,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "preparation_evidence_record": "docs/computer_use_windows_execution_progress_20261001.json#/task_preparation/010"
     },
     {
       "scenario_id": "win-osworld-038",
       "source_task_id": "038",
       "title_zh": "CRM 批量线索更新",
-      "status": "not_started",
+      "status": "preparation_in_progress",
       "analysis_role": "diagnostic_development",
       "batch": "B",
       "provisional_timeout_seconds": 3600,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "preparation_evidence_record": "docs/computer_use_windows_execution_progress_20261001.json#/task_preparation/038"
     },
     {
       "scenario_id": "win-osworld-022",
@@ -231,27 +236,29 @@
       "scenario_id": "win-osworld-080",
       "source_task_id": "080",
       "title_zh": "经营规划工作簿修复",
-      "status": "not_started",
+      "status": "preparation_in_progress",
       "analysis_role": "reserved_until_v1_frozen",
       "batch": "C",
       "provisional_timeout_seconds": 5400,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "preparation_evidence_record": "docs/computer_use_windows_execution_progress_20261001.json#/task_preparation/080"
     },
     {
       "scenario_id": "win-osworld-051",
       "source_task_id": "051",
       "title_zh": "参考图复现与图层编辑",
-      "status": "not_started",
+      "status": "preparation_in_progress",
       "analysis_role": "reserved_until_v1_frozen",
       "batch": "C",
       "provisional_timeout_seconds": 3600,
       "provisional_tool_call_limit": 500,
       "windows_setup_validated": false,
       "grader_validated": false,
-      "recording_validated": false
+      "recording_validated": false,
+      "preparation_evidence_record": "docs/computer_use_windows_execution_progress_20261001.json#/task_preparation/051"
     }
   ],
   "conditions": {

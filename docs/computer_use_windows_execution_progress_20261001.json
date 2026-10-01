@@ -1,8 +1,8 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-01T15:26:07.776854+00:00",
+  "updated_at": "2026-10-02T00:23:54.686195+08:00",
   "goal_status": "active",
-  "phase": "P0 platform qualification and P1 task 013 preparation",
+  "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
   "v0_frozen": false,
   "client": {
@@ -84,7 +84,10 @@
     ],
     "guest_http_verified": true,
     "browser_rendered_sites": [
-      "formcraft"
+      "formcraft",
+      "cloudcrm",
+      "teamchat",
+      "mailhub"
     ],
     "image_manifest": "apps/computer_use/.runtime/osworld-web-images-02.json",
     "gateway_boundary_evidence": "apps/computer_use/.runtime/osworld-sites-host-connectivity-02.json"
@@ -104,16 +107,38 @@
     "apps/computer_use/probe_compaction.py": "a38ba82434b553a4cc22a0b4c94d97f69797a1ee99d0fda8c1e3e816dee05abd",
     "apps/computer_use/vm/test_drag_interruption.ps1": "48d7fdc451ea52f413a44f8d3408fe256e7d09cef8e2c3226c1af6a0783f581d",
     "apps/computer_use/windows_drag_interruption.py": "79665defa3cc81cb0ab55a993a72588b215764b605295b6e6db6673f423f7dc4",
-    "apps/computer_use/windows_office_controls.py": "bb0430b80ece026a1298478ae7e9b8a8c14b8e013c572ba67128adac61458b39"
+    "apps/computer_use/windows_office_controls.py": "bb0430b80ece026a1298478ae7e9b8a8c14b8e013c572ba67128adac61458b39",
+    "apps/computer_use/osworld_windows/sites.py": "ccc3678769c5013dfba046bae2f90a5ac83a908639b1ffe9dd117048920e40db",
+    "apps/computer_use/osworld_windows/qualify013.py": "de3799057598ba0bfbc3a877769e2147d8a71f33a48d230f164526a1ecac2522",
+    "apps/computer_use/osworld_windows/qualify013_gui.py": "bd9860ad2d701101c01d35c5d2032e8e3d60dd0a5ebef728e35b1e37c786c612",
+    "apps/computer_use/osworld_windows/prepare013.py": "64c45f03a081dedb8b9b363076af6c4fa7ad88b599b481b8c7bf0411a5d1a1ef",
+    "apps/computer_use/osworld_windows/task080.py": "883e2875bf1c6a74839c3e44f3cb054229a7ee0466cb80376e08cb0d4dc8f178",
+    "apps/computer_use/osworld_windows/prepare_native.py": "21ba3e34a9a77f3fbd78cd7aeb46b108c0dff1e85e41c7ed12ee0e96c93093c3",
+    "apps/computer_use/osworld_windows/task004.py": "34b58bd9579343c739717bfc681d48e3aed0deaa1866de7cf1a85952f9b71551",
+    "apps/computer_use/osworld_windows/task010.py": "61671213c2d3f70101299641a45f77522995847d80dedf698c750da9f82596f2",
+    "apps/computer_use/osworld_windows/__init__.py": "9f6c33f6e61342c1f07a5724bc342bb9221ef4d0e60fb02cbb6d68140df4c9a8",
+    "apps/computer_use/osworld_windows/upstream.py": "30c0b9fea3362e0327e1b15536cae64740133bc147a5a00ca6977975f9d2cbab",
+    "apps/computer_use/osworld_windows/qualify038.py": "5ae84514f0cd0b5a0d42a07f1cb43df54516648742fd25e82aeca700cd40be27",
+    "apps/computer_use/osworld_windows/mailboxes.py": "85936dc03d279b4e705a790ede6a096299ceb12e1e04d6507b18b707d0926ed2",
+    "apps/computer_use/osworld_windows/prepare_office.py": "4e91c98c512be150dc6d4e8bf7eff5faeacb836e13a6e6e44b00353e9e3a46d7",
+    "apps/computer_use/osworld_windows/task013.py": "83a48cdfcc49a0ec729488e9fc6819c162ae1f22460731f42d08d8f27c0d0113",
+    "apps/computer_use/osworld_windows/prepare010.py": "29e9b2827f7f3f2c52898eedae59540988b0964bfbbfcfce64c0266ed93cef03",
+    "apps/computer_use/osworld_windows/qualify_sites.py": "ce7c7b88f204aafeddddf3d762057b317c1558b5d7e143c260f67989045de840",
+    "apps/computer_use/osworld_windows/qualify010.py": "085c44ef3b9b690bd73be4c5ccbd6afb8af8d4fb033088d9daf66668b69c9f7a",
+    "apps/computer_use/osworld_windows/prepare038.py": "148e456f9b2ae650209bfe5479a67766d95799eccc785e3d7058a8476f9f4de4",
+    "apps/computer_use/osworld_windows/source.py": "2a4654ad3bc70d36cd530ccfa6a15f8cc630081383d7f0449b416dedc67ba8e3",
+    "apps/computer_use/osworld_windows/task038.py": "ca25101c3283776d700ce22b381fc384ce20562317886ddd38b6767a3e1cd31c"
   },
   "pending": [
-    "office task-specific profile/first-run readiness (Writer, Calc, Impress, Thunderbird)",
-    "wire terminal driver into continue-on-task-failure native campaign scheduler",
-    "qualify the remaining nine initializers and independent graders; complete 013 reset/snapshot validation",
-    "validate non-FormCraft site rendering and per-attempt state reset",
-    "full-duration recording overhead and clock alignment",
-    "new qualified frozen snapshot and V0 configuration",
-    "20 baseline runs and evidence-based optimization"
+    "Complete remaining task initializers and independent positive/negative graders, especially 006 materials, 022 sites, 035 dynamic events, 043 calendar, 051 process constraints",
+    "Resolve 004 locked-slide preservation across repeated native saves and font substitution; finish 080 positive/full rubric qualification",
+    "Wire terminal driver, native binary artifact collection, reset, recorder and graders into the continue-on-task-failure campaign scheduler",
+    "Qualify benchmark browser reopen and Explorer entry paths; current Edge open_app still targets legacy BrowserProfile/fixture.html",
+    "Before freezing: archive/remove all known-answer qualification files and old task products from guest and SMB-visible share; validate minimal per-attempt public staging",
+    "Mirror private-site decorative remote assets and validate Calendar/remaining UI paths",
+    "Full-duration recording overhead and monotonic event alignment",
+    "Clean baseline snapshot, restore round trips, frozen V0 configuration",
+    "20 V0 on/off baseline runs; diagnose; at most two general candidates; V1 comparison and conditional repetition"
   ],
   "last_qualified_platform_commit": "e2f9f78",
   "guest_app_inventory": {
@@ -573,7 +598,119 @@
       "reset_roundtrip_validated": false,
       "identity_reuse_rejected": true,
       "preview_url": "http://127.0.0.1:18086/index.html"
+    },
+    "004": {
+      "model_test_completed": false,
+      "snapshot_frozen": false,
+      "reset_roundtrip_validated": false,
+      "input_opened_in_impress": true,
+      "source_input_sha256": "c34c7fa8536023cccb8febcb67961584d6d6cbe324b2fdaa14211ec082592d15",
+      "evidence": "apps/computer_use/.runtime/osworld-004-qual-01",
+      "grader_status": "strict_preservation_gate_pending",
+      "upstream_positive_score_before_save": 1.0,
+      "original_hyperlink_fixture_score_after_save": 0.9667,
+      "qualified_blue_hyperlink_fixture_score_after_save": 1.0,
+      "one_save_locked_render_matches_unedited_one_save_control": true,
+      "two_save_render_drift_detected": true,
+      "installed_gill_sans_font_files_found": false,
+      "serializer_evidence": "apps/computer_use/.runtime/windows/shared/office-roundtrip-03/comparison.json"
+    },
+    "006": {
+      "model_test_completed": false,
+      "status": "external_materials_incomplete",
+      "source_applicants": 20,
+      "external_links": 18,
+      "initial_direct_fetch_timeouts": 12,
+      "recovered_public_pdfs": [
+        "Yao_Tu.pdf",
+        "Li_Wei.pdf",
+        "Xu_Minmin.pdf"
+      ],
+      "recovered_pdfs_include_negative_candidate": true,
+      "original_mailbox_resume_attachments": 2,
+      "audit_evidence": "apps/computer_use/.runtime/osworld-006-material-audit-01",
+      "no_proxy_used_for_downloads": true,
+      "offline_materials_question_pending": true,
+      "remaining": "Recover every task-required original resume or document infeasibility before formal task construction"
+    },
+    "010": {
+      "model_test_completed": false,
+      "snapshot_frozen": false,
+      "reset_roundtrip_validated": false,
+      "original_downloads_staged": 10,
+      "offline_inbox_messages_visible": 4,
+      "original_mailbox_sha256": "2b8239c29558668fb62e665395203ec2719bf369bcbc4146445aa2f59e6444ce",
+      "grader_cases_passed": 11,
+      "upstream_table_omission_confirmed": true,
+      "gui_saved_known_answer_passed": true,
+      "gui_save_evidence": "apps/computer_use/.runtime/windows/shared/office-010-gui-output-01/independent-result.json",
+      "full_initializer_evidence": "apps/computer_use/.runtime/osworld-010-qual-02",
+      "offline_reopen_fixed_and_validated": true,
+      "offline_reopen_evidence": "apps/computer_use/.runtime/windows/shared/mail-offline-startup-03/gui-result.json",
+      "initial_reopen_failure_preserved": "apps/computer_use/.runtime/osworld-010-qual-02/reopen-result.json",
+      "adaptations": [
+        "Original inbox bytes in local-only Thunderbird profile, without original accounts or credentials",
+        "Upstream paragraph score preserved; additional 48 table-cell checks and protected reference integrity",
+        "Register local task profile for ordinary reopen; force offline startup=3"
+      ]
+    },
+    "038": {
+      "model_test_completed": false,
+      "snapshot_frozen": false,
+      "reset_roundtrip_validated": false,
+      "sites_initialized": [
+        "cloudcrm",
+        "teamchat",
+        "mailhub"
+      ],
+      "windows_browser_rendered": true,
+      "grader_cases_passed": 11,
+      "grader_evidence": "apps/computer_use/.runtime/osworld-038-grader-01/result.json",
+      "gui_evidence": "apps/computer_use/.runtime/osworld-038-qual-02",
+      "gui_status_write_validated": false,
+      "pending": "Native GUI status change/conversion and pristine reset qualification; mirror decorative remote avatars locally"
+    },
+    "080": {
+      "model_test_completed": false,
+      "held_out_trajectory_used_for_tuning": false,
+      "input_opened_in_wps": true,
+      "initializer_evidence": "apps/computer_use/.runtime/osworld-080-qual-01",
+      "grader_status": "positive_full_rubric_qualification_pending",
+      "upstream_windows_formula_max_credit": 0.4,
+      "upstream_perfect_fixture_score": 0.7390894607843137,
+      "saved_cache_aware_perfect_fixture_score": 0.9190894607843137,
+      "remaining_fixture_mismatches": [
+        "overlay role annual quota missing",
+        "visible formatting checks incomplete"
+      ],
+      "evidence": "apps/computer_use/.runtime/osworld-080-grader-01/saved-cache-checks.json",
+      "adaptation": "Keep upstream score; additionally apply original numeric checks to saved WPS caches, without grader recalculation or save"
+    },
+    "051": {
+      "model_test_completed": false,
+      "held_out_trajectory_used_for_tuning": false,
+      "initializer_prepared": true,
+      "input_opened_in_gimp": true,
+      "initializer_evidence": "apps/computer_use/.runtime/osworld-051-qual-01",
+      "grader_status": "not_implemented",
+      "canvas": {
+        "width": 2560,
+        "height": 1440,
+        "layers": 1,
+        "background_layer_name": "background.png"
+      }
     }
   },
-  "latest_preparation_source": "This commit; source identities are recorded above. V0 remains unfrozen."
+  "latest_preparation_source": "This commit; source identities are recorded above. V0 remains unfrozen.",
+  "site_identity_qualification": {
+    "passed": true,
+    "sites": 5,
+    "checks": [
+      "fresh_identity_with_nonempty_upstream_defaults",
+      "local_duplicate_rejected",
+      "backend_existing_identity_rejected_without_local_registry",
+      "prior_state_preserved"
+    ],
+    "evidence": "apps/computer_use/.runtime/osworld-sites-identity-02/result.json"
+  }
 }
