@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T03:30:44.697242+08:00",
+  "updated_at": "2026-10-02T04:23:33.529740+08:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -21,7 +21,7 @@
       "process_exit_code": 0
     },
     "host_tests_evidence": "apps/computer_use/.runtime/native-driver-host-tests-02.log",
-    "windows_tests_evidence": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-13.stderr.log",
+    "windows_tests_evidence": "apps/computer_use/.runtime/windows/shared-archive-20261002/osworld-client-tests-13.stderr.log",
     "package_manifest": "apps/computer_use/.runtime/windows-native-client-13/archive.json",
     "default_shared_candidate_promoted": false,
     "qualification_uses_scripted_backend_not_qw3_inference": true
@@ -224,7 +224,12 @@
     "apps/computer_use/osworld_windows/preservation004.py": "1d479a716b80ecc200aeb6dd623844837209540c19d21833237146942b46ec79",
     "apps/computer_use/osworld_windows/preservation004_controls.json": "9adef43ff05c4c5c80313137337f01d61da925a8be97112c67642dbfb0ee5dfc",
     "apps/computer_use/osworld_windows/qualify004.py": "65c4c2f969590562fb5d6d61d90290239458cf93bc2a4dee2e1ef5a47499d81c",
-    "apps/computer_use/osworld_windows/materials006.py": "f441529217550bb63334ff21eb7850f52eee02a801981c2fce0c28e5166f6e0c"
+    "apps/computer_use/osworld_windows/materials006.py": "f441529217550bb63334ff21eb7850f52eee02a801981c2fce0c28e5166f6e0c",
+    "apps/computer_use/vm/archive_runtime.py": "5c7601be9e618f945f5906efec6f0c91ef2b42b51ee37827b601fa4a9e58ac77",
+    "apps/computer_use/vm/archive_share.py": "65d94794684313a05cfcf71d8bb3685263f2a9b135191f1fe2a45899b843cd77",
+    "apps/computer_use/vm/clean_windows_baseline.py": "459ab727264939fb61fedc7aa26bd145ebf784237605cb9038b8711be26d2cd9",
+    "apps/computer_use/vm/prepare_osworld_baseline.ps1": "5143bc6bba6bb7f2ae37993094f6a507644d5072b458fc5bc878264d9781889c",
+    "apps/computer_use/vm/verify_osworld_baseline.ps1": "bb44f8e063fa4ee2752b552339b279852f074b9c21ad288ce1a99b4efa7d5a0a"
   },
   "pending": [
     "Complete remaining task preparation: 006 one inaccessible original and local mirror/initializer/grader; 022 remaining download UI/reset; 035 visibility and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 process audit integration",
@@ -341,7 +346,7 @@
         "file": "gimp-3.2.6-setup.exe",
         "process_id": 7108,
         "signature_status": "Valid",
-        "publisher": "CN=Jernej Simon\u010di\u010d, O=Jernej Simon\u010di\u010d, L=Ljubljana, C=SI",
+        "publisher": "CN=Jernej Simončič, O=Jernej Simončič, L=Ljubljana, C=SI",
         "sha256": "9337cccbc01d4098ee7a3dab215b3afbe6ece99c5287c92441d6f12cf541ebca"
       },
       {
@@ -359,10 +364,10 @@
     "terminal_result_available": true
   },
   "evidence_paths": {
-    "native_client": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-13.json",
+    "native_client": "apps/computer_use/.runtime/windows/shared-archive-20261002/osworld-client-tests-13.json",
     "recording": "apps/computer_use/.runtime/windows-osworld-recording-probe-02",
-    "installers": "apps/computer_use/.runtime/windows/shared/osworld-installers-01",
-    "inventory": "apps/computer_use/.runtime/windows/shared/osworld-app-inventory-02.json"
+    "installers": "apps/computer_use/.runtime/windows/shared-archive-20261002/osworld-installers-01",
+    "inventory": "apps/computer_use/.runtime/windows/shared-archive-20261002/osworld-app-inventory-02.json"
   },
   "office_artifact_qualification": {
     "gimp": {
@@ -709,7 +714,7 @@
       "one_save_locked_render_matches_unedited_one_save_control": true,
       "two_save_render_drift_detected": true,
       "installed_gill_sans_font_files_found": false,
-      "serializer_evidence": "apps/computer_use/.runtime/windows/shared/office-roundtrip-03/comparison.json",
+      "serializer_evidence": "apps/computer_use/.runtime/windows/shared-archive-20261002/office-roundtrip-03/comparison.json",
       "grader_cases_passed": 18,
       "grader_evidence": "apps/computer_use/.runtime/osworld-004-grader-02/result.json",
       "preservation_control_save_counts": [
@@ -803,10 +808,10 @@
       "grader_cases_passed": 11,
       "upstream_table_omission_confirmed": true,
       "gui_saved_known_answer_passed": true,
-      "gui_save_evidence": "apps/computer_use/.runtime/windows/shared/office-010-gui-output-01/independent-result.json",
+      "gui_save_evidence": "apps/computer_use/.runtime/windows/shared-archive-20261002/office-010-gui-output-01/independent-result.json",
       "full_initializer_evidence": "apps/computer_use/.runtime/osworld-010-qual-02",
       "offline_reopen_fixed_and_validated": true,
-      "offline_reopen_evidence": "apps/computer_use/.runtime/windows/shared/mail-offline-startup-03/gui-result.json",
+      "offline_reopen_evidence": "apps/computer_use/.runtime/windows/shared-archive-20261002/mail-offline-startup-03/gui-result.json",
       "initial_reopen_failure_preserved": "apps/computer_use/.runtime/osworld-010-qual-02/reopen-result.json",
       "adaptations": [
         "Original inbox bytes in local-only Thunderbird profile, without original accounts or credentials",
@@ -1036,8 +1041,8 @@
     "files_copied": 5,
     "missing_deliverable_distinguished": true,
     "maximum_file_bytes": 536870912,
-    "receipt": "apps/computer_use/.runtime/windows/shared/binary-collection-qual-01/receipt.json",
-    "independent_validation": "apps/computer_use/.runtime/windows/shared/binary-collection-qual-01-independent.json",
+    "receipt": "apps/computer_use/.runtime/windows/shared-archive-20261002/binary-collection-qual-01/receipt.json",
+    "independent_validation": "apps/computer_use/.runtime/windows/shared-archive-20261002/binary-collection-qual-01-independent.json",
     "limitations": [
       "Integrated with generic native task launcher; final snapshot/recorder/campaign scheduler remains pending",
       "XCF artifact scoring separately qualified; process-constraint review still required for real trajectories",
@@ -1170,5 +1175,102 @@
     "Browser control hints can briefly be empty after native popup closure",
     "Wheel input can modify a focused numeric field; verify values before submission",
     "SMB update handoff takes about five seconds per batch; keep separate from model latency"
-  ]
+  ],
+  "clean_windows_base": {
+    "snapshot": "qw3-osworld-clean-20261002",
+    "created": true,
+    "native_004_restore_roundtrip_passed": true,
+    "formal_run": false,
+    "v0_frozen": false,
+    "snapshot_manifest": "apps/computer_use/.runtime/windows/snapshots/qw3-osworld-clean-20261002/manifest.json",
+    "creation_evidence": "apps/computer_use/.runtime/baseline-clean-qualification-01/freeze-result.json",
+    "restore_evidence": "apps/computer_use/.runtime/baseline-clean-qualification-01/roundtrip-result.json",
+    "restored_audit": "apps/computer_use/.runtime/baseline-clean-qualification-01/baseline-clean-audit-03.json",
+    "warm_blank_applications": [
+      "Writer",
+      "Calc",
+      "Impress",
+      "WPS Spreadsheets",
+      "GIMP"
+    ],
+    "profile_preparation": "Removed historical task data and caches; completed blank-app first-run dialogs; empty offline Thunderbird registration preserved.",
+    "retained_operational_files": "One locked zero-byte GUID temp file independently confirmed empty; no Windows service stopped to remove it.",
+    "restored_checks": [
+      "old task files absent from Desktop/Documents/Downloads",
+      "task-specific application entries absent",
+      "outputs empty",
+      "empty default mailbox",
+      "qualified client source hashes match",
+      "1280x800 display",
+      "UTC guest timezone",
+      "paused executor"
+    ],
+    "guest_cleanup": {
+      "verified_before_removal": true,
+      "removed_paths": 91,
+      "attempts": [
+        "baseline-cleanup-01",
+        "baseline-cleanup-02",
+        "baseline-cleanup-03",
+        "baseline-cleanup-04"
+      ],
+      "final_result": "apps/computer_use/.runtime/baseline-clean-qualification-01/baseline-cleanup-04-result.json",
+      "preserved_failures": "First two attempts removed nothing; third verified the full archive then stopped after 62 paths on a read-only Recent directory; fourth removed the remaining 29 existing paths. Windows disk backup and each partial ZIP retained."
+    },
+    "shared_archive": {
+      "complete": true,
+      "moved_top_level_items": 499,
+      "file_bytes": 11668509158,
+      "bind_inode_preserved": true,
+      "manifest": "apps/computer_use/.runtime/windows/shared-archive-20261002/archive-manifest.json",
+      "retained_core_files": [
+        "bootstrap.ps1",
+        "executor-token.txt",
+        "executor.ps1",
+        "fixture.html"
+      ],
+      "old_evidence_paths": "Replace /windows/shared/ with /windows/shared-archive-20261002/ for items in the archive manifest; no guest-visible symlink added."
+    },
+    "qualification_limit": "One original presentation initialization and snapshot restore, plus blank-app checks; not full per-task state reset, inference, or task completion.",
+    "remaining": [
+      "Integrate snapshot/archive/init/recorder/grading with production campaign scheduler",
+      "Complete scenario-specific preparation and external site reset qualifications",
+      "Resolve missing original 006 resume or receive approval for a clearly labelled variant",
+      "Freeze full V0 experiment configuration before counted paired runs"
+    ]
+  },
+  "history_storage_preservation": {
+    "complete": true,
+    "directories": 31,
+    "bytes": 20684396919,
+    "destination": "/data/qw3-computer-use-history-20261002",
+    "old_paths_retained_by_verified_links": true,
+    "evidence": "apps/computer_use/.runtime/runtime-relocation-01/result.json",
+    "pre_cleanup_disk_backup": {
+      "complete": true,
+      "includes_ram_state": false,
+      "destination": "/data/qw3-computer-use-presnap-20261002",
+      "files": [
+        {
+          "name": "data.qcow2",
+          "bytes": 33196670976,
+          "sha256": "49cb69d018505e8db1a98fb28e4ddaac844edb94321cc6d80d94bea7b8bd6e3a",
+          "mode": "0o644"
+        },
+        {
+          "name": "windows.vars",
+          "bytes": 540672,
+          "sha256": "b301e793fe9438dcbb7fbeecf31d25fff41aa97de7de6b782ab138d5b972af63",
+          "mode": "0o644"
+        },
+        {
+          "name": "windows.rom",
+          "bytes": 3653632,
+          "sha256": "6411c010de3bbfc57ecf8eecd487681e1669ea6636db2c1b831004f6b86805ec",
+          "mode": "0o644"
+        }
+      ],
+      "evidence": "apps/computer_use/.runtime/pre-cleanup-backup-01/result.json"
+    }
+  }
 }
