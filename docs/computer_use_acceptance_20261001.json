@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790825772.4282827,
+  "reviewed_at": 1790826191.4933515,
   "goal_complete": false,
   "recorded_source_commit": "7d18e50",
   "gpu_limit_48gb_retired": true,
@@ -188,7 +188,7 @@
     }
   },
   "remaining": [
-    "Apply and qualify the prepared periodic-selection boundary candidate. The unchanged engine reproduced the retained request50 cold fallback:61.259s prefill/65.225s client first output. Fixed short54/54 and long12/12 controls and the guided live pair are complete; latency repair and live requalification remain open.",
+    "Finish candidate9f1d15 prefix/visual model regressions and live desktop requalification before adopting the boundary fix. Commit1fb9dbb builds and passes44 CPU plus3 targeted policy/CUDA checks. The unchanged engine005 reproduced the retained request50 cold fallback:61.259s prefill/65.225s client first output.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
   ],
@@ -399,5 +399,16 @@
       "partial_hit_ms": 73.680625,
       "reordered_hit_ms": 1.241707
     }
+  },
+  "boundary_candidate_qualification": {
+    "source_commit": "1fb9dbb",
+    "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+    "status": "model_replay_running",
+    "unit": "qw3-computer-guided-boundary-01.service",
+    "expected_main_pid": 1167433,
+    "cpu_checks_passed": 44,
+    "targeted_gpu_policy_checks_passed": 3,
+    "last_qualified_engine_remains": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+    "desktop_qualified": false
   }
 }

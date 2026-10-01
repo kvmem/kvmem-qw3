@@ -32,6 +32,12 @@ Runtime paths below are relative to `apps/computer_use/.runtime/`.
   history and prefix reuse. Fixed-input controls disable prefix reuse and guided
   refresh. These profiles answer different questions and must remain separate.
 
+The workspace now contains candidate engine `9f1d1515...` from `1fb9dbb`. It
+passes 44 CPU and three targeted policy/CUDA checks; its 50-request prefix and
+same-turn visual regressions are running under `qw3-computer-guided-boundary-01.service`.
+It is not yet live-desktop qualified. The measurements below belong to engine
+`005654a6...`, retained in `guided-boundary-candidate/qw3-baseline-005`.
+
 Independent analysis and documentation commits occurred during the frozen
 experiments. Per-trial Git HEAD can differ; application, binary, input, bundle
 and snapshot hashes identify what was tested. No current GPU diagnostic may
@@ -125,8 +131,10 @@ engine, output and retrieval identities.
    stale observations. [Cause and isolated candidate](computer_use_guided_prefix_diagnostic_20261001.json).
    The [unchanged-engine replay](computer_use_prefix_baseline_20261001.json)
    completed all 50 requests and reproduced the final cold fallback: 61.259s
-   prefill and 65.225s client first output. The scheduling candidate passed CPU
-   policy checks but is not applied or GPU-qualified. Keep the replay
+   prefill and 65.225s client first output. The scheduling candidate is applied and
+   built, with 44 CPU and three targeted policy/CUDA checks passed. Its model
+   continuation and visual regressions are running; live qualification remains
+   required. Keep the replay
    alignment guard and 60s observation lifetime.
 2. **Native-client resource attribution repaired:** [defect and repair](computer_use_native_resource_attribution_20261001.json).
    The [native probe](computer_use_native_resource_probe_20261001.json) passed

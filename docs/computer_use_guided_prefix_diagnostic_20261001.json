@@ -38,7 +38,7 @@
     "kind": "warm_periodic_selection_boundary_candidate",
     "prepared_at": 1790822731.1266453,
     "applied_to_worktree": true,
-    "gpu_tested": "CUDA regression probes passed; model continuation not yet tested",
+    "gpu_tested": true,
     "baseline_engine_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
     "base_sources": {
       "src/kvmem_prefix_reuse_policy.hpp": "e1628141ce37c22bc37747fa43149e8a8ad9906565325abe08a09b6f94d04f30",
@@ -88,6 +88,16 @@
       "original_patch_sha256": "361d1bdaf243a27077145ba5964288542340dde2cf98383f0296351e0c93b713",
       "model_prefix_replay_passed": null,
       "live_desktop_qualified": false
+    },
+    "model_continuation_tested": false,
+    "gpu_test_scope": "Three targeted strategy/CUDA regressions passed; model prefix and visual replay are running.",
+    "qualification": {
+      "unit": "qw3-computer-guided-boundary-01.service",
+      "expected_main_pid": 1167433,
+      "result": "apps/computer_use/.runtime/guided-boundary-qualification-01/result.json",
+      "observed_status": "running",
+      "source_commit": "1fb9dbb",
+      "observed_at": 1790826191.4930174
     }
   },
   "candidate_patch_sha256": "361d1bdaf243a27077145ba5964288542340dde2cf98383f0296351e0c93b713",
