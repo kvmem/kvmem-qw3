@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790823928.1011739,
+  "reviewed_at": 1790824712.9063826,
   "goal_complete": false,
   "recorded_source_commit": "7d18e50",
   "gpu_limit_48gb_retired": true,
@@ -188,7 +188,8 @@
     }
   },
   "remaining": [
-    "Complete current-engine six-profile fixed controls and address periodic-selection latency. Guided live archive06 comparison is complete: on passed36 pages; off reached page18 and timed out at900s. Four cold-prefill/observation-expiry retries remain an open usability issue.",
+    "Address periodic-selection checkpoint latency after baseline retained-input reproduction. Current-engine fixed controls are complete: short54/54 and long12/12. Guided live archive06 comparison is complete: on passed36 pages; off reached page18 and timed out at900s. Four cold-prefill/observation-expiry retries remain an open usability issue.",
+    "Complete isolated vision frontend/cache timing and CPU/GPU embedding parity diagnostics queued after prefix reproduction.",
     "Repair native-client process-identity resource sampling and qualify a fresh matched Windows measurement. Independent native functionality and host GPU/RSS evidence remain valid.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
@@ -280,7 +281,7 @@
   },
   "matched_native_client_bundle": "apps/computer_use/.runtime/windows-native-client-06",
   "native_requalification": {
-    "status": "native_and_live_pair_complete_fixed_controls_running",
+    "status": "comparison_complete_on_long_passed_off_long_timed_out",
     "unit": "qw3-computer-final-qualification-04.service",
     "result": "apps/computer_use/.runtime/final-windows-qualification-04/result.json",
     "matrix": "apps/computer_use/.runtime/windows-native-suite-04",
@@ -288,14 +289,18 @@
     "snapshot": "qw3-exact-20261001",
     "bundle_sha256": "23851fd5c83e8b4e70a2595fcf46d3f1c7f1f600e1ff140a3ade8b2ad69c08f4",
     "prior_failure_document": "docs/computer_use_native_newline_failure_20261001.json",
-    "observed_at": 1790823146.3584292,
+    "observed_at": 1790824712.9065413,
     "completed_trials": 18,
     "passed_trials": 18,
     "first_round_progress_document": "docs/computer_use_windows_native_04_progress_20261001.json",
     "source_identity_note": "Application files, model assets and engine remain frozen at the recorded hashes. Independent offline analysis/tests and documentation commits may change Git HEAD during the queue.",
     "restart_passed": 2,
     "restart_report": "docs/computer_use_windows_native_restart_02_20261001.json",
-    "startup_failure_report": "docs/computer_use_windows_long_startup_05_20261001.json"
+    "startup_failure_report": "docs/computer_use_windows_long_startup_05_20261001.json",
+    "supervision_terminal": true,
+    "all_stages_attempted": true,
+    "cleanup_passed": true,
+    "all_live_tasks_passed": false
   },
   "phase_accounting": {
     "document": "docs/computer_use_phase_accounting_20261001.json",
@@ -337,8 +342,12 @@
     "short_passed": 54,
     "short_required": 54,
     "short_document": "docs/computer_use_short_controls_03_20261001.json",
-    "long_status": "running",
-    "long_required": 12
+    "long_status": "completed",
+    "long_required": 12,
+    "long_passed": 12,
+    "long_document": "docs/computer_use_long_controls_03_20261001.json",
+    "engine_binary_sha256": "005654a65d2341ca8b6a504319a6b2b456e9901b9dd5adf6693a4335cc6633ea",
+    "comparison_scope": "Both controls disable cross-request prefix reuse and guided refresh. Fixed-input successes do not close the separate guided-off same-turn quality failure. One long positive/negative request per profile; no live desktop tools."
   },
   "recorded_source_scope": "Qualified application content at7d18e50 and engine005654; documentation/analysis commit identities vary and are recorded per experiment. Earlier retained artifacts keep their original source scopes.",
   "native_resource_probe_readiness": {
@@ -355,11 +364,12 @@
   "queued_diagnostics": {
     "unit": "qw3-computer-qualification-followup-01.service",
     "result": "apps/computer_use/.runtime/qualification-followup-01/result.json",
-    "observed_status": "waiting_for_final_qualification_04",
+    "observed_status": "baseline_prefix_replay_running",
     "experiments": [
       "baseline-prefix-replay",
       "vision-profile"
     ],
-    "production_sources_remain_frozen": true
+    "production_sources_remain_frozen": true,
+    "observed_at": 1790824712.9065428
   }
 }
