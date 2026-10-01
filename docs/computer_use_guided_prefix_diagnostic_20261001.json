@@ -1,6 +1,6 @@
 {
   "kind": "guided_prefix_latency_diagnostic_and_candidate",
-  "reviewed_at": 1790826822.1334586,
+  "reviewed_at": 1790827460.2793686,
   "live_task_result": "docs/computer_use_windows_long_on_06_20261001.json",
   "cause_evidence": {
     "request_before_first_miss": 49,
@@ -103,12 +103,14 @@
       "visual_report": "docs/computer_use_guided_visual_02_20261001.json"
     },
     "model_prefix_replay_passed": true,
-    "visual_regression_passed": true
+    "visual_regression_passed": true,
+    "live_archive_on_qualified": true,
+    "live_archive_on_report": "docs/computer_use_windows_long_on_07_20261001.json"
   },
   "candidate_patch_sha256": "361d1bdaf243a27077145ba5964288542340dde2cf98383f0296351e0c93b713",
   "remaining_validation": [
-    "Qualify actual36-page Windows archive tasks on both policies under the unchanged900s deadline, checking final output and stale observations.",
-    "Complete source-matched fixed54-short/12-long controls with candidate engine9f1d15."
+    "Finish matched off-policy live archive07 and paired evidence/timing audit under unchanged900s deadline.",
+    "Complete source-matched fixed54-short/12-long controls with engine9f1d15."
   ],
   "scope": "The candidate is prepared outside production sources. CPU scheduling tests and a clean patch check do not prove GPU state correctness, retrieval quality, latency improvement or desktop acceptance."
 }

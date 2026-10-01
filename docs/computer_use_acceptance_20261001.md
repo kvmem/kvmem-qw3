@@ -1,11 +1,12 @@
 # Computer-use acceptance evidence index
 
 Status: **active; not a completion certificate**. Windows VM functionality and
-both fixed-input decoder matrices are qualified at the identities below. The
-long live comparison is complete: KVMem on passed; off timed out. Checkpoint
-latency, macOS and physical hardware acceptance remain open. Standalone vision
-timing, the Windows process-identity probe and a fresh native resource pair
-have passed.
+both fixed-input decoder matrices are qualified for baseline engine `005654a6...`.
+Its long live comparison is complete: KVMem on passed; off timed out. Checkpoint
+repair has passed its first real long desktop task; the matching off-policy run
+and new-engine fixed controls are still running. Mac and physical hardware
+acceptance remain open. Standalone vision timing, the Windows process-identity
+probe and a fresh native resource pair have passed.
 
 The user retired the initial 48GB GPU limit. Tests use the current host's RTX
 PRO 6000 Blackwell Server Edition, reporting 97,887 MiB. Inference is local on
@@ -36,7 +37,8 @@ The workspace now contains candidate engine `9f1d1515...` from `1fb9dbb`. It
 passes 44 CPU and three targeted policy/CUDA checks. Its 50-request prefix and
 eight seed/long visual checks also passed; that supervisor is terminal.
 `qw3-computer-guided-live-01.service` now runs fresh real archive on/off tasks
-and fixed-input controls. The candidate is not yet live-desktop qualified. The measurements below belong to engine
+and fixed-input controls. The new on-policy task passed; its completed result
+is recorded separately below. The earlier measurements belong to engine
 `005654a6...`, retained in `guided-boundary-candidate/qw3-baseline-005`.
 
 Independent analysis and documentation commits occurred during the frozen
@@ -125,6 +127,27 @@ The independent offline audit can be reproduced with
 `scripts/computer_use_long_control_audit.py`; the report records all input,
 engine, output and retrieval identities.
 
+## Boundary repair: first real desktop result
+
+The [new on-policy archive](computer_use_windows_long_on_07_20261001.json)
+passed in **416.09s**, with all 36 pages, 80 completed actions, no rejections or
+unresolved receipts, and the exact same 363-byte output SHA-256 as the prior
+successful run. The final screen shows the correct opening reference and saved
+file. Its 81 model requests all have complete, tag-matched phase accounting.
+
+All 41 requests above 131,072 tokens reused history. The longest above-budget
+prefill was 1.671s, and no checkpoint miss occurred. Server visible-output latency
+was 1.918s median / 4.477s p95; screenshot-to-action latency was 3.942s median /
+7.050s p95. Sampled GPU peak was 46.125 GiB. The reference-producing request had
+252,987 tokens, preserved all 78 distinct prior images, and selected 1,018 of
+1,977 blocks with ready query/index state and no scorer fallback.
+
+The prior guided on-policy run took 820.16s and had four stale-observation
+rejections. These are single live runs with different model trajectories;
+use the separate matched 50-request replay for controlled latency evidence.
+The new off-policy task and six-profile fixed controls are still running.
+[All 81 request phases](computer_use_windows_long_on_07_phases_20261001.csv).
+
 ## Remaining work and retained failures
 
 1. **Checkpoint latency:** four on-policy archive requests lost an admissible
@@ -138,7 +161,8 @@ engine, output and retrieval identities.
    passes: the final request reuses159,104 tokens, reduces prefill61.259s to1.570s
    and total elapsed67.393s to6.897s. The
    [eight visual checks](computer_use_guided_visual_02_20261001.json) also pass.
-   Actual desktop and same-engine controls are running. Keep the replay
+   The new on-policy real desktop task also passed, with zero checkpoint misses
+   or rejected actions. Matched off-policy and fixed controls are running. Keep the replay
    alignment guard and 60s observation lifetime.
 2. **Native-client resource attribution repaired:** [defect and repair](computer_use_native_resource_attribution_20261001.json).
    The [native probe](computer_use_native_resource_probe_20261001.json) passed

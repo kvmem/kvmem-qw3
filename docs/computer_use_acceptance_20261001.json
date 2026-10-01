@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790826822.1338599,
+  "reviewed_at": 1790827460.2789853,
   "goal_complete": false,
   "recorded_source_commit": "7d18e50",
   "gpu_limit_48gb_retired": true,
@@ -188,7 +188,7 @@
     }
   },
   "remaining": [
-    "Finish candidate9f1d15 real Windows archive on/off and same-engine fixed controls. Prefix50/50 and guided visual8/8 now pass; the final retained request completes in6.897s instead of67.393s, with159104 tokens reused and no checkpoint miss. This is not yet a live task result.",
+    "Finish candidate9f1d15 matched Windows archive off-policy and six-profile fixed controls. On-policy live archive07 now passes36 pages in416.092s with80 completed actions, zero rejections/misses and an exact363-byte file. All41 above-budget requests reused history; max prefill1.671s. Preserve original engine005 native/core resource identities.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
   ],
@@ -403,7 +403,7 @@
   "boundary_candidate_qualification": {
     "source_commit": "1fb9dbb",
     "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
-    "status": "model_regressions_passed_live_qualification_running",
+    "status": "live_archive_on_passed_matched_off_and_controls_running",
     "unit": "qw3-computer-guided-boundary-01.service",
     "expected_main_pid": 1167433,
     "cpu_checks_passed": 44,
@@ -414,13 +414,16 @@
     "visual_checks_passed": 8,
     "model_supervisor_terminal": true,
     "prefix_report": "docs/computer_use_prefix_boundary_comparison_20261001.json",
-    "visual_report": "docs/computer_use_guided_visual_02_20261001.json"
+    "visual_report": "docs/computer_use_guided_visual_02_20261001.json",
+    "live_archive_on_passed": true,
+    "live_archive_on_report": "docs/computer_use_windows_long_on_07_20261001.json",
+    "desktop_qualification_scope": "One real Windows VM archive workflow, Linux client/model; native core trials retain engine005 identity."
   },
   "boundary_live_requalification": {
     "status": "running",
     "unit": "qw3-computer-guided-live-01.service",
     "expected_main_pid": 1169600,
-    "observed_at": 1790826822.1338618,
+    "observed_at": 1790827460.278988,
     "result": "apps/computer_use/.runtime/guided-live-qualification-01/result.json",
     "run_dirs": [
       "windows-long-on-07",
@@ -431,8 +434,18 @@
     "observed_stages": [
       [
         "long-on",
+        "completed"
+      ],
+      [
+        "long-off",
         "running"
       ]
-    ]
+    ],
+    "on_passed": true,
+    "on_elapsed_seconds": 416.09174174722284,
+    "on_rejected_actions": 0,
+    "on_checkpoint_misses": 0,
+    "on_report": "docs/computer_use_windows_long_on_07_20261001.json",
+    "off_status": "running"
   }
 }
