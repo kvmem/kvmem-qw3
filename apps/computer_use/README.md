@@ -236,7 +236,8 @@ inspect `summary.json` rather than treating process exit as task success.
 
 ```bash
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_suite.py \
-  --snapshot qw3-type-20261001 --kvmem on off --repetitions 3 \
+  --snapshot qw3-edit-20261001 --kvmem on off --repetitions 3 \
+  --guided-refresh both --visual-history retrievable \
   --run-dir apps/computer_use/.runtime/windows-suite-new
 ```
 
@@ -337,8 +338,15 @@ PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_s
   --restart --cases cross_app --run-dir apps/computer_use/.runtime/windows-native-restart-new
 
 PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/windows_native_suite.py \
-  --kvmem on off --repetitions 3 --run-dir apps/computer_use/.runtime/windows-native-suite-new
+  --kvmem on off --repetitions 3 --guided-refresh both --visual-history retrievable \
+  --run-dir apps/computer_use/.runtime/windows-native-suite-new
 ```
+
+Current native/long suite defaults target bundle 05 and `qw3-edit-20261001`.
+Create and verify that matching baseline before running; the older bundle 04
+and `qw3-type-20261001` snapshot belong to the clipboard-preserving executor.
+The suite records the requested refresh and visual-history settings, and its
+audit checks those settings against each actual engine manifest.
 
 `summarize_windows.py` and `audit_windows_suite.py` also read native suite
 exports. The audit still requires all 18 repeated tasks; a passing single pilot

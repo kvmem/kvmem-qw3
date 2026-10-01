@@ -35,6 +35,8 @@ async def command(*args):
 
 async def run(args):
     root = Path(__file__).resolve().parents[2]
+    if args.guided_refresh != "off" and args.method == "none" and "on" in args.kvmem:
+        raise ValueError("Guided refresh with KVMem requires DFlash or MTP")
     output = args.run_dir.resolve(); output.mkdir(parents=True, exist_ok=False)
     info = json.loads(await command("docker", "inspect", "qw3-computer-windows"))[0]
     assert info["Config"].get("Labels", {}).get("com.qw3.computer-use.owner") == "codex-goal-20260930"
@@ -47,7 +49,8 @@ async def run(args):
                "source_commit": (await command("git", "rev-parse", "HEAD")).strip(),
                "source_sha256": {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                                  for p in (root / "apps/computer_use").rglob("*.py") if ".runtime" not in p.parts},
-               "trials": [], "status": "running"}
+               "trials": [], "status": "running",
+               "guided_refresh": args.guided_refresh, "visual_history": args.visual_history}
     app_url, desktop_url = "http://127.0.0.1:18083", "http://127.0.0.1:18082"
     env = dict(os.environ, PYTHONPATH=str(root / "apps/computer_use"))
     async with aiohttp.ClientSession(trust_env=False, timeout=aiohttp.ClientTimeout(total=4)) as client:
@@ -96,7 +99,8 @@ async def run(args):
                         files = await get(desktop_url + "/files", desktop=True)
                         assert files["files"] == [], "Snapshot output directory is not empty"
                         engine_command = [sys.executable, str(root / "apps/computer_use/run_engine.py"), "--method", args.method,
-                                          "--kvmem", kvmem, "--lock-timeout", "30", "--run-dir", str(directory / "engine")]
+                                          "--kvmem", kvmem, "--lock-timeout", "30", "--run-dir", str(directory / "engine"),
+                                          "--guided-refresh", args.guided_refresh, "--visual-history", args.visual_history]
                         with (directory / "engine-launch.log").open("wb") as log:
                             engine = await asyncio.create_subprocess_exec(*engine_command, cwd=root, env=env, stdout=log, stderr=log)
                         sampler = asyncio.create_task(monitor(engine.pid, directory / "resources.jsonl", stopped))
@@ -151,7 +155,9 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--snapshot", default="qw3-type-20261001")
+    parser.add_argument("--snapshot", default="qw3-edit-20261001")
+    parser.add_argument("--guided-refresh", choices=["off", "both"], default="off")
+    parser.add_argument("--visual-history", choices=["pin-all", "retrievable"], default="pin-all")
     parser.add_argument("--method", choices=["none", "mtp", "dflash2"], default="dflash2")
     parser.add_argument("--kvmem", nargs="+", choices=["on", "off"], default=["on", "off"])
     parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))

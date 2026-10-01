@@ -26,6 +26,8 @@ async def run(args):
     root = Path(__file__).resolve().parents[2]
     if args.restart and "browser" in args.cases:
         raise ValueError("Crash/resume qualification supports --cases notepad cross_app")
+    if args.guided_refresh != "off" and args.method == "none" and "on" in args.kvmem:
+        raise ValueError("Guided refresh with KVMem requires DFlash or MTP")
     output = args.run_dir.resolve(); output.mkdir(parents=True, exist_ok=False)
     info = json.loads(await command("docker", "inspect", "qw3-computer-windows"))[0]
     assert info["Config"].get("Labels", {}).get("com.qw3.computer-use.owner") == "codex-goal-20260930"
@@ -48,6 +50,7 @@ async def run(args):
         shutil.copyfile(helper, output / helper.name)
     summary = {"kind": "windows_native_real_model_snapshot_trials", "status": "running", "trials": [],
                "bundle_sha256": bundle_hash, "bundle": bundle, "method": args.method, "restart": args.restart,
+               "guided_refresh": args.guided_refresh, "visual_history": args.visual_history,
                "helper_sha256": helper_hashes,
                "source_commit": (await command("git", "rev-parse", "HEAD")).strip(),
                "task_definitions": {c: CASES[c] for c in args.cases},
@@ -125,6 +128,7 @@ async def run(args):
                         with (directory / "engine-launch.log").open("wb") as log:
                             engine = await asyncio.create_subprocess_exec(sys.executable, str(root / "apps/computer_use/run_engine.py"),
                                 "--method", args.method, "--kvmem", policy, "--lock-timeout", "30", "--run-dir", str(directory / "engine"),
+                                "--guided-refresh", args.guided_refresh, "--visual-history", args.visual_history,
                                 cwd=root, env=env, stdout=log, stderr=log)
                         sampler = asyncio.create_task(monitor(engine.pid, directory / "resources.jsonl", stopped))
                         await ready("http://127.0.0.1:18080/health", engine)
@@ -189,9 +193,11 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--bundle-dir", type=Path, default=Path("apps/computer_use/.runtime/windows-native-client-04"))
-    parser.add_argument("--snapshot", default="qw3-type-20261001")
+    parser.add_argument("--bundle-dir", type=Path, default=Path("apps/computer_use/.runtime/windows-native-client-05"))
+    parser.add_argument("--snapshot", default="qw3-edit-20261001")
     parser.add_argument("--method", choices=["none", "mtp", "dflash2"], default="dflash2")
+    parser.add_argument("--guided-refresh", choices=["off", "both"], default="off")
+    parser.add_argument("--visual-history", choices=["pin-all", "retrievable"], default="pin-all")
     parser.add_argument("--kvmem", nargs="+", choices=["on", "off"], default=["on"])
     parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
     parser.add_argument("--repetitions", type=int, default=1)

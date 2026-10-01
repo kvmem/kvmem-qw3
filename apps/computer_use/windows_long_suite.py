@@ -133,7 +133,7 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--snapshot", default="qw3-type-20261001")
+    parser.add_argument("--snapshot", default="qw3-edit-20261001")
     parser.add_argument("--kvmem", choices=["on", "off"], default="on")
     parser.add_argument("--guided-refresh", choices=["off", "both"], default="off")
     parser.add_argument("--task-timeout", type=float, default=900)

@@ -82,6 +82,15 @@ def audit(run, repetitions):
             assert command[command.index("--kv-dtype") + 1] == "fp8"
             assert ("--kvmem" in command) == (trial["kvmem"] == "on")
             assert manifest["prefix_reuse"] == (trial["kvmem"] == "on")
+            if "guided_refresh" in summary:
+                refresh = summary["guided_refresh"] if trial["kvmem"] == "on" else "off"
+                assert manifest["guided_refresh"] == refresh, "Engine refresh policy differs from the suite"
+                if refresh == "off":
+                    assert "--kvmem-guided-reselect" not in command
+                else:
+                    assert command[command.index("--kvmem-guided-reselect") + 1] == refresh
+            if "visual_history" in summary:
+                assert manifest["visual_history"] == summary["visual_history"]
             log = (directory / "engine/engine.log").read_text()
             speculation = re.findall(r"native dflash_spec_summary: enabled=true .*?drafted=(\d+) accepted=(\d+).*?fallback=(\w+)", log)
             assert speculation and sum(int(s[0]) for s in speculation) > 0
