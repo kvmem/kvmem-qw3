@@ -1,6 +1,6 @@
 {
   "kind": "acceptance_evidence_inventory_not_completion_certificate",
-  "reviewed_at": 1790822124.2416217,
+  "reviewed_at": 1790823146.3584273,
   "goal_complete": false,
   "recorded_source_commit": "53cd0bf",
   "gpu_limit_48gb_retired": true,
@@ -188,7 +188,7 @@
     }
   },
   "remaining": [
-    "Finish guided archive06 dense trial and current-engine six-profile fixed controls. Guided on passed36 pages at261864 query tokens, but four61-108s cold prefills caused observation expiry; reproduce and assess this latency issue. Preserve all earlier guided-off failures and timeouts.",
+    "Complete current-engine six-profile fixed controls and address periodic-selection latency. Guided live archive06 comparison is complete: on passed36 pages; off reached page18 and timed out at900s. Four cold-prefill/observation-expiry retries remain an open usability issue.",
     "Repair native-client process-identity resource sampling and qualify a fresh matched Windows measurement. Independent native functionality and host GPU/RSS evidence remain valid.",
     "Implement and qualify macOS executor/client on an accessible Apple-hosted target.",
     "Qualify accessible physical Windows/Mac desktops, scaling, IME, focus, permissions and takeover."
@@ -280,7 +280,7 @@
   },
   "matched_native_client_bundle": "apps/computer_use/.runtime/windows-native-client-06",
   "native_requalification": {
-    "status": "native_complete_long_and_replay_running",
+    "status": "native_and_live_pair_complete_fixed_controls_running",
     "unit": "qw3-computer-final-qualification-04.service",
     "result": "apps/computer_use/.runtime/final-windows-qualification-04/result.json",
     "matrix": "apps/computer_use/.runtime/windows-native-suite-04",
@@ -288,7 +288,7 @@
     "snapshot": "qw3-exact-20261001",
     "bundle_sha256": "23851fd5c83e8b4e70a2595fcf46d3f1c7f1f600e1ff140a3ade8b2ad69c08f4",
     "prior_failure_document": "docs/computer_use_native_newline_failure_20261001.json",
-    "observed_at": 1790821194.3363106,
+    "observed_at": 1790823146.3584292,
     "completed_trials": 18,
     "passed_trials": 18,
     "first_round_progress_document": "docs/computer_use_windows_native_04_progress_20261001.json",
@@ -327,8 +327,10 @@
   "guided_live_archive": {
     "on_passed": true,
     "on_document": "docs/computer_use_windows_long_on_06_20261001.json",
-    "off_status": "running",
-    "paired_result": null,
-    "latency_issue_open": true
+    "off_status": "normal_deadline_timeout",
+    "paired_result": "docs/computer_use_windows_long_pair_06_20261001.json",
+    "latency_issue_open": true,
+    "comparison_completed": true,
+    "all_tasks_passed": false
   }
 }
