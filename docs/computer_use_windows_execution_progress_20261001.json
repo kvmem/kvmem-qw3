@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T04:54:08.218253+08:00",
+  "updated_at": "2026-10-01T21:15:36.326608+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -234,13 +234,12 @@
     "apps/computer_use/osworld_windows/summarize_preflight.py": "6e7f61e2f95d276fa1a8d5d61dd802e81a0bd9b847a2f44a534c54bdb6f9e49d"
   },
   "pending": [
-    "Complete remaining task preparation: 006 one inaccessible original and local mirror/initializer/grader; 022 remaining download UI/reset; 035 visibility and timeline/reset; 043 disclosed constraint-conflict handling/reset; 051 process audit integration",
-    "Integrate qualified generic native launcher, collectors, event handoff, task reset, recorder and graders into the continue-on-task-failure campaign scheduler",
-    "Integrate qualified application-entry configurations into all scenario initializers and clean reset",
-    "Before freezing: archive/remove all known-answer qualification files and old task products from guest and SMB-visible share; validate minimal per-attempt public staging",
+    "Complete 006 original CV availability and local mirror/mailbox/initializer/grader without substituting unauthorised material",
+    "Common queue qualified on native 004-on and 010-off short preflights; complete remaining scenario reset/collection paths and formal freeze",
+    "Complete 022 remaining four account UI downloads, 035 update visibility/first-observation timing, 043 frozen source-conflict disclosures and 051 complete trajectory/video process audit",
     "Mirror private-site decorative remote assets and validate remaining UI paths",
-    "Full-duration recording overhead and monotonic event alignment",
-    "Clean baseline snapshot, restore round trips, frozen V0 configuration",
+    "Verify full-budget recording completeness and event alignment; 15-minute 013 recording and recorder CPU costs already measured",
+    "Freeze V0 model/engine/history/budgets only after all platform and scenario qualifications; use qualified clean snapshot and archive SMB before every attempt",
     "20 V0 on/off baseline runs; diagnose; at most two general candidates; V1 comparison and conditional repetition"
   ],
   "last_qualified_platform_commit": "cbf885f",
@@ -796,7 +795,7 @@
     "004": {
       "model_test_completed": false,
       "snapshot_frozen": false,
-      "reset_roundtrip_validated": false,
+      "reset_roundtrip_validated": true,
       "input_opened_in_impress": true,
       "source_input_sha256": "c34c7fa8536023cccb8febcb67961584d6d6cbe324b2fdaa14211ec082592d15",
       "evidence": "apps/computer_use/.runtime/osworld-004-qual-01",
@@ -835,9 +834,26 @@
       "unrecognized_serialization_policy": "Requires evidence review; not automatically called model corruption",
       "remaining": [
         "Integrate initializer and grader with campaign and clean reset",
-        "Archive all reference/qualification files outside guest and SMB before snapshot",
         "Review any submission whose locked appearance does not match an unedited control; preserve original score"
-      ]
+      ],
+      "shared_clean_base": "qw3-osworld-clean-20261002",
+      "qualification_answers_isolated_in_base": true,
+      "reset_roundtrip_evidence": "apps/computer_use/.runtime/baseline-clean-qualification-01/roundtrip-result.json",
+      "native_campaign_short_preflight": {
+        "run": "osworld-queue004-on-01",
+        "task": "004",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 60.7077728,
+        "strict_success": false,
+        "inference_requests": 18,
+        "actions": 17,
+        "video_seconds": 84.759061171,
+        "video_sha256": "e1520575e6518df4a6c47368740928652d831d603512935ec98045de3f0d5a89",
+        "evidence": "apps/computer_use/.runtime/osworld-queue-qualification-01/osworld-queue004-on-01/result.json"
+      }
     },
     "006": {
       "model_test_completed": false,
@@ -910,7 +926,22 @@
         "Original inbox bytes in local-only Thunderbird profile, without original accounts or credentials",
         "Upstream paragraph score preserved; additional 48 table-cell checks and protected reference integrity",
         "Register local task profile for ordinary reopen; force offline startup=3"
-      ]
+      ],
+      "native_campaign_short_preflight": {
+        "run": "osworld-queue010-off-01",
+        "task": "010",
+        "kvmem": "off",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 60.3212317,
+        "strict_success": false,
+        "inference_requests": 8,
+        "actions": 6,
+        "video_seconds": 83.363001297,
+        "video_sha256": "ce734fdebac26c6d6199c4e1e51b3bf85fae732924b69dfae2c25a7873bb8cf8",
+        "evidence": "apps/computer_use/.runtime/osworld-queue-qualification-01/osworld-queue010-off-01/result.json"
+      }
     },
     "038": {
       "model_test_completed": false,
@@ -951,9 +982,10 @@
       "native_positive_windows_saved_score": 1,
       "native_positive_strict_success": true,
       "remaining": [
-        "Archive known answers outside guest and SMB before clean snapshot",
         "Campaign integration and task reset"
-      ]
+      ],
+      "shared_clean_base": "qw3-osworld-clean-20261002",
+      "qualification_answers_isolated_in_base": true
     },
     "051": {
       "model_test_completed": false,
@@ -979,9 +1011,10 @@
       "synthetic_audit_fixture_is_not_video_or_real_trajectory": true,
       "remaining": [
         "Bind host-only complete trajectory/video review to every formal saved XCF; no crop/rotation history inferred from final artifact",
-        "Archive qualification reference/answer files outside guest and SMB before clean snapshot",
         "Campaign integration and task reset"
-      ]
+      ],
+      "shared_clean_base": "qw3-osworld-clean-20261002",
+      "qualification_answers_isolated_in_base": true
     },
     "022": {
       "model_test_completed": false,
@@ -1027,9 +1060,10 @@
       "remaining": [
         "Validate remaining four account UI download paths",
         "Fresh per-attempt snapshot and restore roundtrip",
-        "Remove all qualification file mappings/answers and previous downloads from guest and SMB-visible share before formal freeze",
         "Bind initializer, collector and scorer to native campaign driver"
-      ]
+      ],
+      "shared_clean_base": "qw3-osworld-clean-20261002",
+      "qualification_answers_isolated_in_base": true
     },
     "035": {
       "model_test_completed": false,
@@ -1047,7 +1081,7 @@
       "remaining": [
         "Integrate qualified native four-review driver into frozen campaign attempts",
         "Instrument event delivery, UI visibility and first model observation on one host monotonic timeline",
-        "Fresh snapshot and restore roundtrip; remove all qualification answers/workbooks from guest and SMB before freeze"
+        "Fresh snapshot and restore roundtrip; per-attempt share archival remains mandatory"
       ],
       "semantic_event_cases_passed": 22,
       "semantic_event_evidence": "apps/computer_use/.runtime/osworld-035-events-01/result.json",
@@ -1072,7 +1106,9 @@
       "native_same_thread_driver_qualified": true,
       "native_driver_evidence": "apps/computer_use/.runtime/native-driver-qual-02/result.json",
       "driver_qualification_uses_scripted_backend": true,
-      "host_handoff_cases_passed": 10
+      "host_handoff_cases_passed": 10,
+      "shared_clean_base": "qw3-osworld-clean-20261002",
+      "qualification_answers_isolated_in_base": true
     },
     "043": {
       "model_test_completed": false,
@@ -1101,13 +1137,14 @@
       "remaining": [
         "Freeze disclosed handling of source constraint conflicts without claiming full business success",
         "Fresh task snapshot and restore roundtrip",
-        "Remove qualification materials from guest and SMB share before formal freeze",
         "Wire initializer, collector and grading into native campaign"
       ],
       "preserved_failures": [
         "apps/computer_use/.runtime/osworld-043-qual-01",
         "apps/computer_use/.runtime/osworld-043-qual-02/day-before-fix-result.json"
-      ]
+      ],
+      "shared_clean_base": "qw3-osworld-clean-20261002",
+      "qualification_answers_isolated_in_base": true
     }
   },
   "latest_preparation_source": "This commit; source identities are recorded above. V0 remains unfrozen.",
@@ -1380,5 +1417,81 @@
     ],
     "v1_selected": false,
     "no_kvmem_comparison_yet": true
+  },
+  "native_scenario_campaign": {
+    "status": "two_task_native_queue_qualified_nine_adapters_not_all_native_qualified",
+    "formal_run": false,
+    "v0_frozen": false,
+    "adapter_tasks": [
+      "013",
+      "004",
+      "010",
+      "038",
+      "022",
+      "035",
+      "043",
+      "080",
+      "051"
+    ],
+    "blocked_task": "006",
+    "source": [
+      "apps/computer_use/osworld_windows/scenarios.py",
+      "apps/computer_use/osworld_windows/native_run.py",
+      "apps/computer_use/osworld_windows/grade_run.py",
+      "apps/computer_use/osworld_windows/campaign.py"
+    ],
+    "contract_tests": 8,
+    "host_negative_dispatch_checks": 9,
+    "host_dispatch_evidence": "apps/computer_use/.runtime/osworld-queue-grading-qualification-01/result.json",
+    "native_evidence": "apps/computer_use/.runtime/osworld-queue-qualification-01/result.json",
+    "notes": [
+      "Adapter presence is not native qualification of all nine scenarios",
+      "Formal runs rejected until all scenario and platform gates are frozen",
+      "No strategy change or KVMem benefit claim from short integration trials"
+    ],
+    "queue_status": "complete",
+    "native_results": [
+      {
+        "run": "osworld-queue004-on-01",
+        "task": "004",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 60.7077728,
+        "strict_success": false,
+        "inference_requests": 18,
+        "actions": 17,
+        "video_seconds": 84.759061171,
+        "video_sha256": "e1520575e6518df4a6c47368740928652d831d603512935ec98045de3f0d5a89",
+        "evidence": "apps/computer_use/.runtime/osworld-queue-qualification-01/osworld-queue004-on-01/result.json"
+      },
+      {
+        "run": "osworld-queue010-off-01",
+        "task": "010",
+        "kvmem": "off",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 60.3212317,
+        "strict_success": false,
+        "inference_requests": 8,
+        "actions": 6,
+        "video_seconds": 83.363001297,
+        "video_sha256": "ce734fdebac26c6d6199c4e1e51b3bf85fae732924b69dfae2c25a7873bb8cf8",
+        "evidence": "apps/computer_use/.runtime/osworld-queue-qualification-01/osworld-queue010-off-01/result.json"
+      }
+    ],
+    "automatic_continuation_after_timeout_verified": true,
+    "per_attempt_clean_restore_and_share_archive": true,
+    "preview_url": "http://127.0.0.1:18089/index.html",
+    "all_nine_scenarios_native_qualified": false,
+    "formal_runs_completed": 0,
+    "remaining": [
+      "Qualify remaining per-task reset, collection, dynamic events and complete process audit paths",
+      "Finish 006 original materials and adapter",
+      "Freeze common history policy and all ten-task V0 configuration before formal results",
+      "Add granular restore timing and interruption recovery proof before long unattended queue"
+    ]
   }
 }
