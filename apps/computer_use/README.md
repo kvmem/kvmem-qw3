@@ -19,6 +19,10 @@ source identities, preserved failures and the scope of each result.
 See `../../docs/computer_use_codex_m2_20261001.md` for desktop evidence and
 `../../docs/computer_use_long_history_20261001.md` for the separate diagnostics.
 See `../../docs/computer_use_codex_goal_20260930.md` for the full goal.
+The new [ten-scenario Windows campaign](../../docs/computer_use_windows_execution_optimization_20261001.md)
+is in platform preparation. Bundle 07 passed 40 native client contract tests;
+it has not yet run the ten OSWorld-derived scenarios. This does not replace the
+frozen bundle 06 task results above.
 
 ## Runtime
 
@@ -216,6 +220,38 @@ manual takeover while the application is paused. Refreshing the UI image does
 not invalidate the model's active observation. SQLite action records, images,
 Codex history and exact inference requests stay in the app-owned runtime.
 On restart, unfinished tasks are paused until explicitly resumed.
+
+For longer campaigns, `--tool-call-limit 500` sets the lifetime observe/act
+budget of each **new** task. Failed/rejected calls also consume a slot. The
+saved count and limit survive pause/resume and application restarts; changing
+the launch option never raises an existing task's budget. An unfinished task
+from a legacy client with no persisted count must be stopped before starting
+a new one. `--output-policy task` omits the legacy `C:\Qw3Computer\outputs`
+save hint, allowing the task's explicit in-place/output paths to govern.
+Windows `start.ps1` accepts `-ToolCallLimit` and `-OutputPolicy` for these options.
+
+The host can independently record the shared QEMU console without issuing
+executor observations or input:
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python -m vm.record_console \
+  --ffmpeg /absolute/path/to/ffmpeg --fps 10 \
+  --output apps/computer_use/.runtime/new-recording
+```
+
+SIGTERM/SIGINT finalizes the recording; `--duration 10` supports a bounded
+probe. Keep the recovery MKV, browser-compatible MP4, capture event log and
+manifest. Video time uses the host monotonic clock; delayed captures retain
+the preceding frame and all actual capture times remain available. Encoded
+frame rate is not a claim of constant capture frequency. Recording failure is
+explicit in the manifest. This Linux-host helper is separate from the native
+Windows agent client. Dynamic-screen decoding and preservation of the active
+executor observation passed a live probe; full-campaign recording overhead
+and long-duration coverage remain to be qualified.
+
+```bash
+PYTHONPATH=apps/computer_use .venv/bin/python -m unittest vm.test_record_console -v
+```
 
 ```bash
 # Start each trial with no pre-existing expected output file.

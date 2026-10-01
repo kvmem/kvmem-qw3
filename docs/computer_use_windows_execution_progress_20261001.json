@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-01T14:12:37.297241+00:00",
+  "updated_at": "2026-10-01T14:20:41.874379+00:00",
   "goal_status": "active",
   "phase": "P0",
   "formal_runs_completed": 0,
@@ -81,10 +81,11 @@
     "apps/computer_use/pack_windows_client.py": "54c92672389025fbea194fed3274b638483ea7f4bb2bd6a256b81b3f81bc6a93",
     "apps/computer_use/vm/record_console.py": "27d092a9d7215a7dc6727e1fe5428b8b7cca058509457f60827eb139f3d7d821",
     "apps/computer_use/vm/qualify_recording.py": "2213c764dfb70a1dee8fe89d97a77c1d09292c487ce4ab4c9587087f0d079e17",
-    "apps/computer_use/vm/vnc_admin.py": "8ecafde699aef14c519c28dd9a6cc6bebfef5cc1d43d6c2e9ddff72077354921"
+    "apps/computer_use/vm/vnc_admin.py": "8ecafde699aef14c519c28dd9a6cc6bebfef5cc1d43d6c2e9ddff72077354921",
+    "apps/computer_use/vm/install_osworld_graphics_wps.ps1": "6d289dfdf757de91c7006ee4c7ac3803c97f2f4ca955ea67428c3a990a7aa00e"
   },
   "pending": [
-    "GIMP and WPS install and first-run verification",
+    "WPS installer terminal result and all four office apps first-run verification",
     "allowlisted office app launches, bounded drag and keyboard actions",
     "long context policy qualification",
     "continue-on-task-failure scheduler",
@@ -92,5 +93,133 @@
     "ten initializers and independent graders",
     "new qualified frozen snapshot",
     "20 baseline runs and evidence-based optimization"
-  ]
+  ],
+  "last_qualified_platform_commit": "e2f9f78",
+  "guest_app_inventory": {
+    "known_executables": [
+      {
+        "version": "26.8.0.3",
+        "path": "C:\\Program Files\\LibreOffice\\program\\soffice.exe"
+      },
+      {
+        "version": "157.0",
+        "path": "C:\\Program Files\\Mozilla Thunderbird\\thunderbird.exe"
+      },
+      {
+        "version": "3.2.6.0",
+        "path": "C:\\Program Files\\GIMP 3\\bin\\gimp-3.exe"
+      }
+    ],
+    "applications": [
+      {
+        "DisplayName": "GIMP 3.2.6",
+        "DisplayVersion": "3.2.6.0",
+        "Publisher": "The GIMP Team",
+        "InstallLocation": "C:\\Program Files\\GIMP 3\\"
+      },
+      {
+        "DisplayName": "Mozilla Thunderbird (x64 en-US)",
+        "DisplayVersion": "157.0",
+        "Publisher": "Mozilla",
+        "InstallLocation": "C:\\Program Files\\Mozilla Thunderbird"
+      },
+      {
+        "DisplayName": "LibreOffice 26.8.0.3",
+        "DisplayVersion": "26.8.0.3",
+        "Publisher": "The Document Foundation",
+        "InstallLocation": "C:\\Program Files\\LibreOffice\\"
+      },
+      {
+        "DisplayName": "WPS Office (12.1.0.28485)",
+        "DisplayVersion": "12.1.0.28485",
+        "Publisher": "Kingsoft Corp.",
+        "InstallLocation": null
+      }
+    ],
+    "winget_available": true,
+    "disks": [
+      {
+        "DeviceID": "C:",
+        "Size": 67508367360,
+        "FreeSpace": 35312459776
+      }
+    ],
+    "recorded_at": "2026-10-01T21:19:05.1257141Z",
+    "kind": "read_only_windows_application_inventory",
+    "os": {
+      "caption": "Microsoft Windows 11 Enterprise Evaluation",
+      "memory_kib": 8383772,
+      "build": "26300",
+      "version": "10.0.26300"
+    }
+  },
+  "wps_path_inventory": {
+    "executables": [
+      {
+        "version": "12,1,0,28485",
+        "path": "C:\\Users\\Qw3Test\\AppData\\Local\\Kingsoft\\WPS Office\\12.1.0.28485\\office6\\et.exe"
+      }
+    ],
+    "processes": [
+      {
+        "id": 2728,
+        "name": "WPSOffice",
+        "started": "2026-10-01T21:17:13.5602335Z",
+        "cpu_seconds": 6.328125,
+        "path": "C:\\Qw3Computer\\installers\\osworld-01\\WPSOffice.exe",
+        "title": ""
+      },
+      {
+        "id": 4484,
+        "name": "WPSOffice",
+        "started": "2026-10-01T21:17:24.0075283Z",
+        "cpu_seconds": 32.921875,
+        "path": "C:\\ProgramData\\kingsoft\\20261001_141715\\WPSOffice.exe",
+        "title": ""
+      },
+      {
+        "id": 8736,
+        "name": "WPSOffice",
+        "started": "2026-10-01T21:17:27.0198456Z",
+        "cpu_seconds": 1.828125,
+        "path": "C:\\ProgramData\\kingsoft\\20261001_141715\\WPSOffice.exe",
+        "title": ""
+      }
+    ]
+  },
+  "graphics_wps_install": {
+    "passed": true,
+    "started": "2026-10-01T21:16:04.5957947Z",
+    "finished": "2026-10-01T21:20:03.8335751Z",
+    "packages": [
+      {
+        "exit_code": 0,
+        "stage": "exited",
+        "passed": true,
+        "file": "gimp-3.2.6-setup.exe",
+        "process_id": 7108,
+        "signature_status": "Valid",
+        "publisher": "CN=Jernej Simončič, O=Jernej Simončič, L=Ljubljana, C=SI",
+        "sha256": "9337cccbc01d4098ee7a3dab215b3afbe6ece99c5287c92441d6f12cf541ebca"
+      },
+      {
+        "exit_code": 0,
+        "stage": "exited",
+        "passed": true,
+        "file": "WPSOffice.exe",
+        "process_id": 2728,
+        "signature_status": "Valid",
+        "publisher": "CN=WPS SOFTWARE PTE. LTD., O=WPS SOFTWARE PTE. LTD., L=Singapore, C=SG",
+        "sha256": "eba314934969598e5eeb03c27578c66baaede235972d7407faba8023232ed2b1"
+      }
+    ],
+    "kind": "pinned_windows_graphics_wps_installation",
+    "terminal_result_available": true
+  },
+  "evidence_paths": {
+    "native_client": "apps/computer_use/.runtime/windows/shared/osworld-client-tests-07.json",
+    "recording": "apps/computer_use/.runtime/windows-osworld-recording-probe-02",
+    "installers": "apps/computer_use/.runtime/windows/shared/osworld-installers-01",
+    "inventory": "apps/computer_use/.runtime/windows/shared/osworld-app-inventory-02.json"
+  }
 }

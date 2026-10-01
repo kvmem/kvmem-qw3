@@ -11,8 +11,9 @@
 进度及证据见 [执行进度记录](computer_use_windows_execution_progress_20261001.json)。
 新的客户端将 observe/act 调用额度按任务保存，暂停、恢复和重启不增加额度；
 支持按任务自己的路径保存。Linux 和 Windows 原生客户端均通过 40 项回归检查。
-Windows 已安装并校验签名的 LibreOffice 26.8.0 和 Thunderbird 157.0；
-其他应用和场景仍在准备。
+Windows 已安装并校验签名的 LibreOffice 26.8.0、Thunderbird 157.0 和 GIMP 3.2.6；
+WPS 12.1.0.28485 的签名、注册项和 et.exe 路径已核对，但安装器尚未退出，
+仍需取得终态并完成所有应用的首次启动检查。其他场景仍在准备。
 
 连续只读 VNC 录屏已完成动态画面小规模验收：10.083 秒采集 99 帧，
 平均 9.824 Hz，最大采样间隔 0.158 秒。录屏前的 observation ID 在录屏后仍被
