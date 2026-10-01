@@ -1,6 +1,7 @@
 # Mac 测试接入
 
-Windows 虚拟机测试继续进行。Mac 桌面执行器、打包及实际任务验收仍未完成；
+Windows 虚拟机阶段已完成，结果见[验收记录](computer_use_acceptance_20261001.md)。
+Mac 桌面执行器、打包及实际任务验收仍未完成；
 本页和检查脚本用于准备测试环境，不构成 Mac 支持已经完成的证明。
 
 ## 提供连接信息
@@ -53,3 +54,5 @@ ssh qw3-mac 'python3 -' < scripts/computer_use_macos_preflight.py
 
 当前验证仅为 Python 语法检查、命令行帮助，以及 Linux 上正确返回“不支持该平台”。
 Apple API 调用和 Mac 图形会话尚未在真实 Mac 上运行。
+
+物理 Windows 目标的接入边界见[物理机测试接入](computer_use_physical_test_access_20261001.md)。
