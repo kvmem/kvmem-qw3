@@ -66,13 +66,16 @@ def main():
     [string]$BackendToken = '',
     [string]$Desktop = 'http://127.0.0.1:5000',
     [string]$DesktopToken = 'C:\\Qw3Computer\\executor-token.txt',
-    [string]$Runtime = ''
+    [string]$Runtime = '',
+    [ValidateRange(1,10000)][int]$ToolCallLimit = 100,
+    [ValidateSet('outputs','task')][string]$OutputPolicy = 'outputs'
 )
 $ErrorActionPreference = 'Stop'
 $env:PATH = "$PSScriptRoot\\codex\\bin;$env:PATH"
 $env:PYTHONUTF8 = '1'
 if (!$Runtime) { $Runtime = Join-Path $PSScriptRoot 'runtime' }
 $clientArgs = @('-X','utf8','-m','qw3_computer.app','--backend',$Backend,'--desktop',$Desktop,'--desktop-token',$DesktopToken,'--runtime',$Runtime)
+$clientArgs += @('--tool-call-limit',"$ToolCallLimit",'--output-policy',$OutputPolicy)
 if ($BackendToken) { $clientArgs += @('--backend-token',$BackendToken) }
 & "$PSScriptRoot\\python\\python.exe" @clientArgs
 exit $LASTEXITCODE

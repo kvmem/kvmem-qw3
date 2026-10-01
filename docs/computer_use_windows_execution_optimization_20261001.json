@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "kind": "execution_and_optimization_plan_not_runner",
-  "status": "planned_not_started",
+  "status": "platform_preparation_in_progress",
   "created_at": "2026-10-01T20:54:10.173869+08:00",
   "selection_manifest": "docs/computer_use_osworld_windows_10_20261001.json",
   "selection_manifest_sha256": "3297009c1c11a455899f296749bf9888d51e45d9cc4b239d5813e83723bdab8e",
@@ -43,7 +43,7 @@
     {
       "id": "P0",
       "name_zh": "共用平台",
-      "status": "not_started",
+      "status": "in_progress",
       "depends_on": [],
       "exit_checks": [
         "app_allowlist_and_gui_actions",
@@ -1504,5 +1504,7 @@
     "Separate KVMem and workflow effects using matched comparisons",
     "Document failed candidates and unexplained regressions; do not fabricate optimization gains"
   ],
-  "no_publication_or_real_account_actions": true
+  "no_publication_or_real_account_actions": true,
+  "progress_record": "docs/computer_use_windows_execution_progress_20261001.json",
+  "readiness_is_preparation_start_snapshot": true
 }

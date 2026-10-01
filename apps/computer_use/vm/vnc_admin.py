@@ -25,6 +25,7 @@ class Console:
         self.read(struct.unpack(">I", self.read(4))[0])
         self.socket.sendall(struct.pack(">BBBBBBBBHHHBBBxxx", 0,0,0,0,32,24,0,1,255,255,255,16,8,0))
         self.socket.sendall(struct.pack(">BBHi", 2,0,1,0))
+        self.frame = Image.new("RGB", (self.width, self.height))
 
     def read(self, count):
         data = b""
@@ -37,7 +38,6 @@ class Console:
 
     def screenshot(self):
         self.socket.sendall(struct.pack(">BBHHHH", 3,0,0,0,self.width,self.height))
-        image = Image.new("RGB", (self.width,self.height))
         while True:
             kind = self.read(1)[0]
             if kind == 2:
@@ -54,9 +54,9 @@ class Console:
                 x,y,width,height,encoding = struct.unpack(">HHHHi", self.read(12))
                 if encoding != 0:
                     raise RuntimeError(f"Unsupported console encoding {encoding}")
-                image.paste(Image.frombytes("RGB", (width,height), self.read(width*height*4), "raw", "BGRX"), (x,y))
+                self.frame.paste(Image.frombytes("RGB", (width,height), self.read(width*height*4), "raw", "BGRX"), (x,y))
             if count:
-                return image
+                return self.frame.copy()
 
     def close(self):
         self.socket.close()

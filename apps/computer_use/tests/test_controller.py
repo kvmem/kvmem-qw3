@@ -147,6 +147,82 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.state["thread_id"], "test-thread")
         self.assertIn("重新启动", restored.state["notice"])
 
+    async def test_resume_and_restart_keep_task_budget_and_policy(self):
+        self.controller.tool_call_limit = 3
+        self.controller.output_policy = "task"
+        await self.controller.start_task("Update the original workbook in place.")
+        await self.controller.tool("observe", {})
+        await self.controller.control("pause")
+        await self.controller.control("resume")
+        await self.controller.tool("observe", {})
+        await self.controller.close()
+        restored = Controller(self.temp.name, self.desktop, "unused", 1,
+                              tool_call_limit=500, output_policy="outputs")
+        self.controller = restored
+        restored.client = FixtureCodex()
+        restored.ready = True
+        self.assertEqual(restored.state["tool_calls_used"], 2)
+        self.assertEqual(restored.state["tool_call_limit"], 3)
+        self.assertEqual(restored.state["output_policy"], "task")
+        await restored.control("resume")
+        await restored.tool("observe", {})
+        with self.assertRaisesRegex(DesktopError, "limit reached"):
+            await restored.tool("act", {"action": {"kind": "key", "key": "ENTER"}})
+        self.assertTrue(self.desktop.paused)
+        self.assertEqual(restored.state["status"], "paused")
+        self.assertEqual(restored.state["tool_calls_used"], 3)
+        # Exhaustion must be checked before enabling guest input.
+        self.desktop.control = AsyncMock(wraps=self.desktop.control)
+        with self.assertRaisesRegex(DesktopError, "额度已用尽"):
+            await restored.control("resume")
+        self.desktop.control.assert_not_awaited()
+
+    async def test_failed_dispatch_is_counted_before_dispatch(self):
+        await self.controller.start_task("Test budget persistence")
+        async def failing_action(arguments):
+            saved = json.loads(self.controller.state_path.read_text())
+            self.assertEqual(saved["tool_calls_used"], 1)
+            raise DesktopError("Transport failed")
+        self.desktop.act = failing_action
+        with self.assertRaisesRegex(DesktopError, "Transport failed"):
+            await self.controller.tool("act", {})
+        self.assertEqual(self.controller.budget_remaining(), 99)
+
+    async def test_concurrent_calls_cannot_overdraw_last_budget_slot(self):
+        self.controller.tool_call_limit = 1
+        await self.controller.start_task("Test concurrent observation")
+        outcomes = await asyncio.gather(self.controller.tool("observe", {}),
+                                        self.controller.tool("observe", {}), return_exceptions=True)
+        self.assertEqual(sum(isinstance(v, DesktopError) for v in outcomes), 1)
+        self.assertEqual(self.controller.state["tool_calls_used"], 1)
+        self.assertTrue(self.desktop.paused)
+
+    async def test_legacy_task_cannot_resume_with_an_invented_budget(self):
+        self.controller.state = {"status": "paused", "id": "legacy", "thread_id": "thread"}
+        self.desktop.control = AsyncMock(wraps=self.desktop.control)
+        with self.assertRaisesRegex(DesktopError, "累计调用记录"):
+            await self.controller.control("resume")
+        self.desktop.control.assert_not_awaited()
+
+    async def test_task_output_policy_does_not_override_in_place_save(self):
+        self.controller.output_policy = "task"
+        self.controller.client.turn = AsyncMock(return_value="test-turn")
+        prompt = r"Save the edited presentation in C:\Users\Qw3Test\Desktop\source.pptx."
+        await self.controller.start_task(prompt)
+        text = self.controller.client.turn.call_args.args[1]
+        self.assertIn(prompt, text)
+        self.assertNotIn(r"C:\Qw3Computer\outputs", text)
+        await self.controller.control("stop")
+        self.controller.output_policy = "outputs"
+        await self.controller.start_task("Save a new test note")
+        self.assertIn(r"C:\Qw3Computer\outputs", self.controller.client.turn.call_args.args[1])
+        self.assertEqual(self.controller.state["tool_calls_used"], 0)
+
+    async def test_invalid_task_limit_is_rejected(self):
+        for limit in (0, -1, True, 1.5, 10001):
+            with self.assertRaises(ValueError):
+                Controller(self.temp.name, self.desktop, "unused", 1, tool_call_limit=limit)
+
     async def test_foreign_websites_cannot_start_local_tasks(self):
         self.controller.start_task = AsyncMock(return_value={"status": "running"})
         runner, url = await serve(web_app(self.controller))

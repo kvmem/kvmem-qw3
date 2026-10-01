@@ -1,0 +1,96 @@
+{
+  "kind": "windows_osworld_ten_execution_progress",
+  "updated_at": "2026-10-01T14:12:37.297241+00:00",
+  "goal_status": "active",
+  "phase": "P0",
+  "formal_runs_completed": 0,
+  "v0_frozen": false,
+  "client": {
+    "host_tests_passed": 40,
+    "windows_tests_passed": 40,
+    "qualification": {
+      "kind": "windows_native_client_contract_tests",
+      "finished": "2026-10-01T14:05:21.2057929-07:00",
+      "directory": "C:\\Qw3Computer\\clients\\bb04686b5f33",
+      "started": "2026-10-01T14:04:52.0908505-07:00",
+      "python": "Python 3.13.13",
+      "bundle_sha256": "bb04686b5f33589662ae6799fb642219b1caf08aa28963870b794e5dab4656e2",
+      "passed": true,
+      "codex": "codex-cli 0.159.2",
+      "process_exit_code": 0
+    }
+  },
+  "office_install": {
+    "passed": true,
+    "started": "2026-10-01T21:05:46.5836422Z",
+    "finished": "2026-10-01T21:07:44.0095550Z",
+    "packages": [
+      {
+        "passed": true,
+        "signature_status": "Valid",
+        "publisher": "E=info@documentfoundation.org, CN=The Document Foundation, O=The Document Foundation, OU=LibreOffice Build Team, L=Berlin, S=Berlin, C=DE",
+        "sha256": "4aa6c6e1895f4055104effcb556bd3362d20c6ad707c149543304f395ef9db95",
+        "exit_code": 0,
+        "file": "LibreOffice_26.8.0_Win_x86-64.msi"
+      },
+      {
+        "passed": true,
+        "signature_status": "Valid",
+        "publisher": "CN=Mozilla Corporation, OU=Firefox Engineering Operations, O=Mozilla Corporation, L=San Francisco, S=California, C=US",
+        "sha256": "13653e0ce6393536650cd2410bbbac7ff0ff0e73d999f06e99a213069f07ac91",
+        "exit_code": 0,
+        "file": "Thunderbird_Setup_157.0.msi"
+      }
+    ],
+    "kind": "pinned_windows_office_installation"
+  },
+  "recording_probe": {
+    "kind": "live_windows_recorder_qualification",
+    "passed": true,
+    "host_started_unix_ns": 1790863804835831647,
+    "initial_observation_id": "dff4d363-9484-4823-a5fd-e8337d148b8c",
+    "post_recording_action_status": "completed",
+    "pre_recording_observation_accepted": true,
+    "distinct_captured_images": 89,
+    "capture": {
+      "count": 99,
+      "elapsed_seconds": 10.083279748,
+      "mean_hz": 9.823864678283362,
+      "max_gap_seconds": 0.158485819,
+      "median_gap_seconds": 0.1115885445
+    },
+    "decoded_frames": 101,
+    "distinct_decoded_frames": 101,
+    "duration_rounding_error_seconds": 0.016720251999998936,
+    "host_finished_unix_ns": 1790863816306663063
+  },
+  "recording_limits": [
+    "static desktop may be sampled around 2 Hz by QEMU; actual intervals retained",
+    "resource counters exclude VM overhead",
+    "not yet qualified across full-length tasks"
+  ],
+  "web_source": {
+    "repo": "https://github.com/Task-Web/OSWorld-web",
+    "tag": "v2026.08.08",
+    "commit": "90ec2218f7747b15fe5117cdbe59b8978446ab9c",
+    "deployed": false
+  },
+  "source_sha256": {
+    "apps/computer_use/qw3_computer/app.py": "db8e902c87bf6243ac43af50bcc0116faeb2c142908a5e6893874985ddcf5a9f",
+    "apps/computer_use/tests/test_controller.py": "cef2776828d36a4c7c23ab33ee5e9dfbeb6692feb524128783b504d47abe911a",
+    "apps/computer_use/pack_windows_client.py": "54c92672389025fbea194fed3274b638483ea7f4bb2bd6a256b81b3f81bc6a93",
+    "apps/computer_use/vm/record_console.py": "27d092a9d7215a7dc6727e1fe5428b8b7cca058509457f60827eb139f3d7d821",
+    "apps/computer_use/vm/qualify_recording.py": "2213c764dfb70a1dee8fe89d97a77c1d09292c487ce4ab4c9587087f0d079e17",
+    "apps/computer_use/vm/vnc_admin.py": "8ecafde699aef14c519c28dd9a6cc6bebfef5cc1d43d6c2e9ddff72077354921"
+  },
+  "pending": [
+    "GIMP and WPS install and first-run verification",
+    "allowlisted office app launches, bounded drag and keyboard actions",
+    "long context policy qualification",
+    "continue-on-task-failure scheduler",
+    "private site deployment",
+    "ten initializers and independent graders",
+    "new qualified frozen snapshot",
+    "20 baseline runs and evidence-based optimization"
+  ]
+}

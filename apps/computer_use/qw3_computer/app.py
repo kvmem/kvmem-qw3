@@ -18,7 +18,14 @@ from .desktop import Desktop, DesktopError, DesktopRejected, mcp_observation
 
 
 class Controller:
-    def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False):
+    def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False,
+                 tool_call_limit=100, output_policy="outputs"):
+        if type(tool_call_limit) is not int or not 1 <= tool_call_limit <= 10000:
+            raise ValueError("Tool-call limit must be an integer between 1 and 10000")
+        if output_policy not in ("outputs", "task"):
+            raise ValueError("Output policy must be outputs or task")
+        self.tool_call_limit = tool_call_limit
+        self.output_policy = output_policy
         self.runtime = Path(runtime).resolve()
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.desktop = desktop
@@ -31,7 +38,9 @@ class Controller:
         token_file.write_text(self.token)
         token_file.chmod(0o600)
         self.state_path = self.runtime / "task.json"
-        self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {"status": "idle"}
+        self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {
+            "status": "idle", "tool_calls_used": 0, "tool_call_limit": tool_call_limit,
+            "output_policy": output_policy}
         if self.state["status"] in ("starting", "running", "verifying", "paused"):
             self.state["status"] = "paused"
             self.state["notice"] = "应用已重新启动。请核对当前桌面后继续。"
@@ -41,7 +50,6 @@ class Controller:
         self.client = None
         self.consume_task = None
         self.bridge = None
-        self.action_count = 0
         self.control_lock = asyncio.Lock()
         self.save()
 
@@ -53,6 +61,15 @@ class Controller:
     def snapshot(self):
         return self.state | {"ready": self.ready, "observation": self.desktop.latest,
                              "uncertain_actions": self.desktop.unresolved(), "desktop_paused": self.desktop.paused}
+
+    def budget_remaining(self):
+        used, limit = self.state.get("tool_calls_used"), self.state.get("tool_call_limit")
+        if (type(used) is not int or type(limit) is not int or
+                not 0 <= used <= limit <= 10000 or limit < 1):
+            # Older clients did not persist this count. Guessing it would grant
+            # a fresh budget to a partly executed task after an app upgrade.
+            raise DesktopError("任务缺少有效的累计调用记录，请停止旧任务后新建任务。")
+        return limit - used
 
     async def start(self):
         await self.desktop.start()
@@ -131,9 +148,10 @@ class Controller:
             if self.desktop.unresolved():
                 await self.desktop.control("resume", acknowledge_uncertain)
                 await self.desktop.control("pause")
-            self.action_count = 0
             self.state = {"id": uuid.uuid4().hex, "prompt": prompt, "status": "starting",
-                          "messages": [], "files": [], "started_at": time.time(), "current_action": None}
+                          "messages": [], "files": [], "started_at": time.time(), "current_action": None,
+                          "tool_calls_used": 0, "tool_call_limit": self.tool_call_limit,
+                          "output_policy": self.output_policy}
             self.desktop.task_id = self.state["id"]
             self.save()
             try:
@@ -142,7 +160,8 @@ class Controller:
                 self.state["thread_id"] = await self.client.new_thread()
                 description = json.dumps({k: v for k, v in observation.items() if k != "image"}, ensure_ascii=False)
                 text = prompt + "\n\nInitial desktop observation (coordinates use screenshot pixels):\n" + description
-                text += "\nSave requested test deliverables inside C:\\Qw3Computer\\outputs."
+                if self.state["output_policy"] == "outputs":
+                    text += "\nSave requested test deliverables inside C:\\Qw3Computer\\outputs."
                 self.state["turn_id"] = await self.client.turn(self.state["thread_id"], text,
                                                                ["data:image/png;base64," + observation["image"]])
                 if self.state["status"] == "starting":
@@ -163,6 +182,8 @@ class Controller:
             if command == "resume":
                 if self.state["status"] != "paused":
                     raise DesktopError("只有暂停的任务可以继续。")
+                if self.budget_remaining() == 0:
+                    raise DesktopError("任务调用额度已用尽；暂停或重启不会重置额度。")
                 try:
                     await self.desktop.control("resume", acknowledge_uncertain)
                     observation = await self.desktop.observe()
@@ -173,7 +194,6 @@ class Controller:
                     text += "Do not blindly repeat any interrupted action. Current observation:\n"
                     text += json.dumps({k: v for k, v in observation.items() if k != "image"})
                     self.state.update(status="starting", notice="", draft="")
-                    self.action_count = 0
                     self.save()
                     self.state["turn_id"] = await self.client.turn(self.state["thread_id"], text,
                                                                    ["data:image/png;base64," + observation["image"]])
@@ -199,15 +219,24 @@ class Controller:
             return self.snapshot()
 
     async def tool(self, name, arguments):
-        if self.state["status"] == "running":
-            self.action_count += 1
-            if self.action_count > 100:
-                await self.control("pause")
-                raise DesktopError("Tool-call limit reached; task paused for review")
+        if name not in ("observe", "act"):
+            raise DesktopError("Unknown desktop tool")
+        exhausted = False
+        async with self.control_lock:
+            if self.state["status"] == "running":
+                exhausted = self.budget_remaining() == 0
+                if not exhausted:
+                    # Reserve before dispatch, including rejected/failed calls.
+                    # Counts survive pause, resume and process restart.
+                    self.state["tool_calls_used"] += 1
+                else:
+                    self.state["notice"] = "任务调用额度已用尽，请核对当前结果。"
+                self.save()
+        if exhausted:
+            await self.control("pause")
+            raise DesktopError("Tool-call limit reached; task paused for review")
         if name == "observe":
             return mcp_observation(await self.desktop.observe())
-        if name != "act":
-            raise DesktopError("Unknown desktop tool")
         if self.state["status"] != "running":
             raise DesktopError("Task is not running; wait for user resume")
         self.state["current_action"] = arguments.get("action")
@@ -327,7 +356,8 @@ async def run(args):
     if args.backend_token and not token:
         raise ValueError("Backend token file is empty")
     controller = Controller(args.runtime, desktop, args.backend, args.port, backend_token=token,
-                            trace_backend=args.trace_backend)
+                            trace_backend=args.trace_backend, tool_call_limit=args.tool_call_limit,
+                            output_policy=args.output_policy)
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
         await runner.setup()
@@ -353,6 +383,10 @@ def main():
     parser.add_argument("--desktop-token", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--trace-backend", action="store_true", help="Tag QW3 requests for retrieval diagnostics")
+    parser.add_argument("--tool-call-limit", type=int, default=100,
+                        help="Lifetime observe/act budget for new tasks; resume keeps the saved budget")
+    parser.add_argument("--output-policy", choices=("outputs", "task"), default="outputs",
+                        help="Use the legacy outputs folder hint or only the task's own path instructions")
     try:
         asyncio.run(run(parser.parse_args()))
     except KeyboardInterrupt:
