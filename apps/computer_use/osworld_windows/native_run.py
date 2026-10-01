@@ -24,10 +24,11 @@ from .scenarios import IMPLEMENTED, SITES, collection, prepare as prepare_task, 
 from .sites import Site
 from .source import ROOT, sha256
 
-DEFAULT_SNAPSHOT = 'qw3-osworld-pdf-20261002'
+DEFAULT_SNAPSHOT = 'qw3-osworld-images-20261002'
 SNAPSHOT_QUALIFICATIONS = {
     'qw3-osworld-clean-20261002': 'baseline-clean-qualification-01/roundtrip-result.json',
-    DEFAULT_SNAPSHOT: 'pdf-handler-qualification-01/roundtrip-result.json',
+    'qw3-osworld-pdf-20261002': 'pdf-handler-qualification-01/roundtrip-result.json',
+    DEFAULT_SNAPSHOT: 'image-handler-qualification-01/roundtrip-result.json',
 }
 
 def snapshot_qualification(app, name):

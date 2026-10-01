@@ -109,7 +109,7 @@ class CampaignTests(unittest.IsolatedAsyncioTestCase):
     def test_restore_qualification_belongs_to_selected_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             app = Path(temporary)
-            path = app / '.runtime/pdf-handler-qualification-01/roundtrip-result.json'
+            path = app / '.runtime/image-handler-qualification-01/roundtrip-result.json'
             path.parent.mkdir(parents=True)
             for result in [dict(passed=False, snapshot=DEFAULT_SNAPSHOT), dict(passed=True, snapshot='some-other-base')]:
                 path.write_text(json.dumps(result))

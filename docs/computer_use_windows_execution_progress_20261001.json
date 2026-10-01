@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-01T22:39:05.973373+00:00",
+  "updated_at": "2026-10-01T23:14:30.769285+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -239,10 +239,12 @@
     "apps/computer_use/tests/test_relay_evidence.py": "ad67a394192be7b1228242f5858292ba9e29675618141d3ee69fdb3838417dce",
     "apps/computer_use/tests/test_task006.py": "25db045bab6f400a931c034b338de00b5f432a4cf356e5485ab9dd4fc613523b",
     "apps/computer_use/osworld_windows/mirror006.py": "9256de6ae7eb1a24424456093e4cdef966eb6f6fe58e5da405c94e3c2796f4aa",
-    "apps/computer_use/osworld_windows/prepare006.py": "58b261e1f037b68d905e60fe99b04ee6462e13697b2f26af0367366a77adeadb"
+    "apps/computer_use/osworld_windows/prepare006.py": "58b261e1f037b68d905e60fe99b04ee6462e13697b2f26af0367366a77adeadb",
+    "apps/computer_use/osworld_windows/native_run.py": "652697e54d6c3e32c4851329dbf2832990c218902897f88f05655ac19edc3936",
+    "apps/computer_use/tests/test_osworld_campaign.py": "b1ddfd9f91a1908e4d051b6e239b29a7e1f3111513c0cbde520bc6f5d7b18cc0"
   },
   "pending": [
-    "Qualify default JPG/PNG/JPEG handling with neutral images after the 051 OpenWith blocker; preserve current snapshot and failed run",
+    "Complete remaining common platform and task preparation; JPG/PNG/JPEG snapshot restoration and same-budget 051 actual-model retest have passed platform checks, while task remains incomplete",
     "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
     "Complete 022 remaining four account UI downloads; preserve partial 035 real-QW3 handoff and full scripted four-review qualification separately",
     "Mirror private-site fonts and dynamic decorative assets; 65 avatar images are frozen and decoded, candidate not deployed",
@@ -1602,6 +1604,16 @@
       "also_observed_in_model_task": "080",
       "candidate": "Verify foreground after launching an application and resolve the target window before acting",
       "v1_implemented": false
+    },
+    "additional_051_evidence": {
+      "path": "apps/computer_use/.runtime/osworld-image-handler-model-qualification-01/osworld-native051-on-02/failure-analysis.json",
+      "scope_rejections_before": 52,
+      "scope_rejections_after": 0,
+      "both_final_artifacts_missing": true,
+      "candidate": "Inventory source/target roles once; verify document identity after opening or switching before editing; evaluate file-navigation shortcuts generically",
+      "gimp_accessibility_exposes_only_window_controls_in_reviewed_observations": true,
+      "v1_selected": false,
+      "not_kvmem_comparison": true
     }
   },
   "native_scenario_campaign": {
@@ -1740,6 +1752,26 @@
         "actions": 55,
         "video_seconds": 206.766117817,
         "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native051-on-01/result.json"
+      },
+      {
+        "run": "osworld-native051-on-02",
+        "task": "051",
+        "kvmem": "on",
+        "pipeline_passed": true,
+        "status": "timed_out",
+        "formal_run": false,
+        "task_seconds": 180.3686109,
+        "strict_success": false,
+        "inference_requests": 40,
+        "actions": 26,
+        "actions_completed": 26,
+        "scope_rejections": 0,
+        "video_seconds": 207.28147832,
+        "evidence": "apps/computer_use/.runtime/osworld-image-handler-model-qualification-01/osworld-native051-on-02/result.json",
+        "failure_analysis": "apps/computer_use/.runtime/osworld-image-handler-model-qualification-01/osworld-native051-on-02/failure-analysis.json",
+        "compared_prior_run": "osworld-native051-on-01",
+        "same_timeout_seconds": 180,
+        "scope": "Common platform image handler correction, not V1 or KVMem effect"
       }
     ],
     "automatic_continuation_after_timeout_verified": true,
@@ -1791,7 +1823,7 @@
       ],
       "note": "022 model preflight timed out with valid collection; 035 failed before native launch because its manifest lacked instruction; failure preserved and adapter corrected"
     },
-    "default_snapshot": "qw3-osworld-pdf-20261002",
+    "default_snapshot": "qw3-osworld-images-20261002",
     "dynamic_preflight_queue": {
       "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/result.json",
       "status": "halted",
@@ -1872,6 +1904,61 @@
     "deployed": false,
     "fonts_and_dynamic_fallbacks_pending": true,
     "decode_checks_passed": 65,
-    "decode_evidence": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/candidate/decode-qualification.json"
+    "decode_evidence": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/candidate/decode-qualification.json",
+    "fonts_candidate": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/font-candidate/manifest.json",
+    "font_files_frozen": 19,
+    "note": "65 avatars and 19 original font files are frozen, not deployed; calendar dynamic decorative fallbacks remain pending",
+    "font_decode_checks_passed": 19,
+    "font_decode_evidence": "apps/computer_use/.runtime/osworld-offline-assets-inventory-01/font-candidate/decode-qualification.json"
+  },
+  "image_default_clean_base": {
+    "snapshot": "qw3-osworld-images-20261002",
+    "qualified": true,
+    "formal_run": false,
+    "model_used": false,
+    "evidence": "apps/computer_use/.runtime/image-handler-qualification-01/roundtrip-result.json",
+    "retained_prior_snapshots": [
+      "qw3-osworld-clean-20261002",
+      "qw3-osworld-pdf-20261002"
+    ],
+    "handlers": {
+      ".png": "GIMP3.png",
+      ".jpg": "GIMP3.jpg",
+      ".jpeg": "GIMP3.jpeg",
+      ".pdf": "MSEdgePDF"
+    },
+    "checks": {
+      "neutral_marker_absent_after_restore": true,
+      "all_four_handlers_survive_restore": true,
+      "ordinary_images_open_in_gimp": true,
+      "ordinary_pdf_opens_in_edge": true,
+      "all_four_executor_actions_accepted": true,
+      "final_snapshot_restored_clean": true
+    },
+    "executor_allowlist_unchanged": true,
+    "cleanup_evidence": "apps/computer_use/.runtime/image-handler-qualification-01/cleanup-manifest.json",
+    "cleanup_archive_sha256": "285120f462a2e38326c447bb4e718a70a95faba2bd024576207f9c09887c5ce6",
+    "scope": "Common platform correction before formal V0; neutral files only; no agent strategy optimization or KVMem effect claim",
+    "preserved_qualification_failure": "Initial JPG title validator expected the extension, but GIMP omits it; fixed probe uses distinct stems and all four restore proofs passed",
+    "model_retest": {
+      "run": "osworld-native051-on-02",
+      "task": "051",
+      "kvmem": "on",
+      "pipeline_passed": true,
+      "status": "timed_out",
+      "formal_run": false,
+      "task_seconds": 180.3686109,
+      "strict_success": false,
+      "inference_requests": 40,
+      "actions": 26,
+      "actions_completed": 26,
+      "scope_rejections": 0,
+      "video_seconds": 207.28147832,
+      "evidence": "apps/computer_use/.runtime/osworld-image-handler-model-qualification-01/osworld-native051-on-02/result.json",
+      "failure_analysis": "apps/computer_use/.runtime/osworld-image-handler-model-qualification-01/osworld-native051-on-02/failure-analysis.json",
+      "compared_prior_run": "osworld-native051-on-01",
+      "same_timeout_seconds": 180,
+      "scope": "Common platform image handler correction, not V1 or KVMem effect"
+    }
   }
 }
