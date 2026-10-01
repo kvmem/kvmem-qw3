@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-01T23:14:30.769285+00:00",
+  "updated_at": "2026-10-01T23:22:27.051033+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -241,12 +241,13 @@
     "apps/computer_use/osworld_windows/mirror006.py": "9256de6ae7eb1a24424456093e4cdef966eb6f6fe58e5da405c94e3c2796f4aa",
     "apps/computer_use/osworld_windows/prepare006.py": "58b261e1f037b68d905e60fe99b04ee6462e13697b2f26af0367366a77adeadb",
     "apps/computer_use/osworld_windows/native_run.py": "652697e54d6c3e32c4851329dbf2832990c218902897f88f05655ac19edc3936",
-    "apps/computer_use/tests/test_osworld_campaign.py": "b1ddfd9f91a1908e4d051b6e239b29a7e1f3111513c0cbde520bc6f5d7b18cc0"
+    "apps/computer_use/tests/test_osworld_campaign.py": "b1ddfd9f91a1908e4d051b6e239b29a7e1f3111513c0cbde520bc6f5d7b18cc0",
+    "apps/computer_use/osworld_windows/qualify022_downloads_guest.py": "43bc0f9c3c0c647c7d09c11d5c2ebc2d2e6be0f4e9f57dff8bca78e1874c853b"
   },
   "pending": [
     "Complete remaining common platform and task preparation; JPG/PNG/JPEG snapshot restoration and same-budget 051 actual-model retest have passed platform checks, while task remains incomplete",
     "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
-    "Complete 022 remaining four account UI downloads; preserve partial 035 real-QW3 handoff and full scripted four-review qualification separately",
+    "Keep scripted four-review 035 platform qualification separate from actual QW3 failure; freeze dynamic event rules and disclose 022 nonrequired broken links",
     "Mirror private-site fonts and dynamic decorative assets; 65 avatar images are frozen and decoded, candidate not deployed",
     "Complete 043 source-conflict disclosures and 051 full process audit when an artifact could pass; retain failures as failures",
     "Freeze common model/engine/history/budgets and qualified clean snapshot before formal comparisons",
@@ -1131,7 +1132,7 @@
     "022": {
       "model_test_completed": false,
       "snapshot_frozen": false,
-      "reset_roundtrip_validated": false,
+      "reset_roundtrip_validated": true,
       "fixture": "apps/computer_use/.runtime/osworld-022-materials-02",
       "fixture_manifest_sha256": "44287f57e9b04d9890b27d65e7d7dd19f1cd7dbfd5fa104d18064a3d9922827d",
       "local_pdfs": 87,
@@ -1143,7 +1144,7 @@
       "public_account_urls_adapted_to_guest_loopback": true,
       "grader_cases_passed": 24,
       "grader_evidence": "apps/computer_use/.runtime/osworld-022-grader-02/result.json",
-      "six_guest_loopback_sites_running": true,
+      "six_guest_loopback_sites_running": false,
       "debug_port_guest_loopback_only": true,
       "known_answer_upload_submission_passed": true,
       "known_answer_original_score": 1.0,
@@ -1170,11 +1171,9 @@
         "apps/computer_use/.runtime/osworld-022-qual-03/download-result.json"
       ],
       "remaining": [
-        "Validate remaining four account UI download paths",
-        "Fresh per-attempt snapshot and restore roundtrip",
-        "Bind initializer, collector and scorer to native campaign driver"
+        "Freeze common V0 engine/history/budgets and scenario manifest before paired model tests"
       ],
-      "shared_clean_base": "qw3-osworld-clean-20261002",
+      "shared_clean_base": "qw3-osworld-images-20261002",
       "qualification_answers_isolated_in_base": true,
       "real_model_preflight": {
         "formal_run": false,
@@ -1187,7 +1186,30 @@
         "evidence": "apps/computer_use/.runtime/osworld-web-qualification-01/osworld-web022-on-01/result.json",
         "failure_analysis": "apps/computer_use/.runtime/osworld-web-qualification-01/osworld-web022-on-01/failure-analysis.json",
         "platform_gap": "OpenWith PDF default-application confirmation causes nine scope rejections; qualify a new Edge-default clean base before formal freeze"
-      }
+      },
+      "remaining_account_ui_downloads": {
+        "passed": true,
+        "formal_run": false,
+        "model_used": false,
+        "evidence": "apps/computer_use/.runtime/osworld-022-download-qualification-03/result.json",
+        "account_count": 4,
+        "downloads": 7,
+        "original_hashes_match": true,
+        "final_clean_restore": true,
+        "method": "CDP reads visible browser controls and sends mouse/keyboard events; ordinary browser downloads, no direct PDF fetching or state injection",
+        "computer_mcp_trajectory": false,
+        "not_proof_of_model_completion": true,
+        "preserved_failed_attempts": [
+          "apps/computer_use/.runtime/osworld-022-download-qualification-01/result.json",
+          "apps/computer_use/.runtime/osworld-022-download-qualification-02/result.json"
+        ],
+        "source_link_inventory": "apps/computer_use/.runtime/osworld-022-download-qualification-03/link-inventory.json",
+        "missing_nonrequired_tax_links": 4,
+        "missing_link_materials_unchanged": true
+      },
+      "reset_evidence": "apps/computer_use/.runtime/osworld-022-download-qualification-03/result.json",
+      "driver_bound_and_native_preflight_verified": true,
+      "six_guest_loopback_sites_qualified": true
     },
     "035": {
       "model_test_completed": false,
