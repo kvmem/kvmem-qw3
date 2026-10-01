@@ -1,0 +1,330 @@
+{
+  "kind": "completed_paired_live_archive_comparison",
+  "reviewed_at": 1790828350.5021029,
+  "comparison_completed": true,
+  "all_tasks_passed": false,
+  "evidence_consistent": true,
+  "binary_sha256": "9f1d15152189cc4b4f42530cd762eff0ebeac2089b6f725c70e6f74e13625cbf",
+  "source_repair_commit": "1fb9dbb",
+  "run_paths": {
+    "on": "apps/computer_use/.runtime/windows-long-on-07",
+    "off": "apps/computer_use/.runtime/windows-long-off-07"
+  },
+  "matched_controls": {
+    "on_off_labels": true,
+    "same_source_hashes": true,
+    "same_binary": true,
+    "same_launcher": true,
+    "same_snapshot": true,
+    "same_deadline": true,
+    "same_model": true,
+    "same_vision-model": true,
+    "same_dflash-model": true,
+    "same_ctx": true,
+    "same_kv-dtype": true,
+    "same_speculative-method": true,
+    "same_prefill-chunk": true
+  },
+  "aggregates": [
+    {
+      "kvmem": "on",
+      "task_passed": true,
+      "task_seconds": 416.09174174722284,
+      "task_error": null,
+      "inference_requests": 81,
+      "request_statuses": {
+        "completed": 81
+      },
+      "completed_inference_seconds_median": 3.660951445810497,
+      "completed_inference_seconds_p95": 7.327722883783281,
+      "max_completed_prompt_tokens": 258992,
+      "sampled_gpu_peak_bytes": 49526341632,
+      "engine_rss_high_water_bytes": 43153608704
+    },
+    {
+      "kvmem": "off",
+      "task_passed": false,
+      "task_seconds": 901.086665048264,
+      "task_error": "TimeoutError('Live archive task deadline exceeded')",
+      "inference_requests": 41,
+      "request_statuses": {
+        "cancelled": 1,
+        "completed": 40
+      },
+      "completed_inference_seconds_median": 20.328373732976615,
+      "completed_inference_seconds_p95": 42.86063140549231,
+      "max_completed_prompt_tokens": 128005,
+      "sampled_gpu_peak_bytes": 72664219648,
+      "engine_rss_high_water_bytes": 34388099072
+    }
+  ],
+  "retained_evidence_audit": {
+    "kind": "terminal_live_archive_pair_audit",
+    "passed": false,
+    "evidence_consistent": true,
+    "comparison_checks": {
+      "on_off_labels": true,
+      "same_source_hashes": true,
+      "same_binary": true,
+      "same_launcher": true,
+      "same_snapshot": true,
+      "same_deadline": true,
+      "same_model": true,
+      "same_vision-model": true,
+      "same_dflash-model": true,
+      "same_ctx": true,
+      "same_kv-dtype": true,
+      "same_speculative-method": true,
+      "same_prefill-chunk": true
+    },
+    "trials": [
+      {
+        "directory": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-07",
+        "kvmem": "on",
+        "passed": true,
+        "evidence_consistent": true,
+        "reported_passed": true,
+        "elapsed_seconds": 416.09174174722284,
+        "error": null,
+        "evidence_hashes": {
+          "summary.json": "cef6decd952d1409e81a7a8240c7116d1fb58052ef6523ef9501ea360e7599d0",
+          "task/result.json": "40ccedf540576dba6ca71f53536a9c3291a1e710353c8a3e6148cdcdf5dd93f6",
+          "app/task.json": "9cf750039ef7c27c46bcc672d0829b511057d7e636a6e9da6a2babe09946c44b",
+          "engine/manifest.json": "fc768b43d82d4e655110ec784b7c85dd5b23435c278cb3d3eda0fb0928c22d1a"
+        },
+        "action_counts": {
+          "completed": 80
+        },
+        "dflash": {
+          "drafted": 18196,
+          "accepted": 10727,
+          "fallback_requests": 0
+        },
+        "sampled_gpu_peak_bytes": 49526341632,
+        "engine_rss_high_water_bytes": 43153608704,
+        "history": {
+          "request_directory": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-on-07/app/inference/a05c1e2fd43d47aa8c0fae23b2493290",
+          "prompt_tokens": 252987,
+          "backend_trace_tag": "a05c1e2fd43d47aa8c0fae23b2493290",
+          "image_count": 79,
+          "unique_image_url_hashes": 79,
+          "all_prior_images_preserved": true,
+          "unique_prior_images": 78,
+          "reference_absent_from_prior_text": true
+        },
+        "retrieval": {
+          "type": "meta",
+          "schema_version": "qw3_kvmem_retrieval_dump.v2",
+          "seq": 31,
+          "trace_tag": "a05c1e2fd43d47aa8c0fae23b2493290",
+          "block_count": 1977,
+          "selected": 1018,
+          "query_begin": 2518,
+          "query_end": 4205,
+          "context_begin": 0,
+          "context_end": 0,
+          "prompt_tokens": 252987,
+          "budget_blocks": 1024,
+          "prefill_budget_blocks": 1024,
+          "recent": 82,
+          "sink": 11,
+          "block_tokens": 128,
+          "method": "mean-k",
+          "mask": -1,
+          "scorer_requested": "sub-block-mean-k-max",
+          "scorer_used": "sub-block-mean-k-max",
+          "scorer_fallback_reason": "none",
+          "query_expected": 1687,
+          "query_captured": 53,
+          "qc_total_blocks": 1977,
+          "qc_captured_blocks": 1977,
+          "trace_event": 0,
+          "trace_events": 0,
+          "index_ready": 1,
+          "query_ready": 1,
+          "immutable_source_k": 1
+        },
+        "file_sha256": "da215048cb633ff2b47051629299f45ffc52084165b3368cf65e03c0673b10be"
+      },
+      {
+        "directory": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-long-off-07",
+        "kvmem": "off",
+        "passed": false,
+        "evidence_consistent": true,
+        "reported_passed": false,
+        "elapsed_seconds": 901.086665048264,
+        "error": "TimeoutError('Live archive task deadline exceeded')",
+        "evidence_hashes": {
+          "summary.json": "05a6aec1123e1c2721213b237028164879cc0ca9fc543820d6be055a9c7e26f9",
+          "task/result.json": "b59cd0c661ac41dcc7711d5694ad934570f7a0ef74f062747c939dfd93ab12b9",
+          "app/task.json": "2b491bc9f02f410aba5c13ddb485eb5051e116a9671b5df31394fee2e44dffa0",
+          "engine/manifest.json": "3f3f7a6d81e0d0a5700c8a76a5e46517fdddbe76f29bcb1d540cbd8cacbf3034"
+        },
+        "action_counts": {
+          "completed": 39
+        },
+        "dflash": {
+          "drafted": 8766,
+          "accepted": 5188,
+          "fallback_requests": 0
+        },
+        "sampled_gpu_peak_bytes": 72664219648,
+        "engine_rss_high_water_bytes": 34388099072
+      }
+    ],
+    "scope": "Live trajectories may differ. KVMem on includes prefix reuse; off does not. Retained evidence audit, not a new desktop action or statistical reliability claim."
+  },
+  "on_detail_document": "docs/computer_use_windows_long_on_07_20261001.json",
+  "off_visual_review": {
+    "kind": "retained_dense_deadline_visual_review",
+    "reviewed_at": 1790828350.5017474,
+    "path": "apps/computer_use/.runtime/windows-long-off-07/app/desktop/screenshots/7aed1734d0346473214a0fa61e76e025474591ce22ba773bdae5a09bdd414ccb.png",
+    "sha256": "7aed1734d0346473214a0fa61e76e025474591ce22ba773bdae5a09bdd414ccb",
+    "visible_page": 18,
+    "total_pages": 36,
+    "review_checkbox_checked": false,
+    "page_confirmation_not_yet_completed": true,
+    "result_file_count": 0,
+    "scope": "Final retained paused screenshot, visually reviewed. Page 18 is ready for review; its checkbox is unchecked and no output file is recorded."
+  },
+  "off_instruction_compliance": {
+    "opening_reference_repeated_in_assistant_messages": true,
+    "message_indexes": [
+      5
+    ],
+    "scope": "Off violated the no-intermediate-transcription instruction before its timeout. Its later history would contain textual evidence. Off did not reach the final reference query, so no historical-image recall success is claimed. On independently passed reference-absent-from-prior-text audit."
+  },
+  "phase_audits": {
+    "on": {
+      "kind": "serialized_native_request_phase_audit",
+      "passed": true,
+      "analyzer_sha256": "8b721ebc70c3f04e428eaff5d9fc7c23d4f119ee6aeb6720c43205580f541469",
+      "engine_log_sha256": "ea9b2791ead56880a909facff4967342be2bcacfe5c6da71008dabaac07183cc",
+      "scopes": [
+        "Server phases include HTTP preprocessing and response emission.",
+        "Native phases are nested within server engine time.",
+        "Query-replay events are nested timings, not additional total time.",
+        "Validation includes vision preparation; pure vision time is unavailable in this log."
+      ],
+      "requests": 81,
+      "incomplete_requests": 0,
+      "bridge_correlated": true,
+      "trace_tag_matched_requests": 81,
+      "terminal_statuses": {
+        "success": 81
+      },
+      "successful_request_medians_ms": {
+        "server_total_ms": 3622.645986,
+        "server_preprocess_ms": 352.098841,
+        "server_queue_ms": 0.400767,
+        "server_engine_ms": 3213.126488,
+        "server_response_ms": 0.349229,
+        "server_sum_ms": 3622.645986,
+        "server_error_ms": 0.0,
+        "server_pre_json_ms": 73.16054,
+        "server_pre_validate_ms": 144.863868,
+        "server_pre_render_ms": 0.469361,
+        "server_pre_tokenize_ms": 34.183126,
+        "server_pre_span_setup_ms": 109.383157,
+        "server_pre_sum_ms": 352.098841,
+        "server_pre_error_ms": 0.0,
+        "native_total_ms": 3206.512399,
+        "native_setup_ms": 24.56013,
+        "native_prefill_ms": 1521.20433,
+        "native_postprefill_ms": 0.002974,
+        "native_decode_ms": 1666.824439,
+        "native_finalize_ms": 23.426394,
+        "native_sum_ms": 3206.512399,
+        "native_error_ms": 0.0,
+        "native_post_semantic_ms": 3e-05,
+        "native_post_query_replay_ms": 0.0,
+        "native_post_query_probe_ms": 0.0,
+        "native_post_guided_query_ms": 0.0,
+        "native_post_guided_prompt_ms": 0.0,
+        "native_post_guided_decode_ms": 0.0,
+        "native_post_guided_state_ms": 0.0,
+        "native_post_other_ms": 0.002925,
+        "ttft_server_ttft_ms": 1917.508357,
+        "ttft_engine_ttft_ms": 1531.21074,
+        "ttft_response_ttft_ms": 1917.630983,
+        "ttft_request_total_ms": 3622.645986
+      },
+      "complete_phase_coverage": true
+    },
+    "off": {
+      "kind": "serialized_native_request_phase_audit",
+      "passed": true,
+      "analyzer_sha256": "8b721ebc70c3f04e428eaff5d9fc7c23d4f119ee6aeb6720c43205580f541469",
+      "engine_log_sha256": "d1dbe0c481981e4122872541fe5388c5c30a524fca492521e40d14467319d67a",
+      "scopes": [
+        "Server phases include HTTP preprocessing and response emission.",
+        "Native phases are nested within server engine time.",
+        "Query-replay events are nested timings, not additional total time.",
+        "Validation includes vision preparation; pure vision time is unavailable in this log."
+      ],
+      "requests": 41,
+      "incomplete_requests": 1,
+      "bridge_correlated": true,
+      "trace_tag_matched_requests": 0,
+      "terminal_statuses": {
+        "log_incomplete": 1,
+        "success": 40
+      },
+      "successful_request_medians_ms": {
+        "server_total_ms": 20309.3707455,
+        "server_preprocess_ms": 190.0687635,
+        "server_queue_ms": 0.304451,
+        "server_engine_ms": 20122.946075,
+        "server_response_ms": 0.3524585,
+        "server_sum_ms": 20309.3707455,
+        "server_error_ms": 0.0,
+        "server_pre_json_ms": 56.154002500000004,
+        "server_pre_validate_ms": 112.3116615,
+        "server_pre_render_ms": 0.31054950000000003,
+        "server_pre_tokenize_ms": 22.601152499999998,
+        "server_pre_span_setup_ms": 0.6018955,
+        "server_pre_sum_ms": 190.0687635,
+        "server_pre_error_ms": 0.0,
+        "native_total_ms": 20116.541758500003,
+        "native_setup_ms": 0.35539299999999996,
+        "native_prefill_ms": 18804.6864095,
+        "native_postprefill_ms": 0.000771,
+        "native_decode_ms": 1428.682961,
+        "native_finalize_ms": 0.4564055,
+        "native_sum_ms": 20116.541758500003,
+        "native_error_ms": 0.0,
+        "native_post_semantic_ms": 0.0,
+        "native_post_query_replay_ms": 0.0,
+        "native_post_query_probe_ms": 0.0,
+        "native_post_guided_query_ms": 0.0,
+        "native_post_guided_prompt_ms": 0.0,
+        "native_post_guided_decode_ms": 0.0,
+        "native_post_guided_state_ms": 0.0,
+        "native_post_other_ms": 0.000771,
+        "ttft_server_ttft_ms": 18993.305981999998,
+        "ttft_engine_ttft_ms": 18807.216593999998,
+        "ttft_response_ttft_ms": 18993.435222,
+        "ttft_request_total_ms": 20309.3707455
+      },
+      "complete_phase_coverage": false
+    }
+  },
+  "limits": [
+    "One live trial per policy; no statistical speedup or reliability claim. On includes prefix reuse, off does not. Live action trajectories and inputs differ; frozen prefix-disabled controls are separate.",
+    "On completed all 36 pages and exact 363-byte output in 416.092s, with zero rejected actions or checkpoint misses. All 41 above-budget requests reused history.",
+    "Off reached page 18, unchecked, and produced no output before the unchanged 900s deadline; 901.087s includes stop overhead. It also transcribed the opening reference into an intermediate assistant message.",
+    "Off has 40 complete requests plus one deadline-cancelled request lacking terminal timing. Phase consistency passed; full phase coverage did not. Dense correlation uses serial order and exact tokens, not native tags.",
+    "Long-task client/model run on Linux with a Windows VM desktop. Native Windows core trials retain their original engine005 identity. Sampled whole-device GPU and engine RSS exclude VM/client scopes as documented."
+  ],
+  "artifacts": {
+    "apps/computer_use/.runtime/windows-long-pair-07-audit.json": "63d573c56e1c9461f7901ccfce19d651673c2307fbe5b29a71bbefd94d887cef",
+    "apps/computer_use/.runtime/windows-long-pair-07-timings/summary.json": "096301d2ecd0dedd43551ef9ae8c4d27f948e5cec49749306a2b7f9db2172e34",
+    "apps/computer_use/.runtime/windows-long-pair-07-timings/requests.csv": "fb5e6bfcc50a3fbdea2deb2491919659e14fcee330e37360ecc08ac4eec5e19b",
+    "apps/computer_use/.runtime/archive-phase-on-07/result.json": "dd287ac25ba02e649d1a5b768d0bcbb29f69d5051af2b8b03fa6828d016c7cfe",
+    "apps/computer_use/.runtime/archive-phase-off-07/result.json": "fc182cfe5d911c19928c2ca903012624f5d7b9c210eb6a10768b7dcdcce96540",
+    "apps/computer_use/.runtime/windows-long-off-07/task/result.json": "b59cd0c661ac41dcc7711d5694ad934570f7a0ef74f062747c939dfd93ab12b9",
+    "apps/computer_use/.runtime/windows-long-off-07/summary.json": "05a6aec1123e1c2721213b237028164879cc0ca9fc543820d6be055a9c7e26f9",
+    "apps/computer_use/.runtime/windows-long-off-07/visual-review.json": "fcfa25eeadcba3f207186c0e708fadfe871f89c3dce25f1d7247f890320b5d96"
+  },
+  "next": "Finish engine9f six-profile short/long fixed controls; preserve original engine005 native evidence."
+}

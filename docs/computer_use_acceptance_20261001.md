@@ -4,7 +4,7 @@ Status: **active; not a completion certificate**. Windows VM functionality and
 both fixed-input decoder matrices are qualified for baseline engine `005654a6...`.
 Its long live comparison is complete: KVMem on passed; off timed out. Checkpoint
 repair has passed its first real long desktop task; the matching off-policy run
-and new-engine fixed controls are still running. Mac and physical hardware
+timed out at the same deadline. New-engine fixed controls are still running. Mac and physical hardware
 acceptance remain open. Standalone vision timing, the Windows process-identity
 probe and a fresh native resource pair have passed.
 
@@ -37,8 +37,8 @@ The workspace now contains candidate engine `9f1d1515...` from `1fb9dbb`. It
 passes 44 CPU and three targeted policy/CUDA checks. Its 50-request prefix and
 eight seed/long visual checks also passed; that supervisor is terminal.
 `qw3-computer-guided-live-01.service` now runs fresh real archive on/off tasks
-and fixed-input controls. The new on-policy task passed; its completed result
-is recorded separately below. The earlier measurements belong to engine
+and fixed-input controls. The new live pair is complete: on passed and off
+timed out. Its results are recorded separately below. The earlier measurements belong to engine
 `005654a6...`, retained in `guided-boundary-candidate/qw3-baseline-005`.
 
 Independent analysis and documentation commits occurred during the frozen
@@ -127,7 +127,7 @@ The independent offline audit can be reproduced with
 `scripts/computer_use_long_control_audit.py`; the report records all input,
 engine, output and retrieval identities.
 
-## Boundary repair: first real desktop result
+## Boundary repair: completed live on/off comparison
 
 The [new on-policy archive](computer_use_windows_long_on_07_20261001.json)
 passed in **416.09s**, with all 36 pages, 80 completed actions, no rejections or
@@ -145,8 +145,20 @@ was 1.918s median / 4.477s p95; screenshot-to-action latency was 3.942s median /
 The prior guided on-policy run took 820.16s and had four stale-observation
 rejections. These are single live runs with different model trajectories;
 use the separate matched 50-request replay for controlled latency evidence.
-The new off-policy task and six-profile fixed controls are still running.
-[All 81 request phases](computer_use_windows_long_on_07_phases_20261001.csv).
+The [matching off-policy task](computer_use_windows_long_pair_07_20261001.json)
+hit the same 900s deadline (901.09s including stop overhead), with 39 completed
+actions and no rejections or unresolved receipts. Its final paused screenshot
+shows page 18/36, unchecked; no result file was produced. It also repeated the
+opening reference in an intermediate assistant message, violating the task's
+instruction. No successful historical-image recall is claimed for that run.
+
+The paired identities and retained evidence are consistent. On/off sampled
+whole-device GPU peaks were 46.125/67.674 GiB. Off has 40 complete model requests
+and one deadline-cancelled request without terminal timing; its phase audit
+passes consistency, with incomplete coverage. The six-profile fixed controls
+remain running.
+[All 122 paired requests](computer_use_windows_long_requests_07_20261001.csv);
+[all 81 on-policy phases](computer_use_windows_long_on_07_phases_20261001.csv).
 
 ## Remaining work and retained failures
 
@@ -162,7 +174,8 @@ The new off-policy task and six-profile fixed controls are still running.
    and total elapsed67.393s to6.897s. The
    [eight visual checks](computer_use_guided_visual_02_20261001.json) also pass.
    The new on-policy real desktop task also passed, with zero checkpoint misses
-   or rejected actions. Matched off-policy and fixed controls are running. Keep the replay
+   or rejected actions. Matched off-policy comparison is complete with a normal
+   deadline failure; fixed controls are running. Keep the replay
    alignment guard and 60s observation lifetime.
 2. **Native-client resource attribution repaired:** [defect and repair](computer_use_native_resource_attribution_20261001.json).
    The [native probe](computer_use_native_resource_probe_20261001.json) passed
