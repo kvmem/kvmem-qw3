@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T04:46:47.611795+00:00",
+  "updated_at": "2026-10-02T05:22:16.677466+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -247,9 +247,9 @@
   "pending": [
     "Complete remaining common platform and task preparation; JPG/PNG/JPEG snapshot restoration and same-budget 051 actual-model retest have passed platform checks, while task remains incomplete",
     "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
-    "Keep scripted four-review 035 platform qualification separate from actual QW3 failure; freeze dynamic event rules and disclose 022 nonrequired broken links",
+    "Keep scripted four-review 035 platform qualification separate from actual QW3 failure; dynamic event rules and 022 nonrequired broken links are frozen in the adaptation contract",
     "Qualify actual-model near-1M context/compaction and choose a disclosed common history policy; native Windows interruption control-plane passed with scripted inference; then freeze model/engine/history/budgets",
-    "Complete 043 source-conflict disclosures and 051 full process audit when an artifact could pass; retain failures as failures",
+    "043 source-conflict handling is disclosed; complete 051 full process audit when an artifact could pass; retain failures as failures",
     "Freeze common model/engine/history/budgets and qualified clean snapshot before formal comparisons",
     "20 V0 on/off baseline runs; diagnose; at most two generic candidates; V1 comparison and conditional repetition"
   ],
@@ -1215,7 +1215,8 @@
       },
       "reset_evidence": "apps/computer_use/.runtime/osworld-022-download-qualification-03/result.json",
       "driver_bound_and_native_preflight_verified": true,
-      "six_guest_loopback_sites_qualified": true
+      "six_guest_loopback_sites_qualified": true,
+      "adaptation_contract": "docs/computer_use_windows_task_adaptations_20261002.json"
     },
     "035": {
       "model_test_completed": false,
@@ -1291,7 +1292,9 @@
         "first_batch_pixel_exposure_seconds": 9.859681528,
         "second_batch_notification_pixel_exposure_seconds": 15.536539071,
         "full_message_visibility_or_understanding_not_claimed": true
-      }
+      },
+      "adaptation_contract": "docs/computer_use_windows_task_adaptations_20261002.json",
+      "dynamic_schedule_frozen": true
     },
     "043": {
       "model_test_completed": false,
@@ -1318,9 +1321,7 @@
         "Original score ignores finite recurrence/guest integrity and permits five-minute changes to protected events"
       ],
       "remaining": [
-        "Freeze disclosed handling of source constraint conflicts without claiming full business success",
-        "Fresh task snapshot and restore roundtrip",
-        "Wire initializer, collector and grading into native campaign"
+        "Freeze common V0 engine/history/budgets and scenario manifest before paired model tests"
       ],
       "preserved_failures": [
         "apps/computer_use/.runtime/osworld-043-qual-01",
@@ -1341,7 +1342,10 @@
         "actions": 32,
         "video_seconds": 205.688152342,
         "evidence": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native043-on-01/result.json"
-      }
+      },
+      "adaptation_contract": "docs/computer_use_windows_task_adaptations_20261002.json",
+      "source_conflict_handling_disclosed": true,
+      "driver_bound_and_native_preflight_verified": true
     }
   },
   "latest_preparation_source": "This commit; source identities are recorded above. V0 remains unfrozen.",
@@ -2200,10 +2204,52 @@
     "earlier_visual_only_hypothesis_not_supported": true,
     "gpu_oom_observed": false,
     "off_long_context_diagnostic_completed": false,
-    "host_services_stopped": true,
+    "host_services_stopped": false,
     "desktop_paused": true,
     "audit_unit_controls_passed": 4,
     "report": "docs/computer_use_windows_long_context_boundary_20261002.md",
-    "preview_url": "http://127.0.0.1:18089/long-context/index.html"
+    "preview_url": "http://127.0.0.1:18089/long-context/index.html",
+    "repair_progress": {
+      "status": "fixed_engine_replay_passed_native_compaction_retest_running",
+      "candidate_commit": "78cce09",
+      "cold_control": {
+        "directory": "apps/computer_use/.runtime/long-context-cold-control-01",
+        "same_binary_as_original": true,
+        "source_request_bytes_unchanged": true,
+        "prefix_reuse": "off",
+        "prompt_tokens": 316743,
+        "completed": true,
+        "seconds": 167.22948350198567,
+        "scope": "Engine replay only; no native Codex or desktop tool dispatch"
+      },
+      "fixed_replay": "apps/computer_use/.runtime/long-context-fixed-replay-01",
+      "cpu_checks_passed": [
+        "qw3-kvmem-prefix-reuse-policy",
+        "qw3-kvmem-request-plan"
+      ],
+      "near_1m_qualified": false,
+      "default_history_policy_changed": false,
+      "native_client_changed": false,
+      "common_platform_fix_not_v1": true,
+      "original_binary_retained": "apps/computer_use/.runtime/long-context-engine-v0-01/qw3",
+      "fixed_replay_completed": true,
+      "fixed_replay_requests": 6,
+      "all_replay_token_counts_match_original": true,
+      "native_retest": "apps/computer_use/.runtime/native-long-context-fixed-on-01/long-context-on-03",
+      "native_retest_state": "running",
+      "original_sixth_request_resolved": true
+    }
+  },
+  "task_adaptation_contract": {
+    "version": 1,
+    "path": "docs/computer_use_windows_task_adaptations_20261002.json",
+    "sha256": "8e42108d6034dd2d6dbca573dbb14b64315632662606046d3c97b0971b5442db",
+    "scope": [
+      "022",
+      "035",
+      "043"
+    ],
+    "common_v0_frozen": false,
+    "qualification_evidence_bound": true
   }
 }

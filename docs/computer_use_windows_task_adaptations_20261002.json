@@ -1,0 +1,110 @@
+{
+  "kind": "windows_task_adaptation_contract",
+  "version": 1,
+  "date": "2026-10-02",
+  "scope": [
+    "022",
+    "035",
+    "043"
+  ],
+  "formal_run": false,
+  "common_v0_frozen": false,
+  "model_success_claimed": false,
+  "paired_conditions_identical_required": true,
+  "tasks": {
+    "022": {
+      "source_sha256": "4ee7db1c15776f64e5cf520f89d5a4d15e64c0a236ec4e9b80f4c85ed3fac4b2",
+      "implementation_sha256": {
+        "materials022.py": "bcbeb01d97bf376368eb3bf97a2151756779547577fdde619bec682d3c552677",
+        "prepare022.py": "4796d877d1670f3d8224af4358f000a63ebff9f02e0edd58866785d7b716446d",
+        "task022.py": "aa549464508c61cd2ae2a89003a15e4e0060fe73d495fff3c02617ddfe2f50ca"
+      },
+      "evidence_sha256": {
+        "apps/computer_use/.runtime/osworld-022-materials-02/manifest.json": "44287f57e9b04d9890b27d65e7d7dd19f1cd7dbfd5fa104d18064a3d9922827d",
+        "apps/computer_use/.runtime/osworld-022-download-qualification-03/link-inventory.json": "69b2b074ab52de79866b5ee5b4e8f300b1dbfac1b4a2db34e3068a52f301aea8",
+        "apps/computer_use/.runtime/osworld-022-download-qualification-03/result.json": "a1c35b36c2c9ccca802fb96653b7b3644e98f1c7ead4ba064240402226790648"
+      },
+      "material_manifest_sha256": "44287f57e9b04d9890b27d65e7d7dd19f1cd7dbfd5fa104d18064a3d9922827d",
+      "required_documents": 23,
+      "required_material_hashes_present": true,
+      "missing_links": [
+        {
+          "page": "tradepro/dashboard.html",
+          "href": "data/TradePro_1099DIV_2025.pdf",
+          "exists": false
+        },
+        {
+          "page": "tradepro/dashboard.html",
+          "href": "data/TradePro_1099B_2025.pdf",
+          "exists": false
+        },
+        {
+          "page": "tradepro/dashboard.html",
+          "href": "data/TradePro_1099DIV_2024.pdf",
+          "exists": false
+        },
+        {
+          "page": "tradepro/dashboard.html",
+          "href": "data/TradePro_1099B_2024.pdf",
+          "exists": false
+        }
+      ],
+      "missing_link_count": 4,
+      "public_material_bytes_modified": false
+    },
+    "035": {
+      "source_sha256": "a46d1ab1a4b6c5f9cce841352c93dc14b32371b2deae61c48018b905794e2577",
+      "implementation_sha256": {
+        "events035.py": "2f30a5cb1165096f0ce74955230efcc0d1bacb3d314947ef3927e9ed4fc44284",
+        "prepare035.py": "8642e611a28719fde340e546fe4eeb8f7211e49958a656b6856127f6a7607cf5",
+        "task035.py": "edbfbb2ec800e58958cc3ebcf25d17bf11431409b2b015e9751530182778e249"
+      },
+      "evidence_sha256": {
+        "apps/computer_use/.runtime/osworld-035-events-01/result.json": "7997145fa486b6405a6080523f8d6d4441962961cfb205a8eb0fd37e436767f5",
+        "apps/computer_use/.runtime/osworld-035-qual-01/native-preparation-result.json": "5811b1a9f89600b5d24aae52fe53283a09816a652e5491c2915fab44a6c3a244",
+        "apps/computer_use/.runtime/native-driver-qual-02/result.json": "5927bfbdb7904b4db6d65e2c163a0fbed9965eae9049695b94d67cdf13b62bea",
+        "apps/computer_use/.runtime/osworld-native-remaining-qualification-01/osworld-web035-on-02/result.json": "57f317ed86d094723a2b9197349b4d2a763120cfd5aa60e2e5b736bcdaddab37"
+      },
+      "schedule_version": 1,
+      "schedule_sha256": "82246768fe015ba62ad10b3ed66740de905aedf494659dd1bff4a8f6e93dce01",
+      "trigger": "identified_completed_review_turn_with_paused_desktop",
+      "batch_counts": [
+        21,
+        1,
+        1
+      ],
+      "business_month": "2025-12",
+      "message_clock_anchor": "2025-12-23T10:00:00+00:00",
+      "wall_clock_schedule_reproduced": false,
+      "same_thread_and_lifetime_budget": true,
+      "original_remote_judge_reproduced": false,
+      "actual_qw3_preflight_passed": false
+    },
+    "043": {
+      "source_sha256": "dc92942d7d9717f00b198f25907bdd47deef2fca645094e5b25cc0f1b21f91e0",
+      "implementation_sha256": {
+        "prepare043.py": "0ecb8178149b3ae1c6d15af35f92efb63c36342c7bc8a6843cb29e32d4bdbc43",
+        "task043.py": "a1946bb3fed6a4d7514ee1fd7382287f38b58769187fa2742e2b2328ffe92229"
+      },
+      "evidence_sha256": {
+        "apps/computer_use/.runtime/osworld-043-grader-02/result.json": "b857726692eb64aa25c64c06113641d23c22f679f6a696b81e18d16fdfbc835e",
+        "apps/computer_use/.runtime/osworld-043-grader-01/constraint-audit.json": "b1225a36e2822612e98bdd8e77789c5e8516e4921cee0e0249bf01d98e5c1081",
+        "apps/computer_use/.runtime/osworld-043-qual-02/native-edit-result.json": "e1ac30380307e3de937a46c3b2f93d28780919763a681cfa023a248b43086b9d",
+        "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native043-on-01/result.json": "98ddba98f99e1a2e65d0641252a2999a0e2798a3be1004ed0fb78d21588cb320"
+      },
+      "original_score_preserved": true,
+      "structural_and_business_results_separate": true,
+      "normal_hours_diagnostic": [
+        9,
+        18
+      ],
+      "normal_hours_precisely_given_by_original_task": false,
+      "attendee_conflicts": [
+        "M06",
+        "M19"
+      ],
+      "strict_business_positive_qualified": false,
+      "source_requirements_relaxed": false
+    }
+  }
+}

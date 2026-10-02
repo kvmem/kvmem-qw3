@@ -32,7 +32,7 @@ async def run(args):
     output.mkdir(parents=True, exist_ok=False)
     report = dict(kind="immutable_native_input_engine_control", formal_run=False, tools_dispatched=False,
         source=str(source), original_engine=json.loads((source.parent / "engine/manifest.json").read_text()),
-        prefix_reuse=args.prefix_reuse, requests=[], passed=False, status="starting",
+        kvmem=args.kvmem, prefix_reuse=args.prefix_reuse, requests=[], passed=False, status="starting",
         source_commit=None, script_sha256=sha256(Path(__file__)))
     proc = sampler = None
     stopped = asyncio.Event()
@@ -40,9 +40,11 @@ async def run(args):
         (output / "result.json").write_text(json.dumps(report, indent=2))
     environment = dict(os.environ, PYTHONPATH=str(ROOT / "apps/computer_use"))
     try:
-        argv = [sys.executable, ROOT / "apps/computer_use/run_engine.py", "--kvmem", "on",
-                "--guided-refresh", "both", "--visual-history", "pin-all", "--trace-retrieval",
+        argv = [sys.executable, ROOT / "apps/computer_use/run_engine.py", "--kvmem", args.kvmem,
+                "--guided-refresh", "both" if args.kvmem == "on" else "off", "--visual-history", "pin-all",
                 "--prefix-reuse", args.prefix_reuse, "--run-dir", output / "engine"]
+        if args.kvmem == "on":
+            argv.append("--trace-retrieval")
         report["command"] = list(map(str, argv))
         inputs = []
         for number in range(args.first, args.last + 1):
@@ -109,6 +111,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--kvmem", choices=("on", "off"), default="on")
     parser.add_argument("--prefix-reuse", choices=("auto", "off"), default="off")
     parser.add_argument("--first", type=int, default=6)
     parser.add_argument("--last", type=int, default=6)
