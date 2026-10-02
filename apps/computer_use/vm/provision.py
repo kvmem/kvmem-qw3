@@ -14,8 +14,8 @@ HMP = r'''
 import socket,time
 s=socket.socket(socket.AF_UNIX);s.settimeout(2);s.connect('/run/shm/monitor.sock');s.recv(4096)
 def key(name):
- s.sendall(('sendkey '+name+' 50\n').encode());time.sleep(.10);s.recv(8192)
-key('esc');key('meta_l-r');time.sleep(.5);key('ctrl-a')
+ s.sendall(('sendkey '+name+' 50\n').encode());time.sleep(.15);s.recv(8192)
+key('esc');key('meta_l-r');time.sleep(1.5);key('ctrl-a');time.sleep(.3)
 mapping={' ':'spc','-':'minus',':':'shift-semicolon','\\':'backslash','.':'dot'}
 for c in r'powershell -noprofile -executionpolicy bypass -file \\host.lan\data\admin-script.ps1':key(mapping.get(c,c))
 key('ret');time.sleep(1);s.close()

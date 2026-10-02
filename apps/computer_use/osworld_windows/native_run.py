@@ -36,6 +36,19 @@ SNAPSHOT_QUALIFICATIONS = {
     'qw3-osworld-client15-20261002': 'client15-baseline-qualification-01/roundtrip-result.json',
 }
 
+
+def runner_sources():
+    """Shared host source dependencies that must remain fixed across a queue."""
+    app = ROOT / 'apps/computer_use'
+    sources = list((app / 'osworld_windows').glob('*.py'))
+    sources += [app / 'vm' / name for name in ('run_native_task.ps1', 'record_console.py',
+        'model_relay.py', 'snapshot.py', 'archive_share.py', 'archive_runtime.py',
+        'client_resources.ps1', 'provision.py', 'vnc_admin.py')]
+    sources += [app / name for name in ('run_engine.py', 'windows_suite.py',
+        'compare_replay.py', 'collect_artifacts.py')]
+    return sources + [SITE_PLATFORM]
+
+
 def require_evidence_space(*paths):
     records = []
     for path in paths:
@@ -215,11 +228,7 @@ async def run(args):
                 raise ValueError('A model is already running')
             report['source_commit'] = (await command('git', 'rev-parse', 'HEAD')).strip()
             report['private_site_platform'] = await qualify_sites(command)
-            sources = list((app / 'osworld_windows').glob('*.py')) + [
-                app / ('vm/' + name) for name in ('run_native_task.ps1', 'record_console.py',
-                'model_relay.py', 'snapshot.py', 'archive_share.py', 'client_resources.ps1')]
-            sources.append(app / 'run_engine.py')
-            sources.append(SITE_PLATFORM)
+            sources = runner_sources()
             if args.task in CAPABILITY_TASKS:
                 sources += input_sources()
                 sources.append(app / 'capability_regrade.py')

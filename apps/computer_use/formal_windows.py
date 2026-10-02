@@ -96,9 +96,8 @@ def verify_sources(profile):
     if not bindings or str(Path(__file__).relative_to(ROOT)) not in bindings:
         raise ValueError('Freeze must include the formal enrollment implementation')
     app = ROOT / 'apps/computer_use'
-    required = list((app / 'osworld_windows').glob('*.py')) + [app / 'run_engine.py',
-        app / 'osworld_windows/offline_site_platform.json'] + [app / 'vm' / name for name in
-        ('run_native_task.ps1', 'record_console.py', 'model_relay.py', 'snapshot.py', 'archive_share.py', 'client_resources.ps1')]
+    from osworld_windows.native_run import runner_sources
+    required = runner_sources()
     if not {str(p.relative_to(ROOT)) for p in required}.issubset(bindings):
         raise ValueError('Freeze does not cover every source used by the shared pipeline')
     for path, digest in bindings.items():

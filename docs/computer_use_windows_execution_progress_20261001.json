@@ -2566,7 +2566,7 @@
     "business_task_rerun": false,
     "next_candidate": "retrievable visual history protects latest/task/query images; keeps other history available for selection",
     "heldout_task_policy": "Transport/capacity diagnosis only; no task-specific agent prompt or trajectory optimization",
-    "process_review_path": "/home/chaidi/qw3/apps/computer_use/.runtime/osworld-051-process-review-client15-01/package.json",
+    "process_review_path": "/home/chaidi/qw3/apps/computer_use/.runtime/osworld-051-process-review-client15-01/manifest.json",
     "recording_complete": true,
     "recording_duration_seconds": 785.3,
     "limitations": [
@@ -2581,13 +2581,19 @@
     "formal_counts_created": 0,
     "evidence": "Host controls and actual old launcher request bindings only; readiness certificates and V1 installation path still pending"
   },
-  "next_size_boundary_plan": "docs/computer_use_windows_capability_size_plan_04_20261002.json",
+  "next_size_boundary_plan": "docs/computer_use_windows_capability_size_plan_05_20261002.json",
   "current_v0_candidate_visual_history": "retrievable",
   "evidence_storage_preservation": "apps/computer_use/.runtime/gimp051-terminal-preservation-01/result.json",
   "size12_startup_failures_preserved": [
     "apps/computer_use/.runtime/size12-launch-01.json",
     "apps/computer_use/.runtime/windows-capability-size12-02/result.json",
-    "apps/computer_use/.runtime/windows-capability-size12-03/result.json"
+    "apps/computer_use/.runtime/windows-capability-size12-03/result.json",
+    "apps/computer_use/.runtime/windows-capability-size12-04/result.json"
   ],
-  "size12_current_status": "Pre-inference launcher allowlist fixed; next version to start from stopped owned VM"
+  "size12_current_status": "Neutral console input probe passed; next version pending launch",
+  "console_provision_input_probe": {
+    "path": "apps/computer_use/.runtime/provision-input-qualification-01-result.json",
+    "sha256": "23f084285795d6659cb5ec6503b9e866feea26a2faf94606fb2ab05bf91ac4a0",
+    "passed": true
+  }
 }

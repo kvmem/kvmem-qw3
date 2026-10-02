@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 from types import SimpleNamespace
 
-from .native_run import DEFAULT_SNAPSHOT, run as run_attempt
+from .native_run import DEFAULT_SNAPSHOT, runner_sources, run as run_attempt
 from .launch import connection_waits
 from .scenarios import validate_task
 from .source import ROOT, sha256
@@ -54,7 +54,7 @@ async def execute(plan, args, *, runner=run_attempt):
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     report = dict(kind='windows_native_integration_queue', formal_run=False,
                   plan=plan, status='running', completed_attempts=0, trials=[])
-    source_paths = list((ROOT / 'apps/computer_use/osworld_windows').glob('*.py'))
+    source_paths = runner_sources()
     if any(a['task'] in CAPABILITY_TASKS for a in plan['attempts']):
         source_paths += input_sources()
         source_paths.append(ROOT / 'apps/computer_use/capability_regrade.py')
