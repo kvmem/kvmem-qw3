@@ -16,6 +16,7 @@ from .launch import connection_waits
 from .scenarios import validate_task
 from .source import ROOT, sha256
 from .capabilities import TASKS as CAPABILITY_TASKS, INPUT_ROOT, input_sources
+from .capability_boundary import TASKS as BOUNDARY_TASKS, INPUT_ROOT as BOUNDARY_INPUT_ROOT
 
 
 def validate(plan):
@@ -60,6 +61,9 @@ async def execute(plan, args, *, runner=run_attempt):
         if (plan.get('public_inputs_manifest_sha256') is not None
                 and plan['public_inputs_manifest_sha256'] != sha256(INPUT_ROOT / 'manifest.json')):
             raise ValueError('Queue plan belongs to another public fixture corpus')
+        if any(a['task'] in BOUNDARY_TASKS for a in plan['attempts']):
+            if plan.get('boundary_inputs_manifest_sha256') != sha256(BOUNDARY_INPUT_ROOT / 'manifest.json'):
+                raise ValueError('Boundary queue needs the exact additional public corpus')
     sources = {p: sha256(p) for p in source_paths}
     report['source_sha256'] = {str(p.relative_to(ROOT)): value for p, value in sources.items()}
 

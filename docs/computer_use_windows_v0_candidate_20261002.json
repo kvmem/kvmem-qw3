@@ -1,6 +1,6 @@
 {
   "kind": "windows_ten_task_v0_candidate",
-  "version": 1,
+  "version": 2,
   "created_at": "2026-10-02T09:09:08.665721+00:00",
   "formal_run": false,
   "v0_frozen": false,
@@ -17,7 +17,7 @@
   "client_qualification_sha256": "bdf0a5d33cecafc5b051d51e04b2f9cf39be19f3e9e88851c8bd8696a1c26459",
   "snapshot": "qw3-osworld-client15-20261002",
   "qualified_parent_snapshot": "qw3-osworld-office-text-20261002",
-  "visual_history": "pin-all",
+  "visual_history": "retrievable",
   "backend_timeout_seconds": 1800,
   "backend_read_timeout_seconds": 1500,
   "heartbeat_seconds": 30,
@@ -53,8 +53,8 @@
   "host_source_sha256": {
     "apps/computer_use/osworld_windows/__init__.py": "9f6c33f6e61342c1f07a5724bc342bb9221ef4d0e60fb02cbb6d68140df4c9a8",
     "apps/computer_use/osworld_windows/analyze_relay.py": "a852bf0698e458cdf24f56ed695217b7e8d548de6c4c8800f57d343fd00aa961",
-    "apps/computer_use/osworld_windows/campaign.py": "fe5cb3c7f874bc15b678744ce103b612549837071320e49ddecb4769401ef2f1",
-    "apps/computer_use/osworld_windows/capabilities.py": "812f676336fa31be1379dbd958697e443e6528da7748409fc625b890844e7ac9",
+    "apps/computer_use/osworld_windows/campaign.py": "7f68565fe1686e7950c90926375ed1489400d9f071b9590547da16d2875fdeab",
+    "apps/computer_use/osworld_windows/capabilities.py": "5298d9889a99a545aa558af2483e928d33a29649143be385cc43b71dd0296baf",
     "apps/computer_use/osworld_windows/collect022_guest.py": "c33a4c7089638f473a72131c25f1d5d0a6ecbb718a14d4486a1e339a56c6db48",
     "apps/computer_use/osworld_windows/entries.py": "5b218c46f5d7496a21109d465c5f587c789b4dae189242326380760ca191e154",
     "apps/computer_use/osworld_windows/events035.py": "2f30a5cb1165096f0ce74955230efcc0d1bacb3d314947ef3927e9ed4fc44284",
@@ -65,7 +65,7 @@
     "apps/computer_use/osworld_windows/materials006.py": "f441529217550bb63334ff21eb7850f52eee02a801981c2fce0c28e5166f6e0c",
     "apps/computer_use/osworld_windows/materials022.py": "bcbeb01d97bf376368eb3bf97a2151756779547577fdde619bec682d3c552677",
     "apps/computer_use/osworld_windows/mirror006.py": "9256de6ae7eb1a24424456093e4cdef966eb6f6fe58e5da405c94e3c2796f4aa",
-    "apps/computer_use/osworld_windows/native_run.py": "e47d5e9a71a788a464ffc9bda06abeca1cbf9b76158d77a576eda773fd16cf61",
+    "apps/computer_use/osworld_windows/native_run.py": "b7ba133ef0e75b90e2d0d46959bf7b0b43d099b0c233f9532538503c66a78921",
     "apps/computer_use/osworld_windows/offline_sites.py": "8dd500ae7ac2f801d314d0502134c26b67caa26884f5332c0d14f89f23ec9d9b",
     "apps/computer_use/osworld_windows/preflight013.py": "4ea514fd05881077837eb72d7eb92f83153f6cd00a861d9ac1d03ac15a3229f2",
     "apps/computer_use/osworld_windows/prepare006.py": "58b261e1f037b68d905e60fe99b04ee6462e13697b2f26af0367366a77adeadb",
@@ -125,7 +125,10 @@
     "apps/computer_use/vm/record_console.py": "27d092a9d7215a7dc6727e1fe5428b8b7cca058509457f60827eb139f3d7d821",
     "apps/computer_use/vm/snapshot.py": "a0567c16d126e22db2244f5b77f8a9bf9a0b78225f273209a3725198487b8601",
     "apps/computer_use/vm/archive_share.py": "65d94794684313a05cfcf71d8bb3685263f2a9b135191f1fe2a45899b843cd77",
-    "apps/computer_use/vm/client_resources.ps1": "08ea5918132f4238830548c6d41b075cdb27c0fdcd95d03d6c272ea0199c6c3e"
+    "apps/computer_use/vm/client_resources.ps1": "08ea5918132f4238830548c6d41b075cdb27c0fdcd95d03d6c272ea0199c6c3e",
+    "apps/computer_use/formal_windows.py": "a5ace5f1a843268b3daf98c4097594c26837cb3f2764babfd7f38eb05b1e51c2",
+    "apps/computer_use/osworld_windows/capability_boundary.py": "2b26817a7807140307c15d9bd9e11dd6fc1f51e65f907d89f30eda1c031feb43",
+    "apps/computer_use/osworld_windows/offline_site_platform.json": "67c81bb3755af42dc874f66fe85ca4ce99de8b9e3d063f16e5ed9b6d7f91072e"
   },
   "attempts": [
     {
@@ -286,10 +289,21 @@
   "known_preflight_model_failures": {
     "off_native_compaction_summary_count": "16 actual observations reported as 17; original failure and 11/13 audit retained",
     "off_native_diagnostic_evidence": "apps/computer_use/.runtime/native-long-context-wait-off-01/long-context-off-01/failure-analysis.json",
-    "infrastructure_gate_scope": "The off near-1M gate covers measured compaction, restored tools, request receipts and owned engine exit. Model answer accuracy is separately failed and must be reported in subsequent trials; it is not a prerequisite to force positive answers."
+    "infrastructure_gate_scope": "The off near-1M gate covers measured compaction, restored tools, request receipts and owned engine exit. Model answer accuracy is separately failed and must be reported in subsequent trials; it is not a prerequisite to force positive answers.",
+    "on_original_051_backend_capacity": "Pin-all mandatory image history exceeded 131072 selection tokens at request115. Preserved raw result and exact replay; not a normal model task zero."
   },
   "snapshot_qualification_path": "apps/computer_use/.runtime/client15-baseline-qualification-01/roundtrip-result.json",
   "snapshot_qualification_sha256": "925cd1759b5324d25b0ec43c2b51c24673f06076fb069e1914bb33175beaae33",
   "actual_model_launcher_qualification_path": "apps/computer_use/.runtime/native-client-15-launch-qualification-01/result.json",
-  "actual_model_launcher_qualification_sha256": "7fe1ddd5b8e6e05da869132abcc8617162199a153fe0ff25e2d167596ffb5bab"
+  "actual_model_launcher_qualification_sha256": "7fe1ddd5b8e6e05da869132abcc8617162199a153fe0ff25e2d167596ffb5bab",
+  "previous_visual_history_candidate": {
+    "path": "apps/computer_use/.runtime/windows-v0-candidate-before-visual-policy-02.json",
+    "sha256": "ea3b2d227cccd180f909b30193c1750c9b309386efea2135cf5c986284e7fe02"
+  },
+  "visual_history_capacity_diagnostic": {
+    "path": "apps/computer_use/.runtime/gimp051-visual-budget-replay-01/result.json",
+    "sha256": "9fd9f00692aadcb06aeca7434d82f1871c9f3f7fac0900de0187e44602eac659",
+    "policy": "Common pre-freeze platform candidate; no agent V1 claim; pending native business checks",
+    "limits": "Replay connects directly to engine. Native client15 bridge and host relay still have 64 MiB HTTP body limits; end-to-end long visual-history qualification is pending. Size12 probes retain this client and expose any such failure."
+  }
 }

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from osworld_windows.campaign import execute, validate
-from osworld_windows.native_run import DEFAULT_SNAPSHOT, SNAPSHOT_QUALIFICATIONS, require_evidence_space, snapshot_qualification, terminal_status
+from osworld_windows.native_run import DEFAULT_SNAPSHOT, SNAPSHOT_QUALIFICATIONS, inference_failures, require_evidence_space, snapshot_qualification, terminal_status
 from osworld_windows.scenarios import collection, prepare, verify_collection
 from osworld_windows.source import sha256
 from osworld_windows.launch import connection_waits, prepare as prepare_launch, verify_wait_capability
@@ -136,6 +136,26 @@ class CampaignTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(terminal_status(report(success=True) | change)['queue_may_continue'])
         # A saved passing artifact at timeout is not an agent-completed run.
         self.assertEqual(terminal_status(report('time_limit', True))['status'], 'timed_out')
+
+    def test_backend_rejection_is_separate_from_gui_failure_and_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = []
+            for name, metrics in [('rejected', dict(status='http_error', http_status=413)),
+                    ('broken_stream', dict(status='failed', error='backend stream ended early')),
+                    ('deadline', dict(status='cancelled')), ('completed', dict(status='completed'))]:
+                path = Path(temporary) / name / 'metrics.json'
+                path.parent.mkdir()
+                path.write_text(json.dumps(metrics))
+                paths.append(path)
+            failures = inference_failures(paths)
+            self.assertEqual({f['request_id'] for f in failures}, {'rejected', 'broken_stream'})
+            failed = report('agent_failed') | dict(inference_failures=failures)
+            self.assertEqual(terminal_status(failed), dict(status='backend_failed', queue_may_continue=False))
+            self.assertEqual(terminal_status(report('agent_failed'))['status'], 'task_failed')
+            self.assertEqual(terminal_status(report('time_limit') | dict(inference_failures=failures))['status'], 'timed_out')
+            failed = report('agent_failed')
+            failed['native_result']['task']['terminal_observation'] = dict(turn_error=dict(codexErrorInfo=dict(httpConnectionFailed=dict(httpStatusCode=413))))
+            self.assertEqual(terminal_status(failed)['status'], 'backend_failed')
 
     def test_restore_qualification_belongs_to_selected_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:

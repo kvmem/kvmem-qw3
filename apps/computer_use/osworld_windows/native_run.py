@@ -67,6 +67,10 @@ def terminal_status(report):
         return dict(status='infra_invalid', queue_may_continue=False)
     if outcome in {'paused', 'paused_uncertain', 'interrupted'}:
         return dict(status='interrupted', queue_may_continue=False)
+    transport_error = task.get('terminal_observation', {}).get('turn_error', {}) or {}
+    if outcome == 'agent_failed' and (report.get('inference_failures')
+            or transport_error.get('codexErrorInfo', {}).get('httpConnectionFailed')):
+        return dict(status='backend_failed', queue_may_continue=False)
     if grade.get('grading_error') or not grade or grade.get('strict_success') is None:
         return dict(status='grading_failed', queue_may_continue=False)
     if outcome == 'time_limit':
@@ -80,6 +84,24 @@ def terminal_status(report):
     else:
         return dict(status='infra_invalid', queue_may_continue=False)
     return dict(status=status, queue_may_continue=True)
+
+
+def inference_failures(paths):
+    """Retain failed backend receipts separately from unsuccessful GUI work.
+
+    A cancelled request at the task deadline is an ordinary timeout. HTTP and
+    stream failures need investigation before launching another integration
+    attempt; neither a completed recording nor a zero artifact score explains
+    those transport/engine failures.
+    """
+    failures = []
+    for path in sorted(paths):
+        metrics = json.loads(path.read_text(encoding='utf-8-sig'))
+        if metrics.get('status') in {'http_error', 'failed'}:
+            failures.append(dict(request_id=path.parent.name, metrics_path=str(path),
+                **{key: metrics[key] for key in ('status', 'http_status', 'error',
+                    'elapsed_seconds', 'backend_trace_tag') if key in metrics}))
+    return failures
 
 
 async def collect_browser022(bundle, run_id, share, output, wait_json):
@@ -269,6 +291,7 @@ async def run(args):
                 await asyncio.to_thread(shutil.copytree, export, output / 'guest')
             metrics = list((output / 'guest/app/inference').glob('*/metrics.json'))
             report['inference_request_receipts'] = len(metrics)
+            report['inference_failures'] = inference_failures(metrics)
             if not native.get('desktop_stopped'):
                 raise RuntimeError('Desktop stop not acknowledged; no final state grading')
             for site in SITES.get(args.task, ()):

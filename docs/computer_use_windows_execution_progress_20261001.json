@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T10:31:01.166917+00:00",
+  "updated_at": "2026-10-02T11:18:11+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -2540,5 +2540,48 @@
     "all_file_hashes_modes_mtimes_verified": true,
     "original_paths_preserved": true,
     "trials_omitted": false
-  }
+  },
+  "current_native_client15_gimp_preflight_terminal": {
+    "kind": "original_material_051_backend_capacity_failure",
+    "formal_run": false,
+    "source_run": "/home/chaidi/qw3/apps/computer_use/.runtime/windows-client15-051-process-01/osworld-native051-client15-on-03",
+    "source_result_sha256": "9e47d8e4d1e0a4b69591943c5492d3f0948beb71b1f4cc351f0b131637de15ab",
+    "original_result_modified": false,
+    "original_status": "task_failed",
+    "classified_status": "backend_failed",
+    "model_business_failure_established": false,
+    "outcome": "agent_failed",
+    "elapsed_seconds": 747.2694756,
+    "tool_calls_used": 114,
+    "request_receipts": 115,
+    "artifact_saved": false,
+    "error": "multimodal mandatory spans exceed the KVMem active budget",
+    "pinned_tokens": 132096,
+    "budget_tokens": 131072,
+    "reproduction_path": "/home/chaidi/qw3/apps/computer_use/.runtime/gimp051-visual-budget-replay-01/result.json",
+    "reproduction_sha256": "9fd9f00692aadcb06aeca7434d82f1871c9f3f7fac0900de0187e44602eac659",
+    "same_archived_request_for_all_modes": true,
+    "prompt_changed": false,
+    "selection_budget_increased": false,
+    "business_task_rerun": false,
+    "next_candidate": "retrievable visual history protects latest/task/query images; keeps other history available for selection",
+    "heldout_task_policy": "Transport/capacity diagnosis only; no task-specific agent prompt or trajectory optimization",
+    "process_review_path": "/home/chaidi/qw3/apps/computer_use/.runtime/osworld-051-process-review-client15-01/package.json",
+    "recording_complete": true,
+    "recording_duration_seconds": 785.3,
+    "limitations": [
+      "No final.xcf and no successful task completion demonstrated.",
+      "Replay did not execute desktop actions.",
+      "Cold single-request timings are not a reliability or speed conclusion."
+    ]
+  },
+  "formal_dispatch_prototype": {
+    "implemented": true,
+    "qualified": false,
+    "formal_counts_created": 0,
+    "evidence": "Host controls and actual old launcher request bindings only; readiness certificates and V1 installation path still pending"
+  },
+  "next_size_boundary_plan": "docs/computer_use_windows_capability_size_plan_20261002.json",
+  "current_v0_candidate_visual_history": "retrievable",
+  "evidence_storage_preservation": "apps/computer_use/.runtime/gimp051-terminal-preservation-01/result.json"
 }

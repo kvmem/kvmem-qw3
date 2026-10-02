@@ -10,8 +10,10 @@ import re
 import shutil
 
 from .source import ROOT, sha256
+from . import capability_boundary as boundary
 
-TASKS = tuple(f'cap{i:02d}' for i in range(1, 11))
+BASIC_TASKS = tuple(f'cap{i:02d}' for i in range(1, 11))
+TASKS = BASIC_TASKS + boundary.TASKS
 INPUT_ROOT = ROOT / 'apps/computer_use/fixtures/windows_capability'
 DESKTOP = 'C:\\Users\\Qw3Test\\Desktop\\'
 OUTPUTS = 'C:\\Qw3Computer\\outputs\\'
@@ -66,6 +68,8 @@ DEFINITIONS = {
 
 
 def files(task):
+    if task in boundary.TASKS:
+        return boundary.files(task)
     if task == 'cap09':
         folder = DESKTOP + 'CapFiles\\'
         return [(name, folder + relative) for name, relative in [
@@ -82,6 +86,8 @@ def files(task):
 
 def public_inputs(task, directory):
     """Generate inputs, never completed artifacts or host grading code."""
+    if task in boundary.TASKS:
+        return boundary.public_inputs(task, directory)
     directory.mkdir()
     if task == 'cap02':
         (directory / 'draft.txt').write_text('Project note\nOwner: Mei\nStatus: Draft\nHours: 6\n')
@@ -126,7 +132,7 @@ def input_sources():
     manifest = INPUT_ROOT / 'manifest.json'
     index = json.loads(manifest.read_text())
     if (index.get('host_expected_outputs_included') is not False
-            or set(index.get('tasks', {})) != set(TASKS)):
+            or set(index.get('tasks', {})) != set(BASIC_TASKS)):
         raise ValueError('Invalid public fixture corpus')
     sources = [manifest]
     for members in index['tasks'].values():
@@ -141,10 +147,12 @@ def input_sources():
             if sha256(path) != digest:
                 raise ValueError('Public fixture changed: ' + task + '/' + relative)
             sources.append(path)
-    return sources
+    return sources + boundary.input_sources()
 
 
 def prepare(task, run, output, bundle=None):
+    if task in boundary.TASKS:
+        return boundary.prepare(task, run, output, bundle)
     if task not in TASKS or not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}', run):
         raise ValueError('Invalid capability attempt')
     output = Path(output); output.mkdir(parents=True, exist_ok=False)
@@ -201,6 +209,8 @@ def formula(value):
 
 
 def grade(task, artifacts):
+    if task in boundary.TASKS:
+        return boundary.grade(task, artifacts)
     artifacts = Path(artifacts)
     target = artifacts / DEFINITIONS[task][2]
     checks = {'output_saved': target.is_file()}

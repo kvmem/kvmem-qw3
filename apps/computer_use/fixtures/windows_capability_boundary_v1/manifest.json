@@ -1,0 +1,12 @@
+{
+  "kind": "public_capability_size_boundary_inputs_v1",
+  "host_expected_outputs_included": false,
+  "tasks": {
+    "cap11": {
+      "order12.xlsx": "d7b4dafb3846be93e3c92d1091593ada4e8de3ad775c1e41ff392d883b79fbe0"
+    },
+    "cap12": {
+      "sales12.xlsx": "67ce620d988f0a018c3ed8c35cfa6a100a677afc89550624de59454a7fe0c5b1"
+    }
+  }
+}
