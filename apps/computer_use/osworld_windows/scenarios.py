@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 
 from .source import ROOT, sha256
+from .capabilities import TASKS as CAPABILITY_TASKS
 
 TASKS = ('013', '004', '006', '010', '038', '022', '035', '043', '080', '051')
-IMPLEMENTED = tuple(task for task in TASKS if task != '006')
+IMPLEMENTED = tuple(task for task in TASKS if task != '006') + CAPABILITY_TASKS
 FIXTURE022 = ROOT / 'apps/computer_use/.runtime/osworld-022-materials-02'
 DECODER051 = 'sha256:f49901b8ad84c5e151367d30f13cf9eb90921ef9e2bf4cb8ea20bc4d262346e6'
 DESKTOP = 'C:\\Users\\Qw3Test\\Desktop\\'
@@ -24,7 +25,7 @@ SITES = {'013': ('formcraft',), '038': ('cloudcrm', 'teamchat', 'mailhub'),
 
 
 def validate_task(task):
-    if task not in TASKS:
+    if task not in TASKS + CAPABILITY_TASKS:
         raise ValueError('Unknown scenario: ' + str(task))
     if task == '006':
         raise ValueError('006 is not executable: one original CV and its Windows adapter remain unresolved')
@@ -32,12 +33,18 @@ def validate_task(task):
 
 def collection(task):
     validate_task(task)
+    if task in CAPABILITY_TASKS:
+        from .capabilities import files
+        return {'files': [dict(name=name, source=source) for name, source in files(task)]}
     return {'files': [dict(name=name, source=source) for name, source in FILES.get(task, [])]}
 
 
 def prepare(task, run, output, bundle):
     validate_task(task)
-    if task == '004':
+    if task in CAPABILITY_TASKS:
+        from .capabilities import prepare as initializer
+        initializer(task, run, output, bundle)
+    elif task == '004':
         from .prepare_office import prepare as initializer
         initializer(task, run, output)
     elif task in {'051', '080'}:
@@ -92,6 +99,9 @@ def grade(task, directory):
     directory = Path(directory)
     artifacts = directory / 'guest/artifacts'
     verify_collection(task, artifacts)
+    if task in CAPABILITY_TASKS:
+        from .capabilities import grade as evaluator
+        return evaluator(task, artifacts)
     evaluator = importlib.import_module('.task' + task, __package__).grade
     if task in {'004', '080'}:
         return evaluator(artifacts / FILES[task][0][0])

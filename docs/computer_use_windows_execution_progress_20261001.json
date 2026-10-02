@@ -2033,5 +2033,29 @@
       "same_timeout_seconds": 180,
       "scope": "Common platform image handler correction, not V1 or KVMem effect"
     }
+  },
+  "capability_calibration": {
+    "priority": "User requested easier-to-harder tasks after zero complex-task preflight success",
+    "suite": "custom_capability_calibration",
+    "osworld_official_tasks": false,
+    "formal_run": false,
+    "definition": "apps/computer_use/osworld_windows/capabilities.py",
+    "first_batch_plan": "docs/computer_use_windows_capability_plan_20261002.json",
+    "status": "prepared",
+    "original_ten_task_results_preserved": true,
+    "formal_original_runs_completed": 0
+  },
+  "native_interruption_recovery": {
+    "qualified": true,
+    "formal_run": false,
+    "qw3_inference_used": false,
+    "scripted_backend": true,
+    "evidence": "apps/computer_use/.runtime/osworld-native-interruption-qualification-01/result.json",
+    "final_clean_restore": true,
+    "checks": [
+      "Incomplete tool arguments were cancelled without executing the partial action",
+      "Pause, owned client restart, same thread and persisted tool budget, resume and completion",
+      "Prior user prompt and completed action remained in resumed model history"
+    ]
   }
 }

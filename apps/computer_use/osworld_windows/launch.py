@@ -5,10 +5,11 @@ import re
 import shutil
 
 from .source import ROOT, sha256
+from .capabilities import TASKS as CAPABILITY_TASKS
 
 
 def prepare(task, run, prompt, collection, bundle, staged, output, *, timeout, tool_limit, backend):
-    if (task not in {'013','004','006','010','038','022','035','043','080','051'}
+    if (task not in {'013','004','006','010','038','022','035','043','080','051', *CAPABILITY_TASKS}
             or not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}',run) or not isinstance(prompt,str) or not prompt.strip()
             or type(timeout) is not int or not 1 <= timeout <= 14400
             or type(tool_limit) is not int or not 1 <= tool_limit <= 10000

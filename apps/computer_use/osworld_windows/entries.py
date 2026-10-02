@@ -5,13 +5,18 @@ from pathlib import Path
 import re
 
 from .source import sha256
+from .capabilities import TASKS as CAPABILITY_TASKS
 
 
 def configuration(task, run, manifest):
-    if task not in {'013', '004', '006', '010', '038', '022', '035', '043', '080', '051'}:
+    if task not in {'013', '004', '006', '010', '038', '022', '035', '043', '080', '051', *CAPABILITY_TASKS}:
         raise ValueError('Unknown task')
     if not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}', run) or manifest.get('run') != run or manifest.get('task') != task:
         raise ValueError('Entry configuration must belong to this attempt')
+    if task in CAPABILITY_TASKS:
+        if manifest.get('legacy_application_entries') is not True:
+            raise ValueError('Capability tasks require the qualified legacy fixture entries')
+        return dict(version=1, task=task, run=run, legacy=True)
     profile = r'C:\Qw3Computer\OsworldBrowserProfile'
     folder = r'C:\Users\Qw3Test\Desktop'
     urls = manifest.get('browser_urls') or ([manifest['browser_url']] if manifest.get('browser_url') else ['about:blank'])
@@ -35,6 +40,18 @@ def configuration(task, run, manifest):
 def prepare(task, run, manifest, output, staged):
     entry = configuration(task, run, manifest)
     output.mkdir(parents=True, exist_ok=False)
+    if task in CAPABILITY_TASKS:
+        script = r'''$ErrorActionPreference='Stop'
+$result=@{kind='task_application_entries';run='RUN_ID';passed=$false;legacy=$true}
+try {
+    if (Test-Path 'C:\Qw3Computer\application-entries.json') {throw 'Legacy fixture entries require a clean snapshot'}
+    $result.passed=$true
+} catch {$result.error=$_.Exception.ToString()}
+$result | ConvertTo-Json | Set-Content '\\host.lan\Data\RUN_ID-entry-result.json' -Encoding UTF8
+'''.replace('RUN_ID', run)
+        (output / 'install.ps1').write_text(script)
+        (output / 'configuration.json').write_text(json.dumps(entry, indent=2))
+        return entry
     source = staged / 'application-entries.json'
     with source.open('x', encoding='utf-8') as handle:
         json.dump(entry, handle, indent=2)
