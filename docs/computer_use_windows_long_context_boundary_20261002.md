@@ -100,7 +100,9 @@ plain 与 MTP 路径均采用此规则；两项相关 CPU 检查和构建通过�
 等待，并每 30 秒发送无用量、无工具输出的连接存活事件。总等待、读等待和取消
 仍有效；真实 Codex 接收重复事件、超时、取消及不重复执行工具已接入合同检查。
 打包仅携带此前已验证的原生运行检查，宿主机场景评分测试留在仓库中。
-候选还需 Windows 验证和真实长输入复测；未替换已验证客户端 13，不计为 V1 收益。
+候选客户端 14 已在 Linux 和 Windows 各通过 77 项运行合同检查，包含真实 Codex
+接收重复存活事件；推理后端为确定性脚本，不代表 QW3 长输入压缩已通过。
+还需真实长输入复测；未替换已验证客户端 13，也未保存新正式快照，不计为 V1 收益。
 
 ## 验收与后续
 
@@ -120,6 +122,8 @@ plain 与 MTP 路径均采用此规则；两项相关 CPU 检查和构建通过�
 - [关闭状态六条固定输入重放](/home/chaidi/qw3/apps/computer_use/.runtime/long-context-fixed-off-replay-01/result.json)
 - [同一批输入的开关比较](/home/chaidi/qw3/apps/computer_use/.runtime/long-context-fixed-input-comparison-01/summary.json)
 - [关闭状态 883K 输入控制](/home/chaidi/qw3/apps/computer_use/.runtime/long-context-off-883k-control-01/result.json)
+- [连接候选 Linux 合同检查](/home/chaidi/qw3/apps/computer_use/.runtime/transport-contract-linux-03/result.json)
+- [连接候选 Windows 合同检查](/home/chaidi/qw3/apps/computer_use/.runtime/windows-client-14-qualification-01/result.json)
 - [修复后原生复测恢复报告](/home/chaidi/qw3/apps/computer_use/.runtime/native-long-context-fixed-on-01/long-context-on-03/result.json)
 - [复测独立审计](/home/chaidi/qw3/apps/computer_use/.runtime/native-long-context-fixed-on-01/long-context-on-03/independent-grade.json)
 - [证据恢复说明](/home/chaidi/qw3/apps/computer_use/.runtime/native-long-context-fixed-on-01/long-context-on-03/recovery.json)

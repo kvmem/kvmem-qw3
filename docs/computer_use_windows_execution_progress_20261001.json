@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T06:16:30.955344+00:00",
+  "updated_at": "2026-10-02T06:40:32.615021+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -2261,7 +2261,7 @@
       "off_long_replay_is_not_native_compaction": true
     },
     "connection_liveness_candidate": {
-      "status": "linux_contracts_passed_windows_qualification_pending",
+      "status": "windows_contracts_passed_actual_model_compaction_retest_next",
       "linux_contracts": 77,
       "linux_evidence": "apps/computer_use/.runtime/transport-contract-linux-03/result.json",
       "default_backend_timeouts_changed": false,
@@ -2269,7 +2269,12 @@
       "v1_agent_strategy_change": false,
       "candidate_windows_bundle": "windows-native-client-14",
       "periodic_events_do_not_change_usage_or_release_partial_actions": true,
-      "real_codex_accepts_repeated_liveness_events": true
+      "real_codex_accepts_repeated_liveness_events": true,
+      "windows_contracts": 77,
+      "windows_evidence": "apps/computer_use/.runtime/windows-client-14-qualification-01/result.json",
+      "bundle_sha256": "9f5ab5a1feb284f656b15020010f1e432799368feec7fdb1c3e4257371a1f44d",
+      "native_windows_runtime_qualified": true,
+      "actual_model_compaction_qualified": false
     }
   },
   "task_adaptation_contract": {
