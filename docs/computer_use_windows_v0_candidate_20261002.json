@@ -274,7 +274,7 @@
     "model_byte_inventory": true,
     "actual_on_near_1m_compaction": true,
     "actual_off_near_1m_compaction_and_exit": true,
-    "full_extended_wait_application_launcher": false,
+    "full_extended_wait_application_launcher": true,
     "new_client_clean_snapshot_restore": true,
     "006_required_original_cv_available": false,
     "006_full_adapter_and_application_focus": false,
@@ -289,5 +289,7 @@
     "infrastructure_gate_scope": "The off near-1M gate covers measured compaction, restored tools, request receipts and owned engine exit. Model answer accuracy is separately failed and must be reported in subsequent trials; it is not a prerequisite to force positive answers."
   },
   "snapshot_qualification_path": "apps/computer_use/.runtime/client15-baseline-qualification-01/roundtrip-result.json",
-  "snapshot_qualification_sha256": "925cd1759b5324d25b0ec43c2b51c24673f06076fb069e1914bb33175beaae33"
+  "snapshot_qualification_sha256": "925cd1759b5324d25b0ec43c2b51c24673f06076fb069e1914bb33175beaae33",
+  "actual_model_launcher_qualification_path": "apps/computer_use/.runtime/native-client-15-launch-qualification-01/result.json",
+  "actual_model_launcher_qualification_sha256": "7fe1ddd5b8e6e05da869132abcc8617162199a153fe0ff25e2d167596ffb5bab"
 }

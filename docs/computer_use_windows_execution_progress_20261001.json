@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T10:16:41.091674+00:00",
+  "updated_at": "2026-10-02T10:28:11.930819+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -248,7 +248,7 @@
     "Complete remaining common platform and task preparation; JPG/PNG/JPEG snapshot restoration and same-budget 051 actual-model retest have passed platform checks, while task remains incomplete",
     "Complete 006 missing original availability and application focus qualification; original mirror/initializer and neutral folder export are now native-verified, with full scenario still unready",
     "Keep scripted four-review 035 platform qualification separate from actual QW3 failure; dynamic event rules and 022 nonrequired broken links are frozen in the adaptation contract",
-    "Actual-model KVMem on near-1M compaction and two-marker retention passed; off native readonly compaction and tools completed but summary counting failed (16 reported as 17); finish shared application/relay connection-profile qualification and common freeze",
+    "Actual-model KVMem on near-1M compaction and two-marker retention passed; off native readonly compaction and tools completed but summary counting failed (16 reported as 17); shared native client15 application/relay wait profile and clean snapshot now qualified; common formal freeze remains pending",
     "043 source-conflict handling is disclosed; complete 051 full process audit when an artifact could pass; retain failures as failures",
     "Freeze common model/engine/history/budgets and qualified clean snapshot before formal comparisons",
     "20 V0 on/off baseline runs; diagnose; at most two generic candidates; V1 comparison and conditional repetition"
@@ -1149,6 +1149,19 @@
         "from_scratch_positive_native_process_qualification_passed": false,
         "report": "docs/computer_use_windows_051_process_review_20261002.md",
         "host_queue_and_review_contract_evidence": "apps/computer_use/.runtime/host-preparation-contracts-02/result.json"
+      },
+      "full_budget_client15_process_preflight": {
+        "status": "planned",
+        "run": "osworld-native051-client15-on-03",
+        "formal_run": false,
+        "timeout_seconds": 3600,
+        "tool_call_limit": 500,
+        "backend_timeout_seconds": 1800,
+        "backend_read_timeout_seconds": 1500,
+        "snapshot": "qw3-osworld-client15-20261002",
+        "bundle": "windows-native-client-15",
+        "v1_agent_strategy_change": false,
+        "purpose": "Complete from-original-material process and final artifact evidence; any missing artifact or process violation stays failure; unknown process audit is disclosed separately"
       }
     },
     "022": {
@@ -2403,7 +2416,7 @@
     "new_error_path_native_requalification_pending": true
   },
   "formal_connection_profile_preparation": {
-    "status": "linux_and_windows_runtime_contracts_passed_full_launcher_and_clean_snapshot_pending",
+    "status": "runtime_contracts_clean_snapshot_and_actual_model_launcher_qualified",
     "app_source": "apps/computer_use/qw3_computer/app.py",
     "native_launch_source": "apps/computer_use/vm/run_native_task.ps1",
     "queue_source": "apps/computer_use/osworld_windows/campaign.py",
@@ -2424,7 +2437,7 @@
     "windows_evidence": "apps/computer_use/.runtime/windows-client-15-qualification-01/result.json",
     "native_windows_runtime_qualified": true,
     "new_clean_snapshot_created": true,
-    "actual_model_extended_wait_launcher_qualified": false,
+    "actual_model_extended_wait_launcher_qualified": true,
     "host_contract_tests": 23,
     "host_contract_evidence": "apps/computer_use/.runtime/host-preparation-contracts-03/result.json",
     "storage_guard_checks_output_share_and_vm_disk": true,
@@ -2454,7 +2467,7 @@
       "all_eight_default_associations_preserved": true
     },
     "actual_model_launcher_retests": {
-      "status": "planned",
+      "status": "passed_both_modes",
       "attempts": [
         "native-client-15-launch-on-02",
         "native-client-15-launch-off-02"
@@ -2462,12 +2475,26 @@
       "snapshot": "qw3-osworld-client15-20261002",
       "backend_timeout_seconds": 1800,
       "backend_read_timeout_seconds": 1500,
-      "formal_run": false
-    }
+      "formal_run": false,
+      "task_seconds": {
+        "on": 49.4285739,
+        "off": 92.5235234
+      },
+      "requests": {
+        "on": 11,
+        "off": 12
+      },
+      "continuous_recordings_complete": true,
+      "independent_artifact_checks_passed": true,
+      "paired_runner_sources_unchanged": true,
+      "not_a_reliability_estimate": true
+    },
+    "actual_model_launcher_evidence": "apps/computer_use/.runtime/native-client-15-launch-qualification-01/result.json",
+    "actual_model_launcher_evidence_sha256": "7fe1ddd5b8e6e05da869132abcc8617162199a153fe0ff25e2d167596ffb5bab"
   },
   "v0_candidate_preparation": {
     "profile": "docs/computer_use_windows_v0_candidate_20261002.json",
-    "profile_sha256": "baec260fa6fdae93f7f6f1f3a740aba55f826e4bee3d9698bf8c746c2dbe6ff5",
+    "profile_sha256": "ea3b2d227cccd180f909b30193c1750c9b309386efea2135cf5c986284e7fe02",
     "task_ids": [
       "013",
       "004",
