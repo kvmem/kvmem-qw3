@@ -42,3 +42,11 @@ cap02 关闭版本最终截图独立查看确认标题、Owner、Approved 和 Ho
 第二批首条 cap05-on-01 的保存文件通过全部公式与计算值检查，但原生客户端收尾的 legacy /files 对被 LibreOffice 占用的 outputs/cap05.xlsx 使用 ReadAllBytes，导致 infrastructure_error。独立二进制收集成功，连续录像完整；这条是无效测试，不计入完整通过或模型失败。队列正确停止并保留其余 11 条未运行。
 
 Office 校准场景改用与原 OSWorld 办公场景一致的 Desktop 交付和显式二进制收集。新的开关配对两边使用相同新路径，原失败不覆盖、不重判。产品的通用二进制结果列表仍需修复，未宣称平台缺陷已经解决。新版计划为 computer_use_windows_capability_plan_03_20261002.json。
+
+
+新版 cap05-on-02 普通打开 XLSX 触发 OpenWith。执行器按范围限制拒绝点击/ESC，模型重复启动 WPS 后在 78.7 秒无进展暂停，未保存。此条保留为环境阻断，不作为公式能力不足。中性文件也复现同一系统弹窗；注册表原来有 WPS UserChoice，但普通打开仍要求确认默认程序，不能仅检查注册表就宣称关联可用。中性 XLSX/DOCX/PPTX 经系统“Always”确认分别使用 Calc/Writer/Impress，初次真实执行器动作均通过；快照实际恢复验证正在进行。
+
+当前是 8 条有效试次、7 条完整通过，另有 1 条收尾链路无效和 1 条默认程序环境阻断。保留全部录像，分别标记，不将环境阻断混进模型成功率。
+
+
+办公基线恢复验证完成：qw3-osworld-office-20261002-v2。三种中性文件在实际恢复后自然进入 LibreOffice，真实执行器动作全部接受，最后再次恢复清洁快照。首次候选快照因偏好清理丢失 xs 命名空间而重新出现首次欢迎页，保留失败；现用 lxml 保留 QName 命名空间，只清理中性 MRU，两个防回归检查通过。办公默认确认、关闭首次提示和偏好清理属于共同平台配置，不是 agent 策略优化。客户端与执行器未改，原图片/PDF 关联保留。新版剩余 6 个场景计划为 computer_use_windows_capability_plan_04_20261002.json。

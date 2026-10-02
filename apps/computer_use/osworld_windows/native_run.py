@@ -26,11 +26,12 @@ from .site_platform import PLATFORM as SITE_PLATFORM, qualify_runtime as qualify
 from .source import ROOT, sha256
 from .capabilities import TASKS as CAPABILITY_TASKS, input_sources
 
-DEFAULT_SNAPSHOT = 'qw3-osworld-images-20261002'
+DEFAULT_SNAPSHOT = 'qw3-osworld-office-20261002-v2'
 SNAPSHOT_QUALIFICATIONS = {
     'qw3-osworld-clean-20261002': 'baseline-clean-qualification-01/roundtrip-result.json',
     'qw3-osworld-pdf-20261002': 'pdf-handler-qualification-01/roundtrip-result.json',
-    DEFAULT_SNAPSHOT: 'image-handler-qualification-01/roundtrip-result.json',
+    'qw3-osworld-images-20261002': 'image-handler-qualification-01/roundtrip-result.json',
+    DEFAULT_SNAPSHOT: 'office-handler-qualification-02/roundtrip-result.json',
 }
 
 def snapshot_qualification(app, name):

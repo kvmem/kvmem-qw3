@@ -2041,7 +2041,7 @@
     "formal_run": false,
     "definition": "apps/computer_use/osworld_windows/capabilities.py",
     "first_batch_plan": "docs/computer_use_windows_capability_plan_20261002.json",
-    "status": "office_queue_halted_by_export_listing",
+    "status": "office_platform_qualified_next_batch_prepared",
     "original_ten_task_results_preserved": true,
     "formal_original_runs_completed": 0,
     "completed_attempts": 8,
@@ -2049,7 +2049,7 @@
     "first_batch_evidence": "apps/computer_use/.runtime/windows-capability-calibration-01/result.json",
     "analysis": "apps/computer_use/.runtime/windows-capability-analysis-01/summary.json",
     "preview_url": "http://127.0.0.1:18089/capability/index.html",
-    "next_batch_plan": "docs/computer_use_windows_capability_plan_03_20261002.json",
+    "next_batch_plan": "docs/computer_use_windows_capability_plan_04_20261002.json",
     "observed_feasible": [
       "Create and save text",
       "Edit while preserving input",
@@ -2059,8 +2059,23 @@
     "observed_limit": "cap02 off correctly edited onscreen but failed to save by 300 seconds; not proof of inability to edit",
     "invalid_office_attempts": 1,
     "office_artifact_correct_despite_invalid_trial": true,
-    "halted_queue": "apps/computer_use/.runtime/windows-capability-calibration-02/result.json",
-    "export_listing_limitation": "Legacy text/JSON outputs enumeration fails on locked Office binary; new office tasks use established Desktop binary collection, original failure preserved"
+    "halted_queue": "apps/computer_use/.runtime/windows-capability-calibration-03/result.json",
+    "export_listing_limitation": "Legacy text/JSON outputs enumeration fails on locked Office binary; new office tasks use established Desktop binary collection, original failure preserved",
+    "environment_blocked_attempts": 1,
+    "office_default_choice_work": "apps/computer_use/.runtime/office-handler-qualification-01",
+    "initial_neutral_xlsx_executor_passed": true,
+    "initial_neutral_docx_executor_passed": true,
+    "office_snapshot_candidate": "qw3-osworld-office-20261002-v2",
+    "previous_office_snapshot_not_qualified": true,
+    "namespace_cleanup_tests_passed": 2,
+    "qualification_work": "apps/computer_use/.runtime/office-handler-qualification-02",
+    "preserved_failed_office_roundtrip": "apps/computer_use/.runtime/office-handler-qualification-01/roundtrip-result.json",
+    "office_snapshot": "qw3-osworld-office-20261002-v2",
+    "office_restore_qualification": "apps/computer_use/.runtime/office-handler-qualification-02/roundtrip-result.json",
+    "office_restore_qualified": true,
+    "valid_calibration_attempts": 8,
+    "complete_passes": 7,
+    "separate_blocked_or_invalid_attempts": 2
   },
   "native_interruption_recovery": {
     "qualified": true,
@@ -2074,5 +2089,24 @@
       "Pause, owned client restart, same thread and persisted tool budget, resume and completion",
       "Prior user prompt and completed action remained in resumed model history"
     ]
+  },
+  "office_default_clean_base": {
+    "snapshot": "qw3-osworld-office-20261002-v2",
+    "qualified": true,
+    "model_used": false,
+    "formal_run": false,
+    "evidence": "apps/computer_use/.runtime/office-handler-qualification-02/roundtrip-result.json",
+    "prior_snapshots_retained": true,
+    "handlers": {
+      ".xlsx": "LibreOffice.Xlsx",
+      ".docx": "LibreOffice.Docx",
+      ".pptx": "LibreOffice.Pptx"
+    },
+    "images_pdf_unchanged": true,
+    "neutral_probes_and_history_archived": true,
+    "client_and_executor_unchanged": true,
+    "first_failed_office_snapshot_retained": "qw3-osworld-office-20261002",
+    "xml_qname_cleanup_fix": "apps/computer_use/vm/clean_office_preferences.py",
+    "namespace_cleanup_checks_passed": 2
   }
 }

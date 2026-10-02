@@ -54,6 +54,7 @@ def summarize(directory):
     return dict(task=result['task'], name=DEFINITIONS[result['task']][0], kvmem=result['kvmem'],
         run=result['run'], formal_run=False, pipeline_passed=result['pipeline_passed'],
         status=result['status'], strict_success=grade['strict_success'],
+        valid_trial=result['pipeline_passed'] and result['status'] in {'passed', 'task_failed', 'timed_out', 'tool_budget_exhausted'},
         passed=result['status'] == 'passed', checks=grade['checks'],
         partial_check_fraction=grade.get('partial_check_fraction', 0),
         task_seconds=terminal['elapsed_seconds'], inference_requests=len(metrics),
@@ -85,6 +86,8 @@ def build(queues, output, preview):
                 rows.append(summarize(path))
     result = dict(suite='custom_capability_calibration', formal_run=False,
         osworld_official_tasks=False, completed_attempts=len(rows),
+        valid_attempts=sum(row['valid_trial'] for row in rows),
+        invalid_attempts=sum(not row['valid_trial'] for row in rows),
         passed=sum(row['passed'] for row in rows), trials=rows,
         limitations=['Single attempts establish observed feasibility, not stable reliability.',
                      'Short contexts do not measure long-history KVMem retention benefits.',
@@ -116,7 +119,13 @@ def build(queues, output, preview):
                 statuses = row['action_statuses']
                 review = row.get('trajectory_review') or {}
                 note = '<p>最终画面确认编辑正确，但未保存目标文件。</p>' if review.get('visible_edit_milestones_verified') else ''
-                videos.append(f'<article><h3>KVMem {row["kvmem"]} · {"通过" if row["passed"] else "未通过"}</h3>'
+                outcome = '受阻／无效试次' if not row['valid_trial'] else ('通过' if row['passed'] else '未通过')
+                if review.get('failure_class') == 'environment_default_app_choice_dialog':
+                    note += '<p>默认打开触发系统选择弹窗，受执行范围限制而暂停；环境修正后重新测试。</p>'
+                if row['strict_success'] and not row['valid_trial']:
+                    note += '<p>保存产物独立验收正确；收尾链路失败，此条不计入模型成功率。</p>'
+                videos.append(f'<article><h3>KVMem {row["kvmem"]} · {outcome}</h3>'
+                    f'<p>试次：{label}</p>'
                     f'{media}<p>任务 {row["task_seconds"]:.1f} 秒 · {row["inference_requests"]} 次推理 · '
                     f'{row["actions"]} 次动作 · {statuses.get("rejected", 0)} 次动作拒绝 · '
                     f'{len(row["tool_contract_errors"])} 次参数错误</p>'
@@ -128,7 +137,7 @@ def build(queues, output, preview):
         page = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Windows 能力边界回放</title>
 <style>body{font:16px system-ui;background:#f3f5f8;color:#172b40;margin:0}main{max-width:1400px;margin:auto;padding:28px}section{background:white;padding:20px;border-radius:12px;margin:22px 0}.pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}video{width:100%;background:#161b22}button{padding:9px 16px}pre{white-space:pre-wrap}.note{padding:16px;background:#e8edf7}@media(max-width:800px){.pair{grid-template-columns:1fr}}</style>
 <main><h1>Windows 能力边界回放</h1><p class="note">自定义短任务 · 真实 QW3+DFlash2 与原生 Codex · 相同快照、提示与预算的开关配对。连续录像包含启动和收尾，从录像开头播放，未按操作步骤对齐。结果不是官方 OSWorld 分数；单次结果不能证明稳定性或 KVMem 长历史收益。</p>'''
-        page += f'<p>已完成 {len(rows)} 次，其中 {result["passed"]} 次通过独立验收。运行中请刷新查看已完成结果。</p>' + ''.join(sections)
+        page += f'<p>已完成 {len(rows)} 次：{result["valid_attempts"]} 次有效、{result["invalid_attempts"]} 次链路无效；{result["passed"]} 次完整通过。无效测试不计入模型成功率。运行中请刷新查看已完成结果。</p>' + ''.join(sections)
         page += '''</main><script>for(const s of document.querySelectorAll('section')){const vs=[...s.querySelectorAll('video')];s.querySelector('.play').onclick=()=>{for(const v of document.querySelectorAll('video'))v.pause();for(const v of vs)v.currentTime=0;Promise.allSettled(vs.map(v=>v.play()));};s.querySelector('.pause').onclick=()=>vs.forEach(v=>v.pause());}</script></html>'''
         (preview / 'index.html').write_text(page)
     print(json.dumps({k: result[k] for k in ['completed_attempts', 'passed', 'formal_run']}))
