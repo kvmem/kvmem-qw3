@@ -2581,7 +2581,7 @@
     "formal_counts_created": 0,
     "evidence": "Host controls and actual old launcher request bindings only; readiness certificates and V1 installation path still pending"
   },
-  "next_size_boundary_plan": "docs/computer_use_windows_capability_size_plan_05_20261002.json",
+  "next_size_boundary_plan": "docs/computer_use_windows_capability_size_plan_06_20261002.json",
   "current_v0_candidate_visual_history": "retrievable",
   "evidence_storage_preservation": "apps/computer_use/.runtime/gimp051-terminal-preservation-01/result.json",
   "size12_startup_failures_preserved": [
@@ -2590,7 +2590,7 @@
     "apps/computer_use/.runtime/windows-capability-size12-03/result.json",
     "apps/computer_use/.runtime/windows-capability-size12-04/result.json"
   ],
-  "size12_current_status": "First actual native 12-row task interrupted at Save As text delivery; no saved output; remaining three attempts not run",
+  "size12_current_status": "Previous trial remains interrupted; new four-attempt plan uses client16 after 82 Windows contracts and all six 69.7MB scripted transport controls passed; actual launch pending",
   "console_provision_input_probe": {
     "path": "apps/computer_use/.runtime/provision-input-qualification-01-result.json",
     "sha256": "23f084285795d6659cb5ec6503b9e866feea26a2faf94606fb2ab05bf91ac4a0",
@@ -2626,13 +2626,20 @@
     "request_limit_bytes": 536870912,
     "host_capacity_proof": "apps/computer_use/.runtime/model-transport-capacity-host-01/result.json",
     "host_passed": true,
-    "windows_qualified": false,
+    "windows_qualified": true,
     "real_model_test": false,
     "formal_run": false,
     "drops_history": false,
     "host_proof_sha256": "72c33d0e9193934c195d712e3b75303512330cd2bc30cb6a37ddecb3e6bc763f",
     "input_wire_bytes": 69675554,
-    "checks_passed": 6
+    "checks_passed": 6,
+    "windows_contracts_passed": 82,
+    "windows_capacity_checks_passed": 6,
+    "windows_capacity_wire_bytes": 69675554,
+    "windows_evidence": "apps/computer_use/.runtime/windows-client-16-qualification-01/result.json",
+    "windows_evidence_sha256": "1f81537e56d4ed939b155018926e34411fb942e2474c15d1bc341779d3d2808d",
+    "client_bundle": "apps/computer_use/.runtime/windows-native-client-16",
+    "client_bundle_sha256": "f6831b7708da4ee341a478aa5e38f590b43e70336cf086b3b2d4a051032d263f"
   },
   "restored_native_bundle_installer": {
     "implemented": true,

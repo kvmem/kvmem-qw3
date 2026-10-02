@@ -1,0 +1,69 @@
+{
+  "suite": "custom_capability_size_boundary_v1",
+  "version": 6,
+  "formal_run": false,
+  "osworld_official_tasks": false,
+  "visual_history": "retrievable",
+  "backend_timeout_seconds": 1800,
+  "backend_read_timeout_seconds": 1500,
+  "public_inputs_manifest_sha256": "3879517805f8a99685a73cb1e477fb712b87efc36c2d5e61eb31b80955018d97",
+  "boundary_inputs_manifest_sha256": "53c5707d6c7bd63e05987d6fc2a702fd5aab39f2773f30cea84c8ff6072cc841",
+  "snapshot": "qw3-osworld-client15-20261002",
+  "client_bundle_path": "apps/computer_use/.runtime/windows-native-client-16",
+  "purpose": "Increase table size from 3-4 data rows to 12. Measure complete delivery, all formulas, tie ordering and complete record preservation. Not an agent V1 or a replacement for the original ten tasks.",
+  "attempts": [
+    {
+      "task": "cap11",
+      "run": "capability-size12-cap11-off-06",
+      "kvmem": "off",
+      "timeout_seconds": 1800,
+      "tool_call_limit": 340
+    },
+    {
+      "task": "cap11",
+      "run": "capability-size12-cap11-on-06",
+      "kvmem": "on",
+      "timeout_seconds": 1800,
+      "tool_call_limit": 340
+    },
+    {
+      "task": "cap12",
+      "run": "capability-size12-cap12-on-06",
+      "kvmem": "on",
+      "timeout_seconds": 1800,
+      "tool_call_limit": 340
+    },
+    {
+      "task": "cap12",
+      "run": "capability-size12-cap12-off-06",
+      "kvmem": "off",
+      "timeout_seconds": 1800,
+      "tool_call_limit": 340
+    }
+  ],
+  "preserved_startup_failures": [
+    "apps/computer_use/.runtime/size12-launch-01.json",
+    "apps/computer_use/.runtime/windows-capability-size12-02/result.json",
+    "apps/computer_use/.runtime/windows-capability-size12-03/result.json",
+    "apps/computer_use/.runtime/windows-capability-size12-04/result.json"
+  ],
+  "startup_failure_scope": "All four startup failures are retained; no QW3 inference request or model desktop task ran. Latest initialization command lost its first character; longer console focus/key waits passed an actual neutral Windows receipt probe. Original client15/model/prompts/budgets unchanged.",
+  "console_input_probe": {
+    "path": "apps/computer_use/.runtime/provision-input-qualification-01-result.json",
+    "sha256": "23f084285795d6659cb5ec6503b9e866feea26a2faf94606fb2ab05bf91ac4a0",
+    "passed": true
+  },
+  "client_bundle_sha256": "f6831b7708da4ee341a478aa5e38f590b43e70336cf086b3b2d4a051032d263f",
+  "preserved_actual_failure": "apps/computer_use/.runtime/windows-capability-size12-05/capability-size12-cap11-off-05/result.json",
+  "saveas_diagnostic": {
+    "original_outcome": "paused_uncertain; no saved artifact",
+    "exact_win32_cause_confirmed": false,
+    "fresh_dialog_direct_message_probes_passed": true,
+    "fresh_dialog_real_executor_probe_passed": true,
+    "old_receipt_unchanged": true,
+    "automatic_replay_of_old_action": false,
+    "executor_source_changed": false
+  },
+  "client_changes": "Bounded 512 MiB model transport and retained backend error reasons; selected client is verified and installed after restoring the unchanged client15 snapshot. No task instruction or input change.",
+  "qualification_required_before_launch": "apps/computer_use/.runtime/windows-client-16-qualification-01/result.json"
+}
