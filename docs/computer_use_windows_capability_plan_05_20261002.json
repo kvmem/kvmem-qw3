@@ -1,0 +1,25 @@
+{
+  "suite": "custom_capability_calibration",
+  "osworld_official_tasks": false,
+  "formal_run": false,
+  "visual_history": "pin-all",
+  "public_inputs_manifest_sha256": "3879517805f8a99685a73cb1e477fb712b87efc36c2d5e61eb31b80955018d97",
+  "attempts": [
+    {
+      "task": "cap02",
+      "run": "capability-cap02-on-02",
+      "kvmem": "on",
+      "timeout_seconds": 600,
+      "tool_call_limit": 240
+    },
+    {
+      "task": "cap02",
+      "run": "capability-cap02-off-02",
+      "kvmem": "off",
+      "timeout_seconds": 600,
+      "tool_call_limit": 240
+    }
+  ],
+  "version": "Matched 600-second note-edit budget retest; retain the original 300-second result",
+  "snapshot": "qw3-osworld-office-text-20261002"
+}

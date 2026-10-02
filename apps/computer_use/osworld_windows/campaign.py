@@ -52,6 +52,7 @@ async def execute(plan, args, *, runner=run_attempt):
     source_paths = list((ROOT / 'apps/computer_use/osworld_windows').glob('*.py'))
     if any(a['task'] in CAPABILITY_TASKS for a in plan['attempts']):
         source_paths += input_sources()
+        source_paths.append(ROOT / 'apps/computer_use/capability_regrade.py')
         if (plan.get('public_inputs_manifest_sha256') is not None
                 and plan['public_inputs_manifest_sha256'] != sha256(INPUT_ROOT / 'manifest.json')):
             raise ValueError('Queue plan belongs to another public fixture corpus')

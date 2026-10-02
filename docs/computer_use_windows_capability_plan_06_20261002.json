@@ -1,0 +1,68 @@
+{
+  "suite": "custom_capability_calibration",
+  "osworld_official_tasks": false,
+  "formal_run": false,
+  "visual_history": "pin-all",
+  "public_inputs_manifest_sha256": "3879517805f8a99685a73cb1e477fb712b87efc36c2d5e61eb31b80955018d97",
+  "attempts": [
+    {
+      "task": "cap08",
+      "run": "capability-cap08-on-04",
+      "kvmem": "on",
+      "timeout_seconds": 900,
+      "tool_call_limit": 240
+    },
+    {
+      "task": "cap08",
+      "run": "capability-cap08-off-04",
+      "kvmem": "off",
+      "timeout_seconds": 900,
+      "tool_call_limit": 240
+    },
+    {
+      "task": "cap09",
+      "run": "capability-cap09-on-04",
+      "kvmem": "on",
+      "timeout_seconds": 600,
+      "tool_call_limit": 240
+    },
+    {
+      "task": "cap09",
+      "run": "capability-cap09-off-04",
+      "kvmem": "off",
+      "timeout_seconds": 600,
+      "tool_call_limit": 240
+    },
+    {
+      "task": "cap10",
+      "run": "capability-cap10-on-04",
+      "kvmem": "on",
+      "timeout_seconds": 900,
+      "tool_call_limit": 240
+    },
+    {
+      "task": "cap10",
+      "run": "capability-cap10-off-04",
+      "kvmem": "off",
+      "timeout_seconds": 900,
+      "tool_call_limit": 240
+    },
+    {
+      "task": "cap02",
+      "run": "capability-cap02-on-02",
+      "kvmem": "on",
+      "timeout_seconds": 600,
+      "tool_call_limit": 240
+    },
+    {
+      "task": "cap02",
+      "run": "capability-cap02-off-02",
+      "kvmem": "off",
+      "timeout_seconds": 600,
+      "tool_call_limit": 240
+    }
+  ],
+  "version": "Qualified natural TXT opening and Office defaults; complete remaining three scenarios and retain separate note budget retest",
+  "snapshot": "qw3-osworld-office-text-20261002",
+  "preserved_halted_queue": "apps/computer_use/.runtime/windows-capability-calibration-04/result.json"
+}

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from osworld_windows.campaign import execute, validate
-from osworld_windows.native_run import DEFAULT_SNAPSHOT, snapshot_qualification, terminal_status
+from osworld_windows.native_run import DEFAULT_SNAPSHOT, SNAPSHOT_QUALIFICATIONS, snapshot_qualification, terminal_status
 from osworld_windows.scenarios import collection, prepare, verify_collection
 from osworld_windows.source import sha256
 
@@ -109,7 +109,7 @@ class CampaignTests(unittest.IsolatedAsyncioTestCase):
     def test_restore_qualification_belongs_to_selected_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             app = Path(temporary)
-            path = app / '.runtime/office-handler-qualification-02/roundtrip-result.json'
+            path = app / '.runtime' / SNAPSHOT_QUALIFICATIONS[DEFAULT_SNAPSHOT]
             path.parent.mkdir(parents=True)
             for result in [dict(passed=False, snapshot=DEFAULT_SNAPSHOT), dict(passed=True, snapshot='some-other-base')]:
                 path.write_text(json.dumps(result))

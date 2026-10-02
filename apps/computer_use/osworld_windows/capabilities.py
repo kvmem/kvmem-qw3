@@ -257,11 +257,14 @@ def grade(task, artifacts):
             checks['exact_paragraphs'] = actual == ['Weekly Report', 'Owner: Mei', 'Atlas: Approved', 'Birch: Approved']
             checks['correct_paragraphs'] = sum(a == b for a, b in zip(actual, ['Weekly Report', 'Owner: Mei', 'Atlas: Approved', 'Birch: Approved'])) / 4
         elif task == 'cap07':
-            from pptx import Presentation
-            deck = Presentation(target)
-            checks['two_slides'] = len(deck.slides) == 2
-            checks['titles'] = [s.shapes.title.text for s in deck.slides] == ['Briefing', 'Results']
-            checks['body_preserved'] = [s.placeholders[1].text for s in deck.slides] == ['Owner: Mei', 'Atlas completed 3 milestones.']
+            from capability_regrade import grade_presentation
+            evaluated = grade_presentation(target)
+            checks.update(evaluated['checks'])
+            if evaluated.get('failure'):
+                raise ValueError(evaluated.get('error', evaluated['failure']))
+            report.update(grader_revision=evaluated['grader_revision'],
+                          actual_titles=evaluated['actual_titles'],
+                          actual_body_texts=evaluated['actual_body_texts'])
         # Fractional milestones describe partial correctness; they never weaken success.
         boolean_checks = [value for value in checks.values() if type(value) is bool]
         report['strict_success'] = bool(boolean_checks) and all(boolean_checks)

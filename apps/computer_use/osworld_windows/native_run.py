@@ -26,12 +26,13 @@ from .site_platform import PLATFORM as SITE_PLATFORM, qualify_runtime as qualify
 from .source import ROOT, sha256
 from .capabilities import TASKS as CAPABILITY_TASKS, input_sources
 
-DEFAULT_SNAPSHOT = 'qw3-osworld-office-20261002-v2'
+DEFAULT_SNAPSHOT = 'qw3-osworld-office-text-20261002'
 SNAPSHOT_QUALIFICATIONS = {
     'qw3-osworld-clean-20261002': 'baseline-clean-qualification-01/roundtrip-result.json',
     'qw3-osworld-pdf-20261002': 'pdf-handler-qualification-01/roundtrip-result.json',
     'qw3-osworld-images-20261002': 'image-handler-qualification-01/roundtrip-result.json',
-    DEFAULT_SNAPSHOT: 'office-handler-qualification-02/roundtrip-result.json',
+    'qw3-osworld-office-20261002-v2': 'office-handler-qualification-02/roundtrip-result.json',
+    DEFAULT_SNAPSHOT: 'text-handler-qualification-01/roundtrip-result.json',
 }
 
 def snapshot_qualification(app, name):
@@ -177,6 +178,7 @@ async def run(args):
             sources.append(SITE_PLATFORM)
             if args.task in CAPABILITY_TASKS:
                 sources += input_sources()
+                sources.append(app / 'capability_regrade.py')
             report['source_sha256'] = {str(p.relative_to(ROOT)): sha256(p) for p in sources}
             report['snapshot'] = json.loads((share.parent / 'snapshots' / args.snapshot / 'manifest.json').read_text())
             owns_desktop = True
