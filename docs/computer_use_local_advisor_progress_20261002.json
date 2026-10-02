@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "python_routing_retest_complete_latex_install_compile_qualification",
+  "current_stage": "python_routing_retest_complete_latex_scripted_pdf_qualified_integration_next",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -183,15 +183,21 @@
     "apps/computer_use/.runtime/latex-preflight-02/result.json",
     "apps/computer_use/.runtime/latex-install-qualification-01/result.json",
     "apps/computer_use/.runtime/latex-install-qualification-01/reconciliation/result.json",
-    "apps/computer_use/.runtime/latex-install-qualification-02/result.json"
+    "apps/computer_use/.runtime/latex-install-qualification-02/result.json",
+    "apps/computer_use/.runtime/latex-compile-probe-01/result.json",
+    "apps/computer_use/.runtime/latex-compile-probe-02/result.json",
+    "apps/computer_use/.runtime/latex-compile-candidates-01/result.json",
+    "apps/computer_use/.runtime/latex-compile-candidates-02/result.json",
+    "apps/computer_use/.runtime/latex-compile-candidates-03/result.json",
+    "apps/computer_use/.runtime/latex-compile-candidates-03/pdf-qualification.json"
   ],
   "latest_checks": {
     "gpu_idle": true,
-    "root_available_approx_gib": 216,
-    "previous_queue_status": "python_routing_pair_complete_owned_engine_stopped_latex_qualification_active",
+    "root_available_approx_gib": 227,
+    "previous_queue_status": "python_routing_pair_and_latex_qualification_terminal_owned_engine_stopped",
     "gpu_compute_processes": 0
   },
-  "next_action": "Qualify Chinese/math PDF compilation and frozen dependencies, integrate LaTeX jobs and independent grader, then real local-model development and formal new/repair trials. Continue recovery P3-P6, KVMem and advisor gates; goal active.",
+  "next_action": "Integrate scripted-qualified LaTeX catalog into controlled setup/repair jobs, add independent artifact/new-terminal/reopen grading, then native local-model trials and 3+3 formal acceptance. Formal product count remains 6/12. Continue P3-P6, KVMem and advisor gates.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -305,5 +311,23 @@
   },
   "scheduling": "Iterate diagnosis, product changes and matched retests. Freeze local baselines before advisor business trials; original OSWorld missing assets do not block independent work.",
   "last_updated": "2026-10-03",
-  "latex_preparation": "docs/computer_use_latex_preparation_20261003.md"
+  "latex_preparation": "docs/computer_use_latex_preparation_20261003.md",
+  "latex_qualification": {
+    "status": "scripted_install_and_pdf_passed_agent_integration_pending",
+    "model_used": false,
+    "counted_as_product_trial": false,
+    "installation": "apps/computer_use/.runtime/latex-install-qualification-02/result.json",
+    "compile": "apps/computer_use/.runtime/latex-compile-candidates-03/result.json",
+    "pdf": "apps/computer_use/.runtime/latex-compile-candidates-03/pdf-qualification.json",
+    "catalog": "apps/computer_use/latex_catalog.json",
+    "source": "apps/computer_use/fixtures/latex/chinese-math.tex",
+    "retained_failure_categories": [
+      "portable_user_install_argument_conflict",
+      "dry_run_writes_partial_installation",
+      "shared_admin_conflicts_with_portable",
+      "old_repository_metadata_incomplete",
+      "install_rejects_already_installed_package"
+    ],
+    "actual_model_trials": 0
+  }
 }
