@@ -9,13 +9,14 @@ import aiohttp
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from qw3_computer.tool_schema import TOOLS
+from qw3_computer.tool_schema import TOOLS, SOFTWARE_TOOLS
 
 
 async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--token-file", required=True, type=Path)
+    parser.add_argument("--software", action="store_true")
     args = parser.parse_args()
     token = args.token_file.read_text().strip()
     active = {}
@@ -33,7 +34,7 @@ async def main():
                     result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                               "serverInfo": {"name": "qw3-computer", "version": "0.1.0"}}
                 elif method == "tools/list":
-                    result = {"tools": TOOLS}
+                    result = {"tools": TOOLS + (SOFTWARE_TOOLS if args.software else [])}
                 elif method == "ping":
                     result = {}
                 elif method == "tools/call":

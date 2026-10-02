@@ -49,3 +49,34 @@ TOOLS = [{"name": "observe", "description": "Observe the selected desktop. Retur
               "action_id": {"type": "string", "minLength": 8, "maxLength": 80, "pattern": "^[a-zA-Z0-9_-]+$"}, "action": ACTION},
               "required": ["desktop_id", "observation_id", "action_id", "action"], "additionalProperties": False},
           "annotations": {"readOnlyHint": False, "idempotentHint": False}}]
+
+SOFTWARE_TOOLS = [{"name": "software", "description":
+    "Manage software in the explicitly selected local Windows workspace. inspect lists reviewed profiles, projects and jobs. "
+    "setup_python starts ONE background job to download a hash-verified Python installer, create an isolated project venv, "
+    "install the selected profile's exact dependencies and verify them in fresh processes. project is a short lowercase name, "
+    "not a path. Check job_status with wait_seconds=10 while it runs. A completed job must include verification.passed=true. "
+    "Do not claim completion from a job start receipt. cancel_job stops further workflow steps; interrupted installers may "
+    "require human reconciliation. resume_job continues only a known stopped failed/cancelled job. Never resubmit an uncertain "
+    "installation with another action_id. No arbitrary commands, URLs, package scripts or system PATH edits are accepted.",
+    "inputSchema": {"type": "object", "oneOf": [
+        {"type": "object", "properties": {"operation": {"const": "inspect"}}, "required": ["operation"], "additionalProperties": False},
+        {"type": "object", "properties": {"operation": {"const": "setup_python"},
+            "action_id": {"type": "string", "pattern": "^[a-zA-Z0-9_-]{8,80}$"},
+            "project": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,47}$"},
+            "profile": {"enum": ["python-web"]}},
+         "required": ["operation", "action_id", "project", "profile"], "additionalProperties": False},
+        {"type": "object", "properties": {"operation": {"const": "job_status"}, "job_id": {"type": "string"},
+            "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 10}},
+         "required": ["operation", "job_id", "wait_seconds"], "additionalProperties": False},
+        {"type": "object", "properties": {"operation": {"enum": ["cancel_job", "resume_job"]}, "job_id": {"type": "string"}},
+         "required": ["operation", "job_id"], "additionalProperties": False}
+    ]}, "annotations": {"readOnlyHint": False, "idempotentHint": False}}]
+
+# Qwen's XML tool transport resolves scalar types through root properties.
+# Keep operation-specific oneOf validation, and expose the same property types
+# at the root so wait_seconds is decoded as an integer rather than raw text.
+SOFTWARE_TOOLS[0]["inputSchema"]["properties"] = {
+    "operation": {"type": "string", "enum": ["inspect", "setup_python", "job_status", "cancel_job", "resume_job"]},
+    "action_id": {"type": "string"}, "project": {"type": "string"}, "profile": {"type": "string"},
+    "job_id": {"type": "string"}, "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 10}
+}

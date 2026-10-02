@@ -11,21 +11,24 @@ import signal
 import sys
 import time
 import uuid
+from urllib.parse import urlparse
 
 from aiohttp import web
 
 from .bridge import create_app as bridge_app
 from .codex import CodexClient, write_config
 from .desktop import Desktop, DesktopError, DesktopRejected, mcp_observation
+from .software import Software
 
 
 class Controller:
     def __init__(self, runtime, desktop, backend, port, backend_token=None, trace_backend=False,
                  tool_call_limit=100, output_policy="outputs", *, backend_timeout_seconds=600,
-                 backend_read_timeout_seconds=180, heartbeat_seconds=30, thinking=False):
+                 backend_read_timeout_seconds=180, heartbeat_seconds=30, thinking=False, software=None):
         if type(thinking) is not bool:
             raise ValueError("Thinking mode must be a boolean")
         self.thinking = thinking
+        self.software = software
         if type(tool_call_limit) is not int or not 1 <= tool_call_limit <= 10000:
             raise ValueError("Tool-call limit must be an integer between 1 and 10000")
         if output_policy not in ("outputs", "task"):
@@ -74,7 +77,8 @@ class Controller:
 
     def snapshot(self):
         return self.state | {"ready": self.ready, "observation": self.desktop.latest,
-                             "uncertain_actions": self.desktop.unresolved(), "desktop_paused": self.desktop.paused}
+                             "uncertain_actions": self.desktop.unresolved(), "desktop_paused": self.desktop.paused,
+                             "software": self.software.snapshot(self.state.get("id")) if self.software else None}
 
     def budget_remaining(self):
         used, limit = self.state.get("tool_calls_used"), self.state.get("tool_call_limit")
@@ -88,6 +92,9 @@ class Controller:
     def require_saved_inference_mode(self):
         if self.state.get("thinking", False) != self.thinking:
             raise DesktopError("当前推理模式与该任务记录不同。请用原模式继续，或停止旧任务后新建任务。")
+        selected = str(self.software.root) if self.software else None
+        if self.state.get("software_root") != selected:
+            raise DesktopError("该任务的系统配置权限或工作目录发生变化，请用原配置继续。")
 
     async def start(self):
         await self.desktop.start()
@@ -102,9 +109,12 @@ class Controller:
         site = web.TCPSite(self.bridge, "127.0.0.1", 0)
         await site.start()
         bridge_port = site._server.sockets[0].getsockname()[1]
+        proxy_args = [str(Path(__file__).with_name("mcp_proxy.py")), "--endpoint", f"http://127.0.0.1:{self.port}",
+                      "--token-file", str(self.runtime / "mcp-token.txt")]
+        if self.software:
+            proxy_args.append("--software")
         write_config(self.runtime / "codex", f"http://127.0.0.1:{bridge_port}/v1", sys.executable,
-                     [str(Path(__file__).with_name("mcp_proxy.py")), "--endpoint", f"http://127.0.0.1:{self.port}",
-                      "--token-file", str(self.runtime / "mcp-token.txt")], thinking=self.thinking)
+                     proxy_args, thinking=self.thinking, software=self.software is not None)
         self.client = CodexClient(self.runtime / "codex")
         await self.client.start()
         self.consume_task = asyncio.create_task(self.consume())
@@ -124,6 +134,8 @@ class Controller:
                         self.state.update(status="paused", notice="Codex 连接已断开。重启应用后可核对桌面并继续。")
                     with contextlib.suppress(DesktopError):
                         await self.desktop.control("pause")
+                    if self.software:
+                        await self.software.pause(self.state.get("id"))
                     self.save()
                     return
                 if params.get("threadId") != self.state.get("thread_id"):
@@ -146,7 +158,17 @@ class Controller:
                     self.state["current_action"] = None
                     self.state.pop("evidence_error", None)
                     try:
-                        await self.desktop.control("pause")
+                        try:
+                            await self.desktop.control("pause")
+                        finally:
+                            if self.software:
+                                await self.software.pause(self.state.get("id"))
+                        if self.software:
+                            jobs = self.software.snapshot(self.state.get("id"))["jobs"]
+                            self.state["software_verified"] = bool(jobs) and all(
+                                j["status"] == "completed" and j.get("verification", {}).get("passed") is True for j in jobs)
+                            if not self.state["software_verified"]:
+                                self.state.update(status="paused", notice="环境配置尚未通过工具校验，不能认定任务完成。请检查安装进度或错误。")
                         await self.desktop.observe()
                         self.state["files"] = (await self.desktop.request("GET", "/files"))["files"]
                     except DesktopError as exc:
@@ -174,6 +196,7 @@ class Controller:
                           "messages": [], "files": [], "started_at": time.time(), "current_action": None,
                           "tool_calls_used": 0, "tool_call_limit": self.tool_call_limit,
                           "output_policy": self.output_policy, "thinking": self.thinking}
+            self.state["software_root"] = str(self.software.root) if self.software else None
             self.desktop.task_id = self.state["id"]
             self.save()
             try:
@@ -182,6 +205,8 @@ class Controller:
                 self.state["thread_id"] = await self.client.new_thread()
                 description = json.dumps({k: v for k, v in observation.items() if k != "image"}, ensure_ascii=False)
                 text = prompt + "\n\nInitial desktop observation (coordinates use screenshot pixels):\n" + description
+                if self.software:
+                    text += "\nAuthorized local software workspace:\n" + json.dumps(self.software.inspect(self.state["id"]), ensure_ascii=False)
                 if self.state["output_policy"] == "outputs":
                     text += "\nSave requested test deliverables inside C:\\Qw3Computer\\outputs."
                 self.state["turn_id"] = await self.client.turn(self.state["thread_id"], text,
@@ -295,7 +320,11 @@ class Controller:
                 running = self.state["status"] in ("running", "starting")
                 self.state["status"] = "paused" if command == "pause" else "stopped"
                 self.save()
-                await self.desktop.control(command)
+                try:
+                    await self.desktop.control(command)
+                finally:
+                    if self.software:
+                        await self.software.pause(self.state.get("id"))
                 if running and self.state.get("turn_id"):
                     await self.client.interrupt(self.state["thread_id"], self.state["turn_id"])
                 await self.desktop.observe()
@@ -303,7 +332,7 @@ class Controller:
             return self.snapshot()
 
     async def tool(self, name, arguments):
-        if name not in ("observe", "act"):
+        if name not in ("observe", "act") and not (name == "software" and self.software):
             raise DesktopError("Unknown desktop tool")
         exhausted = False
         async with self.control_lock:
@@ -323,6 +352,10 @@ class Controller:
             return mcp_observation(await self.desktop.observe())
         if self.state["status"] != "running":
             raise DesktopError("Task is not running; wait for user resume")
+        if name == "software":
+            result = await self.software.invoke(self.state["id"], arguments)
+            return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                    "isError": result.get("status") in ("failed", "uncertain")}
         self.state["current_action"] = arguments.get("action")
         self.save()
         try:
@@ -373,6 +406,8 @@ class Controller:
                 await self.desktop.control("pause")
         if self.client:
             await self.client.close()
+        if self.software:
+            await self.software.close()
         await self.desktop.close()
         if self.bridge:
             await self.bridge.cleanup()
@@ -449,6 +484,9 @@ def web_app(controller):
 
 
 async def run(args):
+    software_root = getattr(args, "software_root", None)
+    if software_root and (sys.platform != "win32" or urlparse(args.desktop).hostname not in {"localhost", "127.0.0.1"}):
+        raise ValueError("Software mode requires the native Windows client with its local desktop executor")
     desktop = Desktop(args.desktop, args.desktop_token.read_text().strip(), args.runtime / "desktop")
     token = args.backend_token.read_text(encoding="utf-8-sig").strip() if args.backend_token else None
     if args.backend_token and not token:
@@ -457,7 +495,8 @@ async def run(args):
                             trace_backend=args.trace_backend, tool_call_limit=args.tool_call_limit,
                             output_policy=args.output_policy, backend_timeout_seconds=args.backend_timeout,
                             backend_read_timeout_seconds=args.backend_read_timeout,
-                            thinking=getattr(args, "thinking", False))
+                            thinking=getattr(args, "thinking", False),
+                            software=Software(software_root) if software_root else None)
     runner = web.AppRunner(web_app(controller), handler_cancellation=True)
     try:
         await runner.setup()
@@ -486,6 +525,8 @@ def main():
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--trace-backend", action="store_true", help="Tag QW3 requests for retrieval diagnostics")
     parser.add_argument("--thinking", action="store_true", help="Enable local thinking for new tasks; defaults to off")
+    parser.add_argument("--software-root", type=Path,
+                        help="Explicitly enable reviewed native Windows installation workflows in this local workspace")
     parser.add_argument("--tool-call-limit", type=int, default=100,
                         help="Lifetime observe/act budget for new tasks; resume keeps the saved budget")
     parser.add_argument("--output-policy", choices=("outputs", "task"), default="outputs",

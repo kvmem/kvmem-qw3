@@ -16,7 +16,7 @@ from qw3_computer.limits import MAX_MODEL_REQUEST_BYTES
 NATIVE_TEST_FILES = (
     "test_protocol.py", "test_bridge.py", "test_controller.py", "test_desktop.py",
     "test_collect_artifacts.py", "test_long_evidence.py", "test_task_driver.py",
-    "test_vm_relay.py", "test_codex_integration.py", "test_thinking.py", "fixture_mcp.py", "fixture_long_mcp.py",
+    "test_vm_relay.py", "test_codex_integration.py", "test_thinking.py", "test_software.py", "fixture_mcp.py", "fixture_long_mcp.py",
 )
 
 
@@ -53,6 +53,7 @@ def main():
     wheels = sorted((assets / "wheels").glob("*.whl"))
     assert any(p.name.startswith("aiohttp-3.14.0-") for p in wheels)
     assert any(p.name.startswith("pillow-12.1.0-") for p in wheels)
+    assert any(p.name == "certifi-2026.7.22-py3-none-any.whl" for p in wheels)
     for wheel in wheels:
         with zipfile.ZipFile(wheel) as archive:
             assert not any(".data/" in n for n in archive.namelist()), "Unsupported wheel installation scheme"
@@ -86,7 +87,8 @@ def main():
     [ValidateRange(30,14400)][int]$BackendReadTimeout = 180,
     [ValidateRange(1,10000)][int]$ToolCallLimit = 100,
     [ValidateSet('outputs','task')][string]$OutputPolicy = 'outputs',
-    [switch]$Thinking
+    [switch]$Thinking,
+    [string]$SoftwareRoot = ''
 )
 $ErrorActionPreference = 'Stop'
 if ($BackendReadTimeout -gt $BackendTimeout) {throw 'Read timeout exceeds total backend timeout'}
@@ -98,6 +100,7 @@ $clientArgs += @('--tool-call-limit',"$ToolCallLimit",'--output-policy',$OutputP
 $clientArgs += @('--backend-timeout',"$BackendTimeout",'--backend-read-timeout',"$BackendReadTimeout")
 if ($BackendToken) { $clientArgs += @('--backend-token',$BackendToken) }
 if ($Thinking) { $clientArgs += '--thinking' }
+if ($SoftwareRoot) { $clientArgs += @('--software-root',$SoftwareRoot) }
 & "$PSScriptRoot\\python\\python.exe" @clientArgs
 exit $LASTEXITCODE
 ''', encoding="utf-8")
@@ -112,7 +115,7 @@ exit $LASTEXITCODE
         "kind": "windows_native_client_offline_bundle", "qualified": False,
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "python_version": "3.13.13", "codex_version": "0.159.2",
-        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts"],
+        "runtime_capabilities": ["configurable_backend_waits", "large_visual_history_requests", "backend_error_receipts", "opt_in_local_thinking", "application_focus_receipts", "opt_in_software_workflows"],
         "model_request_limit_bytes": MAX_MODEL_REQUEST_BYTES,
         "backend_wait_defaults": {"total_seconds": 600, "read_seconds": 180, "heartbeat_seconds": 30},
         "test_scope": "Windows runtime contracts; host OSWorld/scoring tests remain in the repository",

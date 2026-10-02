@@ -5,7 +5,7 @@
   "status": "active",
   "local_plan": "docs/computer_use_local_diagnostic_plan_20261002.json",
   "combined_goal": "docs/computer_use_local_advisor_goal_20261002.md",
-  "current_stage": "P1_and_product_execution_improvements",
+  "current_stage": "product_python_pilot_passed_and_local_diagnostics_pending",
   "source_baseline": "56896791b41b6aa5c022c99dac4996f719bd4ba0",
   "stages": {
     "P0": {
@@ -85,15 +85,21 @@
     "apps/computer_use/.runtime/local-diagnostic-p0-executor-03/result.json",
     "apps/computer_use/.runtime/local-diagnostic-p0-thinking-audit-01/result.json",
     "apps/computer_use/.runtime/local-diagnostic-p0-focus-audit-01/result.json",
-    "apps/computer_use/.runtime/windows-client-17-qualification-01/result.json"
+    "apps/computer_use/.runtime/windows-client-17-qualification-01/result.json",
+    "apps/computer_use/.runtime/product-python-new-01/result.json",
+    "apps/computer_use/.runtime/product-python-new-02/result.json",
+    "apps/computer_use/.runtime/product-python-new-03/result.json",
+    "apps/computer_use/.runtime/windows-client-21-qualification-01/result.json",
+    "apps/computer_use/.runtime/software-product-audit-20261003.json",
+    "apps/computer_use/.runtime/software-product-replay-20261003/browser-check.json"
   ],
   "latest_checks": {
     "gpu_idle": true,
     "gpu_memory_mib": 97887,
-    "root_available_approx_gib": 70,
-    "previous_queue_status": "halted"
+    "root_available_approx_gib": 196.4,
+    "previous_queue_status": "three_product_pilots_complete_engine_stopped"
   },
-  "next_action": "Continue Python/LaTeX controlled workflow implementation and P1 neutral visual samples; qualify actual QW3 thinking on native client 17. Use frozen baseline sources for old snapshot restoration; original OSWorld V0 remains unfrozen.",
+  "next_action": "Freeze Python formal acceptance with both registry PATH scopes, launcher and reopen checks; repeat clean installs three times and construct project-only repair. Continue independent P1 visual/P2 reasoning preparation, then LaTeX workflows. Preserve all original P0-P8 and OSWorld tasks; advisor remains off until matching local baselines are frozen.",
   "advisor_provider": {
     "provider": "deepseek",
     "model": "deepseek-flash",
@@ -114,9 +120,22 @@
     "product-latex-repair"
   ],
   "product_trials": {
-    "status": "planned",
+    "status": "new_environment_pilot_passed",
     "completed": 0,
-    "planned": 12
+    "planned": 12,
+    "development_attempts_completed": 3,
+    "development_passed": 1,
+    "development_failed": 2,
+    "formal_template_frozen": false,
+    "report": "docs/computer_use_python_workflow_20261003.md",
+    "latest_native_bundle": "apps/computer_use/.runtime/windows-native-client-21",
+    "native_contract_tests_passed": 104,
+    "scenario_status": {
+      "product-python-new": "pilot_passed_repeat_acceptance_pending",
+      "product-python-repair": "planned",
+      "product-latex-new": "planned",
+      "product-latex-repair": "planned"
+    }
   },
   "scheduling": "Iterate diagnosis, product changes and matched retests. Freeze local baselines before advisor business trials; original OSWorld missing assets do not block independent work.",
   "last_updated": "2026-10-03"

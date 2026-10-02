@@ -29,9 +29,18 @@ than repeating actions without progress. Host shell tools are unavailable.
 """
 
 
-def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking=False):
+def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking=False, software=False):
     runtime = Path(runtime).resolve()
     runtime.mkdir(parents=True, exist_ok=True)
+    instructions = INSTRUCTIONS
+    if software:
+        instructions = instructions.replace("Operate only the selected\ndesktop using the computer tools.",
+            "Use computer tools for the selected desktop and the software tool for the explicitly selected local workspace.")
+        instructions += ("\nSoftware mode is explicitly enabled. First inspect the workspace and reviewed profiles. "
+            "Software jobs are asynchronous: starting a job is not completing the task. Use job_status with bounded waits "
+            "until its terminal result; require verification.passed=true before reporting successful setup. "
+            "Do not run installers or shell commands through GUI typing. Preserve existing installations and project files. "
+            "On an uncertain software operation, stop and request reconciliation.\n")
     catalog = {"models": [{
         "slug": "qw3-computer", "display_name": "QW3 Computer",
         "description": "Local QW3/KVMem vision with DFlash",
@@ -39,7 +48,7 @@ def write_config(runtime, bridge_url, mcp_command=None, mcp_args=(), *, thinking
         "supported_reasoning_levels": ([{"effort": "medium", "description": "Enable local QW3 thinking within the shared output budget"}]
                                        if thinking else []),
         "shell_type": "unified_exec", "visibility": "list", "supported_in_api": True,
-        "priority": 0, "base_instructions": INSTRUCTIONS,
+        "priority": 0, "base_instructions": instructions,
         "input_modalities": ["text", "image"], "context_window": 1048576,
         "effective_context_window_percent": 95,
         "truncation_policy": {"mode": "tokens", "limit": 100000},
@@ -94,7 +103,7 @@ command = {json.dumps(str(mcp_command))}
 args = {json.dumps(list(mcp_args))}
 startup_timeout_sec = 20
 tool_timeout_sec = 30
-enabled_tools = ["observe", "act"]
+enabled_tools = {json.dumps(["observe", "act"] + (["software"] if software else []))}
 default_tools_approval_mode = "approve"
 '''
     (runtime / "config.toml").write_text(config, encoding="utf-8")

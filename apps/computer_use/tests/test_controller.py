@@ -106,6 +106,53 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state["thinking"])
         self.assertTrue(json.loads(self.controller.state_path.read_text())["thinking"])
 
+    async def test_software_job_start_without_verification_cannot_complete_task(self):
+        class SoftwareFixture:
+            root = Path("selected-project-workspace")
+            pause = AsyncMock()
+            close = AsyncMock()
+            def snapshot(self, task_id):
+                return {"root": str(self.root), "jobs": [{"status": "running"}]}
+            def inspect(self, task_id):
+                return self.snapshot(task_id)
+        self.controller.software = SoftwareFixture()
+        self.controller.consume_task = asyncio.create_task(self.controller.consume())
+        await self.controller.start_task("Configure the Python project")
+        await asyncio.sleep(0)
+        self.assertEqual(self.controller.state["turn_status"], "completed")
+        self.assertEqual(self.controller.state["status"], "paused")
+        self.assertIn("工具校验", self.controller.state["notice"])
+        self.assertFalse(self.controller.state["software_verified"])
+        self.assertNotIn("evidence_error", self.controller.state)
+        from task_driver import terminal
+        self.assertEqual(terminal(self.controller.snapshot()), "paused")
+        self.controller.software.pause.assert_awaited_once()
+
+    async def test_software_pause_still_runs_when_desktop_executor_is_unreachable(self):
+        class SoftwareFixture:
+            pause = AsyncMock()
+            close = AsyncMock()
+        self.controller.software = SoftwareFixture()
+        self.controller.state.update(id="install-task", status="running")
+        self.desktop.control = AsyncMock(side_effect=DesktopError("executor unavailable"))
+        with self.assertRaisesRegex(DesktopError, "unavailable"):
+            await self.controller.control("pause")
+        self.controller.software.pause.assert_awaited_once_with("install-task")
+        self.assertEqual(self.controller.state["status"], "paused")
+
+    async def test_software_scope_cannot_be_added_when_resuming_old_task(self):
+        from types import SimpleNamespace
+        self.controller.state.update(status="paused", id="task", thread_id="test-thread", thinking=False)
+        self.controller.software = SimpleNamespace(root=Path("new-permission"), close=AsyncMock())
+        with self.assertRaisesRegex(DesktopError, "系统配置权限"):
+            await self.controller.control("resume")
+        self.controller.client.rpc.assert_not_called()
+
+    async def test_disabled_software_tool_cannot_dispatch(self):
+        self.controller.state["status"] = "running"
+        with self.assertRaises(DesktopError):
+            await self.controller.tool("software", {"operation": "setup_python"})
+
     async def test_missing_result_evidence_does_not_publish_completion(self):
         self.desktop.request.side_effect = DesktopError("Desktop unavailable")
         self.controller.consume_task = asyncio.create_task(self.controller.consume())

@@ -25,6 +25,7 @@ button{border:1px solid #c6cfdc;background:white;border-radius:7px;padding:10px 
 <div class="row"><button id="pause">暂停接管</button><button id="resume">继续任务</button></div>
 <label id="ackrow"><input id="ack" type="checkbox"> 我已核对画面，确认可以从当前状态继续。</label>
 <p class="note" id="target"></p></section>
+<section class="card" id="softwareCard" hidden><h2>环境配置</h2><p class="note" id="softwareRoot"></p><div id="softwareJobs" class="messages"></div></section>
 <section class="card"><h2>输出文件</h2><div id="files" class="note">完成后将在这里显示文件证据。</div></section>
 </aside><div>
 <div class="screenbar"><strong id="window">测试桌面</strong><button id="refresh">刷新画面</button></div>
@@ -37,6 +38,12 @@ const labels={idle:'就绪',starting:'准备中',running:'正在执行',verifyin
 function error(message){el('notice').textContent=message;el('notice').style.display=message?'block':'none'}
 async function post(path,body){const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok)throw Error(data.error||'操作失败');return data}
 function render(s){state=s;el('status').textContent=s.ready?(labels[s.status]||s.status):'尚未就绪';
+ el('softwareCard').hidden=!s.software;
+ if(s.software){el('softwareRoot').textContent='工作目录：'+s.software.root;
+  const stages={download_python:'下载并校验 Python',install_python:'安装并核对解释器',create_venv:'创建项目环境',install_dependencies:'安装固定依赖',verify_project:'在新进程中验证'};
+  const statuses={starting:'准备中',running:'执行中',completed:'验证通过',failed:'失败',cancelled:'已中断',uncertain:'结果待核对'};
+  el('softwareJobs').replaceChildren(...s.software.jobs.map(j=>{const d=document.createElement('div');d.className='message';d.textContent=j.project+' · '+(statuses[j.status]||j.status)+'\n'+(stages[j.stage]||'准备工作')+(j.error?'\n'+j.error:'')+(j.verification?.passed?'\n可用项目：'+j.verification.project+'\n双击项目中的 open-terminal.cmd 打开项目终端。':'');return d}));
+ }
  const running=['starting','running'].includes(s.status),busy=running||s.status==='verifying',paused=s.status==='paused';
  el('start').disabled=!s.ready||busy||paused;el('pause').disabled=!running;el('resume').disabled=!paused||!s.ready;el('stop').disabled=!busy&&!paused;el('refresh').disabled=!s.desktop_paused;
  el('ackrow').style.display=s.uncertain_actions?.length?'block':'none';error(s.notice||s.turn_error?.message||'');

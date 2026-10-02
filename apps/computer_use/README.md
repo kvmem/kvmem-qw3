@@ -3,9 +3,12 @@
 The current product goal is tracked in the
 [delivery plan](../../docs/computer_use_product_delivery_20261002.md).
 The latest [Windows focus repair](../../docs/computer_use_focus_improvement_20261003.md)
-passed three fixed switching trials (baseline: zero of three), and native client
-17 passed 89 runtime contracts. These are execution/runtime checks; Python/LaTeX
-product acceptance and optional advisor integration remain open.
+passed three fixed switching trials (baseline: zero of three). Native client
+21 passed 104 runtime contracts and includes an opt-in controlled Python setup
+workflow. These runtime checks are separate from product acceptance; the
+[software trial report](../../docs/computer_use_python_workflow_20261003.md)
+records three development attempts, including the first successful cold install.
+LaTeX and optional advisor integration remain open.
 
 Work in progress: the local UI, Codex provider bridge, Computer MCP and Windows
 VM executor work end to end. A frozen native Windows client passed 18 core-task
@@ -38,7 +41,8 @@ agent harness. `qw3_computer.codex` starts it over JSONL stdio, in an app-owned
 `CODEX_HOME`, with a local model catalog and provider. It does not load the
 user's cloud credentials, MCP connections or plugins. Shell, built-in browser,
 image generation and multi-agent features are disabled. Only the dedicated
-Computer MCP's `observe` and `act` tools are enabled on that server.
+Computer MCP's `observe` and `act` tools are enabled by default. Explicit native
+Windows software mode also enables the reviewed `software` tool described below.
 
 Codex sends Responses requests to `qw3_computer.bridge`; the bridge streams
 Chat Completions from the existing QW3 server. All inference, image input and
@@ -62,14 +66,74 @@ not an implementation of OpenAI effort budgets. Raw local reasoning travels in
 separate `reasoning` items and is replayed across tool/user turns. The same output
 token cap includes reasoning. Resume/follow-up requires the task's saved mode.
 Default launches retain the original non-thinking behavior. This candidate passed
-real local-model image/tool smoke checks and pinned Codex contracts; it has not
-yet been packaged and qualified as a new native Windows bundle or shown business
-task improvement. See the [P0 report](../../docs/computer_use_local_diagnostic_p0_20261002.md).
+real local-model image/tool smoke checks and native Windows/Codex contracts;
+actual QW3 thinking on the native Windows client and business-task improvement
+remain unqualified. See the [P0 report](../../docs/computer_use_local_diagnostic_p0_20261002.md).
 
 The current [product delivery goal](../../docs/computer_use_product_delivery_20261002.md)
 prioritizes complete Python/LaTeX software workflows, using diagnostic results to
 improve execution, verification and recovery. Optional DeepSeek advisory support
 is planned after local baselines; it is not enabled or implemented yet.
+
+## Controlled Windows software mode
+
+The current reviewed profile, `python-web`, installs CPython 3.13.16 x64 in the
+selected workspace and creates `projects/<name>/.venv` with requests 2.34.2,
+pytest 9.1.1 and their exact wheel dependencies. `software_catalog.json` freezes
+official download URLs and SHA-256 checksums. Downloads bypass environment
+proxies and use the client's pinned public CA bundle; certificate and hostname
+verification stay enabled. Package installation is offline from the verified
+wheel cache, using pip hash checking.
+
+Run inside Windows with its already configured local executor and model endpoint:
+
+```powershell
+.\start.ps1 -SoftwareRoot 'C:\Qw3Computer\software' -OutputPolicy task
+```
+
+In the application, request: “为 python-demo 配置 Python 3.13.16，使用 python-web
+配置档，创建隔离环境，完成后核对依赖并说明如何打开项目终端。” Existing source files
+can be placed in `C:\Qw3Computer\software\projects\python-demo` before the task.
+Project names are short lowercase names, not arbitrary paths. The result includes
+`requirements.lock`, `environment-verification.json` and `open-terminal.cmd`;
+open the latter to activate that project's environment in a new terminal.
+
+The model selects the profile and checks the job; the application produces the
+installation commands. It does not accept model-supplied shell commands, URLs
+or packages. System PATH and unrelated Python installations are preserved. A
+conflicting Python 3.13 registration or unmanaged existing `.venv` stops setup
+for inspection. This first profile is not yet a general Python repair tool.
+
+Jobs retain stage results, errors, logs and action identity. Pause cancels known
+owned work; downloads and known-stopped jobs can resume under the same identity.
+An interrupted installer or application restart during installation is marked
+uncertain and blocks another dispatch. Killing an installer does not establish
+rollback; reconciliation for that case remains a product limitation. Model
+completion alone cannot mark an unverified environment successful.
+
+The owned-VM harness restores the frozen clean baseline, uses a qualified native
+bundle, records continuous video, then independently runs the supplied project,
+pytest and pip checks from new activated command prompts. Each attempt needs a
+new output directory; all failures remain in the report. This is a local-model
+workflow with controlled software tools, not a pure GUI benchmark.
+
+```bash
+# Start a separate, owned baseline engine first.
+.venv/bin/python apps/computer_use/run_engine.py --method dflash2 --kvmem off \
+  --run-dir apps/computer_use/.runtime/product-python-engine-next
+
+# Once that engine is ready, run this in another terminal.
+PYTHONPATH=apps/computer_use .venv/bin/python apps/computer_use/software_product_run.py \
+  --output apps/computer_use/.runtime/product-python-new-next \
+  --bundle apps/computer_use/.runtime/windows-native-client-21 \
+  --engine apps/computer_use/.runtime/product-python-engine-next \
+  --ffmpeg /absolute/path/to/ffmpeg
+```
+
+The engine must be running and owned by its manifest; the harness requires the
+task-owned VM to be paused before restoring its snapshot. The current harness
+only covers the Python new-environment pilot. Repair and LaTeX acceptance are
+not implied by a successful new-environment run.
 
 The model catalog advertises image input and a 1M logical context. Automatic
 compaction starts at 950K tokens, above the 128K KVMem retrieval threshold.
