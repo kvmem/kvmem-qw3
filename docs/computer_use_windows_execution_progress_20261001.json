@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T06:40:32.615021+00:00",
+  "updated_at": "2026-10-02T07:55:41.990160+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -2199,8 +2199,8 @@
       "Near-1M summary request itself must have measured usage and engine trace",
       "History strategy is an isolated diagnostic variable; not V1 success evidence"
     ],
-    "near_1m_qualified": false,
-    "diagnosis": "Both visual policies planned 509 mandatory blocks, but final runtime retained 1509/1493 against budget 1024; reused checkpoint 127744 made effective suffix about 189K tokens. Visual-policy toggle did not resolve failure; exact corrective change still requires a controlled engine regression.",
+    "near_1m_qualified": true,
+    "diagnosis": "Original cached Q replay retained completed history after an old P checkpoint as mandatory live suffix. Exact-input control and fixed six-request replay confirmed the engine regression. A later 945K native compaction failed at the default 180s read timeout; client 14 with explicit diagnostic waits and liveness completed measured 945446-token compaction and retained first/latest markers. No observed GPU OOM.",
     "earlier_visual_only_hypothesis_not_supported": true,
     "gpu_oom_observed": false,
     "off_long_context_diagnostic_completed": false,
@@ -2261,7 +2261,7 @@
       "off_long_replay_is_not_native_compaction": true
     },
     "connection_liveness_candidate": {
-      "status": "windows_contracts_passed_actual_model_compaction_retest_next",
+      "status": "actual_model_compaction_retest_passed_independent_audit",
       "linux_contracts": 77,
       "linux_evidence": "apps/computer_use/.runtime/transport-contract-linux-03/result.json",
       "default_backend_timeouts_changed": false,
@@ -2274,8 +2274,51 @@
       "windows_evidence": "apps/computer_use/.runtime/windows-client-14-qualification-01/result.json",
       "bundle_sha256": "9f5ab5a1feb284f656b15020010f1e432799368feec7fdb1c3e4257371a1f44d",
       "native_windows_runtime_qualified": true,
-      "actual_model_compaction_qualified": false
-    }
+      "actual_model_compaction_qualified": true,
+      "formal_v0_client_replaced": false,
+      "formal_v0_snapshot_saved": false
+    },
+    "transport_retest": {
+      "status": "passed_independent_audit",
+      "directory": "apps/computer_use/.runtime/native-long-context-wait-on-01/long-context-on-04",
+      "bundle": "windows-native-client-14",
+      "bundle_sha256": "9f5ab5a1feb284f656b15020010f1e432799368feec7fdb1c3e4257371a1f44d",
+      "observations_requested": 17,
+      "auto_compact_token_limit": 950000,
+      "timeout_seconds": 1800,
+      "backend_timeout_seconds": 1200,
+      "backend_read_timeout_seconds": 900,
+      "history_policy": "pin-all",
+      "original_failures_preserved": true,
+      "near_1m_qualified": true,
+      "independent_audit_passed": true,
+      "independent_audit_checks": 13,
+      "measured_compaction_prompt_tokens": 945446,
+      "compaction_seconds": 492.7077006999989,
+      "completed_compactions": 1,
+      "observations_received": 17,
+      "markers_correct": true,
+      "native_turn_seconds": 1673.287,
+      "requests_completed": 19,
+      "post_compaction_first_prompt_tokens": 2519,
+      "continuous_recording_complete": true,
+      "video_duration_seconds": 1692.5,
+      "sampled_device_gpu_peak_gib": 44.8984375,
+      "sampled_engine_tree_peak_rss_gib": 50.787757873535156,
+      "gpu_oom_observed": false,
+      "caller_owned_engine_stopped": true,
+      "off_same_native_probe_completed": false,
+      "default_production_waits_unchanged": true,
+      "task_and_selection_budgets_unchanged": true,
+      "evidence_sha256": {
+        "result.json": "4d0ab6a1183180abedfc6dc86ab8051cdf08dc2941bcec30764463939494fd95",
+        "independent-grade.json": "1bd90cfceb0b188e2ed4bb80b13a8f5113418e0df74bbc8510eb632da07bfd18",
+        "resources.jsonl": "7ceac2f6a78179707bbcde0dab254ed9a90ec7d05749e38d390995e29e748bce",
+        "video/recording.json": "34ab0dbb5bc469e7b0a26a0877cb4c99b9523c1a69f6c84e14fa3e6079cebb21",
+        "video/screen.mp4": "e4c605dea7bfe12342b1a15dabee6717d96bcfb32b5a04f9bef8d6d32584fe65"
+      }
+    },
+    "qualification_scope": "Single synthetic padded live-observation probe with two markers; not general 1M business-task reliability or an on/off native compaction comparison."
   },
   "task_adaptation_contract": {
     "version": 1,
