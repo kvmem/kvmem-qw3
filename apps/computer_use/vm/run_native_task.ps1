@@ -61,7 +61,7 @@ try {
     $env:PATH="$client\codex\bin;$env:PATH"; $env:PYTHONUTF8='1'
     $appArguments='-X utf8 -m qw3_computer.app --desktop http://127.0.0.1:5000 --desktop-token C:\Qw3Computer\executor-token.txt'+
         ' --backend '+$configuration.backend+' --backend-token "'+$runtime+'\model-token.txt" --runtime "'+$runtime+'\app"'+
-        ' --tool-call-limit '+$configuration.tool_call_limit+' --output-policy task'
+        ' --tool-call-limit '+$configuration.tool_call_limit+' --output-policy task --trace-backend'
     # Historical bundles keep their original default CLI. Extended waits
     # require a newly qualified bundle that supports these explicit options.
     if ($modelWait -ne 600 -or $modelReadWait -ne 180) {

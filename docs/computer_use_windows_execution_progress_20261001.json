@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T08:16:05.603986+00:00",
+  "updated_at": "2026-10-02T10:04:28.120390+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -967,7 +967,8 @@
         "formal_ready": false,
         "native_qualification_scope": "Neutral folder export only: missing folder, Unicode PDF filename, independent byte hashes, nonrecursive subdirectory listing; no benchmark answer or model success",
         "native_evidence": "apps/computer_use/.runtime/osworld-006-native-diagnostic-02/result.json"
-      }
+      },
+      "missing_cv_required_in_original_interview_list": true
     },
     "010": {
       "model_test_completed": false,
@@ -1133,6 +1134,21 @@
         "opened_dialog_extension": ".jpg",
         "intended_reference": "reference.png",
         "failure_analysis": "apps/computer_use/.runtime/osworld-native-remaining-qualification-02/osworld-native051-on-01/failure-analysis.json"
+      },
+      "host_process_review_workflow": {
+        "source": "apps/computer_use/osworld_windows/review051.py",
+        "host_controls_passed": 6,
+        "control_evidence": "apps/computer_use/.runtime/osworld-051-process-review-qualification-01/result.json",
+        "real_failed_preflight_package": "apps/computer_use/.runtime/osworld-051-process-review-02/manifest.json",
+        "package_manifest_sha256": "f48937ffcc984d0be4573cefa1ec82c4b1b90cd28a9384c7827c07372d1c0de1",
+        "real_actions_bound": 26,
+        "real_observations_bound": 44,
+        "complete_visual_review_done": false,
+        "artifact_missing_in_packaged_preflight": true,
+        "original_result_unchanged": true,
+        "from_scratch_positive_native_process_qualification_passed": false,
+        "report": "docs/computer_use_windows_051_process_review_20261002.md",
+        "host_queue_and_review_contract_evidence": "apps/computer_use/.runtime/host-preparation-contracts-02/result.json"
       }
     },
     "022": {
@@ -2164,7 +2180,7 @@
     "failed_native_txt_trial_preserved": "apps/computer_use/.runtime/windows-capability-calibration-04/capability-cap08-on-03/result.json"
   },
   "actual_long_context_qualification": {
-    "status": "cached_boundary_fixed_native_compaction_transport_timeout",
+    "status": "on_compaction_passed_off_transport_completed_summary_bookkeeping_failed",
     "formal_run": false,
     "v1_candidate_implemented": false,
     "native_client_unchanged": true,
@@ -2203,8 +2219,8 @@
     "diagnosis": "Original cached Q replay retained completed history after an old P checkpoint as mandatory live suffix. Exact-input control and fixed six-request replay confirmed the engine regression. A later 945K native compaction failed at the default 180s read timeout; client 14 with explicit diagnostic waits and liveness completed measured 945446-token compaction and retained first/latest markers. No observed GPU OOM.",
     "earlier_visual_only_hypothesis_not_supported": true,
     "gpu_oom_observed": false,
-    "off_long_context_diagnostic_completed": false,
-    "host_services_stopped": false,
+    "off_long_context_diagnostic_completed": true,
+    "host_services_stopped": true,
     "desktop_paused": true,
     "audit_unit_controls_passed": 4,
     "report": "docs/computer_use_windows_long_context_boundary_20261002.md",
@@ -2307,7 +2323,7 @@
       "sampled_engine_tree_peak_rss_gib": 50.787757873535156,
       "gpu_oom_observed": false,
       "caller_owned_engine_stopped": true,
-      "off_same_native_probe_completed": false,
+      "off_same_native_probe_completed": true,
       "default_production_waits_unchanged": true,
       "task_and_selection_budgets_unchanged": true,
       "evidence_sha256": {
@@ -2318,9 +2334,9 @@
         "video/screen.mp4": "e4c605dea7bfe12342b1a15dabee6717d96bcfb32b5a04f9bef8d6d32584fe65"
       }
     },
-    "qualification_scope": "Single synthetic padded live-observation probe with two markers; not general 1M business-task reliability or an on/off native compaction comparison.",
+    "qualification_scope": "Synthetic component: on strict audit passed; off completed near-1M compaction and restored tools, but failed count/latest-marker accuracy. Not a matched timing or general business-reliability comparison.",
     "off_native_diagnostic": {
-      "status": "running",
+      "status": "failed_accuracy_after_completed_compaction",
       "directory": "apps/computer_use/.runtime/native-long-context-wait-off-01/long-context-off-01",
       "engine_directory": "apps/computer_use/.runtime/native-long-context-wait-off-01/engine",
       "engine_pid": 1587991,
@@ -2337,7 +2353,27 @@
       "not_matched_latency_comparison": "Off component qualification uses longer wait budgets after observed 883K cold inference took 929s; not a same-budget product timing pair",
       "last_host_process_identity_verified": true,
       "desktop_actions_available": false,
-      "caller_must_stop_engine_after_terminal": true
+      "caller_must_stop_engine_after_terminal": true,
+      "concurrent_windows_contract_qualification": "apps/computer_use/.runtime/windows-client-15-qualification-01/result.json",
+      "component_diagnostic_not_latency_comparison": true,
+      "observations_received_last_read": 16,
+      "independent_audit_passed": false,
+      "independent_checks_passed": 11,
+      "independent_checks_total": 13,
+      "compaction_prompt_tokens": 944514,
+      "compaction_seconds": 1085.8607082999988,
+      "native_turn_seconds": 6371.477,
+      "requests_completed": 18,
+      "continuous_recording_complete": true,
+      "video_duration_seconds": 6391.1,
+      "sampled_whole_device_peak_gpu_gib": 67.412109375,
+      "sampled_engine_tree_peak_rss_gib": 29.31386947631836,
+      "caller_owned_engine_stopped": true,
+      "caller_owned_engine_exit_code": 143,
+      "analysis": "apps/computer_use/.runtime/native-long-context-wait-off-01/long-context-off-01/failure-analysis.json",
+      "failure_class": "model_summary_counting",
+      "transport_timeout_observed": false,
+      "gpu_oom_observed": false
     }
   },
   "task_adaptation_contract": {
@@ -2367,7 +2403,7 @@
     "new_error_path_native_requalification_pending": true
   },
   "formal_connection_profile_preparation": {
-    "status": "linux_runtime_and_host_queue_tests_passed_windows_requalification_pending",
+    "status": "linux_and_windows_runtime_contracts_passed_full_launcher_and_clean_snapshot_pending",
     "app_source": "apps/computer_use/qw3_computer/app.py",
     "native_launch_source": "apps/computer_use/vm/run_native_task.ps1",
     "queue_source": "apps/computer_use/osworld_windows/campaign.py",
@@ -2379,8 +2415,57 @@
     "extended_waits_explicit_and_shared_across_on_off": true,
     "default_waits_changed": false,
     "legacy_bundle_nondefault_waits_rejected": true,
-    "new_candidate_bundle_not_yet_windows_qualified": true,
+    "new_candidate_bundle_not_yet_windows_qualified": false,
     "formal_v0_frozen": false,
-    "v1_strategy_change": false
+    "v1_strategy_change": false,
+    "candidate_bundle": "windows-native-client-15",
+    "candidate_bundle_sha256": "34939144ed0520de3958b9bca08fed562557ee9a4b4d5ae222db90605cf7d19e",
+    "windows_contract_tests": 79,
+    "windows_evidence": "apps/computer_use/.runtime/windows-client-15-qualification-01/result.json",
+    "native_windows_runtime_qualified": true,
+    "new_clean_snapshot_created": false,
+    "actual_model_extended_wait_launcher_qualified": false,
+    "host_contract_tests": 23,
+    "host_contract_evidence": "apps/computer_use/.runtime/host-preparation-contracts-02/result.json",
+    "storage_guard_checks_output_share_and_vm_disk": true,
+    "engine_and_backend_trace_links_enabled_in_candidate": true
+  },
+  "v0_candidate_preparation": {
+    "profile": "docs/computer_use_windows_v0_candidate_20261002.json",
+    "profile_sha256": "9f43c9cce3f1a68e249ffffbcdaac4cdb878b7e76aff31cf132544ddc9a8156f",
+    "task_ids": [
+      "013",
+      "004",
+      "006",
+      "010",
+      "038",
+      "022",
+      "035",
+      "043",
+      "080",
+      "051"
+    ],
+    "planned_baseline_attempts": 20,
+    "first_on_pairs": 5,
+    "first_off_pairs": 5,
+    "budgets_unchanged_from_original_plan": true,
+    "model_inventory": "apps/computer_use/.runtime/windows-v0-model-inventory-01/manifest.json",
+    "model_inventory_sha256": "21b0d9916ec6425a91c146d4aa4a3e93bc705c330b0beefddd336779e49f65e0",
+    "model_files_hashed": 36,
+    "model_asset_bytes": 88482025136,
+    "formal_v0_frozen": false,
+    "formal_dispatch_qualified": false,
+    "missing_006_not_omitted": true,
+    "remaining_gates_in_profile": true
+  },
+  "closed_capability_history_migration_20261002": {
+    "source": "apps/computer_use/.runtime/windows-capability-calibration-06",
+    "target": "/data/qw3-computer-use-history-20261002/windows-capability-calibration-06",
+    "receipt": "/data/qw3-computer-use-history-20261002/windows-capability-calibration-06-migration.json",
+    "files": 1906,
+    "bytes": 2167341075,
+    "all_file_hashes_modes_mtimes_verified": true,
+    "original_paths_preserved": true,
+    "trials_omitted": false
   }
 }

@@ -157,3 +157,18 @@ plain 与 MTP 路径均采用此规则；两项相关 CPU 检查和构建通过�
 - [第四次原生实际模型验收](/home/chaidi/qw3/apps/computer_use/.runtime/native-long-context-wait-on-01/long-context-on-04/result.json)
 - [第四次独立审计](/home/chaidi/qw3/apps/computer_use/.runtime/native-long-context-wait-on-01/long-context-on-04/independent-grade.json)
 - [自定义能力场景结果与零通过原因](/home/chaidi/qw3/docs/computer_use_windows_capability_boundary_20261002.md)
+
+## 关闭版原生压缩终态（2026-10-02）
+
+关闭版真实 Windows/Codex 诊断已结束。实际 944,514 token 压缩请求完成，后续
+工具恢复、18 份请求回执、完整 6,391.1 秒录像和暂停收尾均通过核对；独立审计
+11/13 项成立，最终结果仍失败。压缩之前实际完成 15 次观察，摘要写成 16 次，
+并把多个不同标记写成第 15 次标记。恢复后取得第 16 次观察就返回“17 次”，
+最新标记因此也与要求的第 17 次不符。原报告和录像不修改，详见
+[计数错误及绑定证据](/home/chaidi/qw3/apps/computer_use/.runtime/native-long-context-wait-off-01/long-context-off-01/failure-analysis.json)。
+
+这证明此次长历史推理与压缩链路可以完成，同时暴露了模型摘要中的进度计数边界。
+不能把“请求完成”当成“任务完成”，也不能将一次合成计数失败概括为所有长业务
+任务都会失败。开启版与关闭版诊断的等待/任务预算不同，关闭版又有只读运行期间
+的脚本化合同检查，故不构成隔离的速度对照。按身份校验停止本任务引擎，退出码
+143，未出现 GPU OOM 或请求超时；全部历史失败保留。

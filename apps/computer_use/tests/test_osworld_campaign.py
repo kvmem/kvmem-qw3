@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from osworld_windows.campaign import execute, validate
-from osworld_windows.native_run import DEFAULT_SNAPSHOT, SNAPSHOT_QUALIFICATIONS, snapshot_qualification, terminal_status
+from osworld_windows.native_run import DEFAULT_SNAPSHOT, SNAPSHOT_QUALIFICATIONS, require_evidence_space, snapshot_qualification, terminal_status
 from osworld_windows.scenarios import collection, prepare, verify_collection
 from osworld_windows.source import sha256
 from osworld_windows.launch import connection_waits, prepare as prepare_launch, verify_wait_capability
@@ -27,6 +27,17 @@ def report(outcome='agent_completed', success=False):
 
 
 class CampaignTests(unittest.IsolatedAsyncioTestCase):
+    def test_roomy_external_output_does_not_hide_full_shared_disk(self):
+        with patch('osworld_windows.native_run.shutil.disk_usage', side_effect=[
+                SimpleNamespace(free=100*1024**3), SimpleNamespace(free=2*1024**3)]):
+            with self.assertRaisesRegex(ValueError, 'shared'):
+                require_evidence_space(Path('/external/output'), Path('/workspace/shared'))
+
+    def test_storage_filesystem_also_requires_the_recording_reserve(self):
+        with patch('osworld_windows.native_run.shutil.disk_usage', return_value=SimpleNamespace(free=7*1024**3)):
+            with self.assertRaisesRegex(ValueError, 'storage'):
+                require_evidence_space(Path('/workspace/storage'))
+
     async def test_one_explicit_connection_profile_reaches_both_attempts(self):
         waits = []
         async def runner(args):

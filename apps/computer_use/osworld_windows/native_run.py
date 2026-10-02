@@ -35,6 +35,16 @@ SNAPSHOT_QUALIFICATIONS = {
     DEFAULT_SNAPSHOT: 'text-handler-qualification-01/roundtrip-result.json',
 }
 
+def require_evidence_space(*paths):
+    records = []
+    for path in paths:
+        free = shutil.disk_usage(path).free
+        if free < 8 * 1024**3:
+            raise ValueError(f'Native desktop trials require at least 8 GiB free: {path}')
+        records.append(dict(path=str(Path(path).resolve()), free_bytes=free))
+    return records
+
+
 def snapshot_qualification(app, name):
     if name not in SNAPSHOT_QUALIFICATIONS:
         raise ValueError('Snapshot has no registered restore qualification')
@@ -99,17 +109,18 @@ async def run(args):
     output = args.output.resolve()
     if not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}', output.name):
         raise ValueError('Invalid attempt identity')
-    if shutil.disk_usage(output.parent).free < 8 * 1024**3:
-        raise ValueError('Native desktop trials require at least 8 GiB free for evidence')
-    output.mkdir(parents=True, exist_ok=False)
-    run_id = output.name
     app = ROOT / 'apps/computer_use'
     share = app / '.runtime/windows/shared'
+    spaces = require_evidence_space(output.parent, share)
+    output.mkdir(parents=True, exist_ok=False)
+    run_id = output.name
     lock = open('/tmp/qw3-osworld-vm.lock', 'a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     info = json.loads(await command('docker', 'inspect', 'qw3-computer-windows'))[0]
     if info['Config'].get('Labels', {}).get('com.qw3.computer-use.owner') != 'codex-goal-20260930':
         raise ValueError('Not the task-owned VM')
+    storage = Path(next(m['Source'] for m in info['Mounts'] if m['Destination'] == '/storage'))
+    spaces.extend(require_evidence_space(storage))
     token = (share / 'executor-token.txt').read_text().strip()
     env = dict(os.environ, PYTHONPATH=str(app))
     report = dict(kind='osworld_native_end_to_end_preflight', formal_run=False,
@@ -117,6 +128,7 @@ async def run(args):
                   kvmem=args.kvmem, timeout_seconds=args.timeout, tool_call_limit=args.tool_limit, visual_history=args.visual_history,
                   pipeline_passed=False, task_success_claimed=False, events=[])
     report.update(waits)
+    report['evidence_filesystem_space_before_trial'] = spaces
     engine = relay = recorder = sampler = reviews = None
     owns_desktop = False
     grading_started = False
@@ -218,7 +230,7 @@ async def run(args):
             event('starting_qw3')
             engine = await launch('engine', [sys.executable, app / 'run_engine.py', '--method', 'dflash2',
                 '--kvmem', args.kvmem, '--guided-refresh', 'both', '--visual-history', args.visual_history,
-                '--lock-timeout', '30', '--run-dir', output / 'engine'])
+                '--trace-retrieval', '--lock-timeout', '30', '--run-dir', output / 'engine'])
             sampler = asyncio.create_task(monitor(engine.pid, output / 'engine-resources.jsonl', monitoring_stopped))
             await ready('http://127.0.0.1:18080/health', process=engine)
             relay = await launch('relay', [sys.executable, app / 'vm/model_relay.py', '--run-dir', output / 'relay',
