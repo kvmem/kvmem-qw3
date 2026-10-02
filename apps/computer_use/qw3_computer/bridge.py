@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -142,15 +143,19 @@ class ResponseStream:
 
 
 def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", max_tokens=4096, trace_dir=None,
-               backend_token=None, trace_backend=False):
+               backend_token=None, trace_backend=False, *, backend_timeout_seconds=600,
+               backend_read_timeout_seconds=180, heartbeat_seconds=30):
     if trace_backend and trace_dir is None:
         raise ValueError("Backend trace tags require a local trace directory")
+    if not 0 < heartbeat_seconds <= backend_read_timeout_seconds <= backend_timeout_seconds:
+        raise ValueError("Require positive heartbeat <= read timeout <= total timeout")
     app = web.Application(client_max_size=64 * 1024 * 1024)
     lock = asyncio.Lock()
 
     async def sessions(app):
         headers = {"Authorization": "Bearer " + backend_token} if backend_token else {}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600, sock_read=180),
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=backend_timeout_seconds,
+                                         sock_read=backend_read_timeout_seconds),
                                          trust_env=False, headers=headers) as session:
             app[BACKEND] = session
             yield
@@ -184,6 +189,21 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
             output = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                                  "Cache-Control": "no-cache"})
             stream = ResponseStream(output, public_model, converted.names)
+            heartbeat = None
+
+            async def progress():
+                # Connection liveness only. Never invent usage or release a
+                # partial tool while the backend is doing silent prefill.
+                while True:
+                    await asyncio.sleep(heartbeat_seconds)
+                    await stream.emit("response.in_progress", response=stream.response)
+
+            async def stop_heartbeat():
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, ConnectionError):
+                        await heartbeat
+
             try:
                 async with app[BACKEND].post(backend_url.rstrip("/") + "/chat/completions",
                                                 json=converted.body) as upstream:
@@ -192,6 +212,7 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                         return web.json_response({"error": {"message": f"QW3 returned HTTP {upstream.status}"}}, status=502)
                     await output.prepare(request)
                     await stream.start()
+                    heartbeat = asyncio.create_task(progress())
                     done = False
                     async for data in read_sse(upstream.content):
                         metrics.setdefault("first_event_seconds", time.monotonic() - started)
@@ -204,6 +225,7 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                                 log.write(data + "\n")
                         await stream.chunk(chunk)
                     require(done, "backend stream ended without [DONE]")
+                    await stop_heartbeat()
                     await stream.finish()
                     metrics.update(status=stream.response["status"], usage=stream.usage)
                     await output.write_eof()
@@ -218,6 +240,7 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                     aiohttp.ClientError, TimeoutError) as exc:
                 metrics.update(status="failed", error=str(exc))
                 LOG.warning("local backend failed: %s", exc)
+                await stop_heartbeat()
                 if not output.prepared:
                     return web.json_response({"error": {"message": str(exc)}}, status=502)
                 try:
@@ -227,6 +250,7 @@ def create_app(backend_url, backend_model="qw3", public_model="qw3-computer", ma
                     pass
                 return output
             finally:
+                await stop_heartbeat()
                 if trace is not None:
                     metrics["elapsed_seconds"] = time.monotonic() - started
                     (trace / "metrics.json").write_text(json.dumps(metrics, indent=2))

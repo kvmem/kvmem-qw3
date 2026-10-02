@@ -12,6 +12,12 @@ import subprocess
 import tarfile
 import zipfile
 
+NATIVE_TEST_FILES = (
+    "test_protocol.py", "test_bridge.py", "test_controller.py", "test_desktop.py",
+    "test_collect_artifacts.py", "test_long_evidence.py", "test_task_driver.py",
+    "test_vm_relay.py", "test_codex_integration.py", "fixture_mcp.py", "fixture_long_mcp.py",
+)
+
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -56,7 +62,11 @@ def main():
         "python313.zip\n.\nLib/site-packages\n../app\nimport site\n", encoding="utf-8")
     app = output / "app"
     shutil.copytree(root / "qw3_computer", app / "qw3_computer", ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copytree(root / "tests", app / "tests", ignore=shutil.ignore_patterns("__pycache__"))
+    # Host scenario graders depend on the source repository and Linux tools;
+    # ship the native runtime contracts previously qualified in Windows.
+    (app / "tests").mkdir()
+    for name in NATIVE_TEST_FILES:
+        shutil.copy2(root / "tests" / name, app / "tests" / name)
     (app / "vm").mkdir()
     shutil.copyfile(root / "vm/model_relay.py", app / "vm/model_relay.py")
     shutil.copyfile(root / "windows_task.py", app / "windows_task.py")
@@ -94,6 +104,7 @@ exit $LASTEXITCODE
         "kind": "windows_native_client_offline_bundle", "qualified": False,
         "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "python_version": "3.13.13", "codex_version": "0.159.2",
+        "test_scope": "Windows runtime contracts; host OSWorld/scoring tests remain in the repository",
         "assets": {p.name: {"sha256": digest(p), "bytes": p.stat().st_size} for p in [python, codex, *wheels]},
         "source_files": {str(p.relative_to(app)): digest(p) for p in app.rglob("*") if p.is_file()},
     }

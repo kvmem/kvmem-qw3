@@ -72,6 +72,8 @@ async def run(args):
     report = dict(kind="native_actual_model_compaction_diagnostic", formal_run=False,
                   real_long_context_inference=True, synthetic_padding=True,
                   desktop_actions_available=False, observations_requested=args.observations,
+                  backend_timeout_seconds=args.backend_timeout,
+                  backend_read_timeout_seconds=args.backend_read_timeout,
                   auto_compact_token_limit=950000, passed=False, started_unix_ns=time.time_ns(),
                   guest_driver_pid=os.getpid())
     (args.output / "ownership.json").write_text(json.dumps(report))
@@ -87,8 +89,12 @@ async def run(args):
                 report["initial_health"] = await response.json()
                 if not report["initial_health"]["paused"]:
                     raise ValueError("Readonly diagnostic requires an already paused desktop")
+        backend_waits = {}
+        if (args.backend_timeout, args.backend_read_timeout) != (600, 180):
+            backend_waits = dict(backend_timeout_seconds=args.backend_timeout,
+                                 backend_read_timeout_seconds=args.backend_read_timeout)
         runner = web.AppRunner(create_app(args.backend, backend_token=args.token_file.read_text().strip(),
-                                          trace_dir=runtime / "inference", trace_backend=True), handler_cancellation=True)
+            trace_dir=runtime / "inference", trace_backend=True, **backend_waits), handler_cancellation=True)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
@@ -181,6 +187,8 @@ if __name__ == "__main__":
     parser.add_argument("--backend")
     parser.add_argument("--token-file", type=Path)
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--backend-timeout", type=int, default=600)
+    parser.add_argument("--backend-read-timeout", type=int, default=180)
     arguments = parser.parse_args()
     if arguments.mcp:
         readonly_fixture(arguments)

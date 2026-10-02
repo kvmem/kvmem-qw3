@@ -24,9 +24,13 @@ async def run(args):
         raise ValueError("Invalid diagnostic identity")
     if not 1 <= args.segment_tokens <= 65000 or not 1 <= args.observations <= 25 or not 1 <= args.timeout <= 14400:
         raise ValueError("Invalid diagnostic budget")
+    if not 30 <= args.backend_read_timeout <= args.backend_timeout <= args.timeout:
+        raise ValueError("Require 30 <= backend read timeout <= backend timeout <= task timeout")
     app = ROOT / "apps/computer_use"
     share = app / ".runtime/windows/shared"
     output = args.output.resolve()
+    if shutil.disk_usage(output.parent).free < 2 * 1024**3:
+        raise ValueError("Long-context qualification requires at least 2 GiB free for evidence")
     output.mkdir(parents=True, exist_ok=False)
     lock = open("/tmp/qw3-osworld-vm.lock", "a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -91,9 +95,12 @@ async def run(args):
                 report["measured_segment_tokens"] = (await response.json())["count"]
             report.update(segment_bytes=len(padding.encode()), observations_requested=args.observations,
                           timeout_seconds=args.timeout, auto_compact_token_limit=950000,
+                          backend_timeout_seconds=args.backend_timeout,
+                          backend_read_timeout_seconds=args.backend_read_timeout,
                           padding_sha256=sha256(staged / "padding.txt"))
             sampler = asyncio.create_task(monitor(engine["pid"], output / "resources.jsonl", stopped))
-            relay = await launch("relay", [sys.executable, app / "vm/model_relay.py", "--run-dir", output / "relay"])
+            relay = await launch("relay", [sys.executable, app / "vm/model_relay.py", "--run-dir", output / "relay",
+                "--backend-timeout", args.backend_timeout, "--backend-read-timeout", args.backend_read_timeout])
             await wait_json(output / "relay/manifest.json", 20)
             shutil.copyfile(output / "relay/model-token.txt", staged / "model-token.txt")
             (staged / "model-token.txt").chmod(0o600)
@@ -114,7 +121,7 @@ try {
     $env:PATH="$client\codex\bin;$env:PATH"
     $env:PYTHONPATH="$client\app"
     $env:PYTHONUTF8='1'
-    $arguments='-X utf8 "'+$staged+'\probe.py" --identity IDENTITY --output "\\host.lan\Data\IDENTITY-output" --padding "'+$staged+'\padding.txt" --token-file "'+$staged+'\model-token.txt" --backend http://GATEWAY:18084/v1 --observations OBSERVATIONS --timeout TIMEOUT'
+    $arguments='-X utf8 "'+$staged+'\probe.py" --identity IDENTITY --output "\\host.lan\Data\IDENTITY-output" --padding "'+$staged+'\padding.txt" --token-file "'+$staged+'\model-token.txt" --backend http://GATEWAY:18084/v1 --observations OBSERVATIONS --timeout TIMEOUT --backend-timeout MODEL_WAIT --backend-read-timeout READ_WAIT'
     $probe=Start-Process "$client\python\python.exe" -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput "$staged\stdout.log" -RedirectStandardError "$staged\stderr.log"
     @{started=$true;pid=$probe.Id;client_sha256='BUNDLE_SHA'} | ConvertTo-Json | Set-Content "$staged\launch-result.json" -Encoding UTF8
 } catch {
@@ -123,6 +130,7 @@ try {
 '''
             for key, value in dict(CLIENT_ID=client_id, BUNDLE_SHA=archive["sha256"], MANIFEST_SHA=sha256(args.bundle / "manifest.json"), IDENTITY=identity,
                 HELPER_SHA=sha256(helper), PADDING_SHA=report["padding_sha256"], GATEWAY=network["Gateway"],
+                MODEL_WAIT=str(args.backend_timeout), READ_WAIT=str(args.backend_read_timeout),
                 OBSERVATIONS=str(args.observations), TIMEOUT=str(args.timeout)).items():
                 script = script.replace(key, value)
             (output / "launch.ps1").write_text(script)
@@ -170,7 +178,11 @@ $result | ConvertTo-Json | Set-Content '\\host.lan\Data\IDENTITY-inputs\cleanup-
             await stop(relay)
             stopped.set()
             if sampler:
-                await sampler
+                try:
+                    await sampler
+                except Exception as exc:
+                    report["sampler_error"] = repr(exc)
+                    report["passed"] = False
             try:
                 report["final_health"] = await get("http://127.0.0.1:18082/health", True)
                 report["passed"] &= report["final_health"]["paused"] is True
@@ -192,5 +204,7 @@ if __name__ == "__main__":
     parser.add_argument("--segment-tokens", type=int, default=60000)
     parser.add_argument("--observations", type=int, default=17)
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--backend-timeout", type=int, default=600)
+    parser.add_argument("--backend-read-timeout", type=int, default=180)
     arguments = parser.parse_args()
     raise SystemExit(0 if asyncio.run(run(arguments))["passed"] else 1)

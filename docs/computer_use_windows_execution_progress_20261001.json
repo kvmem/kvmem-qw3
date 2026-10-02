@@ -1,6 +1,6 @@
 {
   "kind": "windows_osworld_ten_execution_progress",
-  "updated_at": "2026-10-02T05:22:16.677466+00:00",
+  "updated_at": "2026-10-02T06:16:30.955344+00:00",
   "goal_status": "active",
   "phase": "P0_common_platform_and_P1_task_preparation",
   "formal_runs_completed": 0,
@@ -2164,7 +2164,7 @@
     "failed_native_txt_trial_preserved": "apps/computer_use/.runtime/windows-capability-calibration-04/capability-cap08-on-03/result.json"
   },
   "actual_long_context_qualification": {
-    "status": "two_actual_model_diagnostics_failed_before_compaction",
+    "status": "cached_boundary_fixed_native_compaction_transport_timeout",
     "formal_run": false,
     "v1_candidate_implemented": false,
     "native_client_unchanged": true,
@@ -2204,13 +2204,13 @@
     "earlier_visual_only_hypothesis_not_supported": true,
     "gpu_oom_observed": false,
     "off_long_context_diagnostic_completed": false,
-    "host_services_stopped": false,
+    "host_services_stopped": true,
     "desktop_paused": true,
     "audit_unit_controls_passed": 4,
     "report": "docs/computer_use_windows_long_context_boundary_20261002.md",
     "preview_url": "http://127.0.0.1:18089/long-context/index.html",
     "repair_progress": {
-      "status": "fixed_engine_replay_passed_native_compaction_retest_running",
+      "status": "fixed_replay_passed_native_retest_failed_transport_timeout",
       "candidate_commit": "78cce09",
       "cold_control": {
         "directory": "apps/computer_use/.runtime/long-context-cold-control-01",
@@ -2236,8 +2236,40 @@
       "fixed_replay_requests": 6,
       "all_replay_token_counts_match_original": true,
       "native_retest": "apps/computer_use/.runtime/native-long-context-fixed-on-01/long-context-on-03",
-      "native_retest_state": "running",
-      "original_sixth_request_resolved": true
+      "native_retest_state": "failed",
+      "original_sixth_request_resolved": true,
+      "native_retest_maximum_completed_tokens": 883355,
+      "native_retest_attempted_compaction_tokens": 945461,
+      "native_retest_observations": 15,
+      "native_compactions_completed": 0,
+      "native_transport_timeout_seconds": 181.16411499999958,
+      "native_retest_independent_audit_passed": false,
+      "host_disk_full_during_cleanup": true,
+      "original_recording_complete": false,
+      "salvaged_recording_seconds": 1275.0,
+      "off_fixed_input_replay": "apps/computer_use/.runtime/long-context-fixed-off-replay-01",
+      "off_fixed_input_replay_state": "passed",
+      "off_fixed_input_replay_requests": 6,
+      "on_off_binary_equal": true,
+      "on_off_all_input_bytes_equal": true,
+      "fixed_input_comparison": "apps/computer_use/.runtime/long-context-fixed-input-comparison-01/summary.json",
+      "off_883k_capacity_control": "apps/computer_use/.runtime/long-context-off-883k-control-01",
+      "off_883k_capacity_control_state": "passed",
+      "off_883k_input_tokens": 883355,
+      "off_883k_seconds": 928.6694872970693,
+      "off_883k_gpu_oom_observed": false,
+      "off_long_replay_is_not_native_compaction": true
+    },
+    "connection_liveness_candidate": {
+      "status": "linux_contracts_passed_windows_qualification_pending",
+      "linux_contracts": 77,
+      "linux_evidence": "apps/computer_use/.runtime/transport-contract-linux-03/result.json",
+      "default_backend_timeouts_changed": false,
+      "native_windows_client_13_changed": false,
+      "v1_agent_strategy_change": false,
+      "candidate_windows_bundle": "windows-native-client-14",
+      "periodic_events_do_not_change_usage_or_release_partial_actions": true,
+      "real_codex_accepts_repeated_liveness_events": true
     }
   },
   "task_adaptation_contract": {
@@ -2251,5 +2283,19 @@
     ],
     "common_v0_frozen": false,
     "qualification_evidence_bound": true
+  },
+  "history_storage_recovery_20261002": {
+    "source": "apps/computer_use/.runtime/windows/shared-archive-20261002",
+    "target": "/data/qw3-computer-use-history-20261002/windows-shared-archive-20261002",
+    "migration_receipt": "/data/qw3-computer-use-history-20261002/windows-shared-archive-20261002-migration.json",
+    "files": 22834,
+    "bytes": 11675383715,
+    "all_hashes_verified": true,
+    "original_paths_preserved": true,
+    "unrelated_data_deleted": false,
+    "future_desktop_trial_min_free_gib": 8,
+    "future_context_probe_min_free_gib": 2,
+    "sampler_error_no_longer_bypasses_terminal_report": true,
+    "new_error_path_native_requalification_pending": true
   }
 }

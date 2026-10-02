@@ -49,7 +49,10 @@ def request_evidence(raw):
         return evidence
 
 
-def create_app(backend, allowed_peer, token, *, receipt_path=None):
+def create_app(backend, allowed_peer, token, *, receipt_path=None,
+               backend_timeout_seconds=600, backend_read_timeout_seconds=180):
+    if not 0 < backend_read_timeout_seconds <= backend_timeout_seconds:
+        raise ValueError("Require positive read timeout <= total timeout")
     @web.middleware
     async def authorize(request, handler):
         if request.remote != allowed_peer or not secrets.compare_digest(
@@ -62,7 +65,8 @@ def create_app(backend, allowed_peer, token, *, receipt_path=None):
 
     async def session(app):
         async with aiohttp.ClientSession(trust_env=False,
-                                         timeout=aiohttp.ClientTimeout(total=600, sock_read=180)) as client:
+                                         timeout=aiohttp.ClientTimeout(total=backend_timeout_seconds,
+                                             sock_read=backend_read_timeout_seconds)) as client:
             app[key] = client
             yield
     app.cleanup_ctx.append(session)
@@ -132,7 +136,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18084)
+    parser.add_argument("--backend-timeout", type=float, default=600)
+    parser.add_argument("--backend-read-timeout", type=float, default=180)
     args = parser.parse_args()
+    if not 0 < args.backend_read_timeout <= args.backend_timeout <= 14400:
+        parser.error("Require positive read timeout <= total timeout <= 14400")
     info = json.loads(subprocess.check_output(["docker", "inspect", "qw3-computer-windows"], text=True))[0]
     assert info["Config"].get("Labels", {}).get("com.qw3.computer-use.owner") == "codex-goal-20260930"
     assert info["State"]["Running"]
@@ -145,9 +153,13 @@ def main():
     token_file.write_text(token); token_file.chmod(0o600)
     (run / "manifest.json").write_text(json.dumps({"container_id": info["Id"], "bind": gateway,
                                                   "allowed_peer": peer, "port": args.port,
-                                                  "backend": "http://127.0.0.1:18080"}, indent=2))
+                                                  "backend": "http://127.0.0.1:18080",
+                                                  "backend_timeout_seconds": args.backend_timeout,
+                                                  "backend_read_timeout_seconds": args.backend_read_timeout}, indent=2))
     print(f"VM-only authenticated model relay: http://{gateway}:{args.port}", flush=True)
-    web.run_app(create_app("http://127.0.0.1:18080", peer, token, receipt_path=run / "requests.jsonl"), host=gateway, port=args.port,
+    web.run_app(create_app("http://127.0.0.1:18080", peer, token, receipt_path=run / "requests.jsonl",
+                backend_timeout_seconds=args.backend_timeout,
+                backend_read_timeout_seconds=args.backend_read_timeout), host=gateway, port=args.port,
                 handler_cancellation=True, access_log=None)
 
 

@@ -43,6 +43,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.Future()
                 response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
                 await response.prepare(request)
+                if self.mode == "slow":
+                    await asyncio.sleep(.15)
                 if self.mode in ("tool", "bad_tool", "length"):
                     await chunk(response, {"tool_calls": [{"index": 0, "id": "call_one", "type": "function",
                         "function": {"name": "observe", "arguments": "{"}}]})
@@ -92,6 +94,53 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["call_id"], "call_one")
         self.assertEqual(done[0]["arguments"], "{}")
+
+    async def test_silent_prefill_keeps_connection_live_without_fake_output(self):
+        self.mode = "slow"
+        runner, url = await serve(create_app(self.backend_url + "/v1", backend_timeout_seconds=1,
+            backend_read_timeout_seconds=.5, heartbeat_seconds=.02))
+        try:
+            async with self.client.post(url + "/v1/responses", json=request()) as response:
+                events = [json.loads(s) async for s in read_sse(response.content)]
+            self.assertGreaterEqual(sum(e["type"] == "response.in_progress" for e in events), 2)
+            first_output = next(i for i, e in enumerate(events) if e["type"] == "response.output_item.added")
+            for event in events[:first_output]:
+                self.assertNotIn("usage", event.get("response", {}))
+                self.assertEqual(event.get("response", {}).get("output", []), [])
+            self.assertEqual([e["sequence_number"] for e in events], list(range(len(events))))
+            self.assertEqual(events[-1]["type"], "response.completed")
+            self.assertEqual(events[-1]["response"]["usage"]["input_tokens"], 10)
+        finally:
+            await runner.cleanup()
+
+    async def test_liveness_does_not_extend_backend_read_deadline(self):
+        self.mode = "slow"
+        runner, url = await serve(create_app(self.backend_url + "/v1", backend_timeout_seconds=1,
+            backend_read_timeout_seconds=.04, heartbeat_seconds=.01))
+        try:
+            async with self.client.post(url + "/v1/responses", json=request()) as response:
+                events = [json.loads(s) async for s in read_sse(response.content)]
+            self.assertEqual(events[-1]["type"], "response.failed")
+            self.assertFalse(any(e["type"] == "response.output_item.done" for e in events))
+            await asyncio.wait_for(self.cancelled.wait(), 3)
+        finally:
+            await runner.cleanup()
+
+    async def test_disconnect_during_live_wait_cancels_backend_and_releases_slot(self):
+        self.mode = "slow"
+        runner, url = await serve(create_app(self.backend_url + "/v1", backend_timeout_seconds=1,
+            backend_read_timeout_seconds=.5, heartbeat_seconds=.02))
+        try:
+            response = await self.client.post(url + "/v1/responses", json=request())
+            self.assertEqual(response.status, 200)
+            response.close()
+            await asyncio.wait_for(self.cancelled.wait(), 3)
+            self.mode = "text"
+            async with self.client.post(url + "/v1/responses", json=request()) as response:
+                events = [json.loads(s) async for s in read_sse(response.content)]
+            self.assertEqual(events[-1]["type"], "response.completed")
+        finally:
+            await runner.cleanup()
 
     async def test_backend_trace_tags_match_retained_requests_and_metrics(self):
         with tempfile.TemporaryDirectory() as directory:

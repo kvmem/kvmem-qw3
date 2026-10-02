@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -87,6 +88,28 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(.01)
         self.assertEqual(rows[-1]['status'], 'cancelled')
+
+    async def test_configured_read_deadline_stops_upstream_and_records_failure(self):
+        receipts = Path(self.temporary.name) / 'deadline.jsonl'
+        client = TestClient(TestServer(create_app(str(self.upstream.make_url('/')).rstrip('/'),
+            '127.0.0.1', 'test-token', receipt_path=receipts,
+            backend_timeout_seconds=1, backend_read_timeout_seconds=.04), handler_cancellation=True))
+        await client.start_server()
+        try:
+            async with asyncio.timeout(2):
+                response = await client.post('/v1/chat/completions', json={'stream': True},
+                    headers={'Authorization': 'Bearer test-token'})
+                try:
+                    await response.read()
+                except aiohttp.ClientError:
+                    pass
+                await asyncio.wait_for(self.cancelled.wait(), 1)
+            rows = [json.loads(line) for line in receipts.read_text().splitlines()]
+            self.assertEqual(rows[-1]['event'], 'request_terminal')
+            self.assertEqual(rows[-1]['status'], 'error')
+            self.assertEqual(rows[-1]['error_type'], 'SocketTimeoutError')
+        finally:
+            await client.close()
 
     async def test_receipts_bind_request_and_last_image_without_logging_content(self):
         first, last = b'first image', b'last image'

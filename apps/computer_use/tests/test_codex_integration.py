@@ -101,6 +101,9 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     raise
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
             await response.prepare(request)
+            # Exercise repeated connection-liveness events with the real
+            # pinned Codex parser, before releasing either tool or text.
+            await asyncio.sleep(.1)
             if len(calls) <= 2:
                 name = next(t["function"]["name"] for t in body["tools"]
                             if t["function"]["name"].endswith("observe"))
@@ -115,7 +118,7 @@ class CodexIntegrationTests(unittest.IsolatedAsyncioTestCase):
         app = web.Application()
         app.router.add_post("/v1/chat/completions", backend)
         backend_runner, url = await serve(app)
-        bridge_runner, bridge_url = await serve(create_app(url + "/v1"))
+        bridge_runner, bridge_url = await serve(create_app(url + "/v1", heartbeat_seconds=.02))
         with tempfile.TemporaryDirectory(prefix="qw3-codex-integration-") as runtime:
             write_config(runtime, bridge_url + "/v1", sys.executable,
                          [str(Path(__file__).with_name("fixture_mcp.py").resolve()), "--error-second"])

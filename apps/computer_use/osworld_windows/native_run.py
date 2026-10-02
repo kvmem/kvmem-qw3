@@ -97,6 +97,8 @@ async def run(args):
     output = args.output.resolve()
     if not re.fullmatch(r'[a-zA-Z0-9_-]{8,60}', output.name):
         raise ValueError('Invalid attempt identity')
+    if shutil.disk_usage(output.parent).free < 8 * 1024**3:
+        raise ValueError('Native desktop trials require at least 8 GiB free for evidence')
     output.mkdir(parents=True, exist_ok=False)
     run_id = output.name
     app = ROOT / 'apps/computer_use'
@@ -314,7 +316,11 @@ async def run(args):
             await stop(engine)
             monitoring_stopped.set()
             if sampler:
-                await sampler
+                try:
+                    await sampler
+                except Exception as exc:
+                    report['sampler_error'] = repr(exc)
+                    report['pipeline_passed'] = False
             report['private_site_initialized'] = site_initialized
             event('owned_host_services_stopped')
             report.update(terminal_status(report))
